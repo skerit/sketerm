@@ -9,12 +9,14 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const Pty = @import("pty.zig").Pty;
 const Terminal = @import("terminal.zig").Terminal;
+const Pane = @import("ui/pane.zig").Pane;
 
 const APP_ID: [*:0]const u8 = "dev.sker.sketerm";
 
 const App = struct {
     allocator: std.mem.Allocator,
     terminal: ?*Terminal = null,
+    pane: ?*Pane = null,
 };
 
 var g_app: App = undefined;
@@ -85,13 +87,23 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         std.debug.print("sketerm: terminal init failed: {s}\n", .{@errorName(err)});
         return;
     };
-    term.debug_to_stderr = true;
     g_app.terminal = term;
 
+    const pane = Pane.init(g_app.allocator, term) catch |err| {
+        std.debug.print("sketerm: pane init failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    g_app.pane = pane;
+
+    c.adw_application_window_set_content(@ptrCast(window), pane.widget());
     c.gtk_window_present(@ptrCast(window));
 }
 
 fn onShutdown(_: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
+    if (g_app.pane) |p| {
+        p.deinit();
+        g_app.pane = null;
+    }
     if (g_app.terminal) |t| {
         t.deinit();
         g_app.terminal = null;
