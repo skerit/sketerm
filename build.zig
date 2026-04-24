@@ -62,6 +62,24 @@ pub fn build(b: *std.Build) void {
     const spike_step = b.step("spike-gl", "Run the M0.5 GL share-group spike");
     spike_step.dependOn(&spike_run.step);
 
+    // Headless shell smoke runner — `zig build spike-shell`.
+    const shell_mod = b.createModule(.{
+        .root_source_file = b.path("src/spike_shell.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const shell = b.addExecutable(.{
+        .name = "sketerm-spike-shell",
+        .root_module = shell_mod,
+        .use_lld = true,
+    });
+    for (sys_libs) |lib| shell.linkSystemLibrary(lib);
+    b.installArtifact(shell);
+    const shell_run = b.addRunArtifact(shell);
+    const shell_step = b.step("spike-shell", "Headless PTY/parser/screen smoke");
+    shell_step.dependOn(&shell_run.step);
+
     const tests_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
