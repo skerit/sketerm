@@ -13,7 +13,10 @@ const Atlas = @import("../render/atlas.zig").Atlas;
 const GridPass = @import("../render/grid_pass.zig").GridPass;
 const Terminal = @import("../terminal.zig").Terminal;
 const input = @import("input.zig");
+const menu = @import("menu.zig");
+const clipboard = @import("clipboard.zig");
 pub const InputCtx = input.Ctx;
+pub const MenuAction = menu.Action;
 
 const FONT_PATH: [*:0]const u8 = "/usr/share/fonts/TTF/Hack-Regular.ttf";
 const FONT_SIZE: u16 = 14;
@@ -25,6 +28,9 @@ pub const Pane = struct {
     grid_pass: GridPass,
     allocator: std.mem.Allocator,
     input_ctx: ?*input.Ctx = null,
+    /// External sink for menu actions (set by Window).
+    menu_sink: ?menu.Sink = null,
+    menu_sink_ctx: ?*anyopaque = null,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -100,7 +106,33 @@ pub const Pane = struct {
         _ = c.g_signal_connect_data(drag, "drag-update", @ptrCast(&onDragUpdate), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(area_widget, @ptrCast(drag));
 
+        // Right-click → context menu.
+        try menu.attach(area_widget, allocator, paneMenuSink, @ptrCast(self));
+
         return self;
+    }
+
+    fn handleMenuLocal(self: *Pane, action: menu.Action) bool {
+        switch (action) {
+            .copy => {
+                if (!self.terminal.screen.selection.isActive()) return true;
+                const text = self.terminal.screen.extractSelection(self.allocator) catch return true;
+                defer self.allocator.free(text);
+                if (text.len == 0) return true;
+                const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return true;
+                defer self.allocator.free(cstr);
+                @memcpy(cstr, text);
+                const display = c.gtk_widget_get_display(@ptrCast(self.area));
+                const clip = c.gdk_display_get_clipboard(display);
+                c.gdk_clipboard_set_text(clip, cstr.ptr);
+                return true;
+            },
+            .paste => {
+                clipboard.pasteFromClipboard(@ptrCast(self.area), self.terminal);
+                return true;
+            },
+            else => return false,
+        }
     }
 
     fn cellAt(self: *Pane, x: f64, y: f64) struct { row: i32, col: i32 } {
@@ -170,6 +202,12 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, _: ?*anyopaque) callconv(.c) 
     // M4 will only redraw on dirty.
     c.gtk_widget_queue_draw(area);
     return 1; // G_SOURCE_CONTINUE
+}
+
+fn paneMenuSink(ctx: ?*anyopaque, action: menu.Action) void {
+    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    if (self.handleMenuLocal(action)) return;
+    if (self.menu_sink) |f| f(self.menu_sink_ctx, action);
 }
 
 fn onDragBegin(_: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {

@@ -83,6 +83,10 @@ pub const Window = struct {
             ictx.shortcut_ctx = @ptrCast(self);
         }
 
+        // Wire context menu sink so split/new-tab/etc dispatch here.
+        pane.menu_sink = onMenuAction;
+        pane.menu_sink_ctx = @ptrCast(self);
+
         const page = c.adw_tab_view_append(self.tab_view, pane.widget());
         c.adw_tab_page_set_title(page, title);
 
@@ -112,6 +116,21 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .close_tab => self.closeCurrentTab(),
         .next_tab => self.nextTab(),
         .prev_tab => self.prevTab(),
+        else => {},
+    }
+}
+
+fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
+    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    switch (action) {
+        .new_tab => self.newShellTab("shell") catch {},
+        .close_tab => self.closeCurrentTab(),
+        .rename_tab => {
+            // TODO: show GtkPopover with GtkEntry. Stub for now.
+        },
+        .split_h, .split_v, .close_pane => {
+            // TODO: M7 implements splits. Stub.
+        },
         else => {},
     }
 }
