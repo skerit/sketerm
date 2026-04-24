@@ -51,6 +51,16 @@ pub const Screen = struct {
     autowrap: bool = true,
     origin_mode: bool = false,
     insert_mode: bool = false,
+    /// DECSET 2004 — bracketed paste.
+    bracketed_paste: bool = false,
+    /// DECSET 1004 — focus reporting.
+    focus_reports: bool = false,
+    /// DECSET 25 — cursor visibility.
+    cursor_visible: bool = true,
+    /// Mouse mode (1000/1002/1003) — last-set value.
+    mouse_mode: u16 = 0,
+    /// Mouse encoding (1006/1015 etc).
+    mouse_sgr: bool = false,
 
     /// Pending wrap: cursor "logically" past col cols-1, awaiting
     /// next print to actually wrap. Matches xterm semantics.
@@ -61,6 +71,18 @@ pub const Screen = struct {
 
     pool: *Pool,
     allocator: std.mem.Allocator,
+
+    /// Side-effect sink — optional callbacks invoked by apply.
+    sink: Sink = .{},
+
+    pub const Sink = struct {
+        ctx: ?*anyopaque = null,
+        on_title: ?*const fn (ctx: ?*anyopaque, title: []const u8) void = null,
+        on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
+        on_write_pty: ?*const fn (ctx: ?*anyopaque, bytes: []const u8) void = null,
+        on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+        on_cwd: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
+    };
 
     pub fn init(allocator: std.mem.Allocator, pool: *Pool, cols: u16, rows: u16) !*Screen {
         const self = try allocator.create(Screen);
@@ -120,10 +142,43 @@ pub const Screen = struct {
             .execute => |b| self.execute(b),
             .csi => |c_csi| self.csi(c_csi),
             .esc_final => |ef| self.escFinal(ef),
-            .osc => {}, // wired in M5
-            .apc => {},
+            .osc => |osc| self.onOsc(osc.bytes),
+            .apc => {}, // wired in M9 (Kitty graphics)
             .dcs_start, .dcs_data, .dcs_end => {}, // wired in M9
             .child_eof => {},
+        }
+    }
+
+    fn onOsc(self: *Screen, bytes: []const u8) void {
+        // Format: "<num>;<rest>".
+        const semi = std.mem.indexOfScalar(u8, bytes, ';') orelse return;
+        const num_str = bytes[0..semi];
+        const rest = bytes[semi + 1 ..];
+        const num = std.fmt.parseInt(u32, num_str, 10) catch return;
+
+        switch (num) {
+            0, 2 => {
+                if (self.sink.on_title) |f| f(self.sink.ctx, rest);
+            },
+            7 => {
+                if (self.sink.on_cwd) |f| f(self.sink.ctx, rest);
+            },
+            52 => {
+                // OSC 52 — `Pc;Pd` where Pc is selection (c=clipboard,
+                // p=primary, etc) and Pd is base64-encoded text or '?'.
+                const semi2 = std.mem.indexOfScalar(u8, rest, ';') orelse return;
+                const data = rest[semi2 + 1 ..];
+                if (data.len == 0) return;
+                if (data[0] == '?') return; // read query — gated, post-v1
+                if (data.len > 1_500_000) return; // 1 MB cap (after base64 expansion)
+                const decoder = std.base64.standard.Decoder;
+                const out_len = decoder.calcSizeForSlice(data) catch return;
+                const out = self.allocator.alloc(u8, out_len) catch return;
+                defer self.allocator.free(out);
+                decoder.decode(out, data) catch return;
+                if (self.sink.on_clipboard_set) |f| f(self.sink.ctx, out);
+            },
+            else => {},
         }
     }
 
@@ -255,8 +310,61 @@ pub const Screen = struct {
             // SGR.
             'm' => self.sgr(params),
 
+            // Device status report.
+            'n' => self.dsr(params),
+            // Primary device attributes.
+            'c' => self.respondDa(),
+            // Window manipulation reports.
+            't' => self.windowOps(params),
+
             else => {},
         }
+    }
+
+    fn dsr(self: *Screen, params: Event.Csi) void {
+        const arg = params.paramOrDefault(0, 0);
+        switch (arg) {
+            5 => self.respond("\x1b[0n"), // OK
+            6 => {
+                var resp_buf: [32]u8 = undefined;
+                const s = std.fmt.bufPrint(&resp_buf, "\x1b[{d};{d}R", .{ self.row + 1, self.col + 1 }) catch return;
+                self.respond(s);
+            },
+            else => {},
+        }
+    }
+
+    fn respondDa(self: *Screen) void {
+        // VT220 + ANSI color (62=VT220, 22=color)
+        self.respond("\x1b[?62;22c");
+    }
+
+    fn windowOps(self: *Screen, params: Event.Csi) void {
+        const arg = params.paramOrDefault(0, 0);
+        var resp_buf: [32]u8 = undefined;
+        switch (arg) {
+            14 => {
+                // Pixels — we don't know exact pixel size, approximate
+                // via cell metrics * cols/rows. v1: report grid * 8/16.
+                const w: u32 = @as(u32, self.cols) * 8;
+                const h: u32 = @as(u32, self.rows) * 16;
+                const s = std.fmt.bufPrint(&resp_buf, "\x1b[4;{d};{d}t", .{ h, w }) catch return;
+                self.respond(s);
+            },
+            18 => {
+                const s = std.fmt.bufPrint(&resp_buf, "\x1b[8;{d};{d}t", .{ self.rows, self.cols }) catch return;
+                self.respond(s);
+            },
+            19 => {
+                const s = std.fmt.bufPrint(&resp_buf, "\x1b[9;{d};{d}t", .{ self.rows, self.cols }) catch return;
+                self.respond(s);
+            },
+            else => {},
+        }
+    }
+
+    fn respond(self: *Screen, bytes: []const u8) void {
+        if (self.sink.on_write_pty) |f| f(self.sink.ctx, bytes);
     }
 
     fn escFinal(self: *Screen, ef: Event.EscFinal) void {
@@ -510,9 +618,14 @@ pub const Screen = struct {
                     self.pending_wrap = false;
                 },
                 7 => self.autowrap = set,
-                25 => {}, // cursor visibility — track later
-                1049 => self.toggleAltScreen(set),
-                1047 => self.toggleAltScreen(set),
+                25 => self.cursor_visible = set,
+                1000 => self.mouse_mode = if (set) 1000 else 0,
+                1002 => self.mouse_mode = if (set) 1002 else 0,
+                1003 => self.mouse_mode = if (set) 1003 else 0,
+                1004 => self.focus_reports = set,
+                1006 => self.mouse_sgr = set,
+                1047, 1049 => self.toggleAltScreen(set),
+                2004 => self.bracketed_paste = set,
                 else => {},
             }
         }

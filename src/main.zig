@@ -17,7 +17,30 @@ const App = struct {
     allocator: std.mem.Allocator,
     terminal: ?*Terminal = null,
     pane: ?*Pane = null,
+    window: ?*c.GtkWidget = null,
+    title_buf: [256]u8 = undefined,
 };
+
+fn onTitle(ctx: ?*anyopaque, title: []const u8) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const window = app.window orelse return;
+    const n = @min(title.len, app.title_buf.len - 1);
+    @memcpy(app.title_buf[0..n], title[0..n]);
+    app.title_buf[n] = 0;
+    c.gtk_window_set_title(@ptrCast(window), @ptrCast(&app.title_buf));
+}
+
+fn onClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const window = app.window orelse return;
+    const display = c.gtk_widget_get_display(window);
+    const clip = c.gdk_display_get_clipboard(display);
+    // Allocate null-terminated copy.
+    const cstr = app.allocator.allocSentinel(u8, text.len, 0) catch return;
+    defer app.allocator.free(cstr);
+    @memcpy(cstr, text);
+    c.gdk_clipboard_set_text(clip, cstr.ptr);
+}
 
 var g_app: App = undefined;
 
@@ -95,6 +118,12 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         return;
     };
     g_app.terminal = term;
+
+    // Wire title and clipboard callbacks.
+    g_app.window = window;
+    term.user_ctx = @ptrCast(&g_app);
+    term.on_title = onTitle;
+    term.on_clipboard_set = onClipboardSet;
 
     const pane = Pane.init(g_app.allocator, term) catch |err| {
         std.debug.print("sketerm: pane init failed: {s}\n", .{@errorName(err)});

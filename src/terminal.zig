@@ -32,6 +32,12 @@ pub const Terminal = struct {
     pool: Pool,
     screen: *Screen,
 
+    /// User-level callbacks (e.g. wired by main.zig to GTK).
+    user_ctx: ?*anyopaque = null,
+    on_title: ?*const fn (ctx: ?*anyopaque, title: []const u8) void = null,
+    on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+    on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
+
     /// If true, drain prints events to stderr. M1 debug aid.
     debug_to_stderr: bool = false,
 
@@ -71,11 +77,46 @@ pub const Terminal = struct {
             .pool = pool,
             .screen = screen,
         };
-        // Now that the Terminal exists, point Screen at our pool.
+        // Now that the Terminal exists, point Screen at our pool +
+        // wire the side-effect sink.
         self.screen.pool = &self.pool;
+        self.screen.sink = .{
+            .ctx = @ptrCast(self),
+            .on_title = sinkTitle,
+            .on_bell = sinkBell,
+            .on_write_pty = sinkWritePty,
+            .on_clipboard_set = sinkClipboard,
+            .on_cwd = sinkCwd,
+        };
 
         self.worker_thread = try std.Thread.spawn(.{}, workerMain, .{self});
         return self;
+    }
+
+    fn sinkTitle(ctx: ?*anyopaque, title: []const u8) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_title) |f| f(self.user_ctx, title);
+    }
+
+    fn sinkBell(ctx: ?*anyopaque) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_bell) |f| f(self.user_ctx);
+    }
+
+    fn sinkWritePty(ctx: ?*anyopaque, bytes: []const u8) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        _ = self.pty.writeAll(bytes);
+    }
+
+    fn sinkClipboard(ctx: ?*anyopaque, text: []const u8) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_clipboard_set) |f| f(self.user_ctx, text);
+    }
+
+    fn sinkCwd(ctx: ?*anyopaque, cwd: []const u8) void {
+        _ = ctx;
+        _ = cwd;
+        // Stored on Terminal for later layout-save use; v1 stub.
     }
 
     pub fn deinit(self: *Terminal) void {
