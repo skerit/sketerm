@@ -1,0 +1,210 @@
+//! Composes pty + parser + ring + worker thread for one pane.
+//!
+//! Lifecycle: `init` spawns the worker thread and starts reading
+//! from the PTY master fd. Events flow through the SPSC ring; the
+//! main thread drains them via `g_main_context_invoke` (coalesced
+//! by `drain_pending`). `deinit` joins the worker and reaps the
+//! child.
+
+const std = @import("std");
+const c = @import("c.zig").c;
+const Parser = @import("parser/vt.zig").Parser;
+const Event = @import("parser/event.zig").Event;
+const ring_mod = @import("util/ring.zig");
+const Pty = @import("pty.zig").Pty;
+
+pub const RING_CAP: usize = 4096; // power-of-2; one event per slot
+
+pub const EventRing = ring_mod.Ring(Event, RING_CAP);
+
+pub const Terminal = struct {
+    pty: Pty,
+    parser: Parser,
+    ring: *EventRing,
+    worker_thread: std.Thread,
+    shutdown_fd: c_int,
+    drain_pending: std.atomic.Value(bool),
+    allocator: std.mem.Allocator,
+
+    /// If true, drain prints events to stderr. M1 debug aid.
+    debug_to_stderr: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator, pty: Pty) !*Terminal {
+        const self = try allocator.create(Terminal);
+        errdefer allocator.destroy(self);
+
+        const ring = try allocator.create(EventRing);
+        errdefer allocator.destroy(ring);
+        ring.* = .{};
+
+        const efd = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
+        if (efd < 0) return error.EventFd;
+        errdefer _ = c.close(efd);
+
+        self.* = .{
+            .pty = pty,
+            .parser = Parser.init(allocator),
+            .ring = ring,
+            .worker_thread = undefined,
+            .shutdown_fd = efd,
+            .drain_pending = std.atomic.Value(bool).init(false),
+            .allocator = allocator,
+        };
+
+        self.worker_thread = try std.Thread.spawn(.{}, workerMain, .{self});
+        return self;
+    }
+
+    pub fn deinit(self: *Terminal) void {
+        // Signal worker.
+        const one: u64 = 1;
+        _ = c.write(self.shutdown_fd, &one, 8);
+        self.worker_thread.join();
+
+        _ = c.close(self.shutdown_fd);
+        self.pty.closeAndReap();
+
+        // Drain remaining events to free their owned payloads.
+        while (self.ring.pop()) |ev| {
+            var mut_ev = ev;
+            mut_ev.deinit(self.allocator);
+        }
+
+        self.parser.deinit();
+        self.allocator.destroy(self.ring);
+        self.allocator.destroy(self);
+    }
+
+    fn workerMain(self: *Terminal) void {
+        // Block SIGCHLD; only main thread handles it.
+        var set: c.sigset_t = undefined;
+        _ = c.sigemptyset(&set);
+        _ = c.sigaddset(&set, c.SIGCHLD);
+        _ = c.pthread_sigmask(c.SIG_BLOCK, &set, null);
+
+        var pfds = [_]c.struct_pollfd{
+            .{ .fd = self.pty.master_fd, .events = c.POLLIN, .revents = 0 },
+            .{ .fd = self.shutdown_fd, .events = c.POLLIN, .revents = 0 },
+        };
+
+        while (true) {
+            const n = c.poll(&pfds, pfds.len, -1);
+            if (n < 0) break;
+
+            // Shutdown event takes priority.
+            if (pfds[1].revents & c.POLLIN != 0) break;
+
+            if (pfds[0].revents & c.POLLIN != 0) {
+                var buf: [16384]u8 = undefined;
+                const r = c.read(self.pty.master_fd, &buf, buf.len);
+                if (r <= 0) {
+                    self.pushSpinning(.{ .child_eof = 0 });
+                    self.scheduleDrain();
+                    break;
+                }
+                self.parser.advance(buf[0..@intCast(r)], emitFromWorker, @ptrCast(self));
+                self.scheduleDrain();
+            }
+
+            if (pfds[0].revents & (c.POLLHUP | c.POLLERR) != 0) {
+                self.pushSpinning(.{ .child_eof = 0 });
+                self.scheduleDrain();
+                break;
+            }
+        }
+    }
+
+    fn emitFromWorker(ctx: ?*anyopaque, ev: Event) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        self.pushSpinning(ev);
+    }
+
+    fn pushSpinning(self: *Terminal, ev: Event) void {
+        // If ring is full, yield until space appears (back-pressure).
+        var attempts: u32 = 0;
+        while (!self.ring.push(ev)) {
+            attempts +%= 1;
+            if (attempts & 0x3FF == 0) {
+                std.Thread.yield() catch {};
+            } else {
+                std.atomic.spinLoopHint();
+            }
+        }
+    }
+
+    fn scheduleDrain(self: *Terminal) void {
+        const was_pending = self.drain_pending.swap(true, .acq_rel);
+        if (!was_pending) {
+            _ = c.g_main_context_invoke(null, mainDrain, @ptrCast(self));
+        }
+    }
+
+    fn mainDrain(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *Terminal = @ptrCast(@alignCast(user.?));
+        // Reset BEFORE draining: if worker pushes during drain it
+        // will reschedule us on the next batch.
+        self.drain_pending.store(false, .release);
+
+        var stderr_buf: [4096]u8 = undefined;
+        var stderr_writer: ?std.fs.File.Writer = if (self.debug_to_stderr)
+            std.fs.File.stderr().writer(&stderr_buf)
+        else
+            null;
+
+        while (self.ring.pop()) |ev| {
+            var mut_ev = ev;
+            if (stderr_writer) |*w| {
+                debugFormatEvent(&w.interface, ev) catch {};
+            }
+            mut_ev.deinit(self.allocator);
+        }
+
+        if (stderr_writer) |*w| {
+            w.interface.flush() catch {};
+        }
+
+        return @intFromBool(false); // G_SOURCE_REMOVE
+    }
+};
+
+fn debugFormatEvent(w: *std.io.Writer, ev: Event) !void {
+    switch (ev) {
+        .print => |cp| try w.print("U+{X:0>4} ", .{cp}),
+        .print_byte => |b| {
+            if (b >= 0x20 and b < 0x7F) {
+                try w.print("{c}", .{b});
+            } else {
+                try w.print("\\x{x:0>2}", .{b});
+            }
+        },
+        .execute => |b| {
+            switch (b) {
+                '\r' => try w.print("[CR]", .{}),
+                '\n' => try w.print("[LF]\n", .{}),
+                '\t' => try w.print("[TAB]", .{}),
+                0x08 => try w.print("[BS]", .{}),
+                0x07 => try w.print("[BEL]", .{}),
+                else => try w.print("[exec 0x{x:0>2}]", .{b}),
+            }
+        },
+        .csi => |csi| {
+            try w.print("«CSI", .{});
+            if (csi.private != 0) try w.print(" {c}", .{csi.private});
+            if (csi.n_params > 0) {
+                try w.print(" ", .{});
+                for (csi.params[0..csi.n_params], 0..) |p, i| {
+                    if (i > 0) try w.print(";", .{});
+                    try w.print("{d}", .{p});
+                }
+            }
+            try w.print(" {c}»", .{csi.final});
+        },
+        .esc_final => |ef| try w.print("«ESC {c}»", .{ef.final}),
+        .osc => |o| try w.print("«OSC {s}»", .{o.bytes}),
+        .apc => |a| try w.print("«APC {s}»", .{a.bytes}),
+        .dcs_start => |d| try w.print("«DCS-start {c}»", .{d.final}),
+        .dcs_data => try w.print("«DCS-data»", .{}),
+        .dcs_end => try w.print("«DCS-end»", .{}),
+        .child_eof => |s| try w.print("\n«child-eof status={d}»\n", .{s}),
+    }
+}
