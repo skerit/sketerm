@@ -40,10 +40,10 @@ fn onPasteRead(source: ?*c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) 
     const len = std.mem.len(cstr);
     if (len == 0) return;
 
-    // TODO: only wrap when mode 2004 is enabled. v1 always wraps.
-    _ = term.pty.writeAll("\x1b[200~");
+    // Wrap with bracketed-paste markers only when mode 2004 enabled.
+    if (term.screen.bracketed_paste) _ = term.pty.writeAll("\x1b[200~");
     _ = term.pty.writeAll(cstr[0..len]);
-    _ = term.pty.writeAll("\x1b[201~");
+    if (term.screen.bracketed_paste) _ = term.pty.writeAll("\x1b[201~");
 }
 
 pub fn copyToClipboard(widget: *c.GtkWidget, text: [:0]const u8) void {

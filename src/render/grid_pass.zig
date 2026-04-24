@@ -170,6 +170,22 @@ pub const GridPass = struct {
                 }
             }
         }
+
+        // Cursor — draw last (overlay).
+        if (screen.cursor_visible and screen.row < screen.rows and screen.col < screen.cols) {
+            const cx: f32 = @as(f32, @floatFromInt(screen.col)) * cw;
+            const cy: f32 = @as(f32, @floatFromInt(screen.row)) * ch;
+            const cursor_color = self.default_fg;
+            // Block cursor by default. Half-alpha to show glyph through.
+            try self.pushQuad(
+                .{ cx, cy },
+                .{ cw, ch },
+                .{ 0, 0 },
+                .{ 0, 0 },
+                .{ cursor_color[0], cursor_color[1], cursor_color[2], 0.55 },
+                0.0,
+            );
+        }
     }
 
     fn pushQuad(
