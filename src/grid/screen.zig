@@ -30,6 +30,14 @@ pub const Screen = struct {
     alt: ?[]Line = null,
     use_alt: bool = false,
 
+    /// Scrollback ring — receives lines scrolled off the top of the
+    /// main screen. Capped at `scrollback_capacity`. Older entries
+    /// are evicted when full.
+    scrollback: std.ArrayList(Line) = .{},
+    scrollback_capacity: usize = 10_000,
+    /// Rendering offset (0 = bottom, > 0 = scrolled up by N lines).
+    view_offset: u32 = 0,
+
     /// Cursor position, 0-indexed.
     row: u16 = 0,
     col: u16 = 0,
@@ -118,7 +126,33 @@ pub const Screen = struct {
             }
             self.allocator.free(alt);
         }
+        for (self.scrollback.items) |*l| l.deinit(self.allocator);
+        self.scrollback.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    /// Push a line into scrollback. Caller transfers ownership of
+    /// the cells slice. Evicts oldest if cap exceeded.
+    fn pushScrollback(self: *Screen, cells: []Cell) void {
+        if (self.scrollback.items.len >= self.scrollback_capacity) {
+            // Evict oldest.
+            var old = self.scrollback.orderedRemove(0);
+            old.deinit(self.allocator);
+        }
+        self.scrollback.append(self.allocator, .{ .cells = cells }) catch {
+            // On OOM, just drop the line (free it).
+            self.allocator.free(cells);
+        };
+    }
+
+    /// Number of scrollback lines currently held.
+    pub fn scrollbackCount(self: *const Screen) u32 {
+        return @intCast(self.scrollback.items.len);
+    }
+
+    /// Get a scrollback line by offset-from-top. 0 = oldest.
+    pub fn scrollbackLine(self: *const Screen, idx: u32) *const Line {
+        return &self.scrollback.items[idx];
     }
 
     fn buf(self: *Screen) []Line {
@@ -500,14 +534,28 @@ pub const Screen = struct {
         const move: u16 = @intCast(@min(n, @as(u32, region)));
         const lines = self.buf();
 
+        // Push scrolled-out lines into scrollback (only when on main
+        // screen and scrolling at the actual top).
+        const push_to_sb = !self.use_alt and self.scroll_top == 0;
+
         if (move < region) {
-            // Rotate cell-pointers: top `move` go to bottom (cleared);
-            // middle shifts up. Avoids struct-copying Line (which would
-            // alias cells slices and leak / corrupt).
+            // Rotate cell-pointers: top `move` go to bottom (cleared
+            // or pushed to scrollback first).
             var stash = self.allocator.alloc([]Cell, move) catch return;
             defer self.allocator.free(stash);
             var i: u16 = 0;
             while (i < move) : (i += 1) stash[i] = lines[self.scroll_top + i].cells;
+
+            if (push_to_sb) {
+                // Push a *copy* of each scrolled line to scrollback so
+                // the original cell buffer can stay in the rotation.
+                var k: u16 = 0;
+                while (k < move) : (k += 1) {
+                    const copy = self.allocator.dupe(Cell, stash[k]) catch break;
+                    self.pushScrollback(copy);
+                }
+            }
+
             i = 0;
             while (i + move <= self.scroll_bot - self.scroll_top) : (i += 1) {
                 lines[self.scroll_top + i].cells = lines[self.scroll_top + i + move].cells;
@@ -522,6 +570,13 @@ pub const Screen = struct {
             }
         } else {
             // Entire region scrolled.
+            if (push_to_sb) {
+                var i: u16 = 0;
+                while (i < region) : (i += 1) {
+                    const copy = self.allocator.dupe(Cell, lines[self.scroll_top + i].cells) catch break;
+                    self.pushScrollback(copy);
+                }
+            }
             var i: u16 = self.scroll_top;
             while (i <= self.scroll_bot) : (i += 1) {
                 @memset(lines[i].cells, .{});
