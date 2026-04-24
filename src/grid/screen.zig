@@ -266,10 +266,39 @@ pub const Screen = struct {
             .csi => |c_csi| self.csi(c_csi),
             .esc_final => |ef| self.escFinal(ef),
             .osc => |osc| self.onOsc(osc.bytes),
-            .apc => {}, // wired in M9 (Kitty graphics)
+            .apc => |apc| self.onApc(apc.bytes),
             .dcs => |d| self.onDcs(d),
             .dcs_start, .dcs_data, .dcs_end => {}, // legacy stubs
             .child_eof => |status| self.onChildEof(status),
+        }
+    }
+
+    fn onApc(self: *Screen, body: []const u8) void {
+        // Kitty graphics protocol: APC G=...
+        if (body.len < 1 or body[0] != 'G') return;
+        const kitty = @import("../parser/kitty_image.zig");
+        const cmd = kitty.parse(body) catch return;
+        // v1: just notify the sink with raw cmd via the existing image
+        // event when we have RGBA. For format=32 (RGBA), payload IS
+        // the raw pixels (after base64+optional zlib).
+        if (cmd.action == .transmit_and_place and cmd.format == 32 and
+            cmd.compression == 0 and cmd.width > 0 and cmd.height > 0)
+        {
+            // Decode base64 payload.
+            const decoder = std.base64.standard.Decoder;
+            const out_len = decoder.calcSizeForSlice(cmd.payload) catch return;
+            const expected = cmd.width * cmd.height * 4;
+            if (out_len < expected) return;
+            const decode_buf = self.allocator.alloc(u8, out_len) catch return;
+            defer self.allocator.free(decode_buf);
+            decoder.decode(decode_buf, cmd.payload) catch return;
+            if (self.sink.on_image) |f| f(self.sink.ctx, .{
+                .width = cmd.width,
+                .height = cmd.height,
+                .rgba = decode_buf[0..expected],
+                .row = self.row,
+                .col = self.col,
+            });
         }
     }
 

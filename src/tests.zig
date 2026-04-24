@@ -16,6 +16,8 @@ comptime {
     _ = @import("grid/selection.zig");
     _ = @import("layout.zig");
     _ = @import("parser/sixel.zig");
+    _ = @import("parser/iterm_image.zig");
+    _ = @import("parser/kitty_image.zig");
 }
 
 test {
