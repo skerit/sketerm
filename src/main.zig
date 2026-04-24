@@ -9,6 +9,8 @@ const APP_ID: [*:0]const u8 = "dev.sker.sketerm";
 const App = struct {
     allocator: std.mem.Allocator,
     window: ?*Window = null,
+    restore: bool = false,
+    layout_path: ?[]const u8 = null,
 };
 
 var g_app: App = undefined;
@@ -23,12 +25,25 @@ pub fn main() u8 {
     const argv = std.process.argsAlloc(allocator) catch return 1;
     defer std.process.argsFree(allocator, argv);
 
-    var c_argv = allocator.alloc(?[*:0]u8, argv.len + 1) catch return 1;
-    defer allocator.free(c_argv);
-    for (argv, 0..) |arg, i| c_argv[i] = @constCast(arg.ptr);
-    c_argv[argv.len] = null;
+    // Parse our own flags before handing to GTK (which would balk).
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (std.mem.eql(u8, a, "--restore")) {
+            g_app.restore = true;
+        } else if (std.mem.eql(u8, a, "--layout") and i + 1 < argv.len) {
+            i += 1;
+            g_app.layout_path = argv[i];
+        }
+    }
 
-    const argc: c_int = @intCast(argv.len);
+    // GTK gets argv[0] only (our flags would confuse it).
+    var c_argv = allocator.alloc(?[*:0]u8, 2) catch return 1;
+    defer allocator.free(c_argv);
+    c_argv[0] = @constCast(argv[0].ptr);
+    c_argv[1] = null;
+
+    const argc: c_int = 1;
     const argv_ptr: [*c][*c]u8 = @ptrCast(c_argv.ptr);
 
     const app = c.adw_application_new(APP_ID, c.G_APPLICATION_DEFAULT_FLAGS);
@@ -62,10 +77,19 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     };
     g_app.window = window;
 
-    window.newShellTab("shell") catch |err| {
-        std.debug.print("sketerm: spawn first tab failed: {s}\n", .{@errorName(err)});
-        return;
-    };
+    var loaded = false;
+    if (g_app.layout_path) |path| {
+        loaded = window.loadLayoutFromPath(path) catch false;
+    } else if (g_app.restore) {
+        loaded = window.loadLayoutDefault() catch false;
+    }
+
+    if (!loaded) {
+        window.newShellTab("shell") catch |err| {
+            std.debug.print("sketerm: spawn first tab failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+    }
 
     window.present();
 }

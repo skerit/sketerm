@@ -62,37 +62,104 @@ pub const Window = struct {
         const shell_env = c.getenv("SHELL");
         const shell: [*:0]const u8 = if (shell_env != null) @ptrCast(shell_env) else "/bin/bash";
         const argv = [_][*:0]const u8{shell};
+        try self.addTabInternal(title, &argv, null);
+    }
 
-        const pty = try Pty.spawn(.{ .argv = &argv, .rows = 24, .cols = 80 });
+    /// Spawn a new tab from a layout TabSpec (used on --restore).
+    pub fn newTabFromSpec(self: *Window, spec: @import("../layout.zig").TabSpec) !void {
+        if (spec.command.len == 0) return error.EmptyCommand;
+
+        // Allocate null-terminated argv strings.
+        var argv_buf = try self.allocator.alloc([*:0]const u8, spec.command.len);
+        defer self.allocator.free(argv_buf);
+        var arg_owners: std.ArrayList([:0]u8) = .{};
+        defer {
+            for (arg_owners.items) |s| self.allocator.free(s);
+            arg_owners.deinit(self.allocator);
+        }
+        for (spec.command, 0..) |cmd, i| {
+            const z = try self.allocator.allocSentinel(u8, cmd.len, 0);
+            try arg_owners.append(self.allocator, z);
+            @memcpy(z, cmd);
+            argv_buf[i] = z.ptr;
+        }
+
+        const title_z = try self.allocator.allocSentinel(u8, spec.title.len, 0);
+        defer self.allocator.free(title_z);
+        @memcpy(title_z, spec.title);
+
+        try self.addTabInternal(title_z, argv_buf, spec.cwd);
+    }
+
+    fn addTabInternal(
+        self: *Window,
+        title_z: [*:0]const u8,
+        argv: []const [*:0]const u8,
+        cwd: ?[]const u8,
+    ) !void {
+        const pty = try Pty.spawn(.{
+            .argv = argv,
+            .cwd = cwd,
+            .rows = 24,
+            .cols = 80,
+        });
         errdefer pty.closeAndReap();
 
         const term = try Terminal.init(self.allocator, pty, 80, 24);
         errdefer term.deinit();
 
-        // Wire title sink to update the active tab's title (sticky:
-        // only fired by OSC if no manual rename has overridden).
         term.user_ctx = @ptrCast(self);
         term.on_clipboard_set = onTermClipboardSet;
-        // Title is intentionally NOT auto-bound to tab title — tab
-        // titles in sketerm are stable and user-set per plan.
 
         const pane = try Pane.init(self.allocator, term);
 
-        // Wire shortcut sink so Ctrl+Shift+T etc. dispatch here.
         if (pane.input_ctx) |ictx| {
             ictx.shortcut_sink = onShortcut;
             ictx.shortcut_ctx = @ptrCast(self);
         }
-
-        // Wire context menu sink so split/new-tab/etc dispatch here.
         pane.menu_sink = onMenuAction;
         pane.menu_sink_ctx = @ptrCast(self);
 
         const page = c.adw_tab_view_append(self.tab_view, pane.widget());
-        c.adw_tab_page_set_title(page, title);
+        c.adw_tab_page_set_title(page, title_z);
 
         try self.panes.append(self.allocator, pane);
         try self.terminals.append(self.allocator, term);
+    }
+
+    /// Load the default last.json and rebuild tabs from it.
+    pub fn loadLayoutDefault(self: *Window) !bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const path = try layout_mod.defaultSavePath(arena);
+        var parsed = layout_mod.load(self.allocator, path) catch |err| {
+            std.debug.print("sketerm: cannot load layout from {s}: {s}\n", .{ path, @errorName(err) });
+            return false;
+        };
+        defer parsed.deinit();
+
+        for (parsed.value.tabs) |tab| {
+            self.newTabFromSpec(tab) catch |err| {
+                std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
+            };
+        }
+        return true;
+    }
+
+    pub fn loadLayoutFromPath(self: *Window, path: []const u8) !bool {
+        var parsed = layout_mod.load(self.allocator, path) catch |err| {
+            std.debug.print("sketerm: cannot load layout from {s}: {s}\n", .{ path, @errorName(err) });
+            return false;
+        };
+        defer parsed.deinit();
+        for (parsed.value.tabs) |tab| {
+            self.newTabFromSpec(tab) catch |err| {
+                std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
+            };
+        }
+        return true;
     }
 
     pub fn closeCurrentTab(self: *Window) void {
