@@ -77,6 +77,9 @@ pub const Screen = struct {
     /// UTF-8 reassembly for `print_byte` events.
     decoder: utf8.Decoder = .{},
 
+    /// Set on any state change; cleared by the renderer after using.
+    dirty: bool = true,
+
     /// Selection (mouse drag).
     selection: @import("selection.zig").Selection = .{},
 
@@ -233,6 +236,7 @@ pub const Screen = struct {
     // ── Apply parser events ──────────────────────────────────────
 
     pub fn apply(self: *Screen, ev: Event) void {
+        self.dirty = true;
         switch (ev) {
             .print => |cp| self.printCp(cp),
             .print_byte => |b| self.printByte(b),

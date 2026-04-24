@@ -197,10 +197,13 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     return @intFromBool(true);
 }
 
-fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, _: ?*anyopaque) callconv(.c) c.gboolean {
-    // Force redraw every frame for now; M3 baseline.
-    // M4 will only redraw on dirty.
-    c.gtk_widget_queue_draw(area);
+fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {
+    // Redraw only when the screen state changed.
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+    if (self.terminal.screen.dirty) {
+        self.terminal.screen.dirty = false;
+        c.gtk_widget_queue_draw(area);
+    }
     return 1; // G_SOURCE_CONTINUE
 }
 
