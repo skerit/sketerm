@@ -33,7 +33,12 @@ pub fn main() u8 {
     const argv = [_][*:0]const u8{
         "/bin/bash",
         "-c",
-        "echo 'Hello sketerm'; echo 'one two three'; printf 'a\\nb\\nc\\n'; pwd",
+        // Mixes plain output, ANSI colors, OSC title, cursor moves.
+        "printf '\\033]0;sketerm smoke\\007'; " ++
+        "echo Hello, $USER; " ++
+        "printf '\\033[31mred\\033[0m \\033[32mgreen\\033[0m \\033[34mblue\\033[0m\\n'; " ++
+        "printf '\\033[1;1Hcols=%d rows=%d\\n' $(tput cols) $(tput lines); " ++
+        "ls /usr/share/fonts/TTF | head -3",
     };
     const pty = Pty.spawn(.{ .argv = &argv, .rows = 24, .cols = 80 }) catch return 1;
     defer pty.closeAndReap();
