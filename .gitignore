@@ -1,0 +1,11 @@
+zig-out/
+zig-cache/
+.zig-cache/
+*.o
+*.so
+*.a
+core
+core.*
+*.swp
+*.bak
+.DS_Store
