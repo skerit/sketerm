@@ -15,6 +15,8 @@ pub const Ctx = struct {
     /// for top-level shortcuts handled elsewhere.
     shortcut_sink: ?*const fn (ctx: ?*anyopaque, action: Action) void = null,
     shortcut_ctx: ?*anyopaque = null,
+    /// Input method for IME composition (fcitx5 / ibus).
+    im_ctx: ?*c.GtkIMContext = null,
 };
 
 pub const Action = enum {
@@ -32,6 +34,19 @@ pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allo
     const ctx = try allocator.create(Ctx);
     ctx.* = .{ .widget = widget, .terminal = terminal };
 
+    // IME: GtkIMMulticontext routes through fcitx5/ibus on Linux.
+    const im = c.gtk_im_multicontext_new();
+    c.gtk_im_context_set_client_widget(@ptrCast(im), widget);
+    _ = c.g_signal_connect_data(
+        im,
+        "commit",
+        @ptrCast(&onImCommit),
+        @ptrCast(ctx),
+        null,
+        c.G_CONNECT_DEFAULT,
+    );
+    ctx.im_ctx = @ptrCast(im);
+
     const ctrl = c.gtk_event_controller_key_new();
     _ = c.g_signal_connect_data(
         ctrl,
@@ -48,14 +63,29 @@ pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allo
     return ctx;
 }
 
+fn onImCommit(_: *c.GtkIMContext, text: [*:0]const u8, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const len = std.mem.len(text);
+    if (len > 0) _ = ctx.terminal.pty.writeAll(text[0..len]);
+}
+
 fn onKeyPressed(
-    _: *c.GtkEventControllerKey,
+    controller: *c.GtkEventControllerKey,
     keyval: c_uint,
     _: c_uint,
     state: c.GdkModifierType,
     user: ?*anyopaque,
 ) callconv(.c) c.gboolean {
     const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+
+    // Let IME consume the key first (CJK composition).
+    if (ctx.im_ctx) |im| {
+        const event = c.gtk_event_controller_get_current_event(@ptrCast(controller));
+        if (event != null and c.gtk_im_context_filter_keypress(im, @ptrCast(event)) != 0) {
+            return 1;
+        }
+    }
+
     const ctrl_pressed = (state & c.GDK_CONTROL_MASK) != 0;
     const shift_pressed = (state & c.GDK_SHIFT_MASK) != 0;
 
