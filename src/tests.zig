@@ -10,6 +10,9 @@ comptime {
     _ = @import("util/utf8.zig");
     _ = @import("parser/event.zig");
     _ = @import("parser/vt.zig");
+    _ = @import("grid/cell.zig");
+    _ = @import("grid/style_pool.zig");
+    _ = @import("grid/screen.zig");
 }
 
 test {

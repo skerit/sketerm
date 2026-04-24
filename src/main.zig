@@ -81,7 +81,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         return;
     };
 
-    const term = Terminal.init(g_app.allocator, pty) catch |err| {
+    const term = Terminal.init(g_app.allocator, pty, 80, 24) catch |err| {
         std.debug.print("sketerm: terminal init failed: {s}\n", .{@errorName(err)});
         return;
     };

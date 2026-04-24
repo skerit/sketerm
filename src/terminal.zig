@@ -12,6 +12,8 @@ const Parser = @import("parser/vt.zig").Parser;
 const Event = @import("parser/event.zig").Event;
 const ring_mod = @import("util/ring.zig");
 const Pty = @import("pty.zig").Pty;
+const Screen = @import("grid/screen.zig").Screen;
+const Pool = @import("grid/style_pool.zig").Pool;
 
 pub const RING_CAP: usize = 4096; // power-of-2; one event per slot
 
@@ -26,10 +28,19 @@ pub const Terminal = struct {
     drain_pending: std.atomic.Value(bool),
     allocator: std.mem.Allocator,
 
+    /// Style pool + Screen — main-thread state, mutated only in drain.
+    pool: Pool,
+    screen: *Screen,
+
     /// If true, drain prints events to stderr. M1 debug aid.
     debug_to_stderr: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, pty: Pty) !*Terminal {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        pty: Pty,
+        cols: u16,
+        rows: u16,
+    ) !*Terminal {
         const self = try allocator.create(Terminal);
         errdefer allocator.destroy(self);
 
@@ -41,6 +52,14 @@ pub const Terminal = struct {
         if (efd < 0) return error.EventFd;
         errdefer _ = c.close(efd);
 
+        var pool = try Pool.init(allocator);
+        errdefer pool.deinit();
+
+        const screen = try Screen.init(allocator, undefined, cols, rows);
+        // Screen.init takes a *Pool; we'll wire the real pointer below.
+        // (the field can be re-assigned safely before any apply runs.)
+        errdefer screen.deinit();
+
         self.* = .{
             .pty = pty,
             .parser = Parser.init(allocator),
@@ -49,7 +68,11 @@ pub const Terminal = struct {
             .shutdown_fd = efd,
             .drain_pending = std.atomic.Value(bool).init(false),
             .allocator = allocator,
+            .pool = pool,
+            .screen = screen,
         };
+        // Now that the Terminal exists, point Screen at our pool.
+        self.screen.pool = &self.pool;
 
         self.worker_thread = try std.Thread.spawn(.{}, workerMain, .{self});
         return self;
@@ -70,6 +93,8 @@ pub const Terminal = struct {
             mut_ev.deinit(self.allocator);
         }
 
+        self.screen.deinit();
+        self.pool.deinit();
         self.parser.deinit();
         self.allocator.destroy(self.ring);
         self.allocator.destroy(self);
@@ -156,6 +181,8 @@ pub const Terminal = struct {
             if (stderr_writer) |*w| {
                 debugFormatEvent(&w.interface, ev) catch {};
             }
+            // Apply to grid.
+            self.screen.apply(ev);
             mut_ev.deinit(self.allocator);
         }
 
