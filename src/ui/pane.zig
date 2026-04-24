@@ -12,6 +12,7 @@ const c = @import("../c.zig").c;
 const Atlas = @import("../render/atlas.zig").Atlas;
 const GridPass = @import("../render/grid_pass.zig").GridPass;
 const Terminal = @import("../terminal.zig").Terminal;
+const input = @import("input.zig");
 
 const FONT_PATH: [*:0]const u8 = "/usr/share/fonts/TTF/Hack-Regular.ttf";
 const FONT_SIZE: u16 = 14;
@@ -64,6 +65,9 @@ pub const Pane = struct {
             @ptrCast(self),
             null,
         );
+
+        // M4: keyboard input → PTY.
+        input.attach(area_widget, terminal);
 
         return self;
     }
