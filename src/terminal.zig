@@ -37,6 +37,7 @@ pub const Terminal = struct {
     on_title: ?*const fn (ctx: ?*anyopaque, title: []const u8) void = null,
     on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
+    on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
 
     /// If true, drain prints events to stderr. M1 debug aid.
     debug_to_stderr: bool = false,
@@ -87,6 +88,7 @@ pub const Terminal = struct {
             .on_write_pty = sinkWritePty,
             .on_clipboard_set = sinkClipboard,
             .on_cwd = sinkCwd,
+            .on_image = sinkImage,
         };
 
         self.worker_thread = try std.Thread.spawn(.{}, workerMain, .{self});
@@ -117,6 +119,11 @@ pub const Terminal = struct {
         _ = ctx;
         _ = cwd;
         // Stored on Terminal for later layout-save use; v1 stub.
+    }
+
+    fn sinkImage(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_image) |f| f(self.user_ctx, img);
     }
 
     pub fn deinit(self: *Terminal) void {

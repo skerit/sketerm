@@ -11,6 +11,9 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const Atlas = @import("../render/atlas.zig").Atlas;
 const GridPass = @import("../render/grid_pass.zig").GridPass;
+const ImagePass = @import("../render/image_pass.zig").ImagePass;
+const ImageStore = @import("../grid/image_store.zig").Store;
+const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
 const input = @import("input.zig");
 const menu = @import("menu.zig");
@@ -26,11 +29,18 @@ pub const Pane = struct {
     terminal: *Terminal,
     atlas: ?*Atlas = null,
     grid_pass: GridPass,
+    image_pass: ImagePass = ImagePass.init(),
+    image_store: ImageStore,
     allocator: std.mem.Allocator,
     input_ctx: ?*input.Ctx = null,
     /// External sink for menu actions (set by Window).
     menu_sink: ?menu.Sink = null,
     menu_sink_ctx: ?*anyopaque = null,
+    /// Window-level forwarding for terminal sinks.
+    win_title_ctx: ?*anyopaque = null,
+    win_on_title: ?*const fn (ctx: ?*anyopaque, title: []const u8) void = null,
+    win_clip_ctx: ?*anyopaque = null,
+    win_on_clipboard: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -45,8 +55,17 @@ pub const Pane = struct {
             .area = @ptrCast(area_widget),
             .terminal = terminal,
             .grid_pass = GridPass.init(allocator),
+            .image_store = ImageStore.init(allocator),
             .allocator = allocator,
         };
+
+        // Pane is the Terminal's user_ctx for ALL sink callbacks.
+        // Pane dispatches: image → its own store, clipboard/title →
+        // forwarded to Window if its sinks are set.
+        terminal.user_ctx = @ptrCast(self);
+        terminal.on_image = onImageEvent;
+        terminal.on_title = onTitleEvent;
+        terminal.on_clipboard_set = onClipboardEvent;
 
         _ = c.g_signal_connect_data(
             area_widget,
@@ -148,6 +167,8 @@ pub const Pane = struct {
 
     pub fn deinit(self: *Pane) void {
         self.grid_pass.deinit();
+        self.image_pass.deinit();
+        self.image_store.deinit();
         if (self.atlas) |a| a.deinit();
         self.allocator.destroy(self);
     }
@@ -175,6 +196,14 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         std.debug.print("pane realize: grid_pass realize failed\n", .{});
         return;
     };
+    self.image_pass.realize() catch {
+        std.debug.print("pane realize: image_pass realize failed\n", .{});
+        return;
+    };
+
+    // Cell metrics into image store so placements get pixel coords.
+    self.image_store.cell_w = @floatFromInt(self.atlas.?.cell_w);
+    self.image_store.cell_h = @floatFromInt(self.atlas.?.cell_h);
 }
 
 fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(.c) c.gboolean {
@@ -194,7 +223,28 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     self.grid_pass.buildVertices(self.terminal.screen, &self.terminal.pool, atlas) catch return @intFromBool(false);
     self.grid_pass.draw(atlas, phys_w, phys_h);
 
+    // Upload pending images, then draw.
+    self.image_store.flushUploads();
+    self.image_pass.draw(&self.image_store, phys_w, phys_h);
+
     return @intFromBool(true);
+}
+
+fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
+    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    self.image_store.add(img.rgba, img.width, img.height, img.row, img.col) catch {};
+    // Force redraw to upload + display.
+    self.terminal.screen.dirty = true;
+}
+
+fn onTitleEvent(ctx: ?*anyopaque, title: []const u8) void {
+    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    if (self.win_on_title) |f| f(self.win_title_ctx, title);
+}
+
+fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {
+    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    if (self.win_on_clipboard) |f| f(self.win_clip_ctx, text);
 }
 
 fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {

@@ -108,10 +108,12 @@ pub const Window = struct {
         const term = try Terminal.init(self.allocator, pty, 80, 24);
         errdefer term.deinit();
 
-        term.user_ctx = @ptrCast(self);
-        term.on_clipboard_set = onTermClipboardSet;
-
         const pane = try self.makePane(term);
+
+        // Forward terminal sinks to Window where appropriate.
+        pane.win_clip_ctx = @ptrCast(self);
+        pane.win_on_clipboard = onTermClipboardSet;
+        // Title forwarding intentionally null — tab titles are sticky.
 
         // Wrap pane.widget() in a Box so we can swap it for a Paned
         // when splits happen. Box always has exactly one child.
@@ -147,10 +149,10 @@ pub const Window = struct {
 
         const term = try Terminal.init(self.allocator, pty, 80, 24);
         errdefer term.deinit();
-        term.user_ctx = @ptrCast(self);
-        term.on_clipboard_set = onTermClipboardSet;
 
         const pane = try self.makePane(term);
+        pane.win_clip_ctx = @ptrCast(self);
+        pane.win_on_clipboard = onTermClipboardSet;
         try self.panes.append(self.allocator, pane);
         try self.terminals.append(self.allocator, term);
         return pane;
