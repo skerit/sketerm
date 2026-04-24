@@ -65,6 +65,8 @@ pub const Screen = struct {
     focus_reports: bool = false,
     /// DECSET 25 — cursor visibility.
     cursor_visible: bool = true,
+    /// DECSCUSR cursor shape.
+    cursor_shape: CursorShape = .block_blink,
     /// Mouse mode (1000/1002/1003) — last-set value.
     mouse_mode: u16 = 0,
     /// Mouse encoding (1006/1015 etc).
@@ -88,6 +90,15 @@ pub const Screen = struct {
 
     /// Side-effect sink — optional callbacks invoked by apply.
     sink: Sink = .{},
+
+    pub const CursorShape = enum {
+        block_blink,
+        block_steady,
+        underline_blink,
+        underline_steady,
+        bar_blink,
+        bar_steady,
+    };
 
     pub const Sink = struct {
         ctx: ?*anyopaque = null,
@@ -375,6 +386,15 @@ pub const Screen = struct {
             return;
         }
 
+        // Intermediate-distinguished: e.g. `CSI Ps SP q` = DECSCUSR.
+        if (params.n_intermediates == 1 and params.intermediates[0] == ' ') {
+            switch (params.final) {
+                'q' => self.decscusr(params.paramOrDefault(0, 0)),
+                else => {},
+            }
+            return;
+        }
+
         switch (params.final) {
             // Cursor movement.
             'A' => self.cursorUp(params.paramOrDefault(0, 1)),
@@ -452,6 +472,18 @@ pub const Screen = struct {
     fn respondDa(self: *Screen) void {
         // VT220 + ANSI color (62=VT220, 22=color)
         self.respond("\x1b[?62;22c");
+    }
+
+    fn decscusr(self: *Screen, ps: u32) void {
+        self.cursor_shape = switch (ps) {
+            0, 1 => .block_blink,
+            2 => .block_steady,
+            3 => .underline_blink,
+            4 => .underline_steady,
+            5 => .bar_blink,
+            6 => .bar_steady,
+            else => self.cursor_shape,
+        };
     }
 
     fn windowOps(self: *Screen, params: Event.Csi) void {

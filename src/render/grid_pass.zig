@@ -209,16 +209,45 @@ pub const GridPass = struct {
         if (view_off == 0 and screen.cursor_visible and screen.row < screen.rows and screen.col < screen.cols) {
             const cx: f32 = @as(f32, @floatFromInt(screen.col)) * cw;
             const cy: f32 = @as(f32, @floatFromInt(screen.row)) * ch;
-            const cursor_color = self.default_fg;
-            // Block cursor by default. Half-alpha to show glyph through.
-            try self.pushQuad(
-                .{ cx, cy },
-                .{ cw, ch },
-                .{ 0, 0 },
-                .{ 0, 0 },
-                .{ cursor_color[0], cursor_color[1], cursor_color[2], 0.55 },
-                0.0,
-            );
+            const fg = self.default_fg;
+            const block_alpha: f32 = 0.55;
+
+            const Shape = @import("../grid/screen.zig").Screen.CursorShape;
+            switch (screen.cursor_shape) {
+                .block_blink, .block_steady => {
+                    try self.pushQuad(
+                        .{ cx, cy },
+                        .{ cw, ch },
+                        .{ 0, 0 },
+                        .{ 0, 0 },
+                        .{ fg[0], fg[1], fg[2], block_alpha },
+                        0.0,
+                    );
+                },
+                .underline_blink, .underline_steady => {
+                    const h: f32 = @max(2.0, ch / 8.0);
+                    try self.pushQuad(
+                        .{ cx, cy + ch - h },
+                        .{ cw, h },
+                        .{ 0, 0 },
+                        .{ 0, 0 },
+                        .{ fg[0], fg[1], fg[2], 0.85 },
+                        0.0,
+                    );
+                },
+                .bar_blink, .bar_steady => {
+                    const w: f32 = @max(2.0, cw / 6.0);
+                    try self.pushQuad(
+                        .{ cx, cy },
+                        .{ w, ch },
+                        .{ 0, 0 },
+                        .{ 0, 0 },
+                        .{ fg[0], fg[1], fg[2], 0.85 },
+                        0.0,
+                    );
+                },
+            }
+            _ = Shape; // (kept import for clarity)
         }
     }
 
