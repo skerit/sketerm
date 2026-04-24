@@ -8,6 +8,7 @@ const c = @import("../c.zig").c;
 const Pane = @import("pane.zig").Pane;
 const Pty = @import("../pty.zig").Pty;
 const Terminal = @import("../terminal.zig").Terminal;
+const layout_mod = @import("../layout.zig");
 
 pub const Window = struct {
     app_window: *c.GtkWidget,
@@ -106,6 +107,42 @@ pub const Window = struct {
 
     pub fn prevTab(self: *Window) void {
         _ = c.adw_tab_view_select_previous_page(self.tab_view);
+    }
+
+    /// Build a Layout snapshot of the current window state.
+    /// Caller must arena-free or otherwise track strings.
+    pub fn collectLayout(self: *Window, arena: std.mem.Allocator) !layout_mod.Layout {
+        var tabs: std.ArrayList(layout_mod.TabSpec) = .{};
+        const n_pages = c.adw_tab_view_get_n_pages(self.tab_view);
+        var i: c_int = 0;
+        while (i < n_pages) : (i += 1) {
+            if (i >= self.terminals.items.len) break;
+            const term = self.terminals.items[@intCast(i)];
+            const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
+            const title_cstr = c.adw_tab_page_get_title(page);
+            const title = if (title_cstr != null) std.mem.span(@as([*:0]const u8, @ptrCast(title_cstr))) else "";
+
+            const cwd = layout_mod.cwdOfPid(term.pty.child_pid, arena) catch try arena.dupe(u8, "/");
+            const cmd = try arena.alloc([]const u8, 1);
+            cmd[0] = try arena.dupe(u8, std.posix.getenv("SHELL") orelse "/bin/bash");
+            try tabs.append(arena, .{
+                .title = try arena.dupe(u8, title),
+                .cwd = cwd,
+                .command = cmd,
+            });
+        }
+        return .{ .version = 1, .tabs = try tabs.toOwnedSlice(arena) };
+    }
+
+    /// Save current state to the default path. Best-effort.
+    pub fn saveLayoutQuietly(self: *Window) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const path = layout_mod.defaultSavePath(arena) catch return;
+        const layout = self.collectLayout(arena) catch return;
+        layout_mod.save(layout, path) catch return;
     }
 };
 

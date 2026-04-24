@@ -14,6 +14,7 @@ comptime {
     _ = @import("grid/style_pool.zig");
     _ = @import("grid/screen.zig");
     _ = @import("grid/selection.zig");
+    _ = @import("layout.zig");
 }
 
 test {

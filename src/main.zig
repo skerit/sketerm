@@ -72,6 +72,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
 
 fn onShutdown(_: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
     if (g_app.window) |w| {
+        w.saveLayoutQuietly();
         w.deinit();
         g_app.window = null;
     }
