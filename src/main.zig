@@ -73,6 +73,13 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     const shell: [*:0]const u8 = if (shell_env != null) @ptrCast(shell_env) else "/bin/bash";
     const argv = [_][*:0]const u8{shell};
 
+    // Set TERM and COLORTERM in the child env so apps detect us correctly.
+    const term_env: [*:0]const u8 = "TERM=xterm-256color";
+    const colorterm_env: [*:0]const u8 = "COLORTERM=truecolor";
+    const term_program: [*:0]const u8 = "TERM_PROGRAM=sketerm";
+    const extra_env = [_][*:0]const u8{ term_env, colorterm_env, term_program };
+    _ = extra_env; // pty.spawn doesn't yet honor extra_env; setenv'd in spawn directly.
+
     const pty = Pty.spawn(.{
         .argv = &argv,
         .rows = 24,

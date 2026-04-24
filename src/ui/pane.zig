@@ -67,7 +67,17 @@ pub const Pane = struct {
         );
 
         // M4: keyboard input → PTY.
-        input.attach(area_widget, terminal);
+        try input.attach(area_widget, terminal, allocator);
+
+        // Resize → TIOCSWINSZ → SIGWINCH child.
+        _ = c.g_signal_connect_data(
+            area_widget,
+            "resize",
+            @ptrCast(&onResize),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
 
         return self;
     }
@@ -128,4 +138,25 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, _: ?*anyopaque) callconv(.c) 
     // M4 will only redraw on dirty.
     c.gtk_widget_queue_draw(area);
     return 1; // G_SOURCE_CONTINUE
+}
+
+fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const atlas = self.atlas orelse return;
+    if (atlas.cell_w == 0 or atlas.cell_h == 0) return;
+    const cols: u16 = @intCast(@max(1, @divFloor(width, @as(c_int, atlas.cell_w))));
+    const rows: u16 = @intCast(@max(1, @divFloor(height, @as(c_int, atlas.cell_h))));
+    if (cols == self.terminal.screen.cols and rows == self.terminal.screen.rows) return;
+
+    // Recreate the screen with new dimensions. Lossy for v1; M2 reflow
+    // would preserve content. Acceptable until M3.5/M7.
+    self.terminal.screen.deinit();
+    self.terminal.screen = (@import("../grid/screen.zig").Screen.init(
+        self.allocator,
+        &self.terminal.pool,
+        cols,
+        rows,
+    ) catch return);
+
+    self.terminal.pty.setSize(rows, cols);
 }

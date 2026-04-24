@@ -6,14 +6,23 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const Terminal = @import("../terminal.zig").Terminal;
+const clipboard = @import("clipboard.zig");
 
-pub fn attach(widget: *c.GtkWidget, terminal: *Terminal) void {
+const Ctx = struct {
+    widget: *c.GtkWidget,
+    terminal: *Terminal,
+};
+
+pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allocator) !void {
+    const ctx = try allocator.create(Ctx);
+    ctx.* = .{ .widget = widget, .terminal = terminal };
+
     const ctrl = c.gtk_event_controller_key_new();
     _ = c.g_signal_connect_data(
         ctrl,
         "key-pressed",
         @ptrCast(&onKeyPressed),
-        @ptrCast(terminal),
+        @ptrCast(ctx),
         null,
         c.G_CONNECT_DEFAULT,
     );
@@ -30,11 +39,25 @@ fn onKeyPressed(
     state: c.GdkModifierType,
     user: ?*anyopaque,
 ) callconv(.c) c.gboolean {
-    const term: *Terminal = @ptrCast(@alignCast(user.?));
+    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const ctrl_pressed = (state & c.GDK_CONTROL_MASK) != 0;
+    const shift_pressed = (state & c.GDK_SHIFT_MASK) != 0;
+
+    // Built-in keybindings (before generic encoding).
+    if (ctrl_pressed and shift_pressed) {
+        switch (keyval) {
+            c.GDK_KEY_V, c.GDK_KEY_v => {
+                clipboard.pasteFromClipboard(ctx.widget, ctx.terminal);
+                return 1;
+            },
+            else => {},
+        }
+    }
+
     var buf: [16]u8 = undefined;
     const n = encode(&buf, keyval, state);
     if (n == 0) return 0;
-    _ = term.pty.writeAll(buf[0..n]);
+    _ = ctx.terminal.pty.writeAll(buf[0..n]);
     return 1;
 }
 

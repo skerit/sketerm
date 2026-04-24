@@ -87,6 +87,12 @@ pub const Pty = struct {
         _ = c.sigemptyset(&empty_mask);
         _ = c.sigprocmask(c.SIG_SETMASK, &empty_mask, null);
 
+        // Set sketerm-specific env vars (overwrites if present).
+        _ = c.setenv("TERM", "xterm-256color", 1);
+        _ = c.setenv("COLORTERM", "truecolor", 1);
+        _ = c.setenv("TERM_PROGRAM", "sketerm", 1);
+        _ = c.setenv("TERM_PROGRAM_VERSION", "0.0.1", 1);
+
         // chdir if requested.
         if (opts.cwd) |cwd| {
             var buf: [4096]u8 = undefined;
