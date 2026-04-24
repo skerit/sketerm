@@ -111,20 +111,114 @@ pub const Window = struct {
         term.user_ctx = @ptrCast(self);
         term.on_clipboard_set = onTermClipboardSet;
 
-        const pane = try Pane.init(self.allocator, term);
+        const pane = try self.makePane(term);
 
+        // Wrap pane.widget() in a Box so we can swap it for a Paned
+        // when splits happen. Box always has exactly one child.
+        const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        c.gtk_widget_set_hexpand(wrapper, 1);
+        c.gtk_widget_set_vexpand(wrapper, 1);
+        c.gtk_box_append(@ptrCast(wrapper), pane.widget());
+
+        const page = c.adw_tab_view_append(self.tab_view, wrapper);
+        c.adw_tab_page_set_title(page, title_z);
+
+        try self.panes.append(self.allocator, pane);
+        try self.terminals.append(self.allocator, term);
+    }
+
+    fn makePane(self: *Window, term: *Terminal) !*Pane {
+        const pane = try Pane.init(self.allocator, term);
         if (pane.input_ctx) |ictx| {
             ictx.shortcut_sink = onShortcut;
             ictx.shortcut_ctx = @ptrCast(self);
         }
         pane.menu_sink = onMenuAction;
         pane.menu_sink_ctx = @ptrCast(self);
+        return pane;
+    }
 
-        const page = c.adw_tab_view_append(self.tab_view, pane.widget());
-        c.adw_tab_page_set_title(page, title_z);
+    fn spawnShellPane(self: *Window) !*Pane {
+        const shell_env = c.getenv("SHELL");
+        const shell: [*:0]const u8 = if (shell_env != null) @ptrCast(shell_env) else "/bin/bash";
+        const argv = [_][*:0]const u8{shell};
+        const pty = try Pty.spawn(.{ .argv = &argv, .rows = 24, .cols = 80 });
+        errdefer pty.closeAndReap();
 
+        const term = try Terminal.init(self.allocator, pty, 80, 24);
+        errdefer term.deinit();
+        term.user_ctx = @ptrCast(self);
+        term.on_clipboard_set = onTermClipboardSet;
+
+        const pane = try self.makePane(term);
         try self.panes.append(self.allocator, pane);
         try self.terminals.append(self.allocator, term);
+        return pane;
+    }
+
+    /// Split the focused pane: spawn a new pane and place the two
+    /// inside a GtkPaned. orientation = HORIZONTAL splits side-by-side,
+    /// VERTICAL splits top/bottom.
+    pub fn splitFocused(self: *Window, orientation: c_uint) !void {
+        const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
+
+        // Find the focused Pane.
+        var found_idx: ?usize = null;
+        for (self.panes.items, 0..) |p, idx| {
+            if (@intFromPtr(p.widget()) == @intFromPtr(focus)) {
+                found_idx = idx;
+                break;
+            }
+        }
+        if (found_idx == null) return;
+        const focused_pane = self.panes.items[found_idx.?];
+        const focused_w = focused_pane.widget();
+
+        const parent = c.gtk_widget_get_parent(focused_w) orelse return;
+
+        // Build new pane.
+        const new_pane = try self.spawnShellPane();
+        const new_w = new_pane.widget();
+
+        const paned = c.gtk_paned_new(orientation);
+        c.gtk_paned_set_resize_start_child(@ptrCast(paned), 1);
+        c.gtk_paned_set_resize_end_child(@ptrCast(paned), 1);
+        c.gtk_paned_set_shrink_start_child(@ptrCast(paned), 0);
+        c.gtk_paned_set_shrink_end_child(@ptrCast(paned), 0);
+
+        // Detach focused widget from parent (where to put new tree depends
+        // on parent type).
+        const is_paned = c.g_type_check_instance_is_a(
+            @ptrCast(@alignCast(parent)),
+            c.gtk_paned_get_type(),
+        ) != 0;
+        const is_box = c.g_type_check_instance_is_a(
+            @ptrCast(@alignCast(parent)),
+            c.gtk_box_get_type(),
+        ) != 0;
+
+        if (is_paned) {
+            const start = c.gtk_paned_get_start_child(@ptrCast(parent));
+            const end = c.gtk_paned_get_end_child(@ptrCast(parent));
+            if (start == focused_w) {
+                c.gtk_paned_set_start_child(@ptrCast(parent), null);
+                c.gtk_paned_set_start_child(@ptrCast(paned), focused_w);
+                c.gtk_paned_set_end_child(@ptrCast(paned), new_w);
+                c.gtk_paned_set_start_child(@ptrCast(parent), paned);
+            } else if (end == focused_w) {
+                c.gtk_paned_set_end_child(@ptrCast(parent), null);
+                c.gtk_paned_set_start_child(@ptrCast(paned), focused_w);
+                c.gtk_paned_set_end_child(@ptrCast(paned), new_w);
+                c.gtk_paned_set_end_child(@ptrCast(parent), paned);
+            }
+        } else if (is_box) {
+            c.gtk_box_remove(@ptrCast(parent), focused_w);
+            c.gtk_paned_set_start_child(@ptrCast(paned), focused_w);
+            c.gtk_paned_set_end_child(@ptrCast(paned), new_w);
+            c.gtk_box_append(@ptrCast(parent), paned);
+        }
+
+        _ = c.gtk_widget_grab_focus(focused_w);
     }
 
     /// Load the default last.json and rebuild tabs from it.
@@ -220,6 +314,8 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .close_tab => self.closeCurrentTab(),
         .next_tab => self.nextTab(),
         .prev_tab => self.prevTab(),
+        .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {},
+        .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
         else => {},
     }
 }
@@ -232,8 +328,10 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .rename_tab => {
             // TODO: show GtkPopover with GtkEntry. Stub for now.
         },
-        .split_h, .split_v, .close_pane => {
-            // TODO: M7 implements splits. Stub.
+        .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {},
+        .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
+        .close_pane => {
+            // TODO: M7 close-pane (collapse parent paned if sibling alone).
         },
         else => {},
     }

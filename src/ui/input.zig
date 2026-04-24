@@ -23,7 +23,9 @@ pub const Action = enum {
     next_tab,
     prev_tab,
     copy,
-    paste, // primary path; input also handles directly
+    paste,
+    split_h,
+    split_v,
 };
 
 pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allocator) !*Ctx {
@@ -74,6 +76,14 @@ fn onKeyPressed(
             },
             c.GDK_KEY_W, c.GDK_KEY_w => {
                 if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .close_tab);
+                return 1;
+            },
+            c.GDK_KEY_D, c.GDK_KEY_d => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .split_h);
+                return 1;
+            },
+            c.GDK_KEY_R, c.GDK_KEY_r => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .split_v);
                 return 1;
             },
             else => {},
