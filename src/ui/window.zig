@@ -270,6 +270,81 @@ pub const Window = struct {
         _ = c.adw_tab_view_select_previous_page(self.tab_view);
     }
 
+    /// Close the focused pane. If it's the only pane in its tab,
+    /// closes the tab. Otherwise the pane is removed from its
+    /// parent GtkPaned and the sibling takes its place.
+    pub fn closeFocusedPane(self: *Window) void {
+        const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
+        var found_idx: ?usize = null;
+        for (self.panes.items, 0..) |p, idx| {
+            if (@intFromPtr(p.widget()) == @intFromPtr(focus)) {
+                found_idx = idx;
+                break;
+            }
+        }
+        if (found_idx == null) return;
+
+        const pane = self.panes.items[found_idx.?];
+        const w = pane.widget();
+        const parent = c.gtk_widget_get_parent(w) orelse return;
+
+        const is_paned = c.g_type_check_instance_is_a(
+            @ptrCast(@alignCast(parent)),
+            c.gtk_paned_get_type(),
+        ) != 0;
+
+        if (!is_paned) {
+            // Last pane in tab — close the whole tab.
+            self.closeCurrentTab();
+            return;
+        }
+
+        const start = c.gtk_paned_get_start_child(@ptrCast(parent));
+        const end = c.gtk_paned_get_end_child(@ptrCast(parent));
+        const sibling = if (start == w) end else start;
+        if (sibling == null) return;
+
+        // Detach sibling from paned.
+        if (start == w) {
+            c.gtk_paned_set_end_child(@ptrCast(parent), null);
+        } else {
+            c.gtk_paned_set_start_child(@ptrCast(parent), null);
+        }
+
+        // Replace paned with sibling in grandparent.
+        const gp = c.gtk_widget_get_parent(parent) orelse return;
+        const gp_is_paned = c.g_type_check_instance_is_a(
+            @ptrCast(@alignCast(gp)),
+            c.gtk_paned_get_type(),
+        ) != 0;
+
+        if (gp_is_paned) {
+            const gp_start = c.gtk_paned_get_start_child(@ptrCast(gp));
+            if (gp_start == parent) {
+                c.gtk_paned_set_start_child(@ptrCast(gp), sibling);
+            } else {
+                c.gtk_paned_set_end_child(@ptrCast(gp), sibling);
+            }
+        } else {
+            c.gtk_box_remove(@ptrCast(gp), parent);
+            c.gtk_box_append(@ptrCast(gp), sibling);
+        }
+
+        // Clean up. Terminal.deinit kills worker + closes PTY.
+        // Pane.deinit (GL atlas etc) is skipped — leak is bounded
+        // since GTK destroys the widget on unparent and the context
+        // may not be current anymore.
+        _ = self.panes.orderedRemove(found_idx.?);
+        const term = pane.terminal;
+        for (self.terminals.items, 0..) |t, ti| {
+            if (t == term) {
+                _ = self.terminals.orderedRemove(ti);
+                break;
+            }
+        }
+        term.deinit();
+    }
+
     /// Build a Layout snapshot of the current window state.
     /// Caller must arena-free or otherwise track strings.
     pub fn collectLayout(self: *Window, arena: std.mem.Allocator) !layout_mod.Layout {
@@ -330,9 +405,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         },
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {},
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
-        .close_pane => {
-            // TODO: M7 close-pane (collapse parent paned if sibling alone).
-        },
+        .close_pane => self.closeFocusedPane(),
         else => {},
     }
 }
