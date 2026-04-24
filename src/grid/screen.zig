@@ -159,6 +159,73 @@ pub const Screen = struct {
         self.allocator.destroy(self);
     }
 
+    /// Resize the screen to new dimensions while preserving as much
+    /// content as possible. Active rows are re-widened (truncate or
+    /// pad with blanks). Excess rows on shrink are pushed to scrollback
+    /// (main screen) or freed (alt). Cursor is clamped.
+    pub fn resize(self: *Screen, new_cols: u16, new_rows: u16) !void {
+        if (new_cols == self.cols and new_rows == self.rows) return;
+
+        try resizeBuffer(self.allocator, &self.active, self.rows, new_cols, new_rows, !self.use_alt, self);
+        if (self.alt) |alt_buf| {
+            var alt_mut = alt_buf;
+            try resizeBuffer(self.allocator, &alt_mut, self.rows, new_cols, new_rows, false, self);
+            self.alt = alt_mut;
+        }
+
+        self.cols = new_cols;
+        self.rows = new_rows;
+        self.scroll_top = 0;
+        self.scroll_bot = if (new_rows > 0) new_rows - 1 else 0;
+        if (self.row >= new_rows) self.row = if (new_rows == 0) 0 else new_rows - 1;
+        if (self.col >= new_cols) self.col = if (new_cols == 0) 0 else new_cols - 1;
+        self.pending_wrap = false;
+        self.dirty = true;
+    }
+
+    fn resizeBuffer(
+        allocator: std.mem.Allocator,
+        slot: *[]Line,
+        old_rows: u16,
+        new_cols: u16,
+        new_rows: u16,
+        push_to_sb: bool,
+        screen: *Screen,
+    ) !void {
+        // First, resize each line's cells to new width.
+        for (slot.*) |*ln| {
+            if (ln.cells.len == new_cols) continue;
+            const new_cells = try allocator.alloc(Cell, new_cols);
+            @memset(new_cells, .{});
+            const n = @min(ln.cells.len, @as(usize, new_cols));
+            @memcpy(new_cells[0..n], ln.cells[0..n]);
+            if (ln.cells.len > 0) allocator.free(ln.cells);
+            ln.cells = new_cells;
+            ln.dirty = true;
+        }
+
+        // Then adjust row count.
+        if (new_rows > old_rows) {
+            const new_buf = try allocator.realloc(slot.*, new_rows);
+            var i: u16 = old_rows;
+            while (i < new_rows) : (i += 1) new_buf[i] = try Line.init(allocator, new_cols);
+            slot.* = new_buf;
+        } else if (new_rows < old_rows) {
+            const drop = old_rows - new_rows;
+            var i: u16 = 0;
+            while (i < drop) : (i += 1) {
+                if (push_to_sb) {
+                    const copy = allocator.dupe(Cell, slot.*[i].cells) catch null;
+                    if (copy) |cells| screen.pushScrollback(cells);
+                }
+                slot.*[i].deinit(allocator);
+            }
+            std.mem.copyForwards(Line, slot.*[0..new_rows], slot.*[drop..]);
+            const new_buf = try allocator.realloc(slot.*, new_rows);
+            slot.* = new_buf;
+        }
+    }
+
     /// Push a line into scrollback. Caller transfers ownership of
     /// the cells slice. Evicts oldest if cap exceeded.
     fn pushScrollback(self: *Screen, cells: []Cell) void {

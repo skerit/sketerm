@@ -303,15 +303,6 @@ fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) cal
     const rows: u16 = @intCast(@max(1, @divFloor(height, @as(c_int, atlas.cell_h))));
     if (cols == self.terminal.screen.cols and rows == self.terminal.screen.rows) return;
 
-    // Recreate the screen with new dimensions. Lossy for v1; M2 reflow
-    // would preserve content. Acceptable until M3.5/M7.
-    self.terminal.screen.deinit();
-    self.terminal.screen = (@import("../grid/screen.zig").Screen.init(
-        self.allocator,
-        &self.terminal.pool,
-        cols,
-        rows,
-    ) catch return);
-
+    self.terminal.screen.resize(cols, rows) catch return;
     self.terminal.pty.setSize(rows, cols);
 }
