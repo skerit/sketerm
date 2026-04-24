@@ -270,6 +270,7 @@ fn debugFormatEvent(w: *std.io.Writer, ev: Event) !void {
         .esc_final => |ef| try w.print("«ESC {c}»", .{ef.final}),
         .osc => |o| try w.print("«OSC {s}»", .{o.bytes}),
         .apc => |a| try w.print("«APC {s}»", .{a.bytes}),
+        .dcs => |d| try w.print("«DCS {c} body={d}B»", .{ d.proto.final, d.body.len }),
         .dcs_start => |d| try w.print("«DCS-start {c}»", .{d.final}),
         .dcs_data => try w.print("«DCS-data»", .{}),
         .dcs_end => try w.print("«DCS-end»", .{}),

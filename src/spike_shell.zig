@@ -16,7 +16,14 @@ const StylePool = @import("grid/style_pool.zig").Pool;
 const Ctx = struct {
     screen: *Screen,
     allocator: std.mem.Allocator,
+    image_count: u32 = 0,
 };
+
+fn onImage(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
+    const c_ctx: *Ctx = @ptrCast(@alignCast(ctx.?));
+    c_ctx.image_count += 1;
+    std.debug.print("got image {}: {d}x{d} at row={d} col={d}\n", .{ c_ctx.image_count, img.width, img.height, img.row, img.col });
+}
 
 fn emit(user: ?*anyopaque, ev: Event) void {
     const ctx: *Ctx = @ptrCast(@alignCast(user.?));
@@ -33,13 +40,12 @@ pub fn main() u8 {
     const argv = [_][*:0]const u8{
         "/bin/bash",
         "-c",
-        // Mixes plain output, ANSI colors, OSC title, cursor moves,
-        // and a stress: 200 lines of output pushes scrollback.
+        // Plain + colors + scroll + a hand-rolled sixel.
         "printf '\\033]0;sketerm smoke\\007'; " ++
         "echo Hello, $USER; " ++
-        "printf '\\033[31mred\\033[0m \\033[32mgreen\\033[0m \\033[34mblue\\033[0m\\n'; " ++
-        "for i in $(seq 1 200); do echo \"line $i with some output\"; done; " ++
-        "printf '\\033[1;1Hcols=%d rows=%d' $(tput cols) $(tput lines); " ++
+        "for i in $(seq 1 50); do echo \"line $i\"; done; " ++
+        // 6x6 red square sixel: define color 1 = R 100/0/0, select, ~ × 6, terminate.
+        "printf '\\033Pq#1;2;100;0;0#1!6~\\033\\\\'; " ++
         "echo done",
     };
     const pty = Pty.spawn(.{ .argv = &argv, .rows = 24, .cols = 80 }) catch return 1;
@@ -50,10 +56,12 @@ pub fn main() u8 {
     const screen = Screen.init(allocator, &pool, 80, 24) catch return 1;
     defer screen.deinit();
 
+    var ctx = Ctx{ .screen = screen, .allocator = allocator };
+    screen.sink.ctx = @ptrCast(&ctx);
+    screen.sink.on_image = onImage;
+
     var parser = Parser.init(allocator);
     defer parser.deinit();
-
-    var ctx = Ctx{ .screen = screen, .allocator = allocator };
 
     // Read for up to 1 second.
     const start = std.time.milliTimestamp();

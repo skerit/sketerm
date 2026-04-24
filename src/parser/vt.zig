@@ -71,8 +71,16 @@ pub const Parser = struct {
                 return;
             },
             0x1B => {
-                self.enterEscape();
-                return;
+                // In string-collection states, ESC begins the 7-bit
+                // ST (`ESC \`). The string body must be dispatched
+                // first; let those state handlers see the ESC.
+                switch (self.state) {
+                    .osc_string, .apc_string, .dcs_passthrough, .sos_pm_string => {},
+                    else => {
+                        self.enterEscape();
+                        return;
+                    },
+                }
             },
             else => {},
         }
@@ -109,7 +117,15 @@ pub const Parser = struct {
         self.dcs_proto = .{};
         self.cur_param = 0;
         self.has_cur_param = false;
+        self.osc_buf.clearRetainingCapacity();
         self.transitionTo(.dcs_entry);
+    }
+
+    fn dispatchDcs(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {
+        const body = self.allocator.dupe(u8, self.osc_buf.items) catch {
+            return;
+        };
+        emit(ctx, .{ .dcs = .{ .proto = self.dcs_proto, .body = body } });
     }
 
     fn enterOscString(self: *Parser) void {
@@ -268,17 +284,23 @@ pub const Parser = struct {
                         self.dcs_proto.n_params += 1;
                     }
                     self.dcs_proto.final = b;
-                    emit(ctx, .{ .dcs_start = self.dcs_proto });
+                    // Body accumulates in osc_buf; full Event.dcs is
+                    // emitted on terminator from dispatchDcs().
+                    self.osc_buf.clearRetainingCapacity();
                     self.transitionTo(.dcs_passthrough);
                 },
                 else => self.transitionTo(.dcs_ignore),
             },
             .dcs_passthrough => {
                 if (b == 0x07 or b == 0x9C) {
-                    emit(ctx, .{ .dcs_end = {} });
+                    self.dispatchDcs(emit, ctx);
                     self.transitionTo(.ground);
+                } else if (b == 0x1B) {
+                    self.dispatchDcs(emit, ctx);
+                    self.transitionTo(.escape);
+                } else {
+                    self.osc_buf.append(self.allocator, b) catch {};
                 }
-                // else skeleton: drop body bytes. (M9b sixel implements full handling.)
             },
             .dcs_ignore => {
                 if (b == 0x07 or b == 0x9C) self.transitionTo(.ground);
@@ -290,29 +312,34 @@ pub const Parser = struct {
     fn byteOsc(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
         switch (b) {
             0x07, 0x9C => self.dispatchOsc(emit, ctx),
-            else => {
-                // Note: ST in 7-bit form (ESC \) would be ESC, which the
-                // "anywhere" transition routes to .escape state. We
-                // dispatch on transition out of OSC by intercepting that
-                // path: when the next byte after ESC is '\', we reach
-                // .escape state with no buffered final, and the .escape
-                // handler will dispatch ESC '\' as esc_final. For this
-                // simple skeleton, BEL termination is the common case.
-                self.osc_buf.append(self.allocator, b) catch {};
+            0x1B => {
+                // 7-bit ST: dispatch then enter escape state to
+                // consume the trailing '\'.
+                self.dispatchOsc(emit, ctx);
+                self.transitionTo(.escape);
             },
+            else => self.osc_buf.append(self.allocator, b) catch {},
         }
     }
 
     fn byteApc(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
         switch (b) {
             0x07, 0x9C => self.dispatchApc(emit, ctx),
+            0x1B => {
+                self.dispatchApc(emit, ctx);
+                self.transitionTo(.escape);
+            },
             else => self.osc_buf.append(self.allocator, b) catch {},
         }
     }
 
     fn byteSosPm(self: *Parser, b: u8, _: EmitFn, _: ?*anyopaque) void {
         // SOS / PM: no payload exposed in v1.
-        if (b == 0x07 or b == 0x9C) self.transitionTo(.ground);
+        switch (b) {
+            0x07, 0x9C => self.transitionTo(.ground),
+            0x1B => self.transitionTo(.escape),
+            else => {},
+        }
     }
 
     fn dispatchOsc(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {

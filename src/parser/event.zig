@@ -36,15 +36,13 @@ pub const Event = union(enum) {
     /// Application-program command (`ESC _ ... ST`) — Kitty graphics.
     apc: Osc,
 
-    /// Device-control-string entry (`ESC P params final`).
-    /// Used to start sixel; data follows in `dcs_data`, terminated
-    /// by `dcs_end`.
+    /// Device-control-string with full body collected.
+    /// `body` is heap-owned by event; consumer frees.
+    dcs: DcsFull,
+
+    /// (Legacy markers, kept so existing switch arms compile.)
     dcs_start: Dcs,
-
-    /// Chunk of DCS passthrough body. Owned slice; consumer frees.
     dcs_data: []u8,
-
-    /// DCS terminator (ST or BEL).
     dcs_end: void,
 
     /// PTY reached EOF (child closed all references to the slave).
@@ -93,11 +91,17 @@ pub const Event = union(enum) {
         final: u8 = 0,
     };
 
+    pub const DcsFull = struct {
+        proto: Dcs,
+        body: []u8, // owned
+    };
+
     /// Free any heap-owned payload. Call after processing.
     pub fn deinit(self: *Event, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .osc, .apc => |o| allocator.free(o.bytes),
             .dcs_data => |b| allocator.free(b),
+            .dcs => |d| allocator.free(d.body),
             else => {},
         }
     }

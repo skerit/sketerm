@@ -107,6 +107,17 @@ pub const Screen = struct {
         on_write_pty: ?*const fn (ctx: ?*anyopaque, bytes: []const u8) void = null,
         on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
         on_cwd: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
+        on_image: ?*const fn (ctx: ?*anyopaque, img: ImageEvent) void = null,
+    };
+
+    pub const ImageEvent = struct {
+        width: u32,
+        height: u32,
+        /// Borrowed slice — valid only for the duration of the call.
+        /// Sink must copy if it needs the data later.
+        rgba: []const u8,
+        row: u16,
+        col: u16,
     };
 
     pub fn init(allocator: std.mem.Allocator, pool: *Pool, cols: u16, rows: u16) !*Screen {
@@ -256,9 +267,26 @@ pub const Screen = struct {
             .esc_final => |ef| self.escFinal(ef),
             .osc => |osc| self.onOsc(osc.bytes),
             .apc => {}, // wired in M9 (Kitty graphics)
-            .dcs_start, .dcs_data, .dcs_end => {}, // wired in M9
+            .dcs => |d| self.onDcs(d),
+            .dcs_start, .dcs_data, .dcs_end => {}, // legacy stubs
             .child_eof => |status| self.onChildEof(status),
         }
+    }
+
+    fn onDcs(self: *Screen, d: Event.DcsFull) void {
+        // v1: handle 'q' = sixel. Decode and log; render integration
+        // (placement → GL texture) lands in M9b finish.
+        if (d.proto.final != 'q') return;
+        const sixel = @import("../parser/sixel.zig");
+        const decoded = sixel.decode(self.allocator, d.body) catch return;
+        defer self.allocator.free(decoded.rgba);
+        if (self.sink.on_image) |f| f(self.sink.ctx, .{
+            .width = decoded.width,
+            .height = decoded.height,
+            .rgba = decoded.rgba,
+            .row = self.row,
+            .col = self.col,
+        });
     }
 
     fn onChildEof(self: *Screen, status: i32) void {
