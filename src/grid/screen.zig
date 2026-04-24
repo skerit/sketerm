@@ -67,6 +67,9 @@ pub const Screen = struct {
     cursor_visible: bool = true,
     /// DECSCUSR cursor shape.
     cursor_shape: CursorShape = .block_blink,
+    /// Blink phase — true=visible, false=hidden. Toggled by the
+    /// rendering layer when the shape is a blinking variant.
+    cursor_blink_on: bool = true,
     /// Mouse mode (1000/1002/1003) — last-set value.
     mouse_mode: u16 = 0,
     /// Mouse encoding (1006/1015 etc).

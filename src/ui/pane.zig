@@ -41,6 +41,8 @@ pub const Pane = struct {
     win_on_title: ?*const fn (ctx: ?*anyopaque, title: []const u8) void = null,
     win_clip_ctx: ?*anyopaque = null,
     win_on_clipboard: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+    /// Cursor blink timing.
+    last_blink_us: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -248,10 +250,25 @@ fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {
 }
 
 fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {
-    // Redraw only when the screen state changed.
     const self: *Pane = @ptrCast(@alignCast(user.?));
-    if (self.terminal.screen.dirty) {
-        self.terminal.screen.dirty = false;
+
+    // Cursor blink — toggle every 500ms for blinking shapes.
+    const screen = self.terminal.screen;
+    const now = std.time.microTimestamp();
+    if (self.last_blink_us == 0) self.last_blink_us = now;
+    const elapsed = now - self.last_blink_us;
+    const blinking = switch (screen.cursor_shape) {
+        .block_blink, .underline_blink, .bar_blink => true,
+        else => false,
+    };
+    if (blinking and elapsed > 500_000) {
+        self.last_blink_us = now;
+        screen.cursor_blink_on = !screen.cursor_blink_on;
+        screen.dirty = true;
+    }
+
+    if (screen.dirty) {
+        screen.dirty = false;
         c.gtk_widget_queue_draw(area);
     }
     return 1; // G_SOURCE_CONTINUE

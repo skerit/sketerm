@@ -205,8 +205,15 @@ pub const GridPass = struct {
             }
         }
 
-        // Cursor — draw last (overlay). Hide while scrolled back.
-        if (view_off == 0 and screen.cursor_visible and screen.row < screen.rows and screen.col < screen.cols) {
+        // Cursor — draw last (overlay). Hide while scrolled back
+        // or while blink phase is off for a blinking shape.
+        const blinking = switch (screen.cursor_shape) {
+            .block_blink, .underline_blink, .bar_blink => true,
+            else => false,
+        };
+        const blink_visible = !blinking or screen.cursor_blink_on;
+        if (view_off == 0 and screen.cursor_visible and blink_visible and
+            screen.row < screen.rows and screen.col < screen.cols) {
             const cx: f32 = @as(f32, @floatFromInt(screen.col)) * cw;
             const cy: f32 = @as(f32, @floatFromInt(screen.row)) * ch;
             const fg = self.default_fg;
