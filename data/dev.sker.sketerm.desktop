@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=sketerm
+GenericName=Terminal Emulator
+Comment=Native GTK4 terminal emulator with image protocols and OSC 52
+Exec=sketerm %F
+Icon=dev.sker.sketerm
+Categories=System;TerminalEmulator;Utility;
+StartupNotify=true
+StartupWMClass=sketerm
+Terminal=false
+Keywords=shell;prompt;command;commandline;cmd;

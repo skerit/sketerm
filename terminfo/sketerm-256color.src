@@ -1,0 +1,25 @@
+# sketerm-256color: terminfo for the sketerm terminal emulator.
+#
+# Based on xterm-256color, plus extensions for:
+#   - Truecolor (Tc, RGB)
+#   - OSC 52 clipboard (Ms)
+#   - Bracketed paste mode (BE/BD/PS/PE)
+#   - Cursor shape (Ss/Se via DECSCUSR)
+#   - Focus reporting (fe/fd via DECSET 1004)
+#
+# Compile with:  tic -x sketerm-256color.src
+# Install to:    $XDG_DATA_HOME/terminfo (loaded automatically)
+
+sketerm-256color|sketerm with truecolor + sixel + OSC 52,
+    use=xterm-256color,
+    Tc,
+    RGB,
+    Ms=\E]52;%p1%s;%p2%s\007,
+    BE=\E[?2004h,
+    BD=\E[?2004l,
+    PS=\E[200~,
+    PE=\E[201~,
+    Ss=\E[%p1%d q,
+    Se=\E[2 q,
+    fe=\E[?1004h,
+    fd=\E[?1004l,

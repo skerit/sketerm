@@ -1,0 +1,16 @@
+.{
+    .name = .sketerm,
+    .version = "0.0.1",
+    .fingerprint = 0xf7462afd1e681a5e,
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "data",
+        "terminfo",
+        "README.md",
+        "LICENSE",
+    },
+}
