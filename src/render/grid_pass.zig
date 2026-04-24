@@ -180,6 +180,31 @@ pub const GridPass = struct {
             }
         }
 
+        // Selection overlay (translucent).
+        if (screen.selection.isActive() and view_off == 0) {
+            const r_opt = screen.selection.rect();
+            if (r_opt) |r| {
+                var sr = r.top_row;
+                while (sr <= r.bot_row) : (sr += 1) {
+                    if (sr < 0 or sr >= screen.rows) continue;
+                    const start_col: i32 = if (sr == r.top_row) r.top_col else 0;
+                    const end_col: i32 = if (sr == r.bot_row) r.bot_col else screen.cols;
+                    if (end_col <= start_col) continue;
+                    const x: f32 = @as(f32, @floatFromInt(@max(0, start_col))) * cw;
+                    const y: f32 = @as(f32, @floatFromInt(sr)) * ch;
+                    const w: f32 = @as(f32, @floatFromInt(end_col - @max(0, start_col))) * cw;
+                    try self.pushQuad(
+                        .{ x, y },
+                        .{ w, ch },
+                        .{ 0, 0 },
+                        .{ 0, 0 },
+                        .{ 0.4, 0.55, 0.85, 0.45 },
+                        0.0,
+                    );
+                }
+            }
+        }
+
         // Cursor — draw last (overlay). Hide while scrolled back.
         if (view_off == 0 and screen.cursor_visible and screen.row < screen.rows and screen.col < screen.cols) {
             const cx: f32 = @as(f32, @floatFromInt(screen.col)) * cw;

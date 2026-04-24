@@ -93,7 +93,25 @@ pub const Pane = struct {
         );
         c.gtk_widget_add_controller(area_widget, @ptrCast(scroll_ctrl));
 
+        // Left-button drag → selection.
+        const drag = c.gtk_gesture_drag_new();
+        c.gtk_gesture_single_set_button(@ptrCast(drag), 1);
+        _ = c.g_signal_connect_data(drag, "drag-begin", @ptrCast(&onDragBegin), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(drag, "drag-update", @ptrCast(&onDragUpdate), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(area_widget, @ptrCast(drag));
+
         return self;
+    }
+
+    fn cellAt(self: *Pane, x: f64, y: f64) struct { row: i32, col: i32 } {
+        const atlas = self.atlas;
+        if (atlas == null or atlas.?.cell_w == 0 or atlas.?.cell_h == 0) return .{ .row = 0, .col = 0 };
+        const col_f = x / @as(f64, @floatFromInt(atlas.?.cell_w));
+        const row_f = y / @as(f64, @floatFromInt(atlas.?.cell_h));
+        return .{
+            .col = @intFromFloat(@max(0.0, col_f)),
+            .row = @intFromFloat(@max(0.0, row_f)),
+        };
     }
 
     pub fn deinit(self: *Pane) void {
@@ -152,6 +170,23 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, _: ?*anyopaque) callconv(.c) 
     // M4 will only redraw on dirty.
     c.gtk_widget_queue_draw(area);
     return 1; // G_SOURCE_CONTINUE
+}
+
+fn onDragBegin(_: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const cell = self.cellAt(x, y);
+    self.terminal.screen.selection.start(cell.row, cell.col, .normal);
+    c.gtk_widget_queue_draw(@ptrCast(self.area));
+}
+
+fn onDragUpdate(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+    var sx: f64 = 0;
+    var sy: f64 = 0;
+    _ = c.gtk_gesture_drag_get_start_point(g, &sx, &sy);
+    const cell = self.cellAt(sx + dx, sy + dy);
+    self.terminal.screen.selection.extend(cell.row, cell.col);
+    c.gtk_widget_queue_draw(@ptrCast(self.area));
 }
 
 fn onScroll(_: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {

@@ -64,6 +64,10 @@ fn onKeyPressed(
                 clipboard.pasteFromClipboard(ctx.widget, ctx.terminal);
                 return 1;
             },
+            c.GDK_KEY_C, c.GDK_KEY_c => {
+                copySelection(ctx);
+                return 1;
+            },
             c.GDK_KEY_T, c.GDK_KEY_t => {
                 if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .new_tab);
                 return 1;
@@ -91,6 +95,22 @@ fn onKeyPressed(
     if (n == 0) return 0;
     _ = ctx.terminal.pty.writeAll(buf[0..n]);
     return 1;
+}
+
+fn copySelection(ctx: *Ctx) void {
+    const screen = ctx.terminal.screen;
+    if (!screen.selection.isActive()) return;
+    const text = screen.extractSelection(ctx.terminal.allocator) catch return;
+    defer ctx.terminal.allocator.free(text);
+    if (text.len == 0) return;
+
+    // Copy to system clipboard.
+    const display = c.gtk_widget_get_display(ctx.widget);
+    const clip = c.gdk_display_get_clipboard(display);
+    const cstr = ctx.terminal.allocator.allocSentinel(u8, text.len, 0) catch return;
+    defer ctx.terminal.allocator.free(cstr);
+    @memcpy(cstr, text);
+    c.gdk_clipboard_set_text(clip, cstr.ptr);
 }
 
 fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType) usize {

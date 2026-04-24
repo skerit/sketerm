@@ -13,6 +13,7 @@ comptime {
     _ = @import("grid/cell.zig");
     _ = @import("grid/style_pool.zig");
     _ = @import("grid/screen.zig");
+    _ = @import("grid/selection.zig");
 }
 
 test {

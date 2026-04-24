@@ -77,6 +77,9 @@ pub const Screen = struct {
     /// UTF-8 reassembly for `print_byte` events.
     decoder: utf8.Decoder = .{},
 
+    /// Selection (mouse drag).
+    selection: @import("selection.zig").Selection = .{},
+
     pool: *Pool,
     allocator: std.mem.Allocator,
 
@@ -153,6 +156,66 @@ pub const Screen = struct {
     /// Get a scrollback line by offset-from-top. 0 = oldest.
     pub fn scrollbackLine(self: *const Screen, idx: u32) *const Line {
         return &self.scrollback.items[idx];
+    }
+
+    /// Extract selection text (UTF-8). Coordinates are *display*
+    /// rows: 0..rows-1 reference active screen, negative values
+    /// reference scrollback (-1 = bottom-most scrollback line).
+    /// Caller frees the returned slice.
+    pub fn extractSelection(self: *const Screen, allocator: std.mem.Allocator) ![]u8 {
+        const sel = self.selection;
+        const r = sel.rect() orelse return try allocator.alloc(u8, 0);
+
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(allocator);
+
+        var row = r.top_row;
+        while (row <= r.bot_row) : (row += 1) {
+            const line_cells = self.lineCellsAt(row) orelse continue;
+            const start_col: i32 = if (row == r.top_row) r.top_col else 0;
+            const end_col: i32 = if (row == r.bot_row) r.bot_col else @intCast(line_cells.len);
+            const lo: usize = @intCast(@max(@as(i32, 0), start_col));
+            const hi: usize = @intCast(@max(@as(i32, 0), end_col));
+            const hi_clamped = @min(hi, line_cells.len);
+            if (lo >= hi_clamped) continue;
+
+            // Trim trailing blank cells on this line span.
+            var actual_hi = hi_clamped;
+            while (actual_hi > lo and line_cells[actual_hi - 1].rune == 0) actual_hi -= 1;
+
+            var col: usize = lo;
+            while (col < actual_hi) : (col += 1) {
+                const cp = line_cells[col].rune;
+                if (cp == 0) {
+                    try out.append(allocator, ' ');
+                } else if (cp < 0x80) {
+                    try out.append(allocator, @intCast(cp));
+                } else {
+                    var ub: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
+                    try out.appendSlice(allocator, ub[0..n]);
+                }
+            }
+            if (row != r.bot_row) try out.append(allocator, '\n');
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// Returns the cells slice for a display row, including scrollback
+    /// (negative rows). Returns null on out-of-range.
+    fn lineCellsAt(self: *const Screen, row: i32) ?[]Cell {
+        if (row >= 0 and row < @as(i32, @intCast(self.rows))) {
+            const buf_const = if (self.use_alt) self.alt.? else self.active;
+            return buf_const[@intCast(row)].cells;
+        }
+        if (row < 0) {
+            const idx_from_end: u32 = @intCast(-row - 1);
+            const sb_count = self.scrollbackCount();
+            if (idx_from_end >= sb_count) return null;
+            const idx = sb_count - 1 - idx_from_end;
+            return self.scrollback.items[idx].cells;
+        }
+        return null;
     }
 
     fn buf(self: *Screen) []Line {
