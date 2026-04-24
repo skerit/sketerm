@@ -13,6 +13,7 @@ const Atlas = @import("../render/atlas.zig").Atlas;
 const GridPass = @import("../render/grid_pass.zig").GridPass;
 const Terminal = @import("../terminal.zig").Terminal;
 const input = @import("input.zig");
+pub const InputCtx = input.Ctx;
 
 const FONT_PATH: [*:0]const u8 = "/usr/share/fonts/TTF/Hack-Regular.ttf";
 const FONT_SIZE: u16 = 14;
@@ -23,6 +24,7 @@ pub const Pane = struct {
     atlas: ?*Atlas = null,
     grid_pass: GridPass,
     allocator: std.mem.Allocator,
+    input_ctx: ?*input.Ctx = null,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -66,8 +68,8 @@ pub const Pane = struct {
             null,
         );
 
-        // M4: keyboard input → PTY.
-        try input.attach(area_widget, terminal, allocator);
+        // M4: keyboard input → PTY (also handles shortcuts).
+        self.input_ctx = try input.attach(area_widget, terminal, allocator);
 
         // Resize → TIOCSWINSZ → SIGWINCH child.
         _ = c.g_signal_connect_data(

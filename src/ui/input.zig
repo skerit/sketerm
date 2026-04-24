@@ -8,12 +8,25 @@ const c = @import("../c.zig").c;
 const Terminal = @import("../terminal.zig").Terminal;
 const clipboard = @import("clipboard.zig");
 
-const Ctx = struct {
+pub const Ctx = struct {
     widget: *c.GtkWidget,
     terminal: *Terminal,
+    /// Optional shortcut sink for tab/split/etc actions. May be null
+    /// for top-level shortcuts handled elsewhere.
+    shortcut_sink: ?*const fn (ctx: ?*anyopaque, action: Action) void = null,
+    shortcut_ctx: ?*anyopaque = null,
 };
 
-pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allocator) !void {
+pub const Action = enum {
+    new_tab,
+    close_tab,
+    next_tab,
+    prev_tab,
+    copy,
+    paste, // primary path; input also handles directly
+};
+
+pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allocator) !*Ctx {
     const ctx = try allocator.create(Ctx);
     ctx.* = .{ .widget = widget, .terminal = terminal };
 
@@ -30,6 +43,7 @@ pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allo
 
     c.gtk_widget_set_focusable(widget, 1);
     _ = c.gtk_widget_grab_focus(widget);
+    return ctx;
 }
 
 fn onKeyPressed(
@@ -50,8 +64,26 @@ fn onKeyPressed(
                 clipboard.pasteFromClipboard(ctx.widget, ctx.terminal);
                 return 1;
             },
+            c.GDK_KEY_T, c.GDK_KEY_t => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .new_tab);
+                return 1;
+            },
+            c.GDK_KEY_W, c.GDK_KEY_w => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .close_tab);
+                return 1;
+            },
             else => {},
         }
+    }
+    if (ctrl_pressed and !shift_pressed) {
+        if (keyval == c.GDK_KEY_Tab) {
+            if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .next_tab);
+            return 1;
+        }
+    }
+    if (ctrl_pressed and shift_pressed and keyval == c.GDK_KEY_ISO_Left_Tab) {
+        if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .prev_tab);
+        return 1;
     }
 
     var buf: [16]u8 = undefined;
