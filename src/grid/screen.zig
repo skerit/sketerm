@@ -242,8 +242,22 @@ pub const Screen = struct {
             .osc => |osc| self.onOsc(osc.bytes),
             .apc => {}, // wired in M9 (Kitty graphics)
             .dcs_start, .dcs_data, .dcs_end => {}, // wired in M9
-            .child_eof => {},
+            .child_eof => |status| self.onChildEof(status),
         }
+    }
+
+    fn onChildEof(self: *Screen, status: i32) void {
+        // Write a status message at the cursor position. Hold-on-exit
+        // = true (per plan) — pane stays open until user closes it.
+        var msg_buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "[process exited with status {d}]", .{status}) catch return;
+        // CR + LF first to start a new line.
+        self.execute('\r');
+        self.execute('\n');
+        for (msg) |b| self.printByte(b);
+        self.execute('\r');
+        self.execute('\n');
+        self.cursor_visible = false;
     }
 
     fn onOsc(self: *Screen, bytes: []const u8) void {
