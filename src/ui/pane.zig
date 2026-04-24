@@ -81,6 +81,18 @@ pub const Pane = struct {
             c.G_CONNECT_DEFAULT,
         );
 
+        // Mouse-wheel scroll → adjust view_offset.
+        const scroll_ctrl = c.gtk_event_controller_scroll_new(c.GTK_EVENT_CONTROLLER_SCROLL_VERTICAL);
+        _ = c.g_signal_connect_data(
+            scroll_ctrl,
+            "scroll",
+            @ptrCast(&onScroll),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+        c.gtk_widget_add_controller(area_widget, @ptrCast(scroll_ctrl));
+
         return self;
     }
 
@@ -140,6 +152,21 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, _: ?*anyopaque) callconv(.c) 
     // M4 will only redraw on dirty.
     c.gtk_widget_queue_draw(area);
     return 1; // G_SOURCE_CONTINUE
+}
+
+fn onScroll(_: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const screen = self.terminal.screen;
+    const sb = screen.scrollbackCount();
+    // Scroll up (negative dy) increases view_offset. 3 lines per click.
+    if (dy < 0) {
+        const want = screen.view_offset + 3;
+        screen.view_offset = if (want > sb) sb else want;
+    } else if (dy > 0) {
+        screen.view_offset = if (screen.view_offset >= 3) screen.view_offset - 3 else 0;
+    }
+    c.gtk_widget_queue_draw(@ptrCast(self.area));
+    return 1;
 }
 
 fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {

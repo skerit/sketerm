@@ -134,9 +134,18 @@ pub const GridPass = struct {
         const ascent: f32 = @floatFromInt(atlas.ascent);
 
         const buf = if (screen.use_alt) screen.alt.? else screen.active;
+        const sb_count: u32 = if (screen.use_alt) 0 else screen.scrollbackCount();
+        const view_off: u32 = @min(screen.view_offset, sb_count);
+
         var row: u16 = 0;
         while (row < screen.rows) : (row += 1) {
-            const ln = buf[row];
+            // Resolve which logical line to display at this row.
+            // view_off lines from scrollback are visible at top.
+            const ln_ptr: *const @TypeOf(buf[0]) = if (row < view_off) blk: {
+                const sb_idx = sb_count - view_off + row;
+                break :blk screen.scrollbackLine(sb_idx);
+            } else &buf[row - view_off];
+            const ln = ln_ptr.*;
             var col: u16 = 0;
             while (col < screen.cols) : (col += 1) {
                 const cell = ln.cells[col];
@@ -171,8 +180,8 @@ pub const GridPass = struct {
             }
         }
 
-        // Cursor — draw last (overlay).
-        if (screen.cursor_visible and screen.row < screen.rows and screen.col < screen.cols) {
+        // Cursor — draw last (overlay). Hide while scrolled back.
+        if (view_off == 0 and screen.cursor_visible and screen.row < screen.rows and screen.col < screen.cols) {
             const cx: f32 = @as(f32, @floatFromInt(screen.col)) * cw;
             const cy: f32 = @as(f32, @floatFromInt(screen.row)) * ch;
             const cursor_color = self.default_fg;
