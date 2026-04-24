@@ -15,6 +15,7 @@ comptime {
     _ = @import("grid/screen.zig");
     _ = @import("grid/selection.zig");
     _ = @import("layout.zig");
+    _ = @import("parser/sixel.zig");
 }
 
 test {
