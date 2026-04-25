@@ -1362,7 +1362,20 @@ pub const Screen = struct {
                 1003 => self.mouse_mode = if (set) 1003 else 0,
                 1004 => self.focus_reports = set,
                 1006 => self.mouse_sgr = set,
-                1047, 1049 => self.toggleAltScreen(set),
+                1047 => self.toggleAltScreen(set),
+                1049 => {
+                    // 1049 = save cursor + switch alt + clear alt on
+                    // set; restore cursor + switch main on reset.
+                    if (set and !self.use_alt) self.saveCursor();
+                    self.toggleAltScreen(set);
+                    if (set) {
+                        self.row = 0;
+                        self.col = 0;
+                        self.pending_wrap = false;
+                    } else {
+                        self.restoreCursor();
+                    }
+                },
                 2004 => self.bracketed_paste = set,
                 else => {},
             }
