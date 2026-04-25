@@ -47,6 +47,10 @@ pub const Screen = struct {
     saved_col: u16 = 0,
     saved_style: u16 = 0,
     saved_origin: bool = false,
+    saved_autowrap: bool = true,
+    saved_charset_g0: Charset = .ascii,
+    saved_charset_g1: Charset = .ascii,
+    saved_active_charset: ActiveCharset = .g0,
 
     /// Current SGR-derived style index.
     cur_style: u16 = 0,
@@ -121,7 +125,7 @@ pub const Screen = struct {
     charset_g0: Charset = .ascii,
     charset_g1: Charset = .ascii,
     /// Which slot is locked-shift active. SO/SI swap this.
-    active_charset: enum { g0, g1 } = .g0,
+    active_charset: ActiveCharset = .g0,
 
     /// Side-effect sink — optional callbacks invoked by apply.
     sink: Sink = .{},
@@ -136,6 +140,7 @@ pub const Screen = struct {
     };
 
     pub const Charset = enum { ascii, dec_graphics };
+    pub const ActiveCharset = enum { g0, g1 };
 
     /// DEC special graphics translation. Only applies to bytes
     /// 0x60..0x7E in the ASCII range; outside that range the byte
@@ -1087,6 +1092,10 @@ pub const Screen = struct {
         self.saved_col = self.col;
         self.saved_style = self.cur_style;
         self.saved_origin = self.origin_mode;
+        self.saved_autowrap = self.autowrap;
+        self.saved_charset_g0 = self.charset_g0;
+        self.saved_charset_g1 = self.charset_g1;
+        self.saved_active_charset = self.active_charset;
     }
 
     fn restoreCursor(self: *Screen) void {
@@ -1094,6 +1103,10 @@ pub const Screen = struct {
         self.col = @min(self.saved_col, if (self.cols > 0) self.cols - 1 else 0);
         self.cur_style = self.saved_style;
         self.origin_mode = self.saved_origin;
+        self.autowrap = self.saved_autowrap;
+        self.charset_g0 = self.saved_charset_g0;
+        self.charset_g1 = self.saved_charset_g1;
+        self.active_charset = self.saved_active_charset;
         self.pending_wrap = false;
     }
 
