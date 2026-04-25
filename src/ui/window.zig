@@ -56,6 +56,16 @@ pub const Window = struct {
             c.G_CONNECT_DEFAULT,
         );
 
+        // Move keyboard focus to the newly selected tab's pane.
+        _ = c.g_signal_connect_data(
+            tab_view_w,
+            "notify::selected-page",
+            @ptrCast(&onSelectedPageChanged),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+
         return self;
     }
 
@@ -665,6 +675,23 @@ fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) voi
     defer c.g_object_unref(notif);
     if (body.len > 0) c.g_notification_set_body(notif, body_z.ptr);
     c.g_application_send_notification(@ptrCast(app), null, notif);
+}
+
+/// Move keyboard focus into the newly selected tab's pane so
+/// typing immediately reaches that PTY.
+fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    const page = c.adw_tab_view_get_selected_page(view);
+    if (page == null) return;
+    const child = c.adw_tab_page_get_child(page);
+    if (child == null) return;
+    // Find the first Pane whose widget is a descendant of `child`.
+    for (self.panes.items) |p| {
+        if (widgetIsAncestor(@ptrCast(child), p.widget())) {
+            _ = c.gtk_widget_grab_focus(p.widget());
+            return;
+        }
+    }
 }
 
 /// Tear down all Zig-side panes + terminals that lived in this
