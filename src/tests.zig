@@ -15,6 +15,7 @@ comptime {
     _ = @import("grid/style_pool.zig");
     _ = @import("grid/screen.zig");
     _ = @import("grid/selection.zig");
+    _ = @import("grid/image_store.zig");
     _ = @import("layout.zig");
     _ = @import("parser/sixel.zig");
     _ = @import("parser/iterm_image.zig");

@@ -93,13 +93,43 @@ pub const Store = struct {
         }
     }
 
+    /// How many images are currently held (including those marked
+    /// for deletion until the next flushUploads).
+    pub fn count(self: *const Store) usize {
+        return self.images.items.len;
+    }
+
+    /// Free all images and their pending buffers, ignoring GL
+    /// teardown — only safe to call after the GL context is gone
+    /// or was never established. Used by tests.
+    pub fn freeAllNoGL(self: *Store) void {
+        for (self.images.items) |*img| {
+            if (img.pending) |p| self.allocator.free(p);
+        }
+        self.images.clearRetainingCapacity();
+    }
+
+    /// Like flushUploads but skips the GL-side work — for tests.
+    pub fn flushDeletesNoGL(self: *Store) void {
+        var i: usize = 0;
+        while (i < self.images.items.len) {
+            const img = &self.images.items[i];
+            if (img.deleting) {
+                if (img.pending) |p| self.allocator.free(p);
+                _ = self.images.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
     /// Upload pending images to GL, free deleted ones. Caller must
     /// have a current GL context.
     pub fn flushUploads(self: *Store) void {
         // Free GL textures for items marked deleting.
         var i: usize = 0;
         while (i < self.images.items.len) {
-            var img = &self.images.items[i];
+            const img = &self.images.items[i];
             if (img.deleting) {
                 if (img.pending) |p| self.allocator.free(p);
                 if (img.gl_tex != 0) c.glDeleteTextures(1, &img.gl_tex);
@@ -134,3 +164,41 @@ pub const Store = struct {
         }
     }
 };
+
+test "addWithId stores image_id" {
+    var s = Store.init(std.testing.allocator);
+    defer s.images.deinit(std.testing.allocator);
+    defer s.freeAllNoGL();
+    const rgba = [_]u8{0} ** 16; // 2x2 RGBA
+    try s.addWithId(&rgba, 2, 2, 0, 0, 42);
+    try std.testing.expectEqual(@as(u32, 42), s.images.items[0].image_id);
+}
+
+test "markByIdForDelete flags only matching images" {
+    var s = Store.init(std.testing.allocator);
+    defer s.images.deinit(std.testing.allocator);
+    defer s.freeAllNoGL();
+    const rgba = [_]u8{0} ** 16;
+    try s.addWithId(&rgba, 2, 2, 0, 0, 1);
+    try s.addWithId(&rgba, 2, 2, 0, 0, 2);
+    try s.addWithId(&rgba, 2, 2, 0, 0, 1);
+    s.markByIdForDelete(1);
+    try std.testing.expect(s.images.items[0].deleting);
+    try std.testing.expect(!s.images.items[1].deleting);
+    try std.testing.expect(s.images.items[2].deleting);
+    s.flushDeletesNoGL();
+    try std.testing.expectEqual(@as(usize, 1), s.count());
+    try std.testing.expectEqual(@as(u32, 2), s.images.items[0].image_id);
+}
+
+test "markAllForDelete flags everything" {
+    var s = Store.init(std.testing.allocator);
+    defer s.images.deinit(std.testing.allocator);
+    defer s.freeAllNoGL();
+    const rgba = [_]u8{0} ** 16;
+    try s.addWithId(&rgba, 2, 2, 0, 0, 1);
+    try s.addWithId(&rgba, 2, 2, 0, 0, 2);
+    s.markAllForDelete();
+    s.flushDeletesNoGL();
+    try std.testing.expectEqual(@as(usize, 0), s.count());
+}
