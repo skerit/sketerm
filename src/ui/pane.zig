@@ -130,6 +130,19 @@ pub const Pane = struct {
         // Right-click → context menu.
         try menu.attach(area_widget, allocator, paneMenuSink, @ptrCast(self));
 
+        // Mouse motion → hover tooltip for OSC 8 hyperlinks.
+        const motion = c.gtk_event_controller_motion_new();
+        _ = c.g_signal_connect_data(
+            motion,
+            "motion",
+            @ptrCast(&onMotion),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+        c.gtk_widget_add_controller(area_widget, @ptrCast(motion));
+        c.gtk_widget_set_has_tooltip(area_widget, 1);
+
         return self;
     }
 
@@ -278,6 +291,29 @@ fn paneMenuSink(ctx: ?*anyopaque, action: menu.Action) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
     if (self.handleMenuLocal(action)) return;
     if (self.menu_sink) |f| f(self.menu_sink_ctx, action);
+}
+
+fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const cell = self.cellAt(x, y);
+    if (cell.row < 0 or cell.col < 0) return;
+    const screen = self.terminal.screen;
+    if (cell.row >= screen.rows or cell.col >= screen.cols) return;
+    const c_row: u16 = @intCast(cell.row);
+    const c_col: u16 = @intCast(cell.col);
+    const cell_data = screen.cellAt(c_row, c_col);
+    if (cell_data.flags & 0b0000_0100 == 0) {
+        c.gtk_widget_set_tooltip_text(@ptrCast(self.area), null);
+        return;
+    }
+    if (screen.linkUri(cell_data.reserved)) |uri| {
+        // Copy to null-terminated buffer for GTK.
+        var buf: [4096]u8 = undefined;
+        const n = @min(uri.len, buf.len - 1);
+        @memcpy(buf[0..n], uri[0..n]);
+        buf[n] = 0;
+        c.gtk_widget_set_tooltip_text(@ptrCast(self.area), &buf);
+    }
 }
 
 fn onDragBegin(_: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
