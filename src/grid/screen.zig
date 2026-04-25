@@ -103,6 +103,10 @@ pub const Screen = struct {
     /// when no composition active. Renderer overlays at cursor.
     preedit_text: ?[]u8 = null,
 
+    /// Microsecond timestamp when BEL was last received. Renderer
+    /// flashes a translucent white overlay for ~200ms after.
+    bell_at_us: i64 = 0,
+
     /// Side-effect sink — optional callbacks invoked by apply.
     sink: Sink = .{},
 
@@ -565,7 +569,11 @@ pub const Screen = struct {
 
     fn execute(self: *Screen, b: u8) void {
         switch (b) {
-            0x07 => {}, // BEL
+            0x07 => {
+                // BEL: visual flash + optional sink notification.
+                self.bell_at_us = std.time.microTimestamp();
+                if (self.sink.on_bell) |f| f(self.sink.ctx);
+            },
             0x08 => self.backspace(),
             0x09 => self.tab(),
             0x0A, 0x0B, 0x0C => self.lineFeed(),

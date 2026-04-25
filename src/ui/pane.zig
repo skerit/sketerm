@@ -319,6 +319,12 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         screen.dirty = true;
     }
 
+    // Keep redrawing while bell flash is fading.
+    if (screen.bell_at_us > 0) {
+        const since_bell = now - screen.bell_at_us;
+        if (since_bell < 200_000) screen.dirty = true;
+    }
+
     if (screen.dirty) {
         // Update IME cursor location so fcitx5 / ibus position
         // their popups at the right cell.

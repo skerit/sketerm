@@ -213,6 +213,26 @@ pub const GridPass = struct {
             }
         }
 
+        // Bell flash — translucent white overlay that fades over 200ms.
+        if (screen.bell_at_us > 0) {
+            const now = std.time.microTimestamp();
+            const elapsed = now - screen.bell_at_us;
+            if (elapsed >= 0 and elapsed < 200_000) {
+                const t: f32 = @floatCast(@as(f64, @floatFromInt(elapsed)) / 200_000.0);
+                const alpha: f32 = 0.4 * (1.0 - t);
+                const grid_w: f32 = @as(f32, @floatFromInt(screen.cols)) * cw;
+                const grid_h: f32 = @as(f32, @floatFromInt(screen.rows)) * ch;
+                try self.pushQuad(
+                    .{ 0, 0 },
+                    .{ grid_w, grid_h },
+                    .{ 0, 0 },
+                    .{ 0, 0 },
+                    .{ 1.0, 1.0, 1.0, alpha },
+                    0.0,
+                );
+            }
+        }
+
         // IME preedit overlay — render at cursor position with
         // an underline beneath.
         if (view_off == 0 and screen.preedit_text != null) {
