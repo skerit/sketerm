@@ -25,6 +25,10 @@ pub fn Ring(comptime T: type, comptime capacity: usize) type {
         // re-acquiring until they catch up. Cache-line aligned to keep
         // it off the producer's path.
         cached_head: usize align(64) = 0,
+        // Producer-private cache of the last tail value seen via
+        // acquire. Subsequent pushes only re-acquire when they detect
+        // the ring is full against the cache.
+        cached_tail: usize align(64) = 0,
 
         pub fn init() Self {
             return .{};
@@ -35,10 +39,16 @@ pub fn Ring(comptime T: type, comptime capacity: usize) type {
         }
 
         /// Producer side. Returns true if pushed, false if full.
+        ///
+        /// Uses a private `cached_tail` snapshot so a hot push loop
+        /// only pays one `tail.load(.acquire)` when the cached value
+        /// suggests the ring is full. Refreshed lazily.
         pub fn push(self: *Self, item: T) bool {
             const head = self.head.load(.monotonic);
-            const tail = self.tail.load(.acquire);
-            if (head -% tail >= capacity) return false; // full
+            if (head -% self.cached_tail >= capacity) {
+                self.cached_tail = self.tail.load(.acquire);
+                if (head -% self.cached_tail >= capacity) return false;
+            }
             self.items[head & mask] = item;
             self.head.store(head +% 1, .release);
             return true;
