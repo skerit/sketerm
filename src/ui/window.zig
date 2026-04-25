@@ -18,6 +18,7 @@ pub const Window = struct {
     terminals: std.ArrayList(*Terminal) = .{},
     allocator: std.mem.Allocator,
     tab_counter: u32 = 0,
+    debug_events: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         const self = try allocator.create(Window);
@@ -144,6 +145,7 @@ pub const Window = struct {
 
                 const term = try Terminal.init(self.allocator, pty, 80, 24);
                 errdefer term.deinit();
+                term.debug_to_stderr = self.debug_events;
 
                 const pane = try self.makePane(term);
                 pane.win_clip_ctx = @ptrCast(self);
@@ -212,6 +214,7 @@ pub const Window = struct {
 
         const term = try Terminal.init(self.allocator, pty, 80, 24);
         errdefer term.deinit();
+        term.debug_to_stderr = self.debug_events;
 
         const pane = try self.makePane(term);
 
@@ -256,6 +259,7 @@ pub const Window = struct {
 
         const term = try Terminal.init(self.allocator, pty, 80, 24);
         errdefer term.deinit();
+        term.debug_to_stderr = self.debug_events;
 
         const pane = try self.makePane(term);
         pane.win_clip_ctx = @ptrCast(self);

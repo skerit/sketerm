@@ -13,6 +13,7 @@ const App = struct {
     restore: bool = false,
     layout_path: ?[]const u8 = null,
     no_save: bool = false,
+    debug_events: bool = false,
 };
 
 const HELP_TEXT =
@@ -24,6 +25,7 @@ const HELP_TEXT =
     \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json
     \\  --layout <path>       Load tabs from specific JSON layout file
     \\  --no-save             Don't write last.json on exit
+    \\  --debug-events        Print parser events to stderr
     \\  --help                Show this message
     \\  --version             Show version
     \\
@@ -66,6 +68,8 @@ pub fn main() u8 {
             g_app.layout_path = argv[i];
         } else if (std.mem.eql(u8, a, "--no-save")) {
             g_app.no_save = true;
+        } else if (std.mem.eql(u8, a, "--debug-events")) {
+            g_app.debug_events = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print("{s}", .{HELP_TEXT});
             return 0;
@@ -126,6 +130,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         std.debug.print("sketerm: window init failed: {s}\n", .{@errorName(err)});
         return;
     };
+    window.debug_events = g_app.debug_events;
     g_app.window = window;
 
     var loaded = false;
