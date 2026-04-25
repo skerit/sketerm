@@ -1168,9 +1168,25 @@ pub const Screen = struct {
                     var i: usize = 0;
                     while (i < run.len) : (i += 1) self.printCp(run.bytes[i]);
                 } else {
-                    // Tier 3: full per-byte path (UTF-8 reassembly).
+                    // Tier 2.5: mixed run. Within the run, bulk-print
+                    // ASCII subranges via printCp directly (the decoder
+                    // would just emit them unchanged anyway), and only
+                    // route non-ASCII bytes through Decoder.feed for
+                    // codepoint reassembly. Skips per-byte branches in
+                    // the decoder for typical CJK + ASCII chrome.
                     var i: usize = 0;
-                    while (i < run.len) : (i += 1) self.printByte(run.bytes[i]);
+                    while (i < run.len) {
+                        if (self.decoder.expected == 0 and run.bytes[i] < 0x80) {
+                            const start = i;
+                            while (i < run.len and self.decoder.expected == 0 and run.bytes[i] < 0x80) : (i += 1) {}
+                            // start..i is pure ASCII with idle decoder.
+                            // printCp directly without going through feed.
+                            for (run.bytes[start..i]) |b| self.printCp(b);
+                        } else {
+                            self.printByte(run.bytes[i]);
+                            i += 1;
+                        }
+                    }
                 }
             },
             .execute => |b| self.execute(b),
