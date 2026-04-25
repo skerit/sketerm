@@ -435,7 +435,7 @@ pub const GridPass = struct {
             const thumb_h_f: f32 = @as(f32, @floatFromInt(visible)) / @as(f32, @floatFromInt(total_lines));
             const thumb_y: f32 = thumb_top_f * track_h;
             const thumb_h: f32 = @max(8.0, thumb_h_f * track_h);
-            const thumb_color = if (view_off == 0)
+            const thumb_color: [4]f32 = if (view_off == 0)
                 .{ 0.5, 0.5, 0.5, 0.30 }
             else
                 .{ 0.40, 0.55, 0.85, 0.70 };
