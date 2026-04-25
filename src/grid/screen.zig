@@ -121,6 +121,11 @@ pub const Screen = struct {
     mouse_enc: MouseEnc = .legacy,
     /// Pending SS2 / SS3 single-shift consumed by the next printCp.
     pending_single_shift: PendingSingleShift = .none,
+    /// DECSET 2026 — synchronized output. While on, the renderer
+    /// suppresses redraws so the app can stage a multi-step update
+    /// and have it appear atomically. Reset triggers an immediate
+    /// redraw via the dirty flag.
+    sync_output: bool = false,
 
     /// Pending wrap: cursor "logically" past col cols-1, awaiting
     /// next print to actually wrap. Matches xterm semantics.
@@ -2353,6 +2358,7 @@ pub const Screen = struct {
             1006 => self.mouse_enc == .sgr,
             1015 => self.mouse_enc == .urxvt,
             1016 => self.mouse_enc == .sgr_pixel,
+            2026 => self.sync_output,
             // 1007 (alt-screen scroll): we don't, treat as off.
             1007 => false,
             1047, 1049 => self.use_alt,
@@ -3034,6 +3040,13 @@ pub const Screen = struct {
                 1002 => self.mouse_mode = if (set) 1002 else 0,
                 1003 => self.mouse_mode = if (set) 1003 else 0,
                 1004 => self.focus_reports = set,
+                2026 => {
+                    // Synchronized output mode (kitty/wezterm/iTerm2).
+                    // Setting on: app begins a multi-step update that
+                    // shouldn't be displayed mid-state. Reset: flush.
+                    self.sync_output = set;
+                    if (!set) self.dirty = true;
+                },
                 1005 => self.mouse_enc = if (set) .utf8 else .legacy,
                 1006 => {
                     self.mouse_sgr = set;
@@ -3746,6 +3759,29 @@ test "mouse encoding modes are mutually-exclusive last-set" {
     csi.final = 'l';
     s.csi(csi);
     try std.testing.expectEqual(Screen.MouseEnc.legacy, s.mouse_enc);
+}
+
+test "DECSET 2026 toggles sync_output and DECRST flushes" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    try std.testing.expect(!s.sync_output);
+
+    var csi = Event.Csi{};
+    csi.private = '?';
+    csi.params[0] = 2026;
+    csi.n_params = 1;
+    csi.final = 'h'; // DECSET
+    s.csi(csi);
+    try std.testing.expect(s.sync_output);
+    try std.testing.expect(s.dirty);
+
+    s.dirty = false;
+    csi.final = 'l'; // DECRST
+    s.csi(csi);
+    try std.testing.expect(!s.sync_output);
+    try std.testing.expect(s.dirty); // reset triggers immediate flush
 }
 
 test "CSI 20t / 21t report icon / window title" {

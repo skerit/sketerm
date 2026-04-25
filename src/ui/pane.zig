@@ -647,6 +647,12 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         screen.dirty = true;
     }
 
+    // Synchronized-output mode (DECSET 2026): suppress redraws so the
+    // running app can stage a multi-step screen update and have it
+    // appear atomically. The `dirty` flag stays set; we'll redraw
+    // when the app sends DECRST 2026.
+    if (screen.dirty and screen.sync_output) return 1;
+
     if (screen.dirty) {
         // Update IME cursor location so fcitx5 / ibus position
         // their popups at the right cell. Only fire when the cursor
