@@ -110,6 +110,8 @@ pub const Screen = struct {
     /// DECSET 1005 (UTF-8), 1006 (SGR — kept in sync with mouse_sgr
     /// for back-compat), 1015 (urxvt), 1016 (SGR pixel).
     mouse_enc: MouseEnc = .legacy,
+    /// Pending SS2 / SS3 single-shift consumed by the next printCp.
+    pending_single_shift: PendingSingleShift = .none,
 
     /// Pending wrap: cursor "logically" past col cols-1, awaiting
     /// next print to actually wrap. Matches xterm semantics.
@@ -237,6 +239,12 @@ pub const Screen = struct {
 
     pub const Charset = enum { ascii, dec_graphics };
     pub const ActiveCharset = enum { g0, g1 };
+
+    /// SS2 (ESC N) and SS3 (ESC O) single-shift the next printable
+    /// codepoint into G2 / G3 respectively. We don't model G2/G3
+    /// charsets, so the shift is consumed without effect — but the
+    /// flag has to exist so the parser-level escape doesn't leak.
+    pub const PendingSingleShift = enum { none, ss2, ss3 };
 
     /// Mouse-event encoding format. Apps select one via DECSET
     /// 1005/1006/1015/1016 (mutually exclusive in practice — last
@@ -1709,8 +1717,14 @@ pub const Screen = struct {
     }
 
     fn printCp(self: *Screen, cp_in: u32) void {
-        // Translate ASCII through the active charset designation.
-        const active = if (self.active_charset == .g0) self.charset_g0 else self.charset_g1;
+        // SS2 / SS3 — single-shift consumed by this print; G2/G3
+        // unmodelled, so the codepoint passes through as if printed
+        // through ASCII.
+        const single_shifted = self.pending_single_shift != .none;
+        if (single_shifted) self.pending_single_shift = .none;
+        // Translate ASCII through the active charset designation —
+        // unless the single-shift bypassed it.
+        const active = if (single_shifted) Charset.ascii else if (self.active_charset == .g0) self.charset_g0 else self.charset_g1;
         const cp: u32 = if (active == .dec_graphics and cp_in <= 0x7E and cp_in >= 0x5F)
             decGraphicsCp(@intCast(cp_in))
         else
@@ -2416,6 +2430,14 @@ pub const Screen = struct {
                 if (self.col < self.tab_stops.items.len) self.tab_stops.items[self.col] = true;
             },
             'M' => self.reverseLineFeed(),
+            // SS2 (ESC N) / SS3 (ESC O) — single-shift designate G2/G3
+            // for the next printed character. We don't model G2/G3
+            // charsets, so the next codepoint passes through as ASCII.
+            // Recognising the escape prevents the parser from leaking
+            // it into the screen as a print, and `pending_single_shift`
+            // is consumed (no-op'd) by the next printCp.
+            'N' => self.pending_single_shift = .ss2,
+            'O' => self.pending_single_shift = .ss3,
             'Z' => self.respondDa(), // DECID — identify, same payload as DA1
             'c' => self.fullReset(),
             '=' => self.app_keypad = true, // DECPAM — application keypad on
@@ -2446,6 +2468,7 @@ pub const Screen = struct {
         self.mouse_sgr = false;
         self.mouse_enc = .legacy;
         self.pending_wrap = false;
+        self.pending_single_shift = .none;
         self.charset_g0 = .ascii;
         self.charset_g1 = .ascii;
         self.active_charset = .g0;
@@ -2469,6 +2492,7 @@ pub const Screen = struct {
         self.autowrap = true;
         self.origin_mode = false;
         self.pending_wrap = false;
+        self.pending_single_shift = .none;
         self.charset_g0 = .ascii;
         self.charset_g1 = .ascii;
         self.active_charset = .g0;
@@ -3598,6 +3622,30 @@ test "mouse encoding modes are mutually-exclusive last-set" {
     csi.final = 'l';
     s.csi(csi);
     try std.testing.expectEqual(Screen.MouseEnc.legacy, s.mouse_enc);
+}
+
+test "SS2/SS3 single-shift bypass G0 charset for one cp" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+
+    // Designate G0 to DEC graphics so 'a' would normally translate.
+    s.charset_g0 = .dec_graphics;
+
+    // SS2 escape: ESC N → pending_single_shift = ss2.
+    s.escFinal(.{ .final = 'N' });
+    try std.testing.expectEqual(Screen.PendingSingleShift.ss2, s.pending_single_shift);
+
+    // Print 'a' — bypasses G0 (would be 0x2592 ▒ in DEC graphics).
+    s.printCp('a');
+    try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(Screen.PendingSingleShift.none, s.pending_single_shift);
+
+    // Next char goes through G0 again.
+    s.printCp('a');
+    // 'a' in DEC graphics maps to U+2592 (▒).
+    try std.testing.expectEqual(@as(u32, 0x2592), s.cellAt(0, 1).rune);
 }
 
 test "DECRQM reports 1005/1015/1016" {
