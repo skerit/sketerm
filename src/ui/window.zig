@@ -28,16 +28,29 @@ pub const Window = struct {
         c.gtk_window_set_title(@ptrCast(app_window), "sketerm");
         c.gtk_window_set_default_size(@ptrCast(app_window), 1000, 700);
 
-        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        // Adw toolbar layout — gives us a header bar (= draggable
+        // title region) on top, the tab bar under that, and the tab
+        // view as the main content. Without the header bar there's
+        // no drag handle for the window.
+        const toolbar_view = c.adw_toolbar_view_new();
+        const header_bar = c.adw_header_bar_new();
         const tab_bar_w = c.adw_tab_bar_new();
         const tab_view_w = c.adw_tab_view_new();
         c.adw_tab_bar_set_view(@ptrCast(tab_bar_w), @ptrCast(tab_view_w));
         c.adw_tab_bar_set_autohide(@ptrCast(tab_bar_w), 0);
         c.gtk_widget_set_vexpand(@ptrCast(@alignCast(tab_view_w)), 1);
 
-        c.gtk_box_append(@ptrCast(box), @ptrCast(@alignCast(tab_bar_w)));
-        c.gtk_box_append(@ptrCast(box), @ptrCast(@alignCast(tab_view_w)));
-        c.adw_application_window_set_content(@ptrCast(app_window), box);
+        // "+" button in the header bar to create a new tab even when
+        // there are no panes left to right-click on.
+        const new_tab_btn = c.gtk_button_new_from_icon_name("list-add-symbolic");
+        c.gtk_widget_set_tooltip_text(new_tab_btn, "New Tab (Ctrl+Shift+T)");
+        c.gtk_actionable_set_action_name(@ptrCast(new_tab_btn), "win.new-tab");
+        c.adw_header_bar_pack_start(@ptrCast(header_bar), new_tab_btn);
+
+        c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), header_bar);
+        c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), @ptrCast(@alignCast(tab_bar_w)));
+        c.adw_toolbar_view_set_content(@ptrCast(toolbar_view), @ptrCast(@alignCast(tab_view_w)));
+        c.adw_application_window_set_content(@ptrCast(app_window), toolbar_view);
 
         self.* = .{
             .app_window = app_window,
@@ -56,6 +69,20 @@ pub const Window = struct {
             null,
             c.G_CONNECT_DEFAULT,
         );
+
+        // Window-level "new-tab" GAction so the header-bar "+" button
+        // works without a focused pane.
+        const new_tab_action = c.g_simple_action_new("new-tab", null);
+        _ = c.g_signal_connect_data(
+            new_tab_action,
+            "activate",
+            @ptrCast(&onNewTabAction),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+        c.g_action_map_add_action(@ptrCast(@alignCast(app_window)), @ptrCast(new_tab_action));
+        c.g_object_unref(new_tab_action);
 
         // Move keyboard focus to the newly selected tab's pane.
         _ = c.g_signal_connect_data(
@@ -266,6 +293,10 @@ pub const Window = struct {
         const pane = try self.makePane(term);
         pane.win_clip_ctx = @ptrCast(self);
         pane.win_on_clipboard = onTermClipboardSet;
+        pane.win_notify_ctx = @ptrCast(self);
+        pane.win_on_notification = onTermNotification;
+        pane.win_bell_ctx = @ptrCast(self);
+        pane.win_on_bell = onTermBell;
         try self.panes.append(self.allocator, pane);
         try self.terminals.append(self.allocator, term);
         return pane;
@@ -300,6 +331,30 @@ pub const Window = struct {
         c.gtk_paned_set_resize_end_child(@ptrCast(paned), 1);
         c.gtk_paned_set_shrink_start_child(@ptrCast(paned), 0);
         c.gtk_paned_set_shrink_end_child(@ptrCast(paned), 0);
+
+        // Without an explicit position, GtkPaned defaults to start_
+        // child's natural size (which is 0 for an empty GLArea) — the
+        // new pane ends up with zero width and renders black. Pre-
+        // seed position to half the focused widget's current dim.
+        const focused_dim: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
+            c.gtk_widget_get_width(focused_w)
+        else
+            c.gtk_widget_get_height(focused_w);
+        if (focused_dim > 0) {
+            c.gtk_paned_set_position(@ptrCast(paned), @divFloor(focused_dim, 2));
+        }
+        // Safety net: also apply 0.5 ratio on map, in case the paned
+        // gets a different allocation than its focused predecessor.
+        const ratio_holder = try self.allocator.create(f32);
+        ratio_holder.* = 0.5;
+        _ = c.g_signal_connect_data(
+            paned,
+            "map",
+            @ptrCast(&applyPanedRatioMap),
+            @ptrCast(ratio_holder),
+            @ptrCast(&freePanedRatio),
+            c.G_CONNECT_DEFAULT,
+        );
 
         // Detach focused widget from parent (where to put new tree depends
         // on parent type).
@@ -375,6 +430,14 @@ pub const Window = struct {
         const sel = c.adw_tab_view_get_selected_page(self.tab_view);
         if (sel == null) return;
         _ = c.adw_tab_view_close_page(self.tab_view, sel);
+        // After the close completes, if no tabs remain, auto-spawn a
+        // fresh shell so the window doesn't end up in an unrecoverable
+        // empty state. (kitty / iterm2 do the same.)
+        if (c.adw_tab_view_get_n_pages(self.tab_view) == 0) {
+            self.newShellTab(null) catch |err| {
+                std.debug.print("sketerm: replacement tab spawn failed: {s}\n", .{@errorName(err)});
+            };
+        }
     }
 
     pub fn nextTab(self: *Window) void {
@@ -702,6 +765,15 @@ fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) voi
     defer c.g_object_unref(notif);
     if (body.len > 0) c.g_notification_set_body(notif, body_z.ptr);
     c.g_application_send_notification(@ptrCast(app), null, notif);
+}
+
+/// `win.new-tab` GAction — fires from the header-bar "+" button
+/// and is the safety net when no pane has focus.
+fn onNewTabAction(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    self.newShellTab(null) catch |err| {
+        std.debug.print("sketerm: new-tab action failed: {s}\n", .{@errorName(err)});
+    };
 }
 
 /// Move keyboard focus into the newly selected tab's pane so
