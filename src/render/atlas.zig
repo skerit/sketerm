@@ -154,9 +154,10 @@ pub const Atlas = struct {
         const buf = c.hb_buffer_create();
         defer c.hb_buffer_destroy(buf);
         c.hb_buffer_add_utf8(buf, text.ptr, @intCast(text.len), 0, @intCast(text.len));
-        c.hb_buffer_set_direction(buf, c.HB_DIRECTION_LTR);
-        c.hb_buffer_set_script(buf, c.HB_SCRIPT_LATIN);
-        c.hb_buffer_set_language(buf, c.hb_language_from_string("en", -1));
+        // Let HB infer script/direction/language from the buffer
+        // contents. Hardcoding LATIN broke any non-Latin codepoint
+        // (half-blocks, box-draw, CJK) — they came back as notdef.
+        c.hb_buffer_guess_segment_properties(buf);
         c.hb_shape(font, buf, null, 0);
         var glyph_count: c_uint = 0;
         const infos = c.hb_buffer_get_glyph_infos(buf, &glyph_count);

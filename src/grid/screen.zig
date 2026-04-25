@@ -2129,8 +2129,12 @@ pub const Screen = struct {
         } else {
             self.use_alt = false;
         }
+        // Selection coordinates reference the previous buffer — they
+        // make no sense after the swap, so wipe them.
+        self.selection.clear();
         // Always mark all lines dirty when switching.
         for (self.buf()) |*l| l.dirty = true;
+        self.dirty = true;
     }
 
     // ── SGR ──────────────────────────────────────────────────────

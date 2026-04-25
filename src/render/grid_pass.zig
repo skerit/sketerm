@@ -453,6 +453,18 @@ pub const GridPass = struct {
         return true;
     }
 
+    /// True iff every cell in the run is plain ASCII printable. The
+    /// HarfBuzz path (with HB_SCRIPT_LATIN) only does the right thing
+    /// for ASCII; non-Latin codepoints — half-block chars, box-draw,
+    /// CJK, emoji — are rendered via the per-codepoint fallback to
+    /// avoid notdef-tofu from the shaper picking the wrong script.
+    fn runIsPureAscii(cells: []const Cell) bool {
+        for (cells) |cell| {
+            if (cell.rune > 0x7E or cell.rune < 0x20) return false;
+        }
+        return true;
+    }
+
     /// Emit glyph quads for a contiguous run of same-style cells.
     /// Path A: HarfBuzz shape (ligature-aware). Path B: per-codepoint
     /// fallback when shaping fails or the atlas has no hb_font.
@@ -491,7 +503,7 @@ pub const GridPass = struct {
         }
         if (blen == 0) return;
 
-        if (self.enable_ligatures and atlas.hb_font != null) {
+        if (self.enable_ligatures and atlas.hb_font != null and runIsPureAscii(cells)) {
             if (atlas.shapeRun(self.allocator, bytes[0..blen])) |shaped| {
                 defer self.allocator.free(shaped);
                 if (shaped.len > 0) {

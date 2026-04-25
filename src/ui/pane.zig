@@ -649,8 +649,17 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
     // On the alternate screen (TUIs like vim, htop, less), the
     // running app owns the mouse model — host-side selection is
     // usually noise. Require Shift to override (matches xterm /
-    // gnome-terminal / kitty conventions).
-    if (self.terminal.screen.use_alt and !shift_held) return;
+    // gnome-terminal / kitty conventions). Wipe any leftover
+    // selection from the main screen so the user doesn't see a
+    // ghost highlight.
+    if (self.terminal.screen.use_alt and !shift_held) {
+        if (self.terminal.screen.selection.isActive()) {
+            self.terminal.screen.selection.clear();
+            self.terminal.screen.dirty = true;
+            c.gtk_widget_queue_draw(@ptrCast(self.area));
+        }
+        return;
+    }
 
     const cell = self.cellAt(x, y);
     const mode: @import("../grid/selection.zig").Mode = if (alt_held) .rectangular else .normal;
@@ -678,7 +687,14 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
         const ev_d = c.gtk_event_controller_get_current_event(@ptrCast(g));
         if (ev_d != null) mods_d = c.gdk_event_get_modifier_state(ev_d);
         const shift_d = (mods_d & c.GDK_SHIFT_MASK) != 0;
-        if (self.terminal.screen.use_alt and !shift_d) return;
+        if (self.terminal.screen.use_alt and !shift_d) {
+            if (self.terminal.screen.selection.isActive()) {
+                self.terminal.screen.selection.clear();
+                self.terminal.screen.dirty = true;
+                c.gtk_widget_queue_draw(@ptrCast(self.area));
+            }
+            return;
+        }
 
         const cell = self.cellAt(x, y);
         const screen = self.terminal.screen;
