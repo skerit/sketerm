@@ -715,3 +715,56 @@ additive or fix conformance gaps.
 
 End of tick: ~327 tests, build clean, smoke runners green, parser
 bench unchanged.
+
+## Perf-pass tick (after user reported sluggish dialog drag on RTX 3050)
+
+Looking at the actual hot path uncovered three real perf bugs and
+two correctness bugs hidden inside.
+
+### Hot-path fixes
+
+- **Box-drawing rows were going to GridPass overlay.** The
+  "row needs overlay" predicate triggered on any rune > 0x7F —
+  CJK, emoji, math symbols, box-drawing — even though none of
+  those need bidi reorder or complex shaping. GridPass rebuilds
+  its full VBO every frame with no per-row dirty tracking, so
+  every TUI with `┌─┐│└─┘` chrome (htop, btop, lf, yazi, …) was
+  losing the cell-pipeline's per-row dirty optimization. New
+  selective predicate routes only true RTL/Indic/Thai/Khmer/etc.
+  to GridPass; CJK / emoji / symbols stay in CellPass.
+- **Cursor visual-col remap allocated three buffers + ran fribidi
+  per frame on any CJK row.** Same too-coarse non-ASCII heuristic.
+  Now uses the same selective predicate.
+- **`gtk_im_context_set_cursor_location` fired every dirty tick.**
+  That's a D-Bus hop into IBus / fcitx5. Cache last (row, col)
+  and only re-call when the cursor actually moved.
+
+### Correctness fixes uncovered along the way
+
+- **Palette / default-fg / default-bg changes didn't invalidate
+  the cell instance VBO.** Cells with palette-resolved or default
+  colors carried stale RGBA until otherwise marked dirty. Detect
+  the change in rebuildAndUpload and force a full rebuild.
+- **Scrollback growth while scrolled-back didn't shift the
+  display.** When the user is at view_offset > 0 and new content
+  scrolls into scrollback, the displayed sb-indices shift under
+  the same display rows. Track last_sb_count and rebuild when it
+  grew while scrolled.
+- **`view_off > 0` was marking all rows dirty every frame.**
+  Should only mark on scroll-position CHANGE; sitting at a fixed
+  offset shouldn't re-emit the grid 60×/sec. Track last_view_off.
+
+### Earlier tick crash fix (also shipped this round)
+
+- **Shutdown segfault** — `g_main_context_invoke(mainDrain, term)`
+  queued from worker can dispatch after `Terminal.deinit` already
+  ran, into freed memory. Fixed by splitting drain_pending +
+  back-pointer into a heap DrainHandle that's intentionally never
+  freed; mainDrain checks `alive` before dereferencing.
+
+### Cosmetic / additive
+
+- ligature-shaping bypass on pure-alphanumeric runs (programming-
+  font ligatures only fire on punctuation).
+- shell-integration.bash emits OSC 133 prompt marks so
+  Ctrl+Shift+Up/Down has marks to navigate.
