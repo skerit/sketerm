@@ -675,6 +675,11 @@ pub const Screen = struct {
     fn csi(self: *Screen, params: Event.Csi) void {
         // Private-prefix dispatch first.
         if (params.private == '?') {
+            // DECRQM — `CSI ? Pa $ p`, query a DEC private mode.
+            if (params.n_intermediates == 1 and params.intermediates[0] == '$' and params.final == 'p') {
+                self.decrqm(params.paramOrDefault(0, 0));
+                return;
+            }
             switch (params.final) {
                 'h' => self.modeSet(params, true),
                 'l' => self.modeSet(params, false),
@@ -801,6 +806,29 @@ pub const Screen = struct {
 
             else => {},
         }
+    }
+
+    /// DECRQM — reply to a private-mode query.
+    /// Reply: CSI ? Pa ; Ps $ y where Ps =
+    ///   0 not recognized, 1 set, 2 reset, 3 permanently set, 4 permanently reset.
+    fn decrqm(self: *Screen, mode: u32) void {
+        const known: ?bool = switch (mode) {
+            6 => self.origin_mode,
+            7 => self.autowrap,
+            25 => self.cursor_visible,
+            1000 => self.mouse_mode == 1000,
+            1002 => self.mouse_mode == 1002,
+            1003 => self.mouse_mode == 1003,
+            1004 => self.focus_reports,
+            1006 => self.mouse_sgr,
+            1047, 1049 => self.use_alt,
+            2004 => self.bracketed_paste,
+            else => null,
+        };
+        const ps: u8 = if (known) |on| (if (on) 1 else 2) else 0;
+        var out: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&out, "\x1b[?{d};{d}$y", .{ mode, ps }) catch return;
+        self.respond(s);
     }
 
     fn rep(self: *Screen, n: u32) void {
@@ -1734,4 +1762,36 @@ test "CBT walks backward" {
     s.csi(csi);
     // Default 8-col stops: from 17, prev=16, prev=8.
     try std.testing.expectEqual(@as(u16, 8), s.col);
+}
+
+test "DECRQM reports mode state" {
+    const TestSink = struct {
+        var captured: [64]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+    TestSink.captured_len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+
+    // Set autowrap (default already true) and query 7.
+    var csi = Event.Csi{};
+    csi.private = '?';
+    csi.intermediates[0] = '$';
+    csi.n_intermediates = 1;
+    csi.params[0] = 7;
+    csi.n_params = 1;
+    csi.final = 'p';
+    s.csi(csi);
+    const got = TestSink.captured[0..TestSink.captured_len];
+    // Autowrap is on by default → set → reply Ps=1.
+    try std.testing.expectEqualStrings("\x1b[?7;1$y", got);
 }
