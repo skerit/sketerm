@@ -65,3 +65,12 @@ pub fn copyToClipboard(widget: *c.GtkWidget, text: [:0]const u8) void {
     const clipboard = c.gdk_display_get_clipboard(display);
     c.gdk_clipboard_set_text(clipboard, text.ptr);
 }
+
+/// Sets the PRIMARY (X11/select) clipboard. Called when the user
+/// finishes a drag-selection so middle-click paste matches the
+/// xterm convention.
+pub fn copyToPrimary(widget: *c.GtkWidget, text: [:0]const u8) void {
+    const display = c.gtk_widget_get_display(widget);
+    const clipboard = c.gdk_display_get_primary_clipboard(display);
+    c.gdk_clipboard_set_text(clipboard, text.ptr);
+}

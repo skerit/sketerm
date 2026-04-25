@@ -546,6 +546,15 @@ fn onDragBegin(_: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
 
 fn onMousePressed(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
+    const button = c.gtk_gesture_single_get_current_button(@ptrCast(g));
+
+    // Middle-click PRIMARY paste when the running app isn't asking
+    // for mouse reports. With mouse_mode > 0 the app sees the click.
+    if (button == 2 and self.terminal.screen.mouse_mode == 0) {
+        clipboard.pastePrimaryFromClipboard(@ptrCast(self.area), self.terminal);
+        return;
+    }
+
     if (self.terminal.screen.mouse_mode == 0) return;
     emitMouseSeq(self, g, x, y, true);
 }
@@ -601,7 +610,20 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
     // Tiny drags = a click. If Ctrl was held and the click landed on
     // a hyperlinked cell, launch its URI.
     const moved = @abs(dx) > 4 or @abs(dy) > 4;
-    if (moved) return;
+    if (moved) {
+        // Real drag: push the selection text to PRIMARY so middle-click
+        // paste works (Linux convention).
+        if (self.terminal.screen.selection.isActive()) {
+            const text = self.terminal.screen.extractSelection(self.allocator) catch return;
+            defer self.allocator.free(text);
+            if (text.len == 0) return;
+            const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return;
+            defer self.allocator.free(cstr);
+            @memcpy(cstr, text);
+            clipboard.copyToPrimary(@ptrCast(self.area), cstr);
+        }
+        return;
+    }
 
     const event = c.gtk_event_controller_get_current_event(@ptrCast(g));
     if (event == null) return;
