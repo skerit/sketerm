@@ -238,6 +238,11 @@ pub const CellPass = struct {
     /// frame's snapshot.
     last_atlas_generations: [@import("atlas.zig").PAGE_COUNT]u32 =
         [_]u32{0} ** @import("atlas.zig").PAGE_COUNT,
+    /// Last `screen.view_offset` we rendered against. When it changes
+    /// (user scrolls scrollback in or out), every visible row sources
+    /// from a different scrollback / active line — full rebuild
+    /// needed once on the change, not on every frame while scrolled.
+    last_view_off: u32 = std.math.maxInt(u32),
 
     allocator: std.mem.Allocator,
 
@@ -370,9 +375,13 @@ pub const CellPass = struct {
         const sb_count: u32 = if (screen.use_alt) 0 else screen.scrollbackCount();
         const view_off: u32 = @min(screen.view_offset, sb_count);
 
-        // When scrolled, ALL rows shown change content — mark dirty.
-        if (view_off != 0) {
+        // Scroll-position change: every row sources from a different
+        // line. Mark all dirty exactly once on the change instead of
+        // every frame while scrolled-back.
+        const view_changed = view_off != self.last_view_off;
+        if (view_changed) {
             for (self.row_needs_upload.items) |*r| r.* = true;
+            self.last_view_off = view_off;
         }
 
         // Build dirty rows.
@@ -383,7 +392,7 @@ pub const CellPass = struct {
                 break :blk @constCast(screen.scrollbackLine(sb_idx));
             } else &buf[row - view_off];
 
-            const need_rebuild = ln_ptr.*.dirty or self.row_needs_upload.items[row] or atlas_evicted or view_off != 0;
+            const need_rebuild = ln_ptr.*.dirty or self.row_needs_upload.items[row] or atlas_evicted;
             if (!need_rebuild) continue;
 
             try self.rebuildRow(ln_ptr.*, row, screen.cols, atlas, pool, cw, ch, ascent, pad);
