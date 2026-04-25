@@ -132,6 +132,10 @@ pub const Screen = struct {
     /// clusters; the renderer ignores them and draws the base only.
     clusters: std.AutoHashMap(u32, std.ArrayList(u32)),
 
+    /// Kitty graphics receive-side state (chunked transmissions,
+    /// stored images for separate place actions, PNG decode).
+    kitty_images: @import("kitty_images.zig").Manager,
+
     /// Default fg / bg / cursor color overrides, RGBA in 0..1.
     /// Set via OSC 10 / 11 / 12, reset via OSC 110 / 111 / 112.
     /// Renderer syncs from these. cursor_color all-zero = use fg.
@@ -278,6 +282,7 @@ pub const Screen = struct {
             .allocator = allocator,
             .links = std.AutoHashMap(u8, []u8).init(allocator),
             .clusters = std.AutoHashMap(u32, std.ArrayList(u32)).init(allocator),
+            .kitty_images = @import("kitty_images.zig").Manager.init(allocator),
         };
         try self.resetTabStops();
         return self;
@@ -304,6 +309,7 @@ pub const Screen = struct {
         var cl_it = self.clusters.iterator();
         while (cl_it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         self.clusters.deinit();
+        self.kitty_images.deinit();
         if (self.preedit_text) |t| self.allocator.free(t);
         self.allocator.destroy(self);
     }
@@ -954,9 +960,14 @@ pub const Screen = struct {
             return;
         }
 
-        // Delete action — fire the sink so the Pane's ImageStore
-        // marks matching textures for GL-side cleanup.
+        // Delete action — drop our own stored copy AND tell the
+        // Pane's GL ImageStore to free its texture.
         if (cmd.action == .delete) {
+            switch (cmd.delete_what) {
+                'a', 'A' => self.kitty_images.dropAll(),
+                'i', 'I' => if (cmd.image_id != 0) self.kitty_images.drop(cmd.image_id),
+                else => {},
+            }
             if (self.sink.on_image_delete_full) |f| f(self.sink.ctx, .{
                 .image_id = cmd.image_id,
                 .placement_id = cmd.placement_id,
@@ -966,31 +977,23 @@ pub const Screen = struct {
             return;
         }
 
-        // v1: just notify the sink with raw cmd via the existing image
-        // event when we have RGBA. For format=32 (RGBA), payload IS
-        // the raw pixels (after base64+optional zlib).
-        if (cmd.action == .transmit_and_place and cmd.format == 32 and
-            cmd.compression == 0 and cmd.width > 0 and cmd.height > 0)
-        {
-            // Decode base64 payload.
-            const decoder = std.base64.standard.Decoder;
-            const out_len = decoder.calcSizeForSlice(cmd.payload) catch return;
-            const expected = cmd.width * cmd.height * 4;
-            if (out_len < expected) return;
-            const decode_buf = self.allocator.alloc(u8, out_len) catch return;
-            defer self.allocator.free(decode_buf);
-            decoder.decode(decode_buf, cmd.payload) catch return;
-            if (self.sink.on_image) |f| f(self.sink.ctx, .{
-                .width = cmd.width,
-                .height = cmd.height,
-                .rgba = decode_buf[0..expected],
-                .row = self.row,
-                .col = self.col,
-                .image_id = cmd.image_id,
-                .placement_id = cmd.placement_id,
-                .z_index = cmd.z,
-            });
-        }
+        // Ingest into the Manager — handles chunking, base64, PNG/RGB/
+        // RGBA decode, transmit-only vs transmit-and-place, place-by-id.
+        const outcome = self.kitty_images.ingest(cmd);
+        if (outcome.action != .place) return;
+
+        const stored = self.kitty_images.get(outcome.image_id) orelse return;
+        if (self.sink.on_image) |f| f(self.sink.ctx, .{
+            .width = stored.width,
+            .height = stored.height,
+            .rgba = stored.rgba,
+            .row = self.row,
+            .col = self.col,
+            .image_id = outcome.image_id,
+            .placement_id = outcome.placement_id,
+            .z_index = outcome.z,
+        });
+        self.dirty = true;
     }
 
     fn onDcs(self: *Screen, d: Event.DcsFull) void {
