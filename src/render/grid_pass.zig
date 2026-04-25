@@ -343,7 +343,41 @@ pub const GridPass = struct {
         if (view_off == 0 and screen.cursor_visible and blink_visible and
             screen.row < screen.rows and screen.col < screen.cols)
         {
-            const cx: f32 = pad + @as(f32, @floatFromInt(screen.col)) * cw;
+            // For bidi rows, the cursor's visual column may differ from
+            // its logical column. Compute via fribidi when the row has
+            // any non-ASCII codepoint.
+            const visual_col: u16 = blk: {
+                if (!self.enable_bidi) break :blk screen.col;
+                const row_cells = if (!screen.use_alt) screen.active[screen.row].cells else screen.alt.?[screen.row].cells;
+                var any_non_ascii = false;
+                for (row_cells) |rc| {
+                    if (rc.rune > 0x7F) {
+                        any_non_ascii = true;
+                        break;
+                    }
+                }
+                if (!any_non_ascii) break :blk screen.col;
+                const bidi = @import("../grid/bidi.zig");
+                const cps = self.allocator.alloc(u32, row_cells.len) catch break :blk screen.col;
+                defer self.allocator.free(cps);
+                const lvls = self.allocator.alloc(u8, row_cells.len) catch break :blk screen.col;
+                defer self.allocator.free(lvls);
+                const idx = self.allocator.alloc(usize, row_cells.len) catch break :blk screen.col;
+                defer self.allocator.free(idx);
+                for (row_cells, 0..) |rc, i| {
+                    cps[i] = if (rc.rune == 0) ' ' else rc.rune;
+                    idx[i] = i;
+                }
+                _ = bidi.lineLevels(cps, lvls, .auto);
+                bidi.levelsToVisualOrder(lvls, idx);
+                // Find the visual position whose logical index ==
+                // screen.col.
+                for (idx, 0..) |logical, visual| {
+                    if (logical == screen.col) break :blk @intCast(visual);
+                }
+                break :blk screen.col;
+            };
+            const cx: f32 = pad + @as(f32, @floatFromInt(visual_col)) * cw;
             const cy: f32 = pad + @as(f32, @floatFromInt(screen.row)) * ch;
             // OSC 12 cursor color override: use it when alpha > 0,
             // otherwise fall back to default fg.
