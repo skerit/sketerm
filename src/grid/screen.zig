@@ -1024,8 +1024,17 @@ pub const Screen = struct {
             .print => |cp| self.printCp(cp),
             .print_byte => |b| self.printByte(b),
             .print_run => |run| {
-                var i: usize = 0;
-                while (i < run.len) : (i += 1) self.printByte(run.bytes[i]);
+                // Fast-path: when the UTF-8 decoder is idle AND every
+                // byte is ASCII, skip the per-byte decoder dispatch
+                // and call printCp directly. Plain-ASCII workloads
+                // (logs, source code) hit this path.
+                if (self.decoder.expected == 0 and runIsAscii(run.bytes[0..run.len])) {
+                    var i: usize = 0;
+                    while (i < run.len) : (i += 1) self.printCp(run.bytes[i]);
+                } else {
+                    var i: usize = 0;
+                    while (i < run.len) : (i += 1) self.printByte(run.bytes[i]);
+                }
             },
             .execute => |b| self.execute(b),
             .csi => |c_csi| self.csi(c_csi),
@@ -1436,9 +1445,13 @@ pub const Screen = struct {
         }
 
         // Drop any cluster previously attached to this cell — the new
-        // base codepoint replaces it.
-        self.clearClusterAt(self.row, self.col);
-        if (width == 2 and self.col + 1 < self.cols) self.clearClusterAt(self.row, self.col + 1);
+        // base codepoint replaces it. Cluster store is nearly always
+        // empty in steady-state ASCII workloads, so the early-out
+        // saves two hashmap lookups per printable byte.
+        if (self.clusters.count() > 0) {
+            self.clearClusterAt(self.row, self.col);
+            if (width == 2 and self.col + 1 < self.cols) self.clearClusterAt(self.row, self.col + 1);
+        }
 
         var flags: u8 = if (self.current_link_id != 0) 0b0000_0100 else 0;
         if (width == 2) flags |= 0b0000_0001; // is_wide_left
@@ -1485,6 +1498,16 @@ pub const Screen = struct {
     /// We do NOT mark regional indicators here — they're full-width
     /// codepoints, not "extending"; the cluster behavior of "two RIs
     /// = one flag" needs a different treatment we don't yet model.
+    /// True iff every byte in the slice is plain ASCII (≤ 0x7E and
+    /// excluding control bytes 0x00..0x1F). Used to skip the UTF-8
+    /// decoder on pure-ASCII print runs.
+    fn runIsAscii(bytes: []const u8) bool {
+        for (bytes) |b| {
+            if (b < 0x20 or b > 0x7E) return false;
+        }
+        return true;
+    }
+
     pub fn isExtendingCp(cp: u32) bool {
         return switch (cp) {
             0x200C, 0x200D => true, // ZWNJ, ZWJ
