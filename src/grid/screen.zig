@@ -107,6 +107,9 @@ pub const Screen = struct {
     /// flashes a translucent white overlay for ~200ms after.
     bell_at_us: i64 = 0,
 
+    /// Last printed codepoint (for REP, CSI Pn b). 0 = none.
+    last_print_cp: u32 = 0,
+
     /// Side-effect sink — optional callbacks invoked by apply.
     sink: Sink = .{},
 
@@ -557,6 +560,7 @@ pub const Screen = struct {
                 self.col = self.cols - 1;
             }
         }
+        self.last_print_cp = cp;
     }
 
     /// Coarse wide-character check: CJK Unified, Hangul, fullwidth
@@ -712,6 +716,9 @@ pub const Screen = struct {
             // SGR.
             'm' => self.sgr(params),
 
+            // REP — repeat preceding char Pn times.
+            'b' => self.rep(params.paramOrDefault(0, 1)),
+
             // Device status report.
             'n' => self.dsr(params),
             // Primary device attributes.
@@ -721,6 +728,14 @@ pub const Screen = struct {
 
             else => {},
         }
+    }
+
+    fn rep(self: *Screen, n: u32) void {
+        if (self.last_print_cp == 0) return;
+        const cp = self.last_print_cp;
+        const limit = @min(n, @as(u32, self.cols) * @as(u32, self.rows));
+        var i: u32 = 0;
+        while (i < limit) : (i += 1) self.printCp(cp);
     }
 
     fn dsr(self: *Screen, params: Event.Csi) void {
@@ -1592,4 +1607,21 @@ test "extract selection skips wide-cont" {
     defer std.testing.allocator.free(out);
     // Expect "a中b" with no extra space for the cont cell, then trailing blanks trimmed.
     try std.testing.expectEqualStrings("a\xe4\xb8\xadb", out);
+}
+
+test "REP repeats last printed glyph" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+    s.printCp('x');
+    var csi = Event.Csi{};
+    csi.params[0] = 4;
+    csi.n_params = 1;
+    csi.final = 'b';
+    s.csi(csi);
+    try std.testing.expectEqual(@as(u32, 'x'), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'x'), s.cellAt(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'x'), s.cellAt(0, 4).rune);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 5).rune);
 }
