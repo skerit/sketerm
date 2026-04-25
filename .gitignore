@@ -10,3 +10,4 @@ core.*
 *.bak
 .DS_Store
 .claude/
+external/

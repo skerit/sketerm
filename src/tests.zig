@@ -11,6 +11,7 @@ comptime {
     _ = @import("util/percent.zig");
     _ = @import("parser/event.zig");
     _ = @import("parser/vt.zig");
+    _ = @import("parser/conformance_test.zig");
     _ = @import("grid/cell.zig");
     _ = @import("grid/style_pool.zig");
     _ = @import("grid/screen.zig");
