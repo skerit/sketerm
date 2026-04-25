@@ -930,6 +930,29 @@ pub const Screen = struct {
         return self.lineCellsAt(row);
     }
 
+    /// True iff the row contains a codepoint that needs fribidi
+    /// reorder (RTL scripts) or HarfBuzz complex-script shaping
+    /// (Indic, Thai, Khmer, Tibetan, Myanmar). Pure ASCII / Latin
+    /// extended / Greek / Cyrillic / CJK / emoji / box-drawing /
+    /// math symbols all return false — they render correctly in
+    /// the fast cell-instance pipeline.
+    pub fn rowNeedsBidiOrComplexShape(cells: []const Cell) bool {
+        for (cells) |cl| {
+            const cp = cl.rune;
+            if (cp <= 0x7F) continue;
+            if (cp >= 0x0590 and cp <= 0x08FF) return true; // Hebrew/Arabic/Syriac/Thaana/NKo/Samaritan
+            if (cp >= 0xFB50 and cp <= 0xFDFF) return true; // Arabic Pres-Forms-A
+            if (cp >= 0xFE70 and cp <= 0xFEFF) return true; // Arabic Pres-Forms-B
+            if (cp >= 0x0900 and cp <= 0x0DFF) return true; // Indic / Sinhala
+            if (cp >= 0x0E00 and cp <= 0x0EFF) return true; // Thai / Lao
+            if (cp >= 0x0F00 and cp <= 0x0FFF) return true; // Tibetan
+            if (cp >= 0x1000 and cp <= 0x109F) return true; // Myanmar
+            if (cp >= 0xAA60 and cp <= 0xAA7F) return true; // Myanmar Extended-A
+            if (cp >= 0x1780 and cp <= 0x17FF) return true; // Khmer
+        }
+        return false;
+    }
+
     /// Map a visual column (what the user clicked at, in left-to-right
     /// pixel order) to a logical column (how the cells live in the
     /// row buffer). For pure-LTR rows the two are identical; bidi
@@ -939,14 +962,7 @@ pub const Screen = struct {
     /// allocation failure the function returns the input unchanged.
     pub fn visualToLogicalCol(self: *const Screen, allocator: std.mem.Allocator, row: i32, visual_col: u16) u16 {
         const cells = self.lineCellsAt(row) orelse return visual_col;
-        var any_non_ascii = false;
-        for (cells) |cl| {
-            if (cl.rune > 0x7F) {
-                any_non_ascii = true;
-                break;
-            }
-        }
-        if (!any_non_ascii) return visual_col;
+        if (!rowNeedsBidiOrComplexShape(cells)) return visual_col;
         const bidi = @import("bidi.zig");
         const cps = allocator.alloc(u32, cells.len) catch return visual_col;
         defer allocator.free(cps);
@@ -966,14 +982,10 @@ pub const Screen = struct {
     }
 
     /// Inverse of `visualToLogicalCol`. Returns the visual column at
-    /// which a logical column will appear after bidi reorder. Used by
-    /// the selection-overlay renderer to break a logical run into
-    /// visually-contiguous rectangles.
+    /// which a logical column will appear after bidi reorder.
     pub fn logicalToVisualCol(self: *const Screen, allocator: std.mem.Allocator, row: i32, logical_col: u16) u16 {
         const cells = self.lineCellsAt(row) orelse return logical_col;
-        var any_non_ascii = false;
-        for (cells) |cl| if (cl.rune > 0x7F) { any_non_ascii = true; break; };
-        if (!any_non_ascii) return logical_col;
+        if (!rowNeedsBidiOrComplexShape(cells)) return logical_col;
         const bidi = @import("bidi.zig");
         const cps = allocator.alloc(u32, cells.len) catch return logical_col;
         defer allocator.free(cps);

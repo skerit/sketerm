@@ -731,44 +731,15 @@ pub const CellPass = struct {
     }
 };
 
-/// True iff the row needs the GridPass overlay path: contains any
-/// codepoint requiring fribidi visual reorder (RTL scripts) or
-/// complex-script shaping (Indic, Thai, Khmer, etc.). CellPass
-/// renders ANY other codepoint correctly via its per-codepoint
-/// atlas lookup — including CJK, emoji, box-drawing, math symbols,
-/// general punctuation, Greek, Cyrillic, etc.
-///
-/// PREVIOUSLY this returned true for any rune > 0x7F, which dumped
-/// every TUI with box-drawing chrome (htop, btop, lf, yazi, …)
-/// into the per-frame full-rebuild overlay path and hid all of
-/// CellPass's per-row dirty optimizations from those workloads.
+/// Forwards to the canonical predicate on Screen. CellPass skips
+/// rows for which this returns true so the GridPass overlay path
+/// can render them with bidi reorder + complex-script shaping.
 fn rowHasNonAscii(cells: []const Cell) bool {
-    return rowNeedsBidiOrComplexShape(cells);
+    return Screen.rowNeedsBidiOrComplexShape(cells);
 }
 
 pub fn rowNeedsBidiOrComplexShape(cells: []const Cell) bool {
-    for (cells) |cl| {
-        const cp = cl.rune;
-        if (cp <= 0x7F) continue;
-        // RTL scripts (Hebrew, Arabic, Syriac, Thaana, NKo,
-        // Samaritan, Mandaic, Arabic Extended-A).
-        if (cp >= 0x0590 and cp <= 0x08FF) return true;
-        // Arabic Presentation Forms-A and -B.
-        if (cp >= 0xFB50 and cp <= 0xFDFF) return true;
-        if (cp >= 0xFE70 and cp <= 0xFEFF) return true;
-        // Indic / Sinhala / Burmese-family scripts (need shaping).
-        if (cp >= 0x0900 and cp <= 0x0DFF) return true;
-        // Thai, Lao.
-        if (cp >= 0x0E00 and cp <= 0x0EFF) return true;
-        // Tibetan.
-        if (cp >= 0x0F00 and cp <= 0x0FFF) return true;
-        // Myanmar / Myanmar Extended.
-        if (cp >= 0x1000 and cp <= 0x109F) return true;
-        if (cp >= 0xAA60 and cp <= 0xAA7F) return true;
-        // Khmer.
-        if (cp >= 0x1780 and cp <= 0x17FF) return true;
-    }
-    return false;
+    return Screen.rowNeedsBidiOrComplexShape(cells);
 }
 
 test "Instance is 92 bytes" {

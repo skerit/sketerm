@@ -323,9 +323,10 @@ pub const GridPass = struct {
             const visual_col: u16 = blk: {
                 if (!self.enable_bidi) break :blk screen.col;
                 const row_cells = if (!screen.use_alt) screen.active[screen.row].cells else screen.alt.?[screen.row].cells;
-                var any_non_ascii = false;
-                for (row_cells) |rc| if (rc.rune > 0x7F) { any_non_ascii = true; break; };
-                if (!any_non_ascii) break :blk screen.col;
+                // Skip the bidi resolution + heap allocs on rows that
+                // can't reorder visually. CJK / emoji / box-drawing
+                // are non-ASCII but logical == visual.
+                if (!@import("cell_pass.zig").rowNeedsBidiOrComplexShape(row_cells)) break :blk screen.col;
                 const bidi = @import("../grid/bidi.zig");
                 const cps = self.allocator.alloc(u32, row_cells.len) catch break :blk screen.col;
                 defer self.allocator.free(cps);
