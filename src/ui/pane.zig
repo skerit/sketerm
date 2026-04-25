@@ -70,6 +70,7 @@ pub const Pane = struct {
     /// confirm whether GTK is calling tick on the new pane.
     tick_seen: bool = false,
     render_seen: bool = false,
+    resize_seen: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -620,6 +621,10 @@ fn onScroll(_: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
 
 fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
+    if (!self.resize_seen) {
+        self.resize_seen = true;
+        std.debug.print("sketerm: pane resize first-fire (pane={x}) {d}x{d}\n", .{ @intFromPtr(self), width, height });
+    }
     const atlas = self.atlas orelse return;
     if (atlas.cell_w == 0 or atlas.cell_h == 0) return;
     const cols: u16 = @intCast(@max(1, @divFloor(width, @as(c_int, atlas.cell_w))));
