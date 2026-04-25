@@ -91,6 +91,14 @@ pub const Screen = struct {
     pool: *Pool,
     allocator: std.mem.Allocator,
 
+    /// OSC 8 hyperlinks. `current_link_id` is the id stamped on
+    /// cells written while a link is active; 0 means no link.
+    /// `links` stores id → URI. Cap of 255 distinct active ids
+    /// (Cell.reserved is u8); on overflow, ids wrap and replace.
+    current_link_id: u8 = 0,
+    next_link_id: u8 = 1,
+    links: std.AutoHashMap(u8, []u8),
+
     /// Side-effect sink — optional callbacks invoked by apply.
     sink: Sink = .{},
 
@@ -143,6 +151,7 @@ pub const Screen = struct {
             .scroll_bot = if (rows > 0) rows - 1 else 0,
             .pool = pool,
             .allocator = allocator,
+            .links = std.AutoHashMap(u8, []u8).init(allocator),
         };
         return self;
     }
@@ -159,6 +168,10 @@ pub const Screen = struct {
         }
         for (self.scrollback.items) |*l| l.deinit(self.allocator);
         self.scrollback.deinit(self.allocator);
+        // Free OSC 8 link URIs.
+        var link_it = self.links.iterator();
+        while (link_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        self.links.deinit();
         self.allocator.destroy(self);
     }
 
@@ -343,6 +356,35 @@ pub const Screen = struct {
         }
     }
 
+    fn handleOsc8(self: *Screen, params: []const u8) void {
+        // Format: `id=foo;URI` or just `URI` (params optional).
+        // Empty URI = end of link.
+        const semi = std.mem.indexOfScalar(u8, params, ';');
+        const uri = if (semi) |s| params[s + 1 ..] else params;
+        if (uri.len == 0) {
+            self.current_link_id = 0;
+            return;
+        }
+        const owned = self.allocator.dupe(u8, uri) catch return;
+        if (self.next_link_id == 0) self.next_link_id = 1;
+        const id = self.next_link_id;
+        // Replace any existing entry at this id (free old).
+        if (self.links.fetchRemove(id)) |old| self.allocator.free(old.value);
+        self.links.put(id, owned) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        self.next_link_id +%= 1; // wraps from 255 → 1 (we set 0 → 1 above)
+        if (self.next_link_id == 0) self.next_link_id = 1;
+        self.current_link_id = id;
+    }
+
+    /// Look up the URI for a cell's link_id (from Cell.reserved).
+    pub fn linkUri(self: *const Screen, link_id: u8) ?[]const u8 {
+        if (link_id == 0) return null;
+        return if (self.links.get(link_id)) |u| u else null;
+    }
+
     fn onApc(self: *Screen, body: []const u8) void {
         // Kitty graphics protocol: APC G=...
         if (body.len < 1 or body[0] != 'G') return;
@@ -416,6 +458,7 @@ pub const Screen = struct {
             7 => {
                 if (self.sink.on_cwd) |f| f(self.sink.ctx, rest);
             },
+            8 => self.handleOsc8(rest),
             52 => {
                 // OSC 52 — `Pc;Pd` where Pc is selection (c=clipboard,
                 // p=primary, etc) and Pd is base64-encoded text or '?'.
@@ -450,6 +493,8 @@ pub const Screen = struct {
         ln.cells[self.col] = .{
             .rune = cp,
             .style_ref = self.cur_style,
+            .flags = if (self.current_link_id != 0) 0b0000_0100 else 0, // has_link bit
+            .reserved = self.current_link_id,
         };
         ln.dirty = true;
 
