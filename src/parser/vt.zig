@@ -573,3 +573,45 @@ test "ESC mid-CSI cancels and starts new sequence" {
     };
     try std.testing.expectEqual(@as(u32, 1), cup_count);
 }
+
+test "colon-separated SGR (38:2:r:g:b)" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    defer col.deinit();
+    // Modern truecolor with colons: should parse exactly like
+    // semicolon-separated.
+    p.advance("\x1b[38:2:255:128:0m", TestCollector.emit, &col);
+    var found = false;
+    for (col.events.items) |ev| switch (ev) {
+        .csi => |c| if (c.final == 'm' and c.n_params >= 5) {
+            try std.testing.expectEqual(@as(u32, 38), c.params[0]);
+            try std.testing.expectEqual(@as(u32, 2), c.params[1]);
+            try std.testing.expectEqual(@as(u32, 255), c.params[2]);
+            try std.testing.expectEqual(@as(u32, 128), c.params[3]);
+            try std.testing.expectEqual(@as(u32, 0), c.params[4]);
+            found = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(found);
+}
+
+test "DECRQM (CSI ? 1 \\$ p) parses with intermediate" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    defer col.deinit();
+    p.advance("\x1b[?1$p", TestCollector.emit, &col);
+    var found = false;
+    for (col.events.items) |ev| switch (ev) {
+        .csi => |c| if (c.private == '?' and c.final == 'p' and
+            c.n_intermediates == 1 and c.intermediates[0] == '$')
+        {
+            try std.testing.expectEqual(@as(u32, 1), c.params[0]);
+            found = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(found);
+}
