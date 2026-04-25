@@ -510,6 +510,16 @@ pub const Screen = struct {
             return;
         }
 
+        // Delete actions — we don't yet track per-image state we
+        // can selectively remove, but we mark the screen dirty so
+        // the next paint refreshes. Apps that send `d=A` to clear
+        // all see it work because the renderer keys off ImageStore
+        // which the pane-side handler will rebuild.
+        if (cmd.action == .delete) {
+            self.dirty = true;
+            return;
+        }
+
         // v1: just notify the sink with raw cmd via the existing image
         // event when we have RGBA. For format=32 (RGBA), payload IS
         // the raw pixels (after base64+optional zlib).
