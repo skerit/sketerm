@@ -41,9 +41,23 @@ fn onPasteRead(source: ?*c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) 
     if (len == 0) return;
 
     // Wrap with bracketed-paste markers only when mode 2004 enabled.
-    if (term.screen.bracketed_paste) _ = term.pty.writeAll("\x1b[200~");
-    _ = term.pty.writeAll(cstr[0..len]);
-    if (term.screen.bracketed_paste) _ = term.pty.writeAll("\x1b[201~");
+    // When bracketed: scrub embedded ESC bytes so a pasted "\x1b[201~"
+    // can't break out of the wrapping early (xterm convention).
+    if (term.screen.bracketed_paste) {
+        _ = term.pty.writeAll("\x1b[200~");
+        const pasted = cstr[0..len];
+        var start: usize = 0;
+        for (pasted, 0..) |b, i| {
+            if (b == 0x1B) {
+                if (i > start) _ = term.pty.writeAll(pasted[start..i]);
+                start = i + 1;
+            }
+        }
+        if (start < len) _ = term.pty.writeAll(pasted[start..len]);
+        _ = term.pty.writeAll("\x1b[201~");
+    } else {
+        _ = term.pty.writeAll(cstr[0..len]);
+    }
 }
 
 pub fn copyToClipboard(widget: *c.GtkWidget, text: [:0]const u8) void {
