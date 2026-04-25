@@ -195,6 +195,25 @@ fn copySelection(ctx: *Ctx) void {
     c.gdk_clipboard_set_text(clip, cstr.ptr);
 }
 
+/// xterm modifier encoding: 1 + shift(1) + alt(2) + ctrl(4).
+fn modCode(shift: bool, alt: bool, ctrl: bool) u8 {
+    return 1 + (if (shift) @as(u8, 1) else 0) + (if (alt) @as(u8, 2) else 0) + (if (ctrl) @as(u8, 4) else 0);
+}
+
+/// Cursor-key emit. Without modifiers: ESC [/O X. With modifiers:
+/// always ESC [ 1 ; M X (no DECCKM swap, per xterm).
+fn cursorKey(buf: []u8, ck: u8, final: u8, shift: bool, alt: bool, ctrl: bool) usize {
+    const m = modCode(shift, alt, ctrl);
+    if (m == 1) {
+        buf[0] = 0x1B;
+        buf[1] = ck;
+        buf[2] = final;
+        return 3;
+    }
+    const out = std.fmt.bufPrint(buf, "\x1b[1;{d}{c}", .{ m, final }) catch return 0;
+    return out.len;
+}
+
 fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool) usize {
     const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
     const alt = (mods & c.GDK_ALT_MASK) != 0;
@@ -213,12 +232,12 @@ fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool) 
         },
         c.GDK_KEY_ISO_Left_Tab => { @memcpy(buf[0..3], "\x1b[Z"); return 3; },
         c.GDK_KEY_Escape => { buf[0] = 0x1B; return 1; },
-        c.GDK_KEY_Up => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'A'; return 3; },
-        c.GDK_KEY_Down => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'B'; return 3; },
-        c.GDK_KEY_Right => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'C'; return 3; },
-        c.GDK_KEY_Left => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'D'; return 3; },
-        c.GDK_KEY_Home => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'H'; return 3; },
-        c.GDK_KEY_End => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'F'; return 3; },
+        c.GDK_KEY_Up => return cursorKey(buf, ck, 'A', shift, alt, ctrl),
+        c.GDK_KEY_Down => return cursorKey(buf, ck, 'B', shift, alt, ctrl),
+        c.GDK_KEY_Right => return cursorKey(buf, ck, 'C', shift, alt, ctrl),
+        c.GDK_KEY_Left => return cursorKey(buf, ck, 'D', shift, alt, ctrl),
+        c.GDK_KEY_Home => return cursorKey(buf, ck, 'H', shift, alt, ctrl),
+        c.GDK_KEY_End => return cursorKey(buf, ck, 'F', shift, alt, ctrl),
         c.GDK_KEY_Page_Up => { @memcpy(buf[0..4], "\x1b[5~"); return 4; },
         c.GDK_KEY_Page_Down => { @memcpy(buf[0..4], "\x1b[6~"); return 4; },
         c.GDK_KEY_Insert => { @memcpy(buf[0..4], "\x1b[2~"); return 4; },
