@@ -223,3 +223,22 @@ test "markAllForDelete flags everything" {
     s.flushDeletesNoGL();
     try std.testing.expectEqual(@as(usize, 0), s.count());
 }
+
+test "forgetGL drops uploaded images, keeps pending" {
+    var s = Store.init(std.testing.allocator);
+    defer s.images.deinit(std.testing.allocator);
+    defer s.freeAllNoGL();
+    const rgba = [_]u8{0} ** 16;
+    try s.addWithId(&rgba, 2, 2, 0, 0, 1);
+    try s.addWithId(&rgba, 2, 2, 0, 0, 2);
+    // Simulate the first image as already uploaded (pending=null,
+    // gl_tex set to a fake non-zero value).
+    s.allocator.free(s.images.items[0].pending.?);
+    s.images.items[0].pending = null;
+    s.images.items[0].gl_tex = 42;
+    // Image #1 keeps its pending data → re-uploadable.
+    s.forgetGL();
+    try std.testing.expectEqual(@as(usize, 1), s.count());
+    try std.testing.expectEqual(@as(u32, 2), s.images.items[0].image_id);
+    try std.testing.expectEqual(@as(c_uint, 0), s.images.items[0].gl_tex);
+}
