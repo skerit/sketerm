@@ -56,6 +56,9 @@ pub const Pane = struct {
     /// Last reported mouse-motion cell, to suppress duplicates.
     last_motion_row: i32 = -2,
     last_motion_col: i32 = -2,
+    /// xterm button code (0=L,1=M,2=R) currently held, or -1 = none.
+    /// Used by DECSET 1002 button-event tracking.
+    held_button: i32 = -1,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -358,15 +361,27 @@ fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
     const cell = self.cellAt(x, y);
     const screen = self.terminal.screen;
 
-    // Mouse-motion reporting (DECSET 1003 = any motion).
+    // Mouse-motion reporting:
+    //   DECSET 1003 = any motion
+    //   DECSET 1002 = motion only while a button is held
     // Suppress duplicates within the same cell.
-    if (screen.mouse_mode == 1003 and cell.row >= 0 and cell.col >= 0) {
-        if (cell.row != self.last_motion_row or cell.col != self.last_motion_col) {
+    if (cell.row >= 0 and cell.col >= 0) {
+        const want_motion =
+            (screen.mouse_mode == 1003) or
+            (screen.mouse_mode == 1002 and self.held_button >= 0);
+        if (want_motion and
+            (cell.row != self.last_motion_row or cell.col != self.last_motion_col))
+        {
             self.last_motion_row = cell.row;
             self.last_motion_col = cell.col;
+            // Button bits: 32=motion, base 0=L,1=M,2=R or 3=no-button.
+            const base: u32 = if (self.held_button >= 0)
+                @intCast(self.held_button)
+            else
+                3;
             var buf: [32]u8 = undefined;
-            // 35 = 32 (motion bit) + 3 (no button held).
-            const seq = std.fmt.bufPrint(&buf, "\x1b[<35;{d};{d}M", .{
+            const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}M", .{
+                32 + base,
                 @as(u32, @intCast(cell.col + 1)),
                 @as(u32, @intCast(cell.row + 1)),
             }) catch return;
@@ -423,18 +438,23 @@ fn emitMouseSeq(self: *Pane, g: *c.GtkGestureClick, x: f64, y: f64, press: bool)
     if (button_raw == 0) return;
     // Map GTK button numbers (1=L, 2=M, 3=R) to xterm button bits
     // (0=L, 1=M, 2=R per SGR 1006).
-    const xterm_button: u32 = switch (button_raw) {
+    const xterm_button: i32 = switch (button_raw) {
         1 => 0,
         2 => 1,
         3 => 2,
         else => return,
     };
+    if (press) {
+        self.held_button = xterm_button;
+    } else if (self.held_button == xterm_button) {
+        self.held_button = -1;
+    }
     const cell = self.cellAt(x, y);
     if (cell.row < 0 or cell.col < 0) return;
     var buf: [32]u8 = undefined;
     const final: u8 = if (press) 'M' else 'm';
     const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}{c}", .{
-        xterm_button,
+        @as(u32, @intCast(xterm_button)),
         @as(u32, @intCast(cell.col + 1)),
         @as(u32, @intCast(cell.row + 1)),
         final,
