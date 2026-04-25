@@ -100,9 +100,13 @@ htop and btop need the report subset for accurate rendering.
 
 ### Deferred in v1
 - DECDHL / DECDWL (double-height / double-width lines)
-- Character set designation (SCS, SS2/SS3, LS0/LS1)
-- ED 3 (erase scrollback) — minor, easy to add
-- Selective erase (DECSED / DECSEL)
+- SS2 / SS3 single-shifts (LS0 / LS1 done as SI / SO)
+
+### Done in v1 (originally listed deferred)
+- Character set designation (SCS for G0/G1 → DEC graphics, SI/SO).
+- ED 3 (erase scrollback).
+- Selective erase (DECSED / DECSEL routed to plain ED/EL — we
+  don't model the protection bit).
 
 ## OSC sequences
 
@@ -117,7 +121,8 @@ htop and btop need the report subset for accurate rendering.
 | 104    | Reset color palette                       | ✓ |
 | 110/111/112 | Reset fg/bg/cursor                   | ✓ |
 | 133    | Shell integration (FinalTerm prompt marks)| deferred |
-| 777    | Desktop notifications                     | deferred |
+| 9      | iTerm2 desktop notification               | ✓ |
+| 777    | Desktop notifications (notify variant)    | ✓ |
 | 1337   | iTerm2 proprietary — `File=` only         | ✓ |
 
 ## Bracketed paste (DECSET 2004)
@@ -148,7 +153,7 @@ Default behavior per app:
 | Prefix | Purpose                                   | v1 |
 |--------|-------------------------------------------|----|
 | `q`    | Sixel image                               | ✓ (M9b) |
-| `$q`   | DECRQSS — report setting                  | deferred |
+| `$q`   | DECRQSS — report setting (m/r/" q)        | ✓ |
 | `+q`   | XTGETTCAP — terminfo query                | deferred |
 | `P`    | DECUDK — user-defined keys                | never |
 
@@ -175,8 +180,12 @@ Default behavior per app:
 | Mode                                  | v1 |
 |---------------------------------------|----|
 | xterm baseline (modifyOtherKeys=0)    | ✓ |
-| **modifyOtherKeys=1**                 | ✓ (emacs requires) |
+| Cursor + tilde + SS3 keys with Shift/Alt/Ctrl modifier codes | ✓ |
+| modifyOtherKeys=1                     | deferred |
 | modifyOtherKeys=2                     | deferred |
+| DECCKM — application-cursor-keys mode | ✓ |
+| DECPAM / DECPNM — keypad mode         | stub |
+| Kitty progressive enhancement         | deferred |
 | CSI u (libtermkey)                    | deferred |
 | Kitty progressive enhancement (CSI =…)| deferred |
 
