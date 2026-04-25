@@ -6,8 +6,8 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~3 hours of uninterrupted implementation
-- 45+ commits, ~6 kLOC of Zig + 8 kLOC vendored stb_image
+- ~4 hours of uninterrupted implementation
+- 52 commits, ~6.5 kLOC of Zig + 8 kLOC vendored stb_image
 
 ## What got built
 
@@ -25,10 +25,22 @@ substantively complete.
 | M5  OSC 0/2/7/8/52 + DSR + window-size reports + DECSCUSR | done |
 | M6  AdwTabView tabs + GtkPopoverMenu + tab rename popover | done |
 | M7  splits via GtkPaned (nestable) + close_pane | done |
-| M8  JSON layout save/load + `--restore` / `--layout` | done (flat — split tree TBD) |
+| M8  JSON layout v2 with split tree, save/load, SIGTERM-safe | done |
 | M9a Kitty graphics APC parser → ImageStore → GL textured quad | done |
 | M9b Sixel decoder → ImageStore → GL textured quad | done |
 | M9c iTerm2 OSC 1337 + stb_image PNG decode → GL textured quad | done |
+
+Plus extras layered on top of M0-M9:
+
+| Feature | State |
+|---------|-------|
+| OSC 8 hyperlinks: storage + hover tooltip + Ctrl-click → xdg-open | done |
+| Wide-char (CJK / emoji) — 2-column glyphs + correct continuation cells | done |
+| Font fallback chain (Hack → Adwaita Mono → Vera Mono → Free → DejaVu → Noto) | done |
+| Cursor blink (500 ms cycle for blinking shapes) | done |
+| Tab rename via GtkPopover with GtkEntry | done |
+| Auto-numbered tab titles ("Tab 1", "Tab 2", …) | done |
+| `--help` / `--version` / `--restore` / `--layout` flags | done |
 
 ## How to verify
 
@@ -81,13 +93,16 @@ If anything's broken visually, the most likely culprits are:
 
 The post-checkpoint TODO list, in rough priority order:
 
-1. Layout save with split tree (currently flat)
-2. Ctrl+click on OSC 8 links → `xdg-open` URI
-3. IME preedit display at cursor
-4. Pane focus highlight (visual border)
-5. Font fallback (single face today; missing glyphs are tofu)
-6. Selection in scrollback (model is ready; mouse handler isn't)
-7. Reflow with soft-wrap tracking on resize (today: pad/truncate)
+1. IME preedit display at cursor (commit signal works, preedit
+   positioning not wired)
+2. Pane focus highlight (visual border on the focused pane)
+3. Selection extension into scrollback (model accepts negative
+   rows; mouse handler doesn't yet map to them)
+4. Reflow with soft-wrap tracking on resize (today: pad/truncate)
+5. Memory leaks at SIGTERM exit (PTY worker thread allocations
+   are not deinit'd when the signal short-circuits the shutdown
+   sequence)
+6. OSC 8 in selection-extract — preserves text but not the URI
 
 ## Notable design decisions made during the build
 
