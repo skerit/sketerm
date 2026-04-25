@@ -499,6 +499,16 @@ pub const Screen = struct {
         if (body.len < 1 or body[0] != 'G') return;
         const kitty = @import("../parser/kitty_image.zig");
         const cmd = kitty.parse(body) catch return;
+
+        // q=action — capability probe. Reply OK so apps know we
+        // accept kitty graphics; no actual transfer happens.
+        if (cmd.action == .query) {
+            var resp: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&resp, "\x1b_Gi={d};OK\x1b\\", .{cmd.image_id}) catch return;
+            self.respond(s);
+            return;
+        }
+
         // v1: just notify the sink with raw cmd via the existing image
         // event when we have RGBA. For format=32 (RGBA), payload IS
         // the raw pixels (after base64+optional zlib).
