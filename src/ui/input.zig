@@ -166,6 +166,29 @@ fn onKeyPressed(
         return 1;
     }
 
+    // Shift+PgUp/PgDn = keyboard scrollback (xterm convention).
+    if (shift_pressed and !ctrl_pressed) {
+        const screen = ctx.terminal.screen;
+        const sb: u32 = @intCast(screen.scrollbackCount());
+        switch (keyval) {
+            c.GDK_KEY_Page_Up => {
+                const want = screen.view_offset + screen.rows;
+                screen.view_offset = if (want > sb) sb else want;
+                screen.dirty = true;
+                return 1;
+            },
+            c.GDK_KEY_Page_Down => {
+                screen.view_offset = if (screen.view_offset >= screen.rows)
+                    screen.view_offset - screen.rows
+                else
+                    0;
+                screen.dirty = true;
+                return 1;
+            },
+            else => {},
+        }
+    }
+
     var buf: [16]u8 = undefined;
     const screen = ctx.terminal.screen;
     const n = encode(&buf, keyval, state, screen.app_cursor_keys);
