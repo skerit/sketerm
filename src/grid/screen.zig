@@ -483,22 +483,37 @@ pub const Screen = struct {
     }
 
     fn printCp(self: *Screen, cp: u32) void {
-        if (self.pending_wrap) {
+        const width: u8 = if (isWideCp(cp)) 2 else 1;
+
+        // Wide char near right edge wraps before placing.
+        if (self.pending_wrap or (width == 2 and self.col + 1 >= self.cols)) {
             self.lineFeed();
             self.col = 0;
             self.pending_wrap = false;
         }
-        if (self.col >= self.cols) return; // safety
+        if (self.col >= self.cols) return;
+
         var ln = self.line(self.row);
+        var flags: u8 = if (self.current_link_id != 0) 0b0000_0100 else 0;
+        if (width == 2) flags |= 0b0000_0001; // is_wide_left
         ln.cells[self.col] = .{
             .rune = cp,
             .style_ref = self.cur_style,
-            .flags = if (self.current_link_id != 0) 0b0000_0100 else 0, // has_link bit
+            .flags = flags,
             .reserved = self.current_link_id,
         };
+        if (width == 2 and self.col + 1 < self.cols) {
+            // Continuation cell: empty rune, is_wide_cont flag.
+            ln.cells[self.col + 1] = .{
+                .rune = 0,
+                .style_ref = self.cur_style,
+                .flags = 0b0000_0010,
+                .reserved = self.current_link_id,
+            };
+        }
         ln.dirty = true;
 
-        self.col += 1;
+        self.col += width;
         if (self.col >= self.cols) {
             if (self.autowrap) {
                 self.col = self.cols - 1;
@@ -507,6 +522,30 @@ pub const Screen = struct {
                 self.col = self.cols - 1;
             }
         }
+    }
+
+    /// Coarse wide-character check: CJK Unified, Hangul, fullwidth
+    /// forms, kana, and most pictographs/emoji. Conservative.
+    fn isWideCp(cp: u32) bool {
+        return switch (cp) {
+            0x1100...0x115F, // Hangul Jamo
+            0x2E80...0x303E, // CJK Radicals + Kangxi
+            0x3041...0x33FF, // Hiragana / Katakana / Bopomofo
+            0x3400...0x4DBF, // CJK Ext A
+            0x4E00...0x9FFF, // CJK Unified
+            0xA000...0xA4CF, // Yi Syllables
+            0xAC00...0xD7A3, // Hangul Syllables
+            0xF900...0xFAFF, // CJK Compatibility Ideographs
+            0xFE30...0xFE4F, // CJK Compatibility Forms
+            0xFF00...0xFF60, // Fullwidth Forms (most)
+            0xFFE0...0xFFE6, // Fullwidth Signs
+            0x1F300...0x1F64F, // Misc Symbols / Emoji
+            0x1F680...0x1F9FF, // Transport / Supplemental Symbols
+            0x20000...0x2FFFD, // CJK Ext B-F
+            0x30000...0x3FFFD, // CJK Ext G+
+            => true,
+            else => false,
+        };
     }
 
     fn execute(self: *Screen, b: u8) void {

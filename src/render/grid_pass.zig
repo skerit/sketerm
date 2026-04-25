@@ -161,7 +161,11 @@ pub const GridPass = struct {
                     try self.pushQuad(.{ x, y }, .{ cw, ch }, .{ 0, 0 }, .{ 0, 0 }, bg, 0.0);
                 }
 
-                if (cell.rune != 0 and cell.rune != ' ') {
+                // Skip wide-char continuation cells (right half of a
+                // 2-column glyph). Their rune is 0 by design.
+                if (cell.flags & 0b0000_0010 != 0) {
+                    // is_wide_cont — handled by the left cell.
+                } else if (cell.rune != 0 and cell.rune != ' ') {
                     const g = atlas.lookupOrLoad(cell.rune) catch continue;
                     if (g.w == 0 or g.h == 0) continue;
                     const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x));
