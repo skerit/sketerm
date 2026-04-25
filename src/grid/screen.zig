@@ -91,6 +91,11 @@ pub const Screen = struct {
     /// queries. Set externally (Pane.attachFont). Empty string means
     /// "we'll respond with a generic Monospace string".
     font_name: []const u8 = "",
+    /// Cell pixel size — set by Pane.onResize. CSI 14t reports
+    /// `rows*cell_pixel_h` and `cols*cell_pixel_w`. Zero falls back
+    /// to the legacy 8/16 approximation.
+    cell_pixel_w: u16 = 0,
+    cell_pixel_h: u16 = 0,
     /// DECSET 1004 — focus reporting.
     focus_reports: bool = false,
     /// DECCKM (mode 1) — application cursor keys (arrows emit
@@ -2405,11 +2410,21 @@ pub const Screen = struct {
             11 => self.respond("\x1b[1t"), // window state: not iconified
             13 => self.respond("\x1b[3;0;0t"), // window position: 0,0 (we don't know)
             14 => {
-                // Pixels — we don't know exact pixel size, approximate
-                // via cell metrics * cols/rows. v1: report grid * 8/16.
-                const w: u32 = @as(u32, self.cols) * 8;
-                const h: u32 = @as(u32, self.rows) * 16;
+                // Pixels — accurate when Pane has reported cell
+                // metrics; falls back to the legacy 8x16 approximation
+                // when uninitialised (e.g. tests).
+                const cw: u32 = if (self.cell_pixel_w > 0) self.cell_pixel_w else 8;
+                const ch: u32 = if (self.cell_pixel_h > 0) self.cell_pixel_h else 16;
+                const w: u32 = @as(u32, self.cols) * cw;
+                const h: u32 = @as(u32, self.rows) * ch;
                 const s = std.fmt.bufPrint(&resp_buf, "\x1b[4;{d};{d}t", .{ h, w }) catch return;
+                self.respond(s);
+            },
+            16 => {
+                // CSI 16 t — report cell pixel size as `\x1b[6;<h>;<w>t`.
+                const cw: u32 = if (self.cell_pixel_w > 0) self.cell_pixel_w else 8;
+                const ch: u32 = if (self.cell_pixel_h > 0) self.cell_pixel_h else 16;
+                const s = std.fmt.bufPrint(&resp_buf, "\x1b[6;{d};{d}t", .{ ch, cw }) catch return;
                 self.respond(s);
             },
             18 => {
@@ -3708,6 +3723,39 @@ test "mouse encoding modes are mutually-exclusive last-set" {
     csi.final = 'l';
     s.csi(csi);
     try std.testing.expectEqual(Screen.MouseEnc.legacy, s.mouse_enc);
+}
+
+test "CSI 14t reports rows*cell_h × cols*cell_w when set" {
+    const TestSink = struct {
+        var captured: [64]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 80, 24);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+    s.cell_pixel_w = 9;
+    s.cell_pixel_h = 18;
+
+    TestSink.captured_len = 0;
+    var csi = Event.Csi{};
+    csi.params[0] = 14;
+    csi.n_params = 1;
+    csi.final = 't';
+    s.csi(csi);
+    try std.testing.expectEqualStrings("\x1b[4;432;720t", TestSink.captured[0..TestSink.captured_len]);
+
+    TestSink.captured_len = 0;
+    csi.params[0] = 16;
+    s.csi(csi);
+    try std.testing.expectEqualStrings("\x1b[6;18;9t", TestSink.captured[0..TestSink.captured_len]);
 }
 
 test "OSC 50 query responds with current font name" {

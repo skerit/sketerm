@@ -1155,6 +1155,11 @@ fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) cal
     const inner_h: c_int = @max(1, height - 2 * pad);
     const cols: u16 = @intCast(@max(1, @divFloor(inner_w, @as(c_int, atlas.cell_w))));
     const rows: u16 = @intCast(@max(1, @divFloor(inner_h, @as(c_int, atlas.cell_h))));
+    // Always sync the cell-pixel metrics — apps querying CSI 14t
+    // / 18t expect accurate sizes even when col/row counts didn't
+    // change (e.g. when the user just resized the window slightly).
+    self.terminal.screen.cell_pixel_w = atlas.cell_w;
+    self.terminal.screen.cell_pixel_h = atlas.cell_h;
     if (cols == self.terminal.screen.cols and rows == self.terminal.screen.rows) return;
 
     self.terminal.screen.resize(cols, rows) catch return;
