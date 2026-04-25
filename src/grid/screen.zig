@@ -19,6 +19,7 @@ const Attrs = style_pool.Attrs;
 const Color = style_pool.Color;
 const Event = @import("../parser/event.zig").Event;
 const utf8 = @import("../util/utf8.zig");
+const palette_default_256 = @import("palette.zig").default_256;
 
 pub const Screen = struct {
     cols: u16,
@@ -448,6 +449,22 @@ pub const Screen = struct {
         }
     }
 
+    /// OSC 4 — palette query/set. Supports query form
+    /// `OSC 4 ; n ; ?` only; replies with the renderer's default
+    /// palette since we don't yet store a runtime palette.
+    fn handleOsc4(self: *Screen, rest: []const u8) void {
+        const semi = std.mem.indexOfScalar(u8, rest, ';') orelse return;
+        const idx = std.fmt.parseInt(u8, rest[0..semi], 10) catch return;
+        const data = rest[semi + 1 ..];
+        if (data.len != 1 or data[0] != '?') return;
+        const rgb = palette_default_256[idx];
+        var resp_buf: [64]u8 = undefined;
+        const s = std.fmt.bufPrint(&resp_buf, "\x1b]4;{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}\x1b\\", .{
+            idx, rgb[0], rgb[0], rgb[1], rgb[1], rgb[2], rgb[2],
+        }) catch return;
+        self.respond(s);
+    }
+
     fn handleOsc8(self: *Screen, params: []const u8) void {
         // Format: `id=foo;URI` or just `URI` (params optional).
         // Empty URI = end of link.
@@ -550,6 +567,7 @@ pub const Screen = struct {
             7 => {
                 if (self.sink.on_cwd) |f| f(self.sink.ctx, rest);
             },
+            4 => self.handleOsc4(rest),
             8 => self.handleOsc8(rest),
             10, 11 => {
                 // OSC 10/11 fg/bg color query: `?` returns the
