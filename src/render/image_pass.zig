@@ -41,6 +41,11 @@ pub const ImagePass = struct {
     vbo: c_uint = 0,
     u_screen_px: c_int = -1,
     u_image: c_int = -1,
+    /// Inner padding (pixels) applied to the cell grid. Images must
+    /// be offset by this same amount so they line up with the cells
+    /// that referenced them. Set by the Pane each frame from
+    /// `grid_pass.pad`.
+    pad: f32 = 0,
     /// When true, draw() prints per-image diagnostics to stderr.
     debug: bool = false,
 
@@ -128,8 +133,8 @@ pub const ImagePass = struct {
                 if (self.debug) std.debug.print("[image] skip id={d}: tex=0\n", .{img.image_id});
                 continue;
             }
-            const x: f32 = @as(f32, @floatFromInt(img.cell_col)) * store.cell_w;
-            const y: f32 = @as(f32, @floatFromInt(img.cell_row)) * store.cell_h;
+            const x: f32 = self.pad + @as(f32, @floatFromInt(img.cell_col)) * store.cell_w;
+            const y: f32 = self.pad + @as(f32, @floatFromInt(img.cell_row)) * store.cell_h;
 
             // Destination size:
             //   - cells_wide/cells_high > 0 → scale to that many cells

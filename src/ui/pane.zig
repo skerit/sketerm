@@ -487,6 +487,9 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     // images with z_index >= 0 render in front (kitty default).
     // Sandwich the cell + overlay passes between two image passes.
     self.image_store.flushUploads();
+    // Match the cell grid's inner padding so images align with the
+    // cells that placed them.
+    self.image_pass.pad = self.grid_pass.pad;
     self.image_pass.drawZ(&self.image_store, phys_w, phys_h, .below);
 
     self.cell_pass.draw(atlas, phys_w, phys_h);
