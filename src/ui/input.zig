@@ -33,6 +33,8 @@ pub const Action = enum {
     font_reset,
     search_open,
     save_layout,
+    prompt_prev,
+    prompt_next,
 };
 
 pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allocator) !*Ctx {
@@ -197,10 +199,19 @@ fn onKeyPressed(
         }
     }
     // Ctrl+Shift++ as a fallback for keyboards where + is shift+=.
+    // Ctrl+Shift+Up/Down = OSC 133 prompt navigation.
     if (ctrl_pressed and shift_pressed) {
         switch (keyval) {
             c.GDK_KEY_plus => {
                 if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .font_inc);
+                return 1;
+            },
+            c.GDK_KEY_Up, c.GDK_KEY_KP_Up => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .prompt_prev);
+                return 1;
+            },
+            c.GDK_KEY_Down, c.GDK_KEY_KP_Down => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .prompt_next);
                 return 1;
             },
             else => {},

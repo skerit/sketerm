@@ -150,7 +150,11 @@ pub const Screen = struct {
     /// Prompt-mark scrollback rows reported by OSC 133 ; A. Ring
     /// of the last 256 prompt rows for future "jump to previous
     /// prompt" navigation.
-    prompt_marks: [256]i32 = [_]i32{0} ** 256,
+    /// Stable line IDs. Incremented at every new-line birth (init,
+    /// scroll, scrollback push, alt-screen swap, reflow). prompt_marks
+    /// stores IDs (not display rows) so they survive scrolling.
+    next_line_id: u64 = 1,
+    prompt_marks: [256]u64 = [_]u64{0} ** 256,
     prompt_marks_len: u16 = 0,
     prompt_marks_head: u16 = 0,
 
@@ -278,8 +282,12 @@ pub const Screen = struct {
         errdefer allocator.free(active);
         var initialized: u16 = 0;
         errdefer for (active[0..initialized]) |*l| l.deinit(allocator);
+        // Initial line IDs start at 1 and increment as we fill rows.
+        var id_counter: u64 = 1;
         for (active) |*l| {
             l.* = try Line.init(allocator, cols);
+            l.id = id_counter;
+            id_counter += 1;
             initialized += 1;
         }
 
@@ -293,6 +301,7 @@ pub const Screen = struct {
             .links = std.AutoHashMap(u8, []u8).init(allocator),
             .clusters = std.AutoHashMap(u32, std.ArrayList(u32)).init(allocator),
             .kitty_images = @import("kitty_images.zig").Manager.init(allocator),
+            .next_line_id = id_counter,
         };
         try self.resetTabStops();
         return self;
@@ -433,9 +442,90 @@ pub const Screen = struct {
     fn recordPromptMark(self: *Screen) void {
         const cap: u16 = self.prompt_marks.len;
         const idx = self.prompt_marks_head;
-        self.prompt_marks[idx] = @intCast(self.row);
+        // Record the current row's *line ID*, not the row number.
+        // Display rows scroll, IDs don't.
+        const buf_const = if (self.use_alt) self.alt.? else self.active;
+        if (self.row >= self.rows) return;
+        self.prompt_marks[idx] = buf_const[self.row].id;
         self.prompt_marks_head = (idx + 1) % cap;
         if (self.prompt_marks_len < cap) self.prompt_marks_len += 1;
+    }
+
+    /// Allocate a fresh, monotonically-increasing line ID. u64 — won't
+    /// wrap in any plausible session (1 ID/ns × 580 years).
+    fn nextLineId(self: *Screen) u64 {
+        const id = self.next_line_id;
+        self.next_line_id += 1;
+        return id;
+    }
+
+    /// Locate the display row containing `line_id`, including
+    /// scrollback (negative result). Returns null if the ID isn't
+    /// in either the active buffer or scrollback.
+    pub fn rowForLineId(self: *const Screen, line_id: u64) ?i32 {
+        if (line_id == 0) return null;
+        const buf_const = if (self.use_alt) self.alt.? else self.active;
+        for (buf_const, 0..) |l, i| {
+            if (l.id == line_id) return @intCast(i);
+        }
+        if (!self.use_alt) {
+            const sb_count = self.scrollback.items.len;
+            for (self.scrollback.items, 0..) |l, i| {
+                if (l.id == line_id) {
+                    // Scrollback: -1 = bottom-most, -sb_count = oldest.
+                    const from_bottom: i32 = @intCast(sb_count - i);
+                    return -from_bottom;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Step to the previous (older) prompt mark visible in the buffer.
+    /// Returns the new view_offset after the move, or null if there is
+    /// no earlier mark.
+    pub fn jumpPrevPrompt(self: *Screen) ?u32 {
+        if (self.prompt_marks_len == 0) return null;
+        // Iterate marks from most-recent to oldest; pick the first
+        // whose row is *strictly above* the current top-of-view.
+        const view_top: i32 = -@as(i32, @intCast(self.view_offset));
+        var i: u16 = self.prompt_marks_len;
+        while (i > 0) {
+            i -= 1;
+            const slot: u16 = @intCast((@as(u32, self.prompt_marks_head) + @as(u32, self.prompt_marks.len) - 1 - @as(u32, i)) % self.prompt_marks.len);
+            const id = self.prompt_marks[slot];
+            const row = self.rowForLineId(id) orelse continue;
+            if (row < view_top) {
+                const dist: u32 = @intCast(-row);
+                const sb: u32 = @intCast(self.scrollback.items.len);
+                self.view_offset = @min(sb, dist);
+                self.dirty = true;
+                return self.view_offset;
+            }
+        }
+        return null;
+    }
+
+    pub fn jumpNextPrompt(self: *Screen) ?u32 {
+        if (self.prompt_marks_len == 0) return null;
+        const view_top: i32 = -@as(i32, @intCast(self.view_offset));
+        var i: u16 = 0;
+        while (i < self.prompt_marks_len) : (i += 1) {
+            const slot: u16 = @intCast((@as(u32, self.prompt_marks_head) + @as(u32, self.prompt_marks.len) - @as(u32, self.prompt_marks_len) + @as(u32, i)) % self.prompt_marks.len);
+            const id = self.prompt_marks[slot];
+            const row = self.rowForLineId(id) orelse continue;
+            if (row > view_top) {
+                if (row >= 0) {
+                    self.view_offset = 0;
+                } else {
+                    const dist: u32 = @intCast(-row);
+                    self.view_offset = dist;
+                }
+                self.dirty = true;
+                return self.view_offset;
+            }
+        }
+        return null;
     }
 
     /// Clear the visible screen + the scrollback ring + send cursor
@@ -554,9 +644,11 @@ pub const Screen = struct {
         while (i < taken and i < new_rows) : (i += 1) {
             new_active[i] = all_rows[active_first + i];
         }
-        // Pad if we have fewer logical rows than fit.
+        // Pad if we have fewer logical rows than fit. Each new line
+        // gets a fresh ID.
         while (i < new_rows) : (i += 1) {
             new_active[i] = try Line.init(self.allocator, new_cols);
+            new_active[i].id = self.nextLineId();
         }
         // Free the slice carrier (the rows themselves were moved out).
         self.allocator.free(all_rows);
@@ -601,7 +693,10 @@ pub const Screen = struct {
         if (new_rows > old_rows) {
             const new_buf = try allocator.realloc(slot.*, new_rows);
             var i: u16 = old_rows;
-            while (i < new_rows) : (i += 1) new_buf[i] = try Line.init(allocator, new_cols);
+            while (i < new_rows) : (i += 1) {
+                new_buf[i] = try Line.init(allocator, new_cols);
+                new_buf[i].id = screen.nextLineId();
+            }
             slot.* = new_buf;
         } else if (new_rows < old_rows) {
             const drop = old_rows - new_rows;
@@ -609,7 +704,7 @@ pub const Screen = struct {
             while (i < drop) : (i += 1) {
                 if (push_to_sb) {
                     const copy = allocator.dupe(Cell, slot.*[i].cells) catch null;
-                    if (copy) |cells| screen.pushScrollback(cells);
+                    if (copy) |cells| screen.pushScrollback(cells, slot.*[i].id);
                 }
                 slot.*[i].deinit(allocator);
             }
@@ -621,13 +716,13 @@ pub const Screen = struct {
 
     /// Push a line into scrollback. Caller transfers ownership of
     /// the cells slice. Evicts oldest if cap exceeded.
-    fn pushScrollback(self: *Screen, cells: []Cell) void {
+    fn pushScrollback(self: *Screen, cells: []Cell, line_id: u64) void {
         if (self.scrollback.items.len >= self.scrollback_capacity) {
             // Evict oldest.
             var old = self.scrollback.orderedRemove(0);
             old.deinit(self.allocator);
         }
-        self.scrollback.append(self.allocator, .{ .cells = cells }) catch {
+        self.scrollback.append(self.allocator, .{ .cells = cells, .id = line_id }) catch {
             // On OOM, just drop the line (free it).
             self.allocator.free(cells);
         };
@@ -1925,53 +2020,61 @@ pub const Screen = struct {
         const move: u16 = @intCast(@min(n, @as(u32, region)));
         const lines = self.buf();
 
-        // Push scrolled-out lines into scrollback (only when on main
-        // screen and scrolling at the actual top).
         const push_to_sb = !self.use_alt and self.scroll_top == 0;
 
         if (move < region) {
-            // Rotate cell-pointers: top `move` go to bottom (cleared
-            // or pushed to scrollback first).
+            // Stash both the cells AND the ids of the rows we're
+            // about to scroll out — they belong to the content, not
+            // the array slot.
             var stash = self.allocator.alloc([]Cell, move) catch return;
             defer self.allocator.free(stash);
+            var stash_ids = self.allocator.alloc(u64, move) catch return;
+            defer self.allocator.free(stash_ids);
             var i: u16 = 0;
-            while (i < move) : (i += 1) stash[i] = lines[self.scroll_top + i].cells;
+            while (i < move) : (i += 1) {
+                stash[i] = lines[self.scroll_top + i].cells;
+                stash_ids[i] = lines[self.scroll_top + i].id;
+            }
 
             if (push_to_sb) {
-                // Push a *copy* of each scrolled line to scrollback so
-                // the original cell buffer can stay in the rotation.
                 var k: u16 = 0;
                 while (k < move) : (k += 1) {
                     const copy = self.allocator.dupe(Cell, stash[k]) catch break;
-                    self.pushScrollback(copy);
+                    self.pushScrollback(copy, stash_ids[k]);
                 }
             }
 
+            // Shift cells + ids up by `move`.
             i = 0;
             while (i + move <= self.scroll_bot - self.scroll_top) : (i += 1) {
                 lines[self.scroll_top + i].cells = lines[self.scroll_top + i + move].cells;
                 lines[self.scroll_top + i].continues_above = lines[self.scroll_top + i + move].continues_above;
+                lines[self.scroll_top + i].id = lines[self.scroll_top + i + move].id;
             }
+            // The newly-bottom rows get fresh IDs (new content arriving).
             i = 0;
             while (i < move) : (i += 1) {
                 const dst = self.scroll_bot - move + 1 + i;
                 lines[dst].cells = stash[i];
                 @memset(lines[dst].cells, .{});
                 lines[dst].continues_above = false;
+                lines[dst].id = self.nextLineId();
             }
         } else {
-            // Entire region scrolled.
+            // Whole region scrolled; everything goes to scrollback (or
+            // is dropped, on alt screen).
             if (push_to_sb) {
                 var i: u16 = 0;
                 while (i < region) : (i += 1) {
                     const copy = self.allocator.dupe(Cell, lines[self.scroll_top + i].cells) catch break;
-                    self.pushScrollback(copy);
+                    self.pushScrollback(copy, lines[self.scroll_top + i].id);
                 }
             }
             var i: u16 = self.scroll_top;
             while (i <= self.scroll_bot) : (i += 1) {
                 @memset(lines[i].cells, .{});
                 lines[i].continues_above = false;
+                lines[i].id = self.nextLineId();
             }
         }
         var i: u16 = self.scroll_top;
@@ -1990,8 +2093,8 @@ pub const Screen = struct {
             defer self.allocator.free(stash);
             var i: u16 = 0;
             while (i < move) : (i += 1) stash[i] = lines[self.scroll_bot - move + 1 + i].cells;
-            // Shift cells down (iterate top-to-bottom in reverse to avoid
-            // overwriting before reading).
+            // Shift cells + ids down (iterate top-to-bottom in reverse
+            // to avoid overwriting before reading).
             var j: u16 = 0;
             const inner_count: u16 = self.scroll_bot - self.scroll_top + 1 - move;
             while (j < inner_count) : (j += 1) {
@@ -1999,18 +2102,21 @@ pub const Screen = struct {
                 const dst = self.scroll_bot - j;
                 lines[dst].cells = lines[src].cells;
                 lines[dst].continues_above = lines[src].continues_above;
+                lines[dst].id = lines[src].id;
             }
             i = 0;
             while (i < move) : (i += 1) {
                 lines[self.scroll_top + i].cells = stash[i];
                 @memset(lines[self.scroll_top + i].cells, .{});
                 lines[self.scroll_top + i].continues_above = false;
+                lines[self.scroll_top + i].id = self.nextLineId();
             }
         } else {
             var i: u16 = self.scroll_top;
             while (i <= self.scroll_bot) : (i += 1) {
                 @memset(lines[i].cells, .{});
                 lines[i].continues_above = false;
+                lines[i].id = self.nextLineId();
             }
         }
         var i: u16 = self.scroll_top;
@@ -2139,12 +2245,16 @@ pub const Screen = struct {
             }
             while (i < self.rows) : (i += 1) {
                 alt[i] = Line.init(self.allocator, self.cols) catch return;
+                alt[i].id = self.nextLineId();
             }
             self.alt = alt;
         }
         if (on) {
             self.use_alt = true;
-            for (self.alt.?) |*l| l.clear();
+            for (self.alt.?) |*l| {
+                l.clear();
+                l.id = self.nextLineId();
+            }
         } else {
             self.use_alt = false;
         }
@@ -2915,19 +3025,45 @@ test "parseColor handles rgb: and #RRGGBB" {
     try std.testing.expect(Screen.parseColor("not a color") == null);
 }
 
-test "OSC 133 ; A records prompt mark" {
+test "OSC 133 ; A records prompt mark with line ID" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
     var s = try Screen.init(std.testing.allocator, &pool, 5, 3);
     defer s.deinit();
     s.row = 1;
+    const id1 = s.active[1].id;
     s.onOsc("133;A");
     try std.testing.expectEqual(@as(u16, 1), s.prompt_marks_len);
-    try std.testing.expectEqual(@as(i32, 1), s.prompt_marks[0]);
+    try std.testing.expectEqual(id1, s.prompt_marks[0]);
     s.row = 2;
+    const id2 = s.active[2].id;
     s.onOsc("133;A");
     try std.testing.expectEqual(@as(u16, 2), s.prompt_marks_len);
-    try std.testing.expectEqual(@as(i32, 2), s.prompt_marks[1]);
+    try std.testing.expectEqual(id2, s.prompt_marks[1]);
+
+    // Mark survives scrolling: scroll once, the row at id2 is now at
+    // row 1 (or in scrollback), but rowForLineId resolves both.
+    s.scrollUp(1);
+    const r1 = s.rowForLineId(id1);
+    const r2 = s.rowForLineId(id2);
+    try std.testing.expect(r1 != null);
+    try std.testing.expect(r2 != null);
+}
+
+test "jumpPrevPrompt scrolls into scrollback" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 3);
+    defer s.deinit();
+    // Record a mark at row 0, then scroll lots so it's in scrollback.
+    s.row = 0;
+    s.onOsc("133;A");
+    var k: u32 = 0;
+    while (k < 10) : (k += 1) s.scrollUp(1);
+    try std.testing.expectEqual(@as(u32, 0), s.view_offset);
+    const off = s.jumpPrevPrompt();
+    try std.testing.expect(off != null);
+    try std.testing.expect(s.view_offset > 0);
 }
 
 test "XTMODKEYS sets modify_other_keys level" {

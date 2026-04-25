@@ -807,6 +807,18 @@ pub const Window = struct {
         }
     }
 
+    const PromptDir = enum { prev, next };
+
+    fn jumpPromptOnFocused(self: *Window, dir: PromptDir) void {
+        const pane = self.focusedPane() orelse return;
+        const screen = pane.terminal.screen;
+        _ = switch (dir) {
+            .prev => screen.jumpPrevPrompt(),
+            .next => screen.jumpNextPrompt(),
+        };
+        c.gtk_widget_queue_draw(pane.widget());
+    }
+
     fn focusedPane(self: *Window) ?*Pane {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return null;
         for (self.panes.items) |p| {
@@ -988,6 +1000,8 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .font_reset => self.resetFocusedFontSize(),
         .search_open => self.openSearch(),
         .save_layout => self.saveLayoutQuietly(),
+        .prompt_prev => self.jumpPromptOnFocused(.prev),
+        .prompt_next => self.jumpPromptOnFocused(.next),
         else => {},
     }
 }

@@ -11,6 +11,11 @@ pub const Line = struct {
     /// True if this line is the soft-wrap continuation of the line
     /// above (set by the printer when autowrap triggered).
     continues_above: bool = false,
+    /// Monotonic line ID assigned at line birth (LF / scroll / fill).
+    /// Stays attached to the same logical content as it scrolls into
+    /// scrollback or shifts under reflow. 0 = unassigned (legacy
+    /// callers; init() leaves it at 0 — Screen owns the ID counter).
+    id: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, cols: u16) !Line {
         const cells = try allocator.alloc(Cell, cols);
