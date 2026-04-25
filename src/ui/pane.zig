@@ -914,6 +914,11 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
         return;
     }
 
+    // Ctrl+click hyperlink launch — but ONLY when the running app
+    // isn't capturing the mouse (mouse_mode 1000+). Otherwise we'd
+    // hijack a click that the app expected to receive.
+    if (self.terminal.screen.mouse_mode != 0) return;
+
     const event = c.gtk_event_controller_get_current_event(@ptrCast(g));
     if (event == null) return;
     const mods = c.gdk_event_get_modifier_state(event);
