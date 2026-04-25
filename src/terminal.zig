@@ -14,6 +14,7 @@ const ring_mod = @import("util/ring.zig");
 const Pty = @import("pty.zig").Pty;
 const Screen = @import("grid/screen.zig").Screen;
 const Pool = @import("grid/style_pool.zig").Pool;
+const percent = @import("util/percent.zig");
 
 pub const RING_CAP: usize = 4096; // power-of-2; one event per slot
 
@@ -132,37 +133,9 @@ pub const Terminal = struct {
             }
             break :blk cwd_in;
         };
-        const decoded = percentDecode(self.allocator, raw) catch return;
+        const decoded = percent.decode(self.allocator, raw) catch return;
         if (self.cwd) |old| self.allocator.free(old);
         self.cwd = decoded;
-    }
-
-    fn percentDecode(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-        var out = try allocator.alloc(u8, s.len);
-        errdefer allocator.free(out);
-        var w: usize = 0;
-        var i: usize = 0;
-        while (i < s.len) : (i += 1) {
-            if (s[i] == '%' and i + 2 < s.len) {
-                const hi = std.fmt.charToDigit(s[i + 1], 16) catch {
-                    out[w] = s[i];
-                    w += 1;
-                    continue;
-                };
-                const lo = std.fmt.charToDigit(s[i + 2], 16) catch {
-                    out[w] = s[i];
-                    w += 1;
-                    continue;
-                };
-                out[w] = (hi << 4) | lo;
-                w += 1;
-                i += 2;
-            } else {
-                out[w] = s[i];
-                w += 1;
-            }
-        }
-        return try allocator.realloc(out, w);
     }
 
     fn sinkImage(ctx: ?*anyopaque, img: Screen.ImageEvent) void {

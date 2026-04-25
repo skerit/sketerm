@@ -8,6 +8,7 @@ const std = @import("std");
 comptime {
     _ = @import("util/ring.zig");
     _ = @import("util/utf8.zig");
+    _ = @import("util/percent.zig");
     _ = @import("parser/event.zig");
     _ = @import("parser/vt.zig");
     _ = @import("grid/cell.zig");
