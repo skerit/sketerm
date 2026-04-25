@@ -47,9 +47,8 @@ pub const ImagePass = struct {
     }
 
     pub fn deinit(self: *ImagePass) void {
-        if (self.program != 0) c.glDeleteProgram(self.program);
-        if (self.vbo != 0) c.glDeleteBuffers(1, &self.vbo);
-        if (self.vao != 0) c.glDeleteVertexArrays(1, &self.vao);
+        // GL resources are tied to the context (see GridPass.deinit).
+        _ = self;
     }
 
     pub fn realize(self: *ImagePass) !void {

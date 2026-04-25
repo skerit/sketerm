@@ -30,9 +30,12 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store) void {
+        // Free pending pixel buffers. GL textures are owned by their
+        // context — when the widget is unrealized, GTK destroys the
+        // context which frees the textures. Calling glDeleteTextures
+        // here without a current context is a no-op or crash; skip.
         for (self.images.items) |*img| {
             if (img.pending) |p| self.allocator.free(p);
-            if (img.gl_tex != 0) c.glDeleteTextures(1, &img.gl_tex);
         }
         self.images.deinit(self.allocator);
     }

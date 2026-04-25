@@ -84,9 +84,8 @@ pub const GridPass = struct {
     }
 
     pub fn deinit(self: *GridPass) void {
-        if (self.program != 0) c.glDeleteProgram(self.program);
-        if (self.vbo != 0) c.glDeleteBuffers(1, &self.vbo);
-        if (self.vao != 0) c.glDeleteVertexArrays(1, &self.vao);
+        // GL resources are tied to the context, which GTK destroys
+        // on widget unrealize. Skip explicit GL deletes.
         self.vbuf.deinit(self.allocator);
     }
 

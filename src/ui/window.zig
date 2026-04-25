@@ -382,9 +382,8 @@ pub const Window = struct {
         }
 
         // Clean up. Terminal.deinit kills worker + closes PTY.
-        // Pane.deinit (GL atlas etc) is skipped — leak is bounded
-        // since GTK destroys the widget on unparent and the context
-        // may not be current anymore.
+        // Pane.deinit frees Zig-side state; GL resources are tied
+        // to the GL context which GTK tears down on unparent.
         _ = self.panes.orderedRemove(found_idx.?);
         const term = pane.terminal;
         for (self.terminals.items, 0..) |t, ti| {
@@ -394,6 +393,7 @@ pub const Window = struct {
             }
         }
         term.deinit();
+        pane.deinit();
     }
 
     /// Build a Layout snapshot of the current window state.

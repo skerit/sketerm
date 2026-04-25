@@ -111,10 +111,7 @@ pub const Atlas = struct {
     }
 
     pub fn deinit(self: *Atlas) void {
-        if (self.realized) {
-            c.glDeleteTextures(1, &self.gl_tex);
-            self.realized = false;
-        }
+        // GL texture is freed by GTK on widget unrealize.
         self.cache.deinit();
         _ = c.FT_Done_Face(self.ft_face);
         _ = c.FT_Done_FreeType(self.ft_lib);
