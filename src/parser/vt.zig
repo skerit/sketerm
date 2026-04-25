@@ -103,11 +103,51 @@ pub const Parser = struct {
         emit: EmitFn,
         ctx: ?*anyopaque,
     ) void {
-        for (bytes) |b| self.byte(b, emit, ctx);
+        var i: usize = 0;
+        while (i < bytes.len) {
+            // SIMD fast-path: when sitting in Ground state with no
+            // VT52 dispatch quirks, scan ahead for the longest run of
+            // printable bytes (>=0x20 && !=0x7F). `else` includes
+            // 0x80..0xFF since byteGround treats them as printable.
+            // Bulk-copy the run into print_buf, flushing as needed —
+            // skips the per-byte switch tower on every byte.
+            if (self.state == .ground and !self.vt52_mode) {
+                const n = scanPrintable(bytes[i..]);
+                if (n > 0) {
+                    self.appendPrintable(bytes[i .. i + n], emit, ctx);
+                    i += n;
+                    continue;
+                }
+            }
+            self.byte(bytes[i], emit, ctx);
+            i += 1;
+        }
         // Flush any trailing print run so the consumer sees content
         // immediately. Without this, a "shell prints just a few
         // bytes and waits" wouldn't render until the next byte.
         self.flushPrint(emit, ctx);
+    }
+
+    /// Append a slice of printable bytes to `print_buf`, flushing
+    /// (emitting `print_run` events) every 64 bytes. Caller must have
+    /// already verified the bytes are printable per byteGround.
+    fn appendPrintable(
+        self: *Parser,
+        slice: []const u8,
+        emit: EmitFn,
+        ctx: ?*anyopaque,
+    ) void {
+        var off: usize = 0;
+        while (off < slice.len) {
+            if (self.print_len == self.print_buf.len) {
+                self.flushPrint(emit, ctx);
+            }
+            const space: usize = self.print_buf.len - self.print_len;
+            const n: usize = @min(slice.len - off, space);
+            @memcpy(self.print_buf[self.print_len .. self.print_len + n], slice[off .. off + n]);
+            self.print_len += @intCast(n);
+            off += n;
+        }
     }
 
     fn byte(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
@@ -497,6 +537,79 @@ pub const Parser = struct {
         self.transitionTo(.ground);
     }
 };
+
+// ── SIMD ground-state scan ───────────────────────────────────────
+
+/// Return the length of the longest prefix where every byte is
+/// "printable" by `byteGround`'s rules: >=0x20 AND !=0x7F. Includes
+/// 0x80..0xFF (high bytes are passed through as printable; UTF-8
+/// reassembly happens on the consumer side).
+///
+/// Vectorized 16-at-a-time when the input is long enough; falls back
+/// to scalar for the tail.
+fn scanPrintable(bytes: []const u8) usize {
+    var i: usize = 0;
+    const V = @Vector(16, u8);
+    const v_min: V = @splat(0x20);
+    const v_del: V = @splat(0x7F);
+    while (i + 16 <= bytes.len) : (i += 16) {
+        const chunk: V = bytes[i..][0..16].*;
+        const ge_min = chunk >= v_min;
+        const ne_del = chunk != v_del;
+        const ok: @Vector(16, bool) = @select(bool, ge_min, ne_del, @as(@Vector(16, bool), @splat(false)));
+        const mask: u16 = @bitCast(ok);
+        if (mask != 0xFFFF) {
+            const inv: u16 = ~mask;
+            return i + @ctz(inv);
+        }
+    }
+    while (i < bytes.len) : (i += 1) {
+        const b = bytes[i];
+        if (b < 0x20 or b == 0x7F) return i;
+    }
+    return i;
+}
+
+test "scanPrintable: pure ASCII run" {
+    try std.testing.expectEqual(@as(usize, 32), scanPrintable("Hello, world! The quick brown fo"));
+}
+
+test "scanPrintable: stops at LF" {
+    try std.testing.expectEqual(@as(usize, 5), scanPrintable("Hello\nWorld"));
+}
+
+test "scanPrintable: stops at ESC" {
+    try std.testing.expectEqual(@as(usize, 3), scanPrintable("abc\x1b[1m"));
+}
+
+test "scanPrintable: stops at DEL" {
+    try std.testing.expectEqual(@as(usize, 3), scanPrintable("abc\x7Fdef"));
+}
+
+test "scanPrintable: high bytes are printable" {
+    try std.testing.expectEqual(@as(usize, 5), scanPrintable(&[_]u8{ 0xC3, 0xA9, 0xE4, 0xB8, 0xAD }));
+}
+
+test "scanPrintable: control byte at start" {
+    try std.testing.expectEqual(@as(usize, 0), scanPrintable("\x00abc"));
+}
+
+test "scanPrintable: empty" {
+    try std.testing.expectEqual(@as(usize, 0), scanPrintable(""));
+}
+
+test "scanPrintable: long uniform run" {
+    var buf: [256]u8 = undefined;
+    @memset(&buf, 'x');
+    try std.testing.expectEqual(@as(usize, 256), scanPrintable(&buf));
+}
+
+test "scanPrintable: long run with control near end" {
+    var buf: [256]u8 = undefined;
+    @memset(&buf, 'x');
+    buf[200] = 0x07;
+    try std.testing.expectEqual(@as(usize, 200), scanPrintable(&buf));
+}
 
 // ── Tests ────────────────────────────────────────────────────────
 
