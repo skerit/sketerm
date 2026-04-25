@@ -333,3 +333,58 @@ Remaining post-checkpoint TODO list:
 - **Stb_image vendored under `vendor/`** — single-header,
   public-domain, compiled as a C source by `build.zig`. Used
   for iTerm2 OSC 1337 PNG decoding.
+
+## Iteration after the long-tail TODO
+
+This session resumed after a context-compaction during the kitty
+delete dispatch wiring (build was broken — `sinkImageDeleteFull`
+was referenced but not defined). Picked up there and shipped the
+following:
+
+- **Kitty graphics delete dispatch** end-to-end. `Pane.on_image_delete_full`
+  routes `d=a/A/i/I/p/P` to `markByPlacementForDelete` /
+  `markByIdForDelete` / `markAllForDelete`. Legacy `on_image_delete`
+  field removed (the full event supersedes it). Tests in
+  `graphics_conformance_test.zig`.
+- **Middle-click PRIMARY paste**. Drag-select fills PRIMARY, button
+  2 pastes from PRIMARY when `mouse_mode == 0`. With mouse_mode > 0
+  the running app still gets the click. `clipboard.zig` grew
+  `copyToPrimary`.
+- **Config file** at `$XDG_CONFIG_HOME/sketerm/config.conf` (or
+  `~/.config/sketerm/config.conf`). Simple `key = value` format,
+  `#` comments at line start so `#abcdef` colours survive. Wires
+  font, font_size, padding, default_fg/bg, cursor_color, cursor
+  shape+blink, scrollback, shell, term/color_term env, bracketed
+  paste, modify_other_keys, ligatures, auto_theme. Env vars
+  (`SKETERM_FONT`, `SKETERM_SCROLLBACK`) still win. Sample at
+  `data/sample.conf`. 5 tests in `config.zig`.
+- **Live font size** — `Ctrl+=` / `Ctrl+-` / `Ctrl+0`.
+  `Pane.setFontSize` deletes the old GL texture, rebuilds the
+  atlas at the new size, recomputes cell metrics, resizes the
+  Screen + emits SIGWINCH on the child PTY.
+- **Scrollback search** (`Ctrl+Shift+F`). Bottom search bar with
+  prev/next/match-count, Enter cycles forward, Shift+Enter back,
+  Esc closes. Linear UTF-8 scan over scrollback rings + active
+  buffer; results highlighted via the existing selection. 3 tests.
+- **HarfBuzz-shaped runs** — the renderer now detects runs of
+  same-style printable cells, builds UTF-8, calls `atlas.shapeRun`,
+  and looks up glyphs by `glyph_id` (`atlas.lookupOrLoadById`).
+  Falls back to per-codepoint when shaping unavailable. Toggle via
+  `ligatures = false`. ASCII ligature fonts (Fira Code, Iosevka,
+  JetBrains Mono) now render their ligatures.
+- **Wide-cell cursor** — block / underline / outline cursor spans
+  2 columns when on a wide rune.
+- **Reset Terminal** in right-click menu → `Screen.fullReset`.
+- **DECSC/DECRC saves OSC 8 link state** — apps that wrap nested
+  cursor saves around hyperlink spans no longer leak the link state.
+- **Auto-theme** (config `auto_theme = true`, default) — default
+  fg/bg follow `AdwStyleManager` dark/light. Set false to use
+  explicit config colours.
+- **Live theme reactivity** — `notify::dark` repaints all panes
+  when system dark/light flips at runtime.
+- **Tab tooltips** — `AdwTabPage.set_tooltip(title)` so truncated
+  tab titles stay legible.
+- **Double-click word / triple-click line** selection.
+  `Screen.selectWordAt` walks word-class neighbours;
+  `Screen.selectLineAt` selects whole row. Word-class follows xterm
+  default + non-ASCII codepoints. PRIMARY auto-filled. 3 tests.
