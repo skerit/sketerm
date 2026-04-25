@@ -20,6 +20,8 @@ comptime {
     _ = @import("grid/selection.zig");
     _ = @import("grid/selection_conformance_test.zig");
     _ = @import("grid/image_store.zig");
+    _ = @import("grid/reflow.zig");
+    _ = @import("grid/reflow_screen_test.zig");
     _ = @import("layout.zig");
     _ = @import("layout_simple.zig");
     _ = @import("parser/sixel.zig");

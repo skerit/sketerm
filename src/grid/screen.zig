@@ -309,13 +309,20 @@ pub const Screen = struct {
     }
 
     /// Resize the screen to new dimensions while preserving as much
-    /// content as possible. Active rows are re-widened (truncate or
-    /// pad with blanks). Excess rows on shrink are pushed to scrollback
-    /// (main screen) or freed (alt). Cursor is clamped.
+    /// content as possible. When columns change on the main buffer
+    /// we run a full soft-wrap reflow (scrollback + active joined,
+    /// re-chunked at new_cols, redistributed). The alt buffer always
+    /// truncates/pads — apps that use it (vim, less, htop) handle
+    /// their own resize. Cursor is re-placed at its logical position.
     pub fn resize(self: *Screen, new_cols: u16, new_rows: u16) !void {
         if (new_cols == self.cols and new_rows == self.rows) return;
 
-        try resizeBuffer(self.allocator, &self.active, self.rows, new_cols, new_rows, !self.use_alt, self);
+        const cols_changed = new_cols != self.cols;
+        if (cols_changed and !self.use_alt) {
+            try self.reflowMain(new_cols, new_rows);
+        } else {
+            try resizeBuffer(self.allocator, &self.active, self.rows, new_cols, new_rows, !self.use_alt, self);
+        }
         if (self.alt) |alt_buf| {
             var alt_mut = alt_buf;
             try resizeBuffer(self.allocator, &alt_mut, self.rows, new_cols, new_rows, false, self);
@@ -331,6 +338,95 @@ pub const Screen = struct {
         if (self.col >= new_cols) self.col = if (new_cols == 0) 0 else new_cols - 1;
         self.pending_wrap = false;
         self.dirty = true;
+    }
+
+    /// Soft-wrap reflow of scrollback + active. Assumes self.use_alt
+    /// is false. Updates self.scrollback / self.active / self.row /
+    /// self.col to match the rebuilt layout.
+    fn reflowMain(self: *Screen, new_cols: u16, new_rows: u16) !void {
+        const reflow = @import("reflow.zig");
+
+        // Build a single logical-line stream from scrollback, then active.
+        // Capture cursor's logical position before consuming.
+        var combined: std.ArrayList(Line) = .{};
+        defer combined.deinit(self.allocator);
+        try combined.appendSlice(self.allocator, self.scrollback.items);
+        const sb_count = self.scrollback.items.len;
+        try combined.appendSlice(self.allocator, self.active);
+
+        const cursor_pos = reflow.positionInLogicals(
+            combined.items,
+            @intCast(sb_count + self.row),
+            self.col,
+        );
+
+        var logicals = try reflow.build(self.allocator, combined.items, false);
+        defer {
+            for (logicals.items) |*ll| ll.cells.deinit(self.allocator);
+            logicals.deinit(self.allocator);
+        }
+        reflow.trim(&logicals, self.allocator);
+
+        const all_rows = try reflow.rechunk(self.allocator, logicals.items, new_cols);
+        // `all_rows` is owned and we need to redistribute it into
+        // active + scrollback. Free the old buffers first.
+        for (self.active) |*ln| ln.deinit(self.allocator);
+        self.allocator.free(self.active);
+        for (self.scrollback.items) |*ln| ln.deinit(self.allocator);
+        self.scrollback.clearRetainingCapacity();
+
+        // Compute cursor's new (row, col) within all_rows.
+        const new_pos = reflow.positionAfterRechunk(all_rows, cursor_pos.idx, cursor_pos.col, new_cols);
+
+        // The active screen is the bottom new_rows of all_rows; pad
+        // with blank rows if there are fewer logical rows than fit.
+        var sb_rows: usize = 0;
+        var active_first: usize = 0;
+        if (all_rows.len > new_rows) {
+            sb_rows = all_rows.len - new_rows;
+            active_first = sb_rows;
+        }
+
+        // Fill scrollback (older first, capped at scrollback_capacity).
+        if (sb_rows > 0) {
+            const sb_slice = all_rows[0..sb_rows];
+            for (sb_slice) |row| {
+                if (self.scrollback.items.len >= self.scrollback_capacity) {
+                    var oldest = self.scrollback.orderedRemove(0);
+                    oldest.deinit(self.allocator);
+                }
+                try self.scrollback.append(self.allocator, row);
+            }
+        }
+
+        // Fill active with the rest, padding if needed.
+        const taken = all_rows.len - sb_rows;
+        const new_active = try self.allocator.alloc(Line, new_rows);
+        errdefer self.allocator.free(new_active);
+        var i: usize = 0;
+        while (i < taken and i < new_rows) : (i += 1) {
+            new_active[i] = all_rows[active_first + i];
+        }
+        // Pad if we have fewer logical rows than fit.
+        while (i < new_rows) : (i += 1) {
+            new_active[i] = try Line.init(self.allocator, new_cols);
+        }
+        // Free the slice carrier (the rows themselves were moved out).
+        self.allocator.free(all_rows);
+        self.active = new_active;
+
+        // Re-place cursor.
+        if (new_pos.row >= sb_rows) {
+            const new_row = new_pos.row - sb_rows;
+            self.row = if (new_row >= new_rows) new_rows - 1 else @intCast(new_row);
+            self.col = @min(new_pos.col, new_cols - 1);
+        } else {
+            // Cursor's logical position landed in scrollback (rare —
+            // happens if narrowing pushes content above visible area).
+            // Place at top-left of active.
+            self.row = 0;
+            self.col = 0;
+        }
     }
 
     fn resizeBuffer(
