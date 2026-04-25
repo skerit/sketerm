@@ -73,6 +73,15 @@ pub const Screen = struct {
     /// cursor to column 0 in addition to advancing a row). Mostly a
     /// historical mode but a few apps set it explicitly.
     line_feed_mode: bool = false,
+
+    /// xterm window-title stack (CSI 22/23 t). tmux + screen use it
+    /// to swap titles when nested. Cap of 8 entries; older pushes
+    /// drop. Each entry is an owned UTF-8 byte slice.
+    title_stack: [8]?[]u8 = [_]?[]u8{null} ** 8,
+    title_stack_depth: u8 = 0,
+    /// Most recently set title (via OSC 0/2). Owned. Used by the
+    /// title-stack save/restore.
+    last_title: ?[]u8 = null,
     /// DECSET 1004 — focus reporting.
     focus_reports: bool = false,
     /// DECCKM (mode 1) — application cursor keys (arrows emit
@@ -359,6 +368,11 @@ pub const Screen = struct {
         self.clusters.deinit();
         self.kitty_images.deinit();
         if (self.preedit_text) |t| self.allocator.free(t);
+        if (self.last_title) |t| self.allocator.free(t);
+        for (&self.title_stack) |*entry| {
+            if (entry.*) |t| self.allocator.free(t);
+            entry.* = null;
+        }
         self.allocator.destroy(self);
     }
 
@@ -1425,6 +1439,8 @@ pub const Screen = struct {
 
         switch (num) {
             0, 2 => {
+                if (self.last_title) |old| self.allocator.free(old);
+                self.last_title = self.allocator.dupe(u8, rest) catch null;
                 if (self.sink.on_title) |f| f(self.sink.ctx, rest);
             },
             7 => {
@@ -2114,8 +2130,42 @@ pub const Screen = struct {
                 const s = std.fmt.bufPrint(&resp_buf, "\x1b[9;{d};{d}t", .{ self.rows, self.cols }) catch return;
                 self.respond(s);
             },
+            // 22 — save title onto stack. Param 0/2 = window title;
+            // we treat both identically (no separate icon name).
+            22 => self.titleStackPush(),
+            // 23 — restore title from stack.
+            23 => self.titleStackPop(),
             else => {},
         }
+    }
+
+    fn titleStackPush(self: *Screen) void {
+        const cur = self.last_title orelse return;
+        // Drop oldest if full.
+        if (self.title_stack_depth == self.title_stack.len) {
+            if (self.title_stack[0]) |old| self.allocator.free(old);
+            // Shift left.
+            var i: usize = 1;
+            while (i < self.title_stack.len) : (i += 1) {
+                self.title_stack[i - 1] = self.title_stack[i];
+            }
+            self.title_stack_depth -= 1;
+        }
+        const dup = self.allocator.dupe(u8, cur) catch return;
+        self.title_stack[self.title_stack_depth] = dup;
+        self.title_stack_depth += 1;
+    }
+
+    fn titleStackPop(self: *Screen) void {
+        if (self.title_stack_depth == 0) return;
+        self.title_stack_depth -= 1;
+        const restored = self.title_stack[self.title_stack_depth] orelse return;
+        self.title_stack[self.title_stack_depth] = null;
+        // Replace last_title.
+        if (self.last_title) |old| self.allocator.free(old);
+        self.last_title = restored;
+        // Push down to UI.
+        if (self.sink.on_title) |f| f(self.sink.ctx, restored);
     }
 
     fn respond(self: *Screen, bytes: []const u8) void {
@@ -3370,6 +3420,45 @@ test "clearAndScrollback wipes screen + ring + cursor home" {
     try std.testing.expectEqual(@as(u16, 0), s.row);
     try std.testing.expectEqual(@as(u16, 0), s.col);
     try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 0).rune);
+}
+
+test "title stack (CSI 22/23 t) push + pop" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+
+    const Spy = struct {
+        var got: [64]u8 = undefined;
+        var got_len: usize = 0;
+        fn cb(_: ?*anyopaque, t: []const u8) void {
+            const n = @min(t.len, got.len);
+            @memcpy(got[0..n], t[0..n]);
+            got_len = n;
+        }
+    };
+    s.sink.on_title = Spy.cb;
+
+    // OSC 0 ; first
+    s.onOsc("0;first");
+    try std.testing.expectEqualStrings("first", Spy.got[0..Spy.got_len]);
+    // Push.
+    var push = Event.Csi{};
+    push.params[0] = 22;
+    push.n_params = 1;
+    push.final = 't';
+    s.csi(push);
+    // OSC 0 ; second
+    s.onOsc("0;second");
+    try std.testing.expectEqualStrings("second", Spy.got[0..Spy.got_len]);
+    // Pop — should restore "first".
+    Spy.got_len = 0;
+    var pop = Event.Csi{};
+    pop.params[0] = 23;
+    pop.n_params = 1;
+    pop.final = 't';
+    s.csi(pop);
+    try std.testing.expectEqualStrings("first", Spy.got[0..Spy.got_len]);
 }
 
 test "LNM (CSI 20 h): LF carries an implicit CR" {
