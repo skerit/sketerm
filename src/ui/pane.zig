@@ -244,14 +244,12 @@ pub const Pane = struct {
     }
 
     /// Map widget pixel coords to a Screen selection coordinate.
-    /// Negative `row` references scrollback (-1 = bottom-most
-    /// scrollback line). Honors `view_offset` so dragging into
-    /// scrolled-back area produces scrollback coords.
+    /// Returns the VISUAL column (left-to-right pixel order). Callers
+    /// that need a LOGICAL column (selection storage on bidi rows)
+    /// should use `cellAtLogical`.
     fn cellAt(self: *Pane, x: f64, y: f64) struct { row: i32, col: i32 } {
         const atlas = self.atlas;
         if (atlas == null or atlas.?.cell_w == 0 or atlas.?.cell_h == 0) return .{ .row = 0, .col = 0 };
-        // Mouse coords are in widget pixels — subtract pane padding so
-        // the first cell aligns with the rendered grid origin.
         const pad: f64 = @floatCast(self.grid_pass.pad);
         const col_f = (x - pad) / @as(f64, @floatFromInt(atlas.?.cell_w));
         const row_f = (y - pad) / @as(f64, @floatFromInt(atlas.?.cell_h));
@@ -261,6 +259,22 @@ pub const Pane = struct {
             .col = @intFromFloat(@max(0.0, col_f)),
             .row = visible_row - view_off,
         };
+    }
+
+    /// Like `cellAt`, but returns the LOGICAL column (post-bidi
+    /// reorder undo). Selection start/extend uses this so the stored
+    /// selection coordinates are invariant under bidi reorder; the
+    /// renderer's overlay re-maps logical → visual when drawing the
+    /// highlight rects.
+    fn cellAtLogical(self: *Pane, x: f64, y: f64) struct { row: i32, col: i32 } {
+        const c0 = self.cellAt(x, y);
+        if (!self.grid_pass.enable_bidi or c0.col < 0) return c0;
+        const logical_col: u16 = self.terminal.screen.visualToLogicalCol(
+            self.allocator,
+            c0.row,
+            @intCast(c0.col),
+        );
+        return .{ .col = @intCast(logical_col), .row = c0.row };
     }
 
     pub fn deinit(self: *Pane) void {
@@ -812,7 +826,7 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
         return;
     }
 
-    const cell = self.cellAt(x, y);
+    const cell = self.cellAtLogical(x, y);
     const mode: @import("../grid/selection.zig").Mode = if (alt_held) .rectangular else .normal;
     self.terminal.screen.selection.start(cell.row, cell.col, mode);
     c.gtk_widget_queue_draw(@ptrCast(self.area));
@@ -847,7 +861,7 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
             return;
         }
 
-        const cell = self.cellAt(x, y);
+        const cell = self.cellAtLogical(x, y);
         const screen = self.terminal.screen;
         if (n_press == 2) {
             screen.selectWordAt(cell.row, cell.col);
@@ -924,7 +938,7 @@ fn onDragUpdate(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callc
     var sx: f64 = 0;
     var sy: f64 = 0;
     _ = c.gtk_gesture_drag_get_start_point(g, &sx, &sy);
-    const cell = self.cellAt(sx + dx, sy + dy);
+    const cell = self.cellAtLogical(sx + dx, sy + dy);
     self.terminal.screen.selection.extend(cell.row, cell.col);
     c.gtk_widget_queue_draw(@ptrCast(self.area));
 }

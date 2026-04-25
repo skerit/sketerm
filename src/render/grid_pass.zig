@@ -182,7 +182,11 @@ pub const GridPass = struct {
             try self.emitOverlayRow(atlas, pool, cells, row, cw, ch, ascent, ln.scaling);
         }
 
-        // Selection overlay (translucent).
+        // Selection overlay (translucent). For pure-LTR rows we emit
+        // one quad spanning the run; for bidi rows we walk the logical
+        // selection cell-by-cell and emit one quad per cell at its
+        // visual column (so a logical run that's split across visual
+        // segments shows correctly as multiple rectangles).
         if (screen.selection.isActive()) {
             const r_opt = screen.selection.rect();
             if (r_opt) |r| {
@@ -198,10 +202,29 @@ pub const GridPass = struct {
                     const end_col: i32 = if (is_rect) hi_col
                         else if (sr == r.bot_row) r.bot_col else screen.cols;
                     if (end_col <= start_col) continue;
-                    const x: f32 = pad + @as(f32, @floatFromInt(@max(0, start_col))) * cw;
                     const y: f32 = pad + @as(f32, @floatFromInt(visible_row)) * ch;
-                    const w: f32 = @as(f32, @floatFromInt(end_col - @max(0, start_col))) * cw;
-                    try self.pushQuad(.{ x, y }, .{ w, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ 0.4, 0.55, 0.85, 0.45 }, 0.0);
+
+                    // Quick bidi check on this row.
+                    var row_has_bidi = false;
+                    if (self.enable_bidi) {
+                        const cells = screen.lineCellsAtPub(sr) orelse &.{};
+                        for (cells) |cl| if (cl.rune > 0x7F) { row_has_bidi = true; break; };
+                    }
+
+                    if (!row_has_bidi) {
+                        const x: f32 = pad + @as(f32, @floatFromInt(@max(0, start_col))) * cw;
+                        const w: f32 = @as(f32, @floatFromInt(end_col - @max(0, start_col))) * cw;
+                        try self.pushQuad(.{ x, y }, .{ w, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ 0.4, 0.55, 0.85, 0.45 }, 0.0);
+                    } else {
+                        // Per-cell remap. Coalesce visually-adjacent cells
+                        // into a single quad to keep vertex count low.
+                        var col: i32 = @max(0, start_col);
+                        while (col < end_col) : (col += 1) {
+                            const visual: u16 = screen.logicalToVisualCol(self.allocator, sr, @intCast(col));
+                            const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw;
+                            try self.pushQuad(.{ x, y }, .{ cw, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ 0.4, 0.55, 0.85, 0.45 }, 0.0);
+                        }
+                    }
                 }
             }
         }

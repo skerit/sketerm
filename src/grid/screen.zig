@@ -890,6 +890,67 @@ pub const Screen = struct {
         return self.lineCellsAt(row);
     }
 
+    /// Map a visual column (what the user clicked at, in left-to-right
+    /// pixel order) to a logical column (how the cells live in the
+    /// row buffer). For pure-LTR rows the two are identical; bidi
+    /// rows differ.
+    ///
+    /// `allocator` is borrowed for fribidi's transient buffers; on
+    /// allocation failure the function returns the input unchanged.
+    pub fn visualToLogicalCol(self: *const Screen, allocator: std.mem.Allocator, row: i32, visual_col: u16) u16 {
+        const cells = self.lineCellsAt(row) orelse return visual_col;
+        var any_non_ascii = false;
+        for (cells) |cl| {
+            if (cl.rune > 0x7F) {
+                any_non_ascii = true;
+                break;
+            }
+        }
+        if (!any_non_ascii) return visual_col;
+        const bidi = @import("bidi.zig");
+        const cps = allocator.alloc(u32, cells.len) catch return visual_col;
+        defer allocator.free(cps);
+        const lvls = allocator.alloc(u8, cells.len) catch return visual_col;
+        defer allocator.free(lvls);
+        const idx = allocator.alloc(usize, cells.len) catch return visual_col;
+        defer allocator.free(idx);
+        for (cells, 0..) |cl, i| {
+            cps[i] = if (cl.rune == 0) ' ' else cl.rune;
+            idx[i] = i;
+        }
+        _ = bidi.lineLevels(cps, lvls, .auto);
+        bidi.levelsToVisualOrder(lvls, idx);
+        const v: usize = visual_col;
+        if (v >= idx.len) return visual_col;
+        return @intCast(idx[v]);
+    }
+
+    /// Inverse of `visualToLogicalCol`. Returns the visual column at
+    /// which a logical column will appear after bidi reorder. Used by
+    /// the selection-overlay renderer to break a logical run into
+    /// visually-contiguous rectangles.
+    pub fn logicalToVisualCol(self: *const Screen, allocator: std.mem.Allocator, row: i32, logical_col: u16) u16 {
+        const cells = self.lineCellsAt(row) orelse return logical_col;
+        var any_non_ascii = false;
+        for (cells) |cl| if (cl.rune > 0x7F) { any_non_ascii = true; break; };
+        if (!any_non_ascii) return logical_col;
+        const bidi = @import("bidi.zig");
+        const cps = allocator.alloc(u32, cells.len) catch return logical_col;
+        defer allocator.free(cps);
+        const lvls = allocator.alloc(u8, cells.len) catch return logical_col;
+        defer allocator.free(lvls);
+        const idx = allocator.alloc(usize, cells.len) catch return logical_col;
+        defer allocator.free(idx);
+        for (cells, 0..) |cl, i| {
+            cps[i] = if (cl.rune == 0) ' ' else cl.rune;
+            idx[i] = i;
+        }
+        _ = bidi.lineLevels(cps, lvls, .auto);
+        bidi.levelsToVisualOrder(lvls, idx);
+        for (idx, 0..) |logical, visual| if (logical == logical_col) return @intCast(visual);
+        return logical_col;
+    }
+
     pub const SearchMatch = struct {
         /// Display-row coordinate. Negative = scrollback (-1 = bottom).
         row: i32,
@@ -3298,6 +3359,36 @@ test "OSC 777 notify dispatches title+body" {
     s.onOsc("777;notify;Hello;World");
     try std.testing.expectEqualStrings("Hello", Spy.got_title[0..Spy.got_title_len]);
     try std.testing.expectEqualStrings("World", Spy.got_body[0..Spy.got_body_len]);
+}
+
+test "visualToLogicalCol on pure-ASCII line is identity" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+    for ("hello") |b| s.printCp(b);
+    try std.testing.expectEqual(@as(u16, 3), s.visualToLogicalCol(std.testing.allocator, 0, 3));
+    try std.testing.expectEqual(@as(u16, 0), s.visualToLogicalCol(std.testing.allocator, 0, 0));
+}
+
+test "visualToLogicalCol/logicalToVisualCol round-trip on a packed-RTL row" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    // Row sized exactly to the 3 Hebrew characters — no trailing blanks
+    // that would otherwise be swept into the RTL run by UAX #9.
+    var s = try Screen.init(std.testing.allocator, &pool, 3, 1);
+    defer s.deinit();
+    s.printCp(0x05D0); // aleph at logical 0
+    s.printCp(0x05D1); // bet
+    s.printCp(0x05D2); // gimel
+    // Round-trip every column.
+    for (0..3) |lc| {
+        const v = s.logicalToVisualCol(std.testing.allocator, 0, @intCast(lc));
+        const back = s.visualToLogicalCol(std.testing.allocator, 0, v);
+        try std.testing.expectEqual(@as(u16, @intCast(lc)), back);
+    }
+    // Aleph (logical 0) lands at visual 2 (rightmost).
+    try std.testing.expectEqual(@as(u16, 2), s.logicalToVisualCol(std.testing.allocator, 0, 0));
 }
 
 test "REP after RIS does not replay stale" {
