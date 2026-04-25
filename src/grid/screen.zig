@@ -884,6 +884,12 @@ pub const Screen = struct {
         return if (self.lineAt(row)) |l| l.cells else null;
     }
 
+    /// Public alias of lineCellsAt for UI lookups (e.g. mouse-cell
+    /// resolution that needs to peek at scrollback).
+    pub fn lineCellsAtPub(self: *const Screen, row: i32) ?[]Cell {
+        return self.lineCellsAt(row);
+    }
+
     pub const SearchMatch = struct {
         /// Display-row coordinate. Negative = scrollback (-1 = bottom).
         row: i32,

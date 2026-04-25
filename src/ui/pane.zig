@@ -603,16 +603,22 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
 
     var has_link = false;
     const cell = self.cellAt(x, y);
-    if (cell.row >= 0 and cell.col >= 0 and
-        cell.row < screen.rows and cell.col < screen.cols)
-    {
-        const c_cell = screen.cellAt(@intCast(cell.row), @intCast(cell.col));
-        if (c_cell.flags & 0b0000_0100 != 0) {
-            if (screen.linkUri(c_cell.reserved)) |uri| {
-                if (self.allocator.dupe(u8, uri)) |copy| {
-                    self.menu_link_uri = copy;
-                    has_link = true;
-                } else |_| {}
+    if (cell.col >= 0 and cell.col < screen.cols) {
+        // cellAt's row can be negative when the click landed in
+        // scrollback. Resolve via lineCellsAt (negative rows index
+        // scrollback from the bottom).
+        const cells_at = screen.lineCellsAtPub(cell.row);
+        if (cells_at) |cells| {
+            if (cell.col < cells.len) {
+                const c_cell = cells[@intCast(cell.col)];
+                if (c_cell.flags & 0b0000_0100 != 0) {
+                    if (screen.linkUri(c_cell.reserved)) |uri| {
+                        if (self.allocator.dupe(u8, uri)) |copy| {
+                            self.menu_link_uri = copy;
+                            has_link = true;
+                        } else |_| {}
+                    }
+                }
             }
         }
     }
