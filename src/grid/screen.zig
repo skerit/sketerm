@@ -635,6 +635,14 @@ pub const Screen = struct {
             }
             return;
         }
+        if (params.private == '>') {
+            switch (params.final) {
+                'c' => self.respond("\x1b[>42;1;0c"), // DA2: vendor 42 (sketerm), version 1
+                'q' => self.respond("\x1bP>|sketerm 0.1.0\x1b\\"), // XTVERSION
+                else => {},
+            }
+            return;
+        }
 
         // Intermediate-distinguished: e.g. `CSI Ps SP q` = DECSCUSR.
         if (params.n_intermediates == 1 and params.intermediates[0] == ' ') {
