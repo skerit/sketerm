@@ -136,6 +136,10 @@ pub const Screen = struct {
     prompt_marks_len: u16 = 0,
     prompt_marks_head: u16 = 0,
 
+    /// modifyOtherKeys level (CSI > 4 ; Pp m). 0=off, 1=ambiguous
+    /// only, 2=all printable. Input encoder hasn't wired this yet.
+    modify_other_keys: u8 = 0,
+
     /// Custom tab stops. One bool per column, true = stop set.
     /// Default: every 8th column starting at 0.
     tab_stops: std.ArrayList(bool) = .{},
@@ -1032,6 +1036,17 @@ pub const Screen = struct {
             switch (params.final) {
                 'c' => self.respond("\x1b[>42;1;0c"), // DA2: vendor 42 (sketerm), version 1
                 'q' => self.respond("\x1bP>|sketerm 0.1.0\x1b\\"), // XTVERSION
+                'm' => {
+                    // XTMODKEYS — `CSI > Pn ; Pp m`. Pn=4 sets
+                    // modifyOtherKeys level. We accept the level but
+                    // don't yet apply it to key encoding.
+                    if (params.n_params >= 1 and params.params[0] == 4) {
+                        self.modify_other_keys = if (params.n_params >= 2)
+                            @intCast(@min(params.params[1], 2))
+                        else
+                            0;
+                    }
+                },
                 else => {},
             }
             return;
