@@ -439,6 +439,9 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         return;
     }
     self.atlas.?.realize();
+    // Surface the font path via OSC 50 ; ? queries so apps probing for
+    // a font name get something back. Path-as-name is informational.
+    if (self.font_path) |fp| self.terminal.screen.font_name = fp;
 
     self.grid_pass.realize() catch {
         std.debug.print("pane realize: grid_pass realize failed\n", .{});

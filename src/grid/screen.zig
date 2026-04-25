@@ -87,6 +87,10 @@ pub const Screen = struct {
     /// Most recently set title (via OSC 0/2). Owned. Used by the
     /// title-stack save/restore.
     last_title: ?[]u8 = null,
+    /// Display name of the active font, surfaced via OSC 50 ; ?
+    /// queries. Set externally (Pane.attachFont). Empty string means
+    /// "we'll respond with a generic Monospace string".
+    font_name: []const u8 = "",
     /// DECSET 1004 — focus reporting.
     focus_reports: bool = false,
     /// DECCKM (mode 1) — application cursor keys (arrows emit
@@ -1281,6 +1285,87 @@ pub const Screen = struct {
         return if (self.links.get(link_id)) |u| u else null;
     }
 
+    /// OSC 1337 — iTerm2 multi-purpose protocol. Two formats:
+    ///   File=<attrs>:<base64>  → inline image (existing path)
+    ///   <Key>=<Value>          → directive (CursorShape, ClearScrollback,
+    ///                            RequestAttention, SetMark,
+    ///                            CopyToClipboard, ...)
+    ///   <Key>                  → bare directive (ClearScrollback,
+    ///                            StealFocus)
+    fn handleOsc1337(self: *Screen, rest: []const u8) void {
+        // File=...:<b64> still goes to the inline-image decoder.
+        if (rest.len >= 5 and std.mem.eql(u8, rest[0..5], "File=")) {
+            const iterm = @import("../parser/iterm_image.zig");
+            const decoded = iterm.decodePayload(self.allocator, rest) catch return;
+            defer self.allocator.free(decoded.rgba);
+            if (decoded.format != .png or decoded.rgba.len == 0) return;
+            if (self.sink.on_image) |f| f(self.sink.ctx, .{
+                .width = decoded.width,
+                .height = decoded.height,
+                .rgba = decoded.rgba,
+                .row = self.row,
+                .col = self.col,
+                .placement_id = 0,
+                .z_index = 0,
+            });
+            return;
+        }
+
+        // Directive: split at first '='. If no '=', treat the whole
+        // payload as a bare key.
+        const eq = std.mem.indexOfScalar(u8, rest, '=');
+        const key = if (eq) |e| rest[0..e] else rest;
+        const val = if (eq) |e| rest[e + 1 ..] else "";
+
+        if (std.mem.eql(u8, key, "CursorShape")) {
+            // 0=block, 1=vertical bar, 2=underline. Map to the
+            // closest DECSCUSR variant (steady, not blinking).
+            const n = std.fmt.parseInt(u8, val, 10) catch return;
+            self.cursor_shape = switch (n) {
+                0 => .block_steady,
+                1 => .bar_steady,
+                2 => .underline_steady,
+                else => self.cursor_shape,
+            };
+            self.dirty = true;
+            return;
+        }
+        if (std.mem.eql(u8, key, "ClearScrollback")) {
+            self.clearAndScrollback();
+            return;
+        }
+        if (std.mem.eql(u8, key, "SetMark")) {
+            self.recordPromptMark();
+            return;
+        }
+        if (std.mem.eql(u8, key, "RequestAttention")) {
+            // Values: yes / fireworks / once / no. We surface as a
+            // notification so the WM/desktop applies its needs-attention
+            // hint via AdwTabPage / GtkApplication user-attention.
+            if (self.sink.on_notification) |f| f(self.sink.ctx, "sketerm", "attention");
+            return;
+        }
+        if (std.mem.eql(u8, key, "StealFocus")) {
+            // Untrusted apps shouldn't steal focus. Drop silently.
+            return;
+        }
+        if (std.mem.eql(u8, key, "CopyToClipboard")) {
+            // Empty value = begin capture; non-empty = legacy
+            // single-payload form. iTerm2 also pairs this with
+            // EndCopy. We treat the inline form as immediate copy.
+            if (val.len > 0 and self.sink.on_clipboard_set != null) {
+                if (self.sink.on_clipboard_set) |f| f(self.sink.ctx, val);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, key, "EndCopy")) {
+            // No-op: we don't accumulate streamed copy content.
+            return;
+        }
+        // Unknown key — silently drop. Includes SetUserVar,
+        // SetBadgeFormat, etc. (no internal state to attach to).
+    }
+
     pub fn onApc(self: *Screen, body: []const u8) void {
         // Kitty graphics protocol: APC G=...
         if (body.len < 1 or body[0] != 'G') return;
@@ -1598,19 +1683,20 @@ pub const Screen = struct {
                 self.cursor_color = .{ 0, 0, 0, 0 };
                 self.dirty = true;
             },
-            1337 => {
-                // iTerm2 inline image: OSC 1337 ; File=...:<base64> ST
-                const iterm = @import("../parser/iterm_image.zig");
-                const decoded = iterm.decodePayload(self.allocator, rest) catch return;
-                defer self.allocator.free(decoded.rgba);
-                if (decoded.format != .png or decoded.rgba.len == 0) return;
-                if (self.sink.on_image) |f| f(self.sink.ctx, .{
-                    .width = decoded.width,
-                    .height = decoded.height,
-                    .rgba = decoded.rgba,
-                    .row = self.row,
-                    .col = self.col,
-                });
+            1337 => self.handleOsc1337(rest),
+            // OSC 50 — xterm font set / query. We don't dynamically
+            // resize fonts via OSC, so set is silently accepted; query
+            // (`OSC 50 ; ?`) replies with the configured font name so
+            // probes don't conclude unsupported.
+            50 => {
+                if (rest.len == 0) return;
+                if (rest[0] == '?') {
+                    var resp_buf: [128]u8 = undefined;
+                    const fname = if (self.font_name.len > 0) self.font_name else "Monospace";
+                    const out = std.fmt.bufPrint(&resp_buf, "\x1b]50;{s}\x1b\\", .{fname}) catch return;
+                    self.respond(out);
+                }
+                // No-op for set — accepted but ignored.
             },
             777 => {
                 // GNOME notify: `OSC 777 ; notify ; <title> ; <body>`.
@@ -3622,6 +3708,58 @@ test "mouse encoding modes are mutually-exclusive last-set" {
     csi.final = 'l';
     s.csi(csi);
     try std.testing.expectEqual(Screen.MouseEnc.legacy, s.mouse_enc);
+}
+
+test "OSC 50 query responds with current font name" {
+    const TestSink = struct {
+        var captured: [128]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+    TestSink.captured_len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+    s.font_name = "/usr/share/fonts/Hack/Hack-Regular.ttf";
+    s.onOsc("50;?");
+    try std.testing.expectEqualStrings(
+        "\x1b]50;/usr/share/fonts/Hack/Hack-Regular.ttf\x1b\\",
+        TestSink.captured[0..TestSink.captured_len],
+    );
+}
+
+test "OSC 1337 CursorShape and ClearScrollback directives" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+
+    // CursorShape=2 (underline)
+    s.onOsc("1337;CursorShape=2");
+    try std.testing.expectEqual(Screen.CursorShape.underline_steady, s.cursor_shape);
+
+    // ClearScrollback should clear the active grid (and scrollback).
+    inline for ("hello") |ch| s.printCp(ch);
+    s.execute('\n');
+    inline for ("world") |ch| s.printCp(ch);
+    s.onOsc("1337;ClearScrollback");
+    // After ClearScrollback, all rows are blank.
+    var any_nonzero = false;
+    for (s.buf()) |ln| {
+        for (ln.cells) |cell| if (cell.rune != 0) {
+            any_nonzero = true;
+            break;
+        };
+        if (any_nonzero) break;
+    }
+    try std.testing.expect(!any_nonzero);
 }
 
 test "SS2/SS3 single-shift bypass G0 charset for one cp" {
