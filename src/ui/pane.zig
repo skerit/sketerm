@@ -182,14 +182,20 @@ pub const Pane = struct {
         }
     }
 
+    /// Map widget pixel coords to a Screen selection coordinate.
+    /// Negative `row` references scrollback (-1 = bottom-most
+    /// scrollback line). Honors `view_offset` so dragging into
+    /// scrolled-back area produces scrollback coords.
     fn cellAt(self: *Pane, x: f64, y: f64) struct { row: i32, col: i32 } {
         const atlas = self.atlas;
         if (atlas == null or atlas.?.cell_w == 0 or atlas.?.cell_h == 0) return .{ .row = 0, .col = 0 };
         const col_f = x / @as(f64, @floatFromInt(atlas.?.cell_w));
         const row_f = y / @as(f64, @floatFromInt(atlas.?.cell_h));
+        const visible_row: i32 = @intFromFloat(@max(0.0, row_f));
+        const view_off: i32 = @intCast(self.terminal.screen.view_offset);
         return .{
             .col = @intFromFloat(@max(0.0, col_f)),
-            .row = @intFromFloat(@max(0.0, row_f)),
+            .row = visible_row - view_off,
         };
     }
 
