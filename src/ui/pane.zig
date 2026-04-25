@@ -243,11 +243,13 @@ pub const Pane = struct {
         }
     }
 
+    pub const CellPos = struct { row: i32, col: i32 };
+
     /// Map widget pixel coords to a Screen selection coordinate.
     /// Returns the VISUAL column (left-to-right pixel order). Callers
     /// that need a LOGICAL column (selection storage on bidi rows)
     /// should use `cellAtLogical`.
-    fn cellAt(self: *Pane, x: f64, y: f64) struct { row: i32, col: i32 } {
+    fn cellAt(self: *Pane, x: f64, y: f64) CellPos {
         const atlas = self.atlas;
         if (atlas == null or atlas.?.cell_w == 0 or atlas.?.cell_h == 0) return .{ .row = 0, .col = 0 };
         const pad: f64 = @floatCast(self.grid_pass.pad);
@@ -263,10 +265,8 @@ pub const Pane = struct {
 
     /// Like `cellAt`, but returns the LOGICAL column (post-bidi
     /// reorder undo). Selection start/extend uses this so the stored
-    /// selection coordinates are invariant under bidi reorder; the
-    /// renderer's overlay re-maps logical → visual when drawing the
-    /// highlight rects.
-    fn cellAtLogical(self: *Pane, x: f64, y: f64) struct { row: i32, col: i32 } {
+    /// selection coordinates are invariant under bidi reorder.
+    fn cellAtLogical(self: *Pane, x: f64, y: f64) CellPos {
         const c0 = self.cellAt(x, y);
         if (!self.grid_pass.enable_bidi or c0.col < 0) return c0;
         const logical_col: u16 = self.terminal.screen.visualToLogicalCol(
