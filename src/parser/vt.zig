@@ -48,6 +48,11 @@ pub const Parser = struct {
     csi: Event.Csi = .{},
     cur_param: u32 = 0,
     has_cur_param: bool = false,
+    /// True when the param flushed next is a sub-parameter of the
+    /// previous (preceded by ':'). Cleared after each flush; set on
+    /// every ':' separator. Parser tracks this so the SGR handler
+    /// can distinguish `4:3m` (curly underline) from `4;3m`.
+    next_param_is_sub: bool = false,
     osc_buf: std.ArrayList(u8) = .{},
     dcs_proto: Event.Dcs = .{},
     allocator: std.mem.Allocator,
@@ -148,6 +153,7 @@ pub const Parser = struct {
         self.csi = .{};
         self.cur_param = 0;
         self.has_cur_param = false;
+        self.next_param_is_sub = false;
         self.transitionTo(.escape);
     }
 
@@ -155,6 +161,7 @@ pub const Parser = struct {
         self.csi = .{};
         self.cur_param = 0;
         self.has_cur_param = false;
+        self.next_param_is_sub = false;
         self.transitionTo(.csi_entry);
     }
 
@@ -162,6 +169,7 @@ pub const Parser = struct {
         self.dcs_proto = .{};
         self.cur_param = 0;
         self.has_cur_param = false;
+        self.next_param_is_sub = false;
         self.osc_buf.clearRetainingCapacity();
         self.transitionTo(.dcs_entry);
     }
@@ -335,10 +343,12 @@ pub const Parser = struct {
     fn flushParam(self: *Parser) void {
         if (self.csi.n_params < 16) {
             self.csi.params[self.csi.n_params] = if (self.has_cur_param) self.cur_param else 0;
+            self.csi.is_sub[self.csi.n_params] = self.next_param_is_sub;
             self.csi.n_params += 1;
         }
         self.cur_param = 0;
         self.has_cur_param = false;
+        self.next_param_is_sub = false;
     }
 
     fn byteCsi(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
@@ -351,6 +361,7 @@ pub const Parser = struct {
             },
             0x3A, 0x3B => {
                 self.flushParam();
+                if (b == 0x3A) self.next_param_is_sub = true;
                 self.transitionTo(.csi_param);
             },
             0x3C...0x3F => {

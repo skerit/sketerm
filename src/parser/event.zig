@@ -64,6 +64,11 @@ pub const Event = union(enum) {
 
     pub const Csi = struct {
         params: [16]u32 = .{0} ** 16,
+        /// True iff `params[i]` was reached via a `:` (sub-parameter
+        /// of `params[i-1]`) rather than `;`. Used by the SGR handler
+        /// to distinguish `4:3` (curly-underline sub-param) from `4;3`
+        /// (underline AND italic). Index 0 is always false.
+        is_sub: [16]bool = .{false} ** 16,
         n_params: u8 = 0,
         intermediates: [4]u8 = .{0} ** 4,
         n_intermediates: u8 = 0,

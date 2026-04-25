@@ -2726,7 +2726,32 @@ pub const Screen = struct {
                 1 => entry.attrs.bold = true,
                 2 => entry.attrs.dim = true,
                 3 => entry.attrs.italic = true,
-                4 => entry.attrs.underline = true,
+                4 => {
+                    // `4` alone or `4;N` → plain underline.
+                    // `4:0` → no underline; `4:1` → straight; `4:2`
+                    // → double; `4:3` → curly; `4:4` → dotted; `4:5`
+                    // → dashed. Sub-param-aware, kitty/iTerm2 spec.
+                    if (i + 1 < params.n_params and params.is_sub[i + 1]) {
+                        const style = params.params[i + 1];
+                        switch (style) {
+                            0 => {
+                                entry.attrs.underline = false;
+                                entry.attrs.double_underline = false;
+                                entry.attrs.curly_underline = false;
+                            },
+                            1 => entry.attrs.underline = true,
+                            2 => entry.attrs.double_underline = true,
+                            3 => entry.attrs.curly_underline = true,
+                            // 4/5 (dotted/dashed) — fold into curly for now;
+                            // we have no separate flag.
+                            4, 5 => entry.attrs.curly_underline = true,
+                            else => entry.attrs.underline = true,
+                        }
+                        i += 1;
+                    } else {
+                        entry.attrs.underline = true;
+                    }
+                },
                 5 => entry.attrs.blink = true,
                 6 => entry.attrs.fast_blink = true,
                 7 => entry.attrs.reverse = true,
@@ -3435,6 +3460,45 @@ test "clearAndScrollback wipes screen + ring + cursor home" {
     try std.testing.expectEqual(@as(u16, 0), s.row);
     try std.testing.expectEqual(@as(u16, 0), s.col);
     try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 0).rune);
+}
+
+test "SGR 4:3 sets curly underline" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    // `\e[4:3m` — curly underline via colon-separated SGR.
+    var csi = Event.Csi{};
+    csi.params[0] = 4;
+    csi.params[1] = 3;
+    csi.is_sub[1] = true;
+    csi.n_params = 2;
+    csi.final = 'm';
+    s.csi(csi);
+    s.printCp('x');
+    const e = pool.get(s.cellAt(0, 0).style_ref);
+    try std.testing.expect(e.attrs.curly_underline);
+    try std.testing.expect(!e.attrs.underline);
+}
+
+test "SGR 4;3 sets underline AND italic (semicolon — separate params)" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    // `\e[4;3m` — two independent SGR params: 4 (underline) + 3 (italic).
+    var csi = Event.Csi{};
+    csi.params[0] = 4;
+    csi.params[1] = 3;
+    // is_sub[] all false — params separated by ';' in input.
+    csi.n_params = 2;
+    csi.final = 'm';
+    s.csi(csi);
+    s.printCp('x');
+    const e = pool.get(s.cellAt(0, 0).style_ref);
+    try std.testing.expect(e.attrs.underline);
+    try std.testing.expect(e.attrs.italic);
+    try std.testing.expect(!e.attrs.curly_underline);
 }
 
 test "title stack (CSI 22/23 t) push + pop" {
