@@ -593,3 +593,79 @@ test "parser.py: ENQ (0x05) is silently consumed" {
     // No response bytes from us (answerback string is empty).
     try std.testing.expectEqual(@as(usize, 0), h.wtc.items.len);
 }
+
+// ── test_dcs_codes (DECRQSS subset) ──────────────────────────────
+
+test "parser.py: DECRQSS m (SGR query) replies with current SGR" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1bP$qm\x1b\\");
+    // We reply DCS 1 $ r 0m ST regardless of current SGR (v1 stub).
+    try std.testing.expectEqualStrings("\x1bP1$r0m\x1b\\", h.wtc.items);
+}
+
+test "parser.py: DECRQSS r (DECSTBM query) replies with margins" {
+    var h = try Harness.init(std.testing.allocator, 10, 24);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1b[3;20r"); // top=3 bottom=20
+    h.wtc.clearRetainingCapacity();
+    h.feed("\x1bP$qr\x1b\\");
+    try std.testing.expectEqualStrings("\x1bP1$r3;20r\x1b\\", h.wtc.items);
+}
+
+test "parser.py: DECRQSS \" q (DECSCUSR query) replies with shape" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1b[5 q"); // DECSCUSR 5 = bar_blink
+    h.wtc.clearRetainingCapacity();
+    h.feed("\x1bP$q q\x1b\\");
+    try std.testing.expectEqualStrings("\x1bP1$r5 q\x1b\\", h.wtc.items);
+}
+
+test "parser.py: DECRQSS unknown selector replies negative" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1bP$qx\x1b\\");
+    // Negative reply: DCS 0 $ r ST.
+    try std.testing.expectEqualStrings("\x1bP0$r\x1b\\", h.wtc.items);
+}
+
+// ── XTVERSION + DA2 ──────────────────────────────────────────────
+
+test "parser.py: XTVERSION (CSI > q) reply" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1b[>q");
+    try std.testing.expectEqualStrings("\x1bP>|sketerm 0.1.0\x1b\\", h.wtc.items);
+}
+
+test "parser.py: DA2 (CSI > c) reply" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1b[>c");
+    try std.testing.expectEqualStrings("\x1b[>42;1;0c", h.wtc.items);
+}
+
+// ── window-state queries (CSI t) ─────────────────────────────────
+
+test "parser.py: CSI 18 t reports cell-size in rows;cols" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1b[18t");
+    try std.testing.expectEqualStrings("\x1b[8;24;80t", h.wtc.items);
+}
+
+test "parser.py: CSI 11 t reports window state (not iconified)" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1b[11t");
+    try std.testing.expectEqualStrings("\x1b[1t", h.wtc.items);
+}
