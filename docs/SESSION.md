@@ -893,3 +893,27 @@ that real-world apps probe before painting:
 - **DECRQM coverage**: 1005, 1006, 1015, 1016, 2026 all answer
   correctly.
 
+
+## Hot-path tick
+
+Continuing the perf hunt. Bench was already healthy (~150 MB/s
+plain ASCII); these are real-world per-frame and per-event wins.
+
+- **cell_pass: per-style cache in rebuildRow** — runs of cells
+  sharing the same `style_ref` (vim chrome, tree-view rows,
+  status lines) reuse the resolved fg/bg/deco instead of doing
+  pool.get + 2× colorToRGBA + reverse swap + dim multiply +
+  6-step deco-kind chain on every cell.
+- **ring: consumer + producer head/tail caches** — drain loop
+  was issuing `head.load(.acquire)` per pop; cached_head snapshots
+  it once per batch. Mirror cached_tail on the producer side so
+  hot push loops only re-acquire on suspected-full.
+- **atlas: touchPage skip-redundant-store** — frame_counter is
+  bumped once per render, so touchPage was writing
+  last_used_frame to the same value ~16k times per frame.
+  Compare-then-skip cuts cache traffic.
+- **Investigated** but rejected: passing Event by *const through
+  apply/emit — the compiler already passes the union by-reference
+  in ReleaseFast; source-level by-pointer added an indirect access
+  that pessimised CSI cursor moves (-15%). Reverted.
+
