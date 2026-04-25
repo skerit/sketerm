@@ -2391,6 +2391,29 @@ test "parseColor handles rgb: and #RRGGBB" {
     try std.testing.expect(Screen.parseColor("not a color") == null);
 }
 
+test "DA1 advertises sixel + color" {
+    const TestSink = struct {
+        var captured: [64]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+    TestSink.captured_len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+    var csi = Event.Csi{};
+    csi.final = 'c';
+    s.csi(csi);
+    try std.testing.expectEqualStrings("\x1b[?62;4;22c", TestSink.captured[0..TestSink.captured_len]);
+}
+
 test "OSC 4 sets palette index, OSC 104 resets it" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
