@@ -6,8 +6,8 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~157 commits, ~8.5 kLOC of Zig + 8 kLOC vendored stb_image
-- 93 unit tests pass
+- ~165 commits, ~8.6 kLOC of Zig + 8 kLOC vendored stb_image
+- 95 unit tests pass
 
 ## What got built
 
@@ -145,6 +145,9 @@ Things added between commits 67 → 115:
 - OSC 4 / 104 set + reset wired against a runtime
   Screen.palette; renderer pulls the palette each frame.
 - OSC 110 / 111 / 112 reset to defaults.
+- OSC 133 prompt-start marks recorded into a 256-entry ring.
+- modifyOtherKeys=1/2 (CSI > 4 ; Pp m) — emacs/vim get
+  distinct codes for Ctrl+i vs TAB.
 
 ## What's left
 
@@ -158,11 +161,9 @@ Remaining post-checkpoint TODO list:
    ordering wrt thread join).
 3. NVIDIA proprietary GL — falls back to llvmpipe on this laptop.
 4. OSC 8 in selection-extract — preserves text but not the URI.
-5. modifyOtherKeys (CSI > 4 ; Pp m) — for emacs/vim users who want
-   distinct codes for Ctrl-Shift-A vs Ctrl-A.
-6. OSC 133 (FinalTerm prompt marks) — would let us add
-   "jump to previous prompt" navigation.
-7. Kitty progressive enhancement (CSI > 1 u) keyboard.
+5. OSC 133 navigation UI — marks are recorded; no "jump to
+   previous prompt" keybind yet.
+6. Kitty progressive enhancement (CSI > 1 u) keyboard.
 
 ## Notable design decisions made during the build
 
