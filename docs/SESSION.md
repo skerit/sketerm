@@ -6,7 +6,8 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~115 commits, ~7.5 kLOC of Zig + 8 kLOC vendored stb_image
+- ~129 commits, ~7.9 kLOC of Zig + 8 kLOC vendored stb_image
+- 77 unit tests pass
 
 ## What got built
 
@@ -124,6 +125,11 @@ Things added between commits 67 → 115:
 - Parser caps OSC/DCS body at 16 MiB to bound runaway streams.
 - PTY shutdown escalates SIGHUP → SIGTERM → SIGKILL.
 - Shift+PgUp/PgDn paginate scrollback from the keyboard.
+- Tab close now actually frees Pane + Terminal (was a leak).
+- Tab switch grabs focus on the newly selected pane.
+- IRM (CSI 4 h/l) — public-mode insert/replace honored.
+- Bracketed paste strips embedded ESC bytes.
+- PTY captures the real child exit status on EOF.
 
 ## What's left
 
