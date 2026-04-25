@@ -130,10 +130,17 @@ pub fn main() !u8 {
     var ec = Ctx{ .screen = screen, .allocator = allocator };
     // Row 0: green text (SGR 38;5;2).
     // Row 2: red underlined text (SGR 31;4).
-    // Underline drawn in the deco pass; we'll later inspect a row
-    // strip for red pixels below the glyph baseline.
+    // Row 4: a row of box-drawing chars (┌─┐│). These are non-ASCII
+    // (U+2500 range) but don't need bidi/complex shaping. The
+    // selective predicate keeps them in CellPass instead of routing
+    // them to GridPass — preserving per-row dirty optimizations on
+    // box-drawing-heavy TUIs (htop, btop, lf, yazi…).
     const greeting = "\x1b[38;5;2mHello, sketerm!\x1b[0m" ++
-        "\x1b[3;1H\x1b[31;4mUnderlined\x1b[0m";
+        "\x1b[3;1H\x1b[31;4mUnderlined\x1b[0m" ++
+        // Box-drawing in cyan to verify CellPass renders them. The
+        // chars are encoded as UTF-8 here — the parser turns them
+        // into single u32 runes per cell.
+        "\x1b[5;1H\x1b[36m┌─┐│└─┘\x1b[0m";
     parser.advance(greeting, Emit.cb, @ptrCast(&ec));
 
     // Cell pass.

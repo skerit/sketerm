@@ -407,11 +407,12 @@ pub const GridPass = struct {
         }
     }
 
+    /// Forwarded from CellPass — see its definition. Only rows with
+    /// RTL or complex-script content go through the overlay path.
+    /// CJK / emoji / box-drawing / general non-ASCII symbols stay
+    /// in CellPass.
     fn rowNeedsBidi(cells: []const Cell) bool {
-        for (cells) |cell| {
-            if (cell.rune > 0x7F) return true;
-        }
-        return false;
+        return @import("cell_pass.zig").rowNeedsBidiOrComplexShape(cells);
     }
 
     /// Emit glyphs (and per-cell bg) for a row that needs special
