@@ -78,8 +78,10 @@ pub const Pane = struct {
 
         const area_widget = c.gtk_gl_area_new();
         c.gtk_gl_area_set_use_es(@ptrCast(area_widget), 1);
+        c.gtk_gl_area_set_auto_render(@ptrCast(area_widget), 1);
         c.gtk_widget_set_vexpand(area_widget, 1);
         c.gtk_widget_set_hexpand(area_widget, 1);
+        c.gtk_widget_set_visible(area_widget, 1);
 
         self.* = .{
             .area = @ptrCast(area_widget),
