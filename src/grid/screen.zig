@@ -293,7 +293,11 @@ pub const Screen = struct {
 
             var col: usize = lo;
             while (col < actual_hi) : (col += 1) {
-                const cp = line_cells[col].rune;
+                const cell = line_cells[col];
+                // Skip wide-char continuation cells (right half of a
+                // 2-column glyph). Their rune is 0 by design.
+                if (cell.flags & 0b0000_0010 != 0) continue;
+                const cp = cell.rune;
                 if (cp == 0) {
                     try out.append(allocator, ' ');
                 } else if (cp < 0x80) {
@@ -1108,6 +1112,8 @@ pub const Screen = struct {
     pub fn dump(self: *Screen, w: *std.io.Writer) !void {
         for (self.buf()) |ln| {
             for (ln.cells) |cell| {
+                // Skip wide-char continuation cells.
+                if (cell.flags & 0b0000_0010 != 0) continue;
                 if (cell.rune == 0) {
                     try w.writeByte(' ');
                 } else if (cell.rune < 128) {
