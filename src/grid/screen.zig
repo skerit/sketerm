@@ -652,6 +652,13 @@ pub const Screen = struct {
             }
             return;
         }
+        if (params.n_intermediates == 1 and params.intermediates[0] == '!') {
+            switch (params.final) {
+                'p' => self.decstr(),
+                else => {},
+            }
+            return;
+        }
 
         switch (params.final) {
             // Cursor movement.
@@ -787,6 +794,27 @@ pub const Screen = struct {
             'c' => self.fullReset(),
             else => {},
         }
+    }
+
+    fn decstr(self: *Screen) void {
+        // Soft reset (CSI ! p) — reset modes / scroll region /
+        // attributes but keep screen contents.
+        self.row = 0;
+        self.col = 0;
+        self.cur_style = 0;
+        self.scroll_top = 0;
+        self.scroll_bot = if (self.rows > 0) self.rows - 1 else 0;
+        self.autowrap = true;
+        self.origin_mode = false;
+        self.insert_mode = false;
+        self.cursor_visible = true;
+        self.cursor_shape = .block_blink;
+        self.bracketed_paste = false;
+        self.focus_reports = false;
+        self.mouse_mode = 0;
+        self.mouse_sgr = false;
+        self.pending_wrap = false;
+        if (self.use_alt) self.toggleAltScreen(false);
     }
 
     fn fullReset(self: *Screen) void {
