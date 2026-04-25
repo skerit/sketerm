@@ -90,6 +90,12 @@ pub const GridPass = struct {
     enable_ligatures: bool = true,
     enable_bidi: bool = true,
     allocator: std.mem.Allocator,
+    /// Scratch buffers for bidi resolution + visual ordering. Grow
+    /// to cols on first use; subsequent frames reuse them. Avoids
+    /// 3 allocs per bidi row per frame.
+    bidi_cps: std.ArrayList(u32) = .{},
+    bidi_levels: std.ArrayList(u8) = .{},
+    bidi_indices: std.ArrayList(usize) = .{},
 
     pub fn init(allocator: std.mem.Allocator) GridPass {
         return .{ .allocator = allocator };
@@ -97,6 +103,21 @@ pub const GridPass = struct {
 
     pub fn deinit(self: *GridPass) void {
         self.vbuf.deinit(self.allocator);
+        self.bidi_cps.deinit(self.allocator);
+        self.bidi_levels.deinit(self.allocator);
+        self.bidi_indices.deinit(self.allocator);
+    }
+
+    /// Ensure scratch capacity for `n` cells. Returns three slices.
+    fn bidiScratch(self: *GridPass, n: usize) !struct { cps: []u32, lvls: []u8, idx: []usize } {
+        try self.bidi_cps.resize(self.allocator, n);
+        try self.bidi_levels.resize(self.allocator, n);
+        try self.bidi_indices.resize(self.allocator, n);
+        return .{
+            .cps = self.bidi_cps.items,
+            .lvls = self.bidi_levels.items,
+            .idx = self.bidi_indices.items,
+        };
     }
 
     pub fn forgetGL(self: *GridPass) void {
@@ -328,19 +349,14 @@ pub const GridPass = struct {
                 // are non-ASCII but logical == visual.
                 if (!@import("cell_pass.zig").rowNeedsBidiOrComplexShape(row_cells)) break :blk screen.col;
                 const bidi = @import("../grid/bidi.zig");
-                const cps = self.allocator.alloc(u32, row_cells.len) catch break :blk screen.col;
-                defer self.allocator.free(cps);
-                const lvls = self.allocator.alloc(u8, row_cells.len) catch break :blk screen.col;
-                defer self.allocator.free(lvls);
-                const idx2 = self.allocator.alloc(usize, row_cells.len) catch break :blk screen.col;
-                defer self.allocator.free(idx2);
+                const sc = self.bidiScratch(row_cells.len) catch break :blk screen.col;
                 for (row_cells, 0..) |rc, i| {
-                    cps[i] = if (rc.rune == 0) ' ' else rc.rune;
-                    idx2[i] = i;
+                    sc.cps[i] = if (rc.rune == 0) ' ' else rc.rune;
+                    sc.idx[i] = i;
                 }
-                _ = bidi.lineLevels(cps, lvls, .auto);
-                bidi.levelsToVisualOrder(lvls, idx2);
-                for (idx2, 0..) |logical, visual| if (logical == screen.col) break :blk @intCast(visual);
+                _ = bidi.lineLevels(sc.cps, sc.lvls, .auto);
+                bidi.levelsToVisualOrder(sc.lvls, sc.idx);
+                for (sc.idx, 0..) |logical, visual| if (logical == screen.col) break :blk @intCast(visual);
                 break :blk screen.col;
             };
             const cx: f32 = pad + @as(f32, @floatFromInt(visual_col)) * cw;
@@ -534,12 +550,10 @@ pub const GridPass = struct {
         const y_origin_shift: f32 = if (scaling == .dhl_bot) -ch else 0.0;
         const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
 
-        const levels = self.allocator.alloc(u8, cells.len) catch return;
-        defer self.allocator.free(levels);
-        const indices = self.allocator.alloc(usize, cells.len) catch return;
-        defer self.allocator.free(indices);
-        const cps = self.allocator.alloc(u32, cells.len) catch return;
-        defer self.allocator.free(cps);
+        const sc = self.bidiScratch(cells.len) catch return;
+        const levels = sc.lvls;
+        const indices = sc.idx;
+        const cps = sc.cps;
         for (cells, 0..) |cell, i| {
             cps[i] = if (cell.rune == 0) ' ' else cell.rune;
             indices[i] = i;
