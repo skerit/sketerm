@@ -396,7 +396,13 @@ pub const Atlas = struct {
     }
 
     fn touchPage(self: *Atlas, layer: u8) void {
-        if (layer < PAGE_COUNT) self.pages[layer].last_used_frame = self.frame_counter;
+        if (layer >= PAGE_COUNT) return;
+        // frame_counter is bumped once per render, so every touchPage
+        // within a frame writes the same value. Skip the store if the
+        // page is already up-to-date — saves cache traffic in hot
+        // glyph-lookup loops (~16k cells per frame).
+        if (self.pages[layer].last_used_frame == self.frame_counter) return;
+        self.pages[layer].last_used_frame = self.frame_counter;
     }
 
     fn emptyGlyph(self: *const Atlas) Glyph {
