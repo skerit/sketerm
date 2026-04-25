@@ -648,3 +648,35 @@ since apps see what the user clicked on screen.
 - `docs/protocols.md` updated: DECDHL/DECDWL, DECSCNM, DECCOLM, VT52,
   full kitty kbd protocol, kitty animation, kitty zlib/tempfile media
   all listed under "supported".
+
+## Polish pass after deferred items
+
+- **`cell_pass` skips bidi + DW/DH rows.** Without this, rows with
+  any non-ASCII rune got rendered twice — once by CellPass at
+  logical column positions (wrong for bidi) and again by GridPass
+  at visual positions. Now CellPass leaves those rows blank.
+- **Z-ordered image rendering.** Sandwich cell + grid passes between
+  two `image_pass.drawZ` calls: `.below` first, `.above` last. Kitty
+  graphics z<0 placements (e.g. wallpaper image behind text) now
+  render correctly.
+- **`printCp` perf**: ASCII fast-path on `print_run` (skip UTF-8
+  decoder when bytes are pure ASCII and decoder is idle); cluster-
+  store early-out when the map is empty (typical workload).
+- **Animation alpha-blending**: per kitty spec, `a=f` with `C=0`
+  alpha-blends the new frame over the base (default behavior); `C=1`
+  overwrites (was the existing path). Pre-multiplied semantics with
+  proper output-alpha computation. Test in `kitty_images.zig`.
+- **`smoke-cell` target.** Drives a real Screen + Atlas + CellPass +
+  GridPass on EGL surfaceless. Asserts text rendered (>50 non-bg
+  pixels), SGR-green color landed (>5 greenish), focus border drawn
+  (>5 blueish). Catches regressions in the instanced cell pipeline.
+- **XTGETTCAP** (`DCS + q`): respond to terminfo capability queries.
+  Recognised: TN/name, Co/colors, RGB, Tc, bce, U8, civis/cnorm, csr,
+  Su. Used by neovim, tmux, kakoune to probe capabilities. 2 tests.
+- **DECPAM/DECPNM**: was a no-op stub; now sets `Screen.app_keypad`.
+  Input encoder emits `ESC O p..y/X/M` for KP_* keys when set.
+- **OSC 8 markdown escape**: when a link URI contains `)`, switch
+  from `(uri)` to `(<uri>)` form so paste targets that parse markdown
+  (Slack, IRC clients, GitHub comments) don't mis-parse.
+
+End of pass: 322 tests, build clean, both smoke targets PASS.
