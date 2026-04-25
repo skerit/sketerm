@@ -99,9 +99,15 @@ The post-checkpoint TODO list, in rough priority order:
 3. Selection extension into scrollback (model accepts negative
    rows; mouse handler doesn't yet map to them)
 4. Reflow with soft-wrap tracking on resize (today: pad/truncate)
-5. Memory leaks at SIGTERM exit (PTY worker thread allocations
-   are not deinit'd when the signal short-circuits the shutdown
-   sequence)
+5. Memory leaks at exit. ~10 leaks reported by GPA on close.
+   Most come from `g_signal_connect_data` callsites passing
+   `null` as the `GDestroyNotify`, so per-handler ctx structs
+   (input.Ctx, menu Slot, RenameCtx, etc.) live until process
+   exit. Bounded — one allocation per signal connection per
+   widget — but shows up loud in the leak report. Fix: pass a
+   destroy function and free the ctx there. (The ctx structs
+   need to know their allocator; easiest is `*GeneralPurposeAllocator`
+   reachable globally.)
 6. OSC 8 in selection-extract — preserves text but not the URI
 
 ## Notable design decisions made during the build
