@@ -1094,6 +1094,9 @@ pub const Screen = struct {
         self.mouse_mode = 0;
         self.mouse_sgr = false;
         self.pending_wrap = false;
+        self.charset_g0 = .ascii;
+        self.charset_g1 = .ascii;
+        self.active_charset = .g0;
         if (self.use_alt) self.toggleAltScreen(false);
     }
 
@@ -1107,6 +1110,16 @@ pub const Screen = struct {
         self.autowrap = true;
         self.origin_mode = false;
         self.pending_wrap = false;
+        self.charset_g0 = .ascii;
+        self.charset_g1 = .ascii;
+        self.active_charset = .g0;
+        self.app_cursor_keys = false;
+        self.mouse_mode = 0;
+        self.mouse_sgr = false;
+        self.bracketed_paste = false;
+        self.focus_reports = false;
+        self.cursor_visible = true;
+        self.cursor_shape = .block_blink;
         self.resetTabStops() catch {};
     }
 
