@@ -430,14 +430,8 @@ pub const Window = struct {
         const sel = c.adw_tab_view_get_selected_page(self.tab_view);
         if (sel == null) return;
         _ = c.adw_tab_view_close_page(self.tab_view, sel);
-        // After the close completes, if no tabs remain, auto-spawn a
-        // fresh shell so the window doesn't end up in an unrecoverable
-        // empty state. (kitty / iterm2 do the same.)
-        if (c.adw_tab_view_get_n_pages(self.tab_view) == 0) {
-            self.newShellTab(null) catch |err| {
-                std.debug.print("sketerm: replacement tab spawn failed: {s}\n", .{@errorName(err)});
-            };
-        }
+        // Auto-spawn-on-last-close is handled in onPageDetached so it
+        // also covers the AdwTabView "X" button path.
     }
 
     pub fn nextTab(self: *Window) void {
@@ -802,6 +796,18 @@ fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyop
     const child = c.adw_tab_page_get_child(page);
     if (child == null) return;
     collectAndFreePanes(self, @ptrCast(child));
+
+    // If the user just closed the last tab via the AdwTabView "X"
+    // button (which bypasses closeCurrentTab), keep the window
+    // alive by auto-spawning a fresh shell. Skip during app
+    // shutdown — once the window is no longer mapped, this signal
+    // is firing as part of teardown and we'd just leak.
+    if (c.gtk_widget_get_mapped(self.app_window) == 0) return;
+    if (c.adw_tab_view_get_n_pages(self.tab_view) == 0) {
+        self.newShellTab(null) catch |err| {
+            std.debug.print("sketerm: replacement tab spawn failed: {s}\n", .{@errorName(err)});
+        };
+    }
 }
 
 fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
