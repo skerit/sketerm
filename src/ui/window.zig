@@ -336,6 +336,7 @@ pub const Window = struct {
         page: *c.AdwTabPage,
         popover: *c.GtkWidget,
         entry: *c.GtkWidget,
+        allocator: std.mem.Allocator,
     };
 
     /// Show a popover with an entry pre-filled to the current tab's
@@ -357,14 +358,19 @@ pub const Window = struct {
         c.gtk_widget_set_parent(popover, self.app_window);
 
         const ctx = self.allocator.create(RenameCtx) catch return;
-        ctx.* = .{ .page = page, .popover = popover, .entry = entry };
+        ctx.* = .{
+            .page = page,
+            .popover = popover,
+            .entry = entry,
+            .allocator = self.allocator,
+        };
 
         _ = c.g_signal_connect_data(
             entry,
             "activate",
             @ptrCast(&onRenameActivate),
             @ptrCast(ctx),
-            null,
+            @ptrCast(&freeRenameCtx),
             c.G_CONNECT_DEFAULT,
         );
 
@@ -559,7 +565,13 @@ fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     const text = c.gtk_editable_get_text(@ptrCast(entry));
     if (text != null) c.adw_tab_page_set_title(ctx.page, text);
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
-    // ctx leaks for v1 (popover holds entry which holds the closure).
+    // ctx is freed via GDestroyNotify (freeRenameCtx) when the
+    // signal closure is destroyed.
+}
+
+fn freeRenameCtx(user: ?*anyopaque) callconv(.c) void {
+    const ctx: *Window.RenameCtx = @ptrCast(@alignCast(user.?));
+    ctx.allocator.destroy(ctx);
 }
 
 fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
