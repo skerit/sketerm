@@ -19,6 +19,10 @@ pub const Image = struct {
     pending: ?[]u8 = null,
     /// Kitty graphics image_id (0 = no id, sixel/iterm2).
     image_id: u32 = 0,
+    /// Kitty placement_id (multiple placements of same image).
+    placement_id: u32 = 0,
+    /// Z-index for stacking. Higher = drawn on top.
+    z_index: i32 = 0,
     /// Marked for deletion — flushUploads will free its GL texture.
     deleting: bool = false,
 };
@@ -66,6 +70,20 @@ pub const Store = struct {
         col: u16,
         image_id: u32,
     ) !void {
+        return self.addWithPlacement(rgba, width, height, row, col, image_id, 0, 0);
+    }
+
+    pub fn addWithPlacement(
+        self: *Store,
+        rgba: []const u8,
+        width: u32,
+        height: u32,
+        row: u16,
+        col: u16,
+        image_id: u32,
+        placement_id: u32,
+        z_index: i32,
+    ) !void {
         const need = width * height * 4;
         if (rgba.len < need) return error.NotEnoughPixels;
         const copy = try self.allocator.dupe(u8, rgba[0..need]);
@@ -76,7 +94,20 @@ pub const Store = struct {
             .cell_col = col,
             .pending = copy,
             .image_id = image_id,
+            .placement_id = placement_id,
+            .z_index = z_index,
         });
+    }
+
+    /// Mark images with a matching (image_id, placement_id) pair for
+    /// deletion. If placement_id == 0, matches any placement of the
+    /// given image_id.
+    pub fn markByPlacementForDelete(self: *Store, image_id: u32, placement_id: u32) void {
+        for (self.images.items) |*img| {
+            if (img.image_id != image_id) continue;
+            if (placement_id != 0 and img.placement_id != placement_id) continue;
+            img.deleting = true;
+        }
     }
 
     /// Mark all images for deletion. Real teardown happens in
@@ -222,6 +253,45 @@ test "markAllForDelete flags everything" {
     s.markAllForDelete();
     s.flushDeletesNoGL();
     try std.testing.expectEqual(@as(usize, 0), s.count());
+}
+
+test "addWithPlacement stores placement_id and z_index" {
+    var s = Store.init(std.testing.allocator);
+    defer s.images.deinit(std.testing.allocator);
+    defer s.freeAllNoGL();
+    const rgba = [_]u8{0} ** 16;
+    try s.addWithPlacement(&rgba, 2, 2, 0, 0, 7, 42, 5);
+    try std.testing.expectEqual(@as(u32, 7), s.images.items[0].image_id);
+    try std.testing.expectEqual(@as(u32, 42), s.images.items[0].placement_id);
+    try std.testing.expectEqual(@as(i32, 5), s.images.items[0].z_index);
+}
+
+test "markByPlacementForDelete: matches exact placement" {
+    var s = Store.init(std.testing.allocator);
+    defer s.images.deinit(std.testing.allocator);
+    defer s.freeAllNoGL();
+    const rgba = [_]u8{0} ** 16;
+    try s.addWithPlacement(&rgba, 2, 2, 0, 0, 1, 100, 0);
+    try s.addWithPlacement(&rgba, 2, 2, 0, 0, 1, 200, 0);
+    try s.addWithPlacement(&rgba, 2, 2, 0, 0, 2, 100, 0);
+    s.markByPlacementForDelete(1, 100);
+    s.flushDeletesNoGL();
+    // Only the (image_id=1, placement_id=100) entry deleted.
+    try std.testing.expectEqual(@as(usize, 2), s.count());
+}
+
+test "markByPlacementForDelete: placement_id=0 matches all placements of image" {
+    var s = Store.init(std.testing.allocator);
+    defer s.images.deinit(std.testing.allocator);
+    defer s.freeAllNoGL();
+    const rgba = [_]u8{0} ** 16;
+    try s.addWithPlacement(&rgba, 2, 2, 0, 0, 1, 100, 0);
+    try s.addWithPlacement(&rgba, 2, 2, 0, 0, 1, 200, 0);
+    try s.addWithPlacement(&rgba, 2, 2, 0, 0, 2, 100, 0);
+    s.markByPlacementForDelete(1, 0);
+    s.flushDeletesNoGL();
+    try std.testing.expectEqual(@as(usize, 1), s.count());
+    try std.testing.expectEqual(@as(u32, 2), s.images.items[0].image_id);
 }
 
 test "forgetGL drops uploaded images, keeps pending" {

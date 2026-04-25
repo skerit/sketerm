@@ -225,6 +225,10 @@ pub const Screen = struct {
         col: u16,
         /// Kitty graphics image_id (0 = sixel/iterm2/anonymous).
         image_id: u32 = 0,
+        /// Kitty graphics placement_id.
+        placement_id: u32 = 0,
+        /// Z-index for stacking.
+        z_index: i32 = 0,
     };
 
     pub fn init(allocator: std.mem.Allocator, pool: *Pool, cols: u16, rows: u16) !*Screen {
@@ -755,6 +759,8 @@ pub const Screen = struct {
                 .row = self.row,
                 .col = self.col,
                 .image_id = cmd.image_id,
+                .placement_id = cmd.placement_id,
+                .z_index = cmd.z,
             });
         }
     }
@@ -1055,8 +1061,33 @@ pub const Screen = struct {
             0xFE30...0xFE4F, // CJK Compatibility Forms
             0xFF00...0xFF60, // Fullwidth Forms (most)
             0xFFE0...0xFFE6, // Fullwidth Signs
+            0x231A...0x231B, // Watch / hourglass
+            0x23E9...0x23EC, // Media buttons
+            0x23F0, 0x23F3, // Alarm clock, hourglass
+            0x25FD...0x25FE, // Medium small white/black squares
+            0x2614...0x2615, // Umbrella, hot beverage
+            0x2648...0x2653, // Zodiac
+            0x267F, // Wheelchair
+            0x2693, // Anchor
+            0x26A1, // High voltage
+            0x26AA...0x26AB, // White / black circle
+            0x26BD...0x26BE, // Soccer / baseball
+            0x26C4...0x26C5, // Snowman / sun behind cloud
+            0x26CE, 0x26D4, 0x26EA, // Ophiuchus, no entry, church
+            0x26F2...0x26F3, // Fountain, flag in hole
+            0x26F5, 0x26FA, 0x26FD, // Sailboat, tent, fuel pump
+            0x2705, 0x270A...0x270B, 0x2728, // Check mark, raised hand, sparkles
+            0x274C, 0x274E, // Cross mark
+            0x2753...0x2755, 0x2757, // Question / exclamation
+            0x2795...0x2797, // Plus / minus / division signs
+            0x27B0, 0x27BF, // Curly loop / double curly
+            0x2B1B...0x2B1C, // Black / white large square
+            0x2B50, 0x2B55, // Star / circle
+            0x1F000...0x1F02F, // Mahjong tiles
+            0x1F0A0...0x1F0FF, // Playing cards
             0x1F300...0x1F64F, // Misc Symbols / Emoji
             0x1F680...0x1F9FF, // Transport / Supplemental Symbols
+            0x1FA00...0x1FAFF, // Symbols and Pictographs Extended-A
             0x20000...0x2FFFD, // CJK Ext B-F
             0x30000...0x3FFFD, // CJK Ext G+
             => true,

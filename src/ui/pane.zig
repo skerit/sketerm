@@ -345,7 +345,10 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
 
 fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
-    self.image_store.addWithId(img.rgba, img.width, img.height, img.row, img.col, img.image_id) catch {};
+    self.image_store.addWithPlacement(
+        img.rgba, img.width, img.height, img.row, img.col,
+        img.image_id, img.placement_id, img.z_index,
+    ) catch {};
     // Force redraw to upload + display.
     self.terminal.screen.dirty = true;
 }
