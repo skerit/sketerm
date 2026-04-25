@@ -1302,3 +1302,61 @@ test "esc 7 / 8 save+restore cursor" {
     try std.testing.expectEqual(@as(u16, 1), s.row);
     try std.testing.expectEqual(@as(u16, 3), s.col);
 }
+
+test "wide CJK takes 2 columns and marks continuation" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 6, 2);
+    defer s.deinit();
+    // U+4E2D '中' is a wide CJK ideograph.
+    s.printCp(0x4E2D);
+    try std.testing.expectEqual(@as(u32, 0x4E2D), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 1).rune);
+    // Continuation flag bit 1 (is_wide_cont) set.
+    try std.testing.expect(s.cellAt(0, 1).flags & 0b10 != 0);
+    try std.testing.expectEqual(@as(u16, 2), s.col);
+}
+
+test "wide-char wraps at right edge" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 3, 3);
+    defer s.deinit();
+    s.printCp('a');
+    s.printCp('b'); // col=2
+    // Now at col=2; '中' would need 2 cols → wraps to next line.
+    s.printCp(0x4E2D);
+    try std.testing.expectEqual(@as(u32, 0x4E2D), s.cellAt(1, 0).rune);
+    try std.testing.expect(s.cellAt(1, 1).flags & 0b10 != 0);
+}
+
+test "resize preserves active rows" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 4);
+    defer s.deinit();
+    s.printCp('a');
+    s.printCp('b');
+    s.printCp('c');
+    try s.resize(3, 4);
+    try std.testing.expectEqual(@as(u16, 3), s.cols);
+    try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(0, 2).rune);
+}
+
+test "extract selection skips wide-cont" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 6, 1);
+    defer s.deinit();
+    s.printCp('a');
+    s.printCp(0x4E2D); // '中'
+    s.printCp('b');
+    s.selection.start(0, 0, .normal);
+    s.selection.extend(0, 5);
+    const out = try s.extractSelection(std.testing.allocator);
+    defer std.testing.allocator.free(out);
+    // Expect "a中b" with no extra space for the cont cell, then trailing blanks trimmed.
+    try std.testing.expectEqualStrings("a\xe4\xb8\xadb", out);
+}
