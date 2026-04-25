@@ -664,9 +664,11 @@ fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) voi
     const self: *Window = @ptrCast(@alignCast(ctx.?));
     const app = c.gtk_window_get_application(@ptrCast(self.app_window));
     if (app == null) return;
-    const title_z = self.allocator.allocSentinel(u8, title.len, 0) catch return;
+    // Title fallback so the notification widget isn't empty.
+    const effective_title = if (title.len > 0) title else "sketerm";
+    const title_z = self.allocator.allocSentinel(u8, effective_title.len, 0) catch return;
     defer self.allocator.free(title_z);
-    @memcpy(title_z, title);
+    @memcpy(title_z, effective_title);
     const body_z = self.allocator.allocSentinel(u8, body.len, 0) catch return;
     defer self.allocator.free(body_z);
     @memcpy(body_z, body);
