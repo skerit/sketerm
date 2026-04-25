@@ -61,6 +61,9 @@ pub const ImagePass = struct {
         self.u_image = -1;
     }
 
+    /// Build shaders + buffers. Requires a current GL context.
+    /// Idempotent; call `forgetGL` first to re-realize after a
+    /// context loss.
     pub fn realize(self: *ImagePass) !void {
         if (self.program != 0) return;
         self.program = try gl.buildProgram(VERT_SRC, FRAG_SRC);
