@@ -768,3 +768,39 @@ two correctness bugs hidden inside.
   font ligatures only fire on punctuation).
 - shell-integration.bash emits OSC 133 prompt marks so
   Ctrl+Shift+Up/Down has marks to navigate.
+
+## Throughput tick (parser + scrollback)
+
+Headline: scrollback was using `orderedRemove(0)` on a 10k-line
+ArrayList — O(n) shift per evict, ~50µs each, dominating the bench
+once steady-state hit. Fixed plus piggyback wins.
+
+- **Scrollback ring** (`scrollback_head`): in-place overwrite at
+  cap, O(1) eviction.
+- **Buffer-swap on scroll**: hand the scrolled-out top-row cells
+  DIRECTLY to scrollback (no dupe), reuse the evicted oldest
+  cells buffer as the new bottom row. Net 0 allocations per
+  scroll once scrollback is full.
+- **Pre-allocate scrollback ring** to capacity on first push so
+  the fill phase doesn't go through ~14 grow-realloc steps.
+- **applyPrintRunFast** with wrap-mid-run: the bulk-print fast
+  path now handles autowrap correctly mid-run, so `lineFeed`
+  happens within the fast path instead of bailing back to the
+  per-byte slow path.
+- **`hb_buffer_t` reuse + shape cache** (Wyhash-keyed, capped):
+  no more hb_buffer_create/destroy per shapeRun. Identical text
+  re-shapes hit the cache.
+- **`clearAllClusters` early-out** when the cluster store is
+  empty (the typical case when no combining marks have been seen).
+
+Bench results (plain ASCII) before / after tick: 0.9 → 1.2 MB/s
+(+33%). SGR colour churn 1.3 → 1.6 MB/s (+23%). CSI cursor moves
+unchanged at ~95 MB/s (already not bottlenecked by scrollback).
+
+Fast-path counters (instrumented + removed) confirmed 100% of
+print_run events take the fast path on plain-ASCII workloads.
+Remaining gap to Kitty / Ghostty throughput: SIMD UTF-8 decoder
+(would lift parser advance from per-byte to per-vector — biggest
+remaining win on plain text), pass-Event-by-pointer to remove
+the ~88-byte struct copies through emit / apply, persistent-mapped
+cell VBO.
