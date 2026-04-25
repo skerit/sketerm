@@ -12,19 +12,23 @@ const Screen = @import("../grid/screen.zig").Screen;
 const Pool = @import("../grid/style_pool.zig").Pool;
 
 const Bench = struct {
-    pool: Pool,
+    /// Heap-allocated; Screen.pool borrows it. Storing Pool by value
+    /// here would dangle when the Bench struct is moved out of init().
+    pool: *Pool,
     screen: *Screen,
     parser: Parser,
     allocator: std.mem.Allocator,
     captured: std.ArrayList(u8) = .{},
 
     fn init(a: std.mem.Allocator) !Bench {
-        var pool = try Pool.init(a);
-        errdefer pool.deinit();
-        const screen = try Screen.init(a, &pool, 5, 1);
+        const pool_ptr = try a.create(Pool);
+        errdefer a.destroy(pool_ptr);
+        pool_ptr.* = try Pool.init(a);
+        errdefer pool_ptr.deinit();
+        const screen = try Screen.init(a, pool_ptr, 5, 1);
         errdefer screen.deinit();
         return .{
-            .pool = pool,
+            .pool = pool_ptr,
             .screen = screen,
             .parser = Parser.init(a),
             .allocator = a,
@@ -35,6 +39,7 @@ const Bench = struct {
         self.captured.deinit(self.allocator);
         self.screen.deinit();
         self.pool.deinit();
+        self.allocator.destroy(self.pool);
         self.parser.deinit();
     }
 

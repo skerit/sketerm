@@ -3,22 +3,19 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
-    // Default ReleaseSafe so `zig build test` passes out of the box
-    // (a latent UB somewhere triggers a SIGSEGV in the test runner
-    // teardown under ReleaseFast — to investigate). Debug builds
-    // fail to compile entirely on Arch + gcc 15 because Zig 0.15.2's
-    // bundled LLD can't handle gcc 15's `.sframe` section in
-    // crt1.o (R_X86_64_PC64 relocs).
-    //
-    // For perf-sensitive use of the shipped binary, build with
-    // `-Doptimize=ReleaseFast` explicitly. Override here once the
-    // ReleaseFast test crash is fixed.
+    // Default ReleaseFast for the shipped binary. Terminals are
+    // perf-sensitive and runtime safety checks have measurable cost
+    // (parser throughput, render latency). Debug builds fail to
+    // compile entirely on Arch + gcc 15 because Zig 0.15.2's bundled
+    // LLD can't handle gcc 15's `.sframe` section in crt1.o
+    // (R_X86_64_PC64 relocs); use `-Doptimize=ReleaseSafe` for
+    // bounds + overflow checks while developing.
     const optimize_arg = b.option(
         std.builtin.OptimizeMode,
         "optimize",
-        "build mode (default ReleaseSafe; pass ReleaseFast for shipped perf)",
+        "build mode (default ReleaseFast; Debug fails on Arch + gcc 15)",
     );
-    const optimize = optimize_arg orelse .ReleaseSafe;
+    const optimize = optimize_arg orelse .ReleaseFast;
 
     const strip_default = optimize != .Debug and optimize != .ReleaseSafe;
     const strip = b.option(bool, "strip", "strip debug info") orelse strip_default;

@@ -42,22 +42,26 @@ const Capture = struct {
 };
 
 const Harness = struct {
-    pool: Pool,
+    /// Heap-allocated; Screen.pool borrows it. Storing Pool by value
+    /// would dangle through the move out of init().
+    pool: *Pool,
     screen: *Screen,
     parser: Parser,
     capture: *Capture,
     allocator: std.mem.Allocator,
 
     fn init(a: std.mem.Allocator, cols: u16, rows: u16) !Harness {
-        var pool = try Pool.init(a);
-        errdefer pool.deinit();
-        const screen = try Screen.init(a, &pool, cols, rows);
+        const pool_ptr = try a.create(Pool);
+        errdefer a.destroy(pool_ptr);
+        pool_ptr.* = try Pool.init(a);
+        errdefer pool_ptr.deinit();
+        const screen = try Screen.init(a, pool_ptr, cols, rows);
         errdefer screen.deinit();
         const cap = try a.create(Capture);
         cap.* = .{ .allocator = a };
         screen.sink = .{ .ctx = @ptrCast(cap), .on_image = Capture.sink };
         return .{
-            .pool = pool,
+            .pool = pool_ptr,
             .screen = screen,
             .parser = Parser.init(a),
             .capture = cap,
@@ -70,6 +74,7 @@ const Harness = struct {
         self.allocator.destroy(self.capture);
         self.screen.deinit();
         self.pool.deinit();
+        self.allocator.destroy(self.pool);
         self.parser.deinit();
     }
 

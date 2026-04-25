@@ -60,10 +60,6 @@ const HELP_TEXT =
     \\  SKETERM_FONT          Override font (absolute path to .ttf/.otf)
     \\  SKETERM_SCROLLBACK    Scrollback line capacity (default 10000)
     \\
-    \\Build for performance: `zig build -Doptimize=ReleaseFast` strips
-    \\runtime safety checks for the shipped binary (the default
-    \\`zig build` is ReleaseSafe so `zig build test` stays green).
-    \\
     \\Layout file (.layout) — one tab per top-level line, 2-space indent.
     \\Inside a tab, use `pane <command...> [@ <cwd>]` for a single pane,
     \\or `hsplit` / `vsplit` followed by two indented children for splits
