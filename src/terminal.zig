@@ -20,13 +20,34 @@ pub const RING_CAP: usize = 4096; // power-of-2; one event per slot
 
 pub const EventRing = ring_mod.Ring(Event, RING_CAP);
 
+/// Stable trampoline target for `g_main_context_invoke` callbacks.
+/// Lives independently of Terminal so a callback that fires AFTER
+/// Terminal.deinit (queued before, dispatched after) can safely
+/// no-op instead of dereferencing a freed Terminal.
+///
+/// The handle is allocated alongside Terminal in init, but is NOT
+/// freed in deinit — it leaks intentionally. Realistic apps create
+/// O(panes) terminals over their lifetime; per-handle leak is < 32
+/// bytes. Reclaiming would require tracking pending invocations,
+/// which glib doesn't expose.
+pub const DrainHandle = struct {
+    drain_pending: std.atomic.Value(bool) = .{ .raw = false },
+    /// Cleared in Terminal.deinit. mainDrain bails when alive=false.
+    alive: std.atomic.Value(bool) = .{ .raw = true },
+    /// Borrowed; nulled in deinit.
+    terminal: ?*Terminal = null,
+};
+
 pub const Terminal = struct {
     pty: Pty,
     parser: Parser,
     ring: *EventRing,
     worker_thread: std.Thread,
     shutdown_fd: c_int,
-    drain_pending: std.atomic.Value(bool),
+    /// Heap-allocated handle that outlives the Terminal so glib
+    /// callbacks queued before deinit can safely run after deinit.
+    /// drain_pending lives on the handle.
+    drain: *DrainHandle,
     allocator: std.mem.Allocator,
 
     /// Style pool + Screen — main-thread state, mutated only in drain.
@@ -75,17 +96,24 @@ pub const Terminal = struct {
         // (the field can be re-assigned safely before any apply runs.)
         errdefer screen.deinit();
 
+        // Heap handle for glib callbacks. Intentionally never freed.
+        const drain = try allocator.create(DrainHandle);
+        drain.* = .{};
+        errdefer allocator.destroy(drain);
+
         self.* = .{
             .pty = pty,
             .parser = Parser.init(allocator),
             .ring = ring,
             .worker_thread = undefined,
             .shutdown_fd = efd,
-            .drain_pending = std.atomic.Value(bool).init(false),
+            .drain = drain,
             .allocator = allocator,
             .pool = pool,
             .screen = screen,
         };
+        // Back-link: handle holds a borrowed pointer, cleared in deinit.
+        drain.terminal = self;
         // Now that the Terminal exists, point Screen at our pool +
         // wire the side-effect sink.
         self.screen.pool = &self.pool;
@@ -173,6 +201,15 @@ pub const Terminal = struct {
     }
 
     pub fn deinit(self: *Terminal) void {
+        // Mark the drain handle dead BEFORE freeing anything else, so
+        // any g_main_context_invoke(mainDrain) that was queued before
+        // this call but hasn't been dispatched yet will safely no-op
+        // when it eventually runs. The handle itself is intentionally
+        // leaked — glib doesn't expose a way to cancel one-shot
+        // invocations. The leak is bounded by terminal-creation count.
+        self.drain.terminal = null;
+        self.drain.alive.store(false, .release);
+
         // Signal worker.
         const one: u64 = 1;
         _ = c.write(self.shutdown_fd, &one, 8);
@@ -263,17 +300,22 @@ pub const Terminal = struct {
     }
 
     fn scheduleDrain(self: *Terminal) void {
-        const was_pending = self.drain_pending.swap(true, .acq_rel);
+        const was_pending = self.drain.drain_pending.swap(true, .acq_rel);
         if (!was_pending) {
-            _ = c.g_main_context_invoke(null, mainDrain, @ptrCast(self));
+            _ = c.g_main_context_invoke(null, mainDrain, @ptrCast(self.drain));
         }
     }
 
     fn mainDrain(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Terminal = @ptrCast(@alignCast(user.?));
+        const handle: *DrainHandle = @ptrCast(@alignCast(user.?));
+        // First check: was the Terminal torn down between the worker's
+        // schedule and this dispatch? If so the handle is still valid
+        // (intentionally leaked) but the back-pointer is null. Bail.
+        if (!handle.alive.load(.acquire)) return 0; // G_SOURCE_REMOVE
+        const self = handle.terminal orelse return 0;
         // Reset BEFORE draining: if worker pushes during drain it
         // will reschedule us on the next batch.
-        self.drain_pending.store(false, .release);
+        handle.drain_pending.store(false, .release);
 
         var stderr_buf: [4096]u8 = undefined;
         var stderr_writer: ?std.fs.File.Writer = if (self.debug_to_stderr)
