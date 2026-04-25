@@ -197,7 +197,7 @@ fn onKeyPressed(
 
     var buf: [16]u8 = undefined;
     const screen = ctx.terminal.screen;
-    const n = encode(&buf, keyval, state, screen.app_cursor_keys);
+    const n = encode(&buf, keyval, state, screen.app_cursor_keys, screen.modify_other_keys);
     if (n == 0) return 0;
     // Snap to bottom on keypress (matches xterm/iterm2/etc behavior).
     if (screen.view_offset != 0) {
@@ -268,7 +268,7 @@ fn ssoKey(buf: []u8, final: u8, shift: bool, alt: bool, ctrl: bool) usize {
     return out.len;
 }
 
-fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool) usize {
+fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, mok: u8) usize {
     const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
     const alt = (mods & c.GDK_ALT_MASK) != 0;
     const shift = (mods & c.GDK_SHIFT_MASK) != 0;
@@ -317,6 +317,19 @@ fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool) 
 
     // Ctrl + 0x40..0x7E → C0 control (Ctrl-A = 0x01, etc).
     if (ctrl and cp >= 0x40 and cp <= 0x7E) {
+        // modifyOtherKeys: emit `CSI 27 ; M ; cp ~` so apps can
+        // distinguish e.g. Ctrl+i from TAB. Level 2 = always; level
+        // 1 = only ambiguous (i, m, [, h, @).
+        const ambiguous = (cp == 'I' or cp == 'i' or
+            cp == 'M' or cp == 'm' or
+            cp == '[' or
+            cp == 'H' or cp == 'h' or
+            cp == '@');
+        if (mok == 2 or (mok == 1 and ambiguous)) {
+            const m = modCode(shift, alt, ctrl);
+            const out = std.fmt.bufPrint(buf, "\x1b[27;{d};{d}~", .{ m, cp }) catch return 0;
+            return out.len;
+        }
         const code: u8 = @intCast(cp & 0x1F);
         if (alt) {
             buf[0] = 0x1B;
