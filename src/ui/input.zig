@@ -169,6 +169,12 @@ fn onKeyPressed(
     var buf: [16]u8 = undefined;
     const n = encode(&buf, keyval, state);
     if (n == 0) return 0;
+    // Snap to bottom on keypress (matches xterm/iterm2/etc behavior).
+    const screen = ctx.terminal.screen;
+    if (screen.view_offset != 0) {
+        screen.view_offset = 0;
+        screen.dirty = true;
+    }
     _ = ctx.terminal.pty.writeAll(buf[0..n]);
     return 1;
 }
