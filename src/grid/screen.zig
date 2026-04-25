@@ -630,7 +630,8 @@ pub const Screen = struct {
     /// Extract selection text (UTF-8). Coordinates are *display*
     /// rows: 0..rows-1 reference active screen, negative values
     /// reference scrollback (-1 = bottom-most scrollback line).
-    /// Caller frees the returned slice.
+    /// Caller frees the returned slice. OSC 8 link spans are emitted
+    /// as `[linked-text](uri)` markdown so URIs survive copy/paste.
     pub fn extractSelection(self: *const Screen, allocator: std.mem.Allocator) ![]u8 {
         const sel = self.selection;
         const r = sel.rect() orelse return try allocator.alloc(u8, 0);
@@ -641,6 +642,8 @@ pub const Screen = struct {
         const is_rect = sel.mode == .rectangular;
         const rect_lo: i32 = @min(r.top_col, r.bot_col);
         const rect_hi: i32 = @max(r.top_col, r.bot_col);
+
+        var open_link_id: u8 = 0; // currently open OSC 8 link, 0 = none
 
         var row = r.top_row;
         while (row <= r.bot_row) : (row += 1) {
@@ -668,6 +671,26 @@ pub const Screen = struct {
                 // Skip wide-char continuation cells (right half of a
                 // 2-column glyph). Their rune is 0 by design.
                 if (cell.flags & 0b0000_0010 != 0) continue;
+
+                // OSC 8 link state machine: emit `[` on open, `](uri)`
+                // on close. Run boundaries are link_id changes.
+                const has_link = (cell.flags & 0b0000_0100) != 0;
+                const cell_link_id: u8 = if (has_link) cell.reserved else 0;
+                if (cell_link_id != open_link_id) {
+                    if (open_link_id != 0) {
+                        if (self.linkUri(open_link_id)) |uri| {
+                            try out.append(allocator, ']');
+                            try out.append(allocator, '(');
+                            try out.appendSlice(allocator, uri);
+                            try out.append(allocator, ')');
+                        } else {
+                            try out.append(allocator, ']');
+                        }
+                    }
+                    if (cell_link_id != 0) try out.append(allocator, '[');
+                    open_link_id = cell_link_id;
+                }
+
                 const cp = cell.rune;
                 if (cp == 0) {
                     try out.append(allocator, ' ');
@@ -700,6 +723,17 @@ pub const Screen = struct {
                     const next_continues = if (self.lineAt(row + 1)) |l| l.continues_above else false;
                     if (!next_continues) try out.append(allocator, '\n');
                 }
+            }
+        }
+        // Close any link still open at end of selection.
+        if (open_link_id != 0) {
+            if (self.linkUri(open_link_id)) |uri| {
+                try out.append(allocator, ']');
+                try out.append(allocator, '(');
+                try out.appendSlice(allocator, uri);
+                try out.append(allocator, ')');
+            } else {
+                try out.append(allocator, ']');
             }
         }
         return try out.toOwnedSlice(allocator);
@@ -3087,4 +3121,23 @@ test "rectangular selection extracts column block" {
     const text = try s.extractSelection(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("bar\nqux\nyo ", text);
+}
+
+test "extractSelection emits OSC 8 as markdown link" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 30, 1);
+    defer s.deinit();
+
+    // OSC 8 ; ; https://example.com BEL <link text> OSC 8 ; ; BEL
+    s.onOsc("8;;https://example.com");
+    for ("link") |b| s.printCp(b);
+    s.onOsc("8;;");
+    for (" tail") |b| s.printCp(b);
+
+    s.selection.start(0, 0, .normal);
+    s.selection.extend(0, 9); // "link tail"
+    const text = try s.extractSelection(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("[link](https://example.com) tail", text);
 }
