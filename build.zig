@@ -3,15 +3,20 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
-    // Force ReleaseSafe by default. Zig 0.15.2's bundled linker
-    // (whether self-hosted or LLD) can't handle the .sframe section
-    // gcc 15's crt1.o ships with on Arch (R_X86_64_PC64 relocations
-    // in .sframe). Debug builds hit this; ReleaseSafe avoids it.
-    // Override via `-Doptimize=Debug` once a newer LLD is installed.
+    // Default ReleaseSafe so `zig build test` passes out of the box
+    // (a latent UB somewhere triggers a SIGSEGV in the test runner
+    // teardown under ReleaseFast — to investigate). Debug builds
+    // fail to compile entirely on Arch + gcc 15 because Zig 0.15.2's
+    // bundled LLD can't handle gcc 15's `.sframe` section in
+    // crt1.o (R_X86_64_PC64 relocs).
+    //
+    // For perf-sensitive use of the shipped binary, build with
+    // `-Doptimize=ReleaseFast` explicitly. Override here once the
+    // ReleaseFast test crash is fixed.
     const optimize_arg = b.option(
         std.builtin.OptimizeMode,
         "optimize",
-        "build mode (default ReleaseSafe to dodge gcc 15 .sframe + Zig LLD)",
+        "build mode (default ReleaseSafe; pass ReleaseFast for shipped perf)",
     );
     const optimize = optimize_arg orelse .ReleaseSafe;
 
