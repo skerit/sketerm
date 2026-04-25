@@ -6,8 +6,8 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~178 commits, ~8.8 kLOC of Zig + 8 kLOC vendored stb_image
-- 97 unit tests pass
+- ~188 commits, ~9.2 kLOC of Zig + 8 kLOC vendored stb_image
+- 102 unit tests pass
 
 ## What got built
 
@@ -172,6 +172,28 @@ After the user did a real visual test, four bugs surfaced:
   `forgetGL()` helpers on GridPass / ImagePass / ImageStore;
   `Pane.onRealize` deinits any prior atlas and zeros all GL
   handles before the realize path rebuilds.
+
+## Polish round (after the user said split worked)
+
+- **6px inner padding** so terminal content doesn't hug the
+  focus border. Cells offset by `pad`, focus border drawn
+  at the canvas edge, `onResize` and `cellAt` adjusted.
+- **Double-click on the tab bar to rename** — GtkGestureClick
+  with n_press=2 → renameCurrentTab. Single-click already
+  selects the tab so it's the right one by the time we fire.
+- **Easy `.layout` text format** alongside the JSON format:
+  one tab per top-level line, 2-space indent, supports
+  nested hsplit/vsplit. Parser + 4 tests + sample file.
+  --layout dispatches by extension.
+- **Hollow non-blinking cursor on unfocused panes** — the
+  blink toggle in onTick fired on every pane regardless of
+  focus, so all panes' cursors blinked. Now only the focused
+  pane toggles; unfocused panes draw a 1-px hollow outline.
+- **Parser microbench** at `zig build bench-parser`: plain
+  ASCII ~1.6 MB/s, CSI cursor moves ~107 MB/s — emit-per-
+  byte is the print path's bottleneck.
+- **vttest checklist** at `docs/vttest.md` documenting which
+  features should pass and which are explicitly out of scope.
 
 ## What's left
 
