@@ -114,7 +114,7 @@ htop and btop need the report subset for accurate rendering.
 | Number | Purpose                                   | v1 |
 |--------|-------------------------------------------|----|
 | 0, 2   | Set window/icon title                     | ✓ (per pane) |
-| 4      | Set color palette entry                   | ✓ |
+| 4      | Color palette query + set                 | ✓ |
 | 7      | Report working directory (file://…)       | ✓ |
 | 8      | Hyperlinks                                | ✓ |
 | 10/11/12 | Default fg / bg / cursor color (query+set)| ✓ |
