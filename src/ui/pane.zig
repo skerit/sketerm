@@ -61,6 +61,10 @@ pub const Pane = struct {
     win_on_bell: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
     /// Cursor blink timing.
     last_blink_us: i64 = 0,
+    /// Last cursor (row, col) reported to the IM context. -1 = never
+    /// reported — first call sets the actual coords.
+    last_im_row: i32 = -1,
+    last_im_col: i32 = -1,
     /// Last reported mouse-motion cell, to suppress duplicates.
     last_motion_row: i32 = -2,
     last_motion_col: i32 = -2,
@@ -642,15 +646,24 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
 
     if (screen.dirty) {
         // Update IME cursor location so fcitx5 / ibus position
-        // their popups at the right cell.
+        // their popups at the right cell. Only fire when the cursor
+        // ACTUALLY moved — `gtk_im_context_set_cursor_location` can
+        // hop into IBus/fcitx via D-Bus / Wayland IPC, which is too
+        // expensive to do on every dirty redraw.
         if (self.input_ctx) |ictx| if (ictx.im_ctx) |im| if (self.atlas) |atlas| {
-            var rect = c.GdkRectangle{
-                .x = @as(c_int, @intCast(screen.col)) * @as(c_int, atlas.cell_w),
-                .y = @as(c_int, @intCast(screen.row)) * @as(c_int, atlas.cell_h),
-                .width = atlas.cell_w,
-                .height = atlas.cell_h,
-            };
-            c.gtk_im_context_set_cursor_location(im, &rect);
+            const cur_row: i32 = screen.row;
+            const cur_col: i32 = screen.col;
+            if (cur_row != self.last_im_row or cur_col != self.last_im_col) {
+                self.last_im_row = cur_row;
+                self.last_im_col = cur_col;
+                var rect = c.GdkRectangle{
+                    .x = cur_col * @as(c_int, atlas.cell_w),
+                    .y = cur_row * @as(c_int, atlas.cell_h),
+                    .width = atlas.cell_w,
+                    .height = atlas.cell_h,
+                };
+                c.gtk_im_context_set_cursor_location(im, &rect);
+            }
         };
 
         screen.dirty = false;
