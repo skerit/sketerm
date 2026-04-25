@@ -117,7 +117,8 @@ htop and btop need the report subset for accurate rendering.
 | 4      | Set color palette entry                   | ✓ |
 | 7      | Report working directory (file://…)       | ✓ |
 | 8      | Hyperlinks                                | ✓ |
-| 10/11/12 | Default fg / bg / cursor color          | ✓ |
+| 10/11    | Default fg / bg color (query + set)     | ✓ |
+| 12       | Cursor color query                       | ✓ (set deferred — needs cursor color state) |
 | 52     | Clipboard set/get                         | ✓ (get gated; 1 MB cap) |
 | 104    | Reset color palette                       | ✓ |
 | 110/111/112 | Reset fg/bg/cursor                   | ✓ |
