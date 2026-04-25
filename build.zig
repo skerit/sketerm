@@ -99,6 +99,29 @@ pub fn build(b: *std.Build) void {
     const shell_step = b.step("spike-shell", "Headless PTY/parser/screen smoke");
     shell_step.dependOn(&shell_run.step);
 
+    // Parser microbenchmark — `zig build bench-parser`.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_parser.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    const bench = b.addExecutable(.{
+        .name = "sketerm-bench-parser",
+        .root_module = bench_mod,
+        .use_lld = true,
+    });
+    for (sys_libs) |lib| bench.linkSystemLibrary(lib);
+    bench.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    bench.addIncludePath(b.path("vendor"));
+    b.installArtifact(bench);
+    const bench_run = b.addRunArtifact(bench);
+    const bench_step = b.step("bench-parser", "Parser microbenchmark");
+    bench_step.dependOn(&bench_run.step);
+
     const tests_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
