@@ -139,3 +139,21 @@ test "visual order reverses an RTL run inside LTR text" {
     try std.testing.expectEqual(@as(usize, 5), indices[5]);
     try std.testing.expectEqual(@as(usize, 6), indices[6]);
 }
+
+test "logical col 0 maps to last visual col on pure-RTL line" {
+    // Three Hebrew letters: aleph, bet, gimel.
+    var levels = [_]u8{ 1, 1, 1 };
+    var indices: [3]usize = undefined;
+    for (&indices, 0..) |*ix, i| ix.* = i;
+    levelsToVisualOrder(&levels, &indices);
+    // After reverse: visual[0]=2, visual[1]=1, visual[2]=0.
+    // Logical 0 (aleph) appears at visual 2.
+    var visual_col: usize = 0;
+    for (indices, 0..) |logical, vis| {
+        if (logical == 0) {
+            visual_col = vis;
+            break;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), visual_col);
+}
