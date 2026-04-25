@@ -440,11 +440,20 @@ pub const CellPass = struct {
         const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
 
         // First, lay down cell-aligned bg + per-codepoint glyph.
+        // Style resolution is expensive (Pool.get + 2 × colorToRGBA +
+        // reverse swap + dim multiply + deco-kind chain). Runs of
+        // consecutive cells with the same style_ref are common — vim's
+        // chrome strings, tree-view rows, status lines. Cache the last
+        // resolved values per style_ref and reuse.
         var col: u16 = 0;
         const cells = ln.cells[0..@min(@as(usize, cols), ln.cells.len)];
+        var cached_style: u16 = 0xFFFF;
+        var cached_fg: [4]f32 = .{ 0, 0, 0, 0 };
+        var cached_bg: [4]f32 = .{ 0, 0, 0, 0 };
+        var cached_has_bg: bool = false;
+        var cached_deco: f32 = 0;
         while (col < cells.len) : (col += 1) {
             const cell = cells[col];
-            const style = pool.get(cell.style_ref);
             const is_wide = (cell.flags & 0b0000_0001) != 0;
             const cell_w_count: f32 = if (is_wide) 2.0 else 1.0;
             const cx: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
@@ -453,54 +462,47 @@ pub const CellPass = struct {
             slice[col].cell_xy = .{ cx, y };
             slice[col].cell_size = .{ cell_w, ch };
 
-            // Resolve fg + bg to RGBA. Bold lifts palette indices 0..7
-            // into the bright 8..15 slots (xterm convention); doesn't
-            // affect rgb / 256-color / default. Reverse video swaps
-            // fg/bg of the cell — including explicit colors.
-            var fg_color = style.fg;
-            if (style.attrs.bold) {
-                if (fg_color == .palette and fg_color.palette < 8) {
-                    fg_color = .{ .palette = fg_color.palette + 8 };
+            if (cell.style_ref != cached_style) {
+                const style = pool.get(cell.style_ref);
+                // Resolve fg + bg to RGBA. Bold lifts palette indices 0..7
+                // into the bright 8..15 slots (xterm convention); doesn't
+                // affect rgb / 256-color / default. Reverse video swaps
+                // fg/bg of the cell — including explicit colors.
+                var fg_color = style.fg;
+                if (style.attrs.bold) {
+                    if (fg_color == .palette and fg_color.palette < 8) {
+                        fg_color = .{ .palette = fg_color.palette + 8 };
+                    }
                 }
+                var fg_rgba = self.colorToRGBA(fg_color, true);
+                var bg_rgba = self.colorToRGBA(style.bg, false);
+                var has_explicit_bg = style.bg != .default;
+                if (style.attrs.reverse) {
+                    const tmp = fg_rgba;
+                    fg_rgba = bg_rgba;
+                    bg_rgba = tmp;
+                    has_explicit_bg = true;
+                }
+                if (style.attrs.dim) {
+                    fg_rgba[0] *= 0.65;
+                    fg_rgba[1] *= 0.65;
+                    fg_rgba[2] *= 0.65;
+                }
+                cached_fg = fg_rgba;
+                cached_bg = if (has_explicit_bg) bg_rgba else .{ 0, 0, 0, 0 };
+                cached_has_bg = has_explicit_bg;
+                cached_deco = if (style.attrs.curly_underline) 3.0
+                    else if (style.attrs.double_underline) 2.0
+                    else if (style.attrs.underline) 1.0
+                    else if (style.attrs.strikethrough) 4.0
+                    else if (style.attrs.overline) 5.0
+                    else 0.0;
+                cached_style = cell.style_ref;
             }
-            var fg_rgba = self.colorToRGBA(fg_color, true);
-            var bg_rgba = self.colorToRGBA(style.bg, false);
-            var has_explicit_bg = style.bg != .default;
-            if (style.attrs.reverse) {
-                const tmp = fg_rgba;
-                fg_rgba = bg_rgba;
-                bg_rgba = tmp;
-                has_explicit_bg = true;
-            }
-            // Dim attribute halves alpha on the fg as a perceptual
-            // dim (modern terminals use this for chrome / muted text).
-            if (style.attrs.dim) {
-                fg_rgba[0] *= 0.65;
-                fg_rgba[1] *= 0.65;
-                fg_rgba[2] *= 0.65;
-            }
-            slice[col].bg = if (has_explicit_bg) bg_rgba else .{ 0, 0, 0, 0 };
-            slice[col].fg = fg_rgba;
+            slice[col].bg = cached_bg;
+            slice[col].fg = cached_fg;
             slice[col].has_glyph = 1.0; // 1 = no glyph until we set one
-            // Decoration kind from style attrs. Multiple flags can be
-            // set; we pick the most-specific underline (curly > double
-            // > single) and combine with strike/overline only if no
-            // underline is set (rendered as the only deco). For real
-            // multi-deco coverage we'd need 3 passes; one is enough.
-            if (style.attrs.curly_underline) {
-                slice[col].deco = 3;
-            } else if (style.attrs.double_underline) {
-                slice[col].deco = 2;
-            } else if (style.attrs.underline) {
-                slice[col].deco = 1;
-            } else if (style.attrs.strikethrough) {
-                slice[col].deco = 4;
-            } else if (style.attrs.overline) {
-                slice[col].deco = 5;
-            } else {
-                slice[col].deco = 0;
-            }
-
+            slice[col].deco = cached_deco;
             // Per-codepoint glyph (will be overridden by ligature shaping
             // below if applicable).
             if (cell.rune != 0 and cell.rune != ' ' and (cell.flags & 0b0000_0010) == 0) {
