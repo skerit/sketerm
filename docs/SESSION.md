@@ -6,8 +6,8 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~165 commits, ~8.6 kLOC of Zig + 8 kLOC vendored stb_image
-- 95 unit tests pass
+- ~178 commits, ~8.8 kLOC of Zig + 8 kLOC vendored stb_image
+- 97 unit tests pass
 
 ## What got built
 
@@ -148,6 +148,30 @@ Things added between commits 67 → 115:
 - OSC 133 prompt-start marks recorded into a 256-entry ring.
 - modifyOtherKeys=1/2 (CSI > 4 ; Pp m) — emacs/vim get
   distinct codes for Ctrl+i vs TAB.
+
+## User-bug-fix pass (live testing)
+
+After the user did a real visual test, four bugs surfaced:
+
+- Scroll wheel → htop ignored: onScroll now sends mouse
+  buttons 4/5 (SGR 64/65) when the foreground app has
+  captured the mouse and is on the alt screen.
+- No way to drag the title bar: wrapped content in
+  AdwToolbarView with an AdwHeaderBar on top (the standard
+  Adwaita drag region). Header bar gets a "+" button bound
+  to the new `win.new-tab` GAction.
+- Closing the last pane left an empty unrecoverable window:
+  `onPageDetached` now auto-spawns a fresh shell tab
+  whenever n_pages drops to 0 while the window is still
+  mapped.
+- **Splits made the OLD pane go blank.** The actual root
+  cause: `gtk_widget_unparent` unrealizes the GLArea, which
+  destroys its `GdkGLContext`; on re-realize our
+  `grid_pass.realize()` early-returned on `program != 0`
+  and kept the dead-context shader ID. Fix: new
+  `forgetGL()` helpers on GridPass / ImagePass / ImageStore;
+  `Pane.onRealize` deinits any prior atlas and zeros all GL
+  handles before the realize path rebuilds.
 
 ## What's left
 
