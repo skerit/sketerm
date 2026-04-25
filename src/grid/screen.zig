@@ -848,8 +848,15 @@ pub const Screen = struct {
                 while (i < self.row) : (i += 1) lines[i].clear();
                 self.line(self.row).eraseRange(0, self.col + 1);
             },
-            2, 3 => {
+            2 => {
                 for (lines) |*l| l.clear();
+            },
+            3 => {
+                // Mode 3 (xterm extension): clear screen + scrollback.
+                for (lines) |*l| l.clear();
+                for (self.scrollback.items) |*l| l.deinit(self.allocator);
+                self.scrollback.clearRetainingCapacity();
+                self.view_offset = 0;
             },
             else => {},
         }
@@ -1354,6 +1361,25 @@ test "resize preserves active rows" {
     try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
     try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 1).rune);
     try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(0, 2).rune);
+}
+
+test "ED 3 clears scrollback" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 3, 2);
+    defer s.deinit();
+    // Fill enough lines to push some into scrollback.
+    s.printCp('a'); s.execute('\r'); s.execute('\n');
+    s.printCp('b'); s.execute('\r'); s.execute('\n');
+    s.printCp('c'); s.execute('\r'); s.execute('\n');
+    s.printCp('d');
+    try std.testing.expect(s.scrollbackCount() > 0);
+    var csi = Event.Csi{};
+    csi.params[0] = 3;
+    csi.n_params = 1;
+    csi.final = 'J';
+    s.csi(csi);
+    try std.testing.expectEqual(@as(u32, 0), s.scrollbackCount());
 }
 
 test "extract selection skips wide-cont" {
