@@ -26,6 +26,9 @@ comptime {
     _ = @import("parser/iterm_image.zig");
     _ = @import("parser/kitty_image.zig");
     _ = @import("ui/input.zig");
+    _ = @import("ui/input_conformance_test.zig");
+    _ = @import("parser/multicell_conformance_test.zig");
+    _ = @import("parser/clipboard_conformance_test.zig");
 }
 
 test {

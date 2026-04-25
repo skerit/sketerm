@@ -225,13 +225,13 @@ fn copySelection(ctx: *Ctx) void {
 }
 
 /// xterm modifier encoding: 1 + shift(1) + alt(2) + ctrl(4).
-fn modCode(shift: bool, alt: bool, ctrl: bool) u8 {
+pub fn modCode(shift: bool, alt: bool, ctrl: bool) u8 {
     return 1 + (if (shift) @as(u8, 1) else 0) + (if (alt) @as(u8, 2) else 0) + (if (ctrl) @as(u8, 4) else 0);
 }
 
 /// Cursor-key emit. Without modifiers: ESC [/O X. With modifiers:
 /// always ESC [ 1 ; M X (no DECCKM swap, per xterm).
-fn cursorKey(buf: []u8, ck: u8, final: u8, shift: bool, alt: bool, ctrl: bool) usize {
+pub fn cursorKey(buf: []u8, ck: u8, final: u8, shift: bool, alt: bool, ctrl: bool) usize {
     const m = modCode(shift, alt, ctrl);
     if (m == 1) {
         buf[0] = 0x1B;
@@ -245,7 +245,7 @@ fn cursorKey(buf: []u8, ck: u8, final: u8, shift: bool, alt: bool, ctrl: bool) u
 
 /// "Tilde" key emit (PgUp/PgDn/Ins/Del, F5+). Plain: ESC [ N ~.
 /// Modified: ESC [ N ; M ~.
-fn tildeKey(buf: []u8, n: u8, shift: bool, alt: bool, ctrl: bool) usize {
+pub fn tildeKey(buf: []u8, n: u8, shift: bool, alt: bool, ctrl: bool) usize {
     const m = modCode(shift, alt, ctrl);
     if (m == 1) {
         const out = std.fmt.bufPrint(buf, "\x1b[{d}~", .{n}) catch return 0;
@@ -256,7 +256,7 @@ fn tildeKey(buf: []u8, n: u8, shift: bool, alt: bool, ctrl: bool) usize {
 }
 
 /// SS3 key emit (F1-F4). Plain: ESC O X. Modified: ESC [ 1 ; M X.
-fn ssoKey(buf: []u8, final: u8, shift: bool, alt: bool, ctrl: bool) usize {
+pub fn ssoKey(buf: []u8, final: u8, shift: bool, alt: bool, ctrl: bool) usize {
     const m = modCode(shift, alt, ctrl);
     if (m == 1) {
         buf[0] = 0x1B;
