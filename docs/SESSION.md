@@ -876,3 +876,20 @@ fixture fired it.
   SetMark (maps to OSC 133 prompt-mark), RequestAttention (notify),
   CopyToClipboard (immediate copy), StealFocus (deny). 1 unit test.
 
+
+## Spec-coverage tick
+
+Added the canonical CSI-t reports + the synchronized-output mode
+that real-world apps probe before painting:
+
+- **CSI 14t / 16t / 20t / 21t**: report window pixel size, cell
+  pixel size, icon label, window title respectively. Pixel sizes
+  are now accurate (Atlas → Screen.cell_pixel_w/h via Pane.onResize)
+  instead of the legacy 8/16 approximation.
+- **DECSET 2026 (synchronized output)**: TUI frame buffers like
+  ratatui's `enable-sync-output` set 2026 before painting and
+  reset after. Pane.onTick suppresses queue_draw while set; reset
+  bumps dirty so the next tick paints. DECRQM reports state.
+- **DECRQM coverage**: 1005, 1006, 1015, 1016, 2026 all answer
+  correctly.
+
