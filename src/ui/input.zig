@@ -17,7 +17,18 @@ pub const Ctx = struct {
     shortcut_ctx: ?*anyopaque = null,
     /// Input method for IME composition (fcitx5 / ibus).
     im_ctx: ?*c.GtkIMContext = null,
+    /// Last keyval seen on key-pressed (for repeat detection — kitty
+    /// kbd flag 0x02 emits event=2 on repeats vs event=1 on first
+    /// press). Cleared on key-released so the next press is "fresh".
+    last_press_keyval: c_uint = 0,
+    last_press_time_us: i64 = 0,
 };
+
+/// Maximum gap between consecutive presses of the same keyval that
+/// we still consider a hardware repeat (microseconds). Tuned higher
+/// than typical OS auto-repeat (33–50 ms) but well below the time a
+/// user takes to deliberately re-press a key. 120 ms.
+const REPEAT_WINDOW_US: i64 = 120_000;
 
 pub const Action = enum {
     new_tab,
@@ -100,6 +111,14 @@ fn onKeyReleased(
     user: ?*anyopaque,
 ) callconv(.c) void {
     const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    // Clear the repeat-detection memory so the next press is treated
+    // as fresh (event=1). We track this regardless of whether kitty
+    // reports are enabled so a later toggle gets clean state.
+    if (ctx.last_press_keyval == keyval) {
+        ctx.last_press_keyval = 0;
+        ctx.last_press_time_us = 0;
+    }
+
     const screen = ctx.terminal.screen;
     if ((screen.kitty_kbd_flags & 0x02) == 0) return;
 
@@ -168,6 +187,16 @@ fn onKeyPressed(
     user: ?*anyopaque,
 ) callconv(.c) c.gboolean {
     const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+
+    // Detect auto-repeat by comparing against the last press of the
+    // same keyval within REPEAT_WINDOW_US. Used by the kitty kbd
+    // protocol when flag 0x02 (report-events) is enabled.
+    const press_now = std.time.microTimestamp();
+    const is_repeat = ctx.last_press_keyval == keyval and
+        ctx.last_press_time_us != 0 and
+        (press_now - ctx.last_press_time_us) < REPEAT_WINDOW_US;
+    ctx.last_press_keyval = keyval;
+    ctx.last_press_time_us = press_now;
 
     // Let IME consume the key first (CJK composition).
     if (ctx.im_ctx) |im| {
@@ -299,7 +328,7 @@ fn onKeyPressed(
 
     var buf: [16]u8 = undefined;
     const screen = ctx.terminal.screen;
-    const n = encode(&buf, keyval, state, screen.app_cursor_keys, screen.modify_other_keys, screen.kitty_kbd_flags);
+    const n = encode(&buf, keyval, state, screen.app_cursor_keys, screen.modify_other_keys, screen.kitty_kbd_flags, is_repeat);
     if (n == 0) return 0;
     // Snap to bottom on keypress (matches xterm/iterm2/etc behavior).
     if (screen.view_offset != 0) {
@@ -398,23 +427,28 @@ pub fn kittyKeyEvent(buf: []u8, code_point: u32, shift: bool, alt: bool, ctrl: b
     return out.len;
 }
 
-fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, mok: u8, kitty_flags: u8) usize {
+fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, mok: u8, kitty_flags: u8, is_repeat: bool) usize {
     const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
     const alt = (mods & c.GDK_ALT_MASK) != 0;
     const shift = (mods & c.GDK_SHIFT_MASK) != 0;
     // DECCKM swap: arrows/home/end use ESC O X instead of ESC [ X.
     const ck: u8 = if (app_cursor) 'O' else '[';
 
+    // Event type for kitty kbd encoder: 1 = press, 2 = repeat.
+    // Repeats only emit when flag 0x02 (events) is enabled — outside
+    // that flag, repeats look identical to fresh presses.
+    const kitty_event: u8 = if ((kitty_flags & 0x02) != 0 and is_repeat) 2 else 1;
+
     // Kitty progressive-enhancement keyboard — disambiguate flag.
     // Reroute Tab/Enter/Esc/BS and modified keys through CSI u.
     const kitty_disamb = (kitty_flags & 0x01) != 0;
     if (kitty_disamb) {
         switch (keyval) {
-            c.GDK_KEY_Escape => return kittyKey(buf, 27, shift, alt, ctrl),
-            c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => return kittyKey(buf, 13, shift, alt, ctrl),
-            c.GDK_KEY_BackSpace => return kittyKey(buf, 127, shift, alt, ctrl),
-            c.GDK_KEY_Tab => return kittyKey(buf, 9, shift, alt, ctrl),
-            c.GDK_KEY_ISO_Left_Tab => return kittyKey(buf, 9, true, alt, ctrl),
+            c.GDK_KEY_Escape => return kittyKeyEvent(buf, 27, shift, alt, ctrl, kitty_event),
+            c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => return kittyKeyEvent(buf, 13, shift, alt, ctrl, kitty_event),
+            c.GDK_KEY_BackSpace => return kittyKeyEvent(buf, 127, shift, alt, ctrl, kitty_event),
+            c.GDK_KEY_Tab => return kittyKeyEvent(buf, 9, shift, alt, ctrl, kitty_event),
+            c.GDK_KEY_ISO_Left_Tab => return kittyKeyEvent(buf, 9, true, alt, ctrl, kitty_event),
             else => {},
         }
         // Modified printable codepoints — emit CSI u so apps can
@@ -428,7 +462,7 @@ fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, 
                 // map to 'a' = 0x61, with Shift signalled via mods.
                 var canon: u32 = cp_pre;
                 if (canon >= 'A' and canon <= 'Z') canon += 0x20;
-                return kittyKey(buf, canon, shift, alt, ctrl);
+                return kittyKeyEvent(buf, canon, shift, alt, ctrl, kitty_event);
             }
         }
     }

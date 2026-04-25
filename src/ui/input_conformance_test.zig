@@ -171,3 +171,12 @@ test "kittyKeyEvent repeat with mods" {
     const n = input.kittyKeyEvent(&buf, 113, true, false, false, 2);
     try std.testing.expectEqualStrings("\x1b[113;2:2u", buf[0..n]);
 }
+
+test "kittyKeyEvent plain repeat → :2 sub-parameter (no mods)" {
+    // Repeat with no modifiers — kitty spec emits `CSI <kc> ; 1 : 2 u`
+    // (mod=1 explicitly, even though it's the default, because the
+    // `:2` event sub-parameter requires the mods column).
+    var buf: [16]u8 = undefined;
+    const n = input.kittyKeyEvent(&buf, 97, false, false, false, 2);
+    try std.testing.expectEqualStrings("\x1b[97;1:2u", buf[0..n]);
+}
