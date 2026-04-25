@@ -34,6 +34,9 @@ pub const c = @cImport({
     @cInclude("poll.h");
     @cInclude("errno.h");
 
+    // GLib UNIX signal helpers.
+    @cInclude("glib-unix.h");
+
     // Vendored stb_image (PNG decode for iTerm2 OSC 1337).
     @cInclude("stb_image.h");
 });

@@ -99,8 +99,21 @@ pub fn main() u8 {
         c.G_CONNECT_DEFAULT,
     );
 
+    // Graceful shutdown on SIGTERM / SIGHUP / SIGINT — these
+    // call g_application_quit which fires our "shutdown" signal,
+    // letting saveLayoutQuietly run before exit.
+    _ = c.g_unix_signal_add(c.SIGTERM, onSignalQuit, @ptrCast(app));
+    _ = c.g_unix_signal_add(c.SIGHUP, onSignalQuit, @ptrCast(app));
+    _ = c.g_unix_signal_add(c.SIGINT, onSignalQuit, @ptrCast(app));
+
     const status = c.g_application_run(@ptrCast(app), argc, argv_ptr);
     return @intCast(status & 0xff);
+}
+
+fn onSignalQuit(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const app: *c.GApplication = @ptrCast(@alignCast(user.?));
+    c.g_application_quit(app);
+    return 0; // remove source
 }
 
 fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
