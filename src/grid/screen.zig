@@ -1221,6 +1221,12 @@ pub const Screen = struct {
             self.handleDecrqss(d.body);
             return;
         }
+        // XTGETTCAP: `DCS + q <hex-cap>[;<hex-cap>...] ST` — terminfo
+        // query. Used by neovim / tmux / kakoune to probe capabilities.
+        if (d.proto.final == 'q' and d.proto.n_intermediates == 1 and d.proto.intermediates[0] == '+') {
+            self.handleXtgettcap(d.body);
+            return;
+        }
         // Sixel: `DCS Pn ; Pn ; Pn q <body> ST`.
         if (d.proto.final == 'q' and d.proto.n_intermediates == 0) {
             const sixel = @import("../parser/sixel.zig");
@@ -1234,6 +1240,108 @@ pub const Screen = struct {
                 .col = self.col,
             });
         }
+    }
+
+    /// XTGETTCAP — answer terminfo capability queries. The body is a
+    /// `;`-separated list of hex-encoded capability names. We reply
+    /// per-cap: `DCS 1 + r <hex_cap>=<hex_value> ST` for known caps,
+    /// `DCS 0 + r <hex_cap> ST` for unknown.
+    fn handleXtgettcap(self: *Screen, body: []const u8) void {
+        var it = std.mem.splitScalar(u8, body, ';');
+        while (it.next()) |hex_cap| {
+            self.handleXtgettcapOne(hex_cap);
+        }
+    }
+
+    fn handleXtgettcapOne(self: *Screen, hex_cap: []const u8) void {
+        // Decode hex cap name (max 32 bytes — terminfo names are short).
+        var name_buf: [32]u8 = undefined;
+        const name_len = hexDecode(hex_cap, &name_buf) orelse {
+            self.respondXtgettcapMiss(hex_cap);
+            return;
+        };
+        const name = name_buf[0..name_len];
+
+        // Match against known caps. Names are case-sensitive per
+        // terminfo convention. We support termcap (2-char) AND
+        // terminfo (longer) forms for the common ones.
+        const value: ?[]const u8 = blk: {
+            // Terminal name.
+            if (std.mem.eql(u8, name, "TN") or std.mem.eql(u8, name, "name")) break :blk "sketerm-256color";
+            // Number of colors.
+            if (std.mem.eql(u8, name, "Co") or std.mem.eql(u8, name, "colors")) break :blk "256";
+            // RGB / truecolor support.
+            if (std.mem.eql(u8, name, "RGB")) break :blk "8/8/8";
+            if (std.mem.eql(u8, name, "Tc")) break :blk ""; // boolean: present
+            // Back-color erase.
+            if (std.mem.eql(u8, name, "bce")) break :blk "";
+            // UTF-8 capable (ncurses query).
+            if (std.mem.eql(u8, name, "U8")) break :blk "1";
+            // Cursor visibility caps.
+            if (std.mem.eql(u8, name, "civis") or std.mem.eql(u8, name, "vi")) break :blk "\\E[?25l";
+            if (std.mem.eql(u8, name, "cnorm") or std.mem.eql(u8, name, "ve")) break :blk "\\E[?25h";
+            // Scroll region (csr).
+            if (std.mem.eql(u8, name, "csr") or std.mem.eql(u8, name, "cs")) break :blk "\\E[%i%p1%d;%p2%dr";
+            // Hyperlinks (ext_hyperlinks per VTE). We do support them.
+            if (std.mem.eql(u8, name, "Su")) break :blk "";
+            break :blk null;
+        };
+
+        if (value) |v| {
+            self.respondXtgettcapHit(hex_cap, v);
+        } else {
+            self.respondXtgettcapMiss(hex_cap);
+        }
+    }
+
+    fn respondXtgettcapHit(self: *Screen, hex_cap: []const u8, value: []const u8) void {
+        var resp: std.ArrayList(u8) = .{};
+        defer resp.deinit(self.allocator);
+        resp.appendSlice(self.allocator, "\x1bP1+r") catch return;
+        resp.appendSlice(self.allocator, hex_cap) catch return;
+        resp.append(self.allocator, '=') catch return;
+        // Hex-encode value.
+        for (value) |b| {
+            const hex = "0123456789ABCDEF";
+            resp.append(self.allocator, hex[b >> 4]) catch return;
+            resp.append(self.allocator, hex[b & 0x0F]) catch return;
+        }
+        resp.appendSlice(self.allocator, "\x1b\\") catch return;
+        self.respond(resp.items);
+    }
+
+    fn respondXtgettcapMiss(self: *Screen, hex_cap: []const u8) void {
+        var resp: std.ArrayList(u8) = .{};
+        defer resp.deinit(self.allocator);
+        resp.appendSlice(self.allocator, "\x1bP0+r") catch return;
+        resp.appendSlice(self.allocator, hex_cap) catch return;
+        resp.appendSlice(self.allocator, "\x1b\\") catch return;
+        self.respond(resp.items);
+    }
+
+    /// Decode a hex string into the destination buffer. Returns the
+    /// number of bytes written, or null on bad input. Tolerates upper
+    /// + lower case hex; rejects an odd-length input.
+    fn hexDecode(src: []const u8, dst: []u8) ?usize {
+        if (src.len % 2 != 0) return null;
+        const out_len = src.len / 2;
+        if (out_len > dst.len) return null;
+        var i: usize = 0;
+        while (i < out_len) : (i += 1) {
+            const hi = hexNibble(src[i * 2]) orelse return null;
+            const lo = hexNibble(src[i * 2 + 1]) orelse return null;
+            dst[i] = (hi << 4) | lo;
+        }
+        return out_len;
+    }
+
+    fn hexNibble(b: u8) ?u8 {
+        return switch (b) {
+            '0'...'9' => b - '0',
+            'a'...'f' => b - 'a' + 10,
+            'A'...'F' => b - 'A' + 10,
+            else => null,
+        };
     }
 
     /// DECRQSS reply format: `DCS Ps $ r <answer> ST` where Ps=1 if
@@ -3382,6 +3490,82 @@ test "OSC 777 notify dispatches title+body" {
     s.onOsc("777;notify;Hello;World");
     try std.testing.expectEqualStrings("Hello", Spy.got_title[0..Spy.got_title_len]);
     try std.testing.expectEqualStrings("World", Spy.got_body[0..Spy.got_body_len]);
+}
+
+test "XTGETTCAP: TN (Terminal Name) returns sketerm-256color" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+
+    // Capture writePty output.
+    const Spy = struct {
+        var got: [256]u8 = undefined;
+        var got_len: usize = 0;
+        fn cb(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, got.len - got_len);
+            @memcpy(got[got_len .. got_len + n], bytes[0..n]);
+            got_len += n;
+        }
+    };
+    Spy.got_len = 0;
+    s.sink.on_write_pty = Spy.cb;
+
+    // Hex of "TN" = 544E. Send DCS + q 544E ST.
+    var body1 = "544E".*;
+    s.onDcs(.{
+        .proto = .{
+            .params = [_]u32{0} ** 16,
+            .n_params = 0,
+            .intermediates = [_]u8{'+'} ++ [_]u8{0} ** 3,
+            .n_intermediates = 1,
+            .final = 'q',
+        },
+        .body = &body1,
+    });
+    // Should reply with `DCS 1 + r 544E=<hex of "sketerm-256color"> ST`.
+    const resp = Spy.got[0..Spy.got_len];
+    try std.testing.expect(std.mem.startsWith(u8, resp, "\x1bP1+r544E="));
+    try std.testing.expect(std.mem.endsWith(u8, resp, "\x1b\\"));
+    // Decoded value (between '=' and ST) must be hex of "sketerm-256color".
+    const eq_idx = std.mem.indexOfScalar(u8, resp, '=').?;
+    const hex_val = resp[eq_idx + 1 .. resp.len - 2];
+    var decoded_buf: [64]u8 = undefined;
+    const dn = Screen.hexDecode(hex_val, &decoded_buf).?;
+    try std.testing.expectEqualStrings("sketerm-256color", decoded_buf[0..dn]);
+}
+
+test "XTGETTCAP: unknown cap replies with 0+r" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+    const Spy = struct {
+        var got: [256]u8 = undefined;
+        var got_len: usize = 0;
+        fn cb(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, got.len - got_len);
+            @memcpy(got[got_len .. got_len + n], bytes[0..n]);
+            got_len += n;
+        }
+    };
+    Spy.got_len = 0;
+    s.sink.on_write_pty = Spy.cb;
+
+    // Hex of "ZZZ" = 5A5A5A. Unknown cap.
+    var body2 = "5A5A5A".*;
+    s.onDcs(.{
+        .proto = .{
+            .params = [_]u32{0} ** 16,
+            .n_params = 0,
+            .intermediates = [_]u8{'+'} ++ [_]u8{0} ** 3,
+            .n_intermediates = 1,
+            .final = 'q',
+        },
+        .body = &body2,
+    });
+    const resp = Spy.got[0..Spy.got_len];
+    try std.testing.expectEqualStrings("\x1bP0+r5A5A5A\x1b\\", resp);
 }
 
 test "visualToLogicalCol on pure-ASCII line is identity" {
