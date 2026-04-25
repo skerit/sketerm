@@ -110,6 +110,10 @@ pub const Screen = struct {
     /// Last printed codepoint (for REP, CSI Pn b). 0 = none.
     last_print_cp: u32 = 0,
 
+    /// Custom tab stops. One bool per column, true = stop set.
+    /// Default: every 8th column starting at 0.
+    tab_stops: std.ArrayList(bool) = .{},
+
     /// Side-effect sink — optional callbacks invoked by apply.
     sink: Sink = .{},
 
@@ -164,6 +168,7 @@ pub const Screen = struct {
             .allocator = allocator,
             .links = std.AutoHashMap(u8, []u8).init(allocator),
         };
+        try self.resetTabStops();
         return self;
     }
 
@@ -179,6 +184,7 @@ pub const Screen = struct {
         }
         for (self.scrollback.items) |*l| l.deinit(self.allocator);
         self.scrollback.deinit(self.allocator);
+        self.tab_stops.deinit(self.allocator);
         // Free OSC 8 link URIs.
         var link_it = self.links.iterator();
         while (link_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
@@ -207,6 +213,7 @@ pub const Screen = struct {
             self.alt = alt_mut;
         }
 
+        self.resizeTabStops(new_cols);
         self.cols = new_cols;
         self.rows = new_rows;
         self.scroll_top = 0;
@@ -613,9 +620,45 @@ pub const Screen = struct {
     }
 
     fn tab(self: *Screen) void {
-        const next = ((self.col / 8) + 1) * 8;
-        self.col = if (next >= self.cols) self.cols - 1 else next;
+        self.col = self.nextTabStop(self.col);
         self.pending_wrap = false;
+    }
+
+    /// Reset tab_stops to default every-8 columns. Sized to current cols.
+    fn resetTabStops(self: *Screen) !void {
+        try self.tab_stops.resize(self.allocator, self.cols);
+        for (self.tab_stops.items, 0..) |*s, i| s.* = (i % 8 == 0 and i != 0);
+    }
+
+    /// Resize tab_stops, preserving existing values and adding default
+    /// every-8 stops in the new range.
+    fn resizeTabStops(self: *Screen, new_cols: u16) void {
+        const old_len = self.tab_stops.items.len;
+        self.tab_stops.resize(self.allocator, new_cols) catch return;
+        if (new_cols > old_len) {
+            for (self.tab_stops.items[old_len..], old_len..) |*s, i|
+                s.* = (i % 8 == 0 and i != 0);
+        }
+    }
+
+    /// First tab stop strictly to the right of `from`, or cols-1.
+    fn nextTabStop(self: *Screen, from: u16) u16 {
+        if (self.cols == 0) return 0;
+        var c: u16 = from + 1;
+        while (c < self.cols) : (c += 1) {
+            if (c < self.tab_stops.items.len and self.tab_stops.items[c]) return c;
+        }
+        return self.cols - 1;
+    }
+
+    /// First tab stop strictly to the left of `from`, or 0.
+    fn prevTabStop(self: *Screen, from: u16) u16 {
+        if (from == 0) return 0;
+        var c: u16 = from - 1;
+        while (c > 0) : (c -= 1) {
+            if (c < self.tab_stops.items.len and self.tab_stops.items[c]) return c;
+        }
+        return 0;
     }
 
     fn lineFeed(self: *Screen) void {
@@ -719,6 +762,36 @@ pub const Screen = struct {
             // REP — repeat preceding char Pn times.
             'b' => self.rep(params.paramOrDefault(0, 1)),
 
+            // CHT / CBT — forward / backward tab Pn times.
+            'I' => {
+                var n = params.paramOrDefault(0, 1);
+                if (n == 0) n = 1;
+                var i: u32 = 0;
+                while (i < n) : (i += 1) self.col = self.nextTabStop(self.col);
+                self.pending_wrap = false;
+            },
+            'Z' => {
+                var n = params.paramOrDefault(0, 1);
+                if (n == 0) n = 1;
+                var i: u32 = 0;
+                while (i < n) : (i += 1) self.col = self.prevTabStop(self.col);
+                self.pending_wrap = false;
+            },
+
+            // TBC — clear tab stop(s).
+            'g' => {
+                const arg = params.paramOrDefault(0, 0);
+                switch (arg) {
+                    0 => if (self.col < self.tab_stops.items.len) {
+                        self.tab_stops.items[self.col] = false;
+                    },
+                    3 => for (self.tab_stops.items) |*s| {
+                        s.* = false;
+                    },
+                    else => {},
+                }
+            },
+
             // Device status report.
             'n' => self.dsr(params),
             // Primary device attributes.
@@ -807,7 +880,10 @@ pub const Screen = struct {
                 self.lineFeed();
                 self.col = 0;
             },
-            'H' => {}, // HTS — set tab stop at cursor (v1: hardcoded 8-col tabs)
+            'H' => {
+                // HTS — set tab stop at cursor column.
+                if (self.col < self.tab_stops.items.len) self.tab_stops.items[self.col] = true;
+            },
             'M' => self.reverseLineFeed(),
             'c' => self.fullReset(),
             '=' => {}, // DECPAM — application keypad on (numpad encoding shift)
@@ -847,6 +923,7 @@ pub const Screen = struct {
         self.autowrap = true;
         self.origin_mode = false;
         self.pending_wrap = false;
+        self.resetTabStops() catch {};
     }
 
     // ── Cursor primitives ────────────────────────────────────────
@@ -1624,4 +1701,37 @@ test "REP repeats last printed glyph" {
     try std.testing.expectEqual(@as(u32, 'x'), s.cellAt(0, 1).rune);
     try std.testing.expectEqual(@as(u32, 'x'), s.cellAt(0, 4).rune);
     try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 5).rune);
+}
+
+test "HTS sets and tab honors custom stop" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 20, 1);
+    defer s.deinit();
+    // Clear all stops, then set one at col 5.
+    var csi = Event.Csi{};
+    csi.params[0] = 3;
+    csi.n_params = 1;
+    csi.final = 'g';
+    s.csi(csi);
+    s.col = 5;
+    s.escFinal(.{ .final = 'H' });
+    s.col = 0;
+    s.execute(0x09);
+    try std.testing.expectEqual(@as(u16, 5), s.col);
+}
+
+test "CBT walks backward" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 30, 1);
+    defer s.deinit();
+    s.col = 17;
+    var csi = Event.Csi{};
+    csi.params[0] = 2;
+    csi.n_params = 1;
+    csi.final = 'Z';
+    s.csi(csi);
+    // Default 8-col stops: from 17, prev=16, prev=8.
+    try std.testing.expectEqual(@as(u16, 8), s.col);
 }
