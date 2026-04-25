@@ -6,7 +6,7 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~100 commits, ~7.0 kLOC of Zig + 8 kLOC vendored stb_image
+- ~115 commits, ~7.5 kLOC of Zig + 8 kLOC vendored stb_image
 
 ## What got built
 
@@ -53,7 +53,7 @@ Plus extras layered on top of M0-M9:
 
 ```bash
 zig build                          # builds zig-out/bin/sketerm
-zig build test                     # 46/46 tests
+zig build test                     # 66/66 tests
 zig build spike-gl                 # GL share-group spike
 zig build spike-shell              # headless PTY/parser/screen smoke
 zig-out/bin/sketerm                # opens a tab in $SHELL
@@ -98,7 +98,7 @@ If anything's broken visually, the most likely culprits are:
 
 ## Polish layered after the 67-commit checkpoint
 
-Things added between commits 67 → 100:
+Things added between commits 67 → 115:
 
 - Mouse motion reporting for DECSET 1003 + button-held 1002.
 - DECRQM (CSI ? Pa $ p) replies for the modes we track.
@@ -113,21 +113,35 @@ Things added between commits 67 → 100:
 - Cursor keys + F-keys + tilde-keys honor Shift/Alt/Ctrl modifiers.
 - OSC 10/11 fg/bg color queries; CSI t window-state reports.
 - Layout split-tree applies saved ratios on map; `-Dstrip` flag.
+- DECSET 1049 saves/restores cursor distinct from 1047.
+- Soft-wrap aware selection extract — paste reproduces the
+  logical line without spurious newlines.
+- OSC 4 palette query, OSC 9 / OSC 777 desktop notifications,
+  OSC 12 cursor-color query, OSC 1337 inline image (was unwired).
+- Kitty graphics capability probe (a=q) replies OK.
+- DA1 advertises sixel; DECRQSS replies for SGR / DECSTBM /
+  DECSCUSR.
+- Parser caps OSC/DCS body at 16 MiB to bound runaway streams.
+- PTY shutdown escalates SIGHUP → SIGTERM → SIGKILL.
+- Shift+PgUp/PgDn paginate scrollback from the keyboard.
 
 ## What's left
 
 Remaining post-checkpoint TODO list:
 
-1. Reflow with soft-wrap tracking on resize. Today resize pads /
-   truncates per row.
+1. Reflow with soft-wrap tracking on resize — the
+   `continues_above` field is now set on autowrap, so the data is
+   there; what's missing is rebuilding the buffer at the new width
+   from logical lines.
 2. PTY worker thread allocations leak on hard SIGTERM (cleanup
    ordering wrt thread join).
 3. NVIDIA proprietary GL — falls back to llvmpipe on this laptop.
 4. OSC 8 in selection-extract — preserves text but not the URI.
-5. OSC 4 palette query/set — palette is currently a comptime const
-   in `render/grid_pass.zig`, would need to become runtime state.
-6. OSC 12 cursor-color set/query.
-7. modifyOtherKeys (CSI > 4 ; Pp m) — for emacs/vim users who want
+5. OSC 4 / 10 / 11 / 12 set forms — query replies are wired, but
+   actually mutating the runtime palette / fg / bg / cursor color
+   needs the renderer to consume Screen-side state instead of its
+   compile-time defaults.
+6. modifyOtherKeys (CSI > 4 ; Pp m) — for emacs/vim users who want
    distinct codes for Ctrl-Shift-A vs Ctrl-A.
 
 ## Notable design decisions made during the build
