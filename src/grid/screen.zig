@@ -2125,3 +2125,40 @@ test "1049 saves and restores cursor" {
     try std.testing.expectEqual(@as(u16, 2), s.row);
     try std.testing.expectEqual(@as(u16, 3), s.col);
 }
+
+test "kitty graphics query replies OK" {
+    const TestSink = struct {
+        var captured: [64]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+    TestSink.captured_len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+    s.onApc("Gi=42,a=q");
+    const got = TestSink.captured[0..TestSink.captured_len];
+    try std.testing.expectEqualStrings("\x1b_Gi=42;OK\x1b\\", got);
+}
+
+test "REP after RIS does not replay stale" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+    s.printCp('x');
+    s.fullReset();
+    var csi = Event.Csi{};
+    csi.params[0] = 3;
+    csi.n_params = 1;
+    csi.final = 'b';
+    s.csi(csi);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 0).rune);
+}
