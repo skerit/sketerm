@@ -26,23 +26,24 @@ do not actually render in real-world use.** Receive pipeline tests
 prove the parser path works (7 integration tests in
 `src/grid/image_pipeline_test.zig`), so the bug is GL-side.
 
-| #     | Milestone                            | Effort   | User-visible?                                |
+| #     | Milestone                            | Status   | User-visible?                                |
 | ----- | ------------------------------------ | -------- | -------------------------------------------- |
 | M11.0 | ✅ Image render regression — fix #1 | done     | Receive bug; verified via smoke-image.       |
 | M11   | ✅ Legacy DEC modes (SCNM/COLM/VT52) | done     | Niche; spec compliance.                      |
 | M12   | ✅ Per-line scaling (DECDHL/DECDWL)  | done     | Visible if any DEC app uses it.              |
-| M13   | ✅ Bidi + complex-script shaping     | done¹    | Cursor at visual col now too.                |
+| M13   | ✅ Bidi + complex-script shaping     | done     | Cursor + selection visual-aware now too.     |
 | M14   | ✅ OSC 133 prompt navigation         | done     | Stable u64 line IDs.                         |
-| M15   | ✅ Kitty progressive-enhancement kbd | done²    | Level 1 (disambiguate); event-types deferred.|
+| M15   | ✅ Kitty progressive-enhancement kbd | done     | Level 1 + flag 0x02 release+repeat events.   |
+| M16.1 | ✅ Per-row dirty + persistent VBO    | done     | Per-row glBufferSubData via row_needs_upload.|
 | M16.2 | ✅ Parser print_run batching         | done     | 64-byte fixed-size batches.                  |
-| M16.1 | ⏸ Per-row dirty + persistent VBO    | deferred | Profile-guided refactor.                     |
-| M16.3 | ⏸ GPU instancing                     | deferred | Profile-guided refactor.                     |
-| M17.1 | △ Atlas multi-page LRU               | partial  | PAGE_SIZE 1024→2048; full multi-page deferred|
-| M17.2 | ✅ Kitty `o=z` zlib                   | done     | std.compress.flate `.zlib`.                  |
-| M17.3 | ⏸ Kitty animation frames             | deferred | Niche; separate subsystem.                   |
+| M16.3 | ✅ GPU instancing                    | done     | New CellPass — one quad template, N inst.    |
+| M17.1 | ✅ Atlas multi-page LRU              | done     | GL_TEXTURE_2D_ARRAY, 4 pages, LRU eviction.  |
+| M17.2 | ✅ Kitty `o=z` zlib                  | done     | std.compress.flate `.zlib`.                  |
+| M17.3 | ✅ Kitty animation frames            | done     | a=f appends, a=a controls, time-driven tick. |
 | M17.4 | ✅ Image re-upload after GL loss     | done     | Pending pixels retained.                     |
 | M17.5 | ✅ Right-click "Copy Link"           | done     | Context-aware; works on scrollback.          |
 | M17.6 | ✅ Save Layout As… via GtkFileDialog | done     | Ctrl+Shift+Alt+S.                            |
+| —     | ✅ Bidi-aware selection              | done     | Click+drag in logical space; visual remap.   |
 
 ¹ M13 covers paragraph-level bidi + complex-script shaping. Cursor
 positioning visual-aware. Selection in mixed bidi text remains
