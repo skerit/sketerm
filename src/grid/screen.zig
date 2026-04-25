@@ -2171,6 +2171,27 @@ test "kitty graphics query replies OK" {
     try std.testing.expectEqualStrings("\x1b_Gi=42;OK\x1b\\", got);
 }
 
+test "IRM shifts cells right" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    inline for ("abcd") |ch| s.printCp(ch);
+    s.col = 1;
+    // CSI 4 h — insert mode on.
+    var csi = Event.Csi{};
+    csi.params[0] = 4;
+    csi.n_params = 1;
+    csi.final = 'h';
+    s.csi(csi);
+    s.printCp('X');
+    try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'X'), s.cellAt(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 2).rune);
+    try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(0, 3).rune);
+    // 'd' shifted off the right edge.
+}
+
 test "OSC 777 notify dispatches title+body" {
     const Spy = struct {
         var got_title: [64]u8 = undefined;
