@@ -199,6 +199,10 @@ pub const Window = struct {
         }
         self.search_matches.clearRetainingCapacity();
         self.search_idx = 0;
+        // Stale highlights from a previous open should not bleed into
+        // this fresh session.
+        pane.terminal.screen.search_highlights = &.{};
+        pane.terminal.screen.search_active_idx = -1;
         if (self.search_label) |l| c.gtk_label_set_text(@ptrCast(l), "");
     }
 
@@ -207,6 +211,10 @@ pub const Window = struct {
         if (self.search_bar) |w| c.gtk_widget_set_visible(w, 0);
         if (self.search_pane) |p| {
             p.terminal.screen.selection.clear();
+            // Clear borrowed highlight slice BEFORE freeing the
+            // backing storage — otherwise renderer reads dangling.
+            p.terminal.screen.search_highlights = &.{};
+            p.terminal.screen.search_active_idx = -1;
             p.terminal.screen.dirty = true;
             _ = c.gtk_widget_grab_focus(p.widget());
         }
@@ -225,13 +233,18 @@ pub const Window = struct {
             defer self.allocator.free(matches);
             self.search_matches.appendSlice(self.allocator, matches) catch return;
         }
+        // Publish to the renderer — every match gets a translucent
+        // overlay; the active one is brighter.
+        pane.terminal.screen.search_highlights = self.search_matches.items;
         self.refreshSearchLabel();
         if (self.search_matches.items.len > 0) {
             // Jump to the last (most-recent) match — usually what users want.
             self.search_idx = self.search_matches.items.len - 1;
+            pane.terminal.screen.search_active_idx = @intCast(self.search_idx);
             self.applyCurrentMatch();
         } else {
             pane.terminal.screen.selection.clear();
+            pane.terminal.screen.search_active_idx = -1;
             pane.terminal.screen.dirty = true;
         }
     }
@@ -256,10 +269,7 @@ pub const Window = struct {
         if (self.search_matches.items.len == 0) return;
         const m = self.search_matches.items[self.search_idx];
         const screen = pane.terminal.screen;
-        // Use the existing selection model as the highlight.
-        screen.selection.start(m.row, @intCast(m.col), .normal);
-        const end_col: i32 = @as(i32, @intCast(m.col)) + @as(i32, @intCast(m.len)) - 1;
-        screen.selection.extend(m.row, end_col);
+        screen.search_active_idx = @intCast(self.search_idx);
         // Scroll into view.
         if (m.row < 0) {
             const dist: u32 = @intCast(-m.row);

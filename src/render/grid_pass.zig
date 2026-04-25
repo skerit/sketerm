@@ -182,6 +182,23 @@ pub const GridPass = struct {
             try self.emitOverlayRow(atlas, pool, cells, row, cw, ch, ascent, ln.scaling);
         }
 
+        // Search-result overlay — every match in `screen.search_highlights`
+        // gets a translucent yellow rectangle. The active match is
+        // bright orange so the user knows which one is current.
+        for (screen.search_highlights, 0..) |m, i| {
+            const visible_row: i32 = m.row + @as(i32, @intCast(view_off));
+            if (visible_row < 0 or visible_row >= @as(i32, @intCast(screen.rows))) continue;
+            const x: f32 = pad + @as(f32, @floatFromInt(m.col)) * cw;
+            const y: f32 = pad + @as(f32, @floatFromInt(visible_row)) * ch;
+            const w: f32 = @as(f32, @floatFromInt(m.len)) * cw;
+            const is_active = screen.search_active_idx == @as(i32, @intCast(i));
+            const color: [4]f32 = if (is_active)
+                .{ 1.0, 0.55, 0.10, 0.55 } // bright orange — current match
+            else
+                .{ 1.0, 0.85, 0.10, 0.30 }; // dim yellow — other matches
+            try self.pushQuad(.{ x, y }, .{ w, ch }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0);
+        }
+
         // Selection overlay (translucent). For pure-LTR rows we emit
         // one quad spanning the run; for bidi rows we walk the logical
         // selection cell-by-cell and emit one quad per cell at its

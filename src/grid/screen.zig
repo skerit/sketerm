@@ -115,6 +115,14 @@ pub const Screen = struct {
     /// Selection (mouse drag).
     selection: @import("selection.zig").Selection = .{},
 
+    /// Scrollback search results — when non-empty, the renderer
+    /// overlays a translucent highlight on every match. The Window
+    /// owns the SearchMatch buffer separately for navigation; this
+    /// view is just for rendering. `search_active_idx` is the index
+    /// of the currently-selected match (rendered brighter).
+    search_highlights: []const SearchMatch = &.{},
+    search_active_idx: i32 = -1,
+
     pool: *Pool,
     allocator: std.mem.Allocator,
 
