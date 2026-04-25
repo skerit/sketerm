@@ -91,7 +91,7 @@ pub const Pty = struct {
         _ = c.setenv("TERM", "xterm-256color", 1);
         _ = c.setenv("COLORTERM", "truecolor", 1);
         _ = c.setenv("TERM_PROGRAM", "sketerm", 1);
-        _ = c.setenv("TERM_PROGRAM_VERSION", "0.0.1", 1);
+        _ = c.setenv("TERM_PROGRAM_VERSION", "0.1.0", 1);
 
         // chdir if requested.
         if (opts.cwd) |cwd| {

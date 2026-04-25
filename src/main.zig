@@ -5,7 +5,7 @@ const c = @import("c.zig").c;
 const Window = @import("ui/window.zig").Window;
 
 const APP_ID: [*:0]const u8 = "dev.sker.sketerm";
-const VERSION = "0.0.1";
+const VERSION = "0.1.0";
 
 const App = struct {
     allocator: std.mem.Allocator,
