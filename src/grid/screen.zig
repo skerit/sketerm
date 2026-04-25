@@ -32,9 +32,14 @@ pub const Screen = struct {
     use_alt: bool = false,
 
     /// Scrollback ring — receives lines scrolled off the top of the
-    /// main screen. Capped at `scrollback_capacity`. Older entries
-    /// are evicted when full.
+    /// main screen. Capped at `scrollback_capacity`. Once at cap, new
+    /// pushes overwrite the oldest slot in place (O(1) eviction)
+    /// rather than shifting the whole ArrayList — that cost was
+    /// 50µs per evict on a 10k cap, dominating the parser bench.
+    /// `scrollback_head` is the index of the oldest entry; once
+    /// `items.len == capacity` the buffer behaves as a ring.
     scrollback: std.ArrayList(Line) = .{},
+    scrollback_head: usize = 0,
     scrollback_capacity: usize = 10_000,
     /// Rendering offset (0 = bottom, > 0 = scrolled up by N lines).
     view_offset: u32 = 0,
@@ -525,9 +530,11 @@ pub const Screen = struct {
             if (l.id == line_id) return @intCast(i);
         }
         if (!self.use_alt) {
-            const sb_count = self.scrollback.items.len;
-            for (self.scrollback.items, 0..) |l, i| {
-                if (l.id == line_id) {
+            // Walk scrollback in oldest→newest logical order via the ring.
+            const sb_count = self.scrollbackCount();
+            var i: u32 = 0;
+            while (i < sb_count) : (i += 1) {
+                if (self.scrollbackLine(i).id == line_id) {
                     // Scrollback: -1 = bottom-most, -sb_count = oldest.
                     const from_bottom: i32 = @intCast(sb_count - i);
                     return -from_bottom;
@@ -590,6 +597,7 @@ pub const Screen = struct {
         for (self.buf()) |*l| l.clear();
         for (self.scrollback.items) |*l| l.deinit(self.allocator);
         self.scrollback.clearRetainingCapacity();
+        self.scrollback_head = 0;
         self.clearAllClusters();
         self.row = 0;
         self.col = 0;
@@ -640,11 +648,16 @@ pub const Screen = struct {
         self.clearAllClusters();
 
         // Build a single logical-line stream from scrollback, then active.
-        // Capture cursor's logical position before consuming.
+        // Capture cursor's logical position before consuming. Walk the
+        // scrollback ring in oldest→newest order via scrollbackLine.
         var combined: std.ArrayList(Line) = .{};
         defer combined.deinit(self.allocator);
-        try combined.appendSlice(self.allocator, self.scrollback.items);
-        const sb_count = self.scrollback.items.len;
+        const sb_count = self.scrollbackCount();
+        try combined.ensureTotalCapacity(self.allocator, sb_count + self.active.len);
+        var sb_i: u32 = 0;
+        while (sb_i < sb_count) : (sb_i += 1) {
+            combined.appendAssumeCapacity(self.scrollbackLine(sb_i).*);
+        }
         try combined.appendSlice(self.allocator, self.active);
 
         const cursor_pos = reflow.positionInLogicals(
@@ -673,6 +686,7 @@ pub const Screen = struct {
         self.allocator.free(self.active);
         for (self.scrollback.items) |*ln| ln.deinit(self.allocator);
         self.scrollback.clearRetainingCapacity();
+        self.scrollback_head = 0;
 
         // Compute cursor's new (row, col) within all_rows.
         const new_pos = reflow.positionAfterRechunk(all_rows, cursor_pos.idx, cursor_pos.col, new_cols);
@@ -686,15 +700,11 @@ pub const Screen = struct {
             active_first = sb_rows;
         }
 
-        // Fill scrollback (older first, capped at scrollback_capacity).
+        // Fill scrollback via the ring-aware push helper.
         if (sb_rows > 0) {
             const sb_slice = all_rows[0..sb_rows];
             for (sb_slice) |row| {
-                if (self.scrollback.items.len >= self.scrollback_capacity) {
-                    var oldest = self.scrollback.orderedRemove(0);
-                    oldest.deinit(self.allocator);
-                }
-                try self.scrollback.append(self.allocator, row);
+                self.pushScrollback(row.cells, row.id);
             }
         }
 
@@ -777,17 +787,32 @@ pub const Screen = struct {
     }
 
     /// Push a line into scrollback. Caller transfers ownership of
-    /// the cells slice. Evicts oldest if cap exceeded.
-    fn pushScrollback(self: *Screen, cells: []Cell, line_id: u64) void {
-        if (self.scrollback.items.len >= self.scrollback_capacity) {
-            // Evict oldest.
-            var old = self.scrollback.orderedRemove(0);
-            old.deinit(self.allocator);
+    /// the cells slice. When at capacity, the evicted oldest cells
+    /// buffer is RETURNED rather than freed — caller can reuse it as
+    /// the new bottom-row cells (one alloc + one free saved per
+    /// scroll on the hot path). Returns null when no eviction
+    /// happened (pre-cap fill).
+    fn pushScrollbackTakeOld(self: *Screen, cells: []Cell, line_id: u64) ?[]Cell {
+        const cap = self.scrollback_capacity;
+        if (self.scrollback.items.len < cap) {
+            self.scrollback.append(self.allocator, .{ .cells = cells, .id = line_id }) catch {
+                self.allocator.free(cells);
+            };
+            return null;
         }
-        self.scrollback.append(self.allocator, .{ .cells = cells, .id = line_id }) catch {
-            // On OOM, just drop the line (free it).
-            self.allocator.free(cells);
-        };
+        const head = self.scrollback_head;
+        const old_cells = self.scrollback.items[head].cells;
+        self.scrollback.items[head] = .{ .cells = cells, .id = line_id };
+        self.scrollback_head = (head + 1) % cap;
+        return old_cells;
+    }
+
+    /// Push helper that frees the evicted cells. Used when the caller
+    /// can't reuse the buffer (e.g. width changed during reflow).
+    fn pushScrollback(self: *Screen, cells: []Cell, line_id: u64) void {
+        if (self.pushScrollbackTakeOld(cells, line_id)) |old_cells| {
+            self.allocator.free(old_cells);
+        }
     }
 
     /// Number of scrollback lines currently held.
@@ -797,7 +822,9 @@ pub const Screen = struct {
 
     /// Get a scrollback line by offset-from-top. 0 = oldest.
     pub fn scrollbackLine(self: *const Screen, idx: u32) *const Line {
-        return &self.scrollback.items[idx];
+        const len = self.scrollback.items.len;
+        if (len == 0) unreachable;
+        return &self.scrollback.items[(self.scrollback_head + idx) % len];
     }
 
     /// Extract selection text (UTF-8). Coordinates are *display*
@@ -1055,8 +1082,8 @@ pub const Screen = struct {
             const idx_from_end: u32 = @intCast(-row - 1);
             const sb_count = self.scrollbackCount();
             if (idx_from_end >= sb_count) return null;
-            const idx = sb_count - 1 - idx_from_end;
-            return &self.scrollback.items[idx];
+            // Ring-aware: scrollbackLine(0) = oldest, sb_count-1 = newest.
+            return self.scrollbackLine(sb_count - 1 - idx_from_end);
         }
         return null;
     }
@@ -1081,14 +1108,19 @@ pub const Screen = struct {
             .print => |cp| self.printCp(cp),
             .print_byte => |b| self.printByte(b),
             .print_run => |run| {
-                // Fast-path: when the UTF-8 decoder is idle AND every
-                // byte is ASCII, skip the per-byte decoder dispatch
-                // and call printCp directly. Plain-ASCII workloads
-                // (logs, source code) hit this path.
-                if (self.decoder.expected == 0 and runIsAscii(run.bytes[0..run.len])) {
+                // Tier 1: bulk-write the entire run in a tight loop
+                // when nothing complicated is going on (no charset
+                // translation, no insert/cluster/wrap, run fits on
+                // current row). Avoids the per-byte printCp overhead
+                // for the dominant case in plaintext output.
+                if (self.applyPrintRunFast(&run)) {
+                    // handled
+                } else if (self.decoder.expected == 0 and runIsAscii(run.bytes[0..run.len])) {
+                    // Tier 2: skip UTF-8 decoder; per-byte printCp.
                     var i: usize = 0;
                     while (i < run.len) : (i += 1) self.printCp(run.bytes[i]);
                 } else {
+                    // Tier 3: full per-byte path (UTF-8 reassembly).
                     var i: usize = 0;
                     while (i < run.len) : (i += 1) self.printByte(run.bytes[i]);
                 }
@@ -1580,6 +1612,61 @@ pub const Screen = struct {
 
     fn printByte(self: *Screen, b: u8) void {
         if (self.decoder.feed(b)) |cp| self.printCp(cp);
+    }
+
+    /// Bulk-print fast path for `print_run` events. Returns true iff
+    /// the entire run was handled here; false means caller should fall
+    /// back to per-byte. Eligibility (in order of cost):
+    ///   - UTF-8 decoder idle, every byte printable ASCII (≤ 0x7E,
+    ///     ≥ 0x20).
+    ///   - charset_g0 == ASCII, active_charset == g0 (or g1 ASCII).
+    ///   - !insert_mode, !pending_wrap, no cluster store entries,
+    ///     run fits on current row (col + len ≤ cols).
+    /// When eligible we do one tight loop of cell writes — no
+    /// charset translation, no cluster check per cell, no per-cell
+    /// wrap test. Skips one function call per byte plus the autowrap
+    /// + cluster checks inside printCp.
+    fn applyPrintRunFast(self: *Screen, run: *const Event.PrintRun) bool {
+        if (self.decoder.expected != 0) return false;
+        if (self.insert_mode) return false;
+        if (self.pending_wrap) return false;
+        if (self.clusters.count() != 0) return false;
+        // Charset must pass through ASCII unchanged.
+        const active = if (self.active_charset == .g0) self.charset_g0 else self.charset_g1;
+        if (active != .ascii) return false;
+        // Bytes must all be printable ASCII (no LF/CR/BS hidden).
+        if (!runIsAscii(run.bytes[0..run.len])) return false;
+        // Must fit on current row.
+        const len: u16 = @intCast(run.len);
+        if (self.col + len > self.cols) return false;
+
+        var ln = self.line(self.row);
+        const link_id = self.current_link_id;
+        const flags: u8 = if (link_id != 0) 0b0000_0100 else 0;
+        const style = self.cur_style;
+        var k: u16 = 0;
+        while (k < len) : (k += 1) {
+            ln.cells[self.col + k] = .{
+                .rune = run.bytes[k],
+                .style_ref = style,
+                .flags = flags,
+                .reserved = link_id,
+            };
+        }
+        ln.dirty = true;
+        // REP support: track the last printed cp + position.
+        self.last_print_cp = run.bytes[len - 1];
+        self.last_print_key = cellKey(self.row, self.col + len - 1);
+        self.col += len;
+        if (self.col >= self.cols) {
+            if (self.autowrap) {
+                self.col = self.cols - 1;
+                self.pending_wrap = true;
+            } else {
+                self.col = self.cols - 1;
+            }
+        }
+        return true;
     }
 
     fn printCp(self: *Screen, cp_in: u32) void {
@@ -2498,10 +2585,21 @@ pub const Screen = struct {
             }
 
             if (push_to_sb) {
+                // Hand the top-row cells DIRECTLY to scrollback (no
+                // dupe). When the ring is full, the evicted oldest
+                // cells come back — reuse them as the new bottom-row
+                // buffer. Net 0 allocations per scroll in steady state.
                 var k: u16 = 0;
                 while (k < move) : (k += 1) {
-                    const copy = self.allocator.dupe(Cell, stash[k]) catch break;
-                    self.pushScrollback(copy, stash_ids[k]);
+                    const top_cells = stash[k];
+                    if (self.pushScrollbackTakeOld(top_cells, stash_ids[k])) |reused| {
+                        stash[k] = reused;
+                    } else {
+                        // Pre-cap: scrollback took ownership, alloc
+                        // fresh for the new bottom row.
+                        const new_buf = self.allocator.alloc(Cell, self.cols) catch break;
+                        stash[k] = new_buf;
+                    }
                 }
             }
 
@@ -2525,10 +2623,19 @@ pub const Screen = struct {
             // Whole region scrolled; everything goes to scrollback (or
             // is dropped, on alt screen).
             if (push_to_sb) {
-                var i: u16 = 0;
-                while (i < region) : (i += 1) {
-                    const copy = self.allocator.dupe(Cell, lines[self.scroll_top + i].cells) catch break;
-                    self.pushScrollback(copy, lines[self.scroll_top + i].id);
+                // Same swap-buffer trick: hand cells to scrollback,
+                // reuse evicted (or alloc fresh) for the now-blank row.
+                var k: u16 = 0;
+                while (k < region) : (k += 1) {
+                    const idx = self.scroll_top + k;
+                    const old_cells = lines[idx].cells;
+                    const old_id = lines[idx].id;
+                    if (self.pushScrollbackTakeOld(old_cells, old_id)) |reused| {
+                        lines[idx].cells = reused;
+                    } else {
+                        const new_buf = self.allocator.alloc(Cell, self.cols) catch break;
+                        lines[idx].cells = new_buf;
+                    }
                 }
             }
             var i: u16 = self.scroll_top;
