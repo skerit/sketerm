@@ -29,6 +29,10 @@ pub const Window = struct {
     search_pane: ?*Pane = null,
     search_matches: std.ArrayList(@import("../grid/screen.zig").Screen.SearchMatch) = .{},
     search_idx: usize = 0,
+    /// Case-insensitive search toggle. Defaults to smart-case
+    /// (lower-only needle implies CI; mixed-case implies CS).
+    search_case_insensitive: bool = false,
+    search_case_button: ?*c.GtkWidget = null,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         const self = try allocator.create(Window);
@@ -229,7 +233,21 @@ pub const Window = struct {
         self.search_matches = .{};
         self.search_idx = 0;
         if (query.len > 0) {
-            const matches = pane.terminal.screen.search(self.allocator, query) catch return;
+            // Smart-case: lowercase-only needle implies CI; any
+            // uppercase letter forces CS. The explicit toggle wins
+            // either way.
+            var ci = self.search_case_insensitive;
+            if (!ci) {
+                var has_upper = false;
+                for (query) |b| {
+                    if (b >= 'A' and b <= 'Z') {
+                        has_upper = true;
+                        break;
+                    }
+                }
+                ci = !has_upper;
+            }
+            const matches = pane.terminal.screen.searchOpts(self.allocator, query, ci) catch return;
             defer self.allocator.free(matches);
             self.search_matches.appendSlice(self.allocator, matches) catch return;
         }

@@ -1089,9 +1089,29 @@ pub const Screen = struct {
     /// `needle`. Case-sensitive, single-line only (no wrap join).
     /// Caller frees the returned slice.
     pub fn search(self: *const Screen, allocator: std.mem.Allocator, needle: []const u8) ![]SearchMatch {
+        return self.searchOpts(allocator, needle, false);
+    }
+
+    pub fn searchOpts(
+        self: *const Screen,
+        allocator: std.mem.Allocator,
+        needle: []const u8,
+        case_insensitive: bool,
+    ) ![]SearchMatch {
         var out: std.ArrayList(SearchMatch) = .{};
         defer out.deinit(allocator);
         if (needle.len == 0) return try out.toOwnedSlice(allocator);
+
+        // Lowercase the needle once (ASCII-only fold for v1; UTF-8
+        // case-folding would need the unicode case table).
+        var folded_needle: []u8 = &.{};
+        defer if (folded_needle.len > 0) allocator.free(folded_needle);
+        const search_needle: []const u8 = if (case_insensitive) blk: {
+            const lc = try allocator.alloc(u8, needle.len);
+            for (needle, 0..) |b, i| lc[i] = std.ascii.toLower(b);
+            folded_needle = lc;
+            break :blk lc;
+        } else needle;
 
         var line_buf: std.ArrayList(u8) = .{};
         defer line_buf.deinit(allocator);
@@ -1109,13 +1129,13 @@ pub const Screen = struct {
         while (i < sb_count) : (i += 1) {
             const row: i32 = @as(i32, @intCast(i)) - @as(i32, @intCast(sb_count));
             try renderLineForSearch(allocator, self, row, &line_buf, &col_map, &width_map);
-            try findMatches(allocator, line_buf.items, col_map.items, width_map.items, needle, row, &out);
+            try findMatches(allocator, line_buf.items, col_map.items, width_map.items, search_needle, row, &out, case_insensitive);
         }
         // Active screen.
         var r: u16 = 0;
         while (r < self.rows) : (r += 1) {
             try renderLineForSearch(allocator, self, @intCast(r), &line_buf, &col_map, &width_map);
-            try findMatches(allocator, line_buf.items, col_map.items, width_map.items, needle, @intCast(r), &out);
+            try findMatches(allocator, line_buf.items, col_map.items, width_map.items, search_needle, @intCast(r), &out, case_insensitive);
         }
         return try out.toOwnedSlice(allocator);
     }
@@ -3279,10 +3299,15 @@ fn findMatches(
     needle: []const u8,
     row: i32,
     out: *std.ArrayList(Screen.SearchMatch),
+    case_insensitive: bool,
 ) !void {
     var pos: usize = 0;
     while (pos + needle.len <= haystack.len) {
-        if (std.mem.eql(u8, haystack[pos .. pos + needle.len], needle)) {
+        const matched = if (case_insensitive)
+            asciiCaseEq(haystack[pos .. pos + needle.len], needle)
+        else
+            std.mem.eql(u8, haystack[pos .. pos + needle.len], needle);
+        if (matched) {
             const start_col = col_map[pos];
             const end_byte = pos + needle.len - 1;
             const end_col_left = col_map[end_byte];
@@ -3301,6 +3326,16 @@ fn findMatches(
             pos += 1;
         }
     }
+}
+
+/// Compare two byte slices with ASCII letter-case folding on the
+/// haystack side only. `needle` is assumed already-lowercased.
+fn asciiCaseEq(haystack: []const u8, needle_lower: []const u8) bool {
+    if (haystack.len != needle_lower.len) return false;
+    for (haystack, needle_lower) |h, n| {
+        if (std.ascii.toLower(h) != n) return false;
+    }
+    return true;
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -4543,6 +4578,24 @@ test "search finds matches in active screen" {
     try std.testing.expectEqual(@as(u32, 0), matches[0].col);
     try std.testing.expectEqual(@as(u32, 5), matches[0].len);
     try std.testing.expectEqual(@as(u32, 12), matches[1].col);
+}
+
+test "search case-insensitive matches across cases" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 30, 3);
+    defer s.deinit();
+    for ("Hello WORLD hello world") |b| s.printCp(b);
+
+    // CS — only one match
+    const cs = try s.searchOpts(std.testing.allocator, "hello", false);
+    defer std.testing.allocator.free(cs);
+    try std.testing.expectEqual(@as(usize, 1), cs.len);
+
+    // CI — both Hello and hello
+    const ci = try s.searchOpts(std.testing.allocator, "hello", true);
+    defer std.testing.allocator.free(ci);
+    try std.testing.expectEqual(@as(usize, 2), ci.len);
 }
 
 test "search returns empty for empty needle" {
