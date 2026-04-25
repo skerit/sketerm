@@ -6,7 +6,7 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~67 commits, ~6.5 kLOC of Zig + 8 kLOC vendored stb_image
+- ~100 commits, ~7.0 kLOC of Zig + 8 kLOC vendored stb_image
 
 ## What got built
 
@@ -96,25 +96,39 @@ If anything's broken visually, the most likely culprits are:
    in `src/ui/pane.zig`. If your system doesn't have Hack
    installed, atlas init will fail and the pane will be black.
 
+## Polish layered after the 67-commit checkpoint
+
+Things added between commits 67 → 100:
+
+- Mouse motion reporting for DECSET 1003 + button-held 1002.
+- DECRQM (CSI ? Pa $ p) replies for the modes we track.
+- Real per-column tab stops: HTS, CSI g/3g, CHT/CBT.
+- REP (CSI Pn b) — repeat last printed glyph.
+- DECSED / DECSEL routed to plain ED/EL; DECSCA accepted.
+- DEC special-graphics charset (ESC ( 0 / ESC ) 0 / SO / SI).
+- DECCKM application-cursor-keys mode.
+- Focus-event reporting for DECSET 1004 (\\e[I / \\e[O).
+- ESC Z (DECID), ESC # 8 (DECALN), ENQ answerback.
+- Cursor save/restore now includes autowrap + charset state.
+- Cursor keys + F-keys + tilde-keys honor Shift/Alt/Ctrl modifiers.
+- OSC 10/11 fg/bg color queries; CSI t window-state reports.
+- Layout split-tree applies saved ratios on map; `-Dstrip` flag.
+
 ## What's left
 
 Remaining post-checkpoint TODO list:
 
-1. Mouse reporting (DECSET 1006) — vim/htop want mouse events on
-   the PTY. Tracker mouse_mode is already plumbed; add controllers
-   that emit `\x1b[<button;col;row M`/`m` sequences.
-2. IM cursor location update — call
-   `gtk_im_context_set_cursor_location` whenever the cursor moves
-   so fcitx5/ibus position the IME popup at the right place.
-3. Reflow with soft-wrap tracking on resize. Today resize pads /
+1. Reflow with soft-wrap tracking on resize. Today resize pads /
    truncates per row.
-4. RenameCtx leak (allocated by `Window.renameCurrentTab`, never
-   freed — entry is destroyed when popover closes but the Zig
-   alloc isn't tracked).
-5. PTY worker thread allocations leak on hard SIGTERM (cleanup
+2. PTY worker thread allocations leak on hard SIGTERM (cleanup
    ordering wrt thread join).
-6. NVIDIA proprietary GL — falls back to llvmpipe on this laptop.
-7. OSC 8 in selection-extract — preserves text but not the URI.
+3. NVIDIA proprietary GL — falls back to llvmpipe on this laptop.
+4. OSC 8 in selection-extract — preserves text but not the URI.
+5. OSC 4 palette query/set — palette is currently a comptime const
+   in `render/grid_pass.zig`, would need to become runtime state.
+6. OSC 12 cursor-color set/query.
+7. modifyOtherKeys (CSI > 4 ; Pp m) — for emacs/vim users who want
+   distinct codes for Ctrl-Shift-A vs Ctrl-A.
 
 ## Notable design decisions made during the build
 
