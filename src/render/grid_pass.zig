@@ -14,6 +14,7 @@ const Atlas = @import("atlas.zig").Atlas;
 const Screen = @import("../grid/screen.zig").Screen;
 const StylePool = @import("../grid/style_pool.zig").Pool;
 const Color = @import("../grid/style_pool.zig").Color;
+const Cell = @import("../grid/cell.zig").Cell;
 
 const VERT_SRC =
     \\#version 300 es
@@ -88,6 +89,10 @@ pub const GridPass = struct {
     /// pane edges.
     canvas_w: f32 = 0,
     canvas_h: f32 = 0,
+    /// Enable HarfBuzz shaping → ligatures for runs of same-style
+    /// ASCII-ish cells. Falls back to per-codepoint when shaping
+    /// fails or the atlas has no hb_font.
+    enable_ligatures: bool = true,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) GridPass {
@@ -180,41 +185,37 @@ pub const GridPass = struct {
                 break :blk screen.scrollbackLine(sb_idx);
             } else &buf[row - view_off];
             const ln = ln_ptr.*;
+            const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
+
+            // Pass 1 — background quads.
             var col: u16 = 0;
             while (col < screen.cols) : (col += 1) {
                 const cell = ln.cells[col];
                 const style = pool.get(cell.style_ref);
-                const fg = self.colorToVec(style.fg, true, style.attrs.reverse);
+                if (style.bg == .default and !style.attrs.reverse) continue;
                 const bg = self.colorToVec(style.bg, false, style.attrs.reverse);
-
                 const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw;
-                const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
+                try self.pushQuad(.{ x, y }, .{ cw, ch }, .{ 0, 0 }, .{ 0, 0 }, bg, 0.0);
+            }
 
-                // Background quad (only if non-default).
-                if (style.bg != .default or style.attrs.reverse) {
-                    try self.pushQuad(.{ x, y }, .{ cw, ch }, .{ 0, 0 }, .{ 0, 0 }, bg, 0.0);
+            // Pass 2 — glyphs. Detect runs of same-style printable cells
+            // and shape each run with HarfBuzz when ligatures are on.
+            col = 0;
+            while (col < screen.cols) {
+                const cell = ln.cells[col];
+                if (!self.isShapable(cell)) {
+                    col += 1;
+                    continue;
                 }
-
-                // Skip wide-char continuation cells (right half of a
-                // 2-column glyph). Their rune is 0 by design.
-                if (cell.flags & 0b0000_0010 != 0) {
-                    // is_wide_cont — handled by the left cell.
-                } else if (cell.rune != 0 and cell.rune != ' ') {
-                    const g = atlas.lookupOrLoad(cell.rune) catch continue;
-                    if (g.w == 0 or g.h == 0) continue;
-                    const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x));
-                    const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y));
-                    const gw: f32 = @floatFromInt(g.w);
-                    const gh: f32 = @floatFromInt(g.h);
-                    try self.pushQuad(
-                        .{ gx, gy },
-                        .{ gw, gh },
-                        .{ g.u0, g.v0 },
-                        .{ g.u1, g.v1 },
-                        fg,
-                        1.0,
-                    );
+                // Find run end.
+                const run_start = col;
+                const run_style = cell.style_ref;
+                while (col < screen.cols) : (col += 1) {
+                    const c2 = ln.cells[col];
+                    if (!self.isShapable(c2)) break;
+                    if (c2.style_ref != run_style) break;
                 }
+                try self.emitGlyphRun(atlas, pool, ln.cells[run_start..col], run_start, row, cw, ch, ascent);
             }
         }
 
@@ -407,6 +408,108 @@ pub const GridPass = struct {
             try self.pushQuad(.{ 0, h - border }, .{ w, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
             try self.pushQuad(.{ 0, 0 }, .{ border, h }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
             try self.pushQuad(.{ w - border, 0 }, .{ border, h }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+        }
+    }
+
+    /// True iff this cell carries a printable rune we want to shape
+    /// in a run. Wide-continuation cells, blanks, and zero runes
+    /// break the run.
+    fn isShapable(self: *const GridPass, cell: Cell) bool {
+        _ = self;
+        if (cell.flags & 0b0000_0010 != 0) return false;
+        if (cell.rune == 0 or cell.rune == ' ') return false;
+        return true;
+    }
+
+    /// Emit glyph quads for a contiguous run of same-style cells.
+    /// Path A: HarfBuzz shape (ligature-aware). Path B: per-codepoint
+    /// fallback when shaping fails or the atlas has no hb_font.
+    fn emitGlyphRun(
+        self: *GridPass,
+        atlas: *Atlas,
+        pool: *const StylePool,
+        cells: []const Cell,
+        col_start: u16,
+        row: u16,
+        cw: f32,
+        ch: f32,
+        ascent: f32,
+    ) !void {
+        if (cells.len == 0) return;
+        const style = pool.get(cells[0].style_ref);
+        const fg = self.colorToVec(style.fg, true, style.attrs.reverse);
+        const pad: f32 = self.pad;
+        const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
+
+        // Build UTF-8 of run + parallel byte→cell-index map.
+        var bytes: [512]u8 = undefined;
+        var byte_to_cell: [512]u16 = undefined;
+        var blen: usize = 0;
+        for (cells, 0..) |cell, idx| {
+            if (cell.rune == 0) continue;
+            var enc: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(@intCast(cell.rune), &enc) catch 0;
+            if (blen + n > bytes.len) break;
+            var k: usize = 0;
+            while (k < n) : (k += 1) {
+                bytes[blen + k] = enc[k];
+                byte_to_cell[blen + k] = @intCast(idx);
+            }
+            blen += n;
+        }
+        if (blen == 0) return;
+
+        if (self.enable_ligatures and atlas.hb_font != null) {
+            if (atlas.shapeRun(self.allocator, bytes[0..blen])) |shaped| {
+                defer self.allocator.free(shaped);
+                if (shaped.len > 0) {
+                    var i: usize = 0;
+                    while (i < shaped.len) : (i += 1) {
+                        const sg = shaped[i];
+                        const start_cell = if (sg.cluster < blen) byte_to_cell[sg.cluster] else 0;
+                        const start_col: u16 = col_start + start_cell;
+                        const x: f32 = pad + @as(f32, @floatFromInt(start_col)) * cw;
+                        const g = atlas.lookupOrLoadById(sg.glyph_id) catch continue;
+                        if (g.w == 0 or g.h == 0) continue;
+                        // HarfBuzz positions in 26.6 fixed-point.
+                        const xoff: f32 = @as(f32, @floatFromInt(sg.x_offset)) / 64.0;
+                        const yoff: f32 = @as(f32, @floatFromInt(sg.y_offset)) / 64.0;
+                        const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x)) + xoff;
+                        const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) - yoff;
+                        const gw: f32 = @floatFromInt(g.w);
+                        const gh: f32 = @floatFromInt(g.h);
+                        try self.pushQuad(
+                            .{ gx, gy },
+                            .{ gw, gh },
+                            .{ g.u0, g.v0 },
+                            .{ g.u1, g.v1 },
+                            fg,
+                            1.0,
+                        );
+                    }
+                    return;
+                }
+            } else |_| {}
+        }
+
+        // Fallback: per-codepoint.
+        for (cells, 0..) |cell, idx| {
+            if (cell.rune == 0 or cell.rune == ' ') continue;
+            const x: f32 = pad + @as(f32, @floatFromInt(col_start + idx)) * cw;
+            const g = atlas.lookupOrLoad(cell.rune) catch continue;
+            if (g.w == 0 or g.h == 0) continue;
+            const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x));
+            const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y));
+            const gw: f32 = @floatFromInt(g.w);
+            const gh: f32 = @floatFromInt(g.h);
+            try self.pushQuad(
+                .{ gx, gy },
+                .{ gw, gh },
+                .{ g.u0, g.v0 },
+                .{ g.u1, g.v1 },
+                fg,
+                1.0,
+            );
         }
     }
 

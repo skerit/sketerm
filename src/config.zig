@@ -39,6 +39,9 @@ pub const Config = struct {
     bracketed_paste: bool = true,
     modify_other_keys: u8 = 0, // 0=off, 1=basic, 2=full
 
+    // Rendering
+    ligatures: bool = true,
+
     // Owned strings allocated from the parser arena. Not freed
     // individually — `arena.deinit()` reaps everything.
     arena: ?std.heap.ArenaAllocator = null,
@@ -155,6 +158,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         const n = try parseU16(value);
         if (n > 2) return error.BadModifyOtherKeys;
         cfg.modify_other_keys = @intCast(n);
+    } else if (std.mem.eql(u8, key, "ligatures")) {
+        cfg.ligatures = try parseBool(value);
     } else {
         // Unknown key — warn but don't abort.
         std.debug.print("sketerm: config: unknown key '{s}' (ignoring)\n", .{key});

@@ -176,18 +176,27 @@ pub const Atlas = struct {
         return out;
     }
 
-    /// Get an existing glyph or rasterize + upload.
+    /// Get an existing glyph or rasterize + upload. Codepoint-keyed
+    /// path — used by the per-codepoint render path. Internally maps
+    /// to a font glyph_id and delegates to lookupOrLoadById.
     pub fn lookupOrLoad(self: *Atlas, codepoint: u32) !Glyph {
         if (self.cache.get(codepoint)) |g| return g;
-
-        // Rasterize.
         const gid = c.FT_Get_Char_Index(self.ft_face, codepoint);
         if (gid == 0 and codepoint != 0) {
-            return self.cacheEmpty(codepoint);
+            return self.cacheEmptyCp(codepoint);
         }
+        const g = self.lookupOrLoadById(gid) catch return self.cacheEmptyCp(codepoint);
+        try self.cache.put(codepoint, g);
+        return g;
+    }
+
+    /// Glyph-id keyed lookup. The HarfBuzz shape path uses this so
+    /// ligature glyphs (which have no codepoint) reach the atlas.
+    pub fn lookupOrLoadById(self: *Atlas, gid: u32) !Glyph {
+        if (self.glyph_cache.get(gid)) |g| return g;
 
         if (c.FT_Load_Glyph(self.ft_face, gid, c.FT_LOAD_RENDER | c.FT_LOAD_TARGET_LIGHT) != 0) {
-            return self.cacheEmpty(codepoint);
+            return self.cacheEmptyId(gid);
         }
 
         const slot = self.ft_face.*.glyph;
@@ -195,7 +204,6 @@ pub const Atlas = struct {
         const w: u32 = bm.width;
         const h: u32 = bm.rows;
 
-        // Shelf-pack.
         if (self.pack_x + w + 1 > PAGE_SIZE) {
             self.pack_x = 0;
             self.pack_y += self.shelf_h + 1;
@@ -203,14 +211,12 @@ pub const Atlas = struct {
         }
         if (h > self.shelf_h) self.shelf_h = h;
         if (self.pack_y + h > PAGE_SIZE) {
-            // Atlas full — return placeholder.
-            return self.cacheEmpty(codepoint);
+            return self.cacheEmptyId(gid);
         }
 
         const px = self.pack_x;
         const py = self.pack_y;
 
-        // Upload pixels.
         if (w > 0 and h > 0 and self.realized) {
             c.glBindTexture(c.GL_TEXTURE_2D, self.gl_tex);
             c.glPixelStorei(c.GL_UNPACK_ALIGNMENT, 1);
@@ -239,14 +245,13 @@ pub const Atlas = struct {
             .u1 = @as(f32, @floatFromInt(px + w)) * inv_page,
             .v1 = @as(f32, @floatFromInt(py + h)) * inv_page,
         };
-
         self.pack_x += w + 1;
-        try self.cache.put(codepoint, g);
+        try self.glyph_cache.put(gid, g);
         return g;
     }
 
-    fn cacheEmpty(self: *Atlas, codepoint: u32) Glyph {
-        const empty = Glyph{
+    fn emptyGlyph(self: *const Atlas) Glyph {
+        return .{
             .w = 0,
             .h = 0,
             .bearing_x = 0,
@@ -257,7 +262,17 @@ pub const Atlas = struct {
             .u1 = 0,
             .v1 = 0,
         };
+    }
+
+    fn cacheEmptyCp(self: *Atlas, codepoint: u32) Glyph {
+        const empty = self.emptyGlyph();
         _ = self.cache.put(codepoint, empty) catch {};
+        return empty;
+    }
+
+    fn cacheEmptyId(self: *Atlas, gid: u32) Glyph {
+        const empty = self.emptyGlyph();
+        _ = self.glyph_cache.put(gid, empty) catch {};
         return empty;
     }
 };

@@ -495,6 +495,7 @@ pub const Window = struct {
         pane.grid_pass.pad = self.config.padding;
         pane.grid_pass.default_fg = self.config.default_fg;
         pane.grid_pass.default_bg = self.config.default_bg;
+        pane.grid_pass.enable_ligatures = self.config.ligatures;
         // Push config-driven defaults onto the screen so OSC 4/10/11
         // queries reply with the configured values until apps override.
         term.screen.default_fg = self.config.default_fg;
