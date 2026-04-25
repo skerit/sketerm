@@ -121,7 +121,7 @@ htop and btop need the report subset for accurate rendering.
 | 52     | Clipboard set/get                         | ✓ (get gated; 1 MB cap) |
 | 104    | Reset color palette                       | ✓ |
 | 110/111/112 | Reset fg/bg/cursor                   | ✓ |
-| 133    | Shell integration (FinalTerm prompt marks)| deferred |
+| 133    | Shell integration (FinalTerm prompt marks)| ✓ (records A-marks; nav UI deferred) |
 | 9      | iTerm2 desktop notification               | ✓ |
 | 777    | Desktop notifications (notify variant)    | ✓ |
 | 1337   | iTerm2 proprietary — `File=` only         | ✓ |
