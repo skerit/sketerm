@@ -52,6 +52,21 @@ pub const Window = struct {
         c.adw_toolbar_view_set_content(@ptrCast(toolbar_view), @ptrCast(@alignCast(tab_view_w)));
         c.adw_application_window_set_content(@ptrCast(app_window), toolbar_view);
 
+        // Double-click on the tab bar → rename the selected tab.
+        // AdwTabBar handles single-click selection internally, so
+        // by the time n_press == 2 fires, the tab is already current.
+        const tabbar_dblclk = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(tabbar_dblclk), 1);
+        _ = c.g_signal_connect_data(
+            tabbar_dblclk,
+            "pressed",
+            @ptrCast(&onTabBarPressed),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+        c.gtk_widget_add_controller(@ptrCast(@alignCast(tab_bar_w)), @ptrCast(tabbar_dblclk));
+
         self.* = .{
             .app_window = app_window,
             .tab_view = @ptrCast(tab_view_w),
@@ -784,6 +799,16 @@ fn onNewTabAction(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callc
     self.newShellTab(null) catch |err| {
         std.debug.print("sketerm: new-tab action failed: {s}\n", .{@errorName(err)});
     };
+}
+
+/// Open the rename popover on a double-click on the tab bar. The
+/// single-click that AdwTabBar handles internally has already
+/// selected the right tab, so renameCurrentTab targets it.
+fn onTabBarPressed(g: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    if (n_press != 2) return;
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    _ = g;
+    self.renameCurrentTab();
 }
 
 /// Move keyboard focus into the newly selected tab's pane so
