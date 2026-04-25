@@ -191,12 +191,17 @@ site. Leak detection via GPA's debug mode during development.
 Summarized here; full detail in `docs/gpu.md`.
 
 - Each pane's `GtkGLArea` has its own `GdkGLContext`.
-- The window owns a **root** `GdkGLContext`. On pane creation, we
-  bind `create-context` to return a context sharing with the root.
-- Shaders, VBOs, and the glyph atlas are allocated when the root
-  context is first `realize`-d.
-- Atlas updates happen on the root context; pane render callbacks
-  only sample.
+- Shaders, VBOs, and the glyph atlas are allocated lazily when the
+  GLArea fires `realize`.
+- **Re-realize on reparent.** `gtk_widget_unparent` unrealizes the
+  GLArea, which destroys its `GdkGLContext`. Splits / tab moves /
+  layout shuffles all reparent and therefore cycle the context.
+  `Pane.onRealize` treats every realize as potentially a re-realize:
+  the prior `Atlas` is `deinit`-ed, then `forgetGL()` zeros the
+  cached handles on `GridPass` / `ImagePass` / `ImageStore` so the
+  realize path actually rebuilds against the fresh context. Without
+  this, `program != 0` early-returns leak dead-context shader IDs
+  and `glUseProgram` silently renders nothing.
 - Pane GL resources (per-pane VBOs) are released in `unrealize`.
 
 ## Key design decisions
