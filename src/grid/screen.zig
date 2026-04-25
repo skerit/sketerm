@@ -666,6 +666,8 @@ pub const Screen = struct {
                 const n = params.paramOrDefault(0, 1);
                 self.line(self.row).eraseRange(self.col, self.col + @as(u16, @intCast(@min(n, 0xFFFF))));
             },
+            '@' => self.insertChars(params.paramOrDefault(0, 1)),
+            'P' => self.deleteChars(params.paramOrDefault(0, 1)),
 
             // Scroll.
             'S' => self.scrollUp(params.paramOrDefault(0, 1)),
@@ -977,6 +979,42 @@ pub const Screen = struct {
         }
         var i: u16 = self.scroll_top;
         while (i <= self.scroll_bot) : (i += 1) lines[i].dirty = true;
+    }
+
+    fn insertChars(self: *Screen, n: u32) void {
+        var ln = self.line(self.row);
+        const cells = ln.cells;
+        const col = self.col;
+        if (col >= cells.len) return;
+        const max_n: u32 = @intCast(cells.len - col);
+        const move: u16 = @intCast(@min(n, max_n));
+        if (move == 0) return;
+        // Shift cells right from col by `move`. Last cells fall off.
+        var i: usize = cells.len;
+        while (i > col + move) : (i -= 1) {
+            cells[i - 1] = cells[i - 1 - move];
+        }
+        // Clear the inserted cells.
+        var k: u16 = 0;
+        while (k < move) : (k += 1) cells[col + k] = .{};
+        ln.dirty = true;
+    }
+
+    fn deleteChars(self: *Screen, n: u32) void {
+        var ln = self.line(self.row);
+        const cells = ln.cells;
+        const col = self.col;
+        if (col >= cells.len) return;
+        const max_n: u32 = @intCast(cells.len - col);
+        const move: u16 = @intCast(@min(n, max_n));
+        if (move == 0) return;
+        // Shift cells left from col+move into col. Last cells become blank.
+        var i: usize = col;
+        while (i + move < cells.len) : (i += 1) {
+            cells[i] = cells[i + move];
+        }
+        while (i < cells.len) : (i += 1) cells[i] = .{};
+        ln.dirty = true;
     }
 
     fn insertLines(self: *Screen, n: u32) void {
@@ -1369,6 +1407,47 @@ test "resize preserves active rows" {
     try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
     try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 1).rune);
     try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(0, 2).rune);
+}
+
+test "ICH inserts blanks shifting right" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 6, 1);
+    defer s.deinit();
+    s.printCp('a');
+    s.printCp('b');
+    s.printCp('c');
+    s.col = 1;
+    var csi = Event.Csi{};
+    csi.params[0] = 2;
+    csi.n_params = 1;
+    csi.final = '@';
+    s.csi(csi);
+    try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 2).rune);
+    try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 3).rune);
+    try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(0, 4).rune);
+}
+
+test "DCH deletes chars shifting left" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 6, 1);
+    defer s.deinit();
+    s.printCp('a');
+    s.printCp('b');
+    s.printCp('c');
+    s.printCp('d');
+    s.col = 1;
+    var csi = Event.Csi{};
+    csi.params[0] = 2;
+    csi.n_params = 1;
+    csi.final = 'P';
+    s.csi(csi);
+    try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'd'), s.cellAt(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 2).rune);
 }
 
 test "ED 3 clears scrollback" {
