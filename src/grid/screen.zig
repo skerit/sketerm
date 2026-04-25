@@ -655,6 +655,7 @@ pub const Screen = struct {
 
     fn execute(self: *Screen, b: u8) void {
         switch (b) {
+            0x05 => self.respond(""), // ENQ — answerback (we send empty)
             0x07 => {
                 // BEL: visual flash + optional sink notification.
                 self.bell_at_us = std.time.microTimestamp();
@@ -981,6 +982,18 @@ pub const Screen = struct {
                 'B' => .ascii,
                 else => slot.*,
             };
+            return;
+        }
+        // DECALN — `ESC # 8` fills the screen with 'E' for an
+        // alignment pattern. Used by `vttest`.
+        if (ef.n_intermediates == 1 and ef.intermediates[0] == '#' and ef.final == '8') {
+            for (self.buf()) |*ln| {
+                for (ln.cells) |*cell| cell.* = .{ .rune = 'E', .style_ref = 0, .flags = 0, .reserved = 0 };
+                ln.dirty = true;
+            }
+            self.row = 0;
+            self.col = 0;
+            self.pending_wrap = false;
             return;
         }
         switch (ef.final) {
