@@ -25,11 +25,43 @@ _sketerm_emit_cwd() {
     printf '\033]7;file://%s%s\033\\' "$hostname" "$cwd"
 }
 
+# ── OSC 133 prompt marks ────────────────────────────────────────
+# Tags each prompt so sketerm's Ctrl+Shift+Up/Down can jump between
+# them. FinalTerm spec:
+#   A = start of prompt          (PS1 prefix)
+#   B = end of prompt / input    (PS1 suffix)
+#   C = start of command output  (DEBUG trap, post-Enter)
+#   D = end of output            (PROMPT_COMMAND, before next prompt)
+#
+# Wraps PS1 with A / B markers if not already wrapped.
+
+if [[ -z "${SKETERM_OSC133_INSTALLED:-}" && "$PS1" != *$'\001\033]133;A\033\\\002'* ]]; then
+    PS1=$'\001\033]133;A\033\\\002'"$PS1"$'\001\033]133;B\033\\\002'
+    SKETERM_OSC133_INSTALLED=1
+fi
+
+_sketerm_emit_133c() {
+    # Skip when invoked from the prompt itself (PROMPT_COMMAND
+    # callbacks); only emit on real commands.
+    [[ "$BASH_COMMAND" == "$PROMPT_COMMAND" ]] && return
+    [[ "$BASH_COMMAND" == "_sketerm_emit_cwd" ]] && return
+    [[ "$BASH_COMMAND" == _sketerm_* ]] && return
+    printf '\033]133;C\033\\'
+}
+trap '_sketerm_emit_133c' DEBUG
+
+_sketerm_emit_133d() {
+    local rc=$?
+    printf '\033]133;D;%d\033\\' "$rc"
+    return $rc
+}
+
 # Append to PROMPT_COMMAND without clobbering existing entries.
+# Order matters: 133;D first (command finished), then cwd update.
 case "$PROMPT_COMMAND" in
     *_sketerm_emit_cwd*) ;;
-    "") PROMPT_COMMAND='_sketerm_emit_cwd' ;;
-    *)  PROMPT_COMMAND="${PROMPT_COMMAND%;};_sketerm_emit_cwd" ;;
+    "") PROMPT_COMMAND='_sketerm_emit_133d;_sketerm_emit_cwd' ;;
+    *)  PROMPT_COMMAND="_sketerm_emit_133d;${PROMPT_COMMAND%;};_sketerm_emit_cwd" ;;
 esac
 
 # ── OSC 52 copy helper ──────────────────────────────────────────
