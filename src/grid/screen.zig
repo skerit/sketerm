@@ -129,6 +129,13 @@ pub const Screen = struct {
     /// Set via OSC 4 ; n ; rgb:... ; reset via OSC 104.
     palette: [256][3]u8 = palette_default_256,
 
+    /// Prompt-mark scrollback rows reported by OSC 133 ; A. Ring
+    /// of the last 256 prompt rows for future "jump to previous
+    /// prompt" navigation.
+    prompt_marks: [256]i32 = [_]i32{0} ** 256,
+    prompt_marks_len: u16 = 0,
+    prompt_marks_head: u16 = 0,
+
     /// Custom tab stops. One bool per column, true = stop set.
     /// Default: every 8th column starting at 0.
     tab_stops: std.ArrayList(bool) = .{},
@@ -273,6 +280,15 @@ pub const Screen = struct {
     /// renderer when laying out preedit text.
     pub fn isWide(cp: u32) bool {
         return isWideCp(cp);
+    }
+
+    /// Record a prompt-mark at the current row (called from OSC 133).
+    fn recordPromptMark(self: *Screen) void {
+        const cap: u16 = self.prompt_marks.len;
+        const idx = self.prompt_marks_head;
+        self.prompt_marks[idx] = @intCast(self.row);
+        self.prompt_marks_head = (idx + 1) % cap;
+        if (self.prompt_marks_len < cap) self.prompt_marks_len += 1;
     }
 
     /// Clear the visible screen + the scrollback ring + send cursor
@@ -746,6 +762,12 @@ pub const Screen = struct {
                     }
                     self.dirty = true;
                 }
+            },
+            // OSC 133 — FinalTerm shell-integration prompt marks.
+            // A=prompt-start, B=prompt-end, C=command-start,
+            // D=command-end. We record A as a navigable prompt row.
+            133 => {
+                if (rest.len > 0 and rest[0] == 'A') self.recordPromptMark();
             },
             // OSC 104 — palette reset. With no args, reset all
             // entries; with `; n` reset only that index.
