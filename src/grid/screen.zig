@@ -1461,6 +1461,51 @@ test "resize preserves active rows" {
     try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(0, 2).rune);
 }
 
+test "SGR colon-separated parses (NF spec)" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    // Parser flushes on both ; and : the same way for our purposes.
+    var csi = Event.Csi{};
+    csi.params = .{ 38, 5, 196, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    csi.n_params = 3;
+    csi.final = 'm';
+    s.csi(csi);
+    const e = pool.get(s.cur_style);
+    try std.testing.expect(Color.equal(e.fg, .{ .palette = 196 }));
+}
+
+test "SGR 0 resets style" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    var csi = Event.Csi{};
+    csi.params[0] = 1; csi.n_params = 1; csi.final = 'm'; s.csi(csi);
+    try std.testing.expect(pool.get(s.cur_style).attrs.bold);
+    csi.params[0] = 0; csi.n_params = 1; csi.final = 'm'; s.csi(csi);
+    try std.testing.expect(!pool.get(s.cur_style).attrs.bold);
+}
+
+test "DECSTR clears mode flags" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 3);
+    defer s.deinit();
+    s.bracketed_paste = true;
+    s.mouse_mode = 1006;
+    s.cursor_visible = false;
+    var csi = Event.Csi{};
+    csi.intermediates[0] = '!';
+    csi.n_intermediates = 1;
+    csi.final = 'p';
+    s.csi(csi);
+    try std.testing.expect(!s.bracketed_paste);
+    try std.testing.expectEqual(@as(u16, 0), s.mouse_mode);
+    try std.testing.expect(s.cursor_visible);
+}
+
 test "ICH inserts blanks shifting right" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
