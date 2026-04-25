@@ -69,6 +69,10 @@ pub const Screen = struct {
     insert_mode: bool = false,
     /// DECSET 2004 — bracketed paste.
     bracketed_paste: bool = false,
+    /// LNM (mode 20) — when set, LF / VT / FF also perform CR (move
+    /// cursor to column 0 in addition to advancing a row). Mostly a
+    /// historical mode but a few apps set it explicitly.
+    line_feed_mode: bool = false,
     /// DECSET 1004 — focus reporting.
     focus_reports: bool = false,
     /// DECCKM (mode 1) — application cursor keys (arrows emit
@@ -1709,7 +1713,11 @@ pub const Screen = struct {
             },
             0x08 => self.backspace(),
             0x09 => self.tab(),
-            0x0A, 0x0B, 0x0C => self.lineFeed(),
+            0x0A, 0x0B, 0x0C => {
+                self.lineFeed();
+                // LNM: LF/VT/FF also implicitly carry a CR.
+                if (self.line_feed_mode) self.carriageReturn();
+            },
             0x0D => self.carriageReturn(),
             0x0E => self.active_charset = .g1, // SO — locking shift to G1
             0x0F => self.active_charset = .g0, // SI — locking shift to G0
@@ -1997,6 +2005,7 @@ pub const Screen = struct {
         while (i < params.n_params) : (i += 1) {
             switch (params.params[i]) {
                 4 => self.insert_mode = set, // IRM
+                20 => self.line_feed_mode = set, // LNM
                 else => {},
             }
         }
@@ -2186,6 +2195,7 @@ pub const Screen = struct {
         self.autowrap = true;
         self.origin_mode = false;
         self.insert_mode = false;
+        self.line_feed_mode = false;
         self.cursor_visible = true;
         self.cursor_shape = .block_blink;
         self.bracketed_paste = false;
@@ -3360,6 +3370,32 @@ test "clearAndScrollback wipes screen + ring + cursor home" {
     try std.testing.expectEqual(@as(u16, 0), s.row);
     try std.testing.expectEqual(@as(u16, 0), s.col);
     try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 0).rune);
+}
+
+test "LNM (CSI 20 h): LF carries an implicit CR" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.printCp('a');
+    s.printCp('b');
+    // Default mode (LNM off): bare LF moves down but col stays.
+    s.execute(0x0A);
+    try std.testing.expectEqual(@as(u16, 1), s.row);
+    try std.testing.expectEqual(@as(u16, 2), s.col);
+
+    // Reset, enable LNM (CSI 20 h).
+    s.fullReset();
+    s.printCp('a');
+    s.printCp('b');
+    var csi = Event.Csi{};
+    csi.params[0] = 20;
+    csi.n_params = 1;
+    csi.final = 'h';
+    s.csi(csi);
+    s.execute(0x0A);
+    try std.testing.expectEqual(@as(u16, 1), s.row);
+    try std.testing.expectEqual(@as(u16, 0), s.col); // CR happened too
 }
 
 test "IRM shifts cells right" {
