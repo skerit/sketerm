@@ -12,10 +12,13 @@ comptime {
     _ = @import("parser/event.zig");
     _ = @import("parser/vt.zig");
     _ = @import("parser/conformance_test.zig");
+    _ = @import("parser/screen_conformance_test.zig");
+    _ = @import("parser/wezterm_conformance_test.zig");
     _ = @import("grid/cell.zig");
     _ = @import("grid/style_pool.zig");
     _ = @import("grid/screen.zig");
     _ = @import("grid/selection.zig");
+    _ = @import("grid/selection_conformance_test.zig");
     _ = @import("grid/image_store.zig");
     _ = @import("layout.zig");
     _ = @import("layout_simple.zig");
