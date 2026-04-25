@@ -43,6 +43,12 @@ pub const Parser = struct {
     dcs_proto: Event.Dcs = .{},
     allocator: std.mem.Allocator,
 
+    /// Hard cap on osc_buf growth; refusing further bytes once
+    /// exceeded. 16 MiB is comfortably above the largest kitty
+    /// graphics transmission a sane app would ever emit, and below
+    /// "OOM the parser" territory.
+    pub const osc_max: usize = 16 * 1024 * 1024;
+
     pub fn init(allocator: std.mem.Allocator) Parser {
         return .{ .allocator = allocator };
     }
@@ -299,7 +305,7 @@ pub const Parser = struct {
                     self.dispatchDcs(emit, ctx);
                     self.transitionTo(.escape);
                 } else {
-                    self.osc_buf.append(self.allocator, b) catch {};
+                    if (self.osc_buf.items.len < osc_max) self.osc_buf.append(self.allocator, b) catch {};
                 }
             },
             .dcs_ignore => {
@@ -318,7 +324,7 @@ pub const Parser = struct {
                 self.dispatchOsc(emit, ctx);
                 self.transitionTo(.escape);
             },
-            else => self.osc_buf.append(self.allocator, b) catch {},
+            else => if (self.osc_buf.items.len < osc_max) self.osc_buf.append(self.allocator, b) catch {},
         }
     }
 
@@ -329,7 +335,7 @@ pub const Parser = struct {
                 self.dispatchApc(emit, ctx);
                 self.transitionTo(.escape);
             },
-            else => self.osc_buf.append(self.allocator, b) catch {},
+            else => if (self.osc_buf.items.len < osc_max) self.osc_buf.append(self.allocator, b) catch {},
         }
     }
 
