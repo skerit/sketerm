@@ -569,18 +569,17 @@ pub const Screen = struct {
             },
             4 => self.handleOsc4(rest),
             8 => self.handleOsc8(rest),
-            10, 11 => {
-                // OSC 10/11 fg/bg color query: `?` returns the
-                // current default. Set is `OSC 10 ; rgb:.../.../...`
-                // (we don't process set yet — apps rarely ask).
+            10, 11, 12 => {
+                // OSC 10/11/12 fg/bg/cursor color query: `?` returns
+                // the current default. Set form not yet implemented.
                 if (rest.len == 1 and rest[0] == '?') {
                     var resp_buf: [64]u8 = undefined;
-                    // Match the renderer's hard-coded defaults
-                    // (default_fg/default_bg in grid_pass).
-                    const c_str: []const u8 = if (num == 10)
-                        "10;rgb:eaea/eaea/eaea"
-                    else
-                        "11;rgb:1a1a/1a1a/1a1a";
+                    const c_str: []const u8 = switch (num) {
+                        10 => "10;rgb:eaea/eaea/eaea",
+                        11 => "11;rgb:1a1a/1a1a/1a1a",
+                        12 => "12;rgb:eaea/eaea/eaea", // cursor uses fg
+                        else => unreachable,
+                    };
                     const s = std.fmt.bufPrint(&resp_buf, "\x1b]{s}\x1b\\", .{c_str}) catch return;
                     self.respond(s);
                 }
