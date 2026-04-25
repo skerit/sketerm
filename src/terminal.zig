@@ -16,7 +16,11 @@ const Screen = @import("grid/screen.zig").Screen;
 const Pool = @import("grid/style_pool.zig").Pool;
 const percent = @import("util/percent.zig");
 
-pub const RING_CAP: usize = 4096; // power-of-2; one event per slot
+/// SPSC ring capacity — power of 2; one Event per slot. Sized to
+/// absorb roughly 100ms of worker throughput at 16384 × 96B = 1.5MB.
+/// When the main thread is briefly stalled (input handling, GTK
+/// frame work), the worker can keep parsing instead of spin-waiting.
+pub const RING_CAP: usize = 16384;
 
 pub const EventRing = ring_mod.Ring(Event, RING_CAP);
 
