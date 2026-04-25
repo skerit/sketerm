@@ -243,6 +243,10 @@ pub const CellPass = struct {
     /// from a different scrollback / active line — full rebuild
     /// needed once on the change, not on every frame while scrolled.
     last_view_off: u32 = std.math.maxInt(u32),
+    /// Last `screen.scrollbackCount()` snapshot. When it grows AND
+    /// we're scrolled-back, the displayed scrollback indices shift —
+    /// content at row R now comes from a different cached Line.
+    last_sb_count: u32 = std.math.maxInt(u32),
 
     allocator: std.mem.Allocator,
 
@@ -377,12 +381,16 @@ pub const CellPass = struct {
 
         // Scroll-position change: every row sources from a different
         // line. Mark all dirty exactly once on the change instead of
-        // every frame while scrolled-back.
+        // every frame while scrolled-back. Also invalidate when
+        // scrollback grew while we're scrolled-back (the displayed
+        // scrollback indices shift then too).
         const view_changed = view_off != self.last_view_off;
-        if (view_changed) {
+        const sb_drifted = view_off > 0 and sb_count != self.last_sb_count;
+        if (view_changed or sb_drifted) {
             for (self.row_needs_upload.items) |*r| r.* = true;
             self.last_view_off = view_off;
         }
+        self.last_sb_count = sb_count;
 
         // Build dirty rows.
         var row: u16 = 0;
