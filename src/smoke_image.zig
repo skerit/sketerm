@@ -1,0 +1,183 @@
+//! Headless image-render smoke test.
+//!
+//! Initializes a Mesa surfaceless EGL context, creates a 256×64 FBO,
+//! drives ImagePass + ImageStore against a known 32×32 RGBA image,
+//! reads pixels back, and asserts the upper-left of the framebuffer
+//! contains the input red.
+//!
+//! Run: `zig build smoke-image`. Exits 0 on pass, non-zero on fail.
+//! No display server required.
+
+const std = @import("std");
+const c = @cImport({
+    @cInclude("epoxy/egl.h");
+    @cInclude("epoxy/gl.h");
+});
+const ImagePass = @import("render/image_pass.zig").ImagePass;
+const ImageStore = @import("grid/image_store.zig").Store;
+
+const W: c_int = 256;
+const H: c_int = 64;
+
+pub fn main() !u8 {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // 1. EGL surfaceless context.
+    const display = blk: {
+        // Mesa-specific platform — no DISPLAY needed.
+        const eglGetPlatformDisplayEXT_addr = c.eglGetProcAddress("eglGetPlatformDisplayEXT");
+        if (eglGetPlatformDisplayEXT_addr) |p| {
+            const fn_ptr: *const fn (c_uint, ?*anyopaque, ?[*]const c.EGLint) callconv(.c) c.EGLDisplay = @ptrCast(@alignCast(p));
+            const PLATFORM_SURFACELESS_MESA: c_uint = 0x31DD;
+            const d = fn_ptr(PLATFORM_SURFACELESS_MESA, null, null);
+            if (d != null and d != c.EGL_NO_DISPLAY) break :blk d;
+        }
+        break :blk c.eglGetDisplay(c.EGL_DEFAULT_DISPLAY);
+    };
+    if (display == c.EGL_NO_DISPLAY) {
+        std.debug.print("smoke-image: eglGetDisplay failed\n", .{});
+        return 1;
+    }
+    var major: c.EGLint = 0;
+    var minor: c.EGLint = 0;
+    if (c.eglInitialize(display, &major, &minor) == c.EGL_FALSE) {
+        std.debug.print("smoke-image: eglInitialize failed\n", .{});
+        return 1;
+    }
+    std.debug.print("smoke-image: EGL {d}.{d} on {s}\n", .{ major, minor, c.eglQueryString(display, c.EGL_VENDOR) });
+
+    if (c.eglBindAPI(c.EGL_OPENGL_ES_API) == c.EGL_FALSE) {
+        std.debug.print("smoke-image: eglBindAPI failed\n", .{});
+        return 1;
+    }
+
+    const cfg_attribs = [_]c.EGLint{
+        c.EGL_RED_SIZE,           8,
+        c.EGL_GREEN_SIZE,         8,
+        c.EGL_BLUE_SIZE,          8,
+        c.EGL_ALPHA_SIZE,         8,
+        c.EGL_RENDERABLE_TYPE,    c.EGL_OPENGL_ES3_BIT,
+        c.EGL_SURFACE_TYPE,       c.EGL_PBUFFER_BIT,
+        c.EGL_NONE,
+    };
+    var cfg: c.EGLConfig = null;
+    var n_cfg: c.EGLint = 0;
+    if (c.eglChooseConfig(display, &cfg_attribs, &cfg, 1, &n_cfg) == c.EGL_FALSE or n_cfg < 1) {
+        std.debug.print("smoke-image: eglChooseConfig failed\n", .{});
+        return 1;
+    }
+
+    const ctx_attribs = [_]c.EGLint{
+        c.EGL_CONTEXT_MAJOR_VERSION, 3,
+        c.EGL_CONTEXT_MINOR_VERSION, 0,
+        c.EGL_NONE,
+    };
+    const ctx = c.eglCreateContext(display, cfg, c.EGL_NO_CONTEXT, &ctx_attribs);
+    if (ctx == c.EGL_NO_CONTEXT) {
+        std.debug.print("smoke-image: eglCreateContext failed (err 0x{x})\n", .{c.eglGetError()});
+        return 1;
+    }
+    if (c.eglMakeCurrent(display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, ctx) == c.EGL_FALSE) {
+        std.debug.print("smoke-image: eglMakeCurrent failed (err 0x{x})\n", .{c.eglGetError()});
+        return 1;
+    }
+
+    std.debug.print("smoke-image: GL_VERSION={s}\n", .{c.glGetString(c.GL_VERSION)});
+
+    // 2. Offscreen framebuffer.
+    var fbo: c_uint = 0;
+    var rbo: c_uint = 0;
+    c.glGenFramebuffers(1, &fbo);
+    c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+    c.glGenRenderbuffers(1, &rbo);
+    c.glBindRenderbuffer(c.GL_RENDERBUFFER, rbo);
+    c.glRenderbufferStorage(c.GL_RENDERBUFFER, c.GL_RGBA8, W, H);
+    c.glFramebufferRenderbuffer(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_RENDERBUFFER, rbo);
+    if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) {
+        std.debug.print("smoke-image: framebuffer incomplete\n", .{});
+        return 1;
+    }
+    c.glViewport(0, 0, W, H);
+    c.glClearColor(0, 0, 0, 1);
+    c.glClear(c.GL_COLOR_BUFFER_BIT);
+
+    // 3. ImagePass + ImageStore.
+    var pass = ImagePass.init();
+    pass.realize() catch |e| {
+        std.debug.print("smoke-image: image_pass realize: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    pass.debug = true;
+
+    var store = ImageStore.init(allocator);
+    defer store.deinit();
+    store.cell_w = 8;
+    store.cell_h = 16;
+    store.debug = true;
+
+    // 4. 32×32 solid-red RGBA image at cell (0,0).
+    const img_w: u32 = 32;
+    const img_h: u32 = 32;
+    const npix: usize = img_w * img_h;
+    const rgba = try allocator.alloc(u8, npix * 4);
+    defer allocator.free(rgba);
+    for (0..npix) |i| {
+        rgba[i * 4 + 0] = 0xFF;
+        rgba[i * 4 + 1] = 0x00;
+        rgba[i * 4 + 2] = 0x00;
+        rgba[i * 4 + 3] = 0xFF;
+    }
+
+    try store.addWithPlacement(rgba, img_w, img_h, 0, 0, 1, 0, 0);
+    store.flushUploads();
+    pass.draw(&store, W, H);
+    c.glFinish();
+
+    // 5. Read back pixels.
+    const fb_bytes: usize = @intCast(W * H * 4);
+    const fb = try allocator.alloc(u8, fb_bytes);
+    defer allocator.free(fb);
+    c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+
+    // 6. Assert upper-left 32×32 region has red. Note: glReadPixels
+    // returns bottom-left origin, so the image we drew at top-left of
+    // the FBO is at the TOP rows of the readback (row index H-1 down).
+    // Our shader does Y-flip, so the image-top is at the framebuffer's
+    // top, which in glReadPixels output is at the END of the buffer.
+    var red_in_top: usize = 0;
+    var red_in_bottom: usize = 0;
+    var sample_x: c_int = 4;
+    while (sample_x < 28) : (sample_x += 4) {
+        var sample_y: c_int = 4;
+        while (sample_y < 28) : (sample_y += 4) {
+            const top_row: c_int = H - 1 - sample_y;
+            const top_idx: usize = @intCast((top_row * W + sample_x) * 4);
+            if (fb[top_idx] > 0xC0 and fb[top_idx + 1] < 0x40 and fb[top_idx + 2] < 0x40)
+                red_in_top += 1;
+            const bot_idx: usize = @intCast((sample_y * W + sample_x) * 4);
+            if (fb[bot_idx] > 0xC0 and fb[bot_idx + 1] < 0x40 and fb[bot_idx + 2] < 0x40)
+                red_in_bottom += 1;
+        }
+    }
+
+    std.debug.print(
+        "smoke-image: red samples top={d} bottom={d}\n",
+        .{ red_in_top, red_in_bottom },
+    );
+
+    if (red_in_top + red_in_bottom == 0) {
+        std.debug.print("smoke-image: FAIL — no red pixels found anywhere in the framebuffer\n", .{});
+        // Dump corners to see what we actually got.
+        const tl_idx: usize = 0;
+        const br_idx: usize = @intCast(((H - 1) * W + (W - 1)) * 4);
+        std.debug.print(
+            "  [0,0]={d},{d},{d}  [W-1,H-1]={d},{d},{d}\n",
+            .{ fb[tl_idx], fb[tl_idx + 1], fb[tl_idx + 2], fb[br_idx], fb[br_idx + 1], fb[br_idx + 2] },
+        );
+        return 2;
+    }
+    std.debug.print("smoke-image: PASS\n", .{});
+    return 0;
+}

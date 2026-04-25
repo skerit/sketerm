@@ -122,6 +122,33 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench-parser", "Parser microbenchmark");
     bench_step.dependOn(&bench_run.step);
 
+    // Headless image-render smoke — `zig build smoke-image`.
+    const smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_image.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const smoke = b.addExecutable(.{
+        .name = "sketerm-smoke-image",
+        .root_module = smoke_mod,
+        .use_lld = true,
+    });
+    smoke.linkSystemLibrary("EGL");
+    // image_pass imports c.zig which @cIncludes gtk/gtk.h etc, so we
+    // need every system header path. Reuse the same set as the main
+    // exe.
+    for (sys_libs) |lib| smoke.linkSystemLibrary(lib);
+    smoke.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    smoke.addIncludePath(b.path("vendor"));
+    b.installArtifact(smoke);
+    const smoke_run = b.addRunArtifact(smoke);
+    const smoke_step = b.step("smoke-image", "Headless GL image render check");
+    smoke_step.dependOn(&smoke_run.step);
+
     const tests_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
