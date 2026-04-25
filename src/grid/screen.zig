@@ -683,6 +683,10 @@ pub const Screen = struct {
             switch (params.final) {
                 'h' => self.modeSet(params, true),
                 'l' => self.modeSet(params, false),
+                // DECSED/DECSEL — selective erase. We don't model the
+                // protection bit, so treat as plain ED/EL.
+                'J' => self.eraseDisplay(params.paramOrDefault(0, 0)),
+                'K' => self.eraseLine(params.paramOrDefault(0, 0)),
                 else => {},
             }
             return;
@@ -709,6 +713,12 @@ pub const Screen = struct {
                 'p' => self.decstr(),
                 else => {},
             }
+            return;
+        }
+        if (params.n_intermediates == 1 and params.intermediates[0] == '"') {
+            // DECSCA (`CSI Ps " q`) — selective character protection.
+            // We don't model protection; accept silently to keep the
+            // parser quiet for terminfo entries that send it.
             return;
         }
 
