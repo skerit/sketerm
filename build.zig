@@ -150,6 +150,34 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("smoke-image", "Headless GL image render check");
     smoke_step.dependOn(&smoke_run.step);
 
+    // Headless cell-render smoke — `zig build smoke-cell`. Drives a
+    // small Screen → Atlas → CellPass → GridPass through an EGL
+    // surfaceless context, reads pixels back, asserts text + focus
+    // border were rendered. Catches regressions in the instanced
+    // cell pipeline + multi-page atlas.
+    const smoke_cell_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_cell.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const smoke_cell = b.addExecutable(.{
+        .name = "sketerm-smoke-cell",
+        .root_module = smoke_cell_mod,
+        .use_lld = true,
+    });
+    smoke_cell.linkSystemLibrary("EGL");
+    for (sys_libs) |lib| smoke_cell.linkSystemLibrary(lib);
+    smoke_cell.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    smoke_cell.addIncludePath(b.path("vendor"));
+    b.installArtifact(smoke_cell);
+    const smoke_cell_run = b.addRunArtifact(smoke_cell);
+    const smoke_cell_step = b.step("smoke-cell", "Headless GL cell-pipeline render check");
+    smoke_cell_step.dependOn(&smoke_cell_run.step);
+
     const tests_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
