@@ -214,6 +214,31 @@ fn cursorKey(buf: []u8, ck: u8, final: u8, shift: bool, alt: bool, ctrl: bool) u
     return out.len;
 }
 
+/// "Tilde" key emit (PgUp/PgDn/Ins/Del, F5+). Plain: ESC [ N ~.
+/// Modified: ESC [ N ; M ~.
+fn tildeKey(buf: []u8, n: u8, shift: bool, alt: bool, ctrl: bool) usize {
+    const m = modCode(shift, alt, ctrl);
+    if (m == 1) {
+        const out = std.fmt.bufPrint(buf, "\x1b[{d}~", .{n}) catch return 0;
+        return out.len;
+    }
+    const out = std.fmt.bufPrint(buf, "\x1b[{d};{d}~", .{ n, m }) catch return 0;
+    return out.len;
+}
+
+/// SS3 key emit (F1-F4). Plain: ESC O X. Modified: ESC [ 1 ; M X.
+fn ssoKey(buf: []u8, final: u8, shift: bool, alt: bool, ctrl: bool) usize {
+    const m = modCode(shift, alt, ctrl);
+    if (m == 1) {
+        buf[0] = 0x1B;
+        buf[1] = 'O';
+        buf[2] = final;
+        return 3;
+    }
+    const out = std.fmt.bufPrint(buf, "\x1b[1;{d}{c}", .{ m, final }) catch return 0;
+    return out.len;
+}
+
 fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool) usize {
     const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
     const alt = (mods & c.GDK_ALT_MASK) != 0;
@@ -238,22 +263,22 @@ fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool) 
         c.GDK_KEY_Left => return cursorKey(buf, ck, 'D', shift, alt, ctrl),
         c.GDK_KEY_Home => return cursorKey(buf, ck, 'H', shift, alt, ctrl),
         c.GDK_KEY_End => return cursorKey(buf, ck, 'F', shift, alt, ctrl),
-        c.GDK_KEY_Page_Up => { @memcpy(buf[0..4], "\x1b[5~"); return 4; },
-        c.GDK_KEY_Page_Down => { @memcpy(buf[0..4], "\x1b[6~"); return 4; },
-        c.GDK_KEY_Insert => { @memcpy(buf[0..4], "\x1b[2~"); return 4; },
-        c.GDK_KEY_Delete => { @memcpy(buf[0..4], "\x1b[3~"); return 4; },
-        c.GDK_KEY_F1 => { @memcpy(buf[0..3], "\x1bOP"); return 3; },
-        c.GDK_KEY_F2 => { @memcpy(buf[0..3], "\x1bOQ"); return 3; },
-        c.GDK_KEY_F3 => { @memcpy(buf[0..3], "\x1bOR"); return 3; },
-        c.GDK_KEY_F4 => { @memcpy(buf[0..3], "\x1bOS"); return 3; },
-        c.GDK_KEY_F5 => { @memcpy(buf[0..5], "\x1b[15~"); return 5; },
-        c.GDK_KEY_F6 => { @memcpy(buf[0..5], "\x1b[17~"); return 5; },
-        c.GDK_KEY_F7 => { @memcpy(buf[0..5], "\x1b[18~"); return 5; },
-        c.GDK_KEY_F8 => { @memcpy(buf[0..5], "\x1b[19~"); return 5; },
-        c.GDK_KEY_F9 => { @memcpy(buf[0..5], "\x1b[20~"); return 5; },
-        c.GDK_KEY_F10 => { @memcpy(buf[0..5], "\x1b[21~"); return 5; },
-        c.GDK_KEY_F11 => { @memcpy(buf[0..5], "\x1b[23~"); return 5; },
-        c.GDK_KEY_F12 => { @memcpy(buf[0..5], "\x1b[24~"); return 5; },
+        c.GDK_KEY_Page_Up => return tildeKey(buf, 5, shift, alt, ctrl),
+        c.GDK_KEY_Page_Down => return tildeKey(buf, 6, shift, alt, ctrl),
+        c.GDK_KEY_Insert => return tildeKey(buf, 2, shift, alt, ctrl),
+        c.GDK_KEY_Delete => return tildeKey(buf, 3, shift, alt, ctrl),
+        c.GDK_KEY_F1 => return ssoKey(buf, 'P', shift, alt, ctrl),
+        c.GDK_KEY_F2 => return ssoKey(buf, 'Q', shift, alt, ctrl),
+        c.GDK_KEY_F3 => return ssoKey(buf, 'R', shift, alt, ctrl),
+        c.GDK_KEY_F4 => return ssoKey(buf, 'S', shift, alt, ctrl),
+        c.GDK_KEY_F5 => return tildeKey(buf, 15, shift, alt, ctrl),
+        c.GDK_KEY_F6 => return tildeKey(buf, 17, shift, alt, ctrl),
+        c.GDK_KEY_F7 => return tildeKey(buf, 18, shift, alt, ctrl),
+        c.GDK_KEY_F8 => return tildeKey(buf, 19, shift, alt, ctrl),
+        c.GDK_KEY_F9 => return tildeKey(buf, 20, shift, alt, ctrl),
+        c.GDK_KEY_F10 => return tildeKey(buf, 21, shift, alt, ctrl),
+        c.GDK_KEY_F11 => return tildeKey(buf, 23, shift, alt, ctrl),
+        c.GDK_KEY_F12 => return tildeKey(buf, 24, shift, alt, ctrl),
         else => {},
     }
 

@@ -1009,6 +1009,7 @@ pub const Screen = struct {
                 if (self.col < self.tab_stops.items.len) self.tab_stops.items[self.col] = true;
             },
             'M' => self.reverseLineFeed(),
+            'Z' => self.respondDa(), // DECID — identify, same payload as DA1
             'c' => self.fullReset(),
             '=' => {}, // DECPAM — application keypad on (numpad encoding shift)
             '>' => {}, // DECPNM — application keypad off
