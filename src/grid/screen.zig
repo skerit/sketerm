@@ -639,6 +639,20 @@ pub const Screen = struct {
                     self.respond(s);
                 }
             },
+            1337 => {
+                // iTerm2 inline image: OSC 1337 ; File=...:<base64> ST
+                const iterm = @import("../parser/iterm_image.zig");
+                const decoded = iterm.decodePayload(self.allocator, rest) catch return;
+                defer self.allocator.free(decoded.rgba);
+                if (decoded.format != .png or decoded.rgba.len == 0) return;
+                if (self.sink.on_image) |f| f(self.sink.ctx, .{
+                    .width = decoded.width,
+                    .height = decoded.height,
+                    .rgba = decoded.rgba,
+                    .row = self.row,
+                    .col = self.col,
+                });
+            },
             777 => {
                 // GNOME notify: `OSC 777 ; notify ; <title> ; <body>`.
                 const semi2 = std.mem.indexOfScalar(u8, rest, ';') orelse return;
