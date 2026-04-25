@@ -6,8 +6,8 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~144 commits, ~8.3 kLOC of Zig + 8 kLOC vendored stb_image
-- 87 unit tests pass
+- ~157 commits, ~8.5 kLOC of Zig + 8 kLOC vendored stb_image
+- 93 unit tests pass
 
 ## What got built
 
@@ -138,6 +138,13 @@ Things added between commits 67 → 115:
 - SKETERM_FONT / SKETERM_SCROLLBACK env vars override
   defaults at startup.
 - --debug-events CLI flag dumps parser events to stderr.
+- BEL marks the tab needs-attention when the bell hits a
+  non-focused tab; selecting clears it.
+- OSC 10 / 11 / 12 set forms wired (default fg/bg/cursor
+  colors are now runtime-mutable from apps).
+- OSC 4 / 104 set + reset wired against a runtime
+  Screen.palette; renderer pulls the palette each frame.
+- OSC 110 / 111 / 112 reset to defaults.
 
 ## What's left
 
@@ -151,12 +158,11 @@ Remaining post-checkpoint TODO list:
    ordering wrt thread join).
 3. NVIDIA proprietary GL — falls back to llvmpipe on this laptop.
 4. OSC 8 in selection-extract — preserves text but not the URI.
-5. OSC 4 / 10 / 11 / 12 set forms — query replies are wired, but
-   actually mutating the runtime palette / fg / bg / cursor color
-   needs the renderer to consume Screen-side state instead of its
-   compile-time defaults.
-6. modifyOtherKeys (CSI > 4 ; Pp m) — for emacs/vim users who want
+5. modifyOtherKeys (CSI > 4 ; Pp m) — for emacs/vim users who want
    distinct codes for Ctrl-Shift-A vs Ctrl-A.
+6. OSC 133 (FinalTerm prompt marks) — would let us add
+   "jump to previous prompt" navigation.
+7. Kitty progressive enhancement (CSI > 1 u) keyboard.
 
 ## Notable design decisions made during the build
 
