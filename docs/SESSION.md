@@ -508,3 +508,41 @@ Work delivered, in order:
   fine on hardware GPU.
 - M17.1 (atlas multi-page LRU), M17.3 (kitty animation frames),
   M17.6 (Save Layout As dialog) still on the table.
+
+## More autonomous polish
+
+After M11–M17 the autonomous run kept iterating on smaller polish:
+
+- **M16.2 parser print_run batching** — Ground-state printable bytes
+  accumulate into a 64-byte fixed buffer and flush as a single
+  Event.print_run when a non-printable arrives, the buffer fills, or
+  advance() returns. Cuts SPSC ring traffic up to 64× for "shell
+  prints long line" workloads. Screen.apply iterates internally.
+- **M17.6 Save Layout As…** via GtkFileDialog. Ctrl+Shift+Alt+S
+  opens a native save dialog defaulting to `layout.json`.
+- **smoke-image extension** — adds a second image at cell (8,0) with
+  `cells_wide=4, cells_high=2` to verify multi-image rendering AND
+  cell-grid scaling in the headless path. Both red + green sampling
+  fail the build if either regresses.
+- **fullReset cleanup** — RIS / Reset Terminal now also clears
+  reverse_screen, kitty_kbd_flags + stack depth, and bounces VT52
+  back to ANSI via on_decanm. User stuck in any mode can hit Reset
+  Terminal and recover.
+- **Reflow line-id stamping** — post-reflow rows now get fresh
+  `nextLineId()` instead of 0, so prompt_marks don't collide with
+  unrelated post-reflow content.
+
+## Final state
+
+- 305 unit + conformance tests pass
+- `zig build` clean
+- `zig build smoke-image` PASS (multi-image + cell scaling)
+- `zig build spike-shell` runs through a real bash → parser → screen
+  pipeline cleanly
+- Plan-v2 milestones delivered: M11.0 image fix, M11–M15 fully, M13
+  bidi (basic), M16.2 perf, M17.2 / .4 / .5 / .6
+- Deferred: M16.1 (per-row dirty), M16.3 (GPU instancing), M17.1
+  (atlas multi-page), M17.3 (kitty animation frames). Each documented
+  in plan-v2.md with effort estimate and rationale for deferral.
+
+Cron `7,37 * * * *` set to keep iterating if more work surfaces.
