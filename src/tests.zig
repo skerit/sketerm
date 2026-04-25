@@ -35,6 +35,7 @@ comptime {
     _ = @import("parser/graphics_conformance_test.zig");
     _ = @import("config.zig");
     _ = @import("grid/kitty_images.zig");
+    _ = @import("grid/image_pipeline_test.zig");
 }
 
 test {

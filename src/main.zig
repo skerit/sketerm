@@ -14,6 +14,7 @@ const App = struct {
     layout_path: ?[]const u8 = null,
     no_save: bool = false,
     debug_events: bool = false,
+    debug_images: bool = false,
 };
 
 const HELP_TEXT =
@@ -26,6 +27,7 @@ const HELP_TEXT =
     \\  --layout <path>       Load tabs from a layout file (.json or .layout)
     \\  --no-save             Don't write last.json on exit
     \\  --debug-events        Print parser events to stderr
+    \\  --debug-images        Print image upload + draw diagnostics to stderr
     \\  --help                Show this message
     \\  --version             Show version
     \\
@@ -97,6 +99,8 @@ pub fn main() u8 {
             g_app.no_save = true;
         } else if (std.mem.eql(u8, a, "--debug-events")) {
             g_app.debug_events = true;
+        } else if (std.mem.eql(u8, a, "--debug-images")) {
+            g_app.debug_images = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print("{s}", .{HELP_TEXT});
             return 0;
@@ -158,6 +162,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         return;
     };
     window.debug_events = g_app.debug_events;
+    window.debug_images = g_app.debug_images;
     g_app.window = window;
 
     var loaded = false;

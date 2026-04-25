@@ -32,6 +32,9 @@ pub const Store = struct {
     cell_w: f32 = 8.0,
     cell_h: f32 = 16.0,
     allocator: std.mem.Allocator,
+    /// When true, flushUploads prints upload outcomes to stderr.
+    /// Toggled by `--debug-images` CLI flag.
+    debug: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
@@ -211,6 +214,13 @@ pub const Store = struct {
             c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
             c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
             c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+            const err = c.glGetError();
+            if (self.debug) {
+                std.debug.print(
+                    "[image] upload id={d} placement={d} {d}x{d} cell=({d},{d}) tex={d} glErr=0x{x}\n",
+                    .{ img.image_id, img.placement_id, img.width, img.height, img.cell_row, img.cell_col, img.gl_tex, err },
+                );
+            }
             self.allocator.free(pending);
             img.pending = null;
         }

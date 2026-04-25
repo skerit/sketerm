@@ -21,21 +21,102 @@ forward-looking roadmap.
 
 ## What's left (this plan)
 
-Seven milestones, ordered by user value × effort. Estimates are
-"focused person-days" and assume no surprises — multiply by 1.5 for
-realistic calendar time.
+Eight milestones. **M11.0 is highest priority — known regression: images
+do not actually render in real-world use.** Receive pipeline tests
+prove the parser path works (7 integration tests in
+`src/grid/image_pipeline_test.zig`), so the bug is GL-side.
 
-| #   | Milestone                            | Effort   | User-visible?                        |
-| --- | ------------------------------------ | -------- | ------------------------------------ |
-| M11 | Legacy DEC modes (SCNM/COLM/VT52)    | ~3 d     | Niche; spec compliance.              |
-| M12 | Per-line scaling (DECDHL/DECDWL)     | ~4 d     | Visible if any DEC app uses it.      |
-| M13 | Bidi + complex-script shaping        | ~7-10 d  | **Yes** — Arabic/Hebrew/Indic users. |
-| M14 | OSC 133 prompt navigation            | ~2-3 d   | **Yes** — modern shell users.        |
-| M15 | Kitty progressive-enhancement kbd    | ~4-5 d   | **Yes** — neovim/emacs power users.  |
-| M16 | Render + parser perf                 | ~7 d     | Only on slow GPUs / SW renderers.    |
-| M17 | Edge polish                          | ~6 d     | Long-session reliability.            |
+| #     | Milestone                            | Effort   | User-visible?                                |
+| ----- | ------------------------------------ | -------- | -------------------------------------------- |
+| M11.0 | **Image render regression — fix #1** | ~1-2 d   | **Yes** — currently broken on screen.        |
+| M11   | Legacy DEC modes (SCNM/COLM/VT52)    | ~3 d     | Niche; spec compliance.                      |
+| M12   | Per-line scaling (DECDHL/DECDWL)     | ~4 d     | Visible if any DEC app uses it.              |
+| M13   | Bidi + complex-script shaping        | ~7-10 d  | **Yes** — Arabic/Hebrew/Indic users.         |
+| M14   | OSC 133 prompt navigation            | ~2-3 d   | **Yes** — modern shell users.                |
+| M15   | Kitty progressive-enhancement kbd    | ~4-5 d   | **Yes** — neovim/emacs power users.          |
+| M16   | Render + parser perf                 | ~7 d     | Only on slow GPUs / SW renderers.            |
+| M17   | Edge polish                          | ~6 d     | Long-session reliability.                    |
 
-Total: ~33–40 focused days.
+Total: ~34–41 focused days.
+
+### M11.0 — Fix image rendering regression
+
+**Status**: Receive pipeline confirmed working. Kitty graphics PNG +
+multi-chunk + a=t/a=p / sixel / iTerm2 1337 all parse, decode to RGBA,
+and fire `Screen.Sink.on_image` correctly (proven by integration
+tests). The break is somewhere between `Pane.onImageEvent` and what
+the user sees on screen.
+
+**Diagnostic instrumentation shipped** (`--debug-images` flag):
+- `image_store.flushUploads` prints upload outcomes + `glGetError`.
+- `image_pass.draw` prints viewport, image count, per-image position
+  + size + tex id + glError.
+
+**Workflow to diagnose**:
+```
+./zig-out/bin/sketerm --debug-images 2>&1 | tee /tmp/img.log
+# Inside: send a kitty graphics escape (e.g. via `chafa some.png`).
+# Quit, paste /tmp/img.log.
+```
+The log tells us exactly where the path is breaking:
+1. **No `[image] upload` line** → sink wiring is broken (ingest never
+   fired into Pane).
+2. **Upload line with `glErr=0x501` (invalid value)** → texture upload
+   failed; likely format / pixel data mismatch.
+3. **Upload `tex=N` with `[image] draw N=0`** → image got dropped
+   between flush and draw (atlas re-realize wiped it without keeping
+   pending data, despite the M9 fix).
+4. **Draw fires with valid tex, glErr=0** but nothing on screen →
+   coordinate / blending / Y-flip issue. Most likely culprits:
+   - `cell_w/cell_h` set in widget pixels instead of physical (we
+     fixed this once; it may have regressed).
+   - Image rendered before `glClear` is finished (race in command
+     ordering).
+   - Pad offset mismatch puts image outside scissored region.
+5. **Draw fires correctly but image upside down / wrong color** →
+   PNG decode flipped or premultiplied alpha mismatch.
+
+**Likely root cause hypotheses (highest probability first)**:
+1. **`cell_w`/`cell_h` mismatch on HiDPI**: `image_store.cell_w` set
+   from `atlas.cell_w` (physical px). Viewport in physical px. Should
+   match — unless `gtk_widget_get_scale_factor` reports >1 and the
+   GLArea framebuffer has an unexpected scale.
+2. **Atlas re-realize drops images via `forgetGL`**: when split / tab
+   / resize triggers an unrealize, `forgetGL` deletes images that have
+   already been uploaded (no `pending`). Result: any image more than
+   one frame old vanishes on context loss. The fix at M17.4 keeps
+   pixels around for re-upload but it's not in yet.
+3. **`gtk_gl_area_make_current` not called before `flushUploads`**:
+   `onRender` hands us a current context, but only AFTER `realize`
+   completes. If `flushUploads` runs while `program == 0`, the texture
+   gets uploaded into a stale context.
+4. **`image_pass.program` is 0 after split-and-re-realize** because
+   `forgetGL` was called but `realize` for image_pass didn't run.
+
+**Fix plan**:
+1. Implement M17.4 (keep RGBA after upload) — eliminates hypothesis 2.
+2. Assert `program != 0` in image_pass.draw, log if zero.
+3. Add `glGetError()` after every GL call in flushUploads (logged when
+   `debug == true`).
+4. Build the smoke-image binary (below) so future regressions are
+   caught by `zig build smoke-image` in CI rather than human testing.
+
+### M11.0a — Headless image render smoke (CI)
+
+A binary target that:
+1. Initializes EGL with `EGL_PLATFORM_SURFACELESS_MESA`.
+2. Creates a 256×256 framebuffer.
+3. Realizes ImagePass + ImageStore.
+4. Adds a known 32×32 RGBA image at cell (0,0).
+5. Calls flushUploads + draw.
+6. `glReadPixels` and asserts at least one pixel matches input.
+7. Exits 0 on pass, non-zero on fail.
+
+Run as `zig build smoke-image`. Catches all GL-side regressions
+without requiring an X session.
+
+**Effort**: 1-2 days for diagnose-fix-test. EGL surfaceless is ~150
+lines of well-trodden boilerplate.
 
 ---
 

@@ -448,8 +448,10 @@ fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
         img.rgba, img.width, img.height, img.row, img.col,
         img.image_id, img.placement_id, img.z_index,
     ) catch {};
-    // Force redraw to upload + display.
+    // Force redraw to upload + display. Set dirty so onTick paints AND
+    // queue_draw directly so we don't have to wait a frame.
     self.terminal.screen.dirty = true;
+    c.gtk_widget_queue_draw(@ptrCast(self.area));
 }
 
 fn onImageDeleteFullEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Screen.ImageDeleteEvent) void {

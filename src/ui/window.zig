@@ -20,6 +20,7 @@ pub const Window = struct {
     allocator: std.mem.Allocator,
     tab_counter: u32 = 0,
     debug_events: bool = false,
+    debug_images: bool = false,
     config: Config = .{},
     /// Scrollback search (Ctrl+F).
     search_bar: ?*c.GtkWidget = null,
@@ -468,6 +469,8 @@ pub const Window = struct {
         }
         pane.menu_sink = onMenuAction;
         pane.menu_sink_ctx = @ptrCast(self);
+        pane.image_store.debug = self.debug_images;
+        pane.image_pass.debug = self.debug_images;
         return pane;
     }
 

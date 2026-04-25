@@ -41,6 +41,8 @@ pub const ImagePass = struct {
     vbo: c_uint = 0,
     u_screen_px: c_int = -1,
     u_image: c_int = -1,
+    /// When true, draw() prints per-image diagnostics to stderr.
+    debug: bool = false,
 
     pub fn init() ImagePass {
         return .{};
@@ -86,7 +88,17 @@ pub const ImagePass = struct {
     }
 
     pub fn draw(self: *ImagePass, store: *ImageStore, viewport_w: i32, viewport_h: i32) void {
+        if (self.debug) {
+            std.debug.print(
+                "[image] draw N={d} viewport={d}x{d} program={d}\n",
+                .{ store.images.items.len, viewport_w, viewport_h, self.program },
+            );
+        }
         if (store.images.items.len == 0) return;
+        if (self.program == 0) {
+            if (self.debug) std.debug.print("[image] draw: program=0, bailing\n", .{});
+            return;
+        }
         c.glUseProgram(self.program);
         c.glUniform2f(self.u_screen_px, @floatFromInt(viewport_w), @floatFromInt(viewport_h));
         c.glActiveTexture(c.GL_TEXTURE0);
@@ -97,7 +109,10 @@ pub const ImagePass = struct {
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
 
         for (store.images.items) |img| {
-            if (img.gl_tex == 0) continue;
+            if (img.gl_tex == 0) {
+                if (self.debug) std.debug.print("[image] skip id={d}: tex=0\n", .{img.image_id});
+                continue;
+            }
             const x: f32 = @as(f32, @floatFromInt(img.cell_col)) * store.cell_w;
             const y: f32 = @as(f32, @floatFromInt(img.cell_row)) * store.cell_h;
             const w: f32 = @floatFromInt(img.width);
@@ -113,6 +128,13 @@ pub const ImagePass = struct {
             c.glBindTexture(c.GL_TEXTURE_2D, img.gl_tex);
             c.glBufferData(c.GL_ARRAY_BUFFER, @sizeOf(@TypeOf(verts)), &verts, c.GL_DYNAMIC_DRAW);
             c.glDrawArrays(c.GL_TRIANGLES, 0, 6);
+            if (self.debug) {
+                const err = c.glGetError();
+                std.debug.print(
+                    "[image] drew id={d} pos=({d:.0},{d:.0}) size=({d:.0},{d:.0}) tex={d} glErr=0x{x}\n",
+                    .{ img.image_id, x, y, w, h, img.gl_tex, err },
+                );
+            }
         }
 
         c.glDisable(c.GL_BLEND);

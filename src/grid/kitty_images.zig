@@ -31,6 +31,9 @@ pub const Accum = struct {
     width: u32,
     height: u32,
     medium: u8,
+    /// Original action from the first chunk — drives whether
+    /// finalize triggers a place.
+    action: kitty.Action,
     /// Concatenated base64 payload, awaiting final decode.
     payload: std.ArrayList(u8) = .{},
 
@@ -81,7 +84,15 @@ pub const Manager = struct {
             .z = cmd.z,
         };
 
-        switch (cmd.action) {
+        // Continuation chunks omit `a=` per kitty spec — when an
+        // accumulator already exists for this image_id, treat
+        // .unknown as "continue the in-progress transfer".
+        var effective = cmd.action;
+        if (effective == .unknown and self.accums.contains(cmd.image_id)) {
+            effective = .transmit_and_place;
+        }
+
+        switch (effective) {
             .place => {
                 // a=p — place an existing image at the cursor.
                 if (self.store.contains(cmd.image_id)) {
@@ -103,17 +114,20 @@ pub const Manager = struct {
                         .width = cmd.width,
                         .height = cmd.height,
                         .medium = cmd.medium,
+                        .action = effective,
                     }) catch return default;
                 }
                 if (self.accums.getPtr(cmd.image_id)) |acc| {
                     acc.payload.appendSlice(self.allocator, cmd.payload) catch {};
                     if (cmd.more == 1) return default; // wait for more
                 }
+                // Capture the original action BEFORE finalize drops the accum.
+                const original_action: kitty.Action = if (self.accums.getPtr(cmd.image_id)) |a| a.action else effective;
                 // m=0 (or absent) — finalize.
                 const stored_ok = self.finalize(cmd.image_id) catch false;
                 if (!stored_ok) return default;
 
-                if (cmd.action == .transmit_and_place) {
+                if (original_action == .transmit_and_place) {
                     return .{
                         .action = .place,
                         .image_id = cmd.image_id,
