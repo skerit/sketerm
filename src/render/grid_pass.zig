@@ -337,7 +337,8 @@ pub const GridPass = struct {
         };
         const blink_visible = !blinking or screen.cursor_blink_on;
         if (view_off == 0 and screen.cursor_visible and blink_visible and
-            screen.row < screen.rows and screen.col < screen.cols) {
+            screen.row < screen.rows and screen.col < screen.cols)
+        {
             const cx: f32 = pad + @as(f32, @floatFromInt(screen.col)) * cw;
             const cy: f32 = pad + @as(f32, @floatFromInt(screen.row)) * ch;
             // OSC 12 cursor color override: use it when alpha > 0,
@@ -345,42 +346,51 @@ pub const GridPass = struct {
             const fg = if (screen.cursor_color[3] > 0) screen.cursor_color else self.default_fg;
             const block_alpha: f32 = 0.85;
 
-            const Shape = @import("../grid/screen.zig").Screen.CursorShape;
-            switch (screen.cursor_shape) {
-                .block_blink, .block_steady => {
-                    try self.pushQuad(
-                        .{ cx, cy },
-                        .{ cw, ch },
-                        .{ 0, 0 },
-                        .{ 0, 0 },
-                        .{ fg[0], fg[1], fg[2], block_alpha },
-                        0.0,
-                    );
-                },
-                .underline_blink, .underline_steady => {
-                    const h: f32 = @max(2.0, ch / 8.0);
-                    try self.pushQuad(
-                        .{ cx, cy + ch - h },
-                        .{ cw, h },
-                        .{ 0, 0 },
-                        .{ 0, 0 },
-                        .{ fg[0], fg[1], fg[2], 0.95 },
-                        0.0,
-                    );
-                },
-                .bar_blink, .bar_steady => {
-                    const w: f32 = @max(2.0, cw / 6.0);
-                    try self.pushQuad(
-                        .{ cx, cy },
-                        .{ w, ch },
-                        .{ 0, 0 },
-                        .{ 0, 0 },
-                        .{ fg[0], fg[1], fg[2], 0.95 },
-                        0.0,
-                    );
-                },
+            if (focused) {
+                // Filled cursor in the configured shape.
+                switch (screen.cursor_shape) {
+                    .block_blink, .block_steady => {
+                        try self.pushQuad(
+                            .{ cx, cy },
+                            .{ cw, ch },
+                            .{ 0, 0 },
+                            .{ 0, 0 },
+                            .{ fg[0], fg[1], fg[2], block_alpha },
+                            0.0,
+                        );
+                    },
+                    .underline_blink, .underline_steady => {
+                        const h: f32 = @max(2.0, ch / 8.0);
+                        try self.pushQuad(
+                            .{ cx, cy + ch - h },
+                            .{ cw, h },
+                            .{ 0, 0 },
+                            .{ 0, 0 },
+                            .{ fg[0], fg[1], fg[2], 0.95 },
+                            0.0,
+                        );
+                    },
+                    .bar_blink, .bar_steady => {
+                        const w: f32 = @max(2.0, cw / 6.0);
+                        try self.pushQuad(
+                            .{ cx, cy },
+                            .{ w, ch },
+                            .{ 0, 0 },
+                            .{ 0, 0 },
+                            .{ fg[0], fg[1], fg[2], 0.95 },
+                            0.0,
+                        );
+                    },
+                }
+            } else {
+                // Unfocused: hollow outline, never blinks.
+                const t: f32 = 1.0;
+                const a: f32 = 0.55;
+                try self.pushQuad(.{ cx, cy }, .{ cw, t }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], a }, 0.0);
+                try self.pushQuad(.{ cx, cy + ch - t }, .{ cw, t }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], a }, 0.0);
+                try self.pushQuad(.{ cx, cy }, .{ t, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], a }, 0.0);
+                try self.pushQuad(.{ cx + cw - t, cy }, .{ t, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], a }, 0.0);
             }
-            _ = Shape; // (kept import for clarity)
         }
 
         // Focus border — thin accent rectangles at the pane edges.

@@ -379,18 +379,26 @@ fn onBellEvent(ctx: ?*anyopaque) void {
 fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Pane = @ptrCast(@alignCast(user.?));
 
-    // Cursor blink — toggle every 500ms for blinking shapes.
+    // Cursor blink — toggle every 500ms for blinking shapes, but
+    // only on the focused pane. Unfocused panes always show a static
+    // (hollow) cursor and don't waste redraws toggling phase.
     const screen = self.terminal.screen;
     const now = std.time.microTimestamp();
     if (self.last_blink_us == 0) self.last_blink_us = now;
-    const elapsed = now - self.last_blink_us;
-    const blinking = switch (screen.cursor_shape) {
+    const focused = c.gtk_widget_has_focus(@ptrCast(self.area)) != 0;
+    const blinking = focused and switch (screen.cursor_shape) {
         .block_blink, .underline_blink, .bar_blink => true,
         else => false,
     };
+    const elapsed = now - self.last_blink_us;
     if (blinking and elapsed > 500_000) {
         self.last_blink_us = now;
         screen.cursor_blink_on = !screen.cursor_blink_on;
+        screen.dirty = true;
+    } else if (!focused and !screen.cursor_blink_on) {
+        // Coming back into focus from a mid-blink "off" phase would
+        // leave the cursor invisible until the next toggle. Snap on.
+        screen.cursor_blink_on = true;
         screen.dirty = true;
     }
 
@@ -430,6 +438,10 @@ fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     if (self.terminal.screen.focus_reports) {
         _ = self.terminal.pty.writeAll("\x1b[I");
     }
+    // Cursor style + focus border switch on focus change — force a
+    // repaint so the swap is immediate.
+    self.terminal.screen.cursor_blink_on = true;
+    self.terminal.screen.dirty = true;
 }
 
 fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
@@ -437,6 +449,8 @@ fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     if (self.terminal.screen.focus_reports) {
         _ = self.terminal.pty.writeAll("\x1b[O");
     }
+    self.terminal.screen.cursor_blink_on = true;
+    self.terminal.screen.dirty = true;
 }
 
 fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
