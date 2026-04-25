@@ -429,14 +429,27 @@ pub const CellPass = struct {
             slice[col].cell_xy = .{ cx, y };
             slice[col].cell_size = .{ cell_w, ch };
 
-            // Background — set even when default (alpha=0 will discard).
-            const bg = self.colorToVec(style.bg, false, style.attrs.reverse);
-            const has_explicit_bg = style.bg != .default or style.attrs.reverse;
-            slice[col].bg = if (has_explicit_bg) bg else .{ 0, 0, 0, 0 };
-
-            // Foreground for the glyph.
-            const fg = self.colorToVec(style.fg, true, style.attrs.reverse);
-            slice[col].fg = fg;
+            // Resolve fg + bg to RGBA. Reverse video swaps the two
+            // (irrespective of color source — palette + rgb cells
+            // also flip on reverse, matching xterm/iTerm2 semantics).
+            var fg_rgba = self.colorToRGBA(style.fg, true);
+            var bg_rgba = self.colorToRGBA(style.bg, false);
+            var has_explicit_bg = style.bg != .default;
+            if (style.attrs.reverse) {
+                const tmp = fg_rgba;
+                fg_rgba = bg_rgba;
+                bg_rgba = tmp;
+                has_explicit_bg = true;
+            }
+            // Dim attribute halves alpha on the fg as a perceptual
+            // dim (modern terminals use this for chrome / muted text).
+            if (style.attrs.dim) {
+                fg_rgba[0] *= 0.65;
+                fg_rgba[1] *= 0.65;
+                fg_rgba[2] *= 0.65;
+            }
+            slice[col].bg = if (has_explicit_bg) bg_rgba else .{ 0, 0, 0, 0 };
+            slice[col].fg = fg_rgba;
             slice[col].has_glyph = 1.0; // 1 = no glyph until we set one
             // Decoration kind from style attrs. Multiple flags can be
             // set; we pick the most-specific underline (curly > double
@@ -649,6 +662,27 @@ pub const CellPass = struct {
     fn colorToVec(self: *const CellPass, color: Color, is_fg: bool, reverse: bool) [4]f32 {
         return switch (color) {
             .default => if (is_fg != reverse) self.default_fg else self.default_bg,
+            .palette => |p| .{
+                @as(f32, @floatFromInt(self.palette[p][0])) / 255.0,
+                @as(f32, @floatFromInt(self.palette[p][1])) / 255.0,
+                @as(f32, @floatFromInt(self.palette[p][2])) / 255.0,
+                1.0,
+            },
+            .rgb => |r| .{
+                @as(f32, @floatFromInt(r.r)) / 255.0,
+                @as(f32, @floatFromInt(r.g)) / 255.0,
+                @as(f32, @floatFromInt(r.b)) / 255.0,
+                1.0,
+            },
+        };
+    }
+
+    /// Resolve a Color to RGBA without considering reverse video —
+    /// the caller swaps fg/bg explicitly to honour reverse on
+    /// non-default colors too.
+    fn colorToRGBA(self: *const CellPass, color: Color, is_fg: bool) [4]f32 {
+        return switch (color) {
+            .default => if (is_fg) self.default_fg else self.default_bg,
             .palette => |p| .{
                 @as(f32, @floatFromInt(self.palette[p][0])) / 255.0,
                 @as(f32, @floatFromInt(self.palette[p][1])) / 255.0,
