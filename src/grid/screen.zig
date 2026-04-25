@@ -627,6 +627,12 @@ pub const Screen = struct {
         reflow.trim(&logicals, self.allocator);
 
         const all_rows = try reflow.rechunk(self.allocator, logicals.items, new_cols);
+        // Stamp fresh IDs on every reflowed row. Pre-reflow IDs are
+        // irretrievable since cells got redistributed; better to give
+        // each post-reflow row a clean ID than leave it 0 (collides
+        // with "unset"). prompt_marks become stale across a width
+        // change — accepted v1 limitation.
+        for (all_rows) |*ln| ln.id = self.nextLineId();
         // `all_rows` is owned and we need to redistribute it into
         // active + scrollback. Free the old buffers first.
         for (self.active) |*ln| ln.deinit(self.allocator);
