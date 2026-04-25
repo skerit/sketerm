@@ -54,6 +54,9 @@ pub const Manager = struct {
     /// continuation chunks may omit `i=`, so we route their payload to
     /// this id. Cleared when the active transmit finalizes.
     active_transmit_id: u32 = 0,
+    /// When true, finalize errors print to stderr (PNG decode fail,
+    /// bad base64, RGB undersize, etc.). Wired by `--debug-images`.
+    debug: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Manager {
         return .{
@@ -304,7 +307,13 @@ pub const Manager = struct {
                     &ch,
                     4,
                 );
-                if (pix == null or w <= 0 or h <= 0) return false;
+                if (pix == null or w <= 0 or h <= 0) {
+                    if (self.debug) std.debug.print(
+                        "[kitty] PNG decode failed: stb_image returned null/zero (id={d}, payload={d}B)\n",
+                        .{ image_id, raw_bytes.len },
+                    );
+                    return false;
+                }
                 const need: usize = @intCast(w * h * 4);
                 const out = try self.allocator.alloc(u8, need);
                 @memcpy(out, pix[0..need]);

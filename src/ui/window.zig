@@ -472,6 +472,7 @@ pub const Window = struct {
         pane.menu_sink_ctx = @ptrCast(self);
         pane.image_store.debug = self.debug_images;
         pane.image_pass.debug = self.debug_images;
+        pane.terminal.screen.kitty_images.debug = self.debug_images;
         return pane;
     }
 
