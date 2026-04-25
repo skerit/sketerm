@@ -258,6 +258,19 @@ pub const Screen = struct {
         return isWideCp(cp);
     }
 
+    /// Clear the visible screen + the scrollback ring + send cursor
+    /// home. Used by Ctrl+Shift+K (GNOME convention).
+    pub fn clearAndScrollback(self: *Screen) void {
+        for (self.buf()) |*l| l.clear();
+        for (self.scrollback.items) |*l| l.deinit(self.allocator);
+        self.scrollback.clearRetainingCapacity();
+        self.row = 0;
+        self.col = 0;
+        self.view_offset = 0;
+        self.pending_wrap = false;
+        self.dirty = true;
+    }
+
     /// Resize the screen to new dimensions while preserving as much
     /// content as possible. Active rows are re-widened (truncate or
     /// pad with blanks). Excess rows on shrink are pushed to scrollback

@@ -152,6 +152,12 @@ fn onKeyPressed(
                 if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .split_v);
                 return 1;
             },
+            c.GDK_KEY_K, c.GDK_KEY_k => {
+                // Clear screen + scrollback. Direct call — we're on
+                // the main thread, the screen lives there too.
+                ctx.terminal.screen.clearAndScrollback();
+                return 1;
+            },
             else => {},
         }
     }
