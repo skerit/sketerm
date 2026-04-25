@@ -98,24 +98,23 @@ If anything's broken visually, the most likely culprits are:
 
 ## What's left
 
-The post-checkpoint TODO list, in rough priority order:
+Remaining post-checkpoint TODO list:
 
-1. IME preedit display at cursor (commit signal works, preedit
-   positioning not wired)
-2. Pane focus highlight (visual border on the focused pane)
-3. Selection extension into scrollback (model accepts negative
-   rows; mouse handler doesn't yet map to them)
-4. Reflow with soft-wrap tracking on resize (today: pad/truncate)
-5. Memory leaks at exit. ~10 leaks reported by GPA on close.
-   Most come from `g_signal_connect_data` callsites passing
-   `null` as the `GDestroyNotify`, so per-handler ctx structs
-   (input.Ctx, menu Slot, RenameCtx, etc.) live until process
-   exit. Bounded — one allocation per signal connection per
-   widget — but shows up loud in the leak report. Fix: pass a
-   destroy function and free the ctx there. (The ctx structs
-   need to know their allocator; easiest is `*GeneralPurposeAllocator`
-   reachable globally.)
-6. OSC 8 in selection-extract — preserves text but not the URI
+1. Mouse reporting (DECSET 1006) — vim/htop want mouse events on
+   the PTY. Tracker mouse_mode is already plumbed; add controllers
+   that emit `\x1b[<button;col;row M`/`m` sequences.
+2. IM cursor location update — call
+   `gtk_im_context_set_cursor_location` whenever the cursor moves
+   so fcitx5/ibus position the IME popup at the right place.
+3. Reflow with soft-wrap tracking on resize. Today resize pads /
+   truncates per row.
+4. RenameCtx leak (allocated by `Window.renameCurrentTab`, never
+   freed — entry is destroyed when popover closes but the Zig
+   alloc isn't tracked).
+5. PTY worker thread allocations leak on hard SIGTERM (cleanup
+   ordering wrt thread join).
+6. NVIDIA proprietary GL — falls back to llvmpipe on this laptop.
+7. OSC 8 in selection-extract — preserves text but not the URI.
 
 ## Notable design decisions made during the build
 
