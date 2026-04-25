@@ -44,6 +44,9 @@ pub const Config = struct {
     /// If true, fg/bg follow AdwStyleManager dark/light. Set to
     /// false to honour `default_fg` / `default_bg` exactly.
     auto_theme: bool = true,
+    /// Bell behaviour: visual flash always; audible toggles the
+    /// system bell via gdk_display_beep.
+    bell_audible: bool = false,
 
     // Owned strings allocated from the parser arena. Not freed
     // individually — `arena.deinit()` reaps everything.
@@ -165,6 +168,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.ligatures = try parseBool(value);
     } else if (std.mem.eql(u8, key, "auto_theme")) {
         cfg.auto_theme = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "bell_audible")) {
+        cfg.bell_audible = try parseBool(value);
     } else {
         // Unknown key — warn but don't abort.
         std.debug.print("sketerm: config: unknown key '{s}' (ignoring)\n", .{key});

@@ -1127,6 +1127,13 @@ fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
 
 fn onTermBell(ctx: ?*anyopaque, pane: *Pane) void {
     const self: *Window = @ptrCast(@alignCast(ctx.?));
+
+    // Audible bell — system beep through GdkDisplay (DE/portal aware).
+    if (self.config.bell_audible) {
+        const display = c.gtk_widget_get_display(self.app_window);
+        if (display != null) c.gdk_display_beep(display);
+    }
+
     // Find the AdwTabPage whose widget tree contains this pane and
     // mark it needs-attention (unless it's the currently selected one).
     const n = c.adw_tab_view_get_n_pages(self.tab_view);
