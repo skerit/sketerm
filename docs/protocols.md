@@ -14,8 +14,9 @@ Escape sequences and protocols sketerm supports in v1.
 | 0x0B  | VT  — vertical tab      | treated as LF |
 | 0x0C  | FF  — form feed         | treated as LF |
 | 0x0D  | CR  — carriage return   | ✓ |
-| 0x0E  | SO  — shift out (G1)    | deferred |
-| 0x0F  | SI  — shift in (G0)     | deferred |
+| 0x05  | ENQ — answerback        | ✓ (empty reply) |
+| 0x0E  | SO  — shift out (G1)    | ✓ |
+| 0x0F  | SI  — shift in (G0)     | ✓ |
 | 0x1B  | ESC                     | ✓ (enters Escape state) |
 
 ## CSI sequences
