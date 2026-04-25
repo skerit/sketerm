@@ -639,6 +639,10 @@ pub const Screen = struct {
                     self.respond(s);
                 }
             },
+            // OSC 104 / 110 / 111 / 112 — palette / fg / bg / cursor
+            // reset. We don't yet store runtime overrides so these
+            // are no-ops; accepted silently.
+            104, 110, 111, 112 => {},
             1337 => {
                 // iTerm2 inline image: OSC 1337 ; File=...:<base64> ST
                 const iterm = @import("../parser/iterm_image.zig");
