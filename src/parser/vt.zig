@@ -556,3 +556,20 @@ test "APC kitty graphics dispatched on ESC \\\\" {
     };
     try std.testing.expect(saw_apc);
 }
+
+test "ESC mid-CSI cancels and starts new sequence" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    defer col.deinit();
+    // CSI partial → ESC → CUP — the partial CSI should be discarded.
+    p.advance("\x1b[12;\x1b[1;1H", TestCollector.emit, &col);
+    var cup_count: u32 = 0;
+    for (col.events.items) |ev| switch (ev) {
+        .csi => |c| if (c.final == 'H') {
+            cup_count += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(u32, 1), cup_count);
+}
