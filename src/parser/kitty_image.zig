@@ -7,7 +7,18 @@
 
 const std = @import("std");
 
-pub const Action = enum { transmit, transmit_and_place, place, delete, query, unknown };
+pub const Action = enum {
+    transmit,
+    transmit_and_place,
+    place,
+    delete,
+    query,
+    /// `a=f` — append/compose a frame to an existing animation.
+    transmit_frame,
+    /// `a=a` — animation control (play/pause/loop count).
+    animate,
+    unknown,
+};
 
 pub const Command = struct {
     action: Action = .unknown,
@@ -100,6 +111,8 @@ fn applyKv(cmd: *Command, key: []const u8, val: []const u8) void {
                 'p' => .place,
                 'd' => .delete,
                 'q' => .query,
+                'f' => .transmit_frame,
+                'a' => .animate,
                 else => .unknown,
             };
         },

@@ -586,6 +586,19 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         if (since_bell < 200_000) screen.dirty = true;
     }
 
+    // Animation: advance frames in the kitty-graphics manager. When
+    // any image stepped to a new frame, pull its bytes into the
+    // matching placements so the next render shows the new frame.
+    if (screen.kitty_images.advanceAnimations(now)) {
+        var it = screen.kitty_images.store.iterator();
+        while (it.next()) |entry| {
+            const img = entry.value_ptr;
+            if (img.frames.items.len < 2) continue;
+            self.image_store.uploadFrame(entry.key_ptr.*, img.generation, img.rgba) catch {};
+        }
+        screen.dirty = true;
+    }
+
     if (screen.dirty) {
         // Update IME cursor location so fcitx5 / ibus position
         // their popups at the right cell.

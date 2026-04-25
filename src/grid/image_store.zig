@@ -39,6 +39,14 @@ pub const Image = struct {
     src_y: u32 = 0,
     src_w: u32 = 0,
     src_h: u32 = 0,
+    /// Last seen `Manager.StoredImage.generation` for animated images.
+    /// When the source's generation differs, the placement re-fetches
+    /// the current frame's RGBA via `replacePending`.
+    last_seen_generation: u32 = 0,
+    /// True when `pending` holds bytes that haven't been uploaded yet
+    /// (newly added image, frame advance, post-context-loss). Cleared
+    /// by flushUploads after the GL upload completes.
+    pending_dirty: bool = true,
 };
 
 pub const Store = struct {
@@ -190,6 +198,23 @@ pub const Store = struct {
         }
     }
 
+    /// Replace the pending RGBA of every placement matching `image_id`
+    /// with `rgba` and mark `pending_dirty` so the next flushUploads
+    /// pushes it to GL. Caller does NOT need a current GL context.
+    pub fn replacePending(self: *Store, image_id: u32, rgba: []const u8, generation: u32) !void {
+        for (self.images.items) |*img| {
+            if (img.image_id != image_id) continue;
+            if (img.last_seen_generation == generation) continue;
+            const need: usize = @as(usize, img.width) * @as(usize, img.height) * 4;
+            if (rgba.len < need) continue;
+            if (img.pending) |p| self.allocator.free(p);
+            const dup = try self.allocator.dupe(u8, rgba[0..need]);
+            img.pending = dup;
+            img.pending_dirty = true;
+            img.last_seen_generation = generation;
+        }
+    }
+
     /// How many images are currently held (including those marked
     /// for deletion until the next flushUploads).
     pub fn count(self: *const Store) usize {
@@ -202,7 +227,10 @@ pub const Store = struct {
     /// re-uploads them into the new context. Memory cost: each
     /// image holds its RGBA indefinitely until a delete dispatch.
     pub fn forgetGL(self: *Store) void {
-        for (self.images.items) |*img| img.gl_tex = 0;
+        for (self.images.items) |*img| {
+            img.gl_tex = 0;
+            img.pending_dirty = true;
+        }
     }
 
     /// Free all images and their pending buffers, ignoring GL
@@ -246,37 +274,62 @@ pub const Store = struct {
             }
             i += 1;
         }
-        // Upload images that have source pixels but no GL texture
-        // (newly added or post-context-loss). Keep `pending` after.
+        // Upload images that have dirty pending pixels — initial
+        // upload (gl_tex == 0) creates the texture; frame advance
+        // (gl_tex != 0) does a sub-image update.
         for (self.images.items) |*img| {
-            if (img.gl_tex != 0) continue;
+            if (!img.pending_dirty) continue;
             const pending = img.pending orelse continue;
-            c.glGenTextures(1, &img.gl_tex);
-            c.glBindTexture(c.GL_TEXTURE_2D, img.gl_tex);
-            c.glPixelStorei(c.GL_UNPACK_ALIGNMENT, 4);
-            c.glTexImage2D(
-                c.GL_TEXTURE_2D,
-                0,
-                c.GL_RGBA8,
-                @intCast(img.width),
-                @intCast(img.height),
-                0,
-                c.GL_RGBA,
-                c.GL_UNSIGNED_BYTE,
-                pending.ptr,
-            );
-            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
-            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
-            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
-            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
-            const err = c.glGetError();
-            if (self.debug) {
-                std.debug.print(
-                    "[image] upload id={d} placement={d} {d}x{d} cell=({d},{d}) tex={d} glErr=0x{x}\n",
-                    .{ img.image_id, img.placement_id, img.width, img.height, img.cell_row, img.cell_col, img.gl_tex, err },
+            if (img.gl_tex == 0) {
+                c.glGenTextures(1, &img.gl_tex);
+                c.glBindTexture(c.GL_TEXTURE_2D, img.gl_tex);
+                c.glPixelStorei(c.GL_UNPACK_ALIGNMENT, 4);
+                c.glTexImage2D(
+                    c.GL_TEXTURE_2D,
+                    0,
+                    c.GL_RGBA8,
+                    @intCast(img.width),
+                    @intCast(img.height),
+                    0,
+                    c.GL_RGBA,
+                    c.GL_UNSIGNED_BYTE,
+                    pending.ptr,
+                );
+                c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+                c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+                c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+                c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+                const err = c.glGetError();
+                if (self.debug) {
+                    std.debug.print(
+                        "[image] upload id={d} placement={d} {d}x{d} cell=({d},{d}) tex={d} glErr=0x{x}\n",
+                        .{ img.image_id, img.placement_id, img.width, img.height, img.cell_row, img.cell_col, img.gl_tex, err },
+                    );
+                }
+            } else {
+                c.glBindTexture(c.GL_TEXTURE_2D, img.gl_tex);
+                c.glPixelStorei(c.GL_UNPACK_ALIGNMENT, 4);
+                c.glTexSubImage2D(
+                    c.GL_TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    @intCast(img.width),
+                    @intCast(img.height),
+                    c.GL_RGBA,
+                    c.GL_UNSIGNED_BYTE,
+                    pending.ptr,
                 );
             }
+            img.pending_dirty = false;
         }
+    }
+
+    /// Same as `replacePending` — kept for back-compat at call sites
+    /// that named the operation explicitly. The actual GL upload
+    /// happens in `flushUploads` which the render path always calls.
+    pub fn uploadFrame(self: *Store, image_id: u32, generation: u32, rgba: []const u8) !void {
+        try self.replacePending(image_id, rgba, generation);
     }
 };
 

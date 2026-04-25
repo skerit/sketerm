@@ -17,10 +17,38 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const kitty = @import("../parser/kitty_image.zig");
 
+pub const Frame = struct {
+    rgba: []u8,
+    /// Delay before showing this frame, milliseconds. Default 100ms.
+    delay_ms: u32 = 100,
+};
+
 pub const StoredImage = struct {
+    /// Current frame's pixels. Owned by `frames[current_frame]` for
+    /// animated images, or a standalone allocation when `frames` is
+    /// empty (static, single-frame).
     rgba: []u8,
     width: u32,
     height: u32,
+    /// Animation frames. Empty for static images. When non-empty,
+    /// `rgba` aliases `frames[current_frame].rgba` and is NOT owned
+    /// separately.
+    frames: std.ArrayList(Frame) = .{},
+    current_frame: u32 = 0,
+    /// Microsecond timestamp of the last frame advance. -1 = not yet
+    /// seen by `advanceAnimations`; first call seeds the time.
+    last_advance_us: i64 = -1,
+    playing: bool = true,
+    /// Bumps every time `current_frame` changes. Placements compare
+    /// against their snapshot to detect frame transitions.
+    generation: u32 = 0,
+    /// Remaining loop count: -1 = infinite, 0 = stopped, N>0 = play
+    /// for N more loops.
+    loops_remaining: i32 = -1,
+
+    fn rgbaLen(self: *const StoredImage) usize {
+        return @as(usize, self.width) * @as(usize, self.height) * 4;
+    }
 };
 
 /// In-progress chunked transfer. Cleared on m=0 or first non-chunked.
@@ -36,6 +64,12 @@ pub const Accum = struct {
     /// Original action from the first chunk — drives whether
     /// finalize triggers a place.
     action: kitty.Action,
+    /// Frame metadata captured from the first chunk (only used when
+    /// `action == .transmit_frame`).
+    frame_delay_ms: u32 = 100,
+    frame_target: u32 = 0, // 0 = append at end
+    frame_compose_from: u32 = 0,
+    frame_compose_mode: u8 = 0,
     /// Concatenated base64 payload, awaiting final decode.
     payload: std.ArrayList(u8) = .{},
 
@@ -68,11 +102,22 @@ pub const Manager = struct {
 
     pub fn deinit(self: *Manager) void {
         var it = self.store.iterator();
-        while (it.next()) |e| self.allocator.free(e.value_ptr.rgba);
+        while (it.next()) |e| self.freeStoredImage(e.value_ptr);
         self.store.deinit();
         var ait = self.accums.iterator();
         while (ait.next()) |e| e.value_ptr.deinit(self.allocator);
         self.accums.deinit();
+    }
+
+    fn freeStoredImage(self: *Manager, img: *StoredImage) void {
+        if (img.frames.items.len == 0) {
+            // Static: rgba is the standalone allocation.
+            self.allocator.free(img.rgba);
+        } else {
+            // Animated: rgba aliases frames[].rgba — free each frame.
+            for (img.frames.items) |f| self.allocator.free(f.rgba);
+        }
+        img.frames.deinit(self.allocator);
     }
 
     /// Ingest a kitty graphics command. Returns:
@@ -118,6 +163,13 @@ pub const Manager = struct {
             effective = .transmit_and_place; // will be overridden below
         }
 
+        // Animation control: a=a — pure metadata, no payload to
+        // accumulate.
+        if (effective == .animate) {
+            self.applyAnimateControl(cmd);
+            return default;
+        }
+
         switch (effective) {
             .place => {
                 // a=p — place an existing image at the cursor.
@@ -137,7 +189,7 @@ pub const Manager = struct {
                 }
                 return default;
             },
-            .transmit, .transmit_and_place => {
+            .transmit, .transmit_and_place, .transmit_frame => {
                 // Chunked transfer: appended into accum until m=0.
                 const is_first = !self.accums.contains(effective_id);
                 if (is_first) {
@@ -152,6 +204,14 @@ pub const Manager = struct {
                         .medium = cmd.medium,
                         .compression = cmd.compression,
                         .action = cmd.action,
+                        // Frame-only metadata (z=delay, c=target frame,
+                        // r=compose source, C=compose mode). Stored
+                        // unconditionally — finalize ignores when
+                        // action != .transmit_frame.
+                        .frame_delay_ms = if (cmd.z >= 0) @intCast(cmd.z) else 0,
+                        .frame_target = cmd.cells_wide,
+                        .frame_compose_from = cmd.cells_high,
+                        .frame_compose_mode = cmd.no_cursor_move,
                     }) catch return default;
                     self.active_transmit_id = effective_id;
                 }
@@ -189,7 +249,8 @@ pub const Manager = struct {
     /// Drop a stored image (called from delete dispatch).
     pub fn drop(self: *Manager, image_id: u32) void {
         if (self.store.fetchRemove(image_id)) |entry| {
-            self.allocator.free(entry.value.rgba);
+            var v = entry.value;
+            self.freeStoredImage(&v);
         }
         if (self.accums.fetchRemove(image_id)) |entry| {
             var v = entry.value;
@@ -199,7 +260,7 @@ pub const Manager = struct {
 
     pub fn dropAll(self: *Manager) void {
         var it = self.store.iterator();
-        while (it.next()) |e| self.allocator.free(e.value_ptr.rgba);
+        while (it.next()) |e| self.freeStoredImage(e.value_ptr);
         self.store.clearRetainingCapacity();
         var ait = self.accums.iterator();
         while (ait.next()) |e| e.value_ptr.deinit(self.allocator);
@@ -327,10 +388,127 @@ pub const Manager = struct {
             else => return false,
         };
 
+        // Frame-data action: append (or compose into) the existing
+        // animation. The decoded `stored.rgba` becomes a new Frame.
+        if (acc.action == .transmit_frame) {
+            return self.appendFrame(image_id, stored, acc) catch false;
+        }
+
         // Replace any prior image with this id.
-        if (self.store.fetchRemove(image_id)) |old| self.allocator.free(old.value.rgba);
+        if (self.store.fetchRemove(image_id)) |old| {
+            var v = old.value;
+            self.freeStoredImage(&v);
+        }
         try self.store.put(image_id, stored);
         return true;
+    }
+
+    /// Append a frame to an existing image's animation. Promotes a
+    /// static image into an animation on first call (frames[] becomes
+    /// non-empty; rgba aliases frames[0].rgba).
+    fn appendFrame(self: *Manager, image_id: u32, new_frame: StoredImage, acc: *const Accum) !bool {
+        const existing = self.store.getPtr(image_id) orelse {
+            // No source image; treat as a regular store.
+            self.allocator.free(new_frame.rgba);
+            return false;
+        };
+        // Frames must match dimensions of the source.
+        if (new_frame.width != existing.width or new_frame.height != existing.height) {
+            self.allocator.free(new_frame.rgba);
+            return false;
+        }
+
+        // Promote: if static, move existing rgba into frames[0].
+        if (existing.frames.items.len == 0) {
+            try existing.frames.append(self.allocator, .{
+                .rgba = existing.rgba,
+                .delay_ms = 100,
+            });
+            // existing.rgba now aliases frames[0].rgba (don't double-free).
+        }
+
+        // Insert / append frame.
+        const target = acc.frame_target;
+        if (target == 0 or target > existing.frames.items.len) {
+            // Append at end.
+            try existing.frames.append(self.allocator, .{
+                .rgba = new_frame.rgba,
+                .delay_ms = if (acc.frame_delay_ms == 0) 100 else acc.frame_delay_ms,
+            });
+        } else {
+            // Replace the existing 1-based frame at index `target - 1`.
+            const idx: usize = target - 1;
+            self.allocator.free(existing.frames.items[idx].rgba);
+            existing.frames.items[idx] = .{
+                .rgba = new_frame.rgba,
+                .delay_ms = if (acc.frame_delay_ms == 0) 100 else acc.frame_delay_ms,
+            };
+        }
+        // Re-anchor `existing.rgba` to the current frame in case the
+        // insertion replaced it.
+        existing.rgba = existing.frames.items[existing.current_frame].rgba;
+        existing.generation +%= 1;
+        return true;
+    }
+
+    fn applyAnimateControl(self: *Manager, cmd: kitty.Command) void {
+        const img = self.store.getPtr(cmd.image_id) orelse return;
+        // Per kitty spec a=a fields:
+        //   c — playback state (1=stop, 2=run, 3=loading)
+        //   r — number of loops (0 = infinite)
+        //   s — set current frame
+        // Our parser stored c in cells_wide, r in cells_high, s in width.
+        const play_state = cmd.cells_wide;
+        const loop_count = cmd.cells_high;
+        const set_frame = cmd.width;
+        switch (play_state) {
+            1 => img.playing = false,
+            2 => img.playing = true,
+            else => {},
+        }
+        if (loop_count > 0) img.loops_remaining = @intCast(loop_count);
+        if (set_frame > 0 and img.frames.items.len > 0) {
+            const idx = @min(set_frame - 1, img.frames.items.len - 1);
+            img.current_frame = @intCast(idx);
+            img.rgba = img.frames.items[idx].rgba;
+            img.generation +%= 1;
+        }
+    }
+
+    /// Advance every animated image's current_frame based on elapsed
+    /// time. Called from a tick callback. Returns true if any image
+    /// changed frame (caller should refresh placements).
+    pub fn advanceAnimations(self: *Manager, now_us: i64) bool {
+        var any_advanced = false;
+        var it = self.store.iterator();
+        while (it.next()) |entry| {
+            const img = entry.value_ptr;
+            if (img.frames.items.len < 2) continue;
+            if (!img.playing) continue;
+            if (img.last_advance_us < 0) {
+                img.last_advance_us = now_us;
+                continue;
+            }
+            const delay_us: i64 = @as(i64, @intCast(img.frames.items[img.current_frame].delay_ms)) * 1000;
+            if (now_us - img.last_advance_us < delay_us) continue;
+
+            // Advance frame, accounting for loop wrap.
+            const next: u32 = (img.current_frame + 1) % @as(u32, @intCast(img.frames.items.len));
+            if (next == 0 and img.loops_remaining > 0) {
+                img.loops_remaining -= 1;
+                if (img.loops_remaining == 0) {
+                    img.playing = false;
+                    img.last_advance_us = now_us;
+                    continue;
+                }
+            }
+            img.current_frame = next;
+            img.rgba = img.frames.items[next].rgba;
+            img.last_advance_us = now_us;
+            img.generation +%= 1;
+            any_advanced = true;
+        }
+        return any_advanced;
     }
 
     fn readFile(self: *Manager, path: []const u8) ![]u8 {
@@ -429,4 +607,104 @@ test "manager: a=p before any transmit returns none" {
     const out = mgr.ingest(cmd);
     try std.testing.expectEqual(@as(u32, 99), out.image_id);
     // .none — caller doesn't place when nothing stored.
+}
+
+test "animation: a=f appends a frame" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    // Initial transmit (a=t).
+    var rgba_a: [16]u8 = undefined;
+    @memset(&rgba_a, 0xAA);
+    var b64a: [32]u8 = undefined;
+    const enc = std.base64.standard.Encoder;
+    const bA = enc.encode(&b64a, &rgba_a);
+    const cmd_t = kitty.Command{
+        .action = .transmit,
+        .image_id = 5,
+        .format = 32,
+        .width = 2,
+        .height = 2,
+        .more = 0,
+        .payload = bA,
+    };
+    _ = mgr.ingest(cmd_t);
+
+    // Append a 2nd frame (a=f). z=200 ms delay.
+    var rgba_b: [16]u8 = undefined;
+    @memset(&rgba_b, 0x55);
+    var b64b: [32]u8 = undefined;
+    const bB = enc.encode(&b64b, &rgba_b);
+    const cmd_f = kitty.Command{
+        .action = .transmit_frame,
+        .image_id = 5,
+        .format = 32,
+        .width = 2,
+        .height = 2,
+        .more = 0,
+        .payload = bB,
+        .z = 200,
+    };
+    _ = mgr.ingest(cmd_f);
+
+    const stored = mgr.store.getPtr(5).?;
+    try std.testing.expectEqual(@as(usize, 2), stored.frames.items.len);
+    try std.testing.expectEqual(@as(u32, 200), stored.frames.items[1].delay_ms);
+}
+
+test "animation: advanceAnimations cycles current_frame" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    // Build an animation with 3 frames manually.
+    const a0 = try std.testing.allocator.dupe(u8, "AAAAAAAAAAAAAAAA");
+    const a1 = try std.testing.allocator.dupe(u8, "BBBBBBBBBBBBBBBB");
+    const a2 = try std.testing.allocator.dupe(u8, "CCCCCCCCCCCCCCCC");
+    var img: StoredImage = .{ .rgba = a0, .width = 2, .height = 2 };
+    try img.frames.append(std.testing.allocator, .{ .rgba = a0, .delay_ms = 50 });
+    try img.frames.append(std.testing.allocator, .{ .rgba = a1, .delay_ms = 50 });
+    try img.frames.append(std.testing.allocator, .{ .rgba = a2, .delay_ms = 50 });
+    try mgr.store.put(7, img);
+
+    // First call seeds `last_advance_us`.
+    _ = mgr.advanceAnimations(0);
+    // 50 ms = 50_000 us — should advance.
+    const advanced1 = mgr.advanceAnimations(50_000);
+    try std.testing.expect(advanced1);
+    try std.testing.expectEqual(@as(u32, 1), mgr.store.getPtr(7).?.current_frame);
+    // Another 50 ms → frame 2.
+    const advanced2 = mgr.advanceAnimations(100_000);
+    try std.testing.expect(advanced2);
+    try std.testing.expectEqual(@as(u32, 2), mgr.store.getPtr(7).?.current_frame);
+    // Wrap → frame 0.
+    const advanced3 = mgr.advanceAnimations(150_000);
+    try std.testing.expect(advanced3);
+    try std.testing.expectEqual(@as(u32, 0), mgr.store.getPtr(7).?.current_frame);
+}
+
+test "animation: a=a stop pauses playback" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const a0 = try std.testing.allocator.dupe(u8, "AAAAAAAAAAAAAAAA");
+    const a1 = try std.testing.allocator.dupe(u8, "BBBBBBBBBBBBBBBB");
+    var img: StoredImage = .{ .rgba = a0, .width = 2, .height = 2 };
+    try img.frames.append(std.testing.allocator, .{ .rgba = a0, .delay_ms = 50 });
+    try img.frames.append(std.testing.allocator, .{ .rgba = a1, .delay_ms = 50 });
+    try mgr.store.put(8, img);
+
+    // Stop via a=a, c=1.
+    const stop_cmd = kitty.Command{ .action = .animate, .image_id = 8, .cells_wide = 1 };
+    _ = mgr.ingest(stop_cmd);
+    try std.testing.expect(!mgr.store.getPtr(8).?.playing);
+
+    // advanceAnimations does nothing when not playing.
+    _ = mgr.advanceAnimations(0);
+    _ = mgr.advanceAnimations(1_000_000);
+    try std.testing.expectEqual(@as(u32, 0), mgr.store.getPtr(8).?.current_frame);
+
+    // Re-run via a=a, c=2.
+    const run_cmd = kitty.Command{ .action = .animate, .image_id = 8, .cells_wide = 2 };
+    _ = mgr.ingest(run_cmd);
+    try std.testing.expect(mgr.store.getPtr(8).?.playing);
 }
