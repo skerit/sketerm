@@ -685,7 +685,7 @@ fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     self.terminal.screen.dirty = true;
 }
 
-fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
     const cell = self.cellAt(x, y);
     const screen = self.terminal.screen;
@@ -704,10 +704,18 @@ fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
             self.last_motion_row = cell.row;
             self.last_motion_col = cell.col;
             // Button bits: 32=motion, base 0=L,1=M,2=R or 3=no-button.
-            const base: u32 = if (self.held_button >= 0)
+            var base: u32 = if (self.held_button >= 0)
                 @intCast(self.held_button)
             else
                 3;
+            // Modifier bits (SGR 1006): +4 shift, +8 alt, +16 ctrl.
+            const ev = c.gtk_event_controller_get_current_event(@ptrCast(g));
+            if (ev != null) {
+                const mods = c.gdk_event_get_modifier_state(ev);
+                if (mods & c.GDK_SHIFT_MASK != 0) base += 4;
+                if (mods & c.GDK_ALT_MASK != 0) base += 8;
+                if (mods & c.GDK_CONTROL_MASK != 0) base += 16;
+            }
             var buf: [32]u8 = undefined;
             const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}M", .{
                 32 + base,
