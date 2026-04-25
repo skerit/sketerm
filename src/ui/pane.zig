@@ -638,14 +638,22 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
     // the click is going through the click controller as a mouse
     // report instead.
     if (self.terminal.screen.mouse_mode != 0) return;
-    const cell = self.cellAt(x, y);
-    // Alt-drag → rectangular selection (block / column select).
-    var mode: @import("../grid/selection.zig").Mode = .normal;
+
+    // Read modifiers before deciding what kind of drag this is.
+    var mods: c.GdkModifierType = 0;
     const ev = c.gtk_event_controller_get_current_event(@ptrCast(g));
-    if (ev != null) {
-        const mods = c.gdk_event_get_modifier_state(ev);
-        if (mods & c.GDK_ALT_MASK != 0) mode = .rectangular;
-    }
+    if (ev != null) mods = c.gdk_event_get_modifier_state(ev);
+    const shift_held = (mods & c.GDK_SHIFT_MASK) != 0;
+    const alt_held = (mods & c.GDK_ALT_MASK) != 0;
+
+    // On the alternate screen (TUIs like vim, htop, less), the
+    // running app owns the mouse model — host-side selection is
+    // usually noise. Require Shift to override (matches xterm /
+    // gnome-terminal / kitty conventions).
+    if (self.terminal.screen.use_alt and !shift_held) return;
+
+    const cell = self.cellAt(x, y);
+    const mode: @import("../grid/selection.zig").Mode = if (alt_held) .rectangular else .normal;
     self.terminal.screen.selection.start(cell.row, cell.col, mode);
     c.gtk_widget_queue_draw(@ptrCast(self.area));
 }
@@ -663,6 +671,15 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
 
     // Left double / triple click → word / line selection.
     if (button == 1 and self.terminal.screen.mouse_mode == 0 and n_press >= 2) {
+        // On alt screen (TUIs), host-side selection is opt-in via
+        // Shift. Same rule as drag selection — keeps the running
+        // app's mouse model uncontested.
+        var mods_d: c.GdkModifierType = 0;
+        const ev_d = c.gtk_event_controller_get_current_event(@ptrCast(g));
+        if (ev_d != null) mods_d = c.gdk_event_get_modifier_state(ev_d);
+        const shift_d = (mods_d & c.GDK_SHIFT_MASK) != 0;
+        if (self.terminal.screen.use_alt and !shift_d) return;
+
         const cell = self.cellAt(x, y);
         const screen = self.terminal.screen;
         if (n_press == 2) {

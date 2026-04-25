@@ -95,6 +95,13 @@ pub const Pty = struct {
         _ = c.setenv("COLORTERM", opts.color_term, 1);
         _ = c.setenv("TERM_PROGRAM", "sketerm", 1);
         _ = c.setenv("TERM_PROGRAM_VERSION", "0.1.0", 1);
+        // Image-protocol detection hints. Most tools (yazi, lf, btop,
+        // chafa, viu) look at $KITTY_WINDOW_ID for kitty graphics
+        // capability and trust it without further interrogation. We
+        // *do* support kitty graphics, so it's accurate. Sixel users
+        // get DA1's `;4;` advertisement plus the `xterm-256color`
+        // terminfo `Sixel` flag (when set via `term = ` in config).
+        _ = c.setenv("KITTY_WINDOW_ID", "1", 1);
 
         // chdir if requested.
         if (opts.cwd) |cwd| {
