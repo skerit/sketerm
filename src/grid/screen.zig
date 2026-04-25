@@ -2694,8 +2694,16 @@ pub const Screen = struct {
         const lines = self.buf();
 
         if (move < region) {
-            var stash = self.allocator.alloc([]Cell, move) catch return;
-            defer self.allocator.free(stash);
+            // move=1 is the steady-state RI path; stack scratch up to
+            // 8 covers ~all real moves. Heap fallback for larger.
+            var stash_stack: [8][]Cell = undefined;
+            var stash_heap: ?[][]Cell = null;
+            defer if (stash_heap) |h| self.allocator.free(h);
+            const stash: [][]Cell = if (move <= stash_stack.len) stash_stack[0..move] else blk: {
+                const h = self.allocator.alloc([]Cell, move) catch return;
+                stash_heap = h;
+                break :blk h;
+            };
             var i: u16 = 0;
             while (i < move) : (i += 1) stash[i] = lines[self.scroll_bot - move + 1 + i].cells;
             // Shift cells + ids down (iterate top-to-bottom in reverse
