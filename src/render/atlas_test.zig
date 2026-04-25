@@ -31,8 +31,8 @@ test "shapeRun: 'fi' produces glyph IDs" {
         return e;
     };
     defer atlas.deinit();
+    // Atlas owns the cached shape slice — do not free.
     const glyphs = try atlas.shapeRun(a, "fi");
-    defer a.free(glyphs);
     // We get either 2 glyphs (no ligature) or 1 (ligature). Either
     // is fine — assert we got something.
     try std.testing.expect(glyphs.len >= 1 and glyphs.len <= 2);
@@ -48,7 +48,6 @@ test "shapeRun: 'hello' produces 5 glyphs (no ligatures in monospace)" {
     };
     defer atlas.deinit();
     const glyphs = try atlas.shapeRun(a, "hello");
-    defer a.free(glyphs);
     try std.testing.expectEqual(@as(usize, 5), glyphs.len);
 }
 
@@ -60,6 +59,5 @@ test "shapeRun: empty string returns 0 glyphs" {
     };
     defer atlas.deinit();
     const glyphs = try atlas.shapeRun(a, "");
-    defer a.free(glyphs);
     try std.testing.expectEqual(@as(usize, 0), glyphs.len);
 }

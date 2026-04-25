@@ -72,6 +72,16 @@ pub const Atlas = struct {
     /// HarfBuzz font wrapping the FreeType face. Used by `shapeRun`
     /// for ligature / OpenType-feature aware text layout.
     hb_font: ?*c.hb_font_t = null,
+    /// Reusable HarfBuzz buffer — created once per atlas, cleared
+    /// and refilled per shapeRun. Saves the per-call allocation +
+    /// destruction round-trip; was hot in TUI redraws with many
+    /// same-style runs per row.
+    hb_buf: ?*c.hb_buffer_t = null,
+    /// Cache of HarfBuzz shape results keyed by FNV-1a hash of the
+    /// UTF-8 input. Identical text re-shapes hit the cache. Shaping
+    /// only depends on the font + text (we don't change OpenType
+    /// features at runtime), so the key is just the bytes.
+    shape_cache: std.AutoHashMap(u64, []ShapedGlyph),
 
     /// Cell metrics in pixels.
     cell_w: u16,
@@ -114,6 +124,7 @@ pub const Atlas = struct {
         const descent: i16 = @intCast(-@as(c_long, m.descender) >> 6);
 
         const hb_font = c.hb_ft_font_create_referenced(face);
+        const hb_buf = c.hb_buffer_create();
 
         const self = try allocator.create(Atlas);
         errdefer allocator.destroy(self);
@@ -121,12 +132,14 @@ pub const Atlas = struct {
             .ft_lib = lib,
             .ft_face = face,
             .hb_font = hb_font,
+            .hb_buf = hb_buf,
             .cell_w = cell_w,
             .cell_h = cell_h,
             .ascent = ascent,
             .descent = descent,
             .cache = std.AutoHashMap(u32, Glyph).init(allocator),
             .glyph_cache = std.AutoHashMap(u32, Glyph).init(allocator),
+            .shape_cache = std.AutoHashMap(u64, []ShapedGlyph).init(allocator),
             .allocator = allocator,
         };
         return self;
@@ -160,7 +173,12 @@ pub const Atlas = struct {
         // GL texture is freed by GTK on widget unrealize.
         self.cache.deinit();
         self.glyph_cache.deinit();
+        // Free cached shape result slices.
+        var sc_it = self.shape_cache.iterator();
+        while (sc_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        self.shape_cache.deinit();
         for (&self.pages) |*p| p.deinit(self.allocator);
+        if (self.hb_buf) |b| c.hb_buffer_destroy(b);
         if (self.hb_font) |f| c.hb_font_destroy(f);
         _ = c.FT_Done_Face(self.ft_face);
         _ = c.FT_Done_FreeType(self.ft_lib);
@@ -182,17 +200,30 @@ pub const Atlas = struct {
         cluster: u32,
     };
 
-    pub fn shapeRun(self: *Atlas, allocator: std.mem.Allocator, text: []const u8) ![]ShapedGlyph {
+    /// Shape a UTF-8 run with HarfBuzz. Result is cached by content
+    /// hash; the returned slice is OWNED BY THE ATLAS — callers must
+    /// NOT free it. The atlas frees all cached results on deinit.
+    pub fn shapeRun(self: *Atlas, _: std.mem.Allocator, text: []const u8) ![]ShapedGlyph {
         const font = self.hb_font orelse return error.NoHarfBuzzFont;
-        const buf = c.hb_buffer_create();
-        defer c.hb_buffer_destroy(buf);
+        const buf = self.hb_buf orelse return error.NoHarfBuzzFont;
+
+        // Cache hit?
+        const key = std.hash.Wyhash.hash(0, text);
+        if (self.shape_cache.get(key)) |cached| return cached;
+
+        // Cache miss — shape using the persistent buffer (no per-call
+        // hb_buffer_create/destroy).
+        c.hb_buffer_clear_contents(buf);
         c.hb_buffer_add_utf8(buf, text.ptr, @intCast(text.len), 0, @intCast(text.len));
         c.hb_buffer_guess_segment_properties(buf);
         c.hb_shape(font, buf, null, 0);
         var glyph_count: c_uint = 0;
         const infos = c.hb_buffer_get_glyph_infos(buf, &glyph_count);
         const positions = c.hb_buffer_get_glyph_positions(buf, &glyph_count);
-        const out = try allocator.alloc(ShapedGlyph, glyph_count);
+        // Cap cache so generative streams don't grow it without
+        // bound. 4096 entries × ~64 B = ~256 KB worst case.
+        if (self.shape_cache.count() >= 4096) self.shapeCacheEvictOne();
+        const out = try self.allocator.alloc(ShapedGlyph, glyph_count);
         var i: c_uint = 0;
         while (i < glyph_count) : (i += 1) {
             out[i] = .{
@@ -204,7 +235,23 @@ pub const Atlas = struct {
                 .cluster = infos[i].cluster,
             };
         }
+        self.shape_cache.put(key, out) catch {
+            self.allocator.free(out);
+            return error.OutOfMemory;
+        };
         return out;
+    }
+
+    fn shapeCacheEvictOne(self: *Atlas) void {
+        // First entry — cheap, no LRU. Cache is generous (4096); the
+        // policy barely matters in practice.
+        var it = self.shape_cache.iterator();
+        if (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const slice = entry.value_ptr.*;
+            self.allocator.free(slice);
+            _ = self.shape_cache.remove(key);
+        }
     }
 
     /// Codepoint-keyed lookup. Marks the host page as used.

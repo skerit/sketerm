@@ -602,8 +602,8 @@ pub const CellPass = struct {
             }
             if (blen == 0) continue;
 
+            // Atlas owns the cached shape slice — do NOT free.
             const shaped = atlas.shapeRun(self.allocator, bytes[0..blen]) catch continue;
-            defer self.allocator.free(shaped);
             if (shaped.len == 0 or shaped.len == run_len) continue; // No ligation occurred.
 
             // Clear all run cells' glyphs first; we'll repopulate.
