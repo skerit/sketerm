@@ -258,6 +258,16 @@ pub const Screen = struct {
         placement_id: u32 = 0,
         /// Z-index for stacking.
         z_index: i32 = 0,
+        /// Destination size in cells (Kitty `c=`/`r=`). 0 = render at
+        /// native pixel size.
+        cells_wide: u32 = 0,
+        cells_high: u32 = 0,
+        /// Source-rect crop in image-pixel coords (Kitty `x=`,`y=`,
+        /// `w=`,`h=`). w==0 or h==0 means "use the whole image".
+        src_x: u32 = 0,
+        src_y: u32 = 0,
+        src_w: u32 = 0,
+        src_h: u32 = 0,
     };
 
     pub fn init(allocator: std.mem.Allocator, pool: *Pool, cols: u16, rows: u16) !*Screen {
@@ -992,6 +1002,12 @@ pub const Screen = struct {
             .image_id = outcome.image_id,
             .placement_id = outcome.placement_id,
             .z_index = outcome.z,
+            .cells_wide = outcome.cells_wide,
+            .cells_high = outcome.cells_high,
+            .src_x = outcome.src_x,
+            .src_y = outcome.src_y,
+            .src_w = outcome.src_w,
+            .src_h = outcome.src_h,
         });
         self.dirty = true;
     }

@@ -34,6 +34,21 @@ pub const Command = struct {
     /// R=z-range, P=placement, plus lowercase variants that don't free
     /// data. Default 'a' (all visible). Only inspected when action=delete.
     delete_what: u8 = 'a',
+    /// Source rect in image-pixel coords (`x=`,`y=`,`w=`,`h=`). For
+    /// placements: which sub-region of the image to render. Defaults
+    /// to the whole image when w/h are 0.
+    src_x: u32 = 0,
+    src_y: u32 = 0,
+    src_w: u32 = 0,
+    src_h: u32 = 0,
+    /// Destination size in cells (`c=`,`r=`). When >0 the image is
+    /// scaled to fit exactly this many cells; otherwise it renders at
+    /// native pixel size (1 image-pixel per terminal-pixel).
+    cells_wide: u32 = 0,
+    cells_high: u32 = 0,
+    /// `C=1`: don't move the cursor after placement (the app draws on
+    /// top of the image without scrolling).
+    no_cursor_move: u8 = 0,
     /// Raw payload after the ';'. May be empty.
     payload: []const u8 = &.{},
 };
@@ -97,6 +112,15 @@ fn applyKv(cmd: *Command, key: []const u8, val: []const u8) void {
         'o' => cmd.compression = parseUint(val),
         'q' => cmd.quiet = parseUint(val),
         'm' => cmd.more = parseUint(val),
+        'x' => cmd.src_x = parseUint(val),
+        'y' => cmd.src_y = parseUint(val),
+        'w' => cmd.src_w = parseUint(val),
+        'h' => cmd.src_h = parseUint(val),
+        'c' => cmd.cells_wide = parseUint(val),
+        'r' => cmd.cells_high = parseUint(val),
+        'C' => if (val.len > 0) {
+            cmd.no_cursor_move = val[0];
+        },
         't' => if (val.len > 0) {
             cmd.medium = val[0];
         },

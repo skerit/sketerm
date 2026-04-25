@@ -25,6 +25,17 @@ pub const Image = struct {
     z_index: i32 = 0,
     /// Marked for deletion — flushUploads will free its GL texture.
     deleting: bool = false,
+    /// Destination size in cells. 0 = use native pixel size. When
+    /// non-zero the renderer scales the image to fit cells_wide *
+    /// cell_w x cells_high * cell_h pixels.
+    cells_wide: u32 = 0,
+    cells_high: u32 = 0,
+    /// Source-rect crop (image-pixel coords). When src_w/src_h are
+    /// 0, the whole image is rendered.
+    src_x: u32 = 0,
+    src_y: u32 = 0,
+    src_w: u32 = 0,
+    src_h: u32 = 0,
 };
 
 pub const Store = struct {
@@ -87,18 +98,67 @@ pub const Store = struct {
         placement_id: u32,
         z_index: i32,
     ) !void {
-        const need = width * height * 4;
-        if (rgba.len < need) return error.NotEnoughPixels;
-        const copy = try self.allocator.dupe(u8, rgba[0..need]);
-        try self.images.append(self.allocator, .{
+        try self.addFull(.{
+            .rgba = rgba,
             .width = width,
             .height = height,
-            .cell_row = row,
-            .cell_col = col,
-            .pending = copy,
+            .row = row,
+            .col = col,
             .image_id = image_id,
             .placement_id = placement_id,
             .z_index = z_index,
+        });
+    }
+
+    /// Add with full Kitty placement parameters: cell-grid scaling
+    /// (`cells_wide`/`cells_high`) and source-rect crop.
+    pub const AddOpts = struct {
+        rgba: []const u8,
+        width: u32,
+        height: u32,
+        row: u16,
+        col: u16,
+        image_id: u32 = 0,
+        placement_id: u32 = 0,
+        z_index: i32 = 0,
+        cells_wide: u32 = 0,
+        cells_high: u32 = 0,
+        src_x: u32 = 0,
+        src_y: u32 = 0,
+        src_w: u32 = 0,
+        src_h: u32 = 0,
+    };
+
+    pub fn addFull(self: *Store, o: AddOpts) !void {
+        const need = o.width * o.height * 4;
+        if (o.rgba.len < need) return error.NotEnoughPixels;
+        // Same (image_id, placement_id) replaces — apps that re-place
+        // every frame (emberglyph) would otherwise leak entries.
+        // Mark for delete; flushUploads/flushDeletesNoGL frees pending
+        // and the GL texture next time around.
+        if (o.image_id != 0) {
+            for (self.images.items) |*img| {
+                const same_image = img.image_id == o.image_id;
+                const same_pid = (o.placement_id == 0 and img.placement_id == 0) or img.placement_id == o.placement_id;
+                if (same_image and same_pid) img.deleting = true;
+            }
+        }
+        const copy = try self.allocator.dupe(u8, o.rgba[0..need]);
+        try self.images.append(self.allocator, .{
+            .width = o.width,
+            .height = o.height,
+            .cell_row = o.row,
+            .cell_col = o.col,
+            .pending = copy,
+            .image_id = o.image_id,
+            .placement_id = o.placement_id,
+            .z_index = o.z_index,
+            .cells_wide = o.cells_wide,
+            .cells_high = o.cells_high,
+            .src_x = o.src_x,
+            .src_y = o.src_y,
+            .src_w = o.src_w,
+            .src_h = o.src_h,
         });
     }
 

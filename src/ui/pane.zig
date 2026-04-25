@@ -444,10 +444,22 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
 
 fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
-    self.image_store.addWithPlacement(
-        img.rgba, img.width, img.height, img.row, img.col,
-        img.image_id, img.placement_id, img.z_index,
-    ) catch {};
+    self.image_store.addFull(.{
+        .rgba = img.rgba,
+        .width = img.width,
+        .height = img.height,
+        .row = img.row,
+        .col = img.col,
+        .image_id = img.image_id,
+        .placement_id = img.placement_id,
+        .z_index = img.z_index,
+        .cells_wide = img.cells_wide,
+        .cells_high = img.cells_high,
+        .src_x = img.src_x,
+        .src_y = img.src_y,
+        .src_w = img.src_w,
+        .src_h = img.src_h,
+    }) catch {};
     // Force redraw to upload + display. Set dirty so onTick paints AND
     // queue_draw directly so we don't have to wait a frame.
     self.terminal.screen.dirty = true;

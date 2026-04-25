@@ -48,6 +48,10 @@ pub const Manager = struct {
     store: std.AutoHashMap(u32, StoredImage),
     /// Pending chunked transfers keyed by image_id.
     accums: std.AutoHashMap(u32, Accum),
+    /// image_id of the most recently-started chunked transmit. Kitty
+    /// continuation chunks may omit `i=`, so we route their payload to
+    /// this id. Cleared when the active transmit finalizes.
+    active_transmit_id: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Manager {
         return .{
@@ -74,6 +78,16 @@ pub const Manager = struct {
         image_id: u32,
         placement_id: u32,
         z: i32,
+        /// When >0, scale the placed image to this many cells.
+        /// 0 = render at native pixel size.
+        cells_wide: u32 = 0,
+        cells_high: u32 = 0,
+        /// Source-rect crop (image-pixel coords). w_or_h == 0 means
+        /// "use the whole image".
+        src_x: u32 = 0,
+        src_y: u32 = 0,
+        src_w: u32 = 0,
+        src_h: u32 = 0,
     };
 
     pub fn ingest(self: *Manager, cmd: kitty.Command) Outcome {
@@ -84,12 +98,19 @@ pub const Manager = struct {
             .z = cmd.z,
         };
 
-        // Continuation chunks omit `a=` per kitty spec — when an
-        // accumulator already exists for this image_id, treat
-        // .unknown as "continue the in-progress transfer".
+        // Resolve effective image_id: continuation chunks may omit
+        // `i=` (per kitty spec) — route to whichever transmission is
+        // currently in flight.
+        var effective_id = cmd.image_id;
+        if (effective_id == 0 and self.active_transmit_id != 0) {
+            effective_id = self.active_transmit_id;
+        }
+
+        // Continuation chunks omit `a=` too — when an accumulator
+        // already exists for this id, treat .unknown as "continue".
         var effective = cmd.action;
-        if (effective == .unknown and self.accums.contains(cmd.image_id)) {
-            effective = .transmit_and_place;
+        if (effective == .unknown and self.accums.contains(effective_id)) {
+            effective = .transmit_and_place; // will be overridden below
         }
 
         switch (effective) {
@@ -101,38 +122,56 @@ pub const Manager = struct {
                         .image_id = cmd.image_id,
                         .placement_id = cmd.placement_id,
                         .z = cmd.z,
+                        .cells_wide = cmd.cells_wide,
+                        .cells_high = cmd.cells_high,
+                        .src_x = cmd.src_x,
+                        .src_y = cmd.src_y,
+                        .src_w = cmd.src_w,
+                        .src_h = cmd.src_h,
                     };
                 }
                 return default;
             },
             .transmit, .transmit_and_place => {
                 // Chunked transfer: appended into accum until m=0.
-                const is_first = !self.accums.contains(cmd.image_id);
+                const is_first = !self.accums.contains(effective_id);
                 if (is_first) {
-                    self.accums.put(cmd.image_id, .{
+                    // Treat the original cmd.action as the source of
+                    // truth for what to do on finalize. .unknown can
+                    // only happen for continuation chunks (handled
+                    // above), so this is the FIRST chunk.
+                    self.accums.put(effective_id, .{
                         .format = if (cmd.format == 0) 32 else cmd.format,
                         .width = cmd.width,
                         .height = cmd.height,
                         .medium = cmd.medium,
-                        .action = effective,
+                        .action = cmd.action,
                     }) catch return default;
+                    self.active_transmit_id = effective_id;
                 }
-                if (self.accums.getPtr(cmd.image_id)) |acc| {
+                if (self.accums.getPtr(effective_id)) |acc| {
                     acc.payload.appendSlice(self.allocator, cmd.payload) catch {};
                     if (cmd.more == 1) return default; // wait for more
                 }
                 // Capture the original action BEFORE finalize drops the accum.
-                const original_action: kitty.Action = if (self.accums.getPtr(cmd.image_id)) |a| a.action else effective;
+                const original_action: kitty.Action = if (self.accums.getPtr(effective_id)) |a| a.action else effective;
                 // m=0 (or absent) — finalize.
-                const stored_ok = self.finalize(cmd.image_id) catch false;
+                const stored_ok = self.finalize(effective_id) catch false;
+                if (self.active_transmit_id == effective_id) self.active_transmit_id = 0;
                 if (!stored_ok) return default;
 
                 if (original_action == .transmit_and_place) {
                     return .{
                         .action = .place,
-                        .image_id = cmd.image_id,
+                        .image_id = effective_id,
                         .placement_id = cmd.placement_id,
                         .z = cmd.z,
+                        .cells_wide = cmd.cells_wide,
+                        .cells_high = cmd.cells_high,
+                        .src_x = cmd.src_x,
+                        .src_y = cmd.src_y,
+                        .src_w = cmd.src_w,
+                        .src_h = cmd.src_h,
                     };
                 }
                 return default;

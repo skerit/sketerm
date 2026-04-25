@@ -115,15 +115,44 @@ pub const ImagePass = struct {
             }
             const x: f32 = @as(f32, @floatFromInt(img.cell_col)) * store.cell_w;
             const y: f32 = @as(f32, @floatFromInt(img.cell_row)) * store.cell_h;
-            const w: f32 = @floatFromInt(img.width);
-            const h: f32 = @floatFromInt(img.height);
+
+            // Destination size:
+            //   - cells_wide/cells_high > 0 → scale to that many cells
+            //   - else native pixel size
+            const w: f32 = if (img.cells_wide > 0)
+                @as(f32, @floatFromInt(img.cells_wide)) * store.cell_w
+            else
+                @floatFromInt(img.width);
+            const h: f32 = if (img.cells_high > 0)
+                @as(f32, @floatFromInt(img.cells_high)) * store.cell_h
+            else
+                @floatFromInt(img.height);
+
+            // Source-rect crop: pixel offset → UV [0,1].
+            const uv_x0: f32 = if (img.width > 0)
+                @as(f32, @floatFromInt(img.src_x)) / @as(f32, @floatFromInt(img.width))
+            else
+                0;
+            const uv_y0: f32 = if (img.height > 0)
+                @as(f32, @floatFromInt(img.src_y)) / @as(f32, @floatFromInt(img.height))
+            else
+                0;
+            const uv_x1: f32 = if (img.src_w > 0 and img.width > 0)
+                @as(f32, @floatFromInt(img.src_x + img.src_w)) / @as(f32, @floatFromInt(img.width))
+            else
+                1;
+            const uv_y1: f32 = if (img.src_h > 0 and img.height > 0)
+                @as(f32, @floatFromInt(img.src_y + img.src_h)) / @as(f32, @floatFromInt(img.height))
+            else
+                1;
+
             const verts = [_]Vertex{
-                .{ .pos = .{ x, y }, .uv = .{ 0, 0 } },
-                .{ .pos = .{ x + w, y }, .uv = .{ 1, 0 } },
-                .{ .pos = .{ x, y + h }, .uv = .{ 0, 1 } },
-                .{ .pos = .{ x + w, y }, .uv = .{ 1, 0 } },
-                .{ .pos = .{ x + w, y + h }, .uv = .{ 1, 1 } },
-                .{ .pos = .{ x, y + h }, .uv = .{ 0, 1 } },
+                .{ .pos = .{ x, y }, .uv = .{ uv_x0, uv_y0 } },
+                .{ .pos = .{ x + w, y }, .uv = .{ uv_x1, uv_y0 } },
+                .{ .pos = .{ x, y + h }, .uv = .{ uv_x0, uv_y1 } },
+                .{ .pos = .{ x + w, y }, .uv = .{ uv_x1, uv_y0 } },
+                .{ .pos = .{ x + w, y + h }, .uv = .{ uv_x1, uv_y1 } },
+                .{ .pos = .{ x, y + h }, .uv = .{ uv_x0, uv_y1 } },
             };
             c.glBindTexture(c.GL_TEXTURE_2D, img.gl_tex);
             c.glBufferData(c.GL_ARRAY_BUFFER, @sizeOf(@TypeOf(verts)), &verts, c.GL_DYNAMIC_DRAW);
@@ -131,8 +160,8 @@ pub const ImagePass = struct {
             if (self.debug) {
                 const err = c.glGetError();
                 std.debug.print(
-                    "[image] drew id={d} pos=({d:.0},{d:.0}) size=({d:.0},{d:.0}) tex={d} glErr=0x{x}\n",
-                    .{ img.image_id, x, y, w, h, img.gl_tex, err },
+                    "[image] drew id={d} pos=({d:.0},{d:.0}) size=({d:.0},{d:.0}) cells=({d}x{d}) tex={d} glErr=0x{x}\n",
+                    .{ img.image_id, x, y, w, h, img.cells_wide, img.cells_high, img.gl_tex, err },
                 );
             }
         }

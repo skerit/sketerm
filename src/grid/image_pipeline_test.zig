@@ -18,6 +18,8 @@ const Capture = struct {
     placement_id: u32 = 0,
     z_index: i32 = 0,
     fired: bool = false,
+    cells_wide: u32 = 0,
+    cells_high: u32 = 0,
     allocator: std.mem.Allocator,
 
     fn deinit(self: *Capture) void {
@@ -32,6 +34,8 @@ const Capture = struct {
         self.image_id = ev.image_id;
         self.placement_id = ev.placement_id;
         self.z_index = ev.z_index;
+        self.cells_wide = ev.cells_wide;
+        self.cells_high = ev.cells_high;
         if (self.rgba) |b| self.allocator.free(b);
         self.rgba = self.allocator.dupe(u8, ev.rgba) catch null;
     }
@@ -233,6 +237,59 @@ test "sixel DCS payload fires sink" {
     try std.testing.expect(h.capture.fired);
     try std.testing.expect(h.capture.width >= 2);
     try std.testing.expect(h.capture.height >= 1);
+}
+
+// EmberGlyph pattern: multi-chunk transmit where continuation chunks
+// drop the `i=` field. The kitty spec allows this; we route to the
+// active in-progress transmit by id.
+test "kitty multi-chunk: continuation chunks may omit i=" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+
+    // 4×4 RGBA, 64 bytes — long enough to exercise chunking.
+    var rgba: [64]u8 = undefined;
+    @memset(&rgba, 0xC0);
+    var b64_buf: [128]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &rgba);
+    const mid = b64.len / 2;
+
+    var s1: [256]u8 = undefined;
+    var s2: [256]u8 = undefined;
+    var s3: [128]u8 = undefined;
+
+    // Emberglyph: a=t (transmit only) on first chunk, then bare `m=`
+    // on continuations. After all chunks: a=p to place.
+    const tx1 = try std.fmt.bufPrint(&s1, "\x1b_Gi=77,a=t,f=32,s=4,v=4,m=1;{s}\x1b\\", .{b64[0..mid]});
+    const tx2 = try std.fmt.bufPrint(&s2, "\x1b_Gm=0;{s}\x1b\\", .{b64[mid..]});
+    const place = try std.fmt.bufPrint(&s3, "\x1b_Ga=p,i=77,p=1,c=2,r=2,C=1\x1b\\", .{});
+
+    h.feed(tx1);
+    try std.testing.expect(!h.capture.fired); // mid-transfer
+    h.feed(tx2);
+    try std.testing.expect(!h.capture.fired); // a=t alone, no place
+    try std.testing.expect(h.screen.kitty_images.get(77) != null);
+    h.feed(place);
+    try std.testing.expect(h.capture.fired);
+    try std.testing.expectEqual(@as(u32, 77), h.capture.image_id);
+    // Placement parameters should propagate.
+    try std.testing.expectEqual(@as(u32, 2), h.capture.cells_wide);
+    try std.testing.expectEqual(@as(u32, 2), h.capture.cells_high);
+}
+
+// Ensure cells_wide / cells_high arrive in the sink event so the
+// renderer can scale.
+test "kitty a=T,c=W,r=H propagates cell scale to sink" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+    const rgba = [_]u8{ 0xFF, 0x00, 0x00, 0xFF };
+    var b64_buf: [16]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &rgba);
+    var seq_buf: [128]u8 = undefined;
+    const seq = try std.fmt.bufPrint(&seq_buf, "\x1b_Gi=88,a=T,f=32,s=1,v=1,c=8,r=4;{s}\x1b\\", .{b64});
+    h.feed(seq);
+    try std.testing.expect(h.capture.fired);
+    try std.testing.expectEqual(@as(u32, 8), h.capture.cells_wide);
+    try std.testing.expectEqual(@as(u32, 4), h.capture.cells_high);
 }
 
 // iTerm2 OSC 1337 inline image — small PNG.
