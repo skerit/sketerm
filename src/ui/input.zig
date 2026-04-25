@@ -32,6 +32,7 @@ pub const Action = enum {
     font_dec,
     font_reset,
     search_open,
+    save_layout,
 };
 
 pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allocator) !*Ctx {
@@ -164,6 +165,10 @@ fn onKeyPressed(
             },
             c.GDK_KEY_F, c.GDK_KEY_f => {
                 if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .search_open);
+                return 1;
+            },
+            c.GDK_KEY_S, c.GDK_KEY_s => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .save_layout);
                 return 1;
             },
             else => {},

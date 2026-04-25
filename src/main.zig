@@ -40,6 +40,7 @@ const HELP_TEXT =
     \\  Ctrl+Shift+V          Paste
     \\  Ctrl+Shift+K          Clear screen + scrollback
     \\  Ctrl+Shift+F          Open scrollback search
+    \\  Ctrl+Shift+S          Save current layout (last.json)
     \\  Ctrl+= / Ctrl+-       Increase / decrease font size
     \\  Ctrl+0                Reset font size
     \\  Shift+PgUp / PgDn     Scroll back / forward by one screenful

@@ -984,6 +984,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .font_dec => self.adjustFocusedFontSize(-1),
         .font_reset => self.resetFocusedFontSize(),
         .search_open => self.openSearch(),
+        .save_layout => self.saveLayoutQuietly(),
         else => {},
     }
 }
