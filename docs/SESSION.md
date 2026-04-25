@@ -6,8 +6,7 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~4 hours of uninterrupted implementation
-- 52 commits, ~6.5 kLOC of Zig + 8 kLOC vendored stb_image
+- ~67 commits, ~6.5 kLOC of Zig + 8 kLOC vendored stb_image
 
 ## What got built
 
@@ -35,12 +34,20 @@ Plus extras layered on top of M0-M9:
 | Feature | State |
 |---------|-------|
 | OSC 8 hyperlinks: storage + hover tooltip + Ctrl-click → xdg-open | done |
-| Wide-char (CJK / emoji) — 2-column glyphs + correct continuation cells | done |
+| OSC 7: cwd parsed/stored on Terminal; layout save prefers it over /proc | done |
+| Wide-char (CJK / emoji) — 2-column glyphs + continuation cells | done |
 | Font fallback chain (Hack → Adwaita Mono → Vera Mono → Free → DejaVu → Noto) | done |
-| Cursor blink (500 ms cycle for blinking shapes) | done |
+| Cursor blink (500 ms cycle for blinking shapes) + visual alpha bump | done |
 | Tab rename via GtkPopover with GtkEntry | done |
 | Auto-numbered tab titles ("Tab 1", "Tab 2", …) | done |
-| `--help` / `--version` / `--restore` / `--layout` flags | done |
+| Pane focus highlight (thin accent border) | done |
+| Click-to-focus on pane | done |
+| Selection across scrollback boundary (drag past row 0) | done |
+| IME preedit display at cursor with underline + dark backdrop | done |
+| Snap to bottom on keypress (xterm convention) | done |
+| Memory leak fixes (input_ctx + menu arena → Pane.deinit) | done |
+| Bash shell integration sample (data/sketerm-shell-integration.bash) | done |
+| `--help` / `--version` / `--restore` / `--layout` / `--no-save` flags | done |
 
 ## How to verify
 
