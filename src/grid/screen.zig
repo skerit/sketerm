@@ -556,7 +556,7 @@ pub const Screen = struct {
             return;
         }
         // Set form.
-        if (parseColor(data)) |rgba| {
+        if (Screen.parseColor(data)) |rgba| {
             self.palette[idx] = .{
                 @intFromFloat(@round(rgba[0] * 255.0)),
                 @intFromFloat(@round(rgba[1] * 255.0)),
@@ -737,7 +737,7 @@ pub const Screen = struct {
                 // OSC 10/11/12 fg/bg/cursor color query/set.
                 if (rest.len == 1 and rest[0] == '?') {
                     self.respondColor(num);
-                } else if (parseColor(rest)) |rgba| {
+                } else if (Screen.parseColor(rest)) |rgba| {
                     switch (num) {
                         10 => self.default_fg = rgba,
                         11 => self.default_bg = rgba,
@@ -2374,6 +2374,21 @@ test "IRM shifts cells right" {
     try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 2).rune);
     try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(0, 3).rune);
     // 'd' shifted off the right edge.
+}
+
+test "parseColor handles rgb: and #RRGGBB" {
+    const r1 = Screen.parseColor("rgb:ff/00/80").?;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), r1[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), r1[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), r1[2], 0.01);
+    const r2 = Screen.parseColor("#ff0080").?;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), r2[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), r2[2], 0.01);
+    // 4-hex form.
+    const r3 = Screen.parseColor("rgb:ffff/0000/8080").?;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), r3[0], 0.001);
+    // Bad input.
+    try std.testing.expect(Screen.parseColor("not a color") == null);
 }
 
 test "OSC 4 sets palette index, OSC 104 resets it" {
