@@ -2008,14 +2008,33 @@ pub const Screen = struct {
     fn decrqm(self: *Screen, mode: u32) void {
         const known: ?bool = switch (mode) {
             1 => self.app_cursor_keys,
+            // DECANM — VT52 vs ANSI. We have on_decanm but don't
+            // mirror the parser's vt52 flag here; report ANSI (set)
+            // since it's the steady-state for any sane app.
+            2 => true,
+            3 => false, // DECCOLM is rarely set; default reset
+            5 => self.reverse_screen, // DECSCNM
             6 => self.origin_mode,
             7 => self.autowrap,
+            // 8 (DECARM auto-repeat): always on (controlled by OS).
+            8 => true,
+            // 12 (cursor blink): track via cursor_shape
+            12 => switch (self.cursor_shape) {
+                .block_blink, .underline_blink, .bar_blink => true,
+                else => false,
+            },
             25 => self.cursor_visible,
+            40 => self.allow_decolm,
+            // DECTCEM-bound mouse modes
             1000 => self.mouse_mode == 1000,
             1002 => self.mouse_mode == 1002,
             1003 => self.mouse_mode == 1003,
             1004 => self.focus_reports,
+            // 1005, 1015, 1016: not implemented — report as reset
+            1005, 1015, 1016 => false,
             1006 => self.mouse_sgr,
+            // 1007 (alt-screen scroll): we don't, treat as off.
+            1007 => false,
             1047, 1049 => self.use_alt,
             2004 => self.bracketed_paste,
             else => null,
