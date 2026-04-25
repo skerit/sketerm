@@ -143,6 +143,15 @@ pub const Pane = struct {
         // so they're freed when the pane is destroyed.
         try menu.attach(area_widget, self.menu_arena.allocator(), paneMenuSink, @ptrCast(self));
 
+        // Mouse reporting (DECSET 1006). Click controller covers
+        // press / release for any button; emits the SGR sequence
+        // when mouse_mode is enabled by the shell-side app.
+        const click = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(click), 0); // any button
+        _ = c.g_signal_connect_data(click, "pressed", @ptrCast(&onMousePressed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(click, "released", @ptrCast(&onMouseReleased), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(area_widget, @ptrCast(click));
+
         // Mouse motion → hover tooltip for OSC 8 hyperlinks.
         const motion = c.gtk_event_controller_motion_new();
         _ = c.g_signal_connect_data(
@@ -348,12 +357,51 @@ fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
 
 fn onDragBegin(_: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
-    // Always grab focus on click — important for split panes so
-    // typing goes into the clicked pane, not the previously-focused one.
+    // Always grab focus on click.
     _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+    // If app captures the mouse, don't start a text selection —
+    // the click is going through the click controller as a mouse
+    // report instead.
+    if (self.terminal.screen.mouse_mode != 0) return;
     const cell = self.cellAt(x, y);
     self.terminal.screen.selection.start(cell.row, cell.col, .normal);
     c.gtk_widget_queue_draw(@ptrCast(self.area));
+}
+
+fn onMousePressed(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+    if (self.terminal.screen.mouse_mode == 0) return;
+    emitMouseSeq(self, g, x, y, true);
+}
+
+fn onMouseReleased(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+    if (self.terminal.screen.mouse_mode == 0) return;
+    emitMouseSeq(self, g, x, y, false);
+}
+
+fn emitMouseSeq(self: *Pane, g: *c.GtkGestureClick, x: f64, y: f64, press: bool) void {
+    const button_raw = c.gtk_gesture_single_get_current_button(@ptrCast(g));
+    if (button_raw == 0) return;
+    // Map GTK button numbers (1=L, 2=M, 3=R) to xterm button bits
+    // (0=L, 1=M, 2=R per SGR 1006).
+    const xterm_button: u32 = switch (button_raw) {
+        1 => 0,
+        2 => 1,
+        3 => 2,
+        else => return,
+    };
+    const cell = self.cellAt(x, y);
+    if (cell.row < 0 or cell.col < 0) return;
+    var buf: [32]u8 = undefined;
+    const final: u8 = if (press) 'M' else 'm';
+    const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}{c}", .{
+        xterm_button,
+        @as(u32, @intCast(cell.col + 1)),
+        @as(u32, @intCast(cell.row + 1)),
+        final,
+    }) catch return;
+    _ = self.terminal.pty.writeAll(seq);
 }
 
 fn onDragUpdate(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
