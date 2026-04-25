@@ -806,13 +806,7 @@ fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
                 if (mods & c.GDK_ALT_MASK != 0) base += 8;
                 if (mods & c.GDK_CONTROL_MASK != 0) base += 16;
             }
-            var buf: [32]u8 = undefined;
-            const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}M", .{
-                32 + base,
-                @as(u32, @intCast(cell.col + 1)),
-                @as(u32, @intCast(cell.row + 1)),
-            }) catch return;
-            _ = self.terminal.pty.writeAll(seq);
+            self.writeMouseEvent(32 + base, @as(u32, @intCast(cell.col + 1)), @as(u32, @intCast(cell.row + 1)), x, y, true);
         }
     }
 
@@ -962,15 +956,88 @@ fn emitMouseSeq(self: *Pane, g: *c.GtkGestureClick, x: f64, y: f64, press: bool)
     }
     const cell = self.cellAt(x, y);
     if (cell.row < 0 or cell.col < 0) return;
-    var buf: [32]u8 = undefined;
-    const final: u8 = if (press) 'M' else 'm';
-    const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}{c}", .{
-        @as(u32, @intCast(xterm_button)),
-        @as(u32, @intCast(cell.col + 1)),
-        @as(u32, @intCast(cell.row + 1)),
-        final,
-    }) catch return;
-    _ = self.terminal.pty.writeAll(seq);
+    self.writeMouseEvent(@intCast(xterm_button), @intCast(cell.col + 1), @intCast(cell.row + 1), x, y, press);
+}
+
+/// Encode a single mouse event using the screen's currently-active
+/// encoding flavour and write it back to the PTY. Cell coords are
+/// 1-based; pixel coords are widget-local pixels (used by
+/// DECSET 1016 only). `press=true` is press / motion / wheel;
+/// `press=false` is button release (only emitted by SGR/SGR-pixel).
+fn writeMouseEvent(self: *Pane, button: u32, col_1: u32, row_1: u32, px_x: f64, px_y: f64, press: bool) void {
+    const screen = self.terminal.screen;
+    const px_x_u: u32 = @intFromFloat(@max(@as(f64, 0), px_x));
+    const px_y_u: u32 = @intFromFloat(@max(@as(f64, 0), px_y));
+    var buf: [64]u8 = undefined;
+    switch (screen.mouse_enc) {
+        .sgr => {
+            const final: u8 = if (press) 'M' else 'm';
+            const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}{c}", .{ button, col_1, row_1, final }) catch return;
+            _ = self.terminal.pty.writeAll(seq);
+        },
+        .sgr_pixel => {
+            const final: u8 = if (press) 'M' else 'm';
+            const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}{c}", .{ button, px_x_u, px_y_u, final }) catch return;
+            _ = self.terminal.pty.writeAll(seq);
+        },
+        .urxvt => {
+            // urxvt: ESC [ b+32 ; col ; row M  — releases not distinct;
+            // apps reading 1015 expect a press-shaped event with
+            // button = 3 + modifier bits when buttons go up.
+            const b: u32 = if (press) button else 3 | (button & 0x1C);
+            const seq = std.fmt.bufPrint(&buf, "\x1b[{d};{d};{d}M", .{ b + 32, col_1, row_1 }) catch return;
+            _ = self.terminal.pty.writeAll(seq);
+        },
+        .legacy => {
+            const cb_val: u32 = if (press) button + 32 else (3 | (button & 0x1C)) + 32;
+            const cx_clamp: u32 = @min(col_1 + 32, 255);
+            const cy_clamp: u32 = @min(row_1 + 32, 255);
+            const out = [_]u8{
+                0x1B, '[', 'M',
+                @intCast(@min(cb_val, 0xFF)),
+                @intCast(cx_clamp),
+                @intCast(cy_clamp),
+            };
+            _ = self.terminal.pty.writeAll(&out);
+        },
+        .utf8 => {
+            const cb_val: u32 = if (press) button + 32 else (3 | (button & 0x1C)) + 32;
+            var off: usize = 0;
+            buf[off] = 0x1B;
+            off += 1;
+            buf[off] = '[';
+            off += 1;
+            buf[off] = 'M';
+            off += 1;
+            buf[off] = @intCast(@min(cb_val, 0xFF));
+            off += 1;
+            off += encodeUtf8Cp(buf[off..], col_1 + 32);
+            off += encodeUtf8Cp(buf[off..], row_1 + 32);
+            _ = self.terminal.pty.writeAll(buf[0..off]);
+        },
+    }
+}
+
+/// Minimal UTF-8 encoder for mouse-mode 1005. Codepoints up to
+/// 0x7FF need 2 bytes; >0x7FF (very wide windows) need 3.
+fn encodeUtf8Cp(out: []u8, cp: u32) usize {
+    if (cp < 0x80) {
+        if (out.len < 1) return 0;
+        out[0] = @intCast(cp);
+        return 1;
+    } else if (cp < 0x800) {
+        if (out.len < 2) return 0;
+        out[0] = @intCast(0xC0 | (cp >> 6));
+        out[1] = @intCast(0x80 | (cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        if (out.len < 3) return 0;
+        out[0] = @intCast(0xE0 | (cp >> 12));
+        out[1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = @intCast(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    return 0;
 }
 
 fn onDragUpdate(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
@@ -1043,7 +1110,7 @@ fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
     if (screen.mouse_mode > 0 and screen.use_alt) {
         if (dy == 0) return 1;
         var button: u32 = if (dy < 0) 64 else 65; // 64 = btn4, 65 = btn5
-        // Modifier bits (SGR 1006): +4 shift, +8 alt, +16 ctrl.
+        // Modifier bits: +4 shift, +8 alt, +16 ctrl.
         const ev = c.gtk_event_controller_get_current_event(@ptrCast(g));
         if (ev != null) {
             const mods = c.gdk_event_get_modifier_state(ev);
@@ -1053,13 +1120,11 @@ fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
         }
         const row: i32 = if (self.last_motion_row >= 0) self.last_motion_row else 0;
         const col: i32 = if (self.last_motion_col >= 0) self.last_motion_col else 0;
-        var buf: [32]u8 = undefined;
-        const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}M", .{
-            button,
-            @as(u32, @intCast(col + 1)),
-            @as(u32, @intCast(row + 1)),
-        }) catch return 1;
-        _ = self.terminal.pty.writeAll(seq);
+        const cw_px: f64 = if (self.atlas) |a| @floatFromInt(a.cell_w) else 0.0;
+        const ch_px: f64 = if (self.atlas) |a| @floatFromInt(a.cell_h) else 0.0;
+        const px = @as(f64, @floatFromInt(col)) * cw_px;
+        const py = @as(f64, @floatFromInt(row)) * ch_px;
+        self.writeMouseEvent(button, @as(u32, @intCast(col + 1)), @as(u32, @intCast(row + 1)), px, py, true);
         return 1;
     }
 

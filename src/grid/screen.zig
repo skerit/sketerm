@@ -106,6 +106,10 @@ pub const Screen = struct {
     mouse_mode: u16 = 0,
     /// Mouse encoding (1006/1015 etc).
     mouse_sgr: bool = false,
+    /// Mouse-encoding flavour: legacy X10 default; promoted by
+    /// DECSET 1005 (UTF-8), 1006 (SGR — kept in sync with mouse_sgr
+    /// for back-compat), 1015 (urxvt), 1016 (SGR pixel).
+    mouse_enc: MouseEnc = .legacy,
 
     /// Pending wrap: cursor "logically" past col cols-1, awaiting
     /// next print to actually wrap. Matches xterm semantics.
@@ -233,6 +237,17 @@ pub const Screen = struct {
 
     pub const Charset = enum { ascii, dec_graphics };
     pub const ActiveCharset = enum { g0, g1 };
+
+    /// Mouse-event encoding format. Apps select one via DECSET
+    /// 1005/1006/1015/1016 (mutually exclusive in practice — last
+    /// set wins). `legacy` is the X10 byte-tuple format.
+    pub const MouseEnc = enum {
+        legacy, // ESC [ M Cb Cx Cy (3 bytes after M; +32 each)
+        utf8, // 1005 — same shape but Cx/Cy UTF-8 to allow >223
+        sgr, // 1006 — ESC [ < b ; col ; row M/m (M=press, m=release)
+        urxvt, // 1015 — ESC [ b+32 ; col ; row M
+        sgr_pixel, // 1016 — like SGR but col/row in pixels
+    };
 
     /// DEC special graphics translation. Only applies to bytes
     /// 0x60..0x7E in the ASCII range; outside that range the byte
@@ -2229,9 +2244,10 @@ pub const Screen = struct {
             1002 => self.mouse_mode == 1002,
             1003 => self.mouse_mode == 1003,
             1004 => self.focus_reports,
-            // 1005, 1015, 1016: not implemented — report as reset
-            1005, 1015, 1016 => false,
-            1006 => self.mouse_sgr,
+            1005 => self.mouse_enc == .utf8,
+            1006 => self.mouse_enc == .sgr,
+            1015 => self.mouse_enc == .urxvt,
+            1016 => self.mouse_enc == .sgr_pixel,
             // 1007 (alt-screen scroll): we don't, treat as off.
             1007 => false,
             1047, 1049 => self.use_alt,
@@ -2428,6 +2444,7 @@ pub const Screen = struct {
         self.app_keypad = false;
         self.mouse_mode = 0;
         self.mouse_sgr = false;
+        self.mouse_enc = .legacy;
         self.pending_wrap = false;
         self.charset_g0 = .ascii;
         self.charset_g1 = .ascii;
@@ -2459,6 +2476,7 @@ pub const Screen = struct {
         self.app_keypad = false;
         self.mouse_mode = 0;
         self.mouse_sgr = false;
+        self.mouse_enc = .legacy;
         self.bracketed_paste = false;
         self.focus_reports = false;
         self.cursor_visible = true;
@@ -2868,7 +2886,13 @@ pub const Screen = struct {
                 1002 => self.mouse_mode = if (set) 1002 else 0,
                 1003 => self.mouse_mode = if (set) 1003 else 0,
                 1004 => self.focus_reports = set,
-                1006 => self.mouse_sgr = set,
+                1005 => self.mouse_enc = if (set) .utf8 else .legacy,
+                1006 => {
+                    self.mouse_sgr = set;
+                    self.mouse_enc = if (set) .sgr else .legacy;
+                },
+                1015 => self.mouse_enc = if (set) .urxvt else .legacy,
+                1016 => self.mouse_enc = if (set) .sgr_pixel else .legacy,
                 1047 => self.toggleAltScreen(set),
                 1049 => {
                     // 1049 = save cursor + switch alt + clear alt on
@@ -3542,6 +3566,75 @@ test "DECRQM reports mode state" {
     const got = TestSink.captured[0..TestSink.captured_len];
     // Autowrap is on by default → set → reply Ps=1.
     try std.testing.expectEqualStrings("\x1b[?7;1$y", got);
+}
+
+test "mouse encoding modes are mutually-exclusive last-set" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    try std.testing.expectEqual(Screen.MouseEnc.legacy, s.mouse_enc);
+
+    // DECSET 1006 (SGR)
+    var csi = Event.Csi{};
+    csi.private = '?';
+    csi.params[0] = 1006;
+    csi.n_params = 1;
+    csi.final = 'h';
+    s.csi(csi);
+    try std.testing.expectEqual(Screen.MouseEnc.sgr, s.mouse_enc);
+
+    // DECSET 1015 (urxvt) — supersedes
+    csi.params[0] = 1015;
+    s.csi(csi);
+    try std.testing.expectEqual(Screen.MouseEnc.urxvt, s.mouse_enc);
+
+    // DECSET 1016 (SGR-pixel)
+    csi.params[0] = 1016;
+    s.csi(csi);
+    try std.testing.expectEqual(Screen.MouseEnc.sgr_pixel, s.mouse_enc);
+
+    // DECRST 1016 → back to legacy
+    csi.final = 'l';
+    s.csi(csi);
+    try std.testing.expectEqual(Screen.MouseEnc.legacy, s.mouse_enc);
+}
+
+test "DECRQM reports 1005/1015/1016" {
+    const TestSink = struct {
+        var captured: [64]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+    s.mouse_enc = .urxvt;
+
+    // Query 1015 — should be set.
+    TestSink.captured_len = 0;
+    var csi = Event.Csi{};
+    csi.private = '?';
+    csi.intermediates[0] = '$';
+    csi.n_intermediates = 1;
+    csi.params[0] = 1015;
+    csi.n_params = 1;
+    csi.final = 'p';
+    s.csi(csi);
+    try std.testing.expectEqualStrings("\x1b[?1015;1$y", TestSink.captured[0..TestSink.captured_len]);
+
+    // Query 1006 — should be reset.
+    TestSink.captured_len = 0;
+    csi.params[0] = 1006;
+    s.csi(csi);
+    try std.testing.expectEqualStrings("\x1b[?1006;2$y", TestSink.captured[0..TestSink.captured_len]);
 }
 
 test "soft-wrap selection joins without newline" {
