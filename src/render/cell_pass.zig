@@ -325,15 +325,22 @@ pub const CellPass = struct {
         pool: *const StylePool,
         atlas: *Atlas,
     ) !void {
-        // Sync default fg/bg / palette / reverse-screen swap.
-        if (screen.reverse_screen) {
-            self.default_fg = screen.default_bg;
-            self.default_bg = screen.default_fg;
-        } else {
-            self.default_fg = screen.default_fg;
-            self.default_bg = screen.default_bg;
-        }
+        // Sync default fg/bg / palette / reverse-screen swap. When any
+        // of these CHANGES from last frame, every cell whose color
+        // resolved to default / palette has stale RGBA in the instance
+        // VBO — force a full rebuild so colors get re-resolved.
+        const want_fg: [4]f32 = if (screen.reverse_screen) screen.default_bg else screen.default_fg;
+        const want_bg: [4]f32 = if (screen.reverse_screen) screen.default_fg else screen.default_bg;
+        const colors_changed =
+            !std.mem.eql(f32, &self.default_fg, &want_fg) or
+            !std.mem.eql(f32, &self.default_bg, &want_bg) or
+            !std.mem.eql(u8, std.mem.asBytes(&self.palette), std.mem.asBytes(&screen.palette));
+        self.default_fg = want_fg;
+        self.default_bg = want_bg;
         self.palette = screen.palette;
+        if (colors_changed) {
+            for (self.row_needs_upload.items) |*r| r.* = true;
+        }
 
         // Capacity: includes scrollback view rows. The instance grid
         // shows exactly screen.rows lines; scrollback content is
