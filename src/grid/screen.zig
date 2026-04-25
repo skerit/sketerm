@@ -2239,6 +2239,26 @@ test "tab_stops resize keeps existing on shrink, pads on grow" {
     try std.testing.expect(s.tab_stops.items[16]);
 }
 
+test "clearAndScrollback wipes screen + ring + cursor home" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 2);
+    defer s.deinit();
+    inline for ("hello") |ch| s.printCp(ch);
+    s.execute('\r');
+    s.execute('\n');
+    inline for ("world") |ch| s.printCp(ch);
+    s.execute('\r');
+    s.execute('\n');
+    inline for ("x") |ch| s.printCp(ch);
+    try std.testing.expect(s.scrollbackCount() > 0);
+    s.clearAndScrollback();
+    try std.testing.expectEqual(@as(u32, 0), s.scrollbackCount());
+    try std.testing.expectEqual(@as(u16, 0), s.row);
+    try std.testing.expectEqual(@as(u16, 0), s.col);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 0).rune);
+}
+
 test "IRM shifts cells right" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
