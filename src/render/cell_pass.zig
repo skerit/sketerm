@@ -541,6 +541,31 @@ pub const CellPass = struct {
             const run_len = col - run_start;
             if (run_len < 2) continue;
 
+            // Cheap eligibility filter: ligatures in mainstream
+            // programming fonts (Fira Code, JetBrains Mono, Cascadia,
+            // Iosevka, Hasklug, etc.) only fire on punctuation glyphs.
+            // Pure alphanumeric runs cost nothing in the glyph layout
+            // pass already; calling hb_shape on them is wasted work.
+            // Skip the run unless it contains at least one of the
+            // common ligature trigger characters.
+            var lig_eligible = false;
+            {
+                var k: u16 = 0;
+                while (k < run_len) : (k += 1) {
+                    const cp = cells[run_start + k].rune;
+                    switch (cp) {
+                        '=', '<', '>', '!', '-', ':', '&', '|',
+                        '+', '*', '/', '?', '#', '~', '$', '.', '@',
+                        => {
+                            lig_eligible = true;
+                            break;
+                        },
+                        else => {},
+                    }
+                }
+            }
+            if (!lig_eligible) continue;
+
             // Build UTF-8 of the run.
             var bytes: [256]u8 = undefined;
             var blen: usize = 0;
