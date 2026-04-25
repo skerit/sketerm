@@ -429,10 +429,17 @@ pub const CellPass = struct {
             slice[col].cell_xy = .{ cx, y };
             slice[col].cell_size = .{ cell_w, ch };
 
-            // Resolve fg + bg to RGBA. Reverse video swaps the two
-            // (irrespective of color source — palette + rgb cells
-            // also flip on reverse, matching xterm/iTerm2 semantics).
-            var fg_rgba = self.colorToRGBA(style.fg, true);
+            // Resolve fg + bg to RGBA. Bold lifts palette indices 0..7
+            // into the bright 8..15 slots (xterm convention); doesn't
+            // affect rgb / 256-color / default. Reverse video swaps
+            // fg/bg of the cell — including explicit colors.
+            var fg_color = style.fg;
+            if (style.attrs.bold) {
+                if (fg_color == .palette and fg_color.palette < 8) {
+                    fg_color = .{ .palette = fg_color.palette + 8 };
+                }
+            }
+            var fg_rgba = self.colorToRGBA(fg_color, true);
             var bg_rgba = self.colorToRGBA(style.bg, false);
             var has_explicit_bg = style.bg != .default;
             if (style.attrs.reverse) {
