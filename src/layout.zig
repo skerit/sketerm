@@ -11,6 +11,9 @@ pub const Orient = enum { horizontal, vertical };
 pub const PaneSpec = struct {
     cwd: []const u8,
     command: []const []const u8,
+    /// Optional per-pane font override — set when the user has
+    /// changed the font size for this pane via Ctrl+= / Ctrl+-.
+    font_size: ?u16 = null,
 };
 
 pub const SplitSpec = struct {

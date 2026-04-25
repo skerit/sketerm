@@ -359,6 +359,14 @@ pub const Window = struct {
                 const pane = try self.makePane(term);
                 pane.win_clip_ctx = @ptrCast(self);
                 pane.win_on_clipboard = onTermClipboardSet;
+                pane.win_notify_ctx = @ptrCast(self);
+                pane.win_on_notification = onTermNotification;
+                pane.win_bell_ctx = @ptrCast(self);
+                pane.win_on_bell = onTermBell;
+                pane.font_size = p.font_size orelse self.config.font_size;
+                pane.font_path = self.config.font_path;
+                pane.grid_pass.pad = self.config.padding;
+                pane.grid_pass.enable_ligatures = self.config.ligatures;
 
                 try self.panes.append(self.allocator, pane);
                 try self.terminals.append(self.allocator, term);
@@ -942,7 +950,10 @@ pub const Window = struct {
                     layout_mod.cwdOfPid(p.terminal.pty.child_pid, arena) catch try arena.dupe(u8, "/");
                 const cmd = try arena.alloc([]const u8, 1);
                 cmd[0] = try arena.dupe(u8, std.posix.getenv("SHELL") orelse "/bin/bash");
-                return .{ .pane = .{ .cwd = cwd, .command = cmd } };
+                // Save font_size only if it diverges from the global
+                // default — keeps layout files terse.
+                const fs: ?u16 = if (p.font_size != self.config.font_size) p.font_size else null;
+                return .{ .pane = .{ .cwd = cwd, .command = cmd, .font_size = fs } };
             }
         }
         return error.PaneNotFound;
