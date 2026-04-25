@@ -193,7 +193,7 @@ pub const Terminal = struct {
                 var buf: [16384]u8 = undefined;
                 const r = c.read(self.pty.master_fd, &buf, buf.len);
                 if (r <= 0) {
-                    self.pushSpinning(.{ .child_eof = 0 });
+                    self.pushSpinning(.{ .child_eof = self.reapStatus() });
                     self.scheduleDrain();
                     break;
                 }
@@ -202,11 +202,21 @@ pub const Terminal = struct {
             }
 
             if (pfds[0].revents & (c.POLLHUP | c.POLLERR) != 0) {
-                self.pushSpinning(.{ .child_eof = 0 });
+                self.pushSpinning(.{ .child_eof = self.reapStatus() });
                 self.scheduleDrain();
                 break;
             }
         }
+    }
+
+    /// Non-blocking waitpid; returns 0 if child not yet reaped or
+    /// the WEXITSTATUS-style code (or -signo for fatal signals).
+    fn reapStatus(self: *Terminal) i32 {
+        var status: c_int = 0;
+        const r = c.waitpid(self.pty.child_pid, &status, c.WNOHANG);
+        if (r != self.pty.child_pid) return 0;
+        if ((status & 0x7F) == 0) return @intCast((status >> 8) & 0xFF); // WIFEXITED
+        return -@as(i32, @intCast(status & 0x7F)); // WIFSIGNALED → -signo
     }
 
     fn emitFromWorker(ctx: ?*anyopaque, ev: Event) void {
