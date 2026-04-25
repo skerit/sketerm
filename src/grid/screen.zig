@@ -1796,7 +1796,19 @@ pub const Screen = struct {
     /// excluding control bytes 0x00..0x1F). Used to skip the UTF-8
     /// decoder on pure-ASCII print runs.
     fn runIsAscii(bytes: []const u8) bool {
-        for (bytes) |b| {
+        var i: usize = 0;
+        const V = @Vector(16, u8);
+        const v_min: V = @splat(0x20);
+        const v_max: V = @splat(0x7E);
+        while (i + 16 <= bytes.len) : (i += 16) {
+            const chunk: V = bytes[i..][0..16].*;
+            const ge_min = chunk >= v_min;
+            const le_max = chunk <= v_max;
+            const ok: @Vector(16, bool) = @select(bool, ge_min, le_max, @as(@Vector(16, bool), @splat(false)));
+            if (!@reduce(.And, ok)) return false;
+        }
+        while (i < bytes.len) : (i += 1) {
+            const b = bytes[i];
             if (b < 0x20 or b > 0x7E) return false;
         }
         return true;
