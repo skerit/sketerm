@@ -41,6 +41,7 @@ pub const Terminal = struct {
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
     on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void = null,
     on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
+    on_pointer_shape: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
 
     /// Most recent cwd reported via OSC 7 (file://host/path → /path).
     /// Owned. Used by layout save in preference to /proc lookup.
@@ -99,6 +100,7 @@ pub const Terminal = struct {
             .on_image_delete_full = sinkImageDeleteFull,
             .on_decanm = sinkDecanm,
             .on_notification = sinkNotification,
+            .on_pointer_shape = sinkPointerShape,
         };
 
         self.worker_thread = try std.Thread.spawn(.{}, workerMain, .{self});
@@ -163,6 +165,11 @@ pub const Terminal = struct {
     fn sinkNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
         if (self.on_notification) |f| f(self.user_ctx, title, body);
+    }
+
+    fn sinkPointerShape(ctx: ?*anyopaque, name: []const u8) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_pointer_shape) |f| f(self.user_ctx, name);
     }
 
     pub fn deinit(self: *Terminal) void {

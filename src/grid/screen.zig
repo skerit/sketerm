@@ -277,6 +277,11 @@ pub const Screen = struct {
         on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
         /// Kitty delete dispatch with full delete-action context.
         on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: ImageDeleteEvent) void = null,
+        /// OSC 22 ; <name> — set X11 / GTK mouse-cursor shape. Names
+        /// follow the X cursor font ("hand2", "watch", "crosshair",
+        /// "text", "default", etc.); GTK accepts the same set via
+        /// `gtk_widget_set_cursor_from_name`.
+        on_pointer_shape: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
         /// DECANM toggle (DECSET/DECRST 2). When `set == false`,
         /// the parser switches into VT52 mode; when true, returns to
         /// ANSI/VT100. Terminal wires this to its Parser.vt52_mode.
@@ -1453,6 +1458,12 @@ pub const Screen = struct {
             },
             7 => {
                 if (self.sink.on_cwd) |f| f(self.sink.ctx, rest);
+            },
+            22 => {
+                // OSC 22 ; <name> — change mouse pointer shape. Empty
+                // payload restores default. Unknown shape name is the
+                // sink's responsibility.
+                if (self.sink.on_pointer_shape) |f| f(self.sink.ctx, rest);
             },
             4 => self.handleOsc4(rest),
             8 => self.handleOsc8(rest),
@@ -3499,6 +3510,27 @@ test "SGR 4;3 sets underline AND italic (semicolon — separate params)" {
     try std.testing.expect(e.attrs.underline);
     try std.testing.expect(e.attrs.italic);
     try std.testing.expect(!e.attrs.curly_underline);
+}
+
+test "OSC 22: pointer shape sink fires" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+
+    const Spy = struct {
+        var got: [32]u8 = undefined;
+        var got_len: usize = 0;
+        fn cb(_: ?*anyopaque, name: []const u8) void {
+            const n = @min(name.len, got.len);
+            @memcpy(got[0..n], name[0..n]);
+            got_len = n;
+        }
+    };
+    Spy.got_len = 0;
+    s.sink.on_pointer_shape = Spy.cb;
+    s.onOsc("22;hand2");
+    try std.testing.expectEqualStrings("hand2", Spy.got[0..Spy.got_len]);
 }
 
 test "title stack (CSI 22/23 t) push + pop" {

@@ -109,6 +109,7 @@ pub const Pane = struct {
         terminal.on_clipboard_set = onClipboardEvent;
         terminal.on_notification = onNotificationEvent;
         terminal.on_bell = onBellEvent;
+        terminal.on_pointer_shape = onPointerShapeEvent;
 
         _ = c.g_signal_connect_data(
             area_widget,
@@ -572,6 +573,23 @@ fn onNotificationEvent(ctx: ?*anyopaque, title: []const u8, body: []const u8) vo
 fn onBellEvent(ctx: ?*anyopaque) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
     if (self.win_on_bell) |f| f(self.win_bell_ctx, self);
+}
+
+/// OSC 22 — set the GTK pointer (mouse cursor) shape over this pane.
+/// Empty name → restore default. Names are X cursor identifiers like
+/// "default", "hand2", "watch", "crosshair", "text".
+fn onPointerShapeEvent(ctx: ?*anyopaque, name: []const u8) void {
+    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    if (name.len == 0) {
+        c.gtk_widget_set_cursor(@ptrCast(self.area), null);
+        return;
+    }
+    // Need a NUL-terminated copy for gtk_widget_set_cursor_from_name.
+    var buf: [64]u8 = undefined;
+    if (name.len >= buf.len) return;
+    @memcpy(buf[0..name.len], name);
+    buf[name.len] = 0;
+    c.gtk_widget_set_cursor_from_name(@ptrCast(self.area), &buf);
 }
 
 fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {
