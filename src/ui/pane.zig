@@ -843,7 +843,7 @@ fn emitMouseSeq(self: *Pane, g: *c.GtkGestureClick, x: f64, y: f64, press: bool)
     if (button_raw == 0) return;
     // Map GTK button numbers (1=L, 2=M, 3=R) to xterm button bits
     // (0=L, 1=M, 2=R per SGR 1006).
-    const xterm_button: i32 = switch (button_raw) {
+    var xterm_button: i32 = switch (button_raw) {
         1 => 0,
         2 => 1,
         3 => 2,
@@ -853,6 +853,14 @@ fn emitMouseSeq(self: *Pane, g: *c.GtkGestureClick, x: f64, y: f64, press: bool)
         self.held_button = xterm_button;
     } else if (self.held_button == xterm_button) {
         self.held_button = -1;
+    }
+    // Encode modifiers per xterm SGR 1006: +4 shift, +8 meta/alt, +16 ctrl.
+    const ev = c.gtk_event_controller_get_current_event(@ptrCast(g));
+    if (ev != null) {
+        const mods = c.gdk_event_get_modifier_state(ev);
+        if (mods & c.GDK_SHIFT_MASK != 0) xterm_button += 4;
+        if (mods & c.GDK_ALT_MASK != 0) xterm_button += 8;
+        if (mods & c.GDK_CONTROL_MASK != 0) xterm_button += 16;
     }
     const cell = self.cellAt(x, y);
     if (cell.row < 0 or cell.col < 0) return;
@@ -922,7 +930,7 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
     }
 }
 
-fn onScroll(_: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Pane = @ptrCast(@alignCast(user.?));
     const screen = self.terminal.screen;
 
@@ -931,7 +939,15 @@ fn onScroll(_: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
     // adjusting the (irrelevant) scrollback view.
     if (screen.mouse_mode > 0 and screen.use_alt) {
         if (dy == 0) return 1;
-        const button: u32 = if (dy < 0) 64 else 65; // 64 = btn4, 65 = btn5
+        var button: u32 = if (dy < 0) 64 else 65; // 64 = btn4, 65 = btn5
+        // Modifier bits (SGR 1006): +4 shift, +8 alt, +16 ctrl.
+        const ev = c.gtk_event_controller_get_current_event(@ptrCast(g));
+        if (ev != null) {
+            const mods = c.gdk_event_get_modifier_state(ev);
+            if (mods & c.GDK_SHIFT_MASK != 0) button += 4;
+            if (mods & c.GDK_ALT_MASK != 0) button += 8;
+            if (mods & c.GDK_CONTROL_MASK != 0) button += 16;
+        }
         const row: i32 = if (self.last_motion_row >= 0) self.last_motion_row else 0;
         const col: i32 = if (self.last_motion_col >= 0) self.last_motion_col else 0;
         var buf: [32]u8 = undefined;
