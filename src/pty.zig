@@ -124,11 +124,31 @@ pub const Pty = struct {
         _ = c.ioctl(self.master_fd, c.TIOCSWINSZ, &ws);
     }
 
-    /// Close master and reap child synchronously. SIGCHLD path is
-    /// preferable in a real loop; this is for explicit shutdown.
+    /// Close master and reap child. Closing the master delivers SIGHUP
+    /// to the child via the kernel; most shells exit immediately. If
+    /// the child ignores SIGHUP we escalate to TERM, then KILL.
     pub fn closeAndReap(self: Pty) void {
         _ = c.close(self.master_fd);
         var status: c_int = 0;
+        // Phase 1: poll for natural exit (~300 ms total).
+        var i: u32 = 0;
+        while (i < 30) : (i += 1) {
+            const r = c.waitpid(self.child_pid, &status, c.WNOHANG);
+            if (r == self.child_pid) return;
+            if (r < 0) return;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+        // Phase 2: SIGTERM, poll briefly.
+        _ = c.kill(self.child_pid, c.SIGTERM);
+        i = 0;
+        while (i < 20) : (i += 1) {
+            const r = c.waitpid(self.child_pid, &status, c.WNOHANG);
+            if (r == self.child_pid) return;
+            if (r < 0) return;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+        // Phase 3: SIGKILL, blocking wait.
+        _ = c.kill(self.child_pid, c.SIGKILL);
         _ = c.waitpid(self.child_pid, &status, 0);
     }
 
