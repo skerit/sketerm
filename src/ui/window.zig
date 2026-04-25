@@ -1301,6 +1301,13 @@ fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
     while (i < self.panes.items.len) {
         const pane = self.panes.items[i];
         if (widgetIsAncestor(root, pane.widget())) {
+            // If the search bar is currently targeting this pane,
+            // close it before tearing the pane down — otherwise
+            // applyCurrentMatch / nextMatch would deref a dead Pane
+            // and the search_highlights slice would become a
+            // dangling pointer into freed Window memory.
+            if (self.search_pane == pane) self.closeSearch();
+
             const term = pane.terminal;
             _ = self.panes.orderedRemove(i);
             for (self.terminals.items, 0..) |t, ti| {
