@@ -171,6 +171,13 @@ pub const Pane = struct {
         c.gtk_widget_add_controller(area_widget, @ptrCast(motion));
         c.gtk_widget_set_has_tooltip(area_widget, 1);
 
+        // Focus reporting (DECSET 1004). Apps that opt in get
+        // \x1b[I on enter, \x1b[O on leave.
+        const focus = c.gtk_event_controller_focus_new();
+        _ = c.g_signal_connect_data(focus, "enter", @ptrCast(&onFocusEnter), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(focus, "leave", @ptrCast(&onFocusLeave), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(area_widget, @ptrCast(focus));
+
         return self;
     }
 
@@ -354,6 +361,20 @@ fn paneMenuSink(ctx: ?*anyopaque, action: menu.Action) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
     if (self.handleMenuLocal(action)) return;
     if (self.menu_sink) |f| f(self.menu_sink_ctx, action);
+}
+
+fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+    if (self.terminal.screen.focus_reports) {
+        _ = self.terminal.pty.writeAll("\x1b[I");
+    }
+}
+
+fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+    if (self.terminal.screen.focus_reports) {
+        _ = self.terminal.pty.writeAll("\x1b[O");
+    }
 }
 
 fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
