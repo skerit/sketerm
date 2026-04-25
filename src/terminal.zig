@@ -302,6 +302,15 @@ fn debugFormatEvent(w: *std.io.Writer, ev: Event) !void {
                 try w.print("\\x{x:0>2}", .{b});
             }
         },
+        .print_run => |run| {
+            for (run.bytes[0..run.len]) |b| {
+                if (b >= 0x20 and b < 0x7F) {
+                    try w.print("{c}", .{b});
+                } else {
+                    try w.print("\\x{x:0>2}", .{b});
+                }
+            }
+        },
         .execute => |b| {
             switch (b) {
                 '\r' => try w.print("[CR]", .{}),

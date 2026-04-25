@@ -58,12 +58,29 @@ pub const Parser = struct {
     /// 0 = none, 1 = expecting row byte, 2 = expecting col byte.
     vt52_y_state: u8 = 0,
     vt52_y_row: u8 = 0,
+    /// Batched printable bytes from Ground state — flushed as a
+    /// single `print_run` event when a non-printable byte arrives or
+    /// the buffer fills. Cuts per-event overhead substantially for
+    /// "shell prints long line" workloads.
+    print_buf: [64]u8 = .{0} ** 64,
+    print_len: u8 = 0,
 
     /// Hard cap on osc_buf growth; refusing further bytes once
     /// exceeded. 16 MiB is comfortably above the largest kitty
     /// graphics transmission a sane app would ever emit, and below
     /// "OOM the parser" territory.
     pub const osc_max: usize = 16 * 1024 * 1024;
+
+    /// Flush any accumulated printable run — emits a single
+    /// print_run event and resets the buffer. Cheap when empty.
+    fn flushPrint(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {
+        if (self.print_len == 0) return;
+        var run: Event.PrintRun = .{};
+        @memcpy(run.bytes[0..self.print_len], self.print_buf[0..self.print_len]);
+        run.len = self.print_len;
+        emit(ctx, .{ .print_run = run });
+        self.print_len = 0;
+    }
 
     pub fn init(allocator: std.mem.Allocator) Parser {
         return .{ .allocator = allocator };
@@ -82,12 +99,17 @@ pub const Parser = struct {
         ctx: ?*anyopaque,
     ) void {
         for (bytes) |b| self.byte(b, emit, ctx);
+        // Flush any trailing print run so the consumer sees content
+        // immediately. Without this, a "shell prints just a few
+        // bytes and waits" wouldn't render until the next byte.
+        self.flushPrint(emit, ctx);
     }
 
     fn byte(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
         // "Anywhere" transitions per Williams (priority over current state).
         switch (b) {
             0x18, 0x1A => {
+                self.flushPrint(emit, ctx);
                 emit(ctx, .{ .execute = b });
                 self.transitionTo(.ground);
                 return;
@@ -99,6 +121,7 @@ pub const Parser = struct {
                 switch (self.state) {
                     .osc_string, .apc_string, .dcs_passthrough, .sos_pm_string => {},
                     else => {
+                        self.flushPrint(emit, ctx);
                         self.enterEscape();
                         return;
                     },
@@ -167,15 +190,20 @@ pub const Parser = struct {
     // ── Per-state byte handlers ──────────────────────────────────
 
     fn byteGround(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
-        _ = self;
         switch (b) {
-            0x00...0x17, 0x19, 0x1C...0x1F => emit(ctx, .{ .execute = b }),
-            // 0x20-0x7E printable ASCII
-            // 0x7F DEL — execute per spec
-            // 0x80-0xFF — UTF-8 continuation/leading; passed through
-            //             as `print_byte`, main thread reassembles.
-            0x7F => emit(ctx, .{ .execute = b }),
-            else => emit(ctx, .{ .print_byte = b }),
+            0x00...0x17, 0x19, 0x1C...0x1F, 0x7F => {
+                self.flushPrint(emit, ctx);
+                emit(ctx, .{ .execute = b });
+            },
+            // 0x20-0x7E + 0x80-0xFF: printable. Accumulate into
+            // print_buf and emit a single print_run when full.
+            else => {
+                if (self.print_len == self.print_buf.len) {
+                    self.flushPrint(emit, ctx);
+                }
+                self.print_buf[self.print_len] = b;
+                self.print_len += 1;
+            },
         }
     }
 
@@ -482,9 +510,11 @@ test "ground prints" {
     var col = TestCollector{ .allocator = std.testing.allocator };
     defer col.deinit();
     p.advance("Hi", TestCollector.emit, &col);
-    try std.testing.expectEqual(@as(usize, 2), col.events.items.len);
-    try std.testing.expectEqual(@as(u8, 'H'), col.events.items[0].print_byte);
-    try std.testing.expectEqual(@as(u8, 'i'), col.events.items[1].print_byte);
+    try std.testing.expectEqual(@as(usize, 1), col.events.items.len);
+    const run = col.events.items[0].print_run;
+    try std.testing.expectEqual(@as(u8, 2), run.len);
+    try std.testing.expectEqual(@as(u8, 'H'), run.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 'i'), run.bytes[1]);
 }
 
 test "execute cr/lf" {
@@ -574,6 +604,9 @@ test "cancel via can/sub" {
     var saw_print_a = false;
     for (col.events.items) |ev| switch (ev) {
         .print_byte => |b| if (b == 'A') { saw_print_a = true; },
+        .print_run => |run| {
+            for (run.bytes[0..run.len]) |b| if (b == 'A') { saw_print_a = true; };
+        },
         else => {},
     };
     try std.testing.expect(saw_print_a);

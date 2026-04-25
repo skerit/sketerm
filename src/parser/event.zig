@@ -20,6 +20,12 @@ pub const Event = union(enum) {
     /// parser stateless wrt encoding.
     print_byte: u8,
 
+    /// Run of consecutive printable bytes (0x20..0x7E and 0x80+).
+    /// Cuts the per-event overhead for the common "shell prints
+    /// long line" path. Worker still emits this event but with a
+    /// fixed-size payload (no heap), so SPSC ring stays simple.
+    print_run: PrintRun,
+
     /// C0 control byte (0x00–0x1F minus ESC, plus DEL 0x7F).
     execute: u8,
 
@@ -47,6 +53,14 @@ pub const Event = union(enum) {
 
     /// PTY reached EOF (child closed all references to the slave).
     child_eof: i32,
+
+    /// Up to 64 printable bytes accumulated by the parser. Sized to
+    /// fit comfortably within the existing union footprint (Csi is
+    /// the largest at ~92 B; PrintRun is ~66 B).
+    pub const PrintRun = struct {
+        bytes: [64]u8 = .{0} ** 64,
+        len: u8 = 0,
+    };
 
     pub const Csi = struct {
         params: [16]u32 = .{0} ** 16,

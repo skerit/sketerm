@@ -950,6 +950,10 @@ pub const Screen = struct {
         switch (ev) {
             .print => |cp| self.printCp(cp),
             .print_byte => |b| self.printByte(b),
+            .print_run => |run| {
+                var i: usize = 0;
+                while (i < run.len) : (i += 1) self.printByte(run.bytes[i]);
+            },
             .execute => |b| self.execute(b),
             .csi => |c_csi| self.csi(c_csi),
             .esc_final => |ef| self.escFinal(ef),
