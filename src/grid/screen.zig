@@ -118,6 +118,11 @@ pub const Screen = struct {
     /// Last printed codepoint (for REP, CSI Pn b). 0 = none.
     last_print_cp: u32 = 0,
 
+    /// Default fg / bg color overrides, RGBA in 0..1. Set via OSC
+    /// 10 / 11 / OSC 110 / 111 reset. Renderer syncs from these.
+    default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
+    default_bg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 },
+
     /// Custom tab stops. One bool per column, true = stop set.
     /// Default: every 8th column starting at 0.
     tab_stops: std.ArrayList(bool) = .{},
@@ -473,6 +478,61 @@ pub const Screen = struct {
         }
     }
 
+    /// Reply current fg/bg/cursor color in xterm `rgb:RRRR/GGGG/BBBB` form.
+    fn respondColor(self: *Screen, osc_num: u32) void {
+        const rgba = switch (osc_num) {
+            10, 12 => self.default_fg,
+            11 => self.default_bg,
+            else => return,
+        };
+        const r16: u16 = @intFromFloat(@round(rgba[0] * 65535.0));
+        const g16: u16 = @intFromFloat(@round(rgba[1] * 65535.0));
+        const b16: u16 = @intFromFloat(@round(rgba[2] * 65535.0));
+        var resp_buf: [64]u8 = undefined;
+        const s = std.fmt.bufPrint(&resp_buf, "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}\x1b\\", .{
+            osc_num, r16, g16, b16,
+        }) catch return;
+        self.respond(s);
+    }
+
+    /// Parse an xterm color spec: `rgb:RRRR/GGGG/BBBB` (or 2-hex
+    /// per-component form) or `#RRGGBB`. Returns null on bad input.
+    fn parseColor(s: []const u8) ?[4]f32 {
+        if (std.mem.startsWith(u8, s, "rgb:")) {
+            const rest = s[4..];
+            var it = std.mem.splitScalar(u8, rest, '/');
+            const r = it.next() orelse return null;
+            const g = it.next() orelse return null;
+            const b = it.next() orelse return null;
+            return .{
+                hexToFloat(r),
+                hexToFloat(g),
+                hexToFloat(b),
+                1.0,
+            };
+        }
+        if (s.len >= 7 and s[0] == '#') {
+            const r = std.fmt.parseInt(u8, s[1..3], 16) catch return null;
+            const g = std.fmt.parseInt(u8, s[3..5], 16) catch return null;
+            const b = std.fmt.parseInt(u8, s[5..7], 16) catch return null;
+            return .{
+                @as(f32, @floatFromInt(r)) / 255.0,
+                @as(f32, @floatFromInt(g)) / 255.0,
+                @as(f32, @floatFromInt(b)) / 255.0,
+                1.0,
+            };
+        }
+        return null;
+    }
+
+    /// Convert a 1..4-hex component string into a 0..1 float.
+    fn hexToFloat(s: []const u8) f32 {
+        if (s.len == 0 or s.len > 4) return 0;
+        const v = std.fmt.parseInt(u32, s, 16) catch return 0;
+        const max: u32 = (@as(u32, 1) << @intCast(s.len * 4)) - 1;
+        return @as(f32, @floatFromInt(v)) / @as(f32, @floatFromInt(max));
+    }
+
     /// OSC 4 — palette query/set. Supports query form
     /// `OSC 4 ; n ; ?` only; replies with the renderer's default
     /// palette since we don't yet store a runtime palette.
@@ -657,24 +717,33 @@ pub const Screen = struct {
                 if (self.sink.on_notification) |f| f(self.sink.ctx, "sketerm", rest);
             },
             10, 11, 12 => {
-                // OSC 10/11/12 fg/bg/cursor color query: `?` returns
-                // the current default. Set form not yet implemented.
+                // OSC 10/11/12 fg/bg/cursor color query/set.
                 if (rest.len == 1 and rest[0] == '?') {
-                    var resp_buf: [64]u8 = undefined;
-                    const c_str: []const u8 = switch (num) {
-                        10 => "10;rgb:eaea/eaea/eaea",
-                        11 => "11;rgb:1a1a/1a1a/1a1a",
-                        12 => "12;rgb:eaea/eaea/eaea", // cursor uses fg
-                        else => unreachable,
-                    };
-                    const s = std.fmt.bufPrint(&resp_buf, "\x1b]{s}\x1b\\", .{c_str}) catch return;
-                    self.respond(s);
+                    self.respondColor(num);
+                } else if (parseColor(rest)) |rgba| {
+                    switch (num) {
+                        10 => self.default_fg = rgba,
+                        11 => self.default_bg = rgba,
+                        12 => {}, // cursor color — not separately stored yet
+                        else => {},
+                    }
+                    self.dirty = true;
                 }
             },
-            // OSC 104 / 110 / 111 / 112 — palette / fg / bg / cursor
-            // reset. We don't yet store runtime overrides so these
-            // are no-ops; accepted silently.
-            104, 110, 111, 112 => {},
+            // OSC 104 — palette reset (we don't track per-index
+            // overrides yet; accept silently).
+            104 => {},
+            // OSC 110 / 111 — fg / bg color reset to default.
+            110 => {
+                self.default_fg = .{ 0.92, 0.92, 0.92, 1.0 };
+                self.dirty = true;
+            },
+            111 => {
+                self.default_bg = .{ 0.10, 0.10, 0.10, 1.0 };
+                self.dirty = true;
+            },
+            // OSC 112 — cursor color reset (no separate state yet).
+            112 => {},
             1337 => {
                 // iTerm2 inline image: OSC 1337 ; File=...:<base64> ST
                 const iterm = @import("../parser/iterm_image.zig");
@@ -2278,6 +2347,19 @@ test "IRM shifts cells right" {
     try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 2).rune);
     try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(0, 3).rune);
     // 'd' shifted off the right edge.
+}
+
+test "OSC 11 sets default_bg, OSC 111 resets" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    s.onOsc("11;rgb:ff/00/80");
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), s.default_bg[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), s.default_bg[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), s.default_bg[2], 0.01);
+    s.onOsc("111;");
+    try std.testing.expectApproxEqAbs(@as(f32, 0.10), s.default_bg[0], 0.01);
 }
 
 test "OSC 777 notify dispatches title+body" {

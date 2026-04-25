@@ -129,6 +129,10 @@ pub const GridPass = struct {
         focused: bool,
     ) !void {
         self.vbuf.clearRetainingCapacity();
+        // Sync default fg/bg from screen — OSC 10 / 11 / 110 / 111
+        // mutate them.
+        self.default_fg = screen.default_fg;
+        self.default_bg = screen.default_bg;
 
         const cw: f32 = @floatFromInt(atlas.cell_w);
         const ch: f32 = @floatFromInt(atlas.cell_h);
