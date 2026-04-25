@@ -73,14 +73,12 @@ build session. See `git log --oneline` for what's landed.
   serialization deferred.)
 - **M9** — Sixel decoder (RGB color regs, RLE, raster attrs, HLS
   fallback). Kitty graphics APC parser (transmit/place/delete,
-  RGBA). iTerm2 OSC 1337 PNG dimension extraction.
-  `ImageStore` + `ImagePass` upload RGBA pixels to GL textures
-  and draw them as quads after the grid pass — **end-to-end image
-  rendering through the GL pipeline.**
+  RGBA). iTerm2 OSC 1337 with full PNG decode via vendored
+  `stb_image.h`. `ImageStore` + `ImagePass` upload RGBA pixels
+  to GL textures and draw them as quads after the grid pass —
+  **end-to-end image rendering through the GL pipeline.**
 
 ### What's still missing (post-checkpoint)
-- **iTerm2 PNG decode** — dimensions extracted, RGBA decoding is
-  stubbed. `libpng` is on the system; wiring is straightforward.
 - **OSC 8 hover/Ctrl-click** — link IDs stored on cells; UI
   surface (tooltip on hover, click-to-open via `xdg-open`) not yet.
 - **Selection in scrollback** — model accepts negative rows but
