@@ -162,6 +162,16 @@ pub const Screen = struct {
     /// only, 2=all printable. Input encoder hasn't wired this yet.
     modify_other_keys: u8 = 0,
 
+    /// DECSCNM — reverse-video mode. Renderer swaps default fg ↔ bg
+    /// (and inverts cells with .default colors) when set. Off resets
+    /// to normal.
+    reverse_screen: bool = false,
+
+    /// DECSET 40 = "allow 80↔132 column switching". When set,
+    /// DECSET/DECRST 3 (DECCOLM) actually resizes the screen to
+    /// 132 / 80 columns. xterm-compat default is OFF.
+    allow_decolm: bool = false,
+
     /// Kitty progressive-enhancement keyboard flags. Bitmask:
     /// 0x01 disambiguate, 0x02 events, 0x04 alt-keys, 0x08 all-keys,
     /// 0x10 associated-text. Toggled via CSI > N u (set), CSI = N;M u
@@ -243,6 +253,10 @@ pub const Screen = struct {
         on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
         /// Kitty delete dispatch with full delete-action context.
         on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: ImageDeleteEvent) void = null,
+        /// DECANM toggle (DECSET/DECRST 2). When `set == false`,
+        /// the parser switches into VT52 mode; when true, returns to
+        /// ANSI/VT100. Terminal wires this to its Parser.vt52_mode.
+        on_decanm: ?*const fn (ctx: ?*anyopaque, ansi: bool) void = null,
     };
 
     pub const ImageDeleteEvent = struct {
@@ -2277,6 +2291,35 @@ pub const Screen = struct {
         while (i < params.n_params) : (i += 1) {
             switch (params.params[i]) {
                 1 => self.app_cursor_keys = set,
+                2 => {
+                    // DECANM — set=ANSI/VT100, reset=VT52. Forward
+                    // to the parser via the sink so the byte stream
+                    // following this sequence is parsed correctly.
+                    if (self.sink.on_decanm) |f| f(self.sink.ctx, set);
+                },
+                3 => {
+                    // DECCOLM — switch column count when explicitly
+                    // enabled via DECSET 40. Side effects per spec:
+                    // clear screen, home cursor, reset margins.
+                    if (self.allow_decolm) {
+                        const new_cols: u16 = if (set) 132 else 80;
+                        if (new_cols != self.cols) {
+                            self.resize(new_cols, self.rows) catch {};
+                        }
+                        self.scroll_top = 0;
+                        self.scroll_bot = if (self.rows > 0) self.rows - 1 else 0;
+                        self.row = 0;
+                        self.col = 0;
+                        self.pending_wrap = false;
+                        for (self.buf()) |*l| l.clear();
+                        self.dirty = true;
+                    }
+                },
+                5 => {
+                    // DECSCNM — reverse video mode (whole screen).
+                    self.reverse_screen = set;
+                    self.dirty = true;
+                },
                 6 => {
                     self.origin_mode = set;
                     self.row = if (set and self.origin_mode) self.scroll_top else 0;
@@ -2284,6 +2327,7 @@ pub const Screen = struct {
                     self.pending_wrap = false;
                 },
                 7 => self.autowrap = set,
+                40 => self.allow_decolm = set,
                 25 => self.cursor_visible = set,
                 1000 => self.mouse_mode = if (set) 1000 else 0,
                 1002 => self.mouse_mode = if (set) 1002 else 0,
@@ -3487,4 +3531,82 @@ test "DECSWL ESC #5 resets scaling" {
     ef.final = '5';
     s.escFinal(ef);
     try std.testing.expectEqual(@import("line.zig").Scaling.single, s.active[0].scaling);
+}
+
+test "DECSCNM (CSI ?5 h/l) toggles reverse_screen" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    var on = Event.Csi{};
+    on.private = '?';
+    on.params[0] = 5;
+    on.n_params = 1;
+    on.final = 'h';
+    s.csi(on);
+    try std.testing.expect(s.reverse_screen);
+    var off = Event.Csi{};
+    off.private = '?';
+    off.params[0] = 5;
+    off.n_params = 1;
+    off.final = 'l';
+    s.csi(off);
+    try std.testing.expect(!s.reverse_screen);
+}
+
+test "DECSET 40 + DECSET 3 widens to 132 columns" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 80, 24);
+    defer s.deinit();
+    // Without DECSET 40, DECSET 3 is a no-op.
+    var col_set = Event.Csi{};
+    col_set.private = '?';
+    col_set.params[0] = 3;
+    col_set.n_params = 1;
+    col_set.final = 'h';
+    s.csi(col_set);
+    try std.testing.expectEqual(@as(u16, 80), s.cols);
+    // Enable + retry.
+    var allow = Event.Csi{};
+    allow.private = '?';
+    allow.params[0] = 40;
+    allow.n_params = 1;
+    allow.final = 'h';
+    s.csi(allow);
+    s.csi(col_set);
+    try std.testing.expectEqual(@as(u16, 132), s.cols);
+    // Reset returns to 80.
+    var col_rst = Event.Csi{};
+    col_rst.private = '?';
+    col_rst.params[0] = 3;
+    col_rst.n_params = 1;
+    col_rst.final = 'l';
+    s.csi(col_rst);
+    try std.testing.expectEqual(@as(u16, 80), s.cols);
+}
+
+test "DECRST 2 fires on_decanm with ansi=false" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    const Spy = struct {
+        var got_calls: u8 = 0;
+        var last_ansi: bool = true;
+        fn cb(_: ?*anyopaque, ansi: bool) void {
+            got_calls += 1;
+            last_ansi = ansi;
+        }
+    };
+    Spy.got_calls = 0;
+    s.sink = .{ .on_decanm = Spy.cb };
+    var off = Event.Csi{};
+    off.private = '?';
+    off.params[0] = 2;
+    off.n_params = 1;
+    off.final = 'l';
+    s.csi(off);
+    try std.testing.expectEqual(@as(u8, 1), Spy.got_calls);
+    try std.testing.expectEqual(false, Spy.last_ansi);
 }

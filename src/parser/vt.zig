@@ -34,6 +34,15 @@ pub const State = enum {
 
 pub const EmitFn = *const fn (ctx: ?*anyopaque, ev: Event) void;
 
+fn emitVt52Cursor(emit: EmitFn, ctx: ?*anyopaque, vt52_letter: u8) void {
+    // VT52 cursor letters A/B/C/D map directly to the CSI A/B/C/D
+    // single-step cursor motions.
+    var csi: Event.Csi = .{};
+    csi.n_params = 0;
+    csi.final = vt52_letter;
+    emit(ctx, .{ .csi = csi });
+}
+
 pub const Parser = struct {
     state: State = .ground,
     csi: Event.Csi = .{},
@@ -42,6 +51,13 @@ pub const Parser = struct {
     osc_buf: std.ArrayList(u8) = .{},
     dcs_proto: Event.Dcs = .{},
     allocator: std.mem.Allocator,
+    /// VT52 mode (DECANM off via DECRST 2). When set, ESC <letter>
+    /// sequences are interpreted per VT52 spec instead of via CSI.
+    vt52_mode: bool = false,
+    /// Sub-state for VT52's two-byte cursor address: ESC Y row col.
+    /// 0 = none, 1 = expecting row byte, 2 = expecting col byte.
+    vt52_y_state: u8 = 0,
+    vt52_y_row: u8 = 0,
 
     /// Hard cap on osc_buf growth; refusing further bytes once
     /// exceeded. 16 MiB is comfortably above the largest kitty
@@ -164,6 +180,14 @@ pub const Parser = struct {
     }
 
     fn byteEscape(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
+        // VT52 dispatch — runs ahead of the ANSI parser. ESC <X> with
+        // X being one of A/B/C/D/F/G/H/I/J/K/Y/Z/=/>/< is interpreted
+        // per VT100 chapter 3 §3.4. Multi-byte sequences (ESC Y row col)
+        // suspend the dispatch via vt52_y_state.
+        if (self.vt52_mode) {
+            self.handleVt52Escape(b, emit, ctx);
+            return;
+        }
         switch (b) {
             0x00...0x17, 0x19, 0x1C...0x1F => emit(ctx, .{ .execute = b }),
             0x20...0x2F => {
@@ -189,6 +213,74 @@ pub const Parser = struct {
             0x7F => {}, // ignore
             else => self.transitionTo(.ground),
         }
+    }
+
+    fn handleVt52Escape(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
+        // ESC Y is multi-byte: capture row then col.
+        if (self.vt52_y_state == 1) {
+            self.vt52_y_row = b;
+            self.vt52_y_state = 2;
+            self.transitionTo(.escape); // stay in escape until col arrives
+            return;
+        }
+        if (self.vt52_y_state == 2) {
+            const r: u8 = if (self.vt52_y_row >= 0x20) self.vt52_y_row - 0x20 else 0;
+            const col: u8 = if (b >= 0x20) b - 0x20 else 0;
+            // Translate to CSI <r+1>;<c+1>H (CUP).
+            var csi: Event.Csi = .{};
+            csi.params[0] = @as(u32, r) + 1;
+            csi.params[1] = @as(u32, col) + 1;
+            csi.n_params = 2;
+            csi.final = 'H';
+            emit(ctx, .{ .csi = csi });
+            self.vt52_y_state = 0;
+            self.transitionTo(.ground);
+            return;
+        }
+        // Single-byte VT52 commands.
+        switch (b) {
+            'A', 'B', 'C', 'D' => emitVt52Cursor(emit, ctx, b),
+            'F' => {}, // enter graphics charset — we don't model VT52 charset
+            'G' => {}, // exit graphics
+            'H' => {
+                // Cursor home → CUP 1;1.
+                var csi: Event.Csi = .{};
+                csi.params[0] = 1;
+                csi.params[1] = 1;
+                csi.n_params = 2;
+                csi.final = 'H';
+                emit(ctx, .{ .csi = csi });
+            },
+            'I' => emit(ctx, .{ .esc_final = .{ .intermediates = .{ 0, 0, 0, 0 }, .n_intermediates = 0, .final = 'M' } }), // RI
+            'J' => {
+                var csi: Event.Csi = .{};
+                csi.n_params = 0;
+                csi.final = 'J';
+                emit(ctx, .{ .csi = csi });
+            },
+            'K' => {
+                var csi: Event.Csi = .{};
+                csi.n_params = 0;
+                csi.final = 'K';
+                emit(ctx, .{ .csi = csi });
+            },
+            'Y' => {
+                self.vt52_y_state = 1;
+                return; // stay in escape state
+            },
+            'Z' => {
+                // Identify — respond `ESC / Z`. Screen handles via
+                // a synthesized esc_final so the response is sent.
+                emit(ctx, .{ .esc_final = .{ .intermediates = .{ 0, 0, 0, 0 }, .n_intermediates = 0, .final = 'Z' } });
+            },
+            '=', '>' => {}, // alt keypad — ignored
+            '<' => {
+                // Exit VT52, return to ANSI mode.
+                self.vt52_mode = false;
+            },
+            else => {},
+        }
+        self.transitionTo(.ground);
     }
 
     fn byteEscapeIntermediate(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
@@ -614,4 +706,52 @@ test "DECRQM (CSI ? 1 \\$ p) parses with intermediate" {
         else => {},
     };
     try std.testing.expect(found);
+}
+
+// VT52 mode: ESC <letter> dispatches as VT52 commands.
+test "VT52 ESC A emits CSI A (cursor up)" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    p.vt52_mode = true;
+
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    p.advance("\x1bA", TestCollector.emit, &col);
+    defer col.deinit();
+    var found = false;
+    for (col.events.items) |ev| switch (ev) {
+        .csi => |c| {
+            if (c.final == 'A') found = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(found);
+}
+
+test "VT52 ESC Y row col emits CUP with row+1, col+1" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    p.vt52_mode = true;
+
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    // row=2, col=3 → bytes 0x22, 0x23
+    p.advance("\x1bY\x22\x23", TestCollector.emit, &col);
+    defer col.deinit();
+    var found = false;
+    for (col.events.items) |ev| switch (ev) {
+        .csi => |c| {
+            if (c.final == 'H' and c.n_params == 2 and c.params[0] == 3 and c.params[1] == 4) found = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(found);
+}
+
+test "VT52 ESC < exits VT52 mode" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    p.vt52_mode = true;
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    p.advance("\x1b<", TestCollector.emit, &col);
+    defer col.deinit();
+    try std.testing.expectEqual(false, p.vt52_mode);
 }

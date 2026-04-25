@@ -165,8 +165,14 @@ pub const GridPass = struct {
         self.vbuf.clearRetainingCapacity();
         // Sync default fg/bg + palette from screen — OSC 4 / 10 / 11 /
         // 104 / 110 / 111 mutate them.
-        self.default_fg = screen.default_fg;
-        self.default_bg = screen.default_bg;
+        // DECSCNM — swap default fg/bg for the whole screen.
+        if (screen.reverse_screen) {
+            self.default_fg = screen.default_bg;
+            self.default_bg = screen.default_fg;
+        } else {
+            self.default_fg = screen.default_fg;
+            self.default_bg = screen.default_bg;
+        }
         self.palette = screen.palette;
 
         const cw: f32 = @floatFromInt(atlas.cell_w);

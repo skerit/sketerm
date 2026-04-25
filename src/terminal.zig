@@ -97,6 +97,7 @@ pub const Terminal = struct {
             .on_cwd = sinkCwd,
             .on_image = sinkImage,
             .on_image_delete_full = sinkImageDeleteFull,
+            .on_decanm = sinkDecanm,
             .on_notification = sinkNotification,
         };
 
@@ -143,6 +144,15 @@ pub const Terminal = struct {
     fn sinkImage(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
         if (self.on_image) |f| f(self.user_ctx, img);
+    }
+
+    fn sinkDecanm(ctx: ?*anyopaque, ansi: bool) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        // ansi==true → leave VT52, return to ANSI/VT100. ansi==false → VT52.
+        self.parser.vt52_mode = !ansi;
+        if (ansi) {
+            self.parser.vt52_y_state = 0;
+        }
     }
 
     fn sinkImageDeleteFull(ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void {
