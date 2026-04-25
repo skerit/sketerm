@@ -327,6 +327,13 @@ pub const CellPass = struct {
         const slice = self.rowSlice(row);
         @memset(slice, .{});
 
+        // Bidi rows + DH/DW rows are rendered by GridPass (overlay
+        // pipeline), not here — the cell-aligned LTR layout this
+        // pipeline assumes is wrong for them. Leave the row's
+        // instances zeroed so the cell pass emits nothing.
+        const cells_for_check = ln.cells[0..@min(@as(usize, cols), ln.cells.len)];
+        if (ln.scaling != .single or rowHasNonAscii(cells_for_check)) return;
+
         const x_scale: f32 = if (ln.scaling == .single) 1.0 else 2.0;
         const y_scale: f32 = if (ln.scaling == .dhl_top or ln.scaling == .dhl_bot) 2.0 else 1.0;
         const y_origin_shift: f32 = if (ln.scaling == .dhl_bot) -ch else 0.0;
@@ -556,6 +563,14 @@ pub const CellPass = struct {
         };
     }
 };
+
+/// True iff the cells contain any non-ASCII (>0x7F) printable rune.
+/// Triggers the bidi/HB-shaped overlay path in GridPass; CellPass
+/// skips these rows so they're not rendered twice.
+fn rowHasNonAscii(cells: []const Cell) bool {
+    for (cells) |cl| if (cl.rune > 0x7F) return true;
+    return false;
+}
 
 test "Instance is 88 bytes" {
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(Instance));
