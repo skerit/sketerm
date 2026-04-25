@@ -162,6 +162,14 @@ pub const Screen = struct {
     /// only, 2=all printable. Input encoder hasn't wired this yet.
     modify_other_keys: u8 = 0,
 
+    /// Kitty progressive-enhancement keyboard flags. Bitmask:
+    /// 0x01 disambiguate, 0x02 events, 0x04 alt-keys, 0x08 all-keys,
+    /// 0x10 associated-text. Toggled via CSI > N u (set), CSI = N;M u
+    /// (set/push/pop), CSI < N u (pop). Stack depth 9.
+    kitty_kbd_flags: u8 = 0,
+    kitty_kbd_stack: [9]u8 = [_]u8{0} ** 9,
+    kitty_kbd_depth: u8 = 0,
+
     /// Custom tab stops. One bool per column, true = stop set.
     /// Default: every 8th column starting at 0.
     tab_stops: std.ArrayList(bool) = .{},
@@ -1546,6 +1554,12 @@ pub const Screen = struct {
                 // protection bit, so treat as plain ED/EL.
                 'J' => self.eraseDisplay(params.paramOrDefault(0, 0)),
                 'K' => self.eraseLine(params.paramOrDefault(0, 0)),
+                'u' => {
+                    // Kitty kbd: CSI ? u — query flags.
+                    var kbuf: [16]u8 = undefined;
+                    const out = std.fmt.bufPrint(&kbuf, "\x1b[?{d}u", .{self.kitty_kbd_flags}) catch return;
+                    self.respond(out);
+                },
                 else => {},
             }
             return;
@@ -1565,7 +1579,52 @@ pub const Screen = struct {
                             0;
                     }
                 },
+                'u' => {
+                    // Kitty kbd: CSI > flags u — set flags directly.
+                    self.kitty_kbd_flags = @intCast(@min(params.paramOrDefault(0, 0), 0xFF));
+                },
                 else => {},
+            }
+            return;
+        }
+        if (params.private == '=') {
+            // Kitty kbd: CSI = flags ; mode u
+            //   mode 1 = set, 2 = push+set, 3 = pop
+            if (params.final == 'u') {
+                const flags: u8 = @intCast(@min(params.paramOrDefault(0, 0), 0xFF));
+                const mode: u32 = params.paramOrDefault(1, 1);
+                switch (mode) {
+                    1 => self.kitty_kbd_flags = flags,
+                    2 => {
+                        if (self.kitty_kbd_depth < self.kitty_kbd_stack.len) {
+                            self.kitty_kbd_stack[self.kitty_kbd_depth] = self.kitty_kbd_flags;
+                            self.kitty_kbd_depth += 1;
+                        }
+                        self.kitty_kbd_flags = flags;
+                    },
+                    3 => {
+                        if (self.kitty_kbd_depth > 0) {
+                            self.kitty_kbd_depth -= 1;
+                            self.kitty_kbd_flags = self.kitty_kbd_stack[self.kitty_kbd_depth];
+                        } else {
+                            self.kitty_kbd_flags = 0;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            return;
+        }
+        if (params.private == '<') {
+            // Kitty kbd: CSI < N u — pop N levels.
+            if (params.final == 'u') {
+                const n = params.paramOrDefault(0, 1);
+                var k: u32 = 0;
+                while (k < n and self.kitty_kbd_depth > 0) : (k += 1) {
+                    self.kitty_kbd_depth -= 1;
+                    self.kitty_kbd_flags = self.kitty_kbd_stack[self.kitty_kbd_depth];
+                }
+                if (self.kitty_kbd_depth == 0 and k < n) self.kitty_kbd_flags = 0;
             }
             return;
         }
@@ -3299,4 +3358,66 @@ test "extractSelection emits OSC 8 as markdown link" {
     const text = try s.extractSelection(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("[link](https://example.com) tail", text);
+}
+
+test "kitty kbd: CSI > N u sets flags" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    var csi = Event.Csi{};
+    csi.private = '>';
+    csi.params[0] = 5; // disambiguate + report-events
+    csi.n_params = 1;
+    csi.final = 'u';
+    s.csi(csi);
+    try std.testing.expectEqual(@as(u8, 5), s.kitty_kbd_flags);
+}
+
+test "kitty kbd: CSI = N ; 2 u pushes, < pops" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    s.kitty_kbd_flags = 0x01;
+    var push = Event.Csi{};
+    push.private = '=';
+    push.params[0] = 0x0F;
+    push.params[1] = 2;
+    push.n_params = 2;
+    push.final = 'u';
+    s.csi(push);
+    try std.testing.expectEqual(@as(u8, 0x0F), s.kitty_kbd_flags);
+    try std.testing.expectEqual(@as(u8, 1), s.kitty_kbd_depth);
+    var pop = Event.Csi{};
+    pop.private = '<';
+    pop.params[0] = 1;
+    pop.n_params = 1;
+    pop.final = 'u';
+    s.csi(pop);
+    try std.testing.expectEqual(@as(u8, 0x01), s.kitty_kbd_flags);
+}
+
+test "kitty kbd: CSI ? u query replies" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    s.kitty_kbd_flags = 0x05;
+    const Recv = struct {
+        var got: [32]u8 = undefined;
+        var got_len: usize = 0;
+        fn cb(_: ?*anyopaque, b: []const u8) void {
+            const n = @min(b.len, got.len);
+            @memcpy(got[0..n], b[0..n]);
+            got_len = n;
+        }
+    };
+    Recv.got_len = 0;
+    s.sink = .{ .on_write_pty = Recv.cb };
+    var q = Event.Csi{};
+    q.private = '?';
+    q.final = 'u';
+    s.csi(q);
+    try std.testing.expectEqualStrings("\x1b[?5u", Recv.got[0..Recv.got_len]);
 }

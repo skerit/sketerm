@@ -129,3 +129,27 @@ test "ssoKey F2 shift+alt → ESC [ 1 ; 4 Q" {
     const n = input.ssoKey(&buf, 'Q', true, true, false);
     try std.testing.expectEqualStrings("\x1b[1;4Q", buf[0..n]);
 }
+
+test "kittyKey plain Esc → CSI 27 u" {
+    var buf: [16]u8 = undefined;
+    const n = input.kittyKey(&buf, 27, false, false, false);
+    try std.testing.expectEqualStrings("\x1b[27u", buf[0..n]);
+}
+
+test "kittyKey Shift+Tab → CSI 9 ; 2 u" {
+    var buf: [16]u8 = undefined;
+    const n = input.kittyKey(&buf, 9, true, false, false);
+    try std.testing.expectEqualStrings("\x1b[9;2u", buf[0..n]);
+}
+
+test "kittyKey Ctrl+I → CSI 105 ; 5 u" {
+    var buf: [16]u8 = undefined;
+    const n = input.kittyKey(&buf, 105, false, false, true);
+    try std.testing.expectEqualStrings("\x1b[105;5u", buf[0..n]);
+}
+
+test "kittyKey Ctrl+Shift+H → CSI 104 ; 6 u" {
+    var buf: [16]u8 = undefined;
+    const n = input.kittyKey(&buf, 104, true, false, true);
+    try std.testing.expectEqualStrings("\x1b[104;6u", buf[0..n]);
+}

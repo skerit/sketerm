@@ -247,7 +247,7 @@ fn onKeyPressed(
 
     var buf: [16]u8 = undefined;
     const screen = ctx.terminal.screen;
-    const n = encode(&buf, keyval, state, screen.app_cursor_keys, screen.modify_other_keys);
+    const n = encode(&buf, keyval, state, screen.app_cursor_keys, screen.modify_other_keys, screen.kitty_kbd_flags);
     if (n == 0) return 0;
     // Snap to bottom on keypress (matches xterm/iterm2/etc behavior).
     if (screen.view_offset != 0) {
@@ -318,12 +318,55 @@ pub fn ssoKey(buf: []u8, final: u8, shift: bool, alt: bool, ctrl: bool) usize {
     return out.len;
 }
 
-fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, mok: u8) usize {
+/// Kitty progressive-enhancement keyboard CSI u emit.
+/// Format: `CSI <unicode-code-point> [; <mods>] u`. Mods follow the
+/// xterm encoding (1 + shift+alt*2+ctrl*4) — same as modCode(). When
+/// only Shift is "held", we still emit mods=2 here per kitty spec
+/// (callers handle whether Shift suppresses CSI u for printable keys).
+pub fn kittyKey(buf: []u8, code_point: u32, shift: bool, alt: bool, ctrl: bool) usize {
+    const m = modCode(shift, alt, ctrl);
+    if (m == 1) {
+        const out = std.fmt.bufPrint(buf, "\x1b[{d}u", .{code_point}) catch return 0;
+        return out.len;
+    }
+    const out = std.fmt.bufPrint(buf, "\x1b[{d};{d}u", .{ code_point, m }) catch return 0;
+    return out.len;
+}
+
+fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, mok: u8, kitty_flags: u8) usize {
     const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
     const alt = (mods & c.GDK_ALT_MASK) != 0;
     const shift = (mods & c.GDK_SHIFT_MASK) != 0;
     // DECCKM swap: arrows/home/end use ESC O X instead of ESC [ X.
     const ck: u8 = if (app_cursor) 'O' else '[';
+
+    // Kitty progressive-enhancement keyboard — disambiguate flag.
+    // Reroute Tab/Enter/Esc/BS and modified keys through CSI u.
+    const kitty_disamb = (kitty_flags & 0x01) != 0;
+    if (kitty_disamb) {
+        switch (keyval) {
+            c.GDK_KEY_Escape => return kittyKey(buf, 27, shift, alt, ctrl),
+            c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => return kittyKey(buf, 13, shift, alt, ctrl),
+            c.GDK_KEY_BackSpace => return kittyKey(buf, 127, shift, alt, ctrl),
+            c.GDK_KEY_Tab => return kittyKey(buf, 9, shift, alt, ctrl),
+            c.GDK_KEY_ISO_Left_Tab => return kittyKey(buf, 9, true, alt, ctrl),
+            else => {},
+        }
+        // Modified printable codepoints — emit CSI u so apps can
+        // distinguish Ctrl+I from Tab and so on. Shift alone keeps the
+        // literal-character path; the OS already gave us the upper-
+        // case codepoint via gdk_keyval_to_unicode.
+        if (ctrl or alt) {
+            const cp_pre = c.gdk_keyval_to_unicode(keyval);
+            if (cp_pre != 0 and cp_pre < 0x110000) {
+                // Use the lowercase code point so 'A' and 'a' both
+                // map to 'a' = 0x61, with Shift signalled via mods.
+                var canon: u32 = cp_pre;
+                if (canon >= 'A' and canon <= 'Z') canon += 0x20;
+                return kittyKey(buf, canon, shift, alt, ctrl);
+            }
+        }
+    }
 
     // Special keys (return early).
     switch (keyval) {
