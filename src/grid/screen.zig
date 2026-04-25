@@ -365,6 +365,54 @@ pub const Screen = struct {
         return isWideCp(cp);
     }
 
+    /// Word-class membership for double-click word selection.
+    /// Mirrors xterm's default: ASCII alnum, underscore, plus a small
+    /// "extra" set commonly considered part of paths/URIs.
+    fn isWordChar(cp: u32) bool {
+        if (cp == ' ' or cp == 0) return false;
+        if (cp >= 'a' and cp <= 'z') return true;
+        if (cp >= 'A' and cp <= 'Z') return true;
+        if (cp >= '0' and cp <= '9') return true;
+        switch (cp) {
+            '_', '-', '.', '/', '@', '~', '+', ':', '=' => return true,
+            else => {},
+        }
+        return cp >= 0x80; // any non-ASCII codepoint
+    }
+
+    /// Set selection to the word containing (row, col). Used by
+    /// double-click in the UI layer.
+    pub fn selectWordAt(self: *Screen, row: i32, col: i32) void {
+        const cells = self.lineCellsAt(row) orelse return;
+        if (col < 0 or @as(usize, @intCast(col)) >= cells.len) return;
+        const cidx: usize = @intCast(col);
+        const here = cells[cidx];
+        if (!isWordChar(here.rune)) {
+            // Non-word cell → select just this column.
+            self.selection.start(row, col, .normal);
+            self.selection.extend(row, col + 1);
+            self.dirty = true;
+            return;
+        }
+        // Walk left.
+        var lo: usize = cidx;
+        while (lo > 0 and isWordChar(cells[lo - 1].rune)) lo -= 1;
+        // Walk right.
+        var hi: usize = cidx;
+        while (hi + 1 < cells.len and isWordChar(cells[hi + 1].rune)) hi += 1;
+        self.selection.start(row, @intCast(lo), .normal);
+        self.selection.extend(row, @intCast(hi + 1));
+        self.dirty = true;
+    }
+
+    /// Set selection to an entire row.
+    pub fn selectLineAt(self: *Screen, row: i32) void {
+        const cells = self.lineCellsAt(row) orelse return;
+        self.selection.start(row, 0, .normal);
+        self.selection.extend(row, @intCast(cells.len));
+        self.dirty = true;
+    }
+
     /// Record a prompt-mark at the current row (called from OSC 133).
     fn recordPromptMark(self: *Screen) void {
         const cap: u16 = self.prompt_marks.len;
@@ -2960,4 +3008,45 @@ test "search finds multibyte runes" {
     try std.testing.expectEqual(@as(usize, 2), matches.len);
     try std.testing.expectEqual(@as(u32, 0), matches[0].col);
     try std.testing.expectEqual(@as(u32, 1), matches[1].col);
+}
+
+test "selectWordAt grabs full word" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 30, 1);
+    defer s.deinit();
+    for ("hello world.txt") |b| s.printCp(b);
+
+    s.selectWordAt(0, 7); // mid 'world'
+    const r = s.selection.rect().?;
+    try std.testing.expectEqual(@as(i32, 0), r.top_row);
+    try std.testing.expectEqual(@as(i32, 6), r.top_col);
+    try std.testing.expectEqual(@as(i32, 15), r.bot_col); // 'world.txt' is 9 chars from 6, 6+9=15
+}
+
+test "selectWordAt on space selects single col" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 20, 1);
+    defer s.deinit();
+    for ("a b c") |b| s.printCp(b);
+
+    s.selectWordAt(0, 1); // the space
+    const r = s.selection.rect().?;
+    try std.testing.expectEqual(@as(i32, 1), r.top_col);
+    try std.testing.expectEqual(@as(i32, 2), r.bot_col);
+}
+
+test "selectLineAt covers row" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 20, 3);
+    defer s.deinit();
+
+    s.selectLineAt(1);
+    const r = s.selection.rect().?;
+    try std.testing.expectEqual(@as(i32, 1), r.top_row);
+    try std.testing.expectEqual(@as(i32, 0), r.top_col);
+    try std.testing.expectEqual(@as(i32, 1), r.bot_row);
+    try std.testing.expectEqual(@as(i32, 20), r.bot_col);
 }

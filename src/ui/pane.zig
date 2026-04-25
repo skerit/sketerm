@@ -643,7 +643,7 @@ fn onDragBegin(_: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
     c.gtk_widget_queue_draw(@ptrCast(self.area));
 }
 
-fn onMousePressed(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
     const button = c.gtk_gesture_single_get_current_button(@ptrCast(g));
 
@@ -651,6 +651,33 @@ fn onMousePressed(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyop
     // for mouse reports. With mouse_mode > 0 the app sees the click.
     if (button == 2 and self.terminal.screen.mouse_mode == 0) {
         clipboard.pastePrimaryFromClipboard(@ptrCast(self.area), self.terminal);
+        return;
+    }
+
+    // Left double / triple click → word / line selection.
+    if (button == 1 and self.terminal.screen.mouse_mode == 0 and n_press >= 2) {
+        const cell = self.cellAt(x, y);
+        const screen = self.terminal.screen;
+        if (n_press == 2) {
+            screen.selectWordAt(cell.row, cell.col);
+        } else { // 3+
+            screen.selectLineAt(cell.row);
+        }
+        // Push the new selection text to PRIMARY for middle-click paste.
+        if (screen.selection.isActive()) {
+            const text = screen.extractSelection(self.allocator) catch null;
+            if (text) |t| {
+                defer self.allocator.free(t);
+                if (t.len > 0) {
+                    if (self.allocator.allocSentinel(u8, t.len, 0)) |cs| {
+                        defer self.allocator.free(cs);
+                        @memcpy(cs, t);
+                        clipboard.copyToPrimary(@ptrCast(self.area), cs);
+                    } else |_| {}
+                }
+            }
+        }
+        c.gtk_widget_queue_draw(@ptrCast(self.area));
         return;
     }
 
