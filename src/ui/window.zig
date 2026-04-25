@@ -17,6 +17,7 @@ pub const Window = struct {
     panes: std.ArrayList(*Pane) = .{},
     terminals: std.ArrayList(*Terminal) = .{},
     allocator: std.mem.Allocator,
+    tab_counter: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         const self = try allocator.create(Window);
@@ -58,10 +59,18 @@ pub const Window = struct {
     }
 
     /// Spawn a new shell pane and add it as a tab.
-    pub fn newShellTab(self: *Window, title: [*:0]const u8) !void {
+    /// If title == null, a "Tab N" default is used.
+    pub fn newShellTab(self: *Window, title_opt: ?[*:0]const u8) !void {
         const shell_env = c.getenv("SHELL");
         const shell: [*:0]const u8 = if (shell_env != null) @ptrCast(shell_env) else "/bin/bash";
         const argv = [_][*:0]const u8{shell};
+
+        var num_buf: [32]u8 = undefined;
+        const title = if (title_opt) |t| t else blk: {
+            self.tab_counter += 1;
+            const slice = std.fmt.bufPrintZ(&num_buf, "Tab {d}", .{self.tab_counter}) catch "shell";
+            break :blk @as([*:0]const u8, slice.ptr);
+        };
         try self.addTabInternal(title, &argv, null);
     }
 
@@ -387,7 +396,7 @@ pub const Window = struct {
 fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
     const self: *Window = @ptrCast(@alignCast(ctx.?));
     switch (action) {
-        .new_tab => self.newShellTab("shell") catch {},
+        .new_tab => self.newShellTab(null) catch {},
         .close_tab => self.closeCurrentTab(),
         .next_tab => self.nextTab(),
         .prev_tab => self.prevTab(),
@@ -400,7 +409,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
 fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
     const self: *Window = @ptrCast(@alignCast(ctx.?));
     switch (action) {
-        .new_tab => self.newShellTab("shell") catch {},
+        .new_tab => self.newShellTab(null) catch {},
         .close_tab => self.closeCurrentTab(),
         .rename_tab => {
             // TODO: show GtkPopover with GtkEntry. Stub for now.

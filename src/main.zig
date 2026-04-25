@@ -85,7 +85,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     }
 
     if (!loaded) {
-        window.newShellTab("shell") catch |err| {
+        window.newShellTab(null) catch |err| {
             std.debug.print("sketerm: spawn first tab failed: {s}\n", .{@errorName(err)});
             return;
         };
