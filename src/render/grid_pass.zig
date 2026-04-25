@@ -435,11 +435,17 @@ pub const GridPass = struct {
         const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
 
         // Backgrounds (always emit non-default; default bg falls through
-        // to clearcolor).
+        // to clearcolor). Reverse video swaps fg/bg of THIS cell;
+        // we resolve fg first then swap below.
         for (cells, 0..) |cell, col| {
             const style = pool.get(cell.style_ref);
-            if (style.bg == .default and !style.attrs.reverse) continue;
-            const bg = self.colorToVec(style.bg, false, style.attrs.reverse);
+            const has_explicit_bg = style.bg != .default or style.attrs.reverse;
+            if (!has_explicit_bg) continue;
+            // For reverse, draw the cell's fg as the bg.
+            const bg = if (style.attrs.reverse)
+                self.resolveColor(style.fg, true)
+            else
+                self.resolveColor(style.bg, false);
             const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
             try self.pushQuad(.{ x, y }, .{ cw * x_scale, ch }, .{ 0, 0 }, .{ 0, 0 }, bg, 0.0);
         }
@@ -478,7 +484,20 @@ pub const GridPass = struct {
                 continue;
             }
             const style = pool.get(cell.style_ref);
-            const fg = self.colorToVec(style.fg, true, style.attrs.reverse);
+            // Reverse: draw fg using bg color (and bg using fg).
+            // Bold lifts palette 0..7 → 8..15.
+            var fg_color = if (style.attrs.reverse) style.bg else style.fg;
+            if (style.attrs.bold) {
+                if (fg_color == .palette and fg_color.palette < 8) {
+                    fg_color = .{ .palette = fg_color.palette + 8 };
+                }
+            }
+            var fg = self.resolveColor(fg_color, !style.attrs.reverse);
+            if (style.attrs.dim) {
+                fg[0] *= 0.65;
+                fg[1] *= 0.65;
+                fg[2] *= 0.65;
+            }
             const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
             const g = atlas.lookupOrLoad(cell.rune) catch {
                 col += 1;
@@ -530,7 +549,18 @@ pub const GridPass = struct {
             const cell = cells[logical];
             if ((cell.flags & 0b0000_0010) != 0 or cell.rune == 0 or cell.rune == ' ') continue;
             const style = pool.get(cell.style_ref);
-            const fg = self.colorToVec(style.fg, true, style.attrs.reverse);
+            var fg_color = if (style.attrs.reverse) style.bg else style.fg;
+            if (style.attrs.bold) {
+                if (fg_color == .palette and fg_color.palette < 8) {
+                    fg_color = .{ .palette = fg_color.palette + 8 };
+                }
+            }
+            var fg = self.resolveColor(fg_color, !style.attrs.reverse);
+            if (style.attrs.dim) {
+                fg[0] *= 0.65;
+                fg[1] *= 0.65;
+                fg[2] *= 0.65;
+            }
             const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
             const g = atlas.lookupOrLoad(cell.rune) catch continue;
             if (g.w == 0 or g.h == 0) continue;
@@ -588,6 +618,22 @@ pub const GridPass = struct {
             .{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], layer }, .color = color, .is_glyph = 1.0 },
         };
         try self.vbuf.appendSlice(self.allocator, &verts);
+    }
+
+    /// Resolve a Color → RGBA without considering reverse video. The
+    /// caller swaps fg/bg explicitly (for cells with explicit colors
+    /// reverse should still flip them).
+    fn resolveColor(self: *const GridPass, color: Color, is_fg: bool) [4]f32 {
+        return switch (color) {
+            .default => if (is_fg) self.default_fg else self.default_bg,
+            .palette => |p| self.paletteToVec(p, is_fg),
+            .rgb => |c_rgb| [_]f32{
+                @as(f32, @floatFromInt(c_rgb.r)) / 255.0,
+                @as(f32, @floatFromInt(c_rgb.g)) / 255.0,
+                @as(f32, @floatFromInt(c_rgb.b)) / 255.0,
+                1.0,
+            },
+        };
     }
 
     fn colorToVec(self: *const GridPass, color: Color, is_fg: bool, reverse: bool) [4]f32 {
