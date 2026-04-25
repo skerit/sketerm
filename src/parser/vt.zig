@@ -383,7 +383,7 @@ pub const Parser = struct {
     fn flushParam(self: *Parser) void {
         if (self.csi.n_params < 16) {
             self.csi.params[self.csi.n_params] = if (self.has_cur_param) self.cur_param else 0;
-            self.csi.is_sub[self.csi.n_params] = self.next_param_is_sub;
+            self.csi.setSub(self.csi.n_params, self.next_param_is_sub);
             self.csi.n_params += 1;
         }
         self.cur_param = 0;

@@ -64,11 +64,12 @@ pub const Event = union(enum) {
 
     pub const Csi = struct {
         params: [16]u32 = .{0} ** 16,
-        /// True iff `params[i]` was reached via a `:` (sub-parameter
+        /// Bit i = 1 iff `params[i]` was reached via a `:` (sub-parameter
         /// of `params[i-1]`) rather than `;`. Used by the SGR handler
         /// to distinguish `4:3` (curly-underline sub-param) from `4;3`
-        /// (underline AND italic). Index 0 is always false.
-        is_sub: [16]bool = .{false} ** 16,
+        /// (underline AND italic). Bit 0 is always 0. Replaces the
+        /// older `[16]bool` to shrink the event union (was 16 B, now 2).
+        is_sub_bits: u16 = 0,
         n_params: u8 = 0,
         intermediates: [4]u8 = .{0} ** 4,
         n_intermediates: u8 = 0,
@@ -89,6 +90,21 @@ pub const Event = union(enum) {
         pub fn paramRaw(self: *const Csi, idx: usize) u32 {
             if (idx >= self.n_params) return 0;
             return self.params[idx];
+        }
+
+        pub fn isSub(self: *const Csi, idx: usize) bool {
+            if (idx >= 16) return false;
+            return (self.is_sub_bits >> @intCast(idx)) & 1 == 1;
+        }
+
+        pub fn setSub(self: *Csi, idx: usize, v: bool) void {
+            if (idx >= 16) return;
+            const bit: u16 = @as(u16, 1) << @intCast(idx);
+            if (v) {
+                self.is_sub_bits |= bit;
+            } else {
+                self.is_sub_bits &= ~bit;
+            }
         }
     };
 

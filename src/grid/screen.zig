@@ -3159,7 +3159,7 @@ pub const Screen = struct {
                     // `4:0` → no underline; `4:1` → straight; `4:2`
                     // → double; `4:3` → curly; `4:4` → dotted; `4:5`
                     // → dashed. Sub-param-aware, kitty/iTerm2 spec.
-                    if (i + 1 < params.n_params and params.is_sub[i + 1]) {
+                    if (i + 1 < params.n_params and params.isSub(i + 1)) {
                         const style = params.params[i + 1];
                         switch (style) {
                             0 => {
@@ -4157,7 +4157,7 @@ test "SGR 4:3 sets curly underline" {
     var csi = Event.Csi{};
     csi.params[0] = 4;
     csi.params[1] = 3;
-    csi.is_sub[1] = true;
+    csi.setSub(1, true);
     csi.n_params = 2;
     csi.final = 'm';
     s.csi(csi);
