@@ -609,8 +609,45 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
         // scrollback from the bottom).
         const cells_at = screen.lineCellsAtPub(cell.row);
         if (cells_at) |cells| {
-            if (cell.col < cells.len) {
-                const c_cell = cells[@intCast(cell.col)];
+            // Bidi remap: cellAt returns the *visual* column. For
+            // mixed/RTL rows, the logical cell at that visual col
+            // may be different. Resolve via fribidi when the row
+            // contains any non-ASCII codepoint.
+            var logical_col: usize = @intCast(cell.col);
+            if (self.grid_pass.enable_bidi) {
+                var any_non_ascii = false;
+                for (cells) |rc| {
+                    if (rc.rune > 0x7F) {
+                        any_non_ascii = true;
+                        break;
+                    }
+                }
+                if (any_non_ascii) {
+                    const bidi = @import("../grid/bidi.zig");
+                    const cps = self.allocator.alloc(u32, cells.len) catch null;
+                    if (cps) |cps_buf| {
+                        defer self.allocator.free(cps_buf);
+                        const lvls = self.allocator.alloc(u8, cells.len) catch null;
+                        if (lvls) |lvls_buf| {
+                            defer self.allocator.free(lvls_buf);
+                            const idx = self.allocator.alloc(usize, cells.len) catch null;
+                            if (idx) |idx_buf| {
+                                defer self.allocator.free(idx_buf);
+                                for (cells, 0..) |rc, i| {
+                                    cps_buf[i] = if (rc.rune == 0) ' ' else rc.rune;
+                                    idx_buf[i] = i;
+                                }
+                                _ = bidi.lineLevels(cps_buf, lvls_buf, .auto);
+                                bidi.levelsToVisualOrder(lvls_buf, idx_buf);
+                                const v: usize = @intCast(cell.col);
+                                if (v < idx_buf.len) logical_col = idx_buf[v];
+                            }
+                        }
+                    }
+                }
+            }
+            if (logical_col < cells.len) {
+                const c_cell = cells[logical_col];
                 if (c_cell.flags & 0b0000_0100 != 0) {
                     if (screen.linkUri(c_cell.reserved)) |uri| {
                         if (self.allocator.dupe(u8, uri)) |copy| {
