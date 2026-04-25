@@ -29,6 +29,7 @@ comptime {
     _ = @import("ui/input_conformance_test.zig");
     _ = @import("parser/multicell_conformance_test.zig");
     _ = @import("parser/clipboard_conformance_test.zig");
+    _ = @import("parser/graphics_conformance_test.zig");
 }
 
 test {
