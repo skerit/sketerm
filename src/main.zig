@@ -5,6 +5,7 @@ const c = @import("c.zig").c;
 const Window = @import("ui/window.zig").Window;
 
 const APP_ID: [*:0]const u8 = "dev.sker.sketerm";
+const VERSION = "0.0.1";
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -12,6 +13,32 @@ const App = struct {
     restore: bool = false,
     layout_path: ?[]const u8 = null,
 };
+
+const HELP_TEXT =
+    \\sketerm — native GTK4 terminal emulator
+    \\
+    \\Usage: sketerm [OPTIONS]
+    \\
+    \\Options:
+    \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json
+    \\  --layout <path>       Load tabs from specific JSON layout file
+    \\  --help                Show this message
+    \\  --version             Show version
+    \\
+    \\Keyboard shortcuts (built-in):
+    \\  Ctrl+Shift+T          New tab
+    \\  Ctrl+Shift+W          Close tab / pane
+    \\  Ctrl+Tab              Next tab
+    \\  Ctrl+Shift+Tab        Previous tab
+    \\  Ctrl+Shift+D          Split horizontal
+    \\  Ctrl+Shift+R          Split vertical
+    \\  Ctrl+Shift+C          Copy selection
+    \\  Ctrl+Shift+V          Paste
+    \\
+    \\Right-click for context menu (split / new tab / etc).
+    \\Mouse wheel scrolls scrollback (10k lines default).
+    \\
+;
 
 var g_app: App = undefined;
 
@@ -34,6 +61,12 @@ pub fn main() u8 {
         } else if (std.mem.eql(u8, a, "--layout") and i + 1 < argv.len) {
             i += 1;
             g_app.layout_path = argv[i];
+        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            std.debug.print("{s}", .{HELP_TEXT});
+            return 0;
+        } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
+            std.debug.print("sketerm {s}\n", .{VERSION});
+            return 0;
         }
     }
 
