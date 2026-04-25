@@ -128,9 +128,12 @@ pub fn main() !u8 {
         }
     };
     var ec = Ctx{ .screen = screen, .allocator = allocator };
+    // Row 0: green text (SGR 38;5;2).
+    // Row 2: red underlined text (SGR 31;4).
+    // Underline drawn in the deco pass; we'll later inspect a row
+    // strip for red pixels below the glyph baseline.
     const greeting = "\x1b[38;5;2mHello, sketerm!\x1b[0m" ++
-        // CSI 3;1 H — move to row 3 col 1 (1-based).
-        "\x1b[3;1HCell pass live.";
+        "\x1b[3;1H\x1b[31;4mUnderlined\x1b[0m";
     parser.advance(greeting, Emit.cb, @ptrCast(&ec));
 
     // Cell pass.
@@ -160,23 +163,26 @@ pub fn main() !u8 {
     // 1. Some non-bg, non-pure-white pixel exists where text was drawn
     //    (the green "Hello" — channel: G > R, G > B is the marker).
     // 2. Some focus-border accent (blue-ish, B > G > R) along the edge.
+    // 3. Some red pixels in row 2 (the underlined text + the underline
+    //    strip — both red).
     var greenish: usize = 0;
     var bluish_border: usize = 0;
+    var reddish: usize = 0;
     var any_text: usize = 0;
     var i: usize = 0;
     while (i < fb_bytes) : (i += 4) {
         const r: i32 = fb[i + 0];
         const g: i32 = fb[i + 1];
         const b: i32 = fb[i + 2];
-        // Skip the dark bg.
         if (r < 0x20 and g < 0x20 and b < 0x30) continue;
         any_text += 1;
         if (g > r + 30 and g > b + 30) greenish += 1;
         if (b > g + 20 and b > r + 30) bluish_border += 1;
+        if (r > g + 30 and r > b + 30) reddish += 1;
     }
     std.debug.print(
-        "smoke-cell: any_text={d} greenish={d} bluish_border={d}\n",
-        .{ any_text, greenish, bluish_border },
+        "smoke-cell: any_text={d} greenish={d} bluish_border={d} reddish={d}\n",
+        .{ any_text, greenish, bluish_border, reddish },
     );
 
     if (any_text < 50) {
@@ -190,6 +196,10 @@ pub fn main() !u8 {
     if (bluish_border < 5) {
         std.debug.print("smoke-cell: FAIL — focus border not drawn\n", .{});
         return 4;
+    }
+    if (reddish < 5) {
+        std.debug.print("smoke-cell: FAIL — no red text/underline (deco pass broken?)\n", .{});
+        return 5;
     }
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
