@@ -510,15 +510,11 @@ pub const Screen = struct {
             return;
         }
 
-        // Delete actions — we don't yet track per-image state we
-        // can selectively remove, but we mark the screen dirty so
-        // the next paint refreshes. Apps that send `d=A` to clear
-        // all see it work because the renderer keys off ImageStore
-        // which the pane-side handler will rebuild.
-        if (cmd.action == .delete) {
-            self.dirty = true;
-            return;
-        }
+        // Delete actions — accept-and-noop. ImageStore lives on the
+        // Pane side; selective deletion needs an `on_image_delete`
+        // sink before we can wire it. For now, no error so apps
+        // continue rather than fall back to a different protocol.
+        if (cmd.action == .delete) return;
 
         // v1: just notify the sink with raw cmd via the existing image
         // event when we have RGBA. For format=32 (RGBA), payload IS
