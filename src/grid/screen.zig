@@ -74,6 +74,9 @@ pub const Screen = struct {
     /// DECCKM (mode 1) — application cursor keys (arrows emit
     /// `ESC O X` instead of `ESC [ X`).
     app_cursor_keys: bool = false,
+    /// DECPAM / DECPNM (ESC = / ESC >) — application keypad mode.
+    /// Numpad keys emit `ESC O p..y` instead of digits when set.
+    app_keypad: bool = false,
     /// DECSET 25 — cursor visibility.
     cursor_visible: bool = true,
     /// DECSCUSR cursor shape.
@@ -2131,8 +2134,8 @@ pub const Screen = struct {
             'M' => self.reverseLineFeed(),
             'Z' => self.respondDa(), // DECID — identify, same payload as DA1
             'c' => self.fullReset(),
-            '=' => {}, // DECPAM — application keypad on (numpad encoding shift)
-            '>' => {}, // DECPNM — application keypad off
+            '=' => self.app_keypad = true, // DECPAM — application keypad on
+            '>' => self.app_keypad = false, // DECPNM — application keypad off
             else => {},
         }
     }
@@ -2153,6 +2156,7 @@ pub const Screen = struct {
         self.bracketed_paste = false;
         self.focus_reports = false;
         self.app_cursor_keys = false;
+        self.app_keypad = false;
         self.mouse_mode = 0;
         self.mouse_sgr = false;
         self.pending_wrap = false;
@@ -2176,6 +2180,7 @@ pub const Screen = struct {
         self.charset_g1 = .ascii;
         self.active_charset = .g0;
         self.app_cursor_keys = false;
+        self.app_keypad = false;
         self.mouse_mode = 0;
         self.mouse_sgr = false;
         self.bracketed_paste = false;

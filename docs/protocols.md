@@ -158,7 +158,7 @@ Default behavior per app:
 |--------|-------------------------------------------|----|
 | `q`    | Sixel image                               | ✓ (M9b) |
 | `$q`   | DECRQSS — report setting (m/r/" q)        | ✓ |
-| `+q`   | XTGETTCAP — terminfo query                | deferred |
+| `+q`   | XTGETTCAP — terminfo query                | ✓ (TN, Co, RGB, Tc, bce, U8, civis/cnorm, csr, Su) |
 | `P`    | DECUDK — user-defined keys                | never |
 
 ## APC frames

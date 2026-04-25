@@ -328,7 +328,7 @@ fn onKeyPressed(
 
     var buf: [16]u8 = undefined;
     const screen = ctx.terminal.screen;
-    const n = encode(&buf, keyval, state, screen.app_cursor_keys, screen.modify_other_keys, screen.kitty_kbd_flags, is_repeat);
+    const n = encode(&buf, keyval, state, screen.app_cursor_keys, screen.modify_other_keys, screen.kitty_kbd_flags, is_repeat, screen.app_keypad);
     if (n == 0) return 0;
     // Snap to bottom on keypress (matches xterm/iterm2/etc behavior).
     if (screen.view_offset != 0) {
@@ -427,10 +427,43 @@ pub fn kittyKeyEvent(buf: []u8, code_point: u32, shift: bool, alt: bool, ctrl: b
     return out.len;
 }
 
-fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, mok: u8, kitty_flags: u8, is_repeat: bool) usize {
+fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, mok: u8, kitty_flags: u8, is_repeat: bool, app_keypad: bool) usize {
     const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
     const alt = (mods & c.GDK_ALT_MASK) != 0;
     const shift = (mods & c.GDK_SHIFT_MASK) != 0;
+
+    // Application keypad mode (DECPAM): numpad keys emit `ESC O X`
+    // sequences instead of plain digits / operators. xterm uses these
+    // VT220 codes, which vim, less, etc. read for navigation.
+    if (app_keypad) {
+        const final: u8 = switch (keyval) {
+            c.GDK_KEY_KP_0 => 'p',
+            c.GDK_KEY_KP_1 => 'q',
+            c.GDK_KEY_KP_2 => 'r',
+            c.GDK_KEY_KP_3 => 's',
+            c.GDK_KEY_KP_4 => 't',
+            c.GDK_KEY_KP_5 => 'u',
+            c.GDK_KEY_KP_6 => 'v',
+            c.GDK_KEY_KP_7 => 'w',
+            c.GDK_KEY_KP_8 => 'x',
+            c.GDK_KEY_KP_9 => 'y',
+            c.GDK_KEY_KP_Multiply => 'j',
+            c.GDK_KEY_KP_Add => 'k',
+            c.GDK_KEY_KP_Separator => 'l',
+            c.GDK_KEY_KP_Subtract => 'm',
+            c.GDK_KEY_KP_Decimal => 'n',
+            c.GDK_KEY_KP_Divide => 'o',
+            c.GDK_KEY_KP_Equal => 'X',
+            c.GDK_KEY_KP_Enter => 'M',
+            else => 0,
+        };
+        if (final != 0) {
+            buf[0] = 0x1B;
+            buf[1] = 'O';
+            buf[2] = final;
+            return 3;
+        }
+    }
     // DECCKM swap: arrows/home/end use ESC O X instead of ESC [ X.
     const ck: u8 = if (app_cursor) 'O' else '[';
 
