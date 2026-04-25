@@ -249,13 +249,26 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         return;
     }
 
-    // Try each candidate font in order until one works.
+    // Try each candidate font in order until one works. The
+    // SKETERM_FONT env var (when set, must be an absolute path to a
+    // TTF/OTF) is tried first.
     self.atlas = null;
-    for (FONT_CANDIDATES) |path| {
-        if (Atlas.init(self.allocator, path, FONT_SIZE)) |a| {
+    if (std.posix.getenv("SKETERM_FONT")) |env_path| {
+        // env_path isn't null-terminated. Copy + sentinel for FT.
+        const z = self.allocator.allocSentinel(u8, env_path.len, 0) catch return;
+        defer self.allocator.free(z);
+        @memcpy(z, env_path);
+        if (Atlas.init(self.allocator, z.ptr, FONT_SIZE)) |a| {
             self.atlas = a;
-            break;
-        } else |_| continue;
+        } else |_| {}
+    }
+    if (self.atlas == null) {
+        for (FONT_CANDIDATES) |path| {
+            if (Atlas.init(self.allocator, path, FONT_SIZE)) |a| {
+                self.atlas = a;
+                break;
+            } else |_| continue;
+        }
     }
     if (self.atlas == null) {
         std.debug.print("pane realize: no usable font in {d} candidates\n", .{FONT_CANDIDATES.len});

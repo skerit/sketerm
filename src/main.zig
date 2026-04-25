@@ -44,6 +44,9 @@ const HELP_TEXT =
     \\Right-click for context menu (split / new tab / etc).
     \\Mouse wheel scrolls scrollback (10k lines default).
     \\
+    \\Environment:
+    \\  SKETERM_FONT          Override font (absolute path to .ttf/.otf)
+    \\
 ;
 
 var g_app: App = undefined;
