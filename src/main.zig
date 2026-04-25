@@ -39,6 +39,9 @@ const HELP_TEXT =
     \\  Ctrl+Shift+C          Copy selection
     \\  Ctrl+Shift+V          Paste
     \\  Ctrl+Shift+K          Clear screen + scrollback
+    \\  Ctrl+Shift+F          Open scrollback search
+    \\  Ctrl+= / Ctrl+-       Increase / decrease font size
+    \\  Ctrl+0                Reset font size
     \\  Shift+PgUp / PgDn     Scroll back / forward by one screenful
     \\
     \\Right-click for context menu (split / new tab / etc).

@@ -645,6 +645,43 @@ pub const Screen = struct {
         return if (self.lineAt(row)) |l| l.cells else null;
     }
 
+    pub const SearchMatch = struct {
+        /// Display-row coordinate. Negative = scrollback (-1 = bottom).
+        row: i32,
+        col: u32,
+        len: u32,
+    };
+
+    /// Linear scan over scrollback + active (visible) buffer for
+    /// `needle`. Case-sensitive, single-line only (no wrap join).
+    /// Caller frees the returned slice.
+    pub fn search(self: *const Screen, allocator: std.mem.Allocator, needle: []const u8) ![]SearchMatch {
+        var out: std.ArrayList(SearchMatch) = .{};
+        defer out.deinit(allocator);
+        if (needle.len == 0) return try out.toOwnedSlice(allocator);
+
+        var line_buf: std.ArrayList(u8) = .{};
+        defer line_buf.deinit(allocator);
+        var col_map: std.ArrayList(u32) = .{};
+        defer col_map.deinit(allocator);
+
+        // Scrollback: rows -1, -2, … walked from oldest (-sb_count) up.
+        const sb_count = self.scrollbackCount();
+        var i: u32 = 0;
+        while (i < sb_count) : (i += 1) {
+            const row: i32 = @as(i32, @intCast(i)) - @as(i32, @intCast(sb_count));
+            try renderLineForSearch(allocator, self, row, &line_buf, &col_map);
+            try findMatches(allocator, line_buf.items, col_map.items, needle, row, &out);
+        }
+        // Active screen.
+        var r: u16 = 0;
+        while (r < self.rows) : (r += 1) {
+            try renderLineForSearch(allocator, self, @intCast(r), &line_buf, &col_map);
+            try findMatches(allocator, line_buf.items, col_map.items, needle, @intCast(r), &out);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
     /// Returns a *const Line at a display row, or null on OOB.
     fn lineAt(self: *const Screen, row: i32) ?*const Line {
         if (row >= 0 and row < @as(i32, @intCast(self.rows))) {
@@ -2085,6 +2122,61 @@ pub const Screen = struct {
     }
 };
 
+/// Render a single display row into UTF-8, recording the originating
+/// column for each emitted byte. Used by Screen.search.
+fn renderLineForSearch(
+    allocator: std.mem.Allocator,
+    self: *const Screen,
+    row: i32,
+    line_buf: *std.ArrayList(u8),
+    col_map: *std.ArrayList(u32),
+) !void {
+    line_buf.clearRetainingCapacity();
+    col_map.clearRetainingCapacity();
+
+    const cells = self.lineCellsAt(row) orelse return;
+    var col: u32 = 0;
+    while (col < cells.len) : (col += 1) {
+        const cell = cells[col];
+        if (cell.flags & 0b0000_0010 != 0) continue; // wide-cont
+        const cp: u32 = if (cell.rune == 0) ' ' else cell.rune;
+        var enc: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(cp), &enc) catch 0;
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            try line_buf.append(allocator, enc[k]);
+            try col_map.append(allocator, col);
+        }
+    }
+}
+
+fn findMatches(
+    allocator: std.mem.Allocator,
+    haystack: []const u8,
+    col_map: []const u32,
+    needle: []const u8,
+    row: i32,
+    out: *std.ArrayList(Screen.SearchMatch),
+) !void {
+    var pos: usize = 0;
+    while (pos + needle.len <= haystack.len) {
+        if (std.mem.eql(u8, haystack[pos .. pos + needle.len], needle)) {
+            const start_col = col_map[pos];
+            // Match length in columns: max col-1 - start_col + 1.
+            const end_byte = pos + needle.len - 1;
+            const end_col = col_map[end_byte];
+            try out.append(allocator, .{
+                .row = row,
+                .col = start_col,
+                .len = end_col - start_col + 1,
+            });
+            pos += needle.len;
+        } else {
+            pos += 1;
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────
 
 test "init / blank cells" {
@@ -2819,4 +2911,48 @@ test "REP after RIS does not replay stale" {
     csi.final = 'b';
     s.csi(csi);
     try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 0).rune);
+}
+
+test "search finds matches in active screen" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 20, 3);
+    defer s.deinit();
+    for ("hello world hello") |b| s.printCp(b);
+
+    const matches = try s.search(std.testing.allocator, "hello");
+    defer std.testing.allocator.free(matches);
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqual(@as(i32, 0), matches[0].row);
+    try std.testing.expectEqual(@as(u32, 0), matches[0].col);
+    try std.testing.expectEqual(@as(u32, 5), matches[0].len);
+    try std.testing.expectEqual(@as(u32, 12), matches[1].col);
+}
+
+test "search returns empty for empty needle" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 20, 3);
+    defer s.deinit();
+    for ("hello") |b| s.printCp(b);
+
+    const matches = try s.search(std.testing.allocator, "");
+    defer std.testing.allocator.free(matches);
+    try std.testing.expectEqual(@as(usize, 0), matches.len);
+}
+
+test "search finds multibyte runes" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 20, 3);
+    defer s.deinit();
+    s.printCp('é'); // U+00E9 → 2-byte UTF-8
+    s.printCp('é');
+    s.printCp('a');
+
+    const matches = try s.search(std.testing.allocator, "é");
+    defer std.testing.allocator.free(matches);
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqual(@as(u32, 0), matches[0].col);
+    try std.testing.expectEqual(@as(u32, 1), matches[1].col);
 }

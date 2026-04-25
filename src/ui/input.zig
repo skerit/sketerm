@@ -31,6 +31,7 @@ pub const Action = enum {
     font_inc,
     font_dec,
     font_reset,
+    search_open,
 };
 
 pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allocator) !*Ctx {
@@ -159,6 +160,10 @@ fn onKeyPressed(
                 // Clear screen + scrollback. Direct call — we're on
                 // the main thread, the screen lives there too.
                 ctx.terminal.screen.clearAndScrollback();
+                return 1;
+            },
+            c.GDK_KEY_F, c.GDK_KEY_f => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .search_open);
                 return 1;
             },
             else => {},

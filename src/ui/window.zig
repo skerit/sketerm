@@ -21,6 +21,13 @@ pub const Window = struct {
     tab_counter: u32 = 0,
     debug_events: bool = false,
     config: Config = .{},
+    /// Scrollback search (Ctrl+F).
+    search_bar: ?*c.GtkWidget = null,
+    search_entry: ?*c.GtkWidget = null,
+    search_label: ?*c.GtkWidget = null,
+    search_pane: ?*Pane = null,
+    search_matches: std.ArrayList(@import("../grid/screen.zig").Screen.SearchMatch) = .{},
+    search_idx: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         const self = try allocator.create(Window);
@@ -52,6 +59,31 @@ pub const Window = struct {
         c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), header_bar);
         c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), @ptrCast(@alignCast(tab_bar_w)));
         c.adw_toolbar_view_set_content(@ptrCast(toolbar_view), @ptrCast(@alignCast(tab_view_w)));
+
+        // Scrollback search bar — bottom of the window. Hidden by
+        // default; revealed by Ctrl+F (search_open shortcut).
+        const search_bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+        c.gtk_widget_set_margin_start(search_bar, 8);
+        c.gtk_widget_set_margin_end(search_bar, 8);
+        c.gtk_widget_set_margin_top(search_bar, 4);
+        c.gtk_widget_set_margin_bottom(search_bar, 4);
+        c.gtk_widget_set_visible(search_bar, 0);
+        const search_entry = c.gtk_search_entry_new();
+        c.gtk_widget_set_hexpand(search_entry, 1);
+        const search_label = c.gtk_label_new("");
+        const prev_btn = c.gtk_button_new_from_icon_name("go-up-symbolic");
+        c.gtk_widget_set_tooltip_text(prev_btn, "Previous match (Shift+Enter)");
+        const next_btn = c.gtk_button_new_from_icon_name("go-down-symbolic");
+        c.gtk_widget_set_tooltip_text(next_btn, "Next match (Enter)");
+        const close_btn = c.gtk_button_new_from_icon_name("window-close-symbolic");
+        c.gtk_widget_set_tooltip_text(close_btn, "Close search (Esc)");
+        c.gtk_box_append(@ptrCast(search_bar), search_entry);
+        c.gtk_box_append(@ptrCast(search_bar), search_label);
+        c.gtk_box_append(@ptrCast(search_bar), prev_btn);
+        c.gtk_box_append(@ptrCast(search_bar), next_btn);
+        c.gtk_box_append(@ptrCast(search_bar), close_btn);
+        c.adw_toolbar_view_add_bottom_bar(@ptrCast(toolbar_view), search_bar);
+
         c.adw_application_window_set_content(@ptrCast(app_window), toolbar_view);
 
         // Double-click on the tab bar → rename the selected tab.
@@ -74,7 +106,24 @@ pub const Window = struct {
             .tab_view = @ptrCast(tab_view_w),
             .allocator = allocator,
             .config = Config.load(allocator),
+            .search_bar = search_bar,
+            .search_entry = search_entry,
+            .search_label = search_label,
         };
+
+        // Search wiring.
+        _ = c.g_signal_connect_data(search_entry, "search-changed", @ptrCast(&onSearchChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(search_entry, "activate", @ptrCast(&onSearchActivate), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(search_entry, "stop-search", @ptrCast(&onSearchStop), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(prev_btn, "clicked", @ptrCast(&onSearchPrev), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(next_btn, "clicked", @ptrCast(&onSearchNext), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(close_btn, "clicked", @ptrCast(&onSearchClose), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+
+        // Shift+Enter on the entry → previous (entry "activate" only
+        // fires plain Enter; intercept via a key-controller).
+        const search_keys = c.gtk_event_controller_key_new();
+        _ = c.g_signal_connect_data(search_keys, "key-pressed", @ptrCast(&onSearchKeyPressed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(search_entry, @ptrCast(search_keys));
 
         // When a tab is removed (close button, Ctrl+Shift+W, etc),
         // tear down the Pane + Terminal Zig-side state. AdwTabView
@@ -120,8 +169,108 @@ pub const Window = struct {
         for (self.terminals.items) |t| t.deinit();
         self.panes.deinit(self.allocator);
         self.terminals.deinit(self.allocator);
+        self.search_matches.deinit(self.allocator);
         self.config.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Open the scrollback search bar against the focused pane.
+    pub fn openSearch(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+        self.search_pane = pane;
+        if (self.search_bar) |w| c.gtk_widget_set_visible(w, 1);
+        if (self.search_entry) |w| {
+            c.gtk_editable_set_text(@ptrCast(w), "");
+            _ = c.gtk_widget_grab_focus(w);
+        }
+        self.search_matches.clearRetainingCapacity();
+        self.search_idx = 0;
+        if (self.search_label) |l| c.gtk_label_set_text(@ptrCast(l), "");
+    }
+
+    /// Close the search bar and clear any selection used as highlight.
+    pub fn closeSearch(self: *Window) void {
+        if (self.search_bar) |w| c.gtk_widget_set_visible(w, 0);
+        if (self.search_pane) |p| {
+            p.terminal.screen.selection.clear();
+            p.terminal.screen.dirty = true;
+            _ = c.gtk_widget_grab_focus(p.widget());
+        }
+        self.search_pane = null;
+        self.search_matches.clearRetainingCapacity();
+        self.search_idx = 0;
+    }
+
+    fn updateSearch(self: *Window, query: []const u8) void {
+        const pane = self.search_pane orelse return;
+        self.search_matches.deinit(self.allocator);
+        self.search_matches = .{};
+        self.search_idx = 0;
+        if (query.len > 0) {
+            const matches = pane.terminal.screen.search(self.allocator, query) catch return;
+            defer self.allocator.free(matches);
+            self.search_matches.appendSlice(self.allocator, matches) catch return;
+        }
+        self.refreshSearchLabel();
+        if (self.search_matches.items.len > 0) {
+            // Jump to the last (most-recent) match — usually what users want.
+            self.search_idx = self.search_matches.items.len - 1;
+            self.applyCurrentMatch();
+        } else {
+            pane.terminal.screen.selection.clear();
+            pane.terminal.screen.dirty = true;
+        }
+    }
+
+    fn refreshSearchLabel(self: *Window) void {
+        const lab = self.search_label orelse return;
+        var buf: [64:0]u8 = undefined;
+        if (self.search_matches.items.len == 0) {
+            const s = std.fmt.bufPrintZ(&buf, "0/0", .{}) catch "0/0";
+            c.gtk_label_set_text(@ptrCast(lab), s.ptr);
+        } else {
+            const s = std.fmt.bufPrintZ(&buf, "{d}/{d}", .{
+                self.search_idx + 1,
+                self.search_matches.items.len,
+            }) catch "?/?";
+            c.gtk_label_set_text(@ptrCast(lab), s.ptr);
+        }
+    }
+
+    fn applyCurrentMatch(self: *Window) void {
+        const pane = self.search_pane orelse return;
+        if (self.search_matches.items.len == 0) return;
+        const m = self.search_matches.items[self.search_idx];
+        const screen = pane.terminal.screen;
+        // Use the existing selection model as the highlight.
+        screen.selection.start(m.row, @intCast(m.col), .normal);
+        const end_col: i32 = @as(i32, @intCast(m.col)) + @as(i32, @intCast(m.len)) - 1;
+        screen.selection.extend(m.row, end_col);
+        // Scroll into view.
+        if (m.row < 0) {
+            const dist: u32 = @intCast(-m.row);
+            screen.view_offset = @min(screen.scrollbackCount(), dist);
+        } else {
+            screen.view_offset = 0;
+        }
+        screen.dirty = true;
+        self.refreshSearchLabel();
+    }
+
+    fn nextMatch(self: *Window) void {
+        if (self.search_matches.items.len == 0) return;
+        self.search_idx = (self.search_idx + 1) % self.search_matches.items.len;
+        self.applyCurrentMatch();
+    }
+
+    fn prevMatch(self: *Window) void {
+        if (self.search_matches.items.len == 0) return;
+        if (self.search_idx == 0) {
+            self.search_idx = self.search_matches.items.len - 1;
+        } else {
+            self.search_idx -= 1;
+        }
+        self.applyCurrentMatch();
     }
 
     pub fn present(self: *Window) void {
@@ -781,8 +930,63 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .font_inc => self.adjustFocusedFontSize(1),
         .font_dec => self.adjustFocusedFontSize(-1),
         .font_reset => self.resetFocusedFontSize(),
+        .search_open => self.openSearch(),
         else => {},
     }
+}
+
+fn onSearchChanged(entry: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    const text_ptr = c.gtk_editable_get_text(@ptrCast(entry));
+    if (text_ptr == null) return;
+    const cstr: [*:0]const u8 = @ptrCast(text_ptr);
+    const len = std.mem.len(cstr);
+    self.updateSearch(cstr[0..len]);
+}
+
+fn onSearchActivate(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    self.nextMatch();
+}
+
+fn onSearchStop(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    self.closeSearch();
+}
+
+fn onSearchClose(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    self.closeSearch();
+}
+
+fn onSearchNext(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    self.nextMatch();
+}
+
+fn onSearchPrev(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    self.prevMatch();
+}
+
+fn onSearchKeyPressed(
+    _: *c.GtkEventControllerKey,
+    keyval: c_uint,
+    _: c_uint,
+    state: c.GdkModifierType,
+    user: ?*anyopaque,
+) callconv(.c) c.gboolean {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    const shift = (state & c.GDK_SHIFT_MASK) != 0;
+    if (keyval == c.GDK_KEY_Return or keyval == c.GDK_KEY_KP_Enter) {
+        if (shift) self.prevMatch() else self.nextMatch();
+        return 1;
+    }
+    if (keyval == c.GDK_KEY_Escape) {
+        self.closeSearch();
+        return 1;
+    }
+    return 0;
 }
 
 fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
