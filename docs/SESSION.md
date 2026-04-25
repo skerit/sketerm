@@ -804,3 +804,28 @@ Remaining gap to Kitty / Ghostty throughput: SIMD UTF-8 decoder
 remaining win on plain text), pass-Event-by-pointer to remove
 the ~88-byte struct copies through emit / apply, persistent-mapped
 cell VBO.
+
+## ReleaseFast SIGSEGV — root-caused & fixed
+
+Tracking issue from previous tick: `zig build test -Doptimize=ReleaseFast`
+deterministically segfaulted in `Pool.get` on the 36th conformance test.
+Root cause: the test `Harness` (and a couple of similar test-only
+`Bench` wrappers) stored `Pool` BY VALUE but called
+`Screen.init(allocator, &pool, …)` with the *stack address* of that
+local `pool`. When `Harness.init` returned, the struct was moved
+into the caller's frame and the stack region holding the original
+`pool` was reused with garbage; `screen.pool` was a dangling pointer
+the whole time. ReleaseSafe happened to leave the stack alone long
+enough for it to look "fine"; ReleaseFast reused the slot
+aggressively.
+
+Fix: heap-allocate `Pool` in the harness, store as `*Pool` so the
+address is stable. Same fix applied to `clipboard_conformance_test.zig`
+and `image_pipeline_test.zig`. Production `Terminal` was already OK
+because it explicitly re-assigns `self.screen.pool = &self.pool` after
+the heap-allocated struct is constructed.
+
+With the bug gone, default build mode promoted to ReleaseFast — the
+shipped binary now ships with safety checks off (matches
+Kitty/WezTerm/Ghostty conventions). Pass `-Doptimize=ReleaseSafe`
+during development for bounds + overflow checks.
