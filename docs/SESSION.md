@@ -917,3 +917,28 @@ plain ASCII); these are real-world per-frame and per-event wins.
   in ReleaseFast; source-level by-pointer added an indirect access
   that pessimised CSI cursor moves (-15%). Reverted.
 
+
+## Continued tick (build-fix + small wins)
+
+- **Tier 2.5 mixed-run path** — print_run handler bulk-prints
+  contiguous ASCII via printCp directly when decoder is idle,
+  routing only non-ASCII through Decoder.feed for codepoint
+  reassembly. CJK + ASCII chrome no longer pays per-byte branch.
+- **Smart-case search** — `Screen.searchOpts(allocator, needle, ci)`
+  with a smart-case heuristic in `Window.updateSearch`: lower-only
+  needle implies CI; uppercase forces CS. 1 unit test.
+- **Csi.is_sub bool[16] → u16 bitmask** — Csi struct shrunk
+  88 → 76 B. Event union still 96 B (DcsFull is the limiter at
+  88) but Csi-handling code touches fewer cache lines.
+- **SPSC ring 4096 → 16384** — absorbs ~100 ms of worker bursts
+  without spin-waiting on a stalled main thread.
+- **cursor_blink_ms** — config knob for half-cycle interval (was
+  hardcoded 500 ms). Plumbed Pane.cursor_blink_us and read in
+  onTick.
+- **Build regression fix**: `self.writeMouseEvent(...)` was
+  invalid because `writeMouseEvent` was module-level, not a Pane
+  method. Tests passed (tests.zig doesn't import pane.zig); only
+  `zig build` of the main binary surfaced it. Switched to
+  `writeMouseEvent(self, ...)` form. Note for future ticks: run
+  the FULL `zig build`, not just `zig build test`.
+
