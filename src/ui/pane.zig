@@ -258,7 +258,8 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     c.glClearColor(self.grid_pass.default_bg[0], self.grid_pass.default_bg[1], self.grid_pass.default_bg[2], self.grid_pass.default_bg[3]);
     c.glClear(c.GL_COLOR_BUFFER_BIT);
 
-    self.grid_pass.buildVertices(self.terminal.screen, &self.terminal.pool, atlas) catch return @intFromBool(false);
+    const focused = c.gtk_widget_has_focus(@ptrCast(self.area)) != 0;
+    self.grid_pass.buildVertices(self.terminal.screen, &self.terminal.pool, atlas, focused) catch return @intFromBool(false);
     self.grid_pass.draw(atlas, phys_w, phys_h);
 
     // Upload pending images, then draw.

@@ -120,11 +120,13 @@ pub const GridPass = struct {
     }
 
     /// Build the vertex buffer for the current screen state.
+    /// `focused` adds a thin accent border at the pane edges.
     pub fn buildVertices(
         self: *GridPass,
         screen: *Screen,
         pool: *const StylePool,
         atlas: *Atlas,
+        focused: bool,
     ) !void {
         self.vbuf.clearRetainingCapacity();
 
@@ -258,6 +260,18 @@ pub const GridPass = struct {
                 },
             }
             _ = Shape; // (kept import for clarity)
+        }
+
+        // Focus border — thin accent rectangles at the pane edges.
+        if (focused) {
+            const grid_w: f32 = @as(f32, @floatFromInt(screen.cols)) * cw;
+            const grid_h: f32 = @as(f32, @floatFromInt(screen.rows)) * ch;
+            const border: f32 = 2.0;
+            const accent = .{ 0.40, 0.55, 0.85, 0.55 };
+            try self.pushQuad(.{ 0, 0 }, .{ grid_w, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+            try self.pushQuad(.{ 0, grid_h - border }, .{ grid_w, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+            try self.pushQuad(.{ 0, 0 }, .{ border, grid_h }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+            try self.pushQuad(.{ grid_w - border, 0 }, .{ border, grid_h }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
         }
     }
 
