@@ -535,19 +535,59 @@ pub const Screen = struct {
     }
 
     fn onDcs(self: *Screen, d: Event.DcsFull) void {
-        // v1: handle 'q' = sixel. Decode and log; render integration
-        // (placement → GL texture) lands in M9b finish.
-        if (d.proto.final != 'q') return;
-        const sixel = @import("../parser/sixel.zig");
-        const decoded = sixel.decode(self.allocator, d.body) catch return;
-        defer self.allocator.free(decoded.rgba);
-        if (self.sink.on_image) |f| f(self.sink.ctx, .{
-            .width = decoded.width,
-            .height = decoded.height,
-            .rgba = decoded.rgba,
-            .row = self.row,
-            .col = self.col,
-        });
+        // DECRQSS: `DCS $ q <selector> ST` — request status string.
+        if (d.proto.final == 'q' and d.proto.n_intermediates == 1 and d.proto.intermediates[0] == '$') {
+            self.handleDecrqss(d.body);
+            return;
+        }
+        // Sixel: `DCS Pn ; Pn ; Pn q <body> ST`.
+        if (d.proto.final == 'q' and d.proto.n_intermediates == 0) {
+            const sixel = @import("../parser/sixel.zig");
+            const decoded = sixel.decode(self.allocator, d.body) catch return;
+            defer self.allocator.free(decoded.rgba);
+            if (self.sink.on_image) |f| f(self.sink.ctx, .{
+                .width = decoded.width,
+                .height = decoded.height,
+                .rgba = decoded.rgba,
+                .row = self.row,
+                .col = self.col,
+            });
+        }
+    }
+
+    /// DECRQSS reply format: `DCS Ps $ r <answer> ST` where Ps=1 if
+    /// recognized, 0 if not.
+    fn handleDecrqss(self: *Screen, sel: []const u8) void {
+        var resp_buf: [64]u8 = undefined;
+        if (sel.len == 1 and sel[0] == 'm') {
+            // SGR query — report current style. v1: just SGR 0 reset.
+            const s = std.fmt.bufPrint(&resp_buf, "\x1bP1$r0m\x1b\\", .{}) catch return;
+            self.respond(s);
+            return;
+        }
+        if (sel.len == 1 and sel[0] == 'r') {
+            const s = std.fmt.bufPrint(&resp_buf, "\x1bP1$r{d};{d}r\x1b\\", .{
+                self.scroll_top + 1, self.scroll_bot + 1,
+            }) catch return;
+            self.respond(s);
+            return;
+        }
+        if (sel.len == 2 and sel[0] == ' ' and sel[1] == 'q') {
+            // DECSCUSR query.
+            const code: u8 = switch (self.cursor_shape) {
+                .block_blink => 1,
+                .block_steady => 2,
+                .underline_blink => 3,
+                .underline_steady => 4,
+                .bar_blink => 5,
+                .bar_steady => 6,
+            };
+            const s = std.fmt.bufPrint(&resp_buf, "\x1bP1$r{d} q\x1b\\", .{code}) catch return;
+            self.respond(s);
+            return;
+        }
+        // Unrecognized.
+        self.respond("\x1bP0$r\x1b\\");
     }
 
     fn onChildEof(self: *Screen, status: i32) void {
