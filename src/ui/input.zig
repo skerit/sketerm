@@ -341,3 +341,33 @@ fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool) 
     }
     return std.unicode.utf8Encode(@intCast(cp), buf) catch 0;
 }
+
+test "cursorKey plain emits ESC [ X" {
+    var buf: [16]u8 = undefined;
+    const n = cursorKey(&buf, '[', 'A', false, false, false);
+    try std.testing.expectEqualStrings("\x1b[A", buf[0..n]);
+}
+
+test "cursorKey app-mode emits ESC O X" {
+    var buf: [16]u8 = undefined;
+    const n = cursorKey(&buf, 'O', 'A', false, false, false);
+    try std.testing.expectEqualStrings("\x1bOA", buf[0..n]);
+}
+
+test "cursorKey shift+ctrl modifier code 6" {
+    var buf: [16]u8 = undefined;
+    const n = cursorKey(&buf, '[', 'D', true, false, true);
+    try std.testing.expectEqualStrings("\x1b[1;6D", buf[0..n]);
+}
+
+test "tildeKey alt modifier code 3" {
+    var buf: [16]u8 = undefined;
+    const n = tildeKey(&buf, 5, false, true, false);
+    try std.testing.expectEqualStrings("\x1b[5;3~", buf[0..n]);
+}
+
+test "ssoKey plain F1 emits ESC O P" {
+    var buf: [16]u8 = undefined;
+    const n = ssoKey(&buf, 'P', false, false, false);
+    try std.testing.expectEqualStrings("\x1bOP", buf[0..n]);
+}

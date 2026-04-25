@@ -18,6 +18,7 @@ comptime {
     _ = @import("parser/sixel.zig");
     _ = @import("parser/iterm_image.zig");
     _ = @import("parser/kitty_image.zig");
+    _ = @import("ui/input.zig");
 }
 
 test {
