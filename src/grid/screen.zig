@@ -1182,12 +1182,22 @@ pub const Screen = struct {
             return;
         }
 
-        // Delete action — drop our own stored copy AND tell the
-        // Pane's GL ImageStore to free its texture.
+        // Delete action. Per kitty spec, the case of `d=` matters:
+        // lowercase deletes only placements (visible images on screen)
+        // and KEEPS the source image data so subsequent `a=p` calls
+        // can re-place the same image_id without re-transmitting.
+        // Uppercase ALSO drops source data. Apps like emberglyph
+        // (and kitty's own `kitten icat --hold`) clear placements
+        // every frame via `d=a` and rely on the source data sticking
+        // around — so dropping it here was the cause of the
+        // "images don't render in real apps" report.
         if (cmd.action == .delete) {
             switch (cmd.delete_what) {
-                'a', 'A' => self.kitty_images.dropAll(),
-                'i', 'I' => if (cmd.image_id != 0) self.kitty_images.drop(cmd.image_id),
+                // Uppercase: free source image data too.
+                'A' => self.kitty_images.dropAll(),
+                'I' => if (cmd.image_id != 0) self.kitty_images.drop(cmd.image_id),
+                'P' => if (cmd.image_id != 0) self.kitty_images.drop(cmd.image_id),
+                // Lowercase: leave source data alone — placements only.
                 else => {},
             }
             if (self.sink.on_image_delete_full) |f| f(self.sink.ctx, .{

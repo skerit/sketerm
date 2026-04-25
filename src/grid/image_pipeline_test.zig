@@ -292,6 +292,67 @@ test "kitty a=T,c=W,r=H propagates cell scale to sink" {
     try std.testing.expectEqual(@as(u32, 4), h.capture.cells_high);
 }
 
+// EmberGlyph regression: every frame the renderer sends
+// `a=d,d=a` (delete all visible placements) then re-places via
+// `a=p,i=N`. Per kitty spec, lowercase `d=a` deletes only the
+// placements, NOT the source image data. Earlier code dropped the
+// source image too, causing the second `a=p` to silently fail —
+// "images don't render in real apps".
+test "kitty d=a (lowercase) keeps source data — re-place succeeds" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+
+    // Transmit only.
+    const rgba = [_]u8{ 0x12, 0x34, 0x56, 0xFF };
+    var b64_buf: [16]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &rgba);
+    var s1: [128]u8 = undefined;
+    const tx = try std.fmt.bufPrint(&s1, "\x1b_Gi=42,a=t,f=32,s=1,v=1;{s}\x1b\\", .{b64});
+    h.feed(tx);
+    try std.testing.expect(h.screen.kitty_images.get(42) != null);
+
+    // First place — should fire sink.
+    const place = "\x1b_Gi=42,a=p\x1b\\";
+    h.feed(place);
+    try std.testing.expect(h.capture.fired);
+    try std.testing.expectEqual(@as(u32, 42), h.capture.image_id);
+
+    // Reset capture flag.
+    h.capture.fired = false;
+
+    // Lowercase `d=a` — delete all visible placements. Source data
+    // for image 42 must remain so the re-place works.
+    h.feed("\x1b_Ga=d,d=a,q=2;\x1b\\");
+    try std.testing.expect(h.screen.kitty_images.get(42) != null);
+
+    // Re-place — should fire again.
+    h.feed(place);
+    try std.testing.expect(h.capture.fired);
+    try std.testing.expectEqual(@as(u32, 42), h.capture.image_id);
+}
+
+test "kitty d=A (uppercase) drops source data — re-place becomes a no-op" {
+    var h = try Harness.init(std.testing.allocator, 80, 24);
+    defer h.deinit();
+
+    const rgba = [_]u8{ 0x12, 0x34, 0x56, 0xFF };
+    var b64_buf: [16]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &rgba);
+    var s1: [128]u8 = undefined;
+    const tx = try std.fmt.bufPrint(&s1, "\x1b_Gi=42,a=t,f=32,s=1,v=1;{s}\x1b\\", .{b64});
+    h.feed(tx);
+    h.feed("\x1b_Gi=42,a=p\x1b\\");
+    h.capture.fired = false;
+
+    // Uppercase A — also frees source data.
+    h.feed("\x1b_Ga=d,d=A,q=2;\x1b\\");
+    try std.testing.expect(h.screen.kitty_images.get(42) == null);
+
+    // Re-place — Manager has nothing to place; sink does NOT fire.
+    h.feed("\x1b_Gi=42,a=p\x1b\\");
+    try std.testing.expect(!h.capture.fired);
+}
+
 // iTerm2 OSC 1337 inline image — small PNG.
 test "iterm2 OSC 1337 PNG fires sink" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
