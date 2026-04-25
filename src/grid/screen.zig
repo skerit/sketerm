@@ -638,19 +638,29 @@ pub const Screen = struct {
         var out: std.ArrayList(u8) = .{};
         defer out.deinit(allocator);
 
+        const is_rect = sel.mode == .rectangular;
+        const rect_lo: i32 = @min(r.top_col, r.bot_col);
+        const rect_hi: i32 = @max(r.top_col, r.bot_col);
+
         var row = r.top_row;
         while (row <= r.bot_row) : (row += 1) {
             const line_cells = self.lineCellsAt(row) orelse continue;
-            const start_col: i32 = if (row == r.top_row) r.top_col else 0;
-            const end_col: i32 = if (row == r.bot_row) r.bot_col else @intCast(line_cells.len);
+            const start_col: i32 = if (is_rect) rect_lo
+                else if (row == r.top_row) r.top_col else 0;
+            const end_col: i32 = if (is_rect) rect_hi
+                else if (row == r.bot_row) r.bot_col else @intCast(line_cells.len);
             const lo: usize = @intCast(@max(@as(i32, 0), start_col));
             const hi: usize = @intCast(@max(@as(i32, 0), end_col));
             const hi_clamped = @min(hi, line_cells.len);
             if (lo >= hi_clamped) continue;
 
-            // Trim trailing blank cells on this line span.
+            // Trim trailing blank cells on this line span — but not
+            // in rectangular mode where each row must keep its full
+            // width so columns stay aligned in the output.
             var actual_hi = hi_clamped;
-            while (actual_hi > lo and line_cells[actual_hi - 1].rune == 0) actual_hi -= 1;
+            if (!is_rect) {
+                while (actual_hi > lo and line_cells[actual_hi - 1].rune == 0) actual_hi -= 1;
+            }
 
             var col: usize = lo;
             while (col < actual_hi) : (col += 1) {
@@ -681,10 +691,15 @@ pub const Screen = struct {
                 }
             }
             if (row != r.bot_row) {
-                // Suppress the newline if the next row is a soft-wrap
-                // continuation — we want one logical line.
-                const next_continues = if (self.lineAt(row + 1)) |l| l.continues_above else false;
-                if (!next_continues) try out.append(allocator, '\n');
+                if (is_rect) {
+                    // Rectangular: each row is independent.
+                    try out.append(allocator, '\n');
+                } else {
+                    // Suppress the newline if the next row is a
+                    // soft-wrap continuation — we want one logical line.
+                    const next_continues = if (self.lineAt(row + 1)) |l| l.continues_above else false;
+                    if (!next_continues) try out.append(allocator, '\n');
+                }
             }
         }
         return try out.toOwnedSlice(allocator);
@@ -3049,4 +3064,27 @@ test "selectLineAt covers row" {
     try std.testing.expectEqual(@as(i32, 0), r.top_col);
     try std.testing.expectEqual(@as(i32, 1), r.bot_row);
     try std.testing.expectEqual(@as(i32, 20), r.bot_col);
+}
+
+test "rectangular selection extracts column block" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 20, 3);
+    defer s.deinit();
+    for ("foo bar") |b| s.printCp(b);
+    s.printCp('\n');
+    s.col = 0;
+    s.row = 1;
+    for ("baz qux") |b| s.printCp(b);
+    s.printCp('\n');
+    s.col = 0;
+    s.row = 2;
+    for ("hi  yo") |b| s.printCp(b);
+
+    // Cols 4..7 across rows 0..2 should yield "bar\nqux\nyo "
+    s.selection.start(0, 4, .rectangular);
+    s.selection.extend(2, 7);
+    const text = try s.extractSelection(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("bar\nqux\nyo ", text);
 }

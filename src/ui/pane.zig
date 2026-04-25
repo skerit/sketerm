@@ -630,7 +630,7 @@ fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
     }
 }
 
-fn onDragBegin(_: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
     // Always grab focus on click.
     _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
@@ -639,7 +639,14 @@ fn onDragBegin(_: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
     // report instead.
     if (self.terminal.screen.mouse_mode != 0) return;
     const cell = self.cellAt(x, y);
-    self.terminal.screen.selection.start(cell.row, cell.col, .normal);
+    // Alt-drag → rectangular selection (block / column select).
+    var mode: @import("../grid/selection.zig").Mode = .normal;
+    const ev = c.gtk_event_controller_get_current_event(@ptrCast(g));
+    if (ev != null) {
+        const mods = c.gdk_event_get_modifier_state(ev);
+        if (mods & c.GDK_ALT_MASK != 0) mode = .rectangular;
+    }
+    self.terminal.screen.selection.start(cell.row, cell.col, mode);
     c.gtk_widget_queue_draw(@ptrCast(self.area));
 }
 

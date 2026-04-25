@@ -225,12 +225,17 @@ pub const GridPass = struct {
         if (screen.selection.isActive()) {
             const r_opt = screen.selection.rect();
             if (r_opt) |r| {
+                const is_rect = screen.selection.mode == .rectangular;
+                const lo_col: i32 = if (is_rect) @min(r.top_col, r.bot_col) else 0;
+                const hi_col: i32 = if (is_rect) @max(r.top_col, r.bot_col) else 0;
                 var sr = r.top_row;
                 while (sr <= r.bot_row) : (sr += 1) {
                     const visible_row: i32 = sr + @as(i32, @intCast(view_off));
                     if (visible_row < 0 or visible_row >= @as(i32, @intCast(screen.rows))) continue;
-                    const start_col: i32 = if (sr == r.top_row) r.top_col else 0;
-                    const end_col: i32 = if (sr == r.bot_row) r.bot_col else screen.cols;
+                    const start_col: i32 = if (is_rect) lo_col
+                        else if (sr == r.top_row) r.top_col else 0;
+                    const end_col: i32 = if (is_rect) hi_col
+                        else if (sr == r.bot_row) r.bot_col else screen.cols;
                     if (end_col <= start_col) continue;
                     const x: f32 = pad + @as(f32, @floatFromInt(@max(0, start_col))) * cw;
                     const y: f32 = pad + @as(f32, @floatFromInt(visible_row)) * ch;
