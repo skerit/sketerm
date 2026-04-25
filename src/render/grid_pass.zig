@@ -406,17 +406,40 @@ pub const GridPass = struct {
         // Focus border — thin accent rectangles at the pane edges.
         // Drawn at the canvas edge (not the cell-grid edge) so the
         // padding shows as breathing room between border and content.
+        const w_full: f32 = if (self.canvas_w > 0) self.canvas_w
+            else @as(f32, @floatFromInt(screen.cols)) * cw + 2 * pad;
+        const h_full: f32 = if (self.canvas_h > 0) self.canvas_h
+            else @as(f32, @floatFromInt(screen.rows)) * ch + 2 * pad;
         if (focused) {
-            const w: f32 = if (self.canvas_w > 0) self.canvas_w
-                else @as(f32, @floatFromInt(screen.cols)) * cw + 2 * pad;
-            const h: f32 = if (self.canvas_h > 0) self.canvas_h
-                else @as(f32, @floatFromInt(screen.rows)) * ch + 2 * pad;
             const border: f32 = 2.0;
             const accent = .{ 0.40, 0.55, 0.85, 0.75 };
-            try self.pushQuad(.{ 0, 0 }, .{ w, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
-            try self.pushQuad(.{ 0, h - border }, .{ w, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
-            try self.pushQuad(.{ 0, 0 }, .{ border, h }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
-            try self.pushQuad(.{ w - border, 0 }, .{ border, h }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+            try self.pushQuad(.{ 0, 0 }, .{ w_full, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+            try self.pushQuad(.{ 0, h_full - border }, .{ w_full, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+            try self.pushQuad(.{ 0, 0 }, .{ border, h_full }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+            try self.pushQuad(.{ w_full - border, 0 }, .{ border, h_full }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+        }
+
+        // Scrollback position indicator — thin vertical track on the
+        // right edge with a thumb showing the visible window inside
+        // the (scrollback + visible) extent. Hidden when at bottom.
+        if (sb_count > 0) {
+            const total_lines: u32 = sb_count + screen.rows;
+            const view_top: u32 = sb_count - view_off;
+            const visible: u32 = screen.rows;
+            const track_w: f32 = 4.0;
+            const track_x: f32 = w_full - track_w;
+            const track_h: f32 = h_full;
+            const track_color = .{ 0.5, 0.5, 0.5, 0.18 };
+            try self.pushQuad(.{ track_x, 0 }, .{ track_w, track_h }, .{ 0, 0 }, .{ 0, 0 }, track_color, 0.0);
+            const thumb_top_f: f32 = @as(f32, @floatFromInt(view_top)) / @as(f32, @floatFromInt(total_lines));
+            const thumb_h_f: f32 = @as(f32, @floatFromInt(visible)) / @as(f32, @floatFromInt(total_lines));
+            const thumb_y: f32 = thumb_top_f * track_h;
+            const thumb_h: f32 = @max(8.0, thumb_h_f * track_h);
+            const thumb_color = if (view_off == 0)
+                .{ 0.5, 0.5, 0.5, 0.30 }
+            else
+                .{ 0.40, 0.55, 0.85, 0.70 };
+            try self.pushQuad(.{ track_x, thumb_y }, .{ track_w, thumb_h }, .{ 0, 0 }, .{ 0, 0 }, thumb_color, 0.0);
         }
     }
 
