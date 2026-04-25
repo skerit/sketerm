@@ -21,7 +21,15 @@ const clipboard = @import("clipboard.zig");
 pub const InputCtx = input.Ctx;
 pub const MenuAction = menu.Action;
 
-const FONT_PATH: [*:0]const u8 = "/usr/share/fonts/TTF/Hack-Regular.ttf";
+const FONT_CANDIDATES = [_][*:0]const u8{
+    "/usr/share/fonts/TTF/Hack-Regular.ttf",
+    "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
+    "/usr/share/fonts/TTF/VeraMono.ttf",
+    "/usr/share/fonts/gnu-free/FreeMono.otf",
+    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+};
 const FONT_SIZE: u16 = 14;
 
 pub const Pane = struct {
@@ -201,10 +209,18 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         return;
     }
 
-    self.atlas = Atlas.init(self.allocator, FONT_PATH, FONT_SIZE) catch {
-        std.debug.print("pane realize: atlas init failed\n", .{});
+    // Try each candidate font in order until one works.
+    self.atlas = null;
+    for (FONT_CANDIDATES) |path| {
+        if (Atlas.init(self.allocator, path, FONT_SIZE)) |a| {
+            self.atlas = a;
+            break;
+        } else |_| continue;
+    }
+    if (self.atlas == null) {
+        std.debug.print("pane realize: no usable font in {d} candidates\n", .{FONT_CANDIDATES.len});
         return;
-    };
+    }
     self.atlas.?.realize();
 
     self.grid_pass.realize() catch {
