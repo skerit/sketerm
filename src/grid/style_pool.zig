@@ -61,6 +61,11 @@ pub const Entry = struct {
 
 pub const Pool = struct {
     entries: std.ArrayList(Entry) = .{},
+    /// Last-returned index — most call sites re-intern the same entry
+    /// many times in a row (a typical TUI emits `\x1b[31m` once and
+    /// then prints many cells). One compare wins those without
+    /// touching the rest of the array.
+    last_idx: u16 = 0,
     allocator: std.mem.Allocator,
 
     pub const default_index: u16 = 0;
@@ -77,13 +82,22 @@ pub const Pool = struct {
 
     /// Returns the index for an existing entry, or appends a new one.
     pub fn intern(self: *Pool, e: Entry) !u16 {
+        if (self.last_idx < self.entries.items.len and
+            Entry.equal(self.entries.items[self.last_idx], e))
+        {
+            return self.last_idx;
+        }
         for (self.entries.items, 0..) |existing, i| {
-            if (Entry.equal(existing, e)) return @intCast(i);
+            if (Entry.equal(existing, e)) {
+                self.last_idx = @intCast(i);
+                return @intCast(i);
+            }
         }
         if (self.entries.items.len >= 0xFFFF) return error.PoolFull;
-        const idx = self.entries.items.len;
+        const idx: u16 = @intCast(self.entries.items.len);
         try self.entries.append(self.allocator, e);
-        return @intCast(idx);
+        self.last_idx = idx;
+        return idx;
     }
 
     pub fn get(self: *const Pool, idx: u16) Entry {
