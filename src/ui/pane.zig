@@ -65,6 +65,10 @@ pub const Pane = struct {
     /// xterm button code (0=L,1=M,2=R) currently held, or -1 = none.
     /// Used by DECSET 1002 button-event tracking.
     held_button: i32 = -1,
+    /// URI captured at right-click time. menu_pre_popup writes here
+    /// when the click landed on an OSC 8 hyperlink cell; the
+    /// "copy-link" action reads it on activate.
+    menu_link_uri: ?[]u8 = null,
     /// Live font size in points. Initialised from Config.font_size,
     /// adjustable via Ctrl++ / Ctrl+- which rebuilds the atlas.
     font_size: u16 = 14,
@@ -164,7 +168,7 @@ pub const Pane = struct {
 
         // Right-click → context menu. Allocations go into menu_arena
         // so they're freed when the pane is destroyed.
-        try menu.attach(area_widget, self.menu_arena.allocator(), paneMenuSink, @ptrCast(self));
+        try menu.attachWithPrePopup(area_widget, self.menu_arena.allocator(), paneMenuSink, @ptrCast(self), paneMenuPrePopup, @ptrCast(self));
 
         // Mouse reporting (DECSET 1006). Click controller covers
         // press / release for any button; emits the SGR sequence
@@ -221,6 +225,17 @@ pub const Pane = struct {
                 self.terminal.screen.fullReset();
                 return true;
             },
+            .copy_link => {
+                const uri = self.menu_link_uri orelse return true;
+                if (uri.len == 0) return true;
+                const cstr = self.allocator.allocSentinel(u8, uri.len, 0) catch return true;
+                defer self.allocator.free(cstr);
+                @memcpy(cstr, uri);
+                const display = c.gtk_widget_get_display(@ptrCast(self.area));
+                const clip = c.gdk_display_get_clipboard(display);
+                c.gdk_clipboard_set_text(clip, cstr.ptr);
+                return true;
+            },
             else => return false,
         }
     }
@@ -251,6 +266,7 @@ pub const Pane = struct {
         self.image_store.deinit();
         if (self.atlas) |a| a.deinit();
         if (self.input_ctx) |ictx| self.allocator.destroy(ictx);
+        if (self.menu_link_uri) |uri| self.allocator.free(uri);
         self.menu_arena.deinit();
         self.allocator.destroy(self);
     }
@@ -570,6 +586,40 @@ fn paneMenuSink(ctx: ?*anyopaque, action: menu.Action) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
     if (self.handleMenuLocal(action)) return;
     if (self.menu_sink) |f| f(self.menu_sink_ctx, action);
+}
+
+/// Called just before the right-click context menu pops up. We
+/// inspect the cell under the click for an OSC 8 link, and toggle
+/// the `term.copy-link` action's enabled state accordingly.
+fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f64) void {
+    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const screen = self.terminal.screen;
+
+    // Free any URI captured from a previous popup.
+    if (self.menu_link_uri) |old| {
+        self.allocator.free(old);
+        self.menu_link_uri = null;
+    }
+
+    var has_link = false;
+    const cell = self.cellAt(x, y);
+    if (cell.row >= 0 and cell.col >= 0 and
+        cell.row < screen.rows and cell.col < screen.cols)
+    {
+        const c_cell = screen.cellAt(@intCast(cell.row), @intCast(cell.col));
+        if (c_cell.flags & 0b0000_0100 != 0) {
+            if (screen.linkUri(c_cell.reserved)) |uri| {
+                if (self.allocator.dupe(u8, uri)) |copy| {
+                    self.menu_link_uri = copy;
+                    has_link = true;
+                } else |_| {}
+            }
+        }
+    }
+
+    if (c.g_action_map_lookup_action(@ptrCast(group), "copy-link")) |act| {
+        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), if (has_link) 1 else 0);
+    }
 }
 
 fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {

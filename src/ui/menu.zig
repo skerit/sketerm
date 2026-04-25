@@ -16,6 +16,7 @@ pub const Action = enum {
     split_v,
     close_pane,
     reset_terminal,
+    copy_link,
 };
 
 pub const Sink = *const fn (ctx: ?*anyopaque, action: Action) void;
@@ -26,8 +27,16 @@ const ActionSlot = struct {
     action: Action,
 };
 
+/// Optional pre-popup callback. Pane uses this to update the
+/// "term.copy-link" action's enabled state (and stash the URI for
+/// the activate handler) based on what's under the click.
+pub const PrePopupFn = *const fn (ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f64) void;
+
 const ClickCtx = struct {
     popover: *c.GtkWidget,
+    group: *c.GSimpleActionGroup,
+    pre_popup_fn: ?PrePopupFn = null,
+    pre_popup_ctx: ?*anyopaque = null,
 };
 
 const Bind = struct {
@@ -40,6 +49,7 @@ const Bind = struct {
 const BINDS = [_]Bind{
     .{ .name = "copy", .label = "Copy", .detailed = "term.copy", .action = .copy },
     .{ .name = "paste", .label = "Paste", .detailed = "term.paste", .action = .paste },
+    .{ .name = "copy-link", .label = "Copy Link", .detailed = "term.copy-link", .action = .copy_link },
     .{ .name = "split-h", .label = "Split Horizontal", .detailed = "term.split-h", .action = .split_h },
     .{ .name = "split-v", .label = "Split Vertical", .detailed = "term.split-v", .action = .split_v },
     .{ .name = "close-pane", .label = "Close Pane", .detailed = "term.close-pane", .action = .close_pane },
@@ -55,11 +65,23 @@ pub fn attach(
     sink: Sink,
     sink_ctx: ?*anyopaque,
 ) !void {
+    return attachWithPrePopup(widget, allocator, sink, sink_ctx, null, null);
+}
+
+pub fn attachWithPrePopup(
+    widget: *c.GtkWidget,
+    allocator: std.mem.Allocator,
+    sink: Sink,
+    sink_ctx: ?*anyopaque,
+    pre_popup_fn: ?PrePopupFn,
+    pre_popup_ctx: ?*anyopaque,
+) !void {
     // Menu model.
     const menu = c.g_menu_new();
     const sec1 = c.g_menu_new();
     c.g_menu_append(sec1, "Copy", "term.copy");
     c.g_menu_append(sec1, "Paste", "term.paste");
+    c.g_menu_append(sec1, "Copy Link", "term.copy-link");
     c.g_menu_append_section(menu, null, @ptrCast(@alignCast(sec1)));
     c.g_object_unref(sec1);
 
@@ -108,11 +130,22 @@ pub fn attach(
     c.gtk_popover_set_has_arrow(@ptrCast(popover), 0);
     c.g_object_unref(menu);
 
-    // Right-click gesture → popup at cursor.
+    // Right-click gesture → popup at cursor. Default the copy-link
+    // action to disabled so it stays grey when no link is under the
+    // cursor; pre_popup_fn flips it true when there is one.
+    if (c.g_action_map_lookup_action(@ptrCast(group), "copy-link")) |act| {
+        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), 0);
+    }
+
     const click = c.gtk_gesture_click_new();
     c.gtk_gesture_single_set_button(@ptrCast(click), 3);
     const cctx = try allocator.create(ClickCtx);
-    cctx.* = .{ .popover = popover };
+    cctx.* = .{
+        .popover = popover,
+        .group = @ptrCast(group),
+        .pre_popup_fn = pre_popup_fn,
+        .pre_popup_ctx = pre_popup_ctx,
+    };
     _ = c.g_signal_connect_data(
         click,
         "pressed",
@@ -131,6 +164,7 @@ fn onActivate(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(
 
 fn onRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const ctx: *ClickCtx = @ptrCast(@alignCast(user.?));
+    if (ctx.pre_popup_fn) |f| f(ctx.pre_popup_ctx, ctx.group, x, y);
     var rect = c.GdkRectangle{
         .x = @intFromFloat(x),
         .y = @intFromFloat(y),
