@@ -9,3 +9,4 @@ core.*
 *.swp
 *.bak
 .DS_Store
+.claude/
