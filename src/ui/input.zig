@@ -390,3 +390,11 @@ test "ssoKey plain F1 emits ESC O P" {
     const n = ssoKey(&buf, 'P', false, false, false);
     try std.testing.expectEqualStrings("\x1bOP", buf[0..n]);
 }
+
+test "modCode encoding" {
+    try std.testing.expectEqual(@as(u8, 1), modCode(false, false, false));
+    try std.testing.expectEqual(@as(u8, 2), modCode(true, false, false));
+    try std.testing.expectEqual(@as(u8, 3), modCode(false, true, false));
+    try std.testing.expectEqual(@as(u8, 5), modCode(false, false, true));
+    try std.testing.expectEqual(@as(u8, 8), modCode(true, true, true));
+}
