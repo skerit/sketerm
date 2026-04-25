@@ -1934,6 +1934,21 @@ pub const Screen = struct {
             // parser quiet for terminfo entries that send it.
             return;
         }
+        // Public DECRQM — `CSI Pa $ p`. Reports state of an ANSI mode
+        // (IRM=4, LNM=20). xterm spec: reply `CSI Pa ; Ps $ y`.
+        if (params.n_intermediates == 1 and params.intermediates[0] == '$' and params.final == 'p') {
+            const mode = params.paramOrDefault(0, 0);
+            const known: ?bool = switch (mode) {
+                4 => self.insert_mode,
+                20 => self.line_feed_mode,
+                else => null,
+            };
+            const ps: u8 = if (known) |on| (if (on) 1 else 2) else 0;
+            var out: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&out, "\x1b[{d};{d}$y", .{ mode, ps }) catch return;
+            self.respond(s);
+            return;
+        }
 
         switch (params.final) {
             // Cursor movement.
