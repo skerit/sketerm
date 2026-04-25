@@ -225,7 +225,7 @@ pub const GridPass = struct {
             const cx: f32 = @as(f32, @floatFromInt(screen.col)) * cw;
             const cy: f32 = @as(f32, @floatFromInt(screen.row)) * ch;
             const fg = self.default_fg;
-            const block_alpha: f32 = 0.55;
+            const block_alpha: f32 = 0.85;
 
             const Shape = @import("../grid/screen.zig").Screen.CursorShape;
             switch (screen.cursor_shape) {
@@ -246,7 +246,7 @@ pub const GridPass = struct {
                         .{ cw, h },
                         .{ 0, 0 },
                         .{ 0, 0 },
-                        .{ fg[0], fg[1], fg[2], 0.85 },
+                        .{ fg[0], fg[1], fg[2], 0.95 },
                         0.0,
                     );
                 },
@@ -257,7 +257,7 @@ pub const GridPass = struct {
                         .{ w, ch },
                         .{ 0, 0 },
                         .{ 0, 0 },
-                        .{ fg[0], fg[1], fg[2], 0.85 },
+                        .{ fg[0], fg[1], fg[2], 0.95 },
                         0.0,
                     );
                 },
@@ -270,7 +270,7 @@ pub const GridPass = struct {
             const grid_w: f32 = @as(f32, @floatFromInt(screen.cols)) * cw;
             const grid_h: f32 = @as(f32, @floatFromInt(screen.rows)) * ch;
             const border: f32 = 2.0;
-            const accent = .{ 0.40, 0.55, 0.85, 0.55 };
+            const accent = .{ 0.40, 0.55, 0.85, 0.75 };
             try self.pushQuad(.{ 0, 0 }, .{ grid_w, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
             try self.pushQuad(.{ 0, grid_h - border }, .{ grid_w, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
             try self.pushQuad(.{ 0, 0 }, .{ border, grid_h }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
