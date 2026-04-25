@@ -13,9 +13,12 @@ pub const Image = struct {
     /// Top-left cell of the placement.
     cell_row: u16,
     cell_col: u16,
-    /// 0 until uploaded.
+    /// 0 until uploaded; cleared on forgetGL after context loss.
     gl_tex: c_uint = 0,
-    /// Owned pixel buffer pending GL upload.
+    /// Owned source RGBA. Retained AFTER upload too so that GL
+    /// context loss (split / pane shuffle) can re-upload from this
+    /// buffer rather than losing the image. Freed on .deleting flush
+    /// or store deinit.
     pending: ?[]u8 = null,
     /// Kitty graphics image_id (0 = no id, sixel/iterm2).
     image_id: u32 = 0,
@@ -194,24 +197,12 @@ pub const Store = struct {
     }
 
     /// Drop the cached GL texture IDs — call after context loss
-    /// before the next realize. The textures are gone with the
-    /// dead context; without `pending` data we can't rebuild them,
-    /// so any previously-uploaded image is effectively lost. This
-    /// is a v1 limitation (a re-upload mechanism would need to
-    /// keep the source pixels around indefinitely).
+    /// before the next realize. We KEEP all images (their source
+    /// pixels live on in img.pending), so the next flushUploads
+    /// re-uploads them into the new context. Memory cost: each
+    /// image holds its RGBA indefinitely until a delete dispatch.
     pub fn forgetGL(self: *Store) void {
-        // Drop everything that has no pending data to re-upload.
-        // Items with pending data still have their pixels and can
-        // be re-uploaded on the next flush.
-        var i: usize = 0;
-        while (i < self.images.items.len) {
-            if (self.images.items[i].pending == null) {
-                _ = self.images.orderedRemove(i);
-                continue;
-            }
-            self.images.items[i].gl_tex = 0;
-            i += 1;
-        }
+        for (self.images.items) |*img| img.gl_tex = 0;
     }
 
     /// Free all images and their pending buffers, ignoring GL
@@ -239,7 +230,9 @@ pub const Store = struct {
     }
 
     /// Upload pending images to GL, free deleted ones. Caller must
-    /// have a current GL context.
+    /// have a current GL context. Source pixels (img.pending) are
+    /// retained AFTER upload so re-realize after context loss can
+    /// re-upload without losing the image.
     pub fn flushUploads(self: *Store) void {
         // Free GL textures for items marked deleting.
         var i: usize = 0;
@@ -253,10 +246,12 @@ pub const Store = struct {
             }
             i += 1;
         }
-        // Upload pending pixel buffers.
+        // Upload images that have source pixels but no GL texture
+        // (newly added or post-context-loss). Keep `pending` after.
         for (self.images.items) |*img| {
+            if (img.gl_tex != 0) continue;
             const pending = img.pending orelse continue;
-            if (img.gl_tex == 0) c.glGenTextures(1, &img.gl_tex);
+            c.glGenTextures(1, &img.gl_tex);
             c.glBindTexture(c.GL_TEXTURE_2D, img.gl_tex);
             c.glPixelStorei(c.GL_UNPACK_ALIGNMENT, 4);
             c.glTexImage2D(
@@ -281,8 +276,6 @@ pub const Store = struct {
                     .{ img.image_id, img.placement_id, img.width, img.height, img.cell_row, img.cell_col, img.gl_tex, err },
                 );
             }
-            self.allocator.free(pending);
-            img.pending = null;
         }
     }
 };
@@ -364,21 +357,19 @@ test "markByPlacementForDelete: placement_id=0 matches all placements of image" 
     try std.testing.expectEqual(@as(u32, 2), s.images.items[0].image_id);
 }
 
-test "forgetGL drops uploaded images, keeps pending" {
+test "forgetGL keeps all images, drops their GL handles" {
     var s = Store.init(std.testing.allocator);
     defer s.images.deinit(std.testing.allocator);
     defer s.freeAllNoGL();
     const rgba = [_]u8{0} ** 16;
     try s.addWithId(&rgba, 2, 2, 0, 0, 1);
     try s.addWithId(&rgba, 2, 2, 0, 0, 2);
-    // Simulate the first image as already uploaded (pending=null,
-    // gl_tex set to a fake non-zero value).
-    s.allocator.free(s.images.items[0].pending.?);
-    s.images.items[0].pending = null;
-    s.images.items[0].gl_tex = 42;
-    // Image #1 keeps its pending data → re-uploadable.
+    s.images.items[0].gl_tex = 42; // simulate uploaded
+    s.images.items[1].gl_tex = 7;
     s.forgetGL();
-    try std.testing.expectEqual(@as(usize, 1), s.count());
-    try std.testing.expectEqual(@as(u32, 2), s.images.items[0].image_id);
+    try std.testing.expectEqual(@as(usize, 2), s.count());
     try std.testing.expectEqual(@as(c_uint, 0), s.images.items[0].gl_tex);
+    try std.testing.expectEqual(@as(c_uint, 0), s.images.items[1].gl_tex);
+    try std.testing.expect(s.images.items[0].pending != null);
+    try std.testing.expect(s.images.items[1].pending != null);
 }
