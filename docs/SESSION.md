@@ -546,3 +546,20 @@ After M11–M17 the autonomous run kept iterating on smaller polish:
   in plan-v2.md with effort estimate and rationale for deferral.
 
 Cron `7,37 * * * *` set to keep iterating if more work surfaces.
+
+## Cron tick 17:07 — additional polish
+
+- **atlas page size** 1024→2048. 4× glyph capacity for emoji-heavy
+  long sessions. Full multi-page LRU (M17.1) deferred until profile
+  data justifies it.
+- **`--debug-images`** now also routes into the kitty Manager so PNG
+  decode failures from stb_image print to stderr. Useful when an
+  app's images come through but get silently dropped due to corrupt
+  encoding.
+- **Copy Link works on scrollback** — paneMenuPrePopup now resolves
+  the cell via a public Screen.lineCellsAtPub that handles negative
+  rows. Right-click on a hyperlink that has scrolled out of view
+  exposes Copy Link.
+- **fullReset** also wipes reverse_screen + kitty_kbd_flags + bounces
+  VT52 → ANSI (via Sink.on_decanm) so Reset Terminal recovers from
+  any of the modes added in M11/M15.
