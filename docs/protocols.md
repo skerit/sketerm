@@ -182,8 +182,8 @@ Default behavior per app:
 |---------------------------------------|----|
 | xterm baseline (modifyOtherKeys=0)    | ✓ |
 | Cursor + tilde + SS3 keys with Shift/Alt/Ctrl modifier codes | ✓ |
-| modifyOtherKeys=1                     | deferred |
-| modifyOtherKeys=2                     | deferred |
+| modifyOtherKeys=1 (ambiguous combos)  | ✓ |
+| modifyOtherKeys=2 (all printable)     | ✓ |
 | DECCKM — application-cursor-keys mode | ✓ |
 | DECPAM / DECPNM — keypad mode         | stub |
 | Kitty progressive enhancement         | deferred |
