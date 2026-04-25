@@ -2597,11 +2597,24 @@ pub const Screen = struct {
         if (move < region) {
             // Stash both the cells AND the ids of the rows we're
             // about to scroll out — they belong to the content, not
-            // the array slot.
-            var stash = self.allocator.alloc([]Cell, move) catch return;
-            defer self.allocator.free(stash);
-            var stash_ids = self.allocator.alloc(u64, move) catch return;
-            defer self.allocator.free(stash_ids);
+            // the array slot. Common case is move=1; use stack
+            // scratch up to 8 to avoid the steady-state allocator hit.
+            var stash_stack: [8][]Cell = undefined;
+            var ids_stack: [8]u64 = undefined;
+            var stash_heap: ?[][]Cell = null;
+            var ids_heap: ?[]u64 = null;
+            defer if (stash_heap) |h| self.allocator.free(h);
+            defer if (ids_heap) |h| self.allocator.free(h);
+            const stash: [][]Cell = if (move <= stash_stack.len) stash_stack[0..move] else blk: {
+                const h = self.allocator.alloc([]Cell, move) catch return;
+                stash_heap = h;
+                break :blk h;
+            };
+            const stash_ids: []u64 = if (move <= ids_stack.len) ids_stack[0..move] else blk: {
+                const h = self.allocator.alloc(u64, move) catch return;
+                ids_heap = h;
+                break :blk h;
+            };
             var i: u16 = 0;
             while (i < move) : (i += 1) {
                 stash[i] = lines[self.scroll_top + i].cells;
