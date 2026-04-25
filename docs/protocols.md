@@ -100,7 +100,6 @@ htop and btop need the report subset for accurate rendering.
 `CSI t ; b r` — set top and bottom scrolling margins. ✓
 
 ### Deferred in v1
-- DECDHL / DECDWL (double-height / double-width lines)
 - SS2 / SS3 single-shifts (LS0 / LS1 done as SI / SO)
 
 ### Done in v1 (originally listed deferred)
@@ -108,6 +107,10 @@ htop and btop need the report subset for accurate rendering.
 - ED 3 (erase scrollback).
 - Selective erase (DECSED / DECSEL routed to plain ED/EL — we
   don't model the protection bit).
+- DECDHL / DECDWL (double-height / double-width lines, M12).
+- DECSCNM (reverse-video mode).
+- DECCOLM (80/132 column, gated behind DECSET 40).
+- VT52 mode (DECRST 2 enters VT52, DECSET 2 returns to ANSI).
 
 ## OSC sequences
 
@@ -121,7 +124,7 @@ htop and btop need the report subset for accurate rendering.
 | 52     | Clipboard set/get                         | ✓ (get gated; 1 MB cap) |
 | 104    | Reset color palette                       | ✓ |
 | 110/111/112 | Reset fg/bg/cursor                   | ✓ |
-| 133    | Shell integration (FinalTerm prompt marks)| ✓ (records A-marks; nav UI deferred) |
+| 133    | Shell integration (FinalTerm prompt marks)| ✓ (records A-marks; Ctrl+Shift+Up/Down navigates) |
 | 9      | iTerm2 desktop notification               | ✓ |
 | 777    | Desktop notifications (notify variant)    | ✓ |
 | 1337   | iTerm2 proprietary — `File=` only         | ✓ |
@@ -186,9 +189,10 @@ Default behavior per app:
 | modifyOtherKeys=2 (all printable)     | ✓ |
 | DECCKM — application-cursor-keys mode | ✓ |
 | DECPAM / DECPNM — keypad mode         | stub |
-| Kitty progressive enhancement         | deferred |
-| CSI u (libtermkey)                    | deferred |
-| Kitty progressive enhancement (CSI =…)| deferred |
+| Kitty progressive enhancement (CSI > N u, disambiguate)        | ✓ |
+| Kitty progressive enhancement (CSI = N;M u, push/pop stack)    | ✓ |
+| Kitty progressive enhancement (flag 0x02, release+repeat)      | ✓ |
+| CSI u (libtermkey)                                             | ✓ |
 
 ## Character encodings
 
@@ -208,14 +212,20 @@ supported.
 
 ### Kitty graphics (APC G…)
 - Commands: `t` / `T` (transmit, transmit+place), `p` (put),
-  `d` (delete), `q` (query support).
+  `d` (delete), `q` (query support), `f` (frame data),
+  `a` (animation control).
 - Formats v1: `f=32` RGBA, `f=24` RGB, `f=100` PNG.
-- Media v1: `t=d` direct inline.
-- Media **deferred v1**: `t=t` temp file, `t=s` shared memory
-  (security review required).
+- Media v1: `t=d` direct inline, `t=t` tempfile (read+unlink),
+  `t=f` file path.
+- Compression: `o=z` zlib via `std.compress.flate`.
 - Chunked transmit via `m=1` / `m=0`.
 - Placement IDs, image IDs, z-index — all per spec.
 - Delete variants — full set supported.
+- **Animation** — `a=f` appends frames with per-frame `z=delay_ms`;
+  `a=a` controls playback (`c=1` stop / `c=2` run, `r=loop_count`,
+  `s=set_current_frame`). Pane.onTick advances active animations
+  via monotonic-time elapsed comparisons; the placement texture
+  is updated in place via `glTexSubImage2D`.
 
 ### iTerm2 OSC 1337
 - Only `File=` key in v1.
