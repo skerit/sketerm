@@ -80,6 +80,14 @@ pub const GridPass = struct {
     /// Runtime 256-color palette. Synced from `screen.palette` at
     /// the start of buildVertices so OSC 4 / 104 take effect.
     palette: [256][3]u8 = palette_256,
+    /// Inner padding (pixels). Cells are offset by this amount so
+    /// content doesn't sit flush against the focus border.
+    pad: f32 = 6.0,
+    /// Render canvas size in physical pixels. Set by onRender so
+    /// buildVertices can position the focus border at the actual
+    /// pane edges.
+    canvas_w: f32 = 0,
+    canvas_h: f32 = 0,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) GridPass {
@@ -155,6 +163,9 @@ pub const GridPass = struct {
         const cw: f32 = @floatFromInt(atlas.cell_w);
         const ch: f32 = @floatFromInt(atlas.cell_h);
         const ascent: f32 = @floatFromInt(atlas.ascent);
+        // Cells are offset by `pad` to leave breathing room between
+        // content and the focus border at the canvas edges.
+        const pad: f32 = self.pad;
 
         const buf = if (screen.use_alt) screen.alt.? else screen.active;
         const sb_count: u32 = if (screen.use_alt) 0 else screen.scrollbackCount();
@@ -176,8 +187,8 @@ pub const GridPass = struct {
                 const fg = self.colorToVec(style.fg, true, style.attrs.reverse);
                 const bg = self.colorToVec(style.bg, false, style.attrs.reverse);
 
-                const x: f32 = @as(f32, @floatFromInt(col)) * cw;
-                const y: f32 = @as(f32, @floatFromInt(row)) * ch;
+                const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw;
+                const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
 
                 // Background quad (only if non-default).
                 if (style.bg != .default or style.attrs.reverse) {
@@ -220,8 +231,8 @@ pub const GridPass = struct {
                     const start_col: i32 = if (sr == r.top_row) r.top_col else 0;
                     const end_col: i32 = if (sr == r.bot_row) r.bot_col else screen.cols;
                     if (end_col <= start_col) continue;
-                    const x: f32 = @as(f32, @floatFromInt(@max(0, start_col))) * cw;
-                    const y: f32 = @as(f32, @floatFromInt(visible_row)) * ch;
+                    const x: f32 = pad + @as(f32, @floatFromInt(@max(0, start_col))) * cw;
+                    const y: f32 = pad + @as(f32, @floatFromInt(visible_row)) * ch;
                     const w: f32 = @as(f32, @floatFromInt(end_col - @max(0, start_col))) * cw;
                     try self.pushQuad(
                         .{ x, y },
@@ -242,11 +253,13 @@ pub const GridPass = struct {
             if (elapsed >= 0 and elapsed < 200_000) {
                 const t: f32 = @floatCast(@as(f64, @floatFromInt(elapsed)) / 200_000.0);
                 const alpha: f32 = 0.4 * (1.0 - t);
-                const grid_w: f32 = @as(f32, @floatFromInt(screen.cols)) * cw;
-                const grid_h: f32 = @as(f32, @floatFromInt(screen.rows)) * ch;
+                const w: f32 = if (self.canvas_w > 0) self.canvas_w
+                    else @as(f32, @floatFromInt(screen.cols)) * cw + 2 * pad;
+                const h: f32 = if (self.canvas_h > 0) self.canvas_h
+                    else @as(f32, @floatFromInt(screen.rows)) * ch + 2 * pad;
                 try self.pushQuad(
                     .{ 0, 0 },
-                    .{ grid_w, grid_h },
+                    .{ w, h },
                     .{ 0, 0 },
                     .{ 0, 0 },
                     .{ 1.0, 1.0, 1.0, alpha },
@@ -270,8 +283,8 @@ pub const GridPass = struct {
                 };
                 const target_col: u32 = @as(u32, screen.col) + col_off;
                 if (target_col >= screen.cols) break;
-                const x: f32 = @as(f32, @floatFromInt(target_col)) * cw;
-                const y: f32 = @as(f32, @floatFromInt(screen.row)) * ch;
+                const x: f32 = pad + @as(f32, @floatFromInt(target_col)) * cw;
+                const y: f32 = pad + @as(f32, @floatFromInt(screen.row)) * ch;
                 const cell_w_count: u16 = if (@import("../grid/screen.zig").Screen.isWide(cp)) 2 else 1;
                 // Draw a solid block bg behind the preedit so it stands out.
                 try self.pushQuad(
@@ -325,8 +338,8 @@ pub const GridPass = struct {
         const blink_visible = !blinking or screen.cursor_blink_on;
         if (view_off == 0 and screen.cursor_visible and blink_visible and
             screen.row < screen.rows and screen.col < screen.cols) {
-            const cx: f32 = @as(f32, @floatFromInt(screen.col)) * cw;
-            const cy: f32 = @as(f32, @floatFromInt(screen.row)) * ch;
+            const cx: f32 = pad + @as(f32, @floatFromInt(screen.col)) * cw;
+            const cy: f32 = pad + @as(f32, @floatFromInt(screen.row)) * ch;
             // OSC 12 cursor color override: use it when alpha > 0,
             // otherwise fall back to default fg.
             const fg = if (screen.cursor_color[3] > 0) screen.cursor_color else self.default_fg;
@@ -371,15 +384,19 @@ pub const GridPass = struct {
         }
 
         // Focus border — thin accent rectangles at the pane edges.
+        // Drawn at the canvas edge (not the cell-grid edge) so the
+        // padding shows as breathing room between border and content.
         if (focused) {
-            const grid_w: f32 = @as(f32, @floatFromInt(screen.cols)) * cw;
-            const grid_h: f32 = @as(f32, @floatFromInt(screen.rows)) * ch;
+            const w: f32 = if (self.canvas_w > 0) self.canvas_w
+                else @as(f32, @floatFromInt(screen.cols)) * cw + 2 * pad;
+            const h: f32 = if (self.canvas_h > 0) self.canvas_h
+                else @as(f32, @floatFromInt(screen.rows)) * ch + 2 * pad;
             const border: f32 = 2.0;
             const accent = .{ 0.40, 0.55, 0.85, 0.75 };
-            try self.pushQuad(.{ 0, 0 }, .{ grid_w, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
-            try self.pushQuad(.{ 0, grid_h - border }, .{ grid_w, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
-            try self.pushQuad(.{ 0, 0 }, .{ border, grid_h }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
-            try self.pushQuad(.{ grid_w - border, 0 }, .{ border, grid_h }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+            try self.pushQuad(.{ 0, 0 }, .{ w, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+            try self.pushQuad(.{ 0, h - border }, .{ w, border }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+            try self.pushQuad(.{ 0, 0 }, .{ border, h }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
+            try self.pushQuad(.{ w - border, 0 }, .{ border, h }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0);
         }
     }
 

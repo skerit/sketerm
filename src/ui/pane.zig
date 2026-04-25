@@ -222,8 +222,11 @@ pub const Pane = struct {
     fn cellAt(self: *Pane, x: f64, y: f64) struct { row: i32, col: i32 } {
         const atlas = self.atlas;
         if (atlas == null or atlas.?.cell_w == 0 or atlas.?.cell_h == 0) return .{ .row = 0, .col = 0 };
-        const col_f = x / @as(f64, @floatFromInt(atlas.?.cell_w));
-        const row_f = y / @as(f64, @floatFromInt(atlas.?.cell_h));
+        // Mouse coords are in widget pixels — subtract pane padding so
+        // the first cell aligns with the rendered grid origin.
+        const pad: f64 = @floatCast(self.grid_pass.pad);
+        const col_f = (x - pad) / @as(f64, @floatFromInt(atlas.?.cell_w));
+        const row_f = (y - pad) / @as(f64, @floatFromInt(atlas.?.cell_h));
         const visible_row: i32 = @intFromFloat(@max(0.0, row_f));
         const view_off: i32 = @intCast(self.terminal.screen.view_offset);
         return .{
@@ -325,6 +328,9 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     c.glViewport(0, 0, phys_w, phys_h);
     c.glClearColor(self.grid_pass.default_bg[0], self.grid_pass.default_bg[1], self.grid_pass.default_bg[2], self.grid_pass.default_bg[3]);
     c.glClear(c.GL_COLOR_BUFFER_BIT);
+
+    self.grid_pass.canvas_w = @floatFromInt(phys_w);
+    self.grid_pass.canvas_h = @floatFromInt(phys_h);
 
     const focused = c.gtk_widget_has_focus(@ptrCast(self.area)) != 0;
     self.grid_pass.buildVertices(self.terminal.screen, &self.terminal.pool, atlas, focused) catch return @intFromBool(false);
@@ -619,8 +625,14 @@ fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) cal
     const self: *Pane = @ptrCast(@alignCast(user.?));
     const atlas = self.atlas orelse return;
     if (atlas.cell_w == 0 or atlas.cell_h == 0) return;
-    const cols: u16 = @intCast(@max(1, @divFloor(width, @as(c_int, atlas.cell_w))));
-    const rows: u16 = @intCast(@max(1, @divFloor(height, @as(c_int, atlas.cell_h))));
+    // Subtract pane padding (top+bottom, left+right) before computing
+    // cell counts — otherwise we'd allocate cells that overflow the
+    // visible content area.
+    const pad: c_int = @intFromFloat(self.grid_pass.pad);
+    const inner_w: c_int = @max(1, width - 2 * pad);
+    const inner_h: c_int = @max(1, height - 2 * pad);
+    const cols: u16 = @intCast(@max(1, @divFloor(inner_w, @as(c_int, atlas.cell_w))));
+    const rows: u16 = @intCast(@max(1, @divFloor(inner_h, @as(c_int, atlas.cell_h))));
     if (cols == self.terminal.screen.cols and rows == self.terminal.screen.rows) return;
 
     self.terminal.screen.resize(cols, rows) catch return;
