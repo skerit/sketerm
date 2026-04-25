@@ -65,6 +65,11 @@ pub const Pane = struct {
     /// xterm button code (0=L,1=M,2=R) currently held, or -1 = none.
     /// Used by DECSET 1002 button-event tracking.
     held_button: i32 = -1,
+    /// Has the tick callback fired at least once? Used purely for
+    /// the "first tick observed" stderr log so split-debug can
+    /// confirm whether GTK is calling tick on the new pane.
+    tick_seen: bool = false,
+    render_seen: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -302,6 +307,12 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
 
 fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Pane = @ptrCast(@alignCast(user.?));
+    if (!self.render_seen) {
+        self.render_seen = true;
+        std.debug.print("sketerm: pane render first-fire (pane={x} atlas={s})\n", .{
+            @intFromPtr(self), if (self.atlas == null) "null" else "ok",
+        });
+    }
     const atlas = self.atlas orelse return @intFromBool(false);
 
     const w = c.gtk_widget_get_width(@ptrCast(area));
@@ -360,6 +371,10 @@ fn onBellEvent(ctx: ?*anyopaque) void {
 
 fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Pane = @ptrCast(@alignCast(user.?));
+    if (!self.tick_seen) {
+        self.tick_seen = true;
+        std.debug.print("sketerm: pane tick first-fire (pane={x})\n", .{@intFromPtr(self)});
+    }
 
     // Cursor blink — toggle every 500ms for blinking shapes.
     const screen = self.terminal.screen;
