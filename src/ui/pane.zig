@@ -320,6 +320,18 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
     }
 
     if (screen.dirty) {
+        // Update IME cursor location so fcitx5 / ibus position
+        // their popups at the right cell.
+        if (self.input_ctx) |ictx| if (ictx.im_ctx) |im| if (self.atlas) |atlas| {
+            var rect = c.GdkRectangle{
+                .x = @as(c_int, @intCast(screen.col)) * @as(c_int, atlas.cell_w),
+                .y = @as(c_int, @intCast(screen.row)) * @as(c_int, atlas.cell_h),
+                .width = atlas.cell_w,
+                .height = atlas.cell_h,
+            };
+            c.gtk_im_context_set_cursor_location(im, &rect);
+        };
+
         screen.dirty = false;
         c.gtk_widget_queue_draw(area);
     }
