@@ -331,6 +331,10 @@ pub const Window = struct {
         c.gtk_paned_set_resize_end_child(@ptrCast(paned), 1);
         c.gtk_paned_set_shrink_start_child(@ptrCast(paned), 0);
         c.gtk_paned_set_shrink_end_child(@ptrCast(paned), 0);
+        // Make the paned itself stretch to fill its container — without
+        // this, a paned in a Box wrapper takes natural size only.
+        c.gtk_widget_set_hexpand(@ptrCast(paned), 1);
+        c.gtk_widget_set_vexpand(@ptrCast(paned), 1);
 
         // Without an explicit position, GtkPaned defaults to start_
         // child's natural size (which is 0 for an empty GLArea) — the
@@ -356,8 +360,13 @@ pub const Window = struct {
             c.G_CONNECT_DEFAULT,
         );
 
-        // Detach focused widget from parent (where to put new tree depends
-        // on parent type).
+        // Hold an extra reference to focused_w during reparent — without
+        // it, gtk_box_remove / gtk_paned_set_*_child(NULL) drops the
+        // parent's only ref and destroys the widget before we can put
+        // it in its new home.
+        _ = c.g_object_ref(@ptrCast(@alignCast(focused_w)));
+        defer c.g_object_unref(@ptrCast(@alignCast(focused_w)));
+
         const is_paned = c.g_type_check_instance_is_a(
             @ptrCast(@alignCast(parent)),
             c.gtk_paned_get_type(),
@@ -387,6 +396,13 @@ pub const Window = struct {
             c.gtk_paned_set_end_child(@ptrCast(paned), new_w);
             c.gtk_box_append(@ptrCast(parent), paned);
         }
+
+        // Make sure the new GLArea has actually been kicked into life:
+        // realize the GL context now (instead of waiting for the first
+        // frame clock tick) and queue a draw so render fires.
+        c.gtk_widget_queue_resize(new_w);
+        c.gtk_gl_area_queue_render(@ptrCast(new_w));
+        c.gtk_widget_queue_resize(@ptrCast(paned));
 
         _ = c.gtk_widget_grab_focus(focused_w);
     }

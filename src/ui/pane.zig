@@ -247,9 +247,12 @@ pub const Pane = struct {
 
 fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
+    std.debug.print("sketerm: pane realize (pane={x})\n", .{@intFromPtr(self)});
     c.gtk_gl_area_make_current(area);
     if (c.gtk_gl_area_get_error(area) != null) {
-        std.debug.print("pane realize: GL error\n", .{});
+        const err = c.gtk_gl_area_get_error(area);
+        const msg: [*:0]const u8 = if (err != null) err.*.message else "<no message>";
+        std.debug.print("sketerm: pane realize GL error: {s}\n", .{msg});
         return;
     }
 
@@ -292,6 +295,9 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     // Cell metrics into image store so placements get pixel coords.
     self.image_store.cell_w = @floatFromInt(self.atlas.?.cell_w);
     self.image_store.cell_h = @floatFromInt(self.atlas.?.cell_h);
+    std.debug.print("sketerm: pane realize complete (pane={x} cell={d}x{d})\n", .{
+        @intFromPtr(self), self.atlas.?.cell_w, self.atlas.?.cell_h,
+    });
 }
 
 fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(.c) c.gboolean {
