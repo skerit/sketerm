@@ -53,6 +53,9 @@ pub const Pane = struct {
     win_on_clipboard: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     /// Cursor blink timing.
     last_blink_us: i64 = 0,
+    /// Last reported mouse-motion cell, to suppress duplicates.
+    last_motion_row: i32 = -2,
+    last_motion_col: i32 = -2,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -353,8 +356,26 @@ fn paneMenuSink(ctx: ?*anyopaque, action: menu.Action) void {
 fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
     const cell = self.cellAt(x, y);
-    if (cell.row < 0 or cell.col < 0) return;
     const screen = self.terminal.screen;
+
+    // Mouse-motion reporting (DECSET 1003 = any motion).
+    // Suppress duplicates within the same cell.
+    if (screen.mouse_mode == 1003 and cell.row >= 0 and cell.col >= 0) {
+        if (cell.row != self.last_motion_row or cell.col != self.last_motion_col) {
+            self.last_motion_row = cell.row;
+            self.last_motion_col = cell.col;
+            var buf: [32]u8 = undefined;
+            // 35 = 32 (motion bit) + 3 (no button held).
+            const seq = std.fmt.bufPrint(&buf, "\x1b[<35;{d};{d}M", .{
+                @as(u32, @intCast(cell.col + 1)),
+                @as(u32, @intCast(cell.row + 1)),
+            }) catch return;
+            _ = self.terminal.pty.writeAll(seq);
+        }
+    }
+
+    // OSC 8 hover tooltip.
+    if (cell.row < 0 or cell.col < 0) return;
     if (cell.row >= screen.rows or cell.col >= screen.cols) return;
     const c_row: u16 = @intCast(cell.row);
     const c_col: u16 = @intCast(cell.col);
@@ -364,7 +385,6 @@ fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
         return;
     }
     if (screen.linkUri(cell_data.reserved)) |uri| {
-        // Copy to null-terminated buffer for GTK.
         var buf: [4096]u8 = undefined;
         const n = @min(uri.len, buf.len - 1);
         @memcpy(buf[0..n], uri[0..n]);
