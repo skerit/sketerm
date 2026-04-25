@@ -431,6 +431,10 @@ pub const Screen = struct {
     /// reset, resize, clearAndScrollback) where tracking shifts of
     /// individual cells would be expensive.
     fn clearAllClusters(self: *Screen) void {
+        // Fast path: empty cluster store is the common case (nobody
+        // typed combining marks). Called on every scrollUp; iterator
+        // setup adds nontrivial cost in the bench when called 60k×.
+        if (self.clusters.count() == 0) return;
         var it = self.clusters.iterator();
         while (it.next()) |entry| {
             var v = entry.value_ptr.*;
@@ -795,6 +799,13 @@ pub const Screen = struct {
     fn pushScrollbackTakeOld(self: *Screen, cells: []Cell, line_id: u64) ?[]Cell {
         const cap = self.scrollback_capacity;
         if (self.scrollback.items.len < cap) {
+            // Pre-allocate the full ring on first push to avoid the
+            // growth-realloc chain (~14 grows from empty to 10k).
+            if (self.scrollback.capacity == 0 and cap > 0) {
+                self.scrollback.ensureTotalCapacity(self.allocator, cap) catch {
+                    // Fall back to incremental growth.
+                };
+            }
             self.scrollback.append(self.allocator, .{ .cells = cells, .id = line_id }) catch {
                 self.allocator.free(cells);
             };
