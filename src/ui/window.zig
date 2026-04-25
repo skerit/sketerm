@@ -281,6 +281,46 @@ pub const Window = struct {
         _ = c.adw_tab_view_select_previous_page(self.tab_view);
     }
 
+    const RenameCtx = struct {
+        page: *c.AdwTabPage,
+        popover: *c.GtkWidget,
+        entry: *c.GtkWidget,
+    };
+
+    /// Show a popover with an entry pre-filled to the current tab's
+    /// title. Pressing Enter renames; Escape dismisses.
+    pub fn renameCurrentTab(self: *Window) void {
+        const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
+
+        const popover = c.gtk_popover_new();
+        const entry = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(entry), "Tab title");
+
+        const current = c.adw_tab_page_get_title(page);
+        if (current != null) {
+            c.gtk_editable_set_text(@ptrCast(entry), current);
+            c.gtk_editable_select_region(@ptrCast(entry), 0, -1);
+        }
+
+        c.gtk_popover_set_child(@ptrCast(popover), entry);
+        c.gtk_widget_set_parent(popover, self.app_window);
+
+        const ctx = self.allocator.create(RenameCtx) catch return;
+        ctx.* = .{ .page = page, .popover = popover, .entry = entry };
+
+        _ = c.g_signal_connect_data(
+            entry,
+            "activate",
+            @ptrCast(&onRenameActivate),
+            @ptrCast(ctx),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+
+        c.gtk_popover_popup(@ptrCast(popover));
+        _ = c.gtk_widget_grab_focus(entry);
+    }
+
     /// Close the focused pane. If it's the only pane in its tab,
     /// closes the tab. Otherwise the pane is removed from its
     /// parent GtkPaned and the sibling takes its place.
@@ -411,14 +451,20 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
     switch (action) {
         .new_tab => self.newShellTab(null) catch {},
         .close_tab => self.closeCurrentTab(),
-        .rename_tab => {
-            // TODO: show GtkPopover with GtkEntry. Stub for now.
-        },
+        .rename_tab => self.renameCurrentTab(),
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {},
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
         .close_pane => self.closeFocusedPane(),
         else => {},
     }
+}
+
+fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *Window.RenameCtx = @ptrCast(@alignCast(user.?));
+    const text = c.gtk_editable_get_text(@ptrCast(entry));
+    if (text != null) c.adw_tab_page_set_title(ctx.page, text);
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+    // ctx leaks for v1 (popover holds entry which holds the closure).
 }
 
 fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
