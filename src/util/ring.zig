@@ -20,6 +20,11 @@ pub fn Ring(comptime T: type, comptime capacity: usize) type {
         // Both monotonically increasing — wrap is via &mask on access.
         head: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
         tail: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
+        // Consumer-private cache of the last head value seen via
+        // acquire. Subsequent pops can compare against this without
+        // re-acquiring until they catch up. Cache-line aligned to keep
+        // it off the producer's path.
+        cached_head: usize align(64) = 0,
 
         pub fn init() Self {
             return .{};
@@ -40,10 +45,17 @@ pub fn Ring(comptime T: type, comptime capacity: usize) type {
         }
 
         /// Consumer side. Returns the next item, or null if empty.
+        ///
+        /// Uses a private `cached_head` snapshot so a drain loop only
+        /// pays one `head.load(.acquire)` per batch instead of one per
+        /// item. The cache is refreshed lazily when the consumer
+        /// catches up to it.
         pub fn pop(self: *Self) ?T {
             const tail = self.tail.load(.monotonic);
-            const head = self.head.load(.acquire);
-            if (tail == head) return null;
+            if (tail == self.cached_head) {
+                self.cached_head = self.head.load(.acquire);
+                if (tail == self.cached_head) return null;
+            }
             const item = self.items[tail & mask];
             self.tail.store(tail +% 1, .release);
             return item;
