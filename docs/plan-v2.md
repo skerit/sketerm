@@ -28,14 +28,30 @@ prove the parser path works (7 integration tests in
 
 | #     | Milestone                            | Effort   | User-visible?                                |
 | ----- | ------------------------------------ | -------- | -------------------------------------------- |
-| M11.0 | **Image render regression — fix #1** | ~1-2 d   | **Yes** — currently broken on screen.        |
-| M11   | Legacy DEC modes (SCNM/COLM/VT52)    | ~3 d     | Niche; spec compliance.                      |
-| M12   | Per-line scaling (DECDHL/DECDWL)     | ~4 d     | Visible if any DEC app uses it.              |
-| M13   | Bidi + complex-script shaping        | ~7-10 d  | **Yes** — Arabic/Hebrew/Indic users.         |
-| M14   | OSC 133 prompt navigation            | ~2-3 d   | **Yes** — modern shell users.                |
-| M15   | Kitty progressive-enhancement kbd    | ~4-5 d   | **Yes** — neovim/emacs power users.          |
-| M16   | Render + parser perf                 | ~7 d     | Only on slow GPUs / SW renderers.            |
-| M17   | Edge polish                          | ~6 d     | Long-session reliability.                    |
+| M11.0 | ✅ Image render regression — fix #1 | done     | Receive bug; verified via smoke-image.       |
+| M11   | ✅ Legacy DEC modes (SCNM/COLM/VT52) | done     | Niche; spec compliance.                      |
+| M12   | ✅ Per-line scaling (DECDHL/DECDWL)  | done     | Visible if any DEC app uses it.              |
+| M13   | ✅ Bidi + complex-script shaping     | done¹    | Cursor at visual col now too.                |
+| M14   | ✅ OSC 133 prompt navigation         | done     | Stable u64 line IDs.                         |
+| M15   | ✅ Kitty progressive-enhancement kbd | done²    | Level 1 (disambiguate); event-types deferred.|
+| M16.2 | ✅ Parser print_run batching         | done     | 64-byte fixed-size batches.                  |
+| M16.1 | ⏸ Per-row dirty + persistent VBO    | deferred | Profile-guided refactor.                     |
+| M16.3 | ⏸ GPU instancing                     | deferred | Profile-guided refactor.                     |
+| M17.1 | △ Atlas multi-page LRU               | partial  | PAGE_SIZE 1024→2048; full multi-page deferred|
+| M17.2 | ✅ Kitty `o=z` zlib                   | done     | std.compress.flate `.zlib`.                  |
+| M17.3 | ⏸ Kitty animation frames             | deferred | Niche; separate subsystem.                   |
+| M17.4 | ✅ Image re-upload after GL loss     | done     | Pending pixels retained.                     |
+| M17.5 | ✅ Right-click "Copy Link"           | done     | Context-aware; works on scrollback.          |
+| M17.6 | ✅ Save Layout As… via GtkFileDialog | done     | Ctrl+Shift+Alt+S.                            |
+
+¹ M13 covers paragraph-level bidi + complex-script shaping. Cursor
+positioning visual-aware. Selection in mixed bidi text remains
+logical-anchored — visually-correct only for line-aligned selections.
+
+² M15 covers level-1 disambiguate flag (Tab vs Ctrl+I etc). Event
+types (release/repeat — flag 0x02), alt-keys (0x04), all-keys-as-
+escape (0x08), associated-text (0x10) require GTK key-released
+wiring + larger encoder rewrite. Most apps don't enable them.
 
 Total: ~34–41 focused days.
 
