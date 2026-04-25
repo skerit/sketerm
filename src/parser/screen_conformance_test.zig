@@ -480,3 +480,116 @@ test "parser.py: APC with unrecognized command consumed silently" {
     defer std.testing.allocator.free(r);
     try std.testing.expectEqualStrings("ab", r);
 }
+
+// ── test_bottom_margin / test_top_and_bottom_margin (DECSTBM) ─────
+
+test "screen.py: DECSTBM bottom-margin scroll" {
+    var h = try Harness.init(std.testing.allocator, 10, 6);
+    defer h.deinit();
+    h.arm();
+    // CSI 1;5 r — top=1, bottom=5 (1-indexed) → 0..4 inclusive.
+    h.feed("\x1b[1;5r");
+    var i: u8 = 0;
+    while (i < 6) : (i += 1) {
+        var b: [1]u8 = .{ '0' + i };
+        h.feed(&b);
+        h.feed("\r\n");
+    }
+    // Inside-region rows scroll while writing more.
+    var j: u8 = 6;
+    while (j < 8) : (j += 1) {
+        var b: [1]u8 = .{ '0' + j };
+        h.feed(&b);
+        h.feed("\r\n");
+    }
+    // Row 5 (outside region) should still hold whatever was there
+    // when we last touched it. Inside-region rows show '4','5','6','7'.
+    const r0 = try h.line(std.testing.allocator, 0);
+    defer std.testing.allocator.free(r0);
+    try std.testing.expectEqualStrings("4", r0);
+    const r1 = try h.line(std.testing.allocator, 1);
+    defer std.testing.allocator.free(r1);
+    try std.testing.expectEqualStrings("5", r1);
+    const r2 = try h.line(std.testing.allocator, 2);
+    defer std.testing.allocator.free(r2);
+    try std.testing.expectEqualStrings("6", r2);
+    const r3 = try h.line(std.testing.allocator, 3);
+    defer std.testing.allocator.free(r3);
+    try std.testing.expectEqualStrings("7", r3);
+}
+
+// ── test_osc_52 (more thorough, from screen.py) ───────────────────
+
+test "screen.py: OSC 52 with non-base64 chars rejected" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    // Capture the clipboard set sink.
+    const Spy = struct {
+        var captured: [16]u8 = undefined;
+        var captured_len: usize = 0;
+        fn cb(_: ?*anyopaque, t: []const u8) void {
+            const n = @min(t.len, captured.len);
+            @memcpy(captured[0..n], t[0..n]);
+            captured_len = n;
+        }
+    };
+    Spy.captured_len = 0;
+    h.screen.sink.on_clipboard_set = Spy.cb;
+    h.feed("\x1b]52;c;@@@@@\x07");
+    try std.testing.expectEqual(@as(usize, 0), Spy.captured_len);
+}
+
+// ── test_dirty_lines: cursor-only moves don't dirty rows ──────────
+
+test "screen.py: cursor-only moves don't dirty unaffected rows" {
+    var h = try Harness.init(std.testing.allocator, 5, 5);
+    defer h.deinit();
+    h.arm();
+    // Reset all dirty bits.
+    var r: u16 = 0;
+    while (r < 5) : (r += 1) h.screen.line(r).dirty = false;
+    // Cursor moves only — no draw.
+    h.feed("\x1b[3;3H\x1b[5;5H");
+    // None of the rows should have been marked dirty by cursor moves.
+    r = 0;
+    while (r < 5) : (r += 1) {
+        try std.testing.expect(!h.screen.line(r).dirty);
+    }
+}
+
+// ── DECRQM private mode query ────────────────────────────────────
+
+test "parser.py: DECRQM (CSI ? Pa $ p) reports cursor visible" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1b[?25$p");
+    // Reply: ESC [ ? 25 ; Ps $ y where Ps=1 (set, default visible).
+    try std.testing.expectEqualStrings("\x1b[?25;1$y", h.wtc.items);
+    h.wtc.clearRetainingCapacity();
+    h.feed("\x1b[?25l");
+    h.feed("\x1b[?25$p");
+    try std.testing.expectEqualStrings("\x1b[?25;2$y", h.wtc.items);
+}
+
+// ── test_da1 with DECID (ESC Z) ──────────────────────────────────
+
+test "parser.py: DECID (ESC Z) emits DA1 reply" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1bZ");
+    try std.testing.expectEqualStrings("\x1b[?62;4;22c", h.wtc.items);
+}
+
+// ── ENQ (0x05) — answerback (we send empty) ──────────────────────
+
+test "parser.py: ENQ (0x05) is silently consumed" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x05");
+    // No response bytes from us (answerback string is empty).
+    try std.testing.expectEqual(@as(usize, 0), h.wtc.items.len);
+}
