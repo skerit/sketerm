@@ -6,8 +6,8 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~197 commits, ~11.0 kLOC of Zig + 8 kLOC vendored stb_image
-- 226 unit tests pass
+- ~203 commits, ~11.8 kLOC of Zig + 8 kLOC vendored stb_image
+- 247 unit tests pass
 
 ## What got built
 
@@ -247,6 +247,50 @@ Coverage by file (final count this round):
 The 124-test delta came from porting kitty/kitty_tests/parser.py,
 screen.py, multicell.py, clipboard.py, keys.py, plus
 wezterm/term/src/test/{c0,c1,csi}.rs.
+
+## Big-feature implementation pass
+
+In response to "implement ALL the missing features" the session
+shipped four substantive features previously-listed as gaps:
+
+### Soft-wrap reflow on resize (`src/grid/reflow.zig`)
+When columns change on the main buffer, scrollback + active are
+rebuilt: logical lines (rows linked by `continues_above`) get
+joined, re-chunked at the new width, redistributed. Cursor follows
+its logical (line_idx, col_in_line) position. Trailing empty
+logical lines are dropped so bottom-of-active blank padding
+doesn't push real content into scrollback when narrowing. Alt
+screen never reflows. 8 integration tests + 6 primitive tests.
+
+### Grapheme combining (drop-extension model)
+`Screen.isExtendingCp` flags ZWJ, ZWNJ, variation selectors,
+combining marks (basic + supplement + extended + half-marks),
+and emoji skin-tone modifiers. `printCp` short-circuits for
+those: cursor doesn't advance, no cell write. Cursor positions
+for emoji+modifier and char+combining-mark sequences are now
+correct. Limitation: we don't store the extending codepoint as
+part of a grapheme cluster, so the rendered glyph is the base
+only (matches cursor expectations from kitty's tests, but the
+selection-extract for clusters still produces the base only).
+
+### Image manager: placement_id + z_index
+`ImageStore.Image` gained `placement_id` and `z_index`. Kitty
+graphics protocol's `p=` and `z=` propagate from parser → Screen
+sink → Pane → store. New `addWithPlacement(...)` and
+`markByPlacementForDelete(image_id, placement_id)`. Plus wider
+emoji width range for `isWideCp` (BMP misc symbols, mahjong,
+playing cards, supplemental pictographs).
+
+### HarfBuzz integration (foundation)
+`Atlas.init` now wraps the FreeType face in an `hb_font_t` via
+`hb_ft_font_create_referenced`. New `Atlas.shapeRun(text)` runs
+the text through `hb_shape` and returns
+`ShapedGlyph[]{glyph_id, x_advance, y_advance, x_offset,
+y_offset, cluster}`. The renderer doesn't currently use this
+(still does codepoint-per-cell), but the foundation is in place
+for a ligature-aware pass.
+
+Tests count: 226 → 247 (+21). Zero regressions.
 
 ## What's left
 
