@@ -832,13 +832,20 @@ pub const Screen = struct {
     // ── Cursor primitives ────────────────────────────────────────
 
     fn cursorUp(self: *Screen, n: u32) void {
-        const dec: u16 = @intCast(@min(n, @as(u32, self.row)));
+        // If cursor is inside the scroll region, clamp to scroll_top.
+        // Otherwise to absolute row 0 (per xterm/DEC behavior).
+        const inside = self.row >= self.scroll_top and self.row <= self.scroll_bot;
+        const limit: u16 = if (inside) self.scroll_top else 0;
+        const max_dec: u32 = self.row - limit;
+        const dec: u16 = @intCast(@min(n, max_dec));
         self.row -= dec;
         self.pending_wrap = false;
     }
 
     fn cursorDown(self: *Screen, n: u32) void {
-        const max_dec: u32 = @intCast(self.rows - 1 - self.row);
+        const inside = self.row >= self.scroll_top and self.row <= self.scroll_bot;
+        const limit: u16 = if (inside) self.scroll_bot else self.rows - 1;
+        const max_dec: u32 = limit - self.row;
         const dec: u16 = @intCast(@min(n, max_dec));
         self.row += dec;
         self.pending_wrap = false;
