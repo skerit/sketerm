@@ -566,8 +566,27 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
 fn onScroll(_: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Pane = @ptrCast(@alignCast(user.?));
     const screen = self.terminal.screen;
-    const sb = screen.scrollbackCount();
+
+    // Apps in alt-screen + mouse mode (htop, vim, less, …) want
+    // wheel events as mouse buttons 4 / 5. Send those instead of
+    // adjusting the (irrelevant) scrollback view.
+    if (screen.mouse_mode > 0 and screen.use_alt) {
+        if (dy == 0) return 1;
+        const button: u32 = if (dy < 0) 64 else 65; // 64 = btn4, 65 = btn5
+        const row: i32 = if (self.last_motion_row >= 0) self.last_motion_row else 0;
+        const col: i32 = if (self.last_motion_col >= 0) self.last_motion_col else 0;
+        var buf: [32]u8 = undefined;
+        const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}M", .{
+            button,
+            @as(u32, @intCast(col + 1)),
+            @as(u32, @intCast(row + 1)),
+        }) catch return 1;
+        _ = self.terminal.pty.writeAll(seq);
+        return 1;
+    }
+
     // Scroll up (negative dy) increases view_offset. 3 lines per click.
+    const sb = screen.scrollbackCount();
     if (dy < 0) {
         const want = screen.view_offset + 3;
         screen.view_offset = if (want > sb) sb else want;
