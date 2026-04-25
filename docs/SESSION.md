@@ -6,8 +6,8 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~129 commits, ~7.9 kLOC of Zig + 8 kLOC vendored stb_image
-- 77 unit tests pass
+- ~144 commits, ~8.3 kLOC of Zig + 8 kLOC vendored stb_image
+- 87 unit tests pass
 
 ## What got built
 
@@ -130,6 +130,14 @@ Things added between commits 67 → 115:
 - IRM (CSI 4 h/l) — public-mode insert/replace honored.
 - Bracketed paste strips embedded ESC bytes.
 - PTY captures the real child exit status on EOF.
+- Kitty image delete (a=d, a=A) wired through new
+  on_image_delete sink + ImageStore.markByIdForDelete.
+- OSC 7 paths are percent-decoded.
+- Empty-title GNotification falls back to "sketerm".
+- Ctrl+Shift+K clears screen + scrollback.
+- SKETERM_FONT / SKETERM_SCROLLBACK env vars override
+  defaults at startup.
+- --debug-events CLI flag dumps parser events to stderr.
 
 ## What's left
 
