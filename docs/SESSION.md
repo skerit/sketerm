@@ -6,8 +6,8 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~188 commits, ~9.2 kLOC of Zig + 8 kLOC vendored stb_image
-- 102 unit tests pass
+- ~194 commits, ~10.9 kLOC of Zig + 8 kLOC vendored stb_image
+- 209 unit tests pass
 
 ## What got built
 
@@ -194,6 +194,44 @@ After the user did a real visual test, four bugs surfaced:
   byte is the print path's bottleneck.
 - **vttest checklist** at `docs/vttest.md` documenting which
   features should pass and which are explicitly out of scope.
+
+## Conformance test batch from kitty + wezterm
+
+Shallow-cloned kitty + wezterm at `external/` (gitignored,
+~280 MB combined) and ported their conformance tests to Zig.
+Pattern follows Kitty's `parse_bytes_dump`: build a screen,
+feed bytes, assert on observable state (cell rune, cursor
+row/col, captured PTY-write bytes via the `on_write_pty`
+sink, captured titles via `on_title`).
+
+Shared test harness in `src/parser/test_harness.zig`. Test
+files:
+
+- `src/parser/conformance_test.zig` — initial 11 tests
+- `src/parser/screen_conformance_test.zig` — kitty screen.py +
+  parser.py (CSI char manipulation, ED variants, cursor
+  movement, IND/RI, BS clamp, tab stops, SGR, alt screen,
+  dirty bits, DA1, resize, OSC 0/2/8, DEC graphics charset,
+  REP edge cases, PM/APC, DECSTBM, DECRQM, DECID, ENQ)
+- `src/parser/wezterm_conformance_test.zig` — c0.rs + c1.rs +
+  csi.rs (BS/LF/CR/HT, IND/NEL/HTS/RI, VPA, REP, IRM, ICH,
+  ECH, DCH, CUP, DL, CHA, ED 3)
+- `src/parser/multicell_conformance_test.zig` — wide chars,
+  emoji, regional indicators, ZWJ, soft hyphen, autowrap,
+  VS-16, BS at wide-char trailer
+- `src/parser/clipboard_conformance_test.zig` — OSC 52 base64
+  round-trip with edge cases (empty, query, invalid, split
+  across feed() calls, binary bytes)
+- `src/grid/selection_conformance_test.zig` — selection
+  extraction (forward, backward, partial, empty, wide-char,
+  soft-wrapped)
+- `src/ui/input_conformance_test.zig` — modCode at all 8
+  combos, cursorKey/tildeKey/ssoKey at every modifier perm
+
+`docs/external-references.md` documents what's in external/
+and which test files are worth porting next.
+
+Total: **209/209 tests pass**, up from 102.
 
 ## What's left
 
