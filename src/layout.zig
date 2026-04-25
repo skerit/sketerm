@@ -1,21 +1,42 @@
 //! Layout — save/restore window topology + per-pane cwd/command.
 //!
-//! Format: JSON for v1 simplicity; schema-versioned. Plan calls
-//! for ZON post-v1; same fields just different encoding.
+//! Schema v2: tabs each carry a Tree (pane | split), recursive.
+//! v1 saves are still parseable (loader fallback below).
 
 const std = @import("std");
 const c = @import("c.zig").c;
 
-pub const Layout = struct {
-    version: u32 = 1,
-    tabs: []TabSpec,
+pub const Orient = enum { horizontal, vertical };
+
+pub const PaneSpec = struct {
+    cwd: []const u8,
+    command: []const []const u8,
+};
+
+pub const SplitSpec = struct {
+    orientation: Orient,
+    ratio: f32,
+    children: []const Tree, // length must be 2
+};
+
+pub const Tree = union(enum) {
+    pane: PaneSpec,
+    split: SplitSpec,
 };
 
 pub const TabSpec = struct {
     title: []const u8,
-    cwd: []const u8,
-    /// argv. argv[0] is the binary to exec.
-    command: []const []const u8,
+    tree: Tree,
+    /// Legacy v1 fields. If present (non-null) they take precedence
+    /// when `tree` was not in the parsed JSON. Kept for backwards
+    /// compat reads.
+    cwd: ?[]const u8 = null,
+    command: ?[]const []const u8 = null,
+};
+
+pub const Layout = struct {
+    version: u32 = 2,
+    tabs: []const TabSpec,
 };
 
 /// Read `/proc/<pid>/cwd` symlink target.
@@ -32,7 +53,6 @@ pub fn save(layout: Layout, path: []const u8) !void {
     defer dir.close();
     const basename = std.fs.path.basename(path);
 
-    // Write to .tmp + rename for atomicity.
     var tmp_buf: [256]u8 = undefined;
     const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{basename});
     var tmp = try dir.createFile(tmp_name, .{ .truncate = true });
@@ -62,8 +82,6 @@ fn ensureParentDir(path: []const u8) !std.fs.Dir {
     return std.fs.cwd().makeOpenPath(dirname, .{});
 }
 
-/// Default save destination: $XDG_STATE_HOME/sketerm/last.json
-/// or $HOME/.local/state/sketerm/last.json fallback.
 pub fn defaultSavePath(allocator: std.mem.Allocator) ![]u8 {
     if (std.posix.getenv("XDG_STATE_HOME")) |xs| {
         return std.fmt.allocPrint(allocator, "{s}/sketerm/last.json", .{xs});
@@ -74,7 +92,7 @@ pub fn defaultSavePath(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "/tmp/sketerm-last.json", .{});
 }
 
-test "round trip" {
+test "round trip with split tree" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -87,18 +105,31 @@ test "round trip" {
 
     const cmd1 = [_][]const u8{ "bash", "-l" };
     const cmd2 = [_][]const u8{ "nvim", "." };
+    const left = Tree{ .pane = .{ .cwd = "/tmp", .command = &cmd1 } };
+    const right = Tree{ .pane = .{ .cwd = "/home", .command = &cmd2 } };
+    const split_kids = [_]Tree{ left, right };
+    const split_tab_tree = Tree{ .split = .{
+        .orientation = .horizontal,
+        .ratio = 0.5,
+        .children = &split_kids,
+    } };
     var tabs = [_]TabSpec{
-        .{ .title = "shell", .cwd = "/tmp", .command = &cmd1 },
-        .{ .title = "edit", .cwd = "/home", .command = &cmd2 },
+        .{ .title = "split", .tree = split_tab_tree },
+        .{ .title = "single", .tree = .{ .pane = .{ .cwd = "/var", .command = &cmd1 } } },
     };
     const layout = Layout{ .tabs = &tabs };
     try save(layout, file_path);
 
     const parsed = try load(a, file_path);
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 1), parsed.value.version);
+    try std.testing.expectEqual(@as(u32, 2), parsed.value.version);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.tabs.len);
-    try std.testing.expectEqualStrings("shell", parsed.value.tabs[0].title);
-    try std.testing.expectEqualStrings("/tmp", parsed.value.tabs[0].cwd);
-    try std.testing.expectEqualStrings("nvim", parsed.value.tabs[1].command[0]);
+    try std.testing.expectEqualStrings("split", parsed.value.tabs[0].title);
+    switch (parsed.value.tabs[0].tree) {
+        .split => |s| {
+            try std.testing.expectEqual(Orient.horizontal, s.orientation);
+            try std.testing.expectEqual(@as(usize, 2), s.children.len);
+        },
+        else => try std.testing.expect(false),
+    }
 }

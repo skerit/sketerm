@@ -75,29 +75,80 @@ pub const Window = struct {
     }
 
     /// Spawn a new tab from a layout TabSpec (used on --restore).
+    /// Handles both v2 (tree) and v1-compat (cwd/command) fields.
     pub fn newTabFromSpec(self: *Window, spec: @import("../layout.zig").TabSpec) !void {
-        if (spec.command.len == 0) return error.EmptyCommand;
+        const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        c.gtk_widget_set_vexpand(wrapper, 1);
+        c.gtk_widget_set_hexpand(wrapper, 1);
 
-        // Allocate null-terminated argv strings.
-        var argv_buf = try self.allocator.alloc([*:0]const u8, spec.command.len);
-        defer self.allocator.free(argv_buf);
-        var arg_owners: std.ArrayList([:0]u8) = .{};
-        defer {
-            for (arg_owners.items) |s| self.allocator.free(s);
-            arg_owners.deinit(self.allocator);
-        }
-        for (spec.command, 0..) |cmd, i| {
-            const z = try self.allocator.allocSentinel(u8, cmd.len, 0);
-            try arg_owners.append(self.allocator, z);
-            @memcpy(z, cmd);
-            argv_buf[i] = z.ptr;
-        }
+        const root_widget = try self.buildTreeWidget(spec.tree);
+        c.gtk_box_append(@ptrCast(wrapper), root_widget);
 
         const title_z = try self.allocator.allocSentinel(u8, spec.title.len, 0);
         defer self.allocator.free(title_z);
         @memcpy(title_z, spec.title);
 
-        try self.addTabInternal(title_z, argv_buf, spec.cwd);
+        const page = c.adw_tab_view_append(self.tab_view, wrapper);
+        c.adw_tab_page_set_title(page, title_z.ptr);
+    }
+
+    fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree) !*c.GtkWidget {
+        switch (tree) {
+            .pane => |p| {
+                if (p.command.len == 0) return error.EmptyCommand;
+
+                var argv_buf = try self.allocator.alloc([*:0]const u8, p.command.len);
+                defer self.allocator.free(argv_buf);
+                var arg_owners: std.ArrayList([:0]u8) = .{};
+                defer {
+                    for (arg_owners.items) |s| self.allocator.free(s);
+                    arg_owners.deinit(self.allocator);
+                }
+                for (p.command, 0..) |cmd, i| {
+                    const z = try self.allocator.allocSentinel(u8, cmd.len, 0);
+                    try arg_owners.append(self.allocator, z);
+                    @memcpy(z, cmd);
+                    argv_buf[i] = z.ptr;
+                }
+
+                const pty = try Pty.spawn(.{
+                    .argv = argv_buf,
+                    .cwd = p.cwd,
+                    .rows = 24,
+                    .cols = 80,
+                });
+                errdefer pty.closeAndReap();
+
+                const term = try Terminal.init(self.allocator, pty, 80, 24);
+                errdefer term.deinit();
+
+                const pane = try self.makePane(term);
+                pane.win_clip_ctx = @ptrCast(self);
+                pane.win_on_clipboard = onTermClipboardSet;
+
+                try self.panes.append(self.allocator, pane);
+                try self.terminals.append(self.allocator, term);
+                return pane.widget();
+            },
+            .split => |s| {
+                if (s.children.len < 2) return error.InvalidLayout;
+                const orientation: c_uint = if (s.orientation == .horizontal)
+                    @intCast(c.GTK_ORIENTATION_HORIZONTAL)
+                else
+                    @intCast(c.GTK_ORIENTATION_VERTICAL);
+                const paned = c.gtk_paned_new(orientation);
+                c.gtk_paned_set_resize_start_child(@ptrCast(paned), 1);
+                c.gtk_paned_set_resize_end_child(@ptrCast(paned), 1);
+                c.gtk_paned_set_shrink_start_child(@ptrCast(paned), 0);
+                c.gtk_paned_set_shrink_end_child(@ptrCast(paned), 0);
+
+                const first = try self.buildTreeWidget(s.children[0]);
+                const second = try self.buildTreeWidget(s.children[1]);
+                c.gtk_paned_set_start_child(@ptrCast(paned), first);
+                c.gtk_paned_set_end_child(@ptrCast(paned), second);
+                return paned;
+            },
+        }
     }
 
     fn addTabInternal(
@@ -403,22 +454,61 @@ pub const Window = struct {
         const n_pages = c.adw_tab_view_get_n_pages(self.tab_view);
         var i: c_int = 0;
         while (i < n_pages) : (i += 1) {
-            if (i >= self.terminals.items.len) break;
-            const term = self.terminals.items[@intCast(i)];
             const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
+            const wrapper = c.adw_tab_page_get_child(page);
+            const root = c.gtk_widget_get_first_child(@ptrCast(wrapper));
+            if (root == null) continue;
+
             const title_cstr = c.adw_tab_page_get_title(page);
             const title = if (title_cstr != null) std.mem.span(@as([*:0]const u8, @ptrCast(title_cstr))) else "";
 
-            const cwd = layout_mod.cwdOfPid(term.pty.child_pid, arena) catch try arena.dupe(u8, "/");
-            const cmd = try arena.alloc([]const u8, 1);
-            cmd[0] = try arena.dupe(u8, std.posix.getenv("SHELL") orelse "/bin/bash");
+            const tree = self.collectTree(arena, root.?) catch continue;
             try tabs.append(arena, .{
                 .title = try arena.dupe(u8, title),
-                .cwd = cwd,
-                .command = cmd,
+                .tree = tree,
             });
         }
-        return .{ .version = 1, .tabs = try tabs.toOwnedSlice(arena) };
+        return .{ .version = 2, .tabs = try tabs.toOwnedSlice(arena) };
+    }
+
+    fn collectTree(self: *Window, arena: std.mem.Allocator, w: *c.GtkWidget) !layout_mod.Tree {
+        const is_paned = c.g_type_check_instance_is_a(
+            @ptrCast(@alignCast(w)),
+            c.gtk_paned_get_type(),
+        ) != 0;
+        if (is_paned) {
+            const start = c.gtk_paned_get_start_child(@ptrCast(w)) orelse return error.MissingChild;
+            const end = c.gtk_paned_get_end_child(@ptrCast(w)) orelse return error.MissingChild;
+            const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(w)));
+            const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
+                c.gtk_widget_get_width(w)
+            else
+                c.gtk_widget_get_height(w);
+            const pos = c.gtk_paned_get_position(@ptrCast(w));
+            const ratio: f32 = if (total > 0)
+                @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total))
+            else
+                0.5;
+            const children = try arena.alloc(layout_mod.Tree, 2);
+            children[0] = try self.collectTree(arena, start);
+            children[1] = try self.collectTree(arena, end);
+            return .{ .split = .{
+                .orientation = if (orientation == c.GTK_ORIENTATION_HORIZONTAL) .horizontal else .vertical,
+                .ratio = ratio,
+                .children = children,
+            } };
+        }
+
+        // Leaf — find the Pane that owns this widget.
+        for (self.panes.items) |p| {
+            if (@intFromPtr(p.widget()) == @intFromPtr(w)) {
+                const cwd = layout_mod.cwdOfPid(p.terminal.pty.child_pid, arena) catch try arena.dupe(u8, "/");
+                const cmd = try arena.alloc([]const u8, 1);
+                cmd[0] = try arena.dupe(u8, std.posix.getenv("SHELL") orelse "/bin/bash");
+                return .{ .pane = .{ .cwd = cwd, .command = cmd } };
+            }
+        }
+        return error.PaneNotFound;
     }
 
     /// Save current state to the default path. Best-effort.
