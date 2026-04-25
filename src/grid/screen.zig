@@ -714,6 +714,15 @@ pub const Screen = struct {
         if (self.col >= self.cols) return;
 
         var ln = self.line(self.row);
+
+        // IRM (insert mode) — shift cells right by `width` before placing.
+        if (self.insert_mode and self.col < self.cols) {
+            var k: u16 = self.cols;
+            while (k > self.col + width) : (k -= 1) {
+                ln.cells[k - 1] = ln.cells[k - 1 - width];
+            }
+        }
+
         var flags: u8 = if (self.current_link_id != 0) 0b0000_0100 else 0;
         if (width == 2) flags |= 0b0000_0001; // is_wide_left
         ln.cells[self.col] = .{
@@ -992,7 +1001,21 @@ pub const Screen = struct {
             // Window manipulation reports.
             't' => self.windowOps(params),
 
+            // Public-mode SM / RM. Common one is IRM (4) = insert.
+            'h' => self.publicModeSet(params, true),
+            'l' => self.publicModeSet(params, false),
+
             else => {},
+        }
+    }
+
+    fn publicModeSet(self: *Screen, params: Event.Csi, set: bool) void {
+        var i: usize = 0;
+        while (i < params.n_params) : (i += 1) {
+            switch (params.params[i]) {
+                4 => self.insert_mode = set, // IRM
+                else => {},
+            }
         }
     }
 
