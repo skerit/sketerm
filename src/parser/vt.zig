@@ -480,3 +480,73 @@ test "cancel via can/sub" {
     };
     try std.testing.expect(saw_print_a);
 }
+
+test "DCS body collected and dispatched on ST" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    defer col.deinit();
+    // ESC P q ABC ESC \\
+    p.advance("\x1bPq" ++ "ABC" ++ "\x1b\\", TestCollector.emit, &col);
+    var saw_dcs = false;
+    for (col.events.items) |ev| switch (ev) {
+        .dcs => |d| {
+            try std.testing.expectEqual(@as(u8, 'q'), d.proto.final);
+            try std.testing.expectEqualStrings("ABC", d.body);
+            saw_dcs = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_dcs);
+}
+
+test "OSC dispatches on BEL terminator" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    defer col.deinit();
+    p.advance("\x1b]52;c;SGVsbG8=\x07", TestCollector.emit, &col);
+    var saw_osc = false;
+    for (col.events.items) |ev| switch (ev) {
+        .osc => |o| {
+            try std.testing.expectEqualStrings("52;c;SGVsbG8=", o.bytes);
+            saw_osc = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_osc);
+}
+
+test "OSC dispatches on ESC backslash terminator" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    defer col.deinit();
+    p.advance("\x1b]0;sketerm\x1b\\", TestCollector.emit, &col);
+    var saw_osc = false;
+    for (col.events.items) |ev| switch (ev) {
+        .osc => |o| {
+            try std.testing.expectEqualStrings("0;sketerm", o.bytes);
+            saw_osc = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_osc);
+}
+
+test "APC kitty graphics dispatched on ESC \\\\" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    defer col.deinit();
+    p.advance("\x1b_Ga=T,f=32,s=1,v=1,i=1;ABCD\x1b\\", TestCollector.emit, &col);
+    var saw_apc = false;
+    for (col.events.items) |ev| switch (ev) {
+        .apc => |a| {
+            try std.testing.expect(std.mem.startsWith(u8, a.bytes, "Ga="));
+            saw_apc = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_apc);
+}
