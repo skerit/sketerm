@@ -39,6 +39,10 @@ pub const Terminal = struct {
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
 
+    /// Most recent cwd reported via OSC 7 (file://host/path → /path).
+    /// Owned. Used by layout save in preference to /proc lookup.
+    cwd: ?[]u8 = null,
+
     /// If true, drain prints events to stderr. M1 debug aid.
     debug_to_stderr: bool = false,
 
@@ -115,10 +119,20 @@ pub const Terminal = struct {
         if (self.on_clipboard_set) |f| f(self.user_ctx, text);
     }
 
-    fn sinkCwd(ctx: ?*anyopaque, cwd: []const u8) void {
-        _ = ctx;
-        _ = cwd;
-        // Stored on Terminal for later layout-save use; v1 stub.
+    fn sinkCwd(ctx: ?*anyopaque, cwd_in: []const u8) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        // OSC 7 sends `file://hostname/path/to/cwd`.
+        const path: []const u8 = blk: {
+            if (std.mem.startsWith(u8, cwd_in, "file://")) {
+                const after = cwd_in[7..];
+                if (std.mem.indexOfScalar(u8, after, '/')) |slash| break :blk after[slash..];
+                break :blk after;
+            }
+            break :blk cwd_in;
+        };
+        // Replace existing.
+        if (self.cwd) |old| self.allocator.free(old);
+        self.cwd = self.allocator.dupe(u8, path) catch null;
     }
 
     fn sinkImage(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
@@ -144,6 +158,7 @@ pub const Terminal = struct {
         self.screen.deinit();
         self.pool.deinit();
         self.parser.deinit();
+        if (self.cwd) |path| self.allocator.free(path);
         self.allocator.destroy(self.ring);
         self.allocator.destroy(self);
     }

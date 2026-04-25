@@ -502,7 +502,12 @@ pub const Window = struct {
         // Leaf — find the Pane that owns this widget.
         for (self.panes.items) |p| {
             if (@intFromPtr(p.widget()) == @intFromPtr(w)) {
-                const cwd = layout_mod.cwdOfPid(p.terminal.pty.child_pid, arena) catch try arena.dupe(u8, "/");
+                // Prefer OSC 7 cwd if the shell reported it; fall
+                // back to /proc/<pid>/cwd; finally to "/".
+                const cwd: []const u8 = if (p.terminal.cwd) |reported|
+                    try arena.dupe(u8, reported)
+                else
+                    layout_mod.cwdOfPid(p.terminal.pty.child_pid, arena) catch try arena.dupe(u8, "/");
                 const cmd = try arena.alloc([]const u8, 1);
                 cmd[0] = try arena.dupe(u8, std.posix.getenv("SHELL") orelse "/bin/bash");
                 return .{ .pane = .{ .cwd = cwd, .command = cmd } };
