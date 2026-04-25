@@ -109,16 +109,24 @@ fn parseTree(a: std.mem.Allocator, lines: []const Line, expected_indent: usize) 
     const head = lines[0];
     if (head.indent != expected_indent) return ParseError.BadIndent;
 
-    if (std.mem.eql(u8, head.text, "hsplit") or std.mem.eql(u8, head.text, "vsplit")) {
-        const orient: layout.Orient = if (head.text[0] == 'h') .horizontal else .vertical;
-        // Two children expected, each at indent+1, possibly each
-        // followed by their own subtree.
+    // hsplit / vsplit, optionally with `@ <ratio>` (0.0..1.0).
+    if (std.mem.startsWith(u8, head.text, "hsplit") or std.mem.startsWith(u8, head.text, "vsplit")) {
+        const word = head.text[0..6];
+        const orient: layout.Orient = if (word[0] == 'h') .horizontal else .vertical;
+        const rest = std.mem.trimLeft(u8, head.text[6..], " \t");
+        var ratio: f32 = 0.5;
+        if (rest.len > 0) {
+            if (rest[0] != '@') return ParseError.UnknownNode;
+            const after = std.mem.trimLeft(u8, rest[1..], " \t");
+            ratio = std.fmt.parseFloat(f32, after) catch 0.5;
+            if (ratio <= 0.0 or ratio >= 1.0) ratio = 0.5;
+        }
         const inner = lines[1..];
         const children = try collectTwo(a, inner, expected_indent + 1);
         const slots = try a.alloc(layout.Tree, 2);
         slots[0] = children.first;
         slots[1] = children.second;
-        return .{ .split = .{ .orientation = orient, .ratio = 0.5, .children = slots } };
+        return .{ .split = .{ .orientation = orient, .ratio = ratio, .children = slots } };
     }
 
     if (std.mem.startsWith(u8, head.text, "pane")) {
@@ -166,12 +174,28 @@ fn parsePane(a: std.mem.Allocator, text: []const u8) ParseError!layout.PaneSpec 
     }
     if (cmd.len == 0) cmd = std.posix.getenv("SHELL") orelse "/bin/bash";
 
-    // Split command on spaces — naive (no quote handling). For
-    // commands that need quoting users still have JSON.
+    // Tokenise with rudimentary quoting: `"…"` and `'…'` are taken
+    // verbatim (no escape sequences inside), runs of spaces split.
     var parts: std.ArrayList([]const u8) = .{};
-    var ti = std.mem.tokenizeScalar(u8, cmd, ' ');
-    while (ti.next()) |tok| {
-        try parts.append(a, try a.dupe(u8, tok));
+    var i: usize = 0;
+    while (i < cmd.len) {
+        if (cmd[i] == ' ' or cmd[i] == '\t') {
+            i += 1;
+            continue;
+        }
+        if (cmd[i] == '"' or cmd[i] == '\'') {
+            const quote = cmd[i];
+            i += 1;
+            const start = i;
+            while (i < cmd.len and cmd[i] != quote) i += 1;
+            const tok = cmd[start..i];
+            if (i < cmd.len) i += 1;
+            try parts.append(a, try a.dupe(u8, tok));
+            continue;
+        }
+        const start = i;
+        while (i < cmd.len and cmd[i] != ' ' and cmd[i] != '\t') i += 1;
+        try parts.append(a, try a.dupe(u8, cmd[start..i]));
     }
     return .{
         .cwd = try a.dupe(u8, if (cwd.len > 0) cwd else "/"),
@@ -243,4 +267,42 @@ test "nested splits" {
     const right = tree.split.children[1].split;
     try std.testing.expectEqual(layout.Orient.vertical, right.orientation);
     try std.testing.expectEqualStrings("htop", right.children[1].pane.command[0]);
+}
+
+test "split with custom ratio" {
+    const src =
+        \\Stack
+        \\  hsplit @ 0.7
+        \\    pane bash @ /tmp
+        \\    pane htop @ /
+    ;
+    var parsed = try parse(std.testing.allocator, src);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(f32, 0.7), parsed.value.tabs[0].tree.split.ratio);
+}
+
+test "quoted command preserves spaces" {
+    const src =
+        \\Run
+        \\  pane bash -c "echo hello world" @ /
+    ;
+    var parsed = try parse(std.testing.allocator, src);
+    defer parsed.deinit();
+    const cmd = parsed.value.tabs[0].tree.pane.command;
+    try std.testing.expectEqual(@as(usize, 3), cmd.len);
+    try std.testing.expectEqualStrings("bash", cmd[0]);
+    try std.testing.expectEqualStrings("-c", cmd[1]);
+    try std.testing.expectEqualStrings("echo hello world", cmd[2]);
+}
+
+test "single-quoted args preserved" {
+    const src =
+        \\R
+        \\  pane sh -c 'while true; do echo x; sleep 1; done'
+    ;
+    var parsed = try parse(std.testing.allocator, src);
+    defer parsed.deinit();
+    const cmd = parsed.value.tabs[0].tree.pane.command;
+    try std.testing.expectEqual(@as(usize, 3), cmd.len);
+    try std.testing.expectEqualStrings("while true; do echo x; sleep 1; done", cmd[2]);
 }

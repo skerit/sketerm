@@ -11,8 +11,10 @@
 #     hsplit                        ← two children at the next indent
 #     vsplit                        ← two children at the next indent
 # - Splits can nest arbitrarily.
-# - The command is split on spaces (no quote handling — for commands
-#   that need quoting, use the .json format).
+# - Commands split on spaces; "double" or 'single' quotes preserve
+#   embedded spaces verbatim (no escapes inside the quotes).
+# - Splits accept `@ <ratio>` to set the start-child fraction
+#   (e.g. `hsplit @ 0.7`). Range (0.0, 1.0); defaults to 0.5.
 # - Default cwd is `/` if `@ <path>` is omitted.
 
 # Single pane running bash in /tmp.
