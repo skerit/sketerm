@@ -348,6 +348,9 @@ fn onMotion(_: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
 
 fn onDragBegin(_: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
+    // Always grab focus on click — important for split panes so
+    // typing goes into the clicked pane, not the previously-focused one.
+    _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
     const cell = self.cellAt(x, y);
     self.terminal.screen.selection.start(cell.row, cell.col, .normal);
     c.gtk_widget_queue_draw(@ptrCast(self.area));
