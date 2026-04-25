@@ -54,6 +54,9 @@ pub const Pane = struct {
     /// Forward iTerm2 / OSC 777 desktop notifications.
     win_notify_ctx: ?*anyopaque = null,
     win_on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
+    /// Forward BEL events for tab-bar attention.
+    win_bell_ctx: ?*anyopaque = null,
+    win_on_bell: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
     /// Cursor blink timing.
     last_blink_us: i64 = 0,
     /// Last reported mouse-motion cell, to suppress duplicates.
@@ -90,6 +93,7 @@ pub const Pane = struct {
         terminal.on_title = onTitleEvent;
         terminal.on_clipboard_set = onClipboardEvent;
         terminal.on_notification = onNotificationEvent;
+        terminal.on_bell = onBellEvent;
 
         _ = c.g_signal_connect_data(
             area_widget,
@@ -341,6 +345,11 @@ fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {
 fn onNotificationEvent(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
     if (self.win_on_notification) |f| f(self.win_notify_ctx, title, body);
+}
+
+fn onBellEvent(ctx: ?*anyopaque) void {
+    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    if (self.win_on_bell) |f| f(self.win_bell_ctx, self);
 }
 
 fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {

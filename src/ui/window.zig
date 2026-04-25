@@ -223,6 +223,8 @@ pub const Window = struct {
         pane.win_on_clipboard = onTermClipboardSet;
         pane.win_notify_ctx = @ptrCast(self);
         pane.win_on_notification = onTermNotification;
+        pane.win_bell_ctx = @ptrCast(self);
+        pane.win_on_bell = onTermBell;
         // Title forwarding intentionally null — tab titles are sticky.
 
         // Wrap pane.widget() in a Box so we can swap it for a Paned
@@ -664,6 +666,25 @@ fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
     c.gdk_clipboard_set_text(clip, cstr.ptr);
 }
 
+fn onTermBell(ctx: ?*anyopaque, pane: *Pane) void {
+    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    // Find the AdwTabPage whose widget tree contains this pane and
+    // mark it needs-attention (unless it's the currently selected one).
+    const n = c.adw_tab_view_get_n_pages(self.tab_view);
+    const selected = c.adw_tab_view_get_selected_page(self.tab_view);
+    var i: c_int = 0;
+    while (i < n) : (i += 1) {
+        const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
+        if (page == null or page == selected) continue;
+        const child = c.adw_tab_page_get_child(page);
+        if (child == null) continue;
+        if (widgetIsAncestor(@ptrCast(child), pane.widget())) {
+            c.adw_tab_page_set_needs_attention(page, 1);
+            return;
+        }
+    }
+}
+
 fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {
     const self: *Window = @ptrCast(@alignCast(ctx.?));
     const app = c.gtk_window_get_application(@ptrCast(self.app_window));
@@ -689,6 +710,8 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
     const self: *Window = @ptrCast(@alignCast(user.?));
     const page = c.adw_tab_view_get_selected_page(view);
     if (page == null) return;
+    // Clear any needs-attention from the now-active tab.
+    c.adw_tab_page_set_needs_attention(page, 0);
     const child = c.adw_tab_page_get_child(page);
     if (child == null) return;
     // Find the first Pane whose widget is a descendant of `child`.
