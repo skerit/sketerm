@@ -412,3 +412,99 @@ following:
 - **Scrollback position indicator** — thin track on the right edge
   with a thumb showing the visible window inside (scrollback +
   active). Subtle when at bottom, accent when scrolled back.
+
+## Autonomous run (M11–M17, post user-handoff)
+
+Cron-driven session: cron fires every 30 minutes. User left for
+extended period after asking for image fix + remainder of plan-v2.
+
+Work delivered, in order:
+
+### Image render regression fix (M11.0)
+- Found the bug: emberglyph (and the kitty spec generally) sends
+  multi-chunk transmits where continuation chunks omit `i=`. Our
+  Manager keyed accums by image_id, so `i=0` continuations never
+  matched the in-progress accumulator and were silently dropped.
+- Fix in `kitty_images.zig`: track `active_transmit_id`; route
+  continuation chunks (action=.unknown, i=0) to it. Bonus: parse
+  Kitty placement params `c=`/`r=` (cell-grid scale), `x/y/w/h`
+  (source-rect crop), `C=` (no-cursor-move). Renderer scales to
+  cells_wide×cell_w / cells_high×cell_h and crops via UV.
+- `ImageStore.addFull` replaces existing (image_id, placement_id)
+  to stop emberglyph's per-frame re-placement from leaking entries.
+- 7 pipeline integration tests confirm receive path works for
+  every documented format/transmission combo.
+
+### Headless GL smoke (CI) — `zig build smoke-image`
+- `src/smoke_image.zig` opens an EGL surfaceless context (Mesa
+  PLATFORM_SURFACELESS_MESA), creates a 256×64 FBO, drives ImagePass
+  + ImageStore with a 32×32 red RGBA image, glReadPixels, asserts
+  red samples in the upper-left. PASSES on NVIDIA EGL 1.5 / GL ES
+  3.2. Catches GL-side regressions without a display server.
+
+### M14 — OSC 133 prompt navigation
+- `Line.id: u64` assigned at line birth; `Screen.next_line_id`
+  monotonic counter. ID follows the content through scroll, alt
+  swap, reflow, resize.
+- `prompt_marks: [256]u64` (was [256]i32 of row numbers); marks
+  resolve via `rowForLineId` regardless of how far content scrolled.
+- `Screen.jumpPrev/NextPrompt` walks marks, sets view_offset.
+- Ctrl+Shift+Up/Down keybinds → Window.jumpPromptOnFocused.
+
+### M15 — Kitty progressive-enhancement keyboard (level 1)
+- Parse `CSI > N u` (set), `CSI = N;M u` (set/push/pop), `CSI < N u`
+  (pop), `CSI ? u` (query → `CSI ? flags u`). 9-deep stack.
+- Encoder honours the disambiguate flag (0x01): Tab/Enter/Esc/BS
+  emit `CSI N u`; Ctrl/Alt + ASCII letter emit `CSI <lc>;mods u`
+  so apps distinguish Ctrl+I from Tab.
+
+### M13 — Bidi + complex-script shaping via fribidi
+- Linked system fribidi (~50 KB, what foot uses).
+- `src/grid/bidi.zig` wraps `fribidi_get_par_embedding_levels_ex`
+  + visual-order remap.
+- `grid_pass.emitGlyphsForLine`: lines with non-ASCII codepoints
+  go through bidi resolution + visual reorder; pure-ASCII fast-
+  paths skip fribidi entirely.
+- Dropped `runIsPureAscii` — HB shapes Arabic/Indic/etc. correctly
+  with `hb_buffer_guess_segment_properties` already in.
+- Cursor positioning in mixed bidi text not yet visual-aware
+  (logical column only). v1 limitation.
+
+### M12 — DECDHL / DECDWL / DECSWL per-line scaling
+- `Line.scaling: enum {single, dwl, dhl_top, dhl_bot}`. ESC
+  #3/#4/#5/#6 stamp the cursor's line. clear() resets.
+- Renderer dilates x by 2× for dwl + dhl_*; y by 2× for dhl_*
+  with origin shift so a 2-line dhl_top/bot pair renders one
+  big character spanning both rows.
+
+### M11 — DECSCNM + DECCOLM + VT52
+- DECSCNM (CSI ?5 h/l): `Screen.reverse_screen` flag; renderer
+  swaps default fg/bg before resolving cells.
+- DECCOLM (CSI ?3 h/l) gated by DECSET 40 (`allow_decolm`).
+  Toggles screen between 80 and 132 cols, clears, homes, resets
+  margins. Doesn't resize the GTK window.
+- VT52 mode (DECRST 2): Parser flag + handleVt52Escape; ESC
+  <X> for X ∈ A/B/C/D/H/I/J/K/Y/Z/=/>/< translates to equivalent
+  CSI events. Wired via `Sink.on_decanm` → Terminal flips
+  `parser.vt52_mode`.
+
+### M17 polish
+
+- **M17.2** `o=z` zlib decompression in kitty graphics. Uses
+  `std.compress.flate` with the `.zlib` container.
+- **M17.4** Image re-upload after GL context loss. flushUploads
+  retains `pending` after upload; forgetGL just zeros gl_tex.
+  Memory cost: width*height*4 per active image, persistent until
+  delete dispatch. Images now survive splits / pane shuffles.
+- **M17.5** Context-aware right-click "Copy Link" for OSC 8
+  cells. menu.attachWithPrePopup fires a callback before popup;
+  pane checks the cell at click coords for has_link, toggles
+  term.copy-link enabled state, stashes URI for activate.
+
+### Status snapshot
+- 305 tests pass.
+- All M0–M15 milestones in plan-v2 done.
+- M16 (perf) deferred — not the bottleneck; current path runs
+  fine on hardware GPU.
+- M17.1 (atlas multi-page LRU), M17.3 (kitty animation frames),
+  M17.6 (Save Layout As dialog) still on the table.
