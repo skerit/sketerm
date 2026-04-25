@@ -43,6 +43,19 @@ pub const Window = struct {
             .tab_view = @ptrCast(tab_view_w),
             .allocator = allocator,
         };
+
+        // When a tab is removed (close button, Ctrl+Shift+W, etc),
+        // tear down the Pane + Terminal Zig-side state. AdwTabView
+        // emits "page-detached" after the page is gone.
+        _ = c.g_signal_connect_data(
+            tab_view_w,
+            "page-detached",
+            @ptrCast(&onPageDetached),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+
         return self;
     }
 
@@ -652,4 +665,44 @@ fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) voi
     defer c.g_object_unref(notif);
     if (body.len > 0) c.g_notification_set_body(notif, body_z.ptr);
     c.g_application_send_notification(@ptrCast(app), null, notif);
+}
+
+/// Tear down all Zig-side panes + terminals that lived in this
+/// AdwTabPage's widget tree. Called when the user closes a tab.
+fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    const child = c.adw_tab_page_get_child(page);
+    if (child == null) return;
+    collectAndFreePanes(self, @ptrCast(child));
+}
+
+fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
+    // Walk the widget tree under `root` (Box / Paned / GLArea), find
+    // matching Panes by their .widget(), and free them + their Terminal.
+    var i: usize = 0;
+    while (i < self.panes.items.len) {
+        const pane = self.panes.items[i];
+        if (widgetIsAncestor(root, pane.widget())) {
+            const term = pane.terminal;
+            _ = self.panes.orderedRemove(i);
+            for (self.terminals.items, 0..) |t, ti| {
+                if (t == term) {
+                    _ = self.terminals.orderedRemove(ti);
+                    break;
+                }
+            }
+            term.deinit();
+            pane.deinit();
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn widgetIsAncestor(ancestor: *c.GtkWidget, w: *c.GtkWidget) bool {
+    var cur: ?*c.GtkWidget = w;
+    while (cur) |x| : (cur = c.gtk_widget_get_parent(x)) {
+        if (x == ancestor) return true;
+    }
+    return false;
 }
