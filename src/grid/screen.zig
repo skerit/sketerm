@@ -2428,6 +2428,39 @@ test "parseColor handles rgb: and #RRGGBB" {
     try std.testing.expect(Screen.parseColor("not a color") == null);
 }
 
+test "OSC 133 ; A records prompt mark" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 3);
+    defer s.deinit();
+    s.row = 1;
+    s.onOsc("133;A");
+    try std.testing.expectEqual(@as(u16, 1), s.prompt_marks_len);
+    try std.testing.expectEqual(@as(i32, 1), s.prompt_marks[0]);
+    s.row = 2;
+    s.onOsc("133;A");
+    try std.testing.expectEqual(@as(u16, 2), s.prompt_marks_len);
+    try std.testing.expectEqual(@as(i32, 2), s.prompt_marks[1]);
+}
+
+test "XTMODKEYS sets modify_other_keys level" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    var csi = Event.Csi{};
+    csi.private = '>';
+    csi.params[0] = 4;
+    csi.params[1] = 1;
+    csi.n_params = 2;
+    csi.final = 'm';
+    s.csi(csi);
+    try std.testing.expectEqual(@as(u8, 1), s.modify_other_keys);
+    csi.params[1] = 2;
+    s.csi(csi);
+    try std.testing.expectEqual(@as(u8, 2), s.modify_other_keys);
+}
+
 test "DA1 advertises sixel + color" {
     const TestSink = struct {
         var captured: [64]u8 = undefined;
