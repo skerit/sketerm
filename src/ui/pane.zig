@@ -65,12 +65,6 @@ pub const Pane = struct {
     /// xterm button code (0=L,1=M,2=R) currently held, or -1 = none.
     /// Used by DECSET 1002 button-event tracking.
     held_button: i32 = -1,
-    /// Has the tick callback fired at least once? Used purely for
-    /// the "first tick observed" stderr log so split-debug can
-    /// confirm whether GTK is calling tick on the new pane.
-    tick_seen: bool = false,
-    render_seen: bool = false,
-    resize_seen: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -255,7 +249,6 @@ pub const Pane = struct {
 
 fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
-    std.debug.print("sketerm: pane realize (pane={x})\n", .{@intFromPtr(self)});
     c.gtk_gl_area_make_current(area);
     if (c.gtk_gl_area_get_error(area) != null) {
         const err = c.gtk_gl_area_get_error(area);
@@ -277,8 +270,6 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     self.grid_pass.forgetGL();
     self.image_pass.forgetGL();
     self.image_store.forgetGL();
-    self.render_seen = false;
-    self.resize_seen = false;
 
     // Try each candidate font in order until one works. The
     // SKETERM_FONT env var (when set, must be an absolute path to a
@@ -319,19 +310,10 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     // Cell metrics into image store so placements get pixel coords.
     self.image_store.cell_w = @floatFromInt(self.atlas.?.cell_w);
     self.image_store.cell_h = @floatFromInt(self.atlas.?.cell_h);
-    std.debug.print("sketerm: pane realize complete (pane={x} cell={d}x{d})\n", .{
-        @intFromPtr(self), self.atlas.?.cell_w, self.atlas.?.cell_h,
-    });
 }
 
 fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Pane = @ptrCast(@alignCast(user.?));
-    if (!self.render_seen) {
-        self.render_seen = true;
-        std.debug.print("sketerm: pane render first-fire (pane={x} atlas={s})\n", .{
-            @intFromPtr(self), if (self.atlas == null) "null" else "ok",
-        });
-    }
     const atlas = self.atlas orelse return @intFromBool(false);
 
     const w = c.gtk_widget_get_width(@ptrCast(area));
@@ -390,10 +372,6 @@ fn onBellEvent(ctx: ?*anyopaque) void {
 
 fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Pane = @ptrCast(@alignCast(user.?));
-    if (!self.tick_seen) {
-        self.tick_seen = true;
-        std.debug.print("sketerm: pane tick first-fire (pane={x})\n", .{@intFromPtr(self)});
-    }
 
     // Cursor blink — toggle every 500ms for blinking shapes.
     const screen = self.terminal.screen;
@@ -639,10 +617,6 @@ fn onScroll(_: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
 
 fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
-    if (!self.resize_seen) {
-        self.resize_seen = true;
-        std.debug.print("sketerm: pane resize first-fire (pane={x}) {d}x{d}\n", .{ @intFromPtr(self), width, height });
-    }
     const atlas = self.atlas orelse return;
     if (atlas.cell_w == 0 or atlas.cell_h == 0) return;
     const cols: u16 = @intCast(@max(1, @divFloor(width, @as(c_int, atlas.cell_w))));
