@@ -31,6 +31,8 @@ pub const Accum = struct {
     width: u32,
     height: u32,
     medium: u8,
+    /// Compression flag from the first chunk (`o=z` → 1).
+    compression: u32,
     /// Original action from the first chunk — drives whether
     /// finalize triggers a place.
     action: kitty.Action,
@@ -145,6 +147,7 @@ pub const Manager = struct {
                         .width = cmd.width,
                         .height = cmd.height,
                         .medium = cmd.medium,
+                        .compression = cmd.compression,
                         .action = cmd.action,
                     }) catch return default;
                     self.active_transmit_id = effective_id;
@@ -238,6 +241,28 @@ pub const Manager = struct {
             owned_file_data = data;
             raw_bytes = data;
             if (acc.medium == 't') std.fs.deleteFileAbsolute(path) catch {};
+        }
+
+        // Optional zlib decompression (`o=z`). Tools rarely set this
+        // for PNG (already deflate-encoded); it shows up for raw
+        // f=24/32 payloads. Use std.compress.flate with the .zlib
+        // container.
+        var owned_inflated: ?[]u8 = null;
+        defer if (owned_inflated) |b| self.allocator.free(b);
+        if (acc.compression == 1) {
+            var src_reader: std.Io.Reader = .fixed(raw_bytes);
+            const flate = std.compress.flate;
+            var window: [flate.max_window_len]u8 = undefined;
+            var dec: flate.Decompress = .init(&src_reader, .zlib, &window);
+            var aw: std.Io.Writer.Allocating = .init(self.allocator);
+            errdefer aw.deinit();
+            _ = dec.reader.streamRemaining(&aw.writer) catch {
+                aw.deinit();
+                return false;
+            };
+            const inflated = aw.toOwnedSlice() catch return false;
+            owned_inflated = inflated;
+            raw_bytes = inflated;
         }
 
         // Decode according to format.
