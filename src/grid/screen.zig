@@ -1615,49 +1615,62 @@ pub const Screen = struct {
     }
 
     /// Bulk-print fast path for `print_run` events. Returns true iff
-    /// the entire run was handled here; false means caller should fall
-    /// back to per-byte. Eligibility (in order of cost):
-    ///   - UTF-8 decoder idle, every byte printable ASCII (≤ 0x7E,
-    ///     ≥ 0x20).
-    ///   - charset_g0 == ASCII, active_charset == g0 (or g1 ASCII).
-    ///   - !insert_mode, !pending_wrap, no cluster store entries,
-    ///     run fits on current row (col + len ≤ cols).
-    /// When eligible we do one tight loop of cell writes — no
-    /// charset translation, no cluster check per cell, no per-cell
-    /// wrap test. Skips one function call per byte plus the autowrap
-    /// + cluster checks inside printCp.
+    /// the entire run was handled here; false means caller should
+    /// fall back to per-byte. Handles wrap mid-run via lineFeed —
+    /// matches printCp's autowrap semantics, including
+    /// `Line.continues_above = true` on the new row.
+    ///
+    /// Eligibility:
+    ///   - UTF-8 decoder idle.
+    ///   - Every byte printable ASCII (0x20..0x7E).
+    ///   - Active charset = ASCII.
+    ///   - !insert_mode, !pending_wrap, cluster store empty.
     fn applyPrintRunFast(self: *Screen, run: *const Event.PrintRun) bool {
         if (self.decoder.expected != 0) return false;
         if (self.insert_mode) return false;
         if (self.pending_wrap) return false;
         if (self.clusters.count() != 0) return false;
-        // Charset must pass through ASCII unchanged.
         const active = if (self.active_charset == .g0) self.charset_g0 else self.charset_g1;
         if (active != .ascii) return false;
-        // Bytes must all be printable ASCII (no LF/CR/BS hidden).
         if (!runIsAscii(run.bytes[0..run.len])) return false;
-        // Must fit on current row.
-        const len: u16 = @intCast(run.len);
-        if (self.col + len > self.cols) return false;
 
-        var ln = self.line(self.row);
+        const total: u16 = @intCast(run.len);
         const link_id = self.current_link_id;
         const flags: u8 = if (link_id != 0) 0b0000_0100 else 0;
         const style = self.cur_style;
-        var k: u16 = 0;
-        while (k < len) : (k += 1) {
-            ln.cells[self.col + k] = .{
-                .rune = run.bytes[k],
-                .style_ref = style,
-                .flags = flags,
-                .reserved = link_id,
-            };
+        var i: u16 = 0;
+        while (i < total) {
+            // How many bytes fit on the current row.
+            const remaining: u16 = if (self.col >= self.cols) 0 else self.cols - self.col;
+            if (remaining == 0) {
+                // pending_wrap was false on entry; if we got here
+                // it's because we just filled the row and need to
+                // actually wrap before continuing. autowrap off →
+                // drop the rest.
+                if (!self.autowrap) break;
+                self.lineFeed();
+                self.col = 0;
+                self.line(self.row).continues_above = true;
+                continue;
+            }
+            const can_write: u16 = @min(total - i, remaining);
+            var ln = self.line(self.row);
+            var k: u16 = 0;
+            while (k < can_write) : (k += 1) {
+                ln.cells[self.col + k] = .{
+                    .rune = run.bytes[i + k],
+                    .style_ref = style,
+                    .flags = flags,
+                    .reserved = link_id,
+                };
+            }
+            ln.dirty = true;
+            self.last_print_cp = run.bytes[i + can_write - 1];
+            self.last_print_key = cellKey(self.row, self.col + can_write - 1);
+            self.col += can_write;
+            i += can_write;
         }
-        ln.dirty = true;
-        // REP support: track the last printed cp + position.
-        self.last_print_cp = run.bytes[len - 1];
-        self.last_print_key = cellKey(self.row, self.col + len - 1);
-        self.col += len;
+        // Final column / pending-wrap state matches printCp.
         if (self.col >= self.cols) {
             if (self.autowrap) {
                 self.col = self.cols - 1;
