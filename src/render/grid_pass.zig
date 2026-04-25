@@ -185,18 +185,21 @@ pub const GridPass = struct {
             }
         }
 
-        // Selection overlay (translucent).
-        if (screen.selection.isActive() and view_off == 0) {
+        // Selection overlay (translucent). Maps selection rows
+        // (which use 0..rows-1 for active screen and negative for
+        // scrollback) into widget visible rows via view_off.
+        if (screen.selection.isActive()) {
             const r_opt = screen.selection.rect();
             if (r_opt) |r| {
                 var sr = r.top_row;
                 while (sr <= r.bot_row) : (sr += 1) {
-                    if (sr < 0 or sr >= screen.rows) continue;
+                    const visible_row: i32 = sr + @as(i32, @intCast(view_off));
+                    if (visible_row < 0 or visible_row >= @as(i32, @intCast(screen.rows))) continue;
                     const start_col: i32 = if (sr == r.top_row) r.top_col else 0;
                     const end_col: i32 = if (sr == r.bot_row) r.bot_col else screen.cols;
                     if (end_col <= start_col) continue;
                     const x: f32 = @as(f32, @floatFromInt(@max(0, start_col))) * cw;
-                    const y: f32 = @as(f32, @floatFromInt(sr)) * ch;
+                    const y: f32 = @as(f32, @floatFromInt(visible_row)) * ch;
                     const w: f32 = @as(f32, @floatFromInt(end_col - @max(0, start_col))) * cw;
                     try self.pushQuad(
                         .{ x, y },
