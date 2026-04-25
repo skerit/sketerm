@@ -444,8 +444,36 @@ pub const Window = struct {
     }
 
     pub fn loadLayoutFromPath(self: *Window, path: []const u8) !bool {
+        if (std.mem.endsWith(u8, path, ".layout")) {
+            return self.loadLayoutSimple(path);
+        }
         var parsed = layout_mod.load(self.allocator, path) catch |err| {
             std.debug.print("sketerm: cannot load layout from {s}: {s}\n", .{ path, @errorName(err) });
+            return false;
+        };
+        defer parsed.deinit();
+        for (parsed.value.tabs) |tab| {
+            self.newTabFromSpec(tab) catch |err| {
+                std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
+            };
+        }
+        return true;
+    }
+
+    fn loadLayoutSimple(self: *Window, path: []const u8) !bool {
+        const layout_simple = @import("../layout_simple.zig");
+        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+            std.debug.print("sketerm: cannot open {s}: {s}\n", .{ path, @errorName(err) });
+            return false;
+        };
+        defer file.close();
+        const bytes = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            std.debug.print("sketerm: read {s}: {s}\n", .{ path, @errorName(err) });
+            return false;
+        };
+        defer self.allocator.free(bytes);
+        var parsed = layout_simple.parse(self.allocator, bytes) catch |err| {
+            std.debug.print("sketerm: parse {s}: {s}\n", .{ path, @errorName(err) });
             return false;
         };
         defer parsed.deinit();

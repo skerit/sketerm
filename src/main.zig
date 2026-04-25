@@ -23,7 +23,7 @@ const HELP_TEXT =
     \\
     \\Options:
     \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json
-    \\  --layout <path>       Load tabs from specific JSON layout file
+    \\  --layout <path>       Load tabs from a layout file (.json or .layout)
     \\  --no-save             Don't write last.json on exit
     \\  --debug-events        Print parser events to stderr
     \\  --help                Show this message
@@ -47,6 +47,20 @@ const HELP_TEXT =
     \\Environment:
     \\  SKETERM_FONT          Override font (absolute path to .ttf/.otf)
     \\  SKETERM_SCROLLBACK    Scrollback line capacity (default 10000)
+    \\
+    \\Layout file (.layout) — one tab per top-level line, 2-space indent.
+    \\Inside a tab, use `pane <command...> [@ <cwd>]` for a single pane,
+    \\or `hsplit` / `vsplit` followed by two indented children for splits
+    \\(splits can nest). Lines beginning with `#` are comments. Example:
+    \\
+    \\    Dev
+    \\      hsplit
+    \\        pane bash @ /tmp
+    \\        pane fish @ /home
+    \\    Logs
+    \\      pane less /var/log/syslog
+    \\
+    \\See data/sample.layout for a fuller example.
     \\
 ;
 

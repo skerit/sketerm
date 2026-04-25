@@ -1,0 +1,44 @@
+# sketerm sample layout. Run: `sketerm --layout data/sample.layout`
+#
+# Format
+# ------
+# - Lines starting with `#` are comments.
+# - Blank lines are ignored.
+# - 2 spaces per indent level.
+# - Top-level (column 0): a tab title — anything on the line.
+# - Indent level 1 (2 spaces): a tree node — one of:
+#     pane <command...> [@ <cwd>]
+#     hsplit                        ← two children at the next indent
+#     vsplit                        ← two children at the next indent
+# - Splits can nest arbitrarily.
+# - The command is split on spaces (no quote handling — for commands
+#   that need quoting, use the .json format).
+# - Default cwd is `/` if `@ <path>` is omitted.
+
+# Single pane running bash in /tmp.
+Dev
+  pane bash @ /tmp
+
+# Two panes side-by-side: editor on the left, REPL on the right.
+Code
+  hsplit
+    pane vim @ /home/skerit/projects/sketerm
+    pane bash @ /home/skerit
+
+# Two panes stacked: build output on top, log tail on bottom.
+Build
+  vsplit
+    pane cargo build --release @ /home/skerit/projects/foo
+    pane tail -f /var/log/syslog
+
+# Three-way layout: left half = editor, right half split top/bottom.
+Big
+  hsplit
+    pane vim @ /home/skerit/projects/sketerm
+    vsplit
+      pane bash @ /home/skerit
+      pane htop
+
+# Plain follow-the-system-log.
+Logs
+  pane less /var/log/syslog
