@@ -30,6 +30,10 @@ pub const Command = struct {
     more: u32 = 0,
     /// Transmission medium (`t=`): d=direct, t=tempfile, s=shmem, f=file.
     medium: u8 = 'd',
+    /// Delete subcommand (`d=`): A=all, I=intersect cursor, N=image_number,
+    /// R=z-range, P=placement, plus lowercase variants that don't free
+    /// data. Default 'a' (all visible). Only inspected when action=delete.
+    delete_what: u8 = 'a',
     /// Raw payload after the ';'. May be empty.
     payload: []const u8 = &.{},
 };
@@ -95,6 +99,9 @@ fn applyKv(cmd: *Command, key: []const u8, val: []const u8) void {
         'm' => cmd.more = parseUint(val),
         't' => if (val.len > 0) {
             cmd.medium = val[0];
+        },
+        'd' => if (val.len > 0) {
+            cmd.delete_what = val[0];
         },
         else => {},
     }

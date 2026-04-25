@@ -91,7 +91,7 @@ pub const Pane = struct {
         // forwarded to Window if its sinks are set.
         terminal.user_ctx = @ptrCast(self);
         terminal.on_image = onImageEvent;
-        terminal.on_image_delete = onImageDeleteEvent;
+        terminal.on_image_delete_full = onImageDeleteFullEvent;
         terminal.on_title = onTitleEvent;
         terminal.on_clipboard_set = onClipboardEvent;
         terminal.on_notification = onNotificationEvent;
@@ -353,9 +353,32 @@ fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
     self.terminal.screen.dirty = true;
 }
 
-fn onImageDeleteEvent(ctx: ?*anyopaque, image_id: u32) void {
+fn onImageDeleteFullEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Screen.ImageDeleteEvent) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
-    if (image_id == 0) self.image_store.markAllForDelete() else self.image_store.markByIdForDelete(image_id);
+    // Kitty `d=` semantics. Lowercase leaves data on disk, uppercase
+    // also frees it. We don't distinguish on free behaviour — every
+    // delete tears down the GL texture on the next flush.
+    switch (ev.what) {
+        'a', 'A' => self.image_store.markAllForDelete(),
+        'i', 'I' => {
+            if (ev.image_id != 0) self.image_store.markByIdForDelete(ev.image_id);
+        },
+        'p', 'P' => {
+            if (ev.image_id != 0) self.image_store.markByPlacementForDelete(ev.image_id, ev.placement_id);
+        },
+        // 'n','N' (image_number), 'r','R' (z-range), 'x','y','c'
+        // (coordinates), 'z','Z' (z-index): not yet implemented.
+        // Fallback: if we have an image_id, scope the delete to that
+        // image; otherwise leave images alone rather than nuke all.
+        else => {
+            if (ev.image_id != 0) {
+                if (ev.placement_id != 0)
+                    self.image_store.markByPlacementForDelete(ev.image_id, ev.placement_id)
+                else
+                    self.image_store.markByIdForDelete(ev.image_id);
+            }
+        },
+    }
     self.terminal.screen.dirty = true;
 }
 

@@ -222,8 +222,19 @@ pub const Screen = struct {
         on_cwd: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
         on_image: ?*const fn (ctx: ?*anyopaque, img: ImageEvent) void = null,
         on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
-        /// Kitty delete dispatch. id=0 means "all visible images".
-        on_image_delete: ?*const fn (ctx: ?*anyopaque, image_id: u32) void = null,
+        /// Kitty delete dispatch with full delete-action context.
+        on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: ImageDeleteEvent) void = null,
+    };
+
+    pub const ImageDeleteEvent = struct {
+        /// 0 = delete-all-images. Otherwise the specific image.
+        image_id: u32 = 0,
+        /// 0 = any placement of the image. Otherwise specific.
+        placement_id: u32 = 0,
+        /// 'a'=all, 'i'=intersect cursor, 'p'=specific placement,
+        /// 'r'=z-range. Lowercase = leave data on disk; uppercase
+        /// = also free data. We don't distinguish on free behaviour.
+        what: u8 = 'a',
     };
 
     pub const ImageEvent = struct {
@@ -797,7 +808,7 @@ pub const Screen = struct {
         return if (self.links.get(link_id)) |u| u else null;
     }
 
-    fn onApc(self: *Screen, body: []const u8) void {
+    pub fn onApc(self: *Screen, body: []const u8) void {
         // Kitty graphics protocol: APC G=...
         if (body.len < 1 or body[0] != 'G') return;
         const kitty = @import("../parser/kitty_image.zig");
@@ -815,7 +826,11 @@ pub const Screen = struct {
         // Delete action — fire the sink so the Pane's ImageStore
         // marks matching textures for GL-side cleanup.
         if (cmd.action == .delete) {
-            if (self.sink.on_image_delete) |f| f(self.sink.ctx, cmd.image_id);
+            if (self.sink.on_image_delete_full) |f| f(self.sink.ctx, .{
+                .image_id = cmd.image_id,
+                .placement_id = cmd.placement_id,
+                .what = cmd.delete_what,
+            });
             self.dirty = true;
             return;
         }

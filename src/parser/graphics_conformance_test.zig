@@ -57,3 +57,103 @@ test "graphics: unknown action defaults sanely" {
     const cmd = kitty.parse("Ga=Z,i=7") catch return;
     try std.testing.expectEqual(@as(u32, 7), cmd.image_id);
 }
+
+test "graphics: delete d=a (default 'all visible')" {
+    const cmd = try kitty.parse("Ga=d");
+    try std.testing.expectEqual(kitty.Action.delete, cmd.action);
+    // Default delete_what when no `d=` provided is 'a'.
+    try std.testing.expectEqual(@as(u8, 'a'), cmd.delete_what);
+}
+
+test "graphics: delete d=A (delete-all freeing data)" {
+    const cmd = try kitty.parse("Ga=d,d=A");
+    try std.testing.expectEqual(@as(u8, 'A'), cmd.delete_what);
+}
+
+test "graphics: delete d=i picks image by id" {
+    const cmd = try kitty.parse("Ga=d,d=i,i=42");
+    try std.testing.expectEqual(@as(u8, 'i'), cmd.delete_what);
+    try std.testing.expectEqual(@as(u32, 42), cmd.image_id);
+}
+
+test "graphics: delete d=p targets placement" {
+    const cmd = try kitty.parse("Ga=d,d=p,i=5,p=99");
+    try std.testing.expectEqual(@as(u8, 'p'), cmd.delete_what);
+    try std.testing.expectEqual(@as(u32, 5), cmd.image_id);
+    try std.testing.expectEqual(@as(u32, 99), cmd.placement_id);
+}
+
+test "graphics: delete d=z carries z reference" {
+    const cmd = try kitty.parse("Ga=d,d=z,z=-3");
+    try std.testing.expectEqual(@as(u8, 'z'), cmd.delete_what);
+    try std.testing.expectEqual(@as(i32, -3), cmd.z);
+}
+
+// Exercise the Screen-side delete sink to confirm the full event
+// reaches us with the parsed delete_what + image_id + placement_id.
+test "graphics: delete dispatched via Screen.sink as full event" {
+    const Screen = @import("../grid/screen.zig").Screen;
+    const Pool = @import("../grid/style_pool.zig").Pool;
+    const allocator = std.testing.allocator;
+
+    var pool = try Pool.init(allocator);
+    defer pool.deinit();
+
+    var screen = try Screen.init(allocator, &pool, 20, 5);
+    defer screen.deinit();
+
+    const Capture = struct {
+        var captured: ?Screen.ImageDeleteEvent = null;
+        fn sink(_: ?*anyopaque, ev: Screen.ImageDeleteEvent) void {
+            captured = ev;
+        }
+    };
+    Capture.captured = null;
+    screen.sink = .{
+        .ctx = null,
+        .on_image_delete_full = Capture.sink,
+    };
+
+    // Feed an APC that asks for delete by placement (i=7,p=11,d=p).
+    const apc_body = "Ga=d,d=p,i=7,p=11";
+    screen.onApc(apc_body);
+
+    try std.testing.expect(Capture.captured != null);
+    try std.testing.expectEqual(@as(u32, 7), Capture.captured.?.image_id);
+    try std.testing.expectEqual(@as(u32, 11), Capture.captured.?.placement_id);
+    try std.testing.expectEqual(@as(u8, 'p'), Capture.captured.?.what);
+}
+
+test "graphics: ImageStore.markByPlacementForDelete + flush teardown" {
+    const ImageStore = @import("../grid/image_store.zig").Store;
+    const allocator = std.testing.allocator;
+
+    var s = ImageStore.init(allocator);
+    defer s.deinit();
+
+    // 4×4 RGBA stub.
+    var px: [4 * 4 * 4]u8 = undefined;
+    @memset(&px, 0xFF);
+
+    try s.addWithPlacement(&px, 4, 4, 0, 0, 1, 100, 0);
+    try s.addWithPlacement(&px, 4, 4, 0, 0, 1, 200, 0);
+    try s.addWithPlacement(&px, 4, 4, 0, 0, 2, 100, 0);
+
+    // Delete just (image=1, placement=200).
+    s.markByPlacementForDelete(1, 200);
+
+    var deleting_count: usize = 0;
+    for (s.images.items) |img| {
+        if (img.deleting) deleting_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), deleting_count);
+
+    // Now placement_id=0 should match all of image_id=1.
+    s.markByPlacementForDelete(1, 0);
+
+    deleting_count = 0;
+    for (s.images.items) |img| {
+        if (img.deleting) deleting_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), deleting_count);
+}
