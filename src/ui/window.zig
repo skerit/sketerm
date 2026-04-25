@@ -161,6 +161,19 @@ pub const Window = struct {
             c.G_CONNECT_DEFAULT,
         );
 
+        // Theme reactivity — when AdwStyleManager flips dark/light
+        // (system-driven or user toggle), repaint every pane with
+        // updated default colours (only when auto_theme is on).
+        const sm = c.adw_style_manager_get_default();
+        _ = c.g_signal_connect_data(
+            @ptrCast(sm),
+            "notify::dark",
+            @ptrCast(&onThemeChanged),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+
         return self;
     }
 
@@ -309,6 +322,7 @@ pub const Window = struct {
 
         const page = c.adw_tab_view_append(self.tab_view, wrapper);
         c.adw_tab_page_set_title(page, title_z.ptr);
+        c.adw_tab_page_set_tooltip(page, title_z.ptr);
     }
 
     fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree) !*c.GtkWidget {
@@ -431,6 +445,8 @@ pub const Window = struct {
 
         const page = c.adw_tab_view_append(self.tab_view, wrapper);
         c.adw_tab_page_set_title(page, title_z);
+        // Full-title tooltip — useful when titles are truncated.
+        c.adw_tab_page_set_tooltip(page, title_z);
 
         try self.panes.append(self.allocator, pane);
         try self.terminals.append(self.allocator, term);
@@ -1028,6 +1044,20 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
     }
 }
 
+fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    if (!self.config.auto_theme) return;
+    const fg_bg = self.resolveDefaultColors();
+    for (self.panes.items) |p| {
+        p.grid_pass.default_fg = fg_bg.fg;
+        p.grid_pass.default_bg = fg_bg.bg;
+        p.terminal.screen.default_fg = fg_bg.fg;
+        p.terminal.screen.default_bg = fg_bg.bg;
+        p.terminal.screen.dirty = true;
+        c.gtk_widget_queue_draw(p.widget());
+    }
+}
+
 fn applyPanedRatio(paned: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     applyPanedRatioImpl(@ptrCast(paned), user);
 }
@@ -1060,7 +1090,10 @@ fn freePanedRatio(user: ?*anyopaque) callconv(.c) void {
 fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     const ctx: *Window.RenameCtx = @ptrCast(@alignCast(user.?));
     const text = c.gtk_editable_get_text(@ptrCast(entry));
-    if (text != null) c.adw_tab_page_set_title(ctx.page, text);
+    if (text != null) {
+        c.adw_tab_page_set_title(ctx.page, text);
+        c.adw_tab_page_set_tooltip(ctx.page, text);
+    }
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
     // ctx is freed via GDestroyNotify (freeRenameCtx) when the
     // signal closure is destroyed.
