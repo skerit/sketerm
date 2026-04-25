@@ -128,11 +128,12 @@ pub const Pane = struct {
         );
         c.gtk_widget_add_controller(area_widget, @ptrCast(scroll_ctrl));
 
-        // Left-button drag → selection.
+        // Left-button drag → selection (and ctrl-click on links).
         const drag = c.gtk_gesture_drag_new();
         c.gtk_gesture_single_set_button(@ptrCast(drag), 1);
         _ = c.g_signal_connect_data(drag, "drag-begin", @ptrCast(&onDragBegin), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(drag, "drag-update", @ptrCast(&onDragUpdate), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(drag, "drag-end", @ptrCast(&onDragEnd), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(area_widget, @ptrCast(drag));
 
         // Right-click → context menu.
@@ -347,6 +348,38 @@ fn onDragUpdate(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callc
     const cell = self.cellAt(sx + dx, sy + dy);
     self.terminal.screen.selection.extend(cell.row, cell.col);
     c.gtk_widget_queue_draw(@ptrCast(self.area));
+}
+
+fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+
+    // Tiny drags = a click. If Ctrl was held and the click landed on
+    // a hyperlinked cell, launch its URI.
+    const moved = @abs(dx) > 4 or @abs(dy) > 4;
+    if (moved) return;
+
+    const event = c.gtk_event_controller_get_current_event(@ptrCast(g));
+    if (event == null) return;
+    const mods = c.gdk_event_get_modifier_state(event);
+    if (mods & c.GDK_CONTROL_MASK == 0) return;
+
+    var sx: f64 = 0;
+    var sy: f64 = 0;
+    _ = c.gtk_gesture_drag_get_start_point(g, &sx, &sy);
+    const cell = self.cellAt(sx, sy);
+    if (cell.row < 0 or cell.col < 0) return;
+    const screen = self.terminal.screen;
+    if (cell.row >= screen.rows or cell.col >= screen.cols) return;
+    const cell_data = screen.cellAt(@intCast(cell.row), @intCast(cell.col));
+    if (cell_data.flags & 0b0000_0100 == 0) return;
+
+    if (screen.linkUri(cell_data.reserved)) |uri| {
+        var buf: [4096]u8 = undefined;
+        const n = @min(uri.len, buf.len - 1);
+        @memcpy(buf[0..n], uri[0..n]);
+        buf[n] = 0;
+        _ = c.g_app_info_launch_default_for_uri(&buf, null, null);
+    }
 }
 
 fn onScroll(_: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
