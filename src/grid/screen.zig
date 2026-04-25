@@ -594,6 +594,9 @@ pub const Screen = struct {
             self.lineFeed();
             self.col = 0;
             self.pending_wrap = false;
+            // Mark the new line as a soft-wrap continuation; future
+            // reflow can join wrapped paragraphs.
+            self.line(self.row).continues_above = true;
         }
         if (self.col >= self.cols) return;
 
