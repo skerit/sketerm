@@ -9,6 +9,7 @@ const Pane = @import("pane.zig").Pane;
 const Pty = @import("../pty.zig").Pty;
 const Terminal = @import("../terminal.zig").Terminal;
 const layout_mod = @import("../layout.zig");
+const Config = @import("../config.zig").Config;
 
 pub const Window = struct {
     app_window: *c.GtkWidget,
@@ -19,6 +20,7 @@ pub const Window = struct {
     allocator: std.mem.Allocator,
     tab_counter: u32 = 0,
     debug_events: bool = false,
+    config: Config = .{},
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         const self = try allocator.create(Window);
@@ -71,6 +73,7 @@ pub const Window = struct {
             .app_window = app_window,
             .tab_view = @ptrCast(tab_view_w),
             .allocator = allocator,
+            .config = Config.load(allocator),
         };
 
         // When a tab is removed (close button, Ctrl+Shift+W, etc),
@@ -117,6 +120,7 @@ pub const Window = struct {
         for (self.terminals.items) |t| t.deinit();
         self.panes.deinit(self.allocator);
         self.terminals.deinit(self.allocator);
+        self.config.deinit();
         self.allocator.destroy(self);
     }
 
@@ -295,10 +299,34 @@ pub const Window = struct {
     }
 
     fn spawnShellPane(self: *Window) !*Pane {
-        const shell_env = c.getenv("SHELL");
-        const shell: [*:0]const u8 = if (shell_env != null) @ptrCast(shell_env) else "/bin/bash";
+        // Config-driven shell, with $SHELL fallback, then /bin/bash.
+        var shell_buf: [256:0]u8 = undefined;
+        const shell: [*:0]const u8 = if (self.config.shell) |s| blk: {
+            const n = @min(s.len, shell_buf.len);
+            @memcpy(shell_buf[0..n], s[0..n]);
+            shell_buf[n] = 0;
+            break :blk @ptrCast(&shell_buf);
+        } else if (c.getenv("SHELL")) |env_ptr| @as([*:0]const u8, @ptrCast(env_ptr)) else "/bin/bash";
+
         const argv = [_][*:0]const u8{shell};
-        const pty = try Pty.spawn(.{ .argv = &argv, .rows = 24, .cols = 80 });
+
+        // Build TERM/COLORTERM as null-terminated for the child env.
+        var term_buf: [64:0]u8 = undefined;
+        var ct_buf: [64:0]u8 = undefined;
+        const tlen = @min(self.config.term_env.len, term_buf.len);
+        @memcpy(term_buf[0..tlen], self.config.term_env[0..tlen]);
+        term_buf[tlen] = 0;
+        const ctlen = @min(self.config.color_term_env.len, ct_buf.len);
+        @memcpy(ct_buf[0..ctlen], self.config.color_term_env[0..ctlen]);
+        ct_buf[ctlen] = 0;
+
+        const pty = try Pty.spawn(.{
+            .argv = &argv,
+            .rows = 24,
+            .cols = 80,
+            .term = @ptrCast(&term_buf),
+            .color_term = @ptrCast(&ct_buf),
+        });
         errdefer pty.closeAndReap();
 
         const term = try Terminal.init(self.allocator, pty, 80, 24);
@@ -312,6 +340,19 @@ pub const Window = struct {
         pane.win_on_notification = onTermNotification;
         pane.win_bell_ctx = @ptrCast(self);
         pane.win_on_bell = onTermBell;
+        // Push config-derived fields into the pane before realize.
+        pane.font_size = self.config.font_size;
+        pane.font_path = self.config.font_path;
+        pane.grid_pass.pad = self.config.padding;
+        pane.grid_pass.default_fg = self.config.default_fg;
+        pane.grid_pass.default_bg = self.config.default_bg;
+        // Push config-driven defaults onto the screen so OSC 4/10/11
+        // queries reply with the configured values until apps override.
+        term.screen.default_fg = self.config.default_fg;
+        term.screen.default_bg = self.config.default_bg;
+        term.screen.cursor_color = self.config.cursor_color;
+        term.screen.scrollback_capacity = self.config.scrollback;
+        term.screen.bracketed_paste = self.config.bracketed_paste;
         try self.panes.append(self.allocator, pane);
         try self.terminals.append(self.allocator, term);
         return pane;

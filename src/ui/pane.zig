@@ -65,6 +65,12 @@ pub const Pane = struct {
     /// xterm button code (0=L,1=M,2=R) currently held, or -1 = none.
     /// Used by DECSET 1002 button-event tracking.
     held_button: i32 = -1,
+    /// Live font size in points. Initialised from Config.font_size,
+    /// adjustable via Ctrl++ / Ctrl+- which rebuilds the atlas.
+    font_size: u16 = 14,
+    /// Optional explicit font path (overrides FONT_CANDIDATES). Owned
+    /// by the Config arena, valid for the lifetime of the Window.
+    font_path: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -274,22 +280,32 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     self.image_pass.forgetGL();
     self.image_store.forgetGL();
 
-    // Try each candidate font in order until one works. The
-    // SKETERM_FONT env var (when set, must be an absolute path to a
-    // TTF/OTF) is tried first.
+    // Resolution order: explicit Pane.font_path → $SKETERM_FONT env →
+    // built-in candidate list. Size from Pane.font_size (set by
+    // Config or the Ctrl+/Ctrl- shortcuts).
     self.atlas = null;
-    if (std.posix.getenv("SKETERM_FONT")) |env_path| {
-        // env_path isn't null-terminated. Copy + sentinel for FT.
-        const z = self.allocator.allocSentinel(u8, env_path.len, 0) catch return;
+    const size: u16 = self.font_size;
+    if (self.font_path) |fp| {
+        const z = self.allocator.allocSentinel(u8, fp.len, 0) catch return;
         defer self.allocator.free(z);
-        @memcpy(z, env_path);
-        if (Atlas.init(self.allocator, z.ptr, FONT_SIZE)) |a| {
+        @memcpy(z, fp);
+        if (Atlas.init(self.allocator, z.ptr, size)) |a| {
             self.atlas = a;
         } else |_| {}
     }
     if (self.atlas == null) {
+        if (std.posix.getenv("SKETERM_FONT")) |env_path| {
+            const z = self.allocator.allocSentinel(u8, env_path.len, 0) catch return;
+            defer self.allocator.free(z);
+            @memcpy(z, env_path);
+            if (Atlas.init(self.allocator, z.ptr, size)) |a| {
+                self.atlas = a;
+            } else |_| {}
+        }
+    }
+    if (self.atlas == null) {
         for (FONT_CANDIDATES) |path| {
-            if (Atlas.init(self.allocator, path, FONT_SIZE)) |a| {
+            if (Atlas.init(self.allocator, path, size)) |a| {
                 self.atlas = a;
                 break;
             } else |_| continue;

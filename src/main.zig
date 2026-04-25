@@ -44,6 +44,10 @@ const HELP_TEXT =
     \\Right-click for context menu (split / new tab / etc).
     \\Mouse wheel scrolls scrollback (10k lines default).
     \\
+    \\Config: $XDG_CONFIG_HOME/sketerm/config.conf (or
+    \\        ~/.config/sketerm/config.conf). See data/sample.conf.
+    \\        Env vars below override values from the file.
+    \\
     \\Environment:
     \\  SKETERM_FONT          Override font (absolute path to .ttf/.otf)
     \\  SKETERM_SCROLLBACK    Scrollback line capacity (default 10000)

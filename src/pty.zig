@@ -23,8 +23,11 @@ pub const SpawnOpts = struct {
     cwd: ?[]const u8 = null,
     rows: u16 = 24,
     cols: u16 = 80,
-    /// Extra env strings (`KEY=VALUE`); appended to inherited env.
-    extra_env: []const [*:0]const u8 = &.{},
+    /// `TERM` env value the child should see. xterm-256color is the
+    /// safe default — it advertises 256 colours but no sixel.
+    term: [*:0]const u8 = "xterm-256color",
+    /// `COLORTERM` env value. "truecolor" makes apps emit 24-bit SGR.
+    color_term: [*:0]const u8 = "truecolor",
 };
 
 pub const Pty = struct {
@@ -88,8 +91,8 @@ pub const Pty = struct {
         _ = c.sigprocmask(c.SIG_SETMASK, &empty_mask, null);
 
         // Set sketerm-specific env vars (overwrites if present).
-        _ = c.setenv("TERM", "xterm-256color", 1);
-        _ = c.setenv("COLORTERM", "truecolor", 1);
+        _ = c.setenv("TERM", opts.term, 1);
+        _ = c.setenv("COLORTERM", opts.color_term, 1);
         _ = c.setenv("TERM_PROGRAM", "sketerm", 1);
         _ = c.setenv("TERM_PROGRAM_VERSION", "0.1.0", 1);
 
