@@ -680,3 +680,38 @@ since apps see what the user clicked on screen.
   (Slack, IRC clients, GitHub comments) don't mis-parse.
 
 End of pass: 322 tests, build clean, both smoke targets PASS.
+
+## Spec coverage tick (compatibility polish)
+
+Eight commits expanding compatibility with real-world apps' probes
+and modes. None changed any existing behaviour; all are purely
+additive or fix conformance gaps.
+
+- **DECRQM** (`CSI ? Pa $ p`) — added DECSCNM (5), DECCOLM (3),
+  DECARM (8, autorepeat = always on), cursor blink (12), allow_decolm
+  (40), and explicit `2 (reset)` reports for 1005 / 1015 / 1016 mouse
+  modes that we don't implement. Apps that fall back through a chain
+  of probes now see real answers.
+- **LNM** (CSI 20 h/l) — was a no-op; now sets `Screen.line_feed_mode`
+  so LF / VT / FF carry an implicit CR. Test added.
+- **window title stack** (CSI 22 t / 23 t) — owns an 8-deep ring of
+  duped titles. tmux + screen rely on this when nested.
+- **DECSTR** (CSI ! p) — also clears DECSCNM and the active kitty
+  kbd flag set (the saved stack is intentionally untouched).
+- **multi-match search highlight** — Window publishes the in-progress
+  match list to `Screen.search_highlights` + `search_active_idx`;
+  GridPass overlays a translucent yellow rectangle on every match
+  (orange on the active one). Closing search clears the borrowed
+  slice before freeing.
+- **SGR 4:N sub-param** — Parser now tracks `Csi.is_sub[]` so the
+  SGR handler can distinguish `\e[4:3m` (curly underline) from
+  `\e[4;3m` (underline AND italic). Codes 0=off, 1=straight, 2=double,
+  3=curly, 4/5=folded into curly. Two regression tests.
+- **OSC 22** — change mouse pointer shape over the pane via X cursor
+  name. Plumbed Screen.Sink → Terminal sink → Pane handler that
+  calls `gtk_widget_set_cursor_from_name`. Empty name = restore
+  default.
+- **public DECRQM** (CSI Pa $ p) — IRM (4) and LNM (20) state reports.
+
+End of tick: ~327 tests, build clean, smoke runners green, parser
+bench unchanged.
