@@ -167,10 +167,10 @@ fn onKeyPressed(
     }
 
     var buf: [16]u8 = undefined;
-    const n = encode(&buf, keyval, state);
+    const screen = ctx.terminal.screen;
+    const n = encode(&buf, keyval, state, screen.app_cursor_keys);
     if (n == 0) return 0;
     // Snap to bottom on keypress (matches xterm/iterm2/etc behavior).
-    const screen = ctx.terminal.screen;
     if (screen.view_offset != 0) {
         screen.view_offset = 0;
         screen.dirty = true;
@@ -195,10 +195,12 @@ fn copySelection(ctx: *Ctx) void {
     c.gdk_clipboard_set_text(clip, cstr.ptr);
 }
 
-fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType) usize {
+fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool) usize {
     const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
     const alt = (mods & c.GDK_ALT_MASK) != 0;
     const shift = (mods & c.GDK_SHIFT_MASK) != 0;
+    // DECCKM swap: arrows/home/end use ESC O X instead of ESC [ X.
+    const ck: u8 = if (app_cursor) 'O' else '[';
 
     // Special keys (return early).
     switch (keyval) {
@@ -211,12 +213,12 @@ fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType) usize {
         },
         c.GDK_KEY_ISO_Left_Tab => { @memcpy(buf[0..3], "\x1b[Z"); return 3; },
         c.GDK_KEY_Escape => { buf[0] = 0x1B; return 1; },
-        c.GDK_KEY_Up => { @memcpy(buf[0..3], "\x1b[A"); return 3; },
-        c.GDK_KEY_Down => { @memcpy(buf[0..3], "\x1b[B"); return 3; },
-        c.GDK_KEY_Right => { @memcpy(buf[0..3], "\x1b[C"); return 3; },
-        c.GDK_KEY_Left => { @memcpy(buf[0..3], "\x1b[D"); return 3; },
-        c.GDK_KEY_Home => { @memcpy(buf[0..3], "\x1b[H"); return 3; },
-        c.GDK_KEY_End => { @memcpy(buf[0..3], "\x1b[F"); return 3; },
+        c.GDK_KEY_Up => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'A'; return 3; },
+        c.GDK_KEY_Down => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'B'; return 3; },
+        c.GDK_KEY_Right => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'C'; return 3; },
+        c.GDK_KEY_Left => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'D'; return 3; },
+        c.GDK_KEY_Home => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'H'; return 3; },
+        c.GDK_KEY_End => { buf[0] = 0x1B; buf[1] = ck; buf[2] = 'F'; return 3; },
         c.GDK_KEY_Page_Up => { @memcpy(buf[0..4], "\x1b[5~"); return 4; },
         c.GDK_KEY_Page_Down => { @memcpy(buf[0..4], "\x1b[6~"); return 4; },
         c.GDK_KEY_Insert => { @memcpy(buf[0..4], "\x1b[2~"); return 4; },

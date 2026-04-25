@@ -63,6 +63,9 @@ pub const Screen = struct {
     bracketed_paste: bool = false,
     /// DECSET 1004 — focus reporting.
     focus_reports: bool = false,
+    /// DECCKM (mode 1) — application cursor keys (arrows emit
+    /// `ESC O X` instead of `ESC [ X`).
+    app_cursor_keys: bool = false,
     /// DECSET 25 — cursor visibility.
     cursor_visible: bool = true,
     /// DECSCUSR cursor shape.
@@ -876,6 +879,7 @@ pub const Screen = struct {
     ///   0 not recognized, 1 set, 2 reset, 3 permanently set, 4 permanently reset.
     fn decrqm(self: *Screen, mode: u32) void {
         const known: ?bool = switch (mode) {
+            1 => self.app_cursor_keys,
             6 => self.origin_mode,
             7 => self.autowrap,
             25 => self.cursor_visible,
@@ -1009,6 +1013,7 @@ pub const Screen = struct {
         self.cursor_shape = .block_blink;
         self.bracketed_paste = false;
         self.focus_reports = false;
+        self.app_cursor_keys = false;
         self.mouse_mode = 0;
         self.mouse_sgr = false;
         self.pending_wrap = false;
@@ -1316,6 +1321,7 @@ pub const Screen = struct {
         var i: usize = 0;
         while (i < params.n_params) : (i += 1) {
             switch (params.params[i]) {
+                1 => self.app_cursor_keys = set,
                 6 => {
                     self.origin_mode = set;
                     self.row = if (set and self.origin_mode) self.scroll_top else 0;
