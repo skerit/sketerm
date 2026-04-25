@@ -67,10 +67,11 @@ build session. See `git log --oneline` for what's landed.
 - **M7** — splits via `GtkPaned`, nestable. `Ctrl+Shift+D` /
   `Ctrl+Shift+R` for horizontal/vertical. `close_pane` collapses
   the parent paned (or closes the tab if last pane).
-- **M8** — JSON layout save on shutdown to
-  `$XDG_STATE_HOME/sketerm/last.json`; `--restore` and
-  `--layout <path>` rebuild tabs. (Per-tab is flat; split tree
-  serialization deferred.)
+- **M8** — JSON layout save (v2 schema) on shutdown to
+  `$XDG_STATE_HOME/sketerm/last.json`. Each tab carries a
+  recursive Tree (pane | split). `--restore` and
+  `--layout <path>` rebuild the full split topology including
+  the GtkPaned hierarchy.
 - **M9** — Sixel decoder (RGB color regs, RLE, raster attrs, HLS
   fallback). Kitty graphics APC parser (transmit/place/delete,
   RGBA). iTerm2 OSC 1337 with full PNG decode via vendored
@@ -79,16 +80,16 @@ build session. See `git log --oneline` for what's landed.
   **end-to-end image rendering through the GL pipeline.**
 
 ### What's still missing (post-checkpoint)
-- **OSC 8 hover/Ctrl-click** — link IDs stored on cells; UI
   surface (tooltip on hover, click-to-open via `xdg-open`) not yet.
+- **OSC 8 in selection** — link IDs stored, hover tooltip works,
+  Ctrl+click opens; selection-extract preserves text but not the
+  underlying URI.
 - **Selection in scrollback** — model accepts negative rows but
-  the mouse-drag handler hasn't been taught to map screen→
+  the mouse-drag handler hasn't been taught to map screen →
   scrollback coords.
 - **IME preedit positioning** — commit signal works; preedit
   display at the cursor position not wired.
 - **Font fallback** — single face; missing glyphs render as tofu.
-- **Splits in saved layout** — layout records tab list flat, not
-  the per-tab `GtkPaned` tree.
 - **Pane focus highlight** — focused pane is not visually
   distinguished beyond what GTK4 provides on the underlying GLArea.
 
