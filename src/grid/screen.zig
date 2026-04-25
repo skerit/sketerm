@@ -125,6 +125,10 @@ pub const Screen = struct {
     default_bg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 },
     cursor_color: [4]f32 = .{ 0, 0, 0, 0 },
 
+    /// Runtime 256-color palette (overrides the comptime defaults).
+    /// Set via OSC 4 ; n ; rgb:... ; reset via OSC 104.
+    palette: [256][3]u8 = palette_default_256,
+
     /// Custom tab stops. One bool per column, true = stop set.
     /// Default: every 8th column starting at 0.
     tab_stops: std.ArrayList(bool) = .{},
@@ -536,20 +540,30 @@ pub const Screen = struct {
         return @as(f32, @floatFromInt(v)) / @as(f32, @floatFromInt(max));
     }
 
-    /// OSC 4 — palette query/set. Supports query form
-    /// `OSC 4 ; n ; ?` only; replies with the renderer's default
-    /// palette since we don't yet store a runtime palette.
+    /// OSC 4 — palette query/set. `OSC 4 ; n ; ?` queries; any
+    /// other payload after the index is parsed as a color spec.
     fn handleOsc4(self: *Screen, rest: []const u8) void {
         const semi = std.mem.indexOfScalar(u8, rest, ';') orelse return;
         const idx = std.fmt.parseInt(u8, rest[0..semi], 10) catch return;
         const data = rest[semi + 1 ..];
-        if (data.len != 1 or data[0] != '?') return;
-        const rgb = palette_default_256[idx];
-        var resp_buf: [64]u8 = undefined;
-        const s = std.fmt.bufPrint(&resp_buf, "\x1b]4;{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}\x1b\\", .{
-            idx, rgb[0], rgb[0], rgb[1], rgb[1], rgb[2], rgb[2],
-        }) catch return;
-        self.respond(s);
+        if (data.len == 1 and data[0] == '?') {
+            const rgb = self.palette[idx];
+            var resp_buf: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&resp_buf, "\x1b]4;{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}\x1b\\", .{
+                idx, rgb[0], rgb[0], rgb[1], rgb[1], rgb[2], rgb[2],
+            }) catch return;
+            self.respond(s);
+            return;
+        }
+        // Set form.
+        if (parseColor(data)) |rgba| {
+            self.palette[idx] = .{
+                @intFromFloat(@round(rgba[0] * 255.0)),
+                @intFromFloat(@round(rgba[1] * 255.0)),
+                @intFromFloat(@round(rgba[2] * 255.0)),
+            };
+            self.dirty = true;
+        }
     }
 
     fn handleOsc8(self: *Screen, params: []const u8) void {
@@ -733,9 +747,16 @@ pub const Screen = struct {
                     self.dirty = true;
                 }
             },
-            // OSC 104 — palette reset (we don't track per-index
-            // overrides yet; accept silently).
-            104 => {},
+            // OSC 104 — palette reset. With no args, reset all
+            // entries; with `; n` reset only that index.
+            104 => {
+                if (rest.len == 0) {
+                    self.palette = palette_default_256;
+                } else if (std.fmt.parseInt(u8, rest, 10)) |idx| {
+                    self.palette[idx] = palette_default_256[idx];
+                } else |_| {}
+                self.dirty = true;
+            },
             // OSC 110 / 111 — fg / bg color reset to default.
             110 => {
                 self.default_fg = .{ 0.92, 0.92, 0.92, 1.0 };
@@ -2353,6 +2374,17 @@ test "IRM shifts cells right" {
     try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 2).rune);
     try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(0, 3).rune);
     // 'd' shifted off the right edge.
+}
+
+test "OSC 4 sets palette index, OSC 104 resets it" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    s.onOsc("4;1;rgb:ff/00/00");
+    try std.testing.expectEqual([3]u8{ 255, 0, 0 }, s.palette[1]);
+    s.onOsc("104;1");
+    try std.testing.expectEqual(palette_default_256[1], s.palette[1]);
 }
 
 test "OSC 11 sets default_bg, OSC 111 resets" {

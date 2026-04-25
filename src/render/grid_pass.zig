@@ -77,6 +77,9 @@ pub const GridPass = struct {
     /// Default fg/bg used when style.fg/bg is .default.
     default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
     default_bg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 },
+    /// Runtime 256-color palette. Synced from `screen.palette` at
+    /// the start of buildVertices so OSC 4 / 104 take effect.
+    palette: [256][3]u8 = palette_256,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) GridPass {
@@ -129,10 +132,11 @@ pub const GridPass = struct {
         focused: bool,
     ) !void {
         self.vbuf.clearRetainingCapacity();
-        // Sync default fg/bg from screen — OSC 10 / 11 / 110 / 111
-        // mutate them.
+        // Sync default fg/bg + palette from screen — OSC 4 / 10 / 11 /
+        // 104 / 110 / 111 mutate them.
         self.default_fg = screen.default_fg;
         self.default_bg = screen.default_bg;
+        self.palette = screen.palette;
 
         const cw: f32 = @floatFromInt(atlas.cell_w);
         const ch: f32 = @floatFromInt(atlas.cell_h);
@@ -396,7 +400,7 @@ pub const GridPass = struct {
     fn colorToVec(self: *const GridPass, color: Color, is_fg: bool, reverse: bool) [4]f32 {
         const base = switch (color) {
             .default => if (is_fg != reverse) self.default_fg else self.default_bg,
-            .palette => |p| paletteToVec(p, is_fg),
+            .palette => |p| self.paletteToVec(p, is_fg),
             .rgb => |c_rgb| [_]f32{
                 @as(f32, @floatFromInt(c_rgb.r)) / 255.0,
                 @as(f32, @floatFromInt(c_rgb.g)) / 255.0,
@@ -413,10 +417,9 @@ pub const GridPass = struct {
         return base;
     }
 
-    fn paletteToVec(idx: u8, is_fg: bool) [4]f32 {
+    fn paletteToVec(self: *const GridPass, idx: u8, is_fg: bool) [4]f32 {
         _ = is_fg;
-        // Standard xterm 16-color palette + 256-color extension.
-        const p = palette_256[idx];
+        const p = self.palette[idx];
         return .{
             @as(f32, @floatFromInt(p[0])) / 255.0,
             @as(f32, @floatFromInt(p[1])) / 255.0,
