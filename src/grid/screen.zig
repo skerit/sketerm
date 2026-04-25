@@ -757,6 +757,8 @@ pub const Screen = struct {
         const arg = params.paramOrDefault(0, 0);
         var resp_buf: [32]u8 = undefined;
         switch (arg) {
+            11 => self.respond("\x1b[1t"), // window state: not iconified
+            13 => self.respond("\x1b[3;0;0t"), // window position: 0,0 (we don't know)
             14 => {
                 // Pixels — we don't know exact pixel size, approximate
                 // via cell metrics * cols/rows. v1: report grid * 8/16.
