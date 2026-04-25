@@ -2082,3 +2082,45 @@ test "soft-wrap selection joins without newline" {
     // Without soft-wrap awareness this would be "hello\nwor".
     try std.testing.expectEqualStrings("hellowor", out);
 }
+
+test "DECALN fills screen with E" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 4, 2);
+    defer s.deinit();
+    s.escFinal(.{
+        .intermediates = .{ '#', 0, 0, 0 },
+        .n_intermediates = 1,
+        .final = '8',
+    });
+    var r: u16 = 0;
+    while (r < 2) : (r += 1) {
+        var col: u16 = 0;
+        while (col < 4) : (col += 1) {
+            try std.testing.expectEqual(@as(u32, 'E'), s.cellAt(r, col).rune);
+        }
+    }
+}
+
+test "1049 saves and restores cursor" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 5);
+    defer s.deinit();
+    s.row = 2;
+    s.col = 3;
+    var csi = Event.Csi{};
+    csi.private = '?';
+    csi.params[0] = 1049;
+    csi.n_params = 1;
+    csi.final = 'h';
+    s.csi(csi);
+    try std.testing.expect(s.use_alt);
+    try std.testing.expectEqual(@as(u16, 0), s.row);
+    try std.testing.expectEqual(@as(u16, 0), s.col);
+    csi.final = 'l';
+    s.csi(csi);
+    try std.testing.expect(!s.use_alt);
+    try std.testing.expectEqual(@as(u16, 2), s.row);
+    try std.testing.expectEqual(@as(u16, 3), s.col);
+}
