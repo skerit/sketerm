@@ -100,7 +100,6 @@ test "wezterm c1.rs test_ri: ESC M reverse line feed; scrolls at top" {
     defer h.deinit();
     h.arm();
     h.feed("a\r\nb\r\nc\r\nd.");
-    // Now at row 3, col 1.
     try std.testing.expectEqual(@as(u16, 3), h.screen.row);
     h.feed("\x1bM");
     try std.testing.expectEqual(@as(u16, 2), h.screen.row);
@@ -108,8 +107,6 @@ test "wezterm c1.rs test_ri: ESC M reverse line feed; scrolls at top" {
     try std.testing.expectEqual(@as(u16, 1), h.screen.row);
     h.feed("\x1bM");
     try std.testing.expectEqual(@as(u16, 0), h.screen.row);
-    // RI at row 0 scrolls down (clears row 0). The 'd.' was on
-    // row 3; after one scroll-down it moves to row 4 → off-screen.
     h.feed("\x1bM");
     try std.testing.expectEqual(@as(u16, 0), h.screen.row);
     const r0 = try h.line(std.testing.allocator, 0);
@@ -118,4 +115,124 @@ test "wezterm c1.rs test_ri: ESC M reverse line feed; scrolls at top" {
     const r1 = try h.line(std.testing.allocator, 1);
     defer std.testing.allocator.free(r1);
     try std.testing.expectEqualStrings("a", r1);
+}
+
+// ── csi.rs ────────────────────────────────────────────────────────
+
+test "wezterm csi.rs test_vpa: VPA (CSI d) absolute row" {
+    var h = try Harness.init(std.testing.allocator, 4, 3);
+    defer h.deinit();
+    h.arm();
+    h.feed("a\r\nb\r\nc"); // row 2 col 1
+    h.feed("\x1b[d"); // VPA default → row 0 (1-indexed col 1 → 0)
+    try std.testing.expectEqual(@as(u16, 0), h.screen.row);
+    h.feed("\x1b[2d"); // VPA 2 → row 1
+    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
+}
+
+test "wezterm csi.rs test_rep: REP (CSI b) repeats prior glyph" {
+    var h = try Harness.init(std.testing.allocator, 4, 3);
+    defer h.deinit();
+    h.arm();
+    // wezterm test_rep does cup(1, 0) which is (col=1, row=0); CSI
+    // is row;col 1-indexed → "\x1b[1;2H".
+    h.feed("h\x1b[1;2H\x1b[2ba");
+    const r0 = try h.line(std.testing.allocator, 0);
+    defer std.testing.allocator.free(r0);
+    try std.testing.expectEqualStrings("hhha", r0);
+}
+
+test "wezterm csi.rs test_irm: IRM (CSI 4 h) inserts" {
+    var h = try Harness.init(std.testing.allocator, 8, 3);
+    defer h.deinit();
+    h.arm();
+    h.feed("foo\x1b[1;1H\x1b[4hBAR");
+    const r0 = try h.line(std.testing.allocator, 0);
+    defer std.testing.allocator.free(r0);
+    try std.testing.expectEqualStrings("BARfoo", r0);
+}
+
+test "wezterm csi.rs test_ich: ICH (CSI @) shifts right" {
+    var h = try Harness.init(std.testing.allocator, 4, 3);
+    defer h.deinit();
+    h.arm();
+    h.feed("hey!wat?"); // wraps: row0='hey!', row1='wat?'
+    h.feed("\x1b[1;2H"); // row 0 col 1
+    h.feed("\x1b[2@");
+    const r0 = try h.line(std.testing.allocator, 0);
+    defer std.testing.allocator.free(r0);
+    try std.testing.expectEqualStrings("h  e", r0);
+}
+
+test "wezterm csi.rs test_ech: ECH (CSI X) blanks without shift" {
+    var h = try Harness.init(std.testing.allocator, 4, 3);
+    defer h.deinit();
+    h.arm();
+    h.feed("hey!wat?");
+    h.feed("\x1b[1;2H");
+    h.feed("\x1b[2X");
+    const r0 = try h.line(std.testing.allocator, 0);
+    defer std.testing.allocator.free(r0);
+    try std.testing.expectEqualStrings("h  !", r0);
+}
+
+test "wezterm csi.rs test_dch: DCH (CSI P) shifts left" {
+    var h = try Harness.init(std.testing.allocator, 11, 1);
+    defer h.deinit();
+    h.arm();
+    h.feed("hello world\x1b[1;2H");
+    h.feed("\x1b[P"); // DCH 1
+    const r1 = try h.line(std.testing.allocator, 0);
+    defer std.testing.allocator.free(r1);
+    try std.testing.expectEqualStrings("hllo world", r1);
+}
+
+test "wezterm csi.rs test_cup: CUP clamps to last cell" {
+    var h = try Harness.init(std.testing.allocator, 3, 5);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1b[2;2H");
+    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
+    try std.testing.expectEqual(@as(u16, 1), h.screen.col);
+    h.feed("\x1b[500;500H");
+    try std.testing.expectEqual(@as(u16, 4), h.screen.row);
+    try std.testing.expectEqual(@as(u16, 2), h.screen.col);
+}
+
+test "wezterm csi.rs test_dl: DL (CSI M) deletes lines" {
+    var h = try Harness.init(std.testing.allocator, 4, 3);
+    defer h.deinit();
+    h.arm();
+    h.feed("a\r\nb\r\nc");
+    h.feed("\x1b[2;1H"); // row 1 col 0
+    h.feed("\x1b[M"); // DL 1
+    const r0 = try h.line(std.testing.allocator, 0);
+    defer std.testing.allocator.free(r0);
+    try std.testing.expectEqualStrings("a", r0);
+    const r1 = try h.line(std.testing.allocator, 1);
+    defer std.testing.allocator.free(r1);
+    try std.testing.expectEqualStrings("c", r1);
+}
+
+test "wezterm csi.rs test_cha: CHA (CSI G) absolute column" {
+    var h = try Harness.init(std.testing.allocator, 5, 3);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1b[2;2H");
+    h.feed("\x1b[G"); // default → col 0
+    try std.testing.expectEqual(@as(u16, 0), h.screen.col);
+    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
+    h.feed("\x1b[3G"); // col 2 (1-indexed)
+    try std.testing.expectEqual(@as(u16, 2), h.screen.col);
+}
+
+test "wezterm csi.rs test_ed_erase_scrollback: CSI 3 J wipes scrollback" {
+    var h = try Harness.init(std.testing.allocator, 3, 2);
+    defer h.deinit();
+    h.arm();
+    // Force some lines into scrollback.
+    h.feed("a\r\nb\r\nc\r\nd\r\ne\r\nf");
+    try std.testing.expect(h.screen.scrollbackCount() > 0);
+    h.feed("\x1b[3J");
+    try std.testing.expectEqual(@as(u32, 0), h.screen.scrollbackCount());
 }
