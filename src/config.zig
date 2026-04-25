@@ -25,6 +25,9 @@ pub const Config = struct {
     // Cursor
     cursor_shape: CursorShape = .block,
     cursor_blink: bool = true,
+    /// Cursor blink interval in milliseconds. Each interval is one
+    /// half-cycle (on→off OR off→on). 500 = full blink every 1000ms.
+    cursor_blink_ms: u32 = 500,
 
     // Layout
     padding: f32 = 6.0,
@@ -151,6 +154,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         else return error.BadCursorShape;
     } else if (std.mem.eql(u8, key, "cursor_blink")) {
         cfg.cursor_blink = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "cursor_blink_ms")) {
+        cfg.cursor_blink_ms = try parseU32(value);
     } else if (std.mem.eql(u8, key, "padding")) {
         cfg.padding = try parseFloat(value);
     } else if (std.mem.eql(u8, key, "scrollback")) {

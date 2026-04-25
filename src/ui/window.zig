@@ -394,6 +394,7 @@ pub const Window = struct {
                 pane.win_on_bell = onTermBell;
                 pane.font_size = p.font_size orelse self.config.font_size;
                 pane.font_path = self.config.font_path;
+                pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
                 pane.grid_pass.pad = self.config.padding;
                 pane.grid_pass.enable_ligatures = self.config.ligatures;
         pane.grid_pass.enable_bidi = self.config.bidi;
@@ -549,6 +550,7 @@ pub const Window = struct {
         // Push config-derived fields into the pane before realize.
         pane.font_size = self.config.font_size;
         pane.font_path = self.config.font_path;
+        pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
         pane.grid_pass.pad = self.config.padding;
         const fg_bg = self.resolveDefaultColors();
         pane.grid_pass.default_fg = fg_bg.fg;

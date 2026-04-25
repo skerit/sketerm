@@ -81,6 +81,9 @@ pub const Pane = struct {
     /// Optional explicit font path (overrides FONT_CANDIDATES). Owned
     /// by the Config arena, valid for the lifetime of the Window.
     font_path: ?[]const u8 = null,
+    /// Cursor blink half-cycle interval in microseconds. 500_000
+    /// (= 500 ms) is the xterm default.
+    cursor_blink_us: i64 = 500_000,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -617,7 +620,7 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         else => false,
     };
     const elapsed = now - self.last_blink_us;
-    if (blinking and elapsed > 500_000) {
+    if (blinking and elapsed > self.cursor_blink_us) {
         self.last_blink_us = now;
         screen.cursor_blink_on = !screen.cursor_blink_on;
         screen.dirty = true;
@@ -815,7 +818,7 @@ fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
                 if (mods & c.GDK_ALT_MASK != 0) base += 8;
                 if (mods & c.GDK_CONTROL_MASK != 0) base += 16;
             }
-            self.writeMouseEvent(32 + base, @as(u32, @intCast(cell.col + 1)), @as(u32, @intCast(cell.row + 1)), x, y, true);
+            writeMouseEvent(self,32 + base, @as(u32, @intCast(cell.col + 1)), @as(u32, @intCast(cell.row + 1)), x, y, true);
         }
     }
 
@@ -965,7 +968,7 @@ fn emitMouseSeq(self: *Pane, g: *c.GtkGestureClick, x: f64, y: f64, press: bool)
     }
     const cell = self.cellAt(x, y);
     if (cell.row < 0 or cell.col < 0) return;
-    self.writeMouseEvent(@intCast(xterm_button), @intCast(cell.col + 1), @intCast(cell.row + 1), x, y, press);
+    writeMouseEvent(self,@intCast(xterm_button), @intCast(cell.col + 1), @intCast(cell.row + 1), x, y, press);
 }
 
 /// Encode a single mouse event using the screen's currently-active
@@ -1133,7 +1136,7 @@ fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
         const ch_px: f64 = if (self.atlas) |a| @floatFromInt(a.cell_h) else 0.0;
         const px = @as(f64, @floatFromInt(col)) * cw_px;
         const py = @as(f64, @floatFromInt(row)) * ch_px;
-        self.writeMouseEvent(button, @as(u32, @intCast(col + 1)), @as(u32, @intCast(row + 1)), px, py, true);
+        writeMouseEvent(self,button, @as(u32, @intCast(col + 1)), @as(u32, @intCast(row + 1)), px, py, true);
         return 1;
     }
 
