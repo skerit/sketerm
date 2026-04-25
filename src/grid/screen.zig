@@ -1984,9 +1984,14 @@ pub const Screen = struct {
         self.focus_reports = false;
         self.cursor_visible = true;
         self.cursor_shape = .block_blink;
+        self.reverse_screen = false;
+        self.kitty_kbd_flags = 0;
+        self.kitty_kbd_depth = 0;
         self.last_print_cp = 0;
         self.clearAllClusters();
         self.resetTabStops() catch {};
+        // Bring the parser back to ANSI mode if it's in VT52.
+        if (self.sink.on_decanm) |f| f(self.sink.ctx, true);
     }
 
     // ── Cursor primitives ────────────────────────────────────────
