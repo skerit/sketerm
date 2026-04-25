@@ -15,11 +15,15 @@ pub fn build(b: *std.Build) void {
     );
     const optimize = optimize_arg orelse .ReleaseSafe;
 
+    const strip_default = optimize != .Debug and optimize != .ReleaseSafe;
+    const strip = b.option(bool, "strip", "strip debug info") orelse strip_default;
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = strip,
     });
 
     const sys_libs = [_][]const u8{
