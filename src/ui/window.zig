@@ -146,6 +146,28 @@ pub const Window = struct {
                 const second = try self.buildTreeWidget(s.children[1]);
                 c.gtk_paned_set_start_child(@ptrCast(paned), first);
                 c.gtk_paned_set_end_child(@ptrCast(paned), second);
+
+                // Apply saved ratio after the widget gets its first
+                // allocation. Until then we don't know the total
+                // size in pixels.
+                const ratio_holder = try self.allocator.create(f32);
+                ratio_holder.* = if (s.ratio > 0 and s.ratio < 1) s.ratio else 0.5;
+                _ = c.g_signal_connect_data(
+                    paned,
+                    "notify::default-width",
+                    @ptrCast(&applyPanedRatio),
+                    @ptrCast(ratio_holder),
+                    @ptrCast(&freePanedRatio),
+                    c.G_CONNECT_DEFAULT,
+                );
+                _ = c.g_signal_connect_data(
+                    paned,
+                    "map",
+                    @ptrCast(&applyPanedRatioMap),
+                    @ptrCast(ratio_holder),
+                    null,
+                    c.G_CONNECT_DEFAULT,
+                );
                 return paned;
             },
         }
@@ -557,6 +579,35 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
         .close_pane => self.closeFocusedPane(),
         else => {},
+    }
+}
+
+fn applyPanedRatio(paned: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    applyPanedRatioImpl(@ptrCast(paned), user);
+}
+
+fn applyPanedRatioMap(paned: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    applyPanedRatioImpl(paned, user);
+}
+
+fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
+    const ratio_ptr: *f32 = @ptrCast(@alignCast(user.?));
+    const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(paned)));
+    const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
+        c.gtk_widget_get_width(paned)
+    else
+        c.gtk_widget_get_height(paned);
+    if (total <= 0) return;
+    const pos: c_int = @intFromFloat(@as(f32, @floatFromInt(total)) * ratio_ptr.*);
+    c.gtk_paned_set_position(@ptrCast(paned), pos);
+}
+
+fn freePanedRatio(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const ratio_ptr: *f32 = @ptrCast(@alignCast(u));
+        // We don't know the allocator here; for v1 leak. Bounded.
+        // (Future: wrap in a struct with allocator like RenameCtx.)
+        _ = ratio_ptr;
     }
 }
 
