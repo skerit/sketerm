@@ -102,3 +102,43 @@ test "selection rect single cell" {
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("l", out);
 }
+
+test "selection: combining mark stays attached to base" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    // 'a' + U+0301 (combining acute accent)
+    h.feed("a\xcc\x81b");
+    h.screen.selection.start(0, 0, .normal);
+    h.screen.selection.extend(0, 2);
+    const out = try h.screen.extractSelection(std.testing.allocator);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("a\xcc\x81b", out);
+}
+
+test "selection: variation selector + emoji round-trips" {
+    var h = try Harness.init(std.testing.allocator, 5, 1);
+    defer h.deinit();
+    h.arm();
+    // '*' + VS-16 (U+FE0F)
+    h.feed("*\xef\xb8\x8f");
+    h.screen.selection.start(0, 0, .normal);
+    h.screen.selection.extend(0, 1);
+    const out = try h.screen.extractSelection(std.testing.allocator);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("*\xef\xb8\x8f", out);
+}
+
+test "selection: ZWJ sequence preserved (man + ZWJ)" {
+    var h = try Harness.init(std.testing.allocator, 8, 1);
+    defer h.deinit();
+    h.arm();
+    // 👨 (U+1F468, wide) + ZWJ (U+200D — extending, attaches)
+    h.feed("\xf0\x9f\x91\xa8\xe2\x80\x8d");
+    h.screen.selection.start(0, 0, .normal);
+    h.screen.selection.extend(0, 2);
+    const out = try h.screen.extractSelection(std.testing.allocator);
+    defer std.testing.allocator.free(out);
+    // Cluster contains the man emoji plus the ZWJ as an extension.
+    try std.testing.expectEqualStrings("\xf0\x9f\x91\xa8\xe2\x80\x8d", out);
+}

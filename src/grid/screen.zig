@@ -117,6 +117,17 @@ pub const Screen = struct {
 
     /// Last printed codepoint (for REP, CSI Pn b). 0 = none.
     last_print_cp: u32 = 0,
+    /// Position of the cell that received `last_print_cp`. Used by
+    /// the cluster store to attach extending codepoints (combining
+    /// marks, ZWJ continuations, skin-tone modifiers) to the right
+    /// cell. row-encoded as (u32(row) << 16) | u32(col).
+    last_print_key: u32 = 0,
+    /// Cluster store: `(row << 16) | col` → list of extending
+    /// codepoints stamped onto that cell. Persists until the cell
+    /// is overwritten, the line is cleared, or content scrolls off.
+    /// Selection extraction reads from here to emit full grapheme
+    /// clusters; the renderer ignores them and draws the base only.
+    clusters: std.AutoHashMap(u32, std.ArrayList(u32)),
 
     /// Default fg / bg / cursor color overrides, RGBA in 0..1.
     /// Set via OSC 10 / 11 / 12, reset via OSC 110 / 111 / 112.
@@ -252,6 +263,7 @@ pub const Screen = struct {
             .pool = pool,
             .allocator = allocator,
             .links = std.AutoHashMap(u8, []u8).init(allocator),
+            .clusters = std.AutoHashMap(u32, std.ArrayList(u32)).init(allocator),
         };
         // SKETERM_SCROLLBACK env override (lines, 0 = disable scrollback).
         if (std.posix.getenv("SKETERM_SCROLLBACK")) |env| {
@@ -280,8 +292,63 @@ pub const Screen = struct {
         var link_it = self.links.iterator();
         while (link_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.links.deinit();
+        // Free grapheme clusters.
+        var cl_it = self.clusters.iterator();
+        while (cl_it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        self.clusters.deinit();
         if (self.preedit_text) |t| self.allocator.free(t);
         self.allocator.destroy(self);
+    }
+
+    fn cellKey(row: u32, col: u32) u32 {
+        return (row << 16) | (col & 0xFFFF);
+    }
+
+    /// Drop any cluster attached to (row, col). Called on cell
+    /// overwrite + erase + line clear so stale clusters don't
+    /// linger.
+    fn clearClusterAt(self: *Screen, row: u16, col: u16) void {
+        const key = cellKey(row, col);
+        if (self.clusters.fetchRemove(key)) |entry| {
+            var v = entry.value;
+            v.deinit(self.allocator);
+        }
+    }
+
+    /// Append an extending codepoint to the cluster at (row, col).
+    /// Caller has already verified it's an extending codepoint and
+    /// that a base glyph exists at that cell.
+    fn appendCluster(self: *Screen, row: u16, col: u16, cp: u32) void {
+        const key = cellKey(row, col);
+        const gop = self.clusters.getOrPut(key) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.append(self.allocator, cp) catch {};
+    }
+
+    /// Look up the cluster (if any) at (row, col). Returns slice of
+    /// extending codepoints; empty if none.
+    pub fn clusterAt(self: *const Screen, row: u16, col: u16) []const u32 {
+        const key = cellKey(row, col);
+        if (self.clusters.get(key)) |list| return list.items;
+        return &.{};
+    }
+
+    /// Drop every cluster — called from coarse operations (scroll,
+    /// reset, resize, clearAndScrollback) where tracking shifts of
+    /// individual cells would be expensive.
+    fn clearAllClusters(self: *Screen) void {
+        var it = self.clusters.iterator();
+        while (it.next()) |entry| {
+            var v = entry.value_ptr.*;
+            v.deinit(self.allocator);
+        }
+        self.clusters.clearRetainingCapacity();
+    }
+
+    /// Drop clusters for cells at (row, lo..hi).
+    fn clearClustersRange(self: *Screen, row: u16, lo: u16, hi: u16) void {
+        var c = lo;
+        while (c < hi) : (c += 1) self.clearClusterAt(row, c);
     }
 
     /// Public wrapper for the wide-char predicate used by the
@@ -305,6 +372,7 @@ pub const Screen = struct {
         for (self.buf()) |*l| l.clear();
         for (self.scrollback.items) |*l| l.deinit(self.allocator);
         self.scrollback.clearRetainingCapacity();
+        self.clearAllClusters();
         self.row = 0;
         self.col = 0;
         self.view_offset = 0;
@@ -349,6 +417,9 @@ pub const Screen = struct {
     /// self.col to match the rebuilt layout.
     fn reflowMain(self: *Screen, new_cols: u16, new_rows: u16) !void {
         const reflow = @import("reflow.zig");
+        // Reflow shifts every cell to a new (row, col); the cluster
+        // map keyed by (row, col) becomes meaningless. Drop it.
+        self.clearAllClusters();
 
         // Build a single logical-line stream from scrollback, then active.
         // Capture cursor's logical position before consuming.
@@ -540,6 +611,17 @@ pub const Screen = struct {
                     var ub: [4]u8 = undefined;
                     const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
                     try out.appendSlice(allocator, ub[0..n]);
+                }
+                // Append any extending codepoints attached to this
+                // cell (combining marks, ZWJ continuations, skin-
+                // tone modifiers — stored at print time).
+                if (row >= 0 and row < @as(i32, @intCast(self.rows))) {
+                    const cluster = self.clusterAt(@intCast(row), @intCast(col));
+                    for (cluster) |ext_cp| {
+                        var eb: [4]u8 = undefined;
+                        const en = std.unicode.utf8Encode(@intCast(ext_cp), &eb) catch continue;
+                        try out.appendSlice(allocator, eb[0..en]);
+                    }
                 }
             }
             if (row != r.bot_row) {
@@ -960,11 +1042,16 @@ pub const Screen = struct {
         // Combining / extending codepoint: don't advance the cursor,
         // don't write a new cell. The user perceives them as glued
         // to the previous glyph (ZWJ sequences, variation selectors,
-        // skin-tone modifiers, combining marks). We render only the
-        // base; the extension is dropped from the screen state.
-        // Cursor must already have a base glyph behind it for this
-        // to make semantic sense — we gate on last_print_cp != 0.
-        if (self.last_print_cp != 0 and isExtendingCp(cp)) return;
+        // skin-tone modifiers, combining marks). We attach the cp
+        // to the previously-printed cell's cluster so selection
+        // extraction can emit the full cluster. Renderer continues
+        // to draw only the base.
+        if (self.last_print_cp != 0 and isExtendingCp(cp)) {
+            const row: u16 = @intCast(self.last_print_key >> 16);
+            const col: u16 = @intCast(self.last_print_key & 0xFFFF);
+            self.appendCluster(row, col, cp);
+            return;
+        }
 
         const width: u8 = if (isWideCp(cp)) 2 else 1;
 
@@ -989,6 +1076,11 @@ pub const Screen = struct {
             }
         }
 
+        // Drop any cluster previously attached to this cell — the new
+        // base codepoint replaces it.
+        self.clearClusterAt(self.row, self.col);
+        if (width == 2 and self.col + 1 < self.cols) self.clearClusterAt(self.row, self.col + 1);
+
         var flags: u8 = if (self.current_link_id != 0) 0b0000_0100 else 0;
         if (width == 2) flags |= 0b0000_0001; // is_wide_left
         ln.cells[self.col] = .{
@@ -1007,6 +1099,9 @@ pub const Screen = struct {
             };
         }
         ln.dirty = true;
+
+        // Remember where we placed the base for cluster attachment.
+        self.last_print_key = cellKey(self.row, self.col);
 
         self.col += width;
         if (self.col >= self.cols) {
@@ -1530,6 +1625,7 @@ pub const Screen = struct {
         self.cursor_visible = true;
         self.cursor_shape = .block_blink;
         self.last_print_cp = 0;
+        self.clearAllClusters();
         self.resetTabStops() catch {};
     }
 
@@ -1656,6 +1752,7 @@ pub const Screen = struct {
     // ── Scroll ───────────────────────────────────────────────────
 
     pub fn scrollUp(self: *Screen, n: u32) void {
+        self.clearAllClusters();
         if (self.scroll_top >= self.scroll_bot) return;
         const region: u16 = self.scroll_bot - self.scroll_top + 1;
         const move: u16 = @intCast(@min(n, @as(u32, region)));
@@ -1715,6 +1812,7 @@ pub const Screen = struct {
     }
 
     pub fn scrollDown(self: *Screen, n: u32) void {
+        self.clearAllClusters();
         if (self.scroll_top >= self.scroll_bot) return;
         const region: u16 = self.scroll_bot - self.scroll_top + 1;
         const move: u16 = @intCast(@min(n, @as(u32, region)));
