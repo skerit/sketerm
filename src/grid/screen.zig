@@ -790,8 +790,11 @@ pub const Screen = struct {
                 self.lineFeed();
                 self.col = 0;
             },
+            'H' => {}, // HTS — set tab stop at cursor (v1: hardcoded 8-col tabs)
             'M' => self.reverseLineFeed(),
             'c' => self.fullReset(),
+            '=' => {}, // DECPAM — application keypad on (numpad encoding shift)
+            '>' => {}, // DECPNM — application keypad off
             else => {},
         }
     }
