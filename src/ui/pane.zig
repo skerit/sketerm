@@ -481,6 +481,13 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     self.cell_pass.enable_ligatures = self.grid_pass.enable_ligatures;
     self.cell_pass.enable_bidi = self.grid_pass.enable_bidi;
     self.cell_pass.rebuildAndUpload(self.terminal.screen, &self.terminal.pool, atlas) catch return @intFromBool(false);
+
+    // Z-ordering: images with z_index < 0 render BEHIND text/cells,
+    // images with z_index >= 0 render in front (kitty default).
+    // Sandwich the cell + overlay passes between two image passes.
+    self.image_store.flushUploads();
+    self.image_pass.drawZ(&self.image_store, phys_w, phys_h, .below);
+
     self.cell_pass.draw(atlas, phys_w, phys_h);
     // Overlay pipeline (per-vertex VBO) — cursor, selection, focus
     // border, scrollback indicator, preedit, bell, and any rows that
@@ -488,9 +495,8 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     self.grid_pass.buildVertices(self.terminal.screen, &self.terminal.pool, atlas, focused) catch return @intFromBool(false);
     self.grid_pass.draw(atlas, phys_w, phys_h);
 
-    // Upload pending images, then draw.
-    self.image_store.flushUploads();
-    self.image_pass.draw(&self.image_store, phys_w, phys_h);
+    // Foreground images (z >= 0).
+    self.image_pass.drawZ(&self.image_store, phys_w, phys_h, .above);
 
     return @intFromBool(true);
 }

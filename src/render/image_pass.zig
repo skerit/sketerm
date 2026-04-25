@@ -87,11 +87,21 @@ pub const ImagePass = struct {
         c.glBindVertexArray(0);
     }
 
+    /// Z-filter applied to a single draw call. `.below` renders only
+    /// images with `z_index < 0` (Kitty: "behind text"); `.above`
+    /// renders only `z_index >= 0` (default; on top of text); `.all`
+    /// is unfiltered (used by smoke / tests).
+    pub const ZFilter = enum { all, below, above };
+
     pub fn draw(self: *ImagePass, store: *ImageStore, viewport_w: i32, viewport_h: i32) void {
+        self.drawZ(store, viewport_w, viewport_h, .all);
+    }
+
+    pub fn drawZ(self: *ImagePass, store: *ImageStore, viewport_w: i32, viewport_h: i32, zfilter: ZFilter) void {
         if (self.debug) {
             std.debug.print(
-                "[image] draw N={d} viewport={d}x{d} program={d}\n",
-                .{ store.images.items.len, viewport_w, viewport_h, self.program },
+                "[image] draw N={d} viewport={d}x{d} program={d} z={s}\n",
+                .{ store.images.items.len, viewport_w, viewport_h, self.program, @tagName(zfilter) },
             );
         }
         if (store.images.items.len == 0) return;
@@ -109,6 +119,11 @@ pub const ImagePass = struct {
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
 
         for (store.images.items) |img| {
+            switch (zfilter) {
+                .below => if (img.z_index >= 0) continue,
+                .above => if (img.z_index < 0) continue,
+                .all => {},
+            }
             if (img.gl_tex == 0) {
                 if (self.debug) std.debug.print("[image] skip id={d}: tex=0\n", .{img.image_id});
                 continue;
