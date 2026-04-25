@@ -823,7 +823,13 @@ pub const Screen = struct {
                         if (self.linkUri(open_link_id)) |uri| {
                             try out.append(allocator, ']');
                             try out.append(allocator, '(');
+                            // Markdown angle-bracket form for URIs that
+                            // would break the plain (uri) form. Closing
+                            // paren is the only unsafe char here.
+                            const need_angle = std.mem.indexOfScalar(u8, uri, ')') != null;
+                            if (need_angle) try out.append(allocator, '<');
                             try out.appendSlice(allocator, uri);
+                            if (need_angle) try out.append(allocator, '>');
                             try out.append(allocator, ')');
                         } else {
                             try out.append(allocator, ']');

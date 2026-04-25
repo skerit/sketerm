@@ -188,7 +188,7 @@ Default behavior per app:
 | modifyOtherKeys=1 (ambiguous combos)  | ✓ |
 | modifyOtherKeys=2 (all printable)     | ✓ |
 | DECCKM — application-cursor-keys mode | ✓ |
-| DECPAM / DECPNM — keypad mode         | stub |
+| DECPAM / DECPNM — keypad mode         | ✓ (numpad emits ESC O X under DECPAM) |
 | Kitty progressive enhancement (CSI > N u, disambiguate)        | ✓ |
 | Kitty progressive enhancement (CSI = N;M u, push/pop stack)    | ✓ |
 | Kitty progressive enhancement (flag 0x02, release+repeat)      | ✓ |
