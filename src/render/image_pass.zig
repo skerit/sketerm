@@ -51,6 +51,16 @@ pub const ImagePass = struct {
         _ = self;
     }
 
+    /// Drop cached GL handles — call after context loss before
+    /// re-realizing into a new context.
+    pub fn forgetGL(self: *ImagePass) void {
+        self.program = 0;
+        self.vao = 0;
+        self.vbo = 0;
+        self.u_screen_px = -1;
+        self.u_image = -1;
+    }
+
     pub fn realize(self: *ImagePass) !void {
         if (self.program != 0) return;
         self.program = try gl.buildProgram(VERT_SRC, FRAG_SRC);

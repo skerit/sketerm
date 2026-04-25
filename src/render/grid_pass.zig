@@ -93,6 +93,17 @@ pub const GridPass = struct {
     }
 
     /// Realize GL resources. Requires a current context.
+    /// Drop our cached GL handles — call after context loss, before
+    /// re-realizing into a new context. The GPU-side resources are
+    /// already gone (the context took them with it).
+    pub fn forgetGL(self: *GridPass) void {
+        self.program = 0;
+        self.vao = 0;
+        self.vbo = 0;
+        self.u_screen_px = -1;
+        self.u_atlas = -1;
+    }
+
     pub fn realize(self: *GridPass) !void {
         if (self.program != 0) return;
         self.program = try gl.buildProgram(VERT_SRC, FRAG_SRC);

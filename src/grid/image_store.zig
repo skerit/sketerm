@@ -99,6 +99,27 @@ pub const Store = struct {
         return self.images.items.len;
     }
 
+    /// Drop the cached GL texture IDs — call after context loss
+    /// before the next realize. The textures are gone with the
+    /// dead context; without `pending` data we can't rebuild them,
+    /// so any previously-uploaded image is effectively lost. This
+    /// is a v1 limitation (a re-upload mechanism would need to
+    /// keep the source pixels around indefinitely).
+    pub fn forgetGL(self: *Store) void {
+        // Drop everything that has no pending data to re-upload.
+        // Items with pending data still have their pixels and can
+        // be re-uploaded on the next flush.
+        var i: usize = 0;
+        while (i < self.images.items.len) {
+            if (self.images.items[i].pending == null) {
+                _ = self.images.orderedRemove(i);
+                continue;
+            }
+            self.images.items[i].gl_tex = 0;
+            i += 1;
+        }
+    }
+
     /// Free all images and their pending buffers, ignoring GL
     /// teardown — only safe to call after the GL context is gone
     /// or was never established. Used by tests.

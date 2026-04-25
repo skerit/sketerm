@@ -264,6 +264,22 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         return;
     }
 
+    // gtk_widget_unparent unrealizes a widget. A reparent (split,
+    // tab move, layout shuffle) therefore destroys our GL context
+    // and gives us a fresh one on the next realize. Drop every
+    // cached GL handle so the realize path below actually rebuilds
+    // them — without this, grid_pass.realize() returns early on
+    // `program != 0` and we'd glUseProgram a dead ID.
+    if (self.atlas) |old| {
+        old.deinit();
+        self.atlas = null;
+    }
+    self.grid_pass.forgetGL();
+    self.image_pass.forgetGL();
+    self.image_store.forgetGL();
+    self.render_seen = false;
+    self.resize_seen = false;
+
     // Try each candidate font in order until one works. The
     // SKETERM_FONT env var (when set, must be an absolute path to a
     // TTF/OTF) is tried first.
