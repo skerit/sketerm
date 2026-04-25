@@ -1178,6 +1178,7 @@ pub const Screen = struct {
         self.focus_reports = false;
         self.cursor_visible = true;
         self.cursor_shape = .block_blink;
+        self.last_print_cp = 0;
         self.resetTabStops() catch {};
     }
 
