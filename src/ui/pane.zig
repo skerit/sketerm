@@ -41,6 +41,8 @@ pub const Pane = struct {
     image_store: ImageStore,
     allocator: std.mem.Allocator,
     input_ctx: ?*input.Ctx = null,
+    /// Arena holding menu's per-pane closure ctxs. Deinit frees all.
+    menu_arena: std.heap.ArenaAllocator,
     /// External sink for menu actions (set by Window).
     menu_sink: ?menu.Sink = null,
     menu_sink_ctx: ?*anyopaque = null,
@@ -66,6 +68,7 @@ pub const Pane = struct {
             .terminal = terminal,
             .grid_pass = GridPass.init(allocator),
             .image_store = ImageStore.init(allocator),
+            .menu_arena = std.heap.ArenaAllocator.init(allocator),
             .allocator = allocator,
         };
 
@@ -136,8 +139,9 @@ pub const Pane = struct {
         _ = c.g_signal_connect_data(drag, "drag-end", @ptrCast(&onDragEnd), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(area_widget, @ptrCast(drag));
 
-        // Right-click → context menu.
-        try menu.attach(area_widget, allocator, paneMenuSink, @ptrCast(self));
+        // Right-click → context menu. Allocations go into menu_arena
+        // so they're freed when the pane is destroyed.
+        try menu.attach(area_widget, self.menu_arena.allocator(), paneMenuSink, @ptrCast(self));
 
         // Mouse motion → hover tooltip for OSC 8 hyperlinks.
         const motion = c.gtk_event_controller_motion_new();
@@ -194,6 +198,8 @@ pub const Pane = struct {
         self.image_pass.deinit();
         self.image_store.deinit();
         if (self.atlas) |a| a.deinit();
+        if (self.input_ctx) |ictx| self.allocator.destroy(ictx);
+        self.menu_arena.deinit();
         self.allocator.destroy(self);
     }
 
