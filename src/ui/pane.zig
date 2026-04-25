@@ -254,6 +254,85 @@ pub const Pane = struct {
     pub fn widget(self: *Pane) *c.GtkWidget {
         return @ptrCast(self.area);
     }
+
+    /// Live font-size change. Tears down the old atlas (and its GL
+    /// texture), bumps `font_size`, and rebuilds against the current
+    /// GL context. The renderer rebinds the new texture each frame.
+    /// Also re-derives the cell size so PTY winsize tracks the
+    /// new metrics on the next resize.
+    pub fn setFontSize(self: *Pane, new_size: u16) void {
+        if (new_size == self.font_size) return;
+        self.font_size = new_size;
+
+        // Make our GL context current so the texture deletes hit the
+        // right context.
+        c.gtk_gl_area_make_current(self.area);
+        if (c.gtk_gl_area_get_error(self.area) != null) return;
+
+        if (self.atlas) |old| {
+            // Drop the GL texture before destroying the atlas.
+            if (old.realized) {
+                var tex: c_uint = old.gl_tex;
+                c.glDeleteTextures(1, &tex);
+            }
+            old.deinit();
+            self.atlas = null;
+        }
+
+        // Same path as onRealize but inline so we don't re-do GL pass
+        // setup (those programs / VBOs are still live).
+        const size: u16 = self.font_size;
+        if (self.font_path) |fp| {
+            const z = self.allocator.allocSentinel(u8, fp.len, 0) catch return;
+            defer self.allocator.free(z);
+            @memcpy(z, fp);
+            if (Atlas.init(self.allocator, z.ptr, size)) |a| {
+                self.atlas = a;
+            } else |_| {}
+        }
+        if (self.atlas == null) {
+            if (std.posix.getenv("SKETERM_FONT")) |env_path| {
+                const z = self.allocator.allocSentinel(u8, env_path.len, 0) catch return;
+                defer self.allocator.free(z);
+                @memcpy(z, env_path);
+                if (Atlas.init(self.allocator, z.ptr, size)) |a| {
+                    self.atlas = a;
+                } else |_| {}
+            }
+        }
+        if (self.atlas == null) {
+            for (FONT_CANDIDATES) |path| {
+                if (Atlas.init(self.allocator, path, size)) |a| {
+                    self.atlas = a;
+                    break;
+                } else |_| continue;
+            }
+        }
+        if (self.atlas == null) return;
+        self.atlas.?.realize();
+
+        self.image_store.cell_w = @floatFromInt(self.atlas.?.cell_w);
+        self.image_store.cell_h = @floatFromInt(self.atlas.?.cell_h);
+
+        // Force a SIGWINCH on the child — terminal winsize in cells
+        // changes when the cell size changes.
+        const w = c.gtk_widget_get_width(@ptrCast(self.area));
+        const h = c.gtk_widget_get_height(@ptrCast(self.area));
+        const pad: f32 = self.grid_pass.pad;
+        const inner_w = @as(f32, @floatFromInt(w)) - 2 * pad;
+        const inner_h = @as(f32, @floatFromInt(h)) - 2 * pad;
+        const cw: f32 = @floatFromInt(self.atlas.?.cell_w);
+        const ch: f32 = @floatFromInt(self.atlas.?.cell_h);
+        if (cw > 0 and ch > 0) {
+            const cols: u16 = @intCast(@max(@as(i32, 1), @as(i32, @intFromFloat(@floor(inner_w / cw)))));
+            const rows: u16 = @intCast(@max(@as(i32, 1), @as(i32, @intFromFloat(@floor(inner_h / ch)))));
+            _ = self.terminal.screen.resize(cols, rows) catch {};
+            self.terminal.pty.setSize(rows, cols);
+        }
+
+        self.terminal.screen.dirty = true;
+        c.gtk_widget_queue_draw(@ptrCast(self.area));
+    }
 };
 
 fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {

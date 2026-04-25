@@ -28,6 +28,9 @@ pub const Action = enum {
     paste,
     split_h,
     split_v,
+    font_inc,
+    font_dec,
+    font_reset,
 };
 
 pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allocator) !*Ctx {
@@ -165,6 +168,32 @@ fn onKeyPressed(
         if (keyval == c.GDK_KEY_Tab) {
             if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .next_tab);
             return 1;
+        }
+        // Ctrl+- / Ctrl+= (typed as Ctrl+plus on US) / Ctrl+0
+        switch (keyval) {
+            c.GDK_KEY_minus, c.GDK_KEY_KP_Subtract => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .font_dec);
+                return 1;
+            },
+            c.GDK_KEY_equal, c.GDK_KEY_plus, c.GDK_KEY_KP_Add => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .font_inc);
+                return 1;
+            },
+            c.GDK_KEY_0, c.GDK_KEY_KP_0 => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .font_reset);
+                return 1;
+            },
+            else => {},
+        }
+    }
+    // Ctrl+Shift++ as a fallback for keyboards where + is shift+=.
+    if (ctrl_pressed and shift_pressed) {
+        switch (keyval) {
+            c.GDK_KEY_plus => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .font_inc);
+                return 1;
+            },
+            else => {},
         }
     }
     if (ctrl_pressed and shift_pressed and keyval == c.GDK_KEY_ISO_Left_Tab) {

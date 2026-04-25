@@ -588,6 +588,31 @@ pub const Window = struct {
         _ = c.gtk_widget_grab_focus(entry);
     }
 
+    /// Bump the focused pane's font size by `delta` points (clamped
+     /// 6..72) and rebuild the atlas. -1 / +1 / reset are exposed via
+     /// Ctrl+- / Ctrl+= / Ctrl+0.
+    pub fn adjustFocusedFontSize(self: *Window, delta: i32) void {
+        const pane = self.focusedPane() orelse return;
+        const new: i32 = @as(i32, @intCast(pane.font_size)) + delta;
+        const clamped: u16 = @intCast(std.math.clamp(new, 6, 72));
+        if (clamped == pane.font_size) return;
+        pane.setFontSize(clamped);
+    }
+
+    pub fn resetFocusedFontSize(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+        if (pane.font_size == self.config.font_size) return;
+        pane.setFontSize(self.config.font_size);
+    }
+
+    fn focusedPane(self: *Window) ?*Pane {
+        const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return null;
+        for (self.panes.items) |p| {
+            if (@intFromPtr(p.widget()) == @intFromPtr(focus)) return p;
+        }
+        return null;
+    }
+
     /// Close the focused pane. If it's the only pane in its tab,
     /// closes the tab. Otherwise the pane is removed from its
     /// parent GtkPaned and the sibling takes its place.
@@ -753,6 +778,9 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .prev_tab => self.prevTab(),
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {},
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
+        .font_inc => self.adjustFocusedFontSize(1),
+        .font_dec => self.adjustFocusedFontSize(-1),
+        .font_reset => self.resetFocusedFontSize(),
         else => {},
     }
 }
