@@ -36,6 +36,11 @@ pub fn build(b: *std.Build) void {
         .use_lld = true,  // self-hosted linker can't handle gcc 15's SFrame relocs in crt1
     });
     for (sys_libs) |lib| exe.linkSystemLibrary(lib);
+    exe.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    exe.addIncludePath(b.path("vendor"));
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -57,6 +62,11 @@ pub fn build(b: *std.Build) void {
         .use_lld = true,
     });
     for (sys_libs) |lib| spike.linkSystemLibrary(lib);
+    spike.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    spike.addIncludePath(b.path("vendor"));
     b.installArtifact(spike);
     const spike_run = b.addRunArtifact(spike);
     const spike_step = b.step("spike-gl", "Run the M0.5 GL share-group spike");
@@ -75,6 +85,11 @@ pub fn build(b: *std.Build) void {
         .use_lld = true,
     });
     for (sys_libs) |lib| shell.linkSystemLibrary(lib);
+    shell.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    shell.addIncludePath(b.path("vendor"));
     b.installArtifact(shell);
     const shell_run = b.addRunArtifact(shell);
     const shell_step = b.step("spike-shell", "Headless PTY/parser/screen smoke");
@@ -91,6 +106,11 @@ pub fn build(b: *std.Build) void {
         .use_lld = true,
     });
     for (sys_libs) |lib| tests.linkSystemLibrary(lib);
+    tests.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    tests.addIncludePath(b.path("vendor"));
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

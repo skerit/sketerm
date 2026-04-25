@@ -7,6 +7,7 @@
 //! as raw PNG bytes). Real RGBA decode lands in a follow-up.
 
 const std = @import("std");
+const c = @import("../c.zig").c;
 
 pub const Decoded = struct {
     /// Decoded RGBA pixel buffer, or empty if format not supported.
@@ -50,7 +51,7 @@ pub fn decodePayload(allocator: std.mem.Allocator, payload: []const u8) !Decoded
     const decoder = std.base64.standard.Decoder;
     const out_len = decoder.calcSizeForSlice(stripped.items) catch return error.InvalidBase64;
     const decoded = try allocator.alloc(u8, out_len);
-    errdefer allocator.free(decoded);
+    defer allocator.free(decoded);
     decoder.decode(decoded, stripped.items) catch return error.InvalidBase64;
 
     // PNG detection — first 8 bytes are 89 50 4E 47 0D 0A 1A 0A.
@@ -65,24 +66,29 @@ pub fn decodePayload(allocator: std.mem.Allocator, payload: []const u8) !Decoded
         };
     }
 
-    // Extract dimensions from the IHDR chunk (first chunk after sig).
-    // IHDR: 4-byte length, 4-byte type "IHDR", 13 bytes data, 4-byte CRC.
-    // Width is bytes 16..20, height bytes 20..24.
-    if (decoded.len < 24) {
-        allocator.free(decoded);
-        return error.InvalidPng;
-    }
-    const w = std.mem.readInt(u32, decoded[16..20], .big);
-    const h = std.mem.readInt(u32, decoded[20..24], .big);
+    // Decode PNG → RGBA via vendored stb_image.
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var channels: c_int = 0;
+    const pix_ptr = c.stbi_load_from_memory(
+        decoded.ptr,
+        @intCast(decoded.len),
+        &w,
+        &h,
+        &channels,
+        4,
+    );
+    if (pix_ptr == null or w <= 0 or h <= 0) return error.PngDecode;
 
-    // For v1 we don't actually decode the PNG to RGBA — that requires
-    // libpng or stb_image. Just return the dimensions so the consumer
-    // can place a stub. Actual decode is a follow-up integration.
-    allocator.free(decoded);
+    const npix: usize = @intCast(w * h * 4);
+    const out_rgba = try allocator.alloc(u8, npix);
+    @memcpy(out_rgba, pix_ptr[0..npix]);
+    c.stbi_image_free(pix_ptr);
+
     return .{
-        .rgba = &.{},
-        .width = w,
-        .height = h,
+        .rgba = out_rgba,
+        .width = @intCast(w),
+        .height = @intCast(h),
         .format = .png,
     };
 }
@@ -96,26 +102,11 @@ fn parsePxAttr(s: []const u8) u32 {
     return n;
 }
 
-test "extract png dimensions" {
-    // Tiny 1x1 PNG (precomputed).
-    const png_bytes = [_]u8{
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // signature
-        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR length + type
-        0x00, 0x00, 0x00, 0x05, // width = 5
-        0x00, 0x00, 0x00, 0x07, // height = 7
-        0x08, 0x06, 0x00, 0x00, 0x00, // bit depth, color, compression, filter, interlace
-    };
-    var b64_buf: [128]u8 = undefined;
-    const enc = std.base64.standard.Encoder;
-    const b64 = enc.encode(&b64_buf, &png_bytes);
-
+test "rejects non-PNG payload" {
     var payload: std.ArrayList(u8) = .{};
     defer payload.deinit(std.testing.allocator);
-    try payload.appendSlice(std.testing.allocator, "File=name=t.png:");
-    try payload.appendSlice(std.testing.allocator, b64);
-
+    try payload.appendSlice(std.testing.allocator, "File=name=t.png:bm9wZQ=="); // base64("nope")
     const out = try decodePayload(std.testing.allocator, payload.items);
-    try std.testing.expectEqual(Format.png, out.format);
-    try std.testing.expectEqual(@as(u32, 5), out.width);
-    try std.testing.expectEqual(@as(u32, 7), out.height);
+    defer if (out.rgba.len > 0) std.testing.allocator.free(out.rgba);
+    try std.testing.expectEqual(Format.unsupported, out.format);
 }

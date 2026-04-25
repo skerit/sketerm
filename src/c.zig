@@ -33,4 +33,7 @@ pub const c = @cImport({
     @cInclude("signal.h");
     @cInclude("poll.h");
     @cInclude("errno.h");
+
+    // Vendored stb_image (PNG decode for iTerm2 OSC 1337).
+    @cInclude("stb_image.h");
 });
