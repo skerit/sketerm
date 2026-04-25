@@ -190,6 +190,8 @@ pub const GridPass = struct {
             } else &buf[row - view_off];
             const ln = ln_ptr.*;
             const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
+            // Per-line scaling: DECDWL/DECDHL render at 2× cell width.
+            const x_scale: f32 = if (ln.scaling == .single) 1.0 else 2.0;
 
             // Pass 1 — background quads.
             var col: u16 = 0;
@@ -198,14 +200,15 @@ pub const GridPass = struct {
                 const style = pool.get(cell.style_ref);
                 if (style.bg == .default and !style.attrs.reverse) continue;
                 const bg = self.colorToVec(style.bg, false, style.attrs.reverse);
-                const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw;
-                try self.pushQuad(.{ x, y }, .{ cw, ch }, .{ 0, 0 }, .{ 0, 0 }, bg, 0.0);
+                const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
+                try self.pushQuad(.{ x, y }, .{ cw * x_scale, ch }, .{ 0, 0 }, .{ 0, 0 }, bg, 0.0);
             }
 
             // Pass 2 — glyphs. Bidi reorder runs into visual order
             // when needed (any non-ASCII rune triggers fribidi), then
-            // emit each same-style run via HarfBuzz shaping.
-            try self.emitGlyphsForLine(atlas, pool, ln.cells[0..screen.cols], row, cw, ch, ascent);
+            // emit each same-style run via HarfBuzz shaping. Pass the
+            // line scaling for per-glyph dilation.
+            try self.emitGlyphsForLine(atlas, pool, ln.cells[0..screen.cols], row, cw, ch, ascent, ln.scaling);
         }
 
         // Selection overlay (translucent). Maps selection rows
@@ -466,6 +469,7 @@ pub const GridPass = struct {
         cw: f32,
         ch: f32,
         ascent: f32,
+        scaling: @import("../grid/line.zig").Scaling,
     ) !void {
         if (cells.len == 0) return;
 
@@ -482,21 +486,21 @@ pub const GridPass = struct {
 
         if (!has_non_ascii) {
             // Fast path — logical order = visual order.
-            try self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent);
+            try self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent, scaling);
             return;
         }
 
         // Bidi-reorder path. Compute embedding levels + visual order.
         const bidi = @import("../grid/bidi.zig");
         const levels = self.allocator.alloc(u8, cells.len) catch
-            return self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent);
+            return self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent, scaling);
         defer self.allocator.free(levels);
         const indices = self.allocator.alloc(usize, cells.len) catch
-            return self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent);
+            return self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent, scaling);
         defer self.allocator.free(indices);
 
         const cps = self.allocator.alloc(u32, cells.len) catch
-            return self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent);
+            return self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent, scaling);
         defer self.allocator.free(cps);
         for (cells, 0..) |cell, i| {
             cps[i] = if (cell.rune == 0) ' ' else cell.rune;
@@ -536,7 +540,7 @@ pub const GridPass = struct {
             const tmp = self.allocator.alloc(Cell, run_len) catch break;
             defer self.allocator.free(tmp);
             for (0..run_len) |k| tmp[k] = cells[indices[run_v_start + k]];
-            try self.emitGlyphRun(atlas, pool, tmp, @intCast(run_v_start), row, cw, ch, ascent);
+            try self.emitGlyphRun(atlas, pool, tmp, @intCast(run_v_start), row, cw, ch, ascent, scaling);
         }
     }
 
@@ -549,6 +553,7 @@ pub const GridPass = struct {
         cw: f32,
         ch: f32,
         ascent: f32,
+        scaling: @import("../grid/line.zig").Scaling,
     ) !void {
         var col: u16 = 0;
         const cols: u16 = @intCast(cells.len);
@@ -565,7 +570,7 @@ pub const GridPass = struct {
                 if (!self.isShapable(c2)) break;
                 if (c2.style_ref != run_style) break;
             }
-            try self.emitGlyphRun(atlas, pool, cells[run_start..col], run_start, row, cw, ch, ascent);
+            try self.emitGlyphRun(atlas, pool, cells[run_start..col], run_start, row, cw, ch, ascent, scaling);
         }
     }
 
@@ -582,12 +587,21 @@ pub const GridPass = struct {
         cw: f32,
         ch: f32,
         ascent: f32,
+        scaling: @import("../grid/line.zig").Scaling,
     ) !void {
         if (cells.len == 0) return;
         const style = pool.get(cells[0].style_ref);
         const fg = self.colorToVec(style.fg, true, style.attrs.reverse);
         const pad: f32 = self.pad;
         const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
+        // x-axis dilation: DECDWL/DECDHL render at 2x cell width.
+        const x_scale: f32 = if (scaling == .single) 1.0 else 2.0;
+        // y-axis offset for DECDHL: top half shifts the glyph origin
+        // down by ascent, bottom half shifts it up — together they
+        // present a single 2x-tall character spanning two rows.
+        // Glyph dilation matches: 2x for any non-single scaling.
+        const y_scale: f32 = if (scaling == .dhl_top or scaling == .dhl_bot) 2.0 else 1.0;
+        const y_origin_shift: f32 = if (scaling == .dhl_bot) -ch else 0.0;
 
         // Build UTF-8 of run + parallel byte→cell-index map.
         var bytes: [512]u8 = undefined;
@@ -616,16 +630,16 @@ pub const GridPass = struct {
                         const sg = shaped[i];
                         const start_cell = if (sg.cluster < blen) byte_to_cell[sg.cluster] else 0;
                         const start_col: u16 = col_start + start_cell;
-                        const x: f32 = pad + @as(f32, @floatFromInt(start_col)) * cw;
+                        const x: f32 = pad + @as(f32, @floatFromInt(start_col)) * cw * x_scale;
                         const g = atlas.lookupOrLoadById(sg.glyph_id) catch continue;
                         if (g.w == 0 or g.h == 0) continue;
                         // HarfBuzz positions in 26.6 fixed-point.
                         const xoff: f32 = @as(f32, @floatFromInt(sg.x_offset)) / 64.0;
                         const yoff: f32 = @as(f32, @floatFromInt(sg.y_offset)) / 64.0;
-                        const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x)) + xoff;
-                        const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) - yoff;
-                        const gw: f32 = @floatFromInt(g.w);
-                        const gh: f32 = @floatFromInt(g.h);
+                        const gx: f32 = x + (@as(f32, @floatFromInt(g.bearing_x)) + xoff) * x_scale;
+                        const gy: f32 = y + ascent - (@as(f32, @floatFromInt(g.bearing_y)) + yoff) * y_scale + y_origin_shift;
+                        const gw: f32 = @as(f32, @floatFromInt(g.w)) * x_scale;
+                        const gh: f32 = @as(f32, @floatFromInt(g.h)) * y_scale;
                         try self.pushQuad(
                             .{ gx, gy },
                             .{ gw, gh },
@@ -643,13 +657,13 @@ pub const GridPass = struct {
         // Fallback: per-codepoint.
         for (cells, 0..) |cell, idx| {
             if (cell.rune == 0 or cell.rune == ' ') continue;
-            const x: f32 = pad + @as(f32, @floatFromInt(col_start + idx)) * cw;
+            const x: f32 = pad + @as(f32, @floatFromInt(col_start + idx)) * cw * x_scale;
             const g = atlas.lookupOrLoad(cell.rune) catch continue;
             if (g.w == 0 or g.h == 0) continue;
-            const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x));
-            const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y));
-            const gw: f32 = @floatFromInt(g.w);
-            const gh: f32 = @floatFromInt(g.h);
+            const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
+            const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;
+            const gw: f32 = @as(f32, @floatFromInt(g.w)) * x_scale;
+            const gh: f32 = @as(f32, @floatFromInt(g.h)) * y_scale;
             try self.pushQuad(
                 .{ gx, gy },
                 .{ gw, gh },

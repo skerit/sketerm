@@ -1877,6 +1877,23 @@ pub const Screen = struct {
             self.pending_wrap = false;
             return;
         }
+        // DECDHL / DECDWL / DECSWL — per-line scaling.
+        //   #3 = double-height top half
+        //   #4 = double-height bottom half
+        //   #5 = single width / single height (default)
+        //   #6 = double-width single height
+        if (ef.n_intermediates == 1 and ef.intermediates[0] == '#') {
+            const ln = self.line(self.row);
+            switch (ef.final) {
+                '3' => ln.scaling = .dhl_top,
+                '4' => ln.scaling = .dhl_bot,
+                '5' => ln.scaling = .single,
+                '6' => ln.scaling = .dwl,
+                else => {},
+            }
+            ln.dirty = true;
+            return;
+        }
         switch (ef.final) {
             '7' => self.saveCursor(),
             '8' => self.restoreCursor(),
@@ -3420,4 +3437,54 @@ test "kitty kbd: CSI ? u query replies" {
     q.final = 'u';
     s.csi(q);
     try std.testing.expectEqualStrings("\x1b[?5u", Recv.got[0..Recv.got_len]);
+}
+
+test "DECDWL ESC #6 sets line scaling to dwl" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 3);
+    defer s.deinit();
+    s.row = 1;
+    var ef = Event.EscFinal{};
+    ef.intermediates[0] = '#';
+    ef.n_intermediates = 1;
+    ef.final = '6';
+    s.escFinal(ef);
+    try std.testing.expectEqual(@import("line.zig").Scaling.dwl, s.active[1].scaling);
+}
+
+test "DECDHL top + bottom on consecutive lines" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 3);
+    defer s.deinit();
+    s.row = 0;
+    var top = Event.EscFinal{};
+    top.intermediates[0] = '#';
+    top.n_intermediates = 1;
+    top.final = '3';
+    s.escFinal(top);
+    s.row = 1;
+    var bot = Event.EscFinal{};
+    bot.intermediates[0] = '#';
+    bot.n_intermediates = 1;
+    bot.final = '4';
+    s.escFinal(bot);
+    try std.testing.expectEqual(@import("line.zig").Scaling.dhl_top, s.active[0].scaling);
+    try std.testing.expectEqual(@import("line.zig").Scaling.dhl_bot, s.active[1].scaling);
+}
+
+test "DECSWL ESC #5 resets scaling" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    s.active[0].scaling = .dwl;
+    s.row = 0;
+    var ef = Event.EscFinal{};
+    ef.intermediates[0] = '#';
+    ef.n_intermediates = 1;
+    ef.final = '5';
+    s.escFinal(ef);
+    try std.testing.expectEqual(@import("line.zig").Scaling.single, s.active[0].scaling);
 }
