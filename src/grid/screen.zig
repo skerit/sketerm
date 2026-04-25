@@ -189,6 +189,8 @@ pub const Screen = struct {
         on_cwd: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
         on_image: ?*const fn (ctx: ?*anyopaque, img: ImageEvent) void = null,
         on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
+        /// Kitty delete dispatch. id=0 means "all visible images".
+        on_image_delete: ?*const fn (ctx: ?*anyopaque, image_id: u32) void = null,
     };
 
     pub const ImageEvent = struct {
@@ -199,6 +201,8 @@ pub const Screen = struct {
         rgba: []const u8,
         row: u16,
         col: u16,
+        /// Kitty graphics image_id (0 = sixel/iterm2/anonymous).
+        image_id: u32 = 0,
     };
 
     pub fn init(allocator: std.mem.Allocator, pool: *Pool, cols: u16, rows: u16) !*Screen {
@@ -510,11 +514,13 @@ pub const Screen = struct {
             return;
         }
 
-        // Delete actions — accept-and-noop. ImageStore lives on the
-        // Pane side; selective deletion needs an `on_image_delete`
-        // sink before we can wire it. For now, no error so apps
-        // continue rather than fall back to a different protocol.
-        if (cmd.action == .delete) return;
+        // Delete action — fire the sink so the Pane's ImageStore
+        // marks matching textures for GL-side cleanup.
+        if (cmd.action == .delete) {
+            if (self.sink.on_image_delete) |f| f(self.sink.ctx, cmd.image_id);
+            self.dirty = true;
+            return;
+        }
 
         // v1: just notify the sink with raw cmd via the existing image
         // event when we have RGBA. For format=32 (RGBA), payload IS
@@ -536,6 +542,7 @@ pub const Screen = struct {
                 .rgba = decode_buf[0..expected],
                 .row = self.row,
                 .col = self.col,
+                .image_id = cmd.image_id,
             });
         }
     }

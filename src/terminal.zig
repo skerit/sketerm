@@ -39,6 +39,7 @@ pub const Terminal = struct {
     on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
+    on_image_delete: ?*const fn (ctx: ?*anyopaque, image_id: u32) void = null,
     on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
 
     /// Most recent cwd reported via OSC 7 (file://host/path → /path).
@@ -95,6 +96,7 @@ pub const Terminal = struct {
             .on_clipboard_set = sinkClipboard,
             .on_cwd = sinkCwd,
             .on_image = sinkImage,
+            .on_image_delete = sinkImageDelete,
             .on_notification = sinkNotification,
         };
 
@@ -141,6 +143,11 @@ pub const Terminal = struct {
     fn sinkImage(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
         if (self.on_image) |f| f(self.user_ctx, img);
+    }
+
+    fn sinkImageDelete(ctx: ?*anyopaque, image_id: u32) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_image_delete) |f| f(self.user_ctx, image_id);
     }
 
     fn sinkNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {

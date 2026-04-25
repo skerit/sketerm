@@ -86,6 +86,7 @@ pub const Pane = struct {
         // forwarded to Window if its sinks are set.
         terminal.user_ctx = @ptrCast(self);
         terminal.on_image = onImageEvent;
+        terminal.on_image_delete = onImageDeleteEvent;
         terminal.on_title = onTitleEvent;
         terminal.on_clipboard_set = onClipboardEvent;
         terminal.on_notification = onNotificationEvent;
@@ -303,8 +304,14 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
 
 fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
-    self.image_store.add(img.rgba, img.width, img.height, img.row, img.col) catch {};
+    self.image_store.addWithId(img.rgba, img.width, img.height, img.row, img.col, img.image_id) catch {};
     // Force redraw to upload + display.
+    self.terminal.screen.dirty = true;
+}
+
+fn onImageDeleteEvent(ctx: ?*anyopaque, image_id: u32) void {
+    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    if (image_id == 0) self.image_store.markAllForDelete() else self.image_store.markByIdForDelete(image_id);
     self.terminal.screen.dirty = true;
 }
 

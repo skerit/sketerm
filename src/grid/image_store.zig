@@ -17,6 +17,10 @@ pub const Image = struct {
     gl_tex: c_uint = 0,
     /// Owned pixel buffer pending GL upload.
     pending: ?[]u8 = null,
+    /// Kitty graphics image_id (0 = no id, sixel/iterm2).
+    image_id: u32 = 0,
+    /// Marked for deletion — flushUploads will free its GL texture.
+    deleting: bool = false,
 };
 
 pub const Store = struct {
@@ -50,6 +54,18 @@ pub const Store = struct {
         row: u16,
         col: u16,
     ) !void {
+        return self.addWithId(rgba, width, height, row, col, 0);
+    }
+
+    pub fn addWithId(
+        self: *Store,
+        rgba: []const u8,
+        width: u32,
+        height: u32,
+        row: u16,
+        col: u16,
+        image_id: u32,
+    ) !void {
         const need = width * height * 4;
         if (rgba.len < need) return error.NotEnoughPixels;
         const copy = try self.allocator.dupe(u8, rgba[0..need]);
@@ -59,12 +75,40 @@ pub const Store = struct {
             .cell_row = row,
             .cell_col = col,
             .pending = copy,
+            .image_id = image_id,
         });
     }
 
-    /// Upload pending images to GL. Caller must have a current
-    /// GL context.
+    /// Mark all images for deletion. Real teardown happens in
+    /// flushUploads when the GL context is current.
+    pub fn markAllForDelete(self: *Store) void {
+        for (self.images.items) |*img| img.deleting = true;
+    }
+
+    /// Mark images with a matching kitty image_id for deletion.
+    pub fn markByIdForDelete(self: *Store, image_id: u32) void {
+        if (image_id == 0) return;
+        for (self.images.items) |*img| {
+            if (img.image_id == image_id) img.deleting = true;
+        }
+    }
+
+    /// Upload pending images to GL, free deleted ones. Caller must
+    /// have a current GL context.
     pub fn flushUploads(self: *Store) void {
+        // Free GL textures for items marked deleting.
+        var i: usize = 0;
+        while (i < self.images.items.len) {
+            var img = &self.images.items[i];
+            if (img.deleting) {
+                if (img.pending) |p| self.allocator.free(p);
+                if (img.gl_tex != 0) c.glDeleteTextures(1, &img.gl_tex);
+                _ = self.images.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        // Upload pending pixel buffers.
         for (self.images.items) |*img| {
             const pending = img.pending orelse continue;
             if (img.gl_tex == 0) c.glGenTextures(1, &img.gl_tex);
