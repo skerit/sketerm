@@ -6,8 +6,8 @@ v0.1 binary.
 
 ## Time
 - Started: ~00:44 local
-- ~194 commits, ~10.9 kLOC of Zig + 8 kLOC vendored stb_image
-- 209 unit tests pass
+- ~197 commits, ~11.0 kLOC of Zig + 8 kLOC vendored stb_image
+- 226 unit tests pass
 
 ## What got built
 
@@ -231,7 +231,22 @@ files:
 `docs/external-references.md` documents what's in external/
 and which test files are worth porting next.
 
-Total: **209/209 tests pass**, up from 102.
+Total: **226/226 tests pass**, up from 102.
+
+Coverage by file (final count this round):
+- `conformance_test.zig` — 11
+- `screen_conformance_test.zig` — 41
+- `wezterm_conformance_test.zig` — 18
+- `multicell_conformance_test.zig` — 9
+- `clipboard_conformance_test.zig` — 8
+- `selection_conformance_test.zig` — 8
+- `input_conformance_test.zig` — 14
+- `graphics_conformance_test.zig` — 9
+- pre-existing tests in vt.zig / screen.zig / etc — 108
+
+The 124-test delta came from porting kitty/kitty_tests/parser.py,
+screen.py, multicell.py, clipboard.py, keys.py, plus
+wezterm/term/src/test/{c0,c1,csi}.rs.
 
 ## What's left
 
