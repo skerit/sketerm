@@ -24,7 +24,7 @@ const Scaling = @import("../grid/line.zig").Scaling;
 const palette_default = @import("../grid/palette.zig").default_256;
 
 /// Per-cell instance data. Layout matches the vertex attribs
-/// declared in `realize`. 88 bytes — for 200×80 cells: 1.4 MB.
+/// declared in `realize`. 92 bytes — for 200×80 cells: 1.45 MB.
 pub const Instance = extern struct {
     cell_xy: [2]f32 = .{ 0, 0 },
     cell_size: [2]f32 = .{ 0, 0 },
@@ -38,6 +38,10 @@ pub const Instance = extern struct {
     glyph_layer: f32 = 0,
     /// 0 = render glyph normally; >0.5 = no glyph (degenerate triangle).
     has_glyph: f32 = 0,
+    /// Line-decoration kind. 0 = none, 1 = underline, 2 = double
+    /// underline, 3 = curly underline, 4 = strikethrough, 5 = overline.
+    /// Drawn in a third pass after bg + glyph; uses `fg` for color.
+    deco: f32 = 0,
 };
 
 const VERT_SRC =
@@ -52,14 +56,18 @@ const VERT_SRC =
     \\in vec2 a_glyph_uv1;
     \\in float a_glyph_layer;
     \\in float a_has_glyph;
+    \\in float a_deco;
     \\
     \\uniform vec2 u_screen_px;
-    \\uniform int u_kind; // 0 = bg, 1 = glyph
+    \\uniform int u_kind; // 0 = bg, 1 = glyph, 2 = decoration
     \\
     \\out vec4 v_color;
     \\out vec3 v_uvw;
     \\out float v_is_glyph;
     \\out float v_emit;
+    \\out float v_deco_kind;
+    \\out vec2 v_deco_local;
+    \\out float v_deco_w_px;
     \\
     \\const vec2 corners[6] = vec2[6](
     \\    vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
@@ -68,32 +76,65 @@ const VERT_SRC =
     \\
     \\void main() {
     \\    vec2 corner = corners[gl_VertexID];
-    \\    vec2 origin;
-    \\    vec2 size;
-    \\    vec2 uv;
+    \\    vec2 origin = a_cell_xy;
+    \\    vec2 size = a_cell_size;
+    \\    vec2 uv = vec2(0.0);
+    \\    v_deco_kind = 0.0;
+    \\    v_deco_local = vec2(0.0);
+    \\    v_deco_w_px = a_cell_size.x;
     \\    if (u_kind == 0) {
-    \\        // Background quad.
-    \\        origin = a_cell_xy;
-    \\        size = a_cell_size;
     \\        v_color = a_bg;
-    \\        uv = vec2(0.0);
     \\        v_is_glyph = 0.0;
     \\        v_emit = (a_bg.a > 0.001) ? 1.0 : 0.0;
-    \\    } else {
-    \\        // Glyph quad.
+    \\    } else if (u_kind == 1) {
     \\        origin = a_glyph_xy;
     \\        size = a_glyph_size;
     \\        v_color = a_fg;
     \\        uv = mix(a_glyph_uv0, a_glyph_uv1, corner);
     \\        v_is_glyph = 1.0;
     \\        v_emit = (a_has_glyph < 0.5 && a_glyph_size.x > 0.0 && a_glyph_size.y > 0.0) ? 1.0 : 0.0;
+    \\    } else {
+    \\        // Decoration: derive a strip rect from the cell rect.
+    \\        // Heights: thin = max(2, ch/12). Curly is taller (ch/6)
+    \\        // because the wave needs vertical room.
+    \\        float kind = a_deco + 0.5;
+    \\        float ch = a_cell_size.y;
+    \\        float thin = max(2.0, ch / 12.0);
+    \\        float curly_h = max(3.0, ch / 6.0);
+    \\        float dy = 0.0;
+    \\        float dh = thin;
+    \\        if (kind >= 1.0 && kind < 2.0) {
+    \\            // single underline — bottom strip
+    \\            dy = ch - thin;
+    \\            dh = thin;
+    \\        } else if (kind >= 2.0 && kind < 3.0) {
+    \\            // double underline — bottom 3px strip; frag draws 2 lines
+    \\            dy = ch - thin * 2.0 - 1.0;
+    \\            dh = thin * 2.0 + 1.0;
+    \\        } else if (kind >= 3.0 && kind < 4.0) {
+    \\            // curly underline — taller strip near the bottom
+    \\            dy = ch - curly_h;
+    \\            dh = curly_h;
+    \\        } else if (kind >= 4.0 && kind < 5.0) {
+    \\            // strikethrough — middle
+    \\            dy = ch * 0.55 - thin * 0.5;
+    \\            dh = thin;
+    \\        } else if (kind >= 5.0 && kind < 6.0) {
+    \\            // overline — top strip
+    \\            dy = 0.0;
+    \\            dh = thin;
+    \\        }
+    \\        origin = a_cell_xy + vec2(0.0, dy);
+    \\        size = vec2(a_cell_size.x, dh);
+    \\        v_color = a_fg;
+    \\        v_is_glyph = 0.0;
+    \\        v_deco_kind = a_deco;
+    \\        v_deco_local = corner;
+    \\        v_emit = (a_deco > 0.5) ? 1.0 : 0.0;
     \\    }
     \\    v_uvw = vec3(uv, a_glyph_layer);
     \\    vec2 pos = origin + corner * size;
-    \\    if (v_emit < 0.5) {
-    \\        // Collapse degenerate.
-    \\        pos = vec2(-10000.0);
-    \\    }
+    \\    if (v_emit < 0.5) pos = vec2(-10000.0);
     \\    vec2 ndc = (pos / u_screen_px) * 2.0 - 1.0;
     \\    ndc.y = -ndc.y;
     \\    gl_Position = vec4(ndc, 0.0, 1.0);
@@ -109,6 +150,9 @@ const FRAG_SRC =
     \\in vec3 v_uvw;
     \\in float v_is_glyph;
     \\in float v_emit;
+    \\in float v_deco_kind;
+    \\in vec2 v_deco_local;
+    \\in float v_deco_w_px;
     \\
     \\uniform sampler2DArray u_atlas;
     \\
@@ -119,9 +163,40 @@ const FRAG_SRC =
     \\    if (v_is_glyph > 0.5) {
     \\        float a = texture(u_atlas, v_uvw).r;
     \\        o_frag = vec4(v_color.rgb, a * v_color.a);
-    \\    } else {
-    \\        o_frag = v_color;
+    \\        return;
     \\    }
+    \\    if (v_deco_kind < 0.5) {
+    \\        // Plain bg quad.
+    \\        o_frag = v_color;
+    \\        return;
+    \\    }
+    \\    // Decoration shaders: kinds 1/4/5 (under, strike, over) are flat
+    \\    // strips; 2 (double-underline) draws two thin sub-lines; 3 (curly)
+    \\    // is a sine wave covered by anti-aliased stamping.
+    \\    float kind = v_deco_kind + 0.5;
+    \\    if (kind >= 2.0 && kind < 3.0) {
+    \\        // Double underline: top half + bottom half drawn, gap in middle.
+    \\        float vy = v_deco_local.y;
+    \\        if (vy > 0.33 && vy < 0.66) discard;
+    \\        o_frag = v_color;
+    \\        return;
+    \\    }
+    \\    if (kind >= 3.0 && kind < 4.0) {
+    \\        // Curly: y midline with sine wave. Period ~= cell width / 1.5.
+    \\        float x = v_deco_local.x * v_deco_w_px;
+    \\        float wave = sin(x * 6.2831853 / max(8.0, v_deco_w_px / 1.5));
+    \\        float yc = 0.5 + 0.45 * wave; // 0..1 within strip
+    \\        float dist = abs(v_deco_local.y - yc);
+    \\        // ~1.5 px-equivalent line thickness in strip space.
+    \\        float strip_px = max(3.0, v_deco_w_px / 6.0);
+    \\        float thickness = 1.5 / strip_px;
+    \\        if (dist > thickness) discard;
+    \\        // Anti-alias the edge.
+    \\        float aa = clamp((thickness - dist) / (thickness * 0.5), 0.0, 1.0);
+    \\        o_frag = vec4(v_color.rgb, v_color.a * aa);
+    \\        return;
+    \\    }
+    \\    o_frag = v_color;
     \\}
 ;
 
@@ -211,6 +286,7 @@ pub const CellPass = struct {
             .{ .name = "a_glyph_uv1", .off = @offsetOf(Instance, "glyph_uv1"), .count = 2 },
             .{ .name = "a_glyph_layer", .off = @offsetOf(Instance, "glyph_layer"), .count = 1 },
             .{ .name = "a_has_glyph", .off = @offsetOf(Instance, "has_glyph"), .count = 1 },
+            .{ .name = "a_deco", .off = @offsetOf(Instance, "deco"), .count = 1 },
         };
         for (fields) |f| {
             const loc = c.glGetAttribLocation(self.program, f.name.ptr);
@@ -362,6 +438,24 @@ pub const CellPass = struct {
             const fg = self.colorToVec(style.fg, true, style.attrs.reverse);
             slice[col].fg = fg;
             slice[col].has_glyph = 1.0; // 1 = no glyph until we set one
+            // Decoration kind from style attrs. Multiple flags can be
+            // set; we pick the most-specific underline (curly > double
+            // > single) and combine with strike/overline only if no
+            // underline is set (rendered as the only deco). For real
+            // multi-deco coverage we'd need 3 passes; one is enough.
+            if (style.attrs.curly_underline) {
+                slice[col].deco = 3;
+            } else if (style.attrs.double_underline) {
+                slice[col].deco = 2;
+            } else if (style.attrs.underline) {
+                slice[col].deco = 1;
+            } else if (style.attrs.strikethrough) {
+                slice[col].deco = 4;
+            } else if (style.attrs.overline) {
+                slice[col].deco = 5;
+            } else {
+                slice[col].deco = 0;
+            }
 
             // Per-codepoint glyph (will be overridden by ligature shaping
             // below if applicable).
@@ -541,6 +635,13 @@ pub const CellPass = struct {
         c.glUniform1i(self.u_kind, 1);
         c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, @intCast(self.instances.items.len));
 
+        // Pass 3: line decorations (underline / double / curly /
+        // strike / overline). The vertex shader collapses cells with
+        // deco=0 to a degenerate triangle, so cells without
+        // decorations cost only the vertex throughput.
+        c.glUniform1i(self.u_kind, 2);
+        c.glDrawArraysInstanced(c.GL_TRIANGLES, 0, 6, @intCast(self.instances.items.len));
+
         c.glDisable(c.GL_BLEND);
         c.glBindVertexArray(0);
     }
@@ -572,6 +673,6 @@ fn rowHasNonAscii(cells: []const Cell) bool {
     return false;
 }
 
-test "Instance is 88 bytes" {
-    try std.testing.expectEqual(@as(usize, 88), @sizeOf(Instance));
+test "Instance is 92 bytes" {
+    try std.testing.expectEqual(@as(usize, 92), @sizeOf(Instance));
 }
