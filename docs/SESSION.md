@@ -563,3 +563,10 @@ Cron `7,37 * * * *` set to keep iterating if more work surfaces.
 - **fullReset** also wipes reverse_screen + kitty_kbd_flags + bounces
   VT52 → ANSI (via Sink.on_decanm) so Reset Terminal recovers from
   any of the modes added in M11/M15.
+
+## Cron tick 17:25 (self-scheduled wakeup)
+
+Brief tick — confirmed all green (306 tests, build clean). Plan-v2
+table updated to reflect completion status. No new code; the system
+has reached a natural settle point. Next CronCreate-driven tick at
+17:37 will pick up if more items surface.
