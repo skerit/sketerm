@@ -478,6 +478,22 @@ pub const Screen = struct {
                 if (self.sink.on_cwd) |f| f(self.sink.ctx, rest);
             },
             8 => self.handleOsc8(rest),
+            10, 11 => {
+                // OSC 10/11 fg/bg color query: `?` returns the
+                // current default. Set is `OSC 10 ; rgb:.../.../...`
+                // (we don't process set yet — apps rarely ask).
+                if (rest.len == 1 and rest[0] == '?') {
+                    var resp_buf: [64]u8 = undefined;
+                    // Match the renderer's hard-coded defaults
+                    // (default_fg/default_bg in grid_pass).
+                    const c_str: []const u8 = if (num == 10)
+                        "10;rgb:eaea/eaea/eaea"
+                    else
+                        "11;rgb:1a1a/1a1a/1a1a";
+                    const s = std.fmt.bufPrint(&resp_buf, "\x1b]{s}\x1b\\", .{c_str}) catch return;
+                    self.respond(s);
+                }
+            },
             52 => {
                 // OSC 52 — `Pc;Pd` where Pc is selection (c=clipboard,
                 // p=primary, etc) and Pd is base64-encoded text or '?'.
