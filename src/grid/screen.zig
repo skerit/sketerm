@@ -386,7 +386,12 @@ pub const Screen = struct {
                     try out.appendSlice(allocator, ub[0..n]);
                 }
             }
-            if (row != r.bot_row) try out.append(allocator, '\n');
+            if (row != r.bot_row) {
+                // Suppress the newline if the next row is a soft-wrap
+                // continuation — we want one logical line.
+                const next_continues = if (self.lineAt(row + 1)) |l| l.continues_above else false;
+                if (!next_continues) try out.append(allocator, '\n');
+            }
         }
         return try out.toOwnedSlice(allocator);
     }
@@ -394,16 +399,21 @@ pub const Screen = struct {
     /// Returns the cells slice for a display row, including scrollback
     /// (negative rows). Returns null on out-of-range.
     fn lineCellsAt(self: *const Screen, row: i32) ?[]Cell {
+        return if (self.lineAt(row)) |l| l.cells else null;
+    }
+
+    /// Returns a *const Line at a display row, or null on OOB.
+    fn lineAt(self: *const Screen, row: i32) ?*const Line {
         if (row >= 0 and row < @as(i32, @intCast(self.rows))) {
             const buf_const = if (self.use_alt) self.alt.? else self.active;
-            return buf_const[@intCast(row)].cells;
+            return &buf_const[@intCast(row)];
         }
         if (row < 0) {
             const idx_from_end: u32 = @intCast(-row - 1);
             const sb_count = self.scrollbackCount();
             if (idx_from_end >= sb_count) return null;
             const idx = sb_count - 1 - idx_from_end;
-            return self.scrollback.items[idx].cells;
+            return &self.scrollback.items[idx];
         }
         return null;
     }
@@ -1940,4 +1950,19 @@ test "DECRQM reports mode state" {
     const got = TestSink.captured[0..TestSink.captured_len];
     // Autowrap is on by default → set → reply Ps=1.
     try std.testing.expectEqualStrings("\x1b[?7;1$y", got);
+}
+
+test "soft-wrap selection joins without newline" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 2);
+    defer s.deinit();
+    inline for ("hellowor") |ch| s.printCp(ch);
+    s.selection.start(0, 0, .normal);
+    // Selection end is exclusive — col 4 covers row 1 [w o r].
+    s.selection.extend(1, 4);
+    const out = try s.extractSelection(std.testing.allocator);
+    defer std.testing.allocator.free(out);
+    // Without soft-wrap awareness this would be "hello\nwor".
+    try std.testing.expectEqualStrings("hellowor", out);
 }
