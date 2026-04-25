@@ -33,6 +33,7 @@ pub const Action = enum {
     font_reset,
     search_open,
     save_layout,
+    save_layout_as,
     prompt_prev,
     prompt_next,
 };
@@ -170,7 +171,11 @@ fn onKeyPressed(
                 return 1;
             },
             c.GDK_KEY_S, c.GDK_KEY_s => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .save_layout);
+                const alt_held = (state & c.GDK_ALT_MASK) != 0;
+                if (ctx.shortcut_sink) |f| {
+                    if (alt_held) f(ctx.shortcut_ctx, .save_layout_as)
+                    else f(ctx.shortcut_ctx, .save_layout);
+                }
                 return 1;
             },
             else => {},

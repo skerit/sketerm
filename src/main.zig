@@ -43,6 +43,7 @@ const HELP_TEXT =
     \\  Ctrl+Shift+K          Clear screen + scrollback
     \\  Ctrl+Shift+F          Open scrollback search
     \\  Ctrl+Shift+S          Save current layout (last.json)
+    \\  Ctrl+Shift+Alt+S      Save Layout As… (file picker)
     \\  Ctrl+Shift+Up/Down    Jump to prev/next OSC 133 prompt mark
     \\  Ctrl+= / Ctrl+-       Increase / decrease font size
     \\  Ctrl+0                Reset font size

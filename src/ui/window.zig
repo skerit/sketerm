@@ -976,6 +976,23 @@ pub const Window = struct {
         return error.PaneNotFound;
     }
 
+    /// Open a GtkFileChooserNative for save-as; user picks a path,
+    /// we serialize the current layout to it. Defaults to .json (the
+    /// authoritative format) — pick `.layout` if you want the simple
+    /// DSL but only JSON is implemented for save right now.
+    pub fn saveLayoutAs(self: *Window) void {
+        const dialog = c.gtk_file_dialog_new();
+        c.gtk_file_dialog_set_title(dialog, "Save Layout");
+        c.gtk_file_dialog_set_initial_name(dialog, "layout.json");
+        c.gtk_file_dialog_save(
+            dialog,
+            @ptrCast(self.app_window),
+            null,
+            @ptrCast(&onSaveLayoutAsDone),
+            @ptrCast(self),
+        );
+    }
+
     /// Save current state to the default path. Best-effort.
     pub fn saveLayoutQuietly(self: *Window) void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
@@ -1002,6 +1019,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .font_reset => self.resetFocusedFontSize(),
         .search_open => self.openSearch(),
         .save_layout => self.saveLayoutQuietly(),
+        .save_layout_as => self.saveLayoutAs(),
         .prompt_prev => self.jumpPromptOnFocused(.prev),
         .prompt_next => self.jumpPromptOnFocused(.next),
         else => {},
@@ -1073,6 +1091,22 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .close_pane => self.closeFocusedPane(),
         else => {},
     }
+}
+
+fn onSaveLayoutAsDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    const dialog: *c.GtkFileDialog = @ptrCast(source);
+    const file = c.gtk_file_dialog_save_finish(dialog, result, null) orelse return;
+    defer c.g_object_unref(file);
+    const path_cstr = c.g_file_get_path(file) orelse return;
+    defer c.g_free(path_cstr);
+    const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
+
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const layout = self.collectLayout(arena) catch return;
+    layout_mod.save(layout, path) catch return;
 }
 
 fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
