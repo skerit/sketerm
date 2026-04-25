@@ -118,10 +118,12 @@ pub const Screen = struct {
     /// Last printed codepoint (for REP, CSI Pn b). 0 = none.
     last_print_cp: u32 = 0,
 
-    /// Default fg / bg color overrides, RGBA in 0..1. Set via OSC
-    /// 10 / 11 / OSC 110 / 111 reset. Renderer syncs from these.
+    /// Default fg / bg / cursor color overrides, RGBA in 0..1.
+    /// Set via OSC 10 / 11 / 12, reset via OSC 110 / 111 / 112.
+    /// Renderer syncs from these. cursor_color all-zero = use fg.
     default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
     default_bg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 },
+    cursor_color: [4]f32 = .{ 0, 0, 0, 0 },
 
     /// Custom tab stops. One bool per column, true = stop set.
     /// Default: every 8th column starting at 0.
@@ -481,8 +483,9 @@ pub const Screen = struct {
     /// Reply current fg/bg/cursor color in xterm `rgb:RRRR/GGGG/BBBB` form.
     fn respondColor(self: *Screen, osc_num: u32) void {
         const rgba = switch (osc_num) {
-            10, 12 => self.default_fg,
+            10 => self.default_fg,
             11 => self.default_bg,
+            12 => if (self.cursor_color[3] > 0) self.cursor_color else self.default_fg,
             else => return,
         };
         const r16: u16 = @intFromFloat(@round(rgba[0] * 65535.0));
@@ -724,7 +727,7 @@ pub const Screen = struct {
                     switch (num) {
                         10 => self.default_fg = rgba,
                         11 => self.default_bg = rgba,
-                        12 => {}, // cursor color — not separately stored yet
+                        12 => self.cursor_color = rgba,
                         else => {},
                     }
                     self.dirty = true;
@@ -742,8 +745,11 @@ pub const Screen = struct {
                 self.default_bg = .{ 0.10, 0.10, 0.10, 1.0 };
                 self.dirty = true;
             },
-            // OSC 112 — cursor color reset (no separate state yet).
-            112 => {},
+            // OSC 112 — cursor color reset (sentinel: alpha=0 → use fg).
+            112 => {
+                self.cursor_color = .{ 0, 0, 0, 0 };
+                self.dirty = true;
+            },
             1337 => {
                 // iTerm2 inline image: OSC 1337 ; File=...:<base64> ST
                 const iterm = @import("../parser/iterm_image.zig");

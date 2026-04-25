@@ -309,7 +309,9 @@ pub const GridPass = struct {
             screen.row < screen.rows and screen.col < screen.cols) {
             const cx: f32 = @as(f32, @floatFromInt(screen.col)) * cw;
             const cy: f32 = @as(f32, @floatFromInt(screen.row)) * ch;
-            const fg = self.default_fg;
+            // OSC 12 cursor color override: use it when alpha > 0,
+            // otherwise fall back to default fg.
+            const fg = if (screen.cursor_color[3] > 0) screen.cursor_color else self.default_fg;
             const block_alpha: f32 = 0.85;
 
             const Shape = @import("../grid/screen.zig").Screen.CursorShape;
