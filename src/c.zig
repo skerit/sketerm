@@ -19,6 +19,7 @@ pub const c = @cImport({
     @cInclude("freetype/freetype.h");
     @cInclude("hb.h");
     @cInclude("hb-ft.h");
+    @cInclude("fribidi.h");
 
     // POSIX (for PTY, signals, polling). Order matters slightly:
     // sys/types.h first, then platform-specific.

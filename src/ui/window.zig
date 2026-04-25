@@ -368,6 +368,7 @@ pub const Window = struct {
                 pane.font_path = self.config.font_path;
                 pane.grid_pass.pad = self.config.padding;
                 pane.grid_pass.enable_ligatures = self.config.ligatures;
+        pane.grid_pass.enable_bidi = self.config.bidi;
 
                 try self.panes.append(self.allocator, pane);
                 try self.terminals.append(self.allocator, term);
@@ -524,6 +525,7 @@ pub const Window = struct {
         pane.grid_pass.default_fg = fg_bg.fg;
         pane.grid_pass.default_bg = fg_bg.bg;
         pane.grid_pass.enable_ligatures = self.config.ligatures;
+        pane.grid_pass.enable_bidi = self.config.bidi;
         // Push config-driven defaults onto the screen so OSC 4/10/11
         // queries reply with the configured values until apps override.
         term.screen.default_fg = fg_bg.fg;

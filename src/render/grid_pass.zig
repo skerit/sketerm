@@ -93,6 +93,10 @@ pub const GridPass = struct {
     /// ASCII-ish cells. Falls back to per-codepoint when shaping
     /// fails or the atlas has no hb_font.
     enable_ligatures: bool = true,
+    /// Bidi resolution + visual reorder for RTL runs (Hebrew/Arabic).
+    /// Auto-detects: lines with no non-ASCII printables skip fribidi
+    /// entirely, so the cost is paid only on relevant content.
+    enable_bidi: bool = true,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) GridPass {
@@ -198,25 +202,10 @@ pub const GridPass = struct {
                 try self.pushQuad(.{ x, y }, .{ cw, ch }, .{ 0, 0 }, .{ 0, 0 }, bg, 0.0);
             }
 
-            // Pass 2 — glyphs. Detect runs of same-style printable cells
-            // and shape each run with HarfBuzz when ligatures are on.
-            col = 0;
-            while (col < screen.cols) {
-                const cell = ln.cells[col];
-                if (!self.isShapable(cell)) {
-                    col += 1;
-                    continue;
-                }
-                // Find run end.
-                const run_start = col;
-                const run_style = cell.style_ref;
-                while (col < screen.cols) : (col += 1) {
-                    const c2 = ln.cells[col];
-                    if (!self.isShapable(c2)) break;
-                    if (c2.style_ref != run_style) break;
-                }
-                try self.emitGlyphRun(atlas, pool, ln.cells[run_start..col], run_start, row, cw, ch, ascent);
-            }
+            // Pass 2 — glyphs. Bidi reorder runs into visual order
+            // when needed (any non-ASCII rune triggers fribidi), then
+            // emit each same-style run via HarfBuzz shaping.
+            try self.emitGlyphsForLine(atlas, pool, ln.cells[0..screen.cols], row, cw, ch, ascent);
         }
 
         // Selection overlay (translucent). Maps selection rows
@@ -465,6 +454,121 @@ pub const GridPass = struct {
         return true;
     }
 
+    /// Emit glyphs for a full row, bidi-reordered when needed.
+    /// Logical column index → visual column index: for pure-ASCII
+    /// rows the two are identical and we skip fribidi entirely.
+    fn emitGlyphsForLine(
+        self: *GridPass,
+        atlas: *Atlas,
+        pool: *const StylePool,
+        cells: []const Cell,
+        row: u16,
+        cw: f32,
+        ch: f32,
+        ascent: f32,
+    ) !void {
+        if (cells.len == 0) return;
+
+        // Quick scan: any non-ASCII printable? Skip bidi otherwise.
+        var has_non_ascii = false;
+        if (self.enable_bidi) {
+            for (cells) |cell| {
+                if (cell.rune > 0x7F) {
+                    has_non_ascii = true;
+                    break;
+                }
+            }
+        }
+
+        if (!has_non_ascii) {
+            // Fast path — logical order = visual order.
+            try self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent);
+            return;
+        }
+
+        // Bidi-reorder path. Compute embedding levels + visual order.
+        const bidi = @import("../grid/bidi.zig");
+        const levels = self.allocator.alloc(u8, cells.len) catch
+            return self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent);
+        defer self.allocator.free(levels);
+        const indices = self.allocator.alloc(usize, cells.len) catch
+            return self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent);
+        defer self.allocator.free(indices);
+
+        const cps = self.allocator.alloc(u32, cells.len) catch
+            return self.emitRowRunsLogical(atlas, pool, cells, row, cw, ch, ascent);
+        defer self.allocator.free(cps);
+        for (cells, 0..) |cell, i| {
+            cps[i] = if (cell.rune == 0) ' ' else cell.rune;
+            indices[i] = i;
+        }
+
+        _ = bidi.lineLevels(cps, levels, .auto);
+        bidi.levelsToVisualOrder(levels, indices);
+
+        // Emit glyphs in visual-column order. Each visual column maps
+        // to the logical cell at indices[v]; we still want same-style
+        // adjacent cells grouped into one HB-shaped run.
+        var v: usize = 0;
+        while (v < indices.len) {
+            const lc = indices[v];
+            const cell = cells[lc];
+            if (!self.isShapable(cell)) {
+                v += 1;
+                continue;
+            }
+            const run_v_start = v;
+            const run_style = cell.style_ref;
+            const run_level = levels[lc];
+            while (v < indices.len) : (v += 1) {
+                const lc2 = indices[v];
+                const c2 = cells[lc2];
+                if (!self.isShapable(c2)) break;
+                if (c2.style_ref != run_style) break;
+                if (levels[lc2] != run_level) break;
+            }
+            // Build a contiguous physical-cells slice in *visual* order.
+            // Since the indices are already visually-ordered, the
+            // logical rune at indices[v_i] is what should appear at
+            // visual column v_i. For HB shaping correctness we feed
+            // the runes in visual order (kitty/foot do the same).
+            const run_len = v - run_v_start;
+            const tmp = self.allocator.alloc(Cell, run_len) catch break;
+            defer self.allocator.free(tmp);
+            for (0..run_len) |k| tmp[k] = cells[indices[run_v_start + k]];
+            try self.emitGlyphRun(atlas, pool, tmp, @intCast(run_v_start), row, cw, ch, ascent);
+        }
+    }
+
+    fn emitRowRunsLogical(
+        self: *GridPass,
+        atlas: *Atlas,
+        pool: *const StylePool,
+        cells: []const Cell,
+        row: u16,
+        cw: f32,
+        ch: f32,
+        ascent: f32,
+    ) !void {
+        var col: u16 = 0;
+        const cols: u16 = @intCast(cells.len);
+        while (col < cols) {
+            const cell = cells[col];
+            if (!self.isShapable(cell)) {
+                col += 1;
+                continue;
+            }
+            const run_start = col;
+            const run_style = cell.style_ref;
+            while (col < cols) : (col += 1) {
+                const c2 = cells[col];
+                if (!self.isShapable(c2)) break;
+                if (c2.style_ref != run_style) break;
+            }
+            try self.emitGlyphRun(atlas, pool, cells[run_start..col], run_start, row, cw, ch, ascent);
+        }
+    }
+
     /// Emit glyph quads for a contiguous run of same-style cells.
     /// Path A: HarfBuzz shape (ligature-aware). Path B: per-codepoint
     /// fallback when shaping fails or the atlas has no hb_font.
@@ -503,7 +607,7 @@ pub const GridPass = struct {
         }
         if (blen == 0) return;
 
-        if (self.enable_ligatures and atlas.hb_font != null and runIsPureAscii(cells)) {
+        if (self.enable_ligatures and atlas.hb_font != null) {
             if (atlas.shapeRun(self.allocator, bytes[0..blen])) |shaped| {
                 defer self.allocator.free(shaped);
                 if (shaped.len > 0) {

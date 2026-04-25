@@ -36,6 +36,7 @@ comptime {
     _ = @import("config.zig");
     _ = @import("grid/kitty_images.zig");
     _ = @import("grid/image_pipeline_test.zig");
+    _ = @import("grid/bidi.zig");
 }
 
 test {

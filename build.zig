@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
         "freetype2",
         "harfbuzz",
         "epoxy",
+        "fribidi",
     };
 
     const exe = b.addExecutable(.{

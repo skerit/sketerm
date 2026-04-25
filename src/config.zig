@@ -41,6 +41,9 @@ pub const Config = struct {
 
     // Rendering
     ligatures: bool = true,
+    /// Bidirectional text reorder via fribidi. Only affects lines
+    /// containing non-ASCII codepoints; pure-ASCII lines skip it.
+    bidi: bool = true,
     /// If true, fg/bg follow AdwStyleManager dark/light. Set to
     /// false to honour `default_fg` / `default_bg` exactly.
     auto_theme: bool = true,
@@ -166,6 +169,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.modify_other_keys = @intCast(n);
     } else if (std.mem.eql(u8, key, "ligatures")) {
         cfg.ligatures = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "bidi")) {
+        cfg.bidi = try parseBool(value);
     } else if (std.mem.eql(u8, key, "auto_theme")) {
         cfg.auto_theme = try parseBool(value);
     } else if (std.mem.eql(u8, key, "bell_audible")) {
