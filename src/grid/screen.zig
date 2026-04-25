@@ -2435,6 +2435,29 @@ pub const Screen = struct {
                 const s = std.fmt.bufPrint(&resp_buf, "\x1b[9;{d};{d}t", .{ self.rows, self.cols }) catch return;
                 self.respond(s);
             },
+            20, 21 => {
+                // 20 = report icon label, 21 = report window title.
+                // We don't model an icon label distinct from the title.
+                // Format per xterm: ESC ] <L|l> <title> ESC \.
+                const title = self.last_title orelse "";
+                const code: u8 = if (arg == 20) 'L' else 'l';
+                var out_buf: [512]u8 = undefined;
+                const max_t = @min(title.len, out_buf.len - 5);
+                var off: usize = 0;
+                out_buf[off] = 0x1B;
+                off += 1;
+                out_buf[off] = ']';
+                off += 1;
+                out_buf[off] = code;
+                off += 1;
+                @memcpy(out_buf[off .. off + max_t], title[0..max_t]);
+                off += max_t;
+                out_buf[off] = 0x1B;
+                off += 1;
+                out_buf[off] = '\\';
+                off += 1;
+                self.respond(out_buf[0..off]);
+            },
             // 22 — save title onto stack. Param 0/2 = window title;
             // we treat both identically (no separate icon name).
             22 => self.titleStackPush(),
@@ -3723,6 +3746,38 @@ test "mouse encoding modes are mutually-exclusive last-set" {
     csi.final = 'l';
     s.csi(csi);
     try std.testing.expectEqual(Screen.MouseEnc.legacy, s.mouse_enc);
+}
+
+test "CSI 20t / 21t report icon / window title" {
+    const TestSink = struct {
+        var captured: [128]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 80, 24);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+    s.onOsc("0;hello world"); // sets last_title
+
+    TestSink.captured_len = 0;
+    var csi = Event.Csi{};
+    csi.params[0] = 21;
+    csi.n_params = 1;
+    csi.final = 't';
+    s.csi(csi);
+    try std.testing.expectEqualStrings("\x1b]lhello world\x1b\\", TestSink.captured[0..TestSink.captured_len]);
+
+    TestSink.captured_len = 0;
+    csi.params[0] = 20;
+    s.csi(csi);
+    try std.testing.expectEqualStrings("\x1b]Lhello world\x1b\\", TestSink.captured[0..TestSink.captured_len]);
 }
 
 test "CSI 14t reports rows*cell_h × cols*cell_w when set" {
