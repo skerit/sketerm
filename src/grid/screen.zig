@@ -114,6 +114,12 @@ pub const Screen = struct {
     /// Default: every 8th column starting at 0.
     tab_stops: std.ArrayList(bool) = .{},
 
+    /// G0/G1 character-set designations. ASCII or DEC special graphics.
+    charset_g0: Charset = .ascii,
+    charset_g1: Charset = .ascii,
+    /// Which slot is locked-shift active. SO/SI swap this.
+    active_charset: enum { g0, g1 } = .g0,
+
     /// Side-effect sink — optional callbacks invoked by apply.
     sink: Sink = .{},
 
@@ -125,6 +131,45 @@ pub const Screen = struct {
         bar_blink,
         bar_steady,
     };
+
+    pub const Charset = enum { ascii, dec_graphics };
+
+    /// DEC special graphics translation. Only applies to bytes
+    /// 0x60..0x7E in the ASCII range; outside that range the byte
+    /// passes through unchanged.
+    fn decGraphicsCp(b: u8) u32 {
+        return switch (b) {
+            0x5F => ' ',
+            0x60 => 0x25C6, // ◆
+            0x61 => 0x2592, // ▒
+            0x66 => 0x00B0, // °
+            0x67 => 0x00B1, // ±
+            0x68 => 0x2424, // ␤
+            0x69 => 0x240B, // ␋
+            0x6A => 0x2518, // ┘
+            0x6B => 0x2510, // ┐
+            0x6C => 0x250C, // ┌
+            0x6D => 0x2514, // └
+            0x6E => 0x253C, // ┼
+            0x6F => 0x23BA, // ⎺
+            0x70 => 0x23BB, // ⎻
+            0x71 => 0x2500, // ─
+            0x72 => 0x23BC, // ⎼
+            0x73 => 0x23BD, // ⎽
+            0x74 => 0x251C, // ├
+            0x75 => 0x2524, // ┤
+            0x76 => 0x2534, // ┴
+            0x77 => 0x252C, // ┬
+            0x78 => 0x2502, // │
+            0x79 => 0x2264, // ≤
+            0x7A => 0x2265, // ≥
+            0x7B => 0x03C0, // π
+            0x7C => 0x2260, // ≠
+            0x7D => 0x00A3, // £
+            0x7E => 0x00B7, // ·
+            else => b,
+        };
+    }
 
     pub const Sink = struct {
         ctx: ?*anyopaque = null,
@@ -527,7 +572,13 @@ pub const Screen = struct {
         if (self.decoder.feed(b)) |cp| self.printCp(cp);
     }
 
-    fn printCp(self: *Screen, cp: u32) void {
+    fn printCp(self: *Screen, cp_in: u32) void {
+        // Translate ASCII through the active charset designation.
+        const active = if (self.active_charset == .g0) self.charset_g0 else self.charset_g1;
+        const cp: u32 = if (active == .dec_graphics and cp_in <= 0x7E and cp_in >= 0x5F)
+            decGraphicsCp(@intCast(cp_in))
+        else
+            cp_in;
         const width: u8 = if (isWideCp(cp)) 2 else 1;
 
         // Wide char near right edge wraps before placing.
@@ -605,6 +656,8 @@ pub const Screen = struct {
             0x09 => self.tab(),
             0x0A, 0x0B, 0x0C => self.lineFeed(),
             0x0D => self.carriageReturn(),
+            0x0E => self.active_charset = .g1, // SO — locking shift to G1
+            0x0F => self.active_charset = .g0, // SI — locking shift to G0
             else => {},
         }
     }
@@ -910,6 +963,17 @@ pub const Screen = struct {
     }
 
     fn escFinal(self: *Screen, ef: Event.EscFinal) void {
+        // SCS — character-set designation. `ESC ( X` for G0, `ESC ) X`
+        // for G1, where X selects ASCII (B) or DEC graphics (0).
+        if (ef.n_intermediates == 1 and (ef.intermediates[0] == '(' or ef.intermediates[0] == ')')) {
+            const slot: *Charset = if (ef.intermediates[0] == '(') &self.charset_g0 else &self.charset_g1;
+            slot.* = switch (ef.final) {
+                '0' => .dec_graphics,
+                'B' => .ascii,
+                else => slot.*,
+            };
+            return;
+        }
         switch (ef.final) {
             '7' => self.saveCursor(),
             '8' => self.restoreCursor(),
@@ -1772,6 +1836,29 @@ test "CBT walks backward" {
     s.csi(csi);
     // Default 8-col stops: from 17, prev=16, prev=8.
     try std.testing.expectEqual(@as(u16, 8), s.col);
+}
+
+test "SCS DEC graphics translates 'q' to ─" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+    // ESC ( 0 — designate G0 to DEC graphics.
+    s.escFinal(.{
+        .intermediates = .{ '(', 0, 0, 0 },
+        .n_intermediates = 1,
+        .final = '0',
+    });
+    s.printCp('q');
+    try std.testing.expectEqual(@as(u32, 0x2500), s.cellAt(0, 0).rune);
+    // SI returns to G0=ASCII when we redesignate.
+    s.escFinal(.{
+        .intermediates = .{ '(', 0, 0, 0 },
+        .n_intermediates = 1,
+        .final = 'B',
+    });
+    s.printCp('q');
+    try std.testing.expectEqual(@as(u32, 'q'), s.cellAt(0, 1).rune);
 }
 
 test "DECRQM reports mode state" {
