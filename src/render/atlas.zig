@@ -34,6 +34,11 @@ pub const Glyph = struct {
 pub const Atlas = struct {
     ft_lib: c.FT_Library,
     ft_face: c.FT_Face,
+    /// HarfBuzz font wrapping the FreeType face. Used by `shapeRun`
+    /// for ligature / OpenType-feature aware text layout. The
+    /// renderer doesn't currently shape (still does codepoint-per-
+    /// cell), but the hook is here for the next step.
+    hb_font: ?*c.hb_font_t = null,
 
     /// Cell metrics in pixels — used by the renderer to lay out the grid.
     cell_w: u16,
@@ -53,6 +58,10 @@ pub const Atlas = struct {
     shelf_h: u32 = 0,
 
     cache: std.AutoHashMap(u32, Glyph),
+    /// Glyph cache keyed by FreeType glyph index (post-HarfBuzz
+    /// shaping). Cells looked up by codepoint live in `cache`; cells
+    /// looked up by glyph_id (from a shaping pass) live here.
+    glyph_cache: std.AutoHashMap(u32, Glyph),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, font_path: [*:0]const u8, size_px: u16) !*Atlas {
@@ -72,16 +81,23 @@ pub const Atlas = struct {
         const ascent: i16 = @intCast(@as(c_long, m.ascender) >> 6);
         const descent: i16 = @intCast(-@as(c_long, m.descender) >> 6);
 
+        // Wrap the FreeType face in a HarfBuzz font for shaping. We
+        // reference-count it via hb_font_t* so the FT face is shared
+        // (don't destroy it here; Atlas.deinit destroys the face).
+        const hb_font = c.hb_ft_font_create_referenced(face);
+
         const self = try allocator.create(Atlas);
         errdefer allocator.destroy(self);
         self.* = .{
             .ft_lib = lib,
             .ft_face = face,
+            .hb_font = hb_font,
             .cell_w = cell_w,
             .cell_h = cell_h,
             .ascent = ascent,
             .descent = descent,
             .cache = std.AutoHashMap(u32, Glyph).init(allocator),
+            .glyph_cache = std.AutoHashMap(u32, Glyph).init(allocator),
             .allocator = allocator,
         };
         return self;
@@ -113,9 +129,51 @@ pub const Atlas = struct {
     pub fn deinit(self: *Atlas) void {
         // GL texture is freed by GTK on widget unrealize.
         self.cache.deinit();
+        self.glyph_cache.deinit();
+        if (self.hb_font) |f| c.hb_font_destroy(f);
         _ = c.FT_Done_Face(self.ft_face);
         _ = c.FT_Done_FreeType(self.ft_lib);
         self.allocator.destroy(self);
+    }
+
+    /// Shape a UTF-8 string with HarfBuzz. Returns a slice of
+    /// (glyph_id, x_advance, y_advance, x_offset, y_offset, cluster)
+    /// tuples. Caller must free.
+    pub const ShapedGlyph = struct {
+        glyph_id: u32,
+        x_advance: i32,
+        y_advance: i32,
+        x_offset: i32,
+        y_offset: i32,
+        /// Byte offset in the input UTF-8 string.
+        cluster: u32,
+    };
+
+    pub fn shapeRun(self: *Atlas, allocator: std.mem.Allocator, text: []const u8) ![]ShapedGlyph {
+        const font = self.hb_font orelse return error.NoHarfBuzzFont;
+        const buf = c.hb_buffer_create();
+        defer c.hb_buffer_destroy(buf);
+        c.hb_buffer_add_utf8(buf, text.ptr, @intCast(text.len), 0, @intCast(text.len));
+        c.hb_buffer_set_direction(buf, c.HB_DIRECTION_LTR);
+        c.hb_buffer_set_script(buf, c.HB_SCRIPT_LATIN);
+        c.hb_buffer_set_language(buf, c.hb_language_from_string("en", -1));
+        c.hb_shape(font, buf, null, 0);
+        var glyph_count: c_uint = 0;
+        const infos = c.hb_buffer_get_glyph_infos(buf, &glyph_count);
+        const positions = c.hb_buffer_get_glyph_positions(buf, &glyph_count);
+        const out = try allocator.alloc(ShapedGlyph, glyph_count);
+        var i: c_uint = 0;
+        while (i < glyph_count) : (i += 1) {
+            out[i] = .{
+                .glyph_id = infos[i].codepoint,
+                .x_advance = positions[i].x_advance,
+                .y_advance = positions[i].y_advance,
+                .x_offset = positions[i].x_offset,
+                .y_offset = positions[i].y_offset,
+                .cluster = infos[i].cluster,
+            };
+        }
+        return out;
     }
 
     /// Get an existing glyph or rasterize + upload.
