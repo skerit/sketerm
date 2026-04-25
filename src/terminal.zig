@@ -38,6 +38,7 @@ pub const Terminal = struct {
     on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
+    on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
 
     /// Most recent cwd reported via OSC 7 (file://host/path → /path).
     /// Owned. Used by layout save in preference to /proc lookup.
@@ -93,6 +94,7 @@ pub const Terminal = struct {
             .on_clipboard_set = sinkClipboard,
             .on_cwd = sinkCwd,
             .on_image = sinkImage,
+            .on_notification = sinkNotification,
         };
 
         self.worker_thread = try std.Thread.spawn(.{}, workerMain, .{self});
@@ -138,6 +140,11 @@ pub const Terminal = struct {
     fn sinkImage(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
         if (self.on_image) |f| f(self.user_ctx, img);
+    }
+
+    fn sinkNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_notification) |f| f(self.user_ctx, title, body);
     }
 
     pub fn deinit(self: *Terminal) void {

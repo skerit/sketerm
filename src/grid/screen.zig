@@ -188,6 +188,7 @@ pub const Screen = struct {
         on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
         on_cwd: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
         on_image: ?*const fn (ctx: ?*anyopaque, img: ImageEvent) void = null,
+        on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
     };
 
     pub const ImageEvent = struct {
@@ -579,6 +580,10 @@ pub const Screen = struct {
             },
             4 => self.handleOsc4(rest),
             8 => self.handleOsc8(rest),
+            9 => {
+                // iTerm2 desktop notification: OSC 9 ; <message>.
+                if (self.sink.on_notification) |f| f(self.sink.ctx, "sketerm", rest);
+            },
             10, 11, 12 => {
                 // OSC 10/11/12 fg/bg/cursor color query: `?` returns
                 // the current default. Set form not yet implemented.
@@ -593,6 +598,19 @@ pub const Screen = struct {
                     const s = std.fmt.bufPrint(&resp_buf, "\x1b]{s}\x1b\\", .{c_str}) catch return;
                     self.respond(s);
                 }
+            },
+            777 => {
+                // GNOME notify: `OSC 777 ; notify ; <title> ; <body>`.
+                const semi2 = std.mem.indexOfScalar(u8, rest, ';') orelse return;
+                if (!std.mem.eql(u8, rest[0..semi2], "notify")) return;
+                const after = rest[semi2 + 1 ..];
+                const semi3 = std.mem.indexOfScalar(u8, after, ';') orelse {
+                    if (self.sink.on_notification) |f| f(self.sink.ctx, after, "");
+                    return;
+                };
+                const title = after[0..semi3];
+                const body = after[semi3 + 1 ..];
+                if (self.sink.on_notification) |f| f(self.sink.ctx, title, body);
             },
             52 => {
                 // OSC 52 — `Pc;Pd` where Pc is selection (c=clipboard,

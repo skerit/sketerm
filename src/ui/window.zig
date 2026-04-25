@@ -195,6 +195,8 @@ pub const Window = struct {
         // Forward terminal sinks to Window where appropriate.
         pane.win_clip_ctx = @ptrCast(self);
         pane.win_on_clipboard = onTermClipboardSet;
+        pane.win_notify_ctx = @ptrCast(self);
+        pane.win_on_notification = onTermNotification;
         // Title forwarding intentionally null — tab titles are sticky.
 
         // Wrap pane.widget() in a Box so we can swap it for a Paned
@@ -633,4 +635,21 @@ fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
     defer self.allocator.free(cstr);
     @memcpy(cstr, text);
     c.gdk_clipboard_set_text(clip, cstr.ptr);
+}
+
+fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {
+    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    const app = c.gtk_window_get_application(@ptrCast(self.app_window));
+    if (app == null) return;
+    const title_z = self.allocator.allocSentinel(u8, title.len, 0) catch return;
+    defer self.allocator.free(title_z);
+    @memcpy(title_z, title);
+    const body_z = self.allocator.allocSentinel(u8, body.len, 0) catch return;
+    defer self.allocator.free(body_z);
+    @memcpy(body_z, body);
+    const notif = c.g_notification_new(title_z.ptr);
+    if (notif == null) return;
+    defer c.g_object_unref(notif);
+    if (body.len > 0) c.g_notification_set_body(notif, body_z.ptr);
+    c.g_application_send_notification(@ptrCast(app), null, notif);
 }
