@@ -1022,20 +1022,25 @@ pub const Screen = struct {
         defer line_buf.deinit(allocator);
         var col_map: std.ArrayList(u32) = .{};
         defer col_map.deinit(allocator);
+        // Parallel array: width of the cell at col_map[i] (1 or 2).
+        // Used to compute visual end column on matches whose last cell
+        // is wide (CJK / emoji).
+        var width_map: std.ArrayList(u8) = .{};
+        defer width_map.deinit(allocator);
 
         // Scrollback: rows -1, -2, … walked from oldest (-sb_count) up.
         const sb_count = self.scrollbackCount();
         var i: u32 = 0;
         while (i < sb_count) : (i += 1) {
             const row: i32 = @as(i32, @intCast(i)) - @as(i32, @intCast(sb_count));
-            try renderLineForSearch(allocator, self, row, &line_buf, &col_map);
-            try findMatches(allocator, line_buf.items, col_map.items, needle, row, &out);
+            try renderLineForSearch(allocator, self, row, &line_buf, &col_map, &width_map);
+            try findMatches(allocator, line_buf.items, col_map.items, width_map.items, needle, row, &out);
         }
         // Active screen.
         var r: u16 = 0;
         while (r < self.rows) : (r += 1) {
-            try renderLineForSearch(allocator, self, @intCast(r), &line_buf, &col_map);
-            try findMatches(allocator, line_buf.items, col_map.items, needle, @intCast(r), &out);
+            try renderLineForSearch(allocator, self, @intCast(r), &line_buf, &col_map, &width_map);
+            try findMatches(allocator, line_buf.items, col_map.items, width_map.items, needle, @intCast(r), &out);
         }
         return try out.toOwnedSlice(allocator);
     }
@@ -2876,15 +2881,19 @@ fn renderLineForSearch(
     row: i32,
     line_buf: *std.ArrayList(u8),
     col_map: *std.ArrayList(u32),
+    width_map: *std.ArrayList(u8),
 ) !void {
     line_buf.clearRetainingCapacity();
     col_map.clearRetainingCapacity();
+    width_map.clearRetainingCapacity();
 
     const cells = self.lineCellsAt(row) orelse return;
     var col: u32 = 0;
     while (col < cells.len) : (col += 1) {
         const cell = cells[col];
         if (cell.flags & 0b0000_0010 != 0) continue; // wide-cont
+        const is_wide = (cell.flags & 0b0000_0001) != 0;
+        const w: u8 = if (is_wide) 2 else 1;
         const cp: u32 = if (cell.rune == 0) ' ' else cell.rune;
         var enc: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(@intCast(cp), &enc) catch 0;
@@ -2892,6 +2901,7 @@ fn renderLineForSearch(
         while (k < n) : (k += 1) {
             try line_buf.append(allocator, enc[k]);
             try col_map.append(allocator, col);
+            try width_map.append(allocator, w);
         }
     }
 }
@@ -2900,6 +2910,7 @@ fn findMatches(
     allocator: std.mem.Allocator,
     haystack: []const u8,
     col_map: []const u32,
+    width_map: []const u8,
     needle: []const u8,
     row: i32,
     out: *std.ArrayList(Screen.SearchMatch),
@@ -2908,13 +2919,17 @@ fn findMatches(
     while (pos + needle.len <= haystack.len) {
         if (std.mem.eql(u8, haystack[pos .. pos + needle.len], needle)) {
             const start_col = col_map[pos];
-            // Match length in columns: max col-1 - start_col + 1.
             const end_byte = pos + needle.len - 1;
-            const end_col = col_map[end_byte];
+            const end_col_left = col_map[end_byte];
+            const end_w: u32 = width_map[end_byte];
+            // Visual width: from start_col to (end_col_left +
+            // last_cell_width - 1) inclusive. Wide cells contribute
+            // 2 columns each.
+            const len: u32 = (end_col_left + end_w) - start_col;
             try out.append(allocator, .{
                 .row = row,
                 .col = start_col,
-                .len = end_col - start_col + 1,
+                .len = len,
             });
             pos += needle.len;
         } else {
@@ -3958,6 +3973,30 @@ test "search finds multibyte runes" {
     try std.testing.expectEqual(@as(usize, 2), matches.len);
     try std.testing.expectEqual(@as(u32, 0), matches[0].col);
     try std.testing.expectEqual(@as(u32, 1), matches[1].col);
+}
+
+test "search wide CJK match: visual width spans both cells" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 20, 1);
+    defer s.deinit();
+    // 中 = U+4E2D, wide. 文 = U+6587, wide. Each takes 2 columns.
+    s.printCp(0x4E2D);
+    s.printCp(0x6587);
+
+    // "中" alone — len should be 2 (wide).
+    const m1 = try s.search(std.testing.allocator, "\xE4\xB8\xAD");
+    defer std.testing.allocator.free(m1);
+    try std.testing.expectEqual(@as(usize, 1), m1.len);
+    try std.testing.expectEqual(@as(u32, 0), m1[0].col);
+    try std.testing.expectEqual(@as(u32, 2), m1[0].len);
+
+    // "中文" — len should be 4 (two wide chars side-by-side).
+    const m2 = try s.search(std.testing.allocator, "\xE4\xB8\xAD\xE6\x96\x87");
+    defer std.testing.allocator.free(m2);
+    try std.testing.expectEqual(@as(usize, 1), m2.len);
+    try std.testing.expectEqual(@as(u32, 0), m2[0].col);
+    try std.testing.expectEqual(@as(u32, 4), m2[0].len);
 }
 
 test "selectWordAt grabs full word" {
