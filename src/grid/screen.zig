@@ -950,6 +950,16 @@ pub const Screen = struct {
             decGraphicsCp(@intCast(cp_in))
         else
             cp_in;
+
+        // Combining / extending codepoint: don't advance the cursor,
+        // don't write a new cell. The user perceives them as glued
+        // to the previous glyph (ZWJ sequences, variation selectors,
+        // skin-tone modifiers, combining marks). We render only the
+        // base; the extension is dropped from the screen state.
+        // Cursor must already have a base glyph behind it for this
+        // to make semantic sense — we gate on last_print_cp != 0.
+        if (self.last_print_cp != 0 and isExtendingCp(cp)) return;
+
         const width: u8 = if (isWideCp(cp)) 2 else 1;
 
         // Wide char near right edge wraps before placing.
@@ -1002,6 +1012,32 @@ pub const Screen = struct {
             }
         }
         self.last_print_cp = cp;
+    }
+
+    /// Returns true if the codepoint is a "combining" or "extending"
+    /// character that should attach to the preceding cell instead of
+    /// occupying its own. Covers the most common modern grapheme-
+    /// cluster pieces:
+    ///   - ZWJ / ZWNJ (zero-width [non-]joiner)
+    ///   - Variation selectors (VS1..VS16, supplement)
+    ///   - Combining diacritical marks (basic + supplement + extended)
+    ///   - Skin-tone modifiers (Fitzpatrick types 1-6)
+    /// We do NOT mark regional indicators here — they're full-width
+    /// codepoints, not "extending"; the cluster behavior of "two RIs
+    /// = one flag" needs a different treatment we don't yet model.
+    pub fn isExtendingCp(cp: u32) bool {
+        return switch (cp) {
+            0x200C, 0x200D => true, // ZWNJ, ZWJ
+            0x0300...0x036F => true, // Combining diacritical marks
+            0x1AB0...0x1AFF => true, // Combining ext
+            0x1DC0...0x1DFF => true, // Combining supplement
+            0x20D0...0x20FF => true, // Combining for symbols
+            0xFE00...0xFE0F => true, // Variation selectors
+            0xFE20...0xFE2F => true, // Combining half marks
+            0xE0100...0xE01EF => true, // Variation selectors supplement
+            0x1F3FB...0x1F3FF => true, // Emoji skin-tone modifiers
+            else => false,
+        };
     }
 
     /// Coarse wide-character check: CJK Unified, Hangul, fullwidth

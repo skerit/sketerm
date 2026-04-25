@@ -29,17 +29,14 @@ test "screen.py: wide CJK char takes 2 columns" {
     try std.testing.expect(c1.flags & 0b0000_0010 != 0); // is_wide_cont
 }
 
-test "screen.py: emoji skin tone — both codepoints printed (no combining)" {
-    // Kitty would treat U+1F469 + U+1F3FD as a grapheme of width 2.
-    // Without combining-cluster logic, we emit them as separate
-    // cells: the woman emoji takes 2 cols (wide), the skin-tone
-    // modifier U+1F3FD also reads as wide → 2 more cols.
+test "screen.py: emoji skin tone — modifier attaches, cursor at width 2" {
     var h = try Harness.init(std.testing.allocator, 8, 1);
     defer h.deinit();
     h.arm();
-    h.feed("\xf0\x9f\x91\xa9\xf0\x9f\x8f\xbd"); // 👩 + 🏽
-    // Without grapheme combining, each is rendered separately.
-    try std.testing.expect(h.screen.col >= 2);
+    h.feed("\xf0\x9f\x91\xa9\xf0\x9f\x8f\xbd"); // 👩 + 🏽 (skin tone)
+    // Skin-tone modifier U+1F3FD is in our extending set → attaches
+    // to the woman emoji; cursor advances only by the wide base.
+    try std.testing.expectEqual(@as(u16, 2), h.screen.col);
 }
 
 test "screen.py: regional indicator pair — flag" {
@@ -108,22 +105,32 @@ test "screen.py: writing wide char near right edge wraps before placing" {
     try std.testing.expectEqualStrings("abc", r0);
 }
 
-test "screen.py: zero-width joiner sequence — components rendered separately" {
-    // Kitty: 👨‍👩‍👧‍👦 (man+ZWJ+woman+ZWJ+girl+ZWJ+boy) renders as
-    // a single grapheme of width 2. We don't combine; ZWJ is
-    // U+200D which our wide table doesn't include → narrow cell.
-    // Just assert no crash and cursor advanced.
+test "screen.py: ZWJ sequence — ZWJ is extending, second emoji is its own glyph" {
+    // 👨‍👩  (man + ZWJ + woman). Our model: ZWJ (U+200D) is
+    // extending — it attaches to 👨, contributes 0 to width. The
+    // second 👩 is then a fresh wide glyph. Total width: 2 + 2 = 4.
+    // Kitty would cluster all three into width 2; this is a known
+    // simplification (we'd need a cluster-aware printer to match).
     var h = try Harness.init(std.testing.allocator, 20, 1);
     defer h.deinit();
     h.arm();
     h.feed("\xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x91\xa9");
-    try std.testing.expect(h.screen.col > 0);
+    try std.testing.expectEqual(@as(u16, 4), h.screen.col);
 }
 
-test "screen.py: variation selector U+FE0F doesn't crash" {
+test "screen.py: variation selector U+FE0F attaches (col stays at 1)" {
     var h = try Harness.init(std.testing.allocator, 8, 1);
     defer h.deinit();
     h.arm();
-    h.feed("*\xef\xb8\x8f"); // '*' + VS-16
-    try std.testing.expect(h.screen.col > 0);
+    h.feed("*\xef\xb8\x8f"); // '*' (1 col) + VS-16 (extending)
+    try std.testing.expectEqual(@as(u16, 1), h.screen.col);
+}
+
+test "screen.py: combining diacritic attaches" {
+    var h = try Harness.init(std.testing.allocator, 8, 1);
+    defer h.deinit();
+    h.arm();
+    // 'a' + U+0301 (combining acute accent)
+    h.feed("a\xcc\x81");
+    try std.testing.expectEqual(@as(u16, 1), h.screen.col);
 }
