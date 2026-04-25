@@ -2258,6 +2258,13 @@ pub const Screen = struct {
         self.charset_g0 = .ascii;
         self.charset_g1 = .ascii;
         self.active_charset = .g0;
+        // Per VT520 Programmer Reference, DECSTR resets DECSCNM too.
+        // DECCOLM stays as-is (the "allow" flag is sticky per xterm).
+        self.reverse_screen = false;
+        // Kitty kbd flag stack — clear the active flags but leave the
+        // saved stack alone (apps that DECSTR mid-session still expect
+        // their previous push state on subsequent CSI <N u).
+        self.kitty_kbd_flags = 0;
         if (self.use_alt) self.toggleAltScreen(false);
     }
 
