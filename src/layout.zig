@@ -27,11 +27,6 @@ pub const Tree = union(enum) {
 pub const TabSpec = struct {
     title: []const u8,
     tree: Tree,
-    /// Legacy v1 fields. If present (non-null) they take precedence
-    /// when `tree` was not in the parsed JSON. Kept for backwards
-    /// compat reads.
-    cwd: ?[]const u8 = null,
-    command: ?[]const []const u8 = null,
 };
 
 pub const Layout = struct {
