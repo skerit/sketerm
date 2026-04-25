@@ -12,6 +12,7 @@ const App = struct {
     window: ?*Window = null,
     restore: bool = false,
     layout_path: ?[]const u8 = null,
+    no_save: bool = false,
 };
 
 const HELP_TEXT =
@@ -22,6 +23,7 @@ const HELP_TEXT =
     \\Options:
     \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json
     \\  --layout <path>       Load tabs from specific JSON layout file
+    \\  --no-save             Don't write last.json on exit
     \\  --help                Show this message
     \\  --version             Show version
     \\
@@ -61,6 +63,8 @@ pub fn main() u8 {
         } else if (std.mem.eql(u8, a, "--layout") and i + 1 < argv.len) {
             i += 1;
             g_app.layout_path = argv[i];
+        } else if (std.mem.eql(u8, a, "--no-save")) {
+            g_app.no_save = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print("{s}", .{HELP_TEXT});
             return 0;
@@ -142,7 +146,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
 
 fn onShutdown(_: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
     if (g_app.window) |w| {
-        w.saveLayoutQuietly();
+        if (!g_app.no_save) w.saveLayoutQuietly();
         w.deinit();
         g_app.window = null;
     }
