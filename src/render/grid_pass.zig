@@ -213,6 +213,67 @@ pub const GridPass = struct {
             }
         }
 
+        // IME preedit overlay — render at cursor position with
+        // an underline beneath.
+        if (view_off == 0 and screen.preedit_text != null) {
+            const pre = screen.preedit_text.?;
+            var col_off: u16 = 0;
+            var idx: usize = 0;
+            while (idx < pre.len) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(pre[idx]) catch break;
+                if (idx + seq_len > pre.len) break;
+                const cp = std.unicode.utf8Decode(pre[idx .. idx + seq_len]) catch {
+                    idx += seq_len;
+                    continue;
+                };
+                const target_col: u32 = @as(u32, screen.col) + col_off;
+                if (target_col >= screen.cols) break;
+                const x: f32 = @as(f32, @floatFromInt(target_col)) * cw;
+                const y: f32 = @as(f32, @floatFromInt(screen.row)) * ch;
+                const cell_w_count: u16 = if (@import("../grid/screen.zig").Screen.isWide(cp)) 2 else 1;
+                // Draw a solid block bg behind the preedit so it stands out.
+                try self.pushQuad(
+                    .{ x, y },
+                    .{ cw * @as(f32, @floatFromInt(cell_w_count)), ch },
+                    .{ 0, 0 },
+                    .{ 0, 0 },
+                    .{ 0.05, 0.05, 0.10, 0.85 },
+                    0.0,
+                );
+                // Glyph.
+                const g = atlas.lookupOrLoad(cp) catch {
+                    idx += seq_len;
+                    col_off += cell_w_count;
+                    continue;
+                };
+                if (g.w > 0 and g.h > 0) {
+                    const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x));
+                    const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y));
+                    const gw: f32 = @floatFromInt(g.w);
+                    const gh: f32 = @floatFromInt(g.h);
+                    try self.pushQuad(
+                        .{ gx, gy },
+                        .{ gw, gh },
+                        .{ g.u0, g.v0 },
+                        .{ g.u1, g.v1 },
+                        self.default_fg,
+                        1.0,
+                    );
+                }
+                // Underline beneath.
+                try self.pushQuad(
+                    .{ x, y + ch - 2 },
+                    .{ cw * @as(f32, @floatFromInt(cell_w_count)), 2 },
+                    .{ 0, 0 },
+                    .{ 0, 0 },
+                    .{ 0.4, 0.55, 0.85, 0.95 },
+                    0.0,
+                );
+                col_off += cell_w_count;
+                idx += seq_len;
+            }
+        }
+
         // Cursor — draw last (overlay). Hide while scrolled back
         // or while blink phase is off for a blinking shape.
         const blinking = switch (screen.cursor_shape) {

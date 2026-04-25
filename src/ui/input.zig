@@ -45,6 +45,14 @@ pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allo
         null,
         c.G_CONNECT_DEFAULT,
     );
+    _ = c.g_signal_connect_data(
+        im,
+        "preedit-changed",
+        @ptrCast(&onImPreeditChanged),
+        @ptrCast(ctx),
+        null,
+        c.G_CONNECT_DEFAULT,
+    );
     ctx.im_ctx = @ptrCast(im);
 
     const ctrl = c.gtk_event_controller_key_new();
@@ -67,6 +75,34 @@ fn onImCommit(_: *c.GtkIMContext, text: [*:0]const u8, user: ?*anyopaque) callco
     const ctx: *Ctx = @ptrCast(@alignCast(user.?));
     const len = std.mem.len(text);
     if (len > 0) _ = ctx.terminal.pty.writeAll(text[0..len]);
+    // Clear any preedit on commit.
+    const screen = ctx.terminal.screen;
+    if (screen.preedit_text) |old| {
+        screen.allocator.free(old);
+        screen.preedit_text = null;
+        screen.dirty = true;
+    }
+}
+
+fn onImPreeditChanged(im: *c.GtkIMContext, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    var str: [*c]u8 = null;
+    var attrs: ?*c.PangoAttrList = null;
+    var cur: c_int = 0;
+    c.gtk_im_context_get_preedit_string(im, &str, &attrs, &cur);
+    if (attrs) |a| c.pango_attr_list_unref(a);
+    defer if (str != null) c.g_free(str);
+
+    const screen = ctx.terminal.screen;
+    if (screen.preedit_text) |old| screen.allocator.free(old);
+    screen.preedit_text = null;
+    if (str != null) {
+        const slen = std.mem.len(@as([*:0]const u8, @ptrCast(str)));
+        if (slen > 0) {
+            screen.preedit_text = screen.allocator.dupe(u8, str[0..slen]) catch null;
+        }
+    }
+    screen.dirty = true;
 }
 
 fn onKeyPressed(

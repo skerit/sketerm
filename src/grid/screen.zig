@@ -99,6 +99,10 @@ pub const Screen = struct {
     next_link_id: u8 = 1,
     links: std.AutoHashMap(u8, []u8),
 
+    /// IME preedit (composition-in-progress). UTF-8, owned. Empty
+    /// when no composition active. Renderer overlays at cursor.
+    preedit_text: ?[]u8 = null,
+
     /// Side-effect sink — optional callbacks invoked by apply.
     sink: Sink = .{},
 
@@ -172,7 +176,14 @@ pub const Screen = struct {
         var link_it = self.links.iterator();
         while (link_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.links.deinit();
+        if (self.preedit_text) |t| self.allocator.free(t);
         self.allocator.destroy(self);
+    }
+
+    /// Public wrapper for the wide-char predicate used by the
+    /// renderer when laying out preedit text.
+    pub fn isWide(cp: u32) bool {
+        return isWideCp(cp);
     }
 
     /// Resize the screen to new dimensions while preserving as much
