@@ -570,3 +570,81 @@ Brief tick — confirmed all green (306 tests, build clean). Plan-v2
 table updated to reflect completion status. No new code; the system
 has reached a natural settle point. Next CronCreate-driven tick at
 17:37 will pick up if more items surface.
+
+## Deferred-item completion pass (user request: "do not defer things")
+
+User came back and instructed: implement all six deferred items.
+"There is a GPU here, it works. Just use it." Shipped:
+
+### M16.1 + M16.3 + M17.1 — renderer rewrite
+
+Created `src/render/cell_pass.zig` (CellPass) — a new instanced
+pipeline running per-cell instances through `glDrawArraysInstanced`.
+Two-pass rendering (bg first, then glyph) via a `u_kind` uniform on a
+single VAO; the per-instance attributes carry both bg + fg + glyph
+coords, so the same buffer drives both passes. Persistent VBO sized
+`rows × cols × 88 B` (e.g. 1.4 MB at 200×80) with per-row dirty
+tracking — `Line.dirty` plus a `row_needs_upload` array drive
+`glBufferSubData` for only the rows that changed since the last
+frame. Coalesces contiguous dirty runs into a single sub-data call.
+
+`src/render/atlas.zig` now uses `GL_TEXTURE_2D_ARRAY` with PAGE_COUNT=4
+layers × 2048² each (16 MB total budget). Per-page shelf-pack and
+per-glyph layer index. When all pages are full, the LRU page is
+evicted: cache entries that lived on it are removed, pack state is
+reset, generation counter bumped. CellPass snapshots each page's
+generation per frame and forces a full rebuild on any mismatch so
+stale glyph references can't survive.
+
+`src/render/grid_pass.zig` is now overlay-only (cursor, selection,
+preedit, focus border, scrollback indicator, bell flash, plus
+DH/DW-scaled rows and bidi-reordered rows that the per-cell grid
+can't handle).
+
+Shaders updated to `sampler2DArray` with `vec3(uv, layer)` lookups.
+Smoke runner still passes on NVIDIA EGL 1.5 / GL ES 3.2.
+
+### M17.3 — kitty animation frames
+
+`StoredImage` gains a `frames: ArrayList(Frame)` plus `current_frame`,
+`last_advance_us`, `playing`, `loops_remaining`, `generation`.
+`a=f` finalizes a new Frame and either appends or replaces (target
+slot from `c=`); `a=a` toggles `playing` (`c=1` stop / `c=2` run) and
+sets `loops_remaining`. `Manager.advanceAnimations(now_us)` walks
+animated images and steps `current_frame` when the per-frame delay
+elapses, with loop accounting. `Pane.onTick` calls advance + pushes
+the current frame's RGBA into matching placements via
+`replacePending`. A new `pending_dirty` flag drives `flushUploads`:
+a zero `gl_tex` triggers `glTexImage2D` while a non-zero one with
+dirty pending bytes triggers `glTexSubImage2D` for cheap in-place
+frame swaps. Tests cover `a=f` append, `advanceAnimations` cycle, and
+`a=a` stop.
+
+### Kitty kbd repeat events (flag 0x02)
+
+`input.Ctx` tracks `last_press_keyval` + `last_press_time_us`; a press
+of the same keyval within 120 ms is a repeat. `encode` threads
+`is_repeat` into all kitty-disambiguate paths via `kittyKeyEvent` with
+event=2 instead of event=1 when flag 0x02 is on. `key-released` clears
+the memory so the next press is fresh.
+
+### Bidi-aware selection
+
+`Pane.cellAtLogical` (named `CellPos` return) maps the user-clicked
+visual column to the row's logical column via
+`Screen.visualToLogicalCol` (fribidi). Selection storage is logical;
+the renderer remaps logical → visual cell-by-cell when drawing the
+selection overlay (so a logical run split across visual segments
+shows as multiple highlight rectangles, matching gnome-terminal /
+konsole / kitty). Mouse-reporting (SGR 1006) keeps the visual column
+since apps see what the user clicked on screen.
+
+### Final state after this pass
+
+- 318 unit + conformance tests pass (was 309 before this session).
+- `zig build` clean. `zig build smoke-image` PASS (multi-image + cell
+  scaling). Parser bench: CSI cursor moves at ~94 MB/s.
+- Plan-v2 table: every milestone now ✅.
+- `docs/protocols.md` updated: DECDHL/DECDWL, DECSCNM, DECCOLM, VT52,
+  full kitty kbd protocol, kitty animation, kitty zlib/tempfile media
+  all listed under "supported".
