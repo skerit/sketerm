@@ -2177,6 +2177,42 @@ test "kitty graphics query replies OK" {
     try std.testing.expectEqualStrings("\x1b_Gi=42;OK\x1b\\", got);
 }
 
+test "RIS resets charset state" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    // ESC ( 0 — G0 to dec_graphics.
+    s.escFinal(.{
+        .intermediates = .{ '(', 0, 0, 0 },
+        .n_intermediates = 1,
+        .final = '0',
+    });
+    try std.testing.expectEqual(Screen.Charset.dec_graphics, s.charset_g0);
+    s.fullReset();
+    try std.testing.expectEqual(Screen.Charset.ascii, s.charset_g0);
+}
+
+test "tab_stops resize keeps existing on shrink, pads on grow" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    // Default: stop at 8.
+    try std.testing.expect(s.tab_stops.items[8]);
+    // Add a custom stop at col 3.
+    s.tab_stops.items[3] = true;
+    // Shrink to 5 — col 3 stop preserved, col 8 dropped.
+    try s.resize(5, 2);
+    try std.testing.expect(s.tab_stops.items[3]);
+    try std.testing.expectEqual(@as(usize, 5), s.tab_stops.items.len);
+    // Grow to 17 — old stops kept, default stops at 8 and 16 added.
+    try s.resize(17, 2);
+    try std.testing.expect(s.tab_stops.items[3]);
+    try std.testing.expect(s.tab_stops.items[8]);
+    try std.testing.expect(s.tab_stops.items[16]);
+}
+
 test "IRM shifts cells right" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
