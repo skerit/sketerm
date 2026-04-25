@@ -7,7 +7,7 @@ Escape sequences and protocols sketerm supports in v1.
 
 | Byte  | Name | v1                        |
 |-------|------|---------------------------|
-| 0x07  | BEL — bell              | audible + urgency hint via `AdwWindow.urgency-hint` |
+| 0x07  | BEL — bell              | visual flash overlay (~200ms) via `bell_at_us` |
 | 0x08  | BS  — backspace         | ✓ |
 | 0x09  | HT  — horizontal tab    | ✓ |
 | 0x0A  | LF  — line feed         | ✓ |
