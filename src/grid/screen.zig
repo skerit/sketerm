@@ -2148,6 +2148,34 @@ test "kitty graphics query replies OK" {
     try std.testing.expectEqualStrings("\x1b_Gi=42;OK\x1b\\", got);
 }
 
+test "OSC 777 notify dispatches title+body" {
+    const Spy = struct {
+        var got_title: [64]u8 = undefined;
+        var got_body: [64]u8 = undefined;
+        var got_title_len: usize = 0;
+        var got_body_len: usize = 0;
+        fn cb(_: ?*anyopaque, t: []const u8, b: []const u8) void {
+            const tn = @min(t.len, got_title.len);
+            @memcpy(got_title[0..tn], t[0..tn]);
+            got_title_len = tn;
+            const bn = @min(b.len, got_body.len);
+            @memcpy(got_body[0..bn], b[0..bn]);
+            got_body_len = bn;
+        }
+    };
+    Spy.got_title_len = 0;
+    Spy.got_body_len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+    s.sink = .{ .on_notification = Spy.cb };
+    s.onOsc("777;notify;Hello;World");
+    try std.testing.expectEqualStrings("Hello", Spy.got_title[0..Spy.got_title_len]);
+    try std.testing.expectEqualStrings("World", Spy.got_body[0..Spy.got_body_len]);
+}
+
 test "REP after RIS does not replay stale" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
