@@ -40,14 +40,13 @@ pub fn main() u8 {
     const argv = [_][*:0]const u8{
         "/bin/bash",
         "-c",
-        // Plain + colors + scroll + a hand-rolled sixel.
+        // Plain + colors + scroll + hand-rolled sixel + Kitty image.
         "printf '\\033]0;sketerm smoke\\007'; " ++
         "echo Hello, $USER; " ++
         "for i in $(seq 1 50); do echo \"line $i\"; done; " ++
-        // 6x6 red square sixel: define color 1 = R 100/0/0, select, ~ × 6, terminate.
+        // 6x6 red square sixel.
         "printf '\\033Pq#1;2;100;0;0#1!6~\\033\\\\'; " ++
-        // 2x2 RGBA Kitty graphics: 4 px = 16 bytes; base64 = 24 chars.
-        // payload: 4 red pixels = 0xFF 0x00 0x00 0xFF × 4 = base64 \"/wAA////AAD/////AAD/////AAD/\"
+        // 2x2 RGBA Kitty graphics: 16 bytes red.
         "printf '\\033_Ga=T,f=32,s=2,v=2,i=99;/wAA////AAD/////AAD/////AAD/\\033\\\\'; " ++
         "echo done",
     };
