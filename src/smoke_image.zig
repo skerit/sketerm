@@ -131,6 +131,27 @@ pub fn main() !u8 {
     }
 
     try store.addWithPlacement(rgba, img_w, img_h, 0, 0, 1, 0, 0);
+    // Add a SECOND image (32×32 green) at cell (8, 0) to verify
+    // multi-image rendering, and exercise cell-grid scaling
+    // (cells_wide = 4, cells_high = 2 → 32×32 px since cell is 8×16).
+    const rgba2 = try allocator.alloc(u8, npix * 4);
+    defer allocator.free(rgba2);
+    for (0..npix) |i| {
+        rgba2[i * 4 + 0] = 0x00;
+        rgba2[i * 4 + 1] = 0xFF;
+        rgba2[i * 4 + 2] = 0x00;
+        rgba2[i * 4 + 3] = 0xFF;
+    }
+    try store.addFull(.{
+        .rgba = rgba2,
+        .width = img_w,
+        .height = img_h,
+        .row = 0,
+        .col = 8,
+        .image_id = 2,
+        .cells_wide = 4,
+        .cells_high = 2,
+    });
     store.flushUploads();
     pass.draw(&store, W, H);
     c.glFinish();
@@ -162,9 +183,23 @@ pub fn main() !u8 {
         }
     }
 
+    // Sample the green image too — at cell (8,0) with cells_wide=4
+    // and cell_w=8, x = 64..96 in pixels.
+    var green_samples: usize = 0;
+    sample_x = 68;
+    while (sample_x < 92) : (sample_x += 4) {
+        var sample_y: c_int = 4;
+        while (sample_y < 28) : (sample_y += 4) {
+            const top_row: c_int = H - 1 - sample_y;
+            const top_idx: usize = @intCast((top_row * W + sample_x) * 4);
+            if (fb[top_idx] < 0x40 and fb[top_idx + 1] > 0xC0 and fb[top_idx + 2] < 0x40)
+                green_samples += 1;
+        }
+    }
+
     std.debug.print(
-        "smoke-image: red samples top={d} bottom={d}\n",
-        .{ red_in_top, red_in_bottom },
+        "smoke-image: red samples top={d} bottom={d} green={d}\n",
+        .{ red_in_top, red_in_bottom, green_samples },
     );
 
     if (red_in_top + red_in_bottom == 0) {
@@ -177,6 +212,10 @@ pub fn main() !u8 {
             .{ fb[tl_idx], fb[tl_idx + 1], fb[tl_idx + 2], fb[br_idx], fb[br_idx + 1], fb[br_idx + 2] },
         );
         return 2;
+    }
+    if (green_samples == 0) {
+        std.debug.print("smoke-image: FAIL — second (cell-scaled) image not rendered\n", .{});
+        return 3;
     }
     std.debug.print("smoke-image: PASS\n", .{});
     return 0;
