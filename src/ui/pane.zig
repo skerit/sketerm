@@ -11,6 +11,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const Atlas = @import("../render/atlas.zig").Atlas;
 const GridPass = @import("../render/grid_pass.zig").GridPass;
+const CellPass = @import("../render/cell_pass.zig").CellPass;
 const ImagePass = @import("../render/image_pass.zig").ImagePass;
 const ImageStore = @import("../grid/image_store.zig").Store;
 const Screen = @import("../grid/screen.zig").Screen;
@@ -37,6 +38,7 @@ pub const Pane = struct {
     terminal: *Terminal,
     atlas: ?*Atlas = null,
     grid_pass: GridPass,
+    cell_pass: CellPass,
     image_pass: ImagePass = ImagePass.init(),
     image_store: ImageStore,
     allocator: std.mem.Allocator,
@@ -91,6 +93,7 @@ pub const Pane = struct {
             .area = @ptrCast(area_widget),
             .terminal = terminal,
             .grid_pass = GridPass.init(allocator),
+            .cell_pass = CellPass.init(allocator),
             .image_store = ImageStore.init(allocator),
             .menu_arena = std.heap.ArenaAllocator.init(allocator),
             .allocator = allocator,
@@ -262,6 +265,7 @@ pub const Pane = struct {
 
     pub fn deinit(self: *Pane) void {
         self.grid_pass.deinit();
+        self.cell_pass.deinit();
         self.image_pass.deinit();
         self.image_store.deinit();
         if (self.atlas) |a| a.deinit();
@@ -376,6 +380,7 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         self.atlas = null;
     }
     self.grid_pass.forgetGL();
+    self.cell_pass.forgetGL();
     self.image_pass.forgetGL();
     self.image_store.forgetGL();
 
@@ -420,6 +425,10 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         std.debug.print("pane realize: grid_pass realize failed\n", .{});
         return;
     };
+    self.cell_pass.realize() catch {
+        std.debug.print("pane realize: cell_pass realize failed\n", .{});
+        return;
+    };
     self.image_pass.realize() catch {
         std.debug.print("pane realize: image_pass realize failed\n", .{});
         return;
@@ -448,6 +457,20 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     self.grid_pass.canvas_h = @floatFromInt(phys_h);
 
     const focused = c.gtk_widget_has_focus(@ptrCast(self.area)) != 0;
+    // Bump atlas frame counter so multi-page LRU eviction has fresh
+    // "last used" timestamps per render.
+    atlas.markFrame();
+    // Cell pipeline (instanced) — emits per-cell bg + per-cell glyph
+    // for single-scale ASCII rows. Updates only dirty rows in the
+    // persistent VBO.
+    self.cell_pass.pad = self.grid_pass.pad;
+    self.cell_pass.enable_ligatures = self.grid_pass.enable_ligatures;
+    self.cell_pass.enable_bidi = self.grid_pass.enable_bidi;
+    self.cell_pass.rebuildAndUpload(self.terminal.screen, &self.terminal.pool, atlas) catch return @intFromBool(false);
+    self.cell_pass.draw(atlas, phys_w, phys_h);
+    // Overlay pipeline (per-vertex VBO) — cursor, selection, focus
+    // border, scrollback indicator, preedit, bell, and any rows that
+    // need bidi reorder or DH/DW per-line scaling.
     self.grid_pass.buildVertices(self.terminal.screen, &self.terminal.pool, atlas, focused) catch return @intFromBool(false);
     self.grid_pass.draw(atlas, phys_w, phys_h);
 

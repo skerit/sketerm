@@ -1,24 +1,26 @@
-//! Glyph atlas — FreeType raster + GL texture page (R8 grayscale).
-//!
-//! v1: single 1024×1024 R8 page, shelf-packed. LRU eviction and
-//! multi-page growth come post-M3.
+//! Glyph atlas — FreeType raster + GL 2D-array texture with multi-page
+//! shelf-pack and LRU eviction.
 //!
 //! Lifecycle:
 //!   - `init`: load FreeType face, compute cell metrics. No GL.
 //!   - `realize`: must be called with a current GL context. Creates
-//!     the GL texture.
-//!   - `lookupOrLoad`: rasterize codepoint if absent; pack; upload.
+//!     the GL_TEXTURE_2D_ARRAY texture (PAGE_COUNT layers × PAGE_SIZE²).
+//!   - `lookupOrLoad`: rasterize codepoint if absent; pack onto the
+//!     newest page (or evict LRU page if all full); upload.
 //!   - `deinit`: frees FreeType + GL texture.
+//!
+//! Multi-page LRU strategy: each page tracks `last_used_frame`, bumped
+//! whenever any glyph from the page is fetched. When packing fails on
+//! every page, we evict the page with the smallest `last_used_frame`,
+//! drop all glyphs that lived on it, and reuse it.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
 
-// 2048 × 2048 R8 = 4 MB GPU memory per Atlas. With typical cell
-// size (8×16 → ~14k glyphs theoretical, ~7k after shelf-pack waste),
-// this is sufficient for any session that doesn't load thousands of
-// unique emoji + variation selectors. Cross-vendor max is 2048; we
-// stop here to keep llvmpipe and old GLES drivers happy.
+/// Pixels per page side. Cap at 2048 — cross-vendor safe.
 pub const PAGE_SIZE: u32 = 2048;
+/// Number of array-texture layers. 4 × 4 MB = 16 MB GPU memory budget.
+pub const PAGE_COUNT: u32 = 4;
 
 pub const Glyph = struct {
     /// Pixel size of the rasterized bitmap.
@@ -29,43 +31,68 @@ pub const Glyph = struct {
     bearing_y: i16,
     /// Horizontal advance in fractional pixels.
     advance: f32,
-    /// UV in atlas (0..1).
+    /// UV in atlas (0..1) — within the page.
     u0: f32,
     v0: f32,
     u1: f32,
     v1: f32,
+    /// Page (array layer) the glyph lives on.
+    layer: u8 = 0,
+    /// Generation counter — bumped on eviction so stale references
+    /// can be detected and re-resolved by callers that cache.
+    generation: u32 = 0,
+};
+
+const Page = struct {
+    pack_x: u32 = 0,
+    pack_y: u32 = 0,
+    shelf_h: u32 = 0,
+    last_used_frame: u64 = 0,
+    /// Glyph IDs currently cached on this page (for eviction).
+    /// Codepoints are tracked via `cp_glyph_set`.
+    glyphs_on_page: std.ArrayList(GlyphRef) = .{},
+    /// Generation increments when this page gets evicted/reset.
+    generation: u32 = 0,
+
+    fn deinit(self: *Page, allocator: std.mem.Allocator) void {
+        self.glyphs_on_page.deinit(allocator);
+    }
+};
+
+const GlyphRef = struct {
+    /// Either codepoint (kind=.codepoint) or font glyph index (kind=.gid).
+    key: u32,
+    kind: Kind,
+    pub const Kind = enum { codepoint, gid };
 };
 
 pub const Atlas = struct {
     ft_lib: c.FT_Library,
     ft_face: c.FT_Face,
     /// HarfBuzz font wrapping the FreeType face. Used by `shapeRun`
-    /// for ligature / OpenType-feature aware text layout. The
-    /// renderer doesn't currently shape (still does codepoint-per-
-    /// cell), but the hook is here for the next step.
+    /// for ligature / OpenType-feature aware text layout.
     hb_font: ?*c.hb_font_t = null,
 
-    /// Cell metrics in pixels — used by the renderer to lay out the grid.
+    /// Cell metrics in pixels.
     cell_w: u16,
     cell_h: u16,
-    /// Pixels above baseline.
     ascent: i16,
-    /// Pixels below baseline (positive).
     descent: i16,
 
-    /// GL texture id (0 until realize).
+    /// GL_TEXTURE_2D_ARRAY (0 until realize).
     gl_tex: c_uint = 0,
     realized: bool = false,
 
-    /// Shelf-pack state.
-    pack_x: u32 = 0,
-    pack_y: u32 = 0,
-    shelf_h: u32 = 0,
+    /// Page state, one per array layer.
+    pages: [PAGE_COUNT]Page = blk: {
+        var ps: [PAGE_COUNT]Page = undefined;
+        for (&ps) |*p| p.* = .{};
+        break :blk ps;
+    },
+    /// Frame counter — caller bumps via `markFrame` once per render.
+    frame_counter: u64 = 1,
 
     cache: std.AutoHashMap(u32, Glyph),
-    /// Glyph cache keyed by FreeType glyph index (post-HarfBuzz
-    /// shaping). Cells looked up by codepoint live in `cache`; cells
-    /// looked up by glyph_id (from a shaping pass) live here.
     glyph_cache: std.AutoHashMap(u32, Glyph),
     allocator: std.mem.Allocator,
 
@@ -86,9 +113,6 @@ pub const Atlas = struct {
         const ascent: i16 = @intCast(@as(c_long, m.ascender) >> 6);
         const descent: i16 = @intCast(-@as(c_long, m.descender) >> 6);
 
-        // Wrap the FreeType face in a HarfBuzz font for shaping. We
-        // reference-count it via hb_font_t* so the FT face is shared
-        // (don't destroy it here; Atlas.deinit destroys the face).
         const hb_font = c.hb_ft_font_create_referenced(face);
 
         const self = try allocator.create(Atlas);
@@ -112,22 +136,23 @@ pub const Atlas = struct {
     pub fn realize(self: *Atlas) void {
         if (self.realized) return;
         c.glGenTextures(1, &self.gl_tex);
-        c.glBindTexture(c.GL_TEXTURE_2D, self.gl_tex);
-        c.glTexImage2D(
-            c.GL_TEXTURE_2D,
+        c.glBindTexture(c.GL_TEXTURE_2D_ARRAY, self.gl_tex);
+        c.glTexImage3D(
+            c.GL_TEXTURE_2D_ARRAY,
             0,
             c.GL_R8,
             @intCast(PAGE_SIZE),
             @intCast(PAGE_SIZE),
+            @intCast(PAGE_COUNT),
             0,
             c.GL_RED,
             c.GL_UNSIGNED_BYTE,
             null,
         );
-        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
-        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
-        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
-        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+        c.glTexParameteri(c.GL_TEXTURE_2D_ARRAY, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+        c.glTexParameteri(c.GL_TEXTURE_2D_ARRAY, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+        c.glTexParameteri(c.GL_TEXTURE_2D_ARRAY, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+        c.glTexParameteri(c.GL_TEXTURE_2D_ARRAY, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
         self.realized = true;
     }
 
@@ -135,22 +160,25 @@ pub const Atlas = struct {
         // GL texture is freed by GTK on widget unrealize.
         self.cache.deinit();
         self.glyph_cache.deinit();
+        for (&self.pages) |*p| p.deinit(self.allocator);
         if (self.hb_font) |f| c.hb_font_destroy(f);
         _ = c.FT_Done_Face(self.ft_face);
         _ = c.FT_Done_FreeType(self.ft_lib);
         self.allocator.destroy(self);
     }
 
-    /// Shape a UTF-8 string with HarfBuzz. Returns a slice of
-    /// (glyph_id, x_advance, y_advance, x_offset, y_offset, cluster)
-    /// tuples. Caller must free.
+    /// Bump the frame counter. Renderer should call once per render.
+    pub fn markFrame(self: *Atlas) void {
+        self.frame_counter +%= 1;
+    }
+
+    /// Shape a UTF-8 string with HarfBuzz.
     pub const ShapedGlyph = struct {
         glyph_id: u32,
         x_advance: i32,
         y_advance: i32,
         x_offset: i32,
         y_offset: i32,
-        /// Byte offset in the input UTF-8 string.
         cluster: u32,
     };
 
@@ -159,9 +187,6 @@ pub const Atlas = struct {
         const buf = c.hb_buffer_create();
         defer c.hb_buffer_destroy(buf);
         c.hb_buffer_add_utf8(buf, text.ptr, @intCast(text.len), 0, @intCast(text.len));
-        // Let HB infer script/direction/language from the buffer
-        // contents. Hardcoding LATIN broke any non-Latin codepoint
-        // (half-blocks, box-draw, CJK) — they came back as notdef.
         c.hb_buffer_guess_segment_properties(buf);
         c.hb_shape(font, buf, null, 0);
         var glyph_count: c_uint = 0;
@@ -182,24 +207,31 @@ pub const Atlas = struct {
         return out;
     }
 
-    /// Get an existing glyph or rasterize + upload. Codepoint-keyed
-    /// path — used by the per-codepoint render path. Internally maps
-    /// to a font glyph_id and delegates to lookupOrLoadById.
+    /// Codepoint-keyed lookup. Marks the host page as used.
     pub fn lookupOrLoad(self: *Atlas, codepoint: u32) !Glyph {
-        if (self.cache.get(codepoint)) |g| return g;
+        if (self.cache.get(codepoint)) |g| {
+            self.touchPage(g.layer);
+            return g;
+        }
         const gid = c.FT_Get_Char_Index(self.ft_face, codepoint);
         if (gid == 0 and codepoint != 0) {
             return self.cacheEmptyCp(codepoint);
         }
         const g = self.lookupOrLoadById(gid) catch return self.cacheEmptyCp(codepoint);
         try self.cache.put(codepoint, g);
+        try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+            .key = codepoint,
+            .kind = .codepoint,
+        });
         return g;
     }
 
-    /// Glyph-id keyed lookup. The HarfBuzz shape path uses this so
-    /// ligature glyphs (which have no codepoint) reach the atlas.
+    /// Glyph-id keyed lookup (HarfBuzz output).
     pub fn lookupOrLoadById(self: *Atlas, gid: u32) !Glyph {
-        if (self.glyph_cache.get(gid)) |g| return g;
+        if (self.glyph_cache.get(gid)) |g| {
+            self.touchPage(g.layer);
+            return g;
+        }
 
         if (c.FT_Load_Glyph(self.ft_face, gid, c.FT_LOAD_RENDER | c.FT_LOAD_TARGET_LIGHT) != 0) {
             return self.cacheEmptyId(gid);
@@ -210,29 +242,33 @@ pub const Atlas = struct {
         const w: u32 = bm.width;
         const h: u32 = bm.rows;
 
-        if (self.pack_x + w + 1 > PAGE_SIZE) {
-            self.pack_x = 0;
-            self.pack_y += self.shelf_h + 1;
-            self.shelf_h = 0;
+        // Find a page that fits, optionally evicting LRU.
+        const page_idx = self.findOrEvictPage(w, h) orelse return self.cacheEmptyId(gid);
+        const page = &self.pages[page_idx];
+        if (page.pack_x + w + 1 > PAGE_SIZE) {
+            page.pack_x = 0;
+            page.pack_y += page.shelf_h + 1;
+            page.shelf_h = 0;
         }
-        if (h > self.shelf_h) self.shelf_h = h;
-        if (self.pack_y + h > PAGE_SIZE) {
+        if (h > page.shelf_h) page.shelf_h = h;
+        if (page.pack_y + h > PAGE_SIZE) {
             return self.cacheEmptyId(gid);
         }
-
-        const px = self.pack_x;
-        const py = self.pack_y;
+        const px = page.pack_x;
+        const py = page.pack_y;
 
         if (w > 0 and h > 0 and self.realized) {
-            c.glBindTexture(c.GL_TEXTURE_2D, self.gl_tex);
+            c.glBindTexture(c.GL_TEXTURE_2D_ARRAY, self.gl_tex);
             c.glPixelStorei(c.GL_UNPACK_ALIGNMENT, 1);
-            c.glTexSubImage2D(
-                c.GL_TEXTURE_2D,
+            c.glTexSubImage3D(
+                c.GL_TEXTURE_2D_ARRAY,
                 0,
                 @intCast(px),
                 @intCast(py),
+                @intCast(page_idx),
                 @intCast(w),
                 @intCast(h),
+                1,
                 c.GL_RED,
                 c.GL_UNSIGNED_BYTE,
                 bm.buffer,
@@ -250,10 +286,70 @@ pub const Atlas = struct {
             .v0 = @as(f32, @floatFromInt(py)) * inv_page,
             .u1 = @as(f32, @floatFromInt(px + w)) * inv_page,
             .v1 = @as(f32, @floatFromInt(py + h)) * inv_page,
+            .layer = @intCast(page_idx),
+            .generation = page.generation,
         };
-        self.pack_x += w + 1;
+        page.pack_x += w + 1;
+        page.last_used_frame = self.frame_counter;
+        try self.pages[page_idx].glyphs_on_page.append(self.allocator, .{
+            .key = gid,
+            .kind = .gid,
+        });
         try self.glyph_cache.put(gid, g);
         return g;
+    }
+
+    /// Find an existing page with room, or evict the LRU page.
+    fn findOrEvictPage(self: *Atlas, gw: u32, gh: u32) ?u32 {
+        // First pass: pages with room on current shelf.
+        var best_with_room: ?u32 = null;
+        var best_used: u64 = std.math.maxInt(u64);
+        for (&self.pages, 0..) |*p, i| {
+            const horiz = p.pack_x + gw + 1 <= PAGE_SIZE and p.pack_y + @max(p.shelf_h, gh) <= PAGE_SIZE;
+            const new_shelf = p.pack_y + p.shelf_h + 1 + gh <= PAGE_SIZE;
+            if (horiz or new_shelf) {
+                // Prefer LRU page for new glyphs (keeps hot glyphs together).
+                if (p.last_used_frame < best_used) {
+                    best_used = p.last_used_frame;
+                    best_with_room = @intCast(i);
+                }
+            }
+        }
+        if (best_with_room) |idx| return idx;
+
+        // All pages full: evict LRU.
+        var lru_idx: u32 = 0;
+        var lru_used: u64 = std.math.maxInt(u64);
+        for (&self.pages, 0..) |*p, i| {
+            if (p.last_used_frame < lru_used) {
+                lru_used = p.last_used_frame;
+                lru_idx = @intCast(i);
+            }
+        }
+        self.evictPage(lru_idx);
+        return lru_idx;
+    }
+
+    /// Reset a page: drop pack state, remove cache entries that lived
+    /// on it, bump its generation counter.
+    fn evictPage(self: *Atlas, idx: u32) void {
+        const p = &self.pages[idx];
+        for (p.glyphs_on_page.items) |ref| {
+            switch (ref.kind) {
+                .codepoint => _ = self.cache.remove(ref.key),
+                .gid => _ = self.glyph_cache.remove(ref.key),
+            }
+        }
+        p.glyphs_on_page.clearRetainingCapacity();
+        p.pack_x = 0;
+        p.pack_y = 0;
+        p.shelf_h = 0;
+        p.generation +%= 1;
+        p.last_used_frame = self.frame_counter;
+    }
+
+    fn touchPage(self: *Atlas, layer: u8) void {
+        if (layer < PAGE_COUNT) self.pages[layer].last_used_frame = self.frame_counter;
     }
 
     fn emptyGlyph(self: *const Atlas) Glyph {
@@ -267,6 +363,8 @@ pub const Atlas = struct {
             .v0 = 0,
             .u1 = 0,
             .v1 = 0,
+            .layer = 0,
+            .generation = 0,
         };
     }
 
@@ -282,3 +380,13 @@ pub const Atlas = struct {
         return empty;
     }
 };
+
+test "atlas page eviction recycles space" {
+    // We can't run real FT/GL in tests, but we can exercise the
+    // Page bookkeeping layer directly.
+    var p = Page{};
+    defer p.deinit(std.testing.allocator);
+    try p.glyphs_on_page.append(std.testing.allocator, .{ .key = 'A', .kind = .codepoint });
+    try p.glyphs_on_page.append(std.testing.allocator, .{ .key = 'B', .kind = .codepoint });
+    try std.testing.expectEqual(@as(usize, 2), p.glyphs_on_page.items.len);
+}

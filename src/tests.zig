@@ -29,6 +29,8 @@ comptime {
     _ = @import("parser/kitty_image.zig");
     _ = @import("ui/input.zig");
     _ = @import("render/atlas_test.zig");
+    _ = @import("render/atlas.zig");
+    _ = @import("render/cell_pass.zig");
     _ = @import("ui/input_conformance_test.zig");
     _ = @import("parser/multicell_conformance_test.zig");
     _ = @import("parser/clipboard_conformance_test.zig");
