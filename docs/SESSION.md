@@ -829,3 +829,50 @@ With the bug gone, default build mode promoted to ReleaseFast — the
 shipped binary now ships with safety checks off (matches
 Kitty/WezTerm/Ghostty conventions). Pass `-Doptimize=ReleaseSafe`
 during development for bounds + overflow checks.
+
+## SIMD + scratch-buffers tick (post-checkpoint #2)
+
+Bench had been stuck at 1.2 MB/s plain ASCII. Two latent issues
+masking each other:
+
+- **Per-byte parser dispatch** — every printable byte traversed 4
+  nested switches in `Parser.byte`. SIMD scan in `Parser.advance`
+  using `@Vector(16, u8)` finds the longest printable run, bulk-
+  copies into `print_buf`, flushing as 64-byte `print_run` events.
+  Tests cover ESC / DEL / control / high-byte boundaries.
+- **scrollUp / scrollDown allocator hits** — every line-feed (and
+  every RI) allocated 2 small slices (`stash` + `stash_ids`) for
+  `move=1`. Stack scratch up to 8 covers ~all real moves; heap
+  fallback for larger.
+- **runIsAscii** — vectorised the bytewise scan that gates the
+  Tier-2 fast path in `Screen.apply(.print_run)`.
+- **GridPass bidi scratch** — cursor visual-col remap and
+  `emitGlyphsForLine` were each doing 3 allocs per bidi row per
+  frame. Hoisted into `bidi_cps` / `bidi_levels` / `bidi_indices`
+  ArrayLists on GridPass.
+
+Bench results: plain ASCII 1.2 → 138.7 MB/s (115×). All other
+workloads in the 50–100× range. The scrollUp alloc was responsible
+for ~all of the win on this bench because every newline in the
+fixture fired it.
+
+## Niche-compat tick
+
+- **Mouse encodings**: DECSET 1005 (UTF-8), 1015 (urxvt), 1016
+  (SGR-pixel) added next to existing 1006 (SGR). Last-set wins;
+  DECRST returns to legacy. `Pane.writeMouseEvent` switches on
+  `Screen.mouse_enc` for press/release/motion/wheel call sites.
+  DECRQM reports state. 2 unit tests.
+- **SS2 / SS3 single-shifts** (ESC N, ESC O): `pending_single_shift`
+  flag bypasses charset translation for the next codepoint. We
+  don't model G2/G3 charsets, so the bypass is the spec-compliant
+  best-effort given the missing model. 1 unit test.
+- **OSC 50**: `?` query replies with `Screen.font_name` (set from
+  `Pane.realize` to `font_path`). Set is accepted-no-op. Stops apps
+  that probe for a font name from getting confused. 1 unit test.
+- **OSC 1337 directives**: `File=` still goes to the iTerm2 image
+  path; everything else dispatches as `<Key>=<Value>` directives.
+  Implemented: CursorShape (maps to DECSCUSR), ClearScrollback,
+  SetMark (maps to OSC 133 prompt-mark), RequestAttention (notify),
+  CopyToClipboard (immediate copy), StealFocus (deny). 1 unit test.
+
