@@ -388,3 +388,27 @@ following:
   `Screen.selectWordAt` walks word-class neighbours;
   `Screen.selectLineAt` selects whole row. Word-class follows xterm
   default + non-ASCII codepoints. PRIMARY auto-filled. 3 tests.
+
+## More polish on top of the post-compaction batch
+
+- **Rectangular (block) selection** — Alt+drag during selection.
+  Renderer overlays the rectangle; `extractSelection` emits each
+  row as fixed-width without trimming so columns line up. One test.
+- **Per-pane font_size in layout** — saved in `PaneSpec` only when
+  it diverges from the global default, restored on layout load.
+  Layout-loaded panes also get the same notify / bell / config
+  wiring as `newShellTab` panes (was a small drift).
+- **Audible bell** — opt-in via `bell_audible = true`. Uses
+  `gdk_display_beep` so DE/portal handles the actual sound.
+- **Layout DSL** — splits accept `@ <ratio>` (e.g. `hsplit @ 0.7`),
+  pane commands honour `"double"` and `'single'` quotes for args
+  containing spaces. Three tests + sample.layout updated.
+- **Save layout shortcut** — Ctrl+Shift+S calls
+  `saveLayoutQuietly` so users can checkpoint their setup without
+  closing the window.
+- **OSC 8 hyperlinks survive copy** — `extractSelection` emits
+  `[text](uri)` markdown around linked runs, so URIs paste cleanly
+  into chat/issue trackers/markdown. One test.
+- **Scrollback position indicator** — thin track on the right edge
+  with a thumb showing the visible window inside (scrollback +
+  active). Subtle when at bottom, accent when scrolled back.
