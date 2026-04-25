@@ -427,6 +427,47 @@ pub const Manager = struct {
             // existing.rgba now aliases frames[0].rgba (don't double-free).
         }
 
+        // Composition: per kitty spec, when `C=0` (default) the new
+        // frame is alpha-blended over the base frame (referenced by
+        // `r=` or the previous frame); `C=1` overwrites.
+        const compose_alpha = acc.frame_compose_mode == 0;
+        const have_base = existing.frames.items.len > 0;
+        if (compose_alpha and have_base) {
+            const base_idx: usize = blk: {
+                if (acc.frame_compose_from > 0 and acc.frame_compose_from <= existing.frames.items.len) {
+                    break :blk acc.frame_compose_from - 1;
+                }
+                break :blk existing.frames.items.len - 1;
+            };
+            const base = existing.frames.items[base_idx].rgba;
+            // In-place: blend new_frame.rgba over base, write back into
+            // new_frame.rgba (which we own and will install).
+            const npix: usize = @as(usize, existing.width) * @as(usize, existing.height);
+            var p: usize = 0;
+            while (p < npix) : (p += 1) {
+                const i = p * 4;
+                const a: u32 = new_frame.rgba[i + 3];
+                if (a == 0xFF) continue; // fully opaque — keep new
+                if (a == 0) {
+                    // Fully transparent — copy base.
+                    new_frame.rgba[i + 0] = base[i + 0];
+                    new_frame.rgba[i + 1] = base[i + 1];
+                    new_frame.rgba[i + 2] = base[i + 2];
+                    new_frame.rgba[i + 3] = base[i + 3];
+                    continue;
+                }
+                const inv: u32 = 255 - a;
+                inline for (0..3) |k| {
+                    const n: u32 = new_frame.rgba[i + k];
+                    const b: u32 = base[i + k];
+                    new_frame.rgba[i + k] = @intCast((n * a + b * inv + 127) / 255);
+                }
+                // Output alpha = 1 - (1-a_new)(1-a_base). Saturate.
+                const ab: u32 = base[i + 3];
+                new_frame.rgba[i + 3] = @intCast(255 - ((255 - a) * (255 - ab) / 255));
+            }
+        }
+
         // Insert / append frame.
         const target = acc.frame_target;
         if (target == 0 or target > existing.frames.items.len) {
@@ -680,6 +721,49 @@ test "animation: advanceAnimations cycles current_frame" {
     const advanced3 = mgr.advanceAnimations(150_000);
     try std.testing.expect(advanced3);
     try std.testing.expectEqual(@as(u32, 0), mgr.store.getPtr(7).?.current_frame);
+}
+
+test "animation: a=f with C=0 alpha-blends transparent over base" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    // Base frame: solid red 1x1 RGBA.
+    const base = [_]u8{ 0xFF, 0x00, 0x00, 0xFF };
+    var b64a: [8]u8 = undefined;
+    const enc = std.base64.standard.Encoder;
+    const bA = enc.encode(&b64a, &base);
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 11,
+        .format = 32,
+        .width = 1,
+        .height = 1,
+        .more = 0,
+        .payload = bA,
+    });
+
+    // Add frame with full transparency (alpha=0). C=0 (alpha-blend)
+    // should keep base pixel; C=1 (overwrite) would replace.
+    const transparent = [_]u8{ 0x00, 0xFF, 0x00, 0x00 };
+    var b64b: [8]u8 = undefined;
+    const bB = enc.encode(&b64b, &transparent);
+    _ = mgr.ingest(.{
+        .action = .transmit_frame,
+        .image_id = 11,
+        .format = 32,
+        .width = 1,
+        .height = 1,
+        .more = 0,
+        .payload = bB,
+        .no_cursor_move = 0, // C=0 → alpha blend
+    });
+
+    const stored = mgr.store.getPtr(11).?;
+    try std.testing.expectEqual(@as(usize, 2), stored.frames.items.len);
+    // Frame 1 should be the base (red), since the new frame was fully
+    // transparent and we composed alpha=0 over the base.
+    try std.testing.expectEqual(@as(u8, 0xFF), stored.frames.items[1].rgba[0]);
+    try std.testing.expectEqual(@as(u8, 0x00), stored.frames.items[1].rgba[1]);
 }
 
 test "animation: a=a stop pauses playback" {
