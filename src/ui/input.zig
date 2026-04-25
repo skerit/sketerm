@@ -72,11 +72,58 @@ pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allo
         null,
         c.G_CONNECT_DEFAULT,
     );
+    // Key-released — only emits to PTY when kitty kbd report-events
+    // (flag 0x02) is enabled. Otherwise it's a no-op.
+    _ = c.g_signal_connect_data(
+        ctrl,
+        "key-released",
+        @ptrCast(&onKeyReleased),
+        @ptrCast(ctx),
+        null,
+        c.G_CONNECT_DEFAULT,
+    );
     c.gtk_widget_add_controller(widget, @ptrCast(ctrl));
 
     c.gtk_widget_set_focusable(widget, 1);
     _ = c.gtk_widget_grab_focus(widget);
     return ctx;
+}
+
+/// Key-released handler. No-op unless kitty kbd report-events flag
+/// (0x02) is enabled — most apps don't want release noise polluting
+/// their PTY. When enabled, emits `CSI <kc>;<mods>:3 u`.
+fn onKeyReleased(
+    _: *c.GtkEventControllerKey,
+    keyval: c_uint,
+    _: c_uint,
+    state: c.GdkModifierType,
+    user: ?*anyopaque,
+) callconv(.c) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const screen = ctx.terminal.screen;
+    if ((screen.kitty_kbd_flags & 0x02) == 0) return;
+
+    const ctrl = (state & c.GDK_CONTROL_MASK) != 0;
+    const alt = (state & c.GDK_ALT_MASK) != 0;
+    const shift = (state & c.GDK_SHIFT_MASK) != 0;
+
+    // Map to the same canonical lowercase code point we use on press.
+    var cp: u32 = 0;
+    switch (keyval) {
+        c.GDK_KEY_Escape => cp = 27,
+        c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => cp = 13,
+        c.GDK_KEY_BackSpace => cp = 127,
+        c.GDK_KEY_Tab, c.GDK_KEY_ISO_Left_Tab => cp = 9,
+        else => {
+            const u = c.gdk_keyval_to_unicode(keyval);
+            if (u == 0 or u >= 0x110000) return;
+            cp = u;
+            if (cp >= 'A' and cp <= 'Z') cp += 0x20;
+        },
+    }
+    var buf: [32]u8 = undefined;
+    const n = kittyKeyEvent(&buf, cp, shift, alt, ctrl, 3);
+    if (n > 0) _ = ctx.terminal.pty.writeAll(buf[0..n]);
 }
 
 fn onImCommit(_: *c.GtkIMContext, text: [*:0]const u8, user: ?*anyopaque) callconv(.c) void {
@@ -329,12 +376,25 @@ pub fn ssoKey(buf: []u8, final: u8, shift: bool, alt: bool, ctrl: bool) usize {
 /// only Shift is "held", we still emit mods=2 here per kitty spec
 /// (callers handle whether Shift suppresses CSI u for printable keys).
 pub fn kittyKey(buf: []u8, code_point: u32, shift: bool, alt: bool, ctrl: bool) usize {
+    return kittyKeyEvent(buf, code_point, shift, alt, ctrl, 1);
+}
+
+/// Variant that also encodes the event type per kitty kbd flag 0x02:
+///   1 = press, 2 = repeat, 3 = release.
+/// Press emits the same shape as `kittyKey`; repeat/release add the
+/// `:<event>` sub-parameter. Apps that haven't enabled flag 0x02
+/// should use the default `event = 1` form.
+pub fn kittyKeyEvent(buf: []u8, code_point: u32, shift: bool, alt: bool, ctrl: bool, event: u8) usize {
     const m = modCode(shift, alt, ctrl);
-    if (m == 1) {
+    if (event == 1 and m == 1) {
         const out = std.fmt.bufPrint(buf, "\x1b[{d}u", .{code_point}) catch return 0;
         return out.len;
     }
-    const out = std.fmt.bufPrint(buf, "\x1b[{d};{d}u", .{ code_point, m }) catch return 0;
+    if (event == 1) {
+        const out = std.fmt.bufPrint(buf, "\x1b[{d};{d}u", .{ code_point, m }) catch return 0;
+        return out.len;
+    }
+    const out = std.fmt.bufPrint(buf, "\x1b[{d};{d}:{d}u", .{ code_point, m, event }) catch return 0;
     return out.len;
 }
 

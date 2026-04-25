@@ -153,3 +153,21 @@ test "kittyKey Ctrl+Shift+H → CSI 104 ; 6 u" {
     const n = input.kittyKey(&buf, 104, true, false, true);
     try std.testing.expectEqualStrings("\x1b[104;6u", buf[0..n]);
 }
+
+test "kittyKeyEvent press → no event suffix" {
+    var buf: [16]u8 = undefined;
+    const n = input.kittyKeyEvent(&buf, 27, false, false, false, 1);
+    try std.testing.expectEqualStrings("\x1b[27u", buf[0..n]);
+}
+
+test "kittyKeyEvent release adds :3 sub-parameter" {
+    var buf: [16]u8 = undefined;
+    const n = input.kittyKeyEvent(&buf, 105, false, false, true, 3);
+    try std.testing.expectEqualStrings("\x1b[105;5:3u", buf[0..n]);
+}
+
+test "kittyKeyEvent repeat with mods" {
+    var buf: [16]u8 = undefined;
+    const n = input.kittyKeyEvent(&buf, 113, true, false, false, 2);
+    try std.testing.expectEqualStrings("\x1b[113;2:2u", buf[0..n]);
+}
