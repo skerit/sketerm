@@ -966,8 +966,8 @@ pub const Screen = struct {
     }
 
     fn respondDa(self: *Screen) void {
-        // VT220 + ANSI color (62=VT220, 22=color)
-        self.respond("\x1b[?62;22c");
+        // VT220 + sixel + ANSI color (62=VT220, 4=sixel, 22=color).
+        self.respond("\x1b[?62;4;22c");
     }
 
     fn decscusr(self: *Screen, ps: u32) void {
