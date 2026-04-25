@@ -46,6 +46,7 @@ const HELP_TEXT =
     \\
     \\Environment:
     \\  SKETERM_FONT          Override font (absolute path to .ttf/.otf)
+    \\  SKETERM_SCROLLBACK    Scrollback line capacity (default 10000)
     \\
 ;
 

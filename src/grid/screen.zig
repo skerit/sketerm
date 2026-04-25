@@ -227,6 +227,12 @@ pub const Screen = struct {
             .allocator = allocator,
             .links = std.AutoHashMap(u8, []u8).init(allocator),
         };
+        // SKETERM_SCROLLBACK env override (lines, 0 = disable scrollback).
+        if (std.posix.getenv("SKETERM_SCROLLBACK")) |env| {
+            if (std.fmt.parseInt(usize, env, 10)) |n| {
+                self.scrollback_capacity = n;
+            } else |_| {}
+        }
         try self.resetTabStops();
         return self;
     }
