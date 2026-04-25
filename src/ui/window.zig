@@ -493,13 +493,14 @@ pub const Window = struct {
         pane.font_size = self.config.font_size;
         pane.font_path = self.config.font_path;
         pane.grid_pass.pad = self.config.padding;
-        pane.grid_pass.default_fg = self.config.default_fg;
-        pane.grid_pass.default_bg = self.config.default_bg;
+        const fg_bg = self.resolveDefaultColors();
+        pane.grid_pass.default_fg = fg_bg.fg;
+        pane.grid_pass.default_bg = fg_bg.bg;
         pane.grid_pass.enable_ligatures = self.config.ligatures;
         // Push config-driven defaults onto the screen so OSC 4/10/11
         // queries reply with the configured values until apps override.
-        term.screen.default_fg = self.config.default_fg;
-        term.screen.default_bg = self.config.default_bg;
+        term.screen.default_fg = fg_bg.fg;
+        term.screen.default_bg = fg_bg.bg;
         term.screen.cursor_color = self.config.cursor_color;
         term.screen.scrollback_capacity = self.config.scrollback;
         term.screen.bracketed_paste = self.config.bracketed_paste;
@@ -753,6 +754,30 @@ pub const Window = struct {
         const pane = self.focusedPane() orelse return;
         if (pane.font_size == self.config.font_size) return;
         pane.setFontSize(self.config.font_size);
+    }
+
+    const ColorPair = struct { fg: [4]f32, bg: [4]f32 };
+
+    /// Derive the effective default fg/bg. When auto_theme is on we
+    /// follow AdwStyleManager's dark/light state so sketerm matches
+    /// the system appearance. Otherwise honour the explicit config.
+    fn resolveDefaultColors(self: *const Window) ColorPair {
+        if (!self.config.auto_theme) {
+            return .{ .fg = self.config.default_fg, .bg = self.config.default_bg };
+        }
+        const sm = c.adw_style_manager_get_default();
+        const dark = c.adw_style_manager_get_dark(sm) != 0;
+        if (dark) {
+            return .{
+                .fg = .{ 0.92, 0.92, 0.92, 1.0 },
+                .bg = .{ 0.10, 0.10, 0.10, 1.0 },
+            };
+        } else {
+            return .{
+                .fg = .{ 0.10, 0.10, 0.10, 1.0 },
+                .bg = .{ 0.97, 0.97, 0.97, 1.0 },
+            };
+        }
     }
 
     fn focusedPane(self: *Window) ?*Pane {

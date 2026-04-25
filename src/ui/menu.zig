@@ -15,6 +15,7 @@ pub const Action = enum {
     split_h,
     split_v,
     close_pane,
+    reset_terminal,
 };
 
 pub const Sink = *const fn (ctx: ?*anyopaque, action: Action) void;
@@ -45,6 +46,7 @@ const BINDS = [_]Bind{
     .{ .name = "new-tab", .label = "New Tab", .detailed = "term.new-tab", .action = .new_tab },
     .{ .name = "rename-tab", .label = "Rename Tab…", .detailed = "term.rename-tab", .action = .rename_tab },
     .{ .name = "close-tab", .label = "Close Tab", .detailed = "term.close-tab", .action = .close_tab },
+    .{ .name = "reset", .label = "Reset Terminal", .detailed = "term.reset", .action = .reset_terminal },
 };
 
 pub fn attach(
@@ -74,6 +76,11 @@ pub fn attach(
     c.g_menu_append(sec3, "Close Tab", "term.close-tab");
     c.g_menu_append_section(menu, null, @ptrCast(@alignCast(sec3)));
     c.g_object_unref(sec3);
+
+    const sec4 = c.g_menu_new();
+    c.g_menu_append(sec4, "Reset Terminal", "term.reset");
+    c.g_menu_append_section(menu, null, @ptrCast(@alignCast(sec4)));
+    c.g_object_unref(sec4);
 
     // Action group.
     const group = c.g_simple_action_group_new();

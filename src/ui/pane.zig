@@ -217,6 +217,10 @@ pub const Pane = struct {
                 clipboard.pasteFromClipboard(@ptrCast(self.area), self.terminal);
                 return true;
             },
+            .reset_terminal => {
+                self.terminal.screen.fullReset();
+                return true;
+            },
             else => return false,
         }
     }

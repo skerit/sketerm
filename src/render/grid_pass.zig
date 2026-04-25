@@ -346,6 +346,10 @@ pub const GridPass = struct {
             // otherwise fall back to default fg.
             const fg = if (screen.cursor_color[3] > 0) screen.cursor_color else self.default_fg;
             const block_alpha: f32 = 0.85;
+            // Wide-cell cursor: when the cell at the cursor is the
+            // left half of a wide rune, span 2 cells.
+            const at = if (!screen.use_alt) screen.active[screen.row].cells[screen.col] else screen.alt.?[screen.row].cells[screen.col];
+            const cur_cw: f32 = if (at.flags & 0b0000_0001 != 0) cw * 2.0 else cw;
 
             if (focused) {
                 // Filled cursor in the configured shape.
@@ -353,7 +357,7 @@ pub const GridPass = struct {
                     .block_blink, .block_steady => {
                         try self.pushQuad(
                             .{ cx, cy },
-                            .{ cw, ch },
+                            .{ cur_cw, ch },
                             .{ 0, 0 },
                             .{ 0, 0 },
                             .{ fg[0], fg[1], fg[2], block_alpha },
@@ -364,7 +368,7 @@ pub const GridPass = struct {
                         const h: f32 = @max(2.0, ch / 8.0);
                         try self.pushQuad(
                             .{ cx, cy + ch - h },
-                            .{ cw, h },
+                            .{ cur_cw, h },
                             .{ 0, 0 },
                             .{ 0, 0 },
                             .{ fg[0], fg[1], fg[2], 0.95 },
@@ -387,10 +391,10 @@ pub const GridPass = struct {
                 // Unfocused: hollow outline, never blinks.
                 const t: f32 = 1.0;
                 const a: f32 = 0.55;
-                try self.pushQuad(.{ cx, cy }, .{ cw, t }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], a }, 0.0);
-                try self.pushQuad(.{ cx, cy + ch - t }, .{ cw, t }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], a }, 0.0);
+                try self.pushQuad(.{ cx, cy }, .{ cur_cw, t }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], a }, 0.0);
+                try self.pushQuad(.{ cx, cy + ch - t }, .{ cur_cw, t }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], a }, 0.0);
                 try self.pushQuad(.{ cx, cy }, .{ t, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], a }, 0.0);
-                try self.pushQuad(.{ cx + cw - t, cy }, .{ t, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], a }, 0.0);
+                try self.pushQuad(.{ cx + cur_cw - t, cy }, .{ t, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ fg[0], fg[1], fg[2], a }, 0.0);
             }
         }
 

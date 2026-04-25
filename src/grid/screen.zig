@@ -52,6 +52,9 @@ pub const Screen = struct {
     saved_charset_g0: Charset = .ascii,
     saved_charset_g1: Charset = .ascii,
     saved_active_charset: ActiveCharset = .g0,
+    /// Saved OSC 8 link state. Apps that nest OSC 8 across DECSC/DECRC
+    /// boundaries get the right link reapplied on restore.
+    saved_link_id: u8 = 0,
 
     /// Current SGR-derived style index.
     cur_style: u16 = 0,
@@ -1650,7 +1653,7 @@ pub const Screen = struct {
         if (self.use_alt) self.toggleAltScreen(false);
     }
 
-    fn fullReset(self: *Screen) void {
+    pub fn fullReset(self: *Screen) void {
         for (self.buf()) |*l| l.clear();
         self.row = 0;
         self.col = 0;
@@ -1733,6 +1736,7 @@ pub const Screen = struct {
         self.saved_charset_g0 = self.charset_g0;
         self.saved_charset_g1 = self.charset_g1;
         self.saved_active_charset = self.active_charset;
+        self.saved_link_id = self.current_link_id;
     }
 
     fn restoreCursor(self: *Screen) void {
@@ -1744,6 +1748,7 @@ pub const Screen = struct {
         self.charset_g0 = self.saved_charset_g0;
         self.charset_g1 = self.saved_charset_g1;
         self.active_charset = self.saved_active_charset;
+        self.current_link_id = self.saved_link_id;
         self.pending_wrap = false;
     }
 
