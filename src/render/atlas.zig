@@ -13,7 +13,12 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 
-pub const PAGE_SIZE: u32 = 1024;
+// 2048 × 2048 R8 = 4 MB GPU memory per Atlas. With typical cell
+// size (8×16 → ~14k glyphs theoretical, ~7k after shelf-pack waste),
+// this is sufficient for any session that doesn't load thousands of
+// unique emoji + variation selectors. Cross-vendor max is 2048; we
+// stop here to keep llvmpipe and old GLES drivers happy.
+pub const PAGE_SIZE: u32 = 2048;
 
 pub const Glyph = struct {
     /// Pixel size of the rasterized bitmap.
