@@ -36,6 +36,7 @@ const HELP_TEXT =
     \\  Ctrl+Shift+R          Split vertical
     \\  Ctrl+Shift+C          Copy selection
     \\  Ctrl+Shift+V          Paste
+    \\  Shift+PgUp / PgDn     Scroll back / forward by one screenful
     \\
     \\Right-click for context menu (split / new tab / etc).
     \\Mouse wheel scrolls scrollback (10k lines default).
