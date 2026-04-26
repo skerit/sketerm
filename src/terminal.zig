@@ -250,7 +250,14 @@ pub const Terminal = struct {
 
         while (true) {
             const n = c.poll(&pfds, pfds.len, -1);
-            if (n < 0) break;
+            if (n < 0) {
+                // EINTR — signal arrived during the blocking poll.
+                // Resume; SIGTERM/HUP will reach us through the
+                // shutdown_fd, not via interrupting the syscall.
+                const errn = std.posix.errno(n);
+                if (errn == .INTR) continue;
+                break;
+            }
 
             // Shutdown event takes priority.
             if (pfds[1].revents & c.POLLIN != 0) break;
