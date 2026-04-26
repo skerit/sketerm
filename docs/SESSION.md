@@ -1382,3 +1382,75 @@ Prefs UI: new "Inactive pane dimming" group on the Appearance page
 with two 0.05-step spin rows (0..1). New helper `addSpinRowF32Step`
 generalises the existing `addSpinRowF32` to take step + digits.
 
+
+## plan-v3 push (A C B D shipped, E F G H I J K pending)
+
+Plan-v3 reviewed by an independent Plan agent. Findings integrated:
+factual fixes (AdwTabView close-page must always return TRUE +
+finish; KWin blur unreachable on Wayland; no gtk_gl_area_set_has_alpha
+in GTK4); reordered to A→C→B→D→E→F→G→H→I→J→K; effort estimates
+roughly doubled for E (12-16 h), F (16-24 h), I (6-8 h).
+
+### A — Confirm-on-close (shipped)
+
+`confirm_close: enum { never, multiple, always }` (matches
+Terminator). AdwTabView "close-page" handler always returns
+`GDK_EVENT_STOP` and calls `adw_tab_view_close_page_finish` once
+the AdwAlertDialog response arrives. Window "close-request"
+handler counts total panes; same dialog flow. Prefs combo on
+Window > Closing.
+
+Critical detail per the review: returning FALSE on some branches
+and TRUE on others races. Always TRUE; if no confirm needed, call
+`finish(view, page, true)` immediately.
+
+### C — Background opacity / transparency (shipped)
+
+`background_opacity: f32 = 1.0` clamped 0..1. `resolveDefaultColors`
+multiplies into bg.a after auto-theme. Window "realize" handler
+calls `gdk_surface_set_opaque_region(NULL)` once when opacity < 1.
+Live-toggling back to 1.0 doesn't re-enable compositor optimizations
+without a window restart — documented in the prefs subtitle.
+
+KWin blur (`org_kde_kwin_blur` Wayland protocol) is NOT reachable
+from GTK4. Documented; not implemented.
+
+### B — URL auto-detect (shipped)
+
+`grid/url_scan.zig`: hand-rolled `http(s)://` matcher with 7 unit
+tests (plain match, trailing-period trim, OSC 8 skip, two matches,
+no match, ftp rejected, etc.). RFC 3986 unreserved + sub-delims +
+pct-encoded URL chars. Trailing punctuation trimmed.
+
+Renderer: extra "url underline" pass in `grid_pass.buildVertices`
+after the search overlay, before selection. 1px-thin accent
+underline at cell bottom. Per-row scan; OSC 8 cells skipped to
+avoid double-decoration.
+
+`Screen.urlAtVisible(allocator, vrow, vcol)` returns the URL text
+on hit. `Pane.onMotion` shows tooltip; `onDragEnd` launches via
+`g_app_info_launch_default_for_uri`. Both paths fall back from OSC
+8 to auto-detect cleanly.
+
+`auto_url_detect` config (default true). Prefs row in
+Behavior > Mouse.
+
+### D — Quake mode (shipped)
+
+`G_APPLICATION_HANDLES_COMMAND_LINE` switch. Refactored argv parsing
+into the `command-line` signal handler so a second
+`sketerm --toggle` invocation reaches the primary via D-Bus. The
+primary registers a `toggle` GAction; --toggle activates it.
+
+`Window.toggleQuake`: `gtk_window_minimize` when active,
+`unminimize + present` otherwise. Critically, we minimize rather
+than `set_visible(false)` because hiding destroys the GdkSurface →
+GL context loss → atlas + image upload rebuild on every reveal.
+
+Documented Wayland caveats: focus-stealing prevention may delay
+the raise; user binds the keystroke at compositor level (KWin
+Custom Shortcuts / GNOME Settings).
+
+Cron `5c32eb79` (7,37 * * * *) keeps the loop ticking through the
+remaining items every 30 min for 7 days.
+
