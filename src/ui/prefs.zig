@@ -82,6 +82,7 @@ pub fn open(
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &behaviorPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &renderingPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &windowPage);
+    appendPage(@ptrCast(@alignCast(dialog)), ctx, &keybindsPage);
 
     c.adw_dialog_present(@ptrCast(@alignCast(dialog)), @ptrCast(parent_window));
 }
@@ -873,4 +874,192 @@ fn addTabPositionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
 fn tabPositionSelected(ctx: *Ctx, idx: c_uint) void {
     ctx.cfg.tab_position = if (idx == 1) .bottom else .top;
     ctx.ev();
+}
+
+// ── Keybinds page ──────────────────────────────────────────────
+
+const input_mod = @import("input.zig");
+
+const KeybindRowCtx = struct {
+    parent: *Ctx,
+    action: input_mod.Action,
+    button: *c.GtkButton,
+    /// Captures the next keypress when "Press a key…" is active.
+    capture_ctrl: ?*c.GtkEventController = null,
+    /// True while waiting for a key. Esc cancels; Backspace clears.
+    capturing: bool = false,
+};
+
+fn keybindsPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
+    c.adw_preferences_page_set_title(page, "Keybindings");
+    c.adw_preferences_page_set_icon_name(page, "input-keyboard-symbolic");
+
+    const group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(group)), "Keybindings");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(group)),
+        "Click an action's button to record a new shortcut. Esc cancels; " ++
+        "Backspace unbinds. Conflicts log a warning to stderr.");
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(group)));
+
+    inline for (@typeInfo(input_mod.Action).@"enum".fields) |field| {
+        const action: input_mod.Action = @enumFromInt(field.value);
+        addKeybindRow(@ptrCast(@alignCast(group)), ctx, action);
+    }
+}
+
+fn addKeybindRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, action: input_mod.Action) void {
+    const row = c.adw_action_row_new();
+    var label_buf: [64:0]u8 = undefined;
+    const lbl = input_mod.actionLabel(action);
+    const lbl_len = @min(lbl.len, label_buf.len - 1);
+    @memcpy(label_buf[0..lbl_len], lbl[0..lbl_len]);
+    label_buf[lbl_len] = 0;
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), &label_buf);
+
+    const button = c.gtk_button_new();
+    c.gtk_widget_set_valign(button, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_add_css_class(button, "flat");
+    c.gtk_widget_set_size_request(button, 180, -1);
+
+    const rctx = ctx.allocator.create(KeybindRowCtx) catch return;
+    rctx.* = .{ .parent = ctx, .action = action, .button = @ptrCast(@alignCast(button)) };
+
+    refreshKeybindButtonLabel(rctx);
+
+    _ = c.g_signal_connect_data(button, "clicked", @ptrCast(&onKeybindClicked), @ptrCast(rctx), null, c.G_CONNECT_DEFAULT);
+
+    c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), button);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn refreshKeybindButtonLabel(rctx: *KeybindRowCtx) void {
+    // Look up the active accel for this action: config override
+    // wins, otherwise default_bindings.
+    const action_name = input_mod.actionName(rctx.action);
+    var accel: []const u8 = "";
+    var found_in_config = false;
+    for (rctx.parent.cfg.keybinds.items) |kb| {
+        if (std.mem.eql(u8, kb.name, action_name)) {
+            accel = kb.accel;
+            found_in_config = true;
+            break;
+        }
+    }
+    if (!found_in_config) {
+        // Fall back to first matching default.
+        for (input_mod.default_bindings) |b| {
+            if (b.action == rctx.action) {
+                const s = input_mod.accelToString(rctx.parent.allocator, b.keyval, b.mods) catch return;
+                defer rctx.parent.allocator.free(s);
+                setButtonLabel(rctx.button, s);
+                return;
+            }
+        }
+        setButtonLabel(rctx.button, "(unbound)");
+        return;
+    }
+    if (accel.len == 0) {
+        setButtonLabel(rctx.button, "(unbound)");
+        return;
+    }
+    setButtonLabel(rctx.button, accel);
+}
+
+fn setButtonLabel(button: *c.GtkButton, text: []const u8) void {
+    var z: [128:0]u8 = undefined;
+    const n = @min(text.len, z.len - 1);
+    @memcpy(z[0..n], text[0..n]);
+    z[n] = 0;
+    c.gtk_button_set_label(button, &z);
+}
+
+fn onKeybindClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const rctx: *KeybindRowCtx = @ptrCast(@alignCast(user.?));
+    if (rctx.capturing) return;
+    rctx.capturing = true;
+    setButtonLabel(rctx.button, "Press a key…");
+
+    const ctrl = c.gtk_event_controller_key_new();
+    rctx.capture_ctrl = @ptrCast(@alignCast(ctrl));
+    _ = c.g_signal_connect_data(
+        ctrl,
+        "key-pressed",
+        @ptrCast(&onKeybindCapture),
+        @ptrCast(rctx),
+        null,
+        c.G_CONNECT_DEFAULT,
+    );
+    c.gtk_widget_add_controller(@ptrCast(rctx.button), @ptrCast(ctrl));
+    _ = c.gtk_widget_grab_focus(@ptrCast(rctx.button));
+}
+
+fn onKeybindCapture(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const rctx: *KeybindRowCtx = @ptrCast(@alignCast(user.?));
+    if (!rctx.capturing) return 0;
+
+    // Esc cancels — restore the previous label, no change.
+    if (keyval == c.GDK_KEY_Escape) {
+        finishCapture(rctx);
+        return 1;
+    }
+    // Backspace unbinds.
+    if (keyval == c.GDK_KEY_BackSpace) {
+        setKeybind(rctx, "");
+        finishCapture(rctx);
+        return 1;
+    }
+    // Modifier-only keys ignored; wait for the actual key.
+    switch (keyval) {
+        c.GDK_KEY_Shift_L, c.GDK_KEY_Shift_R,
+        c.GDK_KEY_Control_L, c.GDK_KEY_Control_R,
+        c.GDK_KEY_Alt_L, c.GDK_KEY_Alt_R,
+        c.GDK_KEY_Super_L, c.GDK_KEY_Super_R,
+        c.GDK_KEY_Hyper_L, c.GDK_KEY_Hyper_R,
+        c.GDK_KEY_Meta_L, c.GDK_KEY_Meta_R,
+        => return 1,
+        else => {},
+    }
+    // Build the accelerator string.
+    const lower = c.gdk_keyval_to_lower(keyval);
+    const sig = input_mod.SIGNIFICANT_MODS;
+    const accel = input_mod.accelToString(rctx.parent.allocator, lower, state & sig) catch {
+        finishCapture(rctx);
+        return 1;
+    };
+    defer rctx.parent.allocator.free(accel);
+    setKeybind(rctx, accel);
+    finishCapture(rctx);
+    return 1;
+}
+
+fn finishCapture(rctx: *KeybindRowCtx) void {
+    rctx.capturing = false;
+    if (rctx.capture_ctrl) |ctrl| {
+        c.gtk_widget_remove_controller(@ptrCast(rctx.button), @ptrCast(ctrl));
+        rctx.capture_ctrl = null;
+    }
+    refreshKeybindButtonLabel(rctx);
+}
+
+/// Set or replace the override for this action in ctx.cfg.keybinds.
+/// `accel` is borrowed; we dup into the prefs arena.
+fn setKeybind(rctx: *KeybindRowCtx, accel: []const u8) void {
+    const arena = rctx.parent.arena.allocator();
+    const action_name = input_mod.actionName(rctx.action);
+    const accel_dup = arena.dupe(u8, accel) catch return;
+
+    // Replace existing entry, or append.
+    for (rctx.parent.cfg.keybinds.items) |*entry| {
+        if (std.mem.eql(u8, entry.name, action_name)) {
+            entry.accel = accel_dup;
+            rctx.parent.ev();
+            return;
+        }
+    }
+    const name_dup = arena.dupe(u8, action_name) catch return;
+    rctx.parent.cfg.keybinds.append(rctx.parent.allocator, .{
+        .name = name_dup,
+        .accel = accel_dup,
+    }) catch return;
+    rctx.parent.ev();
 }
