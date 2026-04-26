@@ -63,7 +63,12 @@ pub const Event = union(enum) {
     };
 
     pub const Csi = struct {
-        params: [16]u32 = .{0} ** 16,
+        /// Per-param value, clamped to u16 max on flush. Real-world
+        /// CSI params (SGR codes 0-255, cursor positions <screen-size,
+        /// DECSET mode numbers ≤ 9999, truecolor RGB 0-255) all fit in
+        /// u16 with margin. Saves 32 bytes vs the original [16]u32 —
+        /// Csi 76 → 44 B, Event union 80 → 68 B.
+        params: [16]u16 = .{0} ** 16,
         /// Bit i = 1 iff `params[i]` was reached via a `:` (sub-parameter
         /// of `params[i-1]`) rather than `;`. Used by the SGR handler
         /// to distinguish `4:3` (curly-underline sub-param) from `4;3`
@@ -79,10 +84,11 @@ pub const Event = union(enum) {
         final: u8 = 0,
 
         /// Get parameter `idx`, with `default` if absent or zero
-        /// (matching xterm behavior: 0 means "use default").
+        /// (matching xterm behavior: 0 means "use default"). Returns
+        /// u32 for back-compat with consumers that arithmetic on it.
         pub fn paramOrDefault(self: *const Csi, idx: usize, default: u32) u32 {
             if (idx >= self.n_params) return default;
-            const p = self.params[idx];
+            const p: u32 = self.params[idx];
             return if (p == 0) default else p;
         }
 

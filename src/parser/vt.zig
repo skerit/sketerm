@@ -304,8 +304,8 @@ pub const Parser = struct {
             const col: u8 = if (b >= 0x20) b - 0x20 else 0;
             // Translate to CSI <r+1>;<c+1>H (CUP).
             var csi: Event.Csi = .{};
-            csi.params[0] = @as(u32, r) + 1;
-            csi.params[1] = @as(u32, col) + 1;
+            csi.params[0] = @as(u16, r) + 1;
+            csi.params[1] = @as(u16, col) + 1;
             csi.n_params = 2;
             csi.final = 'H';
             emit(ctx, .{ .csi = csi });
@@ -382,7 +382,8 @@ pub const Parser = struct {
 
     fn flushParam(self: *Parser) void {
         if (self.csi.n_params < 16) {
-            self.csi.params[self.csi.n_params] = if (self.has_cur_param) self.cur_param else 0;
+            const v: u16 = @intCast(@min(if (self.has_cur_param) self.cur_param else 0, std.math.maxInt(u16)));
+            self.csi.params[self.csi.n_params] = v;
             self.csi.setSub(self.csi.n_params, self.next_param_is_sub);
             self.csi.n_params += 1;
         }
