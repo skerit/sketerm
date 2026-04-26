@@ -1454,3 +1454,48 @@ Custom Shortcuts / GNOME Settings).
 Cron `5c32eb79` (7,37 * * * *) keeps the loop ticking through the
 remaining items every 30 min for 7 days.
 
+### E — Custom keybindings (shipped)
+
+Two-stage. Stage 1: extend Action enum (6 new actions —
+`paste_clipboard`, `copy_selection`, `interrupt_or_copy`,
+`clear_and_scrollback`, `scrollback_page_up/down`); replace the
+hardcoded switch in `onKeyPressed` with a `default_bindings` table
++ `matchBinding` lookup. `runAction` dispatches per-pane locally
+or via `shortcut_sink` for window-level actions.
+
+Stage 2: `Config.keybinds: ArrayList(KeybindEntry)` parsed from
+`keybind.<action> = <accel>` config lines (round-trip-tested, 2 new
+config tests). `Window.refreshBindings` overlays defaults + config,
+warns on conflicts (stderr); each Pane Ctx borrows the resolved
+slice.
+
+Prefs UI: new "Keybindings" page with one row per Action (comptime
+`inline for` over the enum). Click the suffix button → enter capture
+mode; next keypress sets the binding (Esc cancels; Backspace clears).
+`gtk_accelerator_parse` / `gtk_accelerator_name` for the format.
+`gdk_keyval_to_lower` so 'C' and 'c' match the same default.
+
+### G — Broadcast typing (shipped)
+
+`Terminal.writeUserInput` separates user-input writes (broadcastable)
+from `sinkWritePty` (parser replies, per-pane — DA / DSR / OSC 52 /
+kitty kbd reports must NOT broadcast). All `pty.writeAll` calls in
+`input.zig` and `clipboard.zig` switched to `writeUserInput`.
+Pane mouse/focus reports stay direct.
+
+`Window.groupsend: enum { off, group, all }`, cycled by
+Ctrl+Shift+G via the new `broadcast_cycle` Action. The
+`broadcastBytes(source, bytes)` fan-out walks `terminals` and
+writes directly to each `pty` (skipping the broadcast sink to
+avoid recursion). `Pane.group: ?[]const u8` filters in `.group`
+mode.
+
+Visual: when broadcast is active, every pane's titlebar gets the
+`sketerm-broadcast` CSS class which adds a 2px yellow inset
+shadow ring. The titlebar's normal active/inactive coloring is
+unaffected.
+
+Mouse selection / paste: paste DOES broadcast (matches Terminator).
+Mouse position events stay per-pane (they're meaningless across
+panes; coordinates differ).
+
