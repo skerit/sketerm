@@ -142,6 +142,10 @@ pub const Atlas = struct {
             .shape_cache = std.AutoHashMap(u64, []ShapedGlyph).init(allocator),
             .allocator = allocator,
         };
+        // Pre-grow caches so ASCII pre-warm + first session content
+        // don't pay 4-5 rehashes climbing from default capacity.
+        try self.cache.ensureTotalCapacity(256);
+        try self.glyph_cache.ensureTotalCapacity(256);
         return self;
     }
 
