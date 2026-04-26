@@ -359,6 +359,10 @@ pub const Pane = struct {
 
         self.image_store.cell_w = @floatFromInt(self.atlas.?.cell_w);
         self.image_store.cell_h = @floatFromInt(self.atlas.?.cell_h);
+        // Sync to Screen so CSI 14t/16t reports use the new metrics
+        // without waiting for the next window resize.
+        self.terminal.screen.cell_pixel_w = self.atlas.?.cell_w;
+        self.terminal.screen.cell_pixel_h = self.atlas.?.cell_h;
 
         // Force a SIGWINCH on the child — terminal winsize in cells
         // changes when the cell size changes.
