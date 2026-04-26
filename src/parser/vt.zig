@@ -396,7 +396,7 @@ pub const Parser = struct {
             0x00...0x17, 0x19, 0x1C...0x1F => emit(ctx, .{ .execute = b }),
             0x30...0x39 => {
                 self.has_cur_param = true;
-                self.cur_param = std.math.add(u32, self.cur_param *| 10, b - '0') catch std.math.maxInt(u32);
+                self.cur_param = (self.cur_param *| 10) +| (b - '0');
                 self.transitionTo(.csi_param);
             },
             0x3A, 0x3B => {
