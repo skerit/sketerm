@@ -1249,3 +1249,54 @@ set, so the first prompt picks up the configured scheme.
   applyConfigChange time, so `scheme = solarized_dark` in
   config.conf without an explicit `palette` actually applies.
 
+
+## Small-win settings batch (Terminator-inspired)
+
+11 new schema keys, all live-applied via Window.applyConfigChange
+and persisted to config.conf:
+
+- **Mouse:** `mouse_autohide` (cursor hides on key press, returns on
+  motion — input.zig sets cursor_from_name="none" via an autohide
+  sink callback into Pane), `copy_on_selection` (drag-end + double
+  / triple-click also push to SYSTEM clipboard, not just PRIMARY),
+  `clear_select_on_copy` (Ctrl+Shift+C and the menu .copy clear
+  the selection after copying), `disable_mouse_paste` (gate
+  middle-click PRIMARY paste), `disable_mousewheel_zoom` (toggle
+  the new Ctrl+wheel font-size zoom — also added that in onScroll
+  with min 6 / max 72 pt clamp), `link_single_click` (OSC 8 hyperlink
+  fires on plain click instead of Ctrl+click).
+- **Search:** `search_case_sensitive` — when on, smart-case heuristic
+  is bypassed and the default state is CS. Ctrl+I in the search box
+  still toggles per-search.
+- **Bold:** `allow_bold` (gates whether bold attribute affects
+  rendering at all), `bold_is_bright` (whether bold lifts palette
+  0..7 → 8..15 — xterm convention; on by default). Both threaded
+  into cell_pass + grid_pass; three SGR-bold sites updated.
+- **Window:** `always_on_top` (best-effort: GTK4 dropped the X11
+  set_keep_above API; we log a one-shot stderr hint about KDE /
+  GNOME / wmctrl window rules and accept the toggle so config
+  round-trips). `new_tab_after_current` (uses adw_tab_view_insert at
+  the focused page idx + 1 instead of adw_tab_view_append).
+
+Implementation notes:
+
+- Per-Pane fields mirror the Window config (copy_on_selection,
+  clear_select_on_copy, disable_mouse_paste, disable_mousewheel_zoom,
+  link_single_click, mouse_autohide, cursor_hidden) so the hot path
+  reads from the local Pane, not through the Window.
+- input.zig grew autohide_ctx + autohide_set callback so it can flip
+  Pane.cursor_hidden without importing pane.zig (avoids an import
+  cycle); same model as the existing terminal.Sink callback pattern.
+- pushSelectionToClipboards() helper centralises drag-end and
+  double-click-selection clipboard logic — replaces two duplicate
+  inline blobs.
+
+Prefs UI gets:
+- new "Mouse" group (6 switches) on Behavior page
+- new "Search" group (1 switch) on Behavior page
+- new "Bold" group (2 switches) on Behavior page
+- `new_tab_after_current` switch in Window > Tabs
+- `always_on_top` switch in Window > Stacking, with subtitle that
+  warns the API is best-effort
+
+All tests pass; smoke-cell + smoke-image both PASS on NVIDIA GL ES 3.2.
