@@ -47,6 +47,8 @@ pub const Action = enum {
     save_layout_as,
     prompt_prev,
     prompt_next,
+    pane_next,
+    pane_prev,
 };
 
 pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allocator) !*Ctx {
@@ -293,6 +295,14 @@ fn onKeyPressed(
             },
             c.GDK_KEY_Down, c.GDK_KEY_KP_Down => {
                 if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .prompt_next);
+                return 1;
+            },
+            c.GDK_KEY_Left, c.GDK_KEY_KP_Left => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .pane_prev);
+                return 1;
+            },
+            c.GDK_KEY_Right, c.GDK_KEY_KP_Right => {
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .pane_next);
                 return 1;
             },
             else => {},

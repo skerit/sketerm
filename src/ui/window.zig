@@ -896,6 +896,40 @@ pub const Window = struct {
         return null;
     }
 
+    const PaneDir = enum { prev, next };
+
+    /// Cycle keyboard focus through panes inside the current tab.
+    /// Wraps at either end. If the focused widget isn't a known pane
+    /// we just pick the first pane in the current tab.
+    fn cyclePane(self: *Window, dir: PaneDir) void {
+        const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
+        const root = c.adw_tab_page_get_child(page) orelse return;
+        var in_tab: std.ArrayList(*Pane) = .{};
+        defer in_tab.deinit(self.allocator);
+        for (self.panes.items) |p| {
+            if (widgetIsAncestor(@ptrCast(root), @ptrCast(p.widget()))) {
+                in_tab.append(self.allocator, p) catch return;
+            }
+        }
+        if (in_tab.items.len <= 1) return;
+        const focus = c.gtk_window_get_focus(@ptrCast(self.app_window));
+        var idx: usize = 0;
+        if (focus != null) {
+            for (in_tab.items, 0..) |p, i| {
+                if (focus == @as(*c.GtkWidget, @ptrCast(p.widget()))) {
+                    idx = i;
+                    break;
+                }
+            }
+        }
+        const n = in_tab.items.len;
+        const next = switch (dir) {
+            .next => (idx + 1) % n,
+            .prev => (idx + n - 1) % n,
+        };
+        _ = c.gtk_widget_grab_focus(@ptrCast(in_tab.items[next].widget()));
+    }
+
     /// Close the focused pane. If it's the only pane in its tab,
     /// closes the tab. Otherwise the pane is removed from its
     /// parent GtkPaned and the sibling takes its place.
@@ -1089,9 +1123,12 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .save_layout_as => self.saveLayoutAs(),
         .prompt_prev => self.jumpPromptOnFocused(.prev),
         .prompt_next => self.jumpPromptOnFocused(.next),
+        .pane_prev => self.cyclePane(.prev),
+        .pane_next => self.cyclePane(.next),
         else => {},
     }
 }
+
 
 fn onSearchChanged(entry: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
     const self: *Window = @ptrCast(@alignCast(user.?));
