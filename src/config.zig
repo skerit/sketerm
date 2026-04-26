@@ -337,3 +337,20 @@ test "config: stores font path" {
     defer cfg.deinit();
     try std.testing.expectEqualStrings("/usr/share/fonts/Hack/Hack-Regular.ttf", cfg.font_path.?);
 }
+
+test "config: line_pad_px parses int (positive and negative)" {
+    const body =
+        \\font_size = 12
+        \\line_pad_px = -2
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(i16, -2), cfg.line_pad_px);
+
+    const body2 =
+        \\line_spacing = 4
+    ;
+    var cfg2 = try Config.loadFromBytes(std.testing.allocator, body2);
+    defer cfg2.deinit();
+    try std.testing.expectEqual(@as(i16, 4), cfg2.line_pad_px);
+}
