@@ -340,7 +340,24 @@ pub const Window = struct {
             const slice = std.fmt.bufPrintZ(&num_buf, "Tab {d}", .{self.tab_counter}) catch "shell";
             break :blk @as([*:0]const u8, slice.ptr);
         };
-        try self.addTabInternal(title, &argv, null);
+        // Inherit the focused pane's last-reported cwd (OSC 7) so a
+        // new tab starts in the same directory — matches gnome-terminal /
+        // kitty / wezterm convention. Falls back to inherited cwd
+        // when no focused pane has reported one.
+        const cwd = self.focusedPaneCwd();
+        try self.addTabInternal(title, &argv, cwd);
+    }
+
+    /// Last-reported cwd of the focused pane (OSC 7), or null if no
+    /// pane has the focus or no cwd has been reported.
+    fn focusedPaneCwd(self: *Window) ?[]const u8 {
+        const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return null;
+        for (self.panes.items) |p| {
+            if (focus == @as(*c.GtkWidget, @ptrCast(p.widget()))) {
+                return p.terminal.cwd;
+            }
+        }
+        return null;
     }
 
     /// Spawn a new tab from a layout TabSpec (used on --restore).
