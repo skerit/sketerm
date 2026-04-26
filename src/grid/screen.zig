@@ -1204,7 +1204,11 @@ pub const Screen = struct {
                                 // ASCII subrange — bulk-print.
                                 const start = i;
                                 while (i < run.len and run.bytes[i] < 0x80) : (i += 1) {}
-                                for (run.bytes[start..i]) |b| self.printCp(b);
+                                if (self.fastAsciiEligible() and runIsAscii(run.bytes[start..i])) {
+                                    self.fastAsciiSlice(run.bytes[start..i]);
+                                } else {
+                                    for (run.bytes[start..i]) |b| self.printCp(b);
+                                }
                                 continue;
                             }
                             const cp_len: usize = if ((b0 & 0xE0) == 0xC0) 2
@@ -1828,20 +1832,24 @@ pub const Screen = struct {
         const active = if (self.active_charset == .g0) self.charset_g0 else self.charset_g1;
         if (active != .ascii) return false;
         if (!runIsAscii(run.bytes[0..run.len])) return false;
+        self.fastAsciiSlice(run.bytes[0..run.len]);
+        return true;
+    }
 
-        const total: u16 = @intCast(run.len);
+    /// Fast-write a contiguous ASCII byte slice as cells. Caller is
+    /// responsible for verifying preconditions (decoder idle, no
+    /// insert mode / wrap / cluster, charset = ascii). The slice
+    /// itself doesn't need range-checking bytes — caller has done
+    /// that. Handles autowrap mid-slice.
+    fn fastAsciiSlice(self: *Screen, bytes: []const u8) void {
+        const total: u16 = @intCast(bytes.len);
         const link_id = self.current_link_id;
         const flags: u8 = if (link_id != 0) 0b0000_0100 else 0;
         const style = self.cur_style;
         var i: u16 = 0;
         while (i < total) {
-            // How many bytes fit on the current row.
             const remaining: u16 = if (self.col >= self.cols) 0 else self.cols - self.col;
             if (remaining == 0) {
-                // pending_wrap was false on entry; if we got here
-                // it's because we just filled the row and need to
-                // actually wrap before continuing. autowrap off →
-                // drop the rest.
                 if (!self.autowrap) break;
                 self.lineFeed();
                 self.col = 0;
@@ -1853,19 +1861,18 @@ pub const Screen = struct {
             var k: u16 = 0;
             while (k < can_write) : (k += 1) {
                 ln.cells[self.col + k] = .{
-                    .rune = run.bytes[i + k],
+                    .rune = bytes[i + k],
                     .style_ref = style,
                     .flags = flags,
                     .reserved = link_id,
                 };
             }
             ln.dirty = true;
-            self.last_print_cp = run.bytes[i + can_write - 1];
+            self.last_print_cp = bytes[i + can_write - 1];
             self.last_print_key = cellKey(self.row, self.col + can_write - 1);
             self.col += can_write;
             i += can_write;
         }
-        // Final column / pending-wrap state matches printCp.
         if (self.col >= self.cols) {
             if (self.autowrap) {
                 self.col = self.cols - 1;
@@ -1874,6 +1881,17 @@ pub const Screen = struct {
                 self.col = self.cols - 1;
             }
         }
+    }
+
+    /// Whether the active state allows the ASCII fast-write path.
+    /// Used by Tier 2.5 to decide whether an ASCII subrange in a
+    /// mixed run can take the cell-array fast path.
+    fn fastAsciiEligible(self: *const Screen) bool {
+        if (self.insert_mode) return false;
+        if (self.pending_wrap) return false;
+        if (self.clusters.count() != 0) return false;
+        const active = if (self.active_charset == .g0) self.charset_g0 else self.charset_g1;
+        if (active != .ascii) return false;
         return true;
     }
 
