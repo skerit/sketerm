@@ -1462,7 +1462,11 @@ pub const Screen = struct {
 
         // q=action — capability probe. Reply OK so apps know we
         // accept kitty graphics; no actual transfer happens.
+        // Honour Kitty's `q=` (quiet) flag: q=0 reply normally,
+        // q=1 suppress success reply (still reply on error — but
+        // a=q can't fail), q=2 suppress all replies.
         if (cmd.action == .query) {
+            if (cmd.quiet >= 1) return;
             var resp: [64]u8 = undefined;
             const s = std.fmt.bufPrint(&resp, "\x1b_Gi={d};OK\x1b\\", .{cmd.image_id}) catch return;
             self.respond(s);
@@ -4187,6 +4191,27 @@ test "kitty graphics query replies OK" {
     s.onApc("Gi=42,a=q");
     const got = TestSink.captured[0..TestSink.captured_len];
     try std.testing.expectEqualStrings("\x1b_Gi=42;OK\x1b\\", got);
+}
+
+test "kitty graphics query honours q=1 quiet — no reply" {
+    const TestSink = struct {
+        var captured: [64]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+    TestSink.captured_len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+    s.onApc("Gi=42,a=q,q=1");
+    try std.testing.expectEqual(@as(usize, 0), TestSink.captured_len);
 }
 
 test "RIS resets charset state" {
