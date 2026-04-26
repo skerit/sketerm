@@ -142,6 +142,21 @@ pub const Config = struct {
     /// the original colour and only changes weight.
     bold_is_bright: bool = true,
 
+    // Per-pane titlebar (Terminator-style)
+    /// Show a thin per-pane title bar above the cell grid carrying
+    /// the OSC 0/1/2 terminal title. Off by default — many users
+    /// prefer minimal chrome.
+    show_titlebar: bool = false,
+    /// Active pane title bar foreground / background. Default
+    /// matches Terminator (red bg / white fg) so users coming from
+    /// Terminator see the familiar "this pane has focus" cue.
+    title_active_fg: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 },
+    title_active_bg: [4]f32 = .{ 200.0/255.0, 0.0/255.0, 3.0/255.0, 1.0 },
+    /// Inactive pane title bar foreground / background. Defaults to
+    /// Terminator's mid-grey so unfocused panes are visibly dimmer.
+    title_inactive_fg: [4]f32 = .{ 0.0, 0.0, 0.0, 1.0 },
+    title_inactive_bg: [4]f32 = .{ 192.0/255.0, 190.0/255.0, 191.0/255.0, 1.0 },
+
     // Owned strings allocated from the parser arena. Not freed
     // individually — `arena.deinit()` reaps everything.
     arena: ?std.heap.ArenaAllocator = null,
@@ -304,6 +319,21 @@ pub const Config = struct {
         if (!self.allow_bold) try w.writeAll("allow_bold = false\n");
         if (!self.bold_is_bright) try w.writeAll("bold_is_bright = false\n");
 
+        // Per-pane titlebar.
+        if (self.show_titlebar) try w.writeAll("show_titlebar = true\n");
+        const default_taf: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
+        const default_tab: [4]f32 = .{ 200.0/255.0, 0.0/255.0, 3.0/255.0, 1.0 };
+        const default_tif: [4]f32 = .{ 0.0, 0.0, 0.0, 1.0 };
+        const default_tib: [4]f32 = .{ 192.0/255.0, 190.0/255.0, 191.0/255.0, 1.0 };
+        if (!eqColor(self.title_active_fg, default_taf))
+            try writeColor(w, "title_active_fg", self.title_active_fg);
+        if (!eqColor(self.title_active_bg, default_tab))
+            try writeColor(w, "title_active_bg", self.title_active_bg);
+        if (!eqColor(self.title_inactive_fg, default_tif))
+            try writeColor(w, "title_inactive_fg", self.title_inactive_fg);
+        if (!eqColor(self.title_inactive_bg, default_tib))
+            try writeColor(w, "title_inactive_bg", self.title_inactive_bg);
+
         // Shell exit.
         if (self.exit_action != .close) try w.print("exit_action = {s}\n", .{@tagName(self.exit_action)});
 
@@ -464,6 +494,16 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.allow_bold = try parseBool(value);
     } else if (std.mem.eql(u8, key, "bold_is_bright")) {
         cfg.bold_is_bright = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "show_titlebar")) {
+        cfg.show_titlebar = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "title_active_fg")) {
+        cfg.title_active_fg = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "title_active_bg")) {
+        cfg.title_active_bg = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "title_inactive_fg")) {
+        cfg.title_inactive_fg = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "title_inactive_bg")) {
+        cfg.title_inactive_bg = try parseColor(value);
     } else {
         // Unknown key — warn but don't abort.
         std.debug.print("sketerm: config: unknown key '{s}' (ignoring)\n", .{key});
