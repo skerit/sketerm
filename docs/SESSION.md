@@ -1344,3 +1344,41 @@ Architecture:
 
 Prefs UI: new "Per-pane title bar" group on Appearance page with the
 visibility switch + 4 GtkColorDialogButton rows.
+
+
+## Inactive pane dimming (Terminator/WezTerm-style)
+
+Investigation: neither Terminator nor WezTerm uses opacity for this.
+
+- Terminator (`terminal.py:764-790`): two scalars
+  `inactive_color_offset` (default 0.8 = dim fg) and
+  `inactive_bg_color_offset` (default 1.0 = no bg dim). Multiplies
+  RGB channels directly when caching the inactive colour copy.
+- WezTerm (`config.rs:1889`): `inactive_pane_hsb` HSB transform
+  (default brightness=0.8, saturation=0.9, hue=1.0). Applied in the
+  shader.
+
+Why not opacity: stacking with compositor blur or window-bg alpha
+double-blends; the cursor on a 0.8-opacity pane is hard to read; the
+RGB-multiplier approach gives a "sleeping" look without those issues.
+
+Implementation:
+
+- 2 new config keys: `inactive_fg_dim`, `inactive_bg_dim` (default
+  0.8 / 1.0). Clamped to [0, 1].
+- cell_pass: 2 new uniforms `u_dim_fg`, `u_dim_bg` set per-frame from
+  `cell_pass.dim_fg / dim_bg`. Vertex shader multiplies bg quads by
+  `u_dim_bg`, glyphs + decorations by `u_dim_fg`.
+- grid_pass: per-vertex `a_dim` selector (0 = no dim, 1 = u_dim_fg,
+  2 = u_dim_bg). Cursor / focus border / selection / search highlight
+  / bell flash all emitted with `a_dim = 0` so they stay full-bright
+  even when the pane is dim. Cell content (bidi rows, DW/DH glyphs,
+  IME preedit) uses 1 / 2 appropriately.
+- `Pane.applyDim()` writes both passes' dim factors based on
+  `is_focused`. Called from `onFocusEnter` / `onFocusLeave` (which
+  flip the bool too) and from `applyConfigChange` / `makePane`.
+
+Prefs UI: new "Inactive pane dimming" group on the Appearance page
+with two 0.05-step spin rows (0..1). New helper `addSpinRowF32Step`
+generalises the existing `addSpinRowF32` to take step + digits.
+
