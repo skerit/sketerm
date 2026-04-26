@@ -103,6 +103,44 @@ pub const Config = struct {
     tab_position: TabPosition = .top,
     /// Whether each AdwTabPage shows an X close button.
     close_button_on_tab: bool = true,
+    /// Keep the window above other windows (gtk_window_set_keep_above).
+    always_on_top: bool = false,
+    /// Insert new tabs immediately after the focused one instead of
+    /// appending at the end of the tab bar.
+    new_tab_after_current: bool = false,
+
+    // Mouse
+    /// Hide the mouse cursor while typing; reappear on motion.
+    mouse_autohide: bool = true,
+    /// Copy the current selection to the PRIMARY clipboard
+    /// automatically on selection-end (Linux convention; Terminator
+    /// has it off by default but it's a popular toggle).
+    copy_on_selection: bool = false,
+    /// Drop the active selection after a Ctrl+Shift+C copy.
+    clear_select_on_copy: bool = false,
+    /// Disable middle-click PRIMARY paste entirely.
+    disable_mouse_paste: bool = false,
+    /// Disable Ctrl+wheel font-size zoom.
+    disable_mousewheel_zoom: bool = false,
+    /// Open OSC 8 hyperlinks on a plain click instead of Ctrl+click.
+    /// (Off by default — matches xterm/gnome-terminal/kitty.)
+    link_single_click: bool = false,
+
+    // Search
+    /// Default state for the search box's case sensitivity. The
+    /// actual default is smart-case unless overridden by Ctrl+I or
+    /// this setting.
+    search_case_sensitive: bool = false,
+
+    // Bold
+    /// Whether bold attribute affects rendering at all (font weight
+    /// + bright-color promotion). Off renders bold cells the same as
+    /// normal — matches gnome-terminal's "Allow bold text" toggle.
+    allow_bold: bool = true,
+    /// When bold + allow_bold, also lift palette indices 0..7 to
+    /// their bright variants 8..15 (xterm convention). Off keeps
+    /// the original colour and only changes weight.
+    bold_is_bright: bool = true,
 
     // Owned strings allocated from the parser arena. Not freed
     // individually — `arena.deinit()` reaps everything.
@@ -248,6 +286,23 @@ pub const Config = struct {
         // Window.
         if (self.tab_position != .top) try w.print("tab_position = {s}\n", .{@tagName(self.tab_position)});
         if (!self.close_button_on_tab) try w.writeAll("close_button_on_tab = false\n");
+        if (self.always_on_top) try w.writeAll("always_on_top = true\n");
+        if (self.new_tab_after_current) try w.writeAll("new_tab_after_current = true\n");
+
+        // Mouse.
+        if (!self.mouse_autohide) try w.writeAll("mouse_autohide = false\n");
+        if (self.copy_on_selection) try w.writeAll("copy_on_selection = true\n");
+        if (self.clear_select_on_copy) try w.writeAll("clear_select_on_copy = true\n");
+        if (self.disable_mouse_paste) try w.writeAll("disable_mouse_paste = true\n");
+        if (self.disable_mousewheel_zoom) try w.writeAll("disable_mousewheel_zoom = true\n");
+        if (self.link_single_click) try w.writeAll("link_single_click = true\n");
+
+        // Search.
+        if (self.search_case_sensitive) try w.writeAll("search_case_sensitive = true\n");
+
+        // Bold.
+        if (!self.allow_bold) try w.writeAll("allow_bold = false\n");
+        if (!self.bold_is_bright) try w.writeAll("bold_is_bright = false\n");
 
         // Shell exit.
         if (self.exit_action != .close) try w.print("exit_action = {s}\n", .{@tagName(self.exit_action)});
@@ -387,6 +442,28 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         else return error.BadTabPosition;
     } else if (std.mem.eql(u8, key, "palette")) {
         cfg.palette = try parsePalette16(value);
+    } else if (std.mem.eql(u8, key, "always_on_top")) {
+        cfg.always_on_top = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "new_tab_after_current")) {
+        cfg.new_tab_after_current = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "mouse_autohide")) {
+        cfg.mouse_autohide = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "copy_on_selection")) {
+        cfg.copy_on_selection = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "clear_select_on_copy")) {
+        cfg.clear_select_on_copy = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "disable_mouse_paste")) {
+        cfg.disable_mouse_paste = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "disable_mousewheel_zoom")) {
+        cfg.disable_mousewheel_zoom = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "link_single_click")) {
+        cfg.link_single_click = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "search_case_sensitive")) {
+        cfg.search_case_sensitive = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "allow_bold")) {
+        cfg.allow_bold = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "bold_is_bright")) {
+        cfg.bold_is_bright = try parseBool(value);
     } else {
         // Unknown key — warn but don't abort.
         std.debug.print("sketerm: config: unknown key '{s}' (ignoring)\n", .{key});
