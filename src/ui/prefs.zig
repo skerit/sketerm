@@ -120,6 +120,17 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSwitchRow(@ptrCast(@alignCast(cursor_group)), ctx, "Blink", "Toggle cursor visibility periodically", &ctx.cfg.cursor_blink, cursorBlinkChanged);
     addSpinRowU32(@ptrCast(@alignCast(cursor_group)), ctx, "Blink interval (ms)", "Half-cycle. 500 = full blink every 1 s.", 100, 2000, &ctx.cfg.cursor_blink_ms, cursorBlinkMsChanged);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(cursor_group)));
+
+    // Per-pane title bar (Terminator-style).
+    const tb_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(tb_group)), "Per-pane title bar");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(tb_group)), "Thin label above each pane carrying the OSC 0/1/2 title.");
+    addSwitchRow(@ptrCast(@alignCast(tb_group)), ctx, "Show title bar", "Reveal a per-pane title bar.", &ctx.cfg.show_titlebar, applyOnly);
+    addColorRow(@ptrCast(@alignCast(tb_group)), ctx, "Active foreground", &ctx.cfg.title_active_fg);
+    addColorRow(@ptrCast(@alignCast(tb_group)), ctx, "Active background", &ctx.cfg.title_active_bg);
+    addColorRow(@ptrCast(@alignCast(tb_group)), ctx, "Inactive foreground", &ctx.cfg.title_inactive_fg);
+    addColorRow(@ptrCast(@alignCast(tb_group)), ctx, "Inactive background", &ctx.cfg.title_inactive_bg);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(tb_group)));
 }
 
 // ── Generic row helpers ─────────────────────────────────────────
