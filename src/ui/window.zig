@@ -11,6 +11,11 @@ const Terminal = @import("../terminal.zig").Terminal;
 const layout_mod = @import("../layout.zig");
 const Config = @import("../config.zig").Config;
 
+/// One-shot hint. Reset to false at startup; flipped on first
+/// `always_on_top = true` so we don't spam the log on every
+/// applyConfigChange.
+var always_on_top_warned: bool = false;
+
 pub const Window = struct {
     app_window: *c.GtkWidget,
     tab_view: *c.AdwTabView,
@@ -386,7 +391,7 @@ pub const Window = struct {
         defer self.allocator.free(title_z);
         @memcpy(title_z, spec.title);
 
-        const page = c.adw_tab_view_append(self.tab_view, wrapper);
+        const page = self.appendOrInsertTab(wrapper);
         c.adw_tab_page_set_title(page, title_z.ptr);
         c.adw_tab_page_set_tooltip(page, title_z.ptr);
     }
@@ -525,7 +530,7 @@ pub const Window = struct {
         c.gtk_widget_set_vexpand(wrapper, 1);
         c.gtk_box_append(@ptrCast(wrapper), pane.widget());
 
-        const page = c.adw_tab_view_append(self.tab_view, wrapper);
+        const page = self.appendOrInsertTab(wrapper);
         c.adw_tab_page_set_title(page, title_z);
         // Full-title tooltip — useful when titles are truncated.
         c.adw_tab_page_set_tooltip(page, title_z);
@@ -1085,6 +1090,40 @@ pub const Window = struct {
         self.config.save(path) catch |err| {
             std.debug.print("sketerm: prefs persist failed: {s}\n", .{@errorName(err)});
         };
+    }
+
+    /// Insert a new tab into self.tab_view, honouring the
+    /// `new_tab_after_current` config: at the end (default) or
+    /// immediately after the currently-selected page. Returns the
+    /// AdwTabPage so callers can set its title/tooltip.
+    fn appendOrInsertTab(self: *Window, child: *c.GtkWidget) *c.AdwTabPage {
+        if (self.config.new_tab_after_current) {
+            const sel = c.adw_tab_view_get_selected_page(self.tab_view);
+            if (sel != null) {
+                const idx = c.adw_tab_view_get_page_position(self.tab_view, sel);
+                if (c.adw_tab_view_insert(self.tab_view, child, idx + 1)) |p| return p;
+            }
+        }
+        return c.adw_tab_view_append(self.tab_view, child).?;
+    }
+
+    /// Stay-above-other-windows hint. GTK4 dropped the X11-era
+    /// `gtk_window_set_keep_above`; on modern Wayland clients can't
+    /// request this directly. We log a one-time hint pointing the
+    /// user at their compositor's window-rules feature and remember
+    /// the setting so config round-trips.
+    pub fn setAlwaysOnTop(self: *Window, on: bool) void {
+        _ = self;
+        if (!on) return;
+        if (always_on_top_warned) return;
+        always_on_top_warned = true;
+        std.debug.print(
+            \\sketerm: always_on_top: GTK4 doesn't expose a "keep above" API.
+            \\  Set this via your compositor's window rules:
+            \\    KDE Plasma: System Settings → Window Management → Window Rules
+            \\    GNOME:      gnome-tweaks → Workspaces (or `wmctrl -r sketerm -b add,above`)
+            \\
+        , .{});
     }
 
     /// Move the tab bar to the top or bottom of the toolbar view.
