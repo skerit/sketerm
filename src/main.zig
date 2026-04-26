@@ -52,6 +52,7 @@ const HELP_TEXT =
     \\  Ctrl+Shift+Left/Right Cycle focus between panes in the tab
     \\  Ctrl+= / Ctrl+-       Increase / decrease font size
     \\  Ctrl+0                Reset font size
+    \\  Ctrl+,                Open Preferences (also: right-click menu)
     \\  Shift+PgUp / PgDn     Scroll back / forward by one screenful
     \\
     \\Right-click for context menu (split / new tab / etc).

@@ -1305,6 +1305,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {},
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
         .close_pane => self.closeFocusedPane(),
+        .prefs_open => self.openPrefs(),
         else => {},
     }
 }

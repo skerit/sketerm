@@ -17,6 +17,7 @@ pub const Action = enum {
     close_pane,
     reset_terminal,
     copy_link,
+    prefs_open,
 };
 
 pub const Sink = *const fn (ctx: ?*anyopaque, action: Action) void;
@@ -57,6 +58,7 @@ const BINDS = [_]Bind{
     .{ .name = "rename-tab", .label = "Rename Tab…", .detailed = "term.rename-tab", .action = .rename_tab },
     .{ .name = "close-tab", .label = "Close Tab", .detailed = "term.close-tab", .action = .close_tab },
     .{ .name = "reset", .label = "Reset Terminal", .detailed = "term.reset", .action = .reset_terminal },
+    .{ .name = "prefs", .label = "Preferences…", .detailed = "term.prefs", .action = .prefs_open },
 };
 
 pub fn attach(
@@ -101,6 +103,7 @@ pub fn attachWithPrePopup(
 
     const sec4 = c.g_menu_new();
     c.g_menu_append(sec4, "Reset Terminal", "term.reset");
+    c.g_menu_append(sec4, "Preferences…", "term.prefs");
     c.g_menu_append_section(menu, null, @ptrCast(@alignCast(sec4)));
     c.g_object_unref(sec4);
 
