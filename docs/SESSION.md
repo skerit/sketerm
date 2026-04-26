@@ -1087,3 +1087,22 @@ Two real latent bugs from POSIX signal-vs-syscall interaction:
   used to silently truncate. Retry on EINTR; treat EAGAIN as buffer
   full and return the partial count (caller can decide).
 
+
+## More EINTR + ED 3 ring-head bug
+
+Continued the latent-bug audit of POSIX syscall sites:
+
+- **closeAndReap waitpid EINTR** — phase 1+2 polling waitpid bailed
+  on EINTR, leaving the child unreaped. Phase 3 blocking waitpid
+  had no retry loop. Both now while-loop on EINTR.
+- **terminal.deinit shutdown eventfd write EINTR** — signal during
+  the 8-byte write could leave the worker spinning on poll forever
+  and deinit hanging on join(). Retry until success or non-EINTR.
+- **🐛 ED 3 didn't reset scrollback_head** — the xterm
+  `clear-screen-and-scrollback` extension did
+  `scrollback.clearRetainingCapacity()` but left the ring head
+  pointer pointing at a stale offset. Subsequent pushes appended
+  to a fresh array but the ring eviction order (used once the
+  ring fills again) was wrong. 1 unit test exercises a wrapped
+  ring, ED 3, and asserts head=0.
+
