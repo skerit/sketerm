@@ -68,6 +68,15 @@ pub const Terminal = struct {
     on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
     on_pointer_shape: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
 
+    /// Optional broadcast-typing filter. When set, every byte from
+    /// USER input (keystrokes, paste, hyperlink launch) goes through
+    /// here instead of straight to the local PTY. Parser reply
+    /// channel (`sinkWritePty`) is unaffected — DA / DSR / OSC 52 /
+    /// kitty kbd reports are per-pane and must NOT broadcast.
+    /// Window installs this when groupsend != .off.
+    broadcast_sink: ?*const fn (ctx: ?*anyopaque, source: *Terminal, bytes: []const u8) void = null,
+    broadcast_ctx: ?*anyopaque = null,
+
     /// Most recent cwd reported via OSC 7 (file://host/path → /path).
     /// Owned. Used by layout save in preference to /proc lookup.
     cwd: ?[]u8 = null,
@@ -202,6 +211,19 @@ pub const Terminal = struct {
     fn sinkPointerShape(ctx: ?*anyopaque, name: []const u8) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
         if (self.on_pointer_shape) |f| f(self.user_ctx, name);
+    }
+
+    /// Send user input bytes (keystrokes, paste, etc) to the PTY,
+    /// optionally fanned out across panes when broadcast typing is on.
+    /// Parser reply channel (`sinkWritePty`) deliberately bypasses
+    /// this — those bytes are responses TO this PTY (DA, DSR, OSC 52,
+    /// kitty kbd reports) and must not be broadcast.
+    pub fn writeUserInput(self: *Terminal, bytes: []const u8) void {
+        if (self.broadcast_sink) |f| {
+            f(self.broadcast_ctx, self, bytes);
+            return;
+        }
+        _ = self.pty.writeAll(bytes);
     }
 
     pub fn deinit(self: *Terminal) void {

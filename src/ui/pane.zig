@@ -119,6 +119,11 @@ pub const Pane = struct {
     /// Latest OSC 0/1/2 title text. Owned; freed in deinit.
     titlebar_text: ?[]u8 = null,
 
+    /// Optional group name. When the Window's groupsend mode is `.group`,
+    /// keystrokes typed in any pane with the same group name are
+    /// fanned out across the group. Owned by the Window (Config arena).
+    group: ?[]const u8 = null,
+
     /// Inactive-pane dimming. When `is_focused` is false, the renderer
     /// multiplies fg/bg colours by `inactive_fg_dim` / `inactive_bg_dim`.
     /// Cursor / selection / overlay stay full-bright.

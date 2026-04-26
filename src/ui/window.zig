@@ -16,6 +16,9 @@ const Config = @import("../config.zig").Config;
 /// applyConfigChange.
 var always_on_top_warned: bool = false;
 
+/// Broadcast typing mode. Off / group / all — Terminator semantics.
+pub const GroupSend = enum { off, group, all };
+
 pub const Window = struct {
     app_window: *c.GtkWidget,
     tab_view: *c.AdwTabView,
@@ -57,6 +60,10 @@ pub const Window = struct {
     /// applyConfigChange or initial show; regenerated whenever
     /// title_*_* colours change.
     titlebar_css: ?*c.GtkCssProvider = null,
+    /// Broadcast typing mode. Off = each pane gets its own keystrokes
+    /// (default). Group = fan out to every pane sharing the source's
+    /// `group` name. All = fan out to every pane in this window.
+    groupsend: GroupSend = .off,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         return initWithConfig(allocator, app, null);
@@ -1281,6 +1288,82 @@ pub const Window = struct {
         c.gdk_surface_set_opaque_region(surface, null);
     }
 
+    /// Broadcast user input from `source` across the broadcast set,
+    /// per the current groupsend mode. ALWAYS writes to source first
+    /// (so the typing pane sees its own keystrokes immediately).
+    /// Mouse selections / paste interactions on receivers should not
+    /// fire from here — only keystrokes route through this path.
+    pub fn broadcastBytes(self: *Window, source: *Terminal, bytes: []const u8) void {
+        // Source always gets the bytes — direct PTY write to avoid
+        // re-entering the broadcast sink.
+        _ = source.pty.writeAll(bytes);
+
+        if (self.groupsend == .off) return;
+
+        for (self.terminals.items) |t| {
+            if (t == source) continue;
+            switch (self.groupsend) {
+                .off => unreachable,
+                .all => _ = t.pty.writeAll(bytes),
+                .group => {
+                    // Find the source pane's group + this pane's group.
+                    const src_group: ?[]const u8 = self.groupForTerminal(source);
+                    const dst_group: ?[]const u8 = self.groupForTerminal(t);
+                    if (src_group) |sg| {
+                        if (dst_group) |dg| {
+                            if (std.mem.eql(u8, sg, dg)) _ = t.pty.writeAll(bytes);
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    fn groupForTerminal(self: *Window, term: *Terminal) ?[]const u8 {
+        for (self.panes.items) |p| {
+            if (p.terminal == term) return p.group;
+        }
+        return null;
+    }
+
+    /// Cycle the broadcast mode (off → group → all → off). UI binds
+    /// this to Ctrl+Shift+G via the Action enum.
+    pub fn cycleGroupSend(self: *Window) void {
+        self.groupsend = switch (self.groupsend) {
+            .off => .group,
+            .group => .all,
+            .all => .off,
+        };
+        self.refreshBroadcastSink();
+        // Visual indicator on the focused pane: queue a draw so
+        // the titlebar's broadcast CSS class refresh is immediate.
+        for (self.panes.items) |p| {
+            self.applyBroadcastCss(p);
+            c.gtk_widget_queue_draw(p.widget());
+        }
+    }
+
+    /// Wire / unwire each Terminal's broadcast_sink based on the
+    /// current groupsend mode. Off = no sink installed (direct writes).
+    fn refreshBroadcastSink(self: *Window) void {
+        const sink: ?*const fn (ctx: ?*anyopaque, source: *Terminal, bytes: []const u8) void = if (self.groupsend == .off) null else broadcastSinkFn;
+        for (self.terminals.items) |t| {
+            t.broadcast_sink = sink;
+            t.broadcast_ctx = if (sink != null) @ptrCast(self) else null;
+        }
+    }
+
+    fn applyBroadcastCss(self: *Window, p: *Pane) void {
+        if (p.titlebar_box) |tb| {
+            const w: *c.GtkWidget = @ptrCast(@alignCast(tb));
+            if (self.groupsend != .off) {
+                c.gtk_widget_add_css_class(w, "sketerm-broadcast");
+            } else {
+                c.gtk_widget_remove_css_class(w, "sketerm-broadcast");
+            }
+        }
+    }
+
     /// Build the active keybinding table from default_bindings overlaid
     /// with Config.keybinds. Each (action, accel) override either
     /// replaces a default's accel for that action OR (if the action's
@@ -1360,12 +1443,13 @@ pub const Window = struct {
         const inf = self.config.title_inactive_fg;
         const ib = self.config.title_inactive_bg;
         // Format rgba(r, g, b, a) with values 0..255 + 0..1 alpha.
-        var buf: [1024]u8 = undefined;
+        var buf: [1536]u8 = undefined;
         const css = std.fmt.bufPrintZ(&buf,
             \\.sketerm-titlebar {{ padding: 1px 2px; min-height: 18px; }}
             \\.sketerm-titlebar-active {{ background-color: rgba({d}, {d}, {d}, {d:.3}); color: rgba({d}, {d}, {d}, {d:.3}); }}
             \\.sketerm-titlebar-inactive {{ background-color: rgba({d}, {d}, {d}, {d:.3}); color: rgba({d}, {d}, {d}, {d:.3}); }}
             \\.sketerm-titlebar-label {{ font-weight: bold; }}
+            \\.sketerm-titlebar.sketerm-broadcast {{ box-shadow: inset 0 0 0 2px rgba(255, 200, 60, 0.95); }}
         , .{
             @as(u8, @intFromFloat(@round(ab[0] * 255))),
             @as(u8, @intFromFloat(@round(ab[1] * 255))),
@@ -1657,6 +1741,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .pane_prev => self.cyclePane(.prev),
         .pane_next => self.cyclePane(.next),
         .prefs_open => self.openPrefs(),
+        .broadcast_cycle => self.cycleGroupSend(),
         else => {},
     }
 }
@@ -1942,6 +2027,13 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
             return;
         }
     }
+}
+
+/// Wired into Terminal.broadcast_sink. Routes back to the Window
+/// `broadcastBytes` for the actual fan-out logic.
+fn broadcastSinkFn(ctx: ?*anyopaque, source: *Terminal, bytes: []const u8) void {
+    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    self.broadcastBytes(source, bytes);
 }
 
 /// Called once after the toplevel realizes. Tell the compositor to

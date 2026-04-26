@@ -70,6 +70,8 @@ pub const Action = enum {
     pane_next,
     pane_prev,
     prefs_open,
+    /// Cycle broadcast typing mode: off → group → all → off.
+    broadcast_cycle,
     // Per-pane (dispatched locally inside input.zig).
     paste_clipboard,
     copy_selection,
@@ -107,6 +109,7 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_Right, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .pane_next },
     .{ .keyval = c.GDK_KEY_ISO_Left_Tab, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .prev_tab },
     .{ .keyval = c.GDK_KEY_plus, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .font_inc },
+    .{ .keyval = c.GDK_KEY_g, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .broadcast_cycle },
     // Ctrl+...
     .{ .keyval = c.GDK_KEY_Tab, .mods = c.GDK_CONTROL_MASK, .action = .next_tab },
     .{ .keyval = c.GDK_KEY_minus, .mods = c.GDK_CONTROL_MASK, .action = .font_dec },
@@ -164,6 +167,7 @@ pub fn actionName(a: Action) []const u8 {
         .pane_next => "pane_next",
         .pane_prev => "pane_prev",
         .prefs_open => "prefs_open",
+        .broadcast_cycle => "broadcast_cycle",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
         .interrupt_or_copy => "interrupt_or_copy",
@@ -202,6 +206,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .pane_next => "Next pane",
         .pane_prev => "Previous pane",
         .prefs_open => "Open Preferences",
+        .broadcast_cycle => "Broadcast typing (cycle)",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",
         .interrupt_or_copy => "Copy / interrupt (smart)",
@@ -333,13 +338,13 @@ fn onKeyReleased(
     }
     var buf: [32]u8 = undefined;
     const n = kittyKeyEvent(&buf, cp, shift, alt, ctrl, 3);
-    if (n > 0) _ = ctx.terminal.pty.writeAll(buf[0..n]);
+    if (n > 0) ctx.terminal.writeUserInput(buf[0..n]);
 }
 
 fn onImCommit(_: *c.GtkIMContext, text: [*:0]const u8, user: ?*anyopaque) callconv(.c) void {
     const ctx: *Ctx = @ptrCast(@alignCast(user.?));
     const len = std.mem.len(text);
-    if (len > 0) _ = ctx.terminal.pty.writeAll(text[0..len]);
+    if (len > 0) ctx.terminal.writeUserInput(text[0..len]);
     // Clear any preedit on commit.
     const screen = ctx.terminal.screen;
     if (screen.preedit_text) |old| {
@@ -435,7 +440,7 @@ fn onKeyPressed(
         screen.view_offset = 0;
         screen.dirty = true;
     }
-    _ = ctx.terminal.pty.writeAll(buf[0..n]);
+    ctx.terminal.writeUserInput(buf[0..n]);
     return 1;
 }
 
@@ -459,7 +464,7 @@ fn runAction(ctx: *Ctx, action: Action) c.gboolean {
             // Ctrl+C (interrupt). Off → noop. Selection present →
             // copy. Matches the previous Ctrl+Shift+C behaviour.
             if (!ctx.terminal.screen.selection.isActive() and ctx.smart_copy) {
-                _ = ctx.terminal.pty.writeAll(&[_]u8{0x03});
+                ctx.terminal.writeUserInput(&[_]u8{0x03});
                 return 1;
             }
             copySelection(ctx);

@@ -44,19 +44,19 @@ fn onPasteRead(source: ?*c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) 
     // When bracketed: scrub embedded ESC bytes so a pasted "\x1b[201~"
     // can't break out of the wrapping early (xterm convention).
     if (term.screen.bracketed_paste) {
-        _ = term.pty.writeAll("\x1b[200~");
+        term.writeUserInput("\x1b[200~");
         const pasted = cstr[0..len];
         var start: usize = 0;
         for (pasted, 0..) |b, i| {
             if (b == 0x1B) {
-                if (i > start) _ = term.pty.writeAll(pasted[start..i]);
+                if (i > start) term.writeUserInput(pasted[start..i]);
                 start = i + 1;
             }
         }
-        if (start < len) _ = term.pty.writeAll(pasted[start..len]);
-        _ = term.pty.writeAll("\x1b[201~");
+        if (start < len) term.writeUserInput(pasted[start..len]);
+        term.writeUserInput("\x1b[201~");
     } else {
-        _ = term.pty.writeAll(cstr[0..len]);
+        term.writeUserInput(cstr[0..len]);
     }
 }
 
