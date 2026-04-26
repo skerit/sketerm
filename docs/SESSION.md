@@ -1000,3 +1000,14 @@ Mostly housekeeping wins:
 
 Bench stable at ~155 / 60 / 88 / 89 / 85 MB/s.
 
+
+## Cache pre-grow tick
+
+- **Atlas cache + glyph_cache pre-grown to 256 entries** at init.
+  Avoids 4-5 rehashes during ASCII pre-warm + first session
+  content. ensureTotalCapacity is one-time upfront cost; rehash
+  is O(n) each so the savings are concentrated at warm-up.
+- **🐛 setFontSize: sync Screen.cell_pixel_w/h** after atlas
+  rebuild — otherwise CSI 14t/16t replies stayed stale until the
+  next window resize. Caught by reading the Ctrl++ / Ctrl+- path.
+
