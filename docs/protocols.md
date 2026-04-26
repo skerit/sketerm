@@ -308,4 +308,4 @@ Documented so we don't surprise app heuristics:
 - `DECBI` / `DECFI` (back/forward index) — VT420-specific, unused.
 - Arbitrary set-window XTWINOPS (move, resize, iconify, raise) —
   we respond to size-report subsets only (14t / 18t / 19t).
-- `DECRQSS` — deferred, not rejected architecturally.
+- macOS / Windows ports — Linux-only by design.
