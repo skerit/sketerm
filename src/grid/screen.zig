@@ -1188,22 +1188,51 @@ pub const Screen = struct {
                     var i: usize = 0;
                     while (i < run.len) : (i += 1) self.printCp(run.bytes[i]);
                 } else {
-                    // Tier 2.5: mixed run. Within the run, bulk-print
-                    // ASCII subranges via printCp directly (the decoder
-                    // would just emit them unchanged anyway), and only
-                    // route non-ASCII bytes through Decoder.feed for
-                    // codepoint reassembly. Skips per-byte branches in
-                    // the decoder for typical CJK + ASCII chrome.
+                    // Tier 2.5: mixed run. Lookahead-based UTF-8
+                    // decoding instead of per-byte Decoder.feed:
+                    //   - ASCII bytes via printCp (direct, no decoder).
+                    //   - Multi-byte: classify leading byte, read all
+                    //     continuation bytes in one shot, decode + print.
+                    //   - Falls back to Decoder.feed only when the run
+                    //     ends mid-codepoint (decoder retains state for
+                    //     the next run).
                     var i: usize = 0;
                     while (i < run.len) {
-                        if (self.decoder.expected == 0 and run.bytes[i] < 0x80) {
-                            const start = i;
-                            while (i < run.len and self.decoder.expected == 0 and run.bytes[i] < 0x80) : (i += 1) {}
-                            // start..i is pure ASCII with idle decoder.
-                            // printCp directly without going through feed.
-                            for (run.bytes[start..i]) |b| self.printCp(b);
+                        const b0 = run.bytes[i];
+                        if (self.decoder.expected == 0) {
+                            if (b0 < 0x80) {
+                                // ASCII subrange — bulk-print.
+                                const start = i;
+                                while (i < run.len and run.bytes[i] < 0x80) : (i += 1) {}
+                                for (run.bytes[start..i]) |b| self.printCp(b);
+                                continue;
+                            }
+                            const cp_len: usize = if ((b0 & 0xE0) == 0xC0) 2
+                                else if ((b0 & 0xF0) == 0xE0) 3
+                                else if ((b0 & 0xF8) == 0xF0) 4
+                                else 0;
+                            if (cp_len == 0) {
+                                // Invalid leading byte — drop.
+                                i += 1;
+                                continue;
+                            }
+                            if (i + cp_len <= run.len) {
+                                // All bytes present — validate and
+                                // decode in one shot, no decoder state.
+                                const cp = decodeUtf8Lookahead(run.bytes[i .. i + cp_len], cp_len);
+                                if (cp) |c| self.printCp(c);
+                                i += cp_len;
+                            } else {
+                                // Incomplete at run end — let the
+                                // stateful decoder hold the partial
+                                // bytes for the next run.
+                                while (i < run.len) : (i += 1) self.printByte(run.bytes[i]);
+                                break;
+                            }
                         } else {
-                            self.printByte(run.bytes[i]);
+                            // Decoder is mid-codepoint from a previous
+                            // run — feed continuation bytes until done.
+                            self.printByte(b0);
                             i += 1;
                         }
                     }
@@ -1956,6 +1985,36 @@ pub const Screen = struct {
     /// True iff every byte in the slice is plain ASCII (≤ 0x7E and
     /// excluding control bytes 0x00..0x1F). Used to skip the UTF-8
     /// decoder on pure-ASCII print runs.
+    /// Decode a 2/3/4-byte UTF-8 sequence given the leading-byte's
+    /// classified length. Returns null if any continuation byte is
+    /// malformed (top bits != 0b10). Caller has already verified
+    /// `bytes.len == cp_len`.
+    fn decodeUtf8Lookahead(bytes: []const u8, cp_len: usize) ?u32 {
+        switch (cp_len) {
+            2 => {
+                if ((bytes[1] & 0xC0) != 0x80) return null;
+                return (@as(u32, bytes[0] & 0x1F) << 6) | (bytes[1] & 0x3F);
+            },
+            3 => {
+                if ((bytes[1] & 0xC0) != 0x80) return null;
+                if ((bytes[2] & 0xC0) != 0x80) return null;
+                return (@as(u32, bytes[0] & 0x0F) << 12) |
+                    (@as(u32, bytes[1] & 0x3F) << 6) |
+                    (bytes[2] & 0x3F);
+            },
+            4 => {
+                if ((bytes[1] & 0xC0) != 0x80) return null;
+                if ((bytes[2] & 0xC0) != 0x80) return null;
+                if ((bytes[3] & 0xC0) != 0x80) return null;
+                return (@as(u32, bytes[0] & 0x07) << 18) |
+                    (@as(u32, bytes[1] & 0x3F) << 12) |
+                    (@as(u32, bytes[2] & 0x3F) << 6) |
+                    (bytes[3] & 0x3F);
+            },
+            else => return null,
+        }
+    }
+
     fn runIsAscii(bytes: []const u8) bool {
         var i: usize = 0;
         const V = @Vector(16, u8);
