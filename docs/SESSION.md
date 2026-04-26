@@ -942,3 +942,22 @@ plain ASCII); these are real-world per-frame and per-event wins.
   `writeMouseEvent(self, ...)` form. Note for future ticks: run
   the FULL `zig build`, not just `zig build test`.
 
+
+## UTF-8 lookahead tick
+
+Two compounding wins on the UTF-8-mixed workload:
+
+- **Lookahead-decoded multi-byte codepoints** — Tier 2.5 now
+  classifies a leading byte (1/2/3/4-byte UTF-8) and decodes the
+  whole codepoint via `decodeUtf8Lookahead` in one step. Stateful
+  `Decoder.feed` is reserved for the case where a run ends mid-
+  codepoint (state carries over to next run).
+- **fastAsciiSlice** — extracted from `applyPrintRunFast` so Tier
+  2.5 ASCII subranges go through the same direct cell-array fast
+  path (skips charset / wide / wrap checks per byte).
+- **digit accumulator** uses Zig `*|` / `+|` saturating ops in
+  `byteCsi` — cleaner than the std.math.add+catch dance.
+
+Bench: UTF-8 mix 63 → 85 MB/s (+35% net for this tick). Plain
+ASCII unchanged ~150 MB/s. Other workloads similar.
+
