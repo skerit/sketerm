@@ -119,6 +119,18 @@ pub const Parser = struct {
                     continue;
                 }
             }
+            // Bulk-accumulate digit runs in csi_param / dcs_param state:
+            // skips the per-byte switch tower for `38;2;255;128;0` and
+            // similar long-param sequences. Saturates at u32 max.
+            if (self.state == .csi_param and bytes[i] >= '0' and bytes[i] <= '9') {
+                var v: u32 = self.cur_param;
+                while (i < bytes.len and bytes[i] >= '0' and bytes[i] <= '9') : (i += 1) {
+                    v = (v *| 10) +| (bytes[i] - '0');
+                }
+                self.cur_param = v;
+                self.has_cur_param = true;
+                continue;
+            }
             self.byte(bytes[i], emit, ctx);
             i += 1;
         }
