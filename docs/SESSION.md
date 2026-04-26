@@ -1011,3 +1011,18 @@ Bench stable at ~155 / 60 / 88 / 89 / 85 MB/s.
   rebuild — otherwise CSI 14t/16t replies stayed stale until the
   next window resize. Caught by reading the Ctrl++ / Ctrl+- path.
 
+
+## Polish tick
+
+User-facing config additions:
+
+- **`line_pad_px` config option** (alias `line_spacing`) — extra
+  pixels added to cell_h for visual line spacing. Threaded through
+  Window → Pane → Atlas.initOpts. Negative tightens; clamped so
+  glyphs still fit. 1 unit test for both spellings.
+- **`--config <path>` CLI flag** — bypass the XDG search and load
+  config from an explicit file. Useful for testing alternate
+  themes / configs without touching `~/.config/sketerm/config.conf`.
+  New `Config.loadWithOverride` and `Window.initWithConfig`
+  entry points.
+
