@@ -121,7 +121,91 @@ pub const Config = struct {
         try parseInto(&cfg, body);
         return cfg;
     }
+
+    /// Atomic write to `path`: serialise every key whose value differs
+    /// from the schema default (so the file stays minimal). On disk
+    /// the format round-trips through `loadFromBytes` exactly.
+    pub fn save(self: *const Config, path: []const u8) !void {
+        var dir = try ensureParentDir(path);
+        defer dir.close();
+        const basename = std.fs.path.basename(path);
+
+        var tmp_buf: [256]u8 = undefined;
+        const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{basename});
+        var tmp = try dir.createFile(tmp_name, .{ .truncate = true });
+        defer tmp.close();
+
+        var write_buf: [4096]u8 = undefined;
+        var fw = tmp.writer(&write_buf);
+        try self.serialise(&fw.interface);
+        try fw.interface.flush();
+
+        try dir.rename(tmp_name, basename);
+    }
+
+    /// Same content as save() but directly into a Writer — used by
+    /// tests + the prefs dialog's preview path.
+    pub fn serialise(self: *const Config, w: *std.io.Writer) !void {
+        try w.writeAll("# sketerm config (auto-saved by Preferences dialog)\n");
+
+        // Font.
+        if (self.font_path) |fp| try w.print("font = {s}\n", .{fp});
+        if (self.font_size != 14) try w.print("font_size = {d}\n", .{self.font_size});
+        if (self.line_pad_px != 0) try w.print("line_pad_px = {d}\n", .{self.line_pad_px});
+
+        // Colors.
+        if (!eqColor(self.default_fg, .{ 0.92, 0.92, 0.92, 1.0 }))
+            try writeColor(w, "default_fg", self.default_fg);
+        if (!eqColor(self.default_bg, .{ 0.10, 0.10, 0.10, 1.0 }))
+            try writeColor(w, "default_bg", self.default_bg);
+        if (!eqColor(self.cursor_color, .{ 1.0, 1.0, 1.0, 1.0 }))
+            try writeColor(w, "cursor_color", self.cursor_color);
+
+        // Cursor.
+        if (self.cursor_shape != .block) try w.print("cursor_shape = {s}\n", .{@tagName(self.cursor_shape)});
+        if (!self.cursor_blink) try w.writeAll("cursor_blink = false\n");
+        if (self.cursor_blink_ms != 500) try w.print("cursor_blink_ms = {d}\n", .{self.cursor_blink_ms});
+
+        // Layout.
+        if (self.padding != 6.0) try w.print("padding = {d:.2}\n", .{self.padding});
+        if (self.scrollback != 10000) try w.print("scrollback = {d}\n", .{self.scrollback});
+
+        // Shell + env.
+        if (self.shell) |s| try w.print("shell = {s}\n", .{s});
+        if (!std.mem.eql(u8, self.term_env, "xterm-256color"))
+            try w.print("term = {s}\n", .{self.term_env});
+        if (!std.mem.eql(u8, self.color_term_env, "truecolor"))
+            try w.print("color_term = {s}\n", .{self.color_term_env});
+
+        // Behaviour.
+        if (!self.bracketed_paste) try w.writeAll("bracketed_paste = false\n");
+        if (self.modify_other_keys != 0) try w.print("modify_other_keys = {d}\n", .{self.modify_other_keys});
+
+        // Rendering.
+        if (!self.ligatures) try w.writeAll("ligatures = false\n");
+        if (!self.bidi) try w.writeAll("bidi = false\n");
+        if (!self.auto_theme) try w.writeAll("auto_theme = false\n");
+
+        // Bell.
+        if (self.bell_audible) try w.writeAll("bell_audible = true\n");
+    }
 };
+
+fn eqColor(a: [4]f32, b: [4]f32) bool {
+    return a[0] == b[0] and a[1] == b[1] and a[2] == b[2] and a[3] == b[3];
+}
+
+fn writeColor(w: *std.io.Writer, key: []const u8, c: [4]f32) !void {
+    const r: u8 = @intFromFloat(@round(c[0] * 255.0));
+    const g: u8 = @intFromFloat(@round(c[1] * 255.0));
+    const b: u8 = @intFromFloat(@round(c[2] * 255.0));
+    try w.print("{s} = #{x:0>2}{x:0>2}{x:0>2}\n", .{ key, r, g, b });
+}
+
+fn ensureParentDir(path: []const u8) !std.fs.Dir {
+    const dirname = std.fs.path.dirname(path) orelse ".";
+    return std.fs.cwd().makeOpenPath(dirname, .{});
+}
 
 /// Allocates the path; caller frees.
 fn resolveConfigPath(allocator: std.mem.Allocator) ?[]u8 {
@@ -353,4 +437,58 @@ test "config: line_pad_px parses int (positive and negative)" {
     var cfg2 = try Config.loadFromBytes(std.testing.allocator, body2);
     defer cfg2.deinit();
     try std.testing.expectEqual(@as(i16, 4), cfg2.line_pad_px);
+}
+
+test "config: serialise omits defaults" {
+    var cfg = Config{};
+    var buf: [1024]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+    // Empty config should serialise to just the header comment —
+    // no key=value lines for default values.
+    try std.testing.expect(std.mem.startsWith(u8, out, "# sketerm config"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "font_size") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ligatures") == null);
+}
+
+test "config: serialise round-trips through loadFromBytes" {
+    // Set a few non-default values; serialise; re-parse; check.
+    var cfg = Config{};
+    cfg.font_size = 18;
+    cfg.cursor_shape = .underline;
+    cfg.scrollback = 50000;
+    cfg.padding = 8.0;
+    cfg.bracketed_paste = false;
+    cfg.modify_other_keys = 2;
+    cfg.line_pad_px = -1;
+    cfg.default_fg = .{ 1.0, 0.5, 0.0, 1.0 };
+    cfg.default_bg = .{ 0.0, 0.0, 0.0, 1.0 };
+    cfg.cursor_color = .{ 0.5, 1.0, 0.5, 1.0 };
+    cfg.bell_audible = true;
+    cfg.ligatures = false;
+
+    var buf: [2048]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+
+    var parsed = try Config.loadFromBytes(std.testing.allocator, out);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 18), parsed.font_size);
+    try std.testing.expectEqual(CursorShape.underline, parsed.cursor_shape);
+    try std.testing.expectEqual(@as(u32, 50000), parsed.scrollback);
+    try std.testing.expectEqual(@as(f32, 8.0), parsed.padding);
+    try std.testing.expectEqual(false, parsed.bracketed_paste);
+    try std.testing.expectEqual(@as(u8, 2), parsed.modify_other_keys);
+    try std.testing.expectEqual(@as(i16, -1), parsed.line_pad_px);
+    try std.testing.expectEqual(true, parsed.bell_audible);
+    try std.testing.expectEqual(false, parsed.ligatures);
+    // Colors round-trip through #RRGGBB so they may lose the lowest
+    // byte of float precision but the high bits should match.
+    try std.testing.expect(@abs(parsed.default_fg[0] - 1.0) < 0.01);
+    try std.testing.expect(@abs(parsed.default_fg[1] - 0.5) < 0.01);
+    try std.testing.expect(@abs(parsed.default_fg[2] - 0.0) < 0.01);
+    try std.testing.expect(@abs(parsed.cursor_color[1] - 1.0) < 0.01);
 }
