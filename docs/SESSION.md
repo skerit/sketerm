@@ -1300,3 +1300,47 @@ Prefs UI gets:
   warns the API is best-effort
 
 All tests pass; smoke-cell + smoke-image both PASS on NVIDIA GL ES 3.2.
+
+
+## Per-pane titlebar (Terminator-style)
+
+5 new config keys + Pane wrapper Box restructuring:
+
+- `show_titlebar: bool = false` — off by default, matches sketerm's
+  minimal-chrome default. When on, each pane gets a thin label above
+  its grid carrying the OSC 0/1/2 terminal title.
+- `title_active_fg / _bg` — RGBA, default white-on-red (`#ffffff` /
+  `#c80003` — Terminator's iconic red active pane).
+- `title_inactive_fg / _bg` — black-on-grey (`#000000` / `#c0bebf`).
+- All four colours hot-reloaded via a Window-level `GtkCssProvider`
+  attached to the GdkDisplay at app priority. The provider supplies
+  CSS for two classes:
+    `.sketerm-titlebar-active   { background: rgba(...); color: ...}`
+    `.sketerm-titlebar-inactive { ... }`
+  `Window.refreshTitlebarCss()` is called at init + on every apply.
+
+Architecture:
+
+- `Pane.area` is still the GLArea; `Pane.wrapper_box` is a vertical
+  GtkBox containing `[titlebar][area]`. `Pane.widget()` returns the
+  wrapper so layout / split / tab reparent the whole stack.
+- All focus / click-equality call sites in `Window` updated to
+  compare against `Pane.area` (the focusable widget that
+  `gtk_window_get_focus()` actually returns) rather than `widget()`
+  (the wrapper Box, which is never the focus target).
+- Title label initialised to "Terminal" so a freshly-spawned pane
+  shows something before the shell emits OSC 0/1/2.
+- Click on titlebar Box → grabs focus on the underlying GLArea
+  (otherwise focus would be trapped on the un-focusable Box).
+- `setTitle(text)` / `setTitlebarVisible(bool)` / `setTitlebarActive(bool)`
+  methods on Pane. The on_title sink (Pane.onTitleEvent) calls
+  `setTitle` regardless of `win_on_title` (which stays null per the
+  earlier "tab titles are sticky" decision).
+- `onFocusEnter`/`Leave` flip the active CSS class.
+- `applyConfigChange` propagates `show_titlebar` to all panes via
+  `setTitlebarVisible` and refreshes the CSS provider.
+- `makePane` sets initial visibility from config so newly-spawned
+  panes show the bar immediately when enabled.
+
+Prefs UI: new "Per-pane title bar" group on Appearance page with the
+visibility switch + 4 GtkColorDialogButton rows.
