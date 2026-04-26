@@ -256,6 +256,9 @@ pub const Manager = struct {
             var v = entry.value;
             v.deinit(self.allocator);
         }
+        // Avoid stale active_transmit_id if we just yanked the
+        // in-flight transmission out from under it.
+        if (self.active_transmit_id == image_id) self.active_transmit_id = 0;
     }
 
     pub fn dropAll(self: *Manager) void {
@@ -265,6 +268,7 @@ pub const Manager = struct {
         var ait = self.accums.iterator();
         while (ait.next()) |e| e.value_ptr.deinit(self.allocator);
         self.accums.clearRetainingCapacity();
+        self.active_transmit_id = 0;
     }
 
     /// Look up a stored image's RGBA + dims.
