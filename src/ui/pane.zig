@@ -130,7 +130,7 @@ pub const Pane = struct {
         c.gtk_widget_set_hexpand(area_widget, 1);
         c.gtk_widget_set_visible(area_widget, 1);
 
-        // Titlebar header: hidden by default. The label has 4 px
+        // Titlebar header: hidden by default. The label has 6 px
         // horizontal padding so text doesn't sit flush against the
         // window edge; the wrapping box gets CSS classes for active
         // / inactive colouring (resolved by Window-level provider).
@@ -138,7 +138,7 @@ pub const Pane = struct {
         c.gtk_widget_add_css_class(tb_box, "sketerm-titlebar");
         c.gtk_widget_add_css_class(tb_box, "sketerm-titlebar-inactive");
         c.gtk_widget_set_visible(tb_box, 0);
-        const tb_label_w = c.gtk_label_new("");
+        const tb_label_w = c.gtk_label_new("Terminal");
         c.gtk_widget_add_css_class(tb_label_w, "sketerm-titlebar-label");
         c.gtk_label_set_xalign(@ptrCast(@alignCast(tb_label_w)), 0.0);
         c.gtk_label_set_ellipsize(@ptrCast(@alignCast(tb_label_w)), c.PANGO_ELLIPSIZE_END);
@@ -148,6 +148,20 @@ pub const Pane = struct {
         c.gtk_widget_set_margin_top(tb_label_w, 1);
         c.gtk_widget_set_margin_bottom(tb_label_w, 1);
         c.gtk_box_append(@ptrCast(tb_box), tb_label_w);
+
+        // Click on the titlebar to focus the underlying GLArea so
+        // typing immediately reaches that pane.
+        const tb_click = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(tb_click), 1);
+        _ = c.g_signal_connect_data(
+            tb_click,
+            "pressed",
+            @ptrCast(&onTitlebarClicked),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+        c.gtk_widget_add_controller(tb_box, @ptrCast(tb_click));
 
         // Wrapper that holds [titlebar][GLArea] vertically. We make
         // the wrapper the publicly-exposed widget so splits / layout
@@ -920,6 +934,14 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
     if (c.g_action_map_lookup_action(@ptrCast(group), "copy-link")) |act| {
         c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), if (has_link) 1 else 0);
     }
+}
+
+/// Click on the per-pane title bar. Focuses the underlying GLArea
+/// so the running shell receives keystrokes — without this, clicking
+/// the bar would just trap focus on the (un-focusable) Box.
+fn onTitlebarClicked(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    const self: *Pane = @ptrCast(@alignCast(user.?));
+    _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
 }
 
 fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
