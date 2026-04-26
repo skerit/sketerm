@@ -167,6 +167,13 @@ pub const Atlas = struct {
         c.glTexParameteri(c.GL_TEXTURE_2D_ARRAY, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
         c.glTexParameteri(c.GL_TEXTURE_2D_ARRAY, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
         self.realized = true;
+        // Pre-warm printable ASCII so the first render doesn't fire
+        // ~95 glyph-rasterise + glTexSubImage3D in one frame. The first
+        // shell prompt in a fresh pane visibly stutters otherwise.
+        var cp: u32 = 0x20;
+        while (cp < 0x7F) : (cp += 1) {
+            _ = self.lookupOrLoad(cp) catch continue;
+        }
     }
 
     pub fn deinit(self: *Atlas) void {
