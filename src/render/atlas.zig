@@ -107,6 +107,18 @@ pub const Atlas = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, font_path: [*:0]const u8, size_px: u16) !*Atlas {
+        return initOpts(allocator, font_path, size_px, 0);
+    }
+
+    /// Same as init, with extra `line_pad_px` added to `cell_h`. Used
+    /// to honour a user-configured line spacing tweak. Negative
+    /// values are clamped at the minimum that keeps cell_h ≥ ascent.
+    pub fn initOpts(
+        allocator: std.mem.Allocator,
+        font_path: [*:0]const u8,
+        size_px: u16,
+        line_pad_px: i16,
+    ) !*Atlas {
         var lib: c.FT_Library = undefined;
         if (c.FT_Init_FreeType(&lib) != 0) return error.FreeTypeInit;
         errdefer _ = c.FT_Done_FreeType(lib);
@@ -119,9 +131,16 @@ pub const Atlas = struct {
 
         const m = face.*.size.*.metrics;
         const cell_w: u16 = @intCast(@as(c_long, m.max_advance) >> 6);
-        const cell_h: u16 = @intCast((@as(c_long, m.ascender) - @as(c_long, m.descender)) >> 6);
+        const base_cell_h: u16 = @intCast((@as(c_long, m.ascender) - @as(c_long, m.descender)) >> 6);
         const ascent: i16 = @intCast(@as(c_long, m.ascender) >> 6);
         const descent: i16 = @intCast(-@as(c_long, m.descender) >> 6);
+        // Apply line spacing: add line_pad_px (clamped so glyph still
+        // fits — never below ascent which is the upper baseline limit).
+        const cell_h: u16 = blk: {
+            const sum: i32 = @as(i32, base_cell_h) + line_pad_px;
+            const min_h: i32 = @max(@as(i32, ascent), 1);
+            break :blk @intCast(@max(sum, min_h));
+        };
 
         const hb_font = c.hb_ft_font_create_referenced(face);
         const hb_buf = c.hb_buffer_create();

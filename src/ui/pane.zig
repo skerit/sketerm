@@ -84,6 +84,9 @@ pub const Pane = struct {
     /// Cursor blink half-cycle interval in microseconds. 500_000
     /// (= 500 ms) is the xterm default.
     cursor_blink_us: i64 = 500_000,
+    /// Extra pixels added to cell_h for visual line spacing (passed
+    /// to Atlas.initOpts). 0 = font default.
+    line_pad_px: i16 = 0,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -332,7 +335,7 @@ pub const Pane = struct {
             const z = self.allocator.allocSentinel(u8, fp.len, 0) catch return;
             defer self.allocator.free(z);
             @memcpy(z, fp);
-            if (Atlas.init(self.allocator, z.ptr, size)) |a| {
+            if (Atlas.initOpts(self.allocator, z.ptr, size, self.line_pad_px)) |a| {
                 self.atlas = a;
             } else |_| {}
         }
@@ -341,14 +344,14 @@ pub const Pane = struct {
                 const z = self.allocator.allocSentinel(u8, env_path.len, 0) catch return;
                 defer self.allocator.free(z);
                 @memcpy(z, env_path);
-                if (Atlas.init(self.allocator, z.ptr, size)) |a| {
+                if (Atlas.initOpts(self.allocator, z.ptr, size, self.line_pad_px)) |a| {
                     self.atlas = a;
                 } else |_| {}
             }
         }
         if (self.atlas == null) {
             for (FONT_CANDIDATES) |path| {
-                if (Atlas.init(self.allocator, path, size)) |a| {
+                if (Atlas.initOpts(self.allocator, path, size, self.line_pad_px)) |a| {
                     self.atlas = a;
                     break;
                 } else |_| continue;
@@ -419,7 +422,7 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         const z = self.allocator.allocSentinel(u8, fp.len, 0) catch return;
         defer self.allocator.free(z);
         @memcpy(z, fp);
-        if (Atlas.init(self.allocator, z.ptr, size)) |a| {
+        if (Atlas.initOpts(self.allocator, z.ptr, size, self.line_pad_px)) |a| {
             self.atlas = a;
         } else |_| {}
     }
@@ -428,14 +431,14 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
             const z = self.allocator.allocSentinel(u8, env_path.len, 0) catch return;
             defer self.allocator.free(z);
             @memcpy(z, env_path);
-            if (Atlas.init(self.allocator, z.ptr, size)) |a| {
+            if (Atlas.initOpts(self.allocator, z.ptr, size, self.line_pad_px)) |a| {
                 self.atlas = a;
             } else |_| {}
         }
     }
     if (self.atlas == null) {
         for (FONT_CANDIDATES) |path| {
-            if (Atlas.init(self.allocator, path, size)) |a| {
+            if (Atlas.initOpts(self.allocator, path, size, self.line_pad_px)) |a| {
                 self.atlas = a;
                 break;
             } else |_| continue;

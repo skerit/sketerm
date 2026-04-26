@@ -395,6 +395,7 @@ pub const Window = struct {
                 pane.font_size = p.font_size orelse self.config.font_size;
                 pane.font_path = self.config.font_path;
                 pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
+                pane.line_pad_px = self.config.line_pad_px;
                 pane.grid_pass.pad = self.config.padding;
                 pane.grid_pass.enable_ligatures = self.config.ligatures;
         pane.grid_pass.enable_bidi = self.config.bidi;

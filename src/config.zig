@@ -16,6 +16,10 @@ pub const Config = struct {
     // Font
     font_path: ?[]const u8 = null,
     font_size: u16 = 14,
+    /// Extra pixels added to each cell's height for visual line
+    /// spacing. 0 = font's natural metric; positive = looser; small
+    /// negative = tighter (clamped so the glyph still fits).
+    line_pad_px: i16 = 0,
 
     // Colors (premultiplied RGBA, 0..1).
     default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
@@ -141,6 +145,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.font_path = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "font_size")) {
         cfg.font_size = try parseU16(value);
+    } else if (std.mem.eql(u8, key, "line_pad_px") or std.mem.eql(u8, key, "line_spacing")) {
+        cfg.line_pad_px = try parseI16(value);
     } else if (std.mem.eql(u8, key, "default_fg")) {
         cfg.default_fg = try parseColor(value);
     } else if (std.mem.eql(u8, key, "default_bg")) {
@@ -201,6 +207,10 @@ fn stripComment(line: []const u8) []const u8 {
 
 fn parseU16(s: []const u8) !u16 {
     return std.fmt.parseInt(u16, s, 10);
+}
+
+fn parseI16(s: []const u8) !i16 {
+    return std.fmt.parseInt(i16, s, 10);
 }
 
 fn parseU32(s: []const u8) !u32 {
