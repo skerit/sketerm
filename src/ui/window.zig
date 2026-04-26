@@ -961,6 +961,17 @@ pub const Window = struct {
             screen.cursor_color = self.config.cursor_color;
             p.grid_pass.default_fg = self.config.default_fg;
             p.grid_pass.default_bg = self.config.default_bg;
+            // Palette (16 ANSI colours). When the user has set
+            // `palette` directly OR picked a scheme, the array is
+            // present; we push entries 0..15. Entries 16..255 keep
+            // their built-in 256-table values.
+            if (self.config.palette) |pal| {
+                var i: usize = 0;
+                while (i < 16) : (i += 1) {
+                    screen.palette[i] = pal[i];
+                    p.grid_pass.palette[i] = pal[i];
+                }
+            }
             // Cursor.
             screen.cursor_shape = mapCursorShape(self.config.cursor_shape, self.config.cursor_blink);
             if (self.config.cursor_blink_ms != old_blink_ms) {
