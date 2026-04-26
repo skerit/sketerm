@@ -810,6 +810,40 @@ fn windowPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(stack_group)), "Stacking");
     addSwitchRow(@ptrCast(@alignCast(stack_group)), ctx, "Always on top", "Best effort: GTK4 has no native API; use compositor window rules. (See terminal output for hints.)", &ctx.cfg.always_on_top, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(stack_group)));
+
+    // Confirm-on-close.
+    const close_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(close_group)), "Closing");
+    addConfirmCloseRow(@ptrCast(@alignCast(close_group)), ctx);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(close_group)));
+}
+
+fn addConfirmCloseRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "Never", "If multiple panes", "Always" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Confirm before closing");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Show a dialog before destroying tabs / windows.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    const initial: c_uint = switch (ctx.cfg.confirm_close) {
+        .never => 0,
+        .multiple => 1,
+        .always => 2,
+    };
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), initial);
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .parent = ctx, .on_change = confirmCloseSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn confirmCloseSelected(ctx: *Ctx, sel: c_uint) void {
+    ctx.cfg.confirm_close = switch (sel) {
+        0 => .never,
+        1 => .multiple,
+        2 => .always,
+        else => .multiple,
+    };
+    ctx.ev();
 }
 
 fn addTabPositionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {

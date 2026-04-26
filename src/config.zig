@@ -21,6 +21,13 @@ pub const ExitAction = enum { close, restart, hold };
 /// AdwTabBar position relative to the window.
 pub const TabPosition = enum { top, bottom };
 
+/// When to ask "are you sure?" before destroying panes / tabs.
+/// Matches Terminator's `ask_before_closing` semantics:
+///   never    — close immediately, no dialog
+///   multiple — only ask when there's >1 pane in the closing target
+///   always   — ask on every close
+pub const ConfirmClose = enum { never, multiple, always };
+
 pub const Config = struct {
     // Font
     font_path: ?[]const u8 = null,
@@ -108,6 +115,9 @@ pub const Config = struct {
     /// Insert new tabs immediately after the focused one instead of
     /// appending at the end of the tab bar.
     new_tab_after_current: bool = false,
+    /// Confirm-on-close policy. Default: ask only if there's more
+    /// than one pane being lost (matches Terminator's default).
+    confirm_close: ConfirmClose = .multiple,
 
     // Mouse
     /// Hide the mouse cursor while typing; reappear on motion.
@@ -315,6 +325,8 @@ pub const Config = struct {
         if (!self.close_button_on_tab) try w.writeAll("close_button_on_tab = false\n");
         if (self.always_on_top) try w.writeAll("always_on_top = true\n");
         if (self.new_tab_after_current) try w.writeAll("new_tab_after_current = true\n");
+        if (self.confirm_close != .multiple)
+            try w.print("confirm_close = {s}\n", .{@tagName(self.confirm_close)});
 
         // Mouse.
         if (!self.mouse_autohide) try w.writeAll("mouse_autohide = false\n");
@@ -494,6 +506,11 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.always_on_top = try parseBool(value);
     } else if (std.mem.eql(u8, key, "new_tab_after_current")) {
         cfg.new_tab_after_current = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "confirm_close")) {
+        if (std.mem.eql(u8, value, "never")) cfg.confirm_close = .never
+        else if (std.mem.eql(u8, value, "multiple")) cfg.confirm_close = .multiple
+        else if (std.mem.eql(u8, value, "always")) cfg.confirm_close = .always
+        else return error.BadConfirmClose;
     } else if (std.mem.eql(u8, key, "mouse_autohide")) {
         cfg.mouse_autohide = try parseBool(value);
     } else if (std.mem.eql(u8, key, "copy_on_selection")) {

@@ -170,6 +170,31 @@ pub const Window = struct {
             c.G_CONNECT_DEFAULT,
         );
 
+        // Confirm-on-close gate. AdwTabView emits "close-page" before
+        // detaching; returning TRUE = "I'll handle it asynchronously",
+        // then we MUST call adw_tab_view_close_page_finish(view, page,
+        // accept) once the user has decided. Returning FALSE on some
+        // branches and TRUE on others races — always TRUE.
+        _ = c.g_signal_connect_data(
+            tab_view_w,
+            "close-page",
+            @ptrCast(&onClosePage),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+
+        // Window-level close-request gate. Same idea: when there are
+        // multiple panes/tabs, prompt before letting the toplevel die.
+        _ = c.g_signal_connect_data(
+            app_window,
+            "close-request",
+            @ptrCast(&onWindowCloseRequest),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+
         // Window-level "new-tab" GAction so the header-bar "+" button
         // works without a focused pane.
         const new_tab_action = c.g_simple_action_new("new-tab", null);
@@ -1781,6 +1806,138 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
             _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
             return;
         }
+    }
+}
+
+/// Count panes whose widget tree lives inside `root`. Used by the
+/// confirm-on-close gate to decide whether the user is about to lose
+/// more than one shell.
+fn countPanesInTree(self: *Window, root: *c.GtkWidget) usize {
+    var n: usize = 0;
+    for (self.panes.items) |p| {
+        if (widgetIsAncestor(root, p.widget())) n += 1;
+    }
+    return n;
+}
+
+/// Pending close-page request. Heap-allocated so the AdwAlertDialog's
+/// async response can find its way back to a finish-the-close call.
+const PendingCloseTab = struct {
+    win: *Window,
+    page: *c.AdwTabPage,
+};
+
+/// Pending window close-request. Same idea.
+const PendingCloseWin = struct { win: *Window };
+
+/// AdwTabView "close-page" gate. Always returns GDK_EVENT_STOP (TRUE)
+/// so we own the close lifecycle; subsequent
+/// adw_tab_view_close_page_finish(view, page, accept) actually
+/// commits or aborts. Returning FALSE conditionally races.
+fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+
+    if (self.config.confirm_close == .never) {
+        c.adw_tab_view_close_page_finish(view, page, 1);
+        return 1;
+    }
+
+    // For the "multiple" policy, only ask when this tab actually
+    // contains > 1 pane (i.e. the user has split-panes inside).
+    if (self.config.confirm_close == .multiple) {
+        const child = c.adw_tab_page_get_child(page);
+        const npanes: usize = if (child != null)
+            countPanesInTree(self, @ptrCast(child))
+        else
+            0;
+        if (npanes <= 1) {
+            c.adw_tab_view_close_page_finish(view, page, 1);
+            return 1;
+        }
+    }
+
+    const heading = "Close tab?";
+    const body = "This tab has split panes. Closing it will end every shell inside.";
+    const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new(heading, body)));
+    c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
+    c.adw_alert_dialog_add_response(dialog, "close", "Close");
+    c.adw_alert_dialog_set_response_appearance(dialog, "close", c.ADW_RESPONSE_DESTRUCTIVE);
+    c.adw_alert_dialog_set_default_response(dialog, "cancel");
+    c.adw_alert_dialog_set_close_response(dialog, "cancel");
+
+    const pending = self.allocator.create(PendingCloseTab) catch {
+        // OOM — bail safely by accepting the close.
+        c.adw_tab_view_close_page_finish(view, page, 1);
+        return 1;
+    };
+    pending.* = .{ .win = self, .page = page };
+
+    c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseTabResponse, @ptrCast(pending));
+    return 1;
+}
+
+fn onCloseTabResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    const pending: *PendingCloseTab = @ptrCast(@alignCast(user.?));
+    defer pending.win.allocator.destroy(pending);
+
+    const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
+    const resp_c = c.adw_alert_dialog_choose_finish(dialog, result);
+    const resp = std.mem.span(@as([*:0]const u8, @ptrCast(resp_c)));
+    const accept = std.mem.eql(u8, resp, "close");
+    c.adw_tab_view_close_page_finish(pending.win.tab_view, pending.page, if (accept) 1 else 0);
+}
+
+/// Window-level close-request gate. Returning TRUE blocks the close
+/// while we ask; on accept we close manually via gtk_window_close.
+fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+
+    if (self.config.confirm_close == .never) return 0;
+
+    const npanes = self.panes.items.len;
+    if (self.config.confirm_close == .multiple and npanes <= 1) return 0;
+
+    const heading = "Close window?";
+    const body_buf = std.fmt.allocPrintSentinel(
+        self.allocator,
+        "There {s} {d} {s} open. Closing the window will end every shell.",
+        .{
+            if (npanes == 1) @as([]const u8, "is") else @as([]const u8, "are"),
+            npanes,
+            if (npanes == 1) @as([]const u8, "shell") else @as([]const u8, "shells"),
+        },
+        0,
+    ) catch {
+        // Fall back to a generic body — never block close on OOM.
+        return 0;
+    };
+    defer self.allocator.free(body_buf);
+
+    const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(c.adw_alert_dialog_new(heading, body_buf.ptr)));
+    c.adw_alert_dialog_add_response(dialog, "cancel", "Cancel");
+    c.adw_alert_dialog_add_response(dialog, "close", "Close");
+    c.adw_alert_dialog_set_response_appearance(dialog, "close", c.ADW_RESPONSE_DESTRUCTIVE);
+    c.adw_alert_dialog_set_default_response(dialog, "cancel");
+    c.adw_alert_dialog_set_close_response(dialog, "cancel");
+
+    const pending = self.allocator.create(PendingCloseWin) catch return 0;
+    pending.* = .{ .win = self };
+
+    c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseWinResponse, @ptrCast(pending));
+    return 1; // block while dialog is up
+}
+
+fn onCloseWinResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    const pending: *PendingCloseWin = @ptrCast(@alignCast(user.?));
+    defer pending.win.allocator.destroy(pending);
+
+    const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
+    const resp_c = c.adw_alert_dialog_choose_finish(dialog, result);
+    const resp = std.mem.span(@as([*:0]const u8, @ptrCast(resp_c)));
+    if (std.mem.eql(u8, resp, "close")) {
+        // Disconnect our close-request handler before destroying so
+        // it doesn't fire again on the actual close.
+        c.gtk_window_destroy(@ptrCast(pending.win.app_window));
     }
 }
 
