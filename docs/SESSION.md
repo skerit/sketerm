@@ -1230,3 +1230,22 @@ set, so the first prompt picks up the configured scheme.
 - **close_button_on_tab** — dropped from the dialog. AdwTabView
   doesn't expose a global toggle. Schema key kept for future.
 
+
+## Prefs polish + correctness tick
+
+- **🐛 Wrong-allocator free in prefs dialog** — when the user picked
+  a font, the previous font_path was passed to ctx.allocator.free
+  but lived in Window.config.arena. Heap corruption waiting to
+  happen on the second selection. Dialog now has its own arena;
+  all duped strings (font_path, shell, term_env, …) go there and
+  are reaped on close.
+- **String survival across dialog close** — applyConfigChange
+  re-dups every string field (font_path / shell / term_env /
+  color_term_env / word_chars / scheme) into Window.config.arena
+  before commit. Without this, post-close pointers would dangle.
+- **schemes module extraction** — the 9 built-in colour schemes
+  moved from ui/prefs.zig to grid/schemes.zig with a `lookup(key)`
+  helper. Window now resolves `scheme` → palette at spawn /
+  applyConfigChange time, so `scheme = solarized_dark` in
+  config.conf without an explicit `palette` actually applies.
+
