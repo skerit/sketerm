@@ -604,6 +604,7 @@ pub const Window = struct {
         term.screen.scrollback_capacity = self.config.scrollback;
         term.screen.bracketed_paste = self.config.bracketed_paste;
         term.screen.scroll_on_output = self.config.scroll_on_output;
+        term.screen.word_chars = self.config.word_chars;
         if (self.config.palette) |pal| {
             var i: usize = 0;
             while (i < 16) : (i += 1) {
@@ -1010,6 +1011,7 @@ pub const Window = struct {
             screen.modify_other_keys = self.config.modify_other_keys;
             screen.scrollback_capacity = self.config.scrollback;
             screen.scroll_on_output = self.config.scroll_on_output;
+            screen.word_chars = self.config.word_chars;
             if (p.input_ctx) |ictx| ictx.smart_copy = self.config.smart_copy;
             // Repaint.
             screen.dirty = true;

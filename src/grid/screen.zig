@@ -47,6 +47,10 @@ pub const Screen = struct {
     /// view_offset back to 0. Off by default — matches xterm.
     /// Mirrors gnome-terminal's "scroll on output" toggle.
     scroll_on_output: bool = false,
+    /// Punctuation chars considered "part of a word" for double-click
+    /// selection. Default is sensible for paths + URLs. Set from
+    /// Config.word_chars at pane spawn / applyConfigChange.
+    word_chars: []const u8 = "-_.,/?:@&=+%~",
 
     /// Cursor position, 0-indexed.
     row: u16 = 0,
@@ -499,16 +503,15 @@ pub const Screen = struct {
     /// Word-class membership for double-click word selection.
     /// Mirrors xterm's default: ASCII alnum, underscore, plus a small
     /// "extra" set commonly considered part of paths/URIs.
-    fn isWordChar(cp: u32) bool {
+    fn isWordChar(self: *const Screen, cp: u32) bool {
         if (cp == ' ' or cp == 0) return false;
         if (cp >= 'a' and cp <= 'z') return true;
         if (cp >= 'A' and cp <= 'Z') return true;
         if (cp >= '0' and cp <= '9') return true;
-        switch (cp) {
-            '_', '-', '.', '/', '@', '~', '+', ':', '=' => return true,
-            else => {},
-        }
-        return cp >= 0x80; // any non-ASCII codepoint
+        if (cp >= 0x80) return true; // any non-ASCII codepoint
+        // ASCII punctuation: consult the per-screen word_chars set.
+        for (self.word_chars) |b| if (b == cp) return true;
+        return false;
     }
 
     /// Set selection to the word containing (row, col). Used by
@@ -518,7 +521,7 @@ pub const Screen = struct {
         if (col < 0 or @as(usize, @intCast(col)) >= cells.len) return;
         const cidx: usize = @intCast(col);
         const here = cells[cidx];
-        if (!isWordChar(here.rune)) {
+        if (!self.isWordChar(here.rune)) {
             // Non-word cell → select just this column.
             self.selection.start(row, col, .normal);
             self.selection.extend(row, col + 1);
@@ -527,10 +530,10 @@ pub const Screen = struct {
         }
         // Walk left.
         var lo: usize = cidx;
-        while (lo > 0 and isWordChar(cells[lo - 1].rune)) lo -= 1;
+        while (lo > 0 and self.isWordChar(cells[lo - 1].rune)) lo -= 1;
         // Walk right.
         var hi: usize = cidx;
-        while (hi + 1 < cells.len and isWordChar(cells[hi + 1].rune)) hi += 1;
+        while (hi + 1 < cells.len and self.isWordChar(cells[hi + 1].rune)) hi += 1;
         self.selection.start(row, @intCast(lo), .normal);
         self.selection.extend(row, @intCast(hi + 1));
         self.dirty = true;
