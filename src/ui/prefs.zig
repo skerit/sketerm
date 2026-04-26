@@ -592,6 +592,30 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSpinRowU32(@ptrCast(@alignCast(sb_group)), ctx, "Lines", "Maximum scrollback lines retained per pane.", 100, 100000, &ctx.cfg.scrollback, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(sb_group)), ctx, "Scroll on output", "Snap view to bottom on any output, not just keystrokes.", &ctx.cfg.scroll_on_output, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(sb_group)));
+
+    // Mouse.
+    const mouse_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(mouse_group)), "Mouse");
+    addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Auto-hide cursor", "Hide pointer while typing; reappears on motion.", &ctx.cfg.mouse_autohide, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Copy on selection", "Copy the selection to the system clipboard automatically.", &ctx.cfg.copy_on_selection, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Clear selection after copy", "Drop the highlighted selection after Ctrl+Shift+C.", &ctx.cfg.clear_select_on_copy, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Disable middle-click paste", "Ignore middle-click PRIMARY paste entirely.", &ctx.cfg.disable_mouse_paste, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Disable Ctrl+wheel zoom", "Ctrl+wheel won't change the font size.", &ctx.cfg.disable_mousewheel_zoom, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Single-click hyperlinks", "OSC 8 hyperlinks open on plain click instead of Ctrl+click.", &ctx.cfg.link_single_click, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(mouse_group)));
+
+    // Search.
+    const search_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(search_group)), "Search");
+    addSwitchRow(@ptrCast(@alignCast(search_group)), ctx, "Case sensitive default", "Skip smart-case; treat every search as case-sensitive.", &ctx.cfg.search_case_sensitive, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(search_group)));
+
+    // Bold.
+    const bold_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(bold_group)), "Bold");
+    addSwitchRow(@ptrCast(@alignCast(bold_group)), ctx, "Allow bold", "Honour the bold attribute (font weight + bright color).", &ctx.cfg.allow_bold, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(bold_group)), ctx, "Bold is bright", "Bold text uses bright palette 8..15 instead of normal 0..7.", &ctx.cfg.bold_is_bright, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(bold_group)));
 }
 
 const StringFieldCtx = struct {
@@ -741,11 +765,17 @@ fn windowPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     const tabs_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(tabs_group)), "Tabs");
     addTabPositionRow(@ptrCast(@alignCast(tabs_group)), ctx);
+    addSwitchRow(@ptrCast(@alignCast(tabs_group)), ctx, "New tab after current", "Insert new tabs immediately after the focused one.", &ctx.cfg.new_tab_after_current, applyOnly);
     // close_button_on_tab is in the schema but not in the UI: AdwTabView
     // doesn't expose a global close-button toggle and per-page tweaks
     // would need to walk every page on every change. Revisit when
     // libadwaita gains a property for it.
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(tabs_group)));
+
+    const stack_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(stack_group)), "Stacking");
+    addSwitchRow(@ptrCast(@alignCast(stack_group)), ctx, "Always on top", "Best effort: GTK4 has no native API; use compositor window rules. (See terminal output for hints.)", &ctx.cfg.always_on_top, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(stack_group)));
 }
 
 fn addTabPositionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
