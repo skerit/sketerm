@@ -4546,7 +4546,7 @@ test "XTGETTCAP: TN (Terminal Name) returns sketerm-256color" {
     var body1 = "544E".*;
     s.onDcs(.{
         .proto = .{
-            .params = [_]u32{0} ** 16,
+            .params = [_]u16{0} ** 4,
             .n_params = 0,
             .intermediates = [_]u8{'+'} ++ [_]u8{0} ** 3,
             .n_intermediates = 1,
@@ -4587,7 +4587,7 @@ test "XTGETTCAP: unknown cap replies with 0+r" {
     var body2 = "5A5A5A".*;
     s.onDcs(.{
         .proto = .{
-            .params = [_]u32{0} ** 16,
+            .params = [_]u16{0} ** 4,
             .n_params = 0,
             .intermediates = [_]u8{'+'} ++ [_]u8{0} ** 3,
             .n_intermediates = 1,

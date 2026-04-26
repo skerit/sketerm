@@ -440,8 +440,9 @@ pub const Parser = struct {
                     self.transitionTo(.dcs_param);
                 },
                 0x3A, 0x3B => {
-                    if (self.dcs_proto.n_params < 16) {
-                        self.dcs_proto.params[self.dcs_proto.n_params] = if (self.has_cur_param) self.cur_param else 0;
+                    if (self.dcs_proto.n_params < self.dcs_proto.params.len) {
+                        const v: u16 = @intCast(@min(if (self.has_cur_param) self.cur_param else 0, std.math.maxInt(u16)));
+                        self.dcs_proto.params[self.dcs_proto.n_params] = v;
                         self.dcs_proto.n_params += 1;
                     }
                     self.cur_param = 0;
@@ -456,8 +457,9 @@ pub const Parser = struct {
                     self.transitionTo(.dcs_intermediate);
                 },
                 0x40...0x7E => {
-                    if (self.has_cur_param and self.dcs_proto.n_params < 16) {
-                        self.dcs_proto.params[self.dcs_proto.n_params] = self.cur_param;
+                    if (self.has_cur_param and self.dcs_proto.n_params < self.dcs_proto.params.len) {
+                        const v: u16 = @intCast(@min(self.cur_param, std.math.maxInt(u16)));
+                        self.dcs_proto.params[self.dcs_proto.n_params] = v;
                         self.dcs_proto.n_params += 1;
                     }
                     self.dcs_proto.final = b;

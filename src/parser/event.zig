@@ -119,7 +119,12 @@ pub const Event = union(enum) {
     };
 
     pub const Dcs = struct {
-        params: [16]u32 = .{0} ** 16,
+        /// DCS params. 4 × u16 is enough for every DCS we route —
+        /// XTGETTCAP / DECRQSS only inspect intermediates+final,
+        /// sixel reads its own body. Shrinking from [16]u32 → [4]u16
+        /// dropped DcsFull from 88 → 32 B and the whole Event union
+        /// from 96 → 76 B (Csi is now the limiter).
+        params: [4]u16 = .{0} ** 4,
         n_params: u8 = 0,
         intermediates: [4]u8 = .{0} ** 4,
         n_intermediates: u8 = 0,
