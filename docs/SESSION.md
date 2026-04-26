@@ -1106,3 +1106,21 @@ Continued the latent-bug audit of POSIX syscall sites:
   ring fills again) was wrong. 1 unit test exercises a wrapped
   ring, ED 3, and asserts head=0.
 
+
+## More-bug-hunt tick
+
+- **🐛 kitty.Manager active_transmit_id stale after drop / dropAll**
+  — when a `d=A` or `d=I <id>` deleted an in-flight transmission,
+  the active_transmit_id field kept pointing at the now-deleted
+  accumulator. Continuation chunks that omitted `i=` would route
+  to a missing entry. Reset on matching drop / unconditionally on
+  dropAll.
+- **🐛 kitty graphics: ignored `q=` (quiet) on a=q query** — replied
+  with `OK` regardless. Spec: q=1 suppresses success replies, q=2
+  suppresses all. Now returns silently when q≥1 (the probe is
+  always success). 1 unit test.
+- **🐛 closeFocusedPane: focus surviving sibling pane** — without
+  the explicit grab_focus, focus could land on the empty GtkPaned
+  wrapper or a default widget, leaving keypresses going nowhere.
+  Walk the sibling subtree, focus the first pane found.
+
