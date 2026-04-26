@@ -515,6 +515,12 @@ pub const Window = struct {
     }
 
     fn spawnShellPane(self: *Window) !*Pane {
+        return self.spawnShellPaneOpts(null);
+    }
+
+    /// Spawn a shell with an optional starting cwd. When inherit_cwd
+    /// is non-null, passed to PTY so the child starts there.
+    fn spawnShellPaneOpts(self: *Window, inherit_cwd: ?[]const u8) !*Pane {
         // Config-driven shell, with $SHELL fallback, then /bin/bash.
         var shell_buf: [256:0]u8 = undefined;
         const shell: [*:0]const u8 = if (self.config.shell) |s| blk: {
@@ -542,6 +548,7 @@ pub const Window = struct {
             .cols = 80,
             .term = @ptrCast(&term_buf),
             .color_term = @ptrCast(&ct_buf),
+            .cwd = inherit_cwd,
         });
         errdefer pty.closeAndReap();
 
@@ -598,8 +605,11 @@ pub const Window = struct {
 
         const parent = c.gtk_widget_get_parent(focused_w) orelse return;
 
-        // Build new pane.
-        const new_pane = try self.spawnShellPane();
+        // Inherit the focused pane's last-reported cwd (OSC 7) when
+        // available, so the new shell starts in the same directory.
+        // Falls back to inherited (parent process) cwd when null.
+        const inherit_cwd: ?[]const u8 = focused_pane.terminal.cwd;
+        const new_pane = try self.spawnShellPaneOpts(inherit_cwd);
         const new_w = new_pane.widget();
 
         const paned = c.gtk_paned_new(orientation);
