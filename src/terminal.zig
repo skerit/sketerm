@@ -214,9 +214,14 @@ pub const Terminal = struct {
         self.drain.terminal = null;
         self.drain.alive.store(false, .release);
 
-        // Signal worker.
+        // Signal worker. Loop on EINTR — eventfd write is atomic
+        // 8 bytes but a signal arriving mid-call still returns -1.
         const one: u64 = 1;
-        _ = c.write(self.shutdown_fd, &one, 8);
+        while (true) {
+            const w = c.write(self.shutdown_fd, &one, 8);
+            if (w >= 0) break;
+            if (std.posix.errno(w) != .INTR) break;
+        }
         self.worker_thread.join();
 
         _ = c.close(self.shutdown_fd);
