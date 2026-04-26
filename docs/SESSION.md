@@ -1213,3 +1213,20 @@ Still not wired (deliberately deferred):
 Initial pane spawn now also pushes the user's palette[0..15] when
 set, so the first prompt picks up the configured scheme.
 
+
+## More prefs wiring
+
+- **tab_position {top, bottom}** — Window now holds tab_bar +
+  toolbar_view widgets and re-parents on apply. Initial position
+  loaded from saved config.
+- **exit_action {close, restart, hold}** — Screen.onChildEof sets
+  a child_exited flag; Pane.onTick fires win_on_child_exit
+  next frame (avoids tearing down Terminal from inside apply).
+  Window.onTermChildExit dispatches per the configured action.
+  Default `close` matches gnome-terminal / kitty / wezterm.
+  `hold` keeps the previous behaviour (banner only); `restart`
+  closes + spawns a fresh tab (true in-place PTY swap is a
+  bigger refactor for future).
+- **close_button_on_tab** — dropped from the dialog. AdwTabView
+  doesn't expose a global toggle. Schema key kept for future.
+
