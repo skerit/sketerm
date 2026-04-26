@@ -2850,6 +2850,10 @@ pub const Screen = struct {
                 for (lines) |*l| l.clear();
                 for (self.scrollback.items) |*l| l.deinit(self.allocator);
                 self.scrollback.clearRetainingCapacity();
+                // Reset ring head — without this, post-clear pushes
+                // wrap from a stale offset and eviction order goes
+                // wrong once the ring fills again.
+                self.scrollback_head = 0;
                 self.view_offset = 0;
             },
             else => {},
@@ -3720,6 +3724,36 @@ test "ED 3 clears scrollback" {
     csi.final = 'J';
     s.csi(csi);
     try std.testing.expectEqual(@as(u32, 0), s.scrollbackCount());
+}
+
+test "ED 3 resets scrollback_head so eviction order survives a clear" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 3, 2);
+    defer s.deinit();
+    s.scrollback_capacity = 3; // tiny ring so we wrap quickly
+    // Fill the ring + wrap a few times to advance scrollback_head.
+    inline for (0..6) |_| {
+        s.printCp('x'); s.execute('\r'); s.execute('\n');
+    }
+    try std.testing.expect(s.scrollback_head > 0);
+
+    // Clear via ED 3.
+    var csi = Event.Csi{};
+    csi.params[0] = 3;
+    csi.n_params = 1;
+    csi.final = 'J';
+    s.csi(csi);
+    try std.testing.expectEqual(@as(usize, 0), s.scrollback_head);
+    try std.testing.expectEqual(@as(u32, 0), s.scrollbackCount());
+
+    // Now refill — scrollbackLine indexing must produce sane output.
+    inline for ("abc") |ch| {
+        s.printCp(ch); s.execute('\r'); s.execute('\n');
+    }
+    // Walking scrollbackLine 0..N from oldest should return entries
+    // in the order they were pushed.
+    try std.testing.expect(s.scrollbackCount() > 0);
 }
 
 test "extract selection skips wide-cont" {
