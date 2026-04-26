@@ -1176,14 +1176,20 @@ pub const Screen = struct {
             .print => |cp| self.printCp(cp),
             .print_byte => |b| self.printByte(b),
             .print_run => |run| {
-                // Tier 1: bulk-write the entire run in a tight loop
-                // when nothing complicated is going on (no charset
-                // translation, no insert/cluster/wrap, run fits on
-                // current row). Avoids the per-byte printCp overhead
-                // for the dominant case in plaintext output.
-                if (self.applyPrintRunFast(&run)) {
-                    // handled
-                } else if (self.decoder.expected == 0 and runIsAscii(run.bytes[0..run.len])) {
+                // Single SIMD scan for ascii-ness, dispatched to the
+                // tightest tier the screen state supports:
+                //   Tier 1 — fastAsciiSlice path (full run, cell-array
+                //            direct write; preconditions cleanest).
+                //   Tier 2 — ASCII run but state forbids Tier 1 (e.g.
+                //            insert_mode, pending_wrap, charset != ascii)
+                //            → printCp per byte.
+                //   Tier 2.5 — mixed UTF-8 with lookahead decoding.
+                const slice = run.bytes[0..run.len];
+                const decoder_idle = self.decoder.expected == 0;
+                const ascii_run = decoder_idle and runIsAscii(slice);
+                if (ascii_run and self.fastAsciiEligible()) {
+                    self.fastAsciiSlice(slice);
+                } else if (ascii_run) {
                     // Tier 2: skip UTF-8 decoder; per-byte printCp.
                     var i: usize = 0;
                     while (i < run.len) : (i += 1) self.printCp(run.bytes[i]);
@@ -1814,29 +1820,6 @@ pub const Screen = struct {
 
     fn printByte(self: *Screen, b: u8) void {
         if (self.decoder.feed(b)) |cp| self.printCp(cp);
-    }
-
-    /// Bulk-print fast path for `print_run` events. Returns true iff
-    /// the entire run was handled here; false means caller should
-    /// fall back to per-byte. Handles wrap mid-run via lineFeed —
-    /// matches printCp's autowrap semantics, including
-    /// `Line.continues_above = true` on the new row.
-    ///
-    /// Eligibility:
-    ///   - UTF-8 decoder idle.
-    ///   - Every byte printable ASCII (0x20..0x7E).
-    ///   - Active charset = ASCII.
-    ///   - !insert_mode, !pending_wrap, cluster store empty.
-    fn applyPrintRunFast(self: *Screen, run: *const Event.PrintRun) bool {
-        if (self.decoder.expected != 0) return false;
-        if (self.insert_mode) return false;
-        if (self.pending_wrap) return false;
-        if (self.clusters.count() != 0) return false;
-        const active = if (self.active_charset == .g0) self.charset_g0 else self.charset_g1;
-        if (active != .ascii) return false;
-        if (!runIsAscii(run.bytes[0..run.len])) return false;
-        self.fastAsciiSlice(run.bytes[0..run.len]);
-        return true;
     }
 
     /// Fast-write a contiguous ASCII byte slice as cells. Caller is
