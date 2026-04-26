@@ -930,6 +930,78 @@ pub const Window = struct {
         _ = c.gtk_widget_grab_focus(@ptrCast(in_tab.items[next].widget()));
     }
 
+    /// Open the preferences dialog. Live-applies changes via
+    /// applyConfigChange + persists to ~/.config/sketerm/config.conf
+    /// on every mutation.
+    fn openPrefs(self: *Window) void {
+        const prefs = @import("prefs.zig");
+        prefs.open(self.allocator, @ptrCast(self.app_window), @ptrCast(self), self.config, prefsApplyCallback) catch |err| {
+            std.debug.print("sketerm: prefs dialog: {s}\n", .{@errorName(err)});
+        };
+    }
+
+    /// Push a (possibly-mutated) Config into all live state. Called
+    /// by the prefs dialog whenever the user changes anything; also
+    /// persists the new values to disk so they survive restart.
+    pub fn applyConfigChange(self: *Window, new_cfg: *const Config) void {
+        // Compute diffs we need to react to BEFORE swapping config.
+        const old_size = self.config.font_size;
+        const old_pad = self.config.padding;
+        const old_blink_ms = self.config.cursor_blink_ms;
+        // Replace config wholesale (string fields stay borrowed from
+        // the dialog's working copy until next reload).
+        self.config = new_cfg.*;
+
+        // Push into every pane.
+        for (self.panes.items) |p| {
+            const screen = p.terminal.screen;
+            // Colors.
+            screen.default_fg = self.config.default_fg;
+            screen.default_bg = self.config.default_bg;
+            screen.cursor_color = self.config.cursor_color;
+            p.grid_pass.default_fg = self.config.default_fg;
+            p.grid_pass.default_bg = self.config.default_bg;
+            // Cursor.
+            screen.cursor_shape = mapCursorShape(self.config.cursor_shape, self.config.cursor_blink);
+            if (self.config.cursor_blink_ms != old_blink_ms) {
+                p.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
+            }
+            // Padding.
+            if (self.config.padding != old_pad) {
+                p.grid_pass.pad = self.config.padding;
+                p.cell_pass.pad = self.config.padding;
+                c.gtk_widget_queue_resize(p.widget());
+            }
+            // Rendering.
+            p.grid_pass.enable_ligatures = self.config.ligatures;
+            p.grid_pass.enable_bidi = self.config.bidi;
+            // Behavior.
+            screen.bracketed_paste = self.config.bracketed_paste;
+            screen.modify_other_keys = self.config.modify_other_keys;
+            screen.scrollback_capacity = self.config.scrollback;
+            // Repaint.
+            screen.dirty = true;
+            p.cell_pass.markAllDirty();
+            c.gtk_widget_queue_draw(p.widget());
+        }
+
+        // Font size needs the heavy atlas-rebuild path.
+        if (self.config.font_size != old_size) {
+            for (self.panes.items) |p| p.setFontSize(self.config.font_size);
+        }
+
+        // Persist.
+        self.persistConfig();
+    }
+
+    fn persistConfig(self: *Window) void {
+        const path = resolveConfigSavePath(self.allocator) catch return;
+        defer self.allocator.free(path);
+        self.config.save(path) catch |err| {
+            std.debug.print("sketerm: prefs persist failed: {s}\n", .{@errorName(err)});
+        };
+    }
+
     /// Close the focused pane. If it's the only pane in its tab,
     /// closes the tab. Otherwise the pane is removed from its
     /// parent GtkPaned and the sibling takes its place.
@@ -1137,6 +1209,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .prompt_next => self.jumpPromptOnFocused(.next),
         .pane_prev => self.cyclePane(.prev),
         .pane_next => self.cyclePane(.next),
+        .prefs_open => self.openPrefs(),
         else => {},
     }
 }
@@ -1451,4 +1524,31 @@ fn widgetIsAncestor(ancestor: *c.GtkWidget, w: *c.GtkWidget) bool {
         if (x == ancestor) return true;
     }
     return false;
+}
+
+fn prefsApplyCallback(win_ptr: *anyopaque, new_cfg: *const Config) void {
+    const win: *Window = @ptrCast(@alignCast(win_ptr));
+    win.applyConfigChange(new_cfg);
+}
+
+/// Map config (cursor_shape + cursor_blink) into the screen's
+/// blink/steady cursor variant.
+fn mapCursorShape(shape: @import("../config.zig").CursorShape, blink: bool) @import("../grid/screen.zig").Screen.CursorShape {
+    return switch (shape) {
+        .block => if (blink) .block_blink else .block_steady,
+        .underline => if (blink) .underline_blink else .underline_steady,
+        .bar => if (blink) .bar_blink else .bar_steady,
+    };
+}
+
+/// Path the prefs dialog persists to. Honours XDG; falls back to
+/// ~/.config/sketerm/config.conf. Caller frees.
+fn resolveConfigSavePath(allocator: std.mem.Allocator) ![]u8 {
+    if (std.posix.getenv("XDG_CONFIG_HOME")) |x| {
+        return std.fmt.allocPrint(allocator, "{s}/sketerm/config.conf", .{x});
+    }
+    if (std.posix.getenv("HOME")) |home| {
+        return std.fmt.allocPrint(allocator, "{s}/.config/sketerm/config.conf", .{home});
+    }
+    return error.NoConfigPath;
 }

@@ -49,6 +49,7 @@ pub const Action = enum {
     prompt_next,
     pane_next,
     pane_prev,
+    prefs_open,
 };
 
 pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allocator) !*Ctx {
@@ -276,6 +277,11 @@ fn onKeyPressed(
             },
             c.GDK_KEY_0, c.GDK_KEY_KP_0 => {
                 if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .font_reset);
+                return 1;
+            },
+            c.GDK_KEY_comma => {
+                // Ctrl+, — GNOME Preferences convention.
+                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .prefs_open);
                 return 1;
             },
             else => {},
