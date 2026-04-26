@@ -12,6 +12,15 @@ const std = @import("std");
 
 pub const CursorShape = enum { block, underline, bar };
 
+/// What happens when a pane's shell exits. `close` removes the
+/// pane (current behaviour). `restart` respawns the configured
+/// shell. `hold` keeps the pane open with an exit-status banner
+/// so users can see why a command died.
+pub const ExitAction = enum { close, restart, hold };
+
+/// AdwTabBar position relative to the window.
+pub const TabPosition = enum { top, bottom };
+
 pub const Config = struct {
     // Font
     font_path: ?[]const u8 = null,
@@ -25,6 +34,18 @@ pub const Config = struct {
     default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
     default_bg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 },
     cursor_color: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 },
+    /// When true, the cursor uses the foreground color and ignores
+    /// `cursor_color`. Matches xterm/Terminator default.
+    cursor_color_default: bool = true,
+    /// User-overridden ANSI 16 palette entries. null = "use the
+    /// built-in palette (or scheme presets)". Stored as RGB (no
+    /// alpha — palette colours are always opaque).
+    palette: ?[16][3]u8 = null,
+    /// Built-in scheme name (tango / linux / xterm / solarized_dark /
+    /// solarized_light / gruvbox_dark / gruvbox_light / nord /
+    /// dracula / monokai). Empty string = "no scheme; use defaults
+    /// or `palette` overrides".
+    scheme: []const u8 = "",
 
     // Cursor
     cursor_shape: CursorShape = .block,
@@ -36,15 +57,32 @@ pub const Config = struct {
     // Layout
     padding: f32 = 6.0,
     scrollback: u32 = 10000,
+    /// Snap view back to the bottom on any output, not just on
+    /// keystroke. Off by default — matches xterm; users who want
+    /// the gnome-terminal "auto-tail" behaviour flip this.
+    scroll_on_output: bool = false,
 
     // Shell + child env
     shell: ?[]const u8 = null,
     term_env: []const u8 = "xterm-256color",
     color_term_env: []const u8 = "truecolor",
+    /// Prepend `-` to argv[0] so the shell behaves as a login
+    /// shell (sources /etc/profile etc.). Off by default.
+    login_shell: bool = false,
+    /// What to do when a pane's shell exits.
+    exit_action: ExitAction = .close,
 
     // Behavior
     bracketed_paste: bool = true,
     modify_other_keys: u8 = 0, // 0=off, 1=basic, 2=full
+    /// Characters that count as part of a "word" for double-click
+    /// selection. Defaults to alphanumerics + a few common URL/path
+    /// punctuation characters. Anything OUTSIDE this set is treated
+    /// as a word boundary.
+    word_chars: []const u8 = "-_.,/?:@&=+%~",
+    /// Smart copy: when no selection is active, Ctrl+Shift+C
+    /// forwards as Ctrl+C (interrupt) instead of being a no-op.
+    smart_copy: bool = true,
 
     // Rendering
     ligatures: bool = true,
@@ -54,9 +92,17 @@ pub const Config = struct {
     /// If true, fg/bg follow AdwStyleManager dark/light. Set to
     /// false to honour `default_fg` / `default_bg` exactly.
     auto_theme: bool = true,
-    /// Bell behaviour: visual flash always; audible toggles the
-    /// system bell via gdk_display_beep.
+    /// Bell behaviour: visual flash, system beep, and / or marking
+    /// the AdwTabPage as needs-attention. Independent toggles.
     bell_audible: bool = false,
+    bell_visible: bool = true,
+    bell_urgent: bool = true,
+
+    // Window
+    /// Position of the AdwTabBar relative to the window content.
+    tab_position: TabPosition = .top,
+    /// Whether each AdwTabPage shows an X close button.
+    close_button_on_tab: bool = true,
 
     // Owned strings allocated from the parser arena. Not freed
     // individually — `arena.deinit()` reaps everything.
@@ -188,6 +234,34 @@ pub const Config = struct {
 
         // Bell.
         if (self.bell_audible) try w.writeAll("bell_audible = true\n");
+        if (!self.bell_visible) try w.writeAll("bell_visible = false\n");
+        if (!self.bell_urgent) try w.writeAll("bell_urgent = false\n");
+
+        // Behavioural extras.
+        if (self.scroll_on_output) try w.writeAll("scroll_on_output = true\n");
+        if (!self.smart_copy) try w.writeAll("smart_copy = false\n");
+        if (self.login_shell) try w.writeAll("login_shell = true\n");
+        if (!self.cursor_color_default) try w.writeAll("cursor_color_default = false\n");
+        if (!std.mem.eql(u8, self.word_chars, "-_.,/?:@&=+%~"))
+            try w.print("word_chars = {s}\n", .{self.word_chars});
+
+        // Window.
+        if (self.tab_position != .top) try w.print("tab_position = {s}\n", .{@tagName(self.tab_position)});
+        if (!self.close_button_on_tab) try w.writeAll("close_button_on_tab = false\n");
+
+        // Shell exit.
+        if (self.exit_action != .close) try w.print("exit_action = {s}\n", .{@tagName(self.exit_action)});
+
+        // Color scheme + palette.
+        if (self.scheme.len > 0) try w.print("scheme = {s}\n", .{self.scheme});
+        if (self.palette) |pal| {
+            try w.writeAll("palette = ");
+            for (pal, 0..) |rgb, i| {
+                if (i != 0) try w.writeAll(":");
+                try w.print("#{x:0>2}{x:0>2}{x:0>2}", .{ rgb[0], rgb[1], rgb[2] });
+            }
+            try w.writeAll("\n");
+        }
     }
 };
 
@@ -284,10 +358,57 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.auto_theme = try parseBool(value);
     } else if (std.mem.eql(u8, key, "bell_audible")) {
         cfg.bell_audible = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "bell_visible")) {
+        cfg.bell_visible = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "bell_urgent")) {
+        cfg.bell_urgent = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "scroll_on_output")) {
+        cfg.scroll_on_output = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "smart_copy")) {
+        cfg.smart_copy = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "login_shell")) {
+        cfg.login_shell = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "cursor_color_default")) {
+        cfg.cursor_color_default = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "close_button_on_tab")) {
+        cfg.close_button_on_tab = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "word_chars")) {
+        cfg.word_chars = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "scheme")) {
+        cfg.scheme = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "exit_action")) {
+        if (std.mem.eql(u8, value, "close")) cfg.exit_action = .close
+        else if (std.mem.eql(u8, value, "restart")) cfg.exit_action = .restart
+        else if (std.mem.eql(u8, value, "hold")) cfg.exit_action = .hold
+        else return error.BadExitAction;
+    } else if (std.mem.eql(u8, key, "tab_position")) {
+        if (std.mem.eql(u8, value, "top")) cfg.tab_position = .top
+        else if (std.mem.eql(u8, value, "bottom")) cfg.tab_position = .bottom
+        else return error.BadTabPosition;
+    } else if (std.mem.eql(u8, key, "palette")) {
+        cfg.palette = try parsePalette16(value);
     } else {
         // Unknown key — warn but don't abort.
         std.debug.print("sketerm: config: unknown key '{s}' (ignoring)\n", .{key});
     }
+}
+
+/// Parse `#RRGGBB:#RRGGBB:…:#RRGGBB` (16 entries, colon-separated).
+/// Matches Terminator's palette format.
+fn parsePalette16(s: []const u8) ![16][3]u8 {
+    var out: [16][3]u8 = undefined;
+    var it = std.mem.splitScalar(u8, s, ':');
+    var i: usize = 0;
+    while (it.next()) |tok| : (i += 1) {
+        if (i >= 16) return error.PaletteTooLong;
+        const t = std.mem.trim(u8, tok, &std.ascii.whitespace);
+        if (t.len != 7 or t[0] != '#') return error.BadPaletteEntry;
+        out[i][0] = try std.fmt.parseInt(u8, t[1..3], 16);
+        out[i][1] = try std.fmt.parseInt(u8, t[3..5], 16);
+        out[i][2] = try std.fmt.parseInt(u8, t[5..7], 16);
+    }
+    if (i != 16) return error.PaletteTooShort;
+    return out;
 }
 
 fn trim(s: []const u8) []const u8 {
@@ -450,6 +571,49 @@ test "config: serialise omits defaults" {
     try std.testing.expect(std.mem.startsWith(u8, out, "# sketerm config"));
     try std.testing.expect(std.mem.indexOf(u8, out, "font_size") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "ligatures") == null);
+}
+
+test "config: palette + scheme + new keys round-trip" {
+    var cfg = Config{};
+    cfg.scheme = "solarized_dark";
+    cfg.palette = .{
+        .{ 0x07, 0x36, 0x42 }, .{ 0xdc, 0x32, 0x2f }, .{ 0x85, 0x99, 0x00 }, .{ 0xb5, 0x89, 0x00 },
+        .{ 0x26, 0x8b, 0xd2 }, .{ 0xd3, 0x36, 0x82 }, .{ 0x2a, 0xa1, 0x98 }, .{ 0xee, 0xe8, 0xd5 },
+        .{ 0x00, 0x2b, 0x36 }, .{ 0xcb, 0x4b, 0x16 }, .{ 0x58, 0x6e, 0x75 }, .{ 0x65, 0x7b, 0x83 },
+        .{ 0x83, 0x94, 0x96 }, .{ 0x6c, 0x71, 0xc4 }, .{ 0x93, 0xa1, 0xa1 }, .{ 0xfd, 0xf6, 0xe3 },
+    };
+    cfg.scroll_on_output = true;
+    cfg.smart_copy = false;
+    cfg.login_shell = true;
+    cfg.cursor_color_default = false;
+    cfg.tab_position = .bottom;
+    cfg.close_button_on_tab = false;
+    cfg.exit_action = .hold;
+    cfg.bell_visible = false;
+    cfg.bell_urgent = false;
+    cfg.word_chars = "abc";
+
+    var buf: [2048]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+
+    var parsed = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("solarized_dark", parsed.scheme);
+    try std.testing.expect(parsed.palette != null);
+    try std.testing.expectEqual(@as(u8, 0xdc), parsed.palette.?[1][0]);
+    try std.testing.expectEqual(@as(u8, 0xfd), parsed.palette.?[15][0]);
+    try std.testing.expectEqual(true, parsed.scroll_on_output);
+    try std.testing.expectEqual(false, parsed.smart_copy);
+    try std.testing.expectEqual(true, parsed.login_shell);
+    try std.testing.expectEqual(false, parsed.cursor_color_default);
+    try std.testing.expectEqual(TabPosition.bottom, parsed.tab_position);
+    try std.testing.expectEqual(false, parsed.close_button_on_tab);
+    try std.testing.expectEqual(ExitAction.hold, parsed.exit_action);
+    try std.testing.expectEqual(false, parsed.bell_visible);
+    try std.testing.expectEqual(false, parsed.bell_urgent);
+    try std.testing.expectEqualStrings("abc", parsed.word_chars);
 }
 
 test "config: serialise round-trips through loadFromBytes" {
