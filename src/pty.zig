@@ -145,7 +145,12 @@ pub const Pty = struct {
         while (i < 30) : (i += 1) {
             const r = c.waitpid(self.child_pid, &status, c.WNOHANG);
             if (r == self.child_pid) return;
-            if (r < 0) return;
+            if (r < 0) {
+                // EINTR — try again. Other errors (ECHILD = no such
+                // child, EINVAL etc.) mean we can't reap; bail.
+                if (std.posix.errno(r) == .INTR) continue;
+                return;
+            }
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
         // Phase 2: SIGTERM, poll briefly.
@@ -154,12 +159,20 @@ pub const Pty = struct {
         while (i < 20) : (i += 1) {
             const r = c.waitpid(self.child_pid, &status, c.WNOHANG);
             if (r == self.child_pid) return;
-            if (r < 0) return;
+            if (r < 0) {
+                if (std.posix.errno(r) == .INTR) continue;
+                return;
+            }
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
-        // Phase 3: SIGKILL, blocking wait.
+        // Phase 3: SIGKILL, blocking wait. Loop on EINTR.
         _ = c.kill(self.child_pid, c.SIGKILL);
-        _ = c.waitpid(self.child_pid, &status, 0);
+        while (true) {
+            const r = c.waitpid(self.child_pid, &status, 0);
+            if (r == self.child_pid) return;
+            if (r < 0 and std.posix.errno(r) == .INTR) continue;
+            return;
+        }
     }
 
     pub fn writeAll(self: Pty, bytes: []const u8) usize {
