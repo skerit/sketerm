@@ -1003,6 +1003,18 @@ pub const Window = struct {
         }
         term.deinit();
         pane.deinit();
+
+        // Move focus to the first pane inside the surviving sibling
+        // subtree — without this, focus can land on the now-empty
+        // GtkPaned wrapper and keypresses go nowhere.
+        if (sibling) |sib| {
+            for (self.panes.items) |p| {
+                if (widgetIsAncestor(@ptrCast(sib), @ptrCast(p.widget()))) {
+                    _ = c.gtk_widget_grab_focus(p.widget());
+                    break;
+                }
+            }
+        }
     }
 
     /// Build a Layout snapshot of the current window state.
