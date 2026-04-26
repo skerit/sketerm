@@ -1040,3 +1040,14 @@ User-facing config additions:
   sequence; bench within noise but the path is structurally
   cleaner for long-param sequences.
 
+
+## UX polish tick
+
+- **Split inherits cwd** — when OSC 7 has reported a cwd on the
+  focused pane, splits spawn the new shell there. Falls back to
+  inherited (parent process) cwd when null. Common UX expectation
+  matching gnome-terminal / kitty / wezterm.
+- **Ctrl+I in search** — toggles the case-insensitive override.
+  Smart-case (lower-only → CI, uppercase → CS) is the default;
+  Ctrl+I forces explicit CI regardless of needle case.
+
