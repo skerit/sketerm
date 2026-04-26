@@ -70,6 +70,9 @@ pub fn open(
 
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &appearancePage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &colorsPage);
+    appendPage(@ptrCast(@alignCast(dialog)), ctx, &behaviorPage);
+    appendPage(@ptrCast(@alignCast(dialog)), ctx, &renderingPage);
+    appendPage(@ptrCast(@alignCast(dialog)), ctx, &windowPage);
 
     c.adw_dialog_present(@ptrCast(@alignCast(dialog)), @ptrCast(parent_window));
 }
@@ -664,5 +667,210 @@ fn schemeSelected(ctx: *Ctx, idx: c_uint) void {
 }
 
 fn applyOnly(ctx: *Ctx) void {
+    ctx.ev();
+}
+
+// ── Behavior page ──────────────────────────────────────────────
+
+fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
+    c.adw_preferences_page_set_title(page, "Behavior");
+    c.adw_preferences_page_set_icon_name(page, "preferences-system-symbolic");
+
+    // Shell — note: applies to NEW panes, not running shells.
+    const shell_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(shell_group)), "Shell (applies to new panes)");
+    addShellPathRow(@ptrCast(@alignCast(shell_group)), ctx);
+    addEntryRowOptionalString(@ptrCast(@alignCast(shell_group)), ctx, "TERM", "$TERM env in child", &ctx.cfg.term_env, termEnvChanged);
+    addEntryRowOptionalString(@ptrCast(@alignCast(shell_group)), ctx, "COLORTERM", "$COLORTERM env in child", &ctx.cfg.color_term_env, colorTermEnvChanged);
+    addSwitchRow(@ptrCast(@alignCast(shell_group)), ctx, "Login shell", "Prepend a `-` to argv[0] so the shell sources login profile.", &ctx.cfg.login_shell, applyOnly);
+    addExitActionRow(@ptrCast(@alignCast(shell_group)), ctx);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(shell_group)));
+
+    // Input.
+    const input_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(input_group)), "Input");
+    addSwitchRow(@ptrCast(@alignCast(input_group)), ctx, "Bracketed paste", "Wrap pasted text in DECSET 2004 markers.", &ctx.cfg.bracketed_paste, applyOnly);
+    addModifyOtherKeysRow(@ptrCast(@alignCast(input_group)), ctx);
+    addEntryRowString(@ptrCast(@alignCast(input_group)), ctx, "Word characters", "Chars considered part of a word for double-click selection.", &ctx.cfg.word_chars, wordCharsChanged);
+    addSwitchRow(@ptrCast(@alignCast(input_group)), ctx, "Smart copy", "Ctrl+Shift+C with no selection forwards Ctrl+C.", &ctx.cfg.smart_copy, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(input_group)));
+
+    // Scrollback.
+    const sb_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(sb_group)), "Scrollback");
+    addSpinRowU32(@ptrCast(@alignCast(sb_group)), ctx, "Lines", "Maximum scrollback lines retained per pane.", 100, 100000, &ctx.cfg.scrollback, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(sb_group)), ctx, "Scroll on output", "Snap view to bottom on any output, not just keystrokes.", &ctx.cfg.scroll_on_output, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(sb_group)));
+}
+
+const StringFieldCtx = struct {
+    parent: *Ctx,
+    field: *[]const u8,
+    on_change: *const fn (*Ctx) void,
+};
+
+fn addEntryRowString(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*:0]const u8, subtitle: [*:0]const u8, field: *[]const u8, on_change: *const fn (*Ctx) void) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
+    _ = subtitle; // AdwEntryRow doesn't support subtitle; the field's title carries semantics.
+    var z: [256:0]u8 = undefined;
+    const n = @min(field.*.len, z.len);
+    @memcpy(z[0..n], field.*[0..n]);
+    z[n] = 0;
+    c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
+    const sctx = ctx.allocator.create(StringFieldCtx) catch return;
+    sctx.* = .{ .parent = ctx, .field = field, .on_change = on_change };
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&entryStringChanged), @ptrCast(sctx), null, c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn entryStringChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    const sctx: *StringFieldCtx = @ptrCast(@alignCast(user.?));
+    const txt = c.gtk_editable_get_text(row);
+    if (txt == null) return;
+    const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+    const dup = sctx.parent.allocator.dupe(u8, slice) catch return;
+    sctx.field.* = dup;
+    sctx.on_change(sctx.parent);
+}
+
+fn addEntryRowOptionalString(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*:0]const u8, subtitle: [*:0]const u8, field: *[]const u8, on_change: *const fn (*Ctx) void) void {
+    addEntryRowString(group, ctx, title, subtitle, field, on_change);
+}
+
+fn addShellPathRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Shell");
+    if (ctx.cfg.shell) |s| {
+        var z: [256:0]u8 = undefined;
+        const n = @min(s.len, z.len);
+        @memcpy(z[0..n], s[0..n]);
+        z[n] = 0;
+        c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
+    }
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&shellEntryChanged), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn shellEntryChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const txt = c.gtk_editable_get_text(row);
+    if (txt == null) return;
+    const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+    if (slice.len == 0) {
+        ctx.cfg.shell = null;
+    } else {
+        const dup = ctx.allocator.dupe(u8, slice) catch return;
+        ctx.cfg.shell = dup;
+    }
+    ctx.ev();
+}
+
+fn termEnvChanged(ctx: *Ctx) void {
+    ctx.ev();
+}
+fn colorTermEnvChanged(ctx: *Ctx) void {
+    ctx.ev();
+}
+fn wordCharsChanged(ctx: *Ctx) void {
+    ctx.ev();
+}
+
+fn addModifyOtherKeysRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "Off", "Basic (xterm 1)", "Full (xterm 2)" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "modifyOtherKeys");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Send Ctrl/Alt + alphabetic keys as CSI u sequences.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), ctx.cfg.modify_other_keys);
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .parent = ctx, .on_change = modifyOtherKeysSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn modifyOtherKeysSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.modify_other_keys = @intCast(@min(idx, 2));
+    ctx.ev();
+}
+
+fn addExitActionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "Close pane", "Restart shell", "Hold (show exit status)" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "On shell exit");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    const initial: c_uint = switch (ctx.cfg.exit_action) {
+        .close => 0,
+        .restart => 1,
+        .hold => 2,
+    };
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), initial);
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .parent = ctx, .on_change = exitActionSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn exitActionSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.exit_action = switch (idx) {
+        0 => .close,
+        1 => .restart,
+        2 => .hold,
+        else => .close,
+    };
+    ctx.ev();
+}
+
+// ── Rendering page ─────────────────────────────────────────────
+
+fn renderingPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
+    c.adw_preferences_page_set_title(page, "Rendering");
+    c.adw_preferences_page_set_icon_name(page, "applications-graphics-symbolic");
+
+    const text_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(text_group)), "Text");
+    addSwitchRow(@ptrCast(@alignCast(text_group)), ctx, "Ligatures", "HarfBuzz shaping for programming-font ligatures (Fira Code, JetBrains Mono, …).", &ctx.cfg.ligatures, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(text_group)), ctx, "Bidi", "Hebrew / Arabic / Indic reorder via fribidi. Pure-ASCII rows skip this for free.", &ctx.cfg.bidi, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(text_group)));
+
+    const bell_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(bell_group)), "Bell");
+    addSwitchRow(@ptrCast(@alignCast(bell_group)), ctx, "Audible (system beep)", "Fire gdk_display_beep on BEL. Off by default.", &ctx.cfg.bell_audible, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(bell_group)), ctx, "Visible flash", "Briefly flash the affected pane on BEL.", &ctx.cfg.bell_visible, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(bell_group)), ctx, "Tab needs-attention", "Non-focused tabs get an attention indicator.", &ctx.cfg.bell_urgent, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(bell_group)));
+}
+
+// ── Window page ────────────────────────────────────────────────
+
+fn windowPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
+    c.adw_preferences_page_set_title(page, "Window");
+    c.adw_preferences_page_set_icon_name(page, "view-grid-symbolic");
+
+    const tabs_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(tabs_group)), "Tabs");
+    addTabPositionRow(@ptrCast(@alignCast(tabs_group)), ctx);
+    addSwitchRow(@ptrCast(@alignCast(tabs_group)), ctx, "Close button on tab", "Show the X close button on every tab title.", &ctx.cfg.close_button_on_tab, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(tabs_group)));
+}
+
+fn addTabPositionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "Top", "Bottom" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Position");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    const initial: c_uint = switch (ctx.cfg.tab_position) {
+        .top => 0,
+        .bottom => 1,
+    };
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), initial);
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .parent = ctx, .on_change = tabPositionSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn tabPositionSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.tab_position = if (idx == 1) .bottom else .top;
     ctx.ev();
 }
