@@ -130,6 +130,12 @@ pub const GridPass = struct {
 
     pub fn realize(self: *GridPass) !void {
         if (self.program != 0) return;
+        // Pre-grow the vertex buffer once so the first few frames
+        // don't repeatedly realloc as the overlay reaches steady state.
+        // 2048 vertices × ~52 B = ~100 KB — well within budget.
+        if (self.vbuf.capacity < 2048) {
+            try self.vbuf.ensureTotalCapacity(self.allocator, 2048);
+        }
         self.program = try gl.buildProgram(VERT_SRC, FRAG_SRC);
         self.u_screen_px = c.glGetUniformLocation(self.program, "u_screen_px");
         self.u_atlas = c.glGetUniformLocation(self.program, "u_atlas");
