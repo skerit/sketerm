@@ -623,7 +623,17 @@ pub const Window = struct {
         term.screen.bracketed_paste = self.config.bracketed_paste;
         term.screen.scroll_on_output = self.config.scroll_on_output;
         term.screen.word_chars = self.config.word_chars;
-        if (self.config.palette) |pal| {
+        // Resolve effective palette: explicit `palette` wins, else
+        // look up `scheme` if set, else leave defaults.
+        const eff_pal: ?[16][3]u8 = self.config.palette orelse blk: {
+            if (self.config.scheme.len > 0) {
+                if (@import("../grid/schemes.zig").lookup(self.config.scheme)) |sch| {
+                    break :blk sch.palette;
+                }
+            }
+            break :blk null;
+        };
+        if (eff_pal) |pal| {
             var i: usize = 0;
             while (i < 16) : (i += 1) {
                 term.screen.palette[i] = pal[i];
@@ -1010,11 +1020,18 @@ pub const Window = struct {
                 self.config.cursor_color;
             p.grid_pass.default_fg = self.config.default_fg;
             p.grid_pass.default_bg = self.config.default_bg;
-            // Palette (16 ANSI colours). When the user has set
-            // `palette` directly OR picked a scheme, the array is
-            // present; we push entries 0..15. Entries 16..255 keep
-            // their built-in 256-table values.
-            if (self.config.palette) |pal| {
+            // Palette (16 ANSI colours). Explicit `palette` wins;
+            // `scheme` alone resolves through the built-in table.
+            // Entries 16..255 keep their built-in 256-table values.
+            const eff_pal: ?[16][3]u8 = self.config.palette orelse blk: {
+                if (self.config.scheme.len > 0) {
+                    if (@import("../grid/schemes.zig").lookup(self.config.scheme)) |sch| {
+                        break :blk sch.palette;
+                    }
+                }
+                break :blk null;
+            };
+            if (eff_pal) |pal| {
                 var i: usize = 0;
                 while (i < 16) : (i += 1) {
                     screen.palette[i] = pal[i];
