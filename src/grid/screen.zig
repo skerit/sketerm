@@ -51,6 +51,12 @@ pub const Screen = struct {
     /// selection. Default is sensible for paths + URLs. Set from
     /// Config.word_chars at pane spawn / applyConfigChange.
     word_chars: []const u8 = "-_.,/?:@&=+%~",
+    /// Set by onChildEof when the PTY child has exited. Pane.onTick
+    /// reads this on the next frame and acts per Window.exit_action,
+    /// then clears the flag (so we don't re-fire). Stays false on
+    /// alt-screen swaps.
+    child_exited: bool = false,
+    child_exit_status: i32 = 0,
 
     /// Cursor position, 0-indexed.
     row: u16 = 0,
@@ -1697,17 +1703,20 @@ pub const Screen = struct {
     }
 
     fn onChildEof(self: *Screen, status: i32) void {
-        // Write a status message at the cursor position. Hold-on-exit
-        // = true (per plan) — pane stays open until user closes it.
+        // Always print the status banner. Pane.onTick reads
+        // `child_exited` next frame and acts per Window.exit_action
+        // (close / restart / hold). Doing it on the next frame
+        // avoids tearing down `self` from inside its own apply().
         var msg_buf: [64]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "[process exited with status {d}]", .{status}) catch return;
-        // CR + LF first to start a new line.
         self.execute('\r');
         self.execute('\n');
         for (msg) |b| self.printByte(b);
         self.execute('\r');
         self.execute('\n');
         self.cursor_visible = false;
+        self.child_exited = true;
+        self.child_exit_status = status;
     }
 
     fn onOsc(self: *Screen, bytes: []const u8) void {

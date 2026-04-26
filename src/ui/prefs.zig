@@ -850,7 +850,10 @@ fn windowPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     const tabs_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(tabs_group)), "Tabs");
     addTabPositionRow(@ptrCast(@alignCast(tabs_group)), ctx);
-    addSwitchRow(@ptrCast(@alignCast(tabs_group)), ctx, "Close button on tab", "Show the X close button on every tab title.", &ctx.cfg.close_button_on_tab, applyOnly);
+    // close_button_on_tab is in the schema but not in the UI: AdwTabView
+    // doesn't expose a global close-button toggle and per-page tweaks
+    // would need to walk every page on every change. Revisit when
+    // libadwaita gains a property for it.
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(tabs_group)));
 }
 

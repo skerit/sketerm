@@ -429,6 +429,8 @@ pub const Window = struct {
                 pane.win_on_notification = onTermNotification;
                 pane.win_bell_ctx = @ptrCast(self);
                 pane.win_on_bell = onTermBell;
+                pane.win_child_ctx = @ptrCast(self);
+                pane.win_on_child_exit = onTermChildExit;
                 pane.font_size = p.font_size orelse self.config.font_size;
                 pane.font_path = self.config.font_path;
                 pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
@@ -512,6 +514,8 @@ pub const Window = struct {
         pane.win_on_notification = onTermNotification;
         pane.win_bell_ctx = @ptrCast(self);
         pane.win_on_bell = onTermBell;
+        pane.win_child_ctx = @ptrCast(self);
+        pane.win_on_child_exit = onTermChildExit;
         // Title forwarding intentionally null — tab titles are sticky.
 
         // Wrap pane.widget() in a Box so we can swap it for a Paned
@@ -595,6 +599,8 @@ pub const Window = struct {
         pane.win_on_notification = onTermNotification;
         pane.win_bell_ctx = @ptrCast(self);
         pane.win_on_bell = onTermBell;
+        pane.win_child_ctx = @ptrCast(self);
+        pane.win_on_child_exit = onTermChildExit;
         // Push config-derived fields into the pane before realize.
         pane.font_size = self.config.font_size;
         pane.font_path = self.config.font_path;
@@ -1069,6 +1075,37 @@ pub const Window = struct {
     /// Close the focused pane. If it's the only pane in its tab,
     /// closes the tab. Otherwise the pane is removed from its
     /// parent GtkPaned and the sibling takes its place.
+    /// Close a specific pane (used by exit_action=close). If the
+    /// pane is the only one in its tab, closes the whole tab.
+    pub fn closePane(self: *Window, target: *Pane) void {
+        const w = target.widget();
+        const parent = c.gtk_widget_get_parent(w) orelse return;
+        const is_paned = c.g_type_check_instance_is_a(
+            @ptrCast(@alignCast(parent)),
+            c.gtk_paned_get_type(),
+        ) != 0;
+        if (!is_paned) {
+            // Last pane in its tab — close the tab. Find the AdwTabPage.
+            const n = c.adw_tab_view_get_n_pages(self.tab_view);
+            var i: c_int = 0;
+            while (i < n) : (i += 1) {
+                const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
+                if (page == null) continue;
+                const child = c.adw_tab_page_get_child(page);
+                if (child == null) continue;
+                if (widgetIsAncestor(@ptrCast(child), w)) {
+                    _ = c.adw_tab_view_close_page(self.tab_view, page);
+                    return;
+                }
+            }
+            return;
+        }
+        // Re-use closeFocusedPane's path by temporarily focusing the
+        // target then calling it. Simpler than duplicating.
+        _ = c.gtk_widget_grab_focus(w);
+        self.closeFocusedPane();
+    }
+
     pub fn closeFocusedPane(self: *Window) void {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
         var found_idx: ?usize = null;
@@ -1447,6 +1484,26 @@ fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
     defer self.allocator.free(cstr);
     @memcpy(cstr, text);
     c.gdk_clipboard_set_text(clip, cstr.ptr);
+}
+
+fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {
+    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    _ = status;
+    switch (self.config.exit_action) {
+        .close => self.closePane(pane),
+        .restart => {
+            // Spawn a fresh shell in a new pane and replace the
+            // exited one. v1 implementation: just close the dead
+            // pane and spawn a new tab. Truly in-place restart
+            // would need PTY-level surgery in Terminal.
+            self.closePane(pane);
+            self.newShellTab(null) catch {};
+        },
+        .hold => {
+            // Already showed the "[process exited]" banner; do
+            // nothing further. User can close the pane manually.
+        },
+    }
 }
 
 fn onTermBell(ctx: ?*anyopaque, pane: *Pane) void {

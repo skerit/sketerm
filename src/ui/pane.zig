@@ -58,7 +58,11 @@ pub const Pane = struct {
     win_on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
     /// Forward BEL events for tab-bar attention.
     win_bell_ctx: ?*anyopaque = null,
+    win_child_ctx: ?*anyopaque = null,
     win_on_bell: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
+    /// Fired exactly once when the PTY child exits. Window decides
+    /// what to do (close pane / restart shell / hold).
+    win_on_child_exit: ?*const fn (ctx: ?*anyopaque, pane: *Pane, status: i32) void = null,
     /// Cursor blink timing.
     last_blink_us: i64 = 0,
     /// Last cursor (row, col) reported to the IM context. -1 = never
@@ -614,11 +618,20 @@ fn onPointerShapeEvent(ctx: ?*anyopaque, name: []const u8) void {
 
 fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Pane = @ptrCast(@alignCast(user.?));
+    const screen = self.terminal.screen;
+
+    // PTY child exited — fire the once-per-exit callback so Window
+    // can act per exit_action. Clear flag immediately so subsequent
+    // ticks don't re-fire (Window may close the pane mid-call).
+    if (screen.child_exited) {
+        screen.child_exited = false;
+        if (self.win_on_child_exit) |f| f(self.win_child_ctx, self, screen.child_exit_status);
+        return 1; // pane may be invalid now; bail
+    }
 
     // Cursor blink — toggle every 500ms for blinking shapes, but
     // only on the focused pane. Unfocused panes always show a static
     // (hollow) cursor and don't waste redraws toggling phase.
-    const screen = self.terminal.screen;
     const now = std.time.microTimestamp();
     if (self.last_blink_us == 0) self.last_blink_us = now;
     const focused = c.gtk_widget_has_focus(@ptrCast(self.area)) != 0;
