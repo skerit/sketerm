@@ -15,6 +15,7 @@ const App = struct {
     no_save: bool = false,
     debug_events: bool = false,
     debug_images: bool = false,
+    config_path: ?[]const u8 = null,
 };
 
 const HELP_TEXT =
@@ -26,6 +27,7 @@ const HELP_TEXT =
     \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json
     \\  --layout <path>       Load tabs from a layout file (.json or .layout)
     \\  --no-save             Don't write last.json on exit
+    \\  --config <path>       Load config from <path> instead of XDG default
     \\  --debug-events        Print parser events to stderr
     \\  --debug-images        Print image upload + draw diagnostics to stderr
     \\  --help                Show this message
@@ -103,6 +105,9 @@ pub fn main() u8 {
             g_app.debug_events = true;
         } else if (std.mem.eql(u8, a, "--debug-images")) {
             g_app.debug_images = true;
+        } else if (std.mem.eql(u8, a, "--config") and i + 1 < argv.len) {
+            i += 1;
+            g_app.config_path = argv[i];
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print("{s}", .{HELP_TEXT});
             return 0;
@@ -159,7 +164,14 @@ fn onSignalQuit(user: ?*anyopaque) callconv(.c) c.gboolean {
 }
 
 fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
-    const window = Window.init(g_app.allocator, app) catch |err| {
+    // Honour --config path if provided, otherwise let Window.init use
+    // the default XDG-search loader.
+    const Config = @import("config.zig").Config;
+    const cfg_override: ?Config = if (g_app.config_path) |p|
+        Config.loadWithOverride(g_app.allocator, p)
+    else
+        null;
+    const window = Window.initWithConfig(g_app.allocator, app, cfg_override) catch |err| {
         std.debug.print("sketerm: window init failed: {s}\n", .{@errorName(err)});
         return;
     };

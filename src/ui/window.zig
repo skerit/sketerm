@@ -35,6 +35,14 @@ pub const Window = struct {
     search_case_button: ?*c.GtkWidget = null,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
+        return initWithConfig(allocator, app, null);
+    }
+
+    pub fn initWithConfig(
+        allocator: std.mem.Allocator,
+        app: ?*c.GtkApplication,
+        config_override: ?Config,
+    ) !*Window {
         const self = try allocator.create(Window);
         errdefer allocator.destroy(self);
 
@@ -110,7 +118,7 @@ pub const Window = struct {
             .app_window = app_window,
             .tab_view = @ptrCast(tab_view_w),
             .allocator = allocator,
-            .config = Config.load(allocator),
+            .config = if (config_override) |co| co else Config.load(allocator),
             .search_bar = search_bar,
             .search_entry = search_entry,
             .search_label = search_label,

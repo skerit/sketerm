@@ -72,8 +72,18 @@ pub const Config = struct {
     /// Env overrides (SKETERM_FONT, SKETERM_SCROLLBACK) win over the
     /// file values — explicit invocation beats persistent config.
     pub fn load(allocator: std.mem.Allocator) Config {
+        return loadWithOverride(allocator, null);
+    }
+
+    /// Load with an optional explicit path that overrides the default
+    /// XDG / ~/.config search. Used by --config <path>.
+    pub fn loadWithOverride(allocator: std.mem.Allocator, override_path: ?[]const u8) Config {
         var cfg = Config{};
-        if (resolveConfigPath(allocator)) |path| {
+        const resolved: ?[]u8 = if (override_path) |p|
+            allocator.dupe(u8, p) catch null
+        else
+            resolveConfigPath(allocator);
+        if (resolved) |path| {
             defer allocator.free(path);
             if (std.fs.openFileAbsolute(path, .{})) |file| {
                 defer file.close();
@@ -87,7 +97,11 @@ pub const Config = struct {
                         cfg = Config{};
                     };
                 } else |_| {}
-            } else |_| {}
+            } else |_| {
+                if (override_path != null) {
+                    std.debug.print("sketerm: --config path {s} not readable, using defaults\n", .{path});
+                }
+            }
         }
 
         // Env overrides — highest priority.
