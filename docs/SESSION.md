@@ -1499,3 +1499,89 @@ Mouse selection / paste: paste DOES broadcast (matches Terminator).
 Mouse position events stay per-pane (they're meaningless across
 panes; coordinates differ).
 
+### F — Profiles (MVP shipped)
+
+`Profile` struct (per-pane subset of Config: shell, font_path,
+font_size, scheme, palette, term_env, color_term_env, scrollback,
+login_shell). `Config.profiles: ArrayList(Profile)` parsed from
+`[profile.<name>]` INI sections. `default_profile` selects the
+profile applied to the very first spawn. Round-trip-tested.
+
+Spawn paths: `spawnShellPaneOpts(cwd, profile_name)` resolves
+each effective field via "profile wins → config falls back".
+Splits inherit the focused pane's profile. `Pane.active_profile`
+records which profile spawned the pane.
+
+`Window.findProfile(name)` returns `?*const Profile`. The flat
+parser dispatches inside-section keys to `applyProfileKv` (smaller
+key set than the global applyKv). Unknown sections + unknown keys
+log warnings; unknown sections fall through (don't strip user
+data on round-trip).
+
+Deferred for v1.1: prefs Profiles editor page; right-click "as
+profile…" submenus. Workaround: edit config.conf directly.
+
+### H — SIMD UTF-8 batch decoder (shipped as primitive)
+
+`Decoder.feedBatch(bytes, out)` — `@Vector(16, u8)` ASCII fast-path
+with 16-cp bulk write per chunk; per-byte fallback for multi-byte
+sequences and partial sequences at run-end. 4 unit tests + a 32-
+seed differential fuzzer comparing output vs the per-byte feed
+path on random byte streams.
+
+Honest scope note: the existing `print_run` apply path in
+screen.zig is already heavily tiered (SIMD scan → fastAsciiSlice →
+lookahead-based per-codepoint decode). `feedBatch` is exposed as
+a primitive but doesn't get plumbed into the hot path because the
+existing tiers already amortize. Useful for any future "bulk
+decode arbitrary utf8 → u32 stream" caller.
+
+### I — Persistent-mapped VBO (plumbing, off by default)
+
+cell_pass: `glBufferStorage` + `glMapBufferRange` with
+`MAP_PERSISTENT|MAP_COHERENT|MAP_WRITE` flags + per-frame
+`glFenceSync`. Buffer regrow path recreates the VBO entirely
+(BufferStorage is one-shot immutable). Legacy
+`glBufferData`/`glBufferSubData` path preserved.
+
+Probe defaults to `persistent_supported = 0`: smoke-cell SIGSEGV'd
+when the EXT path was called on the NVIDIA-via-zink ES context —
+likely needs `glBufferStorageEXT` (different symbol resolution)
+on ES. Plumbing is in place; flipping the constant to 1 activates
+the new path on platforms where the EXT_buffer_storage path is
+known good. Documented as a future driver-matrix sweep.
+
+### J — Render thread (analysis, deferred)
+
+`docs/render-thread-analysis.md`: detailed cost / benefit. The
+plan's "two snapshots" list is incomplete — actual interaction
+surface includes 30 Line mutation sites needing generation bumps,
+~20 fields of render config to atomically capture per frame, GL
+context not shared with workers (atlas glyph upload deferral),
+mid-build mutation retry policy, and frame-clock coordination.
+Total: 9-13 days for a microsecond-scale win on hardware that
+isn't CPU-bound. Three lower-cost alternatives flagged.
+
+### K — EGL bypass (research spike, deferred)
+
+`docs/egl-bypass-spike.md`: 2-3 weeks of focused work to bypass
+GSK via wl_subsurface for marginal latency win on this hardware.
+Architecture cost dominates (subsurface tracking through every
+GtkPaned reparent, input routing rewrite, per-driver matrix).
+Recommendation: defer until a slow-hardware user reports
+measurable input latency.
+
+## Final state — plan-v3 push
+
+11 task IDs (#19–#30) tracked. All resolved:
+
+✅ A confirm-on-close · ✅ C transparency ·✅ B URL auto-link
+✅ D quake mode · ✅ E custom keybindings · ✅ F profiles MVP
+✅ G broadcast typing · ✅ H SIMD UTF-8 · ✅ I persistent VBO plumbing
+✅ J render thread (deferred + documented)
+✅ K EGL bypass (deferred + documented)
+
+Total: ~25 commits, ~2200 LoC added. Cron `5c32eb79` (7,37 * * * *)
+will keep firing for 7 days; if more work surfaces it'll pick up
+automatically.
+
