@@ -152,6 +152,15 @@ pub const Config = struct {
     /// the original colour and only changes weight.
     bold_is_bright: bool = true,
 
+    // Background opacity (Wayland with compositor support).
+    /// Window background opacity. 1.0 = fully opaque (default).
+    /// 0.0 = fully transparent. Multiplied into default_bg.a so the
+    /// glClearColor + cell_pass bg quads emit non-opaque alpha. The
+    /// compositor must support per-window alpha (KWin / Mutter do).
+    /// Blur (KWin's org_kde_kwin_blur protocol) is NOT reachable from
+    /// GTK4 — set blur via your compositor's window rules.
+    background_opacity: f32 = 1.0,
+
     // Inactive pane dimming (Terminator-style: multiply RGB channels)
     /// Multiplier applied to foreground colours of unfocused panes.
     /// 1.0 = no dim; 0.0 = fully black. Terminator default is 0.8 —
@@ -343,6 +352,10 @@ pub const Config = struct {
         if (!self.allow_bold) try w.writeAll("allow_bold = false\n");
         if (!self.bold_is_bright) try w.writeAll("bold_is_bright = false\n");
 
+        // Background opacity.
+        if (self.background_opacity != 1.0)
+            try w.print("background_opacity = {d:.2}\n", .{self.background_opacity});
+
         // Inactive pane dimming.
         if (self.inactive_fg_dim != 0.8)
             try w.print("inactive_fg_dim = {d:.2}\n", .{self.inactive_fg_dim});
@@ -529,6 +542,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.allow_bold = try parseBool(value);
     } else if (std.mem.eql(u8, key, "bold_is_bright")) {
         cfg.bold_is_bright = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "background_opacity")) {
+        cfg.background_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "inactive_fg_dim")) {
         cfg.inactive_fg_dim = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "inactive_bg_dim")) {

@@ -247,6 +247,19 @@ pub const Window = struct {
         // populates the colours.
         self.refreshTitlebarCss();
 
+        // After the window is realized we have a GdkSurface and can
+        // tell the compositor not to assume our content is opaque.
+        // Without this, blending behind transparent areas may not
+        // happen even if our framebuffer alpha is < 1.0.
+        _ = c.g_signal_connect_data(
+            app_window,
+            "realize",
+            @ptrCast(&onWindowRealized),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+
         return self;
     }
 
@@ -972,23 +985,28 @@ pub const Window = struct {
     /// Derive the effective default fg/bg. When auto_theme is on we
     /// follow AdwStyleManager's dark/light state so sketerm matches
     /// the system appearance. Otherwise honour the explicit config.
+    /// `background_opacity` is applied to bg.a after theme resolution
+    /// so transparency works under both auto and manual themes.
     fn resolveDefaultColors(self: *const Window) ColorPair {
-        if (!self.config.auto_theme) {
-            return .{ .fg = self.config.default_fg, .bg = self.config.default_bg };
-        }
-        const sm = c.adw_style_manager_get_default();
-        const dark = c.adw_style_manager_get_dark(sm) != 0;
-        if (dark) {
-            return .{
-                .fg = .{ 0.92, 0.92, 0.92, 1.0 },
-                .bg = .{ 0.10, 0.10, 0.10, 1.0 },
-            };
-        } else {
-            return .{
-                .fg = .{ 0.10, 0.10, 0.10, 1.0 },
-                .bg = .{ 0.97, 0.97, 0.97, 1.0 },
-            };
-        }
+        var pair: ColorPair = if (!self.config.auto_theme) blk: {
+            break :blk .{ .fg = self.config.default_fg, .bg = self.config.default_bg };
+        } else blk: {
+            const sm = c.adw_style_manager_get_default();
+            const dark = c.adw_style_manager_get_dark(sm) != 0;
+            if (dark) {
+                break :blk .{
+                    .fg = .{ 0.92, 0.92, 0.92, 1.0 },
+                    .bg = .{ 0.10, 0.10, 0.10, 1.0 },
+                };
+            } else {
+                break :blk .{
+                    .fg = .{ 0.10, 0.10, 0.10, 1.0 },
+                    .bg = .{ 0.97, 0.97, 0.97, 1.0 },
+                };
+            }
+        };
+        pair.bg[3] *= self.config.background_opacity;
+        return pair;
     }
 
     const PromptDir = enum { prev, next };
@@ -1079,19 +1097,24 @@ pub const Window = struct {
         if (self.config.scheme.len > 0) self.config.scheme = arena.dupe(u8, self.config.scheme) catch self.config.scheme;
 
         // Push into every pane.
+        const eff = self.resolveDefaultColors();
         for (self.panes.items) |p| {
             const screen = p.terminal.screen;
-            // Colors.
-            screen.default_fg = self.config.default_fg;
-            screen.default_bg = self.config.default_bg;
+            // Colors. resolveDefaultColors applies auto-theme +
+            // background_opacity so panes get the actual rendering
+            // values, not the raw config struct.
+            screen.default_fg = eff.fg;
+            screen.default_bg = eff.bg;
             // Renderer convention: alpha=0 means "use fg colour". We
             // map cursor_color_default → that sentinel.
             screen.cursor_color = if (self.config.cursor_color_default)
                 .{ 0, 0, 0, 0 }
             else
                 self.config.cursor_color;
-            p.grid_pass.default_fg = self.config.default_fg;
-            p.grid_pass.default_bg = self.config.default_bg;
+            p.grid_pass.default_fg = eff.fg;
+            p.grid_pass.default_bg = eff.bg;
+            p.cell_pass.default_fg = eff.fg;
+            p.cell_pass.default_bg = eff.bg;
             // Palette (16 ANSI colours). Explicit `palette` wins;
             // `scheme` alone resolves through the built-in table.
             // Entries 16..255 keep their built-in 256-table values.
@@ -1175,6 +1198,7 @@ pub const Window = struct {
         // Window-level flags.
         self.search_force_cs = self.config.search_case_sensitive;
         self.setAlwaysOnTop(self.config.always_on_top);
+        self.refreshOpaqueRegion();
 
         // Persist.
         self.persistConfig();
@@ -1201,6 +1225,26 @@ pub const Window = struct {
             }
         }
         return c.adw_tab_view_append(self.tab_view, child).?;
+    }
+
+    /// Tell the compositor that our content is no longer opaque when
+    /// background_opacity < 1.0. Only takes effect under Wayland with
+    /// a compositor that honours surface alpha (KWin / Mutter do).
+    /// X11 ignores opaque regions silently.
+    ///
+    /// Caveat: once we override the region, GTK's auto-tracking is
+    /// permanently bypassed for this surface. Live-toggling back to
+    /// 1.0 won't reinstate compositor optimisations until the window
+    /// is recreated. We document this and accept it.
+    pub fn refreshOpaqueRegion(self: *Window) void {
+        if (self.config.background_opacity >= 0.999) return;
+        const native = c.gtk_widget_get_native(self.app_window);
+        if (native == null) return;
+        const surface = c.gtk_native_get_surface(@ptrCast(@alignCast(native)));
+        if (surface == null) return;
+        // NULL region → "nothing in this surface is opaque" → the
+        // compositor blends every pixel against what's behind us.
+        c.gdk_surface_set_opaque_region(surface, null);
     }
 
     /// (Re)build the per-pane titlebar CSS so the four colour classes
@@ -1807,6 +1851,16 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
             return;
         }
     }
+}
+
+/// Called once after the toplevel realizes. Tell the compositor to
+/// blend everything behind us (no opaque hint) when background_opacity
+/// < 1.0, otherwise we restore an opaque region matching the window
+/// for compositor efficiency.
+fn onWindowRealized(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(user.?));
+    // Re-applied any time the opacity changes — see refreshOpaqueRegion.
+    self.refreshOpaqueRegion();
 }
 
 /// Count panes whose widget tree lives inside `root`. Used by the

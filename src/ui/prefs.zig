@@ -139,6 +139,13 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSpinRowF32Step(@ptrCast(@alignCast(dim_group)), ctx, "Foreground dim", "Multiplier for text + decorations.", 0.0, 1.0, 0.05, 2, &ctx.cfg.inactive_fg_dim, applyOnly);
     addSpinRowF32Step(@ptrCast(@alignCast(dim_group)), ctx, "Background dim", "Multiplier for cell backgrounds.", 0.0, 1.0, 0.05, 2, &ctx.cfg.inactive_bg_dim, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(dim_group)));
+
+    // Background opacity (Wayland transparency).
+    const bg_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(bg_group)), "Background");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(bg_group)), "Window-level transparency. Wayland with compositor support only. Once toggled below 1.0, returning to 1.0 may require a window restart.");
+    addSpinRowF32Step(@ptrCast(@alignCast(bg_group)), ctx, "Opacity", "1.0 = opaque; 0.0 = fully transparent.", 0.0, 1.0, 0.05, 2, &ctx.cfg.background_opacity, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(bg_group)));
 }
 
 // ── Generic row helpers ─────────────────────────────────────────
