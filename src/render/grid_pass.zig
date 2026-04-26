@@ -89,6 +89,10 @@ pub const GridPass = struct {
     canvas_h: f32 = 0,
     enable_ligatures: bool = true,
     enable_bidi: bool = true,
+    /// Honour the bold attribute at all (font weight + bright-color).
+    allow_bold: bool = true,
+    /// When bold + allow_bold, lift palette 0..7 to 8..15.
+    bold_is_bright: bool = true,
     allocator: std.mem.Allocator,
     /// Scratch buffers for bidi resolution + visual ordering. Grow
     /// to cols on first use; subsequent frames reuse them. Avoids
@@ -509,9 +513,10 @@ pub const GridPass = struct {
             }
             const style = pool.get(cell.style_ref);
             // Reverse: draw fg using bg color (and bg using fg).
-            // Bold lifts palette 0..7 → 8..15.
+            // Bold lifts palette 0..7 → 8..15 (xterm convention) when
+            // allow_bold && bold_is_bright.
             var fg_color = if (style.attrs.reverse) style.bg else style.fg;
-            if (style.attrs.bold) {
+            if (style.attrs.bold and self.allow_bold and self.bold_is_bright) {
                 if (fg_color == .palette and fg_color.palette < 8) {
                     fg_color = .{ .palette = fg_color.palette + 8 };
                 }
@@ -572,7 +577,7 @@ pub const GridPass = struct {
             if ((cell.flags & 0b0000_0010) != 0 or cell.rune == 0 or cell.rune == ' ') continue;
             const style = pool.get(cell.style_ref);
             var fg_color = if (style.attrs.reverse) style.bg else style.fg;
-            if (style.attrs.bold) {
+            if (style.attrs.bold and self.allow_bold and self.bold_is_bright) {
                 if (fg_color == .palette and fg_color.palette < 8) {
                     fg_color = .{ .palette = fg_color.palette + 8 };
                 }

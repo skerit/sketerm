@@ -42,6 +42,10 @@ pub const Window = struct {
     /// (lower-only needle implies CI; mixed-case implies CS).
     search_case_insensitive: bool = false,
     search_case_button: ?*c.GtkWidget = null,
+    /// When set, skip the smart-case heuristic — every search is
+    /// case-sensitive by default. Mirrors Config.search_case_sensitive.
+    /// Ctrl+I still toggles per-search override.
+    search_force_cs: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         return initWithConfig(allocator, app, null);
@@ -204,6 +208,10 @@ pub const Window = struct {
             self.setTabPosition(.bottom);
         }
 
+        // Persisted search default + always-on-top advisory.
+        self.search_force_cs = self.config.search_case_sensitive;
+        self.setAlwaysOnTop(self.config.always_on_top);
+
         return self;
     }
 
@@ -259,10 +267,11 @@ pub const Window = struct {
         self.search_idx = 0;
         if (query.len > 0) {
             // Smart-case: lowercase-only needle implies CI; any
-            // uppercase letter forces CS. The explicit toggle wins
-            // either way.
+            // uppercase letter forces CS. The explicit per-search
+            // toggle (Ctrl+I) and the config-level `search_case_sensitive`
+            // both override.
             var ci = self.search_case_insensitive;
-            if (!ci) {
+            if (!ci and !self.search_force_cs) {
                 var has_upper = false;
                 for (query) |b| {
                     if (b >= 'A' and b <= 'Z') {
@@ -545,12 +554,26 @@ pub const Window = struct {
             ictx.shortcut_sink = onShortcut;
             ictx.shortcut_ctx = @ptrCast(self);
             ictx.smart_copy = self.config.smart_copy;
+            ictx.clear_select_on_copy = self.config.clear_select_on_copy;
+            ictx.mouse_autohide = self.config.mouse_autohide;
         }
         pane.menu_sink = onMenuAction;
         pane.menu_sink_ctx = @ptrCast(self);
         pane.image_store.debug = self.debug_images;
         pane.image_pass.debug = self.debug_images;
         pane.terminal.screen.kitty_images.debug = self.debug_images;
+        // Mouse / link flags from config.
+        pane.copy_on_selection = self.config.copy_on_selection;
+        pane.clear_select_on_copy = self.config.clear_select_on_copy;
+        pane.disable_mouse_paste = self.config.disable_mouse_paste;
+        pane.disable_mousewheel_zoom = self.config.disable_mousewheel_zoom;
+        pane.link_single_click = self.config.link_single_click;
+        pane.mouse_autohide = self.config.mouse_autohide;
+        // Renderer bold flags.
+        pane.grid_pass.allow_bold = self.config.allow_bold;
+        pane.grid_pass.bold_is_bright = self.config.bold_is_bright;
+        pane.cell_pass.allow_bold = self.config.allow_bold;
+        pane.cell_pass.bold_is_bright = self.config.bold_is_bright;
         return pane;
     }
 
@@ -1057,13 +1080,28 @@ pub const Window = struct {
             // Rendering.
             p.grid_pass.enable_ligatures = self.config.ligatures;
             p.grid_pass.enable_bidi = self.config.bidi;
+            p.grid_pass.allow_bold = self.config.allow_bold;
+            p.grid_pass.bold_is_bright = self.config.bold_is_bright;
+            p.cell_pass.allow_bold = self.config.allow_bold;
+            p.cell_pass.bold_is_bright = self.config.bold_is_bright;
             // Behavior.
             screen.bracketed_paste = self.config.bracketed_paste;
             screen.modify_other_keys = self.config.modify_other_keys;
             screen.scrollback_capacity = self.config.scrollback;
             screen.scroll_on_output = self.config.scroll_on_output;
             screen.word_chars = self.config.word_chars;
-            if (p.input_ctx) |ictx| ictx.smart_copy = self.config.smart_copy;
+            if (p.input_ctx) |ictx| {
+                ictx.smart_copy = self.config.smart_copy;
+                ictx.clear_select_on_copy = self.config.clear_select_on_copy;
+                ictx.mouse_autohide = self.config.mouse_autohide;
+            }
+            // Mouse / link / autohide flags on the Pane itself.
+            p.copy_on_selection = self.config.copy_on_selection;
+            p.clear_select_on_copy = self.config.clear_select_on_copy;
+            p.disable_mouse_paste = self.config.disable_mouse_paste;
+            p.disable_mousewheel_zoom = self.config.disable_mousewheel_zoom;
+            p.link_single_click = self.config.link_single_click;
+            p.mouse_autohide = self.config.mouse_autohide;
             // Repaint.
             screen.dirty = true;
             p.cell_pass.markAllDirty();
@@ -1079,6 +1117,10 @@ pub const Window = struct {
         if (self.config.tab_position != old_tab_pos) {
             self.setTabPosition(self.config.tab_position);
         }
+
+        // Window-level flags.
+        self.search_force_cs = self.config.search_case_sensitive;
+        self.setAlwaysOnTop(self.config.always_on_top);
 
         // Persist.
         self.persistConfig();

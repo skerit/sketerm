@@ -230,6 +230,12 @@ pub const CellPass = struct {
     enable_ligatures: bool = true,
     /// Bidi resolution for non-ASCII rows.
     enable_bidi: bool = true,
+    /// Honour the bold attribute at all (font weight + bright-color
+    /// promotion). Off renders bold cells the same as normal.
+    allow_bold: bool = true,
+    /// When bold + allow_bold, also lift palette 0..7 to 8..15
+    /// (xterm convention). Off keeps the original colour.
+    bold_is_bright: bool = true,
 
     /// Atlas page generation per layer — when a layer is evicted by
     /// the atlas, every cached glyph that lived on it becomes stale.
@@ -465,11 +471,12 @@ pub const CellPass = struct {
             if (cell.style_ref != cached_style) {
                 const style = pool.get(cell.style_ref);
                 // Resolve fg + bg to RGBA. Bold lifts palette indices 0..7
-                // into the bright 8..15 slots (xterm convention); doesn't
-                // affect rgb / 256-color / default. Reverse video swaps
-                // fg/bg of the cell — including explicit colors.
+                // into the bright 8..15 slots (xterm convention) when
+                // allow_bold && bold_is_bright; doesn't affect rgb /
+                // 256-color / default. Reverse video swaps fg/bg of
+                // the cell — including explicit colors.
                 var fg_color = style.fg;
-                if (style.attrs.bold) {
+                if (style.attrs.bold and self.allow_bold and self.bold_is_bright) {
                     if (fg_color == .palette and fg_color.palette < 8) {
                         fg_color = .{ .palette = fg_color.palette + 8 };
                     }
