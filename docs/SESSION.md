@@ -1026,3 +1026,17 @@ User-facing config additions:
   New `Config.loadWithOverride` and `Window.initWithConfig`
   entry points.
 
+
+## Print-run dispatch dedupe
+
+- **Single SIMD scan per print_run event** — was running runIsAscii
+  twice (once inside applyPrintRunFast precondition, once in the
+  Tier-2 fall-through). Inlined the dispatch: scan once, route by
+  result + state. applyPrintRunFast wrapper removed (its body is
+  now called directly via fastAsciiSlice). Truecolor SGR bench
+  variance ~85-97 MB/s (was ~80-90).
+- **Bulk-accumulate digit runs** in csi_param via the parser's
+  advance() scan. Saves ~6 byteCsi dispatches per truecolor SGR
+  sequence; bench within noise but the path is structurally
+  cleaner for long-param sequences.
+
