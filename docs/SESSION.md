@@ -1124,3 +1124,53 @@ Continued the latent-bug audit of POSIX syscall sites:
   wrapper or a default widget, leaving keypresses going nowhere.
   Walk the sibling subtree, focus the first pane found.
 
+
+## Preferences dialog tick
+
+In-GUI configurability via AdwPreferencesDialog (modeled after
+Terminator after exploring `external/terminator`). 5 pages, ~30
+settings, all live-applied + persisted to disk on every change.
+
+### Pages
+
+- **Appearance** — font path (file picker), font size, line spacing,
+  padding, cursor shape combo, blink switch + interval.
+- **Colors** — 9 built-in scheme presets (sketerm, Tango, Solarized
+  ×2, Gruvbox ×2, Nord, Dracula, Monokai), default fg/bg/cursor
+  swatches, 16-colour ANSI palette (each as a GtkColorDialogButton),
+  cursor-uses-fg toggle, auto-theme.
+- **Behavior** — shell path, TERM/COLORTERM, login_shell switch,
+  exit-action combo (close/restart/hold), bracketed paste,
+  modifyOtherKeys combo, word_chars, smart_copy, scrollback lines,
+  scroll-on-output.
+- **Rendering** — ligatures, bidi, audible/visible/urgent bell.
+- **Window** — tab position (top/bottom), close-button-on-tab.
+
+### Plumbing
+
+- New `Config.save / serialise` writes only non-default values
+  (Terminator-style minimal persistence). Round-trip test.
+- New keys: palette[16], scheme, scroll_on_output, word_chars,
+  smart_copy, login_shell, cursor_color_default, tab_position,
+  close_button_on_tab, exit_action, bell_visible, bell_urgent.
+- `Window.applyConfigChange` is the single entry point; pushes
+  diffs into every live pane (colors, palette, cursor, padding,
+  ligatures, bidi, bracketed paste, modifyOtherKeys, scrollback)
+  and persists to ~/.config/sketerm/config.conf.
+- Heavy paths (`font_size` → atlas rebuild) only fire on actual
+  change.
+- Triggers: `Ctrl+,` (GNOME convention) + "Preferences…" in the
+  right-click context menu.
+
+### Deliberately deferred
+
+- Per-pane / per-profile overrides (Terminator's 'profiles' notion).
+  Single global config kept for v1.
+- Keybinding editor — the hardcoded shortcuts work; rebinding UX is
+  big-surface follow-up work.
+- Background image / transparency — would need a major GL pipeline
+  change.
+- Open color buttons in the Colors page don't auto-refresh their
+  preview swatches when a scheme is picked. The values DO take
+  effect; reopening the dialog reflects them.
+
