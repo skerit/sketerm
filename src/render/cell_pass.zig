@@ -233,6 +233,17 @@ pub const CellPass = struct {
     row_needs_upload: std.ArrayList(bool) = .{},
     /// Capacity of the GL VBO in bytes.
     vbo_capacity: usize = 0,
+    /// When non-null, the VBO was allocated with `glBufferStorage`
+    /// + `MAP_PERSISTENT_BIT|MAP_COHERENT_BIT|MAP_WRITE_BIT` and we
+    /// write directly into this pointer instead of going through
+    /// glBufferSubData. NVIDIA/Mesa/AMD support it; older Mali/Adreno
+    /// drivers don't, in which case we fall back to the legacy path.
+    mapped_ptr: ?[*]Instance = null,
+    /// Fence inserted after each draw so the next frame's writes wait
+    /// until the GPU is done reading the buffer. 0 = no pending fence.
+    fence: c.GLsync = null,
+    /// Cached extension probe. -1 = not yet checked, 0/1 = result.
+    persistent_supported: i8 = -1,
 
     /// Default fg/bg used when style.fg/bg is .default.
     default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
@@ -290,6 +301,11 @@ pub const CellPass = struct {
         self.u_dim_fg = -1;
         self.u_dim_bg = -1;
         self.vbo_capacity = 0;
+        // Persistent-map state is invalid after context loss — drop it
+        // so re-realize can re-probe and remap on the new context.
+        self.mapped_ptr = null;
+        self.fence = null;
+        self.persistent_supported = -1;
         // Mark every row to re-upload into the new context.
         for (self.row_needs_upload.items) |*r| r.* = true;
     }
@@ -332,6 +348,30 @@ pub const CellPass = struct {
         }
 
         c.glBindVertexArray(0);
+
+        // Probe for persistent-mapped buffer support. EXT_buffer_storage
+        // exposes glBufferStorage on GL ES; epoxy's runtime resolver
+        // returns a non-null fn pointer when desktop GL or the EXT
+        // variant is available.
+        if (self.persistent_supported < 0) {
+            // Conservative probe: only enable persistent mapping when
+            // BOTH the GL_EXT_buffer_storage extension is advertised
+            // AND the EXT entry points resolve at runtime.
+            // glBufferStorage's core (desktop) entry isn't usable on
+            // ES contexts; the EXT variant has different name/symbol
+            // resolution and we'd need to call glBufferStorageEXT.
+            // Until smoke-cell verifies the EXT path works on this
+            // driver, default to OFF — the legacy per-row
+            // glBufferSubData path is already efficient.
+            self.persistent_supported = 0;
+        }
+    }
+
+    /// Drop the cached fence + mapped pointer so a re-realize after
+    /// GL context loss starts clean.
+    pub fn forgetGLPersistent(self: *CellPass) void {
+        self.mapped_ptr = null;
+        self.fence = null;
     }
 
     /// Re-allocate the instance buffer when grid size changes.
@@ -665,9 +705,54 @@ pub const CellPass = struct {
         if (self.vbo == 0) return;
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
         const total_bytes: usize = self.instances.items.len * @sizeOf(Instance);
+        const want_persistent = self.persistent_supported == 1;
 
-        // Reallocate the GL buffer if needed (orphan).
+        // Reallocate the GL buffer if needed.
         if (total_bytes > self.vbo_capacity) {
+            // Persistent path: unmap old (if any), allocate via
+            // glBufferStorage with PERSISTENT|COHERENT|WRITE, map
+            // once, copy in initial data.
+            if (want_persistent and total_bytes > 0) {
+                if (self.mapped_ptr != null) {
+                    _ = c.glUnmapBuffer(c.GL_ARRAY_BUFFER);
+                    self.mapped_ptr = null;
+                }
+                if (self.fence) |fnc| {
+                    c.glDeleteSync(fnc);
+                    self.fence = null;
+                }
+                // Recreate the buffer (BufferStorage is one-shot —
+                // can't realloc the same name).
+                c.glDeleteBuffers(1, &self.vbo);
+                c.glGenBuffers(1, &self.vbo);
+                c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
+                // Re-bind VAO attrib pointers — the new VBO needs them.
+                c.glBindVertexArray(self.vao);
+                c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
+                const flags: c.GLbitfield = c.GL_MAP_WRITE_BIT |
+                    c.GL_MAP_PERSISTENT_BIT | c.GL_MAP_COHERENT_BIT |
+                    c.GL_DYNAMIC_STORAGE_BIT;
+                c.glBufferStorage(
+                    c.GL_ARRAY_BUFFER,
+                    @intCast(total_bytes),
+                    self.instances.items.ptr,
+                    flags,
+                );
+                const map_flags: c.GLbitfield = c.GL_MAP_WRITE_BIT |
+                    c.GL_MAP_PERSISTENT_BIT | c.GL_MAP_COHERENT_BIT;
+                const ptr_raw = c.glMapBufferRange(c.GL_ARRAY_BUFFER, 0, @intCast(total_bytes), map_flags);
+                if (ptr_raw != null) {
+                    self.mapped_ptr = @ptrCast(@alignCast(ptr_raw));
+                } else {
+                    // Mapping failed — fall back to legacy path.
+                    self.persistent_supported = 0;
+                }
+                c.glBindVertexArray(0);
+                self.vbo_capacity = total_bytes;
+                for (self.row_needs_upload.items) |*r| r.* = false;
+                return;
+            }
+            // Legacy: orphan via glBufferData.
             c.glBufferData(
                 c.GL_ARRAY_BUFFER,
                 @intCast(total_bytes),
@@ -676,6 +761,32 @@ pub const CellPass = struct {
             );
             self.vbo_capacity = total_bytes;
             for (self.row_needs_upload.items) |*r| r.* = false;
+            return;
+        }
+
+        // Persistent fast path: write directly into mapped memory.
+        // Wait on the previous frame's fence so we don't overwrite
+        // bytes the GPU is still reading.
+        if (self.mapped_ptr) |mptr| {
+            if (self.fence) |fnc| {
+                _ = c.glClientWaitSync(fnc, c.GL_SYNC_FLUSH_COMMANDS_BIT, 1_000_000_000);
+                c.glDeleteSync(fnc);
+                self.fence = null;
+            }
+            const cols = self.cap_cols;
+            var i: usize = 0;
+            while (i < self.row_needs_upload.items.len) {
+                if (!self.row_needs_upload.items[i]) {
+                    i += 1;
+                    continue;
+                }
+                const start = i;
+                while (i < self.row_needs_upload.items.len and self.row_needs_upload.items[i]) i += 1;
+                const off_inst = start * @as(usize, cols);
+                const len_inst = (i - start) * @as(usize, cols);
+                @memcpy(mptr[off_inst .. off_inst + len_inst], self.instances.items[off_inst .. off_inst + len_inst]);
+                for (self.row_needs_upload.items[start..i]) |*r| r.* = false;
+            }
             return;
         }
 
@@ -743,6 +854,18 @@ pub const CellPass = struct {
 
         c.glDisable(c.GL_BLEND);
         c.glBindVertexArray(0);
+
+        // Persistent-mapped path: insert a fence so the next frame's
+        // upload can wait until the GPU is done reading this frame's
+        // bytes. Without the wait we'd risk torn frames if the CPU
+        // races ahead.
+        if (self.mapped_ptr != null) {
+            // Replace any old (un-waited-on) fence — shouldn't happen
+            // in practice since uploadDirtyRows always consumes it,
+            // but guard against double-allocation regardless.
+            if (self.fence) |old| c.glDeleteSync(old);
+            self.fence = c.glFenceSync(c.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        }
     }
 
     fn colorToVec(self: *const CellPass, color: Color, is_fg: bool, reverse: bool) [4]f32 {
