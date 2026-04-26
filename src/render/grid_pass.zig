@@ -111,6 +111,9 @@ pub const GridPass = struct {
     allow_bold: bool = true,
     /// When bold + allow_bold, lift palette 0..7 to 8..15.
     bold_is_bright: bool = true,
+    /// Underline auto-detected http(s) URLs in cell content. Off
+    /// skips the per-row scan + render entirely.
+    enable_url_underline: bool = true,
     allocator: std.mem.Allocator,
     /// Scratch buffers for bidi resolution + visual ordering. Grow
     /// to cols on first use; subsequent frames reuse them. Avoids
@@ -253,6 +256,40 @@ pub const GridPass = struct {
             else
                 .{ 1.0, 0.85, 0.10, 0.30 }; // dim yellow — other matches
             try self.pushQuad(.{ x, y }, .{ w, ch }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0);
+        }
+
+        // Auto-detected URL underlines. Per-row scan over visible
+        // cells; OSC 8 cells are skipped inside scanRow itself.
+        if (self.enable_url_underline) {
+            const url_scan = @import("../grid/url_scan.zig");
+            var matches: [16]url_scan.Match = undefined;
+            var vrow: u16 = 0;
+            while (vrow < screen.rows) : (vrow += 1) {
+                const ln_ptr2: *const @TypeOf(buf[0]) = if (vrow < view_off) blk: {
+                    const sb_idx = sb_count - view_off + vrow;
+                    break :blk screen.scrollbackLine(sb_idx);
+                } else &buf[vrow - view_off];
+                const cells2 = ln_ptr2.cells[0..screen.cols];
+                const n_match = url_scan.scanRow(cells2, &matches);
+                if (n_match == 0) continue;
+                const y: f32 = pad + @as(f32, @floatFromInt(vrow)) * ch;
+                // 1px-equivalent underline near the bottom of the cell.
+                const thin: f32 = @max(1.0, ch / 14.0);
+                const uy: f32 = y + ch - thin - 1.0;
+                for (matches[0..n_match]) |m| {
+                    const x: f32 = pad + @as(f32, @floatFromInt(m.col_start)) * cw;
+                    const w: f32 = @as(f32, @floatFromInt(m.col_end - m.col_start)) * cw;
+                    // Use accent fg @ ~0.85 alpha so the underline
+                    // reads as "this is interactive" without dominating.
+                    const accent: [4]f32 = .{
+                        self.default_fg[0],
+                        self.default_fg[1],
+                        self.default_fg[2],
+                        0.85,
+                    };
+                    try self.pushQuadDim(.{ x, uy }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0, 1.0);
+                }
+            }
         }
 
         // Selection overlay (translucent). For pure-LTR rows we emit

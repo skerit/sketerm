@@ -1039,23 +1039,35 @@ fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
         }
     }
 
-    // OSC 8 hover tooltip.
+    // Hyperlink hover tooltip — OSC 8 first, then auto-detected URL.
     if (cell.row < 0 or cell.col < 0) return;
     if (cell.row >= screen.rows or cell.col >= screen.cols) return;
     const c_row: u16 = @intCast(cell.row);
     const c_col: u16 = @intCast(cell.col);
     const cell_data = screen.cellAt(c_row, c_col);
-    if (cell_data.flags & 0b0000_0100 == 0) {
-        c.gtk_widget_set_tooltip_text(@ptrCast(self.area), null);
-        return;
+    if (cell_data.flags & 0b0000_0100 != 0) {
+        if (screen.linkUri(cell_data.reserved)) |uri| {
+            var buf: [4096]u8 = undefined;
+            const n = @min(uri.len, buf.len - 1);
+            @memcpy(buf[0..n], uri[0..n]);
+            buf[n] = 0;
+            c.gtk_widget_set_tooltip_text(@ptrCast(self.area), &buf);
+            return;
+        }
     }
-    if (screen.linkUri(cell_data.reserved)) |uri| {
-        var buf: [4096]u8 = undefined;
-        const n = @min(uri.len, buf.len - 1);
-        @memcpy(buf[0..n], uri[0..n]);
-        buf[n] = 0;
-        c.gtk_widget_set_tooltip_text(@ptrCast(self.area), &buf);
+    // No OSC 8 — try the auto-URL detector if enabled.
+    if (self.grid_pass.enable_url_underline) {
+        if (screen.urlAtVisible(self.allocator, @intCast(c_row), @intCast(c_col)) catch null) |url| {
+            defer self.allocator.free(url);
+            const max = @min(url.len, 4095);
+            var buf: [4096]u8 = undefined;
+            @memcpy(buf[0..max], url[0..max]);
+            buf[max] = 0;
+            c.gtk_widget_set_tooltip_text(@ptrCast(self.area), &buf);
+            return;
+        }
     }
+    c.gtk_widget_set_tooltip_text(@ptrCast(self.area), null);
 }
 
 fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
@@ -1304,15 +1316,28 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
     const screen = self.terminal.screen;
     if (cell.row >= screen.rows or cell.col >= screen.cols) return;
     const cell_data = screen.cellAt(@intCast(cell.row), @intCast(cell.col));
-    if (cell_data.flags & 0b0000_0100 == 0) return;
 
-    if (screen.linkUri(cell_data.reserved)) |uri| {
-        var buf: [4096]u8 = undefined;
-        const n = @min(uri.len, buf.len - 1);
-        @memcpy(buf[0..n], uri[0..n]);
-        buf[n] = 0;
-        _ = c.g_app_info_launch_default_for_uri(&buf, null, null);
+    // OSC 8 hyperlink — preferred path when the cell carries one.
+    if (cell_data.flags & 0b0000_0100 != 0) {
+        if (screen.linkUri(cell_data.reserved)) |uri| {
+            var buf: [4096]u8 = undefined;
+            const n = @min(uri.len, buf.len - 1);
+            @memcpy(buf[0..n], uri[0..n]);
+            buf[n] = 0;
+            _ = c.g_app_info_launch_default_for_uri(&buf, null, null);
+            return;
+        }
     }
+
+    // No OSC 8 — fall back to the auto-URL detector.
+    if (!self.grid_pass.enable_url_underline) return;
+    const url = (screen.urlAtVisible(self.allocator, cell.row, cell.col) catch null) orelse return;
+    defer self.allocator.free(url);
+    var buf: [4096]u8 = undefined;
+    const n = @min(url.len, buf.len - 1);
+    @memcpy(buf[0..n], url[0..n]);
+    buf[n] = 0;
+    _ = c.g_app_info_launch_default_for_uri(&buf, null, null);
 }
 
 fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {

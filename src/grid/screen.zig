@@ -1386,6 +1386,34 @@ pub const Screen = struct {
         return if (self.links.get(link_id)) |u| u else null;
     }
 
+    /// Auto-URL detector lookup at a visible (row, col). Considers
+    /// scrollback if `view_offset > 0`. Returns the URL text owned
+    /// by the caller via the provided allocator. null = no URL.
+    pub fn urlAtVisible(self: *Screen, allocator: std.mem.Allocator, vrow: i32, vcol: i32) !?[]u8 {
+        if (vrow < 0 or vrow >= @as(i32, @intCast(self.rows))) return null;
+        if (vcol < 0 or vcol >= @as(i32, @intCast(self.cols))) return null;
+
+        const url_scan = @import("url_scan.zig");
+        const cells = self.lineCellsAtPub(vrow) orelse return null;
+        var matches: [16]url_scan.Match = undefined;
+        const n = url_scan.scanRow(cells, &matches);
+        if (n == 0) return null;
+        const col_u: u16 = @intCast(vcol);
+        for (matches[0..n]) |m| {
+            if (col_u >= m.col_start and col_u < m.col_end) {
+                // Extract ASCII URL text. URLs are ASCII-only (RFC),
+                // so a flat copy of `cell.rune` low byte works.
+                var url_buf = try allocator.alloc(u8, m.col_end - m.col_start);
+                errdefer allocator.free(url_buf);
+                for (m.col_start..m.col_end, 0..) |src, dst| {
+                    url_buf[dst] = @intCast(cells[src].rune & 0xFF);
+                }
+                return url_buf;
+            }
+        }
+        return null;
+    }
+
     /// OSC 1337 — iTerm2 multi-purpose protocol. Two formats:
     ///   File=<attrs>:<base64>  → inline image (existing path)
     ///   <Key>=<Value>          → directive (CursorShape, ClearScrollback,

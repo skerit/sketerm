@@ -622,6 +622,7 @@ pub const Window = struct {
         pane.grid_pass.bold_is_bright = self.config.bold_is_bright;
         pane.cell_pass.allow_bold = self.config.allow_bold;
         pane.cell_pass.bold_is_bright = self.config.bold_is_bright;
+        pane.grid_pass.enable_url_underline = self.config.auto_url_detect;
         // Per-pane titlebar visibility.
         pane.setTitlebarVisible(self.config.show_titlebar);
         // Inactive-pane dimming factors.
@@ -1147,6 +1148,7 @@ pub const Window = struct {
             // Rendering.
             p.grid_pass.enable_ligatures = self.config.ligatures;
             p.grid_pass.enable_bidi = self.config.bidi;
+            p.grid_pass.enable_url_underline = self.config.auto_url_detect;
             p.grid_pass.allow_bold = self.config.allow_bold;
             p.grid_pass.bold_is_bright = self.config.bold_is_bright;
             p.cell_pass.allow_bold = self.config.allow_bold;

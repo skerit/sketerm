@@ -643,6 +643,7 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Disable middle-click paste", "Ignore middle-click PRIMARY paste entirely.", &ctx.cfg.disable_mouse_paste, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Disable Ctrl+wheel zoom", "Ctrl+wheel won't change the font size.", &ctx.cfg.disable_mousewheel_zoom, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Single-click hyperlinks", "OSC 8 hyperlinks open on plain click instead of Ctrl+click.", &ctx.cfg.link_single_click, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Auto-detect URLs", "Underline + open plain http(s) URLs in cell content.", &ctx.cfg.auto_url_detect, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(mouse_group)));
 
     // Search.

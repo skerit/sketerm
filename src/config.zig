@@ -152,6 +152,13 @@ pub const Config = struct {
     /// the original colour and only changes weight.
     bold_is_bright: bool = true,
 
+    // URL detection
+    /// Auto-detect plain http(s) URLs in cell content and underline
+    /// them. OSC 8 hyperlinks (when present) win — auto-detected
+    /// matches in OSC 8 ranges are skipped. Click / Ctrl+click to
+    /// open via the system handler.
+    auto_url_detect: bool = true,
+
     // Background opacity (Wayland with compositor support).
     /// Window background opacity. 1.0 = fully opaque (default).
     /// 0.0 = fully transparent. Multiplied into default_bg.a so the
@@ -352,6 +359,9 @@ pub const Config = struct {
         if (!self.allow_bold) try w.writeAll("allow_bold = false\n");
         if (!self.bold_is_bright) try w.writeAll("bold_is_bright = false\n");
 
+        // URL detection.
+        if (!self.auto_url_detect) try w.writeAll("auto_url_detect = false\n");
+
         // Background opacity.
         if (self.background_opacity != 1.0)
             try w.print("background_opacity = {d:.2}\n", .{self.background_opacity});
@@ -542,6 +552,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.allow_bold = try parseBool(value);
     } else if (std.mem.eql(u8, key, "bold_is_bright")) {
         cfg.bold_is_bright = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "auto_url_detect")) {
+        cfg.auto_url_detect = try parseBool(value);
     } else if (std.mem.eql(u8, key, "background_opacity")) {
         cfg.background_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "inactive_fg_dim")) {
