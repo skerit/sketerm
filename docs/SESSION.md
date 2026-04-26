@@ -982,3 +982,21 @@ Mostly housekeeping wins:
   ✓ (shipped earlier ticks), SS2/SS3 done, OSC 22/50/1337
   rows expanded.
 
+
+## Event-shrink tick
+
+- **Csi.params [16]u32 → [16]u16** — real-world CSI params (SGR
+  ≤255, cursor pos, DECSET modes ≤9999, RGB ≤255) all fit in u16
+  with margin. cur_param stays u32 internally; flushParam clamps
+  via `@min(.., max u16)`. Csi shrunk 76 → 42 B; Event union
+  80 → 72 B (PrintRun is now the limiter at 65). SPSC ring memory
+  16384 × 80 → 16384 × 72 = 1.13 MB.
+- **PrintRun bump to 128 tried + reverted** — halved event count
+  for plain-ASCII bursts but doubled Event union size with no
+  measurable bench win. Documented in the comment so future ticks
+  don't repeat the experiment.
+- **GridPass vbuf pre-grow** to 2048 vertices at realize, so the
+  first few overlay-emitting frames don't repeatedly realloc.
+
+Bench stable at ~155 / 60 / 88 / 89 / 85 MB/s.
+
