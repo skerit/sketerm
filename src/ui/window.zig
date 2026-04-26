@@ -401,6 +401,26 @@ pub const Window = struct {
         c.gtk_window_present(@ptrCast(self.app_window));
     }
 
+    /// Quake-mode toggle. If the window is hidden / minimized,
+    /// raise + focus it. Otherwise minimize. We minimize rather than
+    /// `set_visible(false)` because hiding destroys the GdkSurface →
+    /// GL context loss → atlas + image upload rebuild on every reveal.
+    /// Wayland caveat: focus-stealing prevention may delay the raise.
+    pub fn toggleQuake(self: *Window) void {
+        const window: *c.GtkWindow = @ptrCast(@alignCast(self.app_window));
+        // gtk_window_is_active reflects "this window has focus AND is
+        // visible". Minimized windows return false; so do unfocused
+        // ones. Combine with mapped-state to disambiguate.
+        const mapped = c.gtk_widget_get_mapped(self.app_window) != 0;
+        const active = c.gtk_window_is_active(window) != 0;
+        if (mapped and active) {
+            c.gtk_window_minimize(window);
+        } else {
+            c.gtk_window_unminimize(window);
+            c.gtk_window_present(window);
+        }
+    }
+
     /// Spawn a new shell pane and add it as a tab.
     /// If title == null, a "Tab N" default is used.
     pub fn newShellTab(self: *Window, title_opt: ?[*:0]const u8) !void {
