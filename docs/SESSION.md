@@ -961,3 +961,24 @@ Two compounding wins on the UTF-8-mixed workload:
 Bench: UTF-8 mix 63 → 85 MB/s (+35% net for this tick). Plain
 ASCII unchanged ~150 MB/s. Other workloads similar.
 
+
+## Misc tick
+
+Mostly housekeeping wins:
+
+- **Atlas pre-warm at realize** — printable ASCII (0x20..0x7E)
+  rasterised at realize so the first shell prompt doesn't fire
+  ~95 back-to-back glyph-rasterise + glTexSubImage3D in one
+  frame. Smoother first-paint.
+- **Dcs.params [16]u32 → [4]u16** — DCS dispatch never reads
+  proto.params (XTGETTCAP / DECRQSS use intermediates + final;
+  sixel reads its own body). Shrinking dropped DcsFull from
+  88 → 32 B and the Event union from 96 → 80 B (Csi at 76 B
+  is now the limiter). SPSC ring memory: 1.5 → 1.25 MB.
+- **runIsAscii drop in Tier 2.5 subrange** — print_run only
+  carries bytes already classified printable, so the duplicate
+  vector scan is gone.
+- **docs/protocols.md** updated to mark mouse 1005/1015/1016
+  ✓ (shipped earlier ticks), SS2/SS3 done, OSC 22/50/1337
+  rows expanded.
+
