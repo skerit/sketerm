@@ -258,7 +258,16 @@ pub const Terminal = struct {
             if (pfds[0].revents & c.POLLIN != 0) {
                 var buf: [16384]u8 = undefined;
                 const r = c.read(self.pty.master_fd, &buf, buf.len);
-                if (r <= 0) {
+                if (r < 0) {
+                    // EINTR / EAGAIN are transient — resume the poll
+                    // loop. Other errors fall through as EOF.
+                    const errn = std.posix.errno(r);
+                    if (errn == .INTR or errn == .AGAIN) continue;
+                    self.pushSpinning(.{ .child_eof = self.reapStatus() });
+                    self.scheduleDrain();
+                    break;
+                }
+                if (r == 0) {
                     self.pushSpinning(.{ .child_eof = self.reapStatus() });
                     self.scheduleDrain();
                     break;
