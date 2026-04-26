@@ -1051,3 +1051,17 @@ User-facing config additions:
   Smart-case (lower-only → CI, uppercase → CS) is the default;
   Ctrl+I forces explicit CI regardless of needle case.
 
+
+## Shell integration tick
+
+- **zsh + fish integration scripts** — port `OSC 7 cwd`, `OSC 133`
+  prompt marks, and `sketerm_copy` (OSC 52) to zsh's
+  precmd/preexec/chpwd hooks and fish's `--on-event fish_prompt /
+  fish_preexec` and `--on-variable PWD`. Each self-skips when
+  `$TERM_PROGRAM != sketerm`.
+- **README** picks up a short section pointing users at the three
+  scripts and explaining what they enable.
+- **New tab inherits cwd** — Ctrl+Shift+T now spawns in the
+  focused pane's last-reported (OSC 7) cwd, mirroring the prior
+  split-inherits-cwd change.
+
