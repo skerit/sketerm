@@ -43,6 +43,10 @@ pub const Screen = struct {
     scrollback_capacity: usize = 10_000,
     /// Rendering offset (0 = bottom, > 0 = scrolled up by N lines).
     view_offset: u32 = 0,
+    /// When true, any output (printCp / scrollUp / lineFeed) snaps
+    /// view_offset back to 0. Off by default — matches xterm.
+    /// Mirrors gnome-terminal's "scroll on output" toggle.
+    scroll_on_output: bool = false,
 
     /// Cursor position, 0-indexed.
     row: u16 = 0,
@@ -2187,6 +2191,7 @@ pub const Screen = struct {
             self.row += 1;
         }
         self.pending_wrap = false;
+        if (self.scroll_on_output) self.view_offset = 0;
     }
 
     // ── CSI dispatch ─────────────────────────────────────────────

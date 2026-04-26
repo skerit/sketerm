@@ -483,6 +483,7 @@ pub const Window = struct {
             .cwd = cwd,
             .rows = 24,
             .cols = 80,
+            .login_shell = self.config.login_shell,
         });
         errdefer pty.closeAndReap();
 
@@ -566,6 +567,7 @@ pub const Window = struct {
             .term = @ptrCast(&term_buf),
             .color_term = @ptrCast(&ct_buf),
             .cwd = inherit_cwd,
+            .login_shell = self.config.login_shell,
         });
         errdefer pty.closeAndReap();
 
@@ -594,9 +596,20 @@ pub const Window = struct {
         // queries reply with the configured values until apps override.
         term.screen.default_fg = fg_bg.fg;
         term.screen.default_bg = fg_bg.bg;
-        term.screen.cursor_color = self.config.cursor_color;
+        term.screen.cursor_color = if (self.config.cursor_color_default)
+            .{ 0, 0, 0, 0 }
+        else
+            self.config.cursor_color;
         term.screen.scrollback_capacity = self.config.scrollback;
         term.screen.bracketed_paste = self.config.bracketed_paste;
+        term.screen.scroll_on_output = self.config.scroll_on_output;
+        if (self.config.palette) |pal| {
+            var i: usize = 0;
+            while (i < 16) : (i += 1) {
+                term.screen.palette[i] = pal[i];
+                pane.grid_pass.palette[i] = pal[i];
+            }
+        }
         try self.panes.append(self.allocator, pane);
         try self.terminals.append(self.allocator, term);
         return pane;
@@ -958,7 +971,12 @@ pub const Window = struct {
             // Colors.
             screen.default_fg = self.config.default_fg;
             screen.default_bg = self.config.default_bg;
-            screen.cursor_color = self.config.cursor_color;
+            // Renderer convention: alpha=0 means "use fg colour". We
+            // map cursor_color_default → that sentinel.
+            screen.cursor_color = if (self.config.cursor_color_default)
+                .{ 0, 0, 0, 0 }
+            else
+                self.config.cursor_color;
             p.grid_pass.default_fg = self.config.default_fg;
             p.grid_pass.default_bg = self.config.default_bg;
             // Palette (16 ANSI colours). When the user has set
@@ -990,6 +1008,7 @@ pub const Window = struct {
             screen.bracketed_paste = self.config.bracketed_paste;
             screen.modify_other_keys = self.config.modify_other_keys;
             screen.scrollback_capacity = self.config.scrollback;
+            screen.scroll_on_output = self.config.scroll_on_output;
             // Repaint.
             screen.dirty = true;
             p.cell_pass.markAllDirty();
@@ -1404,6 +1423,15 @@ fn onTermBell(ctx: ?*anyopaque, pane: *Pane) void {
         const display = c.gtk_widget_get_display(self.app_window);
         if (display != null) c.gdk_display_beep(display);
     }
+
+    // Visible flash — Pane.onBellEvent already records bell_at_us
+    // and the renderer paints a brief tint. Just disable that path
+    // when the user opted out.
+    if (!self.config.bell_visible) {
+        pane.terminal.screen.bell_at_us = 0;
+    }
+
+    if (!self.config.bell_urgent) return;
 
     // Find the AdwTabPage whose widget tree contains this pane and
     // mark it needs-attention (unless it's the currently selected one).

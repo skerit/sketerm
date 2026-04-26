@@ -28,6 +28,9 @@ pub const SpawnOpts = struct {
     term: [*:0]const u8 = "xterm-256color",
     /// `COLORTERM` env value. "truecolor" makes apps emit 24-bit SGR.
     color_term: [*:0]const u8 = "truecolor",
+    /// Spawn as a login shell — argv[0] in the child gets a leading
+    /// `-` per Unix convention so /etc/profile etc. are sourced.
+    login_shell: bool = false,
 };
 
 pub const Pty = struct {
@@ -112,10 +115,24 @@ pub const Pty = struct {
             _ = c.chdir(@ptrCast(&buf));
         }
 
-        // Build argv on the stack.
+        // Build argv on the stack. login_shell mode: replace argv[0]
+        // with `-<basename>` so the child sees itself as a login shell
+        // and sources /etc/profile + ~/.profile (Unix convention).
         var argv_buf: [64]?[*:0]u8 = undefined;
+        var login_buf: [128:0]u8 = undefined;
         for (opts.argv, 0..) |arg, i| argv_buf[i] = @constCast(arg);
         argv_buf[opts.argv.len] = null;
+        if (opts.login_shell and opts.argv.len > 0) {
+            const argv0_slice = std.mem.span(opts.argv[0]);
+            // Find basename of the executable path.
+            const slash = std.mem.lastIndexOfScalar(u8, argv0_slice, '/');
+            const base = if (slash) |s| argv0_slice[s + 1 ..] else argv0_slice;
+            login_buf[0] = '-';
+            const n = @min(base.len, login_buf.len - 1);
+            @memcpy(login_buf[1 .. 1 + n], base[0..n]);
+            login_buf[1 + n] = 0;
+            argv_buf[0] = @ptrCast(&login_buf);
+        }
 
         _ = c.execvp(opts.argv[0], @ptrCast(&argv_buf));
         // execvp returned → failure.
