@@ -38,6 +38,9 @@ pub const Ctx = struct {
     /// Hide the pointer over the widget while typing. Mirrors
     /// Config.mouse_autohide. The Pane's onMotion handler restores it.
     mouse_autohide: bool = true,
+    /// Active keybinding table. Empty slice = use `default_bindings`.
+    /// Window owns the storage (parsed from Config); Ctx just borrows.
+    bindings: []const Binding = &.{},
 };
 
 /// Maximum gap between consecutive presses of the same keyval that
@@ -47,6 +50,7 @@ pub const Ctx = struct {
 const REPEAT_WINDOW_US: i64 = 120_000;
 
 pub const Action = enum {
+    // Window-level (dispatched via shortcut_sink to Window).
     new_tab,
     close_tab,
     next_tab,
@@ -66,7 +70,175 @@ pub const Action = enum {
     pane_next,
     pane_prev,
     prefs_open,
+    // Per-pane (dispatched locally inside input.zig).
+    paste_clipboard,
+    copy_selection,
+    interrupt_or_copy,
+    clear_and_scrollback,
+    scrollback_page_up,
+    scrollback_page_down,
 };
+
+/// One configured keybind: a (keyval, modifier-mask) → Action mapping.
+pub const Binding = struct {
+    keyval: c_uint,
+    mods: c_uint,
+    action: Action,
+};
+
+/// Default bindings table. Mirrors the prior hardcoded
+/// `dispatchShortcut` switch. Config can override / add to these via
+/// `keybind.<action>` entries; missing entries fall through here.
+pub const default_bindings = [_]Binding{
+    // Ctrl+Shift+...
+    .{ .keyval = c.GDK_KEY_t, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .new_tab },
+    .{ .keyval = c.GDK_KEY_w, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .close_tab },
+    .{ .keyval = c.GDK_KEY_d, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .split_h },
+    .{ .keyval = c.GDK_KEY_r, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .split_v },
+    .{ .keyval = c.GDK_KEY_f, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .search_open },
+    .{ .keyval = c.GDK_KEY_v, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .paste_clipboard },
+    .{ .keyval = c.GDK_KEY_c, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .interrupt_or_copy },
+    .{ .keyval = c.GDK_KEY_k, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .clear_and_scrollback },
+    .{ .keyval = c.GDK_KEY_s, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .save_layout },
+    .{ .keyval = c.GDK_KEY_s, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .save_layout_as },
+    .{ .keyval = c.GDK_KEY_Up, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .prompt_prev },
+    .{ .keyval = c.GDK_KEY_Down, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .prompt_next },
+    .{ .keyval = c.GDK_KEY_Left, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .pane_prev },
+    .{ .keyval = c.GDK_KEY_Right, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .pane_next },
+    .{ .keyval = c.GDK_KEY_ISO_Left_Tab, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .prev_tab },
+    .{ .keyval = c.GDK_KEY_plus, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .font_inc },
+    // Ctrl+...
+    .{ .keyval = c.GDK_KEY_Tab, .mods = c.GDK_CONTROL_MASK, .action = .next_tab },
+    .{ .keyval = c.GDK_KEY_minus, .mods = c.GDK_CONTROL_MASK, .action = .font_dec },
+    .{ .keyval = c.GDK_KEY_KP_Subtract, .mods = c.GDK_CONTROL_MASK, .action = .font_dec },
+    .{ .keyval = c.GDK_KEY_equal, .mods = c.GDK_CONTROL_MASK, .action = .font_inc },
+    .{ .keyval = c.GDK_KEY_plus, .mods = c.GDK_CONTROL_MASK, .action = .font_inc },
+    .{ .keyval = c.GDK_KEY_KP_Add, .mods = c.GDK_CONTROL_MASK, .action = .font_inc },
+    .{ .keyval = c.GDK_KEY_0, .mods = c.GDK_CONTROL_MASK, .action = .font_reset },
+    .{ .keyval = c.GDK_KEY_KP_0, .mods = c.GDK_CONTROL_MASK, .action = .font_reset },
+    .{ .keyval = c.GDK_KEY_comma, .mods = c.GDK_CONTROL_MASK, .action = .prefs_open },
+    // Shift+...
+    .{ .keyval = c.GDK_KEY_Page_Up, .mods = c.GDK_SHIFT_MASK, .action = .scrollback_page_up },
+    .{ .keyval = c.GDK_KEY_Page_Down, .mods = c.GDK_SHIFT_MASK, .action = .scrollback_page_down },
+};
+
+/// Match a (keyval, modifier_state) against the binding table. Returns
+/// the first match, or null. The caller pre-masks `state` to only the
+/// modifier bits we care about (Ctrl/Shift/Alt/Super) — Lock + group
+/// bits are noise and must be filtered.
+pub fn matchBinding(bindings: []const Binding, keyval: c_uint, mods: c_uint) ?Action {
+    const significant: c_uint =
+        c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK | c.GDK_SUPER_MASK;
+    const m = mods & significant;
+    for (bindings) |b| {
+        if (b.keyval == keyval and (b.mods & significant) == m) return b.action;
+    }
+    return null;
+}
+
+/// Modifier mask the binding matcher cares about. Lock and group
+/// bits are filtered before comparison.
+pub const SIGNIFICANT_MODS: c_uint =
+    c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK | c.GDK_SUPER_MASK;
+
+/// Convert an Action to its config-key string form. Stable across
+/// versions — config files reference these names. Inverse: `actionFromName`.
+pub fn actionName(a: Action) []const u8 {
+    return switch (a) {
+        .new_tab => "new_tab",
+        .close_tab => "close_tab",
+        .next_tab => "next_tab",
+        .prev_tab => "prev_tab",
+        .copy => "copy",
+        .paste => "paste",
+        .split_h => "split_h",
+        .split_v => "split_v",
+        .font_inc => "font_inc",
+        .font_dec => "font_dec",
+        .font_reset => "font_reset",
+        .search_open => "search_open",
+        .save_layout => "save_layout",
+        .save_layout_as => "save_layout_as",
+        .prompt_prev => "prompt_prev",
+        .prompt_next => "prompt_next",
+        .pane_next => "pane_next",
+        .pane_prev => "pane_prev",
+        .prefs_open => "prefs_open",
+        .paste_clipboard => "paste_clipboard",
+        .copy_selection => "copy_selection",
+        .interrupt_or_copy => "interrupt_or_copy",
+        .clear_and_scrollback => "clear_and_scrollback",
+        .scrollback_page_up => "scrollback_page_up",
+        .scrollback_page_down => "scrollback_page_down",
+    };
+}
+
+pub fn actionFromName(name: []const u8) ?Action {
+    inline for (@typeInfo(Action).@"enum".fields) |field| {
+        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+/// Human-friendly label for the prefs UI.
+pub fn actionLabel(a: Action) []const u8 {
+    return switch (a) {
+        .new_tab => "New tab",
+        .close_tab => "Close tab",
+        .next_tab => "Next tab",
+        .prev_tab => "Previous tab",
+        .copy => "Copy",
+        .paste => "Paste",
+        .split_h => "Split horizontal",
+        .split_v => "Split vertical",
+        .font_inc => "Increase font size",
+        .font_dec => "Decrease font size",
+        .font_reset => "Reset font size",
+        .search_open => "Open search",
+        .save_layout => "Save layout",
+        .save_layout_as => "Save layout as…",
+        .prompt_prev => "Jump to previous prompt",
+        .prompt_next => "Jump to next prompt",
+        .pane_next => "Next pane",
+        .pane_prev => "Previous pane",
+        .prefs_open => "Open Preferences",
+        .paste_clipboard => "Paste clipboard",
+        .copy_selection => "Copy selection",
+        .interrupt_or_copy => "Copy / interrupt (smart)",
+        .clear_and_scrollback => "Clear screen + scrollback",
+        .scrollback_page_up => "Scroll back one page",
+        .scrollback_page_down => "Scroll forward one page",
+    };
+}
+
+/// Format a (keyval, mods) pair as a GTK accelerator string —
+/// "<Control><Shift>t" — for prefs display + config persistence.
+/// Caller-owned slice via `allocator`. Returns "" when keyval is 0
+/// (= unbound).
+pub fn accelToString(allocator: std.mem.Allocator, keyval: c_uint, mods: c_uint) ![]u8 {
+    if (keyval == 0) return try allocator.dupe(u8, "");
+    const ptr = c.gtk_accelerator_name(keyval, mods);
+    if (ptr == null) return try allocator.dupe(u8, "");
+    defer c.g_free(ptr);
+    const s = std.mem.span(@as([*:0]const u8, @ptrCast(ptr)));
+    return try allocator.dupe(u8, s);
+}
+
+/// Parse a GTK accelerator string. Returns null on failure (e.g. the
+/// user typed garbage in their config). Caller filters.
+pub fn parseAccel(accel: []const u8) ?struct { keyval: c_uint, mods: c_uint } {
+    if (accel.len == 0) return null;
+    var z_buf: [256:0]u8 = undefined;
+    if (accel.len >= z_buf.len) return null;
+    @memcpy(z_buf[0..accel.len], accel);
+    z_buf[accel.len] = 0;
+
+    var kv: c_uint = 0;
+    var m: c_uint = 0;
+    if (c.gtk_accelerator_parse(&z_buf, &kv, &m) == 0) return null;
+    if (kv == 0) return null;
+    return .{ .keyval = c.gdk_keyval_to_lower(kv), .mods = m };
+}
 
 pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allocator) !*Ctx {
     const ctx = try allocator.create(Ctx);
@@ -244,144 +416,14 @@ fn onKeyPressed(
         }
     }
 
-    const ctrl_pressed = (state & c.GDK_CONTROL_MASK) != 0;
-    const shift_pressed = (state & c.GDK_SHIFT_MASK) != 0;
-
-    // Built-in keybindings (before generic encoding).
-    if (ctrl_pressed and shift_pressed) {
-        switch (keyval) {
-            c.GDK_KEY_V, c.GDK_KEY_v => {
-                clipboard.pasteFromClipboard(ctx.widget, ctx.terminal);
-                return 1;
-            },
-            c.GDK_KEY_C, c.GDK_KEY_c => {
-                // smart_copy: if there's no selection, treat
-                // Ctrl+Shift+C as Ctrl+C (interrupt) so the user
-                // doesn't get a "did nothing" surprise. Off → no-op.
-                if (!ctx.terminal.screen.selection.isActive() and ctx.smart_copy) {
-                    _ = ctx.terminal.pty.writeAll(&[_]u8{0x03});
-                    return 1;
-                }
-                copySelection(ctx);
-                return 1;
-            },
-            c.GDK_KEY_T, c.GDK_KEY_t => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .new_tab);
-                return 1;
-            },
-            c.GDK_KEY_W, c.GDK_KEY_w => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .close_tab);
-                return 1;
-            },
-            c.GDK_KEY_D, c.GDK_KEY_d => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .split_h);
-                return 1;
-            },
-            c.GDK_KEY_R, c.GDK_KEY_r => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .split_v);
-                return 1;
-            },
-            c.GDK_KEY_K, c.GDK_KEY_k => {
-                // Clear screen + scrollback. Direct call — we're on
-                // the main thread, the screen lives there too.
-                ctx.terminal.screen.clearAndScrollback();
-                return 1;
-            },
-            c.GDK_KEY_F, c.GDK_KEY_f => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .search_open);
-                return 1;
-            },
-            c.GDK_KEY_S, c.GDK_KEY_s => {
-                const alt_held = (state & c.GDK_ALT_MASK) != 0;
-                if (ctx.shortcut_sink) |f| {
-                    if (alt_held) f(ctx.shortcut_ctx, .save_layout_as)
-                    else f(ctx.shortcut_ctx, .save_layout);
-                }
-                return 1;
-            },
-            else => {},
-        }
-    }
-    if (ctrl_pressed and !shift_pressed) {
-        if (keyval == c.GDK_KEY_Tab) {
-            if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .next_tab);
-            return 1;
-        }
-        // Ctrl+- / Ctrl+= (typed as Ctrl+plus on US) / Ctrl+0
-        switch (keyval) {
-            c.GDK_KEY_minus, c.GDK_KEY_KP_Subtract => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .font_dec);
-                return 1;
-            },
-            c.GDK_KEY_equal, c.GDK_KEY_plus, c.GDK_KEY_KP_Add => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .font_inc);
-                return 1;
-            },
-            c.GDK_KEY_0, c.GDK_KEY_KP_0 => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .font_reset);
-                return 1;
-            },
-            c.GDK_KEY_comma => {
-                // Ctrl+, — GNOME Preferences convention.
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .prefs_open);
-                return 1;
-            },
-            else => {},
-        }
-    }
-    // Ctrl+Shift++ as a fallback for keyboards where + is shift+=.
-    // Ctrl+Shift+Up/Down = OSC 133 prompt navigation.
-    if (ctrl_pressed and shift_pressed) {
-        switch (keyval) {
-            c.GDK_KEY_plus => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .font_inc);
-                return 1;
-            },
-            c.GDK_KEY_Up, c.GDK_KEY_KP_Up => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .prompt_prev);
-                return 1;
-            },
-            c.GDK_KEY_Down, c.GDK_KEY_KP_Down => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .prompt_next);
-                return 1;
-            },
-            c.GDK_KEY_Left, c.GDK_KEY_KP_Left => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .pane_prev);
-                return 1;
-            },
-            c.GDK_KEY_Right, c.GDK_KEY_KP_Right => {
-                if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .pane_next);
-                return 1;
-            },
-            else => {},
-        }
-    }
-    if (ctrl_pressed and shift_pressed and keyval == c.GDK_KEY_ISO_Left_Tab) {
-        if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, .prev_tab);
-        return 1;
-    }
-
-    // Shift+PgUp/PgDn = keyboard scrollback (xterm convention).
-    if (shift_pressed and !ctrl_pressed) {
-        const screen = ctx.terminal.screen;
-        const sb: u32 = @intCast(screen.scrollbackCount());
-        switch (keyval) {
-            c.GDK_KEY_Page_Up => {
-                const want = screen.view_offset + screen.rows;
-                screen.view_offset = if (want > sb) sb else want;
-                screen.dirty = true;
-                return 1;
-            },
-            c.GDK_KEY_Page_Down => {
-                screen.view_offset = if (screen.view_offset >= screen.rows)
-                    screen.view_offset - screen.rows
-                else
-                    0;
-                screen.dirty = true;
-                return 1;
-            },
-            else => {},
-        }
+    // Keybinding match — lowercase the keyval first so 'C' and 'c'
+    // (with/without Shift held) both hit the same binding. GTK4 emits
+    // uppercase keysyms when Shift is held, but our default table
+    // uses lowercase. Match both forms.
+    const lower_kv: c_uint = c.gdk_keyval_to_lower(keyval);
+    const bindings: []const Binding = if (ctx.bindings.len > 0) ctx.bindings else &default_bindings;
+    if (matchBinding(bindings, lower_kv, state) orelse matchBinding(bindings, keyval, state)) |action| {
+        return runAction(ctx, action);
     }
 
     var buf: [16]u8 = undefined;
@@ -395,6 +437,61 @@ fn onKeyPressed(
     }
     _ = ctx.terminal.pty.writeAll(buf[0..n]);
     return 1;
+}
+
+/// Execute a bound action. Returns 1 if handled (the input event
+/// is consumed) so the caller doesn't fall through to byte encoding.
+/// Per-pane actions handle themselves; Window-level actions go via
+/// `shortcut_sink`.
+fn runAction(ctx: *Ctx, action: Action) c.gboolean {
+    switch (action) {
+        // Per-pane (local).
+        .paste_clipboard => {
+            clipboard.pasteFromClipboard(ctx.widget, ctx.terminal);
+            return 1;
+        },
+        .copy_selection => {
+            copySelection(ctx);
+            return 1;
+        },
+        .interrupt_or_copy => {
+            // smart_copy: no selection AND smart_copy on → forward
+            // Ctrl+C (interrupt). Off → noop. Selection present →
+            // copy. Matches the previous Ctrl+Shift+C behaviour.
+            if (!ctx.terminal.screen.selection.isActive() and ctx.smart_copy) {
+                _ = ctx.terminal.pty.writeAll(&[_]u8{0x03});
+                return 1;
+            }
+            copySelection(ctx);
+            return 1;
+        },
+        .clear_and_scrollback => {
+            ctx.terminal.screen.clearAndScrollback();
+            return 1;
+        },
+        .scrollback_page_up => {
+            const screen = ctx.terminal.screen;
+            const sb: u32 = @intCast(screen.scrollbackCount());
+            const want = screen.view_offset + screen.rows;
+            screen.view_offset = if (want > sb) sb else want;
+            screen.dirty = true;
+            return 1;
+        },
+        .scrollback_page_down => {
+            const screen = ctx.terminal.screen;
+            screen.view_offset = if (screen.view_offset >= screen.rows)
+                screen.view_offset - screen.rows
+            else
+                0;
+            screen.dirty = true;
+            return 1;
+        },
+        // Window-level: forward to the sink.
+        else => {
+            if (ctx.shortcut_sink) |f| f(ctx.shortcut_ctx, action);
+            return 1;
+        },
+    }
 }
 
 fn copySelection(ctx: *Ctx) void {

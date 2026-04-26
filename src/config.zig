@@ -21,6 +21,15 @@ pub const ExitAction = enum { close, restart, hold };
 /// AdwTabBar position relative to the window.
 pub const TabPosition = enum { top, bottom };
 
+/// Custom keybinding entry: action name + accelerator string. Action
+/// names are stable across versions (defined in `ui/input.zig`). The
+/// accelerator is a GTK accelerator string (e.g. `<Control><Shift>t`)
+/// — empty string unbinds.
+pub const KeybindEntry = struct {
+    name: []const u8,
+    accel: []const u8,
+};
+
 /// When to ask "are you sure?" before destroying panes / tabs.
 /// Matches Terminator's `ask_before_closing` semantics:
 ///   never    — close immediately, no dialog
@@ -179,6 +188,12 @@ pub const Config = struct {
     /// users prefer the unfocused pane to keep its dark theme. Set
     /// closer to 0.85 for a subtle "sleeping" effect.
     inactive_bg_dim: f32 = 1.0,
+
+    /// Custom keybindings. List of (action_name, accelerator) pairs
+    /// parsed from `keybind.<action> = <accel>` lines. An entry with
+    /// an empty accel unbinds that action; a missing entry inherits
+    /// the default. Round-trip-stable.
+    keybinds: std.ArrayList(KeybindEntry) = .{},
 
     // Per-pane titlebar (Terminator-style)
     /// Show a thin per-pane title bar above the cell grid carrying
@@ -362,6 +377,11 @@ pub const Config = struct {
         // URL detection.
         if (!self.auto_url_detect) try w.writeAll("auto_url_detect = false\n");
 
+        // Custom keybindings — emit one line per non-default override.
+        for (self.keybinds.items) |kb| {
+            try w.print("keybind.{s} = {s}\n", .{ kb.name, kb.accel });
+        }
+
         // Background opacity.
         if (self.background_opacity != 1.0)
             try w.print("background_opacity = {d:.2}\n", .{self.background_opacity});
@@ -451,6 +471,26 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
 }
 
 fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    // `keybind.<action> = <accel>` is a prefix-keyed family that's
+    // handled separately from the flat one-key-per-field set below.
+    // We dup name+value into the config arena and append; consumers
+    // (Window) translate to `[]Binding` at apply time.
+    if (std.mem.startsWith(u8, key, "keybind.")) {
+        const name = key["keybind.".len..];
+        if (name.len == 0) return error.BadKeybindName;
+        const name_dup = try arena.dupe(u8, name);
+        const accel_dup = try arena.dupe(u8, value);
+        // Replace existing entry for the same name so a later override
+        // wins over an earlier line.
+        for (cfg.keybinds.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                entry.accel = accel_dup;
+                return;
+            }
+        }
+        try cfg.keybinds.append(arena, .{ .name = name_dup, .accel = accel_dup });
+        return;
+    }
     if (std.mem.eql(u8, key, "font")) {
         cfg.font_path = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "font_size")) {
@@ -838,4 +878,43 @@ test "config: serialise round-trips through loadFromBytes" {
     try std.testing.expect(@abs(parsed.default_fg[1] - 0.5) < 0.01);
     try std.testing.expect(@abs(parsed.default_fg[2] - 0.0) < 0.01);
     try std.testing.expect(@abs(parsed.cursor_color[1] - 1.0) < 0.01);
+}
+
+test "config: keybind.<action> entries round-trip" {
+    const body =
+        \\keybind.new_tab = <Control><Shift>t
+        \\keybind.split_h = <Control><Alt>d
+        \\keybind.search_open =
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 3), cfg.keybinds.items.len);
+    try std.testing.expectEqualStrings("new_tab", cfg.keybinds.items[0].name);
+    try std.testing.expectEqualStrings("<Control><Shift>t", cfg.keybinds.items[0].accel);
+    try std.testing.expectEqualStrings("split_h", cfg.keybinds.items[1].name);
+    try std.testing.expectEqualStrings("search_open", cfg.keybinds.items[2].name);
+    try std.testing.expectEqualStrings("", cfg.keybinds.items[2].accel);
+
+    // Round-trip via serialise → re-parse.
+    var buf: [512]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+    var parsed = try Config.loadFromBytes(std.testing.allocator, out);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed.keybinds.items.len);
+    try std.testing.expectEqualStrings("<Control><Alt>d", parsed.keybinds.items[1].accel);
+}
+
+test "config: later keybind for same action overrides earlier" {
+    const body =
+        \\keybind.new_tab = <Control><Shift>t
+        \\keybind.new_tab = <Alt>n
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cfg.keybinds.items.len);
+    try std.testing.expectEqualStrings("<Alt>n", cfg.keybinds.items[0].accel);
 }

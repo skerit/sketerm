@@ -46,6 +46,12 @@ pub const Window = struct {
     /// case-sensitive by default. Mirrors Config.search_case_sensitive.
     /// Ctrl+I still toggles per-search override.
     search_force_cs: bool = false,
+    /// Resolved custom keybinding table. Built from
+    /// `Config.keybinds` overlaid on `input.default_bindings`, sorted
+    /// for first-match dispatch in `onKeyPressed`. Re-resolved on
+    /// every `applyConfigChange`.
+    bindings: std.ArrayList(@import("input.zig").Binding) = .{},
+
     /// CSS provider for the per-pane titlebar colour classes
     /// (sketerm-titlebar-active / -inactive). Loaded lazily on first
     /// applyConfigChange or initial show; regenerated whenever
@@ -247,6 +253,9 @@ pub const Window = struct {
         // populates the colours.
         self.refreshTitlebarCss();
 
+        // Resolve keybinds from defaults + Config overrides.
+        self.refreshBindings();
+
         // After the window is realized we have a GdkSurface and can
         // tell the compositor not to assume our content is opaque.
         // Without this, blending behind transparent areas may not
@@ -269,6 +278,7 @@ pub const Window = struct {
         self.panes.deinit(self.allocator);
         self.terminals.deinit(self.allocator);
         self.search_matches.deinit(self.allocator);
+        self.bindings.deinit(self.allocator);
         self.config.deinit();
         self.allocator.destroy(self);
     }
@@ -624,6 +634,7 @@ pub const Window = struct {
             ictx.smart_copy = self.config.smart_copy;
             ictx.clear_select_on_copy = self.config.clear_select_on_copy;
             ictx.mouse_autohide = self.config.mouse_autohide;
+            ictx.bindings = self.bindings.items;
         }
         pane.menu_sink = onMenuAction;
         pane.menu_sink_ctx = @ptrCast(self);
@@ -1221,6 +1232,7 @@ pub const Window = struct {
         self.search_force_cs = self.config.search_case_sensitive;
         self.setAlwaysOnTop(self.config.always_on_top);
         self.refreshOpaqueRegion();
+        self.refreshBindings();
 
         // Persist.
         self.persistConfig();
@@ -1267,6 +1279,63 @@ pub const Window = struct {
         // NULL region → "nothing in this surface is opaque" → the
         // compositor blends every pixel against what's behind us.
         c.gdk_surface_set_opaque_region(surface, null);
+    }
+
+    /// Build the active keybinding table from default_bindings overlaid
+    /// with Config.keybinds. Each (action, accel) override either
+    /// replaces a default's accel for that action OR (if the action's
+    /// default is unbound and the user-supplied accel matches an
+    /// existing default's accel) does nothing — the user can't "free
+    /// up" a default chord without an explicit unbind.
+    /// Empty accel means "unbind that action" (remove all entries).
+    /// Logs duplicate-accel collisions to stderr but doesn't error.
+    pub fn refreshBindings(self: *Window) void {
+        const input = @import("input.zig");
+        const ally = self.allocator;
+        // Reset.
+        self.bindings.clearRetainingCapacity();
+        // Start with defaults.
+        for (input.default_bindings) |b| self.bindings.append(ally, b) catch return;
+        // Apply overrides.
+        for (self.config.keybinds.items) |kb| {
+            const action = input.actionFromName(kb.name) orelse {
+                std.debug.print("sketerm: keybind: unknown action '{s}'\n", .{kb.name});
+                continue;
+            };
+            // Drop every existing binding for this action (multiple
+            // defaults may map to the same action — e.g. font_inc has
+            // 4 entries; an override clears all of them).
+            var i: usize = 0;
+            while (i < self.bindings.items.len) {
+                if (self.bindings.items[i].action == action) {
+                    _ = self.bindings.orderedRemove(i);
+                } else i += 1;
+            }
+            if (kb.accel.len == 0) continue; // unbound
+            const parsed = input.parseAccel(kb.accel) orelse {
+                std.debug.print("sketerm: keybind: bad accelerator '{s}' for '{s}'\n", .{ kb.accel, kb.name });
+                continue;
+            };
+            // Conflict warn if another action already uses this combo.
+            for (self.bindings.items) |existing| {
+                if (existing.keyval == parsed.keyval and (existing.mods & input.SIGNIFICANT_MODS) == (parsed.mods & input.SIGNIFICANT_MODS)) {
+                    std.debug.print(
+                        "sketerm: keybind: '{s}' shadows '{s}' (same accelerator)\n",
+                        .{ input.actionName(action), input.actionName(existing.action) },
+                    );
+                    break;
+                }
+            }
+            self.bindings.append(ally, .{
+                .keyval = parsed.keyval,
+                .mods = parsed.mods,
+                .action = action,
+            }) catch {};
+        }
+        // Push pointer into every existing pane's Ctx.
+        for (self.panes.items) |p| {
+            if (p.input_ctx) |ictx| ictx.bindings = self.bindings.items;
+        }
     }
 
     /// (Re)build the per-pane titlebar CSS so the four colour classes
