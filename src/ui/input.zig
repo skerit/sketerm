@@ -11,6 +11,11 @@ const clipboard = @import("clipboard.zig");
 pub const Ctx = struct {
     widget: *c.GtkWidget,
     terminal: *Terminal,
+    /// Opaque back-pointer set by Pane.init right after attach. Used
+    /// only by `mouse_autohide` so input can flip Pane's
+    /// `cursor_hidden` flag without input.zig importing pane.zig.
+    autohide_ctx: ?*anyopaque = null,
+    autohide_set: ?*const fn (ctx: ?*anyopaque, hidden: bool) void = null,
     /// Optional shortcut sink for tab/split/etc actions. May be null
     /// for top-level shortcuts handled elsewhere.
     shortcut_sink: ?*const fn (ctx: ?*anyopaque, action: Action) void = null,
@@ -27,6 +32,12 @@ pub const Ctx = struct {
     /// a no-op. Set from Config.smart_copy at attach time and on
     /// every applyConfigChange.
     smart_copy: bool = true,
+    /// Drop the active selection after a Ctrl+Shift+C copy. Mirrors
+    /// Config.clear_select_on_copy.
+    clear_select_on_copy: bool = false,
+    /// Hide the pointer over the widget while typing. Mirrors
+    /// Config.mouse_autohide. The Pane's onMotion handler restores it.
+    mouse_autohide: bool = true,
 };
 
 /// Maximum gap between consecutive presses of the same keyval that
@@ -195,6 +206,25 @@ fn onKeyPressed(
     user: ?*anyopaque,
 ) callconv(.c) c.gboolean {
     const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+
+    // mouse_autohide: hide the pointer over the widget while typing.
+    // The Pane's onMotion handler clears it again on next pointer
+    // motion. Pure modifier keys (Shift/Ctrl/Alt/Super alone) are
+    // skipped — those don't represent actual typing.
+    if (ctx.mouse_autohide) switch (keyval) {
+        c.GDK_KEY_Shift_L, c.GDK_KEY_Shift_R,
+        c.GDK_KEY_Control_L, c.GDK_KEY_Control_R,
+        c.GDK_KEY_Alt_L, c.GDK_KEY_Alt_R,
+        c.GDK_KEY_Super_L, c.GDK_KEY_Super_R,
+        c.GDK_KEY_Hyper_L, c.GDK_KEY_Hyper_R,
+        c.GDK_KEY_Meta_L, c.GDK_KEY_Meta_R,
+        c.GDK_KEY_Caps_Lock, c.GDK_KEY_Num_Lock,
+        => {},
+        else => {
+            c.gtk_widget_set_cursor_from_name(ctx.widget, "none");
+            if (ctx.autohide_set) |f| f(ctx.autohide_ctx, true);
+        },
+    };
 
     // Detect auto-repeat by comparing against the last press of the
     // same keyval within REPEAT_WINDOW_US. Used by the kitty kbd
@@ -381,6 +411,12 @@ fn copySelection(ctx: *Ctx) void {
     defer ctx.terminal.allocator.free(cstr);
     @memcpy(cstr, text);
     c.gdk_clipboard_set_text(clip, cstr.ptr);
+
+    if (ctx.clear_select_on_copy) {
+        screen.selection.clear();
+        screen.dirty = true;
+        c.gtk_widget_queue_draw(ctx.widget);
+    }
 }
 
 /// xterm modifier encoding: 1 + shift(1) + alt(2) + ctrl(4).

@@ -91,6 +91,18 @@ pub const Pane = struct {
     /// Extra pixels added to cell_h for visual line spacing (passed
     /// to Atlas.initOpts). 0 = font default.
     line_pad_px: i16 = 0,
+    /// Mouse / link / search behaviour mirrors Window.config and is
+    /// pushed down via applyConfigChange so each frame's hot path
+    /// reads from the local Pane instead of dereffing through Window.
+    copy_on_selection: bool = false,
+    clear_select_on_copy: bool = false,
+    disable_mouse_paste: bool = false,
+    disable_mousewheel_zoom: bool = false,
+    link_single_click: bool = false,
+    mouse_autohide: bool = true,
+    /// True while mouse_autohide has set the pointer to "none". The
+    /// motion handler restores the default cursor on any movement.
+    cursor_hidden: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -153,6 +165,10 @@ pub const Pane = struct {
 
         // M4: keyboard input → PTY (also handles shortcuts).
         self.input_ctx = try input.attach(area_widget, terminal, allocator);
+        if (self.input_ctx) |ictx| {
+            ictx.autohide_ctx = @ptrCast(self);
+            ictx.autohide_set = setCursorHiddenSink;
+        }
 
         // Resize → TIOCSWINSZ → SIGWINCH child.
         _ = c.g_signal_connect_data(
@@ -233,6 +249,11 @@ pub const Pane = struct {
                 const display = c.gtk_widget_get_display(@ptrCast(self.area));
                 const clip = c.gdk_display_get_clipboard(display);
                 c.gdk_clipboard_set_text(clip, cstr.ptr);
+                if (self.clear_select_on_copy) {
+                    self.terminal.screen.selection.clear();
+                    self.terminal.screen.dirty = true;
+                    c.gtk_widget_queue_draw(@ptrCast(self.area));
+                }
                 return true;
             },
             .paste => {
@@ -255,6 +276,31 @@ pub const Pane = struct {
                 return true;
             },
             else => return false,
+        }
+    }
+
+    /// Wired into input.zig's autohide_set. Lets onKeyPressed flip
+    /// Pane.cursor_hidden without input.zig importing pane.zig.
+    fn setCursorHiddenSink(ctx: ?*anyopaque, hidden: bool) void {
+        const self: *Pane = @ptrCast(@alignCast(ctx.?));
+        self.cursor_hidden = hidden;
+    }
+
+    /// Push the current selection to PRIMARY (always, for middle-
+    /// click paste) and optionally to the SYSTEM clipboard
+    /// (`copy_on_selection`). No-op when the selection is empty.
+    fn pushSelectionToClipboards(self: *Pane) void {
+        const screen = self.terminal.screen;
+        if (!screen.selection.isActive()) return;
+        const text = screen.extractSelection(self.allocator) catch return;
+        defer self.allocator.free(text);
+        if (text.len == 0) return;
+        const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return;
+        defer self.allocator.free(cstr);
+        @memcpy(cstr, text);
+        clipboard.copyToPrimary(@ptrCast(self.area), cstr);
+        if (self.copy_on_selection) {
+            clipboard.copyToClipboard(@ptrCast(self.area), cstr);
         }
     }
 
@@ -809,6 +855,13 @@ fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
 
 fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
+
+    // Restore the cursor if mouse_autohide hid it on the last keystroke.
+    if (self.cursor_hidden) {
+        self.cursor_hidden = false;
+        c.gtk_widget_set_cursor(@ptrCast(self.area), null);
+    }
+
     const cell = self.cellAt(x, y);
     const screen = self.terminal.screen;
 
@@ -904,7 +957,9 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
 
     // Middle-click PRIMARY paste when the running app isn't asking
     // for mouse reports. With mouse_mode > 0 the app sees the click.
+    // `disable_mouse_paste` opts out of this entirely.
     if (button == 2 and self.terminal.screen.mouse_mode == 0) {
+        if (self.disable_mouse_paste) return;
         clipboard.pastePrimaryFromClipboard(@ptrCast(self.area), self.terminal);
         return;
     }
@@ -934,20 +989,9 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
         } else { // 3+
             screen.selectLineAt(cell.row);
         }
-        // Push the new selection text to PRIMARY for middle-click paste.
-        if (screen.selection.isActive()) {
-            const text = screen.extractSelection(self.allocator) catch null;
-            if (text) |t| {
-                defer self.allocator.free(t);
-                if (t.len > 0) {
-                    if (self.allocator.allocSentinel(u8, t.len, 0)) |cs| {
-                        defer self.allocator.free(cs);
-                        @memcpy(cs, t);
-                        clipboard.copyToPrimary(@ptrCast(self.area), cs);
-                    } else |_| {}
-                }
-            }
-        }
+        // Push the new selection text to PRIMARY for middle-click
+        // paste; also to SYSTEM clipboard if copy_on_selection is on.
+        self.pushSelectionToClipboards();
         c.gtk_widget_queue_draw(@ptrCast(self.area));
         return;
     }
@@ -1090,16 +1134,9 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
     const moved = @abs(dx) > 4 or @abs(dy) > 4;
     if (moved) {
         // Real drag: push the selection text to PRIMARY so middle-click
-        // paste works (Linux convention).
-        if (self.terminal.screen.selection.isActive()) {
-            const text = self.terminal.screen.extractSelection(self.allocator) catch return;
-            defer self.allocator.free(text);
-            if (text.len == 0) return;
-            const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return;
-            defer self.allocator.free(cstr);
-            @memcpy(cstr, text);
-            clipboard.copyToPrimary(@ptrCast(self.area), cstr);
-        }
+        // paste works (Linux convention); also to SYSTEM clipboard if
+        // copy_on_selection is on.
+        self.pushSelectionToClipboards();
         return;
     }
 
@@ -1111,7 +1148,9 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
     const event = c.gtk_event_controller_get_current_event(@ptrCast(g));
     if (event == null) return;
     const mods = c.gdk_event_get_modifier_state(event);
-    if (mods & c.GDK_CONTROL_MASK == 0) return;
+    // Plain click activates links when `link_single_click` is set;
+    // otherwise require Ctrl.
+    if (!self.link_single_click and (mods & c.GDK_CONTROL_MASK) == 0) return;
 
     var sx: f64 = 0;
     var sy: f64 = 0;
@@ -1135,6 +1174,24 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
 fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Pane = @ptrCast(@alignCast(user.?));
     const screen = self.terminal.screen;
+
+    // Ctrl+wheel = font-size zoom (Terminator/gnome-terminal/iTerm
+    // convention). Only active when not disabled and not currently
+    // captured by a TUI's mouse model.
+    if (!self.disable_mousewheel_zoom and screen.mouse_mode == 0) {
+        const ev_z = c.gtk_event_controller_get_current_event(@ptrCast(g));
+        if (ev_z != null) {
+            const mods_z = c.gdk_event_get_modifier_state(ev_z);
+            if (mods_z & c.GDK_CONTROL_MASK != 0) {
+                if (dy < 0) {
+                    self.setFontSize(@min(self.font_size + 1, 72));
+                } else if (dy > 0) {
+                    self.setFontSize(@max(self.font_size - 1, 6));
+                }
+                return 1;
+            }
+        }
+    }
 
     // Apps in alt-screen + mouse mode (htop, vim, less, …) want
     // wheel events as mouse buttons 4 / 5. Send those instead of
