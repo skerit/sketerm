@@ -1174,3 +1174,42 @@ settings, all live-applied + persisted to disk on every change.
   preview swatches when a scheme is picked. The values DO take
   effect; reopening the dialog reflects them.
 
+
+## Prefs wiring tick
+
+The dialog from the previous tick exposed ~30 settings but several
+weren't actually plumbed through to behaviour. This pass wires:
+
+- **bell_visible / bell_urgent** — gate the visible-flash and
+  AdwTabPage.needs_attention paths in onTermBell. Audible was
+  already wired.
+- **cursor_color_default** — translates to the renderer's
+  alpha=0 sentinel ("use foreground"). Set on initial pane spawn
+  and applyConfigChange.
+- **login_shell** — Pty.SpawnOpts gains login_shell; argv[0]'s
+  basename is prepended with `-` per Unix convention so the
+  shell sources /etc/profile + ~/.profile.
+- **scroll_on_output** — new Screen.scroll_on_output flag;
+  lineFeed snaps view_offset to 0 when set. Lets users opt into
+  gnome-terminal's "auto-tail on output" behaviour.
+- **smart_copy** — Ctrl+Shift+C with no selection sends Ctrl+C
+  (0x03) instead of being a no-op. Field added to input.Ctx.
+- **word_chars** — isWordChar now consults Screen.word_chars
+  for punctuation; double-click selection respects the user's
+  set.
+
+Still not wired (deliberately deferred):
+
+- **tab_position** — the dialog combo writes to config, but
+  AdwToolbarView's add_top_bar / add_bottom_bar require the
+  tab-bar widget reference. Keeping it as a Window field is a
+  small refactor; values are plumbed through, just not visually.
+- **close_button_on_tab** — Adwaita's AdwTabView doesn't expose
+  a global close-button toggle (per-page only via property
+  `closable` which we'd need to walk all pages on every change).
+- **exit_action** — Pane.onChildEof currently closes; restart /
+  hold need separate spawn / banner widgets.
+
+Initial pane spawn now also pushes the user's palette[0..15] when
+set, so the first prompt picks up the configured scheme.
+
