@@ -28,6 +28,10 @@ pub const ApplyFn = *const fn (win: *WindowOpaque, new_cfg: *const Config) void;
 
 const Ctx = struct {
     allocator: std.mem.Allocator,
+    /// Owned strings duped from user input (font path, shell, word
+    /// chars, …). Reaped when the dialog closes — independent of
+    /// Window.config.arena which manages the long-lived strings.
+    arena: std.heap.ArenaAllocator,
     win: *WindowOpaque,
     apply: ApplyFn,
     /// Working copy. Each row writes here, then we call `apply`.
@@ -35,6 +39,10 @@ const Ctx = struct {
 
     fn ev(self: *Ctx) void {
         self.apply(self.win, &self.cfg);
+    }
+
+    fn dupe(self: *Ctx, s: []const u8) ![]const u8 {
+        return self.arena.allocator().dupe(u8, s);
     }
 };
 
@@ -52,6 +60,7 @@ pub fn open(
     const ctx = try allocator.create(Ctx);
     ctx.* = .{
         .allocator = allocator,
+        .arena = std.heap.ArenaAllocator.init(allocator),
         .win = win_ptr,
         .apply = apply,
         .cfg = initial,
@@ -79,6 +88,7 @@ pub fn open(
 
 fn onClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {
     const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    ctx.arena.deinit();
     ctx.allocator.destroy(ctx);
 }
 
@@ -349,8 +359,7 @@ fn onChooseFontDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaq
     // Owned via Config.arena (allocator-independent: dupe into our
     // Ctx allocator since the working cfg in the dialog has no arena
     // — apply path will arena-dupe on persist).
-    const dup = ctx.allocator.dupe(u8, slice) catch return;
-    if (ctx.cfg.font_path) |old| ctx.allocator.free(@constCast(old));
+    const dup = ctx.dupe(slice) catch return;
     ctx.cfg.font_path = dup;
     ctx.ev();
 }
@@ -729,7 +738,7 @@ fn entryStringChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void 
     const txt = c.gtk_editable_get_text(row);
     if (txt == null) return;
     const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
-    const dup = sctx.parent.allocator.dupe(u8, slice) catch return;
+    const dup = sctx.parent.dupe(slice) catch return;
     sctx.field.* = dup;
     sctx.on_change(sctx.parent);
 }
@@ -760,7 +769,7 @@ fn shellEntryChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
     if (slice.len == 0) {
         ctx.cfg.shell = null;
     } else {
-        const dup = ctx.allocator.dupe(u8, slice) catch return;
+        const dup = ctx.dupe(slice) catch return;
         ctx.cfg.shell = dup;
     }
     ctx.ev();

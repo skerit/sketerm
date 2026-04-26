@@ -982,9 +982,19 @@ pub const Window = struct {
         const old_pad = self.config.padding;
         const old_blink_ms = self.config.cursor_blink_ms;
         const old_tab_pos = self.config.tab_position;
-        // Replace config wholesale (string fields stay borrowed from
-        // the dialog's working copy until next reload).
+        // Replace config wholesale, but dup any string fields into
+        // the long-lived Window.config.arena. Without this, strings
+        // duped by the dialog into its own arena would dangle when
+        // the dialog closes.
         self.config = new_cfg.*;
+        if (self.config.arena == null) self.config.arena = std.heap.ArenaAllocator.init(self.allocator);
+        const arena = self.config.arena.?.allocator();
+        if (self.config.font_path) |fp| self.config.font_path = arena.dupe(u8, fp) catch self.config.font_path;
+        if (self.config.shell) |sh| self.config.shell = arena.dupe(u8, sh) catch self.config.shell;
+        self.config.term_env = arena.dupe(u8, self.config.term_env) catch self.config.term_env;
+        self.config.color_term_env = arena.dupe(u8, self.config.color_term_env) catch self.config.color_term_env;
+        self.config.word_chars = arena.dupe(u8, self.config.word_chars) catch self.config.word_chars;
+        if (self.config.scheme.len > 0) self.config.scheme = arena.dupe(u8, self.config.scheme) catch self.config.scheme;
 
         // Push into every pane.
         for (self.panes.items) |p| {
