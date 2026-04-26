@@ -586,6 +586,10 @@ pub const Window = struct {
         pane.cell_pass.bold_is_bright = self.config.bold_is_bright;
         // Per-pane titlebar visibility.
         pane.setTitlebarVisible(self.config.show_titlebar);
+        // Inactive-pane dimming factors.
+        pane.inactive_fg_dim = self.config.inactive_fg_dim;
+        pane.inactive_bg_dim = self.config.inactive_bg_dim;
+        pane.applyDim();
         return pane;
     }
 
@@ -1119,6 +1123,10 @@ pub const Window = struct {
             p.mouse_autohide = self.config.mouse_autohide;
             // Per-pane titlebar visibility.
             p.setTitlebarVisible(self.config.show_titlebar);
+            // Inactive-pane dimming.
+            p.inactive_fg_dim = self.config.inactive_fg_dim;
+            p.inactive_bg_dim = self.config.inactive_bg_dim;
+            p.applyDim();
             // Repaint.
             screen.dirty = true;
             p.cell_pass.markAllDirty();

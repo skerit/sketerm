@@ -60,6 +60,12 @@ const VERT_SRC =
     \\
     \\uniform vec2 u_screen_px;
     \\uniform int u_kind; // 0 = bg, 1 = glyph, 2 = decoration
+    \\// Inactive-pane dimming. 1.0 = no dim. Applied to both fg
+    \\// (glyphs + decorations) and bg quads. Cursor / selection /
+    \\// border / search overlay live in a different pass and stay at
+    \\// full brightness.
+    \\uniform float u_dim_fg;
+    \\uniform float u_dim_bg;
     \\
     \\out vec4 v_color;
     \\out vec3 v_uvw;
@@ -83,13 +89,13 @@ const VERT_SRC =
     \\    v_deco_local = vec2(0.0);
     \\    v_deco_w_px = a_cell_size.x;
     \\    if (u_kind == 0) {
-    \\        v_color = a_bg;
+    \\        v_color = vec4(a_bg.rgb * u_dim_bg, a_bg.a);
     \\        v_is_glyph = 0.0;
     \\        v_emit = (a_bg.a > 0.001) ? 1.0 : 0.0;
     \\    } else if (u_kind == 1) {
     \\        origin = a_glyph_xy;
     \\        size = a_glyph_size;
-    \\        v_color = a_fg;
+    \\        v_color = vec4(a_fg.rgb * u_dim_fg, a_fg.a);
     \\        uv = mix(a_glyph_uv0, a_glyph_uv1, corner);
     \\        v_is_glyph = 1.0;
     \\        v_emit = (a_has_glyph < 0.5 && a_glyph_size.x > 0.0 && a_glyph_size.y > 0.0) ? 1.0 : 0.0;
@@ -126,7 +132,7 @@ const VERT_SRC =
     \\        }
     \\        origin = a_cell_xy + vec2(0.0, dy);
     \\        size = vec2(a_cell_size.x, dh);
-    \\        v_color = a_fg;
+    \\        v_color = vec4(a_fg.rgb * u_dim_fg, a_fg.a);
     \\        v_is_glyph = 0.0;
     \\        v_deco_kind = a_deco;
     \\        v_deco_local = corner;
@@ -207,6 +213,15 @@ pub const CellPass = struct {
     u_screen_px: c_int = -1,
     u_atlas: c_int = -1,
     u_kind: c_int = -1,
+    u_dim_fg: c_int = -1,
+    u_dim_bg: c_int = -1,
+
+    /// Dimming applied to fg / bg (and decorations) when the pane is
+    /// unfocused. 1.0 = no dim. Set by the renderer (Window /
+    /// Pane.onFocusEnter/Leave) — defaults at init are 1.0 so a single
+    /// pane with no focus tracking renders normally.
+    dim_fg: f32 = 1.0,
+    dim_bg: f32 = 1.0,
 
     /// Persistent instance buffer (rows × cols instances).
     instances: std.ArrayList(Instance) = .{},
@@ -272,6 +287,8 @@ pub const CellPass = struct {
         self.u_screen_px = -1;
         self.u_atlas = -1;
         self.u_kind = -1;
+        self.u_dim_fg = -1;
+        self.u_dim_bg = -1;
         self.vbo_capacity = 0;
         // Mark every row to re-upload into the new context.
         for (self.row_needs_upload.items) |*r| r.* = true;
@@ -283,6 +300,8 @@ pub const CellPass = struct {
         self.u_screen_px = c.glGetUniformLocation(self.program, "u_screen_px");
         self.u_atlas = c.glGetUniformLocation(self.program, "u_atlas");
         self.u_kind = c.glGetUniformLocation(self.program, "u_kind");
+        self.u_dim_fg = c.glGetUniformLocation(self.program, "u_dim_fg");
+        self.u_dim_bg = c.glGetUniformLocation(self.program, "u_dim_bg");
 
         c.glGenVertexArrays(1, &self.vao);
         c.glBindVertexArray(self.vao);
@@ -697,6 +716,8 @@ pub const CellPass = struct {
         if (self.program == 0 or self.instances.items.len == 0) return;
         c.glUseProgram(self.program);
         c.glUniform2f(self.u_screen_px, @floatFromInt(viewport_w), @floatFromInt(viewport_h));
+        c.glUniform1f(self.u_dim_fg, self.dim_fg);
+        c.glUniform1f(self.u_dim_bg, self.dim_bg);
         c.glActiveTexture(c.GL_TEXTURE0);
         c.glBindTexture(c.GL_TEXTURE_2D_ARRAY, atlas.gl_tex);
         c.glUniform1i(self.u_atlas, 0);

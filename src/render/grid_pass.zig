@@ -26,8 +26,14 @@ const VERT_SRC =
     \\in vec3 a_uv; // (u, v, layer)
     \\in vec4 a_color;
     \\in float a_is_glyph;
+    \\// Per-vertex dim source: 0 = no dim (cursor, selection, focus
+    \\// border, search highlight, bell flash); 1 = use u_dim_fg (cell
+    \\// glyphs, IME preedit); 2 = use u_dim_bg (cell bg quads).
+    \\in float a_dim;
     \\
     \\uniform vec2 u_screen_px;
+    \\uniform float u_dim_fg;
+    \\uniform float u_dim_bg;
     \\
     \\out vec3 v_uv;
     \\out vec4 v_color;
@@ -38,7 +44,10 @@ const VERT_SRC =
     \\    ndc.y = -ndc.y;
     \\    gl_Position = vec4(ndc, 0.0, 1.0);
     \\    v_uv = a_uv;
-    \\    v_color = a_color;
+    \\    float k = 1.0;
+    \\    if (a_dim > 1.5) k = u_dim_bg;
+    \\    else if (a_dim > 0.5) k = u_dim_fg;
+    \\    v_color = vec4(a_color.rgb * k, a_color.a);
     \\    v_is_glyph = a_is_glyph;
     \\}
 ;
@@ -71,6 +80,7 @@ const Vertex = extern struct {
     uv: [3]f32,
     color: [4]f32,
     is_glyph: f32,
+    dim: f32 = 0.0,
 };
 
 pub const GridPass = struct {
@@ -79,6 +89,14 @@ pub const GridPass = struct {
     vbo: c_uint = 0,
     u_screen_px: c_int = -1,
     u_atlas: c_int = -1,
+    u_dim_fg: c_int = -1,
+    u_dim_bg: c_int = -1,
+    /// Inactive-pane dimming. fg multiplier (glyphs + IME preedit) and
+    /// bg multiplier (cell bg quads in bidi/DW overlay rows). Cursor,
+    /// focus border, selection, search highlight, bell flash are
+    /// emitted with `a_dim = 0` so they stay full-bright regardless.
+    dim_fg: f32 = 1.0,
+    dim_bg: f32 = 1.0,
     vbuf: std.ArrayList(Vertex) = .{},
     /// Default fg/bg used by overlays that need them (preedit text).
     default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
@@ -130,6 +148,8 @@ pub const GridPass = struct {
         self.vbo = 0;
         self.u_screen_px = -1;
         self.u_atlas = -1;
+        self.u_dim_fg = -1;
+        self.u_dim_bg = -1;
     }
 
     pub fn realize(self: *GridPass) !void {
@@ -143,6 +163,8 @@ pub const GridPass = struct {
         self.program = try gl.buildProgram(VERT_SRC, FRAG_SRC);
         self.u_screen_px = c.glGetUniformLocation(self.program, "u_screen_px");
         self.u_atlas = c.glGetUniformLocation(self.program, "u_atlas");
+        self.u_dim_fg = c.glGetUniformLocation(self.program, "u_dim_fg");
+        self.u_dim_bg = c.glGetUniformLocation(self.program, "u_dim_bg");
 
         c.glGenVertexArrays(1, &self.vao);
         c.glBindVertexArray(self.vao);
@@ -154,6 +176,7 @@ pub const GridPass = struct {
         const a_uv: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_uv"));
         const a_color: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_color"));
         const a_is_glyph: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_is_glyph"));
+        const a_dim: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_dim"));
 
         c.glEnableVertexAttribArray(a_pos);
         c.glVertexAttribPointer(a_pos, 2, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "pos")));
@@ -163,6 +186,8 @@ pub const GridPass = struct {
         c.glVertexAttribPointer(a_color, 4, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "color")));
         c.glEnableVertexAttribArray(a_is_glyph);
         c.glVertexAttribPointer(a_is_glyph, 1, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "is_glyph")));
+        c.glEnableVertexAttribArray(a_dim);
+        c.glVertexAttribPointer(a_dim, 1, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "dim")));
 
         c.glBindVertexArray(0);
     }
@@ -309,13 +334,16 @@ pub const GridPass = struct {
                 const x: f32 = pad + @as(f32, @floatFromInt(target_col)) * cw;
                 const y: f32 = pad + @as(f32, @floatFromInt(screen.row)) * ch;
                 const cell_w_count: u16 = if (Screen.isWide(cp)) 2 else 1;
-                try self.pushQuad(
+                // IME preedit bg + glyph + underline all dim with cell
+                // content so the unfocused pane stays consistent.
+                try self.pushQuadDim(
                     .{ x, y },
                     .{ cw * @as(f32, @floatFromInt(cell_w_count)), ch },
                     .{ 0, 0 },
                     .{ 0, 0 },
                     .{ 0.05, 0.05, 0.10, 0.85 },
                     0.0,
+                    2.0,
                 );
                 const g = atlas.lookupOrLoad(cp) catch {
                     idx += seq_len;
@@ -327,15 +355,18 @@ pub const GridPass = struct {
                     const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y));
                     const gw: f32 = @floatFromInt(g.w);
                     const gh: f32 = @floatFromInt(g.h);
-                    try self.pushGlyphQuad(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), self.default_fg);
+                    // IME preedit text is treated as cell content — dim
+                    // it the same way as bidi/DW glyphs when unfocused.
+                    try self.pushGlyphQuadDim(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), self.default_fg, 1.0);
                 }
-                try self.pushQuad(
+                try self.pushQuadDim(
                     .{ x, y + ch - 2 },
                     .{ cw * @as(f32, @floatFromInt(cell_w_count)), 2 },
                     .{ 0, 0 },
                     .{ 0, 0 },
                     .{ 0.4, 0.55, 0.85, 0.95 },
                     0.0,
+                    1.0,
                 );
                 col_off += cell_w_count;
                 idx += seq_len;
@@ -475,7 +506,8 @@ pub const GridPass = struct {
             else
                 self.resolveColor(style.bg, false);
             const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
-            try self.pushQuad(.{ x, y }, .{ cw * x_scale, ch }, .{ 0, 0 }, .{ 0, 0 }, bg, 0.0);
+            // Cell content bg — apply bg-dim when unfocused.
+            try self.pushQuadDim(.{ x, y }, .{ cw * x_scale, ch }, .{ 0, 0 }, .{ 0, 0 }, bg, 0.0, 2.0);
         }
 
         // Glyphs — bidi-reorder runs to visual order before shaping.
@@ -537,7 +569,8 @@ pub const GridPass = struct {
                 const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;
                 const gw: f32 = @as(f32, @floatFromInt(g.w)) * x_scale;
                 const gh: f32 = @as(f32, @floatFromInt(g.h)) * y_scale;
-                try self.pushGlyphQuad(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg);
+                // emitLogicalGlyphs is cell content — dim when unfocused.
+                try self.pushGlyphQuadDim(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0);
             }
             col += 1;
         }
@@ -595,7 +628,8 @@ pub const GridPass = struct {
             const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;
             const gw: f32 = @as(f32, @floatFromInt(g.w)) * x_scale;
             const gh: f32 = @as(f32, @floatFromInt(g.h)) * y_scale;
-            try self.pushGlyphQuad(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg);
+            // emitBidiGlyphs is cell content — dim when unfocused.
+            try self.pushGlyphQuadDim(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0);
         }
     }
 
@@ -608,17 +642,30 @@ pub const GridPass = struct {
         color: [4]f32,
         is_glyph: f32,
     ) !void {
+        return self.pushQuadDim(origin, size, uv0, uv1, color, is_glyph, 0.0);
+    }
+
+    fn pushQuadDim(
+        self: *GridPass,
+        origin: [2]f32,
+        size: [2]f32,
+        uv0: [2]f32,
+        uv1: [2]f32,
+        color: [4]f32,
+        is_glyph: f32,
+        dim: f32,
+    ) !void {
         const px0 = origin[0];
         const py0 = origin[1];
         const px1 = origin[0] + size[0];
         const py1 = origin[1] + size[1];
         const verts = [_]Vertex{
-            .{ .pos = .{ px0, py0 }, .uv = .{ uv0[0], uv0[1], 0 }, .color = color, .is_glyph = is_glyph },
-            .{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], 0 }, .color = color, .is_glyph = is_glyph },
-            .{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], 0 }, .color = color, .is_glyph = is_glyph },
-            .{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], 0 }, .color = color, .is_glyph = is_glyph },
-            .{ .pos = .{ px1, py1 }, .uv = .{ uv1[0], uv1[1], 0 }, .color = color, .is_glyph = is_glyph },
-            .{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], 0 }, .color = color, .is_glyph = is_glyph },
+            .{ .pos = .{ px0, py0 }, .uv = .{ uv0[0], uv0[1], 0 }, .color = color, .is_glyph = is_glyph, .dim = dim },
+            .{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], 0 }, .color = color, .is_glyph = is_glyph, .dim = dim },
+            .{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], 0 }, .color = color, .is_glyph = is_glyph, .dim = dim },
+            .{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], 0 }, .color = color, .is_glyph = is_glyph, .dim = dim },
+            .{ .pos = .{ px1, py1 }, .uv = .{ uv1[0], uv1[1], 0 }, .color = color, .is_glyph = is_glyph, .dim = dim },
+            .{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], 0 }, .color = color, .is_glyph = is_glyph, .dim = dim },
         };
         try self.vbuf.appendSlice(self.allocator, &verts);
     }
@@ -632,17 +679,30 @@ pub const GridPass = struct {
         layer: f32,
         color: [4]f32,
     ) !void {
+        return self.pushGlyphQuadDim(origin, size, uv0, uv1, layer, color, 0.0);
+    }
+
+    fn pushGlyphQuadDim(
+        self: *GridPass,
+        origin: [2]f32,
+        size: [2]f32,
+        uv0: [2]f32,
+        uv1: [2]f32,
+        layer: f32,
+        color: [4]f32,
+        dim: f32,
+    ) !void {
         const px0 = origin[0];
         const py0 = origin[1];
         const px1 = origin[0] + size[0];
         const py1 = origin[1] + size[1];
         const verts = [_]Vertex{
-            .{ .pos = .{ px0, py0 }, .uv = .{ uv0[0], uv0[1], layer }, .color = color, .is_glyph = 1.0 },
-            .{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], layer }, .color = color, .is_glyph = 1.0 },
-            .{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], layer }, .color = color, .is_glyph = 1.0 },
-            .{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], layer }, .color = color, .is_glyph = 1.0 },
-            .{ .pos = .{ px1, py1 }, .uv = .{ uv1[0], uv1[1], layer }, .color = color, .is_glyph = 1.0 },
-            .{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], layer }, .color = color, .is_glyph = 1.0 },
+            .{ .pos = .{ px0, py0 }, .uv = .{ uv0[0], uv0[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim },
+            .{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim },
+            .{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim },
+            .{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim },
+            .{ .pos = .{ px1, py1 }, .uv = .{ uv1[0], uv1[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim },
+            .{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim },
         };
         try self.vbuf.appendSlice(self.allocator, &verts);
     }
@@ -692,6 +752,8 @@ pub const GridPass = struct {
         if (self.vbuf.items.len == 0) return;
         c.glUseProgram(self.program);
         c.glUniform2f(self.u_screen_px, @floatFromInt(viewport_w), @floatFromInt(viewport_h));
+        c.glUniform1f(self.u_dim_fg, self.dim_fg);
+        c.glUniform1f(self.u_dim_bg, self.dim_bg);
         c.glActiveTexture(c.GL_TEXTURE0);
         c.glBindTexture(c.GL_TEXTURE_2D_ARRAY, atlas.gl_tex);
         c.glUniform1i(self.u_atlas, 0);

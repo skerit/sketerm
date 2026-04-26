@@ -131,6 +131,14 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addColorRow(@ptrCast(@alignCast(tb_group)), ctx, "Inactive foreground", &ctx.cfg.title_inactive_fg);
     addColorRow(@ptrCast(@alignCast(tb_group)), ctx, "Inactive background", &ctx.cfg.title_inactive_bg);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(tb_group)));
+
+    // Inactive pane dimming.
+    const dim_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(dim_group)), "Inactive pane dimming");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(dim_group)), "Multiply unfocused panes' colours. 1.0 = no dim. Defaults match Terminator (fg 0.8, bg 1.0).");
+    addSpinRowF32Step(@ptrCast(@alignCast(dim_group)), ctx, "Foreground dim", "Multiplier for text + decorations.", 0.0, 1.0, 0.05, 2, &ctx.cfg.inactive_fg_dim, applyOnly);
+    addSpinRowF32Step(@ptrCast(@alignCast(dim_group)), ctx, "Background dim", "Multiplier for cell backgrounds.", 0.0, 1.0, 0.05, 2, &ctx.cfg.inactive_bg_dim, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(dim_group)));
 }
 
 // ── Generic row helpers ─────────────────────────────────────────
@@ -256,8 +264,23 @@ fn addSpinRowF32(
     field: *f32,
     on_change: *const fn (*Ctx) void,
 ) void {
-    const adj = c.gtk_adjustment_new(field.*, lo, hi, 0.5, 1.0, 0);
-    const row = c.adw_spin_row_new(adj, 0.5, 1);
+    addSpinRowF32Step(group, ctx, title, subtitle, lo, hi, 0.5, 1, field, on_change);
+}
+
+fn addSpinRowF32Step(
+    group: *c.AdwPreferencesGroup,
+    ctx: *Ctx,
+    title: [*:0]const u8,
+    subtitle: [*:0]const u8,
+    lo: f64,
+    hi: f64,
+    step: f64,
+    digits: c_uint,
+    field: *f32,
+    on_change: *const fn (*Ctx) void,
+) void {
+    const adj = c.gtk_adjustment_new(field.*, lo, hi, step, step * 10.0, 0);
+    const row = c.adw_spin_row_new(adj, step, digits);
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), subtitle);
     const sctx = ctx.allocator.create(SpinF32Ctx) catch return;

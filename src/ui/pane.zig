@@ -119,6 +119,13 @@ pub const Pane = struct {
     /// Latest OSC 0/1/2 title text. Owned; freed in deinit.
     titlebar_text: ?[]u8 = null,
 
+    /// Inactive-pane dimming. When `is_focused` is false, the renderer
+    /// multiplies fg/bg colours by `inactive_fg_dim` / `inactive_bg_dim`.
+    /// Cursor / selection / overlay stay full-bright.
+    is_focused: bool = false,
+    inactive_fg_dim: f32 = 0.8,
+    inactive_bg_dim: f32 = 1.0,
+
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
         errdefer allocator.destroy(self);
@@ -344,6 +351,22 @@ pub const Pane = struct {
     fn setCursorHiddenSink(ctx: ?*anyopaque, hidden: bool) void {
         const self: *Pane = @ptrCast(@alignCast(ctx.?));
         self.cursor_hidden = hidden;
+    }
+
+    /// Push the current focus / dim settings into the renderer. Called
+    /// on focus change AND when dim factors change via prefs.
+    pub fn applyDim(self: *Pane) void {
+        if (self.is_focused) {
+            self.cell_pass.dim_fg = 1.0;
+            self.cell_pass.dim_bg = 1.0;
+            self.grid_pass.dim_fg = 1.0;
+            self.grid_pass.dim_bg = 1.0;
+        } else {
+            self.cell_pass.dim_fg = self.inactive_fg_dim;
+            self.cell_pass.dim_bg = self.inactive_bg_dim;
+            self.grid_pass.dim_fg = self.inactive_fg_dim;
+            self.grid_pass.dim_bg = self.inactive_bg_dim;
+        }
     }
 
     /// Push the current selection to PRIMARY (always, for middle-
@@ -955,6 +978,9 @@ fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     self.terminal.screen.dirty = true;
     // Per-pane titlebar: red (active) when this pane has focus.
     self.setTitlebarActive(true);
+    // Inactive-pane dimming: full brightness now.
+    self.is_focused = true;
+    self.applyDim();
 }
 
 fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
@@ -966,6 +992,9 @@ fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     self.terminal.screen.dirty = true;
     // Per-pane titlebar: grey (inactive) when focus leaves.
     self.setTitlebarActive(false);
+    // Inactive-pane dimming: apply the configured factors.
+    self.is_focused = false;
+    self.applyDim();
 }
 
 fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {

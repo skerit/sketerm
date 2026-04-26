@@ -142,6 +142,18 @@ pub const Config = struct {
     /// the original colour and only changes weight.
     bold_is_bright: bool = true,
 
+    // Inactive pane dimming (Terminator-style: multiply RGB channels)
+    /// Multiplier applied to foreground colours of unfocused panes.
+    /// 1.0 = no dim; 0.0 = fully black. Terminator default is 0.8 —
+    /// the unfocused text becomes visibly dimmer without hurting
+    /// readability. Cursor, selection, overlay, and decorations
+    /// stay at full brightness.
+    inactive_fg_dim: f32 = 0.8,
+    /// Same for background. Default 1.0 means "no dim on bg" — most
+    /// users prefer the unfocused pane to keep its dark theme. Set
+    /// closer to 0.85 for a subtle "sleeping" effect.
+    inactive_bg_dim: f32 = 1.0,
+
     // Per-pane titlebar (Terminator-style)
     /// Show a thin per-pane title bar above the cell grid carrying
     /// the OSC 0/1/2 terminal title. Off by default — many users
@@ -319,6 +331,12 @@ pub const Config = struct {
         if (!self.allow_bold) try w.writeAll("allow_bold = false\n");
         if (!self.bold_is_bright) try w.writeAll("bold_is_bright = false\n");
 
+        // Inactive pane dimming.
+        if (self.inactive_fg_dim != 0.8)
+            try w.print("inactive_fg_dim = {d:.2}\n", .{self.inactive_fg_dim});
+        if (self.inactive_bg_dim != 1.0)
+            try w.print("inactive_bg_dim = {d:.2}\n", .{self.inactive_bg_dim});
+
         // Per-pane titlebar.
         if (self.show_titlebar) try w.writeAll("show_titlebar = true\n");
         const default_taf: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
@@ -494,6 +512,10 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.allow_bold = try parseBool(value);
     } else if (std.mem.eql(u8, key, "bold_is_bright")) {
         cfg.bold_is_bright = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "inactive_fg_dim")) {
+        cfg.inactive_fg_dim = std.math.clamp(try parseFloat(value), 0.0, 1.0);
+    } else if (std.mem.eql(u8, key, "inactive_bg_dim")) {
+        cfg.inactive_bg_dim = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "show_titlebar")) {
         cfg.show_titlebar = try parseBool(value);
     } else if (std.mem.eql(u8, key, "title_active_fg")) {
