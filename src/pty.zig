@@ -166,7 +166,13 @@ pub const Pty = struct {
         var written: usize = 0;
         while (written < bytes.len) {
             const n = c.write(self.master_fd, bytes.ptr + written, bytes.len - written);
-            if (n <= 0) break;
+            if (n < 0) {
+                const errn = std.posix.errno(n);
+                if (errn == .INTR) continue; // signal interrupted — retry
+                if (errn == .AGAIN) break; // PTY buffer full and we're non-blocking
+                break;
+            }
+            if (n == 0) break;
             written += @intCast(n);
         }
         return written;
