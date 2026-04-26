@@ -14,6 +14,10 @@ const Config = @import("../config.zig").Config;
 pub const Window = struct {
     app_window: *c.GtkWidget,
     tab_view: *c.AdwTabView,
+    /// Held so applyConfigChange can re-parent the tab bar between
+    /// top and bottom of the toolbar view at runtime.
+    tab_bar: *c.GtkWidget,
+    toolbar_view: *c.GtkWidget,
     title_buf: [256]u8 = undefined,
     panes: std.ArrayList(*Pane) = .{},
     terminals: std.ArrayList(*Terminal) = .{},
@@ -117,6 +121,8 @@ pub const Window = struct {
         self.* = .{
             .app_window = app_window,
             .tab_view = @ptrCast(tab_view_w),
+            .tab_bar = @ptrCast(@alignCast(tab_bar_w)),
+            .toolbar_view = @ptrCast(@alignCast(toolbar_view)),
             .allocator = allocator,
             .config = if (config_override) |co| co else Config.load(allocator),
             .search_bar = search_bar,
@@ -186,6 +192,12 @@ pub const Window = struct {
             null,
             c.G_CONNECT_DEFAULT,
         );
+
+        // Apply persisted tab_position. Init defaults to top via the
+        // add_top_bar call earlier; only reposition on bottom.
+        if (self.config.tab_position == .bottom) {
+            self.setTabPosition(.bottom);
+        }
 
         return self;
     }
@@ -963,6 +975,7 @@ pub const Window = struct {
         const old_size = self.config.font_size;
         const old_pad = self.config.padding;
         const old_blink_ms = self.config.cursor_blink_ms;
+        const old_tab_pos = self.config.tab_position;
         // Replace config wholesale (string fields stay borrowed from
         // the dialog's working copy until next reload).
         self.config = new_cfg.*;
@@ -1024,6 +1037,11 @@ pub const Window = struct {
             for (self.panes.items) |p| p.setFontSize(self.config.font_size);
         }
 
+        // Tab position swap.
+        if (self.config.tab_position != old_tab_pos) {
+            self.setTabPosition(self.config.tab_position);
+        }
+
         // Persist.
         self.persistConfig();
     }
@@ -1034,6 +1052,18 @@ pub const Window = struct {
         self.config.save(path) catch |err| {
             std.debug.print("sketerm: prefs persist failed: {s}\n", .{@errorName(err)});
         };
+    }
+
+    /// Move the tab bar to the top or bottom of the toolbar view.
+    /// Idempotent — safe to call when the bar is already there.
+    pub fn setTabPosition(self: *Window, pos: @import("../config.zig").TabPosition) void {
+        // Remove from whichever bar holds it now (Adw allows safe
+        // removal from top OR bottom regardless of current location).
+        c.adw_toolbar_view_remove(@ptrCast(@alignCast(self.toolbar_view)), self.tab_bar);
+        switch (pos) {
+            .top => c.adw_toolbar_view_add_top_bar(@ptrCast(@alignCast(self.toolbar_view)), self.tab_bar),
+            .bottom => c.adw_toolbar_view_add_bottom_bar(@ptrCast(@alignCast(self.toolbar_view)), self.tab_bar),
+        }
     }
 
     /// Close the focused pane. If it's the only pane in its tab,
