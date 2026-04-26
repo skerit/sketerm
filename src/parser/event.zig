@@ -54,9 +54,10 @@ pub const Event = union(enum) {
     /// PTY reached EOF (child closed all references to the slave).
     child_eof: i32,
 
-    /// Up to 64 printable bytes accumulated by the parser. Sized to
-    /// fit comfortably within the existing union footprint (Csi is
-    /// the largest at ~92 B; PrintRun is ~66 B).
+    /// Up to 64 printable bytes accumulated by the parser. After
+    /// shrinking Csi/Dcs, PrintRun is the union-size limiter at
+    /// 65 bytes. Bumping to 128 was tried and showed no measurable
+    /// throughput win while doubling Event size, so 64 stays.
     pub const PrintRun = struct {
         bytes: [64]u8 = .{0} ** 64,
         len: u8 = 0,
