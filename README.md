@@ -164,6 +164,21 @@ zig-out/bin/sketerm --help
 - [References](docs/references.md) — specs and study targets
 - [Risks](docs/risks.md) — risks and mitigations
 
+## Shell integration
+
+`data/sketerm-shell-integration.{bash,zsh,fish}` — source the one
+that matches your shell to enable:
+
+- **OSC 7 cwd reporting** so layout save remembers each pane's
+  directory, and `Ctrl+Shift+T` / `Ctrl+Shift+D` inherit it.
+- **OSC 133 prompt marks** so `Ctrl+Shift+Up/Down` jumps between
+  prompts in scrollback.
+- **`sketerm_copy`** helper — pipe text through it to set the
+  local clipboard via OSC 52, even over SSH.
+
+Each script self-skips when `$TERM_PROGRAM` is not `sketerm`, so
+sourcing unconditionally is safe.
+
 ## License
 
 TBD.
