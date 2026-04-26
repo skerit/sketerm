@@ -523,6 +523,7 @@ pub const Window = struct {
         if (pane.input_ctx) |ictx| {
             ictx.shortcut_sink = onShortcut;
             ictx.shortcut_ctx = @ptrCast(self);
+            ictx.smart_copy = self.config.smart_copy;
         }
         pane.menu_sink = onMenuAction;
         pane.menu_sink_ctx = @ptrCast(self);
@@ -1009,6 +1010,7 @@ pub const Window = struct {
             screen.modify_other_keys = self.config.modify_other_keys;
             screen.scrollback_capacity = self.config.scrollback;
             screen.scroll_on_output = self.config.scroll_on_output;
+            if (p.input_ctx) |ictx| ictx.smart_copy = self.config.smart_copy;
             // Repaint.
             screen.dirty = true;
             p.cell_pass.markAllDirty();

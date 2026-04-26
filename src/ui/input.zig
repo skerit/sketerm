@@ -22,6 +22,11 @@ pub const Ctx = struct {
     /// press). Cleared on key-released so the next press is "fresh".
     last_press_keyval: c_uint = 0,
     last_press_time_us: i64 = 0,
+    /// Smart-copy mode: if true and Ctrl+Shift+C is pressed with no
+    /// selection, send Ctrl+C (0x03) to the child instead of being
+    /// a no-op. Set from Config.smart_copy at attach time and on
+    /// every applyConfigChange.
+    smart_copy: bool = true,
 };
 
 /// Maximum gap between consecutive presses of the same keyval that
@@ -220,6 +225,13 @@ fn onKeyPressed(
                 return 1;
             },
             c.GDK_KEY_C, c.GDK_KEY_c => {
+                // smart_copy: if there's no selection, treat
+                // Ctrl+Shift+C as Ctrl+C (interrupt) so the user
+                // doesn't get a "did nothing" surprise. Off → no-op.
+                if (!ctx.terminal.screen.selection.isActive() and ctx.smart_copy) {
+                    _ = ctx.terminal.pty.writeAll(&[_]u8{0x03});
+                    return 1;
+                }
                 copySelection(ctx);
                 return 1;
             },
