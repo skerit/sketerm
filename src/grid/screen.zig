@@ -1201,10 +1201,13 @@ pub const Screen = struct {
                         const b0 = run.bytes[i];
                         if (self.decoder.expected == 0) {
                             if (b0 < 0x80) {
-                                // ASCII subrange — bulk-print.
+                                // ASCII subrange. print_run only carries
+                                // bytes the parser already classified as
+                                // printable (>=0x20 && !=0x7F), so we
+                                // can skip the runIsAscii double-check.
                                 const start = i;
                                 while (i < run.len and run.bytes[i] < 0x80) : (i += 1) {}
-                                if (self.fastAsciiEligible() and runIsAscii(run.bytes[start..i])) {
+                                if (self.fastAsciiEligible()) {
                                     self.fastAsciiSlice(run.bytes[start..i]);
                                 } else {
                                     for (run.bytes[start..i]) |b| self.printCp(b);

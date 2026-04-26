@@ -99,10 +99,9 @@ htop and btop need the report subset for accurate rendering.
 ### Scroll region — DECSTBM
 `CSI t ; b r` — set top and bottom scrolling margins. ✓
 
-### Deferred in v1
-- SS2 / SS3 single-shifts (LS0 / LS1 done as SI / SO)
-
 ### Done in v1 (originally listed deferred)
+- SS2 / SS3 single-shifts (ESC N / ESC O — bypass charset
+  translation for the next codepoint; G2/G3 not modelled).
 - Character set designation (SCS for G0/G1 → DEC graphics, SI/SO).
 - ED 3 (erase scrollback).
 - Selective erase (DECSED / DECSEL routed to plain ED/EL — we
@@ -127,7 +126,9 @@ htop and btop need the report subset for accurate rendering.
 | 133    | Shell integration (FinalTerm prompt marks)| ✓ (records A-marks; Ctrl+Shift+Up/Down navigates) |
 | 9      | iTerm2 desktop notification               | ✓ |
 | 777    | Desktop notifications (notify variant)    | ✓ |
-| 1337   | iTerm2 proprietary — `File=` only         | ✓ |
+| 22     | Set X11 / GTK mouse-cursor shape          | ✓ |
+| 50     | Font query (set is no-op)                 | ✓ |
+| 1337   | iTerm2 proprietary (File=, CursorShape, ClearScrollback, SetMark, RequestAttention, CopyToClipboard, EndCopy, StealFocus-deny) | ✓ |
 
 ## Bracketed paste (DECSET 2004)
 
@@ -174,10 +175,10 @@ Default behavior per app:
 | 1000 | X10 button               | ✓ |
 | 1002 | Cell-motion tracking     | ✓ |
 | 1003 | All-motion tracking      | ✓ |
-| 1005 | UTF-8 extended           | deferred |
+| 1005 | UTF-8 extended           | ✓ |
 | 1006 | **SGR extended**         | ✓ (preferred modern) |
-| 1015 | URXVT extended           | deferred |
-| 1016 | SGR-pixels               | deferred |
+| 1015 | URXVT extended           | ✓ |
+| 1016 | SGR-pixels               | ✓ |
 
 ## Keyboard protocols
 
