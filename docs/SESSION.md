@@ -1065,3 +1065,11 @@ User-facing config additions:
   focused pane's last-reported (OSC 7) cwd, mirroring the prior
   split-inherits-cwd change.
 
+
+## Pane navigation tick
+
+- **Ctrl+Shift+Left/Right** — cycle keyboard focus through panes
+  in the current tab. Wraps at either end. Single-pane tabs no-op.
+  Action.pane_prev / pane_next added; the input layer fires the
+  shortcut sink and Window.cyclePane filters panes by tab root.
+
