@@ -1073,3 +1073,17 @@ User-facing config additions:
   Action.pane_prev / pane_next added; the input layer fires the
   shortcut sink and Window.cyclePane filters panes by tab root.
 
+
+## EINTR fixes tick
+
+Two real latent bugs from POSIX signal-vs-syscall interaction:
+
+- **worker poll() / read() EINTR** — a signal arriving during the
+  blocking poll or read previously broke the worker loop and emitted
+  a phantom child_eof. Both calls now retry on EINTR; only true
+  read==0 or other errors close the loop. Shutdown still works via
+  shutdown_fd → POLLIN.
+- **pty.writeAll EINTR** — caller-side mirror; signal during write
+  used to silently truncate. Retry on EINTR; treat EAGAIN as buffer
+  full and return the partial count (caller can decide).
+
