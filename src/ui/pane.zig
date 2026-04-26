@@ -715,6 +715,7 @@ fn onImageDeleteFullEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Sc
 
 fn onTitleEvent(ctx: ?*anyopaque, title: []const u8) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    self.setTitle(title);
     if (self.win_on_title) |f| f(self.win_title_ctx, title);
 }
 
@@ -930,6 +931,8 @@ fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     // repaint so the swap is immediate.
     self.terminal.screen.cursor_blink_on = true;
     self.terminal.screen.dirty = true;
+    // Per-pane titlebar: red (active) when this pane has focus.
+    self.setTitlebarActive(true);
 }
 
 fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
@@ -939,6 +942,8 @@ fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     }
     self.terminal.screen.cursor_blink_on = true;
     self.terminal.screen.dirty = true;
+    // Per-pane titlebar: grey (inactive) when focus leaves.
+    self.setTitlebarActive(false);
 }
 
 fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {

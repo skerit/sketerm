@@ -46,6 +46,11 @@ pub const Window = struct {
     /// case-sensitive by default. Mirrors Config.search_case_sensitive.
     /// Ctrl+I still toggles per-search override.
     search_force_cs: bool = false,
+    /// CSS provider for the per-pane titlebar colour classes
+    /// (sketerm-titlebar-active / -inactive). Loaded lazily on first
+    /// applyConfigChange or initial show; regenerated whenever
+    /// title_*_* colours change.
+    titlebar_css: ?*c.GtkCssProvider = null,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         return initWithConfig(allocator, app, null);
@@ -211,6 +216,11 @@ pub const Window = struct {
         // Persisted search default + always-on-top advisory.
         self.search_force_cs = self.config.search_case_sensitive;
         self.setAlwaysOnTop(self.config.always_on_top);
+
+        // Per-pane titlebar CSS — install once at startup. Pane init
+        // adds the inactive class by default; refreshTitlebarCss
+        // populates the colours.
+        self.refreshTitlebarCss();
 
         return self;
     }
@@ -574,6 +584,8 @@ pub const Window = struct {
         pane.grid_pass.bold_is_bright = self.config.bold_is_bright;
         pane.cell_pass.allow_bold = self.config.allow_bold;
         pane.cell_pass.bold_is_bright = self.config.bold_is_bright;
+        // Per-pane titlebar visibility.
+        pane.setTitlebarVisible(self.config.show_titlebar);
         return pane;
     }
 
@@ -1105,11 +1117,17 @@ pub const Window = struct {
             p.disable_mousewheel_zoom = self.config.disable_mousewheel_zoom;
             p.link_single_click = self.config.link_single_click;
             p.mouse_autohide = self.config.mouse_autohide;
+            // Per-pane titlebar visibility.
+            p.setTitlebarVisible(self.config.show_titlebar);
             // Repaint.
             screen.dirty = true;
             p.cell_pass.markAllDirty();
             c.gtk_widget_queue_draw(p.widget());
         }
+
+        // Refresh CSS provider so any title_*_* color changes take
+        // effect immediately on the active/inactive classes.
+        self.refreshTitlebarCss();
 
         // Font size needs the heavy atlas-rebuild path.
         if (self.config.font_size != old_size) {
@@ -1150,6 +1168,55 @@ pub const Window = struct {
             }
         }
         return c.adw_tab_view_append(self.tab_view, child).?;
+    }
+
+    /// (Re)build the per-pane titlebar CSS so the four colour classes
+    /// resolve to the user-configured rgba values. Called at startup
+    /// and on every applyConfigChange.
+    fn refreshTitlebarCss(self: *Window) void {
+        if (self.titlebar_css == null) {
+            const provider = c.gtk_css_provider_new();
+            const display = c.gtk_widget_get_display(self.app_window);
+            // STYLE_PROVIDER_PRIORITY_APPLICATION beats theme defaults
+            // but loses to user CSS — the right level for "we own this
+            // widget class".
+            c.gtk_style_context_add_provider_for_display(
+                display,
+                @ptrCast(@alignCast(provider)),
+                c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+            self.titlebar_css = provider;
+        }
+        const af = self.config.title_active_fg;
+        const ab = self.config.title_active_bg;
+        const inf = self.config.title_inactive_fg;
+        const ib = self.config.title_inactive_bg;
+        // Format rgba(r, g, b, a) with values 0..255 + 0..1 alpha.
+        var buf: [1024]u8 = undefined;
+        const css = std.fmt.bufPrintZ(&buf,
+            \\.sketerm-titlebar {{ padding: 1px 2px; min-height: 18px; }}
+            \\.sketerm-titlebar-active {{ background-color: rgba({d}, {d}, {d}, {d:.3}); color: rgba({d}, {d}, {d}, {d:.3}); }}
+            \\.sketerm-titlebar-inactive {{ background-color: rgba({d}, {d}, {d}, {d:.3}); color: rgba({d}, {d}, {d}, {d:.3}); }}
+            \\.sketerm-titlebar-label {{ font-weight: bold; }}
+        , .{
+            @as(u8, @intFromFloat(@round(ab[0] * 255))),
+            @as(u8, @intFromFloat(@round(ab[1] * 255))),
+            @as(u8, @intFromFloat(@round(ab[2] * 255))),
+            ab[3],
+            @as(u8, @intFromFloat(@round(af[0] * 255))),
+            @as(u8, @intFromFloat(@round(af[1] * 255))),
+            @as(u8, @intFromFloat(@round(af[2] * 255))),
+            af[3],
+            @as(u8, @intFromFloat(@round(ib[0] * 255))),
+            @as(u8, @intFromFloat(@round(ib[1] * 255))),
+            @as(u8, @intFromFloat(@round(ib[2] * 255))),
+            ib[3],
+            @as(u8, @intFromFloat(@round(inf[0] * 255))),
+            @as(u8, @intFromFloat(@round(inf[1] * 255))),
+            @as(u8, @intFromFloat(@round(inf[2] * 255))),
+            inf[3],
+        }) catch return;
+        c.gtk_css_provider_load_from_string(self.titlebar_css.?, css.ptr);
     }
 
     /// Stay-above-other-windows hint. GTK4 dropped the X11-era
