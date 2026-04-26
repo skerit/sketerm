@@ -253,7 +253,7 @@ pub const Window = struct {
             p.terminal.screen.search_highlights = &.{};
             p.terminal.screen.search_active_idx = -1;
             p.terminal.screen.dirty = true;
-            _ = c.gtk_widget_grab_focus(p.widget());
+            _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
         }
         self.search_pane = null;
         self.search_matches.clearRetainingCapacity();
@@ -379,7 +379,7 @@ pub const Window = struct {
     fn focusedPaneCwd(self: *Window) ?[]const u8 {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return null;
         for (self.panes.items) |p| {
-            if (focus == @as(*c.GtkWidget, @ptrCast(p.widget()))) {
+            if (focus == @as(*c.GtkWidget, @ptrCast(p.area))) {
                 return p.terminal.cwd;
             }
         }
@@ -679,10 +679,13 @@ pub const Window = struct {
     pub fn splitFocused(self: *Window, orientation: c_uint) !void {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
 
-        // Find the focused Pane.
+        // Find the focused Pane. The wrapper Box isn't focusable, so
+        // gtk_window_get_focus returns the inner GLArea. Match against
+        // p.area, then operate on p.widget() (== the wrapper) for
+        // reparenting.
         var found_idx: ?usize = null;
         for (self.panes.items, 0..) |p, idx| {
-            if (@intFromPtr(p.widget()) == @intFromPtr(focus)) {
+            if (@intFromPtr(p.area) == @intFromPtr(focus)) {
                 found_idx = idx;
                 break;
             }
@@ -962,7 +965,7 @@ pub const Window = struct {
     fn focusedPane(self: *Window) ?*Pane {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return null;
         for (self.panes.items) |p| {
-            if (@intFromPtr(p.widget()) == @intFromPtr(focus)) return p;
+            if (@intFromPtr(p.area) == @intFromPtr(focus)) return p;
         }
         return null;
     }
@@ -987,7 +990,7 @@ pub const Window = struct {
         var idx: usize = 0;
         if (focus != null) {
             for (in_tab.items, 0..) |p, i| {
-                if (focus == @as(*c.GtkWidget, @ptrCast(p.widget()))) {
+                if (focus == @as(*c.GtkWidget, @ptrCast(p.area))) {
                     idx = i;
                     break;
                 }
@@ -998,7 +1001,7 @@ pub const Window = struct {
             .next => (idx + 1) % n,
             .prev => (idx + n - 1) % n,
         };
-        _ = c.gtk_widget_grab_focus(@ptrCast(in_tab.items[next].widget()));
+        _ = c.gtk_widget_grab_focus(@ptrCast(in_tab.items[next].area));
     }
 
     /// Open the preferences dialog. Live-applies changes via
@@ -1210,7 +1213,7 @@ pub const Window = struct {
         }
         // Re-use closeFocusedPane's path by temporarily focusing the
         // target then calling it. Simpler than duplicating.
-        _ = c.gtk_widget_grab_focus(w);
+        _ = c.gtk_widget_grab_focus(@ptrCast(target.area));
         self.closeFocusedPane();
     }
 
@@ -1218,7 +1221,7 @@ pub const Window = struct {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
         var found_idx: ?usize = null;
         for (self.panes.items, 0..) |p, idx| {
-            if (@intFromPtr(p.widget()) == @intFromPtr(focus)) {
+            if (@intFromPtr(p.area) == @intFromPtr(focus)) {
                 found_idx = idx;
                 break;
             }
@@ -1291,7 +1294,7 @@ pub const Window = struct {
         if (sibling) |sib| {
             for (self.panes.items) |p| {
                 if (widgetIsAncestor(@ptrCast(sib), @ptrCast(p.widget()))) {
-                    _ = c.gtk_widget_grab_focus(p.widget());
+                    _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
                     break;
                 }
             }
@@ -1700,7 +1703,7 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
     // Find the first Pane whose widget is a descendant of `child`.
     for (self.panes.items) |p| {
         if (widgetIsAncestor(@ptrCast(child), p.widget())) {
-            _ = c.gtk_widget_grab_focus(p.widget());
+            _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
             return;
         }
     }

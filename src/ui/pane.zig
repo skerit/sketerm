@@ -104,6 +104,21 @@ pub const Pane = struct {
     /// motion handler restores the default cursor on any movement.
     cursor_hidden: bool = false,
 
+    /// Per-pane title bar (Terminator-style). The wrapper Box owns
+    /// the header + GLArea; `widget()` returns the wrapper when
+    /// present. The label is updated from on_title (OSC 0/1/2).
+    /// Active / inactive colouring is handled via CSS classes
+    /// "sketerm-titlebar-active" / "sketerm-titlebar-inactive" plus
+    /// a Window-level GtkCssProvider that supplies the actual rgba
+    /// values from Config.title_*_*.
+    wrapper_box: ?*c.GtkWidget = null,
+    titlebar_box: ?*c.GtkWidget = null,
+    titlebar_label: ?*c.GtkLabel = null,
+    titlebar_visible: bool = false,
+    titlebar_active: bool = false,
+    /// Latest OSC 0/1/2 title text. Owned; freed in deinit.
+    titlebar_text: ?[]u8 = null,
+
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
         errdefer allocator.destroy(self);
@@ -115,6 +130,34 @@ pub const Pane = struct {
         c.gtk_widget_set_hexpand(area_widget, 1);
         c.gtk_widget_set_visible(area_widget, 1);
 
+        // Titlebar header: hidden by default. The label has 4 px
+        // horizontal padding so text doesn't sit flush against the
+        // window edge; the wrapping box gets CSS classes for active
+        // / inactive colouring (resolved by Window-level provider).
+        const tb_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+        c.gtk_widget_add_css_class(tb_box, "sketerm-titlebar");
+        c.gtk_widget_add_css_class(tb_box, "sketerm-titlebar-inactive");
+        c.gtk_widget_set_visible(tb_box, 0);
+        const tb_label_w = c.gtk_label_new("");
+        c.gtk_widget_add_css_class(tb_label_w, "sketerm-titlebar-label");
+        c.gtk_label_set_xalign(@ptrCast(@alignCast(tb_label_w)), 0.0);
+        c.gtk_label_set_ellipsize(@ptrCast(@alignCast(tb_label_w)), c.PANGO_ELLIPSIZE_END);
+        c.gtk_widget_set_hexpand(tb_label_w, 1);
+        c.gtk_widget_set_margin_start(tb_label_w, 6);
+        c.gtk_widget_set_margin_end(tb_label_w, 6);
+        c.gtk_widget_set_margin_top(tb_label_w, 1);
+        c.gtk_widget_set_margin_bottom(tb_label_w, 1);
+        c.gtk_box_append(@ptrCast(tb_box), tb_label_w);
+
+        // Wrapper that holds [titlebar][GLArea] vertically. We make
+        // the wrapper the publicly-exposed widget so splits / layout
+        // restore reparent the whole stack rather than just the area.
+        const wrap = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        c.gtk_widget_set_hexpand(wrap, 1);
+        c.gtk_widget_set_vexpand(wrap, 1);
+        c.gtk_box_append(@ptrCast(wrap), tb_box);
+        c.gtk_box_append(@ptrCast(wrap), area_widget);
+
         self.* = .{
             .area = @ptrCast(area_widget),
             .terminal = terminal,
@@ -123,6 +166,9 @@ pub const Pane = struct {
             .image_store = ImageStore.init(allocator),
             .menu_arena = std.heap.ArenaAllocator.init(allocator),
             .allocator = allocator,
+            .wrapper_box = wrap,
+            .titlebar_box = tb_box,
+            .titlebar_label = @ptrCast(@alignCast(tb_label_w)),
         };
 
         // Pane is the Terminal's user_ctx for ALL sink callbacks.
@@ -346,12 +392,54 @@ pub const Pane = struct {
         if (self.atlas) |a| a.deinit();
         if (self.input_ctx) |ictx| self.allocator.destroy(ictx);
         if (self.menu_link_uri) |uri| self.allocator.free(uri);
+        if (self.titlebar_text) |t| self.allocator.free(t);
         self.menu_arena.deinit();
         self.allocator.destroy(self);
     }
 
     pub fn widget(self: *Pane) *c.GtkWidget {
+        if (self.wrapper_box) |w| return w;
         return @ptrCast(self.area);
+    }
+
+    /// Set the per-pane title bar text. Called from the on_title sink
+    /// when the running shell emits an OSC 0/1/2 escape. Idempotent
+    /// when the new text matches the cached value. The label is set
+    /// even if the bar is hidden — it'll display when revealed.
+    pub fn setTitle(self: *Pane, text: []const u8) void {
+        if (self.titlebar_text) |old| {
+            if (std.mem.eql(u8, old, text)) return;
+            self.allocator.free(old);
+        }
+        self.titlebar_text = self.allocator.dupe(u8, text) catch null;
+        const lbl = self.titlebar_label orelse return;
+        const z = self.allocator.allocSentinel(u8, text.len, 0) catch return;
+        defer self.allocator.free(z);
+        @memcpy(z, text);
+        c.gtk_label_set_text(lbl, z.ptr);
+    }
+
+    /// Show / hide the per-pane title bar.
+    pub fn setTitlebarVisible(self: *Pane, visible: bool) void {
+        const tb = self.titlebar_box orelse return;
+        if (self.titlebar_visible == visible) return;
+        self.titlebar_visible = visible;
+        c.gtk_widget_set_visible(tb, if (visible) 1 else 0);
+    }
+
+    /// Toggle active / inactive CSS class on the title bar. The
+    /// Window-level CSS provider supplies the actual rgba colours.
+    pub fn setTitlebarActive(self: *Pane, active: bool) void {
+        const tb = self.titlebar_box orelse return;
+        if (self.titlebar_active == active) return;
+        self.titlebar_active = active;
+        if (active) {
+            c.gtk_widget_remove_css_class(tb, "sketerm-titlebar-inactive");
+            c.gtk_widget_add_css_class(tb, "sketerm-titlebar-active");
+        } else {
+            c.gtk_widget_remove_css_class(tb, "sketerm-titlebar-active");
+            c.gtk_widget_add_css_class(tb, "sketerm-titlebar-inactive");
+        }
     }
 
     /// Live font-size change. Tears down the old atlas (and its GL
