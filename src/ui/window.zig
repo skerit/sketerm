@@ -1117,6 +1117,22 @@ fn onSearchKeyPressed(
         self.closeSearch();
         return 1;
     }
+    // Ctrl+I — toggle case-insensitive override and re-search the
+    // current needle. Without the override, smart-case applies
+    // (lower-only needle → CI, uppercase → CS).
+    if ((keyval == c.GDK_KEY_i or keyval == c.GDK_KEY_I) and
+        (state & c.GDK_CONTROL_MASK) != 0)
+    {
+        self.search_case_insensitive = !self.search_case_insensitive;
+        if (self.search_entry) |w| {
+            const txt = c.gtk_editable_get_text(@ptrCast(w));
+            if (txt != null) {
+                const slice = std.mem.span(txt);
+                self.updateSearch(slice);
+            }
+        }
+        return 1;
+    }
     return 0;
 }
 

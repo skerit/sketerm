@@ -44,6 +44,8 @@ const HELP_TEXT =
     \\  Ctrl+Shift+V          Paste
     \\  Ctrl+Shift+K          Clear screen + scrollback
     \\  Ctrl+Shift+F          Open scrollback search
+    \\  Ctrl+I (in search)    Toggle case-insensitive override
+    \\                          (default: smart-case — uppercase → CS)
     \\  Ctrl+Shift+S          Save current layout (last.json)
     \\  Ctrl+Shift+Alt+S      Save Layout As… (file picker)
     \\  Ctrl+Shift+Up/Down    Jump to prev/next OSC 133 prompt mark
