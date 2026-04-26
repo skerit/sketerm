@@ -441,10 +441,10 @@ pub const Window = struct {
     /// Spawn a new shell pane and add it as a tab.
     /// If title == null, a "Tab N" default is used.
     pub fn newShellTab(self: *Window, title_opt: ?[*:0]const u8) !void {
-        const shell_env = c.getenv("SHELL");
-        const shell: [*:0]const u8 = if (shell_env != null) @ptrCast(shell_env) else "/bin/bash";
-        const argv = [_][*:0]const u8{shell};
+        return self.newShellTabWithProfile(title_opt, null);
+    }
 
+    pub fn newShellTabWithProfile(self: *Window, title_opt: ?[*:0]const u8, profile_name: ?[]const u8) !void {
         var num_buf: [32]u8 = undefined;
         const title = if (title_opt) |t| t else blk: {
             self.tab_counter += 1;
@@ -456,7 +456,30 @@ pub const Window = struct {
         // kitty / wezterm convention. Falls back to inherited cwd
         // when no focused pane has reported one.
         const cwd = self.focusedPaneCwd();
-        try self.addTabInternal(title, &argv, cwd);
+        try self.addTabWithProfile(title, cwd, profile_name);
+    }
+
+    /// Spawn a tab via spawnShellPaneOpts (which honours the profile)
+    /// and wrap it in an AdwTabPage. Used by newShellTabWithProfile
+    /// and the right-click "as <profile>…" menu items.
+    fn addTabWithProfile(
+        self: *Window,
+        title_z: [*:0]const u8,
+        cwd: ?[]const u8,
+        profile_name: ?[]const u8,
+    ) !void {
+        const pane = try self.spawnShellPaneOpts(cwd, profile_name);
+        // spawnShellPaneOpts already appended to self.panes / .terminals.
+        // Wrap pane.widget() in a Box so layout reparenting on splits
+        // matches the addTabInternal path.
+        const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        c.gtk_widget_set_hexpand(wrapper, 1);
+        c.gtk_widget_set_vexpand(wrapper, 1);
+        c.gtk_box_append(@ptrCast(wrapper), pane.widget());
+
+        const page = self.appendOrInsertTab(wrapper);
+        c.adw_tab_page_set_title(page, title_z);
+        c.adw_tab_page_set_tooltip(page, title_z);
     }
 
     /// Last-reported cwd of the focused pane (OSC 7), or null if no
@@ -671,15 +694,40 @@ pub const Window = struct {
     }
 
     fn spawnShellPane(self: *Window) !*Pane {
-        return self.spawnShellPaneOpts(null);
+        return self.spawnShellPaneOpts(null, null);
     }
 
-    /// Spawn a shell with an optional starting cwd. When inherit_cwd
-    /// is non-null, passed to PTY so the child starts there.
-    fn spawnShellPaneOpts(self: *Window, inherit_cwd: ?[]const u8) !*Pane {
-        // Config-driven shell, with $SHELL fallback, then /bin/bash.
+    /// Look up a named profile in the active Config, or null if no
+    /// such profile exists. Caller-borrowed slice (Config arena).
+    pub fn findProfile(self: *const Window, name: []const u8) ?*const @import("../config.zig").Profile {
+        if (name.len == 0) return null;
+        for (self.config.profiles.items) |*p| {
+            if (std.mem.eql(u8, p.name, name)) return p;
+        }
+        return null;
+    }
+
+    /// Spawn a shell with an optional starting cwd and named profile.
+    /// Profile fields override the global Config: shell, font path,
+    /// font size, $TERM, $COLORTERM, scrollback, login_shell, scheme,
+    /// palette. Empty profile string / null profile = global config.
+    fn spawnShellPaneOpts(self: *Window, inherit_cwd: ?[]const u8, profile_name: ?[]const u8) !*Pane {
+        const profile: ?*const @import("../config.zig").Profile = if (profile_name) |n|
+            self.findProfile(n)
+        else if (self.config.default_profile.len > 0)
+            self.findProfile(self.config.default_profile)
+        else
+            null;
+
+        // Pick effective shell: profile.shell wins → Config.shell →
+        // $SHELL env → /bin/bash.
         var shell_buf: [256:0]u8 = undefined;
-        const shell: [*:0]const u8 = if (self.config.shell) |s| blk: {
+        const eff_shell_str: ?[]const u8 = blk: {
+            if (profile) |p| if (p.shell.len > 0) break :blk p.shell;
+            if (self.config.shell) |s| break :blk s;
+            break :blk null;
+        };
+        const shell: [*:0]const u8 = if (eff_shell_str) |s| blk: {
             const n = @min(s.len, shell_buf.len);
             @memcpy(shell_buf[0..n], s[0..n]);
             shell_buf[n] = 0;
@@ -688,15 +736,29 @@ pub const Window = struct {
 
         const argv = [_][*:0]const u8{shell};
 
-        // Build TERM/COLORTERM as null-terminated for the child env.
+        // TERM / COLORTERM, profile-overridable.
+        const eff_term: []const u8 = if (profile) |p|
+            (if (p.term_env.len > 0) p.term_env else self.config.term_env)
+        else
+            self.config.term_env;
+        const eff_color_term: []const u8 = if (profile) |p|
+            (if (p.color_term_env.len > 0) p.color_term_env else self.config.color_term_env)
+        else
+            self.config.color_term_env;
+
         var term_buf: [64:0]u8 = undefined;
         var ct_buf: [64:0]u8 = undefined;
-        const tlen = @min(self.config.term_env.len, term_buf.len);
-        @memcpy(term_buf[0..tlen], self.config.term_env[0..tlen]);
+        const tlen = @min(eff_term.len, term_buf.len);
+        @memcpy(term_buf[0..tlen], eff_term[0..tlen]);
         term_buf[tlen] = 0;
-        const ctlen = @min(self.config.color_term_env.len, ct_buf.len);
-        @memcpy(ct_buf[0..ctlen], self.config.color_term_env[0..ctlen]);
+        const ctlen = @min(eff_color_term.len, ct_buf.len);
+        @memcpy(ct_buf[0..ctlen], eff_color_term[0..ctlen]);
         ct_buf[ctlen] = 0;
+
+        const eff_login_shell: bool = if (profile) |p|
+            (p.login_shell orelse self.config.login_shell)
+        else
+            self.config.login_shell;
 
         const pty = try Pty.spawn(.{
             .argv = &argv,
@@ -705,7 +767,7 @@ pub const Window = struct {
             .term = @ptrCast(&term_buf),
             .color_term = @ptrCast(&ct_buf),
             .cwd = inherit_cwd,
-            .login_shell = self.config.login_shell,
+            .login_shell = eff_login_shell,
         });
         errdefer pty.closeAndReap();
 
@@ -722,9 +784,28 @@ pub const Window = struct {
         pane.win_on_bell = onTermBell;
         pane.win_child_ctx = @ptrCast(self);
         pane.win_on_child_exit = onTermChildExit;
+
+        // Profile name on the pane so cycle/restore knows which one
+        // it spawned with.
+        if (profile) |p| pane.active_profile = p.name;
+
+        // Effective values per-field: profile wins over global.
+        const eff_font_size: u16 = if (profile) |p|
+            (if (p.font_size != 0) p.font_size else self.config.font_size)
+        else
+            self.config.font_size;
+        const eff_font_path: ?[]const u8 = if (profile) |p|
+            (if (p.font_path.len > 0) p.font_path else self.config.font_path)
+        else
+            self.config.font_path;
+        const eff_scrollback: u32 = if (profile) |p|
+            (if (p.scrollback != 0) p.scrollback else self.config.scrollback)
+        else
+            self.config.scrollback;
+
         // Push config-derived fields into the pane before realize.
-        pane.font_size = self.config.font_size;
-        pane.font_path = self.config.font_path;
+        pane.font_size = eff_font_size;
+        pane.font_path = eff_font_path;
         pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
         pane.grid_pass.pad = self.config.padding;
         const fg_bg = self.resolveDefaultColors();
@@ -740,13 +821,18 @@ pub const Window = struct {
             .{ 0, 0, 0, 0 }
         else
             self.config.cursor_color;
-        term.screen.scrollback_capacity = self.config.scrollback;
+        term.screen.scrollback_capacity = eff_scrollback;
         term.screen.bracketed_paste = self.config.bracketed_paste;
         term.screen.scroll_on_output = self.config.scroll_on_output;
         term.screen.word_chars = self.config.word_chars;
-        // Resolve effective palette: explicit `palette` wins, else
-        // look up `scheme` if set, else leave defaults.
-        const eff_pal: ?[16][3]u8 = self.config.palette orelse blk: {
+        // Resolve effective palette: profile.palette > config.palette
+        // > profile.scheme lookup > config.scheme lookup > defaults.
+        const eff_pal: ?[16][3]u8 = blk: {
+            if (profile) |p| if (p.palette) |pp| break :blk pp;
+            if (self.config.palette) |gp| break :blk gp;
+            if (profile) |p| if (p.scheme.len > 0) {
+                if (@import("../grid/schemes.zig").lookup(p.scheme)) |sch| break :blk sch.palette;
+            };
             if (self.config.scheme.len > 0) {
                 if (@import("../grid/schemes.zig").lookup(self.config.scheme)) |sch| {
                     break :blk sch.palette;
@@ -793,7 +879,8 @@ pub const Window = struct {
         // available, so the new shell starts in the same directory.
         // Falls back to inherited (parent process) cwd when null.
         const inherit_cwd: ?[]const u8 = focused_pane.terminal.cwd;
-        const new_pane = try self.spawnShellPaneOpts(inherit_cwd);
+        // Splits inherit the focused pane's profile (matches Terminator).
+        const new_pane = try self.spawnShellPaneOpts(inherit_cwd, focused_pane.active_profile);
         const new_w = new_pane.widget();
 
         const paned = c.gtk_paned_new(orientation);

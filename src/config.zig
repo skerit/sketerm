@@ -30,6 +30,33 @@ pub const KeybindEntry = struct {
     accel: []const u8,
 };
 
+/// A named profile — a Config subset applied per-pane. Defined via
+/// `[profile.<name>]` sections in config.conf. Fields default to
+/// "inherit from global config" (sentinels: empty string for string
+/// fields, 0 for numerics where 0 means "no override"). Empty name
+/// is reserved for the global config.
+pub const Profile = struct {
+    name: []const u8,
+    /// Override for shell binary path. Empty → inherit `Config.shell`.
+    shell: []const u8 = "",
+    /// Override for font file path. Empty → inherit `Config.font_path`.
+    font_path: []const u8 = "",
+    /// Override for font size. 0 → inherit.
+    font_size: u16 = 0,
+    /// Override for the colour scheme name. Empty → inherit.
+    scheme: []const u8 = "",
+    /// Override for the 16-colour ANSI palette. null → inherit.
+    palette: ?[16][3]u8 = null,
+    /// Override for $TERM. Empty → inherit.
+    term_env: []const u8 = "",
+    /// Override for $COLORTERM. Empty → inherit.
+    color_term_env: []const u8 = "",
+    /// Override for scrollback line cap. 0 → inherit.
+    scrollback: u32 = 0,
+    /// Override for login_shell. null → inherit.
+    login_shell: ?bool = null,
+};
+
 /// When to ask "are you sure?" before destroying panes / tabs.
 /// Matches Terminator's `ask_before_closing` semantics:
 ///   never    — close immediately, no dialog
@@ -194,6 +221,15 @@ pub const Config = struct {
     /// an empty accel unbinds that action; a missing entry inherits
     /// the default. Round-trip-stable.
     keybinds: std.ArrayList(KeybindEntry) = .{},
+
+    /// Named profiles. Defined via `[profile.<name>]` sections —
+    /// each section's keys override the corresponding global Config
+    /// field for panes that select this profile. Order preserved
+    /// for round-trip serialisation + UI listing.
+    profiles: std.ArrayList(Profile) = .{},
+    /// Profile name used when no explicit profile is selected. Empty
+    /// = "no default profile; use the global Config directly".
+    default_profile: []const u8 = "",
 
     // Per-pane titlebar (Terminator-style)
     /// Show a thin per-pane title bar above the cell grid carrying
@@ -420,6 +456,29 @@ pub const Config = struct {
             }
             try w.writeAll("\n");
         }
+
+        // Default profile, then each [profile.name] section.
+        if (self.default_profile.len > 0)
+            try w.print("default_profile = {s}\n", .{self.default_profile});
+        for (self.profiles.items) |prof| {
+            try w.print("\n[profile.{s}]\n", .{prof.name});
+            if (prof.shell.len > 0) try w.print("shell = {s}\n", .{prof.shell});
+            if (prof.font_path.len > 0) try w.print("font = {s}\n", .{prof.font_path});
+            if (prof.font_size != 0) try w.print("font_size = {d}\n", .{prof.font_size});
+            if (prof.scheme.len > 0) try w.print("scheme = {s}\n", .{prof.scheme});
+            if (prof.term_env.len > 0) try w.print("term = {s}\n", .{prof.term_env});
+            if (prof.color_term_env.len > 0) try w.print("color_term = {s}\n", .{prof.color_term_env});
+            if (prof.scrollback != 0) try w.print("scrollback = {d}\n", .{prof.scrollback});
+            if (prof.login_shell) |b| try w.print("login_shell = {s}\n", .{if (b) "true" else "false"});
+            if (prof.palette) |pal| {
+                try w.writeAll("palette = ");
+                for (pal, 0..) |rgb, i| {
+                    if (i != 0) try w.writeAll(":");
+                    try w.print("#{x:0>2}{x:0>2}{x:0>2}", .{ rgb[0], rgb[1], rgb[2] });
+                }
+                try w.writeAll("\n");
+            }
+        }
     }
 };
 
@@ -454,19 +513,87 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
     const arena = cfg.arena.?.allocator();
     var lines = std.mem.splitScalar(u8, body, '\n');
     var lineno: usize = 0;
+    // Section state. `null` = global; non-null = profile being filled.
+    var current_profile: ?*Profile = null;
     while (lines.next()) |raw| {
         lineno += 1;
         const line = trim(stripComment(raw));
         if (line.len == 0) continue;
+
+        // Section header: [profile.<name>] only for now. Unknown
+        // sections log a warning and behave as no-section pass-through
+        // — that way unknown future sections don't strip user data.
+        if (line.len >= 2 and line[0] == '[' and line[line.len - 1] == ']') {
+            const inside = trim(line[1 .. line.len - 1]);
+            if (std.mem.startsWith(u8, inside, "profile.")) {
+                const name = inside["profile.".len..];
+                if (name.len == 0) {
+                    std.debug.print("sketerm: config:{d}: empty profile name\n", .{lineno});
+                    current_profile = null;
+                    continue;
+                }
+                current_profile = findOrCreateProfile(cfg, arena, name) catch {
+                    std.debug.print("sketerm: config:{d}: out of memory creating profile\n", .{lineno});
+                    current_profile = null;
+                    continue;
+                };
+                continue;
+            }
+            std.debug.print("sketerm: config:{d}: unknown section '{s}'\n", .{ lineno, inside });
+            current_profile = null;
+            continue;
+        }
+
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
             std.debug.print("sketerm: config:{d}: expected key = value\n", .{lineno});
             continue;
         };
         const key = trim(line[0..eq]);
         const value = trim(line[eq + 1 ..]);
-        applyKv(cfg, arena, key, value) catch |err| {
-            std.debug.print("sketerm: config:{d}: bad value for '{s}' ({s})\n", .{ lineno, key, @errorName(err) });
-        };
+        if (current_profile) |prof| {
+            applyProfileKv(prof, arena, key, value) catch |err| {
+                std.debug.print("sketerm: config:{d}: profile '{s}': bad value for '{s}' ({s})\n", .{ lineno, prof.name, key, @errorName(err) });
+            };
+        } else {
+            applyKv(cfg, arena, key, value) catch |err| {
+                std.debug.print("sketerm: config:{d}: bad value for '{s}' ({s})\n", .{ lineno, key, @errorName(err) });
+            };
+        }
+    }
+}
+
+fn findOrCreateProfile(cfg: *Config, arena: std.mem.Allocator, name: []const u8) !*Profile {
+    for (cfg.profiles.items) |*p| {
+        if (std.mem.eql(u8, p.name, name)) return p;
+    }
+    const dup = try arena.dupe(u8, name);
+    try cfg.profiles.append(arena, .{ .name = dup });
+    return &cfg.profiles.items[cfg.profiles.items.len - 1];
+}
+
+/// Apply one (key, value) line to a profile. Mirrors a subset of
+/// applyKv — only the per-pane fields the Profile struct holds.
+fn applyProfileKv(prof: *Profile, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, key, "shell")) {
+        prof.shell = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "font") or std.mem.eql(u8, key, "font_path")) {
+        prof.font_path = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "font_size")) {
+        prof.font_size = try parseU16(value);
+    } else if (std.mem.eql(u8, key, "scheme")) {
+        prof.scheme = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "palette")) {
+        prof.palette = try parsePalette16(value);
+    } else if (std.mem.eql(u8, key, "term") or std.mem.eql(u8, key, "term_env")) {
+        prof.term_env = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "color_term") or std.mem.eql(u8, key, "color_term_env")) {
+        prof.color_term_env = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "scrollback")) {
+        prof.scrollback = try parseU32(value);
+    } else if (std.mem.eql(u8, key, "login_shell")) {
+        prof.login_shell = try parseBool(value);
+    } else {
+        std.debug.print("sketerm: config: unknown profile key '{s}' (ignoring)\n", .{key});
     }
 }
 
@@ -594,6 +721,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.bold_is_bright = try parseBool(value);
     } else if (std.mem.eql(u8, key, "auto_url_detect")) {
         cfg.auto_url_detect = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "default_profile")) {
+        cfg.default_profile = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "background_opacity")) {
         cfg.background_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "inactive_fg_dim")) {
@@ -917,4 +1046,50 @@ test "config: later keybind for same action overrides earlier" {
     defer cfg.deinit();
     try std.testing.expectEqual(@as(usize, 1), cfg.keybinds.items.len);
     try std.testing.expectEqualStrings("<Alt>n", cfg.keybinds.items[0].accel);
+}
+
+test "config: [profile.name] sections round-trip" {
+    const body =
+        \\font_size = 14
+        \\default_profile = dev
+        \\
+        \\[profile.dev]
+        \\shell = /usr/bin/fish
+        \\scheme = solarized_dark
+        \\font_size = 16
+        \\
+        \\[profile.prod]
+        \\shell = /usr/bin/bash
+        \\login_shell = true
+        \\scrollback = 50000
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(u16, 14), cfg.font_size); // global
+    try std.testing.expectEqualStrings("dev", cfg.default_profile);
+    try std.testing.expectEqual(@as(usize, 2), cfg.profiles.items.len);
+
+    const dev = cfg.profiles.items[0];
+    try std.testing.expectEqualStrings("dev", dev.name);
+    try std.testing.expectEqualStrings("/usr/bin/fish", dev.shell);
+    try std.testing.expectEqualStrings("solarized_dark", dev.scheme);
+    try std.testing.expectEqual(@as(u16, 16), dev.font_size);
+
+    const prod = cfg.profiles.items[1];
+    try std.testing.expectEqualStrings("prod", prod.name);
+    try std.testing.expectEqualStrings("/usr/bin/bash", prod.shell);
+    try std.testing.expectEqual(@as(?bool, true), prod.login_shell);
+    try std.testing.expectEqual(@as(u32, 50000), prod.scrollback);
+
+    // Round-trip via serialise.
+    var buf: [2048]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    var parsed = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.profiles.items.len);
+    try std.testing.expectEqualStrings("solarized_dark", parsed.profiles.items[0].scheme);
+    try std.testing.expectEqual(@as(?bool, true), parsed.profiles.items[1].login_shell);
 }

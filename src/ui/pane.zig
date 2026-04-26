@@ -123,6 +123,10 @@ pub const Pane = struct {
     /// keystrokes typed in any pane with the same group name are
     /// fanned out across the group. Owned by the Window (Config arena).
     group: ?[]const u8 = null,
+    /// Optional profile name. When set, Window.spawnShellPaneOpts uses
+    /// the profile's overrides for shell, scheme, font_size, etc.
+    /// Owned by the Window (Config arena).
+    active_profile: ?[]const u8 = null,
 
     /// Inactive-pane dimming. When `is_focused` is false, the renderer
     /// multiplies fg/bg colours by `inactive_fg_dim` / `inactive_bg_dim`.
