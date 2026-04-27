@@ -56,6 +56,9 @@ pub const Pane = struct {
     /// Forward iTerm2 / OSC 777 desktop notifications.
     win_notify_ctx: ?*anyopaque = null,
     win_on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
+    /// Forward OSC 7 cwd updates so Window can rewrite the tab tooltip.
+    win_cwd_ctx: ?*anyopaque = null,
+    win_on_cwd: ?*const fn (ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void = null,
     /// Forward BEL events for tab-bar attention.
     win_bell_ctx: ?*anyopaque = null,
     win_child_ctx: ?*anyopaque = null,
@@ -208,6 +211,7 @@ pub const Pane = struct {
         terminal.on_image = onImageEvent;
         terminal.on_image_delete_full = onImageDeleteFullEvent;
         terminal.on_title = onTitleEvent;
+        terminal.on_cwd_changed = onCwdEvent;
         terminal.on_clipboard_set = onClipboardEvent;
         terminal.on_notification = onNotificationEvent;
         terminal.on_bell = onBellEvent;
@@ -763,6 +767,11 @@ fn onTitleEvent(ctx: ?*anyopaque, title: []const u8) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
     self.setTitle(title);
     if (self.win_on_title) |f| f(self.win_title_ctx, title);
+}
+
+fn onCwdEvent(ctx: ?*anyopaque, cwd: []const u8) void {
+    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    if (self.win_on_cwd) |f| f(self.win_cwd_ctx, self, cwd);
 }
 
 fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {

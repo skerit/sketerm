@@ -61,6 +61,9 @@ pub const Terminal = struct {
     /// User-level callbacks (e.g. wired by main.zig to GTK).
     user_ctx: ?*anyopaque = null,
     on_title: ?*const fn (ctx: ?*anyopaque, title: []const u8) void = null,
+    /// Fired after OSC 7 updates `self.cwd`. UI uses this to refresh
+    /// the AdwTabPage tooltip so hovering shows the live shell cwd.
+    on_cwd_changed: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
     on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
@@ -182,6 +185,7 @@ pub const Terminal = struct {
         const decoded = percent.decode(self.allocator, raw) catch return;
         if (self.cwd) |old| self.allocator.free(old);
         self.cwd = decoded;
+        if (self.on_cwd_changed) |f| f(self.user_ctx, decoded);
     }
 
     fn sinkImage(ctx: ?*anyopaque, img: Screen.ImageEvent) void {

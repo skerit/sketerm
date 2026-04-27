@@ -567,6 +567,8 @@ pub const Window = struct {
                 pane.win_on_bell = onTermBell;
                 pane.win_child_ctx = @ptrCast(self);
                 pane.win_on_child_exit = onTermChildExit;
+                pane.win_cwd_ctx = @ptrCast(self);
+                pane.win_on_cwd = onTermCwdChanged;
                 pane.font_size = p.font_size orelse self.config.font_size;
                 pane.font_path = self.config.font_path;
                 pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
@@ -652,6 +654,8 @@ pub const Window = struct {
         pane.win_on_bell = onTermBell;
         pane.win_child_ctx = @ptrCast(self);
         pane.win_on_child_exit = onTermChildExit;
+        pane.win_cwd_ctx = @ptrCast(self);
+        pane.win_on_cwd = onTermCwdChanged;
         // Title forwarding intentionally null — tab titles are sticky.
 
         // Wrap pane.widget() in a Box so we can swap it for a Paned
@@ -870,6 +874,8 @@ pub const Window = struct {
         pane.win_on_bell = onTermBell;
         pane.win_child_ctx = @ptrCast(self);
         pane.win_on_child_exit = onTermChildExit;
+        pane.win_cwd_ctx = @ptrCast(self);
+        pane.win_on_cwd = onTermCwdChanged;
 
         // Profile name on the pane so cycle/restore knows which one
         // it spawned with.
@@ -2143,6 +2149,40 @@ fn onTermBell(ctx: ?*anyopaque, pane: *Pane) void {
             c.adw_tab_page_set_needs_attention(page, 1);
             return;
         }
+    }
+}
+
+/// OSC 7 cwd updated for `pane`. Find its AdwTabPage and rewrite
+/// the tooltip to include the live cwd, so hovering tells the user
+/// where each tab actually is. Format: "<title>\n<cwd>".
+fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
+    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    const n = c.adw_tab_view_get_n_pages(self.tab_view);
+    var i: c_int = 0;
+    while (i < n) : (i += 1) {
+        const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
+        if (page == null) continue;
+        const child = c.adw_tab_page_get_child(page);
+        if (child == null) continue;
+        if (!widgetIsAncestor(@ptrCast(child), pane.widget())) continue;
+
+        const title_c = c.adw_tab_page_get_title(page);
+        const title_str: []const u8 = if (title_c != null)
+            std.mem.span(@as([*:0]const u8, @ptrCast(title_c)))
+        else
+            "";
+        const total_len = if (title_str.len > 0) title_str.len + 1 + cwd.len else cwd.len;
+        const tip = self.allocator.allocSentinel(u8, total_len, 0) catch return;
+        defer self.allocator.free(tip);
+        if (title_str.len > 0) {
+            @memcpy(tip[0..title_str.len], title_str);
+            tip[title_str.len] = '\n';
+            @memcpy(tip[title_str.len + 1 .. total_len], cwd);
+        } else {
+            @memcpy(tip[0..cwd.len], cwd);
+        }
+        c.adw_tab_page_set_tooltip(page, tip.ptr);
+        return;
     }
 }
 
