@@ -1835,3 +1835,43 @@ flow inherit pin state automatically.
 
 main.zig HELP_TEXT lists Ctrl+Shift+P. sample.conf documents the
 keybind override.
+
+## Per-pane manual title override
+
+Plan-v3.md line 309 listed Terminator's "set a title that survives
+OSC 0/1/2 updates" as a quick win adjacent to the new titlebar.
+Now done.
+
+### Pane state
+
+- `Pane.title_locked: bool = false` — when true, `setTitle` (called
+  from `on_title` sink) is a no-op so manual strings stick across
+  subsequent OSC updates.
+- `applyTitle` extracted as the unconditional inner that updates
+  `titlebar_text` + the GtkLabel. `setTitle` becomes a thin gate
+  on the lock; new `lockTitle(text)` writes via `applyTitle` and
+  flips the flag; `unlockTitle()` just clears it (label keeps its
+  current text until the next OSC arrives).
+
+### UX
+
+Right-click → Pane section → "Set Pane Title…" opens a GtkPopover
+anchored on `pane.area` (vs. the rename-tab popover which anchors
+on `app_window`). Pre-fills the entry with the current title text;
+Enter applies, Escape dismisses (popover default). Empty string
+calls `unlockTitle` so the user can revert without restarting the
+shell.
+
+`menu.Action.set_pane_title` joins the pane section between
+"Split Vertical" and "Close Pane". `Window.onMenuAction` routes
+to `setFocusedPaneTitle`. `PaneTitleCtx` mirrors the existing
+`RenameCtx` pattern with `freePaneTitleCtx` as the GDestroyNotify.
+
+### Why no keybind
+
+Setting a pane title is rare-and-deliberate, like
+save_default_layout — burning a Ctrl+Shift+\* slot felt wasteful.
+User can bind via `keybind.<...>` if they want, but I didn't add
+the action to `input.zig::Action` since it requires a GTK popover
+that must be anchored on a real widget at call time. Living in
+`menu.Action` is sufficient.
