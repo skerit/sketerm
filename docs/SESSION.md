@@ -1678,3 +1678,50 @@ assertion updated. grid_pass overlay path (bidi / DW / DH) does
 not yet faux-bold; bidi+bold is rare and would need its own
 per-vertex bold flag.
 
+
+## Shift-bypass for mouse-mode + copy_screen action
+
+Two issues + one feature, all driven from a user report: "inside
+mosh+tmux I can drag-select but nothing reaches the clipboard, and
+OSC 52 doesn't work either."
+
+### Shift-bypass (the bug)
+
+`pane.zig: onDragBegin` returned early on `mouse_mode != 0` with no
+modifier check, so when tmux turned on DECSET 1003 every click went
+to tmux as a mouse report — host-side selection became impossible.
+xterm/kitty/gnome-terminal/alacritty all support **Shift-bypass**:
+hold Shift to override app-level mouse tracking.
+
+Fix: read modifiers up-front in `onDragBegin`, only short-circuit
+when `mouse_mode != 0 AND !shift_held`. Mirror in `onMousePressed`
++ `onMouseReleased` so a Shift-held click doesn't ALSO emit a mouse
+report alongside the selection. Factored a `shiftHeld(controller)`
+helper to share the modifier read.
+
+### copy_screen action
+
+When even Shift-drag isn't an option (e.g. the running app re-paints
+constantly, or the user wants the whole pane), Ctrl+Shift+A now
+copies the entire visible screen as UTF-8 to the system clipboard.
+
+`Screen.extractScreen(allocator)` walks rows 0..rows-1 honouring
+`view_offset` (so a scrolled-back view dumps what the user sees),
+trims trailing blanks per row, preserves OSC 8 markdown links, and
+emits one `\n` per row (including blank ones, so paragraph shape
+survives).
+
+Wired through input.zig: new `Action.copy_screen` enum entry, default
+binding, runAction case, prefs label, `actionFromName`. Help text in
+main.zig updated. New unit test asserts the visible-row walker
+produces the expected `"hello\nworld\n\n"` for a 3-row screen.
+
+### OSC 52 over mosh+tmux (docs)
+
+This one's a config story, not code. Two stacked filters need
+updating outside sketerm: tmux only forwards OSC 52 if its terminfo
+advertises the `Ms` cap (workaround: `set -as terminal-features
+',*:clipboard'`); mosh strips OSC 52 unless `MOSH_OSC52=1` is set
+on the server before mosh-server starts. Both documented in
+`data/sample.conf` so the user has an answer next time they wonder
+why their `printf "\033]52;c;$(echo X | base64)\a"` does nothing.
