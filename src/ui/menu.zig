@@ -12,6 +12,7 @@ pub const Action = enum {
     new_tab,
     close_tab,
     rename_tab,
+    pin_tab,
     split_h,
     split_v,
     close_pane,
@@ -56,6 +57,7 @@ const BINDS = [_]Bind{
     .{ .name = "close-pane", .label = "Close Pane", .detailed = "term.close-pane", .action = .close_pane },
     .{ .name = "new-tab", .label = "New Tab", .detailed = "term.new-tab", .action = .new_tab },
     .{ .name = "rename-tab", .label = "Rename Tab…", .detailed = "term.rename-tab", .action = .rename_tab },
+    .{ .name = "pin-tab", .label = "Pin / Unpin Tab", .detailed = "term.pin-tab", .action = .pin_tab },
     .{ .name = "close-tab", .label = "Close Tab", .detailed = "term.close-tab", .action = .close_tab },
     .{ .name = "reset", .label = "Reset Terminal", .detailed = "term.reset", .action = .reset_terminal },
     .{ .name = "prefs", .label = "Preferences…", .detailed = "term.prefs", .action = .prefs_open },
@@ -97,6 +99,7 @@ pub fn attachWithPrePopup(
     const sec3 = c.g_menu_new();
     c.g_menu_append(sec3, "New Tab", "term.new-tab");
     c.g_menu_append(sec3, "Rename Tab…", "term.rename-tab");
+    c.g_menu_append(sec3, "Pin / Unpin Tab", "term.pin-tab");
     c.g_menu_append(sec3, "Close Tab", "term.close-tab");
     c.g_menu_append_section(menu, null, @ptrCast(@alignCast(sec3)));
     c.g_object_unref(sec3);

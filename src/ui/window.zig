@@ -2063,6 +2063,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .new_tab => self.newShellTab(null) catch {},
         .close_tab => self.closeCurrentTab(),
         .rename_tab => self.renameCurrentTab(),
+        .pin_tab => self.togglePinCurrentTab(),
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {},
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
         .close_pane => self.closeFocusedPane(),
