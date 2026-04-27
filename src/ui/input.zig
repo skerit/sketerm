@@ -77,6 +77,10 @@ pub const Action = enum {
     // Per-pane (dispatched locally inside input.zig).
     paste_clipboard,
     copy_selection,
+    /// Copy the entire visible screen to the system clipboard.
+    /// Useful when an app paints output without leaving it
+    /// selectable (TUI dashboards, mosh+tmux mouse-mode, etc.).
+    copy_screen,
     interrupt_or_copy,
     clear_and_scrollback,
     scrollback_page_up,
@@ -113,6 +117,7 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_plus, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .font_inc },
     .{ .keyval = c.GDK_KEY_g, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .broadcast_cycle },
     .{ .keyval = c.GDK_KEY_z, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .restore_closed_tab },
+    .{ .keyval = c.GDK_KEY_a, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_screen },
     // Ctrl+...
     .{ .keyval = c.GDK_KEY_Tab, .mods = c.GDK_CONTROL_MASK, .action = .next_tab },
     .{ .keyval = c.GDK_KEY_minus, .mods = c.GDK_CONTROL_MASK, .action = .font_dec },
@@ -174,6 +179,7 @@ pub fn actionName(a: Action) []const u8 {
         .restore_closed_tab => "restore_closed_tab",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
+        .copy_screen => "copy_screen",
         .interrupt_or_copy => "interrupt_or_copy",
         .clear_and_scrollback => "clear_and_scrollback",
         .scrollback_page_up => "scrollback_page_up",
@@ -214,6 +220,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .restore_closed_tab => "Re-open closed tab",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",
+        .copy_screen => "Copy whole screen",
         .interrupt_or_copy => "Copy / interrupt (smart)",
         .clear_and_scrollback => "Clear screen + scrollback",
         .scrollback_page_up => "Scroll back one page",
@@ -464,6 +471,10 @@ fn runAction(ctx: *Ctx, action: Action) c.gboolean {
             copySelection(ctx);
             return 1;
         },
+        .copy_screen => {
+            copyScreen(ctx);
+            return 1;
+        },
         .interrupt_or_copy => {
             // smart_copy: no selection AND smart_copy on → forward
             // Ctrl+C (interrupt). Off → noop. Selection present →
@@ -524,6 +535,20 @@ fn copySelection(ctx: *Ctx) void {
         screen.dirty = true;
         c.gtk_widget_queue_draw(ctx.widget);
     }
+}
+
+fn copyScreen(ctx: *Ctx) void {
+    const screen = ctx.terminal.screen;
+    const text = screen.extractScreen(ctx.terminal.allocator) catch return;
+    defer ctx.terminal.allocator.free(text);
+    if (text.len == 0) return;
+
+    const display = c.gtk_widget_get_display(ctx.widget);
+    const clip = c.gdk_display_get_clipboard(display);
+    const cstr = ctx.terminal.allocator.allocSentinel(u8, text.len, 0) catch return;
+    defer ctx.terminal.allocator.free(cstr);
+    @memcpy(cstr, text);
+    c.gdk_clipboard_set_text(clip, cstr.ptr);
 }
 
 /// xterm modifier encoding: 1 + shift(1) + alt(2) + ctrl(4).

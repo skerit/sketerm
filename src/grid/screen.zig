@@ -1006,6 +1006,88 @@ pub const Screen = struct {
         return try out.toOwnedSlice(allocator);
     }
 
+    /// Extract the entire visible screen as UTF-8 text. Honours
+    /// `view_offset` so a scrolled-back view dumps what the user
+    /// currently sees. Trailing blank cells per row are trimmed; rows
+    /// that are entirely blank still emit a `\n` so paragraph shape
+    /// survives. Caller frees the returned slice.
+    pub fn extractScreen(self: *const Screen, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(allocator);
+
+        const view_off: i32 = @intCast(@min(self.view_offset, self.scrollbackCount()));
+        var open_link_id: u8 = 0;
+
+        var r: i32 = 0;
+        while (r < @as(i32, @intCast(self.rows))) : (r += 1) {
+            const logical_row: i32 = r - view_off;
+            const line_cells = self.lineCellsAt(logical_row) orelse {
+                try out.append(allocator, '\n');
+                continue;
+            };
+            // Trim trailing blanks (rune == 0) so we don't pad with spaces.
+            var hi: usize = line_cells.len;
+            while (hi > 0 and line_cells[hi - 1].rune == 0) hi -= 1;
+
+            var col: usize = 0;
+            while (col < hi) : (col += 1) {
+                const cell = line_cells[col];
+                if (cell.flags & 0b0000_0010 != 0) continue; // wide-char tail
+
+                const has_link = (cell.flags & 0b0000_0100) != 0;
+                const cell_link_id: u8 = if (has_link) cell.reserved else 0;
+                if (cell_link_id != open_link_id) {
+                    if (open_link_id != 0) {
+                        if (self.linkUri(open_link_id)) |uri| {
+                            try out.append(allocator, ']');
+                            try out.append(allocator, '(');
+                            const need_angle = std.mem.indexOfScalar(u8, uri, ')') != null;
+                            if (need_angle) try out.append(allocator, '<');
+                            try out.appendSlice(allocator, uri);
+                            if (need_angle) try out.append(allocator, '>');
+                            try out.append(allocator, ')');
+                        } else {
+                            try out.append(allocator, ']');
+                        }
+                    }
+                    if (cell_link_id != 0) try out.append(allocator, '[');
+                    open_link_id = cell_link_id;
+                }
+
+                const cp = cell.rune;
+                if (cp == 0) {
+                    try out.append(allocator, ' ');
+                } else if (cp < 0x80) {
+                    try out.append(allocator, @intCast(cp));
+                } else {
+                    var ub: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
+                    try out.appendSlice(allocator, ub[0..n]);
+                }
+                if (logical_row >= 0 and logical_row < @as(i32, @intCast(self.rows))) {
+                    const cluster = self.clusterAt(@intCast(logical_row), @intCast(col));
+                    for (cluster) |ext_cp| {
+                        var eb: [4]u8 = undefined;
+                        const en = std.unicode.utf8Encode(@intCast(ext_cp), &eb) catch continue;
+                        try out.appendSlice(allocator, eb[0..en]);
+                    }
+                }
+            }
+            try out.append(allocator, '\n');
+        }
+        if (open_link_id != 0) {
+            if (self.linkUri(open_link_id)) |uri| {
+                try out.append(allocator, ']');
+                try out.append(allocator, '(');
+                try out.appendSlice(allocator, uri);
+                try out.append(allocator, ')');
+            } else {
+                try out.append(allocator, ']');
+            }
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
     /// Returns the cells slice for a display row, including scrollback
     /// (negative rows). Returns null on out-of-range.
     fn lineCellsAt(self: *const Screen, row: i32) ?[]Cell {
@@ -4879,6 +4961,24 @@ test "rectangular selection extracts column block" {
     const text = try s.extractSelection(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("bar\nqux\nyo ", text);
+}
+
+test "extractScreen captures all visible rows + trims trailing blanks" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+
+    for ("hello") |b| s.printCp(b);
+    s.apply(.{ .execute = '\n' });
+    s.apply(.{ .execute = '\r' });
+    for ("world") |b| s.printCp(b);
+
+    const text = try s.extractScreen(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    // Row 0: "hello" + newline. Row 1: "world" + newline. Row 2: blank
+    // line still emits a newline so paragraph shape is preserved.
+    try std.testing.expectEqualStrings("hello\nworld\n\n", text);
 }
 
 test "extractSelection emits OSC 8 as markdown link" {
