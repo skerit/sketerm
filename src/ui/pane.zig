@@ -1083,17 +1083,27 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
     const self: *Pane = @ptrCast(@alignCast(user.?));
     // Always grab focus on click.
     _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
-    // If app captures the mouse, don't start a text selection —
-    // the click is going through the click controller as a mouse
-    // report instead.
-    if (self.terminal.screen.mouse_mode != 0) return;
 
-    // Read modifiers before deciding what kind of drag this is.
+    // Read modifiers up-front — Shift overrides app-level mouse
+    // tracking (xterm/kitty/gnome-terminal convention).
     var mods: c.GdkModifierType = 0;
     const ev = c.gtk_event_controller_get_current_event(@ptrCast(g));
     if (ev != null) mods = c.gdk_event_get_modifier_state(ev);
     const shift_held = (mods & c.GDK_SHIFT_MASK) != 0;
     const alt_held = (mods & c.GDK_ALT_MASK) != 0;
+
+    // App captures the mouse (e.g. tmux mouse-mode, vim/htop):
+    // forward the click as a mouse report unless Shift is held.
+    // Without this, host-side selection is impossible inside a
+    // tmux/mosh session.
+    if (self.terminal.screen.mouse_mode != 0 and !shift_held) {
+        if (self.terminal.screen.selection.isActive()) {
+            self.terminal.screen.selection.clear();
+            self.terminal.screen.dirty = true;
+            c.gtk_widget_queue_draw(@ptrCast(self.area));
+        }
+        return;
+    }
 
     // On the alternate screen (TUIs like vim, htop, less), the
     // running app owns the mouse model — host-side selection is
@@ -1162,13 +1172,23 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
     }
 
     if (self.terminal.screen.mouse_mode == 0) return;
+    // Shift-bypass: a Shift-held click belongs to the host
+    // (selection / link follow), not the running app.
+    if (shiftHeld(@ptrCast(g))) return;
     emitMouseSeq(self, g, x, y, true);
 }
 
 fn onMouseReleased(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const self: *Pane = @ptrCast(@alignCast(user.?));
     if (self.terminal.screen.mouse_mode == 0) return;
+    if (shiftHeld(@ptrCast(g))) return;
     emitMouseSeq(self, g, x, y, false);
+}
+
+fn shiftHeld(g: *c.GtkEventController) bool {
+    const ev = c.gtk_event_controller_get_current_event(g);
+    if (ev == null) return false;
+    return (c.gdk_event_get_modifier_state(ev) & c.GDK_SHIFT_MASK) != 0;
 }
 
 fn emitMouseSeq(self: *Pane, g: *c.GtkGestureClick, x: f64, y: f64, press: bool) void {
