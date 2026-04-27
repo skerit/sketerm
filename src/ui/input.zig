@@ -72,6 +72,8 @@ pub const Action = enum {
     prefs_open,
     /// Cycle broadcast typing mode: off → group → all → off.
     broadcast_cycle,
+    /// Re-open the most-recently-closed tab (browser convention).
+    restore_closed_tab,
     // Per-pane (dispatched locally inside input.zig).
     paste_clipboard,
     copy_selection,
@@ -110,6 +112,7 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_ISO_Left_Tab, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .prev_tab },
     .{ .keyval = c.GDK_KEY_plus, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .font_inc },
     .{ .keyval = c.GDK_KEY_g, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .broadcast_cycle },
+    .{ .keyval = c.GDK_KEY_z, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .restore_closed_tab },
     // Ctrl+...
     .{ .keyval = c.GDK_KEY_Tab, .mods = c.GDK_CONTROL_MASK, .action = .next_tab },
     .{ .keyval = c.GDK_KEY_minus, .mods = c.GDK_CONTROL_MASK, .action = .font_dec },
@@ -168,6 +171,7 @@ pub fn actionName(a: Action) []const u8 {
         .pane_prev => "pane_prev",
         .prefs_open => "prefs_open",
         .broadcast_cycle => "broadcast_cycle",
+        .restore_closed_tab => "restore_closed_tab",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
         .interrupt_or_copy => "interrupt_or_copy",
@@ -207,6 +211,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .pane_prev => "Previous pane",
         .prefs_open => "Open Preferences",
         .broadcast_cycle => "Broadcast typing (cycle)",
+        .restore_closed_tab => "Re-open closed tab",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",
         .interrupt_or_copy => "Copy / interrupt (smart)",

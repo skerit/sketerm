@@ -19,6 +19,14 @@ var always_on_top_warned: bool = false;
 /// Broadcast typing mode. Off / group / all — Terminator semantics.
 pub const GroupSend = enum { off, group, all };
 
+/// Snapshot of a closed tab's restorable state. Owned strings live
+/// in `Window.closed_arena`. Recent ring grows up to 16 entries.
+pub const ClosedTab = struct {
+    title: []const u8,
+    cwd: ?[]const u8 = null,
+    profile_name: ?[]const u8 = null,
+};
+
 pub const Window = struct {
     app_window: *c.GtkWidget,
     tab_view: *c.AdwTabView,
@@ -64,6 +72,10 @@ pub const Window = struct {
     /// (default). Group = fan out to every pane sharing the source's
     /// `group` name. All = fan out to every pane in this window.
     groupsend: GroupSend = .off,
+    /// Recently-closed tab ring. Newest entry at the end; cap at 16.
+    /// Strings owned by `closed_arena`.
+    closed_tabs: std.ArrayList(ClosedTab) = .{},
+    closed_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         return initWithConfig(allocator, app, null);
@@ -286,6 +298,8 @@ pub const Window = struct {
         self.terminals.deinit(self.allocator);
         self.search_matches.deinit(self.allocator);
         self.bindings.deinit(self.allocator);
+        self.closed_tabs.deinit(self.allocator);
+        if (self.closed_arena) |*a| a.deinit();
         self.config.deinit();
         self.allocator.destroy(self);
     }
@@ -695,6 +709,78 @@ pub const Window = struct {
 
     fn spawnShellPane(self: *Window) !*Pane {
         return self.spawnShellPaneOpts(null, null);
+    }
+
+    /// Snapshot a tab into the recently-closed ring before its panes
+    /// are torn down. Stores title + first-pane cwd + active profile.
+    /// Splits aren't preserved — the restore spawns a single shell.
+    fn captureClosedTab(self: *Window, page: *c.AdwTabPage, root: *c.GtkWidget) void {
+        if (self.closed_arena == null) {
+            self.closed_arena = std.heap.ArenaAllocator.init(self.allocator);
+        }
+        const arena = self.closed_arena.?.allocator();
+
+        // Title (AdwTabPage owns the string; dup into our arena).
+        const title_c = c.adw_tab_page_get_title(page);
+        const title_dup: []const u8 = if (title_c == null) "Tab" else blk: {
+            const span = std.mem.span(@as([*:0]const u8, @ptrCast(title_c)));
+            break :blk arena.dupe(u8, span) catch "Tab";
+        };
+
+        // Find the first pane in this page's tree → snapshot its cwd
+        // + profile.
+        var snap_cwd: ?[]const u8 = null;
+        var snap_profile: ?[]const u8 = null;
+        for (self.panes.items) |p| {
+            if (widgetIsAncestor(root, p.widget())) {
+                if (p.terminal.cwd) |c2| snap_cwd = arena.dupe(u8, c2) catch null;
+                if (p.active_profile) |pn| snap_profile = arena.dupe(u8, pn) catch null;
+                break;
+            }
+        }
+
+        const entry: ClosedTab = .{
+            .title = title_dup,
+            .cwd = snap_cwd,
+            .profile_name = snap_profile,
+        };
+
+        // Cap at 16; drop the oldest when full.
+        const max_closed: usize = 16;
+        if (self.closed_tabs.items.len >= max_closed) {
+            _ = self.closed_tabs.orderedRemove(0);
+        }
+        self.closed_tabs.append(self.allocator, entry) catch {};
+    }
+
+    /// Pop the most-recently-closed tab and respawn it with its
+    /// captured title / cwd / profile. No-op when the ring is empty.
+    pub fn restoreLastClosed(self: *Window) void {
+        if (self.closed_tabs.items.len == 0) return;
+        const entry = self.closed_tabs.pop().?;
+        // newShellTabWithProfile takes a NUL-terminated title.
+        var title_buf: [256:0]u8 = undefined;
+        const n = @min(entry.title.len, title_buf.len);
+        @memcpy(title_buf[0..n], entry.title[0..n]);
+        title_buf[n] = 0;
+        const title_z: ?[*:0]const u8 = if (entry.title.len > 0) @ptrCast(&title_buf) else null;
+        // The captured cwd is owned by closed_arena; the spawn path
+        // dups it into the child PTY's env briefly so it's safe.
+        const pane = self.spawnShellPaneOpts(entry.cwd, entry.profile_name) catch |err| {
+            std.debug.print("sketerm: restore-closed-tab spawn failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        // Wrap pane.widget() in a Box so layout reparenting works the
+        // same as addTabWithProfile does.
+        const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        c.gtk_widget_set_hexpand(wrapper, 1);
+        c.gtk_widget_set_vexpand(wrapper, 1);
+        c.gtk_box_append(@ptrCast(wrapper), pane.widget());
+        const adw_page = self.appendOrInsertTab(wrapper);
+        const title_for_page: [*:0]const u8 = title_z orelse "Tab";
+        c.adw_tab_page_set_title(adw_page, title_for_page);
+        c.adw_tab_page_set_tooltip(adw_page, title_for_page);
+        _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
     }
 
     /// Look up a named profile in the active Config, or null if no
@@ -1829,6 +1915,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .pane_next => self.cyclePane(.next),
         .prefs_open => self.openPrefs(),
         .broadcast_cycle => self.cycleGroupSend(),
+        .restore_closed_tab => self.restoreLastClosed(),
         else => {},
     }
 }
@@ -2271,6 +2358,12 @@ fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyop
     const self: *Window = @ptrCast(@alignCast(user.?));
     const child = c.adw_tab_page_get_child(page);
     if (child == null) return;
+    // Capture the tab's basic state into the recently-closed ring
+    // BEFORE we tear the panes down. We keep title + first-pane's
+    // cwd + profile. Split trees aren't preserved (a future v2 of
+    // this could re-serialise the layout tree the same way --restore
+    // does, but single-pane is the 95% case).
+    self.captureClosedTab(page, @ptrCast(child));
     collectAndFreePanes(self, @ptrCast(child));
 
     // If the user just closed the last tab via the AdwTabView "X"

@@ -53,6 +53,7 @@ const HELP_TEXT =
     \\                          (default: smart-case — uppercase → CS)
     \\  Ctrl+Shift+S          Save current layout (last.json)
     \\  Ctrl+Shift+Alt+S      Save Layout As… (file picker)
+    \\  Ctrl+Shift+Z          Re-open most recently closed tab
     \\  Ctrl+Shift+Up/Down    Jump to prev/next OSC 133 prompt mark
     \\  Ctrl+Shift+Left/Right Cycle focus between panes in the tab
     \\  Ctrl+= / Ctrl+-       Increase / decrease font size
