@@ -1633,3 +1633,28 @@ extremely rare and would require its own per-vertex italic flag
 on grid_pass like the existing dim flag. Latin-only italic is
 the 99% case.
 
+## Recently-closed tabs (Ctrl+Shift+Z)
+
+`Window.closed_tabs: ArrayList(ClosedTab)` — a 16-entry ring (oldest
+evicted on overflow). `onPageDetached` calls `captureClosedTab`
+BEFORE `collectAndFreePanes`, snapshotting:
+
+- The AdwTabPage title
+- The first matching pane's cwd (OSC 7 reported, fallback to nil)
+- That pane's active_profile
+
+Strings are duped into `Window.closed_arena` (fresh-on-first-capture).
+
+`restore_closed_tab` action pops the most-recent and respawns via
+the existing `spawnShellPaneOpts(cwd, profile)` path → wraps in
+the standard tab-page Box → grabs focus on the new pane's GLArea.
+
+Default keybind: Ctrl+Shift+Z (browser convention is Ctrl+Shift+T,
+but we use that for new_tab; Z mirrors undo). Configurable via
+`keybind.restore_closed_tab` like every other action.
+
+Limitation (documented in commit body): splits aren't preserved.
+A full split-tree restore would duplicate the `--restore` JSON
+serialiser, which is a much bigger feature. Single-pane is the
+95% case for the "I closed this by accident" workflow.
+
