@@ -1585,3 +1585,23 @@ Total: ~25 commits, ~2200 LoC added. Cron `5c32eb79` (7,37 * * * *)
 will keep firing for 7 days; if more work surfaces it'll pick up
 automatically.
 
+## I persistent-VBO follow-up — probe re-enabled
+
+Returning to the deferred I item: the smoke-cell SIGSEGV when
+persistent_supported was forced to 1 wasn't a glBufferStorage
+issue. The real bug: the regrow path called glDeleteBuffers +
+glGenBuffers but the VAO records buffer names per-attribute, so
+the next draw read the freed buffer and crashed.
+
+Fix: factored `bindVertexAttribs()` out of realize() so the regrow
+path can re-bind vertex attribs after recreating the VBO. Probe
+now activates when GL_EXT_buffer_storage is advertised AND
+epoxy_glBufferStorage resolves at runtime; runtime glGetError
+post-storage falls back to a mutable glBufferData VBO if the
+driver rejects the call mid-flight (no permanent state corruption).
+
+smoke-cell + smoke-image still pass at this commit. On hardware
+that supports persistent mapping, cell upload now writes directly
+into the GPU-visible buffer with one fence per frame instead of
+glBufferSubData + driver-side staging.
+
