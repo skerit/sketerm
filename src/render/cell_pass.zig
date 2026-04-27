@@ -24,7 +24,7 @@ const Scaling = @import("../grid/line.zig").Scaling;
 const palette_default = @import("../grid/palette.zig").default_256;
 
 /// Per-cell instance data. Layout matches the vertex attribs
-/// declared in `realize`. 96 bytes — for 200×80 cells: 1.5 MB.
+/// declared in `realize`. 100 bytes — for 200×80 cells: 1.6 MB.
 pub const Instance = extern struct {
     cell_xy: [2]f32 = .{ 0, 0 },
     cell_size: [2]f32 = .{ 0, 0 },
@@ -47,6 +47,10 @@ pub const Instance = extern struct {
     /// FreeType face (italic glyph caching) and works for any
     /// monospace font without an italic variant.
     italic: f32 = 0,
+    /// 1.0 = render this glyph faux-bold by sampling the atlas at
+    /// the original UV AND a 1-pixel offset in u, taking max alpha.
+    /// Same idea as italic — cheap, no second FT face needed.
+    bold: f32 = 0,
 };
 
 const VERT_SRC =
@@ -63,6 +67,7 @@ const VERT_SRC =
     \\in float a_has_glyph;
     \\in float a_deco;
     \\in float a_italic;
+    \\in float a_bold;
     \\
     \\uniform vec2 u_screen_px;
     \\uniform int u_kind; // 0 = bg, 1 = glyph, 2 = decoration
@@ -80,6 +85,7 @@ const VERT_SRC =
     \\out float v_deco_kind;
     \\out vec2 v_deco_local;
     \\out float v_deco_w_px;
+    \\out float v_bold;
     \\
     \\const vec2 corners[6] = vec2[6](
     \\    vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
@@ -94,6 +100,7 @@ const VERT_SRC =
     \\    v_deco_kind = 0.0;
     \\    v_deco_local = vec2(0.0);
     \\    v_deco_w_px = a_cell_size.x;
+    \\    v_bold = a_bold;
     \\    if (u_kind == 0) {
     \\        v_color = vec4(a_bg.rgb * u_dim_bg, a_bg.a);
     \\        v_is_glyph = 0.0;
@@ -177,6 +184,7 @@ const FRAG_SRC =
     \\in float v_deco_kind;
     \\in vec2 v_deco_local;
     \\in float v_deco_w_px;
+    \\in float v_bold;
     \\
     \\uniform sampler2DArray u_atlas;
     \\
@@ -186,6 +194,14 @@ const FRAG_SRC =
     \\    if (v_emit < 0.5) discard;
     \\    if (v_is_glyph > 0.5) {
     \\        float a = texture(u_atlas, v_uvw).r;
+    \\        if (v_bold > 0.5) {
+    \\            // Faux bold: sample one texel-step right and take
+    \\            // max alpha — visually thickens the glyph by one
+    \\            // pixel without needing a second FreeType face.
+    \\            // Atlas pages are 2048×2048 → 1/2048 per texel.
+    \\            float a2 = texture(u_atlas, v_uvw + vec3(1.0/2048.0, 0.0, 0.0)).r;
+    \\            a = max(a, a2);
+    \\        }
     \\        o_frag = vec4(v_color.rgb, a * v_color.a);
     \\        return;
     \\    }
@@ -379,6 +395,7 @@ pub const CellPass = struct {
             .{ .name = "a_has_glyph", .off = @offsetOf(Instance, "has_glyph"), .count = 1 },
             .{ .name = "a_deco", .off = @offsetOf(Instance, "deco"), .count = 1 },
             .{ .name = "a_italic", .off = @offsetOf(Instance, "italic"), .count = 1 },
+            .{ .name = "a_bold", .off = @offsetOf(Instance, "bold"), .count = 1 },
         };
         for (fields) |f| {
             const loc = c.glGetAttribLocation(self.program, f.name.ptr);
@@ -541,6 +558,7 @@ pub const CellPass = struct {
         var cached_has_bg: bool = false;
         var cached_deco: f32 = 0;
         var cached_italic: f32 = 0;
+        var cached_bold: f32 = 0;
         while (col < cells.len) : (col += 1) {
             const cell = cells[col];
             const is_wide = (cell.flags & 0b0000_0001) != 0;
@@ -588,6 +606,7 @@ pub const CellPass = struct {
                     else if (style.attrs.overline) 5.0
                     else 0.0;
                 cached_italic = if (style.attrs.italic) 1.0 else 0.0;
+                cached_bold = if (style.attrs.bold and self.allow_bold) 1.0 else 0.0;
                 cached_style = cell.style_ref;
             }
             slice[col].bg = cached_bg;
@@ -595,6 +614,7 @@ pub const CellPass = struct {
             slice[col].has_glyph = 1.0; // 1 = no glyph until we set one
             slice[col].deco = cached_deco;
             slice[col].italic = cached_italic;
+            slice[col].bold = cached_bold;
             // Per-codepoint glyph (will be overridden by ligature shaping
             // below if applicable).
             if (cell.rune != 0 and cell.rune != ' ' and (cell.flags & 0b0000_0010) == 0) {
@@ -972,6 +992,6 @@ pub fn rowNeedsBidiOrComplexShape(cells: []const Cell) bool {
     return Screen.rowNeedsBidiOrComplexShape(cells);
 }
 
-test "Instance is 96 bytes" {
-    try std.testing.expectEqual(@as(usize, 96), @sizeOf(Instance));
+test "Instance is 100 bytes" {
+    try std.testing.expectEqual(@as(usize, 100), @sizeOf(Instance));
 }
