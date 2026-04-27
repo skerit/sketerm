@@ -1899,6 +1899,16 @@ pub const Window = struct {
         layout_mod.save(layout, path) catch return;
     }
 
+    /// Toggle the current tab's pinned state. Pinned tabs sit in a
+    /// separate region at the start of the tab bar (AdwTabView
+    /// native): close button is hidden, drag-reorder is restricted
+    /// to among the pinned set.
+    pub fn togglePinCurrentTab(self: *Window) void {
+        const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
+        const is_pinned = c.adw_tab_page_get_pinned(page) != 0;
+        c.adw_tab_view_set_page_pinned(self.tab_view, page, if (is_pinned) 0 else 1);
+    }
+
     /// Save current state as the "default" layout that's auto-loaded
     /// on subsequent cold starts (no --layout / --restore needed).
     /// Best-effort; user gets stderr feedback on failure.
@@ -1969,6 +1979,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .prefs_open => self.openPrefs(),
         .broadcast_cycle => self.cycleGroupSend(),
         .restore_closed_tab => self.restoreLastClosed(),
+        .toggle_pin_tab => self.togglePinCurrentTab(),
         else => {},
     }
 }

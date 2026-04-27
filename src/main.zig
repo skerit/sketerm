@@ -61,6 +61,7 @@ const HELP_TEXT =
     \\                        next start, no --restore needed). Bind
     \\                        via keybind.save_default_layout.
     \\  Ctrl+Shift+Z          Re-open most recently closed tab
+    \\  Ctrl+Shift+P          Pin / unpin current tab
     \\  Ctrl+Shift+Up/Down    Jump to prev/next OSC 133 prompt mark
     \\  Ctrl+Shift+Left/Right Cycle focus between panes in the tab
     \\  Ctrl+= / Ctrl+-       Increase / decrease font size

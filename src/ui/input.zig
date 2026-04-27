@@ -77,6 +77,9 @@ pub const Action = enum {
     broadcast_cycle,
     /// Re-open the most-recently-closed tab (browser convention).
     restore_closed_tab,
+    /// Pin / unpin the current tab — pinned tabs sit in their own
+    /// section at the start of the tab bar (AdwTabView native).
+    toggle_pin_tab,
     // Per-pane (dispatched locally inside input.zig).
     paste_clipboard,
     copy_selection,
@@ -121,6 +124,7 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_g, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .broadcast_cycle },
     .{ .keyval = c.GDK_KEY_z, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .restore_closed_tab },
     .{ .keyval = c.GDK_KEY_a, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_screen },
+    .{ .keyval = c.GDK_KEY_p, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .toggle_pin_tab },
     // Ctrl+...
     .{ .keyval = c.GDK_KEY_Tab, .mods = c.GDK_CONTROL_MASK, .action = .next_tab },
     .{ .keyval = c.GDK_KEY_minus, .mods = c.GDK_CONTROL_MASK, .action = .font_dec },
@@ -181,6 +185,7 @@ pub fn actionName(a: Action) []const u8 {
         .prefs_open => "prefs_open",
         .broadcast_cycle => "broadcast_cycle",
         .restore_closed_tab => "restore_closed_tab",
+        .toggle_pin_tab => "toggle_pin_tab",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
         .copy_screen => "copy_screen",
@@ -223,6 +228,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .prefs_open => "Open Preferences",
         .broadcast_cycle => "Broadcast typing (cycle)",
         .restore_closed_tab => "Re-open closed tab",
+        .toggle_pin_tab => "Pin / unpin current tab",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",
         .copy_screen => "Copy whole screen",
