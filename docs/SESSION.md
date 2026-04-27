@@ -1798,3 +1798,40 @@ Saving the default layout is a deliberate "this is my workspace"
 moment — not something to fire by reflex. Forcing the user to bind
 it themselves nudges them to think about what the chord means. Also
 keeps Ctrl+Shift+\* surface uncluttered.
+
+## Pin / unpin tabs
+
+AdwTabView has native support for pinned tabs (separate region at
+the start of the tab bar, close button hidden, drag-reorder
+restricted to the pinned set). All sketerm needed was the wire-up.
+
+### Action + binding
+
+- `Action.toggle_pin_tab` added to input.zig with default
+  Ctrl+Shift+P.
+- `Window.togglePinCurrentTab()` reads the current selected page,
+  flips `adw_tab_page_get_pinned`, calls
+  `adw_tab_view_set_page_pinned`. Two lines.
+- `onShortcut` routes the action.
+
+### Context menu
+
+`menu.zig` BINDS table + tab section gained a "Pin / Unpin Tab"
+entry between Rename and Close. New `menu.Action.pin_tab`;
+`onMenuAction` in window.zig dispatches to the same
+`togglePinCurrentTab`. Right-click → Tab section → Pin / Unpin Tab.
+
+### Persistence
+
+Pin state survives layout save/restore. `TabSpec` gained a
+`pinned: bool = false` field (default keeps older JSON files
+parseable via `ignore_unknown_fields`). `collectLayout` writes
+`adw_tab_page_get_pinned`; `newTabFromSpec` calls
+`adw_tab_view_set_page_pinned` after creation when the spec says
+so. Both `--restore` (last.json) and the new auto-load default.json
+flow inherit pin state automatically.
+
+### Help text
+
+main.zig HELP_TEXT lists Ctrl+Shift+P. sample.conf documents the
+keybind override.
