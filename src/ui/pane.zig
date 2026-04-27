@@ -119,6 +119,10 @@ pub const Pane = struct {
     titlebar_label: ?*c.GtkLabel = null,
     titlebar_visible: bool = false,
     titlebar_active: bool = false,
+    /// User-locked title — when true, on_title sink drops incoming
+    /// OSC 0/1/2 updates so the manual string sticks. Cleared via
+    /// the menu's "Set Pane Title…" → empty input.
+    title_locked: bool = false,
     /// Latest OSC 0/1/2 title text. Owned; freed in deinit.
     titlebar_text: ?[]u8 = null,
 
@@ -456,7 +460,16 @@ pub const Pane = struct {
     /// when the running shell emits an OSC 0/1/2 escape. Idempotent
     /// when the new text matches the cached value. The label is set
     /// even if the bar is hidden — it'll display when revealed.
+    /// Drops the call when `title_locked` is set so the user's manual
+    /// override sticks across subsequent OSC updates.
     pub fn setTitle(self: *Pane, text: []const u8) void {
+        if (self.title_locked) return;
+        self.applyTitle(text);
+    }
+
+    /// Internal: same as setTitle but bypasses the lock. Used by
+    /// `lockTitle` so the manual string is applied at lock time.
+    fn applyTitle(self: *Pane, text: []const u8) void {
         if (self.titlebar_text) |old| {
             if (std.mem.eql(u8, old, text)) return;
             self.allocator.free(old);
@@ -467,6 +480,19 @@ pub const Pane = struct {
         defer self.allocator.free(z);
         @memcpy(z, text);
         c.gtk_label_set_text(lbl, z.ptr);
+    }
+
+    /// Lock the title bar to a manual string. Subsequent OSC 0/1/2
+    /// updates are dropped until `unlockTitle` is called.
+    pub fn lockTitle(self: *Pane, text: []const u8) void {
+        self.applyTitle(text);
+        self.title_locked = true;
+    }
+
+    /// Resume tracking incoming OSC 0/1/2 titles. The current label
+    /// stays as-is until the next OSC update arrives.
+    pub fn unlockTitle(self: *Pane) void {
+        self.title_locked = false;
     }
 
     /// Show / hide the per-pane title bar.

@@ -16,6 +16,7 @@ pub const Action = enum {
     split_h,
     split_v,
     close_pane,
+    set_pane_title,
     reset_terminal,
     copy_link,
     prefs_open,
@@ -55,6 +56,7 @@ const BINDS = [_]Bind{
     .{ .name = "split-h", .label = "Split Horizontal", .detailed = "term.split-h", .action = .split_h },
     .{ .name = "split-v", .label = "Split Vertical", .detailed = "term.split-v", .action = .split_v },
     .{ .name = "close-pane", .label = "Close Pane", .detailed = "term.close-pane", .action = .close_pane },
+    .{ .name = "set-pane-title", .label = "Set Pane Title…", .detailed = "term.set-pane-title", .action = .set_pane_title },
     .{ .name = "new-tab", .label = "New Tab", .detailed = "term.new-tab", .action = .new_tab },
     .{ .name = "rename-tab", .label = "Rename Tab…", .detailed = "term.rename-tab", .action = .rename_tab },
     .{ .name = "pin-tab", .label = "Pin / Unpin Tab", .detailed = "term.pin-tab", .action = .pin_tab },
@@ -92,6 +94,7 @@ pub fn attachWithPrePopup(
     const sec2 = c.g_menu_new();
     c.g_menu_append(sec2, "Split Horizontal", "term.split-h");
     c.g_menu_append(sec2, "Split Vertical", "term.split-v");
+    c.g_menu_append(sec2, "Set Pane Title…", "term.set-pane-title");
     c.g_menu_append(sec2, "Close Pane", "term.close-pane");
     c.g_menu_append_section(menu, null, @ptrCast(@alignCast(sec2)));
     c.g_object_unref(sec2);

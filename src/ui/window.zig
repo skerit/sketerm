@@ -1182,6 +1182,58 @@ pub const Window = struct {
         _ = c.gtk_widget_grab_focus(entry);
     }
 
+    const PaneTitleCtx = struct {
+        pane: *Pane,
+        popover: *c.GtkWidget,
+        entry: *c.GtkWidget,
+        allocator: std.mem.Allocator,
+    };
+
+    /// Show a popover anchored on the focused pane with an entry to
+    /// set its title manually. Empty input → unlock (resume OSC
+    /// tracking). Non-empty → lock the title against further OSC
+    /// 0/1/2 updates so the user's string sticks.
+    pub fn setFocusedPaneTitle(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+
+        const popover = c.gtk_popover_new();
+        const entry = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(entry), "Pane title (empty = follow OSC)");
+
+        if (pane.titlebar_text) |cur| {
+            const z = self.allocator.allocSentinel(u8, cur.len, 0) catch null;
+            if (z) |zz| {
+                defer self.allocator.free(zz);
+                @memcpy(zz, cur);
+                c.gtk_editable_set_text(@ptrCast(entry), zz.ptr);
+                c.gtk_editable_select_region(@ptrCast(entry), 0, -1);
+            }
+        }
+
+        c.gtk_popover_set_child(@ptrCast(popover), entry);
+        c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+
+        const ctx = self.allocator.create(PaneTitleCtx) catch return;
+        ctx.* = .{
+            .pane = pane,
+            .popover = popover,
+            .entry = entry,
+            .allocator = self.allocator,
+        };
+
+        _ = c.g_signal_connect_data(
+            entry,
+            "activate",
+            @ptrCast(&onPaneTitleActivate),
+            @ptrCast(ctx),
+            @ptrCast(&freePaneTitleCtx),
+            c.G_CONNECT_DEFAULT,
+        );
+
+        c.gtk_popover_popup(@ptrCast(popover));
+        _ = c.gtk_widget_grab_focus(entry);
+    }
+
     /// Bump the focused pane's font size by `delta` points (clamped
      /// 6..72) and rebuild the atlas. -1 / +1 / reset are exposed via
      /// Ctrl+- / Ctrl+= / Ctrl+0.
@@ -2067,6 +2119,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {},
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
         .close_pane => self.closeFocusedPane(),
+        .set_pane_title => self.setFocusedPaneTitle(),
         .prefs_open => self.openPrefs(),
         else => {},
     }
@@ -2145,6 +2198,25 @@ fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 
 fn freeRenameCtx(user: ?*anyopaque) callconv(.c) void {
     const ctx: *Window.RenameCtx = @ptrCast(@alignCast(user.?));
+    ctx.allocator.destroy(ctx);
+}
+
+fn onPaneTitleActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *Window.PaneTitleCtx = @ptrCast(@alignCast(user.?));
+    const text_c = c.gtk_editable_get_text(@ptrCast(entry));
+    if (text_c != null) {
+        const text = std.mem.span(@as([*:0]const u8, @ptrCast(text_c)));
+        if (text.len == 0) {
+            ctx.pane.unlockTitle();
+        } else {
+            ctx.pane.lockTitle(text);
+        }
+    }
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+}
+
+fn freePaneTitleCtx(user: ?*anyopaque) callconv(.c) void {
+    const ctx: *Window.PaneTitleCtx = @ptrCast(@alignCast(user.?));
     ctx.allocator.destroy(ctx);
 }
 
