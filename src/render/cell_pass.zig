@@ -24,7 +24,7 @@ const Scaling = @import("../grid/line.zig").Scaling;
 const palette_default = @import("../grid/palette.zig").default_256;
 
 /// Per-cell instance data. Layout matches the vertex attribs
-/// declared in `realize`. 92 bytes — for 200×80 cells: 1.45 MB.
+/// declared in `realize`. 96 bytes — for 200×80 cells: 1.5 MB.
 pub const Instance = extern struct {
     cell_xy: [2]f32 = .{ 0, 0 },
     cell_size: [2]f32 = .{ 0, 0 },
@@ -42,6 +42,11 @@ pub const Instance = extern struct {
     /// underline, 3 = curly underline, 4 = strikethrough, 5 = overline.
     /// Drawn in a third pass after bg + glyph; uses `fg` for color.
     deco: f32 = 0,
+    /// 1.0 = render this glyph italicized via a horizontal shear in
+    /// the glyph pass. 0.0 = upright. Cheaper than loading a second
+    /// FreeType face (italic glyph caching) and works for any
+    /// monospace font without an italic variant.
+    italic: f32 = 0,
 };
 
 const VERT_SRC =
@@ -57,6 +62,7 @@ const VERT_SRC =
     \\in float a_glyph_layer;
     \\in float a_has_glyph;
     \\in float a_deco;
+    \\in float a_italic;
     \\
     \\uniform vec2 u_screen_px;
     \\uniform int u_kind; // 0 = bg, 1 = glyph, 2 = decoration
@@ -99,6 +105,11 @@ const VERT_SRC =
     \\        uv = mix(a_glyph_uv0, a_glyph_uv1, corner);
     \\        v_is_glyph = 1.0;
     \\        v_emit = (a_has_glyph < 0.5 && a_glyph_size.x > 0.0 && a_glyph_size.y > 0.0) ? 1.0 : 0.0;
+    \\        // Italic via horizontal shear in pixel space. tan(13°) ≈ 0.231.
+    \\        // Shear pivots around the cell baseline so the bottom of
+    \\        // the glyph stays put and the top tilts right. We compute
+    \\        // the post-shear position later (after the corner-mix below
+    \\        // assembles `pos`).
     \\    } else {
     \\        // Decoration: derive a strip rect from the cell rect.
     \\        // Heights: thin = max(2, ch/12). Curly is taller (ch/6)
@@ -140,6 +151,13 @@ const VERT_SRC =
     \\    }
     \\    v_uvw = vec3(uv, a_glyph_layer);
     \\    vec2 pos = origin + corner * size;
+    \\    // Italic shear: only on glyph pass (u_kind == 1) and only
+    \\    // when the cell is marked italic. Pivot around the cell's
+    \\    // bottom edge so descenders stay anchored. tan(13°) ≈ 0.231.
+    \\    if (u_kind == 1 && a_italic > 0.5) {
+    \\        float baseline_y = a_cell_xy.y + a_cell_size.y;
+    \\        pos.x += (baseline_y - pos.y) * 0.231;
+    \\    }
     \\    if (v_emit < 0.5) pos = vec2(-10000.0);
     \\    vec2 ndc = (pos / u_screen_px) * 2.0 - 1.0;
     \\    ndc.y = -ndc.y;
@@ -360,6 +378,7 @@ pub const CellPass = struct {
             .{ .name = "a_glyph_layer", .off = @offsetOf(Instance, "glyph_layer"), .count = 1 },
             .{ .name = "a_has_glyph", .off = @offsetOf(Instance, "has_glyph"), .count = 1 },
             .{ .name = "a_deco", .off = @offsetOf(Instance, "deco"), .count = 1 },
+            .{ .name = "a_italic", .off = @offsetOf(Instance, "italic"), .count = 1 },
         };
         for (fields) |f| {
             const loc = c.glGetAttribLocation(self.program, f.name.ptr);
@@ -521,6 +540,7 @@ pub const CellPass = struct {
         var cached_bg: [4]f32 = .{ 0, 0, 0, 0 };
         var cached_has_bg: bool = false;
         var cached_deco: f32 = 0;
+        var cached_italic: f32 = 0;
         while (col < cells.len) : (col += 1) {
             const cell = cells[col];
             const is_wide = (cell.flags & 0b0000_0001) != 0;
@@ -567,12 +587,14 @@ pub const CellPass = struct {
                     else if (style.attrs.strikethrough) 4.0
                     else if (style.attrs.overline) 5.0
                     else 0.0;
+                cached_italic = if (style.attrs.italic) 1.0 else 0.0;
                 cached_style = cell.style_ref;
             }
             slice[col].bg = cached_bg;
             slice[col].fg = cached_fg;
             slice[col].has_glyph = 1.0; // 1 = no glyph until we set one
             slice[col].deco = cached_deco;
+            slice[col].italic = cached_italic;
             // Per-codepoint glyph (will be overridden by ligature shaping
             // below if applicable).
             if (cell.rune != 0 and cell.rune != ' ' and (cell.flags & 0b0000_0010) == 0) {
@@ -950,6 +972,6 @@ pub fn rowNeedsBidiOrComplexShape(cells: []const Cell) bool {
     return Screen.rowNeedsBidiOrComplexShape(cells);
 }
 
-test "Instance is 92 bytes" {
-    try std.testing.expectEqual(@as(usize, 92), @sizeOf(Instance));
+test "Instance is 96 bytes" {
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(Instance));
 }
