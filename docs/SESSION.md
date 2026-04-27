@@ -1605,3 +1605,31 @@ that supports persistent mapping, cell upload now writes directly
 into the GPU-visible buffer with one fence per frame instead of
 glBufferSubData + driver-side staging.
 
+## Italic rendering
+
+SGR 3 was parsed into `attrs.italic` but the cell_pass + grid_pass
+renderers both ignored it — italic text rendered upright. Worst
+of both worlds: the parser tracked the attribute, the renderer
+silently dropped it.
+
+Fix is shear-matrix-in-shader: per-instance `a_italic` flag (0.0
+or 1.0); when set AND `u_kind == 1` (glyph pass), the vertex
+shader applies `pos.x += (baseline_y - pos.y) * 0.231`. tan(13°)
+is the standard typographic italic angle. Pivot is the cell
+baseline so descenders stay anchored.
+
+Cheap because we don't need a second FreeType face / italic
+glyph variant — the same upright glyph atlas entry gets sheared.
+Works for any monospace font including those without an italic
+variant (Hack, JetBrains Mono Regular, Iosevka Term, etc.).
+Trade-off: it's a faux-italic, not the typographically-correct
+italic glyph design. Real italic faces would need a second atlas
++ font path config, which is a bigger change.
+
+cell_pass.Instance grew 92 → 96 bytes (one new f32 attribute);
+the size assertion test was updated. grid_pass overlay path
+(bidi / DW / DH glyphs) does NOT yet shear — bidi+italic is
+extremely rare and would require its own per-vertex italic flag
+on grid_pass like the existing dim flag. Latin-only italic is
+the 99% case.
+
