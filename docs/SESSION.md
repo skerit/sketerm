@@ -1875,3 +1875,62 @@ User can bind via `keybind.<...>` if they want, but I didn't add
 the action to `input.zig::Action` since it requires a GTK popover
 that must be anchored on a real widget at call time. Living in
 `menu.Action` is sufficient.
+
+## Regex search in scrollback
+
+Plan-v3.md spillover. Existing scrollback search did literal
+substring matching with smart-case; now Ctrl+R inside the search
+bar flips into POSIX ERE mode for the same buffer.
+
+### Why libc regex.h, not vendor
+
+Zig 0.15.2 stdlib has no regex. Options were: vendor an upstream
+regex implementation (zigregex, mvzr, etc.), reuse PCRE2 if it's
+already in the dep graph (it's not), or call libc's POSIX regex.h.
+libc was the smallest add — already linked via `lc`, no
+build.zig changes, no new vendored code, well-known semantics.
+
+### Translate-c bitfield gotcha
+
+glibc declares `struct re_pattern_buffer` with bitfields at the
+end. Zig's translate-c can't model bitfields, so it leaves the
+type opaque. That means we can't stack-allocate a `regex_t` —
+`var re: regex_t = undefined;` errors with "non-extern variable
+with opaque type." Workaround: heap-allocate via `std.c.malloc`
+with a generous fixed buffer (256 bytes; real size is ~64 on
+x86_64 glibc), cast the pointer to `*regex_t`, free with
+`std.c.free`. Documented in-line so the next reader doesn't
+chase the same rabbit hole.
+
+### `c` import collision
+
+screen.zig had no `c` import yet (it's pure VT logic, no GTK).
+Adding `const c = @import("../c.zig").c` at file scope shadowed
+seven local variables named `c` (column counters, capture vars).
+Inlined `const cre = @import(...).c` inside the regex function
++ helper instead. Tighter scope, no rename churn elsewhere.
+
+### Public surface
+
+- `Screen.searchOptsRegex(allocator, pattern, case_insensitive)`
+  mirrors `searchOpts`. Empty haystack rows skipped. Empty
+  matches (e.g. `a*` on "x") advance by one byte to break out of
+  zero-width loops.
+- `findRegexMatches` uses regexec with REG_EXTENDED + (REG_ICASE
+  if requested), iterates via `z.ptr + search_pos` slicing.
+- Two unit tests: `[0-9]+` finds two number runs across two rows
+  with correct columns/lengths; invalid pattern `[unclosed` returns
+  zero matches silently (no crash, no error to caller).
+
+### UI
+
+`Window.search_regex: bool` added next to `search_case_insensitive`.
+`onSearchKeyPressed` handles Ctrl+R: flips the flag, swaps the entry
+placeholder text ("Search regex (Ctrl+R)" vs. "Search (Ctrl+R for
+regex)"), re-runs the current pattern. Help text in main.zig lists
+Ctrl+R alongside Ctrl+I.
+
+`updateSearch` dispatches to either `searchOpts` or
+`searchOptsRegex` based on the flag — same SearchMatch shape goes
+to the renderer's overlay path, so highlights, jump-next, and
+selection-on-active all work without further changes.
