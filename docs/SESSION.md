@@ -1934,3 +1934,47 @@ Ctrl+R alongside Ctrl+I.
 `searchOptsRegex` based on the flag — same SearchMatch shape goes
 to the renderer's overlay path, so highlights, jump-next, and
 selection-on-active all work without further changes.
+
+## Smooth-scroll accumulator
+
+User-visible problem: on a high-resolution wheel (Logitech MX
+Master) or a touchpad, GTK4 emits fractional dy values like 0.05.
+The previous handler treated `dy < 0` as a +3-line jump regardless
+of magnitude, so each micro-event scrolled 3 lines — content
+flew past on the slightest touch.
+
+### Fix
+
+Per-pane `scroll_accum: f64`. On every event:
+
+```
+scroll_accum -= dy * SCROLL_LINES_PER_NOTCH;
+const whole = @trunc(scroll_accum);
+scroll_accum -= whole;
+view_offset += i32(whole);
+```
+
+`SCROLL_LINES_PER_NOTCH = 3.0` preserves the historical 3-lines-
+per-notch feel for discrete wheels (where dy = ±1.0). Touchpad
+events with fractional dy carry the residual fraction forward, so
+the user has to scroll roughly 1/3 of a "notch" worth of motion
+to advance one line.
+
+### Why no render-side changes
+
+True pixel-smooth scrolling would translate the grid render by a
+sub-cell pixel offset (cell_y = row * cell_h - view_offset_pixels).
+That requires grid_pass to accept a vertical pixel offset and to
+clip the top-most/bottom-most rows. Bigger surgery for a marginal
+visual improvement over per-line accumulation. Deferred.
+
+### Edge cases
+
+- Ctrl+wheel font-zoom path returns before touching scroll_accum,
+  so a stray fractional dy doesn't poison subsequent scroll-after-
+  zoom events.
+- Mouse-mode-on-alt-screen path returns before touching scroll_accum
+  too (those events become button 4/5 mouse reports — the running
+  app handles the scroll itself).
+- Clamp: `view_offset + delta` saturates at `scrollbackCount()` via
+  u64 widening to avoid overflow when delta_lines is large.
