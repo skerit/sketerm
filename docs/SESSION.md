@@ -1978,3 +1978,48 @@ visual improvement over per-line accumulation. Deferred.
   app handles the scroll itself).
 - Clamp: `view_offset + delta` saturates at `scrollbackCount()` via
   u64 widening to avoid overflow when delta_lines is large.
+
+## Profile picker — "New Tab as Profile…"
+
+Plan-v3.md spillover. Profiles existed (config + spawn plumbing)
+since plan-v3 F shipped; only missing bit was a UI hook so the
+user didn't have to type `keybind.<...>` to use them.
+
+### Why a popover, not a GMenu submenu
+
+GMenu does support parameterized actions — you'd build a sub-GMenu
+of items each carrying a `g_menu_item_set_action_and_target_value`
+GVariant string, register a `term.new-tab-as-profile` GAction with
+`G_VARIANT_TYPE_STRING`, decode the variant on activate. Working
+but fiddly: the menu is built once at attach time inside
+`Pane.init`, so the profile list would need to be plumbed into
+that init path (or rebuilt on every popup). Lifetime of the GVariant
+strings + memory for each item ctx adds up.
+
+A second-stage popover sidesteps all that. The right-click menu
+gets a single static "New Tab as Profile…" entry; activating it
+runs `Window.openProfilePicker()` which builds a fresh popover
+each time, anchored on the focused pane, with one GtkButton per
+`Config.profiles.items[i].name`. Clicking a button calls
+`newShellTabWithProfile(null, name)` and dismisses the popover.
+
+If the user has no profiles defined, the popover shows a single
+GtkLabel hint pointing them at `config.conf`. Better than a
+disabled menu item that swallows the click silently.
+
+### Wiring
+
+- `menu.Action.new_tab_as_profile` joins the enum + BINDS table.
+  Section sec3 (Tab) gains a "New Tab as Profile…" entry between
+  "New Tab" and "Rename Tab…".
+- `Window.onMenuAction` routes `.new_tab_as_profile` to
+  `openProfilePicker`.
+- Per-button `ProfileButtonCtx` holds the profile name copy +
+  popover ref. `freeProfileButtonCtx` runs as the GDestroyNotify
+  when the button is destroyed (popover teardown).
+- The button-name copy is sentinel-allocated so it can be passed
+  to `gtk_button_new_with_label` directly. The slice is also
+  what we hand to `newShellTabWithProfile` — `findProfile` does
+  the lookup against `Config.profiles[*].name` and assigns the
+  Config-owned reference into `pane.active_profile`, so the
+  per-button copy can be freed safely after the call.
