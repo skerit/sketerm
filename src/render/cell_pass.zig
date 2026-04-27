@@ -323,7 +323,30 @@ pub const CellPass = struct {
         c.glBindVertexArray(self.vao);
         c.glGenBuffers(1, &self.vbo);
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
+        self.bindVertexAttribs();
+        c.glBindVertexArray(0);
 
+        // Probe for persistent-mapped buffer support. epoxy resolves
+        // `glBufferStorage` to either the desktop core entry OR the
+        // EXT_buffer_storage variant at runtime when available. Two
+        // safety layers: extension advertised, AND the resolver
+        // produced a non-null function pointer. If allocation fails
+        // (mapping returns NULL or glGetError flags an issue), the
+        // upload path itself flips back to 0 and uses the legacy
+        // glBufferSubData fallback.
+        if (self.persistent_supported < 0) {
+            const has_ext = c.epoxy_has_gl_extension("GL_EXT_buffer_storage");
+            const fn_resolves = c.epoxy_glBufferStorage != null;
+            self.persistent_supported = if (has_ext and fn_resolves) 1 else 0;
+        }
+    }
+
+    /// (Re)set per-instance vertex attribute pointers against the
+    /// currently-bound VBO. Must be called at realize-time AND every
+    /// time the underlying VBO is recreated (the VAO records buffer
+    /// names per attribute — recreating without re-binding leaves
+    /// attributes pointing at the freed buffer → SIGSEGV on draw).
+    fn bindVertexAttribs(self: *CellPass) void {
         const stride: c_int = @sizeOf(Instance);
         const fields = [_]struct { name: [:0]const u8, off: usize, count: c_int }{
             .{ .name = "a_cell_xy", .off = @offsetOf(Instance, "cell_xy"), .count = 2 },
@@ -345,25 +368,6 @@ pub const CellPass = struct {
             c.glEnableVertexAttribArray(idx);
             c.glVertexAttribPointer(idx, f.count, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(f.off));
             c.glVertexAttribDivisor(idx, 1);
-        }
-
-        c.glBindVertexArray(0);
-
-        // Probe for persistent-mapped buffer support. EXT_buffer_storage
-        // exposes glBufferStorage on GL ES; epoxy's runtime resolver
-        // returns a non-null fn pointer when desktop GL or the EXT
-        // variant is available.
-        if (self.persistent_supported < 0) {
-            // Conservative probe: only enable persistent mapping when
-            // BOTH the GL_EXT_buffer_storage extension is advertised
-            // AND the EXT entry points resolve at runtime.
-            // glBufferStorage's core (desktop) entry isn't usable on
-            // ES contexts; the EXT variant has different name/symbol
-            // resolution and we'd need to call glBufferStorageEXT.
-            // Until smoke-cell verifies the EXT path works on this
-            // driver, default to OFF — the legacy per-row
-            // glBufferSubData path is already efficient.
-            self.persistent_supported = 0;
         }
     }
 
@@ -722,22 +726,49 @@ pub const CellPass = struct {
                     self.fence = null;
                 }
                 // Recreate the buffer (BufferStorage is one-shot —
-                // can't realloc the same name).
+                // can't realloc the same name). The VAO records
+                // buffer names per-attribute → MUST re-bind attribs
+                // after recreation or the next draw segfaults reading
+                // the freed buffer.
                 c.glDeleteBuffers(1, &self.vbo);
                 c.glGenBuffers(1, &self.vbo);
-                c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
-                // Re-bind VAO attrib pointers — the new VBO needs them.
                 c.glBindVertexArray(self.vao);
                 c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
                 const flags: c.GLbitfield = c.GL_MAP_WRITE_BIT |
                     c.GL_MAP_PERSISTENT_BIT | c.GL_MAP_COHERENT_BIT |
                     c.GL_DYNAMIC_STORAGE_BIT;
+                // Drain any pre-existing GL error so our post-call
+                // check is meaningful.
+                while (c.glGetError() != c.GL_NO_ERROR) {}
                 c.glBufferStorage(
                     c.GL_ARRAY_BUFFER,
                     @intCast(total_bytes),
                     self.instances.items.ptr,
                     flags,
                 );
+                const storage_err = c.glGetError();
+                self.bindVertexAttribs();
+                if (storage_err != c.GL_NO_ERROR) {
+                    // Driver advertised the extension but rejected the
+                    // call — fall back to legacy path for the rest of
+                    // this CellPass's lifetime. glDeleteBuffers + a
+                    // fresh glGenBuffers will be a normal mutable VBO.
+                    self.persistent_supported = 0;
+                    c.glDeleteBuffers(1, &self.vbo);
+                    c.glGenBuffers(1, &self.vbo);
+                    c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
+                    self.bindVertexAttribs();
+                    c.glBufferData(
+                        c.GL_ARRAY_BUFFER,
+                        @intCast(total_bytes),
+                        self.instances.items.ptr,
+                        c.GL_DYNAMIC_DRAW,
+                    );
+                    c.glBindVertexArray(0);
+                    self.vbo_capacity = total_bytes;
+                    for (self.row_needs_upload.items) |*r| r.* = false;
+                    return;
+                }
                 const map_flags: c.GLbitfield = c.GL_MAP_WRITE_BIT |
                     c.GL_MAP_PERSISTENT_BIT | c.GL_MAP_COHERENT_BIT;
                 const ptr_raw = c.glMapBufferRange(c.GL_ARRAY_BUFFER, 0, @intCast(total_bytes), map_flags);
