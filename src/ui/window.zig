@@ -1869,6 +1869,22 @@ pub const Window = struct {
         const sibling = if (start == w) end else start;
         if (sibling == null) return;
 
+        // Take an explicit ref on sibling — detaching from the paned
+        // drops the paned's only ref, which would destroy the widget
+        // before we can re-parent it. Same pattern splitFocused uses
+        // around its reparent. (Don't lose this — symptom is the
+        // entire tab going blank when closing a split pane.)
+        _ = c.g_object_ref(@ptrCast(@alignCast(sibling.?)));
+        defer c.g_object_unref(@ptrCast(@alignCast(sibling.?)));
+
+        // Also ref the paned itself so removing it from the grandparent
+        // (gtk_box_remove / gtk_paned_set_*_child(..., new)) doesn't
+        // destroy it before we're done detaching the closing pane's
+        // child relationship. Otherwise w could be torn down via the
+        // paned's destructor mid-cleanup.
+        _ = c.g_object_ref(@ptrCast(@alignCast(parent)));
+        defer c.g_object_unref(@ptrCast(@alignCast(parent)));
+
         // Detach sibling from paned.
         if (start == w) {
             c.gtk_paned_set_end_child(@ptrCast(parent), null);
