@@ -1658,3 +1658,23 @@ A full split-tree restore would duplicate the `--restore` JSON
 serialiser, which is a much bigger feature. Single-pane is the
 95% case for the "I closed this by accident" workflow.
 
+## Faux-bold rendering
+
+Pair to italic. SGR 1 was honoured for bright-color promotion only
+(when `allow_bold && bold_is_bright`); the glyph itself didn't get
+thicker. Real bold needs a separate FreeType bold face; faux-bold
+uses a shader trick — sample the atlas at the original UV AND a
+1-texel-step in u, take max alpha. Result: glyph appears one pixel
+thicker. Same architectural shape as italic (per-instance flag →
+varying → fragment branch). Cheap, no extra atlas storage.
+
+Gated by `allow_bold` config (already exists). Trade-off: faux-bold
+isn't a real bold typeface — characters get heavier but lose the
+proper bold metrics + bowl shapes that a real bold face provides.
+Most users on modern monospace fonts won't notice.
+
+Instance grew 96 → 100 B for the new `bold` attribute. Test
+assertion updated. grid_pass overlay path (bidi / DW / DH) does
+not yet faux-bold; bidi+bold is rare and would need its own
+per-vertex bold flag.
+
