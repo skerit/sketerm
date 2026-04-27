@@ -1188,6 +1188,70 @@ pub const Window = struct {
         _ = c.gtk_widget_grab_focus(entry);
     }
 
+    const ProfileButtonCtx = struct {
+        window: *Window,
+        profile_name: [:0]u8, // owned, freed by GDestroyNotify
+        popover: *c.GtkWidget,
+        allocator: std.mem.Allocator,
+    };
+
+    /// Right-click → "New Tab as Profile…" picker. Opens a popover
+    /// anchored on the focused pane with a button per defined profile.
+    /// When no profiles exist, shows a single disabled placeholder so
+    /// the user learns where to define them. Clicking a button spawns
+    /// a tab via newShellTabWithProfile and closes the popover.
+    pub fn openProfilePicker(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+
+        const popover = c.gtk_popover_new();
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
+        c.gtk_widget_set_margin_top(box, 6);
+        c.gtk_widget_set_margin_bottom(box, 6);
+        c.gtk_widget_set_margin_start(box, 6);
+        c.gtk_widget_set_margin_end(box, 6);
+
+        if (self.config.profiles.items.len == 0) {
+            const lbl = c.gtk_label_new("No profiles defined.\nAdd `[profile.<name>]` to config.conf.");
+            c.gtk_label_set_xalign(@ptrCast(lbl), 0);
+            c.gtk_box_append(@ptrCast(box), lbl);
+        } else {
+            for (self.config.profiles.items) |p| {
+                const name_z = self.allocator.allocSentinel(u8, p.name.len, 0) catch continue;
+                @memcpy(name_z, p.name);
+
+                const btn = c.gtk_button_new_with_label(name_z.ptr);
+                c.gtk_widget_set_halign(btn, c.GTK_ALIGN_FILL);
+                c.gtk_widget_add_css_class(btn, "flat");
+
+                const ctx = self.allocator.create(ProfileButtonCtx) catch {
+                    self.allocator.free(name_z);
+                    continue;
+                };
+                ctx.* = .{
+                    .window = self,
+                    .profile_name = name_z,
+                    .popover = popover,
+                    .allocator = self.allocator,
+                };
+
+                _ = c.g_signal_connect_data(
+                    btn,
+                    "clicked",
+                    @ptrCast(&onProfilePicked),
+                    @ptrCast(ctx),
+                    @ptrCast(&freeProfileButtonCtx),
+                    c.G_CONNECT_DEFAULT,
+                );
+
+                c.gtk_box_append(@ptrCast(box), btn);
+            }
+        }
+
+        c.gtk_popover_set_child(@ptrCast(popover), box);
+        c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+        c.gtk_popover_popup(@ptrCast(popover));
+    }
+
     const PaneTitleCtx = struct {
         pane: *Pane,
         popover: *c.GtkWidget,
@@ -2140,6 +2204,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
     const self: *Window = @ptrCast(@alignCast(ctx.?));
     switch (action) {
         .new_tab => self.newShellTab(null) catch {},
+        .new_tab_as_profile => self.openProfilePicker(),
         .close_tab => self.closeCurrentTab(),
         .rename_tab => self.renameCurrentTab(),
         .pin_tab => self.togglePinCurrentTab(),
@@ -2225,6 +2290,20 @@ fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 
 fn freeRenameCtx(user: ?*anyopaque) callconv(.c) void {
     const ctx: *Window.RenameCtx = @ptrCast(@alignCast(user.?));
+    ctx.allocator.destroy(ctx);
+}
+
+fn onProfilePicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *Window.ProfileButtonCtx = @ptrCast(@alignCast(user.?));
+    // Spawn the tab first, then dismiss the popover so the user
+    // sees the action take effect.
+    ctx.window.newShellTabWithProfile(null, ctx.profile_name) catch {};
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+}
+
+fn freeProfileButtonCtx(user: ?*anyopaque) callconv(.c) void {
+    const ctx: *Window.ProfileButtonCtx = @ptrCast(@alignCast(user.?));
+    ctx.allocator.free(ctx.profile_name);
     ctx.allocator.destroy(ctx);
 }
 
