@@ -90,6 +90,20 @@ pub fn defaultSavePath(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "/tmp/sketerm-last.json", .{});
 }
 
+/// Path to the user-saved "default layout" — auto-loaded on every
+/// startup when no --layout / --restore was passed. Distinct from
+/// `defaultSavePath` (last.json), which is the auto-save-on-exit
+/// snapshot used by --restore.
+pub fn defaultLayoutPath(allocator: std.mem.Allocator) ![]u8 {
+    if (std.posix.getenv("XDG_STATE_HOME")) |xs| {
+        return std.fmt.allocPrint(allocator, "{s}/sketerm/default.json", .{xs});
+    }
+    if (std.posix.getenv("HOME")) |home| {
+        return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/default.json", .{home});
+    }
+    return std.fmt.allocPrint(allocator, "/tmp/sketerm-default.json", .{});
+}
+
 test "round trip with split tree" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

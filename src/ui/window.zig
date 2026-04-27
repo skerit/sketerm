@@ -1898,6 +1898,52 @@ pub const Window = struct {
         const layout = self.collectLayout(arena) catch return;
         layout_mod.save(layout, path) catch return;
     }
+
+    /// Save current state as the "default" layout that's auto-loaded
+    /// on subsequent cold starts (no --layout / --restore needed).
+    /// Best-effort; user gets stderr feedback on failure.
+    pub fn saveDefaultLayout(self: *Window) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const path = layout_mod.defaultLayoutPath(arena) catch return;
+        const layout = self.collectLayout(arena) catch |err| {
+            std.debug.print("sketerm: collect layout failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        layout_mod.save(layout, path) catch |err| {
+            std.debug.print("sketerm: save default layout to {s} failed: {s}\n", .{ path, @errorName(err) });
+            return;
+        };
+        std.debug.print("sketerm: saved default layout to {s}\n", .{path});
+    }
+
+    /// Load $XDG_STATE_HOME/sketerm/default.json if it exists. Returns
+    /// false silently when the file isn't there (the common case on a
+    /// fresh install). Distinct from loadLayoutDefault, which targets
+    /// last.json under --restore.
+    pub fn loadDefaultLayoutIfPresent(self: *Window) !bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const path = try layout_mod.defaultLayoutPath(arena);
+        std.fs.cwd().access(path, .{}) catch return false;
+
+        var parsed = layout_mod.load(self.allocator, path) catch |err| {
+            std.debug.print("sketerm: cannot load default layout {s}: {s}\n", .{ path, @errorName(err) });
+            return false;
+        };
+        defer parsed.deinit();
+
+        for (parsed.value.tabs) |tab| {
+            self.newTabFromSpec(tab) catch |err| {
+                std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
+            };
+        }
+        return true;
+    }
 };
 
 fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
@@ -1915,6 +1961,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .search_open => self.openSearch(),
         .save_layout => self.saveLayoutQuietly(),
         .save_layout_as => self.saveLayoutAs(),
+        .save_default_layout => self.saveDefaultLayout(),
         .prompt_prev => self.jumpPromptOnFocused(.prev),
         .prompt_next => self.jumpPromptOnFocused(.next),
         .pane_prev => self.cyclePane(.prev),

@@ -26,6 +26,9 @@ const HELP_TEXT =
     \\Options:
     \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json
     \\  --layout <path>       Load tabs from a layout file (.json or .layout)
+    \\                        (Without either flag, sketerm auto-loads
+    \\                        $XDG_STATE_HOME/sketerm/default.json if
+    \\                        present — see save_default_layout action.)
     \\  --no-save             Don't write last.json on exit
     \\  --config <path>       Load config from <path> instead of XDG default
     \\  --toggle              Show/hide the running instance (Quake mode).
@@ -54,6 +57,9 @@ const HELP_TEXT =
     \\                          (default: smart-case — uppercase → CS)
     \\  Ctrl+Shift+S          Save current layout (last.json)
     \\  Ctrl+Shift+Alt+S      Save Layout As… (file picker)
+    \\  (no default)          Save layout as default (auto-loads on
+    \\                        next start, no --restore needed). Bind
+    \\                        via keybind.save_default_layout.
     \\  Ctrl+Shift+Z          Re-open most recently closed tab
     \\  Ctrl+Shift+Up/Down    Jump to prev/next OSC 133 prompt mark
     \\  Ctrl+Shift+Left/Right Cycle focus between panes in the tab
@@ -264,6 +270,10 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         loaded = window.loadLayoutFromPath(path) catch false;
     } else if (g_app.restore) {
         loaded = window.loadLayoutDefault() catch false;
+    } else {
+        // No explicit flag: try the user's saved default.json. Silent
+        // no-op when the file isn't there (fresh install).
+        loaded = window.loadDefaultLayoutIfPresent() catch false;
     }
 
     if (!loaded) {
