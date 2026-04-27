@@ -1753,3 +1753,48 @@ If no shell ever sends OSC 7 the tooltip stays at title-only; this
 is fine — most modern shells (bash 4.4+, zsh, fish) emit OSC 7
 when PROMPT_COMMAND or vcs_info hooks are configured. sketerm
 ships sample.conf docs for the shell hook in earlier sections.
+
+## save_default_layout action
+
+Plan-v3.md line 311 listed "save-as-default" as a quick win adjacent
+to D (quake mode). Done now: a new action lets the user pin their
+current tab/split layout as the default that auto-loads on every
+cold start, no `--restore` flag needed.
+
+### Path strategy
+
+Two distinct files now under `$XDG_STATE_HOME/sketerm/`:
+- `last.json` — auto-saved on exit, loaded by `--restore`. Volatile.
+- `default.json` — *user-saved on demand* via the new action. Loaded
+  on startup whenever neither `--layout` nor `--restore` was passed.
+  Persistent until the user re-saves or deletes it.
+
+`layout.defaultLayoutPath()` mirrors the existing `defaultSavePath`
+pattern (XDG_STATE_HOME → HOME/.local/state → /tmp). The naming
+clash with the older function is documented inline; renaming would
+break the only two existing callers (saveLayoutQuietly +
+loadLayoutDefault).
+
+### Wiring
+
+- `Window.saveDefaultLayout()` writes via the existing collectLayout
+  + layout_mod.save path, prints a stderr confirmation so the user
+  knows where it landed.
+- `Window.loadDefaultLayoutIfPresent()` first probes via
+  `std.fs.cwd().access(path, .{})` so a missing file is silent —
+  fresh installs don't get noise on every start.
+- `main.zig` cold-start chain: `--layout` > `--restore` >
+  `loadDefaultLayoutIfPresent()` > one fresh shell tab.
+- `Action.save_default_layout` added; `actionName` / `actionLabel`
+  updated; routed in `onShortcut` to `saveDefaultLayout`.
+- Help text in main.zig describes the new behaviour. sample.conf
+  documents `keybind.save_default_layout =` (unbound by default —
+  this is a niche action and existing Ctrl+Shift+S/Alt+S pair felt
+  like enough default surface for save flows).
+
+### Why no default keybind
+
+Saving the default layout is a deliberate "this is my workspace"
+moment — not something to fire by reflex. Forcing the user to bind
+it themselves nudges them to think about what the chord means. Also
+keeps Ctrl+Shift+\* surface uncluttered.
