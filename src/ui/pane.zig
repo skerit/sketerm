@@ -75,6 +75,11 @@ pub const Pane = struct {
     /// Last reported mouse-motion cell, to suppress duplicates.
     last_motion_row: i32 = -2,
     last_motion_col: i32 = -2,
+    /// Sub-line scroll accumulator for high-resolution / touchpad
+    /// scroll events. dy is scaled by SCROLL_LINES_PER_NOTCH (3) and
+    /// integer-truncated; the fractional remainder carries forward
+    /// so a string of small dy events eventually advances by a line.
+    scroll_accum: f64 = 0,
     /// xterm button code (0=L,1=M,2=R) currently held, or -1 = none.
     /// Used by DECSET 1002 button-event tracking.
     held_button: i32 = -1,
@@ -1450,13 +1455,24 @@ fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
         return 1;
     }
 
-    // Scroll up (negative dy) increases view_offset. 3 lines per click.
+    // Smooth-scroll accumulator. Notched wheels (dy = ±1) still
+    // scroll a full 3 lines per click — the accumulator just lets
+    // touchpad / high-res wheels send fractional dy without each
+    // micro-event flooring to a 3-line jump.
+    const SCROLL_LINES_PER_NOTCH: f64 = 3.0;
+    self.scroll_accum -= dy * SCROLL_LINES_PER_NOTCH; // up = positive view_offset
+    const whole: f64 = @trunc(self.scroll_accum);
+    self.scroll_accum -= whole;
+    const delta_lines: i32 = @intFromFloat(whole);
+    if (delta_lines == 0) return 1;
+
     const sb = screen.scrollbackCount();
-    if (dy < 0) {
-        const want = screen.view_offset + 3;
-        screen.view_offset = if (want > sb) sb else want;
-    } else if (dy > 0) {
-        screen.view_offset = if (screen.view_offset >= 3) screen.view_offset - 3 else 0;
+    if (delta_lines > 0) {
+        const want: u64 = @as(u64, @intCast(screen.view_offset)) + @as(u64, @intCast(delta_lines));
+        screen.view_offset = if (want > sb) sb else @intCast(want);
+    } else {
+        const dec: u32 = @intCast(-delta_lines);
+        screen.view_offset = if (screen.view_offset >= dec) screen.view_offset - dec else 0;
     }
     c.gtk_widget_queue_draw(@ptrCast(self.area));
     return 1;
