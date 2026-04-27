@@ -525,6 +525,7 @@ pub const Window = struct {
         const page = self.appendOrInsertTab(wrapper);
         c.adw_tab_page_set_title(page, title_z.ptr);
         c.adw_tab_page_set_tooltip(page, title_z.ptr);
+        if (spec.pinned) c.adw_tab_view_set_page_pinned(self.tab_view, page, 1);
     }
 
     fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree) !*c.GtkWidget {
@@ -1818,6 +1819,7 @@ pub const Window = struct {
             try tabs.append(arena, .{
                 .title = try arena.dupe(u8, title),
                 .tree = tree,
+                .pinned = c.adw_tab_page_get_pinned(page) != 0,
             });
         }
         return .{ .version = 2, .tabs = try tabs.toOwnedSlice(arena) };

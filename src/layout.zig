@@ -30,6 +30,9 @@ pub const Tree = union(enum) {
 pub const TabSpec = struct {
     title: []const u8,
     tree: Tree,
+    /// Whether the tab was pinned at save time. Defaults to false so
+    /// older layout files still parse via `ignore_unknown_fields`.
+    pinned: bool = false,
 };
 
 pub const Layout = struct {
