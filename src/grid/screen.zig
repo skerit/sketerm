@@ -1187,6 +1187,63 @@ pub const Screen = struct {
         return self.searchOpts(allocator, needle, false);
     }
 
+    /// Regex variant — uses POSIX Extended Regular Expressions
+    /// (regcomp + REG_EXTENDED). Invalid patterns return an empty
+    /// match list silently; the caller surface assumes regex-search
+    /// can fail without disrupting the UI. `case_insensitive` adds
+    /// REG_ICASE to the compile flags.
+    pub fn searchOptsRegex(
+        self: *const Screen,
+        allocator: std.mem.Allocator,
+        pattern: []const u8,
+        case_insensitive: bool,
+    ) ![]SearchMatch {
+        var out: std.ArrayList(SearchMatch) = .{};
+        defer out.deinit(allocator);
+        if (pattern.len == 0) return try out.toOwnedSlice(allocator);
+
+        // regcomp wants a NUL-terminated pattern.
+        const pat_z = try allocator.allocSentinel(u8, pattern.len, 0);
+        defer allocator.free(pat_z);
+        @memcpy(pat_z, pattern);
+
+        // glibc declares `struct re_pattern_buffer` with bitfields
+        // that translate-c can't model — Zig sees regex_t as opaque,
+        // so we can't stack-allocate. Heap-alloc with a generous
+        // fixed buffer; on x86_64 glibc the real size is ~64 bytes.
+        const cre = @import("../c.zig").c;
+        const re_buf = std.c.malloc(256) orelse return error.OutOfMemory;
+        defer std.c.free(re_buf);
+        const re: *cre.regex_t = @ptrCast(@alignCast(re_buf));
+        const ci_flag: c_int = if (case_insensitive) cre.REG_ICASE else 0;
+        const flags: c_int = cre.REG_EXTENDED | ci_flag;
+        if (cre.regcomp(re, pat_z.ptr, flags) != 0) {
+            return try out.toOwnedSlice(allocator);
+        }
+        defer cre.regfree(re);
+
+        var line_buf: std.ArrayList(u8) = .{};
+        defer line_buf.deinit(allocator);
+        var col_map: std.ArrayList(u32) = .{};
+        defer col_map.deinit(allocator);
+        var width_map: std.ArrayList(u8) = .{};
+        defer width_map.deinit(allocator);
+
+        const sb_count = self.scrollbackCount();
+        var i: u32 = 0;
+        while (i < sb_count) : (i += 1) {
+            const row: i32 = @as(i32, @intCast(i)) - @as(i32, @intCast(sb_count));
+            try renderLineForSearch(allocator, self, row, &line_buf, &col_map, &width_map);
+            try findRegexMatches(allocator, re, line_buf.items, col_map.items, width_map.items, row, &out);
+        }
+        var r: u16 = 0;
+        while (r < self.rows) : (r += 1) {
+            try renderLineForSearch(allocator, self, @intCast(r), &line_buf, &col_map, &width_map);
+            try findRegexMatches(allocator, re, line_buf.items, col_map.items, width_map.items, @intCast(r), &out);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
     pub fn searchOpts(
         self: *const Screen,
         allocator: std.mem.Allocator,
@@ -3526,6 +3583,54 @@ fn findMatches(
     }
 }
 
+/// Walk `haystack` with regexec, emitting a SearchMatch per non-empty
+/// hit. Empty matches (e.g. `a*` against "x") are skipped via a +1
+/// advance to break out of pathological zero-width loops. Caller
+/// owns + reuses the line_buf; we sentinel-terminate via a temporary
+/// allocation so regexec sees a real C string.
+fn findRegexMatches(
+    allocator: std.mem.Allocator,
+    re: *@import("../c.zig").c.regex_t,
+    haystack: []const u8,
+    col_map: []const u32,
+    width_map: []const u8,
+    row: i32,
+    out: *std.ArrayList(Screen.SearchMatch),
+) !void {
+    if (haystack.len == 0) return;
+
+    const cre = @import("../c.zig").c;
+    const z = try allocator.allocSentinel(u8, haystack.len, 0);
+    defer allocator.free(z);
+    @memcpy(z, haystack);
+
+    var search_pos: usize = 0;
+    while (search_pos < haystack.len) {
+        var m: cre.regmatch_t = undefined;
+        const rc = cre.regexec(re, z.ptr + search_pos, 1, &m, 0);
+        if (rc != 0) break;
+        const so: usize = @intCast(m.rm_so);
+        const eo: usize = @intCast(m.rm_eo);
+        if (eo == so) {
+            search_pos += so + 1;
+            continue;
+        }
+        const start = so + search_pos;
+        const end = eo + search_pos;
+        const start_col = col_map[start];
+        const end_byte = end - 1;
+        const end_col_left = col_map[end_byte];
+        const end_w: u32 = width_map[end_byte];
+        const len: u32 = (end_col_left + end_w) - start_col;
+        try out.append(allocator, .{
+            .row = row,
+            .col = start_col,
+            .len = len,
+        });
+        search_pos = end;
+    }
+}
+
 /// Compare two byte slices with ASCII letter-case folding on the
 /// haystack side only. `needle` is assumed already-lowercased.
 fn asciiCaseEq(haystack: []const u8, needle_lower: []const u8) bool {
@@ -4961,6 +5066,38 @@ test "rectangular selection extracts column block" {
     const text = try s.extractSelection(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("bar\nqux\nyo ", text);
+}
+
+test "searchOptsRegex finds POSIX ERE matches" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 30, 2);
+    defer s.deinit();
+
+    for ("abc 123 xyz") |b| s.printCp(b);
+    s.apply(.{ .execute = '\n' });
+    s.apply(.{ .execute = '\r' });
+    for ("foo 456 bar") |b| s.printCp(b);
+
+    const matches = try s.searchOptsRegex(std.testing.allocator, "[0-9]+", false);
+    defer std.testing.allocator.free(matches);
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqual(@as(u32, 4), matches[0].col);
+    try std.testing.expectEqual(@as(u32, 3), matches[0].len);
+    try std.testing.expectEqual(@as(u32, 4), matches[1].col);
+    try std.testing.expectEqual(@as(u32, 3), matches[1].len);
+}
+
+test "searchOptsRegex invalid pattern returns empty silently" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+    for ("hello") |b| s.printCp(b);
+
+    const matches = try s.searchOptsRegex(std.testing.allocator, "[unclosed", false);
+    defer std.testing.allocator.free(matches);
+    try std.testing.expectEqual(@as(usize, 0), matches.len);
 }
 
 test "extractScreen captures all visible rows + trims trailing blanks" {

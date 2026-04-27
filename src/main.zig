@@ -55,6 +55,7 @@ const HELP_TEXT =
     \\  Ctrl+Shift+F          Open scrollback search
     \\  Ctrl+I (in search)    Toggle case-insensitive override
     \\                          (default: smart-case — uppercase → CS)
+    \\  Ctrl+R (in search)    Toggle regex mode (POSIX ERE)
     \\  Ctrl+Shift+S          Save current layout (last.json)
     \\  Ctrl+Shift+Alt+S      Save Layout As… (file picker)
     \\  (no default)          Save layout as default (auto-loads on

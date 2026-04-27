@@ -57,6 +57,9 @@ pub const Window = struct {
     /// case-sensitive by default. Mirrors Config.search_case_sensitive.
     /// Ctrl+I still toggles per-search override.
     search_force_cs: bool = false,
+    /// Regex-mode toggle (Ctrl+R inside the search bar). When on,
+    /// the entry text is treated as POSIX Extended Regular Expression.
+    search_regex: bool = false,
     /// Resolved custom keybinding table. Built from
     /// `Config.keybinds` overlaid on `input.default_bindings`, sorted
     /// for first-match dispatch in `onKeyPressed`. Re-resolved on
@@ -360,7 +363,10 @@ pub const Window = struct {
                 }
                 ci = !has_upper;
             }
-            const matches = pane.terminal.screen.searchOpts(self.allocator, query, ci) catch return;
+            const matches = if (self.search_regex)
+                pane.terminal.screen.searchOptsRegex(self.allocator, query, ci) catch return
+            else
+                pane.terminal.screen.searchOpts(self.allocator, query, ci) catch return;
             defer self.allocator.free(matches);
             self.search_matches.appendSlice(self.allocator, matches) catch return;
         }
@@ -2098,6 +2104,27 @@ fn onSearchKeyPressed(
     {
         self.search_case_insensitive = !self.search_case_insensitive;
         if (self.search_entry) |w| {
+            const txt = c.gtk_editable_get_text(@ptrCast(w));
+            if (txt != null) {
+                const slice = std.mem.span(txt);
+                self.updateSearch(slice);
+            }
+        }
+        return 1;
+    }
+    // Ctrl+R — toggle regex mode. The entry text is then treated
+    // as a POSIX ERE pattern. Placeholder text flips to signal the
+    // mode change.
+    if ((keyval == c.GDK_KEY_r or keyval == c.GDK_KEY_R) and
+        (state & c.GDK_CONTROL_MASK) != 0)
+    {
+        self.search_regex = !self.search_regex;
+        if (self.search_entry) |w| {
+            const placeholder: [*:0]const u8 = if (self.search_regex)
+                "Search regex (Ctrl+R)"
+            else
+                "Search (Ctrl+R for regex)";
+            c.gtk_entry_set_placeholder_text(@ptrCast(w), placeholder);
             const txt = c.gtk_editable_get_text(@ptrCast(w));
             if (txt != null) {
                 const slice = std.mem.span(txt);

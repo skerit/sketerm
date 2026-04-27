@@ -38,6 +38,10 @@ pub const c = @cImport({
     // GLib UNIX signal helpers.
     @cInclude("glib-unix.h");
 
+    // POSIX regex (used by scrollback search regex mode). Linked via
+    // libc; no extra build flag needed.
+    @cInclude("regex.h");
+
     // Vendored stb_image (PNG decode for iTerm2 OSC 1337).
     @cInclude("stb_image.h");
 });
