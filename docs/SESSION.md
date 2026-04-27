@@ -2055,3 +2055,49 @@ parent paned stays alive long enough for our cleanup to finish
 before GTK destroys it. Also documented inline so the next reader
 doesn't lose this — symptom is recoverable-looking (no crash) but
 makes the tab unusable.
+
+## Kitty kbd flag 0x08 — report all keys (printables)
+
+Plan-v3 spillover: extend kitty progressive-enhancement keyboard
+beyond the disambiguate (0x01) and report-events (0x02) flags
+already shipped. Flag 0x08 is "report all keys as escape codes"
+— even unmodified printable keypresses go through CSI u.
+
+### Why apps want it
+
+Editors with full kitty-keyboard support (neovim's
+`set keyboardprotocol=kitty` mode, kakoune, helix) want every
+keystroke as a structured escape so they can build full keymaps
+without ambiguity. Without 0x08, plain `a` arrives as byte 0x61
+(undistinguished from `cat` piping in 'a'), so the editor can't
+tell key-press from streamed text.
+
+### Implementation
+
+In `encode()`, the existing kitty_disamb branch already routed
+Tab/Enter/Esc/BS through CSI u and gated modified printables on
+(ctrl or alt). Two changes:
+
+1. The branch gate is now `kitty_disamb or kitty_report_all` —
+   per spec, 0x08 implies 0x01, so Tab still gets routed even
+   when the user only enables 0x08.
+2. The printable-emit gate adds `or kitty_report_all` so plain
+   unmodified `a` falls into the `kittyKeyEvent` path with mods=1.
+
+### Scope cut: F-keys
+
+Full kitty 0x08 spec also wants F1-F12 and arrows to use the
+kitty private-use codepoint table (F1 = 57364, etc.) inside CSI u.
+Those still use their existing CSI A / SS3 P / etc. shapes here —
+deferred. Apps that don't tolerate this fall back gracefully (the
+existing CSI A is still a valid event, just not in the kitty CSI u
+form).
+
+### Tests
+
+Three additions in input_conformance_test.zig — flipping the
+`encode` function from private to `pub` so the test file can call
+it directly:
+- Plain `a` without 0x08 → byte `a`; with 0x08 → CSI 97 u
+- Shift+`a` with 0x08 → CSI 97;2 u (uppercase folded to lowercase)
+- Tab with 0x08 → CSI 9 u (verifies 0x01 implication)
