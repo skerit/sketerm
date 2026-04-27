@@ -2023,3 +2023,35 @@ disabled menu item that swallows the click silently.
   the lookup against `Config.profiles[*].name` and assigns the
   Config-owned reference into `pane.active_profile`, so the
   per-button copy can be freed safely after the call.
+
+## Bug fix: closeFocusedPane reparent ref-counting
+
+User report: "when I close a pane, the entire tab seems to break."
+The split was getting torn down but the surviving sibling's content
+went blank.
+
+### Root cause
+
+`closeFocusedPane` detaches the surviving sibling from the GtkPaned
+via `gtk_paned_set_*_child(parent, NULL)`, then re-attaches it to
+the grandparent. In GTK4 the paned holds the only strong ref on
+each child — `set_*_child(NULL)` calls `gtk_widget_unparent` which
+`g_object_unref`s, dropping the refcount to zero and finalizing
+the widget. The local `sibling` pointer becomes dangling; the
+follow-up `set_start_child(gp, sibling)` (or `gtk_box_append`)
+either crashes or silently installs garbage → tab goes blank.
+
+`splitFocused` already had the same issue and fixed it years back
+(comment on commit 1f924a9: "gtk_box_remove drops the box's only
+ref → would destroy the widget before paned_set_*_child takes its
+own ref"). The close path missed the same trick.
+
+### Fix
+
+`g_object_ref(sibling)` + `g_object_ref(parent)` immediately after
+the null-check, with matching `defer g_object_unref` calls. The
+sibling stays alive across the detach → reparent transition; the
+parent paned stays alive long enough for our cleanup to finish
+before GTK destroys it. Also documented inline so the next reader
+doesn't lose this — symptom is recoverable-looking (no crash) but
+makes the tab unusable.
