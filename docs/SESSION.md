@@ -1725,3 +1725,31 @@ advertises the `Ms` cap (workaround: `set -as terminal-features
 on the server before mosh-server starts. Both documented in
 `data/sample.conf` so the user has an answer next time they wonder
 why their `printf "\033]52;c;$(echo X | base64)\a"` does nothing.
+
+## Tab tooltip with cwd
+
+Tab titles are sticky (the wireup at line 655 of window.zig
+intentionally suppresses OSC 0/1/2 → tab title), but a tooltip is
+free real estate. Now: hover a tab → see "<title>\n<cwd>" where
+cwd is the live OSC 7 path from the focused pane's shell.
+
+Wiring:
+- `Terminal.on_cwd_changed` callback added next to `on_title`. Fires
+  inside `sinkCwd` after `self.cwd` is updated.
+- `Pane.win_on_cwd` mirrors the pattern of every other Pane→Window
+  forward (clipboard, bell, child-exit). `onCwdEvent` in pane.zig
+  re-emits up.
+- `Window.onTermCwdChanged` walks the tab-view, finds the page
+  whose child contains `pane.widget()` (same pattern as the bell
+  attention-marker), reads the current title via
+  `adw_tab_page_get_title`, allocates a sentinel-terminated
+  `<title>\n<cwd>`, calls `adw_tab_page_set_tooltip`. AdwTabPage
+  dups the string so we free immediately.
+- Wired at all three Pane creation sites: `addTabInternal`,
+  `addTabWithProfile` (via `spawnShellPaneOpts`), and the layout
+  `buildTreeWidget` pane case.
+
+If no shell ever sends OSC 7 the tooltip stays at title-only; this
+is fine — most modern shells (bash 4.4+, zsh, fish) emit OSC 7
+when PROMPT_COMMAND or vcs_info hooks are configured. sketerm
+ships sample.conf docs for the shell hook in earlier sections.
