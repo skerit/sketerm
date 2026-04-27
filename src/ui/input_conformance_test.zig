@@ -180,3 +180,30 @@ test "kittyKeyEvent plain repeat → :2 sub-parameter (no mods)" {
     const n = input.kittyKeyEvent(&buf, 97, false, false, false, 2);
     try std.testing.expectEqualStrings("\x1b[97;1:2u", buf[0..n]);
 }
+
+const c = @import("../c.zig").c;
+
+test "kitty 0x08: plain 'a' goes through CSI u (report-all-keys)" {
+    // Without 0x08, plain 'a' should emit raw byte 0x61.
+    var buf: [16]u8 = undefined;
+    const n_plain = input.encode(&buf, c.GDK_KEY_a, 0, false, 0, 0, false, false);
+    try std.testing.expectEqualStrings("a", buf[0..n_plain]);
+
+    // With 0x08, plain 'a' should emit CSI 97 u.
+    const n_all = input.encode(&buf, c.GDK_KEY_a, 0, false, 0, 0x08, false, false);
+    try std.testing.expectEqualStrings("\x1b[97u", buf[0..n_all]);
+}
+
+test "kitty 0x08: Shift+'a' → CSI 97 ; 2 u (uppercase folds to lowercase)" {
+    var buf: [16]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_A, c.GDK_SHIFT_MASK, false, 0, 0x08, false, false);
+    try std.testing.expectEqualStrings("\x1b[97;2u", buf[0..n]);
+}
+
+test "kitty 0x08: Tab still routes through CSI u (implies disambiguate)" {
+    // 0x08 set, 0x01 NOT set — kitty spec says 0x08 implies 0x01.
+    // Tab should emit `CSI 9 u` rather than the raw byte 0x09.
+    var buf: [16]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_Tab, 0, false, 0, 0x08, false, false);
+    try std.testing.expectEqualStrings("\x1b[9u", buf[0..n]);
+}

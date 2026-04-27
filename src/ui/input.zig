@@ -634,7 +634,7 @@ pub fn kittyKeyEvent(buf: []u8, code_point: u32, shift: bool, alt: bool, ctrl: b
     return out.len;
 }
 
-fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, mok: u8, kitty_flags: u8, is_repeat: bool, app_keypad: bool) usize {
+pub fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, mok: u8, kitty_flags: u8, is_repeat: bool, app_keypad: bool) usize {
     const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
     const alt = (mods & c.GDK_ALT_MASK) != 0;
     const shift = (mods & c.GDK_SHIFT_MASK) != 0;
@@ -679,10 +679,13 @@ fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, 
     // that flag, repeats look identical to fresh presses.
     const kitty_event: u8 = if ((kitty_flags & 0x02) != 0 and is_repeat) 2 else 1;
 
-    // Kitty progressive-enhancement keyboard — disambiguate flag.
-    // Reroute Tab/Enter/Esc/BS and modified keys through CSI u.
+    // Kitty progressive-enhancement keyboard — disambiguate flag
+    // (0x01) reroutes Tab/Enter/Esc/BS and modified keys through
+    // CSI u. Report-all-keys (0x08) implies disambiguate AND also
+    // routes UNMODIFIED printables through CSI u (per kitty spec).
     const kitty_disamb = (kitty_flags & 0x01) != 0;
-    if (kitty_disamb) {
+    const kitty_report_all = (kitty_flags & 0x08) != 0;
+    if (kitty_disamb or kitty_report_all) {
         switch (keyval) {
             c.GDK_KEY_Escape => return kittyKeyEvent(buf, 27, shift, alt, ctrl, kitty_event),
             c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => return kittyKeyEvent(buf, 13, shift, alt, ctrl, kitty_event),
@@ -691,11 +694,13 @@ fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bool, 
             c.GDK_KEY_ISO_Left_Tab => return kittyKeyEvent(buf, 9, true, alt, ctrl, kitty_event),
             else => {},
         }
-        // Modified printable codepoints — emit CSI u so apps can
-        // distinguish Ctrl+I from Tab and so on. Shift alone keeps the
-        // literal-character path; the OS already gave us the upper-
-        // case codepoint via gdk_keyval_to_unicode.
-        if (ctrl or alt) {
+        // Printable codepoints. Without report-all (0x08), only
+        // modified keys get CSI u so plain typing stays as raw
+        // bytes. With 0x08, every printable goes through CSI u
+        // even unmodified — apps using the report-all level want
+        // every keystroke as an escape so they can build full
+        // keymap UIs (e.g. neovim with kitty-keyboard support).
+        if (ctrl or alt or kitty_report_all) {
             const cp_pre = c.gdk_keyval_to_unicode(keyval);
             if (cp_pre != 0 and cp_pre < 0x110000) {
                 // Use the lowercase code point so 'A' and 'a' both
