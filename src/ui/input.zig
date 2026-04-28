@@ -694,6 +694,39 @@ pub fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bo
             c.GDK_KEY_ISO_Left_Tab => return kittyKeyEvent(buf, 9, true, alt, ctrl, kitty_event),
             else => {},
         }
+
+        // With report-all (0x08), functional keys switch to the
+        // kitty Unicode-private-use codepoint table. Apps opting in
+        // get a uniform CSI u stream; apps using only 0x01 keep the
+        // legacy CSI A / SS3 P / CSI 5~ shapes.
+        if (kitty_report_all) {
+            const pua_cp: u32 = switch (keyval) {
+                c.GDK_KEY_Up => 57352,
+                c.GDK_KEY_Down => 57353,
+                c.GDK_KEY_Right => 57351,
+                c.GDK_KEY_Left => 57350,
+                c.GDK_KEY_Home => 57356,
+                c.GDK_KEY_End => 57357,
+                c.GDK_KEY_Insert => 57348,
+                c.GDK_KEY_Delete => 57349,
+                c.GDK_KEY_Page_Up => 57354,
+                c.GDK_KEY_Page_Down => 57355,
+                c.GDK_KEY_F1 => 57364,
+                c.GDK_KEY_F2 => 57365,
+                c.GDK_KEY_F3 => 57366,
+                c.GDK_KEY_F4 => 57367,
+                c.GDK_KEY_F5 => 57368,
+                c.GDK_KEY_F6 => 57369,
+                c.GDK_KEY_F7 => 57370,
+                c.GDK_KEY_F8 => 57371,
+                c.GDK_KEY_F9 => 57372,
+                c.GDK_KEY_F10 => 57373,
+                c.GDK_KEY_F11 => 57374,
+                c.GDK_KEY_F12 => 57375,
+                else => 0,
+            };
+            if (pua_cp != 0) return kittyKeyEvent(buf, pua_cp, shift, alt, ctrl, kitty_event);
+        }
         // Printable codepoints. Without report-all (0x08), only
         // modified keys get CSI u so plain typing stays as raw
         // bytes. With 0x08, every printable goes through CSI u

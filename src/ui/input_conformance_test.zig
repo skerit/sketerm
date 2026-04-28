@@ -207,3 +207,28 @@ test "kitty 0x08: Tab still routes through CSI u (implies disambiguate)" {
     const n = input.encode(&buf, c.GDK_KEY_Tab, 0, false, 0, 0x08, false, false);
     try std.testing.expectEqualStrings("\x1b[9u", buf[0..n]);
 }
+
+test "kitty 0x08: F1 → CSI 57364 u (kitty PUA codepoint)" {
+    var buf: [32]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_F1, 0, false, 0, 0x08, false, false);
+    try std.testing.expectEqualStrings("\x1b[57364u", buf[0..n]);
+}
+
+test "kitty 0x08: Up → CSI 57352 u" {
+    var buf: [32]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_Up, 0, false, 0, 0x08, false, false);
+    try std.testing.expectEqualStrings("\x1b[57352u", buf[0..n]);
+}
+
+test "kitty 0x01 alone: F1 keeps legacy SS3 P (no PUA switch)" {
+    // With disambiguate only, F-keys must NOT switch to PUA codepoints.
+    var buf: [32]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_F1, 0, false, 0, 0x01, false, false);
+    try std.testing.expectEqualStrings("\x1bOP", buf[0..n]);
+}
+
+test "kitty 0x08: Ctrl+F4 → CSI 57367 ; 5 u" {
+    var buf: [32]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_F4, c.GDK_CONTROL_MASK, false, 0, 0x08, false, false);
+    try std.testing.expectEqualStrings("\x1b[57367;5u", buf[0..n]);
+}
