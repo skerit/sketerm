@@ -2472,3 +2472,56 @@ that the layout save/restore uses, doable but ~2x the LOC and
 edge cases (different cwds per pane, different profiles per pane).
 Most user value is "same shell, here, again" which the simple
 form already covers.
+
+## copy_scrollback + scrollback-soft-wrap fix
+
+Two-in-one: shipped a new `copy_scrollback` action and uncovered a
+latent bug while writing its test.
+
+### copy_scrollback
+
+Extends `copy_screen` (visible region only) to dump the entire
+scrollback ring + active screen as text → system clipboard.
+Useful when sharing a long terminal session: previous workflow
+was scroll-up + drag-select chunks, which is hideously slow on
+10k-line backlogs.
+
+`Screen.extractScrollback(allocator)` walks rows
+`-scrollbackCount() .. rows-1`, honouring `continues_above` so
+shell output that wrapped across rows pastes as one logical line.
+OSC 8 link spans survive too, encoded as markdown `[text](uri)`.
+
+Wired through `Action.copy_scrollback` (unbound by default,
+config via `keybind.copy_scrollback`), routed in
+`runAction → copyScrollback`. main.zig HELP_TEXT mentions the
+binding next to Ctrl+Shift+A.
+
+### Bug found while testing
+
+The first version of the test asserted that "abcdefg" wrapped
+across two rows then scrolled to scrollback would copy back as
+one line. It came out as `"abcde\nfg\n…"` — the soft-wrap join
+was lost.
+
+Root cause: `pushScrollbackTakeOld` and `pushScrollback` built
+the scrollback Line via struct literal `.{ .cells = ..., .id = ... }`
+which defaulted `continues_above` to false. So every scroll-up
+into scrollback erased the soft-wrap bit. extractSelection
+already had the right "suppress newline if next row continues"
+logic but the underlying flag was always false in scrollback —
+silent corruption that nobody noticed because soft-wrap-aware
+copy paths just gave the wrong answer.
+
+Fix: `pushScrollbackTakeOld` + `pushScrollback` take a
+`continues_above: bool` param. `scrollUp` stashes it alongside
+cells + ids per row being moved out. `reflowMain` and
+`resizeBuffer` (the other callers) pass through the source
+line's flag.
+
+### Cleanup
+
+Also tidied `duplicateCurrentTab` — the previous tick had a
+dead `cwd` capture that was unused (newShellTabWithProfile pulls
+cwd from `focusedPaneCwd()` internally). Removed.
+
+`zig build && zig build test && zig build smoke-cell` all green.
