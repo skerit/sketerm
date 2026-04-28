@@ -2039,6 +2039,27 @@ pub const Window = struct {
         layout_mod.save(layout, path) catch return;
     }
 
+    /// Duplicate the focused tab — spawn a new tab inheriting the
+    /// focused pane's cwd and profile. Splits in the source tab are
+    /// NOT replicated (the new tab gets one shell pane); cloning a
+    /// full split tree would duplicate the layout snapshot/restore
+    /// path, which is a bigger feature. Most user value is "open
+    /// another shell here in this dir as this profile."
+    pub fn duplicateCurrentTab(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+        const cwd = if (pane.terminal.cwd) |c2| c2 else null;
+        const profile_name = pane.active_profile;
+        // Best-effort title carry — not perfect because newShellTabWithProfile
+        // assigns a fresh "Tab N" title. Future: pass title from current page.
+        self.newShellTabWithProfile(null, profile_name) catch |err| {
+            std.debug.print("sketerm: duplicate tab failed: {s}\n", .{@errorName(err)});
+        };
+        // newShellTabWithProfile spawns at focused pane's cwd via
+        // focusedPaneCwd() — we already match that. The profile_name
+        // is set on the newly-spawned pane during spawnShellPaneOpts.
+        _ = cwd;
+    }
+
     /// Toggle the current tab's pinned state. Pinned tabs sit in a
     /// separate region at the start of the tab bar (AdwTabView
     /// native): close button is hidden, drag-reorder is restricted
@@ -2120,6 +2141,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .broadcast_cycle => self.cycleGroupSend(),
         .restore_closed_tab => self.restoreLastClosed(),
         .toggle_pin_tab => self.togglePinCurrentTab(),
+        .duplicate_tab => self.duplicateCurrentTab(),
         else => {},
     }
 }
@@ -2221,6 +2243,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
     switch (action) {
         .new_tab => self.newShellTab(null) catch {},
         .new_tab_as_profile => self.openProfilePicker(),
+        .duplicate_tab => self.duplicateCurrentTab(),
         .close_tab => self.closeCurrentTab(),
         .rename_tab => self.renameCurrentTab(),
         .pin_tab => self.togglePinCurrentTab(),

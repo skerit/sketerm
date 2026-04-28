@@ -11,6 +11,7 @@ pub const Action = enum {
     paste,
     new_tab,
     new_tab_as_profile,
+    duplicate_tab,
     close_tab,
     rename_tab,
     pin_tab,
@@ -60,6 +61,7 @@ const BINDS = [_]Bind{
     .{ .name = "set-pane-title", .label = "Set Pane Title…", .detailed = "term.set-pane-title", .action = .set_pane_title },
     .{ .name = "new-tab", .label = "New Tab", .detailed = "term.new-tab", .action = .new_tab },
     .{ .name = "new-tab-as-profile", .label = "New Tab as Profile…", .detailed = "term.new-tab-as-profile", .action = .new_tab_as_profile },
+    .{ .name = "duplicate-tab", .label = "Duplicate Tab", .detailed = "term.duplicate-tab", .action = .duplicate_tab },
     .{ .name = "rename-tab", .label = "Rename Tab…", .detailed = "term.rename-tab", .action = .rename_tab },
     .{ .name = "pin-tab", .label = "Pin / Unpin Tab", .detailed = "term.pin-tab", .action = .pin_tab },
     .{ .name = "close-tab", .label = "Close Tab", .detailed = "term.close-tab", .action = .close_tab },
@@ -104,6 +106,7 @@ pub fn attachWithPrePopup(
     const sec3 = c.g_menu_new();
     c.g_menu_append(sec3, "New Tab", "term.new-tab");
     c.g_menu_append(sec3, "New Tab as Profile…", "term.new-tab-as-profile");
+    c.g_menu_append(sec3, "Duplicate Tab", "term.duplicate-tab");
     c.g_menu_append(sec3, "Rename Tab…", "term.rename-tab");
     c.g_menu_append(sec3, "Pin / Unpin Tab", "term.pin-tab");
     c.g_menu_append(sec3, "Close Tab", "term.close-tab");

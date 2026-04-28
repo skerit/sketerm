@@ -80,6 +80,10 @@ pub const Action = enum {
     /// Pin / unpin the current tab — pinned tabs sit in their own
     /// section at the start of the tab bar (AdwTabView native).
     toggle_pin_tab,
+    /// Spawn a new tab inheriting the focused pane's cwd + profile.
+    /// Subtly different from `new_tab` which uses the focused pane's
+    /// cwd already but defaults the profile to none.
+    duplicate_tab,
     // Per-pane (dispatched locally inside input.zig).
     paste_clipboard,
     copy_selection,
@@ -186,6 +190,7 @@ pub fn actionName(a: Action) []const u8 {
         .broadcast_cycle => "broadcast_cycle",
         .restore_closed_tab => "restore_closed_tab",
         .toggle_pin_tab => "toggle_pin_tab",
+        .duplicate_tab => "duplicate_tab",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
         .copy_screen => "copy_screen",
@@ -229,6 +234,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .broadcast_cycle => "Broadcast typing (cycle)",
         .restore_closed_tab => "Re-open closed tab",
         .toggle_pin_tab => "Pin / unpin current tab",
+        .duplicate_tab => "Duplicate tab (cwd + profile)",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",
         .copy_screen => "Copy whole screen",
