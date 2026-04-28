@@ -2259,3 +2259,86 @@ flag and read the actual shifted glyph from there.
 Four new tests cover: 0x04+0x08 plain `a`, Ctrl+`a` with 0x04+0x01,
 digit `1` correctly skipping alt-shifted, and the
 `alt_shifted == code_point` early-out path.
+
+## Atlas: fontconfig fallback chain
+
+Plan-v3 spillover, biggest remaining UX hole. CJK / Devanagari /
+Cyrillic / Hebrew / random Unicode symbols all rendered as the
+"missing glyph" placeholder when the user's monospace font lacks
+them — even though the system has perfectly good fallback fonts.
+Fix: integrate fontconfig so missed codepoints fall through to
+the system's preferred coverage.
+
+### Build dep
+
+`fontconfig` joined `gtk4 / libadwaita-1 / freetype2 / harfbuzz /
+epoxy / fribidi` in `build.zig::sys_libs`. Already present on every
+mainstream Linux desktop — pkg-config-discoverable. `c.zig` pulls
+`fontconfig/fontconfig.h` next to the freetype include.
+
+### Atlas state
+
+- `pixel_size: u16` — recorded at init so fallback faces can be
+  re-sized to match. Without this, fallback glyphs would render
+  at whatever default size FreeType picked (usually 0 → garbage
+  metrics).
+- `fallback_faces: ArrayList(FT_Face)` — populated lazily as each
+  uncovered codepoint triggers an FcFontMatch.
+- `cp_to_fallback: AutoHashMap(u32, ?usize)` — codepoint → face
+  index. The optional value is null when fontconfig couldn't find
+  a covering font (caches negative results so we don't re-query).
+- `fc_initialized: bool` — `FcInit()` result. Skip fallback if
+  init failed for any reason.
+
+### Fallback path
+
+`lookupOrLoad(cp)`:
+1. cp cache hit → return.
+2. Primary face has cp (`FT_Get_Char_Index != 0`) → existing path.
+3. Else: `findFallbackFace(cp)`:
+   - cp_to_fallback hit (positive or negative) → return cached face
+     or null without querying.
+   - Quick scan loaded fallbacks first — in case a previously-loaded
+     fallback also covers this cp (avoids loading the same emoji
+     font twice when several U+1F4A9 emoji land in scrollback).
+   - FcPattern with `FC_CHARSET` containing just `cp` and
+     `FC_SCALABLE = true`. Substitute, default-substitute, match.
+     Bias toward scalable to avoid ancient bitmap fonts that don't
+     scale to our pixel size.
+   - `FT_New_Face` + `FT_Set_Pixel_Sizes(self.pixel_size)`. Append
+     to `fallback_faces`, record index in `cp_to_fallback`.
+4. If a face came back: `loadGlyphFromFace(fb_face, fb_gid)` packs
+   the bitmap into the atlas same as the primary path.
+
+### Refactor: `loadGlyphFromFace`
+
+Existing `lookupOrLoadById` was hard-coded against `self.ft_face`.
+Extracted the FT_Load_Glyph + page-pack body into
+`loadGlyphFromFace(face, gid)`. The id-cache hookup and the
+gid-keyed `glyphs_on_page` append now live in the caller, since
+those caches only make sense for the primary face — fallback gids
+share the namespace per-face but collide across faces, so they're
+keyed by codepoint exclusively.
+
+The body's "page full" / "load failed" returns went from
+`return self.cacheEmptyId(gid)` to typed errors (`error.FtLoad`,
+`error.PageFull`). Callers handle them by caching the empty
+codepoint or empty gid as appropriate.
+
+### Color emoji deferred
+
+CBDT/COLR color glyph rendering needs an RGBA atlas. Our atlas is
+single-channel R8 (one byte per pixel) — every consumer assumes
+`texture(...).r` is the alpha. Switching would touch cell_pass +
+grid_pass shaders, change atlas memory by 4×, and require
+per-glyph-flavor branching in the fragment shader. Big change for
+limited reach (most users want CJK first; emoji second). Documented
+intentionally and skipped.
+
+### Build + smoke
+
+`zig build && zig build test && zig build smoke-cell` all green.
+The smoke harness is ASCII-only so the new path isn't exercised
+directly, but the build produces a working program — the fallback
+only kicks in for uncovered codepoints, ASCII flows through the
+existing fast path unchanged.
