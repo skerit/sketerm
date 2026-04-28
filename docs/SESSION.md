@@ -2407,3 +2407,37 @@ Four new conformance tests:
   the maximum-decoration case
 
 `zig build && zig build test` green.
+
+## OSC 4/10/11/12 query-reply tests
+
+Plan-v3.md unverified-list item: "OSC 4 query reply (cmus, emacs)
+verified?" Set + reset paths had tests; the query forms (where
+the user app sends `OSC N;?` and expects a colour spec back) did
+not. Added four tests that capture the parser-reply via
+`sink.on_write_pty` and assert the response byte string.
+
+### Why this matters
+
+cmus uses OSC 4 queries to discover the host terminal's palette
+and then assigns its own colour scheme around them. Emacs uses
+OSC 11 queries to detect dark vs light backgrounds. If the
+queries silently failed, both apps would fall back to wrong
+defaults and look broken.
+
+### Test shapes
+
+- OSC 4: `ESC ]4;<idx>;rgb:RRRR/GGGG/BBBB ESC \` — note the 8-bit
+  byte is duplicated (`ff` → `ffff`) so the response is in 16-bit
+  per-channel form per the xterm spec.
+- OSC 10/11/12: `ESC ]<num>;rgb:RRRR/GGGG/BBBB ESC \` — same
+  16-bit form but converted directly from the f32 colour rather
+  than byte-doubling.
+- OSC 12 special case: when cursor_color sentinel (alpha=0) is set,
+  the response uses default_fg instead — covered by setting fg via
+  OSC 10, resetting cursor via OSC 112, then querying OSC 12.
+
+### Coverage gain
+
++103 LOC of tests. Documents the response byte string + the
+fallback semantics inline. Ticks off another item from the
+unverified list.
