@@ -2441,3 +2441,34 @@ defaults and look broken.
 +103 LOC of tests. Documents the response byte string + the
 fallback semantics inline. Ticks off another item from the
 unverified list.
+
+## duplicate_tab action
+
+Small quality-of-life add. Right-click on a pane → "Duplicate Tab"
+spawns a new tab inheriting the focused pane's cwd + active_profile.
+Subtly different from `new_tab` (which already inherits cwd via
+`focusedPaneCwd`) in that it also carries the profile, so users
+who set up e.g. a "ssh" profile on one tab can duplicate it
+without re-picking from the profile menu.
+
+### Wiring
+
+- `Action.duplicate_tab` joins `input.zig::Action` with name +
+  label. Unbound by default — keybind via `keybind.duplicate_tab`.
+- `menu.Action.duplicate_tab` joins the right-click menu's tab
+  section between "New Tab as Profile…" and "Rename Tab…". Both
+  the BINDS table and the GMenu append picked up.
+- `Window.duplicateCurrentTab()` reads the focused pane's
+  `active_profile`, calls `newShellTabWithProfile(null, profile)`
+  which already pulls cwd from the focused pane via
+  `focusedPaneCwd()`.
+
+### Out-of-scope: split-tree clone
+
+Cloning a tab with multiple panes / nested splits isn't supported
+— the new tab gets one shell. Replicating the full layout tree
+would re-walk the existing collectTree → buildTreeWidget pipeline
+that the layout save/restore uses, doable but ~2x the LOC and
+edge cases (different cwds per pane, different profiles per pane).
+Most user value is "same shell, here, again" which the simple
+form already covers.
