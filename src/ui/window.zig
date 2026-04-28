@@ -2047,11 +2047,55 @@ pub const Window = struct {
     /// another shell here in this dir as this profile."
     pub fn duplicateCurrentTab(self: *Window) void {
         const pane = self.focusedPane() orelse return;
-        // newShellTabWithProfile pulls cwd from focusedPaneCwd() and
-        // honours the profile's per-pane settings. That covers the
-        // single-pane case which is what 95 % of duplicates hit.
-        self.newShellTabWithProfile(null, pane.active_profile) catch |err| {
-            std.debug.print("sketerm: duplicate tab failed: {s}\n", .{@errorName(err)});
+
+        // Detect single-pane vs split-tree by inspecting the tab page's
+        // root widget. Single-pane case wins by preserving the profile
+        // (which TabSpec doesn't carry today). Split-tree case loses
+        // profile-per-pane but keeps the layout — picked over the
+        // alternative of flattening to one pane and dropping the
+        // splits the user spent time arranging.
+        const sel = c.adw_tab_view_get_selected_page(self.tab_view) orelse {
+            self.newShellTabWithProfile(null, pane.active_profile) catch {};
+            return;
+        };
+        const wrapper = c.adw_tab_page_get_child(sel);
+        const root = if (wrapper != null) c.gtk_widget_get_first_child(@ptrCast(wrapper)) else null;
+        const is_paned = root != null and c.g_type_check_instance_is_a(
+            @ptrCast(@alignCast(root.?)),
+            c.gtk_paned_get_type(),
+        ) != 0;
+
+        if (!is_paned) {
+            // Single pane — use the profile-aware fast path.
+            self.newShellTabWithProfile(null, pane.active_profile) catch |err| {
+                std.debug.print("sketerm: duplicate tab failed: {s}\n", .{@errorName(err)});
+            };
+            return;
+        }
+
+        // Split tree — round-trip via collectTree → newTabFromSpec.
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const tree = self.collectTree(arena, root.?) catch |err| {
+            std.debug.print("sketerm: duplicate split tree failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+
+        const title_cstr = c.adw_tab_page_get_title(sel);
+        const title = if (title_cstr != null)
+            std.mem.span(@as([*:0]const u8, @ptrCast(title_cstr)))
+        else
+            "shell";
+
+        const spec = layout_mod.TabSpec{
+            .title = arena.dupe(u8, title) catch return,
+            .tree = tree,
+            .pinned = false, // duplicates start unpinned
+        };
+        self.newTabFromSpec(spec) catch |err| {
+            std.debug.print("sketerm: duplicate split tree failed: {s}\n", .{@errorName(err)});
         };
     }
 
