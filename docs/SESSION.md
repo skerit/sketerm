@@ -2342,3 +2342,68 @@ The smoke harness is ASCII-only so the new path isn't exercised
 directly, but the build produces a working program — the fallback
 only kicks in for uncovered codepoints, ASCII flows through the
 existing fast path unchanged.
+
+## Kitty kbd flag 0x10 — associated text
+
+Plan-v3 spillover. Closes the kitty progressive-keyboard quartet
+(0x01 disambiguate, 0x02 events, 0x04 alt-shifted, 0x08 report-all,
+0x10 associated text — five flags total, all five now wired except
+0x04 alt-base which needs xkbcommon).
+
+### Format
+
+```
+CSI <code>[:<alt>] [;<mods>[:<event>]] [;<text>] u
+```
+
+Three semicolon-separated sections. The text section is appended
+when 0x10 is set AND the keypress would produce text in normal
+mode. Per kitty spec, if the mods section is at default (1) but
+a text section follows, mods is left empty: `CSI 97;;97 u`.
+
+Examples:
+- Plain 'a' with 0x10 alone: `CSI 97;;97 u`
+- Shift+'a' with 0x10: `CSI 97;2;65 u` (mods=2 for shift, text=65=`A`)
+- Ctrl+'a' with 0x10: `CSI 97;5 u` (Ctrl produces 0x01 in normal
+  mode, not "text" → section omitted)
+
+### Plumbing
+
+`kittyKeyEventComplete(buf, code, alt_shifted, associated_text,
+shift, alt, ctrl, event)` is the most-general emitter — both
+`kittyKeyEventFull` and `kittyKeyEvent` are wrappers passing 0
+for the extra params.
+
+The format generation lives inside `kittyKeyEventComplete`:
+- Code section assembled into a stack buffer (`<code>[:<alt>]`)
+- Mods section similarly (`<mods>[:<event>]`); empty when both at
+  default AND no text follows
+- Final emit branches on whether text is present
+
+`encode()` computes `assoc_text` only when:
+- `kitty_flags & 0x10` is set
+- `!ctrl and !alt` (modifier produces control byte / nothing)
+- For Shift+lowercase letter, text = uppercase variant
+- Otherwise text = the codepoint that gdk_keyval_to_unicode gave us
+
+### IME deferred
+
+Multi-codepoint associated text (e.g. dead-key + 'a' = 'á'
+composition, or full IME-composed strings) needs hooks into
+GtkIMContext's preedit-changed / commit signals to capture what
+the IME would emit. Single-cp covers the unmodified printable
+case which is the bulk of expected use. Multi-cp left for a
+follow-up — would need to plumb a slice through `kittyKeyEventComplete`
+and the format would be `;<cp1>:<cp2>:<cp3>` (colon-separated
+inside the third semicolon section).
+
+### Tests
+
+Four new conformance tests:
+- 0x10+0x08 plain 'a' produces `CSI 97;;97 u` (empty mods)
+- 0x10+0x08 Shift+'a' produces `CSI 97;2;65 u`
+- 0x10 Ctrl+'a' omits the text section (no plain-mode text)
+- `kittyKeyEventComplete` directly with code+alt+text+mods covers
+  the maximum-decoration case
+
+`zig build && zig build test` green.
