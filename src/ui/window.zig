@@ -2047,17 +2047,12 @@ pub const Window = struct {
     /// another shell here in this dir as this profile."
     pub fn duplicateCurrentTab(self: *Window) void {
         const pane = self.focusedPane() orelse return;
-        const cwd = if (pane.terminal.cwd) |c2| c2 else null;
-        const profile_name = pane.active_profile;
-        // Best-effort title carry — not perfect because newShellTabWithProfile
-        // assigns a fresh "Tab N" title. Future: pass title from current page.
-        self.newShellTabWithProfile(null, profile_name) catch |err| {
+        // newShellTabWithProfile pulls cwd from focusedPaneCwd() and
+        // honours the profile's per-pane settings. That covers the
+        // single-pane case which is what 95 % of duplicates hit.
+        self.newShellTabWithProfile(null, pane.active_profile) catch |err| {
             std.debug.print("sketerm: duplicate tab failed: {s}\n", .{@errorName(err)});
         };
-        // newShellTabWithProfile spawns at focused pane's cwd via
-        // focusedPaneCwd() — we already match that. The profile_name
-        // is set on the newly-spawned pane during spawnShellPaneOpts.
-        _ = cwd;
     }
 
     /// Toggle the current tab's pinned state. Pinned tabs sit in a

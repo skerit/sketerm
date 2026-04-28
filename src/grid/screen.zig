@@ -758,7 +758,7 @@ pub const Screen = struct {
         if (sb_rows > 0) {
             const sb_slice = all_rows[0..sb_rows];
             for (sb_slice) |row| {
-                self.pushScrollback(row.cells, row.id);
+                self.pushScrollback(row.cells, row.id, row.continues_above);
             }
         }
 
@@ -830,7 +830,7 @@ pub const Screen = struct {
             while (i < drop) : (i += 1) {
                 if (push_to_sb) {
                     const copy = allocator.dupe(Cell, slot.*[i].cells) catch null;
-                    if (copy) |cells| screen.pushScrollback(cells, slot.*[i].id);
+                    if (copy) |cells| screen.pushScrollback(cells, slot.*[i].id, slot.*[i].continues_above);
                 }
                 slot.*[i].deinit(allocator);
             }
@@ -846,7 +846,7 @@ pub const Screen = struct {
     /// the new bottom-row cells (one alloc + one free saved per
     /// scroll on the hot path). Returns null when no eviction
     /// happened (pre-cap fill).
-    fn pushScrollbackTakeOld(self: *Screen, cells: []Cell, line_id: u64) ?[]Cell {
+    fn pushScrollbackTakeOld(self: *Screen, cells: []Cell, line_id: u64, continues_above: bool) ?[]Cell {
         const cap = self.scrollback_capacity;
         if (self.scrollback.items.len < cap) {
             // Pre-allocate the full ring on first push to avoid the
@@ -856,22 +856,22 @@ pub const Screen = struct {
                     // Fall back to incremental growth.
                 };
             }
-            self.scrollback.append(self.allocator, .{ .cells = cells, .id = line_id }) catch {
+            self.scrollback.append(self.allocator, .{ .cells = cells, .id = line_id, .continues_above = continues_above }) catch {
                 self.allocator.free(cells);
             };
             return null;
         }
         const head = self.scrollback_head;
         const old_cells = self.scrollback.items[head].cells;
-        self.scrollback.items[head] = .{ .cells = cells, .id = line_id };
+        self.scrollback.items[head] = .{ .cells = cells, .id = line_id, .continues_above = continues_above };
         self.scrollback_head = (head + 1) % cap;
         return old_cells;
     }
 
     /// Push helper that frees the evicted cells. Used when the caller
     /// can't reuse the buffer (e.g. width changed during reflow).
-    fn pushScrollback(self: *Screen, cells: []Cell, line_id: u64) void {
-        if (self.pushScrollbackTakeOld(cells, line_id)) |old_cells| {
+    fn pushScrollback(self: *Screen, cells: []Cell, line_id: u64, continues_above: bool) void {
+        if (self.pushScrollbackTakeOld(cells, line_id, continues_above)) |old_cells| {
             self.allocator.free(old_cells);
         }
     }
@@ -1074,6 +1074,94 @@ pub const Screen = struct {
                 }
             }
             try out.append(allocator, '\n');
+        }
+        if (open_link_id != 0) {
+            if (self.linkUri(open_link_id)) |uri| {
+                try out.append(allocator, ']');
+                try out.append(allocator, '(');
+                try out.appendSlice(allocator, uri);
+                try out.append(allocator, ')');
+            } else {
+                try out.append(allocator, ']');
+            }
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// Extract the FULL scrollback ring + active screen as UTF-8 text.
+    /// Honours soft-wrap continuation: rows whose next neighbour has
+    /// `continues_above` set don't get a trailing newline, so a long
+    /// shell line that wrapped across multiple rows pastes as one
+    /// logical line. Useful for "share my whole terminal session"
+    /// flows (Ctrl+Shift+End-style copy-all). Caller frees.
+    pub fn extractScrollback(self: *const Screen, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(allocator);
+
+        const sb_count: i32 = @intCast(self.scrollbackCount());
+        const rows_i: i32 = @intCast(self.rows);
+        var open_link_id: u8 = 0;
+
+        var r: i32 = -sb_count;
+        while (r < rows_i) : (r += 1) {
+            const line_cells = self.lineCellsAt(r) orelse {
+                // Soft-wrap-aware: blank rows still emit '\n' unless
+                // the NEXT row is a continuation (rare for missing
+                // rows but match the trimming convention).
+                const next_continues = if (self.lineAt(r + 1)) |l| l.continues_above else false;
+                if (!next_continues) try out.append(allocator, '\n');
+                continue;
+            };
+            var hi: usize = line_cells.len;
+            while (hi > 0 and line_cells[hi - 1].rune == 0) hi -= 1;
+
+            var col: usize = 0;
+            while (col < hi) : (col += 1) {
+                const cell = line_cells[col];
+                if (cell.flags & 0b0000_0010 != 0) continue;
+
+                const has_link = (cell.flags & 0b0000_0100) != 0;
+                const cell_link_id: u8 = if (has_link) cell.reserved else 0;
+                if (cell_link_id != open_link_id) {
+                    if (open_link_id != 0) {
+                        if (self.linkUri(open_link_id)) |uri| {
+                            try out.append(allocator, ']');
+                            try out.append(allocator, '(');
+                            const need_angle = std.mem.indexOfScalar(u8, uri, ')') != null;
+                            if (need_angle) try out.append(allocator, '<');
+                            try out.appendSlice(allocator, uri);
+                            if (need_angle) try out.append(allocator, '>');
+                            try out.append(allocator, ')');
+                        } else {
+                            try out.append(allocator, ']');
+                        }
+                    }
+                    if (cell_link_id != 0) try out.append(allocator, '[');
+                    open_link_id = cell_link_id;
+                }
+
+                const cp = cell.rune;
+                if (cp == 0) {
+                    try out.append(allocator, ' ');
+                } else if (cp < 0x80) {
+                    try out.append(allocator, @intCast(cp));
+                } else {
+                    var ub: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
+                    try out.appendSlice(allocator, ub[0..n]);
+                }
+                if (r >= 0 and r < rows_i) {
+                    const cluster = self.clusterAt(@intCast(r), @intCast(col));
+                    for (cluster) |ext_cp| {
+                        var eb: [4]u8 = undefined;
+                        const en = std.unicode.utf8Encode(@intCast(ext_cp), &eb) catch continue;
+                        try out.appendSlice(allocator, eb[0..en]);
+                    }
+                }
+            }
+            // Suppress newline when next row is a soft-wrap continuation.
+            const next_continues = if (self.lineAt(r + 1)) |l| l.continues_above else false;
+            if (!next_continues) try out.append(allocator, '\n');
         }
         if (open_link_id != 0) {
             if (self.linkUri(open_link_id)) |uri| {
@@ -3070,16 +3158,19 @@ pub const Screen = struct {
         const push_to_sb = !self.use_alt and self.scroll_top == 0;
 
         if (move < region) {
-            // Stash both the cells AND the ids of the rows we're
-            // about to scroll out — they belong to the content, not
-            // the array slot. Common case is move=1; use stack
-            // scratch up to 8 to avoid the steady-state allocator hit.
+            // Stash cells, ids, AND continues_above of the rows about
+            // to scroll out — they belong to the content, not the
+            // array slot. Common case is move=1; use stack scratch
+            // up to 8 to avoid the steady-state allocator hit.
             var stash_stack: [8][]Cell = undefined;
             var ids_stack: [8]u64 = undefined;
+            var ca_stack: [8]bool = undefined;
             var stash_heap: ?[][]Cell = null;
             var ids_heap: ?[]u64 = null;
+            var ca_heap: ?[]bool = null;
             defer if (stash_heap) |h| self.allocator.free(h);
             defer if (ids_heap) |h| self.allocator.free(h);
+            defer if (ca_heap) |h| self.allocator.free(h);
             const stash: [][]Cell = if (move <= stash_stack.len) stash_stack[0..move] else blk: {
                 const h = self.allocator.alloc([]Cell, move) catch return;
                 stash_heap = h;
@@ -3090,10 +3181,16 @@ pub const Screen = struct {
                 ids_heap = h;
                 break :blk h;
             };
+            const stash_ca: []bool = if (move <= ca_stack.len) ca_stack[0..move] else blk: {
+                const h = self.allocator.alloc(bool, move) catch return;
+                ca_heap = h;
+                break :blk h;
+            };
             var i: u16 = 0;
             while (i < move) : (i += 1) {
                 stash[i] = lines[self.scroll_top + i].cells;
                 stash_ids[i] = lines[self.scroll_top + i].id;
+                stash_ca[i] = lines[self.scroll_top + i].continues_above;
             }
 
             if (push_to_sb) {
@@ -3104,7 +3201,7 @@ pub const Screen = struct {
                 var k: u16 = 0;
                 while (k < move) : (k += 1) {
                     const top_cells = stash[k];
-                    if (self.pushScrollbackTakeOld(top_cells, stash_ids[k])) |reused| {
+                    if (self.pushScrollbackTakeOld(top_cells, stash_ids[k], stash_ca[k])) |reused| {
                         stash[k] = reused;
                     } else {
                         // Pre-cap: scrollback took ownership, alloc
@@ -3142,7 +3239,8 @@ pub const Screen = struct {
                     const idx = self.scroll_top + k;
                     const old_cells = lines[idx].cells;
                     const old_id = lines[idx].id;
-                    if (self.pushScrollbackTakeOld(old_cells, old_id)) |reused| {
+                    const old_ca = lines[idx].continues_above;
+                    if (self.pushScrollbackTakeOld(old_cells, old_id, old_ca)) |reused| {
                         lines[idx].cells = reused;
                     } else {
                         const new_buf = self.allocator.alloc(Cell, self.cols) catch break;
@@ -5201,6 +5299,29 @@ test "searchOptsRegex invalid pattern returns empty silently" {
     const matches = try s.searchOptsRegex(std.testing.allocator, "[unclosed", false);
     defer std.testing.allocator.free(matches);
     try std.testing.expectEqual(@as(usize, 0), matches.len);
+}
+
+test "extractScrollback walks scrollback + active, joins soft-wraps" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 2);
+    defer s.deinit();
+
+    // Print enough to push content into scrollback. Width=5 so
+    // "abcdefg" wraps: "abcde" then "fg".
+    for ("abcdefg") |b| s.printCp(b);
+    s.apply(.{ .execute = '\n' });
+    s.apply(.{ .execute = '\r' });
+    for ("hello") |b| s.printCp(b);
+    s.apply(.{ .execute = '\n' });
+    s.apply(.{ .execute = '\r' });
+    for ("world") |b| s.printCp(b);
+
+    const text = try s.extractScrollback(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    // "abcde" soft-wrapped to "fg" → joined "abcdefg\n", then
+    // "hello\n" + "world\n".
+    try std.testing.expectEqualStrings("abcdefg\nhello\nworld\n", text);
 }
 
 test "extractScreen captures all visible rows + trims trailing blanks" {

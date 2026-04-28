@@ -51,6 +51,8 @@ const HELP_TEXT =
     \\  Ctrl+Shift+C          Copy selection
     \\  Ctrl+Shift+V          Paste
     \\  Ctrl+Shift+A          Copy whole visible screen
+    \\                        (bind keybind.copy_scrollback for the
+    \\                        full scrollback ring)
     \\  Ctrl+Shift+K          Clear screen + scrollback
     \\  Ctrl+Shift+F          Open scrollback search
     \\  Ctrl+I (in search)    Toggle case-insensitive override
