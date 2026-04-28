@@ -2216,3 +2216,46 @@ so the new overlay code itself isn't exercised, but the build
 produces a working program — bidi rendering with italic Hebrew
 or bold Arabic needs a manual test against `printf 'שלום' | …`
 which is hard to automate.
+
+## Kitty kbd flag 0x04 — alt-shifted codepoints
+
+Plan-v3 spillover; rounds out the report-all/disambiguate pair
+shipped in earlier ticks. With flag 0x04 set, kitty's CSI u
+response gains a colon-separated alt-shifted sub-parameter
+embedded in the code field:
+
+```
+plain 'a'         → CSI 97:65 u    (alt-shifted = uppercase 'A')
+Ctrl+'a'          → CSI 97:65;5 u  (mods column survives)
+'a' release       → CSI 97:65;5:3 u (event sub-param survives)
+```
+
+### Conservative scope: ASCII letters only
+
+The full kitty spec also wants alt-base (the codepoint per the
+QWERTY-base layout, for layout-independent shortcuts like
+"Ctrl+Shift+T should always open a tab even on Dvorak"). Doing
+that right needs xkbcommon to query layer-0 of the keymap and
+translate the keycode through it. Out of scope for this tick.
+
+For alt-shifted, the conservative cut is ASCII letters where
+shift→uppercase is layout-independent. Digits and punctuation
+skipped — emitting `1:33` (US-layout `!`) would mislead users on
+French AZERTY (where Shift+1 is `1`) or German QWERTZ (where
+Shift+1 is `!` but Shift+0 is `=`). Apps that need full layout
+behavior pair 0x04 with the upcoming 0x10 (associated text)
+flag and read the actual shifted glyph from there.
+
+### Plumbing
+
+- `kittyKeyEventFull(buf, code, alt_shifted, ...)` — full-arity
+  emitter. `alt_shifted == 0` or `alt_shifted == code_point`
+  omits the sub-parameter.
+- `kittyKeyEvent` is now a thin wrapper passing `alt_shifted = 0`.
+- `encode()` computes `alt_shifted = canon - 0x20` for ASCII
+  lowercase letters when `kitty_flags & 0x04` is set; passes 0
+  otherwise.
+
+Four new tests cover: 0x04+0x08 plain `a`, Ctrl+`a` with 0x04+0x01,
+digit `1` correctly skipping alt-shifted, and the
+`alt_shifted == code_point` early-out path.
