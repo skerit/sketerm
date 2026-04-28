@@ -106,6 +106,20 @@ pub const Atlas = struct {
     glyph_cache: std.AutoHashMap(u32, Glyph),
     allocator: std.mem.Allocator,
 
+    /// Pixel size requested at init — applied to fallback faces so
+    /// they render at the same height as the primary.
+    pixel_size: u16 = 0,
+    /// Fontconfig-discovered fallback faces, indexed by load order.
+    /// First-encountered codepoint that's missing on primary triggers
+    /// an FcFontMatch; subsequent same-codepoint hits skip the query.
+    fallback_faces: std.ArrayList(c.FT_Face) = .{},
+    /// Codepoint → fallback_faces index. The optional value is null
+    /// when fontconfig couldn't find a covering font (also caches
+    /// negative results so we don't query repeatedly).
+    cp_to_fallback: std.AutoHashMap(u32, ?usize) = undefined,
+    /// Whether FcInit() ran successfully. Required for FcFontMatch.
+    fc_initialized: bool = false,
+
     pub fn init(allocator: std.mem.Allocator, font_path: [*:0]const u8, size_px: u16) !*Atlas {
         return initOpts(allocator, font_path, size_px, 0);
     }
@@ -160,6 +174,9 @@ pub const Atlas = struct {
             .glyph_cache = std.AutoHashMap(u32, Glyph).init(allocator),
             .shape_cache = std.AutoHashMap(u64, []ShapedGlyph).init(allocator),
             .allocator = allocator,
+            .pixel_size = size_px,
+            .cp_to_fallback = std.AutoHashMap(u32, ?usize).init(allocator),
+            .fc_initialized = c.FcInit() != 0,
         };
         // Pre-grow caches so ASCII pre-warm + first session content
         // don't pay 4-5 rehashes climbing from default capacity.
@@ -210,6 +227,9 @@ pub const Atlas = struct {
         for (&self.pages) |*p| p.deinit(self.allocator);
         if (self.hb_buf) |b| c.hb_buffer_destroy(b);
         if (self.hb_font) |f| c.hb_font_destroy(f);
+        for (self.fallback_faces.items) |fb| _ = c.FT_Done_Face(fb);
+        self.fallback_faces.deinit(self.allocator);
+        self.cp_to_fallback.deinit();
         _ = c.FT_Done_Face(self.ft_face);
         _ = c.FT_Done_FreeType(self.ft_lib);
         self.allocator.destroy(self);
@@ -291,16 +311,104 @@ pub const Atlas = struct {
             return g;
         }
         const gid = c.FT_Get_Char_Index(self.ft_face, codepoint);
-        if (gid == 0 and codepoint != 0) {
-            return self.cacheEmptyCp(codepoint);
+        if (gid != 0 or codepoint == 0) {
+            const g = self.lookupOrLoadById(gid) catch return self.cacheEmptyCp(codepoint);
+            try self.cache.put(codepoint, g);
+            try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+                .key = codepoint,
+                .kind = .codepoint,
+            });
+            return g;
         }
-        const g = self.lookupOrLoadById(gid) catch return self.cacheEmptyCp(codepoint);
-        try self.cache.put(codepoint, g);
-        try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
-            .key = codepoint,
-            .kind = .codepoint,
-        });
-        return g;
+        // Primary face doesn't have this codepoint — try fontconfig
+        // fallbacks. Result is cached (positive or negative) so we
+        // don't re-query for the same missing codepoint.
+        if (self.findFallbackFace(codepoint)) |fb_face| {
+            const fb_gid = c.FT_Get_Char_Index(fb_face, codepoint);
+            if (fb_gid != 0) {
+                const g = self.loadGlyphFromFace(fb_face, fb_gid) catch return self.cacheEmptyCp(codepoint);
+                try self.cache.put(codepoint, g);
+                try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+                    .key = codepoint,
+                    .kind = .codepoint,
+                });
+                return g;
+            }
+        }
+        return self.cacheEmptyCp(codepoint);
+    }
+
+    /// Locate (or lazily load) a fallback FT_Face that has `cp`. Caches
+    /// both positive matches (face index) and negative results (null
+    /// in the map) so we never query fontconfig twice for the same
+    /// codepoint. Returns null when fontconfig has nothing.
+    fn findFallbackFace(self: *Atlas, cp: u32) ?c.FT_Face {
+        if (self.cp_to_fallback.get(cp)) |entry| {
+            if (entry) |idx| return self.fallback_faces.items[idx];
+            return null;
+        }
+        if (!self.fc_initialized) {
+            _ = self.cp_to_fallback.put(cp, null) catch {};
+            return null;
+        }
+        // Quick scan: maybe an already-loaded fallback covers this cp.
+        for (self.fallback_faces.items, 0..) |fb, idx| {
+            if (c.FT_Get_Char_Index(fb, cp) != 0) {
+                _ = self.cp_to_fallback.put(cp, idx) catch {};
+                return fb;
+            }
+        }
+        // Ask fontconfig for a font that covers `cp`. We bias toward
+        // monospace + scalable so the metrics merge cleanly with the
+        // primary face's cell grid; colour emoji (CBDT/COLR) would
+        // need an RGBA atlas — skipped for v1.
+        const pattern = c.FcPatternCreate() orelse {
+            _ = self.cp_to_fallback.put(cp, null) catch {};
+            return null;
+        };
+        defer c.FcPatternDestroy(pattern);
+        const charset = c.FcCharSetCreate() orelse {
+            _ = self.cp_to_fallback.put(cp, null) catch {};
+            return null;
+        };
+        defer c.FcCharSetDestroy(charset);
+        _ = c.FcCharSetAddChar(charset, cp);
+        _ = c.FcPatternAddCharSet(pattern, c.FC_CHARSET, charset);
+        _ = c.FcPatternAddBool(pattern, c.FC_SCALABLE, c.FcTrue);
+        _ = c.FcConfigSubstitute(null, pattern, c.FcMatchPattern);
+        c.FcDefaultSubstitute(pattern);
+
+        var result: c.FcResult = undefined;
+        const match = c.FcFontMatch(null, pattern, &result) orelse {
+            _ = self.cp_to_fallback.put(cp, null) catch {};
+            return null;
+        };
+        defer c.FcPatternDestroy(match);
+
+        var file_ptr: [*c]c.FcChar8 = undefined;
+        if (c.FcPatternGetString(match, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch) {
+            _ = self.cp_to_fallback.put(cp, null) catch {};
+            return null;
+        }
+        const file_z: [*:0]const u8 = @ptrCast(file_ptr);
+
+        var fb_face: c.FT_Face = undefined;
+        if (c.FT_New_Face(self.ft_lib, file_z, 0, &fb_face) != 0) {
+            _ = self.cp_to_fallback.put(cp, null) catch {};
+            return null;
+        }
+        if (c.FT_Set_Pixel_Sizes(fb_face, 0, self.pixel_size) != 0) {
+            _ = c.FT_Done_Face(fb_face);
+            _ = self.cp_to_fallback.put(cp, null) catch {};
+            return null;
+        }
+        const idx = self.fallback_faces.items.len;
+        self.fallback_faces.append(self.allocator, fb_face) catch {
+            _ = c.FT_Done_Face(fb_face);
+            return null;
+        };
+        _ = self.cp_to_fallback.put(cp, idx) catch {};
+        return fb_face;
     }
 
     /// Glyph-id keyed lookup (HarfBuzz output).
@@ -309,18 +417,33 @@ pub const Atlas = struct {
             self.touchPage(g.layer);
             return g;
         }
+        const g = try self.loadGlyphFromFace(self.ft_face, gid);
+        // gid cache only applies to the primary face — fallback glyphs
+        // share the same gid namespace per-face but collide across.
+        try self.glyph_cache.put(gid, g);
+        try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+            .key = gid,
+            .kind = .gid,
+        });
+        return g;
+    }
 
-        if (c.FT_Load_Glyph(self.ft_face, gid, c.FT_LOAD_RENDER | c.FT_LOAD_TARGET_LIGHT) != 0) {
-            return self.cacheEmptyId(gid);
+    /// Rasterize gid on the supplied face and pack into the atlas.
+    /// Used by both primary-face glyph_cache path and fontconfig
+    /// fallback path. Caller wires the result into whichever cache
+    /// (cp or gid) is appropriate — this fn doesn't touch caches.
+    fn loadGlyphFromFace(self: *Atlas, face: c.FT_Face, gid: u32) !Glyph {
+        if (c.FT_Load_Glyph(face, gid, c.FT_LOAD_RENDER | c.FT_LOAD_TARGET_LIGHT) != 0) {
+            return error.FtLoad;
         }
 
-        const slot = self.ft_face.*.glyph;
+        const slot = face.*.glyph;
         const bm = slot.*.bitmap;
         const w: u32 = bm.width;
         const h: u32 = bm.rows;
 
         // Find a page that fits, optionally evicting LRU.
-        const page_idx = self.findOrEvictPage(w, h) orelse return self.cacheEmptyId(gid);
+        const page_idx = self.findOrEvictPage(w, h) orelse return error.PageFull;
         const page = &self.pages[page_idx];
         if (page.pack_x + w + 1 > PAGE_SIZE) {
             page.pack_x = 0;
@@ -329,7 +452,7 @@ pub const Atlas = struct {
         }
         if (h > page.shelf_h) page.shelf_h = h;
         if (page.pack_y + h > PAGE_SIZE) {
-            return self.cacheEmptyId(gid);
+            return error.PageFull;
         }
         const px = page.pack_x;
         const py = page.pack_y;
@@ -368,11 +491,6 @@ pub const Atlas = struct {
         };
         page.pack_x += w + 1;
         page.last_used_frame = self.frame_counter;
-        try self.pages[page_idx].glyphs_on_page.append(self.allocator, .{
-            .key = gid,
-            .kind = .gid,
-        });
-        try self.glyph_cache.put(gid, g);
         return g;
     }
 

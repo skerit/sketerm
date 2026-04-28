@@ -20,6 +20,7 @@ pub const c = @cImport({
     @cInclude("hb.h");
     @cInclude("hb-ft.h");
     @cInclude("fribidi.h");
+    @cInclude("fontconfig/fontconfig.h");
 
     // POSIX (for PTY, signals, polling). Order matters slightly:
     // sys/types.h first, then platform-specific.

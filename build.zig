@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) void {
         "harfbuzz",
         "epoxy",
         "fribidi",
+        "fontconfig",
     };
 
     const exe = b.addExecutable(.{
