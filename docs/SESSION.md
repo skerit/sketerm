@@ -2101,3 +2101,48 @@ it directly:
 - Plain `a` without 0x08 → byte `a`; with 0x08 → CSI 97 u
 - Shift+`a` with 0x08 → CSI 97;2 u (uppercase folded to lowercase)
 - Tab with 0x08 → CSI 9 u (verifies 0x01 implication)
+
+## Kitty kbd 0x08 — F-keys + nav PUA codepoints
+
+Follow-on from the previous tick's printables work. With
+`report_all` (0x08) set, kitty's spec says functional keys also
+switch to a uniform CSI u shape using the Unicode private-use
+codepoint table — apps using full kitty kbd then get every
+keystroke via the same `CSI <cp> ; <mods> u` parser.
+
+### Mapping table (from kitty spec)
+
+```
+Insert    57348    F1   57364
+Delete    57349    F2   57365
+Left      57350    F3   57366
+Right     57351    F4   57367
+Up        57352    F5   57368
+Down      57353    F6   57369
+Page_Up   57354    F7   57370
+Page_Down 57355    F8   57371
+Home      57356    F9   57372
+End       57357    F10  57373
+                   F11  57374
+                   F12  57375
+```
+
+### Gating
+
+The PUA switch is gated on `kitty_report_all` specifically — with
+`disambiguate` (0x01) alone, F-keys keep their legacy SS3 P /
+tildeKey shapes, and arrows keep CSI A/B/C/D. This matches kitty's
+spec: 0x01 disambiguates *ambiguous* keys (Esc/Tab/Enter/BS +
+modified printables), not all functional keys. Apps opt into the
+new shapes by setting 0x08.
+
+### Tests
+
+Five additions (input_conformance_test.zig):
+- `F1 0x08` → `CSI 57364 u`
+- `Up 0x08` → `CSI 57352 u`
+- `F1 0x01-only` keeps `ESC O P` (legacy SS3 P)
+- `Ctrl+F4 0x08` → `CSI 57367 ; 5 u` (mods column survives)
+
+Plus the prior tick's three tests for printables + Tab implication
+already cover the boundary between 0x01 and 0x08 modes.
