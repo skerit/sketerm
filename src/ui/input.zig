@@ -629,26 +629,54 @@ pub fn kittyKeyEvent(buf: []u8, code_point: u32, shift: bool, alt: bool, ctrl: b
 /// omitted and output matches `kittyKeyEvent`. Otherwise format is
 /// `CSI <code>:<alt-shifted> [; <mods> [: <event>]] u`.
 pub fn kittyKeyEventFull(buf: []u8, code_point: u32, alt_shifted: u32, shift: bool, alt: bool, ctrl: bool, event: u8) usize {
+    return kittyKeyEventComplete(buf, code_point, alt_shifted, 0, shift, alt, ctrl, event);
+}
+
+/// Most general kitty CSI u emitter with optional associated-text
+/// codepoint (kitty flag 0x10). Format:
+///   `CSI <code>[:<alt>][;<mods>[:<event>]][;<text>] u`
+/// When text is set the mods section is always emitted (possibly
+/// empty `;;` when default mods=1), per kitty spec — apps parsing
+/// the text section count semicolons.
+pub fn kittyKeyEventComplete(
+    buf: []u8,
+    code_point: u32,
+    alt_shifted: u32,
+    associated_text: u32,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    event: u8,
+) usize {
     const m = modCode(shift, alt, ctrl);
     const has_alt = alt_shifted != 0 and alt_shifted != code_point;
-    if (event == 1 and m == 1) {
-        const out = if (has_alt)
-            std.fmt.bufPrint(buf, "\x1b[{d}:{d}u", .{ code_point, alt_shifted }) catch return 0
-        else
-            std.fmt.bufPrint(buf, "\x1b[{d}u", .{code_point}) catch return 0;
-        return out.len;
-    }
-    if (event == 1) {
-        const out = if (has_alt)
-            std.fmt.bufPrint(buf, "\x1b[{d}:{d};{d}u", .{ code_point, alt_shifted, m }) catch return 0
-        else
-            std.fmt.bufPrint(buf, "\x1b[{d};{d}u", .{ code_point, m }) catch return 0;
-        return out.len;
-    }
-    const out = if (has_alt)
-        std.fmt.bufPrint(buf, "\x1b[{d}:{d};{d}:{d}u", .{ code_point, alt_shifted, m, event }) catch return 0
+    const has_text = associated_text != 0;
+
+    // Build the code section: <code>[:<alt>]
+    var code_buf: [32]u8 = undefined;
+    const code_part = if (has_alt)
+        std.fmt.bufPrint(&code_buf, "{d}:{d}", .{ code_point, alt_shifted }) catch return 0
     else
-        std.fmt.bufPrint(buf, "\x1b[{d};{d}:{d}u", .{ code_point, m, event }) catch return 0;
+        std.fmt.bufPrint(&code_buf, "{d}", .{code_point}) catch return 0;
+
+    // Build the mods section: <mods>[:<event>], or empty when both
+    // default (m=1, event=1) AND no text follows.
+    var mods_buf: [16]u8 = undefined;
+    const mods_part: []const u8 = blk: {
+        if (m == 1 and event == 1) break :blk if (has_text) "" else "";
+        if (event == 1) break :blk std.fmt.bufPrint(&mods_buf, "{d}", .{m}) catch return 0;
+        break :blk std.fmt.bufPrint(&mods_buf, "{d}:{d}", .{ m, event }) catch return 0;
+    };
+
+    if (has_text) {
+        const out = std.fmt.bufPrint(buf, "\x1b[{s};{s};{d}u", .{ code_part, mods_part, associated_text }) catch return 0;
+        return out.len;
+    }
+    if (mods_part.len == 0) {
+        const out = std.fmt.bufPrint(buf, "\x1b[{s}u", .{code_part}) catch return 0;
+        return out.len;
+    }
+    const out = std.fmt.bufPrint(buf, "\x1b[{s};{s}u", .{ code_part, mods_part }) catch return 0;
     return out.len;
 }
 
@@ -768,7 +796,20 @@ pub fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bo
                     canon - 0x20
                 else
                     0;
-                return kittyKeyEventFull(buf, canon, alt_shifted, shift, alt, ctrl, kitty_event);
+                // Kitty flag 0x10 — associated text. Only emit when
+                // the keystroke would produce text in normal mode:
+                // unmodified printables (and Shift+letter for the
+                // shifted glyph). Ctrl/Alt-modified keys produce
+                // control bytes / nothing — emit no text.
+                const kitty_assoc = (kitty_flags & 0x10) != 0;
+                var assoc_text: u32 = 0;
+                if (kitty_assoc and !ctrl and !alt) {
+                    assoc_text = if (shift and canon >= 'a' and canon <= 'z')
+                        canon - 0x20
+                    else
+                        cp_pre;
+                }
+                return kittyKeyEventComplete(buf, canon, alt_shifted, assoc_text, shift, alt, ctrl, kitty_event);
             }
         }
     }

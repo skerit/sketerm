@@ -260,3 +260,33 @@ test "kittyKeyEventFull alt_shifted == code_point omits sub-param" {
     const n = input.kittyKeyEventFull(&buf, 97, 97, false, false, true, 1);
     try std.testing.expectEqualStrings("\x1b[97;5u", buf[0..n]);
 }
+
+test "kitty 0x10+0x08: plain 'a' → CSI 97;;97 u (assoc text)" {
+    // Plain 'a' with associated text: code=97, no alts, mods empty
+    // (default 1), text=97. Per kitty spec the empty mods section
+    // is signalled by `;;` with the text after.
+    var buf: [32]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_a, 0, false, 0, 0x10 | 0x08, false, false);
+    try std.testing.expectEqualStrings("\x1b[97;;97u", buf[0..n]);
+}
+
+test "kitty 0x10+0x08: Shift+'a' → CSI 97;2;65 u (uppercase text)" {
+    var buf: [32]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_A, c.GDK_SHIFT_MASK, false, 0, 0x10 | 0x08, false, false);
+    try std.testing.expectEqualStrings("\x1b[97;2;65u", buf[0..n]);
+}
+
+test "kitty 0x10: Ctrl+'a' produces no text (control byte, no plain output)" {
+    // Ctrl+'a' has no plain-mode text, so the associated-text section
+    // must be omitted entirely — falls back to CSI 97;5 u.
+    var buf: [32]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_a, c.GDK_CONTROL_MASK, false, 0, 0x10 | 0x01, false, false);
+    try std.testing.expectEqualStrings("\x1b[97;5u", buf[0..n]);
+}
+
+test "kittyKeyEventComplete with text + alt_shifted + mods" {
+    var buf: [32]u8 = undefined;
+    const n = input.kittyKeyEventComplete(&buf, 97, 65, 65, true, false, false, 1);
+    // code:alt = 97:65, mods = 2 (shift), text = 65 (uppercase)
+    try std.testing.expectEqualStrings("\x1b[97:65;2;65u", buf[0..n]);
+}
