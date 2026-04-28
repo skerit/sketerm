@@ -2525,3 +2525,39 @@ dead `cwd` capture that was unused (newShellTabWithProfile pulls
 cwd from `focusedPaneCwd()` internally). Removed.
 
 `zig build && zig build test && zig build smoke-cell` all green.
+
+## duplicate_tab: split-tree clone
+
+Closes the loose end from the previous duplicate_tab tick.
+Single-pane tabs duplicated cleanly with profile carry; multi-pane
+split tabs flattened to one shell, losing the splits the user had
+arranged.
+
+### Branch on root widget type
+
+The tab page's child is a wrapper Box. Its first child is the
+layout root — either the Pane wrapper (single pane) or a GtkPaned
+(split). Branch on `g_type_check_instance_is_a(root,
+gtk_paned_get_type())`:
+
+- **Not a paned** (single pane) — keep the existing fast path:
+  `newShellTabWithProfile(null, pane.active_profile)`. Carries the
+  profile, which TabSpec can't (no profile field on PaneSpec yet).
+- **Is a paned** (split) — round-trip via the layout-spec pipeline:
+  arena-allocate, `collectTree(arena, root)` to build a Tree,
+  package as `TabSpec` with the current page's title +
+  `pinned = false` (fresh duplicates start unpinned), call
+  `newTabFromSpec`. Each leaf pane gets its current OSC 7 cwd
+  preserved via collectTree's existing logic.
+
+### Trade-off documented
+
+The split-tree path drops profiles per pane. Adding `profile_name`
+to PaneSpec would fix that and also fix layout save/restore's
+silent loss of profiles. Out of scope for this tick — would need
+a serializer schema bump + restore-side findProfile lookup at
+each leaf, plus a TabSpec versioning bump if we want backwards
+compat. Picked the smaller win (preserve splits) over the bigger
+refactor.
+
+`zig build && zig build test` green; no render code touched.
