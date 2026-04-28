@@ -2146,3 +2146,73 @@ Five additions (input_conformance_test.zig):
 
 Plus the prior tick's three tests for printables + Tab implication
 already cover the boundary between 0x01 and 0x08 modes.
+
+## grid_pass overlay: italic + faux-bold
+
+Plan-v3 spillover. Bidi/RTL/CJK rows fall through to grid_pass's
+overlay path (the cell_pass fast path only handles simple LTR
+ASCII), and that path didn't apply italic shear or faux-bold —
+so SGR 1/3 silently dropped on Hebrew, Arabic, Devanagari, etc.
+Cell_pass already shipped both effects via instanced shader
+attributes; this just brings the overlay shader to parity.
+
+### Vertex layout
+
+`Vertex` grew by three f32 fields:
+- `italic` — 1.0 = apply shear, 0 = no-op
+- `bold` — passed through as `v_bold` for fragment double-sample
+- `baseline_y` — cell bottom edge in pixels; the shear pivot
+
+Adds 12 bytes per vertex × 6 vertices/quad. Overlay path is hot
+for at most ~50 quads/frame in a typical bidi row; the extra
+~3.6 KB/frame is noise.
+
+### Shader changes
+
+Vertex shader applies the shear before the NDC transform:
+```
+if (a_italic > 0.5) pos.x += (a_baseline_y - pos.y) * 0.231;
+```
+
+Same pivot math as cell_pass — `tan(13°) ≈ 0.231`, baseline at
+cell bottom so descenders stay anchored.
+
+Fragment shader passes `v_bold` through and does the double-sample
+trick: max alpha of two atlas samples 1 texel apart:
+```
+if (v_bold > 0.5) {
+    float a2 = texture(u_atlas, v_uv + vec3(1.0/2048.0, 0.0, 0.0)).r;
+    a = max(a, a2);
+}
+```
+
+### Gating
+
+Both effects gate on `is_single = (x_scale == 1.0 and y_scale == 1.0)`
+— DH/DW rows (DECSWL / DECDWL / DECDHL) skip italic+bold because
+the shear pivot math gets weird with non-1 y_scale, and it'd
+need its own per-quad pivot calculation for the bottom of the
+double-height region. Deferred until someone hits that combo and
+files a bug; double-height italic Arabic is exotic enough.
+
+`bold_f` also gates on `self.allow_bold` so the existing config
+toggle works for both fast path and overlay path consistently.
+
+### Plumbing
+
+Added `pushGlyphQuadStyled` taking the three new params; old
+`pushGlyphQuadDim` is now a thin wrapper passing zeros. Only the
+two emit functions (`emitLogicalGlyphs`, `emitBidiGlyphs`) call
+the styled variant; the preedit path keeps the dim wrapper since
+IME composition shouldn't get retroactive italic.
+
+VAO setup added the three new attribute pointers. Build clean.
+
+### Verification
+
+`smoke-cell` ran and passed: `any_text=2961 greenish=340
+bluish_border=1648 reddish=479`. The smoke harness is ASCII-only
+so the new overlay code itself isn't exercised, but the build
+produces a working program — bidi rendering with italic Hebrew
+or bold Arabic needs a manual test against `printf 'שלום' | …`
+which is hard to automate.
