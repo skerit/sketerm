@@ -4756,6 +4756,109 @@ test "OSC 4 sets palette index, OSC 104 resets it" {
     try std.testing.expectEqual(palette_default_256[1], s.palette[1]);
 }
 
+test "OSC 4 query returns palette entry as rgb spec" {
+    const TestSink = struct {
+        var captured: [128]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+    TestSink.captured_len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+
+    // Set palette[1] = #ff8000, then query it back.
+    s.onOsc("4;1;rgb:ff/80/00");
+    s.onOsc("4;1;?");
+    const got = TestSink.captured[0..TestSink.captured_len];
+    // Format: ESC ]4;1;rgb:ffff/8080/0000 ST  (each byte duplicated → 16-bit).
+    try std.testing.expectEqualStrings("\x1b]4;1;rgb:ffff/8080/0000\x1b\\", got);
+}
+
+test "OSC 10 query returns default_fg as 16-bit rgb" {
+    const TestSink = struct {
+        var captured: [128]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+    TestSink.captured_len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+
+    // Set default_fg to a known value, then query.
+    s.onOsc("10;rgb:ff/00/80");
+    s.onOsc("10;?");
+    const got = TestSink.captured[0..TestSink.captured_len];
+    // 0xff → 65535, 0x00 → 0, 0x80 → 32896 = 0x8080.
+    try std.testing.expectEqualStrings("\x1b]10;rgb:ffff/0000/8080\x1b\\", got);
+}
+
+test "OSC 11 query returns default_bg" {
+    const TestSink = struct {
+        var captured: [128]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+    TestSink.captured_len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+
+    s.onOsc("11;rgb:00/00/00");
+    s.onOsc("11;?");
+    const got = TestSink.captured[0..TestSink.captured_len];
+    try std.testing.expectEqualStrings("\x1b]11;rgb:0000/0000/0000\x1b\\", got);
+}
+
+test "OSC 12 query falls back to default_fg when cursor sentinel set" {
+    const TestSink = struct {
+        var captured: [128]u8 = undefined;
+        var captured_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+    };
+    TestSink.captured_len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write };
+
+    // Lock fg to a known value; cursor stays at sentinel (alpha=0
+    // means "use fg"), so OSC 12 query should report fg.
+    s.onOsc("10;rgb:80/40/20");
+    s.onOsc("112"); // reset cursor to sentinel
+    s.onOsc("12;?");
+    const got = TestSink.captured[0..TestSink.captured_len];
+    try std.testing.expectEqualStrings("\x1b]12;rgb:8080/4040/2020\x1b\\", got);
+}
+
 test "OSC 11 sets default_bg, OSC 111 resets" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
