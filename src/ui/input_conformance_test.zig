@@ -232,3 +232,31 @@ test "kitty 0x08: Ctrl+F4 → CSI 57367 ; 5 u" {
     const n = input.encode(&buf, c.GDK_KEY_F4, c.GDK_CONTROL_MASK, false, 0, 0x08, false, false);
     try std.testing.expectEqualStrings("\x1b[57367;5u", buf[0..n]);
 }
+
+test "kitty 0x04+0x08: plain 'a' adds alt-shifted 'A' sub-param" {
+    // 0x04 (alt-keys) + 0x08 (report-all) — plain 'a' should be
+    // CSI 97:65 u  (alt-shifted = uppercase variant).
+    var buf: [32]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_a, 0, false, 0, 0x04 | 0x08, false, false);
+    try std.testing.expectEqualStrings("\x1b[97:65u", buf[0..n]);
+}
+
+test "kitty 0x04: Ctrl+'a' → CSI 97:65 ; 5 u" {
+    var buf: [32]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_a, c.GDK_CONTROL_MASK, false, 0, 0x04 | 0x01, false, false);
+    try std.testing.expectEqualStrings("\x1b[97:65;5u", buf[0..n]);
+}
+
+test "kitty 0x04: digit '1' has no alt-shifted (layout-dependent)" {
+    // Conservative: skip alt-shifted for digits + punctuation since
+    // US-layout assumption ('1' → '!') would mislead non-US users.
+    var buf: [32]u8 = undefined;
+    const n = input.encode(&buf, c.GDK_KEY_1, c.GDK_CONTROL_MASK, false, 0, 0x04 | 0x01, false, false);
+    try std.testing.expectEqualStrings("\x1b[49;5u", buf[0..n]);
+}
+
+test "kittyKeyEventFull alt_shifted == code_point omits sub-param" {
+    var buf: [16]u8 = undefined;
+    const n = input.kittyKeyEventFull(&buf, 97, 97, false, false, true, 1);
+    try std.testing.expectEqualStrings("\x1b[97;5u", buf[0..n]);
+}

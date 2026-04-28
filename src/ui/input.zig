@@ -621,16 +621,34 @@ pub fn kittyKey(buf: []u8, code_point: u32, shift: bool, alt: bool, ctrl: bool) 
 /// `:<event>` sub-parameter. Apps that haven't enabled flag 0x02
 /// should use the default `event = 1` form.
 pub fn kittyKeyEvent(buf: []u8, code_point: u32, shift: bool, alt: bool, ctrl: bool, event: u8) usize {
+    return kittyKeyEventFull(buf, code_point, 0, shift, alt, ctrl, event);
+}
+
+/// Full kitty CSI u emitter with optional alt-shifted codepoint
+/// (kitty flag 0x04). When `alt_shifted == 0` the sub-parameter is
+/// omitted and output matches `kittyKeyEvent`. Otherwise format is
+/// `CSI <code>:<alt-shifted> [; <mods> [: <event>]] u`.
+pub fn kittyKeyEventFull(buf: []u8, code_point: u32, alt_shifted: u32, shift: bool, alt: bool, ctrl: bool, event: u8) usize {
     const m = modCode(shift, alt, ctrl);
+    const has_alt = alt_shifted != 0 and alt_shifted != code_point;
     if (event == 1 and m == 1) {
-        const out = std.fmt.bufPrint(buf, "\x1b[{d}u", .{code_point}) catch return 0;
+        const out = if (has_alt)
+            std.fmt.bufPrint(buf, "\x1b[{d}:{d}u", .{ code_point, alt_shifted }) catch return 0
+        else
+            std.fmt.bufPrint(buf, "\x1b[{d}u", .{code_point}) catch return 0;
         return out.len;
     }
     if (event == 1) {
-        const out = std.fmt.bufPrint(buf, "\x1b[{d};{d}u", .{ code_point, m }) catch return 0;
+        const out = if (has_alt)
+            std.fmt.bufPrint(buf, "\x1b[{d}:{d};{d}u", .{ code_point, alt_shifted, m }) catch return 0
+        else
+            std.fmt.bufPrint(buf, "\x1b[{d};{d}u", .{ code_point, m }) catch return 0;
         return out.len;
     }
-    const out = std.fmt.bufPrint(buf, "\x1b[{d};{d}:{d}u", .{ code_point, m, event }) catch return 0;
+    const out = if (has_alt)
+        std.fmt.bufPrint(buf, "\x1b[{d}:{d};{d}:{d}u", .{ code_point, alt_shifted, m, event }) catch return 0
+    else
+        std.fmt.bufPrint(buf, "\x1b[{d};{d}:{d}u", .{ code_point, m, event }) catch return 0;
     return out.len;
 }
 
@@ -740,7 +758,17 @@ pub fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bo
                 // map to 'a' = 0x61, with Shift signalled via mods.
                 var canon: u32 = cp_pre;
                 if (canon >= 'A' and canon <= 'Z') canon += 0x20;
-                return kittyKeyEvent(buf, canon, shift, alt, ctrl, kitty_event);
+                // Kitty flag 0x04 — alt-shifted as sub-parameter.
+                // Conservative: only emit for ASCII letters where
+                // shift→uppercase is layout-independent. Digits +
+                // punctuation skipped (US-only assumption would
+                // mislead non-US-layout users).
+                const kitty_alt_keys = (kitty_flags & 0x04) != 0;
+                const alt_shifted: u32 = if (kitty_alt_keys and canon >= 'a' and canon <= 'z')
+                    canon - 0x20
+                else
+                    0;
+                return kittyKeyEventFull(buf, canon, alt_shifted, shift, alt, ctrl, kitty_event);
             }
         }
     }
