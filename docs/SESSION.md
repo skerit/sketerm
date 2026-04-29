@@ -3071,3 +3071,29 @@ self.is_focused;`. Identical semantics, fewer GTK round-trips.
 The smoke harness builds CellPass / GridPass directly (no Pane,
 no focus signal) and passes `focused = true` explicitly to
 `buildVertices`, so the smoke pixel counts are unaffected.
+
+## Bug fix: search match navigation (tick-pause regression)
+
+Surfaced while auditing for tick-pause-induced regressions.
+`Window.applyCurrentMatch` and the no-match clear branch in
+`updateSearch` both set `screen.dirty = true` but never called
+`queue_render`. Before the tick-pause change, the pane's tick
+callback would catch the dirty bit at the next 60 Hz tick and
+queue_render itself. After the tick-pause change, an unfocused
+pane (which is what we have during search interaction — the
+search bar holds focus, not the pane) has its tick removed: dirty
+sits set but no tick is around to consume it.
+
+Symptom: Enter / Shift+Enter to walk through matches scrolled
+view_offset internally but the GL didn't repaint until something
+else woke a render. Sometimes broken-feeling, sometimes blank.
+
+### Fix
+
+Both call sites — applyCurrentMatch (after view_offset adjust)
+and updateSearch's no-match clear (after wiping highlights) —
+now call `gtk_gl_area_queue_render` explicitly on the search
+pane's GLArea. Drain → render direct already covers the
+"text arrived" path; this closes the search-only loop.
+
+`zig build && zig build test && zig build smoke-cell` all green.
