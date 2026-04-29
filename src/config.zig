@@ -1016,6 +1016,39 @@ test "config: serialise round-trips through loadFromBytes" {
     try std.testing.expect(@abs(parsed.cursor_color[1] - 1.0) < 0.01);
 }
 
+test "config: show_titlebar / show_tab_bar round-trip" {
+    // Both bools default to non-default values to exercise the
+    // serializer's "skip default" path for one and "emit non-default"
+    // for the other in a single test.
+    var cfg = Config{};
+    cfg.show_titlebar = true; // default false → must be emitted
+    cfg.show_tab_bar = false; // default true  → must be emitted
+    var buf: [1024]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "show_titlebar = true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "show_tab_bar = false") != null);
+
+    var parsed = try Config.loadFromBytes(std.testing.allocator, out);
+    defer parsed.deinit();
+    try std.testing.expectEqual(true, parsed.show_titlebar);
+    try std.testing.expectEqual(false, parsed.show_tab_bar);
+}
+
+test "config: visibility defaults are NOT emitted (terse output)" {
+    // Verify the serializer's "skip default" gates work — defaults
+    // (show_titlebar=false, show_tab_bar=true) shouldn't appear in
+    // the output, otherwise minimal user configs accumulate cruft.
+    const cfg = Config{};
+    var buf: [1024]u8 = undefined;
+    var w = std.io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "show_titlebar") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "show_tab_bar") == null);
+}
+
 test "config: keybind.<action> entries round-trip" {
     const body =
         \\keybind.new_tab = <Control><Shift>t
