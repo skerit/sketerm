@@ -2977,3 +2977,38 @@ running self-removes on its next iteration. Net win: unfocused
 panes have zero tick overhead.
 
 `zig build && zig build test && zig build smoke-cell` all green.
+
+## Bug fix: faux-bold left-edge artifact
+
+User report: "bold characters are missing 1 vertical row of pixels
+on the left." The faux-bold trick (added in commit 6923932) sampled
+the atlas at `v_uvw + (1/2048, 0, 0)` and took `max(self, sample)`
+for the alpha. The intent: dilate the stroke by 1 texel to fake a
+heavier weight without a second FreeType face.
+
+### What went wrong
+
+The `+1 texel right` direction means each fragment shows `max(self,
+right_neighbor)`. Visually that dilates the glyph LEFT (because
+each fragment can see its right neighbor's coverage, so leftmost
+fragments inherit the second column's brightness).
+
+For glyphs with anti-aliased edges (most fonts), the leftmost
+column has soft alpha (e.g. 0.3) fading INTO the stroke at column
++1 (alpha 1.0). The `+1` sample makes the leftmost fragment show
+1.0 — the soft edge is overwritten with a bright sample. Visually
+the antialiased fade disappears, reading as "the glyph's left
+pixel column is missing."
+
+### Fix
+
+Flip the offset direction: sample `v_uvw - (1/2048, 0, 0)`. Each
+fragment now shows `max(self, left_neighbor)`. The dilation goes
+RIGHT instead — the antialiased left edge is preserved (it was
+the leftmost column to begin with; max with the gap to its left
+doesn't change it). Matches how real bold typefaces work: thicker
+strokes expanding into the cell's whitespace on the right while
+preserving the left bearing.
+
+Two-line shader change in cell_pass.zig + grid_pass.zig.
+`zig build && zig build test && zig build smoke-cell` all green.
