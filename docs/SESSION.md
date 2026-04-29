@@ -3189,3 +3189,21 @@ user changed the config.
 
 sample.conf documents the new key next to `show_titlebar`. Build
 + tests green.
+
+## tests: visibility flag round-trip
+
+Two new tests in config.zig cover the `show_titlebar` /
+`show_tab_bar` pair:
+
+1. **`show_titlebar / show_tab_bar round-trip`** — flips each from
+   default (titlebar: false → true, tab_bar: true → false), serializes,
+   asserts both lines present in the output, re-parses, asserts
+   the parsed Config matches.
+2. **`visibility defaults are NOT emitted (terse output)`** — fresh
+   default Config serialised, asserts neither key appears in the
+   output. Catches future regressions where someone changes the
+   serializer to always emit these (would clutter user configs).
+
+Both add coverage to the serializer's "skip default" gates which
+have historically been subtle (each new field needs the gate
+manually). Pure test addition; no production code touched.
