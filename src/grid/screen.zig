@@ -660,6 +660,19 @@ pub const Screen = struct {
         self.dirty = true;
     }
 
+    /// Wipe only the scrollback ring — visible screen + cursor stay
+    /// where they are. Useful when scrollback gets noisy but you
+    /// don't want to lose the current screen contents.
+    pub fn clearScrollbackOnly(self: *Screen) void {
+        for (self.scrollback.items) |*l| l.deinit(self.allocator);
+        self.scrollback.clearRetainingCapacity();
+        self.scrollback_head = 0;
+        // Snap view back to the live screen — the scrollback we were
+        // looking at is gone.
+        self.view_offset = 0;
+        self.dirty = true;
+    }
+
     /// Resize the screen to new dimensions while preserving as much
     /// content as possible. When columns change on the main buffer
     /// we run a full soft-wrap reflow (scrollback + active joined,
@@ -4841,6 +4854,36 @@ test "DA1 advertises sixel + color" {
     csi.final = 'c';
     s.csi(csi);
     try std.testing.expectEqualStrings("\x1b[?62;4;22c", TestSink.captured[0..TestSink.captured_len]);
+}
+
+test "clearScrollbackOnly wipes ring without disturbing visible screen" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 2);
+    defer s.deinit();
+
+    // Push enough content to populate scrollback + leave content
+    // visible: rows=2, so 4 lines of input → 2 in scrollback, 2 visible.
+    for ("aaa") |b| s.printCp(b);
+    s.apply(.{ .execute = '\n' });
+    s.apply(.{ .execute = '\r' });
+    for ("bbb") |b| s.printCp(b);
+    s.apply(.{ .execute = '\n' });
+    s.apply(.{ .execute = '\r' });
+    for ("ccc") |b| s.printCp(b);
+    s.apply(.{ .execute = '\n' });
+    s.apply(.{ .execute = '\r' });
+    for ("ddd") |b| s.printCp(b);
+
+    try std.testing.expect(s.scrollbackCount() > 0);
+    s.clearScrollbackOnly();
+    try std.testing.expectEqual(@as(u32, 0), s.scrollbackCount());
+
+    // Visible content + cursor should be intact — extractScreen
+    // should still see "ccc" and "ddd".
+    const text = try s.extractScreen(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("ccc\nddd\n", text);
 }
 
 test "OSC 4 sets palette index, OSC 104 resets it" {

@@ -96,6 +96,8 @@ pub const Action = enum {
     copy_scrollback,
     interrupt_or_copy,
     clear_and_scrollback,
+    /// Wipe the scrollback ring only — visible screen untouched.
+    clear_scrollback,
     scrollback_page_up,
     scrollback_page_down,
     /// Jump to the oldest scrollback line (top of buffer).
@@ -206,6 +208,7 @@ pub fn actionName(a: Action) []const u8 {
         .copy_scrollback => "copy_scrollback",
         .interrupt_or_copy => "interrupt_or_copy",
         .clear_and_scrollback => "clear_and_scrollback",
+        .clear_scrollback => "clear_scrollback",
         .scrollback_page_up => "scrollback_page_up",
         .scrollback_page_down => "scrollback_page_down",
         .scrollback_top => "scrollback_top",
@@ -253,6 +256,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .copy_scrollback => "Copy entire scrollback",
         .interrupt_or_copy => "Copy / interrupt (smart)",
         .clear_and_scrollback => "Clear screen + scrollback",
+        .clear_scrollback => "Clear scrollback only",
         .scrollback_page_up => "Scroll back one page",
         .scrollback_page_down => "Scroll forward one page",
         .scrollback_top => "Jump to scrollback top",
@@ -524,6 +528,10 @@ fn runAction(ctx: *Ctx, action: Action) c.gboolean {
         },
         .clear_and_scrollback => {
             ctx.terminal.screen.clearAndScrollback();
+            return 1;
+        },
+        .clear_scrollback => {
+            ctx.terminal.screen.clearScrollbackOnly();
             return 1;
         },
         .scrollback_page_up => {
