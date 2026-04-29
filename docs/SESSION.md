@@ -2744,3 +2744,29 @@ Each has the default accelerator inline (or empty for unbound)
 and a short comment for the ones whose semantics aren't obvious
 from the name alone. Pure docs change — no production code
 touched, build green for sanity.
+
+## Window title: broadcast mode indicator
+
+Safety net for the broadcast-typing feature (Ctrl+Shift+G).
+Existing visual cue was a CSS class on the per-pane titlebar —
+which only shows up when `show_titlebar = true`. Users running
+with titlebars off had no way to tell typing was being multiplexed
+across multiple PTYs except by typing and watching unexpected
+characters appear elsewhere.
+
+### Fix
+
+`Window.refreshWindowTitle()` rebuilds the GTK window title:
+
+- `groupsend = .off` → `"sketerm"` (unchanged from init)
+- `.group` → `"sketerm — broadcast: group"`
+- `.all` → `"sketerm — broadcast: all"`
+
+`cycleGroupSend` calls it after the mode flip + per-pane CSS
+refresh. Visible regardless of `show_titlebar` since the GTK
+window decoration always exposes the title (HeaderBar, taskbar
+hover, alt-tab labels, compositor switchers).
+
+Allocation per call (sentinel buffer, `defer free`) — no
+caching needed; broadcast cycling is cold-path. ~24 LOC; no
+render code touched.
