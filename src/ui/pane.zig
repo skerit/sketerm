@@ -68,6 +68,11 @@ pub const Pane = struct {
     win_on_child_exit: ?*const fn (ctx: ?*anyopaque, pane: *Pane, status: i32) void = null,
     /// Cursor blink timing.
     last_blink_us: i64 = 0,
+    /// GTK tick callback id (0 = not registered). The tick is the
+    /// only thing pumping at frame rate; we self-remove it when no
+    /// time-driven work is active (cursor blink, bell flash,
+    /// animation) and re-install on triggers that need it.
+    tick_id: c_uint = 0,
     /// Last cursor (row, col) reported to the IM context. -1 = never
     /// reported — first call sets the actual coords.
     last_im_row: i32 = -1,
@@ -252,14 +257,11 @@ pub const Pane = struct {
             c.G_CONNECT_DEFAULT,
         );
 
-        // Repaint at the frame clock when the screen changes.
-        // For M3, we just force redraws via a tick callback.
-        _ = c.gtk_widget_add_tick_callback(
-            area_widget,
-            @ptrCast(&onTick),
-            @ptrCast(self),
-            null,
-        );
+        // Tick is installed on demand via ensureTickRunning. It
+        // self-removes when no time-driven work is active. First
+        // install happens here so the cold-start cursor settles in
+        // and any early animation events are picked up.
+        self.ensureTickRunning();
 
         // M4: keyboard input → PTY (also handles shortcuts).
         self.input_ctx = try input.attach(area_widget, terminal, allocator);
@@ -468,6 +470,21 @@ pub const Pane = struct {
     pub fn widget(self: *Pane) *c.GtkWidget {
         if (self.wrapper_box) |w| return w;
         return @ptrCast(self.area);
+    }
+
+    /// Install the frame-clock tick callback if it isn't already
+    /// running. Cheap idempotent — can be called from event handlers
+    /// without checking state. Triggers that start time-driven work
+    /// (focus-in with blinking cursor, bell event, image arrival
+    /// with animation) call this so the tick is alive to pump.
+    pub fn ensureTickRunning(self: *Pane) void {
+        if (self.tick_id != 0) return;
+        self.tick_id = c.gtk_widget_add_tick_callback(
+            @ptrCast(self.area),
+            @ptrCast(&onTick),
+            @ptrCast(self),
+            null,
+        );
     }
 
     /// Set the per-pane title bar text. Called from the on_title sink
@@ -772,6 +789,9 @@ fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
     // queue_draw directly so we don't have to wait a frame.
     self.terminal.screen.dirty = true;
     c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    // Image arrival may include an animation; ensure tick is up to
+    // pump frames if the idle path had stopped it.
+    self.ensureTickRunning();
 }
 
 fn onImageDeleteFullEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Screen.ImageDeleteEvent) void {
@@ -837,6 +857,10 @@ fn onNotificationEvent(ctx: ?*anyopaque, title: []const u8, body: []const u8) vo
 fn onBellEvent(ctx: ?*anyopaque) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
     if (self.win_on_bell) |f| f(self.win_bell_ctx, self);
+    // Visual bell flash fades over 200ms — tick must be alive to
+    // drive the fade. Idle path may have stopped it.
+    self.ensureTickRunning();
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
 }
 
 /// OSC 22 — set the GTK pointer (mouse cursor) shape over this pane.
@@ -941,6 +965,26 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         screen.dirty = false;
         c.gtk_gl_area_queue_render(@ptrCast(area));
     }
+
+    // Self-remove when no time-driven work is active: with the
+    // drain → render direct dispatch, the tick is only needed for
+    // cursor blink, bell flash fade, and kitty-graphics animation.
+    // Triggers (focus-in, bell, image-arrival) call ensureTickRunning
+    // to put us back. Idle multi-pane setups drop to ~0% CPU here.
+    const has_blink_work = blinking;
+    const has_bell_work = screen.bell_at_us > 0 and (now - screen.bell_at_us) < 200_000;
+    const has_anim_work = blk: {
+        var it = screen.kitty_images.store.iterator();
+        while (it.next()) |e| {
+            const img = e.value_ptr;
+            if (img.frames.items.len >= 2 and img.playing) break :blk true;
+        }
+        break :blk false;
+    };
+    if (!has_blink_work and !has_bell_work and !has_anim_work) {
+        self.tick_id = 0;
+        return 0; // G_SOURCE_REMOVE
+    }
     return 1; // G_SOURCE_CONTINUE
 }
 
@@ -1044,11 +1088,14 @@ fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     // repaint so the swap is immediate.
     self.terminal.screen.cursor_blink_on = true;
     self.terminal.screen.dirty = true;
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
     // Per-pane titlebar: red (active) when this pane has focus.
     self.setTitlebarActive(true);
     // Inactive-pane dimming: full brightness now.
     self.is_focused = true;
     self.applyDim();
+    // Tick may have self-removed while idle. Cursor blink starts now.
+    self.ensureTickRunning();
 }
 
 fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
@@ -1058,6 +1105,7 @@ fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     }
     self.terminal.screen.cursor_blink_on = true;
     self.terminal.screen.dirty = true;
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
     // Per-pane titlebar: grey (inactive) when focus leaves.
     self.setTitlebarActive(false);
     // Inactive-pane dimming: apply the configured factors.
