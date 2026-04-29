@@ -733,7 +733,9 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     self.grid_pass.canvas_w = @floatFromInt(phys_w);
     self.grid_pass.canvas_h = @floatFromInt(phys_h);
 
-    const focused = c.gtk_widget_has_focus(@ptrCast(self.area)) != 0;
+    // is_focused is kept in sync by onFocusEnter/onFocusLeave;
+    // skipping the GTK call shaves a few hundred ns per render.
+    const focused = self.is_focused;
     // Bump atlas frame counter so multi-page LRU eviction has fresh
     // "last used" timestamps per render.
     atlas.markFrame();
@@ -898,7 +900,9 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
     // (hollow) cursor and don't waste redraws toggling phase.
     const now = std.time.microTimestamp();
     if (self.last_blink_us == 0) self.last_blink_us = now;
-    const focused = c.gtk_widget_has_focus(@ptrCast(self.area)) != 0;
+    // Use the cached is_focused — saves a GTK round-trip on every
+    // tick. Updated by onFocusEnter/Leave handlers.
+    const focused = self.is_focused;
     const blinking = focused and switch (screen.cursor_shape) {
         .block_blink, .underline_blink, .bar_blink => true,
         else => false,
