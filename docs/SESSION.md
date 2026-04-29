@@ -2658,3 +2658,36 @@ per-pane concern. `screen.dirty = true` triggers the next render.
 Help text in main.zig HELP_TEXT lists the new chord; user can
 rebind via `keybind.scrollback_top` / `keybind.scrollback_bottom`
 just like every other action.
+
+## clear_scrollback — wipe ring, keep visible
+
+UX gap: existing `clear_and_scrollback` (Ctrl+Shift+K) wipes
+both visible screen AND scrollback. Sometimes I want to drop the
+scrollback (it's gotten noisy from a long build / git log) but
+not lose the current shell prompt + last-command output that's
+on screen.
+
+### Implementation
+
+`Screen.clearScrollbackOnly()` mirrors `clearAndScrollback` minus
+the visible-buffer clear and cursor reset:
+
+- Frees scrollback line buffers, resets ring length + head pointer
+- Snaps `view_offset = 0` (the scrollback we were viewing is gone)
+- `dirty = true` for repaint
+- Active screen rows + cursor untouched
+
+`Action.clear_scrollback` joins the enum + name + label tables.
+Per-pane runAction case calls the new method. No default keybind
+— bind via `keybind.clear_scrollback` if you want it. The
+existing Ctrl+Shift+K stays for "clear everything."
+
+### Test
+
+New unit test fills 4 lines into a 2-row screen (so 2 fall to
+scrollback), calls `clearScrollbackOnly`, asserts `scrollbackCount
+== 0` and that `extractScreen` still returns the "ccc\nddd\n"
+visible content.
+
+Touched render-adjacent code (screen.zig), so `smoke-cell` ran
+and passed alongside `zig build && zig build test`.
