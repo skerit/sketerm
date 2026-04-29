@@ -823,6 +823,7 @@ fn onImageDeleteFullEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Sc
         },
     }
     self.terminal.screen.dirty = true;
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
 }
 
 fn onTitleEvent(ctx: ?*anyopaque, title: []const u8) void {

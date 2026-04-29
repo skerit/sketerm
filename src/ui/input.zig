@@ -399,6 +399,7 @@ fn onImCommit(_: *c.GtkIMContext, text: [*:0]const u8, user: ?*anyopaque) callco
         screen.allocator.free(old);
         screen.preedit_text = null;
         screen.dirty = true;
+        c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
     }
 }
 
@@ -421,6 +422,7 @@ fn onImPreeditChanged(im: *c.GtkIMContext, user: ?*anyopaque) callconv(.c) void 
         }
     }
     screen.dirty = true;
+    c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
 }
 
 fn onKeyPressed(
@@ -487,6 +489,7 @@ fn onKeyPressed(
     if (screen.view_offset != 0) {
         screen.view_offset = 0;
         screen.dirty = true;
+        c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
     }
     ctx.terminal.writeUserInput(buf[0..n]);
     return 1;
@@ -540,6 +543,7 @@ fn runAction(ctx: *Ctx, action: Action) c.gboolean {
             const want = screen.view_offset + screen.rows;
             screen.view_offset = if (want > sb) sb else want;
             screen.dirty = true;
+            c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
             return 1;
         },
         .scrollback_page_down => {
@@ -549,18 +553,21 @@ fn runAction(ctx: *Ctx, action: Action) c.gboolean {
             else
                 0;
             screen.dirty = true;
+            c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
             return 1;
         },
         .scrollback_top => {
             const screen = ctx.terminal.screen;
             screen.view_offset = @intCast(screen.scrollbackCount());
             screen.dirty = true;
+            c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
             return 1;
         },
         .scrollback_bottom => {
             const screen = ctx.terminal.screen;
             screen.view_offset = 0;
             screen.dirty = true;
+            c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
             return 1;
         },
         // Window-level: forward to the sink.
