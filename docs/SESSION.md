@@ -2770,3 +2770,32 @@ hover, alt-tab labels, compositor switchers).
 Allocation per call (sentinel buffer, `defer free`) — no
 caching needed; broadcast cycling is cold-path. ~24 LOC; no
 render code touched.
+
+## matchBinding dispatch test coverage
+
+Closes the "Input dispatch test harness" item from plan-v3.md
+line 294 — listed as supposed-to-be-added before E (custom
+keybindings) shipped, but nobody actually wrote them. Six tests
+now exercise `matchBinding` against the real `default_bindings`
+table and a synthetic colliding-accel table.
+
+### Coverage
+
+- **Ctrl+Shift+T → new_tab** — sanity check the canonical default.
+- **Ctrl+Tab → next_tab** — separate from Ctrl+Shift+Tab (which
+  is prev_tab); guards against accidentally loosening the mods
+  filter.
+- **Lock-bit filter** — Caps-Lock on while pressing Ctrl+Shift+T
+  must still match. `SIGNIFICANT_MODS` masks Lock/Group bits;
+  this test would catch a regression that included them.
+- **Unmatched returns null** — F12 isn't bound by default.
+- **Wrong-mods rejected** — Ctrl+T (no Shift) doesn't trigger
+  new_tab.
+- **First-match wins** — two bindings on the same accel: first
+  one in the table is returned. Documents the contract so users
+  prepending overrides via `keybind.<...>` config can rely on
+  order.
+
+Plan-v3 had this listed as gating E but it shipped without the
+harness. Belt-and-braces now: regression coverage retroactively
+applied. Pure test addition; no production code touched.
