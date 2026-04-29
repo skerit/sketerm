@@ -576,13 +576,25 @@ fn findOrCreateProfile(cfg: *Config, arena: std.mem.Allocator, name: []const u8)
     return &cfg.profiles.items[cfg.profiles.items.len - 1];
 }
 
+/// Expand `~` / `~/...` to `$HOME` / `$HOME/...` for path-valued
+/// config keys. Returns an arena-duped slice (either the original
+/// or the expanded form). `~user` (other-user expansion) is
+/// intentionally NOT supported — shell-only, would need pwent.
+fn expandTilde(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
+    if (value.len == 0 or value[0] != '~') return arena.dupe(u8, value);
+    if (value.len > 1 and value[1] != '/') return arena.dupe(u8, value);
+    const home = std.posix.getenv("HOME") orelse return arena.dupe(u8, value);
+    if (value.len == 1) return arena.dupe(u8, home);
+    return std.fmt.allocPrint(arena, "{s}{s}", .{ home, value[1..] });
+}
+
 /// Apply one (key, value) line to a profile. Mirrors a subset of
 /// applyKv — only the per-pane fields the Profile struct holds.
 fn applyProfileKv(prof: *Profile, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
     if (std.mem.eql(u8, key, "shell")) {
-        prof.shell = try arena.dupe(u8, value);
+        prof.shell = try expandTilde(arena, value);
     } else if (std.mem.eql(u8, key, "font") or std.mem.eql(u8, key, "font_path")) {
-        prof.font_path = try arena.dupe(u8, value);
+        prof.font_path = try expandTilde(arena, value);
     } else if (std.mem.eql(u8, key, "font_size")) {
         prof.font_size = try parseU16(value);
     } else if (std.mem.eql(u8, key, "scheme")) {
@@ -624,7 +636,7 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         return;
     }
     if (std.mem.eql(u8, key, "font")) {
-        cfg.font_path = try arena.dupe(u8, value);
+        cfg.font_path = try expandTilde(arena, value);
     } else if (std.mem.eql(u8, key, "font_size")) {
         cfg.font_size = try parseU16(value);
     } else if (std.mem.eql(u8, key, "line_pad_px") or std.mem.eql(u8, key, "line_spacing")) {
@@ -649,7 +661,7 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
     } else if (std.mem.eql(u8, key, "scrollback")) {
         cfg.scrollback = try parseU32(value);
     } else if (std.mem.eql(u8, key, "shell")) {
-        cfg.shell = try arena.dupe(u8, value);
+        cfg.shell = try expandTilde(arena, value);
     } else if (std.mem.eql(u8, key, "term") or std.mem.eql(u8, key, "term_env")) {
         cfg.term_env = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "color_term") or std.mem.eql(u8, key, "color_term_env")) {
@@ -1034,6 +1046,40 @@ test "config: show_titlebar / show_tab_bar round-trip" {
     defer parsed.deinit();
     try std.testing.expectEqual(true, parsed.show_titlebar);
     try std.testing.expectEqual(false, parsed.show_tab_bar);
+}
+
+test "config: ~ expansion in path-valued keys" {
+    // Use the test runner's actual HOME — avoids needing setenv.
+    const home = std.posix.getenv("HOME") orelse return error.SkipZigTest;
+
+    const body =
+        \\font = ~/fonts/Hack.ttf
+        \\shell = ~/bin/myshell
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expect(cfg.font_path != null);
+
+    // Build expected string from the test runner's HOME.
+    var expected_font_buf: [512]u8 = undefined;
+    const expected_font = try std.fmt.bufPrint(&expected_font_buf, "{s}/fonts/Hack.ttf", .{home});
+    try std.testing.expectEqualStrings(expected_font, cfg.font_path.?);
+
+    var expected_shell_buf: [512]u8 = undefined;
+    const expected_shell = try std.fmt.bufPrint(&expected_shell_buf, "{s}/bin/myshell", .{home});
+    try std.testing.expect(cfg.shell != null);
+    try std.testing.expectEqualStrings(expected_shell, cfg.shell.?);
+}
+
+test "config: ~user (no slash after ~) is NOT expanded" {
+    // Whether HOME is set or not, ~root should pass through verbatim
+    // — we don't support shell-style other-user expansion.
+    const body = "shell = ~root/bin/sh\n";
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expect(cfg.shell != null);
+    try std.testing.expectEqualStrings("~root/bin/sh", cfg.shell.?);
 }
 
 test "config: visibility defaults are NOT emitted (terse output)" {
