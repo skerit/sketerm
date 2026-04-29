@@ -2513,20 +2513,39 @@ fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
         if (child == null) continue;
         if (!widgetIsAncestor(@ptrCast(child), pane.widget())) continue;
 
+        // Abbreviate $HOME → ~ so the tooltip stays compact for the
+        // common case of working under your home directory. Falls
+        // through to the raw cwd when HOME isn't set or doesn't
+        // prefix the path (e.g. /tmp, /var/log).
+        var abbrev_buf: [512]u8 = undefined;
+        const display_cwd: []const u8 = blk: {
+            const home = std.posix.getenv("HOME") orelse break :blk cwd;
+            if (home.len == 0 or !std.mem.startsWith(u8, cwd, home)) break :blk cwd;
+            // Match either `HOME` exactly or `HOME/...` — `HOMEextra`
+            // would be a different dir and shouldn't be folded.
+            const after = cwd[home.len..];
+            if (after.len != 0 and after[0] != '/') break :blk cwd;
+            const total = 1 + after.len; // "~" + rest
+            if (total > abbrev_buf.len) break :blk cwd;
+            abbrev_buf[0] = '~';
+            @memcpy(abbrev_buf[1..total], after);
+            break :blk abbrev_buf[0..total];
+        };
+
         const title_c = c.adw_tab_page_get_title(page);
         const title_str: []const u8 = if (title_c != null)
             std.mem.span(@as([*:0]const u8, @ptrCast(title_c)))
         else
             "";
-        const total_len = if (title_str.len > 0) title_str.len + 1 + cwd.len else cwd.len;
+        const total_len = if (title_str.len > 0) title_str.len + 1 + display_cwd.len else display_cwd.len;
         const tip = self.allocator.allocSentinel(u8, total_len, 0) catch return;
         defer self.allocator.free(tip);
         if (title_str.len > 0) {
             @memcpy(tip[0..title_str.len], title_str);
             tip[title_str.len] = '\n';
-            @memcpy(tip[title_str.len + 1 .. total_len], cwd);
+            @memcpy(tip[title_str.len + 1 .. total_len], display_cwd);
         } else {
-            @memcpy(tip[0..cwd.len], cwd);
+            @memcpy(tip[0..display_cwd.len], display_cwd);
         }
         c.adw_tab_page_set_tooltip(page, tip.ptr);
         return;
