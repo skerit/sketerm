@@ -2614,3 +2614,27 @@ Two changes around the leaf path:
   profile applied → behaves identically to pre-change.
 
 `zig build && zig build test` green throughout.
+
+## Layout schema round-trip tests
+
+Recent ticks added two TabSpec/PaneSpec fields (`pinned`, `profile`)
+without explicit round-trip coverage. Adding three tests now so a
+future serializer / parser change can't silently drop them.
+
+### Tests added
+
+1. **`round trip preserves PaneSpec.profile`** — write a single
+   tab with `profile = "ssh-prod"`, save, load, assert the field
+   came back.
+2. **`round trip preserves TabSpec.pinned`** — two tabs, one
+   pinned=true and one default (false). Save + load + assert
+   both bits land where they started.
+3. **`load tolerates older JSON without profile / pinned fields`**
+   — hand-write minimal v2 JSON missing the new fields, parse it,
+   assert the defaults (`pinned = false`, `profile = ""`) fill in.
+   Verifies the `ignore_unknown_fields` + Zig default-init combo
+   keeps backwards-compat. Older `last.json` and `default.json`
+   files keep parsing through schema additions.
+
+`zig build test` green; +89 LOC of pure test coverage. No
+production code touched.
