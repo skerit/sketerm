@@ -290,3 +290,52 @@ test "kittyKeyEventComplete with text + alt_shifted + mods" {
     // code:alt = 97:65, mods = 2 (shift), text = 65 (uppercase)
     try std.testing.expectEqualStrings("\x1b[97:65;2;65u", buf[0..n]);
 }
+
+// ── matchBinding dispatch table coverage ──────────────────────────
+
+test "matchBinding: Ctrl+Shift+T → new_tab" {
+    const bindings = input.default_bindings[0..];
+    const ctrl_shift = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK;
+    const got = input.matchBinding(bindings, c.GDK_KEY_t, ctrl_shift);
+    try std.testing.expectEqual(@as(?input.Action, .new_tab), got);
+}
+
+test "matchBinding: Ctrl+Tab → next_tab (lone Ctrl, not Ctrl+Shift)" {
+    const bindings = input.default_bindings[0..];
+    const got = input.matchBinding(bindings, c.GDK_KEY_Tab, c.GDK_CONTROL_MASK);
+    try std.testing.expectEqual(@as(?input.Action, .next_tab), got);
+}
+
+test "matchBinding: ignores Lock + Group bits via SIGNIFICANT_MODS filter" {
+    // Caps Lock (GDK_LOCK_MASK = 0x02) is NOT in the significant set;
+    // a binding for Ctrl+Shift+T should still match when Lock is on.
+    const bindings = input.default_bindings[0..];
+    const mods: c_uint = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_LOCK_MASK;
+    const got = input.matchBinding(bindings, c.GDK_KEY_t, mods);
+    try std.testing.expectEqual(@as(?input.Action, .new_tab), got);
+}
+
+test "matchBinding: unmatched key returns null" {
+    const bindings = input.default_bindings[0..];
+    // No default binding for plain F12.
+    const got = input.matchBinding(bindings, c.GDK_KEY_F12, 0);
+    try std.testing.expectEqual(@as(?input.Action, null), got);
+}
+
+test "matchBinding: wrong mods don't match (Ctrl+T alone, no Shift)" {
+    const bindings = input.default_bindings[0..];
+    const got = input.matchBinding(bindings, c.GDK_KEY_t, c.GDK_CONTROL_MASK);
+    try std.testing.expectEqual(@as(?input.Action, null), got);
+}
+
+test "matchBinding: first-match wins on duplicate accelerators" {
+    // Build a table where two entries collide on the accel — first
+    // wins per the linear-scan implementation. Documents the contract
+    // so callers can rely on order when overriding defaults.
+    const bindings = [_]input.Binding{
+        .{ .keyval = c.GDK_KEY_a, .mods = 0, .action = .copy },
+        .{ .keyval = c.GDK_KEY_a, .mods = 0, .action = .paste },
+    };
+    const got = input.matchBinding(bindings[0..], c.GDK_KEY_a, 0);
+    try std.testing.expectEqual(@as(?input.Action, .copy), got);
+}
