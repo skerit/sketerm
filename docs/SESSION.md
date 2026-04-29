@@ -3246,3 +3246,41 @@ Two tests:
   `shell = ~root/bin/sh`, asserts it round-trips verbatim.
 
 `zig build && zig build test` green.
+
+## Link hover: pointer cursor
+
+UX polish — when the mouse is over an OSC 8 hyperlinked cell or
+an auto-detected URL, the cursor turns into the "pointer" (hand)
+shape. Matches gnome-terminal, kitty, and basically every modern
+terminal. Tooltip showing the URL was already wired; this finishes
+the visual cue.
+
+### State
+
+`Pane.cursor_over_link: bool` tracks the current state so we only
+call `gtk_widget_set_cursor_from_name` on entry/exit transitions,
+not every motion event (which would hammer the GTK input pipeline
+with redundant work).
+
+### Flow
+
+`onMotion` already detected hover for tooltip purposes. Refactored
+to compute `over_link` once and use it for both the tooltip AND
+the cursor flip:
+
+- `over_link = true` AND `!cursor_over_link` → set cursor "pointer"
+  + flip flag.
+- `over_link = false` AND `cursor_over_link` → set cursor null
+  (system default) + clear flag.
+- Other state combinations: no GTK call.
+
+### Trade-off with OSC 22
+
+When an app sets a custom cursor via OSC 22 (e.g. "watch"), the
+link-hover override momentarily wins, then on leave we reset to
+`null` instead of the OSC 22 setting. Acceptable: OSC 22 is rare,
+and link-hover takes precedence in modern terminals anyway. Could
+be improved by storing the OSC 22 state and restoring on leave —
+deferred unless a user reports the conflict.
+
+`zig build && zig build test` green. No render code touched.
