@@ -230,6 +230,7 @@ pub const Pane = struct {
         terminal.on_title = onTitleEvent;
         terminal.on_cwd_changed = onCwdEvent;
         terminal.on_clipboard_set = onClipboardEvent;
+        terminal.on_render_request = onRenderRequest;
         terminal.on_notification = onNotificationEvent;
         terminal.on_bell = onBellEvent;
         terminal.on_pointer_shape = onPointerShapeEvent;
@@ -811,6 +812,16 @@ fn onTitleEvent(ctx: ?*anyopaque, title: []const u8) void {
 fn onCwdEvent(ctx: ?*anyopaque, cwd: []const u8) void {
     const self: *Pane = @ptrCast(@alignCast(ctx.?));
     if (self.win_on_cwd) |f| f(self.win_cwd_ctx, self, cwd);
+}
+
+/// Drain finished a batch with screen.dirty set — schedule a GL
+/// render now instead of waiting for the next frame's tick to
+/// notice. Also clears the dirty flag so the tick path doesn't
+/// queue a redundant render this frame.
+fn onRenderRequest(ctx: ?*anyopaque) void {
+    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    self.terminal.screen.dirty = false;
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
 }
 
 fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {

@@ -65,6 +65,13 @@ pub const Terminal = struct {
     /// the AdwTabPage tooltip so hovering shows the live shell cwd.
     on_cwd_changed: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
     on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+    /// Fires once at the end of `mainDrain` when events left
+    /// `screen.dirty = true` (and we're not in DECSET 2026 sync
+    /// mode). UI uses it to schedule a GL render directly from the
+    /// drain instead of waiting for the next 60 Hz tick to notice
+    /// the dirty bit — saves up to one frame of latency on
+    /// keystroke echo + heavy output.
+    on_render_request: ?*const fn (ctx: ?*anyopaque) void = null,
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
     on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void = null,
@@ -386,6 +393,13 @@ pub const Terminal = struct {
 
         if (stderr_writer) |*w| {
             w.interface.flush() catch {};
+        }
+
+        // Direct render dispatch: drain cleared the ring, leaving the
+        // screen dirty. Skip in DECSET 2026 sync mode — the running
+        // app will tell us when to flush.
+        if (self.screen.dirty and !self.screen.sync_output) {
+            if (self.on_render_request) |f| f(self.user_ctx);
         }
 
         return @intFromBool(false); // G_SOURCE_REMOVE
