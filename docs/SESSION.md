@@ -3207,3 +3207,42 @@ Two new tests in config.zig cover the `show_titlebar` /
 Both add coverage to the serializer's "skip default" gates which
 have historically been subtle (each new field needs the gate
 manually). Pure test addition; no production code touched.
+
+## Config: ~/ expansion in path values
+
+Quality-of-life add. Users with `font_path = /home/skerit/fonts/Hack.ttf`
+in their config can now write `font_path = ~/fonts/Hack.ttf`.
+Mirrors shell convention without trying to be a full shell parser.
+
+### Scope
+
+`expandTilde(arena, value)` helper at file scope. Applied to four
+keys:
+- `font` / `font_path` (global + profile)
+- `shell` (global + profile)
+
+Other config values (TERM, color schemes, etc.) aren't paths so
+no expansion needed. The serializer writes whatever the field
+holds — once expanded, the Config arena owns the absolute path.
+
+### Rules
+
+1. Empty value or value not starting with `~` → arena.dupe (no
+   change). Identity for the common case.
+2. `~` followed by anything but `/` (e.g. `~root/bin/sh`) →
+   arena.dupe. Shell-style other-user expansion isn't supported.
+3. `~` alone → `$HOME`.
+4. `~/...` → `$HOME/...`.
+5. `$HOME` unset → arena.dupe (no change). User gets the literal
+   `~` and figures it out.
+
+### Tests
+
+Two tests:
+- `~ expansion in path-valued keys` reads the runner's `$HOME`,
+  feeds `font = ~/fonts/Hack.ttf` + `shell = ~/bin/myshell`,
+  asserts both come back as absolute paths.
+- `~user (no slash after ~) is NOT expanded` feeds
+  `shell = ~root/bin/sh`, asserts it round-trips verbatim.
+
+`zig build && zig build test` green.
