@@ -2867,3 +2867,54 @@ The tick itself still fires at frame rate but does almost nothing
 when nothing's dirty (~µs scale).
 
 `zig build && zig build test && zig build smoke-cell` all green.
+
+## perf: drain → render dispatch direct
+
+Follow-up to the auto_render fix. After auto_render=FALSE, the
+GL render runs on demand via queue_render. The tick callback was
+the dispatcher: it polled `screen.dirty` at frame rate and
+scheduled queue_render when set. That added up to a frame's
+worth of latency between "PTY output processed" and "pixels on
+screen" — small but noticeable on remote sessions or heavy
+output where every frame counts.
+
+### Direct dispatch
+
+`Terminal.on_render_request` callback fires from `mainDrain`
+once at the end of the batch when `screen.dirty` is set and
+DECSET 2026 sync mode is OFF. Pane wires it to a tiny shim that
+clears dirty and calls `gtk_gl_area_queue_render(self.area)`.
+
+Now the path is:
+```
+worker thread → ring push → schedule_drain
+  → main thread idle → mainDrain
+    → loop: ring.pop + screen.apply
+    → on_render_request → queue_render (this frame)
+```
+
+vs. before:
+```
+... → mainDrain (left dirty=true, no render scheduled)
+  → next frame tick (~16ms) → notice dirty → queue_render
+    → frame after that → render
+```
+
+### Tick still needed
+
+The tick callback isn't going away — it still drives:
+- Cursor blink (every 500 ms toggle)
+- Bell flash fade (200 ms decay)
+- Animation frame advance (kitty graphics)
+
+Those aren't drain-driven so they need a periodic check. The tick
+just no longer polls dirty for drain-driven renders.
+
+### Risks
+
+The tick still has the dirty branch (line ~908) as a fallback.
+If anything sets dirty without going through drain (e.g. mouse
+events that already queue_render directly), the tick clears
+dirty harmlessly. Belt-and-braces — no correctness change.
+
+Build + test + smoke green.
