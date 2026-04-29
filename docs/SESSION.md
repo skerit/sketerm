@@ -2725,3 +2725,22 @@ before formatting the tooltip:
 
 `zig build && zig build test` green; no render code touched so
 no smoke run needed.
+
+## sample.conf catch-up — document 8 missing keybinds
+
+Recent ticks shipped a stack of new actions but nobody added them
+to `data/sample.conf`. That file is the canonical reference users
+grep through to find action names. Closed the gap:
+
+- `scrollback_top` / `scrollback_bottom` (Ctrl+Shift+Home/End defaults)
+- `broadcast_cycle` (Ctrl+Shift+G default)
+- `restore_closed_tab` (Ctrl+Shift+Z default)
+- `duplicate_tab` (unbound, with split-tree-pipeline note)
+- `copy_selection` (unbound — distinct from interrupt_or_copy)
+- `copy_scrollback` (unbound, with soft-wrap note)
+- `clear_scrollback` (unbound, distinct from clear_and_scrollback)
+
+Each has the default accelerator inline (or empty for unbound)
+and a short comment for the ones whose semantics aren't obvious
+from the name alone. Pure docs change — no production code
+touched, build green for sanity.
