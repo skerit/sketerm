@@ -2153,6 +2153,39 @@ pub const Window = struct {
         };
     }
 
+    /// Copy the focused pane's visible screen to the system clipboard.
+    /// Same body as input.zig::copyScreen — duplicated here because
+    /// the menu sink hits the Window directly while runAction goes
+    /// through the per-pane Ctx. Both paths feed the same extractScreen.
+    pub fn copyFocusedScreen(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+        const screen = pane.terminal.screen;
+        const text = screen.extractScreen(self.allocator) catch return;
+        defer self.allocator.free(text);
+        if (text.len == 0) return;
+        const display = c.gtk_widget_get_display(self.app_window);
+        const clip = c.gdk_display_get_clipboard(display);
+        const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return;
+        defer self.allocator.free(cstr);
+        @memcpy(cstr, text);
+        c.gdk_clipboard_set_text(clip, cstr.ptr);
+    }
+
+    /// Copy the focused pane's scrollback ring + active screen.
+    pub fn copyFocusedScrollback(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+        const screen = pane.terminal.screen;
+        const text = screen.extractScrollback(self.allocator) catch return;
+        defer self.allocator.free(text);
+        if (text.len == 0) return;
+        const display = c.gtk_widget_get_display(self.app_window);
+        const clip = c.gdk_display_get_clipboard(display);
+        const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return;
+        defer self.allocator.free(cstr);
+        @memcpy(cstr, text);
+        c.gdk_clipboard_set_text(clip, cstr.ptr);
+    }
+
     /// Toggle the current tab's pinned state. Pinned tabs sit in a
     /// separate region at the start of the tab bar (AdwTabView
     /// native): close button is hidden, drag-reorder is restricted
@@ -2344,6 +2377,8 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
         .close_pane => self.closeFocusedPane(),
         .set_pane_title => self.setFocusedPaneTitle(),
+        .copy_screen => self.copyFocusedScreen(),
+        .copy_scrollback => self.copyFocusedScrollback(),
         .prefs_open => self.openPrefs(),
         else => {},
     }

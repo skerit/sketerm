@@ -8,6 +8,8 @@ const c = @import("../c.zig").c;
 
 pub const Action = enum {
     copy,
+    copy_screen,
+    copy_scrollback,
     paste,
     new_tab,
     new_tab_as_profile,
@@ -53,6 +55,8 @@ const Bind = struct {
 
 const BINDS = [_]Bind{
     .{ .name = "copy", .label = "Copy", .detailed = "term.copy", .action = .copy },
+    .{ .name = "copy-screen", .label = "Copy Screen", .detailed = "term.copy-screen", .action = .copy_screen },
+    .{ .name = "copy-scrollback", .label = "Copy Scrollback", .detailed = "term.copy-scrollback", .action = .copy_scrollback },
     .{ .name = "paste", .label = "Paste", .detailed = "term.paste", .action = .paste },
     .{ .name = "copy-link", .label = "Copy Link", .detailed = "term.copy-link", .action = .copy_link },
     .{ .name = "split-h", .label = "Split Horizontal", .detailed = "term.split-h", .action = .split_h },
@@ -90,6 +94,8 @@ pub fn attachWithPrePopup(
     const menu = c.g_menu_new();
     const sec1 = c.g_menu_new();
     c.g_menu_append(sec1, "Copy", "term.copy");
+    c.g_menu_append(sec1, "Copy Screen", "term.copy-screen");
+    c.g_menu_append(sec1, "Copy Scrollback", "term.copy-scrollback");
     c.g_menu_append(sec1, "Paste", "term.paste");
     c.g_menu_append(sec1, "Copy Link", "term.copy-link");
     c.g_menu_append_section(menu, null, @ptrCast(@alignCast(sec1)));
