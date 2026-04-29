@@ -2799,3 +2799,71 @@ table and a synthetic colliding-accel table.
 Plan-v3 had this listed as gating E but it shipped without the
 harness. Belt-and-braces now: regression coverage retroactively
 applied. Pure test addition; no production code touched.
+
+## CPU fix: kill 60 Hz idle GL pumping
+
+User report: "sketerm uses A LOT of CPU power, especially on
+laptop battery." Profiled the render path and found the culprit
+in pane.zig:156 — `gtk_gl_area_set_auto_render(area, 1)`.
+
+### What auto_render does
+
+Per GTK4 docs:
+> If auto_render is TRUE the GtkGLArea will automatically queue
+> a redraw at every refresh of the application's clock.
+
+That means: 60 Hz on a standard display, 120/144/240 Hz on
+high-refresh — full GL frames every clock tick regardless of
+whether anything changed. The render handler does serious work
+each call:
+
+```
+glViewport / glClearColor / glClear
+atlas.markFrame
+cell_pass.rebuildAndUpload    ← scans all dirty rows
+image_store.flushUploads
+image_pass.drawZ (below)
+cell_pass.draw
+grid_pass.buildVertices       ← rebuilds overlay vertex buf
+grid_pass.draw
+image_pass.drawZ (above)
+```
+
+For an idle terminal staring at a prompt, that was just thermal
+load — the GPU wakes, rasterizes, and the result is identical
+to the previous frame. On battery, the CPU spends ~milliseconds
+per frame in this path × 60 = 6-12% baseline CPU.
+
+### Fix
+
+Set `auto_render = 0` and convert every `gtk_widget_queue_draw`
+on the GLArea to `gtk_gl_area_queue_render`:
+
+- pane.zig: 11 sites bulk-replaced (selection, image arrival,
+  tick, mouse press/double-click/end, drag begin/end, motion,
+  scroll). The tick callback now only pumps a render when
+  `screen.dirty` actually flipped.
+- input.zig: 1 site (clear-on-copy).
+- window.zig: 3 sites that need GL repaint (prompt jump, dim
+  refresh, auto-theme color change). Three other window.zig
+  sites stay on `queue_draw(p.widget())` because they're CSS
+  / wrapper invalidations only (broadcast titlebar class).
+
+### Resize edge case
+
+`onResize` doesn't queue_render explicitly today — relied on
+auto_render's continuous pump. Without that, a window resize
+could leave the GLArea showing stale framebuffer contents from
+the old size until something else fired. Added an explicit
+`queue_render` at the end of onResize.
+
+### Expected impact
+
+Idle terminal: ~0% baseline CPU (was 6-12%). Active typing /
+animation / scrolling: same as before — the render handler runs
+when there's actual work, just no longer between events. Cursor
+blink still triggers via the tick callback at 500 ms intervals.
+The tick itself still fires at frame rate but does almost nothing
+when nothing's dirty (~µs scale).
+
+`zig build && zig build test && zig build smoke-cell` all green.
