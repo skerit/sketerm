@@ -152,3 +152,92 @@ test "round trip with split tree" {
         else => try std.testing.expect(false),
     }
 }
+
+test "round trip preserves PaneSpec.profile" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const real_path = try tmp_dir.dir.realpathAlloc(a, ".");
+    const file_path = try std.fmt.allocPrint(a, "{s}/profile.json", .{real_path});
+
+    const cmd = [_][]const u8{ "bash", "-l" };
+    var tabs = [_]TabSpec{
+        .{ .title = "dev", .tree = .{ .pane = .{
+            .cwd = "/tmp",
+            .command = &cmd,
+            .profile = "ssh-prod",
+        } } },
+    };
+    try save(.{ .tabs = &tabs }, file_path);
+
+    const parsed = try load(a, file_path);
+    defer parsed.deinit();
+    switch (parsed.value.tabs[0].tree) {
+        .pane => |p| try std.testing.expectEqualStrings("ssh-prod", p.profile),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "round trip preserves TabSpec.pinned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const real_path = try tmp_dir.dir.realpathAlloc(a, ".");
+    const file_path = try std.fmt.allocPrint(a, "{s}/pinned.json", .{real_path});
+
+    const cmd = [_][]const u8{"bash"};
+    var tabs = [_]TabSpec{
+        .{ .title = "pinned-tab", .tree = .{ .pane = .{
+            .cwd = "/",
+            .command = &cmd,
+        } }, .pinned = true },
+        .{ .title = "regular", .tree = .{ .pane = .{
+            .cwd = "/",
+            .command = &cmd,
+        } } }, // pinned defaults to false
+    };
+    try save(.{ .tabs = &tabs }, file_path);
+
+    const parsed = try load(a, file_path);
+    defer parsed.deinit();
+    try std.testing.expectEqual(true, parsed.value.tabs[0].pinned);
+    try std.testing.expectEqual(false, parsed.value.tabs[1].pinned);
+}
+
+test "load tolerates older JSON without profile / pinned fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const real_path = try tmp_dir.dir.realpathAlloc(a, ".");
+    const file_path = try std.fmt.allocPrint(a, "{s}/old.json", .{real_path});
+
+    // Hand-write a minimal v2 layout missing the new fields. Should
+    // still parse via ignore_unknown_fields semantics (strictly a
+    // missing-fields case here, the defaults fill in).
+    const old_json =
+        \\{ "version": 2, "tabs": [
+        \\  { "title": "t",
+        \\    "tree": { "pane": { "cwd": "/", "command": ["sh"] } } }
+        \\] }
+    ;
+    var f = try std.fs.cwd().createFile(file_path, .{});
+    try f.writeAll(old_json);
+    f.close();
+
+    const parsed = try load(a, file_path);
+    defer parsed.deinit();
+    try std.testing.expectEqual(false, parsed.value.tabs[0].pinned);
+    switch (parsed.value.tabs[0].tree) {
+        .pane => |p| try std.testing.expectEqualStrings("", p.profile),
+        else => try std.testing.expect(false),
+    }
+}
