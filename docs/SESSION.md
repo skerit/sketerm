@@ -3051,3 +3051,23 @@ First run: `total=30720 translucent=30541 fully_opaque=53` →
 each can fail / pass independently. build.zig wires the executable
 the same way (`sketerm-smoke-transparency`), running it via
 `addRunArtifact` under the new step.
+
+## perf: cached is_focused (drop GTK round-trip)
+
+Smaller perf polish. Both `onRender` and `onTick` called
+`gtk_widget_has_focus` once per invocation. The function is cheap
+but not free — looks up the widget's surface, walks the focus
+chain, returns. A few hundred ns per call × every render + tick.
+
+`Pane.is_focused` was already a tracked field, kept in sync by
+`onFocusEnter` (sets true) and `onFocusLeave` (sets false). Both
+handlers also queue_render, so the cache is authoritative for any
+frame that gets drawn.
+
+Two-line change replacing both call sites with `const focused =
+self.is_focused;`. Identical semantics, fewer GTK round-trips.
+
+`zig build && zig build test && zig build smoke-cell` all green.
+The smoke harness builds CellPass / GridPass directly (no Pane,
+no focus signal) and passes `focused = true` explicitly to
+`buildVertices`, so the smoke pixel counts are unaffected.
