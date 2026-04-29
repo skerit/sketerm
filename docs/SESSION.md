@@ -3165,3 +3165,27 @@ launch (matches gnome-terminal / xterm behaviour where bar
 visibility is purely runtime). If user demand surfaces a need,
 adding a `Config.tab_bar_visible: bool = true` is a small follow-
 up.
+
+## Config: show_tab_bar
+
+Follow-up from the toggle_tab_bar action — completes the
+"persist initial visibility" suggestion. Mirrors `show_titlebar`
+(per-pane title bar) for symmetry:
+
+- `Config.show_tab_bar: bool = true` — default true matches the
+  GTK widget default + previous behaviour.
+- `Config.serialize` writes `show_tab_bar = false` only when
+  non-default (keeps minimal config files terse).
+- `loadFromBytes` parses the key.
+- `Window.init` calls `gtk_widget_set_visible(self.tab_bar, 0)`
+  when config says false; `applyConfigChange` re-applies on
+  live edits so a prefs UI tweak takes effect without restart.
+
+The runtime `toggle_tab_bar` action still flips visibility purely
+in session state — config provides the default, toggle is a
+non-persisting one-off. Matches gnome-terminal / xterm convention
+where bar visibility resets to "shown" each launch unless the
+user changed the config.
+
+sample.conf documents the new key next to `show_titlebar`. Build
++ tests green.
