@@ -2561,3 +2561,56 @@ compat. Picked the smaller win (preserve splits) over the bigger
 refactor.
 
 `zig build && zig build test` green; no render code touched.
+
+## PaneSpec.profile — per-pane profile in layout
+
+Closes the loose end from the previous duplicate_tab tick.
+TabSpec/PaneSpec didn't carry the per-pane profile, so layout
+save/restore (`--restore`, default.json) AND duplicate_tab's
+split-tree path silently dropped per-pane profile assignments.
+
+### Schema bump
+
+`PaneSpec.profile: []const u8 = ""` joins the existing fields.
+Default empty so older layout JSON parses unchanged via the
+parser's `ignore_unknown_fields = true`. Empty value also
+shipping-clean: signals "no profile, use global config" without
+needing a special sentinel.
+
+### collectTree
+
+Reads `pane.active_profile` (already tracked since the original
+profiles MVP), dupes into the arena, writes to the new field.
+`""` when the pane never had a profile — keeps the JSON small
+for users who don't use profiles.
+
+### buildTreeWidget
+
+Two changes around the leaf path:
+
+1. **Resolve profile up-front** (before argv construction) so
+   `profile.shell` can override `command[0]`. Without this, a
+   pane originally spawned as profile.shell="ssh user@host" then
+   saved + restored would re-spawn the captured `$SHELL` instead
+   — which is what the user already moved AWAY from when they
+   picked the profile. Argv loop checks `i == 0 and profile.shell
+   non-empty` and substitutes.
+
+2. **Apply profile font / font_path overrides** after
+   `pane = makePane(term)`. Mirrors `spawnShellPaneOpts`'s
+   layered resolution: profile > spec > global. Doesn't replicate
+   the full spawnShellPaneOpts body (palette resolution, scheme
+   lookup, scrollback override) — those don't apply to layout
+   restore where the pane content is being recreated, not freshly
+   spawned. Picked the conservative subset; can extend if a user
+   reports a missing override.
+
+### Round-trip flow
+
+- Save: collectTree captures `pane.active_profile` → JSON.
+- Load (--restore / default.json / duplicate split): JSON parses
+  → buildTreeWidget looks up profile by name → applies overrides.
+- Older JSON without the field: parses as `profile = ""` → no
+  profile applied → behaves identically to pre-change.
+
+`zig build && zig build test` green throughout.
