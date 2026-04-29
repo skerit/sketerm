@@ -589,7 +589,7 @@ fn copySelection(ctx: *Ctx) void {
     if (ctx.clear_select_on_copy) {
         screen.selection.clear();
         screen.dirty = true;
-        c.gtk_widget_queue_draw(ctx.widget);
+        c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
     }
 }
 

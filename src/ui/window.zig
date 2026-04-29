@@ -1384,7 +1384,7 @@ pub const Window = struct {
             .prev => screen.jumpPrevPrompt(),
             .next => screen.jumpNextPrompt(),
         };
-        c.gtk_widget_queue_draw(pane.widget());
+        c.gtk_gl_area_queue_render(@ptrCast(pane.area));
     }
 
     fn focusedPane(self: *Window) ?*Pane {
@@ -1545,7 +1545,7 @@ pub const Window = struct {
             // Repaint.
             screen.dirty = true;
             p.cell_pass.markAllDirty();
-            c.gtk_widget_queue_draw(p.widget());
+            c.gtk_gl_area_queue_render(@ptrCast(p.area));
         }
 
         // Refresh CSS provider so any title_*_* color changes take
@@ -2410,7 +2410,7 @@ fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.
         p.terminal.screen.default_fg = fg_bg.fg;
         p.terminal.screen.default_bg = fg_bg.bg;
         p.terminal.screen.dirty = true;
-        c.gtk_widget_queue_draw(p.widget());
+        c.gtk_gl_area_queue_render(@ptrCast(p.area));
     }
 }
 

@@ -153,7 +153,15 @@ pub const Pane = struct {
 
         const area_widget = c.gtk_gl_area_new();
         c.gtk_gl_area_set_use_es(@ptrCast(area_widget), 1);
-        c.gtk_gl_area_set_auto_render(@ptrCast(area_widget), 1);
+        // auto_render=FALSE → GtkGLArea only invokes the render
+        // signal on demand (queue_draw / queue_render). With TRUE,
+        // GTK pumps a full GL frame at the display refresh rate
+        // (60 Hz on most setups, 120/144 on high-refresh) regardless
+        // of whether any cell changed — that's a hot CPU loop on
+        // battery for an idle terminal. We schedule explicit
+        // queue_draw via onTick + drain when content actually
+        // changes, so giving up auto-render costs nothing.
+        c.gtk_gl_area_set_auto_render(@ptrCast(area_widget), 0);
         c.gtk_widget_set_vexpand(area_widget, 1);
         c.gtk_widget_set_hexpand(area_widget, 1);
         c.gtk_widget_set_visible(area_widget, 1);
@@ -341,7 +349,7 @@ pub const Pane = struct {
                 if (self.clear_select_on_copy) {
                     self.terminal.screen.selection.clear();
                     self.terminal.screen.dirty = true;
-                    c.gtk_widget_queue_draw(@ptrCast(self.area));
+                    c.gtk_gl_area_queue_render(@ptrCast(self.area));
                 }
                 return true;
             },
@@ -603,7 +611,7 @@ pub const Pane = struct {
         }
 
         self.terminal.screen.dirty = true;
-        c.gtk_widget_queue_draw(@ptrCast(self.area));
+        c.gtk_gl_area_queue_render(@ptrCast(self.area));
     }
 };
 
@@ -762,7 +770,7 @@ fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
     // Force redraw to upload + display. Set dirty so onTick paints AND
     // queue_draw directly so we don't have to wait a frame.
     self.terminal.screen.dirty = true;
-    c.gtk_widget_queue_draw(@ptrCast(self.area));
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
 }
 
 fn onImageDeleteFullEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Screen.ImageDeleteEvent) void {
@@ -920,7 +928,7 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         };
 
         screen.dirty = false;
-        c.gtk_widget_queue_draw(area);
+        c.gtk_gl_area_queue_render(@ptrCast(area));
     }
     return 1; // G_SOURCE_CONTINUE
 }
@@ -1140,7 +1148,7 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
         if (self.terminal.screen.selection.isActive()) {
             self.terminal.screen.selection.clear();
             self.terminal.screen.dirty = true;
-            c.gtk_widget_queue_draw(@ptrCast(self.area));
+            c.gtk_gl_area_queue_render(@ptrCast(self.area));
         }
         return;
     }
@@ -1155,7 +1163,7 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
         if (self.terminal.screen.selection.isActive()) {
             self.terminal.screen.selection.clear();
             self.terminal.screen.dirty = true;
-            c.gtk_widget_queue_draw(@ptrCast(self.area));
+            c.gtk_gl_area_queue_render(@ptrCast(self.area));
         }
         return;
     }
@@ -1163,7 +1171,7 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
     const cell = self.cellAtLogical(x, y);
     const mode: @import("../grid/selection.zig").Mode = if (alt_held) .rectangular else .normal;
     self.terminal.screen.selection.start(cell.row, cell.col, mode);
-    c.gtk_widget_queue_draw(@ptrCast(self.area));
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
 }
 
 fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
@@ -1192,7 +1200,7 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
             if (self.terminal.screen.selection.isActive()) {
                 self.terminal.screen.selection.clear();
                 self.terminal.screen.dirty = true;
-                c.gtk_widget_queue_draw(@ptrCast(self.area));
+                c.gtk_gl_area_queue_render(@ptrCast(self.area));
             }
             return;
         }
@@ -1207,7 +1215,7 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
         // Push the new selection text to PRIMARY for middle-click
         // paste; also to SYSTEM clipboard if copy_on_selection is on.
         self.pushSelectionToClipboards();
-        c.gtk_widget_queue_draw(@ptrCast(self.area));
+        c.gtk_gl_area_queue_render(@ptrCast(self.area));
         return;
     }
 
@@ -1348,7 +1356,7 @@ fn onDragUpdate(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callc
     _ = c.gtk_gesture_drag_get_start_point(g, &sx, &sy);
     const cell = self.cellAtLogical(sx + dx, sy + dy);
     self.terminal.screen.selection.extend(cell.row, cell.col);
-    c.gtk_widget_queue_draw(@ptrCast(self.area));
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
 }
 
 fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
@@ -1474,7 +1482,7 @@ fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
         const dec: u32 = @intCast(-delta_lines);
         screen.view_offset = if (screen.view_offset >= dec) screen.view_offset - dec else 0;
     }
-    c.gtk_widget_queue_draw(@ptrCast(self.area));
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
     return 1;
 }
 
@@ -1499,4 +1507,8 @@ fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) cal
 
     self.terminal.screen.resize(cols, rows) catch return;
     self.terminal.pty.setSize(rows, cols);
+    // Resize reallocates the framebuffer; with auto_render off we
+    // must explicitly schedule a repaint or the user sees stale
+    // contents from the old size.
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
 }
