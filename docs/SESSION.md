@@ -3147,3 +3147,21 @@ paths automatically; manual UI-side dirty bits need explicit
 queue_render.
 
 `zig build && zig build test && zig build smoke-cell` all green.
+
+## toggle_tab_bar action
+
+Single-tab workflows have ~32 px of vertical space taken by the
+AdwTabBar that's just empty. Now bindable:
+
+- `Action.toggle_tab_bar` joins the input enum + name + label.
+- `Window.toggleTabBarVisibility()` reads `gtk_widget_get_visible`
+  on `self.tab_bar` and flips. AdwToolbarView already handles the
+  layout reflow when the bar disappears — content area grows.
+- Unbound by default; user binds via `keybind.toggle_tab_bar` if
+  they want it. Documented in sample.conf.
+
+No state to persist — bar visibility resets to "shown" on every
+launch (matches gnome-terminal / xterm behaviour where bar
+visibility is purely runtime). If user demand surfaces a need,
+adding a `Config.tab_bar_visible: bool = true` is a small follow-
+up.
