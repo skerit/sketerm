@@ -3097,3 +3097,53 @@ pane's GLArea. Drain → render direct already covers the
 "text arrived" path; this closes the search-only loop.
 
 `zig build && zig build test && zig build smoke-cell` all green.
+
+## Audit: queue_render after every screen.dirty
+
+Follow-up to the search-render fix. The tick-pause perf change
+(commit a79edb2) means panes with non-blinking cursor shapes
+(`cursor_blink = false` config) have no tick callback running.
+Any code path that sets `screen.dirty = true` without an explicit
+companion `queue_render` would silently fail to repaint.
+
+Audited every dirty-setter in input.zig, pane.zig, window.zig:
+
+### input.zig (8 sites fixed)
+
+- `onImCommit` clears preedit on IME commit.
+- `onImPreeditChanged` updates preedit text mid-composition.
+- `onKeyPressed` snap-to-bottom (any keystroke from a scrolled-back
+  view should jump back to live).
+- `runAction` for `scrollback_page_up`, `scrollback_page_down`,
+  `scrollback_top`, `scrollback_bottom` — all four scrollback-
+  jump actions adjust view_offset + dirty + were missing render.
+- `clear_select_on_copy` after copy — already had queue_render
+  (added in an earlier fix).
+
+### pane.zig (1 site fixed)
+
+- `onImageDeleteFullEvent` — kitty graphics deletion handler.
+  Previously relied on tick to consume dirty.
+
+### Sites NOT changed (correctly already covered)
+
+- onTick body's internal dirty=true (cursor blink, bell fade,
+  animation): the tick itself queue_renders at the end, so these
+  are consumed in the same iteration.
+- screen.zig internal apply()-path dirty=true: drain calls
+  on_render_request after the batch which queue_renders.
+- pane.zig mouse/drag/scroll handlers: already had queue_render
+  paired (most predate the tick-pause change).
+- window.zig sites: already audited / fixed in previous ticks
+  (search applyCurrentMatch, dim refresh, auto-theme color, etc.)
+
+### Pattern documentation
+
+Going forward: any new code that sets `screen.dirty = true` on
+a pane that may not be focused (or whose tick may be paused)
+must call `gtk_gl_area_queue_render(self.area)` immediately
+after. The drain → on_render_request hook covers PTY-output
+paths automatically; manual UI-side dirty bits need explicit
+queue_render.
+
+`zig build && zig build test && zig build smoke-cell` all green.
