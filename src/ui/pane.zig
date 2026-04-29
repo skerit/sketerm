@@ -116,6 +116,10 @@ pub const Pane = struct {
     /// True while mouse_autohide has set the pointer to "none". The
     /// motion handler restores the default cursor on any movement.
     cursor_hidden: bool = false,
+    /// True while the pointer is over a hyperlinked cell — cursor
+    /// is forced to the "pointer" shape (gnome-terminal / kitty
+    /// convention). Cleared when the pointer leaves the link.
+    cursor_over_link: bool = false,
 
     /// Per-pane title bar (Terminator-style). The wrapper Box owns
     /// the header + GLArea; `widget()` returns the wrapper when
@@ -1160,35 +1164,49 @@ fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
         }
     }
 
-    // Hyperlink hover tooltip — OSC 8 first, then auto-detected URL.
-    if (cell.row < 0 or cell.col < 0) return;
-    if (cell.row >= screen.rows or cell.col >= screen.cols) return;
-    const c_row: u16 = @intCast(cell.row);
-    const c_col: u16 = @intCast(cell.col);
-    const cell_data = screen.cellAt(c_row, c_col);
-    if (cell_data.flags & 0b0000_0100 != 0) {
-        if (screen.linkUri(cell_data.reserved)) |uri| {
-            var buf: [4096]u8 = undefined;
-            const n = @min(uri.len, buf.len - 1);
-            @memcpy(buf[0..n], uri[0..n]);
-            buf[n] = 0;
-            c.gtk_widget_set_tooltip_text(@ptrCast(self.area), &buf);
-            return;
+    // Hyperlink hover tooltip + pointer cursor — OSC 8 first, then
+    // auto-detected URL. Cursor flips to "pointer" while over a link
+    // and back to default on leave (gnome-terminal / kitty convention).
+    var over_link = false;
+    if (cell.row >= 0 and cell.col >= 0 and
+        cell.row < screen.rows and cell.col < screen.cols)
+    {
+        const c_row: u16 = @intCast(cell.row);
+        const c_col: u16 = @intCast(cell.col);
+        const cell_data = screen.cellAt(c_row, c_col);
+        if (cell_data.flags & 0b0000_0100 != 0) {
+            if (screen.linkUri(cell_data.reserved)) |uri| {
+                var buf: [4096]u8 = undefined;
+                const n = @min(uri.len, buf.len - 1);
+                @memcpy(buf[0..n], uri[0..n]);
+                buf[n] = 0;
+                c.gtk_widget_set_tooltip_text(@ptrCast(self.area), &buf);
+                over_link = true;
+            }
+        }
+        if (!over_link and self.grid_pass.enable_url_underline) {
+            if (screen.urlAtVisible(self.allocator, @intCast(c_row), @intCast(c_col)) catch null) |url| {
+                defer self.allocator.free(url);
+                const max = @min(url.len, 4095);
+                var buf: [4096]u8 = undefined;
+                @memcpy(buf[0..max], url[0..max]);
+                buf[max] = 0;
+                c.gtk_widget_set_tooltip_text(@ptrCast(self.area), &buf);
+                over_link = true;
+            }
         }
     }
-    // No OSC 8 — try the auto-URL detector if enabled.
-    if (self.grid_pass.enable_url_underline) {
-        if (screen.urlAtVisible(self.allocator, @intCast(c_row), @intCast(c_col)) catch null) |url| {
-            defer self.allocator.free(url);
-            const max = @min(url.len, 4095);
-            var buf: [4096]u8 = undefined;
-            @memcpy(buf[0..max], url[0..max]);
-            buf[max] = 0;
-            c.gtk_widget_set_tooltip_text(@ptrCast(self.area), &buf);
-            return;
-        }
+    if (!over_link) c.gtk_widget_set_tooltip_text(@ptrCast(self.area), null);
+
+    // Cursor shape flip — only on transitions, not every motion event,
+    // to avoid hammering gtk_widget_set_cursor with redundant calls.
+    if (over_link and !self.cursor_over_link) {
+        c.gtk_widget_set_cursor_from_name(@ptrCast(self.area), "pointer");
+        self.cursor_over_link = true;
+    } else if (!over_link and self.cursor_over_link) {
+        c.gtk_widget_set_cursor(@ptrCast(self.area), null);
+        self.cursor_over_link = false;
     }
-    c.gtk_widget_set_tooltip_text(@ptrCast(self.area), null);
 }
 
 fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
