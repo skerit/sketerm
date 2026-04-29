@@ -2918,3 +2918,62 @@ events that already queue_render directly), the tick clears
 dirty harmlessly. Belt-and-braces — no correctness change.
 
 Build + test + smoke green.
+
+## perf: tick self-removes when idle
+
+After auto_render=FALSE killed the GL pump and drain → render
+direct dispatch eliminated the tick from output latency, the
+tick callback itself was the last thing pumping at frame rate
+when nothing was happening. Per-pane cost was small (~µs/tick)
+but multiplied across multi-pane setups (8 panes × 60 Hz × N µs)
+it added up to a measurable battery hit on otherwise-idle
+sessions.
+
+### Pause/resume
+
+`Pane.tick_id: c_uint = 0` tracks the GTK tick callback id (0 =
+not registered). `Pane.ensureTickRunning()` is the idempotent
+installer — checks `tick_id`, registers via
+`gtk_widget_add_tick_callback`, stores the returned id.
+
+`onTick` at the end checks three flags:
+- `has_blink_work` — focused pane with a blinking-cursor shape
+- `has_bell_work` — `bell_at_us > 0` and within the 200 ms fade
+- `has_anim_work` — any kitty-graphics image with `frames >= 2`
+  and `playing = true`
+
+If all three are false, `tick_id = 0` + return G_SOURCE_REMOVE.
+The frame clock stops pumping for this widget. `gtk_widget_remove_tick_callback`
+isn't needed — the return value is the documented removal path.
+
+### Re-install triggers
+
+Three event handlers call `ensureTickRunning` to wake the tick
+when work appears:
+- `onFocusEnter` — a newly-focused pane needs the tick to drive
+  cursor blink. (Also added `queue_render` so the focus-border
+  swap is visible immediately, not next frame.)
+- `onBellEvent` — bell flash fades over 200 ms; tick pumps the
+  fade.
+- `onImageEvent` — newly-arrived kitty graphic might be animated;
+  tick advances frames.
+
+Drain → render is already direct (previous tick), so output
+events don't need to wake the tick; the GL render fires from
+`mainDrain` directly.
+
+### Cold-start
+
+`Pane.init` calls `ensureTickRunning` once so any early bell /
+animation event during the first tick can be picked up. The tick
+will self-remove on its first idle iteration.
+
+### Why focus-leave doesn't wake the tick
+
+Focus-leave sets `cursor_blink_on = true` + dirty + queues a
+render directly. No subsequent tick work is needed (cursor is
+static when unfocused), so the tick that may currently be
+running self-removes on its next iteration. Net win: unfocused
+panes have zero tick overhead.
+
+`zig build && zig build test && zig build smoke-cell` all green.
