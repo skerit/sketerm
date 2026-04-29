@@ -195,11 +195,18 @@ const FRAG_SRC =
     \\    if (v_is_glyph > 0.5) {
     \\        float a = texture(u_atlas, v_uvw).r;
     \\        if (v_bold > 0.5) {
-    \\            // Faux bold: sample one texel-step right and take
-    \\            // max alpha — visually thickens the glyph by one
-    \\            // pixel without needing a second FreeType face.
-    \\            // Atlas pages are 2048×2048 → 1/2048 per texel.
-    \\            float a2 = texture(u_atlas, v_uvw + vec3(1.0/2048.0, 0.0, 0.0)).r;
+    \\            // Faux bold: dilate by sampling one texel to the
+    \\            // LEFT in atlas space and taking max alpha. Each
+    \\            // fragment shows max(self, left_neighbor), so the
+    \\            // glyph's stroke extends one pixel to the RIGHT
+    \\            // — preserving the antialiased left bearing the
+    \\            // way real bold typefaces do. Sampling to the
+    \\            // right (the original direction) overwrote the
+    \\            // glyph's leftmost soft edge with a brighter
+    \\            // neighbor, reading as "missing pixel column on
+    \\            // the left." Atlas pages are 2048×2048 → 1/2048
+    \\            // per texel.
+    \\            float a2 = texture(u_atlas, v_uvw - vec3(1.0/2048.0, 0.0, 0.0)).r;
     \\            a = max(a, a2);
     \\        }
     \\        o_frag = vec4(v_color.rgb, a * v_color.a);

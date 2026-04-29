@@ -83,7 +83,10 @@ const FRAG_SRC =
     \\    if (v_is_glyph > 0.5) {
     \\        float a = texture(u_atlas, v_uv).r;
     \\        if (v_bold > 0.5) {
-    \\            float a2 = texture(u_atlas, v_uv + vec3(1.0/2048.0, 0.0, 0.0)).r;
+    \\            // See cell_pass.zig faux-bold comment — sample
+    \\            // LEFT (extends right) preserves the antialiased
+    \\            // left edge instead of overwriting it.
+    \\            float a2 = texture(u_atlas, v_uv - vec3(1.0/2048.0, 0.0, 0.0)).r;
     \\            a = max(a, a2);
     \\        }
     \\        o_frag = vec4(v_color.rgb, a * v_color.a);
