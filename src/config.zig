@@ -236,6 +236,10 @@ pub const Config = struct {
     /// the OSC 0/1/2 terminal title. Off by default — many users
     /// prefer minimal chrome.
     show_titlebar: bool = false,
+    /// Show the AdwTabBar at startup. On by default; users running
+    /// a single tab can set this to false (or rebind toggle_tab_bar)
+    /// to reclaim ~32 px of vertical space.
+    show_tab_bar: bool = true,
     /// Active pane title bar foreground / background. Default
     /// matches Terminator (red bg / white fg) so users coming from
     /// Terminator see the familiar "this pane has focus" cue.
@@ -430,6 +434,7 @@ pub const Config = struct {
 
         // Per-pane titlebar.
         if (self.show_titlebar) try w.writeAll("show_titlebar = true\n");
+        if (!self.show_tab_bar) try w.writeAll("show_tab_bar = false\n");
         const default_taf: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
         const default_tab: [4]f32 = .{ 200.0/255.0, 0.0/255.0, 3.0/255.0, 1.0 };
         const default_tif: [4]f32 = .{ 0.0, 0.0, 0.0, 1.0 };
@@ -731,6 +736,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.inactive_bg_dim = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "show_titlebar")) {
         cfg.show_titlebar = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "show_tab_bar")) {
+        cfg.show_tab_bar = try parseBool(value);
     } else if (std.mem.eql(u8, key, "title_active_fg")) {
         cfg.title_active_fg = try parseColor(value);
     } else if (std.mem.eql(u8, key, "title_active_bg")) {

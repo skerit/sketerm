@@ -173,6 +173,11 @@ pub const Window = struct {
             .search_label = search_label,
         };
 
+        // Honour Config.show_tab_bar at startup. Default true matches
+        // the GTK widget default; users can hide via config or the
+        // toggle_tab_bar action at runtime.
+        if (!self.config.show_tab_bar) c.gtk_widget_set_visible(self.tab_bar, 0);
+
         // Search wiring.
         _ = c.g_signal_connect_data(search_entry, "search-changed", @ptrCast(&onSearchChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(search_entry, "activate", @ptrCast(&onSearchActivate), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -1576,6 +1581,7 @@ pub const Window = struct {
         self.setAlwaysOnTop(self.config.always_on_top);
         self.refreshOpaqueRegion();
         self.refreshBindings();
+        c.gtk_widget_set_visible(self.tab_bar, if (self.config.show_tab_bar) 1 else 0);
 
         // Persist.
         self.persistConfig();
