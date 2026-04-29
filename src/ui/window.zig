@@ -94,6 +94,7 @@ pub const Window = struct {
 
         const app_window = c.adw_application_window_new(app);
         c.gtk_window_set_title(@ptrCast(app_window), "sketerm");
+        // refreshWindowTitle re-applies once groupsend / etc. settle.
         c.gtk_window_set_default_size(@ptrCast(app_window), 1000, 700);
 
         // Adw toolbar layout — gives us a header bar (= draggable
@@ -1666,6 +1667,29 @@ pub const Window = struct {
         for (self.panes.items) |p| {
             self.applyBroadcastCss(p);
             c.gtk_widget_queue_draw(p.widget());
+        }
+        self.refreshWindowTitle();
+    }
+
+    /// Set the GTK window title based on current state — currently
+    /// just appends a broadcast indicator when groupsend != off.
+    /// Visible regardless of `show_titlebar` (per-pane bars), so
+    /// users always have a cue that typing is being multiplexed.
+    fn refreshWindowTitle(self: *Window) void {
+        const suffix: ?[]const u8 = switch (self.groupsend) {
+            .off => null,
+            .group => " — broadcast: group",
+            .all => " — broadcast: all",
+        };
+        if (suffix) |s| {
+            const total = "sketerm".len + s.len;
+            const buf = self.allocator.allocSentinel(u8, total, 0) catch return;
+            defer self.allocator.free(buf);
+            @memcpy(buf[0.."sketerm".len], "sketerm");
+            @memcpy(buf["sketerm".len..total], s);
+            c.gtk_window_set_title(@ptrCast(self.app_window), buf.ptr);
+        } else {
+            c.gtk_window_set_title(@ptrCast(self.app_window), "sketerm");
         }
     }
 
