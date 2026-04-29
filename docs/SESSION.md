@@ -2638,3 +2638,23 @@ future serializer / parser change can't silently drop them.
 
 `zig build test` green; +89 LOC of pure test coverage. No
 production code touched.
+
+## scrollback_top / _bottom actions
+
+Small UX gap: existing `scrollback_page_up` / `_page_down` walked
+by screenfuls but there was no shortcut to jump straight to the
+oldest line in the buffer or back to the live position. Added
+two new actions matching gnome-terminal + kitty conventions:
+
+- **Ctrl+Shift+Home** → `scrollback_top` — set `view_offset =
+  scrollbackCount()` (max scroll back).
+- **Ctrl+Shift+End** → `scrollback_bottom` — set `view_offset =
+  0` (live screen).
+
+Both go through the existing per-pane runAction dispatch — no
+broadcast / window-level wiring needed because scrolling is a
+per-pane concern. `screen.dirty = true` triggers the next render.
+
+Help text in main.zig HELP_TEXT lists the new chord; user can
+rebind via `keybind.scrollback_top` / `keybind.scrollback_bottom`
+just like every other action.
