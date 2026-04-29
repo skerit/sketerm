@@ -2691,3 +2691,37 @@ visible content.
 
 Touched render-adjacent code (screen.zig), so `smoke-cell` ran
 and passed alongside `zig build && zig build test`.
+
+## Tab tooltip: $HOME → ~ abbreviation
+
+Small polish to the existing tab-tooltip cwd line (shipped a few
+ticks back). For users working under $HOME (which is almost
+everyone), the full path was repetitive:
+`/home/skerit/projects/sketerm` reads less cleanly than
+`~/projects/sketerm`, especially when several tabs share the same
+parent.
+
+### Implementation
+
+`onTermCwdChanged` now runs the cwd through a small abbreviator
+before formatting the tooltip:
+
+- Read `$HOME`. If unset or empty, fall through to raw cwd.
+- Check `cwd` starts with `home` AND that the next byte is
+  either end-of-string or `/`. The trailing-slash check matters
+  because otherwise `HOMEextra` (a sibling dir) would falsely
+  fold to `~extra`.
+- Compose `~` + `cwd[home.len..]` into a stack buffer. Only
+  taken when the result fits in 512 B; longer paths fall back
+  to raw cwd to keep this allocation-free.
+
+### Edge cases
+
+- Cwd outside HOME (`/tmp`, `/var/log`) — unchanged.
+- HOME unset — unchanged.
+- Cwd identical to HOME — `cwd[home.len..]` is empty, result is
+  just `"~"`. Correct.
+- HOME longer than cwd — `startsWith` fails, no abbreviation.
+
+`zig build && zig build test` green; no render code touched so
+no smoke run needed.
