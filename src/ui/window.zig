@@ -539,6 +539,13 @@ pub const Window = struct {
             .pane => |p| {
                 if (p.command.len == 0) return error.EmptyCommand;
 
+                // Resolve profile (if any) so we can honour profile.shell
+                // override before constructing argv.
+                const profile: ?*const @import("../config.zig").Profile = if (p.profile.len > 0)
+                    self.findProfile(p.profile)
+                else
+                    null;
+
                 var argv_buf = try self.allocator.alloc([*:0]const u8, p.command.len);
                 defer self.allocator.free(argv_buf);
                 var arg_owners: std.ArrayList([:0]u8) = .{};
@@ -547,9 +554,17 @@ pub const Window = struct {
                     arg_owners.deinit(self.allocator);
                 }
                 for (p.command, 0..) |cmd, i| {
-                    const z = try self.allocator.allocSentinel(u8, cmd.len, 0);
+                    // Profile.shell overrides command[0] if set, so
+                    // duplicating an "ssh" profile keeps using ssh
+                    // even after a layout round-trip captured the
+                    // current $SHELL.
+                    const eff_cmd: []const u8 = if (i == 0 and profile != null and profile.?.shell.len > 0)
+                        profile.?.shell
+                    else
+                        cmd;
+                    const z = try self.allocator.allocSentinel(u8, eff_cmd.len, 0);
                     try arg_owners.append(self.allocator, z);
-                    @memcpy(z, cmd);
+                    @memcpy(z, eff_cmd);
                     argv_buf[i] = z.ptr;
                 }
 
@@ -576,8 +591,17 @@ pub const Window = struct {
                 pane.win_on_child_exit = onTermChildExit;
                 pane.win_cwd_ctx = @ptrCast(self);
                 pane.win_on_cwd = onTermCwdChanged;
-                pane.font_size = p.font_size orelse self.config.font_size;
-                pane.font_path = self.config.font_path;
+                // Profile name on the pane so cycle/restore tracks it.
+                if (profile) |pr| pane.active_profile = pr.name;
+                // Effective font: profile > spec.font_size > global.
+                pane.font_size = if (profile) |pr|
+                    (if (pr.font_size != 0) pr.font_size else (p.font_size orelse self.config.font_size))
+                else
+                    (p.font_size orelse self.config.font_size);
+                pane.font_path = if (profile) |pr|
+                    (if (pr.font_path.len > 0) pr.font_path else self.config.font_path)
+                else
+                    self.config.font_path;
                 pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
                 pane.line_pad_px = self.config.line_pad_px;
                 pane.grid_pass.pad = self.config.padding;
@@ -2005,7 +2029,13 @@ pub const Window = struct {
                 // Save font_size only if it diverges from the global
                 // default — keeps layout files terse.
                 const fs: ?u16 = if (p.font_size != self.config.font_size) p.font_size else null;
-                return .{ .pane = .{ .cwd = cwd, .command = cmd, .font_size = fs } };
+                // Carry profile name so split-tree restore / duplicate
+                // can reapply per-pane profile overrides.
+                const prof: []const u8 = if (p.active_profile) |pn|
+                    try arena.dupe(u8, pn)
+                else
+                    "";
+                return .{ .pane = .{ .cwd = cwd, .command = cmd, .font_size = fs, .profile = prof } };
             }
         }
         return error.PaneNotFound;

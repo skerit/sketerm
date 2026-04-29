@@ -14,6 +14,10 @@ pub const PaneSpec = struct {
     /// Optional per-pane font override — set when the user has
     /// changed the font size for this pane via Ctrl+= / Ctrl+-.
     font_size: ?u16 = null,
+    /// Optional profile name to spawn this pane under. Empty = no
+    /// profile (use global Config). Default keeps older JSON files
+    /// parseable via `ignore_unknown_fields`.
+    profile: []const u8 = "",
 };
 
 pub const SplitSpec = struct {
