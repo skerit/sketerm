@@ -71,6 +71,7 @@ const HELP_TEXT =
     \\  Ctrl+0                Reset font size
     \\  Ctrl+,                Open Preferences (also: right-click menu)
     \\  Shift+PgUp / PgDn     Scroll back / forward by one screenful
+    \\  Ctrl+Shift+Home/End   Jump to scrollback top / live bottom
     \\
     \\Right-click for context menu (split / new tab / etc).
     \\Mouse wheel scrolls scrollback (10k lines default).

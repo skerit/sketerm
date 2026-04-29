@@ -98,6 +98,10 @@ pub const Action = enum {
     clear_and_scrollback,
     scrollback_page_up,
     scrollback_page_down,
+    /// Jump to the oldest scrollback line (top of buffer).
+    scrollback_top,
+    /// Jump to the live screen position (view_offset = 0).
+    scrollback_bottom,
 };
 
 /// One configured keybind: a (keyval, modifier-mask) → Action mapping.
@@ -145,6 +149,8 @@ pub const default_bindings = [_]Binding{
     // Shift+...
     .{ .keyval = c.GDK_KEY_Page_Up, .mods = c.GDK_SHIFT_MASK, .action = .scrollback_page_up },
     .{ .keyval = c.GDK_KEY_Page_Down, .mods = c.GDK_SHIFT_MASK, .action = .scrollback_page_down },
+    .{ .keyval = c.GDK_KEY_Home, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .scrollback_top },
+    .{ .keyval = c.GDK_KEY_End, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .scrollback_bottom },
 };
 
 /// Match a (keyval, modifier_state) against the binding table. Returns
@@ -202,6 +208,8 @@ pub fn actionName(a: Action) []const u8 {
         .clear_and_scrollback => "clear_and_scrollback",
         .scrollback_page_up => "scrollback_page_up",
         .scrollback_page_down => "scrollback_page_down",
+        .scrollback_top => "scrollback_top",
+        .scrollback_bottom => "scrollback_bottom",
     };
 }
 
@@ -247,6 +255,8 @@ pub fn actionLabel(a: Action) []const u8 {
         .clear_and_scrollback => "Clear screen + scrollback",
         .scrollback_page_up => "Scroll back one page",
         .scrollback_page_down => "Scroll forward one page",
+        .scrollback_top => "Jump to scrollback top",
+        .scrollback_bottom => "Jump to scrollback bottom",
     };
 }
 
@@ -530,6 +540,18 @@ fn runAction(ctx: *Ctx, action: Action) c.gboolean {
                 screen.view_offset - screen.rows
             else
                 0;
+            screen.dirty = true;
+            return 1;
+        },
+        .scrollback_top => {
+            const screen = ctx.terminal.screen;
+            screen.view_offset = @intCast(screen.scrollbackCount());
+            screen.dirty = true;
+            return 1;
+        },
+        .scrollback_bottom => {
+            const screen = ctx.terminal.screen;
+            screen.view_offset = 0;
             screen.dirty = true;
             return 1;
         },
