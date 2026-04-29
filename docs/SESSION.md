@@ -3012,3 +3012,42 @@ preserving the left bearing.
 
 Two-line shader change in cell_pass.zig + grid_pass.zig.
 `zig build && zig build test && zig build smoke-cell` all green.
+
+## smoke-transparency — retroactive gating coverage
+
+Plan-v3.md line 293 listed `smoke-transparency` as supposed-to-be-
+added before C (transparency) shipped. C shipped without it.
+Closing the gap now so future bg-alpha regressions get caught.
+
+### What it does
+
+`src/smoke_transparency.zig` mirrors smoke_cell's EGL surfaceless
+context + Atlas + CellPass + GridPass pipeline, with three
+differences:
+
+1. `screen.default_bg = (0.10, 0.10, 0.10, 0.5)` — alpha 0.5
+   instead of 1.0.
+2. `glClearColor(.., .., .., 0.5)` matches.
+3. `grid_pass.buildVertices(.., focused = false)` — skips the
+   focus-border quad which is fully opaque and would push corner
+   pixel alphas back up to 1.0 regardless of bg setting.
+
+### Assertions
+
+After render, the readback histograms the alpha channel:
+- `translucent` = pixels with `a < 200` (= ~78 %). Background
+  cells with bg alpha=0.5 land near a=128. **Must be ≥ 90 % of
+  total.** Threshold catches regressions where bg_a leaks to 1.0.
+- `fully_opaque` = pixels with `a >= 250`. Glyph fill interior
+  blends with `dst.a * (1 - src.a) = 0` for src.a=1, so opaque
+  text reads as a=255. **Must be ≥ 5** to confirm text rendered.
+
+First run: `total=30720 translucent=30541 fully_opaque=53` →
+99.4 % translucent + 53 opaque text fill = PASS.
+
+### Build target
+
+`zig build smoke-transparency` — separate from `smoke-cell` so
+each can fail / pass independently. build.zig wires the executable
+the same way (`sketerm-smoke-transparency`), running it via
+`addRunArtifact` under the new step.
