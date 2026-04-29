@@ -384,6 +384,9 @@ pub const Window = struct {
             pane.terminal.screen.selection.clear();
             pane.terminal.screen.search_active_idx = -1;
             pane.terminal.screen.dirty = true;
+            // Pane is unfocused (search bar has focus); explicit
+            // render needed to clear the previous highlight overlay.
+            c.gtk_gl_area_queue_render(@ptrCast(pane.area));
         }
     }
 
@@ -416,6 +419,12 @@ pub const Window = struct {
             screen.view_offset = 0;
         }
         screen.dirty = true;
+        // Search interactions happen with the search bar focused,
+        // not the pane — the pane's tick may be paused (no blink /
+        // bell / animation). Without an explicit queue_render the
+        // view-offset change wouldn't repaint until something else
+        // wakes the GLArea.
+        c.gtk_gl_area_queue_render(@ptrCast(pane.area));
         self.refreshSearchLabel();
     }
 
