@@ -181,6 +181,33 @@ pub fn build(b: *std.Build) void {
     const smoke_cell_step = b.step("smoke-cell", "Headless GL cell-pipeline render check");
     smoke_cell_step.dependOn(&smoke_cell_run.step);
 
+    // Headless transparency smoke — `zig build smoke-transparency`.
+    // Drives the same stack as smoke-cell but with bg alpha=0.5,
+    // asserts the readback FBO retains translucency. Plan-v3 had
+    // this gating C; added retroactively as regression coverage.
+    const smoke_trans_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_transparency.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const smoke_trans = b.addExecutable(.{
+        .name = "sketerm-smoke-transparency",
+        .root_module = smoke_trans_mod,
+        .use_lld = true,
+    });
+    smoke_trans.linkSystemLibrary("EGL");
+    for (sys_libs) |lib| smoke_trans.linkSystemLibrary(lib);
+    smoke_trans.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    smoke_trans.addIncludePath(b.path("vendor"));
+    b.installArtifact(smoke_trans);
+    const smoke_trans_run = b.addRunArtifact(smoke_trans);
+    const smoke_trans_step = b.step("smoke-transparency", "Headless GL bg-alpha render check");
+    smoke_trans_step.dependOn(&smoke_trans_run.step);
+
     const tests_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
