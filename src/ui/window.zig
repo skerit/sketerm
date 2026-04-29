@@ -2195,6 +2195,14 @@ pub const Window = struct {
         c.gdk_clipboard_set_text(clip, cstr.ptr);
     }
 
+    /// Show / hide the tab bar. Bound via keybind.toggle_tab_bar
+    /// (no default — common terminator-style binding is Ctrl+Shift+B
+    /// but we leave it user-configurable).
+    pub fn toggleTabBarVisibility(self: *Window) void {
+        const visible = c.gtk_widget_get_visible(self.tab_bar) != 0;
+        c.gtk_widget_set_visible(self.tab_bar, if (visible) 0 else 1);
+    }
+
     /// Toggle the current tab's pinned state. Pinned tabs sit in a
     /// separate region at the start of the tab bar (AdwTabView
     /// native): close button is hidden, drag-reorder is restricted
@@ -2276,6 +2284,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .broadcast_cycle => self.cycleGroupSend(),
         .restore_closed_tab => self.restoreLastClosed(),
         .toggle_pin_tab => self.togglePinCurrentTab(),
+        .toggle_tab_bar => self.toggleTabBarVisibility(),
         .duplicate_tab => self.duplicateCurrentTab(),
         else => {},
     }
