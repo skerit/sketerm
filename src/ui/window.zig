@@ -2209,6 +2209,17 @@ pub const Window = struct {
         c.gtk_widget_set_visible(self.tab_bar, if (visible) 0 else 1);
     }
 
+    /// Reload config.conf from disk and live-apply. Uses the XDG
+    /// search path (~/.config/sketerm/config.conf or
+    /// $XDG_CONFIG_HOME/sketerm/config.conf). Doesn't honour
+    /// `--config <path>` overrides — user passed a non-default
+    /// path on the command line would need to restart for that.
+    pub fn reloadConfigFromDisk(self: *Window) void {
+        const new_cfg = Config.load(self.allocator);
+        self.applyConfigChange(&new_cfg);
+        std.debug.print("sketerm: config reloaded\n", .{});
+    }
+
     /// Toggle the current tab's pinned state. Pinned tabs sit in a
     /// separate region at the start of the tab bar (AdwTabView
     /// native): close button is hidden, drag-reorder is restricted
@@ -2291,6 +2302,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .restore_closed_tab => self.restoreLastClosed(),
         .toggle_pin_tab => self.togglePinCurrentTab(),
         .toggle_tab_bar => self.toggleTabBarVisibility(),
+        .reload_config => self.reloadConfigFromDisk(),
         .duplicate_tab => self.duplicateCurrentTab(),
         else => {},
     }
