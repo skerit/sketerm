@@ -3284,3 +3284,34 @@ be improved by storing the OSC 22 state and restoring on leave —
 deferred unless a user reports the conflict.
 
 `zig build && zig build test` green. No render code touched.
+
+## reload_config action
+
+User can edit `config.conf` and apply changes without restarting.
+Useful while iterating on theme / palette / keybind tweaks —
+saves the restart-and-find-your-tabs-again cycle.
+
+### Implementation
+
+`Action.reload_config` joins the input enum + label + name.
+`Window.reloadConfigFromDisk()` calls `Config.load(allocator)`
+(uses XDG search path) and feeds the result through the existing
+`applyConfigChange` pipeline that the Preferences UI already
+uses for live edits — palette, font_size, ligatures, dim
+factors, scheme, all picked up immediately.
+
+### Limitations
+
+- Doesn't honour `--config <path>` overrides. Users who started
+  with a non-default config path would need to restart.
+- The `applyConfigChange` path doesn't reload existing pane
+  scrollback capacity (changing `scrollback = 50000` only takes
+  effect for newly-spawned panes). Same limitation as prefs UI.
+
+### Wiring
+
+Unbound by default — bind via `keybind.reload_config = <Control>F5`
+or whatever feels natural. Documented in sample.conf next to
+`toggle_tab_bar`.
+
+`zig build && zig build test` green.
