@@ -76,6 +76,9 @@ const HELP_TEXT =
     \\Right-click for context menu (split / new tab / etc).
     \\Mouse wheel scrolls scrollback (10k lines default).
     \\
+    \\Send SIGUSR1 to reload config without restart:
+    \\    kill -USR1 $(pidof sketerm)
+    \\
     \\Config: $XDG_CONFIG_HOME/sketerm/config.conf (or
     \\        ~/.config/sketerm/config.conf). See data/sample.conf.
     \\        Env vars below override values from the file.
@@ -186,6 +189,10 @@ pub fn main() u8 {
     _ = c.g_unix_signal_add(c.SIGTERM, onSignalQuit, @ptrCast(app));
     _ = c.g_unix_signal_add(c.SIGHUP, onSignalQuit, @ptrCast(app));
     _ = c.g_unix_signal_add(c.SIGINT, onSignalQuit, @ptrCast(app));
+    // SIGUSR1 → reload config — useful for `kill -USR1 $(pidof sketerm)`
+    // from a script after editing config.conf. Same effect as the
+    // reload_config keybind but from outside the app.
+    _ = c.g_unix_signal_add(c.SIGUSR1, onSignalReloadConfig, null);
 
     const status = c.g_application_run(@ptrCast(app), argc, c_argv);
     return @intCast(status & 0xff);
@@ -195,6 +202,13 @@ fn onSignalQuit(user: ?*anyopaque) callconv(.c) c.gboolean {
     const app: *c.GApplication = @ptrCast(@alignCast(user.?));
     c.g_application_quit(app);
     return 0; // remove source
+}
+
+fn onSignalReloadConfig(_: ?*anyopaque) callconv(.c) c.gboolean {
+    // g_unix_signal_add dispatches on the main thread; safe to
+    // reach into Window from here.
+    if (g_app.window) |win| win.reloadConfigFromDisk();
+    return 1; // keep source — reload should be re-armable
 }
 
 /// HANDLES_COMMAND_LINE handler. Fires both for the primary instance
