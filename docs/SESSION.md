@@ -3315,3 +3315,35 @@ or whatever feels natural. Documented in sample.conf next to
 `toggle_tab_bar`.
 
 `zig build && zig build test` green.
+
+## SIGUSR1 → reload config
+
+Companion to the `reload_config` keybind from the previous tick.
+`kill -USR1 $(pidof sketerm)` from any shell now re-reads
+`config.conf` and live-applies. Useful when:
+
+- Editing the config in another tab and don't want to switch
+  focus to sketerm.
+- Scripting theme changes from a window-manager hook (e.g.
+  toggle dark/light mode at sunset → write a different
+  `default_bg` → `kill -USR1`).
+- SSH'd into the box where sketerm is running headed and
+  pressing the keybind isn't an option.
+
+### Wiring
+
+`g_unix_signal_add(SIGUSR1, onSignalReloadConfig, null)` joins
+the existing SIGTERM/HUP/INT handlers in main.zig. Glib's signal
+shim dispatches on the main thread, so reaching into `g_app.window`
+from the handler is safe (Window methods aren't thread-safe in
+general). Returns G_SOURCE_CONTINUE so the source stays armed
+across multiple signals.
+
+### Help text
+
+main.zig HELP_TEXT gains a footer note pointing users at the
+`kill -USR1` invocation. Both the keybind and the signal route
+through `Window.reloadConfigFromDisk` — same applyConfigChange
+pipeline.
+
+`zig build && zig build test` green.
