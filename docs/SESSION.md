@@ -3347,3 +3347,33 @@ through `Window.reloadConfigFromDisk` — same applyConfigChange
 pipeline.
 
 `zig build && zig build test` green.
+
+## goto_tab_1..9 (Alt+1..9)
+
+Common multi-tab pattern across browsers, gnome-terminal, kitty,
+etc. Alt+digit jumps to the corresponding tab by 1-based index.
+Doesn't collide with shell C-x chords (which use Ctrl) or
+terminator's Ctrl+Shift+digit splits.
+
+### Wiring
+
+Nine actions `goto_tab_1` … `goto_tab_9` join the input enum +
+labels + names. Each maps to `Window.gotoTab(0..8)` at dispatch
+time so the action enum stays free of payloads (matches the
+existing per-action one-to-one keybinding pattern).
+
+`Window.gotoTab(index)` calls `adw_tab_view_get_nth_page` +
+`adw_tab_view_set_selected_page`. Out-of-range index (fewer tabs
+than the digit) is a clean no-op so Alt+9 with only 3 tabs open
+just doesn't do anything.
+
+### Why nine actions, not parameterized
+
+The keybind table is `(keyval, mods) → Action` with no payload.
+A parameterized action would need either a separate "args" field
+in `Binding` or a different dispatch shape. Nine enum entries
+are slightly verbose but mechanically simple — and the user-
+configurable upper bound is "Alt+9" anyway since digit keys are
+the natural binding. Tab-10+ users still cycle via Ctrl+Tab.
+
+main.zig HELP_TEXT lists the new chord.
