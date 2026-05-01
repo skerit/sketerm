@@ -2209,6 +2209,16 @@ pub const Window = struct {
         c.gtk_widget_set_visible(self.tab_bar, if (visible) 0 else 1);
     }
 
+    /// Jump to a specific tab by 0-based index. No-op if the index
+    /// is out of range (fewer tabs than requested).
+    pub fn gotoTab(self: *Window, index: c_int) void {
+        const n = c.adw_tab_view_get_n_pages(self.tab_view);
+        if (index < 0 or index >= n) return;
+        const page = c.adw_tab_view_get_nth_page(self.tab_view, index);
+        if (page == null) return;
+        c.adw_tab_view_set_selected_page(self.tab_view, page);
+    }
+
     /// Reload config.conf from disk and live-apply. Uses the XDG
     /// search path (~/.config/sketerm/config.conf or
     /// $XDG_CONFIG_HOME/sketerm/config.conf). Doesn't honour
@@ -2303,6 +2313,15 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .toggle_pin_tab => self.togglePinCurrentTab(),
         .toggle_tab_bar => self.toggleTabBarVisibility(),
         .reload_config => self.reloadConfigFromDisk(),
+        .goto_tab_1 => self.gotoTab(0),
+        .goto_tab_2 => self.gotoTab(1),
+        .goto_tab_3 => self.gotoTab(2),
+        .goto_tab_4 => self.gotoTab(3),
+        .goto_tab_5 => self.gotoTab(4),
+        .goto_tab_6 => self.gotoTab(5),
+        .goto_tab_7 => self.gotoTab(6),
+        .goto_tab_8 => self.gotoTab(7),
+        .goto_tab_9 => self.gotoTab(8),
         .duplicate_tab => self.duplicateCurrentTab(),
         else => {},
     }

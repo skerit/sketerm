@@ -46,6 +46,7 @@ const HELP_TEXT =
     \\  Ctrl+Shift+W          Close tab / pane
     \\  Ctrl+Tab              Next tab
     \\  Ctrl+Shift+Tab        Previous tab
+    \\  Alt+1 .. Alt+9        Jump to tab N
     \\  Ctrl+Shift+D          Split horizontal
     \\  Ctrl+Shift+R          Split vertical
     \\  Ctrl+Shift+C          Copy selection

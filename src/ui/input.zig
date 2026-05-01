@@ -87,6 +87,18 @@ pub const Action = enum {
     /// Honours XDG search path; --config override paths are not
     /// re-honoured (user would need to restart).
     reload_config,
+    /// Jump to a specific tab by 1-based index. Defaults: Alt+1
+    /// through Alt+9 — gnome-terminal / Firefox / most multi-tab
+    /// apps use this. Out-of-range index is a no-op.
+    goto_tab_1,
+    goto_tab_2,
+    goto_tab_3,
+    goto_tab_4,
+    goto_tab_5,
+    goto_tab_6,
+    goto_tab_7,
+    goto_tab_8,
+    goto_tab_9,
     /// Spawn a new tab inheriting the focused pane's cwd + profile.
     /// Subtly different from `new_tab` which uses the focused pane's
     /// cwd already but defaults the profile to none.
@@ -145,6 +157,18 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_z, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .restore_closed_tab },
     .{ .keyval = c.GDK_KEY_a, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_screen },
     .{ .keyval = c.GDK_KEY_p, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .toggle_pin_tab },
+    // Alt+1..9 → jump to specific tab. Standard across browsers,
+    // gnome-terminal, kitty, etc. Doesn't collide with shell C-x
+    // chords or Ctrl+Shift+digit (which terminator uses for splits).
+    .{ .keyval = c.GDK_KEY_1, .mods = c.GDK_ALT_MASK, .action = .goto_tab_1 },
+    .{ .keyval = c.GDK_KEY_2, .mods = c.GDK_ALT_MASK, .action = .goto_tab_2 },
+    .{ .keyval = c.GDK_KEY_3, .mods = c.GDK_ALT_MASK, .action = .goto_tab_3 },
+    .{ .keyval = c.GDK_KEY_4, .mods = c.GDK_ALT_MASK, .action = .goto_tab_4 },
+    .{ .keyval = c.GDK_KEY_5, .mods = c.GDK_ALT_MASK, .action = .goto_tab_5 },
+    .{ .keyval = c.GDK_KEY_6, .mods = c.GDK_ALT_MASK, .action = .goto_tab_6 },
+    .{ .keyval = c.GDK_KEY_7, .mods = c.GDK_ALT_MASK, .action = .goto_tab_7 },
+    .{ .keyval = c.GDK_KEY_8, .mods = c.GDK_ALT_MASK, .action = .goto_tab_8 },
+    .{ .keyval = c.GDK_KEY_9, .mods = c.GDK_ALT_MASK, .action = .goto_tab_9 },
     // Ctrl+...
     .{ .keyval = c.GDK_KEY_Tab, .mods = c.GDK_CONTROL_MASK, .action = .next_tab },
     .{ .keyval = c.GDK_KEY_minus, .mods = c.GDK_CONTROL_MASK, .action = .font_dec },
@@ -210,6 +234,15 @@ pub fn actionName(a: Action) []const u8 {
         .toggle_pin_tab => "toggle_pin_tab",
         .toggle_tab_bar => "toggle_tab_bar",
         .reload_config => "reload_config",
+        .goto_tab_1 => "goto_tab_1",
+        .goto_tab_2 => "goto_tab_2",
+        .goto_tab_3 => "goto_tab_3",
+        .goto_tab_4 => "goto_tab_4",
+        .goto_tab_5 => "goto_tab_5",
+        .goto_tab_6 => "goto_tab_6",
+        .goto_tab_7 => "goto_tab_7",
+        .goto_tab_8 => "goto_tab_8",
+        .goto_tab_9 => "goto_tab_9",
         .duplicate_tab => "duplicate_tab",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
@@ -260,6 +293,15 @@ pub fn actionLabel(a: Action) []const u8 {
         .toggle_pin_tab => "Pin / unpin current tab",
         .toggle_tab_bar => "Show / hide tab bar",
         .reload_config => "Reload config from disk",
+        .goto_tab_1 => "Jump to tab 1",
+        .goto_tab_2 => "Jump to tab 2",
+        .goto_tab_3 => "Jump to tab 3",
+        .goto_tab_4 => "Jump to tab 4",
+        .goto_tab_5 => "Jump to tab 5",
+        .goto_tab_6 => "Jump to tab 6",
+        .goto_tab_7 => "Jump to tab 7",
+        .goto_tab_8 => "Jump to tab 8",
+        .goto_tab_9 => "Jump to tab 9",
         .duplicate_tab => "Duplicate tab (cwd + profile)",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",
