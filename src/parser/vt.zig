@@ -54,6 +54,13 @@ pub const Parser = struct {
     /// can distinguish `4:3m` (curly underline) from `4;3m`.
     next_param_is_sub: bool = false,
     osc_buf: std.ArrayList(u8) = .{},
+    /// Set to true if any byte destined for `osc_buf` was dropped —
+    /// either because the `osc_max` cap was hit or because an append
+    /// failed with OOM. Cleared on entry to OSC/DCS/APC collection so
+    /// each sequence is judged independently. Dispatch sites read this
+    /// to know the payload is incomplete and surface a parse-error
+    /// rather than handing a corrupt body to the consumer.
+    osc_truncated: bool = false,
     dcs_proto: Event.Dcs = .{},
     allocator: std.mem.Allocator,
     /// VT52 mode (DECANM off via DECRST 2). When set, ESC <letter>
@@ -223,10 +230,17 @@ pub const Parser = struct {
         self.has_cur_param = false;
         self.next_param_is_sub = false;
         self.osc_buf.clearRetainingCapacity();
+        self.osc_truncated = false;
         self.transitionTo(.dcs_entry);
     }
 
     fn dispatchDcs(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {
+        if (self.osc_truncated) {
+            // FIXME: should emit a structured parse-error Event (e.g.
+            // .parse_error = .{ .kind = .dcs_truncated }) once Event
+            // gains such a variant in event.zig.
+            std.debug.print("sketerm: DCS payload truncated\n", .{});
+        }
         const body = self.allocator.dupe(u8, self.osc_buf.items) catch {
             return;
         };
@@ -235,11 +249,13 @@ pub const Parser = struct {
 
     fn enterOscString(self: *Parser) void {
         self.osc_buf.clearRetainingCapacity();
+        self.osc_truncated = false;
         self.transitionTo(.osc_string);
     }
 
     fn enterApcString(self: *Parser) void {
         self.osc_buf.clearRetainingCapacity();
+        self.osc_truncated = false;
         self.transitionTo(.apc_string);
     }
 
@@ -491,7 +507,13 @@ pub const Parser = struct {
                     self.dispatchDcs(emit, ctx);
                     self.transitionTo(.escape);
                 } else {
-                    if (self.osc_buf.items.len < osc_max) self.osc_buf.append(self.allocator, b) catch {};
+                    if (self.osc_buf.items.len < osc_max) {
+                        self.osc_buf.append(self.allocator, b) catch {
+                            self.osc_truncated = true;
+                        };
+                    } else {
+                        self.osc_truncated = true;
+                    }
                 }
             },
             .dcs_ignore => {
@@ -510,7 +532,15 @@ pub const Parser = struct {
                 self.dispatchOsc(emit, ctx);
                 self.transitionTo(.escape);
             },
-            else => if (self.osc_buf.items.len < osc_max) self.osc_buf.append(self.allocator, b) catch {},
+            else => {
+                if (self.osc_buf.items.len < osc_max) {
+                    self.osc_buf.append(self.allocator, b) catch {
+                        self.osc_truncated = true;
+                    };
+                } else {
+                    self.osc_truncated = true;
+                }
+            },
         }
     }
 
@@ -521,7 +551,15 @@ pub const Parser = struct {
                 self.dispatchApc(emit, ctx);
                 self.transitionTo(.escape);
             },
-            else => if (self.osc_buf.items.len < osc_max) self.osc_buf.append(self.allocator, b) catch {},
+            else => {
+                if (self.osc_buf.items.len < osc_max) {
+                    self.osc_buf.append(self.allocator, b) catch {
+                        self.osc_truncated = true;
+                    };
+                } else {
+                    self.osc_truncated = true;
+                }
+            },
         }
     }
 
@@ -535,6 +573,12 @@ pub const Parser = struct {
     }
 
     fn dispatchOsc(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {
+        if (self.osc_truncated) {
+            // FIXME: should emit a structured parse-error Event (e.g.
+            // .parse_error = .{ .kind = .osc_truncated }) once Event
+            // gains such a variant in event.zig.
+            std.debug.print("sketerm: OSC payload truncated\n", .{});
+        }
         const bytes = self.allocator.dupe(u8, self.osc_buf.items) catch {
             self.transitionTo(.ground);
             return;
@@ -544,6 +588,12 @@ pub const Parser = struct {
     }
 
     fn dispatchApc(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {
+        if (self.osc_truncated) {
+            // FIXME: should emit a structured parse-error Event (e.g.
+            // .parse_error = .{ .kind = .apc_truncated }) once Event
+            // gains such a variant in event.zig.
+            std.debug.print("sketerm: APC payload truncated\n", .{});
+        }
         const bytes = self.allocator.dupe(u8, self.osc_buf.items) catch {
             self.transitionTo(.ground);
             return;
@@ -639,7 +689,9 @@ const TestCollector = struct {
 
     fn emit(ctx: ?*anyopaque, ev: Event) void {
         const self: *TestCollector = @ptrCast(@alignCast(ctx.?));
-        self.events.append(self.allocator, ev) catch {};
+        self.events.append(self.allocator, ev) catch |err| {
+            std.debug.print("sketerm: TestCollector dropped event on append: {s}\n", .{@errorName(err)});
+        };
     }
 };
 
