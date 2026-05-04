@@ -338,17 +338,24 @@ pub const Atlas = struct {
         return self.cacheEmptyCp(codepoint);
     }
 
+    /// Best-effort negative caching: under allocation pressure we may
+    /// re-query fontconfig, but correctness is preserved.
+    fn markNoFallback(self: *Atlas, cp: u32) void {
+        _ = self.cp_to_fallback.put(cp, null) catch {};
+    }
+
     /// Locate (or lazily load) a fallback FT_Face that has `cp`. Caches
     /// both positive matches (face index) and negative results (null
-    /// in the map) so we never query fontconfig twice for the same
-    /// codepoint. Returns null when fontconfig has nothing.
+    /// in the map). Best-effort negative caching: under allocation
+    /// pressure we may re-query fontconfig, but correctness is
+    /// preserved. Returns null when fontconfig has nothing.
     fn findFallbackFace(self: *Atlas, cp: u32) ?c.FT_Face {
         if (self.cp_to_fallback.get(cp)) |entry| {
             if (entry) |idx| return self.fallback_faces.items[idx];
             return null;
         }
         if (!self.fc_initialized) {
-            _ = self.cp_to_fallback.put(cp, null) catch {};
+            self.markNoFallback(cp);
             return null;
         }
         // Quick scan: maybe an already-loaded fallback covers this cp.
@@ -363,12 +370,12 @@ pub const Atlas = struct {
         // primary face's cell grid; colour emoji (CBDT/COLR) would
         // need an RGBA atlas — skipped for v1.
         const pattern = c.FcPatternCreate() orelse {
-            _ = self.cp_to_fallback.put(cp, null) catch {};
+            self.markNoFallback(cp);
             return null;
         };
         defer c.FcPatternDestroy(pattern);
         const charset = c.FcCharSetCreate() orelse {
-            _ = self.cp_to_fallback.put(cp, null) catch {};
+            self.markNoFallback(cp);
             return null;
         };
         defer c.FcCharSetDestroy(charset);
@@ -380,26 +387,26 @@ pub const Atlas = struct {
 
         var result: c.FcResult = undefined;
         const match = c.FcFontMatch(null, pattern, &result) orelse {
-            _ = self.cp_to_fallback.put(cp, null) catch {};
+            self.markNoFallback(cp);
             return null;
         };
         defer c.FcPatternDestroy(match);
 
         var file_ptr: [*c]c.FcChar8 = undefined;
         if (c.FcPatternGetString(match, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch) {
-            _ = self.cp_to_fallback.put(cp, null) catch {};
+            self.markNoFallback(cp);
             return null;
         }
         const file_z: [*:0]const u8 = @ptrCast(file_ptr);
 
         var fb_face: c.FT_Face = undefined;
         if (c.FT_New_Face(self.ft_lib, file_z, 0, &fb_face) != 0) {
-            _ = self.cp_to_fallback.put(cp, null) catch {};
+            self.markNoFallback(cp);
             return null;
         }
         if (c.FT_Set_Pixel_Sizes(fb_face, 0, self.pixel_size) != 0) {
             _ = c.FT_Done_Face(fb_face);
-            _ = self.cp_to_fallback.put(cp, null) catch {};
+            self.markNoFallback(cp);
             return null;
         }
         const idx = self.fallback_faces.items.len;
@@ -407,6 +414,7 @@ pub const Atlas = struct {
             _ = c.FT_Done_Face(fb_face);
             return null;
         };
+        // Under OOM we'll re-scan but won't double-load (FT_Face is already in fallback_faces).
         _ = self.cp_to_fallback.put(cp, idx) catch {};
         return fb_face;
     }
