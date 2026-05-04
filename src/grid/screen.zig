@@ -897,7 +897,8 @@ pub const Screen = struct {
     /// Get a scrollback line by offset-from-top. 0 = oldest.
     pub fn scrollbackLine(self: *const Screen, idx: u32) *const Line {
         const len = self.scrollback.items.len;
-        if (len == 0) unreachable;
+        std.debug.assert(len > 0);
+        std.debug.assert(idx < len);
         return &self.scrollback.items[(self.scrollback_head + idx) % len];
     }
 
@@ -3028,7 +3029,7 @@ pub const Screen = struct {
         self.kitty_kbd_depth = 0;
         self.last_print_cp = 0;
         self.clearAllClusters();
-        self.resetTabStops() catch {};
+        self.resetTabStops() catch |e| std.debug.print("sketerm: resetTabStops failed: {s}\n", .{@errorName(e)});
         // Bring the parser back to ANSI mode if it's in VT52.
         if (self.sink.on_decanm) |f| f(self.sink.ctx, true);
     }
@@ -3413,7 +3414,7 @@ pub const Screen = struct {
                     if (self.allow_decolm) {
                         const new_cols: u16 = if (set) 132 else 80;
                         if (new_cols != self.cols) {
-                            self.resize(new_cols, self.rows) catch {};
+                            self.resize(new_cols, self.rows) catch return;
                         }
                         self.scroll_top = 0;
                         self.scroll_bot = if (self.rows > 0) self.rows - 1 else 0;
