@@ -10,6 +10,23 @@
 
 const std = @import("std");
 
+/// Single-line config-load warning to stderr. Centralised so the
+/// "sketerm: config: ..." prefix stays consistent across the parser.
+fn warnConfig(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print("sketerm: config: " ++ fmt ++ "\n", args);
+}
+
+/// Same as warnConfig but tags the source line number — used for
+/// per-line parse errors (`sketerm: config:NN: ...`). We pre-format
+/// the prefix so the user's `args` stays a separate tuple (Zig's
+/// `++` on tuples is comptime-only).
+fn warnConfigAt(lineno: usize, comptime fmt: []const u8, args: anytype) void {
+    var prefix_buf: [64]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "sketerm: config:{d}: ", .{lineno}) catch "sketerm: config: ";
+    std.debug.print("{s}", .{prefix});
+    std.debug.print(fmt ++ "\n", args);
+}
+
 pub const CursorShape = enum { block, underline, bar };
 
 /// What happens when a pane's shell exits. `close` removes the
@@ -284,14 +301,14 @@ pub const Config = struct {
                 if (file.read(&buf)) |n| {
                     cfg.arena = std.heap.ArenaAllocator.init(allocator);
                     parseInto(&cfg, buf[0..n]) catch {
-                        std.debug.print("sketerm: config parse error in {s}, using defaults\n", .{path});
+                        warnConfig("parse error in {s}, using defaults", .{path});
                         cfg.deinit();
                         cfg = Config{};
                     };
                 } else |_| {}
             } else |_| {
                 if (override_path != null) {
-                    std.debug.print("sketerm: --config path {s} not readable, using defaults\n", .{path});
+                    warnConfig("--config path {s} not readable, using defaults", .{path});
                 }
             }
         }
@@ -533,35 +550,35 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
             if (std.mem.startsWith(u8, inside, "profile.")) {
                 const name = inside["profile.".len..];
                 if (name.len == 0) {
-                    std.debug.print("sketerm: config:{d}: empty profile name\n", .{lineno});
+                    warnConfigAt(lineno, "empty profile name", .{});
                     current_profile = null;
                     continue;
                 }
                 current_profile = findOrCreateProfile(cfg, arena, name) catch {
-                    std.debug.print("sketerm: config:{d}: out of memory creating profile\n", .{lineno});
+                    warnConfigAt(lineno, "out of memory creating profile", .{});
                     current_profile = null;
                     continue;
                 };
                 continue;
             }
-            std.debug.print("sketerm: config:{d}: unknown section '{s}'\n", .{ lineno, inside });
+            warnConfigAt(lineno, "unknown section '{s}'", .{inside});
             current_profile = null;
             continue;
         }
 
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
-            std.debug.print("sketerm: config:{d}: expected key = value\n", .{lineno});
+            warnConfigAt(lineno, "expected key = value", .{});
             continue;
         };
         const key = trim(line[0..eq]);
         const value = trim(line[eq + 1 ..]);
         if (current_profile) |prof| {
             applyProfileKv(prof, arena, key, value) catch |err| {
-                std.debug.print("sketerm: config:{d}: profile '{s}': bad value for '{s}' ({s})\n", .{ lineno, prof.name, key, @errorName(err) });
+                warnConfigAt(lineno, "profile '{s}': bad value for '{s}' ({s})", .{ prof.name, key, @errorName(err) });
             };
         } else {
             applyKv(cfg, arena, key, value) catch |err| {
-                std.debug.print("sketerm: config:{d}: bad value for '{s}' ({s})\n", .{ lineno, key, @errorName(err) });
+                warnConfigAt(lineno, "bad value for '{s}' ({s})", .{ key, @errorName(err) });
             };
         }
     }
@@ -610,7 +627,7 @@ fn applyProfileKv(prof: *Profile, arena: std.mem.Allocator, key: []const u8, val
     } else if (std.mem.eql(u8, key, "login_shell")) {
         prof.login_shell = try parseBool(value);
     } else {
-        std.debug.print("sketerm: config: unknown profile key '{s}' (ignoring)\n", .{key});
+        warnConfig("unknown profile key '{s}' (ignoring)", .{key});
     }
 }
 
@@ -760,7 +777,7 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.title_inactive_bg = try parseColor(value);
     } else {
         // Unknown key — warn but don't abort.
-        std.debug.print("sketerm: config: unknown key '{s}' (ignoring)\n", .{key});
+        warnConfig("unknown key '{s}' (ignoring)", .{key});
     }
 }
 
