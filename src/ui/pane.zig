@@ -628,7 +628,9 @@ pub const Pane = struct {
         if (cw > 0 and ch > 0) {
             const cols: u16 = @intCast(@max(@as(i32, 1), @as(i32, @intFromFloat(@floor(inner_w / cw)))));
             const rows: u16 = @intCast(@max(@as(i32, 1), @as(i32, @intFromFloat(@floor(inner_h / ch)))));
-            _ = self.terminal.screen.resize(cols, rows) catch {};
+            self.terminal.screen.resize(cols, rows) catch |err| {
+                std.debug.print("sketerm: pane resize failed: {s}\n", .{@errorName(err)});
+            };
             self.terminal.pty.setSize(rows, cols);
         }
 
@@ -1039,25 +1041,46 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
                 }
                 if (any_non_ascii) {
                     const bidi = @import("../grid/bidi.zig");
-                    const cps = self.allocator.alloc(u32, cells.len) catch null;
-                    if (cps) |cps_buf| {
-                        defer self.allocator.free(cps_buf);
-                        const lvls = self.allocator.alloc(u8, cells.len) catch null;
-                        if (lvls) |lvls_buf| {
-                            defer self.allocator.free(lvls_buf);
-                            const idx = self.allocator.alloc(usize, cells.len) catch null;
-                            if (idx) |idx_buf| {
-                                defer self.allocator.free(idx_buf);
-                                for (cells, 0..) |rc, i| {
-                                    cps_buf[i] = if (rc.rune == 0) ' ' else rc.rune;
-                                    idx_buf[i] = i;
-                                }
-                                _ = bidi.lineLevels(cps_buf, lvls_buf, .auto);
-                                bidi.levelsToVisualOrder(lvls_buf, idx_buf);
-                                const v: usize = @intCast(cell.col);
-                                if (v < idx_buf.len) logical_col = idx_buf[v];
-                            }
+                    // One allocation, three views. Stack-buffer fast
+                    // path covers typical row widths (<~630 cols);
+                    // wider rows fall back to the heap.
+                    var stack_buf: [8192]u8 align(@alignOf(usize)) = undefined;
+                    const need_bytes =
+                        cells.len * @sizeOf(usize) +
+                        cells.len * @sizeOf(u32) +
+                        cells.len * @sizeOf(u8);
+                    var heap_buf: ?[]align(@alignOf(usize)) u8 = null;
+                    defer if (heap_buf) |hb| self.allocator.free(hb);
+                    var got_buf: bool = true;
+                    const buf: []align(@alignOf(usize)) u8 = if (need_bytes <= stack_buf.len)
+                        stack_buf[0..need_bytes]
+                    else blk: {
+                        const hb = self.allocator.alignedAlloc(u8, .of(usize), need_bytes) catch {
+                            got_buf = false;
+                            break :blk stack_buf[0..0];
+                        };
+                        heap_buf = hb;
+                        break :blk hb;
+                    };
+                    if (got_buf) {
+                        // Largest alignment first (usize), then u32,
+                        // then u8 — keeps each view properly aligned.
+                        var off: usize = 0;
+                        const idx_bytes: []align(@alignOf(usize)) u8 = @alignCast(buf[off .. off + cells.len * @sizeOf(usize)]);
+                        const idx_buf = std.mem.bytesAsSlice(usize, idx_bytes);
+                        off += cells.len * @sizeOf(usize);
+                        const cps_bytes: []align(@alignOf(u32)) u8 = @alignCast(buf[off .. off + cells.len * @sizeOf(u32)]);
+                        const cps_buf = std.mem.bytesAsSlice(u32, cps_bytes);
+                        off += cells.len * @sizeOf(u32);
+                        const lvls_buf = buf[off .. off + cells.len];
+                        for (cells, 0..) |rc, i| {
+                            cps_buf[i] = if (rc.rune == 0) ' ' else rc.rune;
+                            idx_buf[i] = i;
                         }
+                        _ = bidi.lineLevels(cps_buf, lvls_buf, .auto);
+                        bidi.levelsToVisualOrder(lvls_buf, idx_buf);
+                        const v: usize = @intCast(cell.col);
+                        if (v < idx_buf.len) logical_col = idx_buf[v];
                     }
                 }
             }
