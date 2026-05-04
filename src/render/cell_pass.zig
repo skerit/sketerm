@@ -728,16 +728,24 @@ pub const CellPass = struct {
             }
             if (!lig_eligible) continue;
 
-            // Build UTF-8 of the run.
+            // Build UTF-8 of the run. Programming-font ligatures are
+            // ASCII (==, !=, ->, …); on a non-ASCII codepoint we bail
+            // rather than pass garbage to HarfBuzz.
             var bytes: [256]u8 = undefined;
             var blen: usize = 0;
+            var lig_ascii_only = true;
             var k: u16 = 0;
             while (k < run_len) : (k += 1) {
                 const cp = cells[run_start + k].rune;
+                if (cp >= 0x80) {
+                    lig_ascii_only = false;
+                    break;
+                }
                 if (blen >= bytes.len) break;
                 bytes[blen] = @intCast(cp);
                 blen += 1;
             }
+            if (!lig_ascii_only) continue;
             if (blen == 0) continue;
 
             // Atlas owns the cached shape slice — do NOT free.
