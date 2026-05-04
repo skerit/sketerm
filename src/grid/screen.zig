@@ -465,9 +465,14 @@ pub const Screen = struct {
     /// that a base glyph exists at that cell.
     fn appendCluster(self: *Screen, row: u16, col: u16, cp: u32) void {
         const key = cellKey(row, col);
-        const gop = self.clusters.getOrPut(key) catch return;
+        const gop = self.clusters.getOrPut(key) catch |err| {
+            std.debug.print("sketerm: appendCluster getOrPut OOM: {s}\n", .{@errorName(err)});
+            return;
+        };
         if (!gop.found_existing) gop.value_ptr.* = .{};
-        gop.value_ptr.append(self.allocator, cp) catch {};
+        gop.value_ptr.append(self.allocator, cp) catch |err| {
+            std.debug.print("sketerm: appendCluster append OOM: {s}\n", .{@errorName(err)});
+        };
     }
 
     /// Look up the cluster (if any) at (row, col). Returns slice of
@@ -3524,6 +3529,18 @@ pub const Screen = struct {
 
     // ── SGR ──────────────────────────────────────────────────────
 
+    /// Read three consecutive params starting at `start` as a 0-255-clamped
+    /// RGB triple. Returns null if the params slice doesn't have enough
+    /// entries (i.e. `start + 2 >= n_params`).
+    fn sgrReadRgb(params: *const Event.Csi, start: usize) ?struct { r: u8, g: u8, b: u8 } {
+        if (start + 2 >= params.n_params) return null;
+        return .{
+            .r = @intCast(@min(params.params[start], 255)),
+            .g = @intCast(@min(params.params[start + 1], 255)),
+            .b = @intCast(@min(params.params[start + 2], 255)),
+        };
+    }
+
     fn sgr(self: *Screen, params: Event.Csi) void {
         var entry = self.pool.get(self.cur_style);
         var i: usize = 0;
@@ -3579,11 +3596,9 @@ pub const Screen = struct {
                         entry.fg = .{ .palette = @intCast(@min(params.params[i + 2], 255)) };
                         i += 2;
                     } else if (i + 4 < params.n_params and params.params[i + 1] == 2) {
-                        entry.fg = .{ .rgb = .{
-                            .r = @intCast(@min(params.params[i + 2], 255)),
-                            .g = @intCast(@min(params.params[i + 3], 255)),
-                            .b = @intCast(@min(params.params[i + 4], 255)),
-                        } };
+                        if (sgrReadRgb(&params, i + 2)) |rgb| {
+                            entry.fg = .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } };
+                        }
                         i += 4;
                     }
                 },
@@ -3594,11 +3609,9 @@ pub const Screen = struct {
                         entry.bg = .{ .palette = @intCast(@min(params.params[i + 2], 255)) };
                         i += 2;
                     } else if (i + 4 < params.n_params and params.params[i + 1] == 2) {
-                        entry.bg = .{ .rgb = .{
-                            .r = @intCast(@min(params.params[i + 2], 255)),
-                            .g = @intCast(@min(params.params[i + 3], 255)),
-                            .b = @intCast(@min(params.params[i + 4], 255)),
-                        } };
+                        if (sgrReadRgb(&params, i + 2)) |rgb| {
+                            entry.bg = .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } };
+                        }
                         i += 4;
                     }
                 },
