@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const cast = @import("../util/cast.zig");
 const Terminal = @import("../terminal.zig").Terminal;
 const clipboard = @import("clipboard.zig");
 
@@ -407,7 +408,7 @@ fn onKeyReleased(
     state: c.GdkModifierType,
     user: ?*anyopaque,
 ) callconv(.c) void {
-    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Ctx, user);
     // Clear the repeat-detection memory so the next press is treated
     // as fresh (event=1). We track this regardless of whether kitty
     // reports are enabled so a later toggle gets clean state.
@@ -443,7 +444,7 @@ fn onKeyReleased(
 }
 
 fn onImCommit(_: *c.GtkIMContext, text: [*:0]const u8, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Ctx, user);
     const len = std.mem.len(text);
     if (len > 0) ctx.terminal.writeUserInput(text[0..len]);
     // Clear any preedit on commit.
@@ -457,7 +458,7 @@ fn onImCommit(_: *c.GtkIMContext, text: [*:0]const u8, user: ?*anyopaque) callco
 }
 
 fn onImPreeditChanged(im: *c.GtkIMContext, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Ctx, user);
     var str: [*c]u8 = null;
     var attrs: ?*c.PangoAttrList = null;
     var cur: c_int = 0;
@@ -485,7 +486,7 @@ fn onKeyPressed(
     state: c.GdkModifierType,
     user: ?*anyopaque,
 ) callconv(.c) c.gboolean {
-    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Ctx, user);
 
     // mouse_autohide: hide the pointer over the widget while typing.
     // The Pane's onMotion handler clears it again on next pointer

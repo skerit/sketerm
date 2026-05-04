@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const cast = @import("../util/cast.zig");
 const Atlas = @import("../render/atlas.zig").Atlas;
 const GridPass = @import("../render/grid_pass.zig").GridPass;
 const CellPass = @import("../render/cell_pass.zig").CellPass;
@@ -386,7 +387,7 @@ pub const Pane = struct {
     /// Wired into input.zig's autohide_set. Lets onKeyPressed flip
     /// Pane.cursor_hidden without input.zig importing pane.zig.
     fn setCursorHiddenSink(ctx: ?*anyopaque, hidden: bool) void {
-        const self: *Pane = @ptrCast(@alignCast(ctx.?));
+        const self = cast.userData(Pane, ctx);
         self.cursor_hidden = hidden;
     }
 
@@ -640,7 +641,7 @@ pub const Pane = struct {
 };
 
 fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     c.gtk_gl_area_make_current(area);
     if (c.gtk_gl_area_get_error(area) != null) {
         const err = c.gtk_gl_area_get_error(area);
@@ -723,7 +724,7 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     const atlas = self.atlas orelse return @intFromBool(false);
 
     const w = c.gtk_widget_get_width(@ptrCast(area));
@@ -776,7 +777,7 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
 }
 
 fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
-    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Pane, ctx);
     self.image_store.addFull(.{
         .rgba = img.rgba,
         .width = img.width,
@@ -803,7 +804,7 @@ fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
 }
 
 fn onImageDeleteFullEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Screen.ImageDeleteEvent) void {
-    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Pane, ctx);
     // Kitty `d=` semantics. Lowercase leaves data on disk, uppercase
     // also frees it. We don't distinguish on free behaviour — every
     // delete tears down the GL texture on the next flush.
@@ -833,13 +834,13 @@ fn onImageDeleteFullEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Sc
 }
 
 fn onTitleEvent(ctx: ?*anyopaque, title: []const u8) void {
-    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Pane, ctx);
     self.setTitle(title);
     if (self.win_on_title) |f| f(self.win_title_ctx, title);
 }
 
 fn onCwdEvent(ctx: ?*anyopaque, cwd: []const u8) void {
-    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Pane, ctx);
     if (self.win_on_cwd) |f| f(self.win_cwd_ctx, self, cwd);
 }
 
@@ -848,23 +849,23 @@ fn onCwdEvent(ctx: ?*anyopaque, cwd: []const u8) void {
 /// notice. Also clears the dirty flag so the tick path doesn't
 /// queue a redundant render this frame.
 fn onRenderRequest(ctx: ?*anyopaque) void {
-    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Pane, ctx);
     self.terminal.screen.dirty = false;
     c.gtk_gl_area_queue_render(@ptrCast(self.area));
 }
 
 fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {
-    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Pane, ctx);
     if (self.win_on_clipboard) |f| f(self.win_clip_ctx, text);
 }
 
 fn onNotificationEvent(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {
-    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Pane, ctx);
     if (self.win_on_notification) |f| f(self.win_notify_ctx, title, body);
 }
 
 fn onBellEvent(ctx: ?*anyopaque) void {
-    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Pane, ctx);
     if (self.win_on_bell) |f| f(self.win_bell_ctx, self);
     // Visual bell flash fades over 200ms — tick must be alive to
     // drive the fade. Idle path may have stopped it.
@@ -876,7 +877,7 @@ fn onBellEvent(ctx: ?*anyopaque) void {
 /// Empty name → restore default. Names are X cursor identifiers like
 /// "default", "hand2", "watch", "crosshair", "text".
 fn onPointerShapeEvent(ctx: ?*anyopaque, name: []const u8) void {
-    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Pane, ctx);
     if (name.len == 0) {
         c.gtk_widget_set_cursor(@ptrCast(self.area), null);
         return;
@@ -890,7 +891,7 @@ fn onPointerShapeEvent(ctx: ?*anyopaque, name: []const u8) void {
 }
 
 fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     const screen = self.terminal.screen;
 
     // PTY child exited — fire the once-per-exit callback so Window
@@ -1000,7 +1001,7 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
 }
 
 fn paneMenuSink(ctx: ?*anyopaque, action: menu.Action) void {
-    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Pane, ctx);
     if (self.handleMenuLocal(action)) return;
     if (self.menu_sink) |f| f(self.menu_sink_ctx, action);
 }
@@ -1009,7 +1010,7 @@ fn paneMenuSink(ctx: ?*anyopaque, action: menu.Action) void {
 /// inspect the cell under the click for an OSC 8 link, and toggle
 /// the `term.copy-link` action's enabled state accordingly.
 fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f64) void {
-    const self: *Pane = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Pane, ctx);
     const screen = self.terminal.screen;
 
     // Free any URI captured from a previous popup.
@@ -1107,12 +1108,12 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
 /// so the running shell receives keystrokes — without this, clicking
 /// the bar would just trap focus on the (un-focusable) Box.
 fn onTitlebarClicked(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
 }
 
 fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     if (self.terminal.screen.focus_reports) {
         _ = self.terminal.pty.writeAll("\x1b[I");
     }
@@ -1131,7 +1132,7 @@ fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
 }
 
 fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     if (self.terminal.screen.focus_reports) {
         _ = self.terminal.pty.writeAll("\x1b[O");
     }
@@ -1146,7 +1147,7 @@ fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
 }
 
 fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
 
     // Restore the cursor if mouse_autohide hid it on the last keystroke.
     if (self.cursor_hidden) {
@@ -1233,7 +1234,7 @@ fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
 }
 
 fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     // Always grab focus on click.
     _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
 
@@ -1280,7 +1281,7 @@ fn onDragBegin(g: *c.GtkGestureDrag, x: f64, y: f64, user: ?*anyopaque) callconv
 }
 
 fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     const button = c.gtk_gesture_single_get_current_button(@ptrCast(g));
 
     // Middle-click PRIMARY paste when the running app isn't asking
@@ -1332,7 +1333,7 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
 }
 
 fn onMouseReleased(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     if (self.terminal.screen.mouse_mode == 0) return;
     if (shiftHeld(@ptrCast(g))) return;
     emitMouseSeq(self, g, x, y, false);
@@ -1455,7 +1456,7 @@ fn encodeUtf8Cp(out: []u8, cp: u32) usize {
 }
 
 fn onDragUpdate(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     var sx: f64 = 0;
     var sy: f64 = 0;
     _ = c.gtk_gesture_drag_get_start_point(g, &sx, &sy);
@@ -1465,7 +1466,7 @@ fn onDragUpdate(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callc
 }
 
 fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) void {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
 
     // Tiny drags = a click. If Ctrl was held and the click landed on
     // a hyperlinked cell, launch its URI.
@@ -1523,7 +1524,7 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
 }
 
 fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     const screen = self.terminal.screen;
 
     // Ctrl+wheel = font-size zoom (Terminator/gnome-terminal/iTerm
@@ -1592,7 +1593,7 @@ fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
 }
 
 fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
-    const self: *Pane = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Pane, user);
     const atlas = self.atlas orelse return;
     if (atlas.cell_w == 0 or atlas.cell_h == 0) return;
     // Subtract pane padding (top+bottom, left+right) before computing

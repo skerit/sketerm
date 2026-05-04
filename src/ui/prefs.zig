@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const cast = @import("../util/cast.zig");
 const Config = @import("../config.zig").Config;
 const CursorShape = @import("../config.zig").CursorShape;
 const ExitAction = @import("../config.zig").ExitAction;
@@ -88,7 +89,7 @@ pub fn open(
 }
 
 fn onClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Ctx, user);
     ctx.arena.deinit();
     ctx.allocator.destroy(ctx);
 }
@@ -202,7 +203,7 @@ fn addSpinRowU16(
 }
 
 fn spinU16Changed(spin: *c.AdwSpinRow, user: ?*anyopaque) callconv(.c) void {
-    const sctx: *SpinU16Ctx = @ptrCast(@alignCast(user.?));
+    const sctx = cast.userData(SpinU16Ctx, user);
     const v = c.adw_spin_row_get_value(spin);
     sctx.field.* = @intFromFloat(@max(0.0, v));
     sctx.on_change(sctx.parent);
@@ -229,7 +230,7 @@ fn addSpinRowU32(
 }
 
 fn spinU32Changed(spin: *c.AdwSpinRow, user: ?*anyopaque) callconv(.c) void {
-    const sctx: *SpinU32Ctx = @ptrCast(@alignCast(user.?));
+    const sctx = cast.userData(SpinU32Ctx, user);
     const v = c.adw_spin_row_get_value(spin);
     sctx.field.* = @intFromFloat(@max(0.0, v));
     sctx.on_change(sctx.parent);
@@ -256,7 +257,7 @@ fn addSpinRowI16(
 }
 
 fn spinI16Changed(spin: *c.AdwSpinRow, user: ?*anyopaque) callconv(.c) void {
-    const sctx: *SpinI16Ctx = @ptrCast(@alignCast(user.?));
+    const sctx = cast.userData(SpinI16Ctx, user);
     const v = c.adw_spin_row_get_value(spin);
     sctx.field.* = @intFromFloat(v);
     sctx.on_change(sctx.parent);
@@ -298,7 +299,7 @@ fn addSpinRowF32Step(
 }
 
 fn spinF32Changed(spin: *c.AdwSpinRow, user: ?*anyopaque) callconv(.c) void {
-    const sctx: *SpinF32Ctx = @ptrCast(@alignCast(user.?));
+    const sctx = cast.userData(SpinF32Ctx, user);
     const v: f32 = @floatCast(c.adw_spin_row_get_value(spin));
     sctx.field.* = v;
     sctx.on_change(sctx.parent);
@@ -323,7 +324,7 @@ fn addSwitchRow(
 }
 
 fn switchChanged(row: *c.AdwSwitchRow, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-    const sctx: *SwitchCtx = @ptrCast(@alignCast(user.?));
+    const sctx = cast.userData(SwitchCtx, user);
     sctx.field.* = c.adw_switch_row_get_active(row) != 0;
     sctx.on_change(sctx.parent);
 }
@@ -349,7 +350,7 @@ fn addCursorShapeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
 }
 
 fn comboChanged(row: *c.AdwComboRow, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-    const cctx: *ComboCtx = @ptrCast(@alignCast(user.?));
+    const cctx = cast.userData(ComboCtx, user);
     cctx.on_change(cctx.parent, c.adw_combo_row_get_selected(row));
 }
 
@@ -384,7 +385,7 @@ fn addFontPathRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
 }
 
 fn onChooseFont(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Ctx, user);
     const dialog = c.gtk_file_dialog_new();
     c.gtk_file_dialog_set_title(dialog, "Select font file (.ttf / .otf)");
     const root = c.gtk_widget_get_root(@ptrCast(btn));
@@ -392,7 +393,7 @@ fn onChooseFont(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onChooseFontDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Ctx, user);
     const file = c.gtk_file_dialog_open_finish(@ptrCast(@alignCast(source)), result, null) orelse return;
     defer c.g_object_unref(@ptrCast(@alignCast(file)));
     const path_z = c.g_file_get_path(file) orelse return;
@@ -487,7 +488,7 @@ fn addColorRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*:0]const u8, f
 }
 
 fn colorRowChanged(btn: *c.GtkColorDialogButton, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-    const cctx: *ColorRowCtx = @ptrCast(@alignCast(user.?));
+    const cctx = cast.userData(ColorRowCtx, user);
     const rgba = c.gtk_color_dialog_button_get_rgba(btn);
     cctx.field.* = .{ rgba.*.red, rgba.*.green, rgba.*.blue, rgba.*.alpha };
     cctx.parent.ev();
@@ -523,7 +524,7 @@ fn addPaletteRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, idx: usize) void {
 }
 
 fn paletteRowChanged(btn: *c.GtkColorDialogButton, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-    const pctx: *PaletteRowCtx = @ptrCast(@alignCast(user.?));
+    const pctx = cast.userData(PaletteRowCtx, user);
     const rgba = c.gtk_color_dialog_button_get_rgba(btn);
     // Promote palette to override mode if needed (copying from
     // current effective palette).
@@ -683,7 +684,7 @@ fn addEntryRowString(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*:0]const
 }
 
 fn entryStringChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
-    const sctx: *StringFieldCtx = @ptrCast(@alignCast(user.?));
+    const sctx = cast.userData(StringFieldCtx, user);
     const txt = c.gtk_editable_get_text(row);
     if (txt == null) return;
     const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
@@ -711,7 +712,7 @@ fn addShellPathRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
 }
 
 fn shellEntryChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Ctx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Ctx, user);
     const txt = c.gtk_editable_get_text(row);
     if (txt == null) return;
     const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
@@ -974,7 +975,7 @@ fn setButtonLabel(button: *c.GtkButton, text: []const u8) void {
 }
 
 fn onKeybindClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const rctx: *KeybindRowCtx = @ptrCast(@alignCast(user.?));
+    const rctx = cast.userData(KeybindRowCtx, user);
     if (rctx.capturing) return;
     rctx.capturing = true;
     setButtonLabel(rctx.button, "Press a key…");
@@ -994,7 +995,7 @@ fn onKeybindClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onKeybindCapture(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const rctx: *KeybindRowCtx = @ptrCast(@alignCast(user.?));
+    const rctx = cast.userData(KeybindRowCtx, user);
     if (!rctx.capturing) return 0;
 
     // Esc cancels — restore the previous label, no change.

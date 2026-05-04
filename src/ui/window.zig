@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const cast = @import("../util/cast.zig");
 const Pane = @import("pane.zig").Pane;
 const Pty = @import("../pty.zig").Pty;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -2307,7 +2308,7 @@ pub const Window = struct {
 };
 
 fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
-    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Window, ctx);
     switch (action) {
         .new_tab => self.newShellTab(null) catch |err| logActionError("new_tab", err),
         .close_tab => self.closeCurrentTab(),
@@ -2348,7 +2349,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
 
 
 fn onSearchChanged(entry: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     const text_ptr = c.gtk_editable_get_text(@ptrCast(entry));
     if (text_ptr == null) return;
     const cstr: [*:0]const u8 = @ptrCast(text_ptr);
@@ -2357,27 +2358,27 @@ fn onSearchChanged(entry: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) voi
 }
 
 fn onSearchActivate(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     self.nextMatch();
 }
 
 fn onSearchStop(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     self.closeSearch();
 }
 
 fn onSearchClose(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     self.closeSearch();
 }
 
 fn onSearchNext(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     self.nextMatch();
 }
 
 fn onSearchPrev(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     self.prevMatch();
 }
 
@@ -2388,7 +2389,7 @@ fn onSearchKeyPressed(
     state: c.GdkModifierType,
     user: ?*anyopaque,
 ) callconv(.c) c.gboolean {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     const shift = (state & c.GDK_SHIFT_MASK) != 0;
     if (keyval == c.GDK_KEY_Return or keyval == c.GDK_KEY_KP_Enter) {
         if (shift) self.prevMatch() else self.nextMatch();
@@ -2439,7 +2440,7 @@ fn onSearchKeyPressed(
 }
 
 fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
-    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Window, ctx);
     switch (action) {
         .new_tab => self.newShellTab(null) catch |err| logActionError("new_tab", err),
         .new_tab_as_profile => self.openProfilePicker(),
@@ -2459,7 +2460,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
 }
 
 fn onSaveLayoutAsDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     const dialog: *c.GtkFileDialog = @ptrCast(source);
     const file = c.gtk_file_dialog_save_finish(dialog, result, null) orelse return;
     defer c.g_object_unref(file);
@@ -2475,7 +2476,7 @@ fn onSaveLayoutAsDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyop
 }
 
 fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     if (!self.config.auto_theme) return;
     const fg_bg = self.resolveDefaultColors();
     for (self.panes.items) |p| {
@@ -2497,7 +2498,7 @@ fn applyPanedRatioMap(paned: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void 
 }
 
 fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
-    const ctx: *PanedRatioCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(PanedRatioCtx, user);
     const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(paned)));
     const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
         c.gtk_widget_get_width(paned)
@@ -2516,7 +2517,7 @@ fn freePanedRatio(user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Window.RenameCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Window.RenameCtx, user);
     const text = c.gtk_editable_get_text(@ptrCast(entry));
     if (text != null) {
         c.adw_tab_page_set_title(ctx.page, text);
@@ -2528,12 +2529,12 @@ fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn freeRenameCtx(user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Window.RenameCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Window.RenameCtx, user);
     ctx.allocator.destroy(ctx);
 }
 
 fn onProfilePicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Window.ProfileButtonCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Window.ProfileButtonCtx, user);
     // Spawn the tab first, then dismiss the popover so the user
     // sees the action take effect.
     ctx.window.newShellTabWithProfile(null, ctx.profile_name) catch |err| logActionError("new_tab_as_profile", err);
@@ -2541,13 +2542,13 @@ fn onProfilePicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 fn freeProfileButtonCtx(user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Window.ProfileButtonCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Window.ProfileButtonCtx, user);
     ctx.allocator.free(ctx.profile_name);
     ctx.allocator.destroy(ctx);
 }
 
 fn onPaneTitleActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Window.PaneTitleCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Window.PaneTitleCtx, user);
     const text_c = c.gtk_editable_get_text(@ptrCast(entry));
     if (text_c != null) {
         const text = std.mem.span(@as([*:0]const u8, @ptrCast(text_c)));
@@ -2561,12 +2562,12 @@ fn onPaneTitleActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void 
 }
 
 fn freePaneTitleCtx(user: ?*anyopaque) callconv(.c) void {
-    const ctx: *Window.PaneTitleCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(Window.PaneTitleCtx, user);
     ctx.allocator.destroy(ctx);
 }
 
 fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
-    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Window, ctx);
     const display = c.gtk_widget_get_display(self.app_window);
     const clip = c.gdk_display_get_clipboard(display);
     const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return;
@@ -2576,7 +2577,7 @@ fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
 }
 
 fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {
-    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Window, ctx);
     _ = status;
     switch (self.config.exit_action) {
         .close => self.closePane(pane),
@@ -2596,7 +2597,7 @@ fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {
 }
 
 fn onTermBell(ctx: ?*anyopaque, pane: *Pane) void {
-    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Window, ctx);
 
     // Audible bell — system beep through GdkDisplay (DE/portal aware).
     if (self.config.bell_audible) {
@@ -2634,7 +2635,7 @@ fn onTermBell(ctx: ?*anyopaque, pane: *Pane) void {
 /// the tooltip to include the live cwd, so hovering tells the user
 /// where each tab actually is. Format: "<title>\n<cwd>".
 fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
-    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Window, ctx);
     const n = c.adw_tab_view_get_n_pages(self.tab_view);
     var i: c_int = 0;
     while (i < n) : (i += 1) {
@@ -2684,7 +2685,7 @@ fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
 }
 
 fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {
-    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Window, ctx);
     const app = c.gtk_window_get_application(@ptrCast(self.app_window));
     if (app == null) return;
     // Title fallback so the notification widget isn't empty.
@@ -2705,7 +2706,7 @@ fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) voi
 /// `win.new-tab` GAction — fires from the header-bar "+" button
 /// and is the safety net when no pane has focus.
 fn onNewTabAction(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     self.newShellTab(null) catch |err| {
         std.debug.print("sketerm: new-tab action failed: {s}\n", .{@errorName(err)});
     };
@@ -2716,7 +2717,7 @@ fn onNewTabAction(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callc
 /// selected the right tab, so renameCurrentTab targets it.
 fn onTabBarPressed(g: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
     if (n_press != 2) return;
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     _ = g;
     self.renameCurrentTab();
 }
@@ -2724,7 +2725,7 @@ fn onTabBarPressed(g: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user: 
 /// Move keyboard focus into the newly selected tab's pane so
 /// typing immediately reaches that PTY.
 fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     const page = c.adw_tab_view_get_selected_page(view);
     if (page == null) return;
     // Clear any needs-attention from the now-active tab.
@@ -2743,7 +2744,7 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
 /// Wired into Terminal.broadcast_sink. Routes back to the Window
 /// `broadcastBytes` for the actual fan-out logic.
 fn broadcastSinkFn(ctx: ?*anyopaque, source: *Terminal, bytes: []const u8) void {
-    const self: *Window = @ptrCast(@alignCast(ctx.?));
+    const self = cast.userData(Window, ctx);
     self.broadcastBytes(source, bytes);
 }
 
@@ -2752,7 +2753,7 @@ fn broadcastSinkFn(ctx: ?*anyopaque, source: *Terminal, bytes: []const u8) void 
 /// < 1.0, otherwise we restore an opaque region matching the window
 /// for compositor efficiency.
 fn onWindowRealized(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     // Re-applied any time the opacity changes — see refreshOpaqueRegion.
     self.refreshOpaqueRegion();
 }
@@ -2783,7 +2784,7 @@ const PendingCloseWin = struct { win: *Window };
 /// adw_tab_view_close_page_finish(view, page, accept) actually
 /// commits or aborts. Returning FALSE conditionally races.
 fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
 
     if (self.config.confirm_close == .never) {
         c.adw_tab_view_close_page_finish(view, page, 1);
@@ -2825,7 +2826,7 @@ fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) call
 }
 
 fn onCloseTabResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-    const pending: *PendingCloseTab = @ptrCast(@alignCast(user.?));
+    const pending = cast.userData(PendingCloseTab, user);
     defer pending.win.allocator.destroy(pending);
 
     const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
@@ -2838,7 +2839,7 @@ fn onCloseTabResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*a
 /// Window-level close-request gate. Returning TRUE blocks the close
 /// while we ask; on accept we close manually via gtk_window_close.
 fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
 
     if (self.config.confirm_close == .never) return 0;
 
@@ -2876,7 +2877,7 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
 }
 
 fn onCloseWinResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
-    const pending: *PendingCloseWin = @ptrCast(@alignCast(user.?));
+    const pending = cast.userData(PendingCloseWin, user);
     defer pending.win.allocator.destroy(pending);
 
     const dialog: *c.AdwAlertDialog = @ptrCast(@alignCast(source));
@@ -2892,7 +2893,7 @@ fn onCloseWinResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*a
 /// Tear down all Zig-side panes + terminals that lived in this
 /// AdwTabPage's widget tree. Called when the user closes a tab.
 fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyopaque) callconv(.c) void {
-    const self: *Window = @ptrCast(@alignCast(user.?));
+    const self = cast.userData(Window, user);
     const child = c.adw_tab_page_get_child(page);
     if (child == null) return;
     // Capture the tab's basic state into the recently-closed ring

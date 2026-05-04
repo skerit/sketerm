@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const cast = @import("../util/cast.zig");
 
 pub const Action = enum {
     copy,
@@ -179,12 +180,12 @@ pub fn attachWithPrePopup(
 }
 
 fn onActivate(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
-    const slot: *ActionSlot = @ptrCast(@alignCast(user.?));
+    const slot = cast.userData(ActionSlot, user);
     slot.sink(slot.sink_ctx, slot.action);
 }
 
 fn onRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *ClickCtx = @ptrCast(@alignCast(user.?));
+    const ctx = cast.userData(ClickCtx, user);
     if (ctx.pre_popup_fn) |f| f(ctx.pre_popup_ctx, ctx.group, x, y);
     var rect = c.GdkRectangle{
         .x = @intFromFloat(x),
