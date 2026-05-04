@@ -72,6 +72,10 @@ pub const Accum = struct {
     frame_compose_mode: u8 = 0,
     /// Concatenated base64 payload, awaiting final decode.
     payload: std.ArrayList(u8) = .{},
+    /// Set when an appendSlice into `payload` failed mid-stream. A
+    /// truncated payload would decode as a corrupt image, so finalize
+    /// bails out instead of feeding garbage to the decoders.
+    poisoned: bool = false,
 
     pub fn deinit(self: *Accum, allocator: std.mem.Allocator) void {
         self.payload.deinit(allocator);
@@ -216,7 +220,9 @@ pub const Manager = struct {
                     self.active_transmit_id = effective_id;
                 }
                 if (self.accums.getPtr(effective_id)) |acc| {
-                    acc.payload.appendSlice(self.allocator, cmd.payload) catch {};
+                    acc.payload.appendSlice(self.allocator, cmd.payload) catch {
+                        acc.poisoned = true;
+                    };
                     if (cmd.more == 1) return default; // wait for more
                 }
                 // Capture the original action BEFORE finalize drops the accum.
@@ -283,6 +289,17 @@ pub const Manager = struct {
         defer entry.value.deinit(self.allocator);
         const acc = &entry.value;
 
+        // Bail early on a poisoned accumulator: an appendSlice failed
+        // mid-chunk-stream so the payload is truncated. Decoding it
+        // would silently produce a corrupt image.
+        if (acc.poisoned) {
+            if (self.debug) std.debug.print(
+                "[kitty] dropping poisoned chunk stream (id={d}, OOM during append)\n",
+                .{image_id},
+            );
+            return false;
+        }
+
         // Strip whitespace/newlines from the accumulated base64.
         var stripped: std.ArrayList(u8) = .{};
         defer stripped.deinit(self.allocator);
@@ -308,7 +325,9 @@ pub const Manager = struct {
             const data = self.readFile(path) catch return false;
             owned_file_data = data;
             raw_bytes = data;
-            if (acc.medium == 't') std.fs.deleteFileAbsolute(path) catch {};
+            if (acc.medium == 't') std.fs.deleteFileAbsolute(path) catch |err| {
+                std.debug.print("sketerm: failed to delete kitty tempfile {s}: {s}\n", .{ path, @errorName(err) });
+            };
         }
 
         // Optional zlib decompression (`o=z`). Tools rarely set this
