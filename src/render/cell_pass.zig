@@ -14,7 +14,8 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const gl = @import("gl.zig");
-const Atlas = @import("atlas.zig").Atlas;
+const atlas_mod = @import("atlas.zig");
+const Atlas = atlas_mod.Atlas;
 const Screen = @import("../grid/screen.zig").Screen;
 const StylePool = @import("../grid/style_pool.zig").Pool;
 const Color = @import("../grid/style_pool.zig").Color;
@@ -53,8 +54,11 @@ pub const Instance = extern struct {
     bold: f32 = 0,
 };
 
+// ITALIC_SHEAR = tan(13°) ≈ 0.231: horizontal-shear factor used to
+// fake italics for any monospace font without a second FT face.
 const VERT_SRC =
     \\#version 300 es
+    \\const float ITALIC_SHEAR = 0.231;
     \\in vec2 a_cell_xy;
     \\in vec2 a_cell_size;
     \\in vec4 a_bg;
@@ -163,7 +167,7 @@ const VERT_SRC =
     \\    // bottom edge so descenders stay anchored. tan(13°) ≈ 0.231.
     \\    if (u_kind == 1 && a_italic > 0.5) {
     \\        float baseline_y = a_cell_xy.y + a_cell_size.y;
-    \\        pos.x += (baseline_y - pos.y) * 0.231;
+    \\        pos.x += (baseline_y - pos.y) * ITALIC_SHEAR;
     \\    }
     \\    if (v_emit < 0.5) pos = vec2(-10000.0);
     \\    vec2 ndc = (pos / u_screen_px) * 2.0 - 1.0;
@@ -172,10 +176,23 @@ const VERT_SRC =
     \\}
 ;
 
-const FRAG_SRC =
+// GLSL-side named constants:
+//   ATLAS_TEXEL    = 1 / atlas page size — used for the faux-bold
+//                    one-texel left-neighbor sample.
+//   WAVE_TWO_PI    = 2π — period of the sine used for curly underline.
+//   WAVE_AMPLITUDE = vertical amplitude of the curly wave (0..1 within
+//                    the strip's local y).
+//   WAVE_THICKNESS_PX
+//                  = curly underline line thickness, in pixels.
+const FRAG_SRC = std.fmt.comptimePrint(
     \\#version 300 es
     \\precision mediump float;
     \\precision mediump sampler2DArray;
+    \\
+    \\const float ATLAS_TEXEL = 1.0 / {d}.0;
+    \\const float WAVE_TWO_PI = 6.2831853;
+    \\const float WAVE_AMPLITUDE = 0.45;
+    \\const float WAVE_THICKNESS_PX = 1.5;
     \\
     \\in vec4 v_color;
     \\in vec3 v_uvw;
@@ -190,11 +207,11 @@ const FRAG_SRC =
     \\
     \\out vec4 o_frag;
     \\
-    \\void main() {
+    \\void main() {{
     \\    if (v_emit < 0.5) discard;
-    \\    if (v_is_glyph > 0.5) {
+    \\    if (v_is_glyph > 0.5) {{
     \\        float a = texture(u_atlas, v_uvw).r;
-    \\        if (v_bold > 0.5) {
+    \\        if (v_bold > 0.5) {{
     \\            // Faux bold: dilate by sampling one texel to the
     \\            // LEFT in atlas space and taking max alpha. Each
     \\            // fragment shows max(self, left_neighbor), so the
@@ -204,48 +221,47 @@ const FRAG_SRC =
     \\            // right (the original direction) overwrote the
     \\            // glyph's leftmost soft edge with a brighter
     \\            // neighbor, reading as "missing pixel column on
-    \\            // the left." Atlas pages are 2048×2048 → 1/2048
-    \\            // per texel.
-    \\            float a2 = texture(u_atlas, v_uvw - vec3(1.0/2048.0, 0.0, 0.0)).r;
+    \\            // the left."
+    \\            float a2 = texture(u_atlas, v_uvw - vec3(ATLAS_TEXEL, 0.0, 0.0)).r;
     \\            a = max(a, a2);
-    \\        }
+    \\        }}
     \\        o_frag = vec4(v_color.rgb, a * v_color.a);
     \\        return;
-    \\    }
-    \\    if (v_deco_kind < 0.5) {
+    \\    }}
+    \\    if (v_deco_kind < 0.5) {{
     \\        // Plain bg quad.
     \\        o_frag = v_color;
     \\        return;
-    \\    }
+    \\    }}
     \\    // Decoration shaders: kinds 1/4/5 (under, strike, over) are flat
     \\    // strips; 2 (double-underline) draws two thin sub-lines; 3 (curly)
     \\    // is a sine wave covered by anti-aliased stamping.
     \\    float kind = v_deco_kind + 0.5;
-    \\    if (kind >= 2.0 && kind < 3.0) {
+    \\    if (kind >= 2.0 && kind < 3.0) {{
     \\        // Double underline: top half + bottom half drawn, gap in middle.
     \\        float vy = v_deco_local.y;
     \\        if (vy > 0.33 && vy < 0.66) discard;
     \\        o_frag = v_color;
     \\        return;
-    \\    }
-    \\    if (kind >= 3.0 && kind < 4.0) {
-    \\        // Curly: y midline with sine wave. Period ~= cell width / 1.5.
+    \\    }}
+    \\    if (kind >= 3.0 && kind < 4.0) {{
+    \\        // Curly: y midline with sine wave. Period ~= cell width / WAVE_THICKNESS_PX.
     \\        float x = v_deco_local.x * v_deco_w_px;
-    \\        float wave = sin(x * 6.2831853 / max(8.0, v_deco_w_px / 1.5));
-    \\        float yc = 0.5 + 0.45 * wave; // 0..1 within strip
+    \\        float wave = sin(x * WAVE_TWO_PI / max(8.0, v_deco_w_px / WAVE_THICKNESS_PX));
+    \\        float yc = 0.5 + WAVE_AMPLITUDE * wave; // 0..1 within strip
     \\        float dist = abs(v_deco_local.y - yc);
-    \\        // ~1.5 px-equivalent line thickness in strip space.
+    \\        // ~WAVE_THICKNESS_PX px-equivalent line thickness in strip space.
     \\        float strip_px = max(3.0, v_deco_w_px / 6.0);
-    \\        float thickness = 1.5 / strip_px;
+    \\        float thickness = WAVE_THICKNESS_PX / strip_px;
     \\        if (dist > thickness) discard;
     \\        // Anti-alias the edge.
     \\        float aa = clamp((thickness - dist) / (thickness * 0.5), 0.0, 1.0);
     \\        o_frag = vec4(v_color.rgb, v_color.a * aa);
     \\        return;
-    \\    }
+    \\    }}
     \\    o_frag = v_color;
-    \\}
-;
+    \\}}
+, .{atlas_mod.PAGE_SIZE});
 
 pub const CellPass = struct {
     program: c_uint = 0,

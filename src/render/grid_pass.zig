@@ -14,7 +14,8 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const gl = @import("gl.zig");
-const Atlas = @import("atlas.zig").Atlas;
+const atlas_mod = @import("atlas.zig");
+const Atlas = atlas_mod.Atlas;
 const Screen = @import("../grid/screen.zig").Screen;
 const StylePool = @import("../grid/style_pool.zig").Pool;
 const Color = @import("../grid/style_pool.zig").Color;
@@ -65,10 +66,14 @@ const VERT_SRC =
     \\}
 ;
 
-const FRAG_SRC =
+// ATLAS_TEXEL = 1/PAGE_SIZE — per-texel UV step for the faux-bold
+// left-neighbor sample (see cell_pass.zig comment).
+const FRAG_SRC = std.fmt.comptimePrint(
     \\#version 300 es
     \\precision mediump float;
     \\precision mediump sampler2DArray;
+    \\
+    \\const float ATLAS_TEXEL = 1.0 / {d}.0;
     \\
     \\in vec3 v_uv;
     \\in vec4 v_color;
@@ -79,22 +84,22 @@ const FRAG_SRC =
     \\
     \\out vec4 o_frag;
     \\
-    \\void main() {
-    \\    if (v_is_glyph > 0.5) {
+    \\void main() {{
+    \\    if (v_is_glyph > 0.5) {{
     \\        float a = texture(u_atlas, v_uv).r;
-    \\        if (v_bold > 0.5) {
+    \\        if (v_bold > 0.5) {{
     \\            // See cell_pass.zig faux-bold comment — sample
     \\            // LEFT (extends right) preserves the antialiased
     \\            // left edge instead of overwriting it.
-    \\            float a2 = texture(u_atlas, v_uv - vec3(1.0/2048.0, 0.0, 0.0)).r;
+    \\            float a2 = texture(u_atlas, v_uv - vec3(ATLAS_TEXEL, 0.0, 0.0)).r;
     \\            a = max(a, a2);
-    \\        }
+    \\        }}
     \\        o_frag = vec4(v_color.rgb, a * v_color.a);
-    \\    } else {
+    \\    }} else {{
     \\        o_frag = v_color;
-    \\    }
-    \\}
-;
+    \\    }}
+    \\}}
+, .{atlas_mod.PAGE_SIZE});
 
 const Vertex = extern struct {
     pos: [2]f32,
