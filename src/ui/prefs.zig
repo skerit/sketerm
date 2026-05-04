@@ -153,31 +153,37 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
 // ── Generic row helpers ─────────────────────────────────────────
 
 const SpinU16Ctx = struct {
+    allocator: std.mem.Allocator,
     parent: *Ctx,
     field: *u16,
     on_change: *const fn (*Ctx) void,
 };
 const SpinU32Ctx = struct {
+    allocator: std.mem.Allocator,
     parent: *Ctx,
     field: *u32,
     on_change: *const fn (*Ctx) void,
 };
 const SpinI16Ctx = struct {
+    allocator: std.mem.Allocator,
     parent: *Ctx,
     field: *i16,
     on_change: *const fn (*Ctx) void,
 };
 const SpinF32Ctx = struct {
+    allocator: std.mem.Allocator,
     parent: *Ctx,
     field: *f32,
     on_change: *const fn (*Ctx) void,
 };
 const SwitchCtx = struct {
+    allocator: std.mem.Allocator,
     parent: *Ctx,
     field: *bool,
     on_change: *const fn (*Ctx) void,
 };
 const ComboCtx = struct {
+    allocator: std.mem.Allocator,
     parent: *Ctx,
     on_change: *const fn (*Ctx, c_uint) void,
 };
@@ -197,8 +203,8 @@ fn addSpinRowU16(
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), subtitle);
     const sctx = ctx.allocator.create(SpinU16Ctx) catch return;
-    sctx.* = .{ .parent = ctx, .field = field, .on_change = on_change };
-    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&spinU16Changed), @ptrCast(sctx), null, c.G_CONNECT_DEFAULT);
+    sctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field, .on_change = on_change };
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&spinU16Changed), @ptrCast(sctx), @ptrCast(&freeSpinU16Ctx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -207,6 +213,13 @@ fn spinU16Changed(spin: *c.AdwSpinRow, user: ?*anyopaque) callconv(.c) void {
     const v = c.adw_spin_row_get_value(spin);
     sctx.field.* = @intFromFloat(@max(0.0, v));
     sctx.on_change(sctx.parent);
+}
+
+fn freeSpinU16Ctx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const sctx: *SpinU16Ctx = @ptrCast(@alignCast(u));
+        sctx.allocator.destroy(sctx);
+    }
 }
 
 fn addSpinRowU32(
@@ -224,8 +237,8 @@ fn addSpinRowU32(
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), subtitle);
     const sctx = ctx.allocator.create(SpinU32Ctx) catch return;
-    sctx.* = .{ .parent = ctx, .field = field, .on_change = on_change };
-    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&spinU32Changed), @ptrCast(sctx), null, c.G_CONNECT_DEFAULT);
+    sctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field, .on_change = on_change };
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&spinU32Changed), @ptrCast(sctx), @ptrCast(&freeSpinU32Ctx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -234,6 +247,13 @@ fn spinU32Changed(spin: *c.AdwSpinRow, user: ?*anyopaque) callconv(.c) void {
     const v = c.adw_spin_row_get_value(spin);
     sctx.field.* = @intFromFloat(@max(0.0, v));
     sctx.on_change(sctx.parent);
+}
+
+fn freeSpinU32Ctx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const sctx: *SpinU32Ctx = @ptrCast(@alignCast(u));
+        sctx.allocator.destroy(sctx);
+    }
 }
 
 fn addSpinRowI16(
@@ -251,8 +271,8 @@ fn addSpinRowI16(
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), subtitle);
     const sctx = ctx.allocator.create(SpinI16Ctx) catch return;
-    sctx.* = .{ .parent = ctx, .field = field, .on_change = on_change };
-    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&spinI16Changed), @ptrCast(sctx), null, c.G_CONNECT_DEFAULT);
+    sctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field, .on_change = on_change };
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&spinI16Changed), @ptrCast(sctx), @ptrCast(&freeSpinI16Ctx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -261,6 +281,13 @@ fn spinI16Changed(spin: *c.AdwSpinRow, user: ?*anyopaque) callconv(.c) void {
     const v = c.adw_spin_row_get_value(spin);
     sctx.field.* = @intFromFloat(v);
     sctx.on_change(sctx.parent);
+}
+
+fn freeSpinI16Ctx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const sctx: *SpinI16Ctx = @ptrCast(@alignCast(u));
+        sctx.allocator.destroy(sctx);
+    }
 }
 
 fn addSpinRowF32(
@@ -293,8 +320,8 @@ fn addSpinRowF32Step(
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), subtitle);
     const sctx = ctx.allocator.create(SpinF32Ctx) catch return;
-    sctx.* = .{ .parent = ctx, .field = field, .on_change = on_change };
-    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&spinF32Changed), @ptrCast(sctx), null, c.G_CONNECT_DEFAULT);
+    sctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field, .on_change = on_change };
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&spinF32Changed), @ptrCast(sctx), @ptrCast(&freeSpinF32Ctx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -303,6 +330,13 @@ fn spinF32Changed(spin: *c.AdwSpinRow, user: ?*anyopaque) callconv(.c) void {
     const v: f32 = @floatCast(c.adw_spin_row_get_value(spin));
     sctx.field.* = v;
     sctx.on_change(sctx.parent);
+}
+
+fn freeSpinF32Ctx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const sctx: *SpinF32Ctx = @ptrCast(@alignCast(u));
+        sctx.allocator.destroy(sctx);
+    }
 }
 
 fn addSwitchRow(
@@ -318,8 +352,8 @@ fn addSwitchRow(
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), subtitle);
     c.adw_switch_row_set_active(@ptrCast(@alignCast(row)), if (field.*) 1 else 0);
     const sctx = ctx.allocator.create(SwitchCtx) catch return;
-    sctx.* = .{ .parent = ctx, .field = field, .on_change = on_change };
-    _ = c.g_signal_connect_data(row, "notify::active", @ptrCast(&switchChanged), @ptrCast(sctx), null, c.G_CONNECT_DEFAULT);
+    sctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field, .on_change = on_change };
+    _ = c.g_signal_connect_data(row, "notify::active", @ptrCast(&switchChanged), @ptrCast(sctx), @ptrCast(&freeSwitchCtx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -327,6 +361,13 @@ fn switchChanged(row: *c.AdwSwitchRow, _: *c.GParamSpec, user: ?*anyopaque) call
     const sctx = cast.userData(SwitchCtx, user);
     sctx.field.* = c.adw_switch_row_get_active(row) != 0;
     sctx.on_change(sctx.parent);
+}
+
+fn freeSwitchCtx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const sctx: *SwitchCtx = @ptrCast(@alignCast(u));
+        sctx.allocator.destroy(sctx);
+    }
 }
 
 // ── Cursor shape combo ──────────────────────────────────────────
@@ -344,14 +385,21 @@ fn addCursorShapeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     };
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), initial);
     const cctx = ctx.allocator.create(ComboCtx) catch return;
-    cctx.* = .{ .parent = ctx, .on_change = cursorShapeSelected };
-    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = cursorShapeSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(&freeComboCtx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
 fn comboChanged(row: *c.AdwComboRow, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const cctx = cast.userData(ComboCtx, user);
     cctx.on_change(cctx.parent, c.adw_combo_row_get_selected(row));
+}
+
+fn freeComboCtx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const cctx: *ComboCtx = @ptrCast(@alignCast(u));
+        cctx.allocator.destroy(cctx);
+    }
 }
 
 fn cursorShapeSelected(ctx: *Ctx, idx: c_uint) void {
@@ -431,11 +479,13 @@ const schemes = @import("../grid/schemes.zig");
 const SCHEMES = schemes.all;
 
 const PaletteRowCtx = struct {
+    allocator: std.mem.Allocator,
     parent: *Ctx,
     index: usize, // 0..15
 };
 
 const ColorRowCtx = struct {
+    allocator: std.mem.Allocator,
     parent: *Ctx,
     field: *[4]f32,
 };
@@ -481,8 +531,8 @@ fn addColorRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*:0]const u8, f
     c.gtk_color_dialog_button_set_rgba(@ptrCast(@alignCast(btn)), &rgba);
 
     const cctx = ctx.allocator.create(ColorRowCtx) catch return;
-    cctx.* = .{ .parent = ctx, .field = field };
-    _ = c.g_signal_connect_data(btn, "notify::rgba", @ptrCast(&colorRowChanged), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field };
+    _ = c.g_signal_connect_data(btn, "notify::rgba", @ptrCast(&colorRowChanged), @ptrCast(cctx), @ptrCast(&freeColorRowCtx), c.G_CONNECT_DEFAULT);
     c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), btn);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
@@ -492,6 +542,13 @@ fn colorRowChanged(btn: *c.GtkColorDialogButton, _: *c.GParamSpec, user: ?*anyop
     const rgba = c.gtk_color_dialog_button_get_rgba(btn);
     cctx.field.* = .{ rgba.*.red, rgba.*.green, rgba.*.blue, rgba.*.alpha };
     cctx.parent.ev();
+}
+
+fn freeColorRowCtx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const cctx: *ColorRowCtx = @ptrCast(@alignCast(u));
+        cctx.allocator.destroy(cctx);
+    }
 }
 
 fn addPaletteRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, idx: usize) void {
@@ -517,8 +574,8 @@ fn addPaletteRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, idx: usize) void {
     c.gtk_color_dialog_button_set_rgba(@ptrCast(@alignCast(btn)), &rgba);
 
     const pctx = ctx.allocator.create(PaletteRowCtx) catch return;
-    pctx.* = .{ .parent = ctx, .index = idx };
-    _ = c.g_signal_connect_data(btn, "notify::rgba", @ptrCast(&paletteRowChanged), @ptrCast(pctx), null, c.G_CONNECT_DEFAULT);
+    pctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .index = idx };
+    _ = c.g_signal_connect_data(btn, "notify::rgba", @ptrCast(&paletteRowChanged), @ptrCast(pctx), @ptrCast(&freePaletteRowCtx), c.G_CONNECT_DEFAULT);
     c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), btn);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
@@ -547,6 +604,13 @@ fn paletteRowChanged(btn: *c.GtkColorDialogButton, _: *c.GParamSpec, user: ?*any
     pctx.parent.ev();
 }
 
+fn freePaletteRowCtx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const pctx: *PaletteRowCtx = @ptrCast(@alignCast(u));
+        pctx.allocator.destroy(pctx);
+    }
+}
+
 fn addSchemeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const items_array = blk: {
         // null-terminated [*:0]?[*:0]const u8 list.
@@ -569,8 +633,8 @@ fn addSchemeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     }
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), sel);
     const cctx = ctx.allocator.create(ComboCtx) catch return;
-    cctx.* = .{ .parent = ctx, .on_change = schemeSelected };
-    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = schemeSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(&freeComboCtx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -663,6 +727,7 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
 }
 
 const StringFieldCtx = struct {
+    allocator: std.mem.Allocator,
     parent: *Ctx,
     field: *[]const u8,
     on_change: *const fn (*Ctx) void,
@@ -678,8 +743,8 @@ fn addEntryRowString(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*:0]const
     z[n] = 0;
     c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
     const sctx = ctx.allocator.create(StringFieldCtx) catch return;
-    sctx.* = .{ .parent = ctx, .field = field, .on_change = on_change };
-    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&entryStringChanged), @ptrCast(sctx), null, c.G_CONNECT_DEFAULT);
+    sctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field, .on_change = on_change };
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&entryStringChanged), @ptrCast(sctx), @ptrCast(&freeStringFieldCtx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -691,6 +756,13 @@ fn entryStringChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void 
     const dup = sctx.parent.dupe(slice) catch return;
     sctx.field.* = dup;
     sctx.on_change(sctx.parent);
+}
+
+fn freeStringFieldCtx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const sctx: *StringFieldCtx = @ptrCast(@alignCast(u));
+        sctx.allocator.destroy(sctx);
+    }
 }
 
 fn addEntryRowOptionalString(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*:0]const u8, subtitle: [*:0]const u8, field: *[]const u8, on_change: *const fn (*Ctx) void) void {
@@ -743,8 +815,8 @@ fn addModifyOtherKeysRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), ctx.cfg.modify_other_keys);
     const cctx = ctx.allocator.create(ComboCtx) catch return;
-    cctx.* = .{ .parent = ctx, .on_change = modifyOtherKeysSelected };
-    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = modifyOtherKeysSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(&freeComboCtx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -765,8 +837,8 @@ fn addExitActionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     };
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), initial);
     const cctx = ctx.allocator.create(ComboCtx) catch return;
-    cctx.* = .{ .parent = ctx, .on_change = exitActionSelected };
-    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = exitActionSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(&freeComboCtx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -841,8 +913,8 @@ fn addConfirmCloseRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     };
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), initial);
     const cctx = ctx.allocator.create(ComboCtx) catch return;
-    cctx.* = .{ .parent = ctx, .on_change = confirmCloseSelected };
-    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = confirmCloseSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(&freeComboCtx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -867,8 +939,8 @@ fn addTabPositionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     };
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), initial);
     const cctx = ctx.allocator.create(ComboCtx) catch return;
-    cctx.* = .{ .parent = ctx, .on_change = tabPositionSelected };
-    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = tabPositionSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(&freeComboCtx), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -882,6 +954,7 @@ fn tabPositionSelected(ctx: *Ctx, idx: c_uint) void {
 const input_mod = @import("input.zig");
 
 const KeybindRowCtx = struct {
+    allocator: std.mem.Allocator,
     parent: *Ctx,
     action: input_mod.Action,
     button: *c.GtkButton,
@@ -923,11 +996,11 @@ fn addKeybindRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, action: input_mod.Act
     c.gtk_widget_set_size_request(button, 180, -1);
 
     const rctx = ctx.allocator.create(KeybindRowCtx) catch return;
-    rctx.* = .{ .parent = ctx, .action = action, .button = @ptrCast(@alignCast(button)) };
+    rctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .action = action, .button = @ptrCast(@alignCast(button)) };
 
     refreshKeybindButtonLabel(rctx);
 
-    _ = c.g_signal_connect_data(button, "clicked", @ptrCast(&onKeybindClicked), @ptrCast(rctx), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(button, "clicked", @ptrCast(&onKeybindClicked), @ptrCast(rctx), @ptrCast(&freeKeybindRowCtx), c.G_CONNECT_DEFAULT);
 
     c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), button);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
@@ -972,6 +1045,13 @@ fn setButtonLabel(button: *c.GtkButton, text: []const u8) void {
     @memcpy(z[0..n], text[0..n]);
     z[n] = 0;
     c.gtk_button_set_label(button, &z);
+}
+
+fn freeKeybindRowCtx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const rctx: *KeybindRowCtx = @ptrCast(@alignCast(u));
+        rctx.allocator.destroy(rctx);
+    }
 }
 
 fn onKeybindClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
