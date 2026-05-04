@@ -30,6 +30,7 @@ pub const Action = enum {
 pub const Sink = *const fn (ctx: ?*anyopaque, action: Action) void;
 
 const ActionSlot = struct {
+    allocator: std.mem.Allocator,
     sink: Sink,
     sink_ctx: ?*anyopaque,
     action: Action,
@@ -41,6 +42,7 @@ const ActionSlot = struct {
 pub const PrePopupFn = *const fn (ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f64) void;
 
 const ClickCtx = struct {
+    allocator: std.mem.Allocator,
     popover: *c.GtkWidget,
     group: *c.GSimpleActionGroup,
     pre_popup_fn: ?PrePopupFn = null,
@@ -130,14 +132,14 @@ pub fn attachWithPrePopup(
     const group = c.g_simple_action_group_new();
     for (BINDS) |b| {
         const slot = try allocator.create(ActionSlot);
-        slot.* = .{ .sink = sink, .sink_ctx = sink_ctx, .action = b.action };
+        slot.* = .{ .allocator = allocator, .sink = sink, .sink_ctx = sink_ctx, .action = b.action };
         const act = c.g_simple_action_new(b.name, null);
         _ = c.g_signal_connect_data(
             act,
             "activate",
             @ptrCast(&onActivate),
             @ptrCast(slot),
-            null,
+            @ptrCast(&freeActionSlot),
             c.G_CONNECT_DEFAULT,
         );
         c.g_action_map_add_action(@ptrCast(group), @ptrCast(act));
@@ -163,6 +165,7 @@ pub fn attachWithPrePopup(
     c.gtk_gesture_single_set_button(@ptrCast(click), 3);
     const cctx = try allocator.create(ClickCtx);
     cctx.* = .{
+        .allocator = allocator,
         .popover = popover,
         .group = @ptrCast(group),
         .pre_popup_fn = pre_popup_fn,
@@ -173,7 +176,7 @@ pub fn attachWithPrePopup(
         "pressed",
         @ptrCast(&onRightClick),
         @ptrCast(cctx),
-        null,
+        @ptrCast(&freeClickCtx),
         c.G_CONNECT_DEFAULT,
     );
     c.gtk_widget_add_controller(widget, @ptrCast(click));
@@ -182,6 +185,20 @@ pub fn attachWithPrePopup(
 fn onActivate(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
     const slot = cast.userData(ActionSlot, user);
     slot.sink(slot.sink_ctx, slot.action);
+}
+
+fn freeActionSlot(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const slot: *ActionSlot = @ptrCast(@alignCast(u));
+        slot.allocator.destroy(slot);
+    }
+}
+
+fn freeClickCtx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const ctx: *ClickCtx = @ptrCast(@alignCast(u));
+        ctx.allocator.destroy(ctx);
+    }
 }
 
 fn onRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
