@@ -2478,53 +2478,64 @@ pub const Screen = struct {
     // ── CSI dispatch ─────────────────────────────────────────────
 
     fn csi(self: *Screen, params: Event.Csi) void {
-        // Private-prefix dispatch first.
-        if (params.private == '?') {
-            // DECRQM — `CSI ? Pa $ p`, query a DEC private mode.
-            if (params.n_intermediates == 1 and params.intermediates[0] == '$' and params.final == 'p') {
-                self.decrqm(params.paramOrDefault(0, 0));
-                return;
-            }
-            switch (params.final) {
-                'h' => self.modeSet(params, true),
-                'l' => self.modeSet(params, false),
-                // DECSED/DECSEL — selective erase. We don't model the
-                // protection bit, so treat as plain ED/EL.
-                'J' => self.eraseDisplay(params.paramOrDefault(0, 0)),
-                'K' => self.eraseLine(params.paramOrDefault(0, 0)),
-                'u' => {
-                    // Kitty kbd: CSI ? u — query flags.
-                    var kbuf: [16]u8 = undefined;
-                    const out = std.fmt.bufPrint(&kbuf, "\x1b[?{d}u", .{self.kitty_kbd_flags}) catch return;
-                    self.respond(out);
-                },
-                else => {},
-            }
+        // Top-level dispatch by private-prefix byte ('?', '>', '=', '<')
+        // or no prefix. Each branch delegates to a focused handler that
+        // knows the inner switch shape for that prefix.
+        switch (params.private) {
+            '?' => self.csiPrivate(params),
+            '>' => self.csiAux(params),
+            '=', '<' => self.csiKittyKbd(params),
+            else => self.csiPublic(params),
+        }
+    }
+
+    fn csiPrivate(self: *Screen, params: Event.Csi) void {
+        // DECRQM — `CSI ? Pa $ p`, query a DEC private mode.
+        if (params.n_intermediates == 1 and params.intermediates[0] == '$' and params.final == 'p') {
+            self.decrqm(params.paramOrDefault(0, 0));
             return;
         }
-        if (params.private == '>') {
-            switch (params.final) {
-                'c' => self.respond("\x1b[>42;1;0c"), // DA2: vendor 42 (sketerm), version 1
-                'q' => self.respond("\x1bP>|sketerm 0.1.0\x1b\\"), // XTVERSION
-                'm' => {
-                    // XTMODKEYS — `CSI > Pn ; Pp m`. Pn=4 sets
-                    // modifyOtherKeys level. We accept the level but
-                    // don't yet apply it to key encoding.
-                    if (params.n_params >= 1 and params.params[0] == 4) {
-                        self.modify_other_keys = if (params.n_params >= 2)
-                            @intCast(@min(params.params[1], 2))
-                        else
-                            0;
-                    }
-                },
-                'u' => {
-                    // Kitty kbd: CSI > flags u — set flags directly.
-                    self.kitty_kbd_flags = @intCast(@min(params.paramOrDefault(0, 0), 0xFF));
-                },
-                else => {},
-            }
-            return;
+        switch (params.final) {
+            'h' => self.modeSet(params, true),
+            'l' => self.modeSet(params, false),
+            // DECSED/DECSEL — selective erase. We don't model the
+            // protection bit, so treat as plain ED/EL.
+            'J' => self.eraseDisplay(params.paramOrDefault(0, 0)),
+            'K' => self.eraseLine(params.paramOrDefault(0, 0)),
+            'u' => {
+                // Kitty kbd: CSI ? u — query flags.
+                var kbuf: [16]u8 = undefined;
+                const out = std.fmt.bufPrint(&kbuf, "\x1b[?{d}u", .{self.kitty_kbd_flags}) catch return;
+                self.respond(out);
+            },
+            else => {},
         }
+    }
+
+    fn csiAux(self: *Screen, params: Event.Csi) void {
+        switch (params.final) {
+            'c' => self.respond("\x1b[>42;1;0c"), // DA2: vendor 42 (sketerm), version 1
+            'q' => self.respond("\x1bP>|sketerm 0.1.0\x1b\\"), // XTVERSION
+            'm' => {
+                // XTMODKEYS — `CSI > Pn ; Pp m`. Pn=4 sets
+                // modifyOtherKeys level. We accept the level but
+                // don't yet apply it to key encoding.
+                if (params.n_params >= 1 and params.params[0] == 4) {
+                    self.modify_other_keys = if (params.n_params >= 2)
+                        @intCast(@min(params.params[1], 2))
+                    else
+                        0;
+                }
+            },
+            'u' => {
+                // Kitty kbd: CSI > flags u — set flags directly.
+                self.kitty_kbd_flags = @intCast(@min(params.paramOrDefault(0, 0), 0xFF));
+            },
+            else => {},
+        }
+    }
+
+    fn csiKittyKbd(self: *Screen, params: Event.Csi) void {
         if (params.private == '=') {
             // Kitty kbd: CSI = flags ; mode u
             //   mode 1 = set, 2 = push+set, 3 = pop
@@ -2566,7 +2577,9 @@ pub const Screen = struct {
             }
             return;
         }
+    }
 
+    fn csiPublic(self: *Screen, params: Event.Csi) void {
         // Intermediate-distinguished: e.g. `CSI Ps SP q` = DECSCUSR.
         if (params.n_intermediates == 1 and params.intermediates[0] == ' ') {
             switch (params.final) {
