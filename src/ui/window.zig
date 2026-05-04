@@ -27,6 +27,22 @@ pub const ClosedTab = struct {
     profile_name: ?[]const u8 = null,
 };
 
+/// Owned ratio holder for `applyPanedRatio` / `applyPanedRatioMap` /
+/// `freePanedRatio`. Carries its own allocator so the GTK destroy-notify
+/// can free without needing a Window pointer.
+const PanedRatioCtx = struct {
+    allocator: std.mem.Allocator,
+    ratio: f32,
+};
+
+/// Called from user-triggered action dispatch (menu items, keybinds,
+/// window callbacks) when a fallible op (`newShellTab`, `splitFocused`,
+/// …) fails. The previous `catch {}` swallowed errors silently — the
+/// user clicked, nothing happened, and there was no log line.
+fn logActionError(action: []const u8, err: anyerror) void {
+    std.debug.print("sketerm: action '{s}' failed: {s}\n", .{ action, @errorName(err) });
+}
+
 pub const Window = struct {
     app_window: *c.GtkWidget,
     tab_view: *c.AdwTabView,
@@ -647,8 +663,11 @@ pub const Window = struct {
                 // Apply saved ratio after the widget gets its first
                 // allocation. Until then we don't know the total
                 // size in pixels.
-                const ratio_holder = try self.allocator.create(f32);
-                ratio_holder.* = if (s.ratio > 0 and s.ratio < 1) s.ratio else 0.5;
+                const ratio_holder = try self.allocator.create(PanedRatioCtx);
+                ratio_holder.* = .{
+                    .allocator = self.allocator,
+                    .ratio = if (s.ratio > 0 and s.ratio < 1) s.ratio else 0.5,
+                };
                 _ = c.g_signal_connect_data(
                     paned,
                     "notify::default-width",
@@ -1044,8 +1063,8 @@ pub const Window = struct {
         }
         // Safety net: also apply 0.5 ratio on map, in case the paned
         // gets a different allocation than its focused predecessor.
-        const ratio_holder = try self.allocator.create(f32);
-        ratio_holder.* = 0.5;
+        const ratio_holder = try self.allocator.create(PanedRatioCtx);
+        ratio_holder.* = .{ .allocator = self.allocator, .ratio = 0.5 };
         _ = c.g_signal_connect_data(
             paned,
             "map",
@@ -2124,7 +2143,7 @@ pub const Window = struct {
         // alternative of flattening to one pane and dropping the
         // splits the user spent time arranging.
         const sel = c.adw_tab_view_get_selected_page(self.tab_view) orelse {
-            self.newShellTabWithProfile(null, pane.active_profile) catch {};
+            self.newShellTabWithProfile(null, pane.active_profile) catch |err| logActionError("duplicate_tab", err);
             return;
         };
         const wrapper = c.adw_tab_page_get_child(sel);
@@ -2290,12 +2309,12 @@ pub const Window = struct {
 fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
     const self: *Window = @ptrCast(@alignCast(ctx.?));
     switch (action) {
-        .new_tab => self.newShellTab(null) catch {},
+        .new_tab => self.newShellTab(null) catch |err| logActionError("new_tab", err),
         .close_tab => self.closeCurrentTab(),
         .next_tab => self.nextTab(),
         .prev_tab => self.prevTab(),
-        .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {},
-        .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
+        .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("split_h", err),
+        .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch |err| logActionError("split_v", err),
         .font_inc => self.adjustFocusedFontSize(1),
         .font_dec => self.adjustFocusedFontSize(-1),
         .font_reset => self.resetFocusedFontSize(),
@@ -2422,14 +2441,14 @@ fn onSearchKeyPressed(
 fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
     const self: *Window = @ptrCast(@alignCast(ctx.?));
     switch (action) {
-        .new_tab => self.newShellTab(null) catch {},
+        .new_tab => self.newShellTab(null) catch |err| logActionError("new_tab", err),
         .new_tab_as_profile => self.openProfilePicker(),
         .duplicate_tab => self.duplicateCurrentTab(),
         .close_tab => self.closeCurrentTab(),
         .rename_tab => self.renameCurrentTab(),
         .pin_tab => self.togglePinCurrentTab(),
-        .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {},
-        .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {},
+        .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("split_h", err),
+        .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch |err| logActionError("split_v", err),
         .close_pane => self.closeFocusedPane(),
         .set_pane_title => self.setFocusedPaneTitle(),
         .copy_screen => self.copyFocusedScreen(),
@@ -2478,23 +2497,21 @@ fn applyPanedRatioMap(paned: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void 
 }
 
 fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
-    const ratio_ptr: *f32 = @ptrCast(@alignCast(user.?));
+    const ctx: *PanedRatioCtx = @ptrCast(@alignCast(user.?));
     const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(paned)));
     const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
         c.gtk_widget_get_width(paned)
     else
         c.gtk_widget_get_height(paned);
     if (total <= 0) return;
-    const pos: c_int = @intFromFloat(@as(f32, @floatFromInt(total)) * ratio_ptr.*);
+    const pos: c_int = @intFromFloat(@as(f32, @floatFromInt(total)) * ctx.ratio);
     c.gtk_paned_set_position(@ptrCast(paned), pos);
 }
 
 fn freePanedRatio(user: ?*anyopaque) callconv(.c) void {
     if (user) |u| {
-        const ratio_ptr: *f32 = @ptrCast(@alignCast(u));
-        // We don't know the allocator here; for v1 leak. Bounded.
-        // (Future: wrap in a struct with allocator like RenameCtx.)
-        _ = ratio_ptr;
+        const ctx: *PanedRatioCtx = @ptrCast(@alignCast(u));
+        ctx.allocator.destroy(ctx);
     }
 }
 
@@ -2519,7 +2536,7 @@ fn onProfilePicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *Window.ProfileButtonCtx = @ptrCast(@alignCast(user.?));
     // Spawn the tab first, then dismiss the popover so the user
     // sees the action take effect.
-    ctx.window.newShellTabWithProfile(null, ctx.profile_name) catch {};
+    ctx.window.newShellTabWithProfile(null, ctx.profile_name) catch |err| logActionError("new_tab_as_profile", err);
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
 }
 
@@ -2569,7 +2586,7 @@ fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {
             // pane and spawn a new tab. Truly in-place restart
             // would need PTY-level surgery in Terminal.
             self.closePane(pane);
-            self.newShellTab(null) catch {};
+            self.newShellTab(null) catch |err| logActionError("exit_restart_new_tab", err);
         },
         .hold => {
             // Already showed the "[process exited]" banner; do
