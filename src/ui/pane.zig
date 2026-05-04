@@ -793,7 +793,9 @@ fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
         .src_y = img.src_y,
         .src_w = img.src_w,
         .src_h = img.src_h,
-    }) catch {};
+    }) catch |err| {
+        std.debug.print("sketerm: image_store.addFull failed (id={d}): {s}\n", .{ img.image_id, @errorName(err) });
+    };
     // Force redraw to upload + display. Set dirty so onTick paints AND
     // queue_draw directly so we don't have to wait a frame.
     self.terminal.screen.dirty = true;
@@ -941,7 +943,9 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         while (it.next()) |entry| {
             const img = entry.value_ptr;
             if (img.frames.items.len < 2) continue;
-            self.image_store.uploadFrame(entry.key_ptr.*, img.generation, img.rgba) catch {};
+            self.image_store.uploadFrame(entry.key_ptr.*, img.generation, img.rgba) catch |err| {
+                std.debug.print("sketerm: image_store.uploadFrame failed (id={d}): {s}\n", .{ entry.key_ptr.*, @errorName(err) });
+            };
         }
         screen.dirty = true;
     }
