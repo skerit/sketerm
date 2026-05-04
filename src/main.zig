@@ -124,10 +124,16 @@ pub fn main() u8 {
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
         if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
-            std.debug.print("{s}", .{HELP_TEXT});
+            var stdout_buf: [4096]u8 = undefined;
+            var stdout = std.fs.File.stdout().writer(&stdout_buf);
+            stdout.interface.print("{s}", .{HELP_TEXT}) catch {};
+            stdout.interface.flush() catch {};
             return 0;
         } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
-            std.debug.print("sketerm {s}\n", .{VERSION});
+            var stdout_buf: [128]u8 = undefined;
+            var stdout = std.fs.File.stdout().writer(&stdout_buf);
+            stdout.interface.print("sketerm {s}\n", .{VERSION}) catch {};
+            stdout.interface.flush() catch {};
             return 0;
         }
     }
