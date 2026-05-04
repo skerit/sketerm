@@ -20,6 +20,7 @@ const Screen = @import("../grid/screen.zig").Screen;
 const StylePool = @import("../grid/style_pool.zig").Pool;
 const Color = @import("../grid/style_pool.zig").Color;
 const Cell = @import("../grid/cell.zig").Cell;
+const style_util = @import("style.zig");
 
 const VERT_SRC =
     \\#version 300 es
@@ -812,41 +813,11 @@ pub const GridPass = struct {
     /// caller swaps fg/bg explicitly (for cells with explicit colors
     /// reverse should still flip them).
     fn resolveColor(self: *const GridPass, color: Color, is_fg: bool) [4]f32 {
-        return switch (color) {
-            .default => if (is_fg) self.default_fg else self.default_bg,
-            .palette => |p| self.paletteToVec(p, is_fg),
-            .rgb => |c_rgb| [_]f32{
-                @as(f32, @floatFromInt(c_rgb.r)) / 255.0,
-                @as(f32, @floatFromInt(c_rgb.g)) / 255.0,
-                @as(f32, @floatFromInt(c_rgb.b)) / 255.0,
-                1.0,
-            },
-        };
+        return style_util.colorToRGBA(color, is_fg, self.default_fg, self.default_bg, &self.palette);
     }
 
     fn colorToVec(self: *const GridPass, color: Color, is_fg: bool, reverse: bool) [4]f32 {
-        const base = switch (color) {
-            .default => if (is_fg != reverse) self.default_fg else self.default_bg,
-            .palette => |p| self.paletteToVec(p, is_fg),
-            .rgb => |c_rgb| [_]f32{
-                @as(f32, @floatFromInt(c_rgb.r)) / 255.0,
-                @as(f32, @floatFromInt(c_rgb.g)) / 255.0,
-                @as(f32, @floatFromInt(c_rgb.b)) / 255.0,
-                1.0,
-            },
-        };
-        return base;
-    }
-
-    fn paletteToVec(self: *const GridPass, idx: u8, is_fg: bool) [4]f32 {
-        _ = is_fg;
-        const p = self.palette[idx];
-        return .{
-            @as(f32, @floatFromInt(p[0])) / 255.0,
-            @as(f32, @floatFromInt(p[1])) / 255.0,
-            @as(f32, @floatFromInt(p[2])) / 255.0,
-            1.0,
-        };
+        return style_util.colorToVec(color, is_fg, reverse, self.default_fg, self.default_bg, &self.palette);
     }
 
     pub fn draw(self: *GridPass, atlas: *Atlas, viewport_w: i32, viewport_h: i32) void {

@@ -23,6 +23,7 @@ const Cell = @import("../grid/cell.zig").Cell;
 const Line = @import("../grid/line.zig").Line;
 const Scaling = @import("../grid/line.zig").Scaling;
 const palette_default = @import("../grid/palette.zig").default_256;
+const style_util = @import("style.zig");
 
 /// Per-cell instance data. Layout matches the vertex attribs
 /// declared in `realize`. 100 bytes — for 200×80 cells: 1.6 MB.
@@ -965,42 +966,14 @@ pub const CellPass = struct {
     }
 
     fn colorToVec(self: *const CellPass, color: Color, is_fg: bool, reverse: bool) [4]f32 {
-        return switch (color) {
-            .default => if (is_fg != reverse) self.default_fg else self.default_bg,
-            .palette => |p| .{
-                @as(f32, @floatFromInt(self.palette[p][0])) / 255.0,
-                @as(f32, @floatFromInt(self.palette[p][1])) / 255.0,
-                @as(f32, @floatFromInt(self.palette[p][2])) / 255.0,
-                1.0,
-            },
-            .rgb => |r| .{
-                @as(f32, @floatFromInt(r.r)) / 255.0,
-                @as(f32, @floatFromInt(r.g)) / 255.0,
-                @as(f32, @floatFromInt(r.b)) / 255.0,
-                1.0,
-            },
-        };
+        return style_util.colorToVec(color, is_fg, reverse, self.default_fg, self.default_bg, &self.palette);
     }
 
     /// Resolve a Color to RGBA without considering reverse video —
     /// the caller swaps fg/bg explicitly to honour reverse on
     /// non-default colors too.
     fn colorToRGBA(self: *const CellPass, color: Color, is_fg: bool) [4]f32 {
-        return switch (color) {
-            .default => if (is_fg) self.default_fg else self.default_bg,
-            .palette => |p| .{
-                @as(f32, @floatFromInt(self.palette[p][0])) / 255.0,
-                @as(f32, @floatFromInt(self.palette[p][1])) / 255.0,
-                @as(f32, @floatFromInt(self.palette[p][2])) / 255.0,
-                1.0,
-            },
-            .rgb => |r| .{
-                @as(f32, @floatFromInt(r.r)) / 255.0,
-                @as(f32, @floatFromInt(r.g)) / 255.0,
-                @as(f32, @floatFromInt(r.b)) / 255.0,
-                1.0,
-            },
-        };
+        return style_util.colorToRGBA(color, is_fg, self.default_fg, self.default_bg, &self.palette);
     }
 };
 
