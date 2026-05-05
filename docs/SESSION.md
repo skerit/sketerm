@@ -3593,3 +3593,43 @@ The cellAt + setFontSize-resize + onRender scale multiplies all
 stay (those use `gtk_widget_get_*` which IS logical). Only the
 `onResize` callback's signal arguments were already physical and
 needed no scaling.
+
+## ✨ Command palette (Ctrl+Shift+P)
+
+VSCode/Sublime/Builder-style modal popover listing every curated
+user-facing action with title + one-line description + icon +
+live keybind hint. Searchable by substring across title and
+description; Up/Down navigate while typing-focus stays in the
+search entry; Enter activates; Escape dismisses.
+
+Wiring:
+
+- `input.zig::Action.command_palette` is the new action.
+- Default keybind: `Ctrl+Shift+P`. The previous binding for that
+  chord (`toggle_pin_tab`) moved to `Ctrl+Shift+I`. Either is
+  user-overridable via config.
+- `input.zig::runAction` is now `pub` so the palette can dispatch
+  per-pane actions (copy/paste/scrollback) against the focused
+  pane's input controller — same code path as the keybind.
+- `Window.dispatchAction` is the unified entry point: tries the
+  focused pane's input.runAction first, falls through to
+  `onShortcut` for window-level work. Palette and keybind both
+  hit the same dispatch.
+- `src/ui/palette.zig` — AdwDialog (handles modality + Escape +
+  centring), AdwActionRow per entry inside a GtkListBox styled
+  with the `boxed-list` CSS class for the libadwaita pill look.
+  Per-row keybind hint resolved via `gtk_accelerator_get_label`
+  against the live `Window.bindings` table (so user-customised
+  chords show up correctly).
+
+Curated entry set (~33 rows, intentionally not the raw enum dump):
+clipboard (4), tabs (8), panes (4), search & scrollback (8), font
+(3), layout & config (4), misc (2). Skipped: `goto_tab_1..9`
+(Alt+digit IS the workflow — palette rows would be noise),
+`interrupt_or_copy` (intent-overloaded chord), and any action
+with no actual handler today (e.g. menu.zig's `reset_terminal`,
+which falls through `else => {}` in `onMenuAction`).
+
+Adding a new entry is one line at the top of `ENTRIES` in
+`palette.zig`. The icon name comes from the Adwaita symbolic
+icon set; the keybind hint is automatic.

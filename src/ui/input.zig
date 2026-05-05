@@ -124,6 +124,9 @@ pub const Action = enum {
     scrollback_top,
     /// Jump to the live screen position (view_offset = 0).
     scrollback_bottom,
+    /// Open the command palette — modal popover with every
+    /// user-facing action, searchable by title/description.
+    command_palette,
 };
 
 /// One configured keybind: a (keyval, modifier-mask) → Action mapping.
@@ -157,7 +160,12 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_g, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .broadcast_cycle },
     .{ .keyval = c.GDK_KEY_z, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .restore_closed_tab },
     .{ .keyval = c.GDK_KEY_a, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_screen },
-    .{ .keyval = c.GDK_KEY_p, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .toggle_pin_tab },
+    // Ctrl+Shift+P is the cross-app convention for "command palette"
+    // (VSCode, Sublime, JetBrains, GNOME Builder, …) so it takes
+    // precedence here. Pin/unpin tab moves to Ctrl+Shift+I — pick
+    // any new chord in your config if you don't like it.
+    .{ .keyval = c.GDK_KEY_p, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .command_palette },
+    .{ .keyval = c.GDK_KEY_i, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .toggle_pin_tab },
     // Alt+1..9 → jump to specific tab. Standard across browsers,
     // gnome-terminal, kitty, etc. Doesn't collide with shell C-x
     // chords or Ctrl+Shift+digit (which terminator uses for splits).
@@ -256,6 +264,7 @@ pub fn actionName(a: Action) []const u8 {
         .scrollback_page_down => "scrollback_page_down",
         .scrollback_top => "scrollback_top",
         .scrollback_bottom => "scrollback_bottom",
+        .command_palette => "command_palette",
     };
 }
 
@@ -315,6 +324,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .scrollback_page_down => "Scroll forward one page",
         .scrollback_top => "Jump to scrollback top",
         .scrollback_bottom => "Jump to scrollback bottom",
+        .command_palette => "Open command palette",
     };
 }
 
@@ -553,7 +563,12 @@ fn onKeyPressed(
 /// is consumed) so the caller doesn't fall through to byte encoding.
 /// Per-pane actions handle themselves; Window-level actions go via
 /// `shortcut_sink`.
-fn runAction(ctx: *Ctx, action: Action) c.gboolean {
+///
+/// Public so the command palette can dispatch the per-pane half of
+/// the same action set (copy/paste/scrollback/...) against the
+/// focused pane's input context — same code path as the keybind
+/// version, no divergence.
+pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
     switch (action) {
         // Per-pane (local).
         .paste_clipboard => {

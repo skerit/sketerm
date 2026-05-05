@@ -10,6 +10,7 @@ const Pane = @import("pane.zig").Pane;
 const Pty = @import("../pty.zig").Pty;
 const Terminal = @import("../terminal.zig").Terminal;
 const layout_mod = @import("../layout.zig");
+const palette_mod = @import("palette.zig");
 const Config = @import("../config.zig").Config;
 
 /// One-shot hint. Reset to false at startup; flipped on first
@@ -2343,8 +2344,24 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .goto_tab_8 => self.gotoTab(7),
         .goto_tab_9 => self.gotoTab(8),
         .duplicate_tab => self.duplicateCurrentTab(),
+        .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         else => {},
     }
+}
+
+/// Public entry-point used by the command palette. Tries the
+/// focused pane's input controller first (covers per-pane actions
+/// like copy_selection / paste_clipboard / scrollback_*) and falls
+/// through to `onShortcut` for window-level actions. Mirrors the
+/// dispatch order the keybind handler uses, so palette dispatch
+/// and keybind dispatch hit the exact same code paths.
+pub fn dispatchAction(window: *Window, action: @import("input.zig").Action) void {
+    if (window.focusedPane()) |pane| {
+        if (pane.input_ctx) |ictx| {
+            if (@import("input.zig").runAction(ictx, action) != 0) return;
+        }
+    }
+    onShortcut(@ptrCast(window), action);
 }
 
 
