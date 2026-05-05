@@ -32,9 +32,20 @@ pub const ClosedTab = struct {
 /// Owned ratio holder for `applyPanedRatio` / `applyPanedRatioMap` /
 /// `freePanedRatio`. Carries its own allocator so the GTK destroy-notify
 /// can free without needing a Window pointer.
+/// Live ratio tracker for a GtkPaned. `ratio` is updated whenever the
+/// user drags (via notify::position) and re-applied on every map (via
+/// the map signal). Tab switches unmap+remap the paged subtree; without
+/// re-apply, GtkPaned reverts to natural sizes on remap.
+///
+/// `setting` guards against the feedback loop: our own gtk_paned_set_
+/// position triggers notify::position, which would re-read total (which
+/// may be transient during allocation) and corrupt ratio. We bracket
+/// every set_position with setting=true so the notify handler ignores
+/// our own writes.
 const PanedRatioCtx = struct {
     allocator: std.mem.Allocator,
     ratio: f32,
+    setting: bool = false,
 };
 
 /// Called from user-triggered action dispatch (menu items, keybinds,
@@ -721,8 +732,8 @@ pub const Window = struct {
                 };
                 _ = c.g_signal_connect_data(
                     paned,
-                    "notify::default-width",
-                    @ptrCast(&applyPanedRatio),
+                    "notify::position",
+                    @ptrCast(&onPanedPositionChanged),
                     @ptrCast(ratio_holder),
                     @ptrCast(&freePanedRatio),
                     c.G_CONNECT_DEFAULT,
@@ -1133,10 +1144,18 @@ pub const Window = struct {
         ratio_holder.* = .{ .allocator = self.allocator, .ratio = 0.5 };
         _ = c.g_signal_connect_data(
             paned,
+            "notify::position",
+            @ptrCast(&onPanedPositionChanged),
+            @ptrCast(ratio_holder),
+            @ptrCast(&freePanedRatio),
+            c.G_CONNECT_DEFAULT,
+        );
+        _ = c.g_signal_connect_data(
+            paned,
             "map",
             @ptrCast(&applyPanedRatioMap),
             @ptrCast(ratio_holder),
-            @ptrCast(&freePanedRatio),
+            null,
             c.G_CONNECT_DEFAULT,
         );
 
@@ -2674,12 +2693,26 @@ fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.
     }
 }
 
-fn applyPanedRatio(paned: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-    applyPanedRatioImpl(@ptrCast(paned), user);
-}
-
 fn applyPanedRatioMap(paned: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     applyPanedRatioImpl(paned, user);
+}
+
+/// notify::position fires when the user drags the divider — we read the
+/// current pos/total back into ctx.ratio so the next remap restores
+/// what the user chose, and so layout-save reads the up-to-date value.
+fn onPanedPositionChanged(paned: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(PanedRatioCtx, user);
+    if (ctx.setting) return;
+    const w: *c.GtkWidget = @ptrCast(paned);
+    const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(w)));
+    const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
+        c.gtk_widget_get_width(w)
+    else
+        c.gtk_widget_get_height(w);
+    if (total <= 0) return;
+    const pos = c.gtk_paned_get_position(@ptrCast(w));
+    if (pos <= 0) return;
+    ctx.ratio = @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total));
 }
 
 fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
@@ -2691,7 +2724,9 @@ fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
         c.gtk_widget_get_height(paned);
     if (total <= 0) return;
     const pos: c_int = @intFromFloat(@as(f32, @floatFromInt(total)) * ctx.ratio);
+    ctx.setting = true;
     c.gtk_paned_set_position(@ptrCast(paned), pos);
+    ctx.setting = false;
 }
 
 fn freePanedRatio(user: ?*anyopaque) callconv(.c) void {
