@@ -113,6 +113,68 @@ const Vertex = extern struct {
     baseline_y: f32 = 0.0,
 };
 
+/// Snapshot of every input that affects the overlay vertex buffer
+/// (cursor, selection, search, preedit, focus border, scrollbar,
+/// bell flash, default colors/palette, viewport, atlas metrics, and
+/// the GridPass-owned tunables). Cell content is *not* in here — the
+/// caller passes a separate `cells_changed` flag from CellPass.
+///
+/// Compared field-by-field via `std.meta.eql`; nested fixed arrays
+/// (palette, color vecs) recurse element-wise. Slice contents that
+/// can vary at the same length (search highlights, preedit text) are
+/// hashed instead of compared by ptr+len.
+const Snapshot = struct {
+    canvas_w: f32 = 0,
+    canvas_h: f32 = 0,
+    pad: f32 = 0,
+    focused: bool = false,
+
+    use_alt: bool = false,
+    view_off: u32 = 0,
+    sb_count: u32 = 0,
+
+    rows: u16 = 0,
+    cols: u16 = 0,
+    cell_w: u16 = 0,
+    cell_h: u16 = 0,
+    ascent: i16 = 0,
+
+    reverse_screen: bool = false,
+    default_fg: [4]f32 = .{ 0, 0, 0, 0 },
+    default_bg: [4]f32 = .{ 0, 0, 0, 0 },
+    palette: [256][3]u8 = std.mem.zeroes([256][3]u8),
+
+    cursor_visible: bool = false,
+    cursor_blink_on: bool = false,
+    cursor_shape: u8 = 0,
+    cursor_row: u16 = 0,
+    cursor_col: u16 = 0,
+    cursor_color: [4]f32 = .{ 0, 0, 0, 0 },
+
+    selection_mode: u8 = 0,
+    selection_anchor_row: i32 = 0,
+    selection_anchor_col: i32 = 0,
+    selection_end_row: i32 = 0,
+    selection_end_col: i32 = 0,
+
+    search_count: u32 = 0,
+    search_active_idx: i32 = -1,
+    search_hash: u64 = 0,
+
+    preedit_hash: u64 = 0,
+    preedit_len: usize = 0,
+
+    bell_at_us: i64 = 0,
+
+    dim_fg: f32 = 1.0,
+    dim_bg: f32 = 1.0,
+    enable_url_underline: bool = true,
+    enable_bidi: bool = true,
+    enable_ligatures: bool = true,
+    allow_bold: bool = true,
+    bold_is_bright: bool = true,
+};
+
 pub const GridPass = struct {
     program: c_uint = 0,
     vao: c_uint = 0,
@@ -152,6 +214,31 @@ pub const GridPass = struct {
     bidi_levels: std.ArrayList(u8) = .{},
     bidi_indices: std.ArrayList(usize) = .{},
 
+    /// Vertex-buffer reuse gating. After a successful build, holds
+    /// the inputs the build saw. On the next call, if cell content
+    /// hasn't changed, atlas pages haven't been evicted, the bell
+    /// isn't fading, and the snapshot still matches, `buildVertices`
+    /// returns immediately and `draw()` reuses the prior vbuf — the
+    /// GL upload is also skipped when `vbo_uploaded` is already set.
+    /// Reset by `forgetGL` (GL context loss invalidates everything).
+    vbuf_valid: bool = false,
+    /// Tracks whether the live VBO contents match `vbuf.items`. Set
+    /// after `draw` uploads. Cleared by every `buildVertices` rebuild
+    /// and by `forgetGL`. When set, `draw` skips the `glBufferData`.
+    vbo_uploaded: bool = false,
+    last_snapshot: Snapshot = .{},
+    last_atlas_generations: [atlas_mod.PAGE_COUNT]u32 =
+        [_]u32{0} ** atlas_mod.PAGE_COUNT,
+
+    /// Per-row caches keyed off the cell pass's `rebuilt_rows` mask.
+    /// Each row owns its own `Match` slice (URL hits) and a single
+    /// boolean for whether the row needs the bidi/DH overlay path.
+    /// Both invalidate on any rebuild signalled from the cell pass.
+    row_url_matches: std.ArrayList(std.ArrayList(@import("../grid/url_scan.zig").Match)) = .{},
+    row_url_match_count: std.ArrayList(usize) = .{},
+    row_overlay_needed: std.ArrayList(bool) = .{},
+    row_caches_valid: std.ArrayList(bool) = .{},
+
     pub fn init(allocator: std.mem.Allocator) GridPass {
         return .{ .allocator = allocator };
     }
@@ -161,6 +248,11 @@ pub const GridPass = struct {
         self.bidi_cps.deinit(self.allocator);
         self.bidi_levels.deinit(self.allocator);
         self.bidi_indices.deinit(self.allocator);
+        for (self.row_url_matches.items) |*lst| lst.deinit(self.allocator);
+        self.row_url_matches.deinit(self.allocator);
+        self.row_url_match_count.deinit(self.allocator);
+        self.row_overlay_needed.deinit(self.allocator);
+        self.row_caches_valid.deinit(self.allocator);
     }
 
     /// Ensure scratch capacity for `n` cells. Returns three slices.
@@ -183,6 +275,13 @@ pub const GridPass = struct {
         self.u_atlas = -1;
         self.u_dim_fg = -1;
         self.u_dim_bg = -1;
+        self.vbuf_valid = false;
+        self.vbo_uploaded = false;
+        self.last_atlas_generations = [_]u32{0} ** atlas_mod.PAGE_COUNT;
+        // Per-row caches don't depend on GL state, but they do hold
+        // glyph-position / bidi info that's tied to the atlas. Drop
+        // them so a re-realize against a fresh atlas rescans cleanly.
+        for (self.row_caches_valid.items) |*r| r.* = false;
     }
 
     pub fn realize(self: *GridPass) !void {
@@ -236,14 +335,74 @@ pub const GridPass = struct {
 
     /// Build the vertex buffer for the current screen state.
     /// `focused` adds a thin accent border at the pane edges.
+    /// `cells_changed` is the `cells_rebuilt` flag from the cell pass:
+    /// when false, no visible row's content moved, so any bidi/DH
+    /// overlay row + URL-underline scan would emit identical glyphs.
+    /// `rebuilt_rows` is the cell pass's per-row "rebuilt this frame"
+    /// mask (slice length == screen.rows). Rows whose entry is true
+    /// invalidate the per-row URL/bidi caches; everything else is
+    /// reused from the prior frame. An empty slice forces every
+    /// row's cache to be rebuilt (used by the smoke binaries).
     pub fn buildVertices(
         self: *GridPass,
         screen: *Screen,
         pool: *const StylePool,
         atlas: *Atlas,
         focused: bool,
+        cells_changed: bool,
+        rebuilt_rows: []const bool,
     ) !void {
+        // Atlas page eviction invalidates every UV/layer baked into
+        // the prior vbuf. Detect once per frame; if any layer's
+        // generation moved, force a rebuild and snapshot the new
+        // generations so we don't keep re-detecting.
+        var atlas_evicted = false;
+        for (atlas.pages, 0..) |p, i| {
+            if (p.generation != self.last_atlas_generations[i]) {
+                atlas_evicted = true;
+                self.last_atlas_generations[i] = p.generation;
+            }
+        }
+
+        // Bell flash is time-driven: alpha = 0.4 * (1 - elapsed/200ms).
+        // While the fade is running, every frame's overlay differs from
+        // the last — never reuse the cached vbuf during this window.
+        const bell_animating = blk: {
+            if (screen.bell_at_us <= 0) break :blk false;
+            const elapsed = std.time.microTimestamp() - screen.bell_at_us;
+            break :blk elapsed >= 0 and elapsed < 200_000;
+        };
+
+        const snap = self.computeSnapshot(screen, atlas, focused);
+        if (self.vbuf_valid and !cells_changed and !atlas_evicted and
+            !bell_animating and std.meta.eql(snap, self.last_snapshot))
+        {
+            return;
+        }
+
+        // We're rebuilding — the live VBO contents will diverge from
+        // `vbuf.items` until `draw` reuploads.
+        self.vbo_uploaded = false;
         self.vbuf.clearRetainingCapacity();
+
+        // Per-row caches: resize to match the current screen and
+        // invalidate rows the cell pass rebuilt (or every row when
+        // the atlas got evicted — cached glyph/position data is
+        // tied to the atlas). Cap capacity to avoid runaway when the
+        // grid shrinks and grows repeatedly.
+        try self.ensureRowCaches(screen.rows);
+        if (atlas_evicted) {
+            for (self.row_caches_valid.items) |*v| v.* = false;
+        } else if (rebuilt_rows.len == 0) {
+            // No rebuilt-row info from the caller (smoke binaries) —
+            // safest default is to rescan every row.
+            for (self.row_caches_valid.items) |*v| v.* = false;
+        } else {
+            const n = @min(rebuilt_rows.len, self.row_caches_valid.items.len);
+            for (rebuilt_rows[0..n], 0..) |dirty, i| {
+                if (dirty) self.row_caches_valid.items[i] = false;
+            }
+        }
 
         if (screen.reverse_screen) {
             self.default_fg = screen.default_bg;
@@ -265,6 +424,11 @@ pub const GridPass = struct {
 
         // Bidi rows + DH/DW rows: emit their glyphs here as overlays
         // (the cell pipeline only handles single-scale ASCII rows).
+        // The per-row `row_overlay_needed` cache + caches_valid flag
+        // means a row that wasn't rebuilt this frame skips the
+        // `rowNeedsBidi` cell scan entirely. Mostly-static htop-style
+        // content stops paying for the per-cell non-ASCII check on
+        // every redraw.
         var row: u16 = 0;
         while (row < screen.rows) : (row += 1) {
             const ln_ptr: *const @TypeOf(buf[0]) = if (row < view_off) blk: {
@@ -274,8 +438,11 @@ pub const GridPass = struct {
             const ln = ln_ptr.*;
             const cells = ln.cells[0..screen.cols];
 
-            const need_overlay = ln.scaling != .single or rowNeedsBidi(cells);
-            if (!need_overlay) continue;
+            if (!self.row_caches_valid.items[row]) {
+                self.row_overlay_needed.items[row] =
+                    ln.scaling != .single or rowNeedsBidi(cells);
+            }
+            if (!self.row_overlay_needed.items[row]) continue;
 
             try self.emitOverlayRow(atlas, pool, cells, row, cw, ch, ascent, ln.scaling);
         }
@@ -297,35 +464,44 @@ pub const GridPass = struct {
             try self.pushQuad(.{ x, y }, .{ w, ch }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0);
         }
 
-        // Auto-detected URL underlines. Per-row scan over visible
-        // cells; OSC 8 cells are skipped inside scanRow itself.
+        // Auto-detected URL underlines. Per-row scan results live in
+        // `row_url_matches`; rows whose cache is still valid skip the
+        // O(cols) `scanRow` call and just re-emit cached matches. The
+        // emission itself is a few quads per match — cheap regardless.
         if (self.enable_url_underline) {
             const url_scan = @import("../grid/url_scan.zig");
-            var matches: [16]url_scan.Match = undefined;
+            var scratch: [16]url_scan.Match = undefined;
             var vrow: u16 = 0;
             while (vrow < screen.rows) : (vrow += 1) {
-                const ln_ptr2: *const @TypeOf(buf[0]) = if (vrow < view_off) blk: {
-                    const sb_idx = sb_count - view_off + vrow;
-                    break :blk screen.scrollbackLine(sb_idx);
-                } else &buf[vrow - view_off];
-                const cells2 = ln_ptr2.cells[0..screen.cols];
-                const n_match = url_scan.scanRow(cells2, &matches);
+                if (!self.row_caches_valid.items[vrow]) {
+                    const ln_ptr2: *const @TypeOf(buf[0]) = if (vrow < view_off) blk: {
+                        const sb_idx = sb_count - view_off + vrow;
+                        break :blk screen.scrollbackLine(sb_idx);
+                    } else &buf[vrow - view_off];
+                    const cells2 = ln_ptr2.cells[0..screen.cols];
+                    const n_match = url_scan.scanRow(cells2, &scratch);
+                    var slot = &self.row_url_matches.items[vrow];
+                    slot.clearRetainingCapacity();
+                    if (n_match > 0) {
+                        try slot.appendSlice(self.allocator, scratch[0..n_match]);
+                    }
+                    self.row_url_match_count.items[vrow] = n_match;
+                }
+                const n_match = self.row_url_match_count.items[vrow];
                 if (n_match == 0) continue;
                 const y: f32 = pad + @as(f32, @floatFromInt(vrow)) * ch;
                 // 1px-equivalent underline near the bottom of the cell.
                 const thin: f32 = @max(1.0, ch / 14.0);
                 const uy: f32 = y + ch - thin - 1.0;
-                for (matches[0..n_match]) |m| {
+                const accent: [4]f32 = .{
+                    self.default_fg[0],
+                    self.default_fg[1],
+                    self.default_fg[2],
+                    0.85,
+                };
+                for (self.row_url_matches.items[vrow].items) |m| {
                     const x: f32 = pad + @as(f32, @floatFromInt(m.col_start)) * cw;
                     const w: f32 = @as(f32, @floatFromInt(m.col_end - m.col_start)) * cw;
-                    // Use accent fg @ ~0.85 alpha so the underline
-                    // reads as "this is interactive" without dominating.
-                    const accent: [4]f32 = .{
-                        self.default_fg[0],
-                        self.default_fg[1],
-                        self.default_fg[2],
-                        0.85,
-                    };
                     try self.pushQuadDim(.{ x, uy }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, accent, 0.0, 1.0);
                 }
             }
@@ -539,6 +715,90 @@ pub const GridPass = struct {
                 .{ 0.40, 0.55, 0.85, 0.70 };
             try self.pushQuad(.{ track_x, thumb_y }, .{ track_w, thumb_h }, .{ 0, 0 }, .{ 0, 0 }, thumb_color, 0.0);
         }
+
+        // Per-row caches are now consistent with what we emitted —
+        // mark them all valid so the next frame can reuse any row
+        // the cell pass doesn't touch.
+        for (self.row_caches_valid.items) |*v| v.* = true;
+        self.last_snapshot = snap;
+        self.vbuf_valid = true;
+    }
+
+    fn ensureRowCaches(self: *GridPass, rows: u16) !void {
+        const old_len = self.row_url_matches.items.len;
+        if (rows == old_len) return;
+        if (rows < old_len) {
+            // Free the per-row Match lists we're dropping.
+            for (self.row_url_matches.items[rows..]) |*lst| lst.deinit(self.allocator);
+        }
+        try self.row_url_matches.resize(self.allocator, rows);
+        try self.row_url_match_count.resize(self.allocator, rows);
+        try self.row_overlay_needed.resize(self.allocator, rows);
+        try self.row_caches_valid.resize(self.allocator, rows);
+        if (rows > old_len) {
+            for (self.row_url_matches.items[old_len..]) |*lst| lst.* = .{};
+            for (self.row_url_match_count.items[old_len..]) |*c0| c0.* = 0;
+            for (self.row_overlay_needed.items[old_len..]) |*c0| c0.* = false;
+        }
+        // Any growth or shrink invalidates the row->index mapping.
+        for (self.row_caches_valid.items) |*v| v.* = false;
+    }
+
+    fn computeSnapshot(self: *const GridPass, screen: *const Screen, atlas: *const Atlas, focused: bool) Snapshot {
+        const sb_count: u32 = if (screen.use_alt) 0 else screen.scrollbackCount();
+        var s: Snapshot = .{
+            .canvas_w = self.canvas_w,
+            .canvas_h = self.canvas_h,
+            .pad = self.pad,
+            .focused = focused,
+
+            .use_alt = screen.use_alt,
+            .view_off = @min(screen.view_offset, sb_count),
+            .sb_count = sb_count,
+
+            .rows = screen.rows,
+            .cols = screen.cols,
+            .cell_w = atlas.cell_w,
+            .cell_h = atlas.cell_h,
+            .ascent = atlas.ascent,
+
+            .reverse_screen = screen.reverse_screen,
+            .default_fg = screen.default_fg,
+            .default_bg = screen.default_bg,
+            .palette = screen.palette,
+
+            .cursor_visible = screen.cursor_visible,
+            .cursor_blink_on = screen.cursor_blink_on,
+            .cursor_shape = @intFromEnum(screen.cursor_shape),
+            .cursor_row = screen.row,
+            .cursor_col = screen.col,
+            .cursor_color = screen.cursor_color,
+
+            .selection_mode = @intFromEnum(screen.selection.mode),
+            .selection_anchor_row = screen.selection.anchor_row,
+            .selection_anchor_col = screen.selection.anchor_col,
+            .selection_end_row = screen.selection.end_row,
+            .selection_end_col = screen.selection.end_col,
+
+            .search_count = @intCast(screen.search_highlights.len),
+            .search_active_idx = screen.search_active_idx,
+            .search_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(screen.search_highlights)),
+
+            .bell_at_us = screen.bell_at_us,
+
+            .dim_fg = self.dim_fg,
+            .dim_bg = self.dim_bg,
+            .enable_url_underline = self.enable_url_underline,
+            .enable_bidi = self.enable_bidi,
+            .enable_ligatures = self.enable_ligatures,
+            .allow_bold = self.allow_bold,
+            .bold_is_bright = self.bold_is_bright,
+        };
+        if (screen.preedit_text) |t| {
+            s.preedit_hash = std.hash.Wyhash.hash(0, t);
+            s.preedit_len = t.len;
+        }
+        return s;
     }
 
     /// Forwarded from CellPass — see its definition. Only rows with
@@ -832,8 +1092,11 @@ pub const GridPass = struct {
 
         c.glBindVertexArray(self.vao);
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
-        const bytes: c.GLsizeiptr = @intCast(self.vbuf.items.len * @sizeOf(Vertex));
-        c.glBufferData(c.GL_ARRAY_BUFFER, bytes, self.vbuf.items.ptr, c.GL_DYNAMIC_DRAW);
+        if (!self.vbo_uploaded) {
+            const bytes: c.GLsizeiptr = @intCast(self.vbuf.items.len * @sizeOf(Vertex));
+            c.glBufferData(c.GL_ARRAY_BUFFER, bytes, self.vbuf.items.ptr, c.GL_DYNAMIC_DRAW);
+            self.vbo_uploaded = true;
+        }
 
         c.glEnable(c.GL_BLEND);
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);

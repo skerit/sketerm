@@ -181,6 +181,34 @@ pub fn build(b: *std.Build) void {
     const smoke_cell_step = b.step("smoke-cell", "Headless GL cell-pipeline render check");
     smoke_cell_step.dependOn(&smoke_cell_run.step);
 
+    // Headless cell-upload microbench — `zig build bench-cell-upload`.
+    // Same EGL surfaceless context as smoke-cell, but at 4K with a
+    // realistic-sized cell grid, looped to measure per-frame upload +
+    // draw + GPU-finish latency. Used to isolate GL cost from GTK4 /
+    // Wayland integration when chasing render stalls.
+    const bench_cell_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_cell_upload.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const bench_cell = b.addExecutable(.{
+        .name = "sketerm-bench-cell-upload",
+        .root_module = bench_cell_mod,
+        .use_lld = true,
+    });
+    bench_cell.linkSystemLibrary("EGL");
+    for (sys_libs) |lib| bench_cell.linkSystemLibrary(lib);
+    bench_cell.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    bench_cell.addIncludePath(b.path("vendor"));
+    b.installArtifact(bench_cell);
+    const bench_cell_run = b.addRunArtifact(bench_cell);
+    const bench_cell_step = b.step("bench-cell-upload", "Headless cell-upload microbench (isolates GL from GTK)");
+    bench_cell_step.dependOn(&bench_cell_run.step);
+
     // Headless transparency smoke — `zig build smoke-transparency`.
     // Drives the same stack as smoke-cell but with bg alpha=0.5,
     // asserts the readback FBO retains translucency. Plan-v3 had

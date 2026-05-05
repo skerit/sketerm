@@ -111,6 +111,8 @@ pub fn main() u8 {
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
+    @import("util/profile.zig").init();
+
     g_app = .{ .allocator = allocator };
 
     const argv = std.process.argsAlloc(allocator) catch return 1;

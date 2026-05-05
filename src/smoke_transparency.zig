@@ -146,7 +146,7 @@ pub fn main() !u8 {
     grid_pass.canvas_h = @floatFromInt(H);
     // focused=false skips the focus-border quad which is opaque
     // and would push corner pixel alphas up to 1.0.
-    try grid_pass.buildVertices(screen, &pool, atlas.?, false);
+    try grid_pass.buildVertices(screen, &pool, atlas.?, false, true, &.{});
     grid_pass.draw(atlas.?, W, H);
     c.glFinish();
 

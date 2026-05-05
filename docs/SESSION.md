@@ -3377,3 +3377,219 @@ configurable upper bound is "Alt+9" anyway since digit keys are
 the natural binding. Tab-10+ users still cycle via Ctrl+Tab.
 
 main.zig HELP_TEXT lists the new chord.
+
+## render: gate overlay rebuild on input change
+
+`grid_pass.buildVertices` ran every render unconditionally — full
+vbuf rebuild including the per-row bidi/DH detect, URL scan, and
+selection emit, even when no overlay-relevant input had moved
+since the last frame. On large grids (4K, 24pt font, ~270x90
+cells) the per-row scans made every redraw heavier than it
+needed to be, and idle-blink frames did the same work just to
+toggle cursor visibility.
+
+Now: `CellPass.rebuildAndUpload` records `cells_rebuilt` (any
+row got rebuilt this call). `GridPass` keeps a `Snapshot` of
+overlay inputs (cursor, selection, search, preedit, focus,
+view_off, bell, default colors/palette, viewport, atlas
+metrics, GridPass-owned tunables) plus the per-page atlas
+generation. `buildVertices(... cells_changed)` returns early if
+none of these moved AND the bell isn't currently fading — `draw`
+reuploads the prior vbuf as-is.
+
+Snapshot uses fixed arrays so `std.meta.eql` can compare without
+heap touch; variable-length inputs (search highlights, preedit
+text) are hashed via Wyhash. Atlas page eviction is detected the
+same way `cell_pass` already does it; both passes now snapshot
+generations independently.
+
+Smoke binaries pass `cells_changed=true` since they're one-shot.
+408/408 tests still pass.
+
+## HiDPI: scale-factor everywhere it was missing
+
+Three bugs from the same root cause — widget input/size APIs return
+LOGICAL CSS pixels, but our cell metrics + `pad` + GL viewport live
+in PHYSICAL framebuffer pixels (atlas measures via
+`FT_Set_Pixel_Sizes`, viewport is `widget_size * scale_factor`).
+Mixing the two units broke things on any HiDPI surface.
+
+1. `Pane.cellAt(x, y)` divided pointer coords (logical) by
+   `atlas.cell_w` (physical). At scale_factor=2 every click landed
+   half-way to its intended cell. Fix: scale `x`, `y` up by
+   `gtk_widget_get_scale_factor` before the divide.
+
+2. `onResize` and `setFontSize`'s grid-resize math divided
+   `gtk_widget_get_width/height` (logical) by physical cell
+   metrics, so `cols`/`rows` came out at half on scale=2. Visually
+   the right half of the GL area sat empty (`glClearColor` only)
+   while the shell formatted output to the under-counted column
+   width. Fix: multiply widget size by scale_factor before the
+   divide.
+
+3. `Pane.font_size` (a value the docstring already calls "points")
+   was passed straight to `Atlas.initOpts` as raw pixels. On 4K
+   HiDPI surfaces the default 14-point config rendered cells at 14
+   physical pixels = ~7 logical pixels per cell, which is why
+   first-run text was tiny and users compensated by bumping to 18-
+   24. Now `Pane.physicalFontSize()` does the conversion:
+   `pixel_size = round(font_pt * 96 * scale_factor / 72)`. The
+   chrome (Pango) was already doing this; the GL area now matches.
+
+   **Migration:** users who manually bumped `font_size` to
+   compensate should drop back to ~14. The post-fix value is in
+   POINTS, not pixels.
+
+Deferred: rebuilding the atlas when scale_factor changes mid-run
+(window moved between monitors with different scales). Today the
+atlas is sized at first-realize / setFontSize. A
+`notify::scale-factor` handler that re-runs the atlas-init path
+would close that gap.
+
+## render: GtkGraphicsOffload — the actual fix for the 4K stall
+
+After the user reported "still slow even with htop refreshing every
+few seconds," the long-running buffer-sync investigation (persistent-
+mapped + fence, `glBufferData` orphan, triple-buffered VBOs,
+`glMapBufferRange` with INVALIDATE+UNSYNCHRONIZED) all came up empty.
+A headless EGL surfaceless microbench (`zig build bench-cell-upload`,
+`src/bench_cell_upload.zig`) running the SAME upload + draw code at
+4K finished a full frame in ~500 µs end-to-end including `glFinish`.
+The same code on the GTK4 path was 10-20× slower.
+
+The bottleneck wasn't our GL code. It was GTK4's render model:
+`GtkGLArea` renders to an offscreen FBO, then GSK composites that
+FBO into the window's render tree on the GPU after `onRender`
+returns. Mesa serialises our next `glBufferData` behind that
+compositing pass — 5-8 ms of stall every frame. On the same Wayland
+surface, GTK chrome dispatch (popovers, menu hover, button hover
+state) all wait behind the same pipeline drain.
+
+Fix: wrap the `GtkGLArea` in a `GtkGraphicsOffload` widget. Added
+in GTK 4.14, extended to support `GtkGLArea` in 4.16. Tells GTK to
+attach the GLArea's output as a `GdkDmabufTexture` to a Wayland
+**subsurface** below the window's main surface — bypassing GSK's
+offscreen FBO + composite step entirely. The compositor stacks the
+subsurface and can even direct-scanout it. No GPU work between our
+render and the surface commit, no implicit sync on the next upload.
+
+Wiring is one line in `pane.zig`:
+
+```zig
+const offload = c.gtk_graphics_offload_new(area_widget);
+c.gtk_graphics_offload_set_enabled(@ptrCast(offload), c.GTK_GRAPHICS_OFFLOAD_ENABLED);
+c.gtk_graphics_offload_set_black_background(@ptrCast(offload), 1);
+// Then add `offload` to the wrapper box instead of `area_widget` directly.
+```
+
+Verified live with `GDK_DEBUG=offload` — every frame logs
+`GdkDmabufTexture Attaching` against a created Wayland subsurface;
+zero fallback reasons. Per-frame upload latency dropped from ~6 ms
+to ~25-100 µs steady state (60-240× faster). Total `onRender`
+dropped from 2-3 ms typical / 8-10 ms max to 15-130 µs typical /
+~390 µs max — ~25× faster on the worst case.
+
+**Caveats** (offload silently falls back if any of these break):
+- Requires GTK ≥ 4.16. Arch ships 4.22, fine.
+- Anything painted on top of the offload region with effects (CSS
+  rounded corners, shadows, opacity, libadwaita overlays) disables
+  offload. Our pane structure today is `[titlebar above][offload(GLArea)]`
+  in a vertical box — nothing on top of the GL region — so we're
+  clean. A future overlay (e.g. a search bar drawn over the grid)
+  would need to live as a separate offloaded subsurface or be
+  rendered into our own GL output.
+- `GDK_DEBUG=offload` is the canonical way to verify it's still
+  engaging after future widget-tree changes.
+
+Other GTK4 terminals (Ptyxis, Console, Black Box) don't hit this
+class of bug because they wrap VTE, which renders via Cairo+Pango
+through GSK — no `GtkGLArea`. Our cell pipeline is novel for the
+GTK4 ecosystem; `GtkGraphicsOffload` was built for exactly our
+shape of app.
+
+## terminal: BCE on EL/ED/ECH
+
+CSI K (Erase In Line), CSI J (Erase In Display), and CSI X
+(Erase Character) all `@memset(cells, .{})`'d, which gave erased
+cells the default style. xterm-style BCE (Background Color Erase)
+fills with the current SGR style instead — htop's full-width
+green header bar is the canonical visible test: it writes column
+labels with green bg, then EL's the rest of the row, expecting
+green to extend to the screen edge. Without BCE the green stopped
+at the last printed column.
+
+`Line.clearStyled(fill_style)` and `Line.eraseRangeStyled(from,
+to, fill_style)` are the BCE variants of `clear` and `eraseRange`.
+The three CSI erase paths in `Screen` now pass `self.cur_style`.
+Plain `clear` / `eraseRange` stay for reflow + full resets where
+default-style fill is correct.
+
+Scroll-region fills (`scrollUp`/`scrollDown` blank-row clears,
+`insertChars`) still use `.{}`; xterm BCEs those too but fewer
+apps depend on it and the fix is mechanical. Deferred.
+
+## render: per-row caches + idle-frame upload skip
+
+When fast-updating apps (htop, watch, top, journalctl -f) churn
+the screen at full-grid scale, the per-frame fixed costs in the
+overlay pass started to dominate: every redraw re-walked every
+row to detect bidi/DH overlay rows and re-scanned every row for
+URL underlines, even rows whose content hadn't moved since the
+last frame. On 4K HiDPI surfaces the chrome shares the same
+Wayland surface as the GL area, so a slow `onRender` stalls the
+chrome too — menu hover felt laggy *only* while content was
+churning.
+
+Three changes:
+
+1. **`CellPass.rebuilt_rows`** — a per-row "rebuilt this frame"
+   bitmask, parallel to `row_needs_upload` but with different
+   lifetime: cleared at the *top* of `rebuildAndUpload`, set per
+   row that gets rebuilt, and SURVIVES `uploadDirtyRows` so the
+   overlay pass can read it after the cell pass returns.
+
+2. **`GridPass` per-row caches** — `row_url_matches` (URL hits
+   per row) + `row_overlay_needed` (does the row need the bidi/
+   DH glyph path) + `row_caches_valid`. `buildVertices` accepts
+   `rebuilt_rows: []const bool`; rows whose entry is true get
+   their caches re-scanned, every other row reuses last frame's
+   answer. Atlas eviction wipes everything (cached glyph
+   positions are tied to the atlas).
+
+3. **Skip the GL upload when nothing rebuilt.**
+   - `CellPass.rebuildAndUpload` returns early when `any_built ==
+     false`, avoiding the persistent-mapped fence wait on idle
+     frames driven only by cursor blink / overlay state.
+   - `GridPass.draw` tracks `vbo_uploaded`. `buildVertices`
+     clears it on every rebuild, `draw` sets it after the
+     `glBufferData`. Idle reuses the prior upload — no copy, no
+     driver round-trip.
+
+Net effect during an htop refresh on a ~100×60 grid: the bidi
+loop's per-row "any non-ASCII?" cell scan only runs on rows that
+htop actually rewrote, the URL scan likewise, and the `glBufferData`
+on the overlay vbuf disappears entirely on frames where overlay
+state didn't move.
+
+Smoke binaries pass `&.{}` for `rebuilt_rows`, which the build
+treats as "rescan every row" — the smokes only render once.
+
+## render: revert onResize scale_factor multiply
+
+The HiDPI batch multiplied the `GtkGLArea::resize` signal's
+`width` / `height` by `scale_factor` to convert "logical" to
+"physical." That was wrong: unlike `gtk_widget_get_width`, which
+*does* return logical CSS pixels, the `resize` signal on
+`GtkGLArea` already fires with framebuffer dimensions (physical
+pixels) — that's the whole reason the signal exists separately
+from `size-allocate`, so client code can call `glViewport` with
+the right values. Multiplying again over-counted cols/rows by
+`scale_factor`, so on a HiDPI surface the shell got told it had
+twice as many columns as the screen could display. htop laid out
+its bars wider than the visible area and you saw only the top-
+left fragment.
+
+The cellAt + setFontSize-resize + onRender scale multiplies all
+stay (those use `gtk_widget_get_*` which IS logical). Only the
+`onResize` callback's signal arguments were already physical and
+needed no scaling.

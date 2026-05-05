@@ -156,7 +156,7 @@ pub fn main() !u8 {
     try grid_pass.realize();
     grid_pass.canvas_w = @floatFromInt(W);
     grid_pass.canvas_h = @floatFromInt(H);
-    try grid_pass.buildVertices(screen, &pool, atlas.?, true);
+    try grid_pass.buildVertices(screen, &pool, atlas.?, true, true, &.{});
     grid_pass.draw(atlas.?, W, H);
     c.glFinish();
 

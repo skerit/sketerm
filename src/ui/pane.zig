@@ -209,14 +209,42 @@ pub const Pane = struct {
         );
         c.gtk_widget_add_controller(tb_box, @ptrCast(tb_click));
 
-        // Wrapper that holds [titlebar][GLArea] vertically. We make
-        // the wrapper the publicly-exposed widget so splits / layout
-        // restore reparent the whole stack rather than just the area.
+        // Wrap the GLArea in a GtkGraphicsOffload (GTK ≥ 4.16). The
+        // offload widget tells GTK4 to attach our rendered output as
+        // a Wayland subsurface with a dmabuf, bypassing GSK's
+        // offscreen-FBO + composite step. Without this, the FBO blit
+        // + GTK chrome composite holds the GPU after every frame,
+        // and our next `glBufferData` stalls 5-8 ms on the implicit
+        // sync — visible as sluggish menu hover whenever content
+        // updates. Maintainer reference + the chain that makes this
+        // work for GLArea specifically: the GTK 4.16 release added
+        // dmabuf export to GLArea so offload can pass-through.
+        //
+        // black_background=true draws a solid black under the
+        // offloaded subsurface — avoids the brief transparency flash
+        // on first realise while the dmabuf is still being attached.
+        // ENABLED forces the offload path even when GTK can't fully
+        // verify the offload is safe (fall-through is automatic if
+        // the compositor or driver actually rejects it).
+        //
+        // Verify this is hitting the fast path with `GDK_DEBUG=offload`
+        // — every frame logs either an offload success or the reason
+        // it fell back (CSS effects, overlapping siblings, etc.).
+        const offload = c.gtk_graphics_offload_new(area_widget);
+        c.gtk_graphics_offload_set_enabled(@ptrCast(offload), c.GTK_GRAPHICS_OFFLOAD_ENABLED);
+        c.gtk_graphics_offload_set_black_background(@ptrCast(offload), 1);
+        c.gtk_widget_set_vexpand(offload, 1);
+        c.gtk_widget_set_hexpand(offload, 1);
+
+        // Wrapper that holds [titlebar][offload(GLArea)] vertically.
+        // We make the wrapper the publicly-exposed widget so splits /
+        // layout restore reparent the whole stack rather than just
+        // the area.
         const wrap = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
         c.gtk_widget_set_hexpand(wrap, 1);
         c.gtk_widget_set_vexpand(wrap, 1);
         c.gtk_box_append(@ptrCast(wrap), tb_box);
-        c.gtk_box_append(@ptrCast(wrap), area_widget);
+        c.gtk_box_append(@ptrCast(wrap), offload);
 
         self.* = .{
             .area = @ptrCast(area_widget),
@@ -431,12 +459,23 @@ pub const Pane = struct {
     /// Returns the VISUAL column (left-to-right pixel order). Callers
     /// that need a LOGICAL column (selection storage on bidi rows)
     /// should use `cellAtLogical`.
+    ///
+    /// GTK gesture/motion events report widget-local LOGICAL pixels
+    /// (pre-HiDPI). The cell grid + `pad` live in PHYSICAL framebuffer
+    /// pixels (atlas measures cells via `FT_Set_Pixel_Sizes`, GL
+    /// viewport uses `widget_size * scale_factor`). Scale up the
+    /// pointer coords first so the divide is unit-consistent — without
+    /// this, clicks on HiDPI displays land 1/scale of the way to the
+    /// intended cell.
     fn cellAt(self: *Pane, x: f64, y: f64) CellPos {
         const atlas = self.atlas;
         if (atlas == null or atlas.?.cell_w == 0 or atlas.?.cell_h == 0) return .{ .row = 0, .col = 0 };
+        const scale: f64 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
+        const sx = x * scale;
+        const sy = y * scale;
         const pad: f64 = @floatCast(self.grid_pass.pad);
-        const col_f = (x - pad) / @as(f64, @floatFromInt(atlas.?.cell_w));
-        const row_f = (y - pad) / @as(f64, @floatFromInt(atlas.?.cell_h));
+        const col_f = (sx - pad) / @as(f64, @floatFromInt(atlas.?.cell_w));
+        const row_f = (sy - pad) / @as(f64, @floatFromInt(atlas.?.cell_h));
         const visible_row: i32 = @intFromFloat(@max(0.0, row_f));
         const view_off: i32 = @intCast(self.terminal.screen.view_offset);
         return .{
@@ -554,6 +593,21 @@ pub const Pane = struct {
         }
     }
 
+    /// Convert a point size (Pane.font_size, the user-facing config
+    /// value) to PHYSICAL framebuffer pixels honouring the widget's
+    /// HiDPI scale factor. FreeType + the cell grid both work in
+    /// physical pixels — feed it the result of this. Without the
+    /// scale_factor multiply the same point size renders tiny on
+    /// HiDPI surfaces because GTK reports logical CSS pixels and we'd
+    /// be sizing cells as if 1 logical px == 1 device px.
+    fn physicalFontSize(self: *const Pane) u16 {
+        const scale: f64 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
+        const dpi: f64 = 96.0 * scale;
+        const px: f64 = @as(f64, @floatFromInt(self.font_size)) * dpi / 72.0;
+        const rounded = @round(px);
+        return @intFromFloat(@max(1.0, rounded));
+    }
+
     /// Live font-size change. Tears down the old atlas (and its GL
     /// texture), bumps `font_size`, and rebuilds against the current
     /// GL context. The renderer rebinds the new texture each frame.
@@ -580,7 +634,7 @@ pub const Pane = struct {
 
         // Same path as onRealize but inline so we don't re-do GL pass
         // setup (those programs / VBOs are still live).
-        const size: u16 = self.font_size;
+        const size: u16 = self.physicalFontSize();
         if (self.font_path) |fp| {
             const z = self.allocator.allocSentinel(u8, fp.len, 0) catch return;
             defer self.allocator.free(z);
@@ -618,12 +672,15 @@ pub const Pane = struct {
         self.terminal.screen.cell_pixel_h = self.atlas.?.cell_h;
 
         // Force a SIGWINCH on the child — terminal winsize in cells
-        // changes when the cell size changes.
+        // changes when the cell size changes. Widget size is logical
+        // CSS pixels; cell metrics are framebuffer pixels — multiply
+        // by scale_factor to compare in the same space.
         const w = c.gtk_widget_get_width(@ptrCast(self.area));
         const h = c.gtk_widget_get_height(@ptrCast(self.area));
+        const scale = c.gtk_widget_get_scale_factor(@ptrCast(self.area));
         const pad: f32 = self.grid_pass.pad;
-        const inner_w = @as(f32, @floatFromInt(w)) - 2 * pad;
-        const inner_h = @as(f32, @floatFromInt(h)) - 2 * pad;
+        const inner_w = @as(f32, @floatFromInt(w * scale)) - 2 * pad;
+        const inner_h = @as(f32, @floatFromInt(h * scale)) - 2 * pad;
         const cw: f32 = @floatFromInt(self.atlas.?.cell_w);
         const ch: f32 = @floatFromInt(self.atlas.?.cell_h);
         if (cw > 0 and ch > 0) {
@@ -669,7 +726,7 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     // built-in candidate list. Size from Pane.font_size (set by
     // Config or the Ctrl+/Ctrl- shortcuts).
     self.atlas = null;
-    const size: u16 = self.font_size;
+    const size: u16 = self.physicalFontSize();
     if (self.font_path) |fp| {
         const z = self.allocator.allocSentinel(u8, fp.len, 0) catch return;
         defer self.allocator.free(z);
@@ -726,6 +783,8 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
 fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Pane, user);
     const atlas = self.atlas orelse return @intFromBool(false);
+    const profile = @import("../util/profile.zig");
+    const t_total = if (profile.enabled) std.time.nanoTimestamp() else 0;
 
     const w = c.gtk_widget_get_width(@ptrCast(area));
     const h = c.gtk_widget_get_height(@ptrCast(area));
@@ -752,7 +811,11 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     self.cell_pass.pad = self.grid_pass.pad;
     self.cell_pass.enable_ligatures = self.grid_pass.enable_ligatures;
     self.cell_pass.enable_bidi = self.grid_pass.enable_bidi;
+    const t_cell_rebuild = if (profile.enabled) std.time.nanoTimestamp() else 0;
     self.cell_pass.rebuildAndUpload(self.terminal.screen, &self.terminal.pool, atlas) catch return @intFromBool(false);
+    if (profile.enabled) profile.record(.cell_rebuild, @intCast(std.time.nanoTimestamp() - t_cell_rebuild));
+    const cells_changed = self.cell_pass.cells_rebuilt;
+    const rebuilt_rows = self.cell_pass.rebuilt_rows.items;
 
     // Z-ordering: images with z_index < 0 render BEHIND text/cells,
     // images with z_index >= 0 render in front (kitty default).
@@ -761,17 +824,36 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     // Match the cell grid's inner padding so images align with the
     // cells that placed them.
     self.image_pass.pad = self.grid_pass.pad;
-    self.image_pass.drawZ(&self.image_store, phys_w, phys_h, .below);
+    var img_ns: u64 = 0;
+    {
+        const t_img = if (profile.enabled) std.time.nanoTimestamp() else 0;
+        self.image_pass.drawZ(&self.image_store, phys_w, phys_h, .below);
+        if (profile.enabled) img_ns += @intCast(std.time.nanoTimestamp() - t_img);
+    }
 
+    const t_cell_draw = if (profile.enabled) std.time.nanoTimestamp() else 0;
     self.cell_pass.draw(atlas, phys_w, phys_h);
+    if (profile.enabled) profile.record(.cell_draw, @intCast(std.time.nanoTimestamp() - t_cell_draw));
     // Overlay pipeline (per-vertex VBO) — cursor, selection, focus
     // border, scrollback indicator, preedit, bell, and any rows that
     // need bidi reorder or DH/DW per-line scaling.
-    self.grid_pass.buildVertices(self.terminal.screen, &self.terminal.pool, atlas, focused) catch return @intFromBool(false);
+    const t_grid_build = if (profile.enabled) std.time.nanoTimestamp() else 0;
+    self.grid_pass.buildVertices(self.terminal.screen, &self.terminal.pool, atlas, focused, cells_changed, rebuilt_rows) catch return @intFromBool(false);
+    if (profile.enabled) profile.record(.grid_build, @intCast(std.time.nanoTimestamp() - t_grid_build));
+    const t_grid_draw = if (profile.enabled) std.time.nanoTimestamp() else 0;
     self.grid_pass.draw(atlas, phys_w, phys_h);
+    if (profile.enabled) profile.record(.grid_draw, @intCast(std.time.nanoTimestamp() - t_grid_draw));
 
     // Foreground images (z >= 0).
-    self.image_pass.drawZ(&self.image_store, phys_w, phys_h, .above);
+    {
+        const t_img = if (profile.enabled) std.time.nanoTimestamp() else 0;
+        self.image_pass.drawZ(&self.image_store, phys_w, phys_h, .above);
+        if (profile.enabled) img_ns += @intCast(std.time.nanoTimestamp() - t_img);
+    }
+    if (profile.enabled) {
+        profile.record(.image_pass, img_ns);
+        profile.record(.onrender_total, @intCast(std.time.nanoTimestamp() - t_total));
+    }
 
     return @intFromBool(true);
 }
@@ -1602,7 +1684,12 @@ fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) cal
     if (atlas.cell_w == 0 or atlas.cell_h == 0) return;
     // Subtract pane padding (top+bottom, left+right) before computing
     // cell counts — otherwise we'd allocate cells that overflow the
-    // visible content area.
+    // visible content area. NOTE: GtkGLArea's resize signal fires with
+    // the framebuffer dimensions in PHYSICAL pixels (that's the whole
+    // reason the signal exists separately from size-allocate — to give
+    // the user the right values for `glViewport`). Do not multiply by
+    // scale_factor here; cell metrics are also in framebuffer pixels,
+    // so the divide is already unit-consistent.
     const pad: c_int = @intFromFloat(self.grid_pass.pad);
     const inner_w: c_int = @max(1, width - 2 * pad);
     const inner_h: c_int = @max(1, height - 2 * pad);
