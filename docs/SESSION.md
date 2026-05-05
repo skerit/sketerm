@@ -3633,3 +3633,66 @@ which falls through `else => {}` in `onMenuAction`).
 Adding a new entry is one line at the top of `ENTRIES` in
 `palette.zig`. The icon name comes from the Adwaita symbolic
 icon set; the keybind hint is automatic.
+
+## 🐛 Pane unrealize: release GL resources
+
+Previously each pane's `cell_pass` / `grid_pass` / `image_pass` /
+`image_store` / `atlas` only freed CPU memory in deinit; the GL
+program / VAOs / VBOs / textures stayed in the window's shared
+context until the window itself was destroyed. Long sessions
+opening / closing many tabs grew GPU memory linearly.
+
+Each pass now has a `releaseGL` method that `glDelete*`s the
+resources it owns; the pane connects an `unrealize` signal
+handler that fires those releases while the GL context is still
+current (the last point GTK guarantees that — after the signal
+returns the context is torn down). `forgetGL` (which only zeros
+the IDs, used after context loss for a fresh re-realize) stays
+for the reparent path.
+
+## 🐛 PTY child reap: async escalation chain
+
+`Pty.closeAndReap` was running on the GLib main thread,
+blocking the UI up to ~500 ms (30 × 10 ms HUP poll, 20 × 10 ms
+TERM poll, blocking SIGKILL waitpid) when a child ignored the
+hangup signals. Closing a tab whose shell trapped SIGHUP/SIGTERM
+froze sketerm visibly.
+
+`Pty.closeAndReapAsync` keeps the cheap synchronous parts
+(close master_fd, send SIGHUP, single WNOHANG poll — catches
+the common case without scheduling) and hands the escalation to
+a `g_timeout_add(10, …)` chain. A small `Reaper` struct
+(allocated via `std.heap.c_allocator` for lifetime independence)
+polls every tick, sends SIGTERM at tick 30, SIGKILL at tick 50,
+gives up at tick 200 (orphaning the child to init). `Terminal.deinit`
+returns immediately after scheduling.
+
+The synchronous `closeAndReap` stays for spawn-rollback
+errdefers — those run on a freshly-exec'd child that exits in
+<10 ms on SIGHUP, where blocking cost is negligible.
+
+## 🐛 PTY non-blocking writes + queue
+
+The master fd was blocking. `Pty.writeAll` would park the GLib
+main thread on `write(2)` whenever the child stopped reading
+its slave (4 KiB TIOCINQ buffer full). Broadcast-typing into a
+hung pane froze the entire UI.
+
+Master fd now has `O_NONBLOCK` set at spawn. `writeAll` tries a
+direct write loop; on EAGAIN, the remainder goes into a per-Pty
+`std.ArrayList(u8)` queue (cap 1 MiB — bounded for the hung-
+child case) and a `g_unix_fd_add` POLLOUT watch is armed. When
+the kernel signals writability, `drainWatchCb` pulls bytes from
+the queue and writes; on empty queue, the watch is removed
+(`G_SOURCE_REMOVE` returned).
+
+Ordering: writes always go through the queue when one exists,
+so a fresh `writeAll` can't race ahead of bytes still pending
+flush. Queue uses `std.heap.c_allocator` so the watch's lifetime
+is independent of the Terminal's allocator (the watch can fire
+one event-loop iteration after `closeAndReapAsync` is called;
+that path explicitly removes the source + frees the queue
+before closing the fd, so this is safety-net not normal flow).
+
+Both `closeAndReap` and `closeAndReapAsync` call
+`releaseWriteResources` first to drop the watch + queue cleanly.
