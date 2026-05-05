@@ -322,6 +322,13 @@ fn onKeyPressed(
             activateSelected(ctx);
             return 1;
         },
+        // GtkSearchEntry swallows Escape via its built-in "stop-search"
+        // handler before AdwDialog's default close-on-Escape sees it,
+        // so dismiss explicitly here.
+        c.GDK_KEY_Escape => {
+            c.adw_dialog_force_close(@ptrCast(@alignCast(ctx.dialog)));
+            return 1;
+        },
         else => return 0,
     }
 }

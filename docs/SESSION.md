@@ -3696,3 +3696,35 @@ before closing the fd, so this is safety-net not normal flow).
 
 Both `closeAndReap` and `closeAndReapAsync` call
 `releaseWriteResources` first to drop the watch + queue cleanly.
+
+## 🐛 close-path segfault: defer Pane teardown out of widget destroy
+
+Closing the window via the X button always crashed in
+`heap.arena_allocator.ArenaAllocator.free`, called via
+`g_closure_unref` → `g_signal_handlers_destroy` →
+`gtk_widget_remove_controller` (deep inside an
+`adw_tab_bar_set_view` → page-unref chain).
+
+Root cause: `onPageDetached` called `collectAndFreePanes` which
+called `Pane.deinit` synchronously from inside the widget
+destroy chain. `Pane.deinit` runs `menu_arena.deinit()`, but
+the destroy chain is not finished — the right-click controller
+on the same GLArea hasn't yet been unparented, and its signal
+closures still hold a `freeClickCtx` GDestroyNotify whose
+`ClickCtx` was allocated out of `menu_arena`. When GTK finally
+unrefs that controller a few frames later, `freeClickCtx` calls
+`ctx.allocator.destroy(ctx)` against the dead arena and Zig's
+`ArenaAllocator.free` segfaults reading `self.state.buffer_list`.
+
+Fix: `schedulePaneTeardown(pane, term)` queues
+`Pane.deinit` + `Terminal.deinit` via `g_idle_add` (default
+priority — runs after the current main-loop iteration unwinds,
+so the entire widget-destroy chain finishes before we drop
+arena state). Holder is `c_allocator`-owned so the deferred
+callback's lifetime is independent of any of our GPA / arena
+state. Sinks are cleared synchronously so any in-flight
+`g_main_context_invoke` from the PTY worker doesn't reach into
+a half-torn-down Pane between the schedule and the fire.
+
+Same path applies in `closePane` (Ctrl+Shift+W on a single
+pane) — fixed identically.

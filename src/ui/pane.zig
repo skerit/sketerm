@@ -51,7 +51,7 @@ pub const Pane = struct {
     menu_sink_ctx: ?*anyopaque = null,
     /// Window-level forwarding for terminal sinks.
     win_title_ctx: ?*anyopaque = null,
-    win_on_title: ?*const fn (ctx: ?*anyopaque, title: []const u8) void = null,
+    win_on_title: ?*const fn (ctx: ?*anyopaque, pane: *Pane, title: []const u8) void = null,
     win_clip_ctx: ?*anyopaque = null,
     win_on_clipboard: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     /// Forward iTerm2 / OSC 777 desktop notifications.
@@ -998,7 +998,7 @@ fn onImageDeleteFullEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Sc
 fn onTitleEvent(ctx: ?*anyopaque, title: []const u8) void {
     const self = cast.userData(Pane, ctx);
     self.setTitle(title);
-    if (self.win_on_title) |f| f(self.win_title_ctx, title);
+    if (self.win_on_title) |f| f(self.win_title_ctx, self, title);
 }
 
 fn onCwdEvent(ctx: ?*anyopaque, cwd: []const u8) void {
@@ -1271,9 +1271,14 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
 /// Click on the per-pane title bar. Focuses the underlying GLArea
 /// so the running shell receives keystrokes — without this, clicking
 /// the bar would just trap focus on the (un-focusable) Box.
-fn onTitlebarClicked(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+fn onTitlebarClicked(_: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
     _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+    // Double-click → dispatch the menu's `set_pane_title` action
+    // (same path as the right-click "Set Pane Title…" entry).
+    if (n_press == 2) {
+        paneMenuSink(@ptrCast(self), .set_pane_title);
+    }
 }
 
 fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {

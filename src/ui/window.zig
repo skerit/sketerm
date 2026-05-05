@@ -89,6 +89,11 @@ pub const Window = struct {
     /// applyConfigChange or initial show; regenerated whenever
     /// title_*_* colours change.
     titlebar_css: ?*c.GtkCssProvider = null,
+
+    /// Sub-notch accumulator for tab-bar scroll → tab switch.
+    /// Touchpads emit many small dy events per gesture; we sum them
+    /// and only flip a tab once |accum| crosses 1.0.
+    tab_scroll_accum: f64 = 0,
     /// Broadcast typing mode. Off = each pane gets its own keystrokes
     /// (default). Group = fan out to every pane sharing the source's
     /// `group` name. All = fan out to every pane in this window.
@@ -178,6 +183,29 @@ pub const Window = struct {
             c.G_CONNECT_DEFAULT,
         );
         c.gtk_widget_add_controller(@ptrCast(@alignCast(tab_bar_w)), @ptrCast(tabbar_dblclk));
+
+        // Scroll on the tab bar → switch tabs (Firefox / GNOME-Terminal
+        // convention). dy<0 = scroll up = previous, dy>0 = scroll down
+        // = next. Uses an `accum` field so a touchpad's many small
+        // delta events still snap to one tab change per "notch"-ish.
+        const tabbar_scroll = c.gtk_event_controller_scroll_new(c.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+        // CAPTURE phase: AdwTabBar uses scroll internally to pan its
+        // tab strip when tabs overflow; with the default BUBBLE phase
+        // we'd never see the event. CAPTURE fires before children, so
+        // we get first dibs and return TRUE to stop further handling.
+        c.gtk_event_controller_set_propagation_phase(
+            @ptrCast(tabbar_scroll),
+            c.GTK_PHASE_CAPTURE,
+        );
+        _ = c.g_signal_connect_data(
+            tabbar_scroll,
+            "scroll",
+            @ptrCast(&onTabBarScroll),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+        c.gtk_widget_add_controller(@ptrCast(@alignCast(tab_bar_w)), @ptrCast(tabbar_scroll));
 
         self.* = .{
             .app_window = app_window,
@@ -675,7 +703,9 @@ pub const Window = struct {
                 c.gtk_paned_set_resize_end_child(@ptrCast(paned), 1);
                 c.gtk_paned_set_shrink_start_child(@ptrCast(paned), 0);
                 c.gtk_paned_set_shrink_end_child(@ptrCast(paned), 0);
-
+                // Wide handle so GtkPaned honours CSS min-width on
+                // the separator (gives us the gutter around the line).
+                c.gtk_paned_set_wide_handle(@ptrCast(paned), 1);
                 const first = try self.buildTreeWidget(s.children[0]);
                 const second = try self.buildTreeWidget(s.children[1]);
                 c.gtk_paned_set_start_child(@ptrCast(paned), first);
@@ -749,7 +779,12 @@ pub const Window = struct {
         pane.win_on_child_exit = onTermChildExit;
         pane.win_cwd_ctx = @ptrCast(self);
         pane.win_on_cwd = onTermCwdChanged;
-        // Title forwarding intentionally null — tab titles are sticky.
+        // OSC 0/1/2 titles drive the AdwTabPage title — but only
+        // until the user explicitly renames the tab (which sets the
+        // "user-locked" flag on the page). Renaming with an empty
+        // string clears the lock and lets OSC tracking resume.
+        pane.win_title_ctx = @ptrCast(self);
+        pane.win_on_title = onTermTitleChanged;
 
         // Wrap pane.widget() in a Box so we can swap it for a Paned
         // when splits happen. Box always has exactly one child.
@@ -1073,6 +1108,9 @@ pub const Window = struct {
         c.gtk_paned_set_resize_end_child(@ptrCast(paned), 1);
         c.gtk_paned_set_shrink_start_child(@ptrCast(paned), 0);
         c.gtk_paned_set_shrink_end_child(@ptrCast(paned), 0);
+        // Wide handle so GtkPaned honours CSS min-width on the
+        // separator (gives us the gutter around the line).
+        c.gtk_paned_set_wide_handle(@ptrCast(paned), 1);
         // Make the paned itself stretch to fill its container — without
         // this, a paned in a Box wrapper takes natural size only.
         c.gtk_widget_set_hexpand(@ptrCast(paned), 1);
@@ -1233,11 +1271,21 @@ pub const Window = struct {
         popover: *c.GtkWidget,
         entry: *c.GtkWidget,
         allocator: std.mem.Allocator,
+        window: *Window,
     };
 
     /// Show a popover with an entry pre-filled to the current tab's
     /// title. Pressing Enter renames; Escape dismisses.
     pub fn renameCurrentTab(self: *Window) void {
+        self.renameCurrentTabAt(null);
+    }
+
+    /// Variant that anchors the popover at a specific point inside the
+    /// tab bar — used by the double-click gesture so the popover
+    /// pops up next to the tab the user double-clicked rather than
+    /// dropping below the toplevel window (which puts it off-screen
+    /// when the window is maximized).
+    pub fn renameCurrentTabAt(self: *Window, click: ?struct { x: f64, y: f64 }) void {
         const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
 
         const popover = c.gtk_popover_new();
@@ -1251,7 +1299,32 @@ pub const Window = struct {
         }
 
         c.gtk_popover_set_child(@ptrCast(popover), entry);
-        c.gtk_widget_set_parent(popover, self.app_window);
+        // Parent on the tab bar so the popover lands beneath the tab
+        // strip, not beneath the whole window. Pointing_to narrows the
+        // anchor point to the click location when known; otherwise we
+        // anchor the popover under the visual center of the tab bar.
+        c.gtk_widget_set_parent(popover, self.tab_bar);
+        var alloc_w: c_int = 0;
+        var alloc_h: c_int = 0;
+        if (click) |pt| {
+            const rect = c.GdkRectangle{
+                .x = @intFromFloat(pt.x),
+                .y = @intFromFloat(pt.y),
+                .width = 1,
+                .height = 1,
+            };
+            c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+        } else {
+            alloc_w = c.gtk_widget_get_width(self.tab_bar);
+            alloc_h = c.gtk_widget_get_height(self.tab_bar);
+            const rect = c.GdkRectangle{
+                .x = @divFloor(alloc_w, 2),
+                .y = @divFloor(alloc_h, 2),
+                .width = 1,
+                .height = 1,
+            };
+            c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+        }
 
         const ctx = self.allocator.create(RenameCtx) catch return;
         ctx.* = .{
@@ -1259,6 +1332,7 @@ pub const Window = struct {
             .popover = popover,
             .entry = entry,
             .allocator = self.allocator,
+            .window = self,
         };
 
         _ = c.g_signal_connect_data(
@@ -1367,7 +1441,23 @@ pub const Window = struct {
         }
 
         c.gtk_popover_set_child(@ptrCast(popover), entry);
-        c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+        // Anchor on the per-pane title bar when it's visible — that's
+        // the natural visual anchor for "set pane title". Falls back
+        // to a thin rect at the top of the GLArea so the popover
+        // lands at the top of the pane instead of dropping below it.
+        if (pane.titlebar_box) |tb| {
+            c.gtk_widget_set_parent(popover, tb);
+        } else {
+            c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+            const w = c.gtk_widget_get_width(@ptrCast(pane.area));
+            const rect = c.GdkRectangle{
+                .x = @divFloor(w, 2),
+                .y = 1,
+                .width = 1,
+                .height = 1,
+            };
+            c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+        }
 
         const ctx = self.allocator.create(PaneTitleCtx) catch return;
         ctx.* = .{
@@ -1855,13 +1945,60 @@ pub const Window = struct {
         const inf = self.config.title_inactive_fg;
         const ib = self.config.title_inactive_bg;
         // Format rgba(r, g, b, a) with values 0..255 + 0..1 alpha.
-        var buf: [1536]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         const css = std.fmt.bufPrintZ(&buf,
             \\.sketerm-titlebar {{ padding: 1px 2px; min-height: 18px; }}
             \\.sketerm-titlebar-active {{ background-color: rgba({d}, {d}, {d}, {d:.3}); color: rgba({d}, {d}, {d}, {d:.3}); }}
             \\.sketerm-titlebar-inactive {{ background-color: rgba({d}, {d}, {d}, {d:.3}); color: rgba({d}, {d}, {d}, {d:.3}); }}
             \\.sketerm-titlebar-label {{ font-weight: bold; }}
             \\.sketerm-titlebar.sketerm-broadcast {{ box-shadow: inset 0 0 0 2px rgba(255, 200, 60, 0.95); }}
+            \\
+            \\/* Active-tab indicator — accent line under the selected
+            \\   tab plus a stronger background tint, à la Terminator.
+            \\   Inactive tabs dim to ~55% so the active one stands
+            \\   out. libadwaita uses `tab:selected` (pseudo-class),
+            \\   not `.selected` / `:checked`. We give the selected
+            \\   rule higher specificity (`tabbar tabbox tab`) so it
+            \\   wins over libadwaita's own `tabbar tab:selected`
+            \\   block at the same priority level. */
+            \\tabbar tab {{ opacity: 0.55; }}
+            \\tabbar tabbox tab:selected {{
+            \\    opacity: 1.0;
+            \\    box-shadow: inset 0 -3px 0 0 #3584e4;
+            \\    background-color: rgba(53, 132, 228, 0.18);
+            \\}}
+            \\
+            \\/* Split-pane separator — solid 2-px #353535 line.
+            \\   `gtk_paned_set_wide_handle(paned, TRUE)` adds the
+            \\   `.wide` style class to the separator. libadwaita's
+            \\   `paned.horizontal > separator.wide` rule has higher
+            \\   specificity than `paned > separator` and paints
+            \\   1-px box-shadow lines on both edges; we have to
+            \\   match that selector to override. */
+            \\paned.horizontal > separator,
+            \\paned.vertical > separator,
+            \\paned.horizontal > separator.wide,
+            \\paned.vertical > separator.wide {{
+            \\    background-color: #353535;
+            \\    background-image: none;
+            \\    box-shadow: none;
+            \\    border: none;
+            \\    margin: 0;
+            \\    padding: 0;
+            \\    min-width: 2px;
+            \\    min-height: 2px;
+            \\}}
+            \\paned.horizontal > separator:hover,
+            \\paned.vertical > separator:hover,
+            \\paned.horizontal > separator.wide:hover,
+            \\paned.vertical > separator.wide:hover,
+            \\paned.horizontal > separator:active,
+            \\paned.vertical > separator:active,
+            \\paned.horizontal > separator.wide:active,
+            \\paned.vertical > separator.wide:active {{
+            \\    background-color: #5a5a5a;
+            \\    box-shadow: none;
+            \\}}
         , .{
             @as(u8, @intFromFloat(@round(ab[0] * 255))),
             @as(u8, @intFromFloat(@round(ab[1] * 255))),
@@ -2024,6 +2161,11 @@ pub const Window = struct {
         // Clean up. Terminal.deinit kills worker + closes PTY.
         // Pane.deinit frees Zig-side state; GL resources are tied
         // to the GL context which GTK tears down on unparent.
+        // Defer the actual `Pane.deinit` / `Terminal.deinit` to a
+        // `g_idle_add` so the trailing widget-destroy chain can fire
+        // its controller / signal-closure cleanups (which dereference
+        // `pane.menu_arena` via the click-context GDestroyNotify)
+        // BEFORE we tear `menu_arena` down.
         _ = self.panes.orderedRemove(found_idx.?);
         const term = pane.terminal;
         for (self.terminals.items, 0..) |t, ti| {
@@ -2032,8 +2174,8 @@ pub const Window = struct {
                 break;
             }
         }
-        term.deinit();
-        pane.deinit();
+        term.clearSinks();
+        schedulePaneTeardown(pane, term);
 
         // Move focus to the first pane inside the surviving sibling
         // subtree — without this, focus can land on the now-empty
@@ -2561,10 +2703,37 @@ fn freePanedRatio(user: ?*anyopaque) callconv(.c) void {
 
 fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Window.RenameCtx, user);
-    const text = c.gtk_editable_get_text(@ptrCast(entry));
-    if (text != null) {
-        c.adw_tab_page_set_title(ctx.page, text);
-        c.adw_tab_page_set_tooltip(ctx.page, text);
+    const text_c = c.gtk_editable_get_text(@ptrCast(entry));
+    const text: []const u8 = if (text_c == null) &.{}
+        else std.mem.span(@as([*:0]const u8, @ptrCast(text_c)));
+
+    if (text.len == 0) {
+        // Empty input → clear the user-lock and resume OSC tracking.
+        // Pull the current title from the page's first pane's
+        // `titlebar_text` so the tab doesn't stay frozen on whatever
+        // we last wrote — that field tracks OSC 0/1/2 in real time.
+        c.g_object_set_data(@ptrCast(@alignCast(ctx.page)), "sketerm-title-locked", null);
+        // Find Window via the dialog's parent — RenameCtx doesn't
+        // carry it, but the tab view does via the page.
+        const win = ctx.window;
+        const child = c.adw_tab_page_get_child(ctx.page);
+        if (child != null) {
+            for (win.panes.items) |p| {
+                if (widgetIsAncestor(@ptrCast(child), p.widget())) {
+                    const t: []const u8 = if (p.titlebar_text) |tt| tt else "sketerm";
+                    setTabPageTitleFromUtf8(win.allocator, ctx.page, t);
+                    break;
+                }
+            }
+        }
+    } else {
+        c.adw_tab_page_set_title(ctx.page, text_c);
+        c.adw_tab_page_set_tooltip(ctx.page, text_c);
+        // Mark the page as user-renamed so subsequent OSC titles
+        // don't overwrite it. Stored as a non-null marker; the
+        // pointer value is unused — `g_object_get_data` only checks
+        // for presence.
+        c.g_object_set_data(@ptrCast(@alignCast(ctx.page)), "sketerm-title-locked", @ptrCast(ctx.page));
     }
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
     // ctx is freed via GDestroyNotify (freeRenameCtx) when the
@@ -2727,6 +2896,43 @@ fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
     }
 }
 
+/// Wired from `Pane.win_on_title`. Updates the AdwTabPage's title from
+/// OSC 0/1/2 events emitted by the shell, but only while the page
+/// hasn't been user-renamed. The "user-locked" flag lives on the
+/// page as `g_object_set_data(page, "sketerm-title-locked")`.
+fn onTermTitleChanged(ctx: ?*anyopaque, pane: *Pane, title: []const u8) void {
+    const self = cast.userData(Window, ctx);
+    const page = self.tabPageForPane(pane) orelse return;
+    if (c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null) return;
+    setTabPageTitleFromUtf8(self.allocator, page, title);
+}
+
+fn setTabPageTitleFromUtf8(allocator: std.mem.Allocator, page: *c.AdwTabPage, title: []const u8) void {
+    // Tabs render single-line — drop empty titles to a fallback so a
+    // tab never goes blank.
+    const effective = if (title.len > 0) title else "sketerm";
+    const z = allocator.allocSentinel(u8, effective.len, 0) catch return;
+    defer allocator.free(z);
+    @memcpy(z, effective);
+    c.adw_tab_page_set_title(page, z.ptr);
+    c.adw_tab_page_set_tooltip(page, z.ptr);
+}
+
+/// Walk every tab page and return the one whose widget tree contains
+/// `pane`. O(tabs × panes-per-tab) — both small for any realistic
+/// session.
+fn tabPageForPane(self: *Window, pane: *Pane) ?*c.AdwTabPage {
+    const n = c.adw_tab_view_get_n_pages(self.tab_view);
+    var i: c_int = 0;
+    while (i < n) : (i += 1) {
+        const page = c.adw_tab_view_get_nth_page(self.tab_view, i) orelse continue;
+        const child = c.adw_tab_page_get_child(page);
+        if (child == null) continue;
+        if (widgetIsAncestor(@ptrCast(child), pane.widget())) return page;
+    }
+    return null;
+}
+
 fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {
     const self = cast.userData(Window, ctx);
     const app = c.gtk_window_get_application(@ptrCast(self.app_window));
@@ -2758,11 +2964,31 @@ fn onNewTabAction(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callc
 /// Open the rename popover on a double-click on the tab bar. The
 /// single-click that AdwTabBar handles internally has already
 /// selected the right tab, so renameCurrentTab targets it.
-fn onTabBarPressed(g: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+fn onTabBarPressed(_: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     if (n_press != 2) return;
     const self = cast.userData(Window, user);
-    _ = g;
-    self.renameCurrentTab();
+    self.renameCurrentTabAt(.{ .x = x, .y = y });
+}
+
+/// Scroll on the tab bar → switch tabs (browser convention).
+/// Vertical-scroll dy < 0 = up = previous, dy > 0 = down = next.
+/// dx (horizontal scroll, common on touchpads) maps the same way:
+/// left = previous, right = next. Touchpad smooth-scroll bursts are
+/// summed into `tab_scroll_accum` so each ~1.0 of accumulated delta
+/// triggers exactly one tab change.
+fn onTabBarScroll(
+    _: *c.GtkEventControllerScroll,
+    dx: f64,
+    dy: f64,
+    user: ?*anyopaque,
+) callconv(.c) c.gboolean {
+    const self = cast.userData(Window, user);
+    const delta = if (dy != 0) dy else dx;
+    if (delta == 0) return 0;
+    self.tab_scroll_accum += delta;
+    while (self.tab_scroll_accum >= 1.0) : (self.tab_scroll_accum -= 1.0) self.nextTab();
+    while (self.tab_scroll_accum <= -1.0) : (self.tab_scroll_accum += 1.0) self.prevTab();
+    return 1; // handled
 }
 
 /// Move keyboard focus into the newly selected tab's pane so
@@ -2960,6 +3186,42 @@ fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyop
     }
 }
 
+/// Holder for `g_idle_add` deferred Pane/Terminal teardown. Heap-
+/// allocated via `c_allocator` so its lifetime is independent of any
+/// of our arena/GPA state. See `deferredPaneTeardown`.
+const PendingPaneFree = struct {
+    pane: *Pane,
+    term: *Terminal,
+};
+
+/// `g_idle_add` callback — runs after the current main-loop iteration
+/// unwinds, so the widget destroy chain has fully fired its
+/// controller / signal-closure cleanups before we tear our own
+/// per-Pane state down. Without this defer, `Pane.deinit` deinits
+/// `menu_arena` while GTK is still mid-destroy on the same widget
+/// subtree, and the trailing `freeClickCtx` GDestroyNotify lands on
+/// a dead arena → segfault in `ArenaAllocator.free`.
+fn deferredPaneTeardown(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const holder = cast.userData(PendingPaneFree, user);
+    holder.term.deinit();
+    holder.pane.deinit();
+    std.heap.c_allocator.destroy(holder);
+    return 0; // G_SOURCE_REMOVE
+}
+
+fn schedulePaneTeardown(pane: *Pane, term: *Terminal) void {
+    const holder = std.heap.c_allocator.create(PendingPaneFree) catch {
+        // OOM — fall back to synchronous teardown. Risks the same
+        // crash this defer was added to dodge, but at least we're
+        // not silently leaking the Pane + Terminal.
+        term.deinit();
+        pane.deinit();
+        return;
+    };
+    holder.* = .{ .pane = pane, .term = term };
+    _ = c.g_idle_add(@ptrCast(&deferredPaneTeardown), @ptrCast(holder));
+}
+
 fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
     // Walk the widget tree under `root` (Box / Paned / GLArea), find
     // matching Panes by their .widget(), and free them + their Terminal.
@@ -2982,8 +3244,13 @@ fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
                     break;
                 }
             }
-            term.deinit();
-            pane.deinit();
+            // Pane.terminal sinks reach into Terminal/Pane state that
+            // we're about to free — null them now so any in-flight
+            // `g_main_context_invoke(mainDrainEvents, …)` from the
+            // PTY worker that fires before the deferred teardown runs
+            // sees a quiesced Terminal and produces no callbacks.
+            term.clearSinks();
+            schedulePaneTeardown(pane, term);
             continue;
         }
         i += 1;
