@@ -47,12 +47,33 @@ pub const Line = struct {
         self.scaling = .single;
     }
 
+    /// Like `clear` but stamps every cell with `fill_style` so the
+    /// renderer paints them with that style's bg (xterm BCE — Background
+    /// Color Erase). Used by CSI K / J / X erase paths so the current
+    /// SGR bg propagates into "erased" cells. Plain `clear` (used by
+    /// reflow + full resets) keeps the default-style behaviour.
+    pub fn clearStyled(self: *Line, fill_style: u16) void {
+        for (self.cells) |*cell| cell.* = .{ .style_ref = fill_style };
+        self.dirty = true;
+        self.continues_above = false;
+        self.scaling = .single;
+    }
+
     /// Erase a half-open range [from, to).
     pub fn eraseRange(self: *Line, from: u16, to: u16) void {
         const lo = @min(from, @as(u16, @intCast(self.cells.len)));
         const hi = @min(to, @as(u16, @intCast(self.cells.len)));
         if (lo >= hi) return;
         @memset(self.cells[lo..hi], .{});
+        self.dirty = true;
+    }
+
+    /// BCE-aware variant of `eraseRange` — see `clearStyled`.
+    pub fn eraseRangeStyled(self: *Line, from: u16, to: u16, fill_style: u16) void {
+        const lo = @min(from, @as(u16, @intCast(self.cells.len)));
+        const hi = @min(to, @as(u16, @intCast(self.cells.len)));
+        if (lo >= hi) return;
+        for (self.cells[lo..hi]) |*cell| cell.* = .{ .style_ref = fill_style };
         self.dirty = true;
     }
 };

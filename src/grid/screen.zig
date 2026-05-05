@@ -2657,7 +2657,7 @@ pub const Screen = struct {
             'K' => self.eraseLine(params.paramOrDefault(0, 0)),
             'X' => {
                 const n = params.paramOrDefault(0, 1);
-                self.line(self.row).eraseRange(self.col, self.col + @as(u16, @intCast(@min(n, 0xFFFF))));
+                self.line(self.row).eraseRangeStyled(self.col, self.col + @as(u16, @intCast(@min(n, 0xFFFF))), self.cur_style);
             },
             '@' => self.insertChars(params.paramOrDefault(0, 1)),
             'P' => self.deleteChars(params.paramOrDefault(0, 1)),
@@ -3139,19 +3139,20 @@ pub const Screen = struct {
 
     fn eraseDisplay(self: *Screen, mode: u32) void {
         const lines = self.buf();
+        const fill = self.cur_style;
         switch (mode) {
             0 => {
-                self.line(self.row).eraseRange(self.col, self.cols);
+                self.line(self.row).eraseRangeStyled(self.col, self.cols, fill);
                 var i: u16 = self.row + 1;
-                while (i < self.rows) : (i += 1) lines[i].clear();
+                while (i < self.rows) : (i += 1) lines[i].clearStyled(fill);
             },
             1 => {
                 var i: u16 = 0;
-                while (i < self.row) : (i += 1) lines[i].clear();
-                self.line(self.row).eraseRange(0, self.col + 1);
+                while (i < self.row) : (i += 1) lines[i].clearStyled(fill);
+                self.line(self.row).eraseRangeStyled(0, self.col + 1, fill);
             },
             2 => {
-                for (lines) |*l| l.clear();
+                for (lines) |*l| l.clearStyled(fill);
             },
             3 => {
                 // Mode 3 (xterm extension): clear screen + scrollback.
@@ -3170,10 +3171,11 @@ pub const Screen = struct {
 
     fn eraseLine(self: *Screen, mode: u32) void {
         var ln = self.line(self.row);
+        const fill = self.cur_style;
         switch (mode) {
-            0 => ln.eraseRange(self.col, self.cols),
-            1 => ln.eraseRange(0, self.col + 1),
-            2 => ln.clear(),
+            0 => ln.eraseRangeStyled(self.col, self.cols, fill),
+            1 => ln.eraseRangeStyled(0, self.col + 1, fill),
+            2 => ln.clearStyled(fill),
             else => {},
         }
     }
