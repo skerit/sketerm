@@ -361,8 +361,16 @@ pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allo
     const ctx = try allocator.create(Ctx);
     ctx.* = .{ .widget = widget, .terminal = terminal };
 
-    // IME: GtkIMMulticontext routes through fcitx5/ibus on Linux.
-    const im = c.gtk_im_multicontext_new();
+    // GtkIMContextSimple: in-process compose-table handling. Picked
+    // over GtkIMMulticontext because the latter on Wayland routes to
+    // the wayland-im module, which delegates dead-key composition to
+    // the compositor. Compositors only compose for surfaces they
+    // recognize as text inputs — and our GLArea sits inside a
+    // GtkGraphicsOffload subsurface, which the compositor's text-
+    // input plumbing does not engage. Result with multicontext: dead
+    // keys (^, ¨, AltGr+= → ~, ` → grave, etc.) silently drop.
+    // Simple handles them via the same Compose tables xkbcommon uses.
+    const im = c.gtk_im_context_simple_new();
     c.gtk_im_context_set_client_widget(@ptrCast(im), widget);
     _ = c.g_signal_connect_data(
         im,
@@ -383,6 +391,13 @@ pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allo
     ctx.im_ctx = @ptrCast(im);
 
     const ctrl = c.gtk_event_controller_key_new();
+    // Hand the IM context to the controller. GTK4 then routes key
+    // events through the IM context BEFORE our key-pressed handler
+    // runs, auto-fires focus-in/focus-out, and tracks dead-key state.
+    // Without this, dead-key composition (AZERTY ^ + e → ê, AltGr+= +
+    // space → ~, ` + a → à) silently drops because the manual filter_
+    // keypress call fights GTK's own IM event routing.
+    c.gtk_event_controller_key_set_im_context(@ptrCast(ctrl), @ptrCast(im));
     _ = c.g_signal_connect_data(
         ctrl,
         "key-pressed",
@@ -490,7 +505,7 @@ fn onImPreeditChanged(im: *c.GtkIMContext, user: ?*anyopaque) callconv(.c) void 
 }
 
 fn onKeyPressed(
-    controller: *c.GtkEventControllerKey,
+    _: *c.GtkEventControllerKey,
     keyval: c_uint,
     _: c_uint,
     state: c.GdkModifierType,
@@ -527,13 +542,11 @@ fn onKeyPressed(
     ctx.last_press_keyval = keyval;
     ctx.last_press_time_us = press_now;
 
-    // Let IME consume the key first (CJK composition).
-    if (ctx.im_ctx) |im| {
-        const event = c.gtk_event_controller_get_current_event(@ptrCast(controller));
-        if (event != null and c.gtk_im_context_filter_keypress(im, @ptrCast(event)) != 0) {
-            return 1;
-        }
-    }
+    // IME filtering happens automatically — gtk_event_controller_key_
+    // set_im_context (in attach()) routes events through the IM context
+    // before this handler runs, so key-pressed only fires for keys the
+    // IM did not consume. Re-submitting via filter_keypress here would
+    // double-process the event.
 
     // Keybinding match — lowercase the keyval first so 'C' and 'c'
     // (with/without Shift held) both hit the same binding. GTK4 emits

@@ -1286,6 +1286,15 @@ fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     if (self.terminal.screen.focus_reports) {
         _ = self.terminal.pty.writeAll("\x1b[I");
     }
+    // Tell the IM context this widget owns focus. Required for both:
+    // (1) dead-key state tracking in the simple IM module
+    // (2) Wayland text-input-v3 enable (compositor only routes
+    //     composed text to enabled clients). GtkEventControllerKey
+    //     does NOT auto-fire focus_in/out — GtkText/GtkEntry call
+    //     it from their own focus handlers; we have to do the same.
+    if (self.input_ctx) |ictx| if (ictx.im_ctx) |im| {
+        c.gtk_im_context_focus_in(im);
+    };
     // Cursor style + focus border switch on focus change — force a
     // repaint so the swap is immediate.
     self.terminal.screen.cursor_blink_on = true;
@@ -1305,6 +1314,9 @@ fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     if (self.terminal.screen.focus_reports) {
         _ = self.terminal.pty.writeAll("\x1b[O");
     }
+    if (self.input_ctx) |ictx| if (ictx.im_ctx) |im| {
+        c.gtk_im_context_focus_out(im);
+    };
     self.terminal.screen.cursor_blink_on = true;
     self.terminal.screen.dirty = true;
     c.gtk_gl_area_queue_render(@ptrCast(self.area));
