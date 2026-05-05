@@ -281,6 +281,18 @@ pub const Pane = struct {
             null,
             c.G_CONNECT_DEFAULT,
         );
+        // unrealize fires while the GL context is STILL CURRENT —
+        // last chance to glDelete owned resources. Without it the
+        // pane's program / VAOs / VBOs / textures leak into the
+        // window's shared context for as long as the window lives.
+        _ = c.g_signal_connect_data(
+            area_widget,
+            "unrealize",
+            @ptrCast(&onUnrealize),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
         _ = c.g_signal_connect_data(
             area_widget,
             "render",
@@ -740,6 +752,28 @@ pub const Pane = struct {
         c.gtk_gl_area_queue_render(@ptrCast(self.area));
     }
 };
+
+fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Pane, user);
+    // Make the about-to-die context current so glDelete* lands on the
+    // right resources. After this signal returns GTK tears the context
+    // down — there is no second chance.
+    c.gtk_gl_area_make_current(area);
+    if (c.gtk_gl_area_get_error(area) != null) {
+        // Context is already broken; nothing useful to delete against
+        // it. Forget the IDs so a future realize starts clean.
+        self.grid_pass.forgetGL();
+        self.cell_pass.forgetGL();
+        self.image_pass.forgetGL();
+        self.image_store.forgetGL();
+        return;
+    }
+    self.grid_pass.releaseGL();
+    self.cell_pass.releaseGL();
+    self.image_pass.releaseGL();
+    self.image_store.releaseGL();
+    if (self.atlas) |a| a.releaseGL();
+}
 
 fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);

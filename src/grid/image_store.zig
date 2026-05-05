@@ -233,6 +233,21 @@ pub const Store = struct {
         }
     }
 
+    /// Like `forgetGL`, but ALSO `glDeleteTextures` on every image
+    /// that has one. Caller must have a current GL context — the
+    /// pane's `unrealize` signal is the last opportunity. Without
+    /// this, every closed pane leaks one GL texture per kitty image
+    /// it had displayed, into the shared window context.
+    pub fn releaseGL(self: *Store) void {
+        for (self.images.items) |*img| {
+            if (img.gl_tex != 0) {
+                c.glDeleteTextures(1, &img.gl_tex);
+                img.gl_tex = 0;
+            }
+            img.pending_dirty = true;
+        }
+    }
+
     /// Free all images and their pending buffers, ignoring GL
     /// teardown — only safe to call after the GL context is gone
     /// or was never established. Used by tests.

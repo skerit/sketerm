@@ -386,6 +386,21 @@ pub const CellPass = struct {
         for (self.row_needs_upload.items) |*r| r.* = true;
     }
 
+    /// Like `forgetGL`, but ALSO `glDelete*`s every resource we own.
+    /// Caller must have a current GL context — the pane's `unrealize`
+    /// signal is the last opportunity. Without this, every closed
+    /// pane leaks 1 program + 3 VAOs + 3 VBOs into the shared context.
+    pub fn releaseGL(self: *CellPass) void {
+        if (self.program != 0) {
+            c.glDeleteProgram(self.program);
+        }
+        // 3 VAOs + 3 VBOs from the rotating slots, all in flat arrays.
+        // glDelete* tolerates id == 0, so we can pass the whole array.
+        c.glDeleteVertexArrays(3, &self.vaos[0]);
+        c.glDeleteBuffers(3, &self.vbos[0]);
+        self.forgetGL();
+    }
+
     pub fn realize(self: *CellPass) !void {
         if (self.program != 0) return;
         self.program = try gl.buildProgram(VERT_SRC, FRAG_SRC);

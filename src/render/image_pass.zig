@@ -68,6 +68,25 @@ pub const ImagePass = struct {
         self.u_image = -1;
     }
 
+    /// Like `forgetGL`, but ALSO `glDelete*`s every resource we own.
+    /// Caller must have a current GL context — the pane's `unrealize`
+    /// signal is the last opportunity. Without this, every closed
+    /// pane leaks 1 program + 1 VAO + 1 VBO into the shared context.
+    pub fn releaseGL(self: *ImagePass) void {
+        if (self.program != 0) {
+            c.glDeleteProgram(self.program);
+        }
+        if (self.vao != 0) {
+            var v = self.vao;
+            c.glDeleteVertexArrays(1, &v);
+        }
+        if (self.vbo != 0) {
+            var b = self.vbo;
+            c.glDeleteBuffers(1, &b);
+        }
+        self.forgetGL();
+    }
+
     /// Build shaders + buffers. Requires a current GL context.
     /// Idempotent; call `forgetGL` first to re-realize after a
     /// context loss.

@@ -284,6 +284,27 @@ pub const GridPass = struct {
         for (self.row_caches_valid.items) |*r| r.* = false;
     }
 
+    /// Like `forgetGL`, but ALSO calls `glDelete*` on the resources we
+    /// own. Caller must have a current GL context. Used from the
+    /// pane's `unrealize` signal handler — that's the last point GTK
+    /// guarantees the context is live before tearing it down. Without
+    /// this, every closed pane leaks one program + VAO + VBO into the
+    /// window's shared GL context.
+    pub fn releaseGL(self: *GridPass) void {
+        if (self.program != 0) {
+            c.glDeleteProgram(self.program);
+        }
+        if (self.vao != 0) {
+            var v = self.vao;
+            c.glDeleteVertexArrays(1, &v);
+        }
+        if (self.vbo != 0) {
+            var b = self.vbo;
+            c.glDeleteBuffers(1, &b);
+        }
+        self.forgetGL();
+    }
+
     pub fn realize(self: *GridPass) !void {
         if (self.program != 0) return;
         // Pre-grow the vertex buffer once so the first few frames

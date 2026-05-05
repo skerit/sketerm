@@ -219,14 +219,10 @@ pub const Atlas = struct {
     pub fn deinit(self: *Atlas) void {
         // GL texture is NOT freed here — by design, atlas can be
         // deinit-ed without a current GL context (e.g. from Pane
-        // teardown after the GLArea has been unrealized). Callers
-        // that DO have a current context (`Pane.setFontSize`) call
-        // `glDeleteTextures` themselves before destroying the Atlas.
-        // The pane's GLArea otherwise holds the only reference; when
-        // the GLArea is destroyed it tears down the GL context,
-        // which frees any textures still attached to it. Closing a
-        // pane without destroying the GLArea would leak `gl_tex`
-        // (see SESSION.md notes on GL resource lifetime).
+        // teardown after the GLArea has been unrealized). Use
+        // `releaseGL` from the pane's `unrealize` handler, or
+        // `glDeleteTextures` manually before deinit, when a context
+        // is current.
         self.cache.deinit();
         self.glyph_cache.deinit();
         // Free cached shape result slices.
@@ -242,6 +238,17 @@ pub const Atlas = struct {
         _ = c.FT_Done_Face(self.ft_face);
         _ = c.FT_Done_FreeType(self.ft_lib);
         self.allocator.destroy(self);
+    }
+
+    /// Free the GL texture under a still-current GL context. Call
+    /// from the pane's `unrealize` handler before `deinit`. Sets
+    /// `realized=false` so subsequent calls are no-ops.
+    pub fn releaseGL(self: *Atlas) void {
+        if (self.realized and self.gl_tex != 0) {
+            c.glDeleteTextures(1, &self.gl_tex);
+            self.gl_tex = 0;
+        }
+        self.realized = false;
     }
 
     /// Bump the frame counter. Renderer should call once per render.
