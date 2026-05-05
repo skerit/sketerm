@@ -319,8 +319,27 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
-        for (self.panes.items) |p| p.deinit();
+        // Teardown order matters. Steps:
+        //
+        // 1. Null every Terminal sink + user_ctx so any
+        //    `g_main_context_invoke(mainDrain, …)` already queued by
+        //    a worker thread can't reach into a Pane via stale
+        //    callback pointers — the dispatched mainDrain will see
+        //    the cleared callbacks and produce no calls into Pane.
+        // 2. Deinit terminals (joins their worker threads, drains
+        //    the ring, frees PTY + parser + screen + style pool).
+        //    After this returns, no further worker activity is
+        //    possible against any of these terminals.
+        // 3. Deinit panes (GL passes, atlas, IM context, arenas,
+        //    GObject unrefs). Safe now that the terminal-side
+        //    machinery is fully quiesced.
+        //
+        // Reversing #2 and #3 — the obvious order — would let a
+        // late mainDrain dispatch into a freed Pane, since worker
+        // joins happen inside Terminal.deinit, not before it.
+        for (self.terminals.items) |t| t.clearSinks();
         for (self.terminals.items) |t| t.deinit();
+        for (self.panes.items) |p| p.deinit();
         self.panes.deinit(self.allocator);
         self.terminals.deinit(self.allocator);
         self.search_matches.deinit(self.allocator);
@@ -711,6 +730,13 @@ pub const Window = struct {
         term.debug_to_stderr = self.debug_events;
 
         const pane = try self.makePane(term);
+        // If anything below this fails (alloc failure adding to the
+        // panes/terminals list, etc.) we'd otherwise leave a Pane
+        // alive whose Terminal we just reaped via the prior errdefer
+        // — its on_* callbacks would still point at the dead
+        // Terminal, and the next render would fault. Drop the Pane
+        // explicitly on failure so neither side outlives the other.
+        errdefer pane.deinit();
 
         // Forward terminal sinks to Window where appropriate.
         pane.win_clip_ctx = @ptrCast(self);

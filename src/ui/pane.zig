@@ -504,7 +504,38 @@ pub const Pane = struct {
         self.image_pass.deinit();
         self.image_store.deinit();
         if (self.atlas) |a| a.deinit();
-        if (self.input_ctx) |ictx| self.allocator.destroy(ictx);
+        if (self.input_ctx) |ictx| {
+            // Disconnect every signal handler we connected with `ctx`
+            // as user-data, then drop the IM context's ref. Without
+            // this, fcitx5 / ibus may still emit `commit` or
+            // `preedit-changed` against the freed Ctx (we're not the
+            // sole owner of the IM context's lifetime — the GTK IM
+            // module routes events asynchronously through D-Bus).
+            // Also leaks one GtkIMMulticontext (and its inner D-Bus
+            // name watch) per closed pane, which is what we're
+            // really fixing here.
+            if (ictx.im_ctx) |im| {
+                // Disconnect every handler we attached with `ictx` as
+                // user_data. `g_signal_handlers_disconnect_by_data`
+                // is a macro in glib; spell out the underlying call
+                // because the cImport translation of the macro form
+                // loses the gpointer target types.
+                const im_obj: ?*anyopaque = @ptrCast(im);
+                const ictx_data: ?*anyopaque = @ptrCast(ictx);
+                _ = c.g_signal_handlers_disconnect_matched(
+                    im_obj,
+                    c.G_SIGNAL_MATCH_DATA,
+                    0,
+                    0,
+                    null,
+                    null,
+                    ictx_data,
+                );
+                c.gtk_im_context_set_client_widget(@ptrCast(im), null);
+                c.g_object_unref(im_obj);
+            }
+            self.allocator.destroy(ictx);
+        }
         if (self.menu_link_uri) |uri| self.allocator.free(uri);
         if (self.titlebar_text) |t| self.allocator.free(t);
         self.menu_arena.deinit();
@@ -617,6 +648,13 @@ pub const Pane = struct {
         if (new_size == self.font_size) return;
         self.font_size = new_size;
 
+        // Bail before touching GL state if the GLArea hasn't realized
+        // yet (theoretically possible when prefs / Ctrl+= fire on a
+        // never-mapped tab via --restore + dialog open). The next
+        // realize will pick up `font_size` and build the atlas at
+        // the new size from scratch.
+        if (c.gtk_widget_get_realized(@ptrCast(self.area)) == 0) return;
+
         // Make our GL context current so the texture deletes hit the
         // right context.
         c.gtk_gl_area_make_current(self.area);
@@ -686,8 +724,14 @@ pub const Pane = struct {
         if (cw > 0 and ch > 0) {
             const cols: u16 = @intCast(@max(@as(i32, 1), @as(i32, @intFromFloat(@floor(inner_w / cw)))));
             const rows: u16 = @intCast(@max(@as(i32, 1), @as(i32, @intFromFloat(@floor(inner_h / ch)))));
+            // If the screen rejected the new dimensions (OOM
+            // reflowing the buffer, etc.), don't tell the child a
+            // different size from what the renderer is using —
+            // mismatched winsize makes the shell wrap output
+            // off-screen.
             self.terminal.screen.resize(cols, rows) catch |err| {
                 std.debug.print("sketerm: pane resize failed: {s}\n", .{@errorName(err)});
+                return;
             };
             self.terminal.pty.setSize(rows, cols);
         }

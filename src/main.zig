@@ -241,6 +241,10 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
         } else if (std.mem.eql(u8, a, "--layout") and n + 1 < argc) {
             n += 1;
             const v = std.mem.span(@as([*:0]const u8, @ptrCast(argv_raw[@intCast(n)])));
+            // Free the prior dupe — `--toggle` re-enters command-line
+            // handling on every secondary invocation, and without this
+            // the path leaks once per call.
+            if (g_app.layout_path) |old| g_app.allocator.free(old);
             g_app.layout_path = g_app.allocator.dupe(u8, v) catch null;
         } else if (std.mem.eql(u8, a, "--no-save")) {
             g_app.no_save = true;
@@ -251,6 +255,7 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
         } else if (std.mem.eql(u8, a, "--config") and n + 1 < argc) {
             n += 1;
             const v = std.mem.span(@as([*:0]const u8, @ptrCast(argv_raw[@intCast(n)])));
+            if (g_app.config_path) |old| g_app.allocator.free(old);
             g_app.config_path = g_app.allocator.dupe(u8, v) catch null;
         }
     }

@@ -224,6 +224,23 @@ pub const Terminal = struct {
         if (self.on_pointer_shape) |f| f(self.user_ctx, name);
     }
 
+    /// Null out every external sink + the user_ctx pointer, so nothing
+    /// dispatched after this call can reach into a freed Pane / Window.
+    /// Used by Window.deinit to fence the terminals before tearing
+    /// down the panes that own the sink targets.
+    pub fn clearSinks(self: *Terminal) void {
+        self.user_ctx = null;
+        self.on_title = null;
+        self.on_cwd_changed = null;
+        self.on_clipboard_set = null;
+        self.on_render_request = null;
+        self.on_bell = null;
+        self.on_image = null;
+        self.on_image_delete_full = null;
+        self.on_notification = null;
+        self.on_pointer_shape = null;
+    }
+
     /// Send user input bytes (keystrokes, paste, etc) to the PTY,
     /// optionally fanned out across panes when broadcast typing is on.
     /// Parser reply channel (`sinkWritePty`) deliberately bypasses

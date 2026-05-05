@@ -3046,6 +3046,25 @@ pub const Screen = struct {
         self.kitty_kbd_flags = 0;
         self.kitty_kbd_depth = 0;
         self.last_print_cp = 0;
+        self.bell_at_us = 0;
+        // OSC 8 link table — drop every URI string. Cells holding
+        // link references were just zeroed by `l.clear()` above, so
+        // nothing dangles after this drain.
+        var link_it = self.links.iterator();
+        while (link_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        self.links.clearRetainingCapacity();
+        // Title stack — free each saved title before zeroing the
+        // depth. RIS is "factory reset" so the saved-title chain
+        // shouldn't survive it.
+        for (&self.title_stack) |*entry| {
+            if (entry.*) |t| self.allocator.free(t);
+            entry.* = null;
+        }
+        self.title_stack_depth = 0;
+        // Active IME preedit — release the buffer; the next IM
+        // commit / preedit-changed will allocate fresh.
+        if (self.preedit_text) |t| self.allocator.free(t);
+        self.preedit_text = null;
         self.clearAllClusters();
         self.resetTabStops() catch |e| std.debug.print("sketerm: resetTabStops failed: {s}\n", .{@errorName(e)});
         // Bring the parser back to ANSI mode if it's in VT52.
