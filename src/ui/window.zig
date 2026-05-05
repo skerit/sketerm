@@ -3212,8 +3212,11 @@ fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyop
     // button (which bypasses closeCurrentTab), keep the window
     // alive by auto-spawning a fresh shell. Skip during app
     // shutdown — once the window is no longer mapped, this signal
-    // is firing as part of teardown and we'd just leak.
+    // is firing as part of teardown and we'd just leak. Also bail
+    // if the tab_view itself has already been finalised (visible
+    // as `ADW_IS_TAB_VIEW` assertion warnings during quit).
     if (c.gtk_widget_get_mapped(self.app_window) == 0) return;
+    if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(self.tab_view)), c.adw_tab_view_get_type()) == 0) return;
     if (c.adw_tab_view_get_n_pages(self.tab_view) == 0) {
         self.newShellTab(null) catch |err| {
             std.debug.print("sketerm: replacement tab spawn failed: {s}\n", .{@errorName(err)});

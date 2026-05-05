@@ -197,6 +197,15 @@ fn freeActionSlot(user: ?*anyopaque) callconv(.c) void {
 fn freeClickCtx(user: ?*anyopaque) callconv(.c) void {
     if (user) |u| {
         const ctx: *ClickCtx = @ptrCast(@alignCast(u));
+        // Pop popovers added via gtk_widget_set_parent must be
+        // explicitly unparented before the host widget finalizes,
+        // otherwise GTK warns "Finalizing GtkGLArea, but it still
+        // has children left". This destroy-notify fires when the
+        // click controller is removed from the widget — i.e. on
+        // widget destruction — making it the right hook.
+        if (c.gtk_widget_get_parent(ctx.popover) != null) {
+            c.gtk_widget_unparent(ctx.popover);
+        }
         ctx.allocator.destroy(ctx);
     }
 }
