@@ -1,0 +1,83 @@
+# Maintainer: Jelle De Loecker <jelle@elevenways.be>
+
+pkgname=sketerm-git
+_pkgname=sketerm
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc='Native GTK4 terminal emulator written in Zig (git master)'
+arch=('x86_64')
+url='https://github.com/skerit/sketerm'
+license=('MIT')
+depends=(
+    'gtk4'
+    'libadwaita'
+    'freetype2'
+    'harfbuzz'
+    'libepoxy'
+    'fribidi'
+    'fontconfig'
+)
+makedepends=(
+    'git'
+    'zig'
+    'ncurses'  # for tic (terminfo compiler)
+)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=("$_pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$_pkgname"
+    local ver
+    ver=$(grep -m1 '\.version' build.zig.zon | sed -E 's/.*"([^"]+)".*/\1/')
+    printf '%s.r%s.g%s' \
+        "$ver" \
+        "$(git rev-list --count HEAD)" \
+        "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+    cd "$_pkgname"
+    zig build -Doptimize=ReleaseFast
+}
+
+check() {
+    cd "$_pkgname"
+    zig build test
+}
+
+package() {
+    cd "$_pkgname"
+
+    # Main binary
+    install -Dm755 zig-out/bin/sketerm "$pkgdir/usr/bin/sketerm"
+
+    # Desktop entry + scalable icon (auto-discovered by hicolor theme)
+    install -Dm644 data/dev.sker.sketerm.desktop \
+        "$pkgdir/usr/share/applications/dev.sker.sketerm.desktop"
+    install -Dm644 data/icons/hicolor/scalable/apps/dev.sker.sketerm.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.svg"
+
+    # License
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # Sample config + saved-layout reference
+    install -Dm644 data/sample.conf "$pkgdir/usr/share/$_pkgname/sample.conf"
+    install -Dm644 data/sample.layout "$pkgdir/usr/share/$_pkgname/sample.layout"
+
+    # Shell-integration scripts (sourced by user from their rc files)
+    install -Dm644 data/sketerm-shell-integration.bash \
+        "$pkgdir/usr/share/$_pkgname/shell-integration/sketerm.bash"
+    install -Dm644 data/sketerm-shell-integration.zsh \
+        "$pkgdir/usr/share/$_pkgname/shell-integration/sketerm.zsh"
+    install -Dm644 data/sketerm-shell-integration.fish \
+        "$pkgdir/usr/share/$_pkgname/shell-integration/sketerm.fish"
+
+    # Compile + install the terminfo entry system-wide so $TERM=sketerm-256color
+    # resolves without per-user setup.
+    install -d "$pkgdir/usr/share/terminfo"
+    tic -x -o "$pkgdir/usr/share/terminfo" terminfo/sketerm-256color.src
+}
+
+# vim:set ts=4 sw=4 et:

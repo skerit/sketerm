@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>sketerm</title>
+  <defs>
+    <linearGradient id="bezel" x1="64" y1="12" x2="64" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3d3846"/>
+      <stop offset="1" stop-color="#241f31"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="64" y1="44" x2="64" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1e1e2e"/>
+      <stop offset="1" stop-color="#11111b"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Window body -->
+  <rect x="12" y="12" width="104" height="104" rx="20" ry="20" fill="url(#bezel)"/>
+
+  <!-- Title-bar dots -->
+  <circle cx="28" cy="28" r="3.5" fill="#ed5e5e"/>
+  <circle cx="40" cy="28" r="3.5" fill="#f9c74f"/>
+  <circle cx="52" cy="28" r="3.5" fill="#90be6d"/>
+
+  <!-- Inner screen -->
+  <rect x="20" y="44" width="88" height="64" rx="4" ry="4" fill="url(#screen)"/>
+
+  <!-- Prompt chevron (path-based so we don't depend on a font) -->
+  <path d="M 32 64 L 52 78 L 32 92" stroke="#a6e3a1" stroke-width="6"
+        fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Cursor block -->
+  <rect x="62" y="68" width="20" height="22" rx="1.5" fill="#fab387"/>
+</svg>

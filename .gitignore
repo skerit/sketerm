@@ -11,3 +11,10 @@ core.*
 .DS_Store
 .claude/
 external/
+
+# makepkg working dirs (we keep dist/PKGBUILD; everything else is generated)
+dist/src/
+dist/pkg/
+dist/sketerm/
+dist/*.pkg.tar.*
+dist/*.log
