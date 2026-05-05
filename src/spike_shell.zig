@@ -50,7 +50,7 @@ pub fn main() u8 {
         "printf '\\033_Ga=T,f=32,s=2,v=2,i=99;/wAA////AAD/////AAD/////AAD/\\033\\\\'; " ++
         "echo done",
     };
-    const pty = Pty.spawn(.{ .argv = &argv, .rows = 24, .cols = 80 }) catch return 1;
+    var pty = Pty.spawn(.{ .argv = &argv, .rows = 24, .cols = 80 }) catch return 1;
     defer pty.closeAndReap();
 
     var pool = StylePool.init(allocator) catch return 1;

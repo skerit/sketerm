@@ -33,9 +33,28 @@ pub const SpawnOpts = struct {
     login_shell: bool = false,
 };
 
+/// Cap on queued bytes per Pty before we start dropping. Hit only
+/// when the child is hung (not draining the slave) and the user
+/// keeps typing / pasting / broadcasting. 1 MiB ≈ 30 minutes of
+/// typing at 60 wpm; in practice the queue empties within ms.
+const WRITE_QUEUE_CAP: usize = 1024 * 1024;
+
 pub const Pty = struct {
     master_fd: c_int,
     child_pid: c.pid_t,
+    /// Bytes that wouldn't fit a non-blocking `write` because the
+    /// slave's input queue (TIOCINQ, typically 4 KiB) was full. We
+    /// hold them in user-space and drain via a `g_unix_fd_add`
+    /// G_IO_OUT watch when the kernel signals writability. The
+    /// queue uses `std.heap.c_allocator` so its lifetime is
+    /// independent of any caller's allocator (the GLib watch can
+    /// outlive a tab tear-down by exactly one event-loop iteration).
+    write_queue: std.ArrayList(u8) = .{},
+    /// GLib source id for the POLLOUT watch, or 0 when no watch is
+    /// active. `g_source_remove` ignores 0, so we don't gate the
+    /// removal on this — but the field is the canonical "is the
+    /// watch live" signal for adders.
+    write_watch_id: c_uint = 0,
 
     pub fn spawn(opts: SpawnOpts) SpawnError!Pty {
         var master: c_int = undefined;
@@ -52,6 +71,15 @@ pub const Pty = struct {
         // FD_CLOEXEC on master.
         const flags = c.fcntl(master, c.F_GETFD, @as(c_int, 0));
         if (flags >= 0) _ = c.fcntl(master, c.F_SETFD, flags | c.FD_CLOEXEC);
+
+        // O_NONBLOCK on master so `writeAll` never parks the GLib
+        // main thread. A hung child (one that has stopped reading
+        // its slave) used to block the whole UI for the duration of
+        // every keystroke broadcast / motion-mode mouse event. Now
+        // EAGAIN bounces back into our user-space queue and a GLib
+        // POLLOUT watch drains it asynchronously.
+        const file_flags = c.fcntl(master, c.F_GETFL, @as(c_int, 0));
+        if (file_flags >= 0) _ = c.fcntl(master, c.F_SETFL, file_flags | c.O_NONBLOCK);
 
         if (opts.argv.len == 0 or opts.argv.len + 1 > 64) {
             _ = c.close(master);
@@ -154,7 +182,8 @@ pub const Pty = struct {
     /// Close master and reap child. Closing the master delivers SIGHUP
     /// to the child via the kernel; most shells exit immediately. If
     /// the child ignores SIGHUP we escalate to TERM, then KILL.
-    pub fn closeAndReap(self: Pty) void {
+    pub fn closeAndReap(self: *Pty) void {
+        self.releaseWriteResources();
         _ = c.close(self.master_fd);
         var status: c_int = 0;
         // Phase 1: poll for natural exit (~300 ms total).
@@ -192,14 +221,92 @@ pub const Pty = struct {
         }
     }
 
-    pub fn writeAll(self: Pty, bytes: []const u8) usize {
+    /// Same intent as `closeAndReap`, but moves the SIGHUP →
+    /// SIGTERM → SIGKILL escalation chain off the main thread via
+    /// `g_timeout_add`. The synchronous version blocks the GLib
+    /// main loop up to ~500 ms when the child ignores HUP/TERM —
+    /// closing a tab freezes the UI for half a second. This variant
+    /// closes the master fd and sends SIGHUP synchronously (cheap),
+    /// then if the child hasn't exited yet, hands a small Reaper
+    /// struct to a g_timeout that polls every 10 ms and escalates
+    /// signals over time. Caller returns immediately.
+    ///
+    /// The Reaper outlives the Pty by design — children that ignore
+    /// every signal would keep the Pty pinned in memory if it were
+    /// the owner. On app exit, any still-running children become
+    /// orphans (reparented to init) which the kernel handles. The
+    /// Reaper allocates from `std.heap.c_allocator` so its lifetime
+    /// is independent of any Terminal/Window allocator.
+    pub fn closeAndReapAsync(self: *Pty) void {
+        // Drop the POLLOUT watch + queued bytes BEFORE closing the
+        // master fd — once closed, the watch's callback could fire
+        // one more time and dereference a freed Pty otherwise. The
+        // watch's GDestroyNotify only frees its own ctx, not the
+        // queue or the Pty.
+        self.releaseWriteResources();
+        _ = c.close(self.master_fd);
+
+        // Most shells exit on master close (EIO on slave reads) so a
+        // synchronous WNOHANG poll usually catches it without ever
+        // scheduling a timeout. Send SIGHUP first to nudge any that
+        // don't get the EIO signal naturally (e.g. ssh sessions).
+        _ = c.kill(self.child_pid, c.SIGHUP);
+        var status: c_int = 0;
+        const r = c.waitpid(self.child_pid, &status, c.WNOHANG);
+        if (r == self.child_pid) return;
+
+        const reaper = std.heap.c_allocator.create(Reaper) catch {
+            // Allocation failure — fall back to the blocking path.
+            // Better to freeze the UI briefly than leak a child.
+            var sync_pty = Pty{ .master_fd = -1, .child_pid = self.child_pid };
+            sync_pty.closeAndReap();
+            return;
+        };
+        reaper.* = .{ .pid = self.child_pid, .attempts = 0 };
+        _ = c.g_timeout_add(10, @ptrCast(&reapStep), @ptrCast(reaper));
+    }
+
+    /// Free queued bytes + cancel the POLLOUT watch. Idempotent;
+    /// called by both close paths so deinit-on-error of fresh spawns
+    /// doesn't trip on the queue's hot pointer.
+    fn releaseWriteResources(self: *Pty) void {
+        if (self.write_watch_id != 0) {
+            _ = c.g_source_remove(self.write_watch_id);
+            self.write_watch_id = 0;
+        }
+        self.write_queue.deinit(std.heap.c_allocator);
+    }
+
+    /// Try a non-blocking write. Bytes that don't fit (EAGAIN) get
+    /// queued and the kernel signals us via POLLOUT when it can take
+    /// more. Caller-visible behaviour: writes never block, queue
+    /// preserves order across calls. Return value is the number of
+    /// bytes that have been *delivered to the kernel* — anything
+    /// that ended up queued counts as 0 because it hasn't reached
+    /// the slave yet.
+    pub fn writeAll(self: *Pty, bytes: []const u8) usize {
+        // Preserve ordering: if there's already queued data, append
+        // and let the POLLOUT watch flush it. A direct write here
+        // would race ahead of the queued bytes.
+        if (self.write_queue.items.len > 0) {
+            self.queueBytes(bytes);
+            return 0;
+        }
+
         var written: usize = 0;
         while (written < bytes.len) {
             const n = c.write(self.master_fd, bytes.ptr + written, bytes.len - written);
             if (n < 0) {
                 const errn = std.posix.errno(n);
                 if (errn == .INTR) continue; // signal interrupted — retry
-                if (errn == .AGAIN) break; // PTY buffer full and we're non-blocking
+                if (errn == .AGAIN) {
+                    // Slave's input queue full. Hand the rest to the
+                    // POLLOUT watch.
+                    self.queueBytes(bytes[written..]);
+                    return written;
+                }
+                // Real error (EBADF, EIO, EPIPE, ...) — return what
+                // we managed; caller can't do much about it.
                 break;
             }
             if (n == 0) break;
@@ -207,4 +314,116 @@ pub const Pty = struct {
         }
         return written;
     }
+
+    /// Append to the user-space queue (capped to `WRITE_QUEUE_CAP` —
+    /// further bytes are dropped to bound memory in the hung-child
+    /// case) and arm the POLLOUT watch if it isn't already running.
+    fn queueBytes(self: *Pty, bytes: []const u8) void {
+        const cap_left = WRITE_QUEUE_CAP -| self.write_queue.items.len;
+        const take = @min(bytes.len, cap_left);
+        if (take > 0) {
+            self.write_queue.appendSlice(std.heap.c_allocator, bytes[0..take]) catch {};
+        }
+        if (self.write_watch_id == 0 and self.write_queue.items.len > 0) {
+            self.write_watch_id = c.g_unix_fd_add(
+                self.master_fd,
+                c.G_IO_OUT | c.G_IO_HUP | c.G_IO_ERR,
+                @ptrCast(&drainWatchCb),
+                @ptrCast(self),
+            );
+        }
+    }
+
+    /// POLLOUT-handler entry point. GLib calls us with `condition`
+    /// containing the events that fired. We drain as much as the
+    /// kernel will take; on empty queue or fatal condition we
+    /// remove the watch by returning false.
+    fn drainWatchCb(_: c_int, condition: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *Pty = @ptrCast(@alignCast(user.?));
+        // HUP / ERR: child died or pipe broke. Drop everything.
+        if ((condition & (c.G_IO_HUP | c.G_IO_ERR)) != 0) {
+            self.write_queue.clearRetainingCapacity();
+            self.write_watch_id = 0;
+            return 0;
+        }
+        // Drain as much as the kernel will take.
+        while (self.write_queue.items.len > 0) {
+            const n = c.write(
+                self.master_fd,
+                self.write_queue.items.ptr,
+                self.write_queue.items.len,
+            );
+            if (n < 0) {
+                const errn = std.posix.errno(n);
+                if (errn == .INTR) continue;
+                if (errn == .AGAIN) break; // wait for next POLLOUT
+                // Other errors — abandon the queue.
+                self.write_queue.clearRetainingCapacity();
+                self.write_watch_id = 0;
+                return 0;
+            }
+            if (n == 0) break;
+            const consumed: usize = @intCast(n);
+            // Shift remaining bytes down. Cheaper than a ring buffer
+            // for the typical "small queue, occasional spike" pattern.
+            const remaining = self.write_queue.items.len - consumed;
+            std.mem.copyForwards(
+                u8,
+                self.write_queue.items[0..remaining],
+                self.write_queue.items[consumed..],
+            );
+            self.write_queue.shrinkRetainingCapacity(remaining);
+        }
+        if (self.write_queue.items.len == 0) {
+            self.write_watch_id = 0;
+            return 0;
+        }
+        return 1;
+    }
 };
+
+/// Outlives the Pty that schedules it. Iterates a g_timeout polling
+/// `waitpid(WNOHANG)` and escalating signals at fixed tick counts.
+/// Allocated via `std.heap.c_allocator` so its lifetime is decoupled
+/// from any Terminal/Window allocator.
+const Reaper = struct {
+    pid: c.pid_t,
+    attempts: u32,
+};
+
+const REAP_SIGTERM_TICK: u32 = 30; // 300 ms after SIGHUP
+const REAP_SIGKILL_TICK: u32 = 50; // 500 ms after SIGHUP
+const REAP_GIVEUP_TICK: u32 = 200; // 2 s — orphan; kernel reaps at app exit
+
+fn reapStep(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const r: *Reaper = @ptrCast(@alignCast(user.?));
+    var status: c_int = 0;
+    const w = c.waitpid(r.pid, &status, c.WNOHANG);
+    if (w == r.pid) {
+        std.heap.c_allocator.destroy(r);
+        return 0; // G_SOURCE_REMOVE
+    }
+    if (w < 0) {
+        const errn = std.posix.errno(w);
+        // EINTR — retry on next tick. ECHILD or anything else means
+        // the child is unreachable; give up rather than spin forever.
+        if (errn != .INTR) {
+            std.heap.c_allocator.destroy(r);
+            return 0;
+        }
+    }
+    r.attempts += 1;
+    switch (r.attempts) {
+        REAP_SIGTERM_TICK => _ = c.kill(r.pid, c.SIGTERM),
+        REAP_SIGKILL_TICK => _ = c.kill(r.pid, c.SIGKILL),
+        REAP_GIVEUP_TICK => {
+            // 2 s of failed kills — child is in an unkillable state
+            // (uninterruptible sleep, kernel D-state, or PID re-used).
+            // Orphan it; init will reap when sketerm exits.
+            std.heap.c_allocator.destroy(r);
+            return 0;
+        },
+        else => {},
+    }
+    return 1; // G_SOURCE_CONTINUE
+}

@@ -275,7 +275,11 @@ pub const Terminal = struct {
         self.worker_thread.join();
 
         _ = c.close(self.shutdown_fd);
-        self.pty.closeAndReap();
+        // Async reap: closes master_fd + sends SIGHUP synchronously,
+        // then escalates SIGTERM / SIGKILL on a g_timeout chain so
+        // a child that ignores HUP doesn't freeze the GLib main
+        // thread for ~500 ms while we close a tab.
+        self.pty.closeAndReapAsync();
 
         // Drain remaining events to free their owned payloads.
         while (self.ring.pop()) |ev| {

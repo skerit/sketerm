@@ -620,7 +620,7 @@ pub const Window = struct {
                     argv_buf[i] = z.ptr;
                 }
 
-                const pty = try Pty.spawn(.{
+                var pty = try Pty.spawn(.{
                     .argv = argv_buf,
                     .cwd = p.cwd,
                     .rows = 24,
@@ -716,7 +716,7 @@ pub const Window = struct {
         argv: []const [*:0]const u8,
         cwd: ?[]const u8,
     ) !void {
-        const pty = try Pty.spawn(.{
+        var pty = try Pty.spawn(.{
             .argv = argv,
             .cwd = cwd,
             .rows = 24,
@@ -943,7 +943,7 @@ pub const Window = struct {
         else
             self.config.login_shell;
 
-        const pty = try Pty.spawn(.{
+        var pty = try Pty.spawn(.{
             .argv = &argv,
             .rows = 24,
             .cols = 80,
