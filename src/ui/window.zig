@@ -48,6 +48,44 @@ const PanedRatioCtx = struct {
     setting: bool = false,
 };
 
+/// Smallest M such that `scale * M` is integer (within 1e-3 tolerance).
+/// 1.0 → 1, 1.5 → 2, 1.25/1.75 → 4. Caps at 16; anything past that we
+/// pretend is integer (no realistic compositor reports those scales).
+///
+/// Used to snap GtkPaned divider positions to a logical-pixel grid that
+/// maps onto integer device pixels at the current surface scale —
+/// without this, GtkGraphicsOffload rejects every frame at fractional
+/// scale and GTK silently falls back to the GSK FBO composite path
+/// (which c3db441 was supposed to escape). Diagnose with
+/// `GDK_DEBUG=offload` — the "Non-integral device coordinates" line
+/// is the rejection.
+fn alignmentForScale(scale: f64) u32 {
+    if (scale <= 0) return 1;
+    const tol: f64 = 1e-3;
+    var m: u32 = 1;
+    while (m <= 16) : (m += 1) {
+        const v = scale * @as(f64, @floatFromInt(m));
+        if (@abs(v - @round(v)) < tol) return m;
+    }
+    return 1;
+}
+
+/// Surface scale for `widget`'s native, or 1.0 if not realized yet.
+fn widgetSurfaceScale(widget: *c.GtkWidget) f64 {
+    const native = c.gtk_widget_get_native(widget) orelse return 1.0;
+    const surface = c.gtk_native_get_surface(native) orelse return 1.0;
+    return c.gdk_surface_get_scale(surface);
+}
+
+/// Round `pos` down to the nearest multiple of M that's still > 0.
+fn snapDown(pos: c_int, m: u32) c_int {
+    if (m <= 1) return pos;
+    if (pos <= 0) return pos;
+    const im: c_int = @intCast(m);
+    const snapped = @divFloor(pos, im) * im;
+    return if (snapped <= 0) im else snapped;
+}
+
 /// Called from user-triggered action dispatch (menu items, keybinds,
 /// window callbacks) when a fallible op (`newShellTab`, `splitFocused`,
 /// …) fails. The previous `catch {}` swallowed errors silently — the
@@ -1987,13 +2025,21 @@ pub const Window = struct {
             \\    background-color: rgba(53, 132, 228, 0.18);
             \\}}
             \\
-            \\/* Split-pane separator — solid 2-px #353535 line.
+            \\/* Split-pane separator — solid 4-px #353535 line.
             \\   `gtk_paned_set_wide_handle(paned, TRUE)` adds the
             \\   `.wide` style class to the separator. libadwaita's
             \\   `paned.horizontal > separator.wide` rule has higher
             \\   specificity than `paned > separator` and paints
             \\   1-px box-shadow lines on both edges; we have to
-            \\   match that selector to override. */
+            \\   match that selector to override.
+            \\
+            \\   Width is 4 logical px (not 2) so it stays a multiple
+            \\   of 4 — every fractional surface scale we care about
+            \\   (1.25, 1.5, 1.75) maps that to integer device pixels,
+            \\   keeping the pane rectangles on the GtkGraphicsOffload-
+            \\   compatible grid. With an odd-width separator at scale
+            \\   1.5 one pane always falls off-grid and offload
+            \\   silently rejects every frame. */
             \\paned.horizontal > separator,
             \\paned.vertical > separator,
             \\paned.horizontal > separator.wide,
@@ -2004,8 +2050,8 @@ pub const Window = struct {
             \\    border: none;
             \\    margin: 0;
             \\    padding: 0;
-            \\    min-width: 2px;
-            \\    min-height: 2px;
+            \\    min-width: 4px;
+            \\    min-height: 4px;
             \\}}
             \\paned.horizontal > separator:hover,
             \\paned.vertical > separator:hover,
@@ -2697,9 +2743,11 @@ fn applyPanedRatioMap(paned: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void 
     applyPanedRatioImpl(paned, user);
 }
 
-/// notify::position fires when the user drags the divider — we read the
-/// current pos/total back into ctx.ratio so the next remap restores
-/// what the user chose, and so layout-save reads the up-to-date value.
+/// notify::position fires when the user drags the divider AND when the
+/// paned itself re-allocates on window resize. We re-snap to the
+/// device-pixel grid (see `alignmentForScale`) so GtkGraphicsOffload
+/// keeps engaging at fractional scale, and update ratio so the next
+/// remap and layout save reflect the snapped position.
 fn onPanedPositionChanged(paned: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(PanedRatioCtx, user);
     if (ctx.setting) return;
@@ -2712,7 +2760,15 @@ fn onPanedPositionChanged(paned: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque
     if (total <= 0) return;
     const pos = c.gtk_paned_get_position(@ptrCast(w));
     if (pos <= 0) return;
-    ctx.ratio = @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total));
+
+    const m = alignmentForScale(widgetSurfaceScale(w));
+    const snapped = snapDown(pos, m);
+    if (snapped != pos) {
+        ctx.setting = true;
+        c.gtk_paned_set_position(@ptrCast(w), snapped);
+        ctx.setting = false;
+    }
+    ctx.ratio = @as(f32, @floatFromInt(snapped)) / @as(f32, @floatFromInt(total));
 }
 
 fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
@@ -2723,7 +2779,9 @@ fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
     else
         c.gtk_widget_get_height(paned);
     if (total <= 0) return;
-    const pos: c_int = @intFromFloat(@as(f32, @floatFromInt(total)) * ctx.ratio);
+    const raw_pos: c_int = @intFromFloat(@as(f32, @floatFromInt(total)) * ctx.ratio);
+    const m = alignmentForScale(widgetSurfaceScale(paned));
+    const pos = snapDown(raw_pos, m);
     ctx.setting = true;
     c.gtk_paned_set_position(@ptrCast(paned), pos);
     ctx.setting = false;
