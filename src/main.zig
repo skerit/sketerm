@@ -149,7 +149,18 @@ pub fn main() u8 {
     const c_argv: [*c][*c]u8 = @ptrCast(@alignCast(std.os.argv.ptr));
     const argc: c_int = @intCast(std.os.argv.len);
 
-    const app = c.adw_application_new(APP_ID, c.G_APPLICATION_HANDLES_COMMAND_LINE);
+    // SKETERM_APP_ID overrides the GApplication ID so a second instance
+    // can run alongside the primary one (debug / profiling). Must be a
+    // valid reverse-DNS-style name; GLib aborts otherwise.
+    var app_id_buf: [256:0]u8 = undefined;
+    const app_id: [*:0]const u8 = if (std.posix.getenv("SKETERM_APP_ID")) |env| blk: {
+        if (env.len == 0 or env.len >= app_id_buf.len) break :blk APP_ID;
+        @memcpy(app_id_buf[0..env.len], env);
+        app_id_buf[env.len] = 0;
+        break :blk @ptrCast(&app_id_buf);
+    } else APP_ID;
+
+    const app = c.adw_application_new(app_id, c.G_APPLICATION_HANDLES_COMMAND_LINE);
     defer c.g_object_unref(app);
 
     _ = c.g_signal_connect_data(
