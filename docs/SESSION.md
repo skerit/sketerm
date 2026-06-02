@@ -3728,3 +3728,72 @@ a half-torn-down Pane between the schedule and the fire.
 
 Same path applies in `closePane` (Ctrl+Shift+W on a single
 pane) — fixed identically.
+
+## ⬆️ Zig 0.16 port + SGR-dim rendering fix
+
+### Toolchain port (0.15.2 -> 0.16)
+
+The big structural change is C bindings. Zig 0.16's in-process
+`@cImport` SEGVs while translating the GTK/glib header set (the new
+Aro frontend, not LLVM/clang). Standalone `zig translate-c` on the
+same input succeeds, so the build now generates the bindings
+out-of-process: a `b.addTranslateC` step on `vendor/cimport_root.h`,
+piped through a `sed` step, exposed as the `cbindings` module that
+`src/c.zig` re-exports.
+
+Three Aro bugs are worked around, each load-bearing (build fails
+loudly without it) and each with a documented removal condition:
+
+- `vendor/cimport_root.h` predefines `_Pragma(x)` to empty (glib's
+  `G_GNUC_BEGIN_IGNORE_DEPRECATIONS` expands to `_Pragma(...)` inside
+  a macro, which Aro mishandles), defines `__GDK_H_INSIDE__`, and pins
+  `GLIB_VERSION_MIN/MAX` to 2.74 so the 2.76+ `g_string_free` macro
+  (which translates to invalid Zig) is not emitted.
+- `vendor/aro_shims/gdk/version/gdkversionmacros.h` is a copy of the
+  system header with the `#error "Only <gdk/gdk.h>"` guard removed,
+  placed first on the include path to shadow the system one. Aro
+  honours `#pragma once` too late (after the `#error` on line 18 has
+  already fired on re-include). This file is a pinned copy and will
+  drift on GTK bumps; the version `#if` keeps drift loud, not silent.
+- The `sed` step rewrites `_ = @ptrCast(@alignCast(<expr>));` (which
+  Aro emits for discarded pointer-returning inline fns like
+  `g_set_object`) to `_ = <expr>;`. The capture is `[^;]+` so it can
+  never cross a statement boundary.
+
+Stdlib API churn is absorbed without plumbing an `Io` instance
+everywhere: direct-libc shims for file I/O (`fopen`/`fread`/`fwrite`/
+`rename`/`mkdir`/`unlink`/`access` in config/layout/kitty_images/
+window/main/spike_shell/terminal), `getenv`, and `clock_gettime` (the
+`nano/micro/milliTimestamp` hub now lives in `util/profile.zig`). Plus
+the mechanical renames: `ArrayList(T) = .empty`, `std.Io.Writer`,
+`mem.trimEnd/trimStart`, `DebugAllocator`, `process.Init.Minimal`.
+
+### SGR-dim (faint) rendering
+
+The user-reported bug: dim placeholder/ghost text in TUIs (claude-code,
+opencode) rendered too bright and sometimes was not cleared. Two
+causes:
+
+- The HarfBuzz ligature glyph path resolved fg without the dim /
+  bold-bright / reverse handling the main path applied, so a `->` or
+  `...` ligature inside dim text rendered bright at the cluster anchor.
+  Fixed by extracting `resolveStyleColors()` and calling it from both
+  paths in `cell_pass.zig`.
+- The root cause of "too bright / stays stale": `Cell.style_ref` is a
+  u16 index into an interned style pool capped at 65535 entries with no
+  eviction. During long truecolor sessions the pool fills, `intern`
+  returns `error.PoolFull`, and the old code silently kept the previous
+  `cur_style` -- so a fresh `\e[2m` inherited a bright non-dim style.
+  Added `compactStylePool()` in `screen.zig`: a lazy mark/remap GC
+  (triggered only on intern overflow) that walks active + alt +
+  scrollback + cur/saved style, keeps only referenced entries (default
+  pinned at slot 0), and rewrites every `style_ref`. Widening the index
+  was rejected -- it breaks the comptime-pinned 8-byte `Cell`.
+
+### Atlas glyph residue
+
+`atlas.zig` now zero-fills glyph pages at realize. `glTexImage3D` with
+a NULL pointer leaves contents undefined (GL ES 3.0 spec); AMD/radeonsi
+left residue in the 1-texel inter-glyph padding, and the faux-bold path
+(which samples one texel left of each glyph) picked it up as a faint
+vertical line on narrow bold glyphs (`i`, `l`, `v`).
