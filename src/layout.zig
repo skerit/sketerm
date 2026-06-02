@@ -48,50 +48,98 @@ pub const Layout = struct {
 pub fn cwdOfPid(pid: c.pid_t, allocator: std.mem.Allocator) ![]u8 {
     var path_buf: [64]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "/proc/{d}/cwd", .{pid});
+    var path_z: [128]u8 = undefined;
+    if (path.len >= path_z.len) return error.PathTooLong;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
     var read_buf: [4096]u8 = undefined;
-    const target = try std.posix.readlink(path, &read_buf);
-    return try allocator.dupe(u8, target);
+    const n = c.readlink(@ptrCast(&path_z), &read_buf, read_buf.len);
+    if (n < 0) return error.ReadlinkFailed;
+    return try allocator.dupe(u8, read_buf[0..@intCast(n)]);
 }
 
 pub fn save(layout: Layout, path: []const u8) !void {
-    var dir = try ensureParentDir(path);
-    defer dir.close();
-    const basename = std.fs.path.basename(path);
+    try makeParentDirs(path);
 
-    var tmp_buf: [256]u8 = undefined;
-    const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{basename});
-    var tmp = try dir.createFile(tmp_name, .{ .truncate = true });
-    defer tmp.close();
+    var path_z: [4096]u8 = undefined;
+    if (path.len + 4 >= path_z.len) return error.PathTooLong;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
 
-    var write_buf: [4096]u8 = undefined;
-    var w = tmp.writer(&write_buf);
-    try std.json.Stringify.value(layout, .{ .whitespace = .indent_2 }, &w.interface);
-    try w.interface.flush();
+    var tmp_z: [4096]u8 = undefined;
+    @memcpy(tmp_z[0..path.len], path);
+    @memcpy(tmp_z[path.len .. path.len + 4], ".tmp");
+    tmp_z[path.len + 4] = 0;
 
-    try dir.rename(tmp_name, basename);
+    const fp = c.fopen(@ptrCast(&tmp_z), "wb") orelse return error.WriteFailed;
+    var write_buf: [16384]u8 = undefined;
+    var w = std.Io.Writer.fixed(&write_buf);
+    std.json.Stringify.value(layout, .{ .whitespace = .indent_2 }, &w) catch |err| {
+        _ = c.fclose(fp);
+        return err;
+    };
+    const bytes = w.buffered();
+    if (c.fwrite(bytes.ptr, 1, bytes.len, fp) != bytes.len) {
+        _ = c.fclose(fp);
+        return error.WriteFailed;
+    }
+    if (c.fclose(fp) != 0) return error.WriteFailed;
+    if (c.rename(@ptrCast(&tmp_z), @ptrCast(&path_z)) != 0) {
+        _ = c.unlink(@ptrCast(&tmp_z));
+        return error.WriteFailed;
+    }
 }
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(Layout) {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const bytes = try file.readToEndAlloc(allocator, 1024 * 1024);
+    var path_z: [4096]u8 = undefined;
+    if (path.len >= path_z.len) return error.PathTooLong;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const fp = c.fopen(@ptrCast(&path_z), "rb") orelse return error.OpenFailed;
+    defer _ = c.fclose(fp);
+    if (c.fseek(fp, 0, c.SEEK_END) != 0) return error.ReadFailed;
+    const size_long = c.ftell(fp);
+    if (size_long <= 0 or size_long > 1024 * 1024) return error.BadFile;
+    if (c.fseek(fp, 0, c.SEEK_SET) != 0) return error.ReadFailed;
+    const size: usize = @intCast(size_long);
+    const bytes = try allocator.alloc(u8, size);
     defer allocator.free(bytes);
+    if (c.fread(bytes.ptr, 1, size, fp) != size) return error.ShortRead;
     return try std.json.parseFromSlice(Layout, allocator, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     });
 }
 
-fn ensureParentDir(path: []const u8) !std.fs.Dir {
-    const dirname = std.fs.path.dirname(path) orelse ".";
-    return std.fs.cwd().makeOpenPath(dirname, .{});
+/// Create every missing parent directory of `path` via `mkdir(2)`,
+/// like `mkdir -p $(dirname path)`. Duplicated from `config.zig` —
+/// both modules predate Zig 0.16's removal of `std.fs.Dir`.
+fn makeParentDirs(path: []const u8) !void {
+    const dirname = std.fs.path.dirname(path) orelse return;
+    if (dirname.len == 0) return;
+    var path_z: [4096]u8 = undefined;
+    if (dirname.len >= path_z.len) return error.PathTooLong;
+    var i: usize = 0;
+    while (i < dirname.len) {
+        const start = i;
+        while (i < dirname.len and dirname[i] != '/') i += 1;
+        if (i == start) {
+            i += 1;
+            continue;
+        }
+        const slice_len = i;
+        @memcpy(path_z[0..slice_len], dirname[0..slice_len]);
+        path_z[slice_len] = 0;
+        _ = c.mkdir(@ptrCast(&path_z), 0o755);
+        i += 1;
+    }
 }
 
 pub fn defaultSavePath(allocator: std.mem.Allocator) ![]u8 {
-    if (std.posix.getenv("XDG_STATE_HOME")) |xs| {
+    if (@import("util/profile.zig").getenv("XDG_STATE_HOME")) |xs| {
         return std.fmt.allocPrint(allocator, "{s}/sketerm/last.json", .{xs});
     }
-    if (std.posix.getenv("HOME")) |home| {
+    if (@import("util/profile.zig").getenv("HOME")) |home| {
         return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/last.json", .{home});
     }
     return std.fmt.allocPrint(allocator, "/tmp/sketerm-last.json", .{});
@@ -102,10 +150,10 @@ pub fn defaultSavePath(allocator: std.mem.Allocator) ![]u8 {
 /// `defaultSavePath` (last.json), which is the auto-save-on-exit
 /// snapshot used by --restore.
 pub fn defaultLayoutPath(allocator: std.mem.Allocator) ![]u8 {
-    if (std.posix.getenv("XDG_STATE_HOME")) |xs| {
+    if (@import("util/profile.zig").getenv("XDG_STATE_HOME")) |xs| {
         return std.fmt.allocPrint(allocator, "{s}/sketerm/default.json", .{xs});
     }
-    if (std.posix.getenv("HOME")) |home| {
+    if (@import("util/profile.zig").getenv("HOME")) |home| {
         return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/default.json", .{home});
     }
     return std.fmt.allocPrint(allocator, "/tmp/sketerm-default.json", .{});
@@ -119,7 +167,7 @@ test "round trip with split tree" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const real_path = try tmp_dir.dir.realpathAlloc(a, ".");
+    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
     const file_path = try std.fmt.allocPrint(a, "{s}/lay.json", .{real_path});
 
     const cmd1 = [_][]const u8{ "bash", "-l" };
@@ -160,7 +208,7 @@ test "round trip preserves PaneSpec.profile" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const real_path = try tmp_dir.dir.realpathAlloc(a, ".");
+    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
     const file_path = try std.fmt.allocPrint(a, "{s}/profile.json", .{real_path});
 
     const cmd = [_][]const u8{ "bash", "-l" };
@@ -188,7 +236,7 @@ test "round trip preserves TabSpec.pinned" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const real_path = try tmp_dir.dir.realpathAlloc(a, ".");
+    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
     const file_path = try std.fmt.allocPrint(a, "{s}/pinned.json", .{real_path});
 
     const cmd = [_][]const u8{"bash"};
@@ -217,7 +265,7 @@ test "load tolerates older JSON without profile / pinned fields" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const real_path = try tmp_dir.dir.realpathAlloc(a, ".");
+    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
     const file_path = try std.fmt.allocPrint(a, "{s}/old.json", .{real_path});
 
     // Hand-write a minimal v2 layout missing the new fields. Should
@@ -229,9 +277,15 @@ test "load tolerates older JSON without profile / pinned fields" {
         \\    "tree": { "pane": { "cwd": "/", "command": ["sh"] } } }
         \\] }
     ;
-    var f = try std.fs.cwd().createFile(file_path, .{});
-    try f.writeAll(old_json);
-    f.close();
+    // Write the hand-crafted JSON via libc — Zig 0.16's std.fs APIs
+    // require an Io we don't have here.
+    var fp_z: [4096]u8 = undefined;
+    if (file_path.len >= fp_z.len) return error.PathTooLong;
+    @memcpy(fp_z[0..file_path.len], file_path);
+    fp_z[file_path.len] = 0;
+    const fp = c.fopen(@ptrCast(&fp_z), "wb") orelse return error.WriteFailed;
+    _ = c.fwrite(old_json.ptr, 1, old_json.len, fp);
+    _ = c.fclose(fp);
 
     const parsed = try load(a, file_path);
     defer parsed.deinit();

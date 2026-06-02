@@ -49,7 +49,7 @@ pub const Pty = struct {
     /// queue uses `std.heap.c_allocator` so its lifetime is
     /// independent of any caller's allocator (the GLib watch can
     /// outlive a tab tear-down by exactly one event-loop iteration).
-    write_queue: std.ArrayList(u8) = .{},
+    write_queue: std.ArrayList(u8) = .empty,
     /// GLib source id for the POLLOUT watch, or 0 when no watch is
     /// active. `g_source_remove` ignores 0, so we don't gate the
     /// removal on this — but the field is the canonical "is the
@@ -197,7 +197,7 @@ pub const Pty = struct {
                 if (std.posix.errno(r) == .INTR) continue;
                 return;
             }
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            _ = c.usleep(10 * 1000);
         }
         // Phase 2: SIGTERM, poll briefly.
         _ = c.kill(self.child_pid, c.SIGTERM);
@@ -209,7 +209,7 @@ pub const Pty = struct {
                 if (std.posix.errno(r) == .INTR) continue;
                 return;
             }
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            _ = c.usleep(10 * 1000);
         }
         // Phase 3: SIGKILL, blocking wait. Loop on EINTR.
         _ = c.kill(self.child_pid, c.SIGKILL);

@@ -694,7 +694,7 @@ pub const Pane = struct {
             } else |_| {}
         }
         if (self.atlas == null) {
-            if (std.posix.getenv("SKETERM_FONT")) |env_path| {
+            if (@import("../util/profile.zig").getenv("SKETERM_FONT")) |env_path| {
                 const z = self.allocator.allocSentinel(u8, env_path.len, 0) catch return;
                 defer self.allocator.free(z);
                 @memcpy(z, env_path);
@@ -814,7 +814,7 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         } else |_| {}
     }
     if (self.atlas == null) {
-        if (std.posix.getenv("SKETERM_FONT")) |env_path| {
+        if (@import("../util/profile.zig").getenv("SKETERM_FONT")) |env_path| {
             const z = self.allocator.allocSentinel(u8, env_path.len, 0) catch return;
             defer self.allocator.free(z);
             @memcpy(z, env_path);
@@ -862,7 +862,7 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     const self = cast.userData(Pane, user);
     const atlas = self.atlas orelse return @intFromBool(false);
     const profile = @import("../util/profile.zig");
-    const t_total = if (profile.enabled) std.time.nanoTimestamp() else 0;
+    const t_total = if (profile.enabled) profile.nanoTimestamp() else 0;
 
     const w = c.gtk_widget_get_width(@ptrCast(area));
     const h = c.gtk_widget_get_height(@ptrCast(area));
@@ -889,9 +889,9 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     self.cell_pass.pad = self.grid_pass.pad;
     self.cell_pass.enable_ligatures = self.grid_pass.enable_ligatures;
     self.cell_pass.enable_bidi = self.grid_pass.enable_bidi;
-    const t_cell_rebuild = if (profile.enabled) std.time.nanoTimestamp() else 0;
+    const t_cell_rebuild = if (profile.enabled) profile.nanoTimestamp() else 0;
     self.cell_pass.rebuildAndUpload(self.terminal.screen, &self.terminal.pool, atlas) catch return @intFromBool(false);
-    if (profile.enabled) profile.record(.cell_rebuild, @intCast(std.time.nanoTimestamp() - t_cell_rebuild));
+    if (profile.enabled) profile.record(.cell_rebuild, @intCast(profile.nanoTimestamp() - t_cell_rebuild));
     const cells_changed = self.cell_pass.cells_rebuilt;
     const rebuilt_rows = self.cell_pass.rebuilt_rows.items;
 
@@ -904,33 +904,33 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     self.image_pass.pad = self.grid_pass.pad;
     var img_ns: u64 = 0;
     {
-        const t_img = if (profile.enabled) std.time.nanoTimestamp() else 0;
+        const t_img = if (profile.enabled) profile.nanoTimestamp() else 0;
         self.image_pass.drawZ(&self.image_store, phys_w, phys_h, .below);
-        if (profile.enabled) img_ns += @intCast(std.time.nanoTimestamp() - t_img);
+        if (profile.enabled) img_ns += @intCast(profile.nanoTimestamp() - t_img);
     }
 
-    const t_cell_draw = if (profile.enabled) std.time.nanoTimestamp() else 0;
+    const t_cell_draw = if (profile.enabled) profile.nanoTimestamp() else 0;
     self.cell_pass.draw(atlas, phys_w, phys_h);
-    if (profile.enabled) profile.record(.cell_draw, @intCast(std.time.nanoTimestamp() - t_cell_draw));
+    if (profile.enabled) profile.record(.cell_draw, @intCast(profile.nanoTimestamp() - t_cell_draw));
     // Overlay pipeline (per-vertex VBO) — cursor, selection, focus
     // border, scrollback indicator, preedit, bell, and any rows that
     // need bidi reorder or DH/DW per-line scaling.
-    const t_grid_build = if (profile.enabled) std.time.nanoTimestamp() else 0;
+    const t_grid_build = if (profile.enabled) profile.nanoTimestamp() else 0;
     self.grid_pass.buildVertices(self.terminal.screen, &self.terminal.pool, atlas, focused, cells_changed, rebuilt_rows) catch return @intFromBool(false);
-    if (profile.enabled) profile.record(.grid_build, @intCast(std.time.nanoTimestamp() - t_grid_build));
-    const t_grid_draw = if (profile.enabled) std.time.nanoTimestamp() else 0;
+    if (profile.enabled) profile.record(.grid_build, @intCast(profile.nanoTimestamp() - t_grid_build));
+    const t_grid_draw = if (profile.enabled) profile.nanoTimestamp() else 0;
     self.grid_pass.draw(atlas, phys_w, phys_h);
-    if (profile.enabled) profile.record(.grid_draw, @intCast(std.time.nanoTimestamp() - t_grid_draw));
+    if (profile.enabled) profile.record(.grid_draw, @intCast(profile.nanoTimestamp() - t_grid_draw));
 
     // Foreground images (z >= 0).
     {
-        const t_img = if (profile.enabled) std.time.nanoTimestamp() else 0;
+        const t_img = if (profile.enabled) profile.nanoTimestamp() else 0;
         self.image_pass.drawZ(&self.image_store, phys_w, phys_h, .above);
-        if (profile.enabled) img_ns += @intCast(std.time.nanoTimestamp() - t_img);
+        if (profile.enabled) img_ns += @intCast(profile.nanoTimestamp() - t_img);
     }
     if (profile.enabled) {
         profile.record(.image_pass, img_ns);
-        profile.record(.onrender_total, @intCast(std.time.nanoTimestamp() - t_total));
+        profile.record(.onrender_total, @intCast(profile.nanoTimestamp() - t_total));
     }
 
     return @intFromBool(true);
@@ -1068,7 +1068,7 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
     // Cursor blink — toggle every 500ms for blinking shapes, but
     // only on the focused pane. Unfocused panes always show a static
     // (hollow) cursor and don't waste redraws toggling phase.
-    const now = std.time.microTimestamp();
+    const now = @import("../util/profile.zig").microTimestamp();
     if (self.last_blink_us == 0) self.last_blink_us = now;
     // Use the cached is_focused — saves a GTK round-trip on every
     // tick. Updated by onFocusEnter/Leave handlers.

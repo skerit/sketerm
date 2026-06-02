@@ -10,6 +10,7 @@ const Parser = @import("parser/vt.zig").Parser;
 const Event = @import("parser/event.zig").Event;
 const Screen = @import("grid/screen.zig").Screen;
 const Pool = @import("grid/style_pool.zig").Pool;
+const profile_mod = @import("util/profile.zig");
 
 const Ctx = struct {
     screen: *Screen,
@@ -39,12 +40,12 @@ fn runOne(allocator: std.mem.Allocator, w: Workload) !void {
     defer parser.deinit();
 
     const total_bytes: usize = w.sample.len * w.repeats;
-    const start = std.time.nanoTimestamp();
+    const start = profile_mod.nanoTimestamp();
     var i: usize = 0;
     while (i < w.repeats) : (i += 1) {
         parser.advance(w.sample, emit, @ptrCast(&ctx));
     }
-    const elapsed_ns: i128 = std.time.nanoTimestamp() - start;
+    const elapsed_ns: i128 = profile_mod.nanoTimestamp() - start;
     const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
     const mb: f64 = @as(f64, @floatFromInt(total_bytes)) / (1024.0 * 1024.0);
     const mbps: f64 = mb / elapsed_s;
@@ -55,7 +56,7 @@ fn runOne(allocator: std.mem.Allocator, w: Workload) !void {
 }
 
 pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    var gpa: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -70,14 +71,13 @@ pub fn main() !void {
 
     // 2. Heavy SGR usage — every char wrapped in a colour change.
     var sgr_buf: [1024]u8 = undefined;
-    var sgr_writer = std.io.fixedBufferStream(&sgr_buf);
-    var w = sgr_writer.writer();
+    var sgr_writer = std.Io.Writer.fixed(&sgr_buf);
     var k: u8 = 30;
     while (k <= 37) : (k += 1) {
-        try w.print("\x1b[{d}m{c}{c}", .{ k, 'A' + k - 30, 'a' + k - 30 });
+        try sgr_writer.print("\x1b[{d}m{c}{c}", .{ k, 'A' + k - 30, 'a' + k - 30 });
     }
-    try w.writeAll("\x1b[0m\n");
-    const sgr = sgr_writer.getWritten();
+    try sgr_writer.writeAll("\x1b[0m\n");
+    const sgr = sgr_writer.buffered();
 
     // 3. Truecolor SGR (most expensive parameter parsing path).
     const truecolor =

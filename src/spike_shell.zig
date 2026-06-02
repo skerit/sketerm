@@ -33,7 +33,7 @@ fn emit(user: ?*anyopaque, ev: Event) void {
 }
 
 pub fn main() u8 {
-    var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
@@ -66,9 +66,9 @@ pub fn main() u8 {
     defer parser.deinit();
 
     // Read for up to 1 second.
-    const start = std.time.milliTimestamp();
+    const start = @import("util/profile.zig").milliTimestamp();
     var buf: [4096]u8 = undefined;
-    while (std.time.milliTimestamp() - start < 1000) {
+    while (@import("util/profile.zig").milliTimestamp() - start < 1000) {
         var pfd = c.struct_pollfd{
             .fd = pty.master_fd,
             .events = c.POLLIN,
@@ -90,15 +90,17 @@ pub fn main() u8 {
         }
     }
 
-    // Dump the screen to stdout.
+    // Dump the screen to stdout via a fixed in-memory writer, then
+    // hand the buffered output to libc's stdout. Zig 0.16 removed the
+    // free-standing `std.fs.File.stdout()` helper.
     var stdout_buf: [16384]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buf);
-    stdout.interface.print("=== sketerm smoke run ===\n", .{}) catch return 2;
-    stdout.interface.print("cursor: row={d} col={d}\n", .{ screen.row, screen.col }) catch {};
-    stdout.interface.print("scrollback: {d} lines\n", .{screen.scrollbackCount()}) catch {};
-    stdout.interface.print("--- grid (active) ---\n", .{}) catch {};
-    screen.dump(&stdout.interface) catch return 2;
-    stdout.interface.print("=== end ===\n", .{}) catch {};
-    stdout.interface.flush() catch return 2;
+    var w = std.Io.Writer.fixed(&stdout_buf);
+    w.print("=== sketerm smoke run ===\n", .{}) catch return 2;
+    w.print("cursor: row={d} col={d}\n", .{ screen.row, screen.col }) catch {};
+    w.print("scrollback: {d} lines\n", .{screen.scrollbackCount()}) catch {};
+    w.print("--- grid (active) ---\n", .{}) catch {};
+    screen.dump(&w) catch return 2;
+    w.print("=== end ===\n", .{}) catch {};
+    _ = c.fwrite(w.buffered().ptr, 1, w.buffered().len, c.stdout);
     return 0;
 }

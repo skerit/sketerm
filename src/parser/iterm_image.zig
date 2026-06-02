@@ -42,7 +42,7 @@ pub fn decodePayload(allocator: std.mem.Allocator, payload: []const u8) !Decoded
     }
 
     // Decode base64. Strip whitespace/newlines.
-    var stripped: std.ArrayList(u8) = .{};
+    var stripped: std.ArrayList(u8) = .empty;
     defer stripped.deinit(allocator);
     for (b64) |b| {
         if (b == ' ' or b == '\n' or b == '\r' or b == '\t') continue;
@@ -103,7 +103,7 @@ fn parsePxAttr(s: []const u8) u32 {
 }
 
 test "rejects non-PNG payload" {
-    var payload: std.ArrayList(u8) = .{};
+    var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(std.testing.allocator);
     try payload.appendSlice(std.testing.allocator, "File=name=t.png:bm9wZQ=="); // base64("nope")
     const out = try decodePayload(std.testing.allocator, payload.items);

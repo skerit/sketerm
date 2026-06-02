@@ -53,7 +53,7 @@ pub const Parser = struct {
     /// every ':' separator. Parser tracks this so the SGR handler
     /// can distinguish `4:3m` (curly underline) from `4;3m`.
     next_param_is_sub: bool = false,
-    osc_buf: std.ArrayList(u8) = .{},
+    osc_buf: std.ArrayList(u8) = .empty,
     /// Set to true if any byte destined for `osc_buf` was dropped —
     /// either because the `osc_max` cap was hit or because an append
     /// failed with OOM. Cleared on entry to OSC/DCS/APC collection so
@@ -679,7 +679,7 @@ test "scanPrintable: long run with control near end" {
 // ── Tests ────────────────────────────────────────────────────────
 
 const TestCollector = struct {
-    events: std.ArrayList(Event) = .{},
+    events: std.ArrayList(Event) = .empty,
     allocator: std.mem.Allocator,
 
     fn deinit(self: *TestCollector) void {

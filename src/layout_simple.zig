@@ -56,7 +56,7 @@ pub fn parse(allocator: std.mem.Allocator, src: []const u8) !Parsed {
     const a = arena.allocator();
 
     // Tokenize into trimmed lines with indent counts.
-    var lines: std.ArrayList(Line) = .{};
+    var lines: std.ArrayList(Line) = .empty;
     defer lines.deinit(allocator);
 
     var line_no: usize = 0;
@@ -68,7 +68,7 @@ pub fn parse(allocator: std.mem.Allocator, src: []const u8) !Parsed {
         while (i < raw.len and raw[i] == ' ') : (i += 1) indent += 1;
         if (indent % 2 != 0) return ParseError.BadIndent;
         const tail = raw[i..];
-        const trimmed = std.mem.trimRight(u8, tail, " \t\r");
+        const trimmed = std.mem.trimEnd(u8, tail, " \t\r");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
         try lines.append(allocator, .{
             .indent = indent / 2,
@@ -77,7 +77,7 @@ pub fn parse(allocator: std.mem.Allocator, src: []const u8) !Parsed {
         });
     }
 
-    var tabs: std.ArrayList(layout.TabSpec) = .{};
+    var tabs: std.ArrayList(layout.TabSpec) = .empty;
 
     var idx: usize = 0;
     while (idx < lines.items.len) {
@@ -113,11 +113,11 @@ fn parseTree(a: std.mem.Allocator, lines: []const Line, expected_indent: usize) 
     if (std.mem.startsWith(u8, head.text, "hsplit") or std.mem.startsWith(u8, head.text, "vsplit")) {
         const word = head.text[0..6];
         const orient: layout.Orient = if (word[0] == 'h') .horizontal else .vertical;
-        const rest = std.mem.trimLeft(u8, head.text[6..], " \t");
+        const rest = std.mem.trimStart(u8, head.text[6..], " \t");
         var ratio: f32 = 0.5;
         if (rest.len > 0) {
             if (rest[0] != '@') return ParseError.UnknownNode;
-            const after = std.mem.trimLeft(u8, rest[1..], " \t");
+            const after = std.mem.trimStart(u8, rest[1..], " \t");
             ratio = std.fmt.parseFloat(f32, after) catch 0.5;
             if (ratio <= 0.0 or ratio >= 1.0) ratio = 0.5;
         }
@@ -165,18 +165,18 @@ fn collectTwo(a: std.mem.Allocator, body: []const Line, child_indent: usize) Par
 
 fn parsePane(a: std.mem.Allocator, text: []const u8) ParseError!layout.PaneSpec {
     // text begins with "pane "; parse: pane <command...> [@ <cwd>]
-    const after = std.mem.trimLeft(u8, text["pane".len..], " \t");
+    const after = std.mem.trimStart(u8, text["pane".len..], " \t");
     var cmd: []const u8 = after;
     var cwd: []const u8 = "";
     if (std.mem.indexOf(u8, after, " @ ")) |at| {
-        cmd = std.mem.trimRight(u8, after[0..at], " \t");
-        cwd = std.mem.trimLeft(u8, after[at + 3 ..], " \t");
+        cmd = std.mem.trimEnd(u8, after[0..at], " \t");
+        cwd = std.mem.trimStart(u8, after[at + 3 ..], " \t");
     }
-    if (cmd.len == 0) cmd = std.posix.getenv("SHELL") orelse "/bin/bash";
+    if (cmd.len == 0) cmd = @import("util/profile.zig").getenv("SHELL") orelse "/bin/bash";
 
     // Tokenise with rudimentary quoting: `"…"` and `'…'` are taken
     // verbatim (no escape sequences inside), runs of spaces split.
-    var parts: std.ArrayList([]const u8) = .{};
+    var parts: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
     while (i < cmd.len) {
         if (cmd[i] == ' ' or cmd[i] == '\t') {

@@ -22,6 +22,7 @@ const Atlas = @import("render/atlas.zig").Atlas;
 const CellPass = @import("render/cell_pass.zig").CellPass;
 const Screen = @import("grid/screen.zig").Screen;
 const StylePool = @import("grid/style_pool.zig").Pool;
+const profile_mod = @import("util/profile.zig");
 
 const c_egl = @cImport({
     @cInclude("epoxy/egl.h");
@@ -46,7 +47,7 @@ const ITERATIONS: usize = 500;
 const WARMUP: usize = 20;
 
 pub fn main() !u8 {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    var gpa: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -140,7 +141,7 @@ pub fn main() !u8 {
     var ec = Ctx{ .screen = screen, .allocator = allocator };
 
     // Build htop-shaped content into a buffer and feed it once for warmup.
-    var content: std.ArrayList(u8) = .{};
+    var content: std.ArrayList(u8) = .empty;
     defer content.deinit(allocator);
     try content.appendSlice(allocator, "\x1b[2J\x1b[H");
     // Green-bg header.
@@ -182,15 +183,15 @@ pub fn main() !u8 {
     }
 
     // Per-iteration timings — same operations the interactive render path runs.
-    var t_rebuild = std.array_list.Aligned(u64, null){};
+    var t_rebuild = std.array_list.Aligned(u64, null).empty;
     defer t_rebuild.deinit(allocator);
-    var t_upload_only = std.array_list.Aligned(u64, null){};
+    var t_upload_only = std.array_list.Aligned(u64, null).empty;
     defer t_upload_only.deinit(allocator);
-    var t_draw = std.array_list.Aligned(u64, null){};
+    var t_draw = std.array_list.Aligned(u64, null).empty;
     defer t_draw.deinit(allocator);
-    var t_finish = std.array_list.Aligned(u64, null){};
+    var t_finish = std.array_list.Aligned(u64, null).empty;
     defer t_finish.deinit(allocator);
-    var t_total = std.array_list.Aligned(u64, null){};
+    var t_total = std.array_list.Aligned(u64, null).empty;
     defer t_total.deinit(allocator);
     try t_rebuild.ensureTotalCapacity(allocator, ITERATIONS);
     try t_upload_only.ensureTotalCapacity(allocator, ITERATIONS);
@@ -202,14 +203,14 @@ pub fn main() !u8 {
     while (i < ITERATIONS) : (i += 1) {
         markAllRowsDirty(screen);
 
-        const t0 = std.time.nanoTimestamp();
+        const t0 = profile_mod.nanoTimestamp();
         // rebuildAndUpload includes the CPU loop AND the GL upload.
         try cell_pass.rebuildAndUpload(screen, &pool, atlas.?);
-        const t1 = std.time.nanoTimestamp();
+        const t1 = profile_mod.nanoTimestamp();
         cell_pass.draw(atlas.?, W, H);
-        const t2 = std.time.nanoTimestamp();
+        const t2 = profile_mod.nanoTimestamp();
         c.glFinish();
-        const t3 = std.time.nanoTimestamp();
+        const t3 = profile_mod.nanoTimestamp();
 
         try t_rebuild.append(allocator, @intCast(t1 - t0));
         try t_draw.append(allocator, @intCast(t2 - t1));

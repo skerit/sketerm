@@ -535,7 +535,7 @@ fn onKeyPressed(
     // Detect auto-repeat by comparing against the last press of the
     // same keyval within REPEAT_WINDOW_US. Used by the kitty kbd
     // protocol when flag 0x02 (report-events) is enabled.
-    const press_now = std.time.microTimestamp();
+    const press_now = @import("../util/profile.zig").microTimestamp();
     const is_repeat = ctx.last_press_keyval == keyval and
         ctx.last_press_time_us != 0 and
         (press_now - ctx.last_press_time_us) < REPEAT_WINDOW_US;

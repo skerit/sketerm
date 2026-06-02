@@ -189,7 +189,7 @@ pub const GridPass = struct {
     /// emitted with `a_dim = 0` so they stay full-bright regardless.
     dim_fg: f32 = 1.0,
     dim_bg: f32 = 1.0,
-    vbuf: std.ArrayList(Vertex) = .{},
+    vbuf: std.ArrayList(Vertex) = .empty,
     /// Default fg/bg used by overlays that need them (preedit text).
     default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
     default_bg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 },
@@ -210,9 +210,9 @@ pub const GridPass = struct {
     /// Scratch buffers for bidi resolution + visual ordering. Grow
     /// to cols on first use; subsequent frames reuse them. Avoids
     /// 3 allocs per bidi row per frame.
-    bidi_cps: std.ArrayList(u32) = .{},
-    bidi_levels: std.ArrayList(u8) = .{},
-    bidi_indices: std.ArrayList(usize) = .{},
+    bidi_cps: std.ArrayList(u32) = .empty,
+    bidi_levels: std.ArrayList(u8) = .empty,
+    bidi_indices: std.ArrayList(usize) = .empty,
 
     /// Vertex-buffer reuse gating. After a successful build, holds
     /// the inputs the build saw. On the next call, if cell content
@@ -234,10 +234,10 @@ pub const GridPass = struct {
     /// Each row owns its own `Match` slice (URL hits) and a single
     /// boolean for whether the row needs the bidi/DH overlay path.
     /// Both invalidate on any rebuild signalled from the cell pass.
-    row_url_matches: std.ArrayList(std.ArrayList(@import("../grid/url_scan.zig").Match)) = .{},
-    row_url_match_count: std.ArrayList(usize) = .{},
-    row_overlay_needed: std.ArrayList(bool) = .{},
-    row_caches_valid: std.ArrayList(bool) = .{},
+    row_url_matches: std.ArrayList(std.ArrayList(@import("../grid/url_scan.zig").Match)) = .empty,
+    row_url_match_count: std.ArrayList(usize) = .empty,
+    row_overlay_needed: std.ArrayList(bool) = .empty,
+    row_caches_valid: std.ArrayList(bool) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) GridPass {
         return .{ .allocator = allocator };
@@ -390,7 +390,7 @@ pub const GridPass = struct {
         // the last — never reuse the cached vbuf during this window.
         const bell_animating = blk: {
             if (screen.bell_at_us <= 0) break :blk false;
-            const elapsed = std.time.microTimestamp() - screen.bell_at_us;
+            const elapsed = @import("../util/profile.zig").microTimestamp() - screen.bell_at_us;
             break :blk elapsed >= 0 and elapsed < 200_000;
         };
 
@@ -577,7 +577,7 @@ pub const GridPass = struct {
 
         // Bell flash.
         if (screen.bell_at_us > 0) {
-            const now = std.time.microTimestamp();
+            const now = @import("../util/profile.zig").microTimestamp();
             const elapsed = now - screen.bell_at_us;
             if (elapsed >= 0 and elapsed < 200_000) {
                 const t: f32 = @floatCast(@as(f64, @floatFromInt(elapsed)) / 200_000.0);
@@ -757,7 +757,7 @@ pub const GridPass = struct {
         try self.row_overlay_needed.resize(self.allocator, rows);
         try self.row_caches_valid.resize(self.allocator, rows);
         if (rows > old_len) {
-            for (self.row_url_matches.items[old_len..]) |*lst| lst.* = .{};
+            for (self.row_url_matches.items[old_len..]) |*lst| lst.* = .empty;
             for (self.row_url_match_count.items[old_len..]) |*c0| c0.* = 0;
             for (self.row_overlay_needed.items[old_len..]) |*c0| c0.* = false;
         }

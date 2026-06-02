@@ -18,6 +18,7 @@ const atlas_mod = @import("atlas.zig");
 const Atlas = atlas_mod.Atlas;
 const Screen = @import("../grid/screen.zig").Screen;
 const StylePool = @import("../grid/style_pool.zig").Pool;
+const StyleEntry = @import("../grid/style_pool.zig").Entry;
 const Color = @import("../grid/style_pool.zig").Color;
 const Cell = @import("../grid/cell.zig").Cell;
 const Line = @import("../grid/line.zig").Line;
@@ -60,6 +61,7 @@ pub const Instance = extern struct {
 const VERT_SRC =
     \\#version 300 es
     \\const float ITALIC_SHEAR = 0.231;
+++ "\nconst float ATLAS_TEXEL = 1.0 / " ++ std.fmt.comptimePrint("{d}", .{atlas_mod.PAGE_SIZE}) ++ ".0;\n" ++
     \\in vec2 a_cell_xy;
     \\in vec2 a_cell_size;
     \\in vec4 a_bg;
@@ -113,8 +115,23 @@ const VERT_SRC =
     \\    } else if (u_kind == 1) {
     \\        origin = a_glyph_xy;
     \\        size = a_glyph_size;
+    \\        vec2 uv1 = a_glyph_uv1;
+    \\        // Faux bold dilates the glyph one pixel to the right in
+    \\        // the fragment shader (max with the left-neighbor sample).
+    \\        // At the original quad's right edge that thickening has no
+    \\        // pixel column to render into and gets clipped — visible
+    \\        // as bold `h`/`n` losing their right vertical/curve. Widen
+    \\        // the quad and uv mapping by 1 px / 1 atlas texel so the
+    \\        // dilated stroke has somewhere to go. The new texel is
+    \\        // inter-glyph padding (zeroed in Atlas.realize); the
+    \\        // shader's max() pulls the original right-edge stroke
+    \\        // into it.
+    \\        if (a_bold > 0.5) {
+    \\            size.x += 1.0;
+    \\            uv1.x += ATLAS_TEXEL;
+    \\        }
     \\        v_color = vec4(a_fg.rgb * u_dim_fg, a_fg.a);
-    \\        uv = mix(a_glyph_uv0, a_glyph_uv1, corner);
+    \\        uv = mix(a_glyph_uv0, uv1, corner);
     \\        v_is_glyph = 1.0;
     \\        v_emit = (a_has_glyph < 0.5 && a_glyph_size.x > 0.0 && a_glyph_size.y > 0.0) ? 1.0 : 0.0;
     \\        // Italic via horizontal shear in pixel space. tan(13°) ≈ 0.231.
@@ -300,13 +317,13 @@ pub const CellPass = struct {
     dim_bg: f32 = 1.0,
 
     /// Persistent instance buffer (rows × cols instances).
-    instances: std.ArrayList(Instance) = .{},
+    instances: std.ArrayList(Instance) = .empty,
     /// Allocated rows / cols — re-init the buffer when these change.
     cap_rows: u16 = 0,
     cap_cols: u16 = 0,
     /// Per-row "needs upload" flag — set when a row's instance data
     /// in `instances` changed since the last GL upload.
-    row_needs_upload: std.ArrayList(bool) = .{},
+    row_needs_upload: std.ArrayList(bool) = .empty,
 
     /// Default fg/bg used when style.fg/bg is .default.
     default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
@@ -357,7 +374,7 @@ pub const CellPass = struct {
     /// `GridPass` reads this after the cell pass returns so it can
     /// invalidate per-row caches (URL scan results, bidi-needs flag)
     /// only on rows whose content actually moved.
-    rebuilt_rows: std.ArrayList(bool) = .{},
+    rebuilt_rows: std.ArrayList(bool) = .empty,
 
     allocator: std.mem.Allocator,
 
@@ -484,7 +501,7 @@ pub const CellPass = struct {
         atlas: *Atlas,
     ) !void {
         const profile_mod = @import("../util/profile.zig");
-        const t_loop_start = if (profile_mod.enabled) std.time.nanoTimestamp() else 0;
+        const t_loop_start = if (profile_mod.enabled) profile_mod.nanoTimestamp() else 0;
         // Reset the per-frame "rebuilt" mask so callers reading after
         // this returns see only rows we actually touched this frame.
         for (self.rebuilt_rows.items) |*r| r.* = false;
@@ -572,12 +589,12 @@ pub const CellPass = struct {
         // state changes.
         if (!any_built) return;
         if (profile_mod.enabled) {
-            const now = std.time.nanoTimestamp();
+            const now = profile_mod.nanoTimestamp();
             profile_mod.record(.cell_rebuild_loop, @intCast(now - t_loop_start));
         }
-        const t_upload = if (profile_mod.enabled) std.time.nanoTimestamp() else 0;
+        const t_upload = if (profile_mod.enabled) profile_mod.nanoTimestamp() else 0;
         try self.uploadDirtyRows();
-        if (profile_mod.enabled) profile_mod.record(.cell_upload, @intCast(std.time.nanoTimestamp() - t_upload));
+        if (profile_mod.enabled) profile_mod.record(.cell_upload, @intCast(profile_mod.nanoTimestamp() - t_upload));
     }
 
     fn rebuildRow(
@@ -634,34 +651,10 @@ pub const CellPass = struct {
 
             if (cell.style_ref != cached_style) {
                 const style = pool.get(cell.style_ref);
-                // Resolve fg + bg to RGBA. Bold lifts palette indices 0..7
-                // into the bright 8..15 slots (xterm convention) when
-                // allow_bold && bold_is_bright; doesn't affect rgb /
-                // 256-color / default. Reverse video swaps fg/bg of
-                // the cell — including explicit colors.
-                var fg_color = style.fg;
-                if (style.attrs.bold and self.allow_bold and self.bold_is_bright) {
-                    if (fg_color == .palette and fg_color.palette < 8) {
-                        fg_color = .{ .palette = fg_color.palette + 8 };
-                    }
-                }
-                var fg_rgba = self.colorToRGBA(fg_color, true);
-                var bg_rgba = self.colorToRGBA(style.bg, false);
-                var has_explicit_bg = style.bg != .default;
-                if (style.attrs.reverse) {
-                    const tmp = fg_rgba;
-                    fg_rgba = bg_rgba;
-                    bg_rgba = tmp;
-                    has_explicit_bg = true;
-                }
-                if (style.attrs.dim) {
-                    fg_rgba[0] *= 0.65;
-                    fg_rgba[1] *= 0.65;
-                    fg_rgba[2] *= 0.65;
-                }
-                cached_fg = fg_rgba;
-                cached_bg = if (has_explicit_bg) bg_rgba else .{ 0, 0, 0, 0 };
-                cached_has_bg = has_explicit_bg;
+                const resolved = self.resolveStyleColors(style);
+                cached_fg = resolved.fg;
+                cached_bg = if (resolved.has_bg) resolved.bg else .{ 0, 0, 0, 0 };
+                cached_has_bg = resolved.has_bg;
                 cached_deco = if (style.attrs.curly_underline) 3.0
                     else if (style.attrs.double_underline) 2.0
                     else if (style.attrs.underline) 1.0
@@ -796,7 +789,13 @@ pub const CellPass = struct {
             while (cc < run_start + run_len) : (cc += 1) instances[cc].has_glyph = 1.0;
 
             const style = pool.get(run_style);
-            const fg = self.colorToVec(style.fg, true, style.attrs.reverse);
+            // Must match rebuildRow's resolution exactly (bold-bright
+            // lift, reverse swap, dim attenuation) — otherwise ligature
+            // glyphs render with a different fg than the surrounding
+            // cells. The most visible failure mode: dim placeholder
+            // text containing `...`, `->`, `=>` etc. shows a bright
+            // glyph at the ligature anchor while the rest stays dim.
+            const fg = self.resolveStyleColors(style).fg;
 
             for (shaped) |sg| {
                 const cluster_col = run_start + @as(u16, @intCast(@min(@as(usize, sg.cluster), @as(usize, run_len) - 1)));
@@ -917,7 +916,44 @@ pub const CellPass = struct {
     fn colorToRGBA(self: *const CellPass, color: Color, is_fg: bool) [4]f32 {
         return style_util.colorToRGBA(color, is_fg, self.default_fg, self.default_bg, &self.palette);
     }
+
+    /// Resolve a style entry to its final fg/bg vec4s with bold-bright
+    /// lifting (palette 0..7 → 8..15 when bold), reverse-video swap,
+    /// and dim attenuation applied. `has_bg` reports whether the bg
+    /// is explicit (the caller leaves the instance bg zeroed when not,
+    /// so the window-clear color shows through).
+    fn resolveStyleColors(self: *const CellPass, style: StyleEntry) struct {
+        fg: [4]f32,
+        bg: [4]f32,
+        has_bg: bool,
+    } {
+        var fg_color = style.fg;
+        if (style.attrs.bold and self.allow_bold and self.bold_is_bright) {
+            if (fg_color == .palette and fg_color.palette < 8) {
+                fg_color = .{ .palette = fg_color.palette + 8 };
+            }
+        }
+        var fg_rgba = self.colorToRGBA(fg_color, true);
+        var bg_rgba = self.colorToRGBA(style.bg, false);
+        var has_bg = style.bg != .default;
+        if (style.attrs.reverse) {
+            const tmp = fg_rgba;
+            fg_rgba = bg_rgba;
+            bg_rgba = tmp;
+            has_bg = true;
+        }
+        if (style.attrs.dim) {
+            fg_rgba[0] *= DIM_FG_SCALE;
+            fg_rgba[1] *= DIM_FG_SCALE;
+            fg_rgba[2] *= DIM_FG_SCALE;
+        }
+        return .{ .fg = fg_rgba, .bg = bg_rgba, .has_bg = has_bg };
+    }
 };
+
+/// Per-channel attenuation applied to fg color when SGR 2 (dim/faint)
+/// is set. Matches the value used in grid_pass.zig.
+const DIM_FG_SCALE: f32 = 0.65;
 
 /// Forwards to the canonical predicate on Screen. CellPass skips
 /// rows for which this returns true so the GridPass overlay path

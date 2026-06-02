@@ -33,7 +33,7 @@ const H: c_int = 96;
 const FONT_SIZE: u16 = 14;
 
 pub fn main() !u8 {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    var gpa: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

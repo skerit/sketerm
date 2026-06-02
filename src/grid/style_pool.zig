@@ -60,7 +60,7 @@ pub const Entry = struct {
 };
 
 pub const Pool = struct {
-    entries: std.ArrayList(Entry) = .{},
+    entries: std.ArrayList(Entry) = .empty,
     /// Last-returned index — most call sites re-intern the same entry
     /// many times in a row (a typical TUI emits `\x1b[31m` once and
     /// then prints many cells). One compare wins those without
@@ -102,6 +102,21 @@ pub const Pool = struct {
 
     pub fn get(self: *const Pool, idx: u16) Entry {
         return self.entries.items[idx];
+    }
+
+    /// Sentinel index used by `Screen.compactStylePool` to mark an
+    /// unreferenced (collectable) entry. The pool can hold at most
+    /// 0xFFFF entries (intern errors at that length), so 0xFFFF is
+    /// never a live index and is safe as "unused".
+    pub const unused_index: u16 = 0xFFFF;
+
+    /// Swap in a freshly compacted entry table. The caller
+    /// (`Screen.compactStylePool`) has already remapped every live
+    /// `style_ref` / `cur_style` / `saved_style` to the new indices.
+    pub fn replaceEntries(self: *Pool, new_entries: std.ArrayList(Entry)) void {
+        self.entries.deinit(self.allocator);
+        self.entries = new_entries;
+        self.last_idx = 0;
     }
 };
 

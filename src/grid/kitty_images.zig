@@ -33,7 +33,7 @@ pub const StoredImage = struct {
     /// Animation frames. Empty for static images. When non-empty,
     /// `rgba` aliases `frames[current_frame].rgba` and is NOT owned
     /// separately.
-    frames: std.ArrayList(Frame) = .{},
+    frames: std.ArrayList(Frame) = .empty,
     current_frame: u32 = 0,
     /// Microsecond timestamp of the last frame advance. -1 = not yet
     /// seen by `advanceAnimations`; first call seeds the time.
@@ -71,7 +71,7 @@ pub const Accum = struct {
     frame_compose_from: u32 = 0,
     frame_compose_mode: u8 = 0,
     /// Concatenated base64 payload, awaiting final decode.
-    payload: std.ArrayList(u8) = .{},
+    payload: std.ArrayList(u8) = .empty,
     /// Set when an appendSlice into `payload` failed mid-stream. A
     /// truncated payload would decode as a corrupt image, so finalize
     /// bails out instead of feeding garbage to the decoders.
@@ -301,7 +301,7 @@ pub const Manager = struct {
         }
 
         // Strip whitespace/newlines from the accumulated base64.
-        var stripped: std.ArrayList(u8) = .{};
+        var stripped: std.ArrayList(u8) = .empty;
         defer stripped.deinit(self.allocator);
         try stripped.ensureTotalCapacity(self.allocator, acc.payload.items.len);
         for (acc.payload.items) |b| {
@@ -321,13 +321,21 @@ pub const Manager = struct {
         var owned_file_data: ?[]u8 = null;
         defer if (owned_file_data) |b| self.allocator.free(b);
         if (acc.medium == 't' or acc.medium == 'f') {
-            const path = std.mem.trimRight(u8, decoded, "\x00 \r\n\t");
+            const path = std.mem.trimEnd(u8, decoded, "\x00 \r\n\t");
             const data = self.readFile(path) catch return false;
             owned_file_data = data;
             raw_bytes = data;
-            if (acc.medium == 't') std.fs.deleteFileAbsolute(path) catch |err| {
-                std.debug.print("sketerm: failed to delete kitty tempfile {s}: {s}\n", .{ path, @errorName(err) });
-            };
+            if (acc.medium == 't') {
+                // Zig 0.16's std.fs.deleteFileAbsolute is gone — use libc.
+                var del_z: [4096]u8 = undefined;
+                if (path.len < del_z.len) {
+                    @memcpy(del_z[0..path.len], path);
+                    del_z[path.len] = 0;
+                    if (c.unlink(@ptrCast(&del_z)) != 0) {
+                        std.debug.print("sketerm: failed to delete kitty tempfile {s}\n", .{path});
+                    }
+                }
+            }
         }
 
         // Optional zlib decompression (`o=z`). Tools rarely set this
@@ -576,15 +584,25 @@ pub const Manager = struct {
     }
 
     fn readFile(self: *Manager, path: []const u8) ![]u8 {
-        const file = try std.fs.openFileAbsolute(path, .{});
-        defer file.close();
-        const stat = try file.stat();
-        const max: u64 = 64 * 1024 * 1024; // sanity cap
-        if (stat.size == 0 or stat.size > max) return error.BadFile;
-        const buf = try self.allocator.alloc(u8, @intCast(stat.size));
+        // Zig 0.16's `std.fs.openFileAbsolute` now needs an `Io`. We
+        // link libc, so use it directly.
+        var path_z: [4096]u8 = undefined;
+        if (path.len >= path_z.len) return error.BadFile;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+        const fp = c.fopen(@ptrCast(&path_z), "rb") orelse return error.BadFile;
+        defer _ = c.fclose(fp);
+        if (c.fseek(fp, 0, c.SEEK_END) != 0) return error.BadFile;
+        const size_long = c.ftell(fp);
+        if (size_long <= 0) return error.BadFile;
+        const max: c_long = 64 * 1024 * 1024; // sanity cap
+        if (size_long > max) return error.BadFile;
+        if (c.fseek(fp, 0, c.SEEK_SET) != 0) return error.BadFile;
+        const size: usize = @intCast(size_long);
+        const buf = try self.allocator.alloc(u8, size);
         errdefer self.allocator.free(buf);
-        const n = try file.readAll(buf);
-        if (n != buf.len) return error.ShortRead;
+        const n = c.fread(buf.ptr, 1, size, fp);
+        if (n != size) return error.ShortRead;
         return buf;
     }
 };

@@ -396,16 +396,19 @@ pub const Terminal = struct {
         // will reschedule us on the next batch.
         handle.drain_pending.store(false, .release);
 
+        // Debug-trace events to stderr. Zig 0.16 removed
+        // `std.fs.File.stderr()`; we accumulate into a fixed buffer
+        // and flush via libc's stderr.
         var stderr_buf: [4096]u8 = undefined;
-        var stderr_writer: ?std.fs.File.Writer = if (self.debug_to_stderr)
-            std.fs.File.stderr().writer(&stderr_buf)
+        var stderr_writer: ?std.Io.Writer = if (self.debug_to_stderr)
+            std.Io.Writer.fixed(&stderr_buf)
         else
             null;
 
         while (self.ring.pop()) |ev| {
             var mut_ev = ev;
             if (stderr_writer) |*w| {
-                debugFormatEvent(&w.interface, ev) catch {};
+                debugFormatEvent(w, ev) catch {};
             }
             // Apply to grid.
             self.screen.apply(ev);
@@ -413,7 +416,8 @@ pub const Terminal = struct {
         }
 
         if (stderr_writer) |*w| {
-            w.interface.flush() catch {};
+            const bytes = w.buffered();
+            if (bytes.len > 0) _ = c.fwrite(bytes.ptr, 1, bytes.len, c.stderr);
         }
 
         // Direct render dispatch: drain cleared the ring, leaving the
@@ -427,7 +431,7 @@ pub const Terminal = struct {
     }
 };
 
-fn debugFormatEvent(w: *std.io.Writer, ev: Event) !void {
+fn debugFormatEvent(w: *std.Io.Writer, ev: Event) !void {
     switch (ev) {
         .print => |cp| try w.print("U+{X:0>4} ", .{cp}),
         .print_byte => |b| {

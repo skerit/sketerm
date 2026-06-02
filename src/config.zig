@@ -237,13 +237,13 @@ pub const Config = struct {
     /// parsed from `keybind.<action> = <accel>` lines. An entry with
     /// an empty accel unbinds that action; a missing entry inherits
     /// the default. Round-trip-stable.
-    keybinds: std.ArrayList(KeybindEntry) = .{},
+    keybinds: std.ArrayList(KeybindEntry) = .empty,
 
     /// Named profiles. Defined via `[profile.<name>]` sections —
     /// each section's keys override the corresponding global Config
     /// field for panes that select this profile. Order preserved
     /// for round-trip serialisation + UI listing.
-    profiles: std.ArrayList(Profile) = .{},
+    profiles: std.ArrayList(Profile) = .empty,
     /// Profile name used when no explicit profile is selected. Empty
     /// = "no default profile; use the global Config directly".
     default_profile: []const u8 = "",
@@ -294,30 +294,42 @@ pub const Config = struct {
             resolveConfigPath(allocator);
         if (resolved) |path| {
             defer allocator.free(path);
-            if (std.fs.openFileAbsolute(path, .{})) |file| {
-                defer file.close();
-                const max_bytes: usize = 64 * 1024;
-                var buf: [max_bytes]u8 = undefined;
-                if (file.read(&buf)) |n| {
+            // Zig 0.16's `std.fs` requires an `Io` instance we don't
+            // thread through here. Just use libc — we link it anyway.
+            const c = @import("c.zig").c;
+            // path is allocator-owned and not necessarily NUL-terminated;
+            // copy onto a stack buffer with a trailing 0.
+            var path_z: [4096]u8 = undefined;
+            if (path.len >= path_z.len) {
+                warnConfig("config path too long: {s}", .{path});
+            } else {
+                @memcpy(path_z[0..path.len], path);
+                path_z[path.len] = 0;
+                const fp = c.fopen(@ptrCast(&path_z), "rb");
+                if (fp == null) {
+                    if (override_path != null) {
+                        warnConfig("--config path {s} not readable, using defaults", .{path});
+                    }
+                } else {
+                    defer _ = c.fclose(fp);
+                    const max_bytes: usize = 64 * 1024;
+                    var buf: [max_bytes]u8 = undefined;
+                    const n = c.fread(&buf, 1, buf.len, fp);
                     cfg.arena = std.heap.ArenaAllocator.init(allocator);
                     parseInto(&cfg, buf[0..n]) catch {
                         warnConfig("parse error in {s}, using defaults", .{path});
                         cfg.deinit();
                         cfg = Config{};
                     };
-                } else |_| {}
-            } else |_| {
-                if (override_path != null) {
-                    warnConfig("--config path {s} not readable, using defaults", .{path});
                 }
             }
         }
 
         // Env overrides — highest priority.
-        if (std.posix.getenv("SKETERM_SCROLLBACK")) |env| {
+        if (@import("util/profile.zig").getenv("SKETERM_SCROLLBACK")) |env| {
             if (std.fmt.parseInt(u32, env, 10)) |n| cfg.scrollback = n else |_| {}
         }
-        if (std.posix.getenv("SKETERM_FONT")) |env_path| {
+        if (@import("util/profile.zig").getenv("SKETERM_FONT")) |env_path| {
             if (cfg.arena == null) cfg.arena = std.heap.ArenaAllocator.init(allocator);
             const arena = cfg.arena.?.allocator();
             cfg.font_path = arena.dupe(u8, env_path) catch cfg.font_path;
@@ -333,28 +345,45 @@ pub const Config = struct {
 
     /// Atomic write to `path`: serialise every key whose value differs
     /// from the schema default (so the file stays minimal). On disk
-    /// the format round-trips through `loadFromBytes` exactly.
+    /// the format round-trips through `loadFromBytes` exactly. Uses
+    /// libc since Zig 0.16's `std.fs` now needs an `Io` instance we
+    /// don't thread through here.
     pub fn save(self: *const Config, path: []const u8) !void {
-        var dir = try ensureParentDir(path);
-        defer dir.close();
-        const basename = std.fs.path.basename(path);
+        const c = @import("c.zig").c;
+        try makeParentDirs(path);
 
-        var tmp_buf: [256]u8 = undefined;
-        const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{basename});
-        var tmp = try dir.createFile(tmp_name, .{ .truncate = true });
-        defer tmp.close();
+        var path_z: [4096]u8 = undefined;
+        if (path.len + 4 >= path_z.len) return error.PathTooLong;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
 
-        var write_buf: [4096]u8 = undefined;
-        var fw = tmp.writer(&write_buf);
-        try self.serialise(&fw.interface);
-        try fw.interface.flush();
+        var tmp_z: [4096]u8 = undefined;
+        @memcpy(tmp_z[0..path.len], path);
+        @memcpy(tmp_z[path.len .. path.len + 4], ".tmp");
+        tmp_z[path.len + 4] = 0;
 
-        try dir.rename(tmp_name, basename);
+        const fp = c.fopen(@ptrCast(&tmp_z), "wb") orelse return error.WriteFailed;
+        var write_buf: [16384]u8 = undefined;
+        var w = std.Io.Writer.fixed(&write_buf);
+        self.serialise(&w) catch |err| {
+            _ = c.fclose(fp);
+            return err;
+        };
+        const bytes = w.buffered();
+        if (c.fwrite(bytes.ptr, 1, bytes.len, fp) != bytes.len) {
+            _ = c.fclose(fp);
+            return error.WriteFailed;
+        }
+        if (c.fclose(fp) != 0) return error.WriteFailed;
+        if (c.rename(@ptrCast(&tmp_z), @ptrCast(&path_z)) != 0) {
+            _ = c.unlink(@ptrCast(&tmp_z));
+            return error.WriteFailed;
+        }
     }
 
     /// Same content as save() but directly into a Writer — used by
     /// tests + the prefs dialog's preview path.
-    pub fn serialise(self: *const Config, w: *std.io.Writer) !void {
+    pub fn serialise(self: *const Config, w: *std.Io.Writer) !void {
         try w.writeAll("# sketerm config (auto-saved by Preferences dialog)\n");
 
         // Font.
@@ -508,24 +537,48 @@ fn eqColor(a: [4]f32, b: [4]f32) bool {
     return a[0] == b[0] and a[1] == b[1] and a[2] == b[2] and a[3] == b[3];
 }
 
-fn writeColor(w: *std.io.Writer, key: []const u8, c: [4]f32) !void {
+fn writeColor(w: *std.Io.Writer, key: []const u8, c: [4]f32) !void {
     const r: u8 = @intFromFloat(@round(c[0] * 255.0));
     const g: u8 = @intFromFloat(@round(c[1] * 255.0));
     const b: u8 = @intFromFloat(@round(c[2] * 255.0));
     try w.print("{s} = #{x:0>2}{x:0>2}{x:0>2}\n", .{ key, r, g, b });
 }
 
-fn ensureParentDir(path: []const u8) !std.fs.Dir {
-    const dirname = std.fs.path.dirname(path) orelse ".";
-    return std.fs.cwd().makeOpenPath(dirname, .{});
+/// Create every missing parent directory of `path` via `mkdir(2)`,
+/// like `mkdir -p $(dirname path)`. Used by `save()` and the layout
+/// serialiser. Stays in libc-land since `std.fs.Dir` is gone in 0.16.
+fn makeParentDirs(path: []const u8) !void {
+    const c_module = @import("c.zig").c;
+    const dirname = std.fs.path.dirname(path) orelse return;
+    if (dirname.len == 0) return;
+    var path_z: [4096]u8 = undefined;
+    if (dirname.len >= path_z.len) return error.PathTooLong;
+    var i: usize = 0;
+    while (i < dirname.len) {
+        // Walk forward to the next '/' (or end), then ensure the prefix
+        // exists. Skip the leading '/' on absolute paths so we don't
+        // try to mkdir(""), and skip empty components from "//".
+        const start = i;
+        while (i < dirname.len and dirname[i] != '/') i += 1;
+        if (i == start) {
+            i += 1;
+            continue;
+        }
+        const slice_len = i;
+        @memcpy(path_z[0..slice_len], dirname[0..slice_len]);
+        path_z[slice_len] = 0;
+        // EEXIST is fine — we want idempotent mkdir.
+        _ = c_module.mkdir(@ptrCast(&path_z), 0o755);
+        i += 1;
+    }
 }
 
 /// Allocates the path; caller frees.
 fn resolveConfigPath(allocator: std.mem.Allocator) ?[]u8 {
-    if (std.posix.getenv("XDG_CONFIG_HOME")) |x| {
+    if (@import("util/profile.zig").getenv("XDG_CONFIG_HOME")) |x| {
         return std.fmt.allocPrint(allocator, "{s}/sketerm/config.conf", .{x}) catch null;
     }
-    if (std.posix.getenv("HOME")) |home| {
+    if (@import("util/profile.zig").getenv("HOME")) |home| {
         return std.fmt.allocPrint(allocator, "{s}/.config/sketerm/config.conf", .{home}) catch null;
     }
     return null;
@@ -600,7 +653,7 @@ fn findOrCreateProfile(cfg: *Config, arena: std.mem.Allocator, name: []const u8)
 fn expandTilde(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
     if (value.len == 0 or value[0] != '~') return arena.dupe(u8, value);
     if (value.len > 1 and value[1] != '/') return arena.dupe(u8, value);
-    const home = std.posix.getenv("HOME") orelse return arena.dupe(u8, value);
+    const home = @import("util/profile.zig").getenv("HOME") orelse return arena.dupe(u8, value);
     if (value.len == 1) return arena.dupe(u8, home);
     return std.fmt.allocPrint(arena, "{s}{s}", .{ home, value[1..] });
 }
@@ -951,7 +1004,7 @@ test "config: line_pad_px parses int (positive and negative)" {
 test "config: serialise omits defaults" {
     var cfg = Config{};
     var buf: [1024]u8 = undefined;
-    var w = std.io.Writer.fixed(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     try cfg.serialise(&w);
     const out = w.buffered();
     // Empty config should serialise to just the header comment —
@@ -982,7 +1035,7 @@ test "config: palette + scheme + new keys round-trip" {
     cfg.word_chars = "abc";
 
     var buf: [2048]u8 = undefined;
-    var w = std.io.Writer.fixed(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     try cfg.serialise(&w);
 
     var parsed = try Config.loadFromBytes(std.testing.allocator, w.buffered());
@@ -1021,7 +1074,7 @@ test "config: serialise round-trips through loadFromBytes" {
     cfg.ligatures = false;
 
     var buf: [2048]u8 = undefined;
-    var w = std.io.Writer.fixed(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     try cfg.serialise(&w);
     const out = w.buffered();
 
@@ -1053,7 +1106,7 @@ test "config: show_titlebar / show_tab_bar round-trip" {
     cfg.show_titlebar = true; // default false → must be emitted
     cfg.show_tab_bar = false; // default true  → must be emitted
     var buf: [1024]u8 = undefined;
-    var w = std.io.Writer.fixed(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     try cfg.serialise(&w);
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "show_titlebar = true") != null);
@@ -1067,7 +1120,7 @@ test "config: show_titlebar / show_tab_bar round-trip" {
 
 test "config: ~ expansion in path-valued keys" {
     // Use the test runner's actual HOME — avoids needing setenv.
-    const home = std.posix.getenv("HOME") orelse return error.SkipZigTest;
+    const home = @import("util/profile.zig").getenv("HOME") orelse return error.SkipZigTest;
 
     const body =
         \\font = ~/fonts/Hack.ttf
@@ -1105,7 +1158,7 @@ test "config: visibility defaults are NOT emitted (terse output)" {
     // the output, otherwise minimal user configs accumulate cruft.
     const cfg = Config{};
     var buf: [1024]u8 = undefined;
-    var w = std.io.Writer.fixed(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     try cfg.serialise(&w);
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "show_titlebar") == null);
@@ -1130,7 +1183,7 @@ test "config: keybind.<action> entries round-trip" {
 
     // Round-trip via serialise → re-parse.
     var buf: [512]u8 = undefined;
-    var w = std.io.Writer.fixed(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     try cfg.serialise(&w);
     const out = w.buffered();
     var parsed = try Config.loadFromBytes(std.testing.allocator, out);
@@ -1188,7 +1241,7 @@ test "config: [profile.name] sections round-trip" {
 
     // Round-trip via serialise.
     var buf: [2048]u8 = undefined;
-    var w = std.io.Writer.fixed(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     try cfg.serialise(&w);
     var parsed = try Config.loadFromBytes(std.testing.allocator, w.buffered());
     defer parsed.deinit();

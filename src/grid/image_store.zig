@@ -50,7 +50,7 @@ pub const Image = struct {
 };
 
 pub const Store = struct {
-    images: std.ArrayList(Image) = .{},
+    images: std.ArrayList(Image) = .empty,
     cell_w: f32 = 8.0,
     cell_h: f32 = 16.0,
     allocator: std.mem.Allocator,

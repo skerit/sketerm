@@ -38,7 +38,7 @@ pub const Screen = struct {
     /// 50µs per evict on a 10k cap, dominating the parser bench.
     /// `scrollback_head` is the index of the oldest entry; once
     /// `items.len == capacity` the buffer behaves as a ring.
-    scrollback: std.ArrayList(Line) = .{},
+    scrollback: std.ArrayList(Line) = .empty,
     scrollback_head: usize = 0,
     scrollback_capacity: usize = 10_000,
     /// Rendering offset (0 = bottom, > 0 = scrolled up by N lines).
@@ -245,7 +245,7 @@ pub const Screen = struct {
 
     /// Custom tab stops. One bool per column, true = stop set.
     /// Default: every 8th column starting at 0.
-    tab_stops: std.ArrayList(bool) = .{},
+    tab_stops: std.ArrayList(bool) = .empty,
 
     /// G0/G1 character-set designations. ASCII or DEC special graphics.
     charset_g0: Charset = .ascii,
@@ -469,7 +469,7 @@ pub const Screen = struct {
             std.debug.print("sketerm: appendCluster getOrPut OOM: {s}\n", .{@errorName(err)});
             return;
         };
-        if (!gop.found_existing) gop.value_ptr.* = .{};
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
         gop.value_ptr.append(self.allocator, cp) catch |err| {
             std.debug.print("sketerm: appendCluster append OOM: {s}\n", .{@errorName(err)});
         };
@@ -722,7 +722,7 @@ pub const Screen = struct {
         // Build a single logical-line stream from scrollback, then active.
         // Capture cursor's logical position before consuming. Walk the
         // scrollback ring in oldest→newest order via scrollbackLine.
-        var combined: std.ArrayList(Line) = .{};
+        var combined: std.ArrayList(Line) = .empty;
         defer combined.deinit(self.allocator);
         const sb_count = self.scrollbackCount();
         try combined.ensureTotalCapacity(self.allocator, sb_count + self.active.len);
@@ -916,7 +916,7 @@ pub const Screen = struct {
         const sel = self.selection;
         const r = sel.rect() orelse return try allocator.alloc(u8, 0);
 
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
 
         const is_rect = sel.mode == .rectangular;
@@ -1031,7 +1031,7 @@ pub const Screen = struct {
     /// that are entirely blank still emit a `\n` so paragraph shape
     /// survives. Caller frees the returned slice.
     pub fn extractScreen(self: *const Screen, allocator: std.mem.Allocator) ![]u8 {
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
 
         const view_off: i32 = @intCast(@min(self.view_offset, self.scrollbackCount()));
@@ -1114,7 +1114,7 @@ pub const Screen = struct {
     /// logical line. Useful for "share my whole terminal session"
     /// flows (Ctrl+Shift+End-style copy-all). Caller frees.
     pub fn extractScrollback(self: *const Screen, allocator: std.mem.Allocator) ![]u8 {
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
 
         const sb_count: i32 = @intCast(self.scrollbackCount());
@@ -1305,7 +1305,7 @@ pub const Screen = struct {
         pattern: []const u8,
         case_insensitive: bool,
     ) ![]SearchMatch {
-        var out: std.ArrayList(SearchMatch) = .{};
+        var out: std.ArrayList(SearchMatch) = .empty;
         defer out.deinit(allocator);
         if (pattern.len == 0) return try out.toOwnedSlice(allocator);
 
@@ -1329,11 +1329,11 @@ pub const Screen = struct {
         }
         defer cre.regfree(re);
 
-        var line_buf: std.ArrayList(u8) = .{};
+        var line_buf: std.ArrayList(u8) = .empty;
         defer line_buf.deinit(allocator);
-        var col_map: std.ArrayList(u32) = .{};
+        var col_map: std.ArrayList(u32) = .empty;
         defer col_map.deinit(allocator);
-        var width_map: std.ArrayList(u8) = .{};
+        var width_map: std.ArrayList(u8) = .empty;
         defer width_map.deinit(allocator);
 
         const sb_count = self.scrollbackCount();
@@ -1357,7 +1357,7 @@ pub const Screen = struct {
         needle: []const u8,
         case_insensitive: bool,
     ) ![]SearchMatch {
-        var out: std.ArrayList(SearchMatch) = .{};
+        var out: std.ArrayList(SearchMatch) = .empty;
         defer out.deinit(allocator);
         if (needle.len == 0) return try out.toOwnedSlice(allocator);
 
@@ -1372,14 +1372,14 @@ pub const Screen = struct {
             break :blk lc;
         } else needle;
 
-        var line_buf: std.ArrayList(u8) = .{};
+        var line_buf: std.ArrayList(u8) = .empty;
         defer line_buf.deinit(allocator);
-        var col_map: std.ArrayList(u32) = .{};
+        var col_map: std.ArrayList(u32) = .empty;
         defer col_map.deinit(allocator);
         // Parallel array: width of the cell at col_map[i] (1 or 2).
         // Used to compute visual end column on matches whose last cell
         // is wide (CJK / emoji).
-        var width_map: std.ArrayList(u8) = .{};
+        var width_map: std.ArrayList(u8) = .empty;
         defer width_map.deinit(allocator);
 
         // Scrollback: rows -1, -2, … walked from oldest (-sb_count) up.
@@ -1892,7 +1892,7 @@ pub const Screen = struct {
     }
 
     fn respondXtgettcapHit(self: *Screen, hex_cap: []const u8, value: []const u8) void {
-        var resp: std.ArrayList(u8) = .{};
+        var resp: std.ArrayList(u8) = .empty;
         defer resp.deinit(self.allocator);
         resp.appendSlice(self.allocator, "\x1bP1+r") catch return;
         resp.appendSlice(self.allocator, hex_cap) catch return;
@@ -1908,7 +1908,7 @@ pub const Screen = struct {
     }
 
     fn respondXtgettcapMiss(self: *Screen, hex_cap: []const u8) void {
-        var resp: std.ArrayList(u8) = .{};
+        var resp: std.ArrayList(u8) = .empty;
         defer resp.deinit(self.allocator);
         resp.appendSlice(self.allocator, "\x1bP0+r") catch return;
         resp.appendSlice(self.allocator, hex_cap) catch return;
@@ -2401,7 +2401,7 @@ pub const Screen = struct {
             0x05 => self.respond(""), // ENQ — answerback (we send empty)
             0x07 => {
                 // BEL: visual flash + optional sink notification.
-                self.bell_at_us = std.time.microTimestamp();
+                self.bell_at_us = @import("../util/profile.zig").microTimestamp();
                 if (self.sink.on_bell) |f| f(self.sink.ctx);
             },
             0x08 => self.backspace(),
@@ -3645,14 +3645,116 @@ pub const Screen = struct {
             }
             if (params.n_params == 0) break; // CSI m alone = reset
         }
-        self.cur_style = self.pool.intern(entry) catch self.cur_style;
+        self.cur_style = self.pool.intern(entry) catch blk: {
+            // Pool exhausted (65535 distinct styles). Without this,
+            // intern silently returns the OLD cur_style, so a fresh
+            // `\e[2m` (or any new SGR combo) renders with the wrong
+            // (often brighter, non-dim) style and stale styling
+            // persists — the "ghost text too bright / remains" bug in
+            // long truecolor TUI sessions. Garbage-collect the styles
+            // no live cell references, then retry once.
+            self.compactStylePool();
+            break :blk self.pool.intern(entry) catch self.cur_style;
+        };
+    }
+
+    /// Garbage-collect the interned style pool. Walks every live cell
+    /// (active + alt + scrollback) plus `cur_style` / `saved_style`,
+    /// keeps only the referenced entries (entry 0 / default always
+    /// survives at slot 0), and rewrites every `style_ref` to the
+    /// compacted indices. No-op if it can't allocate scratch or if
+    /// every entry is still live (genuinely 64K distinct styles on
+    /// screen — pathological, nothing to reclaim).
+    fn compactStylePool(self: *Screen) void {
+        const pool = self.pool;
+        const old_len = pool.entries.items.len;
+        if (old_len == 0) return;
+
+        const used = self.allocator.alloc(bool, old_len) catch return;
+        defer self.allocator.free(used);
+        @memset(used, false);
+        used[0] = true; // default entry must survive
+
+        const markRef = struct {
+            fn f(u: []bool, ref: u16) void {
+                if (ref < u.len) u[ref] = true;
+            }
+        }.f;
+
+        markRef(used, self.cur_style);
+        markRef(used, self.saved_style);
+        for (self.active) |ln| {
+            for (ln.cells) |cell| markRef(used, cell.style_ref);
+        }
+        if (self.alt) |alt| {
+            for (alt) |ln| {
+                for (ln.cells) |cell| markRef(used, cell.style_ref);
+            }
+        }
+        for (self.scrollback.items) |ln| {
+            for (ln.cells) |cell| markRef(used, cell.style_ref);
+        }
+
+        const remap = self.allocator.alloc(u16, old_len) catch return;
+        defer self.allocator.free(remap);
+        @memset(remap, Pool.unused_index);
+
+        var new_entries: std.ArrayList(Entry) = .empty;
+        errdefer new_entries.deinit(self.allocator);
+        var i: usize = 0;
+        while (i < old_len) : (i += 1) {
+            if (!used[i]) continue;
+            remap[i] = @intCast(new_entries.items.len);
+            new_entries.append(self.allocator, pool.entries.items[i]) catch {
+                new_entries.deinit(self.allocator);
+                return;
+            };
+        }
+
+        // Everything still referenced — compaction reclaims nothing,
+        // so don't churn the buffers (and don't leak new_entries).
+        if (new_entries.items.len == old_len) {
+            new_entries.deinit(self.allocator);
+            return;
+        }
+
+        const remapRef = struct {
+            fn f(r: []const u16, ref: u16) u16 {
+                if (ref >= r.len) return 0;
+                const n = r[ref];
+                return if (n == Pool.unused_index) 0 else n;
+            }
+        }.f;
+
+        self.cur_style = remapRef(remap, self.cur_style);
+        self.saved_style = remapRef(remap, self.saved_style);
+        for (self.active) |ln| {
+            for (ln.cells) |*cell| cell.style_ref = remapRef(remap, cell.style_ref);
+        }
+        if (self.alt) |alt| {
+            for (alt) |ln| {
+                for (ln.cells) |*cell| cell.style_ref = remapRef(remap, cell.style_ref);
+            }
+        }
+        for (self.scrollback.items) |ln| {
+            for (ln.cells) |*cell| cell.style_ref = remapRef(remap, cell.style_ref);
+        }
+
+        pool.replaceEntries(new_entries);
+
+        // Cell contents shifted style indices — force a full redraw.
+        for (self.active) |*l| l.dirty = true;
+        if (self.alt) |alt| for (alt) |*l| {
+            l.dirty = true;
+        };
+        self.dirty = true;
     }
 
     // ── Debug ────────────────────────────────────────────────────
 
     /// Dump the active screen to a writer for tests / debugging.
     /// Each row terminated by `\n`. Cells with rune 0 render as space.
-    pub fn dump(self: *Screen, w: *std.io.Writer) !void {
+    pub fn dump(self: *Screen, w: *std.Io.Writer) !void {
         for (self.buf()) |ln| {
             for (ln.cells) |cell| {
                 // Skip wide-char continuation cells.
@@ -5640,4 +5742,57 @@ test "DECRST 2 fires on_decanm with ansi=false" {
     s.csi(off);
     try std.testing.expectEqual(@as(u8, 1), Spy.got_calls);
     try std.testing.expectEqual(false, Spy.last_ansi);
+}
+
+test "style pool compaction recovers from exhaustion (ghost-text dim bug)" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 4, 1);
+    defer s.deinit();
+
+    // A live cell on a non-default bold style — must survive compaction
+    // with its appearance intact.
+    var bold = Event.Csi{};
+    bold.params[0] = 1;
+    bold.n_params = 1;
+    bold.final = 'm';
+    s.csi(bold);
+    s.printCp('A');
+    const a_style_before = s.cellAt(0, 0).style_ref;
+    try std.testing.expect(pool.get(a_style_before).attrs.bold);
+
+    // Exhaust the 64K index space with distinct truecolor entries so
+    // the next intern would overflow (the real-world trigger: a long
+    // truecolor TUI session).
+    var n: u32 = 0;
+    while (n < 0x10000) : (n += 1) {
+        _ = pool.intern(.{ .fg = .{ .rgb = .{
+            .r = @intCast(n & 0xFF),
+            .g = @intCast((n >> 8) & 0xFF),
+            .b = @intCast(n >> 16 & 0xFF),
+        } } }) catch break;
+    }
+    try std.testing.expect(pool.entries.items.len >= 0xFFFF);
+
+    // The bug: without compaction, this `\e[2m` (dim) silently keeps
+    // the previous cur_style, so ghost text renders bright + stale.
+    var dim = Event.Csi{};
+    dim.params[0] = 2;
+    dim.n_params = 1;
+    dim.final = 'm';
+    s.csi(dim);
+
+    // cur_style must now genuinely be a dim style, and the pool must
+    // have shrunk (dead truecolor entries reclaimed).
+    try std.testing.expect(pool.get(s.cur_style).attrs.dim);
+    try std.testing.expect(pool.entries.items.len < 0xFFFF);
+
+    // The pre-existing 'A' cell still renders bold after the
+    // style_ref remap.
+    try std.testing.expectEqual(@as(u32, 'A'), s.cellAt(0, 0).rune);
+    try std.testing.expect(pool.get(s.cellAt(0, 0).style_ref).attrs.bold);
+
+    // Newly printed dim text actually carries dim.
+    s.printCp('B');
+    try std.testing.expect(pool.get(s.cellAt(0, 1).style_ref).attrs.dim);
 }

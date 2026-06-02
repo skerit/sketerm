@@ -106,8 +106,8 @@ const HELP_TEXT =
 
 var g_app: App = undefined;
 
-pub fn main() u8 {
-    var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .{};
+pub fn main(init: std.process.Init.Minimal) u8 {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
@@ -115,27 +115,19 @@ pub fn main() u8 {
 
     g_app = .{ .allocator = allocator };
 
-    const argv = std.process.argsAlloc(allocator) catch return 1;
-    defer std.process.argsFree(allocator, argv);
-
     // --help and --version exit before reaching GApplication so the
     // user gets output even with no display. Everything else is
     // forwarded to the primary instance via "command-line" so a
     // second `sketerm --toggle` invocation reaches the running app.
+    const argv = init.args.vector;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
-        const a = argv[i];
+        const a = std.mem.span(argv[i]);
         if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
-            var stdout_buf: [4096]u8 = undefined;
-            var stdout = std.fs.File.stdout().writer(&stdout_buf);
-            stdout.interface.print("{s}", .{HELP_TEXT}) catch {};
-            stdout.interface.flush() catch {};
+            _ = c.fputs(HELP_TEXT, c.stdout);
             return 0;
         } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
-            var stdout_buf: [128]u8 = undefined;
-            var stdout = std.fs.File.stdout().writer(&stdout_buf);
-            stdout.interface.print("sketerm {s}\n", .{VERSION}) catch {};
-            stdout.interface.flush() catch {};
+            _ = c.fprintf(c.stdout, "sketerm %s\n", @as([*:0]const u8, VERSION));
             return 0;
         }
     }
@@ -146,19 +138,22 @@ pub fn main() u8 {
     // (is_remote=false) and any subsequent invocation
     // (is_remote=true) — that's what makes `sketerm --toggle`
     // reach a running window.
-    const c_argv: [*c][*c]u8 = @ptrCast(@alignCast(std.os.argv.ptr));
-    const argc: c_int = @intCast(std.os.argv.len);
+    const c_argv: [*c][*c]u8 = @ptrCast(@alignCast(@constCast(argv.ptr)));
+    const argc: c_int = @intCast(argv.len);
 
     // SKETERM_APP_ID overrides the GApplication ID so a second instance
     // can run alongside the primary one (debug / profiling). Must be a
     // valid reverse-DNS-style name; GLib aborts otherwise.
     var app_id_buf: [256:0]u8 = undefined;
-    const app_id: [*:0]const u8 = if (std.posix.getenv("SKETERM_APP_ID")) |env| blk: {
+    const app_id: [*:0]const u8 = blk: {
+        const raw = c.getenv("SKETERM_APP_ID");
+        if (raw == null) break :blk APP_ID;
+        const env = std.mem.span(raw);
         if (env.len == 0 or env.len >= app_id_buf.len) break :blk APP_ID;
         @memcpy(app_id_buf[0..env.len], env);
         app_id_buf[env.len] = 0;
         break :blk @ptrCast(&app_id_buf);
-    } else APP_ID;
+    };
 
     const app = c.adw_application_new(app_id, c.G_APPLICATION_HANDLES_COMMAND_LINE);
     defer c.g_object_unref(app);

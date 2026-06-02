@@ -26,9 +26,9 @@ pub const Harness = struct {
     parser: Parser,
     allocator: std.mem.Allocator,
     /// Captured response bytes (e.g. DSR replies, DA1 reply).
-    wtc: std.ArrayList(u8) = .{},
+    wtc: std.ArrayList(u8) = .empty,
     /// Captured OSC titles (set by OSC 0/2).
-    titles: std.ArrayList([]u8) = .{},
+    titles: std.ArrayList([]u8) = .empty,
 
     pub fn init(a: std.mem.Allocator, cols: u16, rows: u16) !Harness {
         const pool_ptr = try a.create(Pool);
@@ -89,7 +89,7 @@ pub const Harness = struct {
     /// Caller frees.
     pub fn line(self: *Harness, allocator: std.mem.Allocator, row: u16) ![]u8 {
         const cells = self.screen.line(row).cells;
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
         var hi: usize = cells.len;
         while (hi > 0 and (cells[hi - 1].rune == 0 or cells[hi - 1].rune == ' ')) hi -= 1;

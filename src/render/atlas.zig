@@ -50,7 +50,7 @@ const Page = struct {
     last_used_frame: u64 = 0,
     /// Glyph IDs currently cached on this page (for eviction).
     /// Codepoints are tracked via `cp_glyph_set`.
-    glyphs_on_page: std.ArrayList(GlyphRef) = .{},
+    glyphs_on_page: std.ArrayList(GlyphRef) = .empty,
     /// Generation increments when this page gets evicted/reset.
     generation: u32 = 0,
 
@@ -112,7 +112,7 @@ pub const Atlas = struct {
     /// Fontconfig-discovered fallback faces, indexed by load order.
     /// First-encountered codepoint that's missing on primary triggers
     /// an FcFontMatch; subsequent same-codepoint hits skip the query.
-    fallback_faces: std.ArrayList(c.FT_Face) = .{},
+    fallback_faces: std.ArrayList(c.FT_Face) = .empty,
     /// Codepoint → fallback_faces index. The optional value is null
     /// when fontconfig couldn't find a covering font (also caches
     /// negative results so we don't query repeatedly).
@@ -202,6 +202,39 @@ pub const Atlas = struct {
             c.GL_UNSIGNED_BYTE,
             null,
         );
+        // Explicitly zero every page. glTexImage3D with a NULL pointer
+        // leaves contents *undefined* per the GL ES 3.0 spec — most
+        // drivers happen to clear, but AMD/radeonsi has been observed
+        // to leave residual data in the inter-glyph padding strips
+        // (`pack_x += w + 1` reserves 1 texel between glyphs but never
+        // writes it). The faux-bold path in cell_pass samples one
+        // texel to the LEFT of each glyph, and at the leftmost column
+        // that lands inside that padding strip — undefined memory there
+        // shows up as a faint vertical line on the left of every bold
+        // narrow glyph (`i`, `l`, `v`). Zero-filling once at realize
+        // costs ~16 MB of TexSubImage3D up front and fixes it.
+        const zero = self.allocator.alloc(u8, PAGE_SIZE * PAGE_SIZE) catch null;
+        defer if (zero) |z| self.allocator.free(z);
+        if (zero) |z| {
+            @memset(z, 0);
+            c.glPixelStorei(c.GL_UNPACK_ALIGNMENT, 1);
+            var layer: c_int = 0;
+            while (layer < PAGE_COUNT) : (layer += 1) {
+                c.glTexSubImage3D(
+                    c.GL_TEXTURE_2D_ARRAY,
+                    0,
+                    0,
+                    0,
+                    layer,
+                    @intCast(PAGE_SIZE),
+                    @intCast(PAGE_SIZE),
+                    1,
+                    c.GL_RED,
+                    c.GL_UNSIGNED_BYTE,
+                    z.ptr,
+                );
+            }
+        }
         c.glTexParameteri(c.GL_TEXTURE_2D_ARRAY, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
         c.glTexParameteri(c.GL_TEXTURE_2D_ARRAY, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
         c.glTexParameteri(c.GL_TEXTURE_2D_ARRAY, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);

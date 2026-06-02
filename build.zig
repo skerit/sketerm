@@ -6,8 +6,8 @@ pub fn build(b: *std.Build) void {
     // Default ReleaseFast for the shipped binary. Terminals are
     // perf-sensitive and runtime safety checks have measurable cost
     // (parser throughput, render latency). Debug builds fail to
-    // compile entirely on Arch + gcc 15 because Zig 0.15.2's bundled
-    // LLD can't handle gcc 15's `.sframe` section in crt1.o
+    // compile entirely on Arch + gcc 15 because Zig's bundled LLD
+    // can't handle gcc 15's `.sframe` section in crt1.o
     // (R_X86_64_PC64 relocs); use `-Doptimize=ReleaseSafe` for
     // bounds + overflow checks while developing.
     const optimize_arg = b.option(
@@ -20,6 +20,15 @@ pub fn build(b: *std.Build) void {
     const strip_default = optimize != .Debug and optimize != .ReleaseSafe;
     const strip = b.option(bool, "strip", "strip debug info") orelse strip_default;
 
+    // Pre-translate the GTK+glib+freetype+stb C headers into a single
+    // generated Zig module via a TranslateC step. In Zig 0.16 the
+    // in-process `@cImport` on this header set crashes `zig build-exe`
+    // (SEGV inside Aro), but the same input through a standalone
+    // `zig translate-c` subprocess succeeds. Out-of-process step it
+    // is. See `vendor/cimport_root.h` for the headers + workaround
+    // defines.
+    const cbindings_mod = buildCBindings(b, target, optimize);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -27,28 +36,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .strip = strip,
     });
-
-    const sys_libs = [_][]const u8{
-        "gtk4",
-        "libadwaita-1",
-        "freetype2",
-        "harfbuzz",
-        "epoxy",
-        "fribidi",
-        "fontconfig",
-    };
+    configureSysDeps(b, exe_mod, cbindings_mod);
 
     const exe = b.addExecutable(.{
         .name = "sketerm",
         .root_module = exe_mod,
-        .use_lld = true,  // self-hosted linker can't handle gcc 15's SFrame relocs in crt1
+        .use_lld = true, // self-hosted linker can't handle gcc 15's SFrame relocs in crt1
     });
-    for (sys_libs) |lib| exe.linkSystemLibrary(lib);
-    exe.addCSourceFile(.{
-        .file = b.path("vendor/stb_image_impl.c"),
-        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
-    });
-    exe.addIncludePath(b.path("vendor"));
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -64,17 +58,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    configureSysDeps(b, spike_mod, cbindings_mod);
     const spike = b.addExecutable(.{
         .name = "sketerm-spike-gl",
         .root_module = spike_mod,
         .use_lld = true,
     });
-    for (sys_libs) |lib| spike.linkSystemLibrary(lib);
-    spike.addCSourceFile(.{
-        .file = b.path("vendor/stb_image_impl.c"),
-        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
-    });
-    spike.addIncludePath(b.path("vendor"));
     b.installArtifact(spike);
     const spike_run = b.addRunArtifact(spike);
     const spike_step = b.step("spike-gl", "Run the M0.5 GL share-group spike");
@@ -87,17 +76,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    configureSysDeps(b, shell_mod, cbindings_mod);
     const shell = b.addExecutable(.{
         .name = "sketerm-spike-shell",
         .root_module = shell_mod,
         .use_lld = true,
     });
-    for (sys_libs) |lib| shell.linkSystemLibrary(lib);
-    shell.addCSourceFile(.{
-        .file = b.path("vendor/stb_image_impl.c"),
-        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
-    });
-    shell.addIncludePath(b.path("vendor"));
     b.installArtifact(shell);
     const shell_run = b.addRunArtifact(shell);
     const shell_step = b.step("spike-shell", "Headless PTY/parser/screen smoke");
@@ -110,17 +94,12 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
         .link_libc = true,
     });
+    configureSysDeps(b, bench_mod, cbindings_mod);
     const bench = b.addExecutable(.{
         .name = "sketerm-bench-parser",
         .root_module = bench_mod,
         .use_lld = true,
     });
-    for (sys_libs) |lib| bench.linkSystemLibrary(lib);
-    bench.addCSourceFile(.{
-        .file = b.path("vendor/stb_image_impl.c"),
-        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
-    });
-    bench.addIncludePath(b.path("vendor"));
     b.installArtifact(bench);
     const bench_run = b.addRunArtifact(bench);
     const bench_step = b.step("bench-parser", "Parser microbenchmark");
@@ -133,21 +112,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // image_pass imports c.zig which @cIncludes gtk/gtk.h etc, so we
+    // need every system header path. Reuse the same set as the main
+    // exe.
+    configureSysDeps(b, smoke_mod, cbindings_mod);
+    smoke_mod.linkSystemLibrary("EGL", .{});
     const smoke = b.addExecutable(.{
         .name = "sketerm-smoke-image",
         .root_module = smoke_mod,
         .use_lld = true,
     });
-    smoke.linkSystemLibrary("EGL");
-    // image_pass imports c.zig which @cIncludes gtk/gtk.h etc, so we
-    // need every system header path. Reuse the same set as the main
-    // exe.
-    for (sys_libs) |lib| smoke.linkSystemLibrary(lib);
-    smoke.addCSourceFile(.{
-        .file = b.path("vendor/stb_image_impl.c"),
-        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
-    });
-    smoke.addIncludePath(b.path("vendor"));
     b.installArtifact(smoke);
     const smoke_run = b.addRunArtifact(smoke);
     const smoke_step = b.step("smoke-image", "Headless GL image render check");
@@ -164,18 +138,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    configureSysDeps(b, smoke_cell_mod, cbindings_mod);
+    smoke_cell_mod.linkSystemLibrary("EGL", .{});
     const smoke_cell = b.addExecutable(.{
         .name = "sketerm-smoke-cell",
         .root_module = smoke_cell_mod,
         .use_lld = true,
     });
-    smoke_cell.linkSystemLibrary("EGL");
-    for (sys_libs) |lib| smoke_cell.linkSystemLibrary(lib);
-    smoke_cell.addCSourceFile(.{
-        .file = b.path("vendor/stb_image_impl.c"),
-        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
-    });
-    smoke_cell.addIncludePath(b.path("vendor"));
     b.installArtifact(smoke_cell);
     const smoke_cell_run = b.addRunArtifact(smoke_cell);
     const smoke_cell_step = b.step("smoke-cell", "Headless GL cell-pipeline render check");
@@ -192,18 +161,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    configureSysDeps(b, bench_cell_mod, cbindings_mod);
+    bench_cell_mod.linkSystemLibrary("EGL", .{});
     const bench_cell = b.addExecutable(.{
         .name = "sketerm-bench-cell-upload",
         .root_module = bench_cell_mod,
         .use_lld = true,
     });
-    bench_cell.linkSystemLibrary("EGL");
-    for (sys_libs) |lib| bench_cell.linkSystemLibrary(lib);
-    bench_cell.addCSourceFile(.{
-        .file = b.path("vendor/stb_image_impl.c"),
-        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
-    });
-    bench_cell.addIncludePath(b.path("vendor"));
     b.installArtifact(bench_cell);
     const bench_cell_run = b.addRunArtifact(bench_cell);
     const bench_cell_step = b.step("bench-cell-upload", "Headless cell-upload microbench (isolates GL from GTK)");
@@ -219,18 +183,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    configureSysDeps(b, smoke_trans_mod, cbindings_mod);
+    smoke_trans_mod.linkSystemLibrary("EGL", .{});
     const smoke_trans = b.addExecutable(.{
         .name = "sketerm-smoke-transparency",
         .root_module = smoke_trans_mod,
         .use_lld = true,
     });
-    smoke_trans.linkSystemLibrary("EGL");
-    for (sys_libs) |lib| smoke_trans.linkSystemLibrary(lib);
-    smoke_trans.addCSourceFile(.{
-        .file = b.path("vendor/stb_image_impl.c"),
-        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
-    });
-    smoke_trans.addIncludePath(b.path("vendor"));
     b.installArtifact(smoke_trans);
     const smoke_trans_run = b.addRunArtifact(smoke_trans);
     const smoke_trans_step = b.step("smoke-transparency", "Headless GL bg-alpha render check");
@@ -242,17 +201,137 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    configureSysDeps(b, tests_mod, cbindings_mod);
     const tests = b.addTest(.{
         .root_module = tests_mod,
         .use_lld = true,
     });
-    for (sys_libs) |lib| tests.linkSystemLibrary(lib);
-    tests.addCSourceFile(.{
-        .file = b.path("vendor/stb_image_impl.c"),
-        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
-    });
-    tests.addIncludePath(b.path("vendor"));
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+}
+
+/// Set up the out-of-process TranslateC step that turns
+/// `vendor/cimport_root.h` into a Zig module. Returns a module each
+/// binary can import as `@import("cbindings")`.
+///
+/// The raw translate-c output contains some invalid Zig that Aro emits
+/// for discarded pointer-returning calls inside `static inline` glib
+/// functions (e.g. `g_set_object`): `_ = @ptrCast(@alignCast(call()))`
+/// fails with "@ptrCast must have a known result type". A sed pass
+/// strips the redundant outer cast so the discard typechecks.
+fn buildCBindings(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const tc = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/cimport_root.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // Same `-I` order as `configureSysDeps`: shim path first so it
+    // shadows the system gdkversionmacros.h.
+    tc.addIncludePath(b.path("vendor/aro_shims"));
+    const pkgs = [_][]const u8{
+        "gtk4",
+        "libadwaita-1",
+        "freetype2",
+        "harfbuzz",
+        "epoxy",
+        "fribidi",
+        "fontconfig",
+    };
+    for (pkgs) |p| {
+        const cflags = b.run(&.{ "pkg-config", "--cflags-only-I", p });
+        var it_inc = std.mem.tokenizeAny(u8, cflags, " \r\n\t");
+        while (it_inc.next()) |tok| {
+            if (std.mem.startsWith(u8, tok, "-I")) {
+                tc.addIncludePath(.{ .cwd_relative = b.dupe(tok[2..]) });
+            }
+        }
+    }
+    tc.addIncludePath(b.path("vendor"));
+
+    // Post-process: replace `_ = @ptrCast(@alignCast(<expr>));` with
+    // `_ = <expr>;`. Aro emits the redundant casts when translating
+    // discarded calls like `g_object_ref(x);` and Zig 0.16 rejects
+    // `_ = @ptrCast(...)` because the result type is unknown at the
+    // discard site. The capture is `[^;]+` rather than `.+` so it can
+    // never run past the statement-terminating `;` — `.+` is greedy and
+    // would corrupt two such discards sharing one line. Aro emits one
+    // per line today, but the negated class keeps the rewrite correct
+    // regardless of future output shape (the expr never contains `;`).
+    const fix = b.addSystemCommand(&.{
+        "sed",
+        "-E",
+        "s/_ = @ptrCast\\(@alignCast\\(([^;]+)\\)\\);/_ = \\1;/g",
+    });
+    fix.addFileArg(tc.getOutput());
+    const fixed = fix.captureStdOut(.{ .basename = "cimport_root_fixed.zig" });
+
+    return b.createModule(.{
+        .root_source_file = fixed,
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+}
+
+/// Register the shared system-library / C-source / include-path set
+/// on a module. Also wires the pre-translated C bindings module as
+/// `@import("cbindings")` so `src/c.zig` can re-export it.
+///
+/// pkg-config is invoked here directly (rather than via `linkSystemLibrary`)
+/// so we control include-path order: `vendor/aro_shims/` must come
+/// FIRST so the patched `gdk/version/gdkversionmacros.h` shadows the
+/// system one. (Aro reads gdkversionmacros.h's `#error` guard at line
+/// 18 every re-include — its `#pragma once` lives at line 22, too
+/// late to stop re-processing.)
+fn configureSysDeps(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    cbindings_mod: *std.Build.Module,
+) void {
+    const sys_libs = [_][]const u8{
+        "gtk4",
+        "libadwaita-1",
+        "freetype2",
+        "harfbuzz",
+        "epoxy",
+        "fribidi",
+        "fontconfig",
+    };
+    mod.addImport("cbindings", cbindings_mod);
+    mod.addIncludePath(b.path("vendor/aro_shims"));
+    for (sys_libs) |lib| addPkgConfig(b, mod, lib);
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    mod.addIncludePath(b.path("vendor"));
+}
+
+/// Resolve a pkg-config package and split its output into include
+/// paths (added via `addIncludePath` AFTER any earlier shim paths) and
+/// library names (added via `linkSystemLibrary` with `use_pkg_config =
+/// .no` so the Zig build system doesn't reinvoke pkg-config).
+fn addPkgConfig(b: *std.Build, mod: *std.Build.Module, pkg: []const u8) void {
+    const cflags = b.run(&.{ "pkg-config", "--cflags-only-I", pkg });
+    var it_inc = std.mem.tokenizeAny(u8, cflags, " \r\n\t");
+    while (it_inc.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "-I")) {
+            const path = tok[2..];
+            mod.addIncludePath(.{ .cwd_relative = b.dupe(path) });
+        }
+    }
+
+    const libs = b.run(&.{ "pkg-config", "--libs-only-l", pkg });
+    var it_lib = std.mem.tokenizeAny(u8, libs, " \r\n\t");
+    while (it_lib.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "-l")) {
+            mod.linkSystemLibrary(tok[2..], .{ .use_pkg_config = .no });
+        }
+    }
 }

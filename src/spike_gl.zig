@@ -30,21 +30,15 @@ const Results = struct {
 
 var results: Results = .{};
 
-pub fn main() u8 {
-    var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .{};
+pub fn main(init: std.process.Init.Minimal) u8 {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
+    _ = allocator;
 
-    const argv = std.process.argsAlloc(allocator) catch return 1;
-    defer std.process.argsFree(allocator, argv);
-
-    var c_argv = allocator.alloc(?[*:0]u8, argv.len + 1) catch return 1;
-    defer allocator.free(c_argv);
-    for (argv, 0..) |arg, i| c_argv[i] = @constCast(arg.ptr);
-    c_argv[argv.len] = null;
-
+    const argv = init.args.vector;
     const argc: c_int = @intCast(argv.len);
-    const argv_ptr: [*c][*c]u8 = @ptrCast(c_argv.ptr);
+    const argv_ptr: [*c][*c]u8 = @ptrCast(@constCast(argv.ptr));
 
     const app = c.adw_application_new(APP_ID, c.G_APPLICATION_DEFAULT_FLAGS);
     defer c.g_object_unref(app);

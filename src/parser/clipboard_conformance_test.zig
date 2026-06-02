@@ -18,7 +18,7 @@ const Bench = struct {
     screen: *Screen,
     parser: Parser,
     allocator: std.mem.Allocator,
-    captured: std.ArrayList(u8) = .{},
+    captured: std.ArrayList(u8) = .empty,
 
     fn init(a: std.mem.Allocator) !Bench {
         const pool_ptr = try a.create(Pool);

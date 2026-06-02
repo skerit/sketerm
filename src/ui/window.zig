@@ -102,8 +102,8 @@ pub const Window = struct {
     tab_bar: *c.GtkWidget,
     toolbar_view: *c.GtkWidget,
     title_buf: [256]u8 = undefined,
-    panes: std.ArrayList(*Pane) = .{},
-    terminals: std.ArrayList(*Terminal) = .{},
+    panes: std.ArrayList(*Pane) = .empty,
+    terminals: std.ArrayList(*Terminal) = .empty,
     allocator: std.mem.Allocator,
     tab_counter: u32 = 0,
     debug_events: bool = false,
@@ -114,7 +114,7 @@ pub const Window = struct {
     search_entry: ?*c.GtkWidget = null,
     search_label: ?*c.GtkWidget = null,
     search_pane: ?*Pane = null,
-    search_matches: std.ArrayList(@import("../grid/screen.zig").Screen.SearchMatch) = .{},
+    search_matches: std.ArrayList(@import("../grid/screen.zig").Screen.SearchMatch) = .empty,
     search_idx: usize = 0,
     /// Case-insensitive search toggle. Defaults to smart-case
     /// (lower-only needle implies CI; mixed-case implies CS).
@@ -131,7 +131,7 @@ pub const Window = struct {
     /// `Config.keybinds` overlaid on `input.default_bindings`, sorted
     /// for first-match dispatch in `onKeyPressed`. Re-resolved on
     /// every `applyConfigChange`.
-    bindings: std.ArrayList(@import("input.zig").Binding) = .{},
+    bindings: std.ArrayList(@import("input.zig").Binding) = .empty,
 
     /// CSS provider for the per-pane titlebar colour classes
     /// (sketerm-titlebar-active / -inactive). Loaded lazily on first
@@ -149,7 +149,7 @@ pub const Window = struct {
     groupsend: GroupSend = .off,
     /// Recently-closed tab ring. Newest entry at the end; cap at 16.
     /// Strings owned by `closed_arena`.
-    closed_tabs: std.ArrayList(ClosedTab) = .{},
+    closed_tabs: std.ArrayList(ClosedTab) = .empty,
     closed_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
@@ -465,7 +465,7 @@ pub const Window = struct {
     fn updateSearch(self: *Window, query: []const u8) void {
         const pane = self.search_pane orelse return;
         self.search_matches.deinit(self.allocator);
-        self.search_matches = .{};
+        self.search_matches = .empty;
         self.search_idx = 0;
         if (query.len > 0) {
             // Smart-case: lowercase-only needle implies CI; any
@@ -677,7 +677,7 @@ pub const Window = struct {
 
                 var argv_buf = try self.allocator.alloc([*:0]const u8, p.command.len);
                 defer self.allocator.free(argv_buf);
-                var arg_owners: std.ArrayList([:0]u8) = .{};
+                var arg_owners: std.ArrayList([:0]u8) = .empty;
                 defer {
                     for (arg_owners.items) |s| self.allocator.free(s);
                     arg_owners.deinit(self.allocator);
@@ -1284,16 +1284,30 @@ pub const Window = struct {
 
     fn loadLayoutSimple(self: *Window, path: []const u8) !bool {
         const layout_simple = @import("../layout_simple.zig");
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-            std.debug.print("sketerm: cannot open {s}: {s}\n", .{ path, @errorName(err) });
+        // Zig 0.16's `std.fs.cwd().openFile` requires an `Io`. Use libc.
+        var path_z: [4096]u8 = undefined;
+        if (path.len >= path_z.len) {
+            std.debug.print("sketerm: path too long: {s}\n", .{path});
+            return false;
+        }
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+        const fp = c.fopen(@ptrCast(&path_z), "rb") orelse {
+            std.debug.print("sketerm: cannot open {s}\n", .{path});
             return false;
         };
-        defer file.close();
-        const bytes = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
-            std.debug.print("sketerm: read {s}: {s}\n", .{ path, @errorName(err) });
-            return false;
-        };
+        defer _ = c.fclose(fp);
+        if (c.fseek(fp, 0, c.SEEK_END) != 0) return false;
+        const size_long = c.ftell(fp);
+        if (size_long <= 0 or size_long > 1024 * 1024) return false;
+        if (c.fseek(fp, 0, c.SEEK_SET) != 0) return false;
+        const size: usize = @intCast(size_long);
+        const bytes = self.allocator.alloc(u8, size) catch return false;
         defer self.allocator.free(bytes);
+        if (c.fread(bytes.ptr, 1, size, fp) != size) {
+            std.debug.print("sketerm: short read on {s}\n", .{path});
+            return false;
+        }
         var parsed = layout_simple.parse(self.allocator, bytes) catch |err| {
             std.debug.print("sketerm: parse {s}: {s}\n", .{ path, @errorName(err) });
             return false;
@@ -1611,7 +1625,7 @@ pub const Window = struct {
     fn cyclePane(self: *Window, dir: PaneDir) void {
         const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
         const root = c.adw_tab_page_get_child(page) orelse return;
-        var in_tab: std.ArrayList(*Pane) = .{};
+        var in_tab: std.ArrayList(*Pane) = .empty;
         defer in_tab.deinit(self.allocator);
         for (self.panes.items) |p| {
             if (widgetIsAncestor(@ptrCast(root), @ptrCast(p.widget()))) {
@@ -2258,7 +2272,7 @@ pub const Window = struct {
     /// Build a Layout snapshot of the current window state.
     /// Caller must arena-free or otherwise track strings.
     pub fn collectLayout(self: *Window, arena: std.mem.Allocator) !layout_mod.Layout {
-        var tabs: std.ArrayList(layout_mod.TabSpec) = .{};
+        var tabs: std.ArrayList(layout_mod.TabSpec) = .empty;
         const n_pages = c.adw_tab_view_get_n_pages(self.tab_view);
         var i: c_int = 0;
         while (i < n_pages) : (i += 1) {
@@ -2318,7 +2332,7 @@ pub const Window = struct {
                 else
                     layout_mod.cwdOfPid(p.terminal.pty.child_pid, arena) catch try arena.dupe(u8, "/");
                 const cmd = try arena.alloc([]const u8, 1);
-                cmd[0] = try arena.dupe(u8, std.posix.getenv("SHELL") orelse "/bin/bash");
+                cmd[0] = try arena.dupe(u8, @import("../util/profile.zig").getenv("SHELL") orelse "/bin/bash");
                 // Save font_size only if it diverges from the global
                 // default — keeps layout files terse.
                 const fs: ?u16 = if (p.font_size != self.config.font_size) p.font_size else null;
@@ -2524,7 +2538,13 @@ pub const Window = struct {
         const arena = arena_state.allocator();
 
         const path = try layout_mod.defaultLayoutPath(arena);
-        std.fs.cwd().access(path, .{}) catch return false;
+        // Existence check via libc. F_OK = 0 in POSIX; Aro translates
+        // the F_OK macro fine but it's only accessible inside `c.`.
+        var path_z: [4096]u8 = undefined;
+        if (path.len >= path_z.len) return false;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+        if (c.access(@ptrCast(&path_z), c.F_OK) != 0) return false;
 
         var parsed = layout_mod.load(self.allocator, path) catch |err| {
             std.debug.print("sketerm: cannot load default layout {s}: {s}\n", .{ path, @errorName(err) });
@@ -2956,7 +2976,7 @@ fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
         // prefix the path (e.g. /tmp, /var/log).
         var abbrev_buf: [512]u8 = undefined;
         const display_cwd: []const u8 = blk: {
-            const home = std.posix.getenv("HOME") orelse break :blk cwd;
+            const home = @import("../util/profile.zig").getenv("HOME") orelse break :blk cwd;
             if (home.len == 0 or !std.mem.startsWith(u8, cwd, home)) break :blk cwd;
             // Match either `HOME` exactly or `HOME/...` — `HOMEextra`
             // would be a different dir and shouldn't be folded.
@@ -3379,10 +3399,10 @@ fn mapCursorShape(shape: @import("../config.zig").CursorShape, blink: bool) @imp
 /// Path the prefs dialog persists to. Honours XDG; falls back to
 /// ~/.config/sketerm/config.conf. Caller frees.
 fn resolveConfigSavePath(allocator: std.mem.Allocator) ![]u8 {
-    if (std.posix.getenv("XDG_CONFIG_HOME")) |x| {
+    if (@import("../util/profile.zig").getenv("XDG_CONFIG_HOME")) |x| {
         return std.fmt.allocPrint(allocator, "{s}/sketerm/config.conf", .{x});
     }
-    if (std.posix.getenv("HOME")) |home| {
+    if (@import("../util/profile.zig").getenv("HOME")) |home| {
         return std.fmt.allocPrint(allocator, "{s}/.config/sketerm/config.conf", .{home});
     }
     return error.NoConfigPath;

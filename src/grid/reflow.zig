@@ -31,7 +31,7 @@ const Line = @import("line.zig").Line;
 
 pub const Logical = struct {
     /// Concatenated cells from all rows in this logical line.
-    cells: std.ArrayList(Cell) = .{},
+    cells: std.ArrayList(Cell) = .empty,
     /// True if the LAST row of this logical line has `continues_above`
     /// = true on the row that would have followed it (i.e. the line
     /// was filled to capacity). When false, the last row's trailing
@@ -48,7 +48,7 @@ pub fn build(
     rows: []const Line,
     initial_continues: bool,
 ) !std.ArrayList(Logical) {
-    var out: std.ArrayList(Logical) = .{};
+    var out: std.ArrayList(Logical) = .empty;
     errdefer {
         for (out.items) |*ll| ll.cells.deinit(allocator);
         out.deinit(allocator);
@@ -114,7 +114,7 @@ pub fn rechunk(
     logicals: []const Logical,
     new_cols: u16,
 ) ![]Line {
-    var rows: std.ArrayList(Line) = .{};
+    var rows: std.ArrayList(Line) = .empty;
     errdefer {
         for (rows.items) |*r| r.deinit(allocator);
         rows.deinit(allocator);
