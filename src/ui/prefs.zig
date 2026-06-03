@@ -856,7 +856,10 @@ fn exitActionSelected(ctx: *Ctx, idx: c_uint) void {
 
 fn renderingPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_page_set_title(page, "Rendering");
-    c.adw_preferences_page_set_icon_name(page, "applications-graphics-symbolic");
+    // Bundled (hicolor) icon: the stock applications-graphics-symbolic
+    // isn't delivered by every icon-theme chain (white-square fallback
+    // on custom themes inheriting breeze).
+    c.adw_preferences_page_set_icon_name(page, "sketerm-rendering-symbolic");
 
     const text_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(text_group)), "Text");

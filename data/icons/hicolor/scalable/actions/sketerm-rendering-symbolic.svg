@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- A display/monitor — the "Rendering" page. Monochrome symbolic:
+       GTK recolours the fill to the page foreground. Bundled (hicolor
+       fallback) so it resolves regardless of the user's icon theme;
+       Adwaita's applications-graphics-symbolic isn't delivered by some
+       theme chains (e.g. custom themes inheriting breeze). -->
+  <g fill="#2e3436">
+    <rect x="1.5" y="2.5" width="13" height="8.5" rx="1.5"/>
+    <rect x="7.25" y="11" width="1.5" height="1.8"/>
+    <rect x="5.5" y="12.6" width="5" height="1.4" rx="0.7"/>
+  </g>
+</svg>
