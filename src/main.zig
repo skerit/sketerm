@@ -289,6 +289,15 @@ fn onToggleAction(_: *c.GSimpleAction, _: ?*c.GVariant, _: ?*anyopaque) callconv
 }
 
 fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
+    // Make the bundled symbolic icons (sketerm-split-*-symbolic) resolvable.
+    // Installed builds find them under /usr/share/icons/hicolor (a default
+    // search path); for `zig build run` the CWD is the repo root, so add
+    // data/icons too. A non-existent path is harmless.
+    if (c.gdk_display_get_default()) |display| {
+        const theme = c.gtk_icon_theme_get_for_display(display);
+        c.gtk_icon_theme_add_search_path(theme, "data/icons");
+    }
+
     // Honour --config path if provided, otherwise let Window.init use
     // the default XDG-search loader.
     const Config = @import("config.zig").Config;

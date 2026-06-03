@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Two panes stacked (top / bottom) — the result of a vertical
+       split. Monochrome symbolic icon: GTK recolours the fill to the
+       menu foreground via the -symbolic name. -->
+  <g fill="#2e3436">
+    <rect x="1.5" y="2.5" width="13" height="4.5" rx="1"/>
+    <rect x="1.5" y="9" width="13" height="4.5" rx="1"/>
+  </g>
+</svg>

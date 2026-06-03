@@ -1,7 +1,10 @@
-//! Right-click context menu — GtkPopoverMenu over GMenu model.
+//! Right-click context menu — a custom GtkPopover of icon+label
+//! buttons. (GTK4's GtkPopoverMenu does NOT render per-item icons, so
+//! the model approach can't show them; we build the rows ourselves.)
 //!
 //! Actions dispatch via a single sink callback. Names use the
-//! "term" action prefix; widget gets a GSimpleActionGroup inserted.
+//! "term" action prefix; widget gets a GSimpleActionGroup inserted,
+//! and each button drives its action via action-name.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -53,27 +56,33 @@ const Bind = struct {
     name: [*:0]const u8,
     label: [*:0]const u8,
     detailed: [*:0]const u8,
+    /// Symbolic icon name (stock Adwaita, or a bundled sketerm-* icon).
+    icon: [*:0]const u8,
     action: Action,
+    /// Section index; a separator is drawn where it changes. BINDS is
+    /// ordered for display (it doubles as the row list and the action
+    /// source).
+    section: u8,
 };
 
 const BINDS = [_]Bind{
-    .{ .name = "copy", .label = "Copy", .detailed = "term.copy", .action = .copy },
-    .{ .name = "copy-screen", .label = "Copy Screen", .detailed = "term.copy-screen", .action = .copy_screen },
-    .{ .name = "copy-scrollback", .label = "Copy Scrollback", .detailed = "term.copy-scrollback", .action = .copy_scrollback },
-    .{ .name = "paste", .label = "Paste", .detailed = "term.paste", .action = .paste },
-    .{ .name = "copy-link", .label = "Copy Link", .detailed = "term.copy-link", .action = .copy_link },
-    .{ .name = "split-h", .label = "Split Horizontal", .detailed = "term.split-h", .action = .split_h },
-    .{ .name = "split-v", .label = "Split Vertical", .detailed = "term.split-v", .action = .split_v },
-    .{ .name = "close-pane", .label = "Close Pane", .detailed = "term.close-pane", .action = .close_pane },
-    .{ .name = "set-pane-title", .label = "Set Pane Title…", .detailed = "term.set-pane-title", .action = .set_pane_title },
-    .{ .name = "new-tab", .label = "New Tab", .detailed = "term.new-tab", .action = .new_tab },
-    .{ .name = "new-tab-as-profile", .label = "New Tab as Profile…", .detailed = "term.new-tab-as-profile", .action = .new_tab_as_profile },
-    .{ .name = "duplicate-tab", .label = "Duplicate Tab", .detailed = "term.duplicate-tab", .action = .duplicate_tab },
-    .{ .name = "rename-tab", .label = "Rename Tab…", .detailed = "term.rename-tab", .action = .rename_tab },
-    .{ .name = "pin-tab", .label = "Pin / Unpin Tab", .detailed = "term.pin-tab", .action = .pin_tab },
-    .{ .name = "close-tab", .label = "Close Tab", .detailed = "term.close-tab", .action = .close_tab },
-    .{ .name = "reset", .label = "Reset Terminal", .detailed = "term.reset", .action = .reset_terminal },
-    .{ .name = "prefs", .label = "Preferences…", .detailed = "term.prefs", .action = .prefs_open },
+    .{ .name = "copy", .label = "Copy", .detailed = "term.copy", .icon = "edit-copy-symbolic", .action = .copy, .section = 0 },
+    .{ .name = "copy-screen", .label = "Copy Screen", .detailed = "term.copy-screen", .icon = "edit-select-all-symbolic", .action = .copy_screen, .section = 0 },
+    .{ .name = "copy-scrollback", .label = "Copy Scrollback", .detailed = "term.copy-scrollback", .icon = "edit-select-all-symbolic", .action = .copy_scrollback, .section = 0 },
+    .{ .name = "paste", .label = "Paste", .detailed = "term.paste", .icon = "edit-paste-symbolic", .action = .paste, .section = 0 },
+    .{ .name = "copy-link", .label = "Copy Link", .detailed = "term.copy-link", .icon = "insert-link-symbolic", .action = .copy_link, .section = 0 },
+    .{ .name = "split-h", .label = "Split Left / Right", .detailed = "term.split-h", .icon = "sketerm-split-left-right-symbolic", .action = .split_h, .section = 1 },
+    .{ .name = "split-v", .label = "Split Top / Bottom", .detailed = "term.split-v", .icon = "sketerm-split-top-bottom-symbolic", .action = .split_v, .section = 1 },
+    .{ .name = "set-pane-title", .label = "Set Pane Title…", .detailed = "term.set-pane-title", .icon = "document-edit-symbolic", .action = .set_pane_title, .section = 1 },
+    .{ .name = "close-pane", .label = "Close Pane", .detailed = "term.close-pane", .icon = "window-close-symbolic", .action = .close_pane, .section = 1 },
+    .{ .name = "new-tab", .label = "New Tab", .detailed = "term.new-tab", .icon = "tab-new-symbolic", .action = .new_tab, .section = 2 },
+    .{ .name = "new-tab-as-profile", .label = "New Tab as Profile…", .detailed = "term.new-tab-as-profile", .icon = "tab-new-symbolic", .action = .new_tab_as_profile, .section = 2 },
+    .{ .name = "duplicate-tab", .label = "Duplicate Tab", .detailed = "term.duplicate-tab", .icon = "edit-copy-symbolic", .action = .duplicate_tab, .section = 2 },
+    .{ .name = "rename-tab", .label = "Rename Tab…", .detailed = "term.rename-tab", .icon = "document-edit-symbolic", .action = .rename_tab, .section = 2 },
+    .{ .name = "pin-tab", .label = "Pin / Unpin Tab", .detailed = "term.pin-tab", .icon = "view-pin-symbolic", .action = .pin_tab, .section = 2 },
+    .{ .name = "close-tab", .label = "Close Tab", .detailed = "term.close-tab", .icon = "window-close-symbolic", .action = .close_tab, .section = 2 },
+    .{ .name = "reset", .label = "Reset Terminal", .detailed = "term.reset", .icon = "view-refresh-symbolic", .action = .reset_terminal, .section = 3 },
+    .{ .name = "prefs", .label = "Preferences…", .detailed = "term.prefs", .icon = "preferences-system-symbolic", .action = .prefs_open, .section = 3 },
 };
 
 pub fn attach(
@@ -93,42 +102,8 @@ pub fn attachWithPrePopup(
     pre_popup_fn: ?PrePopupFn,
     pre_popup_ctx: ?*anyopaque,
 ) !void {
-    // Menu model.
-    const menu = c.g_menu_new();
-    const sec1 = c.g_menu_new();
-    c.g_menu_append(sec1, "Copy", "term.copy");
-    c.g_menu_append(sec1, "Copy Screen", "term.copy-screen");
-    c.g_menu_append(sec1, "Copy Scrollback", "term.copy-scrollback");
-    c.g_menu_append(sec1, "Paste", "term.paste");
-    c.g_menu_append(sec1, "Copy Link", "term.copy-link");
-    c.g_menu_append_section(menu, null, @ptrCast(@alignCast(sec1)));
-    c.g_object_unref(sec1);
-
-    const sec2 = c.g_menu_new();
-    c.g_menu_append(sec2, "Split Horizontal", "term.split-h");
-    c.g_menu_append(sec2, "Split Vertical", "term.split-v");
-    c.g_menu_append(sec2, "Set Pane Title…", "term.set-pane-title");
-    c.g_menu_append(sec2, "Close Pane", "term.close-pane");
-    c.g_menu_append_section(menu, null, @ptrCast(@alignCast(sec2)));
-    c.g_object_unref(sec2);
-
-    const sec3 = c.g_menu_new();
-    c.g_menu_append(sec3, "New Tab", "term.new-tab");
-    c.g_menu_append(sec3, "New Tab as Profile…", "term.new-tab-as-profile");
-    c.g_menu_append(sec3, "Duplicate Tab", "term.duplicate-tab");
-    c.g_menu_append(sec3, "Rename Tab…", "term.rename-tab");
-    c.g_menu_append(sec3, "Pin / Unpin Tab", "term.pin-tab");
-    c.g_menu_append(sec3, "Close Tab", "term.close-tab");
-    c.g_menu_append_section(menu, null, @ptrCast(@alignCast(sec3)));
-    c.g_object_unref(sec3);
-
-    const sec4 = c.g_menu_new();
-    c.g_menu_append(sec4, "Reset Terminal", "term.reset");
-    c.g_menu_append(sec4, "Preferences…", "term.prefs");
-    c.g_menu_append_section(menu, null, @ptrCast(@alignCast(sec4)));
-    c.g_object_unref(sec4);
-
-    // Action group.
+    // Action group: one GSimpleAction per bind. Buttons below trigger
+    // these by action-name.
     const group = c.g_simple_action_group_new();
     for (BINDS) |b| {
         const slot = try allocator.create(ActionSlot);
@@ -148,18 +123,47 @@ pub fn attachWithPrePopup(
     c.gtk_widget_insert_action_group(widget, "term", @ptrCast(group));
     c.g_object_unref(group);
 
-    // Popover.
-    const popover = c.gtk_popover_menu_new_from_model(@ptrCast(@alignCast(menu)));
-    c.gtk_widget_set_parent(popover, widget);
-    c.gtk_popover_set_has_arrow(@ptrCast(popover), 0);
-    c.g_object_unref(menu);
-
-    // Right-click gesture → popup at cursor. Default the copy-link
-    // action to disabled so it stays grey when no link is under the
-    // cursor; pre_popup_fn flips it true when there is one.
+    // Default the copy-link action to disabled so its button stays grey
+    // when no link is under the cursor; pre_popup_fn flips it true when
+    // there is one. Buttons bound by action-name track this live.
     if (c.g_action_map_lookup_action(@ptrCast(group), "copy-link")) |act| {
         c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), 0);
     }
+
+    // Popover: a custom GtkPopover holding a column of icon+label
+    // buttons. We build the rows by hand because GtkPopoverMenu won't
+    // render per-item icons. Each button activates its "term.*" action
+    // (resolved through the group inserted above) and pops down on click.
+    const popover = c.gtk_popover_new();
+    c.gtk_widget_set_parent(popover, widget);
+    c.gtk_popover_set_has_arrow(@ptrCast(popover), 0);
+
+    const list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+    var first = true;
+    var prev_section: u8 = 0;
+    for (BINDS) |b| {
+        if (!first and b.section != prev_section) {
+            c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+        }
+        first = false;
+        prev_section = b.section;
+
+        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
+        const img = c.gtk_image_new_from_icon_name(b.icon);
+        const lbl = c.gtk_label_new(b.label);
+        c.gtk_label_set_xalign(@ptrCast(lbl), 0.0);
+        c.gtk_widget_set_hexpand(lbl, 1);
+        c.gtk_box_append(@ptrCast(row), img);
+        c.gtk_box_append(@ptrCast(row), lbl);
+
+        const btn = c.gtk_button_new();
+        c.gtk_button_set_child(@ptrCast(btn), row);
+        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+        c.gtk_actionable_set_action_name(@ptrCast(btn), b.detailed);
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(list), btn);
+    }
+    c.gtk_popover_set_child(@ptrCast(popover), list);
 
     const click = c.gtk_gesture_click_new();
     c.gtk_gesture_single_set_button(@ptrCast(click), 3);
@@ -185,6 +189,17 @@ pub fn attachWithPrePopup(
 fn onActivate(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
     const slot = cast.userData(ActionSlot, user);
     slot.sink(slot.sink_ctx, slot.action);
+}
+
+/// Dismiss the popover after a row is clicked. The button's action-name
+/// fires the "term.*" action as part of the same click; this just makes
+/// the menu close like a menu. `user` is the popover widget (a child of
+/// it, so it never outlives it — no destroy-notify needed).
+fn onItemClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const pop: *c.GtkWidget = @ptrCast(@alignCast(u));
+        c.gtk_popover_popdown(@ptrCast(pop));
+    }
 }
 
 fn freeActionSlot(user: ?*anyopaque) callconv(.c) void {

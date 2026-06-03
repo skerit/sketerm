@@ -9,7 +9,7 @@
 
 pkgname=sketerm-git
 _pkgname=sketerm
-pkgver=0.1.0.r564.gad501ce
+pkgver=0.1.0.r566.g12668b7
 pkgrel=1
 pkgdesc='Native GTK4 terminal emulator written in Zig'
 arch=('x86_64')
@@ -71,6 +71,13 @@ package() {
         "$pkgdir/usr/share/applications/dev.sker.sketerm.desktop"
     install -Dm644 data/icons/hicolor/scalable/apps/dev.sker.sketerm.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.svg"
+
+    # Bundled context-menu action icons (split left/right + top/bottom),
+    # found via the hicolor fallback theme.
+    install -Dm644 data/icons/hicolor/scalable/actions/sketerm-split-left-right-symbolic.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/actions/sketerm-split-left-right-symbolic.svg"
+    install -Dm644 data/icons/hicolor/scalable/actions/sketerm-split-top-bottom-symbolic.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/actions/sketerm-split-top-bottom-symbolic.svg"
 
     # License
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
