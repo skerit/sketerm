@@ -116,20 +116,8 @@ const VERT_SRC =
     \\        origin = a_glyph_xy;
     \\        size = a_glyph_size;
     \\        vec2 uv1 = a_glyph_uv1;
-    \\        // Faux bold dilates the glyph one pixel to the right in
-    \\        // the fragment shader (max with the left-neighbor sample).
-    \\        // At the original quad's right edge that thickening has no
-    \\        // pixel column to render into and gets clipped — visible
-    \\        // as bold `h`/`n` losing their right vertical/curve. Widen
-    \\        // the quad and uv mapping by 1 px / 1 atlas texel so the
-    \\        // dilated stroke has somewhere to go. The new texel is
-    \\        // inter-glyph padding (zeroed in Atlas.realize); the
-    \\        // shader's max() pulls the original right-edge stroke
-    \\        // into it.
-    \\        if (a_bold > 0.5) {
-    \\            size.x += 1.0;
-    \\            uv1.x += ATLAS_TEXEL;
-    \\        }
+    \\        // Bold is a real glyph from the atlas (bold face or
+    \\        // outline-embolden) — `a_bold` is inert, no quad fakery.
     \\        v_color = vec4(a_fg.rgb * u_dim_fg, a_fg.a);
     \\        uv = mix(a_glyph_uv0, uv1, corner);
     \\        v_is_glyph = 1.0;
@@ -228,21 +216,9 @@ const FRAG_SRC = std.fmt.comptimePrint(
     \\void main() {{
     \\    if (v_emit < 0.5) discard;
     \\    if (v_is_glyph > 0.5) {{
+    \\        // Bold is baked into the atlas glyph now (real bold face or
+    \\        // FT outline-embolden); no shader dilation. `v_bold` is inert.
     \\        float a = texture(u_atlas, v_uvw).r;
-    \\        if (v_bold > 0.5) {{
-    \\            // Faux bold: dilate by sampling one texel to the
-    \\            // LEFT in atlas space and taking max alpha. Each
-    \\            // fragment shows max(self, left_neighbor), so the
-    \\            // glyph's stroke extends one pixel to the RIGHT
-    \\            // — preserving the antialiased left bearing the
-    \\            // way real bold typefaces do. Sampling to the
-    \\            // right (the original direction) overwrote the
-    \\            // glyph's leftmost soft edge with a brighter
-    \\            // neighbor, reading as "missing pixel column on
-    \\            // the left."
-    \\            float a2 = texture(u_atlas, v_uvw - vec3(ATLAS_TEXEL, 0.0, 0.0)).r;
-    \\            a = max(a, a2);
-    \\        }}
     \\        o_frag = vec4(v_color.rgb, a * v_color.a);
     \\        return;
     \\    }}
@@ -672,9 +648,10 @@ pub const CellPass = struct {
             slice[col].italic = cached_italic;
             slice[col].bold = cached_bold;
             // Per-codepoint glyph (will be overridden by ligature shaping
-            // below if applicable).
+            // below if applicable). Bold pulls a real bold glyph from the
+            // atlas (bold face or outline-embolden) — no shader fakery.
             if (cell.rune != 0 and cell.rune != ' ' and (cell.flags & 0b0000_0010) == 0) {
-                const g = atlas.lookupOrLoad(cell.rune) catch continue;
+                const g = atlas.lookupOrLoad(cell.rune, cached_bold > 0.5) catch continue;
                 if (g.w > 0 and g.h > 0) {
                     const gx: f32 = cx + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
                     const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;
@@ -780,8 +757,12 @@ pub const CellPass = struct {
             if (!lig_ascii_only) continue;
             if (blen == 0) continue;
 
+            // Bold runs shape + rasterize against the bold face (or
+            // outline-embolden) so the ligature matches its bold cells.
+            const run_bold = pool.get(run_style).attrs.bold and self.allow_bold;
+
             // Atlas owns the cached shape slice — do NOT free.
-            const shaped = atlas.shapeRun(self.allocator, bytes[0..blen]) catch continue;
+            const shaped = atlas.shapeRun(self.allocator, bytes[0..blen], run_bold) catch continue;
             if (shaped.len == 0 or shaped.len == run_len) continue; // No ligation occurred.
 
             // Clear all run cells' glyphs first; we'll repopulate.
@@ -799,7 +780,7 @@ pub const CellPass = struct {
 
             for (shaped) |sg| {
                 const cluster_col = run_start + @as(u16, @intCast(@min(@as(usize, sg.cluster), @as(usize, run_len) - 1)));
-                const g = atlas.lookupOrLoadById(sg.glyph_id) catch continue;
+                const g = atlas.lookupOrLoadById(sg.glyph_id, run_bold) catch continue;
                 if (g.w == 0 or g.h == 0) continue;
                 const x: f32 = pad + @as(f32, @floatFromInt(cluster_col)) * cw;
                 const xoff: f32 = @as(f32, @floatFromInt(sg.x_offset)) / 64.0;

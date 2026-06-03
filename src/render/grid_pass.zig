@@ -87,14 +87,9 @@ const FRAG_SRC = std.fmt.comptimePrint(
     \\
     \\void main() {{
     \\    if (v_is_glyph > 0.5) {{
+    \\        // Bold is a real atlas glyph now (bold face / outline-embolden);
+    \\        // `v_bold` is inert, no shader dilation.
     \\        float a = texture(u_atlas, v_uv).r;
-    \\        if (v_bold > 0.5) {{
-    \\            // See cell_pass.zig faux-bold comment — sample
-    \\            // LEFT (extends right) preserves the antialiased
-    \\            // left edge instead of overwriting it.
-    \\            float a2 = texture(u_atlas, v_uv - vec3(ATLAS_TEXEL, 0.0, 0.0)).r;
-    \\            a = max(a, a2);
-    \\        }}
     \\        o_frag = vec4(v_color.rgb, a * v_color.a);
     \\    }} else {{
     \\        o_frag = v_color;
@@ -618,7 +613,7 @@ pub const GridPass = struct {
                     0.0,
                     2.0,
                 );
-                const g = atlas.lookupOrLoad(cp) catch {
+                const g = atlas.lookupOrLoad(cp, false) catch {
                     idx += seq_len;
                     col_off += cell_w_count;
                     continue;
@@ -916,8 +911,9 @@ pub const GridPass = struct {
                 fg[1] *= 0.65;
                 fg[2] *= 0.65;
             }
+            const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
-            const g = atlas.lookupOrLoad(cell.rune) catch {
+            const g = atlas.lookupOrLoad(cell.rune, bold) catch {
                 col += 1;
                 continue;
             };
@@ -983,8 +979,9 @@ pub const GridPass = struct {
                 fg[1] *= 0.65;
                 fg[2] *= 0.65;
             }
+            const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
-            const g = atlas.lookupOrLoad(cell.rune) catch continue;
+            const g = atlas.lookupOrLoad(cell.rune, bold) catch continue;
             if (g.w == 0 or g.h == 0) continue;
             const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
             const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;

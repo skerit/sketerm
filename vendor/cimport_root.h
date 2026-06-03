@@ -37,6 +37,7 @@
 
 #include <ft2build.h>
 #include <freetype/freetype.h>
+#include <freetype/ftoutln.h>
 #include <hb.h>
 #include <hb-ft.h>
 #include <fribidi.h>
