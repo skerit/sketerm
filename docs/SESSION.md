@@ -4106,3 +4106,41 @@ background_* key actually changed (prefs entry rows fire per
 keystroke). Prefs group on the Appearance page. Verified visually
 on the live system (screenshots: image cover-crop in split panes +
 135° navy gradient).
+
+## 2026-06-10 — sketerm-mux: durable panes (tmux without the hacks)
+
+The big one. Native mux subsystem per the (untracked) mux-design
+doc: shells live in a daemon and stream PARSED EVENTS to clients —
+never re-encoded escape sequences, so every terminal feature works
+through it by construction. Five landed steps:
+
+1. **wire.zig** — framed binary protocol (append-only type/tag
+   bytes); every parser Event round-trips, incl. owned OSC/APC/DCS
+   payloads. peelFrame skips unknown types for forward compat.
+2. **snapshot.zig** — lossless Screen dump: grid (active/alt/
+   scrollback), style pool, links, clusters, cursor, modes, palette,
+   prompt marks, title. Restore builds a fresh Screen. v1 gap: kitty
+   image placements (apps redraw).
+3. **daemon.zig + sketerm-mux binary** — single-threaded poll loop,
+   one PTY+Parser+Screen per session, events applied once and
+   broadcast to attached clients. ATTACH = seq-stamped snapshot +
+   live EVENTS; RESIZE re-snapshots all clients. Links **libc only**
+   (~550 KB): new `glib` build option gates pty.zig's write-queue
+   watch + async reaper behind blocking fallbacks; sys/socket.h +
+   sys/un.h added to cimport_root.h. `zig build mux`, smoke-mux
+   (headless end-to-end incl. reattach + resize + kill).
+4. **GUI attach** — Terminal.initRemote (no PTY/worker; socket on
+   the GLib loop, SNAPSHOT frames swap the Screen wholesale).
+   writeRaw/requestResize abstract PTY-vs-socket — pane.zig no
+   longer touches `terminal.pty`. KEY FIX: reapStatus now guards
+   child_pid <= 0; waitpid(-1) would have reaped arbitrary GUI
+   children. Palette "New Durable Tab", IPC new-durable-tab /
+   attach-session, daemon auto-spawned (sibling-of-exe then $PATH).
+   Closing a remote pane detaches; session lives. Verified live:
+   marker echoed → GUI killed → daemon survived → new GUI attached
+   → marker present + pane interactive (screenshot).
+5. **sketerm mux TUI** — raw-termios picker (arrows/jk, Enter
+   attach-as-tab via GUI IPC, n new, x kill, q quit) + list/attach/
+   new/kill subcommands. GUI socket discovery skips mux.sock.
+
+PKGBUILD now installs sketerm-mux. Tests 442 → 450.
