@@ -29,6 +29,16 @@ pub fn build(b: *std.Build) void {
     // defines.
     const cbindings_mod = buildCBindings(b, target, optimize);
 
+    // Build options: `glib` tells pty.zig whether a GLib main loop
+    // exists (GUI) or not (sketerm-mux daemon, which must not link
+    // glib and uses blocking fallbacks for the write queue).
+    const glib_opts = b.addOptions();
+    glib_opts.addOption(bool, "glib", true);
+    const glib_opts_mod = glib_opts.createModule();
+    const noglib_opts = b.addOptions();
+    noglib_opts.addOption(bool, "glib", false);
+    const noglib_opts_mod = noglib_opts.createModule();
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -37,6 +47,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
     });
     configureSysDeps(b, exe_mod, cbindings_mod);
+    exe_mod.addImport("build_options", glib_opts_mod);
 
     const exe = b.addExecutable(.{
         .name = "sketerm",
@@ -51,6 +62,47 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run sketerm");
     run_step.dependOn(&run_cmd.step);
 
+    // sketerm-mux session daemon — `zig build mux`. LEAN dependency
+    // set: terminal core only (libc + fribidi + vendored stb), no
+    // GTK — the whole point is scp-ing one binary to a server. The
+    // cbindings module is imported for libc/fribidi decls; unused
+    // GTK externs are never referenced so nothing GTK gets linked.
+    const mux_mod = b.createModule(.{
+        .root_source_file = b.path("src/mux_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+    });
+    configureCoreDeps(b, mux_mod, cbindings_mod);
+    mux_mod.addImport("build_options", noglib_opts_mod);
+    const mux_exe = b.addExecutable(.{
+        .name = "sketerm-mux",
+        .root_module = mux_mod,
+        .use_lld = true,
+    });
+    b.installArtifact(mux_exe);
+    const mux_step = b.step("mux", "Build the sketerm-mux session daemon");
+    mux_step.dependOn(&b.addInstallArtifact(mux_exe, .{}).step);
+
+    // Mux end-to-end smoke — `zig build smoke-mux` (headless).
+    const smoke_mux_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_mux.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, smoke_mux_mod, cbindings_mod);
+    smoke_mux_mod.addImport("build_options", noglib_opts_mod);
+    const smoke_mux = b.addExecutable(.{
+        .name = "sketerm-smoke-mux",
+        .root_module = smoke_mux_mod,
+        .use_lld = true,
+    });
+    const smoke_mux_run = b.addRunArtifact(smoke_mux);
+    const smoke_mux_step = b.step("smoke-mux", "Mux daemon end-to-end smoke (headless)");
+    smoke_mux_step.dependOn(&smoke_mux_run.step);
+
     // M0.5 GL spike — `zig build spike-gl`.
     const spike_mod = b.createModule(.{
         .root_source_file = b.path("src/spike_gl.zig"),
@@ -59,6 +111,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureSysDeps(b, spike_mod, cbindings_mod);
+    spike_mod.addImport("build_options", glib_opts_mod);
     const spike = b.addExecutable(.{
         .name = "sketerm-spike-gl",
         .root_module = spike_mod,
@@ -77,6 +130,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureSysDeps(b, shell_mod, cbindings_mod);
+    shell_mod.addImport("build_options", glib_opts_mod);
     const shell = b.addExecutable(.{
         .name = "sketerm-spike-shell",
         .root_module = shell_mod,
@@ -95,6 +149,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureSysDeps(b, replay_mod, cbindings_mod);
+    replay_mod.addImport("build_options", glib_opts_mod);
     const replay = b.addExecutable(.{
         .name = "sketerm-replay",
         .root_module = replay_mod,
@@ -114,6 +169,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureSysDeps(b, bench_mod, cbindings_mod);
+    bench_mod.addImport("build_options", glib_opts_mod);
     const bench = b.addExecutable(.{
         .name = "sketerm-bench-parser",
         .root_module = bench_mod,
@@ -135,6 +191,7 @@ pub fn build(b: *std.Build) void {
     // need every system header path. Reuse the same set as the main
     // exe.
     configureSysDeps(b, smoke_mod, cbindings_mod);
+    smoke_mod.addImport("build_options", glib_opts_mod);
     smoke_mod.linkSystemLibrary("EGL", .{});
     const smoke = b.addExecutable(.{
         .name = "sketerm-smoke-image",
@@ -156,6 +213,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureSysDeps(b, smoke_e2e_mod, cbindings_mod);
+    smoke_e2e_mod.addImport("build_options", glib_opts_mod);
     const smoke_e2e = b.addExecutable(.{
         .name = "sketerm-smoke-e2e",
         .root_module = smoke_e2e_mod,
@@ -182,6 +240,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureSysDeps(b, smoke_cell_mod, cbindings_mod);
+    smoke_cell_mod.addImport("build_options", glib_opts_mod);
     smoke_cell_mod.linkSystemLibrary("EGL", .{});
     const smoke_cell = b.addExecutable(.{
         .name = "sketerm-smoke-cell",
@@ -205,6 +264,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureSysDeps(b, bench_cell_mod, cbindings_mod);
+    bench_cell_mod.addImport("build_options", glib_opts_mod);
     bench_cell_mod.linkSystemLibrary("EGL", .{});
     const bench_cell = b.addExecutable(.{
         .name = "sketerm-bench-cell-upload",
@@ -227,6 +287,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureSysDeps(b, smoke_trans_mod, cbindings_mod);
+    smoke_trans_mod.addImport("build_options", glib_opts_mod);
     smoke_trans_mod.linkSystemLibrary("EGL", .{});
     const smoke_trans = b.addExecutable(.{
         .name = "sketerm-smoke-transparency",
@@ -245,6 +306,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     configureSysDeps(b, tests_mod, cbindings_mod);
+    tests_mod.addImport("build_options", glib_opts_mod);
     const tests = b.addTest(.{
         .root_module = tests_mod,
         .use_lld = true,
@@ -332,6 +394,25 @@ fn buildCBindings(
 /// system one. (Aro reads gdkversionmacros.h's `#error` guard at line
 /// 18 every re-include — its `#pragma once` lives at line 22, too
 /// late to stop re-processing.)
+/// Lean dependency set for GTK-free binaries built on the terminal
+/// core (sketerm-mux): cbindings decls, fribidi (grid/bidi.zig),
+/// vendored stb_image (kitty/iterm image decode), libc. Keep this
+/// list minimal — every entry is something a server must have.
+fn configureCoreDeps(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    cbindings_mod: *std.Build.Module,
+) void {
+    mod.addImport("cbindings", cbindings_mod);
+    mod.addIncludePath(b.path("vendor/aro_shims"));
+    addPkgConfig(b, mod, "fribidi");
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    mod.addIncludePath(b.path("vendor"));
+}
+
 fn configureSysDeps(
     b: *std.Build,
     mod: *std.Build.Module,

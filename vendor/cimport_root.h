@@ -54,6 +54,10 @@
 #include <signal.h>
 #include <poll.h>
 #include <errno.h>
+/* Unix-domain sockets for the sketerm-mux daemon + clients. */
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
 
 #include <glib-unix.h>
 #include <regex.h>

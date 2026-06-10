@@ -8,6 +8,7 @@
 //! See `docs/lifecycle.md` for the full sequence and invariants.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const c = @import("c.zig").c;
 
 pub const SpawnError = error{
@@ -251,6 +252,9 @@ pub const Pty = struct {
     /// Reaper allocates from `std.heap.c_allocator` so its lifetime
     /// is independent of any Terminal/Window allocator.
     pub fn closeAndReapAsync(self: *Pty) void {
+        // Without a GLib main loop (sketerm-mux) there is nothing to
+        // schedule the Reaper on — block briefly instead.
+        if (comptime !build_options.glib) return self.closeAndReap();
         // Drop the POLLOUT watch + queued bytes BEFORE closing the
         // master fd — once closed, the watch's callback could fire
         // one more time and dereference a freed Pty otherwise. The
@@ -283,9 +287,11 @@ pub const Pty = struct {
     /// called by both close paths so deinit-on-error of fresh spawns
     /// doesn't trip on the queue's hot pointer.
     fn releaseWriteResources(self: *Pty) void {
-        if (self.write_watch_id != 0) {
-            _ = c.g_source_remove(self.write_watch_id);
-            self.write_watch_id = 0;
+        if (comptime build_options.glib) {
+            if (self.write_watch_id != 0) {
+                _ = c.g_source_remove(self.write_watch_id);
+                self.write_watch_id = 0;
+            }
         }
         self.write_queue.deinit(std.heap.c_allocator);
     }
@@ -332,6 +338,25 @@ pub const Pty = struct {
     /// further bytes are dropped to bound memory in the hung-child
     /// case) and arm the POLLOUT watch if it isn't already running.
     fn queueBytes(self: *Pty, bytes: []const u8) void {
+        // No GLib main loop (sketerm-mux): drain with a bounded
+        // blocking poll loop instead of a POLLOUT watch. The daemon
+        // writes keystrokes, not bulk data; a full PTY input queue
+        // means a wedged child — give up after ~1 s rather than hang.
+        if (comptime !build_options.glib) {
+            var rest = bytes;
+            var spins: u32 = 0;
+            while (rest.len > 0 and spins < 100) : (spins += 1) {
+                var pfd = [_]c.struct_pollfd{.{ .fd = self.master_fd, .events = c.POLLOUT, .revents = 0 }};
+                _ = c.poll(&pfd, 1, 10);
+                const n = c.write(self.master_fd, rest.ptr, rest.len);
+                if (n > 0) {
+                    rest = rest[@intCast(n)..];
+                } else if (n < 0 and std.posix.errno(n) != .AGAIN and std.posix.errno(n) != .INTR) {
+                    break;
+                }
+            }
+            return;
+        }
         const cap_left = WRITE_QUEUE_CAP -| self.write_queue.items.len;
         const take = @min(bytes.len, cap_left);
         if (take > 0) {
