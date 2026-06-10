@@ -4,8 +4,9 @@
 //! foreground / background / attribute fields. Runs of consecutive
 //! cells almost always share style, so dedup gets ~98 %.
 //!
-//! v1 uses a linear scan for intern. Add a hash if profiling
-//! shows pain.
+//! Intern is a hash lookup on a canonical packed key, with a
+//! last-returned-index fast path for the "same style, many cells"
+//! pattern that dominates real output.
 
 const std = @import("std");
 
@@ -63,8 +64,27 @@ pub const Entry = struct {
     }
 };
 
+/// Canonical packed form of a Color — unions can't be hashed raw
+/// (inactive payload bytes are undefined).
+fn colorKey(col: Color) u32 {
+    return switch (col) {
+        .default => 0,
+        .palette => |p| 0x0100_0000 | @as(u32, p),
+        .rgb => |c| 0x0200_0000 | (@as(u32, c.r) << 16) | (@as(u32, c.g) << 8) | c.b,
+    };
+}
+
+fn entryKey(e: Entry) u128 {
+    return (@as(u128, colorKey(e.fg)) << 96) |
+        (@as(u128, colorKey(e.bg)) << 64) |
+        (@as(u128, colorKey(e.underline_color)) << 32) |
+        @as(u16, @bitCast(e.attrs));
+}
+
 pub const Pool = struct {
     entries: std.ArrayList(Entry) = .empty,
+    /// entryKey → index, kept in lockstep with `entries`.
+    index: std.AutoHashMapUnmanaged(u128, u16) = .empty,
     /// Last-returned index — most call sites re-intern the same entry
     /// many times in a row (a typical TUI emits `\x1b[31m` once and
     /// then prints many cells). One compare wins those without
@@ -76,12 +96,15 @@ pub const Pool = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Pool {
         var p = Pool{ .allocator = allocator };
+        errdefer p.deinit();
         try p.entries.append(allocator, .{}); // index 0 = default
+        try p.index.put(allocator, entryKey(.{}), 0);
         return p;
     }
 
     pub fn deinit(self: *Pool) void {
         self.entries.deinit(self.allocator);
+        self.index.deinit(self.allocator);
     }
 
     /// Returns the index for an existing entry, or appends a new one.
@@ -91,15 +114,17 @@ pub const Pool = struct {
         {
             return self.last_idx;
         }
-        for (self.entries.items, 0..) |existing, i| {
-            if (Entry.equal(existing, e)) {
-                self.last_idx = @intCast(i);
-                return @intCast(i);
-            }
+        if (self.index.get(entryKey(e))) |i| {
+            self.last_idx = i;
+            return i;
         }
         if (self.entries.items.len >= 0xFFFF) return error.PoolFull;
         const idx: u16 = @intCast(self.entries.items.len);
         try self.entries.append(self.allocator, e);
+        self.index.put(self.allocator, entryKey(e), idx) catch |err| {
+            _ = self.entries.pop();
+            return err;
+        };
         self.last_idx = idx;
         return idx;
     }
@@ -121,6 +146,13 @@ pub const Pool = struct {
         self.entries.deinit(self.allocator);
         self.entries = new_entries;
         self.last_idx = 0;
+        // Rebuild the hash index in lockstep. On OOM fall back to a
+        // partially-filled index: misses just re-append, which only
+        // costs duplicate entries, never wrong lookups.
+        self.index.clearRetainingCapacity();
+        for (self.entries.items, 0..) |e, i| {
+            self.index.put(self.allocator, entryKey(e), @intCast(i)) catch break;
+        }
     }
 };
 
