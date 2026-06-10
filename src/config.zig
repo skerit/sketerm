@@ -660,34 +660,7 @@ fn writeColor(w: *std.Io.Writer, key: []const u8, c: [4]f32) !void {
     try w.print("{s} = #{x:0>2}{x:0>2}{x:0>2}\n", .{ key, r, g, b });
 }
 
-/// Create every missing parent directory of `path` via `mkdir(2)`,
-/// like `mkdir -p $(dirname path)`. Used by `save()` and the layout
-/// serialiser. Stays in libc-land since `std.fs.Dir` is gone in 0.16.
-fn makeParentDirs(path: []const u8) !void {
-    const c_module = @import("c.zig").c;
-    const dirname = std.fs.path.dirname(path) orelse return;
-    if (dirname.len == 0) return;
-    var path_z: [4096]u8 = undefined;
-    if (dirname.len >= path_z.len) return error.PathTooLong;
-    var i: usize = 0;
-    while (i < dirname.len) {
-        // Walk forward to the next '/' (or end), then ensure the prefix
-        // exists. Skip the leading '/' on absolute paths so we don't
-        // try to mkdir(""), and skip empty components from "//".
-        const start = i;
-        while (i < dirname.len and dirname[i] != '/') i += 1;
-        if (i == start) {
-            i += 1;
-            continue;
-        }
-        const slice_len = i;
-        @memcpy(path_z[0..slice_len], dirname[0..slice_len]);
-        path_z[slice_len] = 0;
-        // EEXIST is fine — we want idempotent mkdir.
-        _ = c_module.mkdir(@ptrCast(&path_z), 0o755);
-        i += 1;
-    }
-}
+const makeParentDirs = @import("util/pathz.zig").makeParentDirs;
 
 /// Allocates the path; caller frees.
 fn resolveConfigPath(allocator: std.mem.Allocator) ?[]u8 {

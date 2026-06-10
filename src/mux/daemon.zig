@@ -107,14 +107,7 @@ const Client = struct {
     }
 };
 
-/// NUL-terminate `path` into `buf` (paths come from config/CLI and
-/// fit PATH_MAX by construction; errors otherwise).
-fn pathZ(buf: *[4096]u8, path: []const u8) error{BadPath}![*:0]const u8 {
-    if (path.len >= buf.len) return error.BadPath;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    return @ptrCast(buf);
-}
+const pathZ = @import("../util/pathz.zig").pathZ;
 
 /// Bind + listen on a fresh Unix socket. Shared with client.zig's
 /// connect for the sockaddr_un fill.

@@ -94,10 +94,7 @@ pub fn save(layout: Layout, path: []const u8) !void {
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(Layout) {
     var path_z: [4096]u8 = undefined;
-    if (path.len >= path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    const fp = c.fopen(@ptrCast(&path_z), "rb") orelse return error.OpenFailed;
+    const fp = c.fopen(try pathZ(&path_z, path), "rb") orelse return error.OpenFailed;
     defer _ = c.fclose(fp);
     if (c.fseek(fp, 0, c.SEEK_END) != 0) return error.ReadFailed;
     const size_long = c.ftell(fp);
@@ -113,29 +110,9 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(Lay
     });
 }
 
-/// Create every missing parent directory of `path` via `mkdir(2)`,
-/// like `mkdir -p $(dirname path)`. Duplicated from `config.zig` —
-/// both modules predate Zig 0.16's removal of `std.fs.Dir`.
-fn makeParentDirs(path: []const u8) !void {
-    const dirname = std.fs.path.dirname(path) orelse return;
-    if (dirname.len == 0) return;
-    var path_z: [4096]u8 = undefined;
-    if (dirname.len >= path_z.len) return error.PathTooLong;
-    var i: usize = 0;
-    while (i < dirname.len) {
-        const start = i;
-        while (i < dirname.len and dirname[i] != '/') i += 1;
-        if (i == start) {
-            i += 1;
-            continue;
-        }
-        const slice_len = i;
-        @memcpy(path_z[0..slice_len], dirname[0..slice_len]);
-        path_z[slice_len] = 0;
-        _ = c.mkdir(@ptrCast(&path_z), 0o755);
-        i += 1;
-    }
-}
+const pathz_util = @import("util/pathz.zig");
+const makeParentDirs = pathz_util.makeParentDirs;
+const pathZ = pathz_util.pathZ;
 
 pub fn defaultSavePath(allocator: std.mem.Allocator) ![]u8 {
     if (@import("util/profile.zig").getenv("XDG_STATE_HOME")) |xs| {
