@@ -24,12 +24,16 @@ pub const FrameType = enum(u8) {
     detach = 6,
     list = 7,
     kill = 8,
+    // client → daemon (continued; append-only)
+    shutdown = 9,
     // daemon → client
     welcome = 64,
     snapshot = 65,
     events = 66,
     exit = 67,
     gone = 68,
+    ok = 69,
+    err = 70,
     _,
 };
 
