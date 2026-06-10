@@ -175,6 +175,10 @@ const Snapshot = struct {
     search_hash: u64 = 0,
     hints_hash: u64 = 0,
 
+    copy_cursor_on: bool = false,
+    copy_cursor_row: i32 = 0,
+    copy_cursor_col: u16 = 0,
+
     preedit_hash: u64 = 0,
     preedit_len: usize = 0,
 
@@ -758,6 +762,28 @@ pub const GridPass = struct {
             }
         }
 
+        // Copy-mode cursor — hollow amber block, distinct from the
+        // live cursor. Display-row coordinate: shift by view_off like
+        // the search overlay so it tracks while scrolled back.
+        if (screen.copy_cursor) |cc| {
+            const visible_row: i32 = cc.row + @as(i32, @intCast(view_off));
+            if (visible_row >= 0 and visible_row < @as(i32, @intCast(screen.rows)) and
+                cc.col < screen.cols)
+            {
+                const x: f32 = pad + @as(f32, @floatFromInt(cc.col)) * cw;
+                const y: f32 = pad + @as(f32, @floatFromInt(visible_row)) * ch;
+                const amber: [4]f32 = .{ 1.0, 0.72, 0.10, 0.95 };
+                const t: f32 = 2.0;
+                try self.pushQuad(.{ x, y }, .{ cw, t }, .{ 0, 0 }, .{ 0, 0 }, amber, 0.0);
+                try self.pushQuad(.{ x, y + ch - t }, .{ cw, t }, .{ 0, 0 }, .{ 0, 0 }, amber, 0.0);
+                try self.pushQuad(.{ x, y }, .{ t, ch }, .{ 0, 0 }, .{ 0, 0 }, amber, 0.0);
+                try self.pushQuad(.{ x + cw - t, y }, .{ t, ch }, .{ 0, 0 }, .{ 0, 0 }, amber, 0.0);
+                // Faint fill so the cell reads as "current" even on
+                // busy content.
+                try self.pushQuad(.{ x + t, y + t }, .{ cw - 2 * t, ch - 2 * t }, .{ 0, 0 }, .{ 0, 0 }, .{ 1.0, 0.72, 0.10, 0.18 }, 0.0);
+            }
+        }
+
         const w_full: f32 = if (self.canvas_w > 0) self.canvas_w
             else @as(f32, @floatFromInt(screen.cols)) * cw + 2 * pad;
         const h_full: f32 = if (self.canvas_h > 0) self.canvas_h
@@ -873,6 +899,11 @@ pub const GridPass = struct {
         if (screen.preedit_text) |t| {
             s.preedit_hash = std.hash.Wyhash.hash(0, t);
             s.preedit_len = t.len;
+        }
+        if (screen.copy_cursor) |cc| {
+            s.copy_cursor_on = true;
+            s.copy_cursor_row = cc.row;
+            s.copy_cursor_col = cc.col;
         }
         return s;
     }

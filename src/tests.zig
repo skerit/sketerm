@@ -23,6 +23,7 @@ comptime {
     _ = @import("grid/reflow.zig");
     _ = @import("grid/reflow_screen_test.zig");
     _ = @import("grid/url_scan.zig");
+    _ = @import("grid/word_motion.zig");
     _ = @import("layout.zig");
     _ = @import("layout_simple.zig");
     _ = @import("parser/sixel.zig");

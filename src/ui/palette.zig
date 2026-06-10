@@ -40,6 +40,8 @@ const ENTRIES = [_]Entry{
        .desc = "Copy the full scrollback buffer plus the visible screen.", .action = .copy_scrollback },
     .{ .icon = "find-location-symbolic", .title = "Keyboard Hints",
        .desc = "Label URLs, paths, and hashes on screen; type a label to open or copy.", .action = .hints_open },
+    .{ .icon = "edit-select-all-symbolic", .title = "Copy Mode",
+       .desc = "Keyboard-driven selection: move with h/j/k/l, select with v, copy with y.", .action = .copy_mode },
 
     // Tabs
     .{ .icon = "tab-new-symbolic", .title = "New Tab",

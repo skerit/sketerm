@@ -154,6 +154,13 @@ pub const Screen = struct {
     /// Selection (mouse drag).
     selection: @import("selection.zig").Selection = .{},
 
+    /// Copy-mode cursor (keyboard-driven selection). Display-buffer
+    /// coordinates: row 0..rows-1 = active screen, negative =
+    /// scrollback (-1 = bottom-most line). Window owns the mode and
+    /// drives this; null = copy mode inactive. Renderer draws a
+    /// hollow amber block at this cell.
+    copy_cursor: ?CopyCursor = null,
+
     /// Scrollback search results — when non-empty, the renderer
     /// overlays a translucent highlight on every match. The Window
     /// owns the SearchMatch buffer separately for navigation; this
@@ -537,17 +544,9 @@ pub const Screen = struct {
     }
 
     /// Word-class membership for double-click word selection.
-    /// Mirrors xterm's default: ASCII alnum, underscore, plus a small
-    /// "extra" set commonly considered part of paths/URIs.
+    /// Shared with copy mode's w/b motions via word_motion.zig.
     fn isWordChar(self: *const Screen, cp: u32) bool {
-        if (cp == ' ' or cp == 0) return false;
-        if (cp >= 'a' and cp <= 'z') return true;
-        if (cp >= 'A' and cp <= 'Z') return true;
-        if (cp >= '0' and cp <= '9') return true;
-        if (cp >= 0x80) return true; // any non-ASCII codepoint
-        // ASCII punctuation: consult the per-screen word_chars set.
-        for (self.word_chars) |b| if (b == cp) return true;
-        return false;
+        return @import("word_motion.zig").isWordChar(self.word_chars, cp);
     }
 
     /// Set selection to the word containing (row, col). Used by
@@ -1321,6 +1320,12 @@ pub const Screen = struct {
         label: [2]u8,
         label_len: u8,
         typed: u8,
+    };
+
+    pub const CopyCursor = struct {
+        /// Display-row coordinate. Negative = scrollback (-1 = bottom).
+        row: i32,
+        col: u16,
     };
 
     /// Linear scan over scrollback + active (visible) buffer for

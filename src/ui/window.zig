@@ -22,6 +22,10 @@ var always_on_top_warned: bool = false;
 /// Broadcast typing mode. Off / group / all — Terminator semantics.
 pub const GroupSend = enum { off, group, all };
 
+/// Copy-mode selection kind. `cell` = v (char-wise), `line` = V,
+/// `rect` = Ctrl+v / r.
+const CopyModeSel = enum { none, cell, line, rect };
+
 /// Snapshot of a closed tab's restorable state. Owned strings live
 /// in `Window.closed_arena`. Recent ring grows up to 16 entries.
 pub const ClosedTab = struct {
@@ -161,6 +165,18 @@ pub const Window = struct {
     /// Strings owned by `closed_arena`.
     closed_tabs: std.ArrayList(ClosedTab) = .empty,
     closed_arena: ?std.heap.ArenaAllocator = null,
+
+    /// Copy mode (keyboard-driven selection). Raw pane pointer —
+    /// MUST be cleared on pane close, same rule as `search_pane`.
+    /// Cursor uses display-buffer coords (negative row = scrollback),
+    /// the Screen.SearchMatch / Selection convention.
+    copymode_pane: ?*Pane = null,
+    copymode_row: i32 = 0,
+    copymode_col: u16 = 0,
+    /// Active selection kind + the cell where the anchor was dropped.
+    copymode_sel: CopyModeSel = .none,
+    copymode_anchor_row: i32 = 0,
+    copymode_anchor_col: u16 = 0,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         return initWithConfig(allocator, app, null);
@@ -450,6 +466,8 @@ pub const Window = struct {
             self.exitHints();
             return;
         }
+        // Modes are mutually exclusive — both intercept all keys.
+        if (self.copymode_pane != null) self.exitCopyMode();
         const pane = self.focusedPane() orelse return;
         const hints_mod = @import("hints.zig");
         const matches = hints_mod.collectVisible(self.allocator, pane.terminal.screen) catch return;
@@ -662,6 +680,220 @@ pub const Window = struct {
             self.search_idx -= 1;
         }
         self.applyCurrentMatch();
+    }
+
+    // ── Copy mode (keyboard-driven selection) ─────────────────────
+
+    /// Enter copy mode on the focused pane. The copy cursor starts at
+    /// the terminal cursor; every key press is routed through the
+    /// pane input ctx's `copymode_sink` until exit (Esc/q/y/Enter).
+    pub fn openCopyMode(self: *Window) void {
+        if (self.copymode_pane != null) self.exitCopyMode();
+        // Modes are mutually exclusive — both intercept all keys.
+        if (self.hints_pane != null) self.exitHints();
+        const pane = self.focusedPane() orelse return;
+        const ictx = pane.input_ctx orelse return;
+        const screen = pane.terminal.screen;
+        self.copymode_pane = pane;
+        self.copymode_sel = .none;
+        self.copymode_row = @intCast(@min(screen.row, screen.rows -| 1));
+        self.copymode_col = @min(screen.col, screen.cols -| 1);
+        ictx.copymode_sink = onCopyModeKey;
+        ictx.copymode_ctx = @ptrCast(self);
+        self.copyModeRefresh();
+    }
+
+    /// Leave copy mode: uninstall the key sink, drop the overlay
+    /// cursor and any in-progress selection, repaint.
+    pub fn exitCopyMode(self: *Window) void {
+        const pane = self.copymode_pane orelse return;
+        self.copymode_pane = null;
+        self.copymode_sel = .none;
+        if (pane.input_ctx) |ictx| {
+            ictx.copymode_sink = null;
+            ictx.copymode_ctx = null;
+        }
+        const screen = pane.terminal.screen;
+        screen.copy_cursor = null;
+        screen.selection.clear();
+        screen.dirty = true;
+        c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+    }
+
+    /// Copy-mode key dispatch. Returns true when the key is
+    /// consumed; bare modifier presses return false so chords (e.g.
+    /// Ctrl+v) can still assemble in GTK's modifier tracking.
+    fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType) bool {
+        const pane = self.copymode_pane orelse return false;
+        const screen = pane.terminal.screen;
+        const ctrl = (state & c.GDK_CONTROL_MASK) != 0;
+        const row = self.copymode_row;
+        const col: i32 = self.copymode_col;
+        switch (keyval) {
+            c.GDK_KEY_Shift_L, c.GDK_KEY_Shift_R,
+            c.GDK_KEY_Control_L, c.GDK_KEY_Control_R,
+            c.GDK_KEY_Alt_L, c.GDK_KEY_Alt_R,
+            c.GDK_KEY_Super_L, c.GDK_KEY_Super_R,
+            c.GDK_KEY_Hyper_L, c.GDK_KEY_Hyper_R,
+            c.GDK_KEY_Meta_L, c.GDK_KEY_Meta_R,
+            c.GDK_KEY_Caps_Lock, c.GDK_KEY_Num_Lock,
+            => return false,
+            c.GDK_KEY_Escape, c.GDK_KEY_q => self.exitCopyMode(),
+            c.GDK_KEY_y, c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => self.copyModeYank(),
+            c.GDK_KEY_h, c.GDK_KEY_Left => self.copyModeMoveTo(row, col - 1),
+            c.GDK_KEY_l, c.GDK_KEY_Right => self.copyModeMoveTo(row, col + 1),
+            c.GDK_KEY_k, c.GDK_KEY_Up => self.copyModeMoveTo(row - 1, col),
+            c.GDK_KEY_j, c.GDK_KEY_Down => self.copyModeMoveTo(row + 1, col),
+            c.GDK_KEY_0, c.GDK_KEY_Home => self.copyModeMoveTo(row, 0),
+            c.GDK_KEY_dollar, c.GDK_KEY_End => self.copyModeMoveTo(row, copyModeLineEnd(screen, row)),
+            // g / G — scrollback top / live bottom (cursor keeps its
+            // column, mirroring scrollback_top/bottom actions).
+            c.GDK_KEY_g => {
+                const sb: i32 = if (screen.use_alt) 0 else @intCast(screen.scrollbackCount());
+                self.copyModeMoveTo(-sb, col);
+            },
+            c.GDK_KEY_G => self.copyModeMoveTo(@as(i32, @intCast(screen.rows)) - 1, col),
+            c.GDK_KEY_w => self.copyModeWord(.next),
+            c.GDK_KEY_b => self.copyModeWord(.prev),
+            // v = cell-wise anchor toggle; Ctrl+v (or r) = rectangular;
+            // V = line-wise.
+            c.GDK_KEY_v => self.copyModeToggleSel(if (ctrl) .rect else .cell),
+            c.GDK_KEY_V => self.copyModeToggleSel(.line),
+            c.GDK_KEY_r => self.copyModeToggleSel(.rect),
+            // Everything else is swallowed while copy mode is active.
+            else => {},
+        }
+        return true;
+    }
+
+    /// Toggle the selection anchor. Re-pressing the active kind drops
+    /// the anchor; switching kinds keeps the existing anchor cell.
+    fn copyModeToggleSel(self: *Window, kind: CopyModeSel) void {
+        if (self.copymode_sel == kind) {
+            self.copymode_sel = .none;
+        } else {
+            if (self.copymode_sel == .none) {
+                self.copymode_anchor_row = self.copymode_row;
+                self.copymode_anchor_col = self.copymode_col;
+            }
+            self.copymode_sel = kind;
+        }
+        self.copyModeRefresh();
+    }
+
+    /// Move the copy cursor, clamping into the buffer (scrollback top
+    /// .. live bottom) and scrolling the view so it stays visible.
+    fn copyModeMoveTo(self: *Window, row: i32, col: i32) void {
+        const pane = self.copymode_pane orelse return;
+        const screen = pane.terminal.screen;
+        const sb: i32 = if (screen.use_alt) 0 else @intCast(screen.scrollbackCount());
+        const max_row: i32 = @as(i32, @intCast(screen.rows)) - 1;
+        const max_col: i32 = @as(i32, @intCast(screen.cols)) - 1;
+        self.copymode_row = std.math.clamp(row, -sb, max_row);
+        self.copymode_col = @intCast(std.math.clamp(col, 0, max_col));
+        // Keep the cursor on-screen: its visible row is row +
+        // view_offset. Moving past the top scrolls back; past the
+        // bottom scrolls forward (same clamping as scrollback_page_*).
+        const view_off: i32 = @intCast(@min(screen.view_offset, screen.scrollbackCount()));
+        if (self.copymode_row + view_off < 0) {
+            screen.view_offset = @intCast(-self.copymode_row);
+        } else if (self.copymode_row + view_off > max_row) {
+            screen.view_offset = @intCast(max_row - self.copymode_row);
+        }
+        self.copyModeRefresh();
+    }
+
+    const WordDir = enum { next, prev };
+
+    /// w / b — jump to the next / previous word start, wrapping to
+    /// adjacent lines when the current one runs out of words.
+    fn copyModeWord(self: *Window, dir: WordDir) void {
+        const pane = self.copymode_pane orelse return;
+        const screen = pane.terminal.screen;
+        const wm = @import("../grid/word_motion.zig");
+        if (screen.lineCellsAtPub(self.copymode_row)) |cells| {
+            const hit = switch (dir) {
+                .next => wm.nextWordStart(cells, screen.word_chars, self.copymode_col),
+                .prev => wm.prevWordStart(cells, screen.word_chars, self.copymode_col),
+            };
+            if (hit) |c2| {
+                self.copyModeMoveTo(self.copymode_row, @intCast(c2));
+                return;
+            }
+        }
+        const sb: i32 = if (screen.use_alt) 0 else @intCast(screen.scrollbackCount());
+        const max_row: i32 = @as(i32, @intCast(screen.rows)) - 1;
+        var row = self.copymode_row;
+        while (true) {
+            row = if (dir == .next) row + 1 else row - 1;
+            if (row < -sb or row > max_row) return; // buffer edge — stay put
+            const cells = screen.lineCellsAtPub(row) orelse continue;
+            const hit = switch (dir) {
+                .next => wm.firstWordStart(cells, screen.word_chars),
+                .prev => wm.lastWordStart(cells, screen.word_chars),
+            };
+            if (hit) |c2| {
+                self.copyModeMoveTo(row, @intCast(c2));
+                return;
+            }
+        }
+    }
+
+    /// y / Enter — copy the active selection to CLIPBOARD + PRIMARY
+    /// and leave copy mode. No selection → just exits.
+    fn copyModeYank(self: *Window) void {
+        const pane = self.copymode_pane orelse return;
+        const screen = pane.terminal.screen;
+        if (screen.selection.isActive()) blk: {
+            const text = screen.extractSelection(self.allocator) catch break :blk;
+            defer self.allocator.free(text);
+            if (text.len == 0) break :blk;
+            const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch break :blk;
+            defer self.allocator.free(cstr);
+            @memcpy(cstr, text);
+            clipboard.copyToClipboard(@ptrCast(pane.area), cstr);
+            clipboard.copyToPrimary(@ptrCast(pane.area), cstr);
+        }
+        self.exitCopyMode();
+    }
+
+    /// Re-derive `screen.selection` from anchor + cursor, publish the
+    /// overlay cursor, repaint. Called after every copy-mode change.
+    fn copyModeRefresh(self: *Window) void {
+        const pane = self.copymode_pane orelse return;
+        const screen = pane.terminal.screen;
+        const row = self.copymode_row;
+        const col = self.copymode_col;
+        const a_row = self.copymode_anchor_row;
+        const a_col = self.copymode_anchor_col;
+        switch (self.copymode_sel) {
+            .none => screen.selection.clear(),
+            .cell => {
+                // Inclusive both ways: Selection's bottom column is
+                // exclusive, so bump whichever endpoint is later.
+                if (row > a_row or (row == a_row and col >= a_col)) {
+                    screen.selection.start(a_row, a_col, .normal);
+                    screen.selection.extend(row, @as(i32, col) + 1);
+                } else {
+                    screen.selection.start(a_row, @as(i32, a_col) + 1, .normal);
+                    screen.selection.extend(row, col);
+                }
+            },
+            .line => {
+                // Whole lines, anchor row through cursor row.
+                screen.selection.start(@min(a_row, row), 0, .normal);
+                screen.selection.extend(@max(a_row, row), @intCast(screen.cols));
+            },
+            .rect => {
+                const lo: i32 = @min(a_col, col);
+                const hi: i32 = @as(i32, @max(a_col, col)) + 1;
+                screen.selection.start(a_row, lo, .rectangular);
+                screen.selection.extend(row, hi);
+            },
+        }
+        screen.copy_cursor = .{ .row = row, .col = col };
+        screen.dirty = true;
+        c.gtk_gl_area_queue_render(@ptrCast(pane.area));
     }
 
     pub fn present(self: *Window) void {
@@ -2409,6 +2641,7 @@ pub const Window = struct {
         // them before the pane is freed.
         if (self.search_pane == pane) self.closeSearch();
         if (self.hints_pane == pane) self.exitHints();
+        if (self.copymode_pane == pane) self.exitCopyMode();
         _ = self.panes.orderedRemove(found_idx.?);
         const term = pane.terminal;
         for (self.terminals.items, 0..) |t, ti| {
@@ -2835,8 +3068,25 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .show_scrollback => self.openScrollbackPager(),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         .hints_open => self.openHints(),
+        .copy_mode => self.openCopyMode(),
         else => {},
     }
+}
+
+/// input.Ctx copy-mode sink — forwards into the Window method.
+fn onCopyModeKey(ctx: ?*anyopaque, keyval: c_uint, state: c.GdkModifierType) bool {
+    const self = cast.userData(Window, ctx);
+    return self.handleCopyModeKey(keyval, state);
+}
+
+/// Column of the last non-blank cell on a display row ($ motion).
+/// Blank line → column 0.
+fn copyModeLineEnd(screen: *const @import("../grid/screen.zig").Screen, row: i32) i32 {
+    const cells = screen.lineCellsAtPub(row) orelse return 0;
+    var i: usize = cells.len;
+    while (i > 0 and cells[i - 1].rune == 0) i -= 1;
+    if (i == 0) return 0;
+    return @intCast(i - 1);
 }
 
 /// Public entry-point used by the command palette. Tries the
@@ -3600,6 +3850,7 @@ fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
             // dangling pointer into freed Window memory.
             if (self.search_pane == pane) self.closeSearch();
             if (self.hints_pane == pane) self.exitHints();
+            if (self.copymode_pane == pane) self.exitCopyMode();
 
             const term = pane.terminal;
             _ = self.panes.orderedRemove(i);

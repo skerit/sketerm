@@ -48,6 +48,12 @@ pub const Ctx = struct {
     /// exit.
     hint_sink: ?*const fn (ctx: ?*anyopaque, keyval: c_uint) bool = null,
     hint_ctx: ?*anyopaque = null,
+    /// Copy-mode key sink. While set, every key press is routed here
+    /// before bindings / PTY encoding. Returns true = consumed; false
+    /// (bare modifiers) falls through to GTK so modifier state stays
+    /// intact. Window installs/clears this in open/exitCopyMode.
+    copymode_sink: ?*const fn (ctx: ?*anyopaque, keyval: c_uint, state: c.GdkModifierType) bool = null,
+    copymode_ctx: ?*anyopaque = null,
 };
 
 /// Maximum gap between consecutive presses of the same keyval that
@@ -140,6 +146,9 @@ pub const Action = enum {
     /// Keyboard hints / quick-select: label every URL / path / hash
     /// on screen; typing a label opens (URLs) or copies it.
     hints_open,
+    /// Enter copy mode — keyboard-driven cursor + selection over
+    /// screen and scrollback (WezTerm/tmux convention).
+    copy_mode,
 };
 
 /// One configured keybind: a (keyval, modifier-mask) → Action mapping.
@@ -182,6 +191,8 @@ pub const default_bindings = [_]Binding{
     // any new chord in your config if you don't like it.
     .{ .keyval = c.GDK_KEY_p, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .command_palette },
     .{ .keyval = c.GDK_KEY_i, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .toggle_pin_tab },
+    // Ctrl+Shift+X → copy mode (WezTerm's default chord).
+    .{ .keyval = c.GDK_KEY_x, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_mode },
     // Alt+1..9 → jump to specific tab. Standard across browsers,
     // gnome-terminal, kitty, etc. Doesn't collide with shell C-x
     // chords or Ctrl+Shift+digit (which terminator uses for splits).
@@ -283,6 +294,7 @@ pub fn actionName(a: Action) []const u8 {
         .scrollback_bottom => "scrollback_bottom",
         .command_palette => "command_palette",
         .hints_open => "hints_open",
+        .copy_mode => "copy_mode",
     };
 }
 
@@ -345,6 +357,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .scrollback_bottom => "Jump to scrollback bottom",
         .command_palette => "Open command palette",
         .hints_open => "Keyboard hints (open/copy URLs, paths, hashes)",
+        .copy_mode => "Copy mode (keyboard selection)",
     };
 }
 
@@ -539,6 +552,15 @@ fn onKeyPressed(
     // only happens for keys hint mode ignores, e.g. bare modifiers.
     if (ctx.hint_sink) |hs| {
         if (hs(ctx.hint_ctx, keyval)) return 1;
+    }
+
+    // Copy mode owns the keyboard while active — nothing below
+    // (bindings, IME, PTY encoding) sees the key. Bare modifier
+    // presses return false from the sink and fall through so GTK's
+    // modifier tracking stays coherent.
+    if (ctx.copymode_sink) |sink| {
+        if (sink(ctx.copymode_ctx, keyval, state)) return 1;
+        return 0;
     }
 
     // mouse_autohide: hide the pointer over the widget while typing.
