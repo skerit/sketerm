@@ -37,6 +37,8 @@ pub const TabSpec = struct {
     /// Whether the tab was pinned at save time. Defaults to false so
     /// older layout files still parse via `ignore_unknown_fields`.
     pinned: bool = false,
+    /// Tab colour swatch as "#RRGGBB"; null = none.
+    color: ?[]const u8 = null,
 };
 
 pub const Layout = struct {

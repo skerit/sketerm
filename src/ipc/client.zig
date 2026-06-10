@@ -23,6 +23,8 @@ const CLI_HELP =
     \\  focus (--pane N | --tab N)        focus a pane or select a tab
     \\  close-pane [--pane N]             close a pane
     \\  set-title [--tab N | --pane N] <title>
+    \\  set-tab-color [--tab N] <#RRGGBB|none>
+    \\                                    colour swatch on the tab
     \\
     \\Socket resolution: --socket, then $SKETERM_SOCKET (set inside
     \\every sketerm pane), then the single *.sock under

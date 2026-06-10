@@ -1023,6 +1023,9 @@ pub const Window = struct {
         c.adw_tab_page_set_title(page, title_z.ptr);
         c.adw_tab_page_set_tooltip(page, title_z.ptr);
         if (spec.pinned) c.adw_tab_view_set_page_pinned(self.tab_view, page, 1);
+        if (spec.color) |col_str| {
+            if (parseHexRGB(col_str)) |col| self.setTabColor(page, col);
+        }
     }
 
     fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree) !*c.GtkWidget {
@@ -2318,6 +2321,115 @@ pub const Window = struct {
         return c.adw_tab_view_get_selected_page(self.tab_view);
     }
 
+    // ── Per-tab colours ──────────────────────────────────────────
+
+    /// Set or clear a tab's colour: a round 16×16 swatch as the
+    /// page icon, plus the packed value on the GObject so layout
+    /// save and `cli list` can read it back. Marker bit 1<<24
+    /// distinguishes "black" from "unset".
+    pub fn setTabColor(self: *Window, page: *c.AdwTabPage, rgb: ?[3]u8) void {
+        _ = self;
+        if (rgb) |col| {
+            var px: [16 * 16 * 4]u8 = undefined;
+            for (0..16) |yy| {
+                for (0..16) |xx| {
+                    const dx = @as(f32, @floatFromInt(xx)) - 7.5;
+                    const dy = @as(f32, @floatFromInt(yy)) - 7.5;
+                    const inside = dx * dx + dy * dy <= 7.0 * 7.0;
+                    const o = (yy * 16 + xx) * 4;
+                    px[o + 0] = col[0];
+                    px[o + 1] = col[1];
+                    px[o + 2] = col[2];
+                    px[o + 3] = if (inside) 255 else 0;
+                }
+            }
+            const bytes = c.g_bytes_new(&px, px.len);
+            defer c.g_bytes_unref(bytes);
+            const tex = c.gdk_memory_texture_new(16, 16, c.GDK_MEMORY_R8G8B8A8, bytes, 16 * 4) orelse return;
+            c.adw_tab_page_set_icon(page, @ptrCast(@alignCast(tex)));
+            c.g_object_unref(tex);
+            const packed_val: usize = (1 << 24) |
+                (@as(usize, col[0]) << 16) | (@as(usize, col[1]) << 8) | col[2];
+            c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-color", @ptrFromInt(packed_val));
+        } else {
+            c.adw_tab_page_set_icon(page, null);
+            c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-color", null);
+        }
+    }
+
+    fn tabColorOf(page: *c.AdwTabPage) ?[3]u8 {
+        const v = @intFromPtr(c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-tab-color"));
+        if (v & (1 << 24) == 0) return null;
+        return .{ @truncate(v >> 16), @truncate(v >> 8), @truncate(v) };
+    }
+
+    fn parseHexRGB(s: []const u8) ?[3]u8 {
+        const hex = if (s.len > 0 and s[0] == '#') s[1..] else s;
+        if (hex.len != 6) return null;
+        const r = std.fmt.parseInt(u8, hex[0..2], 16) catch return null;
+        const g = std.fmt.parseInt(u8, hex[2..4], 16) catch return null;
+        const b = std.fmt.parseInt(u8, hex[4..6], 16) catch return null;
+        return .{ r, g, b };
+    }
+
+    const TabColorCtx = struct {
+        allocator: std.mem.Allocator,
+        win: *Window,
+        page: *c.AdwTabPage,
+    };
+
+    /// "Tab Colour…" menu entry: GtkColorDialog on the selected tab.
+    /// Picking a fully-transparent colour (alpha ≈ 0) clears it.
+    fn chooseTabColor(self: *Window) void {
+        const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
+        const ctx = self.allocator.create(TabColorCtx) catch return;
+        // Ref the page: the tab may be closed while the dialog is up.
+        _ = c.g_object_ref(@as(?*anyopaque, @ptrCast(page)));
+        ctx.* = .{ .allocator = self.allocator, .win = self, .page = page };
+        const dialog = c.gtk_color_dialog_new();
+        c.gtk_color_dialog_set_with_alpha(dialog, 1);
+        const initial: c.GdkRGBA = if (tabColorOf(page)) |col| .{
+            .red = @as(f32, @floatFromInt(col[0])) / 255.0,
+            .green = @as(f32, @floatFromInt(col[1])) / 255.0,
+            .blue = @as(f32, @floatFromInt(col[2])) / 255.0,
+            .alpha = 1.0,
+        } else .{ .red = 0.8, .green = 0.2, .blue = 0.2, .alpha = 1.0 };
+        c.gtk_color_dialog_choose_rgba(dialog, @ptrCast(self.app_window), &initial, null, @ptrCast(&onTabColorChosen), @ptrCast(ctx));
+    }
+
+    fn onTabColorChosen(source: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(TabColorCtx, user);
+        const dialog: ?*c.GtkColorDialog = @ptrCast(@alignCast(source));
+        const rgba = c.gtk_color_dialog_choose_rgba_finish(dialog, res, null);
+        if (rgba != null) {
+            // Only apply if the page is still alive in the view.
+            if (ctx.win.pageStillOpen(ctx.page)) {
+                if (rgba.*.alpha < 0.01) {
+                    ctx.win.setTabColor(ctx.page, null);
+                } else {
+                    ctx.win.setTabColor(ctx.page, .{
+                        @intFromFloat(std.math.clamp(rgba.*.red, 0.0, 1.0) * 255.0),
+                        @intFromFloat(std.math.clamp(rgba.*.green, 0.0, 1.0) * 255.0),
+                        @intFromFloat(std.math.clamp(rgba.*.blue, 0.0, 1.0) * 255.0),
+                    });
+                }
+            }
+            c.gdk_rgba_free(rgba);
+        }
+        c.g_object_unref(dialog);
+        c.g_object_unref(@as(?*anyopaque, @ptrCast(ctx.page)));
+        ctx.allocator.destroy(ctx);
+    }
+
+    fn pageStillOpen(self: *Window, page: *c.AdwTabPage) bool {
+        const n = c.adw_tab_view_get_n_pages(self.tab_view);
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            if (c.adw_tab_view_get_nth_page(self.tab_view, i) == page) return true;
+        }
+        return false;
+    }
+
     fn ipcDispatchTrampoline(ctx: *anyopaque, req: ipc_protocol.Request, out: *std.ArrayList(u8), allocator: std.mem.Allocator) void {
         const self: *Window = @ptrCast(@alignCast(ctx));
         self.ipcDispatch(req, out, allocator) catch {
@@ -2408,6 +2520,17 @@ pub const Window = struct {
             c.adw_tab_page_set_title(page, z.ptr);
             c.adw_tab_page_set_tooltip(page, z.ptr);
             try ipc_protocol.writeOk(out, allocator, null, {});
+        } else if (eql(u8, req.cmd, "set-tab-color")) {
+            const page = self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
+            const spec = req.data orelse return ipc_protocol.writeErr(out, allocator, "set-tab-color requires data (#RRGGBB or none)");
+            if (eql(u8, spec, "none")) {
+                self.setTabColor(page, null);
+            } else if (parseHexRGB(spec)) |col| {
+                self.setTabColor(page, col);
+            } else {
+                return ipc_protocol.writeErr(out, allocator, "bad color (want #RRGGBB or none)");
+            }
+            try ipc_protocol.writeOk(out, allocator, null, {});
         } else {
             try ipc_protocol.writeErr(out, allocator, "unknown command");
         }
@@ -2446,6 +2569,10 @@ pub const Window = struct {
                 .id = tabPageId(page),
                 .title = if (title_c != null) try arena.dupe(u8, std.mem.span(title_c)) else "",
                 .selected = (page == sel),
+                .color = if (tabColorOf(page)) |col|
+                    try std.fmt.allocPrint(arena, "#{x:0>2}{x:0>2}{x:0>2}", .{ col[0], col[1], col[2] })
+                else
+                    null,
                 .panes = pane_infos.items,
             });
         }
@@ -2928,6 +3055,10 @@ pub const Window = struct {
                 .title = try arena.dupe(u8, title),
                 .tree = tree,
                 .pinned = c.adw_tab_page_get_pinned(page) != 0,
+                .color = if (tabColorOf(page.?)) |col|
+                    try std.fmt.allocPrint(arena, "#{x:0>2}{x:0>2}{x:0>2}", .{ col[0], col[1], col[2] })
+                else
+                    null,
             });
         }
         return .{ .version = 2, .tabs = try tabs.toOwnedSlice(arena) };
@@ -3446,6 +3577,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .duplicate_tab => self.duplicateCurrentTab(),
         .close_tab => self.closeCurrentTab(),
         .rename_tab => self.renameCurrentTab(),
+        .color_tab => self.chooseTabColor(),
         .pin_tab => self.togglePinCurrentTab(),
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("split_h", err),
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch |err| logActionError("split_v", err),

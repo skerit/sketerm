@@ -54,6 +54,8 @@ pub const TabInfo = struct {
     id: u32,
     title: []const u8,
     selected: bool,
+    /// "#rrggbb" when a tab colour is set.
+    color: ?[]const u8 = null,
     panes: []const PaneInfo,
 };
 
