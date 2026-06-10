@@ -4144,3 +4144,29 @@ through it by construction. Five landed steps:
    new/kill subcommands. GUI socket discovery skips mux.sock.
 
 PKGBUILD now installs sketerm-mux. Tests 442 → 450.
+
+## 2026-06-10 — SSH domains: sketerm ssh <host>
+
+Remote durable sessions, mosh-style UX. `sketerm-mux --proxy`
+bridges stdin/stdout to the daemon socket (auto-starting the daemon
+via detached double-fork re-exec of /proc/self/exe). The GUI/TUI
+side runs `ssh -T -o BatchMode=yes <host> sketerm-mux --proxy` over
+a socketpair (Conn.connectSsh; double-forked so init reaps the ssh;
+hello→welcome probe validates the whole bridge before use), so one
+fd carries the protocol and Terminal.Remote needed zero changes.
+BatchMode means key/agent auth required — a password prompt would
+corrupt the protocol pipe (mosh has the same constraint).
+
+UX: `sketerm ssh <host>` = durable remote shell as a tab in the
+running window (sugar for `sketerm mux <host> new`); `sketerm mux
+<host>` = the same TUI against the remote daemon (optional leading
+host on every subcommand); tab titles '⌁ name @ host'. Remote
+spawns send empty argv → daemon uses ITS $SHELL (new default), and
+no cwd. IPC new-durable-tab/attach-session gained a host field.
+$SKETERM_SSH overrides the transport binary.
+
+Verified via fake-ssh wrapper (isolated XDG_RUNTIME_DIR as the
+"remote"): ssh-tab spawn, resize propagation through the proxy,
+GUI kill → session survives in remote daemon → reattach in a fresh
+GUI with the echoed marker intact. Server deploy story: scp the
+libc-only sketerm-mux binary, done.
