@@ -163,6 +163,17 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_group_set_description(@ptrCast(@alignCast(bg_group)), "Window-level transparency. Wayland with compositor support only. Once toggled below 1.0, returning to 1.0 may require a window restart.");
     addSpinRowF32Step(@ptrCast(@alignCast(bg_group)), ctx, "Opacity", "1.0 = opaque; 0.0 = fully transparent.", 0.0, 1.0, 0.05, 2, &ctx.cfg.background_opacity, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(bg_group)));
+
+    // Background image / gradient layer.
+    const bgi_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(bgi_group)), "Background image / gradient");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(bgi_group)), "Image (cover-cropped) wins over the gradient. Gradient is active once both colours are non-transparent.");
+    addEntryRowString(@ptrCast(@alignCast(bgi_group)), ctx, "Image path (PNG/JPEG)", "", &ctx.cfg.background_image, applyOnly);
+    addSpinRowF32Step(@ptrCast(@alignCast(bgi_group)), ctx, "Image opacity", "Keep low — text sits on it.", 0.0, 1.0, 0.05, 2, &ctx.cfg.background_image_opacity, applyOnly);
+    addColorRow(@ptrCast(@alignCast(bgi_group)), ctx, "Gradient from", &ctx.cfg.background_gradient_from);
+    addColorRow(@ptrCast(@alignCast(bgi_group)), ctx, "Gradient to", &ctx.cfg.background_gradient_to);
+    addSpinRowF32Step(@ptrCast(@alignCast(bgi_group)), ctx, "Gradient angle", "0 = left to right, 90 = top to bottom.", 0.0, 360.0, 15.0, 1, &ctx.cfg.background_gradient_angle, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(bgi_group)));
 }
 
 // ── Generic row helpers ─────────────────────────────────────────

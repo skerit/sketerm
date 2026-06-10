@@ -14,6 +14,7 @@ const palette_mod = @import("palette.zig");
 const clipboard = @import("clipboard.zig");
 const Config = @import("../config.zig").Config;
 const ipc_server = @import("../ipc/server.zig");
+const bg_pass_mod = @import("../render/bg_pass.zig");
 const ipc_protocol = @import("../ipc/protocol.zig");
 
 /// One-shot hint. Reset to false at startup; flipped on first
@@ -119,6 +120,10 @@ pub const Window = struct {
     next_pane_id: u32 = 1,
     next_tab_id: u32 = 1,
     ipc: ?*ipc_server.Server = null,
+    /// Shared background-layer source (one image decode for every
+    /// pane). Panes hold a pointer; refreshBgSource mutates + bumps
+    /// the generation.
+    bg_source: bg_pass_mod.Source = .{},
     /// Socket path, computed at init (before any spawn) so every
     /// child gets SKETERM_SOCKET even if the listener starts later.
     ipc_path: ?[:0]u8 = null,
@@ -419,6 +424,9 @@ pub const Window = struct {
         // Resolve keybinds from defaults + Config overrides.
         self.refreshBindings();
 
+        // Background image / gradient layer.
+        self.refreshBgSource();
+
         // Remote-control socket (sketerm cli). Failure is non-fatal:
         // the terminal works fine without scripting.
         if (ipc_server.defaultSocketPath(allocator)) |sock_path| {
@@ -481,6 +489,7 @@ pub const Window = struct {
         self.closed_tabs.deinit(self.allocator);
         if (self.closed_arena) |*a| a.deinit();
         if (self.ipc) |srv| srv.deinit(); // frees ipc_path (server owns it)
+        if (self.bg_source.pixels) |px| c.stbi_image_free(px);
         self.config.deinit();
         self.allocator.destroy(self);
     }
@@ -1256,6 +1265,7 @@ pub const Window = struct {
         pane.mouse_autohide = self.config.mouse_autohide;
         pane.middle_click_action = self.config.mouse_middle_click;
         pane.right_click_action = self.config.mouse_right_click;
+        pane.bg_pass.source = &self.bg_source;
         // Renderer bold flags.
         pane.grid_pass.allow_bold = self.config.allow_bold;
         pane.grid_pass.bold_is_bright = self.config.bold_is_bright;
@@ -2089,6 +2099,17 @@ pub const Window = struct {
         defer old_cfg.deinit();
         self.config = cloned;
 
+        // Background layer: only re-decode when one of its keys
+        // actually moved (image decode is not keystroke-cheap).
+        if (!std.mem.eql(u8, old_cfg.background_image, self.config.background_image) or
+            old_cfg.background_image_opacity != self.config.background_image_opacity or
+            !std.mem.eql(f32, &old_cfg.background_gradient_from, &self.config.background_gradient_from) or
+            !std.mem.eql(f32, &old_cfg.background_gradient_to, &self.config.background_gradient_to) or
+            old_cfg.background_gradient_angle != self.config.background_gradient_angle)
+        {
+            self.refreshBgSource();
+        }
+
         // Push into every pane.
         const eff = self.resolveDefaultColors();
         for (self.panes.items) |p| {
@@ -2319,6 +2340,48 @@ pub const Window = struct {
             return null;
         }
         return c.adw_tab_view_get_selected_page(self.tab_view);
+    }
+
+    // ── Background layer (image / gradient) ─────────────────────
+
+    /// Rebuild bg_source from config: decode the image (if any) or
+    /// arm the gradient. Frees the previous stbi allocation. Call on
+    /// startup and whenever a background_* key may have changed.
+    fn refreshBgSource(self: *Window) void {
+        if (self.bg_source.pixels) |px| {
+            c.stbi_image_free(px);
+            self.bg_source.pixels = null;
+        }
+        self.bg_source.mode = .none;
+
+        const cfg = &self.config;
+        if (cfg.background_image.len > 0) blk: {
+            var path_z_buf: [4096]u8 = undefined;
+            const path_z = std.fmt.bufPrintZ(&path_z_buf, "{s}", .{cfg.background_image}) catch break :blk;
+            var w: c_int = 0;
+            var h: c_int = 0;
+            var n: c_int = 0;
+            const px = c.stbi_load(path_z.ptr, &w, &h, &n, 4);
+            if (px == null) {
+                std.debug.print("sketerm: background_image load failed: {s}\n", .{cfg.background_image});
+                break :blk;
+            }
+            self.bg_source.pixels = px;
+            self.bg_source.w = w;
+            self.bg_source.h = h;
+            self.bg_source.opacity = cfg.background_image_opacity;
+            self.bg_source.mode = .image;
+        }
+        if (self.bg_source.mode == .none and
+            cfg.background_gradient_from[3] > 0 and cfg.background_gradient_to[3] > 0)
+        {
+            self.bg_source.color0 = cfg.background_gradient_from;
+            self.bg_source.color1 = cfg.background_gradient_to;
+            self.bg_source.angle_deg = cfg.background_gradient_angle;
+            self.bg_source.opacity = 1.0;
+            self.bg_source.mode = .gradient;
+        }
+        self.bg_source.generation +%= 1;
     }
 
     // ── Per-tab colours ──────────────────────────────────────────

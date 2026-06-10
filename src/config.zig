@@ -260,6 +260,20 @@ pub const Config = struct {
     /// minimum-contrast.
     minimum_contrast: f32 = 1.0,
 
+    /// Background image (absolute path, PNG/JPEG via stb). Empty =
+    /// off. Drawn cover-cropped behind the cell grid; wins over the
+    /// gradient when both are set.
+    background_image: []const u8 = "",
+    /// Layer alpha for the background image. Keep low — text on
+    /// default bg sits directly on the image.
+    background_image_opacity: f32 = 0.3,
+    /// Two-colour background gradient; active when BOTH colours have
+    /// alpha > 0 (the zeroed default means off).
+    background_gradient_from: [4]f32 = .{ 0, 0, 0, 0 },
+    background_gradient_to: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Gradient direction in degrees: 0 = left→right, 90 = top→bottom.
+    background_gradient_angle: f32 = 90,
+
     /// Custom keybindings. List of (action_name, accelerator) pairs
     /// parsed from `keybind.<action> = <accel>` lines. An entry with
     /// an empty accel unbinds that action; a missing entry inherits
@@ -314,6 +328,7 @@ pub const Config = struct {
         if (self.font_path) |s| out.font_path = try arena.dupe(u8, s);
         out.font_family = try arena.dupe(u8, self.font_family);
         out.font_features = try arena.dupe(u8, self.font_features);
+        out.background_image = try arena.dupe(u8, self.background_image);
         if (self.shell) |s| out.shell = try arena.dupe(u8, s);
         out.scheme = try arena.dupe(u8, self.scheme);
         out.term_env = try arena.dupe(u8, self.term_env);
@@ -565,6 +580,18 @@ pub const Config = struct {
             try w.print("inactive_bg_dim = {d:.2}\n", .{self.inactive_bg_dim});
         if (self.minimum_contrast != 1.0)
             try w.print("minimum_contrast = {d:.2}\n", .{self.minimum_contrast});
+
+        // Background layer.
+        if (self.background_image.len > 0)
+            try w.print("background_image = {s}\n", .{self.background_image});
+        if (self.background_image_opacity != 0.3)
+            try w.print("background_image_opacity = {d:.2}\n", .{self.background_image_opacity});
+        if (!eqColor(self.background_gradient_from, .{ 0, 0, 0, 0 }))
+            try writeColor(w, "background_gradient_from", self.background_gradient_from);
+        if (!eqColor(self.background_gradient_to, .{ 0, 0, 0, 0 }))
+            try writeColor(w, "background_gradient_to", self.background_gradient_to);
+        if (self.background_gradient_angle != 90)
+            try w.print("background_gradient_angle = {d:.1}\n", .{self.background_gradient_angle});
 
         // Per-pane titlebar.
         if (self.show_titlebar) try w.writeAll("show_titlebar = true\n");
@@ -913,6 +940,16 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.background_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "minimum_contrast")) {
         cfg.minimum_contrast = std.math.clamp(try parseFloat(value), 1.0, 21.0);
+    } else if (std.mem.eql(u8, key, "background_image")) {
+        cfg.background_image = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "background_image_opacity")) {
+        cfg.background_image_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
+    } else if (std.mem.eql(u8, key, "background_gradient_from")) {
+        cfg.background_gradient_from = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "background_gradient_to")) {
+        cfg.background_gradient_to = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "background_gradient_angle")) {
+        cfg.background_gradient_angle = try parseFloat(value);
     } else if (std.mem.eql(u8, key, "inactive_fg_dim")) {
         cfg.inactive_fg_dim = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "inactive_bg_dim")) {

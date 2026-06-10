@@ -33,6 +33,7 @@ comptime {
     _ = @import("ui/hints.zig");
     _ = @import("ui/pane.zig");
     _ = @import("ipc/protocol.zig");
+    _ = @import("render/bg_pass.zig");
     _ = @import("render/atlas_test.zig");
     _ = @import("render/atlas.zig");
     _ = @import("render/cell_pass.zig");

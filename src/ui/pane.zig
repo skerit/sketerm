@@ -14,6 +14,7 @@ const Atlas = @import("../render/atlas.zig").Atlas;
 const GridPass = @import("../render/grid_pass.zig").GridPass;
 const CellPass = @import("../render/cell_pass.zig").CellPass;
 const ImagePass = @import("../render/image_pass.zig").ImagePass;
+const BgPass = @import("../render/bg_pass.zig").BgPass;
 const ImageStore = @import("../grid/image_store.zig").Store;
 const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -45,6 +46,7 @@ pub const Pane = struct {
     grid_pass: GridPass,
     cell_pass: CellPass,
     image_pass: ImagePass = ImagePass.init(),
+    bg_pass: BgPass = .{},
     image_store: ImageStore,
     allocator: std.mem.Allocator,
     input_ctx: ?*input.Ctx = null,
@@ -851,12 +853,14 @@ fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         self.grid_pass.forgetGL();
         self.cell_pass.forgetGL();
         self.image_pass.forgetGL();
+        self.bg_pass.forgetGL();
         self.image_store.forgetGL();
         return;
     }
     self.grid_pass.releaseGL();
     self.cell_pass.releaseGL();
     self.image_pass.releaseGL();
+    self.bg_pass.releaseGL();
     self.image_store.releaseGL();
     if (self.atlas) |a| a.releaseGL();
 }
@@ -884,6 +888,7 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     self.grid_pass.forgetGL();
     self.cell_pass.forgetGL();
     self.image_pass.forgetGL();
+    self.bg_pass.forgetGL();
     self.image_store.forgetGL();
 
     // Resolution order: explicit Pane.font_path → Pane.font_family
@@ -911,6 +916,10 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         std.debug.print("pane realize: image_pass realize failed\n", .{});
         return;
     };
+    self.bg_pass.realize() catch {
+        std.debug.print("pane realize: bg_pass realize failed\n", .{});
+        return;
+    };
 
     // Cell metrics into image store so placements get pixel coords.
     self.image_store.cell_w = @floatFromInt(self.atlas.?.cell_w);
@@ -935,6 +944,10 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
 
     self.grid_pass.canvas_w = @floatFromInt(phys_w);
     self.grid_pass.canvas_h = @floatFromInt(phys_h);
+
+    // Background layer (gradient / image) — under everything,
+    // including kitty below-text images.
+    self.bg_pass.draw(phys_w, phys_h);
 
     // is_focused is kept in sync by onFocusEnter/onFocusLeave;
     // skipping the GTK call shaves a few hundred ns per render.
