@@ -4170,3 +4170,43 @@ Verified via fake-ssh wrapper (isolated XDG_RUNTIME_DIR as the
 GUI kill → session survives in remote daemon → reattach in a fresh
 GUI with the echoed marker intact. Server deploy story: scp the
 libc-only sketerm-mux binary, done.
+
+## 2026-06-10 — UDP transport (mosh-style) + TUI create-new row
+
+- **TUI**: the picker now ends with a selectable "+ create new
+  session" row (Enter there = `n`), so creating works without
+  knowing the keybinding. Selection spans sessions + that row.
+- **Encrypted UDP transport** — `sketerm ssh -u <host>` /
+  `sketerm mux udp:<host>`. Declined reading mosh's source (GPL-3 vs
+  our MIT); built from the published SSP concepts instead:
+  - `mux/rudp.zig`: pure state machine. Datagrams sealed with
+    ChaCha20-Poly1305 (std.crypto); 64-bit crypto seq is both nonce
+    (direction byte prevents cross-peer reuse) and anti-replay
+    sliding window (checked only AFTER authentication). Roaming:
+    transports update the peer address only from packets that
+    authenticated. On top: go-back-N byte stream — 1200 B segments,
+    cumulative acks piggybacked on data, RTO 80ms→1s backoff, 3 s
+    keepalives, BYE teardown. Tests drive two channels through a
+    deterministic lossy network: 64 KB through 30% loss arrives
+    intact + ordered; replay/tamper/wrong-key all silently dropped;
+    a fully-eaten window recovers via RTO.
+  - `sketerm-mux --udp-listen` (remote end, started over ssh):
+    binds an ephemeral port, prints "SKETERM-UDP <port> <key>" up
+    the ssh pipe, double-forks free of ssh, bridges UDP↔daemon
+    socket. Exits on BYE or if NO client ever authenticates within
+    60 s (abandoned bootstrap); once authenticated it persists —
+    that persistence is the roaming story. `--udp-connect` is the
+    local socketpair bridge; getaddrinfo for resolution; user@ is
+    stripped for the UDP destination. Everything downstream
+    (Conn, Terminal.Remote, daemon) is untouched — the fd just
+    happens to be a socketpair to an encrypted-UDP pump.
+  - Zig 0.16 notes: std.crypto.random + std.time.milliTimestamp are
+    gone in this context — getentropy(3) + clock_gettime(MONOTONIC)
+    via libc. netinet/in.h, arpa/inet.h, netdb.h added to
+    cimport_root.h.
+  Verified via the fake-ssh rig end-to-end over real UDP sockets:
+  list, `ssh -u` tab spawn, marker, GUI kill, session survives,
+  reattach over a FRESH bootstrap (new port + key) with content
+  intact; no leaked bridge processes after disconnect.
+
+Tests 450 → 454.
