@@ -381,6 +381,14 @@ pub const Pane = struct {
         c.gtk_widget_add_controller(area_widget, @ptrCast(motion));
         c.gtk_widget_set_has_tooltip(area_widget, 1);
 
+        // File drag & drop → paste shell-quoted path(s). Accepts file
+        // lists from file managers and plain text as fallback.
+        const drop = c.gtk_drop_target_new(c.G_TYPE_INVALID, @intCast(c.GDK_ACTION_COPY));
+        var drop_types = [_]c.GType{ c.gdk_file_list_get_type(), c.G_TYPE_STRING };
+        c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
+        _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onFileDrop), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(area_widget, @ptrCast(drop));
+
         // Focus reporting (DECSET 1004). Apps that opt in get
         // \x1b[I on enter, \x1b[O on leave.
         const focus = c.gtk_event_controller_focus_new();
@@ -1084,6 +1092,96 @@ fn onPointerShapeEvent(ctx: ?*anyopaque, name: []const u8) void {
     @memcpy(buf[0..name.len], name);
     buf[name.len] = 0;
     c.gtk_widget_set_cursor_from_name(@ptrCast(self.area), &buf);
+}
+
+fn shellSafeChar(b: u8) bool {
+    return switch (b) {
+        'a'...'z', 'A'...'Z', '0'...'9', '_', '.', '/', '-', '+', ':', '@', '%', '=', ',' => true,
+        else => false,
+    };
+}
+
+/// Single-quote a path for the shell unless every byte is safe bare.
+/// Embedded single quotes become the standard '\'' dance.
+fn appendShellQuoted(list: *std.ArrayList(u8), allocator: std.mem.Allocator, path: []const u8) !void {
+    var safe = path.len > 0;
+    for (path) |b| {
+        if (!shellSafeChar(b)) {
+            safe = false;
+            break;
+        }
+    }
+    if (safe) {
+        try list.appendSlice(allocator, path);
+        return;
+    }
+    try list.append(allocator, '\'');
+    for (path) |b| {
+        if (b == '\'') {
+            try list.appendSlice(allocator, "'\\''");
+        } else {
+            try list.append(allocator, b);
+        }
+    }
+    try list.append(allocator, '\'');
+}
+
+fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(Pane, user);
+
+    if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) != 0) {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));
+        // get_files is transfer-container: free the list, not the GFiles.
+        const files = c.gdk_file_list_get_files(flist);
+        defer c.g_slist_free(files);
+        var node = files;
+        while (node != null) : (node = node.*.next) {
+            const gfile: ?*c.GFile = @ptrCast(node.*.data);
+            const path_c = c.g_file_get_path(gfile);
+            if (path_c == null) continue; // non-local URI (e.g. sftp://)
+            defer c.g_free(path_c);
+            if (out.items.len > 0) out.append(self.allocator, ' ') catch return 0;
+            const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_c)));
+            appendShellQuoted(&out, self.allocator, path) catch return 0;
+        }
+        if (out.items.len == 0) return 0;
+        // Trailing space so the user can keep typing arguments.
+        out.append(self.allocator, ' ') catch return 0;
+        clipboard.pasteText(self.terminal, out.items);
+        _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        return 1;
+    }
+
+    if (c.g_type_check_value_holds(value, c.G_TYPE_STRING) != 0) {
+        const s = c.g_value_get_string(value);
+        if (s == null) return 0;
+        const txt = std.mem.span(@as([*:0]const u8, @ptrCast(s)));
+        if (txt.len == 0) return 0;
+        clipboard.pasteText(self.terminal, txt);
+        _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        return 1;
+    }
+
+    return 0;
+}
+
+test "appendShellQuoted passes safe paths bare, quotes the rest" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+
+    try appendShellQuoted(&out, a, "/home/user/file.txt");
+    try std.testing.expectEqualStrings("/home/user/file.txt", out.items);
+
+    out.clearRetainingCapacity();
+    try appendShellQuoted(&out, a, "/tmp/my file (1).png");
+    try std.testing.expectEqualStrings("'/tmp/my file (1).png'", out.items);
+
+    out.clearRetainingCapacity();
+    try appendShellQuoted(&out, a, "/tmp/it's.txt");
+    try std.testing.expectEqualStrings("'/tmp/it'\\''s.txt'", out.items);
 }
 
 fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {

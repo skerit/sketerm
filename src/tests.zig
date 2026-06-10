@@ -31,6 +31,7 @@ comptime {
     _ = @import("parser/kitty_image.zig");
     _ = @import("ui/input.zig");
     _ = @import("ui/hints.zig");
+    _ = @import("ui/pane.zig");
     _ = @import("render/atlas_test.zig");
     _ = @import("render/atlas.zig");
     _ = @import("render/cell_pass.zig");

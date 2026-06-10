@@ -37,15 +37,16 @@ fn onPasteRead(source: ?*c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) 
     defer c.g_free(text_ptr);
 
     const cstr: [*:0]const u8 = @ptrCast(text_ptr);
-    const len = std.mem.len(cstr);
-    if (len == 0) return;
+    pasteText(term, cstr[0..std.mem.len(cstr)]);
+}
 
-    // Wrap with bracketed-paste markers only when mode 2004 enabled.
-    // When bracketed: scrub embedded ESC bytes so a pasted "\x1b[201~"
-    // can't break out of the wrapping early (xterm convention).
+/// Send pasted text to the PTY, honouring bracketed paste.
+/// When bracketed: scrub embedded ESC bytes so a pasted "\x1b[201~"
+/// can't break out of the wrapping early (xterm convention).
+pub fn pasteText(term: *Terminal, pasted: []const u8) void {
+    if (pasted.len == 0) return;
     if (term.screen.bracketed_paste) {
         term.writeUserInput("\x1b[200~");
-        const pasted = cstr[0..len];
         var start: usize = 0;
         for (pasted, 0..) |b, i| {
             if (b == 0x1B) {
@@ -53,10 +54,10 @@ fn onPasteRead(source: ?*c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) 
                 start = i + 1;
             }
         }
-        if (start < len) term.writeUserInput(pasted[start..len]);
+        if (start < pasted.len) term.writeUserInput(pasted[start..]);
         term.writeUserInput("\x1b[201~");
     } else {
-        term.writeUserInput(cstr[0..len]);
+        term.writeUserInput(pasted);
     }
 }
 
