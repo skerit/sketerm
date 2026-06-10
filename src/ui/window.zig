@@ -16,6 +16,7 @@ const Config = @import("../config.zig").Config;
 const ipc_server = @import("../ipc/server.zig");
 const bg_pass_mod = @import("../render/bg_pass.zig");
 const ipc_protocol = @import("../ipc/protocol.zig");
+const pathZ = @import("../util/pathz.zig").pathZ;
 
 /// One-shot hint. Reset to false at startup; flipped on first
 /// `always_on_top = true` so we don't spam the log on every
@@ -1692,13 +1693,11 @@ pub const Window = struct {
         const layout_simple = @import("../layout_simple.zig");
         // Zig 0.16's `std.fs.cwd().openFile` requires an `Io`. Use libc.
         var path_z: [4096]u8 = undefined;
-        if (path.len >= path_z.len) {
+        const p = pathZ(&path_z, path) catch {
             std.debug.print("sketerm: path too long: {s}\n", .{path});
             return false;
-        }
-        @memcpy(path_z[0..path.len], path);
-        path_z[path.len] = 0;
-        const fp = c.fopen(@ptrCast(&path_z), "rb") orelse {
+        };
+        const fp = c.fopen(p, "rb") orelse {
             std.debug.print("sketerm: cannot open {s}\n", .{path});
             return false;
         };
@@ -3590,10 +3589,8 @@ pub const Window = struct {
         // Existence check via libc. F_OK = 0 in POSIX; Aro translates
         // the F_OK macro fine but it's only accessible inside `c.`.
         var path_z: [4096]u8 = undefined;
-        if (path.len >= path_z.len) return false;
-        @memcpy(path_z[0..path.len], path);
-        path_z[path.len] = 0;
-        if (c.access(@ptrCast(&path_z), c.F_OK) != 0) return false;
+        const p = pathZ(&path_z, path) catch return false;
+        if (c.access(p, c.F_OK) != 0) return false;
 
         var parsed = layout_mod.load(self.allocator, path) catch |err| {
             std.debug.print("sketerm: cannot load default layout {s}: {s}\n", .{ path, @errorName(err) });

@@ -10,6 +10,7 @@ comptime {
     _ = @import("util/utf8.zig");
     _ = @import("util/percent.zig");
     _ = @import("util/pathz.zig");
+    _ = @import("shim_drift_test.zig");
     _ = @import("parser/event.zig");
     _ = @import("parser/vt.zig");
     _ = @import("parser/conformance_test.zig");

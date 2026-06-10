@@ -16,6 +16,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const kitty = @import("../parser/kitty_image.zig");
+const pathZ = @import("../util/pathz.zig").pathZ;
 
 pub const Frame = struct {
     rgba: []u8,
@@ -587,10 +588,8 @@ pub const Manager = struct {
         // Zig 0.16's `std.fs.openFileAbsolute` now needs an `Io`. We
         // link libc, so use it directly.
         var path_z: [4096]u8 = undefined;
-        if (path.len >= path_z.len) return error.BadFile;
-        @memcpy(path_z[0..path.len], path);
-        path_z[path.len] = 0;
-        const fp = c.fopen(@ptrCast(&path_z), "rb") orelse return error.BadFile;
+        const p = pathZ(&path_z, path) catch return error.BadFile;
+        const fp = c.fopen(p, "rb") orelse return error.BadFile;
         defer _ = c.fclose(fp);
         if (c.fseek(fp, 0, c.SEEK_END) != 0) return error.BadFile;
         const size_long = c.ftell(fp);
