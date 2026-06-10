@@ -961,6 +961,61 @@ pub const GridPass = struct {
         }
     }
 
+    /// SGR line decorations (underline / double / curly / strike /
+    /// overline) for one overlay cell at its visual column. CellPass
+    /// draws these in-shader for plain rows; overlay rows get flat
+    /// quads here — curly degrades to a thicker single line since
+    /// this pass has no wave fragment path. Honours SGR 58
+    /// underline_color, falling back to the resolved fg.
+    fn emitCellDeco(
+        self: *GridPass,
+        pool: *const StylePool,
+        cell: Cell,
+        visual_col: usize,
+        y: f32,
+        cw: f32,
+        ch: f32,
+        x_scale: f32,
+    ) !void {
+        if ((cell.flags & 0b0000_0010) != 0) return; // wide continuation
+        const style = pool.get(cell.style_ref);
+        const a = style.attrs;
+        const has_line = a.underline or a.double_underline or a.curly_underline;
+        if (!has_line and !a.strikethrough and !a.overline) return;
+
+        var fg = self.resolveColor(if (a.reverse) style.bg else style.fg, !a.reverse);
+        if (a.dim) {
+            fg[0] *= 0.65;
+            fg[1] *= 0.65;
+            fg[2] *= 0.65;
+        }
+        const color = switch (style.underline_color) {
+            .default => fg,
+            else => self.resolveColor(style.underline_color, true),
+        };
+
+        const is_wide = (cell.flags & 0b0000_0001) != 0;
+        const x: f32 = self.pad + @as(f32, @floatFromInt(visual_col)) * cw * x_scale;
+        const w: f32 = cw * x_scale * (if (is_wide) @as(f32, 2.0) else 1.0);
+        const thin: f32 = @max(1.0, ch / 14.0);
+
+        if (a.double_underline) {
+            try self.pushQuadDim(.{ x, y + ch - thin - 1.0 }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
+            try self.pushQuadDim(.{ x, y + ch - 3.0 * thin - 1.0 }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
+        } else if (a.curly_underline) {
+            const thick = thin * 2.0;
+            try self.pushQuadDim(.{ x, y + ch - thick - 1.0 }, .{ w, thick }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
+        } else if (a.underline) {
+            try self.pushQuadDim(.{ x, y + ch - thin - 1.0 }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
+        }
+        if (a.strikethrough) {
+            try self.pushQuadDim(.{ x, y + ch * 0.5 - thin * 0.5 }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
+        }
+        if (a.overline) {
+            try self.pushQuadDim(.{ x, y }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
+        }
+    }
+
     fn emitLogicalGlyphs(
         self: *GridPass,
         atlas: *Atlas,
@@ -1026,6 +1081,12 @@ pub const GridPass = struct {
             }
             col += 1;
         }
+
+        // Decorations draw even on spaces/empty cells (underlined
+        // whitespace is meaningful), so this is a separate sweep.
+        for (cells, 0..) |cell, dcol| {
+            try self.emitCellDeco(pool, cell, dcol, y + y_origin_shift, cw, ch, x_scale);
+        }
     }
 
     fn emitBidiGlyphs(
@@ -1087,6 +1148,12 @@ pub const GridPass = struct {
             const baseline_y: f32 = y + ch;
             const colored_f: f32 = if (g.colored) 1.0 else 0.0;
             try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f);
+        }
+
+        // Decorations at visual columns — separate sweep so
+        // underlined spaces still draw.
+        for (indices, 0..) |logical, visual| {
+            try self.emitCellDeco(pool, cells[logical], visual, y + y_origin_shift, cw, ch, x_scale);
         }
     }
 
