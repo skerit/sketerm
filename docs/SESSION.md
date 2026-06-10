@@ -3797,3 +3797,75 @@ a NULL pointer leaves contents undefined (GL ES 3.0 spec); AMD/radeonsi
 left residue in the 1-texel inter-glyph padding, and the faux-bold path
 (which samples one texel left of each glyph) picked it up as a faint
 vertical line on narrow bold glyphs (`i`, `l`, `v`).
+
+## 2026-06-10 — full-codebase review sweep
+
+Multi-agent review of every subsystem followed by fixes; 411 → 420
+tests, all green.
+
+### Ghost / stale cell fixes (grid)
+
+- Erase paths (ED 0/1/2/3, EL, ECH, ICH/DCH) and `toggleAltScreen`
+  never removed entries from the cluster side-table, so combining
+  marks survived a `clear` / alt-screen round-trip attached to blank
+  cells. All erase paths now clear the affected cluster ranges; the
+  alt toggle drops the table wholesale (keys are coordinates in the
+  active buffer) and resets `last_print_cp`.
+- Overwriting half of a wide (CJK) pair left the orphan half behind:
+  an orphaned wide-left kept drawing the old glyph, an orphaned
+  continuation rendered as a permanently blank column. New
+  `splitWidePair()` blanks both halves; called from `printCp`,
+  `fastAsciiSlice` (boundary cells only — interior pairs are fully
+  overwritten), the erase paths, and ICH/DCH.
+- ECH (`CSI n X`) computed `col + n` in u16 — a large param wrapped
+  and erased nothing. Clamped in u32 against `cols`.
+- `scrollUp`/`scrollDown` shift loops copied cells/id/continues_above
+  but dropped `scaling`, so DECDWL/DECDHL lines lost their size on
+  scroll; recycled blank rows now also reset to `.single`.
+
+### Parser
+
+- `byteEscape` wrote the 5th intermediate byte out of bounds (write
+  before the `< 4` guard; sibling handlers had it right).
+
+### UI lifetime
+
+- `Pane.onTick` returned G_SOURCE_CONTINUE after the child-exit
+  callback — with `exit_action = close` the pane is freed and the
+  next frame ticked into freed memory. Now returns REMOVE.
+- `closeFocusedPane` left `Window.search_pane` dangling (the tab-close
+  path already handled it); the pane-title popover now verifies its
+  pane is still in `window.panes` before dereferencing.
+- `setFontSize` rebuilt the atlas without invalidating either render
+  pass; the fresh atlas starts at generation 0 — equal to the passes'
+  last-seen generations — so eviction detection never fired and stale
+  UVs sampled a blank texture. Now marks all rows dirty + drops the
+  grid-pass vbuf.
+
+### Config ownership
+
+- `Config.cloneInto`/`clone`: deep-copy strings, keybinds, profiles.
+- `applyConfigChange` previously adopted `new_cfg.arena` and leaked
+  the old arena on every prefs change / reload. Now clones into a
+  fresh window-owned arena, frees the old one at function end, and
+  re-points pane slices (`font_path`, `active_profile`) at the new
+  copies. `reloadConfigFromDisk` frees its loaded config.
+- The prefs dialog working copy was a shallow struct copy aliasing the
+  window's arena — now cloned into the dialog's own arena. Keybind
+  appends used the GPA on an arena-backed list (leak); fixed.
+- config.conf larger than the 64 KiB read buffer now warns instead of
+  silently dropping trailing sections.
+
+### Misc
+
+- KP_Enter sends its dedicated kitty codepoint 57414 (press + release)
+  instead of being indistinguishable from Return.
+- Layout save serializes the pane's actual spawn argv (stored on Pane
+  at spawn) instead of collapsing every pane to $SHELL — `ssh host` /
+  `nvim .` tabs now survive a save/restore round-trip.
+
+### Reviewed and rejected
+
+- "Rotating VBO slots draw stale data" — false alarm: uploads write
+  the full instance buffer and `vbo_slot` only advances inside the
+  upload, so `draw()` always binds the most recently written slot.
