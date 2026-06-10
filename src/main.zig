@@ -166,11 +166,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return @import("ipc/mux_cli.zig").run(allocator, mux_args);
     }
 
-    // `sketerm ssh <host>` — mosh-style: open a durable remote shell
-    // on <host> as a tab in the running window. Sugar for
-    // `sketerm mux <host> new`.
+    // `sketerm ssh [-u] <host>` — mosh-style: open a durable remote
+    // shell on <host> as a tab in the running window. Sugar for
+    // `sketerm mux [udp:]<host> new`. -u picks the encrypted UDP
+    // transport (lower latency, roams across network changes).
     if (argv.len >= 3 and std.mem.eql(u8, std.mem.span(argv[1]), "ssh")) {
-        const ssh_args = [_][]const u8{ std.mem.span(argv[2]), "new" };
+        const use_udp = std.mem.eql(u8, std.mem.span(argv[2]), "-u");
+        if (use_udp and argv.len < 4) return 2;
+        const host_raw = std.mem.span(argv[if (use_udp) 3 else 2]);
+        var host_buf: [300]u8 = undefined;
+        const host: []const u8 = if (use_udp)
+            std.fmt.bufPrint(&host_buf, "udp:{s}", .{host_raw}) catch return 2
+        else
+            host_raw;
+        const ssh_args = [_][]const u8{ host, "new" };
         return @import("ipc/mux_cli.zig").run(allocator, &ssh_args);
     }
 

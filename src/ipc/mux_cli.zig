@@ -112,6 +112,12 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
 
 fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn {
     if (host) |h| {
+        if (std.mem.startsWith(u8, h, "udp:")) {
+            return mux_client.Conn.connectUdp(allocator, h[4..]) catch {
+                _ = c.fprintf(c.stderr, "sketerm mux: UDP transport failed (key auth? sketerm-mux on the host? UDP not filtered?)\n");
+                return null;
+            };
+        }
         return mux_client.Conn.connectSsh(allocator, h) catch {
             _ = c.fprintf(c.stderr, "sketerm mux: ssh transport to host failed (key auth? sketerm-mux installed there?)\n");
             return null;
@@ -214,6 +220,8 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
     var drawn_lines: usize = 0;
     while (true) {
         const sessions = parsed.value.sessions;
+        // The list has one virtual trailing row: "create new session".
+        const n_rows = sessions.len + 1;
         drawTui(sessions, selected, &drawn_lines);
 
         var buf: [8]u8 = undefined;
@@ -228,12 +236,15 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
         const is_up = (key.len == 1 and key[0] == 'k') or std.mem.eql(u8, key, "\x1b[A");
         const is_down = (key.len == 1 and key[0] == 'j') or std.mem.eql(u8, key, "\x1b[B");
         if (is_up and selected > 0) selected -= 1;
-        if (is_down and sessions.len > 0 and selected < sessions.len - 1) selected += 1;
+        if (is_down and selected < n_rows - 1) selected += 1;
 
         if (key.len == 1 and (key[0] == '\r' or key[0] == '\n')) {
-            if (sessions.len == 0) continue;
             eraseTui(&drawn_lines);
             raw.leave();
+            if (selected >= sessions.len) {
+                // The "create new" row.
+                return if (guiCommand(allocator, "new-durable-tab", null, host)) 0 else 1;
+            }
             const name = sessions[selected].name;
             if (guiCommand(allocator, "attach-session", name, host)) {
                 _ = c.printf("attached '%.*s'\n", @as(c_int, @intCast(name.len)), name.ptr);
@@ -246,7 +257,7 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
             raw.leave();
             return if (guiCommand(allocator, "new-durable-tab", null, host)) 0 else 1;
         }
-        if (key.len == 1 and key[0] == 'x' and sessions.len > 0) {
+        if (key.len == 1 and key[0] == 'x' and selected < sessions.len) {
             const name = sessions[selected].name;
             if (muxConnect(allocator, host)) |conn_v| {
                 var conn = conn_v;
@@ -269,10 +280,6 @@ fn drawTui(sessions: []const SessionInfo, selected: usize, drawn_lines: *usize) 
     eraseTui(drawn_lines);
     _ = c.printf("\x1b[1msketerm sessions\x1b[0m  (Enter attach · n new · x kill · q quit)\r\n");
     var lines: usize = 1;
-    if (sessions.len == 0) {
-        _ = c.printf("  \x1b[2m(none — press n to start one)\x1b[0m\r\n");
-        lines += 1;
-    }
     for (sessions, 0..) |s, i| {
         const marker: [*:0]const u8 = if (i == selected) "\x1b[7m \xe2\x96\xb8 " else "   ";
         _ = c.printf(
@@ -289,6 +296,10 @@ fn drawTui(sessions: []const SessionInfo, selected: usize, drawn_lines: *usize) 
         );
         lines += 1;
     }
+    // Virtual trailing row: create a new session (same as `n`).
+    const new_marker: [*:0]const u8 = if (selected >= sessions.len) "\x1b[7m \xe2\x96\xb8 " else "   ";
+    _ = c.printf("%s\x1b[32m+ create new session\x1b[39m\x1b[27m\r\n", new_marker);
+    lines += 1;
     _ = c.fflush(c.stdout);
     drawn_lines.* = lines;
 }

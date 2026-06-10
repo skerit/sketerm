@@ -58,6 +58,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+/* UDP transport (sketerm-mux --udp-listen / --udp-connect). */
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
 #include <glib-unix.h>
 #include <regex.h>

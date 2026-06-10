@@ -2349,7 +2349,13 @@ pub const Window = struct {
     fn muxConnect(self: *Window, host: ?[]const u8) !@import("../mux/client.zig").Conn {
         const mux_client = @import("../mux/client.zig");
         const mux_daemon = @import("../mux/daemon.zig");
-        if (host) |h| return mux_client.Conn.connectSsh(self.allocator, h);
+        if (host) |h| {
+            // "udp:host" selects the mosh-style encrypted UDP
+            // transport (ssh bootstrap, then roaming datagrams).
+            if (std.mem.startsWith(u8, h, "udp:"))
+                return mux_client.Conn.connectUdp(self.allocator, h[4..]);
+            return mux_client.Conn.connectSsh(self.allocator, h);
+        }
         const path = try mux_daemon.defaultSocketPath(self.allocator);
         defer self.allocator.free(path);
 
