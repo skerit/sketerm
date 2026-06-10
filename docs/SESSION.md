@@ -4272,3 +4272,19 @@ Tests 454 → 466.
   reproducible win.)
 - Styled line clears use @memset (no measured delta; consistency
   with clear()).
+
+## 2026-06-11 (later): images over the mux
+
+- Daemon-side kitty file fetch (mux/kitty_inline.zig): t=f/t=t/t=s
+  transmissions name files on the daemon's host; the daemon reads
+  them and rewrites the APC to inline t=d before broadcasting.
+  File-mode kitty graphics now work over SSH/UDP mux — something
+  plain kitty-over-ssh cannot do. Tempfile/shm cleanup honored
+  daemon-side; 6MB raw cap keeps frames under the 16MB wire limit.
+- Snapshot v2: Screen.retain_images (daemon-only) keeps owned
+  copies of every placed image (12MB budget, oldest evicted,
+  delete commands pruned); snapshot carries them; the client
+  replays into the pane ImageStore after attach (stale placements
+  flushed first). Images survive detach/reattach.
+- smoke-mux gained an image stage covering the whole loop
+  headlessly. Tests 466 -> 470.
