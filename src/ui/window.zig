@@ -113,6 +113,9 @@ pub const Window = struct {
     tab_counter: u32 = 0,
     debug_events: bool = false,
     debug_images: bool = false,
+    /// --hold: per-invocation exit_action override. Lives outside
+    /// Config so a SIGUSR1 config reload can't clear it.
+    hold_override: bool = false,
     config: Config = .{},
     /// Scrollback search (Ctrl+F).
     search_bar: ?*c.GtkWidget = null,
@@ -3402,7 +3405,8 @@ fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
 fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {
     const self = cast.userData(Window, ctx);
     _ = status;
-    switch (self.config.exit_action) {
+    const action = if (self.hold_override) .hold else self.config.exit_action;
+    switch (action) {
         .close => self.closePane(pane),
         .restart => {
             // Spawn a fresh shell in a new pane and replace the

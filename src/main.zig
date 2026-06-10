@@ -13,6 +13,7 @@ const App = struct {
     restore: bool = false,
     layout_path: ?[]const u8 = null,
     no_save: bool = false,
+    hold: bool = false,
     debug_events: bool = false,
     debug_images: bool = false,
     config_path: ?[]const u8 = null,
@@ -30,6 +31,9 @@ const HELP_TEXT =
     \\                        $XDG_STATE_HOME/sketerm/default.json if
     \\                        present — see save_default_layout action.)
     \\  --no-save             Don't write last.json on exit
+    \\  --hold                Keep panes open after their command exits
+    \\                        (overrides exit_action from config; handy
+    \\                        with --layout one-shot commands)
     \\  --config <path>       Load config from <path> instead of XDG default
     \\  --toggle              Show/hide the running instance (Quake mode).
     \\                        Bind your compositor's keyboard shortcut to
@@ -254,6 +258,8 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
             g_app.layout_path = g_app.allocator.dupe(u8, v) catch null;
         } else if (std.mem.eql(u8, a, "--no-save")) {
             g_app.no_save = true;
+        } else if (std.mem.eql(u8, a, "--hold")) {
+            g_app.hold = true;
         } else if (std.mem.eql(u8, a, "--debug-events")) {
             g_app.debug_events = true;
         } else if (std.mem.eql(u8, a, "--debug-images")) {
@@ -311,6 +317,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     };
     window.debug_events = g_app.debug_events;
     window.debug_images = g_app.debug_images;
+    window.hold_override = g_app.hold;
     g_app.window = window;
 
     var loaded = false;
