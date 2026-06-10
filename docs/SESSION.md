@@ -4057,3 +4057,30 @@ registered in tests.zig.
   socket cleanup on SIGTERM.
 
 Tests 437 → 441 (protocol parse/serialize, feature parsing).
+
+## 2026-06-10 — smoke-e2e, mouse bindings, per-tab colours
+
+- **smoke-e2e** (`zig build smoke-e2e`) — first end-to-end test of
+  the real app, enabled by the IPC work: forks zig-out/bin/sketerm
+  under a private SKETERM_APP_ID, waits for the socket, then asserts
+  list shows panes, a send-text echo round-trips into get-text
+  output (polled until the marker appears twice — typed + output),
+  split adds a pane, unknown commands error, and SIGTERM unlinks the
+  socket. SKIPs without a display. Run step depends on the install
+  step and pins cwd to the project root.
+- **Configurable mouse bindings** — mouse_middle_click /
+  mouse_right_click config keys (menu | paste_primary |
+  paste_clipboard | none). menu.PrePopupFn now returns bool: false
+  vetoes the popover, letting paneMenuPrePopup run a rebound
+  right-click action instead (PuTTY-style paste). Only acts when
+  mouse_mode == 0; disable_mouse_paste still wins for middle.
+  Combo rows in prefs Mouse group.
+- **Per-tab colours** — round 16×16 GdkMemoryTexture swatch set as
+  the AdwTabPage icon (GdkTexture implements GIcon). Entry points:
+  right-click "Tab Colour…" (GtkColorDialog, async ctx refs the page
+  so closing the tab mid-dialog is safe; alpha≈0 clears) and
+  `sketerm cli set-tab-color --tab N '#RRGGBB'|none`. Packed colour
+  lives in g_object_set_data ("sketerm-tab-color", bit 24 = set
+  marker), surfaces in `cli list` as "color", and persists through
+  layout save/restore via the new TabSpec.color field (old layouts
+  parse fine — defaults null).
