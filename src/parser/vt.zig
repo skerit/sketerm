@@ -295,8 +295,10 @@ pub const Parser = struct {
         switch (b) {
             0x00...0x17, 0x19, 0x1C...0x1F => emit(ctx, .{ .execute = b }),
             0x20...0x2F => {
-                self.csi.intermediates[self.csi.n_intermediates] = b;
-                if (self.csi.n_intermediates < 4) self.csi.n_intermediates += 1;
+                if (self.csi.n_intermediates < 4) {
+                    self.csi.intermediates[self.csi.n_intermediates] = b;
+                    self.csi.n_intermediates += 1;
+                }
                 self.transitionTo(.escape_intermediate);
             },
             0x30...0x4F, 0x51...0x57, 0x59, 0x5A, 0x5C, 0x60...0x7E => {
