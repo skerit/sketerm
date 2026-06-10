@@ -128,17 +128,28 @@ fn runProxy(allocator: std.mem.Allocator) u8 {
         .{ .fd = 0, .events = cc.POLLIN, .revents = 0 },
         .{ .fd = conn.fd, .events = cc.POLLIN, .revents = 0 },
     };
+    // Test hook: SKETERM_MUX_DELAY_MS sleeps before forwarding each
+    // chunk in both directions, simulating a high-latency link
+    // (RTT ≈ 2 × value) for predictive-echo testing.
+    var delay_us: c_uint = 0;
+    if (cc.getenv("SKETERM_MUX_DELAY_MS")) |v| {
+        const span = std.mem.span(@as([*:0]const u8, @ptrCast(v)));
+        if (std.fmt.parseInt(c_uint, span, 10)) |ms| delay_us = ms * 1000 else |_| {}
+    }
+
     var buf: [32768]u8 = undefined;
     while (true) {
         if (cc.poll(&fds, fds.len, -1) < 0) continue;
         if (fds[0].revents & (cc.POLLIN | cc.POLLHUP) != 0) {
             const n = cc.read(0, &buf, buf.len);
             if (n <= 0) return 0;
+            if (delay_us != 0) _ = cc.usleep(delay_us);
             if (!writeFull(conn.fd, buf[0..@intCast(n)])) return 0;
         }
         if (fds[1].revents & (cc.POLLIN | cc.POLLHUP) != 0) {
             const n = cc.read(conn.fd, &buf, buf.len);
             if (n <= 0) return 0;
+            if (delay_us != 0) _ = cc.usleep(delay_us);
             if (!writeFull(1, buf[0..@intCast(n)])) return 0;
         }
         if (fds[0].revents & cc.POLLERR != 0 or fds[1].revents & cc.POLLERR != 0) return 0;

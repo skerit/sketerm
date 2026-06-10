@@ -175,6 +175,7 @@ const Snapshot = struct {
     search_active_idx: i32 = -1,
     search_hash: u64 = 0,
     hints_hash: u64 = 0,
+    predictions_hash: u64 = 0,
 
     copy_cursor_on: bool = false,
     copy_cursor_row: i32 = 0,
@@ -548,6 +549,35 @@ pub const GridPass = struct {
             }
         }
 
+        // Predictive-echo overlay (remote panes): speculative glyphs
+        // in the default fg, underlined to read as unconfirmed —
+        // the real echo overwrites the cell and the overlay empties.
+        for (screen.predictions_overlay) |pc| {
+            const visible_row: i32 = @as(i32, pc.row) + @as(i32, @intCast(view_off));
+            if (visible_row < 0 or visible_row >= @as(i32, @intCast(screen.rows))) continue;
+            if (pc.col >= screen.cols) continue;
+            const x: f32 = pad + @as(f32, @floatFromInt(pc.col)) * cw;
+            const y: f32 = pad + @as(f32, @floatFromInt(visible_row)) * ch;
+            const fg = self.default_fg;
+            const color: [4]f32 = .{ fg[0], fg[1], fg[2], 0.85 };
+            if (atlas.lookupOrLoad(pc.cp, false, false) catch null) |g| {
+                if (g.w != 0 and g.h != 0) {
+                    const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x));
+                    const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y));
+                    try self.pushGlyphQuad(
+                        .{ gx, gy },
+                        .{ @floatFromInt(g.w), @floatFromInt(g.h) },
+                        .{ g.u0, g.v0 },
+                        .{ g.u1, g.v1 },
+                        @floatFromInt(g.layer),
+                        color,
+                    );
+                }
+            }
+            const t: f32 = 1.0;
+            try self.pushQuad(.{ x, y + ch - 2 }, .{ cw, t }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0);
+        }
+
         // Auto-detected URL underlines. Per-row scan results live in
         // `row_url_matches`; rows whose cache is still valid skip the
         // O(cols) `scanRow` call and just re-emit cached matches. The
@@ -890,6 +920,7 @@ pub const GridPass = struct {
             .search_active_idx = screen.search_active_idx,
             .search_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(screen.search_highlights)),
             .hints_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(screen.hints_overlay)),
+            .predictions_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(screen.predictions_overlay)),
 
             .bell_at_us = screen.bell_at_us,
 

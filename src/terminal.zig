@@ -18,6 +18,9 @@ const percent = @import("util/percent.zig");
 const mux_client = @import("mux/client.zig");
 const mux_wire = @import("mux/wire.zig");
 const mux_snapshot = @import("mux/snapshot.zig");
+const predict_mod = @import("mux/predict.zig");
+const cell_mod = @import("grid/cell.zig");
+const profile_util = @import("util/profile.zig");
 
 /// SPSC ring capacity — power of 2; one Event per slot. Sized to
 /// absorb roughly 100ms of worker throughput at 16384 × 96B = 1.5MB.
@@ -110,6 +113,11 @@ pub const Terminal = struct {
         watch_id: c_uint = 0,
         /// Set when the daemon said GONE/EXIT — no more writes.
         closed: bool = false,
+        /// Predictive local echo (mosh-style). The expiry timer only
+        /// runs while predictions are outstanding, so echo-less input
+        /// (password prompts) flushes even when no events arrive.
+        predictor: predict_mod.Predictor,
+        expire_timer: c_uint = 0,
 
         pub fn sendInput(self: *Remote, bytes: []const u8) void {
             if (self.closed) return;
@@ -148,7 +156,12 @@ pub const Terminal = struct {
         remote.* = .{
             .conn = conn,
             .session = try allocator.dupe(u8, session_name),
+            .predictor = predict_mod.Predictor.init(allocator),
         };
+        if (profile_util.getenv("SKETERM_PREDICT")) |v| {
+            if (std.mem.eql(u8, v, "always")) remote.predictor.force = .always;
+            if (std.mem.eql(u8, v, "never")) remote.predictor.force = .never;
+        }
         errdefer allocator.free(remote.session);
 
         self.* = .{
@@ -251,6 +264,13 @@ pub const Terminal = struct {
                     self.screen.apply(ev);
                     ev.deinit(self.allocator);
                 }
+                if (self.remote) |remote| {
+                    remote.predictor.reconcile(
+                        .{ .ctx = @ptrCast(self), .cpAt = predictCpAt },
+                        profile_util.milliTimestamp(),
+                    );
+                    self.syncPredictions();
+                }
             },
             .snapshot => {
                 if (frame.payload.len < 8) return;
@@ -264,6 +284,11 @@ pub const Terminal = struct {
                 self.screen = fresh;
                 self.wireScreenSink();
                 old.deinit();
+                // Predicted positions are meaningless on a new grid.
+                if (self.remote) |remote| {
+                    remote.predictor.pending.clearRetainingCapacity();
+                    remote.predictor.overlay.clearRetainingCapacity();
+                }
                 if (self.on_render_request) |f| f(self.user_ctx);
             },
             .exit, .gone => self.remoteClosed("session ended"),
@@ -462,11 +487,76 @@ pub const Terminal = struct {
     /// this — those bytes are responses TO this PTY (DA, DSR, OSC 52,
     /// kitty kbd reports) and must not be broadcast.
     pub fn writeUserInput(self: *Terminal, bytes: []const u8) void {
+        // Predictive echo speculates on keystrokes only — parser
+        // replies and mouse reports go through writeRaw directly and
+        // must not disturb the prediction state.
+        if (self.remote) |remote| {
+            if (!remote.closed) {
+                remote.predictor.onInput(
+                    bytes,
+                    self.screen.row,
+                    self.screen.col,
+                    self.screen.cols,
+                    self.screen.use_alt,
+                    profile_util.milliTimestamp(),
+                );
+                self.syncPredictions();
+                self.ensurePredictTimer();
+            }
+        }
         if (self.broadcast_sink) |f| {
             f(self.broadcast_ctx, self, bytes);
             return;
         }
         self.writeRaw(bytes);
+    }
+
+    /// Active-screen cell reader for prediction reconcile. Returns
+    /// U+FFFD for anything a simple prediction can't match (alt
+    /// screen, clusters, out of range) so the predictor self-clears.
+    fn predictCpAt(ctx: ?*anyopaque, row: u16, col: u16) u21 {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        const s = self.screen;
+        if (s.use_alt or row >= s.rows or col >= s.cols) return 0xFFFD;
+        const cell = s.cellAt(row, col).*;
+        const fl: cell_mod.Flags = @bitCast(cell.flags);
+        if (fl.is_cluster or fl.is_wide_left or fl.is_wide_cont) return 0xFFFD;
+        return @intCast(cell.rune & 0x1FFFFF);
+    }
+
+    /// Mirror the predictor's visible cells into the Screen overlay
+    /// and redraw when it changed.
+    fn syncPredictions(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        const cells = remote.predictor.visibleCells();
+        const prev = self.screen.predictions_overlay;
+        self.screen.predictions_overlay = cells;
+        if (prev.len != 0 or cells.len != 0) {
+            self.screen.dirty = true;
+            if (self.on_render_request) |f| f(self.user_ctx);
+        }
+    }
+
+    /// Run the expiry sweep while predictions are outstanding, so
+    /// echo-less input (password prompts) can't pin stale glyphs.
+    fn ensurePredictTimer(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        if (remote.expire_timer != 0) return;
+        if (remote.predictor.pending.items.len == 0) return;
+        remote.expire_timer = c.g_timeout_add(250, @ptrCast(&predictTimerCb), @ptrCast(self));
+    }
+
+    fn predictTimerCb(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *Terminal = @ptrCast(@alignCast(user.?));
+        const remote = self.remote orelse return 0;
+        if (remote.predictor.expire(profile_util.milliTimestamp())) {
+            self.syncPredictions();
+        }
+        if (remote.predictor.pending.items.len == 0) {
+            remote.expire_timer = 0;
+            return 0;
+        }
+        return 1;
     }
 
     pub fn deinit(self: *Terminal) void {
@@ -476,6 +566,8 @@ pub const Terminal = struct {
             self.drain.terminal = null;
             self.drain.alive.store(false, .release);
             if (remote.watch_id != 0) _ = c.g_source_remove(remote.watch_id);
+            if (remote.expire_timer != 0) _ = c.g_source_remove(remote.expire_timer);
+            remote.predictor.deinit();
             if (!remote.closed) remote.conn.sendFrame(.detach, "") catch {};
             remote.conn.deinit();
             self.allocator.free(remote.session);

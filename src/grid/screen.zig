@@ -175,6 +175,12 @@ pub const Screen = struct {
     /// buffer; rows are DISPLAY rows captured at collect time.
     hints_overlay: []const HintOverlay = &.{},
 
+    /// Predictive-echo overlay (remote panes). Speculative glyphs
+    /// drawn underlined at active-screen cells until the real echo
+    /// arrives; the Terminal's Predictor owns the buffer and keeps
+    /// it empty unless display is warranted.
+    predictions_overlay: []const @import("../mux/predict.zig").Cell = &.{},
+
     pool: *Pool,
     allocator: std.mem.Allocator,
 
