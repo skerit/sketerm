@@ -174,3 +174,36 @@ test "kitty parser.py: incomplete UTF-8 split across feed() calls" {
     h.feed("\x80");
     try std.testing.expectEqual(@as(u16, 2), h.screen.col);
 }
+
+test "OSC payload with UTF-8 bytes containing 0x9C is not truncated" {
+    // ✳ is E2 9C B3 — the 0x9C continuation byte must NOT be treated
+    // as an 8-bit ST. The pre-fix behaviour cut the title there and
+    // printed " Claude Code" into the grid at the cursor (the exact
+    // "ghost text" seen with Claude Code, whose title/spinner glyphs
+    // ✳/✓ all carry 0x9C). Only BEL / ESC \ terminate.
+    var h = try Harness.init(std.testing.allocator, 40, 2);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1b]0;\xE2\x9C\xB3 Claude Code\x07");
+    // Nothing printed: cursor untouched, row empty.
+    try std.testing.expectEqual(@as(u16, 0), h.screen.row);
+    try std.testing.expectEqual(@as(u16, 0), h.screen.col);
+    const r0 = try h.line(std.testing.allocator, 0);
+    defer std.testing.allocator.free(r0);
+    try std.testing.expectEqualStrings("", r0);
+    // Ground state: following text prints normally.
+    h.feed("ok");
+    const r0b = try h.line(std.testing.allocator, 0);
+    defer std.testing.allocator.free(r0b);
+    try std.testing.expectEqualStrings("ok", r0b);
+}
+
+test "OSC with ESC backslash terminator still dispatches cleanly" {
+    var h = try Harness.init(std.testing.allocator, 40, 2);
+    defer h.deinit();
+    h.arm();
+    h.feed("\x1b]2;title \xE2\x9C\x93 done\x1b\\after");
+    const r0 = try h.line(std.testing.allocator, 0);
+    defer std.testing.allocator.free(r0);
+    try std.testing.expectEqualStrings("after", r0);
+}

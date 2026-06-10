@@ -502,7 +502,15 @@ pub const Parser = struct {
                 else => self.transitionTo(.dcs_ignore),
             },
             .dcs_passthrough => {
-                if (b == 0x07 or b == 0x9C) {
+                // NOTE: raw 0x9C (8-bit ST) is deliberately NOT a
+                // terminator in any string state. This is a UTF-8
+                // terminal: 0x9C occurs as a continuation byte in
+                // common codepoints (✓ = E2 9C 93, ✳ = E2 9C B3), and
+                // honouring it mid-payload truncates the string and
+                // dumps the tail into the grid as printed text.
+                // Matches kitty/ghostty/xterm-in-UTF-8: only BEL and
+                // ESC \ terminate.
+                if (b == 0x07) {
                     self.dispatchDcs(emit, ctx);
                     self.transitionTo(.ground);
                 } else if (b == 0x1B) {
@@ -519,7 +527,7 @@ pub const Parser = struct {
                 }
             },
             .dcs_ignore => {
-                if (b == 0x07 or b == 0x9C) self.transitionTo(.ground);
+                if (b == 0x07) self.transitionTo(.ground);
             },
             else => unreachable,
         }
@@ -527,7 +535,10 @@ pub const Parser = struct {
 
     fn byteOsc(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
         switch (b) {
-            0x07, 0x9C => self.dispatchOsc(emit, ctx),
+            // Raw 0x9C is NOT a terminator — see the dcs_passthrough
+            // comment. UTF-8 payloads (titles with ✓/✳/emoji) carry
+            // 0x9C as a continuation byte.
+            0x07 => self.dispatchOsc(emit, ctx),
             0x1B => {
                 // 7-bit ST: dispatch then enter escape state to
                 // consume the trailing '\'.
@@ -548,7 +559,7 @@ pub const Parser = struct {
 
     fn byteApc(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
         switch (b) {
-            0x07, 0x9C => self.dispatchApc(emit, ctx),
+            0x07 => self.dispatchApc(emit, ctx),
             0x1B => {
                 self.dispatchApc(emit, ctx);
                 self.transitionTo(.escape);
@@ -568,7 +579,7 @@ pub const Parser = struct {
     fn byteSosPm(self: *Parser, b: u8, _: EmitFn, _: ?*anyopaque) void {
         // SOS / PM: no payload exposed in v1.
         switch (b) {
-            0x07, 0x9C => self.transitionTo(.ground),
+            0x07 => self.transitionTo(.ground),
             0x1B => self.transitionTo(.escape),
             else => {},
         }

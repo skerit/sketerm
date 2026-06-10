@@ -3891,3 +3891,23 @@ outlines (FreeType won't rasterize COLR to BGRA on the plain load
 path); CBDT/sbix is the common case on Linux. smoke-cell now draws
 U+1F600 and counts "yellowish" pixels (soft check — passes mono-only
 on machines without a colour emoji font).
+
+## 2026-06-10 — "ghost text" root cause: raw 0x9C terminating OSC
+
+The long-standing "ghost text in Claude Code's input that never gets
+erased" was NOT an erase/damage bug. Captured a real Claude Code
+session via a pty.fork harness and replayed it through the parser
+(`zig build replay -- capture.bin cols rows`, new debug tool): the
+grid itself contained an injected " Claude Code" fragment. Root cause:
+the parser honoured raw 0x9C as an 8-bit ST inside OSC/DCS/APC/SOS-PM
+strings. In a UTF-8 terminal 0x9C is a continuation byte of very
+common codepoints — ✳ (E2 9C B3) and ✓ (E2 9C 93), which Claude Code
+puts in its window title and updates constantly. The title OSC got
+truncated mid-payload and the tail was printed into the grid at the
+cursor position. A diff-based TUI renderer (Ink) never repaints cells
+it believes are blank, so the garbage stayed — "doesn't get erased".
+Fix: only BEL and ESC \ terminate string sequences (matches
+kitty/ghostty/xterm-in-UTF-8). The existing kitty conformance test
+("C1 controls handled as printable") already encoded this stance for
+ground state; the string states were the leftover. Regression tests
+feed the exact ✳-title sequence.

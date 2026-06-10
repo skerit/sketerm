@@ -87,6 +87,25 @@ pub fn build(b: *std.Build) void {
     const shell_step = b.step("spike-shell", "Headless PTY/parser/screen smoke");
     shell_step.dependOn(&shell_run.step);
 
+    // Capture replay tool — `zig build replay -- capture.bin [cols rows]`.
+    const replay_mod = b.createModule(.{
+        .root_source_file = b.path("src/replay.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureSysDeps(b, replay_mod, cbindings_mod);
+    const replay = b.addExecutable(.{
+        .name = "sketerm-replay",
+        .root_module = replay_mod,
+        .use_lld = true,
+    });
+    b.installArtifact(replay);
+    const replay_run = b.addRunArtifact(replay);
+    if (b.args) |args| replay_run.addArgs(args);
+    const replay_step = b.step("replay", "Replay a captured PTY byte stream into a Screen dump");
+    replay_step.dependOn(&replay_run.step);
+
     // Parser microbenchmark — `zig build bench-parser`.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench_parser.zig"),
