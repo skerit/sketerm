@@ -4249,3 +4249,26 @@ Tests 450 → 454.
   port-range setup.
 
 Tests 454 → 466.
+
+## 2026-06-11: performance pass (drain budget, style pool, bench truth)
+
+- mainDrain budget: 4096 events / ~3ms per drain, then re-arm via
+  the drain_pending coalescing. Output floods (cat largefile) no
+  longer own the main thread; painting + input interleave.
+- StylePool intern: hash map on a canonical packed key (unions
+  can't hash raw — colorKey packs tag+payload). last_idx fast path
+  kept. Microbench truth: NO delta at <16 styles, but the new
+  truecolor-gradient workload (4096 unique styles — chafa/timg
+  half-block images, gradient prompts) goes 3.4 -> ~150 MB/s (45x):
+  the linear scan was quadratic in unique styles.
+- "Vectorize the parser" turned out already done (scanPrintable is
+  16-wide SIMD; csi_param batches digit runs). perf shows remaining
+  bench time is eraseDisplay/scrollUp memory bandwidth — no parser
+  work left worth taking.
+- Measurement honesty: bench-parser varies ~2x run-to-run with CPU
+  power state on this laptop. Compare best-of-N runs only. (An
+  earlier same-session claim of doubled throughput from the pool
+  change was variance; the gradient number above is the real,
+  reproducible win.)
+- Styled line clears use @memset (no measured delta; consistency
+  with clear()).
