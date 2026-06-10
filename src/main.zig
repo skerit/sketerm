@@ -33,6 +33,14 @@ const HELP_TEXT =
     \\                         $SKETERM_SOCKET/$SKETERM_PANE_ID are
     \\                         preset; `--pane self` self-addresses.
     \\
+    \\Durable sessions (sketerm-mux):
+    \\  sketerm mux            TUI picker: attach / spawn / kill
+    \\                         daemon-backed sessions that survive
+    \\                         GUI restarts. Also: mux list / attach
+    \\                         <name> / new / kill <name>. Create one
+    \\                         from the command palette ("New Durable
+    \\                         Tab") or `sketerm cli new-durable-tab`.
+    \\
     \\Options:
     \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json
     \\  --layout <path>       Load tabs from a layout file (.json or .layout)
@@ -142,6 +150,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer allocator.free(cli_args);
         for (argv[2..], 0..) |a, n| cli_args[n] = std.mem.span(a);
         return @import("ipc/client.zig").run(allocator, cli_args);
+    }
+
+    // `sketerm mux ...` — durable-session manager (TUI picker with
+    // no further arguments). Also socket-only; no GApplication.
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "mux")) {
+        const mux_args = allocator.alloc([]const u8, argv.len - 2) catch return 1;
+        defer allocator.free(mux_args);
+        for (argv[2..], 0..) |a, n| mux_args[n] = std.mem.span(a);
+        return @import("ipc/mux_cli.zig").run(allocator, mux_args);
     }
 
     var i: usize = 1;

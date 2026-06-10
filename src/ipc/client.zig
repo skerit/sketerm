@@ -127,7 +127,7 @@ fn parsePaneArg(arg: []const u8) ?u32 {
     return std.fmt.parseInt(u32, arg, 10) catch null;
 }
 
-fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
+pub fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
     if (arg) |a| return allocator.dupeZ(u8, a) catch null;
     if (c.getenv("SKETERM_SOCKET")) |env| {
         return allocator.dupeZ(u8, std.mem.span(env)) catch null;
@@ -143,6 +143,9 @@ fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
     while (c.g_dir_read_name(dir)) |name_c| {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(name_c)));
         if (!std.mem.endsWith(u8, name, ".sock")) continue;
+        // The mux daemon's socket lives in the same dir; it speaks a
+        // different protocol and must never match GUI discovery.
+        if (std.mem.eql(u8, name, "mux.sock")) continue;
         if (found != null) {
             allocator.free(found.?);
             _ = c.fprintf(c.stderr, "sketerm cli: multiple instances; pass --socket\n");
