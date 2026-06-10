@@ -173,6 +173,7 @@ const Snapshot = struct {
     search_count: u32 = 0,
     search_active_idx: i32 = -1,
     search_hash: u64 = 0,
+    hints_hash: u64 = 0,
 
     preedit_hash: u64 = 0,
     preedit_len: usize = 0,
@@ -501,6 +502,43 @@ pub const GridPass = struct {
             try self.pushQuad(.{ x, y }, .{ w, ch }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0);
         }
 
+        // Keyboard-hints overlay (quick-select). Per match: a
+        // translucent highlight over the range plus a label badge at
+        // its start — opaque accent bg with the label glyphs on top,
+        // already-typed prefix chars rendered dimmer.
+        for (screen.hints_overlay) |hm| {
+            if (hm.row >= screen.rows) continue;
+            const y: f32 = pad + @as(f32, @floatFromInt(hm.row)) * ch;
+            const x: f32 = pad + @as(f32, @floatFromInt(hm.col_start)) * cw;
+            const w: f32 = @as(f32, @floatFromInt(hm.col_end -| hm.col_start)) * cw;
+            // Range highlight — translucent teal so it reads as
+            // distinct from the yellow search overlay.
+            try self.pushQuad(.{ x, y }, .{ w, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ 0.15, 0.65, 0.65, 0.30 }, 0.0);
+            // Label badge bg.
+            const badge_w: f32 = @as(f32, @floatFromInt(hm.label_len)) * cw;
+            try self.pushQuad(.{ x, y }, .{ badge_w, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ 0.95, 0.75, 0.10, 1.0 }, 0.0);
+            // Label glyphs (bold, dark on the badge).
+            var li: u8 = 0;
+            while (li < hm.label_len) : (li += 1) {
+                const g = atlas.lookupOrLoad(hm.label[li], true, false) catch continue;
+                if (g.w == 0 or g.h == 0) continue;
+                const lx: f32 = x + @as(f32, @floatFromInt(li)) * cw + @as(f32, @floatFromInt(g.bearing_x));
+                const ly: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y));
+                const color: [4]f32 = if (li < hm.typed)
+                    .{ 0.45, 0.35, 0.05, 1.0 } // typed prefix — dim
+                else
+                    .{ 0.08, 0.06, 0.0, 1.0 };
+                try self.pushGlyphQuad(
+                    .{ lx, ly },
+                    .{ @floatFromInt(g.w), @floatFromInt(g.h) },
+                    .{ g.u0, g.v0 },
+                    .{ g.u1, g.v1 },
+                    @floatFromInt(g.layer),
+                    color,
+                );
+            }
+        }
+
         // Auto-detected URL underlines. Per-row scan results live in
         // `row_url_matches`; rows whose cache is still valid skip the
         // O(cols) `scanRow` call and just re-emit cached matches. The
@@ -820,6 +858,7 @@ pub const GridPass = struct {
             .search_count = @intCast(screen.search_highlights.len),
             .search_active_idx = screen.search_active_idx,
             .search_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(screen.search_highlights)),
+            .hints_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(screen.hints_overlay)),
 
             .bell_at_us = screen.bell_at_us,
 

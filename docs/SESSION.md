@@ -3938,3 +3938,27 @@ Three gaps vs kitty/wezterm closed:
   that form too. CellPass Instance carries `deco_color` (120 B);
   the deco pass draws with it. Overlay (bidi) rows still draw
   decorations-as-before — SGR underline colour there is a known gap.
+
+## 2026-06-10 — keyboard hints / quick-select mode
+
+kitty-hints/WezTerm-QuickSelect equivalent, bound to Ctrl+Shift+E
+(action `hints_open`, also in the command palette). `src/ui/hints.zig`
+scans the visible rows (scrollback-aware via view_offset) for OSC 8
+link runs, plain URLs (reusing url_scan), file paths (slash-bearing
+tokens, handles `src/x.zig:123`), and hex hashes (7-64 chars, ≥1
+letter so plain numbers don't match), deduplicating by overlap with
+URL > path > hash priority. Match text is extracted eagerly at
+collect time so later screen changes can't corrupt activation.
+Labels come from a home-row alphabet — single chars up to 26 matches,
+uniform two-char labels beyond (prefix-free by construction).
+
+Mode state lives on Window (`hints_pane` et al). Key interception
+goes through a new `hint_sink` hook checked at the top of input.zig's
+onKeyPressed — typing filters labels live (typed prefix renders dim),
+Backspace un-types, Esc exits, a completed label opens URLs via
+g_app_info_launch_default_for_uri or copies paths/hashes to both
+clipboards. Rendering: `Screen.hints_overlay` slice (Window-owned,
+mirroring search_highlights) drawn by GridPass — teal range highlight
++ amber label badge with bold glyphs; snapshot gains a hints hash so
+the vbuf rebuilds when the overlay changes. Pane-close paths clear
+the mode like they clear search.

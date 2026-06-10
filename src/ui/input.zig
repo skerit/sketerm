@@ -42,6 +42,12 @@ pub const Ctx = struct {
     /// Active keybinding table. Empty slice = use `default_bindings`.
     /// Window owns the storage (parsed from Config); Ctx just borrows.
     bindings: []const Binding = &.{},
+    /// Hint-mode key interceptor. While set, every key press is fed
+    /// here FIRST; a true return consumes the event. Window installs
+    /// it on the focused pane when hint mode opens and clears it on
+    /// exit.
+    hint_sink: ?*const fn (ctx: ?*anyopaque, keyval: c_uint) bool = null,
+    hint_ctx: ?*anyopaque = null,
 };
 
 /// Maximum gap between consecutive presses of the same keyval that
@@ -127,6 +133,9 @@ pub const Action = enum {
     /// Open the command palette — modal popover with every
     /// user-facing action, searchable by title/description.
     command_palette,
+    /// Keyboard hints / quick-select: label every URL / path / hash
+    /// on screen; typing a label opens (URLs) or copies it.
+    hints_open,
 };
 
 /// One configured keybind: a (keyval, modifier-mask) → Action mapping.
@@ -158,6 +167,7 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_ISO_Left_Tab, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .prev_tab },
     .{ .keyval = c.GDK_KEY_plus, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .font_inc },
     .{ .keyval = c.GDK_KEY_g, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .broadcast_cycle },
+    .{ .keyval = c.GDK_KEY_e, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .hints_open },
     .{ .keyval = c.GDK_KEY_z, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .restore_closed_tab },
     .{ .keyval = c.GDK_KEY_a, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_screen },
     // Ctrl+Shift+P is the cross-app convention for "command palette"
@@ -265,6 +275,7 @@ pub fn actionName(a: Action) []const u8 {
         .scrollback_top => "scrollback_top",
         .scrollback_bottom => "scrollback_bottom",
         .command_palette => "command_palette",
+        .hints_open => "hints_open",
     };
 }
 
@@ -325,6 +336,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .scrollback_top => "Jump to scrollback top",
         .scrollback_bottom => "Jump to scrollback bottom",
         .command_palette => "Open command palette",
+        .hints_open => "Keyboard hints (open/copy URLs, paths, hashes)",
     };
 }
 
@@ -513,6 +525,13 @@ fn onKeyPressed(
     user: ?*anyopaque,
 ) callconv(.c) c.gboolean {
     const ctx = cast.userData(Ctx, user);
+
+    // Hint mode owns the keyboard while active — feed it everything
+    // before shortcuts / PTY encoding. A false return (unconsumed)
+    // only happens for keys hint mode ignores, e.g. bare modifiers.
+    if (ctx.hint_sink) |hs| {
+        if (hs(ctx.hint_ctx, keyval)) return 1;
+    }
 
     // mouse_autohide: hide the pointer over the widget while typing.
     // The Pane's onMotion handler clears it again on next pointer

@@ -11,6 +11,7 @@ const Pty = @import("../pty.zig").Pty;
 const Terminal = @import("../terminal.zig").Terminal;
 const layout_mod = @import("../layout.zig");
 const palette_mod = @import("palette.zig");
+const clipboard = @import("clipboard.zig");
 const Config = @import("../config.zig").Config;
 
 /// One-shot hint. Reset to false at startup; flipped on first
@@ -115,6 +116,15 @@ pub const Window = struct {
     search_label: ?*c.GtkWidget = null,
     search_pane: ?*Pane = null,
     search_matches: std.ArrayList(@import("../grid/screen.zig").Screen.SearchMatch) = .empty,
+
+    /// Keyboard-hints (quick-select) mode state. `hints_pane` non-null
+    /// = mode active on that pane; its input Ctx then routes keys to
+    /// `onHintKey`. `hint_matches` owns the extracted texts.
+    hints_pane: ?*Pane = null,
+    hint_matches: []@import("hints.zig").Match = &.{},
+    hints_typed: [2]u8 = .{ 0, 0 },
+    hints_typed_len: u8 = 0,
+    hints_overlay_buf: std.ArrayList(@import("../grid/screen.zig").Screen.HintOverlay) = .empty,
     search_idx: usize = 0,
     /// Case-insensitive search toggle. Defaults to smart-case
     /// (lower-only needle implies CI; mixed-case implies CS).
@@ -420,11 +430,102 @@ pub const Window = struct {
         self.panes.deinit(self.allocator);
         self.terminals.deinit(self.allocator);
         self.search_matches.deinit(self.allocator);
+        @import("hints.zig").freeMatches(self.allocator, self.hint_matches);
+        self.allocator.free(self.hint_matches);
+        self.hints_overlay_buf.deinit(self.allocator);
         self.bindings.deinit(self.allocator);
         self.closed_tabs.deinit(self.allocator);
         if (self.closed_arena) |*a| a.deinit();
         self.config.deinit();
         self.allocator.destroy(self);
+    }
+
+    // ── Keyboard hints (quick-select) ───────────────────────────
+
+    /// Enter hint mode on the focused pane: scan the visible screen
+    /// for URLs / paths / hashes, overlay labels, route keys to
+    /// `onHintKey` until a label is completed or Esc.
+    pub fn openHints(self: *Window) void {
+        if (self.hints_pane != null) {
+            self.exitHints();
+            return;
+        }
+        const pane = self.focusedPane() orelse return;
+        const hints_mod = @import("hints.zig");
+        const matches = hints_mod.collectVisible(self.allocator, pane.terminal.screen) catch return;
+        if (matches.len == 0) {
+            self.allocator.free(matches);
+            return;
+        }
+        self.hint_matches = matches;
+        self.hints_pane = pane;
+        self.hints_typed_len = 0;
+        if (pane.input_ctx) |ictx| {
+            ictx.hint_sink = onHintKey;
+            ictx.hint_ctx = @ptrCast(self);
+        }
+        self.refreshHintOverlay();
+    }
+
+    pub fn exitHints(self: *Window) void {
+        const pane = self.hints_pane orelse return;
+        self.hints_pane = null;
+        if (pane.input_ctx) |ictx| {
+            ictx.hint_sink = null;
+            ictx.hint_ctx = null;
+        }
+        pane.terminal.screen.hints_overlay = &.{};
+        pane.terminal.screen.dirty = true;
+        c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+        @import("hints.zig").freeMatches(self.allocator, self.hint_matches);
+        self.allocator.free(self.hint_matches);
+        self.hint_matches = &.{};
+        self.hints_overlay_buf.clearRetainingCapacity();
+    }
+
+    /// Rebuild the overlay slice from matches whose label starts with
+    /// the typed prefix, then queue a redraw.
+    fn refreshHintOverlay(self: *Window) void {
+        const pane = self.hints_pane orelse return;
+        self.hints_overlay_buf.clearRetainingCapacity();
+        const typed = self.hints_typed[0..self.hints_typed_len];
+        for (self.hint_matches) |m| {
+            if (!std.mem.startsWith(u8, m.label[0..m.label_len], typed)) continue;
+            self.hints_overlay_buf.append(self.allocator, .{
+                .row = m.row,
+                .col_start = m.col_start,
+                .col_end = m.col_end,
+                .label = m.label,
+                .label_len = m.label_len,
+                .typed = self.hints_typed_len,
+            }) catch break;
+        }
+        pane.terminal.screen.hints_overlay = self.hints_overlay_buf.items;
+        pane.terminal.screen.dirty = true;
+        c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+    }
+
+    /// A label was completed: open URLs with the default handler;
+    /// copy paths / hashes to both clipboards.
+    fn activateHint(self: *Window, m: @import("hints.zig").Match) void {
+        const pane = self.hints_pane orelse return;
+        if (m.text.len == 0) return;
+        switch (m.kind) {
+            .url => {
+                var buf: [4096]u8 = undefined;
+                const n = @min(m.text.len, buf.len - 1);
+                @memcpy(buf[0..n], m.text[0..n]);
+                buf[n] = 0;
+                _ = c.g_app_info_launch_default_for_uri(&buf, null, null);
+            },
+            .path, .hash => {
+                const z = self.allocator.allocSentinel(u8, m.text.len, 0) catch return;
+                defer self.allocator.free(z);
+                @memcpy(z, m.text);
+                clipboard.copyToClipboard(@ptrCast(pane.area), z);
+                clipboard.copyToPrimary(@ptrCast(pane.area), z);
+            },
+        }
     }
 
     /// Open the scrollback search bar against the focused pane.
@@ -2304,9 +2405,10 @@ pub const Window = struct {
         // its controller / signal-closure cleanups (which dereference
         // `pane.menu_arena` via the click-context GDestroyNotify)
         // BEFORE we tear `menu_arena` down.
-        // The search bar holds a raw pane pointer — drop it before the
-        // pane is freed or the next search keystroke dereferences it.
+        // The search bar / hint mode hold raw pane pointers — drop
+        // them before the pane is freed.
         if (self.search_pane == pane) self.closeSearch();
+        if (self.hints_pane == pane) self.exitHints();
         _ = self.panes.orderedRemove(found_idx.?);
         const term = pane.terminal;
         for (self.terminals.items, 0..) |t, ti| {
@@ -2672,6 +2774,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .goto_tab_9 => self.gotoTab(8),
         .duplicate_tab => self.duplicateCurrentTab(),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
+        .hints_open => self.openHints(),
         else => {},
     }
 }
@@ -3436,6 +3539,7 @@ fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
             // and the search_highlights slice would become a
             // dangling pointer into freed Window memory.
             if (self.search_pane == pane) self.closeSearch();
+            if (self.hints_pane == pane) self.exitHints();
 
             const term = pane.terminal;
             _ = self.panes.orderedRemove(i);
@@ -3464,6 +3568,60 @@ fn widgetIsAncestor(ancestor: *c.GtkWidget, w: *c.GtkWidget) bool {
         if (x == ancestor) return true;
     }
     return false;
+}
+
+/// Hint-mode key interceptor, installed on the focused pane's input
+/// Ctx while hint mode is active. Returns true when the key was
+/// consumed; bare modifiers fall through so autohide/IM bookkeeping
+/// stays sane.
+fn onHintKey(ctx: ?*anyopaque, keyval: c_uint) bool {
+    const self = cast.userData(Window, ctx);
+    if (self.hints_pane == null) return false;
+    switch (keyval) {
+        c.GDK_KEY_Escape => {
+            self.exitHints();
+            return true;
+        },
+        c.GDK_KEY_BackSpace => {
+            if (self.hints_typed_len > 0) {
+                self.hints_typed_len -= 1;
+                self.refreshHintOverlay();
+            }
+            return true;
+        },
+        c.GDK_KEY_Shift_L, c.GDK_KEY_Shift_R,
+        c.GDK_KEY_Control_L, c.GDK_KEY_Control_R,
+        c.GDK_KEY_Alt_L, c.GDK_KEY_Alt_R,
+        c.GDK_KEY_Super_L, c.GDK_KEY_Super_R,
+        c.GDK_KEY_Caps_Lock, c.GDK_KEY_Num_Lock,
+        => return false,
+        else => {},
+    }
+    const u = c.gdk_keyval_to_unicode(keyval);
+    if (u >= 'a' and u <= 'z' and self.hints_typed_len < 2) {
+        const candidate_len = self.hints_typed_len + 1;
+        self.hints_typed[self.hints_typed_len] = @intCast(u);
+        // Count matches under the new prefix; activate on a unique
+        // FULL match, revert the keystroke when nothing matches.
+        var matching: usize = 0;
+        var full: ?@import("hints.zig").Match = null;
+        for (self.hint_matches) |m| {
+            if (!std.mem.startsWith(u8, m.label[0..m.label_len], self.hints_typed[0..candidate_len])) continue;
+            matching += 1;
+            if (m.label_len == candidate_len) full = m;
+        }
+        if (matching == 0) return true; // ignore stray key
+        if (full) |m| {
+            self.activateHint(m);
+            self.exitHints();
+            return true;
+        }
+        self.hints_typed_len = candidate_len;
+        self.refreshHintOverlay();
+        return true;
+    }
+    // Swallow everything else — hint mode owns the keyboard.
+    return true;
 }
 
 fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {

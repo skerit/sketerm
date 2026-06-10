@@ -155,6 +155,13 @@ pub fn main() !u8 {
     try cell_pass.rebuildAndUpload(screen, &pool, atlas.?);
     cell_pass.draw(atlas.?, W, H);
 
+    // Keyboard-hints overlay — exercise the badge + highlight path
+    // under real GL (label "a" over the first word of row 0).
+    const hint_overlays = [_]Screen.HintOverlay{
+        .{ .row = 0, .col_start = 0, .col_end = 5, .label = .{ 'a', 0 }, .label_len = 1, .typed = 0 },
+    };
+    screen.hints_overlay = &hint_overlays;
+
     // Overlay pass — draws cursor + focus border + scrollback indicator.
     var grid_pass = GridPass.init(allocator);
     defer grid_pass.deinit();

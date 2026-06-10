@@ -162,6 +162,12 @@ pub const Screen = struct {
     search_highlights: []const SearchMatch = &.{},
     search_active_idx: i32 = -1,
 
+    /// Keyboard-hints overlays (quick-select mode). When non-empty,
+    /// the renderer draws a label badge at each match start plus a
+    /// translucent highlight over its range. The Window owns the
+    /// buffer; rows are DISPLAY rows captured at collect time.
+    hints_overlay: []const HintOverlay = &.{},
+
     pool: *Pool,
     allocator: std.mem.Allocator,
 
@@ -1304,6 +1310,17 @@ pub const Screen = struct {
         row: i32,
         col: u32,
         len: u32,
+    };
+
+    pub const HintOverlay = struct {
+        /// Display row (0..rows-1).
+        row: u16,
+        col_start: u16,
+        col_end: u16,
+        /// Label text + how many of its chars were already typed.
+        label: [2]u8,
+        label_len: u8,
+        typed: u8,
     };
 
     /// Linear scan over scrollback + active (visible) buffer for

@@ -38,6 +38,8 @@ const ENTRIES = [_]Entry{
        .desc = "Copy the entire visible terminal area.", .action = .copy_screen },
     .{ .icon = "document-save-symbolic", .title = "Copy Scrollback",
        .desc = "Copy the full scrollback buffer plus the visible screen.", .action = .copy_scrollback },
+    .{ .icon = "find-location-symbolic", .title = "Keyboard Hints",
+       .desc = "Label URLs, paths, and hashes on screen; type a label to open or copy.", .action = .hints_open },
 
     // Tabs
     .{ .icon = "tab-new-symbolic", .title = "New Tab",
