@@ -103,6 +103,9 @@ pub const Pane = struct {
     /// `font_path` is unset (or fails to load). Owned by the Config
     /// arena like `font_path`.
     font_family: ?[]const u8 = null,
+    /// OpenType feature spec for shaping. Owned by the Config arena
+    /// like `font_family`; applied to every atlas this pane creates.
+    font_features: ?[]const u8 = null,
     /// Cursor blink half-cycle interval in microseconds. 500_000
     /// (= 500 ms) is the xterm default.
     cursor_blink_us: i64 = 500_000,
@@ -606,6 +609,12 @@ pub const Pane = struct {
     /// explicit file path → family name via fontconfig → $SKETERM_FONT
     /// → built-in candidate list. Returns null when nothing loads.
     fn createAtlas(self: *Pane) ?*Atlas {
+        const a = self.createAtlasInner() orelse return null;
+        if (self.font_features) |spec| a.setFontFeatures(spec);
+        return a;
+    }
+
+    fn createAtlasInner(self: *Pane) ?*Atlas {
         const size: u16 = self.physicalFontSize();
         if (self.font_path) |fp| {
             if (self.tryAtlasPath(fp, size)) |a| return a;

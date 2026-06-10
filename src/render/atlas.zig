@@ -155,6 +155,11 @@ pub const Atlas = struct {
     /// features at runtime), so the key is just the bytes.
     shape_cache: std.AutoHashMap(u64, []ShapedGlyph),
 
+    /// OpenType features applied to every hb_shape call. Parsed once
+    /// by setFontFeatures; rare enough that a fixed array suffices.
+    features: [16]c.hb_feature_t = undefined,
+    n_features: usize = 0,
+
     /// Cell metrics in pixels.
     cell_w: u16,
     cell_h: u16,
@@ -426,7 +431,7 @@ pub const Atlas = struct {
         c.hb_buffer_clear_contents(buf);
         c.hb_buffer_add_utf8(buf, text.ptr, @intCast(text.len), 0, @intCast(text.len));
         c.hb_buffer_guess_segment_properties(buf);
-        c.hb_shape(font, buf, null, 0);
+        c.hb_shape(font, buf, if (self.n_features > 0) &self.features else null, @intCast(self.n_features));
         var glyph_count: c_uint = 0;
         const infos = c.hb_buffer_get_glyph_infos(buf, &glyph_count);
         const positions = c.hb_buffer_get_glyph_positions(buf, &glyph_count);
@@ -450,6 +455,31 @@ pub const Atlas = struct {
             return error.OutOfMemory;
         };
         return out;
+    }
+
+    /// Parse a whitespace/comma-separated OpenType feature spec
+    /// ("-calt +ss01 zero cv05=3", CSS/kitty syntax accepted by
+    /// hb_feature_from_string). Unparseable tokens are skipped; at
+    /// most 16 features stick. Clears the shape cache — cached runs
+    /// were shaped under the old feature set.
+    pub fn setFontFeatures(self: *Atlas, spec: []const u8) void {
+        self.n_features = 0;
+        var it = std.mem.tokenizeAny(u8, spec, " \t,");
+        while (it.next()) |tok| {
+            if (self.n_features >= self.features.len) break;
+            var feat: c.hb_feature_t = undefined;
+            if (c.hb_feature_from_string(tok.ptr, @intCast(tok.len), &feat) != 0) {
+                self.features[self.n_features] = feat;
+                self.n_features += 1;
+            }
+        }
+        self.clearShapeCache();
+    }
+
+    fn clearShapeCache(self: *Atlas) void {
+        var it = self.shape_cache.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        self.shape_cache.clearRetainingCapacity();
     }
 
     fn shapeCacheEvictOne(self: *Atlas) void {

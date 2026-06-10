@@ -89,6 +89,10 @@ pub const Config = struct {
     /// Font family name resolved via fontconfig ("JetBrains Mono").
     /// `font_path` wins when both are set. Empty = unset.
     font_family: []const u8 = "",
+    /// OpenType features for HarfBuzz shaping, whitespace/comma
+    /// separated, CSS/kitty syntax: "-calt +ss01 zero cv05=3".
+    /// Empty = font defaults.
+    font_features: []const u8 = "",
     font_size: u16 = 14,
     /// Extra pixels added to each cell's height for visual line
     /// spacing. 0 = font's natural metric; positive = looser; small
@@ -298,6 +302,7 @@ pub const Config = struct {
         out.arena = null;
         if (self.font_path) |s| out.font_path = try arena.dupe(u8, s);
         out.font_family = try arena.dupe(u8, self.font_family);
+        out.font_features = try arena.dupe(u8, self.font_features);
         if (self.shell) |s| out.shell = try arena.dupe(u8, s);
         out.scheme = try arena.dupe(u8, self.scheme);
         out.term_env = try arena.dupe(u8, self.term_env);
@@ -453,6 +458,7 @@ pub const Config = struct {
         // Font.
         if (self.font_path) |fp| try w.print("font = {s}\n", .{fp});
         if (self.font_family.len > 0) try w.print("font_family = {s}\n", .{self.font_family});
+        if (self.font_features.len > 0) try w.print("font_features = {s}\n", .{self.font_features});
         if (self.font_size != 14) try w.print("font_size = {d}\n", .{self.font_size});
         if (self.line_pad_px != 0) try w.print("line_pad_px = {d}\n", .{self.line_pad_px});
 
@@ -779,6 +785,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.font_path = try expandTilde(arena, value);
     } else if (std.mem.eql(u8, key, "font_family")) {
         cfg.font_family = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "font_features")) {
+        cfg.font_features = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "font_size")) {
         cfg.font_size = try parseU16(value);
     } else if (std.mem.eql(u8, key, "line_pad_px") or std.mem.eql(u8, key, "line_spacing")) {

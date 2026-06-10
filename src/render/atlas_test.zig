@@ -62,6 +62,36 @@ test "shapeRun: empty string returns 0 glyphs" {
     try std.testing.expectEqual(@as(usize, 0), glyphs.len);
 }
 
+test "setFontFeatures parses spec, skips junk, clears shape cache" {
+    const a = std.testing.allocator;
+    var atlas = openAnyFont(a) catch |e| {
+        if (e == error.NoFontAvailable) return error.SkipZigTest;
+        return e;
+    };
+    defer atlas.deinit();
+
+    atlas.setFontFeatures("-calt +ss01 zero cv05=3");
+    try std.testing.expectEqual(@as(usize, 4), atlas.n_features);
+    // calt disabled → value 0; ss01 enabled → 1; cv05 → 3.
+    try std.testing.expectEqual(@as(u32, 0), atlas.features[0].value);
+    try std.testing.expectEqual(@as(u32, 1), atlas.features[1].value);
+    try std.testing.expectEqual(@as(u32, 3), atlas.features[3].value);
+
+    // Prime the cache, change features, cache must be empty again.
+    _ = try atlas.shapeRun(a, "fi", false, false);
+    try std.testing.expect(atlas.shape_cache.count() > 0);
+    atlas.setFontFeatures("");
+    try std.testing.expectEqual(@as(usize, 0), atlas.n_features);
+    try std.testing.expectEqual(@as(usize, 0), atlas.shape_cache.count());
+
+    // hb_feature_from_string is lenient about tags, so don't assert
+    // junk rejection — just that a valid token lands with its tag.
+    atlas.setFontFeatures("+ss02");
+    try std.testing.expectEqual(@as(usize, 1), atlas.n_features);
+    const ss02: u32 = ('s' << 24) | ('s' << 16) | ('0' << 8) | '2';
+    try std.testing.expectEqual(ss02, atlas.features[0].tag);
+}
+
 test "bold glyph is real + heavier than regular (no shader fakery)" {
     const a = std.testing.allocator;
     var atlas = openAnyFont(a) catch |e| {

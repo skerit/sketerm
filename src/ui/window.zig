@@ -1073,6 +1073,7 @@ pub const Window = struct {
                 else
                     self.config.font_family;
                 pane.font_family = if (eff_fam.len > 0) eff_fam else null;
+                pane.font_features = if (self.config.font_features.len > 0) self.config.font_features else null;
                 pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
                 pane.line_pad_px = self.config.line_pad_px;
                 pane.grid_pass.pad = self.config.padding;
@@ -1426,6 +1427,7 @@ pub const Window = struct {
         pane.font_size = eff_font_size;
         pane.font_path = eff_font_path;
         pane.font_family = if (eff_font_family.len > 0) eff_font_family else null;
+        pane.font_features = if (self.config.font_features.len > 0) self.config.font_features else null;
         pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
         pane.grid_pass.pad = self.config.padding;
         const fg_bg = self.resolveDefaultColors();
@@ -2025,6 +2027,7 @@ pub const Window = struct {
         // old-arena free at function end, so comparing later is safe.
         const old_font_path = self.config.font_path;
         const old_font_family = self.config.font_family;
+        const old_font_features = self.config.font_features;
         const old_blink_ms = self.config.cursor_blink_ms;
         const old_tab_pos = self.config.tab_position;
         // Replace config wholesale via a deep copy into a fresh
@@ -2142,6 +2145,7 @@ pub const Window = struct {
                 }
                 break :blk if (self.config.font_family.len > 0) self.config.font_family else null;
             };
+            p.font_features = if (self.config.font_features.len > 0) self.config.font_features else null;
             // Mouse / link / autohide flags on the Pane itself.
             p.copy_on_selection = self.config.copy_on_selection;
             p.clear_select_on_copy = self.config.clear_select_on_copy;
@@ -2173,7 +2177,10 @@ pub const Window = struct {
             // early-return, so rebuild the atlases explicitly.
             const path_changed = !eqOptStr(old_font_path, self.config.font_path);
             const family_changed = !std.mem.eql(u8, old_font_family, self.config.font_family);
-            if (path_changed or family_changed) {
+            // Feature changes need the same rebuild: cached shaped
+            // runs and atlas glyphs were produced under the old set.
+            const features_changed = !std.mem.eql(u8, old_font_features, self.config.font_features);
+            if (path_changed or family_changed or features_changed) {
                 for (self.panes.items) |p| p.refreshFont();
             }
         }

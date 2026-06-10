@@ -118,6 +118,7 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(font_group)), "Font");
     addFontFamilyRow(@ptrCast(@alignCast(font_group)), ctx);
     addFontPathRow(@ptrCast(@alignCast(font_group)), ctx);
+    addFontFeaturesRow(@ptrCast(@alignCast(font_group)), ctx);
     addSpinRowU16(@ptrCast(@alignCast(font_group)), ctx, "Size", "Font size in points", 6, 72, &ctx.cfg.font_size, fontSizeChanged);
     addSpinRowI16(@ptrCast(@alignCast(font_group)), ctx, "Line spacing", "Extra pixels per cell row", -8, 24, &ctx.cfg.line_pad_px, linePadChanged);
     addSpinRowF32(@ptrCast(@alignCast(font_group)), ctx, "Padding", "Inner padding around the cell grid", 0.0, 32.0, &ctx.cfg.padding, paddingChanged);
@@ -447,6 +448,29 @@ fn fontFamilyChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
     if (txt == null) return;
     const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
     ctx.cfg.font_family = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
+    ctx.ev();
+}
+
+fn addFontFeaturesRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "OpenType features (e.g. -calt +ss01 zero)");
+    if (ctx.cfg.font_features.len > 0) {
+        var z: [256:0]u8 = undefined;
+        const n = @min(ctx.cfg.font_features.len, z.len);
+        @memcpy(z[0..n], ctx.cfg.font_features[0..n]);
+        z[n] = 0;
+        c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
+    }
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&fontFeaturesChanged), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn fontFeaturesChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
+    const txt = c.gtk_editable_get_text(row);
+    if (txt == null) return;
+    const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+    ctx.cfg.font_features = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
     ctx.ev();
 }
 
