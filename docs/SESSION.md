@@ -4024,3 +4024,36 @@ OSC 22 pointer shapes turned out to be already implemented end-to-end
 
 Tests 434 → 437 (contrast helpers, shell quoting). pane.zig is now
 registered in tests.zig.
+
+## 2026-06-10 — font_features + remote control (sketerm cli)
+
+- **font_features** — OpenType feature config for HarfBuzz shaping.
+  CSS/kitty syntax ("-calt +ss01 zero cv05=3"), parsed via
+  hb_feature_from_string into a fixed array on the Atlas and passed
+  to every hb_shape call; setFontFeatures clears the shape cache.
+  Changing the key rides the refreshFont rebuild path (fresh atlas =
+  fresh glyph rasterizations). Config key + prefs entry row in Font
+  group + sample.conf docs.
+- **Remote control** — `sketerm cli <cmd>` scripts the running
+  instance, wezterm-style. Design per jelle-ai review: Unix socket
+  at $XDG_RUNTIME_DIR/sketerm/<pid>.sock (dir 0700, no token — local
+  trust model), one JSON object per line each way. New src/ipc/
+  module: protocol.zig (pure types + parse/serialize, unit-tested),
+  server.zig (GSocketService; accepts + read_line_async land on the
+  GLib main loop, so dispatch runs on the main thread — threading
+  rule holds with zero new threads), client.zig (blocking GIO
+  client; never enters GApplication, so no display needed).
+  Commands: list (tab/pane tree JSON with ids, titles, cwd, pid,
+  size, focus), send-text (--paste for bracketed), get-text
+  (--scrollback dumps the ring), new-tab (--cwd/--title), split
+  (--dir h|v), focus, close-pane, set-title. Window assigns stable
+  monotonic pane ids BEFORE the PTY spawn so children get
+  SKETERM_PANE_ID + SKETERM_SOCKET in env ('--pane self'
+  self-addresses); tab ids ride g_object_set_data on the AdwTabPage.
+  Window.ipcDispatch implements commands; the socket file is
+  unlinked in Window.deinit. Verified end-to-end against a live
+  second instance (SKETERM_APP_ID override): echo round-trip via
+  send-text→get-text, env vars inside spawned panes, error replies,
+  socket cleanup on SIGTERM.
+
+Tests 437 → 441 (protocol parse/serialize, feature parsing).
