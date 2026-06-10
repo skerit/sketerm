@@ -4084,3 +4084,25 @@ Tests 437 → 441 (protocol parse/serialize, feature parsing).
   marker), surfaces in `cli list` as "color", and persists through
   layout save/restore via the new TabSpec.color field (old layouts
   parse fine — defaults null).
+
+## 2026-06-10 — background images + gradients (BgPass)
+
+New `src/render/bg_pass.zig`: fullscreen pass drawn immediately
+after the clear, under kitty below-text images and the cell grid —
+cells with an explicit bg paint over it, default-bg cells let it
+show (kitty's background_image model). Two modes in one shader:
+two-colour angled gradient (u_dir from background_gradient_angle)
+and image, cover-cropped via a pure `coverTransform` helper
+(unit-tested). Config: background_image (+_opacity, default 0.3),
+background_gradient_from/_to (active when both alphas > 0) and
+_angle. The CPU-side `Source` lives once on the Window
+(refreshBgSource decodes via stbi_load, frees the old stbi
+allocation, bumps a generation counter); each pane's BgPass uploads
+its own texture into its own GL context and re-uploads when the
+generation moves. Context-loss handled with the standard
+forgetGL/releaseGL/realize trio wired into both pane unrealize
+branches + realize. applyConfigChange re-decodes only when a
+background_* key actually changed (prefs entry rows fire per
+keystroke). Prefs group on the Appearance page. Verified visually
+on the live system (screenshots: image cover-crop in split panes +
+135° navy gradient).
