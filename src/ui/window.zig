@@ -710,6 +710,7 @@ pub const Window = struct {
                 term.debug_to_stderr = self.debug_events;
 
                 const pane = try self.makePane(term);
+                pane.setSpawnArgv(argv_buf);
                 pane.win_clip_ctx = @ptrCast(self);
                 pane.win_on_clipboard = onTermClipboardSet;
                 pane.win_notify_ctx = @ptrCast(self);
@@ -809,6 +810,7 @@ pub const Window = struct {
         term.debug_to_stderr = self.debug_events;
 
         const pane = try self.makePane(term);
+        pane.setSpawnArgv(argv);
         // If anything below this fails (alloc failure adding to the
         // panes/terminals list, etc.) we'd otherwise leave a Pane
         // alive whose Terminal we just reaped via the prior errdefer
@@ -1043,6 +1045,7 @@ pub const Window = struct {
         term.debug_to_stderr = self.debug_events;
 
         const pane = try self.makePane(term);
+        pane.setSpawnArgv(&argv);
         pane.win_clip_ctx = @ptrCast(self);
         pane.win_on_clipboard = onTermClipboardSet;
         pane.win_notify_ctx = @ptrCast(self);
@@ -1484,6 +1487,7 @@ pub const Window = struct {
     }
 
     const PaneTitleCtx = struct {
+        window: *Window,
         pane: *Pane,
         popover: *c.GtkWidget,
         entry: *c.GtkWidget,
@@ -1532,6 +1536,7 @@ pub const Window = struct {
 
         const ctx = self.allocator.create(PaneTitleCtx) catch return;
         ctx.* = .{
+            .window = self,
             .pane = pane,
             .popover = popover,
             .entry = entry,
@@ -1670,19 +1675,21 @@ pub const Window = struct {
         const old_pad = self.config.padding;
         const old_blink_ms = self.config.cursor_blink_ms;
         const old_tab_pos = self.config.tab_position;
-        // Replace config wholesale, but dup any string fields into
-        // the long-lived Window.config.arena. Without this, strings
-        // duped by the dialog into its own arena would dangle when
-        // the dialog closes.
-        self.config = new_cfg.*;
-        if (self.config.arena == null) self.config.arena = std.heap.ArenaAllocator.init(self.allocator);
-        const arena = self.config.arena.?.allocator();
-        if (self.config.font_path) |fp| self.config.font_path = arena.dupe(u8, fp) catch self.config.font_path;
-        if (self.config.shell) |sh| self.config.shell = arena.dupe(u8, sh) catch self.config.shell;
-        self.config.term_env = arena.dupe(u8, self.config.term_env) catch self.config.term_env;
-        self.config.color_term_env = arena.dupe(u8, self.config.color_term_env) catch self.config.color_term_env;
-        self.config.word_chars = arena.dupe(u8, self.config.word_chars) catch self.config.word_chars;
-        if (self.config.scheme.len > 0) self.config.scheme = arena.dupe(u8, self.config.scheme) catch self.config.scheme;
+        // Replace config wholesale via a deep copy into a fresh
+        // window-owned arena, then free the previous one. Never adopt
+        // `new_cfg.arena` or alias its strings: the prefs dialog's
+        // working copy and reload-from-disk configs have their own
+        // lifetimes (dialog close / caller deinit).
+        const cloned = new_cfg.clone(self.allocator) catch |err| {
+            std.debug.print("sketerm: config apply failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        // Defer freeing the old arena to the end of this function —
+        // panes still hold slices into it (screen.word_chars et al.)
+        // until the push-loop below reassigns them.
+        var old_cfg = self.config;
+        defer old_cfg.deinit();
+        self.config = cloned;
 
         // Push into every pane.
         const eff = self.resolveDefaultColors();
@@ -1751,6 +1758,27 @@ pub const Window = struct {
                 ictx.clear_select_on_copy = self.config.clear_select_on_copy;
                 ictx.mouse_autohide = self.config.mouse_autohide;
             }
+            // These slices pointed into the old config arena (freed
+            // when this function returns) — re-point them at the new
+            // config's copies.
+            if (p.active_profile) |pn| {
+                p.active_profile = null;
+                for (self.config.profiles.items) |*pr| {
+                    if (std.mem.eql(u8, pr.name, pn)) {
+                        p.active_profile = pr.name;
+                        break;
+                    }
+                }
+            }
+            p.font_path = blk: {
+                if (p.active_profile) |pn| {
+                    for (self.config.profiles.items) |*pr| {
+                        if (std.mem.eql(u8, pr.name, pn) and pr.font_path.len > 0)
+                            break :blk pr.font_path;
+                    }
+                }
+                break :blk self.config.font_path;
+            };
             // Mouse / link / autohide flags on the Pane itself.
             p.copy_on_selection = self.config.copy_on_selection;
             p.clear_select_on_copy = self.config.clear_select_on_copy;
@@ -2245,6 +2273,9 @@ pub const Window = struct {
         // its controller / signal-closure cleanups (which dereference
         // `pane.menu_arena` via the click-context GDestroyNotify)
         // BEFORE we tear `menu_arena` down.
+        // The search bar holds a raw pane pointer — drop it before the
+        // pane is freed or the next search keystroke dereferences it.
+        if (self.search_pane == pane) self.closeSearch();
         _ = self.panes.orderedRemove(found_idx.?);
         const term = pane.terminal;
         for (self.terminals.items, 0..) |t, ti| {
@@ -2331,8 +2362,17 @@ pub const Window = struct {
                     try arena.dupe(u8, reported)
                 else
                     layout_mod.cwdOfPid(p.terminal.pty.child_pid, arena) catch try arena.dupe(u8, "/");
-                const cmd = try arena.alloc([]const u8, 1);
-                cmd[0] = try arena.dupe(u8, @import("../util/profile.zig").getenv("SHELL") orelse "/bin/bash");
+                // Serialize the command the pane was actually spawned
+                // with; fall back to $SHELL for panes without a record.
+                const cmd: [][]const u8 = if (p.spawn_argv) |av| blk: {
+                    const out = try arena.alloc([]const u8, av.len);
+                    for (av, 0..) |a, i| out[i] = try arena.dupe(u8, a);
+                    break :blk out;
+                } else blk: {
+                    const out = try arena.alloc([]const u8, 1);
+                    out[0] = try arena.dupe(u8, @import("../util/profile.zig").getenv("SHELL") orelse "/bin/bash");
+                    break :blk out;
+                };
                 // Save font_size only if it diverges from the global
                 // default — keeps layout files terse.
                 const fs: ?u16 = if (p.font_size != self.config.font_size) p.font_size else null;
@@ -2493,7 +2533,10 @@ pub const Window = struct {
     /// `--config <path>` overrides — user passed a non-default
     /// path on the command line would need to restart for that.
     pub fn reloadConfigFromDisk(self: *Window) void {
-        const new_cfg = Config.load(self.allocator);
+        var new_cfg = Config.load(self.allocator);
+        // applyConfigChange deep-copies; the loaded config (and its
+        // arena) is ours to free.
+        defer new_cfg.deinit();
         self.applyConfigChange(&new_cfg);
         std.debug.print("sketerm: config reloaded\n", .{});
     }
@@ -2874,13 +2917,24 @@ fn freeProfileButtonCtx(user: ?*anyopaque) callconv(.c) void {
 
 fn onPaneTitleActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Window.PaneTitleCtx, user);
-    const text_c = c.gtk_editable_get_text(@ptrCast(entry));
-    if (text_c != null) {
-        const text = std.mem.span(@as([*:0]const u8, @ptrCast(text_c)));
-        if (text.len == 0) {
-            ctx.pane.unlockTitle();
-        } else {
-            ctx.pane.lockTitle(text);
+    // The pane can be closed (keybind, child exit) while the popover
+    // is open — verify it's still alive before dereferencing.
+    var alive = false;
+    for (ctx.window.panes.items) |p| {
+        if (p == ctx.pane) {
+            alive = true;
+            break;
+        }
+    }
+    if (alive) {
+        const text_c = c.gtk_editable_get_text(@ptrCast(entry));
+        if (text_c != null) {
+            const text = std.mem.span(@as([*:0]const u8, @ptrCast(text_c)));
+            if (text.len == 0) {
+                ctx.pane.unlockTitle();
+            } else {
+                ctx.pane.lockTitle(text);
+            }
         }
     }
     c.gtk_popover_popdown(@ptrCast(ctx.popover));

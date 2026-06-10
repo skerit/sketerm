@@ -150,6 +150,12 @@ pub const Pane = struct {
     /// Owned by the Window (Config arena).
     active_profile: ?[]const u8 = null,
 
+    /// argv the PTY child was spawned with, deep-copied. Layout save
+    /// reads this so a round-trip keeps the real command (`ssh host`,
+    /// `nvim .`) instead of collapsing every pane to $SHELL. Owned;
+    /// freed in deinit.
+    spawn_argv: ?[][]u8 = null,
+
     /// Inactive-pane dimming. When `is_focused` is false, the renderer
     /// multiplies fg/bg colours by `inactive_fg_dim` / `inactive_bg_dim`.
     /// Cursor / selection / overlay stay full-bright.
@@ -550,8 +556,33 @@ pub const Pane = struct {
         }
         if (self.menu_link_uri) |uri| self.allocator.free(uri);
         if (self.titlebar_text) |t| self.allocator.free(t);
+        self.freeSpawnArgv();
         self.menu_arena.deinit();
         self.allocator.destroy(self);
+    }
+
+    fn freeSpawnArgv(self: *Pane) void {
+        if (self.spawn_argv) |av| {
+            for (av) |a| self.allocator.free(a);
+            self.allocator.free(av);
+            self.spawn_argv = null;
+        }
+    }
+
+    /// Record the child's argv (NUL-terminated form, as handed to
+    /// Pty.spawn). Best-effort: on OOM the pane simply keeps no argv
+    /// and layout save falls back to $SHELL.
+    pub fn setSpawnArgv(self: *Pane, argv: []const [*:0]const u8) void {
+        self.freeSpawnArgv();
+        const out = self.allocator.alloc([]u8, argv.len) catch return;
+        for (argv, 0..) |a, i| {
+            out[i] = self.allocator.dupe(u8, std.mem.span(a)) catch {
+                for (out[0..i]) |s| self.allocator.free(s);
+                self.allocator.free(out);
+                return;
+            };
+        }
+        self.spawn_argv = out;
     }
 
     pub fn widget(self: *Pane) *c.GtkWidget {
@@ -713,6 +744,17 @@ pub const Pane = struct {
         }
         if (self.atlas == null) return;
         self.atlas.?.realize();
+
+        // The atlas was just rebuilt: every glyph UV cached in the
+        // passes points into the dead texture. The fresh atlas starts
+        // at generation 0 — same as the passes' last-seen generations —
+        // so eviction detection won't fire; force the rebuild here.
+        // Without this, an unchanged grid renders stale/blank glyphs
+        // until each line happens to go dirty on its own.
+        self.cell_pass.markAllDirty();
+        self.grid_pass.vbuf_valid = false;
+        self.grid_pass.vbo_uploaded = false;
+        for (self.grid_pass.row_caches_valid.items) |*r| r.* = false;
 
         self.image_store.cell_w = @floatFromInt(self.atlas.?.cell_w);
         self.image_store.cell_h = @floatFromInt(self.atlas.?.cell_h);
@@ -1061,8 +1103,12 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
     // ticks don't re-fire (Window may close the pane mid-call).
     if (screen.child_exited) {
         screen.child_exited = false;
+        self.tick_id = 0;
         if (self.win_on_child_exit) |f| f(self.win_child_ctx, self, screen.child_exit_status);
-        return 1; // pane may be invalid now; bail
+        // The exit callback may have torn the pane down (exit_action
+        // .close); `self` is potentially freed. Returning CONTINUE
+        // would re-enter next frame on dangling memory.
+        return 0; // G_SOURCE_REMOVE
     }
 
     // Cursor blink — toggle every 500ms for blinking shapes, but

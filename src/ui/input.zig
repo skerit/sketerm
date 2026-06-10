@@ -453,7 +453,8 @@ fn onKeyReleased(
     var cp: u32 = 0;
     switch (keyval) {
         c.GDK_KEY_Escape => cp = 27,
-        c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => cp = 13,
+        c.GDK_KEY_Return => cp = 13,
+        c.GDK_KEY_KP_Enter => cp = 57414,
         c.GDK_KEY_BackSpace => cp = 127,
         c.GDK_KEY_Tab, c.GDK_KEY_ISO_Left_Tab => cp = 9,
         else => {
@@ -882,7 +883,10 @@ pub fn encode(buf: []u8, keyval: c_uint, mods: c.GdkModifierType, app_cursor: bo
     if (kitty_disamb or kitty_report_all) {
         switch (keyval) {
             c.GDK_KEY_Escape => return kittyKeyEvent(buf, 27, shift, alt, ctrl, kitty_event),
-            c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => return kittyKeyEvent(buf, 13, shift, alt, ctrl, kitty_event),
+            c.GDK_KEY_Return => return kittyKeyEvent(buf, 13, shift, alt, ctrl, kitty_event),
+            // Keypad Enter has its own functional codepoint so apps
+            // can bind it separately from Return (kitty spec table).
+            c.GDK_KEY_KP_Enter => return kittyKeyEvent(buf, 57414, shift, alt, ctrl, kitty_event),
             c.GDK_KEY_BackSpace => return kittyKeyEvent(buf, 127, shift, alt, ctrl, kitty_event),
             c.GDK_KEY_Tab => return kittyKeyEvent(buf, 9, shift, alt, ctrl, kitty_event),
             c.GDK_KEY_ISO_Left_Tab => return kittyKeyEvent(buf, 9, true, alt, ctrl, kitty_event),
