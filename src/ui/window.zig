@@ -13,6 +13,8 @@ const layout_mod = @import("../layout.zig");
 const palette_mod = @import("palette.zig");
 const clipboard = @import("clipboard.zig");
 const Config = @import("../config.zig").Config;
+const ipc_server = @import("../ipc/server.zig");
+const ipc_protocol = @import("../ipc/protocol.zig");
 
 /// One-shot hint. Reset to false at startup; flipped on first
 /// `always_on_top = true` so we don't spam the log on every
@@ -111,6 +113,15 @@ pub const Window = struct {
     terminals: std.ArrayList(*Terminal) = .empty,
     allocator: std.mem.Allocator,
     tab_counter: u32 = 0,
+    /// Remote control: monotonic pane / tab ids + the socket server.
+    /// Pane ids are allocated BEFORE the PTY spawn so the child env
+    /// can carry SKETERM_PANE_ID.
+    next_pane_id: u32 = 1,
+    next_tab_id: u32 = 1,
+    ipc: ?*ipc_server.Server = null,
+    /// Socket path, computed at init (before any spawn) so every
+    /// child gets SKETERM_SOCKET even if the listener starts later.
+    ipc_path: ?[:0]u8 = null,
     debug_events: bool = false,
     debug_images: bool = false,
     /// --hold: per-invocation exit_action override. Lives outside
@@ -408,6 +419,20 @@ pub const Window = struct {
         // Resolve keybinds from defaults + Config overrides.
         self.refreshBindings();
 
+        // Remote-control socket (sketerm cli). Failure is non-fatal:
+        // the terminal works fine without scripting.
+        if (ipc_server.defaultSocketPath(allocator)) |sock_path| {
+            self.ipc_path = sock_path;
+            self.ipc = ipc_server.start(allocator, sock_path, @ptrCast(self), ipcDispatchTrampoline) catch |err| blk: {
+                std.debug.print("sketerm: remote control disabled: {s}\n", .{@errorName(err)});
+                break :blk null;
+            };
+            if (self.ipc == null) {
+                allocator.free(sock_path);
+                self.ipc_path = null;
+            }
+        } else |_| {}
+
         // After the window is realized we have a GdkSurface and can
         // tell the compositor not to assume our content is opaque.
         // Without this, blending behind transparent areas may not
@@ -455,6 +480,7 @@ pub const Window = struct {
         self.bindings.deinit(self.allocator);
         self.closed_tabs.deinit(self.allocator);
         if (self.closed_arena) |*a| a.deinit();
+        if (self.ipc) |srv| srv.deinit(); // frees ipc_path (server owns it)
         self.config.deinit();
         self.allocator.destroy(self);
     }
@@ -1033,11 +1059,14 @@ pub const Window = struct {
                     argv_buf[i] = z.ptr;
                 }
 
+                const pane_id = self.allocPaneId();
                 var pty = try Pty.spawn(.{
                     .argv = argv_buf,
                     .cwd = p.cwd,
                     .rows = 24,
                     .cols = 80,
+                    .pane_id = pane_id,
+                    .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
                 });
                 errdefer pty.closeAndReap();
 
@@ -1046,6 +1075,7 @@ pub const Window = struct {
                 term.debug_to_stderr = self.debug_events;
 
                 const pane = try self.makePane(term);
+                pane.id = pane_id;
                 pane.setSpawnArgv(argv_buf);
                 pane.win_clip_ctx = @ptrCast(self);
                 pane.win_on_clipboard = onTermClipboardSet;
@@ -1138,12 +1168,15 @@ pub const Window = struct {
         argv: []const [*:0]const u8,
         cwd: ?[]const u8,
     ) !void {
+        const pane_id = self.allocPaneId();
         var pty = try Pty.spawn(.{
             .argv = argv,
             .cwd = cwd,
             .rows = 24,
             .cols = 80,
             .login_shell = self.config.login_shell,
+            .pane_id = pane_id,
+            .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
         });
         errdefer pty.closeAndReap();
 
@@ -1152,6 +1185,7 @@ pub const Window = struct {
         term.debug_to_stderr = self.debug_events;
 
         const pane = try self.makePane(term);
+        pane.id = pane_id;
         pane.setSpawnArgv(argv);
         // If anything below this fails (alloc failure adding to the
         // panes/terminals list, etc.) we'd otherwise leave a Pane
@@ -1373,6 +1407,7 @@ pub const Window = struct {
         else
             self.config.login_shell;
 
+        const pane_id = self.allocPaneId();
         var pty = try Pty.spawn(.{
             .argv = &argv,
             .rows = 24,
@@ -1381,6 +1416,8 @@ pub const Window = struct {
             .color_term = @ptrCast(&ct_buf),
             .cwd = inherit_cwd,
             .login_shell = eff_login_shell,
+            .pane_id = pane_id,
+            .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
         });
         errdefer pty.closeAndReap();
 
@@ -1389,6 +1426,7 @@ pub const Window = struct {
         term.debug_to_stderr = self.debug_events;
 
         const pane = try self.makePane(term);
+        pane.id = pane_id;
         pane.setSpawnArgv(&argv);
         pane.win_clip_ctx = @ptrCast(self);
         pane.win_on_clipboard = onTermClipboardSet;
@@ -2214,14 +2252,200 @@ pub const Window = struct {
     /// immediately after the currently-selected page. Returns the
     /// AdwTabPage so callers can set its title/tooltip.
     fn appendOrInsertTab(self: *Window, child: *c.GtkWidget) *c.AdwTabPage {
-        if (self.config.new_tab_after_current) {
-            const sel = c.adw_tab_view_get_selected_page(self.tab_view);
-            if (sel != null) {
-                const idx = c.adw_tab_view_get_page_position(self.tab_view, sel);
-                if (c.adw_tab_view_insert(self.tab_view, child, idx + 1)) |p| return p;
+        const page = blk: {
+            if (self.config.new_tab_after_current) {
+                const sel = c.adw_tab_view_get_selected_page(self.tab_view);
+                if (sel != null) {
+                    const idx = c.adw_tab_view_get_page_position(self.tab_view, sel);
+                    if (c.adw_tab_view_insert(self.tab_view, child, idx + 1)) |p| break :blk p;
+                }
+            }
+            break :blk c.adw_tab_view_append(self.tab_view, child).?;
+        };
+        // Stable id for remote-control addressing, stored on the
+        // GObject (survives reorder; pages are never re-tagged).
+        c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-id", @ptrFromInt(self.next_tab_id));
+        self.next_tab_id += 1;
+        return page;
+    }
+
+    // ── Remote control (sketerm cli) ─────────────────────────────
+
+    fn allocPaneId(self: *Window) u32 {
+        const id = self.next_pane_id;
+        self.next_pane_id += 1;
+        return id;
+    }
+
+    fn tabPageId(page: *c.AdwTabPage) u32 {
+        return @intCast(@intFromPtr(c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-tab-id")));
+    }
+
+    /// Resolve a pane address: explicit id, else the focused pane,
+    /// else the selected tab's first pane, else the first pane.
+    fn paneById(self: *Window, id_opt: ?u32) ?*Pane {
+        if (id_opt) |id| {
+            for (self.panes.items) |p| if (p.id == id) return p;
+            return null;
+        }
+        if (self.focusedPane()) |p| return p;
+        const sel = c.adw_tab_view_get_selected_page(self.tab_view);
+        if (sel != null) {
+            if (c.adw_tab_page_get_child(sel)) |child| {
+                for (self.panes.items) |p| {
+                    if (widgetIsAncestor(@ptrCast(child), p.widget())) return p;
+                }
             }
         }
-        return c.adw_tab_view_append(self.tab_view, child).?;
+        if (self.panes.items.len > 0) return self.panes.items[0];
+        return null;
+    }
+
+    fn tabPageById(self: *Window, id_opt: ?u32) ?*c.AdwTabPage {
+        if (id_opt) |id| {
+            const n = c.adw_tab_view_get_n_pages(self.tab_view);
+            var i: c_int = 0;
+            while (i < n) : (i += 1) {
+                const page = c.adw_tab_view_get_nth_page(self.tab_view, i) orelse continue;
+                if (tabPageId(page) == id) return page;
+            }
+            return null;
+        }
+        return c.adw_tab_view_get_selected_page(self.tab_view);
+    }
+
+    fn ipcDispatchTrampoline(ctx: *anyopaque, req: ipc_protocol.Request, out: *std.ArrayList(u8), allocator: std.mem.Allocator) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        self.ipcDispatch(req, out, allocator) catch {
+            out.clearRetainingCapacity();
+            ipc_protocol.writeErr(out, allocator, "internal error") catch {};
+        };
+    }
+
+    fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+        const eql = std.mem.eql;
+        if (eql(u8, req.cmd, "list")) {
+            try self.ipcList(out, allocator);
+        } else if (eql(u8, req.cmd, "send-text")) {
+            const data = req.data orelse return ipc_protocol.writeErr(out, allocator, "send-text requires data");
+            const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            if (req.paste)
+                clipboard.pasteText(pane.terminal, data)
+            else
+                pane.terminal.writeUserInput(data);
+            try ipc_protocol.writeOk(out, allocator, null, {});
+        } else if (eql(u8, req.cmd, "get-text")) {
+            const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const screen = pane.terminal.screen;
+            const text = if (req.scrollback > 0)
+                try screen.extractScrollback(allocator)
+            else
+                try screen.extractScreen(allocator);
+            defer allocator.free(text);
+            try ipc_protocol.writeOk(out, allocator, "text", text);
+        } else if (eql(u8, req.cmd, "new-tab")) {
+            var title_buf: [256:0]u8 = undefined;
+            const title_z: ?[*:0]const u8 = if (req.title) |t| blk: {
+                const s = std.fmt.bufPrintZ(&title_buf, "{s}", .{t}) catch break :blk null;
+                break :blk s.ptr;
+            } else null;
+            if (req.cwd) |cwd| {
+                var num_buf: [32]u8 = undefined;
+                const t: [*:0]const u8 = title_z orelse tdef: {
+                    self.tab_counter += 1;
+                    const s = std.fmt.bufPrintZ(&num_buf, "Tab {d}", .{self.tab_counter}) catch "shell";
+                    break :tdef s.ptr;
+                };
+                try self.addTabWithProfile(t, cwd, null);
+            } else {
+                try self.newShellTab(title_z);
+            }
+            try ipc_protocol.writeOk(out, allocator, "created", .{
+                .tab = self.next_tab_id - 1,
+                .pane = self.next_pane_id - 1,
+            });
+        } else if (eql(u8, req.cmd, "split")) {
+            const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+            const dir = req.direction orelse "h";
+            const orient: c_uint = if (eql(u8, dir, "v"))
+                @intCast(c.GTK_ORIENTATION_VERTICAL)
+            else
+                @intCast(c.GTK_ORIENTATION_HORIZONTAL);
+            try self.splitFocused(orient);
+            try ipc_protocol.writeOk(out, allocator, "created", .{
+                .pane = self.next_pane_id - 1,
+            });
+        } else if (eql(u8, req.cmd, "focus")) {
+            if (req.pane != null) {
+                const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+                if (tabPageForPane(self, pane)) |page| c.adw_tab_view_set_selected_page(self.tab_view, page);
+                _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+                try ipc_protocol.writeOk(out, allocator, null, {});
+            } else if (req.tab != null) {
+                const page = self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
+                c.adw_tab_view_set_selected_page(self.tab_view, page);
+                try ipc_protocol.writeOk(out, allocator, null, {});
+            } else {
+                try ipc_protocol.writeErr(out, allocator, "focus requires pane or tab");
+            }
+        } else if (eql(u8, req.cmd, "close-pane")) {
+            const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            self.closePane(pane);
+            try ipc_protocol.writeOk(out, allocator, null, {});
+        } else if (eql(u8, req.cmd, "set-title")) {
+            const text = req.title orelse req.data orelse return ipc_protocol.writeErr(out, allocator, "set-title requires title");
+            var z_buf: [512:0]u8 = undefined;
+            const z = std.fmt.bufPrintZ(&z_buf, "{s}", .{text}) catch return ipc_protocol.writeErr(out, allocator, "title too long");
+            const page = if (req.pane != null) pg: {
+                const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+                break :pg tabPageForPane(self, pane) orelse return ipc_protocol.writeErr(out, allocator, "pane has no tab");
+            } else self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
+            c.adw_tab_page_set_title(page, z.ptr);
+            c.adw_tab_page_set_tooltip(page, z.ptr);
+            try ipc_protocol.writeOk(out, allocator, null, {});
+        } else {
+            try ipc_protocol.writeErr(out, allocator, "unknown command");
+        }
+    }
+
+    fn ipcList(self: *Window, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var tabs: std.ArrayList(ipc_protocol.TabInfo) = .empty;
+        const focused = self.focusedPane();
+        const sel = c.adw_tab_view_get_selected_page(self.tab_view);
+        const n = c.adw_tab_view_get_n_pages(self.tab_view);
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            const page = c.adw_tab_view_get_nth_page(self.tab_view, i) orelse continue;
+            const child = c.adw_tab_page_get_child(page);
+            var pane_infos: std.ArrayList(ipc_protocol.PaneInfo) = .empty;
+            for (self.panes.items) |p| {
+                if (child == null) continue;
+                if (!widgetIsAncestor(@ptrCast(child), p.widget())) continue;
+                const scr = p.terminal.screen;
+                try pane_infos.append(arena, .{
+                    .id = p.id,
+                    .title = if (scr.last_title) |t| try arena.dupe(u8, t) else "",
+                    .cwd = if (p.terminal.cwd) |cw| try arena.dupe(u8, cw) else "",
+                    .pid = p.terminal.pty.child_pid,
+                    .rows = scr.rows,
+                    .cols = scr.cols,
+                    .focused = (p == focused),
+                });
+            }
+            const title_c = c.adw_tab_page_get_title(page);
+            try tabs.append(arena, .{
+                .id = tabPageId(page),
+                .title = if (title_c != null) try arena.dupe(u8, std.mem.span(title_c)) else "",
+                .selected = (page == sel),
+                .panes = pane_infos.items,
+            });
+        }
+        try ipc_protocol.writeOk(out, allocator, "tabs", tabs.items);
     }
 
     /// Tell the compositor that our content is no longer opaque when

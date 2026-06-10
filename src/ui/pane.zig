@@ -35,6 +35,9 @@ const FONT_CANDIDATES = [_][*:0]const u8{
 const FONT_SIZE: u16 = 14;
 
 pub const Pane = struct {
+    /// Stable monotonic id for remote-control addressing. Assigned
+    /// by Window before the PTY spawn so the child env can carry it.
+    id: u32 = 0,
     area: *c.GtkGLArea,
     terminal: *Terminal,
     atlas: ?*Atlas = null,

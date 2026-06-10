@@ -31,6 +31,10 @@ pub const SpawnOpts = struct {
     /// Spawn as a login shell — argv[0] in the child gets a leading
     /// `-` per Unix convention so /etc/profile etc. are sourced.
     login_shell: bool = false,
+    /// Remote-control identity exported into the child env
+    /// (SKETERM_PANE_ID / SKETERM_SOCKET). 0 / null = not exported.
+    pane_id: u32 = 0,
+    socket_path: ?[*:0]const u8 = null,
 };
 
 /// Cap on queued bytes per Pty before we start dropping. Hit only
@@ -133,6 +137,15 @@ pub const Pty = struct {
         // get DA1's `;4;` advertisement plus the `xterm-256color`
         // terminfo `Sixel` flag (when set via `term = ` in config).
         _ = c.setenv("KITTY_WINDOW_ID", "1", 1);
+        // Remote control: lets `sketerm cli` inside the terminal find
+        // the socket and self-address its own pane.
+        if (opts.pane_id != 0) {
+            var id_buf: [16]u8 = undefined;
+            if (std.fmt.bufPrintZ(&id_buf, "{d}", .{opts.pane_id})) |s| {
+                _ = c.setenv("SKETERM_PANE_ID", s.ptr, 1);
+            } else |_| {}
+        }
+        if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1);
 
         // chdir if requested.
         if (opts.cwd) |cwd| {

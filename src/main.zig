@@ -24,6 +24,15 @@ const HELP_TEXT =
     \\
     \\Usage: sketerm [OPTIONS]
     \\
+    \\Remote control:
+    \\  sketerm cli <command>  Script the running instance over its
+    \\                         Unix socket (list, send-text, get-text,
+    \\                         new-tab, split, focus, close-pane,
+    \\                         set-title). `sketerm cli --help` for
+    \\                         details. Inside a sketerm pane,
+    \\                         $SKETERM_SOCKET/$SKETERM_PANE_ID are
+    \\                         preset; `--pane self` self-addresses.
+    \\
     \\Options:
     \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json
     \\  --layout <path>       Load tabs from a layout file (.json or .layout)
@@ -124,6 +133,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // forwarded to the primary instance via "command-line" so a
     // second `sketerm --toggle` invocation reaches the running app.
     const argv = init.args.vector;
+
+    // `sketerm cli ...` is the remote-control client: pure socket
+    // talk, never enters GApplication (no display, no D-Bus
+    // round-trip to the primary instance).
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "cli")) {
+        const cli_args = allocator.alloc([]const u8, argv.len - 2) catch return 1;
+        defer allocator.free(cli_args);
+        for (argv[2..], 0..) |a, n| cli_args[n] = std.mem.span(a);
+        return @import("ipc/client.zig").run(allocator, cli_args);
+    }
+
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = std.mem.span(argv[i]);
