@@ -3643,6 +3643,40 @@ pub const Screen = struct {
         };
     }
 
+    /// Parse the extended-colour payload following SGR 38/48/58 at
+    /// index `i`. Handles `;5;n` / `:5:n` (palette), `;2;r;g;b` /
+    /// `:2:r:g:b` (truecolor) AND the ITU colon form with a colorspace
+    /// slot `:2::r:g:b` (what neovim/kitty emit). Returns the colour
+    /// plus how many params past `i` were consumed.
+    fn sgrReadExtColor(params: *const Event.Csi, i: usize) ?struct { color: @import("style_pool.zig").Color, skip: usize } {
+        if (i + 1 >= params.n_params) return null;
+        switch (params.params[i + 1]) {
+            5 => {
+                if (i + 2 >= params.n_params) return null;
+                return .{
+                    .color = .{ .palette = @intCast(@min(params.params[i + 2], 255)) },
+                    .skip = 2,
+                };
+            },
+            2 => {
+                // Colon form with colorspace: detect by the colour
+                // payload extending to a 4th trailing SUB param
+                // (38:2::r:g:b → i+1..i+5 all sub). Legacy semicolon
+                // and bare colon forms put r at i+2.
+                const base: usize = if (params.isSub(i + 1) and i + 5 < params.n_params and params.isSub(i + 5))
+                    i + 3
+                else
+                    i + 2;
+                const rgb = sgrReadRgb(params, base) orelse return null;
+                return .{
+                    .color = .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } },
+                    .skip = base + 2 - i,
+                };
+            },
+            else => return null,
+        }
+    }
+
     fn sgr(self: *Screen, params: Event.Csi) void {
         var entry = self.pool.get(self.cur_style);
         var i: usize = 0;
@@ -3694,32 +3728,31 @@ pub const Screen = struct {
                 29 => entry.attrs.strikethrough = false,
                 30...37 => entry.fg = .{ .palette = @intCast(p - 30) },
                 38 => {
-                    if (i + 2 < params.n_params and params.params[i + 1] == 5) {
-                        entry.fg = .{ .palette = @intCast(@min(params.params[i + 2], 255)) };
-                        i += 2;
-                    } else if (i + 4 < params.n_params and params.params[i + 1] == 2) {
-                        if (sgrReadRgb(&params, i + 2)) |rgb| {
-                            entry.fg = .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } };
-                        }
-                        i += 4;
+                    if (sgrReadExtColor(&params, i)) |ext| {
+                        entry.fg = ext.color;
+                        i += ext.skip;
                     }
                 },
                 39 => entry.fg = .default,
                 40...47 => entry.bg = .{ .palette = @intCast(p - 40) },
                 48 => {
-                    if (i + 2 < params.n_params and params.params[i + 1] == 5) {
-                        entry.bg = .{ .palette = @intCast(@min(params.params[i + 2], 255)) };
-                        i += 2;
-                    } else if (i + 4 < params.n_params and params.params[i + 1] == 2) {
-                        if (sgrReadRgb(&params, i + 2)) |rgb| {
-                            entry.bg = .{ .rgb = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b } };
-                        }
-                        i += 4;
+                    if (sgrReadExtColor(&params, i)) |ext| {
+                        entry.bg = ext.color;
+                        i += ext.skip;
                     }
                 },
                 49 => entry.bg = .default,
                 53 => entry.attrs.overline = true,
                 55 => entry.attrs.overline = false,
+                // SGR 58/59 — underline (decoration) colour, used by
+                // editors for spell/diagnostic squiggles.
+                58 => {
+                    if (sgrReadExtColor(&params, i)) |ext| {
+                        entry.underline_color = ext.color;
+                        i += ext.skip;
+                    }
+                },
+                59 => entry.underline_color = .default,
                 90...97 => entry.fg = .{ .palette = @intCast(p - 90 + 8) },
                 100...107 => entry.bg = .{ .palette = @intCast(p - 100 + 8) },
                 else => {},
@@ -6008,4 +6041,98 @@ test "DCH clears clusters on the shifted row" {
     s.col = 0;
     s.deleteChars(1); // 'e' shifts to col 0; old cluster key is stale
     try std.testing.expectEqual(@as(usize, 0), s.clusters.count());
+}
+
+test "SGR 58 semicolon truecolor sets underline color; 59 resets" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    var sgr_ev = Event.Csi{};
+    sgr_ev.final = 'm';
+    sgr_ev.n_params = 6;
+    sgr_ev.params[0] = 4; // underline on
+    sgr_ev.params[1] = 58;
+    sgr_ev.params[2] = 2;
+    sgr_ev.params[3] = 255;
+    sgr_ev.params[4] = 0;
+    sgr_ev.params[5] = 128;
+    s.csi(sgr_ev);
+    const e = pool.get(s.cur_style);
+    try std.testing.expect(e.attrs.underline);
+    try std.testing.expectEqual(@as(u8, 255), e.underline_color.rgb.r);
+    try std.testing.expectEqual(@as(u8, 0), e.underline_color.rgb.g);
+    try std.testing.expectEqual(@as(u8, 128), e.underline_color.rgb.b);
+
+    var off = Event.Csi{};
+    off.final = 'm';
+    off.n_params = 1;
+    off.params[0] = 59;
+    s.csi(off);
+    try std.testing.expect(pool.get(s.cur_style).underline_color == .default);
+}
+
+test "SGR 58 colon form with colorspace slot (58:2::r:g:b)" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    var ev = Event.Csi{};
+    ev.final = 'm';
+    ev.n_params = 7;
+    ev.params[0] = 58;
+    ev.params[1] = 2; // sub
+    ev.params[2] = 0; // empty colorspace, sub
+    ev.params[3] = 10; // r, sub
+    ev.params[4] = 20; // g, sub
+    ev.params[5] = 30; // b, sub
+    ev.params[6] = 1; // separate SGR: bold
+    var k: usize = 1;
+    while (k <= 5) : (k += 1) ev.setSub(k, true);
+    s.csi(ev);
+    const e = pool.get(s.cur_style);
+    try std.testing.expectEqual(@as(u8, 10), e.underline_color.rgb.r);
+    try std.testing.expectEqual(@as(u8, 20), e.underline_color.rgb.g);
+    try std.testing.expectEqual(@as(u8, 30), e.underline_color.rgb.b);
+    try std.testing.expect(e.attrs.bold);
+}
+
+test "SGR 58 palette form (58:5:n)" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    var ev = Event.Csi{};
+    ev.final = 'm';
+    ev.n_params = 3;
+    ev.params[0] = 58;
+    ev.params[1] = 5;
+    ev.params[2] = 196;
+    ev.setSub(1, true);
+    ev.setSub(2, true);
+    s.csi(ev);
+    try std.testing.expectEqual(@as(u8, 196), pool.get(s.cur_style).underline_color.palette);
+}
+
+test "SGR 38 colon form with colorspace slot still parses fg" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    var ev = Event.Csi{};
+    ev.final = 'm';
+    ev.n_params = 6;
+    ev.params[0] = 38;
+    ev.params[1] = 2;
+    ev.params[2] = 0; // colorspace
+    ev.params[3] = 1;
+    ev.params[4] = 2;
+    ev.params[5] = 3;
+    var k: usize = 1;
+    while (k <= 5) : (k += 1) ev.setSub(k, true);
+    s.csi(ev);
+    const e = pool.get(s.cur_style);
+    try std.testing.expectEqual(@as(u8, 1), e.fg.rgb.r);
+    try std.testing.expectEqual(@as(u8, 2), e.fg.rgb.g);
+    try std.testing.expectEqual(@as(u8, 3), e.fg.rgb.b);
 }

@@ -3911,3 +3911,30 @@ kitty/ghostty/xterm-in-UTF-8). The existing kitty conformance test
 ("C1 controls handled as printable") already encoded this stance for
 ground state; the string states were the leftover. Regression tests
 feed the exact ✳-title sequence.
+
+## 2026-06-10 — font handling overhaul
+
+Three gaps vs kitty/wezterm closed:
+
+- **Real italic / bold-italic faces.** `loadBoldFace` generalised to
+  `loadVariantFace(weight, slant)`; the atlas now resolves italic and
+  bold-italic siblings of the primary family via fontconfig at init.
+  Glyph cache keys gained ITALIC_KEY_BIT; `lookupOrLoad`/`ById` and
+  `shapeRun` take (bold, italic) and pick faces through one
+  `styledFace()` helper (graceful degradation: missing bold-italic →
+  italic + embolden; missing italic → regular + the old shader shear,
+  gated on `atlas.hasItalic()` in both passes). An italic face that
+  lacks a codepoint falls back to the regular face before fontconfig.
+- **`font_family` config** (global + per-profile + prefs entry row):
+  resolved to a file via fontconfig (`resolveFamilyPath`). Pane font
+  resolution order: `font` path → `font_family` → $SKETERM_FONT →
+  candidates, deduplicated into `Pane.createAtlas()`. Changing the
+  font at the same size now rebuilds atlases live
+  (`Pane.refreshFont`, split out of setFontSize).
+- **SGR 58/59 underline colour.** `StyleEntry.underline_color`
+  (.default = follow fg). The shared `sgrReadExtColor` helper parses
+  `;5;n`, `:5:n`, `;2;r;g;b`, `:2:r:g:b` AND the ITU colon form with
+  colorspace slot `:2::r:g:b` (what neovim emits) — 38/48 now accept
+  that form too. CellPass Instance carries `deco_color` (120 B);
+  the deco pass draws with it. Overlay (bidi) rows still draw
+  decorations-as-before — SGR underline colour there is a known gap.

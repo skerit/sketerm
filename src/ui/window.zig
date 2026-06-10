@@ -732,6 +732,11 @@ pub const Window = struct {
                     (if (pr.font_path.len > 0) pr.font_path else self.config.font_path)
                 else
                     self.config.font_path;
+                const eff_fam: []const u8 = if (profile) |pr|
+                    (if (pr.font_family.len > 0) pr.font_family else self.config.font_family)
+                else
+                    self.config.font_family;
+                pane.font_family = if (eff_fam.len > 0) eff_fam else null;
                 pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
                 pane.line_pad_px = self.config.line_pad_px;
                 pane.grid_pass.pad = self.config.padding;
@@ -1070,6 +1075,10 @@ pub const Window = struct {
             (if (p.font_path.len > 0) p.font_path else self.config.font_path)
         else
             self.config.font_path;
+        const eff_font_family: []const u8 = if (profile) |p|
+            (if (p.font_family.len > 0) p.font_family else self.config.font_family)
+        else
+            self.config.font_family;
         const eff_scrollback: u32 = if (profile) |p|
             (if (p.scrollback != 0) p.scrollback else self.config.scrollback)
         else
@@ -1078,6 +1087,7 @@ pub const Window = struct {
         // Push config-derived fields into the pane before realize.
         pane.font_size = eff_font_size;
         pane.font_path = eff_font_path;
+        pane.font_family = if (eff_font_family.len > 0) eff_font_family else null;
         pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
         pane.grid_pass.pad = self.config.padding;
         const fg_bg = self.resolveDefaultColors();
@@ -1673,6 +1683,10 @@ pub const Window = struct {
         // Compute diffs we need to react to BEFORE swapping config.
         const old_size = self.config.font_size;
         const old_pad = self.config.padding;
+        // Old font selection strings stay alive until the deferred
+        // old-arena free at function end, so comparing later is safe.
+        const old_font_path = self.config.font_path;
+        const old_font_family = self.config.font_family;
         const old_blink_ms = self.config.cursor_blink_ms;
         const old_tab_pos = self.config.tab_position;
         // Replace config wholesale via a deep copy into a fresh
@@ -1779,6 +1793,15 @@ pub const Window = struct {
                 }
                 break :blk self.config.font_path;
             };
+            p.font_family = blk: {
+                if (p.active_profile) |pn| {
+                    for (self.config.profiles.items) |*pr| {
+                        if (std.mem.eql(u8, pr.name, pn) and pr.font_family.len > 0)
+                            break :blk pr.font_family;
+                    }
+                }
+                break :blk if (self.config.font_family.len > 0) self.config.font_family else null;
+            };
             // Mouse / link / autohide flags on the Pane itself.
             p.copy_on_selection = self.config.copy_on_selection;
             p.clear_select_on_copy = self.config.clear_select_on_copy;
@@ -1805,6 +1828,14 @@ pub const Window = struct {
         // Font size needs the heavy atlas-rebuild path.
         if (self.config.font_size != old_size) {
             for (self.panes.items) |p| p.setFontSize(self.config.font_size);
+        } else {
+            // Same size, different font file/family: setFontSize would
+            // early-return, so rebuild the atlases explicitly.
+            const path_changed = !eqOptStr(old_font_path, self.config.font_path);
+            const family_changed = !std.mem.eql(u8, old_font_family, self.config.font_family);
+            if (path_changed or family_changed) {
+                for (self.panes.items) |p| p.refreshFont();
+            }
         }
 
         // Tab position swap.
@@ -3433,6 +3464,12 @@ fn widgetIsAncestor(ancestor: *c.GtkWidget, w: *c.GtkWidget) bool {
         if (x == ancestor) return true;
     }
     return false;
+}
+
+fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 fn prefsApplyCallback(win_ptr: *anyopaque, new_cfg: *const Config) void {

@@ -58,6 +58,8 @@ pub const Profile = struct {
     shell: []const u8 = "",
     /// Override for font file path. Empty → inherit `Config.font_path`.
     font_path: []const u8 = "",
+    /// Override for font family name. Empty → inherit `Config.font_family`.
+    font_family: []const u8 = "",
     /// Override for font size. 0 → inherit.
     font_size: u16 = 0,
     /// Override for the colour scheme name. Empty → inherit.
@@ -84,6 +86,9 @@ pub const ConfirmClose = enum { never, multiple, always };
 pub const Config = struct {
     // Font
     font_path: ?[]const u8 = null,
+    /// Font family name resolved via fontconfig ("JetBrains Mono").
+    /// `font_path` wins when both are set. Empty = unset.
+    font_family: []const u8 = "",
     font_size: u16 = 14,
     /// Extra pixels added to each cell's height for visual line
     /// spacing. 0 = font's natural metric; positive = looser; small
@@ -285,6 +290,7 @@ pub const Config = struct {
         var out = self.*;
         out.arena = null;
         if (self.font_path) |s| out.font_path = try arena.dupe(u8, s);
+        out.font_family = try arena.dupe(u8, self.font_family);
         if (self.shell) |s| out.shell = try arena.dupe(u8, s);
         out.scheme = try arena.dupe(u8, self.scheme);
         out.term_env = try arena.dupe(u8, self.term_env);
@@ -306,6 +312,7 @@ pub const Config = struct {
             cp.name = try arena.dupe(u8, p.name);
             cp.shell = try arena.dupe(u8, p.shell);
             cp.font_path = try arena.dupe(u8, p.font_path);
+            cp.font_family = try arena.dupe(u8, p.font_family);
             cp.scheme = try arena.dupe(u8, p.scheme);
             cp.term_env = try arena.dupe(u8, p.term_env);
             cp.color_term_env = try arena.dupe(u8, p.color_term_env);
@@ -438,6 +445,7 @@ pub const Config = struct {
 
         // Font.
         if (self.font_path) |fp| try w.print("font = {s}\n", .{fp});
+        if (self.font_family.len > 0) try w.print("font_family = {s}\n", .{self.font_family});
         if (self.font_size != 14) try w.print("font_size = {d}\n", .{self.font_size});
         if (self.line_pad_px != 0) try w.print("line_pad_px = {d}\n", .{self.line_pad_px});
 
@@ -565,6 +573,7 @@ pub const Config = struct {
             try w.print("\n[profile.{s}]\n", .{prof.name});
             if (prof.shell.len > 0) try w.print("shell = {s}\n", .{prof.shell});
             if (prof.font_path.len > 0) try w.print("font = {s}\n", .{prof.font_path});
+            if (prof.font_family.len > 0) try w.print("font_family = {s}\n", .{prof.font_family});
             if (prof.font_size != 0) try w.print("font_size = {d}\n", .{prof.font_size});
             if (prof.scheme.len > 0) try w.print("scheme = {s}\n", .{prof.scheme});
             if (prof.term_env.len > 0) try w.print("term = {s}\n", .{prof.term_env});
@@ -715,6 +724,8 @@ fn applyProfileKv(prof: *Profile, arena: std.mem.Allocator, key: []const u8, val
         prof.shell = try expandTilde(arena, value);
     } else if (std.mem.eql(u8, key, "font") or std.mem.eql(u8, key, "font_path")) {
         prof.font_path = try expandTilde(arena, value);
+    } else if (std.mem.eql(u8, key, "font_family")) {
+        prof.font_family = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "font_size")) {
         prof.font_size = try parseU16(value);
     } else if (std.mem.eql(u8, key, "scheme")) {
@@ -757,6 +768,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
     }
     if (std.mem.eql(u8, key, "font")) {
         cfg.font_path = try expandTilde(arena, value);
+    } else if (std.mem.eql(u8, key, "font_family")) {
+        cfg.font_family = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "font_size")) {
         cfg.font_size = try parseU16(value);
     } else if (std.mem.eql(u8, key, "line_pad_px") or std.mem.eql(u8, key, "line_spacing")) {

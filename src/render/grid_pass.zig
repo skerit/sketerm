@@ -634,7 +634,7 @@ pub const GridPass = struct {
                     0.0,
                     2.0,
                 );
-                const g = atlas.lookupOrLoad(cp, false) catch {
+                const g = atlas.lookupOrLoad(cp, false, false) catch {
                     idx += seq_len;
                     col_off += cell_w_count;
                     continue;
@@ -934,7 +934,7 @@ pub const GridPass = struct {
             }
             const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
-            const g = atlas.lookupOrLoad(cell.rune, bold) catch {
+            const g = atlas.lookupOrLoad(cell.rune, bold, style.attrs.italic) catch {
                 col += 1;
                 continue;
             };
@@ -945,8 +945,10 @@ pub const GridPass = struct {
                 const gh: f32 = @as(f32, @floatFromInt(g.h)) * y_scale;
                 // Italic/bold only on single-scale rows. DH/DW rows
                 // skip — shear pivot math gets weird with y_scale != 1.
+                // Shear only without a real italic face (the glyph
+                // carries the slant otherwise).
                 const is_single = (x_scale == 1.0 and y_scale == 1.0);
-                const italic_f: f32 = if (is_single and style.attrs.italic and !g.colored) 1.0 else 0.0;
+                const italic_f: f32 = if (is_single and style.attrs.italic and !g.colored and !atlas.hasItalic()) 1.0 else 0.0;
                 const bold_f: f32 = if (is_single and style.attrs.bold and self.allow_bold) 1.0 else 0.0;
                 const baseline_y: f32 = y + ch;
                 const colored_f: f32 = if (g.colored) 1.0 else 0.0;
@@ -1003,14 +1005,14 @@ pub const GridPass = struct {
             }
             const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
-            const g = atlas.lookupOrLoad(cell.rune, bold) catch continue;
+            const g = atlas.lookupOrLoad(cell.rune, bold, style.attrs.italic) catch continue;
             if (g.w == 0 or g.h == 0) continue;
             const gx: f32 = x + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
             const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;
             const gw: f32 = @as(f32, @floatFromInt(g.w)) * x_scale;
             const gh: f32 = @as(f32, @floatFromInt(g.h)) * y_scale;
             const is_single = (x_scale == 1.0 and y_scale == 1.0);
-            const italic_f: f32 = if (is_single and style.attrs.italic and !g.colored) 1.0 else 0.0;
+            const italic_f: f32 = if (is_single and style.attrs.italic and !g.colored and !atlas.hasItalic()) 1.0 else 0.0;
             const bold_f: f32 = if (is_single and style.attrs.bold and self.allow_bold) 1.0 else 0.0;
             const baseline_y: f32 = y + ch;
             const colored_f: f32 = if (g.colored) 1.0 else 0.0;

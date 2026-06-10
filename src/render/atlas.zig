@@ -73,11 +73,50 @@ const GlyphRef = struct {
     pub const Kind = enum { codepoint, gid };
 };
 
-/// Bold glyphs share the `cache` / `glyph_cache` maps with their regular
-/// counterparts, distinguished by this high bit in the key. Codepoints
-/// top out at 0x10FFFF (~2^21) and font glyph indices fit in a face's
-/// glyph count (< 2^16 for any sfnt), so bit 30 is always free.
+/// Bold / italic glyphs share the `cache` / `glyph_cache` maps with
+/// their regular counterparts, distinguished by these high bits in the
+/// key. Codepoints top out at 0x10FFFF (~2^21) and font glyph indices
+/// fit in a face's glyph count (< 2^16 for any sfnt), so bits 29/30
+/// are always free.
 const BOLD_KEY_BIT: u32 = 0x4000_0000;
+const ITALIC_KEY_BIT: u32 = 0x2000_0000;
+
+fn styleKey(base: u32, bold: bool, italic: bool) u32 {
+    var key = base;
+    if (bold) key |= BOLD_KEY_BIT;
+    if (italic) key |= ITALIC_KEY_BIT;
+    return key;
+}
+
+/// Resolve a font family name ("JetBrains Mono") to a file path via
+/// fontconfig. Returned slice is allocated with `allocator`; caller
+/// frees. Note fontconfig substitutes rather than failing: an unknown
+/// family resolves to the system default monospace-ish match.
+pub fn resolveFamilyPath(allocator: std.mem.Allocator, family: []const u8) ?[:0]u8 {
+    if (family.len == 0) return null;
+    if (c.FcInit() == 0) return null;
+    const fam_z = allocator.allocSentinel(u8, family.len, 0) catch return null;
+    defer allocator.free(fam_z);
+    @memcpy(fam_z, family);
+
+    const pattern = c.FcPatternCreate() orelse return null;
+    defer c.FcPatternDestroy(pattern);
+    _ = c.FcPatternAddString(pattern, c.FC_FAMILY, @ptrCast(fam_z.ptr));
+    _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, c.FC_WEIGHT_REGULAR);
+    _ = c.FcPatternAddInteger(pattern, c.FC_SLANT, c.FC_SLANT_ROMAN);
+    _ = c.FcPatternAddBool(pattern, c.FC_SCALABLE, c.FcTrue);
+    _ = c.FcConfigSubstitute(null, pattern, c.FcMatchPattern);
+    c.FcDefaultSubstitute(pattern);
+
+    var result: c.FcResult = undefined;
+    const match = c.FcFontMatch(null, pattern, &result) orelse return null;
+    defer c.FcPatternDestroy(match);
+
+    var file_ptr: [*c]c.FcChar8 = undefined;
+    if (c.FcPatternGetString(match, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch) return null;
+    const span = std.mem.span(@as([*:0]const u8, @ptrCast(file_ptr)));
+    return allocator.dupeZ(u8, span) catch null;
+}
 
 pub const Atlas = struct {
     ft_lib: c.FT_Library,
@@ -90,6 +129,12 @@ pub const Atlas = struct {
     /// True when there is no real bold face and bold must be synthesized
     /// via `FT_Outline_Embolden` on the regular (or fallback) face.
     synthesize_bold: bool = true,
+    /// Real italic / bold-italic faces (fontconfig matches of the
+    /// primary family), or null — italic then degrades to the shader
+    /// shear and bold-italic to italic-face + embolden (or bold face
+    /// + shear, or regular + both).
+    ft_face_italic: ?c.FT_Face = null,
+    ft_face_bold_italic: ?c.FT_Face = null,
     /// HarfBuzz font wrapping the FreeType face. Used by `shapeRun`
     /// for ligature / OpenType-feature aware text layout.
     hb_font: ?*c.hb_font_t = null,
@@ -97,6 +142,8 @@ pub const Atlas = struct {
     /// runs (their glyph ids live in the bold face's namespace). Null
     /// when there is no real bold face.
     hb_font_bold: ?*c.hb_font_t = null,
+    hb_font_italic: ?*c.hb_font_t = null,
+    hb_font_bold_italic: ?*c.hb_font_t = null,
     /// Reusable HarfBuzz buffer — created once per atlas, cleared
     /// and refilled per shapeRun. Saves the per-call allocation +
     /// destruction round-trip; was hot in TUI redraws with many
@@ -185,11 +232,15 @@ pub const Atlas = struct {
         const hb_buf = c.hb_buffer_create();
 
         const fc_ok = c.FcInit() != 0;
-        // Resolve the real bold face up front (best quality). Falls back
-        // to synthetic outline-embolden of the regular face when the
-        // family has no bold variant.
-        const bold_face = if (fc_ok) loadBoldFace(lib, face, font_path, size_px) else null;
+        // Resolve real bold / italic / bold-italic faces up front
+        // (best quality). Missing variants degrade to synthesis:
+        // outline-embolden for bold, shader shear for italic.
+        const bold_face = if (fc_ok) loadVariantFace(lib, face, font_path, size_px, c.FC_WEIGHT_BOLD, c.FC_SLANT_ROMAN) else null;
+        const italic_face = if (fc_ok) loadVariantFace(lib, face, font_path, size_px, c.FC_WEIGHT_REGULAR, c.FC_SLANT_ITALIC) else null;
+        const bold_italic_face = if (fc_ok) loadVariantFace(lib, face, font_path, size_px, c.FC_WEIGHT_BOLD, c.FC_SLANT_ITALIC) else null;
         const hb_font_bold = if (bold_face) |bf| c.hb_ft_font_create_referenced(bf) else null;
+        const hb_font_italic = if (italic_face) |f| c.hb_ft_font_create_referenced(f) else null;
+        const hb_font_bold_italic = if (bold_italic_face) |f| c.hb_ft_font_create_referenced(f) else null;
 
         const self = try allocator.create(Atlas);
         errdefer allocator.destroy(self);
@@ -198,8 +249,12 @@ pub const Atlas = struct {
             .ft_face = face,
             .ft_face_bold = bold_face,
             .synthesize_bold = bold_face == null,
+            .ft_face_italic = italic_face,
+            .ft_face_bold_italic = bold_italic_face,
             .hb_font = hb_font,
             .hb_font_bold = hb_font_bold,
+            .hb_font_italic = hb_font_italic,
+            .hb_font_bold_italic = hb_font_bold_italic,
             .hb_buf = hb_buf,
             .cell_w = cell_w,
             .cell_h = cell_h,
@@ -284,7 +339,7 @@ pub const Atlas = struct {
         // shell prompt in a fresh pane visibly stutters otherwise.
         var cp: u32 = 0x20;
         while (cp < 0x7F) : (cp += 1) {
-            _ = self.lookupOrLoad(cp, false) catch continue;
+            _ = self.lookupOrLoad(cp, false, false) catch continue;
         }
     }
 
@@ -305,10 +360,14 @@ pub const Atlas = struct {
         if (self.hb_buf) |b| c.hb_buffer_destroy(b);
         if (self.hb_font) |f| c.hb_font_destroy(f);
         if (self.hb_font_bold) |f| c.hb_font_destroy(f);
+        if (self.hb_font_italic) |f| c.hb_font_destroy(f);
+        if (self.hb_font_bold_italic) |f| c.hb_font_destroy(f);
         for (self.fallback_faces.items) |fb| _ = c.FT_Done_Face(fb);
         self.fallback_faces.deinit(self.allocator);
         self.cp_to_fallback.deinit();
         if (self.ft_face_bold) |bf| _ = c.FT_Done_Face(bf);
+        if (self.ft_face_italic) |f| _ = c.FT_Done_Face(f);
+        if (self.ft_face_bold_italic) |f| _ = c.FT_Done_Face(f);
         _ = c.FT_Done_Face(self.ft_face);
         _ = c.FT_Done_FreeType(self.ft_lib);
         self.allocator.destroy(self);
@@ -343,19 +402,23 @@ pub const Atlas = struct {
     /// Shape a UTF-8 run with HarfBuzz. Result is cached by content
     /// hash; the returned slice is OWNED BY THE ATLAS — callers must
     /// NOT free it. The atlas frees all cached results on deinit.
-    pub fn shapeRun(self: *Atlas, _: std.mem.Allocator, text: []const u8, bold: bool) ![]ShapedGlyph {
-        // A bold run shapes with the bold HarfBuzz font so its glyph ids
-        // land in the bold face's namespace. With no real bold face we
-        // shape with the regular font (gids stay regular and are
-        // emboldened at raster time), so the key must NOT be bold-tagged
-        // then — else identical text would shape twice for one result.
-        const use_bold = bold and self.hb_font_bold != null;
-        const font = (if (use_bold) self.hb_font_bold else self.hb_font) orelse return error.NoHarfBuzzFont;
+    pub fn shapeRun(self: *Atlas, _: std.mem.Allocator, text: []const u8, bold: bool, italic: bool) ![]ShapedGlyph {
+        // A styled run shapes with the matching HarfBuzz font so its
+        // glyph ids land in that face's namespace. With no real styled
+        // face we shape with the regular font (gids stay regular and
+        // are emboldened/sheared at raster/draw time), so the cache key
+        // must NOT be style-tagged then — else identical text would
+        // shape twice for one result. The key tag must mirror the face
+        // styledFace() will pick at glyph-load time.
+        const sf = self.styledFace(bold, italic);
+        const font = (sf.hb orelse self.hb_font) orelse return error.NoHarfBuzzFont;
         const buf = self.hb_buf orelse return error.NoHarfBuzzFont;
 
         // Cache hit?
         var key = std.hash.Wyhash.hash(0, text);
-        if (use_bold) key ^= 0x9E37_79B9_7F4A_7C15;
+        if (font == self.hb_font_bold) key ^= 0x9E37_79B9_7F4A_7C15;
+        if (font == self.hb_font_italic) key ^= 0x5851_F42D_4C95_7F2D;
+        if (font == self.hb_font_bold_italic) key ^= 0x2545_F491_4F6C_DD1D;
         if (self.shape_cache.get(key)) |cached| return cached;
 
         // Cache miss — shape using the persistent buffer (no per-call
@@ -402,20 +465,20 @@ pub const Atlas = struct {
     }
 
     /// Codepoint-keyed lookup. Marks the host page as used. When `bold`
-    /// is set, the glyph is drawn from the real bold face (or synthesized
-    /// via outline-embolden) and cached under a bold-tagged key.
-    pub fn lookupOrLoad(self: *Atlas, codepoint: u32, bold: bool) !Glyph {
-        const key = if (bold) codepoint | BOLD_KEY_BIT else codepoint;
+    /// / `italic` are set, the glyph is drawn from the matching real
+    /// face (or synthesized: embolden for bold; italic without a real
+    /// face is sheared by the renderer) and cached under a style-tagged
+    /// key.
+    pub fn lookupOrLoad(self: *Atlas, codepoint: u32, bold: bool, italic: bool) !Glyph {
+        const key = styleKey(codepoint, bold, italic);
         if (self.cache.get(key)) |g| {
             self.touchPage(g.layer);
             return g;
         }
-        // For bold, prefer the real bold face's glyph index; with no bold
-        // face the regular index is used and emboldened at raster time.
-        const primary: c.FT_Face = if (bold) (self.ft_face_bold orelse self.ft_face) else self.ft_face;
-        const gid = c.FT_Get_Char_Index(primary, codepoint);
+        const sf = self.styledFace(bold, italic);
+        const gid = c.FT_Get_Char_Index(sf.face, codepoint);
         if (gid != 0 or codepoint == 0) {
-            const g = self.lookupOrLoadById(gid, bold) catch return self.cacheEmptyCp(codepoint);
+            const g = self.loadGlyphFromFace(sf.face, gid, sf.embolden) catch return self.cacheEmpty(key);
             try self.cache.put(key, g);
             try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
                 .key = key,
@@ -423,15 +486,13 @@ pub const Atlas = struct {
             });
             return g;
         }
-        // Primary face doesn't have this codepoint — try fontconfig
-        // fallbacks. Result is cached (positive or negative) so we
-        // don't re-query for the same missing codepoint. Bold fallback
-        // glyphs are always synthesized (fallback faces rarely ship a
-        // matching bold).
-        if (self.findFallbackFace(codepoint)) |fb_face| {
-            const fb_gid = c.FT_Get_Char_Index(fb_face, codepoint);
-            if (fb_gid != 0) {
-                const g = self.loadGlyphFromFace(fb_face, fb_gid, bold) catch return self.cacheEmptyCp(codepoint);
+        // Styled face doesn't have this codepoint — try the regular
+        // face before fontconfig fallbacks (an italic variant can ship
+        // fewer glyphs than its regular sibling).
+        if (sf.face != self.ft_face) {
+            const reg_gid = c.FT_Get_Char_Index(self.ft_face, codepoint);
+            if (reg_gid != 0) {
+                const g = self.loadGlyphFromFace(self.ft_face, reg_gid, bold) catch return self.cacheEmpty(key);
                 try self.cache.put(key, g);
                 try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
                     .key = key,
@@ -440,7 +501,23 @@ pub const Atlas = struct {
                 return g;
             }
         }
-        return self.cacheEmptyCp(codepoint);
+        // Fontconfig fallbacks. Result is cached (positive or negative)
+        // so we don't re-query for the same missing codepoint. Styled
+        // fallback glyphs are always synthesized (fallback faces rarely
+        // ship matching variants).
+        if (self.findFallbackFace(codepoint)) |fb_face| {
+            const fb_gid = c.FT_Get_Char_Index(fb_face, codepoint);
+            if (fb_gid != 0) {
+                const g = self.loadGlyphFromFace(fb_face, fb_gid, bold) catch return self.cacheEmpty(key);
+                try self.cache.put(key, g);
+                try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+                    .key = key,
+                    .kind = .codepoint,
+                });
+                return g;
+            }
+        }
+        return self.cacheEmpty(key);
     }
 
     /// Best-effort negative caching: under allocation pressure we may
@@ -567,20 +644,21 @@ pub const Atlas = struct {
         return fb_face;
     }
 
-    /// Glyph-id keyed lookup (HarfBuzz output). When `bold` is set the
-    /// gid is interpreted in the bold face's namespace (caller shaped the
-    /// run with the bold HarfBuzz font); with no bold face the regular
-    /// gid is emboldened at raster time.
-    pub fn lookupOrLoadById(self: *Atlas, gid: u32, bold: bool) !Glyph {
-        const key = if (bold) gid | BOLD_KEY_BIT else gid;
+    /// Glyph-id keyed lookup (HarfBuzz output). When `bold` / `italic`
+    /// are set the gid is interpreted in the matching styled face's
+    /// namespace (the caller shaped the run with that face's HarfBuzz
+    /// font — shapeRun and this function pick faces via the same
+    /// styledFace()); with no styled face the regular gid is used and
+    /// bold is emboldened at raster time.
+    pub fn lookupOrLoadById(self: *Atlas, gid: u32, bold: bool, italic: bool) !Glyph {
+        const key = styleKey(gid, bold, italic);
         if (self.glyph_cache.get(key)) |g| {
             self.touchPage(g.layer);
             return g;
         }
-        const face: c.FT_Face = if (bold) (self.ft_face_bold orelse self.ft_face) else self.ft_face;
-        const embolden = bold and self.ft_face_bold == null;
-        const g = try self.loadGlyphFromFace(face, gid, embolden);
-        // gid cache only applies to the primary face — fallback glyphs
+        const sf = self.styledFace(bold, italic);
+        const g = try self.loadGlyphFromFace(sf.face, gid, sf.embolden);
+        // gid cache only applies to the primary faces — fallback glyphs
         // share the same gid namespace per-face but collide across.
         try self.glyph_cache.put(key, g);
         try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
@@ -590,18 +668,26 @@ pub const Atlas = struct {
         return g;
     }
 
-    /// Ask fontconfig for the bold-weight, roman variant of the primary
-    /// face's family and load it with FreeType. Returns null when no
-    /// genuinely-bolder face exists (caller then synthesizes bold). The
-    /// caller has already verified FcInit() succeeded.
-    fn loadBoldFace(lib: c.FT_Library, regular: c.FT_Face, regular_path: [*:0]const u8, size_px: u16) ?c.FT_Face {
+    /// Ask fontconfig for a styled variant (weight/slant) of the
+    /// primary face's family and load it with FreeType. Returns null
+    /// when no genuine variant exists (caller then synthesizes: bold
+    /// via outline-embolden, italic via the shader shear). The caller
+    /// has already verified FcInit() succeeded.
+    fn loadVariantFace(
+        lib: c.FT_Library,
+        regular: c.FT_Face,
+        regular_path: [*:0]const u8,
+        size_px: u16,
+        want_weight: c_int,
+        want_slant: c_int,
+    ) ?c.FT_Face {
         const fam = regular.*.family_name;
         if (fam == null) return null;
         const pattern = c.FcPatternCreate() orelse return null;
         defer c.FcPatternDestroy(pattern);
         _ = c.FcPatternAddString(pattern, c.FC_FAMILY, @ptrCast(fam));
-        _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, c.FC_WEIGHT_BOLD);
-        _ = c.FcPatternAddInteger(pattern, c.FC_SLANT, c.FC_SLANT_ROMAN);
+        _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, want_weight);
+        _ = c.FcPatternAddInteger(pattern, c.FC_SLANT, want_slant);
         _ = c.FcPatternAddBool(pattern, c.FC_SCALABLE, c.FcTrue);
         _ = c.FcConfigSubstitute(null, pattern, c.FcMatchPattern);
         c.FcDefaultSubstitute(pattern);
@@ -614,23 +700,66 @@ pub const Atlas = struct {
         if (c.FcPatternGetString(match, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch) return null;
         const file_z: [*:0]const u8 = @ptrCast(file_ptr);
 
-        // Reject the match unless it is actually bold-weight AND a
-        // different file than the regular face. If fontconfig had no
-        // bold sibling it returns the regular file at regular weight;
-        // loading that as "bold" would just duplicate the regular face,
-        // so fall through to synthesis instead.
-        var weight: c_int = 0;
-        _ = c.FcPatternGetInteger(match, c.FC_WEIGHT, 0, &weight);
-        if (weight < c.FC_WEIGHT_SEMIBOLD) return null;
+        // Reject the match unless it genuinely has the requested
+        // style AND is a different file than the regular face. When
+        // the family ships no such sibling, fontconfig returns the
+        // regular file at regular style; loading that would just
+        // duplicate the regular face — fall through to synthesis.
+        if (want_weight >= c.FC_WEIGHT_BOLD) {
+            var weight: c_int = 0;
+            _ = c.FcPatternGetInteger(match, c.FC_WEIGHT, 0, &weight);
+            if (weight < c.FC_WEIGHT_SEMIBOLD) return null;
+        }
+        if (want_slant >= c.FC_SLANT_ITALIC) {
+            var slant: c_int = 0;
+            _ = c.FcPatternGetInteger(match, c.FC_SLANT, 0, &slant);
+            // Accept italic or oblique — either is a real slanted face.
+            if (slant < c.FC_SLANT_ITALIC) return null;
+        }
         if (std.mem.orderZ(u8, file_z, regular_path) == .eq) return null;
 
-        var bold: c.FT_Face = undefined;
-        if (c.FT_New_Face(lib, file_z, 0, &bold) != 0) return null;
-        if (c.FT_Set_Pixel_Sizes(bold, 0, size_px) != 0) {
-            _ = c.FT_Done_Face(bold);
+        var variant: c.FT_Face = undefined;
+        if (c.FT_New_Face(lib, file_z, 0, &variant) != 0) return null;
+        if (c.FT_Set_Pixel_Sizes(variant, 0, size_px) != 0) {
+            _ = c.FT_Done_Face(variant);
             return null;
         }
-        return bold;
+        return variant;
+    }
+
+    /// Pick the best-matching primary face for a style, with graceful
+    /// degradation. `embolden` reports whether the caller must still
+    /// synthesize bold; renderers consult `hasItalic()` to decide on
+    /// the shader shear.
+    const StyledFace = struct {
+        face: c.FT_Face,
+        hb: ?*c.hb_font_t,
+        embolden: bool,
+    };
+
+    fn styledFace(self: *const Atlas, bold: bool, italic: bool) StyledFace {
+        // The renderer's shear decision is global (hasItalic), so the
+        // italic branches are taken only when ft_face_italic exists —
+        // a bold-italic-without-italic family would otherwise get
+        // double-slanted (real slant + shear).
+        if (bold and italic and self.hasItalic()) {
+            if (self.ft_face_bold_italic) |f| return .{ .face = f, .hb = self.hb_font_bold_italic, .embolden = false };
+            return .{ .face = self.ft_face_italic.?, .hb = self.hb_font_italic, .embolden = true };
+        }
+        if (italic and self.hasItalic()) {
+            return .{ .face = self.ft_face_italic.?, .hb = self.hb_font_italic, .embolden = false };
+        }
+        if (bold) {
+            if (self.ft_face_bold) |f| return .{ .face = f, .hb = self.hb_font_bold, .embolden = false };
+            return .{ .face = self.ft_face, .hb = self.hb_font, .embolden = true };
+        }
+        return .{ .face = self.ft_face, .hb = self.hb_font, .embolden = false };
+    }
+
+    /// Whether a real italic face is available. When true, renderers
+    /// draw italic cells from it and skip the synthetic shear.
+    pub fn hasItalic(self: *const Atlas) bool {
+        return self.ft_face_italic != null;
     }
 
     /// Rasterize `gid` on `face`, packing into the atlas. When `embolden`
@@ -910,17 +1039,12 @@ pub const Atlas = struct {
         };
     }
 
-    fn cacheEmptyCp(self: *Atlas, codepoint: u32) Glyph {
+    fn cacheEmpty(self: *Atlas, key: u32) Glyph {
         const empty = self.emptyGlyph();
-        _ = self.cache.put(codepoint, empty) catch {};
+        _ = self.cache.put(key, empty) catch {};
         return empty;
     }
 
-    fn cacheEmptyId(self: *Atlas, gid: u32) Glyph {
-        const empty = self.emptyGlyph();
-        _ = self.glyph_cache.put(gid, empty) catch {};
-        return empty;
-    }
 };
 
 test "atlas page eviction recycles space" {

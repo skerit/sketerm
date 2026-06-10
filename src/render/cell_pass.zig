@@ -57,6 +57,9 @@ pub const Instance = extern struct {
     /// 1.0 = colour (emoji) glyph: the atlas texels carry straight
     /// RGBA sampled directly; fg tint does not apply.
     colored: f32 = 0,
+    /// Decoration (underline/strike/overline) colour. Defaults to the
+    /// cell fg; SGR 58 overrides it (diagnostic squiggles).
+    deco_color: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 // ITALIC_SHEAR = tan(13°) ≈ 0.231: horizontal-shear factor used to
@@ -79,6 +82,7 @@ const VERT_SRC =
     \\in float a_italic;
     \\in float a_bold;
     \\in float a_colored;
+    \\in vec4 a_deco_color;
     \\
     \\uniform vec2 u_screen_px;
     \\uniform int u_kind; // 0 = bg, 1 = glyph, 2 = decoration
@@ -168,7 +172,7 @@ const VERT_SRC =
     \\        }
     \\        origin = a_cell_xy + vec2(0.0, dy);
     \\        size = vec2(a_cell_size.x, dh);
-    \\        v_color = vec4(a_fg.rgb * u_dim_fg, a_fg.a);
+    \\        v_color = vec4(a_deco_color.rgb * u_dim_fg, a_deco_color.a);
     \\        v_is_glyph = 0.0;
     \\        v_deco_kind = a_deco;
     \\        v_deco_local = corner;
@@ -456,6 +460,7 @@ pub const CellPass = struct {
             .{ .name = "a_italic", .off = @offsetOf(Instance, "italic"), .count = 1 },
             .{ .name = "a_bold", .off = @offsetOf(Instance, "bold"), .count = 1 },
             .{ .name = "a_colored", .off = @offsetOf(Instance, "colored"), .count = 1 },
+            .{ .name = "a_deco_color", .off = @offsetOf(Instance, "deco_color"), .count = 4 },
         };
         for (fields) |f| {
             const loc = c.glGetAttribLocation(self.program, f.name.ptr);
@@ -631,7 +636,9 @@ pub const CellPass = struct {
         var cached_bg: [4]f32 = .{ 0, 0, 0, 0 };
         var cached_has_bg: bool = false;
         var cached_deco: f32 = 0;
+        var cached_deco_color: [4]f32 = .{ 0, 0, 0, 0 };
         var cached_italic: f32 = 0;
+        var cached_attr_italic: bool = false;
         var cached_bold: f32 = 0;
         while (col < cells.len) : (col += 1) {
             const cell = cells[col];
@@ -655,7 +662,15 @@ pub const CellPass = struct {
                     else if (style.attrs.strikethrough) 4.0
                     else if (style.attrs.overline) 5.0
                     else 0.0;
-                cached_italic = if (style.attrs.italic) 1.0 else 0.0;
+                cached_deco_color = switch (style.underline_color) {
+                    .default => cached_fg,
+                    else => self.colorToRGBA(style.underline_color, true),
+                };
+                cached_attr_italic = style.attrs.italic;
+                // Shader shear is the fallback for families without a
+                // real italic face; with one, the italic glyph itself
+                // carries the slant.
+                cached_italic = if (style.attrs.italic and !atlas.hasItalic()) 1.0 else 0.0;
                 cached_bold = if (style.attrs.bold and self.allow_bold) 1.0 else 0.0;
                 cached_style = cell.style_ref;
             }
@@ -663,13 +678,14 @@ pub const CellPass = struct {
             slice[col].fg = cached_fg;
             slice[col].has_glyph = 1.0; // 1 = no glyph until we set one
             slice[col].deco = cached_deco;
+            slice[col].deco_color = cached_deco_color;
             slice[col].italic = cached_italic;
             slice[col].bold = cached_bold;
             // Per-codepoint glyph (will be overridden by ligature shaping
             // below if applicable). Bold pulls a real bold glyph from the
             // atlas (bold face or outline-embolden) — no shader fakery.
             if (cell.rune != 0 and cell.rune != ' ' and (cell.flags & 0b0000_0010) == 0) {
-                const g = atlas.lookupOrLoad(cell.rune, cached_bold > 0.5) catch continue;
+                const g = atlas.lookupOrLoad(cell.rune, cached_bold > 0.5, cached_attr_italic) catch continue;
                 if (g.w > 0 and g.h > 0) {
                     const gx: f32 = cx + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
                     const gy: f32 = y + ascent - @as(f32, @floatFromInt(g.bearing_y)) * y_scale + y_origin_shift;
@@ -779,12 +795,14 @@ pub const CellPass = struct {
             if (!lig_ascii_only) continue;
             if (blen == 0) continue;
 
-            // Bold runs shape + rasterize against the bold face (or
-            // outline-embolden) so the ligature matches its bold cells.
-            const run_bold = pool.get(run_style).attrs.bold and self.allow_bold;
+            // Styled runs shape + rasterize against the matching face
+            // (or synthesize) so the ligature matches its cells.
+            const run_attrs = pool.get(run_style).attrs;
+            const run_bold = run_attrs.bold and self.allow_bold;
+            const run_italic = run_attrs.italic;
 
             // Atlas owns the cached shape slice — do NOT free.
-            const shaped = atlas.shapeRun(self.allocator, bytes[0..blen], run_bold) catch continue;
+            const shaped = atlas.shapeRun(self.allocator, bytes[0..blen], run_bold, run_italic) catch continue;
             if (shaped.len == 0 or shaped.len == run_len) continue; // No ligation occurred.
 
             // Clear all run cells' glyphs first; we'll repopulate.
@@ -802,7 +820,7 @@ pub const CellPass = struct {
 
             for (shaped) |sg| {
                 const cluster_col = run_start + @as(u16, @intCast(@min(@as(usize, sg.cluster), @as(usize, run_len) - 1)));
-                const g = atlas.lookupOrLoadById(sg.glyph_id, run_bold) catch continue;
+                const g = atlas.lookupOrLoadById(sg.glyph_id, run_bold, run_italic) catch continue;
                 if (g.w == 0 or g.h == 0) continue;
                 const x: f32 = pad + @as(f32, @floatFromInt(cluster_col)) * cw;
                 const xoff: f32 = @as(f32, @floatFromInt(sg.x_offset)) / 64.0;
@@ -969,6 +987,6 @@ pub fn rowNeedsBidiOrComplexShape(cells: []const Cell) bool {
     return Screen.rowNeedsBidiOrComplexShape(cells);
 }
 
-test "Instance is 104 bytes" {
-    try std.testing.expectEqual(@as(usize, 104), @sizeOf(Instance));
+test "Instance is 120 bytes" {
+    try std.testing.expectEqual(@as(usize, 120), @sizeOf(Instance));
 }

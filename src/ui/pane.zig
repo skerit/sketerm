@@ -99,6 +99,10 @@ pub const Pane = struct {
     /// Optional explicit font path (overrides FONT_CANDIDATES). Owned
     /// by the Config arena, valid for the lifetime of the Window.
     font_path: ?[]const u8 = null,
+    /// Optional font family name resolved via fontconfig. Used when
+    /// `font_path` is unset (or fails to load). Owned by the Config
+    /// arena like `font_path`.
+    font_family: ?[]const u8 = null,
     /// Cursor blink half-cycle interval in microseconds. 500_000
     /// (= 500 ms) is the xterm default.
     cursor_blink_us: i64 = 500_000,
@@ -590,6 +594,40 @@ pub const Pane = struct {
         return @ptrCast(self.area);
     }
 
+    /// Build an Atlas at the pane's current size. Resolution order:
+    /// explicit file path → family name via fontconfig → $SKETERM_FONT
+    /// → built-in candidate list. Returns null when nothing loads.
+    fn createAtlas(self: *Pane) ?*Atlas {
+        const size: u16 = self.physicalFontSize();
+        if (self.font_path) |fp| {
+            if (self.tryAtlasPath(fp, size)) |a| return a;
+        }
+        if (self.font_family) |fam| {
+            if (@import("../render/atlas.zig").resolveFamilyPath(self.allocator, fam)) |path| {
+                defer self.allocator.free(path);
+                if (Atlas.initOpts(self.allocator, path.ptr, size, self.line_pad_px)) |a| {
+                    return a;
+                } else |_| {}
+            }
+        }
+        if (@import("../util/profile.zig").getenv("SKETERM_FONT")) |env_path| {
+            if (self.tryAtlasPath(env_path, size)) |a| return a;
+        }
+        for (FONT_CANDIDATES) |path| {
+            if (Atlas.initOpts(self.allocator, path, size, self.line_pad_px)) |a| {
+                return a;
+            } else |_| continue;
+        }
+        return null;
+    }
+
+    fn tryAtlasPath(self: *Pane, fp: []const u8, size: u16) ?*Atlas {
+        const z = self.allocator.allocSentinel(u8, fp.len, 0) catch return null;
+        defer self.allocator.free(z);
+        @memcpy(z, fp);
+        return Atlas.initOpts(self.allocator, z.ptr, size, self.line_pad_px) catch null;
+    }
+
     /// Install the frame-clock tick callback if it isn't already
     /// running. Cheap idempotent — can be called from event handlers
     /// without checking state. Triggers that start time-driven work
@@ -690,12 +728,19 @@ pub const Pane = struct {
     pub fn setFontSize(self: *Pane, new_size: u16) void {
         if (new_size == self.font_size) return;
         self.font_size = new_size;
+        self.refreshFont();
+    }
 
+    /// Rebuild the atlas against the pane's CURRENT font fields
+    /// (size, path, family, line padding). Used by setFontSize and by
+    /// applyConfigChange when the font selection changed at the same
+    /// size.
+    pub fn refreshFont(self: *Pane) void {
         // Bail before touching GL state if the GLArea hasn't realized
         // yet (theoretically possible when prefs / Ctrl+= fire on a
         // never-mapped tab via --restore + dialog open). The next
-        // realize will pick up `font_size` and build the atlas at
-        // the new size from scratch.
+        // realize will pick up the font fields and build the atlas
+        // from scratch.
         if (c.gtk_widget_get_realized(@ptrCast(self.area)) == 0) return;
 
         // Make our GL context current so the texture deletes hit the
@@ -715,33 +760,7 @@ pub const Pane = struct {
 
         // Same path as onRealize but inline so we don't re-do GL pass
         // setup (those programs / VBOs are still live).
-        const size: u16 = self.physicalFontSize();
-        if (self.font_path) |fp| {
-            const z = self.allocator.allocSentinel(u8, fp.len, 0) catch return;
-            defer self.allocator.free(z);
-            @memcpy(z, fp);
-            if (Atlas.initOpts(self.allocator, z.ptr, size, self.line_pad_px)) |a| {
-                self.atlas = a;
-            } else |_| {}
-        }
-        if (self.atlas == null) {
-            if (@import("../util/profile.zig").getenv("SKETERM_FONT")) |env_path| {
-                const z = self.allocator.allocSentinel(u8, env_path.len, 0) catch return;
-                defer self.allocator.free(z);
-                @memcpy(z, env_path);
-                if (Atlas.initOpts(self.allocator, z.ptr, size, self.line_pad_px)) |a| {
-                    self.atlas = a;
-                } else |_| {}
-            }
-        }
-        if (self.atlas == null) {
-            for (FONT_CANDIDATES) |path| {
-                if (Atlas.initOpts(self.allocator, path, size, self.line_pad_px)) |a| {
-                    self.atlas = a;
-                    break;
-                } else |_| continue;
-            }
-        }
+        self.atlas = self.createAtlas();
         if (self.atlas == null) return;
         self.atlas.?.realize();
 
@@ -842,37 +861,10 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     self.image_pass.forgetGL();
     self.image_store.forgetGL();
 
-    // Resolution order: explicit Pane.font_path → $SKETERM_FONT env →
-    // built-in candidate list. Size from Pane.font_size (set by
-    // Config or the Ctrl+/Ctrl- shortcuts).
-    self.atlas = null;
-    const size: u16 = self.physicalFontSize();
-    if (self.font_path) |fp| {
-        const z = self.allocator.allocSentinel(u8, fp.len, 0) catch return;
-        defer self.allocator.free(z);
-        @memcpy(z, fp);
-        if (Atlas.initOpts(self.allocator, z.ptr, size, self.line_pad_px)) |a| {
-            self.atlas = a;
-        } else |_| {}
-    }
-    if (self.atlas == null) {
-        if (@import("../util/profile.zig").getenv("SKETERM_FONT")) |env_path| {
-            const z = self.allocator.allocSentinel(u8, env_path.len, 0) catch return;
-            defer self.allocator.free(z);
-            @memcpy(z, env_path);
-            if (Atlas.initOpts(self.allocator, z.ptr, size, self.line_pad_px)) |a| {
-                self.atlas = a;
-            } else |_| {}
-        }
-    }
-    if (self.atlas == null) {
-        for (FONT_CANDIDATES) |path| {
-            if (Atlas.initOpts(self.allocator, path, size, self.line_pad_px)) |a| {
-                self.atlas = a;
-                break;
-            } else |_| continue;
-        }
-    }
+    // Resolution order: explicit Pane.font_path → Pane.font_family
+    // (fontconfig) → $SKETERM_FONT env → built-in candidate list.
+    // Size from Pane.font_size (set by Config or Ctrl+/Ctrl-).
+    self.atlas = self.createAtlas();
     if (self.atlas == null) {
         std.debug.print("pane realize: no usable font in {d} candidates\n", .{FONT_CANDIDATES.len});
         return;

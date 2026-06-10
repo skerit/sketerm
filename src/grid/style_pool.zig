@@ -50,11 +50,15 @@ pub const Attrs = packed struct(u16) {
 pub const Entry = struct {
     fg: Color = .default,
     bg: Color = .default,
+    /// SGR 58/59 underline (decoration) colour. `.default` = follow
+    /// the cell's fg, the pre-SGR-58 behaviour.
+    underline_color: Color = .default,
     attrs: Attrs = .{},
 
     pub fn equal(a: Entry, b: Entry) bool {
         if (!Color.equal(a.fg, b.fg)) return false;
         if (!Color.equal(a.bg, b.bg)) return false;
+        if (!Color.equal(a.underline_color, b.underline_color)) return false;
         return @as(u16, @bitCast(a.attrs)) == @as(u16, @bitCast(b.attrs));
     }
 };

@@ -116,6 +116,7 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
 
     const font_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(font_group)), "Font");
+    addFontFamilyRow(@ptrCast(@alignCast(font_group)), ctx);
     addFontPathRow(@ptrCast(@alignCast(font_group)), ctx);
     addSpinRowU16(@ptrCast(@alignCast(font_group)), ctx, "Size", "Font size in points", 6, 72, &ctx.cfg.font_size, fontSizeChanged);
     addSpinRowI16(@ptrCast(@alignCast(font_group)), ctx, "Line spacing", "Extra pixels per cell row", -8, 24, &ctx.cfg.line_pad_px, linePadChanged);
@@ -419,6 +420,29 @@ fn cursorShapeSelected(ctx: *Ctx, idx: c_uint) void {
 }
 
 // ── Font path row (file chooser) ────────────────────────────────
+
+fn addFontFamilyRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Font family (fontconfig name; the font file below wins if set)");
+    if (ctx.cfg.font_family.len > 0) {
+        var z: [256:0]u8 = undefined;
+        const n = @min(ctx.cfg.font_family.len, z.len);
+        @memcpy(z[0..n], ctx.cfg.font_family[0..n]);
+        z[n] = 0;
+        c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
+    }
+    _ = c.g_signal_connect_data(row, "changed", @ptrCast(&fontFamilyChanged), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn fontFamilyChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
+    const txt = c.gtk_editable_get_text(row);
+    if (txt == null) return;
+    const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+    ctx.cfg.font_family = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
+    ctx.ev();
+}
 
 fn addFontPathRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_action_row_new();
