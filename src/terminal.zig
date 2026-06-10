@@ -733,6 +733,17 @@ pub const Terminal = struct {
         else
             null;
 
+        // Budgeted drain: an output flood (cat largefile, fast TUI)
+        // can refill the ring as fast as we pop it. Without a cap
+        // this loop owns the main thread for the whole burst and GTK
+        // can't paint or process input. Cap by event count, with a
+        // coarse time check so heavyweight events (images) can't
+        // blow the budget — then re-arm and yield back to the loop.
+        const max_events: u32 = 4096;
+        const budget_ms: i64 = 3;
+        const start_ms = profile_util.milliTimestamp();
+        var processed: u32 = 0;
+        var over_budget = false;
         while (self.ring.pop()) |ev| {
             var mut_ev = ev;
             if (stderr_writer) |*w| {
@@ -741,6 +752,13 @@ pub const Terminal = struct {
             // Apply to grid.
             self.screen.apply(ev);
             mut_ev.deinit(self.allocator);
+            processed += 1;
+            if (processed >= max_events or
+                (processed & 0xFF == 0 and profile_util.milliTimestamp() - start_ms >= budget_ms))
+            {
+                over_budget = true;
+                break;
+            }
         }
 
         if (stderr_writer) |*w| {
@@ -753,6 +771,15 @@ pub const Terminal = struct {
         // app will tell us when to flush.
         if (self.screen.dirty and !self.screen.sync_output) {
             if (self.on_render_request) |f| f(self.user_ctx);
+        }
+
+        // Ring not empty: re-arm with the same coalescing dance the
+        // worker uses, so we never double-queue an invoke.
+        if (over_budget) {
+            const was_pending = handle.drain_pending.swap(true, .acq_rel);
+            if (!was_pending) {
+                _ = c.g_main_context_invoke(null, mainDrain, @ptrCast(handle));
+            }
         }
 
         return @intFromBool(false); // G_SOURCE_REMOVE
