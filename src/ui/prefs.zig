@@ -149,6 +149,12 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSpinRowF32Step(@ptrCast(@alignCast(dim_group)), ctx, "Background dim", "Multiplier for cell backgrounds.", 0.0, 1.0, 0.05, 2, &ctx.cfg.inactive_bg_dim, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(dim_group)));
 
+    // Text legibility.
+    const contrast_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(contrast_group)), "Legibility");
+    addSpinRowF32Step(@ptrCast(@alignCast(contrast_group)), ctx, "Minimum contrast", "WCAG ratio 1..21. Text below it snaps to white/black. 1.0 = off; 3.0 is a sane floor.", 1.0, 21.0, 0.5, 1, &ctx.cfg.minimum_contrast, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(contrast_group)));
+
     // Background opacity (Wayland transparency).
     const bg_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(bg_group)), "Background");

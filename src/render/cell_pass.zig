@@ -339,6 +339,9 @@ pub const CellPass = struct {
     /// When bold + allow_bold, also lift palette 0..7 to 8..15
     /// (xterm convention). Off keeps the original colour.
     bold_is_bright: bool = true,
+    /// Minimum WCAG contrast ratio enforced between resolved fg and
+    /// the cell's effective bg. <= 1.0 disables.
+    min_contrast: f32 = 1.0,
 
     /// Atlas page generation per layer — when a layer is evicted by
     /// the atlas, every cached glyph that lived on it becomes stale.
@@ -968,6 +971,9 @@ pub const CellPass = struct {
             fg_rgba[1] *= DIM_FG_SCALE;
             fg_rgba[2] *= DIM_FG_SCALE;
         }
+        // Effective bg is the clearcolor when the cell has none.
+        const eff_bg = if (has_bg) bg_rgba else self.default_bg;
+        fg_rgba = style_util.applyMinContrast(fg_rgba, eff_bg, self.min_contrast);
         return .{ .fg = fg_rgba, .bg = bg_rgba, .has_bg = has_bg };
     }
 };

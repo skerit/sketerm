@@ -19,6 +19,7 @@ const Atlas = atlas_mod.Atlas;
 const Screen = @import("../grid/screen.zig").Screen;
 const StylePool = @import("../grid/style_pool.zig").Pool;
 const Color = @import("../grid/style_pool.zig").Color;
+const StyleEntry = @import("../grid/style_pool.zig").Entry;
 const Cell = @import("../grid/cell.zig").Cell;
 const style_util = @import("style.zig");
 
@@ -191,6 +192,7 @@ const Snapshot = struct {
     enable_ligatures: bool = true,
     allow_bold: bool = true,
     bold_is_bright: bool = true,
+    min_contrast: f32 = 1.0,
 };
 
 pub const GridPass = struct {
@@ -224,6 +226,9 @@ pub const GridPass = struct {
     /// Underline auto-detected http(s) URLs in cell content. Off
     /// skips the per-row scan + render entirely.
     enable_url_underline: bool = true,
+    /// Minimum WCAG contrast ratio enforced on overlay-row glyph fg
+    /// vs the cell's effective bg. <= 1.0 disables.
+    min_contrast: f32 = 1.0,
     allocator: std.mem.Allocator,
     /// Scratch buffers for bidi resolution + visual ordering. Grow
     /// to cols on first use; subsequent frames reuse them. Avoids
@@ -895,6 +900,7 @@ pub const GridPass = struct {
             .enable_ligatures = self.enable_ligatures,
             .allow_bold = self.allow_bold,
             .bold_is_bright = self.bold_is_bright,
+            .min_contrast = self.min_contrast,
         };
         if (screen.preedit_text) |t| {
             s.preedit_hash = std.hash.Wyhash.hash(0, t);
@@ -1057,6 +1063,7 @@ pub const GridPass = struct {
                 fg[1] *= 0.65;
                 fg[2] *= 0.65;
             }
+            fg = style_util.applyMinContrast(fg, self.effectiveBg(style), self.min_contrast);
             const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
             const g = atlas.lookupOrLoad(cell.rune, bold, style.attrs.italic) catch {
@@ -1134,6 +1141,7 @@ pub const GridPass = struct {
                 fg[1] *= 0.65;
                 fg[2] *= 0.65;
             }
+            fg = style_util.applyMinContrast(fg, self.effectiveBg(style), self.min_contrast);
             const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
             const g = atlas.lookupOrLoad(cell.rune, bold, style.attrs.italic) catch continue;
@@ -1253,6 +1261,14 @@ pub const GridPass = struct {
     /// Resolve a Color → RGBA without considering reverse video. The
     /// caller swaps fg/bg explicitly (for cells with explicit colors
     /// reverse should still flip them).
+    /// The bg an overlay glyph actually sits on — explicit cell bg
+    /// (fg when reversed), else the clearcolor.
+    fn effectiveBg(self: *const GridPass, style: StyleEntry) [4]f32 {
+        if (style.attrs.reverse) return self.resolveColor(style.fg, true);
+        if (style.bg != .default) return self.resolveColor(style.bg, false);
+        return self.default_bg;
+    }
+
     fn resolveColor(self: *const GridPass, color: Color, is_fg: bool) [4]f32 {
         return style_util.colorToRGBA(color, is_fg, self.default_fg, self.default_bg, &self.palette);
     }

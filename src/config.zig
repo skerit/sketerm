@@ -238,6 +238,13 @@ pub const Config = struct {
     /// closer to 0.85 for a subtle "sleeping" effect.
     inactive_bg_dim: f32 = 1.0,
 
+    /// Minimum WCAG contrast ratio between text and its cell
+    /// background, 1.0 (off) .. 21.0. Text falling below the
+    /// threshold snaps to white or black, whichever reads better.
+    /// Kitty calls this text_fg_override_threshold; ghostty
+    /// minimum-contrast.
+    minimum_contrast: f32 = 1.0,
+
     /// Custom keybindings. List of (action_name, accelerator) pairs
     /// parsed from `keybind.<action> = <accel>` lines. An entry with
     /// an empty accel unbinds that action; a missing entry inherits
@@ -535,6 +542,8 @@ pub const Config = struct {
             try w.print("inactive_fg_dim = {d:.2}\n", .{self.inactive_fg_dim});
         if (self.inactive_bg_dim != 1.0)
             try w.print("inactive_bg_dim = {d:.2}\n", .{self.inactive_bg_dim});
+        if (self.minimum_contrast != 1.0)
+            try w.print("minimum_contrast = {d:.2}\n", .{self.minimum_contrast});
 
         // Per-pane titlebar.
         if (self.show_titlebar) try w.writeAll("show_titlebar = true\n");
@@ -875,6 +884,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.default_profile = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "background_opacity")) {
         cfg.background_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
+    } else if (std.mem.eql(u8, key, "minimum_contrast")) {
+        cfg.minimum_contrast = std.math.clamp(try parseFloat(value), 1.0, 21.0);
     } else if (std.mem.eql(u8, key, "inactive_fg_dim")) {
         cfg.inactive_fg_dim = std.math.clamp(try parseFloat(value), 0.0, 1.0);
     } else if (std.mem.eql(u8, key, "inactive_bg_dim")) {
@@ -1096,6 +1107,7 @@ test "config: palette + scheme + new keys round-trip" {
     cfg.bell_visible = false;
     cfg.bell_urgent = false;
     cfg.word_chars = "abc";
+    cfg.minimum_contrast = 3.5;
 
     var buf: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -1118,6 +1130,7 @@ test "config: palette + scheme + new keys round-trip" {
     try std.testing.expectEqual(false, parsed.bell_visible);
     try std.testing.expectEqual(false, parsed.bell_urgent);
     try std.testing.expectEqualStrings("abc", parsed.word_chars);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.5), parsed.minimum_contrast, 1e-6);
 }
 
 test "config: serialise round-trips through loadFromBytes" {

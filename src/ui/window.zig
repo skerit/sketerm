@@ -1221,6 +1221,8 @@ pub const Window = struct {
         pane.grid_pass.bold_is_bright = self.config.bold_is_bright;
         pane.cell_pass.allow_bold = self.config.allow_bold;
         pane.cell_pass.bold_is_bright = self.config.bold_is_bright;
+        pane.grid_pass.min_contrast = self.config.minimum_contrast;
+        pane.cell_pass.min_contrast = self.config.minimum_contrast;
         pane.grid_pass.enable_url_underline = self.config.auto_url_detect;
         // Per-pane titlebar visibility.
         pane.setTitlebarVisible(self.config.show_titlebar);
@@ -2097,6 +2099,8 @@ pub const Window = struct {
             p.grid_pass.bold_is_bright = self.config.bold_is_bright;
             p.cell_pass.allow_bold = self.config.allow_bold;
             p.cell_pass.bold_is_bright = self.config.bold_is_bright;
+            p.grid_pass.min_contrast = self.config.minimum_contrast;
+            p.cell_pass.min_contrast = self.config.minimum_contrast;
             // Behavior.
             screen.bracketed_paste = self.config.bracketed_paste;
             screen.modify_other_keys = self.config.modify_other_keys;
