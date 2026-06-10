@@ -175,6 +175,15 @@ pub const Screen = struct {
     /// buffer; rows are DISPLAY rows captured at collect time.
     hints_overlay: []const HintOverlay = &.{},
 
+    /// Image-placement retention for mux snapshots. The GUI keeps
+    /// placements in the per-pane ImageStore; the headless daemon
+    /// has no panes, so when `retain_images` is set every on_image
+    /// emission is also copied here (capped, oldest evicted) and the
+    /// snapshot carries the list so reattach restores images.
+    retain_images: bool = false,
+    retained_images: std.ArrayList(RetainedImage) = .empty,
+    retained_image_bytes: usize = 0,
+
     /// Predictive-echo overlay (remote panes). Speculative glyphs
     /// drawn underlined at active-screen cells until the real echo
     /// arrives; the Terminal's Predictor owns the buffer and keeps
@@ -405,6 +414,66 @@ pub const Screen = struct {
         src_h: u32 = 0,
     };
 
+    /// An ImageEvent with owned pixels — what `retain_images` keeps
+    /// for the mux snapshot.
+    pub const RetainedImage = struct {
+        ev: ImageEvent,
+        /// `ev.rgba` aliases this owned buffer.
+        owned: []u8,
+    };
+
+    /// Total pixel bytes retained for snapshots; beyond this the
+    /// oldest placements are dropped (they reappear when the app
+    /// redraws). Must leave room under the 16 MB wire frame cap.
+    pub const RETAIN_IMAGE_BUDGET: usize = 12 * 1024 * 1024;
+
+    /// Emit an image to the sink, retaining a copy when configured.
+    fn emitImage(self: *Screen, ev: ImageEvent) void {
+        if (self.sink.on_image) |f| f(self.sink.ctx, ev);
+        if (!self.retain_images) return;
+        if (ev.rgba.len > RETAIN_IMAGE_BUDGET) return;
+        const owned = self.allocator.dupe(u8, ev.rgba) catch return;
+        var copy = ev;
+        copy.rgba = owned;
+        self.retained_images.append(self.allocator, .{ .ev = copy, .owned = owned }) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        self.retained_image_bytes += owned.len;
+        while (self.retained_image_bytes > RETAIN_IMAGE_BUDGET and self.retained_images.items.len > 0) {
+            const old = self.retained_images.orderedRemove(0);
+            self.retained_image_bytes -= old.owned.len;
+            self.allocator.free(old.owned);
+        }
+    }
+
+    /// Prune retained placements to mirror a delete command.
+    fn pruneRetainedImages(self: *Screen, ev: ImageDeleteEvent) void {
+        if (!self.retain_images or self.retained_images.items.len == 0) return;
+        var i: usize = 0;
+        while (i < self.retained_images.items.len) {
+            const ri = self.retained_images.items[i].ev;
+            const hit = switch (ev.what) {
+                'a', 'A' => ev.image_id == 0 or ri.image_id == ev.image_id,
+                'p', 'P' => ri.image_id == ev.image_id and
+                    (ev.placement_id == 0 or ri.placement_id == ev.placement_id),
+                'i', 'I' => ri.image_id == ev.image_id,
+                else => false,
+            };
+            if (hit) {
+                const old = self.retained_images.orderedRemove(i);
+                self.retained_image_bytes -= old.owned.len;
+                self.allocator.free(old.owned);
+            } else i += 1;
+        }
+    }
+
+    pub fn clearRetainedImages(self: *Screen) void {
+        for (self.retained_images.items) |ri| self.allocator.free(ri.owned);
+        self.retained_images.clearRetainingCapacity();
+        self.retained_image_bytes = 0;
+    }
+
     pub fn init(allocator: std.mem.Allocator, pool: *Pool, cols: u16, rows: u16) !*Screen {
         const self = try allocator.create(Screen);
         errdefer allocator.destroy(self);
@@ -439,6 +508,8 @@ pub const Screen = struct {
     }
 
     pub fn deinit(self: *Screen) void {
+        self.clearRetainedImages();
+        self.retained_images.deinit(self.allocator);
         for (self.active) |*l| l.deinit(self.allocator);
         self.allocator.free(self.active);
         if (self.alt) |alt| {
@@ -1726,7 +1797,7 @@ pub const Screen = struct {
             const decoded = iterm.decodePayload(self.allocator, rest) catch return;
             defer self.allocator.free(decoded.rgba);
             if (decoded.format != .png or decoded.rgba.len == 0) return;
-            if (self.sink.on_image) |f| f(self.sink.ctx, .{
+            self.emitImage(.{
                 .width = decoded.width,
                 .height = decoded.height,
                 .rgba = decoded.rgba,
@@ -1830,11 +1901,13 @@ pub const Screen = struct {
                 // Lowercase: leave source data alone — placements only.
                 else => {},
             }
-            if (self.sink.on_image_delete_full) |f| f(self.sink.ctx, .{
+            const del_ev = ImageDeleteEvent{
                 .image_id = cmd.image_id,
                 .placement_id = cmd.placement_id,
                 .what = cmd.delete_what,
-            });
+            };
+            self.pruneRetainedImages(del_ev);
+            if (self.sink.on_image_delete_full) |f| f(self.sink.ctx, del_ev);
             self.dirty = true;
             return;
         }
@@ -1845,7 +1918,7 @@ pub const Screen = struct {
         if (outcome.action != .place) return;
 
         const stored = self.kitty_images.get(outcome.image_id) orelse return;
-        if (self.sink.on_image) |f| f(self.sink.ctx, .{
+        self.emitImage(.{
             .width = stored.width,
             .height = stored.height,
             .rgba = stored.rgba,
@@ -1881,7 +1954,7 @@ pub const Screen = struct {
             const sixel = @import("../parser/sixel.zig");
             const decoded = sixel.decode(self.allocator, d.body) catch return;
             defer self.allocator.free(decoded.rgba);
-            if (self.sink.on_image) |f| f(self.sink.ctx, .{
+            self.emitImage(.{
                 .width = decoded.width,
                 .height = decoded.height,
                 .rgba = decoded.rgba,

@@ -385,6 +385,9 @@ pub const Daemon = struct {
         errdefer pool.deinit();
         const screen = try Screen.init(allocator, pool, req.cols, req.rows);
         errdefer screen.deinit();
+        // Keep image placements for the attach snapshot — there's no
+        // per-pane ImageStore on the daemon side to remember them.
+        screen.retain_images = true;
 
         const s = try allocator.create(Session);
         errdefer allocator.destroy(s);

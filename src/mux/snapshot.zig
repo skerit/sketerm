@@ -5,9 +5,8 @@
 //! grapheme clusters, cursor, modes, palette, title. Versioned and
 //! little-endian like wire.zig.
 //!
-//! v1 limitation (documented in the mux design): kitty image
-//! placements are NOT snapshotted — images vanish on reattach and
-//! reappear as the application redraws them.
+//! v2: image placements retained by the daemon's Screen
+//! (`retain_images`) ride along, so reattach restores images.
 
 const std = @import("std");
 const Screen = @import("../grid/screen.zig").Screen;
@@ -16,7 +15,7 @@ const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
 const Pool = style_pool.Pool;
 
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 const Sink = struct {
     out: *std.ArrayList(u8),
@@ -152,6 +151,38 @@ pub fn serialize(screen: *const Screen, out: *std.ArrayList(u8), allocator: std.
     // Prompt marks (OSC 133 navigation).
     try s.int(u16, screen.prompt_marks_len);
     for (screen.prompt_marks[0..screen.prompt_marks_len]) |m| try s.int(u64, m);
+
+    // Image placements retained by the daemon (`retain_images`).
+    // Newest-first budget pass keeps the freshest placements when
+    // the lot would overflow the wire frame; emitted in original
+    // order so z-equal stacking stays stable.
+    const items = screen.retained_images.items;
+    var budget: usize = Screen.RETAIN_IMAGE_BUDGET;
+    var first_kept: usize = items.len;
+    while (first_kept > 0) {
+        const need = items[first_kept - 1].owned.len;
+        if (need > budget) break;
+        budget -= need;
+        first_kept -= 1;
+    }
+    try s.int(u32, @intCast(items.len - first_kept));
+    for (items[first_kept..]) |ri| {
+        const ev = ri.ev;
+        try s.int(u32, ev.width);
+        try s.int(u32, ev.height);
+        try s.int(u16, ev.row);
+        try s.int(u16, ev.col);
+        try s.int(u32, ev.image_id);
+        try s.int(u32, ev.placement_id);
+        try s.int(i32, ev.z_index);
+        try s.int(u32, ev.cells_wide);
+        try s.int(u32, ev.cells_high);
+        try s.int(u32, ev.src_x);
+        try s.int(u32, ev.src_y);
+        try s.int(u32, ev.src_w);
+        try s.int(u32, ev.src_h);
+        try s.bytes(ri.owned);
+    }
 }
 
 const Src = struct {
@@ -343,6 +374,36 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
     screen.prompt_marks_len = @min(try src.int(u16), screen.prompt_marks.len);
     for (0..screen.prompt_marks_len) |idx| screen.prompt_marks[idx] = try src.int(u64);
 
+    // Retained image placements — parked on the screen; the client
+    // replays them into its image sink once a pane is wired
+    // (Terminal.replayRetainedImages) and then frees them.
+    const n_images = try src.int(u32);
+    for (0..n_images) |_| {
+        var ev = Screen.ImageEvent{
+            .width = try src.int(u32),
+            .height = try src.int(u32),
+            .rgba = &.{},
+            .row = try src.int(u16),
+            .col = try src.int(u16),
+            .image_id = try src.int(u32),
+            .placement_id = try src.int(u32),
+            .z_index = try src.int(i32),
+            .cells_wide = try src.int(u32),
+            .cells_high = try src.int(u32),
+            .src_x = try src.int(u32),
+            .src_y = try src.int(u32),
+            .src_w = try src.int(u32),
+            .src_h = try src.int(u32),
+        };
+        const data_len = try src.int(u32);
+        const data = try src.take(data_len);
+        const owned = try allocator.dupe(u8, data);
+        errdefer allocator.free(owned);
+        ev.rgba = owned;
+        try screen.retained_images.append(allocator, .{ .ev = ev, .owned = owned });
+        screen.retained_image_bytes += owned.len;
+    }
+
     screen.dirty = true;
     return screen;
 }
@@ -407,6 +468,40 @@ test "snapshot: populated screen round-trips" {
     const txt_b = try back.extractScreen(a);
     defer a.free(txt_b);
     try testing.expectEqualStrings(txt_a, txt_b);
+}
+
+test "snapshot: retained image placements round-trip" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 20, 6);
+    defer h.deinit();
+    h.screen.retain_images = true;
+
+    // 1x1 RGBA kitty transmit+place (t=d, base64 of 4 bytes).
+    h.feed("\x1b[3;4H"); // place at row 2, col 3 (0-based)
+    h.feed("\x1b_Gf=32,s=1,v=1,t=d,a=T,i=9,p=2,z=5;/wAA/w==\x1b\\");
+    try testing.expectEqual(@as(usize, 1), h.screen.retained_images.items.len);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try serialize(h.screen, &buf, a);
+
+    var pool2 = try Pool.init(a);
+    defer pool2.deinit();
+    const back = try restore(a, &pool2, buf.items);
+    defer back.deinit();
+
+    try testing.expectEqual(@as(usize, 1), back.retained_images.items.len);
+    const ri = back.retained_images.items[0];
+    try testing.expectEqual(@as(u32, 9), ri.ev.image_id);
+    try testing.expectEqual(@as(u32, 2), ri.ev.placement_id);
+    try testing.expectEqual(@as(i32, 5), ri.ev.z_index);
+    try testing.expectEqual(@as(u16, 2), ri.ev.row);
+    try testing.expectEqual(@as(u16, 3), ri.ev.col);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xff, 0, 0, 0xff }, ri.owned);
+
+    // Delete prunes the retained copy too.
+    h.feed("\x1b_Ga=d,d=I,i=9\x1b\\");
+    try testing.expectEqual(@as(usize, 0), h.screen.retained_images.items.len);
 }
 
 test "snapshot: alt screen state survives" {

@@ -2484,6 +2484,9 @@ pub const Window = struct {
 
         try self.panes.append(self.allocator, pane);
         try self.terminals.append(self.allocator, term);
+        // Pane sinks are wired — push snapshot-restored image
+        // placements into the ImageStore.
+        term.replayRetainedImages();
         c.adw_tab_view_set_selected_page(self.tab_view, page);
         _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
     }

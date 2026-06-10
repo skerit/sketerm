@@ -20,6 +20,16 @@ fn fail(comptime msg: []const u8) noreturn {
 
 const MARKER = "mux-smoke-7311";
 
+/// 2x2 solid-red RGBA file for the t=f image stage.
+fn writeRedRgba(path: []const u8) !void {
+    var z_buf: [4096]u8 = undefined;
+    const p = try @import("util/pathz.zig").pathZ(&z_buf, path);
+    const fp = c.fopen(p, "wb") orelse return error.OpenFailed;
+    defer _ = c.fclose(fp);
+    const px = [_]u8{ 0xff, 0, 0, 0xff } ** 4;
+    if (c.fwrite(&px, 1, px.len, fp) != px.len) return error.WriteFailed;
+}
+
 /// Client-side mirror: snapshot restore + event application.
 const Mirror = struct {
     allocator: std.mem.Allocator,
@@ -118,6 +128,45 @@ pub fn main() u8 {
     }
     if (!seen) fail("marker never appeared via event stream");
 
+    // Kitty t=f image: the file lives on the DAEMON's host. The
+    // daemon must fetch + inline it (t=d rewrite) so the client can
+    // decode it without filesystem access, and the snapshot must
+    // carry the placement across reattach.
+    var img_path_buf: [128]u8 = undefined;
+    const img_path = std.fmt.bufPrint(&img_path_buf, "/tmp/sketerm-mux-smoke-{d}-img.rgba", .{c.getpid()}) catch unreachable;
+    writeRedRgba(img_path) catch fail("image file write");
+    var b64_buf: [256]u8 = undefined;
+    const enc = std.base64.standard.Encoder;
+    const path_b64 = enc.encode(b64_buf[0..enc.calcSize(img_path.len)], img_path);
+    var cmd_buf: [512]u8 = undefined;
+    const img_cmd = std.fmt.bufPrint(
+        &cmd_buf,
+        "printf '\\033_Gf=32,s=2,v=2,t=f,a=T,i=77;{s}\\033\\\\'\n",
+        .{path_b64},
+    ) catch unreachable;
+    conn.sendFrame(.input, img_cmd) catch fail("img input send");
+    deadline = 0;
+    var img_seen = false;
+    while (deadline < 200) : (deadline += 1) {
+        const f = conn.recvFrame() catch fail("img stream read");
+        defer f.deinit(allocator);
+        if (f.ftype == .events) mirror.applyEvents(f.payload) catch fail("img events apply");
+        if (mirror.screen.?.kitty_images.get(77) != null) {
+            img_seen = true;
+            break;
+        }
+    }
+    if (!img_seen) fail("t=f image never reached the client inline");
+    {
+        // t=f must leave the file in place (only t=t deletes); clean
+        // it up ourselves now that the assertion ran.
+        var z_buf: [4096]u8 = undefined;
+        if (@import("util/pathz.zig").pathZ(&z_buf, img_path)) |p| {
+            if (c.access(p, c.F_OK) != 0) fail("t=f deleted the source file");
+            _ = c.unlink(p);
+        } else |_| {}
+    }
+
     // Detach, reattach: snapshot alone must already contain the marker.
     conn.sendFrame(.detach, "") catch fail("detach send");
     (conn.recvExpect(&.{.ok}) catch fail("detach ok")).deinit(allocator);
@@ -129,6 +178,10 @@ pub fn main() u8 {
         const txt = mirror.screenText() catch fail("extract2");
         defer allocator.free(txt);
         if (std.mem.count(u8, txt, MARKER) < 2) fail("marker lost across reattach");
+        // Image placement restored from the snapshot.
+        if (mirror.screen.?.retained_images.items.len < 1) fail("image placement missing from snapshot");
+        const ri = mirror.screen.?.retained_images.items[0];
+        if (ri.ev.image_id != 77 or ri.owned.len != 16) fail("retained image data wrong");
     }
 
     // Resize → fresh snapshot broadcast with new geometry.

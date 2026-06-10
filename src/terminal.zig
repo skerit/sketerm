@@ -289,6 +289,7 @@ pub const Terminal = struct {
                     remote.predictor.pending.clearRetainingCapacity();
                     remote.predictor.overlay.clearRetainingCapacity();
                 }
+                self.replayRetainedImages();
                 if (self.on_render_request) |f| f(self.user_ctx);
             },
             .exit, .gone => self.remoteClosed("session ended"),
@@ -433,6 +434,25 @@ pub const Terminal = struct {
         if (self.cwd) |old| self.allocator.free(old);
         self.cwd = decoded;
         if (self.on_cwd_changed) |f| f(self.user_ctx, decoded);
+    }
+
+    /// Replay snapshot-restored image placements into the image sink
+    /// and drop them. Must run AFTER the pane wired `on_image` (the
+    /// sink chain ends in the pane's ImageStore) — Window calls this
+    /// when attaching a mux tab; the snapshot branch of
+    /// handleRemoteFrame calls it directly since the pane exists.
+    pub fn replayRetainedImages(self: *Terminal) void {
+        if (self.screen.retained_images.items.len == 0) return;
+        // The snapshot replaced the whole grid; placements from the
+        // previous attach are stale. Flush before replaying.
+        if (self.screen.sink.on_image_delete_full) |f| {
+            f(self.screen.sink.ctx, .{ .what = 'A' });
+        }
+        for (self.screen.retained_images.items) |ri| {
+            if (self.screen.sink.on_image) |f| f(self.screen.sink.ctx, ri.ev);
+        }
+        self.screen.clearRetainedImages();
+        self.screen.dirty = true;
     }
 
     fn sinkImage(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
