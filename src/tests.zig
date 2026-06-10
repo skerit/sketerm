@@ -35,6 +35,7 @@ comptime {
     _ = @import("ipc/protocol.zig");
     _ = @import("render/bg_pass.zig");
     _ = @import("mux/wire.zig");
+    _ = @import("mux/snapshot.zig");
     _ = @import("render/atlas_test.zig");
     _ = @import("render/atlas.zig");
     _ = @import("render/cell_pass.zig");
