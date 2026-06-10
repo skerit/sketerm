@@ -511,6 +511,25 @@ pub const Screen = struct {
         return isWideCp(cp);
     }
 
+    /// Blank both halves of any wide-char pair overlapping `col`.
+    /// Overwriting or erasing one half of a pair must not leave the
+    /// other half behind: an orphaned wide-left keeps drawing the old
+    /// glyph, an orphaned continuation renders as a permanently blank
+    /// cell (ghost cells after CJK is overwritten by narrow text).
+    fn splitWidePair(self: *Screen, ln: *Line, col: u16) void {
+        if (col >= self.cols) return;
+        const f = ln.cells[col].flags;
+        if (f & 0b0000_0001 != 0) { // wide-left
+            ln.cells[col] = .{};
+            if (col + 1 < self.cols and (ln.cells[col + 1].flags & 0b0000_0010) != 0)
+                ln.cells[col + 1] = .{};
+        } else if (f & 0b0000_0010 != 0) { // wide continuation
+            ln.cells[col] = .{};
+            if (col > 0 and (ln.cells[col - 1].flags & 0b0000_0001) != 0)
+                ln.cells[col - 1] = .{};
+        }
+    }
+
     /// Word-class membership for double-click word selection.
     /// Mirrors xterm's default: ASCII alnum, underscore, plus a small
     /// "extra" set commonly considered part of paths/URIs.
@@ -2138,6 +2157,10 @@ pub const Screen = struct {
             }
             const can_write: u16 = @min(total - i, remaining);
             var ln = self.line(self.row);
+            // The written range overwrites pairs fully inside it; only
+            // pairs straddling the boundaries need an explicit split.
+            self.splitWidePair(ln, self.col);
+            self.splitWidePair(ln, self.col + can_write - 1);
             var k: u16 = 0;
             while (k < can_write) : (k += 1) {
                 ln.cells[self.col + k] = .{
@@ -2234,6 +2257,11 @@ pub const Screen = struct {
             self.clearClusterAt(self.row, self.col);
             if (width == 2 and self.col + 1 < self.cols) self.clearClusterAt(self.row, self.col + 1);
         }
+
+        // Writing into either half of an existing wide pair must blank
+        // the other half, or the renderer keeps the orphan around.
+        self.splitWidePair(ln, self.col);
+        if (width == 2) self.splitWidePair(ln, self.col + 1);
 
         var flags: u8 = if (self.current_link_id != 0) 0b0000_0100 else 0;
         if (width == 2) flags |= 0b0000_0001; // is_wide_left
@@ -2657,7 +2685,12 @@ pub const Screen = struct {
             'K' => self.eraseLine(params.paramOrDefault(0, 0)),
             'X' => {
                 const n = params.paramOrDefault(0, 1);
-                self.line(self.row).eraseRangeStyled(self.col, self.col + @as(u16, @intCast(@min(n, 0xFFFF))), self.cur_style);
+                // Clamp in u32: col + n can exceed u16 for large params.
+                const hi: u16 = @intCast(@min(@as(u32, self.col) + n, @as(u32, self.cols)));
+                if (self.clusters.count() > 0) self.clearClustersRange(self.row, self.col, hi);
+                self.splitWidePair(self.line(self.row), self.col);
+                if (hi > 0) self.splitWidePair(self.line(self.row), hi - 1);
+                self.line(self.row).eraseRangeStyled(self.col, hi, self.cur_style);
             },
             '@' => self.insertChars(params.paramOrDefault(0, 1)),
             'P' => self.deleteChars(params.paramOrDefault(0, 1)),
@@ -3161,20 +3194,34 @@ pub const Screen = struct {
         const fill = self.cur_style;
         switch (mode) {
             0 => {
+                if (self.clusters.count() > 0) {
+                    self.clearClustersRange(self.row, self.col, self.cols);
+                    var r: u16 = self.row + 1;
+                    while (r < self.rows) : (r += 1) self.clearClustersRange(r, 0, self.cols);
+                }
+                self.splitWidePair(self.line(self.row), self.col);
                 self.line(self.row).eraseRangeStyled(self.col, self.cols, fill);
                 var i: u16 = self.row + 1;
                 while (i < self.rows) : (i += 1) lines[i].clearStyled(fill);
             },
             1 => {
+                if (self.clusters.count() > 0) {
+                    var r: u16 = 0;
+                    while (r < self.row) : (r += 1) self.clearClustersRange(r, 0, self.cols);
+                    self.clearClustersRange(self.row, 0, self.col + 1);
+                }
                 var i: u16 = 0;
                 while (i < self.row) : (i += 1) lines[i].clearStyled(fill);
+                self.splitWidePair(self.line(self.row), self.col);
                 self.line(self.row).eraseRangeStyled(0, self.col + 1, fill);
             },
             2 => {
+                self.clearAllClusters();
                 for (lines) |*l| l.clearStyled(fill);
             },
             3 => {
                 // Mode 3 (xterm extension): clear screen + scrollback.
+                self.clearAllClusters();
                 for (lines) |*l| l.clear();
                 for (self.scrollback.items) |*l| l.deinit(self.allocator);
                 self.scrollback.clearRetainingCapacity();
@@ -3192,9 +3239,20 @@ pub const Screen = struct {
         var ln = self.line(self.row);
         const fill = self.cur_style;
         switch (mode) {
-            0 => ln.eraseRangeStyled(self.col, self.cols, fill),
-            1 => ln.eraseRangeStyled(0, self.col + 1, fill),
-            2 => ln.clearStyled(fill),
+            0 => {
+                if (self.clusters.count() > 0) self.clearClustersRange(self.row, self.col, self.cols);
+                self.splitWidePair(ln, self.col);
+                ln.eraseRangeStyled(self.col, self.cols, fill);
+            },
+            1 => {
+                if (self.clusters.count() > 0) self.clearClustersRange(self.row, 0, self.col + 1);
+                self.splitWidePair(ln, self.col);
+                ln.eraseRangeStyled(0, self.col + 1, fill);
+            },
+            2 => {
+                if (self.clusters.count() > 0) self.clearClustersRange(self.row, 0, self.cols);
+                ln.clearStyled(fill);
+            },
             else => {},
         }
     }
@@ -3271,6 +3329,7 @@ pub const Screen = struct {
                 lines[self.scroll_top + i].cells = lines[self.scroll_top + i + move].cells;
                 lines[self.scroll_top + i].continues_above = lines[self.scroll_top + i + move].continues_above;
                 lines[self.scroll_top + i].id = lines[self.scroll_top + i + move].id;
+                lines[self.scroll_top + i].scaling = lines[self.scroll_top + i + move].scaling;
             }
             // The newly-bottom rows get fresh IDs (new content arriving).
             i = 0;
@@ -3280,6 +3339,7 @@ pub const Screen = struct {
                 @memset(lines[dst].cells, .{});
                 lines[dst].continues_above = false;
                 lines[dst].id = self.nextLineId();
+                lines[dst].scaling = .single;
             }
         } else {
             // Whole region scrolled; everything goes to scrollback (or
@@ -3306,6 +3366,7 @@ pub const Screen = struct {
                 @memset(lines[i].cells, .{});
                 lines[i].continues_above = false;
                 lines[i].id = self.nextLineId();
+                lines[i].scaling = .single;
             }
         }
         var i: u16 = self.scroll_top;
@@ -3342,6 +3403,7 @@ pub const Screen = struct {
                 lines[dst].cells = lines[src].cells;
                 lines[dst].continues_above = lines[src].continues_above;
                 lines[dst].id = lines[src].id;
+                lines[dst].scaling = lines[src].scaling;
             }
             i = 0;
             while (i < move) : (i += 1) {
@@ -3349,6 +3411,7 @@ pub const Screen = struct {
                 @memset(lines[self.scroll_top + i].cells, .{});
                 lines[self.scroll_top + i].continues_above = false;
                 lines[self.scroll_top + i].id = self.nextLineId();
+                lines[self.scroll_top + i].scaling = .single;
             }
         } else {
             var i: u16 = self.scroll_top;
@@ -3356,6 +3419,7 @@ pub const Screen = struct {
                 @memset(lines[i].cells, .{});
                 lines[i].continues_above = false;
                 lines[i].id = self.nextLineId();
+                lines[i].scaling = .single;
             }
         }
         var i: u16 = self.scroll_top;
@@ -3370,6 +3434,11 @@ pub const Screen = struct {
         const max_n: u32 = @intCast(cells.len - col);
         const move: u16 = @intCast(@min(n, max_n));
         if (move == 0) return;
+        // Shifted cells change column; clusters are keyed by (row, col)
+        // and would point at the wrong cells afterwards.
+        if (self.clusters.count() > 0) self.clearClustersRange(self.row, col, self.cols);
+        // A wide pair straddling the insertion point gets torn apart.
+        self.splitWidePair(ln, col);
         // Shift cells right from col by `move`. Last cells fall off.
         var i: usize = cells.len;
         while (i > col + move) : (i -= 1) {
@@ -3389,6 +3458,13 @@ pub const Screen = struct {
         const max_n: u32 = @intCast(cells.len - col);
         const move: u16 = @intCast(@min(n, max_n));
         if (move == 0) return;
+        // Shifted cells change column; clusters are keyed by (row, col)
+        // and would point at the wrong cells afterwards.
+        if (self.clusters.count() > 0) self.clearClustersRange(self.row, col, self.cols);
+        // Wide pairs straddling either edge of the deleted range get
+        // torn apart — blank both halves before shifting.
+        self.splitWidePair(ln, col);
+        self.splitWidePair(ln, col + move - 1);
         // Shift cells left from col+move into col. Last cells become blank.
         var i: usize = col;
         while (i + move < cells.len) : (i += 1) {
@@ -3518,6 +3594,11 @@ pub const Screen = struct {
 
     fn toggleAltScreen(self: *Screen, on: bool) void {
         if (on == self.use_alt) return;
+        // Clusters are keyed by (row, col) in the ACTIVE buffer; after
+        // the swap every key points at the other buffer's content.
+        // Same for the last-print cell used for cluster attachment.
+        self.clearAllClusters();
+        self.last_print_cp = 0;
         if (on and self.alt == null) {
             const alt = self.allocator.alloc(Line, self.rows) catch return;
             var i: u16 = 0;
@@ -5795,4 +5876,136 @@ test "style pool compaction recovers from exhaustion (ghost-text dim bug)" {
     // Newly printed dim text actually carries dim.
     s.printCp('B');
     try std.testing.expect(pool.get(s.cellAt(0, 1).style_ref).attrs.dim);
+}
+
+test "ED 2 clears the cluster side-table" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.printCp('e');
+    s.printCp(0x0301); // combining acute -> cluster at (0,0)
+    try std.testing.expectEqual(@as(usize, 1), s.clusterAt(0, 0).len);
+    s.eraseDisplay(2);
+    try std.testing.expectEqual(@as(usize, 0), s.clusterAt(0, 0).len);
+    try std.testing.expectEqual(@as(usize, 0), s.clusters.count());
+}
+
+test "EL 0 clears clusters from cursor to end of line" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.printCp('a');
+    s.printCp(0x0301);
+    s.printCp('b');
+    s.printCp(0x0301);
+    try std.testing.expectEqual(@as(usize, 2), s.clusters.count());
+    s.col = 1;
+    s.eraseLine(0);
+    try std.testing.expectEqual(@as(usize, 1), s.clusterAt(0, 0).len);
+    try std.testing.expectEqual(@as(usize, 0), s.clusterAt(0, 1).len);
+}
+
+test "alt-screen toggle drops clusters keyed to the old buffer" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.printCp('e');
+    s.printCp(0x0301);
+    s.toggleAltScreen(true);
+    try std.testing.expectEqual(@as(usize, 0), s.clusters.count());
+    s.toggleAltScreen(false);
+    try std.testing.expectEqual(@as(usize, 0), s.clusters.count());
+}
+
+test "narrow overwrite of wide-left blanks the continuation cell" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.printCp(0x4E2D); // CJK, occupies cols 0-1
+    try std.testing.expect(s.cellAt(0, 0).flags & 0b0000_0001 != 0);
+    try std.testing.expect(s.cellAt(0, 1).flags & 0b0000_0010 != 0);
+    s.row = 0;
+    s.col = 0;
+    s.printCp('a');
+    try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
+    // The orphaned continuation must be a plain blank, not is_wide_cont.
+    try std.testing.expectEqual(@as(u8, 0), s.cellAt(0, 1).flags);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 1).rune);
+}
+
+test "narrow overwrite of wide continuation blanks the orphan wide-left" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.printCp(0x4E2D); // cols 0-1
+    s.row = 0;
+    s.col = 1;
+    s.printCp('a');
+    try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 1).rune);
+    try std.testing.expectEqual(@as(u8, 0), s.cellAt(0, 0).flags);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 0).rune);
+}
+
+test "fast ASCII path splits a straddled wide pair" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.printCp(0x4E2D); // cols 0-1
+    s.printCp(0x56FD); // cols 2-3
+    s.row = 0;
+    s.col = 1;
+    s.fastAsciiSlice("xy"); // overwrites cols 1-2
+    try std.testing.expectEqual(@as(u8, 0), s.cellAt(0, 0).flags); // old wide-left blanked
+    try std.testing.expectEqual(@as(u32, 'x'), s.cellAt(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'y'), s.cellAt(0, 2).rune);
+    try std.testing.expectEqual(@as(u8, 0), s.cellAt(0, 3).flags); // old continuation blanked
+}
+
+test "ECH with huge parameter does not overflow column math" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.printCp('a');
+    s.printCp('b');
+    s.col = 1;
+    var ech = Event.Csi{};
+    ech.params[0] = 65535; // col + n would wrap u16
+    ech.n_params = 1;
+    ech.final = 'X';
+    s.csi(ech);
+    try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 1).rune);
+}
+
+test "scroll within region preserves DECDWL scaling of shifted lines" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 4);
+    defer s.deinit();
+    s.active[2].scaling = .dwl;
+    s.scrollUp(1);
+    try std.testing.expectEqual(@import("line.zig").Scaling.dwl, s.active[1].scaling);
+    // The recycled bottom row must come back as single-width.
+    try std.testing.expectEqual(@import("line.zig").Scaling.single, s.active[3].scaling);
+}
+
+test "DCH clears clusters on the shifted row" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.printCp('a');
+    s.printCp('e');
+    s.printCp(0x0301); // cluster at (0,1)
+    try std.testing.expectEqual(@as(usize, 1), s.clusters.count());
+    s.col = 0;
+    s.deleteChars(1); // 'e' shifts to col 0; old cluster key is stale
+    try std.testing.expectEqual(@as(usize, 0), s.clusters.count());
 }
