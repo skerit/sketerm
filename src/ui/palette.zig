@@ -90,6 +90,8 @@ const ENTRIES = [_]Entry{
        .desc = "Wipe the scrollback ring. The visible screen stays.", .action = .clear_scrollback },
     .{ .icon = "view-list-symbolic", .title = "Show Scrollback in Pager",
        .desc = "Open the scrollback buffer plus visible screen in a pager tab.", .action = .show_scrollback },
+    .{ .icon = "network-server-symbolic", .title = "New Durable Tab (mux)",
+       .desc = "Shell in the sketerm-mux daemon; survives GUI restarts.", .action = .new_durable_tab },
 
     // Font
     .{ .icon = "zoom-in-symbolic", .title = "Increase Font Size",

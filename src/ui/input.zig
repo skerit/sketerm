@@ -120,6 +120,9 @@ pub const Action = enum {
     /// in a pager (`less -R +G`, or `$PAGER`) in a new tab. Kitty's
     /// show_scrollback equivalent.
     show_scrollback,
+    /// Spawn a shell inside the sketerm-mux daemon and attach it as
+    /// a tab — survives GUI restarts (reattach via `sketerm mux`).
+    new_durable_tab,
     // Per-pane (dispatched locally inside input.zig).
     paste_clipboard,
     copy_selection,
@@ -281,6 +284,7 @@ pub fn actionName(a: Action) []const u8 {
         .goto_tab_9 => "goto_tab_9",
         .duplicate_tab => "duplicate_tab",
         .show_scrollback => "show_scrollback",
+        .new_durable_tab => "new_durable_tab",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
         .copy_screen => "copy_screen",
@@ -344,6 +348,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .goto_tab_9 => "Jump to tab 9",
         .duplicate_tab => "Duplicate tab (cwd + profile)",
         .show_scrollback => "Show scrollback in pager",
+        .new_durable_tab => "New durable tab (mux)",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",
         .copy_screen => "Copy whole screen",

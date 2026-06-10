@@ -15,6 +15,9 @@ const Pty = @import("pty.zig").Pty;
 const Screen = @import("grid/screen.zig").Screen;
 const Pool = @import("grid/style_pool.zig").Pool;
 const percent = @import("util/percent.zig");
+const mux_client = @import("mux/client.zig");
+const mux_wire = @import("mux/wire.zig");
+const mux_snapshot = @import("mux/snapshot.zig");
 
 /// SPSC ring capacity — power of 2; one Event per slot. Sized to
 /// absorb roughly 100ms of worker throughput at 16384 × 96B = 1.5MB.
@@ -94,6 +97,218 @@ pub const Terminal = struct {
     /// If true, drain prints events to stderr. M1 debug aid.
     debug_to_stderr: bool = false,
 
+    /// Non-null = this Terminal renders a sketerm-mux session
+    /// instead of owning a PTY. No worker thread, no ring; the
+    /// socket is watched on the GLib main loop and decoded events
+    /// are applied to the Screen directly.
+    remote: ?*Remote = null,
+
+    /// Remote (mux) attachment state.
+    pub const Remote = struct {
+        conn: mux_client.Conn,
+        session: []u8,
+        watch_id: c_uint = 0,
+        /// Set when the daemon said GONE/EXIT — no more writes.
+        closed: bool = false,
+
+        pub fn sendInput(self: *Remote, bytes: []const u8) void {
+            if (self.closed) return;
+            self.conn.sendFrame(.input, bytes) catch {
+                self.closed = true;
+            };
+        }
+    };
+
+    /// Attach to an existing sketerm-mux session. `conn` must have
+    /// already completed ATTACH and received the first SNAPSHOT
+    /// (passed as `snap_payload`, seq header included) — that keeps
+    /// all blocking I/O in the caller, before the Terminal exists.
+    /// Takes ownership of `conn`.
+    pub fn initRemote(
+        allocator: std.mem.Allocator,
+        conn: mux_client.Conn,
+        session_name: []const u8,
+        snap_payload: []const u8,
+    ) !*Terminal {
+        if (snap_payload.len < 8) return error.BadSnapshot;
+        const self = try allocator.create(Terminal);
+        errdefer allocator.destroy(self);
+
+        var pool = try Pool.init(allocator);
+        errdefer pool.deinit();
+
+        const drain = try allocator.create(DrainHandle);
+        drain.* = .{};
+        errdefer allocator.destroy(drain);
+
+        // On failure the CALLER still owns `conn` (closes it); we
+        // only clean up what we allocated here.
+        const remote = try allocator.create(Remote);
+        errdefer allocator.destroy(remote);
+        remote.* = .{
+            .conn = conn,
+            .session = try allocator.dupe(u8, session_name),
+        };
+        errdefer allocator.free(remote.session);
+
+        self.* = .{
+            .pty = .{ .master_fd = -1, .child_pid = -1 },
+            .parser = Parser.init(allocator),
+            .ring = undefined,
+            .worker_thread = undefined,
+            .shutdown_fd = -1,
+            .drain = drain,
+            .allocator = allocator,
+            .pool = pool,
+            .screen = undefined,
+            .remote = remote,
+        };
+        drain.terminal = self;
+
+        // Restore the snapshot into our pool; wire sinks like init.
+        self.screen = try mux_snapshot.restore(allocator, &self.pool, snap_payload[8..]);
+        errdefer self.screen.deinit();
+        self.wireScreenSink();
+
+        // Non-blocking + main-loop watch for the live stream.
+        const fl = c.fcntl(remote.conn.fd, c.F_GETFL, @as(c_int, 0));
+        _ = c.fcntl(remote.conn.fd, c.F_SETFL, fl | c.O_NONBLOCK);
+        remote.watch_id = c.g_unix_fd_add(
+            remote.conn.fd,
+            c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR,
+            @ptrCast(&remoteSocketCb),
+            @ptrCast(self),
+        );
+        return self;
+    }
+
+    fn wireScreenSink(self: *Terminal) void {
+        self.screen.sink = .{
+            .ctx = @ptrCast(self),
+            .on_title = sinkTitle,
+            .on_bell = sinkBell,
+            .on_write_pty = sinkWritePty,
+            .on_clipboard_set = sinkClipboard,
+            .on_cwd = sinkCwd,
+            .on_image = sinkImage,
+            .on_image_delete_full = sinkImageDeleteFull,
+            .on_decanm = sinkDecanm,
+            .on_notification = sinkNotification,
+            .on_pointer_shape = sinkPointerShape,
+        };
+    }
+
+    /// Socket readable: peel frames, apply events / snapshots.
+    fn remoteSocketCb(_: c_int, condition: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *Terminal = @ptrCast(@alignCast(user.?));
+        const remote = self.remote orelse return 0;
+        if ((condition & (c.G_IO_HUP | c.G_IO_ERR)) != 0) {
+            self.remoteClosed("connection lost");
+            return 0;
+        }
+
+        var tmp: [32768]u8 = undefined;
+        var rounds: u8 = 0;
+        while (rounds < 8) : (rounds += 1) {
+            const n = c.read(remote.conn.fd, &tmp, tmp.len);
+            if (n < 0) {
+                if (std.posix.errno(n) == .AGAIN or std.posix.errno(n) == .INTR) break;
+                self.remoteClosed("read error");
+                return 0;
+            }
+            if (n == 0) {
+                self.remoteClosed("daemon closed");
+                return 0;
+            }
+            remote.conn.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]) catch break;
+            if (@as(usize, @intCast(n)) < tmp.len) break;
+        }
+
+        while (true) {
+            const peeled = mux_wire.peelFrame(remote.conn.rbuf.items) catch {
+                self.remoteClosed("protocol error");
+                return 0;
+            } orelse break;
+            self.handleRemoteFrame(peeled.frame);
+            const remaining = remote.conn.rbuf.items.len - peeled.consumed;
+            std.mem.copyForwards(u8, remote.conn.rbuf.items[0..remaining], remote.conn.rbuf.items[peeled.consumed..]);
+            remote.conn.rbuf.shrinkRetainingCapacity(remaining);
+        }
+
+        if (self.screen.dirty and !self.screen.sync_output) {
+            if (self.on_render_request) |f| f(self.user_ctx);
+        }
+        return 1;
+    }
+
+    fn handleRemoteFrame(self: *Terminal, frame: mux_wire.Frame) void {
+        switch (frame.ftype) {
+            .events => {
+                if (frame.payload.len < 12) return;
+                var r = mux_wire.Reader.init(frame.payload[12..]);
+                while (!r.atEnd()) {
+                    var ev = r.getEvent(self.allocator) catch return;
+                    self.screen.apply(ev);
+                    ev.deinit(self.allocator);
+                }
+            },
+            .snapshot => {
+                if (frame.payload.len < 8) return;
+                const fresh = mux_snapshot.restore(self.allocator, &self.pool, frame.payload[8..]) catch return;
+                // Carry over GUI-side fields the snapshot doesn't own.
+                fresh.scrollback_capacity = self.screen.scrollback_capacity;
+                fresh.word_chars = self.screen.word_chars;
+                fresh.cell_pixel_w = self.screen.cell_pixel_w;
+                fresh.cell_pixel_h = self.screen.cell_pixel_h;
+                const old = self.screen;
+                self.screen = fresh;
+                self.wireScreenSink();
+                old.deinit();
+                if (self.on_render_request) |f| f(self.user_ctx);
+            },
+            .exit, .gone => self.remoteClosed("session ended"),
+            else => {},
+        }
+    }
+
+    fn remoteClosed(self: *Terminal, reason: []const u8) void {
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        remote.closed = true;
+        remote.watch_id = 0; // we return 0 from the cb; source removed
+        self.screen.child_exited = true;
+        self.screen.dirty = true;
+        std.debug.print("sketerm: mux session '{s}': {s}\n", .{ remote.session, reason });
+        if (self.on_render_request) |f| f(self.user_ctx);
+    }
+
+    /// PTY-or-socket write for parser replies / mouse / focus
+    /// reports. Use this instead of touching `pty` directly.
+    pub fn writeRaw(self: *Terminal, bytes: []const u8) void {
+        if (self.remote) |r| {
+            r.sendInput(bytes);
+            return;
+        }
+        _ = self.pty.writeAll(bytes);
+    }
+
+    /// Resize, routed to the PTY or the mux daemon. The daemon
+    /// answers with a fresh snapshot, so remote panes skip the local
+    /// screen.resize (the snapshot replaces the grid wholesale).
+    pub fn requestResize(self: *Terminal, rows: u16, cols: u16) void {
+        if (self.remote) |r| {
+            if (r.closed) return;
+            var payload: [4]u8 = undefined;
+            std.mem.writeInt(u16, payload[0..2], rows, .little);
+            std.mem.writeInt(u16, payload[2..4], cols, .little);
+            r.conn.sendFrame(.resize, &payload) catch {
+                r.closed = true;
+            };
+            return;
+        }
+        self.pty.setSize(rows, cols);
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         pty: Pty,
@@ -170,7 +385,7 @@ pub const Terminal = struct {
 
     fn sinkWritePty(ctx: ?*anyopaque, bytes: []const u8) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
-        _ = self.pty.writeAll(bytes);
+        self.writeRaw(bytes);
     }
 
     fn sinkClipboard(ctx: ?*anyopaque, text: []const u8) void {
@@ -251,10 +466,27 @@ pub const Terminal = struct {
             f(self.broadcast_ctx, self, bytes);
             return;
         }
-        _ = self.pty.writeAll(bytes);
+        self.writeRaw(bytes);
     }
 
     pub fn deinit(self: *Terminal) void {
+        if (self.remote) |remote| {
+            // Detach, don't kill: the session keeps running in the
+            // daemon — that's the entire point.
+            self.drain.terminal = null;
+            self.drain.alive.store(false, .release);
+            if (remote.watch_id != 0) _ = c.g_source_remove(remote.watch_id);
+            if (!remote.closed) remote.conn.sendFrame(.detach, "") catch {};
+            remote.conn.deinit();
+            self.allocator.free(remote.session);
+            self.allocator.destroy(remote);
+            self.screen.deinit();
+            self.pool.deinit();
+            self.parser.deinit();
+            if (self.cwd) |path| self.allocator.free(path);
+            self.allocator.destroy(self);
+            return;
+        }
         // Mark the drain handle dead BEFORE freeing anything else, so
         // any g_main_context_invoke(mainDrain) that was queued before
         // this call but hasn't been dispatched yet will safely no-op
@@ -354,6 +586,10 @@ pub const Terminal = struct {
     /// the WEXITSTATUS-style code (or -signo for fatal signals).
     fn reapStatus(self: *Terminal) i32 {
         var status: c_int = 0;
+        // Remote terminals have child_pid == -1; waitpid(-1) would
+        // reap ARBITRARY children of the GUI (the forked mux daemon,
+        // file-chooser portals…). Never let that happen.
+        if (self.pty.child_pid <= 0) return 0;
         const r = c.waitpid(self.pty.child_pid, &status, c.WNOHANG);
         if (r != self.pty.child_pid) return 0;
         if ((status & 0x7F) == 0) return @intCast((status >> 8) & 0xFF); // WIFEXITED

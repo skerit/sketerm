@@ -2342,6 +2342,125 @@ pub const Window = struct {
         return c.adw_tab_view_get_selected_page(self.tab_view);
     }
 
+    // ── Durable tabs (sketerm-mux) ───────────────────────────────
+
+    /// Connect to the mux daemon, spawning it first if absent.
+    fn muxConnect(self: *Window) !@import("../mux/client.zig").Conn {
+        const mux_client = @import("../mux/client.zig");
+        const mux_daemon = @import("../mux/daemon.zig");
+        const path = try mux_daemon.defaultSocketPath(self.allocator);
+        defer self.allocator.free(path);
+
+        if (mux_client.Conn.connect(self.allocator, path)) |conn| return conn else |_| {}
+
+        // Spawn the daemon (sibling binary, falls back to $PATH) and
+        // retry with backoff for ~2s.
+        const pid = c.fork();
+        if (pid == 0) {
+            _ = c.setsid();
+            // Try next to our own binary first so `zig build run`
+            // works without installing.
+            var self_buf: [4096]u8 = undefined;
+            const n = c.readlink("/proc/self/exe", &self_buf, self_buf.len - 1);
+            if (n > 0) {
+                const exe_path = self_buf[0..@intCast(n)];
+                if (std.mem.lastIndexOfScalar(u8, exe_path, '/')) |slash| {
+                    var sib_buf: [4096:0]u8 = undefined;
+                    const sib = std.fmt.bufPrintZ(&sib_buf, "{s}/sketerm-mux", .{exe_path[0..slash]}) catch "";
+                    if (sib.len > 0) {
+                        const argv0 = [_:null]?[*:0]const u8{ sib.ptr, null };
+                        _ = c.execv(sib.ptr, @ptrCast(@constCast(&argv0)));
+                    }
+                }
+            }
+            const argv1 = [_:null]?[*:0]const u8{ "sketerm-mux", null };
+            _ = c.execvp("sketerm-mux", @ptrCast(@constCast(&argv1)));
+            c._exit(127);
+        }
+        var tries: u32 = 0;
+        while (tries < 40) : (tries += 1) {
+            _ = c.usleep(50_000);
+            if (mux_client.Conn.connect(self.allocator, path)) |conn| return conn else |_| {}
+        }
+        return error.MuxDaemonUnreachable;
+    }
+
+    /// Spawn a shell session in the daemon and attach it as a tab.
+    pub fn newDurableTab(self: *Window) !void {
+        var name_buf: [64]u8 = undefined;
+        // Unique-enough name: pid + monotonic counter.
+        self.tab_counter += 1;
+        const name = std.fmt.bufPrint(&name_buf, "s{d}-{d}", .{ c.getpid(), self.tab_counter }) catch "s0";
+
+        var conn = try self.muxConnect();
+        {
+            // This errdefer covers ONLY the spawn phase; once the
+            // block exits cleanly, attachMuxTab owns the conn (and
+            // deinits it on its own failures).
+            errdefer conn.deinit();
+            const shell: []const u8 = if (self.config.shell) |sh| sh else blk: {
+                const env = c.getenv("SHELL");
+                break :blk if (env != null) std.mem.span(env) else "/bin/sh";
+            };
+            try conn.sendJson(.spawn, .{
+                .name = name,
+                .argv = [_][]const u8{shell},
+                .cwd = self.focusedPaneCwd(),
+                .rows = @as(u16, 24),
+                .cols = @as(u16, 80),
+            });
+            (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
+        }
+        try self.attachMuxTab(conn, name);
+    }
+
+    /// Attach `conn` to session `name` and wrap it in a new tab.
+    /// Takes ownership of `conn` on success AND failure.
+    pub fn attachMuxTab(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8) !void {
+        var conn = conn_in;
+
+        const term = blk: {
+            // conn is ours to clean up only until initRemote takes it.
+            errdefer conn.deinit();
+            try conn.sendJson(.attach, .{ .name = name });
+            const snap = try conn.recvExpect(&.{.snapshot});
+            defer snap.deinit(self.allocator);
+            break :blk try Terminal.initRemote(self.allocator, conn, name, snap.payload);
+        };
+        errdefer term.deinit();
+        term.debug_to_stderr = self.debug_events;
+
+        const pane = try self.makePane(term);
+        pane.id = self.allocPaneId();
+        errdefer pane.deinit();
+        pane.win_clip_ctx = @ptrCast(self);
+        pane.win_on_clipboard = onTermClipboardSet;
+        pane.win_notify_ctx = @ptrCast(self);
+        pane.win_on_notification = onTermNotification;
+        pane.win_bell_ctx = @ptrCast(self);
+        pane.win_on_bell = onTermBell;
+        pane.win_cwd_ctx = @ptrCast(self);
+        pane.win_on_cwd = onTermCwdChanged;
+        pane.win_title_ctx = @ptrCast(self);
+        pane.win_on_title = onTermTitleChanged;
+
+        const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        c.gtk_widget_set_hexpand(wrapper, 1);
+        c.gtk_widget_set_vexpand(wrapper, 1);
+        c.gtk_box_append(@ptrCast(wrapper), pane.widget());
+
+        var title_buf: [96:0]u8 = undefined;
+        const title_z = std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{name}) catch "mux";
+        const page = self.appendOrInsertTab(wrapper);
+        c.adw_tab_page_set_title(page, title_z.ptr);
+        c.adw_tab_page_set_tooltip(page, title_z.ptr);
+
+        try self.panes.append(self.allocator, pane);
+        try self.terminals.append(self.allocator, term);
+        c.adw_tab_view_set_selected_page(self.tab_view, page);
+        _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+    }
+
     // ── Background layer (image / gradient) ─────────────────────
 
     /// Rebuild bg_source from config: decode the image (if any) or
@@ -2583,6 +2702,14 @@ pub const Window = struct {
             c.adw_tab_page_set_title(page, z.ptr);
             c.adw_tab_page_set_tooltip(page, z.ptr);
             try ipc_protocol.writeOk(out, allocator, null, {});
+        } else if (eql(u8, req.cmd, "new-durable-tab")) {
+            self.newDurableTab() catch return ipc_protocol.writeErr(out, allocator, "durable spawn failed");
+            try ipc_protocol.writeOk(out, allocator, "pane", self.next_pane_id - 1);
+        } else if (eql(u8, req.cmd, "attach-session")) {
+            const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "attach-session requires data (session name)");
+            const conn = self.muxConnect() catch return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
+            self.attachMuxTab(conn, name) catch return ipc_protocol.writeErr(out, allocator, "attach failed (no such session?)");
+            try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (eql(u8, req.cmd, "set-tab-color")) {
             const page = self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
             const spec = req.data orelse return ipc_protocol.writeErr(out, allocator, "set-tab-color requires data (#RRGGBB or none)");
@@ -2670,7 +2797,7 @@ pub const Window = struct {
     pub fn broadcastBytes(self: *Window, source: *Terminal, bytes: []const u8) void {
         // Source always gets the bytes — direct PTY write to avoid
         // re-entering the broadcast sink.
-        _ = source.pty.writeAll(bytes);
+        source.writeRaw(bytes);
 
         if (self.groupsend == .off) return;
 
@@ -2678,14 +2805,14 @@ pub const Window = struct {
             if (t == source) continue;
             switch (self.groupsend) {
                 .off => unreachable,
-                .all => _ = t.pty.writeAll(bytes),
+                .all => t.writeRaw(bytes),
                 .group => {
                     // Find the source pane's group + this pane's group.
                     const src_group: ?[]const u8 = self.groupForTerminal(source);
                     const dst_group: ?[]const u8 = self.groupForTerminal(t);
                     if (src_group) |sg| {
                         if (dst_group) |dg| {
-                            if (std.mem.eql(u8, sg, dg)) _ = t.pty.writeAll(bytes);
+                            if (std.mem.eql(u8, sg, dg)) t.writeRaw(bytes);
                         }
                     }
                 },
@@ -3502,6 +3629,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .goto_tab_9 => self.gotoTab(8),
         .duplicate_tab => self.duplicateCurrentTab(),
         .show_scrollback => self.openScrollbackPager(),
+        .new_durable_tab => self.newDurableTab() catch |err| logActionError("new_durable_tab", err),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         .hints_open => self.openHints(),
         .copy_mode => self.openCopyMode(),

@@ -833,7 +833,7 @@ pub const Pane = struct {
                 std.debug.print("sketerm: pane resize failed: {s}\n", .{@errorName(err)});
                 return;
             };
-            self.terminal.pty.setSize(rows, cols);
+            self.terminal.requestResize(rows, cols);
         }
 
         self.terminal.screen.dirty = true;
@@ -1465,7 +1465,7 @@ fn onTitlebarClicked(_: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user
 fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
     if (self.terminal.screen.focus_reports) {
-        _ = self.terminal.pty.writeAll("\x1b[I");
+        self.terminal.writeRaw("\x1b[I");
     }
     // Tell the IM context this widget owns focus. Required for both:
     // (1) dead-key state tracking in the simple IM module
@@ -1493,7 +1493,7 @@ fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
 fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
     if (self.terminal.screen.focus_reports) {
-        _ = self.terminal.pty.writeAll("\x1b[O");
+        self.terminal.writeRaw("\x1b[O");
     }
     if (self.input_ctx) |ictx| if (ictx.im_ctx) |im| {
         c.gtk_im_context_focus_out(im);
@@ -1754,12 +1754,12 @@ fn writeMouseEvent(self: *Pane, button: u32, col_1: u32, row_1: u32, px_x: f64, 
         .sgr => {
             const final: u8 = if (press) 'M' else 'm';
             const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}{c}", .{ button, col_1, row_1, final }) catch return;
-            _ = self.terminal.pty.writeAll(seq);
+            self.terminal.writeRaw(seq);
         },
         .sgr_pixel => {
             const final: u8 = if (press) 'M' else 'm';
             const seq = std.fmt.bufPrint(&buf, "\x1b[<{d};{d};{d}{c}", .{ button, px_x_u, px_y_u, final }) catch return;
-            _ = self.terminal.pty.writeAll(seq);
+            self.terminal.writeRaw(seq);
         },
         .urxvt => {
             // urxvt: ESC [ b+32 ; col ; row M  — releases not distinct;
@@ -1767,7 +1767,7 @@ fn writeMouseEvent(self: *Pane, button: u32, col_1: u32, row_1: u32, px_x: f64, 
             // button = 3 + modifier bits when buttons go up.
             const b: u32 = if (press) button else 3 | (button & 0x1C);
             const seq = std.fmt.bufPrint(&buf, "\x1b[{d};{d};{d}M", .{ b + 32, col_1, row_1 }) catch return;
-            _ = self.terminal.pty.writeAll(seq);
+            self.terminal.writeRaw(seq);
         },
         .legacy => {
             const cb_val: u32 = if (press) button + 32 else (3 | (button & 0x1C)) + 32;
@@ -1779,7 +1779,7 @@ fn writeMouseEvent(self: *Pane, button: u32, col_1: u32, row_1: u32, px_x: f64, 
                 @intCast(cx_clamp),
                 @intCast(cy_clamp),
             };
-            _ = self.terminal.pty.writeAll(&out);
+            self.terminal.writeRaw(&out);
         },
         .utf8 => {
             const cb_val: u32 = if (press) button + 32 else (3 | (button & 0x1C)) + 32;
@@ -1794,7 +1794,7 @@ fn writeMouseEvent(self: *Pane, button: u32, col_1: u32, row_1: u32, px_x: f64, 
             off += 1;
             off += encodeUtf8Cp(buf[off..], col_1 + 32);
             off += encodeUtf8Cp(buf[off..], row_1 + 32);
-            _ = self.terminal.pty.writeAll(buf[0..off]);
+            self.terminal.writeRaw(buf[0..off]);
         },
     }
 }
@@ -1983,7 +1983,7 @@ fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) cal
     if (cols == self.terminal.screen.cols and rows == self.terminal.screen.rows) return;
 
     self.terminal.screen.resize(cols, rows) catch return;
-    self.terminal.pty.setSize(rows, cols);
+    self.terminal.requestResize(rows, cols);
     // Resize reallocates the framebuffer; with auto_render off we
     // must explicitly schedule a repaint or the user sees stale
     // contents from the old size.
