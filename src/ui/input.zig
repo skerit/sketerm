@@ -110,6 +110,10 @@ pub const Action = enum {
     /// Subtly different from `new_tab` which uses the focused pane's
     /// cwd already but defaults the profile to none.
     duplicate_tab,
+    /// Dump scrollback + visible screen to a temp file and open it
+    /// in a pager (`less -R +G`, or `$PAGER`) in a new tab. Kitty's
+    /// show_scrollback equivalent.
+    show_scrollback,
     // Per-pane (dispatched locally inside input.zig).
     paste_clipboard,
     copy_selection,
@@ -170,6 +174,8 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_e, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .hints_open },
     .{ .keyval = c.GDK_KEY_z, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .restore_closed_tab },
     .{ .keyval = c.GDK_KEY_a, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_screen },
+    // Kitty's default for show_scrollback.
+    .{ .keyval = c.GDK_KEY_h, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .show_scrollback },
     // Ctrl+Shift+P is the cross-app convention for "command palette"
     // (VSCode, Sublime, JetBrains, GNOME Builder, …) so it takes
     // precedence here. Pin/unpin tab moves to Ctrl+Shift+I — pick
@@ -263,6 +269,7 @@ pub fn actionName(a: Action) []const u8 {
         .goto_tab_8 => "goto_tab_8",
         .goto_tab_9 => "goto_tab_9",
         .duplicate_tab => "duplicate_tab",
+        .show_scrollback => "show_scrollback",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
         .copy_screen => "copy_screen",
@@ -324,6 +331,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .goto_tab_8 => "Jump to tab 8",
         .goto_tab_9 => "Jump to tab 9",
         .duplicate_tab => "Duplicate tab (cwd + profile)",
+        .show_scrollback => "Show scrollback in pager",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",
         .copy_screen => "Copy whole screen",

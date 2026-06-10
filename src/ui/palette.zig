@@ -86,6 +86,8 @@ const ENTRIES = [_]Entry{
        .desc = "Scroll forward one screenful.", .action = .scrollback_page_down },
     .{ .icon = "edit-clear-all-symbolic", .title = "Clear Scrollback",
        .desc = "Wipe the scrollback ring. The visible screen stays.", .action = .clear_scrollback },
+    .{ .icon = "view-list-symbolic", .title = "Show Scrollback in Pager",
+       .desc = "Open the scrollback buffer plus visible screen in a pager tab.", .action = .show_scrollback },
 
     // Font
     .{ .icon = "zoom-in-symbolic", .title = "Increase Font Size",

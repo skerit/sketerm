@@ -2642,6 +2642,65 @@ pub const Window = struct {
         c.gdk_clipboard_set_text(clip, cstr.ptr);
     }
 
+    /// Open the focused pane's scrollback + screen in a pager tab.
+    /// Kitty's show_scrollback: dump to a 0600 temp file, spawn
+    /// `less -R +G <file>` (or `$PAGER <file>`) in a new tab; the
+    /// wrapping `sh -c` rm's the file once the pager exits.
+    pub fn openScrollbackPager(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+        const screen = pane.terminal.screen;
+        const text = screen.extractScrollback(self.allocator) catch return;
+        defer self.allocator.free(text);
+
+        const dir = @import("../util/profile.zig").getenv("XDG_RUNTIME_DIR") orelse "/tmp";
+        var path_buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrintZ(
+            &path_buf,
+            "{s}/sketerm-scrollback-{d}-{d}.txt",
+            .{ dir, c.getpid(), @import("../util/profile.zig").milliTimestamp() },
+        ) catch return;
+
+        const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
+        if (fd < 0) return;
+        var off: usize = 0;
+        while (off < text.len) {
+            const n = c.write(fd, text.ptr + off, text.len - off);
+            if (n <= 0) {
+                _ = c.close(fd);
+                _ = c.unlink(path.ptr);
+                return;
+            }
+            off += @intCast(n);
+        }
+        if (c.close(fd) != 0) {
+            _ = c.unlink(path.ptr);
+            return;
+        }
+
+        // $PAGER overrides; default matches kitty (-R raw colours,
+        // +G jump to end). The path is single-quoted — safe because
+        // we generated it from safe chars (XDG_RUNTIME_DIR/tmp +
+        // pid + timestamp, no quotes possible).
+        const pager = blk: {
+            const env = @import("../util/profile.zig").getenv("PAGER") orelse break :blk "less -R +G";
+            break :blk if (env.len == 0) "less -R +G" else env;
+        };
+        var cmd_buf: [1024]u8 = undefined;
+        const cmd = std.fmt.bufPrintZ(
+            &cmd_buf,
+            "{s} '{s}'; rm -f '{s}'",
+            .{ pager, path, path },
+        ) catch {
+            _ = c.unlink(path.ptr);
+            return;
+        };
+        const argv = [_][*:0]const u8{ "/bin/sh", "-c", cmd.ptr };
+        self.addTabInternal("Scrollback", &argv, null) catch |err| {
+            _ = c.unlink(path.ptr);
+            logActionError("show_scrollback", err);
+        };
+    }
+
     /// Show / hide the tab bar. Bound via keybind.toggle_tab_bar
     /// (no default — common terminator-style binding is Ctrl+Shift+B
     /// but we leave it user-configurable).
@@ -2773,6 +2832,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .goto_tab_8 => self.gotoTab(7),
         .goto_tab_9 => self.gotoTab(8),
         .duplicate_tab => self.duplicateCurrentTab(),
+        .show_scrollback => self.openScrollbackPager(),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         .hints_open => self.openHints(),
         else => {},
@@ -3203,7 +3263,7 @@ fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
 /// page as `g_object_set_data(page, "sketerm-title-locked")`.
 fn onTermTitleChanged(ctx: ?*anyopaque, pane: *Pane, title: []const u8) void {
     const self = cast.userData(Window, ctx);
-    const page = self.tabPageForPane(pane) orelse return;
+    const page = tabPageForPane(self, pane) orelse return;
     if (c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null) return;
     setTabPageTitleFromUtf8(self.allocator, page, title);
 }
