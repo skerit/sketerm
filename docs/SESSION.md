@@ -3962,3 +3962,30 @@ mirroring search_highlights) drawn by GridPass — teal range highlight
 + amber label badge with bold glyphs; snapshot gains a hints hash so
 the vbuf rebuilds when the overlay changes. Pane-close paths clear
 the mode like they clear search.
+
+## 2026-06-10 — show_scrollback + copy mode (parallel agents)
+
+Two features built in parallel worktrees and merged:
+
+- **show_scrollback (Ctrl+Shift+H)** — kitty equivalent. Dumps
+  scrollback + screen via the existing `extractScrollback` to a 0600
+  temp file in $XDG_RUNTIME_DIR (fallback /tmp), opens a new tab
+  running `less -R +G <file>` (or `$PAGER`); the wrapping `sh -c`
+  rm's the file when the pager exits, and every error path unlinks.
+  Also revived `addTabInternal` (was dead code) and fixed the
+  method-syntax `tabPageForPane` call it exposed.
+- **Copy mode (Ctrl+Shift+X)** — WezTerm/tmux-style keyboard
+  selection. Sink pair `copymode_sink` on input.Ctx (checked after
+  hint_sink; sink-false only for bare modifiers, and unconsumed keys
+  return 0 so GTK modifier tracking stays coherent). Motions:
+  h/j/k/l + arrows, 0/$/Home/End, g/G, w/b word motions (new pure
+  `grid/word_motion.zig`, unit-tested; `Screen.isWordChar` now
+  delegates there). v / V / Ctrl+v-or-r toggle cell / line / rect
+  selection — rebuilt from anchor+cursor into `screen.selection`
+  (display-buffer coords, negative = scrollback, matching the mouse
+  path so `extractSelection` is correct while scrolled). y/Enter
+  yanks to CLIPBOARD + PRIMARY and exits; Esc/q exits. The copy
+  cursor is `Screen.copy_cursor`, drawn by GridPass as an amber
+  hollow outline (snapshot-gated). View follows the cursor via
+  view_offset. Hint mode and copy mode are mutually exclusive
+  (cross-guards in both openers); both clear on pane close.
