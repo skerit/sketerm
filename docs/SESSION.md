@@ -3989,3 +3989,38 @@ Two features built in parallel worktrees and merged:
   hollow outline (snapshot-gated). View follows the cursor via
   view_offset. Hint mode and copy mode are mutually exclusive
   (cross-guards in both openers); both clear on pane close.
+
+## 2026-06-10 — small-batch sweep: dnd, contrast, --hold, overlay decorations
+
+Four well-contained gaps closed in one pass:
+
+- **Drag & drop files (paste path)** — GtkDropTarget per pane accepts
+  GdkFileList + string drops. Local paths are single-quote
+  shell-escaped (bare when every byte is safe), space-joined with a
+  trailing space; non-local URIs (sftp://) are skipped. Text drops
+  paste as-is. Both go through `clipboard.pasteText`, the
+  bracketed-paste logic extracted from the clipboard read callback.
+- **minimum_contrast** — WCAG contrast floor (1..21, default 1.0 =
+  off) between text fg and its effective cell bg; below it fg snaps
+  to white or black, whichever reads better. Shared helpers in
+  render/style.zig (`contrastRatio`, `applyMinContrast`); applied in
+  CellPass `resolveStyleColors` and both GridPass overlay glyph
+  emitters (new `effectiveBg` mirrors the overlay bg-quad logic).
+  Config key + Legibility prefs group + sample.conf; GridPass
+  snapshot gains the field so the vbuf rebuilds on change.
+- **--hold** — per-invocation exit_action override stored as
+  `Window.hold_override` (outside Config, so SIGUSR1 reload can't
+  clear it). Pairs with --layout one-shot commands.
+- **Overlay-row SGR decorations** — GridPass bidi/DH/DW rows drew no
+  underline/strike/overline at all (CellPass zeroes those rows and
+  the overlay only emitted bg + glyphs). New `emitCellDeco` draws
+  flat quads per visual column — single/double underline, strike,
+  overline; curly degrades to a thicker line (no wave shader in this
+  pass). Honours SGR 58 underline_color, falls back to resolved fg.
+  Decorations sweep separately from glyphs so underlined spaces draw.
+
+OSC 22 pointer shapes turned out to be already implemented end-to-end
+(screen → terminal sink → Pane cursor-from-name); no work needed.
+
+Tests 434 → 437 (contrast helpers, shell quoting). pane.zig is now
+registered in tests.zig.
