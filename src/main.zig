@@ -34,12 +34,17 @@ const HELP_TEXT =
     \\                         preset; `--pane self` self-addresses.
     \\
     \\Durable sessions (sketerm-mux):
-    \\  sketerm mux            TUI picker: attach / spawn / kill
+    \\  sketerm mux [host]     TUI picker: attach / spawn / kill
     \\                         daemon-backed sessions that survive
-    \\                         GUI restarts. Also: mux list / attach
-    \\                         <name> / new / kill <name>. Create one
-    \\                         from the command palette ("New Durable
-    \\                         Tab") or `sketerm cli new-durable-tab`.
+    \\                         GUI restarts. With a host, manages the
+    \\                         REMOTE daemon over SSH. Also: mux
+    \\                         [host] list / attach <name> / new /
+    \\                         kill <name>.
+    \\  sketerm ssh <host>     mosh-style: durable remote shell on
+    \\                         <host> as a tab in the running window.
+    \\                         Needs key auth + sketerm-mux on the
+    \\                         host; survives disconnects (reattach
+    \\                         with `sketerm mux <host>`).
     \\
     \\Options:
     \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json
@@ -159,6 +164,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer allocator.free(mux_args);
         for (argv[2..], 0..) |a, n| mux_args[n] = std.mem.span(a);
         return @import("ipc/mux_cli.zig").run(allocator, mux_args);
+    }
+
+    // `sketerm ssh <host>` — mosh-style: open a durable remote shell
+    // on <host> as a tab in the running window. Sugar for
+    // `sketerm mux <host> new`.
+    if (argv.len >= 3 and std.mem.eql(u8, std.mem.span(argv[1]), "ssh")) {
+        const ssh_args = [_][]const u8{ std.mem.span(argv[2]), "new" };
+        return @import("ipc/mux_cli.zig").run(allocator, &ssh_args);
     }
 
     var i: usize = 1;

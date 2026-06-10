@@ -330,11 +330,18 @@ pub const Daemon = struct {
             return;
         };
         defer parsed.deinit();
-        const req = parsed.value;
-        if (req.name.len == 0 or req.name.len > 64 or req.argv.len == 0) {
-            cl.queueErr("spawn needs name + argv");
+        var req = parsed.value;
+        if (req.name.len == 0 or req.name.len > 64) {
+            cl.queueErr("spawn needs a name");
             return;
         }
+        // Empty argv = "the daemon host's login shell" — remote
+        // clients can't know what's installed here.
+        const default_shell: []const []const u8 = &.{blk: {
+            const sh = std.c.getenv("SHELL");
+            break :blk if (sh != null) std.mem.span(sh.?) else "/bin/sh";
+        }};
+        if (req.argv.len == 0) req.argv = default_shell;
         if (self.findSession(req.name) != null) {
             cl.queueErr("session name already exists");
             return;

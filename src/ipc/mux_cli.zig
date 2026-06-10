@@ -15,18 +15,22 @@ const mux_wire = @import("../mux/wire.zig");
 const ipc_client = @import("client.zig");
 
 const MUX_HELP =
-    \\Usage: sketerm mux [command]
+    \\Usage: sketerm mux [host] [command]
     \\
-    \\No command: interactive session picker (TUI).
+    \\No command: interactive session picker (TUI) — local daemon,
+    \\or <host>'s daemon over SSH (`sketerm mux user@box`).
     \\  Up/Down or j/k  select        Enter  attach as tab
     \\  n  new durable tab            x      kill selected session
     \\  q / Esc  quit
     \\
-    \\Commands:
-    \\  list            print sessions
-    \\  attach <name>   attach a session as a tab in the running GUI
-    \\  new             spawn a durable tab in the running GUI
-    \\  kill <name>     kill a session
+    \\Commands (each accepts an optional leading host):
+    \\  list                  print sessions
+    \\  attach <name>         attach a session as a GUI tab
+    \\  new                   spawn a durable tab in the GUI
+    \\  kill <name>           kill a session
+    \\
+    \\`sketerm ssh <host>` = `sketerm mux <host> new` — open a
+    \\remote shell that survives disconnects (key auth required).
     \\
 ;
 
@@ -44,15 +48,31 @@ const Welcome = struct {
     sessions: []SessionInfo = &.{},
 };
 
-pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
-    if (args.len == 0) return tui(allocator);
+fn isSubcommand(s2: []const u8) bool {
+    const known = [_][]const u8{ "list", "attach", "new", "kill" };
+    for (known) |k| {
+        if (std.mem.eql(u8, s2, k)) return true;
+    }
+    return false;
+}
+
+pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
+    // Optional leading host: anything that isn't a known subcommand
+    // or flag ("sketerm mux user@box [cmd]").
+    var host: ?[]const u8 = null;
+    var args = args_in;
+    if (args.len > 0 and !isSubcommand(args[0]) and !std.mem.startsWith(u8, args[0], "-")) {
+        host = args[0];
+        args = args[1..];
+    }
+    if (args.len == 0) return tui(allocator, host);
     const cmd = args[0];
     if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         _ = c.fputs(MUX_HELP, c.stdout);
         return 0;
     }
     if (std.mem.eql(u8, cmd, "list")) {
-        var sessions = fetchSessions(allocator) orelse return 1;
+        var sessions = fetchSessions(allocator, host) orelse return 1;
         defer sessions.deinit();
         for (sessions.value.sessions) |s| {
             _ = c.printf(
@@ -70,13 +90,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         return 0;
     }
     if (std.mem.eql(u8, cmd, "attach") and args.len >= 2) {
-        return if (guiCommand(allocator, "attach-session", args[1])) 0 else 1;
+        return if (guiCommand(allocator, "attach-session", args[1], host)) 0 else 1;
     }
     if (std.mem.eql(u8, cmd, "new")) {
-        return if (guiCommand(allocator, "new-durable-tab", null)) 0 else 1;
+        return if (guiCommand(allocator, "new-durable-tab", null, host)) 0 else 1;
     }
     if (std.mem.eql(u8, cmd, "kill") and args.len >= 2) {
-        var conn = muxConnect(allocator) orelse return 1;
+        var conn = muxConnect(allocator, host) orelse return 1;
         defer conn.deinit();
         conn.sendJson(.kill, .{ .name = args[1] }) catch return 1;
         const f = conn.recvExpect(&.{.ok}) catch {
@@ -90,7 +110,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     return 2;
 }
 
-fn muxConnect(allocator: std.mem.Allocator) ?mux_client.Conn {
+fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn {
+    if (host) |h| {
+        return mux_client.Conn.connectSsh(allocator, h) catch {
+            _ = c.fprintf(c.stderr, "sketerm mux: ssh transport to host failed (key auth? sketerm-mux installed there?)\n");
+            return null;
+        };
+    }
     const path = mux_daemon.defaultSocketPath(allocator) catch return null;
     defer allocator.free(path);
     return mux_client.Conn.connect(allocator, path) catch {
@@ -99,8 +125,8 @@ fn muxConnect(allocator: std.mem.Allocator) ?mux_client.Conn {
     };
 }
 
-fn fetchSessions(allocator: std.mem.Allocator) ?std.json.Parsed(Welcome) {
-    var conn = muxConnect(allocator) orelse return null;
+fn fetchSessions(allocator: std.mem.Allocator, host: ?[]const u8) ?std.json.Parsed(Welcome) {
+    var conn = muxConnect(allocator, host) orelse return null;
     defer conn.deinit();
     conn.sendFrame(.list, "") catch return null;
     const f = conn.recvExpect(&.{.welcome}) catch return null;
@@ -113,7 +139,7 @@ fn fetchSessions(allocator: std.mem.Allocator) ?std.json.Parsed(Welcome) {
 
 /// Send one command to the running GUI over its IPC socket
 /// ($SKETERM_SOCKET inside a pane, auto-discovery otherwise).
-fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8) bool {
+fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, host: ?[]const u8) bool {
     const sock = ipc_client.resolveSocket(allocator, null) orelse {
         _ = c.fprintf(c.stderr, "sketerm mux: no running sketerm window found\n");
         return false;
@@ -122,7 +148,7 @@ fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8) 
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    std.json.Stringify.value(.{ .cmd = cmd, .data = data }, .{}, &aw.writer) catch return false;
+    std.json.Stringify.value(.{ .cmd = cmd, .data = data, .host = host }, .{}, &aw.writer) catch return false;
     aw.writer.writeAll("\n") catch return false;
 
     const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0);
@@ -177,8 +203,8 @@ const RawMode = struct {
     }
 };
 
-fn tui(allocator: std.mem.Allocator) u8 {
-    var parsed = fetchSessions(allocator) orelse return 1;
+fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
+    var parsed = fetchSessions(allocator, host) orelse return 1;
     defer parsed.deinit();
 
     var raw = RawMode.enter() orelse return 1;
@@ -209,7 +235,7 @@ fn tui(allocator: std.mem.Allocator) u8 {
             eraseTui(&drawn_lines);
             raw.leave();
             const name = sessions[selected].name;
-            if (guiCommand(allocator, "attach-session", name)) {
+            if (guiCommand(allocator, "attach-session", name, host)) {
                 _ = c.printf("attached '%.*s'\n", @as(c_int, @intCast(name.len)), name.ptr);
                 return 0;
             }
@@ -218,11 +244,11 @@ fn tui(allocator: std.mem.Allocator) u8 {
         if (key.len == 1 and key[0] == 'n') {
             eraseTui(&drawn_lines);
             raw.leave();
-            return if (guiCommand(allocator, "new-durable-tab", null)) 0 else 1;
+            return if (guiCommand(allocator, "new-durable-tab", null, host)) 0 else 1;
         }
         if (key.len == 1 and key[0] == 'x' and sessions.len > 0) {
             const name = sessions[selected].name;
-            if (muxConnect(allocator)) |conn_v| {
+            if (muxConnect(allocator, host)) |conn_v| {
                 var conn = conn_v;
                 defer conn.deinit();
                 conn.sendJson(.kill, .{ .name = name }) catch {};
@@ -230,7 +256,7 @@ fn tui(allocator: std.mem.Allocator) u8 {
             }
             // Refresh the list.
             parsed.deinit();
-            parsed = fetchSessions(allocator) orelse {
+            parsed = fetchSessions(allocator, host) orelse {
                 eraseTui(&drawn_lines);
                 return 1;
             };

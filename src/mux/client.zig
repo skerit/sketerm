@@ -27,6 +27,61 @@ pub const Conn = struct {
         self.rbuf.deinit(self.allocator);
     }
 
+    /// Connect to a REMOTE host's daemon by running
+    /// `ssh -T -o BatchMode=yes <host> sketerm-mux --proxy` over a
+    /// socketpair (one fd both ways, so everything downstream is
+    /// transport-agnostic). The child is double-forked — it reparents
+    /// to init, no zombie to reap. Requires key/agent auth
+    /// (BatchMode fails instead of prompting on the protocol pipe).
+    /// $SKETERM_SSH overrides the ssh binary (tests fake a remote).
+    pub fn connectSsh(allocator: std.mem.Allocator, host: []const u8) !Conn {
+        var pair: [2]c_int = undefined;
+        if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair) != 0) return error.SocketFailed;
+        errdefer {
+            _ = c.close(pair[0]);
+            _ = c.close(pair[1]);
+        }
+
+        var host_z_buf: [256:0]u8 = undefined;
+        const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{host}) catch return error.BadPath;
+
+        const ssh_env = c.getenv("SKETERM_SSH");
+        const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
+
+        const pid = c.fork();
+        if (pid < 0) return error.ForkFailed;
+        if (pid == 0) {
+            if (c.fork() == 0) {
+                _ = c.dup2(pair[1], 0);
+                _ = c.dup2(pair[1], 1);
+                _ = c.close(pair[0]);
+                _ = c.close(pair[1]);
+                const argv = [_:null]?[*:0]const u8{
+                    ssh_bin, "-T", "-o", "BatchMode=yes", host_z.ptr, "sketerm-mux", "--proxy", null,
+                };
+                _ = c.execvp(ssh_bin, @ptrCast(@constCast(&argv)));
+            }
+            c._exit(0);
+        }
+        var st: c_int = 0;
+        _ = c.waitpid(pid, &st, 0);
+        _ = c.close(pair[1]);
+
+        var conn = Conn{ .allocator = allocator, .fd = pair[0] };
+        // Probe the bridge: hello → welcome proves ssh + remote
+        // binary + daemon all came up before we hand the conn out.
+        conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION }) catch {
+            conn.deinit();
+            return error.SshTransportFailed;
+        };
+        const w = conn.recvExpect(&.{.welcome}) catch {
+            conn.deinit();
+            return error.SshTransportFailed;
+        };
+        w.deinit(allocator);
+        return conn;
+    }
+
     pub fn sendFrame(self: *Conn, ftype: wire.FrameType, payload: []const u8) !void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);

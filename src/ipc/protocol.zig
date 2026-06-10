@@ -30,6 +30,9 @@ pub const Request = struct {
     /// new-tab: working directory and title.
     cwd: ?[]const u8 = null,
     title: ?[]const u8 = null,
+    /// new-durable-tab / attach-session: SSH host of the mux daemon
+    /// ("user@box" accepted). null = local daemon.
+    host: ?[]const u8 = null,
 };
 
 pub fn parseRequest(allocator: std.mem.Allocator, line: []const u8) !std.json.Parsed(Request) {

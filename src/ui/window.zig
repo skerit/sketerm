@@ -2344,10 +2344,12 @@ pub const Window = struct {
 
     // ── Durable tabs (sketerm-mux) ───────────────────────────────
 
-    /// Connect to the mux daemon, spawning it first if absent.
-    fn muxConnect(self: *Window) !@import("../mux/client.zig").Conn {
+    /// Connect to the mux daemon — local (spawning it if absent) or
+    /// on an SSH host (`ssh <host> sketerm-mux --proxy`).
+    fn muxConnect(self: *Window, host: ?[]const u8) !@import("../mux/client.zig").Conn {
         const mux_client = @import("../mux/client.zig");
         const mux_daemon = @import("../mux/daemon.zig");
+        if (host) |h| return mux_client.Conn.connectSsh(self.allocator, h);
         const path = try mux_daemon.defaultSocketPath(self.allocator);
         defer self.allocator.free(path);
 
@@ -2385,38 +2387,45 @@ pub const Window = struct {
         return error.MuxDaemonUnreachable;
     }
 
-    /// Spawn a shell session in the daemon and attach it as a tab.
-    pub fn newDurableTab(self: *Window) !void {
+    /// Spawn a shell session in the daemon (local or `host`'s) and
+    /// attach it as a tab.
+    pub fn newDurableTab(self: *Window, host: ?[]const u8) !void {
         var name_buf: [64]u8 = undefined;
         // Unique-enough name: pid + monotonic counter.
         self.tab_counter += 1;
         const name = std.fmt.bufPrint(&name_buf, "s{d}-{d}", .{ c.getpid(), self.tab_counter }) catch "s0";
 
-        var conn = try self.muxConnect();
+        var conn = try self.muxConnect(host);
         {
             // This errdefer covers ONLY the spawn phase; once the
             // block exits cleanly, attachMuxTab owns the conn (and
             // deinits it on its own failures).
             errdefer conn.deinit();
-            const shell: []const u8 = if (self.config.shell) |sh| sh else blk: {
-                const env = c.getenv("SHELL");
-                break :blk if (env != null) std.mem.span(env) else "/bin/sh";
+            // Local spawns honour the configured shell + cwd; remote
+            // spawns send empty argv = "the remote's login shell"
+            // and no cwd (local paths mean nothing over there).
+            const argv: []const []const u8 = if (host != null) &.{} else blk: {
+                const sh: []const u8 = if (self.config.shell) |s| s else sh2: {
+                    const env = c.getenv("SHELL");
+                    break :sh2 if (env != null) std.mem.span(env) else "/bin/sh";
+                };
+                break :blk &.{sh};
             };
             try conn.sendJson(.spawn, .{
                 .name = name,
-                .argv = [_][]const u8{shell},
-                .cwd = self.focusedPaneCwd(),
+                .argv = argv,
+                .cwd = if (host != null) null else self.focusedPaneCwd(),
                 .rows = @as(u16, 24),
                 .cols = @as(u16, 80),
             });
             (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
         }
-        try self.attachMuxTab(conn, name);
+        try self.attachMuxTab(conn, name, host);
     }
 
     /// Attach `conn` to session `name` and wrap it in a new tab.
     /// Takes ownership of `conn` on success AND failure.
-    pub fn attachMuxTab(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8) !void {
+    pub fn attachMuxTab(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8) !void {
         var conn = conn_in;
 
         const term = blk: {
@@ -2449,8 +2458,11 @@ pub const Window = struct {
         c.gtk_widget_set_vexpand(wrapper, 1);
         c.gtk_box_append(@ptrCast(wrapper), pane.widget());
 
-        var title_buf: [96:0]u8 = undefined;
-        const title_z = std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{name}) catch "mux";
+        var title_buf: [160:0]u8 = undefined;
+        const title_z = if (host) |h|
+            std.fmt.bufPrintZ(&title_buf, "⌁ {s} @ {s}", .{ name, h }) catch "mux"
+        else
+            std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{name}) catch "mux";
         const page = self.appendOrInsertTab(wrapper);
         c.adw_tab_page_set_title(page, title_z.ptr);
         c.adw_tab_page_set_tooltip(page, title_z.ptr);
@@ -2703,12 +2715,12 @@ pub const Window = struct {
             c.adw_tab_page_set_tooltip(page, z.ptr);
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (eql(u8, req.cmd, "new-durable-tab")) {
-            self.newDurableTab() catch return ipc_protocol.writeErr(out, allocator, "durable spawn failed");
+            self.newDurableTab(req.host) catch return ipc_protocol.writeErr(out, allocator, "durable spawn failed (ssh/key auth?)");
             try ipc_protocol.writeOk(out, allocator, "pane", self.next_pane_id - 1);
         } else if (eql(u8, req.cmd, "attach-session")) {
             const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "attach-session requires data (session name)");
-            const conn = self.muxConnect() catch return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
-            self.attachMuxTab(conn, name) catch return ipc_protocol.writeErr(out, allocator, "attach failed (no such session?)");
+            const conn = self.muxConnect(req.host) catch return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
+            self.attachMuxTab(conn, name, req.host) catch return ipc_protocol.writeErr(out, allocator, "attach failed (no such session?)");
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (eql(u8, req.cmd, "set-tab-color")) {
             const page = self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
@@ -3629,7 +3641,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .goto_tab_9 => self.gotoTab(8),
         .duplicate_tab => self.duplicateCurrentTab(),
         .show_scrollback => self.openScrollbackPager(),
-        .new_durable_tab => self.newDurableTab() catch |err| logActionError("new_durable_tab", err),
+        .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         .hints_open => self.openHints(),
         .copy_mode => self.openCopyMode(),
