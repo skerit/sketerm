@@ -146,6 +146,30 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("smoke-image", "Headless GL image render check");
     smoke_step.dependOn(&smoke_run.step);
 
+    // IPC end-to-end smoke — `zig build smoke-e2e`. Launches the
+    // built app (needs a display; SKIPs without one), drives it via
+    // the remote-control socket, asserts on get-text output.
+    const smoke_e2e_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_e2e.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureSysDeps(b, smoke_e2e_mod, cbindings_mod);
+    const smoke_e2e = b.addExecutable(.{
+        .name = "sketerm-smoke-e2e",
+        .root_module = smoke_e2e_mod,
+        .use_lld = true,
+    });
+    b.installArtifact(smoke_e2e);
+    const smoke_e2e_run = b.addRunArtifact(smoke_e2e);
+    // It execs zig-out/bin/sketerm, so the main install must finish
+    // first, and the cwd must be the project root (default).
+    smoke_e2e_run.step.dependOn(b.getInstallStep());
+    smoke_e2e_run.setCwd(b.path("."));
+    const smoke_e2e_step = b.step("smoke-e2e", "End-to-end smoke via remote-control socket (needs display)");
+    smoke_e2e_step.dependOn(&smoke_e2e_run.step);
+
     // Headless cell-render smoke — `zig build smoke-cell`. Drives a
     // small Screen → Atlas → CellPass → GridPass through an EGL
     // surfaceless context, reads pixels back, asserts text + focus
