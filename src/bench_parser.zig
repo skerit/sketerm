@@ -89,6 +89,19 @@ pub fn main() !void {
         "\x1b[2J\x1b[H\x1b[5;10HX\x1b[1;1H\x1b[K" ++
         "\x1b[10;20HY\x1b[5A\x1b[3B\x1b[2C\x1b[1D\x1b[10;1H";
 
+    // 4b. Truecolor gradient — every cell a UNIQUE color, the style
+    // pool's worst case (image-as-halfblocks, gradient prompts).
+    const grad_buf = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(grad_buf);
+    var grad_writer = std.Io.Writer.fixed(grad_buf);
+    var gi: u32 = 0;
+    while (gi < 4096) : (gi += 1) {
+        try grad_writer.print("\x1b[38;2;{d};{d};{d}m█", .{ gi & 0xFF, (gi >> 4) & 0xFF, (gi * 7) & 0xFF });
+        if (gi % 64 == 63) try grad_writer.writeAll("\n");
+    }
+    try grad_writer.writeAll("\x1b[0m\n");
+    const gradient = grad_writer.buffered();
+
     // 5. UTF-8 mixed (CJK + emoji).
     const utf8_mix =
         "Hello 中国 こんにちは 한국 🚀🎉🔥\n";
@@ -98,6 +111,7 @@ pub fn main() !void {
         .{ .name = "SGR colour churn",   .sample = sgr,       .repeats = 50_000 },
         .{ .name = "truecolor SGR",      .sample = truecolor, .repeats = 50_000 },
         .{ .name = "CSI cursor moves",   .sample = csi_moves, .repeats = 100_000 },
+        .{ .name = "truecolor gradient", .sample = gradient,  .repeats = 2_000 },
         .{ .name = "UTF-8 mix (CJK+emoji)", .sample = utf8_mix, .repeats = 50_000 },
     };
 

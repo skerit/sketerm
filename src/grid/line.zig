@@ -53,7 +53,7 @@ pub const Line = struct {
     /// SGR bg propagates into "erased" cells. Plain `clear` (used by
     /// reflow + full resets) keeps the default-style behaviour.
     pub fn clearStyled(self: *Line, fill_style: u16) void {
-        for (self.cells) |*cell| cell.* = .{ .style_ref = fill_style };
+        @memset(self.cells, .{ .style_ref = fill_style });
         self.dirty = true;
         self.continues_above = false;
         self.scaling = .single;
@@ -73,7 +73,7 @@ pub const Line = struct {
         const lo = @min(from, @as(u16, @intCast(self.cells.len)));
         const hi = @min(to, @as(u16, @intCast(self.cells.len)));
         if (lo >= hi) return;
-        for (self.cells[lo..hi]) |*cell| cell.* = .{ .style_ref = fill_style };
+        @memset(self.cells[lo..hi], .{ .style_ref = fill_style });
         self.dirty = true;
     }
 };
