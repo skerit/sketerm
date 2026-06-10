@@ -312,6 +312,68 @@ logical lines can re-wrap correctly on subsequent resize.
 `gdk_frame_clock_add_tick_callback` drives the blink. No separate
 timer thread; vsync-locked to the compositor.
 
+## Mux subsystem (durable sessions)
+
+The terminal core (parser → `Event` → `Screen`) has no GTK
+dependency, which makes it host-agnostic: the same pipeline runs
+inside `sketerm-mux`, a libc-only daemon that owns PTYs so shells
+survive the GUI.
+
+```
+src/mux/
+├── wire.zig        framed binary protocol; append-only FrameType/
+│                   EventTag bytes; every parser Event round-trips
+├── snapshot.zig    lossless Screen serialization (grid, alt,
+│                   scrollback, styles, links, clusters, modes,
+│                   palette, prompt marks)
+├── daemon.zig      single-threaded poll loop; one PTY + Parser +
+│                   authoritative Screen per session; events applied
+│                   once, broadcast to attached clients
+├── client.zig      Conn (frame IO over any fd), connectSsh,
+│                   connectUdp, daemon spawn helpers
+└── rudp.zig        encrypted reliable-datagram transport (UDP)
+src/mux_main.zig    sketerm-mux entry: daemon / --proxy /
+                    --udp-listen / --udp-connect modes
+```
+
+**Events on the wire, never escape sequences.** The protocol carries
+the parsed `Event` representation, so every feature (kitty graphics,
+OSC 52, hyperlinks, underline colors) works through the mux with no
+per-feature support — the property tmux structurally cannot have.
+Attach sends a sequence-stamped snapshot, then streams live events;
+the client applies them to its local `Screen` through the exact code
+path the local PTY worker uses.
+
+**Transports.** One protocol, three pipes:
+- *Local*: Unix socket at `$XDG_RUNTIME_DIR/sketerm/mux.sock`.
+- *SSH*: `ssh -T -o BatchMode=yes host sketerm-mux --proxy`; the
+  proxy bridges stdio to the remote daemon's socket, auto-starting
+  it. sshd is the auth boundary. `$SKETERM_SSH` overrides the ssh
+  binary (used by the test rig to fake a remote host).
+- *UDP* (mosh-style): an SSH bootstrap runs `--udp-listen`, which
+  announces `SKETERM-UDP <port> <keyhex>` and detaches; the session
+  then runs over ChaCha20-Poly1305-sealed datagrams. The u64 crypto
+  sequence doubles as nonce and feeds an anti-replay window; the
+  server re-learns the peer address only from authenticated packets,
+  which is what makes roaming (IP changes, suspend) free. A
+  go-back-N stream with piggybacked acks runs on top so the framed
+  protocol is unchanged. `rudp.zig` is a pure state machine with
+  injectable clock/emit — loss, replay, and tamper are unit-tested.
+
+**GUI side.** `Terminal.initRemote` builds a Terminal with no PTY
+and no worker thread: the connection fd is watched via
+`g_unix_fd_add` on the main loop, EVENTS frames apply directly to
+`Screen`, SNAPSHOT swaps the screen wholesale. `writeRaw` /
+`requestResize` abstract PTY-vs-socket so `src/ui` never touches
+`terminal.pty`. Remote terminals have `child_pid = -1`; exit-reaping
+guards on `child_pid <= 0` (a `waitpid(-1)` would reap arbitrary
+GUI children).
+
+**Failure boundary.** GUI crash/restart/disconnect: sessions
+survive, reattach restores screen + scrollback exactly. Daemon
+death (server reboot, kill -9): sessions are gone — orphaned PTYs
+SIGHUP their children. Same boundary as tmux.
+
 ## Module ownership
 
 - `ui/app.zig` — owns `AdwApplication`, spawns windows.
