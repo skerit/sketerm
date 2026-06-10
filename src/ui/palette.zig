@@ -123,6 +123,10 @@ const RowCtx = struct {
     action: input.Action,
     title_lower: []u8,
     desc_lower: []u8,
+    /// Non-null = a dynamic [domain.<name>] row: activation opens a
+    /// durable tab on this transport-prefixed host instead of
+    /// dispatching `action`. Arena-owned.
+    domain_host: ?[]const u8 = null,
 };
 
 const Ctx = struct {
@@ -193,8 +197,10 @@ pub fn open(window: *Window) !void {
     c.gtk_box_append(@ptrCast(root), scrolled);
     ctx.listbox = listbox;
 
-    // Build rows.
-    const rows = try arena.alloc(*RowCtx, ENTRIES.len);
+    // Build rows: the curated static set plus one "New Tab on <name>"
+    // per configured [domain.<name>].
+    const domains = window.config.domains.items;
+    const rows = try arena.alloc(*RowCtx, ENTRIES.len + domains.len);
     for (ENTRIES, 0..) |entry, i| {
         const rctx = try arena.create(RowCtx);
         rctx.* = .{
@@ -233,6 +239,38 @@ pub fn open(window: *Window) !void {
         c.gtk_list_box_append(@ptrCast(@alignCast(listbox)), row);
     }
 
+    var row_count: usize = ENTRIES.len;
+    for (domains) |dom| {
+        if (dom.host.len == 0) continue;
+        const title_z = try std.fmt.allocPrintSentinel(arena, "New Tab on {s}", .{dom.name}, 0);
+        const desc_z = try std.fmt.allocPrintSentinel(
+            arena,
+            "Durable remote shell on {s} ({s}).",
+            .{ dom.host, @tagName(dom.transport) },
+            0,
+        );
+        const rctx = try arena.create(RowCtx);
+        rctx.* = .{
+            .palette = ctx,
+            .action = .new_durable_tab,
+            .title_lower = try toLowerOwned(arena, title_z),
+            .desc_lower = try toLowerOwned(arena, desc_z),
+            .domain_host = try dom.hostSpec(arena),
+        };
+        rows[row_count] = rctx;
+        row_count += 1;
+
+        const row = c.adw_action_row_new();
+        c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title_z);
+        c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), desc_z);
+        c.gtk_list_box_row_set_activatable(@ptrCast(@alignCast(row)), 1);
+        const icon = c.gtk_image_new_from_icon_name("network-server-symbolic");
+        c.gtk_image_set_pixel_size(@ptrCast(@alignCast(icon)), 20);
+        c.adw_action_row_add_prefix(@ptrCast(@alignCast(row)), icon);
+        c.g_object_set_data(@ptrCast(@alignCast(row)), "palette-row", @ptrCast(rctx));
+        c.gtk_list_box_append(@ptrCast(@alignCast(listbox)), row);
+    }
+
     // Single listbox-level activation handler — fires for click,
     // double-click on AdwActionRow, and `gtk_list_box_row_activate`
     // (the path our Enter key forwarding takes).
@@ -244,7 +282,7 @@ pub fn open(window: *Window) !void {
         null,
         c.G_CONNECT_DEFAULT,
     );
-    ctx.rows = rows;
+    ctx.rows = rows[0..row_count];
 
     // Search filter.
     _ = c.g_signal_connect_data(
@@ -388,9 +426,26 @@ fn onListBoxRowActivated(
     const rctx: *RowCtx = @ptrCast(@alignCast(data));
     const win = ctx.window;
     const action = rctx.action;
+    const domain_host = rctx.domain_host;
     // Dismiss BEFORE dispatching: actions like .prefs_open open
     // another dialog, and the palette would otherwise stack on top.
+    // NOTE: domain_host is arena memory freed by the dialog's
+    // destroy-notify; copy before closing.
+    var host_buf: [512]u8 = undefined;
+    const host_copy: ?[]const u8 = if (domain_host) |h|
+        (if (h.len < host_buf.len) blk: {
+            @memcpy(host_buf[0..h.len], h);
+            break :blk host_buf[0..h.len];
+        } else null)
+    else
+        null;
     c.adw_dialog_force_close(@ptrCast(@alignCast(ctx.dialog)));
+    if (host_copy) |h| {
+        win.newDurableTab(h) catch {
+            std.debug.print("sketerm: durable tab on {s} failed (ssh/key auth?)\n", .{h});
+        };
+        return;
+    }
     window_mod.dispatchAction(win, action);
 }
 

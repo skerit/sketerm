@@ -61,9 +61,19 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
     // or flag ("sketerm mux user@box [cmd]").
     var host: ?[]const u8 = null;
     var args = args_in;
+    var domain_spec: ?[]u8 = null;
+    defer if (domain_spec) |s| allocator.free(s);
     if (args.len > 0 and !isSubcommand(args[0]) and !std.mem.startsWith(u8, args[0], "-")) {
         host = args[0];
         args = args[1..];
+        // A bare name may be a [domain.<name>] from config.conf —
+        // resolve it to its transport-prefixed host spec.
+        var cfg = @import("../config.zig").Config.load(allocator);
+        defer cfg.deinit();
+        if (cfg.resolveDomain(host.?, allocator)) |spec| {
+            domain_spec = spec;
+            host = spec;
+        }
     }
     if (args.len == 0) return tui(allocator, host);
     const cmd = args[0];

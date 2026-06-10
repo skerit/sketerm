@@ -80,6 +80,26 @@ pub const Profile = struct {
     login_shell: ?bool = null,
 };
 
+/// `[domain.<name>]` sections — named remote mux endpoints, so the
+/// palette / `sketerm mux <name>` can offer "new tab on devbox"
+/// without retyping hosts.
+pub const Domain = struct {
+    name: []const u8,
+    /// SSH endpoint, "host" or "user@host". Empty = section ignored.
+    host: []const u8 = "",
+    /// How to reach the remote daemon after the SSH bootstrap.
+    transport: enum { ssh, udp } = .ssh,
+
+    /// Allocate the transport-prefixed host string the durable-tab
+    /// plumbing speaks ("udp:host" / "host").
+    pub fn hostSpec(self: *const Domain, allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
+        return switch (self.transport) {
+            .ssh => allocator.dupe(u8, self.host),
+            .udp => std.fmt.allocPrint(allocator, "udp:{s}", .{self.host}),
+        };
+    }
+};
+
 /// When to ask "are you sure?" before destroying panes / tabs.
 /// Matches Terminator's `ask_before_closing` semantics:
 ///   never    — close immediately, no dialog
@@ -289,6 +309,10 @@ pub const Config = struct {
     /// = "no default profile; use the global Config directly".
     default_profile: []const u8 = "",
 
+    /// Named mux domains from `[domain.<name>]` sections. Order
+    /// preserved for round-trip serialisation + UI listing.
+    domains: std.ArrayList(Domain) = .empty,
+
     // Per-pane titlebar (Terminator-style)
     /// Show a thin per-pane title bar above the cell grid carrying
     /// the OSC 0/1/2 terminal title. Off by default — many users
@@ -355,6 +379,14 @@ pub const Config = struct {
             cp.term_env = try arena.dupe(u8, p.term_env);
             cp.color_term_env = try arena.dupe(u8, p.color_term_env);
             out.profiles.appendAssumeCapacity(cp);
+        }
+        out.domains = .empty;
+        try out.domains.ensureTotalCapacity(arena, self.domains.items.len);
+        for (self.domains.items) |d| {
+            var cd = d;
+            cd.name = try arena.dupe(u8, d.name);
+            cd.host = try arena.dupe(u8, d.host);
+            out.domains.appendAssumeCapacity(cd);
         }
         return out;
     }
@@ -646,6 +678,24 @@ pub const Config = struct {
                 try w.writeAll("\n");
             }
         }
+
+        for (self.domains.items) |dom| {
+            try w.print("\n[domain.{s}]\n", .{dom.name});
+            if (dom.host.len > 0) try w.print("host = {s}\n", .{dom.host});
+            if (dom.transport != .ssh) try w.print("transport = {s}\n", .{@tagName(dom.transport)});
+        }
+    }
+
+    /// Look up a domain by name and allocate its transport-prefixed
+    /// host spec ("udp:host" / "host"). Null when no such domain or
+    /// the section never set a host.
+    pub fn resolveDomain(self: *const Config, name: []const u8, allocator: std.mem.Allocator) ?[]u8 {
+        for (self.domains.items) |*d| {
+            if (!std.mem.eql(u8, d.name, name)) continue;
+            if (d.host.len == 0) return null;
+            return d.hostSpec(allocator) catch null;
+        }
+        return null;
     }
 };
 
@@ -677,8 +727,9 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
     const arena = cfg.arena.?.allocator();
     var lines = std.mem.splitScalar(u8, body, '\n');
     var lineno: usize = 0;
-    // Section state. `null` = global; non-null = profile being filled.
+    // Section state. `null`/`null` = global; at most one non-null.
     var current_profile: ?*Profile = null;
+    var current_domain: ?*Domain = null;
     while (lines.next()) |raw| {
         lineno += 1;
         const line = trim(stripComment(raw));
@@ -689,22 +740,33 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
         // — that way unknown future sections don't strip user data.
         if (line.len >= 2 and line[0] == '[' and line[line.len - 1] == ']') {
             const inside = trim(line[1 .. line.len - 1]);
+            current_profile = null;
+            current_domain = null;
             if (std.mem.startsWith(u8, inside, "profile.")) {
                 const name = inside["profile.".len..];
                 if (name.len == 0) {
                     warnConfigAt(lineno, "empty profile name", .{});
-                    current_profile = null;
                     continue;
                 }
                 current_profile = findOrCreateProfile(cfg, arena, name) catch {
                     warnConfigAt(lineno, "out of memory creating profile", .{});
-                    current_profile = null;
+                    continue;
+                };
+                continue;
+            }
+            if (std.mem.startsWith(u8, inside, "domain.")) {
+                const name = inside["domain.".len..];
+                if (name.len == 0) {
+                    warnConfigAt(lineno, "empty domain name", .{});
+                    continue;
+                }
+                current_domain = findOrCreateDomain(cfg, arena, name) catch {
+                    warnConfigAt(lineno, "out of memory creating domain", .{});
                     continue;
                 };
                 continue;
             }
             warnConfigAt(lineno, "unknown section '{s}'", .{inside});
-            current_profile = null;
             continue;
         }
 
@@ -714,7 +776,11 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
         };
         const key = trim(line[0..eq]);
         const value = trim(line[eq + 1 ..]);
-        if (current_profile) |prof| {
+        if (current_domain) |dom| {
+            applyDomainKv(dom, arena, key, value) catch |err| {
+                warnConfigAt(lineno, "domain '{s}': bad value for '{s}' ({s})", .{ dom.name, key, @errorName(err) });
+            };
+        } else if (current_profile) |prof| {
             applyProfileKv(prof, arena, key, value) catch |err| {
                 warnConfigAt(lineno, "profile '{s}': bad value for '{s}' ({s})", .{ prof.name, key, @errorName(err) });
             };
@@ -724,6 +790,27 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
             };
         }
     }
+}
+
+fn findOrCreateDomain(cfg: *Config, arena: std.mem.Allocator, name: []const u8) !*Domain {
+    for (cfg.domains.items) |*d| {
+        if (std.mem.eql(u8, d.name, name)) return d;
+    }
+    const dup = try arena.dupe(u8, name);
+    try cfg.domains.append(arena, .{ .name = dup });
+    return &cfg.domains.items[cfg.domains.items.len - 1];
+}
+
+fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, key, "host")) {
+        dom.host = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "transport")) {
+        if (std.mem.eql(u8, value, "ssh")) {
+            dom.transport = .ssh;
+        } else if (std.mem.eql(u8, value, "udp")) {
+            dom.transport = .udp;
+        } else return error.BadTransport;
+    } else return error.UnknownKey;
 }
 
 fn findOrCreateProfile(cfg: *Config, arena: std.mem.Allocator, name: []const u8) !*Profile {
@@ -1315,6 +1402,43 @@ test "config: later keybind for same action overrides earlier" {
     defer cfg.deinit();
     try std.testing.expectEqual(@as(usize, 1), cfg.keybinds.items.len);
     try std.testing.expectEqualStrings("<Alt>n", cfg.keybinds.items[0].accel);
+}
+
+test "config: [domain.name] sections parse, resolve, round-trip" {
+    const body =
+        \\[domain.devbox]
+        \\host = skerit@192.168.1.2
+        \\transport = udp
+        \\
+        \\[domain.work]
+        \\host = build.example.com
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.domains.items.len);
+    try std.testing.expectEqualStrings("skerit@192.168.1.2", cfg.domains.items[0].host);
+    try std.testing.expectEqual(.udp, cfg.domains.items[0].transport);
+    try std.testing.expectEqual(.ssh, cfg.domains.items[1].transport);
+
+    const spec = cfg.resolveDomain("devbox", std.testing.allocator).?;
+    defer std.testing.allocator.free(spec);
+    try std.testing.expectEqualStrings("udp:skerit@192.168.1.2", spec);
+    const spec2 = cfg.resolveDomain("work", std.testing.allocator).?;
+    defer std.testing.allocator.free(spec2);
+    try std.testing.expectEqualStrings("build.example.com", spec2);
+    try std.testing.expect(cfg.resolveDomain("nope", std.testing.allocator) == null);
+
+    // Round-trip via serialise.
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    var cfg2 = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer cfg2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cfg2.domains.items.len);
+    try std.testing.expectEqual(.udp, cfg2.domains.items[0].transport);
+    try std.testing.expectEqualStrings("build.example.com", cfg2.domains.items[1].host);
 }
 
 test "config: [profile.name] sections round-trip" {

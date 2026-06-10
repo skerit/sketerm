@@ -173,9 +173,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (argv.len >= 3 and std.mem.eql(u8, std.mem.span(argv[1]), "ssh")) {
         const use_udp = std.mem.eql(u8, std.mem.span(argv[2]), "-u");
         if (use_udp and argv.len < 4) return 2;
-        const host_raw = std.mem.span(argv[if (use_udp) 3 else 2]);
+        var host_raw: []const u8 = std.mem.span(argv[if (use_udp) 3 else 2]);
+        // [domain.<name>] resolution: a bare name from config.conf
+        // expands to its host (transport prefix included).
+        var cfg = @import("config.zig").Config.load(allocator);
+        defer cfg.deinit();
+        const domain_spec = cfg.resolveDomain(host_raw, allocator);
+        defer if (domain_spec) |s| allocator.free(s);
+        if (domain_spec) |s| host_raw = s;
         var host_buf: [300]u8 = undefined;
-        const host: []const u8 = if (use_udp)
+        const host: []const u8 = if (use_udp and !std.mem.startsWith(u8, host_raw, "udp:"))
             std.fmt.bufPrint(&host_buf, "udp:{s}", .{host_raw}) catch return 2
         else
             host_raw;
