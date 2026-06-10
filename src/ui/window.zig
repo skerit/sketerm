@@ -1102,26 +1102,10 @@ pub const Window = struct {
                 pane.win_on_cwd = onTermCwdChanged;
                 // Profile name on the pane so cycle/restore tracks it.
                 if (profile) |pr| pane.active_profile = pr.name;
-                // Effective font: profile > spec.font_size > global.
-                pane.font_size = if (profile) |pr|
-                    (if (pr.font_size != 0) pr.font_size else (p.font_size orelse self.config.font_size))
-                else
-                    (p.font_size orelse self.config.font_size);
-                pane.font_path = if (profile) |pr|
-                    (if (pr.font_path.len > 0) pr.font_path else self.config.font_path)
-                else
-                    self.config.font_path;
-                const eff_fam: []const u8 = if (profile) |pr|
-                    (if (pr.font_family.len > 0) pr.font_family else self.config.font_family)
-                else
-                    self.config.font_family;
-                pane.font_family = if (eff_fam.len > 0) eff_fam else null;
-                pane.font_features = if (self.config.font_features.len > 0) self.config.font_features else null;
-                pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
-                pane.line_pad_px = self.config.line_pad_px;
-                pane.grid_pass.pad = self.config.padding;
-                pane.grid_pass.enable_ligatures = self.config.ligatures;
-        pane.grid_pass.enable_bidi = self.config.bidi;
+                self.applyPaneConfig(pane, .{
+                    .profile = profile,
+                    .font_size_override = p.font_size,
+                });
 
                 try self.panes.append(self.allocator, pane);
                 try self.terminals.append(self.allocator, term);
@@ -1225,6 +1209,8 @@ pub const Window = struct {
         // string clears the lock and lets OSC tracking resume.
         pane.win_title_ctx = @ptrCast(self);
         pane.win_on_title = onTermTitleChanged;
+
+        self.applyPaneConfig(pane, .{});
 
         // Wrap pane.widget() in a Box so we can swap it for a Paned
         // when splits happen. Box always has exactly one child.
@@ -1459,12 +1445,34 @@ pub const Window = struct {
         // it spawned with.
         if (profile) |p| pane.active_profile = p.name;
 
+        self.applyPaneConfig(pane, .{ .profile = profile });
+        try self.panes.append(self.allocator, pane);
+        try self.terminals.append(self.allocator, term);
+        return pane;
+    }
+
+    const PaneConfigOpts = struct {
+        profile: ?*const @import("../config.zig").Profile = null,
+        /// Saved per-pane font size (layout restore). Loses to a
+        /// profile override, wins over the global config.
+        font_size_override: ?u16 = null,
+    };
+
+    /// Push every config-derived (and profile-overridden) field onto
+    /// a fresh pane + its terminal. The single source of truth for
+    /// ALL pane-creation paths (new tab/split, layout restore,
+    /// addTabInternal) — restored panes used to skip the color push
+    /// entirely and kept the built-in gray background.
+    fn applyPaneConfig(self: *Window, pane: *Pane, opts: PaneConfigOpts) void {
+        const profile = opts.profile;
+        const term = pane.terminal;
+
         // Effective values per-field: profile wins over global.
-        const eff_font_size: u16 = if (profile) |p|
-            (if (p.font_size != 0) p.font_size else self.config.font_size)
+        pane.font_size = if (profile) |p|
+            (if (p.font_size != 0) p.font_size else (opts.font_size_override orelse self.config.font_size))
         else
-            self.config.font_size;
-        const eff_font_path: ?[]const u8 = if (profile) |p|
+            (opts.font_size_override orelse self.config.font_size);
+        pane.font_path = if (profile) |p|
             (if (p.font_path.len > 0) p.font_path else self.config.font_path)
         else
             self.config.font_path;
@@ -1472,17 +1480,10 @@ pub const Window = struct {
             (if (p.font_family.len > 0) p.font_family else self.config.font_family)
         else
             self.config.font_family;
-        const eff_scrollback: u32 = if (profile) |p|
-            (if (p.scrollback != 0) p.scrollback else self.config.scrollback)
-        else
-            self.config.scrollback;
-
-        // Push config-derived fields into the pane before realize.
-        pane.font_size = eff_font_size;
-        pane.font_path = eff_font_path;
         pane.font_family = if (eff_font_family.len > 0) eff_font_family else null;
         pane.font_features = if (self.config.font_features.len > 0) self.config.font_features else null;
         pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
+        pane.line_pad_px = self.config.line_pad_px;
         pane.grid_pass.pad = self.config.padding;
         const fg_bg = self.resolveDefaultColors();
         pane.grid_pass.default_fg = fg_bg.fg;
@@ -1493,11 +1494,16 @@ pub const Window = struct {
         // queries reply with the configured values until apps override.
         term.screen.default_fg = fg_bg.fg;
         term.screen.default_bg = fg_bg.bg;
+        term.screen.configured_fg = fg_bg.fg;
+        term.screen.configured_bg = fg_bg.bg;
         term.screen.cursor_color = if (self.config.cursor_color_default)
             .{ 0, 0, 0, 0 }
         else
             self.config.cursor_color;
-        term.screen.scrollback_capacity = eff_scrollback;
+        term.screen.scrollback_capacity = if (profile) |p|
+            (if (p.scrollback != 0) p.scrollback else self.config.scrollback)
+        else
+            self.config.scrollback;
         term.screen.bracketed_paste = self.config.bracketed_paste;
         term.screen.scroll_on_output = self.config.scroll_on_output;
         term.screen.word_chars = self.config.word_chars;
@@ -1523,9 +1529,6 @@ pub const Window = struct {
                 pane.grid_pass.palette[i] = pal[i];
             }
         }
-        try self.panes.append(self.allocator, pane);
-        try self.terminals.append(self.allocator, term);
-        return pane;
     }
 
     /// Split the focused pane: spawn a new pane and place the two
@@ -2118,6 +2121,8 @@ pub const Window = struct {
             // values, not the raw config struct.
             screen.default_fg = eff.fg;
             screen.default_bg = eff.bg;
+            screen.configured_fg = eff.fg;
+            screen.configured_bg = eff.bg;
             // Renderer convention: alpha=0 means "use fg colour". We
             // map cursor_color_default → that sentinel.
             screen.cursor_color = if (self.config.cursor_color_default)
@@ -3826,6 +3831,8 @@ fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.
         p.grid_pass.default_bg = fg_bg.bg;
         p.terminal.screen.default_fg = fg_bg.fg;
         p.terminal.screen.default_bg = fg_bg.bg;
+        p.terminal.screen.configured_fg = fg_bg.fg;
+        p.terminal.screen.configured_bg = fg_bg.bg;
         p.terminal.screen.dirty = true;
         c.gtk_gl_area_queue_render(@ptrCast(p.area));
     }

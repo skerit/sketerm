@@ -224,6 +224,11 @@ pub const Screen = struct {
     default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
     default_bg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 },
     cursor_color: [4]f32 = .{ 0, 0, 0, 0 },
+    /// What OSC 110/111 reset to — the CONFIGURED defaults, kept
+    /// separate because OSC 10/11 mutate default_fg/bg directly.
+    /// The Window sets these alongside default_fg/bg.
+    configured_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
+    configured_bg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 },
 
     /// Runtime 256-color palette (overrides the comptime defaults).
     /// Set via OSC 4 ; n ; rgb:... ; reset via OSC 104.
@@ -2098,13 +2103,14 @@ pub const Screen = struct {
                 } else |_| {}
                 self.dirty = true;
             },
-            // OSC 110 / 111 — fg / bg color reset to default.
+            // OSC 110 / 111 — fg / bg color reset to the configured
+            // defaults (not the compiled-in fallbacks).
             110 => {
-                self.default_fg = .{ 0.92, 0.92, 0.92, 1.0 };
+                self.default_fg = self.configured_fg;
                 self.dirty = true;
             },
             111 => {
-                self.default_bg = .{ 0.10, 0.10, 0.10, 1.0 };
+                self.default_bg = self.configured_bg;
                 self.dirty = true;
             },
             // OSC 112 — cursor color reset (sentinel: alpha=0 → use fg).
