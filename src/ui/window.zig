@@ -1251,6 +1251,8 @@ pub const Window = struct {
         pane.disable_mousewheel_zoom = self.config.disable_mousewheel_zoom;
         pane.link_single_click = self.config.link_single_click;
         pane.mouse_autohide = self.config.mouse_autohide;
+        pane.middle_click_action = self.config.mouse_middle_click;
+        pane.right_click_action = self.config.mouse_right_click;
         // Renderer bold flags.
         pane.grid_pass.allow_bold = self.config.allow_bold;
         pane.grid_pass.bold_is_bright = self.config.bold_is_bright;
@@ -2191,6 +2193,8 @@ pub const Window = struct {
             p.disable_mousewheel_zoom = self.config.disable_mousewheel_zoom;
             p.link_single_click = self.config.link_single_click;
             p.mouse_autohide = self.config.mouse_autohide;
+            p.middle_click_action = self.config.mouse_middle_click;
+            p.right_click_action = self.config.mouse_right_click;
             // Per-pane titlebar visibility.
             p.setTitlebarVisible(self.config.show_titlebar);
             // Inactive-pane dimming.

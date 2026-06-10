@@ -38,6 +38,10 @@ pub const ExitAction = enum { close, restart, hold };
 /// AdwTabBar position relative to the window.
 pub const TabPosition = enum { top, bottom };
 
+/// What a middle / right click does when the running app isn't in
+/// mouse-report mode. `menu` only makes sense for right-click.
+pub const MouseAction = enum { menu, paste_primary, paste_clipboard, none };
+
 /// Custom keybinding entry: action name + accelerator string. Action
 /// names are stable across versions (defined in `ui/input.zig`). The
 /// accelerator is a GTK accelerator string (e.g. `<Control><Shift>t`)
@@ -197,6 +201,13 @@ pub const Config = struct {
     /// Open OSC 8 hyperlinks on a plain click instead of Ctrl+click.
     /// (Off by default — matches xterm/gnome-terminal/kitty.)
     link_single_click: bool = false,
+    /// Middle-click action (mouse-report mode off). `menu` is not
+    /// meaningful here and acts like `none`. `disable_mouse_paste`
+    /// is the legacy kill-switch and still wins when set.
+    mouse_middle_click: MouseAction = .paste_primary,
+    /// Right-click action. `menu` = context menu (default, PuTTY
+    /// users want paste_clipboard here).
+    mouse_right_click: MouseAction = .menu,
 
     // Search
     /// Default state for the search box's case sensitivity. The
@@ -521,6 +532,10 @@ pub const Config = struct {
         if (self.copy_on_selection) try w.writeAll("copy_on_selection = true\n");
         if (self.clear_select_on_copy) try w.writeAll("clear_select_on_copy = true\n");
         if (self.disable_mouse_paste) try w.writeAll("disable_mouse_paste = true\n");
+        if (self.mouse_middle_click != .paste_primary)
+            try w.print("mouse_middle_click = {s}\n", .{@tagName(self.mouse_middle_click)});
+        if (self.mouse_right_click != .menu)
+            try w.print("mouse_right_click = {s}\n", .{@tagName(self.mouse_right_click)});
         if (self.disable_mousewheel_zoom) try w.writeAll("disable_mousewheel_zoom = true\n");
         if (self.link_single_click) try w.writeAll("link_single_click = true\n");
 
@@ -876,6 +891,10 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.clear_select_on_copy = try parseBool(value);
     } else if (std.mem.eql(u8, key, "disable_mouse_paste")) {
         cfg.disable_mouse_paste = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "mouse_middle_click")) {
+        cfg.mouse_middle_click = std.meta.stringToEnum(MouseAction, value) orelse return error.BadMouseAction;
+    } else if (std.mem.eql(u8, key, "mouse_right_click")) {
+        cfg.mouse_right_click = std.meta.stringToEnum(MouseAction, value) orelse return error.BadMouseAction;
     } else if (std.mem.eql(u8, key, "disable_mousewheel_zoom")) {
         cfg.disable_mousewheel_zoom = try parseBool(value);
     } else if (std.mem.eql(u8, key, "link_single_click")) {

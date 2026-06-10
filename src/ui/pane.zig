@@ -20,6 +20,7 @@ const Terminal = @import("../terminal.zig").Terminal;
 const input = @import("input.zig");
 const menu = @import("menu.zig");
 const clipboard = @import("clipboard.zig");
+const MouseAction = @import("../config.zig").MouseAction;
 pub const InputCtx = input.Ctx;
 pub const MenuAction = menu.Action;
 
@@ -123,6 +124,10 @@ pub const Pane = struct {
     disable_mouse_paste: bool = false,
     disable_mousewheel_zoom: bool = false,
     link_single_click: bool = false,
+    /// Rebindable click actions (config mouse_middle_click /
+    /// mouse_right_click). Only consulted when mouse_mode == 0.
+    middle_click_action: MouseAction = .paste_primary,
+    right_click_action: MouseAction = .menu,
     mouse_autohide: bool = true,
     /// True while mouse_autohide has set the pointer to "none". The
     /// motion handler restores the default cursor on any movement.
@@ -1321,9 +1326,23 @@ fn paneMenuSink(ctx: ?*anyopaque, action: menu.Action) void {
 /// Called just before the right-click context menu pops up. We
 /// inspect the cell under the click for an OSC 8 link, and toggle
 /// the `term.copy-link` action's enabled state accordingly.
-fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f64) void {
+fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f64) bool {
     const self = cast.userData(Pane, ctx);
     const screen = self.terminal.screen;
+
+    // Right-click rebound away from the menu: run the bound action
+    // instead (only when the running app isn't consuming the mouse;
+    // with mouse_mode on, the click already reached it via SGR 1006).
+    if (self.right_click_action != .menu) {
+        if (screen.mouse_mode == 0) {
+            switch (self.right_click_action) {
+                .paste_primary => clipboard.pastePrimaryFromClipboard(@ptrCast(self.area), self.terminal),
+                .paste_clipboard => clipboard.pasteFromClipboard(@ptrCast(self.area), self.terminal),
+                .menu, .none => {},
+            }
+        }
+        return false;
+    }
 
     // Free any URI captured from a previous popup.
     if (self.menu_link_uri) |old| {
@@ -1414,6 +1433,7 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
     if (c.g_action_map_lookup_action(@ptrCast(group), "copy-link")) |act| {
         c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), if (has_link) 1 else 0);
     }
+    return true;
 }
 
 /// Click on the per-pane title bar. Focuses the underlying GLArea
@@ -1618,7 +1638,11 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
     // `disable_mouse_paste` opts out of this entirely.
     if (button == 2 and self.terminal.screen.mouse_mode == 0) {
         if (self.disable_mouse_paste) return;
-        clipboard.pastePrimaryFromClipboard(@ptrCast(self.area), self.terminal);
+        switch (self.middle_click_action) {
+            .paste_primary => clipboard.pastePrimaryFromClipboard(@ptrCast(self.area), self.terminal),
+            .paste_clipboard => clipboard.pasteFromClipboard(@ptrCast(self.area), self.terminal),
+            .menu, .none => {},
+        }
         return;
     }
 

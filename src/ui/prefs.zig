@@ -14,6 +14,7 @@ const cast = @import("../util/cast.zig");
 const Config = @import("../config.zig").Config;
 const CursorShape = @import("../config.zig").CursorShape;
 const ExitAction = @import("../config.zig").ExitAction;
+const config_mod = @import("../config.zig");
 const TabPosition = @import("../config.zig").TabPosition;
 
 // Forward-declare the Window pointer type. We can't import window.zig
@@ -416,6 +417,40 @@ fn freeComboCtx(user: ?*anyopaque) callconv(.c) void {
     }
 }
 
+const MouseActionCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    field: *config_mod.MouseAction,
+};
+
+fn addMouseActionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*:0]const u8, subtitle: [*:0]const u8, field: *config_mod.MouseAction) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "Context menu", "Paste selection (PRIMARY)", "Paste clipboard", "Nothing" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), subtitle);
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), @intFromEnum(field.*));
+    const mctx = ctx.allocator.create(MouseActionCtx) catch return;
+    mctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&mouseActionChanged), @ptrCast(mctx), @ptrCast(&freeMouseActionCtx), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn mouseActionChanged(row: *c.AdwComboRow, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const mctx = cast.userData(MouseActionCtx, user);
+    const idx = c.adw_combo_row_get_selected(row);
+    if (idx > @intFromEnum(config_mod.MouseAction.none)) return;
+    mctx.field.* = @enumFromInt(idx);
+    mctx.parent.ev();
+}
+
+fn freeMouseActionCtx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const mctx: *MouseActionCtx = @ptrCast(@alignCast(u));
+        mctx.allocator.destroy(mctx);
+    }
+}
+
 fn cursorShapeSelected(ctx: *Ctx, idx: c_uint) void {
     ctx.cfg.cursor_shape = switch (idx) {
         0 => .block,
@@ -770,6 +805,8 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Disable Ctrl+wheel zoom", "Ctrl+wheel won't change the font size.", &ctx.cfg.disable_mousewheel_zoom, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Single-click hyperlinks", "OSC 8 hyperlinks open on plain click instead of Ctrl+click.", &ctx.cfg.link_single_click, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(mouse_group)), ctx, "Auto-detect URLs", "Underline + open plain http(s) URLs in cell content.", &ctx.cfg.auto_url_detect, applyOnly);
+    addMouseActionRow(@ptrCast(@alignCast(mouse_group)), ctx, "Middle click", "Action when apps aren't capturing the mouse.", &ctx.cfg.mouse_middle_click);
+    addMouseActionRow(@ptrCast(@alignCast(mouse_group)), ctx, "Right click", "Menu is the default; PuTTY refugees pick paste.", &ctx.cfg.mouse_right_click);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(mouse_group)));
 
     // Search.

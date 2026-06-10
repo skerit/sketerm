@@ -41,8 +41,10 @@ const ActionSlot = struct {
 
 /// Optional pre-popup callback. Pane uses this to update the
 /// "term.copy-link" action's enabled state (and stash the URI for
-/// the activate handler) based on what's under the click.
-pub const PrePopupFn = *const fn (ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f64) void;
+/// the activate handler) based on what's under the click. Return
+/// false to suppress the menu entirely (right-click rebound to
+/// paste) — the hook may perform its own action instead.
+pub const PrePopupFn = *const fn (ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f64) bool;
 
 const ClickCtx = struct {
     allocator: std.mem.Allocator,
@@ -227,7 +229,9 @@ fn freeClickCtx(user: ?*anyopaque) callconv(.c) void {
 
 fn onRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(ClickCtx, user);
-    if (ctx.pre_popup_fn) |f| f(ctx.pre_popup_ctx, ctx.group, x, y);
+    if (ctx.pre_popup_fn) |f| {
+        if (!f(ctx.pre_popup_ctx, ctx.group, x, y)) return;
+    }
     var rect = c.GdkRectangle{
         .x = @intFromFloat(x),
         .y = @intFromFloat(y),
