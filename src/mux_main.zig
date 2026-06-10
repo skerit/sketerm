@@ -11,6 +11,7 @@ const HELP =
     \\
     \\Usage: sketerm-mux [--socket PATH]
     \\       sketerm-mux --proxy
+    \\       sketerm-mux --udp-listen [--udp-port LO:HI]
     \\
     \\Runs in the foreground, listening on PATH (default
     \\$XDG_RUNTIME_DIR/sketerm/mux.sock). Clients (the sketerm GUI or
@@ -23,6 +24,11 @@ const HELP =
     \\runs `ssh <host> sketerm-mux --proxy` and speaks the mux
     \\protocol over the SSH pipe — sessions live in the REMOTE
     \\daemon and survive the connection.
+    \\
+    \\--udp-listen is the mosh-style bootstrap (run via ssh): binds a
+    \\UDP port, announces "SKETERM-UDP <port> <key>" on stdout, then
+    \\detaches and serves encrypted datagrams. --udp-port pins the
+    \\port to a firewall-open range (e.g. 60000:61000).
     \\
 ;
 
@@ -42,7 +48,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, a, "--proxy")) {
             return runProxy(allocator);
         } else if (std.mem.eql(u8, a, "--udp-listen")) {
-            return runUdpListen(allocator);
+            // Optional: --udp-listen --udp-port 60000:61000 (firewalls
+            // usually need a pinned range, like mosh's 60000-61000).
+            var range: ?[2]u16 = null;
+            if (i + 2 < argv.len and std.mem.eql(u8, std.mem.span(argv[i + 1]), "--udp-port")) {
+                range = parsePortRange(std.mem.span(argv[i + 2])) orelse {
+                    std.debug.print("sketerm-mux: bad --udp-port (want lo:hi)\n", .{});
+                    return 2;
+                };
+            }
+            return runUdpListen(allocator, range);
         } else if (std.mem.eql(u8, a, "--udp-connect") and i + 3 < argv.len) {
             return runUdpConnect(
                 allocator,
@@ -174,6 +189,14 @@ fn writeFull(fd: c_int, bytes: []const u8) bool {
 
 const rudp = @import("mux/rudp.zig");
 
+fn parsePortRange(s: []const u8) ?[2]u16 {
+    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return null;
+    const lo = std.fmt.parseInt(u16, s[0..colon], 10) catch return null;
+    const hi = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch return null;
+    if (lo == 0 or hi < lo) return null;
+    return .{ lo, hi };
+}
+
 /// Monotonic milliseconds (Zig 0.16 removed std.time.milliTimestamp).
 fn nowMs() i64 {
     const cc = @import("c.zig").c;
@@ -204,7 +227,7 @@ const cc_sockaddr_storage = @import("c.zig").c.struct_sockaddr_storage;
 /// and bridges encrypted UDP ↔ the local daemon socket. One
 /// instance per connection (the mosh-server model); exits on BYE or
 /// daemon loss, NOT on network silence — that's the durability.
-fn runUdpListen(allocator: std.mem.Allocator) u8 {
+fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16) u8 {
     const cc = @import("c.zig").c;
     _ = cc.signal(cc.SIGPIPE, cc.SIG_IGN);
 
@@ -213,8 +236,25 @@ fn runUdpListen(allocator: std.mem.Allocator) u8 {
     var bind_addr: cc.struct_sockaddr_in = std.mem.zeroes(cc.struct_sockaddr_in);
     bind_addr.sin_family = cc.AF_INET;
     bind_addr.sin_addr.s_addr = cc.INADDR_ANY;
-    bind_addr.sin_port = 0;
-    if (cc.bind(udp_fd, @ptrCast(&bind_addr), @sizeOf(cc.struct_sockaddr_in)) != 0) return 1;
+    if (port_range) |r| {
+        // Pinned range: first free port wins.
+        var p: u32 = r[0];
+        var bound = false;
+        while (p <= r[1]) : (p += 1) {
+            bind_addr.sin_port = std.mem.nativeToBig(u16, @intCast(p));
+            if (cc.bind(udp_fd, @ptrCast(&bind_addr), @sizeOf(cc.struct_sockaddr_in)) == 0) {
+                bound = true;
+                break;
+            }
+        }
+        if (!bound) {
+            std.debug.print("sketerm-mux: no free UDP port in {d}:{d}\n", .{ r[0], r[1] });
+            return 1;
+        }
+    } else {
+        bind_addr.sin_port = 0;
+        if (cc.bind(udp_fd, @ptrCast(&bind_addr), @sizeOf(cc.struct_sockaddr_in)) != 0) return 1;
+    }
     var got_addr: cc.struct_sockaddr_in = undefined;
     var got_len: cc.socklen_t = @sizeOf(cc.struct_sockaddr_in);
     if (cc.getsockname(udp_fd, @ptrCast(&got_addr), &got_len) != 0) return 1;
@@ -247,7 +287,7 @@ fn runUdpListen(allocator: std.mem.Allocator) u8 {
     // port forever (abandoned `ssh host sketerm-mux --udp-listen`).
     // Once a client HAS authenticated, we wait indefinitely — that
     // persistence is what makes roaming + reattach work.
-    return bridgeUdp(allocator, &chan, &out, udp_fd, unix_fd, unix_fd, true, nowMs() + 60_000);
+    return bridgeUdp(allocator, &chan, &out, udp_fd, unix_fd, unix_fd, true, nowMs() + 60_000, null);
 }
 
 /// `--udp-connect <ip> <port> <keyhex>`: run on the LOCAL side as a
@@ -288,12 +328,30 @@ fn runUdpConnect(allocator: std.mem.Allocator, host: []const u8, port_s: []const
     // any daemon traffic flows.
     _ = chan.tick(nowMs(), UdpOut.emit, @ptrCast(&out));
 
-    return bridgeUdp(allocator, &chan, &out, udp_fd, 0, 1, false, null);
+    // The client gives up when the server never proves key
+    // possession: warn at 5s (likely a firewalled port), exit at 15s
+    // so the GUI's blocking handshake fails instead of hanging.
+    var warn_buf: [320]u8 = undefined;
+    const warn_msg = std.fmt.bufPrint(
+        &warn_buf,
+        "sketerm-mux: no UDP reply from {s}:{d} after 5s — is the port blocked? Try plain `sketerm ssh {s}` or pin mux_udp_port_range to a firewall-open range.\n",
+        .{ host, port, host },
+    ) catch "sketerm-mux: no UDP reply after 5s — port blocked?\n";
+    const start = nowMs();
+    return bridgeUdp(allocator, &chan, &out, udp_fd, 0, 1, false, start + 15_000, .{
+        .at = start + 5_000,
+        .msg = warn_msg,
+    });
 }
 
 /// Shared pump: encrypted UDP ↔ a local byte stream.
 /// `roam` (server side): update out.peer from the source address of
 /// every AUTHENTICATED datagram.
+const UdpWarn = struct {
+    at: i64,
+    msg: []const u8,
+};
+
 fn bridgeUdp(
     allocator: std.mem.Allocator,
     chan: *rudp.Channel,
@@ -303,16 +361,27 @@ fn bridgeUdp(
     stream_out: c_int,
     roam: bool,
     abandon_deadline: ?i64,
+    warn: ?UdpWarn,
 ) u8 {
     const cc = @import("c.zig").c;
     var deliver: std.ArrayList(u8) = .empty;
     defer deliver.deinit(allocator);
     var ever_authenticated = false;
+    var warned = false;
 
     while (true) {
         const now = nowMs();
         if (abandon_deadline) |dl| {
-            if (!ever_authenticated and now > dl) return 1;
+            if (!ever_authenticated and now > dl) {
+                if (warn != null) _ = cc.fprintf(cc.stderr, "sketerm-mux: giving up on UDP transport\n");
+                return 1;
+            }
+        }
+        if (warn) |w| {
+            if (!warned and !ever_authenticated and now > w.at) {
+                warned = true;
+                _ = cc.fwrite(w.msg.ptr, 1, w.msg.len, cc.stderr);
+            }
         }
         const deadline = chan.tick(now, UdpOut.emit, @ptrCast(out));
         const timeout: c_int = if (deadline) |d|

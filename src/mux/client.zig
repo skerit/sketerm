@@ -53,7 +53,7 @@ pub const Conn = struct {
     /// socketpair. Everything downstream is fd-agnostic, same as
     /// the plain SSH transport — but the live connection is
     /// encrypted UDP with roaming + retransmission (rudp.zig).
-    pub fn connectUdp(allocator: std.mem.Allocator, host: []const u8) !Conn {
+    pub fn connectUdp(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8) !Conn {
         // 1. Bootstrap: ssh prints the announcement on a pipe.
         var pipe_fds: [2]c_int = undefined;
         if (c.pipe(&pipe_fds) != 0) return error.SocketFailed;
@@ -73,9 +73,16 @@ pub const Conn = struct {
             _ = c.dup2(pipe_fds[1], 1);
             _ = c.close(pipe_fds[0]);
             _ = c.close(pipe_fds[1]);
-            const argv = [_:null]?[*:0]const u8{
-                ssh_bin, "-T", "-o", "BatchMode=yes", host_z.ptr, "sketerm-mux", "--udp-listen", null,
+            var range_z_buf: [32:0]u8 = undefined;
+            var argv = [_:null]?[*:0]const u8{
+                ssh_bin, "-T", "-o", "BatchMode=yes", host_z.ptr, "sketerm-mux", "--udp-listen", null, null, null,
             };
+            if (port_range) |r| {
+                if (std.fmt.bufPrintZ(&range_z_buf, "{s}", .{r})) |rz| {
+                    argv[7] = "--udp-port";
+                    argv[8] = rz.ptr;
+                } else |_| {}
+            }
             _ = c.execvp(ssh_bin, @ptrCast(@constCast(&argv)));
             c._exit(127);
         }

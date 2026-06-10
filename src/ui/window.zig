@@ -2351,8 +2351,13 @@ pub const Window = struct {
         if (host) |h| {
             // "udp:host" selects the mosh-style encrypted UDP
             // transport (ssh bootstrap, then roaming datagrams).
-            if (std.mem.startsWith(u8, h, "udp:"))
-                return mux_client.Conn.connectUdp(self.allocator, h[4..]);
+            if (std.mem.startsWith(u8, h, "udp:")) {
+                const range: ?[]const u8 = if (self.config.mux_udp_port_range.len > 0)
+                    self.config.mux_udp_port_range
+                else
+                    null;
+                return mux_client.Conn.connectUdp(self.allocator, h[4..], range);
+            }
             return mux_client.Conn.connectSsh(self.allocator, h);
         }
         const path = try mux_daemon.defaultSocketPath(self.allocator);

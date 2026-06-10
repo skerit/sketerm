@@ -4210,3 +4210,42 @@ libc-only sketerm-mux binary, done.
   intact; no leaked bridge processes after disconnect.
 
 Tests 450 → 454.
+
+## 2026-06-10 (evening): housekeeping, predictive echo, domains, shakeout prep
+
+- Housekeeping: CLAUDE.md rewritten for the Zig-0.16 / mux era
+  (build steps, glib option, IPC + mux subsystems, std quirks);
+  architecture.md gained a mux section. pathZ/makeParentDirs
+  deduped into util/pathz.zig (was 4+ copies). New test pins the
+  gdkversionmacros aro shim against the system header so GTK
+  upgrades can't drift it silently. Also: the ok/err/shutdown
+  FrameType hunk from the UDP commit had been left uncommitted —
+  HEAD was unbuildable on a fresh checkout; fixed.
+- Predictive local echo (mosh-style) for remote panes:
+  src/mux/predict.zig is a pure state machine (fake-clock unit
+  tests). Printable keystrokes render speculatively via a new
+  GridPass overlay (underlined, default fg); reconciled against
+  the live event stream after every EVENTS frame. Display gated on
+  smoothed input→echo RTT >= 60ms AND a previously confirmed
+  prediction; Enter drops confidence, so echo-off (password)
+  prompts never display speculation — verified live with a
+  400ms-each-way delayed proxy (SKETERM_MUX_DELAY_MS test hook):
+  glyphs visible on screen while absent from the grid, secret
+  input after `read -s` never rendered. GLib 250ms timer expires
+  stale predictions; timeout pauses prediction 5s.
+  SKETERM_PREDICT=always|never overrides.
+- [domain.<name>] config sections: host + transport (ssh|udp).
+  Palette grows a "New Tab on <name>" row per domain;
+  `sketerm mux <name>` and `sketerm ssh <name>` resolve names
+  (verified live: fake-ssh log shows the resolved user@host).
+- Real-world shakeout prep: `--udp-listen --udp-port LO:HI` +
+  `mux_udp_port_range` config key threaded through the GUI/CLI
+  bootstrap (verified: announce binds in-range, ssh argv carries
+  the flag). Client bridge warns on stderr after 5s without an
+  authenticated UDP reply and gives up at 15s so the GUI handshake
+  errors instead of hanging (verified against a black-hole port).
+  docs/REMOTE.md documents the server install (non-interactive
+  PATH gotcha), BatchMode key-auth requirement, and firewall
+  port-range setup.
+
+Tests 454 → 466.

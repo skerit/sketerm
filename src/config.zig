@@ -173,6 +173,10 @@ pub const Config = struct {
     /// punctuation characters. Anything OUTSIDE this set is treated
     /// as a word boundary.
     word_chars: []const u8 = "-_.,/?:@&=+%~",
+    /// UDP port range "lo:hi" passed to the remote `--udp-listen`
+    /// bootstrap (mosh-style; firewalls usually need a pinned range
+    /// like "60000:61000"). Empty = ephemeral port.
+    mux_udp_port_range: []const u8 = "",
     /// Smart copy: when no selection is active, Ctrl+Shift+C
     /// forwards as Ctrl+C (interrupt) instead of being a no-op.
     smart_copy: bool = true,
@@ -358,6 +362,7 @@ pub const Config = struct {
         out.term_env = try arena.dupe(u8, self.term_env);
         out.color_term_env = try arena.dupe(u8, self.color_term_env);
         out.word_chars = try arena.dupe(u8, self.word_chars);
+        out.mux_udp_port_range = try arena.dupe(u8, self.mux_udp_port_range);
         out.default_profile = try arena.dupe(u8, self.default_profile);
         out.keybinds = .empty;
         try out.keybinds.ensureTotalCapacity(arena, self.keybinds.items.len);
@@ -565,6 +570,8 @@ pub const Config = struct {
         if (!self.cursor_color_default) try w.writeAll("cursor_color_default = false\n");
         if (!std.mem.eql(u8, self.word_chars, "-_.,/?:@&=+%~"))
             try w.print("word_chars = {s}\n", .{self.word_chars});
+        if (self.mux_udp_port_range.len > 0)
+            try w.print("mux_udp_port_range = {s}\n", .{self.mux_udp_port_range});
 
         // Window.
         if (self.tab_position != .top) try w.print("tab_position = {s}\n", .{@tagName(self.tab_position)});
@@ -948,6 +955,13 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.close_button_on_tab = try parseBool(value);
     } else if (std.mem.eql(u8, key, "word_chars")) {
         cfg.word_chars = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "mux_udp_port_range")) {
+        // Validate lo:hi here so a typo warns at load, not mid-ssh.
+        const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.BadPortRange;
+        const lo = try std.fmt.parseInt(u16, value[0..colon], 10);
+        const hi = try std.fmt.parseInt(u16, value[colon + 1 ..], 10);
+        if (lo == 0 or hi < lo) return error.BadPortRange;
+        cfg.mux_udp_port_range = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "scheme")) {
         cfg.scheme = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "exit_action")) {

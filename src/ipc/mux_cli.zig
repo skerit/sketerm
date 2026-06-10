@@ -123,7 +123,13 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
 fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn {
     if (host) |h| {
         if (std.mem.startsWith(u8, h, "udp:")) {
-            return mux_client.Conn.connectUdp(allocator, h[4..]) catch {
+            var cfg = @import("../config.zig").Config.load(allocator);
+            defer cfg.deinit();
+            const range: ?[]const u8 = if (cfg.mux_udp_port_range.len > 0)
+                cfg.mux_udp_port_range
+            else
+                null;
+            return mux_client.Conn.connectUdp(allocator, h[4..], range) catch {
                 _ = c.fprintf(c.stderr, "sketerm mux: UDP transport failed (key auth? sketerm-mux on the host? UDP not filtered?)\n");
                 return null;
             };
