@@ -136,6 +136,11 @@ pub fn main() !u8 {
     // them to GridPass — preserving per-row dirty optimizations on
     // box-drawing-heavy TUIs (htop, btop, lf, yazi…).
     const greeting = "\x1b[38;5;2mHello, sketerm!\x1b[0m" ++
+        // Row 1: colour emoji (U+1F600, grinning face) — exercises the
+        // fontconfig colour-font fallback + BGRA strike rescale + the
+        // GridPass colored-glyph shader branch. Soft assertion below:
+        // machines without a colour emoji font render it monochrome.
+        "\x1b[2;1H😀" ++
         "\x1b[3;1H\x1b[31;4mUnderlined\x1b[0m" ++
         // Box-drawing in cyan to verify CellPass renders them. The
         // chars are encoded as UTF-8 here — the parser turns them
@@ -175,6 +180,7 @@ pub fn main() !u8 {
     var greenish: usize = 0;
     var bluish_border: usize = 0;
     var reddish: usize = 0;
+    var yellowish: usize = 0;
     var any_text: usize = 0;
     var i: usize = 0;
     while (i < fb_bytes) : (i += 4) {
@@ -186,11 +192,17 @@ pub fn main() !u8 {
         if (g > r + 30 and g > b + 30) greenish += 1;
         if (b > g + 20 and b > r + 30) bluish_border += 1;
         if (r > g + 30 and r > b + 30) reddish += 1;
+        // Emoji yellow: warm pixel, red+green both well above blue.
+        if (r > 150 and g > 100 and r > b + 80 and g > b + 50) yellowish += 1;
     }
     std.debug.print(
-        "smoke-cell: any_text={d} greenish={d} bluish_border={d} reddish={d}\n",
-        .{ any_text, greenish, bluish_border, reddish },
+        "smoke-cell: any_text={d} greenish={d} bluish_border={d} reddish={d} emoji_yellowish={d}\n",
+        .{ any_text, greenish, bluish_border, reddish, yellowish },
     );
+    // Soft check only: no colour emoji font installed → 0 is legitimate.
+    if (yellowish < 5) {
+        std.debug.print("smoke-cell: note — no colour emoji pixels (colour font missing or colour pipeline broken)\n", .{});
+    }
 
     if (any_text < 50) {
         std.debug.print("smoke-cell: FAIL — too few non-bg pixels (text not rendered?)\n", .{});

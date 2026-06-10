@@ -19,7 +19,7 @@ const c = @import("../c.zig").c;
 
 /// Pixels per page side. Cap at 2048 — cross-vendor safe.
 pub const PAGE_SIZE: u32 = 2048;
-/// Number of array-texture layers. 4 × 4 MB = 16 MB GPU memory budget.
+/// Number of array-texture layers. RGBA8: 4 × 16 MB = 64 MB GPU budget.
 pub const PAGE_COUNT: u32 = 4;
 
 pub const Glyph = struct {
@@ -41,6 +41,10 @@ pub const Glyph = struct {
     /// Generation counter — bumped on eviction so stale references
     /// can be detected and re-resolved by callers that cache.
     generation: u32 = 0,
+    /// True for color (emoji) glyphs: atlas texels carry actual RGBA;
+    /// the shader samples them directly instead of tinting coverage
+    /// with the cell fg.
+    colored: bool = false,
 };
 
 const Page = struct {
@@ -221,15 +225,19 @@ pub const Atlas = struct {
         if (self.realized) return;
         c.glGenTextures(1, &self.gl_tex);
         c.glBindTexture(c.GL_TEXTURE_2D_ARRAY, self.gl_tex);
+        // RGBA so colour emoji (CBDT/sbix strikes) can live alongside
+        // monochrome glyphs. Mono coverage is stored in alpha with
+        // RGB=255 — shaders tint with the cell fg; colour glyphs carry
+        // straight (un-premultiplied) RGBA sampled directly.
         c.glTexImage3D(
             c.GL_TEXTURE_2D_ARRAY,
             0,
-            c.GL_R8,
+            c.GL_RGBA8,
             @intCast(PAGE_SIZE),
             @intCast(PAGE_SIZE),
             @intCast(PAGE_COUNT),
             0,
-            c.GL_RED,
+            c.GL_RGBA,
             c.GL_UNSIGNED_BYTE,
             null,
         );
@@ -243,8 +251,8 @@ pub const Atlas = struct {
         // that lands inside that padding strip — undefined memory there
         // shows up as a faint vertical line on the left of every bold
         // narrow glyph (`i`, `l`, `v`). Zero-filling once at realize
-        // costs ~16 MB of TexSubImage3D up front and fixes it.
-        const zero = self.allocator.alloc(u8, PAGE_SIZE * PAGE_SIZE) catch null;
+        // costs ~64 MB of TexSubImage3D up front and fixes it.
+        const zero = self.allocator.alloc(u8, PAGE_SIZE * PAGE_SIZE * 4) catch null;
         defer if (zero) |z| self.allocator.free(z);
         if (zero) |z| {
             @memset(z, 0);
@@ -260,7 +268,7 @@ pub const Atlas = struct {
                     @intCast(PAGE_SIZE),
                     @intCast(PAGE_SIZE),
                     1,
-                    c.GL_RED,
+                    c.GL_RGBA,
                     c.GL_UNSIGNED_BYTE,
                     z.ptr,
                 );
@@ -441,6 +449,44 @@ pub const Atlas = struct {
         _ = self.cp_to_fallback.put(cp, null) catch {};
     }
 
+    /// Codepoints whose fontconfig fallback should prefer a colour
+    /// (emoji) font over a scalable monochrome one. Covers the emoji
+    /// blocks plus the handful of emoji-presentation symbols outside
+    /// them (watch, hourglass, media controls, misc symbols, dingbats).
+    fn isEmojiCp(cp: u32) bool {
+        return switch (cp) {
+            0x1F000...0x1FAFF => true, // mahjong..symbols-extended-A (incl. emoticons, transport, flags)
+            0x2600...0x27BF => true, // misc symbols + dingbats
+            0x231A, 0x231B => true, // watch, hourglass
+            0x23E9...0x23FA => true, // media controls, alarm clock
+            0x25FD, 0x25FE => true, // small squares
+            0x2B05...0x2B07, 0x2B1B, 0x2B1C, 0x2B50, 0x2B55 => true,
+            else => false,
+        };
+    }
+
+    /// Apply `px` to a face. Scalable faces use FT_Set_Pixel_Sizes;
+    /// fixed-strike (bitmap, e.g. CBDT emoji) faces select the nearest
+    /// available strike instead — the rasterized bitmap is rescaled to
+    /// cell size at glyph-load time.
+    fn setFaceSize(face: c.FT_Face, px: u16) bool {
+        if (c.FT_Set_Pixel_Sizes(face, 0, px) == 0) return true;
+        const n = face.*.num_fixed_sizes;
+        if (n <= 0 or face.*.available_sizes == null) return false;
+        var best: c_int = 0;
+        var best_diff: u64 = std.math.maxInt(u64);
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            const h: i64 = @intCast(face.*.available_sizes[@intCast(i)].height);
+            const diff: u64 = @abs(h - @as(i64, px));
+            if (diff < best_diff) {
+                best_diff = diff;
+                best = i;
+            }
+        }
+        return c.FT_Select_Size(face, best) == 0;
+    }
+
     /// Locate (or lazily load) a fallback FT_Face that has `cp`. Caches
     /// both positive matches (face index) and negative results (null
     /// in the map). Best-effort negative caching: under allocation
@@ -462,10 +508,11 @@ pub const Atlas = struct {
                 return fb;
             }
         }
-        // Ask fontconfig for a font that covers `cp`. We bias toward
-        // monospace + scalable so the metrics merge cleanly with the
-        // primary face's cell grid; colour emoji (CBDT/COLR) would
-        // need an RGBA atlas — skipped for v1.
+        // Ask fontconfig for a font that covers `cp`. For regular text
+        // we bias toward scalable faces so the metrics merge cleanly
+        // with the primary face's cell grid. For emoji codepoints we
+        // instead prefer a colour font (CBDT/sbix — e.g. Noto Color
+        // Emoji); its fixed-size strikes are rescaled at load.
         const pattern = c.FcPatternCreate() orelse {
             self.markNoFallback(cp);
             return null;
@@ -478,7 +525,11 @@ pub const Atlas = struct {
         defer c.FcCharSetDestroy(charset);
         _ = c.FcCharSetAddChar(charset, cp);
         _ = c.FcPatternAddCharSet(pattern, c.FC_CHARSET, charset);
-        _ = c.FcPatternAddBool(pattern, c.FC_SCALABLE, c.FcTrue);
+        if (isEmojiCp(cp)) {
+            _ = c.FcPatternAddBool(pattern, c.FC_COLOR, c.FcTrue);
+        } else {
+            _ = c.FcPatternAddBool(pattern, c.FC_SCALABLE, c.FcTrue);
+        }
         _ = c.FcConfigSubstitute(null, pattern, c.FcMatchPattern);
         c.FcDefaultSubstitute(pattern);
 
@@ -501,7 +552,7 @@ pub const Atlas = struct {
             self.markNoFallback(cp);
             return null;
         }
-        if (c.FT_Set_Pixel_Sizes(fb_face, 0, self.pixel_size) != 0) {
+        if (!setFaceSize(fb_face, self.pixel_size)) {
             _ = c.FT_Done_Face(fb_face);
             self.markNoFallback(cp);
             return null;
@@ -588,7 +639,7 @@ pub const Atlas = struct {
     /// outline thickening, not a shader-side pixel smear.
     fn loadGlyphFromFace(self: *Atlas, face: c.FT_Face, gid: u32, embolden: bool) !Glyph {
         if (embolden) {
-            if (c.FT_Load_Glyph(face, gid, c.FT_LOAD_DEFAULT) != 0) return error.FtLoad;
+            if (c.FT_Load_Glyph(face, gid, c.FT_LOAD_DEFAULT | c.FT_LOAD_COLOR) != 0) return error.FtLoad;
             const s = face.*.glyph;
             if (s.*.format == c.FT_GLYPH_FORMAT_OUTLINE) {
                 // Same strength FreeType's own ftsynth.c uses for
@@ -597,14 +648,56 @@ pub const Atlas = struct {
                 _ = c.FT_Outline_Embolden(&s.*.outline, strength);
             }
             if (c.FT_Render_Glyph(s, c.FT_RENDER_MODE_LIGHT) != 0) return error.FtLoad;
-        } else if (c.FT_Load_Glyph(face, gid, c.FT_LOAD_RENDER | c.FT_LOAD_TARGET_LIGHT) != 0) {
+        } else if (c.FT_Load_Glyph(face, gid, c.FT_LOAD_RENDER | c.FT_LOAD_TARGET_LIGHT | c.FT_LOAD_COLOR) != 0) {
             return error.FtLoad;
         }
 
         const slot = face.*.glyph;
         const bm = slot.*.bitmap;
-        const w: u32 = bm.width;
-        const h: u32 = bm.rows;
+
+        // Convert the FreeType bitmap to straight RGBA. Two source
+        // forms: 8-bit coverage (outline fonts — stored as RGB=255 +
+        // coverage in alpha so shaders can tint with the cell fg) and
+        // premultiplied BGRA (colour emoji strikes — rescaled to cell
+        // size and un-premultiplied for the SRC_ALPHA blend pipeline).
+        var w: u32 = bm.width;
+        var h: u32 = bm.rows;
+        const colored = bm.pixel_mode == c.FT_PIXEL_MODE_BGRA;
+        var rgba: ?[]u8 = null;
+        defer if (rgba) |b| self.allocator.free(b);
+        var bearing_x: i16 = if (w > 0) @intCast(slot.*.bitmap_left) else 0;
+        var bearing_y: i16 = if (h > 0) @intCast(slot.*.bitmap_top) else 0;
+        var advance: f32 = @as(f32, @floatFromInt(slot.*.advance.x)) / 64.0;
+
+        if (w > 0 and h > 0) {
+            if (colored) {
+                // Emoji strike: fit into a 2-cell × cell_h box, keeping
+                // aspect. Strikes are fixed-size (Noto: 128 px) and
+                // almost never match the cell, so this nearly always
+                // rescales.
+                const box_w: f32 = @floatFromInt(@as(u32, self.cell_w) * 2);
+                const box_h: f32 = @floatFromInt(self.cell_h);
+                const scale = @min(box_h / @as(f32, @floatFromInt(h)), box_w / @as(f32, @floatFromInt(w)));
+                const dw: u32 = @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(w)) * scale))));
+                const dh: u32 = @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(h)) * scale))));
+                rgba = try scaleBgraToRgba(self.allocator, bm, dw, dh);
+                // Centre in the 2-cell box: top-left of the glyph quad
+                // is computed as (x + bearing_x, y + ascent - bearing_y).
+                const dwi: i32 = @intCast(dw);
+                const dhi: i32 = @intCast(dh);
+                bearing_x = @intCast(@max(0, @divTrunc(@as(i32, self.cell_w) * 2 - dwi, 2)));
+                bearing_y = @intCast(self.ascent - @divTrunc(@as(i32, self.cell_h) - dhi, 2));
+                advance = @floatFromInt(@as(u32, self.cell_w) * 2);
+                w = dw;
+                h = dh;
+            } else if (bm.pixel_mode == c.FT_PIXEL_MODE_GRAY) {
+                rgba = try grayToRgba(self.allocator, bm);
+            } else {
+                // MONO and exotic modes — treat as missing rather than
+                // uploading garbage.
+                return error.FtLoad;
+            }
+        }
 
         // Find a page that fits, optionally evicting LRU.
         const page_idx = self.findOrEvictPage(w, h) orelse return error.PageFull;
@@ -621,7 +714,7 @@ pub const Atlas = struct {
         const px = page.pack_x;
         const py = page.pack_y;
 
-        if (w > 0 and h > 0 and self.realized) {
+        if (rgba != null and self.realized) {
             c.glBindTexture(c.GL_TEXTURE_2D_ARRAY, self.gl_tex);
             c.glPixelStorei(c.GL_UNPACK_ALIGNMENT, 1);
             c.glTexSubImage3D(
@@ -633,9 +726,9 @@ pub const Atlas = struct {
                 @intCast(w),
                 @intCast(h),
                 1,
-                c.GL_RED,
+                c.GL_RGBA,
                 c.GL_UNSIGNED_BYTE,
-                bm.buffer,
+                rgba.?.ptr,
             );
         }
 
@@ -643,19 +736,103 @@ pub const Atlas = struct {
         const g = Glyph{
             .w = @intCast(w),
             .h = @intCast(h),
-            .bearing_x = @intCast(slot.*.bitmap_left),
-            .bearing_y = @intCast(slot.*.bitmap_top),
-            .advance = @as(f32, @floatFromInt(slot.*.advance.x)) / 64.0,
+            .bearing_x = bearing_x,
+            .bearing_y = bearing_y,
+            .advance = advance,
             .u0 = @as(f32, @floatFromInt(px)) * inv_page,
             .v0 = @as(f32, @floatFromInt(py)) * inv_page,
             .u1 = @as(f32, @floatFromInt(px + w)) * inv_page,
             .v1 = @as(f32, @floatFromInt(py + h)) * inv_page,
             .layer = @intCast(page_idx),
             .generation = page.generation,
+            .colored = colored,
         };
         page.pack_x += w + 1;
         page.last_used_frame = self.frame_counter;
         return g;
+    }
+
+    /// Expand an 8-bit FreeType coverage bitmap to RGBA: RGB=255,
+    /// coverage in alpha. Honours `pitch` (rows may be padded).
+    fn grayToRgba(allocator: std.mem.Allocator, bm: c.FT_Bitmap) ![]u8 {
+        const w: usize = bm.width;
+        const h: usize = bm.rows;
+        const out = try allocator.alloc(u8, w * h * 4);
+        const pitch: usize = @intCast(@abs(bm.pitch));
+        var row: usize = 0;
+        while (row < h) : (row += 1) {
+            const src = bm.buffer + row * pitch;
+            var col: usize = 0;
+            while (col < w) : (col += 1) {
+                const o = (row * w + col) * 4;
+                out[o + 0] = 255;
+                out[o + 1] = 255;
+                out[o + 2] = 255;
+                out[o + 3] = src[col];
+            }
+        }
+        return out;
+    }
+
+    /// Box-filter a premultiplied-BGRA strike bitmap down (or up) to
+    /// dw×dh and convert to straight RGBA. Box averaging over the
+    /// source rect per destination pixel handles the typical large
+    /// downscale (128 px strike → ~20 px cell) without aliasing;
+    /// upscale degenerates to nearest-neighbour, which is fine for
+    /// the ≤2× cases that occur with small strikes.
+    fn scaleBgraToRgba(allocator: std.mem.Allocator, bm: c.FT_Bitmap, dw: u32, dh: u32) ![]u8 {
+        const sw: usize = bm.width;
+        const sh: usize = bm.rows;
+        const pitch: usize = @intCast(@abs(bm.pitch));
+        const out = try allocator.alloc(u8, @as(usize, dw) * @as(usize, dh) * 4);
+        var dy: u32 = 0;
+        while (dy < dh) : (dy += 1) {
+            // Source row span [y0, y1) for this destination row.
+            var y0: usize = @intFromFloat(@floor(@as(f32, @floatFromInt(dy)) * @as(f32, @floatFromInt(sh)) / @as(f32, @floatFromInt(dh))));
+            var y1: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(dy + 1)) * @as(f32, @floatFromInt(sh)) / @as(f32, @floatFromInt(dh))));
+            y0 = @min(y0, sh - 1);
+            y1 = @max(@min(y1, sh), y0 + 1);
+            var dx: u32 = 0;
+            while (dx < dw) : (dx += 1) {
+                var x0: usize = @intFromFloat(@floor(@as(f32, @floatFromInt(dx)) * @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(dw))));
+                var x1: usize = @intFromFloat(@ceil(@as(f32, @floatFromInt(dx + 1)) * @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(dw))));
+                x0 = @min(x0, sw - 1);
+                x1 = @max(@min(x1, sw), x0 + 1);
+                // Average premultiplied channels over the box.
+                var sum_b: u32 = 0;
+                var sum_g: u32 = 0;
+                var sum_r: u32 = 0;
+                var sum_a: u32 = 0;
+                var sy = y0;
+                while (sy < y1) : (sy += 1) {
+                    const src_row = bm.buffer + sy * pitch;
+                    var sx = x0;
+                    while (sx < x1) : (sx += 1) {
+                        const s = src_row + sx * 4;
+                        sum_b += s[0];
+                        sum_g += s[1];
+                        sum_r += s[2];
+                        sum_a += s[3];
+                    }
+                }
+                const count: u32 = @intCast((y1 - y0) * (x1 - x0));
+                const a: u32 = sum_a / count;
+                const o = (@as(usize, dy) * dw + dx) * 4;
+                if (a == 0) {
+                    out[o + 0] = 0;
+                    out[o + 1] = 0;
+                    out[o + 2] = 0;
+                    out[o + 3] = 0;
+                } else {
+                    // Un-premultiply: averaged premult channel / alpha.
+                    out[o + 0] = @intCast(@min(255, (sum_r / count) * 255 / a));
+                    out[o + 1] = @intCast(@min(255, (sum_g / count) * 255 / a));
+                    out[o + 2] = @intCast(@min(255, (sum_b / count) * 255 / a));
+                    out[o + 3] = @intCast(a);
+                }
+            }
+        }
+        return out;
     }
 
     /// Find an existing page with room, or evict the LRU page.

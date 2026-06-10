@@ -3869,3 +3869,25 @@ tests, all green.
 - "Rotating VBO slots draw stale data" — false alarm: uploads write
   the full instance buffer and `vbo_slot` only advances inside the
   upload, so `draw()` always binds the most recently written slot.
+
+## 2026-06-10 — colour emoji rendering
+
+Atlas switched from GL_R8 to GL_RGBA8 (64 MB GPU budget): monochrome
+coverage now lives in alpha (RGB=255, shaders tint with cell fg);
+colour emoji carry straight RGBA sampled directly. Glyph loading adds
+FT_LOAD_COLOR; BGRA strikes (CBDT — Noto Color Emoji ships 128 px) are
+box-filtered down to a 2-cell × cell_h box, un-premultiplied for the
+SRC_ALPHA blend pipeline, and centred. Fontconfig fallback for emoji
+codepoints (`isEmojiCp`) requests `color=true` instead of the scalable
+bias — without it fontconfig hands back DejaVu Sans, and fixed-strike
+faces were rejected outright by FT_Set_Pixel_Sizes (now: nearest-strike
+FT_Select_Size). A `colored` flag rides the Glyph struct into both
+passes: CellPass Instance (now 104 B) and the GridPass overlay vertex
+both branch in the fragment shader (only pane-dim applies to colour
+glyphs, no fg tint, no italic shear). Note: emoji rows render via
+CellPass (only RTL/complex-script rows go to the overlay) — the colour
+branch is needed in BOTH shaders. COLR-only fonts still render as mono
+outlines (FreeType won't rasterize COLR to BGRA on the plain load
+path); CBDT/sbix is the common case on Linux. smoke-cell now draws
+U+1F600 and counts "yellowish" pixels (soft check — passes mono-only
+on machines without a colour emoji font).

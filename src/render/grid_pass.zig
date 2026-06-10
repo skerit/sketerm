@@ -39,6 +39,8 @@ const VERT_SRC =
     \\in float a_bold;
     \\// Cell bottom-edge y in pixel space — pivot for italic shear.
     \\in float a_baseline_y;
+    \\// 1.0 = colour (emoji) glyph — atlas RGBA sampled directly.
+    \\in float a_colored;
     \\
     \\uniform vec2 u_screen_px;
     \\uniform float u_dim_fg;
@@ -48,6 +50,8 @@ const VERT_SRC =
     \\out vec4 v_color;
     \\out float v_is_glyph;
     \\out float v_bold;
+    \\out float v_colored;
+    \\out float v_dim_k;
     \\
     \\void main() {
     \\    vec2 pos = a_pos;
@@ -64,6 +68,8 @@ const VERT_SRC =
     \\    v_color = vec4(a_color.rgb * k, a_color.a);
     \\    v_is_glyph = a_is_glyph;
     \\    v_bold = a_bold;
+    \\    v_colored = a_colored;
+    \\    v_dim_k = k;
     \\}
 ;
 
@@ -80,6 +86,8 @@ const FRAG_SRC = std.fmt.comptimePrint(
     \\in vec4 v_color;
     \\in float v_is_glyph;
     \\in float v_bold;
+    \\in float v_colored;
+    \\in float v_dim_k;
     \\
     \\uniform sampler2DArray u_atlas;
     \\
@@ -89,8 +97,15 @@ const FRAG_SRC = std.fmt.comptimePrint(
     \\    if (v_is_glyph > 0.5) {{
     \\        // Bold is a real atlas glyph now (bold face / outline-embolden);
     \\        // `v_bold` is inert, no shader dilation.
-    \\        float a = texture(u_atlas, v_uv).r;
-    \\        o_frag = vec4(v_color.rgb, a * v_color.a);
+    \\        vec4 t = texture(u_atlas, v_uv);
+    \\        if (v_colored > 0.5) {{
+    \\            // Colour emoji: atlas carries straight RGBA. Only the
+    \\            // pane-dim factor applies; fg tint does not.
+    \\            o_frag = vec4(t.rgb * v_dim_k, t.a * v_color.a);
+    \\        }} else {{
+    \\            // Mono: coverage in alpha (RGB=255), tinted with fg.
+    \\            o_frag = vec4(v_color.rgb, t.a * v_color.a);
+    \\        }}
     \\    }} else {{
     \\        o_frag = v_color;
     \\    }}
@@ -106,6 +121,9 @@ const Vertex = extern struct {
     italic: f32 = 0.0,
     bold: f32 = 0.0,
     baseline_y: f32 = 0.0,
+    /// 1.0 = colour (emoji) glyph: sample atlas RGBA directly instead
+    /// of tinting coverage with `color`.
+    colored: f32 = 0.0,
 };
 
 /// Snapshot of every input that affects the overlay vertex buffer
@@ -328,6 +346,7 @@ pub const GridPass = struct {
         const a_italic: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_italic"));
         const a_bold: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_bold"));
         const a_baseline_y: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_baseline_y"));
+        const a_colored: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_colored"));
 
         c.glEnableVertexAttribArray(a_pos);
         c.glVertexAttribPointer(a_pos, 2, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "pos")));
@@ -345,6 +364,8 @@ pub const GridPass = struct {
         c.glVertexAttribPointer(a_bold, 1, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "bold")));
         c.glEnableVertexAttribArray(a_baseline_y);
         c.glVertexAttribPointer(a_baseline_y, 1, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "baseline_y")));
+        c.glEnableVertexAttribArray(a_colored);
+        c.glVertexAttribPointer(a_colored, 1, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "colored")));
 
         c.glBindVertexArray(0);
     }
@@ -925,10 +946,11 @@ pub const GridPass = struct {
                 // Italic/bold only on single-scale rows. DH/DW rows
                 // skip — shear pivot math gets weird with y_scale != 1.
                 const is_single = (x_scale == 1.0 and y_scale == 1.0);
-                const italic_f: f32 = if (is_single and style.attrs.italic) 1.0 else 0.0;
+                const italic_f: f32 = if (is_single and style.attrs.italic and !g.colored) 1.0 else 0.0;
                 const bold_f: f32 = if (is_single and style.attrs.bold and self.allow_bold) 1.0 else 0.0;
                 const baseline_y: f32 = y + ch;
-                try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y);
+                const colored_f: f32 = if (g.colored) 1.0 else 0.0;
+                try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f);
             }
             col += 1;
         }
@@ -988,10 +1010,11 @@ pub const GridPass = struct {
             const gw: f32 = @as(f32, @floatFromInt(g.w)) * x_scale;
             const gh: f32 = @as(f32, @floatFromInt(g.h)) * y_scale;
             const is_single = (x_scale == 1.0 and y_scale == 1.0);
-            const italic_f: f32 = if (is_single and style.attrs.italic) 1.0 else 0.0;
+            const italic_f: f32 = if (is_single and style.attrs.italic and !g.colored) 1.0 else 0.0;
             const bold_f: f32 = if (is_single and style.attrs.bold and self.allow_bold) 1.0 else 0.0;
             const baseline_y: f32 = y + ch;
-            try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y);
+            const colored_f: f32 = if (g.colored) 1.0 else 0.0;
+            try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f);
         }
     }
 
@@ -1054,7 +1077,7 @@ pub const GridPass = struct {
         color: [4]f32,
         dim: f32,
     ) !void {
-        return self.pushGlyphQuadStyled(origin, size, uv0, uv1, layer, color, dim, 0.0, 0.0, 0.0);
+        return self.pushGlyphQuadStyled(origin, size, uv0, uv1, layer, color, dim, 0.0, 0.0, 0.0, 0.0);
     }
 
     /// Glyph quad with italic shear + faux-bold support. Used by the
@@ -1074,15 +1097,16 @@ pub const GridPass = struct {
         italic: f32,
         bold: f32,
         baseline_y: f32,
+        colored: f32,
     ) !void {
         const px0 = origin[0];
         const py0 = origin[1];
         const px1 = origin[0] + size[0];
         const py1 = origin[1] + size[1];
-        const v0 = Vertex{ .pos = .{ px0, py0 }, .uv = .{ uv0[0], uv0[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y };
-        const v1 = Vertex{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y };
-        const v2 = Vertex{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y };
-        const v3 = Vertex{ .pos = .{ px1, py1 }, .uv = .{ uv1[0], uv1[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y };
+        const v0 = Vertex{ .pos = .{ px0, py0 }, .uv = .{ uv0[0], uv0[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored };
+        const v1 = Vertex{ .pos = .{ px1, py0 }, .uv = .{ uv1[0], uv0[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored };
+        const v2 = Vertex{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored };
+        const v3 = Vertex{ .pos = .{ px1, py1 }, .uv = .{ uv1[0], uv1[1], layer }, .color = color, .is_glyph = 1.0, .dim = dim, .italic = italic, .bold = bold, .baseline_y = baseline_y, .colored = colored };
         const verts = [_]Vertex{ v0, v1, v2, v1, v3, v2 };
         try self.vbuf.appendSlice(self.allocator, &verts);
     }

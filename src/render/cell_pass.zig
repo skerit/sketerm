@@ -54,6 +54,9 @@ pub const Instance = extern struct {
     /// the original UV AND a 1-pixel offset in u, taking max alpha.
     /// Same idea as italic — cheap, no second FT face needed.
     bold: f32 = 0,
+    /// 1.0 = colour (emoji) glyph: the atlas texels carry straight
+    /// RGBA sampled directly; fg tint does not apply.
+    colored: f32 = 0,
 };
 
 // ITALIC_SHEAR = tan(13°) ≈ 0.231: horizontal-shear factor used to
@@ -75,6 +78,7 @@ const VERT_SRC =
     \\in float a_deco;
     \\in float a_italic;
     \\in float a_bold;
+    \\in float a_colored;
     \\
     \\uniform vec2 u_screen_px;
     \\uniform int u_kind; // 0 = bg, 1 = glyph, 2 = decoration
@@ -93,6 +97,8 @@ const VERT_SRC =
     \\out vec2 v_deco_local;
     \\out float v_deco_w_px;
     \\out float v_bold;
+    \\out float v_colored;
+    \\out float v_dim_k;
     \\
     \\const vec2 corners[6] = vec2[6](
     \\    vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
@@ -108,6 +114,8 @@ const VERT_SRC =
     \\    v_deco_local = vec2(0.0);
     \\    v_deco_w_px = a_cell_size.x;
     \\    v_bold = a_bold;
+    \\    v_colored = a_colored;
+    \\    v_dim_k = u_dim_fg;
     \\    if (u_kind == 0) {
     \\        v_color = vec4(a_bg.rgb * u_dim_bg, a_bg.a);
     \\        v_is_glyph = 0.0;
@@ -208,6 +216,8 @@ const FRAG_SRC = std.fmt.comptimePrint(
     \\in vec2 v_deco_local;
     \\in float v_deco_w_px;
     \\in float v_bold;
+    \\in float v_colored;
+    \\in float v_dim_k;
     \\
     \\uniform sampler2DArray u_atlas;
     \\
@@ -218,8 +228,15 @@ const FRAG_SRC = std.fmt.comptimePrint(
     \\    if (v_is_glyph > 0.5) {{
     \\        // Bold is baked into the atlas glyph now (real bold face or
     \\        // FT outline-embolden); no shader dilation. `v_bold` is inert.
-    \\        float a = texture(u_atlas, v_uvw).r;
-    \\        o_frag = vec4(v_color.rgb, a * v_color.a);
+    \\        // Atlas is RGBA: mono coverage lives in alpha (RGB=255) and
+    \\        // gets tinted with the cell fg; colour emoji carry straight
+    \\        // RGBA sampled directly (only pane-dim applies).
+    \\        vec4 t = texture(u_atlas, v_uvw);
+    \\        if (v_colored > 0.5) {{
+    \\            o_frag = vec4(t.rgb * v_dim_k, t.a * v_color.a);
+    \\        }} else {{
+    \\            o_frag = vec4(v_color.rgb, t.a * v_color.a);
+    \\        }}
     \\        return;
     \\    }}
     \\    if (v_deco_kind < 0.5) {{
@@ -438,6 +455,7 @@ pub const CellPass = struct {
             .{ .name = "a_deco", .off = @offsetOf(Instance, "deco"), .count = 1 },
             .{ .name = "a_italic", .off = @offsetOf(Instance, "italic"), .count = 1 },
             .{ .name = "a_bold", .off = @offsetOf(Instance, "bold"), .count = 1 },
+            .{ .name = "a_colored", .off = @offsetOf(Instance, "colored"), .count = 1 },
         };
         for (fields) |f| {
             const loc = c.glGetAttribLocation(self.program, f.name.ptr);
@@ -663,6 +681,10 @@ pub const CellPass = struct {
                     slice[col].glyph_uv1 = .{ g.u1, g.v1 };
                     slice[col].glyph_layer = @floatFromInt(g.layer);
                     slice[col].has_glyph = 0.0;
+                    slice[col].colored = if (g.colored) 1.0 else 0.0;
+                    // No italic shear on colour emoji — shearing the
+                    // RGBA strike just distorts it.
+                    if (g.colored) slice[col].italic = 0.0;
                 }
             }
         }
@@ -947,6 +969,6 @@ pub fn rowNeedsBidiOrComplexShape(cells: []const Cell) bool {
     return Screen.rowNeedsBidiOrComplexShape(cells);
 }
 
-test "Instance is 100 bytes" {
-    try std.testing.expectEqual(@as(usize, 100), @sizeOf(Instance));
+test "Instance is 104 bytes" {
+    try std.testing.expectEqual(@as(usize, 104), @sizeOf(Instance));
 }
