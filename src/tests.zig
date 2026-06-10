@@ -12,6 +12,7 @@ comptime {
     _ = @import("util/pathz.zig");
     _ = @import("shim_drift_test.zig");
     _ = @import("mux/predict.zig");
+    _ = @import("mux/kitty_inline.zig");
     _ = @import("parser/event.zig");
     _ = @import("parser/vt.zig");
     _ = @import("parser/conformance_test.zig");

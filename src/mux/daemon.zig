@@ -596,8 +596,22 @@ const EventCollector = struct {
 
     fn emit(user: ?*anyopaque, ev: Event) void {
         const self: *EventCollector = @ptrCast(@alignCast(user.?));
-        self.writer.putEvent(ev) catch {};
-        self.screen.apply(ev);
+        // Kitty file/tempfile/shm transmissions reference THIS
+        // host's filesystem — fetch and inline them so the client
+        // (which can't read our disk) gets the data. Apply the
+        // rewritten event locally too, keeping the authoritative
+        // screen identical to what clients see.
+        var fwd = ev;
+        var owned: ?[]u8 = null;
+        defer if (owned) |b| self.allocator.free(b);
+        if (ev == .apc) {
+            if (@import("kitty_inline.zig").rewrite(self.allocator, ev.apc.bytes)) |nb| {
+                owned = nb;
+                fwd = .{ .apc = .{ .bytes = nb } };
+            }
+        }
+        self.writer.putEvent(fwd) catch {};
+        self.screen.apply(fwd);
         self.count += 1;
         var mut = ev;
         mut.deinit(self.allocator);
