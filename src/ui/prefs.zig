@@ -59,13 +59,19 @@ pub fn open(
     apply: ApplyFn,
 ) !void {
     const ctx = try allocator.create(Ctx);
+    errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
         .arena = std.heap.ArenaAllocator.init(allocator),
         .win = win_ptr,
         .apply = apply,
-        .cfg = initial,
+        .cfg = undefined,
     };
+    errdefer ctx.arena.deinit();
+    // Deep-copy into the dialog's arena: a plain struct copy would
+    // alias the Window's config arena, which applyConfigChange frees
+    // on the very first row change — dangling working copy.
+    ctx.cfg = try initial.cloneInto(ctx.arena.allocator());
 
     const dialog = c.adw_preferences_dialog_new();
     // Free Ctx when the dialog goes away.
@@ -1141,7 +1147,9 @@ fn setKeybind(rctx: *KeybindRowCtx, accel: []const u8) void {
         }
     }
     const name_dup = arena.dupe(u8, action_name) catch return;
-    rctx.parent.cfg.keybinds.append(rctx.parent.allocator, .{
+    // The list's backing array lives in the prefs arena (cloneInto);
+    // growing it through the GPA would leak the GPA block on close.
+    rctx.parent.cfg.keybinds.append(arena, .{
         .name = name_dup,
         .accel = accel_dup,
     }) catch return;

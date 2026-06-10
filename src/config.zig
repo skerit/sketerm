@@ -276,6 +276,53 @@ pub const Config = struct {
         self.arena = null;
     }
 
+    /// Deep-copy every heap-backed field (strings, keybinds, profiles)
+    /// into `arena`. The returned copy carries NO arena of its own —
+    /// the caller's arena owns the memory. Use this to decouple a
+    /// Config copy from the source's lifetime; a plain struct copy
+    /// aliases the source arena and dangles when it is freed.
+    pub fn cloneInto(self: *const Config, arena: std.mem.Allocator) error{OutOfMemory}!Config {
+        var out = self.*;
+        out.arena = null;
+        if (self.font_path) |s| out.font_path = try arena.dupe(u8, s);
+        if (self.shell) |s| out.shell = try arena.dupe(u8, s);
+        out.scheme = try arena.dupe(u8, self.scheme);
+        out.term_env = try arena.dupe(u8, self.term_env);
+        out.color_term_env = try arena.dupe(u8, self.color_term_env);
+        out.word_chars = try arena.dupe(u8, self.word_chars);
+        out.default_profile = try arena.dupe(u8, self.default_profile);
+        out.keybinds = .empty;
+        try out.keybinds.ensureTotalCapacity(arena, self.keybinds.items.len);
+        for (self.keybinds.items) |kb| {
+            out.keybinds.appendAssumeCapacity(.{
+                .name = try arena.dupe(u8, kb.name),
+                .accel = try arena.dupe(u8, kb.accel),
+            });
+        }
+        out.profiles = .empty;
+        try out.profiles.ensureTotalCapacity(arena, self.profiles.items.len);
+        for (self.profiles.items) |p| {
+            var cp = p;
+            cp.name = try arena.dupe(u8, p.name);
+            cp.shell = try arena.dupe(u8, p.shell);
+            cp.font_path = try arena.dupe(u8, p.font_path);
+            cp.scheme = try arena.dupe(u8, p.scheme);
+            cp.term_env = try arena.dupe(u8, p.term_env);
+            cp.color_term_env = try arena.dupe(u8, p.color_term_env);
+            out.profiles.appendAssumeCapacity(cp);
+        }
+        return out;
+    }
+
+    /// Deep-copy into a fresh self-owned arena backed by `allocator`.
+    pub fn clone(self: *const Config, allocator: std.mem.Allocator) error{OutOfMemory}!Config {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        var out = try self.cloneInto(arena.allocator());
+        out.arena = arena;
+        return out;
+    }
+
     /// Try `~/.config/sketerm/config.conf`. Missing file → defaults.
     /// Parse errors print to stderr and fall back to defaults.
     /// Env overrides (SKETERM_FONT, SKETERM_SCROLLBACK) win over the
@@ -315,6 +362,9 @@ pub const Config = struct {
                     const max_bytes: usize = 64 * 1024;
                     var buf: [max_bytes]u8 = undefined;
                     const n = c.fread(&buf, 1, buf.len, fp);
+                    if (n == buf.len and c.feof(fp) == 0) {
+                        warnConfig("{s} larger than 64 KiB; trailing settings ignored", .{path});
+                    }
                     cfg.arena = std.heap.ArenaAllocator.init(allocator);
                     parseInto(&cfg, buf[0..n]) catch {
                         warnConfig("parse error in {s}, using defaults", .{path});
