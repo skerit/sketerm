@@ -4422,3 +4422,26 @@ Tests 454 → 466.
 - Gotcha: zig build test does NOT reinstall zig-out/bin/sketerm —
   launch live tests only after a plain `zig build`. Also the shim
   drift test skips when cwd != repo root (relative path).
+
+## 2026-06-11 (later): protocol trio + mux double-reply fix
+
+- Mode 2048 in-band resize: report on DECSET (immediately, per
+  spec) and after every Screen.resize; pixel fields 0 when cell
+  metrics unknown (daemon side). Mode 2031 + DSR ?996: dark/light
+  derived from effective bg luminance (isDarkBg in window.zig);
+  notifyColorScheme pushed from applyPaneConfig/applyConfigChange/
+  onThemeChanged, reports CSI ?997;1|2 n on actual flips only.
+  Mode 2027: we always cluster — DECRQM answers 3 (permanently
+  set), set/reset ignored.
+- LATENT BUG FIXED: mux mirror screens had on_write_pty wired, so
+  every DSR/DA/DECRQM from a remote app was answered TWICE (daemon
+  + mirror). Screen.mute_responses (set in initRemote + carried
+  over snapshot swaps) silences mirrors; GUI-owned replies
+  (OSC 52 read, DSR ?996) use respondForce and the daemon skips
+  them via defer_gui_queries. Snapshot bumped to v3 (carries
+  mode_2031/in_band_resize) — REDEPLOY sketerm-mux on remote hosts,
+  v2/v3 mismatch refuses to attach.
+- Verified live: local pane answers 2027;3$y / 997;1n / real-pixel
+  48-report / single DSR reply; durable pane shows the routing
+  split (daemon answers DECRQM/2048/DSR once, mirror answers ?996)
+  and exactly ONE cursor reply.
