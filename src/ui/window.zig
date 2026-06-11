@@ -1035,6 +1035,12 @@ pub const Window = struct {
         const page = self.appendOrInsertTab(wrapper);
         c.adw_tab_page_set_title(page, title_z.ptr);
         c.adw_tab_page_set_tooltip(page, title_z.ptr);
+        // Re-arm the user-rename lock so OSC titles can't stomp a
+        // deliberately named tab. Files predating the flag (null)
+        // count as renamed — restored titles never followed OSC then.
+        if (spec.title_locked orelse true) {
+            c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-title-locked", @ptrCast(page));
+        }
         if (spec.pinned) c.adw_tab_view_set_page_pinned(self.tab_view, page, 1);
         if (spec.color) |col_str| {
             if (parseHexRGB(col_str)) |col| self.setTabColor(page, col);
@@ -1093,18 +1099,7 @@ pub const Window = struct {
                 const pane = try self.makePane(term);
                 pane.id = pane_id;
                 pane.setSpawnArgv(argv_buf);
-                pane.win_clip_ctx = @ptrCast(self);
-                pane.win_on_clipboard = onTermClipboardSet;
-                pane.win_notify_ctx = @ptrCast(self);
-                pane.win_on_notification = onTermNotification;
-                pane.win_progress_ctx = @ptrCast(self);
-                pane.win_on_progress = onTermProgress;
-                pane.win_bell_ctx = @ptrCast(self);
-                pane.win_on_bell = onTermBell;
-                pane.win_child_ctx = @ptrCast(self);
-                pane.win_on_child_exit = onTermChildExit;
-                pane.win_cwd_ctx = @ptrCast(self);
-                pane.win_on_cwd = onTermCwdChanged;
+                self.wirePaneSinks(pane);
                 // Profile name on the pane so cycle/restore tracks it.
                 if (profile) |pr| pane.active_profile = pr.name;
                 self.applyPaneConfig(pane, .{
@@ -1197,25 +1192,7 @@ pub const Window = struct {
         // explicitly on failure so neither side outlives the other.
         errdefer pane.deinit();
 
-        // Forward terminal sinks to Window where appropriate.
-        pane.win_clip_ctx = @ptrCast(self);
-        pane.win_on_clipboard = onTermClipboardSet;
-        pane.win_notify_ctx = @ptrCast(self);
-        pane.win_on_notification = onTermNotification;
-        pane.win_progress_ctx = @ptrCast(self);
-        pane.win_on_progress = onTermProgress;
-        pane.win_bell_ctx = @ptrCast(self);
-        pane.win_on_bell = onTermBell;
-        pane.win_child_ctx = @ptrCast(self);
-        pane.win_on_child_exit = onTermChildExit;
-        pane.win_cwd_ctx = @ptrCast(self);
-        pane.win_on_cwd = onTermCwdChanged;
-        // OSC 0/1/2 titles drive the AdwTabPage title — but only
-        // until the user explicitly renames the tab (which sets the
-        // "user-locked" flag on the page). Renaming with an empty
-        // string clears the lock and lets OSC tracking resume.
-        pane.win_title_ctx = @ptrCast(self);
-        pane.win_on_title = onTermTitleChanged;
+        self.wirePaneSinks(pane);
 
         self.applyPaneConfig(pane, .{});
 
@@ -1437,6 +1414,25 @@ pub const Window = struct {
         const pane = try self.makePane(term);
         pane.id = pane_id;
         pane.setSpawnArgv(&argv);
+        self.wirePaneSinks(pane);
+
+        // Profile name on the pane so cycle/restore knows which one
+        // it spawned with.
+        if (profile) |p| pane.active_profile = p.name;
+
+        self.applyPaneConfig(pane, .{ .profile = profile });
+        try self.panes.append(self.allocator, pane);
+        try self.terminals.append(self.allocator, term);
+        return pane;
+    }
+
+    /// Wire every Window-level sink onto a fresh pane. THE single
+    /// place pane→window callbacks are connected — every pane
+    /// creation path (tab, split, layout restore, mux attach) goes
+    /// through here, so a new sink added here reaches all of them.
+    /// All handlers are pane-aware and no-op when irrelevant (e.g.
+    /// child-exit never fires for remote panes, which have no child).
+    fn wirePaneSinks(self: *Window, pane: *Pane) void {
         pane.win_clip_ctx = @ptrCast(self);
         pane.win_on_clipboard = onTermClipboardSet;
         pane.win_notify_ctx = @ptrCast(self);
@@ -1449,15 +1445,38 @@ pub const Window = struct {
         pane.win_on_child_exit = onTermChildExit;
         pane.win_cwd_ctx = @ptrCast(self);
         pane.win_on_cwd = onTermCwdChanged;
+        // OSC 0/1/2 titles drive the AdwTabPage title — but only
+        // until the user explicitly renames the tab (which sets the
+        // "user-locked" flag on the page). Renaming with an empty
+        // string clears the lock and lets OSC tracking resume.
+        pane.win_title_ctx = @ptrCast(self);
+        pane.win_on_title = onTermTitleChanged;
+    }
 
-        // Profile name on the pane so cycle/restore knows which one
-        // it spawned with.
-        if (profile) |p| pane.active_profile = p.name;
-
-        self.applyPaneConfig(pane, .{ .profile = profile });
-        try self.panes.append(self.allocator, pane);
-        try self.terminals.append(self.allocator, term);
-        return pane;
+    /// Sever a pane from the window before teardown: drop every
+    /// window-level pointer into it (search / hints / copy mode),
+    /// unlist it and its terminal, fence the terminal's sinks, and
+    /// defer the actual deinit past GTK's widget-destroy chain.
+    /// Counterpart of wirePaneSinks — the single removal path.
+    fn unlistPane(self: *Window, pane: *Pane) void {
+        if (self.search_pane == pane) self.closeSearch();
+        if (self.hints_pane == pane) self.exitHints();
+        if (self.copymode_pane == pane) self.exitCopyMode();
+        for (self.panes.items, 0..) |p, idx| {
+            if (p == pane) {
+                _ = self.panes.orderedRemove(idx);
+                break;
+            }
+        }
+        const term = pane.terminal;
+        for (self.terminals.items, 0..) |t, ti| {
+            if (t == term) {
+                _ = self.terminals.orderedRemove(ti);
+                break;
+            }
+        }
+        term.clearSinks();
+        schedulePaneTeardown(pane, term);
     }
 
     const PaneConfigOpts = struct {
@@ -2480,18 +2499,7 @@ pub const Window = struct {
         const pane = try self.makePane(term);
         pane.id = self.allocPaneId();
         errdefer pane.deinit();
-        pane.win_clip_ctx = @ptrCast(self);
-        pane.win_on_clipboard = onTermClipboardSet;
-        pane.win_notify_ctx = @ptrCast(self);
-        pane.win_on_notification = onTermNotification;
-        pane.win_progress_ctx = @ptrCast(self);
-        pane.win_on_progress = onTermProgress;
-        pane.win_bell_ctx = @ptrCast(self);
-        pane.win_on_bell = onTermBell;
-        pane.win_cwd_ctx = @ptrCast(self);
-        pane.win_on_cwd = onTermCwdChanged;
-        pane.win_title_ctx = @ptrCast(self);
-        pane.win_on_title = onTermTitleChanged;
+        self.wirePaneSinks(pane);
         // Fonts, colors, padding, palette — same push every other
         // pane-creation path gets. Must happen before the widget
         // enters the tree (realize builds the atlas from pane state).
@@ -2525,27 +2533,7 @@ pub const Window = struct {
                 c.gtk_box_append(@ptrCast(parent), pane.widget());
             }
 
-            // Same bookkeeping as closeFocusedPane: drop window-level
-            // pointers into the dying pane, unlist it, fence its
-            // sinks, defer the actual deinit past GTK's destroy chain.
-            if (self.search_pane == old) self.closeSearch();
-            if (self.hints_pane == old) self.exitHints();
-            if (self.copymode_pane == old) self.exitCopyMode();
-            for (self.panes.items, 0..) |p, idx| {
-                if (p == old) {
-                    _ = self.panes.orderedRemove(idx);
-                    break;
-                }
-            }
-            const old_term = old.terminal;
-            for (self.terminals.items, 0..) |t, ti| {
-                if (t == old_term) {
-                    _ = self.terminals.orderedRemove(ti);
-                    break;
-                }
-            }
-            old_term.clearSinks();
-            schedulePaneTeardown(old, old_term);
+            self.unlistPane(old);
             break :blk page;
         } else blk: {
             const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
@@ -2610,7 +2598,15 @@ pub const Window = struct {
 
     // ── Per-tab colours ──────────────────────────────────────────
 
-    /// Set or clear a tab's colour: a round 16×16 swatch as the
+    /// Wrap a 64×64 RGBA buffer in a GdkTexture for tab iconography
+    /// (colour swatch, progress ring). Caller unrefs.
+    fn iconTexture64(px: *const [64 * 64 * 4]u8) ?*c.GdkTexture {
+        const bytes = c.g_bytes_new(px, px.len);
+        defer c.g_bytes_unref(bytes);
+        return c.gdk_memory_texture_new(64, 64, c.GDK_MEMORY_R8G8B8A8, bytes, 64 * 4);
+    }
+
+    /// Set or clear a tab's colour: a round swatch as the
     /// page icon, plus the packed value on the GObject so layout
     /// save and `cli list` can read it back. Marker bit 1<<24
     /// distinguishes "black" from "unset".
@@ -2635,9 +2631,7 @@ pub const Window = struct {
                     px[o + 3] = @intFromFloat(255.0 * cov);
                 }
             }
-            const bytes = c.g_bytes_new(&px, px.len);
-            defer c.g_bytes_unref(bytes);
-            const tex = c.gdk_memory_texture_new(S, S, c.GDK_MEMORY_R8G8B8A8, bytes, S * 4) orelse return;
+            const tex = iconTexture64(&px) orelse return;
             c.adw_tab_page_set_icon(page, @ptrCast(@alignCast(tex)));
             c.g_object_unref(tex);
             const packed_val: usize = (1 << 24) |
@@ -2703,9 +2697,7 @@ pub const Window = struct {
                 px[o + 3] = @intFromFloat(a);
             }
         }
-        const bytes = c.g_bytes_new(&px, px.len);
-        defer c.g_bytes_unref(bytes);
-        const tex = c.gdk_memory_texture_new(S, S, c.GDK_MEMORY_R8G8B8A8, bytes, S * 4) orelse return;
+        const tex = iconTexture64(&px) orelse return;
         c.adw_tab_page_set_indicator_icon(page, @ptrCast(@alignCast(tex)));
         c.g_object_unref(tex);
         const packed_val: usize = (1 << 24) | (@as(usize, state) << 8) | percent;
@@ -3329,19 +3321,9 @@ pub const Window = struct {
             c.gtk_paned_get_type(),
         ) != 0;
         if (!is_paned) {
-            // Last pane in its tab — close the tab. Find the AdwTabPage.
-            const n = c.adw_tab_view_get_n_pages(self.tab_view);
-            var i: c_int = 0;
-            while (i < n) : (i += 1) {
-                const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
-                if (page == null) continue;
-                const child = c.adw_tab_page_get_child(page);
-                if (child == null) continue;
-                if (widgetIsAncestor(@ptrCast(child), w)) {
-                    _ = c.adw_tab_view_close_page(self.tab_view, page);
-                    return;
-                }
-            }
+            // Last pane in its tab — close the tab.
+            const page = tabPageForPane(self, target) orelse return;
+            _ = c.adw_tab_view_close_page(self.tab_view, page);
             return;
         }
         // Re-use closeFocusedPane's path by temporarily focusing the
@@ -3433,19 +3415,7 @@ pub const Window = struct {
         // BEFORE we tear `menu_arena` down.
         // The search bar / hint mode hold raw pane pointers — drop
         // them before the pane is freed.
-        if (self.search_pane == pane) self.closeSearch();
-        if (self.hints_pane == pane) self.exitHints();
-        if (self.copymode_pane == pane) self.exitCopyMode();
-        _ = self.panes.orderedRemove(found_idx.?);
-        const term = pane.terminal;
-        for (self.terminals.items, 0..) |t, ti| {
-            if (t == term) {
-                _ = self.terminals.orderedRemove(ti);
-                break;
-            }
-        }
-        term.clearSinks();
-        schedulePaneTeardown(pane, term);
+        self.unlistPane(pane);
 
         // Move focus to the first pane inside the surviving sibling
         // subtree — without this, focus can land on the now-empty
@@ -3484,6 +3454,7 @@ pub const Window = struct {
                     try std.fmt.allocPrint(arena, "#{x:0>2}{x:0>2}{x:0>2}", .{ col[0], col[1], col[2] })
                 else
                     null,
+                .title_locked = c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null,
             });
         }
         return .{ .version = 2, .tabs = try tabs.toOwnedSlice(arena) };
@@ -4238,21 +4209,11 @@ fn onTermBell(ctx: ?*anyopaque, pane: *Pane) void {
 
     if (!self.config.bell_urgent) return;
 
-    // Find the AdwTabPage whose widget tree contains this pane and
-    // mark it needs-attention (unless it's the currently selected one).
-    const n = c.adw_tab_view_get_n_pages(self.tab_view);
-    const selected = c.adw_tab_view_get_selected_page(self.tab_view);
-    var i: c_int = 0;
-    while (i < n) : (i += 1) {
-        const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
-        if (page == null or page == selected) continue;
-        const child = c.adw_tab_page_get_child(page);
-        if (child == null) continue;
-        if (widgetIsAncestor(@ptrCast(child), pane.widget())) {
-            c.adw_tab_page_set_needs_attention(page, 1);
-            return;
-        }
-    }
+    // Mark the containing tab needs-attention (unless it's the
+    // currently selected one).
+    const page = tabPageForPane(self, pane) orelse return;
+    if (page == c.adw_tab_view_get_selected_page(self.tab_view)) return;
+    c.adw_tab_page_set_needs_attention(page, 1);
 }
 
 /// OSC 7 cwd updated for `pane`. Find its AdwTabPage and rewrite
@@ -4260,14 +4221,8 @@ fn onTermBell(ctx: ?*anyopaque, pane: *Pane) void {
 /// where each tab actually is. Format: "<title>\n<cwd>".
 fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
     const self = cast.userData(Window, ctx);
-    const n = c.adw_tab_view_get_n_pages(self.tab_view);
-    var i: c_int = 0;
-    while (i < n) : (i += 1) {
-        const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
-        if (page == null) continue;
-        const child = c.adw_tab_page_get_child(page);
-        if (child == null) continue;
-        if (!widgetIsAncestor(@ptrCast(child), pane.widget())) continue;
+    {
+        const page = tabPageForPane(self, pane) orelse return;
 
         // Abbreviate $HOME → ~ so the tooltip stays compact for the
         // common case of working under your home directory. Falls
@@ -4368,18 +4323,7 @@ fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) voi
 /// re-aggregate the window-level taskbar progress.
 fn onTermProgress(ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) void {
     const self = cast.userData(Window, ctx);
-    const n = c.adw_tab_view_get_n_pages(self.tab_view);
-    var i: c_int = 0;
-    while (i < n) : (i += 1) {
-        const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
-        if (page == null) continue;
-        const child = c.adw_tab_page_get_child(page);
-        if (child == null) continue;
-        if (widgetIsAncestor(@ptrCast(child), pane.widget())) {
-            self.setTabProgress(page, state, percent);
-            break;
-        }
-    }
+    if (tabPageForPane(self, pane)) |page| self.setTabProgress(page, state, percent);
     self.updateTaskbarProgress();
 }
 
