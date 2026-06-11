@@ -4365,3 +4365,36 @@ Tests 454 → 466.
   without the field treat saved titles as renamed (= old
   behaviour). Verified live: default-layout names survive zsh,
   fresh tabs follow OSC 0.
+
+## 2026-06-11 (later): mux context menu + OSC gap sweep
+
+- Remote (mux) panes get a context-menu section: Detach Session /
+  Rename Session… / Kill Session. Rows hidden on local panes (menu
+  binds carry remote_only; pre-popup enables, onRightClick syncs
+  row visibility off the action enabled state). Rename = new wire
+  frame 10 (append-only): daemon validates+dedupes, GUI commits
+  remote.session + retitles the tab ONLY on the OK reply
+  (pending_rename). Also `sketerm mux rename <old> <new>` and `r`
+  in the TUI picker (cooked-mode inline prompt). Remote.host now
+  stored on the terminal for title rebuilds.
+- OSC 133 C/D command zones: stable line IDs bound the last
+  command's output (survives scrollback). "Copy Command Output" in
+  the context menu (greyed until available), palette entry,
+  bindable copy_command_output. Shipped shell-integration scripts
+  already emit C/D;exit. D's exit code recorded (last_cmd_exit).
+- OSC 52 READ behind `clipboard_read = allow` (default deny =
+  immediate empty reply so apps don't hang). Allowed path: async
+  GDK read; reply ctx rides the DrainHandle so pane teardown
+  mid-read is detected. Verified live both ways (python pty probe;
+  NOTE: on Wayland the read only resolves while the window has
+  focus — no offer otherwise, reply degrades to empty).
+- OSC 99 kitty notifications subset: chunked title/body, base64,
+  id-switch discards unfinished; icon/button kinds dropped.
+- OSC 4 applies multiple idx;spec pairs (pywal), OSC 104 takes an
+  index list, and onOsc no longer drops semicolon-less payloads —
+  bare 104/110/111/112 (the standard reset-all forms) worked only
+  with a trailing ';' before.
+- Test-harness gotcha (cost ~20 min): capturing a terminal reply
+  with `timeout 2 cat -v > file` loses everything — cat's stdio
+  buffer dies with the SIGTERM. Use a python pty probe (raw mode +
+  select) or `dd bs=1`.

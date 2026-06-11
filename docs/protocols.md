@@ -116,15 +116,17 @@ htop and btop need the report subset for accurate rendering.
 | Number | Purpose                                   | v1 |
 |--------|-------------------------------------------|----|
 | 0, 2   | Set window/icon title                     | ✓ (per pane) |
-| 4      | Color palette query + set                 | ✓ |
+| 4      | Color palette query + set (multi-pair)    | ✓ |
 | 7      | Report working directory (file://…)       | ✓ |
 | 8      | Hyperlinks                                | ✓ |
 | 10/11/12 | Default fg / bg / cursor color (query+set)| ✓ |
-| 52     | Clipboard set/get                         | ✓ (get gated; 1 MB cap) |
-| 104    | Reset color palette                       | ✓ |
-| 110/111/112 | Reset fg/bg/cursor                   | ✓ |
-| 133    | Shell integration (FinalTerm prompt marks)| ✓ (records A-marks; Ctrl+Shift+Up/Down navigates) |
+| 52     | Clipboard set + read query                | ✓ (read gated behind `clipboard_read = allow`, empty reply when denied; 1 MB cap both ways) |
+| 99     | Kitty desktop notifications               | ✓ (chunked title/body, base64; icon/button payload kinds dropped) |
+| 104    | Reset color palette (bare / index list)   | ✓ |
+| 110/111/112 | Reset fg/bg/cursor (incl. bare form) | ✓ |
+| 133    | Shell integration (FinalTerm prompt marks)| ✓ (A-marks navigate via Ctrl+Shift+Up/Down; C/D bound the command-output zone behind "Copy Command Output" / `copy_command_output`) |
 | 9      | iTerm2 desktop notification               | ✓ |
+| 9;4    | ConEmu progress (tab ring + taskbar)      | ✓ |
 | 777    | Desktop notifications (notify variant)    | ✓ |
 | 22     | Set X11 / GTK mouse-cursor shape          | ✓ |
 | 50     | Font query (set is no-op)                 | ✓ |
