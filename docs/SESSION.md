@@ -4528,3 +4528,35 @@ Tests 454 → 466.
 - Already existed, no work needed: quake mode (--toggle), bell options
   (bell_audible/visible/urgent). Skipped deliberately: configurable
   hint patterns (needs a regex engine; scanners cover URL/path/hash).
+
+## 2026-06-11 (late): per-pane shaders + durable-pane auto-reconnect
+
+- Per-pane shaders (25e5599): Pane owns an optional ShaderSource
+  (shader_own + shader_own_src + custom_shader_path); resolution is
+  user pick > profile.custom_shader > global, applied at the END of
+  applyPaneConfig (NOT makePane — no profile in scope there; makePane
+  only wires shader_default_source). custom_shader_user makes an
+  explicit pick sticky across config reloads. UI: context-menu
+  "Pane Shader…" (GtkFileDialog, ShaderPickCtx validates the pane is
+  still listed before applying) + "Clear Pane Shader" (re-runs
+  applyPaneConfigByName so profile/global comes back). Layout saves
+  the pick (PaneSpec.custom_shader, user picks only). Verified live:
+  broken profile shader prints compile-failed and keeps rendering;
+  valid one is silent with an interactive pane.
+- Durable panes in layouts (same commit): PaneSpec.mux_session/
+  mux_host; collectTree records terminal.remote; buildTreeWidget
+  routes mux specs through restoreMuxPane = attach, or on
+  "no such session" spawn UNDER THE SAME NAME then attach
+  (resume-or-create). makeRemotePaneFromSnap factored out of
+  attachMux (pane build without tab page — restore places the widget
+  in the split tree itself). Connect failure falls through to the
+  plain PTY spawn with a stderr note. Verified live in an isolated
+  XDG_RUNTIME_DIR/XDG_STATE_HOME rig: marker survived GUI restart
+  (attach path); killing the daemon and restoring recreated the
+  session under the same name with a working shell (create path).
+- TEST RIG NOTES: overriding XDG_RUNTIME_DIR breaks Wayland — set
+  WAYLAND_DISPLAY=/run/user/1000/wayland-0 (absolute path works).
+  Profile-feature tests MUST also override XDG_STATE_HOME: otherwise
+  startup restores last.json and panes get profile="" (bit me — the
+  "missing" compile error was a test-setup bug, not a code bug).
+  Kill test daemons via lsof -t on their mux.sock, never pkill.
