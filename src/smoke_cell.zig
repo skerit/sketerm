@@ -240,6 +240,48 @@ pub fn main() !u8 {
         std.debug.print("smoke-cell: FAIL — command-zone gutter bar not drawn\n", .{});
         return 6;
     }
+
+    // Custom-shader pass: re-render the scene through a channel-
+    // swapping user shader (r<->b). The red gutter bar must come out
+    // blue — proves the offscreen detour + user program both ran.
+    {
+        const ShaderPass = @import("render/shader_pass.zig").ShaderPass;
+        const ShaderSource = @import("render/shader_pass.zig").Source;
+        const user_src =
+            \\void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+            \\    vec4 t = texture(iChannel0, fragCoord / iResolution.xy);
+            \\    fragColor = vec4(t.b, t.g, t.r, 1.0);
+            \\}
+        ;
+        var shader_src = ShaderSource{ .src = user_src, .generation = 1 };
+        var sp = ShaderPass{ .source = &shader_src };
+        if (!sp.begin(allocator, W, H)) {
+            std.debug.print("smoke-cell: FAIL — shader pass begin/compile failed\n", .{});
+            return 7;
+        }
+        c.glViewport(0, 0, W, H);
+        c.glClearColor(0.05, 0.05, 0.08, 1.0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        cell_pass.draw(atlas.?, W, H);
+        grid_pass.draw(atlas.?, W, H);
+        sp.finish(W, H, 0.5);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        var gutter_blue: usize = 0;
+        var j: usize = 0;
+        while (j < fb_bytes) : (j += 4) {
+            const r: i32 = fb[j + 0];
+            const g: i32 = fb[j + 1];
+            const b: i32 = fb[j + 2];
+            if ((j / 4) % @as(usize, @intCast(W)) < 3 and b > g + 30 and b > r + 30) gutter_blue += 1;
+        }
+        std.debug.print("smoke-cell: shader gutter_blue={d}\n", .{gutter_blue});
+        if (gutter_blue < 3) {
+            std.debug.print("smoke-cell: FAIL — custom shader did not transform the frame\n", .{});
+            return 8;
+        }
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }

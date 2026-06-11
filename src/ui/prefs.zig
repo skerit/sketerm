@@ -174,6 +174,14 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addColorRow(@ptrCast(@alignCast(bgi_group)), ctx, "Gradient to", &ctx.cfg.background_gradient_to);
     addSpinRowF32Step(@ptrCast(@alignCast(bgi_group)), ctx, "Gradient angle", "0 = left to right, 90 = top to bottom.", 0.0, 360.0, 15.0, 1, &ctx.cfg.background_gradient_angle, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(bgi_group)));
+
+    // Custom post-process shader.
+    const shader_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(shader_group)), "Custom shader");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(shader_group)), "Shadertoy-style fragment shader applied to the whole frame (CRT, glow, …). Compile errors disable it — the terminal keeps rendering.");
+    addEntryRowString(@ptrCast(@alignCast(shader_group)), ctx, "Shader file (GLSL, mainImage)", "", &ctx.cfg.custom_shader, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(shader_group)), ctx, "Animate", "Redraw continuously so iTime advances.", &ctx.cfg.custom_shader_animation, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(shader_group)));
 }
 
 // ── Generic row helpers ─────────────────────────────────────────

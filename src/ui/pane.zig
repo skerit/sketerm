@@ -15,6 +15,7 @@ const GridPass = @import("../render/grid_pass.zig").GridPass;
 const CellPass = @import("../render/cell_pass.zig").CellPass;
 const ImagePass = @import("../render/image_pass.zig").ImagePass;
 const BgPass = @import("../render/bg_pass.zig").BgPass;
+const ShaderPass = @import("../render/shader_pass.zig").ShaderPass;
 const ImageStore = @import("../grid/image_store.zig").Store;
 const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -48,6 +49,9 @@ pub const Pane = struct {
     cell_pass: CellPass,
     image_pass: ImagePass = ImagePass.init(),
     bg_pass: BgPass = .{},
+    shader_pass: ShaderPass = .{},
+    /// iTime epoch for the custom shader (monotonic µs; 0 = unset).
+    shader_epoch_us: i64 = 0,
     image_store: ImageStore,
     allocator: std.mem.Allocator,
     input_ctx: ?*input.Ctx = null,
@@ -693,6 +697,14 @@ pub const Pane = struct {
         );
     }
 
+    /// Re-arm rendering after a custom_shader config change: queue a
+    /// frame (recompile happens lazily in onRender) and make sure the
+    /// tick is alive so animation can self-sustain via `dirty`.
+    pub fn updateShaderTick(self: *Pane) void {
+        self.ensureTickRunning();
+        c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    }
+
     /// Set the per-pane title bar text. Called from the on_title sink
     /// when the running shell emits an OSC 0/1/2 escape. Idempotent
     /// when the new text matches the cached value. The label is set
@@ -877,6 +889,7 @@ fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         self.cell_pass.forgetGL();
         self.image_pass.forgetGL();
         self.bg_pass.forgetGL();
+        self.shader_pass.forgetGL();
         self.image_store.forgetGL();
         return;
     }
@@ -884,6 +897,7 @@ fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     self.cell_pass.releaseGL();
     self.image_pass.releaseGL();
     self.bg_pass.releaseGL();
+    self.shader_pass.releaseGL();
     self.image_store.releaseGL();
     if (self.atlas) |a| a.releaseGL();
 }
@@ -912,6 +926,7 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     self.cell_pass.forgetGL();
     self.image_pass.forgetGL();
     self.bg_pass.forgetGL();
+    self.shader_pass.forgetGL();
     self.image_store.forgetGL();
 
     // Resolution order: explicit Pane.font_path → Pane.font_family
@@ -960,6 +975,11 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     const scale = c.gtk_widget_get_scale_factor(@ptrCast(area));
     const phys_w: c_int = w * scale;
     const phys_h: c_int = h * scale;
+
+    // Custom-shader detour: render the whole scene into an offscreen
+    // texture; finish() maps it through the user shader at the end.
+    const shader_on = self.shader_pass.active() and
+        self.shader_pass.begin(self.allocator, phys_w, phys_h);
 
     c.glViewport(0, 0, phys_w, phys_h);
     c.glClearColor(self.grid_pass.default_bg[0], self.grid_pass.default_bg[1], self.grid_pass.default_bg[2], self.grid_pass.default_bg[3]);
@@ -1023,6 +1043,13 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
         self.image_pass.drawZ(&self.image_store, phys_w, phys_h, .above);
         if (profile.enabled) img_ns += @intCast(profile.nanoTimestamp() - t_img);
     }
+    if (shader_on) {
+        const now_us = c.g_get_monotonic_time();
+        if (self.shader_epoch_us == 0) self.shader_epoch_us = now_us;
+        const time_s: f32 = @as(f32, @floatFromInt(now_us - self.shader_epoch_us)) / 1e6;
+        self.shader_pass.finish(phys_w, phys_h, time_s);
+    }
+
     if (profile.enabled) {
         profile.record(.image_pass, img_ns);
         profile.record(.onrender_total, @intCast(profile.nanoTimestamp() - t_total));
@@ -1318,6 +1345,13 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
     if (screen.bell_at_us > 0) {
         const since_bell = now - screen.bell_at_us;
         if (since_bell < 200_000) screen.dirty = true;
+    }
+
+    // Custom-shader animation: redraw every frame so iTime advances.
+    if (self.shader_pass.active()) {
+        if (self.shader_pass.source) |src| {
+            if (src.animate) screen.dirty = true;
+        }
     }
 
     // Animation: advance frames in the kitty-graphics manager. When

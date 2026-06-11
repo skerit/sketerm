@@ -15,6 +15,7 @@ const clipboard = @import("clipboard.zig");
 const Config = @import("../config.zig").Config;
 const ipc_server = @import("../ipc/server.zig");
 const bg_pass_mod = @import("../render/bg_pass.zig");
+const shader_pass_mod = @import("../render/shader_pass.zig");
 const ipc_protocol = @import("../ipc/protocol.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
 const Screen = @import("../grid/screen.zig").Screen;
@@ -148,6 +149,9 @@ pub const Window = struct {
     /// pane). Panes hold a pointer; refreshBgSource mutates + bumps
     /// the generation.
     bg_source: bg_pass_mod.Source = .{},
+    /// Custom post-process shader source (one file read shared by
+    /// every pane). `src` is window-allocator-owned.
+    shader_source: shader_pass_mod.Source = .{},
     /// Socket path, computed at init (before any spawn) so every
     /// child gets SKETERM_SOCKET even if the listener starts later.
     ipc_path: ?[:0]u8 = null,
@@ -475,6 +479,9 @@ pub const Window = struct {
         // Background image / gradient layer.
         self.refreshBgSource();
 
+        // Custom post-process shader.
+        self.refreshShaderSource();
+
         // Remote-control socket (sketerm cli). Failure is non-fatal:
         // the terminal works fine without scripting.
         if (ipc_server.defaultSocketPath(allocator)) |sock_path| {
@@ -542,6 +549,7 @@ pub const Window = struct {
         if (self.closed_arena) |*a| a.deinit();
         if (self.ipc) |srv| srv.deinit(); // frees ipc_path (server owns it)
         if (self.bg_source.pixels) |px| c.stbi_image_free(px);
+        if (self.shader_source.src) |s| self.allocator.free(s);
         self.config.deinit();
         self.allocator.destroy(self);
     }
@@ -1345,6 +1353,8 @@ pub const Window = struct {
         pane.middle_click_action = self.config.mouse_middle_click;
         pane.right_click_action = self.config.mouse_right_click;
         pane.bg_pass.source = &self.bg_source;
+        pane.shader_pass.source = &self.shader_source;
+        pane.updateShaderTick();
         // Renderer bold flags.
         pane.grid_pass.allow_bold = self.config.allow_bold;
         pane.grid_pass.bold_is_bright = self.config.bold_is_bright;
@@ -2391,6 +2401,13 @@ pub const Window = struct {
             self.refreshBgSource();
         }
 
+        // Custom shader: re-read the file only when its keys moved.
+        if (!std.mem.eql(u8, old_cfg.custom_shader, self.config.custom_shader) or
+            old_cfg.custom_shader_animation != self.config.custom_shader_animation)
+        {
+            self.refreshShaderSource();
+        }
+
         // Push into every pane.
         const eff = self.resolveDefaultColors();
         for (self.panes.items) |p| {
@@ -2889,6 +2906,38 @@ pub const Window = struct {
             self.bg_source.mode = .gradient;
         }
         self.bg_source.generation +%= 1;
+    }
+
+    /// (Re-)read the custom_shader file into shader_source. Call on
+    /// startup and whenever a custom_shader* key may have changed.
+    fn refreshShaderSource(self: *Window) void {
+        if (self.shader_source.src) |s| {
+            self.allocator.free(s);
+            self.shader_source.src = null;
+        }
+        self.shader_source.animate = self.config.custom_shader_animation;
+
+        const path = self.config.custom_shader;
+        if (path.len > 0) blk: {
+            var path_z: [4096]u8 = undefined;
+            if (path.len >= path_z.len) break :blk;
+            @memcpy(path_z[0..path.len], path);
+            path_z[path.len] = 0;
+            const fp = c.fopen(@ptrCast(&path_z), "rb") orelse {
+                std.debug.print("sketerm: custom_shader not readable: {s}\n", .{path});
+                break :blk;
+            };
+            defer _ = c.fclose(fp);
+            const max_bytes: usize = 256 * 1024;
+            const buf = self.allocator.alloc(u8, max_bytes) catch break :blk;
+            const n = c.fread(buf.ptr, 1, buf.len, fp);
+            if (n == 0) {
+                self.allocator.free(buf);
+                break :blk;
+            }
+            self.shader_source.src = self.allocator.realloc(buf, n) catch buf[0..n];
+        }
+        self.shader_source.generation +%= 1;
     }
 
     // ── Per-tab colours ──────────────────────────────────────────

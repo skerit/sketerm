@@ -308,6 +308,14 @@ pub const Config = struct {
     /// Gradient direction in degrees: 0 = left→right, 90 = top→bottom.
     background_gradient_angle: f32 = 90,
 
+    /// Custom post-process fragment shader (shadertoy-style file
+    /// defining mainImage; iChannel0 = the rendered frame). Empty =
+    /// off. Compile errors disable the pass, never blank the pane.
+    custom_shader: []const u8 = "",
+    /// Redraw continuously so iTime advances (CRT flicker, glow…).
+    /// Off = the shader still runs but only on normal damage.
+    custom_shader_animation: bool = false,
+
     /// Custom keybindings. List of (action_name, accelerator) pairs
     /// parsed from `keybind.<action> = <accel>` lines. An entry with
     /// an empty accel unbinds that action; a missing entry inherits
@@ -368,6 +376,7 @@ pub const Config = struct {
         out.font_features = try arena.dupe(u8, self.font_features);
         out.hint_editor = try arena.dupe(u8, self.hint_editor);
         out.background_image = try arena.dupe(u8, self.background_image);
+        out.custom_shader = try arena.dupe(u8, self.custom_shader);
         if (self.shell) |s| out.shell = try arena.dupe(u8, s);
         out.scheme = try arena.dupe(u8, self.scheme);
         out.term_env = try arena.dupe(u8, self.term_env);
@@ -638,6 +647,10 @@ pub const Config = struct {
             try w.print("background_image = {s}\n", .{self.background_image});
         if (self.background_image_opacity != 0.3)
             try w.print("background_image_opacity = {d:.2}\n", .{self.background_image_opacity});
+        if (self.custom_shader.len > 0)
+            try w.print("custom_shader = {s}\n", .{self.custom_shader});
+        if (self.custom_shader_animation)
+            try w.print("custom_shader_animation = true\n", .{});
         if (!eqColor(self.background_gradient_from, .{ 0, 0, 0, 0 }))
             try writeColor(w, "background_gradient_from", self.background_gradient_from);
         if (!eqColor(self.background_gradient_to, .{ 0, 0, 0, 0 }))
@@ -1041,6 +1054,10 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.background_image = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "background_image_opacity")) {
         cfg.background_image_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
+    } else if (std.mem.eql(u8, key, "custom_shader")) {
+        cfg.custom_shader = try expandTilde(arena, value);
+    } else if (std.mem.eql(u8, key, "custom_shader_animation")) {
+        cfg.custom_shader_animation = try parseBool(value);
     } else if (std.mem.eql(u8, key, "background_gradient_from")) {
         cfg.background_gradient_from = try parseColor(value);
     } else if (std.mem.eql(u8, key, "background_gradient_to")) {
