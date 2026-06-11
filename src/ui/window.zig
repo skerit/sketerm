@@ -1705,9 +1705,56 @@ pub const Window = struct {
         const pane = self.focusedPane() orelse return;
         const dialog = c.gtk_file_dialog_new();
         c.gtk_file_dialog_set_title(dialog, "Choose Pane Shader (GLSL, shadertoy mainImage)");
+        // Start where the user will actually find shaders: the
+        // pane's current pick, else the shipped presets directory.
+        if (pane.custom_shader_path) |cur| {
+            var buf: [4096]u8 = undefined;
+            if (std.fmt.bufPrintZ(&buf, "{s}", .{cur})) |z| {
+                const gf = c.g_file_new_for_path(z.ptr);
+                c.gtk_file_dialog_set_initial_file(dialog, gf);
+                c.g_object_unref(gf);
+            } else |_| {}
+        } else if (shaderPresetDirZ()) |dir| {
+            const gf = c.g_file_new_for_path(dir);
+            c.gtk_file_dialog_set_initial_folder(dialog, gf);
+            c.g_object_unref(gf);
+        }
         const ctx = self.allocator.create(ShaderPickCtx) catch return;
         ctx.* = .{ .win = self, .pane = pane };
         c.gtk_file_dialog_open(dialog, @ptrCast(self.app_window), null, @ptrCast(&onShaderPicked), @ptrCast(ctx));
+    }
+
+    /// Directory holding the shipped CRT shader presets, or null.
+    /// Same resolution order as the shell-integration scripts:
+    /// installed share dir next to the exe → repo data/ (dev tree)
+    /// → /usr/share. Resolved once, cached for the process.
+    fn shaderPresetDirZ() ?[*:0]const u8 {
+        const S = struct {
+            var buf: [4096]u8 = undefined;
+            var resolved: ?[*:0]const u8 = null;
+            var done: bool = false;
+        };
+        if (S.done) return S.resolved;
+        S.done = true;
+        var exe_buf: [4096]u8 = undefined;
+        const n = c.readlink("/proc/self/exe", &exe_buf, exe_buf.len - 1);
+        if (n > 0) {
+            const exe_dir = std.fs.path.dirname(exe_buf[0..@intCast(n)]) orelse "/usr/bin";
+            const candidates = [_][]const u8{
+                "/../share/sketerm/shaders",
+                "/../../data/shaders",
+            };
+            for (candidates) |suffix| {
+                const cand = std.fmt.bufPrintZ(&S.buf, "{s}{s}", .{ exe_dir, suffix }) catch continue;
+                if (c.access(cand.ptr, c.R_OK) == 0) {
+                    S.resolved = cand.ptr;
+                    return S.resolved;
+                }
+            }
+        }
+        const sys = std.fmt.bufPrintZ(&S.buf, "/usr/share/sketerm/shaders", .{}) catch return null;
+        if (c.access(sys.ptr, c.R_OK) == 0) S.resolved = sys.ptr;
+        return S.resolved;
     }
 
     fn clearPaneShader(self: *Window) void {
