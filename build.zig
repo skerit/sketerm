@@ -294,6 +294,11 @@ pub fn build(b: *std.Build) void {
     configureSysDeps(b, smoke_cell_mod, cbindings_mod);
     smoke_cell_mod.addImport("build_options", glib_opts_mod);
     smoke_cell_mod.linkSystemLibrary("EGL", .{});
+    // The shipped CRT shader, embedded so the smoke test compiles
+    // and runs the REAL file (data/ is outside the module root).
+    smoke_cell_mod.addAnonymousImport("crt_amber_glsl", .{
+        .root_source_file = b.path("data/shaders/crt-amber.glsl"),
+    });
     const smoke_cell = b.addExecutable(.{
         .name = "sketerm-smoke-cell",
         .root_module = smoke_cell_mod,

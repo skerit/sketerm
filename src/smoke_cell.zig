@@ -282,6 +282,49 @@ pub fn main() !u8 {
         }
     }
 
+    // Shipped CRT shader: compile + run the real file (embedded at
+    // build time) and assert the output is phosphor-amber — warm
+    // pixels where text was, black bezel in the curved-off corner.
+    {
+        const ShaderPass = @import("render/shader_pass.zig").ShaderPass;
+        const ShaderSource = @import("render/shader_pass.zig").Source;
+        const crt_src = @embedFile("crt_amber_glsl");
+        var shader_src = ShaderSource{ .src = crt_src, .generation = 1 };
+        var sp = ShaderPass{ .source = &shader_src };
+        if (!sp.begin(allocator, W, H)) {
+            std.debug.print("smoke-cell: FAIL — crt-amber.glsl failed to compile\n", .{});
+            return 9;
+        }
+        c.glViewport(0, 0, W, H);
+        c.glClearColor(0.05, 0.05, 0.08, 1.0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        cell_pass.draw(atlas.?, W, H);
+        grid_pass.draw(atlas.?, W, H);
+        sp.finish(W, H, 0.5);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        var amber: usize = 0;
+        var corner_dark = true;
+        var j: usize = 0;
+        while (j < fb_bytes) : (j += 4) {
+            const r: i32 = fb[j + 0];
+            const g: i32 = fb[j + 1];
+            const b: i32 = fb[j + 2];
+            // Amber phosphor: r > g > b with real brightness.
+            if (r > 60 and r > g and g > b + 10) amber += 1;
+        }
+        // Corner pixel sits outside the curved tube → pure black.
+        const cr = fb[0];
+        const cg = fb[1];
+        const cb = fb[2];
+        if (cr > 8 or cg > 8 or cb > 8) corner_dark = false;
+        std.debug.print("smoke-cell: crt amber={d} corner_dark={}\n", .{ amber, corner_dark });
+        if (amber < 50 or !corner_dark) {
+            std.debug.print("smoke-cell: FAIL — crt-amber shader output wrong\n", .{});
+            return 10;
+        }
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }
