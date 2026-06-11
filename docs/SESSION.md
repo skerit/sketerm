@@ -4288,3 +4288,22 @@ Tests 454 → 466.
   flushed first). Images survive detach/reattach.
 - smoke-mux gained an image stage covering the whole loop
   headlessly. Tests 466 -> 470.
+
+## 2026-06-11 (later): first real-server shakeout — SIGILL fix
+
+- Jelle's first real `sketerm mux archdev` failed: the scp'd daemon
+  died with SIGILL on the server. Root cause: ReleaseFast targets
+  the build host's CPU (Zen 4, AVX-512); archdev is Zen 2.
+- New `zig build mux-portable`: baseline CPU + static musl, one
+  binary for any x86_64 Linux regardless of CPU/libc. Packaged at
+  /usr/lib/sketerm/sketerm-mux-portable; REMOTE.md now leads with
+  it and warns against copying /usr/bin/sketerm-mux.
+- Mux-side binaries now translate a lean vendor/cimport_core.h
+  (the GTK set only translates against native glibc). musl quirks:
+  SIG_IGN macro fails translate-c (Zig-side constant now), struct
+  timespec has zero-width padding bitfields (predefined via musl's
+  alltypes guard; 64-bit only).
+- ssh-transport failure hint rewritten to point at the diagnosis
+  command (`ssh <host> sketerm-mux --proxy`) and the real causes.
+- Verified on archdev: portable binary runs, hello→welcome probe
+  round-trips through --proxy on the Zen 2.
