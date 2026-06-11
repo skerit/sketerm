@@ -4307,3 +4307,24 @@ Tests 454 → 466.
   command (`ssh <host> sketerm-mux --proxy`) and the real causes.
 - Verified on archdev: portable binary runs, hello→welcome probe
   round-trips through --proxy on the Zen 2.
+
+## 2026-06-11 (later): OSC 9;4 progress reporting
+
+- Jelle's remote zig build spammed notifications saying "4;1;7":
+  ConEmu progress (OSC 9;4;st;pr) colliding with the iTerm2/urxvt
+  notification meaning of OSC 9. Screen now strictly parses the
+  4; form (state 0-4, percent clamped; malformed falls back to
+  notification) into a new on_progress sink.
+- Tab: 16x16 progress ring drawn into the AdwTabPage INDICATOR
+  icon (the regular icon stays the tab-colour swatch). Blue arc
+  from 12 o'clock; red=error, amber=paused, 3/4 ring for
+  indeterminate. Packed state on the GObject mirrors the
+  tab-colour trick.
+- Taskbar: window-level aggregate (mean percent, any-error →
+  urgent) published as the com.canonical.Unity.LauncherEntry
+  Update D-Bus signal (KDE task manager, docks). Deduplicated;
+  re-aggregated on page close so a dead tab can't pin the value.
+- Works over the mux for free (OSC rides the event stream) —
+  remote builds show progress on the local tab.
+- Verified live: dbus-monitor showed 0.42 → 0.53+urgent → clear;
+  screenshots confirmed blue 42% and red 65% rings. Tests 471.
