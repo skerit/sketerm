@@ -4472,3 +4472,59 @@ Tests 454 → 466.
   the user is active. Use IPC-driveable surfaces instead (that's
   what `cli action` is for). Also: Belgian AZERTY — ydotool keycode
   30='q', 16='a'.
+
+## 2026-06-11 (evening): survey completion — blocks, shaders, multi-window, auto-integration
+
+- Command-block UX (4c5268a): Screen.cmd_zones ring (64 CmdZone, stable
+  line-ID ranges; rows in a zone ⟺ id ∈ [start_id,end_id) since IDs are
+  birth-ordered). GridPass draws green/red gutter bars (left padding)
+  over output rows + red right-edge minimap ticks for scrolled-away
+  failures (rowForLineIdFast = binary search over scrollback). Click in
+  the gutter selects the command's output line-wise (pushes PRIMARY);
+  select_command_output action does the last zone from keyboard/palette.
+  Snapshot gained cmd_zones_hash. smoke-cell asserts the gutter pixels.
+  Zones are NOT in the mux snapshot (transient, like last_output_*) —
+  adding them means a v4 bump + daemon redeploys; deferred on purpose.
+  Gotcha rediscovered: ReleaseFast `.?` on null is UB, not a panic —
+  a wrong test "passed" into garbage instead of crashing.
+- custom_shader (65ac997): shader_pass.zig renders the frame into an
+  FBO and maps it through a user shadertoy-style mainImage shader
+  (iChannel0/iResolution/iTime/iTimeDelta/iFrame). GtkGLArea's own FBO
+  is saved/restored via GL_DRAW_FRAMEBUFFER_BINDING (it's never 0!).
+  Window owns the file read (shader_source, like bg_source); compile
+  failure disables the pass once per generation. custom_shader_animation
+  drives redraws via onTick dirty. smoke-cell runs a channel-swap shader
+  and asserts the gutter bar comes back blue.
+- Detachable tabs (006450c): tab drag-out + detach_tab action.
+  create-window spawns a secondary Window (clone of config, NO IPC
+  socket — pid-keyed path would clobber the primary's). page-attached
+  adopts panes (disownPane from source + wirePaneSinks + applyPaneConfig
+  on dest; widget→Pane via g_object_data "sketerm-pane" on the GLArea).
+  page-detached defers close-vs-transfer ONE idle: adopted pages have no
+  panes left in the source lists so collectAndFreePanes no-ops; the page
+  is g_object_ref'd across the idle so the child tree stays walkable.
+  Secondary windows close when empty; primary respawns a shell; closing
+  the primary quits the app (it owns IPC/quake/layout). Layout save
+  still persists the primary only — secondary tabs are lost on quit
+  (durable mux tabs survive daemon-side anyway). Verified over IPC:
+  detach (split tab, both shells live), last-tab detach (respawn), close
+  regression, clean 3-window shutdown.
+- Search minimap ticks (1fd0e4f): every match = amber tick on the right
+  edge, active = orange; same coordinate mapping as the zone ticks.
+- Auto shell-integration (acc55fa): zsh via ZDOTDIR shim (.zshenv
+  restores user ZDOTDIR, chains real .zshenv, loads integration at
+  first precmd), fish via XDG_DATA_DIRS vendor_conf.d shim (strips
+  itself from the var). pty.zig SpawnOpts.shell_integration; Window
+  resolves the script dir (env override > exe-relative share > repo
+  data/ > /usr/share). shell_integration = off disables. Scripts moved
+  to data/shell-integration/ (installed layout == repo layout).
+  FOUND REAL BUGS by exercising it: (1) fish single quotes treat \\ as
+  an escape, so the script's '\e\\\e]' collapsed and leaked literal
+  "e]133;A" into the grid on EVERY prompt — fish OSC now ends with BEL;
+  (2) fish ≥ 4.0 emits OSC 7 + 133 natively (with exit codes) — our
+  hooks self-disable there or every mark (and every cmd zone) doubles.
+  Jelle's shell is FISH (not zsh) — his command blocks come from fish's
+  native marks, via the parser's existing 133 handling.
+- Already existed, no work needed: quake mode (--toggle), bell options
+  (bell_audible/visible/urgent). Skipped deliberately: configurable
+  hint patterns (needs a regex engine; scanners cover URL/path/hash).
