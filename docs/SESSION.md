@@ -4328,3 +4328,21 @@ Tests 454 → 466.
   remote builds show progress on the local tab.
 - Verified live: dbus-monitor showed 0.42 → 0.53+urgent → clear;
   screenshots confirmed blue 42% and red 65% rings. Tests 471.
+
+## 2026-06-11 (later): mux TUI takeover + durable-pane config
+
+- sketerm mux attach/new from inside a pane now REPLACES that pane
+  (tmux-attach semantics) instead of opening a tab: guiCommand
+  sends SKETERM_PANE_ID, attachMux(takeover) swaps the new pane
+  into the old one's box/paned slot and defers teardown via
+  schedulePaneTeardown. Outside a pane: new tab as before.
+- attachMuxTab was a 4th pane-creation path missing
+  applyPaneConfig — durable panes got default font size/colors/
+  palette. Now routed through the shared helper.
+- Progress ring + tab colour swatch render 64x64 supersampled
+  with soft radial/angular edges (16px hard-edge circles were
+  visibly lumpy).
+- Verified live: takeover in a split slot and a single-pane tab
+  (tab count unchanged, title rewritten, sibling row count
+  matches => font correct), ring screenshot smooth, progress
+  over a durable session (OSC rides the mux event stream).
