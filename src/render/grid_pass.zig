@@ -634,6 +634,34 @@ pub const GridPass = struct {
             }
         }
 
+        // Search-match ticks on the same right-edge minimap: every
+        // match across the whole buffer, amber; the active one
+        // orange. Search rows are display coords (negative =
+        // scrollback), same mapping as the failed-command ticks.
+        if (!screen.use_alt and screen.search_highlights.len > 0 and self.canvas_w > 8) {
+            const total_rows: f32 = @floatFromInt(sb_count + screen.rows);
+            if (total_rows > 0) {
+                for (screen.search_highlights, 0..) |m, i| {
+                    const buf_pos: f32 = @floatFromInt(m.row + @as(i32, @intCast(sb_count)));
+                    const frac = std.math.clamp(buf_pos / total_rows, 0.0, 1.0);
+                    const ty = frac * (self.canvas_h - 4);
+                    const is_active = screen.search_active_idx == @as(i32, @intCast(i));
+                    const color: [4]f32 = if (is_active)
+                        .{ 1.0, 0.55, 0.10, 0.95 }
+                    else
+                        .{ 1.0, 0.85, 0.10, 0.65 };
+                    try self.pushQuad(
+                        .{ self.canvas_w - 4, ty },
+                        .{ 3, 4 },
+                        .{ 0, 0 },
+                        .{ 0, 0 },
+                        color,
+                        0.0,
+                    );
+                }
+            }
+        }
+
         // Auto-detected URL underlines. Per-row scan results live in
         // `row_url_matches`; rows whose cache is still valid skip the
         // O(cols) `scanRow` call and just re-emit cached matches. The
