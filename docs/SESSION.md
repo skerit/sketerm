@@ -4818,3 +4818,20 @@ Tests 454 → 466.
 - NOTE: pre-existing harmless startup Gtk-CRITICAL
   (gtk_gl_area_queue_render before realize) confirmed present on
   r662 too — not from this work.
+
+## 2026-06-12: dither the shader output (kills vignette banding)
+
+- Vignette (and any smooth gradient: glow falloff, the inactive-dim
+  ramp) banded because the output framebuffer is 8-bit GL_RGBA8 — a
+  gentle brightness ramp on dark pixels has too few code values and
+  snaps into contour bands, worst in the dark corners, reinforced by
+  the 8-bit persistence/feedback loop.
+- Fix is dithering at the 8-bit output, not 16F targets: the final
+  present is to GtkGLArea's 8-bit default framebuffer regardless, so
+  16F would pay 2x bandwidth + need EXT_color_buffer_half_float and
+  STILL band at the present. FRAG_FOOTER now adds ~1 LSB triangular-
+  PDF noise (hash(p) - hash(p+0.5)) before the implicit 8-bit round.
+  Static per-pixel (no crawl), single scalar across rgb (grays stay
+  gray), applies to every shader + the dim-only path.
+- smoke-cell: flat darkened input (->100) now spans 99..101 across
+  the buffer, proving the dither fires. 492 tests pass.

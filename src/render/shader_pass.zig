@@ -372,14 +372,29 @@ const FRAG_HEADER =
 // The footer applies the inactive-pane dim to the shader's OUTPUT —
 // a single uniform desaturate toward luma then a uniform darken, so
 // the whole pane recedes without altering any colour relationship
-// (both default 0 = identity for a focused pane).
+// (both default 0 = identity for a focused pane) — then dithers.
+//
+// Dither: the output framebuffer is 8-bit, so any smooth low-
+// amplitude gradient (a vignette, a glow falloff, the dim ramp)
+// quantizes into visible contour bands. Adding ~1 LSB of
+// triangular-PDF noise (one hash minus another) before the implicit
+// 8-bit rounding scatters the band boundary into imperceptible
+// grain. Static per-pixel (depends only on gl_FragCoord) so it
+// doesn't crawl, and a single scalar across rgb so grays stay gray.
 const FRAG_FOOTER =
     \\
+    \\float sketerm_hash(vec2 p) {
+    \\    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    \\    p3 += dot(p3, p3.yzx + 33.33);
+    \\    return fract((p3.x + p3.y) * p3.z);
+    \\}
     \\void main() {
     \\    mainImage(sketerm_frag, v_uv * iResolution.xy);
     \\    float sketerm_luma = dot(sketerm_frag.rgb, vec3(0.2126, 0.7152, 0.0722));
     \\    sketerm_frag.rgb = mix(sketerm_frag.rgb, vec3(sketerm_luma), sketerm_dim_desat);
     \\    sketerm_frag.rgb *= (1.0 - sketerm_dim_darken);
+    \\    float sketerm_d = sketerm_hash(gl_FragCoord.xy) - sketerm_hash(gl_FragCoord.xy + 0.5);
+    \\    sketerm_frag.rgb += vec3(sketerm_d / 255.0);
     \\}
     \\
 ;

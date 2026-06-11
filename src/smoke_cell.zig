@@ -607,6 +607,22 @@ pub fn main() !u8 {
             std.debug.print("smoke-cell: FAIL — darken math wrong\n", .{});
             return 24;
         }
+        // Dither must produce per-pixel variation on this flat input
+        // (otherwise banding stays). The red channel should span more
+        // than one 8-bit level across the buffer.
+        var rmin: i32 = 255;
+        var rmax: i32 = 0;
+        var di: usize = 0;
+        while (di < fb_bytes) : (di += 4) {
+            const rv: i32 = fb[di];
+            if (rv < rmin) rmin = rv;
+            if (rv > rmax) rmax = rv;
+        }
+        std.debug.print("smoke-cell: dim dither red span {d}..{d}\n", .{ rmin, rmax });
+        if (rmax - rmin < 1) {
+            std.debug.print("smoke-cell: FAIL — dither not applied (flat output)\n", .{});
+            return 27;
+        }
         sp.releaseGL();
     }
 
