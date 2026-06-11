@@ -129,6 +129,9 @@ pub const Window = struct {
     /// child gets SKETERM_SOCKET even if the listener starts later.
     ipc_path: ?[:0]u8 = null,
     debug_events: bool = false,
+    /// Last (visible|urgent|percent) published to the taskbar via
+    /// the Unity LauncherEntry signal; dedups OSC progress floods.
+    taskbar_sent: u32 = 0xFFFF_FFFF,
     debug_images: bool = false,
     /// --hold: per-invocation exit_action override. Lives outside
     /// Config so a SIGUSR1 config reload can't clear it.
@@ -1094,6 +1097,8 @@ pub const Window = struct {
                 pane.win_on_clipboard = onTermClipboardSet;
                 pane.win_notify_ctx = @ptrCast(self);
                 pane.win_on_notification = onTermNotification;
+                pane.win_progress_ctx = @ptrCast(self);
+                pane.win_on_progress = onTermProgress;
                 pane.win_bell_ctx = @ptrCast(self);
                 pane.win_on_bell = onTermBell;
                 pane.win_child_ctx = @ptrCast(self);
@@ -1197,6 +1202,8 @@ pub const Window = struct {
         pane.win_on_clipboard = onTermClipboardSet;
         pane.win_notify_ctx = @ptrCast(self);
         pane.win_on_notification = onTermNotification;
+        pane.win_progress_ctx = @ptrCast(self);
+        pane.win_on_progress = onTermProgress;
         pane.win_bell_ctx = @ptrCast(self);
         pane.win_on_bell = onTermBell;
         pane.win_child_ctx = @ptrCast(self);
@@ -1434,6 +1441,8 @@ pub const Window = struct {
         pane.win_on_clipboard = onTermClipboardSet;
         pane.win_notify_ctx = @ptrCast(self);
         pane.win_on_notification = onTermNotification;
+        pane.win_progress_ctx = @ptrCast(self);
+        pane.win_on_progress = onTermProgress;
         pane.win_bell_ctx = @ptrCast(self);
         pane.win_on_bell = onTermBell;
         pane.win_child_ctx = @ptrCast(self);
@@ -2461,6 +2470,8 @@ pub const Window = struct {
         pane.win_on_clipboard = onTermClipboardSet;
         pane.win_notify_ctx = @ptrCast(self);
         pane.win_on_notification = onTermNotification;
+        pane.win_progress_ctx = @ptrCast(self);
+        pane.win_on_progress = onTermProgress;
         pane.win_bell_ctx = @ptrCast(self);
         pane.win_on_bell = onTermBell;
         pane.win_cwd_ctx = @ptrCast(self);
@@ -2567,6 +2578,110 @@ pub const Window = struct {
             c.adw_tab_page_set_icon(page, null);
             c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-color", null);
         }
+    }
+
+    /// Tab progress ring (OSC 9;4), drawn into the page's INDICATOR
+    /// icon so it coexists with the tab-colour swatch (which owns the
+    /// regular icon). State 0 clears. The packed value also lands on
+    /// the GObject (marker 1<<24 | state<<8 | percent) so the taskbar
+    /// aggregate can walk pages without touching panes.
+    pub fn setTabProgress(self: *Window, page: ?*c.AdwTabPage, state: u8, percent: u8) void {
+        _ = self;
+        if (state == 0) {
+            c.adw_tab_page_set_indicator_icon(page, null);
+            c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-progress", null);
+            return;
+        }
+        const color: [3]u8 = switch (state) {
+            2 => .{ 0xE0, 0x1B, 0x24 }, // error: red
+            4 => .{ 0xF5, 0xC2, 0x11 }, // paused: amber
+            else => .{ 0x35, 0x84, 0xE4 }, // normal/indeterminate: blue
+        };
+        // Indeterminate has no meaningful percent; a 3/4 ring reads
+        // as "busy" without pretending to know how far along.
+        const turn = if (state == 3)
+            0.75 * std.math.tau
+        else
+            @as(f32, @floatFromInt(percent)) / 100.0 * std.math.tau;
+        var px: [16 * 16 * 4]u8 = undefined;
+        for (0..16) |yy| {
+            for (0..16) |xx| {
+                const dx = @as(f32, @floatFromInt(xx)) - 7.5;
+                const dy = @as(f32, @floatFromInt(yy)) - 7.5;
+                const r = @sqrt(dx * dx + dy * dy);
+                const o = (yy * 16 + xx) * 4;
+                px[o + 0] = color[0];
+                px[o + 1] = color[1];
+                px[o + 2] = color[2];
+                if (r < 4.5 or r > 7.5) {
+                    px[o + 3] = 0;
+                } else {
+                    // Angle from 12 o'clock, clockwise; the unfilled
+                    // remainder stays as a faint track.
+                    var ang = std.math.atan2(dx, -dy);
+                    if (ang < 0) ang += std.math.tau;
+                    px[o + 3] = if (ang <= turn) 255 else 56;
+                }
+            }
+        }
+        const bytes = c.g_bytes_new(&px, px.len);
+        defer c.g_bytes_unref(bytes);
+        const tex = c.gdk_memory_texture_new(16, 16, c.GDK_MEMORY_R8G8B8A8, bytes, 16 * 4) orelse return;
+        c.adw_tab_page_set_indicator_icon(page, @ptrCast(@alignCast(tex)));
+        c.g_object_unref(tex);
+        const packed_val: usize = (1 << 24) | (@as(usize, state) << 8) | percent;
+        c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-progress", @ptrFromInt(packed_val));
+    }
+
+    /// Aggregate every tab's progress into one window-level value and
+    /// publish it over the Unity LauncherEntry D-Bus signal — KDE's
+    /// task manager and most docks fill the taskbar button with it.
+    /// Mean percent across active tabs (indeterminate counts as 50);
+    /// any error state raises the urgent flag. Deduplicated so OSC
+    /// floods don't spam the bus.
+    pub fn updateTaskbarProgress(self: *Window) void {
+        var total: u32 = 0;
+        var count: u32 = 0;
+        var urgent = false;
+        const n = c.adw_tab_view_get_n_pages(self.tab_view);
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
+            if (page == null) continue;
+            const v = @intFromPtr(c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-tab-progress"));
+            if (v & (1 << 24) == 0) continue;
+            const state: u8 = @truncate(v >> 8);
+            total += if (state == 3) 50 else @as(u8, @truncate(v));
+            count += 1;
+            if (state == 2) urgent = true;
+        }
+        const visible = count != 0;
+        const pct: u32 = if (visible) total / count else 0;
+        const packed_sig: u32 = (@as(u32, @intFromBool(visible)) << 16) |
+            (@as(u32, @intFromBool(urgent)) << 8) | pct;
+        if (packed_sig == self.taskbar_sent) return;
+        self.taskbar_sent = packed_sig;
+
+        const app = c.gtk_window_get_application(@ptrCast(self.app_window));
+        if (app == null) return;
+        const conn = c.g_application_get_dbus_connection(@ptrCast(app));
+        if (conn == null) return;
+        const dict_type = c.g_variant_type_new("a{sv}");
+        defer c.g_variant_type_free(dict_type);
+        var builder: c.GVariantBuilder = undefined;
+        c.g_variant_builder_init(&builder, dict_type);
+        c.g_variant_builder_add(&builder, "{sv}", "progress", c.g_variant_new_double(@as(f64, @floatFromInt(pct)) / 100.0));
+        c.g_variant_builder_add(&builder, "{sv}", "progress-visible", c.g_variant_new_boolean(@intFromBool(visible)));
+        c.g_variant_builder_add(&builder, "{sv}", "urgent", c.g_variant_new_boolean(@intFromBool(urgent)));
+        _ = c.g_dbus_connection_emit_signal(
+            conn,
+            null,
+            "/dev/sker/sketerm/launcherentry",
+            "com.canonical.Unity.LauncherEntry",
+            "Update",
+            c.g_variant_new("(sa{sv})", "application://dev.sker.sketerm.desktop", &builder),
+            null,
+        );
     }
 
     fn tabColorOf(page: *c.AdwTabPage) ?[3]u8 {
@@ -4159,6 +4274,25 @@ fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) voi
     c.g_application_send_notification(@ptrCast(app), null, notif);
 }
 
+/// OSC 9;4 progress from `pane`: drive the tab's indicator ring and
+/// re-aggregate the window-level taskbar progress.
+fn onTermProgress(ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) void {
+    const self = cast.userData(Window, ctx);
+    const n = c.adw_tab_view_get_n_pages(self.tab_view);
+    var i: c_int = 0;
+    while (i < n) : (i += 1) {
+        const page = c.adw_tab_view_get_nth_page(self.tab_view, i);
+        if (page == null) continue;
+        const child = c.adw_tab_page_get_child(page);
+        if (child == null) continue;
+        if (widgetIsAncestor(@ptrCast(child), pane.widget())) {
+            self.setTabProgress(page, state, percent);
+            break;
+        }
+    }
+    self.updateTaskbarProgress();
+}
+
 /// `win.new-tab` GAction — fires from the header-bar "+" button
 /// and is the safety net when no pane has focus.
 fn onNewTabAction(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
@@ -4394,6 +4528,10 @@ fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyop
             std.debug.print("sketerm: replacement tab spawn failed: {s}\n", .{@errorName(err)});
         };
     }
+
+    // The closed page may have carried progress; re-aggregate so the
+    // taskbar doesn't stay stuck at the dead tab's value.
+    self.updateTaskbarProgress();
 }
 
 /// Holder for `g_idle_add` deferred Pane/Terminal teardown. Heap-

@@ -83,6 +83,7 @@ pub const Terminal = struct {
     on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void = null,
     on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
     on_pointer_shape: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
+    on_progress: ?*const fn (ctx: ?*anyopaque, state: u8, percent: u8) void = null,
 
     /// Optional broadcast-typing filter. When set, every byte from
     /// USER input (keystrokes, paste, hyperlink launch) goes through
@@ -207,6 +208,7 @@ pub const Terminal = struct {
             .on_image_delete_full = sinkImageDeleteFull,
             .on_decanm = sinkDecanm,
             .on_notification = sinkNotification,
+            .on_progress = sinkProgress,
             .on_pointer_shape = sinkPointerShape,
         };
     }
@@ -392,6 +394,7 @@ pub const Terminal = struct {
             .on_image_delete_full = sinkImageDeleteFull,
             .on_decanm = sinkDecanm,
             .on_notification = sinkNotification,
+            .on_progress = sinkProgress,
             .on_pointer_shape = sinkPointerShape,
         };
 
@@ -479,6 +482,11 @@ pub const Terminal = struct {
         if (self.on_notification) |f| f(self.user_ctx, title, body);
     }
 
+    fn sinkProgress(ctx: ?*anyopaque, state: u8, pct: u8) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_progress) |f| f(self.user_ctx, state, pct);
+    }
+
     fn sinkPointerShape(ctx: ?*anyopaque, name: []const u8) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
         if (self.on_pointer_shape) |f| f(self.user_ctx, name);
@@ -498,6 +506,7 @@ pub const Terminal = struct {
         self.on_image = null;
         self.on_image_delete_full = null;
         self.on_notification = null;
+        self.on_progress = null;
         self.on_pointer_shape = null;
     }
 

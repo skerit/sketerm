@@ -63,6 +63,9 @@ pub const Pane = struct {
     /// Forward iTerm2 / OSC 777 desktop notifications.
     win_notify_ctx: ?*anyopaque = null,
     win_on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
+    /// Forward OSC 9;4 progress so Window can drive tab + taskbar.
+    win_progress_ctx: ?*anyopaque = null,
+    win_on_progress: ?*const fn (ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) void = null,
     /// Forward OSC 7 cwd updates so Window can rewrite the tab tooltip.
     win_cwd_ctx: ?*anyopaque = null,
     win_on_cwd: ?*const fn (ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void = null,
@@ -293,6 +296,7 @@ pub const Pane = struct {
         terminal.on_clipboard_set = onClipboardEvent;
         terminal.on_render_request = onRenderRequest;
         terminal.on_notification = onNotificationEvent;
+        terminal.on_progress = onProgressEvent;
         terminal.on_bell = onBellEvent;
         terminal.on_pointer_shape = onPointerShapeEvent;
 
@@ -1091,6 +1095,11 @@ fn onRenderRequest(ctx: ?*anyopaque) void {
 fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {
     const self = cast.userData(Pane, ctx);
     if (self.win_on_clipboard) |f| f(self.win_clip_ctx, text);
+}
+
+fn onProgressEvent(ctx: ?*anyopaque, state: u8, percent: u8) void {
+    const self = cast.userData(Pane, ctx);
+    if (self.win_on_progress) |f| f(self.win_progress_ctx, self, state, percent);
 }
 
 fn onNotificationEvent(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {

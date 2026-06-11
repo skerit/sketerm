@@ -364,6 +364,10 @@ pub const Screen = struct {
         on_cwd: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
         on_image: ?*const fn (ctx: ?*anyopaque, img: ImageEvent) void = null,
         on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
+        /// ConEmu progress report `OSC 9 ; 4 ; st ; pr` (emitted by
+        /// zig build, systemd, PowerShell, ...). st: 0 clear,
+        /// 1 normal, 2 error, 3 indeterminate, 4 paused; pr 0-100.
+        on_progress: ?*const fn (ctx: ?*anyopaque, state: u8, percent: u8) void = null,
         /// Kitty delete dispatch with full delete-action context.
         on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: ImageDeleteEvent) void = null,
         /// OSC 22 ; <name> — set X11 / GTK mouse-cursor shape. Names
@@ -1702,6 +1706,25 @@ pub const Screen = struct {
 
     /// OSC 4 — palette query/set. `OSC 4 ; n ; ?` queries; any
     /// other payload after the index is parsed as a color spec.
+    /// Parse a ConEmu progress payload: the part after `OSC 9 ;`.
+    /// Accepts `4`, `4;st` and `4;st;pr` with digit-only fields and
+    /// st 0-4; pr clamps to 100. Anything else returns null so the
+    /// caller can fall back to the notification meaning of OSC 9.
+    pub fn parseProgress(rest: []const u8) ?struct { state: u8, percent: u8 } {
+        if (rest.len == 0 or rest[0] != '4') return null;
+        if (rest.len == 1) return .{ .state = 0, .percent = 0 };
+        if (rest[1] != ';') return null;
+        var it = std.mem.splitScalar(u8, rest[2..], ';');
+        const state = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
+        if (state > 4) return null;
+        const percent: u8 = if (it.next()) |p|
+            @intCast(@min(std.fmt.parseInt(u32, p, 10) catch return null, 100))
+        else
+            0;
+        if (it.next() != null) return null;
+        return .{ .state = state, .percent = percent };
+    }
+
     fn handleOsc4(self: *Screen, rest: []const u8) void {
         const semi = std.mem.indexOfScalar(u8, rest, ';') orelse return;
         const idx = std.fmt.parseInt(u8, rest[0..semi], 10) catch return;
@@ -2143,7 +2166,15 @@ pub const Screen = struct {
             4 => self.handleOsc4(rest),
             8 => self.handleOsc8(rest),
             9 => {
-                // iTerm2 desktop notification: OSC 9 ; <message>.
+                // OSC 9 is two colliding extensions: ConEmu progress
+                // (`9 ; 4 ; st ; pr`) and the iTerm2/urxvt desktop
+                // notification (`9 ; <message>`). A strict parse of
+                // the `4;` form routes to progress; anything else —
+                // including a malformed `4;...` — stays a notification.
+                if (parseProgress(rest)) |p| {
+                    if (self.sink.on_progress) |f| f(self.sink.ctx, p.state, p.percent);
+                    return;
+                }
                 if (self.sink.on_notification) |f| f(self.sink.ctx, "sketerm", rest);
             },
             10, 11, 12 => {
@@ -5410,6 +5441,50 @@ test "OSC 777 notify dispatches title+body" {
     s.onOsc("777;notify;Hello;World");
     try std.testing.expectEqualStrings("Hello", Spy.got_title[0..Spy.got_title_len]);
     try std.testing.expectEqualStrings("World", Spy.got_body[0..Spy.got_body_len]);
+}
+
+test "OSC 9;4 routes to progress, plain OSC 9 stays a notification" {
+    const Spy = struct {
+        var progress: ?struct { state: u8, percent: u8 } = null;
+        var notified: usize = 0;
+        fn onProgress(_: ?*anyopaque, state: u8, percent: u8) void {
+            progress = .{ .state = state, .percent = percent };
+        }
+        fn onNotify(_: ?*anyopaque, _: []const u8, _: []const u8) void {
+            notified += 1;
+        }
+    };
+    Spy.progress = null;
+    Spy.notified = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+    s.sink = .{ .on_progress = Spy.onProgress, .on_notification = Spy.onNotify };
+
+    s.onOsc("9;4;1;7");
+    try std.testing.expectEqual(@as(u8, 1), Spy.progress.?.state);
+    try std.testing.expectEqual(@as(u8, 7), Spy.progress.?.percent);
+    try std.testing.expectEqual(@as(usize, 0), Spy.notified);
+
+    s.onOsc("9;4;2;29"); // error state
+    try std.testing.expectEqual(@as(u8, 2), Spy.progress.?.state);
+
+    s.onOsc("9;4;0"); // clear
+    try std.testing.expectEqual(@as(u8, 0), Spy.progress.?.state);
+
+    s.onOsc("9;4;1;250"); // out-of-range percent clamps
+    try std.testing.expectEqual(@as(u8, 100), Spy.progress.?.percent);
+
+    s.onOsc("9;build done"); // plain message → notification
+    try std.testing.expectEqual(@as(usize, 1), Spy.notified);
+
+    s.onOsc("9;4;banana"); // malformed 4; → notification fallback
+    try std.testing.expectEqual(@as(usize, 2), Spy.notified);
+
+    s.onOsc("9;4;9;50"); // unknown state → notification fallback
+    try std.testing.expectEqual(@as(usize, 3), Spy.notified);
 }
 
 test "XTGETTCAP: TN (Terminal Name) returns sketerm-256color" {
