@@ -9,7 +9,7 @@
 
 pkgname=sketerm-git
 _pkgname=sketerm
-pkgver=0.1.0.r618.g5ab6bce
+pkgver=0.1.0.r639.g87f6727
 pkgrel=1
 pkgdesc='Native GTK4 terminal emulator written in Zig'
 arch=('x86_64')
@@ -99,13 +99,19 @@ package() {
     install -Dm644 data/sample.conf "$pkgdir/usr/share/$_pkgname/sample.conf"
     install -Dm644 data/sample.layout "$pkgdir/usr/share/$_pkgname/sample.layout"
 
-    # Shell-integration scripts (sourced by user from their rc files)
-    install -Dm644 data/sketerm-shell-integration.bash \
+    # Shell-integration scripts + auto-injection shims. zsh/fish are
+    # injected automatically at spawn; bash users source sketerm.bash
+    # from their rc file.
+    install -Dm644 data/shell-integration/sketerm.bash \
         "$pkgdir/usr/share/$_pkgname/shell-integration/sketerm.bash"
-    install -Dm644 data/sketerm-shell-integration.zsh \
+    install -Dm644 data/shell-integration/sketerm.zsh \
         "$pkgdir/usr/share/$_pkgname/shell-integration/sketerm.zsh"
-    install -Dm644 data/sketerm-shell-integration.fish \
+    install -Dm644 data/shell-integration/sketerm.fish \
         "$pkgdir/usr/share/$_pkgname/shell-integration/sketerm.fish"
+    install -Dm644 data/shell-integration/zsh/.zshenv \
+        "$pkgdir/usr/share/$_pkgname/shell-integration/zsh/.zshenv"
+    install -Dm644 data/shell-integration/fish-xdg/fish/vendor_conf.d/sketerm.fish \
+        "$pkgdir/usr/share/$_pkgname/shell-integration/fish-xdg/fish/vendor_conf.d/sketerm.fish"
 
     # Compile + install the terminfo entry system-wide so $TERM=sketerm-256color
     # resolves without per-user setup.

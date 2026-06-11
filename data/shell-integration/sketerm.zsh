@@ -13,6 +13,11 @@
 
 [[ "$TERM_PROGRAM" != "sketerm" ]] && return 0
 
+# Idempotent: auto-injection + a manual `source` must not double the
+# hooks (every prompt would emit two sets of OSC marks).
+[[ -n "$_SKETERM_INTEGRATED" ]] && return 0
+typeset -g _SKETERM_INTEGRATED=1
+
 # ── OSC 7 cwd reporting ─────────────────────────────────────────
 _sketerm_emit_cwd() {
     local hn="${HOST:-${HOSTNAME:-localhost}}"

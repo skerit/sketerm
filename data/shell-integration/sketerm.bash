@@ -13,6 +13,12 @@ if [[ "$TERM_PROGRAM" != "sketerm" ]]; then
     return 0 2>/dev/null || exit 0
 fi
 
+# Idempotent: a double `source` must not double the hooks.
+if [[ -n "$_SKETERM_INTEGRATED" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+_SKETERM_INTEGRATED=1
+
 # ── OSC 7 cwd reporting ─────────────────────────────────────────
 # Emits ESC ] 7 ; file://hostname/cwd ESC \ after every prompt.
 # sketerm captures this and stores it on the Terminal so layout

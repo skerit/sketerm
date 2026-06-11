@@ -166,8 +166,10 @@ zig-out/bin/sketerm --help
 
 ## Shell integration
 
-`data/sketerm-shell-integration.{bash,zsh,fish}` — source the one
-that matches your shell to enable:
+**zsh and fish are integrated automatically** — sketerm injects the
+script at spawn (disable with `shell_integration = off` in the
+config). bash users source `data/shell-integration/sketerm.bash`
+from their `.bashrc`. The integration enables:
 
 - **OSC 7 cwd reporting** so layout save remembers each pane's
   directory, and `Ctrl+Shift+T` / `Ctrl+Shift+D` inherit it.

@@ -191,6 +191,11 @@ pub const Config = struct {
     auto_theme: bool = true,
     /// Bell behaviour: visual flash, system beep, and / or marking
     /// the AdwTabPage as needs-attention. Independent toggles.
+    /// Auto shell-integration: inject the OSC 7/133 scripts into
+    /// zsh/fish at spawn (ZDOTDIR / XDG_DATA_DIRS shims) — command
+    /// blocks, cwd inheritance and prompt nav work without rc edits.
+    /// bash still needs the manual `source` line.
+    shell_integration: bool = true,
     bell_audible: bool = false,
     bell_visible: bool = true,
     bell_urgent: bool = true,
@@ -579,6 +584,7 @@ pub const Config = struct {
         if (!self.auto_theme) try w.writeAll("auto_theme = false\n");
 
         // Bell.
+        if (!self.shell_integration) try w.writeAll("shell_integration = off\n");
         if (self.bell_audible) try w.writeAll("bell_audible = true\n");
         if (!self.bell_visible) try w.writeAll("bell_visible = false\n");
         if (!self.bell_urgent) try w.writeAll("bell_urgent = false\n");
@@ -963,6 +969,13 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.bidi = try parseBool(value);
     } else if (std.mem.eql(u8, key, "auto_theme")) {
         cfg.auto_theme = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "shell_integration")) {
+        cfg.shell_integration = if (std.mem.eql(u8, value, "auto"))
+            true
+        else if (std.mem.eql(u8, value, "off"))
+            false
+        else
+            try parseBool(value);
     } else if (std.mem.eql(u8, key, "bell_audible")) {
         cfg.bell_audible = try parseBool(value);
     } else if (std.mem.eql(u8, key, "bell_visible")) {

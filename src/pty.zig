@@ -36,6 +36,18 @@ pub const SpawnOpts = struct {
     /// (SKETERM_PANE_ID / SKETERM_SOCKET). 0 / null = not exported.
     pane_id: u32 = 0,
     socket_path: ?[*:0]const u8 = null,
+    /// Auto shell-integration (OSC 7/133 marks without rc edits).
+    /// null = off / unsupported shell.
+    shell_integration: ?ShellIntegration = null,
+};
+
+pub const ShellIntegration = struct {
+    pub const Kind = enum { zsh, fish };
+    kind: Kind,
+    /// Absolute path of the per-shell integration script.
+    script: [*:0]const u8,
+    /// zsh: the ZDOTDIR shim dir; fish: the XDG_DATA_DIRS shim dir.
+    shim_dir: [*:0]const u8,
 };
 
 /// Cap on queued bytes per Pty before we start dropping. Hit only
@@ -147,6 +159,31 @@ pub const Pty = struct {
             } else |_| {}
         }
         if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1);
+
+        // Auto shell-integration: hand the script path to the shim
+        // and arrange the shell to read the shim first. zsh reads
+        // startup files from $ZDOTDIR; fish auto-sources
+        // vendor_conf.d snippets from $XDG_DATA_DIRS entries. The
+        // shims restore both variables, so nothing leaks to children.
+        if (opts.shell_integration) |si| {
+            _ = c.setenv("SKETERM_SHELL_INTEGRATION", si.script, 1);
+            switch (si.kind) {
+                .zsh => {
+                    if (c.getenv("ZDOTDIR")) |orig| {
+                        _ = c.setenv("SKETERM_ORIG_ZDOTDIR", orig, 1);
+                    }
+                    _ = c.setenv("ZDOTDIR", si.shim_dir, 1);
+                },
+                .fish => {
+                    var buf: [4096]u8 = undefined;
+                    const cur = c.getenv("XDG_DATA_DIRS");
+                    const cur_s: []const u8 = if (cur) |p| std.mem.span(@as([*:0]const u8, @ptrCast(p))) else "/usr/local/share:/usr/share";
+                    if (std.fmt.bufPrintZ(&buf, "{s}:{s}", .{ std.mem.span(si.shim_dir), cur_s })) |joined| {
+                        _ = c.setenv("XDG_DATA_DIRS", joined.ptr, 1);
+                    } else |_| {}
+                },
+            }
+        }
 
         // chdir if requested.
         if (opts.cwd) |cwd| {

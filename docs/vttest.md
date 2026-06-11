@@ -57,7 +57,7 @@ Numbers refer to the vttest menu.
 - iTerm2 OSC 1337 — `imgcat image.png` from iTerm2's tools.
 - OSC 52 clipboard — `printf '\e]52;c;%s\a' "$(echo hello | base64)"`
   then paste somewhere; should be "hello".
-- OSC 7 cwd — source `data/sketerm-shell-integration.bash` from your
+- OSC 7 cwd — source `data/shell-integration/sketerm.bash` from your
   bashrc, then check `--restore` picks up the right cwd.
 - DECSET 1004 focus — `cat -v`, then click in/out of the pane;
   should see `^[[I` / `^[[O`.

@@ -157,6 +157,13 @@ pub const Window = struct {
     /// drag-out) close when their last tab leaves; closing the
     /// primary quits the app.
     is_primary: bool = false,
+    /// Resolved auto shell-integration paths (allocator-owned,
+    /// sentinel-terminated). All null when the script dir wasn't
+    /// found; gated on Config.shell_integration at spawn time.
+    si_zsh_script: ?[:0]u8 = null,
+    si_fish_script: ?[:0]u8 = null,
+    si_zsh_shim: ?[:0]u8 = null,
+    si_fish_shim: ?[:0]u8 = null,
     /// Socket path, computed at init (before any spawn) so every
     /// child gets SKETERM_SOCKET even if the listener starts later.
     ipc_path: ?[:0]u8 = null,
@@ -525,6 +532,9 @@ pub const Window = struct {
         // Custom post-process shader.
         self.refreshShaderSource();
 
+        // Auto shell-integration script discovery.
+        self.resolveShellIntegration();
+
         // Remote-control socket (sketerm cli). Failure is non-fatal:
         // the terminal works fine without scripting. Primary only —
         // the socket path is keyed on the pid, so a secondary window
@@ -597,6 +607,10 @@ pub const Window = struct {
         if (self.ipc) |srv| srv.deinit(); // frees ipc_path (server owns it)
         if (self.bg_source.pixels) |px| c.stbi_image_free(px);
         if (self.shader_source.src) |s| self.allocator.free(s);
+        if (self.si_zsh_script) |s| self.allocator.free(s);
+        if (self.si_fish_script) |s| self.allocator.free(s);
+        if (self.si_zsh_shim) |s| self.allocator.free(s);
+        if (self.si_fish_shim) |s| self.allocator.free(s);
         self.config.deinit();
         self.allocator.destroy(self);
     }
@@ -1252,6 +1266,7 @@ pub const Window = struct {
                     .cols = 80,
                     .pane_id = pane_id,
                     .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
+                    .shell_integration = self.shellIntegrationFor(argv_buf[0]),
                 });
                 errdefer pty.closeAndReap();
 
@@ -1337,6 +1352,7 @@ pub const Window = struct {
             .login_shell = self.config.login_shell,
             .pane_id = pane_id,
             .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
+            .shell_integration = self.shellIntegrationFor(argv[0]),
         });
         errdefer pty.closeAndReap();
 
@@ -1569,6 +1585,7 @@ pub const Window = struct {
             .login_shell = eff_login_shell,
             .pane_id = pane_id,
             .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
+            .shell_integration = self.shellIntegrationFor(argv[0]),
         });
         errdefer pty.closeAndReap();
 
@@ -2979,6 +2996,61 @@ pub const Window = struct {
     }
 
     // ── Background layer (image / gradient) ─────────────────────
+
+    /// Locate the shell-integration script directory and cache the
+    /// per-shell script + shim paths. Resolution: env override →
+    /// installed share dir next to the exe → repo data/ (dev tree)
+    /// → /usr/share. Missing dir = feature silently off.
+    fn resolveShellIntegration(self: *Window) void {
+        const ally = self.allocator;
+        var base_buf: [4096]u8 = undefined;
+        const base: []const u8 = blk: {
+            if (@import("../util/profile.zig").getenv("SKETERM_SHELL_INTEGRATION_DIR")) |env| break :blk env;
+            var exe_buf: [4096]u8 = undefined;
+            const n = c.readlink("/proc/self/exe", &exe_buf, exe_buf.len - 1);
+            if (n > 0) {
+                const exe_path = exe_buf[0..@intCast(n)];
+                const exe_dir = std.fs.path.dirname(exe_path) orelse "/usr/bin";
+                const candidates = [_][]const u8{
+                    "/../share/sketerm/shell-integration",
+                    "/../../data/shell-integration",
+                };
+                for (candidates) |suffix| {
+                    const cand = std.fmt.bufPrintZ(&base_buf, "{s}{s}/sketerm.zsh", .{ exe_dir, suffix }) catch continue;
+                    if (c.access(cand.ptr, c.R_OK) == 0) {
+                        break :blk base_buf[0 .. exe_dir.len + suffix.len];
+                    }
+                }
+            }
+            const sys = "/usr/share/sketerm/shell-integration";
+            const sys_probe = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm.zsh", .{sys}) catch return;
+            if (c.access(sys_probe.ptr, c.R_OK) == 0) break :blk sys;
+            return;
+        };
+        self.si_zsh_script = std.fmt.allocPrintSentinel(ally, "{s}/sketerm.zsh", .{base}, 0) catch null;
+        self.si_fish_script = std.fmt.allocPrintSentinel(ally, "{s}/sketerm.fish", .{base}, 0) catch null;
+        self.si_zsh_shim = std.fmt.allocPrintSentinel(ally, "{s}/zsh", .{base}, 0) catch null;
+        self.si_fish_shim = std.fmt.allocPrintSentinel(ally, "{s}/fish-xdg", .{base}, 0) catch null;
+    }
+
+    /// Pick the injection setup for the program being spawned, or
+    /// null (no injection) for shells we don't auto-integrate.
+    fn shellIntegrationFor(self: *const Window, argv0: [*:0]const u8) ?@import("../pty.zig").ShellIntegration {
+        if (!self.config.shell_integration) return null;
+        const prog = std.mem.span(argv0);
+        const base = std.fs.path.basename(prog);
+        if (std.mem.eql(u8, base, "zsh")) {
+            const script = self.si_zsh_script orelse return null;
+            const shim = self.si_zsh_shim orelse return null;
+            return .{ .kind = .zsh, .script = script.ptr, .shim_dir = shim.ptr };
+        }
+        if (std.mem.eql(u8, base, "fish")) {
+            const script = self.si_fish_script orelse return null;
+            const shim = self.si_fish_shim orelse return null;
+            return .{ .kind = .fish, .script = script.ptr, .shim_dir = shim.ptr };
+        }
+        return null;
+    }
 
     /// Rebuild bg_source from config: decode the image (if any) or
     /// arm the gradient. Frees the previous stbi allocation. Call on
