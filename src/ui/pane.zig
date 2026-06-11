@@ -209,6 +209,10 @@ pub const Pane = struct {
         c.gtk_widget_set_vexpand(area_widget, 1);
         c.gtk_widget_set_hexpand(area_widget, 1);
         c.gtk_widget_set_visible(area_widget, 1);
+        // Widget → Pane back-pointer for tree walks that only have
+        // the GTK side (tab transfer between windows adopts panes by
+        // walking the page's widget tree).
+        c.g_object_set_data(@ptrCast(@alignCast(area_widget)), "sketerm-pane", @ptrCast(self));
 
         // Titlebar header: hidden by default. The label has 6 px
         // horizontal padding so text doesn't sit flush against the

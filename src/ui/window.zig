@@ -152,6 +152,11 @@ pub const Window = struct {
     /// Custom post-process shader source (one file read shared by
     /// every pane). `src` is window-allocator-owned.
     shader_source: shader_pass_mod.Source = .{},
+    /// The first window of the process: owns the IPC socket, quake
+    /// toggle, and layout persistence. Secondary windows (tab
+    /// drag-out) close when their last tab leaves; closing the
+    /// primary quits the app.
+    is_primary: bool = false,
     /// Socket path, computed at init (before any spawn) so every
     /// child gets SKETERM_SOCKET even if the listener starts later.
     ipc_path: ?[:0]u8 = null,
@@ -236,6 +241,7 @@ pub const Window = struct {
         allocator: std.mem.Allocator,
         app: ?*c.GtkApplication,
         config_override: ?Config,
+        is_primary: bool,
     ) !*Window {
         const self = try allocator.create(Window);
         errdefer allocator.destroy(self);
@@ -339,6 +345,7 @@ pub const Window = struct {
             .toolbar_view = @ptrCast(@alignCast(toolbar_view)),
             .allocator = allocator,
             .config = if (config_override) |co| co else Config.load(allocator),
+            .is_primary = is_primary,
             .search_bar = search_bar,
             .search_entry = search_entry,
             .search_label = search_label,
@@ -375,6 +382,30 @@ pub const Window = struct {
             c.G_CONNECT_DEFAULT,
         );
 
+        // Detachable tabs: dragging a tab out of the tab bar asks for
+        // a window to drop it into; we spawn a fresh (secondary)
+        // Window and hand back its tab view.
+        _ = c.g_signal_connect_data(
+            tab_view_w,
+            "create-window",
+            @ptrCast(&onCreateWindow),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+
+        // Counterpart of page-detached for cross-window transfers:
+        // adopt the panes living in the attached page (move them out
+        // of the source Window's bookkeeping into ours).
+        _ = c.g_signal_connect_data(
+            tab_view_w,
+            "page-attached",
+            @ptrCast(&onPageAttached),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+
         // Confirm-on-close gate. AdwTabView emits "close-page" before
         // detaching; returning TRUE = "I'll handle it asynchronously",
         // then we MUST call adw_tab_view_close_page_finish(view, page,
@@ -395,6 +426,18 @@ pub const Window = struct {
             app_window,
             "close-request",
             @ptrCast(&onWindowCloseRequest),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+
+        // Multi-window lifecycle: closing the primary quits the app
+        // (it owns IPC/quake/layout); a secondary frees its Zig state
+        // once the GTK destroy chain has unwound.
+        _ = c.g_signal_connect_data(
+            app_window,
+            "destroy",
+            @ptrCast(&onWindowDestroyed),
             @ptrCast(self),
             null,
             c.G_CONNECT_DEFAULT,
@@ -483,18 +526,22 @@ pub const Window = struct {
         self.refreshShaderSource();
 
         // Remote-control socket (sketerm cli). Failure is non-fatal:
-        // the terminal works fine without scripting.
-        if (ipc_server.defaultSocketPath(allocator)) |sock_path| {
-            self.ipc_path = sock_path;
-            self.ipc = ipc_server.start(allocator, sock_path, @ptrCast(self), ipcDispatchTrampoline) catch |err| blk: {
-                std.debug.print("sketerm: remote control disabled: {s}\n", .{@errorName(err)});
-                break :blk null;
-            };
-            if (self.ipc == null) {
-                allocator.free(sock_path);
-                self.ipc_path = null;
-            }
-        } else |_| {}
+        // the terminal works fine without scripting. Primary only —
+        // the socket path is keyed on the pid, so a secondary window
+        // would collide with (and clobber) the primary's socket.
+        if (is_primary) {
+            if (ipc_server.defaultSocketPath(allocator)) |sock_path| {
+                self.ipc_path = sock_path;
+                self.ipc = ipc_server.start(allocator, sock_path, @ptrCast(self), ipcDispatchTrampoline) catch |err| blk: {
+                    std.debug.print("sketerm: remote control disabled: {s}\n", .{@errorName(err)});
+                    break :blk null;
+                };
+                if (self.ipc == null) {
+                    allocator.free(sock_path);
+                    self.ipc_path = null;
+                }
+            } else |_| {}
+        }
 
         // After the window is realized we have a GdkSurface and can
         // tell the compositor not to assume our content is opaque.
@@ -1573,12 +1620,12 @@ pub const Window = struct {
         pane.win_on_session_renamed = onTermSessionRenamed;
     }
 
-    /// Sever a pane from the window before teardown: drop every
-    /// window-level pointer into it (search / hints / copy mode),
-    /// unlist it and its terminal, fence the terminal's sinks, and
-    /// defer the actual deinit past GTK's widget-destroy chain.
-    /// Counterpart of wirePaneSinks — the single removal path.
-    fn unlistPane(self: *Window, pane: *Pane) void {
+    /// Drop every window-level pointer into a pane (search / hints /
+    /// copy mode / zoom / notify slots) and unlist it + its terminal —
+    /// WITHOUT tearing the pane down. Shared by the close path
+    /// (unlistPane) and cross-window tab adoption, where the pane
+    /// lives on under another Window.
+    fn disownPane(self: *Window, pane: *Pane) void {
         if (self.search_pane == pane) self.closeSearch();
         if (self.hints_pane == pane) self.exitHints();
         if (self.copymode_pane == pane) self.exitCopyMode();
@@ -1600,8 +1647,73 @@ pub const Window = struct {
                 break;
             }
         }
+    }
+
+    /// Sever a pane from the window before teardown: disown it, fence
+    /// the terminal's sinks, and defer the actual deinit past GTK's
+    /// widget-destroy chain. Counterpart of wirePaneSinks — the
+    /// single removal path.
+    fn unlistPane(self: *Window, pane: *Pane) void {
+        self.disownPane(pane);
+        const term = pane.terminal;
         term.clearSinks();
         schedulePaneTeardown(pane, term);
+    }
+
+    /// Spawn an empty secondary Window sharing this one's config.
+    /// Used by tab drag-out (AdwTabView "create-window") and the
+    /// detach_tab action.
+    fn spawnSecondaryWindow(self: *Window) ?*Window {
+        const app = c.gtk_window_get_application(@ptrCast(self.app_window));
+        const cfg = self.config.clone(self.allocator) catch null;
+        const win = Window.initWithConfig(self.allocator, @ptrCast(app), cfg, false) catch |err| {
+            std.debug.print("sketerm: secondary window spawn failed: {s}\n", .{@errorName(err)});
+            return null;
+        };
+        win.debug_events = self.debug_events;
+        win.hold_override = self.hold_override;
+        c.gtk_window_present(@ptrCast(win.app_window));
+        return win;
+    }
+
+    /// detach_tab action: move the selected tab into a fresh window —
+    /// keyboard/palette equivalent of dragging it out of the tab bar.
+    fn detachCurrentTab(self: *Window) void {
+        const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
+        const win = self.spawnSecondaryWindow() orelse return;
+        c.adw_tab_view_transfer_page(self.tab_view, page, win.tab_view, 0);
+    }
+
+    /// Take ownership of a pane that arrived from another Window via
+    /// tab drag-out/drag-in: unhook it there, list it here, rewire
+    /// every sink and config-derived field against this window.
+    fn adoptPane(self: *Window, pane: *Pane) void {
+        const src_any = pane.win_clip_ctx orelse return;
+        const src: *Window = @ptrCast(@alignCast(src_any));
+        if (src == self) return;
+        src.disownPane(pane);
+        self.panes.append(self.allocator, pane) catch return;
+        self.terminals.append(self.allocator, pane.terminal) catch {};
+        self.wirePaneSinks(pane);
+        // Re-point bindings, menu/shortcut sinks, bg/shader sources
+        // and push this window's config — the pane now renders under
+        // our atlas settings. Per-pane font zoom resets, same as a
+        // config reload.
+        self.applyPaneConfig(pane, .{});
+    }
+
+    /// Walk a transferred page's widget tree and adopt every pane in
+    /// it (split trees carry several).
+    fn adoptPanesInTree(self: *Window, w: *c.GtkWidget) void {
+        if (c.g_object_get_data(@ptrCast(@alignCast(w)), "sketerm-pane")) |data| {
+            const pane: *Pane = @ptrCast(@alignCast(data));
+            self.adoptPane(pane);
+            return;
+        }
+        var child = c.gtk_widget_get_first_child(w);
+        while (child) |ch| : (child = c.gtk_widget_get_next_sibling(ch)) {
+            self.adoptPanesInTree(ch);
+        }
     }
 
     const PaneConfigOpts = struct {
@@ -4198,6 +4310,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .goto_tab_8 => self.gotoTab(7),
         .goto_tab_9 => self.gotoTab(8),
         .duplicate_tab => self.duplicateCurrentTab(),
+        .detach_tab => self.detachCurrentTab(),
         .show_scrollback => self.openScrollbackPager(),
         .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
@@ -5088,38 +5201,136 @@ fn onCloseWinResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*a
     }
 }
 
-/// Tear down all Zig-side panes + terminals that lived in this
-/// AdwTabPage's widget tree. Called when the user closes a tab.
+/// A tab left this view — closed by the user, OR mid-transfer to
+/// another window (drag-out). Which one isn't knowable here: during
+/// a transfer the destination's "page-attached" hasn't fired yet. So
+/// defer the close-vs-transfer decision one main-loop iteration; by
+/// then an adopted page's panes are gone from our lists and the
+/// teardown below finds nothing to free.
 fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
     const child = c.adw_tab_page_get_child(page);
     if (child == null) return;
-    // Capture the tab's basic state into the recently-closed ring
-    // BEFORE we tear the panes down. We keep title + first-pane's
-    // cwd + profile. Split trees aren't preserved (a future v2 of
-    // this could re-serialise the layout tree the same way --restore
-    // does, but single-pane is the 95% case).
-    self.captureClosedTab(page, @ptrCast(child));
-    collectAndFreePanes(self, @ptrCast(child));
 
-    // If the user just closed the last tab via the AdwTabView "X"
-    // button (which bypasses closeCurrentTab), keep the window
-    // alive by auto-spawning a fresh shell. Skip during app
-    // shutdown — once the window is no longer mapped, this signal
-    // is firing as part of teardown and we'd just leak. Also bail
-    // if the tab_view itself has already been finalised (visible
-    // as `ADW_IS_TAB_VIEW` assertion warnings during quit).
-    if (c.gtk_widget_get_mapped(self.app_window) == 0) return;
-    if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(self.tab_view)), c.adw_tab_view_get_type()) == 0) return;
+    // App/window shutdown: no transfer is possible, and idles may
+    // never run again — tear down synchronously (prior behaviour).
+    if (c.gtk_widget_get_mapped(self.app_window) == 0) {
+        collectAndFreePanes(self, @ptrCast(child));
+        return;
+    }
+
+    const pending = std.heap.c_allocator.create(PendingPageDetach) catch {
+        // OOM — fall back to the synchronous path; a mid-transfer
+        // page would be freed under the destination window, but
+        // we're in OOM territory anyway.
+        self.captureClosedTab(page, @ptrCast(child));
+        collectAndFreePanes(self, @ptrCast(child));
+        return;
+    };
+    _ = c.g_object_ref(@ptrCast(@alignCast(page)));
+    pending.* = .{ .win = self, .page = page };
+    _ = c.g_idle_add(@ptrCast(&onPageDetachedIdle), @ptrCast(pending));
+}
+
+const PendingPageDetach = struct {
+    win: *Window,
+    page: *c.AdwTabPage,
+};
+
+fn onPageDetachedIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const pending = cast.userData(PendingPageDetach, user);
+    const self = pending.win;
+    const page = pending.page;
+    defer {
+        c.g_object_unref(@ptrCast(@alignCast(page)));
+        std.heap.c_allocator.destroy(pending);
+    }
+
+    const child = c.adw_tab_page_get_child(page);
+    if (child != null) {
+        // Closed (not transferred) ⟺ some pane under this page is
+        // still in OUR lists — a cross-window adoption would have
+        // disowned them all by now.
+        var was_close = false;
+        for (self.panes.items) |p| {
+            if (widgetIsAncestor(@ptrCast(child), p.widget())) {
+                was_close = true;
+                break;
+            }
+        }
+        if (was_close) {
+            // Capture the tab's basic state into the recently-closed
+            // ring BEFORE we tear the panes down. We keep title +
+            // first-pane's cwd + profile; split trees aren't preserved.
+            self.captureClosedTab(page, @ptrCast(child));
+            collectAndFreePanes(self, @ptrCast(child));
+        }
+    }
+
+    // Window-alive bookkeeping. Bail if the window died or the
+    // tab_view has been finalised in the meantime (visible as
+    // `ADW_IS_TAB_VIEW` assertion warnings during quit).
+    if (c.gtk_widget_get_mapped(self.app_window) == 0) return 0;
+    if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(self.tab_view)), c.adw_tab_view_get_type()) == 0) return 0;
     if (c.adw_tab_view_get_n_pages(self.tab_view) == 0) {
-        self.newShellTab(null) catch |err| {
-            std.debug.print("sketerm: replacement tab spawn failed: {s}\n", .{@errorName(err)});
-        };
+        if (self.is_primary) {
+            // Keep the primary alive with a fresh shell (it owns the
+            // IPC socket / quake toggle / layout persistence).
+            self.newShellTab(null) catch |err| {
+                std.debug.print("sketerm: replacement tab spawn failed: {s}\n", .{@errorName(err)});
+            };
+        } else {
+            // A secondary window with no tabs left has no reason to
+            // exist — its last tab was closed or dragged elsewhere.
+            c.gtk_window_destroy(@ptrCast(self.app_window));
+            return 0;
+        }
     }
 
     // The closed page may have carried progress; re-aggregate so the
     // taskbar doesn't stay stuck at the dead tab's value.
     self.updateTaskbarProgress();
+    return 0; // G_SOURCE_REMOVE
+}
+
+/// Destination side of a tab transfer: adopt every pane in the
+/// arriving page. Pages attached by our own tab-creation paths are
+/// already ours — adoptPane no-ops on them.
+fn onPageAttached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Window, user);
+    const child = c.adw_tab_page_get_child(page) orelse return;
+    self.adoptPanesInTree(@ptrCast(child));
+    self.updateTaskbarProgress();
+}
+
+/// AdwTabView "create-window": a tab is being dragged out of every
+/// existing window. Spawn an empty secondary Window and return its
+/// view; libadwaita transfers the page into it.
+fn onCreateWindow(_: *c.AdwTabView, user: ?*anyopaque) callconv(.c) ?*c.AdwTabView {
+    const self = cast.userData(Window, user);
+    const win = self.spawnSecondaryWindow() orelse return null;
+    return win.tab_view;
+}
+
+/// GTK destroy of the toplevel. Primary: quit the whole app (it owns
+/// the IPC socket and layout persistence; orphaned secondaries would
+/// be half-functional). Secondary: free the Zig-side Window once the
+/// destroy chain has unwound — its pages already tore down via the
+/// unmapped path in onPageDetached.
+fn onWindowDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Window, user);
+    if (self.is_primary) {
+        const app = c.gtk_window_get_application(@ptrCast(self.app_window));
+        if (app != null) c.g_application_quit(@ptrCast(@alignCast(app)));
+        return;
+    }
+    _ = c.g_idle_add(@ptrCast(&deferredWindowFree), @ptrCast(self));
+}
+
+fn deferredWindowFree(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(Window, user);
+    self.deinit();
+    return 0; // G_SOURCE_REMOVE
 }
 
 /// Holder for `g_idle_add` deferred Pane/Terminal teardown. Heap-

@@ -116,6 +116,9 @@ pub const Action = enum {
     /// Subtly different from `new_tab` which uses the focused pane's
     /// cwd already but defaults the profile to none.
     duplicate_tab,
+    /// Move the current tab into its own new window (also available
+    /// by dragging the tab out of the tab bar).
+    detach_tab,
     /// Dump scrollback + visible screen to a temp file and open it
     /// in a pager (`less -R +G`, or `$PAGER`) in a new tab. Kitty's
     /// show_scrollback equivalent.
@@ -290,6 +293,7 @@ pub fn actionName(a: Action) []const u8 {
         .goto_tab_8 => "goto_tab_8",
         .goto_tab_9 => "goto_tab_9",
         .duplicate_tab => "duplicate_tab",
+        .detach_tab => "detach_tab",
         .show_scrollback => "show_scrollback",
         .new_durable_tab => "new_durable_tab",
         .paste_clipboard => "paste_clipboard",
@@ -357,6 +361,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .goto_tab_8 => "Jump to tab 8",
         .goto_tab_9 => "Jump to tab 9",
         .duplicate_tab => "Duplicate tab (cwd + profile)",
+        .detach_tab => "Detach tab into a new window",
         .show_scrollback => "Show scrollback in pager",
         .new_durable_tab => "New durable tab (mux)",
         .paste_clipboard => "Paste clipboard",

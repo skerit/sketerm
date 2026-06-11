@@ -377,7 +377,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         Config.loadWithOverride(g_app.allocator, p)
     else
         null;
-    const window = Window.initWithConfig(g_app.allocator, app, cfg_override) catch |err| {
+    const window = Window.initWithConfig(g_app.allocator, app, cfg_override, true) catch |err| {
         std.debug.print("sketerm: window init failed: {s}\n", .{@errorName(err)});
         return;
     };
