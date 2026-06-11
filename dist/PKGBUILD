@@ -9,7 +9,7 @@
 
 pkgname=sketerm-git
 _pkgname=sketerm
-pkgver=0.1.0.r652.gc382762
+pkgver=0.1.0.r653.g018dd33
 pkgrel=1
 pkgdesc='Native GTK4 terminal emulator written in Zig'
 arch=('x86_64')
@@ -100,13 +100,19 @@ package() {
     install -Dm644 data/sample.layout "$pkgdir/usr/share/$_pkgname/sample.layout"
 
     # Ready-made CRT shaders (custom_shader / "Pane Shader…").
-    # crt.glsl is the full retro engine (phosphor color + colorize
-    # strength replace the old amber/green twins); crt-lottes is the
-    # public-domain RetroArch classic.
+    # Mixed licensing — see data/shaders/README: crt.glsl is MIT
+    # (sketerm original), crt-lottes public domain, crt-easymode and
+    # zfast-crt are GPL ports shipped as runtime data.
     install -Dm644 data/shaders/crt.glsl \
         "$pkgdir/usr/share/$_pkgname/shaders/crt.glsl"
     install -Dm644 data/shaders/crt-lottes.glsl \
         "$pkgdir/usr/share/$_pkgname/shaders/crt-lottes.glsl"
+    install -Dm644 data/shaders/crt-easymode.glsl \
+        "$pkgdir/usr/share/$_pkgname/shaders/crt-easymode.glsl"
+    install -Dm644 data/shaders/zfast-crt.glsl \
+        "$pkgdir/usr/share/$_pkgname/shaders/zfast-crt.glsl"
+    install -Dm644 data/shaders/README \
+        "$pkgdir/usr/share/$_pkgname/shaders/README"
 
     # Shell-integration scripts + auto-injection shims. zsh/fish are
     # injected automatically at spawn; bash users source sketerm.bash

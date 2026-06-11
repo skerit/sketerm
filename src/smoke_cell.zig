@@ -389,6 +389,42 @@ pub fn main() !u8 {
         }
     }
 
+    // RetroArch ports: compile + render each, assert output exists.
+    {
+        const ShaderPass = @import("render/shader_pass.zig").ShaderPass;
+        const ShaderSource = @import("render/shader_pass.zig").Source;
+        const ports = [_]struct { name: []const u8, src: []const u8 }{
+            .{ .name = "crt-easymode", .src = @embedFile("crt_easymode_glsl") },
+            .{ .name = "zfast-crt", .src = @embedFile("zfast_crt_glsl") },
+        };
+        for (ports) |port| {
+            var ssrc = ShaderSource{ .src = port.src, .generation = 1 };
+            var sp = ShaderPass{ .source = &ssrc };
+            if (!sp.begin(allocator, W, H)) {
+                std.debug.print("smoke-cell: FAIL — {s} failed to compile\n", .{port.name});
+                return 16;
+            }
+            c.glViewport(0, 0, W, H);
+            c.glClearColor(0.05, 0.05, 0.08, 1.0);
+            c.glClear(c.GL_COLOR_BUFFER_BIT);
+            cell_pass.draw(atlas.?, W, H);
+            grid_pass.draw(atlas.?, W, H);
+            sp.finish(W, H, 0.3);
+            c.glFinish();
+            c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+            var lit: usize = 0;
+            var pm: usize = 0;
+            while (pm < fb_bytes) : (pm += 4) {
+                if (@max(fb[pm], @max(fb[pm + 1], fb[pm + 2])) > 60) lit += 1;
+            }
+            std.debug.print("smoke-cell: {s} lit={d}\n", .{ port.name, lit });
+            if (lit < 100) {
+                std.debug.print("smoke-cell: FAIL — {s} output wrong\n", .{port.name});
+                return 17;
+            }
+        }
+    }
+
     // Previous-frame feedback (iChannel1): a decaying-max shader run
     // twice — second frame's scene is empty, so anything bright on
     // screen can ONLY be the ghost of frame one at half brightness.

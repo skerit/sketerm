@@ -1,0 +1,17 @@
+sketerm shader presets — per-file licensing
+============================================
+
+sketerm itself is MIT-licensed. The shaders in this directory are
+DATA files loaded at runtime; they are distributed alongside sketerm
+("mere aggregation" in GPL terms) and each carries its OWN license:
+
+  crt.glsl           MIT (sketerm original; effects re-implemented
+                     from scratch)
+  crt-lottes.glsl    Public domain (Timothy Lottes), sketerm port
+  crt-easymode.glsl  GPL (EasyMode), ported from RetroArch's
+                     libretro/glsl-shaders
+  zfast-crt.glsl     GPL-2.0-or-later (Greg Hogan / SoltanGris42),
+                     ported from RetroArch's libretro/glsl-shaders
+
+If you redistribute the GPL shader files (modified or not), the GPL's
+terms apply to those files. They do not extend to sketerm's code.

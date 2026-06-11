@@ -302,6 +302,14 @@ pub fn build(b: *std.Build) void {
     smoke_cell_mod.addAnonymousImport("crt_lottes_glsl", .{
         .root_source_file = b.path("data/shaders/crt-lottes.glsl"),
     });
+    // GPL-licensed port files — embedded ONLY into this test binary,
+    // which is never distributed (see data/shaders/README).
+    smoke_cell_mod.addAnonymousImport("crt_easymode_glsl", .{
+        .root_source_file = b.path("data/shaders/crt-easymode.glsl"),
+    });
+    smoke_cell_mod.addAnonymousImport("zfast_crt_glsl", .{
+        .root_source_file = b.path("data/shaders/zfast-crt.glsl"),
+    });
     const smoke_cell = b.addExecutable(.{
         .name = "sketerm-smoke-cell",
         .root_module = smoke_cell_mod,

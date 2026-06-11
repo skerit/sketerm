@@ -4660,3 +4660,29 @@ Tests 454 → 466.
 - Verified live: dialog + animating preview open via cli action,
   zero criticals, IPC responsive, clean app teardown with the
   dialog open.
+
+## 2026-06-12: RetroArch ports (proper, license-clean)
+
+- Jelle offered to relicense sketerm MIT→GPL for shader ports.
+  DECLINED as unnecessary: shader files are runtime DATA — GPL
+  "mere aggregation" lets GPL files ship beside an MIT program,
+  each under its own license (RetroArch itself does this). Core
+  stays MIT; data/shaders/README documents per-file licensing.
+  GPL files are embedded ONLY into the smoke-cell test binary
+  (never distributed).
+- Ported from real sources (libretro/glsl-shaders): crt-easymode
+  (EasyMode, GPL) and zfast-crt (Greg Hogan, GPL-2+). Port pattern:
+  Texture/TextureSize/InputSize/OutputSize → iChannel0/iResolution,
+  passthrough vertex stage folded (zfast's maskFade/invDims
+  varyings inlined), and a NEW `v_scale` param — these shaders
+  expect low-res emulator frames, so the terminal acts as
+  iResolution/v_scale virtual source pixels (scanline + mask
+  frequency follow). easymode SCANLINE_CUTOFF default raised
+  400→1000 (at v_scale 2 a 4K pane's virtual source exceeds 400 and
+  scanlines would self-disable).
+- cool-retro-term NOT code-ported even with license cleared: its
+  noise/jitter sample a noise TEXTURE asset (we have no LUT inputs)
+  — the from-scratch procedural equivalents in crt.glsl remain the
+  right substitute.
+- smoke-cell compiles + renders both ports (easymode lit=4194,
+  zfast lit=3713).
