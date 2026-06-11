@@ -18,6 +18,16 @@ pub const PaneSpec = struct {
     /// profile (use global Config). Default keeps older JSON files
     /// parseable via `ignore_unknown_fields`.
     profile: []const u8 = "",
+    /// Explicit per-pane shader pick (path). Empty = none saved
+    /// (profile/global resolution applies on restore).
+    custom_shader: []const u8 = "",
+    /// Durable mux pane: session name on the daemon. Empty = a
+    /// plain local PTY pane. On restore the session is attached if
+    /// it still exists, or recreated under the same name.
+    mux_session: []const u8 = "",
+    /// Transport-prefixed host for mux panes ("" = local daemon,
+    /// "user@box" = ssh, "udp:box" = mosh-style UDP).
+    mux_host: []const u8 = "",
 };
 
 pub const SplitSpec = struct {

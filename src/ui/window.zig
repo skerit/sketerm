@@ -1227,6 +1227,23 @@ pub const Window = struct {
     fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree) !*c.GtkWidget {
         switch (tree) {
             .pane => |p| {
+                // Durable mux pane: reattach (or recreate under the
+                // same name) instead of spawning a local PTY. A dead
+                // host / failed daemon falls through to the plain
+                // spawn below so startup never wedges on a layout.
+                if (p.mux_session.len > 0) {
+                    if (self.restoreMuxPane(p)) |pane| {
+                        if (p.custom_shader.len > 0)
+                            _ = pane.setCustomShader(p.custom_shader, self.config.custom_shader_animation, true);
+                        return pane.widget();
+                    } else |err| {
+                        std.debug.print(
+                            "sketerm: mux restore '{s}'{s}{s} failed ({s}) — spawning local shell\n",
+                            .{ p.mux_session, if (p.mux_host.len > 0) " @ " else "", p.mux_host, @errorName(err) },
+                        );
+                    }
+                }
+
                 if (p.command.len == 0) return error.EmptyCommand;
 
                 // Resolve profile (if any) so we can honour profile.shell
@@ -1284,6 +1301,10 @@ pub const Window = struct {
                     .profile = profile,
                     .font_size_override = p.font_size,
                 });
+                // Explicit per-pane shader pick (wins over the
+                // profile/global shader applyPaneConfig resolved).
+                if (p.custom_shader.len > 0)
+                    _ = pane.setCustomShader(p.custom_shader, self.config.custom_shader_animation, true);
 
                 try self.panes.append(self.allocator, pane);
                 try self.terminals.append(self.allocator, term);
@@ -1416,7 +1437,8 @@ pub const Window = struct {
         pane.middle_click_action = self.config.mouse_middle_click;
         pane.right_click_action = self.config.mouse_right_click;
         pane.bg_pass.source = &self.bg_source;
-        pane.shader_pass.source = &self.shader_source;
+        pane.shader_default_source = &self.shader_source;
+        pane.refreshShaderBinding();
         pane.updateShaderTick();
         // Renderer bold flags.
         pane.grid_pass.allow_bold = self.config.allow_bold;
@@ -1677,6 +1699,40 @@ pub const Window = struct {
         schedulePaneTeardown(pane, term);
     }
 
+    /// "Pane Shader…": pick a GLSL file for the focused pane only.
+    /// The pick is sticky across config reloads (custom_shader_user).
+    fn pickPaneShader(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+        const dialog = c.gtk_file_dialog_new();
+        c.gtk_file_dialog_set_title(dialog, "Choose Pane Shader (GLSL, shadertoy mainImage)");
+        const ctx = self.allocator.create(ShaderPickCtx) catch return;
+        ctx.* = .{ .win = self, .pane = pane };
+        c.gtk_file_dialog_open(dialog, @ptrCast(self.app_window), null, @ptrCast(&onShaderPicked), @ptrCast(ctx));
+    }
+
+    fn clearPaneShader(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+        _ = pane.setCustomShader(null, self.config.custom_shader_animation, false);
+        // Re-resolve so a profile/global shader (if any) comes back.
+        self.applyPaneConfigByName(pane);
+    }
+
+    /// applyPaneConfig with the pane's stored profile re-resolved by
+    /// name — for paths that need a config re-push outside the
+    /// spawn/restore flows.
+    fn applyPaneConfigByName(self: *Window, pane: *Pane) void {
+        var profile: ?*const @import("../config.zig").Profile = null;
+        if (pane.active_profile) |name| {
+            for (self.config.profiles.items) |*p| {
+                if (std.mem.eql(u8, p.name, name)) {
+                    profile = p;
+                    break;
+                }
+            }
+        }
+        self.applyPaneConfig(pane, .{ .profile = profile });
+    }
+
     /// Spawn an empty secondary Window sharing this one's config.
     /// Used by tab drag-out (AdwTabView "create-window") and the
     /// detach_tab action.
@@ -1816,6 +1872,21 @@ pub const Window = struct {
                 pane.grid_pass.palette[i] = pal[i];
             }
         }
+
+        // Shader resolution: explicit user pick > profile > global.
+        // The user pick is sticky — config reloads / profile pushes
+        // leave it alone.
+        pane.shader_default_source = &self.shader_source;
+        if (!pane.custom_shader_user) {
+            const prof_shader: []const u8 = if (profile) |p| p.custom_shader else "";
+            _ = pane.setCustomShader(
+                if (prof_shader.len > 0) prof_shader else null,
+                self.config.custom_shader_animation,
+                false,
+            );
+        }
+        pane.refreshShaderBinding();
+        pane.updateShaderTick();
     }
 
     /// Split the focused pane: spawn a new pane and place the two
@@ -2918,21 +2989,26 @@ pub const Window = struct {
     /// `sketerm mux` CLI was invoked from; its shell — including that
     /// CLI — is torn down once the remote pane is in place).
     /// Takes ownership of `conn` on success AND failure.
-    pub fn attachMux(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane) !void {
+    /// Build a remote (mux) pane from an attach snapshot: Terminal +
+    /// Pane, sinks wired, config pushed, listed, images replayed —
+    /// but NO tab page; the caller decides where the widget goes.
+    /// Takes ownership of `conn` on success and failure.
+    fn makeRemotePaneFromSnap(
+        self: *Window,
+        conn_in: @import("../mux/client.zig").Conn,
+        name: []const u8,
+        host: ?[]const u8,
+        snap_payload: []const u8,
+    ) !*Pane {
         var conn = conn_in;
-
         const term = blk: {
-            // conn is ours to clean up only until initRemote takes it.
             errdefer conn.deinit();
-            try conn.sendJson(.attach, .{ .name = name });
-            const snap = try conn.recvExpect(&.{.snapshot});
-            defer snap.deinit(self.allocator);
-            break :blk try Terminal.initRemote(self.allocator, conn, name, snap.payload);
+            break :blk try Terminal.initRemote(self.allocator, conn, name, snap_payload);
         };
         errdefer term.deinit();
         term.debug_to_stderr = self.debug_events;
         // Remember the transport host so session renames can rebuild
-        // the "⌁ name @ host" tab title.
+        // the "⌁ name @ host" tab title (and layout save records it).
         if (host) |h| {
             term.remote.?.host = self.allocator.dupe(u8, h) catch null;
         }
@@ -2945,6 +3021,68 @@ pub const Window = struct {
         // pane-creation path gets. Must happen before the widget
         // enters the tree (realize builds the atlas from pane state).
         self.applyPaneConfig(pane, .{});
+        try self.panes.append(self.allocator, pane);
+        try self.terminals.append(self.allocator, term);
+        // Pane sinks are wired — push snapshot-restored image
+        // placements into the ImageStore.
+        term.replayRetainedImages();
+        return pane;
+    }
+
+    /// Layout restore for a durable mux pane: attach when the
+    /// session still exists, otherwise recreate it under the SAME
+    /// name (daemon restarted / server rebooted) and attach that —
+    /// "resume or create". Returns the placed-nowhere pane.
+    fn restoreMuxPane(self: *Window, spec: layout_mod.PaneSpec) !*Pane {
+        const host: ?[]const u8 = if (spec.mux_host.len > 0) spec.mux_host else null;
+        var conn = try self.muxConnect(host);
+
+        const Owned = @TypeOf(try conn.recvFrame());
+        var snap: Owned = undefined;
+        {
+            errdefer conn.deinit();
+            try conn.sendJson(.attach, .{ .name = spec.mux_session });
+            const reply = try conn.recvExpect(&.{ .snapshot, .err });
+            if (reply.ftype == .snapshot) {
+                snap = reply;
+            } else {
+                reply.deinit(self.allocator);
+                // Session gone — recreate. Local spawns honour the
+                // saved cwd + configured shell; remote spawns send
+                // empty argv = the remote's login shell.
+                const argv: []const []const u8 = if (host != null) &.{} else blk: {
+                    const sh: []const u8 = if (self.config.shell) |s| s else sh2: {
+                        const env = c.getenv("SHELL");
+                        break :sh2 if (env != null) std.mem.span(env) else "/bin/sh";
+                    };
+                    break :blk &.{sh};
+                };
+                try conn.sendJson(.spawn, .{
+                    .name = spec.mux_session,
+                    .argv = argv,
+                    .cwd = if (host != null or spec.cwd.len == 0) null else spec.cwd,
+                    .rows = @as(u16, 24),
+                    .cols = @as(u16, 80),
+                });
+                (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
+                try conn.sendJson(.attach, .{ .name = spec.mux_session });
+                snap = try conn.recvExpect(&.{.snapshot});
+            }
+        }
+        defer snap.deinit(self.allocator);
+        return self.makeRemotePaneFromSnap(conn, spec.mux_session, host, snap.payload);
+    }
+
+    pub fn attachMux(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane) !void {
+        var conn = conn_in;
+
+        const snap = blk: {
+            errdefer conn.deinit();
+            try conn.sendJson(.attach, .{ .name = name });
+            break :blk try conn.recvExpect(&.{.snapshot});
+        };
+        defer snap.deinit(self.allocator);
+        const pane = try self.makeRemotePaneFromSnap(conn, name, host, snap.payload);
 
         var title_buf: [160:0]u8 = undefined;
         const title_z = if (host) |h|
@@ -2985,12 +3123,6 @@ pub const Window = struct {
         };
         c.adw_tab_page_set_title(page, title_z.ptr);
         c.adw_tab_page_set_tooltip(page, title_z.ptr);
-
-        try self.panes.append(self.allocator, pane);
-        try self.terminals.append(self.allocator, term);
-        // Pane sinks are wired — push snapshot-restored image
-        // placements into the ImageStore.
-        term.replayRetainedImages();
         c.adw_tab_view_set_selected_page(self.tab_view, page);
         _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
     }
@@ -4059,7 +4191,29 @@ pub const Window = struct {
                     try arena.dupe(u8, pn)
                 else
                     "";
-                return .{ .pane = .{ .cwd = cwd, .command = cmd, .font_size = fs, .profile = prof } };
+                // Explicit shader pick travels with the layout;
+                // profile/global shaders re-resolve on restore.
+                const shader: []const u8 = if (p.custom_shader_user)
+                    (if (p.custom_shader_path) |sp| try arena.dupe(u8, sp) else "")
+                else
+                    "";
+                // Durable mux panes: session + transport so restore
+                // can reattach (or recreate under the same name).
+                var mux_session: []const u8 = "";
+                var mux_host: []const u8 = "";
+                if (p.terminal.remote) |r| {
+                    mux_session = try arena.dupe(u8, r.session);
+                    if (r.host) |h| mux_host = try arena.dupe(u8, h);
+                }
+                return .{ .pane = .{
+                    .cwd = cwd,
+                    .command = cmd,
+                    .font_size = fs,
+                    .profile = prof,
+                    .custom_shader = shader,
+                    .mux_session = mux_session,
+                    .mux_host = mux_host,
+                } };
             }
         }
         return error.PaneNotFound;
@@ -4521,6 +4675,8 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .new_tab => self.newShellTab(null) catch |err| logActionError("new_tab", err),
         .new_tab_as_profile => self.openProfilePicker(),
         .duplicate_tab => self.duplicateCurrentTab(),
+        .shader_pick => self.pickPaneShader(),
+        .shader_clear => self.clearPaneShader(),
         .close_tab => self.closeCurrentTab(),
         .rename_tab => self.renameCurrentTab(),
         .color_tab => self.chooseTabColor(),
@@ -4540,6 +4696,34 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .prefs_open => self.openPrefs(),
         else => {},
     }
+}
+
+const ShaderPickCtx = struct {
+    win: *Window,
+    pane: *Pane,
+};
+
+fn onShaderPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(ShaderPickCtx, user);
+    defer ctx.win.allocator.destroy(ctx);
+    const dialog: *c.GtkFileDialog = @ptrCast(source);
+    const file = c.gtk_file_dialog_open_finish(dialog, result, null) orelse return;
+    defer c.g_object_unref(file);
+    const path_cstr = c.g_file_get_path(file) orelse return;
+    defer c.g_free(path_cstr);
+
+    // The pane may have closed while the dialog was up — only act if
+    // it's still listed (the pointer would be dangling otherwise).
+    var alive = false;
+    for (ctx.win.panes.items) |p| {
+        if (p == ctx.pane) {
+            alive = true;
+            break;
+        }
+    }
+    if (!alive) return;
+    const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
+    _ = ctx.pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true);
 }
 
 fn onSaveLayoutAsDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {

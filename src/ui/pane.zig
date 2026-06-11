@@ -16,6 +16,7 @@ const CellPass = @import("../render/cell_pass.zig").CellPass;
 const ImagePass = @import("../render/image_pass.zig").ImagePass;
 const BgPass = @import("../render/bg_pass.zig").BgPass;
 const ShaderPass = @import("../render/shader_pass.zig").ShaderPass;
+const ShaderSource = @import("../render/shader_pass.zig").Source;
 const ImageStore = @import("../grid/image_store.zig").Store;
 const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -52,6 +53,21 @@ pub const Pane = struct {
     shader_pass: ShaderPass = .{},
     /// iTime epoch for the custom shader (monotonic µs; 0 = unset).
     shader_epoch_us: i64 = 0,
+    /// Window-level shader source (the config-global one). The pane
+    /// falls back to this when it has no own shader. Set by
+    /// applyPaneConfig.
+    shader_default_source: ?*const ShaderSource = null,
+    /// Pane-owned shader (profile override or explicit user pick) —
+    /// wins over the window default. `shader_own_src` backs
+    /// `shader_own.src`; `custom_shader_path` is kept for change
+    /// detection + layout persistence. All pane-allocator-owned.
+    shader_own: ShaderSource = .{},
+    shader_own_src: ?[]u8 = null,
+    custom_shader_path: ?[]u8 = null,
+    /// True when the user picked the shader explicitly (context
+    /// menu / palette / restored layout) — config reloads and
+    /// profile pushes then leave it alone.
+    custom_shader_user: bool = false,
     image_store: ImageStore,
     allocator: std.mem.Allocator,
     input_ctx: ?*input.Ctx = null,
@@ -577,6 +593,8 @@ pub const Pane = struct {
         self.cell_pass.deinit();
         self.image_pass.deinit();
         self.image_store.deinit();
+        if (self.shader_own_src) |s| self.allocator.free(s);
+        if (self.custom_shader_path) |s| self.allocator.free(s);
         if (self.atlas) |a| a.deinit();
         if (self.input_ctx) |ictx| {
             // Disconnect every signal handler we connected with `ctx`
@@ -707,6 +725,77 @@ pub const Pane = struct {
     pub fn updateShaderTick(self: *Pane) void {
         self.ensureTickRunning();
         c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    }
+
+    /// Set (or clear, with null) this pane's own shader. Reads the
+    /// file immediately; a same-path call only refreshes `animate`.
+    /// `user_pick` marks the choice as explicit so profile/config
+    /// pushes won't overwrite it. Returns false when the file could
+    /// not be read (pane falls back to the window default).
+    pub fn setCustomShader(self: *Pane, path: ?[]const u8, animate: bool, user_pick: bool) bool {
+        if (path == null and self.custom_shader_path == null) return true;
+        if (path) |p| if (self.custom_shader_path) |cur| {
+            if (std.mem.eql(u8, p, cur)) {
+                self.shader_own.animate = animate;
+                if (user_pick) self.custom_shader_user = true;
+                self.updateShaderTick();
+                return true;
+            }
+        };
+
+        // Drop the old own shader.
+        if (self.shader_own_src) |s| self.allocator.free(s);
+        if (self.custom_shader_path) |s| self.allocator.free(s);
+        self.shader_own_src = null;
+        self.custom_shader_path = null;
+        self.shader_own.src = null;
+        self.custom_shader_user = false;
+
+        var ok = true;
+        if (path) |p| read: {
+            var path_z: [4096]u8 = undefined;
+            if (p.len >= path_z.len) {
+                ok = false;
+                break :read;
+            }
+            @memcpy(path_z[0..p.len], p);
+            path_z[p.len] = 0;
+            const fp = c.fopen(@ptrCast(&path_z), "rb") orelse {
+                std.debug.print("sketerm: pane shader not readable: {s}\n", .{p});
+                ok = false;
+                break :read;
+            };
+            defer _ = c.fclose(fp);
+            const buf = self.allocator.alloc(u8, 256 * 1024) catch {
+                ok = false;
+                break :read;
+            };
+            const n = c.fread(buf.ptr, 1, buf.len, fp);
+            if (n == 0) {
+                self.allocator.free(buf);
+                ok = false;
+                break :read;
+            }
+            self.shader_own_src = self.allocator.realloc(buf, n) catch buf[0..n];
+            self.shader_own.src = self.shader_own_src;
+            self.custom_shader_path = self.allocator.dupe(u8, p) catch null;
+            self.custom_shader_user = user_pick;
+        }
+        self.shader_own.animate = animate;
+        self.shader_own.generation +%= 1;
+        self.refreshShaderBinding();
+        self.updateShaderTick();
+        return ok;
+    }
+
+    /// Point the GL pass at the pane's own shader when one is
+    /// loaded, else at the window-level default.
+    pub fn refreshShaderBinding(self: *Pane) void {
+        if (self.shader_own.src != null) {
+            self.shader_pass.source = &self.shader_own;
+        } else {
+            self.shader_pass.source = self.shader_default_source;
+        }
     }
 
     /// Set the per-pane title bar text. Called from the on_title sink

@@ -78,6 +78,10 @@ pub const Profile = struct {
     scrollback: u32 = 0,
     /// Override for login_shell. null → inherit.
     login_shell: ?bool = null,
+    /// Per-profile custom post-process shader (retroterm-style GLSL
+    /// file). Empty → inherit `Config.custom_shader` (which may also
+    /// be empty = none).
+    custom_shader: []const u8 = "",
 };
 
 /// `[domain.<name>]` sections — named remote mux endpoints, so the
@@ -408,6 +412,7 @@ pub const Config = struct {
             cp.scheme = try arena.dupe(u8, p.scheme);
             cp.term_env = try arena.dupe(u8, p.term_env);
             cp.color_term_env = try arena.dupe(u8, p.color_term_env);
+            cp.custom_shader = try arena.dupe(u8, p.custom_shader);
             out.profiles.appendAssumeCapacity(cp);
         }
         out.domains = .empty;
@@ -708,6 +713,7 @@ pub const Config = struct {
             if (prof.color_term_env.len > 0) try w.print("color_term = {s}\n", .{prof.color_term_env});
             if (prof.scrollback != 0) try w.print("scrollback = {d}\n", .{prof.scrollback});
             if (prof.login_shell) |b| try w.print("login_shell = {s}\n", .{if (b) "true" else "false"});
+            if (prof.custom_shader.len > 0) try w.print("custom_shader = {s}\n", .{prof.custom_shader});
             if (prof.palette) |pal| {
                 try w.writeAll("palette = ");
                 for (pal, 0..) |rgb, i| {
@@ -896,6 +902,8 @@ fn applyProfileKv(prof: *Profile, arena: std.mem.Allocator, key: []const u8, val
         prof.scrollback = try parseU32(value);
     } else if (std.mem.eql(u8, key, "login_shell")) {
         prof.login_shell = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "custom_shader")) {
+        prof.custom_shader = try expandTilde(arena, value);
     } else {
         warnConfig("unknown profile key '{s}' (ignoring)", .{key});
     }
@@ -1363,6 +1371,32 @@ test "config: serialise round-trips through loadFromBytes" {
     try std.testing.expect(@abs(parsed.default_fg[1] - 0.5) < 0.01);
     try std.testing.expect(@abs(parsed.default_fg[2] - 0.0) < 0.01);
     try std.testing.expect(@abs(parsed.cursor_color[1] - 1.0) < 0.01);
+}
+
+test "config: profile custom_shader parses and round-trips" {
+    const src =
+        "custom_shader = /tmp/global.glsl\n" ++
+        "[profile.retro]\n" ++
+        "scheme = monokai\n" ++
+        "custom_shader = /tmp/crt.glsl\n";
+    var cfg = try Config.loadFromBytes(std.testing.allocator, src);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("/tmp/global.glsl", cfg.custom_shader);
+    try std.testing.expectEqual(@as(usize, 1), cfg.profiles.items.len);
+    try std.testing.expectEqualStrings("/tmp/crt.glsl", cfg.profiles.items[0].custom_shader);
+
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const out = w.buffered();
+    var re = try Config.loadFromBytes(std.testing.allocator, out);
+    defer re.deinit();
+    try std.testing.expectEqualStrings("/tmp/crt.glsl", re.profiles.items[0].custom_shader);
+
+    // Clone keeps the profile shader (config-reload path).
+    var cl = try cfg.clone(std.testing.allocator);
+    defer cl.deinit();
+    try std.testing.expectEqualStrings("/tmp/crt.glsl", cl.profiles.items[0].custom_shader);
 }
 
 test "config: show_titlebar / show_tab_bar round-trip" {
