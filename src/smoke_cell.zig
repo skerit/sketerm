@@ -578,6 +578,67 @@ pub fn main() !u8 {
         }
     }
 
+    // Inactive-pane dim: the dim-only post path (no user shader).
+    // Render a known mid-gray scene, then darken 0.5 + desaturate 0,
+    // and confirm the output is ~half brightness with hue intact.
+    {
+        const ShaderPass = @import("render/shader_pass.zig").ShaderPass;
+        var sp = ShaderPass{};
+        sp.dim_darken = 0.5;
+        sp.dim_desat = 0.0;
+        if (!sp.beginDim(allocator, W, H)) {
+            std.debug.print("smoke-cell: FAIL — beginDim failed\n", .{});
+            return 23;
+        }
+        c.glViewport(0, 0, W, H);
+        // Distinct channels so a desaturate bug would show as channel
+        // convergence: (200, 100, 40).
+        c.glClearColor(200.0 / 255.0, 100.0 / 255.0, 40.0 / 255.0, 1.0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        sp.finishDim(W, H);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        const r: i32 = fb[0];
+        const g: i32 = fb[1];
+        const b: i32 = fb[2];
+        std.debug.print("smoke-cell: dim darken r={d} g={d} b={d}\n", .{ r, g, b });
+        // Each channel ~halved (200->100, 100->50, 40->20), ±8.
+        if (@abs(r - 100) > 8 or @abs(g - 50) > 8 or @abs(b - 20) > 8) {
+            std.debug.print("smoke-cell: FAIL — darken math wrong\n", .{});
+            return 24;
+        }
+        sp.releaseGL();
+    }
+
+    // Inactive-pane desaturate: full desaturate must collapse the
+    // channels to a single luma value (no darken).
+    {
+        const ShaderPass = @import("render/shader_pass.zig").ShaderPass;
+        var sp = ShaderPass{};
+        sp.dim_darken = 0.0;
+        sp.dim_desat = 1.0;
+        if (!sp.beginDim(allocator, W, H)) {
+            std.debug.print("smoke-cell: FAIL — beginDim (desat) failed\n", .{});
+            return 25;
+        }
+        c.glViewport(0, 0, W, H);
+        c.glClearColor(200.0 / 255.0, 100.0 / 255.0, 40.0 / 255.0, 1.0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        sp.finishDim(W, H);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        const r: i32 = fb[0];
+        const g: i32 = fb[1];
+        const b: i32 = fb[2];
+        std.debug.print("smoke-cell: dim desat r={d} g={d} b={d}\n", .{ r, g, b });
+        // luma = 0.2126*200 + 0.7152*100 + 0.0722*40 ≈ 116; all equal.
+        if (@abs(r - g) > 3 or @abs(g - b) > 3 or @abs(r - 116) > 8) {
+            std.debug.print("smoke-cell: FAIL — desaturate math wrong\n", .{});
+            return 26;
+        }
+        sp.releaseGL();
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }

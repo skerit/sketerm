@@ -1457,8 +1457,8 @@ pub const Window = struct {
         // Per-pane titlebar visibility.
         pane.setTitlebarVisible(self.config.show_titlebar);
         // Inactive-pane dimming factors.
-        pane.inactive_fg_dim = self.config.inactive_fg_dim;
-        pane.inactive_bg_dim = self.config.inactive_bg_dim;
+        pane.inactive_darken = self.config.inactive_darken;
+        pane.inactive_desaturate = self.config.inactive_desaturate;
         pane.applyDim();
         return pane;
     }
@@ -2878,8 +2878,8 @@ pub const Window = struct {
             // Per-pane titlebar visibility.
             p.setTitlebarVisible(self.config.show_titlebar);
             // Inactive-pane dimming.
-            p.inactive_fg_dim = self.config.inactive_fg_dim;
-            p.inactive_bg_dim = self.config.inactive_bg_dim;
+            p.inactive_darken = self.config.inactive_darken;
+            p.inactive_desaturate = self.config.inactive_desaturate;
             p.applyDim();
             // Repaint.
             screen.dirty = true;

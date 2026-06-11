@@ -363,16 +363,34 @@ const FRAG_HEADER =
     \\uniform float iTime;
     \\uniform float iTimeDelta;
     \\uniform int iFrame;
+    \\uniform float sketerm_dim_darken;
+    \\uniform float sketerm_dim_desat;
     \\#line 1
     \\
 ;
 
+// The footer applies the inactive-pane dim to the shader's OUTPUT —
+// a single uniform desaturate toward luma then a uniform darken, so
+// the whole pane recedes without altering any colour relationship
+// (both default 0 = identity for a focused pane).
 const FRAG_FOOTER =
     \\
     \\void main() {
     \\    mainImage(sketerm_frag, v_uv * iResolution.xy);
+    \\    float sketerm_luma = dot(sketerm_frag.rgb, vec3(0.2126, 0.7152, 0.0722));
+    \\    sketerm_frag.rgb = mix(sketerm_frag.rgb, vec3(sketerm_luma), sketerm_dim_desat);
+    \\    sketerm_frag.rgb *= (1.0 - sketerm_dim_darken);
     \\}
     \\
+;
+
+/// Built-in identity shader: samples the scene unchanged. The footer
+/// then applies dim/desaturate. Used for the dim-only path (inactive
+/// pane with no custom shader of its own).
+const DIM_IDENTITY_SRC =
+    \\void mainImage(out vec4 c, in vec2 f) {
+    \\    c = texture(iChannel0, f / iResolution.xy);
+    \\}
 ;
 
 pub const ShaderPass = struct {
@@ -389,6 +407,21 @@ pub const ShaderPass = struct {
     u_time: c_int = -1,
     u_time_delta: c_int = -1,
     u_frame: c_int = -1,
+    u_dim_darken: c_int = -1,
+    u_dim_desat: c_int = -1,
+    /// Inactive-pane dim, applied in the footer (and the dim-only
+    /// program). Both 0 = no effect. Driven by the pane per frame
+    /// from config + focus.
+    dim_darken: f32 = 0,
+    dim_desat: f32 = 0,
+    /// Lazily-built identity+dim program for the dim-only path (an
+    /// inactive pane with no custom shader). Separate from `program`
+    /// so it survives the user-shader generation cache.
+    dim_program: c_uint = 0,
+    dim_u_channel0: c_int = -1,
+    dim_u_resolution: c_int = -1,
+    dim_u_darken: c_int = -1,
+    dim_u_desat: c_int = -1,
     /// Previous-frame feedback (iChannel1): the user shader renders
     /// into a ping-pong texture pair instead of straight to screen;
     /// last frame's OUTPUT is sampled this frame (phosphor
@@ -436,12 +469,18 @@ pub const ShaderPass = struct {
         self.lut_tex = .{ 0, 0, 0, 0 };
         self.lut_loc = .{ -1, -1, -1, -1 };
         self.lut_len = 0;
+        self.dim_program = 0;
+        self.dim_u_channel0 = -1;
+        self.dim_u_resolution = -1;
+        self.dim_u_darken = -1;
+        self.dim_u_desat = -1;
         self.built_generation = std.math.maxInt(u32);
         self.failed = false;
     }
 
     pub fn releaseGL(self: *ShaderPass) void {
         if (self.program != 0) c.glDeleteProgram(self.program);
+        if (self.dim_program != 0) c.glDeleteProgram(self.dim_program);
         if (self.vao != 0) {
             var v = self.vao;
             c.glDeleteVertexArrays(1, &v);
@@ -514,6 +553,8 @@ pub const ShaderPass = struct {
         self.u_time = c.glGetUniformLocation(self.program, "iTime");
         self.u_time_delta = c.glGetUniformLocation(self.program, "iTimeDelta");
         self.u_frame = c.glGetUniformLocation(self.program, "iFrame");
+        self.u_dim_darken = c.glGetUniformLocation(self.program, "sketerm_dim_darken");
+        self.u_dim_desat = c.glGetUniformLocation(self.program, "sketerm_dim_desat");
 
         // Tunable uniforms: //@param declarations → locations. A
         // param whose uniform got optimized out keeps loc -1 and is
@@ -545,20 +586,25 @@ pub const ShaderPass = struct {
             self.lut_tex[ti] = self.loadTexture(allocator, d.path());
         }
 
-        if (self.vao == 0) {
-            const quad = [_]f32{ -1, -1, 3, -1, -1, 3 }; // fullscreen triangle
-            c.glGenVertexArrays(1, &self.vao);
-            c.glGenBuffers(1, &self.vbo);
-            c.glBindVertexArray(self.vao);
-            c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
-            c.glBufferData(c.GL_ARRAY_BUFFER, quad.len * @sizeOf(f32), &quad, c.GL_STATIC_DRAW);
-            const a_pos: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_pos"));
-            c.glEnableVertexAttribArray(a_pos);
-            c.glVertexAttribPointer(a_pos, 2, c.GL_FLOAT, c.GL_FALSE, 0, null);
-            c.glBindVertexArray(0);
-        }
+        self.ensureQuad(self.program);
         self.failed = false;
         return true;
+    }
+
+    /// Fullscreen-triangle VAO/VBO, shared by the user-shader and
+    /// dim-only programs (same VERT_SRC → same a_pos location).
+    fn ensureQuad(self: *ShaderPass, program: c_uint) void {
+        if (self.vao != 0) return;
+        const quad = [_]f32{ -1, -1, 3, -1, -1, 3 }; // fullscreen triangle
+        c.glGenVertexArrays(1, &self.vao);
+        c.glGenBuffers(1, &self.vbo);
+        c.glBindVertexArray(self.vao);
+        c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
+        c.glBufferData(c.GL_ARRAY_BUFFER, quad.len * @sizeOf(f32), &quad, c.GL_STATIC_DRAW);
+        const a_pos: c_uint = @intCast(c.glGetAttribLocation(program, "a_pos"));
+        c.glEnableVertexAttribArray(a_pos);
+        c.glVertexAttribPointer(a_pos, 2, c.GL_FLOAT, c.GL_FALSE, 0, null);
+        c.glBindVertexArray(0);
     }
 
     fn ensureTarget(self: *ShaderPass, w: c_int, h: c_int) bool {
@@ -713,6 +759,8 @@ pub const ShaderPass = struct {
         c.glUniform1f(self.u_time, time_s);
         c.glUniform1f(self.u_time_delta, @max(0.0, time_s - self.last_time_s));
         c.glUniform1i(self.u_frame, self.frame_counter);
+        if (self.u_dim_darken >= 0) c.glUniform1f(self.u_dim_darken, self.dim_darken);
+        if (self.u_dim_desat >= 0) c.glUniform1f(self.u_dim_desat, self.dim_desat);
         // Tunable params: shader default, overridden by any matching
         // `shader_param.<name>` config entry. Uploaded every frame so
         // a config reload re-tunes live without recompiling.
@@ -747,6 +795,54 @@ pub const ShaderPass = struct {
             c.glBindFramebuffer(c.GL_FRAMEBUFFER, @intCast(self.prev_fbo));
             self.fb_idx ^= 1;
         }
+        c.glEnable(c.GL_BLEND);
+    }
+
+    /// Whether an inactive-pane dim is requested this frame.
+    pub fn wantsDim(self: *const ShaderPass) bool {
+        return self.dim_darken > 0.0 or self.dim_desat > 0.0;
+    }
+
+    fn ensureDimProgram(self: *ShaderPass, allocator: std.mem.Allocator) bool {
+        if (self.dim_program != 0) return true;
+        const full = std.mem.concat(allocator, u8, &.{ FRAG_HEADER, DIM_IDENTITY_SRC, FRAG_FOOTER }) catch return false;
+        defer allocator.free(full);
+        self.dim_program = gl.buildProgram(VERT_SRC, full) catch return false;
+        self.dim_u_channel0 = c.glGetUniformLocation(self.dim_program, "iChannel0");
+        self.dim_u_resolution = c.glGetUniformLocation(self.dim_program, "iResolution");
+        self.dim_u_darken = c.glGetUniformLocation(self.dim_program, "sketerm_dim_darken");
+        self.dim_u_desat = c.glGetUniformLocation(self.dim_program, "sketerm_dim_desat");
+        self.ensureQuad(self.dim_program);
+        return true;
+    }
+
+    /// Dim-only offscreen redirect: an inactive pane with no custom
+    /// shader still routes through an FBO so `finishDim` can apply the
+    /// uniform darken/desaturate. Returns false to render direct.
+    pub fn beginDim(self: *ShaderPass, allocator: std.mem.Allocator, w: c_int, h: c_int) bool {
+        if (!self.wantsDim()) return false;
+        if (!self.ensureDimProgram(allocator)) return false;
+        c.glGetIntegerv(c.GL_DRAW_FRAMEBUFFER_BINDING, &self.prev_fbo);
+        if (!self.ensureTarget(w, h)) return false;
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, self.fbo);
+        return true;
+    }
+
+    /// Composite the scene texture to screen with dim/desaturate.
+    pub fn finishDim(self: *ShaderPass, w: c_int, h: c_int) void {
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, @intCast(self.prev_fbo));
+        c.glViewport(0, 0, w, h);
+        c.glDisable(c.GL_BLEND);
+        c.glUseProgram(self.dim_program);
+        c.glActiveTexture(c.GL_TEXTURE0);
+        c.glBindTexture(c.GL_TEXTURE_2D, self.tex);
+        c.glUniform1i(self.dim_u_channel0, 0);
+        c.glUniform3f(self.dim_u_resolution, @floatFromInt(w), @floatFromInt(h), 1.0);
+        if (self.dim_u_darken >= 0) c.glUniform1f(self.dim_u_darken, self.dim_darken);
+        if (self.dim_u_desat >= 0) c.glUniform1f(self.dim_u_desat, self.dim_desat);
+        c.glBindVertexArray(self.vao);
+        c.glDrawArrays(c.GL_TRIANGLES, 0, 3);
+        c.glBindVertexArray(0);
         c.glEnable(c.GL_BLEND);
     }
 };

@@ -206,12 +206,14 @@ pub const Pane = struct {
     /// freed in deinit.
     spawn_argv: ?[][]u8 = null,
 
-    /// Inactive-pane dimming. When `is_focused` is false, the renderer
-    /// multiplies fg/bg colours by `inactive_fg_dim` / `inactive_bg_dim`.
-    /// Cursor / selection / overlay stay full-bright.
+    /// Inactive-pane dimming. When `is_focused` is false, the FINAL
+    /// composited pane is uniformly darkened (`inactive_darken`) and
+    /// optionally desaturated (`inactive_desaturate`) by a post-
+    /// process step — preserving every fg/bg colour relationship,
+    /// unlike a per-cell multiply. 0/0 = no dim.
     is_focused: bool = false,
-    inactive_fg_dim: f32 = 0.8,
-    inactive_bg_dim: f32 = 1.0,
+    inactive_darken: f32 = 0.2,
+    inactive_desaturate: f32 = 0.0,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *Terminal) !*Pane {
         const self = try allocator.create(Pane);
@@ -521,19 +523,24 @@ pub const Pane = struct {
     }
 
     /// Push the current focus / dim settings into the renderer. Called
-    /// on focus change AND when dim factors change via prefs.
+    /// on focus change AND when dim factors change via prefs. The dim
+    /// is a uniform post-process (shader_pass), not a per-cell
+    /// multiply — so the cell/grid dim uniforms stay neutral.
     pub fn applyDim(self: *Pane) void {
+        self.cell_pass.dim_fg = 1.0;
+        self.cell_pass.dim_bg = 1.0;
+        self.grid_pass.dim_fg = 1.0;
+        self.grid_pass.dim_bg = 1.0;
         if (self.is_focused) {
-            self.cell_pass.dim_fg = 1.0;
-            self.cell_pass.dim_bg = 1.0;
-            self.grid_pass.dim_fg = 1.0;
-            self.grid_pass.dim_bg = 1.0;
+            self.shader_pass.dim_darken = 0;
+            self.shader_pass.dim_desat = 0;
         } else {
-            self.cell_pass.dim_fg = self.inactive_fg_dim;
-            self.cell_pass.dim_bg = self.inactive_bg_dim;
-            self.grid_pass.dim_fg = self.inactive_fg_dim;
-            self.grid_pass.dim_bg = self.inactive_bg_dim;
+            self.shader_pass.dim_darken = self.inactive_darken;
+            self.shader_pass.dim_desat = self.inactive_desaturate;
         }
+        // Callers (focus handlers, config-change loop) queue the
+        // redraw — applyDim runs during early pane setup too, when
+        // self.area isn't a realizable GL area yet.
     }
 
     /// Push the current selection to PRIMARY (always, for middle-
@@ -1107,8 +1114,11 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
 
     // Custom-shader detour: render the whole scene into an offscreen
     // texture; finish() maps it through the user shader at the end.
+    // When there's no custom shader but the pane is inactive (dim
+    // requested), take the same offscreen path for a dim-only post.
     const shader_on = self.shader_pass.active() and
         self.shader_pass.begin(self.allocator, phys_w, phys_h);
+    const dim_on = !shader_on and self.shader_pass.beginDim(self.allocator, phys_w, phys_h);
 
     c.glViewport(0, 0, phys_w, phys_h);
     c.glClearColor(self.grid_pass.default_bg[0], self.grid_pass.default_bg[1], self.grid_pass.default_bg[2], self.grid_pass.default_bg[3]);
@@ -1177,6 +1187,8 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
         if (self.shader_epoch_us == 0) self.shader_epoch_us = now_us;
         const time_s: f32 = @as(f32, @floatFromInt(now_us - self.shader_epoch_us)) / 1e6;
         self.shader_pass.finish(phys_w, phys_h, time_s);
+    } else if (dim_on) {
+        self.shader_pass.finishDim(phys_w, phys_h);
     }
 
     if (profile.enabled) {

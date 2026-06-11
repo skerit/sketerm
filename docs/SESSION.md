@@ -4794,3 +4794,27 @@ Tests 454 → 466.
   are still global (config.shader_params, shared by all panes). The
   shader SELECTION and clear are per-tab; per-tab param overrides
   would need per-pane override slices — deferred.
+
+## 2026-06-12: inactive-pane dim → uniform post-process (darken + desaturate)
+
+- Replaced the per-cell inactive dim (fg.rgb*k_fg, bg.rgb*k_bg with
+  DIFFERENT factors → changed fg/bg contrast and broke the
+  minimum-contrast lift, so colors looked different when inactive)
+  with a UNIFORM post-process over the whole composited pane.
+- Implemented inside shader_pass: FRAG_FOOTER now applies
+  desaturate-toward-luma then darken via sketerm_dim_desat /
+  sketerm_dim_darken (both 0 for focused panes). A dim-only path
+  (beginDim/finishDim + a built-in identity program) handles
+  inactive panes with no custom shader; panes WITH a custom shader
+  get dimmed in the same footer. Uniform scalar on the final image →
+  every colour relationship preserved, just dimmer.
+- Two config sliders (prefs "Inactive pane dimming"):
+  inactive_darken (default 0.20) and inactive_desaturate (default
+  0.00). Old inactive_fg_dim/inactive_bg_dim keys are accepted +
+  ignored so old configs don't error.
+- smoke-cell proves the math: darken 0.5 maps (200,100,40)->
+  (100,50,20) exactly (hue intact); desaturate 1.0 ->(117,117,117)
+  (=luma). 492 tests pass.
+- NOTE: pre-existing harmless startup Gtk-CRITICAL
+  (gtk_gl_area_queue_render before realize) confirmed present on
+  r662 too — not from this work.

@@ -146,9 +146,9 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     // Inactive pane dimming.
     const dim_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(dim_group)), "Inactive pane dimming");
-    c.adw_preferences_group_set_description(@ptrCast(@alignCast(dim_group)), "Multiply unfocused panes' colours. 1.0 = no dim. Defaults match Terminator (fg 0.8, bg 1.0).");
-    addSpinRowF32Step(@ptrCast(@alignCast(dim_group)), ctx, "Foreground dim", "Multiplier for text + decorations.", 0.0, 1.0, 0.05, 2, &ctx.cfg.inactive_fg_dim, applyOnly);
-    addSpinRowF32Step(@ptrCast(@alignCast(dim_group)), ctx, "Background dim", "Multiplier for cell backgrounds.", 0.0, 1.0, 0.05, 2, &ctx.cfg.inactive_bg_dim, applyOnly);
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(dim_group)), "Uniformly darken (and optionally desaturate) unfocused panes. Applied to the whole pane, so colours stay true \xe2\x80\x94 just dimmer.");
+    addSpinRowF32Step(@ptrCast(@alignCast(dim_group)), ctx, "Darken", "How much to darken unfocused panes. 0 = none, 1 = black.", 0.0, 1.0, 0.05, 2, &ctx.cfg.inactive_darken, applyOnly);
+    addSpinRowF32Step(@ptrCast(@alignCast(dim_group)), ctx, "Desaturate", "Fade unfocused panes toward gray. 0 = full colour, 1 = grayscale.", 0.0, 1.0, 0.05, 2, &ctx.cfg.inactive_desaturate, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(dim_group)));
 
     // Text legibility.

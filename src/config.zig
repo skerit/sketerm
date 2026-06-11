@@ -285,16 +285,14 @@ pub const Config = struct {
     background_opacity: f32 = 1.0,
 
     // Inactive pane dimming (Terminator-style: multiply RGB channels)
-    /// Multiplier applied to foreground colours of unfocused panes.
-    /// 1.0 = no dim; 0.0 = fully black. Terminator default is 0.8 —
-    /// the unfocused text becomes visibly dimmer without hurting
-    /// readability. Cursor, selection, overlay, and decorations
-    /// stay at full brightness.
-    inactive_fg_dim: f32 = 0.8,
-    /// Same for background. Default 1.0 means "no dim on bg" — most
-    /// users prefer the unfocused pane to keep its dark theme. Set
-    /// closer to 0.85 for a subtle "sleeping" effect.
-    inactive_bg_dim: f32 = 1.0,
+    /// Uniform darken applied to the FINAL composited image of an
+    /// unfocused pane (post-process, so every fg/bg colour relation is
+    /// preserved — just dimmer). 0 = no dim; 1 = black. Default 0.2.
+    inactive_darken: f32 = 0.2,
+    /// Optional desaturation of an unfocused pane, blending toward
+    /// luma. 0 = full colour (default); 1 = grayscale. Combines with
+    /// `inactive_darken`.
+    inactive_desaturate: f32 = 0.0,
 
     /// Minimum WCAG contrast ratio between text and its cell
     /// background, 1.0 (off) .. 21.0. Text falling below the
@@ -675,10 +673,10 @@ pub const Config = struct {
             try w.print("background_opacity = {d:.2}\n", .{self.background_opacity});
 
         // Inactive pane dimming.
-        if (self.inactive_fg_dim != 0.8)
-            try w.print("inactive_fg_dim = {d:.2}\n", .{self.inactive_fg_dim});
-        if (self.inactive_bg_dim != 1.0)
-            try w.print("inactive_bg_dim = {d:.2}\n", .{self.inactive_bg_dim});
+        if (self.inactive_darken != 0.2)
+            try w.print("inactive_darken = {d:.2}\n", .{self.inactive_darken});
+        if (self.inactive_desaturate != 0.0)
+            try w.print("inactive_desaturate = {d:.2}\n", .{self.inactive_desaturate});
         if (self.minimum_contrast != 1.0)
             try w.print("minimum_contrast = {d:.2}\n", .{self.minimum_contrast});
 
@@ -1141,10 +1139,14 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.background_gradient_to = try parseColor(value);
     } else if (std.mem.eql(u8, key, "background_gradient_angle")) {
         cfg.background_gradient_angle = try parseFloat(value);
-    } else if (std.mem.eql(u8, key, "inactive_fg_dim")) {
-        cfg.inactive_fg_dim = std.math.clamp(try parseFloat(value), 0.0, 1.0);
-    } else if (std.mem.eql(u8, key, "inactive_bg_dim")) {
-        cfg.inactive_bg_dim = std.math.clamp(try parseFloat(value), 0.0, 1.0);
+    } else if (std.mem.eql(u8, key, "inactive_darken")) {
+        cfg.inactive_darken = std.math.clamp(try parseFloat(value), 0.0, 1.0);
+    } else if (std.mem.eql(u8, key, "inactive_desaturate")) {
+        cfg.inactive_desaturate = std.math.clamp(try parseFloat(value), 0.0, 1.0);
+    } else if (std.mem.eql(u8, key, "inactive_fg_dim") or std.mem.eql(u8, key, "inactive_bg_dim")) {
+        // Retired per-cell dim keys — accepted (and ignored) so old
+        // config files don't error. Use inactive_darken instead.
+        _ = parseFloat(value) catch {};
     } else if (std.mem.eql(u8, key, "show_titlebar")) {
         cfg.show_titlebar = try parseBool(value);
     } else if (std.mem.eql(u8, key, "show_tab_bar")) {
