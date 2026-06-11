@@ -481,6 +481,103 @@ pub fn main() !u8 {
         }
     }
 
+    // //@texture inputs: builtin:noise and a file LUT. The shaders
+    // output ONLY the texture, so the framebuffer content proves the
+    // load+bind path end to end.
+    {
+        const ShaderPass = @import("render/shader_pass.zig").ShaderPass;
+        const ShaderSource = @import("render/shader_pass.zig").Source;
+
+        // builtin:noise — output should be wideband noise.
+        const noise_user =
+            \\//@texture noiseTex builtin:noise
+            \\uniform sampler2D noiseTex;
+            \\void mainImage(out vec4 o, in vec2 fc) {
+            \\    o = vec4(texture(noiseTex, fc / 256.0).rgb, 1.0);
+            \\}
+        ;
+        var nsrc = ShaderSource{ .src = noise_user, .generation = 1 };
+        var nsp = ShaderPass{ .source = &nsrc };
+        if (!nsp.begin(allocator, W, H)) {
+            std.debug.print("smoke-cell: FAIL — noise texture shader begin failed\n", .{});
+            return 18;
+        }
+        c.glViewport(0, 0, W, H);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        nsp.finish(W, H, 0.0);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        var lo: usize = 0;
+        var hi: usize = 0;
+        var nm: usize = 0;
+        while (nm < fb_bytes) : (nm += 4) {
+            if (fb[nm] < 64) lo += 1;
+            if (fb[nm] > 192) hi += 1;
+        }
+        std.debug.print("smoke-cell: noise-tex lo={d} hi={d}\n", .{ lo, hi });
+        if (lo < 1000 or hi < 1000) {
+            std.debug.print("smoke-cell: FAIL — builtin:noise texture not sampled\n", .{});
+            return 19;
+        }
+
+        // File LUT: a hand-written 2x2 pure-red BMP, loaded via a
+        // shader-relative path (Source.dir).
+        const bmp_path = "/tmp/sketerm-smoke-lut.bmp";
+        {
+            // 24-bit BMP, 2x2, rows padded to 4 bytes (2*3=6 → pad 2).
+            const px_data = [_]u8{
+                0, 0, 255, 0, 0, 255, 0, 0, // row 0: BGR red ×2 + pad
+                0, 0, 255, 0, 0, 255, 0, 0, // row 1
+            };
+            var header = [_]u8{0} ** 54;
+            header[0] = 'B';
+            header[1] = 'M';
+            std.mem.writeInt(u32, header[2..6], 54 + px_data.len, .little);
+            std.mem.writeInt(u32, header[10..14], 54, .little);
+            std.mem.writeInt(u32, header[14..18], 40, .little);
+            std.mem.writeInt(i32, header[18..22], 2, .little);
+            std.mem.writeInt(i32, header[22..26], 2, .little);
+            std.mem.writeInt(u16, header[26..28], 1, .little);
+            std.mem.writeInt(u16, header[28..30], 24, .little);
+            const f = c.fopen(bmp_path, "wb") orelse {
+                std.debug.print("smoke-cell: FAIL — cannot write LUT bmp\n", .{});
+                return 20;
+            };
+            _ = c.fwrite(&header, 1, header.len, f);
+            _ = c.fwrite(&px_data, 1, px_data.len, f);
+            _ = c.fclose(f);
+        }
+        const lut_user =
+            \\//@texture lut sketerm-smoke-lut.bmp
+            \\uniform sampler2D lut;
+            \\void mainImage(out vec4 o, in vec2 fc) {
+            \\    o = vec4(texture(lut, fc / iResolution.xy).rgb, 1.0);
+            \\}
+        ;
+        var lsrc = ShaderSource{ .src = lut_user, .generation = 1, .dir = "/tmp" };
+        var lsp = ShaderPass{ .source = &lsrc };
+        if (!lsp.begin(allocator, W, H)) {
+            std.debug.print("smoke-cell: FAIL — file LUT shader begin failed\n", .{});
+            return 21;
+        }
+        c.glViewport(0, 0, W, H);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        lsp.finish(W, H, 0.0);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        var red: usize = 0;
+        var lm: usize = 0;
+        while (lm < fb_bytes) : (lm += 4) {
+            if (fb[lm] > 200 and fb[lm + 1] < 50 and fb[lm + 2] < 50) red += 1;
+        }
+        _ = c.remove(bmp_path);
+        std.debug.print("smoke-cell: file-lut red={d}/{d}\n", .{ red, fb_bytes / 4 });
+        if (red < fb_bytes / 8) {
+            std.debug.print("smoke-cell: FAIL — file LUT not loaded/bound\n", .{});
+            return 22;
+        }
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }

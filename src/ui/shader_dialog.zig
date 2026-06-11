@@ -23,6 +23,7 @@ const Ctx = struct {
     /// Live preview state. The shader source is OUR copy — the
     /// window/pane source can be swapped while the dialog is open.
     src_copy: ?[]u8 = null,
+    dir_copy: ?[]u8 = null,
     preview_source: shader_pass.Source = .{},
     preview_pass: shader_pass.ShaderPass = .{},
     dummy_tex: c_uint = 0,
@@ -54,7 +55,12 @@ pub fn open(win: *Window) bool {
     ctx.params_len = shader_pass.parseParams(src, &ctx.params, &ctx.meta);
     ctx.src_copy = win.allocator.dupe(u8, src) catch null;
     if (ctx.src_copy) |sc| {
-        ctx.preview_source = .{ .src = sc, .animate = true, .generation = 1 };
+        const src_dir: ?[]const u8 = if (pane.shader_own.src != null)
+            pane.shader_own.dir
+        else
+            win.shader_source.dir;
+        if (src_dir) |d| ctx.dir_copy = win.allocator.dupe(u8, d) catch null;
+        ctx.preview_source = .{ .src = sc, .animate = true, .generation = 1, .dir = ctx.dir_copy };
         ctx.preview_pass.source = &ctx.preview_source;
     }
 
@@ -273,6 +279,7 @@ fn onDialogClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {
 fn deferredCtxFree(user: ?*anyopaque) callconv(.c) c.gboolean {
     const ctx = cast.userData(Ctx, user);
     if (ctx.src_copy) |s| ctx.allocator.free(s);
+    if (ctx.dir_copy) |d| ctx.allocator.free(d);
     ctx.allocator.destroy(ctx);
     return 0; // G_SOURCE_REMOVE
 }

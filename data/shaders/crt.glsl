@@ -31,7 +31,9 @@
 #pragma parameter brightness "Brightness" 1.0 0.5 1.6 0.02
 #pragma parameter saturation "Saturation" 1.0 0.0 2.0 0.05
 //@color phosphor 1.00 0.70 0.20 "Phosphor tint"
+//@texture noiseTex builtin:noise
 
+uniform sampler2D noiseTex;
 uniform float colorize;
 uniform float curvature;
 uniform float scanlines;
@@ -108,9 +110,12 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float scan = sin(fragCoord.y * 3.14159) * 0.5 + 0.5;
     col *= 1.0 - scanlines * scan;
 
-    // Static noise (needs animation to crawl).
+    // Static noise — texture grain (cool-retro-term style), crawls
+    // while animating. The repeating 256² noise tile reads softer
+    // than per-pixel hash noise.
     if (noise > 0.0) {
-        col += (hash12(fragCoord + fract(iTime) * 1e3) - 0.5) * noise;
+        vec2 nuv = fragCoord / 256.0 + vec2(fract(iTime * 7.13), fract(iTime * 3.77));
+        col += (texture(noiseTex, nuv).rgb - 0.5) * noise;
     }
 
     // Vignette darkens the corners like a real tube.

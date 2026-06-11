@@ -63,6 +63,7 @@ pub const Pane = struct {
     /// detection + layout persistence. All pane-allocator-owned.
     shader_own: ShaderSource = .{},
     shader_own_src: ?[]u8 = null,
+    shader_own_dir: ?[]u8 = null,
     custom_shader_path: ?[]u8 = null,
     /// True when the user picked the shader explicitly (context
     /// menu / palette / restored layout) — config reloads and
@@ -594,6 +595,7 @@ pub const Pane = struct {
         self.image_pass.deinit();
         self.image_store.deinit();
         if (self.shader_own_src) |s| self.allocator.free(s);
+        if (self.shader_own_dir) |d| self.allocator.free(d);
         if (self.custom_shader_path) |s| self.allocator.free(s);
         if (self.atlas) |a| a.deinit();
         if (self.input_ctx) |ictx| {
@@ -746,9 +748,12 @@ pub const Pane = struct {
         // Drop the old own shader.
         if (self.shader_own_src) |s| self.allocator.free(s);
         if (self.custom_shader_path) |s| self.allocator.free(s);
+        if (self.shader_own_dir) |d| self.allocator.free(d);
         self.shader_own_src = null;
         self.custom_shader_path = null;
+        self.shader_own_dir = null;
         self.shader_own.src = null;
+        self.shader_own.dir = null;
         self.custom_shader_user = false;
 
         var ok = true;
@@ -779,6 +784,11 @@ pub const Pane = struct {
             self.shader_own_src = self.allocator.realloc(buf, n) catch buf[0..n];
             self.shader_own.src = self.shader_own_src;
             self.custom_shader_path = self.allocator.dupe(u8, p) catch null;
+            // Shader-relative //@texture paths resolve against this.
+            if (std.fs.path.dirname(p)) |d| {
+                self.shader_own_dir = self.allocator.dupe(u8, d) catch null;
+                self.shader_own.dir = self.shader_own_dir;
+            }
             self.custom_shader_user = user_pick;
         }
         self.shader_own.animate = animate;

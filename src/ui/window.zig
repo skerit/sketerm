@@ -607,6 +607,7 @@ pub const Window = struct {
         if (self.ipc) |srv| srv.deinit(); // frees ipc_path (server owns it)
         if (self.bg_source.pixels) |px| c.stbi_image_free(px);
         if (self.shader_source.src) |s| self.allocator.free(s);
+        if (self.shader_source.dir) |d| self.allocator.free(d);
         if (self.si_zsh_script) |s| self.allocator.free(s);
         if (self.si_fish_script) |s| self.allocator.free(s);
         if (self.si_zsh_shim) |s| self.allocator.free(s);
@@ -3348,10 +3349,20 @@ pub const Window = struct {
             self.allocator.free(s);
             self.shader_source.src = null;
         }
+        if (self.shader_source.dir) |d| {
+            self.allocator.free(d);
+            self.shader_source.dir = null;
+        }
         self.shader_source.animate = self.config.custom_shader_animation;
         self.shader_source.overrides = self.config.shader_params.items;
 
         const path = self.config.custom_shader;
+        if (path.len > 0) {
+            // Shader-relative //@texture paths resolve against this.
+            if (std.fs.path.dirname(path)) |d| {
+                self.shader_source.dir = self.allocator.dupe(u8, d) catch null;
+            }
+        }
         if (path.len > 0) blk: {
             var path_z: [4096]u8 = undefined;
             if (path.len >= path_z.len) break :blk;

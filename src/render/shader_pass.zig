@@ -29,6 +29,33 @@ pub const Source = struct {
     /// Window re-points it on every reload); values are read each
     /// frame, so changes apply live without recompiling.
     overrides: []const ParamKV = &.{},
+    /// Directory of the shader file (owner-managed memory) —
+    /// relative //@texture paths resolve against it. null = only
+    /// absolute and builtin: paths work.
+    dir: ?[]const u8 = null,
+};
+
+pub const MAX_TEXTURES = 4;
+
+/// An extra texture input declared by the shader:
+///   //@texture <uniform_name> <path|builtin:noise> ["Label"]
+/// Bound to texture units 2.. (0 = iChannel0, 1 = iChannel1).
+/// `builtin:noise` is a generated 256×256 RGBA noise tile
+/// (GL_REPEAT) — what cool-retro-term-style static/jitter wants,
+/// no asset file needed. Image paths load via stb (PNG/JPEG/BMP),
+/// relative to the shader file.
+pub const TextureDecl = struct {
+    name_buf: [32]u8 = undefined,
+    name_len: u8 = 0,
+    path_buf: [256]u8 = undefined,
+    path_len: u8 = 0,
+
+    pub fn name(self: *const TextureDecl) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    pub fn path(self: *const TextureDecl) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
 };
 
 /// One `shader_param.<name> = <value>` config entry. Float params
@@ -277,6 +304,44 @@ test "parseParams: RetroArch #pragma parameter + meta + color" {
     try std.testing.expectEqualStrings("Phosphor tint", params[2].label());
 }
 
+/// Scan shader source for //@texture declarations. Pure.
+pub fn parseTextures(src: []const u8, out: *[MAX_TEXTURES]TextureDecl) usize {
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line_raw| {
+        if (count >= MAX_TEXTURES) break;
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, "//@texture ")) continue;
+        var rest = line["//@texture ".len..];
+        var t = TextureDecl{};
+        const nm = takeQuoted(rest) orelse continue;
+        if (nm.text.len == 0 or nm.text.len > 31) continue;
+        @memcpy(t.name_buf[0..nm.text.len], nm.text);
+        t.name_len = @intCast(nm.text.len);
+        rest = nm.remaining;
+        const pt = takeQuoted(rest) orelse continue;
+        if (pt.text.len == 0 or pt.text.len > 255) continue;
+        @memcpy(t.path_buf[0..pt.text.len], pt.text);
+        t.path_len = @intCast(pt.text.len);
+        out[count] = t;
+        count += 1;
+    }
+    return count;
+}
+
+test "parseTextures: name + path, builtin allowed" {
+    const src =
+        "//@texture noiseTex builtin:noise\n" ++
+        "//@texture lut \"sub dir/mask.png\"\n" ++
+        "//@texture broken\n";
+    var out: [MAX_TEXTURES]TextureDecl = undefined;
+    const n = parseTextures(src, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("noiseTex", out[0].name());
+    try std.testing.expectEqualStrings("builtin:noise", out[0].path());
+    try std.testing.expectEqualStrings("sub dir/mask.png", out[1].path());
+}
+
 const VERT_SRC =
     \\#version 300 es
     \\in vec2 a_pos;
@@ -349,6 +414,11 @@ pub const ShaderPass = struct {
     params: [MAX_PARAMS]Param = undefined,
     params_len: usize = 0,
     meta: Meta = .{},
+    /// Extra texture inputs (//@texture). Units 2..; loaded at
+    /// program build, freed on rebuild/release.
+    lut_tex: [MAX_TEXTURES]c_uint = .{ 0, 0, 0, 0 },
+    lut_loc: [MAX_TEXTURES]c_int = .{ -1, -1, -1, -1 },
+    lut_len: usize = 0,
 
     pub fn forgetGL(self: *ShaderPass) void {
         self.program = 0;
@@ -363,6 +433,9 @@ pub const ShaderPass = struct {
         self.fb_idx = 0;
         self.fb_w = 0;
         self.fb_h = 0;
+        self.lut_tex = .{ 0, 0, 0, 0 };
+        self.lut_loc = .{ -1, -1, -1, -1 };
+        self.lut_len = 0;
         self.built_generation = std.math.maxInt(u32);
         self.failed = false;
     }
@@ -395,6 +468,12 @@ pub const ShaderPass = struct {
             if (f != 0) {
                 var ff = f;
                 c.glDeleteFramebuffers(1, &ff);
+            }
+        }
+        for (self.lut_tex) |t| {
+            if (t != 0) {
+                var tt = t;
+                c.glDeleteTextures(1, &tt);
             }
         }
         self.forgetGL();
@@ -448,6 +527,24 @@ pub const ShaderPass = struct {
             p.loc = c.glGetUniformLocation(self.program, @ptrCast(&name_z));
         }
 
+        // Extra texture inputs (//@texture). Old set freed first —
+        // a recompile may declare different files.
+        for (&self.lut_tex) |*t| {
+            if (t.* != 0) {
+                c.glDeleteTextures(1, t);
+                t.* = 0;
+            }
+        }
+        var decls: [MAX_TEXTURES]TextureDecl = undefined;
+        self.lut_len = parseTextures(user, &decls);
+        for (decls[0..self.lut_len], 0..) |*d, ti| {
+            var name_z: [33]u8 = undefined;
+            @memcpy(name_z[0..d.name_len], d.name());
+            name_z[d.name_len] = 0;
+            self.lut_loc[ti] = c.glGetUniformLocation(self.program, @ptrCast(&name_z));
+            self.lut_tex[ti] = self.loadTexture(allocator, d.path());
+        }
+
         if (self.vao == 0) {
             const quad = [_]f32{ -1, -1, 3, -1, -1, 3 }; // fullscreen triangle
             c.glGenVertexArrays(1, &self.vao);
@@ -482,6 +579,67 @@ pub const ShaderPass = struct {
             self.tex_h = h;
         }
         return ok;
+    }
+
+    /// Load one //@texture input: `builtin:noise` generates a
+    /// 256×256 RGBA noise tile (deterministic — same grain every
+    /// run); anything else loads via stb, relative paths resolved
+    /// against Source.dir. Returns 0 on failure (uniform stays
+    /// unbound; shader samples black).
+    fn loadTexture(self: *ShaderPass, allocator: std.mem.Allocator, path: []const u8) c_uint {
+        var tex: c_uint = 0;
+
+        if (std.mem.eql(u8, path, "builtin:noise")) {
+            const side = 256;
+            const px = allocator.alloc(u8, side * side * 4) catch return 0;
+            defer allocator.free(px);
+            var seed: u32 = 0x9e3779b9;
+            for (px) |*b| {
+                seed = seed *% 1664525 +% 1013904223;
+                b.* = @truncate(seed >> 24);
+            }
+            c.glGenTextures(1, &tex);
+            c.glBindTexture(c.GL_TEXTURE_2D, tex);
+            c.glTexImage2D(c.GL_TEXTURE_2D, 0, c.GL_RGBA8, side, side, 0, c.GL_RGBA, c.GL_UNSIGNED_BYTE, px.ptr);
+            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_REPEAT);
+            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_REPEAT);
+            return tex;
+        }
+
+        var path_z: [4096]u8 = undefined;
+        const resolved: ?[:0]const u8 = blk: {
+            if (path.len > 0 and path[0] == '/') {
+                break :blk std.fmt.bufPrintZ(&path_z, "{s}", .{path}) catch null;
+            }
+            const dir = if (self.source) |s| s.dir else null;
+            if (dir) |d| {
+                break :blk std.fmt.bufPrintZ(&path_z, "{s}/{s}", .{ d, path }) catch null;
+            }
+            break :blk null;
+        };
+        const rz = resolved orelse {
+            std.debug.print("sketerm: shader texture path unresolvable: {s}\n", .{path});
+            return 0;
+        };
+        var w: c_int = 0;
+        var h: c_int = 0;
+        var n: c_int = 0;
+        const px = c.stbi_load(rz.ptr, &w, &h, &n, 4);
+        if (px == null) {
+            std.debug.print("sketerm: shader texture load failed: {s}\n", .{rz});
+            return 0;
+        }
+        defer c.stbi_image_free(px);
+        c.glGenTextures(1, &tex);
+        c.glBindTexture(c.GL_TEXTURE_2D, tex);
+        c.glTexImage2D(c.GL_TEXTURE_2D, 0, c.GL_RGBA8, w, h, 0, c.GL_RGBA, c.GL_UNSIGNED_BYTE, px);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_REPEAT);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_REPEAT);
+        return tex;
     }
 
     /// (Re)allocate the feedback ping-pong pair. Cleared to black on
@@ -539,6 +697,14 @@ pub const ShaderPass = struct {
             c.glActiveTexture(c.GL_TEXTURE1);
             c.glBindTexture(c.GL_TEXTURE_2D, self.fb_tex[self.fb_idx ^ 1]);
             c.glUniform1i(self.u_channel1, 1);
+        }
+        // Extra texture inputs on units 2.. (0 = frame, 1 = feedback).
+        for (0..self.lut_len) |ti| {
+            if (self.lut_tex[ti] == 0 or self.lut_loc[ti] < 0) continue;
+            const unit: c_uint = @intCast(@as(usize, @intCast(c.GL_TEXTURE2)) + ti);
+            c.glActiveTexture(unit);
+            c.glBindTexture(c.GL_TEXTURE_2D, self.lut_tex[ti]);
+            c.glUniform1i(self.lut_loc[ti], @intCast(2 + ti));
         }
         c.glActiveTexture(c.GL_TEXTURE0);
         c.glBindTexture(c.GL_TEXTURE_2D, self.tex);
