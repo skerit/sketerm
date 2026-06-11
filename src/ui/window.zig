@@ -1776,7 +1776,7 @@ pub const Window = struct {
         self.shader_source.overrides = self.config.shader_params.items;
         for (self.panes.items) |p| {
             // A preset pane owns its override slice — leave it alone.
-            if (p.preset_name == null)
+            if (!p.hasOwnShaderParams())
                 p.shader_own.overrides = self.config.shader_params.items;
         }
     }
@@ -1785,7 +1785,7 @@ pub const Window = struct {
     /// pane set (saved via the preset, not the config); a plain pane
     /// edits the global config entry.
     pub fn setPaneShaderParam(self: *Window, pane: *Pane, name: []const u8, value: f32, color: ?[3]f32) void {
-        if (pane.preset_name != null) {
+        if (pane.hasOwnShaderParams()) {
             pane.setPresetParam(name, value, color);
         } else {
             self.setShaderParam(name, value, color);
@@ -2004,7 +2004,7 @@ pub const Window = struct {
         // global. Both the pick and an explicit clear are sticky —
         // config reloads / profile pushes leave them alone.
         pane.shader_default_source = &self.shader_source;
-        if (pane.preset_name == null)
+        if (!pane.hasOwnShaderParams())
             pane.shader_own.overrides = self.config.shader_params.items;
         if (!pane.custom_shader_user and !pane.shader_cleared) {
             const prof_shader: []const u8 = if (profile) |p| p.custom_shader else "";
@@ -2948,7 +2948,7 @@ pub const Window = struct {
             // this), then re-resolve profile/global shader for panes
             // without a sticky user pick.
             p.shader_default_source = &self.shader_source;
-            if (p.preset_name == null)
+            if (!p.hasOwnShaderParams())
                 p.shader_own.overrides = self.config.shader_params.items;
             if (!p.custom_shader_user and !p.shader_cleared) {
                 const prof_shader: []const u8 = blk: {

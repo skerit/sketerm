@@ -22,8 +22,20 @@ const Ctx = struct {
     /// Pane the dialog was opened on. May close while the dialog is
     /// up — deref only via alivePane().
     pane: *Pane,
-    /// Entry of the "Save as Preset" row.
+    /// Effective shader file path the dialog operates on (own copy —
+    /// used to filter applicable presets and as save target).
+    path_copy: ?[]u8 = null,
+    /// Preset UI: name entry, dropdown (model item 0 = "new"), and
+    /// the buttons whose sensitivity tracks selection/name.
     name_entry: ?*c.GtkWidget = null,
+    combo_row: ?*c.GtkWidget = null,
+    combo_model: ?*c.GtkStringList = null,
+    load_btn: ?*c.GtkWidget = null,
+    delete_btn: ?*c.GtkWidget = null,
+    save_btn: ?*c.GtkWidget = null,
+    /// Per-param widgets so Load can push values back into the UI.
+    adjs: [shader_pass.MAX_PARAMS]?*c.GtkAdjustment = @splat(null),
+    color_btns: [shader_pass.MAX_PARAMS]?*c.GtkWidget = @splat(null),
     params: [shader_pass.MAX_PARAMS]shader_pass.Param = undefined,
     params_len: usize = 0,
     meta: shader_pass.Meta = .{},
@@ -78,6 +90,8 @@ pub fn open(win: *Window) bool {
 
     const ctx = win.allocator.create(Ctx) catch return false;
     ctx.* = .{ .allocator = win.allocator, .win = win, .pane = pane };
+    const eff_path: []const u8 = if (pane.custom_shader_path) |p| p else win.config.custom_shader;
+    ctx.path_copy = win.allocator.dupe(u8, eff_path) catch null;
     ctx.params_len = shader_pass.parseParams(src, &ctx.params, &ctx.meta);
     ctx.src_copy = win.allocator.dupe(u8, src) catch null;
     if (ctx.src_copy) |sc| {
@@ -141,6 +155,7 @@ pub fn open(win: *Window) bool {
                     p.step * 10.0,
                     0,
                 );
+                ctx.adjs[i] = adj;
                 const scale = c.gtk_scale_new(c.GTK_ORIENTATION_HORIZONTAL, adj);
                 c.gtk_widget_set_size_request(scale, 220, -1);
                 c.gtk_widget_set_valign(scale, c.GTK_ALIGN_CENTER);
@@ -159,6 +174,7 @@ pub fn open(win: *Window) bool {
             .color => {
                 const dlg = c.gtk_color_dialog_new();
                 const btn = c.gtk_color_dialog_button_new(dlg);
+                ctx.color_btns[i] = btn;
                 c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
                 const cur = currentColor(ctx, p);
                 var rgba: c.GdkRGBA = .{ .red = cur[0], .green = cur[1], .blue = cur[2], .alpha = 1.0 };
@@ -222,32 +238,91 @@ pub fn open(win: *Window) bool {
 
     c.adw_preferences_page_add(@ptrCast(@alignCast(page)), @ptrCast(@alignCast(group)));
 
-    // Save-as-preset: name entry + button. Writes the shader path +
-    // the current values of every declared param to
-    // shader-presets/<name>.conf and binds the pane to it.
+    // Preset management: dropdown of presets saved for THIS shader
+    // file (item 0 = create-new), Load/Delete on the dropdown row,
+    // name entry + Save below. Save always writes <name>.conf —
+    // same name = overwrite, edited name = save under that name.
     {
         const sgroup = c.adw_preferences_group_new();
         c.adw_preferences_group_set_title(@ptrCast(@alignCast(sgroup)), "Preset");
-        c.adw_preferences_group_set_description(@ptrCast(@alignCast(sgroup)), "Save this shader + current values as a named preset (right-click \xe2\x86\x92 Shader Preset\xe2\x80\xa6 applies it).");
+        c.adw_preferences_group_set_description(@ptrCast(@alignCast(sgroup)), "Named value sets for this shader. Load applies one; Save writes the current values under the name below.");
+
+        // Dropdown row.
+        const combo = c.adw_combo_row_new();
+        c.adw_preferences_row_set_title(@ptrCast(@alignCast(combo)), "Saved presets");
+        const model = c.gtk_string_list_new(null);
+        c.gtk_string_list_append(model, "\xe2\x80\x94 New preset \xe2\x80\x94");
+        var preselect: c_uint = 0;
+        {
+            var arena_state = std.heap.ArenaAllocator.init(win.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const names = shader_preset.list(arena) catch &[_][]u8{};
+            var count: c_uint = 0;
+            for (names) |nm| {
+                // Only presets created for this shader file apply.
+                const pr = shader_preset.load(arena, nm) catch continue;
+                if (ctx.path_copy == null or !std.mem.eql(u8, pr.shader_path, ctx.path_copy.?)) continue;
+                const nz = dupZ(win.allocator, nm) orelse continue;
+                defer win.allocator.free(nz);
+                c.gtk_string_list_append(model, nz.ptr);
+                count += 1;
+                if (pane.preset_name) |bound| {
+                    if (std.mem.eql(u8, bound, nm)) preselect = count;
+                }
+            }
+        }
+        c.adw_combo_row_set_model(@ptrCast(@alignCast(combo)), @ptrCast(@alignCast(model)));
+        c.g_object_unref(model); // the row holds its own ref now
+        ctx.combo_model = model;
+        ctx.combo_row = @ptrCast(combo);
+        c.adw_combo_row_set_selected(@ptrCast(@alignCast(combo)), preselect);
+
+        const load_btn = c.gtk_button_new_with_label("Load");
+        c.gtk_widget_set_valign(load_btn, c.GTK_ALIGN_CENTER);
+        c.gtk_widget_set_tooltip_text(load_btn, "Apply this preset's values to the pane and the sliders");
+        _ = c.g_signal_connect_data(load_btn, "clicked", @ptrCast(&onPresetLoadClicked), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        ctx.load_btn = load_btn;
+        c.adw_action_row_add_suffix(@ptrCast(@alignCast(combo)), load_btn);
+
+        const delete_btn = c.gtk_button_new_with_label("Delete");
+        c.gtk_widget_set_valign(delete_btn, c.GTK_ALIGN_CENTER);
+        c.gtk_widget_add_css_class(delete_btn, "destructive-action");
+        c.gtk_widget_set_tooltip_text(delete_btn, "Delete the selected preset");
+        _ = c.g_signal_connect_data(delete_btn, "clicked", @ptrCast(&onPresetDeleteClicked), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        ctx.delete_btn = delete_btn;
+        c.adw_action_row_add_suffix(@ptrCast(@alignCast(combo)), delete_btn);
+
+        // Selecting a preset prefills the name; sensitivity follows.
+        _ = c.g_signal_connect_data(combo, "notify::selected", @ptrCast(&onPresetComboChanged), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        c.adw_preferences_group_add(@ptrCast(@alignCast(sgroup)), @ptrCast(@alignCast(combo)));
+
+        // Name entry + Save row.
         const srow = c.adw_entry_row_new();
         c.adw_preferences_row_set_title(@ptrCast(@alignCast(srow)), "Preset name");
-        // Prefill: the pane's bound preset, else the shader's title.
-        const prefill: []const u8 = if (pane.preset_name) |pn| pn else ctx.meta.title();
-        if (prefill.len > 0) {
-            if (dupZ(win.allocator, prefill)) |pz| {
+        ctx.name_entry = @ptrCast(srow);
+        const save_btn = c.gtk_button_new_with_label("Save");
+        c.gtk_widget_set_valign(save_btn, c.GTK_ALIGN_CENTER);
+        c.gtk_widget_add_css_class(save_btn, "suggested-action");
+        c.gtk_widget_set_tooltip_text(save_btn, "Save the current values under this name (overwrites)");
+        // User-data is the dialog's main Ctx (freed on close) — no
+        // destroy-notify, per the signal-context ownership rule.
+        _ = c.g_signal_connect_data(save_btn, "clicked", @ptrCast(&onSavePresetClicked), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        ctx.save_btn = save_btn;
+        c.adw_entry_row_add_suffix(@ptrCast(@alignCast(srow)), save_btn);
+        _ = c.g_signal_connect_data(srow, "changed", @ptrCast(&onPresetNameChanged), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        c.adw_preferences_group_add(@ptrCast(@alignCast(sgroup)), @ptrCast(@alignCast(srow)));
+
+        // Prefill the name with the pane's bound preset (if any) and
+        // settle initial button sensitivity.
+        if (pane.preset_name) |pn| {
+            if (dupZ(win.allocator, pn)) |pz| {
                 defer win.allocator.free(pz);
                 c.gtk_editable_set_text(@ptrCast(srow), pz.ptr);
             }
         }
-        const save_btn = c.gtk_button_new_with_label("Save");
-        c.gtk_widget_set_valign(save_btn, c.GTK_ALIGN_CENTER);
-        c.gtk_widget_add_css_class(save_btn, "suggested-action");
-        // User-data is the dialog's main Ctx (freed on close) — no
-        // destroy-notify, per the signal-context ownership rule.
-        _ = c.g_signal_connect_data(save_btn, "clicked", @ptrCast(&onSavePresetClicked), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
-        c.adw_entry_row_add_suffix(@ptrCast(@alignCast(srow)), save_btn);
-        ctx.name_entry = @ptrCast(srow);
-        c.adw_preferences_group_add(@ptrCast(@alignCast(sgroup)), @ptrCast(@alignCast(srow)));
+        updatePresetButtons(ctx);
+
         c.adw_preferences_page_add(@ptrCast(@alignCast(page)), @ptrCast(@alignCast(sgroup)));
     }
 
@@ -291,7 +366,7 @@ fn alivePane(ctx: *Ctx) ?*Pane {
 /// preset params when a preset is bound, else the global config.
 fn effectiveOverrides(ctx: *Ctx) []const shader_pass.ParamKV {
     if (alivePane(ctx)) |pane| {
-        if (pane.preset_name != null) return pane.preset_params.items;
+        if (pane.hasOwnShaderParams()) return pane.preset_params.items;
     }
     return ctx.win.config.shader_params.items;
 }
@@ -347,17 +422,147 @@ fn onResetClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     }
 }
 
+/// Name of the dropdown's current selection; null for item 0
+/// ("— New preset —"). Borrowed from the GtkStringList.
+fn selectedPresetName(ctx: *Ctx) ?[]const u8 {
+    const combo = ctx.combo_row orelse return null;
+    const model = ctx.combo_model orelse return null;
+    const idx = c.adw_combo_row_get_selected(@ptrCast(@alignCast(combo)));
+    if (idx == 0 or idx == c.GTK_INVALID_LIST_POSITION) return null;
+    const s = c.gtk_string_list_get_string(model, idx) orelse return null;
+    return std.mem.span(@as([*:0]const u8, @ptrCast(s)));
+}
+
+/// Sensitivity: Load/Delete need a real selection; Save needs a
+/// valid name in the entry.
+fn updatePresetButtons(ctx: *Ctx) void {
+    const has_sel: c_int = if (selectedPresetName(ctx) != null) 1 else 0;
+    if (ctx.load_btn) |b| c.gtk_widget_set_sensitive(b, has_sel);
+    if (ctx.delete_btn) |b| c.gtk_widget_set_sensitive(b, has_sel);
+    if (ctx.save_btn) |b| {
+        var valid: c_int = 0;
+        if (ctx.name_entry) |entry| {
+            if (c.gtk_editable_get_text(@ptrCast(entry))) |t| {
+                const name = std.mem.span(@as([*:0]const u8, @ptrCast(t)));
+                if (shader_preset.validName(name)) valid = 1;
+            }
+        }
+        c.gtk_widget_set_sensitive(b, valid);
+    }
+}
+
+fn onPresetComboChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
+    // Selection prefills the name (Save then overwrites it); the
+    // create-new entry clears it so Save stays disabled until typed.
+    if (ctx.name_entry) |entry| {
+        if (selectedPresetName(ctx)) |name| {
+            if (dupZ(ctx.allocator, name)) |nz| {
+                defer ctx.allocator.free(nz);
+                c.gtk_editable_set_text(@ptrCast(entry), nz.ptr);
+            }
+        } else {
+            c.gtk_editable_set_text(@ptrCast(entry), "");
+        }
+    }
+    updatePresetButtons(ctx);
+}
+
+fn onPresetNameChanged(_: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    updatePresetButtons(cast.userData(Ctx, user));
+}
+
+/// Load: apply the selected preset to the pane AND push its values
+/// into the dialog widgets. Defensive against shader drift — preset
+/// params the shader no longer declares are skipped, declared params
+/// the preset lacks return to their defaults, floats clamp to the
+/// slider range.
+fn onPresetLoadClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
+    const name = selectedPresetName(ctx) orelse return;
+    const pane = alivePane(ctx) orelse return;
+    if (!ctx.win.applyShaderPresetByName(pane, name)) {
+        std.debug.print("sketerm: preset '{s}' failed to load\n", .{name});
+        return;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const preset = shader_preset.load(arena_state.allocator(), name) catch return;
+
+    // Widget updates re-enter the changed handlers, which route the
+    // values to the pane's per-pane set — keeping UI and render
+    // state in lockstep.
+    for (ctx.params[0..ctx.params_len], 0..) |*p, i| {
+        switch (p.kind) {
+            .float => if (ctx.adjs[i]) |adj| {
+                var v: f64 = p.default_value;
+                for (preset.params) |kv| {
+                    if (kv.color == null and std.mem.eql(u8, kv.name, p.name())) {
+                        v = kv.value;
+                        break;
+                    }
+                }
+                c.gtk_adjustment_set_value(adj, v);
+            },
+            .color => if (ctx.color_btns[i]) |btn| {
+                var col = p.default_color;
+                for (preset.params) |kv| {
+                    if (std.mem.eql(u8, kv.name, p.name())) {
+                        if (kv.color) |kc| {
+                            col = kc;
+                            break;
+                        }
+                    }
+                }
+                var rgba: c.GdkRGBA = .{ .red = col[0], .green = col[1], .blue = col[2], .alpha = 1.0 };
+                c.gtk_color_dialog_button_set_rgba(@ptrCast(@alignCast(btn)), &rgba);
+            },
+        }
+    }
+
+    // The loaded preset's name becomes the save target.
+    if (ctx.name_entry) |entry| {
+        if (dupZ(ctx.allocator, name)) |nz| {
+            defer ctx.allocator.free(nz);
+            c.gtk_editable_set_text(@ptrCast(entry), nz.ptr);
+        }
+    }
+    updatePresetButtons(ctx);
+}
+
+fn onPresetDeleteClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
+    const combo = ctx.combo_row orelse return;
+    const model = ctx.combo_model orelse return;
+    const idx = c.adw_combo_row_get_selected(@ptrCast(@alignCast(combo)));
+    if (idx == 0 or idx == c.GTK_INVALID_LIST_POSITION) return;
+    const name = selectedPresetName(ctx) orelse return;
+    shader_preset.delete(ctx.allocator, name) catch {
+        std.debug.print("sketerm: preset '{s}' delete failed\n", .{name});
+        return;
+    };
+    // Unbind a pane that pointed at the deleted preset — it keeps
+    // its current shader and values, just loses the (now dangling)
+    // name so layouts stop referencing it.
+    if (alivePane(ctx)) |pane| {
+        if (pane.preset_name) |bound| {
+            if (std.mem.eql(u8, bound, name)) pane.unbindPresetName();
+        }
+    }
+    c.gtk_string_list_remove(model, idx);
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(combo)), 0);
+    updatePresetButtons(ctx);
+}
+
 fn onSavePresetClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
     const pane = alivePane(ctx) orelse return;
     const entry = ctx.name_entry orelse return;
     const text_ptr = c.gtk_editable_get_text(@ptrCast(entry)) orelse return;
     const name = std.mem.span(@as([*:0]const u8, @ptrCast(text_ptr)));
-    if (!shader_preset.validName(name)) {
-        std.debug.print("sketerm: invalid preset name: '{s}'\n", .{name});
-        return;
-    }
-    const path: []const u8 = pane.custom_shader_path orelse ctx.win.config.custom_shader;
+    if (!shader_preset.validName(name)) return;
+    const path: []const u8 = ctx.path_copy orelse return;
     if (path.len == 0) return;
 
     // Snapshot the DECLARED params at their current effective values
@@ -387,6 +592,32 @@ fn onSavePresetClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     // give it its own pick first or the overrides have no effect.
     if (!pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true)) return;
     pane.applyShaderPresetParams(name, kvs[0..n]);
+
+    // Make sure the dropdown lists the (possibly new) name and
+    // selects it.
+    if (ctx.combo_model) |model| {
+        const n_items = c.g_list_model_get_n_items(@ptrCast(@alignCast(model)));
+        var i: c_uint = 1;
+        var found: ?c_uint = null;
+        while (i < n_items) : (i += 1) {
+            const s = c.gtk_string_list_get_string(model, i) orelse continue;
+            if (std.mem.eql(u8, std.mem.span(@as([*:0]const u8, @ptrCast(s))), name)) {
+                found = i;
+                break;
+            }
+        }
+        if (found == null) {
+            if (dupZ(ctx.allocator, name)) |nz| {
+                defer ctx.allocator.free(nz);
+                c.gtk_string_list_append(model, nz.ptr);
+                found = n_items;
+            }
+        }
+        if (ctx.combo_row) |combo| {
+            if (found) |fi| c.adw_combo_row_set_selected(@ptrCast(@alignCast(combo)), fi);
+        }
+    }
+    updatePresetButtons(ctx);
 }
 
 fn freeRowCtx(user: ?*anyopaque) callconv(.c) void {
@@ -412,6 +643,7 @@ fn deferredCtxFree(user: ?*anyopaque) callconv(.c) c.gboolean {
     const ctx = cast.userData(Ctx, user);
     if (ctx.src_copy) |s| ctx.allocator.free(s);
     if (ctx.dir_copy) |d| ctx.allocator.free(d);
+    if (ctx.path_copy) |p| ctx.allocator.free(p);
     ctx.allocator.destroy(ctx);
     return 0; // G_SOURCE_REMOVE
 }

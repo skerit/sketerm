@@ -862,10 +862,25 @@ pub const Pane = struct {
         c.gtk_gl_area_queue_render(@ptrCast(self.area));
     }
 
-    /// Set/update one param in this pane's preset override set (live
-    /// — values upload each frame). No-op when no preset is bound.
+    /// Whether the pane owns its shader-param override slice (bound
+    /// preset, or an unbound-but-kept per-pane set after a preset
+    /// delete). Window's config repoints must skip such panes.
+    pub fn hasOwnShaderParams(self: *const Pane) bool {
+        return self.preset_name != null or self.preset_params.items.len > 0;
+    }
+
+    /// Forget the preset NAME but keep the per-pane param values —
+    /// used when the preset file is deleted out from under the pane.
+    pub fn unbindPresetName(self: *Pane) void {
+        if (self.preset_name) |n| self.allocator.free(n);
+        self.preset_name = null;
+    }
+
+    /// Set/update one param in this pane's per-pane override set
+    /// (live — values upload each frame). No-op when the pane rides
+    /// the global config params.
     pub fn setPresetParam(self: *Pane, name: []const u8, value: f32, color: ?[3]f32) void {
-        if (self.preset_name == null) return;
+        if (!self.hasOwnShaderParams()) return;
         for (self.preset_params.items) |*entry| {
             if (std.mem.eql(u8, entry.name, name)) {
                 entry.value = value;

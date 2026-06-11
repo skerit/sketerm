@@ -4876,3 +4876,22 @@ Tests 454 → 466.
   no-flag startup loads default.json; run the palette's "Save
   Default Layout" after arranging shaders so the per-pane state
   persists.
+
+## 2026-06-12: preset UX in the shader dialog (dropdown + load/save/delete)
+
+- The Configure Shader dialog's Preset group is now full management:
+  an AdwComboRow listing every preset saved FOR THIS SHADER FILE
+  (item 0 = "-- New preset --"), Load + red Delete buttons on that
+  row, name entry + Save below.
+- Load applies the preset to the pane AND pushes its values into the
+  sliders/color buttons (handlers re-route them to the pane's set,
+  so UI and render stay in lockstep). Defensive against shader
+  drift: unknown preset params are skipped, declared params missing
+  from the preset return to defaults, floats clamp to slider range.
+  The loaded name fills the entry; selecting a preset prefills too.
+- Save writes <name>.conf (same name = overwrite), binds the pane,
+  and inserts/selects the name in the dropdown. Save is insensitive
+  while the name is empty/invalid; Load/Delete while "new" is
+  selected. Deleting unbinds a pane that pointed at the name but
+  keeps its live values (Pane.unbindPresetName; ownership now keyed
+  on hasOwnShaderParams, not just the name).
