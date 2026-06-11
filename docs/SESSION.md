@@ -4835,3 +4835,19 @@ Tests 454 → 466.
   gray), applies to every shader + the dim-only path.
 - smoke-cell: flat darkened input (->100) now spans 99..101 across
   the buffer, proving the dither fires. 492 tests pass.
+
+## 2026-06-12: shader pick/clear strictly PER PANE (revert tab scope)
+
+- a466467's tab-wide spread treated the wrong disease. The real
+  reason "everything has the same shader" was the GLOBAL
+  `custom_shader = crt.glsl` line in config.conf: every pane without
+  an explicit pick/clear falls back to it, so new tabs/panes always
+  came up CRT regardless of scoping.
+- Pick and clear now act on the clicked pane only; a split is a
+  fresh pane (global/profile default, no inheritance). Model is
+  three layers: global config < profile < per-pane explicit
+  pick-or-cleared, persisted per pane in the layout JSON.
+- Startup gotcha: no-flag startup loads default.json, which only
+  gets updated by an explicit Save Layout As — a default.json saved
+  before the shader fields existed restores every pane to the global
+  default. Re-save it to make picks/clears stick across restarts.

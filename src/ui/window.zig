@@ -1806,38 +1806,9 @@ pub const Window = struct {
 
     fn clearPaneShader(self: *Window) void {
         const pane = self.focusedPane() orelse return;
-        // Shaders are scoped to the TAB: clear every pane sharing the
-        // focused pane's tab, so a split stays visually consistent.
-        // Explicit, sticky "no shader" — overrides profile/global and
-        // survives config reloads (see Pane.shader_cleared).
-        if (tabPageForPane(self, pane)) |page| {
-            self.setTabShader(page, null);
-        } else {
-            pane.clearShader();
-        }
-    }
-
-    /// Apply a shader pick (path) or an explicit clear (null) to every
-    /// pane in `page` — the per-tab shader scope.
-    fn setTabShader(self: *Window, page: *c.AdwTabPage, path: ?[]const u8) void {
-        for (self.panes.items) |p| {
-            if (tabPageForPane(self, p) != page) continue;
-            if (path) |pp|
-                _ = p.setCustomShader(pp, self.config.custom_shader_animation, true)
-            else
-                p.clearShader();
-        }
-    }
-
-    /// Copy `src`'s effective shader choice onto `dst` — used when a
-    /// split adds a pane to a tab, so it adopts the tab's shader.
-    fn inheritShader(self: *Window, dst: *Pane, src: *Pane) void {
-        if (src.shader_own.src != null) {
-            if (src.custom_shader_path) |p|
-                _ = dst.setCustomShader(p, self.config.custom_shader_animation, true);
-        } else if (src.shader_cleared) {
-            dst.clearShader();
-        }
+        // Strictly per-pane: explicit, sticky "no shader" — overrides
+        // profile/global and survives config reloads (Pane.shader_cleared).
+        pane.clearShader();
     }
 
     /// applyPaneConfig with the pane's stored profile re-resolved by
@@ -2097,8 +2068,6 @@ pub const Window = struct {
         const inherit_cwd: ?[]const u8 = focused_pane.terminal.cwd;
         // Splits inherit the focused pane's profile (matches Terminator).
         const new_pane = try self.spawnShellPaneOpts(inherit_cwd, focused_pane.active_profile);
-        // ...and its shader, so the per-tab shader scope stays uniform.
-        self.inheritShader(new_pane, focused_pane);
         const new_w = new_pane.widget();
 
         const paned = c.gtk_paned_new(orientation);
@@ -4861,12 +4830,8 @@ fn onShaderPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque
     }
     if (!alive) return;
     const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
-    // Per-tab scope: apply the pick to every pane in this pane's tab.
-    if (tabPageForPane(ctx.win, ctx.pane)) |page| {
-        ctx.win.setTabShader(page, path);
-    } else {
-        _ = ctx.pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true);
-    }
+    // Strictly per-pane: the pick lands on the clicked pane only.
+    _ = ctx.pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true);
 }
 
 fn onSaveLayoutAsDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
