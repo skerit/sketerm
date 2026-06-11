@@ -219,7 +219,21 @@ pub fn attachWithPrePopup(
             n_remote += 1;
         }
     }
-    c.gtk_popover_set_child(@ptrCast(popover), list);
+    // Wrap the list in a scroller with natural-height propagation.
+    // Not for scrolling per se: GTK4 silently popdowns an autohide
+    // popover whose MINIMUM size doesn't fit the space the compositor
+    // grants (gtkpopover.c gtk_popover_native_layout →
+    // is_acceptable_size). A bare GtkBox's minimum is the full list,
+    // so right-clicking mid-window — where neither half fits ~15
+    // rows — made the menu vanish the frame it mapped. The scroller
+    // makes the minimum tiny (menu scrolls when constrained) while
+    // natural height keeps the usual full-size rendering.
+    const scroller = c.gtk_scrolled_window_new();
+    c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
+    c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(scroller), 1);
+    c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(scroller), 1);
+    c.gtk_scrolled_window_set_child(@ptrCast(scroller), list);
+    c.gtk_popover_set_child(@ptrCast(popover), scroller);
 
     const click = c.gtk_gesture_click_new();
     c.gtk_gesture_single_set_button(@ptrCast(click), 3);
