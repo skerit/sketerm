@@ -15,6 +15,12 @@ const CLI_HELP =
     \\  send-text [opts] <text...>        write text to a pane's PTY
     \\      --pane N    target pane (default: focused)
     \\      --paste     wrap in bracketed-paste markers if enabled
+    \\  type-text [opts] <text...>        like send-text, but paced as
+    \\                                    human keystrokes
+    \\      --pane N    target pane (default: focused)
+    \\      --enter     append Enter (CR) after the text
+    \\      --delay MS  base inter-key delay  (default 60)
+    \\      --jitter MS random extra delay    (default 90)
     \\  get-text [--pane N] [--scrollback N]
     \\                                    read screen text back (JSON);
     \\                                    --scrollback dumps the ring too
@@ -65,6 +71,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     var req: protocol.Request = .{ .cmd = cmd };
     var text_parts: std.ArrayList([]const u8) = .empty;
     defer text_parts.deinit(allocator);
+    var type_delay: u32 = 60;
+    var type_jitter: u32 = 90;
+    var press_enter = false;
 
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -94,6 +103,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             req.direction = args[i];
         } else if (std.mem.eql(u8, a, "--paste")) {
             req.paste = true;
+        } else if (std.mem.eql(u8, a, "--delay") and i + 1 < args.len) {
+            i += 1;
+            type_delay = std.fmt.parseInt(u32, args[i], 10) catch 60;
+        } else if (std.mem.eql(u8, a, "--jitter") and i + 1 < args.len) {
+            i += 1;
+            type_jitter = std.fmt.parseInt(u32, args[i], 10) catch 90;
+        } else if (std.mem.eql(u8, a, "--enter")) {
+            press_enter = true;
         } else if (std.mem.eql(u8, a, "--help")) {
             _ = c.fputs(CLI_HELP, c.stdout);
             return 0;
@@ -118,7 +135,99 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         return 1;
     };
 
+    if (std.mem.eql(u8, cmd, "type-text")) {
+        const text_raw = req.data orelse {
+            _ = c.fprintf(c.stderr, "sketerm cli: type-text requires text\n");
+            allocator.free(sock_path);
+            return 2;
+        };
+        const text = if (press_enter)
+            std.fmt.allocPrint(allocator, "{s}\r", .{text_raw}) catch return 1
+        else
+            text_raw;
+        return typeText(allocator, sock_path, req.pane, text, type_delay, type_jitter);
+    }
+
     return talk(allocator, sock_path, req);
+}
+
+/// Stream one send-text request per keystroke over a single
+/// connection, sleeping a randomized inter-key delay in between.
+/// Pacing lives client-side so a Ctrl-C stops the "typing" cold.
+fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, text: []const u8, delay: u32, jitter: u32) u8 {
+    defer allocator.free(sock_path);
+    const humantype = @import("../util/humantype.zig");
+
+    const client = c.g_socket_client_new();
+    defer c.g_object_unref(client);
+    const addr = c.g_unix_socket_address_new(sock_path.ptr);
+    defer c.g_object_unref(addr);
+    var gerr: [*c]c.GError = null;
+    const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
+    if (conn == null) {
+        const msg: [*c]const u8 = if (gerr != null) gerr.*.message else "unknown";
+        _ = c.fprintf(c.stderr, "sketerm cli: connect failed: %s\n", msg);
+        if (gerr != null) c.g_error_free(gerr);
+        return 1;
+    }
+    defer c.g_object_unref(conn);
+    const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn));
+    const din = c.g_data_input_stream_new(c.g_io_stream_get_input_stream(@ptrCast(conn)));
+    defer c.g_object_unref(din);
+
+    var seed: u64 = 0;
+    {
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+        seed = @as(u64, @bitCast(@as(i64, ts.tv_nsec))) ^ (@as(u64, @bitCast(@as(i64, ts.tv_sec))) << 20);
+    }
+    var pacer = humantype.Pacer.init(delay, jitter, seed);
+    var chunks = humantype.Chunks{ .text = text };
+    var first = true;
+    while (chunks.next()) |chunk| {
+        if (!first) {
+            const ms = pacer.delayMs(chunk);
+            var ts: c.struct_timespec = .{
+                .tv_sec = ms / 1000,
+                .tv_nsec = @as(c_long, ms % 1000) * 1_000_000,
+            };
+            _ = c.nanosleep(&ts, null);
+        }
+        first = false;
+
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        const line_req: protocol.Request = .{ .cmd = "send-text", .pane = pane, .data = chunk };
+        std.json.Stringify.value(line_req, .{}, &aw.writer) catch return 1;
+        aw.writer.writeAll("\n") catch return 1;
+        const line = aw.written();
+
+        var written: c.gsize = 0;
+        var werr: [*c]c.GError = null;
+        if (c.g_output_stream_write_all(out_stream, line.ptr, line.len, &written, null, &werr) == 0) {
+            if (werr != null) c.g_error_free(werr);
+            _ = c.fprintf(c.stderr, "sketerm cli: write failed\n");
+            return 1;
+        }
+        // One response line per request keeps us in lockstep — and
+        // surfaces "no such pane" on the first keystroke, not never.
+        var rlen: c.gsize = 0;
+        var rerr: [*c]c.GError = null;
+        const resp = c.g_data_input_stream_read_line(din, &rlen, null, &rerr);
+        if (resp == null) {
+            if (rerr != null) c.g_error_free(rerr);
+            _ = c.fprintf(c.stderr, "sketerm cli: no response\n");
+            return 1;
+        }
+        defer c.g_free(resp);
+        if (std.mem.indexOf(u8, resp[0..rlen], "\"ok\":true") == null) {
+            _ = c.fwrite(resp, 1, rlen, c.stdout);
+            _ = c.fputc('\n', c.stdout);
+            return 1;
+        }
+    }
+    _ = c.fputs("{\"ok\":true}\n", c.stdout);
+    return 0;
 }
 
 /// "--pane self" resolves via $SKETERM_PANE_ID.

@@ -30,6 +30,16 @@ const MUX_HELP =
     \\  kill <name>           kill a session
     \\  rename <old> <new>    rename a session
     \\
+    \\Headless commands (no GUI needed; talk to the daemon directly):
+    \\  spawn <name> [opts] [command...]   create a session
+    \\      --cwd DIR --rows N --cols N    (default: login shell, 80x24)
+    \\  send <name> [opts] <text...>       write text to the session PTY
+    \\      --enter     append Enter (CR) after the text
+    \\      --type      emulate human typing (paced keystrokes)
+    \\      --delay MS  base inter-key delay  (default 60)
+    \\      --jitter MS random extra delay    (default 90)
+    \\  get-text <name> [--scrollback]     print the session's screen
+    \\
     \\`sketerm ssh <host>` = `sketerm mux <host> new` — open a
     \\remote shell that survives disconnects (key auth required).
     \\
@@ -50,7 +60,7 @@ const Welcome = struct {
 };
 
 fn isSubcommand(s2: []const u8) bool {
-    const known = [_][]const u8{ "list", "attach", "new", "kill", "rename" };
+    const known = [_][]const u8{ "list", "attach", "new", "kill", "rename", "spawn", "send", "get-text" };
     for (known) |k| {
         if (std.mem.eql(u8, s2, k)) return true;
     }
@@ -120,8 +130,204 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
     if (std.mem.eql(u8, cmd, "rename") and args.len >= 3) {
         return if (renameSession(allocator, host, args[1], args[2])) 0 else 1;
     }
+    if (std.mem.eql(u8, cmd, "spawn") and args.len >= 2) {
+        return muxSpawn(allocator, host, args[1], args[2..]);
+    }
+    if (std.mem.eql(u8, cmd, "send") and args.len >= 2) {
+        return muxSend(allocator, host, args[1], args[2..]);
+    }
+    if (std.mem.eql(u8, cmd, "get-text") and args.len >= 2) {
+        return muxGetText(allocator, host, args[1], args[2..]);
+    }
     _ = c.fputs(MUX_HELP, c.stdout);
     return 2;
+}
+
+// ── headless commands ───────────────────────────────────────────
+
+fn msleep(ms: u32) void {
+    var ts: c.struct_timespec = .{
+        .tv_sec = ms / 1000,
+        .tv_nsec = @as(c_long, ms % 1000) * 1_000_000,
+    };
+    _ = c.nanosleep(&ts, null);
+}
+
+fn clockSeed() u64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @as(u64, @bitCast(@as(i64, ts.tv_nsec))) ^ (@as(u64, @bitCast(@as(i64, ts.tv_sec))) << 20);
+}
+
+/// Create a session without involving a GUI. Locally the daemon is
+/// auto-started; over SSH/UDP the proxy bootstrap already does that.
+fn muxSpawn(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, rest: []const []const u8) u8 {
+    var cwd: ?[]const u8 = null;
+    var rows: u16 = 24;
+    var cols: u16 = 80;
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (std.mem.eql(u8, a, "--cwd") and i + 1 < rest.len) {
+            i += 1;
+            cwd = rest[i];
+        } else if (std.mem.eql(u8, a, "--rows") and i + 1 < rest.len) {
+            i += 1;
+            rows = std.fmt.parseInt(u16, rest[i], 10) catch 24;
+        } else if (std.mem.eql(u8, a, "--cols") and i + 1 < rest.len) {
+            i += 1;
+            cols = std.fmt.parseInt(u16, rest[i], 10) catch 80;
+        } else {
+            // First non-flag word starts the command; everything
+            // after belongs to it verbatim ("spawn s top -d 1").
+            argv.appendSlice(allocator, rest[i..]) catch return 1;
+            break;
+        }
+    }
+
+    var conn = blk: {
+        if (host != null) break :blk muxConnect(allocator, host) orelse return 1;
+        break :blk mux_client.Conn.connectLocalAutostart(allocator) catch {
+            _ = c.fprintf(c.stderr, "sketerm mux: cannot start the local daemon\n");
+            return 1;
+        };
+    };
+    defer conn.deinit();
+    conn.sendJson(.spawn, .{
+        .name = name,
+        .argv = argv.items,
+        .cwd = cwd,
+        .rows = rows,
+        .cols = cols,
+    }) catch return 1;
+    const f = conn.recvExpect(&.{.ok}) catch {
+        _ = c.fprintf(c.stderr, "sketerm mux: spawn failed (name taken?)\n");
+        return 1;
+    };
+    f.deinit(allocator);
+    _ = c.printf("%.*s\n", @as(c_int, @intCast(name.len)), name.ptr);
+    return 0;
+}
+
+/// Attach just long enough to feed input — the daemon requires an
+/// attached client for INPUT frames, and attach answers with a
+/// snapshot we discard.
+fn attachForIo(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8) ?struct { conn: mux_client.Conn, snap: mux_client.Conn.OwnedFrame } {
+    var conn = muxConnect(allocator, host) orelse return null;
+    conn.sendJson(.attach, .{ .name = name }) catch {
+        conn.deinit();
+        return null;
+    };
+    const snap = conn.recvExpect(&.{.snapshot}) catch {
+        _ = c.fprintf(
+            c.stderr,
+            "sketerm mux: no such session '%.*s'\n",
+            @as(c_int, @intCast(name.len)),
+            name.ptr,
+        );
+        conn.deinit();
+        return null;
+    };
+    return .{ .conn = conn, .snap = snap };
+}
+
+fn muxSend(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, rest: []const []const u8) u8 {
+    var press_enter = false;
+    var type_mode = false;
+    var delay: u32 = 60;
+    var jitter: u32 = 90;
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (std.mem.eql(u8, a, "--enter")) {
+            press_enter = true;
+        } else if (std.mem.eql(u8, a, "--type")) {
+            type_mode = true;
+        } else if (std.mem.eql(u8, a, "--delay") and i + 1 < rest.len) {
+            i += 1;
+            delay = std.fmt.parseInt(u32, rest[i], 10) catch 60;
+        } else if (std.mem.eql(u8, a, "--jitter") and i + 1 < rest.len) {
+            i += 1;
+            jitter = std.fmt.parseInt(u32, rest[i], 10) catch 90;
+        } else {
+            parts.append(allocator, a) catch return 1;
+        }
+    }
+    const joined = std.mem.join(allocator, " ", parts.items) catch return 1;
+    defer allocator.free(joined);
+    const text = if (press_enter)
+        std.fmt.allocPrint(allocator, "{s}\r", .{joined}) catch return 1
+    else
+        joined;
+    defer if (press_enter) allocator.free(text);
+
+    var io = attachForIo(allocator, host, name) orelse return 1;
+    defer io.conn.deinit();
+    io.snap.deinit(allocator);
+
+    if (!type_mode) {
+        io.conn.sendFrame(.input, text) catch return 1;
+        return finishSend(allocator, &io.conn);
+    }
+    const humantype = @import("../util/humantype.zig");
+    var pacer = humantype.Pacer.init(delay, jitter, clockSeed());
+    var chunks = humantype.Chunks{ .text = text };
+    var first = true;
+    while (chunks.next()) |chunk| {
+        if (!first) msleep(pacer.delayMs(chunk));
+        first = false;
+        io.conn.sendFrame(.input, chunk) catch return 1;
+    }
+    return finishSend(allocator, &io.conn);
+}
+
+/// Detach + wait for the OK before closing. Frames are processed in
+/// order, so the round-trip proves every input frame reached the PTY
+/// — without it, closing right after the last write races the
+/// daemon's poll loop (and loses outright against pre-fix daemons).
+fn finishSend(allocator: std.mem.Allocator, conn: *mux_client.Conn) u8 {
+    conn.sendJson(.detach, .{}) catch return 1;
+    const f = conn.recvExpect(&.{.ok}) catch return 1;
+    f.deinit(allocator);
+    return 0;
+}
+
+fn muxGetText(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, rest: []const []const u8) u8 {
+    var want_scrollback = false;
+    for (rest) |a| {
+        if (std.mem.eql(u8, a, "--scrollback")) want_scrollback = true;
+    }
+
+    var io = attachForIo(allocator, host, name) orelse return 1;
+    defer io.conn.deinit();
+    defer io.snap.deinit(allocator);
+    // Snapshot payload = u64 sequence stamp, then the screen.
+    if (io.snap.payload.len < 8) return 1;
+
+    const Pool = @import("../grid/style_pool.zig").Pool;
+    const snapshot = @import("../mux/snapshot.zig");
+    var pool = Pool.init(allocator) catch return 1;
+    defer pool.deinit();
+    const screen = snapshot.restore(allocator, &pool, io.snap.payload[8..]) catch {
+        _ = c.fprintf(c.stderr, "sketerm mux: bad snapshot\n");
+        return 1;
+    };
+    defer screen.deinit();
+
+    const text = (if (want_scrollback)
+        screen.extractScrollback(allocator)
+    else
+        screen.extractScreen(allocator)) catch return 1;
+    defer allocator.free(text);
+    _ = c.fwrite(text.ptr, 1, text.len, c.stdout);
+    if (text.len == 0 or text[text.len - 1] != '\n') _ = c.fputc('\n', c.stdout);
+    return 0;
 }
 
 fn renameSession(allocator: std.mem.Allocator, host: ?[]const u8, old: []const u8, new: []const u8) bool {

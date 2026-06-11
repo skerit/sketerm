@@ -11,6 +11,7 @@ comptime {
     _ = @import("util/percent.zig");
     _ = @import("util/pathz.zig");
     _ = @import("util/shellquote.zig");
+    _ = @import("util/humantype.zig");
     _ = @import("shim_drift_test.zig");
     _ = @import("mux/predict.zig");
     _ = @import("mux/kitty_inline.zig");

@@ -4720,3 +4720,32 @@ Tests 454 → 466.
   asserts every output pixel red). With LUT + feedback + params +
   color pickers, single-pass shader expressiveness now matches what
   cool-retro-term's engine uses.
+
+## 2026-06-12: right-click fix (real one) + headless mux + type-text
+
+- Context menu "often doesn't open": ROOT CAUSE was GTK4 silently
+  popdown-ing an autohide popover whose MINIMUM size doesn't fit
+  the compositor-granted rect (is_acceptable_size, gtkpopover.c).
+  ~15 menu rows fit neither above nor below a mid-window click.
+  Fix: wrap rows in GtkScrolledWindow with propagate-natural-height
+  (tiny minimum, identical natural rendering, scrolls when tight).
+  The earlier gesture-claim fix (7532e46) was a wrong-mechanism
+  guess; kept as harmless hygiene. Diagnosed via WAYLAND_DEBUG
+  trace: client destroys xdg_popup 5ms after configure(h=399).
+- DAEMON BUG: poll loop checked POLLHUP before POLLIN — a client
+  that writes its last frame and closes lost that frame (a `mux
+  send`'s Enter, typically). POLLIN now drains first; EOF marks
+  dead. CLI also detach+OK round-trips before close (fixes the
+  race against older deployed daemons too).
+- Headless mux verbs (no GUI needed): `sketerm mux spawn <name>
+  [--cwd|--rows|--cols] [cmd...]`, `mux send <name> [--enter]
+  [--type --delay N --jitter N] <text>`, `mux get-text <name>
+  [--scrollback]`. get-text restores the attach snapshot into a
+  local Screen and extracts text. Local daemon auto-starts
+  (connectLocalAutostart in mux/client.zig — window.zig's fork
+  block moved there and shared).
+- `sketerm cli type-text [--pane N] [--enter] [--delay/--jitter]`:
+  human-paced typing into GUI panes — one send-text request per
+  UTF-8 codepoint over a single IPC connection, randomized
+  inter-key delay (LCG), extra hesitation before Enter. Pure
+  pacing logic in util/humantype.zig (tested; 492 total now).

@@ -204,12 +204,18 @@ pub const Daemon = struct {
 
         for (self.clients.items, 0..) |cl, i| {
             const re = fds.items[client_base + i].revents;
-            if (re & (c.POLLHUP | c.POLLERR) != 0) {
+            // POLLIN before POLLHUP: a client that writes its last
+            // frame and closes raises both at once, and the data is
+            // still readable. Declaring it dead first silently drops
+            // that final input (a `mux send`'s Enter, typically).
+            // clientReadable flags dead itself once read() hits EOF.
+            if (re & c.POLLIN != 0) {
+                self.clientReadable(cl);
+            } else if (re & (c.POLLHUP | c.POLLERR) != 0) {
                 cl.dead = true;
                 continue;
             }
-            if (re & c.POLLIN != 0) self.clientReadable(cl);
-            if (re & c.POLLOUT != 0) self.clientWritable(cl);
+            if (re & c.POLLOUT != 0 and !cl.dead) self.clientWritable(cl);
         }
 
         for (self.sessions.items, 0..) |s, i| {

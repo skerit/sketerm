@@ -41,6 +41,30 @@ pub const Conn = struct {
         return .{ .allocator = allocator, .fd = fd };
     }
 
+    /// Connect to the local daemon, spawning it (sibling binary,
+    /// $PATH fallback) and retrying for ~2s when it isn't running.
+    pub fn connectLocalAutostart(allocator: std.mem.Allocator) !Conn {
+        const path = try daemon.defaultSocketPath(allocator);
+        defer allocator.free(path);
+        if (Conn.connect(allocator, path)) |conn| return conn else |_| {}
+
+        const pid = c.fork();
+        if (pid == 0) {
+            _ = c.setsid();
+            var bin_buf: [4096:0]u8 = undefined;
+            const bin = findMuxBinary(&bin_buf);
+            const argv = [_:null]?[*:0]const u8{ bin, null };
+            _ = c.execvp(bin, @ptrCast(@constCast(&argv)));
+            c._exit(127);
+        }
+        var tries: u32 = 0;
+        while (tries < 40) : (tries += 1) {
+            _ = c.usleep(50_000);
+            if (Conn.connect(allocator, path)) |conn| return conn else |_| {}
+        }
+        return error.MuxDaemonUnreachable;
+    }
+
     pub fn deinit(self: *Conn) void {
         _ = c.close(self.fd);
         self.rbuf.deinit(self.allocator);

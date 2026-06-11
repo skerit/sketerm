@@ -3005,7 +3005,6 @@ pub const Window = struct {
     /// on an SSH host (`ssh <host> sketerm-mux --proxy`).
     fn muxConnect(self: *Window, host: ?[]const u8) !@import("../mux/client.zig").Conn {
         const mux_client = @import("../mux/client.zig");
-        const mux_daemon = @import("../mux/daemon.zig");
         if (host) |h| {
             // "udp:host" selects the mosh-style encrypted UDP
             // transport (ssh bootstrap, then roaming datagrams).
@@ -3018,41 +3017,7 @@ pub const Window = struct {
             }
             return mux_client.Conn.connectSsh(self.allocator, h);
         }
-        const path = try mux_daemon.defaultSocketPath(self.allocator);
-        defer self.allocator.free(path);
-
-        if (mux_client.Conn.connect(self.allocator, path)) |conn| return conn else |_| {}
-
-        // Spawn the daemon (sibling binary, falls back to $PATH) and
-        // retry with backoff for ~2s.
-        const pid = c.fork();
-        if (pid == 0) {
-            _ = c.setsid();
-            // Try next to our own binary first so `zig build run`
-            // works without installing.
-            var self_buf: [4096]u8 = undefined;
-            const n = c.readlink("/proc/self/exe", &self_buf, self_buf.len - 1);
-            if (n > 0) {
-                const exe_path = self_buf[0..@intCast(n)];
-                if (std.mem.lastIndexOfScalar(u8, exe_path, '/')) |slash| {
-                    var sib_buf: [4096:0]u8 = undefined;
-                    const sib = std.fmt.bufPrintZ(&sib_buf, "{s}/sketerm-mux", .{exe_path[0..slash]}) catch "";
-                    if (sib.len > 0) {
-                        const argv0 = [_:null]?[*:0]const u8{ sib.ptr, null };
-                        _ = c.execv(sib.ptr, @ptrCast(@constCast(&argv0)));
-                    }
-                }
-            }
-            const argv1 = [_:null]?[*:0]const u8{ "sketerm-mux", null };
-            _ = c.execvp("sketerm-mux", @ptrCast(@constCast(&argv1)));
-            c._exit(127);
-        }
-        var tries: u32 = 0;
-        while (tries < 40) : (tries += 1) {
-            _ = c.usleep(50_000);
-            if (mux_client.Conn.connect(self.allocator, path)) |conn| return conn else |_| {}
-        }
-        return error.MuxDaemonUnreachable;
+        return mux_client.Conn.connectLocalAutostart(self.allocator);
     }
 
     /// Spawn a shell session in the daemon (local or `host`'s) and
