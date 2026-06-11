@@ -254,6 +254,17 @@ pub const Screen = struct {
     prompt_marks_len: u16 = 0,
     prompt_marks_head: u16 = 0,
 
+    /// OSC 133 command-output zones. C captures the line where the
+    /// command's output begins; D closes the zone (output rows are
+    /// [C-row, D-row), the D row holds the next prompt). Stored as
+    /// stable line IDs so the zone survives scrolling into scrollback.
+    /// `last_*` describe the most recently COMPLETED command.
+    pending_output_start_id: u64 = 0,
+    last_output_start_id: u64 = 0,
+    last_output_end_id: u64 = 0,
+    /// Exit status from `OSC 133 ; D ; <code>` (0 when not reported).
+    last_cmd_exit: i32 = 0,
+
     /// modifyOtherKeys level (CSI > 4 ; Pp m). 0=off, 1=ambiguous
     /// only, 2=all printable. Input encoder hasn't wired this yet.
     modify_other_keys: u8 = 0,
@@ -1213,6 +1224,75 @@ pub const Screen = struct {
             } else {
                 try out.append(allocator, ']');
             }
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// Whether a completed OSC 133 command-output zone is currently
+    /// reachable (both boundary rows still in scrollback/screen and
+    /// non-empty). Cheap enough for menu-popup enablement.
+    pub fn lastCommandOutputAvailable(self: *const Screen) bool {
+        if (self.last_output_start_id == 0 or self.last_output_end_id == 0) return false;
+        const start = self.rowForLineId(self.last_output_start_id) orelse return false;
+        const end = self.rowForLineId(self.last_output_end_id) orelse return false;
+        return end > start;
+    }
+
+    /// Extract the output of the last completed command (OSC 133 C/D
+    /// zone) as plain UTF-8 text, or null when no zone is reachable.
+    /// Caller frees.
+    pub fn extractLastCommandOutput(self: *const Screen, allocator: std.mem.Allocator) !?[]u8 {
+        if (self.last_output_start_id == 0 or self.last_output_end_id == 0) return null;
+        const start = self.rowForLineId(self.last_output_start_id) orelse return null;
+        const end = self.rowForLineId(self.last_output_end_id) orelse return null;
+        if (end <= start) return null;
+        return try self.extractRowRange(allocator, start, end);
+    }
+
+    /// Extract display rows [start, end) as plain text (no link
+    /// markup). Negative rows index scrollback. Trailing blanks are
+    /// trimmed per row; soft-wrapped rows join into one logical line.
+    pub fn extractRowRange(self: *const Screen, allocator: std.mem.Allocator, start: i32, end_excl: i32) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+
+        var r: i32 = start;
+        while (r < end_excl) : (r += 1) {
+            const joins_next = blk: {
+                if (r + 1 >= end_excl) break :blk false;
+                break :blk if (self.lineAt(r + 1)) |l| l.continues_above else false;
+            };
+            const line_cells = self.lineCellsAt(r) orelse {
+                if (!joins_next) try out.append(allocator, '\n');
+                continue;
+            };
+            var hi: usize = line_cells.len;
+            while (hi > 0 and line_cells[hi - 1].rune == 0) hi -= 1;
+
+            var col: usize = 0;
+            while (col < hi) : (col += 1) {
+                const cell = line_cells[col];
+                if (cell.flags & 0b0000_0010 != 0) continue; // wide tail
+                const cp = cell.rune;
+                if (cp == 0) {
+                    try out.append(allocator, ' ');
+                } else if (cp < 0x80) {
+                    try out.append(allocator, @intCast(cp));
+                } else {
+                    var ub: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
+                    try out.appendSlice(allocator, ub[0..n]);
+                }
+                if (r >= 0 and r < @as(i32, @intCast(self.rows))) {
+                    const cluster = self.clusterAt(@intCast(r), @intCast(col));
+                    for (cluster) |ext_cp| {
+                        var eb: [4]u8 = undefined;
+                        const en = std.unicode.utf8Encode(@intCast(ext_cp), &eb) catch continue;
+                        try out.appendSlice(allocator, eb[0..en]);
+                    }
+                }
+            }
+            if (!joins_next) try out.append(allocator, '\n');
         }
         return try out.toOwnedSlice(allocator);
     }
@@ -2192,10 +2272,32 @@ pub const Screen = struct {
                 }
             },
             // OSC 133 — FinalTerm shell-integration prompt marks.
-            // A=prompt-start, B=prompt-end, C=command-start,
-            // D=command-end. We record A as a navigable prompt row.
+            // A=prompt-start (navigable), B=prompt-end (input starts;
+            // nothing to record), C=command-output-start, D=command
+            // finished (optional `;exit-code`). C/D bound the
+            // command-output zone used by "Copy Command Output".
             133 => {
-                if (rest.len > 0 and rest[0] == 'A') self.recordPromptMark();
+                if (rest.len == 0) return;
+                switch (rest[0]) {
+                    'A' => self.recordPromptMark(),
+                    'C' => {
+                        if (self.use_alt or self.row >= self.rows) return;
+                        self.pending_output_start_id = self.active[self.row].id;
+                    },
+                    'D' => {
+                        if (self.use_alt or self.row >= self.rows) return;
+                        const start_id = self.pending_output_start_id;
+                        if (start_id == 0) return;
+                        self.pending_output_start_id = 0;
+                        self.last_output_start_id = start_id;
+                        self.last_output_end_id = self.active[self.row].id;
+                        self.last_cmd_exit = 0;
+                        if (rest.len > 2 and rest[1] == ';') {
+                            self.last_cmd_exit = std.fmt.parseInt(i32, rest[2..], 10) catch 0;
+                        }
+                    },
+                    else => {},
+                }
             },
             // OSC 104 — palette reset. With no args, reset all
             // entries; with `; n` reset only that index.
@@ -5199,6 +5301,54 @@ test "OSC 133 ; A records prompt mark with line ID" {
     const r2 = s.rowForLineId(id2);
     try std.testing.expect(r1 != null);
     try std.testing.expect(r2 != null);
+}
+
+test "OSC 133 C/D bounds the last-command-output zone" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 4);
+    defer s.deinit();
+
+    const nl = struct {
+        fn go(scr: *Screen) void {
+            scr.apply(.{ .execute = '\n' });
+            scr.apply(.{ .execute = '\r' });
+        }
+    }.go;
+
+    // Prompt + command echo on row 0; output starts row 1.
+    s.onOsc("133;A");
+    for ("$ ls") |b| s.printCp(b);
+    nl(s);
+    s.onOsc("133;C");
+    for ("file1") |b| s.printCp(b);
+    nl(s);
+    for ("file2") |b| s.printCp(b);
+    nl(s);
+    s.onOsc("133;D;3");
+
+    try std.testing.expect(s.lastCommandOutputAvailable());
+    try std.testing.expectEqual(@as(i32, 3), s.last_cmd_exit);
+    const out = (try s.extractLastCommandOutput(std.testing.allocator)).?;
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("file1\nfile2\n", out);
+
+    // Zone survives scrolling into scrollback.
+    var k: u32 = 0;
+    while (k < 6) : (k += 1) s.scrollUp(1);
+    const out2 = (try s.extractLastCommandOutput(std.testing.allocator)).?;
+    defer std.testing.allocator.free(out2);
+    try std.testing.expectEqualStrings("file1\nfile2\n", out2);
+
+    // D without a preceding C records nothing new.
+    s.onOsc("133;D;0");
+    try std.testing.expectEqual(@as(i32, 3), s.last_cmd_exit);
+
+    // Empty zone (C immediately followed by D on the same row) is
+    // not "available".
+    s.onOsc("133;C");
+    s.onOsc("133;D;0");
+    try std.testing.expect(!s.lastCommandOutputAvailable());
 }
 
 test "jumpPrevPrompt scrolls into scrollback" {

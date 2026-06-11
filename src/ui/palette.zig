@@ -38,6 +38,8 @@ const ENTRIES = [_]Entry{
        .desc = "Copy the entire visible terminal area.", .action = .copy_screen },
     .{ .icon = "document-save-symbolic", .title = "Copy Scrollback",
        .desc = "Copy the full scrollback buffer plus the visible screen.", .action = .copy_scrollback },
+    .{ .icon = "utilities-terminal-symbolic", .title = "Copy Command Output",
+       .desc = "Copy the output of the last command (needs OSC 133 shell integration).", .action = .copy_command_output },
     .{ .icon = "find-location-symbolic", .title = "Keyboard Hints",
        .desc = "Label URLs, paths, and hashes on screen; type a label to open or copy.", .action = .hints_open },
     .{ .icon = "edit-select-all-symbolic", .title = "Copy Mode",

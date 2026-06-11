@@ -133,6 +133,7 @@ pub const Action = enum {
     /// Copy the full scrollback ring + active screen. Soft-wraps
     /// preserved as logical lines (no extra newlines mid-output).
     copy_scrollback,
+    copy_command_output,
     interrupt_or_copy,
     clear_and_scrollback,
     /// Wipe the scrollback ring only — visible screen untouched.
@@ -289,6 +290,7 @@ pub fn actionName(a: Action) []const u8 {
         .copy_selection => "copy_selection",
         .copy_screen => "copy_screen",
         .copy_scrollback => "copy_scrollback",
+        .copy_command_output => "copy_command_output",
         .interrupt_or_copy => "interrupt_or_copy",
         .clear_and_scrollback => "clear_and_scrollback",
         .clear_scrollback => "clear_scrollback",
@@ -353,6 +355,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .copy_selection => "Copy selection",
         .copy_screen => "Copy whole screen",
         .copy_scrollback => "Copy entire scrollback",
+        .copy_command_output => "Copy last command output (needs shell integration)",
         .interrupt_or_copy => "Copy / interrupt (smart)",
         .clear_and_scrollback => "Clear screen + scrollback",
         .clear_scrollback => "Clear scrollback only",
@@ -655,6 +658,10 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
             copyScrollback(ctx);
             return 1;
         },
+        .copy_command_output => {
+            copyCommandOutput(ctx);
+            return 1;
+        },
         .interrupt_or_copy => {
             // smart_copy: no selection AND smart_copy on → forward
             // Ctrl+C (interrupt). Off → noop. Selection present →
@@ -754,6 +761,21 @@ fn copyScreen(ctx: *Ctx) void {
 fn copyScrollback(ctx: *Ctx) void {
     const screen = ctx.terminal.screen;
     const text = screen.extractScrollback(ctx.terminal.allocator) catch return;
+    defer ctx.terminal.allocator.free(text);
+    if (text.len == 0) return;
+
+    const display = c.gtk_widget_get_display(ctx.widget);
+    const clip = c.gdk_display_get_clipboard(display);
+    const cstr = ctx.terminal.allocator.allocSentinel(u8, text.len, 0) catch return;
+    defer ctx.terminal.allocator.free(cstr);
+    @memcpy(cstr, text);
+    c.gdk_clipboard_set_text(clip, cstr.ptr);
+}
+
+fn copyCommandOutput(ctx: *Ctx) void {
+    const screen = ctx.terminal.screen;
+    const maybe = screen.extractLastCommandOutput(ctx.terminal.allocator) catch return;
+    const text = maybe orelse return;
     defer ctx.terminal.allocator.free(text);
     if (text.len == 0) return;
 

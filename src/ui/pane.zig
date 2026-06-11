@@ -444,6 +444,19 @@ pub const Pane = struct {
                 clipboard.pasteFromClipboard(@ptrCast(self.area), self.terminal);
                 return true;
             },
+            .copy_output => {
+                const maybe = self.terminal.screen.extractLastCommandOutput(self.allocator) catch return true;
+                const text = maybe orelse return true;
+                defer self.allocator.free(text);
+                if (text.len == 0) return true;
+                const cstr = self.allocator.allocSentinel(u8, text.len, 0) catch return true;
+                defer self.allocator.free(cstr);
+                @memcpy(cstr, text);
+                const display = c.gtk_widget_get_display(@ptrCast(self.area));
+                const clip = c.gdk_display_get_clipboard(display);
+                c.gdk_clipboard_set_text(clip, cstr.ptr);
+                return true;
+            },
             .reset_terminal => {
                 self.terminal.screen.fullReset();
                 return true;
@@ -1373,6 +1386,13 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
             }
         }
         return false;
+    }
+
+    // "Copy Command Output" greys out until a completed OSC 133
+    // command zone is reachable.
+    if (c.g_action_map_lookup_action(@ptrCast(group), "copy-output")) |act| {
+        const avail = self.terminal.screen.lastCommandOutputAvailable();
+        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(avail));
     }
 
     // Mux session rows (detach / rename / kill) only make sense on a
