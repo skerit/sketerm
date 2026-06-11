@@ -4700,3 +4700,23 @@ Tests 454 → 466.
   project is GPL-3.0-or-later. Code from GPL-2+/GPL-3/PD/MIT
   sources may now be ported into core; GPL-2-ONLY code may NOT
   (incompatible with GPL-3).
+
+## 2026-06-12: shader LUT/texture inputs (//@texture)
+
+- Shaders can declare extra texture inputs:
+  `//@texture <uniform> <path|builtin:noise>`. Units 2.. (0=frame,
+  1=feedback); loaded at program build, freed on rebuild/releaseGL.
+  builtin:noise = deterministic 256² RGBA tile (GL_REPEAT) — what
+  cool-retro-term-style grain wants, no asset file. File paths
+  resolve against NEW Source.dir (owner-managed: Window dirname of
+  custom_shader, Pane dirname of the pick, dialog copies it).
+- FOUND PRE-EXISTING DOC LIE: stb_image_impl.c compiled with
+  STBI_ONLY_PNG only — docs claimed PNG/JPEG everywhere (a .jpg
+  background_image silently failed!). Now PNG+JPEG+BMP.
+- crt.glsl static noise switched from hash to the noise texture
+  (softer, authentic crawl).
+- smoke-cell: builtin:noise stage (wideband histogram) + file-LUT
+  stage (hand-written 2×2 red BMP via Source.dir-relative path,
+  asserts every output pixel red). With LUT + feedback + params +
+  color pickers, single-pass shader expressiveness now matches what
+  cool-retro-term's engine uses.
