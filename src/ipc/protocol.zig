@@ -51,6 +51,8 @@ pub const PaneInfo = struct {
     rows: u16,
     cols: u16,
     focused: bool,
+    /// Pane is zoomed (fills its tab, siblings hidden).
+    zoomed: bool = false,
 };
 
 pub const TabInfo = struct {

@@ -138,6 +138,12 @@ pub const Window = struct {
     /// evicted at 32; entries for closing panes dropped in unlistPane.
     notify_slots: std.ArrayList(NotifySlot) = .empty,
     next_notify_token: u32 = 1,
+    /// Zoomed pane (tmux z): non-null while one pane fills its tab.
+    /// `zoom_hidden` holds the sibling subtrees we hid, each with a
+    /// strong ref so the pointers stay valid for the restore even if
+    /// GTK re-shuffles the tree in between.
+    zoom_pane: ?*Pane = null,
+    zoom_hidden: std.ArrayList(*c.GtkWidget) = .empty,
     /// Shared background-layer source (one image decode for every
     /// pane). Panes hold a pointer; refreshBgSource mutates + bumps
     /// the generation.
@@ -523,6 +529,8 @@ pub const Window = struct {
         for (self.panes.items) |p| p.deinit();
         self.panes.deinit(self.allocator);
         self.terminals.deinit(self.allocator);
+        for (self.zoom_hidden.items) |w| c.g_object_unref(w);
+        self.zoom_hidden.deinit(self.allocator);
         for (self.notify_slots.items) |slot| self.allocator.free(slot.id);
         self.notify_slots.deinit(self.allocator);
         self.search_matches.deinit(self.allocator);
@@ -1564,6 +1572,10 @@ pub const Window = struct {
         if (self.search_pane == pane) self.closeSearch();
         if (self.hints_pane == pane) self.exitHints();
         if (self.copymode_pane == pane) self.exitCopyMode();
+        // ANY pane removal unzooms (tmux semantics) — the close is
+        // about to collapse a GtkPaned, and doing that surgery inside
+        // a hidden tree would leave half-restored visibility behind.
+        self.unzoomPane();
         self.dropNotifySlotsForPane(pane);
         for (self.panes.items, 0..) |p, idx| {
             if (p == pane) {
@@ -1670,7 +1682,62 @@ pub const Window = struct {
     /// Split the focused pane: spawn a new pane and place the two
     /// inside a GtkPaned. orientation = HORIZONTAL splits side-by-side,
     /// VERTICAL splits top/bottom.
+    /// Toggle tmux-style pane zoom: the focused pane fills its tab;
+    /// toggling again restores the split layout. Implemented by
+    /// hiding the sibling subtree at every GtkPaned level on the path
+    /// to the tab root — a paned with one hidden child gives the
+    /// other the full allocation and hides its handle, so nested
+    /// splits collapse cleanly with NO reparenting (reparenting would
+    /// unrealize the GLArea and tear down its GL context).
+    pub fn toggleZoomPane(self: *Window) void {
+        if (self.zoom_pane != null) {
+            self.unzoomPane();
+            return;
+        }
+        const pane = self.focusedPane() orelse return;
+        const page = tabPageForPane(self, pane) orelse return;
+        const tab_child = c.adw_tab_page_get_child(page) orelse return;
+
+        var w: *c.GtkWidget = pane.widget();
+        while (w != @as(*c.GtkWidget, @ptrCast(tab_child))) {
+            const parent = c.gtk_widget_get_parent(w) orelse break;
+            if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(parent)), c.gtk_paned_get_type()) != 0) {
+                const start = c.gtk_paned_get_start_child(@ptrCast(parent));
+                const end = c.gtk_paned_get_end_child(@ptrCast(parent));
+                const sibling: ?*c.GtkWidget = if (start == w) end else start;
+                if (sibling) |sib| {
+                    // Strong ref so the restore pointers stay valid no
+                    // matter what happens to the tree in between.
+                    _ = c.g_object_ref(sib);
+                    c.gtk_widget_set_visible(sib, 0);
+                    self.zoom_hidden.append(self.allocator, sib) catch {
+                        c.gtk_widget_set_visible(sib, 1);
+                        c.g_object_unref(sib);
+                    };
+                }
+            }
+            w = parent;
+        }
+        if (self.zoom_hidden.items.len == 0) return; // single pane — nothing to zoom
+        self.zoom_pane = pane;
+        _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+    }
+
+    pub fn unzoomPane(self: *Window) void {
+        const pane = self.zoom_pane orelse return;
+        self.zoom_pane = null;
+        for (self.zoom_hidden.items) |w| {
+            c.gtk_widget_set_visible(w, 1);
+            c.g_object_unref(w);
+        }
+        self.zoom_hidden.clearRetainingCapacity();
+        _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+    }
+
     pub fn splitFocused(self: *Window, orientation: c_uint) !void {
+        // Splitting a zoomed layout would wire the new pane into a
+        // hidden tree — restore the real layout first.
+        self.unzoomPane();
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
 
         // Find the focused Pane. The wrapper Box isn't focusable, so
@@ -3176,6 +3243,19 @@ pub const Window = struct {
                 return ipc_protocol.writeErr(out, allocator, "bad color (want #RRGGBB or none)");
             }
             try ipc_protocol.writeOk(out, allocator, null, {});
+        } else if (eql(u8, req.cmd, "action")) {
+            // Dispatch any bindable action by name — the scripting
+            // equivalent of pressing its keybind ("zoom_pane",
+            // "copy_mode", "split_h", …; names as in `keybind.*`).
+            const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "action needs data=<name>");
+            const action = @import("input.zig").actionFromName(name) orelse
+                return ipc_protocol.writeErr(out, allocator, "unknown action");
+            if (req.pane != null) {
+                const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+                _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+            }
+            dispatchAction(self, action);
+            try ipc_protocol.writeOk(out, allocator, null, {});
         } else {
             try ipc_protocol.writeErr(out, allocator, "unknown command");
         }
@@ -3207,6 +3287,7 @@ pub const Window = struct {
                     .rows = scr.rows,
                     .cols = scr.cols,
                     .focused = (p == focused),
+                    .zoomed = (p == self.zoom_pane),
                 });
             }
             const title_c = c.adw_tab_page_get_title(page);
@@ -4042,8 +4123,16 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .save_default_layout => self.saveDefaultLayout(),
         .prompt_prev => self.jumpPromptOnFocused(.prev),
         .prompt_next => self.jumpPromptOnFocused(.next),
-        .pane_prev => self.cyclePane(.prev),
-        .pane_next => self.cyclePane(.next),
+        // tmux semantics: navigating away from a zoomed pane unzooms.
+        .pane_prev => {
+            self.unzoomPane();
+            self.cyclePane(.prev);
+        },
+        .pane_next => {
+            self.unzoomPane();
+            self.cyclePane(.next);
+        },
+        .zoom_pane => self.toggleZoomPane(),
         .prefs_open => self.openPrefs(),
         .broadcast_cycle => self.cycleGroupSend(),
         .restore_closed_tab => self.restoreLastClosed(),
@@ -4205,6 +4294,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("split_h", err),
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch |err| logActionError("split_v", err),
         .close_pane => self.closeFocusedPane(),
+        .zoom_pane => self.toggleZoomPane(),
         .set_pane_title => self.setFocusedPaneTitle(),
         // Detach = close the pane; Terminal.deinit on a remote pane
         // sends DETACH and leaves the session running in the daemon.
@@ -5034,7 +5124,7 @@ fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
             if (self.search_pane == pane) self.closeSearch();
             if (self.hints_pane == pane) self.exitHints();
             if (self.copymode_pane == pane) self.exitCopyMode();
-
+            if (self.zoom_pane == pane) self.unzoomPane();
             const term = pane.terminal;
             _ = self.panes.orderedRemove(i);
             for (self.terminals.items, 0..) |t, ti| {

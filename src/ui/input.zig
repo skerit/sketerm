@@ -153,6 +153,8 @@ pub const Action = enum {
     /// Enter copy mode — keyboard-driven cursor + selection over
     /// screen and scrollback (WezTerm/tmux convention).
     copy_mode,
+    /// Toggle zooming the focused pane to fill its tab (tmux z).
+    zoom_pane,
 };
 
 /// One configured keybind: a (keyval, modifier-mask) → Action mapping.
@@ -197,6 +199,8 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_i, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .toggle_pin_tab },
     // Ctrl+Shift+X → copy mode (WezTerm's default chord).
     .{ .keyval = c.GDK_KEY_x, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_mode },
+    // Ctrl+Shift+M → zoom ("maximize") the focused pane.
+    .{ .keyval = c.GDK_KEY_m, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .zoom_pane },
     // Alt+1..9 → jump to specific tab. Standard across browsers,
     // gnome-terminal, kitty, etc. Doesn't collide with shell C-x
     // chords or Ctrl+Shift+digit (which terminator uses for splits).
@@ -301,6 +305,7 @@ pub fn actionName(a: Action) []const u8 {
         .command_palette => "command_palette",
         .hints_open => "hints_open",
         .copy_mode => "copy_mode",
+        .zoom_pane => "zoom_pane",
     };
 }
 
@@ -366,6 +371,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .command_palette => "Open command palette",
         .hints_open => "Keyboard hints (open/copy URLs, paths, hashes)",
         .copy_mode => "Copy mode (keyboard selection)",
+        .zoom_pane => "Zoom pane (fill the tab; toggle)",
     };
 }
 

@@ -25,6 +25,9 @@ const CLI_HELP =
     \\  set-title [--tab N | --pane N] <title>
     \\  set-tab-color [--tab N] <#RRGGBB|none>
     \\                                    colour swatch on the tab
+    \\  action [--pane N] <name>          run a bindable action by its
+    \\                                    keybind.* name (zoom_pane,
+    \\                                    copy_mode, show_scrollback, …)
     \\
     \\Socket resolution: --socket, then $SKETERM_SOCKET (set inside
     \\every sketerm pane), then the single *.sock under
