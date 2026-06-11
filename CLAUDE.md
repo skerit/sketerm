@@ -125,4 +125,5 @@ Design documents are never committed — proposals stay untracked in the working
 
 ## License
 
-MIT (see `LICENSE`).
+GPL-3.0-or-later (see `LICENSE`). Shader presets in data/shaders/ keep
+per-file licenses (all GPL-3-compatible) — see data/shaders/README.

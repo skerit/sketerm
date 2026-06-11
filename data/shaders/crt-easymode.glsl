@@ -13,9 +13,7 @@
     frames, so the terminal image is treated as iResolution/v_scale
     "source" pixels (scanline + mask frequency follow it).
 
-    NOTE: this file is GPL-licensed (unlike sketerm itself, MIT) —
-    it is data loaded at runtime, distributed alongside under its
-    own license. See data/shaders/README.
+    See data/shaders/README for per-file licensing.
 */
 
 //@name CRT EasyMode

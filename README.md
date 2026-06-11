@@ -183,4 +183,11 @@ sourcing unconditionally is safe.
 
 ## License
 
-TBD.
+GPL-3.0-or-later (see `LICENSE`). Selling copies is permitted —
+what the GPL forbids is closed-source redistribution: anyone who
+distributes sketerm (modified or not) must provide the source under
+the same terms.
+
+Shader presets under `data/shaders/` carry per-file licenses (MIT,
+public domain, GPL — see `data/shaders/README`); all are compatible
+with the GPL-3 core.

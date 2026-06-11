@@ -4686,3 +4686,17 @@ Tests 454 → 466.
   right substitute.
 - smoke-cell compiles + renders both ports (easymode lit=4194,
   zfast lit=3713).
+
+## 2026-06-12: relicensed MIT → GPL-3.0-or-later
+
+- Jelle's explicit decision (sole copyright holder; reversible until
+  outside contributions arrive). Corrected the motivation: GPL does
+  NOT forbid selling — it forbids CLOSED-SOURCE redistribution
+  (which is what kills take-and-sell forks in practice).
+- LICENSE = GPL-3.0 text; README/CLAUDE.md/PKGBUILD license fields
+  updated; data/shaders/README simplified (everything in the repo
+  is now GPL-3-compatible; crt.glsl follows the project license).
+- CLAUDE.md "## License MIT" note is GONE — future sessions: the
+  project is GPL-3.0-or-later. Code from GPL-2+/GPL-3/PD/MIT
+  sources may now be ported into core; GPL-2-ONLY code may NOT
+  (incompatible with GPL-3).

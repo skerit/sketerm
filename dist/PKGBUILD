@@ -9,12 +9,12 @@
 
 pkgname=sketerm-git
 _pkgname=sketerm
-pkgver=0.1.0.r653.g018dd33
+pkgver=0.1.0.r654.gac2068c
 pkgrel=1
 pkgdesc='Native GTK4 terminal emulator written in Zig'
 arch=('x86_64')
 url='https://github.com/skerit/sketerm'
-license=('MIT')
+license=('GPL-3.0-or-later')
 depends=(
     'gtk4'
     'libadwaita'
@@ -100,9 +100,8 @@ package() {
     install -Dm644 data/sample.layout "$pkgdir/usr/share/$_pkgname/sample.layout"
 
     # Ready-made CRT shaders (custom_shader / "Pane Shader…").
-    # Mixed licensing — see data/shaders/README: crt.glsl is MIT
-    # (sketerm original), crt-lottes public domain, crt-easymode and
-    # zfast-crt are GPL ports shipped as runtime data.
+    # Per-file licensing (all GPL-3-compatible) — see
+    # data/shaders/README.
     install -Dm644 data/shaders/crt.glsl \
         "$pkgdir/usr/share/$_pkgname/shaders/crt.glsl"
     install -Dm644 data/shaders/crt-lottes.glsl \

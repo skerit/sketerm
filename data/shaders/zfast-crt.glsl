@@ -15,9 +15,7 @@
     (maskFade, invDims) computed inline; FINEMASK kept; a `v_scale`
     parameter added so the terminal frame acts as a low-res source.
 
-    NOTE: this file is GPL-licensed (unlike sketerm itself, MIT) —
-    it is data loaded at runtime, distributed alongside under its
-    own license. See data/shaders/README.
+    See data/shaders/README for per-file licensing.
 */
 
 //@name zfast CRT
