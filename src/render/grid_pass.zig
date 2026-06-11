@@ -176,6 +176,7 @@ const Snapshot = struct {
     search_hash: u64 = 0,
     hints_hash: u64 = 0,
     predictions_hash: u64 = 0,
+    cmd_zones_hash: u64 = 0,
 
     copy_cursor_on: bool = false,
     copy_cursor_row: i32 = 0,
@@ -578,6 +579,61 @@ pub const GridPass = struct {
             try self.pushQuad(.{ x, y + ch - 2 }, .{ cw, t }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0);
         }
 
+        // Command-zone gutter bars (OSC 133 C/D). Each output row of
+        // a completed command gets a thin bar in the left padding,
+        // green for exit 0 / red otherwise. Membership is the
+        // line-ID range check (IDs are birth-ordered), so this is
+        // O(rows × zones) with no buffer scan.
+        if (!screen.use_alt and screen.cmd_zones_len > 0 and pad >= 3) {
+            const bar_w: f32 = @min(3.0, pad - 1.0);
+            var vr: u16 = 0;
+            while (vr < screen.rows) : (vr += 1) {
+                const ln_ptr: *const @TypeOf(buf[0]) = if (vr < view_off) blk: {
+                    const sb_idx = sb_count - view_off + vr;
+                    break :blk screen.scrollbackLine(sb_idx);
+                } else &buf[vr - view_off];
+                const lid = ln_ptr.id;
+                if (lid == 0) continue;
+                var zi: u16 = 0;
+                while (zi < screen.cmd_zones_len) : (zi += 1) {
+                    const z = screen.cmdZone(zi).?;
+                    if (lid >= z.start_id and lid < z.end_id) {
+                        const color: [4]f32 = if (z.exit == 0)
+                            .{ 0.25, 0.75, 0.35, 0.55 }
+                        else
+                            .{ 0.90, 0.25, 0.20, 0.75 };
+                        const y: f32 = pad + @as(f32, @floatFromInt(vr)) * ch;
+                        try self.pushQuad(.{ 0, y }, .{ bar_w, ch }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0);
+                        break;
+                    }
+                }
+            }
+
+            // Failed-command ticks on the right edge — a minimap of
+            // where in the whole buffer (scrollback + screen) red
+            // zones live, so a scrolled-away failure stays findable.
+            const total_rows: f32 = @floatFromInt(sb_count + screen.rows);
+            if (total_rows > 0 and self.canvas_w > 8) {
+                var zi: u16 = 0;
+                while (zi < screen.cmd_zones_len) : (zi += 1) {
+                    const z = screen.cmdZone(zi).?;
+                    if (z.exit == 0) continue;
+                    const drow = screen.rowForLineIdFast(z.start_id) orelse continue;
+                    const buf_pos: f32 = @floatFromInt(drow + @as(i32, @intCast(sb_count)));
+                    const frac = std.math.clamp(buf_pos / total_rows, 0.0, 1.0);
+                    const ty = frac * (self.canvas_h - 4);
+                    try self.pushQuad(
+                        .{ self.canvas_w - 4, ty },
+                        .{ 3, 4 },
+                        .{ 0, 0 },
+                        .{ 0, 0 },
+                        .{ 0.90, 0.25, 0.20, 0.85 },
+                        0.0,
+                    );
+                }
+            }
+        }
+
         // Auto-detected URL underlines. Per-row scan results live in
         // `row_url_matches`; rows whose cache is still valid skip the
         // O(cols) `scanRow` call and just re-emit cached matches. The
@@ -921,6 +977,10 @@ pub const GridPass = struct {
             .search_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(screen.search_highlights)),
             .hints_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(screen.hints_overlay)),
             .predictions_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(screen.predictions_overlay)),
+            .cmd_zones_hash = std.hash.Wyhash.hash(
+                (@as(u64, screen.cmd_zones_head) << 16) | screen.cmd_zones_len,
+                std.mem.asBytes(&screen.cmd_zones),
+            ),
 
             .bell_at_us = screen.bell_at_us,
 

@@ -21,6 +21,25 @@ const Event = @import("../parser/event.zig").Event;
 const utf8 = @import("../util/utf8.zig");
 const palette_default_256 = @import("palette.zig").default_256;
 
+pub const CMD_ZONE_CAP = 64;
+
+/// A completed OSC 133 C/D command-output zone. Stored as stable
+/// line IDs; 0/0 = empty slot.
+pub const CmdZone = extern struct {
+    start_id: u64 = 0,
+    end_id: u64 = 0,
+    exit: i32 = 0,
+    _pad: i32 = 0,
+};
+
+/// A command zone resolved to display-buffer rows (negative =
+/// scrollback). Output rows are [start_row, end_row).
+pub const CmdZoneRows = struct {
+    start_row: i32,
+    end_row: i32,
+    exit: i32,
+};
+
 pub const Screen = struct {
     cols: u16,
     rows: u16,
@@ -286,6 +305,15 @@ pub const Screen = struct {
     last_output_end_id: u64 = 0,
     /// Exit status from `OSC 133 ; D ; <code>` (0 when not reported).
     last_cmd_exit: i32 = 0,
+
+    /// Ring of completed command zones (command-block UX: gutter
+    /// marks, click-to-select, failed-command minimap). extern so the
+    /// renderer can hash the raw bytes without padding UB. Zone rows
+    /// have line IDs in [start_id, end_id) — IDs are birth-ordered,
+    /// so display-row membership is an ID range check.
+    cmd_zones: [CMD_ZONE_CAP]CmdZone = [_]CmdZone{.{}} ** CMD_ZONE_CAP,
+    cmd_zones_len: u16 = 0,
+    cmd_zones_head: u16 = 0,
 
     /// OSC 99 (kitty desktop notifications) accumulator. Chunks with
     /// the same identifier append payload parts until `d` signals
@@ -800,6 +828,78 @@ pub const Screen = struct {
         const id = self.next_line_id;
         self.next_line_id += 1;
         return id;
+    }
+
+    /// Push a completed command zone onto the ring (OSC 133 D).
+    fn recordCmdZone(self: *Screen, start_id: u64, end_id: u64, exit: i32) void {
+        const cap: u16 = CMD_ZONE_CAP;
+        self.cmd_zones[self.cmd_zones_head] = .{ .start_id = start_id, .end_id = end_id, .exit = exit };
+        self.cmd_zones_head = (self.cmd_zones_head + 1) % cap;
+        if (self.cmd_zones_len < cap) self.cmd_zones_len += 1;
+    }
+
+    /// Iterate the zone ring, newest first. idx 0 = most recent.
+    pub fn cmdZone(self: *const Screen, idx: u16) ?CmdZone {
+        if (idx >= self.cmd_zones_len) return null;
+        const cap: u32 = CMD_ZONE_CAP;
+        const slot: u16 = @intCast((@as(u32, self.cmd_zones_head) + cap - 1 - @as(u32, idx)) % cap);
+        return self.cmd_zones[slot];
+    }
+
+    /// Find the zone containing `display_row` (negative = scrollback)
+    /// via the line-ID range check: zone rows were born between the
+    /// C row and the D row, so their IDs fall in [start_id, end_id).
+    pub fn cmdZoneContainingDisplayRow(self: *const Screen, display_row: i32) ?CmdZoneRows {
+        if (self.use_alt) return null;
+        const ln = self.lineAt(display_row) orelse return null;
+        if (ln.id == 0) return null;
+        var i: u16 = 0;
+        while (i < self.cmd_zones_len) : (i += 1) {
+            const z = self.cmdZone(i).?;
+            if (ln.id >= z.start_id and ln.id < z.end_id) {
+                const start = self.rowForLineIdFast(z.start_id) orelse return null;
+                const end = self.rowForLineIdFast(z.end_id) orelse return null;
+                if (end <= start) return null;
+                return .{ .start_row = start, .end_row = end, .exit = z.exit };
+            }
+        }
+        return null;
+    }
+
+    /// Line-wise select a command zone's output rows. Returns true
+    /// when a zone covered `display_row` and the selection was set.
+    pub fn selectCmdZoneAt(self: *Screen, display_row: i32) bool {
+        const z = self.cmdZoneContainingDisplayRow(display_row) orelse return false;
+        self.selection.start(z.start_row, 0, .line_select);
+        self.selection.extend(z.end_row - 1, @intCast(self.cols));
+        self.dirty = true;
+        return true;
+    }
+
+    /// `rowForLineId` with a binary search over scrollback (lines
+    /// land there in birth order, so IDs are sorted). Falls back to
+    /// the linear walk if the sorted assumption ever fails (reflow
+    /// edge cases) — correctness over speed.
+    pub fn rowForLineIdFast(self: *const Screen, line_id: u64) ?i32 {
+        if (line_id == 0 or self.use_alt) return self.rowForLineId(line_id);
+        for (self.active, 0..) |l, i| {
+            if (l.id == line_id) return @intCast(i);
+        }
+        const sb_count = self.scrollbackCount();
+        if (sb_count > 0) {
+            var lo: u32 = 0;
+            var hi: u32 = sb_count;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const mid_id = self.scrollbackLine(mid).id;
+                if (mid_id == line_id) {
+                    const from_bottom: i32 = @intCast(sb_count - mid);
+                    return -from_bottom;
+                }
+                if (mid_id < line_id) lo = mid + 1 else hi = mid;
+            }
+        }
+        return self.rowForLineId(line_id);
     }
 
     /// Locate the display row containing `line_id`, including
@@ -2580,6 +2680,7 @@ pub const Screen = struct {
                         if (rest.len > 2 and rest[1] == ';') {
                             self.last_cmd_exit = std.fmt.parseInt(i32, rest[2..], 10) catch 0;
                         }
+                        self.recordCmdZone(start_id, self.last_output_end_id, self.last_cmd_exit);
                     },
                     else => {},
                 }
@@ -6066,6 +6167,69 @@ test "OSC 133 C/D bounds the last-command-output zone" {
     s.onOsc("133;C");
     s.onOsc("133;D;0");
     try std.testing.expect(!s.lastCommandOutputAvailable());
+}
+
+test "command-zone ring: membership, selection, fast row lookup" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 4);
+    defer s.deinit();
+
+    const nl = struct {
+        fn go(scr: *Screen) void {
+            scr.apply(.{ .execute = '\n' });
+            scr.apply(.{ .execute = '\r' });
+        }
+    }.go;
+
+    // Two commands: first fails (exit 1), second succeeds.
+    s.onOsc("133;A");
+    for ("$ a") |b| s.printCp(b);
+    nl(s);
+    s.onOsc("133;C");
+    for ("boom") |b| s.printCp(b);
+    nl(s);
+    s.onOsc("133;D;1");
+    s.onOsc("133;A");
+    for ("$ b") |b| s.printCp(b);
+    nl(s);
+    s.onOsc("133;C");
+    for ("ok") |b| s.printCp(b);
+    nl(s);
+    s.onOsc("133;D;0");
+
+    try std.testing.expectEqual(@as(u16, 2), s.cmd_zones_len);
+    // Newest-first iteration.
+    try std.testing.expectEqual(@as(i32, 0), s.cmdZone(0).?.exit);
+    try std.testing.expectEqual(@as(i32, 1), s.cmdZone(1).?.exit);
+    try std.testing.expect(s.cmdZone(2) == null);
+
+    // The screen scrolled once while printing, so "boom" sits at
+    // display row 0; it belongs to the failed zone.
+    const z = s.cmdZoneContainingDisplayRow(0).?;
+    try std.testing.expectEqual(@as(i32, 1), z.exit);
+    try std.testing.expectEqual(@as(i32, 0), z.start_row);
+    try std.testing.expectEqual(@as(i32, 1), z.end_row);
+
+    // Click-select primes a line-wise selection over the zone.
+    try std.testing.expect(s.selectCmdZoneAt(0));
+    try std.testing.expectEqual(@import("selection.zig").Mode.line_select, s.selection.mode);
+    const text = try s.extractSelection(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "boom") != null);
+
+    // The "$ b" prompt row between the two zones resolves to null.
+    try std.testing.expect(s.cmdZoneContainingDisplayRow(1) == null);
+
+    // Fast lookup agrees with the linear walk after scrolling the
+    // zones into scrollback.
+    var k: u32 = 0;
+    while (k < 6) : (k += 1) s.scrollUp(1);
+    const fail_z = s.cmdZone(1).?;
+    try std.testing.expectEqual(
+        s.rowForLineId(fail_z.start_id),
+        s.rowForLineIdFast(fail_z.start_id),
+    );
 }
 
 test "jumpPrevPrompt scrolls into scrollback" {

@@ -145,7 +145,12 @@ pub fn main() !u8 {
         // Box-drawing in cyan to verify CellPass renders them. The
         // chars are encoded as UTF-8 here — the parser turns them
         // into single u32 runes per cell.
-        "\x1b[5;1H\x1b[36m┌─┐│└─┘\x1b[0m";
+        "\x1b[5;1H\x1b[36m┌─┐│└─┘\x1b[0m" ++
+        // Row 4 (the only free row in this 5-row grid): a failed
+        // OSC 133 command zone — exercises the command-block gutter
+        // bar (red, leftmost ~3px of the row). CUP (not LF) moves to
+        // the D row so nothing scrolls.
+        "\x1b[4;1H\x1b]133;C\x07command output\x1b[5;1H\x1b]133;D;2\x07";
     parser.advance(greeting, Emit.cb, @ptrCast(&ec));
 
     // Cell pass.
@@ -188,6 +193,7 @@ pub fn main() !u8 {
     var bluish_border: usize = 0;
     var reddish: usize = 0;
     var yellowish: usize = 0;
+    var gutter_red: usize = 0;
     var any_text: usize = 0;
     var i: usize = 0;
     while (i < fb_bytes) : (i += 4) {
@@ -201,10 +207,13 @@ pub fn main() !u8 {
         if (r > g + 30 and r > b + 30) reddish += 1;
         // Emoji yellow: warm pixel, red+green both well above blue.
         if (r > 150 and g > 100 and r > b + 80 and g > b + 50) yellowish += 1;
+        // Command-zone gutter bar: red pixels hugging the left edge
+        // (x < 3, inside the padding strip — no glyph reaches there).
+        if ((i / 4) % @as(usize, @intCast(W)) < 3 and r > g + 30 and r > b + 30) gutter_red += 1;
     }
     std.debug.print(
-        "smoke-cell: any_text={d} greenish={d} bluish_border={d} reddish={d} emoji_yellowish={d}\n",
-        .{ any_text, greenish, bluish_border, reddish, yellowish },
+        "smoke-cell: any_text={d} greenish={d} bluish_border={d} reddish={d} emoji_yellowish={d} gutter_red={d}\n",
+        .{ any_text, greenish, bluish_border, reddish, yellowish, gutter_red },
     );
     // Soft check only: no colour emoji font installed → 0 is legitimate.
     if (yellowish < 5) {
@@ -226,6 +235,10 @@ pub fn main() !u8 {
     if (reddish < 5) {
         std.debug.print("smoke-cell: FAIL — no red text/underline (deco pass broken?)\n", .{});
         return 5;
+    }
+    if (gutter_red < 3) {
+        std.debug.print("smoke-cell: FAIL — command-zone gutter bar not drawn\n", .{});
+        return 6;
     }
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;

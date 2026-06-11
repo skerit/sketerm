@@ -1734,6 +1734,23 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
         return;
     }
 
+    // Gutter click — a single left click in the left padding strip
+    // on a row inside an OSC 133 command zone selects that command's
+    // whole output (line-wise) and primes PRIMARY, Warp-block style.
+    if (button == 1 and self.terminal.screen.mouse_mode == 0 and n_press == 1 and
+        !self.terminal.screen.use_alt)
+    {
+        const scale: f64 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
+        if (x * scale < @as(f64, @floatCast(self.grid_pass.pad))) {
+            const cell = self.cellAt(x, y);
+            if (self.terminal.screen.selectCmdZoneAt(cell.row)) {
+                self.pushSelectionToClipboards();
+                c.gtk_gl_area_queue_render(@ptrCast(self.area));
+                return;
+            }
+        }
+    }
+
     // Left double / triple click → word / line selection.
     if (button == 1 and self.terminal.screen.mouse_mode == 0 and n_press >= 2) {
         // On alt screen (TUIs), host-side selection is opt-in via

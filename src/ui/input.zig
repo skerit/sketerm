@@ -134,6 +134,8 @@ pub const Action = enum {
     /// preserved as logical lines (no extra newlines mid-output).
     copy_scrollback,
     copy_command_output,
+    /// Line-wise select the last command's output zone (OSC 133).
+    select_command_output,
     interrupt_or_copy,
     clear_and_scrollback,
     /// Wipe the scrollback ring only — visible screen untouched.
@@ -295,6 +297,7 @@ pub fn actionName(a: Action) []const u8 {
         .copy_screen => "copy_screen",
         .copy_scrollback => "copy_scrollback",
         .copy_command_output => "copy_command_output",
+        .select_command_output => "select_command_output",
         .interrupt_or_copy => "interrupt_or_copy",
         .clear_and_scrollback => "clear_and_scrollback",
         .clear_scrollback => "clear_scrollback",
@@ -361,6 +364,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .copy_screen => "Copy whole screen",
         .copy_scrollback => "Copy entire scrollback",
         .copy_command_output => "Copy last command output (needs shell integration)",
+        .select_command_output => "Select last command output (needs shell integration)",
         .interrupt_or_copy => "Copy / interrupt (smart)",
         .clear_and_scrollback => "Clear screen + scrollback",
         .clear_scrollback => "Clear scrollback only",
@@ -666,6 +670,15 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
         },
         .copy_command_output => {
             copyCommandOutput(ctx);
+            return 1;
+        },
+        .select_command_output => {
+            const screen = ctx.terminal.screen;
+            const z = screen.cmdZone(0) orelse return 1;
+            const row = screen.rowForLineIdFast(z.start_id) orelse return 1;
+            if (screen.selectCmdZoneAt(row)) {
+                c.gtk_widget_queue_draw(ctx.widget);
+            }
             return 1;
         },
         .interrupt_or_copy => {
