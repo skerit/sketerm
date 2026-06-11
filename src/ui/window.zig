@@ -16,6 +16,7 @@ const Config = @import("../config.zig").Config;
 const ipc_server = @import("../ipc/server.zig");
 const bg_pass_mod = @import("../render/bg_pass.zig");
 const shader_pass_mod = @import("../render/shader_pass.zig");
+const shader_preset_mod = @import("../shader_preset.zig");
 const ipc_protocol = @import("../ipc/protocol.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
 const Screen = @import("../grid/screen.zig").Screen;
@@ -1225,6 +1226,18 @@ pub const Window = struct {
         }
     }
 
+    /// Re-apply a PaneSpec's saved shader state: preset by name
+    /// first, then the explicit path pick, then a sticky clear.
+    fn restorePaneShader(self: *Window, pane: *Pane, p: @import("../layout.zig").PaneSpec) void {
+        if (p.shader_preset.len > 0) {
+            if (self.applyShaderPresetByName(pane, p.shader_preset)) return;
+        }
+        if (p.custom_shader.len > 0)
+            _ = pane.setCustomShader(p.custom_shader, self.config.custom_shader_animation, true)
+        else if (p.shader_cleared)
+            pane.clearShader();
+    }
+
     fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree) !*c.GtkWidget {
         switch (tree) {
             .pane => |p| {
@@ -1234,10 +1247,7 @@ pub const Window = struct {
                 // spawn below so startup never wedges on a layout.
                 if (p.mux_session.len > 0) {
                     if (self.restoreMuxPane(p)) |pane| {
-                        if (p.custom_shader.len > 0)
-                            _ = pane.setCustomShader(p.custom_shader, self.config.custom_shader_animation, true)
-                        else if (p.shader_cleared)
-                            pane.clearShader();
+                        self.restorePaneShader(pane, p);
                         return pane.widget();
                     } else |err| {
                         std.debug.print(
@@ -1304,13 +1314,10 @@ pub const Window = struct {
                     .profile = profile,
                     .font_size_override = p.font_size,
                 });
-                // Explicit per-pane shader pick (wins over the
+                // Explicit per-pane shader preset/pick (wins over the
                 // profile/global shader applyPaneConfig resolved), or
                 // an explicit clear that turns the shader off.
-                if (p.custom_shader.len > 0)
-                    _ = pane.setCustomShader(p.custom_shader, self.config.custom_shader_animation, true)
-                else if (p.shader_cleared)
-                    pane.clearShader();
+                self.restorePaneShader(pane, p);
 
                 try self.panes.append(self.allocator, pane);
                 try self.terminals.append(self.allocator, term);
@@ -1768,8 +1775,33 @@ pub const Window = struct {
     fn repointShaderOverrides(self: *Window) void {
         self.shader_source.overrides = self.config.shader_params.items;
         for (self.panes.items) |p| {
-            p.shader_own.overrides = self.config.shader_params.items;
+            // A preset pane owns its override slice — leave it alone.
+            if (p.preset_name == null)
+                p.shader_own.overrides = self.config.shader_params.items;
         }
+    }
+
+    /// Route a shader-param edit: a preset pane edits its own per-
+    /// pane set (saved via the preset, not the config); a plain pane
+    /// edits the global config entry.
+    pub fn setPaneShaderParam(self: *Window, pane: *Pane, name: []const u8, value: f32, color: ?[3]f32) void {
+        if (pane.preset_name != null) {
+            pane.setPresetParam(name, value, color);
+        } else {
+            self.setShaderParam(name, value, color);
+        }
+    }
+
+    /// Load + apply a named shader preset to `pane`. False when the
+    /// preset (or its shader file) can't be read.
+    pub fn applyShaderPresetByName(self: *Window, pane: *Pane, name: []const u8) bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const preset = shader_preset_mod.load(arena_state.allocator(), name) catch return false;
+        if (preset.shader_path.len == 0) return false;
+        if (!pane.setCustomShader(preset.shader_path, preset.animate, true)) return false;
+        pane.applyShaderPresetParams(name, preset.params);
+        return true;
     }
 
     /// Set (or update) one shader_param override, live + persisted.
@@ -1808,6 +1840,7 @@ pub const Window = struct {
         const pane = self.focusedPane() orelse return;
         // Strictly per-pane: explicit, sticky "no shader" — overrides
         // profile/global and survives config reloads (Pane.shader_cleared).
+        pane.dropShaderPreset(self.config.shader_params.items);
         pane.clearShader();
     }
 
@@ -1971,7 +2004,8 @@ pub const Window = struct {
         // global. Both the pick and an explicit clear are sticky —
         // config reloads / profile pushes leave them alone.
         pane.shader_default_source = &self.shader_source;
-        pane.shader_own.overrides = self.config.shader_params.items;
+        if (pane.preset_name == null)
+            pane.shader_own.overrides = self.config.shader_params.items;
         if (!pane.custom_shader_user and !pane.shader_cleared) {
             const prof_shader: []const u8 = if (profile) |p| p.custom_shader else "";
             _ = pane.setCustomShader(
@@ -2399,6 +2433,104 @@ pub const Window = struct {
         c.gtk_popover_popup(@ptrCast(popover));
     }
 
+    const PresetButtonCtx = struct {
+        window: *Window,
+        preset_name: [:0]u8, // owned, freed by GDestroyNotify
+        popover: *c.GtkWidget,
+        allocator: std.mem.Allocator,
+    };
+
+    /// Right-click → "Shader Preset…" picker. A popover anchored on
+    /// the focused pane: a button per saved preset (applies it to
+    /// that pane) plus a trash button to delete the preset file.
+    /// With no presets, a placeholder explains where they come from.
+    pub fn openShaderPresetPicker(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const names = shader_preset_mod.list(arena_state.allocator()) catch return;
+
+        const popover = c.gtk_popover_new();
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
+        c.gtk_widget_set_margin_top(box, 6);
+        c.gtk_widget_set_margin_bottom(box, 6);
+        c.gtk_widget_set_margin_start(box, 6);
+        c.gtk_widget_set_margin_end(box, 6);
+
+        if (names.len == 0) {
+            const lbl = c.gtk_label_new("No shader presets saved yet.\nConfigure Shader… has a \"Save as Preset\" button.");
+            c.gtk_label_set_xalign(@ptrCast(lbl), 0);
+            c.gtk_box_append(@ptrCast(box), lbl);
+        } else {
+            for (names) |name| {
+                const name_z = self.allocator.allocSentinel(u8, name.len, 0) catch continue;
+                @memcpy(name_z, name);
+
+                const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+                const btn = c.gtk_button_new_with_label(name_z.ptr);
+                c.gtk_widget_set_hexpand(btn, 1);
+                c.gtk_widget_set_halign(btn, c.GTK_ALIGN_FILL);
+                c.gtk_widget_add_css_class(btn, "flat");
+
+                const apply_ctx = self.allocator.create(PresetButtonCtx) catch {
+                    self.allocator.free(name_z);
+                    continue;
+                };
+                apply_ctx.* = .{
+                    .window = self,
+                    .preset_name = name_z,
+                    .popover = popover,
+                    .allocator = self.allocator,
+                };
+                _ = c.g_signal_connect_data(
+                    btn,
+                    "clicked",
+                    @ptrCast(&onPresetPicked),
+                    @ptrCast(apply_ctx),
+                    @ptrCast(&freePresetButtonCtx),
+                    c.G_CONNECT_DEFAULT,
+                );
+                c.gtk_box_append(@ptrCast(row), btn);
+
+                const del = c.gtk_button_new_from_icon_name("user-trash-symbolic");
+                c.gtk_widget_add_css_class(del, "flat");
+                c.gtk_widget_set_tooltip_text(del, "Delete preset");
+                const del_name = self.allocator.allocSentinel(u8, name.len, 0) catch {
+                    c.gtk_box_append(@ptrCast(box), row);
+                    continue;
+                };
+                @memcpy(del_name, name);
+                const del_ctx = self.allocator.create(PresetButtonCtx) catch {
+                    self.allocator.free(del_name);
+                    c.gtk_box_append(@ptrCast(box), row);
+                    continue;
+                };
+                del_ctx.* = .{
+                    .window = self,
+                    .preset_name = del_name,
+                    .popover = popover,
+                    .allocator = self.allocator,
+                };
+                _ = c.g_signal_connect_data(
+                    del,
+                    "clicked",
+                    @ptrCast(&onPresetDeleted),
+                    @ptrCast(del_ctx),
+                    @ptrCast(&freePresetButtonCtx),
+                    c.G_CONNECT_DEFAULT,
+                );
+                c.gtk_box_append(@ptrCast(row), del);
+
+                c.gtk_box_append(@ptrCast(box), row);
+            }
+        }
+
+        c.gtk_popover_set_child(@ptrCast(popover), box);
+        c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+        c.gtk_popover_popup(@ptrCast(popover));
+    }
+
     const PaneTitleCtx = struct {
         window: *Window,
         pane: *Pane,
@@ -2812,10 +2944,12 @@ pub const Window = struct {
             p.font_features = if (self.config.font_features.len > 0) self.config.font_features else null;
             // Shader state: the overrides slice points into the
             // config arena (about to be freed) — re-point it
-            // UNCONDITIONALLY, then re-resolve profile/global shader
-            // for panes without a sticky user pick.
+            // UNCONDITIONALLY (preset panes own their slice and skip
+            // this), then re-resolve profile/global shader for panes
+            // without a sticky user pick.
             p.shader_default_source = &self.shader_source;
-            p.shader_own.overrides = self.config.shader_params.items;
+            if (p.preset_name == null)
+                p.shader_own.overrides = self.config.shader_params.items;
             if (!p.custom_shader_user and !p.shader_cleared) {
                 const prof_shader: []const u8 = blk: {
                     if (p.active_profile) |pn| {
@@ -4296,6 +4430,10 @@ pub const Window = struct {
                     (if (p.custom_shader_path) |sp| try arena.dupe(u8, sp) else "")
                 else
                     "";
+                const preset: []const u8 = if (p.preset_name) |pn|
+                    try arena.dupe(u8, pn)
+                else
+                    "";
                 // Durable mux panes: session + transport so restore
                 // can reattach (or recreate under the same name).
                 var mux_session: []const u8 = "";
@@ -4310,6 +4448,7 @@ pub const Window = struct {
                     .font_size = fs,
                     .profile = prof,
                     .custom_shader = shader,
+                    .shader_preset = preset,
                     .shader_cleared = p.shader_cleared,
                     .mux_session = mux_session,
                     .mux_host = mux_host,
@@ -4640,6 +4779,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .configure_shader => {
             if (!@import("shader_dialog.zig").open(self)) self.pickPaneShader();
         },
+        .shader_preset_pick => self.openShaderPresetPicker(),
         .show_scrollback => self.openScrollbackPager(),
         .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
@@ -4779,6 +4919,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .new_tab_as_profile => self.openProfilePicker(),
         .duplicate_tab => self.duplicateCurrentTab(),
         .shader_pick => self.pickPaneShader(),
+        .shader_preset => self.openShaderPresetPicker(),
         .shader_config => {
             // No active shader → offer the picker instead.
             if (!@import("shader_dialog.zig").open(self)) self.pickPaneShader();
@@ -4830,7 +4971,9 @@ fn onShaderPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque
     }
     if (!alive) return;
     const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
-    // Strictly per-pane: the pick lands on the clicked pane only.
+    // Strictly per-pane: the pick lands on the clicked pane only. A
+    // manual file pick replaces any bound preset.
+    ctx.pane.dropShaderPreset(ctx.win.config.shader_params.items);
     _ = ctx.pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true);
 }
 
@@ -4977,6 +5120,33 @@ fn onProfilePicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 fn freeProfileButtonCtx(user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Window.ProfileButtonCtx, user);
     ctx.allocator.free(ctx.profile_name);
+    ctx.allocator.destroy(ctx);
+}
+
+fn onPresetPicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Window.PresetButtonCtx, user);
+    if (ctx.window.focusedPane()) |pane| {
+        if (!ctx.window.applyShaderPresetByName(pane, ctx.preset_name)) {
+            std.debug.print("sketerm: shader preset '{s}' failed to apply\n", .{ctx.preset_name});
+        }
+    }
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+}
+
+fn onPresetDeleted(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Window.PresetButtonCtx, user);
+    shader_preset_mod.delete(ctx.allocator, ctx.preset_name) catch {
+        std.debug.print("sketerm: shader preset '{s}' delete failed\n", .{ctx.preset_name});
+        return;
+    };
+    // Hide the row (button + delete button) — the popover rebuilds
+    // fresh on next open.
+    if (c.gtk_widget_get_parent(@ptrCast(btn))) |row| c.gtk_widget_set_visible(row, 0);
+}
+
+fn freePresetButtonCtx(user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Window.PresetButtonCtx, user);
+    ctx.allocator.free(ctx.preset_name);
     ctx.allocator.destroy(ctx);
 }
 

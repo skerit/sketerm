@@ -122,6 +122,8 @@ pub const Action = enum {
     /// Open the dynamic shader-config dialog (sliders/colors from
     /// the focused pane's shader parameter declarations).
     configure_shader,
+    /// Open the shader-preset picker (apply/delete saved presets).
+    shader_preset_pick,
     /// Dump scrollback + visible screen to a temp file and open it
     /// in a pager (`less -R +G`, or `$PAGER`) in a new tab. Kitty's
     /// show_scrollback equivalent.
@@ -298,6 +300,7 @@ pub fn actionName(a: Action) []const u8 {
         .duplicate_tab => "duplicate_tab",
         .detach_tab => "detach_tab",
         .configure_shader => "configure_shader",
+        .shader_preset_pick => "shader_preset_pick",
         .show_scrollback => "show_scrollback",
         .new_durable_tab => "new_durable_tab",
         .paste_clipboard => "paste_clipboard",
@@ -367,6 +370,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .duplicate_tab => "Duplicate tab (cwd + profile)",
         .detach_tab => "Detach tab into a new window",
         .configure_shader => "Configure shader (sliders for the pane's shader params)",
+        .shader_preset_pick => "Shader preset (apply or delete a saved shader preset)",
         .show_scrollback => "Show scrollback in pager",
         .new_durable_tab => "New durable tab (mux)",
         .paste_clipboard => "Paste clipboard",

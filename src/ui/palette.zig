@@ -115,6 +115,10 @@ const ENTRIES = [_]Entry{
     .{ .icon = "view-refresh-symbolic", .title = "Reload Config",
        .desc = "Re-read config.conf from disk and apply live.", .action = .reload_config },
 
+    // Shaders
+    .{ .icon = "starred-symbolic", .title = "Shader Preset…",
+       .desc = "Apply or delete a saved shader preset on the focused pane.", .action = .shader_preset_pick },
+
     // Misc
     .{ .icon = "input-keyboard-symbolic", .title = "Broadcast Mode",
        .desc = "Cycle broadcast typing across panes: off → group → all → off.", .action = .broadcast_cycle },

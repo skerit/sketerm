@@ -31,6 +31,7 @@ comptime {
     _ = @import("grid/url_scan.zig");
     _ = @import("grid/word_motion.zig");
     _ = @import("layout.zig");
+    _ = @import("shader_preset.zig");
     _ = @import("layout_simple.zig");
     _ = @import("parser/sixel.zig");
     _ = @import("parser/iterm_image.zig");

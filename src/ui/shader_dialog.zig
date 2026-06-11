@@ -9,7 +9,9 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const Window = @import("window.zig").Window;
+const Pane = @import("pane.zig").Pane;
 const shader_pass = @import("../render/shader_pass.zig");
+const shader_preset = @import("../shader_preset.zig");
 
 const PREVIEW_W = 380;
 const PREVIEW_H = 230;
@@ -17,6 +19,11 @@ const PREVIEW_H = 230;
 const Ctx = struct {
     allocator: std.mem.Allocator,
     win: *Window,
+    /// Pane the dialog was opened on. May close while the dialog is
+    /// up — deref only via alivePane().
+    pane: *Pane,
+    /// Entry of the "Save as Preset" row.
+    name_entry: ?*c.GtkWidget = null,
     params: [shader_pass.MAX_PARAMS]shader_pass.Param = undefined,
     params_len: usize = 0,
     meta: shader_pass.Meta = .{},
@@ -70,7 +77,7 @@ pub fn open(win: *Window) bool {
     };
 
     const ctx = win.allocator.create(Ctx) catch return false;
-    ctx.* = .{ .allocator = win.allocator, .win = win };
+    ctx.* = .{ .allocator = win.allocator, .win = win, .pane = pane };
     ctx.params_len = shader_pass.parseParams(src, &ctx.params, &ctx.meta);
     ctx.src_copy = win.allocator.dupe(u8, src) catch null;
     if (ctx.src_copy) |sc| {
@@ -127,7 +134,7 @@ pub fn open(win: *Window) bool {
         switch (p.kind) {
             .float => {
                 const adj = c.gtk_adjustment_new(
-                    currentFloat(win, p),
+                    currentFloat(ctx, p),
                     p.min,
                     p.max,
                     p.step,
@@ -153,7 +160,7 @@ pub fn open(win: *Window) bool {
                 const dlg = c.gtk_color_dialog_new();
                 const btn = c.gtk_color_dialog_button_new(dlg);
                 c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
-                const cur = currentColor(win, p);
+                const cur = currentColor(ctx, p);
                 var rgba: c.GdkRGBA = .{ .red = cur[0], .green = cur[1], .blue = cur[2], .alpha = 1.0 };
                 c.gtk_color_dialog_button_set_rgba(@ptrCast(@alignCast(btn)), &rgba);
                 _ = c.g_signal_connect_data(
@@ -214,6 +221,36 @@ pub fn open(win: *Window) bool {
     }
 
     c.adw_preferences_page_add(@ptrCast(@alignCast(page)), @ptrCast(@alignCast(group)));
+
+    // Save-as-preset: name entry + button. Writes the shader path +
+    // the current values of every declared param to
+    // shader-presets/<name>.conf and binds the pane to it.
+    {
+        const sgroup = c.adw_preferences_group_new();
+        c.adw_preferences_group_set_title(@ptrCast(@alignCast(sgroup)), "Preset");
+        c.adw_preferences_group_set_description(@ptrCast(@alignCast(sgroup)), "Save this shader + current values as a named preset (right-click \xe2\x86\x92 Shader Preset\xe2\x80\xa6 applies it).");
+        const srow = c.adw_entry_row_new();
+        c.adw_preferences_row_set_title(@ptrCast(@alignCast(srow)), "Preset name");
+        // Prefill: the pane's bound preset, else the shader's title.
+        const prefill: []const u8 = if (pane.preset_name) |pn| pn else ctx.meta.title();
+        if (prefill.len > 0) {
+            if (dupZ(win.allocator, prefill)) |pz| {
+                defer win.allocator.free(pz);
+                c.gtk_editable_set_text(@ptrCast(srow), pz.ptr);
+            }
+        }
+        const save_btn = c.gtk_button_new_with_label("Save");
+        c.gtk_widget_set_valign(save_btn, c.GTK_ALIGN_CENTER);
+        c.gtk_widget_add_css_class(save_btn, "suggested-action");
+        // User-data is the dialog's main Ctx (freed on close) — no
+        // destroy-notify, per the signal-context ownership rule.
+        _ = c.g_signal_connect_data(save_btn, "clicked", @ptrCast(&onSavePresetClicked), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        c.adw_entry_row_add_suffix(@ptrCast(@alignCast(srow)), save_btn);
+        ctx.name_entry = @ptrCast(srow);
+        c.adw_preferences_group_add(@ptrCast(@alignCast(sgroup)), @ptrCast(@alignCast(srow)));
+        c.adw_preferences_page_add(@ptrCast(@alignCast(page)), @ptrCast(@alignCast(sgroup)));
+    }
+
     c.adw_preferences_dialog_add(@ptrCast(@alignCast(dialog)), @ptrCast(@alignCast(page)));
 
     // Free the Ctx once the dialog goes away (row ctxs free via
@@ -242,16 +279,33 @@ fn digitsForStep(step: f32) c_int {
     return 3;
 }
 
-/// Current effective value: config override else shader default.
-fn currentFloat(win: *Window, p: *const shader_pass.Param) f64 {
-    for (win.config.shader_params.items) |kv| {
+/// The dialog's pane, or null if it closed while the dialog is up.
+fn alivePane(ctx: *Ctx) ?*Pane {
+    for (ctx.win.panes.items) |p| {
+        if (p == ctx.pane) return ctx.pane;
+    }
+    return null;
+}
+
+/// Effective override slice the dialog reads/writes: the pane's own
+/// preset params when a preset is bound, else the global config.
+fn effectiveOverrides(ctx: *Ctx) []const shader_pass.ParamKV {
+    if (alivePane(ctx)) |pane| {
+        if (pane.preset_name != null) return pane.preset_params.items;
+    }
+    return ctx.win.config.shader_params.items;
+}
+
+/// Current effective value: override else shader default.
+fn currentFloat(ctx: *Ctx, p: *const shader_pass.Param) f64 {
+    for (effectiveOverrides(ctx)) |kv| {
         if (std.mem.eql(u8, kv.name, p.name()) and kv.color == null) return kv.value;
     }
     return p.default_value;
 }
 
-fn currentColor(win: *Window, p: *const shader_pass.Param) [3]f32 {
-    for (win.config.shader_params.items) |kv| {
+fn currentColor(ctx: *Ctx, p: *const shader_pass.Param) [3]f32 {
+    for (effectiveOverrides(ctx)) |kv| {
         if (std.mem.eql(u8, kv.name, p.name())) {
             if (kv.color) |col| return col;
         }
@@ -259,18 +313,27 @@ fn currentColor(win: *Window, p: *const shader_pass.Param) [3]f32 {
     return p.default_color;
 }
 
+/// Route a param edit: preset pane → per-pane set, else global config.
+fn setParam(ctx: *Ctx, name: []const u8, value: f32, color: ?[3]f32) void {
+    if (alivePane(ctx)) |pane| {
+        ctx.win.setPaneShaderParam(pane, name, value, color);
+    } else {
+        ctx.win.setShaderParam(name, value, color);
+    }
+}
+
 fn onSliderChanged(adj: *c.GtkAdjustment, user: ?*anyopaque) callconv(.c) void {
     const rctx = cast.userData(RowCtx, user);
     const p = &rctx.ctx.params[rctx.idx];
     const v: f32 = @floatCast(c.gtk_adjustment_get_value(adj));
-    rctx.ctx.win.setShaderParam(p.name(), v, null);
+    setParam(rctx.ctx, p.name(), v, null);
 }
 
 fn onColorChanged(btn: *c.GtkColorDialogButton, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const rctx = cast.userData(RowCtx, user);
     const p = &rctx.ctx.params[rctx.idx];
     const rgba = c.gtk_color_dialog_button_get_rgba(btn);
-    rctx.ctx.win.setShaderParam(p.name(), 0, .{ rgba.*.red, rgba.*.green, rgba.*.blue });
+    setParam(rctx.ctx, p.name(), 0, .{ rgba.*.red, rgba.*.green, rgba.*.blue });
 }
 
 fn onResetClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -278,10 +341,52 @@ fn onResetClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = rctx.ctx;
     for (ctx.params[0..ctx.params_len]) |*p| {
         switch (p.kind) {
-            .float => ctx.win.setShaderParam(p.name(), p.default_value, null),
-            .color => ctx.win.setShaderParam(p.name(), 0, p.default_color),
+            .float => setParam(ctx, p.name(), p.default_value, null),
+            .color => setParam(ctx, p.name(), 0, p.default_color),
         }
     }
+}
+
+fn onSavePresetClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
+    const pane = alivePane(ctx) orelse return;
+    const entry = ctx.name_entry orelse return;
+    const text_ptr = c.gtk_editable_get_text(@ptrCast(entry)) orelse return;
+    const name = std.mem.span(@as([*:0]const u8, @ptrCast(text_ptr)));
+    if (!shader_preset.validName(name)) {
+        std.debug.print("sketerm: invalid preset name: '{s}'\n", .{name});
+        return;
+    }
+    const path: []const u8 = pane.custom_shader_path orelse ctx.win.config.custom_shader;
+    if (path.len == 0) return;
+
+    // Snapshot the DECLARED params at their current effective values
+    // — never the whole global param soup (it carries entries from
+    // other shaders).
+    var kvs: [shader_pass.MAX_PARAMS]shader_pass.ParamKV = undefined;
+    var n: usize = 0;
+    for (ctx.params[0..ctx.params_len]) |*p| {
+        kvs[n] = switch (p.kind) {
+            .float => .{ .name = p.name(), .value = @floatCast(currentFloat(ctx, p)) },
+            .color => .{ .name = p.name(), .color = currentColor(ctx, p) },
+        };
+        n += 1;
+    }
+    shader_preset.save(ctx.allocator, .{
+        .name = name,
+        .shader_path = path,
+        .animate = ctx.win.config.custom_shader_animation,
+        .params = kvs[0..n],
+    }) catch |err| {
+        std.debug.print("sketerm: preset save failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    // Bind the pane to the preset it just saved, so layout
+    // persistence records the name and further slider edits stay
+    // per-pane. The pane may be riding the global default shader —
+    // give it its own pick first or the overrides have no effect.
+    if (!pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true)) return;
+    pane.applyShaderPresetParams(name, kvs[0..n]);
 }
 
 fn freeRowCtx(user: ?*anyopaque) callconv(.c) void {
@@ -434,9 +539,10 @@ fn onPreviewRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) ca
     c.glClear(c.GL_COLOR_BUFFER_BIT);
     if (ctx.dummy_tex == 0) return 1;
 
-    // Live values: same slice setShaderParam mutates (re-read every
-    // frame — appends can realloc it).
-    ctx.preview_source.overrides = ctx.win.config.shader_params.items;
+    // Live values: same slice the param edits mutate (re-read every
+    // frame — appends can realloc it). Preset panes feed their own
+    // per-pane set.
+    ctx.preview_source.overrides = effectiveOverrides(ctx);
 
     const sp = &ctx.preview_pass;
     if (!sp.ensureProgram(ctx.allocator)) return 1;

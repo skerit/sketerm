@@ -4851,3 +4851,28 @@ Tests 454 → 466.
   gets updated by an explicit Save Layout As — a default.json saved
   before the shader fields existed restores every pane to the global
   default. Re-save it to make picks/clears stick across restarts.
+
+## 2026-06-12: shader presets (named shader + params combos)
+
+- New src/shader_preset.zig: a preset = shader path + animate flag +
+  param values, one file per preset under
+  $XDG_CONFIG_HOME/sketerm/shader-presets/<name>.conf. Parse/
+  serialize round-trip unit-tested.
+- Configure Shader... dialog gains a "Preset" group: name entry +
+  Save button. Saving snapshots the DECLARED params at their current
+  values (never the global param soup) and binds the pane to the
+  preset.
+- Right-click -> "Shader Preset..." (and palette "Shader Preset...")
+  opens a picker popover: one button per preset (applies to the
+  focused pane), trash button deletes the file.
+- Params go per-pane when a preset is bound: Pane.preset_params owns
+  the values and shader_own.overrides points at them, so dialog
+  slider edits tune only that pane (global config params untouched).
+  Manual file pick or clear drops the preset binding.
+- Layout persistence: PaneSpec.shader_preset; restore re-resolves by
+  name with the raw path as fallback. Verified live: a layout with
+  one preset pane + one cleared pane restores without errors.
+- Reminder that answers "why do my cleared shaders come back":
+  no-flag startup loads default.json; run the palette's "Save
+  Default Layout" after arranging shaders so the per-pane state
+  persists.

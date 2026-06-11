@@ -21,6 +21,10 @@ pub const PaneSpec = struct {
     /// Explicit per-pane shader pick (path). Empty = none saved
     /// (profile/global resolution applies on restore).
     custom_shader: []const u8 = "",
+    /// Shader preset bound to the pane (shader_preset.zig). Restore
+    /// re-resolves it by name; the custom_shader path above is the
+    /// fallback when the preset file has since been deleted.
+    shader_preset: []const u8 = "",
     /// User explicitly cleared this pane's shader (sticky "off").
     /// Persisted so the clear survives a restart, mirroring how an
     /// explicit pick does.

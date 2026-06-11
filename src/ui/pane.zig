@@ -17,6 +17,7 @@ const ImagePass = @import("../render/image_pass.zig").ImagePass;
 const BgPass = @import("../render/bg_pass.zig").BgPass;
 const ShaderPass = @import("../render/shader_pass.zig").ShaderPass;
 const ShaderSource = @import("../render/shader_pass.zig").Source;
+const ShaderParamKV = @import("../render/shader_pass.zig").ParamKV;
 const ImageStore = @import("../grid/image_store.zig").Store;
 const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -69,6 +70,13 @@ pub const Pane = struct {
     /// menu / palette / restored layout) — config reloads and
     /// profile pushes then leave it alone.
     custom_shader_user: bool = false,
+    /// Shader preset applied to this pane (see shader_preset.zig):
+    /// the preset's param values live in `preset_params` (names
+    /// owned) and `shader_own.overrides` points at them instead of
+    /// the global config slice — making params per-pane while a
+    /// preset is active. Both cleared by dropShaderPreset.
+    preset_name: ?[]u8 = null,
+    preset_params: std.ArrayList(ShaderParamKV) = .empty,
     /// True when the user explicitly cleared this pane's shader.
     /// Distinct from "no pick" (which inherits profile/global): a
     /// cleared pane shows NO shader and, like a user pick, is sticky
@@ -614,6 +622,8 @@ pub const Pane = struct {
         if (self.shader_own_src) |s| self.allocator.free(s);
         if (self.shader_own_dir) |d| self.allocator.free(d);
         if (self.custom_shader_path) |s| self.allocator.free(s);
+        self.freePresetData();
+        self.preset_params.deinit(self.allocator);
         if (self.atlas) |a| a.deinit();
         if (self.input_ctx) |ictx| {
             // Disconnect every signal handler we connected with `ctx`
@@ -828,6 +838,68 @@ pub const Pane = struct {
         } else {
             self.shader_pass.source = self.shader_default_source;
         }
+    }
+
+    /// Bind a shader preset's params to this pane: own copies of the
+    /// values, and `shader_own.overrides` re-pointed at them so the
+    /// preset tunes THIS pane only. Call after setCustomShader
+    /// succeeded for the preset's shader path.
+    pub fn applyShaderPresetParams(self: *Pane, name: []const u8, params: []const ShaderParamKV) void {
+        self.freePresetData();
+        self.preset_name = self.allocator.dupe(u8, name) catch null;
+        for (params) |p| {
+            const pname = self.allocator.dupe(u8, p.name) catch continue;
+            self.preset_params.append(self.allocator, .{
+                .name = pname,
+                .value = p.value,
+                .color = p.color,
+            }) catch {
+                self.allocator.free(pname);
+                continue;
+            };
+        }
+        self.shader_own.overrides = self.preset_params.items;
+        c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    }
+
+    /// Set/update one param in this pane's preset override set (live
+    /// — values upload each frame). No-op when no preset is bound.
+    pub fn setPresetParam(self: *Pane, name: []const u8, value: f32, color: ?[3]f32) void {
+        if (self.preset_name == null) return;
+        for (self.preset_params.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                entry.value = value;
+                entry.color = color;
+                self.shader_own.overrides = self.preset_params.items;
+                c.gtk_gl_area_queue_render(@ptrCast(self.area));
+                return;
+            }
+        }
+        const pname = self.allocator.dupe(u8, name) catch return;
+        self.preset_params.append(self.allocator, .{
+            .name = pname,
+            .value = value,
+            .color = color,
+        }) catch {
+            self.allocator.free(pname);
+            return;
+        };
+        self.shader_own.overrides = self.preset_params.items;
+        c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    }
+
+    /// Unbind the preset; `global_overrides` is the config-level
+    /// shader_params slice the pane falls back to.
+    pub fn dropShaderPreset(self: *Pane, global_overrides: []const ShaderParamKV) void {
+        self.freePresetData();
+        self.shader_own.overrides = global_overrides;
+    }
+
+    fn freePresetData(self: *Pane) void {
+        if (self.preset_name) |n| self.allocator.free(n);
+        self.preset_name = null;
+        for (self.preset_params.items) |p| self.allocator.free(p.name);
+        self.preset_params.clearRetainingCapacity();
     }
 
     /// Explicitly turn this pane's shader off (sticky). Picking a
