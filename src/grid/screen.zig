@@ -269,6 +269,15 @@ pub const Screen = struct {
     /// Exit status from `OSC 133 ; D ; <code>` (0 when not reported).
     last_cmd_exit: i32 = 0,
 
+    /// OSC 99 (kitty desktop notifications) accumulator. Chunks with
+    /// the same identifier append title/body until `d` signals done;
+    /// a different identifier discards the unfinished one. Transient
+    /// — not snapshotted.
+    notify_id: [64]u8 = undefined,
+    notify_id_len: u8 = 0,
+    notify_title: std.ArrayList(u8) = .empty,
+    notify_body: std.ArrayList(u8) = .empty,
+
     /// modifyOtherKeys level (CSI > 4 ; Pp m). 0=off, 1=ambiguous
     /// only, 2=all printable. Input encoder hasn't wired this yet.
     modify_other_keys: u8 = 0,
@@ -534,6 +543,8 @@ pub const Screen = struct {
     pub fn deinit(self: *Screen) void {
         self.clearRetainedImages();
         self.retained_images.deinit(self.allocator);
+        self.notify_title.deinit(self.allocator);
+        self.notify_body.deinit(self.allocator);
         for (self.active) |*l| l.deinit(self.allocator);
         self.allocator.free(self.active);
         if (self.alt) |alt| {
@@ -1815,27 +1826,111 @@ pub const Screen = struct {
     }
 
     fn handleOsc4(self: *Screen, rest: []const u8) void {
-        const semi = std.mem.indexOfScalar(u8, rest, ';') orelse return;
-        const idx = std.fmt.parseInt(u8, rest[0..semi], 10) catch return;
-        const data = rest[semi + 1 ..];
-        if (data.len == 1 and data[0] == '?') {
-            const rgb = self.palette[idx];
-            var resp_buf: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&resp_buf, "\x1b]4;{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}\x1b\\", .{
-                idx, rgb[0], rgb[0], rgb[1], rgb[1], rgb[2], rgb[2],
-            }) catch return;
-            self.respond(s);
-            return;
+        // xterm form allows MULTIPLE `idx;spec` pairs in one OSC 4
+        // (pywal & friends set all 16 ANSI colors in one sequence).
+        var it = std.mem.splitScalar(u8, rest, ';');
+        while (it.next()) |idx_str| {
+            const data = it.next() orelse return;
+            const idx = std.fmt.parseInt(u8, idx_str, 10) catch return;
+            if (data.len == 1 and data[0] == '?') {
+                const rgb = self.palette[idx];
+                var resp_buf: [64]u8 = undefined;
+                const s = std.fmt.bufPrint(&resp_buf, "\x1b]4;{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}\x1b\\", .{
+                    idx, rgb[0], rgb[0], rgb[1], rgb[1], rgb[2], rgb[2],
+                }) catch return;
+                self.respond(s);
+                continue;
+            }
+            // Set form.
+            if (Screen.parseColor(data)) |rgba| {
+                self.palette[idx] = .{
+                    @intFromFloat(@round(rgba[0] * 255.0)),
+                    @intFromFloat(@round(rgba[1] * 255.0)),
+                    @intFromFloat(@round(rgba[2] * 255.0)),
+                };
+                self.dirty = true;
+            }
         }
-        // Set form.
-        if (Screen.parseColor(data)) |rgba| {
-            self.palette[idx] = .{
-                @intFromFloat(@round(rgba[0] * 255.0)),
-                @intFromFloat(@round(rgba[1] * 255.0)),
-                @intFromFloat(@round(rgba[2] * 255.0)),
-            };
-            self.dirty = true;
+    }
+
+    /// OSC 99 — kitty desktop-notification protocol (subset).
+    /// `metadata ; payload` where metadata is COLON-separated k=v:
+    /// `i` identifier, `d` done (0 = more chunks follow), `p` payload
+    /// kind (title/body), `e=1` payload is base64. Unsupported
+    /// payload kinds (icons, buttons, …) drop the chunk; unknown
+    /// metadata keys are ignored per spec.
+    fn handleOsc99(self: *Screen, rest: []const u8) void {
+        const MAX_TITLE = 512;
+        const MAX_BODY = 4096;
+        const semi = std.mem.indexOfScalar(u8, rest, ';');
+        const meta = if (semi) |s| rest[0..s] else rest;
+        const payload_raw = if (semi) |s| rest[s + 1 ..] else "";
+
+        var id: []const u8 = "0";
+        var done = true;
+        var is_body = false;
+        var is_b64 = false;
+        var it = std.mem.splitScalar(u8, meta, ':');
+        while (it.next()) |kv| {
+            const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+            const k = kv[0..eq];
+            const v = kv[eq + 1 ..];
+            if (std.mem.eql(u8, k, "i")) {
+                id = v;
+            } else if (std.mem.eql(u8, k, "d")) {
+                done = !std.mem.eql(u8, v, "0");
+            } else if (std.mem.eql(u8, k, "p")) {
+                if (std.mem.eql(u8, v, "body")) {
+                    is_body = true;
+                } else if (!std.mem.eql(u8, v, "title")) {
+                    return; // icon/buttons/query — unsupported kind
+                }
+            } else if (std.mem.eql(u8, k, "e")) {
+                is_b64 = std.mem.eql(u8, v, "1");
+            }
+            // Unknown keys: ignore (spec says be lenient).
         }
+
+        // New identifier discards any unfinished accumulation.
+        const cur_id = self.notify_id[0..self.notify_id_len];
+        if (!std.mem.eql(u8, cur_id, id)) {
+            self.notify_title.clearRetainingCapacity();
+            self.notify_body.clearRetainingCapacity();
+            const n: u8 = @intCast(@min(id.len, self.notify_id.len));
+            @memcpy(self.notify_id[0..n], id[0..n]);
+            self.notify_id_len = n;
+        }
+
+        // Decode payload (base64 or raw) and append to the right part.
+        var decode_buf: [4096]u8 = undefined;
+        var payload: []const u8 = payload_raw;
+        if (is_b64) {
+            const decoder = std.base64.standard.Decoder;
+            const out_len = decoder.calcSizeForSlice(payload_raw) catch 0;
+            if (out_len == 0 or out_len > decode_buf.len) {
+                payload = "";
+            } else {
+                decoder.decode(decode_buf[0..out_len], payload_raw) catch {
+                    payload = "";
+                };
+                if (payload.len != 0) payload = decode_buf[0..out_len];
+            }
+        }
+        const dst = if (is_body) &self.notify_body else &self.notify_title;
+        const cap: usize = if (is_body) MAX_BODY else MAX_TITLE;
+        const room = cap -| dst.items.len;
+        const take = @min(payload.len, room);
+        dst.appendSlice(self.allocator, payload[0..take]) catch {};
+
+        if (!done) return;
+        const title: []const u8 = if (self.notify_title.items.len > 0)
+            self.notify_title.items
+        else
+            "sketerm";
+        if (self.sink.on_notification) |f| f(self.sink.ctx, title, self.notify_body.items);
+        self.notify_title.clearRetainingCapacity();
+        self.notify_body.clearRetainingCapacity();
+        self.notify_id_len = 0;
     }
 
     fn handleOsc8(self: *Screen, params: []const u8) void {
@@ -2231,10 +2326,11 @@ pub const Screen = struct {
     }
 
     fn onOsc(self: *Screen, bytes: []const u8) void {
-        // Format: "<num>;<rest>".
-        const semi = std.mem.indexOfScalar(u8, bytes, ';') orelse return;
-        const num_str = bytes[0..semi];
-        const rest = bytes[semi + 1 ..];
+        // Format: "<num>;<rest>" — or just "<num>": OSC 104/110/111/
+        // 112 are sent without any payload in their reset-all form.
+        const semi = std.mem.indexOfScalar(u8, bytes, ';');
+        const num_str = if (semi) |s| bytes[0..s] else bytes;
+        const rest = if (semi) |s| bytes[s + 1 ..] else "";
         const num = std.fmt.parseInt(u32, num_str, 10) catch return;
 
         switch (num) {
@@ -2254,6 +2350,7 @@ pub const Screen = struct {
             },
             4 => self.handleOsc4(rest),
             8 => self.handleOsc8(rest),
+            99 => self.handleOsc99(rest),
             9 => {
                 // OSC 9 is two colliding extensions: ConEmu progress
                 // (`9 ; 4 ; st ; pr`) and the iTerm2/urxvt desktop
@@ -2309,13 +2406,18 @@ pub const Screen = struct {
                 }
             },
             // OSC 104 — palette reset. With no args, reset all
-            // entries; with `; n` reset only that index.
+            // entries; with `; n [; n …]` reset only those indices.
             104 => {
                 if (rest.len == 0) {
                     self.palette = palette_default_256;
-                } else if (std.fmt.parseInt(u8, rest, 10)) |idx| {
-                    self.palette[idx] = palette_default_256[idx];
-                } else |_| {}
+                } else {
+                    var it = std.mem.splitScalar(u8, rest, ';');
+                    while (it.next()) |idx_str| {
+                        if (std.fmt.parseInt(u8, idx_str, 10)) |idx| {
+                            self.palette[idx] = palette_default_256[idx];
+                        } else |_| {}
+                    }
+                }
                 self.dirty = true;
             },
             // OSC 110 / 111 — fg / bg color reset to the configured
@@ -5325,6 +5427,84 @@ test "OSC 133 ; A records prompt mark with line ID" {
     const r2 = s.rowForLineId(id2);
     try std.testing.expect(r1 != null);
     try std.testing.expect(r2 != null);
+}
+
+test "OSC 99 kitty notifications: chunked title+body, base64, id switch" {
+    const TestSink = struct {
+        var title_buf: [128]u8 = undefined;
+        var body_buf: [128]u8 = undefined;
+        var title_len: usize = 0;
+        var body_len: usize = 0;
+        var fired: u32 = 0;
+        fn notify(_: ?*anyopaque, title: []const u8, body: []const u8) void {
+            title_len = @min(title.len, title_buf.len);
+            @memcpy(title_buf[0..title_len], title[0..title_len]);
+            body_len = @min(body.len, body_buf.len);
+            @memcpy(body_buf[0..body_len], body[0..body_len]);
+            fired += 1;
+        }
+    };
+    TestSink.fired = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_notification = TestSink.notify };
+
+    // Simple single-chunk: payload is the title.
+    s.onOsc("99;;hello");
+    try std.testing.expectEqual(@as(u32, 1), TestSink.fired);
+    try std.testing.expectEqualStrings("hello", TestSink.title_buf[0..TestSink.title_len]);
+
+    // Chunked: title, then body across two chunks, then done.
+    s.onOsc("99;i=x:d=0;Build");
+    try std.testing.expectEqual(@as(u32, 1), TestSink.fired); // not yet
+    s.onOsc("99;i=x:d=0:p=body;part1 ");
+    s.onOsc("99;i=x:p=body;part2");
+    try std.testing.expectEqual(@as(u32, 2), TestSink.fired);
+    try std.testing.expectEqualStrings("Build", TestSink.title_buf[0..TestSink.title_len]);
+    try std.testing.expectEqualStrings("part1 part2", TestSink.body_buf[0..TestSink.body_len]);
+
+    // base64 payload (e=1): "aGk=" → "hi".
+    s.onOsc("99;e=1;aGk=");
+    try std.testing.expectEqualStrings("hi", TestSink.title_buf[0..TestSink.title_len]);
+
+    // A new identifier discards an unfinished accumulation.
+    s.onOsc("99;i=a:d=0;stale");
+    s.onOsc("99;i=b;fresh");
+    try std.testing.expectEqualStrings("fresh", TestSink.title_buf[0..TestSink.title_len]);
+
+    // Unsupported payload kind drops the chunk, no crash.
+    s.onOsc("99;p=icon;PNGDATA");
+}
+
+test "OSC 4 multi-pair set + bare OSC 104/111 reset" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+
+    // pywal-style: two pairs in one OSC 4.
+    s.onOsc("4;1;#102030;2;#405060");
+    try std.testing.expectEqual([3]u8{ 0x10, 0x20, 0x30 }, s.palette[1]);
+    try std.testing.expectEqual([3]u8{ 0x40, 0x50, 0x60 }, s.palette[2]);
+
+    // Multi-index 104 resets only the named entries.
+    s.onOsc("104;1;2");
+    try std.testing.expectEqual(palette_default_256[1], s.palette[1]);
+    try std.testing.expectEqual(palette_default_256[2], s.palette[2]);
+
+    // Bare "104" (no semicolon at all) resets everything.
+    s.onOsc("4;3;#0a0b0c");
+    s.onOsc("104");
+    try std.testing.expectEqual(palette_default_256[3], s.palette[3]);
+
+    // Bare "111" restores the configured bg.
+    s.configured_bg = .{ 0.5, 0.5, 0.5, 1.0 };
+    s.default_bg = .{ 0.0, 0.0, 0.0, 1.0 };
+    s.onOsc("111");
+    try std.testing.expectEqual(@as(f32, 0.5), s.default_bg[0]);
 }
 
 test "OSC 52 read: denied by default with empty reply, sink fired when allowed" {
