@@ -65,6 +65,16 @@ DECSET / DECRST (`?`-prefixed):
 - 1047 — alt screen (simple)
 - 1049 — alt screen + save cursor
 - 2004 — **bracketed paste mode** ✓ (v1 req)
+- 2026 — synchronized output ✓
+- 2027 — grapheme clustering: always on; DECRQM reports "permanently set" ✓
+- 2031 — color-scheme change reports (`CSI ? 997 ; 1|2 n` on dark/light flips; query via `CSI ? 996 n`) ✓
+- 2048 — in-band resize reports (`CSI 48;rows;cols;hpx;wpx t` on set + every resize) ✓
+
+Over the mux, protocol replies come from exactly one side: the
+daemon's authoritative Screen answers state queries (DSR, DA,
+DECRQM, color/palette); GUI-owned queries (OSC 52 read, DSR ?996
+color scheme) are deferred by the daemon and answered by the
+attached client's mirror.
 
 ### Character attributes
 SGR — reset, bold, dim, italic, underline, slow-blink, reverse,
