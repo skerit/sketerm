@@ -4346,3 +4346,22 @@ Tests 454 → 466.
   (tab count unchanged, title rewritten, sibling row count
   matches => font correct), ring screenshot smooth, progress
   over a durable session (OSC rides the mux event stream).
+
+## 2026-06-11 (later): pane-path dedup sweep
+
+- Jelle flagged the "4th pane-creation path" font bug class. Audit
+  found sink wiring duplicated 4x with real drift: restore + split
+  paths never wired win_on_title, attachMux skipped child-exit.
+  Now: wirePaneSinks (single connect path, all 7 sinks) and
+  unlistPane (single disconnect: search/hints/copymode refs,
+  unlist, clearSinks, schedulePaneTeardown). Adding a sink in one
+  place reaches every pane kind.
+- bell/cwd/progress handlers + closePane shared 4 inline copies of
+  the page-walk; all use tabPageForPane now. Swatch/ring share
+  iconTexture64.
+- Consequence handled: restored tabs now follow OSC titles, which
+  would let shells stomp deliberately named tabs ("Local"). Layout
+  gains title_locked (persisted user-rename lock); legacy files
+  without the field treat saved titles as renamed (= old
+  behaviour). Verified live: default-layout names survive zsh,
+  fresh tabs follow OSC 0.
