@@ -4777,3 +4777,20 @@ Tests 454 → 466.
   shader froze. Now: animate while the pane is mapped (any visible
   split, focused or not); pause when on a background tab. A "map"
   handler restarts the tick when the tab comes back.
+
+## 2026-06-12: shaders scoped per TAB
+
+- Shader pick / clear now apply to EVERY pane in the focused tab
+  (setTabShader), not just the focused pane. Splitting a pane makes
+  the new pane inherit the focused pane's shader (inheritShader), so
+  a tab stays visually uniform. New tabs start from the global/
+  profile default — picks/clears don't leak between tabs.
+- Persistence already per-pane (PaneSpec.custom_shader +
+  shader_cleared), so a restored split tab reconstructs its shader
+  on every pane. Verified: save writes shader_cleared per pane;
+  --layout restore of a tab with one cleared + one crt.glsl pane
+  comes back correctly with no crash.
+- KNOWN LIMITATION: shader PARAM values (the config dialog sliders)
+  are still global (config.shader_params, shared by all panes). The
+  shader SELECTION and clear are per-tab; per-tab param overrides
+  would need per-pane override slices — deferred.
