@@ -1213,37 +1213,7 @@ fn onPointerShapeEvent(ctx: ?*anyopaque, name: []const u8) void {
     c.gtk_widget_set_cursor_from_name(@ptrCast(self.area), &buf);
 }
 
-fn shellSafeChar(b: u8) bool {
-    return switch (b) {
-        'a'...'z', 'A'...'Z', '0'...'9', '_', '.', '/', '-', '+', ':', '@', '%', '=', ',' => true,
-        else => false,
-    };
-}
-
-/// Single-quote a path for the shell unless every byte is safe bare.
-/// Embedded single quotes become the standard '\'' dance.
-fn appendShellQuoted(list: *std.ArrayList(u8), allocator: std.mem.Allocator, path: []const u8) !void {
-    var safe = path.len > 0;
-    for (path) |b| {
-        if (!shellSafeChar(b)) {
-            safe = false;
-            break;
-        }
-    }
-    if (safe) {
-        try list.appendSlice(allocator, path);
-        return;
-    }
-    try list.append(allocator, '\'');
-    for (path) |b| {
-        if (b == '\'') {
-            try list.appendSlice(allocator, "'\\''");
-        } else {
-            try list.append(allocator, b);
-        }
-    }
-    try list.append(allocator, '\'');
-}
+const appendShellQuoted = @import("../util/shellquote.zig").appendQuoted;
 
 fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Pane, user);

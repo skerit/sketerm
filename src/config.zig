@@ -236,6 +236,12 @@ pub const Config = struct {
     /// default — any program on the PTY (incl. remote ones over ssh)
     /// could exfiltrate clipboard contents. Accepts allow/deny.
     clipboard_read: bool = false,
+    /// Editor command for activating a path hint whose file exists:
+    /// either a template with {file}/{line}/{col} placeholders
+    /// ("code -g {file}:{line}") or a bare command that takes
+    /// `+line file` ("nvim"). Empty = $EDITOR/$VISUAL, falling back
+    /// to copy-to-clipboard when neither is set.
+    hint_editor: []const u8 = "",
 
     // Search
     /// Default state for the search box's case sensitivity. The
@@ -360,6 +366,7 @@ pub const Config = struct {
         if (self.font_path) |s| out.font_path = try arena.dupe(u8, s);
         out.font_family = try arena.dupe(u8, self.font_family);
         out.font_features = try arena.dupe(u8, self.font_features);
+        out.hint_editor = try arena.dupe(u8, self.hint_editor);
         out.background_image = try arena.dupe(u8, self.background_image);
         if (self.shell) |s| out.shell = try arena.dupe(u8, s);
         out.scheme = try arena.dupe(u8, self.scheme);
@@ -591,6 +598,7 @@ pub const Config = struct {
         if (self.clear_select_on_copy) try w.writeAll("clear_select_on_copy = true\n");
         if (self.disable_mouse_paste) try w.writeAll("disable_mouse_paste = true\n");
         if (self.clipboard_read) try w.writeAll("clipboard_read = allow\n");
+        if (self.hint_editor.len > 0) try w.print("hint_editor = {s}\n", .{self.hint_editor});
         if (self.mouse_middle_click != .paste_primary)
             try w.print("mouse_middle_click = {s}\n", .{@tagName(self.mouse_middle_click)});
         if (self.mouse_right_click != .menu)
@@ -1001,6 +1009,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.mouse_middle_click = std.meta.stringToEnum(MouseAction, value) orelse return error.BadMouseAction;
     } else if (std.mem.eql(u8, key, "mouse_right_click")) {
         cfg.mouse_right_click = std.meta.stringToEnum(MouseAction, value) orelse return error.BadMouseAction;
+    } else if (std.mem.eql(u8, key, "hint_editor")) {
+        cfg.hint_editor = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "clipboard_read")) {
         if (std.mem.eql(u8, value, "allow")) {
             cfg.clipboard_read = true;

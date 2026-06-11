@@ -226,6 +226,78 @@ pub fn assignLabels(matches: []Match) void {
     }
 }
 
+/// `path[:line[:col]]` split of a path match's text. Compiler/grep
+/// output styles `file.zig:12`, `file.zig:12:5`, and bare paths all
+/// parse; a non-numeric suffix leaves the text untouched.
+pub const FileLine = struct {
+    path: []const u8,
+    line: ?u32 = null,
+    col: ?u32 = null,
+};
+
+pub fn parseFileLine(text: []const u8) FileLine {
+    var path = text;
+    var line: ?u32 = null;
+    var col: ?u32 = null;
+    var rounds: u8 = 0;
+    while (rounds < 2) : (rounds += 1) {
+        const colon = std.mem.lastIndexOfScalar(u8, path, ':') orelse break;
+        const seg = path[colon + 1 ..];
+        if (seg.len == 0 or seg.len > 9) break;
+        const v = std.fmt.parseInt(u32, seg, 10) catch break;
+        // Second numeric suffix found: what we took for the line was
+        // actually the column.
+        if (line) |prev| {
+            col = prev;
+        }
+        line = v;
+        path = path[0..colon];
+    }
+    return .{ .path = path, .line = line, .col = col };
+}
+
+/// Build the `sh -c` command line that opens `abs_path` in `editor`.
+/// Template form substitutes {file} (shell-quoted), {line}, {col};
+/// bare form appends the near-universal `+line file`
+/// (vim/nvim/emacs/nano/micro/kak). Caller frees.
+pub fn buildEditorCommand(
+    allocator: std.mem.Allocator,
+    editor: []const u8,
+    abs_path: []const u8,
+    line: ?u32,
+    col: ?u32,
+) ![]u8 {
+    const shellquote = @import("../util/shellquote.zig");
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    if (std.mem.indexOf(u8, editor, "{file}") != null) {
+        var i: usize = 0;
+        while (i < editor.len) {
+            const rest = editor[i..];
+            if (std.mem.startsWith(u8, rest, "{file}")) {
+                try shellquote.appendQuoted(&out, allocator, abs_path);
+                i += "{file}".len;
+            } else if (std.mem.startsWith(u8, rest, "{line}")) {
+                try out.print(allocator, "{d}", .{line orelse 1});
+                i += "{line}".len;
+            } else if (std.mem.startsWith(u8, rest, "{col}")) {
+                try out.print(allocator, "{d}", .{col orelse 1});
+                i += "{col}".len;
+            } else {
+                try out.append(allocator, editor[i]);
+                i += 1;
+            }
+        }
+    } else {
+        try out.appendSlice(allocator, editor);
+        if (line) |ln| try out.print(allocator, " +{d}", .{ln});
+        try out.append(allocator, ' ');
+        try shellquote.appendQuoted(&out, allocator, abs_path);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 fn isPathChar(cp: u32) bool {
     return switch (cp) {
         'a'...'z', 'A'...'Z', '0'...'9' => true,
@@ -326,6 +398,47 @@ test "URL is not double-reported as path" {
     }
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqual(Kind.url, matches[0].kind);
+}
+
+test "parseFileLine splits path / line / col" {
+    const fl1 = parseFileLine("src/ui/pane.zig:123");
+    try std.testing.expectEqualStrings("src/ui/pane.zig", fl1.path);
+    try std.testing.expectEqual(@as(?u32, 123), fl1.line);
+    try std.testing.expectEqual(@as(?u32, null), fl1.col);
+
+    const fl2 = parseFileLine("/abs/x.c:12:5");
+    try std.testing.expectEqualStrings("/abs/x.c", fl2.path);
+    try std.testing.expectEqual(@as(?u32, 12), fl2.line);
+    try std.testing.expectEqual(@as(?u32, 5), fl2.col);
+
+    const fl3 = parseFileLine("./plain/path");
+    try std.testing.expectEqualStrings("./plain/path", fl3.path);
+    try std.testing.expectEqual(@as(?u32, null), fl3.line);
+
+    // Non-numeric suffix stays in the path (C++ scope, URLs-as-paths).
+    const fl4 = parseFileLine("ns::func");
+    try std.testing.expectEqualStrings("ns::func", fl4.path);
+}
+
+test "buildEditorCommand: bare editor, +line, template" {
+    const a = std.testing.allocator;
+
+    const c1 = try buildEditorCommand(a, "nvim", "/tmp/x.zig", 12, null);
+    defer a.free(c1);
+    try std.testing.expectEqualStrings("nvim +12 /tmp/x.zig", c1);
+
+    const c2 = try buildEditorCommand(a, "nvim", "/tmp/has space.txt", null, null);
+    defer a.free(c2);
+    try std.testing.expectEqualStrings("nvim '/tmp/has space.txt'", c2);
+
+    const c3 = try buildEditorCommand(a, "code -g {file}:{line}:{col}", "/tmp/x.zig", 12, 5);
+    defer a.free(c3);
+    try std.testing.expectEqualStrings("code -g /tmp/x.zig:12:5", c3);
+
+    // Missing line/col default to 1 in templates.
+    const c4 = try buildEditorCommand(a, "hx {file}:{line}", "/a/b", null, null);
+    defer a.free(c4);
+    try std.testing.expectEqualStrings("hx /a/b:1", c4);
 }
 
 test "two-char labels are uniform when >26 matches" {

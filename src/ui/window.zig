@@ -618,7 +618,18 @@ pub const Window = struct {
                 buf[n] = 0;
                 _ = c.g_app_info_launch_default_for_uri(&buf, null, null);
             },
-            .path, .hash => {
+            .path => {
+                // A path hint whose file exists locally opens in the
+                // editor; anything else (remote pane paths, deleted
+                // files, no editor configured) copies as before.
+                if (self.openPathInEditor(pane, m.text)) return;
+                const z = self.allocator.allocSentinel(u8, m.text.len, 0) catch return;
+                defer self.allocator.free(z);
+                @memcpy(z, m.text);
+                clipboard.copyToClipboard(@ptrCast(pane.area), z);
+                clipboard.copyToPrimary(@ptrCast(pane.area), z);
+            },
+            .hash => {
                 const z = self.allocator.allocSentinel(u8, m.text.len, 0) catch return;
                 defer self.allocator.free(z);
                 @memcpy(z, m.text);
@@ -626,6 +637,55 @@ pub const Window = struct {
                 clipboard.copyToPrimary(@ptrCast(pane.area), z);
             },
         }
+    }
+
+    /// Try to open a path-hint's target in the configured editor, in
+    /// a new tab whose cwd matches the originating pane (compiler
+    /// output is usually cwd-relative). Returns false when the file
+    /// doesn't exist locally or no editor is available — the caller
+    /// falls back to copying.
+    fn openPathInEditor(self: *Window, pane: *Pane, text: []const u8) bool {
+        const hints_mod = @import("hints.zig");
+        const fl = hints_mod.parseFileLine(text);
+        if (fl.path.len == 0) return false;
+
+        // Resolve to an absolute path: ~ → $HOME, relative → pane cwd.
+        var abs_buf: [4096]u8 = undefined;
+        const cwd: ?[]const u8 = if (pane.terminal.cwd) |d| d else null;
+        const abs: []const u8 = blk: {
+            if (fl.path[0] == '/') break :blk fl.path;
+            if (fl.path.len >= 2 and fl.path[0] == '~' and fl.path[1] == '/') {
+                const home = @import("../util/profile.zig").getenv("HOME") orelse return false;
+                break :blk std.fmt.bufPrint(&abs_buf, "{s}{s}", .{ home, fl.path[1..] }) catch return false;
+            }
+            const base = cwd orelse return false;
+            break :blk std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ base, fl.path }) catch return false;
+        };
+        var z_buf: [4096]u8 = undefined;
+        const abs_z = std.fmt.bufPrintZ(&z_buf, "{s}", .{abs}) catch return false;
+        if (c.access(abs_z.ptr, c.F_OK) != 0) return false;
+
+        const editor: []const u8 = blk: {
+            if (self.config.hint_editor.len > 0) break :blk self.config.hint_editor;
+            const profile_util = @import("../util/profile.zig");
+            if (profile_util.getenv("EDITOR")) |e| {
+                if (e.len > 0) break :blk e;
+            }
+            if (profile_util.getenv("VISUAL")) |v| {
+                if (v.len > 0) break :blk v;
+            }
+            return false;
+        };
+
+        // The file path is shell-quoted by buildEditorCommand — it
+        // came off the screen and may contain metacharacters.
+        const cmd = hints_mod.buildEditorCommand(self.allocator, editor, abs, fl.line, fl.col) catch return false;
+        defer self.allocator.free(cmd);
+        var sh_buf: [5200:0]u8 = undefined;
+        const sh_cmd = std.fmt.bufPrintZ(&sh_buf, "{s}", .{cmd}) catch return false;
+        const argv = [_][*:0]const u8{ "/bin/sh", "-c", sh_cmd.ptr };
+        self.addTabInternal("Editor", &argv, cwd) catch return false;
+        return true;
     }
 
     /// Open the scrollback search bar against the focused pane.
