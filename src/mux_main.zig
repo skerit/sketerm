@@ -6,6 +6,12 @@
 const std = @import("std");
 const daemon = @import("mux/daemon.zig");
 
+/// musl's `SIG_IGN` macro fails translate-c (function-pointer cast);
+/// the value is plain 1 on every libc. Typed off `signal`'s second
+/// parameter so it matches whichever handler typedef the libc uses.
+const sig_ign: @typeInfo(@TypeOf(@import("c.zig").c.signal)).@"fn".params[1].type.? =
+    @ptrFromInt(1);
+
 const HELP =
     \\sketerm-mux — sketerm session daemon (durable panes)
     \\
@@ -101,7 +107,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 /// the daemon when absent. Runs on the REMOTE side of an SSH pipe.
 fn runProxy(allocator: std.mem.Allocator) u8 {
     const cc = @import("c.zig").c;
-    _ = cc.signal(cc.SIGPIPE, cc.SIG_IGN);
+    _ = cc.signal(cc.SIGPIPE, sig_ign);
 
     const path = daemon.defaultSocketPath(allocator) catch return 1;
     defer allocator.free(path);
@@ -229,7 +235,7 @@ const cc_sockaddr_storage = @import("c.zig").c.struct_sockaddr_storage;
 /// daemon loss, NOT on network silence — that's the durability.
 fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16) u8 {
     const cc = @import("c.zig").c;
-    _ = cc.signal(cc.SIGPIPE, cc.SIG_IGN);
+    _ = cc.signal(cc.SIGPIPE, sig_ign);
 
     const udp_fd = cc.socket(cc.AF_INET, cc.SOCK_DGRAM | cc.SOCK_CLOEXEC, 0);
     if (udp_fd < 0) return 1;
@@ -294,7 +300,7 @@ fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16) u8 {
 /// transport child (socketpair on stdin/stdout, like --proxy).
 fn runUdpConnect(allocator: std.mem.Allocator, host: []const u8, port_s: []const u8, keyhex: []const u8) u8 {
     const cc = @import("c.zig").c;
-    _ = cc.signal(cc.SIGPIPE, cc.SIG_IGN);
+    _ = cc.signal(cc.SIGPIPE, sig_ign);
 
     const key = rudp.keyFromHex(keyhex) orelse return 1;
     const port = std.fmt.parseInt(u16, port_s, 10) catch return 1;
@@ -489,5 +495,5 @@ fn installSignalHandlers() void {
     _ = cc.signal(cc.SIGTERM, onTerm);
     _ = cc.signal(cc.SIGINT, onTerm);
     // Writing to a client that vanished must not kill the daemon.
-    _ = cc.signal(cc.SIGPIPE, cc.SIG_IGN);
+    _ = cc.signal(cc.SIGPIPE, sig_ign);
 }

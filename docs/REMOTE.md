@@ -7,13 +7,23 @@ restarts, and suspends.
 
 ## Install on the server
 
-`sketerm-mux` has no dependencies beyond glibc. Copy it and you are
-done:
+Deploy the **portable** build — one static binary that runs on any
+x86_64 Linux, regardless of CPU generation or libc:
 
 ```
-scp /usr/bin/sketerm-mux server:/tmp/
-ssh server sudo install -m755 /tmp/sketerm-mux /usr/local/bin/
+scp /usr/lib/sketerm/sketerm-mux-portable server:/tmp/
+ssh server sudo install -m755 /tmp/sketerm-mux-portable /usr/local/bin/sketerm-mux
 ```
+
+(From the repo instead: `zig build mux-portable`, artifact at
+`zig-out/bin/sketerm-mux-portable`.)
+
+Do NOT copy `/usr/bin/sketerm-mux`: the default build is optimized
+for the CPU it was built on, so a binary from a recent machine dies
+with "Illegal instruction" on an older server (e.g. Zen 4 → Zen 2,
+which lacks AVX-512). It is also dynamically linked against the
+build host's glibc. The portable build (baseline CPU, static musl)
+has neither problem.
 
 `/usr/local/bin` (or any directory on the default non-interactive
 PATH) matters: the GUI reaches the binary by running
@@ -29,7 +39,7 @@ ssh server sketerm-mux --help
 ```
 
 Cross-compiling for a different server architecture works from the
-repo: `zig build mux -Dtarget=aarch64-linux`.
+repo: `zig build mux-portable -Dportable-target=aarch64-linux-musl`.
 
 ## Authentication
 
@@ -101,5 +111,5 @@ echo-off prompts (passwords).
   local trust boundary; nothing listens on the network except the
   per-connection UDP bootstrap, which requires the key announced
   over SSH).
-- Kitty-graphics placements are not yet part of the reattach
-  snapshot; full-screen apps redraw them on reattach.
+- Kitty-graphics placements are snapshotted (12 MB retention budget
+  per session, oldest evicted) and come back on reattach.

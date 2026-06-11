@@ -22,7 +22,7 @@ Zig **0.16**. The default optimize mode is `ReleaseFast` because **`Debug` build
 - File IO via libc (`c.fopen`/`c.open`) — `std.fs.cwd()` is gone (see `config.zig`).
 - ArrayLists are unmanaged: `.empty`, `list.append(allocator, x)`.
 - `std.Io.Writer.Allocating` for JSON stringify targets. `@abs(i64)` returns `u64`.
-- `@cImport` goes through an out-of-process TranslateC step + sed fixup (Aro can't parse GTK headers in-process). Translated bindings land at `.zig-cache/o/*/cimport_root_fixed.zig` — **grep there to check whether a C symbol exists before using it**. New C headers go in `vendor/cimport_root.h`.
+- `@cImport` goes through an out-of-process TranslateC step + sed fixup (Aro can't parse GTK headers in-process). Translated bindings land at `.zig-cache/o/*/cimport_root_fixed.zig` (GUI set) and `cimport_core_fixed.zig` (mux set) — **grep there to check whether a C symbol exists before using it**. New C headers go in `vendor/cimport_root.h`; headers the mux side needs ALSO go in `vendor/cimport_core.h`, which must stay translatable against musl (no GTK/glibc-only headers — `zig build mux-portable` is the check).
 
 ## Build / run / test
 
@@ -30,6 +30,7 @@ Zig **0.16**. The default optimize mode is `ReleaseFast` because **`Debug` build
 zig build                       # GUI binary at zig-out/bin/sketerm
 zig build run -- [args]         # build + run with optional CLI args
 zig build mux                   # sketerm-mux session daemon (libc-only)
+zig build mux-portable          # static-musl baseline-CPU daemon for scp-to-server
 zig build test                  # full test suite (currently 454 tests)
 zig build test --summary all    # show test count + timings
 zig build smoke-mux             # mux daemon end-to-end smoke (headless)

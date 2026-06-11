@@ -29,6 +29,11 @@ pub fn build(b: *std.Build) void {
     // defines.
     const cbindings_mod = buildCBindings(b, target, optimize);
 
+    // Lean translation of `vendor/cimport_core.h` for the GTK-free
+    // mux binaries — keeps their libc surface explicit and identical
+    // to what the musl-targeted mux-portable build sees.
+    const core_cbindings_mod = buildCoreCBindings(b, target, optimize);
+
     // Build options: `glib` tells pty.zig whether a GLib main loop
     // exists (GUI) or not (sketerm-mux daemon, which must not link
     // glib and uses blocking fallbacks for the write queue).
@@ -74,7 +79,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .strip = strip,
     });
-    configureCoreDeps(b, mux_mod, cbindings_mod);
+    configureCoreDeps(b, mux_mod, core_cbindings_mod);
     mux_mod.addImport("build_options", noglib_opts_mod);
     const mux_exe = b.addExecutable(.{
         .name = "sketerm-mux",
@@ -85,6 +90,53 @@ pub fn build(b: *std.Build) void {
     const mux_step = b.step("mux", "Build the sketerm-mux session daemon");
     mux_step.dependOn(&b.addInstallArtifact(mux_exe, .{}).step);
 
+    // Portable daemon for server deployment — `zig build mux-portable`.
+    // The default build targets the NATIVE CPU (ReleaseFast), so a
+    // binary built on a Zen 4 laptop SIGILLs on a Zen 2 server (AVX-512
+    // in, e.g., memcpy-sized vector loops). This artifact is baseline
+    // CPU + static musl: one binary that runs on any Linux box of the
+    // same architecture, regardless of CPU generation or libc. Cross-
+    // arch via `-Dportable-target=aarch64-linux-musl`.
+    // fribidi is deliberately NOT linked: the daemon never calls bidi
+    // (ldd of the native build confirms it's dropped), and there is no
+    // static musl fribidi on build hosts. A new daemon-side fribidi
+    // reference fails this link — that's the desired signal.
+    const portable_triple = b.option(
+        []const u8,
+        "portable-target",
+        "target triple for mux-portable (default x86_64-linux-musl)",
+    ) orelse "x86_64-linux-musl";
+    const portable_query = std.Target.Query.parse(.{
+        .arch_os_abi = portable_triple,
+    }) catch @panic("bad -Dportable-target triple");
+    const portable_target = b.resolveTargetQuery(portable_query);
+    const portable_cbindings = buildCoreCBindings(b, portable_target, optimize);
+    const mux_portable_mod = b.createModule(.{
+        .root_source_file = b.path("src/mux_main.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+    });
+    mux_portable_mod.addImport("cbindings", portable_cbindings);
+    addPkgConfigIncludes(b, mux_portable_mod, "fribidi");
+    mux_portable_mod.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    mux_portable_mod.addIncludePath(b.path("vendor"));
+    mux_portable_mod.addImport("build_options", noglib_opts_mod);
+    const mux_portable_exe = b.addExecutable(.{
+        .name = "sketerm-mux-portable",
+        .root_module = mux_portable_mod,
+        .use_lld = true,
+    });
+    const mux_portable_step = b.step(
+        "mux-portable",
+        "Build a baseline-CPU static-musl sketerm-mux for scp-to-server",
+    );
+    mux_portable_step.dependOn(&b.addInstallArtifact(mux_portable_exe, .{}).step);
+
     // Mux end-to-end smoke — `zig build smoke-mux` (headless).
     const smoke_mux_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_mux.zig"),
@@ -92,7 +144,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    configureCoreDeps(b, smoke_mux_mod, cbindings_mod);
+    configureCoreDeps(b, smoke_mux_mod, core_cbindings_mod);
     smoke_mux_mod.addImport("build_options", noglib_opts_mod);
     const smoke_mux = b.addExecutable(.{
         .name = "sketerm-smoke-mux",
@@ -384,6 +436,50 @@ fn buildCBindings(
     });
 }
 
+/// Translate the lean core header set (`vendor/cimport_core.h`) for
+/// GTK-free binaries. Separate from `buildCBindings` because the full
+/// set drags in GTK system headers, which only translate against the
+/// native glibc — the portable musl daemon needs a root that stays
+/// libc-clean. Translated output lands at
+/// `.zig-cache/o/*/cimport_core_fixed.zig`.
+fn buildCoreCBindings(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const tc = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/cimport_core.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const cflags = b.run(&.{ "pkg-config", "--cflags-only-I", "fribidi" });
+    var it_inc = std.mem.tokenizeAny(u8, cflags, " \r\n\t");
+    while (it_inc.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "-I")) {
+            tc.addIncludePath(.{ .cwd_relative = b.dupe(tok[2..]) });
+        }
+    }
+    tc.addIncludePath(b.path("vendor"));
+
+    // Same discard-cast fixup as the full set (see buildCBindings);
+    // harmless when the pattern never matches.
+    const fix = b.addSystemCommand(&.{
+        "sed",
+        "-E",
+        "s/_ = @ptrCast\\(@alignCast\\(([^;]+)\\)\\);/_ = \\1;/g",
+    });
+    fix.addFileArg(tc.getOutput());
+    const fixed = fix.captureStdOut(.{ .basename = "cimport_core_fixed.zig" });
+
+    return b.createModule(.{
+        .root_source_file = fixed,
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+}
+
 /// Register the shared system-library / C-source / include-path set
 /// on a module. Also wires the pre-translated C bindings module as
 /// `@import("cbindings")` so `src/c.zig` can re-export it.
@@ -442,20 +538,27 @@ fn configureSysDeps(
 /// library names (added via `linkSystemLibrary` with `use_pkg_config =
 /// .no` so the Zig build system doesn't reinvoke pkg-config).
 fn addPkgConfig(b: *std.Build, mod: *std.Build.Module, pkg: []const u8) void {
-    const cflags = b.run(&.{ "pkg-config", "--cflags-only-I", pkg });
-    var it_inc = std.mem.tokenizeAny(u8, cflags, " \r\n\t");
-    while (it_inc.next()) |tok| {
-        if (std.mem.startsWith(u8, tok, "-I")) {
-            const path = tok[2..];
-            mod.addIncludePath(.{ .cwd_relative = b.dupe(path) });
-        }
-    }
+    addPkgConfigIncludes(b, mod, pkg);
 
     const libs = b.run(&.{ "pkg-config", "--libs-only-l", pkg });
     var it_lib = std.mem.tokenizeAny(u8, libs, " \r\n\t");
     while (it_lib.next()) |tok| {
         if (std.mem.startsWith(u8, tok, "-l")) {
             mod.linkSystemLibrary(tok[2..], .{ .use_pkg_config = .no });
+        }
+    }
+}
+
+/// Include paths only — for modules that compile against a package's
+/// headers but must not link it (mux-portable: static musl, no system
+/// shared libs available).
+fn addPkgConfigIncludes(b: *std.Build, mod: *std.Build.Module, pkg: []const u8) void {
+    const cflags = b.run(&.{ "pkg-config", "--cflags-only-I", pkg });
+    var it_inc = std.mem.tokenizeAny(u8, cflags, " \r\n\t");
+    while (it_inc.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "-I")) {
+            const path = tok[2..];
+            mod.addIncludePath(.{ .cwd_relative = b.dupe(path) });
         }
     }
 }

@@ -9,7 +9,7 @@
 
 pkgname=sketerm-git
 _pkgname=sketerm
-pkgver=0.1.0.r593.gb7dfc13
+pkgver=0.1.0.r618.g5ab6bce
 pkgrel=1
 pkgdesc='Native GTK4 terminal emulator written in Zig'
 arch=('x86_64')
@@ -53,6 +53,7 @@ pkgver() {
 build() {
     cd "$(_srcroot)"
     zig build -Doptimize=ReleaseFast
+    zig build mux-portable -Doptimize=ReleaseFast
 }
 
 check() {
@@ -66,9 +67,14 @@ package() {
     # Main binary
     install -Dm755 zig-out/bin/sketerm "$pkgdir/usr/bin/sketerm"
 
-    # Session daemon (durable panes; also deployable standalone to
-    # servers — links libc only)
+    # Session daemon (durable panes; links libc only)
     install -Dm755 zig-out/bin/sketerm-mux "$pkgdir/usr/bin/sketerm-mux"
+
+    # Portable daemon for scp-to-server deployment: baseline CPU +
+    # static musl, so it runs on older CPUs and any libc (the native
+    # build above SIGILLs on pre-AVX-512 hosts). See docs/REMOTE.md.
+    install -Dm755 zig-out/bin/sketerm-mux-portable \
+        "$pkgdir/usr/lib/$_pkgname/sketerm-mux-portable"
 
     # Desktop entry + scalable icon (auto-discovered by the hicolor theme)
     install -Dm644 data/dev.sker.sketerm.desktop \

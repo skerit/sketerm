@@ -135,7 +135,18 @@ fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn 
             };
         }
         return mux_client.Conn.connectSsh(allocator, h) catch {
-            _ = c.fprintf(c.stderr, "sketerm mux: ssh transport to host failed (key auth? sketerm-mux installed there?)\n");
+            _ = c.fprintf(
+                c.stderr,
+                "sketerm mux: ssh transport to %.*s failed\n" ++
+                    "  see the real error:  ssh %.*s sketerm-mux --proxy\n" ++
+                    "  common causes: sketerm-mux not installed there; binary built\n" ++
+                    "  for a newer CPU (deploy `zig build mux-portable` instead);\n" ++
+                    "  key/agent auth not set up (BatchMode forbids password prompts)\n",
+                @as(c_int, @intCast(h.len)),
+                h.ptr,
+                @as(c_int, @intCast(h.len)),
+                h.ptr,
+            );
             return null;
         };
     }
