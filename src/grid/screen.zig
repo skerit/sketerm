@@ -92,6 +92,24 @@ pub const Screen = struct {
     /// Off by default: any app on the PTY could exfiltrate the
     /// clipboard. Denied queries get an empty reply.
     allow_clipboard_read: bool = false,
+    /// Mode 2031 — push a `CSI ? 997 ; 1|2 n` report when the color
+    /// scheme flips dark/light (notifyColorScheme).
+    mode_2031: bool = false,
+    /// Mode 2048 — in-band resize reports: `CSI 48;rows;cols;hpx;wpx t`
+    /// immediately on set and after every resize.
+    in_band_resize: bool = false,
+    /// Current scheme as the GUI last pushed it (bg luminance).
+    /// Answers `CSI ? 996 n`; true until the GUI says otherwise.
+    color_scheme_dark: bool = true,
+    /// Mux mirror screens: the daemon's authoritative Screen answers
+    /// every protocol query — a mirror replying too would double
+    /// every response the app sees. respond() no-ops when set;
+    /// GUI-owned replies (clipboard read, color-scheme) use
+    /// respondForce instead.
+    mute_responses: bool = false,
+    /// Mux daemon screens: skip the queries only the GUI can answer
+    /// (OSC 52 read, DSR ?996) so the attached mirror replies alone.
+    defer_gui_queries: bool = false,
     /// LNM (mode 20) — when set, LF / VT / FF also perform CR (move
     /// cursor to column 0 in addition to advancing a row). Mostly a
     /// historical mode but a few apps set it explicitly.
@@ -913,6 +931,7 @@ pub const Screen = struct {
         if (self.col >= new_cols) self.col = if (new_cols == 0) 0 else new_cols - 1;
         self.pending_wrap = false;
         self.dirty = true;
+        if (self.in_band_resize) self.sendResizeReport();
     }
 
     /// Soft-wrap reflow of scrollback + active. Assumes self.use_alt
@@ -2635,11 +2654,14 @@ pub const Screen = struct {
                     // the PTY (including remote ones) can ask. When
                     // denied, reply with an empty payload immediately
                     // so the querying app isn't stuck in its timeout.
+                    // GUI-owned: daemon screens defer to the attached
+                    // mirror (only the GUI has a clipboard).
+                    if (self.defer_gui_queries) return;
                     const sel: u8 = if (rest.len > 0 and rest[0] == 'p') 'p' else 'c';
                     if (!self.allow_clipboard_read or self.sink.on_clipboard_get == null) {
                         var resp_buf: [16]u8 = undefined;
                         const out = std.fmt.bufPrint(&resp_buf, "\x1b]52;{c};\x1b\\", .{sel}) catch return;
-                        self.respond(out);
+                        self.respondForce(out);
                         return;
                     }
                     self.sink.on_clipboard_get.?(self.sink.ctx, sel);
@@ -3067,6 +3089,15 @@ pub const Screen = struct {
                 const out = std.fmt.bufPrint(&kbuf, "\x1b[?{d}u", .{self.kitty_kbd_flags}) catch return;
                 self.respond(out);
             },
+            'n' => {
+                // DSR ?996 — dark/light color-scheme query (contour,
+                // kitty 0.38+). GUI-owned: only the GUI knows the
+                // theme, so daemon screens defer to the mirror.
+                if (params.paramOrDefault(0, 0) == 996) {
+                    if (self.defer_gui_queries) return;
+                    self.respondForce(if (self.color_scheme_dark) "\x1b[?997;1n" else "\x1b[?997;2n");
+                }
+            },
             else => {},
         }
     }
@@ -3296,6 +3327,14 @@ pub const Screen = struct {
     /// Reply: CSI ? Pa ; Ps $ y where Ps =
     ///   0 not recognized, 1 set, 2 reset, 3 permanently set, 4 permanently reset.
     fn decrqm(self: *Screen, mode: u32) void {
+        // Mode 2027 (grapheme clustering) is always on and can't be
+        // disabled — DECRPM 3 = "permanently set".
+        if (mode == 2027) {
+            var out27: [32]u8 = undefined;
+            const s27 = std.fmt.bufPrint(&out27, "\x1b[?{d};3$y", .{mode}) catch return;
+            self.respond(s27);
+            return;
+        }
         const known: ?bool = switch (mode) {
             1 => self.app_cursor_keys,
             // DECANM — VT52 vs ANSI. We have on_decanm but don't
@@ -3325,6 +3364,8 @@ pub const Screen = struct {
             1015 => self.mouse_enc == .urxvt,
             1016 => self.mouse_enc == .sgr_pixel,
             2026 => self.sync_output,
+            2031 => self.mode_2031,
+            2048 => self.in_band_resize,
             // 1007 (alt-screen scroll): we don't, treat as off.
             1007 => false,
             1047, 1049 => self.use_alt,
@@ -3469,6 +3510,14 @@ pub const Screen = struct {
     }
 
     fn respond(self: *Screen, bytes: []const u8) void {
+        if (self.mute_responses) return;
+        if (self.sink.on_write_pty) |f| f(self.sink.ctx, bytes);
+    }
+
+    /// For replies that are GUI-owned (the daemon defers them): a
+    /// mux mirror IS the designated responder, so the mute doesn't
+    /// apply. Identical to respond() on local screens.
+    fn respondForce(self: *Screen, bytes: []const u8) void {
         if (self.sink.on_write_pty) |f| f(self.sink.ctx, bytes);
     }
 
@@ -4113,9 +4162,42 @@ pub const Screen = struct {
                     }
                 },
                 2004 => self.bracketed_paste = set,
+                // Mode 2027 (grapheme clustering): our cluster
+                // handling is always on and not disableable — accept
+                // silently; DECRQM reports "permanently set".
+                2027 => {},
+                2031 => self.mode_2031 = set,
+                2048 => {
+                    // In-band resize: spec requires an immediate
+                    // report on enabling so the app learns the
+                    // current geometry without a race.
+                    self.in_band_resize = set;
+                    if (set) self.sendResizeReport();
+                },
                 else => {},
             }
         }
+    }
+
+    /// Mode 2048 report: `CSI 48 ; rows ; cols ; height_px ; width_px t`.
+    /// Pixel fields are 0 when cell metrics are unknown (spec allows
+    /// it; lying with a fake cell size would mislead image layout).
+    fn sendResizeReport(self: *Screen) void {
+        var out_buf: [48]u8 = undefined;
+        const hpx: u32 = @as(u32, self.rows) * self.cell_pixel_h;
+        const wpx: u32 = @as(u32, self.cols) * self.cell_pixel_w;
+        const s = std.fmt.bufPrint(&out_buf, "\x1b[48;{d};{d};{d};{d}t", .{ self.rows, self.cols, hpx, wpx }) catch return;
+        self.respond(s);
+    }
+
+    /// Push a color-scheme update from the GUI (bg luminance). Emits
+    /// the mode-2031 report when the scheme actually flipped and the
+    /// app subscribed. GUI-owned — bypasses the mirror mute.
+    pub fn notifyColorScheme(self: *Screen, dark: bool) void {
+        const changed = self.color_scheme_dark != dark;
+        self.color_scheme_dark = dark;
+        if (!changed or !self.mode_2031) return;
+        self.respondForce(if (dark) "\x1b[?997;1n" else "\x1b[?997;2n");
     }
 
     fn toggleAltScreen(self: *Screen, on: bool) void {
@@ -5587,6 +5669,157 @@ test "OSC 133 ; A records prompt mark with line ID" {
     const r2 = s.rowForLineId(id2);
     try std.testing.expect(r1 != null);
     try std.testing.expect(r2 != null);
+}
+
+fn testCsiPrivate(s: *Screen, comptime n_params: usize, params: [n_params]u16, final: u8) void {
+    var csi = Event.Csi{};
+    inline for (params, 0..) |p, i| csi.params[i] = p;
+    csi.n_params = n_params;
+    csi.private = '?';
+    csi.final = final;
+    s.apply(.{ .csi = csi });
+}
+
+test "mode 2048: report on set and on every resize" {
+    const Cap = struct {
+        var buf: [128]u8 = undefined;
+        var len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, buf.len - len);
+            @memcpy(buf[len .. len + n], bytes[0..n]);
+            len += n;
+        }
+    };
+    Cap.len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = Cap.write };
+
+    // Enable → immediate report. Pixel fields 0 (no cell metrics).
+    testCsiPrivate(s, 1, .{2048}, 'h');
+    try std.testing.expectEqualStrings("\x1b[48;3;10;0;0t", Cap.buf[0..Cap.len]);
+
+    // Resize with known cell metrics → report includes pixels.
+    Cap.len = 0;
+    s.cell_pixel_w = 8;
+    s.cell_pixel_h = 16;
+    try s.resize(8, 2);
+    try std.testing.expectEqualStrings("\x1b[48;2;8;32;64t", Cap.buf[0..Cap.len]);
+
+    // DECRQM sees it set; reset stops the reports.
+    Cap.len = 0;
+    var rqm = Event.Csi{};
+    rqm.params[0] = 2048;
+    rqm.n_params = 1;
+    rqm.private = '?';
+    rqm.intermediates[0] = '$';
+    rqm.n_intermediates = 1;
+    rqm.final = 'p';
+    s.apply(.{ .csi = rqm });
+    try std.testing.expectEqualStrings("\x1b[?2048;1$y", Cap.buf[0..Cap.len]);
+    Cap.len = 0;
+    testCsiPrivate(s, 1, .{2048}, 'l');
+    try s.resize(10, 3);
+    try std.testing.expectEqual(@as(usize, 0), Cap.len);
+}
+
+test "mode 2027 reports permanently set; 996/997/2031 color scheme" {
+    const Cap = struct {
+        var buf: [128]u8 = undefined;
+        var len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, buf.len - len);
+            @memcpy(buf[len .. len + n], bytes[0..n]);
+            len += n;
+        }
+    };
+    Cap.len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = Cap.write };
+
+    // 2027 — always-on clustering, DECRPM 3.
+    var rqm = Event.Csi{};
+    rqm.params[0] = 2027;
+    rqm.n_params = 1;
+    rqm.private = '?';
+    rqm.intermediates[0] = '$';
+    rqm.n_intermediates = 1;
+    rqm.final = 'p';
+    s.apply(.{ .csi = rqm });
+    try std.testing.expectEqualStrings("\x1b[?2027;3$y", Cap.buf[0..Cap.len]);
+
+    // DSR ?996 — dark by default, light after the GUI pushes.
+    Cap.len = 0;
+    testCsiPrivate(s, 1, .{996}, 'n');
+    try std.testing.expectEqualStrings("\x1b[?997;1n", Cap.buf[0..Cap.len]);
+    Cap.len = 0;
+    s.color_scheme_dark = false;
+    testCsiPrivate(s, 1, .{996}, 'n');
+    try std.testing.expectEqualStrings("\x1b[?997;2n", Cap.buf[0..Cap.len]);
+
+    // Mode 2031: unsolicited report only when subscribed AND flipped.
+    Cap.len = 0;
+    s.notifyColorScheme(true); // flip, but mode off → silent
+    try std.testing.expectEqual(@as(usize, 0), Cap.len);
+    testCsiPrivate(s, 1, .{2031}, 'h');
+    s.notifyColorScheme(true); // no flip → silent
+    try std.testing.expectEqual(@as(usize, 0), Cap.len);
+    s.notifyColorScheme(false); // flip → report
+    try std.testing.expectEqualStrings("\x1b[?997;2n", Cap.buf[0..Cap.len]);
+}
+
+test "mux mirror: mute_responses silences queries, GUI-owned paths still answer" {
+    const Cap = struct {
+        var buf: [128]u8 = undefined;
+        var len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, buf.len - len);
+            @memcpy(buf[len .. len + n], bytes[0..n]);
+            len += n;
+        }
+    };
+    Cap.len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = Cap.write };
+    s.mute_responses = true;
+
+    // DSR 6 (cursor) and DA are answered by the daemon — the mirror
+    // must stay silent or the app sees every reply twice.
+    var dsr6 = Event.Csi{};
+    dsr6.params[0] = 6;
+    dsr6.n_params = 1;
+    dsr6.final = 'n';
+    s.apply(.{ .csi = dsr6 });
+    var da = Event.Csi{};
+    da.final = 'c';
+    s.apply(.{ .csi = da });
+    try std.testing.expectEqual(@as(usize, 0), Cap.len);
+
+    // GUI-owned replies bypass the mute: ?996 and the OSC 52 deny.
+    testCsiPrivate(s, 1, .{996}, 'n');
+    try std.testing.expectEqualStrings("\x1b[?997;1n", Cap.buf[0..Cap.len]);
+    Cap.len = 0;
+    s.onOsc("52;c;?");
+    try std.testing.expectEqualStrings("\x1b]52;c;\x1b\\", Cap.buf[0..Cap.len]);
+
+    // Daemon side: defer_gui_queries leaves both unanswered there.
+    Cap.len = 0;
+    s.mute_responses = false;
+    s.defer_gui_queries = true;
+    testCsiPrivate(s, 1, .{996}, 'n');
+    s.onOsc("52;c;?");
+    try std.testing.expectEqual(@as(usize, 0), Cap.len);
 }
 
 test "OSC 99 kitty notifications: chunked title+body, base64, id switch" {

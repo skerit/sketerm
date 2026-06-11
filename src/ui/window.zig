@@ -1578,6 +1578,10 @@ pub const Window = struct {
         term.screen.bracketed_paste = self.config.bracketed_paste;
         term.screen.scroll_on_output = self.config.scroll_on_output;
         term.screen.allow_clipboard_read = self.config.clipboard_read;
+        // Initial dark/light for DSR ?996 / mode 2031, derived from
+        // the effective background's luminance — that's what apps
+        // actually want to know (vim background=dark/light).
+        term.screen.color_scheme_dark = isDarkBg(fg_bg.bg);
         term.screen.word_chars = self.config.word_chars;
         // Resolve effective palette: profile.palette > config.palette
         // > profile.scheme lookup > config.scheme lookup > defaults.
@@ -2271,6 +2275,8 @@ pub const Window = struct {
             screen.default_bg = eff.bg;
             screen.configured_fg = eff.fg;
             screen.configured_bg = eff.bg;
+            screen.notifyColorScheme(isDarkBg(eff.bg));
+            screen.allow_clipboard_read = self.config.clipboard_read;
             // Renderer convention: alpha=0 means "use fg colour". We
             // map cursor_color_default → that sentinel.
             screen.cursor_color = if (self.config.cursor_color_default)
@@ -4179,6 +4185,7 @@ fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.
         p.terminal.screen.default_bg = fg_bg.bg;
         p.terminal.screen.configured_fg = fg_bg.fg;
         p.terminal.screen.configured_bg = fg_bg.bg;
+        p.terminal.screen.notifyColorScheme(isDarkBg(fg_bg.bg));
         p.terminal.screen.dirty = true;
         c.gtk_gl_area_queue_render(@ptrCast(p.area));
     }
@@ -4506,6 +4513,12 @@ fn tabPageForPane(self: *Window, pane: *Pane) ?*c.AdwTabPage {
         if (widgetIsAncestor(@ptrCast(child), pane.widget())) return page;
     }
     return null;
+}
+
+/// Dark/light classification of an effective background, for the
+/// DSR ?996 / mode 2031 color-scheme reports (relative luminance).
+fn isDarkBg(bg: [4]f32) bool {
+    return (0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2]) < 0.5;
 }
 
 /// Stable GNotification tag for an OSC 99 identifier, so a repeated

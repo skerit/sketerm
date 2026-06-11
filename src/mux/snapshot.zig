@@ -15,7 +15,7 @@ const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
 const Pool = style_pool.Pool;
 
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 const Sink = struct {
     out: *std.ArrayList(u8),
@@ -121,6 +121,10 @@ pub fn serialize(screen: *const Screen, out: *std.ArrayList(u8), allocator: std.
     try s.byte(@intFromEnum(screen.mouse_enc));
     try s.boolean(screen.focus_reports);
     try s.boolean(screen.sync_output);
+    // v3: a reattaching mirror must know these to emit the GUI-owned
+    // reports (mode 2031 color-scheme) and agree on mode state.
+    try s.boolean(screen.mode_2031);
+    try s.boolean(screen.in_band_resize);
 
     // Colors + title.
     try s.f32x4(screen.default_fg);
@@ -336,6 +340,8 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
     screen.mouse_enc = std.enums.fromInt(@TypeOf(screen.mouse_enc), try src.byte()) orelse return error.BadSnapshot;
     screen.focus_reports = try src.boolean();
     screen.sync_output = try src.boolean();
+    screen.mode_2031 = try src.boolean();
+    screen.in_band_resize = try src.boolean();
 
     screen.default_fg = try src.f32x4();
     screen.default_bg = try src.f32x4();

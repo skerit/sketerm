@@ -394,6 +394,9 @@ pub const Daemon = struct {
         // Keep image placements for the attach snapshot — there's no
         // per-pane ImageStore on the daemon side to remember them.
         screen.retain_images = true;
+        // Queries only the GUI can answer (clipboard read, color
+        // scheme) are left for the attached mirror to reply to.
+        screen.defer_gui_queries = true;
 
         const s = try allocator.create(Session);
         errdefer allocator.destroy(s);

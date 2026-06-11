@@ -193,6 +193,10 @@ pub const Terminal = struct {
         // Restore the snapshot into our pool; wire sinks like init.
         self.screen = try mux_snapshot.restore(allocator, &self.pool, snap_payload[8..]);
         errdefer self.screen.deinit();
+        // Mirror screens never answer protocol queries — the daemon's
+        // authoritative Screen already does; replying here would
+        // double every DSR/DA/DECRQM response the app sees.
+        self.screen.mute_responses = true;
         self.wireScreenSink();
 
         // Non-blocking + main-loop watch for the live stream.
@@ -294,6 +298,9 @@ pub const Terminal = struct {
                 fresh.word_chars = self.screen.word_chars;
                 fresh.cell_pixel_w = self.screen.cell_pixel_w;
                 fresh.cell_pixel_h = self.screen.cell_pixel_h;
+                fresh.mute_responses = self.screen.mute_responses;
+                fresh.allow_clipboard_read = self.screen.allow_clipboard_read;
+                fresh.color_scheme_dark = self.screen.color_scheme_dark;
                 const old = self.screen;
                 self.screen = fresh;
                 self.wireScreenSink();
