@@ -355,6 +355,62 @@ pub fn main() !u8 {
         }
     }
 
+    // Previous-frame feedback (iChannel1): a decaying-max shader run
+    // twice — second frame's scene is empty, so anything bright on
+    // screen can ONLY be the ghost of frame one at half brightness.
+    {
+        const ShaderPass = @import("render/shader_pass.zig").ShaderPass;
+        const ShaderSource = @import("render/shader_pass.zig").Source;
+        const fb_user =
+            \\void mainImage(out vec4 o, in vec2 fc) {
+            \\    vec2 uv = fc / iResolution.xy;
+            \\    o = vec4(max(texture(iChannel0, uv).rgb, texture(iChannel1, uv).rgb * 0.5), 1.0);
+            \\}
+        ;
+        var ssrc = ShaderSource{ .src = fb_user, .generation = 1 };
+        var sp2 = ShaderPass{ .source = &ssrc };
+
+        // Frame 1: real scene.
+        if (!sp2.begin(allocator, W, H)) {
+            std.debug.print("smoke-cell: FAIL — feedback shader begin failed\n", .{});
+            return 12;
+        }
+        c.glViewport(0, 0, W, H);
+        c.glClearColor(0.0, 0.0, 0.0, 1.0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        cell_pass.draw(atlas.?, W, H);
+        sp2.finish(W, H, 0.1);
+
+        // Frame 2: empty scene — only the ghost should remain.
+        if (!sp2.begin(allocator, W, H)) {
+            std.debug.print("smoke-cell: FAIL — feedback shader re-begin failed\n", .{});
+            return 12;
+        }
+        c.glViewport(0, 0, W, H);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        sp2.finish(W, H, 0.2);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        var ghost: usize = 0;
+        var bright: usize = 0;
+        var m: usize = 0;
+        while (m < fb_bytes) : (m += 4) {
+            const r: i32 = fb[m + 0];
+            const g: i32 = fb[m + 1];
+            const b: i32 = fb[m + 2];
+            const mx = @max(r, @max(g, b));
+            if (mx > 40) ghost += 1;
+            if (mx > 200) bright += 1;
+        }
+        std.debug.print("smoke-cell: feedback ghost={d} bright={d}\n", .{ ghost, bright });
+        // Ghost present (history sampled) AND dimmed (it decayed —
+        // i.e. not just the original frame leaking through).
+        if (ghost < 50 or bright > 10) {
+            std.debug.print("smoke-cell: FAIL — iChannel1 feedback broken\n", .{});
+            return 13;
+        }
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }

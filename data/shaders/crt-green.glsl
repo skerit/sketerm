@@ -24,6 +24,7 @@
 #pragma parameter vignette "Vignette" 0.28 0.0 1.0 0.01
 #pragma parameter flicker "Flicker" 0.015 0.0 0.2 0.005
 #pragma parameter mono "Monochrome mix" 1.0 0.0 1.0 0.05
+#pragma parameter persistence "Phosphor persistence" 0.0 0.0 0.95 0.05
 //@color phosphor 0.25 1.00 0.35 "Phosphor tint"
 uniform float curvature;
 uniform float scanlines;
@@ -31,6 +32,7 @@ uniform float glow;
 uniform float vignette;
 uniform float flicker;
 uniform float mono;
+uniform float persistence;
 uniform vec3 phosphor;
 
 vec2 curve(vec2 uv) {
@@ -71,6 +73,13 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     // Vignette darkens the corners like a real tube.
     vec2 v = uv * (1.0 - uv);
     col *= pow(v.x * v.y * 16.0, vignette);
+
+    // Phosphor persistence: decaying max with LAST frame's output
+    // (iChannel1) — moving text leaves fading trails like a slow
+    // tube. Decay happens per rendered frame, so enable
+    // custom_shader_animation for a smooth continuous fade.
+    vec3 prev = texture(iChannel1, fragCoord / iResolution.xy).rgb;
+    col = max(col, prev * persistence);
 
     // Mains-hum flicker (only moves when animation is on).
     col *= 1.0 - flicker * (0.5 + 0.5 * sin(iTime * 120.0));

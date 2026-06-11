@@ -293,6 +293,7 @@ const FRAG_HEADER =
     \\in vec2 v_uv;
     \\out vec4 sketerm_frag;
     \\uniform sampler2D iChannel0;
+    \\uniform sampler2D iChannel1;
     \\uniform vec3 iResolution;
     \\uniform float iTime;
     \\uniform float iTimeDelta;
@@ -318,10 +319,22 @@ pub const ShaderPass = struct {
     tex_w: c_int = 0,
     tex_h: c_int = 0,
     u_channel0: c_int = -1,
+    u_channel1: c_int = -1,
     u_resolution: c_int = -1,
     u_time: c_int = -1,
     u_time_delta: c_int = -1,
     u_frame: c_int = -1,
+    /// Previous-frame feedback (iChannel1): the user shader renders
+    /// into a ping-pong texture pair instead of straight to screen;
+    /// last frame's OUTPUT is sampled this frame (phosphor
+    /// persistence, trails). Only engaged when the program actually
+    /// references iChannel1 — other shaders keep the direct path.
+    has_feedback: bool = false,
+    fb_tex: [2]c_uint = .{ 0, 0 },
+    fb_fbo: [2]c_uint = .{ 0, 0 },
+    fb_idx: u1 = 0,
+    fb_w: c_int = 0,
+    fb_h: c_int = 0,
     /// Generation the current program (or failure) was built from.
     built_generation: u32 = std.math.maxInt(u32),
     /// Compile failed for built_generation — render direct, stay quiet.
@@ -345,6 +358,11 @@ pub const ShaderPass = struct {
         self.tex = 0;
         self.tex_w = 0;
         self.tex_h = 0;
+        self.fb_tex = .{ 0, 0 };
+        self.fb_fbo = .{ 0, 0 };
+        self.fb_idx = 0;
+        self.fb_w = 0;
+        self.fb_h = 0;
         self.built_generation = std.math.maxInt(u32);
         self.failed = false;
     }
@@ -366,6 +384,18 @@ pub const ShaderPass = struct {
         if (self.tex != 0) {
             var t = self.tex;
             c.glDeleteTextures(1, &t);
+        }
+        for (self.fb_tex) |t| {
+            if (t != 0) {
+                var tt = t;
+                c.glDeleteTextures(1, &tt);
+            }
+        }
+        for (self.fb_fbo) |f| {
+            if (f != 0) {
+                var ff = f;
+                c.glDeleteFramebuffers(1, &ff);
+            }
         }
         self.forgetGL();
     }
@@ -396,6 +426,8 @@ pub const ShaderPass = struct {
             return false;
         };
         self.u_channel0 = c.glGetUniformLocation(self.program, "iChannel0");
+        self.u_channel1 = c.glGetUniformLocation(self.program, "iChannel1");
+        self.has_feedback = self.u_channel1 >= 0;
         self.u_resolution = c.glGetUniformLocation(self.program, "iResolution");
         self.u_time = c.glGetUniformLocation(self.program, "iTime");
         self.u_time_delta = c.glGetUniformLocation(self.program, "iTimeDelta");
@@ -449,6 +481,30 @@ pub const ShaderPass = struct {
         return ok;
     }
 
+    /// (Re)allocate the feedback ping-pong pair. Cleared to black on
+    /// every (re)alloc so a resize doesn't smear garbage trails.
+    fn ensureFeedback(self: *ShaderPass, w: c_int, h: c_int) bool {
+        if (self.fb_fbo[0] != 0 and self.fb_w == w and self.fb_h == h) return true;
+        for (0..2) |i| {
+            if (self.fb_tex[i] == 0) c.glGenTextures(1, &self.fb_tex[i]);
+            c.glBindTexture(c.GL_TEXTURE_2D, self.fb_tex[i]);
+            c.glTexImage2D(c.GL_TEXTURE_2D, 0, c.GL_RGBA8, w, h, 0, c.GL_RGBA, c.GL_UNSIGNED_BYTE, null);
+            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+            c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+            if (self.fb_fbo[i] == 0) c.glGenFramebuffers(1, &self.fb_fbo[i]);
+            c.glBindFramebuffer(c.GL_FRAMEBUFFER, self.fb_fbo[i]);
+            c.glFramebufferTexture2D(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_TEXTURE_2D, self.fb_tex[i], 0);
+            if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) return false;
+            c.glClearColor(0, 0, 0, 1);
+            c.glClear(c.GL_COLOR_BUFFER_BIT);
+        }
+        self.fb_w = w;
+        self.fb_h = h;
+        return true;
+    }
+
     /// Redirect rendering into the offscreen target. Returns false
     /// when the pass is off/broken — caller renders direct. On true,
     /// `finish` MUST run after the scene passes.
@@ -462,12 +518,25 @@ pub const ShaderPass = struct {
     }
 
     /// Run the user shader: offscreen texture → GtkGLArea framebuffer.
-    /// `time_s` is monotonic seconds (pane-level epoch).
+    /// With feedback (iChannel1 referenced), the shader renders into
+    /// a ping-pong texture first — sampling LAST frame's output —
+    /// and the result is blitted to the screen and kept for next
+    /// frame. `time_s` is monotonic seconds (pane-level epoch).
     pub fn finish(self: *ShaderPass, w: c_int, h: c_int, time_s: f32) void {
-        c.glBindFramebuffer(c.GL_FRAMEBUFFER, @intCast(self.prev_fbo));
+        const feedback = self.has_feedback and self.ensureFeedback(w, h);
+        if (feedback) {
+            c.glBindFramebuffer(c.GL_FRAMEBUFFER, self.fb_fbo[self.fb_idx]);
+        } else {
+            c.glBindFramebuffer(c.GL_FRAMEBUFFER, @intCast(self.prev_fbo));
+        }
         c.glViewport(0, 0, w, h);
         c.glDisable(c.GL_BLEND);
         c.glUseProgram(self.program);
+        if (feedback) {
+            c.glActiveTexture(c.GL_TEXTURE1);
+            c.glBindTexture(c.GL_TEXTURE_2D, self.fb_tex[self.fb_idx ^ 1]);
+            c.glUniform1i(self.u_channel1, 1);
+        }
         c.glActiveTexture(c.GL_TEXTURE0);
         c.glBindTexture(c.GL_TEXTURE_2D, self.tex);
         c.glUniform1i(self.u_channel0, 0);
@@ -500,6 +569,15 @@ pub const ShaderPass = struct {
         c.glBindVertexArray(self.vao);
         c.glDrawArrays(c.GL_TRIANGLES, 0, 3);
         c.glBindVertexArray(0);
+        if (feedback) {
+            // This frame's output → screen, and it stays in fb_tex
+            // for next frame's iChannel1.
+            c.glBindFramebuffer(c.GL_READ_FRAMEBUFFER, self.fb_fbo[self.fb_idx]);
+            c.glBindFramebuffer(c.GL_DRAW_FRAMEBUFFER, @intCast(self.prev_fbo));
+            c.glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, c.GL_COLOR_BUFFER_BIT, c.GL_NEAREST);
+            c.glBindFramebuffer(c.GL_FRAMEBUFFER, @intCast(self.prev_fbo));
+            self.fb_idx ^= 1;
+        }
         c.glEnable(c.GL_BLEND);
     }
 };

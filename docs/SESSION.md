@@ -4612,3 +4612,20 @@ Tests 454 → 466.
   upload (else black), mono-override still collapses to 264.
 - Verified live: dialog opens via `cli action configure_shader`
   with zero criticals, app + IPC responsive under the modal.
+
+## 2026-06-11 (midnight): iChannel1 previous-frame feedback
+
+- ShaderPass: when the program references iChannel1, the user shader
+  renders into a ping-pong RGBA8 pair (sampling LAST frame's OUTPUT
+  on unit 1) and the result blits to the GtkGLArea fbo
+  (glBlitFramebuffer, GLES 3.0). Non-feedback shaders keep the
+  direct path — zero extra cost. Pair is cleared on (re)alloc so
+  resizes don't smear garbage; fb_* handles in forgetGL/releaseGL.
+- Shipped CRTs: `persistence` param (default 0 = visually identical,
+  max(col, prev*persistence)) → phosphor afterglow trails. Decay is
+  per-RENDERED-frame: without custom_shader_animation trails only
+  fade when something redraws; with it, smooth continuous fade.
+- smoke-cell feedback stage: decaying-max shader run twice, second
+  frame's scene EMPTY → 1283 ghost pixels at half brightness, 0 at
+  full (proves it's the decayed history, not leakage). CRT stage
+  counts unchanged (persistence=0 default).
