@@ -4629,3 +4629,34 @@ Tests 454 → 466.
   frame's scene EMPTY → 1283 ghost pixels at half brightness, 0 at
   full (proves it's the decayed history, not leakage). CRT stage
   counts unchanged (persistence=0 default).
+
+## 2026-06-12 (small hours): unified CRT + lottes port + live preview
+
+- crt-amber/green MERGED into data/shaders/crt.glsl: phosphor is a
+  color param, `colorize` 0..1 is the user-requested "strength"
+  (0 = no colorization at all). Engine grew the cool-retro-term
+  effect set REIMPLEMENTED FROM SCRATCH (CRT is GPL-3 — its QML
+  shader code must never be copied; the effects are just ideas):
+  chroma (RGB split), noise (static), jitter (per-line hsync wobble
+  + occasional tear), saturation, brightness. mono → colorize
+  rename (param was hours old, no compat shim).
+- crt-lottes.glsl: port of Timothy Lottes' PUBLIC DOMAIN classic
+  (the only license-compatible popular RetroArch CRT — easymode/
+  zfast/royale are GPL-2, NOT portable into MIT sketerm). Gaussian
+  beam Tri/Horz3/Horz5/Scan, 5 shadow-mask styles, warp, original
+  param names. smoke-cell compiles + renders it (lit=3944,
+  warp corner black).
+- Dialog LIVE PREVIEW: GtkGLArea in the config dialog renders a
+  synthetic terminal image (deterministic CPU-generated glyph
+  blocks, flipped for GL row order) through the user's shader with
+  the CURRENT override values — re-reads config.shader_params.items
+  every frame (setShaderParam appends can realloc), so sliders
+  update it as you drag; tick callback keeps it animating (flicker/
+  noise/persistence visible). Drives ShaderPass manually: own
+  Source w/ DUPed src (window source can swap while dialog open),
+  ensureProgram(pub now) + tex= + prev_fbo= + finish(). Lifetime:
+  Ctx freed via g_idle_add AFTER "closed" (unrealize GL cleanup
+  during the destroy chain still needs it).
+- Verified live: dialog + animating preview open via cli action,
+  zero criticals, IPC responsive, clean app teardown with the
+  dialog open.

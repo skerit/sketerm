@@ -288,11 +288,11 @@ pub fn main() !u8 {
     {
         const ShaderPass = @import("render/shader_pass.zig").ShaderPass;
         const ShaderSource = @import("render/shader_pass.zig").Source;
-        const crt_src = @embedFile("crt_amber_glsl");
+        const crt_src = @embedFile("crt_glsl");
         var shader_src = ShaderSource{ .src = crt_src, .generation = 1 };
         var sp = ShaderPass{ .source = &shader_src };
         if (!sp.begin(allocator, W, H)) {
-            std.debug.print("smoke-cell: FAIL — crt-amber.glsl failed to compile\n", .{});
+            std.debug.print("smoke-cell: FAIL — crt.glsl failed to compile\n", .{});
             return 9;
         }
         c.glViewport(0, 0, W, H);
@@ -320,7 +320,7 @@ pub fn main() !u8 {
         if (cr > 8 or cg > 8 or cb > 8) corner_dark = false;
         std.debug.print("smoke-cell: crt amber={d} corner_dark={}\n", .{ amber, corner_dark });
         if (amber < 50 or !corner_dark) {
-            std.debug.print("smoke-cell: FAIL — crt-amber shader output wrong\n", .{});
+            std.debug.print("smoke-cell: FAIL — crt shader output wrong\n", .{});
             return 10;
         }
 
@@ -329,7 +329,7 @@ pub fn main() !u8 {
         // green/red/cyan test text stops being warm). Same program,
         // no recompile — overrides upload per frame.
         const ParamKV = @import("render/shader_pass.zig").ParamKV;
-        const flat = [_]ParamKV{.{ .name = "mono", .value = 0.0 }};
+        const flat = [_]ParamKV{.{ .name = "colorize", .value = 0.0 }};
         shader_src.overrides = &flat;
         c.glBindFramebuffer(c.GL_FRAMEBUFFER, sp.fbo);
         c.glViewport(0, 0, W, H);
@@ -352,6 +352,40 @@ pub fn main() !u8 {
         if (amber2 * 2 >= amber) {
             std.debug.print("smoke-cell: FAIL — shader_param override did not reach the GPU\n", .{});
             return 11;
+        }
+    }
+
+    // CRT-Lottes port: compile + render the shipped file, assert it
+    // produces output (beam math is easy to break silently) and the
+    // warped-off corner is black.
+    {
+        const ShaderPass = @import("render/shader_pass.zig").ShaderPass;
+        const ShaderSource = @import("render/shader_pass.zig").Source;
+        const lottes_src = @embedFile("crt_lottes_glsl");
+        var ssrc = ShaderSource{ .src = lottes_src, .generation = 1 };
+        var sp = ShaderPass{ .source = &ssrc };
+        if (!sp.begin(allocator, W, H)) {
+            std.debug.print("smoke-cell: FAIL — crt-lottes.glsl failed to compile\n", .{});
+            return 14;
+        }
+        c.glViewport(0, 0, W, H);
+        c.glClearColor(0.05, 0.05, 0.08, 1.0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        cell_pass.draw(atlas.?, W, H);
+        grid_pass.draw(atlas.?, W, H);
+        sp.finish(W, H, 0.3);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        var lit: usize = 0;
+        var lm: usize = 0;
+        while (lm < fb_bytes) : (lm += 4) {
+            if (@max(fb[lm], @max(fb[lm + 1], fb[lm + 2])) > 60) lit += 1;
+        }
+        const corner_black = fb[0] < 8 and fb[1] < 8 and fb[2] < 8;
+        std.debug.print("smoke-cell: lottes lit={d} corner_black={}\n", .{ lit, corner_black });
+        if (lit < 100 or !corner_black) {
+            std.debug.print("smoke-cell: FAIL — crt-lottes output wrong\n", .{});
+            return 15;
         }
     }
 

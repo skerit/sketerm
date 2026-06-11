@@ -407,7 +407,10 @@ pub const ShaderPass = struct {
         return !(self.failed and self.built_generation == src.generation);
     }
 
-    fn ensureProgram(self: *ShaderPass, allocator: std.mem.Allocator) bool {
+    /// Compile/refresh the program for the current Source generation.
+    /// pub for the config dialog's preview, which drives the pass
+    /// manually (sets `tex` + `prev_fbo`, then calls finish()).
+    pub fn ensureProgram(self: *ShaderPass, allocator: std.mem.Allocator) bool {
         const src = self.source orelse return false;
         const user = src.src orelse return false;
         if (self.built_generation == src.generation) return !self.failed;

@@ -11,12 +11,23 @@ const cast = @import("../util/cast.zig");
 const Window = @import("window.zig").Window;
 const shader_pass = @import("../render/shader_pass.zig");
 
+const PREVIEW_W = 380;
+const PREVIEW_H = 230;
+
 const Ctx = struct {
     allocator: std.mem.Allocator,
     win: *Window,
     params: [shader_pass.MAX_PARAMS]shader_pass.Param = undefined,
     params_len: usize = 0,
     meta: shader_pass.Meta = .{},
+    /// Live preview state. The shader source is OUR copy — the
+    /// window/pane source can be swapped while the dialog is open.
+    src_copy: ?[]u8 = null,
+    preview_source: shader_pass.Source = .{},
+    preview_pass: shader_pass.ShaderPass = .{},
+    dummy_tex: c_uint = 0,
+    epoch_us: i64 = 0,
+    tick_id: c_uint = 0,
 };
 
 const RowCtx = struct {
@@ -41,6 +52,11 @@ pub fn open(win: *Window) bool {
     const ctx = win.allocator.create(Ctx) catch return false;
     ctx.* = .{ .allocator = win.allocator, .win = win };
     ctx.params_len = shader_pass.parseParams(src, &ctx.params, &ctx.meta);
+    ctx.src_copy = win.allocator.dupe(u8, src) catch null;
+    if (ctx.src_copy) |sc| {
+        ctx.preview_source = .{ .src = sc, .animate = true, .generation = 1 };
+        ctx.preview_pass.source = &ctx.preview_source;
+    }
 
     const dialog = c.adw_preferences_dialog_new();
     const title_z = dupZ(win.allocator, if (ctx.meta.title().len > 0) ctx.meta.title() else "Shader") orelse {
@@ -151,6 +167,25 @@ pub fn open(win: *Window) bool {
         c.adw_preferences_group_add(@ptrCast(@alignCast(group)), @ptrCast(@alignCast(reset_row)));
     }
 
+    // Live preview: a GL area rendering a synthetic terminal frame
+    // through THIS shader with the current values — sliders feed the
+    // same overrides slice, so it updates as you drag (and animates,
+    // so flicker/noise/persistence are visible too).
+    if (ctx.src_copy != null) {
+        const pgroup = c.adw_preferences_group_new();
+        c.adw_preferences_group_set_title(@ptrCast(@alignCast(pgroup)), "Preview");
+        const area = c.gtk_gl_area_new();
+        c.gtk_gl_area_set_use_es(@ptrCast(area), 1);
+        c.gtk_widget_set_size_request(area, PREVIEW_W, PREVIEW_H);
+        c.gtk_widget_add_css_class(area, "card");
+        _ = c.g_signal_connect_data(area, "realize", @ptrCast(&onPreviewRealize), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(area, "unrealize", @ptrCast(&onPreviewUnrealize), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(area, "render", @ptrCast(&onPreviewRender), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        ctx.tick_id = c.gtk_widget_add_tick_callback(area, @ptrCast(&onPreviewTick), @ptrCast(ctx), null);
+        c.adw_preferences_group_add(@ptrCast(@alignCast(pgroup)), area);
+        c.adw_preferences_page_add(@ptrCast(@alignCast(page)), @ptrCast(@alignCast(pgroup)));
+    }
+
     c.adw_preferences_page_add(@ptrCast(@alignCast(page)), @ptrCast(@alignCast(group)));
     c.adw_preferences_dialog_add(@ptrCast(@alignCast(dialog)), @ptrCast(@alignCast(page)));
 
@@ -230,6 +265,150 @@ fn freeRowCtx(user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onDialogClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {
+    // Defer the free past the destroy chain — the preview GLArea's
+    // unrealize handler (GL cleanup) still needs the Ctx.
+    _ = c.g_idle_add(@ptrCast(&deferredCtxFree), user);
+}
+
+fn deferredCtxFree(user: ?*anyopaque) callconv(.c) c.gboolean {
     const ctx = cast.userData(Ctx, user);
+    if (ctx.src_copy) |s| ctx.allocator.free(s);
     ctx.allocator.destroy(ctx);
+    return 0; // G_SOURCE_REMOVE
+}
+
+// ── Live preview ────────────────────────────────────────────────
+
+/// Build a synthetic "terminal output" RGBA image: dark background,
+/// colored glyph-block text lines, a prompt and a block cursor.
+/// Deterministic (no RNG) so the preview is stable across opens.
+fn makeDummyTerminal(allocator: std.mem.Allocator) ?[]u8 {
+    const w = PREVIEW_W;
+    const h = PREVIEW_H;
+    const buf = allocator.alloc(u8, w * h * 4) catch return null;
+    // Background.
+    var i: usize = 0;
+    while (i < buf.len) : (i += 4) {
+        buf[i] = 13;
+        buf[i + 1] = 13;
+        buf[i + 2] = 18;
+        buf[i + 3] = 255;
+    }
+    const colors = [_][3]u8{
+        .{ 90, 220, 120 }, // green (prompt)
+        .{ 230, 230, 230 }, // white
+        .{ 200, 200, 200 }, // gray
+        .{ 120, 170, 250 }, // blue
+        .{ 240, 200, 90 }, // yellow
+        .{ 235, 110, 100 }, // red
+        .{ 200, 200, 200 },
+        .{ 230, 230, 230 },
+    };
+    var seed: u32 = 0x5e1ec7ed;
+    const line_h = 16;
+    var row: usize = 0;
+    while (row * line_h + 14 < h) : (row += 1) {
+        const y0 = 4 + row * line_h;
+        var x: usize = 6;
+        // Prompt marker on every 4th line.
+        const is_prompt = row % 4 == 0;
+        var word: usize = 0;
+        while (x + 10 < w - 6) : (word += 1) {
+            seed = seed *% 1664525 +% 1013904223;
+            const wlen = 2 + (seed >> 8) % 7;
+            const color = if (is_prompt and word == 0)
+                colors[0]
+            else
+                colors[(seed >> 16) % colors.len];
+            var g: usize = 0;
+            while (g < wlen and x + 7 < w - 6) : (g += 1) {
+                // One 5x10 "glyph" block with a 2px gap.
+                var py: usize = 0;
+                while (py < 10) : (py += 1) {
+                    var px: usize = 0;
+                    while (px < 5) : (px += 1) {
+                        // Flip vertically: GL texture row 0 = bottom.
+                        const ty = h - 1 - (y0 + py + 2);
+                        const off = (ty * w + x + px) * 4;
+                        buf[off] = color[0];
+                        buf[off + 1] = color[1];
+                        buf[off + 2] = color[2];
+                    }
+                }
+                x += 7;
+            }
+            x += 8; // word gap
+            seed = seed *% 1664525 +% 1013904223;
+            if ((seed >> 24) % 5 == 0) break; // short line
+        }
+    }
+    // Block cursor on the last visible line.
+    const cy = 4 + ((h - 18) / line_h) * line_h;
+    var py: usize = 0;
+    while (py < 12) : (py += 1) {
+        var px: usize = 0;
+        while (px < 8) : (px += 1) {
+            const ty = h - 1 - (cy + py);
+            const off = (ty * w + 10 + px) * 4;
+            buf[off] = 230;
+            buf[off + 1] = 230;
+            buf[off + 2] = 230;
+        }
+    }
+    return buf;
+}
+
+fn onPreviewRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
+    c.gtk_gl_area_make_current(area);
+    if (c.gtk_gl_area_get_error(area) != null) return;
+    const img = makeDummyTerminal(ctx.allocator) orelse return;
+    defer ctx.allocator.free(img);
+    c.glGenTextures(1, &ctx.dummy_tex);
+    c.glBindTexture(c.GL_TEXTURE_2D, ctx.dummy_tex);
+    c.glTexImage2D(c.GL_TEXTURE_2D, 0, c.GL_RGBA8, PREVIEW_W, PREVIEW_H, 0, c.GL_RGBA, c.GL_UNSIGNED_BYTE, img.ptr);
+    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+}
+
+fn onPreviewUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
+    c.gtk_gl_area_make_current(area);
+    ctx.preview_pass.releaseGL();
+    if (ctx.dummy_tex != 0) {
+        var t = ctx.dummy_tex;
+        c.glDeleteTextures(1, &t);
+        ctx.dummy_tex = 0;
+    }
+}
+
+fn onPreviewRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const ctx = cast.userData(Ctx, user);
+    const w = c.gtk_widget_get_width(@ptrCast(area)) * c.gtk_widget_get_scale_factor(@ptrCast(area));
+    const h = c.gtk_widget_get_height(@ptrCast(area)) * c.gtk_widget_get_scale_factor(@ptrCast(area));
+    c.glViewport(0, 0, w, h);
+    c.glClearColor(0.05, 0.05, 0.07, 1.0);
+    c.glClear(c.GL_COLOR_BUFFER_BIT);
+    if (ctx.dummy_tex == 0) return 1;
+
+    // Live values: same slice setShaderParam mutates (re-read every
+    // frame — appends can realloc it).
+    ctx.preview_source.overrides = ctx.win.config.shader_params.items;
+
+    const sp = &ctx.preview_pass;
+    if (!sp.ensureProgram(ctx.allocator)) return 1;
+    c.glGetIntegerv(c.GL_DRAW_FRAMEBUFFER_BINDING, &sp.prev_fbo);
+    sp.tex = ctx.dummy_tex;
+    const now = c.g_get_monotonic_time();
+    if (ctx.epoch_us == 0) ctx.epoch_us = now;
+    const t: f32 = @as(f32, @floatFromInt(now - ctx.epoch_us)) / 1e6;
+    sp.finish(w, h, t);
+    return 1;
+}
+
+fn onPreviewTick(area: *c.GtkWidget, _: *c.GdkFrameClock, _: ?*anyopaque) callconv(.c) c.gboolean {
+    c.gtk_gl_area_queue_render(@ptrCast(area));
+    return 1; // G_SOURCE_CONTINUE
 }
