@@ -69,8 +69,29 @@ pub const Layout = struct {
     tabs: []const TabSpec,
 };
 
-/// Read `/proc/<pid>/cwd` symlink target.
+/// macOS: query a process's vnode paths (cwd + root) via libproc.
+/// Layout of struct proc_vnodepathinfo: two vnode_info_path entries,
+/// each { struct vnode_info (152 bytes), char vip_path[MAXPATHLEN] }
+/// — pvi_cdir.vip_path therefore sits at offset 152. UNVERIFIED on
+/// real hardware; sizes match Apple's libproc.h and the layouts the
+/// rust-libproc/gopsutil ports ship.
+extern fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
+
+/// Working directory of a live process. Linux: /proc/<pid>/cwd
+/// symlink. macOS: proc_pidinfo(PROC_PIDVNODEPATHINFO).
 pub fn cwdOfPid(pid: c.pid_t, allocator: std.mem.Allocator) ![]u8 {
+    if (@import("util/platform.zig").is_macos) {
+        const VNODE_INFO_SIZE = 152;
+        const MAXPATHLEN = 1024;
+        const PROC_PIDVNODEPATHINFO: c_int = 9;
+        var buf: [2 * (VNODE_INFO_SIZE + MAXPATHLEN)]u8 align(8) = undefined;
+        const n = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &buf, buf.len);
+        if (n <= VNODE_INFO_SIZE) return error.ReadlinkFailed;
+        const path_bytes = buf[VNODE_INFO_SIZE .. VNODE_INFO_SIZE + MAXPATHLEN];
+        const len = std.mem.indexOfScalar(u8, path_bytes, 0) orelse MAXPATHLEN;
+        if (len == 0) return error.ReadlinkFailed;
+        return try allocator.dupe(u8, path_bytes[0..len]);
+    }
     var path_buf: [64]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "/proc/{d}/cwd", .{pid});
     var path_z: [128]u8 = undefined;

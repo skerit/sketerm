@@ -32,8 +32,7 @@ pub const Server = struct {
 
 /// Compute the per-process socket path. Caller frees.
 pub fn defaultSocketPath(allocator: std.mem.Allocator) ![:0]u8 {
-    const rt_raw = c.getenv("XDG_RUNTIME_DIR");
-    const rt: []const u8 = if (rt_raw != null) std.mem.span(rt_raw) else "/tmp";
+    const rt = @import("../util/platform.zig").runtimeDir();
     return std.fmt.allocPrintSentinel(allocator, "{s}/sketerm/{d}.sock", .{ rt, c.getpid() }, 0);
 }
 

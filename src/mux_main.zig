@@ -5,12 +5,15 @@
 
 const std = @import("std");
 const daemon = @import("mux/daemon.zig");
+const platform = @import("util/platform.zig");
 
-/// musl's `SIG_IGN` macro fails translate-c (function-pointer cast);
-/// the value is plain 1 on every libc. Typed off `signal`'s second
-/// parameter so it matches whichever handler typedef the libc uses.
-const sig_ign: @typeInfo(@TypeOf(@import("c.zig").c.signal)).@"fn".params[1].type.? =
-    @ptrFromInt(1);
+/// SIGPIPE "ignore" via a no-op handler. The libc `SIG_IGN` macro
+/// fails translate-c (function-pointer cast) and its raw value (1)
+/// violates fn-pointer alignment on aarch64-macos. For SIGPIPE the
+/// no-op handler is equivalent: write() still returns EPIPE, the
+/// process just doesn't die.
+fn sigNoop(_: c_int) callconv(.c) void {}
+const sig_ign = &sigNoop;
 
 const HELP =
     \\sketerm-mux — sketerm session daemon (durable panes)
@@ -121,9 +124,7 @@ fn runProxy(allocator: std.mem.Allocator) u8 {
             _ = cc.setsid();
             if (cc.fork() == 0) {
                 var self_buf: [4096:0]u8 = undefined;
-                const n = cc.readlink("/proc/self/exe", &self_buf, self_buf.len - 1);
-                if (n > 0) {
-                    self_buf[@intCast(n)] = 0;
+                if (platform.exePathZ(&self_buf)) |_| {
                     const argv0 = [_:null]?[*:0]const u8{ &self_buf, null };
                     _ = cc.execv(&self_buf, @ptrCast(@constCast(&argv0)));
                 }
@@ -237,7 +238,7 @@ fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16) u8 {
     const cc = @import("c.zig").c;
     _ = cc.signal(cc.SIGPIPE, sig_ign);
 
-    const udp_fd = cc.socket(cc.AF_INET, cc.SOCK_DGRAM | cc.SOCK_CLOEXEC, 0);
+    const udp_fd = platform.socketCloexec(cc.AF_INET, cc.SOCK_DGRAM, 0);
     if (udp_fd < 0) return 1;
     var bind_addr: cc.struct_sockaddr_in = std.mem.zeroes(cc.struct_sockaddr_in);
     bind_addr.sin_family = cc.AF_INET;
@@ -271,7 +272,9 @@ fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16) u8 {
     var hexbuf: [rudp.KEY_LEN * 2]u8 = undefined;
     const keyhex = rudp.keyToHex(key, &hexbuf);
     _ = cc.printf("SKETERM-UDP %u %.*s\n", @as(c_uint, port), @as(c_int, @intCast(keyhex.len)), keyhex.ptr);
-    _ = cc.fflush(cc.stdout);
+    // fflush(NULL) = flush ALL streams (POSIX) — portable across
+    // libcs where `stdout` is a macro/inline fn translate-c mangles.
+    _ = cc.fflush(null);
 
     // Detach from the ssh session: the bootstrap is done, the
     // connection now lives on UDP. Parent exits → ssh returns.
@@ -321,7 +324,7 @@ fn runUdpConnect(allocator: std.mem.Allocator, host: []const u8, port_s: []const
     defer cc.freeaddrinfo(res);
 
     const ai = res.?;
-    const udp_fd = cc.socket(ai.ai_family, cc.SOCK_DGRAM | cc.SOCK_CLOEXEC, 0);
+    const udp_fd = platform.socketCloexec(ai.ai_family, cc.SOCK_DGRAM, 0);
     if (udp_fd < 0) return 1;
 
     var chan = rudp.Channel.init(allocator, key, true);
@@ -379,14 +382,16 @@ fn bridgeUdp(
         const now = nowMs();
         if (abandon_deadline) |dl| {
             if (!ever_authenticated and now > dl) {
-                if (warn != null) _ = cc.fprintf(cc.stderr, "sketerm-mux: giving up on UDP transport\n");
+                if (warn != null) std.debug.print("sketerm-mux: giving up on UDP transport\n", .{});
                 return 1;
             }
         }
         if (warn) |w| {
             if (!warned and !ever_authenticated and now > w.at) {
                 warned = true;
-                _ = cc.fwrite(w.msg.ptr, 1, w.msg.len, cc.stderr);
+                // raw write(2) to fd 2 — `stderr` is a macro/inline
+                // fn on Darwin's libc that translate-c mangles.
+                _ = cc.write(2, w.msg.ptr, w.msg.len);
             }
         }
         const deadline = chan.tick(now, UdpOut.emit, @ptrCast(out));
@@ -460,9 +465,7 @@ fn connectDaemonRetry(allocator: std.mem.Allocator) ?c_int {
         _ = cc.setsid();
         if (cc.fork() == 0) {
             var self_buf: [4096:0]u8 = undefined;
-            const n = cc.readlink("/proc/self/exe", &self_buf, self_buf.len - 1);
-            if (n > 0) {
-                self_buf[@intCast(n)] = 0;
+            if (platform.exePathZ(&self_buf)) |_| {
                 const argv0 = [_:null]?[*:0]const u8{ &self_buf, null };
                 _ = cc.execv(&self_buf, @ptrCast(@constCast(&argv0)));
             }

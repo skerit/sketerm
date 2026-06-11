@@ -415,7 +415,7 @@ fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, 
     std.json.Stringify.value(.{ .cmd = cmd, .data = data, .host = host, .pane = self_pane }, .{}, &aw.writer) catch return false;
     aw.writer.writeAll("\n") catch return false;
 
-    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0);
+    const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
     if (fd < 0) return false;
     defer _ = c.close(fd);
     var addr: c.struct_sockaddr_un = undefined;

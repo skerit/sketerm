@@ -32,8 +32,7 @@ pub const Source = struct {
     generation: u32 = 0,
 };
 
-const VERT_SRC =
-    \\#version 300 es
+pub const VERT_SRC =
     \\in vec2 a_pos;
     \\out vec2 v_uv;
     \\void main() {
@@ -43,9 +42,7 @@ const VERT_SRC =
     \\}
 ;
 
-const FRAG_SRC =
-    \\#version 300 es
-    \\precision mediump float;
+pub const FRAG_SRC =
     \\in vec2 v_uv;
     \\uniform int u_mode;       // 0 = gradient, 1 = image
     \\uniform vec4 u_color0;

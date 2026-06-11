@@ -67,6 +67,10 @@ There's no `--test-filter` wired through `build.zig`; to run a single test, eith
 
 **Renderer invariants.** After ANY atlas rebuild/swap, call `cell_pass.markAllDirty()` and reset GridPass `vbuf_valid`/`vbo_uploaded`/`row_caches_valid` (generation counters reset to 0 and won't trip eviction detection). GridPass `Snapshot` must gain a hash/field for any new Screen-side overlay state (hints, copy cursor, …) or the vbuf won't rebuild. Emoji/CJK rows render via CellPass, not GridPass — `rowNeedsBidiOrComplexShape` only routes RTL/complex scripts to the overlay; glyph-rendering changes must hit BOTH shader pairs.
 
+**Shaders carry NO `#version`/`precision` lines.** `gl.zig compileShader` injects a per-API header (`300 es` on Linux/GLES, `330 core` on macOS desktop GL) — adding a version line to a shader source breaks one of the two platforms. `zig build smoke-gl-core` compiles every shader under desktop GL 3.3 core (the macOS path) via Mesa. Never call `gtk_gl_area_set_use_es` directly; use `gl.requestArea` + `gl.adoptAreaApi`.
+
+**Platform layer.** Linux-vs-macOS primitives live ONLY in `src/util/platform.zig` (exe path, eventfd-vs-pipe wakeup, runtime dir, cloexec sockets), keyed on comptime `builtin.os.tag`. OS-specific headers are `#ifdef __linux__`-gated in `vendor/cimport_*.h`. `zig build mux-portable -Dportable-target=aarch64-macos` is the cross-compile check — keep it green. See `docs/macos.md`.
+
 **Tab/pane tree is plain Zig data; GTK widgets are the view.** Layout persistence (`layout.zig`) serializes the tree to JSON; widgets rebuild from the tree on load. Saved at shutdown to `$XDG_STATE_HOME/sketerm/last.json`; restored via `--restore` or `--layout <path>`.
 
 **CSI handling is split.** `Screen.csi()` is a small dispatcher that routes by `params.private` to `csiPrivate` (`?`), `csiAux` (`>`), `csiKittyKbd` (`=`/`<`), or `csiPublic`. Don't fold logic back into one giant function. CSI params are u16; `Event.Csi` carries colon sub-params via `setSub(idx)`/`isSub`.

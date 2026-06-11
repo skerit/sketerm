@@ -223,7 +223,7 @@ pub fn open(win: *Window) bool {
         const pgroup = c.adw_preferences_group_new();
         c.adw_preferences_group_set_title(@ptrCast(@alignCast(pgroup)), "Preview");
         const area = c.gtk_gl_area_new();
-        c.gtk_gl_area_set_use_es(@ptrCast(area), 1);
+        @import("../render/gl.zig").requestArea(@ptrCast(area));
         c.gtk_widget_set_size_request(area, PREVIEW_W, PREVIEW_H);
         c.gtk_widget_add_css_class(area, "card");
         _ = c.g_signal_connect_data(area, "realize", @ptrCast(&onPreviewRealize), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);

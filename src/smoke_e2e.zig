@@ -47,8 +47,7 @@ pub fn main() u8 {
     child_pid = pid;
 
     // Wait for the socket to appear (app startup + bind).
-    const rt_raw = c.getenv("XDG_RUNTIME_DIR");
-    const rt: []const u8 = if (rt_raw != null) std.mem.span(rt_raw) else "/tmp";
+    const rt = @import("util/platform.zig").runtimeDir();
     const sock_path = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm/{d}.sock", .{ rt, pid }, 0) catch return fail("alloc");
     defer allocator.free(sock_path);
     var waited: u32 = 0;

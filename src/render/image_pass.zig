@@ -5,8 +5,7 @@ const c = @import("../c.zig").c;
 const gl = @import("gl.zig");
 const ImageStore = @import("../grid/image_store.zig").Store;
 
-const VERT_SRC =
-    \\#version 300 es
+pub const VERT_SRC =
     \\in vec2 a_pos;
     \\in vec2 a_uv;
     \\uniform vec2 u_screen_px;
@@ -19,9 +18,7 @@ const VERT_SRC =
     \\}
 ;
 
-const FRAG_SRC =
-    \\#version 300 es
-    \\precision mediump float;
+pub const FRAG_SRC =
     \\in vec2 v_uv;
     \\uniform sampler2D u_image;
     \\out vec4 o_frag;

@@ -18,6 +18,7 @@ const percent = @import("util/percent.zig");
 const mux_client = @import("mux/client.zig");
 const mux_wire = @import("mux/wire.zig");
 const mux_snapshot = @import("mux/snapshot.zig");
+const platform = @import("util/platform.zig");
 const predict_mod = @import("mux/predict.zig");
 const cell_mod = @import("grid/cell.zig");
 const profile_util = @import("util/profile.zig");
@@ -53,7 +54,8 @@ pub const Terminal = struct {
     parser: Parser,
     ring: *EventRing,
     worker_thread: std.Thread,
-    shutdown_fd: c_int,
+    /// Worker shutdown wakeup (eventfd on Linux, pipe elsewhere).
+    shutdown: platform.Wakeup,
     /// Heap-allocated handle that outlives the Terminal so glib
     /// callbacks queued before deinit can safely run after deinit.
     /// drain_pending lives on the handle.
@@ -181,7 +183,7 @@ pub const Terminal = struct {
             .parser = Parser.init(allocator),
             .ring = undefined,
             .worker_thread = undefined,
-            .shutdown_fd = -1,
+            .shutdown = .{ .read_fd = -1, .write_fd = -1 },
             .drain = drain,
             .allocator = allocator,
             .pool = pool,
@@ -408,9 +410,8 @@ pub const Terminal = struct {
         errdefer allocator.destroy(ring);
         ring.* = .{};
 
-        const efd = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
-        if (efd < 0) return error.EventFd;
-        errdefer _ = c.close(efd);
+        const shutdown_wk = try platform.Wakeup.init();
+        errdefer shutdown_wk.close();
 
         var pool = try Pool.init(allocator);
         errdefer pool.deinit();
@@ -430,7 +431,7 @@ pub const Terminal = struct {
             .parser = Parser.init(allocator),
             .ring = ring,
             .worker_thread = undefined,
-            .shutdown_fd = efd,
+            .shutdown = shutdown_wk,
             .drain = drain,
             .allocator = allocator,
             .pool = pool,
@@ -685,17 +686,11 @@ pub const Terminal = struct {
         self.drain.terminal = null;
         self.drain.alive.store(false, .release);
 
-        // Signal worker. Loop on EINTR — eventfd write is atomic
-        // 8 bytes but a signal arriving mid-call still returns -1.
-        const one: u64 = 1;
-        while (true) {
-            const w = c.write(self.shutdown_fd, &one, 8);
-            if (w >= 0) break;
-            if (std.posix.errno(w) != .INTR) break;
-        }
+        // Signal worker (EINTR-safe inside Wakeup.signal).
+        self.shutdown.signal();
         self.worker_thread.join();
 
-        _ = c.close(self.shutdown_fd);
+        self.shutdown.close();
         // Async reap: closes master_fd + sends SIGHUP synchronously,
         // then escalates SIGTERM / SIGKILL on a g_timeout chain so
         // a child that ignores HUP doesn't freeze the GLib main
@@ -725,7 +720,7 @@ pub const Terminal = struct {
 
         var pfds = [_]c.struct_pollfd{
             .{ .fd = self.pty.master_fd, .events = c.POLLIN, .revents = 0 },
-            .{ .fd = self.shutdown_fd, .events = c.POLLIN, .revents = 0 },
+            .{ .fd = self.shutdown.read_fd, .events = c.POLLIN, .revents = 0 },
         };
 
         while (true) {

@@ -3,6 +3,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
+    // LLD is pinned on Linux because the self-hosted ELF linker
+    // chokes on gcc 15's `.sframe` relocs in crt1.o. On macOS the
+    // self-hosted Mach-O linker is the supported path — LLD's
+    // Mach-O port is not.
+    const use_lld = target.result.os.tag == .linux;
+
     // Default ReleaseFast for the shipped binary. Terminals are
     // perf-sensitive and runtime safety checks have measurable cost
     // (parser throughput, render latency). Debug builds fail to
@@ -57,7 +63,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "sketerm",
         .root_module = exe_mod,
-        .use_lld = true, // self-hosted linker can't handle gcc 15's SFrame relocs in crt1
+        .use_lld = use_lld,
     });
     b.installArtifact(exe);
 
@@ -84,7 +90,7 @@ pub fn build(b: *std.Build) void {
     const mux_exe = b.addExecutable(.{
         .name = "sketerm-mux",
         .root_module = mux_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     b.installArtifact(mux_exe);
     const mux_step = b.step("mux", "Build the sketerm-mux session daemon");
@@ -129,7 +135,10 @@ pub fn build(b: *std.Build) void {
     const mux_portable_exe = b.addExecutable(.{
         .name = "sketerm-mux-portable",
         .root_module = mux_portable_mod,
-        .use_lld = true,
+        // Keyed on the PORTABLE triple, not the host target — a
+        // `-Dportable-target=aarch64-macos` cross build needs the
+        // self-hosted Mach-O linker.
+        .use_lld = portable_target.result.os.tag == .linux,
     });
     const mux_portable_step = b.step(
         "mux-portable",
@@ -149,7 +158,7 @@ pub fn build(b: *std.Build) void {
     const smoke_mux = b.addExecutable(.{
         .name = "sketerm-smoke-mux",
         .root_module = smoke_mux_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     const smoke_mux_run = b.addRunArtifact(smoke_mux);
     const smoke_mux_step = b.step("smoke-mux", "Mux daemon end-to-end smoke (headless)");
@@ -167,7 +176,7 @@ pub fn build(b: *std.Build) void {
     const spike = b.addExecutable(.{
         .name = "sketerm-spike-gl",
         .root_module = spike_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     b.installArtifact(spike);
     const spike_run = b.addRunArtifact(spike);
@@ -186,7 +195,7 @@ pub fn build(b: *std.Build) void {
     const shell = b.addExecutable(.{
         .name = "sketerm-spike-shell",
         .root_module = shell_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     b.installArtifact(shell);
     const shell_run = b.addRunArtifact(shell);
@@ -205,7 +214,7 @@ pub fn build(b: *std.Build) void {
     const replay = b.addExecutable(.{
         .name = "sketerm-replay",
         .root_module = replay_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     b.installArtifact(replay);
     const replay_run = b.addRunArtifact(replay);
@@ -225,7 +234,7 @@ pub fn build(b: *std.Build) void {
     const bench = b.addExecutable(.{
         .name = "sketerm-bench-parser",
         .root_module = bench_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     b.installArtifact(bench);
     const bench_run = b.addRunArtifact(bench);
@@ -248,7 +257,7 @@ pub fn build(b: *std.Build) void {
     const smoke = b.addExecutable(.{
         .name = "sketerm-smoke-image",
         .root_module = smoke_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     b.installArtifact(smoke);
     const smoke_run = b.addRunArtifact(smoke);
@@ -269,7 +278,7 @@ pub fn build(b: *std.Build) void {
     const smoke_e2e = b.addExecutable(.{
         .name = "sketerm-smoke-e2e",
         .root_module = smoke_e2e_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     b.installArtifact(smoke_e2e);
     const smoke_e2e_run = b.addRunArtifact(smoke_e2e);
@@ -313,7 +322,7 @@ pub fn build(b: *std.Build) void {
     const smoke_cell = b.addExecutable(.{
         .name = "sketerm-smoke-cell",
         .root_module = smoke_cell_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     b.installArtifact(smoke_cell);
     const smoke_cell_run = b.addRunArtifact(smoke_cell);
@@ -337,7 +346,7 @@ pub fn build(b: *std.Build) void {
     const bench_cell = b.addExecutable(.{
         .name = "sketerm-bench-cell-upload",
         .root_module = bench_cell_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     b.installArtifact(bench_cell);
     const bench_cell_run = b.addRunArtifact(bench_cell);
@@ -360,12 +369,37 @@ pub fn build(b: *std.Build) void {
     const smoke_trans = b.addExecutable(.{
         .name = "sketerm-smoke-transparency",
         .root_module = smoke_trans_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     b.installArtifact(smoke_trans);
     const smoke_trans_run = b.addRunArtifact(smoke_trans);
     const smoke_trans_step = b.step("smoke-transparency", "Headless GL bg-alpha render check");
     smoke_trans_step.dependOn(&smoke_trans_run.step);
+
+    // Desktop-GL core shader smoke — `zig build smoke-gl-core`.
+    // Compiles every shader under a GL 3.3 core context: the macOS
+    // GDK path, provable on a Linux box via Mesa's EGL desktop-GL.
+    const smoke_core_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_gl_core.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureSysDeps(b, smoke_core_mod, cbindings_mod);
+    smoke_core_mod.addImport("build_options", glib_opts_mod);
+    smoke_core_mod.linkSystemLibrary("EGL", .{});
+    smoke_core_mod.addAnonymousImport("crt_glsl", .{
+        .root_source_file = b.path("data/shaders/crt.glsl"),
+    });
+    const smoke_core = b.addExecutable(.{
+        .name = "sketerm-smoke-gl-core",
+        .root_module = smoke_core_mod,
+        .use_lld = use_lld,
+    });
+    b.installArtifact(smoke_core);
+    const smoke_core_run = b.addRunArtifact(smoke_core);
+    const smoke_core_step = b.step("smoke-gl-core", "Compile all shaders under desktop GL 3.3 core (macOS GL path)");
+    smoke_core_step.dependOn(&smoke_core_run.step);
 
     const tests_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
@@ -377,7 +411,7 @@ pub fn build(b: *std.Build) void {
     tests_mod.addImport("build_options", glib_opts_mod);
     const tests = b.addTest(.{
         .root_module = tests_mod,
-        .use_lld = true,
+        .use_lld = use_lld,
     });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");

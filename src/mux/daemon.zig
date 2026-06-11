@@ -140,7 +140,7 @@ pub const Daemon = struct {
         _ = c.mkdir(try pathZ(&z_buf, sock_path[0..dir_end]), 0o700);
         _ = c.unlink(try pathZ(&z_buf, sock_path));
 
-        const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0);
+        const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
         if (fd < 0) return error.SocketFailed;
         errdefer _ = c.close(fd);
         var addr: c.struct_sockaddr_un = undefined;
@@ -669,7 +669,6 @@ const EventCollector = struct {
 };
 
 pub fn defaultSocketPath(allocator: std.mem.Allocator) ![]u8 {
-    const rt_c = std.c.getenv("XDG_RUNTIME_DIR");
-    const rt: []const u8 = if (rt_c) |p| std.mem.span(p) else "/tmp";
+    const rt = @import("../util/platform.zig").runtimeDir();
     return std.fmt.allocPrint(allocator, "{s}/sketerm/mux.sock", .{rt});
 }

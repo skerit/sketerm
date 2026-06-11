@@ -10,9 +10,8 @@ const daemon = @import("daemon.zig");
 /// Resolve the sketerm-mux binary: sibling of our own executable
 /// first (works for `zig build run` trees), then bare name ($PATH).
 pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
-    const n = c.readlink("/proc/self/exe", buf, buf.len - 1);
-    if (n > 0) {
-        const exe_path = buf[0..@intCast(n)];
+    const platform = @import("../util/platform.zig");
+    if (platform.exePathZ(buf)) |exe_path| {
         if (std.mem.lastIndexOfScalar(u8, exe_path, '/')) |slash| {
             const dir_len = slash + 1;
             const want = "sketerm-mux";
@@ -32,7 +31,7 @@ pub const Conn = struct {
     rbuf: std.ArrayList(u8) = .empty,
 
     pub fn connect(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
-        const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0);
+        const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
         if (fd < 0) return error.SocketFailed;
         errdefer _ = c.close(fd);
         var addr: c.struct_sockaddr_un = undefined;

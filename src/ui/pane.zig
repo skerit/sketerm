@@ -18,6 +18,7 @@ const BgPass = @import("../render/bg_pass.zig").BgPass;
 const ShaderPass = @import("../render/shader_pass.zig").ShaderPass;
 const ShaderSource = @import("../render/shader_pass.zig").Source;
 const ShaderParamKV = @import("../render/shader_pass.zig").ParamKV;
+const gl_mod = @import("../render/gl.zig");
 const ImageStore = @import("../grid/image_store.zig").Store;
 const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -228,7 +229,7 @@ pub const Pane = struct {
         errdefer allocator.destroy(self);
 
         const area_widget = c.gtk_gl_area_new();
-        c.gtk_gl_area_set_use_es(@ptrCast(area_widget), 1);
+        gl_mod.requestArea(@ptrCast(area_widget));
         // auto_render=FALSE → GtkGLArea only invokes the render
         // signal on demand (queue_draw / queue_render). With TRUE,
         // GTK pumps a full GL frame at the display refresh rate
@@ -1128,6 +1129,7 @@ fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
 fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
     c.gtk_gl_area_make_current(area);
+    gl_mod.adoptAreaApi(area);
     if (c.gtk_gl_area_get_error(area) != null) {
         const err = c.gtk_gl_area_get_error(area);
         const msg: [*:0]const u8 = if (err != null) err.*.message else "<no message>";

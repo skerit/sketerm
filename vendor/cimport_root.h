@@ -46,9 +46,14 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
-#include <sys/eventfd.h>
+#ifdef __linux__
+#include <sys/eventfd.h> /* Wakeup fast path (pipe fallback elsewhere) */
+#include <pty.h>         /* openpty/forkpty live here on glibc/musl */
+#else
+#include <util.h>        /* macOS: openpty/forkpty */
+#include <sys/random.h>  /* macOS: getentropy lives here */
+#endif
 #include <termios.h>
-#include <pty.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>

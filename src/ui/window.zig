@@ -1750,9 +1750,8 @@ pub const Window = struct {
         if (S.done) return S.resolved;
         S.done = true;
         var exe_buf: [4096]u8 = undefined;
-        const n = c.readlink("/proc/self/exe", &exe_buf, exe_buf.len - 1);
-        if (n > 0) {
-            const exe_dir = std.fs.path.dirname(exe_buf[0..@intCast(n)]) orelse "/usr/bin";
+        if (@import("../util/platform.zig").exePath(&exe_buf)) |exe_path| {
+            const exe_dir = std.fs.path.dirname(exe_path) orelse "/usr/bin";
             const candidates = [_][]const u8{
                 "/../share/sketerm/shaders",
                 "/../../data/shaders",
@@ -3361,9 +3360,7 @@ pub const Window = struct {
         const base: []const u8 = blk: {
             if (@import("../util/profile.zig").getenv("SKETERM_SHELL_INTEGRATION_DIR")) |env| break :blk env;
             var exe_buf: [4096]u8 = undefined;
-            const n = c.readlink("/proc/self/exe", &exe_buf, exe_buf.len - 1);
-            if (n > 0) {
-                const exe_path = exe_buf[0..@intCast(n)];
+            if (@import("../util/platform.zig").exePath(&exe_buf)) |exe_path| {
                 const exe_dir = std.fs.path.dirname(exe_path) orelse "/usr/bin";
                 const candidates = [_][]const u8{
                     "/../share/sketerm/shell-integration",

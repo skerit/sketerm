@@ -77,7 +77,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     c.gtk_window_set_default_size(@ptrCast(window), 600, 400);
 
     const area = c.gtk_gl_area_new();
-    c.gtk_gl_area_set_use_es(@ptrCast(area), 1); // request OpenGL ES
+    @import("render/gl.zig").requestArea(@ptrCast(area)); // GLES on Linux, GL on macOS
     c.gtk_widget_set_vexpand(area, 1);
     c.gtk_widget_set_hexpand(area, 1);
 

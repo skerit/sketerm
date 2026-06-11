@@ -4895,3 +4895,43 @@ Tests 454 → 466.
   selected. Deleting unbinds a pane that pointed at the name but
   keeps its live values (Pane.unbindPresetName; ownership now keyed
   on hasOwnShaderParams, not just the name).
+
+## 2026-06-12: macOS portability, phase 1 (GL + platform layer + core cross-compile)
+
+- GOAL: husband's Mac. Research: brew GTK4 4.22 + libadwaita are
+  viable (quartz backend, GL renderer); the hard blocker was GL —
+  macOS GDK is desktop-GL-only (4.1 core via CGL), NO GLES, no
+  fallback: gtk_gl_area_set_use_es(1) = black widget.
+- GL portability: all 10 shader sources lost their #version/
+  precision lines; gl.zig injects a per-API header at compileShader
+  (GLES "300 es" w/ precision defaults vs "330 core") via the
+  2-string glShaderSource form. gl.requestArea picks the API per OS
+  (Linux behavior byte-identical: still use_es); gl.adoptAreaApi
+  syncs from the realized GdkGLContext. NEW `zig build smoke-gl-core`
+  compiles every pass pair + dim + crt.glsl under a real desktop-GL
+  3.3 core context (Mesa EGL) — the macOS shader path is proven on
+  Linux. All GLES smokes unchanged-green.
+- New src/util/platform.zig: exePath (/proc/self/exe vs
+  _NSGetExecutablePath+realpath), Wakeup (eventfd vs nonblocking
+  pipe; terminal.zig worker shutdown now uses it), runtimeDir
+  (XDG_RUNTIME_DIR -> TMPDIR -> /tmp; replaces 5 ad-hoc getenv
+  sites), socketCloexec (SOCK_CLOEXEC is Linux-only), exePathZ.
+- vendor/cimport_*.h gated: pty.h + sys/eventfd.h Linux-only;
+  Darwin branch declares openpty/forkpty directly (Zig's bundled
+  darwin headers lack util.h) + sys/random.h. musl timespec shim
+  now inside #ifdef __linux__ (features.h doesn't exist on Darwin).
+- layout.zig cwdOfPid: macOS via proc_pidinfo(PROC_PIDVNODEPATHINFO)
+  with documented struct offsets (UNVERIFIED on hardware).
+- mux_main: SIG_IGN @ptrFromInt(1) hack violated aarch64 fn-pointer
+  alignment -> no-op handler (same EPIPE semantics); Darwin's
+  stdout/stderr translate as inline fns -> fflush(null), write(2,..),
+  std.debug.print.
+- build.zig: use_lld only for Linux targets (macOS wants the
+  self-hosted Mach-O linker); mux-portable's keyed on its own triple.
+- MILESTONE: `zig build mux-portable -Dportable-target=aarch64-macos`
+  produces a native arm64 Mach-O sketerm-mux from this Linux box.
+- 497 tests pass (platform.zig added 2), smoke-mux/cell/image/
+  transparency/gl-core/spike-shell all green, daemon still libc-only.
+- NOT done: GUI build on real hardware (brew GTK + translate-c on
+  Darwin headers is the expected friction), .app bundle, Cmd
+  keybindings. Recipe + friction list in docs/macos.md.

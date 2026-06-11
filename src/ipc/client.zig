@@ -245,8 +245,7 @@ pub fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
         return allocator.dupeZ(u8, std.mem.span(env)) catch null;
     }
     // Exactly one running instance → unambiguous.
-    const rt_raw = c.getenv("XDG_RUNTIME_DIR");
-    const rt: []const u8 = if (rt_raw != null) std.mem.span(rt_raw) else "/tmp";
+    const rt = @import("../util/platform.zig").runtimeDir();
     const dir_z = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm", .{rt}, 0) catch return null;
     defer allocator.free(dir_z);
     const dir = c.g_dir_open(dir_z.ptr, 0, null) orelse return null;

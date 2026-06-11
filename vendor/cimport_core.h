@@ -14,10 +14,12 @@
  * targets the padding is empty and time_t == long, so define the
  * struct ourselves and claim musl's alltypes.h guard. 32-bit musl
  * targets would need a different layout — unsupported. */
+#ifdef __linux__
 #include <features.h>
 #ifndef __GLIBC__
 struct timespec { long tv_sec; long tv_nsec; };
 #define __DEFINED_struct_timespec
+#endif
 #endif
 
 #include <stdio.h>
@@ -28,9 +30,24 @@ struct timespec { long tv_sec; long tv_nsec; };
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
-#include <sys/eventfd.h>
+#ifdef __linux__
+#include <sys/eventfd.h> /* Wakeup fast path (pipe fallback elsewhere) */
+#include <pty.h>         /* openpty/forkpty live here on glibc/musl */
+#else
+/* macOS: openpty/forkpty live in libSystem, but their declaring
+ * header (util.h) ships with the Xcode SDK, not with Zig's bundled
+ * libc headers — declare them directly so Linux→macOS cross builds
+ * work. Symbols resolve at link time. */
+struct termios;
+struct winsize;
+int openpty(int *amaster, int *aslave, char *name,
+            struct termios *termp, struct winsize *winp);
+int forkpty(int *amaster, char *name,
+            struct termios *termp, struct winsize *winp);
+int login_tty(int fd);
+#include <sys/random.h>  /* macOS: getentropy lives here */
+#endif
 #include <termios.h>
-#include <pty.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>

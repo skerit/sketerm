@@ -342,8 +342,7 @@ test "parseTextures: name + path, builtin allowed" {
     try std.testing.expectEqualStrings("sub dir/mask.png", out[1].path());
 }
 
-const VERT_SRC =
-    \\#version 300 es
+pub const VERT_SRC =
     \\in vec2 a_pos;
     \\out vec2 v_uv;
     \\void main() {
@@ -352,9 +351,7 @@ const VERT_SRC =
     \\}
 ;
 
-const FRAG_HEADER =
-    \\#version 300 es
-    \\precision highp float;
+pub const FRAG_HEADER =
     \\in vec2 v_uv;
     \\out vec4 sketerm_frag;
     \\uniform sampler2D iChannel0;
@@ -381,7 +378,7 @@ const FRAG_HEADER =
 // 8-bit rounding scatters the band boundary into imperceptible
 // grain. Static per-pixel (depends only on gl_FragCoord) so it
 // doesn't crawl, and a single scalar across rgb so grays stay gray.
-const FRAG_FOOTER =
+pub const FRAG_FOOTER =
     \\
     \\float sketerm_hash(vec2 p) {
     \\    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -402,7 +399,7 @@ const FRAG_FOOTER =
 /// Built-in identity shader: samples the scene unchanged. The footer
 /// then applies dim/desaturate. Used for the dim-only path (inactive
 /// pane with no custom shader of its own).
-const DIM_IDENTITY_SRC =
+pub const DIM_IDENTITY_SRC =
     \\void mainImage(out vec4 c, in vec2 f) {
     \\    c = texture(iChannel0, f / iResolution.xy);
     \\}

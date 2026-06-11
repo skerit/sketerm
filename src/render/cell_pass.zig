@@ -64,8 +64,7 @@ pub const Instance = extern struct {
 
 // ITALIC_SHEAR = tan(13°) ≈ 0.231: horizontal-shear factor used to
 // fake italics for any monospace font without a second FT face.
-const VERT_SRC =
-    \\#version 300 es
+pub const VERT_SRC =
     \\const float ITALIC_SHEAR = 0.231;
 ++ "\nconst float ATLAS_TEXEL = 1.0 / " ++ std.fmt.comptimePrint("{d}", .{atlas_mod.PAGE_SIZE}) ++ ".0;\n" ++
     \\in vec2 a_cell_xy;
@@ -202,10 +201,7 @@ const VERT_SRC =
 //                    the strip's local y).
 //   WAVE_THICKNESS_PX
 //                  = curly underline line thickness, in pixels.
-const FRAG_SRC = std.fmt.comptimePrint(
-    \\#version 300 es
-    \\precision mediump float;
-    \\precision mediump sampler2DArray;
+pub const FRAG_SRC = std.fmt.comptimePrint(
     \\
     \\const float ATLAS_TEXEL = 1.0 / {d}.0;
     \\const float WAVE_TWO_PI = 6.2831853;

@@ -23,8 +23,7 @@ const StyleEntry = @import("../grid/style_pool.zig").Entry;
 const Cell = @import("../grid/cell.zig").Cell;
 const style_util = @import("style.zig");
 
-const VERT_SRC =
-    \\#version 300 es
+pub const VERT_SRC =
     \\in vec2 a_pos;
     \\in vec3 a_uv; // (u, v, layer)
     \\in vec4 a_color;
@@ -76,10 +75,7 @@ const VERT_SRC =
 
 // ATLAS_TEXEL = 1/PAGE_SIZE — per-texel UV step for the faux-bold
 // left-neighbor sample (see cell_pass.zig comment).
-const FRAG_SRC = std.fmt.comptimePrint(
-    \\#version 300 es
-    \\precision mediump float;
-    \\precision mediump sampler2DArray;
+pub const FRAG_SRC = std.fmt.comptimePrint(
     \\
     \\const float ATLAS_TEXEL = 1.0 / {d}.0;
     \\
