@@ -282,11 +282,18 @@ fn freeClickCtx(user: ?*anyopaque) callconv(.c) void {
     }
 }
 
-fn onRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(ClickCtx, user);
     if (ctx.pre_popup_fn) |f| {
         if (!f(ctx.pre_popup_ctx, ctx.group, x, y)) return;
     }
+    // Claim the event sequence BEFORE popping up. The menu opens on
+    // button PRESS; without the claim, the matching RELEASE keeps
+    // propagating after the popover has mapped and taken its grab,
+    // and the grab logic reads it as a click outside — dismissing
+    // the menu the instant it opened. Timing-dependent, so it
+    // presented as "right-click often does nothing".
+    _ = c.gtk_gesture_set_state(@ptrCast(@alignCast(g)), c.GTK_EVENT_SEQUENCE_CLAIMED);
     // Remote-only rows: visible iff the pre-popup hook enabled the
     // mux actions (i.e. the pane renders a mux session). All three
     // share one fate, so probing "mux-detach" decides for the lot.
