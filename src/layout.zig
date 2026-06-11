@@ -39,6 +39,11 @@ pub const TabSpec = struct {
     pinned: bool = false,
     /// Tab colour swatch as "#RRGGBB"; null = none.
     color: ?[]const u8 = null,
+    /// Whether the user explicitly renamed the tab (OSC titles must
+    /// not overwrite it after restore). null = the file predates the
+    /// field; restore treats those titles as renamed, matching the
+    /// old behaviour where restored titles never followed OSC.
+    title_locked: ?bool = null,
 };
 
 pub const Layout = struct {
@@ -223,7 +228,7 @@ test "round trip preserves TabSpec.pinned" {
         .{ .title = "pinned-tab", .tree = .{ .pane = .{
             .cwd = "/",
             .command = &cmd,
-        } }, .pinned = true },
+        } }, .pinned = true, .title_locked = false },
         .{ .title = "regular", .tree = .{ .pane = .{
             .cwd = "/",
             .command = &cmd,
@@ -235,6 +240,7 @@ test "round trip preserves TabSpec.pinned" {
     defer parsed.deinit();
     try std.testing.expectEqual(true, parsed.value.tabs[0].pinned);
     try std.testing.expectEqual(false, parsed.value.tabs[1].pinned);
+    try std.testing.expectEqual(@as(?bool, false), parsed.value.tabs[0].title_locked);
 }
 
 test "load tolerates older JSON without profile / pinned fields" {
@@ -269,6 +275,8 @@ test "load tolerates older JSON without profile / pinned fields" {
     const parsed = try load(a, file_path);
     defer parsed.deinit();
     try std.testing.expectEqual(false, parsed.value.tabs[0].pinned);
+    // Pre-title_locked file: null means "treat as renamed" on restore.
+    try std.testing.expectEqual(@as(?bool, null), parsed.value.tabs[0].title_locked);
     switch (parsed.value.tabs[0].tree) {
         .pane => |p| try std.testing.expectEqualStrings("", p.profile),
         else => try std.testing.expect(false),
