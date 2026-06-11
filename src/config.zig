@@ -331,6 +331,12 @@ pub const Config = struct {
     /// the default. Round-trip-stable.
     keybinds: std.ArrayList(KeybindEntry) = .empty,
 
+    /// `shader_param.<name> = <float>` overrides for the tunable
+    /// uniforms custom shaders declare via `//@param` lines (glow,
+    /// vignette, curvature, …). Uploaded every frame — a reload
+    /// re-tunes live without recompiling.
+    shader_params: std.ArrayList(@import("render/shader_pass.zig").ParamKV) = .empty,
+
     /// Named profiles. Defined via `[profile.<name>]` sections —
     /// each section's keys override the corresponding global Config
     /// field for panes that select this profile. Order preserved
@@ -399,6 +405,14 @@ pub const Config = struct {
             out.keybinds.appendAssumeCapacity(.{
                 .name = try arena.dupe(u8, kb.name),
                 .accel = try arena.dupe(u8, kb.accel),
+            });
+        }
+        out.shader_params = .empty;
+        try out.shader_params.ensureTotalCapacity(arena, self.shader_params.items.len);
+        for (self.shader_params.items) |sp| {
+            out.shader_params.appendAssumeCapacity(.{
+                .name = try arena.dupe(u8, sp.name),
+                .value = sp.value,
             });
         }
         out.profiles = .empty;
@@ -639,6 +653,11 @@ pub const Config = struct {
         // Custom keybindings — emit one line per non-default override.
         for (self.keybinds.items) |kb| {
             try w.print("keybind.{s} = {s}\n", .{ kb.name, kb.accel });
+        }
+
+        // Shader param overrides.
+        for (self.shader_params.items) |sp| {
+            try w.print("shader_param.{s} = {d}\n", .{ sp.name, sp.value });
         }
 
         // Background opacity.
@@ -928,6 +947,23 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
             }
         }
         try cfg.keybinds.append(arena, .{ .name = name_dup, .accel = accel_dup });
+        return;
+    }
+    // `shader_param.<name> = <float>` — tunable shader uniforms.
+    if (std.mem.startsWith(u8, key, "shader_param.")) {
+        const name = key["shader_param.".len..];
+        if (name.len == 0 or name.len > 31) return error.BadShaderParam;
+        const val = try parseFloat(value);
+        for (cfg.shader_params.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                entry.value = val;
+                return;
+            }
+        }
+        try cfg.shader_params.append(arena, .{
+            .name = try arena.dupe(u8, name),
+            .value = val,
+        });
         return;
     }
     if (std.mem.eql(u8, key, "font")) {
@@ -1397,6 +1433,31 @@ test "config: profile custom_shader parses and round-trips" {
     var cl = try cfg.clone(std.testing.allocator);
     defer cl.deinit();
     try std.testing.expectEqualStrings("/tmp/crt.glsl", cl.profiles.items[0].custom_shader);
+}
+
+test "config: shader_param.<name> entries parse, dedupe, round-trip, clone" {
+    const src =
+        "shader_param.glow = 1.25\n" ++
+        "shader_param.curvature = 0\n" ++
+        "shader_param.glow = 0.8\n"; // later line wins
+    var cfg = try Config.loadFromBytes(std.testing.allocator, src);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cfg.shader_params.items.len);
+    try std.testing.expectEqualStrings("glow", cfg.shader_params.items[0].name);
+    try std.testing.expectEqual(@as(f32, 0.8), cfg.shader_params.items[0].value);
+    try std.testing.expectEqual(@as(f32, 0.0), cfg.shader_params.items[1].value);
+
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    var re = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer re.deinit();
+    try std.testing.expectEqual(@as(usize, 2), re.shader_params.items.len);
+    try std.testing.expectEqual(@as(f32, 0.8), re.shader_params.items[0].value);
+
+    var cl = try cfg.clone(std.testing.allocator);
+    defer cl.deinit();
+    try std.testing.expectEqualStrings("curvature", cl.shader_params.items[1].name);
 }
 
 test "config: show_titlebar / show_tab_bar round-trip" {

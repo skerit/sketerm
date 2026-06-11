@@ -323,6 +323,36 @@ pub fn main() !u8 {
             std.debug.print("smoke-cell: FAIL — crt-amber shader output wrong\n", .{});
             return 10;
         }
+
+        // shader_param override path: mono=0 keeps the original
+        // colors, so the phosphor-amber count must collapse (the
+        // green/red/cyan test text stops being warm). Same program,
+        // no recompile — overrides upload per frame.
+        const ParamKV = @import("render/shader_pass.zig").ParamKV;
+        const flat = [_]ParamKV{.{ .name = "mono", .value = 0.0 }};
+        shader_src.overrides = &flat;
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, sp.fbo);
+        c.glViewport(0, 0, W, H);
+        c.glClearColor(0.05, 0.05, 0.08, 1.0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+        cell_pass.draw(atlas.?, W, H);
+        grid_pass.draw(atlas.?, W, H);
+        sp.finish(W, H, 0.6);
+        c.glFinish();
+        c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+        var amber2: usize = 0;
+        var k: usize = 0;
+        while (k < fb_bytes) : (k += 4) {
+            const r: i32 = fb[k + 0];
+            const g: i32 = fb[k + 1];
+            const b: i32 = fb[k + 2];
+            if (r > 60 and r > g and g > b + 10) amber2 += 1;
+        }
+        std.debug.print("smoke-cell: crt mono-override amber={d} (was {d})\n", .{ amber2, amber });
+        if (amber2 * 2 >= amber) {
+            std.debug.print("smoke-cell: FAIL — shader_param override did not reach the GPU\n", .{});
+            return 11;
+        }
     }
 
     std.debug.print("smoke-cell: PASS\n", .{});

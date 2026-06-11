@@ -4560,3 +4560,23 @@ Tests 454 → 466.
   startup restores last.json and panes get profile="" (bit me — the
   "missing" compile error was a test-setup bug, not a code bug).
   Kill test daemons via lsof -t on their mux.sock, never pkill.
+
+## 2026-06-11 (night): tunable shader params (cool-retro-term style)
+
+- Shaders declare knobs via `//@param <name> <default>` + a matching
+  `uniform float <name>;`. parseParams (pure, unit-tested) runs at
+  program build; locations cached; values uploaded EVERY finish() —
+  `shader_param.<name> = <float>` config overrides apply live on
+  SIGUSR1/prefs reload, no recompile. Source.overrides points into
+  the CONFIG ARENA: re-pointed unconditionally in applyConfigChange
+  (window source + every pane's shader_own) or it dangles after the
+  arena swap — reload-storm tested (5x SIGUSR1, stable).
+- Shipped CRT shaders converted from #defines to params: curvature,
+  scanlines, glow, vignette, flicker, mono (mono=0 keeps original
+  colors). smoke-cell asserts BOTH paths under real GL: defaults
+  (corner dark ⟺ curvature uniform arrived) and overrides (mono=0
+  collapses amber 1521 → 264).
+- GOTCHA (cost a debug round): `zig build test`/`smoke-cell` do NOT
+  rebuild zig-out/bin/sketerm — a live-test after config.zig edits
+  ran a stale GUI and printed "unknown key", looking like a parse
+  bug. Plain `zig build` first, then live-test.

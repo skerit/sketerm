@@ -24,7 +24,76 @@ pub const Source = struct {
     animate: bool = false,
     /// Bumped on every change; panes recompile lazily.
     generation: u32 = 0,
+    /// Config-driven `shader_param.<name>` overrides for the
+    /// shader's tunable uniforms. Points into the live Config (the
+    /// Window re-points it on every reload); values are read each
+    /// frame, so changes apply live without recompiling.
+    overrides: []const ParamKV = &.{},
 };
+
+/// One `shader_param.<name> = <value>` config entry.
+pub const ParamKV = struct {
+    name: []const u8,
+    value: f32,
+};
+
+pub const MAX_PARAMS = 16;
+
+/// A tunable uniform declared by the shader via a default line:
+///   //@param <name> <default>
+/// The shader also declares `uniform float <name>;` and uses it.
+pub const Param = struct {
+    name_buf: [32]u8 = undefined,
+    name_len: u8 = 0,
+    default_value: f32 = 0,
+    /// Uniform location in the built program; -1 = absent/unused.
+    loc: c_int = -1,
+
+    pub fn name(self: *const Param) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
+/// Scan shader source for `//@param name default` lines. Pure —
+/// unit-tested without GL. Malformed lines are skipped; at most
+/// MAX_PARAMS are collected.
+pub fn parseParams(src: []const u8, out: *[MAX_PARAMS]Param) usize {
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line_raw| {
+        if (count >= MAX_PARAMS) break;
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        const marker = "//@param ";
+        if (!std.mem.startsWith(u8, line, marker)) continue;
+        var it = std.mem.tokenizeAny(u8, line[marker.len..], " \t");
+        const pname = it.next() orelse continue;
+        const pdefault = it.next() orelse continue;
+        if (pname.len == 0 or pname.len > 31) continue;
+        const val = std.fmt.parseFloat(f32, pdefault) catch continue;
+        var p = Param{ .default_value = val, .name_len = @intCast(pname.len) };
+        @memcpy(p.name_buf[0..pname.len], pname);
+        out[count] = p;
+        count += 1;
+    }
+    return count;
+}
+
+test "parseParams: extracts name/default, skips malformed" {
+    const src =
+        "// a comment\n" ++
+        "//@param glow 0.55\n" ++
+        "  //@param vignette 0.28  // trailing words ignored\n" ++
+        "//@param broken\n" ++
+        "//@param bad_value abc\n" ++
+        "uniform float glow;\n";
+    var params: [MAX_PARAMS]Param = undefined;
+    const n = parseParams(src, &params);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("glow", params[0].name());
+    try std.testing.expectEqual(@as(f32, 0.55), params[0].default_value);
+    try std.testing.expectEqualStrings("vignette", params[1].name());
+    try std.testing.expectEqual(@as(f32, 0.28), params[1].default_value);
+}
 
 const VERT_SRC =
     \\#version 300 es
@@ -81,6 +150,9 @@ pub const ShaderPass = struct {
     prev_fbo: c_int = 0,
     /// Window-owned shared source. Null until the Window wires it.
     source: ?*const Source = null,
+    /// Tunable uniforms parsed from `//@param` lines at build time.
+    params: [MAX_PARAMS]Param = undefined,
+    params_len: usize = 0,
 
     pub fn forgetGL(self: *ShaderPass) void {
         self.program = 0;
@@ -146,6 +218,17 @@ pub const ShaderPass = struct {
         self.u_time_delta = c.glGetUniformLocation(self.program, "iTimeDelta");
         self.u_frame = c.glGetUniformLocation(self.program, "iFrame");
 
+        // Tunable uniforms: //@param declarations → locations. A
+        // param whose uniform got optimized out keeps loc -1 and is
+        // skipped at upload.
+        self.params_len = parseParams(user, &self.params);
+        for (self.params[0..self.params_len]) |*p| {
+            var name_z: [33]u8 = undefined;
+            @memcpy(name_z[0..p.name_len], p.name());
+            name_z[p.name_len] = 0;
+            p.loc = c.glGetUniformLocation(self.program, @ptrCast(&name_z));
+        }
+
         if (self.vao == 0) {
             const quad = [_]f32{ -1, -1, 3, -1, -1, 3 }; // fullscreen triangle
             c.glGenVertexArrays(1, &self.vao);
@@ -208,6 +291,21 @@ pub const ShaderPass = struct {
         c.glUniform1f(self.u_time, time_s);
         c.glUniform1f(self.u_time_delta, @max(0.0, time_s - self.last_time_s));
         c.glUniform1i(self.u_frame, self.frame_counter);
+        // Tunable params: shader default, overridden by any matching
+        // `shader_param.<name>` config entry. Uploaded every frame so
+        // a config reload re-tunes live without recompiling.
+        const overrides: []const ParamKV = if (self.source) |s| s.overrides else &.{};
+        for (self.params[0..self.params_len]) |p| {
+            if (p.loc < 0) continue;
+            var value = p.default_value;
+            for (overrides) |kv| {
+                if (std.mem.eql(u8, kv.name, p.name())) {
+                    value = kv.value;
+                    break;
+                }
+            }
+            c.glUniform1f(p.loc, value);
+        }
         self.last_time_s = time_s;
         self.frame_counter +%= 1;
         c.glBindVertexArray(self.vao);

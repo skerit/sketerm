@@ -1924,6 +1924,7 @@ pub const Window = struct {
         // The user pick is sticky — config reloads / profile pushes
         // leave it alone.
         pane.shader_default_source = &self.shader_source;
+        pane.shader_own.overrides = self.config.shader_params.items;
         if (!pane.custom_shader_user) {
             const prof_shader: []const u8 = if (profile) |p| p.custom_shader else "";
             _ = pane.setCustomShader(
@@ -2648,12 +2649,15 @@ pub const Window = struct {
             self.refreshBgSource();
         }
 
-        // Custom shader: re-read the file only when its keys moved.
+        // Custom shader: re-read the file only when its keys moved —
+        // but ALWAYS re-point the param overrides, which live in the
+        // config arena that gets freed when this function returns.
         if (!std.mem.eql(u8, old_cfg.custom_shader, self.config.custom_shader) or
             old_cfg.custom_shader_animation != self.config.custom_shader_animation)
         {
             self.refreshShaderSource();
         }
+        self.shader_source.overrides = self.config.shader_params.items;
 
         // Push into every pane.
         const eff = self.resolveDefaultColors();
@@ -2759,6 +2763,31 @@ pub const Window = struct {
                 break :blk if (self.config.font_family.len > 0) self.config.font_family else null;
             };
             p.font_features = if (self.config.font_features.len > 0) self.config.font_features else null;
+            // Shader state: the overrides slice points into the
+            // config arena (about to be freed) — re-point it
+            // UNCONDITIONALLY, then re-resolve profile/global shader
+            // for panes without a sticky user pick.
+            p.shader_default_source = &self.shader_source;
+            p.shader_own.overrides = self.config.shader_params.items;
+            if (!p.custom_shader_user) {
+                const prof_shader: []const u8 = blk: {
+                    if (p.active_profile) |pn| {
+                        for (self.config.profiles.items) |*pr| {
+                            if (std.mem.eql(u8, pr.name, pn) and pr.custom_shader.len > 0)
+                                break :blk pr.custom_shader;
+                        }
+                    }
+                    break :blk "";
+                };
+                _ = p.setCustomShader(
+                    if (prof_shader.len > 0) prof_shader else null,
+                    self.config.custom_shader_animation,
+                    false,
+                );
+            } else {
+                p.shader_own.animate = self.config.custom_shader_animation;
+            }
+            p.refreshShaderBinding();
             // Mouse / link / autohide flags on the Pane itself.
             p.copy_on_selection = self.config.copy_on_selection;
             p.clear_select_on_copy = self.config.clear_select_on_copy;
@@ -3279,6 +3308,7 @@ pub const Window = struct {
             self.shader_source.src = null;
         }
         self.shader_source.animate = self.config.custom_shader_animation;
+        self.shader_source.overrides = self.config.shader_params.items;
 
         const path = self.config.custom_shader;
         if (path.len > 0) blk: {
