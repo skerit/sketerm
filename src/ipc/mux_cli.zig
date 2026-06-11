@@ -179,9 +179,18 @@ fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, 
     };
     defer allocator.free(sock);
 
+    // Inside a sketerm pane (SKETERM_PANE_ID in the env), attach/new
+    // take over THIS pane instead of opening a tab — running
+    // `sketerm mux` in a pane and picking a session should behave
+    // like `tmux attach`, not spawn windows elsewhere.
+    const self_pane: ?u32 = blk: {
+        const env = c.getenv("SKETERM_PANE_ID") orelse break :blk null;
+        break :blk std.fmt.parseInt(u32, std.mem.span(@as([*:0]const u8, @ptrCast(env))), 10) catch null;
+    };
+
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    std.json.Stringify.value(.{ .cmd = cmd, .data = data, .host = host }, .{}, &aw.writer) catch return false;
+    std.json.Stringify.value(.{ .cmd = cmd, .data = data, .host = host, .pane = self_pane }, .{}, &aw.writer) catch return false;
     aw.writer.writeAll("\n") catch return false;
 
     const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0);

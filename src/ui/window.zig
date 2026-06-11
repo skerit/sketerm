@@ -2414,6 +2414,13 @@ pub const Window = struct {
     /// Spawn a shell session in the daemon (local or `host`'s) and
     /// attach it as a tab.
     pub fn newDurableTab(self: *Window, host: ?[]const u8) !void {
+        try self.newDurableSession(host, null);
+    }
+
+    /// Spawn a fresh session on the daemon and attach it — into a new
+    /// tab, or into `takeover`'s slot when the request came from a
+    /// `sketerm mux` CLI running inside that pane.
+    pub fn newDurableSession(self: *Window, host: ?[]const u8, takeover: ?*Pane) !void {
         var name_buf: [64]u8 = undefined;
         // Unique-enough name: pid + monotonic counter.
         self.tab_counter += 1;
@@ -2444,12 +2451,19 @@ pub const Window = struct {
             });
             (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
         }
-        try self.attachMuxTab(conn, name, host);
+        try self.attachMux(conn, name, host, takeover);
     }
 
-    /// Attach `conn` to session `name` and wrap it in a new tab.
-    /// Takes ownership of `conn` on success AND failure.
     pub fn attachMuxTab(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8) !void {
+        try self.attachMux(conn_in, name, host, null);
+    }
+
+    /// Attach `conn` to session `name` — wrapped in a new tab, or
+    /// replacing `takeover`'s spot in its split tree (the pane the
+    /// `sketerm mux` CLI was invoked from; its shell — including that
+    /// CLI — is torn down once the remote pane is in place).
+    /// Takes ownership of `conn` on success AND failure.
+    pub fn attachMux(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane) !void {
         var conn = conn_in;
 
         const term = blk: {
@@ -2478,18 +2492,68 @@ pub const Window = struct {
         pane.win_on_cwd = onTermCwdChanged;
         pane.win_title_ctx = @ptrCast(self);
         pane.win_on_title = onTermTitleChanged;
-
-        const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-        c.gtk_widget_set_hexpand(wrapper, 1);
-        c.gtk_widget_set_vexpand(wrapper, 1);
-        c.gtk_box_append(@ptrCast(wrapper), pane.widget());
+        // Fonts, colors, padding, palette — same push every other
+        // pane-creation path gets. Must happen before the widget
+        // enters the tree (realize builds the atlas from pane state).
+        self.applyPaneConfig(pane, .{});
 
         var title_buf: [160:0]u8 = undefined;
         const title_z = if (host) |h|
             std.fmt.bufPrintZ(&title_buf, "⌁ {s} @ {s}", .{ name, h }) catch "mux"
         else
             std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{name}) catch "mux";
-        const page = self.appendOrInsertTab(wrapper);
+
+        const page = if (takeover) |old| blk: {
+            const page = tabPageForPane(self, old) orelse return error.PaneHasNoTab;
+            const old_w = old.widget();
+            const parent = c.gtk_widget_get_parent(old_w) orelse return error.PaneHasNoTab;
+            const is_paned = c.g_type_check_instance_is_a(
+                @ptrCast(@alignCast(parent)),
+                c.gtk_paned_get_type(),
+            ) != 0;
+            // Drop the new pane into the old one's slot. Replacing /
+            // removing the child destroys old_w's widget subtree;
+            // Zig-side teardown is deferred below.
+            if (is_paned) {
+                if (c.gtk_paned_get_start_child(@ptrCast(parent)) == old_w) {
+                    c.gtk_paned_set_start_child(@ptrCast(parent), pane.widget());
+                } else {
+                    c.gtk_paned_set_end_child(@ptrCast(parent), pane.widget());
+                }
+            } else {
+                c.gtk_box_remove(@ptrCast(parent), old_w);
+                c.gtk_box_append(@ptrCast(parent), pane.widget());
+            }
+
+            // Same bookkeeping as closeFocusedPane: drop window-level
+            // pointers into the dying pane, unlist it, fence its
+            // sinks, defer the actual deinit past GTK's destroy chain.
+            if (self.search_pane == old) self.closeSearch();
+            if (self.hints_pane == old) self.exitHints();
+            if (self.copymode_pane == old) self.exitCopyMode();
+            for (self.panes.items, 0..) |p, idx| {
+                if (p == old) {
+                    _ = self.panes.orderedRemove(idx);
+                    break;
+                }
+            }
+            const old_term = old.terminal;
+            for (self.terminals.items, 0..) |t, ti| {
+                if (t == old_term) {
+                    _ = self.terminals.orderedRemove(ti);
+                    break;
+                }
+            }
+            old_term.clearSinks();
+            schedulePaneTeardown(old, old_term);
+            break :blk page;
+        } else blk: {
+            const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+            c.gtk_widget_set_hexpand(wrapper, 1);
+            c.gtk_widget_set_vexpand(wrapper, 1);
+            c.gtk_box_append(@ptrCast(wrapper), pane.widget());
+            break :blk self.appendOrInsertTab(wrapper);
+        };
         c.adw_tab_page_set_title(page, title_z.ptr);
         c.adw_tab_page_set_tooltip(page, title_z.ptr);
 
@@ -2553,22 +2617,27 @@ pub const Window = struct {
     pub fn setTabColor(self: *Window, page: *c.AdwTabPage, rgb: ?[3]u8) void {
         _ = self;
         if (rgb) |col| {
-            var px: [16 * 16 * 4]u8 = undefined;
-            for (0..16) |yy| {
-                for (0..16) |xx| {
-                    const dx = @as(f32, @floatFromInt(xx)) - 7.5;
-                    const dy = @as(f32, @floatFromInt(yy)) - 7.5;
-                    const inside = dx * dx + dy * dy <= 7.0 * 7.0;
-                    const o = (yy * 16 + xx) * 4;
+            // 4× supersampled disc with a soft rim, like the progress
+            // ring — a raw 16px circle renders visibly jagged.
+            const S = 64;
+            const ctr = (@as(f32, S) - 1.0) / 2.0;
+            var px: [S * S * 4]u8 = undefined;
+            for (0..S) |yy| {
+                for (0..S) |xx| {
+                    const dx = @as(f32, @floatFromInt(xx)) - ctr;
+                    const dy = @as(f32, @floatFromInt(yy)) - ctr;
+                    const r = @sqrt(dx * dx + dy * dy);
+                    const cov = std.math.clamp(28.0 - r + 0.5, 0.0, 1.0);
+                    const o = (yy * S + xx) * 4;
                     px[o + 0] = col[0];
                     px[o + 1] = col[1];
                     px[o + 2] = col[2];
-                    px[o + 3] = if (inside) 255 else 0;
+                    px[o + 3] = @intFromFloat(255.0 * cov);
                 }
             }
             const bytes = c.g_bytes_new(&px, px.len);
             defer c.g_bytes_unref(bytes);
-            const tex = c.gdk_memory_texture_new(16, 16, c.GDK_MEMORY_R8G8B8A8, bytes, 16 * 4) orelse return;
+            const tex = c.gdk_memory_texture_new(S, S, c.GDK_MEMORY_R8G8B8A8, bytes, S * 4) orelse return;
             c.adw_tab_page_set_icon(page, @ptrCast(@alignCast(tex)));
             c.g_object_unref(tex);
             const packed_val: usize = (1 << 24) |
@@ -2603,30 +2672,40 @@ pub const Window = struct {
             0.75 * std.math.tau
         else
             @as(f32, @floatFromInt(percent)) / 100.0 * std.math.tau;
-        var px: [16 * 16 * 4]u8 = undefined;
-        for (0..16) |yy| {
-            for (0..16) |xx| {
-                const dx = @as(f32, @floatFromInt(xx)) - 7.5;
-                const dy = @as(f32, @floatFromInt(yy)) - 7.5;
+        // Rendered at 4× the display size with soft edges; GTK's
+        // downscale does the rest. Drawing at 16px directly gives a
+        // visibly lumpy ring.
+        const S = 64;
+        const ctr = (@as(f32, S) - 1.0) / 2.0;
+        const r_out = 30.0;
+        const r_in = 18.0;
+        var px: [S * S * 4]u8 = undefined;
+        for (0..S) |yy| {
+            for (0..S) |xx| {
+                const dx = @as(f32, @floatFromInt(xx)) - ctr;
+                const dy = @as(f32, @floatFromInt(yy)) - ctr;
                 const r = @sqrt(dx * dx + dy * dy);
-                const o = (yy * 16 + xx) * 4;
+                const o = (yy * S + xx) * 4;
                 px[o + 0] = color[0];
                 px[o + 1] = color[1];
                 px[o + 2] = color[2];
-                if (r < 4.5 or r > 7.5) {
-                    px[o + 3] = 0;
-                } else {
-                    // Angle from 12 o'clock, clockwise; the unfilled
-                    // remainder stays as a faint track.
-                    var ang = std.math.atan2(dx, -dy);
-                    if (ang < 0) ang += std.math.tau;
-                    px[o + 3] = if (ang <= turn) 255 else 56;
-                }
+                // Radial coverage: 1 inside the annulus, fading over
+                // ~1px at both rims.
+                const cov = std.math.clamp(@min(r_out - r, r - r_in) + 0.5, 0.0, 1.0);
+                // Angle from 12 o'clock, clockwise. The unfilled
+                // remainder stays as a faint track; the arc tip gets
+                // a ~1px angular feather (scaled by radius so the
+                // feather width is constant in pixels).
+                var ang = std.math.atan2(dx, -dy);
+                if (ang < 0) ang += std.math.tau;
+                const fill = std.math.clamp((turn - ang) * @max(r, 1.0) + 0.5, 0.0, 1.0);
+                const a = (56.0 + fill * (255.0 - 56.0)) * cov;
+                px[o + 3] = @intFromFloat(a);
             }
         }
         const bytes = c.g_bytes_new(&px, px.len);
         defer c.g_bytes_unref(bytes);
-        const tex = c.gdk_memory_texture_new(16, 16, c.GDK_MEMORY_R8G8B8A8, bytes, 16 * 4) orelse return;
+        const tex = c.gdk_memory_texture_new(S, S, c.GDK_MEMORY_R8G8B8A8, bytes, S * 4) orelse return;
         c.adw_tab_page_set_indicator_icon(page, @ptrCast(@alignCast(tex)));
         c.g_object_unref(tex);
         const packed_val: usize = (1 << 24) | (@as(usize, state) << 8) | percent;
@@ -2848,12 +2927,23 @@ pub const Window = struct {
             c.adw_tab_page_set_tooltip(page, z.ptr);
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (eql(u8, req.cmd, "new-durable-tab")) {
-            self.newDurableTab(req.host) catch return ipc_protocol.writeErr(out, allocator, "durable spawn failed (ssh/key auth?)");
+            // req.pane set = the CLI runs inside that pane (SKETERM_
+            // PANE_ID): the session takes the pane over, tmux-style,
+            // instead of opening a tab.
+            const takeover: ?*Pane = if (req.pane != null)
+                self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane")
+            else
+                null;
+            self.newDurableSession(req.host, takeover) catch return ipc_protocol.writeErr(out, allocator, "durable spawn failed (ssh/key auth?)");
             try ipc_protocol.writeOk(out, allocator, "pane", self.next_pane_id - 1);
         } else if (eql(u8, req.cmd, "attach-session")) {
             const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "attach-session requires data (session name)");
+            const takeover: ?*Pane = if (req.pane != null)
+                self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane")
+            else
+                null;
             const conn = self.muxConnect(req.host) catch return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
-            self.attachMuxTab(conn, name, req.host) catch return ipc_protocol.writeErr(out, allocator, "attach failed (no such session?)");
+            self.attachMux(conn, name, req.host, takeover) catch return ipc_protocol.writeErr(out, allocator, "attach failed (no such session?)");
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (eql(u8, req.cmd, "set-tab-color")) {
             const page = self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
