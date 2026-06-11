@@ -17,6 +17,7 @@ const ipc_server = @import("../ipc/server.zig");
 const bg_pass_mod = @import("../render/bg_pass.zig");
 const ipc_protocol = @import("../ipc/protocol.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
+const Screen = @import("../grid/screen.zig").Screen;
 
 /// One-shot hint. Reset to false at startup; flipped on first
 /// `always_on_top = true` so we don't spam the log on every
@@ -36,6 +37,17 @@ pub const ClosedTab = struct {
     title: []const u8,
     cwd: ?[]const u8 = null,
     profile_name: ?[]const u8 = null,
+};
+
+/// One OSC 99 notification that may still be activated from the
+/// desktop. `id` is the sanitized protocol identifier (owned),
+/// echoed back in the activation report.
+const NotifySlot = struct {
+    token: u32,
+    pane: *Pane,
+    id: []u8,
+    want_report: bool,
+    want_focus: bool,
 };
 
 /// Owned ratio holder for `applyPanedRatio` / `applyPanedRatioMap` /
@@ -121,6 +133,11 @@ pub const Window = struct {
     next_pane_id: u32 = 1,
     next_tab_id: u32 = 1,
     ipc: ?*ipc_server.Server = null,
+    /// OSC 99 notifications awaiting a possible activation: token →
+    /// originating pane + sanitized id (owned). Bounded ring — oldest
+    /// evicted at 32; entries for closing panes dropped in unlistPane.
+    notify_slots: std.ArrayList(NotifySlot) = .empty,
+    next_notify_token: u32 = 1,
     /// Shared background-layer source (one image decode for every
     /// pane). Panes hold a pointer; refreshBgSource mutates + bumps
     /// the generation.
@@ -387,6 +404,27 @@ pub const Window = struct {
         c.g_action_map_add_action(@ptrCast(@alignCast(app_window)), @ptrCast(new_tab_action));
         c.g_object_unref(new_tab_action);
 
+        // App-scoped action for desktop-notification activation (GIO
+        // requires "app." actions on GNotifications). Target (uu) =
+        // (slot token, button number; 0 = the notification body).
+        if (app) |a| {
+            if (c.g_action_map_lookup_action(@ptrCast(a), "notify-act") == null) {
+                const vt = c.g_variant_type_new("(uu)");
+                defer c.g_variant_type_free(vt);
+                const act = c.g_simple_action_new("notify-act", vt);
+                _ = c.g_signal_connect_data(
+                    act,
+                    "activate",
+                    @ptrCast(&onNotifyActivate),
+                    @ptrCast(self),
+                    null,
+                    c.G_CONNECT_DEFAULT,
+                );
+                c.g_action_map_add_action(@ptrCast(a), @ptrCast(act));
+                c.g_object_unref(act);
+            }
+        }
+
         // Move keyboard focus to the newly selected tab's pane.
         _ = c.g_signal_connect_data(
             tab_view_w,
@@ -485,6 +523,8 @@ pub const Window = struct {
         for (self.panes.items) |p| p.deinit();
         self.panes.deinit(self.allocator);
         self.terminals.deinit(self.allocator);
+        for (self.notify_slots.items) |slot| self.allocator.free(slot.id);
+        self.notify_slots.deinit(self.allocator);
         self.search_matches.deinit(self.allocator);
         @import("hints.zig").freeMatches(self.allocator, self.hint_matches);
         self.allocator.free(self.hint_matches);
@@ -1464,6 +1504,7 @@ pub const Window = struct {
         if (self.search_pane == pane) self.closeSearch();
         if (self.hints_pane == pane) self.exitHints();
         if (self.copymode_pane == pane) self.exitCopyMode();
+        self.dropNotifySlotsForPane(pane);
         for (self.panes.items, 0..) |p, idx| {
             if (p == pane) {
                 _ = self.panes.orderedRemove(idx);
@@ -2414,6 +2455,43 @@ pub const Window = struct {
         const id = self.next_pane_id;
         self.next_pane_id += 1;
         return id;
+    }
+
+    /// Park an interactive OSC 99 notification so its desktop
+    /// activation can find the pane + identifier later. Bounded:
+    /// the oldest slot is evicted at 32. Returns the slot token.
+    fn registerNotifySlot(self: *Window, pane: *Pane, ev: Screen.NotificationEvent) ?u32 {
+        const id_copy = self.allocator.dupe(u8, ev.id) catch return null;
+        if (self.notify_slots.items.len >= 32) {
+            const old = self.notify_slots.orderedRemove(0);
+            self.allocator.free(old.id);
+        }
+        const token = self.next_notify_token;
+        self.next_notify_token +%= 1;
+        if (self.next_notify_token == 0) self.next_notify_token = 1;
+        self.notify_slots.append(self.allocator, .{
+            .token = token,
+            .pane = pane,
+            .id = id_copy,
+            .want_report = ev.want_report,
+            .want_focus = ev.want_focus,
+        }) catch {
+            self.allocator.free(id_copy);
+            return null;
+        };
+        return token;
+    }
+
+    fn dropNotifySlotsForPane(self: *Window, pane: *Pane) void {
+        var i: usize = 0;
+        while (i < self.notify_slots.items.len) {
+            if (self.notify_slots.items[i].pane == pane) {
+                const slot = self.notify_slots.orderedRemove(i);
+                self.allocator.free(slot.id);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     fn tabPageId(page: *c.AdwTabPage) u32 {
@@ -4430,23 +4508,157 @@ fn tabPageForPane(self: *Window, pane: *Pane) ?*c.AdwTabPage {
     return null;
 }
 
-fn onTermNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {
+/// Stable GNotification tag for an OSC 99 identifier, so a repeated
+/// id replaces the previous notification and p=close can withdraw
+/// it. Null (untagged) when the app supplied no id.
+fn notifyTag(buf: []u8, id: []const u8) ?[*:0]const u8 {
+    if (id.len == 0) return null;
+    const z = std.fmt.bufPrintZ(buf, "sketerm-osc99-{s}", .{id}) catch return null;
+    return z.ptr;
+}
+
+fn onTermNotification(ctx: ?*anyopaque, pane: *Pane, ev: Screen.NotificationEvent) void {
     const self = cast.userData(Window, ctx);
     const app = c.gtk_window_get_application(@ptrCast(self.app_window));
     if (app == null) return;
-    // Title fallback so the notification widget isn't empty.
-    const effective_title = if (title.len > 0) title else "sketerm";
+    var tag_buf: [96]u8 = undefined;
+
+    if (ev.close) {
+        if (notifyTag(&tag_buf, ev.id)) |tag| {
+            c.g_application_withdraw_notification(@ptrCast(app), tag);
+        }
+        return;
+    }
+
+    // Occasion gate: `unfocused` = skip while this window is active;
+    // `invisible` additionally requires the pane's tab to be the
+    // selected one (i.e. the pane is actually on screen).
+    const win_active = c.gtk_window_is_active(@ptrCast(self.app_window)) != 0;
+    switch (ev.occasion) {
+        .always => {},
+        .unfocused => if (win_active) return,
+        .invisible => if (win_active) {
+            const page = tabPageForPane(self, pane);
+            if (page != null and page == c.adw_tab_view_get_selected_page(self.tab_view)) return;
+        },
+    }
+
+    const effective_title = if (ev.title.len > 0) ev.title else "sketerm";
     const title_z = self.allocator.allocSentinel(u8, effective_title.len, 0) catch return;
     defer self.allocator.free(title_z);
     @memcpy(title_z, effective_title);
-    const body_z = self.allocator.allocSentinel(u8, body.len, 0) catch return;
-    defer self.allocator.free(body_z);
-    @memcpy(body_z, body);
     const notif = c.g_notification_new(title_z.ptr);
     if (notif == null) return;
     defer c.g_object_unref(notif);
-    if (body.len > 0) c.g_notification_set_body(notif, body_z.ptr);
-    c.g_application_send_notification(@ptrCast(app), null, notif);
+
+    if (ev.body.len > 0) {
+        const body_z = self.allocator.allocSentinel(u8, ev.body.len, 0) catch return;
+        defer self.allocator.free(body_z);
+        @memcpy(body_z, ev.body);
+        c.g_notification_set_body(notif, body_z.ptr);
+    }
+
+    // Icon: themed name wins when the theme has it; otherwise the
+    // transmitted image bytes (PNG/JPEG/GIF — the notification daemon
+    // decodes them from the serialized GBytesIcon).
+    if (ev.icon_name.len > 0) {
+        var name_buf: [128]u8 = undefined;
+        if (std.fmt.bufPrintZ(&name_buf, "{s}", .{ev.icon_name})) |name_z| {
+            const icon = c.g_themed_icon_new(name_z.ptr);
+            c.g_notification_set_icon(notif, @ptrCast(icon));
+            c.g_object_unref(icon);
+        } else |_| {}
+    } else if (ev.icon_data.len > 0) {
+        const bytes = c.g_bytes_new(ev.icon_data.ptr, ev.icon_data.len);
+        const icon = c.g_bytes_icon_new(bytes);
+        c.g_bytes_unref(bytes);
+        c.g_notification_set_icon(notif, @ptrCast(icon));
+        c.g_object_unref(icon);
+    }
+
+    if (ev.urgency) |u| {
+        c.g_notification_set_priority(notif, switch (u) {
+            0 => c.G_NOTIFICATION_PRIORITY_LOW,
+            2 => c.G_NOTIFICATION_PRIORITY_URGENT,
+            else => c.G_NOTIFICATION_PRIORITY_NORMAL,
+        });
+    }
+
+    // Activation slot — needed for reports AND for focusing the
+    // originating pane. Plain notifications skip the bookkeeping.
+    const interactive = ev.want_report or ev.buttons_raw.len > 0 or ev.want_focus;
+    var token: u32 = 0;
+    if (interactive) {
+        token = self.registerNotifySlot(pane, ev) orelse 0;
+    }
+    if (token != 0) {
+        c.g_notification_set_default_action_and_target(
+            notif,
+            "app.notify-act",
+            "(uu)",
+            token,
+            @as(c_uint, 0),
+        );
+        // Buttons: U+2028-separated labels, numbered from 1 in
+        // activation reports. Cap at 8 — desktop daemons show 2-3.
+        var n_btn: c_uint = 0;
+        var bit = std.mem.splitSequence(u8, ev.buttons_raw, "\xe2\x80\xa8");
+        while (bit.next()) |label| {
+            if (label.len == 0) continue;
+            if (n_btn >= 8) break;
+            n_btn += 1;
+            const label_z = self.allocator.allocSentinel(u8, label.len, 0) catch break;
+            defer self.allocator.free(label_z);
+            @memcpy(label_z, label);
+            c.g_notification_add_button_with_target(
+                notif,
+                label_z.ptr,
+                "app.notify-act",
+                "(uu)",
+                token,
+                n_btn,
+            );
+        }
+    }
+
+    c.g_application_send_notification(@ptrCast(app), notifyTag(&tag_buf, ev.id), notif);
+}
+
+/// Activation report / focus dispatch for "app.notify-act". Fired by
+/// the desktop when the user clicks an OSC 99 notification (button 0)
+/// or one of its buttons (1-based).
+fn onNotifyActivate(_: *c.GSimpleAction, param: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Window, user);
+    if (param == null) return;
+    var token: c_uint = 0;
+    var button: c_uint = 0;
+    c.g_variant_get(param, "(uu)", &token, &button);
+
+    const slot = blk: {
+        for (self.notify_slots.items) |s| {
+            if (s.token == token) break :blk s;
+        }
+        return; // pane closed, or slot evicted — nothing to do
+    };
+
+    if (slot.want_focus) {
+        c.gtk_window_present(@ptrCast(self.app_window));
+        if (tabPageForPane(self, slot.pane)) |page| {
+            c.adw_tab_view_set_selected_page(self.tab_view, page);
+        }
+        _ = c.gtk_widget_grab_focus(@ptrCast(slot.pane.area));
+    }
+    if (slot.want_report) {
+        // Spec: OSC 99 ; i=<id> ; <button-or-empty>. id was sanitized
+        // at parse time, so it can't smuggle escape bytes.
+        var buf: [96]u8 = undefined;
+        const id: []const u8 = if (slot.id.len > 0) slot.id else "0";
+        const out = if (button == 0)
+            std.fmt.bufPrint(&buf, "\x1b]99;i={s};\x1b\\", .{id}) catch return
+        else
+            std.fmt.bufPrint(&buf, "\x1b]99;i={s};{d}\x1b\\", .{ id, button }) catch return;
+        slot.pane.terminal.writeRaw(out);
+    }
 }
 
 /// OSC 9;4 progress from `pane`: drive the tab's indicator ring and

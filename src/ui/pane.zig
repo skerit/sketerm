@@ -61,9 +61,9 @@ pub const Pane = struct {
     win_on_title: ?*const fn (ctx: ?*anyopaque, pane: *Pane, title: []const u8) void = null,
     win_clip_ctx: ?*anyopaque = null,
     win_on_clipboard: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
-    /// Forward iTerm2 / OSC 777 desktop notifications.
+    /// Forward desktop notifications (OSC 9 / 99 / 777 / 1337).
     win_notify_ctx: ?*anyopaque = null,
-    win_on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
+    win_on_notification: ?*const fn (ctx: ?*anyopaque, pane: *Pane, ev: Screen.NotificationEvent) void = null,
     /// Forward OSC 9;4 progress so Window can drive tab + taskbar.
     win_progress_ctx: ?*anyopaque = null,
     win_on_progress: ?*const fn (ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) void = null,
@@ -1177,9 +1177,9 @@ fn onProgressEvent(ctx: ?*anyopaque, state: u8, percent: u8) void {
     if (self.win_on_progress) |f| f(self.win_progress_ctx, self, state, percent);
 }
 
-fn onNotificationEvent(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {
+fn onNotificationEvent(ctx: ?*anyopaque, ev: Screen.NotificationEvent) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_notification) |f| f(self.win_notify_ctx, title, body);
+    if (self.win_on_notification) |f| f(self.win_notify_ctx, self, ev);
 }
 
 fn onSessionRenamedEvent(ctx: ?*anyopaque, name: []const u8) void {

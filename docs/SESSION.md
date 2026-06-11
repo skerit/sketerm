@@ -4398,3 +4398,27 @@ Tests 454 → 466.
   with `timeout 2 cat -v > file` loses everything — cat's stdio
   buffer dies with the SIGTERM. Use a python pty probe (raw mode +
   select) or `dd bs=1`.
+
+## 2026-06-11 (later): OSC 99 full interactive notifications
+
+- Notification chain now carries Screen.NotificationEvent (id,
+  icon name/data, buttons_raw, urgency, report/focus flags,
+  occasion, close) instead of (title, body) — OSC 9/777/1337 fill
+  the simple fields. Window: GNotification with themed icon (n=) or
+  GBytesIcon image (p=icon), urgency→priority, o=unfocused/
+  invisible gates, p=close withdraws by tag, repeated ids replace.
+- Buttons + activation: app-scoped "notify-act" GAction (uu) =
+  (slot token, button#). NotifySlot ring (cap 32, dropped in
+  unlistPane) maps token → pane + sanitized id; activation focuses
+  the pane (a=focus, default) and/or writes the spec report
+  OSC 99;i=<id>;[N] via writeRaw (a=report). Ids sanitized at parse
+  ([A-Za-z0-9_+.-]) so a hostile id can't inject into the report.
+- p=? capability reply deliberately omits c= and alive:
+  GNotification has no closure feedback. Sounds/timeouts likewise.
+- Verified live end-to-end: dbus-monitor shows Notify with both
+  buttons + urgency 2 + image-path dialog-warning; gdbus
+  ActivateAction (token 1, button 2) delivered
+  ESC]99;i=mynote;2 ESC\ back into the pane (python pty probe).
+- Gotcha: zig build test does NOT reinstall zig-out/bin/sketerm —
+  launch live tests only after a plain `zig build`. Also the shim
+  drift test skips when cwd != repo root (relative path).

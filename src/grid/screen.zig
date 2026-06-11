@@ -270,13 +270,23 @@ pub const Screen = struct {
     last_cmd_exit: i32 = 0,
 
     /// OSC 99 (kitty desktop notifications) accumulator. Chunks with
-    /// the same identifier append title/body until `d` signals done;
-    /// a different identifier discards the unfinished one. Transient
-    /// — not snapshotted.
+    /// the same identifier append payload parts until `d` signals
+    /// done; a different identifier discards the unfinished one.
+    /// Transient — not snapshotted.
     notify_id: [64]u8 = undefined,
     notify_id_len: u8 = 0,
     notify_title: std.ArrayList(u8) = .empty,
     notify_body: std.ArrayList(u8) = .empty,
+    /// U+2028-separated button labels (p=buttons payload).
+    notify_buttons: std.ArrayList(u8) = .empty,
+    /// Raw image bytes for the notification icon (p=icon payload).
+    notify_icon_data: std.ArrayList(u8) = .empty,
+    /// Decoded themed-icon name (metadata key n, first one kept).
+    notify_icon_name: std.ArrayList(u8) = .empty,
+    notify_urgency: ?u8 = null,
+    notify_report: bool = false,
+    notify_focus: bool = true,
+    notify_occasion: NotificationEvent.Occasion = .always,
 
     /// modifyOtherKeys level (CSI > 4 ; Pp m). 0=off, 1=ambiguous
     /// only, 2=all printable. Input encoder hasn't wired this yet.
@@ -387,7 +397,7 @@ pub const Screen = struct {
         on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
         on_cwd: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
         on_image: ?*const fn (ctx: ?*anyopaque, img: ImageEvent) void = null,
-        on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
+        on_notification: ?*const fn (ctx: ?*anyopaque, ev: NotificationEvent) void = null,
         /// ConEmu progress report `OSC 9 ; 4 ; st ; pr` (emitted by
         /// zig build, systemd, PowerShell, ...). st: 0 clear,
         /// 1 normal, 2 error, 3 indeterminate, 4 paused; pr 0-100.
@@ -409,6 +419,57 @@ pub const Screen = struct {
         /// write-pty. `selection` is 'c' (clipboard) or 'p' (primary).
         on_clipboard_get: ?*const fn (ctx: ?*anyopaque, selection: u8) void = null,
     };
+
+    /// Desktop-notification request flowing out of the screen. All
+    /// slices are borrowed — valid only for the duration of the sink
+    /// call. Simple producers (OSC 9 / 777 / 1337) fill title/body
+    /// and leave the rest defaulted; OSC 99 fills everything.
+    pub const NotificationEvent = struct {
+        pub const Occasion = enum { always, unfocused, invisible };
+
+        /// Sanitized identifier ([A-Za-z0-9_+.-], ≤64) — used to
+        /// replace/withdraw and echoed in activation reports.
+        id: []const u8 = "",
+        title: []const u8 = "",
+        body: []const u8 = "",
+        /// Themed icon name (OSC 99 metadata key n, decoded).
+        icon_name: []const u8 = "",
+        /// Raw image bytes (PNG/JPEG/GIF) for the icon (p=icon).
+        icon_data: []const u8 = "",
+        /// Button labels separated by U+2028 (0xE2 0x80 0xA8).
+        buttons_raw: []const u8 = "",
+        /// 0 = low, 1 = normal, 2 = critical. Null = unspecified.
+        urgency: ?u8 = null,
+        /// App asked for an activation report (`a=report`): clicking
+        /// the notification (or button N) must echo
+        /// `OSC 99 ; i=<id> ; [N]` back to the PTY.
+        want_report: bool = false,
+        /// Focus the originating pane on activation (default on).
+        want_focus: bool = true,
+        /// When to actually show (o= key).
+        occasion: Occasion = .always,
+        /// p=close — withdraw the notification with this id instead
+        /// of showing anything.
+        close: bool = false,
+    };
+
+    /// Keep only the characters the OSC 99 spec allows in
+    /// identifiers, so a hostile id can't inject escape data when
+    /// echoed in reports. Returns the (possibly shorter) sanitized
+    /// prefix written into `out`.
+    pub fn sanitizeNotifyId(id: []const u8, out: []u8) []const u8 {
+        var n: usize = 0;
+        for (id) |ch| {
+            if (n >= out.len) break;
+            const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+                (ch >= '0' and ch <= '9') or ch == '_' or ch == '-' or ch == '+' or ch == '.';
+            if (ok) {
+                out[n] = ch;
+                n += 1;
+            }
+        }
+        return out[0..n];
+    }
 
     pub const ImageDeleteEvent = struct {
         /// 0 = delete-all-images. Otherwise the specific image.
@@ -545,6 +606,9 @@ pub const Screen = struct {
         self.retained_images.deinit(self.allocator);
         self.notify_title.deinit(self.allocator);
         self.notify_body.deinit(self.allocator);
+        self.notify_buttons.deinit(self.allocator);
+        self.notify_icon_data.deinit(self.allocator);
+        self.notify_icon_name.deinit(self.allocator);
         for (self.active) |*l| l.deinit(self.allocator);
         self.allocator.free(self.active);
         if (self.alt) |alt| {
@@ -1853,23 +1917,47 @@ pub const Screen = struct {
         }
     }
 
-    /// OSC 99 — kitty desktop-notification protocol (subset).
-    /// `metadata ; payload` where metadata is COLON-separated k=v:
-    /// `i` identifier, `d` done (0 = more chunks follow), `p` payload
-    /// kind (title/body), `e=1` payload is base64. Unsupported
-    /// payload kinds (icons, buttons, …) drop the chunk; unknown
-    /// metadata keys are ignored per spec.
+    fn clearNotifyAccum(self: *Screen) void {
+        self.notify_title.clearRetainingCapacity();
+        self.notify_body.clearRetainingCapacity();
+        self.notify_buttons.clearRetainingCapacity();
+        self.notify_icon_data.clearRetainingCapacity();
+        self.notify_icon_name.clearRetainingCapacity();
+        self.notify_urgency = null;
+        self.notify_report = false;
+        self.notify_focus = true;
+        self.notify_occasion = .always;
+        self.notify_id_len = 0;
+    }
+
+    /// OSC 99 — kitty desktop-notification protocol.
+    /// `metadata ; payload`, metadata COLON-separated k=v. Supported:
+    /// `i` id, `d` done, `e=1` base64, `p` title/body/buttons/icon/
+    /// close/?, `a` report/focus (− negates), `o` occasion, `u`
+    /// urgency, `n` themed-icon name (base64). Not supported (and
+    /// omitted from the `p=?` capability reply): `c` close events and
+    /// `p=alive` — GNotification gives no closure feedback. `s`
+    /// sounds and `w` timeouts likewise.
     fn handleOsc99(self: *Screen, rest: []const u8) void {
         const MAX_TITLE = 512;
         const MAX_BODY = 4096;
+        const MAX_BUTTONS = 2048;
+        const MAX_ICON = 256 * 1024;
+        const Kind = enum { title, body, buttons, icon, close, query, unsupported };
+
         const semi = std.mem.indexOfScalar(u8, rest, ';');
         const meta = if (semi) |s| rest[0..s] else rest;
         const payload_raw = if (semi) |s| rest[s + 1 ..] else "";
 
         var id: []const u8 = "0";
         var done = true;
-        var is_body = false;
+        var kind: Kind = .title;
         var is_b64 = false;
+        var urgency: ?u8 = null;
+        var report: ?bool = null;
+        var focus: ?bool = null;
+        var occasion: ?NotificationEvent.Occasion = null;
+        var icon_name_b64: []const u8 = "";
         var it = std.mem.splitScalar(u8, meta, ':');
         while (it.next()) |kv| {
             const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
@@ -1880,46 +1968,109 @@ pub const Screen = struct {
             } else if (std.mem.eql(u8, k, "d")) {
                 done = !std.mem.eql(u8, v, "0");
             } else if (std.mem.eql(u8, k, "p")) {
-                if (std.mem.eql(u8, v, "body")) {
-                    is_body = true;
-                } else if (!std.mem.eql(u8, v, "title")) {
-                    return; // icon/buttons/query — unsupported kind
-                }
+                kind = blk: {
+                    if (std.mem.eql(u8, v, "title")) break :blk .title;
+                    if (std.mem.eql(u8, v, "body")) break :blk .body;
+                    if (std.mem.eql(u8, v, "buttons")) break :blk .buttons;
+                    if (std.mem.eql(u8, v, "icon")) break :blk .icon;
+                    if (std.mem.eql(u8, v, "close")) break :blk .close;
+                    if (std.mem.eql(u8, v, "?")) break :blk .query;
+                    break :blk .unsupported; // alive, future kinds
+                };
             } else if (std.mem.eql(u8, k, "e")) {
                 is_b64 = std.mem.eql(u8, v, "1");
+            } else if (std.mem.eql(u8, k, "u")) {
+                const u = std.fmt.parseInt(u8, v, 10) catch continue;
+                if (u <= 2) urgency = u;
+            } else if (std.mem.eql(u8, k, "a")) {
+                var ait = std.mem.splitScalar(u8, v, ',');
+                while (ait.next()) |act| {
+                    if (std.mem.eql(u8, act, "report")) report = true;
+                    if (std.mem.eql(u8, act, "-report")) report = false;
+                    if (std.mem.eql(u8, act, "focus")) focus = true;
+                    if (std.mem.eql(u8, act, "-focus")) focus = false;
+                }
+            } else if (std.mem.eql(u8, k, "o")) {
+                occasion = std.meta.stringToEnum(NotificationEvent.Occasion, v);
+            } else if (std.mem.eql(u8, k, "n")) {
+                if (icon_name_b64.len == 0) icon_name_b64 = v;
             }
-            // Unknown keys: ignore (spec says be lenient).
+            // Unknown keys (g, c, s, t, w, f, …): ignore, per spec.
         }
+
+        var id_buf: [64]u8 = undefined;
+        const safe_id = sanitizeNotifyId(id, &id_buf);
+
+        if (kind == .query) {
+            // Capability reply — advertise only what we honour.
+            var resp_buf: [192]u8 = undefined;
+            const out = std.fmt.bufPrint(
+                &resp_buf,
+                "\x1b]99;i={s}:p=?;a=report,focus:o=always,unfocused,invisible:p=title,body,buttons,icon,close:u=0,1,2\x1b\\",
+                .{safe_id},
+            ) catch return;
+            self.respond(out);
+            return;
+        }
+        if (kind == .close) {
+            if (self.sink.on_notification) |f| f(self.sink.ctx, .{ .id = safe_id, .close = true });
+            return;
+        }
+        if (kind == .unsupported) return;
 
         // New identifier discards any unfinished accumulation.
         const cur_id = self.notify_id[0..self.notify_id_len];
         if (!std.mem.eql(u8, cur_id, id)) {
-            self.notify_title.clearRetainingCapacity();
-            self.notify_body.clearRetainingCapacity();
+            self.clearNotifyAccum();
             const n: u8 = @intCast(@min(id.len, self.notify_id.len));
             @memcpy(self.notify_id[0..n], id[0..n]);
             self.notify_id_len = n;
         }
 
-        // Decode payload (base64 or raw) and append to the right part.
+        // Metadata flags persist across the chunks of one id.
+        if (urgency) |u| self.notify_urgency = u;
+        if (report) |r| self.notify_report = r;
+        if (focus) |fo| self.notify_focus = fo;
+        if (occasion) |o| self.notify_occasion = o;
+        if (icon_name_b64.len > 0 and self.notify_icon_name.items.len == 0) {
+            var name_buf: [128]u8 = undefined;
+            const decoder = std.base64.standard.Decoder;
+            const n_len = decoder.calcSizeForSlice(icon_name_b64) catch 0;
+            if (n_len > 0 and n_len <= name_buf.len) {
+                if (decoder.decode(name_buf[0..n_len], icon_name_b64)) {
+                    self.notify_icon_name.appendSlice(self.allocator, name_buf[0..n_len]) catch {};
+                } else |_| {}
+            }
+        }
+
+        // Decode payload (base64 or raw) and append to its part.
         var decode_buf: [4096]u8 = undefined;
         var payload: []const u8 = payload_raw;
         if (is_b64) {
+            payload = "";
             const decoder = std.base64.standard.Decoder;
             const out_len = decoder.calcSizeForSlice(payload_raw) catch 0;
-            if (out_len == 0 or out_len > decode_buf.len) {
-                payload = "";
-            } else {
-                decoder.decode(decode_buf[0..out_len], payload_raw) catch {
-                    payload = "";
-                };
-                if (payload.len != 0) payload = decode_buf[0..out_len];
+            if (out_len > 0 and out_len <= decode_buf.len) {
+                if (decoder.decode(decode_buf[0..out_len], payload_raw)) {
+                    payload = decode_buf[0..out_len];
+                } else |_| {}
             }
         }
-        const dst = if (is_body) &self.notify_body else &self.notify_title;
-        const cap: usize = if (is_body) MAX_BODY else MAX_TITLE;
-        const room = cap -| dst.items.len;
-        const take = @min(payload.len, room);
+        const dst = switch (kind) {
+            .title => &self.notify_title,
+            .body => &self.notify_body,
+            .buttons => &self.notify_buttons,
+            .icon => &self.notify_icon_data,
+            else => unreachable,
+        };
+        const cap: usize = switch (kind) {
+            .title => MAX_TITLE,
+            .body => MAX_BODY,
+            .buttons => MAX_BUTTONS,
+            .icon => MAX_ICON,
+            else => unreachable,
+        };
+        const take = @min(payload.len, cap -| dst.items.len);
         dst.appendSlice(self.allocator, payload[0..take]) catch {};
 
         if (!done) return;
@@ -1927,10 +2078,19 @@ pub const Screen = struct {
             self.notify_title.items
         else
             "sketerm";
-        if (self.sink.on_notification) |f| f(self.sink.ctx, title, self.notify_body.items);
-        self.notify_title.clearRetainingCapacity();
-        self.notify_body.clearRetainingCapacity();
-        self.notify_id_len = 0;
+        if (self.sink.on_notification) |f| f(self.sink.ctx, .{
+            .id = safe_id,
+            .title = title,
+            .body = self.notify_body.items,
+            .icon_name = self.notify_icon_name.items,
+            .icon_data = self.notify_icon_data.items,
+            .buttons_raw = self.notify_buttons.items,
+            .urgency = self.notify_urgency,
+            .want_report = self.notify_report,
+            .want_focus = self.notify_focus,
+            .occasion = self.notify_occasion,
+        });
+        self.clearNotifyAccum();
     }
 
     fn handleOsc8(self: *Screen, params: []const u8) void {
@@ -2047,7 +2207,7 @@ pub const Screen = struct {
             // Values: yes / fireworks / once / no. We surface as a
             // notification so the WM/desktop applies its needs-attention
             // hint via AdwTabPage / GtkApplication user-attention.
-            if (self.sink.on_notification) |f| f(self.sink.ctx, "sketerm", "attention");
+            if (self.sink.on_notification) |f| f(self.sink.ctx, .{ .title = "sketerm", .body = "attention" });
             return;
         }
         if (std.mem.eql(u8, key, "StealFocus")) {
@@ -2361,7 +2521,7 @@ pub const Screen = struct {
                     if (self.sink.on_progress) |f| f(self.sink.ctx, p.state, p.percent);
                     return;
                 }
-                if (self.sink.on_notification) |f| f(self.sink.ctx, "sketerm", rest);
+                if (self.sink.on_notification) |f| f(self.sink.ctx, .{ .title = "sketerm", .body = rest });
             },
             10, 11, 12 => {
                 // OSC 10/11/12 fg/bg/cursor color query/set.
@@ -2456,12 +2616,12 @@ pub const Screen = struct {
                 if (!std.mem.eql(u8, rest[0..semi2], "notify")) return;
                 const after = rest[semi2 + 1 ..];
                 const semi3 = std.mem.indexOfScalar(u8, after, ';') orelse {
-                    if (self.sink.on_notification) |f| f(self.sink.ctx, after, "");
+                    if (self.sink.on_notification) |f| f(self.sink.ctx, .{ .title = after });
                     return;
                 };
                 const title = after[0..semi3];
                 const body = after[semi3 + 1 ..];
-                if (self.sink.on_notification) |f| f(self.sink.ctx, title, body);
+                if (self.sink.on_notification) |f| f(self.sink.ctx, .{ .title = title, .body = body });
             },
             52 => {
                 // OSC 52 — `Pc;Pd` where Pc is selection (c=clipboard,
@@ -5431,16 +5591,23 @@ test "OSC 133 ; A records prompt mark with line ID" {
 
 test "OSC 99 kitty notifications: chunked title+body, base64, id switch" {
     const TestSink = struct {
+        var last: Screen.NotificationEvent = .{};
         var title_buf: [128]u8 = undefined;
         var body_buf: [128]u8 = undefined;
-        var title_len: usize = 0;
-        var body_len: usize = 0;
+        var buttons_buf: [128]u8 = undefined;
+        var icon_buf: [128]u8 = undefined;
         var fired: u32 = 0;
-        fn notify(_: ?*anyopaque, title: []const u8, body: []const u8) void {
-            title_len = @min(title.len, title_buf.len);
-            @memcpy(title_buf[0..title_len], title[0..title_len]);
-            body_len = @min(body.len, body_buf.len);
-            @memcpy(body_buf[0..body_len], body[0..body_len]);
+        fn notify(_: ?*anyopaque, ev: Screen.NotificationEvent) void {
+            // Slices are borrowed; copy what assertions need.
+            last = ev;
+            @memcpy(title_buf[0..ev.title.len], ev.title);
+            last.title = title_buf[0..ev.title.len];
+            @memcpy(body_buf[0..ev.body.len], ev.body);
+            last.body = body_buf[0..ev.body.len];
+            @memcpy(buttons_buf[0..ev.buttons_raw.len], ev.buttons_raw);
+            last.buttons_raw = buttons_buf[0..ev.buttons_raw.len];
+            @memcpy(icon_buf[0..ev.icon_name.len], ev.icon_name);
+            last.icon_name = icon_buf[0..ev.icon_name.len];
             fired += 1;
         }
     };
@@ -5455,7 +5622,9 @@ test "OSC 99 kitty notifications: chunked title+body, base64, id switch" {
     // Simple single-chunk: payload is the title.
     s.onOsc("99;;hello");
     try std.testing.expectEqual(@as(u32, 1), TestSink.fired);
-    try std.testing.expectEqualStrings("hello", TestSink.title_buf[0..TestSink.title_len]);
+    try std.testing.expectEqualStrings("hello", TestSink.last.title);
+    try std.testing.expect(!TestSink.last.want_report);
+    try std.testing.expect(TestSink.last.want_focus);
 
     // Chunked: title, then body across two chunks, then done.
     s.onOsc("99;i=x:d=0;Build");
@@ -5463,20 +5632,92 @@ test "OSC 99 kitty notifications: chunked title+body, base64, id switch" {
     s.onOsc("99;i=x:d=0:p=body;part1 ");
     s.onOsc("99;i=x:p=body;part2");
     try std.testing.expectEqual(@as(u32, 2), TestSink.fired);
-    try std.testing.expectEqualStrings("Build", TestSink.title_buf[0..TestSink.title_len]);
-    try std.testing.expectEqualStrings("part1 part2", TestSink.body_buf[0..TestSink.body_len]);
+    try std.testing.expectEqualStrings("Build", TestSink.last.title);
+    try std.testing.expectEqualStrings("part1 part2", TestSink.last.body);
+    try std.testing.expectEqualStrings("x", TestSink.last.id);
 
     // base64 payload (e=1): "aGk=" → "hi".
     s.onOsc("99;e=1;aGk=");
-    try std.testing.expectEqualStrings("hi", TestSink.title_buf[0..TestSink.title_len]);
+    try std.testing.expectEqualStrings("hi", TestSink.last.title);
 
     // A new identifier discards an unfinished accumulation.
     s.onOsc("99;i=a:d=0;stale");
     s.onOsc("99;i=b;fresh");
-    try std.testing.expectEqualStrings("fresh", TestSink.title_buf[0..TestSink.title_len]);
+    try std.testing.expectEqualStrings("fresh", TestSink.last.title);
+}
 
-    // Unsupported payload kind drops the chunk, no crash.
-    s.onOsc("99;p=icon;PNGDATA");
+test "OSC 99: buttons, icon, urgency, actions, occasion, close, query" {
+    const TestSink = struct {
+        var last: Screen.NotificationEvent = .{};
+        var buttons_buf: [128]u8 = undefined;
+        var icon_name_buf: [128]u8 = undefined;
+        var icon_data_buf: [128]u8 = undefined;
+        var id_buf: [64]u8 = undefined;
+        var fired: u32 = 0;
+        fn notify(_: ?*anyopaque, ev: Screen.NotificationEvent) void {
+            last = ev;
+            @memcpy(buttons_buf[0..ev.buttons_raw.len], ev.buttons_raw);
+            last.buttons_raw = buttons_buf[0..ev.buttons_raw.len];
+            @memcpy(icon_name_buf[0..ev.icon_name.len], ev.icon_name);
+            last.icon_name = icon_name_buf[0..ev.icon_name.len];
+            @memcpy(icon_data_buf[0..ev.icon_data.len], ev.icon_data);
+            last.icon_data = icon_data_buf[0..ev.icon_data.len];
+            @memcpy(id_buf[0..ev.id.len], ev.id);
+            last.id = id_buf[0..ev.id.len];
+            fired += 1;
+        }
+        var resp: [256]u8 = undefined;
+        var resp_len: usize = 0;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, resp.len - resp_len);
+            @memcpy(resp[resp_len .. resp_len + n], bytes[0..n]);
+            resp_len += n;
+        }
+    };
+    TestSink.fired = 0;
+    TestSink.resp_len = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_notification = TestSink.notify, .on_write_pty = TestSink.write };
+
+    // Buttons (U+2028 separated), urgency, report action, occasion,
+    // icon name (n= is base64: "ZGlhbG9nLXdhcm5pbmc=" = dialog-warning).
+    s.onOsc("99;i=n1:d=0:u=2:a=report:o=unfocused:n=ZGlhbG9nLXdhcm5pbmc=;Disk alert");
+    s.onOsc("99;i=n1:p=buttons;Retry\xe2\x80\xa8Ignore");
+    try std.testing.expectEqual(@as(u32, 1), TestSink.fired);
+    try std.testing.expectEqualStrings("Retry\xe2\x80\xa8Ignore", TestSink.last.buttons_raw);
+    try std.testing.expectEqualStrings("dialog-warning", TestSink.last.icon_name);
+    try std.testing.expectEqual(@as(?u8, 2), TestSink.last.urgency);
+    try std.testing.expect(TestSink.last.want_report);
+    try std.testing.expectEqual(Screen.NotificationEvent.Occasion.unfocused, TestSink.last.occasion);
+
+    // Icon image payload (p=icon, base64).
+    s.onOsc("99;i=n2:d=0:p=icon:e=1;UE5HIQ==");
+    s.onOsc("99;i=n2;t");
+    try std.testing.expectEqualStrings("PNG!", TestSink.last.icon_data);
+
+    // -focus negation.
+    s.onOsc("99;a=-focus;nofocus");
+    try std.testing.expect(!TestSink.last.want_focus);
+
+    // p=close fires a close event with the sanitized id.
+    s.onOsc("99;i=ab\x07cd:p=close;");
+    try std.testing.expect(TestSink.last.close);
+    try std.testing.expectEqualStrings("abcd", TestSink.last.id);
+
+    // p=? capability query gets a reply that omits c= (no close
+    // feedback through GNotification) and echoes the id.
+    s.onOsc("99;i=q1:p=?;");
+    const resp = TestSink.resp[0..TestSink.resp_len];
+    try std.testing.expect(std.mem.startsWith(u8, resp, "\x1b]99;i=q1:p=?;"));
+    try std.testing.expect(std.mem.indexOf(u8, resp, "p=title,body,buttons,icon,close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "c=") == null);
+
+    // p=alive is unsupported — ignored without a crash.
+    s.onOsc("99;i=q2:p=alive;");
 }
 
 test "OSC 4 multi-pair set + bare OSC 104/111 reset" {
@@ -5814,12 +6055,12 @@ test "OSC 777 notify dispatches title+body" {
         var got_body: [64]u8 = undefined;
         var got_title_len: usize = 0;
         var got_body_len: usize = 0;
-        fn cb(_: ?*anyopaque, t: []const u8, b: []const u8) void {
-            const tn = @min(t.len, got_title.len);
-            @memcpy(got_title[0..tn], t[0..tn]);
+        fn cb(_: ?*anyopaque, ev: Screen.NotificationEvent) void {
+            const tn = @min(ev.title.len, got_title.len);
+            @memcpy(got_title[0..tn], ev.title[0..tn]);
             got_title_len = tn;
-            const bn = @min(b.len, got_body.len);
-            @memcpy(got_body[0..bn], b[0..bn]);
+            const bn = @min(ev.body.len, got_body.len);
+            @memcpy(got_body[0..bn], ev.body[0..bn]);
             got_body_len = bn;
         }
     };
@@ -5843,7 +6084,7 @@ test "OSC 9;4 routes to progress, plain OSC 9 stays a notification" {
         fn onProgress(_: ?*anyopaque, state: u8, percent: u8) void {
             progress = .{ .state = state, .percent = percent };
         }
-        fn onNotify(_: ?*anyopaque, _: []const u8, _: []const u8) void {
+        fn onNotify(_: ?*anyopaque, _: Screen.NotificationEvent) void {
             notified += 1;
         }
     };

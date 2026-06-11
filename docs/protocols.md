@@ -121,7 +121,7 @@ htop and btop need the report subset for accurate rendering.
 | 8      | Hyperlinks                                | ✓ |
 | 10/11/12 | Default fg / bg / cursor color (query+set)| ✓ |
 | 52     | Clipboard set + read query                | ✓ (read gated behind `clipboard_read = allow`, empty reply when denied; 1 MB cap both ways) |
-| 99     | Kitty desktop notifications               | ✓ (chunked title/body, base64; icon/button payload kinds dropped) |
+| 99     | Kitty desktop notifications               | ✓ (chunked title/body, buttons + activation reports, themed-icon names + image payloads, urgency, occasion filter, close/withdraw, `p=?` capability reply; NOT supported: close events `c=`, `p=alive`, sounds, timeouts — GNotification gives no closure feedback) |
 | 104    | Reset color palette (bare / index list)   | ✓ |
 | 110/111/112 | Reset fg/bg/cursor (incl. bare form) | ✓ |
 | 133    | Shell integration (FinalTerm prompt marks)| ✓ (A-marks navigate via Ctrl+Shift+Up/Down; C/D bound the command-output zone behind "Copy Command Output" / `copy_command_output`) |

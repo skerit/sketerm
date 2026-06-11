@@ -83,7 +83,7 @@ pub const Terminal = struct {
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
     on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void = null,
-    on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
+    on_notification: ?*const fn (ctx: ?*anyopaque, ev: Screen.NotificationEvent) void = null,
     on_pointer_shape: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
     on_progress: ?*const fn (ctx: ?*anyopaque, state: u8, percent: u8) void = null,
     /// Fired when the mux daemon confirmed a session rename. The new
@@ -534,9 +534,9 @@ pub const Terminal = struct {
         if (self.on_image_delete_full) |f| f(self.user_ctx, ev);
     }
 
-    fn sinkNotification(ctx: ?*anyopaque, title: []const u8, body: []const u8) void {
+    fn sinkNotification(ctx: ?*anyopaque, ev: Screen.NotificationEvent) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
-        if (self.on_notification) |f| f(self.user_ctx, title, body);
+        if (self.on_notification) |f| f(self.user_ctx, ev);
     }
 
     fn sinkProgress(ctx: ?*anyopaque, state: u8, pct: u8) void {
