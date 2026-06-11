@@ -4445,3 +4445,30 @@ Tests 454 → 466.
   48-report / single DSR reply; durable pane shows the routing
   split (daemon answers DECRQM/2048/DSR once, mirror answers ?996)
   and exactly ONE cursor reply.
+
+## 2026-06-11 (later): file:line hints + pane zoom + cli action
+
+- Path hints now open in an editor: parseFileLine + buildEditorCommand
+  (pure, tested in hints.zig), shell quoting consolidated into
+  util/shellquote.zig (pane.zig drag&drop now imports it). Resolution:
+  hint_editor config ({file}/{line}/{col} template or bare `+line`
+  command) > $EDITOR > $VISUAL > copy fallback; relative paths
+  resolve against the pane's OSC 7 cwd; nonexistent local files copy
+  (covers remote-pane paths naturally).
+- Pane zoom (Ctrl+Shift+M, menu, palette, `cli action zoom_pane`):
+  hides the sibling subtree at each GtkPaned level (paned gives full
+  allocation to the remaining child; NO reparenting → GL context
+  survives). zoom_hidden holds g_object_ref'd widgets for restore.
+  Auto-unzoom: split, pane_next/prev, ANY pane close (unlistPane).
+  Verified over IPC: 16x58 → 34x116 → back; all 3 close/split edge
+  cases. `zoomed` flag in cli list output.
+- NEW IPC: `sketerm cli action <name>` dispatches any bindable
+  action — scripting + the testability story for window-level
+  features (no keyboard needed).
+- PROCESS WARNING (cost real harm): kdotool windowactivate +
+  ydotool key injection while Jelle was ACTIVELY TYPING — focus
+  ping-ponged, his keystrokes landed in my test window and possibly
+  mine in his Kate draft. NEVER inject input or steal focus while
+  the user is active. Use IPC-driveable surfaces instead (that's
+  what `cli action` is for). Also: Belgian AZERTY — ydotool keycode
+  30='q', 16='a'.
