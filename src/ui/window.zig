@@ -1536,6 +1536,7 @@ pub const Window = struct {
             self.config.scrollback;
         term.screen.bracketed_paste = self.config.bracketed_paste;
         term.screen.scroll_on_output = self.config.scroll_on_output;
+        term.screen.allow_clipboard_read = self.config.clipboard_read;
         term.screen.word_chars = self.config.word_chars;
         // Resolve effective palette: profile.palette > config.palette
         // > profile.scheme lookup > config.scheme lookup > defaults.

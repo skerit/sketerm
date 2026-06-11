@@ -232,6 +232,10 @@ pub const Config = struct {
     /// Right-click action. `menu` = context menu (default, PuTTY
     /// users want paste_clipboard here).
     mouse_right_click: MouseAction = .menu,
+    /// Allow apps to READ the clipboard via OSC 52 query. Off by
+    /// default — any program on the PTY (incl. remote ones over ssh)
+    /// could exfiltrate clipboard contents. Accepts allow/deny.
+    clipboard_read: bool = false,
 
     // Search
     /// Default state for the search box's case sensitivity. The
@@ -586,6 +590,7 @@ pub const Config = struct {
         if (self.copy_on_selection) try w.writeAll("copy_on_selection = true\n");
         if (self.clear_select_on_copy) try w.writeAll("clear_select_on_copy = true\n");
         if (self.disable_mouse_paste) try w.writeAll("disable_mouse_paste = true\n");
+        if (self.clipboard_read) try w.writeAll("clipboard_read = allow\n");
         if (self.mouse_middle_click != .paste_primary)
             try w.print("mouse_middle_click = {s}\n", .{@tagName(self.mouse_middle_click)});
         if (self.mouse_right_click != .menu)
@@ -996,6 +1001,14 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.mouse_middle_click = std.meta.stringToEnum(MouseAction, value) orelse return error.BadMouseAction;
     } else if (std.mem.eql(u8, key, "mouse_right_click")) {
         cfg.mouse_right_click = std.meta.stringToEnum(MouseAction, value) orelse return error.BadMouseAction;
+    } else if (std.mem.eql(u8, key, "clipboard_read")) {
+        if (std.mem.eql(u8, value, "allow")) {
+            cfg.clipboard_read = true;
+        } else if (std.mem.eql(u8, value, "deny")) {
+            cfg.clipboard_read = false;
+        } else {
+            cfg.clipboard_read = try parseBool(value);
+        }
     } else if (std.mem.eql(u8, key, "disable_mousewheel_zoom")) {
         cfg.disable_mousewheel_zoom = try parseBool(value);
     } else if (std.mem.eql(u8, key, "link_single_click")) {

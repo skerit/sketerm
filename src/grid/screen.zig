@@ -88,6 +88,10 @@ pub const Screen = struct {
     insert_mode: bool = false,
     /// DECSET 2004 — bracketed paste.
     bracketed_paste: bool = false,
+    /// OSC 52 read queries allowed (config `clipboard_read = allow`).
+    /// Off by default: any app on the PTY could exfiltrate the
+    /// clipboard. Denied queries get an empty reply.
+    allow_clipboard_read: bool = false,
     /// LNM (mode 20) — when set, LF / VT / FF also perform CR (move
     /// cursor to column 0 in addition to advancing a row). Mostly a
     /// historical mode but a few apps set it explicitly.
@@ -390,6 +394,11 @@ pub const Screen = struct {
         /// the parser switches into VT52 mode; when true, returns to
         /// ANSI/VT100. Terminal wires this to its Parser.vt52_mode.
         on_decanm: ?*const fn (ctx: ?*anyopaque, ansi: bool) void = null,
+        /// OSC 52 read query (`OSC 52 ; Pc ; ?`). Only fired when
+        /// `allow_clipboard_read` is set; the sink must answer
+        /// asynchronously with `OSC 52 ; <sel> ; <base64>` via
+        /// write-pty. `selection` is 'c' (clipboard) or 'p' (primary).
+        on_clipboard_get: ?*const fn (ctx: ?*anyopaque, selection: u8) void = null,
     };
 
     pub const ImageDeleteEvent = struct {
@@ -2358,7 +2367,22 @@ pub const Screen = struct {
                 const semi2 = std.mem.indexOfScalar(u8, rest, ';') orelse return;
                 const data = rest[semi2 + 1 ..];
                 if (data.len == 0) return;
-                if (data[0] == '?') return; // read query — gated, post-v1
+                if (data[0] == '?') {
+                    // Read query. Gated behind `clipboard_read = allow`
+                    // — clipboard contents are sensitive and any app on
+                    // the PTY (including remote ones) can ask. When
+                    // denied, reply with an empty payload immediately
+                    // so the querying app isn't stuck in its timeout.
+                    const sel: u8 = if (rest.len > 0 and rest[0] == 'p') 'p' else 'c';
+                    if (!self.allow_clipboard_read or self.sink.on_clipboard_get == null) {
+                        var resp_buf: [16]u8 = undefined;
+                        const out = std.fmt.bufPrint(&resp_buf, "\x1b]52;{c};\x1b\\", .{sel}) catch return;
+                        self.respond(out);
+                        return;
+                    }
+                    self.sink.on_clipboard_get.?(self.sink.ctx, sel);
+                    return;
+                }
                 if (data.len > 1_500_000) return; // 1 MB cap (after base64 expansion)
                 const decoder = std.base64.standard.Decoder;
                 const out_len = decoder.calcSizeForSlice(data) catch return;
@@ -5301,6 +5325,45 @@ test "OSC 133 ; A records prompt mark with line ID" {
     const r2 = s.rowForLineId(id2);
     try std.testing.expect(r1 != null);
     try std.testing.expect(r2 != null);
+}
+
+test "OSC 52 read: denied by default with empty reply, sink fired when allowed" {
+    const TestSink = struct {
+        var captured: [64]u8 = undefined;
+        var captured_len: usize = 0;
+        var get_fired: ?u8 = null;
+        fn write(_: ?*anyopaque, bytes: []const u8) void {
+            const n = @min(bytes.len, captured.len - captured_len);
+            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
+            captured_len += n;
+        }
+        fn get(_: ?*anyopaque, selection: u8) void {
+            get_fired = selection;
+        }
+    };
+    TestSink.captured_len = 0;
+    TestSink.get_fired = null;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = TestSink.write, .on_clipboard_get = TestSink.get };
+
+    // Default: denied → immediate empty reply, no sink call.
+    s.onOsc("52;c;?");
+    try std.testing.expectEqualStrings("\x1b]52;c;\x1b\\", TestSink.captured[0..TestSink.captured_len]);
+    try std.testing.expectEqual(@as(?u8, null), TestSink.get_fired);
+
+    // Allowed: sink fires with the selection, no synchronous reply.
+    TestSink.captured_len = 0;
+    s.allow_clipboard_read = true;
+    s.onOsc("52;p;?");
+    try std.testing.expectEqual(@as(usize, 0), TestSink.captured_len);
+    try std.testing.expectEqual(@as(?u8, 'p'), TestSink.get_fired);
+
+    // Write path is unaffected by the gate (handled by clipboard_set).
+    s.onOsc("52;c;aGVsbG8=");
 }
 
 test "OSC 133 C/D bounds the last-command-output zone" {

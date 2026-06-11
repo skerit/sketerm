@@ -71,6 +71,8 @@ pub const Terminal = struct {
     /// the AdwTabPage tooltip so hovering shows the live shell cwd.
     on_cwd_changed: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
     on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+    /// OSC 52 read query (only fired when the screen allows reads).
+    on_clipboard_get: ?*const fn (ctx: ?*anyopaque, selection: u8) void = null,
     /// Fires once at the end of `mainDrain` when events left
     /// `screen.dirty = true` (and we're not in DECSET 2026 sync
     /// mode). UI uses it to schedule a GL render directly from the
@@ -212,6 +214,7 @@ pub const Terminal = struct {
             .on_bell = sinkBell,
             .on_write_pty = sinkWritePty,
             .on_clipboard_set = sinkClipboard,
+            .on_clipboard_get = sinkClipboardGet,
             .on_cwd = sinkCwd,
             .on_image = sinkImage,
             .on_image_delete_full = sinkImageDeleteFull,
@@ -437,6 +440,7 @@ pub const Terminal = struct {
             .on_bell = sinkBell,
             .on_write_pty = sinkWritePty,
             .on_clipboard_set = sinkClipboard,
+            .on_clipboard_get = sinkClipboardGet,
             .on_cwd = sinkCwd,
             .on_image = sinkImage,
             .on_image_delete_full = sinkImageDeleteFull,
@@ -468,6 +472,11 @@ pub const Terminal = struct {
     fn sinkClipboard(ctx: ?*anyopaque, text: []const u8) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
         if (self.on_clipboard_set) |f| f(self.user_ctx, text);
+    }
+
+    fn sinkClipboardGet(ctx: ?*anyopaque, selection: u8) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_clipboard_get) |f| f(self.user_ctx, selection);
     }
 
     fn sinkCwd(ctx: ?*anyopaque, cwd_in: []const u8) void {
@@ -549,6 +558,7 @@ pub const Terminal = struct {
         self.on_title = null;
         self.on_cwd_changed = null;
         self.on_clipboard_set = null;
+        self.on_clipboard_get = null;
         self.on_render_request = null;
         self.on_bell = null;
         self.on_image = null;

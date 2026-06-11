@@ -18,6 +18,7 @@ const BgPass = @import("../render/bg_pass.zig").BgPass;
 const ImageStore = @import("../grid/image_store.zig").Store;
 const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
+const DrainHandle = @import("../terminal.zig").DrainHandle;
 const input = @import("input.zig");
 const menu = @import("menu.zig");
 const clipboard = @import("clipboard.zig");
@@ -297,6 +298,7 @@ pub const Pane = struct {
         terminal.on_title = onTitleEvent;
         terminal.on_cwd_changed = onCwdEvent;
         terminal.on_clipboard_set = onClipboardEvent;
+        terminal.on_clipboard_get = onClipboardGetEvent;
         terminal.on_render_request = onRenderRequest;
         terminal.on_notification = onNotificationEvent;
         terminal.on_progress = onProgressEvent;
@@ -1112,6 +1114,62 @@ fn onRenderRequest(ctx: ?*anyopaque) void {
 fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {
     const self = cast.userData(Pane, ctx);
     if (self.win_on_clipboard) |f| f(self.win_clip_ctx, text);
+}
+
+/// OSC 52 read query (config-gated upstream). GDK clipboard reads
+/// are async; the reply ctx rides the terminal's DrainHandle so a
+/// pane/terminal teardown between request and callback is detected
+/// instead of dereferenced.
+const ClipReadCtx = struct {
+    allocator: std.mem.Allocator,
+    drain: *DrainHandle,
+    selection: u8,
+};
+
+fn onClipboardGetEvent(ctx: ?*anyopaque, selection: u8) void {
+    const self = cast.userData(Pane, ctx);
+    const display = c.gtk_widget_get_display(@ptrCast(self.area));
+    const clip = if (selection == 'p')
+        c.gdk_display_get_primary_clipboard(display)
+    else
+        c.gdk_display_get_clipboard(display);
+    const rctx = self.allocator.create(ClipReadCtx) catch return;
+    rctx.* = .{
+        .allocator = self.allocator,
+        .drain = self.terminal.drain,
+        .selection = selection,
+    };
+    c.gdk_clipboard_read_text_async(clip, null, @ptrCast(&onClipReadDone), @ptrCast(rctx));
+}
+
+fn onClipReadDone(source: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    const rctx: *ClipReadCtx = @ptrCast(@alignCast(user.?));
+    defer rctx.allocator.destroy(rctx);
+    const text_c = c.gdk_clipboard_read_text_finish(@ptrCast(@alignCast(source)), res, null);
+    defer if (text_c != null) c.g_free(text_c);
+    if (!rctx.drain.alive.load(.acquire)) return;
+    const term = rctx.drain.terminal orelse return;
+
+    var text: []const u8 = if (text_c != null)
+        std.mem.span(@as([*:0]const u8, @ptrCast(text_c)))
+    else
+        "";
+    // Bound the reply: the response flows through the PTY input
+    // path; cap mirrors the 1 MB write-side limit.
+    if (text.len > 1_000_000) text = text[0..1_000_000];
+
+    const enc_len = std.base64.standard.Encoder.calcSize(text.len);
+    const buf = rctx.allocator.alloc(u8, enc_len + 16) catch return;
+    defer rctx.allocator.free(buf);
+    var w: usize = 0;
+    const head = std.fmt.bufPrint(buf[0..16], "\x1b]52;{c};", .{rctx.selection}) catch return;
+    w += head.len;
+    const b64 = std.base64.standard.Encoder.encode(buf[w .. w + enc_len], text);
+    w += b64.len;
+    buf[w] = 0x1b;
+    buf[w + 1] = '\\';
+    w += 2;
+    term.writeRaw(buf[0..w]);
 }
 
 fn onProgressEvent(ctx: ?*anyopaque, state: u8, percent: u8) void {
