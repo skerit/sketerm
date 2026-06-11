@@ -413,6 +413,7 @@ pub const Config = struct {
             out.shader_params.appendAssumeCapacity(.{
                 .name = try arena.dupe(u8, sp.name),
                 .value = sp.value,
+                .color = sp.color,
             });
         }
         out.profiles = .empty;
@@ -657,7 +658,16 @@ pub const Config = struct {
 
         // Shader param overrides.
         for (self.shader_params.items) |sp| {
-            try w.print("shader_param.{s} = {d}\n", .{ sp.name, sp.value });
+            if (sp.color) |col| {
+                try w.print("shader_param.{s} = #{x:0>2}{x:0>2}{x:0>2}\n", .{
+                    sp.name,
+                    @as(u8, @intFromFloat(std.math.clamp(col[0], 0.0, 1.0) * 255.0)),
+                    @as(u8, @intFromFloat(std.math.clamp(col[1], 0.0, 1.0) * 255.0)),
+                    @as(u8, @intFromFloat(std.math.clamp(col[2], 0.0, 1.0) * 255.0)),
+                });
+            } else {
+                try w.print("shader_param.{s} = {d}\n", .{ sp.name, sp.value });
+            }
         }
 
         // Background opacity.
@@ -949,20 +959,30 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         try cfg.keybinds.append(arena, .{ .name = name_dup, .accel = accel_dup });
         return;
     }
-    // `shader_param.<name> = <float>` — tunable shader uniforms.
+    // `shader_param.<name> = <float | #rrggbb>` — tunable shader
+    // uniforms (floats and vec3 colors).
     if (std.mem.startsWith(u8, key, "shader_param.")) {
         const name = key["shader_param.".len..];
         if (name.len == 0 or name.len > 31) return error.BadShaderParam;
-        const val = try parseFloat(value);
+        var val: f32 = 0;
+        var col: ?[3]f32 = null;
+        if (value.len > 0 and value[0] == '#') {
+            const rgba = try parseColor(value);
+            col = .{ rgba[0], rgba[1], rgba[2] };
+        } else {
+            val = try parseFloat(value);
+        }
         for (cfg.shader_params.items) |*entry| {
             if (std.mem.eql(u8, entry.name, name)) {
                 entry.value = val;
+                entry.color = col;
                 return;
             }
         }
         try cfg.shader_params.append(arena, .{
             .name = try arena.dupe(u8, name),
             .value = val,
+            .color = col,
         });
         return;
     }
@@ -1458,6 +1478,24 @@ test "config: shader_param.<name> entries parse, dedupe, round-trip, clone" {
     var cl = try cfg.clone(std.testing.allocator);
     defer cl.deinit();
     try std.testing.expectEqualStrings("curvature", cl.shader_params.items[1].name);
+}
+
+test "config: shader_param color values (#rrggbb) round-trip" {
+    const src = "shader_param.phosphor = #ffb333\n";
+    var cfg = try Config.loadFromBytes(std.testing.allocator, src);
+    defer cfg.deinit();
+    const col = cfg.shader_params.items[0].color.?;
+    try std.testing.expect(@abs(col[0] - 1.0) < 0.01);
+    try std.testing.expect(@abs(col[1] - 0.7) < 0.01);
+    try std.testing.expect(@abs(col[2] - 0.2) < 0.01);
+
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "shader_param.phosphor = #ffb333") != null);
+    var re = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer re.deinit();
+    try std.testing.expect(re.shader_params.items[0].color != null);
 }
 
 test "config: show_titlebar / show_tab_bar round-trip" {

@@ -7,32 +7,31 @@
 // Effects: monochrome amber phosphor, scanlines, barrel curvature,
 // glow (bloom), vignette, faint flicker.
 //
-// Every knob below is tunable from config.conf without editing this
-// file — the `//@param name default` lines declare the defaults and
-// `shader_param.<name> = <value>` overrides them (applied live on
-// config reload):
-//
-//   shader_param.glow      = 1.2
-//   shader_param.curvature = 0.0     # flat screen
-//   shader_param.scanlines = 0.4
-//   shader_param.vignette  = 0.1
-//   shader_param.flicker   = 0.03
-//   shader_param.mono      = 0.0     # keep original colors, tint off
+// Every knob below is tunable WITHOUT editing this file: right-click
+// a pane using it > "Configure Shader…" for live sliders + color
+// picker, or set `shader_param.<name> = <value>` (floats, or #rrggbb
+// for colors) in config.conf — applied live on reload. Param
+// declarations use the RetroArch `#pragma parameter` format
+// (name "Label" default min max step) plus sketerm's //@color,
+// //@name and //@desc extensions.
 
-#define PHOSPHOR vec3(1.00, 0.70, 0.20)   // amber
+//@name Amber CRT
+//@desc Monochrome phosphor tube: scanlines, curvature, glow, vignette and mains-hum flicker (enable custom_shader_animation).
 
-//@param curvature 0.06
-//@param scanlines 0.22
-//@param glow 0.55
-//@param vignette 0.28
-//@param flicker 0.015
-//@param mono 1.0
+#pragma parameter curvature "Tube curvature" 0.06 0.0 0.5 0.01
+#pragma parameter scanlines "Scanline strength" 0.22 0.0 1.0 0.01
+#pragma parameter glow "Glow / bloom" 0.55 0.0 2.0 0.05
+#pragma parameter vignette "Vignette" 0.28 0.0 1.0 0.01
+#pragma parameter flicker "Flicker" 0.015 0.0 0.2 0.005
+#pragma parameter mono "Monochrome mix" 1.0 0.0 1.0 0.05
+//@color phosphor 1.00 0.70 0.20 "Phosphor tint"
 uniform float curvature;
 uniform float scanlines;
 uniform float glow;
 uniform float vignette;
 uniform float flicker;
 uniform float mono;
+uniform vec3 phosphor;
 
 vec2 curve(vec2 uv) {
     uv = uv * 2.0 - 1.0;
@@ -63,7 +62,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     // Monochrome phosphor: luminance through the tint. mono=0 keeps
     // the original colors (scanlines/curvature only).
     float lum = dot(col, vec3(0.299, 0.587, 0.114));
-    col = mix(col, PHOSPHOR * lum, mono);
+    col = mix(col, phosphor * lum, mono);
 
     // Scanlines locked to output pixels (stable while scrolling).
     float scan = sin(fragCoord.y * 3.14159) * 0.5 + 0.5;

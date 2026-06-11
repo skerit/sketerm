@@ -1757,6 +1757,47 @@ pub const Window = struct {
         return S.resolved;
     }
 
+    /// The shader_params items slice may have been reallocated (or
+    /// the config arena swapped) — re-point every Source at it.
+    fn repointShaderOverrides(self: *Window) void {
+        self.shader_source.overrides = self.config.shader_params.items;
+        for (self.panes.items) |p| {
+            p.shader_own.overrides = self.config.shader_params.items;
+        }
+    }
+
+    /// Set (or update) one shader_param override, live + persisted.
+    /// Called per slider tick from the shader config dialog — values
+    /// upload each frame, so the very next render shows it.
+    pub fn setShaderParam(self: *Window, name: []const u8, value: f32, color: ?[3]f32) void {
+        if (self.config.arena == null) {
+            // Defaults-only config (no file yet) has no arena to own
+            // the entry name; give it one.
+            self.config.arena = std.heap.ArenaAllocator.init(self.allocator);
+        }
+        const arena = self.config.arena.?.allocator();
+        var found = false;
+        for (self.config.shader_params.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                entry.value = value;
+                entry.color = color;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            const name_dup = arena.dupe(u8, name) catch return;
+            self.config.shader_params.append(arena, .{
+                .name = name_dup,
+                .value = value,
+                .color = color,
+            }) catch return;
+        }
+        self.repointShaderOverrides();
+        for (self.panes.items) |p| c.gtk_gl_area_queue_render(@ptrCast(p.area));
+        self.persistConfig();
+    }
+
     fn clearPaneShader(self: *Window) void {
         const pane = self.focusedPane() orelse return;
         _ = pane.setCustomShader(null, self.config.custom_shader_animation, false);
@@ -2556,7 +2597,7 @@ pub const Window = struct {
         c.gtk_gl_area_queue_render(@ptrCast(pane.area));
     }
 
-    fn focusedPane(self: *Window) ?*Pane {
+    pub fn focusedPane(self: *Window) ?*Pane {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return null;
         for (self.panes.items) |p| {
             if (@intFromPtr(p.area) == @intFromPtr(focus)) return p;
@@ -4614,6 +4655,9 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .goto_tab_9 => self.gotoTab(8),
         .duplicate_tab => self.duplicateCurrentTab(),
         .detach_tab => self.detachCurrentTab(),
+        .configure_shader => {
+            if (!@import("shader_dialog.zig").open(self)) self.pickPaneShader();
+        },
         .show_scrollback => self.openScrollbackPager(),
         .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
@@ -4753,6 +4797,10 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .new_tab_as_profile => self.openProfilePicker(),
         .duplicate_tab => self.duplicateCurrentTab(),
         .shader_pick => self.pickPaneShader(),
+        .shader_config => {
+            // No active shader → offer the picker instead.
+            if (!@import("shader_dialog.zig").open(self)) self.pickPaneShader();
+        },
         .shader_clear => self.clearPaneShader(),
         .close_tab => self.closeCurrentTab(),
         .rename_tab => self.renameCurrentTab(),

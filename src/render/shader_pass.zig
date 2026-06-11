@@ -31,68 +31,250 @@ pub const Source = struct {
     overrides: []const ParamKV = &.{},
 };
 
-/// One `shader_param.<name> = <value>` config entry.
+/// One `shader_param.<name> = <value>` config entry. Float params
+/// carry `value`; color params (hex `#rrggbb` in the config) carry
+/// `color` and ignore `value`.
 pub const ParamKV = struct {
     name: []const u8,
-    value: f32,
+    value: f32 = 0,
+    color: ?[3]f32 = null,
 };
 
-pub const MAX_PARAMS = 16;
+pub const MAX_PARAMS = 24;
 
-/// A tunable uniform declared by the shader via a default line:
-///   //@param <name> <default>
-/// The shader also declares `uniform float <name>;` and uses it.
+pub const ParamKind = enum { float, color };
+
+/// A tunable uniform declared by the shader. Two float syntaxes:
+///   #pragma parameter <name> "<Label>" <default> <min> <max> [step]
+///       (RetroArch-compatible — their shaders' params Just Work)
+///   //@param <name> <default> [min max [step]] ["Label"]
+/// and a color (vec3) syntax RetroArch has no equivalent for:
+///   //@color <name> <r> <g> <b> ["Label"]
+/// The shader also declares `uniform float/vec3 <name>;` itself.
 pub const Param = struct {
     name_buf: [32]u8 = undefined,
     name_len: u8 = 0,
+    label_buf: [64]u8 = undefined,
+    label_len: u8 = 0,
+    kind: ParamKind = .float,
     default_value: f32 = 0,
+    min: f32 = 0,
+    max: f32 = 1,
+    step: f32 = 0.01,
+    default_color: [3]f32 = .{ 1, 1, 1 },
     /// Uniform location in the built program; -1 = absent/unused.
     loc: c_int = -1,
 
     pub fn name(self: *const Param) []const u8 {
         return self.name_buf[0..self.name_len];
     }
+
+    /// UI label: the declared one, else the uniform name.
+    pub fn label(self: *const Param) []const u8 {
+        if (self.label_len > 0) return self.label_buf[0..self.label_len];
+        return self.name();
+    }
 };
 
-/// Scan shader source for `//@param name default` lines. Pure —
+/// Shader self-description for the config dialog header.
+pub const Meta = struct {
+    title_buf: [64]u8 = undefined,
+    title_len: u8 = 0,
+    desc_buf: [256]u8 = undefined,
+    desc_len: u8 = 0,
+
+    pub fn title(self: *const Meta) []const u8 {
+        return self.title_buf[0..self.title_len];
+    }
+    pub fn desc(self: *const Meta) []const u8 {
+        return self.desc_buf[0..self.desc_len];
+    }
+};
+
+fn setName(p: *Param, s: []const u8) bool {
+    if (s.len == 0 or s.len > 31) return false;
+    @memcpy(p.name_buf[0..s.len], s);
+    p.name_len = @intCast(s.len);
+    return true;
+}
+
+fn setLabel(p: *Param, s: []const u8) void {
+    const n = @min(s.len, p.label_buf.len);
+    @memcpy(p.label_buf[0..n], s[0..n]);
+    p.label_len = @intCast(n);
+}
+
+/// Take a possibly-quoted token: `"Two words"` or a bare word.
+fn takeQuoted(rest: []const u8) ?struct { text: []const u8, remaining: []const u8 } {
+    const t = std.mem.trimStart(u8, rest, " \t");
+    if (t.len == 0) return null;
+    if (t[0] == '"') {
+        const end = std.mem.indexOfScalarPos(u8, t, 1, '"') orelse return null;
+        return .{ .text = t[1..end], .remaining = t[end + 1 ..] };
+    }
+    const end = std.mem.indexOfAny(u8, t, " \t") orelse t.len;
+    return .{ .text = t[0..end], .remaining = t[end..] };
+}
+
+/// Scan shader source for parameter declarations + meta. Pure —
 /// unit-tested without GL. Malformed lines are skipped; at most
 /// MAX_PARAMS are collected.
-pub fn parseParams(src: []const u8, out: *[MAX_PARAMS]Param) usize {
+pub fn parseParams(src: []const u8, out: *[MAX_PARAMS]Param, meta: ?*Meta) usize {
     var count: usize = 0;
     var lines = std.mem.splitScalar(u8, src, '\n');
     while (lines.next()) |line_raw| {
-        if (count >= MAX_PARAMS) break;
         const line = std.mem.trim(u8, line_raw, " \t\r");
-        const marker = "//@param ";
-        if (!std.mem.startsWith(u8, line, marker)) continue;
-        var it = std.mem.tokenizeAny(u8, line[marker.len..], " \t");
-        const pname = it.next() orelse continue;
-        const pdefault = it.next() orelse continue;
-        if (pname.len == 0 or pname.len > 31) continue;
-        const val = std.fmt.parseFloat(f32, pdefault) catch continue;
-        var p = Param{ .default_value = val, .name_len = @intCast(pname.len) };
-        @memcpy(p.name_buf[0..pname.len], pname);
-        out[count] = p;
-        count += 1;
+
+        if (meta) |m| {
+            if (std.mem.startsWith(u8, line, "//@name ")) {
+                const t = std.mem.trim(u8, line["//@name ".len..], " \t");
+                const n = @min(t.len, m.title_buf.len);
+                @memcpy(m.title_buf[0..n], t[0..n]);
+                m.title_len = @intCast(n);
+                continue;
+            }
+            if (std.mem.startsWith(u8, line, "//@desc ")) {
+                const t = std.mem.trim(u8, line["//@desc ".len..], " \t");
+                const n = @min(t.len, m.desc_buf.len);
+                @memcpy(m.desc_buf[0..n], t[0..n]);
+                m.desc_len = @intCast(n);
+                continue;
+            }
+        }
+        if (count >= MAX_PARAMS) continue;
+
+        // RetroArch: #pragma parameter name "Label" default min max [step]
+        if (std.mem.startsWith(u8, line, "#pragma parameter ")) {
+            var rest = line["#pragma parameter ".len..];
+            var p = Param{};
+            const nm = takeQuoted(rest) orelse continue;
+            if (!setName(&p, nm.text)) continue;
+            rest = nm.remaining;
+            const lb = takeQuoted(rest) orelse continue;
+            setLabel(&p, lb.text);
+            rest = lb.remaining;
+            var it = std.mem.tokenizeAny(u8, rest, " \t");
+            p.default_value = std.fmt.parseFloat(f32, it.next() orelse continue) catch continue;
+            p.min = std.fmt.parseFloat(f32, it.next() orelse continue) catch continue;
+            p.max = std.fmt.parseFloat(f32, it.next() orelse continue) catch continue;
+            if (it.next()) |s| p.step = std.fmt.parseFloat(f32, s) catch 0.01;
+            if (p.max <= p.min) continue;
+            out[count] = p;
+            count += 1;
+            continue;
+        }
+
+        // //@param name default [min max [step]] ["Label"]
+        if (std.mem.startsWith(u8, line, "//@param ")) {
+            var rest = line["//@param ".len..];
+            var p = Param{};
+            const nm = takeQuoted(rest) orelse continue;
+            if (!setName(&p, nm.text)) continue;
+            rest = nm.remaining;
+            const dv = takeQuoted(rest) orelse continue;
+            p.default_value = std.fmt.parseFloat(f32, dv.text) catch continue;
+            rest = dv.remaining;
+            // Optional min/max/step, then optional quoted label.
+            var floats: [3]f32 = undefined;
+            var nfloats: usize = 0;
+            while (nfloats < 3) {
+                const tk = takeQuoted(rest) orelse break;
+                if (tk.text.len > 0 and tk.text[0] == '/') break; // trailing comment
+                const v = std.fmt.parseFloat(f32, tk.text) catch break;
+                floats[nfloats] = v;
+                nfloats += 1;
+                rest = tk.remaining;
+            }
+            if (nfloats >= 2) {
+                p.min = floats[0];
+                p.max = floats[1];
+                if (nfloats == 3) p.step = floats[2];
+            } else {
+                // Derive a usable range around the default.
+                p.min = 0;
+                p.max = @max(1.0, p.default_value * 2.0);
+            }
+            if (takeQuoted(rest)) |lb| {
+                if (lb.text.len > 0 and lb.text[0] != '/') setLabel(&p, lb.text);
+            }
+            if (p.max <= p.min) continue;
+            out[count] = p;
+            count += 1;
+            continue;
+        }
+
+        // //@color name r g b ["Label"]
+        if (std.mem.startsWith(u8, line, "//@color ")) {
+            var rest = line["//@color ".len..];
+            var p = Param{ .kind = .color };
+            const nm = takeQuoted(rest) orelse continue;
+            if (!setName(&p, nm.text)) continue;
+            rest = nm.remaining;
+            var ok = true;
+            for (0..3) |i| {
+                const tk = takeQuoted(rest) orelse {
+                    ok = false;
+                    break;
+                };
+                p.default_color[i] = std.fmt.parseFloat(f32, tk.text) catch {
+                    ok = false;
+                    break;
+                };
+                rest = tk.remaining;
+            }
+            if (!ok) continue;
+            if (takeQuoted(rest)) |lb| {
+                if (lb.text.len > 0 and lb.text[0] != '/') setLabel(&p, lb.text);
+            }
+            out[count] = p;
+            count += 1;
+            continue;
+        }
     }
     return count;
 }
 
-test "parseParams: extracts name/default, skips malformed" {
+test "parseParams: //@param with range/label, defaults derived" {
     const src =
-        "// a comment\n" ++
-        "//@param glow 0.55\n" ++
-        "  //@param vignette 0.28  // trailing words ignored\n" ++
+        "//@param glow 0.55 0.0 2.0 0.05 \"Glow strength\"\n" ++
+        "  //@param vignette 0.28\n" ++
         "//@param broken\n" ++
         "//@param bad_value abc\n" ++
         "uniform float glow;\n";
     var params: [MAX_PARAMS]Param = undefined;
-    const n = parseParams(src, &params);
+    const n = parseParams(src, &params, null);
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqualStrings("glow", params[0].name());
+    try std.testing.expectEqualStrings("Glow strength", params[0].label());
     try std.testing.expectEqual(@as(f32, 0.55), params[0].default_value);
+    try std.testing.expectEqual(@as(f32, 2.0), params[0].max);
+    try std.testing.expectEqual(@as(f32, 0.05), params[0].step);
     try std.testing.expectEqualStrings("vignette", params[1].name());
-    try std.testing.expectEqual(@as(f32, 0.28), params[1].default_value);
+    try std.testing.expectEqualStrings("vignette", params[1].label());
+    try std.testing.expectEqual(@as(f32, 1.0), params[1].max);
+}
+
+test "parseParams: RetroArch #pragma parameter + meta + color" {
+    const src =
+        "//@name Amber CRT\n" ++
+        "//@desc Phosphor monitor with scanlines.\n" ++
+        "#pragma parameter SCANLINE \"Scanline strength\" 0.22 0.0 1.0 0.01\n" ++
+        "#pragma parameter CURV \"Curvature\" 0.06 0.0 0.5\n" ++
+        "//@color phosphor 1.0 0.7 0.2 \"Phosphor tint\"\n";
+    var params: [MAX_PARAMS]Param = undefined;
+    var meta = Meta{};
+    const n = parseParams(src, &params, &meta);
+    try std.testing.expectEqualStrings("Amber CRT", meta.title());
+    try std.testing.expectEqualStrings("Phosphor monitor with scanlines.", meta.desc());
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("SCANLINE", params[0].name());
+    try std.testing.expectEqualStrings("Scanline strength", params[0].label());
+    try std.testing.expectEqual(@as(f32, 0.01), params[0].step);
+    try std.testing.expectEqualStrings("CURV", params[1].name());
+    try std.testing.expectEqual(@as(f32, 0.5), params[1].max);
+    try std.testing.expectEqual(ParamKind.color, params[2].kind);
+    try std.testing.expectEqual(@as(f32, 0.7), params[2].default_color[1]);
+    try std.testing.expectEqualStrings("Phosphor tint", params[2].label());
 }
 
 const VERT_SRC =
@@ -153,6 +335,7 @@ pub const ShaderPass = struct {
     /// Tunable uniforms parsed from `//@param` lines at build time.
     params: [MAX_PARAMS]Param = undefined,
     params_len: usize = 0,
+    meta: Meta = .{},
 
     pub fn forgetGL(self: *ShaderPass) void {
         self.program = 0;
@@ -221,7 +404,8 @@ pub const ShaderPass = struct {
         // Tunable uniforms: //@param declarations → locations. A
         // param whose uniform got optimized out keeps loc -1 and is
         // skipped at upload.
-        self.params_len = parseParams(user, &self.params);
+        self.meta = .{};
+        self.params_len = parseParams(user, &self.params, &self.meta);
         for (self.params[0..self.params_len]) |*p| {
             var name_z: [33]u8 = undefined;
             @memcpy(name_z[0..p.name_len], p.name());
@@ -298,13 +482,18 @@ pub const ShaderPass = struct {
         for (self.params[0..self.params_len]) |p| {
             if (p.loc < 0) continue;
             var value = p.default_value;
+            var color = p.default_color;
             for (overrides) |kv| {
                 if (std.mem.eql(u8, kv.name, p.name())) {
                     value = kv.value;
+                    if (kv.color) |col| color = col;
                     break;
                 }
             }
-            c.glUniform1f(p.loc, value);
+            switch (p.kind) {
+                .float => c.glUniform1f(p.loc, value),
+                .color => c.glUniform3f(p.loc, color[0], color[1], color[2]),
+            }
         }
         self.last_time_s = time_s;
         self.frame_counter +%= 1;

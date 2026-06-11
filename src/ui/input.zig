@@ -119,6 +119,9 @@ pub const Action = enum {
     /// Move the current tab into its own new window (also available
     /// by dragging the tab out of the tab bar).
     detach_tab,
+    /// Open the dynamic shader-config dialog (sliders/colors from
+    /// the focused pane's shader parameter declarations).
+    configure_shader,
     /// Dump scrollback + visible screen to a temp file and open it
     /// in a pager (`less -R +G`, or `$PAGER`) in a new tab. Kitty's
     /// show_scrollback equivalent.
@@ -294,6 +297,7 @@ pub fn actionName(a: Action) []const u8 {
         .goto_tab_9 => "goto_tab_9",
         .duplicate_tab => "duplicate_tab",
         .detach_tab => "detach_tab",
+        .configure_shader => "configure_shader",
         .show_scrollback => "show_scrollback",
         .new_durable_tab => "new_durable_tab",
         .paste_clipboard => "paste_clipboard",
@@ -362,6 +366,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .goto_tab_9 => "Jump to tab 9",
         .duplicate_tab => "Duplicate tab (cwd + profile)",
         .detach_tab => "Detach tab into a new window",
+        .configure_shader => "Configure shader (sliders for the pane's shader params)",
         .show_scrollback => "Show scrollback in pager",
         .new_durable_tab => "New durable tab (mux)",
         .paste_clipboard => "Paste clipboard",

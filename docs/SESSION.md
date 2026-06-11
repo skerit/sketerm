@@ -4580,3 +4580,35 @@ Tests 454 → 466.
   rebuild zig-out/bin/sketerm — a live-test after config.zig edits
   ran a stale GUI and printed "unknown key", looking like a parse
   bug. Plain `zig build` first, then live-test.
+
+## 2026-06-11 (later night): shader config dialog + RetroArch param format
+
+- Param declarations now use RetroArch's `#pragma parameter name
+  "Label" default min max [step]` (their CRT shader ecosystem's
+  convention; Mesa ignores unknown pragmas) plus sketerm extensions:
+  //@color name r g b "Label" (vec3 — RetroArch is floats-only),
+  //@name + //@desc for dialog headers. //@param still parses
+  (extended: default [min max [step]] ["Label"]). parseParams is
+  pure + unit-tested; Param carries label/min/max/step/kind/color.
+  NOTE: only the PARAM FORMAT is RetroArch-compatible — full .slang/
+  .glslp presets are multi-pass with different entry points and do
+  NOT run as-is; single-pass bodies need porting to mainImage.
+- Colors: shader_param.<name> = #rrggbb in config (round-trip
+  tested); ParamKV gained color: ?[3]f32; upload via glUniform3f.
+- src/ui/shader_dialog.zig: "Configure Shader…" (context menu +
+  configure_shader action) builds an AdwPreferencesDialog
+  dynamically: GtkScale per float param (range/step/digits from
+  metadata), GtkColorDialogButton per color, group header from
+  //@name//@desc, reset-to-defaults row. Every change goes through
+  Window.setShaderParam → config mutate (in the CONFIG ARENA —
+  created on demand for default configs) → repointShaderOverrides
+  (append can REALLOC items; every Source must re-point) → queue
+  renders → persistConfig. No shader active → falls back to the
+  file picker. LIFETIME: RowCtx carries its own allocator — its
+  destroy-notify runs after the dialog Ctx is freed on "closed".
+- Shipped CRTs converted to pragma params + phosphor //@color (the
+  amber/green twins now only differ by tint default). smoke-cell
+  unchanged-but-meaningful: amber=1521 proves the vec3 default
+  upload (else black), mono-override still collapses to 264.
+- Verified live: dialog opens via `cli action configure_shader`
+  with zero criticals, app + IPC responsive under the modal.
