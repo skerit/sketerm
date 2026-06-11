@@ -76,6 +76,9 @@ pub const Pane = struct {
     /// Fired exactly once when the PTY child exits. Window decides
     /// what to do (close pane / restart shell / hold).
     win_on_child_exit: ?*const fn (ctx: ?*anyopaque, pane: *Pane, status: i32) void = null,
+    /// Forward mux session renames so Window can retitle the tab.
+    win_session_rename_ctx: ?*anyopaque = null,
+    win_on_session_renamed: ?*const fn (ctx: ?*anyopaque, pane: *Pane, name: []const u8) void = null,
     /// Cursor blink timing.
     last_blink_us: i64 = 0,
     /// GTK tick callback id (0 = not registered). The tick is the
@@ -299,6 +302,7 @@ pub const Pane = struct {
         terminal.on_progress = onProgressEvent;
         terminal.on_bell = onBellEvent;
         terminal.on_pointer_shape = onPointerShapeEvent;
+        terminal.on_session_renamed = onSessionRenamedEvent;
 
         _ = c.g_signal_connect_data(
             area_widget,
@@ -1107,6 +1111,11 @@ fn onNotificationEvent(ctx: ?*anyopaque, title: []const u8, body: []const u8) vo
     if (self.win_on_notification) |f| f(self.win_notify_ctx, title, body);
 }
 
+fn onSessionRenamedEvent(ctx: ?*anyopaque, name: []const u8) void {
+    const self = cast.userData(Pane, ctx);
+    if (self.win_on_session_renamed) |f| f(self.win_session_rename_ctx, self, name);
+}
+
 fn onBellEvent(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
     if (self.win_on_bell) |f| f(self.win_bell_ctx, self);
@@ -1364,6 +1373,15 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
             }
         }
         return false;
+    }
+
+    // Mux session rows (detach / rename / kill) only make sense on a
+    // remote pane; menu.zig hides the rows of disabled mux actions.
+    const is_remote = self.terminal.remote != null;
+    for ([_][*:0]const u8{ "mux-detach", "mux-rename", "mux-kill" }) |name| {
+        if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
+            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(is_remote));
+        }
     }
 
     // Free any URI captured from a previous popup.

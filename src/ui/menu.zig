@@ -26,6 +26,9 @@ pub const Action = enum {
     split_v,
     close_pane,
     set_pane_title,
+    mux_detach,
+    mux_rename,
+    mux_kill,
     reset_terminal,
     copy_link,
     prefs_open,
@@ -47,12 +50,24 @@ const ActionSlot = struct {
 /// paste) — the hook may perform its own action instead.
 pub const PrePopupFn = *const fn (ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f64) bool;
 
+const N_REMOTE_ROWS = blk: {
+    var n: usize = 0;
+    for (BINDS) |b| {
+        if (b.remote_only) n += 1;
+    }
+    break :blk n;
+};
+
 const ClickCtx = struct {
     allocator: std.mem.Allocator,
     popover: *c.GtkWidget,
     group: *c.GSimpleActionGroup,
     pre_popup_fn: ?PrePopupFn = null,
     pre_popup_ctx: ?*anyopaque = null,
+    /// Remote-only row buttons + their leading separator; shown only
+    /// when the pre-popup hook enabled the mux actions. Children of
+    /// the popover, so the pointers never outlive it.
+    remote_widgets: [N_REMOTE_ROWS + 1]?*c.GtkWidget = @splat(null),
 };
 
 const Bind = struct {
@@ -66,6 +81,10 @@ const Bind = struct {
     /// ordered for display (it doubles as the row list and the action
     /// source).
     section: u8,
+    /// Row only makes sense on a mux-attached (remote) pane. These
+    /// rows (and their section separator) are hidden when the
+    /// pre-popup hook leaves their action disabled.
+    remote_only: bool = false,
 };
 
 const BINDS = [_]Bind{
@@ -78,6 +97,9 @@ const BINDS = [_]Bind{
     .{ .name = "split-v", .label = "Split Top / Bottom", .detailed = "term.split-v", .icon = "sketerm-split-top-bottom-symbolic", .action = .split_v, .section = 1 },
     .{ .name = "set-pane-title", .label = "Set Pane Title…", .detailed = "term.set-pane-title", .icon = "document-edit-symbolic", .action = .set_pane_title, .section = 1 },
     .{ .name = "close-pane", .label = "Close Pane", .detailed = "term.close-pane", .icon = "window-close-symbolic", .action = .close_pane, .section = 1 },
+    .{ .name = "mux-detach", .label = "Detach Session", .detailed = "term.mux-detach", .icon = "network-offline-symbolic", .action = .mux_detach, .section = 4, .remote_only = true },
+    .{ .name = "mux-rename", .label = "Rename Session…", .detailed = "term.mux-rename", .icon = "document-edit-symbolic", .action = .mux_rename, .section = 4, .remote_only = true },
+    .{ .name = "mux-kill", .label = "Kill Session", .detailed = "term.mux-kill", .icon = "process-stop-symbolic", .action = .mux_kill, .section = 4, .remote_only = true },
     .{ .name = "new-tab", .label = "New Tab", .detailed = "term.new-tab", .icon = "tab-new-symbolic", .action = .new_tab, .section = 2 },
     .{ .name = "new-tab-as-profile", .label = "New Tab as Profile…", .detailed = "term.new-tab-as-profile", .icon = "tab-new-symbolic", .action = .new_tab_as_profile, .section = 2 },
     .{ .name = "duplicate-tab", .label = "Duplicate Tab", .detailed = "term.duplicate-tab", .icon = "edit-copy-symbolic", .action = .duplicate_tab, .section = 2 },
@@ -133,6 +155,13 @@ pub fn attachWithPrePopup(
     if (c.g_action_map_lookup_action(@ptrCast(group), "copy-link")) |act| {
         c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), 0);
     }
+    // Mux rows default hidden; the pane's pre-popup hook enables them
+    // when its terminal is a remote (mux) attachment.
+    for ([_][*:0]const u8{ "mux-detach", "mux-rename", "mux-kill" }) |name| {
+        if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
+            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), 0);
+        }
+    }
 
     // Popover: a custom GtkPopover holding a column of icon+label
     // buttons. We build the rows by hand because GtkPopoverMenu won't
@@ -143,11 +172,20 @@ pub fn attachWithPrePopup(
     c.gtk_popover_set_has_arrow(@ptrCast(popover), 0);
 
     const list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+    var remote_widgets: [N_REMOTE_ROWS + 1]?*c.GtkWidget = @splat(null);
+    var n_remote: usize = 0;
     var first = true;
     var prev_section: u8 = 0;
     for (BINDS) |b| {
         if (!first and b.section != prev_section) {
-            c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+            const sep = c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL);
+            c.gtk_box_append(@ptrCast(list), sep);
+            // The separator leading INTO the remote section hides
+            // together with its rows.
+            if (b.remote_only) {
+                remote_widgets[n_remote] = sep;
+                n_remote += 1;
+            }
         }
         first = false;
         prev_section = b.section;
@@ -166,6 +204,10 @@ pub fn attachWithPrePopup(
         c.gtk_actionable_set_action_name(@ptrCast(btn), b.detailed);
         _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(list), btn);
+        if (b.remote_only) {
+            remote_widgets[n_remote] = btn;
+            n_remote += 1;
+        }
     }
     c.gtk_popover_set_child(@ptrCast(popover), list);
 
@@ -178,6 +220,7 @@ pub fn attachWithPrePopup(
         .group = @ptrCast(group),
         .pre_popup_fn = pre_popup_fn,
         .pre_popup_ctx = pre_popup_ctx,
+        .remote_widgets = remote_widgets,
     };
     _ = c.g_signal_connect_data(
         click,
@@ -233,6 +276,16 @@ fn onRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaq
     const ctx = cast.userData(ClickCtx, user);
     if (ctx.pre_popup_fn) |f| {
         if (!f(ctx.pre_popup_ctx, ctx.group, x, y)) return;
+    }
+    // Remote-only rows: visible iff the pre-popup hook enabled the
+    // mux actions (i.e. the pane renders a mux session). All three
+    // share one fate, so probing "mux-detach" decides for the lot.
+    var show_remote = false;
+    if (c.g_action_map_lookup_action(@ptrCast(ctx.group), "mux-detach")) |act| {
+        show_remote = c.g_action_get_enabled(@ptrCast(act)) != 0;
+    }
+    for (ctx.remote_widgets) |maybe_w| {
+        if (maybe_w) |w| c.gtk_widget_set_visible(w, @intFromBool(show_remote));
     }
     var rect = c.GdkRectangle{
         .x = @intFromFloat(x),

@@ -26,6 +26,7 @@ pub const FrameType = enum(u8) {
     kill = 8,
     // client → daemon (continued; append-only)
     shutdown = 9,
+    rename = 10,
     // daemon → client
     welcome = 64,
     snapshot = 65,

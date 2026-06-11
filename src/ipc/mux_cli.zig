@@ -21,13 +21,14 @@ const MUX_HELP =
     \\or <host>'s daemon over SSH (`sketerm mux user@box`).
     \\  Up/Down or j/k  select        Enter  attach as tab
     \\  n  new durable tab            x      kill selected session
-    \\  q / Esc  quit
+    \\  r  rename selected session    q / Esc  quit
     \\
     \\Commands (each accepts an optional leading host):
     \\  list                  print sessions
     \\  attach <name>         attach a session as a GUI tab
     \\  new                   spawn a durable tab in the GUI
     \\  kill <name>           kill a session
+    \\  rename <old> <new>    rename a session
     \\
     \\`sketerm ssh <host>` = `sketerm mux <host> new` — open a
     \\remote shell that survives disconnects (key auth required).
@@ -49,7 +50,7 @@ const Welcome = struct {
 };
 
 fn isSubcommand(s2: []const u8) bool {
-    const known = [_][]const u8{ "list", "attach", "new", "kill" };
+    const known = [_][]const u8{ "list", "attach", "new", "kill", "rename" };
     for (known) |k| {
         if (std.mem.eql(u8, s2, k)) return true;
     }
@@ -116,8 +117,23 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
         f.deinit(allocator);
         return 0;
     }
+    if (std.mem.eql(u8, cmd, "rename") and args.len >= 3) {
+        return if (renameSession(allocator, host, args[1], args[2])) 0 else 1;
+    }
     _ = c.fputs(MUX_HELP, c.stdout);
     return 2;
+}
+
+fn renameSession(allocator: std.mem.Allocator, host: ?[]const u8, old: []const u8, new: []const u8) bool {
+    var conn = muxConnect(allocator, host) orelse return false;
+    defer conn.deinit();
+    conn.sendJson(.rename, .{ .name = old, .new_name = new }) catch return false;
+    const f = conn.recvExpect(&.{.ok}) catch {
+        _ = c.fprintf(c.stderr, "sketerm mux: rename failed\n");
+        return false;
+    };
+    f.deinit(allocator);
+    return true;
 }
 
 fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn {
@@ -293,6 +309,32 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
             raw.leave();
             return if (guiCommand(allocator, "new-durable-tab", null, host)) 0 else 1;
         }
+        if (key.len == 1 and key[0] == 'r' and selected < sessions.len) {
+            const name = sessions[selected].name;
+            // Inline cooked-mode prompt: drop raw, read one echoed
+            // line, then restore raw and erase the prompt line.
+            eraseTui(&drawn_lines);
+            raw.leave();
+            _ = c.printf("rename '%.*s' to: ", @as(c_int, @intCast(name.len)), name.ptr);
+            _ = c.fflush(c.stdout);
+            var line_buf: [128]u8 = undefined;
+            const rn = c.read(0, &line_buf, line_buf.len);
+            raw = RawMode.enter() orelse return 1;
+            _ = c.printf("\x1b[A\x1b[2K");
+            if (rn > 0) {
+                const new_name = std.mem.trim(u8, line_buf[0..@intCast(rn)], " \r\n");
+                if (new_name.len > 0 and !std.mem.eql(u8, new_name, name)) {
+                    _ = renameSession(allocator, host, name, new_name);
+                }
+            }
+            parsed.deinit();
+            parsed = fetchSessions(allocator, host) orelse {
+                eraseTui(&drawn_lines);
+                return 1;
+            };
+            if (selected >= parsed.value.sessions.len + 1) selected = parsed.value.sessions.len;
+            continue;
+        }
         if (key.len == 1 and key[0] == 'x' and selected < sessions.len) {
             const name = sessions[selected].name;
             if (muxConnect(allocator, host)) |conn_v| {
@@ -314,7 +356,7 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
 
 fn drawTui(sessions: []const SessionInfo, selected: usize, drawn_lines: *usize) void {
     eraseTui(drawn_lines);
-    _ = c.printf("\x1b[1msketerm sessions\x1b[0m  (Enter attach · n new · x kill · q quit)\r\n");
+    _ = c.printf("\x1b[1msketerm sessions\x1b[0m  (Enter attach · n new · r rename · x kill · q quit)\r\n");
     var lines: usize = 1;
     for (sessions, 0..) |s, i| {
         const marker: [*:0]const u8 = if (i == selected) "\x1b[7m \xe2\x96\xb8 " else "   ";

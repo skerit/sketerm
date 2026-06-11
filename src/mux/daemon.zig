@@ -33,6 +33,11 @@ pub const AttachReq = struct {
     name: []const u8 = "",
 };
 
+pub const RenameReq = struct {
+    name: []const u8 = "",
+    new_name: []const u8 = "",
+};
+
 pub const SessionInfo = struct {
     name: []const u8,
     rows: u16,
@@ -300,6 +305,7 @@ pub const Daemon = struct {
             },
             .list => self.handleList(cl),
             .kill => self.handleKill(cl, frame.payload),
+            .rename => self.handleRename(cl, frame.payload),
             .shutdown => {
                 cl.queueJson(.ok, .{ .ok = true });
                 self.running = false;
@@ -475,6 +481,38 @@ pub const Daemon = struct {
         };
         self.removeSession(s);
         cl.queueJson(.ok, .{ .ok = true });
+    }
+
+    fn handleRename(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(RenameReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad rename request");
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+        if (req.new_name.len == 0 or req.new_name.len > 64) {
+            cl.queueErr("rename needs a name (1-64 chars)");
+            return;
+        }
+        const s = self.findSession(req.name) orelse {
+            cl.queueErr("no such session");
+            return;
+        };
+        if (self.findSession(req.new_name)) |other| {
+            if (other != s) {
+                cl.queueErr("session name already exists");
+                return;
+            }
+        }
+        const fresh = self.allocator.dupe(u8, req.new_name) catch {
+            cl.queueErr("oom");
+            return;
+        };
+        self.allocator.free(s.name);
+        s.name = fresh;
+        cl.queueJson(.ok, .{ .ok = true, .name = s.name });
     }
 
     fn removeSession(self: *Daemon, s: *Session) void {

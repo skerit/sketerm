@@ -1451,6 +1451,8 @@ pub const Window = struct {
         // string clears the lock and lets OSC tracking resume.
         pane.win_title_ctx = @ptrCast(self);
         pane.win_on_title = onTermTitleChanged;
+        pane.win_session_rename_ctx = @ptrCast(self);
+        pane.win_on_session_renamed = onTermSessionRenamed;
     }
 
     /// Sever a pane from the window before teardown: drop every
@@ -1989,6 +1991,82 @@ pub const Window = struct {
         _ = c.gtk_widget_grab_focus(entry);
     }
 
+    const MuxRenameCtx = struct {
+        window: *Window,
+        pane: *Pane,
+        popover: *c.GtkWidget,
+        entry: *c.GtkWidget,
+        allocator: std.mem.Allocator,
+    };
+
+    /// "Rename Session…" on a mux pane: popover entry pre-filled with
+    /// the session name. Enter sends the rename to the daemon; the
+    /// tab retitles only when the daemon's OK comes back.
+    pub fn renameFocusedMuxSession(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+        const remote = pane.terminal.remote orelse return;
+
+        const popover = c.gtk_popover_new();
+        const entry = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(entry), "Session name");
+
+        const z = self.allocator.allocSentinel(u8, remote.session.len, 0) catch null;
+        if (z) |zz| {
+            defer self.allocator.free(zz);
+            @memcpy(zz, remote.session);
+            c.gtk_editable_set_text(@ptrCast(entry), zz.ptr);
+            c.gtk_editable_select_region(@ptrCast(entry), 0, -1);
+        }
+
+        c.gtk_popover_set_child(@ptrCast(popover), entry);
+        c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+        const w = c.gtk_widget_get_width(@ptrCast(pane.area));
+        const rect = c.GdkRectangle{
+            .x = @divFloor(w, 2),
+            .y = 1,
+            .width = 1,
+            .height = 1,
+        };
+        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+
+        const ctx = self.allocator.create(MuxRenameCtx) catch return;
+        ctx.* = .{
+            .window = self,
+            .pane = pane,
+            .popover = popover,
+            .entry = entry,
+            .allocator = self.allocator,
+        };
+
+        _ = c.g_signal_connect_data(
+            entry,
+            "activate",
+            @ptrCast(&onMuxRenameActivate),
+            @ptrCast(ctx),
+            @ptrCast(&freeMuxRenameCtx),
+            c.G_CONNECT_DEFAULT,
+        );
+
+        c.gtk_popover_popup(@ptrCast(popover));
+        _ = c.gtk_widget_grab_focus(entry);
+    }
+
+    /// "Kill Session" on a mux pane: tell the daemon to tear the
+    /// session down, then close the pane. The daemon's GONE broadcast
+    /// covers any other client attached to the same session.
+    pub fn killFocusedMuxSession(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+        const remote = pane.terminal.remote orelse return;
+        if (!remote.closed) {
+            var aw: std.Io.Writer.Allocating = .init(self.allocator);
+            defer aw.deinit();
+            if (std.json.Stringify.value(.{ .name = remote.session }, .{}, &aw.writer)) {
+                remote.conn.sendFrame(.kill, aw.written()) catch {};
+            } else |_| {}
+        }
+        self.closeFocusedPane();
+    }
+
     /// Bump the focused pane's font size by `delta` points (clamped
      /// 6..72) and rebuild the atlas. -1 / +1 / reset are exposed via
      /// Ctrl+- / Ctrl+= / Ctrl+0.
@@ -2495,6 +2573,11 @@ pub const Window = struct {
         };
         errdefer term.deinit();
         term.debug_to_stderr = self.debug_events;
+        // Remember the transport host so session renames can rebuild
+        // the "⌁ name @ host" tab title.
+        if (host) |h| {
+            term.remote.?.host = self.allocator.dupe(u8, h) catch null;
+        }
 
         const pane = try self.makePane(term);
         pane.id = self.allocPaneId();
@@ -3978,6 +4061,11 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch |err| logActionError("split_v", err),
         .close_pane => self.closeFocusedPane(),
         .set_pane_title => self.setFocusedPaneTitle(),
+        // Detach = close the pane; Terminal.deinit on a remote pane
+        // sends DETACH and leaves the session running in the daemon.
+        .mux_detach => self.closeFocusedPane(),
+        .mux_rename => self.renameFocusedMuxSession(),
+        .mux_kill => self.killFocusedMuxSession(),
         .copy_screen => self.copyFocusedScreen(),
         .copy_scrollback => self.copyFocusedScrollback(),
         .prefs_open => self.openPrefs(),
@@ -4158,6 +4246,47 @@ fn onPaneTitleActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void 
 fn freePaneTitleCtx(user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Window.PaneTitleCtx, user);
     ctx.allocator.destroy(ctx);
+}
+
+fn onMuxRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Window.MuxRenameCtx, user);
+    // The pane can close while the popover is open — verify it's
+    // still alive before dereferencing.
+    var alive = false;
+    for (ctx.window.panes.items) |p| {
+        if (p == ctx.pane) {
+            alive = true;
+            break;
+        }
+    }
+    if (alive) {
+        const text_c = c.gtk_editable_get_text(@ptrCast(entry));
+        if (text_c != null) {
+            const text = std.mem.span(@as([*:0]const u8, @ptrCast(text_c)));
+            if (text.len > 0) ctx.pane.terminal.renameSession(text);
+        }
+    }
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+}
+
+fn freeMuxRenameCtx(user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Window.MuxRenameCtx, user);
+    ctx.allocator.destroy(ctx);
+}
+
+/// Wired from `Pane.win_on_session_renamed` — the daemon confirmed a
+/// session rename; rebuild the "⌁ name [@ host]" tab title.
+fn onTermSessionRenamed(ctx: ?*anyopaque, pane: *Pane, name: []const u8) void {
+    const self = cast.userData(Window, ctx);
+    const page = tabPageForPane(self, pane) orelse return;
+    const remote = pane.terminal.remote orelse return;
+    var title_buf: [160:0]u8 = undefined;
+    const title_z = if (remote.host) |h|
+        std.fmt.bufPrintZ(&title_buf, "⌁ {s} @ {s}", .{ name, h }) catch return
+    else
+        std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{name}) catch return;
+    c.adw_tab_page_set_title(page, title_z.ptr);
+    c.adw_tab_page_set_tooltip(page, title_z.ptr);
 }
 
 fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {

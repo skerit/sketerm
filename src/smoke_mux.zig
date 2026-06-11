@@ -201,8 +201,22 @@ pub fn main() u8 {
     if (std.mem.indexOf(u8, lst.payload, "\"smoke\"") == null) fail("list missing session");
     lst.deinit(allocator);
 
+    // Rename: duplicate name rejected, fresh name confirmed and
+    // visible in LIST (under the new name only).
+    conn2.sendJson(.rename, .{ .name = "smoke", .new_name = "" }) catch fail("rename send");
+    (conn2.recvExpect(&.{.err}) catch fail("rename empty not rejected")).deinit(allocator);
+    conn2.sendJson(.rename, .{ .name = "smoke", .new_name = "smoke2" }) catch fail("rename send");
+    (conn2.recvExpect(&.{.ok}) catch fail("rename ok")).deinit(allocator);
+    conn2.sendFrame(.list, "") catch fail("list send");
+    const lst2 = conn2.recvExpect(&.{.welcome}) catch fail("list after rename");
+    if (std.mem.indexOf(u8, lst2.payload, "\"smoke2\"") == null) fail("rename missing in list");
+    if (std.mem.indexOf(u8, lst2.payload, "\"smoke\",") != null) fail("old name still listed");
+    lst2.deinit(allocator);
+    conn2.sendJson(.rename, .{ .name = "nosuch", .new_name = "other" }) catch fail("rename send");
+    (conn2.recvExpect(&.{.err}) catch fail("rename ghost not rejected")).deinit(allocator);
+
     // Kill: attached client gets GONE.
-    conn2.sendJson(.kill, .{ .name = "smoke" }) catch fail("kill send");
+    conn2.sendJson(.kill, .{ .name = "smoke2" }) catch fail("kill send");
     (conn2.recvExpect(&.{.ok}) catch fail("kill ok")).deinit(allocator);
     (conn.recvExpect(&.{.gone}) catch fail("gone")).deinit(allocator);
 

@@ -84,6 +84,9 @@ pub const Terminal = struct {
     on_notification: ?*const fn (ctx: ?*anyopaque, title: []const u8, body: []const u8) void = null,
     on_pointer_shape: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
     on_progress: ?*const fn (ctx: ?*anyopaque, state: u8, percent: u8) void = null,
+    /// Fired when the mux daemon confirmed a session rename. The new
+    /// name is already committed to `remote.session`.
+    on_session_renamed: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
 
     /// Optional broadcast-typing filter. When set, every byte from
     /// USER input (keystrokes, paste, hyperlink launch) goes through
@@ -111,6 +114,12 @@ pub const Terminal = struct {
     pub const Remote = struct {
         conn: mux_client.Conn,
         session: []u8,
+        /// Transport host string ("user@box", "udp:box") or null for
+        /// the local daemon. Owned; set by Window right after attach.
+        host: ?[]u8 = null,
+        /// Rename sent to the daemon, awaiting its OK. Committed to
+        /// `session` on .ok, dropped on .err. Owned while non-null.
+        pending_rename: ?[]u8 = null,
         watch_id: c_uint = 0,
         /// Set when the daemon said GONE/EXIT — no more writes.
         closed: bool = false,
@@ -295,8 +304,47 @@ pub const Terminal = struct {
                 if (self.on_render_request) |f| f(self.user_ctx);
             },
             .exit, .gone => self.remoteClosed("session ended"),
+            // The only request the GUI sends that's answered with
+            // OK/ERR while attached is a rename (resize answers with
+            // a SNAPSHOT; detach is sent during teardown). Guarded by
+            // pending_rename anyway, so a future frame can't misfire.
+            .ok => {
+                const remote = self.remote orelse return;
+                const pending = remote.pending_rename orelse return;
+                remote.pending_rename = null;
+                self.allocator.free(remote.session);
+                remote.session = pending;
+                if (self.on_session_renamed) |f| f(self.user_ctx, pending);
+            },
+            .err => {
+                const remote = self.remote orelse return;
+                if (remote.pending_rename) |pending| {
+                    std.debug.print("sketerm: mux rename of '{s}' rejected: {s}\n", .{ remote.session, frame.payload });
+                    self.allocator.free(pending);
+                    remote.pending_rename = null;
+                }
+            },
             else => {},
         }
+    }
+
+    /// Ask the daemon to rename this remote session. The new name is
+    /// committed (and `on_session_renamed` fired) only when the OK
+    /// frame comes back.
+    pub fn renameSession(self: *Terminal, new_name: []const u8) void {
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        if (new_name.len == 0 or new_name.len > 64) return;
+        if (std.mem.eql(u8, new_name, remote.session)) return;
+        const pending = self.allocator.dupe(u8, new_name) catch return;
+        if (remote.pending_rename) |old| self.allocator.free(old);
+        remote.pending_rename = pending;
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        std.json.Stringify.value(.{ .name = remote.session, .new_name = new_name }, .{}, &aw.writer) catch return;
+        remote.conn.sendFrame(.rename, aw.written()) catch {
+            remote.closed = true;
+        };
     }
 
     fn remoteClosed(self: *Terminal, reason: []const u8) void {
@@ -508,6 +556,7 @@ pub const Terminal = struct {
         self.on_notification = null;
         self.on_progress = null;
         self.on_pointer_shape = null;
+        self.on_session_renamed = null;
     }
 
     /// Send user input bytes (keystrokes, paste, etc) to the PTY,
@@ -599,6 +648,8 @@ pub const Terminal = struct {
             remote.predictor.deinit();
             if (!remote.closed) remote.conn.sendFrame(.detach, "") catch {};
             remote.conn.deinit();
+            if (remote.host) |h| self.allocator.free(h);
+            if (remote.pending_rename) |p| self.allocator.free(p);
             self.allocator.free(remote.session);
             self.allocator.destroy(remote);
             self.screen.deinit();
