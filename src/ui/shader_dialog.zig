@@ -29,7 +29,26 @@ const Ctx = struct {
     dummy_tex: c_uint = 0,
     epoch_us: i64 = 0,
     tick_id: c_uint = 0,
+    preview_area: ?*c.GtkWidget = null,
+    // Teardown is a race: "closed" frees the Ctx, but the preview
+    // GLArea's "unrealize" (GL cleanup) also dereferences it, and the
+    // two fire in an order GTK doesn't pin. Free only once BOTH have
+    // happened (or, with no realized preview, on "closed" alone).
+    has_preview: bool = false,
+    preview_realized: bool = false,
+    closed_seen: bool = false,
+    gl_released: bool = false,
+    free_scheduled: bool = false,
 };
+
+fn maybeScheduleFree(ctx: *Ctx) void {
+    if (ctx.free_scheduled) return;
+    if (!ctx.closed_seen) return;
+    // A realized preview still owes us its unrealize (GL teardown).
+    if (ctx.has_preview and ctx.preview_realized and !ctx.gl_released) return;
+    ctx.free_scheduled = true;
+    _ = c.g_idle_add(@ptrCast(&deferredCtxFree), @ptrCast(ctx));
+}
 
 const RowCtx = struct {
     /// Own copy — freeRowCtx (widget destroy-notify) can run AFTER
@@ -188,6 +207,8 @@ pub fn open(win: *Window) bool {
         _ = c.g_signal_connect_data(area, "unrealize", @ptrCast(&onPreviewUnrealize), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(area, "render", @ptrCast(&onPreviewRender), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
         ctx.tick_id = c.gtk_widget_add_tick_callback(area, @ptrCast(&onPreviewTick), @ptrCast(ctx), null);
+        ctx.preview_area = area;
+        ctx.has_preview = true;
         c.adw_preferences_group_add(@ptrCast(@alignCast(pgroup)), area);
         c.adw_preferences_page_add(@ptrCast(@alignCast(page)), @ptrCast(@alignCast(pgroup)));
     }
@@ -271,9 +292,15 @@ fn freeRowCtx(user: ?*anyopaque) callconv(.c) void {
 }
 
 fn onDialogClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {
-    // Defer the free past the destroy chain — the preview GLArea's
-    // unrealize handler (GL cleanup) still needs the Ctx.
-    _ = c.g_idle_add(@ptrCast(&deferredCtxFree), user);
+    const ctx = cast.userData(Ctx, user);
+    ctx.closed_seen = true;
+    // Stop the tick now so no further render references the Ctx after
+    // it is freed.
+    if (ctx.tick_id != 0) {
+        if (ctx.preview_area) |area| c.gtk_widget_remove_tick_callback(area, ctx.tick_id);
+        ctx.tick_id = 0;
+    }
+    maybeScheduleFree(ctx);
 }
 
 fn deferredCtxFree(user: ?*anyopaque) callconv(.c) c.gboolean {
@@ -367,6 +394,7 @@ fn makeDummyTerminal(allocator: std.mem.Allocator) ?[]u8 {
 
 fn onPreviewRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
+    ctx.preview_realized = true;
     c.gtk_gl_area_make_current(area);
     if (c.gtk_gl_area_get_error(area) != null) return;
     const img = makeDummyTerminal(ctx.allocator) orelse return;
@@ -382,6 +410,10 @@ fn onPreviewRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
 
 fn onPreviewUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
+    if (ctx.tick_id != 0) {
+        c.gtk_widget_remove_tick_callback(@ptrCast(area), ctx.tick_id);
+        ctx.tick_id = 0;
+    }
     c.gtk_gl_area_make_current(area);
     ctx.preview_pass.releaseGL();
     if (ctx.dummy_tex != 0) {
@@ -389,6 +421,8 @@ fn onPreviewUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         c.glDeleteTextures(1, &t);
         ctx.dummy_tex = 0;
     }
+    ctx.gl_released = true;
+    maybeScheduleFree(ctx);
 }
 
 fn onPreviewRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(.c) c.gboolean {

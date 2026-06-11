@@ -21,6 +21,10 @@ pub const PaneSpec = struct {
     /// Explicit per-pane shader pick (path). Empty = none saved
     /// (profile/global resolution applies on restore).
     custom_shader: []const u8 = "",
+    /// User explicitly cleared this pane's shader (sticky "off").
+    /// Persisted so the clear survives a restart, mirroring how an
+    /// explicit pick does.
+    shader_cleared: bool = false,
     /// Durable mux pane: session name on the daemon. Empty = a
     /// plain local PTY pane. On restore the session is attached if
     /// it still exists, or recreated under the same name.

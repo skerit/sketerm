@@ -69,6 +69,11 @@ pub const Pane = struct {
     /// menu / palette / restored layout) — config reloads and
     /// profile pushes then leave it alone.
     custom_shader_user: bool = false,
+    /// True when the user explicitly cleared this pane's shader.
+    /// Distinct from "no pick" (which inherits profile/global): a
+    /// cleared pane shows NO shader and, like a user pick, is sticky
+    /// across config reloads and profile pushes.
+    shader_cleared: bool = false,
     image_store: ImageStore,
     allocator: std.mem.Allocator,
     input_ctx: ?*input.Ctx = null,
@@ -444,6 +449,11 @@ pub const Pane = struct {
         _ = c.g_signal_connect_data(focus, "leave", @ptrCast(&onFocusLeave), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(area_widget, @ptrCast(focus));
 
+        // Becoming visible again (tab switched back) must restart the
+        // tick: an animating shader self-removes it while unmapped, so
+        // nothing else would resume the animation.
+        _ = c.g_signal_connect_data(area_widget, "map", @ptrCast(&onAreaMap), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+
         return self;
     }
 
@@ -735,6 +745,8 @@ pub const Pane = struct {
     /// pushes won't overwrite it. Returns false when the file could
     /// not be read (pane falls back to the window default).
     pub fn setCustomShader(self: *Pane, path: ?[]const u8, animate: bool, user_pick: bool) bool {
+        // Setting a real shader cancels an explicit clear.
+        if (path != null) self.shader_cleared = false;
         if (path == null and self.custom_shader_path == null) return true;
         if (path) |p| if (self.custom_shader_path) |cur| {
             if (std.mem.eql(u8, p, cur)) {
@@ -799,13 +811,27 @@ pub const Pane = struct {
     }
 
     /// Point the GL pass at the pane's own shader when one is
-    /// loaded, else at the window-level default.
+    /// loaded, at nothing when the user explicitly cleared it, else
+    /// at the window-level default.
     pub fn refreshShaderBinding(self: *Pane) void {
         if (self.shader_own.src != null) {
             self.shader_pass.source = &self.shader_own;
+        } else if (self.shader_cleared) {
+            self.shader_pass.source = null;
         } else {
             self.shader_pass.source = self.shader_default_source;
         }
+    }
+
+    /// Explicitly turn this pane's shader off (sticky). Picking a
+    /// shader later un-clears it.
+    pub fn clearShader(self: *Pane) void {
+        // Drop any pane-owned shader first.
+        _ = self.setCustomShader(null, self.shader_own.animate, false);
+        self.shader_cleared = true;
+        self.custom_shader_user = false;
+        self.refreshShaderBinding();
+        c.gtk_gl_area_queue_render(@ptrCast(self.area));
     }
 
     /// Set the per-pane title bar text. Called from the on_title sink
@@ -1450,12 +1476,14 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         if (since_bell < 200_000) screen.dirty = true;
     }
 
-    // Custom-shader animation: redraw every frame so iTime advances.
-    if (self.shader_pass.active()) {
-        if (self.shader_pass.source) |src| {
-            if (src.animate) screen.dirty = true;
-        }
-    }
+    // Custom-shader animation: redraw every frame so iTime advances —
+    // but only while the pane is actually on screen. A pane on a
+    // background tab is unmapped; animating it would burn GPU for
+    // pixels nobody sees (and GTK may still tick it briefly during
+    // tab transitions). Tying this to visibility, not focus, keeps
+    // side-by-side splits animating in lockstep.
+    const shader_animating = shaderAnimates(self) and c.gtk_widget_get_mapped(@ptrCast(self.area)) != 0;
+    if (shader_animating) screen.dirty = true;
 
     // Animation: advance frames in the kitty-graphics manager. When
     // any image stepped to a new frame, pull its bytes into the
@@ -1519,11 +1547,27 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         }
         break :blk false;
     };
-    if (!has_blink_work and !has_bell_work and !has_anim_work) {
+    // An animating shader on a visible pane is time-driven work too —
+    // without this the tick self-removed the moment the pane lost
+    // focus (cursor blink stopped keeping it alive) and the shader
+    // froze. Goes idle on its own when the pane is unmapped.
+    if (!has_blink_work and !has_bell_work and !has_anim_work and !shader_animating) {
         self.tick_id = 0;
         return 0; // G_SOURCE_REMOVE
     }
     return 1; // G_SOURCE_CONTINUE
+}
+
+/// Whether the pane's effective shader requests per-frame animation.
+fn shaderAnimates(self: *Pane) bool {
+    if (!self.shader_pass.active()) return false;
+    const src = self.shader_pass.source orelse return false;
+    return src.animate;
+}
+
+fn onAreaMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Pane, user);
+    if (shaderAnimates(self)) self.updateShaderTick();
 }
 
 fn paneMenuSink(ctx: ?*anyopaque, action: menu.Action) void {

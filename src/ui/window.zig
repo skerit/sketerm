@@ -1235,7 +1235,9 @@ pub const Window = struct {
                 if (p.mux_session.len > 0) {
                     if (self.restoreMuxPane(p)) |pane| {
                         if (p.custom_shader.len > 0)
-                            _ = pane.setCustomShader(p.custom_shader, self.config.custom_shader_animation, true);
+                            _ = pane.setCustomShader(p.custom_shader, self.config.custom_shader_animation, true)
+                        else if (p.shader_cleared)
+                            pane.clearShader();
                         return pane.widget();
                     } else |err| {
                         std.debug.print(
@@ -1303,9 +1305,12 @@ pub const Window = struct {
                     .font_size_override = p.font_size,
                 });
                 // Explicit per-pane shader pick (wins over the
-                // profile/global shader applyPaneConfig resolved).
+                // profile/global shader applyPaneConfig resolved), or
+                // an explicit clear that turns the shader off.
                 if (p.custom_shader.len > 0)
-                    _ = pane.setCustomShader(p.custom_shader, self.config.custom_shader_animation, true);
+                    _ = pane.setCustomShader(p.custom_shader, self.config.custom_shader_animation, true)
+                else if (p.shader_cleared)
+                    pane.clearShader();
 
                 try self.panes.append(self.allocator, pane);
                 try self.terminals.append(self.allocator, term);
@@ -1801,9 +1806,9 @@ pub const Window = struct {
 
     fn clearPaneShader(self: *Window) void {
         const pane = self.focusedPane() orelse return;
-        _ = pane.setCustomShader(null, self.config.custom_shader_animation, false);
-        // Re-resolve so a profile/global shader (if any) comes back.
-        self.applyPaneConfigByName(pane);
+        // Explicit, sticky "no shader" — overrides profile/global and
+        // survives config reloads (see Pane.shader_cleared).
+        pane.clearShader();
     }
 
     /// applyPaneConfig with the pane's stored profile re-resolved by
@@ -1962,12 +1967,12 @@ pub const Window = struct {
             }
         }
 
-        // Shader resolution: explicit user pick > profile > global.
-        // The user pick is sticky — config reloads / profile pushes
-        // leave it alone.
+        // Shader resolution: explicit user pick / clear > profile >
+        // global. Both the pick and an explicit clear are sticky —
+        // config reloads / profile pushes leave them alone.
         pane.shader_default_source = &self.shader_source;
         pane.shader_own.overrides = self.config.shader_params.items;
-        if (!pane.custom_shader_user) {
+        if (!pane.custom_shader_user and !pane.shader_cleared) {
             const prof_shader: []const u8 = if (profile) |p| p.custom_shader else "";
             _ = pane.setCustomShader(
                 if (prof_shader.len > 0) prof_shader else null,
@@ -2811,7 +2816,7 @@ pub const Window = struct {
             // for panes without a sticky user pick.
             p.shader_default_source = &self.shader_source;
             p.shader_own.overrides = self.config.shader_params.items;
-            if (!p.custom_shader_user) {
+            if (!p.custom_shader_user and !p.shader_cleared) {
                 const prof_shader: []const u8 = blk: {
                     if (p.active_profile) |pn| {
                         for (self.config.profiles.items) |*pr| {
@@ -2826,7 +2831,7 @@ pub const Window = struct {
                     self.config.custom_shader_animation,
                     false,
                 );
-            } else {
+            } else if (p.custom_shader_user) {
                 p.shader_own.animate = self.config.custom_shader_animation;
             }
             p.refreshShaderBinding();
@@ -4305,6 +4310,7 @@ pub const Window = struct {
                     .font_size = fs,
                     .profile = prof,
                     .custom_shader = shader,
+                    .shader_cleared = p.shader_cleared,
                     .mux_session = mux_session,
                     .mux_host = mux_host,
                 } };

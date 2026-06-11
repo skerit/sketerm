@@ -110,11 +110,16 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float scan = sin(fragCoord.y * 3.14159) * 0.5 + 0.5;
     col *= 1.0 - scanlines * scan;
 
-    // Static noise — texture grain (cool-retro-term style), crawls
-    // while animating. The repeating 256² noise tile reads softer
-    // than per-pixel hash noise.
+    // Static noise — texture grain (cool-retro-term style). The
+    // repeating 256² noise tile reads softer than per-pixel hash
+    // noise. A CONTINUOUS uv offset would translate the tile and
+    // look like a diagonal crawl; instead jump to a fresh random
+    // tile position each ~frame so it flickers in place like real
+    // tube static, with no direction.
     if (noise > 0.0) {
-        vec2 nuv = fragCoord / 256.0 + vec2(fract(iTime * 7.13), fract(iTime * 3.77));
+        float frame = floor(iTime * 24.0);
+        vec2 jump = vec2(hash12(vec2(frame, 11.0)), hash12(vec2(frame, 23.0)));
+        vec2 nuv = fragCoord / 256.0 + jump;
         col += (texture(noiseTex, nuv).rgb - 0.5) * noise;
     }
 

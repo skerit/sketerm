@@ -4749,3 +4749,31 @@ Tests 454 → 466.
   UTF-8 codepoint over a single IPC connection, randomized
   inter-key delay (LCG), extra hesitation before Enter. Pure
   pacing logic in util/humantype.zig (tested; 492 total now).
+
+## 2026-06-12: shader fixes — clear, noise drift, dialog crash, vis-gated anim
+
+- "Clear Pane Shader" did nothing when the shader came from
+  global/profile config: setCustomShader(null) only drops a
+  PER-PANE pick, then re-resolution brought the global back. Added
+  Pane.shader_cleared — an explicit, sticky "no shader" state
+  (refreshShaderBinding → source=null). Survives config reloads &
+  profile pushes (treated like a user pick), persists in layout
+  JSON (PaneSpec.shader_cleared). Picking a shader un-clears.
+- crt.glsl noise crawled diagonally: the uv offset was a CONTINUOUS
+  vec2(fract(iTime*7.13), fract(iTime*3.77)) added to fragCoord,
+  translating the whole tile. Replaced with a per-frame random
+  JUMP (floor(iTime*24) → hash12 → uv) so it flickers in place like
+  real tube static, no direction. smoke-cell noise histogram still
+  wideband.
+- Shader config dialog crashed on close: deferredCtxFree freed the
+  Ctx but NEVER removed the preview GLArea's tick callback, so
+  onPreviewRender kept firing against freed memory. Now the tick is
+  removed on closed/unrealize, and the free waits until BOTH
+  "closed" AND GL-release have happened (flags + single guarded
+  g_idle). Also immune to a double "closed".
+- Shader animation now tied to VISIBILITY, not focus. onTick's
+  self-removal didn't count shader animation as keep-alive work, so
+  the tick died the moment cursor-blink stopped (focus loss) and the
+  shader froze. Now: animate while the pane is mapped (any visible
+  split, focused or not); pause when on a background tab. A "map"
+  handler restarts the tick when the tab comes back.
