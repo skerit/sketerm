@@ -4,6 +4,20 @@ Goal: `sketerm app <host> <cmd>` (and eventually durable-tab app
 forwarding) working when the LOCAL machine is a Mac, as transparently
 as the Linux waypipe path — the user never names a backend.
 
+## STATUS (2026-06-12, evening)
+
+Linux side COMPLETE and DEFAULT. All milestones landed in
+src/wlhost/ + daemon + GUI: wire codec/tables, daemon endpoint,
+compositor brain, input (pc105/us keymap over the pipe), resize,
+damage-row copies + deflate, popups, text clipboard, cursor-shape/
+viewporter/fractional-scale. Validated live: weston-terminal, GTK4,
+libadwaita (ghostty: known-incompatible, exits pre-map, app-side).
+Native pipe is the session default; waypipe is opt-in
+(SKETERM_MUX_WAYLAND=waypipe, per-session wl_mode for the headless
+`sketerm app -u` bridge). REMAINING: the macOS merge milestone
+(needs the Mac hardware), waypipe code removal after a cool-down,
+dnd + non-text clipboard as demand appears.
+
 ## DECISION (2026-06-12)
 
 After the analysis below: **go fully native, skip every interim.**
