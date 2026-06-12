@@ -84,6 +84,14 @@ pub const View = struct {
     /// xdg_toplevel.resize with wayland edge flags (1 top, 2 bottom,
     /// 4 left, 8 right, combinable).
     toplevel_resize: ?*const fn (ctx: ?*anyopaque, surface: u32, edges: u32) void = null,
+    /// xdg_toplevel.set_parent — dialogs become transient for
+    /// their parent's host window (0 clears).
+    toplevel_parent: ?*const fn (ctx: ?*anyopaque, surface: u32, parent: u32) void = null,
+    /// xdg_toplevel.set_min_size (0 = unset).
+    toplevel_min_size: ?*const fn (ctx: ?*anyopaque, surface: u32, w: i32, h: i32) void = null,
+    /// App-initiated window ops: 1 maximize, 2 unmaximize,
+    /// 3 fullscreen, 4 unfullscreen, 5 minimize.
+    toplevel_state_request: ?*const fn (ctx: ?*anyopaque, surface: u32, req: u8) void = null,
     /// Committed window geometry: the app's visible rect within
     /// its buffer. Frames are CROPPED to it — the view needs the
     /// offset to translate widget coords back to surface coords.
@@ -105,7 +113,8 @@ const Global = struct {
 const globals = [_]Global{
     .{ .name = 1, .iface = &protocol.wl_compositor, .version = 4 },
     .{ .name = 2, .iface = &protocol.wl_shm, .version = 1 },
-    .{ .name = 3, .iface = &protocol.wl_seat, .version = 1 },
+    // v4: keyboards get repeat_info — held keys repeat client-side.
+    .{ .name = 3, .iface = &protocol.wl_seat, .version = 4 },
     .{ .name = 4, .iface = &protocol.wl_output, .version = 2 },
     .{ .name = 5, .iface = &protocol.xdg_wm_base, .version = 2 },
     // v1 = selection only, no dnd action machinery.
@@ -246,6 +255,8 @@ pub const Compositor = struct {
     /// Surface currently holding pointer / keyboard focus (0 = none).
     pointer_focus: u32 = 0,
     keyboard_focus: u32 = 0,
+    /// Version the client bound wl_seat at (gates repeat_info).
+    seat_version: u32 = 1,
     /// Tight-packed copy handed to toplevel_frame.
     frame_scratch: std.ArrayList(u8) = .empty,
     serial: u32 = 1,
@@ -517,20 +528,40 @@ pub const Compositor = struct {
 
     /// View → client: the host window was resized — tell the app to
     /// redraw at the new size (it acks and commits a new buffer).
-    pub fn configureToplevel(self: *Compositor, sid: u32, w: i32, h: i32, maximized: bool) Error!void {
+    pub const ToplevelState = struct {
+        activated: bool = true,
+        maximized: bool = false,
+        fullscreen: bool = false,
+        resizing: bool = false,
+    };
+
+    pub fn configureToplevel(self: *Compositor, sid: u32, w: i32, h: i32, st: ToplevelState) Error!void {
         const surf = self.surfaces.getPtr(sid) orelse return;
         if (surf.toplevel == 0 or !surf.configured) return;
         if (w <= 0 or h <= 0) return;
-        var buf: [64]u8 = undefined;
+        var buf: [80]u8 = undefined;
         var b = wire.Builder.init(&buf, surf.toplevel, 0); // configure
         b.putInt(w);
         b.putInt(h);
-        var states: [8]u8 = undefined;
-        std.mem.writeInt(u32, states[0..4], 4, .little); // activated
-        // Maximized apps square their corners and drop shadows;
-        // unmaximized resizes carry the resizing state instead.
-        std.mem.writeInt(u32, states[4..8], if (maximized) 1 else 3, .little);
-        b.putArray(&states);
+        var states: [16]u8 = undefined;
+        var n: usize = 0;
+        if (st.maximized) {
+            std.mem.writeInt(u32, states[n..][0..4], 1, .little);
+            n += 4;
+        }
+        if (st.fullscreen) {
+            std.mem.writeInt(u32, states[n..][0..4], 2, .little);
+            n += 4;
+        }
+        if (st.resizing and !st.maximized and !st.fullscreen) {
+            std.mem.writeInt(u32, states[n..][0..4], 3, .little);
+            n += 4;
+        }
+        if (st.activated) {
+            std.mem.writeInt(u32, states[n..][0..4], 4, .little);
+            n += 4;
+        }
+        b.putArray(states[0..n]);
         try self.send(try b.finish());
         var buf2: [16]u8 = undefined;
         var b2 = wire.Builder.init(&buf2, surf.xdg_surface, 0); // configure
@@ -648,6 +679,7 @@ pub const Compositor = struct {
             if (!std.mem.eql(u8, g.iface.name, iname) or ver == 0 or ver > g.version)
                 return Error.Protocol;
             try self.register(id, g.iface);
+            if (g.iface == &protocol.wl_seat) self.seat_version = ver;
             try self.boundGlobal(id, g.iface);
         } else if (iface == &protocol.wl_compositor) switch (hdr.opcode) {
             0 => { // create_surface
@@ -742,6 +774,13 @@ pub const Compositor = struct {
                 try payload.appendSlice(self.allocator, &meta);
                 try payload.appendSlice(self.allocator, us_keymap);
                 try pipe.appendUnit(&self.out, self.allocator, .keymap, payload.items);
+                if (self.seat_version >= 4) {
+                    var rbuf: [16]u8 = undefined;
+                    var rb = wire.Builder.init(&rbuf, id, 5); // repeat_info
+                    rb.putInt(30); // keys/sec
+                    rb.putInt(400); // delay ms
+                    try self.send(try rb.finish());
+                }
             },
             2 => { // get_touch — registered, never speaks
                 try self.register((try it.next()).?.new_id, &protocol.wl_touch);
@@ -1081,6 +1120,28 @@ pub const Compositor = struct {
                 const app_id = (try it.next()).?.string orelse return;
                 if (self.view.toplevel_app_id) |cb| cb(self.view.ctx, sid, app_id);
             },
+            1 => { // set_parent(?toplevel)
+                const ptl = (try it.next()).?.object;
+                const psid = if (ptl != 0) (self.xdg_map.get(ptl) orelse 0) else 0;
+                if (self.view.toplevel_parent) |cb| cb(self.view.ctx, sid, psid);
+            },
+            8 => { // set_min_size(w, h)
+                const mw = (try it.next()).?.int;
+                const mh = (try it.next()).?.int;
+                if (self.view.toplevel_min_size) |cb| cb(self.view.ctx, sid, mw, mh);
+            },
+            9, 10, 12, 13 => { // maximize / unmaximize / unfullscreen / minimize
+                const op: u8 = switch (hdr.opcode) {
+                    9 => 1,
+                    10 => 2,
+                    12 => 4,
+                    else => 5,
+                };
+                if (self.view.toplevel_state_request) |cb| cb(self.view.ctx, sid, op);
+            },
+            11 => { // set_fullscreen(?output)
+                if (self.view.toplevel_state_request) |cb| cb(self.view.ctx, sid, 3);
+            },
             5 => { // move(seat, serial) — app-initiated window drag
                 if (self.view.toplevel_move) |cb| cb(self.view.ctx, sid);
             },
@@ -1090,9 +1151,10 @@ pub const Compositor = struct {
                 const edges = (try it.next()).?.uint;
                 if (self.view.toplevel_resize) |cb| cb(self.view.ctx, sid, edges);
             },
-            // set_parent/min/max/maximize/fullscreen/minimize/menu:
-            // accepted, no window management in v1.
-            1, 4, 7, 8, 9, 10, 11, 12, 13 => {},
+            // show_window_menu needs a real GdkEvent to forward —
+            // there is none for synthetic input; set_max_size has
+            // no GTK4 window API. Both accepted and dropped.
+            4, 7 => {},
             else => return Error.Protocol,
         }
     }

@@ -146,6 +146,9 @@ pub const AppHost = struct {
             .toplevel_resize = onResize,
             .input_region = onInputRegion,
             .toplevel_geometry = onGeometry,
+            .toplevel_parent = onParent,
+            .toplevel_min_size = onMinSize,
+            .toplevel_state_request = onStateRequest,
             .clipboard_offer = onClipOffer,
             .clipboard_data = onClipData,
             .clipboard_read = onClipRead,
@@ -226,6 +229,18 @@ pub const AppHost = struct {
             defer c.g_object_unref(tex);
             c.gtk_widget_set_size_request(popup.picture, w, h);
             c.gtk_picture_set_paintable(@ptrCast(popup.picture), @ptrCast(tex));
+            // Constraint adjustment, slide-style: keep the popup
+            // inside the host window now that its size is known.
+            const pw = c.gtk_widget_get_width(popup.win.picture);
+            const ph = c.gtk_widget_get_height(popup.win.picture);
+            if (pw > 0 and ph > 0) {
+                const mx = c.gtk_widget_get_margin_start(popup.picture);
+                const my = c.gtk_widget_get_margin_top(popup.picture);
+                const cx = std.math.clamp(mx, 0, @max(0, pw - w));
+                const cy = std.math.clamp(my, 0, @max(0, ph - h));
+                if (cx != mx) c.gtk_widget_set_margin_start(popup.picture, cx);
+                if (cy != my) c.gtk_widget_set_margin_top(popup.picture, cy);
+            }
             return;
         }
         const win = self.winFor(surface, w, h) orelse return;
@@ -466,6 +481,9 @@ pub const AppHost = struct {
         // default-size does NOT track maximization — listen and
         // configure with the real allocation + maximized state.
         _ = c.g_signal_connect_data(@ptrCast(window), "notify::maximized", @ptrCast(&onWinResize), win, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(window), "notify::fullscreened", @ptrCast(&onWinResize), win, null, 0);
+        // Apps render inactive chrome when not activated.
+        _ = c.g_signal_connect_data(@ptrCast(window), "notify::is-active", @ptrCast(&onWinState), win, null, 0);
 
         c.gtk_window_present(window);
         return win;
@@ -615,6 +633,35 @@ pub const AppHost = struct {
     /// over terminals, hand over links…).
     /// The app's input region → the host GdkSurface, so clicks in
     /// CSD shadow margins pass through to whatever is underneath.
+    fn onParent(ctx: ?*anyopaque, surface: u32, parent: u32) void {
+        const self = cast.userData(AppHost, ctx);
+        const win = self.windows.get(surface) orelse return;
+        const pwin: ?*c.GtkWindow = if (parent != 0)
+            (if (self.windows.get(parent)) |p| p.window else null)
+        else
+            null;
+        c.gtk_window_set_transient_for(win.window, pwin);
+    }
+
+    fn onMinSize(ctx: ?*anyopaque, surface: u32, mw: i32, mh: i32) void {
+        const self = cast.userData(AppHost, ctx);
+        const win = self.windows.get(surface) orelse return;
+        c.gtk_widget_set_size_request(@ptrCast(win.window), if (mw > 0) mw else -1, if (mh > 0) mh else -1);
+    }
+
+    fn onStateRequest(ctx: ?*anyopaque, surface: u32, req: u8) void {
+        const self = cast.userData(AppHost, ctx);
+        const win = self.windows.get(surface) orelse return;
+        switch (req) {
+            1 => c.gtk_window_maximize(win.window),
+            2 => c.gtk_window_unmaximize(win.window),
+            3 => c.gtk_window_fullscreen(win.window),
+            4 => c.gtk_window_unfullscreen(win.window),
+            5 => c.gtk_window_minimize(win.window),
+            else => {},
+        }
+    }
+
     fn onGeometry(ctx: ?*anyopaque, surface: u32, x: i32, y: i32, gw: i32, gh: i32) void {
         _ = gw;
         _ = gh;
@@ -744,17 +791,27 @@ pub const AppHost = struct {
         if (self.doomed and self.pending_reads == 0) self.finalFree();
     }
 
+    fn winStates(win: *Win) @import("wlhost/compositor.zig").Compositor.ToplevelState {
+        return .{
+            .activated = c.gtk_window_is_active(win.window) != 0,
+            .maximized = c.gtk_window_is_maximized(win.window) != 0,
+            .fullscreen = c.gtk_window_is_fullscreen(win.window) != 0,
+            .resizing = false,
+        };
+    }
+
     fn onWinResize(_: ?*c.GtkWindow, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
-        const maximized = c.gtk_window_is_maximized(win.window) != 0;
+        var st = winStates(win);
         var w: c_int = 0;
         var h: c_int = 0;
-        if (maximized) {
+        if (st.maximized or st.fullscreen) {
             // default-size keeps the unmaximized size; the real
             // allocation is what the app must fill.
             w = c.gtk_widget_get_width(@ptrCast(win.window));
             h = c.gtk_widget_get_height(@ptrCast(win.window));
         } else {
+            st.resizing = true;
             c.gtk_window_get_default_size(win.window, &w, &h);
         }
         if (w <= 0 or h <= 0) return;
@@ -763,7 +820,16 @@ pub const AppHost = struct {
         if ((w == win.buf_w and h == win.buf_h) or (w == win.sent_w and h == win.sent_h)) return;
         win.sent_w = w;
         win.sent_h = h;
-        win.host.comp.configureToplevel(win.surface, w, h, maximized) catch return;
+        win.host.comp.configureToplevel(win.surface, w, h, st) catch return;
+        win.host.flushHost();
+    }
+
+    /// State-only change (focus in/out): configure at the current
+    /// size with fresh states — bypasses the size echo guard.
+    fn onWinState(_: ?*c.GtkWindow, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
+        if (win.buf_w <= 0 or win.buf_h <= 0) return;
+        win.host.comp.configureToplevel(win.surface, win.buf_w, win.buf_h, winStates(win)) catch return;
         win.host.flushHost();
     }
 
