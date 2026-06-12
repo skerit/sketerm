@@ -2438,6 +2438,94 @@ pub const Window = struct {
         c.gtk_popover_popup(@ptrCast(popover));
     }
 
+    /// Right-click → "Apply Profile to Pane…" picker. Same popover
+    /// shape as openProfilePicker, but the pick re-applies the
+    /// chosen profile's settings to the focused LIVE pane instead of
+    /// spawning a tab. "default" is always listed first.
+    pub fn openApplyProfilePicker(self: *Window) void {
+        const pane = self.focusedPane() orelse return;
+
+        const popover = c.gtk_popover_new();
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
+        c.gtk_widget_set_margin_top(box, 6);
+        c.gtk_widget_set_margin_bottom(box, 6);
+        c.gtk_widget_set_margin_start(box, 6);
+        c.gtk_widget_set_margin_end(box, 6);
+
+        var names_buf: [1][]const u8 = .{"default"};
+        addApplyProfileButtons(self, @ptrCast(box), popover, &names_buf);
+        var prof_names = std.ArrayList([]const u8).empty;
+        defer prof_names.deinit(self.allocator);
+        for (self.config.profiles.items) |p| {
+            prof_names.append(self.allocator, p.name) catch break;
+        }
+        addApplyProfileButtons(self, @ptrCast(box), popover, prof_names.items);
+
+        c.gtk_popover_set_child(@ptrCast(popover), box);
+        c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+        c.gtk_popover_popup(@ptrCast(popover));
+    }
+
+    fn addApplyProfileButtons(self: *Window, box: *c.GtkBox, popover: *c.GtkWidget, names: []const []const u8) void {
+        for (names) |name| {
+            const name_z = self.allocator.allocSentinel(u8, name.len, 0) catch continue;
+            @memcpy(name_z, name);
+
+            const btn = c.gtk_button_new_with_label(name_z.ptr);
+            c.gtk_widget_set_halign(btn, c.GTK_ALIGN_FILL);
+            c.gtk_widget_add_css_class(btn, "flat");
+
+            const ctx = self.allocator.create(ProfileButtonCtx) catch {
+                self.allocator.free(name_z);
+                continue;
+            };
+            ctx.* = .{
+                .window = self,
+                .profile_name = name_z,
+                .popover = popover,
+                .allocator = self.allocator,
+            };
+            _ = c.g_signal_connect_data(
+                btn,
+                "clicked",
+                @ptrCast(&onApplyProfilePicked),
+                @ptrCast(ctx),
+                @ptrCast(&freeProfileButtonCtx),
+                c.G_CONNECT_DEFAULT,
+            );
+            c.gtk_box_append(box, btn);
+        }
+    }
+
+    /// Re-apply a profile's settings bundle to a LIVE pane: records
+    /// the pane's profile, pushes settings, and runs the font
+    /// rebuild that applyPaneConfig (a spawn-path helper) leaves to
+    /// the realize path. The shell/$TERM fields only affect future
+    /// respawns — the running child keeps its environment.
+    pub fn applyProfileToPane(self: *Window, pane: *Pane, profile_name: []const u8) void {
+        const profile = self.findProfile(profile_name);
+        pane.active_profile = if (profile) |p| p.name else null;
+
+        const old_size = pane.font_size;
+        const old_path = pane.font_path;
+        const old_family = pane.font_family;
+        const old_features = pane.font_features;
+        const old_line_pad = pane.line_pad_px;
+
+        self.applyPaneConfig(pane, .{ .profile = profile });
+
+        const font_changed = pane.font_size != old_size or
+            !eqOptStr(old_path, pane.font_path) or
+            !eqOptStr(old_family, pane.font_family) or
+            !eqOptStr(old_features, pane.font_features) or
+            pane.line_pad_px != old_line_pad;
+        if (font_changed) pane.refreshFont();
+        c.gtk_widget_queue_resize(pane.widget());
+        pane.terminal.screen.dirty = true;
+        pane.cell_pass.markAllDirty();
+        c.gtk_gl_area_queue_render(@ptrCast(pane.area));
+    }
+
     const PresetButtonCtx = struct {
         window: *Window,
         preset_name: [:0]u8, // owned, freed by GDestroyNotify
@@ -4915,6 +5003,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
             if (!@import("shader_dialog.zig").open(self)) self.pickPaneShader();
         },
         .shader_preset_pick => self.openShaderPresetPicker(),
+        .apply_profile => self.openApplyProfilePicker(),
         .show_scrollback => self.openScrollbackPager(),
         .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
@@ -5052,6 +5141,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
     switch (action) {
         .new_tab => self.newShellTab(null) catch |err| logActionError("new_tab", err),
         .new_tab_as_profile => self.openProfilePicker(),
+        .apply_profile => self.openApplyProfilePicker(),
         .duplicate_tab => self.duplicateCurrentTab(),
         .shader_pick => self.pickPaneShader(),
         .shader_preset => self.openShaderPresetPicker(),
@@ -5242,6 +5332,14 @@ fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 fn freeRenameCtx(user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Window.RenameCtx, user);
     ctx.allocator.destroy(ctx);
+}
+
+fn onApplyProfilePicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Window.ProfileButtonCtx, user);
+    if (ctx.window.focusedPane()) |pane| {
+        ctx.window.applyProfileToPane(pane, ctx.profile_name);
+    }
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
 }
 
 fn onProfilePicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

@@ -114,6 +114,8 @@ const ENTRIES = [_]Entry{
        .desc = "Save current tabs and panes as the default for every new launch.", .action = .save_default_layout },
     .{ .icon = "view-refresh-symbolic", .title = "Reload Config",
        .desc = "Re-read config.conf from disk and apply live.", .action = .reload_config },
+    .{ .icon = "preferences-other-symbolic", .title = "Apply Profile to Pane…",
+       .desc = "Re-style the focused pane with a profile's font/colors/scrollback.", .action = .apply_profile },
 
     // Shaders
     .{ .icon = "starred-symbolic", .title = "Shader Preset…",
