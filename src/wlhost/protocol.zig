@@ -332,6 +332,66 @@ pub const wl_data_device_manager = Interface{
     },
 };
 
+// ─── modern niceties (cursor-shape / viewporter / fractional) ───
+
+pub const wp_cursor_shape_manager_v1 = Interface{
+    .name = "wp_cursor_shape_manager_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "get_pointer", .sig = "no", .new_id_iface = &wp_cursor_shape_device_v1 },
+        .{ .name = "get_tablet_tool_v2", .sig = "no", .new_id_iface = &wp_cursor_shape_device_v1 },
+    },
+};
+
+pub const wp_cursor_shape_device_v1 = Interface{
+    .name = "wp_cursor_shape_device_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "set_shape", .sig = "uu" },
+    },
+};
+
+pub const wp_viewporter = Interface{
+    .name = "wp_viewporter",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "get_viewport", .sig = "no", .new_id_iface = &wp_viewport },
+    },
+};
+
+pub const wp_viewport = Interface{
+    .name = "wp_viewport",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "set_source", .sig = "ffff" },
+        .{ .name = "set_destination", .sig = "ii" },
+    },
+};
+
+pub const wp_fractional_scale_manager_v1 = Interface{
+    .name = "wp_fractional_scale_manager_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "get_fractional_scale", .sig = "no", .new_id_iface = &wp_fractional_scale_v1 },
+    },
+};
+
+pub const wp_fractional_scale_v1 = Interface{
+    .name = "wp_fractional_scale_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "preferred_scale", .sig = "u" },
+    },
+};
+
 // ─── xdg-shell ──────────────────────────────────────────────────
 
 pub const xdg_wm_base = Interface{
@@ -429,6 +489,9 @@ pub const all = [_]*const Interface{
     &wl_touch,       &wl_output,      &xdg_wm_base,    &xdg_positioner,
     &xdg_surface,    &xdg_toplevel,   &xdg_popup,      &wl_data_offer,
     &wl_data_source, &wl_data_device, &wl_data_device_manager,
+    &wp_cursor_shape_manager_v1,      &wp_cursor_shape_device_v1,
+    &wp_viewporter,  &wp_viewport,    &wp_fractional_scale_manager_v1,
+    &wp_fractional_scale_v1,
 };
 
 // ─── tests ──────────────────────────────────────────────────────

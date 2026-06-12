@@ -70,6 +70,9 @@ pub const View = struct {
     /// with sendClipData (ALWAYS answer, even empty — the daemon
     /// holds a pipe fd FIFO-paired with the answers).
     clipboard_read: ?*const fn (ctx: ?*anyopaque, mime: []const u8) void = null,
+    /// wp_cursor_shape set_shape — apply to the pointer-focused
+    /// window (enum per cursor-shape-v1; names match CSS cursors).
+    cursor_shape: ?*const fn (ctx: ?*anyopaque, shape: u32) void = null,
 };
 
 const Global = struct {
@@ -88,6 +91,12 @@ const globals = [_]Global{
     .{ .name = 5, .iface = &protocol.xdg_wm_base, .version = 2 },
     // v1 = selection only, no dnd action machinery.
     .{ .name = 6, .iface = &protocol.wl_data_device_manager, .version = 1 },
+    // Modern niceties many clients probe for. Viewporter is
+    // accept-and-ignore at scale 1; fractional scale always says
+    // 1.0; cursor shapes reach the view.
+    .{ .name = 7, .iface = &protocol.wp_cursor_shape_manager_v1, .version = 1 },
+    .{ .name = 8, .iface = &protocol.wp_viewporter, .version = 1 },
+    .{ .name = 9, .iface = &protocol.wp_fractional_scale_manager_v1, .version = 1 },
 };
 
 const Pool = struct {
@@ -693,6 +702,47 @@ pub const Compositor = struct {
         } else if (iface == &protocol.wl_output) {
             // release — lenient even though we advertise v2.
             try self.destroyObject(hdr.object);
+        } else if (iface == &protocol.wp_cursor_shape_manager_v1) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object),
+            1, 2 => { // get_pointer / get_tablet_tool_v2
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.wp_cursor_shape_device_v1);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wp_cursor_shape_device_v1) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object),
+            1 => { // set_shape(serial, shape)
+                _ = (try it.next()).?; // serial
+                const shape = (try it.next()).?.uint;
+                if (self.view.cursor_shape) |cb| cb(self.view.ctx, shape);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wp_viewporter) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object),
+            1 => { // get_viewport
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.wp_viewport);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wp_viewport) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object),
+            // set_source / set_destination: scale-1 scope — the
+            // destination always equals the buffer size in practice.
+            1, 2 => {},
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wp_fractional_scale_manager_v1) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object),
+            1 => { // get_fractional_scale(id, surface)
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.wp_fractional_scale_v1);
+                var buf: [16]u8 = undefined;
+                var b = wire.Builder.init(&buf, id, 0); // preferred_scale
+                b.putUint(120); // 1.0 in 1/120ths
+                try self.send(try b.finish());
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wp_fractional_scale_v1) {
+            try self.destroyObject(hdr.object); // destroy
         } else if (iface == &protocol.wl_data_device_manager) switch (hdr.opcode) {
             0 => { // create_data_source
                 const id = (try it.next()).?.new_id;
@@ -1128,6 +1178,7 @@ const TestView = struct {
     clip_data: [64]u8 = undefined,
     clip_data_len: usize = 0,
     clip_reads: usize = 0,
+    cursor: u32 = 0,
 
     fn onNew(ctx: ?*anyopaque, surface: u32) void {
         _ = surface;
@@ -1186,6 +1237,10 @@ const TestView = struct {
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
         self.clip_reads += 1;
     }
+    fn onCursor(ctx: ?*anyopaque, shape: u32) void {
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.cursor = shape;
+    }
 
     fn view(self: *TestView) View {
         return .{
@@ -1199,6 +1254,7 @@ const TestView = struct {
             .clipboard_offer = onClipOffer,
             .clipboard_data = onClipData,
             .clipboard_read = onClipRead,
+            .cursor_shape = onCursor,
         };
     }
 };
@@ -1768,6 +1824,83 @@ test "set_cursor is not a destructor; cursor surfaces never reach the view" {
         try req(&comp, try b.finish());
     }
     try t.expectEqual(@as(?*const protocol.Interface, null), comp.objects.get(9));
+}
+
+test "extensions: cursor shape, viewporter, fractional scale" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [80]u8 = undefined;
+
+    { // registry(2), bind all three managers -> 3, 4, 5
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 2, 0);
+        b1.putUint(7);
+        b1.putString("wp_cursor_shape_manager_v1");
+        b1.putUint(1);
+        b1.putNewId(3);
+        try req(&comp, try b1.finish());
+        var b2 = wire.Builder.init(&buf, 2, 0);
+        b2.putUint(8);
+        b2.putString("wp_viewporter");
+        b2.putUint(1);
+        b2.putNewId(4);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 2, 0);
+        b3.putUint(9);
+        b3.putString("wp_fractional_scale_manager_v1");
+        b3.putUint(1);
+        b3.putNewId(5);
+        try req(&comp, try b3.finish());
+    }
+    { // cursor device(6) + set_shape(text=9) -> callback
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putNewId(6);
+        b.putObject(0);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 6, 1);
+        b1.putUint(1);
+        b1.putUint(9);
+        try req(&comp, try b1.finish());
+    }
+    try t.expectEqual(@as(u32, 9), tv.cursor);
+
+    { // viewport on a surface: accepted, inert
+        var bc = wire.Builder.init(&buf, 2, 0);
+        bc.putUint(1);
+        bc.putString("wl_compositor");
+        bc.putUint(1);
+        bc.putNewId(7);
+        try req(&comp, try bc.finish());
+        var bs = wire.Builder.init(&buf, 7, 0);
+        bs.putNewId(8);
+        try req(&comp, try bs.finish());
+        var b = wire.Builder.init(&buf, 4, 1); // get_viewport(9, surf 8)
+        b.putNewId(9);
+        b.putObject(8);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 9, 2); // set_destination
+        b1.putInt(800);
+        b1.putInt(600);
+        try req(&comp, try b1.finish());
+    }
+    try t.expect(!comp.dead);
+
+    // fractional scale: preferred_scale(120) arrives on creation.
+    comp.clearOut();
+    {
+        var b = wire.Builder.init(&buf, 5, 1); // get_fractional_scale(10, surf 8)
+        b.putNewId(10);
+        b.putObject(8);
+        try req(&comp, try b.finish());
+    }
+    const p = (try pipe.peelUnit(comp.takeOut())).?;
+    const hdr = (try wire.parseHeader(p.unit.payload)).?;
+    try t.expectEqual(@as(u32, 10), hdr.object);
+    try t.expectEqual(@as(u16, 0), hdr.opcode); // preferred_scale
+    try t.expectEqual(@as(u32, 120), std.mem.readInt(u32, p.unit.payload[wire.header_size..][0..4], .little));
 }
 
 test "protocol violation produces wl_display.error and dead" {

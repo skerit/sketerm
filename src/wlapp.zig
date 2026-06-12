@@ -101,6 +101,7 @@ pub const AppHost = struct {
             .toplevel_gone = onGone,
             .popup_new = onPopupNew,
             .popup_gone = onPopupGone,
+            .cursor_shape = onCursorShape,
             .clipboard_offer = onClipOffer,
             .clipboard_data = onClipData,
             .clipboard_read = onClipRead,
@@ -510,6 +511,36 @@ pub const AppHost = struct {
         win.host.stampNow();
         win.host.comp.keyboardLeave() catch return;
         win.host.flushHost();
+    }
+
+    /// cursor-shape-v1 enum → CSS cursor names (GDK speaks CSS).
+    const cursor_names = [_][:0]const u8{
+        "default",     "context-menu", "help",        "pointer",
+        "progress",    "wait",         "cell",        "crosshair",
+        "text",        "vertical-text", "alias",      "copy",
+        "move",        "no-drop",      "not-allowed", "grab",
+        "grabbing",    "e-resize",     "n-resize",    "ne-resize",
+        "nw-resize",   "s-resize",     "se-resize",   "sw-resize",
+        "w-resize",    "ew-resize",    "ns-resize",   "nesw-resize",
+        "nwse-resize", "col-resize",   "row-resize",  "all-scroll",
+        "zoom-in",     "zoom-out",
+    };
+
+    /// Remote app sets its cursor: apply to the pointer-focused
+    /// window's picture so the local pointer matches (text beam
+    /// over terminals, hand over links…).
+    fn onCursorShape(ctx: ?*anyopaque, shape: u32) void {
+        const self = cast.userData(AppHost, ctx);
+        if (shape < 1 or shape > cursor_names.len) return;
+        const focus = self.comp.pointer_focus;
+        if (focus == 0) return;
+        const widget: ?*c.GtkWidget = if (self.windows.get(focus)) |win|
+            win.picture
+        else if (self.popups.get(focus)) |p|
+            p.picture
+        else
+            null;
+        if (widget) |wd| c.gtk_widget_set_cursor_from_name(wd, cursor_names[shape - 1].ptr);
     }
 
     // ── clipboard bridge (compositor seat ↔ GdkClipboard) ───────
