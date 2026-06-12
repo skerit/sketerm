@@ -64,13 +64,16 @@ pub fn exePathZ(buf: *[4096:0]u8) ?[:0]const u8 {
 /// defines them as macros over __stdinp/__stdoutp/__stderrp, which
 /// translate-c renders as inline FUNCTIONS — referencing `c.stdout`
 /// there yields a function, not a stream. Always go through these.
-pub inline fn stdin() [*c]c.FILE {
+/// Return type is `?*c.FILE`, not `[*c]c.FILE`: glibc's FILE
+/// translates as an opaque struct, and C pointers to opaque types
+/// are rejected; Darwin's sized `[*c]FILE` coerces to `?*FILE`.
+pub inline fn stdin() ?*c.FILE {
     return if (is_macos) c.stdin() else c.stdin;
 }
-pub inline fn stdout() [*c]c.FILE {
+pub inline fn stdout() ?*c.FILE {
     return if (is_macos) c.stdout() else c.stdout;
 }
-pub inline fn stderr() [*c]c.FILE {
+pub inline fn stderr() ?*c.FILE {
     return if (is_macos) c.stderr() else c.stderr;
 }
 
