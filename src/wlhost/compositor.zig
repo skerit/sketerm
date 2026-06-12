@@ -42,6 +42,8 @@ pub const Error = error{
     OutOfMemory,
 } || wire.Error;
 
+pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
+
 /// Renderer-facing callbacks. Slices are valid only for the call.
 pub const View = struct {
     ctx: ?*anyopaque = null,
@@ -82,6 +84,10 @@ pub const View = struct {
     /// xdg_toplevel.resize with wayland edge flags (1 top, 2 bottom,
     /// 4 left, 8 right, combinable).
     toplevel_resize: ?*const fn (ctx: ?*anyopaque, surface: u32, edges: u32) void = null,
+    /// Committed input region (surface coords). Null slice = the
+    /// whole surface accepts input (the default); empty/partial =
+    /// only those rects do — CSD shadows become click-through.
+    input_region: ?*const fn (ctx: ?*anyopaque, surface: u32, rects: ?[]const Rect) void = null,
 };
 
 const Global = struct {
@@ -146,6 +152,11 @@ const Surface = struct {
     frame_cbs: std.ArrayList(u32) = .empty,
     /// Initial configure sent (xdg dance).
     configured: bool = false,
+    /// Double-buffered input region: set_input_region stages, the
+    /// next commit applies. whole = null region (everything).
+    input_pending: bool = false,
+    input_whole: bool = true,
+    input_rects: std.ArrayList(Rect) = .empty,
 };
 
 /// xdg_positioner state — just enough geometry to place menus.
@@ -209,6 +220,10 @@ pub const Compositor = struct {
     positioners: std.AutoHashMapUnmanaged(u32, Positioner) = .empty,
     /// Surface id of the popup holding an explicit grab (0 = none).
     grabbed_popup: u32 = 0,
+    /// wl_region contents (add rects only; subtract is rare and
+    /// ignored in v1 — the union over-approximates input areas,
+    /// which fails safe).
+    regions: std.AutoHashMapUnmanaged(u32, std.ArrayList(Rect)) = .empty,
     /// Clipboard: app-side data sources and their offered mimes
     /// (owned strings), bound data devices, server-created offers.
     data_sources: std.AutoHashMapUnmanaged(u32, std.ArrayList([]u8)) = .empty,
@@ -246,10 +261,16 @@ pub const Compositor = struct {
         self.pools.deinit(a);
         self.buffers.deinit(a);
         var sit = self.surfaces.valueIterator();
-        while (sit.next()) |s| s.frame_cbs.deinit(a);
+        while (sit.next()) |s| {
+            s.frame_cbs.deinit(a);
+            s.input_rects.deinit(a);
+        }
         self.surfaces.deinit(a);
         self.xdg_map.deinit(a);
         self.positioners.deinit(a);
+        var rit = self.regions.valueIterator();
+        while (rit.next()) |r| r.deinit(a);
+        self.regions.deinit(a);
         var dit = self.data_sources.valueIterator();
         while (dit.next()) |mimes| {
             for (mimes.items) |m| a.free(m);
@@ -627,9 +648,25 @@ pub const Compositor = struct {
                 try self.register(id, &protocol.wl_region);
             },
             else => return Error.Protocol,
-        } else if (iface == &protocol.wl_region) {
-            // destroy/add/subtract — only destroy needs action
-            if (hdr.opcode == 0) try self.destroyObject(hdr.object);
+        } else if (iface == &protocol.wl_region) switch (hdr.opcode) {
+            0 => { // destroy
+                if (self.regions.getPtr(hdr.object)) |r| {
+                    r.deinit(self.allocator);
+                    _ = self.regions.remove(hdr.object);
+                }
+                try self.destroyObject(hdr.object);
+            },
+            1 => { // add(x, y, w, h)
+                const slot = try self.regions.getOrPut(self.allocator, hdr.object);
+                if (!slot.found_existing) slot.value_ptr.* = .empty;
+                const x = (try it.next()).?.int;
+                const y = (try it.next()).?.int;
+                const rw = (try it.next()).?.int;
+                const rh = (try it.next()).?.int;
+                try slot.value_ptr.append(self.allocator, .{ .x = x, .y = y, .w = rw, .h = rh });
+            },
+            2 => {}, // subtract — v1 over-approximates (fails safe)
+            else => return Error.Protocol,
         } else if (iface == &protocol.wl_shm) switch (hdr.opcode) {
             0 => { // create_pool(id, fd, size) — bytes via side-band
                 const id = (try it.next()).?.new_id;
@@ -926,6 +963,7 @@ pub const Compositor = struct {
                 if (self.pointer_focus == hdr.object) self.pointer_focus = 0;
                 if (self.keyboard_focus == hdr.object) self.keyboard_focus = 0;
                 surf.frame_cbs.deinit(self.allocator);
+                surf.input_rects.deinit(self.allocator);
                 _ = self.surfaces.remove(hdr.object);
                 try self.destroyObject(hdr.object);
             },
@@ -937,10 +975,23 @@ pub const Compositor = struct {
                 const cb = (try it.next()).?.new_id;
                 try surf.frame_cbs.append(self.allocator, cb);
             },
+            5 => { // set_input_region(?region) — staged until commit
+                const region = (try it.next()).?.object;
+                surf.input_pending = true;
+                surf.input_rects.clearRetainingCapacity();
+                if (region == 0) {
+                    surf.input_whole = true;
+                } else {
+                    surf.input_whole = false;
+                    if (self.regions.get(region)) |rects| {
+                        try surf.input_rects.appendSlice(self.allocator, rects.items);
+                    }
+                }
+            },
             6 => try self.commit(hdr.object, surf),
-            // damage/damage_buffer/regions/transform/scale/offset:
-            // accepted, ignored (full-copy pipeline).
-            2, 4, 5, 7, 8, 9, 10 => {},
+            // damage/damage_buffer/opaque-region/transform/scale/
+            // offset: accepted, ignored (full-copy pipeline).
+            2, 4, 7, 8, 9, 10 => {},
             else => return Error.Protocol,
         }
     }
@@ -1032,6 +1083,12 @@ pub const Compositor = struct {
         if (surf.has_pending) {
             surf.committed_buffer = surf.pending_buffer;
             surf.has_pending = false;
+        }
+        if (surf.input_pending) {
+            surf.input_pending = false;
+            if (self.view.input_region) |cb| {
+                cb(self.view.ctx, sid, if (surf.input_whole) null else surf.input_rects.items);
+            }
         }
 
         if (surf.xdg_surface != 0 and !surf.configured) {
@@ -1229,6 +1286,7 @@ const TestView = struct {
     clip_reads: usize = 0,
     cursor: u32 = 0,
     ssd: ?bool = null,
+    input_rects: usize = 999,
 
     fn onNew(ctx: ?*anyopaque, surface: u32) void {
         _ = surface;
@@ -1291,6 +1349,11 @@ const TestView = struct {
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
         self.cursor = shape;
     }
+    fn onInputRegion(ctx: ?*anyopaque, surface: u32, rects: ?[]const Rect) void {
+        _ = surface;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.input_rects = if (rects) |r| r.len else 999;
+    }
     fn onDeco(ctx: ?*anyopaque, surface: u32, ssd: bool) void {
         _ = surface;
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
@@ -1311,6 +1374,7 @@ const TestView = struct {
             .clipboard_read = onClipRead,
             .cursor_shape = onCursor,
             .toplevel_decoration = onDeco,
+            .input_region = onInputRegion,
         };
     }
 };
@@ -1957,6 +2021,48 @@ test "extensions: cursor shape, viewporter, fractional scale" {
     try t.expectEqual(@as(u32, 10), hdr.object);
     try t.expectEqual(@as(u16, 0), hdr.opcode); // preferred_scale
     try t.expectEqual(@as(u32, 120), std.mem.readInt(u32, p.unit.payload[wire.header_size..][0..4], .little));
+}
+
+test "input region: staged on set, applied at commit" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+    var b = wire.Builder.init(&buf, 1, 1); // registry(2)
+    b.putNewId(2);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 2, 0); // compositor(3)
+    b.putUint(1);
+    b.putString("wl_compositor");
+    b.putUint(1);
+    b.putNewId(3);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 3, 0); // surface(4)
+    b.putNewId(4);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 3, 1); // region(5)
+    b.putNewId(5);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 5, 1); // add(10,10,100,100)
+    b.putInt(10);
+    b.putInt(10);
+    b.putInt(100);
+    b.putInt(100);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 4, 5); // set_input_region(5)
+    b.putObject(5);
+    try req(&comp, try b.finish());
+    try t.expectEqual(@as(usize, 999), tv.input_rects); // staged, not applied
+    b = wire.Builder.init(&buf, 4, 6); // commit
+    try req(&comp, try b.finish());
+    try t.expectEqual(@as(usize, 1), tv.input_rects);
+    // null region restores whole-surface input
+    b = wire.Builder.init(&buf, 4, 5);
+    b.putObject(0);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 4, 6);
+    try req(&comp, try b.finish());
+    try t.expectEqual(@as(usize, 999), tv.input_rects);
 }
 
 test "xdg-decoration: SSD negotiation reaches the view" {

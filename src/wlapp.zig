@@ -138,6 +138,7 @@ pub const AppHost = struct {
             .toplevel_decoration = onDecoration,
             .toplevel_move = onMove,
             .toplevel_resize = onResize,
+            .input_region = onInputRegion,
             .clipboard_offer = onClipOffer,
             .clipboard_data = onClipData,
             .clipboard_read = onClipRead,
@@ -597,6 +598,25 @@ pub const AppHost = struct {
     /// Remote app sets its cursor: apply to the pointer-focused
     /// window's picture so the local pointer matches (text beam
     /// over terminals, hand over links…).
+    /// The app's input region → the host GdkSurface, so clicks in
+    /// CSD shadow margins pass through to whatever is underneath.
+    fn onInputRegion(ctx: ?*anyopaque, surface: u32, rects: ?[]const @import("wlhost/compositor.zig").Rect) void {
+        const self = cast.userData(AppHost, ctx);
+        const win = self.windows.get(surface) orelse return;
+        const gdk_surface = c.gtk_native_get_surface(@ptrCast(win.window)) orelse return;
+        const list = rects orelse {
+            c.gdk_surface_set_input_region(gdk_surface, null);
+            return;
+        };
+        const region = c.cairo_region_create() orelse return;
+        defer c.cairo_region_destroy(region);
+        for (list) |r| {
+            var cr = c.cairo_rectangle_int_t{ .x = r.x, .y = r.y, .width = r.w, .height = r.h };
+            _ = c.cairo_region_union_rectangle(region, &cr);
+        }
+        c.gdk_surface_set_input_region(gdk_surface, region);
+    }
+
     fn onMove(ctx: ?*anyopaque, surface: u32) void {
         const self = cast.userData(AppHost, ctx);
         const win = self.windows.get(surface) orelse return;
