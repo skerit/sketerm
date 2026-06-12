@@ -59,6 +59,10 @@ pub const ChannelKind = enum(u8) {
     /// units (Wayland messages + shm pool side-band), no waypipe on
     /// either end. The GUI compositor brain consumes it directly.
     wayland_native = 2,
+    /// Window pixel stream (winstream/proto.zig units): remotes
+    /// with no forwardable display protocol — macOS capture agent;
+    /// the stub backend tests the pipeline anywhere.
+    winstream = 3,
     _,
 };
 

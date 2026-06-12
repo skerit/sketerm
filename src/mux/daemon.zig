@@ -17,6 +17,8 @@ const wire = @import("wire.zig");
 const wlwire = @import("../wlhost/wire.zig");
 const wltrack = @import("../wlhost/track.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
+const wsproto = @import("../winstream/proto.zig");
+const WsSource = @import("../winstream/source.zig").Source;
 const snapshot = @import("snapshot.zig");
 const Pty = @import("../pty.zig").Pty;
 const Parser = @import("../parser/vt.zig").Parser;
@@ -87,8 +89,17 @@ const Session = struct {
     /// + shm-mirrored (Channel.native). False = legacy waypipe wrap
     /// (SKETERM_MUX_WAYLAND=waypipe).
     wl_native: bool = false,
+    /// Window-stream agent (pixel capture, no display protocol):
+    /// the macOS backend, or the stub for pipeline testing
+    /// (SKETERM_WINSTREAM=stub). Mutually exclusive with Wayland
+    /// forwarding.
+    winstream: ?*WsSource = null,
 
     fn deinit(self: *Session) void {
+        if (self.winstream) |ws| {
+            ws.deinit();
+            self.allocator.destroy(ws);
+        }
         if (self.wl_hub_fd >= 0) _ = c.close(self.wl_hub_fd);
         var z_buf: [4096]u8 = undefined;
         if (self.wl_hub_path) |p| {
@@ -423,6 +434,7 @@ pub const Daemon = struct {
             }
         }
 
+        self.pumpWinstreams();
         self.reap();
     }
 
@@ -530,6 +542,15 @@ pub const Daemon = struct {
                 const ch = self.findChannel(id) orelse return;
                 if (ch.client != cl or ch.dead) return;
                 if (ch.native != null) return self.nativeClientData(ch, frame.payload[4..]);
+                if (ch.session.winstream) |ws| {
+                    var pos: usize = 0;
+                    const bytes = frame.payload[4..];
+                    while (wsproto.peelUnit(bytes[pos..]) catch null) |p| {
+                        ws.handleInput(p.unit);
+                        pos += p.consumed;
+                    }
+                    return;
+                }
                 ch.pending.appendSlice(ch.allocator, frame.payload[4..]) catch {
                     self.closeChannel(ch, true);
                     return;
@@ -1222,8 +1243,16 @@ pub const Daemon = struct {
         // back into the legacy `waypipe server` wrap (e.g. for
         // GPU-buffer transfer); SKETERM_MUX_NO_WAYLAND=1 disables
         // app forwarding entirely.
+        // Window-stream backend (pixel capture) for app sessions:
+        // today gated on SKETERM_WINSTREAM=stub (pipeline testing
+        // anywhere); the Darwin ScreenCaptureKit backend will key on
+        // builtin.os.tag once it exists.
+        const ws_env = std.c.getenv("SKETERM_WINSTREAM");
+        const want_winstream = ws_env != null and
+            (req.app or std.mem.eql(u8, std.mem.span(ws_env.?), "all"));
+
         var use_waypipe = false;
-        var forwarding_possible = true;
+        var forwarding_possible = !want_winstream;
         if (std.mem.eql(u8, req.wl_mode, "waypipe")) {
             // The client can ONLY bridge waypipe (headless `sketerm
             // app -u`): without waypipe here, forwarding is off —
@@ -1333,6 +1362,13 @@ pub const Daemon = struct {
             s.wl_native = native_wayland;
             hub = null; // ownership moved to the session
         }
+        if (want_winstream) {
+            const ws = allocator.create(WsSource) catch null;
+            if (ws) |w| {
+                w.* = WsSource.init(allocator);
+                s.winstream = w;
+            }
+        }
         screen.sink = .{ .ctx = @ptrCast(s), .on_write_pty = Session.sinkWritePty };
         return s;
     }
@@ -1357,6 +1393,48 @@ pub const Daemon = struct {
         }
         cl.attached = s;
         self.queueSnapshot(cl, s);
+        if (s.winstream != null and cl.proto >= 2) self.openWinstreamChan(s, cl);
+    }
+
+    /// Window-stream channels have no fd (frames originate in the
+    /// daemon) — fd = -1 is ignored by poll; the channel exists for
+    /// id allocation and client routing.
+    fn openWinstreamChan(self: *Daemon, s: *Session, cl: *Client) void {
+        for (self.channels.items) |ch| {
+            if (ch.session == s and !ch.dead and ch.native == null and s.winstream != null) return; // one per session
+        }
+        const ch = self.allocator.create(Channel) catch return;
+        ch.* = .{
+            .allocator = self.allocator,
+            .id = self.next_chan_id,
+            .fd = -1,
+            .session = s,
+            .client = cl,
+        };
+        self.next_chan_id += 1;
+        self.channels.append(self.allocator, ch) catch {
+            ch.deinit();
+            return;
+        };
+        var hdr: [5]u8 = undefined;
+        cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .winstream));
+    }
+
+    /// Pump every live window-stream session: frames toward the
+    /// attached client, bounded by the poll cadence.
+    fn pumpWinstreams(self: *Daemon) void {
+        for (self.channels.items) |ch| {
+            if (ch.dead or ch.native != null) continue;
+            const ws = ch.session.winstream orelse continue;
+            if (ch.client.dead) continue;
+            var ts: c.struct_timespec = undefined;
+            _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+            const now_ms: u64 = @intCast(ts.tv_sec * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));
+            var units: std.ArrayList(u8) = .empty;
+            defer units.deinit(self.allocator);
+            ws.poll(&units, self.allocator, now_ms) catch continue;
+            if (units.items.len > 0) self.queueUnits(ch, units.items);
+        }
     }
 
     fn queueSnapshot(self: *Daemon, cl: *Client, s: *Session) void {

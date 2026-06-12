@@ -535,6 +535,95 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     conn.sendJson(.kill, .{ .name = "wlapp" }) catch fail("app-stage kill");
 }
 
+/// Window-stream pipeline (the macOS-apps-on-Linux transport) with
+/// the stub capture source: spawn an app session, expect win_open +
+/// frames on a winstream channel, send a key, expect the tint to
+/// change (input round-trip).
+fn winstreamStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    _ = c.setenv("SKETERM_WINSTREAM", "stub", 1);
+    defer _ = c.unsetenv("SKETERM_WINSTREAM");
+    const wsproto = @import("winstream/proto.zig");
+
+    var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("ws connect");
+    defer conn.deinit();
+    const tv = c.struct_timeval{ .tv_sec = 15, .tv_usec = 0 };
+    _ = c.setsockopt(conn.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+    conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("ws hello");
+    (conn.recvExpect(&.{.welcome}) catch fail("ws welcome")).deinit(allocator);
+    conn.sendJson(.spawn, .{
+        .name = "wsapp",
+        .argv = [_][]const u8{"/bin/sleep", "60"},
+        .rows = @as(u16, 10),
+        .cols = @as(u16, 40),
+        .app = true,
+    }) catch fail("ws spawn");
+    (conn.recvExpect(&.{.ok}) catch fail("ws spawn ok")).deinit(allocator);
+    conn.sendJson(.attach, .{ .name = "wsapp" }) catch fail("ws attach");
+
+    var chan_id: u32 = 0;
+    var saw_open = false;
+    var tint_before: ?u8 = null;
+    var tint_after: ?u8 = null;
+    var sent_key = false;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(allocator);
+    var rounds: usize = 0;
+    while (tint_after == null and rounds < 600) : (rounds += 1) {
+        const f = conn.recvFrame() catch fail("ws stream read");
+        defer f.deinit(allocator);
+        switch (f.ftype) {
+            .chan_open => {
+                const open = wire.decodeChanOpen(f.payload) orelse fail("ws chan_open");
+                if (open.kind != .winstream) fail("ws channel kind");
+                chan_id = open.id;
+            },
+            .chan_data => {
+                if ((wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
+                raw.appendSlice(allocator, f.payload[4..]) catch fail("oom");
+                var pos: usize = 0;
+                while ((wsproto.peelUnit(raw.items[pos..]) catch fail("ws unit")) != null) {
+                    const p = (wsproto.peelUnit(raw.items[pos..]) catch unreachable).?;
+                    switch (p.unit.tag) {
+                        .win_open => {
+                            const wo = wsproto.decodeWinOpen(p.unit.payload) orelse fail("ws open dec");
+                            if (wo.w != 320 or wo.h != 240) fail("ws open size");
+                            saw_open = true;
+                        },
+                        .win_frame => {
+                            const fr = wsproto.decodeFrame(p.unit.payload) orelse fail("ws frame dec");
+                            if (!sent_key) {
+                                tint_before = fr.pixels[2];
+                            } else if (fr.pixels[2] != tint_before.?) {
+                                tint_after = fr.pixels[2];
+                            }
+                        },
+                        else => {},
+                    }
+                    pos += p.consumed;
+                }
+                const rem = raw.items.len - pos;
+                std.mem.copyForwards(u8, raw.items[0..rem], raw.items[pos..]);
+                raw.shrinkRetainingCapacity(rem);
+                if (saw_open and tint_before != null and !sent_key) {
+                    sent_key = true;
+                    var ub: std.ArrayList(u8) = .empty;
+                    defer ub.deinit(allocator);
+                    var idb: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &idb, chan_id, .little);
+                    ub.appendSlice(allocator, &idb) catch fail("oom");
+                    wsproto.appendInputKey(&ub, allocator, .{ .win = 1, .key = 30, .pressed = true, .mods = 0 }) catch fail("oom");
+                    conn.sendFrame(.chan_data, ub.items) catch fail("ws key send");
+                }
+            },
+            else => {},
+        }
+    }
+    if (!saw_open) fail("winstream window never opened");
+    if (tint_after == null) fail("winstream input never changed the frame");
+    conn.sendJson(.kill, .{ .name = "wsapp" }) catch fail("ws kill");
+    std.debug.print("smoke-mux: winstream stub round-trip ok\n", .{});
+}
+
 /// wl_surface.commit on surface 7 — 8 header bytes, no args.
 fn commitNeedle() [8]u8 {
     var buf: [8]u8 = undefined;
@@ -731,6 +820,9 @@ pub fn main() u8 {
 
     // Native pipe with a REAL Wayland app + the compositor brain.
     realAppStage(allocator, sock_path);
+
+    // Window-stream pipeline (stub capture source).
+    winstreamStage(allocator, sock_path);
 
     // A second client sees the session in LIST.
     var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("connect2");

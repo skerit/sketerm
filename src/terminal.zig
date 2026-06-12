@@ -138,6 +138,8 @@ pub const Terminal = struct {
         /// Sketerm-native app channels: the wlhost compositor brain
         /// renders these as local windows — no waypipe involved.
         napps: std.ArrayList(*NApp) = .empty,
+        /// Window-stream channels (pixel capture remotes).
+        wsapps: std.ArrayList(*WsApp) = .empty,
 
         pub fn sendInput(self: *Remote, bytes: []const u8) void {
             if (self.closed) return;
@@ -164,6 +166,13 @@ pub const Terminal = struct {
         terminal: *Terminal,
         id: u32,
         host: *@import("wlapp.zig").AppHost,
+    };
+
+    /// One window-stream channel (kind winstream).
+    const WsApp = struct {
+        terminal: *Terminal,
+        id: u32,
+        host: *@import("winapp.zig").WsHost,
     };
 
     /// Attach to an existing sketerm-mux session. `conn` must have
@@ -367,6 +376,7 @@ pub const Terminal = struct {
                 const id = mux_wire.decodeChanId(frame.payload) orelse return;
                 if (self.findChan(id)) |ch| self.destroyChan(ch, false);
                 if (self.findNApp(id)) |na| self.destroyNApp(na);
+                if (self.findWsApp(id)) |wa| self.destroyWsApp(wa);
             },
             else => {},
         }
@@ -427,6 +437,10 @@ pub const Terminal = struct {
             self.nappOpen(open.id);
             return;
         }
+        if (open.kind == .winstream) {
+            self.wsappOpen(open.id);
+            return;
+        }
         if (open.kind != .wayland) {
             self.sendChanClose(open.id);
             return;
@@ -453,6 +467,7 @@ pub const Terminal = struct {
     fn chanData(self: *Terminal, payload: []const u8) void {
         const id = mux_wire.decodeChanId(payload) orelse return;
         if (self.findNApp(id)) |na| return self.nappData(na, payload[4..]);
+        if (self.findWsApp(id)) |wa| return self.wsappData(wa, payload[4..]);
         const ch = self.findChan(id) orelse return;
         const bytes = payload[4..];
         // Write-through while the pipe keeps up; buffer the rest and
@@ -502,6 +517,85 @@ pub const Terminal = struct {
         while (remote.napps.items.len > 0) {
             self.destroyNApp(remote.napps.items[remote.napps.items.len - 1]);
         }
+        while (remote.wsapps.items.len > 0) {
+            self.destroyWsApp(remote.wsapps.items[remote.wsapps.items.len - 1]);
+        }
+    }
+
+    // ── window-stream channels (pixel capture remotes) ──────────
+
+    fn findWsApp(self: *Terminal, id: u32) ?*WsApp {
+        const remote = self.remote orelse return null;
+        for (remote.wsapps.items) |wa| {
+            if (wa.id == id) return wa;
+        }
+        return null;
+    }
+
+    fn wsappOpen(self: *Terminal, id: u32) void {
+        const remote = self.remote orelse return;
+        const host = @import("winapp.zig").WsHost.create(self.allocator) catch {
+            self.sendChanClose(id);
+            return;
+        };
+        const wa = self.allocator.create(WsApp) catch {
+            host.destroy();
+            self.sendChanClose(id);
+            return;
+        };
+        wa.* = .{ .terminal = self, .id = id, .host = host };
+        host.on_flush = wsappFlushCb;
+        host.flush_ctx = wa;
+        remote.wsapps.append(self.allocator, wa) catch {
+            host.destroy();
+            self.allocator.destroy(wa);
+            self.sendChanClose(id);
+            return;
+        };
+    }
+
+    fn wsappData(self: *Terminal, wa: *WsApp, bytes: []const u8) void {
+        wa.host.feed(bytes) catch {
+            self.sendChanClose(wa.id);
+            self.destroyWsApp(wa);
+            return;
+        };
+        self.wsappFlush(wa);
+    }
+
+    fn wsappFlush(self: *Terminal, wa: *WsApp) void {
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        const out = wa.host.takeOut();
+        if (out.len == 0) return;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, wa.id, .little);
+        payload.appendSlice(self.allocator, &idb) catch return;
+        payload.appendSlice(self.allocator, out) catch return;
+        wa.host.clearOut();
+        remote.conn.sendFrame(.chan_data, payload.items) catch {
+            remote.closed = true;
+        };
+    }
+
+    fn wsappFlushCb(ctx: ?*anyopaque) void {
+        const wa = @import("util/cast.zig").userData(WsApp, ctx);
+        wa.terminal.wsappFlush(wa);
+    }
+
+    fn destroyWsApp(self: *Terminal, wa: *WsApp) void {
+        wa.host.destroy();
+        if (self.remote) |remote| {
+            for (remote.wsapps.items, 0..) |it, i| {
+                if (it == wa) {
+                    _ = remote.wsapps.swapRemove(i);
+                    break;
+                }
+            }
+        }
+        self.allocator.destroy(wa);
     }
 
     // ── sketerm-native app channels (wlhost compositor) ──────────
@@ -940,6 +1034,7 @@ pub const Terminal = struct {
             self.destroyAllChans();
             remote.channels.deinit(self.allocator);
             remote.napps.deinit(self.allocator);
+            remote.wsapps.deinit(self.allocator);
             remote.predictor.deinit();
             if (!remote.closed) remote.conn.sendFrame(.detach, "") catch {};
             remote.conn.deinit();
