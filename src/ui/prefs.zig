@@ -28,6 +28,8 @@ const WindowOpaque = anyopaque;
 /// panes and persisting to disk.
 pub const ApplyFn = *const fn (win: *WindowOpaque, new_cfg: *const Config) void;
 
+const ProfileSettings = config_mod.ProfileSettings;
+
 const Ctx = struct {
     allocator: std.mem.Allocator,
     /// Owned strings duped from user input (font path, shell, word
@@ -38,6 +40,17 @@ const Ctx = struct {
     apply: ApplyFn,
     /// Working copy. Each row writes here, then we call `apply`.
     cfg: Config,
+    /// The settings bundle the pane-level rows edit: the Default
+    /// settings, or one profile's. Points INTO `cfg` — invalidated
+    /// only by profile create/delete, which immediately reopen the
+    /// dialog with a fresh Ctx.
+    edit: *ProfileSettings,
+    /// Name of the bundle in `edit` ("" = Default). Borrows cfg's
+    /// profile-name string.
+    edit_name: []const u8,
+    /// Needed to reopen the dialog bound to another profile.
+    parent_window: *c.GtkWindow,
+    dialog: ?*c.AdwDialog = null,
 
     fn ev(self: *Ctx) void {
         self.apply(self.win, &self.cfg);
@@ -59,6 +72,22 @@ pub fn open(
     initial: Config,
     apply: ApplyFn,
 ) !void {
+    return openForProfile(allocator, parent_window, win_ptr, initial, apply, "");
+}
+
+/// Open the dialog with the pane-level pages bound to `profile_name`
+/// ("" / "default" / unknown = the Default settings). The Profiles
+/// page's selector switches bundles by closing + reopening here —
+/// rows capture raw field pointers at build time, so rebinding a
+/// live dialog isn't possible.
+fn openForProfile(
+    allocator: std.mem.Allocator,
+    parent_window: *c.GtkWindow,
+    win_ptr: *WindowOpaque,
+    initial: Config,
+    apply: ApplyFn,
+    profile_name: []const u8,
+) !void {
     const ctx = try allocator.create(Ctx);
     errdefer allocator.destroy(ctx);
     ctx.* = .{
@@ -67,6 +96,9 @@ pub fn open(
         .win = win_ptr,
         .apply = apply,
         .cfg = undefined,
+        .edit = undefined,
+        .edit_name = "",
+        .parent_window = parent_window,
     };
     errdefer ctx.arena.deinit();
     // Deep-copy into the dialog's arena: a plain struct copy would
@@ -74,7 +106,26 @@ pub fn open(
     // on the very first row change — dangling working copy.
     ctx.cfg = try initial.cloneInto(ctx.arena.allocator());
 
+    // Resolve the bundle being edited. Unknown / deleted profile
+    // names degrade to the Default settings.
+    ctx.edit = &ctx.cfg.settings;
+    if (profile_name.len > 0 and !std.mem.eql(u8, profile_name, "default")) {
+        for (ctx.cfg.profiles.items) |*p| {
+            if (std.mem.eql(u8, p.name, profile_name)) {
+                ctx.edit = &p.settings;
+                ctx.edit_name = p.name;
+                break;
+            }
+        }
+    }
+
     const dialog = c.adw_preferences_dialog_new();
+    ctx.dialog = @ptrCast(@alignCast(dialog));
+    if (ctx.edit_name.len > 0) {
+        var title_buf: [160:0]u8 = undefined;
+        const t = std.fmt.bufPrintZ(&title_buf, "Preferences — profile “{s}”", .{ctx.edit_name}) catch "Preferences";
+        c.adw_dialog_set_title(@ptrCast(@alignCast(dialog)), t.ptr);
+    }
     // Free Ctx when the dialog goes away.
     _ = c.g_signal_connect_data(
         dialog,
@@ -85,6 +136,7 @@ pub fn open(
         c.G_CONNECT_DEFAULT,
     );
 
+    appendPage(@ptrCast(@alignCast(dialog)), ctx, &profilesPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &appearancePage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &colorsPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &behaviorPage);
@@ -109,6 +161,204 @@ fn appendPage(dialog: *c.AdwPreferencesDialog, ctx: *Ctx, builder: PageBuilder) 
     c.adw_preferences_dialog_add(dialog, @ptrCast(@alignCast(page)));
 }
 
+// ── Profiles page ───────────────────────────────────────────────
+
+fn profilesPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
+    c.adw_preferences_page_set_title(page, "Profiles");
+    c.adw_preferences_page_set_icon_name(page, "system-users-symbolic");
+
+    const sel_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(sel_group)), "Profile being edited");
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(sel_group)), "The pane-level pages (fonts, colors, shell, scrollback, shader) edit this profile. Window, input and keybinding settings are always global.");
+    addEditingProfileRow(@ptrCast(@alignCast(sel_group)), ctx);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(sel_group)));
+
+    const manage_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(manage_group)), "Manage");
+    addNewProfileRow(@ptrCast(@alignCast(manage_group)), ctx);
+    if (ctx.edit_name.len > 0)
+        addDeleteProfileRow(@ptrCast(@alignCast(manage_group)), ctx);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(manage_group)));
+
+    const spawn_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(spawn_group)), "New panes");
+    addDefaultProfileRow(@ptrCast(@alignCast(spawn_group)), ctx);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(spawn_group)));
+}
+
+/// "default" + every named profile as a GtkStringList. Name strings
+/// are arena-duped (the list copies them anyway, but the pointer
+/// array needs a NUL-terminated form).
+fn profileNameModel(ctx: *Ctx) ?*c.GtkStringList {
+    const arena = ctx.arena.allocator();
+    const n = ctx.cfg.profiles.items.len;
+    const arr = arena.alloc(?[*:0]const u8, n + 2) catch return null;
+    arr[0] = "default";
+    for (ctx.cfg.profiles.items, 0..) |p, i| {
+        const z = arena.allocSentinel(u8, p.name.len, 0) catch return null;
+        @memcpy(z, p.name);
+        arr[i + 1] = z.ptr;
+    }
+    arr[n + 1] = null;
+    return c.gtk_string_list_new(@ptrCast(arr.ptr));
+}
+
+/// Index of `name` in the profileNameModel ordering (0 = default).
+fn profileModelIndex(ctx: *Ctx, name: []const u8) c_uint {
+    if (name.len == 0 or std.mem.eql(u8, name, "default")) return 0;
+    for (ctx.cfg.profiles.items, 0..) |p, i| {
+        if (std.mem.eql(u8, p.name, name)) return @intCast(i + 1);
+    }
+    return 0;
+}
+
+/// Model index → profile name ("" = default). Borrows cfg strings.
+fn profileModelName(ctx: *Ctx, idx: c_uint) []const u8 {
+    if (idx == 0 or idx > ctx.cfg.profiles.items.len) return "";
+    return ctx.cfg.profiles.items[idx - 1].name;
+}
+
+fn addEditingProfileRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = profileNameModel(ctx) orelse return;
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Profile");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Switching reopens the dialog bound to that profile.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), profileModelIndex(ctx, ctx.edit_name));
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = editingProfileSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(&freeComboCtx), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn editingProfileSelected(ctx: *Ctx, idx: c_uint) void {
+    const name = profileModelName(ctx, idx);
+    if (std.mem.eql(u8, name, ctx.edit_name)) return;
+    reopenForProfile(ctx, name);
+}
+
+/// Close this dialog and reopen it bound to `name`. The Ctx dies
+/// with the close — capture everything needed first.
+fn reopenForProfile(ctx: *Ctx, name: []const u8) void {
+    const allocator = ctx.allocator;
+    const win = ctx.win;
+    const apply = ctx.apply;
+    const parent_window = ctx.parent_window;
+    const dialog = ctx.dialog;
+    var name_buf: [128]u8 = undefined;
+    const n = @min(name.len, name_buf.len);
+    @memcpy(name_buf[0..n], name[0..n]);
+    var snapshot = ctx.cfg.clone(allocator) catch return;
+    defer snapshot.deinit();
+    // force_close frees ctx via onClosed — no Ctx access past here.
+    if (dialog) |d| c.adw_dialog_force_close(d);
+    openForProfile(allocator, parent_window, win, snapshot, apply, name_buf[0..n]) catch {};
+}
+
+const NewProfileCtx = struct {
+    allocator: std.mem.Allocator,
+    parent: *Ctx,
+    entry: *c.GtkWidget,
+};
+
+fn addNewProfileRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const row = c.adw_entry_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "New profile (copies the profile being edited)");
+    const btn = c.gtk_button_new_with_label("Create");
+    c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_add_css_class(btn, "suggested-action");
+    const nctx = ctx.allocator.create(NewProfileCtx) catch return;
+    nctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .entry = @ptrCast(@alignCast(row)) };
+    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onCreateProfile), @ptrCast(nctx), @ptrCast(&freeNewProfileCtx), c.G_CONNECT_DEFAULT);
+    c.adw_entry_row_add_suffix(@ptrCast(@alignCast(row)), btn);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn onCreateProfile(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const nctx = cast.userData(NewProfileCtx, user);
+    const ctx = nctx.parent;
+    const txt = c.gtk_editable_get_text(@ptrCast(@alignCast(nctx.entry)));
+    if (txt == null) return;
+    const raw = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+    const name = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    if (name.len == 0 or name.len > 64) return;
+    if (std.mem.eql(u8, name, "default")) return;
+    // Section-header syntax can't carry these.
+    if (std.mem.indexOfAny(u8, name, "[]=#") != null) return;
+    for (ctx.cfg.profiles.items) |p| {
+        if (std.mem.eql(u8, p.name, name)) return; // exists
+    }
+    const arena = ctx.arena.allocator();
+    const name_dup = arena.dupe(u8, name) catch return;
+    // Full copy of the bundle being edited; its strings live in the
+    // same arena, and the apply path deep-copies on its side.
+    ctx.cfg.profiles.append(arena, .{
+        .name = name_dup,
+        .settings = ctx.edit.*,
+    }) catch return;
+    ctx.ev();
+    // The append may have reallocated profiles (ctx.edit dangles) —
+    // reopen immediately, bound to the new profile.
+    reopenForProfile(ctx, name_dup);
+}
+
+fn freeNewProfileCtx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const nctx: *NewProfileCtx = @ptrCast(@alignCast(u));
+        nctx.allocator.destroy(nctx);
+    }
+}
+
+fn addDeleteProfileRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const row = c.adw_action_row_new();
+    var title_buf: [160:0]u8 = undefined;
+    const t = std.fmt.bufPrintZ(&title_buf, "Delete profile “{s}”", .{ctx.edit_name}) catch "Delete this profile";
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), t.ptr);
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Panes using it fall back to the Default settings.");
+    const btn = c.gtk_button_new_with_label("Delete");
+    c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_add_css_class(btn, "destructive-action");
+    // User-data is the dialog's main Ctx (managed by onClosed) — no
+    // destroy-notify needed.
+    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onDeleteProfile), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), btn);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn onDeleteProfile(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
+    if (ctx.edit_name.len == 0) return;
+    for (ctx.cfg.profiles.items, 0..) |p, i| {
+        if (std.mem.eql(u8, p.name, ctx.edit_name)) {
+            _ = ctx.cfg.profiles.orderedRemove(i);
+            break;
+        }
+    }
+    if (std.mem.eql(u8, ctx.cfg.default_profile, ctx.edit_name))
+        ctx.cfg.default_profile = "";
+    ctx.ev();
+    reopenForProfile(ctx, "");
+}
+
+fn addDefaultProfileRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = profileNameModel(ctx) orelse return;
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Profile for new panes");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Used by new tabs and splits unless one is picked explicitly.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), profileModelIndex(ctx, ctx.cfg.default_profile));
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = defaultProfileSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(&freeComboCtx), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn defaultProfileSelected(ctx: *Ctx, idx: c_uint) void {
+    const name = profileModelName(ctx, idx);
+    ctx.cfg.default_profile = ctx.dupe(name) catch return;
+    ctx.ev();
+}
+
 // ── Appearance page ─────────────────────────────────────────────
 
 fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
@@ -120,9 +370,9 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addFontFamilyRow(@ptrCast(@alignCast(font_group)), ctx);
     addFontPathRow(@ptrCast(@alignCast(font_group)), ctx);
     addFontFeaturesRow(@ptrCast(@alignCast(font_group)), ctx);
-    addSpinRowU16(@ptrCast(@alignCast(font_group)), ctx, "Size", "Font size in points", 6, 72, &ctx.cfg.settings.font_size, fontSizeChanged);
-    addSpinRowI16(@ptrCast(@alignCast(font_group)), ctx, "Line spacing", "Extra pixels per cell row", -8, 24, &ctx.cfg.settings.line_pad_px, linePadChanged);
-    addSpinRowF32(@ptrCast(@alignCast(font_group)), ctx, "Padding", "Inner padding around the cell grid", 0.0, 32.0, &ctx.cfg.settings.padding, paddingChanged);
+    addSpinRowU16(@ptrCast(@alignCast(font_group)), ctx, "Size", "Font size in points", 6, 72, &ctx.edit.font_size, fontSizeChanged);
+    addSpinRowI16(@ptrCast(@alignCast(font_group)), ctx, "Line spacing", "Extra pixels per cell row", -8, 24, &ctx.edit.line_pad_px, linePadChanged);
+    addSpinRowF32(@ptrCast(@alignCast(font_group)), ctx, "Padding", "Inner padding around the cell grid", 0.0, 32.0, &ctx.edit.padding, paddingChanged);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(font_group)));
 
     const cursor_group = c.adw_preferences_group_new();
@@ -179,7 +429,7 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     const shader_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(shader_group)), "Custom shader");
     c.adw_preferences_group_set_description(@ptrCast(@alignCast(shader_group)), "Shadertoy-style fragment shader applied to the whole frame (CRT, glow, …). Compile errors disable it — the terminal keeps rendering.");
-    addEntryRowString(@ptrCast(@alignCast(shader_group)), ctx, "Shader file (GLSL, mainImage)", "", &ctx.cfg.settings.custom_shader, applyOnly);
+    addEntryRowString(@ptrCast(@alignCast(shader_group)), ctx, "Shader file (GLSL, mainImage)", "", &ctx.edit.custom_shader, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(shader_group)), ctx, "Animate", "Redraw continuously so iTime advances.", &ctx.cfg.custom_shader_animation, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(shader_group)));
 }
@@ -485,10 +735,10 @@ fn cursorShapeSelected(ctx: *Ctx, idx: c_uint) void {
 fn addFontFamilyRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_entry_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Font family (fontconfig name; the font file below wins if set)");
-    if (ctx.cfg.settings.font_family.len > 0) {
+    if (ctx.edit.font_family.len > 0) {
         var z: [256:0]u8 = undefined;
-        const n = @min(ctx.cfg.settings.font_family.len, z.len);
-        @memcpy(z[0..n], ctx.cfg.settings.font_family[0..n]);
+        const n = @min(ctx.edit.font_family.len, z.len);
+        @memcpy(z[0..n], ctx.edit.font_family[0..n]);
         z[n] = 0;
         c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
     }
@@ -501,17 +751,17 @@ fn fontFamilyChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
     const txt = c.gtk_editable_get_text(row);
     if (txt == null) return;
     const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
-    ctx.cfg.settings.font_family = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
+    ctx.edit.font_family = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
     ctx.ev();
 }
 
 fn addFontFeaturesRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_entry_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "OpenType features (e.g. -calt +ss01 zero)");
-    if (ctx.cfg.settings.font_features.len > 0) {
+    if (ctx.edit.font_features.len > 0) {
         var z: [256:0]u8 = undefined;
-        const n = @min(ctx.cfg.settings.font_features.len, z.len);
-        @memcpy(z[0..n], ctx.cfg.settings.font_features[0..n]);
+        const n = @min(ctx.edit.font_features.len, z.len);
+        @memcpy(z[0..n], ctx.edit.font_features[0..n]);
         z[n] = 0;
         c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
     }
@@ -524,14 +774,14 @@ fn fontFeaturesChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void
     const txt = c.gtk_editable_get_text(row);
     if (txt == null) return;
     const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
-    ctx.cfg.settings.font_features = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
+    ctx.edit.font_features = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
     ctx.ev();
 }
 
 fn addFontPathRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_action_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Font file");
-    const sub = if (ctx.cfg.settings.font_path) |fp| fp else "(default search path)";
+    const sub = if (ctx.edit.font_path) |fp| fp else "(default search path)";
     var z: [512:0]u8 = undefined;
     const n = @min(sub.len, z.len);
     @memcpy(z[0..n], sub[0..n]);
@@ -565,7 +815,7 @@ fn onChooseFontDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaq
     // Ctx allocator since the working cfg in the dialog has no arena
     // — apply path will arena-dupe on persist).
     const dup = ctx.dupe(slice) catch return;
-    ctx.cfg.settings.font_path = dup;
+    ctx.edit.font_path = dup;
     ctx.ev();
 }
 
@@ -618,10 +868,10 @@ fn colorsPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     // Defaults (fg / bg / cursor + auto-theme + cursor_color_default).
     const defaults_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(defaults_group)), "Defaults");
-    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Foreground", &ctx.cfg.settings.default_fg);
-    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Background", &ctx.cfg.settings.default_bg);
-    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Cursor", &ctx.cfg.settings.cursor_color);
-    addSwitchRow(@ptrCast(@alignCast(defaults_group)), ctx, "Cursor uses foreground", "Override the explicit cursor colour with the foreground.", &ctx.cfg.settings.cursor_color_default, applyOnly);
+    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Foreground", &ctx.edit.default_fg);
+    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Background", &ctx.edit.default_bg);
+    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Cursor", &ctx.edit.cursor_color);
+    addSwitchRow(@ptrCast(@alignCast(defaults_group)), ctx, "Cursor uses foreground", "Override the explicit cursor colour with the foreground.", &ctx.edit.cursor_color_default, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(defaults_group)), ctx, "Auto theme", "Follow Adwaita dark/light at runtime.", &ctx.cfg.auto_theme, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(defaults_group)));
 
@@ -674,7 +924,7 @@ fn addPaletteRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, idx: usize) void {
     // Pull current value: prefer cfg.palette override; else scheme;
     // else built-in default 256-table first 16.
     const default_pal = @import("../grid/palette.zig").default_256;
-    const cur: [3]u8 = if (ctx.cfg.settings.palette) |p| p[idx] else default_pal[idx];
+    const cur: [3]u8 = if (ctx.edit.palette) |p| p[idx] else default_pal[idx];
 
     const dlg = c.gtk_color_dialog_new();
     const btn = c.gtk_color_dialog_button_new(dlg);
@@ -699,22 +949,22 @@ fn paletteRowChanged(btn: *c.GtkColorDialogButton, _: *c.GParamSpec, user: ?*any
     const rgba = c.gtk_color_dialog_button_get_rgba(btn);
     // Promote palette to override mode if needed (copying from
     // current effective palette).
-    if (pctx.parent.cfg.settings.palette == null) {
+    if (pctx.parent.edit.palette == null) {
         const default_pal = @import("../grid/palette.zig").default_256;
         var pal: [16][3]u8 = undefined;
         var i: usize = 0;
         while (i < 16) : (i += 1) pal[i] = default_pal[i];
-        pctx.parent.cfg.settings.palette = pal;
+        pctx.parent.edit.palette = pal;
     }
-    var pal = pctx.parent.cfg.settings.palette.?;
+    var pal = pctx.parent.edit.palette.?;
     pal[pctx.index] = .{
         @intFromFloat(@round(rgba.*.red * 255.0)),
         @intFromFloat(@round(rgba.*.green * 255.0)),
         @intFromFloat(@round(rgba.*.blue * 255.0)),
     };
-    pctx.parent.cfg.settings.palette = pal;
+    pctx.parent.edit.palette = pal;
     // Editing the palette unsets `scheme` — the user has overridden.
-    pctx.parent.cfg.settings.scheme = "";
+    pctx.parent.edit.scheme = "";
     pctx.parent.ev();
 }
 
@@ -740,7 +990,7 @@ fn addSchemeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
     var sel: c_uint = 0;
     for (SCHEMES, 0..) |sch, i| {
-        if (std.mem.eql(u8, sch.key, ctx.cfg.settings.scheme)) {
+        if (std.mem.eql(u8, sch.key, ctx.edit.scheme)) {
             sel = @intCast(i);
             break;
         }
@@ -755,20 +1005,20 @@ fn addSchemeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
 fn schemeSelected(ctx: *Ctx, idx: c_uint) void {
     if (idx >= SCHEMES.len) return;
     const sch = SCHEMES[idx];
-    ctx.cfg.settings.scheme = sch.key;
-    ctx.cfg.settings.default_fg = .{
+    ctx.edit.scheme = sch.key;
+    ctx.edit.default_fg = .{
         @as(f32, @floatFromInt(sch.fg[0])) / 255.0,
         @as(f32, @floatFromInt(sch.fg[1])) / 255.0,
         @as(f32, @floatFromInt(sch.fg[2])) / 255.0,
         1.0,
     };
-    ctx.cfg.settings.default_bg = .{
+    ctx.edit.default_bg = .{
         @as(f32, @floatFromInt(sch.bg[0])) / 255.0,
         @as(f32, @floatFromInt(sch.bg[1])) / 255.0,
         @as(f32, @floatFromInt(sch.bg[2])) / 255.0,
         1.0,
     };
-    ctx.cfg.settings.palette = sch.palette;
+    ctx.edit.palette = sch.palette;
     ctx.ev();
     // Note: the open color buttons in the dialog don't auto-refresh
     // their preview swatches. The next reopen will reflect the new
@@ -792,9 +1042,9 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     const shell_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(shell_group)), "Shell (applies to new panes)");
     addShellPathRow(@ptrCast(@alignCast(shell_group)), ctx);
-    addEntryRowOptionalString(@ptrCast(@alignCast(shell_group)), ctx, "TERM", "$TERM env in child", &ctx.cfg.settings.term_env, termEnvChanged);
-    addEntryRowOptionalString(@ptrCast(@alignCast(shell_group)), ctx, "COLORTERM", "$COLORTERM env in child", &ctx.cfg.settings.color_term_env, colorTermEnvChanged);
-    addSwitchRow(@ptrCast(@alignCast(shell_group)), ctx, "Login shell", "Prepend a `-` to argv[0] so the shell sources login profile.", &ctx.cfg.settings.login_shell, applyOnly);
+    addEntryRowOptionalString(@ptrCast(@alignCast(shell_group)), ctx, "TERM", "$TERM env in child", &ctx.edit.term_env, termEnvChanged);
+    addEntryRowOptionalString(@ptrCast(@alignCast(shell_group)), ctx, "COLORTERM", "$COLORTERM env in child", &ctx.edit.color_term_env, colorTermEnvChanged);
+    addSwitchRow(@ptrCast(@alignCast(shell_group)), ctx, "Login shell", "Prepend a `-` to argv[0] so the shell sources login profile.", &ctx.edit.login_shell, applyOnly);
     addExitActionRow(@ptrCast(@alignCast(shell_group)), ctx);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(shell_group)));
 
@@ -810,7 +1060,7 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     // Scrollback.
     const sb_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(sb_group)), "Scrollback");
-    addSpinRowU32(@ptrCast(@alignCast(sb_group)), ctx, "Lines", "Maximum scrollback lines retained per pane.", 100, 100000, &ctx.cfg.settings.scrollback, applyOnly);
+    addSpinRowU32(@ptrCast(@alignCast(sb_group)), ctx, "Lines", "Maximum scrollback lines retained per pane.", 100, 100000, &ctx.edit.scrollback, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(sb_group)), ctx, "Scroll on output", "Snap view to bottom on any output, not just keystrokes.", &ctx.cfg.scroll_on_output, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(sb_group)));
 
@@ -888,7 +1138,7 @@ fn addEntryRowOptionalString(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*
 fn addShellPathRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_entry_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Shell");
-    if (ctx.cfg.settings.shell) |s| {
+    if (ctx.edit.shell) |s| {
         var z: [256:0]u8 = undefined;
         const n = @min(s.len, z.len);
         @memcpy(z[0..n], s[0..n]);
@@ -905,10 +1155,10 @@ fn shellEntryChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
     if (txt == null) return;
     const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
     if (slice.len == 0) {
-        ctx.cfg.settings.shell = null;
+        ctx.edit.shell = null;
     } else {
         const dup = ctx.dupe(slice) catch return;
-        ctx.cfg.settings.shell = dup;
+        ctx.edit.shell = dup;
     }
     ctx.ev();
 }
