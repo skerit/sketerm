@@ -5328,3 +5328,22 @@ the mux wire (fds never leave their host):
   (mirrors the real ordering guarantee).
 - 541 tests, smoke-mux, smoke-e2e, mux-portable, aarch64-macos
   cross all PASS.
+
+## 2026-06-12: native pipe — GTK4 validated live, identity polish
+
+- Minimal GTK4 C client (gcc against system gtk4) through the full
+  pipe: window maps with CSD, POPOVER MENU opens correctly placed
+  (first live xdg_popup validation), entry renders. Mesa's swrast
+  EGL presents via wl_shm, so even GL clients work ("loaded OpenGL
+  4.5" on our dmabuf-less compositor).
+- Polish: titles/app_ids arriving before the first frame are
+  buffered and applied at window creation (GTK sets them before
+  attaching a buffer — every window was "remote app" before);
+  app_id → gtk_window_set_icon_name (desktop icon convention);
+  comp.now_ms stamped per feed (frame done events carried 0).
+- ghostty: initializes fully (GL, shell spawn) but exits 0 before
+  mapping — no protocol error on the wire, likely missing-protocol
+  gating on its side (cursor_shape/fractional_scale?). App-specific;
+  revisit when more protocol extensions land.
+- Pushed milestones 1-6 to origin (c875e4a..8ada0ca).
+- 541 tests, smoke-mux, mux-portable all PASS.
