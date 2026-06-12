@@ -14,6 +14,9 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const wire = @import("wire.zig");
+const wlwire = @import("../wlhost/wire.zig");
+const wltrack = @import("../wlhost/track.zig");
+const wlpipe = @import("../wlhost/pipe.zig");
 const snapshot = @import("snapshot.zig");
 const Pty = @import("../pty.zig").Pty;
 const Parser = @import("../parser/vt.zig").Parser;
@@ -73,6 +76,11 @@ const Session = struct {
     /// Owned hub + display socket paths, unlinked on teardown.
     wl_hub_path: ?[]u8 = null,
     wl_display_path: ?[]u8 = null,
+    /// Sketerm-native app pipe (SKETERM_MUX_NATIVE_WAYLAND=1): the
+    /// daemon IS the Wayland display — wl_hub_fd listens on the
+    /// display socket itself, no waypipe wrap, and each app
+    /// connection gets parsed + shm-mirrored (Channel.native).
+    wl_native: bool = false,
 
     fn deinit(self: *Session) void {
         if (self.wl_hub_fd >= 0) _ = c.close(self.wl_hub_fd);
@@ -153,11 +161,59 @@ const Channel = struct {
     /// Bytes from the client not yet written to fd (partial writes).
     pending: std.ArrayList(u8) = .empty,
     dead: bool = false,
+    /// Non-null on a native-pipe channel: the app speaks raw Wayland
+    /// to us and the byte stream toward the GUI is wlhost/pipe units.
+    native: ?*Native = null,
 
     fn deinit(self: *Channel) void {
+        if (self.native) |nv| nv.deinit();
         _ = c.close(self.fd);
         self.pending.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+};
+
+/// Per-channel state of the sketerm-native app pipe (no waypipe:
+/// the session's app connects straight to the daemon). Owns the
+/// protocol tracker and the mmapped shm pool mirrors.
+const Native = struct {
+    allocator: std.mem.Allocator,
+    tracker: wltrack.Tracker,
+    /// Raw bytes from the app socket; messages may arrive split.
+    inbuf: std.ArrayList(u8) = .empty,
+    /// SCM_RIGHTS fds awaiting their create_pool message (Wayland
+    /// pairs fds with messages in arrival order).
+    fds: std.ArrayList(c_int) = .empty,
+    /// GUI→app unit stream reassembly (chan_data may split units).
+    unitbuf: std.ArrayList(u8) = .empty,
+    /// pool id → mmapped mirror. Mirrors outlive wl_shm_pool
+    /// destructors: existing buffers keep referencing the memory.
+    pools: std.AutoHashMapUnmanaged(u32, PoolMirror) = .empty,
+
+    const PoolMirror = struct {
+        fd: c_int,
+        ptr: [*]u8,
+        size: usize,
+    };
+
+    fn deinit(self: *Native) void {
+        var it = self.pools.valueIterator();
+        while (it.next()) |p| {
+            _ = c.munmap(p.ptr, p.size);
+            _ = c.close(p.fd);
+        }
+        self.pools.deinit(self.allocator);
+        for (self.fds.items) |fd| _ = c.close(fd);
+        self.fds.deinit(self.allocator);
+        self.inbuf.deinit(self.allocator);
+        self.unitbuf.deinit(self.allocator);
+        self.tracker.deinit();
+        self.allocator.destroy(self);
+    }
+
+    fn popFd(self: *Native) ?c_int {
+        if (self.fds.items.len == 0) return null;
+        return self.fds.orderedRemove(0);
     }
 };
 
@@ -414,6 +470,7 @@ pub const Daemon = struct {
                 const id = wire.decodeChanId(frame.payload) orelse return;
                 const ch = self.findChannel(id) orelse return;
                 if (ch.client != cl or ch.dead) return;
+                if (ch.native != null) return self.nativeClientData(ch, frame.payload[4..]);
                 ch.pending.appendSlice(ch.allocator, frame.payload[4..]) catch {
                     self.closeChannel(ch, true);
                     return;
@@ -459,7 +516,22 @@ pub const Daemon = struct {
             return;
         };
 
+        var native: ?*Native = null;
+        if (s.wl_native) {
+            native = self.allocator.create(Native) catch {
+                _ = c.close(fd);
+                return;
+            };
+            const tracker = wltrack.Tracker.init(self.allocator) catch {
+                self.allocator.destroy(native.?);
+                _ = c.close(fd);
+                return;
+            };
+            native.?.* = .{ .allocator = self.allocator, .tracker = tracker };
+        }
+
         const ch = self.allocator.create(Channel) catch {
+            if (native) |nv| nv.deinit();
             _ = c.close(fd);
             return;
         };
@@ -469,6 +541,7 @@ pub const Daemon = struct {
             .fd = fd,
             .session = s,
             .client = cl,
+            .native = native,
         };
         self.next_chan_id += 1;
         self.channels.append(self.allocator, ch) catch {
@@ -476,13 +549,15 @@ pub const Daemon = struct {
             return;
         };
         var hdr: [5]u8 = undefined;
-        cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .wayland));
+        const kind: wire.ChannelKind = if (s.wl_native) .wayland_native else .wayland;
+        cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, kind));
     }
 
     /// Forward hub-socket bytes to the channel's client as
     /// chan_data frames. Bounded rounds keep one chatty app from
     /// starving the loop.
     fn channelReadable(self: *Daemon, ch: *Channel) void {
+        if (ch.native != null) return self.nativeReadable(ch);
         var rounds: u8 = 0;
         while (rounds < 4) : (rounds += 1) {
             var buf: [4 + 16384]u8 = undefined;
@@ -513,6 +588,236 @@ pub const Daemon = struct {
         const remaining = ch.pending.items.len - n;
         std.mem.copyForwards(u8, ch.pending.items[0..remaining], ch.pending.items[n..]);
         ch.pending.shrinkRetainingCapacity(remaining);
+    }
+
+    // ── sketerm-native app pipe ─────────────────────────────────
+
+    /// Drain the app's Wayland socket: bytes into the reassembly
+    /// buffer, SCM_RIGHTS fds into the pairing queue, then process
+    /// complete messages.
+    fn nativeReadable(self: *Daemon, ch: *Channel) void {
+        const nv = ch.native.?;
+        var rounds: u8 = 0;
+        while (rounds < 4) : (rounds += 1) {
+            var data: [16384]u8 = undefined;
+            var cbuf: [256]u8 align(@alignOf(c.struct_cmsghdr)) = undefined;
+            var iov = c.struct_iovec{ .iov_base = &data, .iov_len = data.len };
+            var mh = std.mem.zeroes(c.struct_msghdr);
+            mh.msg_iov = @ptrCast(&iov);
+            mh.msg_iovlen = 1;
+            mh.msg_control = &cbuf;
+            mh.msg_controllen = cbuf.len;
+            // No MSG_CMSG_CLOEXEC: Darwin lacks it, and the daemon
+            // is single-threaded — collectFds sets FD_CLOEXEC before
+            // anything can fork.
+            const r = c.recvmsg(ch.fd, &mh, 0);
+            if (r < 0) {
+                if (std.posix.errno(r) != .AGAIN) self.closeChannel(ch, true);
+                break;
+            }
+            if (r == 0) {
+                self.closeChannel(ch, true);
+                break;
+            }
+            collectFds(nv, &mh);
+            nv.inbuf.appendSlice(nv.allocator, data[0..@intCast(r)]) catch {
+                self.closeChannel(ch, true);
+                return;
+            };
+            if (@as(usize, @intCast(r)) < data.len) break;
+        }
+        if (!ch.dead) self.nativeProcess(ch);
+    }
+
+    /// Hand-rolled CMSG walk (the CMSG_* macros don't survive
+    /// translate-c). On both 64-bit glibc and musl the cmsghdr is 16
+    /// bytes and CMSG_ALIGN(sizeof cmsghdr) == sizeof cmsghdr, so
+    /// data follows the header directly.
+    fn collectFds(nv: *Native, mh: *const c.struct_msghdr) void {
+        const ctl: [*]const u8 = @ptrCast(mh.msg_control orelse return);
+        const clen: usize = @intCast(mh.msg_controllen);
+        const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
+        const alignment: usize = @sizeOf(usize);
+        var off: usize = 0;
+        while (off + hdr_size <= clen) {
+            const hdr: *const c.struct_cmsghdr = @alignCast(@ptrCast(ctl + off));
+            const cl: usize = @intCast(hdr.cmsg_len);
+            if (cl < hdr_size or off + cl > clen) break;
+            if (hdr.cmsg_level == c.SOL_SOCKET and hdr.cmsg_type == c.SCM_RIGHTS) {
+                const n_fds = (cl - hdr_size) / @sizeOf(c_int);
+                var i: usize = 0;
+                while (i < n_fds) : (i += 1) {
+                    var fd: c_int = undefined;
+                    @memcpy(std.mem.asBytes(&fd), ctl[off + hdr_size + i * @sizeOf(c_int) ..][0..@sizeOf(c_int)]);
+                    _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+                    nv.fds.append(nv.allocator, fd) catch {
+                        _ = c.close(fd);
+                    };
+                }
+            }
+            off += (cl + alignment - 1) & ~(alignment - 1);
+        }
+    }
+
+    /// Peel complete Wayland messages off the reassembly buffer,
+    /// track them, and emit pipe units toward the GUI. Any protocol
+    /// violation kills the app connection (matching a strict
+    /// compositor).
+    fn nativeProcess(self: *Daemon, ch: *Channel) void {
+        const nv = ch.native.?;
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(self.allocator);
+
+        var pos: usize = 0;
+        var fail = false;
+        while (!fail) {
+            const avail = nv.inbuf.items[pos..];
+            const mh = wlwire.parseHeader(avail) catch {
+                fail = true;
+                break;
+            } orelse break;
+            if (avail.len < mh.size) break;
+            const msgb = avail[0..mh.size];
+            const action = nv.tracker.clientMessage(mh, msgb[wlwire.header_size..]) catch {
+                fail = true;
+                break;
+            };
+            self.nativeAction(nv, &units, msgb, action) catch {
+                fail = true;
+                break;
+            };
+            pos += mh.size;
+        }
+        if (pos > 0) {
+            const rem = nv.inbuf.items.len - pos;
+            std.mem.copyForwards(u8, nv.inbuf.items[0..rem], nv.inbuf.items[pos..]);
+            nv.inbuf.shrinkRetainingCapacity(rem);
+        }
+        if (units.items.len > 0) self.queueUnits(ch, units.items);
+        if (fail) self.closeChannel(ch, true);
+    }
+
+    /// Bound on pool bytes per pipe unit — also the granularity at
+    /// which queueUnits may split the stream into chan_data frames.
+    const POOL_CHUNK: usize = 1 << 20;
+
+    fn nativeAction(self: *Daemon, nv: *Native, units: *std.ArrayList(u8), msgb: []const u8, action: wltrack.Action) !void {
+        const a = self.allocator;
+        switch (action) {
+            .relay, .buffer_create, .buffer_destroy => try wlpipe.appendUnit(units, a, .wl_msg, msgb),
+            .pool_create => |p| {
+                const fd = nv.popFd() orelse return error.MissingFd;
+                errdefer _ = c.close(fd);
+                if (p.size <= 0) return error.BadSize;
+                const sz: usize = @intCast(p.size);
+                const ptr = c.mmap(null, sz, c.PROT_READ, c.MAP_SHARED, fd, 0);
+                if (ptr == null or ptr == c.MAP_FAILED) return error.MapFailed;
+                try nv.pools.put(a, p.id, .{ .fd = fd, .ptr = @ptrCast(ptr.?), .size = sz });
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+                try wlpipe.appendPoolMeta(units, a, .pool_create, p.id, @intCast(sz));
+            },
+            .pool_resize => |p| {
+                const mirror = nv.pools.getPtr(p.id) orelse return error.NoSuchPool;
+                if (p.size <= 0) return error.BadSize;
+                const sz: usize = @intCast(p.size);
+                if (sz < mirror.size) return error.BadSize; // pools only grow
+                _ = c.munmap(mirror.ptr, mirror.size);
+                const ptr = c.mmap(null, sz, c.PROT_READ, c.MAP_SHARED, mirror.fd, 0);
+                if (ptr == null or ptr == c.MAP_FAILED) {
+                    // Mirror is gone; the pool is unusable from here.
+                    _ = c.close(mirror.fd);
+                    _ = nv.pools.remove(p.id);
+                    return error.MapFailed;
+                }
+                mirror.ptr = @ptrCast(ptr.?);
+                mirror.size = sz;
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+                try wlpipe.appendPoolMeta(units, a, .pool_resize, p.id, @intCast(sz));
+            },
+            .pool_destroy => {
+                // Keep the mirror: live buffers still reference the
+                // pool memory (wl_shm_pool destructor semantics).
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+            },
+            .commit => |cm| {
+                // v1 full copy of the committed buffer's extent;
+                // damage-based diffing comes later.
+                if (nv.pools.get(cm.info.pool)) |mirror| {
+                    if (cm.info.offset >= 0 and cm.info.stride > 0 and cm.info.height > 0) {
+                        const off: usize = @intCast(cm.info.offset);
+                        const len: usize = @intCast(@as(i64, cm.info.stride) * @as(i64, cm.info.height));
+                        const end = @min(off +| len, mirror.size);
+                        var chunk = off;
+                        while (chunk < end) {
+                            const chunk_end = @min(chunk + POOL_CHUNK, end);
+                            try wlpipe.appendPoolUpdate(units, a, cm.info.pool, @intCast(chunk), mirror.ptr[chunk..chunk_end]);
+                            chunk = chunk_end;
+                        }
+                    }
+                }
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+            },
+        }
+    }
+
+    /// Ship a unit stream to the channel's client, split into
+    /// chan_data frames well below MAX_FRAME (units may split across
+    /// frames — pipe.zig receivers reassemble).
+    fn queueUnits(self: *Daemon, ch: *Channel, bytes: []const u8) void {
+        const MAX_CHUNK: usize = 4 << 20;
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const end = @min(off + MAX_CHUNK, bytes.len);
+            const payload = self.allocator.alloc(u8, 4 + (end - off)) catch {
+                self.closeChannel(ch, true);
+                return;
+            };
+            defer self.allocator.free(payload);
+            std.mem.writeInt(u32, payload[0..4], ch.id, .little);
+            @memcpy(payload[4..], bytes[off..end]);
+            ch.client.queueFrame(.chan_data, payload);
+            off = end;
+        }
+    }
+
+    /// GUI→app bytes on a native channel: peel pipe units, write the
+    /// Wayland events through to the app, watch for delete_id.
+    fn nativeClientData(self: *Daemon, ch: *Channel, bytes: []const u8) void {
+        const nv = ch.native.?;
+        nv.unitbuf.appendSlice(nv.allocator, bytes) catch {
+            self.closeChannel(ch, true);
+            return;
+        };
+        var pos: usize = 0;
+        while (true) {
+            const peeled = wlpipe.peelUnit(nv.unitbuf.items[pos..]) catch {
+                self.closeChannel(ch, true);
+                return;
+            } orelse break;
+            switch (peeled.unit.tag) {
+                .wl_msg => {
+                    // One Wayland message per unit (pipe contract).
+                    const maybe_hdr = wlwire.parseHeader(peeled.unit.payload) catch null;
+                    if (maybe_hdr) |h| {
+                        nv.tracker.serverMessage(h, peeled.unit.payload[wlwire.header_size..]) catch {};
+                    }
+                    ch.pending.appendSlice(ch.allocator, peeled.unit.payload) catch {
+                        self.closeChannel(ch, true);
+                        return;
+                    };
+                },
+                // keymap (fd materialization) lands with the input
+                // milestone; unknown tags skip for forward compat.
+                else => {},
+            }
+            pos += peeled.consumed;
+        }
+        if (pos > 0) {
+            const rem = nv.unitbuf.items.len - pos;
+            std.mem.copyForwards(u8, nv.unitbuf.items[0..rem], nv.unitbuf.items[pos..]);
+            nv.unitbuf.shrinkRetainingCapacity(rem);
+        }
+        self.channelWritable(ch);
     }
 
     fn closeChannel(self: *Daemon, ch: *Channel, notify: bool) void {
@@ -613,8 +918,10 @@ pub const Daemon = struct {
 
     /// Create a session's Wayland hub socket + display paths next to
     /// the daemon socket. Null on any failure — sessions must spawn
-    /// regardless, just without Wayland forwarding.
-    fn setupWaylandHub(self: *Daemon) ?WaylandHub {
+    /// regardless, just without Wayland forwarding. In native mode
+    /// there is no waypipe between app and daemon, so the listening
+    /// socket IS the display socket (the .hub path goes unused).
+    fn setupWaylandHub(self: *Daemon, native: bool) ?WaylandHub {
         const dir_end = std.mem.lastIndexOfScalar(u8, self.sock_path, '/') orelse return null;
         const dir = self.sock_path[0..dir_end];
         const id = self.next_wl_id;
@@ -637,7 +944,7 @@ pub const Daemon = struct {
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
         if (fd < 0) return null;
         var addr: c.struct_sockaddr_un = undefined;
-        fillSockaddrUn(&addr, hub_path) catch {
+        fillSockaddrUn(&addr, if (native) display_path else hub_path) catch {
             _ = c.close(fd);
             return null;
         };
@@ -654,11 +961,15 @@ pub const Daemon = struct {
 
         // Wayland forwarding: wrap the command in a `waypipe server`
         // that provides $WAYLAND_DISPLAY for everything in the
-        // session, connecting each app back to our hub socket.
-        const want_wayland = waypipeAvailable() and
-            std.c.getenv("SKETERM_MUX_NO_WAYLAND") == null and
-            req.argv.len > 0 and !std.mem.eql(u8, std.fs.path.basename(req.argv[0]), "waypipe");
-        var hub: ?WaylandHub = if (want_wayland) self.setupWaylandHub() else null;
+        // session, connecting each app back to our hub socket. With
+        // SKETERM_MUX_NATIVE_WAYLAND=1 (the sketerm-native pipe,
+        // maturing — waypipe stays the default until it does) the
+        // daemon listens on the display socket itself instead.
+        const native_wayland = std.c.getenv("SKETERM_MUX_NATIVE_WAYLAND") != null;
+        const want_wayland = std.c.getenv("SKETERM_MUX_NO_WAYLAND") == null and
+            req.argv.len > 0 and !std.mem.eql(u8, std.fs.path.basename(req.argv[0]), "waypipe") and
+            (native_wayland or waypipeAvailable());
+        var hub: ?WaylandHub = if (want_wayland) self.setupWaylandHub(native_wayland) else null;
         errdefer if (hub) |h| {
             _ = c.close(h.fd);
             allocator.free(h.hub_path);
@@ -672,7 +983,8 @@ pub const Daemon = struct {
         }
         var argv_ptrs: std.ArrayList([*:0]const u8) = .empty;
         defer argv_ptrs.deinit(allocator);
-        if (hub) |h| {
+        if (hub != null and !native_wayland) {
+            const h = hub.?;
             // Options must precede the mode word (waypipe 0.11 CLI).
             const base = [_][]const u8{ "waypipe", "--socket", h.hub_path, "--display", h.display_path };
             const tail = [_][]const u8{ "server", "--" };
@@ -698,11 +1010,20 @@ pub const Daemon = struct {
             try argv_ptrs.append(allocator, z.ptr);
         }
 
+        // Native mode: the daemon is the display, so the daemon must
+        // set the child's WAYLAND_DISPLAY (waypipe did it before).
+        var wl_disp_z: ?[:0]u8 = null;
+        defer if (wl_disp_z) |z| allocator.free(z);
+        if (native_wayland) {
+            if (hub) |h| wl_disp_z = try allocator.dupeZ(u8, h.display_path);
+        }
+
         var pty = try Pty.spawn(.{
             .argv = argv_ptrs.items,
             .cwd = req.cwd,
             .rows = req.rows,
             .cols = req.cols,
+            .wayland_display = if (wl_disp_z) |z| z.ptr else null,
         });
         errdefer pty.closeAndReap();
         // The poll loop does bounded read rounds — master must not
@@ -738,6 +1059,7 @@ pub const Daemon = struct {
             s.wl_hub_fd = h.fd;
             s.wl_hub_path = h.hub_path;
             s.wl_display_path = h.display_path;
+            s.wl_native = native_wayland;
             hub = null; // ownership moved to the session
         }
         screen.sink = .{ .ctx = @ptrCast(s), .on_write_pty = Session.sinkWritePty };

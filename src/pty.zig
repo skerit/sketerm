@@ -39,6 +39,10 @@ pub const SpawnOpts = struct {
     /// Auto shell-integration (OSC 7/133 marks without rc edits).
     /// null = off / unsupported shell.
     shell_integration: ?ShellIntegration = null,
+    /// WAYLAND_DISPLAY for the child (absolute socket path). Used by
+    /// the mux daemon's native app pipe, where the daemon itself is
+    /// the display (waypipe used to set this for its wrapped child).
+    wayland_display: ?[*:0]const u8 = null,
 };
 
 pub const ShellIntegration = struct {
@@ -159,6 +163,7 @@ pub const Pty = struct {
             } else |_| {}
         }
         if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1);
+        if (opts.wayland_display) |wd| _ = c.setenv("WAYLAND_DISPLAY", wd, 1);
 
         // Auto shell-integration: hand the script path to the shim
         // and arrange the shell to read the shim first. zsh reads
