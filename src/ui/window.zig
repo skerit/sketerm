@@ -5851,7 +5851,24 @@ fn onNotifyActivate(_: *c.GSimpleAction, param: ?*c.GVariant, user: ?*anyopaque)
 /// re-aggregate the window-level taskbar progress.
 fn onTermProgress(ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) void {
     const self = cast.userData(Window, ctx);
-    if (tabPageForPane(self, pane)) |page| self.setTabProgress(page, state, percent);
+    const page = tabPageForPane(self, pane) orelse return;
+
+    // One pane owns the tab's progress slot at a time: two builds in
+    // split panes would otherwise overwrite each other's ring (and
+    // wobble the taskbar aggregate) on every OSC update. The owner
+    // releases by clearing (state 0) or by going quiet for 3s.
+    const now_ms: usize = @intCast(@divTrunc(c.g_get_monotonic_time(), 1000));
+    const owner: u32 = @truncate(@intFromPtr(c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-progress-owner")));
+    const stamp: usize = @intFromPtr(c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-progress-stamp"));
+    if (owner != 0 and owner != pane.id and now_ms -% stamp < 3000) return;
+    if (state == 0) {
+        c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-progress-owner", null);
+    } else {
+        c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-progress-owner", @ptrFromInt(@as(usize, pane.id)));
+        c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-progress-stamp", @ptrFromInt(now_ms));
+    }
+
+    self.setTabProgress(page, state, percent);
     self.updateTaskbarProgress();
 }
 
