@@ -4972,3 +4972,41 @@ Tests 454 → 466.
   query sites (IPC list, broadcast group, pane cycle) to the model;
   then extract the GLib-loop/clipboard/dialog seams into a frontend
   interface.
+
+## 2026-06-12: config refactor — Default is just a profile
+
+- GOAL (user): collapse the three config layers (global config /
+  profile patches / per-pane overrides). Profiles become the single
+  unit of pane appearance; "Default" is the profile formerly known
+  as the global config.
+- config.zig: new `ProfileSettings` struct holds every pane-level
+  key (font path/family/features/size, line_pad_px, padding, fg/bg/
+  cursor color, palette, scheme, shell, term/color_term, login_shell,
+  scrollback, custom_shader). `Config.settings` IS the Default
+  profile; `Config.profiles` is a list of named COMPLETE bundles —
+  the old patch-style `Profile` (inherit sentinels: ""/0/null) is
+  gone, and with it every "profile wins → global falls back" chain.
+- Parse: top-level keys edit Default; `[profile.<name>]` sections
+  seed from the Default-so-far then override (old sparse configs
+  migrate with the inheritance they expect); `[profile.default]`
+  round-trips into Config.settings. Serialise: Default at top level
+  (file compat), profile sections diffed against Default.
+- window.zig: applyPaneConfig/applyConfigChange resolve ONE bundle
+  per pane via `Config.profileSettings(name)` (deleted profile →
+  Default). Bonus correctness: a config reload now pushes each
+  pane's OWN profile colors/palette/scrollback/font (before, the
+  push-loop pushed global values over profile panes); font rebuilds
+  are per-pane diffs instead of global-size-change-rebuilds-all.
+  Ctrl+0 resets to the pane's profile size; layout saves font_size
+  relative to the profile, not the global default.
+- ✨ Apply Profile to Pane: context menu / palette / keybindable
+  action; popover lists default + named profiles, pick re-runs
+  applyPaneConfig on the live pane + font rebuild. Sticky shader
+  picks/clears survive (same rule as config reload).
+- ✨ Prefs "Profiles" page: combo picks the profile being edited
+  (pane-level rows bind to that bundle; switching reopens the dialog
+  — rows capture field pointers at build time), create-as-copy,
+  delete (falls back to Default), default-profile-for-new-panes
+  combo. Dialog title shows the non-default profile being edited.
+- 504 tests green; mux daemon still libc-only; e2e smoke not run
+  (headless session) — needs a manual GUI pass on the new pickers.
