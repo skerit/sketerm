@@ -38,6 +38,10 @@ pub const AppHost = struct {
     /// Surface that last got a clipboard offer — re-offer happens
     /// per keyboard-focus change, not per keystroke.
     offered_focus: u32 = 0,
+    /// Title/app_id that arrived BEFORE the first frame created the
+    /// window (the usual order) — applied in winFor. Owned strings.
+    pending_titles: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
+    pending_app_ids: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
 
     const Popup = struct {
         host: *AppHost,
@@ -93,6 +97,7 @@ pub const AppHost = struct {
             .ctx = self,
             .toplevel_frame = onFrame,
             .toplevel_title = onTitle,
+            .toplevel_app_id = onAppId,
             .toplevel_gone = onGone,
             .popup_new = onPopupNew,
             .popup_gone = onPopupGone,
@@ -116,6 +121,12 @@ pub const AppHost = struct {
         var pit = self.popups.valueIterator();
         while (pit.next()) |p| self.allocator.destroy(p.*);
         self.popups.deinit(self.allocator);
+        var tit = self.pending_titles.valueIterator();
+        while (tit.next()) |v| self.allocator.free(v.*);
+        self.pending_titles.deinit(self.allocator);
+        var ait = self.pending_app_ids.valueIterator();
+        while (ait.next()) |v| self.allocator.free(v.*);
+        self.pending_app_ids.deinit(self.allocator);
         if (self.pending_reads > 0) {
             self.doomed = true;
             return;
@@ -132,6 +143,7 @@ pub const AppHost = struct {
     /// fatal — caller closes the channel.
     pub fn feed(self: *AppHost, bytes: []const u8) !void {
         if (self.dead) return;
+        self.stampNow();
         try self.comp.feed(bytes);
         if (self.comp.dead) return error.Protocol;
     }
@@ -260,10 +272,40 @@ pub const AppHost = struct {
 
     fn onTitle(ctx: ?*anyopaque, surface: u32, title: []const u8) void {
         const self = cast.userData(AppHost, ctx);
-        const win = self.windows.get(surface) orelse return;
+        const win = self.windows.get(surface) orelse {
+            // Window doesn't exist until the first frame — remember.
+            const owned = self.allocator.dupe(u8, title) catch return;
+            if (self.pending_titles.fetchPut(self.allocator, surface, owned) catch {
+                self.allocator.free(owned);
+                return;
+            }) |old| self.allocator.free(old.value);
+            return;
+        };
         var buf: [256:0]u8 = undefined;
         const z = std.fmt.bufPrintZ(&buf, "{s}", .{title}) catch return;
         c.gtk_window_set_title(win.window, z.ptr);
+    }
+
+    fn onAppId(ctx: ?*anyopaque, surface: u32, app_id: []const u8) void {
+        const self = cast.userData(AppHost, ctx);
+        const win = self.windows.get(surface) orelse {
+            const owned = self.allocator.dupe(u8, app_id) catch return;
+            if (self.pending_app_ids.fetchPut(self.allocator, surface, owned) catch {
+                self.allocator.free(owned);
+                return;
+            }) |old| self.allocator.free(old.value);
+            return;
+        };
+        applyAppId(win, app_id);
+    }
+
+    /// Desktop identity: app ids double as icon names by convention
+    /// (org.gnome.Calculator etc.) — gives the window the right
+    /// taskbar icon when the theme has it locally.
+    fn applyAppId(win: *Win, app_id: []const u8) void {
+        var buf: [256:0]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&buf, "{s}", .{app_id}) catch return;
+        c.gtk_window_set_icon_name(win.window, z.ptr);
     }
 
     fn onGone(ctx: ?*anyopaque, surface: u32) void {
@@ -295,6 +337,17 @@ pub const AppHost = struct {
             self.allocator.destroy(win);
             return null;
         };
+        if (self.pending_titles.fetchRemove(surface)) |kv| {
+            var tbuf: [256:0]u8 = undefined;
+            if (std.fmt.bufPrintZ(&tbuf, "{s}", .{kv.value})) |z| {
+                c.gtk_window_set_title(window, z.ptr);
+            } else |_| {}
+            self.allocator.free(kv.value);
+        }
+        if (self.pending_app_ids.fetchRemove(surface)) |kv| {
+            applyAppId(win, kv.value);
+            self.allocator.free(kv.value);
+        }
         _ = c.g_object_set_data(@ptrCast(window), "sketerm-wlapp", win);
         _ = c.g_signal_connect_data(@ptrCast(window), "close-request", @ptrCast(&onCloseRequest), win, null, 0);
 

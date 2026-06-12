@@ -52,6 +52,8 @@ pub const View = struct {
     /// applied), wl_shm format (0 argb, 1 xrgb).
     toplevel_frame: ?*const fn (ctx: ?*anyopaque, surface: u32, w: i32, h: i32, format: u32, pixels: []const u8) void = null,
     toplevel_title: ?*const fn (ctx: ?*anyopaque, surface: u32, title: []const u8) void = null,
+    /// xdg_toplevel.set_app_id — desktop identity (icon, grouping).
+    toplevel_app_id: ?*const fn (ctx: ?*anyopaque, surface: u32, app_id: []const u8) void = null,
     /// Toplevel destroyed (or its surface) — drop the window.
     toplevel_gone: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
     /// A surface gained the popup role: render it at (x, y) in the
@@ -912,10 +914,14 @@ pub const Compositor = struct {
                 const title = (try it.next()).?.string orelse return;
                 if (self.view.toplevel_title) |cb| cb(self.view.ctx, sid, title);
             },
-            // set_parent/app_id/min/max/maximize/fullscreen/minimize:
+            3 => { // set_app_id(s)
+                const app_id = (try it.next()).?.string orelse return;
+                if (self.view.toplevel_app_id) |cb| cb(self.view.ctx, sid, app_id);
+            },
+            // set_parent/min/max/maximize/fullscreen/minimize:
             // accepted, no window management in v1. move/resize/menu
-            // need a seat serial the client can't have (caps 0).
-            1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 => {},
+            // need a grab serial we rarely hand out.
+            1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 => {},
             else => return Error.Protocol,
         }
     }
