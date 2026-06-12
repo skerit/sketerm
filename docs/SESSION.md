@@ -5372,3 +5372,14 @@ Verified live without any gate env: GTK4 client maps, menus open.
   scale 1), wp_fractional_scale_manager_v1 (always 1.0).
 - 542 tests, smoke-mux, mux-portable, aarch64-macos, live clip
   regression all PASS.
+
+## 2026-06-12: wl_mode per session — `sketerm app -u` un-broken
+
+The default flip regressed standalone `sketerm app -u`: the
+headless client can only bridge waypipe, but new daemons handed it
+native channels. SpawnReq.wl_mode (""/native/waypipe) lets clients
+pick; -u requests waypipe, GUI spawns stay native-default, and
+waypipe-requested sessions on waypipe-less hosts get NO forwarding
+(clean app-side failure) instead of a dead-end native session.
+Wire-compatible both directions. 542 tests, smoke-mux, both
+portable targets PASS.
