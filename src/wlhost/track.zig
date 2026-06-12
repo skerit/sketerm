@@ -48,8 +48,19 @@ pub const Action = union(enum) {
     },
     buffer_destroy: struct { id: u32 },
     /// wl_surface.commit with a live attached buffer: replicate
-    /// that buffer's bytes before relaying the commit.
-    commit: struct { surface: u32, buffer: u32 },
+    /// that buffer's bytes before relaying the commit. Geometry is
+    /// resolved from the tracked buffer so the daemon can copy
+    /// [offset, offset + stride*height) without its own bookkeeping.
+    commit: struct { surface: u32, buffer: u32, info: BufferInfo },
+};
+
+pub const BufferInfo = struct {
+    pool: u32,
+    offset: i32,
+    width: i32,
+    height: i32,
+    stride: i32,
+    format: u32,
 };
 
 pub const Tracker = struct {
@@ -59,6 +70,8 @@ pub const Tracker = struct {
     /// is double-buffered state, but committed content persists:
     /// a commit without re-attach still implies a content update).
     attached: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// buffer id → geometry, dropped with the object on delete_id.
+    buffers: std.AutoHashMapUnmanaged(u32, BufferInfo) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Error!Tracker {
         var self = Tracker{ .allocator = allocator };
@@ -69,6 +82,7 @@ pub const Tracker = struct {
     pub fn deinit(self: *Tracker) void {
         self.objects.deinit(self.allocator);
         self.attached.deinit(self.allocator);
+        self.buffers.deinit(self.allocator);
     }
 
     /// One complete client→compositor message (header + body).
@@ -119,6 +133,14 @@ pub const Tracker = struct {
                 const height = (try it.next()).?.int;
                 const stride = (try it.next()).?.int;
                 const format = (try it.next()).?.uint;
+                try self.buffers.put(self.allocator, new_id, .{
+                    .pool = hdr.object,
+                    .offset = offset,
+                    .width = width,
+                    .height = height,
+                    .stride = stride,
+                    .format = format,
+                });
                 return .{ .buffer_create = .{
                     .id = new_id,
                     .pool = hdr.object,
@@ -154,7 +176,10 @@ pub const Tracker = struct {
             },
             6 => { // commit
                 const buffer = self.attached.get(hdr.object) orelse return .relay;
-                return .{ .commit = .{ .surface = hdr.object, .buffer = buffer } };
+                // Attach named a buffer we never saw created (or one
+                // already destroyed): relay, nothing to replicate.
+                const info = self.buffers.get(buffer) orelse return .relay;
+                return .{ .commit = .{ .surface = hdr.object, .buffer = buffer, .info = info } };
             },
             else => return .relay,
         };
@@ -169,6 +194,7 @@ pub const Tracker = struct {
         const id = (try it.next()).?.uint;
         _ = self.objects.remove(id);
         _ = self.attached.remove(id);
+        _ = self.buffers.remove(id);
     }
 };
 
@@ -253,17 +279,32 @@ test "attach + commit reports replication, null attach clears" {
     const c0 = enc(&buf, 4, 6, .{});
     try t.expectEqual(Action.relay, try tr.clientMessage(c0.hdr, c0.body));
 
-    // attach buffer 9 (id never validated here — daemon's job), commit
+    // shm pool (id 8) + buffer (id 9) so commit can resolve geometry
+    try bindShm(&tr, 2, 7);
+    const cp = enc(&buf, 7, 0, .{ 8, 4096 });
+    _ = try tr.clientMessage(cp.hdr, cp.body);
+    const cb = enc(&buf, 8, 0, .{ 9, 0, 32, 32, 128, 1 });
+    _ = try tr.clientMessage(cb.hdr, cb.body);
+
+    // attach buffer 9, commit → replication with geometry
     const at = enc(&buf, 4, 1, .{ 9, 0, 0 });
     try t.expectEqual(Action.relay, try tr.clientMessage(at.hdr, at.body));
     const c1 = enc(&buf, 4, 6, .{});
     const a = try tr.clientMessage(c1.hdr, c1.body);
     try t.expectEqual(@as(u32, 4), a.commit.surface);
     try t.expectEqual(@as(u32, 9), a.commit.buffer);
+    try t.expectEqual(@as(u32, 8), a.commit.info.pool);
+    try t.expectEqual(@as(i32, 128), a.commit.info.stride);
 
     // commit again without re-attach: content may have changed in place
     const c2 = enc(&buf, 4, 6, .{});
     try t.expectEqual(@as(u32, 9), (try tr.clientMessage(c2.hdr, c2.body)).commit.buffer);
+
+    // attaching an unknown buffer id relays instead of committing
+    const at_unk = enc(&buf, 4, 1, .{ 99, 0, 0 });
+    _ = try tr.clientMessage(at_unk.hdr, at_unk.body);
+    const c_unk = enc(&buf, 4, 6, .{});
+    try t.expectEqual(Action.relay, try tr.clientMessage(c_unk.hdr, c_unk.body));
 
     // null attach clears
     const an = enc(&buf, 4, 1, .{ 0, 0, 0 });
