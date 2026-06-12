@@ -5406,3 +5406,18 @@ host windows undecorated by default + zxdg_decoration negotiation
 (SSD requesters get host decorations); per-window identity via
 gdk_wayland_toplevel_set_application_id / X11 WM_CLASS (libX11 now
 linked on Linux GUI). 545 tests, smoke-mux, portable targets PASS.
+
+## 2026-06-12: app windows — move/resize, transparency, input regions
+
+From live laptop testing: undecorated host windows couldn't be
+dragged (xdg_toplevel.move was ignored — now hands off to
+gdk_toplevel_begin_move/resize with the originating press); CSD
+shadows composited onto theme gray (host windows now have a
+transparent background via CSS class); shadow margins ate clicks
+(input regions tracked + applied to the host GdkSurface — staged on
+set_input_region, applied at commit, subtract fails safe). Plus the
+tab progress ring: one pane owns it at a time (3s quiet timeout) so
+two concurrent builds stop glitching the ring + taskbar. OPEN: the
+user-reported Super+drag crash — not reproducible headless (no WM),
+awaiting which-process-died + log from the laptop.
+546 tests, smoke-mux, both portable targets PASS.
