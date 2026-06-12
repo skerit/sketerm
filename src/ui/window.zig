@@ -1652,7 +1652,8 @@ pub const Window = struct {
     /// creation path (tab, split, layout restore, mux attach) goes
     /// through here, so a new sink added here reaches all of them.
     /// All handlers are pane-aware and no-op when irrelevant (e.g.
-    /// child-exit never fires for remote panes, which have no child).
+    /// child-exit on a remote pane means "session ended / connection
+    /// lost" and detaches to a local shell instead of exit_action).
     fn wirePaneSinks(self: *Window, pane: *Pane) void {
         pane.win_clip_ctx = @ptrCast(self);
         pane.win_on_clipboard = onTermClipboardSet;
@@ -3420,6 +3421,74 @@ pub const Window = struct {
         return self.makeRemotePaneFromSnap(conn, spec.mux_session, host, snap.payload);
     }
 
+    /// Put `pane` into `old`'s slot — tree model and widget tree in
+    /// the same function — then unlist `old` (its teardown is
+    /// deferred past GTK's destroy chain). Shared by the mux takeover
+    /// and the detach-to-local-shell path.
+    fn swapPaneInPlace(self: *Window, old: *Pane, pane: *Pane) !*c.AdwTabPage {
+        const page = tabPageForPane(self, old) orelse return error.PaneHasNoTab;
+        // Mirror in the tree model: the new pane takes the old
+        // leaf's slot in place.
+        if (tabTreeOf(page)) |t| {
+            t.replaceLeaf(old, pane) catch
+                std.debug.print("sketerm: tree model takeover desync (leaf not found)\n", .{});
+        }
+        const old_w = old.widget();
+        const parent = c.gtk_widget_get_parent(old_w) orelse return error.PaneHasNoTab;
+        const is_paned = c.g_type_check_instance_is_a(
+            @ptrCast(@alignCast(parent)),
+            c.gtk_paned_get_type(),
+        ) != 0;
+        // Drop the new pane into the old one's slot. Replacing /
+        // removing the child destroys old_w's widget subtree;
+        // Zig-side teardown is deferred below.
+        if (is_paned) {
+            if (c.gtk_paned_get_start_child(@ptrCast(parent)) == old_w) {
+                c.gtk_paned_set_start_child(@ptrCast(parent), pane.widget());
+            } else {
+                c.gtk_paned_set_end_child(@ptrCast(parent), pane.widget());
+            }
+        } else {
+            c.gtk_box_remove(@ptrCast(parent), old_w);
+            c.gtk_box_append(@ptrCast(parent), pane.widget());
+        }
+
+        self.unlistPane(old);
+        return page;
+    }
+
+    /// Detach a remote (mux) pane back into a fresh local shell in
+    /// the same slot — the session keeps running on the daemon; the
+    /// pane does NOT close (tmux semantics: detach lands you in a
+    /// shell). Also the landing path when a remote session ends or
+    /// the connection drops. Falls back to closing the pane only if
+    /// the local shell spawn itself fails.
+    fn detachPaneToShell(self: *Window, pane: *Pane) void {
+        if (pane.terminal.remote == null) return;
+        const fresh = self.spawnShellPaneOpts(null, null) catch {
+            std.debug.print("sketerm: detach: local shell spawn failed — closing pane\n", .{});
+            self.closePane(pane);
+            return;
+        };
+        const page = self.swapPaneInPlace(pane, fresh) catch {
+            // No tab slot to land in (mid-teardown) — drop the fresh
+            // pane again and close the remote one.
+            self.unlistPane(fresh);
+            self.closePane(pane);
+            return;
+        };
+        // The "⌁ session @ host" title is stale now; hand the tab
+        // back to OSC tracking unless the user renamed it.
+        if (c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") == null) {
+            var num_buf: [32]u8 = undefined;
+            self.tab_counter += 1;
+            const t = std.fmt.bufPrintZ(&num_buf, "Tab {d}", .{self.tab_counter}) catch "shell";
+            c.adw_tab_page_set_title(page, t.ptr);
+            c.adw_tab_page_set_tooltip(page, t.ptr);
+        }
+        _ = c.gtk_widget_grab_focus(@ptrCast(fresh.area));
+    }
+
     pub fn attachMux(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane) !void {
         var conn = conn_in;
 
@@ -3437,37 +3506,9 @@ pub const Window = struct {
         else
             std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{name}) catch "mux";
 
-        const page = if (takeover) |old| blk: {
-            const page = tabPageForPane(self, old) orelse return error.PaneHasNoTab;
-            // Mirror in the tree model: the new remote pane takes the
-            // old leaf's slot in place.
-            if (tabTreeOf(page)) |t| {
-                t.replaceLeaf(old, pane) catch
-                    std.debug.print("sketerm: tree model takeover desync (leaf not found)\n", .{});
-            }
-            const old_w = old.widget();
-            const parent = c.gtk_widget_get_parent(old_w) orelse return error.PaneHasNoTab;
-            const is_paned = c.g_type_check_instance_is_a(
-                @ptrCast(@alignCast(parent)),
-                c.gtk_paned_get_type(),
-            ) != 0;
-            // Drop the new pane into the old one's slot. Replacing /
-            // removing the child destroys old_w's widget subtree;
-            // Zig-side teardown is deferred below.
-            if (is_paned) {
-                if (c.gtk_paned_get_start_child(@ptrCast(parent)) == old_w) {
-                    c.gtk_paned_set_start_child(@ptrCast(parent), pane.widget());
-                } else {
-                    c.gtk_paned_set_end_child(@ptrCast(parent), pane.widget());
-                }
-            } else {
-                c.gtk_box_remove(@ptrCast(parent), old_w);
-                c.gtk_box_append(@ptrCast(parent), pane.widget());
-            }
-
-            self.unlistPane(old);
-            break :blk page;
-        } else blk: {
+        const page = if (takeover) |old|
+            try self.swapPaneInPlace(old, pane)
+        else blk: {
             const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
             c.gtk_widget_set_hexpand(wrapper, 1);
             c.gtk_widget_set_vexpand(wrapper, 1);
@@ -3957,7 +3998,11 @@ pub const Window = struct {
             else
                 null;
             const conn = self.muxConnect(req.host) catch return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
-            self.attachMux(conn, name, req.host, takeover) catch return ipc_protocol.writeErr(out, allocator, "attach failed (no such session?)");
+            self.attachMux(conn, name, req.host, takeover) catch |err| {
+                var msg_buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "attach failed: {s}", .{@errorName(err)}) catch "attach failed";
+                return ipc_protocol.writeErr(out, allocator, msg);
+            };
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (eql(u8, req.cmd, "set-tab-color")) {
             const page = self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
@@ -5036,6 +5081,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .apply_profile => self.openApplyProfilePicker(),
         .show_scrollback => self.openScrollbackPager(),
         .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
+        .mux_detach => if (self.focusedPane()) |p| self.detachPaneToShell(p),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         .hints_open => self.openHints(),
         .copy_mode => self.openCopyMode(),
@@ -5191,7 +5237,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .set_pane_title => self.setFocusedPaneTitle(),
         // Detach = close the pane; Terminal.deinit on a remote pane
         // sends DETACH and leaves the session running in the daemon.
-        .mux_detach => self.closeFocusedPane(),
+        .mux_detach => if (self.focusedPane()) |p| self.detachPaneToShell(p),
         .mux_rename => self.renameFocusedMuxSession(),
         .mux_kill => self.killFocusedMuxSession(),
         .copy_screen => self.copyFocusedScreen(),
@@ -5497,6 +5543,13 @@ fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
 fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {
     const self = cast.userData(Window, ctx);
     _ = status;
+    // A remote pane "exiting" means the mux session ended or the
+    // connection dropped — never close the pane for that; land in a
+    // local shell instead (exit_action governs local children only).
+    if (pane.terminal.remote != null) {
+        self.detachPaneToShell(pane);
+        return;
+    }
     const action = if (self.hold_override) .hold else self.config.exit_action;
     switch (action) {
         .close => self.closePane(pane),
