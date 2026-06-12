@@ -329,9 +329,12 @@ static void apply_content(SketermSckCtx *c, SCShareableContent *content) {
 }
 
 static void kick_refresh(SketermSckCtx *c, uint64_t now) {
-    // Caller holds the mutex.
+    // Caller holds the mutex. Healthy refresh every 500ms; back off
+    // hard while fetches fail (missing TCC grant) — each failure
+    // logs, and a tight retry would just spam.
     if (c->refresh_inflight || c->dead) return;
-    if (c->fetch_ok && now - c->last_refresh_ms < 500) return;
+    uint64_t min_gap = c->fetch_ok ? 500 : 5000;
+    if (c->last_refresh_ms != 0 && now - c->last_refresh_ms < min_gap) return;
     c->refresh_inflight = YES;
     c->last_refresh_ms = now;
     [SCShareableContent getShareableContentExcludingDesktopWindows:YES
@@ -402,7 +405,30 @@ void sketerm_sck_destroy(SckCtx *ctx) {
     dispatch_sync(c->frame_q, ^{});
     close(c->pipe_r);
     close(c->pipe_w);
+    free(c->ev_scratch);
+    c->ev_scratch = NULL;
+    pthread_mutex_destroy(&c->mu);
     CFBridgingRelease(ctx);
+}
+
+/// Queue win_open events for every live window — a freshly attached
+/// client missed the originals (frames alone don't carry titles).
+void sketerm_sck_reannounce(SckCtx *ctx) {
+    SketermSckCtx *c = (__bridge SketermSckCtx *)ctx;
+    pthread_mutex_lock(&c->mu);
+    for (SketermSckWin *sw in c->wins.allValues) {
+        if (sw->closing) continue;
+        [c->pending addObject:@{
+            @"kind" : @0,
+            @"win" : @(sw->win_id),
+            @"w" : @((int32_t)sw->rect.size.width),
+            @"h" : @((int32_t)sw->rect.size.height),
+            @"title" : sw->title.length ? sw->title : @"remote app",
+        }];
+        sw->dirty = sw->latest != NULL; // resend the current frame too
+    }
+    pthread_mutex_unlock(&c->mu);
+    wake(c);
 }
 
 int sketerm_sck_wakeup_fd(SckCtx *ctx) {

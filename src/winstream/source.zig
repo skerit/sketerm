@@ -73,6 +73,15 @@ pub const Source = union(enum) {
             .sck => |*s| if (comptime have_sck) s.pollFd() else -1,
         };
     }
+
+    /// A client (re)attached its winstream channel: replay window
+    /// lifecycle so it doesn't start from frames-without-windows.
+    pub fn reannounce(self: *Source) void {
+        switch (self.*) {
+            .stub => |*s| s.opened = false, // re-opens on next poll
+            .sck => |*s| if (comptime have_sck) s.reannounce(),
+        }
+    }
 };
 
 pub const Stub = struct {

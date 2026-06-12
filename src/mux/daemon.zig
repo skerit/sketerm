@@ -370,10 +370,22 @@ pub const Daemon = struct {
         // Window-stream wakeup pipes: SCK delivers frames on its own
         // dispatch queues — a readable byte here just ends the poll
         // wait early so pumpWinstreams() drains with low latency.
-        // No revents handling: the source reads its pipe dry in poll().
+        // No revents handling: the source reads its pipe dry in
+        // poll(). Only polled while a live channel exists — without
+        // one nothing drains the pipe, and a permanently-readable fd
+        // would spin this loop hot.
         for (self.sessions.items) |s| {
+            var ws_fd: c_int = -1;
+            if (s.winstream) |ws| {
+                for (self.channels.items) |ch| {
+                    if (ch.session == s and !ch.dead and ch.native == null and !ch.client.dead) {
+                        ws_fd = ws.pollFd();
+                        break;
+                    }
+                }
+            }
             try fds.append(self.allocator, .{
-                .fd = if (s.winstream) |ws| ws.pollFd() else -1,
+                .fd = ws_fd,
                 .events = c.POLLIN,
                 .revents = 0,
             });
@@ -1480,6 +1492,9 @@ pub const Daemon = struct {
         };
         var hdr: [5]u8 = undefined;
         cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .winstream));
+        // Windows opened while nobody was attached (or for a prior
+        // client) must be replayed for this one.
+        if (s.winstream) |ws| ws.reannounce();
     }
 
     /// Pump every live window-stream session: frames toward the

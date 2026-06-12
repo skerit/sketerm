@@ -33,6 +33,7 @@ extern fn sketerm_sck_key(ctx: *anyopaque, win: u32, keycode: u16, down: bool, f
 extern fn sketerm_sck_ptr(ctx: *anyopaque, win: u32, kind: u8, x: f64, y: f64, detail: u32) void;
 extern fn sketerm_sck_scroll(ctx: *anyopaque, win: u32, dx: f64, dy: f64) void;
 extern fn sketerm_sck_close_win(ctx: *anyopaque, win: u32) void;
+extern fn sketerm_sck_reannounce(ctx: *anyopaque) void;
 
 const status_screen: u32 = 1;
 
@@ -49,6 +50,10 @@ pub const Source = struct {
     ctx: *anyopaque,
     zbuf: std.ArrayList(u8) = .empty,
     notice_open: bool = false,
+    /// Dedupe for shim error reporting — refresh retries reproduce
+    /// the same failure string every few seconds.
+    last_err: [512]u8 = undefined,
+    last_err_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, app_pid: i32) !Source {
         const ctx = sketerm_sck_create(app_pid) orelse return error.SckInitFailed;
@@ -64,14 +69,30 @@ pub const Source = struct {
         return sketerm_sck_wakeup_fd(self.ctx);
     }
 
+    /// A client (re)attached: replay win_open + current frame for
+    /// every live window — it missed the originals.
+    pub fn reannounce(self: *Source) void {
+        sketerm_sck_reannounce(self.ctx);
+    }
+
     pub fn poll(self: *Source, out: *std.ArrayList(u8), out_allocator: std.mem.Allocator, now_ms: u64) !void {
         _ = now_ms; // SCK paces frames itself (minimumFrameInterval)
 
+        // Drain FIRST, unconditionally: it reads the wakeup pipe dry
+        // (a stale readable byte would spin the daemon poll loop hot)
+        // and kicks the throttled window refresh.
+        var n: usize = 0;
+        const evs = sketerm_sck_drain(self.ctx, &n);
+
         // Shim-side problems (TCC, fetch failures, stream errors)
-        // land in the daemon log the moment they happen.
+        // land in the daemon log — once per distinct message.
         var err_buf: [512]u8 = undefined;
         const elen = sketerm_sck_last_error(self.ctx, &err_buf, err_buf.len);
-        if (elen > 0) std.debug.print("sketerm-mux winstream: {s}\n", .{err_buf[0..elen]});
+        if (elen > 0 and !std.mem.eql(u8, err_buf[0..elen], self.last_err[0..self.last_err_len])) {
+            std.debug.print("sketerm-mux winstream: {s}\n", .{err_buf[0..elen]});
+            @memcpy(self.last_err[0..elen], err_buf[0..elen]);
+            self.last_err_len = elen;
+        }
 
         if (sketerm_sck_status(self.ctx) & status_screen == 0) {
             if (!self.notice_open) {
@@ -105,9 +126,8 @@ pub const Source = struct {
             return;
         }
 
-        var n: usize = 0;
-        const evs = sketerm_sck_drain(self.ctx, &n) orelse return;
-        for (evs[0..n]) |ev| {
+        const list = evs orelse return;
+        for (list[0..n]) |ev| {
             switch (ev.kind) {
                 0 => try proto.appendWinOpen(out, out_allocator, .{
                     .win = ev.win,
