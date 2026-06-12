@@ -5471,3 +5471,17 @@ poll/handleInput surface:
   musl, aarch64-macos portable, GUI build all green. Real-capture
   live run pending the manual Screen Recording + Accessibility
   toggles (registered, awaiting the human).
+
+## 2026-06-12: Mac-as-client — Linux app over the native pipe
+
+The merge-milestone direction nobody had hardware for until now:
+sketerm GUI on the Mac (GTK/macOS) attaching a durable session on
+the colima Ubuntu VM over SSH, weston-terminal launched from the
+session shell ($WAYLAND_DISPLAY = the daemon's native display).
+The app runs against the Mac-side wlhost compositor — stays alive,
+zero protocol errors in the GUI log. Same wlhost/winapp code as
+Linux, unchanged. Visual + input confirmation needs eyeballs on
+the console (screencapture is TCC-blocked for the SSH shell);
+protocol level is green. Rig: fresh aarch64-musl daemon scp'd to
+the VM, weston installed there, SKETERM_SSH wrapper for the colima
+key.
