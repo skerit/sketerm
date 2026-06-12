@@ -4935,3 +4935,40 @@ Tests 454 → 466.
 - NOT done: GUI build on real hardware (brew GTK + translate-c on
   Darwin headers is the expected friction), .app bundle, Cmd
   keybindings. Recipe + friction list in docs/macos.md.
+
+## 2026-06-12: pane-tree model — frontend abstraction, step 1
+
+- GOAL: de-GTK the core UI so a native AppKit frontend is possible
+  (ghostty-style core + thin frontends; Qt rejected: C++ ABI).
+- CLAUDE.md claimed "tab/pane tree is plain Zig data" — it wasn't:
+  the tree only existed as GtkPaned nesting (tabPageForPane walked
+  widget ancestry, collectLayout walked GTK containers). Now it's
+  true: src/ui/tree.zig is a generic toolkit-free Tree(Leaf) model
+  (split/remove/replace/contains/serialize, unit-tested on u32),
+  instantiated as Window.PaneTree = Tree(*Pane).
+- One tree per tab, attached to the AdwTabPage as qdata — travels
+  with cross-window tab drags for free, sidestepping the page-
+  detached/attached close-vs-transfer race entirely. Freed only on
+  true tab teardown (3 sites around collectAndFreePanes).
+- Mutation sync points: appendOrInsertTab (5 creation sites, takes
+  the root node), buildTreeWidget (builds model alongside widgets on
+  restore), splitFocused (splitLeaf), closeFocusedPane (removeLeaf,
+  model focus_hint replaces the widget walk), mux takeover
+  (replaceLeaf).
+- Reads flipped to model: tabPageForPane (widget walk kept as
+  fallback), collectLayout (modelTreeToLayout; live ratios read from
+  the split's view handle), duplicateCurrentTab. Bonus correctness:
+  layout save while a pane is ZOOMED now serializes the real tree
+  (the widget walk saw the zoom-reparented structure).
+- Verification net: SKETERM_VERIFY_TREE=1 structurally compares
+  model vs widget tree after every split/close and inside
+  collectLayout; divergence ABORTS. smoke-e2e sets it and now also
+  drives a nested v-split + close-pane through IPC. Manually
+  verified the same sequence against a live instance on a restored
+  2-tab default layout — no divergence.
+- 503 tests (tree.zig +6), smoke-e2e/cell/mux green, macOS mux
+  cross-compile still green.
+- NEXT steps for the abstraction: flip remaining widgetIsAncestor
+  query sites (IPC list, broadcast group, pane cycle) to the model;
+  then extract the GLib-loop/clipboard/dialog seams into a frontend
+  interface.

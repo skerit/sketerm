@@ -40,6 +40,10 @@ pub fn main() u8 {
     if (pid < 0) return fail("fork");
     if (pid == 0) {
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e", 1);
+        // Cross-check the pane-tree model against the widget tree
+        // after every split/close — divergence aborts the app, which
+        // fails this harness.
+        _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -97,7 +101,26 @@ pub fn main() u8 {
     defer allocator.free(list2);
     if (std.mem.count(u8, list2, "\"id\":") < 3) return fail("split did not add a pane"); // 1 tab id + 2 pane ids
 
-    // 5. unknown command must error.
+    // 5. nested split (vertical on the new pane), then close it —
+    // exercises the tree model's deep split + collapse paths under
+    // SKETERM_VERIFY_TREE.
+    const split2 = roundtrip(allocator, sock_path, "{\"cmd\":\"split\",\"pane\":2,\"direction\":\"v\"}\n") orelse return fail("split2 roundtrip");
+    defer allocator.free(split2);
+    if (std.mem.indexOf(u8, split2, "\"ok\":true") == null) return fail("split2 not ok");
+    _ = c.usleep(500_000);
+    const close2 = roundtrip(allocator, sock_path, "{\"cmd\":\"close-pane\",\"pane\":2}\n") orelse return fail("close-pane roundtrip");
+    defer allocator.free(close2);
+    if (std.mem.indexOf(u8, close2, "\"ok\":true") == null) return fail("close-pane not ok");
+    _ = c.usleep(500_000);
+    const list3 = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return fail("list3 roundtrip");
+    defer allocator.free(list3);
+    // Relative invariant (the instance may have restored a saved
+    // default layout, so absolute counts are unknowable): split2
+    // added one pane, close-pane removed one — net equal to list2.
+    if (std.mem.count(u8, list3, "\"id\":") != std.mem.count(u8, list2, "\"id\":"))
+        return fail("close-pane wrong pane count");
+
+    // 6. unknown command must error.
     const bad = roundtrip(allocator, sock_path, "{\"cmd\":\"nope\"}\n") orelse return fail("bad-cmd roundtrip");
     defer allocator.free(bad);
     if (std.mem.indexOf(u8, bad, "\"ok\":false") == null) return fail("unknown cmd not rejected");

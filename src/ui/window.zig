@@ -17,6 +17,14 @@ const ipc_server = @import("../ipc/server.zig");
 const bg_pass_mod = @import("../render/bg_pass.zig");
 const shader_pass_mod = @import("../render/shader_pass.zig");
 const shader_preset_mod = @import("../shader_preset.zig");
+const tree_mod = @import("tree.zig");
+
+/// Toolkit-free pane-tree model — one per tab, attached to the
+/// AdwTabPage as qdata (travels with cross-window tab drags). The
+/// GtkPaned nesting is a VIEW of this; every widget-tree mutation
+/// below also updates the model. See src/ui/tree.zig.
+pub const PaneTree = tree_mod.Tree(*Pane);
+const TAB_TREE_KEY = "sketerm-tree";
 const ipc_protocol = @import("../ipc/protocol.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
 const Screen = @import("../grid/screen.zig").Screen;
@@ -1180,7 +1188,7 @@ pub const Window = struct {
         c.gtk_widget_set_vexpand(wrapper, 1);
         c.gtk_box_append(@ptrCast(wrapper), pane.widget());
 
-        const page = self.appendOrInsertTab(wrapper);
+        const page = self.appendOrInsertTab(wrapper, .{ .leaf = pane });
         c.adw_tab_page_set_title(page, title_z);
         c.adw_tab_page_set_tooltip(page, title_z);
     }
@@ -1204,14 +1212,15 @@ pub const Window = struct {
         c.gtk_widget_set_vexpand(wrapper, 1);
         c.gtk_widget_set_hexpand(wrapper, 1);
 
-        const root_widget = try self.buildTreeWidget(spec.tree);
+        var model_root: PaneTree.Node = undefined;
+        const root_widget = try self.buildTreeWidget(spec.tree, &model_root);
         c.gtk_box_append(@ptrCast(wrapper), root_widget);
 
         const title_z = try self.allocator.allocSentinel(u8, spec.title.len, 0);
         defer self.allocator.free(title_z);
         @memcpy(title_z, spec.title);
 
-        const page = self.appendOrInsertTab(wrapper);
+        const page = self.appendOrInsertTab(wrapper, model_root);
         c.adw_tab_page_set_title(page, title_z.ptr);
         c.adw_tab_page_set_tooltip(page, title_z.ptr);
         // Re-arm the user-rename lock so OSC titles can't stomp a
@@ -1238,7 +1247,9 @@ pub const Window = struct {
             pane.clearShader();
     }
 
-    fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree) !*c.GtkWidget {
+    /// Build the widget subtree for a layout spec, producing the
+    /// matching model node in `node_out` (valid only on success).
+    fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_out: *PaneTree.Node) !*c.GtkWidget {
         switch (tree) {
             .pane => |p| {
                 // Durable mux pane: reattach (or recreate under the
@@ -1248,6 +1259,7 @@ pub const Window = struct {
                 if (p.mux_session.len > 0) {
                     if (self.restoreMuxPane(p)) |pane| {
                         self.restorePaneShader(pane, p);
+                        node_out.* = .{ .leaf = pane };
                         return pane.widget();
                     } else |err| {
                         std.debug.print(
@@ -1321,6 +1333,7 @@ pub const Window = struct {
 
                 try self.panes.append(self.allocator, pane);
                 try self.terminals.append(self.allocator, term);
+                node_out.* = .{ .leaf = pane };
                 return pane.widget();
             },
             .split => |s| {
@@ -1337,10 +1350,20 @@ pub const Window = struct {
                 // Wide handle so GtkPaned honours CSS min-width on
                 // the separator (gives us the gutter around the line).
                 c.gtk_paned_set_wide_handle(@ptrCast(paned), 1);
-                const first = try self.buildTreeWidget(s.children[0]);
-                const second = try self.buildTreeWidget(s.children[1]);
+                var first_node: PaneTree.Node = undefined;
+                var second_node: PaneTree.Node = undefined;
+                const first = try self.buildTreeWidget(s.children[0], &first_node);
+                const second = try self.buildTreeWidget(s.children[1], &second_node);
                 c.gtk_paned_set_start_child(@ptrCast(paned), first);
                 c.gtk_paned_set_end_child(@ptrCast(paned), second);
+                const split_node = try self.allocator.create(PaneTree.Split);
+                split_node.* = .{
+                    .orientation = if (s.orientation == .horizontal) .horizontal else .vertical,
+                    .ratio = if (s.ratio > 0 and s.ratio < 1) s.ratio else 0.5,
+                    .children = .{ first_node, second_node },
+                    .view = paned,
+                };
+                node_out.* = .{ .split = split_node };
 
                 // Apply saved ratio after the widget gets its first
                 // allocation. Until then we don't know the total
@@ -1416,7 +1439,7 @@ pub const Window = struct {
         c.gtk_widget_set_vexpand(wrapper, 1);
         c.gtk_box_append(@ptrCast(wrapper), pane.widget());
 
-        const page = self.appendOrInsertTab(wrapper);
+        const page = self.appendOrInsertTab(wrapper, .{ .leaf = pane });
         c.adw_tab_page_set_title(page, title_z);
         // Full-title tooltip — useful when titles are truncated.
         c.adw_tab_page_set_tooltip(page, title_z);
@@ -1539,7 +1562,7 @@ pub const Window = struct {
         c.gtk_widget_set_hexpand(wrapper, 1);
         c.gtk_widget_set_vexpand(wrapper, 1);
         c.gtk_box_append(@ptrCast(wrapper), pane.widget());
-        const adw_page = self.appendOrInsertTab(wrapper);
+        const adw_page = self.appendOrInsertTab(wrapper, .{ .leaf = pane });
         const title_for_page: [*:0]const u8 = title_z orelse "Tab";
         c.adw_tab_page_set_title(adw_page, title_for_page);
         c.adw_tab_page_set_tooltip(adw_page, title_for_page);
@@ -2184,6 +2207,20 @@ pub const Window = struct {
             c.gtk_paned_set_end_child(@ptrCast(paned), new_w);
             c.gtk_box_append(@ptrCast(parent), paned);
         }
+
+        // Mirror the widget surgery in the tab's tree model: focused
+        // keeps the first slot (start child), new pane the second.
+        if (is_paned or is_box) {
+            if (tabPageForPane(self, focused_pane)) |page| {
+                if (tabTreeOf(page)) |t| {
+                    const orient: tree_mod.Orient = if (orientation == c.GTK_ORIENTATION_HORIZONTAL) .horizontal else .vertical;
+                    t.splitLeaf(focused_pane, new_pane, orient, 0.5, paned) catch
+                        std.debug.print("sketerm: tree model split desync (leaf not found)\n", .{});
+                }
+            }
+        }
+
+        self.verifyAllTabs();
 
         // Make sure the new GLArea has actually been kicked into life:
         // realize the GL context now (instead of waiting for the first
@@ -3037,7 +3074,7 @@ pub const Window = struct {
     /// `new_tab_after_current` config: at the end (default) or
     /// immediately after the currently-selected page. Returns the
     /// AdwTabPage so callers can set its title/tooltip.
-    fn appendOrInsertTab(self: *Window, child: *c.GtkWidget) *c.AdwTabPage {
+    fn appendOrInsertTab(self: *Window, child: *c.GtkWidget, tree_root: PaneTree.Node) *c.AdwTabPage {
         const page = blk: {
             if (self.config.new_tab_after_current) {
                 const sel = c.adw_tab_view_get_selected_page(self.tab_view);
@@ -3052,7 +3089,32 @@ pub const Window = struct {
         // GObject (survives reorder; pages are never re-tagged).
         c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-id", @ptrFromInt(self.next_tab_id));
         self.next_tab_id += 1;
+        self.attachTabTree(page, tree_root);
         return page;
+    }
+
+    /// Attach the pane-tree model to a tab page. Best-effort on OOM
+    /// (queries fall back gracefully on a missing tree).
+    fn attachTabTree(self: *Window, page: *c.AdwTabPage, root: PaneTree.Node) void {
+        const t = self.allocator.create(PaneTree) catch return;
+        t.* = .{ .allocator = self.allocator, .root = root };
+        c.g_object_set_data(@ptrCast(@alignCast(page)), TAB_TREE_KEY, @ptrCast(t));
+    }
+
+    pub fn tabTreeOf(page: *c.AdwTabPage) ?*PaneTree {
+        const p = c.g_object_get_data(@ptrCast(@alignCast(page)), TAB_TREE_KEY) orelse return null;
+        return @ptrCast(@alignCast(p));
+    }
+
+    /// Free a page's tree model — call ONLY on true tab teardown
+    /// (close/shutdown), never on cross-window transfer (the qdata
+    /// must travel with the page).
+    fn freeTabTree(self: *Window, page: *c.AdwTabPage) void {
+        if (tabTreeOf(page)) |t| {
+            t.deinit();
+            self.allocator.destroy(t);
+            c.g_object_set_data(@ptrCast(@alignCast(page)), TAB_TREE_KEY, null);
+        }
     }
 
     // ── Remote control (sketerm cli) ─────────────────────────────
@@ -3313,6 +3375,12 @@ pub const Window = struct {
 
         const page = if (takeover) |old| blk: {
             const page = tabPageForPane(self, old) orelse return error.PaneHasNoTab;
+            // Mirror in the tree model: the new remote pane takes the
+            // old leaf's slot in place.
+            if (tabTreeOf(page)) |t| {
+                t.replaceLeaf(old, pane) catch
+                    std.debug.print("sketerm: tree model takeover desync (leaf not found)\n", .{});
+            }
             const old_w = old.widget();
             const parent = c.gtk_widget_get_parent(old_w) orelse return error.PaneHasNoTab;
             const is_paned = c.g_type_check_instance_is_a(
@@ -3340,7 +3408,7 @@ pub const Window = struct {
             c.gtk_widget_set_hexpand(wrapper, 1);
             c.gtk_widget_set_vexpand(wrapper, 1);
             c.gtk_box_append(@ptrCast(wrapper), pane.widget());
-            break :blk self.appendOrInsertTab(wrapper);
+            break :blk self.appendOrInsertTab(wrapper, .{ .leaf = pane });
         };
         c.adw_tab_page_set_title(page, title_z.ptr);
         c.adw_tab_page_set_tooltip(page, title_z.ptr);
@@ -4250,6 +4318,9 @@ pub const Window = struct {
         const pane = self.panes.items[found_idx.?];
         const w = pane.widget();
         const parent = c.gtk_widget_get_parent(w) orelse return;
+        // Resolve the page BEFORE the widget surgery below detaches
+        // the pane from it — needed for the tree-model update.
+        const tree_page = tabPageForPane(self, pane);
 
         const is_paned = c.g_type_check_instance_is_a(
             @ptrCast(@alignCast(parent)),
@@ -4317,14 +4388,28 @@ pub const Window = struct {
         // its controller / signal-closure cleanups (which dereference
         // `pane.menu_arena` via the click-context GDestroyNotify)
         // BEFORE we tear `menu_arena` down.
+        // Mirror the collapse in the tab's tree model.
+        var focus_hint: ?*Pane = null;
+        if (tree_page) |page| {
+            if (tabTreeOf(page)) |t| {
+                if (t.removeLeaf(pane)) |r| {
+                    focus_hint = r.focus_hint;
+                } else |_| {
+                    std.debug.print("sketerm: tree model close desync (leaf not found)\n", .{});
+                }
+            }
+        }
+
         // The search bar / hint mode hold raw pane pointers — drop
         // them before the pane is freed.
         self.unlistPane(pane);
 
-        // Move focus to the first pane inside the surviving sibling
-        // subtree — without this, focus can land on the now-empty
-        // GtkPaned wrapper and keypresses go nowhere.
-        if (sibling) |sib| {
+        // Move focus to the first pane of the surviving sibling
+        // subtree (model hint) — without this, focus can land on the
+        // now-empty GtkPaned wrapper and keypresses go nowhere.
+        if (focus_hint) |fp| {
+            _ = c.gtk_widget_grab_focus(@ptrCast(fp.area));
+        } else if (sibling) |sib| {
             for (self.panes.items) |p| {
                 if (widgetIsAncestor(@ptrCast(sib), @ptrCast(p.widget()))) {
                     _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
@@ -4332,6 +4417,8 @@ pub const Window = struct {
                 }
             }
         }
+
+        self.verifyAllTabs();
     }
 
     /// Build a Layout snapshot of the current window state.
@@ -4349,7 +4436,13 @@ pub const Window = struct {
             const title_cstr = c.adw_tab_page_get_title(page);
             const title = if (title_cstr != null) std.mem.span(@as([*:0]const u8, @ptrCast(title_cstr))) else "";
 
-            const tree = self.collectTree(arena, root.?) catch continue;
+            self.verifyTreeModel(page.?, root.?);
+            // Model-based serialization (correct even while zoomed);
+            // widget walk only as fallback for a missing model.
+            const tree = if (Window.tabTreeOf(page.?)) |t|
+                self.modelTreeToLayout(arena, t.root) catch continue
+            else
+                self.collectTree(arena, root.?) catch continue;
             try tabs.append(arena, .{
                 .title = try arena.dupe(u8, title),
                 .tree = tree,
@@ -4395,6 +4488,18 @@ pub const Window = struct {
         // Leaf — find the Pane that owns this widget.
         for (self.panes.items) |p| {
             if (@intFromPtr(p.widget()) == @intFromPtr(w)) {
+                return .{ .pane = try self.paneSpec(arena, p) };
+            }
+        }
+        return error.PaneNotFound;
+    }
+
+    /// Serialize one pane's restore state (cwd, command, profile,
+    /// shader, mux session) — shared by the model- and widget-based
+    /// layout walkers.
+    fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.PaneSpec {
+        {
+            {
                 // Prefer OSC 7 cwd if the shell reported it; fall
                 // back to /proc/<pid>/cwd; finally to "/".
                 const cwd: []const u8 = if (p.terminal.cwd) |reported|
@@ -4439,7 +4544,7 @@ pub const Window = struct {
                     mux_session = try arena.dupe(u8, r.session);
                     if (r.host) |h| mux_host = try arena.dupe(u8, h);
                 }
-                return .{ .pane = .{
+                return .{
                     .cwd = cwd,
                     .command = cmd,
                     .font_size = fs,
@@ -4449,10 +4554,92 @@ pub const Window = struct {
                     .shader_cleared = p.shader_cleared,
                     .mux_session = mux_session,
                     .mux_host = mux_host,
-                } };
+                };
             }
         }
-        return error.PaneNotFound;
+    }
+
+    /// Serialize a model node to a layout tree. Split ratios are
+    /// read live from the view handle (the GtkPaned) at save time.
+    fn modelTreeToLayout(self: *Window, arena: std.mem.Allocator, node: PaneTree.Node) !layout_mod.Tree {
+        switch (node) {
+            .leaf => |p| return .{ .pane = try self.paneSpec(arena, p) },
+            .split => |sp| {
+                var ratio: f32 = if (sp.ratio > 0 and sp.ratio < 1) sp.ratio else 0.5;
+                if (sp.view) |v| {
+                    const paned: *c.GtkWidget = @ptrCast(@alignCast(v));
+                    const total: c_int = if (sp.orientation == .horizontal)
+                        c.gtk_widget_get_width(paned)
+                    else
+                        c.gtk_widget_get_height(paned);
+                    const pos = c.gtk_paned_get_position(@ptrCast(paned));
+                    if (total > 0) ratio = @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total));
+                }
+                const children = try arena.alloc(layout_mod.Tree, 2);
+                children[0] = try self.modelTreeToLayout(arena, sp.children[0]);
+                children[1] = try self.modelTreeToLayout(arena, sp.children[1]);
+                return .{ .split = .{
+                    .orientation = if (sp.orientation == .horizontal) .horizontal else .vertical,
+                    .ratio = ratio,
+                    .children = children,
+                } };
+            },
+        }
+    }
+
+    /// SKETERM_VERIFY_TREE=1: structural cross-check of the tree
+    /// model against the live widget tree. Skipped while a pane is
+    /// zoomed (zoom reparents widgets; the model is authoritative).
+    fn verifyTreeModel(self: *Window, page: *c.AdwTabPage, root_widget: *c.GtkWidget) void {
+        const S = struct {
+            var enabled: ?bool = null;
+        };
+        if (S.enabled == null) S.enabled = c.getenv("SKETERM_VERIFY_TREE") != null;
+        if (!S.enabled.?) return;
+        if (self.zoom_pane != null) return;
+        const t = Window.tabTreeOf(page) orelse {
+            std.debug.print("sketerm: VERIFY: page has no tree model\n", .{});
+            return;
+        };
+        if (!self.widgetMatchesNode(root_widget, t.root)) {
+            std.debug.print("sketerm: VERIFY FAILED: tree model diverges from widget tree\n", .{});
+            // Test-only env var: die loudly so the e2e harness fails.
+            c.abort();
+        }
+    }
+
+    /// Verify every tab's model (SKETERM_VERIFY_TREE only; no-op
+    /// otherwise). Called after each tree mutation.
+    fn verifyAllTabs(self: *Window) void {
+        if (c.getenv("SKETERM_VERIFY_TREE") == null) return;
+        const n = c.adw_tab_view_get_n_pages(self.tab_view);
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            const page = c.adw_tab_view_get_nth_page(self.tab_view, i) orelse continue;
+            const wrapper = c.adw_tab_page_get_child(page) orelse continue;
+            const root = c.gtk_widget_get_first_child(@ptrCast(wrapper)) orelse continue;
+            self.verifyTreeModel(page, root);
+        }
+    }
+
+    fn widgetMatchesNode(self: *Window, w: *c.GtkWidget, node: PaneTree.Node) bool {
+        const is_paned = c.g_type_check_instance_is_a(
+            @ptrCast(@alignCast(w)),
+            c.gtk_paned_get_type(),
+        ) != 0;
+        switch (node) {
+            .leaf => |p| return !is_paned and @intFromPtr(p.widget()) == @intFromPtr(w),
+            .split => |sp| {
+                if (!is_paned) return false;
+                const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(w)));
+                const want_horiz = sp.orientation == .horizontal;
+                if ((orientation == c.GTK_ORIENTATION_HORIZONTAL) != want_horiz) return false;
+                const start = c.gtk_paned_get_start_child(@ptrCast(w)) orelse return false;
+                const end = c.gtk_paned_get_end_child(@ptrCast(w)) orelse return false;
+                return self.widgetMatchesNode(start, sp.children[0]) and
+                    self.widgetMatchesNode(end, sp.children[1]);
+            },
+        }
     }
 
     /// Open a GtkFileChooserNative for save-as; user picks a path,
@@ -4517,12 +4704,16 @@ pub const Window = struct {
             return;
         }
 
-        // Split tree — round-trip via collectTree → newTabFromSpec.
+        // Split tree — round-trip via the tree model → newTabFromSpec
+        // (widget walk only as fallback for a missing model).
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const tree = self.collectTree(arena, root.?) catch |err| {
+        const tree = (if (Window.tabTreeOf(sel)) |t|
+            self.modelTreeToLayout(arena, t.root)
+        else
+            self.collectTree(arena, root.?)) catch |err| {
             std.debug.print("sketerm: duplicate split tree failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -5348,7 +5539,18 @@ fn setTabPageTitleFromUtf8(allocator: std.mem.Allocator, page: *c.AdwTabPage, ti
 /// session.
 fn tabPageForPane(self: *Window, pane: *Pane) ?*c.AdwTabPage {
     const n = c.adw_tab_view_get_n_pages(self.tab_view);
+    // Model first: pure data, correct even while a pane is zoomed
+    // (zoom reparents widgets but never touches the model).
     var i: c_int = 0;
+    while (i < n) : (i += 1) {
+        const page = c.adw_tab_view_get_nth_page(self.tab_view, i) orelse continue;
+        if (Window.tabTreeOf(page)) |t| {
+            if (t.contains(pane)) return page;
+        }
+    }
+    // Widget-walk fallback for pages without a model (shouldn't
+    // happen; kept for robustness during the model rollout).
+    i = 0;
     while (i < n) : (i += 1) {
         const page = c.adw_tab_view_get_nth_page(self.tab_view, i) orelse continue;
         const child = c.adw_tab_page_get_child(page);
@@ -5747,6 +5949,7 @@ fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyop
     // never run again — tear down synchronously (prior behaviour).
     if (c.gtk_widget_get_mapped(self.app_window) == 0) {
         collectAndFreePanes(self, @ptrCast(child));
+        self.freeTabTree(page);
         return;
     }
 
@@ -5756,6 +5959,7 @@ fn onPageDetached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyop
         // we're in OOM territory anyway.
         self.captureClosedTab(page, @ptrCast(child));
         collectAndFreePanes(self, @ptrCast(child));
+        self.freeTabTree(page);
         return;
     };
     _ = c.g_object_ref(@ptrCast(@alignCast(page)));
@@ -5795,6 +5999,7 @@ fn onPageDetachedIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
             // first-pane's cwd + profile; split trees aren't preserved.
             self.captureClosedTab(page, @ptrCast(child));
             collectAndFreePanes(self, @ptrCast(child));
+            self.freeTabTree(page);
         }
     }
 
