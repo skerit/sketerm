@@ -113,3 +113,22 @@ echo-off prompts (passwords).
   over SSH).
 - Kitty-graphics placements are snapshotted (12 MB retention budget
   per session, oldest evicted) and come back on reattach.
+
+## Remote GUI apps (Wayland forwarding)
+
+Any Wayland app started inside a durable session shows up as a
+native window on the client desktop — `$WAYLAND_DISPLAY` in the
+session points at the daemon itself, which relays the protocol over
+the mux connection (so forwarded apps roam with UDP transports and
+survive reattach like everything else). **Nothing extra to install
+on either end**: the daemon is the display server, the sketerm GUI
+is the compositor.
+
+Supported today: windows (resizable, titled, with the app's icon),
+keyboard + mouse, menus/popups, text clipboard both ways. Damage
+tracking + deflate keep buffer traffic reasonable over a network.
+Pixel transport is shm-only — software-rendered GL works (Mesa
+presents via shm), GPU-buffer (dmabuf) apps don't. For those,
+`SKETERM_MUX_WAYLAND=waypipe` in the daemon's environment opts back
+into the legacy waypipe wrap (needs waypipe installed remotely);
+`SKETERM_MUX_NO_WAYLAND=1` disables forwarding entirely.

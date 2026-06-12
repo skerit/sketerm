@@ -604,10 +604,6 @@ pub fn main() u8 {
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
-    // Sessions in this smoke use the sketerm-native app pipe (no
-    // waypipe dependency on the test host).
-    _ = c.setenv("SKETERM_MUX_NATIVE_WAYLAND", "1", 1);
-
     var path_buf: [128]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-mux-smoke-{d}/mux.sock", .{c.getpid()}) catch unreachable;
 

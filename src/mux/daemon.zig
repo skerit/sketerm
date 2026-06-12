@@ -76,10 +76,11 @@ const Session = struct {
     /// Owned hub + display socket paths, unlinked on teardown.
     wl_hub_path: ?[]u8 = null,
     wl_display_path: ?[]u8 = null,
-    /// Sketerm-native app pipe (SKETERM_MUX_NATIVE_WAYLAND=1): the
-    /// daemon IS the Wayland display — wl_hub_fd listens on the
-    /// display socket itself, no waypipe wrap, and each app
-    /// connection gets parsed + shm-mirrored (Channel.native).
+    /// Sketerm-native app pipe (the DEFAULT): the daemon IS the
+    /// Wayland display — wl_hub_fd listens on the display socket
+    /// itself, no waypipe wrap, and each app connection gets parsed
+    /// + shm-mirrored (Channel.native). False = legacy waypipe wrap
+    /// (SKETERM_MUX_WAYLAND=waypipe).
     wl_native: bool = false,
 
     fn deinit(self: *Session) void {
@@ -1210,16 +1211,19 @@ pub const Daemon = struct {
     fn spawnSession(self: *Daemon, req: SpawnReq) !*Session {
         const allocator = self.allocator;
 
-        // Wayland forwarding: wrap the command in a `waypipe server`
-        // that provides $WAYLAND_DISPLAY for everything in the
-        // session, connecting each app back to our hub socket. With
-        // SKETERM_MUX_NATIVE_WAYLAND=1 (the sketerm-native pipe,
-        // maturing — waypipe stays the default until it does) the
-        // daemon listens on the display socket itself instead.
-        const native_wayland = std.c.getenv("SKETERM_MUX_NATIVE_WAYLAND") != null;
+        // Wayland forwarding. DEFAULT: the sketerm-native pipe —
+        // the daemon listens on the session's display socket itself,
+        // nothing else installed. SKETERM_MUX_WAYLAND=waypipe opts
+        // back into the legacy `waypipe server` wrap (e.g. for
+        // GPU-buffer transfer); SKETERM_MUX_NO_WAYLAND=1 disables
+        // app forwarding entirely.
+        const wl_mode = std.c.getenv("SKETERM_MUX_WAYLAND");
+        const use_waypipe = wl_mode != null and
+            std.mem.eql(u8, std.mem.span(wl_mode.?), "waypipe") and
+            waypipeAvailable();
+        const native_wayland = !use_waypipe;
         const want_wayland = std.c.getenv("SKETERM_MUX_NO_WAYLAND") == null and
-            req.argv.len > 0 and !std.mem.eql(u8, std.fs.path.basename(req.argv[0]), "waypipe") and
-            (native_wayland or waypipeAvailable());
+            req.argv.len > 0 and !std.mem.eql(u8, std.fs.path.basename(req.argv[0]), "waypipe");
         var hub: ?WaylandHub = if (want_wayland) self.setupWaylandHub(native_wayland) else null;
         errdefer if (hub) |h| {
             _ = c.close(h.fd);
