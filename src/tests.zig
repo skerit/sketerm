@@ -62,6 +62,7 @@ comptime {
     _ = @import("grid/schemes.zig");
     _ = @import("wlhost/wire.zig");
     _ = @import("wlhost/protocol.zig");
+    _ = @import("wlhost/track.zig");
 }
 
 test {
