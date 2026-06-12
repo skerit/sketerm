@@ -143,6 +143,16 @@ pub const Compositor = struct {
         }
     }
 
+    /// View → client: ask the app to close this toplevel (window
+    /// close button). The app decides; nothing is destroyed here.
+    pub fn requestClose(self: *Compositor, sid: u32) Error!void {
+        const surf = self.surfaces.getPtr(sid) orelse return;
+        if (surf.toplevel == 0) return;
+        var buf: [8]u8 = undefined;
+        var b = wire.Builder.init(&buf, surf.toplevel, 1); // close
+        try self.send(try b.finish());
+    }
+
     /// The accumulated outgoing unit stream; caller ships it (as
     /// chan_data, or decoded onto a test socket) and then clears.
     pub fn takeOut(self: *Compositor) []const u8 {

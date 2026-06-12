@@ -135,6 +135,9 @@ pub const Terminal = struct {
         /// Forwarded Wayland app streams (daemon chan_* frames ↔
         /// local waypipe client), keyed by daemon channel id.
         channels: std.ArrayList(*WlChan) = .empty,
+        /// Sketerm-native app channels: the wlhost compositor brain
+        /// renders these as local windows — no waypipe involved.
+        napps: std.ArrayList(*NApp) = .empty,
 
         pub fn sendInput(self: *Remote, bytes: []const u8) void {
             if (self.closed) return;
@@ -154,6 +157,13 @@ pub const Terminal = struct {
         watch_out: c_uint = 0,
         /// Daemon bytes not yet written to fd (partial writes).
         pending: std.ArrayList(u8) = .empty,
+    };
+
+    /// One sketerm-native app channel (kind wayland_native).
+    const NApp = struct {
+        terminal: *Terminal,
+        id: u32,
+        host: *@import("wlapp.zig").AppHost,
     };
 
     /// Attach to an existing sketerm-mux session. `conn` must have
@@ -356,6 +366,7 @@ pub const Terminal = struct {
             .chan_close => {
                 const id = mux_wire.decodeChanId(frame.payload) orelse return;
                 if (self.findChan(id)) |ch| self.destroyChan(ch, false);
+                if (self.findNApp(id)) |na| self.destroyNApp(na);
             },
             else => {},
         }
@@ -412,6 +423,10 @@ pub const Terminal = struct {
     fn chanOpen(self: *Terminal, payload: []const u8) void {
         const remote = self.remote orelse return;
         const open = mux_wire.decodeChanOpen(payload) orelse return;
+        if (open.kind == .wayland_native) {
+            self.nappOpen(open.id);
+            return;
+        }
         if (open.kind != .wayland) {
             self.sendChanClose(open.id);
             return;
@@ -437,6 +452,7 @@ pub const Terminal = struct {
 
     fn chanData(self: *Terminal, payload: []const u8) void {
         const id = mux_wire.decodeChanId(payload) orelse return;
+        if (self.findNApp(id)) |na| return self.nappData(na, payload[4..]);
         const ch = self.findChan(id) orelse return;
         const bytes = payload[4..];
         // Write-through while the pipe keeps up; buffer the rest and
@@ -483,6 +499,86 @@ pub const Terminal = struct {
         while (remote.channels.items.len > 0) {
             self.destroyChan(remote.channels.items[remote.channels.items.len - 1], false);
         }
+        while (remote.napps.items.len > 0) {
+            self.destroyNApp(remote.napps.items[remote.napps.items.len - 1]);
+        }
+    }
+
+    // ── sketerm-native app channels (wlhost compositor) ──────────
+
+    fn findNApp(self: *Terminal, id: u32) ?*NApp {
+        const remote = self.remote orelse return null;
+        for (remote.napps.items) |na| {
+            if (na.id == id) return na;
+        }
+        return null;
+    }
+
+    fn nappOpen(self: *Terminal, id: u32) void {
+        const remote = self.remote orelse return;
+        const host = @import("wlapp.zig").AppHost.create(self.allocator) catch {
+            self.sendChanClose(id);
+            return;
+        };
+        const na = self.allocator.create(NApp) catch {
+            host.destroy();
+            self.sendChanClose(id);
+            return;
+        };
+        na.* = .{ .terminal = self, .id = id, .host = host };
+        host.on_flush = nappFlushCb;
+        host.flush_ctx = na;
+        remote.napps.append(self.allocator, na) catch {
+            host.destroy();
+            self.allocator.destroy(na);
+            self.sendChanClose(id);
+            return;
+        };
+    }
+
+    fn nappData(self: *Terminal, na: *NApp, bytes: []const u8) void {
+        na.host.feed(bytes) catch {
+            self.sendChanClose(na.id);
+            self.destroyNApp(na);
+            return;
+        };
+        self.nappFlush(na);
+    }
+
+    /// Ship pending compositor events to the daemon.
+    fn nappFlush(self: *Terminal, na: *NApp) void {
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        const out = na.host.takeOut();
+        if (out.len == 0) return;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, na.id, .little);
+        payload.appendSlice(self.allocator, &idb) catch return;
+        payload.appendSlice(self.allocator, out) catch return;
+        na.host.clearOut();
+        remote.conn.sendFrame(.chan_data, payload.items) catch {
+            remote.closed = true;
+        };
+    }
+
+    fn nappFlushCb(ctx: ?*anyopaque) void {
+        const na = @import("util/cast.zig").userData(NApp, ctx);
+        na.terminal.nappFlush(na);
+    }
+
+    fn destroyNApp(self: *Terminal, na: *NApp) void {
+        na.host.destroy();
+        if (self.remote) |remote| {
+            for (remote.napps.items, 0..) |it, i| {
+                if (it == na) {
+                    _ = remote.napps.swapRemove(i);
+                    break;
+                }
+            }
+        }
+        self.allocator.destroy(na);
     }
 
     /// Local waypipe client socket readable: forward to the daemon.
@@ -843,6 +939,7 @@ pub const Terminal = struct {
             if (remote.expire_timer != 0) _ = c.g_source_remove(remote.expire_timer);
             self.destroyAllChans();
             remote.channels.deinit(self.allocator);
+            remote.napps.deinit(self.allocator);
             remote.predictor.deinit();
             if (!remote.closed) remote.conn.sendFrame(.detach, "") catch {};
             remote.conn.deinit();
