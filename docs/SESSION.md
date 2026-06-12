@@ -5397,3 +5397,12 @@ smoke-mux winstream stage + live rig PASS (stub window renders its
 pattern on screen). The Mac side drops ScreenCaptureKit +
 CGEventPost behind Source.poll/handleInput — transport and render
 are done. 546 tests, all targets green.
+
+## 2026-06-12: app-window UX — pane attach, decorations, identity
+
+User-reported from live laptop→archdev testing (pcmanfm WORKS over
+the native pipe): `sketerm app` in a pane takes over the pane;
+host windows undecorated by default + zxdg_decoration negotiation
+(SSD requesters get host decorations); per-window identity via
+gdk_wayland_toplevel_set_application_id / X11 WM_CLASS (libX11 now
+linked on Linux GUI). 545 tests, smoke-mux, portable targets PASS.
