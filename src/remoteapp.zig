@@ -282,8 +282,8 @@ fn execWaypipeSsh(allocator: std.mem.Allocator, host: [:0]const u8, command: []c
     if (no_gpu) argv.append(allocator, "--no-gpu") catch return 1;
     argv.append(allocator, "--title-prefix") catch return 1;
     argv.append(allocator, title.ptr) catch return 1;
-    argv.append(allocator, "--ssh-bin") catch return 1;
-    argv.append(allocator, sshBin()) catch return 1;
+    // waypipe 0.11 dropped --ssh-bin; it finds `ssh` on PATH.
+    // ($SKETERM_SSH is honored by the mux transports, not here.)
     argv.append(allocator, "ssh") catch return 1;
     argv.append(allocator, host.ptr) catch return 1;
     for (command) |arg| {
