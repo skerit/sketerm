@@ -186,6 +186,10 @@ const Native = struct {
     fds: std.ArrayList(c_int) = .empty,
     /// GUI→app unit stream reassembly (chan_data may split units).
     unitbuf: std.ArrayList(u8) = .empty,
+    /// Fds to attach (SCM_RIGHTS) to the NEXT write toward the app.
+    /// Early arrival is fine — libwayland queues fds until the
+    /// consuming message shows up; late is the only fatal order.
+    out_fds: std.ArrayList(c_int) = .empty,
     /// pool id → mmapped mirror. Mirrors outlive wl_shm_pool
     /// destructors: existing buffers keep referencing the memory.
     pools: std.AutoHashMapUnmanaged(u32, PoolMirror) = .empty,
@@ -205,6 +209,8 @@ const Native = struct {
         self.pools.deinit(self.allocator);
         for (self.fds.items) |fd| _ = c.close(fd);
         self.fds.deinit(self.allocator);
+        for (self.out_fds.items) |fd| _ = c.close(fd);
+        self.out_fds.deinit(self.allocator);
         self.inbuf.deinit(self.allocator);
         self.unitbuf.deinit(self.allocator);
         self.tracker.deinit();
@@ -579,7 +585,10 @@ pub const Daemon = struct {
 
     fn channelWritable(self: *Daemon, ch: *Channel) void {
         if (ch.pending.items.len == 0) return;
-        const n_raw = c.write(ch.fd, ch.pending.items.ptr, ch.pending.items.len);
+        const n_raw = if (ch.native != null and ch.native.?.out_fds.items.len > 0)
+            self.writeWithFds(ch)
+        else
+            c.write(ch.fd, ch.pending.items.ptr, ch.pending.items.len);
         if (n_raw < 0) {
             if (std.posix.errno(n_raw) != .AGAIN) self.closeChannel(ch, true);
             return;
@@ -588,6 +597,41 @@ pub const Daemon = struct {
         const remaining = ch.pending.items.len - n;
         std.mem.copyForwards(u8, ch.pending.items[0..remaining], ch.pending.items[n..]);
         ch.pending.shrinkRetainingCapacity(remaining);
+    }
+
+    /// sendmsg with the queued SCM_RIGHTS fds attached. Attaching
+    /// to the first available write keeps fds AT OR BEFORE their
+    /// message bytes, which is the order Wayland clients require.
+    fn writeWithFds(self: *Daemon, ch: *Channel) isize {
+        _ = self;
+        const nv = ch.native.?;
+        const n_fds = @min(nv.out_fds.items.len, 8);
+        var iov = c.struct_iovec{
+            .iov_base = ch.pending.items.ptr,
+            .iov_len = ch.pending.items.len,
+        };
+        const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
+        var cbuf: [128]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([128]u8);
+        const cmsg: *c.struct_cmsghdr = @ptrCast(&cbuf);
+        cmsg.cmsg_len = @intCast(hdr_size + n_fds * @sizeOf(c_int));
+        cmsg.cmsg_level = c.SOL_SOCKET;
+        cmsg.cmsg_type = c.SCM_RIGHTS;
+        for (nv.out_fds.items[0..n_fds], 0..) |fd, i| {
+            @memcpy(cbuf[hdr_size + i * @sizeOf(c_int) ..][0..@sizeOf(c_int)], std.mem.asBytes(&fd));
+        }
+        var mh = std.mem.zeroes(c.struct_msghdr);
+        mh.msg_iov = @ptrCast(&iov);
+        mh.msg_iovlen = 1;
+        mh.msg_control = &cbuf;
+        const space = (cmsg.cmsg_len + @sizeOf(usize) - 1) & ~@as(usize, @sizeOf(usize) - 1);
+        mh.msg_controllen = @intCast(space);
+        const r = c.sendmsg(ch.fd, &mh, 0);
+        if (r > 0) {
+            // Kernel duplicated them into the receiver's queue.
+            for (nv.out_fds.items[0..n_fds]) |fd| _ = c.close(fd);
+            for (0..n_fds) |_| _ = nv.out_fds.orderedRemove(0);
+        }
+        return r;
     }
 
     // ── sketerm-native app pipe ─────────────────────────────────
@@ -806,8 +850,51 @@ pub const Daemon = struct {
                         return;
                     };
                 },
-                // keymap (fd materialization) lands with the input
-                // milestone; unknown tags skip for forward compat.
+                .keymap => {
+                    // u32 keyboard id, u32 format, keymap bytes.
+                    // Materialize an anon fd and emit the real
+                    // wl_keyboard.keymap(format, fd, size) event.
+                    const pl = peeled.unit.payload;
+                    if (pl.len < 8) break;
+                    const kbd = std.mem.readInt(u32, pl[0..4], .little);
+                    const format = std.mem.readInt(u32, pl[4..8], .little);
+                    const blob = pl[8..];
+                    // NUL-terminated per xkb convention.
+                    const fd = @import("../util/platform.zig").anonFileFd(blob.len + 1);
+                    if (fd < 0) break;
+                    var written: usize = 0;
+                    var w_ok = true;
+                    while (written < blob.len) {
+                        const w = c.write(fd, blob.ptr + written, blob.len - written);
+                        if (w <= 0) {
+                            w_ok = false;
+                            break;
+                        }
+                        written += @intCast(w);
+                    }
+                    if (!w_ok) {
+                        _ = c.close(fd);
+                        break;
+                    }
+                    var mbuf: [24]u8 = undefined;
+                    var b = wlwire.Builder.init(&mbuf, kbd, 0); // keymap
+                    b.putUint(format);
+                    // 'h' fd arg: no bytes on the wire
+                    b.putUint(@intCast(blob.len + 1));
+                    const msg = b.finish() catch {
+                        _ = c.close(fd);
+                        break;
+                    };
+                    ch.pending.appendSlice(ch.allocator, msg) catch {
+                        _ = c.close(fd);
+                        self.closeChannel(ch, true);
+                        return;
+                    };
+                    nv.out_fds.append(nv.allocator, fd) catch {
+                        _ = c.close(fd);
+                    };
+                },
+                // Unknown tags skip for forward compat.
                 else => {},
             }
             pos += peeled.consumed;

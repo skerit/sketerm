@@ -49,6 +49,36 @@ pub fn socketCloexec(domain: c_int, sock_type: c_int, proto: c_int) c_int {
     return fd;
 }
 
+/// memfd_create is in both glibc and musl libc but its declaration
+/// hides behind _GNU_SOURCE, which the translate-c pass doesn't
+/// define — declare it ourselves (Linux-only; resolved at link).
+extern fn memfd_create(name: [*:0]const u8, flags: c_uint) c_int;
+
+/// Anonymous file fd, sized and CLOEXEC — the shm backing for
+/// keymaps the mux daemon hands to Wayland apps. Linux: memfd.
+/// macOS: shm_open with a throwaway name, unlinked immediately.
+pub fn anonFileFd(size: usize) c_int {
+    var fd: c_int = -1;
+    if (is_linux) {
+        fd = memfd_create("sketerm-anon", 1); // MFD_CLOEXEC
+    } else {
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&name_buf, "/sketerm-anon-{d}", .{c.getpid()}) catch return -1;
+        // shm_open is variadic on Darwin — the mode needs a fixed type.
+        fd = c.shm_open(name.ptr, c.O_RDWR | c.O_CREAT | c.O_EXCL, @as(c.mode_t, 0o600));
+        if (fd >= 0) {
+            _ = c.shm_unlink(name.ptr);
+            _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+        }
+    }
+    if (fd < 0) return -1;
+    if (c.ftruncate(fd, @intCast(size)) != 0) {
+        _ = c.close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 /// exePath with a NUL terminator — for execv/dirname-style callers.
 pub fn exePathZ(buf: *[4096:0]u8) ?[:0]const u8 {
     var tmp: [4096]u8 = undefined;

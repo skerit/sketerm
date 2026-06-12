@@ -278,12 +278,13 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
         var frames: usize = 0;
         var w: i32 = 0;
         var h: i32 = 0;
+        var sid: u32 = 0;
         var nonzero_px: bool = false;
         fn onFrame(ctx: ?*anyopaque, surface: u32, fw: i32, fh: i32, format: u32, pixels: []const u8) void {
             _ = ctx;
-            _ = surface;
             _ = format;
             frames += 1;
+            sid = surface;
             w = fw;
             h = fh;
             for (pixels) |p| {
@@ -295,6 +296,7 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
         }
     };
     ViewState.frames = 0;
+    ViewState.sid = 0;
     ViewState.nonzero_px = false;
 
     var comp = compositor_mod.Compositor.init(allocator, .{
@@ -337,6 +339,52 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     if (ViewState.w < 100 or ViewState.h < 100) fail("implausible toplevel size");
     if (!ViewState.nonzero_px) fail("toplevel frame is all zeros");
     std.debug.print("smoke-mux: real app frame {d}x{d} after {d} rounds\n", .{ ViewState.w, ViewState.h, rounds });
+
+    // Keyboard input through the full pipe: the keymap fd was
+    // materialized by the daemon when weston-terminal bound the
+    // keyboard; now type "ls" and expect echo redraws (new frames).
+    const frames_before_input = ViewState.frames;
+    comp.now_ms = 1000;
+    comp.keyboardEnter(ViewState.sid) catch fail("kbd enter");
+    comp.keyboardModifiers(0, 0, 0, 0) catch fail("kbd mods");
+    for ([_]u32{ 38, 31 }) |key| { // evdev l, s
+        comp.keyboardKey(key, true) catch fail("kbd key");
+        comp.keyboardKey(key, false) catch fail("kbd key");
+    }
+    {
+        const out = comp.takeOut();
+        if (out.len == 0) fail("no input events queued (keyboard never bound?)");
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(allocator);
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, chan_id, .little);
+        payload.appendSlice(allocator, &idb) catch fail("oom");
+        payload.appendSlice(allocator, out) catch fail("oom");
+        comp.clearOut();
+        conn.sendFrame(.chan_data, payload.items) catch fail("input chan send");
+    }
+    rounds = 0;
+    while (ViewState.frames == frames_before_input and rounds < 2000) : (rounds += 1) {
+        const f = conn.recvFrame() catch fail("input echo read (timeout = keys never echoed)");
+        defer f.deinit(allocator);
+        if (f.ftype != .chan_data) continue;
+        if ((wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
+        comp.feed(f.payload[4..]) catch fail("compositor feed (input)");
+        const out = comp.takeOut();
+        if (out.len > 0) {
+            var payload: std.ArrayList(u8) = .empty;
+            defer payload.deinit(allocator);
+            var idb: [4]u8 = undefined;
+            std.mem.writeInt(u32, &idb, chan_id, .little);
+            payload.appendSlice(allocator, &idb) catch fail("oom");
+            payload.appendSlice(allocator, out) catch fail("oom");
+            comp.clearOut();
+            conn.sendFrame(.chan_data, payload.items) catch fail("chan send");
+        }
+        if (comp.dead) fail("protocol error after input injection");
+    }
+    if (ViewState.frames == frames_before_input) fail("typed keys never produced a redraw");
+    std.debug.print("smoke-mux: input echo ok ({d} frames after typing)\n", .{ViewState.frames});
 
     // Tear the session down; the daemon must survive the app dying.
     conn.sendJson(.kill, .{ .name = "wlapp" }) catch fail("app-stage kill");

@@ -10,14 +10,32 @@
 //! lifecycle + committed pixels to whatever renders windows.
 //!
 //! v1 scope (docs/proposal-macos-remote-apps.md): shm only,
-//! toplevels only (popups refused), wl_seat advertised with no
-//! capabilities (input is the next milestone), single output,
-//! integer scale 1. Frame callbacks fire at commit time.
+//! toplevels only (popups refused), single output, integer scale 1.
+//! Frame callbacks fire at commit time.
+//!
+//! Input: wl_seat v1 with pointer+keyboard. The view injects via
+//! pointer*/keyboard* methods; key codes are evdev (GTK hardware
+//! keycode - 8). The keymap is a fixed pc105/us blob shipped as a
+//! pipe `keymap` unit — the DAEMON materializes the fd and emits
+//! the wl_keyboard.keymap event (we can't carry fds).
 
 const std = @import("std");
 const wire = @import("wire.zig");
 const protocol = @import("protocol.zig");
 const pipe = @import("pipe.zig");
+
+/// Fixed pc105/us xkb keymap (scope pin: layouts come later).
+/// Generated: `xkbcli compile-keymap --layout us --model pc105`.
+pub const us_keymap = @embedFile("us_keymap.txt");
+
+fn removeId(list: *std.ArrayList(u32), id: u32) void {
+    for (list.items, 0..) |v, i| {
+        if (v == id) {
+            _ = list.swapRemove(i);
+            return;
+        }
+    }
+}
 
 pub const Error = error{
     Protocol,
@@ -94,6 +112,12 @@ pub const Compositor = struct {
     surfaces: std.AutoHashMapUnmanaged(u32, Surface) = .empty,
     /// xdg_surface id → wl_surface id; xdg_toplevel id → wl_surface id.
     xdg_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Bound input devices (a client may bind several of each).
+    pointers: std.ArrayList(u32) = .empty,
+    keyboards: std.ArrayList(u32) = .empty,
+    /// Surface currently holding pointer / keyboard focus (0 = none).
+    pointer_focus: u32 = 0,
+    keyboard_focus: u32 = 0,
     /// Tight-packed copy handed to toplevel_frame.
     frame_scratch: std.ArrayList(u8) = .empty,
     serial: u32 = 1,
@@ -122,6 +146,8 @@ pub const Compositor = struct {
         while (sit.next()) |s| s.frame_cbs.deinit(a);
         self.surfaces.deinit(a);
         self.xdg_map.deinit(a);
+        self.pointers.deinit(a);
+        self.keyboards.deinit(a);
         self.frame_scratch.deinit(a);
     }
 
@@ -140,6 +166,140 @@ pub const Compositor = struct {
             const rem = self.inbuf.items.len - pos;
             std.mem.copyForwards(u8, self.inbuf.items[0..rem], self.inbuf.items[pos..]);
             self.inbuf.shrinkRetainingCapacity(rem);
+        }
+    }
+
+    // ── input injection (view → client) ─────────────────────────
+    // Coordinates are surface-local pixels; key codes are evdev.
+    // All no-ops until the client binds the device.
+
+    pub fn pointerEnter(self: *Compositor, sid: u32, x: f64, y: f64) Error!void {
+        if (!self.surfaces.contains(sid)) return;
+        if (self.pointer_focus == sid) return;
+        try self.pointerLeave();
+        self.pointer_focus = sid;
+        const serial = self.nextSerial();
+        for (self.pointers.items) |p| {
+            var buf: [32]u8 = undefined;
+            var b = wire.Builder.init(&buf, p, 0); // enter
+            b.putUint(serial);
+            b.putObject(sid);
+            b.putFixed(wire.fixedFromF64(x));
+            b.putFixed(wire.fixedFromF64(y));
+            try self.send(try b.finish());
+        }
+    }
+
+    pub fn pointerLeave(self: *Compositor) Error!void {
+        if (self.pointer_focus == 0) return;
+        const serial = self.nextSerial();
+        for (self.pointers.items) |p| {
+            var buf: [16]u8 = undefined;
+            var b = wire.Builder.init(&buf, p, 1); // leave
+            b.putUint(serial);
+            b.putObject(self.pointer_focus);
+            try self.send(try b.finish());
+        }
+        self.pointer_focus = 0;
+    }
+
+    pub fn pointerMotion(self: *Compositor, x: f64, y: f64) Error!void {
+        if (self.pointer_focus == 0) return;
+        for (self.pointers.items) |p| {
+            var buf: [24]u8 = undefined;
+            var b = wire.Builder.init(&buf, p, 2); // motion
+            b.putUint(self.now_ms);
+            b.putFixed(wire.fixedFromF64(x));
+            b.putFixed(wire.fixedFromF64(y));
+            try self.send(try b.finish());
+        }
+    }
+
+    /// `button` is an evdev code (BTN_LEFT 0x110 …).
+    pub fn pointerButton(self: *Compositor, button: u32, pressed: bool) Error!void {
+        if (self.pointer_focus == 0) return;
+        const serial = self.nextSerial();
+        for (self.pointers.items) |p| {
+            var buf: [32]u8 = undefined;
+            var b = wire.Builder.init(&buf, p, 3); // button
+            b.putUint(serial);
+            b.putUint(self.now_ms);
+            b.putUint(button);
+            b.putUint(if (pressed) 1 else 0);
+            try self.send(try b.finish());
+        }
+    }
+
+    /// `axis`: 0 vertical, 1 horizontal. `value` in surface px.
+    pub fn pointerAxis(self: *Compositor, axis: u32, value: f64) Error!void {
+        if (self.pointer_focus == 0) return;
+        for (self.pointers.items) |p| {
+            var buf: [24]u8 = undefined;
+            var b = wire.Builder.init(&buf, p, 4); // axis
+            b.putUint(self.now_ms);
+            b.putUint(axis);
+            b.putFixed(wire.fixedFromF64(value));
+            try self.send(try b.finish());
+        }
+    }
+
+    pub fn keyboardEnter(self: *Compositor, sid: u32) Error!void {
+        if (!self.surfaces.contains(sid)) return;
+        if (self.keyboard_focus == sid) return;
+        try self.keyboardLeave();
+        self.keyboard_focus = sid;
+        const serial = self.nextSerial();
+        for (self.keyboards.items) |k| {
+            var buf: [24]u8 = undefined;
+            var b = wire.Builder.init(&buf, k, 1); // enter
+            b.putUint(serial);
+            b.putObject(sid);
+            b.putArray(&.{}); // no keys held
+            try self.send(try b.finish());
+        }
+    }
+
+    pub fn keyboardLeave(self: *Compositor) Error!void {
+        if (self.keyboard_focus == 0) return;
+        const serial = self.nextSerial();
+        for (self.keyboards.items) |k| {
+            var buf: [16]u8 = undefined;
+            var b = wire.Builder.init(&buf, k, 2); // leave
+            b.putUint(serial);
+            b.putObject(self.keyboard_focus);
+            try self.send(try b.finish());
+        }
+        self.keyboard_focus = 0;
+    }
+
+    /// `key` is an evdev code (GTK hardware keycode - 8).
+    pub fn keyboardKey(self: *Compositor, key: u32, pressed: bool) Error!void {
+        if (self.keyboard_focus == 0) return;
+        const serial = self.nextSerial();
+        for (self.keyboards.items) |k| {
+            var buf: [32]u8 = undefined;
+            var b = wire.Builder.init(&buf, k, 3); // key
+            b.putUint(serial);
+            b.putUint(self.now_ms);
+            b.putUint(key);
+            b.putUint(if (pressed) 1 else 0);
+            try self.send(try b.finish());
+        }
+    }
+
+    /// X11-order modifier masks (shift 1, lock 2, ctrl 4, mod1 8 …)
+    /// — GDK's low bits match the pc105/us keymap's mod order.
+    pub fn keyboardModifiers(self: *Compositor, depressed: u32, latched: u32, locked: u32, group: u32) Error!void {
+        const serial = self.nextSerial();
+        for (self.keyboards.items) |k| {
+            var buf: [32]u8 = undefined;
+            var b = wire.Builder.init(&buf, k, 4); // modifiers
+            b.putUint(serial);
+            b.putUint(depressed);
+            b.putUint(latched);
+            b.putUint(locked);
+            b.putUint(group);
+            try self.send(try b.finish());
         }
     }
 
@@ -300,15 +460,43 @@ pub const Compositor = struct {
         } else if (iface == &protocol.wl_surface) {
             try self.surfaceRequest(hdr, &it);
         } else if (iface == &protocol.wl_seat) switch (hdr.opcode) {
-            // Caps are 0 so get_* "shouldn't" arrive, but sloppy
-            // toolkits send them anyway: register the device object
-            // and stay silent — it simply never emits events.
-            0 => try self.register((try it.next()).?.new_id, &protocol.wl_pointer),
-            1 => try self.register((try it.next()).?.new_id, &protocol.wl_keyboard),
-            2 => try self.register((try it.next()).?.new_id, &protocol.wl_touch),
+            0 => { // get_pointer
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.wl_pointer);
+                try self.pointers.append(self.allocator, id);
+            },
+            1 => { // get_keyboard
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.wl_keyboard);
+                try self.keyboards.append(self.allocator, id);
+                // The daemon materializes the keymap fd and emits
+                // wl_keyboard.keymap(id, format, fd, size) itself.
+                var payload: std.ArrayList(u8) = .empty;
+                defer payload.deinit(self.allocator);
+                var meta: [8]u8 = undefined;
+                std.mem.writeInt(u32, meta[0..4], id, .little);
+                std.mem.writeInt(u32, meta[4..8], 1, .little); // xkb_v1
+                try payload.appendSlice(self.allocator, &meta);
+                try payload.appendSlice(self.allocator, us_keymap);
+                try pipe.appendUnit(&self.out, self.allocator, .keymap, payload.items);
+            },
+            2 => { // get_touch — registered, never speaks
+                try self.register((try it.next()).?.new_id, &protocol.wl_touch);
+            },
             else => return Error.Protocol,
-        } else if (iface == &protocol.wl_pointer or iface == &protocol.wl_keyboard or iface == &protocol.wl_touch) {
-            // Only request on all three is release (a destructor).
+        } else if (iface == &protocol.wl_pointer) switch (hdr.opcode) {
+            // set_cursor: accepted, ignored — the local pointer
+            // keeps its native cursor in v1. The cursor surface
+            // (no xdg role) renders nowhere by design.
+            0 => {},
+            1 => { // release
+                removeId(&self.pointers, hdr.object);
+                try self.destroyObject(hdr.object);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wl_keyboard or iface == &protocol.wl_touch) {
+            // release — the only request on both.
+            removeId(&self.keyboards, hdr.object);
             try self.destroyObject(hdr.object);
         } else if (iface == &protocol.wl_output) {
             // release — lenient even though we advertise v2.
@@ -347,6 +535,8 @@ pub const Compositor = struct {
         switch (hdr.opcode) {
             0 => { // destroy
                 if (surf.toplevel != 0) self.notifyGone(hdr.object);
+                if (self.pointer_focus == hdr.object) self.pointer_focus = 0;
+                if (self.keyboard_focus == hdr.object) self.keyboard_focus = 0;
                 surf.frame_cbs.deinit(self.allocator);
                 _ = self.surfaces.remove(hdr.object);
                 try self.destroyObject(hdr.object);
@@ -445,8 +635,12 @@ pub const Compositor = struct {
 
         if (surf.committed_buffer != 0) {
             if (self.buffers.get(surf.committed_buffer)) |info| {
-                try self.pushFrame(sid, info);
-                // Released immediately: pixels were copied out.
+                // Only toplevels reach the view — cursor surfaces
+                // (set_cursor, no xdg role) commit buffers too and
+                // must NOT become windows.
+                if (surf.toplevel != 0) try self.pushFrame(sid, info);
+                // Released immediately: pixels were copied out (or
+                // ignored — either way we won't read them later).
                 var buf: [8]u8 = undefined;
                 var b = wire.Builder.init(&buf, surf.committed_buffer, 0); // release
                 try self.send(try b.finish());
@@ -500,7 +694,7 @@ pub const Compositor = struct {
         } else if (iface == &protocol.wl_seat) {
             var buf: [16]u8 = undefined;
             var b = wire.Builder.init(&buf, id, 0); // capabilities
-            b.putUint(0); // input lands with the next milestone
+            b.putUint(3); // pointer | keyboard
             try self.send(try b.finish());
         } else if (iface == &protocol.wl_output) {
             var gbuf: [96]u8 = undefined;
@@ -819,6 +1013,179 @@ test "full client lifecycle: bind, surface, xdg dance, commit, pixels" {
         try req(&comp, try b.finish());
     }
     try t.expectEqual(@as(usize, 1), tv.gone);
+}
+
+test "seat: devices bind, keymap unit emitted, input events flow" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    { // get_registry(2)
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&comp, try b.finish());
+    }
+    { // bind seat(name 3) → id 3
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(3);
+        b.putString("wl_seat");
+        b.putUint(1);
+        b.putNewId(3);
+        try req(&comp, try b.finish());
+    }
+    { // bind compositor → 4, create surface 5
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(1);
+        b.putString("wl_compositor");
+        b.putUint(1);
+        b.putNewId(4);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 4, 0);
+        b2.putNewId(5);
+        try req(&comp, try b2.finish());
+    }
+    comp.clearOut();
+    { // get_pointer(6), get_keyboard(7)
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 3, 1);
+        b2.putNewId(7);
+        try req(&comp, try b2.finish());
+    }
+    // keymap unit with keyboard id 7, format 1, the embedded blob.
+    {
+        var found = false;
+        var pos: usize = 0;
+        const bytes = comp.takeOut();
+        while (try pipe.peelUnit(bytes[pos..])) |p| {
+            if (p.unit.tag == .keymap) {
+                try t.expectEqual(@as(u32, 7), std.mem.readInt(u32, p.unit.payload[0..4], .little));
+                try t.expectEqual(@as(u32, 1), std.mem.readInt(u32, p.unit.payload[4..8], .little));
+                try t.expectEqual(us_keymap.len, p.unit.payload.len - 8);
+                found = true;
+            }
+            pos += p.consumed;
+        }
+        try t.expect(found);
+    }
+    comp.clearOut();
+
+    // enter + motion + button + key reach the device objects.
+    try comp.pointerEnter(5, 10.5, 20.0);
+    try comp.pointerMotion(11.0, 21.0);
+    try comp.pointerButton(0x110, true);
+    try comp.keyboardEnter(5);
+    try comp.keyboardKey(38, true); // evdev 'a'
+    try comp.keyboardModifiers(1, 0, 0, 0);
+
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    const expect = [_][2]u32{
+        .{ 6, 0 }, // pointer enter
+        .{ 6, 2 }, // motion
+        .{ 6, 3 }, // button
+        .{ 7, 1 }, // keyboard enter
+        .{ 7, 3 }, // key
+        .{ 7, 4 }, // modifiers
+    };
+    try t.expectEqualSlices([2]u32, &expect, evs.items);
+
+    // No focus → no events.
+    try comp.pointerLeave();
+    try comp.keyboardLeave();
+    comp.clearOut();
+    try comp.pointerMotion(1, 1);
+    try comp.keyboardKey(38, false);
+    try t.expectEqual(@as(usize, 0), comp.takeOut().len);
+}
+
+test "set_cursor is not a destructor; cursor surfaces never reach the view" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    { // registry(2), seat bind(3), compositor bind(4)
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 2, 0);
+        b2.putUint(3);
+        b2.putString("wl_seat");
+        b2.putUint(1);
+        b2.putNewId(3);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 2, 0);
+        b3.putUint(1);
+        b3.putString("wl_compositor");
+        b3.putUint(1);
+        b3.putNewId(4);
+        try req(&comp, try b3.finish());
+    }
+    { // get_pointer(9)
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(9);
+        try req(&comp, try b.finish());
+    }
+    { // cursor surface (15) + set_cursor — the weston-terminal dance
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(15);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 9, 0); // set_cursor
+        b2.putUint(1);
+        b2.putObject(15);
+        b2.putInt(13);
+        b2.putInt(15);
+        try req(&comp, try b2.finish());
+        // pointer must survive — a second set_cursor still works
+        var b3 = wire.Builder.init(&buf, 9, 0);
+        b3.putUint(2);
+        b3.putObject(0);
+        b3.putInt(0);
+        b3.putInt(0);
+        try req(&comp, try b3.finish());
+    }
+    try t.expect(!comp.dead);
+    try t.expect(comp.objects.get(9) != null);
+
+    { // commit the cursor surface with a buffer → no view callback
+        var b = wire.Builder.init(&buf, 2, 0); // bind shm(5)
+        b.putUint(2);
+        b.putString("wl_shm");
+        b.putUint(1);
+        b.putNewId(5);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 5, 0); // pool(6, 16)
+        b2.putNewId(6);
+        b2.putInt(16);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 6, 0); // buffer(7) 2x2
+        b3.putNewId(7);
+        b3.putInt(0);
+        b3.putInt(2);
+        b3.putInt(2);
+        b3.putInt(8);
+        b3.putUint(0);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 15, 1); // attach
+        b4.putObject(7);
+        b4.putInt(0);
+        b4.putInt(0);
+        try req(&comp, try b4.finish());
+        var b5 = wire.Builder.init(&buf, 15, 6); // commit
+        try req(&comp, try b5.finish());
+    }
+    try t.expectEqual(@as(usize, 0), tv.frames);
+    try t.expect(!comp.dead);
+
+    { // release destroys the pointer for real
+        var b = wire.Builder.init(&buf, 9, 1);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(?*const protocol.Interface, null), comp.objects.get(9));
 }
 
 test "protocol violation produces wl_display.error and dead" {
