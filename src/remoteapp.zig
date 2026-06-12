@@ -84,8 +84,10 @@ pub fn classifyProbe(output: []const u8) ?RemoteKind {
 
 /// Any Vulkan ICD manifest installed locally? Same check the probe
 /// runs remotely. Loaders look in these two; lavapipe (software
-/// Vulkan) counts and works.
-fn hasLocalVulkanIcd() bool {
+/// Vulkan) counts and works. Also used by wlbridge + the mux daemon:
+/// waypipe (0.11) needs Vulkan for GPU-buffer transfer and ABORTS
+/// connections without it, so Vulkan-less ends must pass --no-gpu.
+pub fn hasLocalVulkanIcd() bool {
     for ([_][*:0]const u8{ "/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d" }) |dir| {
         const d = c.opendir(dir) orelse continue;
         defer _ = c.closedir(d);

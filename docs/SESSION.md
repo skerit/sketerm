@@ -5047,3 +5047,34 @@ Tests 454 → 466.
   as the local compositor): wayland-info globals round-trip;
   weston-terminal renders, accepts forwarded keyboard input, runs a
   live fish shell. 507 tests.
+
+## 2026-06-12: phase 2 — Wayland apps over the mux ("mosh for GUIs")
+
+- GOAL (user): type `gimp` in a durable remote shell and have it open
+  on the local desktop — no `sketerm app` prefix, transport-agnostic.
+- Wire proto v2: chan_open/chan_data/chan_close — generic byte
+  channels multiplexed over the mux connection. Transport-agnostic by
+  construction (one fd), so app streams ride the roaming rudp UDP
+  transport for free. Daemon gates channels on hello proto>=2; old
+  clients keep working channel-less. Local connections now send the
+  hello probe too (connectLocalAutostart) — they never did, which
+  silently disabled channels for local daemons.
+- Daemon: session commands wrap in `waypipe server` (per-session
+  $WAYLAND_DISPLAY + hub socket next to mux.sock); hub accepts become
+  channels toward the latest attached v2 client, refused cleanly when
+  detached. waypipe CLI gotcha: options must precede the mode word.
+  SKETERM_MUX_NO_WAYLAND=1 opts out; waypipe-less hosts spawn plain.
+- GUI: wlbridge.zig owns one `waypipe client` (lazy spawn, reap +
+  respawn, SIGTERM at exit); terminal.zig pumps channels ↔ that
+  socket via g_unix_fd_add watches with write-buffering.
+- Vulkan again: BOTH waypipe ends abort without a Vulkan ICD when
+  dmabuf is in play — each side now self-checks and passes --no-gpu.
+- VERIFIED headless full-stack (sketerm GUI as a Wayland client on
+  weston, isolated XDG_RUNTIME_DIR so the real daemon stays
+  untouched): durable tab shell reports the per-session
+  WAYLAND_DISPLAY; `weston-flower &` typed in that shell renders on
+  the local compositor through daemon→channel→wlbridge. 507 tests,
+  smoke-mux/e2e PASS, macOS mux cross-compile green.
+- NOT yet: flow control beyond write-buffering (pixel floods share
+  the go-back-N stream with keystrokes — measure before separating
+  associations), UDP-transport e2e rig, `sketerm app` over rudp.

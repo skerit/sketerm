@@ -58,8 +58,27 @@ const Session = struct {
     seq: u64 = 0,
     exited: bool = false,
     exit_status: i32 = 0,
+    /// Wayland app forwarding: the session's shell runs wrapped in a
+    /// `waypipe server` that provides $WAYLAND_DISPLAY; each app
+    /// connection waypipe makes lands on this hub socket and is
+    /// tunneled to an attached client as a byte channel. -1 = no
+    /// Wayland support for this session (waypipe absent at spawn).
+    wl_hub_fd: c_int = -1,
+    /// Owned hub + display socket paths, unlinked on teardown.
+    wl_hub_path: ?[]u8 = null,
+    wl_display_path: ?[]u8 = null,
 
     fn deinit(self: *Session) void {
+        if (self.wl_hub_fd >= 0) _ = c.close(self.wl_hub_fd);
+        var z_buf: [4096]u8 = undefined;
+        if (self.wl_hub_path) |p| {
+            if (pathZ(&z_buf, p)) |z| _ = c.unlink(z) else |_| {}
+            self.allocator.free(p);
+        }
+        if (self.wl_display_path) |p| {
+            if (pathZ(&z_buf, p)) |z| _ = c.unlink(z) else |_| {}
+            self.allocator.free(p);
+        }
         self.pty.closeAndReap();
         self.parser.deinit();
         self.screen.deinit();
@@ -83,6 +102,9 @@ const Client = struct {
     wbuf: std.ArrayList(u8) = .empty,
     attached: ?*Session = null,
     dead: bool = false,
+    /// Protocol version the client announced in hello. Channels are
+    /// only opened toward proto >= 2 clients.
+    proto: u32 = 1,
 
     fn deinit(self: *Client) void {
         _ = c.close(self.fd);
@@ -114,6 +136,25 @@ const Client = struct {
 
 const pathZ = @import("../util/pathz.zig").pathZ;
 
+/// One tunneled byte stream: an accepted waypipe-server connection
+/// on a session's Wayland hub, bridged to `client` as chan_* frames.
+const Channel = struct {
+    allocator: std.mem.Allocator,
+    id: u32,
+    fd: c_int,
+    session: *Session,
+    client: *Client,
+    /// Bytes from the client not yet written to fd (partial writes).
+    pending: std.ArrayList(u8) = .empty,
+    dead: bool = false,
+
+    fn deinit(self: *Channel) void {
+        _ = c.close(self.fd);
+        self.pending.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+};
+
 /// Bind + listen on a fresh Unix socket. Shared with client.zig's
 /// connect for the sockaddr_un fill.
 pub fn fillSockaddrUn(addr: *c.struct_sockaddr_un, path: []const u8) error{BadPath}!void {
@@ -130,6 +171,11 @@ pub const Daemon = struct {
     sock_path: []u8,
     sessions: std.ArrayList(*Session) = .empty,
     clients: std.ArrayList(*Client) = .empty,
+    channels: std.ArrayList(*Channel) = .empty,
+    next_chan_id: u32 = 1,
+    /// Monotonic id for per-session Wayland socket paths (session
+    /// names are user input — not path-safe).
+    next_wl_id: u32 = 1,
     running: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, sock_path: []const u8) !*Daemon {
@@ -158,6 +204,8 @@ pub const Daemon = struct {
     }
 
     pub fn deinit(self: *Daemon) void {
+        for (self.channels.items) |ch| ch.deinit();
+        self.channels.deinit(self.allocator);
         for (self.clients.items) |cl| cl.deinit();
         self.clients.deinit(self.allocator);
         for (self.sessions.items) |s| s.deinit();
@@ -196,6 +244,24 @@ pub const Daemon = struct {
                 .revents = 0,
             });
         }
+        const hub_base = fds.items.len;
+        for (self.sessions.items) |s| {
+            try fds.append(self.allocator, .{
+                .fd = s.wl_hub_fd, // -1 entries are ignored by poll
+                .events = c.POLLIN,
+                .revents = 0,
+            });
+        }
+        const chan_base = fds.items.len;
+        for (self.channels.items) |ch| {
+            var ev: c_short = c.POLLIN;
+            if (ch.pending.items.len > 0) ev |= c.POLLOUT;
+            try fds.append(self.allocator, .{
+                .fd = if (ch.dead) -1 else ch.fd,
+                .events = ev,
+                .revents = 0,
+            });
+        }
 
         const pr = c.poll(fds.items.ptr, @intCast(fds.items.len), timeout_ms);
         if (pr < 0) return; // EINTR etc — next tick retries
@@ -221,6 +287,19 @@ pub const Daemon = struct {
         for (self.sessions.items, 0..) |s, i| {
             const re = fds.items[session_base + i].revents;
             if (re & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0) self.drainSession(s);
+        }
+
+        for (self.sessions.items, 0..) |s, i| {
+            if (fds.items[hub_base + i].revents & c.POLLIN != 0) self.acceptWaylandApp(s);
+        }
+
+        for (self.channels.items, 0..) |ch, i| {
+            const re = fds.items[chan_base + i].revents;
+            if (ch.dead) continue;
+            if (re & c.POLLIN != 0) self.channelReadable(ch);
+            if (!ch.dead and re & c.POLLOUT != 0) self.channelWritable(ch);
+            if (!ch.dead and re & (c.POLLHUP | c.POLLERR) != 0 and re & c.POLLIN == 0)
+                self.closeChannel(ch, true);
         }
 
         self.reap();
@@ -283,7 +362,16 @@ pub const Daemon = struct {
 
     fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         switch (frame.ftype) {
-            .hello => cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION }),
+            .hello => {
+                const HelloReq = struct { proto: u32 = 1 };
+                if (std.json.parseFromSlice(HelloReq, self.allocator, frame.payload, .{
+                    .ignore_unknown_fields = true,
+                })) |p| {
+                    cl.proto = p.value.proto;
+                    p.deinit();
+                } else |_| {}
+                cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION });
+            },
             .spawn => self.handleSpawn(cl, frame.payload),
             .attach => self.handleAttach(cl, frame.payload),
             .detach => {
@@ -316,7 +404,118 @@ pub const Daemon = struct {
                 cl.queueJson(.ok, .{ .ok = true });
                 self.running = false;
             },
+            .chan_data => {
+                const id = wire.decodeChanId(frame.payload) orelse return;
+                const ch = self.findChannel(id) orelse return;
+                if (ch.client != cl or ch.dead) return;
+                ch.pending.appendSlice(ch.allocator, frame.payload[4..]) catch {
+                    self.closeChannel(ch, true);
+                    return;
+                };
+                self.channelWritable(ch);
+            },
+            .chan_close => {
+                const id = wire.decodeChanId(frame.payload) orelse return;
+                const ch = self.findChannel(id) orelse return;
+                if (ch.client != cl) return;
+                // Client already dropped its side — no echo needed.
+                ch.dead = true;
+            },
             else => cl.queueErr("unknown frame type"),
+        }
+    }
+
+    fn findChannel(self: *Daemon, id: u32) ?*Channel {
+        for (self.channels.items) |ch| {
+            if (ch.id == id) return ch;
+        }
+        return null;
+    }
+
+    /// A Wayland app connected to the session's hub: tunnel it to an
+    /// attached channel-capable client, or refuse (the app gets a
+    /// clean "cannot connect to display" instead of a hang).
+    fn acceptWaylandApp(self: *Daemon, s: *Session) void {
+        const fd = c.accept(s.wl_hub_fd, null, null);
+        if (fd < 0) return;
+        _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+        const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+        _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+
+        // Latest attached client wins (multiple GUIs on one session
+        // is rare; the newest attachment is the active human).
+        var target: ?*Client = null;
+        for (self.clients.items) |cl| {
+            if (cl.attached == s and !cl.dead and cl.proto >= 2) target = cl;
+        }
+        const cl = target orelse {
+            _ = c.close(fd);
+            return;
+        };
+
+        const ch = self.allocator.create(Channel) catch {
+            _ = c.close(fd);
+            return;
+        };
+        ch.* = .{
+            .allocator = self.allocator,
+            .id = self.next_chan_id,
+            .fd = fd,
+            .session = s,
+            .client = cl,
+        };
+        self.next_chan_id += 1;
+        self.channels.append(self.allocator, ch) catch {
+            ch.deinit();
+            return;
+        };
+        var hdr: [5]u8 = undefined;
+        cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .wayland));
+    }
+
+    /// Forward hub-socket bytes to the channel's client as
+    /// chan_data frames. Bounded rounds keep one chatty app from
+    /// starving the loop.
+    fn channelReadable(self: *Daemon, ch: *Channel) void {
+        var rounds: u8 = 0;
+        while (rounds < 4) : (rounds += 1) {
+            var buf: [4 + 16384]u8 = undefined;
+            const n_raw = c.read(ch.fd, buf[4..].ptr, buf.len - 4);
+            if (n_raw < 0) {
+                if (std.posix.errno(n_raw) != .AGAIN) self.closeChannel(ch, true);
+                return;
+            }
+            if (n_raw == 0) {
+                self.closeChannel(ch, true);
+                return;
+            }
+            const n: usize = @intCast(n_raw);
+            std.mem.writeInt(u32, buf[0..4], ch.id, .little);
+            ch.client.queueFrame(.chan_data, buf[0 .. 4 + n]);
+            if (n < buf.len - 4) return;
+        }
+    }
+
+    fn channelWritable(self: *Daemon, ch: *Channel) void {
+        if (ch.pending.items.len == 0) return;
+        const n_raw = c.write(ch.fd, ch.pending.items.ptr, ch.pending.items.len);
+        if (n_raw < 0) {
+            if (std.posix.errno(n_raw) != .AGAIN) self.closeChannel(ch, true);
+            return;
+        }
+        const n: usize = @intCast(n_raw);
+        const remaining = ch.pending.items.len - n;
+        std.mem.copyForwards(u8, ch.pending.items[0..remaining], ch.pending.items[n..]);
+        ch.pending.shrinkRetainingCapacity(remaining);
+    }
+
+    fn closeChannel(self: *Daemon, ch: *Channel, notify: bool) void {
+        _ = self;
+        if (ch.dead) return;
+        ch.dead = true;
+        if (notify and !ch.client.dead) {
+            var hdr: [4]u8 = undefined;
+            ch.client.queueFrame(.chan_close, wire.putChanHeader(&hdr, ch.id));
         }
     }
 
@@ -363,8 +562,102 @@ pub const Daemon = struct {
         cl.queueJson(.ok, .{ .ok = true, .name = s.name });
     }
 
+    /// Vulkan ICD manifests installed on this host? waypipe needs
+    /// Vulkan for GPU-buffer (dmabuf) transfer and aborts app
+    /// connections without it — Vulkan-less hosts get --no-gpu.
+    fn hasVulkanIcd() bool {
+        for ([_][*:0]const u8{ "/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d" }) |dir| {
+            const d = c.opendir(dir) orelse continue;
+            defer _ = c.closedir(d);
+            while (c.readdir(d)) |ent| {
+                const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+                if (std.mem.endsWith(u8, name, ".json")) return true;
+            }
+        }
+        return false;
+    }
+
+    /// waypipe present on this host? Cached after the first check.
+    fn waypipeAvailable() bool {
+        const S = struct {
+            var checked: bool = false;
+            var found: bool = false;
+        };
+        if (S.checked) return S.found;
+        S.checked = true;
+        const path_env = std.c.getenv("PATH") orelse return false;
+        var it = std.mem.splitScalar(u8, std.mem.span(path_env), ':');
+        var buf: [4096]u8 = undefined;
+        while (it.next()) |dir| {
+            if (dir.len == 0) continue;
+            const full = std.fmt.bufPrintZ(&buf, "{s}/waypipe", .{dir}) catch continue;
+            if (c.access(full.ptr, c.X_OK) == 0) {
+                S.found = true;
+                break;
+            }
+        }
+        return S.found;
+    }
+
+    const WaylandHub = struct {
+        fd: c_int,
+        hub_path: []u8,
+        display_path: []u8,
+    };
+
+    /// Create a session's Wayland hub socket + display paths next to
+    /// the daemon socket. Null on any failure — sessions must spawn
+    /// regardless, just without Wayland forwarding.
+    fn setupWaylandHub(self: *Daemon) ?WaylandHub {
+        const dir_end = std.mem.lastIndexOfScalar(u8, self.sock_path, '/') orelse return null;
+        const dir = self.sock_path[0..dir_end];
+        const id = self.next_wl_id;
+        self.next_wl_id += 1;
+        const hub_path = std.fmt.allocPrint(self.allocator, "{s}/wl-{d}.hub", .{ dir, id }) catch return null;
+        const display_path = std.fmt.allocPrint(self.allocator, "{s}/wl-{d}", .{ dir, id }) catch {
+            self.allocator.free(hub_path);
+            return null;
+        };
+        var ok = false;
+        defer if (!ok) {
+            self.allocator.free(hub_path);
+            self.allocator.free(display_path);
+        };
+
+        var z_buf: [4096]u8 = undefined;
+        if (pathZ(&z_buf, hub_path)) |z| _ = c.unlink(z) else |_| return null;
+        if (pathZ(&z_buf, display_path)) |z| _ = c.unlink(z) else |_| return null;
+
+        const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+        if (fd < 0) return null;
+        var addr: c.struct_sockaddr_un = undefined;
+        fillSockaddrUn(&addr, hub_path) catch {
+            _ = c.close(fd);
+            return null;
+        };
+        if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0 or c.listen(fd, 8) != 0) {
+            _ = c.close(fd);
+            return null;
+        }
+        ok = true;
+        return .{ .fd = fd, .hub_path = hub_path, .display_path = display_path };
+    }
+
     fn spawnSession(self: *Daemon, req: SpawnReq) !*Session {
         const allocator = self.allocator;
+
+        // Wayland forwarding: wrap the command in a `waypipe server`
+        // that provides $WAYLAND_DISPLAY for everything in the
+        // session, connecting each app back to our hub socket.
+        const want_wayland = waypipeAvailable() and
+            std.c.getenv("SKETERM_MUX_NO_WAYLAND") == null and
+            req.argv.len > 0 and !std.mem.eql(u8, std.fs.path.basename(req.argv[0]), "waypipe");
+        var hub: ?WaylandHub = if (want_wayland) self.setupWaylandHub() else null;
+        errdefer if (hub) |h| {
+            _ = c.close(h.fd);
+            allocator.free(h.hub_path);
+            allocator.free(h.display_path);
+        };
 
         var argv_z: std.ArrayList([:0]u8) = .empty;
         defer {
@@ -373,6 +666,26 @@ pub const Daemon = struct {
         }
         var argv_ptrs: std.ArrayList([*:0]const u8) = .empty;
         defer argv_ptrs.deinit(allocator);
+        if (hub) |h| {
+            // Options must precede the mode word (waypipe 0.11 CLI).
+            const base = [_][]const u8{ "waypipe", "--socket", h.hub_path, "--display", h.display_path };
+            const tail = [_][]const u8{ "server", "--" };
+            for (base) |a| {
+                const z = try allocator.dupeZ(u8, a);
+                try argv_z.append(allocator, z);
+                try argv_ptrs.append(allocator, z.ptr);
+            }
+            if (!hasVulkanIcd()) {
+                const z = try allocator.dupeZ(u8, "--no-gpu");
+                try argv_z.append(allocator, z);
+                try argv_ptrs.append(allocator, z.ptr);
+            }
+            for (tail) |a| {
+                const z = try allocator.dupeZ(u8, a);
+                try argv_z.append(allocator, z);
+                try argv_ptrs.append(allocator, z.ptr);
+            }
+        }
         for (req.argv) |a| {
             const z = try allocator.dupeZ(u8, a);
             try argv_z.append(allocator, z);
@@ -414,6 +727,12 @@ pub const Daemon = struct {
             .pool = pool,
             .screen = screen,
         };
+        if (hub) |h| {
+            s.wl_hub_fd = h.fd;
+            s.wl_hub_path = h.hub_path;
+            s.wl_display_path = h.display_path;
+            hub = null; // ownership moved to the session
+        }
         screen.sink = .{ .ctx = @ptrCast(s), .on_write_pty = Session.sinkWritePty };
         return s;
     }
@@ -531,6 +850,12 @@ pub const Daemon = struct {
                 cl.queueJson(.gone, .{ .reason = "session closed" });
             }
         }
+        // Mark only — removeSession runs mid-tick (kill frames), and
+        // dropping list entries here would desync the pollfd array
+        // built at tick start. reap() removes them at tick end.
+        for (self.channels.items) |ch| {
+            if (ch.session == s) self.closeChannel(ch, true);
+        }
         for (self.sessions.items, 0..) |it, i| {
             if (it == s) {
                 _ = self.sessions.swapRemove(i);
@@ -538,6 +863,19 @@ pub const Daemon = struct {
             }
         }
         s.deinit();
+    }
+
+    fn dropDeadChannels(self: *Daemon) void {
+        var i: usize = 0;
+        while (i < self.channels.items.len) {
+            const ch = self.channels.items[i];
+            if (ch.dead) {
+                _ = self.channels.swapRemove(i);
+                ch.deinit();
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Read whatever the PTY has, parse, apply to the authoritative
@@ -604,6 +942,12 @@ pub const Daemon = struct {
     }
 
     fn reap(self: *Daemon) void {
+        // A dying client takes its channels down — the remote apps'
+        // waypipe connections see EOF and fail cleanly.
+        for (self.channels.items) |ch| {
+            if (ch.client.dead) ch.dead = true;
+        }
+        self.dropDeadChannels();
         var i: usize = 0;
         while (i < self.clients.items.len) {
             const cl = self.clients.items[i];

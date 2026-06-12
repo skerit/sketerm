@@ -42,10 +42,15 @@ pub const Conn = struct {
 
     /// Connect to the local daemon, spawning it (sibling binary,
     /// $PATH fallback) and retrying for ~2s when it isn't running.
+    /// Sends the hello/welcome probe like the remote transports do —
+    /// it announces OUR proto version, which gates whether the
+    /// daemon offers byte channels (Wayland app forwarding).
     pub fn connectLocalAutostart(allocator: std.mem.Allocator) !Conn {
         const path = try daemon.defaultSocketPath(allocator);
         defer allocator.free(path);
-        if (Conn.connect(allocator, path)) |conn| return conn else |_| {}
+        if (Conn.connect(allocator, path)) |conn| {
+            return helloProbe(allocator, conn);
+        } else |_| {}
 
         const pid = c.fork();
         if (pid == 0) {
@@ -59,9 +64,22 @@ pub const Conn = struct {
         var tries: u32 = 0;
         while (tries < 40) : (tries += 1) {
             _ = c.usleep(50_000);
-            if (Conn.connect(allocator, path)) |conn| return conn else |_| {}
+            if (Conn.connect(allocator, path)) |conn| {
+                return helloProbe(allocator, conn);
+            } else |_| {}
         }
         return error.MuxDaemonUnreachable;
+    }
+
+    /// hello → welcome round trip; consumes the welcome so the
+    /// stream is clean for the caller's own frames.
+    fn helloProbe(allocator: std.mem.Allocator, conn_in: Conn) !Conn {
+        var conn = conn_in;
+        errdefer conn.deinit();
+        try conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION });
+        const w = try conn.recvExpect(&.{.welcome});
+        w.deinit(allocator);
+        return conn;
     }
 
     pub fn deinit(self: *Conn) void {

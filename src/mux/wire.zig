@@ -11,7 +11,11 @@
 const std = @import("std");
 const Event = @import("../parser/event.zig").Event;
 
-pub const PROTO_VERSION: u32 = 1;
+/// Version 2 adds the byte-channel frames (chan_*) used for Wayland
+/// app forwarding. The daemon only opens channels toward clients
+/// whose hello announced proto >= 2; older clients keep working
+/// without them.
+pub const PROTO_VERSION: u32 = 2;
 
 /// Frame types. Append-only.
 pub const FrameType = enum(u8) {
@@ -35,8 +39,50 @@ pub const FrameType = enum(u8) {
     gone = 68,
     ok = 69,
     err = 70,
+    // Byte channels (both directions). Generic multiplexed streams
+    // riding the mux connection — used to tunnel a session's
+    // Wayland (waypipe) traffic, so forwarded apps inherit whatever
+    // transport the terminal uses (incl. roaming UDP). The daemon
+    // initiates with chan_open; chan_data/chan_close flow both ways.
+    chan_open = 80,
+    chan_data = 81,
+    chan_close = 82,
     _,
 };
+
+/// chan_open payload kinds. Append-only.
+pub const ChannelKind = enum(u8) {
+    /// A waypipe-server connection from the session's Wayland
+    /// display; bridge it to the local waypipe client.
+    wayland = 1,
+    _,
+};
+
+/// chan_open: u32 channel id + u8 kind.
+pub fn encodeChanOpen(buf: *[5]u8, id: u32, kind: ChannelKind) []const u8 {
+    std.mem.writeInt(u32, buf[0..4], id, .little);
+    buf[4] = @intFromEnum(kind);
+    return buf[0..5];
+}
+
+pub fn decodeChanOpen(payload: []const u8) ?struct { id: u32, kind: ChannelKind } {
+    if (payload.len < 5) return null;
+    return .{
+        .id = std.mem.readInt(u32, payload[0..4], .little),
+        .kind = @enumFromInt(payload[4]),
+    };
+}
+
+/// chan_data: u32 channel id + raw bytes. chan_close: u32 id only.
+pub fn putChanHeader(buf: *[4]u8, id: u32) []const u8 {
+    std.mem.writeInt(u32, buf[0..4], id, .little);
+    return buf[0..4];
+}
+
+pub fn decodeChanId(payload: []const u8) ?u32 {
+    if (payload.len < 4) return null;
+    return std.mem.readInt(u32, payload[0..4], .little);
+}
 
 pub const MAX_FRAME = 16 << 20; // images can be chunky; bound anyway
 
