@@ -1035,7 +1035,7 @@ pub const Terminal = struct {
 
         if (stderr_writer) |*w| {
             const bytes = w.buffered();
-            if (bytes.len > 0) _ = c.fwrite(bytes.ptr, 1, bytes.len, c.stderr);
+            if (bytes.len > 0) _ = c.fwrite(bytes.ptr, 1, bytes.len, platform.stderr());
         }
 
         // Direct render dispatch: drain cleared the ring, leaving the

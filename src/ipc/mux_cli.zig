@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const platform = @import("../util/platform.zig");
 const mux_client = @import("../mux/client.zig");
 const mux_daemon = @import("../mux/daemon.zig");
 const mux_wire = @import("../mux/wire.zig");
@@ -89,7 +90,7 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
     if (args.len == 0) return tui(allocator, host);
     const cmd = args[0];
     if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
-        _ = c.fputs(MUX_HELP, c.stdout);
+        _ = c.fputs(MUX_HELP, platform.stdout());
         return 0;
     }
     if (std.mem.eql(u8, cmd, "list")) {
@@ -121,7 +122,7 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
         defer conn.deinit();
         conn.sendJson(.kill, .{ .name = args[1] }) catch return 1;
         const f = conn.recvExpect(&.{.ok}) catch {
-            _ = c.fprintf(c.stderr, "sketerm mux: kill failed\n");
+            _ = c.fprintf(platform.stderr(), "sketerm mux: kill failed\n");
             return 1;
         };
         f.deinit(allocator);
@@ -139,7 +140,7 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
     if (std.mem.eql(u8, cmd, "get-text") and args.len >= 2) {
         return muxGetText(allocator, host, args[1], args[2..]);
     }
-    _ = c.fputs(MUX_HELP, c.stdout);
+    _ = c.fputs(MUX_HELP, platform.stdout());
     return 2;
 }
 
@@ -191,7 +192,7 @@ fn muxSpawn(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, r
     var conn = blk: {
         if (host != null) break :blk muxConnect(allocator, host) orelse return 1;
         break :blk mux_client.Conn.connectLocalAutostart(allocator) catch {
-            _ = c.fprintf(c.stderr, "sketerm mux: cannot start the local daemon\n");
+            _ = c.fprintf(platform.stderr(), "sketerm mux: cannot start the local daemon\n");
             return 1;
         };
     };
@@ -204,7 +205,7 @@ fn muxSpawn(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, r
         .cols = cols,
     }) catch return 1;
     const f = conn.recvExpect(&.{.ok}) catch {
-        _ = c.fprintf(c.stderr, "sketerm mux: spawn failed (name taken?)\n");
+        _ = c.fprintf(platform.stderr(), "sketerm mux: spawn failed (name taken?)\n");
         return 1;
     };
     f.deinit(allocator);
@@ -223,7 +224,7 @@ fn attachForIo(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8
     };
     const snap = conn.recvExpect(&.{.snapshot}) catch {
         _ = c.fprintf(
-            c.stderr,
+            platform.stderr(),
             "sketerm mux: no such session '%.*s'\n",
             @as(c_int, @intCast(name.len)),
             name.ptr,
@@ -315,7 +316,7 @@ fn muxGetText(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8,
     var pool = Pool.init(allocator) catch return 1;
     defer pool.deinit();
     const screen = snapshot.restore(allocator, &pool, io.snap.payload[8..]) catch {
-        _ = c.fprintf(c.stderr, "sketerm mux: bad snapshot\n");
+        _ = c.fprintf(platform.stderr(), "sketerm mux: bad snapshot\n");
         return 1;
     };
     defer screen.deinit();
@@ -325,8 +326,8 @@ fn muxGetText(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8,
     else
         screen.extractScreen(allocator)) catch return 1;
     defer allocator.free(text);
-    _ = c.fwrite(text.ptr, 1, text.len, c.stdout);
-    if (text.len == 0 or text[text.len - 1] != '\n') _ = c.fputc('\n', c.stdout);
+    _ = c.fwrite(text.ptr, 1, text.len, platform.stdout());
+    if (text.len == 0 or text[text.len - 1] != '\n') _ = c.fputc('\n', platform.stdout());
     return 0;
 }
 
@@ -335,7 +336,7 @@ fn renameSession(allocator: std.mem.Allocator, host: ?[]const u8, old: []const u
     defer conn.deinit();
     conn.sendJson(.rename, .{ .name = old, .new_name = new }) catch return false;
     const f = conn.recvExpect(&.{.ok}) catch {
-        _ = c.fprintf(c.stderr, "sketerm mux: rename failed\n");
+        _ = c.fprintf(platform.stderr(), "sketerm mux: rename failed\n");
         return false;
     };
     f.deinit(allocator);
@@ -352,13 +353,13 @@ fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn 
             else
                 null;
             return mux_client.Conn.connectUdp(allocator, h[4..], range) catch {
-                _ = c.fprintf(c.stderr, "sketerm mux: UDP transport failed (key auth? sketerm-mux on the host? UDP not filtered?)\n");
+                _ = c.fprintf(platform.stderr(), "sketerm mux: UDP transport failed (key auth? sketerm-mux on the host? UDP not filtered?)\n");
                 return null;
             };
         }
         return mux_client.Conn.connectSsh(allocator, h) catch {
             _ = c.fprintf(
-                c.stderr,
+                platform.stderr(),
                 "sketerm mux: ssh transport to %.*s failed\n" ++
                     "  see the real error:  ssh %.*s sketerm-mux --proxy\n" ++
                     "  common causes: sketerm-mux not installed there; binary built\n" ++
@@ -375,7 +376,7 @@ fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn 
     const path = mux_daemon.defaultSocketPath(allocator) catch return null;
     defer allocator.free(path);
     return mux_client.Conn.connect(allocator, path) catch {
-        _ = c.fprintf(c.stderr, "sketerm mux: daemon not running (no durable sessions yet)\n");
+        _ = c.fprintf(platform.stderr(), "sketerm mux: daemon not running (no durable sessions yet)\n");
         return null;
     };
 }
@@ -396,7 +397,7 @@ fn fetchSessions(allocator: std.mem.Allocator, host: ?[]const u8) ?std.json.Pars
 /// ($SKETERM_SOCKET inside a pane, auto-discovery otherwise).
 fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, host: ?[]const u8) bool {
     const sock = ipc_client.resolveSocket(allocator, null) orelse {
-        _ = c.fprintf(c.stderr, "sketerm mux: no running sketerm window found\n");
+        _ = c.fprintf(platform.stderr(), "sketerm mux: no running sketerm window found\n");
         return false;
     };
     defer allocator.free(sock);
@@ -421,7 +422,7 @@ fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, 
     var addr: c.struct_sockaddr_un = undefined;
     mux_daemon.fillSockaddrUn(&addr, sock) catch return false;
     if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) {
-        _ = c.fprintf(c.stderr, "sketerm mux: cannot reach the sketerm window\n");
+        _ = c.fprintf(platform.stderr(), "sketerm mux: cannot reach the sketerm window\n");
         return false;
     }
     const line = aw.written();
@@ -435,7 +436,7 @@ fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, 
     const rn = c.read(fd, &resp, resp.len);
     if (rn <= 0) return false;
     const ok = std.mem.indexOf(u8, resp[0..@intCast(rn)], "\"ok\":true") != null;
-    if (!ok) _ = c.fprintf(c.stderr, "sketerm mux: %.*s", @as(c_int, @intCast(rn)), &resp);
+    if (!ok) _ = c.fprintf(platform.stderr(), "sketerm mux: %.*s", @as(c_int, @intCast(rn)), &resp);
     return ok;
 }
 
@@ -446,7 +447,7 @@ const RawMode = struct {
 
     fn enter() ?RawMode {
         if (c.isatty(0) == 0) {
-            _ = c.fprintf(c.stderr, "sketerm mux: stdin is not a terminal (use `sketerm mux list`)\n");
+            _ = c.fprintf(platform.stderr(), "sketerm mux: stdin is not a terminal (use `sketerm mux list`)\n");
             return null;
         }
         var orig: c.struct_termios = undefined;
@@ -462,7 +463,7 @@ const RawMode = struct {
 
     fn leave(self: *const RawMode) void {
         _ = c.printf("\x1b[?25h");
-        _ = c.fflush(c.stdout);
+        _ = c.fflush(platform.stdout());
         _ = c.tcsetattr(0, c.TCSANOW, &self.orig);
     }
 };
@@ -522,7 +523,7 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
             eraseTui(&drawn_lines);
             raw.leave();
             _ = c.printf("rename '%.*s' to: ", @as(c_int, @intCast(name.len)), name.ptr);
-            _ = c.fflush(c.stdout);
+            _ = c.fflush(platform.stdout());
             var line_buf: [128]u8 = undefined;
             const rn = c.read(0, &line_buf, line_buf.len);
             raw = RawMode.enter() orelse return 1;
@@ -584,7 +585,7 @@ fn drawTui(sessions: []const SessionInfo, selected: usize, drawn_lines: *usize) 
     const new_marker: [*:0]const u8 = if (selected >= sessions.len) "\x1b[7m \xe2\x96\xb8 " else "   ";
     _ = c.printf("%s\x1b[32m+ create new session\x1b[39m\x1b[27m\r\n", new_marker);
     lines += 1;
-    _ = c.fflush(c.stdout);
+    _ = c.fflush(platform.stdout());
     drawn_lines.* = lines;
 }
 
@@ -592,6 +593,6 @@ fn eraseTui(drawn_lines: *usize) void {
     if (drawn_lines.* == 0) return;
     var i: usize = 0;
     while (i < drawn_lines.*) : (i += 1) _ = c.printf("\x1b[A\x1b[2K");
-    _ = c.fflush(c.stdout);
+    _ = c.fflush(platform.stdout());
     drawn_lines.* = 0;
 }

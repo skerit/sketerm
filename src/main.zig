@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const platform = @import("util/platform.zig");
 const Window = @import("ui/window.zig").Window;
 
 const APP_ID: [*:0]const u8 = "dev.sker.sketerm";
@@ -210,10 +211,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     while (i < argv.len) : (i += 1) {
         const a = std.mem.span(argv[i]);
         if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
-            _ = c.fputs(HELP_TEXT, c.stdout);
+            _ = c.fputs(HELP_TEXT, platform.stdout());
             return 0;
         } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
-            _ = c.fprintf(c.stdout, "sketerm %s\n", @as([*:0]const u8, VERSION));
+            _ = c.fprintf(platform.stdout(), "sketerm %s\n", @as([*:0]const u8, VERSION));
             return 0;
         }
     }

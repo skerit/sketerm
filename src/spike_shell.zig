@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const platform = @import("util/platform.zig");
 const Pty = @import("pty.zig").Pty;
 const Parser = @import("parser/vt.zig").Parser;
 const Event = @import("parser/event.zig").Event;
@@ -101,6 +102,6 @@ pub fn main() u8 {
     w.print("--- grid (active) ---\n", .{}) catch {};
     screen.dump(&w) catch return 2;
     w.print("=== end ===\n", .{}) catch {};
-    _ = c.fwrite(w.buffered().ptr, 1, w.buffered().len, c.stdout);
+    _ = c.fwrite(w.buffered().ptr, 1, w.buffered().len, platform.stdout());
     return 0;
 }

@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const platform = @import("util/platform.zig");
 const protocol = @import("ipc/protocol.zig");
 
 const MARKER = "sketerm-e2e-marker-7423";
@@ -15,7 +16,7 @@ const MARKER = "sketerm-e2e-marker-7423";
 var child_pid: c.pid_t = 0;
 
 fn fail(comptime msg: []const u8) u8 {
-    _ = c.fprintf(c.stderr, "smoke-e2e: FAIL: " ++ msg ++ "\n");
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: FAIL: " ++ msg ++ "\n");
     if (child_pid > 0) {
         _ = c.kill(child_pid, c.SIGKILL);
         var status: c_int = 0;
@@ -29,8 +30,12 @@ pub fn main() u8 {
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
-    if (c.getenv("WAYLAND_DISPLAY") == null and c.getenv("DISPLAY") == null) {
-        _ = c.fputs("smoke-e2e: SKIP (no display)\n", c.stdout);
+    // macOS always has a display (the GDK macOS backend talks to the
+    // WindowServer directly; no env var advertises it).
+    if (!platform.is_macos and
+        c.getenv("WAYLAND_DISPLAY") == null and c.getenv("DISPLAY") == null)
+    {
+        _ = c.fputs("smoke-e2e: SKIP (no display)\n", platform.stdout());
         return 0;
     }
 
@@ -132,7 +137,7 @@ pub fn main() u8 {
     child_pid = 0;
     if (c.access(sock_path.ptr, c.F_OK) == 0) return fail("socket not unlinked on shutdown");
 
-    _ = c.fputs("smoke-e2e: PASS\n", c.stdout);
+    _ = c.fputs("smoke-e2e: PASS\n", platform.stdout());
     return 0;
 }
 

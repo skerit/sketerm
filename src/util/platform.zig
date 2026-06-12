@@ -59,6 +59,21 @@ pub fn exePathZ(buf: *[4096:0]u8) ?[:0]const u8 {
     return buf[0..p.len :0];
 }
 
+/// C stdio streams. glibc exports stdin/stdout/stderr as extern
+/// `FILE *` variables, so `c.stdout` is a value. Darwin's <stdio.h>
+/// defines them as macros over __stdinp/__stdoutp/__stderrp, which
+/// translate-c renders as inline FUNCTIONS — referencing `c.stdout`
+/// there yields a function, not a stream. Always go through these.
+pub inline fn stdin() [*c]c.FILE {
+    return if (is_macos) c.stdin() else c.stdin;
+}
+pub inline fn stdout() [*c]c.FILE {
+    return if (is_macos) c.stdout() else c.stdout;
+}
+pub inline fn stderr() [*c]c.FILE {
+    return if (is_macos) c.stderr() else c.stderr;
+}
+
 /// Cross-thread wakeup primitive for poll loops. Linux: an eventfd
 /// (one fd, kernel-coalesced counter). macOS/other: a non-blocking
 /// pipe pair. Poll `read_fd`; `signal()` from any thread.

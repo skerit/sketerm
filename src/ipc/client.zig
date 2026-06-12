@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const platform = @import("../util/platform.zig");
 const protocol = @import("protocol.zig");
 
 const CLI_HELP =
@@ -54,15 +55,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             i += 1;
             socket_arg = args[i];
         } else if (std.mem.eql(u8, args[i], "--help")) {
-            _ = c.fputs(CLI_HELP, c.stdout);
+            _ = c.fputs(CLI_HELP, platform.stdout());
             return 0;
         } else {
-            _ = c.fprintf(c.stderr, "sketerm cli: unknown flag before command\n");
+            _ = c.fprintf(platform.stderr(), "sketerm cli: unknown flag before command\n");
             return 2;
         }
     }
     if (i >= args.len) {
-        _ = c.fputs(CLI_HELP, c.stdout);
+        _ = c.fputs(CLI_HELP, platform.stdout());
         return 2;
     }
     const cmd = args[i];
@@ -80,13 +81,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         if (std.mem.eql(u8, a, "--pane") and i + 1 < args.len) {
             i += 1;
             req.pane = parsePaneArg(args[i]) orelse {
-                _ = c.fprintf(c.stderr, "sketerm cli: bad --pane value\n");
+                _ = c.fprintf(platform.stderr(), "sketerm cli: bad --pane value\n");
                 return 2;
             };
         } else if (std.mem.eql(u8, a, "--tab") and i + 1 < args.len) {
             i += 1;
             req.tab = std.fmt.parseInt(u32, args[i], 10) catch {
-                _ = c.fprintf(c.stderr, "sketerm cli: bad --tab value\n");
+                _ = c.fprintf(platform.stderr(), "sketerm cli: bad --tab value\n");
                 return 2;
             };
         } else if (std.mem.eql(u8, a, "--scrollback") and i + 1 < args.len) {
@@ -112,7 +113,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, a, "--enter")) {
             press_enter = true;
         } else if (std.mem.eql(u8, a, "--help")) {
-            _ = c.fputs(CLI_HELP, c.stdout);
+            _ = c.fputs(CLI_HELP, platform.stdout());
             return 0;
         } else {
             text_parts.append(allocator, a) catch return 1;
@@ -131,13 +132,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     }
 
     const sock_path = resolveSocket(allocator, socket_arg) orelse {
-        _ = c.fprintf(c.stderr, "sketerm cli: no socket found (is sketerm running? use --socket or $SKETERM_SOCKET)\n");
+        _ = c.fprintf(platform.stderr(), "sketerm cli: no socket found (is sketerm running? use --socket or $SKETERM_SOCKET)\n");
         return 1;
     };
 
     if (std.mem.eql(u8, cmd, "type-text")) {
         const text_raw = req.data orelse {
-            _ = c.fprintf(c.stderr, "sketerm cli: type-text requires text\n");
+            _ = c.fprintf(platform.stderr(), "sketerm cli: type-text requires text\n");
             allocator.free(sock_path);
             return 2;
         };
@@ -166,7 +167,7 @@ fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, text: [
     const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
     if (conn == null) {
         const msg: [*c]const u8 = if (gerr != null) gerr.*.message else "unknown";
-        _ = c.fprintf(c.stderr, "sketerm cli: connect failed: %s\n", msg);
+        _ = c.fprintf(platform.stderr(), "sketerm cli: connect failed: %s\n", msg);
         if (gerr != null) c.g_error_free(gerr);
         return 1;
     }
@@ -206,7 +207,7 @@ fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, text: [
         var werr: [*c]c.GError = null;
         if (c.g_output_stream_write_all(out_stream, line.ptr, line.len, &written, null, &werr) == 0) {
             if (werr != null) c.g_error_free(werr);
-            _ = c.fprintf(c.stderr, "sketerm cli: write failed\n");
+            _ = c.fprintf(platform.stderr(), "sketerm cli: write failed\n");
             return 1;
         }
         // One response line per request keeps us in lockstep — and
@@ -216,17 +217,17 @@ fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, text: [
         const resp = c.g_data_input_stream_read_line(din, &rlen, null, &rerr);
         if (resp == null) {
             if (rerr != null) c.g_error_free(rerr);
-            _ = c.fprintf(c.stderr, "sketerm cli: no response\n");
+            _ = c.fprintf(platform.stderr(), "sketerm cli: no response\n");
             return 1;
         }
         defer c.g_free(resp);
         if (std.mem.indexOf(u8, resp[0..rlen], "\"ok\":true") == null) {
-            _ = c.fwrite(resp, 1, rlen, c.stdout);
-            _ = c.fputc('\n', c.stdout);
+            _ = c.fwrite(resp, 1, rlen, platform.stdout());
+            _ = c.fputc('\n', platform.stdout());
             return 1;
         }
     }
-    _ = c.fputs("{\"ok\":true}\n", c.stdout);
+    _ = c.fputs("{\"ok\":true}\n", platform.stdout());
     return 0;
 }
 
@@ -259,7 +260,7 @@ pub fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
         if (std.mem.eql(u8, name, "mux.sock")) continue;
         if (found != null) {
             allocator.free(found.?);
-            _ = c.fprintf(c.stderr, "sketerm cli: multiple instances; pass --socket\n");
+            _ = c.fprintf(platform.stderr(), "sketerm cli: multiple instances; pass --socket\n");
             return null;
         }
         found = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_z, name }, 0) catch return null;
@@ -286,7 +287,7 @@ fn talk(allocator: std.mem.Allocator, sock_path: [:0]u8, req: protocol.Request) 
     const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
     if (conn == null) {
         const msg: [*c]const u8 = if (gerr != null) gerr.*.message else "unknown";
-        _ = c.fprintf(c.stderr, "sketerm cli: connect failed: %s\n", msg);
+        _ = c.fprintf(platform.stderr(), "sketerm cli: connect failed: %s\n", msg);
         if (gerr != null) c.g_error_free(gerr);
         return 1;
     }
@@ -296,7 +297,7 @@ fn talk(allocator: std.mem.Allocator, sock_path: [:0]u8, req: protocol.Request) 
     var written: c.gsize = 0;
     if (c.g_output_stream_write_all(out_stream, line.ptr, line.len, &written, null, &gerr) == 0) {
         if (gerr != null) c.g_error_free(gerr);
-        _ = c.fprintf(c.stderr, "sketerm cli: write failed\n");
+        _ = c.fprintf(platform.stderr(), "sketerm cli: write failed\n");
         return 1;
     }
 
@@ -306,13 +307,13 @@ fn talk(allocator: std.mem.Allocator, sock_path: [:0]u8, req: protocol.Request) 
     const resp = c.g_data_input_stream_read_line(din, &rlen, null, &gerr);
     if (resp == null) {
         if (gerr != null) c.g_error_free(gerr);
-        _ = c.fprintf(c.stderr, "sketerm cli: no response\n");
+        _ = c.fprintf(platform.stderr(), "sketerm cli: no response\n");
         return 1;
     }
     defer c.g_free(resp);
 
-    _ = c.fwrite(resp, 1, rlen, c.stdout);
-    _ = c.fputc('\n', c.stdout);
+    _ = c.fwrite(resp, 1, rlen, platform.stdout());
+    _ = c.fputc('\n', platform.stdout());
 
     // Exit code mirrors the ok field.
     const Ok = struct { ok: bool = false };
