@@ -23,6 +23,19 @@
  * `vendor/aro_shims/` and also predefine the guard for belt-and-braces. */
 #define __GDK_H_INSIDE__ 1
 
+/* On aarch64, graphene-config.h selects its NEON backend, whose
+ * `#include <arm_neon.h>` crashes Aro outright (SIGBUS — observed on
+ * Apple Silicon, macOS SDK). GRAPHENE_SIMD_BENCHMARK is graphene's
+ * own escape hatch: it skips the baked-in GRAPHENE_HAS_* block so our
+ * GRAPHENE_HAS_SCALAR pick wins. Scalar simd4f is the same 16 bytes
+ * (lower alignment), and sketerm never calls graphene itself — the
+ * types only ride along inside GTK/GSK declarations. x86_64 keeps the
+ * SSE backend (xmmintrin translates fine). */
+#ifdef __aarch64__
+#define GRAPHENE_SIMD_BENCHMARK 1
+#define GRAPHENE_HAS_SCALAR 1
+#endif
+
 /* Pin GLib API floor to 2.74 so the 2.76+ `g_string_free` macro
  * doesn't get defined. That macro expands into a `__builtin_constant_p`
  * ternary chain that translate-c lowers to invalid Zig (statement-
