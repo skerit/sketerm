@@ -114,10 +114,10 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
         return 0;
     }
     if (std.mem.eql(u8, cmd, "attach") and args.len >= 2) {
-        return if (guiCommand(allocator, "attach-session", args[1], host)) 0 else 1;
+        return if (guiCommand(allocator, "attach-session", args[1], host, true)) 0 else 1;
     }
     if (std.mem.eql(u8, cmd, "new")) {
-        return if (guiCommand(allocator, "new-durable-tab", null, host)) 0 else 1;
+        return if (guiCommand(allocator, "new-durable-tab", null, host, true)) 0 else 1;
     }
     if (std.mem.eql(u8, cmd, "kill") and args.len >= 2) {
         var conn = muxConnect(allocator, host) orelse return 1;
@@ -397,7 +397,7 @@ fn fetchSessions(allocator: std.mem.Allocator, host: ?[]const u8) ?std.json.Pars
 
 /// Send one command to the running GUI over its IPC socket
 /// ($SKETERM_SOCKET inside a pane, auto-discovery otherwise).
-fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, host: ?[]const u8) bool {
+pub fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, host: ?[]const u8, use_pane: bool) bool {
     const sock = ipc_client.resolveSocket(allocator, null) orelse {
         _ = c.fprintf(platform.stderr(), "sketerm mux: no running sketerm window found\n");
         return false;
@@ -409,6 +409,7 @@ fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, 
     // `sketerm mux` in a pane and picking a session should behave
     // like `tmux attach`, not spawn windows elsewhere.
     const self_pane: ?u32 = blk: {
+        if (!use_pane) break :blk null;
         const env = c.getenv("SKETERM_PANE_ID") orelse break :blk null;
         break :blk std.fmt.parseInt(u32, std.mem.span(@as([*:0]const u8, @ptrCast(env))), 10) catch null;
     };
@@ -504,10 +505,10 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
             raw.leave();
             if (selected >= sessions.len) {
                 // The "create new" row.
-                return if (guiCommand(allocator, "new-durable-tab", null, host)) 0 else 1;
+                return if (guiCommand(allocator, "new-durable-tab", null, host, true)) 0 else 1;
             }
             const name = sessions[selected].name;
-            if (guiCommand(allocator, "attach-session", name, host)) {
+            if (guiCommand(allocator, "attach-session", name, host, true)) {
                 _ = c.printf("attached '%.*s'\n", @as(c_int, @intCast(name.len)), name.ptr);
                 return 0;
             }
@@ -516,7 +517,7 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
         if (key.len == 1 and key[0] == 'n') {
             eraseTui(&drawn_lines);
             raw.leave();
-            return if (guiCommand(allocator, "new-durable-tab", null, host)) 0 else 1;
+            return if (guiCommand(allocator, "new-durable-tab", null, host, true)) 0 else 1;
         }
         if (key.len == 1 and key[0] == 'r' and selected < sessions.len) {
             const name = sessions[selected].name;

@@ -209,8 +209,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         return 2;
     };
 
-    // Local preflight: we need a Wayland session and the local half
-    // of the forwarder.
+    // NATIVE-FIRST: with a sketerm GUI running (the compositor
+    // brain) and sketerm-mux on the remote, no waypipe is involved
+    // on either end — spawn an app session and let the GUI render.
+    if (!use_udp) {
+        if (runNativeApp(allocator, host, parsed.command)) |code| return code;
+    }
+
+    // Legacy waypipe fallbacks. Local preflight: we need a Wayland
+    // session and the local half of the forwarder.
     if (c.getenv("WAYLAND_DISPLAY") == null) {
         errMsg("no Wayland session ($WAYLAND_DISPLAY unset) — remote apps need a local Wayland compositor", .{});
         return 1;
@@ -316,6 +323,50 @@ const PumpChan = struct {
 /// wraps the command in `waypipe server`; its display connections
 /// come back as byte channels which we pump into the local waypipe
 /// client. The session's terminal output streams to our stdout.
+/// The sketerm-native path for plain `sketerm app`: spawn an
+/// app-kind session on the host's daemon over SSH and hand it to
+/// the running GUI, whose compositor brain renders the windows.
+/// Null = prerequisites missing (no GUI / no remote daemon) —
+/// caller falls back to waypipe.
+fn runNativeApp(allocator: std.mem.Allocator, host: []const u8, command: []const []const u8) ?u8 {
+    const ipc_client = @import("ipc/client.zig");
+    const gui_sock = ipc_client.resolveSocket(allocator, null) orelse return null;
+    allocator.free(gui_sock);
+
+    var conn = mux_client.Conn.connectSsh(allocator, host) catch return null;
+    defer conn.deinit();
+
+    var rnd: [4]u8 = undefined;
+    _ = c.getentropy(&rnd, rnd.len);
+    var name_buf: [64]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "app-{d}-{x}", .{
+        c.getpid(),
+        std.mem.readInt(u32, &rnd, .little),
+    }) catch return null;
+
+    conn.sendJson(.spawn, .{
+        .name = name,
+        .argv = command,
+        .rows = @as(u16, 24),
+        .cols = @as(u16, 80),
+        .app = true,
+    }) catch return null;
+    const ok = conn.recvExpect(&.{.ok}) catch {
+        errMsg("daemon on {s} refused the app session", .{host});
+        return 1;
+    };
+    ok.deinit(allocator);
+
+    // The GUI attaches with its own connection and owns the session
+    // from here; a fresh tab (not this pane) shows the app's output.
+    if (!@import("ipc/mux_cli.zig").guiCommand(allocator, "attach-session", name, host, false)) {
+        errMsg("session '{s}' spawned on {s}, but no sketerm GUI took it (attach manually: sketerm mux {s} attach {s})", .{ name, host, host, name });
+        return 1;
+    }
+    std.debug.print("sketerm: app session '{s}' on {s} — windows render via the sketerm GUI\n", .{ name, host });
+    return 0;
+}
+
 fn runMuxApp(allocator: std.mem.Allocator, host: []const u8, command: []const []const u8, port_range: ?[]const u8) u8 {
     var conn = mux_client.Conn.connectUdp(allocator, host, port_range) catch {
         errMsg("UDP transport to {s} failed (needs key auth + sketerm-mux installed there)", .{host});
