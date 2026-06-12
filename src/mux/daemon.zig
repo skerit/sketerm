@@ -98,8 +98,15 @@ const Session = struct {
     /// (SKETERM_WINSTREAM=stub). Mutually exclusive with Wayland
     /// forwarding.
     winstream: ?*WsSource = null,
+    /// App display connections accepted BEFORE any channel-capable
+    /// client attached. Wayland clients block on an unanswered
+    /// socket, so queueing here keeps a freshly-spawned app alive
+    /// through the spawn→GUI-attach handover gap.
+    wl_pending: std.ArrayList(c_int) = .empty,
 
     fn deinit(self: *Session) void {
+        for (self.wl_pending.items) |fd| _ = c.close(fd);
+        self.wl_pending.deinit(self.allocator);
         if (self.winstream) |ws| {
             ws.deinit();
             self.allocator.destroy(ws);
@@ -596,10 +603,22 @@ pub const Daemon = struct {
             if (cl.attached == s and !cl.dead and cl.proto >= 2) target = cl;
         }
         const cl = target orelse {
-            _ = c.close(fd);
+            // Nobody to render yet — park the connection; the app
+            // blocks harmlessly. Drained on the next attach.
+            if (s.wl_pending.items.len >= 16) {
+                _ = c.close(fd);
+                return;
+            }
+            s.wl_pending.append(self.allocator, fd) catch {
+                _ = c.close(fd);
+            };
             return;
         };
+        self.openAppChannel(s, cl, fd);
+    }
 
+    /// Bridge one accepted app connection to `cl` as a channel.
+    fn openAppChannel(self: *Daemon, s: *Session, cl: *Client, fd: c_int) void {
         var native: ?*Native = null;
         if (s.wl_native) {
             native = self.allocator.create(Native) catch {
@@ -1397,7 +1416,14 @@ pub const Daemon = struct {
         }
         cl.attached = s;
         self.queueSnapshot(cl, s);
-        if (s.winstream != null and cl.proto >= 2) self.openWinstreamChan(s, cl);
+        if (cl.proto >= 2) {
+            if (s.winstream != null) self.openWinstreamChan(s, cl);
+            // Apps that connected before any renderer was attached.
+            while (s.wl_pending.items.len > 0) {
+                const fd = s.wl_pending.orderedRemove(0);
+                self.openAppChannel(s, cl, fd);
+            }
+        }
     }
 
     /// Window-stream channels have no fd (frames originate in the

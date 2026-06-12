@@ -633,6 +633,73 @@ fn winstreamStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     std.debug.print("smoke-mux: winstream stub round-trip ok\n", .{});
 }
 
+/// The spawn→GUI-attach handover gap (`sketerm app` via the GUI):
+/// an app that connects to its display BEFORE any client attached
+/// must be parked, not refused — and bridged on the next attach.
+fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("pend connect");
+    defer conn.deinit();
+    const tv = c.struct_timeval{ .tv_sec = 15, .tv_usec = 0 };
+    _ = c.setsockopt(conn.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+    conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("pend hello");
+    (conn.recvExpect(&.{.welcome}) catch fail("pend welcome")).deinit(allocator);
+    conn.sendJson(.spawn, .{
+        .name = "pend",
+        .argv = [_][]const u8{ "/bin/sleep", "60" },
+        .rows = @as(u16, 10),
+        .cols = @as(u16, 40),
+    }) catch fail("pend spawn");
+    (conn.recvExpect(&.{.ok}) catch fail("pend spawn ok")).deinit(allocator);
+
+    // App connects + speaks BEFORE anyone attached (sessions above:
+    // smoke=wl-1, wlapp=wl-2, wsapp=no hub → pend=wl-3).
+    const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/').?;
+    var disp_buf: [128]u8 = undefined;
+    const disp = std.fmt.bufPrint(&disp_buf, "{s}/wl-3", .{sock_path[0..dir_end]}) catch unreachable;
+    const app_fd = @import("util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    var addr: c.struct_sockaddr_un = undefined;
+    daemon_mod.fillSockaddrUn(&addr, disp) catch fail("pend sockaddr");
+    if (c.connect(app_fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) fail("pend app connect");
+    defer _ = c.close(app_fd);
+    var mbuf: [16]u8 = undefined;
+    var b = wlwire.Builder.init(&mbuf, 1, 1); // get_registry(2)
+    b.putNewId(2);
+    const m = b.finish() catch unreachable;
+    if (c.write(app_fd, m.ptr, m.len) != @as(isize, @intCast(m.len))) fail("pend app write");
+
+    // Give the daemon a tick to accept-and-park, then attach.
+    _ = c.usleep(100_000);
+    conn.sendJson(.attach, .{ .name = "pend" }) catch fail("pend attach");
+
+    var got_relay = false;
+    var rounds: usize = 0;
+    var chan_id: u32 = 0;
+    while (!got_relay and rounds < 200) : (rounds += 1) {
+        const f = conn.recvFrame() catch fail("pend read (parked app never bridged)");
+        defer f.deinit(allocator);
+        switch (f.ftype) {
+            .chan_open => {
+                const open = wire.decodeChanOpen(f.payload) orelse fail("pend chan_open");
+                if (open.kind != .wayland_native) fail("pend chan kind");
+                chan_id = open.id;
+            },
+            .chan_data => {
+                if ((wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
+                // First unit must be the parked get_registry.
+                const p = (wlpipe.peelUnit(f.payload[4..]) catch fail("pend unit")) orelse continue;
+                if (p.unit.tag == .wl_msg) {
+                    const h = (wlwire.parseHeader(p.unit.payload) catch fail("pend hdr")) orelse fail("pend hdr");
+                    if (h.object == 1 and h.opcode == 1) got_relay = true;
+                }
+            },
+            else => {},
+        }
+    }
+    if (!got_relay) fail("parked app connection never reached the client");
+    conn.sendJson(.kill, .{ .name = "pend" }) catch fail("pend kill");
+    std.debug.print("smoke-mux: pre-attach app parking ok\n", .{});
+}
+
 /// wl_surface.commit on surface 7 — 8 header bytes, no args.
 fn commitNeedle() [8]u8 {
     var buf: [8]u8 = undefined;
@@ -832,6 +899,9 @@ pub fn main() u8 {
 
     // Window-stream pipeline (stub capture source).
     winstreamStage(allocator, sock_path);
+
+    // Apps that connect before a renderer attaches are parked.
+    pendingAppStage(allocator, sock_path);
 
     // A second client sees the session in LIST.
     var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("connect2");
