@@ -2379,6 +2379,11 @@ pub const Window = struct {
         profile_name: [:0]u8, // owned, freed by GDestroyNotify
         popover: *c.GtkWidget,
         allocator: std.mem.Allocator,
+        /// Target pane, captured at popover build time. Resolving the
+        /// focused pane at CLICK time silently fails: the popover's
+        /// button holds the window focus by then, so focusedPane()
+        /// returns null. Null for the new-tab flow (no target pane).
+        pane: ?*Pane = null,
     };
 
     /// Right-click → "New Tab as Profile…" picker. Opens a popover
@@ -2433,9 +2438,7 @@ pub const Window = struct {
             }
         }
 
-        c.gtk_popover_set_child(@ptrCast(popover), box);
-        c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
-        c.gtk_popover_popup(@ptrCast(popover));
+        presentPanePopover(pane, popover, box);
     }
 
     /// Right-click → "Apply Profile to Pane…" picker. Same popover
@@ -2453,20 +2456,43 @@ pub const Window = struct {
         c.gtk_widget_set_margin_end(box, 6);
 
         var names_buf: [1][]const u8 = .{"default"};
-        addApplyProfileButtons(self, @ptrCast(box), popover, &names_buf);
+        addApplyProfileButtons(self, pane, @ptrCast(box), popover, &names_buf);
         var prof_names = std.ArrayList([]const u8).empty;
         defer prof_names.deinit(self.allocator);
         for (self.config.profiles.items) |p| {
             prof_names.append(self.allocator, p.name) catch break;
         }
-        addApplyProfileButtons(self, @ptrCast(box), popover, prof_names.items);
+        addApplyProfileButtons(self, pane, @ptrCast(box), popover, prof_names.items);
 
-        c.gtk_popover_set_child(@ptrCast(popover), box);
+        presentPanePopover(pane, popover, box);
+    }
+
+    /// Show a picker popover over a pane. Wraps the content in a
+    /// natural-size scroller and anchors at the pane's center:
+    /// GTK4 silently popdowns an autohide popover whose MINIMUM size
+    /// doesn't fit the space the compositor grants (same quirk the
+    /// context menu works around in menu.zig) — anchored at the
+    /// pane's bottom edge, any popover taller than the strip below
+    /// the window vanished the frame it mapped.
+    fn presentPanePopover(pane: *Pane, popover: *c.GtkWidget, content: ?*c.GtkWidget) void {
+        const scroller = c.gtk_scrolled_window_new();
+        c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
+        c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(scroller), 1);
+        c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(scroller), 1);
+        c.gtk_scrolled_window_set_child(@ptrCast(scroller), content);
+        c.gtk_popover_set_child(@ptrCast(popover), scroller);
         c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+        var rect = c.GdkRectangle{
+            .x = @divTrunc(c.gtk_widget_get_width(@ptrCast(pane.area)), 2),
+            .y = @divTrunc(c.gtk_widget_get_height(@ptrCast(pane.area)), 2),
+            .width = 1,
+            .height = 1,
+        };
+        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
         c.gtk_popover_popup(@ptrCast(popover));
     }
 
-    fn addApplyProfileButtons(self: *Window, box: *c.GtkBox, popover: *c.GtkWidget, names: []const []const u8) void {
+    fn addApplyProfileButtons(self: *Window, pane: *Pane, box: *c.GtkBox, popover: *c.GtkWidget, names: []const []const u8) void {
         for (names) |name| {
             const name_z = self.allocator.allocSentinel(u8, name.len, 0) catch continue;
             @memcpy(name_z, name);
@@ -2484,6 +2510,7 @@ pub const Window = struct {
                 .profile_name = name_z,
                 .popover = popover,
                 .allocator = self.allocator,
+                .pane = pane,
             };
             _ = c.g_signal_connect_data(
                 btn,
@@ -2531,6 +2558,10 @@ pub const Window = struct {
         preset_name: [:0]u8, // owned, freed by GDestroyNotify
         popover: *c.GtkWidget,
         allocator: std.mem.Allocator,
+        /// Target pane, captured at popover build time (the popover
+        /// button holds the window focus at click time, so resolving
+        /// focusedPane() then returns null). Null = delete-only ctx.
+        pane: ?*Pane = null,
     };
 
     /// Right-click → "Shader Preset…" picker. A popover anchored on
@@ -2575,6 +2606,7 @@ pub const Window = struct {
                     .preset_name = name_z,
                     .popover = popover,
                     .allocator = self.allocator,
+                    .pane = pane,
                 };
                 _ = c.g_signal_connect_data(
                     btn,
@@ -2619,9 +2651,7 @@ pub const Window = struct {
             }
         }
 
-        c.gtk_popover_set_child(@ptrCast(popover), box);
-        c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
-        c.gtk_popover_popup(@ptrCast(popover));
+        presentPanePopover(pane, popover, box);
     }
 
     const PaneTitleCtx = struct {
@@ -5336,7 +5366,7 @@ fn freeRenameCtx(user: ?*anyopaque) callconv(.c) void {
 
 fn onApplyProfilePicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Window.ProfileButtonCtx, user);
-    if (ctx.window.focusedPane()) |pane| {
+    if (ctx.pane) |pane| {
         ctx.window.applyProfileToPane(pane, ctx.profile_name);
     }
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
@@ -5358,7 +5388,7 @@ fn freeProfileButtonCtx(user: ?*anyopaque) callconv(.c) void {
 
 fn onPresetPicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Window.PresetButtonCtx, user);
-    if (ctx.window.focusedPane()) |pane| {
+    if (ctx.pane) |pane| {
         if (!ctx.window.applyShaderPresetByName(pane, ctx.preset_name)) {
             std.debug.print("sketerm: shader preset '{s}' failed to apply\n", .{ctx.preset_name});
         }
