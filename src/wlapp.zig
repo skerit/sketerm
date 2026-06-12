@@ -12,6 +12,15 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const builtin = @import("builtin");
+
+// Backend-specific identity calls; the headers are too heavy for
+// the cimport set, so declare the handful of symbols directly.
+// Referenced only on Linux (comptime-gated) — they resolve there.
+extern fn gdk_wayland_toplevel_set_application_id(toplevel: ?*c.GdkSurface, application_id: [*:0]const u8) void;
+extern fn gdk_x11_display_get_xdisplay(display: ?*c.GdkDisplay) ?*anyopaque;
+extern fn gdk_x11_surface_get_xid(surface: ?*c.GdkSurface) c_ulong;
+extern fn XChangeProperty(dpy: ?*anyopaque, win: c_ulong, prop: c_ulong, kind: c_ulong, format: c_int, mode: c_int, data: [*]const u8, n: c_int) c_int;
 const cast = @import("util/cast.zig");
 const Compositor = @import("wlhost/compositor.zig").Compositor;
 
@@ -42,6 +51,9 @@ pub const AppHost = struct {
     /// window (the usual order) — applied in winFor. Owned strings.
     pending_titles: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     pending_app_ids: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
+    /// Surfaces whose app negotiated server-side decorations before
+    /// the window existed (the normal order).
+    pending_ssd: std.AutoHashMapUnmanaged(u32, bool) = .empty,
 
     const Popup = struct {
         host: *AppHost,
@@ -102,6 +114,7 @@ pub const AppHost = struct {
             .popup_new = onPopupNew,
             .popup_gone = onPopupGone,
             .cursor_shape = onCursorShape,
+            .toplevel_decoration = onDecoration,
             .clipboard_offer = onClipOffer,
             .clipboard_data = onClipData,
             .clipboard_read = onClipRead,
@@ -128,6 +141,7 @@ pub const AppHost = struct {
         var ait = self.pending_app_ids.valueIterator();
         while (ait.next()) |v| self.allocator.free(v.*);
         self.pending_app_ids.deinit(self.allocator);
+        self.pending_ssd.deinit(self.allocator);
         if (self.pending_reads > 0) {
             self.doomed = true;
             return;
@@ -301,12 +315,34 @@ pub const AppHost = struct {
     }
 
     /// Desktop identity: app ids double as icon names by convention
-    /// (org.gnome.Calculator etc.) — gives the window the right
-    /// taskbar icon when the theme has it locally.
+    /// (org.gnome.Calculator etc.), and the window itself gets the
+    /// remote app's identity so taskbars group/iconify it as that
+    /// app instead of as sketerm.
     fn applyAppId(win: *Win, app_id: []const u8) void {
         var buf: [256:0]u8 = undefined;
         const z = std.fmt.bufPrintZ(&buf, "{s}", .{app_id}) catch return;
         c.gtk_window_set_icon_name(win.window, z.ptr);
+        if (comptime !builtin.os.tag.isDarwin()) {
+            const display = c.gdk_display_get_default() orelse return;
+            const surface = c.gtk_native_get_surface(@ptrCast(win.window)) orelse return;
+            const backend = std.mem.span(c.g_type_name_from_instance(@ptrCast(@alignCast(display))));
+            if (std.mem.indexOf(u8, backend, "Wayland") != null) {
+                gdk_wayland_toplevel_set_application_id(surface, z.ptr);
+            } else if (std.mem.indexOf(u8, backend, "X11") != null) {
+                const xdpy = gdk_x11_display_get_xdisplay(display) orelse return;
+                const xid = gdk_x11_surface_get_xid(surface);
+                if (xid == 0) return;
+                // WM_CLASS (atom 67), XA_STRING (31), PropModeReplace:
+                // "instance\0class\0".
+                var cls: [520]u8 = undefined;
+                const n = @min(z.len, 255);
+                @memcpy(cls[0..n], z[0..n]);
+                cls[n] = 0;
+                @memcpy(cls[n + 1 ..][0..n], z[0..n]);
+                cls[n + 1 + n] = 0;
+                _ = XChangeProperty(xdpy, xid, 67, 31, 8, 0, &cls, @intCast(2 * n + 2));
+            }
+        }
     }
 
     fn onGone(ctx: ?*anyopaque, surface: u32) void {
@@ -327,6 +363,10 @@ pub const AppHost = struct {
         const window: *c.GtkWindow = @ptrCast(c.gtk_window_new());
         const picture = c.gtk_picture_new();
         c.gtk_window_set_title(window, "remote app");
+        // Undecorated unless the app asked for host decorations —
+        // Wayland apps default to drawing their own chrome, and a
+        // second titlebar around it looks broken.
+        c.gtk_window_set_decorated(window, @intFromBool(self.pending_ssd.get(surface) orelse false));
         c.gtk_window_set_default_size(window, w, h);
         const overlay = c.gtk_overlay_new();
         c.gtk_overlay_set_child(@ptrCast(overlay), picture);
@@ -529,6 +569,15 @@ pub const AppHost = struct {
     /// Remote app sets its cursor: apply to the pointer-focused
     /// window's picture so the local pointer matches (text beam
     /// over terminals, hand over links…).
+    fn onDecoration(ctx: ?*anyopaque, surface: u32, ssd: bool) void {
+        const self = cast.userData(AppHost, ctx);
+        if (self.windows.get(surface)) |win| {
+            c.gtk_window_set_decorated(win.window, @intFromBool(ssd));
+        } else {
+            self.pending_ssd.put(self.allocator, surface, ssd) catch {};
+        }
+    }
+
     fn onCursorShape(ctx: ?*anyopaque, shape: u32) void {
         const self = cast.userData(AppHost, ctx);
         if (shape < 1 or shape > cursor_names.len) return;

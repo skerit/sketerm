@@ -358,8 +358,9 @@ fn runNativeApp(allocator: std.mem.Allocator, host: []const u8, command: []const
     ok.deinit(allocator);
 
     // The GUI attaches with its own connection and owns the session
-    // from here; a fresh tab (not this pane) shows the app's output.
-    if (!@import("ipc/mux_cli.zig").guiCommand(allocator, "attach-session", name, host, false)) {
+    // from here. Inside a sketerm pane, THIS pane becomes the
+    // session view (like `sketerm mux attach`); outside, a new tab.
+    if (!@import("ipc/mux_cli.zig").guiCommand(allocator, "attach-session", name, host, true)) {
         errMsg("session '{s}' spawned on {s}, but no sketerm GUI took it (attach manually: sketerm mux {s} attach {s})", .{ name, host, host, name });
         return 1;
     }

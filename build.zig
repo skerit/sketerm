@@ -593,6 +593,12 @@ fn configureSysDeps(
     mod.addImport("cbindings", cbindings_mod);
     mod.addIncludePath(b.path("vendor/aro_shims"));
     for (sys_libs) |lib| addPkgConfig(b, mod, lib);
+    // Per-window WM_CLASS for remote app windows (wlapp.zig calls
+    // XChangeProperty directly — GTK links X11 but doesn't re-export
+    // it). Linux-only; the macOS GUI has no X11.
+    if (mod.resolved_target.?.result.os.tag == .linux) {
+        mod.linkSystemLibrary("X11", .{ .use_pkg_config = .yes });
+    }
     mod.addCSourceFile(.{
         .file = b.path("vendor/stb_image_impl.c"),
         .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },

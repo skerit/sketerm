@@ -73,6 +73,9 @@ pub const View = struct {
     /// wp_cursor_shape set_shape — apply to the pointer-focused
     /// window (enum per cursor-shape-v1; names match CSS cursors).
     cursor_shape: ?*const fn (ctx: ?*anyopaque, shape: u32) void = null,
+    /// xdg-decoration: the app wants server-side (host) decorations
+    /// (true) or draws its own (false).
+    toplevel_decoration: ?*const fn (ctx: ?*anyopaque, surface: u32, ssd: bool) void = null,
 };
 
 const Global = struct {
@@ -97,6 +100,10 @@ const globals = [_]Global{
     .{ .name = 7, .iface = &protocol.wp_cursor_shape_manager_v1, .version = 1 },
     .{ .name = 8, .iface = &protocol.wp_viewporter, .version = 1 },
     .{ .name = 9, .iface = &protocol.wp_fractional_scale_manager_v1, .version = 1 },
+    // Decoration negotiation: SSD-wanting apps (Qt, traditional
+    // GTK) get the host window's decorations; CSD apps draw their
+    // own into an undecorated host window.
+    .{ .name = 10, .iface = &protocol.zxdg_decoration_manager_v1, .version = 1 },
 };
 
 const Pool = struct {
@@ -743,6 +750,34 @@ pub const Compositor = struct {
             else => return Error.Protocol,
         } else if (iface == &protocol.wp_fractional_scale_v1) {
             try self.destroyObject(hdr.object); // destroy
+        } else if (iface == &protocol.zxdg_decoration_manager_v1) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object),
+            1 => { // get_toplevel_decoration(id, xdg_toplevel)
+                const id = (try it.next()).?.new_id;
+                const tl = (try it.next()).?.object;
+                const sid = self.xdg_map.get(tl) orelse return Error.Protocol;
+                try self.register(id, &protocol.zxdg_toplevel_decoration_v1);
+                try self.xdg_map.put(self.allocator, id, sid);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zxdg_toplevel_decoration_v1) switch (hdr.opcode) {
+            0 => { // destroy
+                _ = self.xdg_map.remove(hdr.object);
+                try self.destroyObject(hdr.object);
+            },
+            1, 2 => { // set_mode(u) / unset_mode
+                var mode: u32 = 2; // unset → we prefer server-side
+                if (hdr.opcode == 1) mode = (try it.next()).?.uint;
+                if (mode != 1) mode = 2;
+                var buf: [16]u8 = undefined;
+                var b = wire.Builder.init(&buf, hdr.object, 0); // configure
+                b.putUint(mode);
+                try self.send(try b.finish());
+                if (self.xdg_map.get(hdr.object)) |sid| {
+                    if (self.view.toplevel_decoration) |cb| cb(self.view.ctx, sid, mode == 2);
+                }
+            },
+            else => return Error.Protocol,
         } else if (iface == &protocol.wl_data_device_manager) switch (hdr.opcode) {
             0 => { // create_data_source
                 const id = (try it.next()).?.new_id;
@@ -1179,6 +1214,7 @@ const TestView = struct {
     clip_data_len: usize = 0,
     clip_reads: usize = 0,
     cursor: u32 = 0,
+    ssd: ?bool = null,
 
     fn onNew(ctx: ?*anyopaque, surface: u32) void {
         _ = surface;
@@ -1241,6 +1277,11 @@ const TestView = struct {
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
         self.cursor = shape;
     }
+    fn onDeco(ctx: ?*anyopaque, surface: u32, ssd: bool) void {
+        _ = surface;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.ssd = ssd;
+    }
 
     fn view(self: *TestView) View {
         return .{
@@ -1255,6 +1296,7 @@ const TestView = struct {
             .clipboard_data = onClipData,
             .clipboard_read = onClipRead,
             .cursor_shape = onCursor,
+            .toplevel_decoration = onDeco,
         };
     }
 };
@@ -1901,6 +1943,64 @@ test "extensions: cursor shape, viewporter, fractional scale" {
     try t.expectEqual(@as(u32, 10), hdr.object);
     try t.expectEqual(@as(u16, 0), hdr.opcode); // preferred_scale
     try t.expectEqual(@as(u32, 120), std.mem.readInt(u32, p.unit.payload[wire.header_size..][0..4], .little));
+}
+
+test "xdg-decoration: SSD negotiation reaches the view" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [80]u8 = undefined;
+    // registry(2), compositor(3)→surface(4), wm_base(5)→xdg(6)→toplevel(7)
+    var b = wire.Builder.init(&buf, 1, 1);
+    b.putNewId(2);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 2, 0);
+    b.putUint(1);
+    b.putString("wl_compositor");
+    b.putUint(1);
+    b.putNewId(3);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 2, 0);
+    b.putUint(5);
+    b.putString("xdg_wm_base");
+    b.putUint(1);
+    b.putNewId(5);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 3, 0);
+    b.putNewId(4);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 5, 2);
+    b.putNewId(6);
+    b.putObject(4);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 6, 1);
+    b.putNewId(7);
+    try req(&comp, try b.finish());
+    // bind decoration manager(name 10) → 8; decoration 9 on toplevel 7
+    b = wire.Builder.init(&buf, 2, 0);
+    b.putUint(10);
+    b.putString("zxdg_decoration_manager_v1");
+    b.putUint(1);
+    b.putNewId(8);
+    try req(&comp, try b.finish());
+    b = wire.Builder.init(&buf, 8, 1);
+    b.putNewId(9);
+    b.putObject(7);
+    try req(&comp, try b.finish());
+    comp.clearOut();
+    b = wire.Builder.init(&buf, 9, 1); // set_mode(server_side)
+    b.putUint(2);
+    try req(&comp, try b.finish());
+    try t.expectEqual(@as(?bool, true), tv.ssd);
+    const p = (try pipe.peelUnit(comp.takeOut())).?;
+    const hdr = (try wire.parseHeader(p.unit.payload)).?;
+    try t.expectEqual(@as(u32, 9), hdr.object); // configure(mode)
+    try t.expectEqual(@as(u32, 2), std.mem.readInt(u32, p.unit.payload[wire.header_size..][0..4], .little));
+    // client_side flips it back
+    b = wire.Builder.init(&buf, 9, 1);
+    b.putUint(1);
+    try req(&comp, try b.finish());
+    try t.expectEqual(@as(?bool, false), tv.ssd);
 }
 
 test "protocol violation produces wl_display.error and dead" {

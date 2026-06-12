@@ -392,6 +392,28 @@ pub const wp_fractional_scale_v1 = Interface{
     },
 };
 
+pub const zxdg_decoration_manager_v1 = Interface{
+    .name = "zxdg_decoration_manager_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "get_toplevel_decoration", .sig = "no", .new_id_iface = &zxdg_toplevel_decoration_v1 },
+    },
+};
+
+pub const zxdg_toplevel_decoration_v1 = Interface{
+    .name = "zxdg_toplevel_decoration_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "set_mode", .sig = "u" },
+        .{ .name = "unset_mode", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "configure", .sig = "u" },
+    },
+};
+
 // ─── xdg-shell ──────────────────────────────────────────────────
 
 pub const xdg_wm_base = Interface{
@@ -491,7 +513,8 @@ pub const all = [_]*const Interface{
     &wl_data_source, &wl_data_device, &wl_data_device_manager,
     &wp_cursor_shape_manager_v1,      &wp_cursor_shape_device_v1,
     &wp_viewporter,  &wp_viewport,    &wp_fractional_scale_manager_v1,
-    &wp_fractional_scale_v1,
+    &wp_fractional_scale_v1,            &zxdg_decoration_manager_v1,
+    &zxdg_toplevel_decoration_v1,
 };
 
 // ─── tests ──────────────────────────────────────────────────────
