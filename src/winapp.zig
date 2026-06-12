@@ -150,6 +150,9 @@ pub const WsHost = struct {
         _ = c.g_signal_connect_data(@ptrCast(click), "pressed", @ptrCast(&onPress), win, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(click), "released", @ptrCast(&onRelease), win, null, 0);
         c.gtk_widget_add_controller(picture, @ptrCast(click));
+        const scroll = c.gtk_event_controller_scroll_new(c.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+        _ = c.g_signal_connect_data(@ptrCast(scroll), "scroll", @ptrCast(&onScroll), win, null, 0);
+        c.gtk_widget_add_controller(picture, @ptrCast(scroll));
         const key = c.gtk_event_controller_key_new();
         _ = c.g_signal_connect_data(@ptrCast(key), "key-pressed", @ptrCast(&onKeyPress), win, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(key), "key-released", @ptrCast(&onKeyRelease), win, null, 0);
@@ -191,6 +194,22 @@ pub const WsHost = struct {
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(g));
         proto.appendInputPtr(&win.host.out, win.host.allocator, .{ .win = win.id, .kind = 2, .x = x, .y = y, .detail = btn }) catch return;
         win.host.flush();
+    }
+
+    fn onScroll(ctl: ?*c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const win = cast.userData(Win, user);
+        // Wheel events arrive as ±1 notches; touchpads report
+        // surface pixels — normalize to wheel-line-ish units so the
+        // agent can treat x/y as scroll lines.
+        var fx = dx;
+        var fy = dy;
+        if (c.gtk_event_controller_scroll_get_unit(ctl) == c.GDK_SCROLL_UNIT_SURFACE) {
+            fx /= 40.0;
+            fy /= 40.0;
+        }
+        proto.appendInputPtr(&win.host.out, win.host.allocator, .{ .win = win.id, .kind = 3, .x = fx, .y = fy, .detail = 0 }) catch return 1;
+        win.host.flush();
+        return 1;
     }
 
     fn onKeyPress(_: ?*c.GtkEventControllerKey, _: c_uint, keycode: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {

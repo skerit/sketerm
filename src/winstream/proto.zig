@@ -29,7 +29,10 @@ pub const Tag = enum(u8) {
     /// u32 win, u32 evdev key, u8 pressed, u32 mods (X11 order).
     input_key = 16,
     /// u32 win, u8 kind (0 move, 1 down, 2 up, 3 scroll),
-    /// f64 x, f64 y, u32 detail (button / scroll axis+sign).
+    /// f64 x, f64 y, u32 detail. Kinds 0-2: x/y are window-local
+    /// pixels, detail is the X11 button (1 left, 2 middle,
+    /// 3 right). Kind 3: x/y carry the scroll deltas in wheel
+    /// lines (positive = content down/right), detail unused.
     input_ptr = 17,
     /// u32 win — ask the app to close this window.
     close_req = 18,
