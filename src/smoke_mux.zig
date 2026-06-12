@@ -392,10 +392,10 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
 /// this end answering the protocol. Pass = a committed toplevel
 /// frame with plausible dimensions reaches the view. Skipped when
 /// weston-terminal isn't installed.
-fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) bool {
     if (c.access("/usr/bin/weston-terminal", c.X_OK) != 0) {
         std.debug.print("smoke-mux: real-app stage SKIPPED (no weston-terminal)\n", .{});
-        return;
+        return false;
     }
     const compositor_mod = @import("wlhost/compositor.zig");
 
@@ -414,6 +414,10 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
         .rows = @as(u16, 10),
         .cols = @as(u16, 60),
         .app = true,
+        // This stage asserts the NATIVE pipe: keep it pinned even
+        // on hosts where app sessions default to window streaming
+        // (macOS) or waypipe (SKETERM_MUX_WAYLAND).
+        .wl_mode = "native",
     }) catch fail("app-stage spawn");
     (conn.recvExpect(&.{.ok}) catch fail("app-stage spawn ok")).deinit(allocator);
     conn.sendJson(.attach, .{ .name = "wlapp" }) catch fail("app-stage attach");
@@ -533,6 +537,7 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
 
     // Tear the session down; the daemon must survive the app dying.
     conn.sendJson(.kill, .{ .name = "wlapp" }) catch fail("app-stage kill");
+    return true;
 }
 
 /// Window-stream pipeline (the macOS-apps-on-Linux transport) with
@@ -541,6 +546,14 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
 /// change (input round-trip).
 fn winstreamStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     const wsproto = @import("winstream/proto.zig");
+
+    // This stage asserts the STUB test pattern; on macOS builds
+    // with the ScreenCaptureKit backend, the winstream session
+    // would otherwise capture for real. Scoped to this stage —
+    // a process-wide value would steal the Wayland hub from the
+    // earlier app sessions (winstream excludes wayland).
+    _ = c.setenv("SKETERM_WINSTREAM", "stub", 1);
+    defer _ = c.unsetenv("SKETERM_WINSTREAM");
 
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("ws connect");
     defer conn.deinit();
@@ -636,7 +649,7 @@ fn winstreamStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
 /// The spawn→GUI-attach handover gap (`sketerm app` via the GUI):
 /// an app that connects to its display BEFORE any client attached
 /// must be parked, not refused — and bridged on the next attach.
-fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8, wl_id: usize) void {
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("pend connect");
     defer conn.deinit();
     const tv = c.struct_timeval{ .tv_sec = 15, .tv_usec = 0 };
@@ -651,11 +664,12 @@ fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     }) catch fail("pend spawn");
     (conn.recvExpect(&.{.ok}) catch fail("pend spawn ok")).deinit(allocator);
 
-    // App connects + speaks BEFORE anyone attached (sessions above:
-    // smoke=wl-1, wlapp=wl-2, wsapp=no hub → pend=wl-3).
+    // App connects + speaks BEFORE anyone attached. `wl_id` is the
+    // hub number this spawn got: smoke=wl-1, wlapp=wl-2 (only when
+    // the real-app stage ran), wsapp=no hub.
     const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/').?;
     var disp_buf: [128]u8 = undefined;
-    const disp = std.fmt.bufPrint(&disp_buf, "{s}/wl-3", .{sock_path[0..dir_end]}) catch unreachable;
+    const disp = std.fmt.bufPrint(&disp_buf, "{s}/wl-{d}", .{ sock_path[0..dir_end], wl_id }) catch unreachable;
     const app_fd = @import("util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
     var addr: c.struct_sockaddr_un = undefined;
     daemon_mod.fillSockaddrUn(&addr, disp) catch fail("pend sockaddr");
@@ -754,7 +768,11 @@ fn sendWithFd(sock: c_int, bytes: []const u8, fd: c_int) !void {
     mh.msg_iov = @ptrCast(&iov);
     mh.msg_iovlen = 1;
     mh.msg_control = &cbuf;
-    mh.msg_controllen = @intCast(hdr_size + 8); // CMSG_SPACE(4)
+    // CMSG_SPACE(sizeof(int)): cmsg alignment is 8 on Linux (16-byte
+    // header), 4 on Darwin (12-byte header, and XNU rejects a
+    // controllen that overshoots the aligned length).
+    const cmsg_align: usize = if (@import("builtin").os.tag == .macos) 4 else 8;
+    mh.msg_controllen = @intCast(std.mem.alignForward(usize, hdr_size + @sizeOf(c_int), cmsg_align));
     if (c.sendmsg(sock, &mh, 0) != @as(isize, @intCast(bytes.len))) return error.SendFailed;
 }
 
@@ -895,13 +913,13 @@ pub fn main() u8 {
     nativePipeStage(allocator, &conn, sock_path);
 
     // Native pipe with a REAL Wayland app + the compositor brain.
-    realAppStage(allocator, sock_path);
+    const wlapp_ran = realAppStage(allocator, sock_path);
 
     // Window-stream pipeline (stub capture source).
     winstreamStage(allocator, sock_path);
 
     // Apps that connect before a renderer attaches are parked.
-    pendingAppStage(allocator, sock_path);
+    pendingAppStage(allocator, sock_path, if (wlapp_ran) 3 else 2);
 
     // A second client sees the session in LIST.
     var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("connect2");
