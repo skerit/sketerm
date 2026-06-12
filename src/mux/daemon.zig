@@ -756,6 +756,12 @@ pub const Daemon = struct {
             cl.queueErr("no such session");
             return;
         };
+        if (s.exited) {
+            // The corpse only lingers until the next reap; attaching
+            // to it would wedge the client on a dead screen.
+            cl.queueErr("session has exited");
+            return;
+        }
         cl.attached = s;
         self.queueSnapshot(cl, s);
     }
@@ -944,8 +950,15 @@ pub const Daemon = struct {
         s.exited = true;
         var st: [4]u8 = undefined;
         std.mem.writeInt(i32, &st, s.exit_status, .little);
+        // Deliver the exit, then force-detach: nothing will ever flow
+        // on this session again, and a client that vanished without a
+        // clean goodbye (UDP peer roamed away for good) must not pin
+        // the dead session in the list forever.
         for (self.clients.items) |cl| {
-            if (cl.attached == s and !cl.dead) cl.queueFrame(.exit, &st);
+            if (cl.attached == s) {
+                if (!cl.dead) cl.queueFrame(.exit, &st);
+                cl.attached = null;
+            }
         }
     }
 
@@ -966,18 +979,17 @@ pub const Daemon = struct {
                 i += 1;
             }
         }
-        // Exited sessions with no attached clients are removed; an
-        // attached client keeps the dead session visible (its EXIT
-        // banner) until it detaches.
+        // Exited sessions are removed outright — sessionExited
+        // already detached every client (defensively re-checked here
+        // so a dangling cl.attached is impossible). Live sessions are
+        // NEVER reaped, attached or not: surviving client-less for
+        // days is the whole point of the daemon.
         i = 0;
-        outer: while (i < self.sessions.items.len) {
+        while (i < self.sessions.items.len) {
             const s = self.sessions.items[i];
             if (s.exited) {
                 for (self.clients.items) |cl| {
-                    if (cl.attached == s) {
-                        i += 1;
-                        continue :outer;
-                    }
+                    if (cl.attached == s) cl.attached = null;
                 }
                 _ = self.sessions.swapRemove(i);
                 s.deinit();
