@@ -27,6 +27,9 @@ pub const SpawnReq = struct {
     cwd: ?[]const u8 = null,
     rows: u16 = 24,
     cols: u16 = 80,
+    /// One-shot forwarded GUI app (`sketerm app -u`), not an
+    /// interactive shell — listed differently by clients.
+    app: bool = false,
 };
 
 pub const AttachReq = struct {
@@ -45,6 +48,7 @@ pub const SessionInfo = struct {
     clients: u32,
     exited: bool,
     title: []const u8 = "",
+    app: bool = false,
 };
 
 const Session = struct {
@@ -58,6 +62,8 @@ const Session = struct {
     seq: u64 = 0,
     exited: bool = false,
     exit_status: i32 = 0,
+    /// Spawned via `sketerm app -u` — a forwarded GUI app, not a shell.
+    app: bool = false,
     /// Wayland app forwarding: the session's shell runs wrapped in a
     /// `waypipe server` that provides $WAYLAND_DISPLAY; each app
     /// connection waypipe makes lands on this hub socket and is
@@ -726,6 +732,7 @@ pub const Daemon = struct {
             .parser = Parser.init(allocator),
             .pool = pool,
             .screen = screen,
+            .app = req.app,
         };
         if (hub) |h| {
             s.wl_hub_fd = h.fd;
@@ -790,6 +797,7 @@ pub const Daemon = struct {
                 .clients = n_clients,
                 .exited = s.exited,
                 .title = if (s.screen.last_title) |t| t else "",
+                .app = s.app,
             }) catch return;
         }
         cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .sessions = infos.items });

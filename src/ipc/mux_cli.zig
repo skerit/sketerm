@@ -53,6 +53,7 @@ const SessionInfo = struct {
     clients: u32 = 0,
     exited: bool = false,
     title: []const u8 = "",
+    app: bool = false,
 };
 
 const Welcome = struct {
@@ -98,9 +99,10 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
         defer sessions.deinit();
         for (sessions.value.sessions) |s| {
             _ = c.printf(
-                "%-24.*s %ux%u  %u client(s)%s  %.*s\n",
+                "%-24.*s %-5s %ux%u  %u client(s)%s  %.*s\n",
                 @as(c_int, @intCast(s.name.len)),
                 s.name.ptr,
+                @as([*:0]const u8, if (s.app) "app" else "shell"),
                 @as(c_uint, s.cols),
                 @as(c_uint, s.rows),
                 @as(c_uint, s.clients),
@@ -568,10 +570,11 @@ fn drawTui(sessions: []const SessionInfo, selected: usize, drawn_lines: *usize) 
     for (sessions, 0..) |s, i| {
         const marker: [*:0]const u8 = if (i == selected) "\x1b[7m \xe2\x96\xb8 " else "   ";
         _ = c.printf(
-            "%s%-24.*s %3ux%-3u %u client(s)%s  \x1b[2m%.*s\x1b[0m\x1b[27m\r\n",
+            "%s%-24.*s %s%3ux%-3u %u client(s)%s  \x1b[2m%.*s\x1b[0m\x1b[27m\r\n",
             marker,
             @as(c_int, @intCast(s.name.len)),
             s.name.ptr,
+            @as([*:0]const u8, if (s.app) "\x1b[35m[gui app]\x1b[39m " else ""),
             @as(c_uint, s.cols),
             @as(c_uint, s.rows),
             @as(c_uint, s.clients),
