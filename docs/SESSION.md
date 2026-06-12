@@ -5272,3 +5272,29 @@ Remote apps are now interactive over the native pipe:
   compression, popups, clipboard.
 - 537 tests, smoke-mux, smoke-e2e, mux-portable, aarch64-macos
   cross all PASS.
+
+## 2026-06-12: native app pipe milestone 5 — resize, damage, deflate, popups
+
+- Resize: GTK default-size notify → configureToplevel → xdg
+  configure pair → app redraws at the new size (verified live:
+  806x539 → 1100x700, client allocated the new buffer, crisp).
+  Feedback guards stop configure echo loops.
+- Damage: tracker folds damage/damage_buffer into per-surface row
+  ranges; daemon copies only damaged rows per commit. Clients that
+  never declare damage get full copies; ack-only commits copy
+  nothing. Typing echo now ships a few rows, not 1.7 MB.
+- Compression: pool chunks >=1KB go as raw-deflate pool_update_z
+  units when smaller (std.compress.flate — pure Zig, daemon stays
+  libc-only). Receivers accept both forms; corrupt streams and
+  length lies are protocol errors.
+- Popups: positioner place() (anchor/gravity/offset), popup
+  configure dance, grab → click-outside popup_done, keyboard
+  follows the grab. GUI renders popups as GtkOverlay children of
+  the parent window (GTK4 has no positioned toplevels; menus clip
+  at the window edge like nested compositors). Unit-tested; no
+  popup-capable demo app installed for a live check — revisit with
+  a GTK client once the data-device milestone lands.
+- Remaining: clipboard (wl_data_device_manager, text scope),
+  per-app window icons/WM_CLASS, retire-waypipe flag flip.
+- 540 tests, smoke-mux, smoke-e2e, mux-portable, aarch64-macos
+  cross, live input regression all PASS.
