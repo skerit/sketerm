@@ -47,12 +47,17 @@ pub const View = struct {
     ctx: ?*anyopaque = null,
     /// A surface gained the toplevel role.
     toplevel_new: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
-    /// New committed content. `pixels` is tightly packed w*4 rows
-    /// (stride already applied), wl_shm format (0 argb, 1 xrgb).
+    /// New committed content for a MAPPED surface (toplevel or
+    /// popup). `pixels` is tightly packed w*4 rows (stride already
+    /// applied), wl_shm format (0 argb, 1 xrgb).
     toplevel_frame: ?*const fn (ctx: ?*anyopaque, surface: u32, w: i32, h: i32, format: u32, pixels: []const u8) void = null,
     toplevel_title: ?*const fn (ctx: ?*anyopaque, surface: u32, title: []const u8) void = null,
     /// Toplevel destroyed (or its surface) — drop the window.
     toplevel_gone: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
+    /// A surface gained the popup role: render it at (x, y) in the
+    /// PARENT surface's coordinate space.
+    popup_new: ?*const fn (ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void = null,
+    popup_gone: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
 };
 
 const Global = struct {
@@ -93,10 +98,63 @@ const Surface = struct {
     committed_buffer: u32 = 0,
     xdg_surface: u32 = 0,
     toplevel: u32 = 0,
+    /// xdg_popup id when this surface is a popup.
+    popup: u32 = 0,
+    /// Popup placement (parent surface coords) from the positioner.
+    parent: u32 = 0,
+    px: i32 = 0,
+    py: i32 = 0,
+    pw: i32 = 0,
+    ph: i32 = 0,
     /// wl_callback ids awaiting frame done.
     frame_cbs: std.ArrayList(u32) = .empty,
     /// Initial configure sent (xdg dance).
     configured: bool = false,
+};
+
+/// xdg_positioner state — just enough geometry to place menus.
+const Positioner = struct {
+    w: i32 = 0,
+    h: i32 = 0,
+    ax: i32 = 0,
+    ay: i32 = 0,
+    aw: i32 = 0,
+    ah: i32 = 0,
+    anchor: u32 = 0,
+    gravity: u32 = 0,
+    ox: i32 = 0,
+    oy: i32 = 0,
+
+    /// Popup top-left in parent coords: anchor point on the anchor
+    /// rect, extended along the gravity. Constraint adjustment is
+    /// ignored in v1 (popups clip at the host window edge anyway).
+    fn place(p: *const Positioner) [2]i32 {
+        // anchor enum: 1 top, 2 bottom, 3 left, 4 right, 5 tl,
+        // 6 bl, 7 tr, 8 br (0 = center)
+        var x: i32 = p.ax + @divTrunc(p.aw, 2);
+        var y: i32 = p.ay + @divTrunc(p.ah, 2);
+        switch (p.anchor) {
+            3, 5, 6 => x = p.ax,
+            4, 7, 8 => x = p.ax + p.aw,
+            else => {},
+        }
+        switch (p.anchor) {
+            1, 5, 7 => y = p.ay,
+            2, 6, 8 => y = p.ay + p.ah,
+            else => {},
+        }
+        switch (p.gravity) {
+            3, 5, 6 => x -= p.w, // gravity left: extends leftwards
+            4, 7, 8 => {},
+            else => x -= @divTrunc(p.w, 2),
+        }
+        switch (p.gravity) {
+            1, 5, 7 => y -= p.h,
+            2, 6, 8 => {},
+            else => y -= @divTrunc(p.h, 2),
+        }
+        return .{ x + p.ox, y + p.oy };
+    }
 };
 
 pub const Compositor = struct {
@@ -112,6 +170,9 @@ pub const Compositor = struct {
     surfaces: std.AutoHashMapUnmanaged(u32, Surface) = .empty,
     /// xdg_surface id → wl_surface id; xdg_toplevel id → wl_surface id.
     xdg_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    positioners: std.AutoHashMapUnmanaged(u32, Positioner) = .empty,
+    /// Surface id of the popup holding an explicit grab (0 = none).
+    grabbed_popup: u32 = 0,
     /// Bound input devices (a client may bind several of each).
     pointers: std.ArrayList(u32) = .empty,
     keyboards: std.ArrayList(u32) = .empty,
@@ -146,6 +207,7 @@ pub const Compositor = struct {
         while (sit.next()) |s| s.frame_cbs.deinit(a);
         self.surfaces.deinit(a);
         self.xdg_map.deinit(a);
+        self.positioners.deinit(a);
         self.pointers.deinit(a);
         self.keyboards.deinit(a);
         self.frame_scratch.deinit(a);
@@ -301,6 +363,23 @@ pub const Compositor = struct {
             b.putUint(group);
             try self.send(try b.finish());
         }
+    }
+
+    /// View → client: a click landed outside a grabbed popup —
+    /// tell the app to dismiss it (xdg_popup.popup_done). No-op
+    /// when nothing is grabbed.
+    pub fn dismissPopups(self: *Compositor) Error!void {
+        if (self.grabbed_popup == 0) return;
+        const surf = self.surfaces.getPtr(self.grabbed_popup) orelse {
+            self.grabbed_popup = 0;
+            return;
+        };
+        if (surf.popup != 0) {
+            var buf: [8]u8 = undefined;
+            var b = wire.Builder.init(&buf, surf.popup, 1); // popup_done
+            try self.send(try b.finish());
+        }
+        self.grabbed_popup = 0;
     }
 
     /// View → client: the host window was resized — tell the app to
@@ -548,8 +627,56 @@ pub const Compositor = struct {
             3 => {}, // pong
             else => return Error.Protocol,
         } else if (iface == &protocol.xdg_positioner) {
-            // destroy/set_* — geometry unused until popups exist
-            if (hdr.opcode == 0) try self.destroyObject(hdr.object);
+            const pos = blk: {
+                const slot = try self.positioners.getOrPut(self.allocator, hdr.object);
+                if (!slot.found_existing) slot.value_ptr.* = .{};
+                break :blk slot.value_ptr;
+            };
+            switch (hdr.opcode) {
+                0 => { // destroy
+                    _ = self.positioners.remove(hdr.object);
+                    try self.destroyObject(hdr.object);
+                },
+                1 => { // set_size
+                    pos.w = (try it.next()).?.int;
+                    pos.h = (try it.next()).?.int;
+                },
+                2 => { // set_anchor_rect
+                    pos.ax = (try it.next()).?.int;
+                    pos.ay = (try it.next()).?.int;
+                    pos.aw = (try it.next()).?.int;
+                    pos.ah = (try it.next()).?.int;
+                },
+                3 => pos.anchor = (try it.next()).?.uint,
+                4 => pos.gravity = (try it.next()).?.uint,
+                6 => { // set_offset
+                    pos.ox = (try it.next()).?.int;
+                    pos.oy = (try it.next()).?.int;
+                },
+                // constraint_adjustment / reactive / parent_size /
+                // parent_configure: accepted, unused in v1.
+                5, 7, 8, 9 => {},
+                else => return Error.Protocol,
+            }
+        } else if (iface == &protocol.xdg_popup) {
+            const sid = self.xdg_map.get(hdr.object) orelse return Error.Protocol;
+            switch (hdr.opcode) {
+                0 => { // destroy
+                    if (self.grabbed_popup == sid) self.grabbed_popup = 0;
+                    if (self.surfaces.getPtr(sid)) |surf| {
+                        surf.popup = 0;
+                        surf.configured = false;
+                    }
+                    if (self.view.popup_gone) |cb| cb(self.view.ctx, sid);
+                    _ = self.xdg_map.remove(hdr.object);
+                    try self.destroyObject(hdr.object);
+                },
+                1 => { // grab(seat, serial)
+                    self.grabbed_popup = sid;
+                },
+                2 => {}, // reposition — v1 keeps the original spot
+                else => return Error.Protocol,
+            }
         } else if (iface == &protocol.xdg_surface) {
             try self.xdgSurfaceRequest(hdr, &it);
         } else if (iface == &protocol.xdg_toplevel) {
@@ -564,6 +691,10 @@ pub const Compositor = struct {
         switch (hdr.opcode) {
             0 => { // destroy
                 if (surf.toplevel != 0) self.notifyGone(hdr.object);
+                if (surf.popup != 0) {
+                    if (self.grabbed_popup == hdr.object) self.grabbed_popup = 0;
+                    if (self.view.popup_gone) |cb| cb(self.view.ctx, hdr.object);
+                }
                 if (self.pointer_focus == hdr.object) self.pointer_focus = 0;
                 if (self.keyboard_focus == hdr.object) self.keyboard_focus = 0;
                 surf.frame_cbs.deinit(self.allocator);
@@ -606,7 +737,26 @@ pub const Compositor = struct {
                 surf.toplevel = id;
                 if (self.view.toplevel_new) |cb| cb(self.view.ctx, sid);
             },
-            2 => return Error.Protocol, // get_popup — v1 refuses
+            2 => { // get_popup(id, parent, positioner)
+                const id = (try it.next()).?.new_id;
+                const parent_xdg = (try it.next()).?.object;
+                const pos_id = (try it.next()).?.object;
+                if (parent_xdg == 0) return Error.Protocol; // v1: explicit parent only
+                const parent_sid = self.xdg_map.get(parent_xdg) orelse return Error.Protocol;
+                const pos = self.positioners.get(pos_id) orelse return Error.Protocol;
+                const surf = self.surfaces.getPtr(sid) orelse return Error.Protocol;
+                if (surf.toplevel != 0 or surf.popup != 0) return Error.Protocol;
+                try self.register(id, &protocol.xdg_popup);
+                try self.xdg_map.put(self.allocator, id, sid);
+                const at = pos.place();
+                surf.popup = id;
+                surf.parent = parent_sid;
+                surf.px = at[0];
+                surf.py = at[1];
+                surf.pw = pos.w;
+                surf.ph = pos.h;
+                if (self.view.popup_new) |cb| cb(self.view.ctx, sid, parent_sid, at[0], at[1]);
+            },
             3 => {}, // set_window_geometry — buffer size rules v1
             4 => {}, // ack_configure
             else => return Error.Protocol,
@@ -655,6 +805,14 @@ pub const Compositor = struct {
                 std.mem.writeInt(u32, &states, 4, .little); // activated
                 b.putArray(&states);
                 try self.send(try b.finish());
+            } else if (surf.popup != 0) {
+                var buf: [32]u8 = undefined;
+                var b = wire.Builder.init(&buf, surf.popup, 0); // configure
+                b.putInt(surf.px);
+                b.putInt(surf.py);
+                b.putInt(surf.pw);
+                b.putInt(surf.ph);
+                try self.send(try b.finish());
             }
             var buf2: [16]u8 = undefined;
             var b2 = wire.Builder.init(&buf2, surf.xdg_surface, 0); // configure
@@ -664,10 +822,11 @@ pub const Compositor = struct {
 
         if (surf.committed_buffer != 0) {
             if (self.buffers.get(surf.committed_buffer)) |info| {
-                // Only toplevels reach the view — cursor surfaces
-                // (set_cursor, no xdg role) commit buffers too and
-                // must NOT become windows.
-                if (surf.toplevel != 0) try self.pushFrame(sid, info);
+                // Only mapped surfaces (toplevel/popup role) reach
+                // the view — cursor surfaces (set_cursor, no xdg
+                // role) commit buffers too and must NOT become
+                // windows.
+                if (surf.toplevel != 0 or surf.popup != 0) try self.pushFrame(sid, info);
                 // Released immediately: pixels were copied out (or
                 // ignored — either way we won't read them later).
                 var buf: [8]u8 = undefined;
@@ -817,6 +976,11 @@ const TestView = struct {
     title_buf: [64]u8 = undefined,
     title_len: usize = 0,
     gone: usize = 0,
+    popups: usize = 0,
+    popups_gone: usize = 0,
+    popup_x: i32 = 0,
+    popup_y: i32 = 0,
+    popup_parent: u32 = 0,
 
     fn onNew(ctx: ?*anyopaque, surface: u32) void {
         _ = surface;
@@ -845,6 +1009,20 @@ const TestView = struct {
         self.gone += 1;
     }
 
+    fn onPopupNew(ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void {
+        _ = surface;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.popups += 1;
+        self.popup_x = x;
+        self.popup_y = y;
+        self.popup_parent = parent;
+    }
+    fn onPopupGone(ctx: ?*anyopaque, surface: u32) void {
+        _ = surface;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.popups_gone += 1;
+    }
+
     fn view(self: *TestView) View {
         return .{
             .ctx = self,
@@ -852,6 +1030,8 @@ const TestView = struct {
             .toplevel_frame = onFrame,
             .toplevel_title = onTitle,
             .toplevel_gone = onGone,
+            .popup_new = onPopupNew,
+            .popup_gone = onPopupGone,
         };
     }
 };
@@ -1129,6 +1309,128 @@ test "seat: devices bind, keymap unit emitted, input events flow" {
     try comp.pointerMotion(1, 1);
     try comp.keyboardKey(38, false);
     try t.expectEqual(@as(usize, 0), comp.takeOut().len);
+}
+
+test "popup lifecycle: positioner place, configure, frame, grab dismiss" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    // registry(2), compositor(3), shm(4), wm_base(5); toplevel
+    // surface 6 with xdg 7 + toplevel 8, committed once.
+    {
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 2, 0);
+        b1.putUint(1);
+        b1.putString("wl_compositor");
+        b1.putUint(4);
+        b1.putNewId(3);
+        try req(&comp, try b1.finish());
+        var b2 = wire.Builder.init(&buf, 2, 0);
+        b2.putUint(2);
+        b2.putString("wl_shm");
+        b2.putUint(1);
+        b2.putNewId(4);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 2, 0);
+        b3.putUint(5);
+        b3.putString("xdg_wm_base");
+        b3.putUint(2);
+        b3.putNewId(5);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 3, 0);
+        b4.putNewId(6);
+        try req(&comp, try b4.finish());
+        var b5 = wire.Builder.init(&buf, 5, 2);
+        b5.putNewId(7);
+        b5.putObject(6);
+        try req(&comp, try b5.finish());
+        var b6 = wire.Builder.init(&buf, 7, 1);
+        b6.putNewId(8);
+        try req(&comp, try b6.finish());
+        var b7 = wire.Builder.init(&buf, 6, 6); // commit
+        try req(&comp, try b7.finish());
+    }
+
+    // Positioner 9: 100x200 menu anchored bottom-left of a rect at
+    // (10, 20, 30, 40), gravity bottom-right → lands at (10, 60).
+    {
+        var b = wire.Builder.init(&buf, 5, 1); // create_positioner
+        b.putNewId(9);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 9, 1); // set_size
+        b1.putInt(100);
+        b1.putInt(200);
+        try req(&comp, try b1.finish());
+        var b2 = wire.Builder.init(&buf, 9, 2); // set_anchor_rect
+        b2.putInt(10);
+        b2.putInt(20);
+        b2.putInt(30);
+        b2.putInt(40);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 9, 3); // anchor bottom_left
+        b3.putUint(6);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 9, 4); // gravity bottom_right
+        b4.putUint(8);
+        try req(&comp, try b4.finish());
+    }
+
+    // Popup: surface 10, xdg 11, popup 12, grab, commit.
+    var popup_seen_at: [2]i32 = .{ -1, -1 };
+    _ = &popup_seen_at;
+    {
+        var b = wire.Builder.init(&buf, 3, 0); // create_surface(10)
+        b.putNewId(10);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 5, 2); // get_xdg_surface(11, 10)
+        b1.putNewId(11);
+        b1.putObject(10);
+        try req(&comp, try b1.finish());
+        var b2 = wire.Builder.init(&buf, 11, 2); // get_popup(12, 7, 9)
+        b2.putNewId(12);
+        b2.putObject(7);
+        b2.putObject(9);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 12, 1); // grab(seat=0, serial)
+        b3.putObject(0);
+        b3.putUint(1);
+        try req(&comp, try b3.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.popups);
+    try t.expectEqual(@as(i32, 10), tv.popup_x);
+    try t.expectEqual(@as(i32, 60), tv.popup_y);
+    try t.expectEqual(@as(u32, 6), tv.popup_parent);
+
+    // First popup commit → xdg_popup.configure(10,60,100,200).
+    comp.clearOut();
+    {
+        var b = wire.Builder.init(&buf, 10, 6);
+        try req(&comp, try b.finish());
+    }
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    try t.expectEqual([2]u32{ 12, 0 }, evs.items[0]); // popup configure
+    try t.expectEqual([2]u32{ 11, 0 }, evs.items[1]); // xdg configure
+
+    // Click-outside dismiss → popup_done on the grabbed popup.
+    comp.clearOut();
+    try comp.dismissPopups();
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    try t.expectEqual([2]u32{ 12, 1 }, evs.items[0]); // popup_done
+    try t.expectEqual(@as(u32, 0), comp.grabbed_popup);
+
+    // Destroy → popup_gone.
+    {
+        var b = wire.Builder.init(&buf, 12, 0);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.popups_gone);
 }
 
 test "set_cursor is not a destructor; cursor surfaces never reach the view" {

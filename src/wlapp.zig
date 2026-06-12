@@ -6,9 +6,9 @@
 //! the v1 full-copy pipeline. terminal.zig pumps chan_data payloads
 //! in via feed() and ships flush()'d bytes back to the daemon.
 //!
-//! No input yet (the compositor advertises a capability-less seat);
-//! the window close button sends xdg_toplevel.close, which is the
-//! one liberty a render-only view can take.
+//! Input flows back through the compositor's seat (keyboard +
+//! pointer); popups render as overlay children inside the parent
+//! window; the close button sends xdg_toplevel.close.
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -19,6 +19,10 @@ pub const AppHost = struct {
     allocator: std.mem.Allocator,
     comp: Compositor,
     windows: std.AutoHashMapUnmanaged(u32, *Win) = .empty,
+    /// Popup surfaces, rendered as overlay children of the parent
+    /// window (GTK4 has no positioned toplevels — menus clip at the
+    /// window edge, same as nested compositors).
+    popups: std.AutoHashMapUnmanaged(u32, *Popup) = .empty,
     /// Channel is gone — feed() refuses, windows show stale frames
     /// until the user closes them.
     dead: bool = false,
@@ -27,10 +31,20 @@ pub const AppHost = struct {
     on_flush: ?*const fn (ctx: ?*anyopaque) void = null,
     flush_ctx: ?*anyopaque = null,
 
+    const Popup = struct {
+        host: *AppHost,
+        surface: u32,
+        /// Window hosting the overlay this popup renders into.
+        win: *Win,
+        picture: *c.GtkWidget,
+    };
+
     const Win = struct {
         host: *AppHost,
         surface: u32,
         window: *c.GtkWindow,
+        /// GtkOverlay between window and picture — popups land here.
+        overlay: *c.GtkWidget,
         picture: *c.GtkWidget,
         /// Committed buffer size — the surface coordinate space.
         buf_w: i32 = 0,
@@ -72,6 +86,8 @@ pub const AppHost = struct {
             .toplevel_frame = onFrame,
             .toplevel_title = onTitle,
             .toplevel_gone = onGone,
+            .popup_new = onPopupNew,
+            .popup_gone = onPopupGone,
         });
         return self;
     }
@@ -85,6 +101,9 @@ pub const AppHost = struct {
             self.allocator.destroy(w.*);
         }
         self.windows.deinit(self.allocator);
+        var pit = self.popups.valueIterator();
+        while (pit.next()) |p| self.allocator.destroy(p.*);
+        self.popups.deinit(self.allocator);
         self.comp.deinit();
         self.allocator.destroy(self);
     }
@@ -109,22 +128,114 @@ pub const AppHost = struct {
 
     // ── view callbacks (main thread — GTK is safe) ──────────────
 
-    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, format: u32, pixels: []const u8) void {
-        const self = cast.userData(AppHost, ctx);
-        const win = self.winFor(surface, w, h) orelse return;
-        win.buf_w = w;
-        win.buf_h = h;
+    fn newTexture(w: i32, h: i32, format: u32, pixels: []const u8) ?*c.GdkTexture {
         // wl_shm: 0 = argb8888 (premultiplied), 1 = xrgb8888 — both
         // little-endian BGRA in memory.
         const gdk_format: c.GdkMemoryFormat = if (format == 1)
             c.GDK_MEMORY_B8G8R8X8
         else
             c.GDK_MEMORY_B8G8R8A8_PREMULTIPLIED;
-        const gbytes = c.g_bytes_new(pixels.ptr, pixels.len) orelse return;
+        const gbytes = c.g_bytes_new(pixels.ptr, pixels.len) orelse return null;
         defer c.g_bytes_unref(gbytes);
-        const tex = c.gdk_memory_texture_new(w, h, gdk_format, gbytes, @intCast(w * 4)) orelse return;
+        return c.gdk_memory_texture_new(w, h, gdk_format, gbytes, @intCast(w * 4));
+    }
+
+    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, format: u32, pixels: []const u8) void {
+        const self = cast.userData(AppHost, ctx);
+        if (self.popups.get(surface)) |popup| {
+            const tex = newTexture(w, h, format, pixels) orelse return;
+            defer c.g_object_unref(tex);
+            c.gtk_widget_set_size_request(popup.picture, w, h);
+            c.gtk_picture_set_paintable(@ptrCast(popup.picture), @ptrCast(tex));
+            return;
+        }
+        const win = self.winFor(surface, w, h) orelse return;
+        win.buf_w = w;
+        win.buf_h = h;
+        const tex = newTexture(w, h, format, pixels) orelse return;
         defer c.g_object_unref(tex);
         c.gtk_picture_set_paintable(@ptrCast(win.picture), @ptrCast(tex));
+    }
+
+    /// A popup landed: hang its picture in the parent window's
+    /// overlay at (x, y) — parent may itself be a popup (nested
+    /// menus), in which case offsets accumulate.
+    fn onPopupNew(ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void {
+        const self = cast.userData(AppHost, ctx);
+        var px = x;
+        var py = y;
+        var win: *Win = undefined;
+        if (self.windows.get(parent)) |w| {
+            win = w;
+        } else if (self.popups.get(parent)) |pp| {
+            win = pp.win;
+            px += c.gtk_widget_get_margin_start(pp.picture);
+            py += c.gtk_widget_get_margin_top(pp.picture);
+        } else return;
+
+        const popup = self.allocator.create(Popup) catch return;
+        const picture = c.gtk_picture_new();
+        c.gtk_picture_set_content_fit(@ptrCast(picture), c.GTK_CONTENT_FIT_FILL);
+        c.gtk_widget_set_halign(picture, c.GTK_ALIGN_START);
+        c.gtk_widget_set_valign(picture, c.GTK_ALIGN_START);
+        c.gtk_widget_set_margin_start(picture, @max(0, px));
+        c.gtk_widget_set_margin_top(picture, @max(0, py));
+        popup.* = .{ .host = self, .surface = surface, .win = win, .picture = picture.? };
+        self.popups.put(self.allocator, surface, popup) catch {
+            self.allocator.destroy(popup);
+            return;
+        };
+        c.gtk_overlay_add_overlay(@ptrCast(win.overlay), picture);
+
+        const motion = c.gtk_event_controller_motion_new();
+        _ = c.g_signal_connect_data(@ptrCast(motion), "enter", @ptrCast(&onPopupPtrEnter), popup, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(motion), "motion", @ptrCast(&onPopupPtrMotion), popup, null, 0);
+        c.gtk_widget_add_controller(picture, motion);
+        const click = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(click), 0);
+        _ = c.g_signal_connect_data(@ptrCast(click), "pressed", @ptrCast(&onPopupBtnPress), popup, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(click), "released", @ptrCast(&onPopupBtnRelease), popup, null, 0);
+        c.gtk_widget_add_controller(picture, @ptrCast(click));
+    }
+
+    fn onPopupGone(ctx: ?*anyopaque, surface: u32) void {
+        const self = cast.userData(AppHost, ctx);
+        const popup = self.popups.get(surface) orelse return;
+        _ = self.popups.remove(surface);
+        c.gtk_overlay_remove_overlay(@ptrCast(popup.win.overlay), popup.picture);
+        self.allocator.destroy(popup);
+    }
+
+    fn onPopupPtrEnter(_: ?*c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+        const popup = cast.userData(Popup, user);
+        popup.host.stampNow();
+        popup.host.comp.pointerEnter(popup.surface, x, y) catch return;
+        popup.host.flushHost();
+    }
+
+    fn onPopupPtrMotion(_: ?*c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+        const popup = cast.userData(Popup, user);
+        popup.host.stampNow();
+        popup.host.comp.pointerEnter(popup.surface, x, y) catch return;
+        popup.host.comp.pointerMotion(x, y) catch return;
+        popup.host.flushHost();
+    }
+
+    fn onPopupBtnPress(gesture: ?*c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+        const popup = cast.userData(Popup, user);
+        popup.host.stampNow();
+        popup.host.comp.pointerEnter(popup.surface, x, y) catch return;
+        const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
+        popup.host.comp.pointerButton(evdevButton(btn), true) catch return;
+        popup.host.flushHost();
+    }
+
+    fn onPopupBtnRelease(gesture: ?*c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+        const popup = cast.userData(Popup, user);
+        popup.host.stampNow();
+        const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
+        popup.host.comp.pointerButton(evdevButton(btn), false) catch return;
+        popup.host.flushHost();
     }
 
     fn onTitle(ctx: ?*anyopaque, surface: u32, title: []const u8) void {
@@ -154,9 +265,11 @@ pub const AppHost = struct {
         const picture = c.gtk_picture_new();
         c.gtk_window_set_title(window, "remote app");
         c.gtk_window_set_default_size(window, w, h);
-        c.gtk_window_set_child(window, picture);
+        const overlay = c.gtk_overlay_new();
+        c.gtk_overlay_set_child(@ptrCast(overlay), picture);
+        c.gtk_window_set_child(window, overlay);
         c.gtk_picture_set_content_fit(@ptrCast(picture), c.GTK_CONTENT_FIT_FILL);
-        win.* = .{ .host = self, .surface = surface, .window = window, .picture = picture.? };
+        win.* = .{ .host = self, .surface = surface, .window = window, .overlay = overlay.?, .picture = picture.? };
         self.windows.put(self.allocator, surface, win) catch {
             c.gtk_window_destroy(window);
             self.allocator.destroy(win);
@@ -249,6 +362,8 @@ pub const AppHost = struct {
     fn onBtnPress(gesture: ?*c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
         win.host.stampNow();
+        // A click on the main surface while a menu is up dismisses it.
+        win.host.comp.dismissPopups() catch {};
         const p = win.mapXY(x, y);
         win.host.comp.pointerEnter(win.surface, p[0], p[1]) catch return;
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
@@ -277,7 +392,8 @@ pub const AppHost = struct {
 
     fn sendKey(win: *Win, keycode: c_uint, state: c.GdkModifierType, pressed: bool) void {
         win.host.stampNow();
-        win.host.comp.keyboardEnter(win.surface) catch return;
+        const target = if (win.host.comp.grabbed_popup != 0) win.host.comp.grabbed_popup else win.surface;
+        win.host.comp.keyboardEnter(target) catch return;
         // GDK's low modifier bits are the X11/xkb mod order the
         // pc105/us keymap uses (shift, lock, ctrl, mod1…).
         win.host.comp.keyboardModifiers(@as(u32, @intCast(state)) & 0xff, 0, 0, 0) catch return;
