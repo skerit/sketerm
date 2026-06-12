@@ -72,9 +72,9 @@ pub const Layout = struct {
 /// macOS: query a process's vnode paths (cwd + root) via libproc.
 /// Layout of struct proc_vnodepathinfo: two vnode_info_path entries,
 /// each { struct vnode_info (152 bytes), char vip_path[MAXPATHLEN] }
-/// — pvi_cdir.vip_path therefore sits at offset 152. UNVERIFIED on
-/// real hardware; sizes match Apple's libproc.h and the layouts the
-/// rust-libproc/gopsutil ports ship.
+/// — pvi_cdir.vip_path therefore sits at offset 152. VERIFIED on
+/// hardware (arm64, macOS 26.4 SDK): sizeof(vnode_info)=152,
+/// offsetof(vip_path)=152, flavor 9, live call matches getcwd().
 extern fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
 
 /// Working directory of a live process. Linux: /proc/<pid>/cwd
