@@ -237,7 +237,9 @@ static bool pid_in_session(SketermSckCtx *c, pid_t pid) {
 
 // ── window refresh ──────────────────────────────────────────────
 
-static void start_stream(SketermSckCtx *c, SketermSckWin *sw, SCWindow *scw) {
+// BGRA, point-resolution, ~30fps, cursor excluded — the stream
+// settings every window uses, sized to the window's current frame.
+static SCStreamConfiguration *stream_config(SCWindow *scw) {
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
     cfg.width = (size_t)MAX(scw.frame.size.width, 32.0);
     cfg.height = (size_t)MAX(scw.frame.size.height, 32.0);
@@ -245,6 +247,11 @@ static void start_stream(SketermSckCtx *c, SketermSckWin *sw, SCWindow *scw) {
     cfg.minimumFrameInterval = CMTimeMake(1, 30);
     cfg.showsCursor = NO;
     cfg.queueDepth = 3;
+    return cfg;
+}
+
+static void start_stream(SketermSckCtx *c, SketermSckWin *sw, SCWindow *scw) {
+    SCStreamConfiguration *cfg = stream_config(scw);
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:scw];
     SketermSckOut *out = [SketermSckOut new];
     out->ctx = c;
@@ -304,14 +311,7 @@ static void apply_content(SketermSckCtx *c, SCShareableContent *content) {
                 [c->pending addObject:@{ @"kind" : @2, @"win" : key, @"title" : title }];
             }
             if (resized && sw->stream) {
-                SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
-                cfg.width = (size_t)MAX(scw.frame.size.width, 32.0);
-                cfg.height = (size_t)MAX(scw.frame.size.height, 32.0);
-                cfg.pixelFormat = kCVPixelFormatType_32BGRA;
-                cfg.minimumFrameInterval = CMTimeMake(1, 30);
-                cfg.showsCursor = NO;
-                cfg.queueDepth = 3;
-                [sw->stream updateConfiguration:cfg completionHandler:^(NSError *e){ (void)e; }];
+                [sw->stream updateConfiguration:stream_config(scw) completionHandler:^(NSError *e){ (void)e; }];
             }
         }
     }
