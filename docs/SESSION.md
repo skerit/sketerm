@@ -5168,3 +5168,41 @@ Tests 454 → 466.
   inherit $SKETERM_SOCKET — `sketerm mux attach` then talks to the
   REAL GUI, not the test instance (env -u SKETERM_SOCKET).
 - 508 tests, smoke-mux, smoke-e2e, mux-portable all PASS.
+
+## 2026-06-12: native app pipe, milestones 1+2 — wlhost core + daemon endpoint
+
+The sketerm-native replacement for waypipe (decision + plan in
+docs/proposal-macos-remote-apps.md), built on the Linux machine:
+
+- `src/wlhost/` — GTK-free, libc-free protocol core, shared by the
+  daemon and the future GUI compositor brain:
+  - `wire.zig`: Wayland wire codec (header/args/builder, fds are
+    out-of-band placeholders). Round-trip + malformed-input tests.
+  - `protocol.zig`: hand-written interface tables, core wayland +
+    xdg-shell, v1 scope (shm only, no dmabuf/data-device). Cross-
+    checked mechanically against wayland.xml 1.25 + xdg-shell
+    stable — pinned at wl_compositor/wl_surface v6 (v7's
+    release/get_release excluded by version, opcodes unaffected).
+  - `track.zig`: per-connection state machine — object id →
+    interface, registry binds, shm pool/buffer lifecycle,
+    attach→commit with resolved buffer geometry in the action.
+  - `pipe.zig`: the chan_data sub-protocol (tag+len units: verbatim
+    wl messages, pool side-band, chunked pool updates for buffers
+    bigger than MAX_FRAME). ChannelKind.wayland_native = 2.
+- Daemon endpoint (`SKETERM_MUX_NATIVE_WAYLAND=1`, waypipe stays
+  the default until the GUI side exists): the daemon listens on the
+  session's $WAYLAND_DISPLAY socket itself (no waypipe wrap; pty
+  gained a wayland_display spawn opt), recvmsg + hand-rolled CMSG
+  walk for SCM_RIGHTS (macros don't translate), mmap pool mirrors,
+  full-buffer copy per commit. GUI→app units flow back verbatim;
+  delete_id tracked. Protocol violations kill the app connection.
+- smoke-mux drives it end-to-end with a scripted Wayland app: real
+  fd over SCM_RIGHTS, registry/shm/surface dance, commit → pool
+  bytes verified at the client; one event written back and read
+  out of the app socket verbatim.
+- Portability: <sys/mman.h> added to cimport_core.h (musl-clean);
+  MSG_CMSG_CLOEXEC avoided (Darwin lacks it; single-threaded daemon
+  sets FD_CLOEXEC post-recvmsg). aarch64-macos cross-compile green.
+- Next: GUI compositor brain (render `foot`), then input, then
+  damage diffing + compression.
+- 531 tests, smoke-mux, mux-portable, GUI build all PASS.
