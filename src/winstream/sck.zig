@@ -12,7 +12,6 @@
 const std = @import("std");
 const proto = @import("proto.zig");
 const keymap = @import("keymap.zig");
-const zpool = @import("../wlhost/zpool.zig");
 
 const CEvent = extern struct {
     kind: u32, // 0 open, 1 frame, 2 title, 3 close
@@ -138,24 +137,12 @@ pub const Source = struct {
                 1 => {
                     const d = ev.data orelse continue;
                     if (ev.w <= 0 or ev.h <= 0) continue;
-                    const pixels = d[0..ev.len];
-                    try self.zbuf.resize(self.allocator, pixels.len);
-                    if (zpool.compress(pixels, self.zbuf.items)) |z| {
-                        try proto.appendFrameZ(out, out_allocator, .{
-                            .win = ev.win,
-                            .w = ev.w,
-                            .h = ev.h,
-                            .raw_len = @intCast(pixels.len),
-                            .z = z,
-                        });
-                    } else {
-                        try proto.appendFrame(out, out_allocator, .{
-                            .win = ev.win,
-                            .w = ev.w,
-                            .h = ev.h,
-                            .pixels = pixels,
-                        });
-                    }
+                    try proto.appendFrameMaybeZ(out, out_allocator, &self.zbuf, self.allocator, .{
+                        .win = ev.win,
+                        .w = ev.w,
+                        .h = ev.h,
+                        .pixels = d[0..ev.len],
+                    });
                 },
                 2 => {
                     var pbuf: [4 + 512]u8 = undefined;

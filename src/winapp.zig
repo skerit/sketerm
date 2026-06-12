@@ -10,7 +10,6 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const cast = @import("util/cast.zig");
 const proto = @import("winstream/proto.zig");
-const zpool = @import("wlhost/zpool.zig");
 
 pub const WsHost = struct {
     allocator: std.mem.Allocator,
@@ -79,17 +78,9 @@ pub const WsHost = struct {
                 const wo = proto.decodeWinOpen(u.payload) orelse return error.Protocol;
                 _ = self.winFor(wo.win, wo.w, wo.h, wo.title);
             },
-            .win_frame => {
-                const fr = proto.decodeFrame(u.payload) orelse return error.Protocol;
+            .win_frame, .win_frame_z => {
+                const fr = (proto.decodeFrameAny(u.tag, u.payload, &self.zbuf, self.allocator) catch return error.Protocol) orelse return error.Protocol;
                 self.showFrame(fr.win, fr.w, fr.h, fr.pixels);
-            },
-            .win_frame_z => {
-                const fz = proto.decodeFrameZ(u.payload) orelse return error.Protocol;
-                const need = @as(usize, @intCast(@max(fz.w, 1))) * 4 * @as(usize, @intCast(@max(fz.h, 1)));
-                if (fz.raw_len != need) return error.Protocol;
-                try self.zbuf.resize(self.allocator, fz.raw_len);
-                _ = zpool.decompress(fz.z, self.zbuf.items) catch return error.Protocol;
-                self.showFrame(fz.win, fz.w, fz.h, self.zbuf.items);
             },
             .win_title => {
                 if (u.payload.len < 4) return error.Protocol;

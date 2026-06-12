@@ -135,25 +135,12 @@ pub const Stub = struct {
                 self.frame_buf.items[i + 3] = 0xff;
             }
         }
-        // Deflate when it shrinks (the same trade as pool updates);
-        // the receiver accepts both forms.
-        try self.zbuf.resize(self.allocator, self.frame_buf.items.len);
-        if (zpool.compress(self.frame_buf.items, self.zbuf.items)) |z| {
-            try proto.appendFrameZ(out, out_allocator, .{
-                .win = 1,
-                .w = self.w,
-                .h = self.h,
-                .raw_len = @intCast(self.frame_buf.items.len),
-                .z = z,
-            });
-        } else {
-            try proto.appendFrame(out, out_allocator, .{
-                .win = 1,
-                .w = self.w,
-                .h = self.h,
-                .pixels = self.frame_buf.items,
-            });
-        }
+        try proto.appendFrameMaybeZ(out, out_allocator, &self.zbuf, self.allocator, .{
+            .win = 1,
+            .w = self.w,
+            .h = self.h,
+            .pixels = self.frame_buf.items,
+        });
     }
 
     pub fn handleInput(self: *Stub, unit: proto.Unit) void {

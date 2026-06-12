@@ -1500,6 +1500,9 @@ pub const Daemon = struct {
     /// Pump every live window-stream session: frames toward the
     /// attached client, bounded by the poll cadence.
     fn pumpWinstreams(self: *Daemon) void {
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+        const now_ms: u64 = @intCast(ts.tv_sec * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));
         for (self.channels.items) |ch| {
             if (ch.dead or ch.native != null) continue;
             const ws = ch.session.winstream orelse continue;
@@ -1508,9 +1511,6 @@ pub const Daemon = struct {
             // write buffer — skip frame production until it drains
             // (the source keeps streaming; only emission pauses).
             if (ch.client.wbuf.items.len > 8 << 20) continue;
-            var ts: c.struct_timespec = undefined;
-            _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-            const now_ms: u64 = @intCast(ts.tv_sec * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));
             var units: std.ArrayList(u8) = .empty;
             defer units.deinit(self.allocator);
             ws.poll(&units, self.allocator, now_ms) catch continue;

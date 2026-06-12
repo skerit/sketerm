@@ -13,6 +13,7 @@
 //! coordinates are window-local pixels.
 
 const std = @import("std");
+const zpool = @import("../wlhost/zpool.zig");
 
 pub const Tag = enum(u8) {
     /// u32 win, i32 w, i32 h, title bytes.
@@ -145,6 +146,49 @@ pub fn decodeFrameZ(p: []const u8) ?FrameZ {
     };
 }
 
+/// Emit a frame, deflating into caller-owned `zbuf` scratch when it
+/// shrinks (receivers accept both forms — see decodeFrameAny). Every
+/// capture source wants this exact compress-or-fall-back-to-raw
+/// dance; keep it in one place. `zbuf` is resized to fit.
+pub fn appendFrameMaybeZ(
+    out: *std.ArrayList(u8),
+    out_a: std.mem.Allocator,
+    zbuf: *std.ArrayList(u8),
+    zbuf_a: std.mem.Allocator,
+    v: Frame,
+) !void {
+    try zbuf.resize(zbuf_a, v.pixels.len);
+    if (zpool.compress(v.pixels, zbuf.items)) |z| {
+        try appendFrameZ(out, out_a, .{ .win = v.win, .w = v.w, .h = v.h, .raw_len = @intCast(v.pixels.len), .z = z });
+    } else {
+        try appendFrame(out, out_a, v);
+    }
+}
+
+/// Decode a win_frame OR win_frame_z unit to a pixel frame, inflating
+/// the _z form into caller-owned `scratch` (resized to fit). Returned
+/// pixels alias either the payload or `scratch`. Null on a malformed
+/// unit or a raw_len that disagrees with the dimensions.
+pub fn decodeFrameAny(
+    tag: Tag,
+    payload: []const u8,
+    scratch: *std.ArrayList(u8),
+    scratch_a: std.mem.Allocator,
+) !?Frame {
+    switch (tag) {
+        .win_frame => return decodeFrame(payload),
+        .win_frame_z => {
+            const fz = decodeFrameZ(payload) orelse return null;
+            const need = @as(usize, @intCast(@max(fz.w, 1))) * 4 * @as(usize, @intCast(@max(fz.h, 1)));
+            if (fz.raw_len != need) return null;
+            try scratch.resize(scratch_a, fz.raw_len);
+            _ = zpool.decompress(fz.z, scratch.items) catch return null;
+            return .{ .win = fz.win, .w = fz.w, .h = fz.h, .pixels = scratch.items };
+        },
+        else => return null,
+    }
+}
+
 pub const InputKey = struct { win: u32, key: u32, pressed: bool, mods: u32 };
 
 pub fn appendInputKey(out: *std.ArrayList(u8), a: std.mem.Allocator, v: InputKey) !void {
@@ -235,4 +279,40 @@ test "winstream units round-trip" {
     var bad = u2_.unit.payload[0 .. u2_.unit.payload.len - 1];
     try t.expectEqual(@as(?Frame, null), decodeFrame(bad));
     _ = &bad;
+}
+
+test "appendFrameMaybeZ ↔ decodeFrameAny round-trips both forms" {
+    const a = t.allocator;
+    var zbuf: std.ArrayList(u8) = .empty;
+    defer zbuf.deinit(a);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(a);
+
+    // Compressible pixels (long runs) take the _z path; random-ish
+    // pixels stay raw. Exercise both and confirm a faithful frame.
+    inline for (.{ true, false }) |compressible| {
+        const w = 8;
+        const h = 8;
+        var px: [w * h * 4]u8 = undefined;
+        for (&px, 0..) |*b, i| b.* = if (compressible) @intCast((i / 32) % 3) else @truncate(i * 131 + 7);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try appendFrameMaybeZ(&out, a, &zbuf, a, .{ .win = 9, .w = w, .h = h, .pixels = &px });
+
+        const u = (try peelUnit(out.items)).?;
+        try t.expect(u.unit.tag == .win_frame or u.unit.tag == .win_frame_z);
+        if (compressible) try t.expectEqual(Tag.win_frame_z, u.unit.tag);
+        const fr = (try decodeFrameAny(u.unit.tag, u.unit.payload, &scratch, a)).?;
+        try t.expectEqual(@as(u32, 9), fr.win);
+        try t.expectEqual(@as(i32, w), fr.w);
+        try t.expectEqualSlices(u8, &px, fr.pixels);
+    }
+
+    // A _z unit whose raw_len disagrees with w*h*4 is rejected.
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(a);
+    try appendFrameZ(&bad, a, .{ .win = 1, .w = 4, .h = 4, .raw_len = 999, .z = "\x00\x00" });
+    const bu = (try peelUnit(bad.items)).?;
+    try t.expectEqual(@as(?Frame, null), try decodeFrameAny(bu.unit.tag, bu.unit.payload, &scratch, a));
 }
