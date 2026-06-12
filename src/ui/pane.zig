@@ -30,7 +30,14 @@ const MouseAction = @import("../config.zig").MouseAction;
 pub const InputCtx = input.Ctx;
 pub const MenuAction = menu.Action;
 
-const FONT_CANDIDATES = [_][*:0]const u8{
+const FONT_CANDIDATES = if (@import("../util/platform.zig").is_macos) [_][*:0]const u8{
+    // System fonts every macOS install ships. Menlo is a .ttc
+    // collection — FreeType opens face index 0 (Menlo-Regular).
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Monaco.ttf",
+    "/System/Library/Fonts/SFNSMono.ttf",
+    "/System/Library/Fonts/Supplemental/Courier New.ttf",
+} else [_][*:0]const u8{
     "/usr/share/fonts/TTF/Hack-Regular.ttf",
     "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
     "/usr/share/fonts/TTF/VeraMono.ttf",
