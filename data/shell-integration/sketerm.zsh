@@ -21,7 +21,10 @@ typeset -g _SKETERM_INTEGRATED=1
 # ── OSC 7 cwd reporting ─────────────────────────────────────────
 _sketerm_emit_cwd() {
     local hn="${HOST:-${HOSTNAME:-localhost}}"
-    local cwd="${PWD//%/%25}"
+    # `\%`: in zsh ${name//pattern/repl} an UNESCAPED leading % anchors
+    # an empty match at the end of the string — ${PWD//%/%25} APPENDS
+    # %25 instead of escaping percent signs.
+    local cwd="${PWD//\%/%25}"
     cwd="${cwd// /%20}"
     printf '\033]7;file://%s%s\033\\' "$hn" "$cwd"
 }
