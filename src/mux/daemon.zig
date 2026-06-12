@@ -1281,6 +1281,33 @@ pub const Daemon = struct {
         return .{ .fd = fd, .hub_path = hub_path, .display_path = display_path };
     }
 
+    /// Window-stream backend policy for a spawn. On macOS builds
+    /// with the ScreenCaptureKit backend, app sessions capture
+    /// automatically (their apps have no forwardable display
+    /// protocol) UNLESS the client pinned a wl_mode — an explicit
+    /// Wayland request (test rigs, `sketerm app -u`) wins. The
+    /// SKETERM_WINSTREAM env is the rig override: "stub" = test
+    /// pattern for app sessions, "all" = test pattern for every
+    /// session, "sck" = real capture for every session. Any value
+    /// but "sck" forces the stub so smoke-mux and Linux rigs get a
+    /// deterministic pattern.
+    fn winstreamGate(req: SpawnReq) struct { want: bool, use_sck: bool } {
+        const env = std.c.getenv("SKETERM_WINSTREAM");
+        const val: ?[]const u8 = if (env) |e| std.mem.span(e) else null;
+        const eq = struct {
+            fn f(v: ?[]const u8, s: []const u8) bool {
+                return v != null and std.mem.eql(u8, v.?, s);
+            }
+        }.f;
+        const widen = eq(val, "all") or eq(val, "sck");
+        return .{
+            .want = req.winstream or
+                (val != null and (req.app or widen)) or
+                ((comptime wssource.have_sck) and req.app and req.wl_mode.len == 0),
+            .use_sck = (comptime wssource.have_sck) and (val == null or eq(val, "sck")),
+        };
+    }
+
     fn spawnSession(self: *Daemon, req: SpawnReq) !*Session {
         const allocator = self.allocator;
 
@@ -1290,30 +1317,11 @@ pub const Daemon = struct {
         // back into the legacy `waypipe server` wrap (e.g. for
         // GPU-buffer transfer); SKETERM_MUX_NO_WAYLAND=1 disables
         // app forwarding entirely.
-        // Window-stream backend (pixel capture). On macOS builds
-        // with the ScreenCaptureKit backend (winstream_sck), app
-        // sessions stream automatically — apps there have no
-        // forwardable display protocol. SKETERM_WINSTREAM keeps the
-        // test/rig gating: "stub" = test pattern for app sessions,
-        // "all" = stub for every session, "sck" = real capture for
-        // every session (launch GUI apps from a plain shell).
-        const ws_env = std.c.getenv("SKETERM_WINSTREAM");
-        const ws_val: ?[]const u8 = if (ws_env) |e| std.mem.span(e) else null;
-        const ws_widen = ws_val != null and
-            (std.mem.eql(u8, ws_val.?, "all") or std.mem.eql(u8, ws_val.?, "sck"));
-        // An explicit wl_mode is a client asking for the Wayland
-        // pipe (test rigs, `sketerm app -u`) — capture must not
-        // hijack it, even on a capture-capable host.
-        const want_winstream = req.winstream or
-            (ws_val != null and (req.app or ws_widen)) or
-            ((comptime wssource.have_sck) and req.app and req.wl_mode.len == 0);
-        // Env set to anything but "sck" forces the stub backend —
-        // smoke-mux and the Linux rigs rely on the test pattern.
-        const ws_use_sck = (comptime wssource.have_sck) and
-            (ws_val == null or std.mem.eql(u8, ws_val.?, "sck"));
+        // Window-stream backend (pixel capture): policy in winstreamGate.
+        const ws_gate = winstreamGate(req);
 
         var use_waypipe = false;
-        var forwarding_possible = !want_winstream;
+        var forwarding_possible = !ws_gate.want;
         if (std.mem.eql(u8, req.wl_mode, "waypipe")) {
             // The client can ONLY bridge waypipe (headless `sketerm
             // app -u`): without waypipe here, forwarding is off —
@@ -1423,9 +1431,9 @@ pub const Daemon = struct {
             s.wl_native = native_wayland;
             hub = null; // ownership moved to the session
         }
-        if (want_winstream) create_ws: {
+        if (ws_gate.want) create_ws: {
             const w = allocator.create(WsSource) catch break :create_ws;
-            if (ws_use_sck) {
+            if (ws_gate.use_sck) {
                 w.* = WsSource.initSck(allocator, s.pty.child_pid) catch |err| {
                     std.debug.print("sketerm-mux: window capture init failed ({s}) — session '{s}' has no app streaming\n", .{ @errorName(err), req.name });
                     allocator.destroy(w);
