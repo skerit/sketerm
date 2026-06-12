@@ -5142,3 +5142,29 @@ Tests 454 → 466.
   system daemon (was the pre-channel build; one leftover idle
   session dropped).
 - 508 tests, smoke-mux PASS.
+
+## 2026-06-12: mux session lifecycle — kinds, zombies, detach-to-shell
+
+- Session kind: SpawnReq/Session/SessionInfo carry an `app` flag
+  (set by `sketerm app -u` spawns); `mux list` prints shell/app,
+  the TUI tags `[gui app]`. ignore_unknown_fields + defaults keep
+  old daemon ↔ new client (and vice versa) compatible.
+- 🐛 Zombie sessions: sessionExited now delivers .exit then
+  force-detaches every client, so a vanished-without-BYE client
+  (UDP peer roamed away) can't pin a dead session in the list;
+  reap collects it the same tick. handleAttach refuses exited
+  sessions in the race window. Live sessions are NEVER reaped.
+- 🐛 Detach never closes the pane: palette "Detach Session" called
+  closeFocusedPane, and remote session end / connection loss went
+  through exit_action=close. Both now swap a fresh local shell
+  into the pane's slot (swapPaneInPlace, extracted from the
+  attachMux takeover surgery); exit_action is local-children-only.
+  `mux_detach` is now a bindable action (keybind.mux_detach,
+  `sketerm cli action mux_detach`).
+- VERIFIED live (isolated Xvfb GUI + daemon): remote `exit` lands
+  the pane in a local shell + session reaped; mux_detach lands in
+  a local shell with the session alive at 0 clients; reattach OK.
+- Gotcha hit while testing: scripts running INSIDE a sketerm pane
+  inherit $SKETERM_SOCKET — `sketerm mux attach` then talks to the
+  REAL GUI, not the test instance (env -u SKETERM_SOCKET).
+- 508 tests, smoke-mux, smoke-e2e, mux-portable all PASS.
