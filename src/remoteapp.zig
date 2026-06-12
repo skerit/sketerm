@@ -261,7 +261,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             return 1;
         },
         .darwin => {
-            errMsg("{s} is macOS — remote macOS apps aren't supported yet (needs the window-streaming backend)", .{host});
+            // macOS apps stream as pixels via the mux daemon's
+            // ScreenCaptureKit agent — a durable-session feature,
+            // not a one-shot exec like the waypipe path.
+            errMsg("{s} is macOS — run the app in a durable session instead: `sketerm mux {s}`, then launch it from the session shell (needs a capture-enabled sketerm-mux on the Mac: docs/REMOTE.md \"Remote macOS apps\")", .{ host, host });
             return 1;
         },
         .other => |u| {
