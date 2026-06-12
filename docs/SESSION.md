@@ -5118,3 +5118,27 @@ Tests 454 → 466.
   remote-tab bootstrap blocks the main loop (pre-existing).
 - NOT done: .app bundle, Cmd keybindings, visual screenshot
   verification (screencapture needs Screen Recording permission).
+## 2026-06-12: phase 3 — `sketerm app -u`: roaming GUI apps, standalone
+
+- `sketerm app -u <host> <cmd>` (udp: domains imply -u): bootstrap
+  over SSH, then run the app as a ONE-SHOT mux session over the
+  encrypted roaming UDP transport — no durable tab needed; this is
+  the standalone "mosh for GUI apps". The daemon wraps the app in
+  waypipe server as usual; the CLI pumps the chan_* frames into the
+  local waypipe client with a plain poll loop (no GTK/GLib), and
+  streams the session's terminal text to stdout for error
+  visibility. spawn+attach are pipelined back-to-back so the app
+  can't race its first display connection against our attachment.
+- 🐛 findInPath allocated with a sentinel but returned []u8 — the
+  deferred free passed the wrong size (latent in the ssh path, which
+  exec()s and never frees; the -u path crashed the DebugAllocator).
+- VERIFIED over REAL UDP to 127.0.0.1 (fresh system daemon):
+  weston-flower renders on the local compositor with every byte
+  riding rudp datagrams; full process chain (udp-connect bridge,
+  daemon waypipe server, --no-gpu waypipe client) observed live.
+- Known issue (pre-existing): `udp:localhost` fails — the UDP
+  bootstrap's name resolution disagrees with the listener's bind
+  family (v4/v6); IPs and real hostnames work. Restarted the local
+  system daemon (was the pre-channel build; one leftover idle
+  session dropped).
+- 508 tests, smoke-mux PASS.
