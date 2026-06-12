@@ -45,6 +45,12 @@ const HELP_TEXT =
     \\                         Needs key auth + sketerm-mux on the
     \\                         host; survives disconnects (reattach
     \\                         with `sketerm mux <host>`).
+    \\  sketerm app <host> <command...>
+    \\                         Run a remote GUI app with its windows
+    \\                         on this desktop (compressed Wayland
+    \\                         forwarding — fast, unlike ssh -X).
+    \\                         Needs key auth; Linux remotes need
+    \\                         the `waypipe` package installed.
     \\
     \\Options:
     \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json
@@ -155,6 +161,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer allocator.free(cli_args);
         for (argv[2..], 0..) |a, n| cli_args[n] = std.mem.span(a);
         return @import("ipc/client.zig").run(allocator, cli_args);
+    }
+
+    // `sketerm app <host> <command...>` — run a remote GUI app with
+    // its windows on this desktop (Wayland forwarding). No
+    // GApplication; the process becomes the forwarder.
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "app")) {
+        const app_args = allocator.alloc([]const u8, argv.len - 2) catch return 1;
+        defer allocator.free(app_args);
+        for (argv[2..], 0..) |a, n| app_args[n] = std.mem.span(a);
+        return @import("remoteapp.zig").run(allocator, app_args);
     }
 
     // `sketerm mux ...` — durable-session manager (TUI picker with

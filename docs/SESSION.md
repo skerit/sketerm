@@ -5021,3 +5021,29 @@ Tests 454 → 466.
   focusedPane() at click time, when the popover button holds focus →
   null → no-op (also hit the PRE-EXISTING shader-preset picker; pane
   now captured in the button ctx at build time).
+
+## 2026-06-12: `sketerm app` — remote GUI apps on the local desktop
+
+- GOAL (user): the thing X11 forwarding stopped being good at, and
+  Wayland never had — run a remote graphical app with its window
+  locally, transport-agnostic UX (future macOS backend must slot in
+  without the user caring). This is phase 1 of the "mosh for GUI
+  apps" plan; phase 2 will run the stream over the mux rudp
+  transport for roaming.
+- `sketerm app [user@]<host|domain> <command...>` (src/remoteapp.zig):
+  generic front end; backend = waypipe over SSH for Linux remotes.
+  One ssh probe (`uname` + waypipe + Vulkan-ICD discovery) dispatches
+  to the backend and produces actionable errors (no waypipe on
+  remote / macOS remote / no local Wayland). $SKETERM_SSH override
+  honored (probe + waypipe --ssh-bin). Domains from config.conf
+  resolve; udp: domains fall back to their ssh host for now.
+- Vulkan gotcha: waypipe 0.11 ABORTS when the local compositor
+  advertises dmabuf but Vulkan is missing (typical headless server).
+  The probe checks ICD manifests on both ends and degrades to
+  --no-gpu (shm transfer) automatically.
+- Remote windows get a "[host] " title prefix. Process exec's into
+  waypipe after preflight so signals/exit status flow naturally.
+- VERIFIED end-to-end on this box (sshd to localhost + weston-on-Xvfb
+  as the local compositor): wayland-info globals round-trip;
+  weston-terminal renders, accepts forwarded keyboard input, runs a
+  live fish shell. 507 tests.
