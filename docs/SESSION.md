@@ -5298,3 +5298,33 @@ Remote apps are now interactive over the native pipe:
   per-app window icons/WM_CLASS, retire-waypipe flag flip.
 - 540 tests, smoke-mux, smoke-e2e, mux-portable, aarch64-macos
   cross, live input regression all PASS.
+
+## 2026-06-12: native app pipe milestone 6 — clipboard
+
+Text clipboard both directions over the native pipe, fd-free on
+the mux wire (fds never leave their host):
+
+- Protocol: wl_data_offer/source/device/manager tables (full v3,
+  XML-verified; advertised at v1 = selection only, dnd ignored).
+  wl_data_device.data_offer is the first server-created object —
+  tracker.serverMessage now registers event-created ids.
+- Daemon: receive(mime, fd) fds are held in a FIFO until the GUI's
+  clip_data unit arrives (write + close). clip_send units make the
+  daemon pipe a wl_data_source.send to the app and poll the read
+  end until EOF → clip_data up. Clip pipes ride the main poll loop.
+- GUI/compositor: set_selection → best-text-mime view callback →
+  fetchClipboard; clip_data → GdkClipboard.set_text. Paste offers
+  are re-announced per keyboard-focus change (NOT the GTK focus
+  controller alone — it doesn't fire under bare X) and answered
+  via async GTK clipboard reads; AppHost defers its final free
+  while reads are in flight.
+- smoke-mux: scripted paste (PASTE-42 through a held fd) + copy
+  (COPY-7 through the daemon pipe) round-trips. LIVE: OSC 52 set
+  "CLIP-LIVE-9" in the durable session; Ctrl+Shift+V in remote
+  weston-terminal pasted it (screenshot-confirmed).
+- Test-rig gotchas hit: raw ESC bytes can't be typed into a shell
+  (readline eats them — send printf-escaped text); the smoke's GUI
+  side must wait for relayed messages before referencing their ids
+  (mirrors the real ordering guarantee).
+- 541 tests, smoke-mux, smoke-e2e, mux-portable, aarch64-macos
+  cross all PASS.
