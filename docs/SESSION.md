@@ -5421,3 +5421,17 @@ two concurrent builds stop glitching the ring + taskbar. OPEN: the
 user-reported Super+drag crash — not reproducible headless (no WM),
 awaiting which-process-died + log from the laptop.
 546 tests, smoke-mux, both portable targets PASS.
+
+## 2026-06-12: window geometry + the full xdg_toplevel sweep
+
+User round 3: taskbar/alt-tab absence (host windows now join the
+GtkApplication), shadow-as-border on maximize/snap (frames CROPPED
+to xdg window geometry — shadows never leave the compositor; input
++ input-region coords compensate), maximize stretch (default-size
+doesn't track maximization — real allocation + maximized state
+sent on notify::maximized). Then the everything-else sweep:
+set_parent/min_size/maximize/fullscreen/minimize honored, activated
+follows focus, fullscreen state round-trips, seat v4 + repeat_info,
+popup constraint sliding. 546 tests, smoke-mux, rig (crop verified
+visually: edge-to-edge content, popup placed right), both portable
+targets PASS.
