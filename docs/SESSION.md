@@ -5359,3 +5359,16 @@ still disables forwarding. smoke-mux runs the default path (env
 gate removed); REMOTE.md documents the feature + limits.
 Verified live without any gate env: GTK4 client maps, menus open.
 541 tests, smoke-mux, smoke-e2e, mux-portable, aarch64-macos PASS.
+
+## 2026-06-12: native pipe — adwaita validated, wp extensions
+
+- libadwaita A/B client (AdwApplicationWindow + header bar) maps
+  and lives over the pipe — the modern GNOME app class works;
+  ghostty's clean exit is confirmed app-specific (still dies with
+  cursor-shape/viewporter/fractional-scale advertised).
+- New protocols: wp_cursor_shape_manager_v1 (set_shape → view →
+  gtk_widget_set_cursor_from_name on the focused window — remote
+  apps now drive the local pointer shape), wp_viewporter (inert at
+  scale 1), wp_fractional_scale_manager_v1 (always 1.0).
+- 542 tests, smoke-mux, mux-portable, aarch64-macos, live clip
+  regression all PASS.
