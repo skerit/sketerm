@@ -5008,5 +5008,16 @@ Tests 454 → 466.
   — rows capture field pointers at build time), create-as-copy,
   delete (falls back to Default), default-profile-for-new-panes
   combo. Dialog title shows the non-default profile being edited.
-- 504 tests green; mux daemon still libc-only; e2e smoke not run
-  (headless session) — needs a manual GUI pass on the new pickers.
+- 504 tests green; mux daemon still libc-only.
+- VERIFIED headless (Xvfb + xdotool + imagemagick, isolated
+  XDG_CONFIG_HOME): smoke-e2e PASS; profile spawn renders distinct
+  colors/size; SIGUSR1 reload restyles a profile pane in place;
+  apply-profile popover round-trips dev→default; prefs Profiles page
+  create/delete persists to config.conf and reopens bound right.
+- 🐛 the pass caught two silent picker bugs (would have shipped):
+  GTK4 popdowns autohide popovers whose min size doesn't fit (pickers
+  anchored at the pane's bottom edge died on map — now scroller +
+  center anchor via presentPanePopover), and picker buttons resolved
+  focusedPane() at click time, when the popover button holds focus →
+  null → no-op (also hit the PRE-EXISTING shader-preset picker; pane
+  now captured in the button ctx at build time).
