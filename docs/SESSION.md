@@ -5383,3 +5383,17 @@ waypipe-requested sessions on waypipe-less hosts get NO forwarding
 (clean app-side failure) instead of a dead-end native session.
 Wire-compatible both directions. 542 tests, smoke-mux, both
 portable targets PASS.
+
+## 2026-06-12: winstream — macOS-apps-on-Linux transport, stub-proven
+
+Everything buildable without a Mac: proto units (win_open/frame/
+frame_z/title/close + input_key/input_ptr/close_req, evdev codes,
+window-local pixels), stub capture source (animated pattern,
+input-reactive, 10fps rate-limited), daemon agent (fd-less
+winstream channels opened at attach for app sessions when
+SKETERM_WINSTREAM is set; "all" widens for rig testing), GUI WsHost
+(GtkWindow per remote window, BGRA → GdkMemoryTexture, input back).
+smoke-mux winstream stage + live rig PASS (stub window renders its
+pattern on screen). The Mac side drops ScreenCaptureKit +
+CGEventPost behind Source.poll/handleInput — transport and render
+are done. 546 tests, all targets green.
