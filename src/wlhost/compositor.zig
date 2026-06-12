@@ -76,6 +76,12 @@ pub const View = struct {
     /// xdg-decoration: the app wants server-side (host) decorations
     /// (true) or draws its own (false).
     toplevel_decoration: ?*const fn (ctx: ?*anyopaque, surface: u32, ssd: bool) void = null,
+    /// xdg_toplevel.move — the app's own titlebar drag: start an
+    /// interactive move of the host window.
+    toplevel_move: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
+    /// xdg_toplevel.resize with wayland edge flags (1 top, 2 bottom,
+    /// 4 left, 8 right, combinable).
+    toplevel_resize: ?*const fn (ctx: ?*anyopaque, surface: u32, edges: u32) void = null,
 };
 
 const Global = struct {
@@ -1003,10 +1009,18 @@ pub const Compositor = struct {
                 const app_id = (try it.next()).?.string orelse return;
                 if (self.view.toplevel_app_id) |cb| cb(self.view.ctx, sid, app_id);
             },
-            // set_parent/min/max/maximize/fullscreen/minimize:
-            // accepted, no window management in v1. move/resize/menu
-            // need a grab serial we rarely hand out.
-            1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 => {},
+            5 => { // move(seat, serial) — app-initiated window drag
+                if (self.view.toplevel_move) |cb| cb(self.view.ctx, sid);
+            },
+            6 => { // resize(seat, serial, edges)
+                _ = (try it.next()).?; // seat
+                _ = (try it.next()).?; // serial
+                const edges = (try it.next()).?.uint;
+                if (self.view.toplevel_resize) |cb| cb(self.view.ctx, sid, edges);
+            },
+            // set_parent/min/max/maximize/fullscreen/minimize/menu:
+            // accepted, no window management in v1.
+            1, 4, 7, 8, 9, 10, 11, 12, 13 => {},
             else => return Error.Protocol,
         }
     }

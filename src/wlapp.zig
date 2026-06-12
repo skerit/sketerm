@@ -77,6 +77,11 @@ pub const AppHost = struct {
         /// guard: don't re-configure what the app already drew).
         sent_w: i32 = 0,
         sent_h: i32 = 0,
+        /// Latest button press (widget coords) — gdk's interactive
+        /// move/resize grab wants the originating press.
+        press_btn: c_uint = 0,
+        press_x: f64 = 0,
+        press_y: f64 = 0,
 
         /// Widget → surface coordinates (the picture stretches to
         /// the widget, content-fit FILL).
@@ -91,6 +96,22 @@ pub const AppHost = struct {
             };
         }
     };
+
+    /// CSD apps carry alpha (drop shadows, rounded corners) in
+    /// their buffers; the host window must not paint a background
+    /// behind it or shadows composite onto theme gray.
+    fn ensureTransparentCss() void {
+        const S = struct {
+            var done: bool = false;
+        };
+        if (S.done) return;
+        S.done = true;
+        const display = c.gdk_display_get_default() orelse return;
+        const provider = c.gtk_css_provider_new();
+        c.gtk_css_provider_load_from_string(provider, "window.sketerm-remote-app { background: transparent; }");
+        c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        c.g_object_unref(provider);
+    }
 
     /// Stamp the compositor clock (frame-callback and input event
     /// timestamps) from the GLib monotonic clock.
@@ -115,6 +136,8 @@ pub const AppHost = struct {
             .popup_gone = onPopupGone,
             .cursor_shape = onCursorShape,
             .toplevel_decoration = onDecoration,
+            .toplevel_move = onMove,
+            .toplevel_resize = onResize,
             .clipboard_offer = onClipOffer,
             .clipboard_data = onClipData,
             .clipboard_read = onClipRead,
@@ -363,6 +386,8 @@ pub const AppHost = struct {
         const window: *c.GtkWindow = @ptrCast(c.gtk_window_new());
         const picture = c.gtk_picture_new();
         c.gtk_window_set_title(window, "remote app");
+        ensureTransparentCss();
+        c.gtk_widget_add_css_class(@ptrCast(window), "sketerm-remote-app");
         // Undecorated unless the app asked for host decorations —
         // Wayland apps default to drawing their own chrome, and a
         // second titlebar around it looks broken.
@@ -475,6 +500,9 @@ pub const AppHost = struct {
 
     fn onBtnPress(gesture: ?*c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
+        win.press_btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
+        win.press_x = x;
+        win.press_y = y;
         win.host.stampNow();
         // A click on the main surface while a menu is up dismisses it.
         win.host.comp.dismissPopups() catch {};
@@ -569,6 +597,37 @@ pub const AppHost = struct {
     /// Remote app sets its cursor: apply to the pointer-focused
     /// window's picture so the local pointer matches (text beam
     /// over terminals, hand over links…).
+    fn onMove(ctx: ?*anyopaque, surface: u32) void {
+        const self = cast.userData(AppHost, ctx);
+        const win = self.windows.get(surface) orelse return;
+        const display = c.gdk_display_get_default() orelse return;
+        const device = c.gdk_seat_get_pointer(c.gdk_display_get_default_seat(display)) orelse return;
+        const gdk_surface = c.gtk_native_get_surface(@ptrCast(win.window)) orelse return;
+        c.gdk_toplevel_begin_move(@ptrCast(gdk_surface), device, @intCast(win.press_btn), win.press_x, win.press_y, 0);
+    }
+
+    fn onResize(ctx: ?*anyopaque, surface: u32, edges: u32) void {
+        const self = cast.userData(AppHost, ctx);
+        const win = self.windows.get(surface) orelse return;
+        const display = c.gdk_display_get_default() orelse return;
+        const device = c.gdk_seat_get_pointer(c.gdk_display_get_default_seat(display)) orelse return;
+        const gdk_surface = c.gtk_native_get_surface(@ptrCast(win.window)) orelse return;
+        // wayland edge bits (1 top, 2 bottom, 4 left, 8 right) →
+        // GdkSurfaceEdge enum.
+        const edge: c.GdkSurfaceEdge = switch (edges) {
+            1 => c.GDK_SURFACE_EDGE_NORTH,
+            2 => c.GDK_SURFACE_EDGE_SOUTH,
+            4 => c.GDK_SURFACE_EDGE_WEST,
+            5 => c.GDK_SURFACE_EDGE_NORTH_WEST,
+            6 => c.GDK_SURFACE_EDGE_SOUTH_WEST,
+            8 => c.GDK_SURFACE_EDGE_EAST,
+            9 => c.GDK_SURFACE_EDGE_NORTH_EAST,
+            10 => c.GDK_SURFACE_EDGE_SOUTH_EAST,
+            else => return,
+        };
+        c.gdk_toplevel_begin_resize(@ptrCast(gdk_surface), edge, device, @intCast(win.press_btn), win.press_x, win.press_y, 0);
+    }
+
     fn onDecoration(ctx: ?*anyopaque, surface: u32, ssd: bool) void {
         const self = cast.userData(AppHost, ctx);
         if (self.windows.get(surface)) |win| {
