@@ -241,7 +241,15 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench-parser", "Parser microbenchmark");
     bench_step.dependOn(&bench_run.step);
 
+    // The headless GL harnesses below (smoke-image, smoke-cell,
+    // bench-cell-upload, smoke-transparency, smoke-gl-core) drive GL
+    // through EGL surfaceless contexts — there is no EGL on macOS, so
+    // they are registered only for Linux targets. `zig build test`
+    // plus running the app is the macOS verification path.
+    const has_egl = target.result.os.tag == .linux;
+
     // Headless image-render smoke — `zig build smoke-image`.
+    if (has_egl) {
     const smoke_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_image.zig"),
         .target = target,
@@ -263,6 +271,7 @@ pub fn build(b: *std.Build) void {
     const smoke_run = b.addRunArtifact(smoke);
     const smoke_step = b.step("smoke-image", "Headless GL image render check");
     smoke_step.dependOn(&smoke_run.step);
+    }
 
     // IPC end-to-end smoke — `zig build smoke-e2e`. Launches the
     // built app (needs a display; SKIPs without one), drives it via
@@ -294,6 +303,7 @@ pub fn build(b: *std.Build) void {
     // surfaceless context, reads pixels back, asserts text + focus
     // border were rendered. Catches regressions in the instanced
     // cell pipeline + multi-page atlas.
+    if (has_egl) {
     const smoke_cell_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_cell.zig"),
         .target = target,
@@ -328,12 +338,14 @@ pub fn build(b: *std.Build) void {
     const smoke_cell_run = b.addRunArtifact(smoke_cell);
     const smoke_cell_step = b.step("smoke-cell", "Headless GL cell-pipeline render check");
     smoke_cell_step.dependOn(&smoke_cell_run.step);
+    }
 
     // Headless cell-upload microbench — `zig build bench-cell-upload`.
     // Same EGL surfaceless context as smoke-cell, but at 4K with a
     // realistic-sized cell grid, looped to measure per-frame upload +
     // draw + GPU-finish latency. Used to isolate GL cost from GTK4 /
     // Wayland integration when chasing render stalls.
+    if (has_egl) {
     const bench_cell_mod = b.createModule(.{
         .root_source_file = b.path("src/bench_cell_upload.zig"),
         .target = target,
@@ -352,11 +364,13 @@ pub fn build(b: *std.Build) void {
     const bench_cell_run = b.addRunArtifact(bench_cell);
     const bench_cell_step = b.step("bench-cell-upload", "Headless cell-upload microbench (isolates GL from GTK)");
     bench_cell_step.dependOn(&bench_cell_run.step);
+    }
 
     // Headless transparency smoke — `zig build smoke-transparency`.
     // Drives the same stack as smoke-cell but with bg alpha=0.5,
     // asserts the readback FBO retains translucency. Plan-v3 had
     // this gating C; added retroactively as regression coverage.
+    if (has_egl) {
     const smoke_trans_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_transparency.zig"),
         .target = target,
@@ -375,10 +389,12 @@ pub fn build(b: *std.Build) void {
     const smoke_trans_run = b.addRunArtifact(smoke_trans);
     const smoke_trans_step = b.step("smoke-transparency", "Headless GL bg-alpha render check");
     smoke_trans_step.dependOn(&smoke_trans_run.step);
+    }
 
     // Desktop-GL core shader smoke — `zig build smoke-gl-core`.
     // Compiles every shader under a GL 3.3 core context: the macOS
     // GDK path, provable on a Linux box via Mesa's EGL desktop-GL.
+    if (has_egl) {
     const smoke_core_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_gl_core.zig"),
         .target = target,
@@ -400,6 +416,7 @@ pub fn build(b: *std.Build) void {
     const smoke_core_run = b.addRunArtifact(smoke_core);
     const smoke_core_step = b.step("smoke-gl-core", "Compile all shaders under desktop GL 3.3 core (macOS GL path)");
     smoke_core_step.dependOn(&smoke_core_run.step);
+    }
 
     const tests_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
