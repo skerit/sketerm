@@ -102,6 +102,7 @@ User entry points: `sketerm ssh [-u] <host>`, `sketerm mux [host] [list|attach <
 - Per-worker `ArenaAllocator` reset once per ring drain for transient parse payloads.
 - GTK signal contexts allocated on the heap (`*Ctx` types) **must** carry their own `allocator: std.mem.Allocator` and pass a matching `freeXxxCtx` callback as `g_signal_connect_data`'s 5th arg. The pattern is in `menu.zig` (`freeActionSlot`, `freeClickCtx`), `window.zig` (`PanedRatioCtx`/`freePanedRatio`, `RenameCtx`/`freeRenameCtx`), and every `add*Row` builder in `prefs.zig`. Skip the destroy-notify only when the user-data is the dialog's main `Ctx` (managed elsewhere) or is a non-heap pointer.
 - Config lives in an arena: `applyConfigChange` clones into a fresh arena and frees the old one — anything holding config-arena slices (pane `font_path`, `active_profile`, `font_family`, …) must be re-pointed in that loop.
+- **Pane-level settings are `ProfileSettings` bundles.** `Config.settings` IS the Default profile; `[profile.<name>]` sections are COMPLETE copies (seeded from Default at parse time — no inherit sentinels). Resolve a pane's bundle with `Config.profileSettings(name)` (empty/"default"/unknown → Default); never write field-by-field profile-vs-global fallbacks. App-level keys (window, mouse, keybinds, rendering flags, bells, background image/opacity) stay flat on `Config`.
 
 ## Debugging tips
 
