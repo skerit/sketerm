@@ -51,8 +51,16 @@ pub const Action = union(enum) {
     /// that buffer's bytes before relaying the commit. Geometry is
     /// resolved from the tracked buffer so the daemon can copy
     /// [offset, offset + stride*height) without its own bookkeeping.
-    commit: struct { surface: u32, buffer: u32, info: BufferInfo },
+    /// `damage` is the row range the client declared dirty since
+    /// its last commit (full height when it declared nothing —
+    /// trust-but-clamp, like any compositor).
+    commit: struct { surface: u32, buffer: u32, info: BufferInfo, damage: ?RowRange },
 };
+
+/// Damaged rows [y0, y1) in buffer coordinates. Width collapses to
+/// full rows: rows are contiguous in the pool, so one linear copy
+/// covers them; terminals scroll full-width anyway.
+pub const RowRange = struct { y0: i32, y1: i32 };
 
 pub const BufferInfo = struct {
     pool: u32,
@@ -72,6 +80,14 @@ pub const Tracker = struct {
     attached: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// buffer id → geometry, dropped with the object on delete_id.
     buffers: std.AutoHashMapUnmanaged(u32, BufferInfo) = .empty,
+    /// surface id → accumulated damage rows since the last commit.
+    /// Absent = the client declared no damage (copy everything —
+    /// the conservative reading for clients that skip damage).
+    damage: std.AutoHashMapUnmanaged(u32, RowRange) = .empty,
+    /// Surfaces that have committed at least once WITH damage info;
+    /// only these get partial copies (a client that never damages
+    /// always full-copies).
+    uses_damage: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Error!Tracker {
         var self = Tracker{ .allocator = allocator };
@@ -83,6 +99,8 @@ pub const Tracker = struct {
         self.objects.deinit(self.allocator);
         self.attached.deinit(self.allocator);
         self.buffers.deinit(self.allocator);
+        self.damage.deinit(self.allocator);
+        self.uses_damage.deinit(self.allocator);
     }
 
     /// One complete client→compositor message (header + body).
@@ -174,16 +192,52 @@ pub const Tracker = struct {
                 }
                 return .relay;
             },
+            2, 9 => { // damage / damage_buffer (scale 1: same space)
+                var it = wire.ArgIter.init(body, msg.sig);
+                _ = try it.next(); // x
+                const y = (try it.next()).?.int;
+                _ = try it.next(); // width
+                const h = (try it.next()).?.int;
+                if (h > 0) try self.addDamage(hdr.object, y, y +| h);
+                return .relay;
+            },
             6 => { // commit
-                const buffer = self.attached.get(hdr.object) orelse return .relay;
+                const buffer = self.attached.get(hdr.object) orelse {
+                    _ = self.damage.remove(hdr.object);
+                    return .relay;
+                };
                 // Attach named a buffer we never saw created (or one
                 // already destroyed): relay, nothing to replicate.
                 const info = self.buffers.get(buffer) orelse return .relay;
-                return .{ .commit = .{ .surface = hdr.object, .buffer = buffer, .info = info } };
+                // Damage-using clients: absent damage on a commit
+                // means "content unchanged" → copy nothing (empty
+                // range), not everything.
+                const dmg: ?RowRange = if (self.uses_damage.contains(hdr.object))
+                    (self.damage.get(hdr.object) orelse RowRange{ .y0 = 0, .y1 = 0 })
+                else
+                    null;
+                _ = self.damage.remove(hdr.object);
+                return .{ .commit = .{
+                    .surface = hdr.object,
+                    .buffer = buffer,
+                    .info = info,
+                    .damage = dmg,
+                } };
             },
             else => return .relay,
         };
         return .relay;
+    }
+
+    fn addDamage(self: *Tracker, sid: u32, y0: i32, y1: i32) Error!void {
+        try self.uses_damage.put(self.allocator, sid, {});
+        const slot = try self.damage.getOrPut(self.allocator, sid);
+        if (slot.found_existing) {
+            slot.value_ptr.y0 = @min(slot.value_ptr.y0, y0);
+            slot.value_ptr.y1 = @max(slot.value_ptr.y1, y1);
+        } else {
+            slot.value_ptr.* = .{ .y0 = y0, .y1 = y1 };
+        }
     }
 
     /// One complete compositor→client message. Only
@@ -195,6 +249,8 @@ pub const Tracker = struct {
         _ = self.objects.remove(id);
         _ = self.attached.remove(id);
         _ = self.buffers.remove(id);
+        _ = self.damage.remove(id);
+        _ = self.uses_damage.remove(id);
     }
 };
 
@@ -311,6 +367,46 @@ test "attach + commit reports replication, null attach clears" {
     _ = try tr.clientMessage(an.hdr, an.body);
     const c3 = enc(&buf, 4, 6, .{});
     try t.expectEqual(Action.relay, try tr.clientMessage(c3.hdr, c3.body));
+}
+
+test "damage rows: accumulate, reset on commit, trust-but-clamp semantics" {
+    var tr = try Tracker.init(t.allocator);
+    defer tr.deinit();
+    var buf: [64]u8 = undefined;
+
+    // compositor(3) → surface(4); shm(7) → pool(8) → buffer(9)
+    const gr = enc(&buf, 1, 1, .{2});
+    _ = try tr.clientMessage(gr.hdr, gr.body);
+    const bindc = enc(&buf, 2, 0, .{ 1, @as([]const u8, "wl_compositor"), 6, 3 });
+    _ = try tr.clientMessage(bindc.hdr, bindc.body);
+    const cs = enc(&buf, 3, 0, .{4});
+    _ = try tr.clientMessage(cs.hdr, cs.body);
+    try bindShm(&tr, 2, 7);
+    const cp = enc(&buf, 7, 0, .{ 8, 4096 });
+    _ = try tr.clientMessage(cp.hdr, cp.body);
+    const cb = enc(&buf, 8, 0, .{ 9, 0, 32, 32, 128, 1 });
+    _ = try tr.clientMessage(cb.hdr, cb.body);
+    const at = enc(&buf, 4, 1, .{ 9, 0, 0 });
+    _ = try tr.clientMessage(at.hdr, at.body);
+
+    // First commit, no damage ever declared → null (full copy).
+    const c1 = enc(&buf, 4, 6, .{});
+    try t.expectEqual(@as(?RowRange, null), (try tr.clientMessage(c1.hdr, c1.body)).commit.damage);
+
+    // Two damage rects accumulate to one row bbox.
+    const d1 = enc(&buf, 4, 2, .{ 0, 4, 32, 4 }); // rows 4..8
+    _ = try tr.clientMessage(d1.hdr, d1.body);
+    const d2 = enc(&buf, 4, 9, .{ 0, 20, 32, 2 }); // damage_buffer rows 20..22
+    _ = try tr.clientMessage(d2.hdr, d2.body);
+    const c2 = enc(&buf, 4, 6, .{});
+    const dmg = (try tr.clientMessage(c2.hdr, c2.body)).commit.damage.?;
+    try t.expectEqual(@as(i32, 4), dmg.y0);
+    try t.expectEqual(@as(i32, 22), dmg.y1);
+
+    // Damage-using surface, commit with none declared → empty range.
+    const c3 = enc(&buf, 4, 6, .{});
+    const dmg3 = (try tr.clientMessage(c3.hdr, c3.body)).commit.damage.?;
+    try t.expectEqual(@as(i32, 0), dmg3.y1 - dmg3.y0);
 }
 
 test "protocol violations are errors" {

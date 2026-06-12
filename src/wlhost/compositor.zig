@@ -303,6 +303,27 @@ pub const Compositor = struct {
         }
     }
 
+    /// View → client: the host window was resized — tell the app to
+    /// redraw at the new size (it acks and commits a new buffer).
+    pub fn configureToplevel(self: *Compositor, sid: u32, w: i32, h: i32) Error!void {
+        const surf = self.surfaces.getPtr(sid) orelse return;
+        if (surf.toplevel == 0 or !surf.configured) return;
+        if (w <= 0 or h <= 0) return;
+        var buf: [64]u8 = undefined;
+        var b = wire.Builder.init(&buf, surf.toplevel, 0); // configure
+        b.putInt(w);
+        b.putInt(h);
+        var states: [8]u8 = undefined;
+        std.mem.writeInt(u32, states[0..4], 4, .little); // activated
+        std.mem.writeInt(u32, states[4..8], 3, .little); // resizing
+        b.putArray(&states);
+        try self.send(try b.finish());
+        var buf2: [16]u8 = undefined;
+        var b2 = wire.Builder.init(&buf2, surf.xdg_surface, 0); // configure
+        b2.putUint(self.nextSerial());
+        try self.send(try b2.finish());
+    }
+
     /// View → client: ask the app to close this toplevel (window
     /// close button). The app decides; nothing is destroyed here.
     pub fn requestClose(self: *Compositor, sid: u32) Error!void {
@@ -345,6 +366,14 @@ pub const Compositor = struct {
                 const end = @as(usize, upd.offset) + upd.bytes.len;
                 if (end > pool.bytes.items.len) return Error.Protocol;
                 @memcpy(pool.bytes.items[upd.offset..end], upd.bytes);
+            },
+            .pool_update_z => {
+                const upd = pipe.decodePoolUpdateZ(payload) orelse return Error.Protocol;
+                const pool = self.pools.getPtr(upd.pool) orelse return Error.Protocol;
+                const end = @as(usize, upd.offset) + upd.raw_len;
+                if (end > pool.bytes.items.len) return Error.Protocol;
+                _ = @import("zpool.zig").decompress(upd.z, pool.bytes.items[upd.offset..end]) catch
+                    return Error.Protocol;
             },
             .pool_destroy => {
                 if (payload.len >= 4) {

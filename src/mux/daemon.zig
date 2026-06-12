@@ -784,18 +784,40 @@ pub const Daemon = struct {
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
             },
             .commit => |cm| {
-                // v1 full copy of the committed buffer's extent;
-                // damage-based diffing comes later.
+                // Copy the damaged rows (full buffer when the client
+                // never declares damage). Rows are contiguous in the
+                // pool, so the range is one linear copy.
                 if (nv.pools.get(cm.info.pool)) |mirror| {
                     if (cm.info.offset >= 0 and cm.info.stride > 0 and cm.info.height > 0) {
-                        const off: usize = @intCast(cm.info.offset);
-                        const len: usize = @intCast(@as(i64, cm.info.stride) * @as(i64, cm.info.height));
-                        const end = @min(off +| len, mirror.size);
-                        var chunk = off;
-                        while (chunk < end) {
-                            const chunk_end = @min(chunk + POOL_CHUNK, end);
-                            try wlpipe.appendPoolUpdate(units, a, cm.info.pool, @intCast(chunk), mirror.ptr[chunk..chunk_end]);
-                            chunk = chunk_end;
+                        var y0: i64 = 0;
+                        var y1: i64 = cm.info.height;
+                        if (cm.damage) |d| {
+                            y0 = @max(y0, @as(i64, d.y0));
+                            y1 = @min(y1, @as(i64, d.y1));
+                        }
+                        if (y0 < y1) {
+                            const off: usize = @intCast(@as(i64, cm.info.offset) + y0 * cm.info.stride);
+                            const len: usize = @intCast((y1 - y0) * cm.info.stride);
+                            const end = @min(off +| len, mirror.size);
+                            var chunk = @min(off, end);
+                            while (chunk < end) {
+                                const chunk_end = @min(chunk + POOL_CHUNK, end);
+                                const raw = mirror.ptr[chunk..chunk_end];
+                                // Deflate when it shrinks (pixel rows
+                                // usually do); raw otherwise.
+                                var sent_z = false;
+                                if (raw.len >= 1024) {
+                                    if (a.alloc(u8, raw.len)) |zbuf| {
+                                        defer a.free(zbuf);
+                                        if (@import("../wlhost/zpool.zig").compress(raw, zbuf)) |z| {
+                                            try wlpipe.appendPoolUpdateZ(units, a, cm.info.pool, @intCast(chunk), @intCast(raw.len), z);
+                                            sent_z = true;
+                                        }
+                                    } else |_| {}
+                                }
+                                if (!sent_z) try wlpipe.appendPoolUpdate(units, a, cm.info.pool, @intCast(chunk), raw);
+                                chunk = chunk_end;
+                            }
                         }
                     }
                 }

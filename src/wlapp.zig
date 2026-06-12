@@ -35,6 +35,10 @@ pub const AppHost = struct {
         /// Committed buffer size — the surface coordinate space.
         buf_w: i32 = 0,
         buf_h: i32 = 0,
+        /// Last size sent via configureToplevel (resize feedback
+        /// guard: don't re-configure what the app already drew).
+        sent_w: i32 = 0,
+        sent_h: i32 = 0,
 
         /// Widget → surface coordinates (the picture stretches to
         /// the widget, content-fit FILL).
@@ -189,6 +193,12 @@ pub const AppHost = struct {
         _ = c.g_signal_connect_data(@ptrCast(focus), "leave", @ptrCast(&onFocusLeave), win, null, 0);
         c.gtk_widget_add_controller(@ptrCast(window), focus);
 
+        // Window resize → xdg configure, so the app redraws at the
+        // new size instead of us stretching stale pixels. GTK4 keeps
+        // default-width/height live while the user resizes.
+        _ = c.g_signal_connect_data(@ptrCast(window), "notify::default-width", @ptrCast(&onWinResize), win, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(window), "notify::default-height", @ptrCast(&onWinResize), win, null, 0);
+
         c.gtk_window_present(window);
         return win;
     }
@@ -298,6 +308,21 @@ pub const AppHost = struct {
         const win = cast.userData(Win, user);
         win.host.stampNow();
         win.host.comp.keyboardLeave() catch return;
+        win.host.flushHost();
+    }
+
+    fn onWinResize(_: ?*c.GtkWindow, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
+        var w: c_int = 0;
+        var h: c_int = 0;
+        c.gtk_window_get_default_size(win.window, &w, &h);
+        if (w <= 0 or h <= 0) return;
+        // Skip echoes of the size the app already drew (or that we
+        // already asked for) — configure storms upset some clients.
+        if ((w == win.buf_w and h == win.buf_h) or (w == win.sent_w and h == win.sent_h)) return;
+        win.sent_w = w;
+        win.sent_h = h;
+        win.host.comp.configureToplevel(win.surface, w, h) catch return;
         win.host.flushHost();
     }
 

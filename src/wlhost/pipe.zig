@@ -33,6 +33,10 @@ pub const Tag = enum(u8) {
     /// u32 keymap format, bytes. GUI→daemon; daemon materializes a
     /// memfd and emits the real wl_keyboard.keymap event itself.
     keymap = 6,
+    /// Deflated pool_update: u32 pool id, u32 offset, u32 raw len,
+    /// raw-deflate bytes (wlhost/zpool.zig). Senders use it only
+    /// when it shrinks; receivers must accept both forms.
+    pool_update_z = 7,
     _,
 };
 
@@ -61,6 +65,18 @@ pub fn appendPoolUpdate(out: *std.ArrayList(u8), allocator: std.mem.Allocator, p
     std.mem.writeInt(u32, hdr[9..13], offset, .little);
     try out.appendSlice(allocator, &hdr);
     try out.appendSlice(allocator, bytes);
+}
+
+/// Deflated pool update; `raw_len` is the inflated size.
+pub fn appendPoolUpdateZ(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pool: u32, offset: u32, raw_len: u32, z: []const u8) !void {
+    var hdr: [header_size + 12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(12 + z.len + 1), .little);
+    hdr[4] = @intFromEnum(Tag.pool_update_z);
+    std.mem.writeInt(u32, hdr[5..9], pool, .little);
+    std.mem.writeInt(u32, hdr[9..13], offset, .little);
+    std.mem.writeInt(u32, hdr[13..17], raw_len, .little);
+    try out.appendSlice(allocator, &hdr);
+    try out.appendSlice(allocator, z);
 }
 
 pub fn appendPoolMeta(out: *std.ArrayList(u8), allocator: std.mem.Allocator, tag: Tag, pool: u32, size: u32) !void {
@@ -96,6 +112,17 @@ pub fn decodePoolUpdate(payload: []const u8) ?struct { pool: u32, offset: u32, b
         .pool = std.mem.readInt(u32, payload[0..4], .little),
         .offset = std.mem.readInt(u32, payload[4..8], .little),
         .bytes = payload[8..],
+    };
+}
+
+/// Decoded pool_update_z payload view.
+pub fn decodePoolUpdateZ(payload: []const u8) ?struct { pool: u32, offset: u32, raw_len: u32, z: []const u8 } {
+    if (payload.len < 12) return null;
+    return .{
+        .pool = std.mem.readInt(u32, payload[0..4], .little),
+        .offset = std.mem.readInt(u32, payload[4..8], .little),
+        .raw_len = std.mem.readInt(u32, payload[8..12], .little),
+        .z = payload[12..],
     };
 }
 

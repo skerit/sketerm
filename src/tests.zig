@@ -65,6 +65,7 @@ comptime {
     _ = @import("wlhost/track.zig");
     _ = @import("wlhost/pipe.zig");
     _ = @import("wlhost/compositor.zig");
+    _ = @import("wlhost/zpool.zig");
 }
 
 test {
