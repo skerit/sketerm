@@ -335,7 +335,9 @@ fn runMuxApp(allocator: std.mem.Allocator, host: []const u8, command: []const []
     // Pipeline spawn + attach in back-to-back frames: the daemon
     // handles both in order before the freshly-spawned app can race
     // its first display connection against our attachment.
-    conn.sendJson(.spawn, .{ .name = name, .argv = command, .rows = @as(u16, 24), .cols = @as(u16, 80), .app = true }) catch {
+    // This client is headless: no compositor brain, only the local
+    // waypipe-client bridge — the session must use the waypipe wrap.
+    conn.sendJson(.spawn, .{ .name = name, .argv = command, .rows = @as(u16, 24), .cols = @as(u16, 80), .app = true, .wl_mode = "waypipe" }) catch {
         errMsg("spawn failed", .{});
         return 1;
     };

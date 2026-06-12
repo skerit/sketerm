@@ -33,6 +33,11 @@ pub const SpawnReq = struct {
     /// One-shot forwarded GUI app (`sketerm app -u`), not an
     /// interactive shell — listed differently by clients.
     app: bool = false,
+    /// Wayland forwarding mode for this session: "" = daemon
+    /// default, "native" = sketerm-native pipe, "waypipe" = legacy
+    /// wrap. Headless clients (`sketerm app -u`) need waypipe —
+    /// they have no compositor brain, only a waypipe-client bridge.
+    wl_mode: []const u8 = "",
 };
 
 pub const AttachReq = struct {
@@ -1217,12 +1222,23 @@ pub const Daemon = struct {
         // back into the legacy `waypipe server` wrap (e.g. for
         // GPU-buffer transfer); SKETERM_MUX_NO_WAYLAND=1 disables
         // app forwarding entirely.
-        const wl_mode = std.c.getenv("SKETERM_MUX_WAYLAND");
-        const use_waypipe = wl_mode != null and
-            std.mem.eql(u8, std.mem.span(wl_mode.?), "waypipe") and
-            waypipeAvailable();
+        var use_waypipe = false;
+        var forwarding_possible = true;
+        if (std.mem.eql(u8, req.wl_mode, "waypipe")) {
+            // The client can ONLY bridge waypipe (headless `sketerm
+            // app -u`): without waypipe here, forwarding is off —
+            // a native session would dead-end at that client.
+            use_waypipe = true;
+            forwarding_possible = waypipeAvailable();
+        } else if (!std.mem.eql(u8, req.wl_mode, "native")) {
+            const env = std.c.getenv("SKETERM_MUX_WAYLAND");
+            use_waypipe = env != null and
+                std.mem.eql(u8, std.mem.span(env.?), "waypipe") and
+                waypipeAvailable();
+        }
         const native_wayland = !use_waypipe;
-        const want_wayland = std.c.getenv("SKETERM_MUX_NO_WAYLAND") == null and
+        const want_wayland = forwarding_possible and
+            std.c.getenv("SKETERM_MUX_NO_WAYLAND") == null and
             req.argv.len > 0 and !std.mem.eql(u8, std.fs.path.basename(req.argv[0]), "waypipe");
         var hub: ?WaylandHub = if (want_wayland) self.setupWaylandHub(native_wayland) else null;
         errdefer if (hub) |h| {
