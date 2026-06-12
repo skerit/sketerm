@@ -60,6 +60,8 @@ comptime {
     _ = @import("grid/image_pipeline_test.zig");
     _ = @import("grid/bidi.zig");
     _ = @import("grid/schemes.zig");
+    _ = @import("wlhost/wire.zig");
+    _ = @import("wlhost/protocol.zig");
 }
 
 test {
