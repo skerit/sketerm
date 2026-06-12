@@ -58,6 +58,16 @@ pub const View = struct {
     /// PARENT surface's coordinate space.
     popup_new: ?*const fn (ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void = null,
     popup_gone: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
+    /// The app announced a clipboard selection with a usable text
+    /// mime. Call fetchClipboard to pull the content.
+    clipboard_offer: ?*const fn (ctx: ?*anyopaque, source: u32, mime: []const u8) void = null,
+    /// Content fetched from the app (answer to fetchClipboard) —
+    /// hand it to the host clipboard.
+    clipboard_data: ?*const fn (ctx: ?*anyopaque, bytes: []const u8) void = null,
+    /// The app wants to paste: read the host clipboard and answer
+    /// with sendClipData (ALWAYS answer, even empty — the daemon
+    /// holds a pipe fd FIFO-paired with the answers).
+    clipboard_read: ?*const fn (ctx: ?*anyopaque, mime: []const u8) void = null,
 };
 
 const Global = struct {
@@ -74,6 +84,8 @@ const globals = [_]Global{
     .{ .name = 3, .iface = &protocol.wl_seat, .version = 1 },
     .{ .name = 4, .iface = &protocol.wl_output, .version = 2 },
     .{ .name = 5, .iface = &protocol.xdg_wm_base, .version = 2 },
+    // v1 = selection only, no dnd action machinery.
+    .{ .name = 6, .iface = &protocol.wl_data_device_manager, .version = 1 },
 };
 
 const Pool = struct {
@@ -173,6 +185,12 @@ pub const Compositor = struct {
     positioners: std.AutoHashMapUnmanaged(u32, Positioner) = .empty,
     /// Surface id of the popup holding an explicit grab (0 = none).
     grabbed_popup: u32 = 0,
+    /// Clipboard: app-side data sources and their offered mimes
+    /// (owned strings), bound data devices, server-created offers.
+    data_sources: std.AutoHashMapUnmanaged(u32, std.ArrayList([]u8)) = .empty,
+    data_devices: std.ArrayList(u32) = .empty,
+    /// Next server-allocated object id (data offers).
+    next_server_id: u32 = 0xff000000,
     /// Bound input devices (a client may bind several of each).
     pointers: std.ArrayList(u32) = .empty,
     keyboards: std.ArrayList(u32) = .empty,
@@ -208,6 +226,13 @@ pub const Compositor = struct {
         self.surfaces.deinit(a);
         self.xdg_map.deinit(a);
         self.positioners.deinit(a);
+        var dit = self.data_sources.valueIterator();
+        while (dit.next()) |mimes| {
+            for (mimes.items) |m| a.free(m);
+            mimes.deinit(a);
+        }
+        self.data_sources.deinit(a);
+        self.data_devices.deinit(a);
         self.pointers.deinit(a);
         self.keyboards.deinit(a);
         self.frame_scratch.deinit(a);
@@ -365,6 +390,59 @@ pub const Compositor = struct {
         }
     }
 
+    /// Best text-ish mime an app-side source offers (preference
+    /// order matches what GTK itself advertises).
+    fn bestTextMime(self: *Compositor, source: u32) ?[]const u8 {
+        const mimes = self.data_sources.get(source) orelse return null;
+        for ([_][]const u8{ "text/plain;charset=utf-8", "UTF8_STRING", "text/plain" }) |want| {
+            for (mimes.items) |m| {
+                if (std.mem.eql(u8, m, want)) return m;
+            }
+        }
+        return null;
+    }
+
+    /// View → client: pull the app's announced clipboard content.
+    /// The daemon pipes it; the answer arrives as clipboard_data.
+    pub fn fetchClipboard(self: *Compositor, source: u32, mime: []const u8) Error!void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, source, .little);
+        try payload.appendSlice(self.allocator, &idb);
+        try payload.appendSlice(self.allocator, mime);
+        try pipe.appendUnit(&self.out, self.allocator, .clip_send, payload.items);
+    }
+
+    /// View → client: paste bytes answering the oldest outstanding
+    /// clipboard_read (the daemon writes them into the held fd).
+    pub fn sendClipData(self: *Compositor, bytes: []const u8) Error!void {
+        try pipe.appendUnit(&self.out, self.allocator, .clip_data, bytes);
+    }
+
+    /// View → client: announce the HOST clipboard to the app so it
+    /// can paste: a fresh server-created data offer per call, sent
+    /// to every bound data device.
+    pub fn offerSelection(self: *Compositor, mime: []const u8) Error!void {
+        for (self.data_devices.items) |dev| {
+            const id = self.next_server_id;
+            self.next_server_id += 1;
+            try self.objects.put(self.allocator, id, &protocol.wl_data_offer);
+            var buf: [16]u8 = undefined;
+            var b = wire.Builder.init(&buf, dev, 0); // data_offer(new_id)
+            b.putNewId(id);
+            try self.send(try b.finish());
+            var mbuf: [128]u8 = undefined;
+            var bm = wire.Builder.init(&mbuf, id, 0); // offer(mime)
+            bm.putString(mime);
+            try self.send(try bm.finish());
+            var sbuf: [16]u8 = undefined;
+            var bs = wire.Builder.init(&sbuf, dev, 5); // selection(offer)
+            bs.putObject(id);
+            try self.send(try bs.finish());
+        }
+    }
+
     /// View → client: a click landed outside a grabbed popup —
     /// tell the app to dismiss it (xdg_popup.popup_done). No-op
     /// when nothing is grabbed.
@@ -462,6 +540,10 @@ pub const Compositor = struct {
                         _ = self.pools.remove(id);
                     }
                 }
+            },
+            .clip_data => {
+                // Fetched app clipboard content (answer to clip_send).
+                if (self.view.clipboard_data) |cb| cb(self.view.ctx, payload);
             },
             else => {}, // forward compat
         }
@@ -609,6 +691,59 @@ pub const Compositor = struct {
         } else if (iface == &protocol.wl_output) {
             // release — lenient even though we advertise v2.
             try self.destroyObject(hdr.object);
+        } else if (iface == &protocol.wl_data_device_manager) switch (hdr.opcode) {
+            0 => { // create_data_source
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.wl_data_source);
+                try self.data_sources.put(self.allocator, id, .empty);
+            },
+            1 => { // get_data_device(id, seat)
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.wl_data_device);
+                try self.data_devices.append(self.allocator, id);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wl_data_source) switch (hdr.opcode) {
+            0 => { // offer(mime)
+                const mime = (try it.next()).?.string orelse return Error.Protocol;
+                const mimes = self.data_sources.getPtr(hdr.object) orelse return Error.Protocol;
+                const owned = try self.allocator.dupe(u8, mime);
+                errdefer self.allocator.free(owned);
+                try mimes.append(self.allocator, owned);
+            },
+            1 => { // destroy
+                if (self.data_sources.getPtr(hdr.object)) |mimes| {
+                    for (mimes.items) |m| self.allocator.free(m);
+                    mimes.deinit(self.allocator);
+                    _ = self.data_sources.remove(hdr.object);
+                }
+                try self.destroyObject(hdr.object);
+            },
+            else => {}, // set_actions — dnd, ignored at v1
+        } else if (iface == &protocol.wl_data_device) switch (hdr.opcode) {
+            0 => {}, // start_drag — dnd unsupported in v1
+            1 => { // set_selection(?source, serial)
+                const source = (try it.next()).?.object;
+                if (source != 0) {
+                    if (self.bestTextMime(source)) |mime| {
+                        if (self.view.clipboard_offer) |cb| cb(self.view.ctx, source, mime);
+                    }
+                }
+            },
+            2 => { // release
+                removeId(&self.data_devices, hdr.object);
+                try self.destroyObject(hdr.object);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wl_data_offer) switch (hdr.opcode) {
+            0 => {}, // accept — dnd negotiation, ignored
+            1 => { // receive(mime, fd) — the paste; fd is held by
+                // the daemon, FIFO-paired with sendClipData answers.
+                const mime = (try it.next()).?.string orelse return Error.Protocol;
+                if (self.view.clipboard_read) |cb| cb(self.view.ctx, mime);
+            },
+            2 => try self.destroyObject(hdr.object), // destroy
+            else => {}, // finish/set_actions — dnd, ignored
         } else if (iface == &protocol.xdg_wm_base) switch (hdr.opcode) {
             0 => try self.destroyObject(hdr.object), // destroy
             1 => { // create_positioner
@@ -981,6 +1116,12 @@ const TestView = struct {
     popup_x: i32 = 0,
     popup_y: i32 = 0,
     popup_parent: u32 = 0,
+    clip_source: u32 = 0,
+    clip_mime: [64]u8 = undefined,
+    clip_mime_len: usize = 0,
+    clip_data: [64]u8 = undefined,
+    clip_data_len: usize = 0,
+    clip_reads: usize = 0,
 
     fn onNew(ctx: ?*anyopaque, surface: u32) void {
         _ = surface;
@@ -1023,6 +1164,23 @@ const TestView = struct {
         self.popups_gone += 1;
     }
 
+    fn onClipOffer(ctx: ?*anyopaque, source: u32, mime: []const u8) void {
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.clip_source = source;
+        self.clip_mime_len = @min(mime.len, self.clip_mime.len);
+        @memcpy(self.clip_mime[0..self.clip_mime_len], mime[0..self.clip_mime_len]);
+    }
+    fn onClipData(ctx: ?*anyopaque, bytes: []const u8) void {
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.clip_data_len = @min(bytes.len, self.clip_data.len);
+        @memcpy(self.clip_data[0..self.clip_data_len], bytes[0..self.clip_data_len]);
+    }
+    fn onClipRead(ctx: ?*anyopaque, mime: []const u8) void {
+        _ = mime;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.clip_reads += 1;
+    }
+
     fn view(self: *TestView) View {
         return .{
             .ctx = self,
@@ -1032,6 +1190,9 @@ const TestView = struct {
             .toplevel_gone = onGone,
             .popup_new = onPopupNew,
             .popup_gone = onPopupGone,
+            .clipboard_offer = onClipOffer,
+            .clipboard_data = onClipData,
+            .clipboard_read = onClipRead,
         };
     }
 };
@@ -1309,6 +1470,90 @@ test "seat: devices bind, keymap unit emitted, input events flow" {
     try comp.pointerMotion(1, 1);
     try comp.keyboardKey(38, false);
     try t.expectEqual(@as(usize, 0), comp.takeOut().len);
+}
+
+test "clipboard: copy offer, fetch, paste offer, receive answer" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [80]u8 = undefined;
+
+    { // registry(2) + bind manager(name 6) → 3
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 2, 0);
+        b1.putUint(6);
+        b1.putString("wl_data_device_manager");
+        b1.putUint(1);
+        b1.putNewId(3);
+        try req(&comp, try b1.finish());
+    }
+    { // create_data_source(4) + offers + get_data_device(5, seat 0)
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(4);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 4, 0);
+        b1.putString("image/png");
+        try req(&comp, try b1.finish());
+        var b2 = wire.Builder.init(&buf, 4, 0);
+        b2.putString("text/plain;charset=utf-8");
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 3, 1);
+        b3.putNewId(5);
+        b3.putObject(0);
+        try req(&comp, try b3.finish());
+    }
+    { // set_selection(source 4) → clipboard_offer with the text mime
+        var b = wire.Builder.init(&buf, 5, 1);
+        b.putObject(4);
+        b.putUint(1);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(u32, 4), tv.clip_source);
+    try t.expectEqualStrings("text/plain;charset=utf-8", tv.clip_mime[0..tv.clip_mime_len]);
+
+    // fetchClipboard → clip_send unit; clip_data unit → callback.
+    comp.clearOut();
+    try comp.fetchClipboard(4, "text/plain;charset=utf-8");
+    {
+        const p = (try pipe.peelUnit(comp.takeOut())).?;
+        try t.expectEqual(pipe.Tag.clip_send, p.unit.tag);
+        try t.expectEqual(@as(u32, 4), std.mem.readInt(u32, p.unit.payload[0..4], .little));
+    }
+    comp.clearOut();
+    {
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        try pipe.appendUnit(&unit, t.allocator, .clip_data, "COPIED");
+        try comp.feed(unit.items);
+    }
+    try t.expectEqualStrings("COPIED", tv.clip_data[0..tv.clip_data_len]);
+
+    // offerSelection → data_offer/offer/selection toward device 5,
+    // then receive on the server-created offer → clipboard_read.
+    comp.clearOut();
+    try comp.offerSelection("text/plain;charset=utf-8");
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    try t.expectEqual(@as(usize, 3), evs.items.len);
+    try t.expectEqual([2]u32{ 5, 0 }, evs.items[0]); // data_offer
+    try t.expectEqual([2]u32{ 0xff000000, 0 }, .{ evs.items[1][0], evs.items[1][1] }); // offer(mime)
+    try t.expectEqual([2]u32{ 5, 5 }, evs.items[2]); // selection
+    {
+        var b = wire.Builder.init(&buf, 0xff000000, 1); // receive
+        b.putString("text/plain;charset=utf-8");
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.clip_reads);
+    comp.clearOut();
+    try comp.sendClipData("PASTED");
+    {
+        const p = (try pipe.peelUnit(comp.takeOut())).?;
+        try t.expectEqual(pipe.Tag.clip_data, p.unit.tag);
+        try t.expectEqualStrings("PASTED", p.unit.payload);
+    }
 }
 
 test "popup lifecycle: positioner place, configure, frame, grab dismiss" {

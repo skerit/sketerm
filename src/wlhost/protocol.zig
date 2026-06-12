@@ -266,6 +266,72 @@ pub const wl_output = Interface{
     },
 };
 
+// ─── data device (clipboard / dnd) ──────────────────────────────
+
+pub const wl_data_offer = Interface{
+    .name = "wl_data_offer",
+    .version = 3,
+    .requests = &.{
+        .{ .name = "accept", .sig = "u?s" },
+        .{ .name = "receive", .sig = "sh" },
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "finish", .sig = "", .since = 3 },
+        .{ .name = "set_actions", .sig = "uu", .since = 3 },
+    },
+    .events = &.{
+        .{ .name = "offer", .sig = "s" },
+        .{ .name = "source_actions", .sig = "u", .since = 3 },
+        .{ .name = "action", .sig = "u", .since = 3 },
+    },
+};
+
+pub const wl_data_source = Interface{
+    .name = "wl_data_source",
+    .version = 3,
+    .requests = &.{
+        .{ .name = "offer", .sig = "s" },
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "set_actions", .sig = "u", .since = 3 },
+    },
+    .events = &.{
+        .{ .name = "target", .sig = "?s" },
+        .{ .name = "send", .sig = "sh" },
+        .{ .name = "cancelled", .sig = "" },
+        .{ .name = "dnd_drop_performed", .sig = "", .since = 3 },
+        .{ .name = "dnd_finished", .sig = "", .since = 3 },
+        .{ .name = "action", .sig = "u", .since = 3 },
+    },
+};
+
+pub const wl_data_device = Interface{
+    .name = "wl_data_device",
+    .version = 3,
+    .requests = &.{
+        .{ .name = "start_drag", .sig = "?oo?ou" },
+        .{ .name = "set_selection", .sig = "?ou" },
+        .{ .name = "release", .sig = "", .since = 2 },
+    },
+    .events = &.{
+        // The ONE server-created object in our scope — both the
+        // daemon tracker and clients register it from this event.
+        .{ .name = "data_offer", .sig = "n", .new_id_iface = &wl_data_offer },
+        .{ .name = "enter", .sig = "uoff?o" },
+        .{ .name = "leave", .sig = "" },
+        .{ .name = "motion", .sig = "uff" },
+        .{ .name = "drop", .sig = "" },
+        .{ .name = "selection", .sig = "?o" },
+    },
+};
+
+pub const wl_data_device_manager = Interface{
+    .name = "wl_data_device_manager",
+    .version = 3,
+    .requests = &.{
+        .{ .name = "create_data_source", .sig = "n", .new_id_iface = &wl_data_source },
+        .{ .name = "get_data_device", .sig = "no", .new_id_iface = &wl_data_device },
+    },
+};
+
 // ─── xdg-shell ──────────────────────────────────────────────────
 
 pub const xdg_wm_base = Interface{
@@ -357,11 +423,12 @@ pub const xdg_popup = Interface{
 };
 
 pub const all = [_]*const Interface{
-    &wl_display,    &wl_registry,  &wl_callback, &wl_compositor,
-    &wl_shm,        &wl_shm_pool,  &wl_buffer,   &wl_surface,
-    &wl_region,     &wl_seat,      &wl_pointer,  &wl_keyboard,
-    &wl_touch,      &wl_output,    &xdg_wm_base, &xdg_positioner,
-    &xdg_surface,   &xdg_toplevel, &xdg_popup,
+    &wl_display,     &wl_registry,    &wl_callback,    &wl_compositor,
+    &wl_shm,         &wl_shm_pool,    &wl_buffer,      &wl_surface,
+    &wl_region,      &wl_seat,        &wl_pointer,     &wl_keyboard,
+    &wl_touch,       &wl_output,      &xdg_wm_base,    &xdg_positioner,
+    &xdg_surface,    &xdg_toplevel,   &xdg_popup,      &wl_data_offer,
+    &wl_data_source, &wl_data_device, &wl_data_device_manager,
 };
 
 // ─── tests ──────────────────────────────────────────────────────
@@ -372,7 +439,7 @@ test "find resolves every table entry, rejects unknowns" {
     for (all) |iface| {
         try t.expectEqual(iface, find(iface.name).?);
     }
-    try t.expectEqual(@as(?*const Interface, null), find("wl_data_device"));
+    try t.expectEqual(@as(?*const Interface, null), find("wl_subcompositor"));
 }
 
 test "fd counting" {
@@ -388,9 +455,12 @@ test "every 'n' signature names its interface (except registry.bind)" {
             if (iface == &wl_registry) continue;
             try t.expectEqual(has_n, msg.new_id_iface != null);
         }
-        // Events never create objects in our advertised set.
+        // wl_data_device.data_offer is the lone server-created
+        // object; every other event creates nothing.
         for (iface.events) |*msg| {
-            try t.expectEqual(@as(?*const Interface, null), msg.new_id_iface);
+            const has_n = std.mem.indexOfScalar(u8, msg.sig, 'n') != null;
+            try t.expectEqual(has_n, msg.new_id_iface != null);
+            if (has_n) try t.expectEqual(&wl_data_device, iface);
         }
     }
 }

@@ -37,6 +37,16 @@ pub const Tag = enum(u8) {
     /// raw-deflate bytes (wlhost/zpool.zig). Senders use it only
     /// when it shrinks; receivers must accept both forms.
     pool_update_z = 7,
+    /// u32 data_source id, mime string. GUI→daemon: fetch the
+    /// app's clipboard offer — the daemon creates a pipe, sends
+    /// wl_data_source.send(mime, fd) itself, and answers with a
+    /// clip_data unit when the app closes its end. One outstanding
+    /// fetch at a time per channel (FIFO pairing).
+    clip_send = 8,
+    /// Raw clipboard bytes. Daemon→GUI: the answer to clip_send.
+    /// GUI→daemon: paste bytes for the oldest held receive-fd
+    /// (wl_data_offer.receive's fd, FIFO-paired).
+    clip_data = 9,
     _,
 };
 

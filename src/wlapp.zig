@@ -30,6 +30,14 @@ pub const AppHost = struct {
     /// events) immediately rather than on the next feed.
     on_flush: ?*const fn (ctx: ?*anyopaque) void = null,
     flush_ctx: ?*anyopaque = null,
+    /// GTK async clipboard reads in flight — their callbacks hold
+    /// this AppHost, so destroy() defers the final free until they
+    /// all land (doomed marks the limbo state).
+    pending_reads: u32 = 0,
+    doomed: bool = false,
+    /// Surface that last got a clipboard offer — re-offer happens
+    /// per keyboard-focus change, not per keystroke.
+    offered_focus: u32 = 0,
 
     const Popup = struct {
         host: *AppHost,
@@ -88,11 +96,15 @@ pub const AppHost = struct {
             .toplevel_gone = onGone,
             .popup_new = onPopupNew,
             .popup_gone = onPopupGone,
+            .clipboard_offer = onClipOffer,
+            .clipboard_data = onClipData,
+            .clipboard_read = onClipRead,
         });
         return self;
     }
 
     pub fn destroy(self: *AppHost) void {
+        self.dead = true;
         var it = self.windows.valueIterator();
         while (it.next()) |w| {
             // Break the close-request link before gtk teardown.
@@ -104,6 +116,14 @@ pub const AppHost = struct {
         var pit = self.popups.valueIterator();
         while (pit.next()) |p| self.allocator.destroy(p.*);
         self.popups.deinit(self.allocator);
+        if (self.pending_reads > 0) {
+            self.doomed = true;
+            return;
+        }
+        self.finalFree();
+    }
+
+    fn finalFree(self: *AppHost) void {
         self.comp.deinit();
         self.allocator.destroy(self);
     }
@@ -394,6 +414,13 @@ pub const AppHost = struct {
         win.host.stampNow();
         const target = if (win.host.comp.grabbed_popup != 0) win.host.comp.grabbed_popup else win.surface;
         win.host.comp.keyboardEnter(target) catch return;
+        // First key toward a newly focused surface: make sure it
+        // has a host-clipboard offer to paste from (the focus
+        // controller alone is unreliable under bare X).
+        if (win.host.offered_focus != win.host.comp.keyboard_focus) {
+            win.host.offered_focus = win.host.comp.keyboard_focus;
+            win.host.comp.offerSelection("text/plain;charset=utf-8") catch {};
+        }
         // GDK's low modifier bits are the X11/xkb mod order the
         // pc105/us keymap uses (shift, lock, ctrl, mod1…).
         win.host.comp.keyboardModifiers(@as(u32, @intCast(state)) & 0xff, 0, 0, 0) catch return;
@@ -417,6 +444,11 @@ pub const AppHost = struct {
         const win = cast.userData(Win, user);
         win.host.stampNow();
         win.host.comp.keyboardEnter(win.surface) catch return;
+        // Fresh offer per focus: the host clipboard may have changed
+        // while the app was unfocused. Empty clipboards just paste
+        // empty (the async read answers honestly either way).
+        win.host.offered_focus = win.host.comp.keyboard_focus;
+        win.host.comp.offerSelection("text/plain;charset=utf-8") catch {};
         win.host.flushHost();
     }
 
@@ -425,6 +457,56 @@ pub const AppHost = struct {
         win.host.stampNow();
         win.host.comp.keyboardLeave() catch return;
         win.host.flushHost();
+    }
+
+    // ── clipboard bridge (compositor seat ↔ GdkClipboard) ───────
+
+    fn gdkClipboard() ?*c.GdkClipboard {
+        const display = c.gdk_display_get_default() orelse return null;
+        return c.gdk_display_get_clipboard(display);
+    }
+
+    /// App announced a copy: pull the content through the pipe; the
+    /// answer lands in onClipData.
+    fn onClipOffer(ctx: ?*anyopaque, source: u32, mime: []const u8) void {
+        const self = cast.userData(AppHost, ctx);
+        self.comp.fetchClipboard(source, mime) catch return;
+        self.flushHost();
+    }
+
+    /// Fetched app clipboard content → host clipboard.
+    fn onClipData(ctx: ?*anyopaque, bytes: []const u8) void {
+        const self = cast.userData(AppHost, ctx);
+        const clipboard = gdkClipboard() orelse return;
+        const z = self.allocator.dupeZ(u8, bytes) catch return;
+        defer self.allocator.free(z);
+        c.gdk_clipboard_set_text(clipboard, z.ptr);
+    }
+
+    /// App wants to paste: async-read the host clipboard; ALWAYS
+    /// answer (the daemon holds a pipe fd per outstanding read).
+    fn onClipRead(ctx: ?*anyopaque, mime: []const u8) void {
+        _ = mime; // text-only scope
+        const self = cast.userData(AppHost, ctx);
+        const clipboard = gdkClipboard() orelse {
+            self.comp.sendClipData("") catch return;
+            self.flushHost();
+            return;
+        };
+        self.pending_reads += 1;
+        c.gdk_clipboard_read_text_async(clipboard, null, @ptrCast(&onClipReadDone), self);
+    }
+
+    fn onClipReadDone(src: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(AppHost, user);
+        const text = c.gdk_clipboard_read_text_finish(@ptrCast(src), res, null);
+        defer if (text != null) c.g_free(text);
+        if (!self.dead) {
+            const bytes: []const u8 = if (text) |tp| std.mem.span(@as([*:0]const u8, @ptrCast(tp))) else "";
+            if (self.comp.sendClipData(bytes)) self.flushHost() else |_| {}
+        }
+        self.pending_reads -= 1;
+        if (self.doomed and self.pending_reads == 0) self.finalFree();
     }
 
     fn onWinResize(_: ?*c.GtkWindow, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {

@@ -190,9 +190,20 @@ const Native = struct {
     /// Early arrival is fine — libwayland queues fds until the
     /// consuming message shows up; late is the only fatal order.
     out_fds: std.ArrayList(c_int) = .empty,
+    /// Paste: write-ends from wl_data_offer.receive, FIFO-paired
+    /// with clip_data units coming from the GUI.
+    clip_paste_fds: std.ArrayList(c_int) = .empty,
+    /// Copy: read-ends of pipes whose write-ends went to the app
+    /// via wl_data_source.send; EOF ships a clip_data unit up.
+    clip_reads: std.ArrayList(ClipRead) = .empty,
     /// pool id → mmapped mirror. Mirrors outlive wl_shm_pool
     /// destructors: existing buffers keep referencing the memory.
     pools: std.AutoHashMapUnmanaged(u32, PoolMirror) = .empty,
+
+    const ClipRead = struct {
+        fd: c_int,
+        buf: std.ArrayList(u8) = .empty,
+    };
 
     const PoolMirror = struct {
         fd: c_int,
@@ -211,6 +222,13 @@ const Native = struct {
         self.fds.deinit(self.allocator);
         for (self.out_fds.items) |fd| _ = c.close(fd);
         self.out_fds.deinit(self.allocator);
+        for (self.clip_paste_fds.items) |fd| _ = c.close(fd);
+        self.clip_paste_fds.deinit(self.allocator);
+        for (self.clip_reads.items) |*cr| {
+            _ = c.close(cr.fd);
+            cr.buf.deinit(self.allocator);
+        }
+        self.clip_reads.deinit(self.allocator);
         self.inbuf.deinit(self.allocator);
         self.unitbuf.deinit(self.allocator);
         self.tracker.deinit();
@@ -330,6 +348,18 @@ pub const Daemon = struct {
                 .revents = 0,
             });
         }
+        const clip_base = fds.items.len;
+        for (self.channels.items) |ch| {
+            if (ch.native) |nv| {
+                for (nv.clip_reads.items) |cr| {
+                    try fds.append(self.allocator, .{
+                        .fd = if (ch.dead) -1 else cr.fd,
+                        .events = c.POLLIN,
+                        .revents = 0,
+                    });
+                }
+            }
+        }
 
         const pr = c.poll(fds.items.ptr, @intCast(fds.items.len), timeout_ms);
         if (pr < 0) return; // EINTR etc — next tick retries
@@ -368,6 +398,23 @@ pub const Daemon = struct {
             if (!ch.dead and re & c.POLLOUT != 0) self.channelWritable(ch);
             if (!ch.dead and re & (c.POLLHUP | c.POLLERR) != 0 and re & c.POLLIN == 0)
                 self.closeChannel(ch, true);
+        }
+
+        // Clipboard-fetch pipes (snapshot the count: clip_reads may
+        // shrink while we drain, never grow — chan reads above can
+        // append, but those fds weren't polled this tick).
+        var clip_idx: usize = 0;
+        for (self.channels.items) |ch| {
+            const nv = ch.native orelse continue;
+            var j: usize = 0;
+            while (j < nv.clip_reads.items.len and clip_base + clip_idx < fds.items.len) {
+                const re = fds.items[clip_base + clip_idx].revents;
+                clip_idx += 1;
+                if (re & (c.POLLIN | c.POLLHUP) != 0 and !ch.dead) {
+                    if (self.clipReadable(ch, j)) continue; // removed; j stays
+                }
+                j += 1;
+            }
         }
 
         self.reap();
@@ -749,6 +796,17 @@ pub const Daemon = struct {
         const a = self.allocator;
         switch (action) {
             .relay, .buffer_create, .buffer_destroy => try wlpipe.appendUnit(units, a, .wl_msg, msgb),
+            .clip_receive => {
+                // App wants to paste: hold the write-end until the
+                // GUI ships clip_data; relay so the GUI knows the
+                // mime asked for.
+                const fd = nv.popFd() orelse return error.MissingFd;
+                nv.clip_paste_fds.append(a, fd) catch {
+                    _ = c.close(fd);
+                    return error.MissingFd;
+                };
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+            },
             .pool_create => |p| {
                 const fd = nv.popFd() orelse return error.MissingFd;
                 errdefer _ = c.close(fd);
@@ -846,6 +904,41 @@ pub const Daemon = struct {
         }
     }
 
+    /// One clipboard-fetch pipe is readable: drain it; on EOF ship
+    /// the collected bytes up as a clip_data unit and drop the
+    /// entry. Returns true when the entry was removed.
+    fn clipReadable(self: *Daemon, ch: *Channel, idx: usize) bool {
+        const nv = ch.native.?;
+        const cr = &nv.clip_reads.items[idx];
+        var done = false;
+        while (true) {
+            var buf: [4096]u8 = undefined;
+            const r = c.read(cr.fd, &buf, buf.len);
+            if (r > 0) {
+                // Cap pathological sources at 16 MB.
+                if (cr.buf.items.len < (16 << 20)) {
+                    cr.buf.appendSlice(nv.allocator, buf[0..@intCast(r)]) catch {
+                        done = true;
+                        break;
+                    };
+                }
+                continue;
+            }
+            if (r < 0 and std.posix.errno(r) == .AGAIN) break;
+            done = true; // EOF or error
+            break;
+        }
+        if (!done) return false;
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(self.allocator);
+        wlpipe.appendUnit(&units, self.allocator, .clip_data, cr.buf.items) catch {};
+        if (units.items.len > 0) self.queueUnits(ch, units.items);
+        _ = c.close(cr.fd);
+        cr.buf.deinit(nv.allocator);
+        _ = nv.clip_reads.orderedRemove(idx);
+        return true;
+    }
+
     /// GUI→app bytes on a native channel: peel pipe units, write the
     /// Wayland events through to the app, watch for delete_id.
     fn nativeClientData(self: *Daemon, ch: *Channel, bytes: []const u8) void {
@@ -915,6 +1008,55 @@ pub const Daemon = struct {
                     nv.out_fds.append(nv.allocator, fd) catch {
                         _ = c.close(fd);
                     };
+                },
+                .clip_send => {
+                    // GUI fetches the app's clipboard: pipe(), the
+                    // write-end rides a wl_data_source.send event,
+                    // the read-end is polled until the app's EOF.
+                    const pl = peeled.unit.payload;
+                    if (pl.len < 4) break;
+                    const source = std.mem.readInt(u32, pl[0..4], .little);
+                    const mime = pl[4..];
+                    var pfds: [2]c_int = undefined;
+                    if (c.pipe(&pfds) != 0) break;
+                    _ = c.fcntl(pfds[0], c.F_SETFD, c.FD_CLOEXEC);
+                    _ = c.fcntl(pfds[1], c.F_SETFD, c.FD_CLOEXEC);
+                    const fl = c.fcntl(pfds[0], c.F_GETFL, @as(c_int, 0));
+                    _ = c.fcntl(pfds[0], c.F_SETFL, fl | c.O_NONBLOCK);
+
+                    var mbuf: [256]u8 = undefined;
+                    var b = wlwire.Builder.init(&mbuf, source, 1); // send
+                    b.putString(mime);
+                    const msg = b.finish() catch {
+                        _ = c.close(pfds[0]);
+                        _ = c.close(pfds[1]);
+                        break;
+                    };
+                    ch.pending.appendSlice(ch.allocator, msg) catch {
+                        _ = c.close(pfds[0]);
+                        _ = c.close(pfds[1]);
+                        self.closeChannel(ch, true);
+                        return;
+                    };
+                    nv.out_fds.append(nv.allocator, pfds[1]) catch {
+                        _ = c.close(pfds[1]);
+                    };
+                    nv.clip_reads.append(nv.allocator, .{ .fd = pfds[0] }) catch {
+                        _ = c.close(pfds[0]);
+                    };
+                },
+                .clip_data => {
+                    // Paste bytes for the oldest held receive-fd.
+                    if (nv.clip_paste_fds.items.len == 0) break;
+                    const fd = nv.clip_paste_fds.orderedRemove(0);
+                    const data = peeled.unit.payload;
+                    var written: usize = 0;
+                    while (written < data.len) {
+                        const w = c.write(fd, data.ptr + written, data.len - written);
+                        if (w <= 0) break;
+                        written += @intCast(w);
+                    }
+                    _ = c.close(fd);
                 },
                 // Unknown tags skip for forward compat.
                 else => {},

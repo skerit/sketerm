@@ -47,6 +47,10 @@ pub const Action = union(enum) {
         format: u32,
     },
     buffer_destroy: struct { id: u32 },
+    /// wl_data_offer.receive — the app wants to paste: the message
+    /// carries one fd the daemon must hold until the GUI ships the
+    /// clipboard bytes (clip_data unit, FIFO-paired).
+    clip_receive: struct { offer: u32 },
     /// wl_surface.commit with a live attached buffer: replicate
     /// that buffer's bytes before relaying the commit. Geometry is
     /// resolved from the tracked buffer so the daemon can copy
@@ -181,6 +185,8 @@ pub const Tracker = struct {
         };
         if (iface == &protocol.wl_buffer and hdr.opcode == 0)
             return .{ .buffer_destroy = .{ .id = hdr.object } };
+        if (iface == &protocol.wl_data_offer and hdr.opcode == 1)
+            return .{ .clip_receive = .{ .offer = hdr.object } };
         if (iface == &protocol.wl_surface) switch (hdr.opcode) {
             1 => { // attach
                 var it = wire.ArgIter.init(body, msg.sig);
@@ -240,17 +246,33 @@ pub const Tracker = struct {
         }
     }
 
-    /// One complete compositor→client message. Only
-    /// wl_display.delete_id mutates tracker state.
+    /// One complete compositor→client message. Two cases mutate
+    /// tracker state: wl_display.delete_id frees ids, and events
+    /// that CREATE objects (wl_data_device.data_offer is the only
+    /// one in scope) register them so the client's requests on the
+    /// new id dispatch.
     pub fn serverMessage(self: *Tracker, hdr: wire.Header, body: []const u8) Error!void {
-        if (hdr.object != 1 or hdr.opcode != 1) return; // not delete_id
-        var it = wire.ArgIter.init(body, "u");
-        const id = (try it.next()).?.uint;
-        _ = self.objects.remove(id);
-        _ = self.attached.remove(id);
-        _ = self.buffers.remove(id);
-        _ = self.damage.remove(id);
-        _ = self.uses_damage.remove(id);
+        if (hdr.object == 1 and hdr.opcode == 1) { // delete_id
+            var it = wire.ArgIter.init(body, "u");
+            const id = (try it.next()).?.uint;
+            _ = self.objects.remove(id);
+            _ = self.attached.remove(id);
+            _ = self.buffers.remove(id);
+            _ = self.damage.remove(id);
+            _ = self.uses_damage.remove(id);
+            return;
+        }
+        const iface = self.objects.get(hdr.object) orelse return;
+        if (hdr.opcode >= iface.events.len) return;
+        const ev = &iface.events[hdr.opcode];
+        const target = ev.new_id_iface orelse return;
+        var it = wire.ArgIter.init(body, ev.sig);
+        while (try it.next()) |arg| switch (arg) {
+            .new_id => |id| {
+                if (id != 0) try self.objects.put(self.allocator, id, target);
+            },
+            else => {},
+        };
     }
 };
 
