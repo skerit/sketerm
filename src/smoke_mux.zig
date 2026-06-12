@@ -540,8 +540,6 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
 /// frames on a winstream channel, send a key, expect the tint to
 /// change (input round-trip).
 fn winstreamStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
-    _ = c.setenv("SKETERM_WINSTREAM", "stub", 1);
-    defer _ = c.unsetenv("SKETERM_WINSTREAM");
     const wsproto = @import("winstream/proto.zig");
 
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("ws connect");
@@ -556,6 +554,7 @@ fn winstreamStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
         .rows = @as(u16, 10),
         .cols = @as(u16, 40),
         .app = true,
+        .winstream = true,
     }) catch fail("ws spawn");
     (conn.recvExpect(&.{.ok}) catch fail("ws spawn ok")).deinit(allocator);
     conn.sendJson(.attach, .{ .name = "wsapp" }) catch fail("ws attach");
@@ -589,12 +588,22 @@ fn winstreamStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
                             if (wo.w != 320 or wo.h != 240) fail("ws open size");
                             saw_open = true;
                         },
-                        .win_frame => {
-                            const fr = wsproto.decodeFrame(p.unit.payload) orelse fail("ws frame dec");
+                        .win_frame, .win_frame_z => {
+                            var red: u8 = 0;
+                            if (p.unit.tag == .win_frame) {
+                                const fr = wsproto.decodeFrame(p.unit.payload) orelse fail("ws frame dec");
+                                red = fr.pixels[2];
+                            } else {
+                                const fz = wsproto.decodeFrameZ(p.unit.payload) orelse fail("ws framez dec");
+                                const scratch = allocator.alloc(u8, fz.raw_len) catch fail("oom");
+                                defer allocator.free(scratch);
+                                const rawpx = @import("wlhost/zpool.zig").decompress(fz.z, scratch) catch fail("ws inflate");
+                                red = rawpx[2];
+                            }
                             if (!sent_key) {
-                                tint_before = fr.pixels[2];
-                            } else if (fr.pixels[2] != tint_before.?) {
-                                tint_after = fr.pixels[2];
+                                tint_before = red;
+                            } else if (red != tint_before.?) {
+                                tint_after = red;
                             }
                         },
                         else => {},

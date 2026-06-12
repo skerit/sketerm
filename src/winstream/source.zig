@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const proto = @import("proto.zig");
+const zpool = @import("../wlhost/zpool.zig");
 
 pub const Source = struct {
     allocator: std.mem.Allocator,
@@ -20,6 +21,7 @@ pub const Source = struct {
     w: i32 = 320,
     h: i32 = 240,
     frame_buf: std.ArrayList(u8) = .empty,
+    zbuf: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Source {
         return .{ .allocator = allocator };
@@ -27,6 +29,7 @@ pub const Source = struct {
 
     pub fn deinit(self: *Source) void {
         self.frame_buf.deinit(self.allocator);
+        self.zbuf.deinit(self.allocator);
     }
 
     /// Called from the daemon poll loop: append any pending units
@@ -60,12 +63,25 @@ pub const Source = struct {
                 self.frame_buf.items[i + 3] = 0xff;
             }
         }
-        try proto.appendFrame(out, out_allocator, .{
-            .win = 1,
-            .w = self.w,
-            .h = self.h,
-            .pixels = self.frame_buf.items,
-        });
+        // Deflate when it shrinks (the same trade as pool updates);
+        // the receiver accepts both forms.
+        try self.zbuf.resize(self.allocator, self.frame_buf.items.len);
+        if (zpool.compress(self.frame_buf.items, self.zbuf.items)) |z| {
+            try proto.appendFrameZ(out, out_allocator, .{
+                .win = 1,
+                .w = self.w,
+                .h = self.h,
+                .raw_len = @intCast(self.frame_buf.items.len),
+                .z = z,
+            });
+        } else {
+            try proto.appendFrame(out, out_allocator, .{
+                .win = 1,
+                .w = self.w,
+                .h = self.h,
+                .pixels = self.frame_buf.items,
+            });
+        }
     }
 
     /// One unit from the client (input_* / close_req).
@@ -101,9 +117,8 @@ test "stub source: open, frames, input feedback" {
     try t.expectEqual(proto.Tag.win_open, u1_.unit.tag);
     pos += u1_.consumed;
     const u2_ = (try proto.peelUnit(out.items[pos..])).?;
-    const fr = proto.decodeFrame(u2_.unit.payload).?;
-    try t.expectEqual(@as(i32, 320), fr.w);
-    const r_before = fr.pixels[2];
+    var raw: [320 * 240 * 4]u8 = undefined;
+    const r_before = frameRed(u2_.unit, &raw);
 
     // Key press tints the next frame.
     var inp: std.ArrayList(u8) = .empty;
@@ -119,7 +134,14 @@ test "stub source: open, frames, input feedback" {
 
     try src.poll(&out, t.allocator, 200);
     const u3_ = (try proto.peelUnit(out.items)).?;
-    try t.expectEqual(proto.Tag.win_frame, u3_.unit.tag); // no re-open
-    const fr2 = proto.decodeFrame(u3_.unit.payload).?;
-    try t.expect(fr2.pixels[2] != r_before);
+    try t.expect(u3_.unit.tag == .win_frame or u3_.unit.tag == .win_frame_z); // no re-open
+    try t.expect(frameRed(u3_.unit, &raw) != r_before);
+}
+
+/// Red byte of pixel 0, inflating frame_z when needed.
+fn frameRed(u: proto.Unit, scratch: []u8) u8 {
+    if (u.tag == .win_frame) return proto.decodeFrame(u.payload).?.pixels[2];
+    const fz = proto.decodeFrameZ(u.payload).?;
+    const raw = zpool.decompress(fz.z, scratch[0..fz.raw_len]) catch unreachable;
+    return raw[2];
 }

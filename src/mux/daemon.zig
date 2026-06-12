@@ -35,6 +35,10 @@ pub const SpawnReq = struct {
     /// One-shot forwarded GUI app (`sketerm app -u`), not an
     /// interactive shell — listed differently by clients.
     app: bool = false,
+    /// Force the window-stream backend for this session (the
+    /// explicit form of SKETERM_WINSTREAM; what `sketerm app`
+    /// toward capture-only remotes will set).
+    winstream: bool = false,
     /// Wayland forwarding mode for this session: "" = daemon
     /// default, "native" = sketerm-native pipe, "waypipe" = legacy
     /// wrap. Headless clients (`sketerm app -u`) need waypipe —
@@ -1248,8 +1252,8 @@ pub const Daemon = struct {
         // anywhere); the Darwin ScreenCaptureKit backend will key on
         // builtin.os.tag once it exists.
         const ws_env = std.c.getenv("SKETERM_WINSTREAM");
-        const want_winstream = ws_env != null and
-            (req.app or std.mem.eql(u8, std.mem.span(ws_env.?), "all"));
+        const want_winstream = req.winstream or (ws_env != null and
+            (req.app or std.mem.eql(u8, std.mem.span(ws_env.?), "all")));
 
         var use_waypipe = false;
         var forwarding_possible = !want_winstream;
