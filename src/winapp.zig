@@ -26,6 +26,19 @@ pub const WsHost = struct {
         id: u32,
         window: *c.GtkWindow,
         picture: *c.GtkWidget,
+
+        /// Queue a pointer unit for this window and flush. `detail`
+        /// is the X11 button for press/release, ignored otherwise.
+        fn sendPtr(win: *Win, kind: u8, x: f64, y: f64, detail: u32) void {
+            proto.appendInputPtr(&win.host.out, win.host.allocator, .{ .win = win.id, .kind = kind, .x = x, .y = y, .detail = detail }) catch return;
+            win.host.flush();
+        }
+
+        /// Queue a key unit (evdev code + X11-order mods) and flush.
+        fn sendKey(win: *Win, key: u32, pressed: bool, state: c.GdkModifierType) void {
+            proto.appendInputKey(&win.host.out, win.host.allocator, .{ .win = win.id, .key = key, .pressed = pressed, .mods = @as(u32, @intCast(state)) & 0xff }) catch return;
+            win.host.flush();
+        }
     };
 
     pub fn create(allocator: std.mem.Allocator) !*WsHost {
@@ -168,55 +181,35 @@ pub const WsHost = struct {
     }
 
     fn onMotion(_: ?*c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const win = cast.userData(Win, user);
-        proto.appendInputPtr(&win.host.out, win.host.allocator, .{ .win = win.id, .kind = 0, .x = x, .y = y, .detail = 0 }) catch return;
-        win.host.flush();
+        cast.userData(Win, user).sendPtr(0, x, y, 0);
     }
 
     fn onPress(g: ?*c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const win = cast.userData(Win, user);
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(g));
-        proto.appendInputPtr(&win.host.out, win.host.allocator, .{ .win = win.id, .kind = 1, .x = x, .y = y, .detail = btn }) catch return;
-        win.host.flush();
+        cast.userData(Win, user).sendPtr(1, x, y, btn);
     }
 
     fn onRelease(g: ?*c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const win = cast.userData(Win, user);
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(g));
-        proto.appendInputPtr(&win.host.out, win.host.allocator, .{ .win = win.id, .kind = 2, .x = x, .y = y, .detail = btn }) catch return;
-        win.host.flush();
+        cast.userData(Win, user).sendPtr(2, x, y, btn);
     }
 
     fn onScroll(ctl: ?*c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const win = cast.userData(Win, user);
         // Wheel events arrive as ±1 notches; touchpads report
         // surface pixels — normalize to wheel-line-ish units so the
         // agent can treat x/y as scroll lines.
-        var fx = dx;
-        var fy = dy;
-        if (c.gtk_event_controller_scroll_get_unit(ctl) == c.GDK_SCROLL_UNIT_SURFACE) {
-            fx /= 40.0;
-            fy /= 40.0;
-        }
-        proto.appendInputPtr(&win.host.out, win.host.allocator, .{ .win = win.id, .kind = 3, .x = fx, .y = fy, .detail = 0 }) catch return 1;
-        win.host.flush();
+        const surface = c.gtk_event_controller_scroll_get_unit(ctl) == c.GDK_SCROLL_UNIT_SURFACE;
+        const scale: f64 = if (surface) 40.0 else 1.0;
+        cast.userData(Win, user).sendPtr(3, dx / scale, dy / scale, 0);
         return 1;
     }
 
     fn onKeyPress(_: ?*c.GtkEventControllerKey, _: c_uint, keycode: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const win = cast.userData(Win, user);
-        if (keycode >= 8) {
-            proto.appendInputKey(&win.host.out, win.host.allocator, .{ .win = win.id, .key = @intCast(keycode - 8), .pressed = true, .mods = @as(u32, @intCast(state)) & 0xff }) catch return 1;
-            win.host.flush();
-        }
+        if (keycode >= 8) cast.userData(Win, user).sendKey(keycode - 8, true, state);
         return 1;
     }
 
     fn onKeyRelease(_: ?*c.GtkEventControllerKey, _: c_uint, keycode: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) void {
-        const win = cast.userData(Win, user);
-        if (keycode >= 8) {
-            proto.appendInputKey(&win.host.out, win.host.allocator, .{ .win = win.id, .key = @intCast(keycode - 8), .pressed = false, .mods = @as(u32, @intCast(state)) & 0xff }) catch return;
-            win.host.flush();
-        }
+        if (keycode >= 8) cast.userData(Win, user).sendKey(keycode - 8, false, state);
     }
 };
