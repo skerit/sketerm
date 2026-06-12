@@ -5237,3 +5237,38 @@ zero waypipe:
   seat events), then damage diffing + compression, then popups.
 - 535 tests, smoke-mux (incl. real app), smoke-e2e, mux-portable,
   aarch64-macos cross all PASS.
+
+## 2026-06-12: native app pipe milestone 4 — input
+
+Remote apps are now interactive over the native pipe:
+
+- Compositor: seat caps pointer|keyboard; injection APIs for the
+  view (pointer enter/leave/motion/button/axis, keyboard enter/
+  leave/key/modifiers), serials + injectable now_ms clock. Focus
+  tracked per device; events fan out to every bound device object.
+- Keymap: fixed pc105/us blob (xkbcli-generated, embedded). On
+  get_keyboard the compositor emits a pipe `keymap` unit; the
+  DAEMON materializes the fd (platform.anonFileFd: memfd_create on
+  Linux — declared by hand, _GNU_SOURCE hides it from translate-c —
+  Darwin shm_open) and sends wl_keyboard.keymap itself, attaching
+  the fd SCM_RIGHTS-style to the next pending write (early fd
+  arrival is legal; late is not).
+- GUI: GTK controllers on app windows (motion/click/scroll on the
+  picture, key/focus on the window) → seat injection, with
+  widget→surface coordinate scaling (picture content-fit FILL).
+  GDK button → evdev BTN_*, GTK keycode-8 = evdev, GDK modifier
+  low bits = xkb mod order.
+- Hardware-truth bugs caught by driving REAL weston-terminal:
+  (1) wl_pointer.set_cursor (opcode 0) was dispatched as a
+  destructor — the bogus delete_id killed the app the moment the
+  pointer entered. (2) Cursor surfaces (set_cursor, no xdg role)
+  commit real buffers — they reached the view as phantom 30x30
+  windows. Both fixed, both regression-tested.
+- smoke-mux input stage: types l/s into weston-terminal through
+  the full pipe and asserts echo redraws. VERIFIED live under
+  Xvfb: `echo NATIVE-OK` typed into the remote window executed
+  and rendered (screenshot-confirmed).
+- Next: window resize (GTK size → xdg configure), damage diffing +
+  compression, popups, clipboard.
+- 537 tests, smoke-mux, smoke-e2e, mux-portable, aarch64-macos
+  cross all PASS.
