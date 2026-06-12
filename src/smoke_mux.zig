@@ -242,6 +242,106 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
     }
 }
 
+/// The real-client milestone: a stock Wayland app (weston-terminal)
+/// spawned in a native-pipe session, with the wlhost Compositor on
+/// this end answering the protocol. Pass = a committed toplevel
+/// frame with plausible dimensions reaches the view. Skipped when
+/// weston-terminal isn't installed.
+fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    if (c.access("/usr/bin/weston-terminal", c.X_OK) != 0) {
+        std.debug.print("smoke-mux: real-app stage SKIPPED (no weston-terminal)\n", .{});
+        return;
+    }
+    const compositor_mod = @import("wlhost/compositor.zig");
+
+    var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("app-stage connect");
+    defer conn.deinit();
+    // Hang guard: a silent stall fails the stage instead of wedging
+    // the smoke. Generous because weston-terminal loads fonts.
+    const tv = c.struct_timeval{ .tv_sec = 20, .tv_usec = 0 };
+    _ = c.setsockopt(conn.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+
+    conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("app-stage hello");
+    (conn.recvExpect(&.{.welcome}) catch fail("app-stage welcome")).deinit(allocator);
+    conn.sendJson(.spawn, .{
+        .name = "wlapp",
+        .argv = [_][]const u8{"/usr/bin/weston-terminal"},
+        .rows = @as(u16, 10),
+        .cols = @as(u16, 60),
+        .app = true,
+    }) catch fail("app-stage spawn");
+    (conn.recvExpect(&.{.ok}) catch fail("app-stage spawn ok")).deinit(allocator);
+    conn.sendJson(.attach, .{ .name = "wlapp" }) catch fail("app-stage attach");
+    (conn.recvExpect(&.{.snapshot}) catch fail("app-stage snapshot")).deinit(allocator);
+
+    const ViewState = struct {
+        var frames: usize = 0;
+        var w: i32 = 0;
+        var h: i32 = 0;
+        var nonzero_px: bool = false;
+        fn onFrame(ctx: ?*anyopaque, surface: u32, fw: i32, fh: i32, format: u32, pixels: []const u8) void {
+            _ = ctx;
+            _ = surface;
+            _ = format;
+            frames += 1;
+            w = fw;
+            h = fh;
+            for (pixels) |p| {
+                if (p != 0) {
+                    nonzero_px = true;
+                    break;
+                }
+            }
+        }
+    };
+    ViewState.frames = 0;
+    ViewState.nonzero_px = false;
+
+    var comp = compositor_mod.Compositor.init(allocator, .{
+        .toplevel_frame = ViewState.onFrame,
+    }) catch fail("compositor init");
+    defer comp.deinit();
+
+    var chan_id: u32 = 0;
+    var rounds: usize = 0;
+    while (ViewState.frames == 0 and rounds < 2000) : (rounds += 1) {
+        const f = conn.recvFrame() catch fail("app-stage stream read (timeout = app never committed)");
+        defer f.deinit(allocator);
+        switch (f.ftype) {
+            .chan_open => {
+                const open = wire.decodeChanOpen(f.payload) orelse fail("app-stage chan_open");
+                if (open.kind != .wayland_native) fail("app-stage channel kind");
+                chan_id = open.id;
+            },
+            .chan_data => {
+                if ((wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
+                comp.feed(f.payload[4..]) catch fail("compositor feed");
+                const out = comp.takeOut();
+                if (out.len > 0) {
+                    var payload: std.ArrayList(u8) = .empty;
+                    defer payload.deinit(allocator);
+                    var idb: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &idb, chan_id, .little);
+                    payload.appendSlice(allocator, &idb) catch fail("oom");
+                    payload.appendSlice(allocator, out) catch fail("oom");
+                    comp.clearOut();
+                    conn.sendFrame(.chan_data, payload.items) catch fail("app-stage chan send");
+                }
+                if (comp.dead) fail("compositor flagged protocol error from a stock client");
+            },
+            .exit => fail("weston-terminal exited before committing a frame"),
+            else => {},
+        }
+    }
+    if (ViewState.frames == 0) fail("no toplevel frame from weston-terminal");
+    if (ViewState.w < 100 or ViewState.h < 100) fail("implausible toplevel size");
+    if (!ViewState.nonzero_px) fail("toplevel frame is all zeros");
+    std.debug.print("smoke-mux: real app frame {d}x{d} after {d} rounds\n", .{ ViewState.w, ViewState.h, rounds });
+
+    // Tear the session down; the daemon must survive the app dying.
+    conn.sendJson(.kill, .{ .name = "wlapp" }) catch fail("app-stage kill");
+}
+
 /// wl_surface.commit on surface 7 — 8 header bytes, no args.
 fn commitNeedle() [8]u8 {
     var buf: [8]u8 = undefined;
@@ -407,8 +507,11 @@ pub fn main() u8 {
     snap3.deinit(allocator);
     if (mirror.screen.?.rows != 20 or mirror.screen.?.cols != 80) fail("resize geometry");
 
-    // Native Wayland app pipe end-to-end.
+    // Native Wayland app pipe end-to-end (scripted client).
     nativePipeStage(allocator, &conn, sock_path);
+
+    // Native pipe with a REAL Wayland app + the compositor brain.
+    realAppStage(allocator, sock_path);
 
     // A second client sees the session in LIST.
     var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("connect2");
