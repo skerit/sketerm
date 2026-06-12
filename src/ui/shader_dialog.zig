@@ -90,7 +90,7 @@ pub fn open(win: *Window) bool {
 
     const ctx = win.allocator.create(Ctx) catch return false;
     ctx.* = .{ .allocator = win.allocator, .win = win, .pane = pane };
-    const eff_path: []const u8 = if (pane.custom_shader_path) |p| p else win.config.custom_shader;
+    const eff_path: []const u8 = if (pane.custom_shader_path) |p| p else win.config.settings.custom_shader;
     ctx.path_copy = win.allocator.dupe(u8, eff_path) catch null;
     ctx.params_len = shader_pass.parseParams(src, &ctx.params, &ctx.meta);
     ctx.src_copy = win.allocator.dupe(u8, src) catch null;

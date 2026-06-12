@@ -120,9 +120,9 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addFontFamilyRow(@ptrCast(@alignCast(font_group)), ctx);
     addFontPathRow(@ptrCast(@alignCast(font_group)), ctx);
     addFontFeaturesRow(@ptrCast(@alignCast(font_group)), ctx);
-    addSpinRowU16(@ptrCast(@alignCast(font_group)), ctx, "Size", "Font size in points", 6, 72, &ctx.cfg.font_size, fontSizeChanged);
-    addSpinRowI16(@ptrCast(@alignCast(font_group)), ctx, "Line spacing", "Extra pixels per cell row", -8, 24, &ctx.cfg.line_pad_px, linePadChanged);
-    addSpinRowF32(@ptrCast(@alignCast(font_group)), ctx, "Padding", "Inner padding around the cell grid", 0.0, 32.0, &ctx.cfg.padding, paddingChanged);
+    addSpinRowU16(@ptrCast(@alignCast(font_group)), ctx, "Size", "Font size in points", 6, 72, &ctx.cfg.settings.font_size, fontSizeChanged);
+    addSpinRowI16(@ptrCast(@alignCast(font_group)), ctx, "Line spacing", "Extra pixels per cell row", -8, 24, &ctx.cfg.settings.line_pad_px, linePadChanged);
+    addSpinRowF32(@ptrCast(@alignCast(font_group)), ctx, "Padding", "Inner padding around the cell grid", 0.0, 32.0, &ctx.cfg.settings.padding, paddingChanged);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(font_group)));
 
     const cursor_group = c.adw_preferences_group_new();
@@ -179,7 +179,7 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     const shader_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(shader_group)), "Custom shader");
     c.adw_preferences_group_set_description(@ptrCast(@alignCast(shader_group)), "Shadertoy-style fragment shader applied to the whole frame (CRT, glow, …). Compile errors disable it — the terminal keeps rendering.");
-    addEntryRowString(@ptrCast(@alignCast(shader_group)), ctx, "Shader file (GLSL, mainImage)", "", &ctx.cfg.custom_shader, applyOnly);
+    addEntryRowString(@ptrCast(@alignCast(shader_group)), ctx, "Shader file (GLSL, mainImage)", "", &ctx.cfg.settings.custom_shader, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(shader_group)), ctx, "Animate", "Redraw continuously so iTime advances.", &ctx.cfg.custom_shader_animation, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(shader_group)));
 }
@@ -485,10 +485,10 @@ fn cursorShapeSelected(ctx: *Ctx, idx: c_uint) void {
 fn addFontFamilyRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_entry_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Font family (fontconfig name; the font file below wins if set)");
-    if (ctx.cfg.font_family.len > 0) {
+    if (ctx.cfg.settings.font_family.len > 0) {
         var z: [256:0]u8 = undefined;
-        const n = @min(ctx.cfg.font_family.len, z.len);
-        @memcpy(z[0..n], ctx.cfg.font_family[0..n]);
+        const n = @min(ctx.cfg.settings.font_family.len, z.len);
+        @memcpy(z[0..n], ctx.cfg.settings.font_family[0..n]);
         z[n] = 0;
         c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
     }
@@ -501,17 +501,17 @@ fn fontFamilyChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
     const txt = c.gtk_editable_get_text(row);
     if (txt == null) return;
     const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
-    ctx.cfg.font_family = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
+    ctx.cfg.settings.font_family = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
     ctx.ev();
 }
 
 fn addFontFeaturesRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_entry_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "OpenType features (e.g. -calt +ss01 zero)");
-    if (ctx.cfg.font_features.len > 0) {
+    if (ctx.cfg.settings.font_features.len > 0) {
         var z: [256:0]u8 = undefined;
-        const n = @min(ctx.cfg.font_features.len, z.len);
-        @memcpy(z[0..n], ctx.cfg.font_features[0..n]);
+        const n = @min(ctx.cfg.settings.font_features.len, z.len);
+        @memcpy(z[0..n], ctx.cfg.settings.font_features[0..n]);
         z[n] = 0;
         c.gtk_editable_set_text(@ptrCast(@alignCast(row)), &z);
     }
@@ -524,14 +524,14 @@ fn fontFeaturesChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void
     const txt = c.gtk_editable_get_text(row);
     if (txt == null) return;
     const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
-    ctx.cfg.font_features = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
+    ctx.cfg.settings.font_features = if (slice.len == 0) "" else ctx.dupe(slice) catch return;
     ctx.ev();
 }
 
 fn addFontPathRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_action_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Font file");
-    const sub = if (ctx.cfg.font_path) |fp| fp else "(default search path)";
+    const sub = if (ctx.cfg.settings.font_path) |fp| fp else "(default search path)";
     var z: [512:0]u8 = undefined;
     const n = @min(sub.len, z.len);
     @memcpy(z[0..n], sub[0..n]);
@@ -565,7 +565,7 @@ fn onChooseFontDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaq
     // Ctx allocator since the working cfg in the dialog has no arena
     // — apply path will arena-dupe on persist).
     const dup = ctx.dupe(slice) catch return;
-    ctx.cfg.font_path = dup;
+    ctx.cfg.settings.font_path = dup;
     ctx.ev();
 }
 
@@ -618,10 +618,10 @@ fn colorsPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     // Defaults (fg / bg / cursor + auto-theme + cursor_color_default).
     const defaults_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(defaults_group)), "Defaults");
-    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Foreground", &ctx.cfg.default_fg);
-    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Background", &ctx.cfg.default_bg);
-    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Cursor", &ctx.cfg.cursor_color);
-    addSwitchRow(@ptrCast(@alignCast(defaults_group)), ctx, "Cursor uses foreground", "Override the explicit cursor colour with the foreground.", &ctx.cfg.cursor_color_default, applyOnly);
+    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Foreground", &ctx.cfg.settings.default_fg);
+    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Background", &ctx.cfg.settings.default_bg);
+    addColorRow(@ptrCast(@alignCast(defaults_group)), ctx, "Cursor", &ctx.cfg.settings.cursor_color);
+    addSwitchRow(@ptrCast(@alignCast(defaults_group)), ctx, "Cursor uses foreground", "Override the explicit cursor colour with the foreground.", &ctx.cfg.settings.cursor_color_default, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(defaults_group)), ctx, "Auto theme", "Follow Adwaita dark/light at runtime.", &ctx.cfg.auto_theme, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(defaults_group)));
 
@@ -674,7 +674,7 @@ fn addPaletteRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, idx: usize) void {
     // Pull current value: prefer cfg.palette override; else scheme;
     // else built-in default 256-table first 16.
     const default_pal = @import("../grid/palette.zig").default_256;
-    const cur: [3]u8 = if (ctx.cfg.palette) |p| p[idx] else default_pal[idx];
+    const cur: [3]u8 = if (ctx.cfg.settings.palette) |p| p[idx] else default_pal[idx];
 
     const dlg = c.gtk_color_dialog_new();
     const btn = c.gtk_color_dialog_button_new(dlg);
@@ -699,22 +699,22 @@ fn paletteRowChanged(btn: *c.GtkColorDialogButton, _: *c.GParamSpec, user: ?*any
     const rgba = c.gtk_color_dialog_button_get_rgba(btn);
     // Promote palette to override mode if needed (copying from
     // current effective palette).
-    if (pctx.parent.cfg.palette == null) {
+    if (pctx.parent.cfg.settings.palette == null) {
         const default_pal = @import("../grid/palette.zig").default_256;
         var pal: [16][3]u8 = undefined;
         var i: usize = 0;
         while (i < 16) : (i += 1) pal[i] = default_pal[i];
-        pctx.parent.cfg.palette = pal;
+        pctx.parent.cfg.settings.palette = pal;
     }
-    var pal = pctx.parent.cfg.palette.?;
+    var pal = pctx.parent.cfg.settings.palette.?;
     pal[pctx.index] = .{
         @intFromFloat(@round(rgba.*.red * 255.0)),
         @intFromFloat(@round(rgba.*.green * 255.0)),
         @intFromFloat(@round(rgba.*.blue * 255.0)),
     };
-    pctx.parent.cfg.palette = pal;
+    pctx.parent.cfg.settings.palette = pal;
     // Editing the palette unsets `scheme` — the user has overridden.
-    pctx.parent.cfg.scheme = "";
+    pctx.parent.cfg.settings.scheme = "";
     pctx.parent.ev();
 }
 
@@ -740,7 +740,7 @@ fn addSchemeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
     var sel: c_uint = 0;
     for (SCHEMES, 0..) |sch, i| {
-        if (std.mem.eql(u8, sch.key, ctx.cfg.scheme)) {
+        if (std.mem.eql(u8, sch.key, ctx.cfg.settings.scheme)) {
             sel = @intCast(i);
             break;
         }
@@ -755,20 +755,20 @@ fn addSchemeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
 fn schemeSelected(ctx: *Ctx, idx: c_uint) void {
     if (idx >= SCHEMES.len) return;
     const sch = SCHEMES[idx];
-    ctx.cfg.scheme = sch.key;
-    ctx.cfg.default_fg = .{
+    ctx.cfg.settings.scheme = sch.key;
+    ctx.cfg.settings.default_fg = .{
         @as(f32, @floatFromInt(sch.fg[0])) / 255.0,
         @as(f32, @floatFromInt(sch.fg[1])) / 255.0,
         @as(f32, @floatFromInt(sch.fg[2])) / 255.0,
         1.0,
     };
-    ctx.cfg.default_bg = .{
+    ctx.cfg.settings.default_bg = .{
         @as(f32, @floatFromInt(sch.bg[0])) / 255.0,
         @as(f32, @floatFromInt(sch.bg[1])) / 255.0,
         @as(f32, @floatFromInt(sch.bg[2])) / 255.0,
         1.0,
     };
-    ctx.cfg.palette = sch.palette;
+    ctx.cfg.settings.palette = sch.palette;
     ctx.ev();
     // Note: the open color buttons in the dialog don't auto-refresh
     // their preview swatches. The next reopen will reflect the new
@@ -792,9 +792,9 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     const shell_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(shell_group)), "Shell (applies to new panes)");
     addShellPathRow(@ptrCast(@alignCast(shell_group)), ctx);
-    addEntryRowOptionalString(@ptrCast(@alignCast(shell_group)), ctx, "TERM", "$TERM env in child", &ctx.cfg.term_env, termEnvChanged);
-    addEntryRowOptionalString(@ptrCast(@alignCast(shell_group)), ctx, "COLORTERM", "$COLORTERM env in child", &ctx.cfg.color_term_env, colorTermEnvChanged);
-    addSwitchRow(@ptrCast(@alignCast(shell_group)), ctx, "Login shell", "Prepend a `-` to argv[0] so the shell sources login profile.", &ctx.cfg.login_shell, applyOnly);
+    addEntryRowOptionalString(@ptrCast(@alignCast(shell_group)), ctx, "TERM", "$TERM env in child", &ctx.cfg.settings.term_env, termEnvChanged);
+    addEntryRowOptionalString(@ptrCast(@alignCast(shell_group)), ctx, "COLORTERM", "$COLORTERM env in child", &ctx.cfg.settings.color_term_env, colorTermEnvChanged);
+    addSwitchRow(@ptrCast(@alignCast(shell_group)), ctx, "Login shell", "Prepend a `-` to argv[0] so the shell sources login profile.", &ctx.cfg.settings.login_shell, applyOnly);
     addExitActionRow(@ptrCast(@alignCast(shell_group)), ctx);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(shell_group)));
 
@@ -810,7 +810,7 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     // Scrollback.
     const sb_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(sb_group)), "Scrollback");
-    addSpinRowU32(@ptrCast(@alignCast(sb_group)), ctx, "Lines", "Maximum scrollback lines retained per pane.", 100, 100000, &ctx.cfg.scrollback, applyOnly);
+    addSpinRowU32(@ptrCast(@alignCast(sb_group)), ctx, "Lines", "Maximum scrollback lines retained per pane.", 100, 100000, &ctx.cfg.settings.scrollback, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(sb_group)), ctx, "Scroll on output", "Snap view to bottom on any output, not just keystrokes.", &ctx.cfg.scroll_on_output, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(sb_group)));
 
@@ -888,7 +888,7 @@ fn addEntryRowOptionalString(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*
 fn addShellPathRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_entry_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Shell");
-    if (ctx.cfg.shell) |s| {
+    if (ctx.cfg.settings.shell) |s| {
         var z: [256:0]u8 = undefined;
         const n = @min(s.len, z.len);
         @memcpy(z[0..n], s[0..n]);
@@ -905,10 +905,10 @@ fn shellEntryChanged(row: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
     if (txt == null) return;
     const slice = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
     if (slice.len == 0) {
-        ctx.cfg.shell = null;
+        ctx.cfg.settings.shell = null;
     } else {
         const dup = ctx.dupe(slice) catch return;
-        ctx.cfg.shell = dup;
+        ctx.cfg.settings.shell = dup;
     }
     ctx.ev();
 }

@@ -51,37 +51,80 @@ pub const KeybindEntry = struct {
     accel: []const u8,
 };
 
-/// A named profile — a Config subset applied per-pane. Defined via
-/// `[profile.<name>]` sections in config.conf. Fields default to
-/// "inherit from global config" (sentinels: empty string for string
-/// fields, 0 for numerics where 0 means "no override"). Empty name
-/// is reserved for the global config.
+/// The pane-level settings bundle — everything that can sensibly
+/// differ between two panes. The Default profile is the embedded
+/// `Config.settings`; named profiles ([profile.<name>] sections) are
+/// COMPLETE copies of this struct, not patches: there is no inherit
+/// sentinel and no fallback chain at apply time. A new profile is
+/// seeded from the Default settings at parse/create time.
+pub const ProfileSettings = struct {
+    // Font.
+    font_path: ?[]const u8 = null,
+    /// Font family name resolved via fontconfig ("JetBrains Mono").
+    /// `font_path` wins when both are set. Empty = unset.
+    font_family: []const u8 = "",
+    /// OpenType features for HarfBuzz shaping, whitespace/comma
+    /// separated, CSS/kitty syntax: "-calt +ss01 zero cv05=3".
+    /// Empty = font defaults.
+    font_features: []const u8 = "",
+    font_size: u16 = 14,
+    /// Extra pixels added to each cell's height for visual line
+    /// spacing. 0 = font's natural metric; positive = looser; small
+    /// negative = tighter (clamped so the glyph still fits).
+    line_pad_px: i16 = 0,
+    /// Inner padding around the cell grid, in pixels.
+    padding: f32 = 6.0,
+
+    // Colors (premultiplied RGBA, 0..1).
+    default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
+    default_bg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 },
+    cursor_color: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 },
+    /// When true, the cursor uses the foreground color and ignores
+    /// `cursor_color`. Matches xterm/Terminator default.
+    cursor_color_default: bool = true,
+    /// User-overridden ANSI 16 palette entries. null = "use the
+    /// built-in palette (or scheme presets)". Stored as RGB (no
+    /// alpha — palette colours are always opaque).
+    palette: ?[16][3]u8 = null,
+    /// Built-in scheme name (tango / linux / xterm / solarized_dark /
+    /// …). Empty string = "no scheme; use defaults or `palette`".
+    scheme: []const u8 = "",
+
+    // Shell + child env.
+    shell: ?[]const u8 = null,
+    term_env: []const u8 = "xterm-256color",
+    color_term_env: []const u8 = "truecolor",
+    /// Prepend `-` to argv[0] so the shell behaves as a login shell.
+    login_shell: bool = false,
+
+    scrollback: u32 = 10000,
+
+    /// Custom post-process fragment shader (shadertoy-style file
+    /// defining mainImage; iChannel0 = the rendered frame). Empty =
+    /// off. Compile errors disable the pass, never blank the pane.
+    custom_shader: []const u8 = "",
+
+    /// Deep-copy every heap-backed field into `arena`.
+    pub fn cloneInto(self: *const ProfileSettings, arena: std.mem.Allocator) error{OutOfMemory}!ProfileSettings {
+        var out = self.*;
+        if (self.font_path) |s| out.font_path = try arena.dupe(u8, s);
+        out.font_family = try arena.dupe(u8, self.font_family);
+        out.font_features = try arena.dupe(u8, self.font_features);
+        out.scheme = try arena.dupe(u8, self.scheme);
+        if (self.shell) |s| out.shell = try arena.dupe(u8, s);
+        out.term_env = try arena.dupe(u8, self.term_env);
+        out.color_term_env = try arena.dupe(u8, self.color_term_env);
+        out.custom_shader = try arena.dupe(u8, self.custom_shader);
+        return out;
+    }
+};
+
+/// A named profile: a complete `ProfileSettings`. The Default
+/// profile is NOT in `Config.profiles` — it is `Config.settings`;
+/// the name "default" is reserved for it.
 pub const Profile = struct {
     name: []const u8,
-    /// Override for shell binary path. Empty → inherit `Config.shell`.
-    shell: []const u8 = "",
-    /// Override for font file path. Empty → inherit `Config.font_path`.
-    font_path: []const u8 = "",
-    /// Override for font family name. Empty → inherit `Config.font_family`.
-    font_family: []const u8 = "",
-    /// Override for font size. 0 → inherit.
-    font_size: u16 = 0,
-    /// Override for the colour scheme name. Empty → inherit.
-    scheme: []const u8 = "",
-    /// Override for the 16-colour ANSI palette. null → inherit.
-    palette: ?[16][3]u8 = null,
-    /// Override for $TERM. Empty → inherit.
-    term_env: []const u8 = "",
-    /// Override for $COLORTERM. Empty → inherit.
-    color_term_env: []const u8 = "",
-    /// Override for scrollback line cap. 0 → inherit.
-    scrollback: u32 = 0,
-    /// Override for login_shell. null → inherit.
-    login_shell: ?bool = null,
-    /// Per-profile custom post-process shader (retroterm-style GLSL
-    /// file). Empty → inherit `Config.custom_shader` (which may also
-    /// be empty = none).
-    custom_shader: []const u8 = "",
+    settings: ProfileSettings = .{},
 };
 
 /// `[domain.<name>]` sections — named remote mux endpoints, so the
@@ -112,37 +155,10 @@ pub const Domain = struct {
 pub const ConfirmClose = enum { never, multiple, always };
 
 pub const Config = struct {
-    // Font
-    font_path: ?[]const u8 = null,
-    /// Font family name resolved via fontconfig ("JetBrains Mono").
-    /// `font_path` wins when both are set. Empty = unset.
-    font_family: []const u8 = "",
-    /// OpenType features for HarfBuzz shaping, whitespace/comma
-    /// separated, CSS/kitty syntax: "-calt +ss01 zero cv05=3".
-    /// Empty = font defaults.
-    font_features: []const u8 = "",
-    font_size: u16 = 14,
-    /// Extra pixels added to each cell's height for visual line
-    /// spacing. 0 = font's natural metric; positive = looser; small
-    /// negative = tighter (clamped so the glyph still fits).
-    line_pad_px: i16 = 0,
-
-    // Colors (premultiplied RGBA, 0..1).
-    default_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
-    default_bg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 },
-    cursor_color: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 },
-    /// When true, the cursor uses the foreground color and ignores
-    /// `cursor_color`. Matches xterm/Terminator default.
-    cursor_color_default: bool = true,
-    /// User-overridden ANSI 16 palette entries. null = "use the
-    /// built-in palette (or scheme presets)". Stored as RGB (no
-    /// alpha — palette colours are always opaque).
-    palette: ?[16][3]u8 = null,
-    /// Built-in scheme name (tango / linux / xterm / solarized_dark /
-    /// solarized_light / gruvbox_dark / gruvbox_light / nord /
-    /// dracula / monokai). Empty string = "no scheme; use defaults
-    /// or `palette` overrides".
-    scheme: []const u8 = "",
+    /// The Default profile — every pane-level setting (font, colors,
+    /// shell, scrollback, shader). Named profiles in `profiles` are
+    /// complete alternatives to this bundle, selected per pane.
+    settings: ProfileSettings = .{},
 
     // Cursor
     cursor_shape: CursorShape = .block,
@@ -152,20 +168,11 @@ pub const Config = struct {
     cursor_blink_ms: u32 = 500,
 
     // Layout
-    padding: f32 = 6.0,
-    scrollback: u32 = 10000,
     /// Snap view back to the bottom on any output, not just on
     /// keystroke. Off by default — matches xterm; users who want
     /// the gnome-terminal "auto-tail" behaviour flip this.
     scroll_on_output: bool = false,
 
-    // Shell + child env
-    shell: ?[]const u8 = null,
-    term_env: []const u8 = "xterm-256color",
-    color_term_env: []const u8 = "truecolor",
-    /// Prepend `-` to argv[0] so the shell behaves as a login
-    /// shell (sources /etc/profile etc.). Off by default.
-    login_shell: bool = false,
     /// What to do when a pane's shell exits.
     exit_action: ExitAction = .close,
 
@@ -315,12 +322,9 @@ pub const Config = struct {
     /// Gradient direction in degrees: 0 = left→right, 90 = top→bottom.
     background_gradient_angle: f32 = 90,
 
-    /// Custom post-process fragment shader (shadertoy-style file
-    /// defining mainImage; iChannel0 = the rendered frame). Empty =
-    /// off. Compile errors disable the pass, never blank the pane.
-    custom_shader: []const u8 = "",
     /// Redraw continuously so iTime advances (CRT flicker, glow…).
     /// Off = the shader still runs but only on normal damage.
+    /// Applies to whichever custom shader a pane resolves to.
     custom_shader_animation: bool = false,
 
     /// Custom keybindings. List of (action_name, accelerator) pairs
@@ -336,12 +340,14 @@ pub const Config = struct {
     shader_params: std.ArrayList(@import("render/shader_pass.zig").ParamKV) = .empty,
 
     /// Named profiles. Defined via `[profile.<name>]` sections —
-    /// each section's keys override the corresponding global Config
-    /// field for panes that select this profile. Order preserved
-    /// for round-trip serialisation + UI listing.
+    /// each is a COMPLETE ProfileSettings (seeded from the Default
+    /// settings parsed so far, then overridden by the section's
+    /// keys). Order preserved for round-trip serialisation + UI
+    /// listing. "default" is reserved: that section edits
+    /// `Config.settings` directly and never lands in this list.
     profiles: std.ArrayList(Profile) = .empty,
-    /// Profile name used when no explicit profile is selected. Empty
-    /// = "no default profile; use the global Config directly".
+    /// Profile name new panes spawn with when none is requested.
+    /// Empty (or "default") = the Default settings.
     default_profile: []const u8 = "",
 
     /// Named mux domains from `[domain.<name>]` sections. Order
@@ -384,16 +390,9 @@ pub const Config = struct {
     pub fn cloneInto(self: *const Config, arena: std.mem.Allocator) error{OutOfMemory}!Config {
         var out = self.*;
         out.arena = null;
-        if (self.font_path) |s| out.font_path = try arena.dupe(u8, s);
-        out.font_family = try arena.dupe(u8, self.font_family);
-        out.font_features = try arena.dupe(u8, self.font_features);
+        out.settings = try self.settings.cloneInto(arena);
         out.hint_editor = try arena.dupe(u8, self.hint_editor);
         out.background_image = try arena.dupe(u8, self.background_image);
-        out.custom_shader = try arena.dupe(u8, self.custom_shader);
-        if (self.shell) |s| out.shell = try arena.dupe(u8, s);
-        out.scheme = try arena.dupe(u8, self.scheme);
-        out.term_env = try arena.dupe(u8, self.term_env);
-        out.color_term_env = try arena.dupe(u8, self.color_term_env);
         out.word_chars = try arena.dupe(u8, self.word_chars);
         out.mux_udp_port_range = try arena.dupe(u8, self.mux_udp_port_range);
         out.default_profile = try arena.dupe(u8, self.default_profile);
@@ -417,16 +416,10 @@ pub const Config = struct {
         out.profiles = .empty;
         try out.profiles.ensureTotalCapacity(arena, self.profiles.items.len);
         for (self.profiles.items) |p| {
-            var cp = p;
-            cp.name = try arena.dupe(u8, p.name);
-            cp.shell = try arena.dupe(u8, p.shell);
-            cp.font_path = try arena.dupe(u8, p.font_path);
-            cp.font_family = try arena.dupe(u8, p.font_family);
-            cp.scheme = try arena.dupe(u8, p.scheme);
-            cp.term_env = try arena.dupe(u8, p.term_env);
-            cp.color_term_env = try arena.dupe(u8, p.color_term_env);
-            cp.custom_shader = try arena.dupe(u8, p.custom_shader);
-            out.profiles.appendAssumeCapacity(cp);
+            out.profiles.appendAssumeCapacity(.{
+                .name = try arena.dupe(u8, p.name),
+                .settings = try p.settings.cloneInto(arena),
+            });
         }
         out.domains = .empty;
         try out.domains.ensureTotalCapacity(arena, self.domains.items.len);
@@ -500,14 +493,15 @@ pub const Config = struct {
             }
         }
 
-        // Env overrides — highest priority.
+        // Env overrides — highest priority. Applied to the Default
+        // settings only; named profiles keep their own values.
         if (@import("util/profile.zig").getenv("SKETERM_SCROLLBACK")) |env| {
-            if (std.fmt.parseInt(u32, env, 10)) |n| cfg.scrollback = n else |_| {}
+            if (std.fmt.parseInt(u32, env, 10)) |n| cfg.settings.scrollback = n else |_| {}
         }
         if (@import("util/profile.zig").getenv("SKETERM_FONT")) |env_path| {
             if (cfg.arena == null) cfg.arena = std.heap.ArenaAllocator.init(allocator);
             const arena = cfg.arena.?.allocator();
-            cfg.font_path = arena.dupe(u8, env_path) catch cfg.font_path;
+            cfg.settings.font_path = arena.dupe(u8, env_path) catch cfg.settings.font_path;
         }
         return cfg;
     }
@@ -558,39 +552,83 @@ pub const Config = struct {
 
     /// Same content as save() but directly into a Writer — used by
     /// tests + the prefs dialog's preview path.
+    /// Emit every pane-level key of `s` that differs from `base`.
+    /// Top-level (Default) settings diff against the schema defaults;
+    /// profile sections diff against the Default settings — so a
+    /// profile section only carries what makes it different.
+    fn serialiseSettings(s: *const ProfileSettings, base: *const ProfileSettings, w: *std.Io.Writer) !void {
+        // Font.
+        if (!eqOptStr(s.font_path, base.font_path)) {
+            if (s.font_path) |fp| try w.print("font = {s}\n", .{fp});
+        }
+        if (!std.mem.eql(u8, s.font_family, base.font_family))
+            try w.print("font_family = {s}\n", .{s.font_family});
+        if (!std.mem.eql(u8, s.font_features, base.font_features))
+            try w.print("font_features = {s}\n", .{s.font_features});
+        if (s.font_size != base.font_size) try w.print("font_size = {d}\n", .{s.font_size});
+        if (s.line_pad_px != base.line_pad_px) try w.print("line_pad_px = {d}\n", .{s.line_pad_px});
+        if (s.padding != base.padding) try w.print("padding = {d:.2}\n", .{s.padding});
+
+        // Colors.
+        if (!eqColor(s.default_fg, base.default_fg)) try writeColor(w, "default_fg", s.default_fg);
+        if (!eqColor(s.default_bg, base.default_bg)) try writeColor(w, "default_bg", s.default_bg);
+        if (!eqColor(s.cursor_color, base.cursor_color)) try writeColor(w, "cursor_color", s.cursor_color);
+        if (s.cursor_color_default != base.cursor_color_default)
+            try w.print("cursor_color_default = {s}\n", .{if (s.cursor_color_default) "true" else "false"});
+        if (!std.mem.eql(u8, s.scheme, base.scheme)) try w.print("scheme = {s}\n", .{s.scheme});
+        const pal_differs = blk: {
+            if (s.palette == null and base.palette == null) break :blk false;
+            if (s.palette == null or base.palette == null) break :blk true;
+            break :blk !std.meta.eql(s.palette.?, base.palette.?);
+        };
+        if (pal_differs) {
+            if (s.palette) |pal| {
+                try w.writeAll("palette = ");
+                for (pal, 0..) |rgb, i| {
+                    if (i != 0) try w.writeAll(":");
+                    try w.print("#{x:0>2}{x:0>2}{x:0>2}", .{ rgb[0], rgb[1], rgb[2] });
+                }
+                try w.writeAll("\n");
+            }
+            // null-while-base-set isn't expressible in the format;
+            // the parse-time seed keeps base's palette in that case.
+        }
+
+        // Shell + env.
+        if (!eqOptStr(s.shell, base.shell)) {
+            if (s.shell) |sh| try w.print("shell = {s}\n", .{sh});
+        }
+        if (!std.mem.eql(u8, s.term_env, base.term_env))
+            try w.print("term = {s}\n", .{s.term_env});
+        if (!std.mem.eql(u8, s.color_term_env, base.color_term_env))
+            try w.print("color_term = {s}\n", .{s.color_term_env});
+        if (s.login_shell != base.login_shell)
+            try w.print("login_shell = {s}\n", .{if (s.login_shell) "true" else "false"});
+
+        if (s.scrollback != base.scrollback) try w.print("scrollback = {d}\n", .{s.scrollback});
+
+        if (!std.mem.eql(u8, s.custom_shader, base.custom_shader))
+            try w.print("custom_shader = {s}\n", .{s.custom_shader});
+    }
+
+    fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        return std.mem.eql(u8, a.?, b.?);
+    }
+
     pub fn serialise(self: *const Config, w: *std.Io.Writer) !void {
         try w.writeAll("# sketerm config (auto-saved by Preferences dialog)\n");
 
-        // Font.
-        if (self.font_path) |fp| try w.print("font = {s}\n", .{fp});
-        if (self.font_family.len > 0) try w.print("font_family = {s}\n", .{self.font_family});
-        if (self.font_features.len > 0) try w.print("font_features = {s}\n", .{self.font_features});
-        if (self.font_size != 14) try w.print("font_size = {d}\n", .{self.font_size});
-        if (self.line_pad_px != 0) try w.print("line_pad_px = {d}\n", .{self.line_pad_px});
-
-        // Colors.
-        if (!eqColor(self.default_fg, .{ 0.92, 0.92, 0.92, 1.0 }))
-            try writeColor(w, "default_fg", self.default_fg);
-        if (!eqColor(self.default_bg, .{ 0.10, 0.10, 0.10, 1.0 }))
-            try writeColor(w, "default_bg", self.default_bg);
-        if (!eqColor(self.cursor_color, .{ 1.0, 1.0, 1.0, 1.0 }))
-            try writeColor(w, "cursor_color", self.cursor_color);
+        // Default profile settings, at top level (key compat with
+        // pre-profile configs).
+        const schema_defaults = ProfileSettings{};
+        try serialiseSettings(&self.settings, &schema_defaults, w);
 
         // Cursor.
         if (self.cursor_shape != .block) try w.print("cursor_shape = {s}\n", .{@tagName(self.cursor_shape)});
         if (!self.cursor_blink) try w.writeAll("cursor_blink = false\n");
         if (self.cursor_blink_ms != 500) try w.print("cursor_blink_ms = {d}\n", .{self.cursor_blink_ms});
-
-        // Layout.
-        if (self.padding != 6.0) try w.print("padding = {d:.2}\n", .{self.padding});
-        if (self.scrollback != 10000) try w.print("scrollback = {d}\n", .{self.scrollback});
-
-        // Shell + env.
-        if (self.shell) |s| try w.print("shell = {s}\n", .{s});
-        if (!std.mem.eql(u8, self.term_env, "xterm-256color"))
-            try w.print("term = {s}\n", .{self.term_env});
-        if (!std.mem.eql(u8, self.color_term_env, "truecolor"))
-            try w.print("color_term = {s}\n", .{self.color_term_env});
 
         // Behaviour.
         if (!self.bracketed_paste) try w.writeAll("bracketed_paste = false\n");
@@ -610,8 +648,6 @@ pub const Config = struct {
         // Behavioural extras.
         if (self.scroll_on_output) try w.writeAll("scroll_on_output = true\n");
         if (!self.smart_copy) try w.writeAll("smart_copy = false\n");
-        if (self.login_shell) try w.writeAll("login_shell = true\n");
-        if (!self.cursor_color_default) try w.writeAll("cursor_color_default = false\n");
         if (!std.mem.eql(u8, self.word_chars, "-_.,/?:@&=+%~"))
             try w.print("word_chars = {s}\n", .{self.word_chars});
         if (self.mux_udp_port_range.len > 0)
@@ -685,8 +721,6 @@ pub const Config = struct {
             try w.print("background_image = {s}\n", .{self.background_image});
         if (self.background_image_opacity != 0.3)
             try w.print("background_image_opacity = {d:.2}\n", .{self.background_image_opacity});
-        if (self.custom_shader.len > 0)
-            try w.print("custom_shader = {s}\n", .{self.custom_shader});
         if (self.custom_shader_animation)
             try w.print("custom_shader_animation = true\n", .{});
         if (!eqColor(self.background_gradient_from, .{ 0, 0, 0, 0 }))
@@ -715,40 +749,14 @@ pub const Config = struct {
         // Shell exit.
         if (self.exit_action != .close) try w.print("exit_action = {s}\n", .{@tagName(self.exit_action)});
 
-        // Color scheme + palette.
-        if (self.scheme.len > 0) try w.print("scheme = {s}\n", .{self.scheme});
-        if (self.palette) |pal| {
-            try w.writeAll("palette = ");
-            for (pal, 0..) |rgb, i| {
-                if (i != 0) try w.writeAll(":");
-                try w.print("#{x:0>2}{x:0>2}{x:0>2}", .{ rgb[0], rgb[1], rgb[2] });
-            }
-            try w.writeAll("\n");
-        }
-
-        // Default profile, then each [profile.name] section.
+        // Default profile name, then each [profile.name] section.
+        // Profile keys diff against the Default settings, matching
+        // the parse-time seed — so the round-trip is exact.
         if (self.default_profile.len > 0)
             try w.print("default_profile = {s}\n", .{self.default_profile});
         for (self.profiles.items) |prof| {
             try w.print("\n[profile.{s}]\n", .{prof.name});
-            if (prof.shell.len > 0) try w.print("shell = {s}\n", .{prof.shell});
-            if (prof.font_path.len > 0) try w.print("font = {s}\n", .{prof.font_path});
-            if (prof.font_family.len > 0) try w.print("font_family = {s}\n", .{prof.font_family});
-            if (prof.font_size != 0) try w.print("font_size = {d}\n", .{prof.font_size});
-            if (prof.scheme.len > 0) try w.print("scheme = {s}\n", .{prof.scheme});
-            if (prof.term_env.len > 0) try w.print("term = {s}\n", .{prof.term_env});
-            if (prof.color_term_env.len > 0) try w.print("color_term = {s}\n", .{prof.color_term_env});
-            if (prof.scrollback != 0) try w.print("scrollback = {d}\n", .{prof.scrollback});
-            if (prof.login_shell) |b| try w.print("login_shell = {s}\n", .{if (b) "true" else "false"});
-            if (prof.custom_shader.len > 0) try w.print("custom_shader = {s}\n", .{prof.custom_shader});
-            if (prof.palette) |pal| {
-                try w.writeAll("palette = ");
-                for (pal, 0..) |rgb, i| {
-                    if (i != 0) try w.writeAll(":");
-                    try w.print("#{x:0>2}{x:0>2}{x:0>2}", .{ rgb[0], rgb[1], rgb[2] });
-                }
-                try w.writeAll("\n");
-            }
+            try serialiseSettings(&prof.settings, &self.settings, w);
         }
 
         for (self.domains.items) |dom| {
@@ -756,6 +764,18 @@ pub const Config = struct {
             if (dom.host.len > 0) try w.print("host = {s}\n", .{dom.host});
             if (dom.transport != .ssh) try w.print("transport = {s}\n", .{@tagName(dom.transport)});
         }
+    }
+
+    /// Resolve a profile name to its settings. Empty name, the
+    /// reserved "default", and unknown names all yield the Default
+    /// settings — a pane whose profile was deleted degrades to
+    /// Default instead of dangling.
+    pub fn profileSettings(self: *const Config, name: []const u8) *const ProfileSettings {
+        if (name.len == 0 or std.mem.eql(u8, name, "default")) return &self.settings;
+        for (self.profiles.items) |*p| {
+            if (std.mem.eql(u8, p.name, name)) return &p.settings;
+        }
+        return &self.settings;
     }
 
     /// Look up a domain by name and allocate its transport-prefixed
@@ -800,7 +820,12 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
     var lines = std.mem.splitScalar(u8, body, '\n');
     var lineno: usize = 0;
     // Section state. `null`/`null` = global; at most one non-null.
-    var current_profile: ?*Profile = null;
+    // `[profile.default]` points at cfg.settings so a section-style
+    // Default round-trips; new profiles seed from the Default
+    // settings parsed SO FAR — global keys must precede profile
+    // sections (the serializer always writes them that way).
+    var current_settings: ?*ProfileSettings = null;
+    var current_profile_name: []const u8 = "";
     var current_domain: ?*Domain = null;
     while (lines.next()) |raw| {
         lineno += 1;
@@ -812,7 +837,8 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
         // — that way unknown future sections don't strip user data.
         if (line.len >= 2 and line[0] == '[' and line[line.len - 1] == ']') {
             const inside = trim(line[1 .. line.len - 1]);
-            current_profile = null;
+            current_settings = null;
+            current_profile_name = "";
             current_domain = null;
             if (std.mem.startsWith(u8, inside, "profile.")) {
                 const name = inside["profile.".len..];
@@ -820,10 +846,17 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
                     warnConfigAt(lineno, "empty profile name", .{});
                     continue;
                 }
-                current_profile = findOrCreateProfile(cfg, arena, name) catch {
+                if (std.mem.eql(u8, name, "default")) {
+                    current_settings = &cfg.settings;
+                    current_profile_name = "default";
+                    continue;
+                }
+                const prof = findOrCreateProfile(cfg, arena, name) catch {
                     warnConfigAt(lineno, "out of memory creating profile", .{});
                     continue;
                 };
+                current_settings = &prof.settings;
+                current_profile_name = prof.name;
                 continue;
             }
             if (std.mem.startsWith(u8, inside, "domain.")) {
@@ -852,10 +885,13 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
             applyDomainKv(dom, arena, key, value) catch |err| {
                 warnConfigAt(lineno, "domain '{s}': bad value for '{s}' ({s})", .{ dom.name, key, @errorName(err) });
             };
-        } else if (current_profile) |prof| {
-            applyProfileKv(prof, arena, key, value) catch |err| {
-                warnConfigAt(lineno, "profile '{s}': bad value for '{s}' ({s})", .{ prof.name, key, @errorName(err) });
+        } else if (current_settings) |s| {
+            const handled = applySettingsKv(s, arena, key, value) catch |err| {
+                warnConfigAt(lineno, "profile '{s}': bad value for '{s}' ({s})", .{ current_profile_name, key, @errorName(err) });
+                continue;
             };
+            if (!handled)
+                warnConfig("unknown profile key '{s}' (ignoring)", .{key});
         } else {
             applyKv(cfg, arena, key, value) catch |err| {
                 warnConfigAt(lineno, "bad value for '{s}' ({s})", .{ key, @errorName(err) });
@@ -890,7 +926,11 @@ fn findOrCreateProfile(cfg: *Config, arena: std.mem.Allocator, name: []const u8)
         if (std.mem.eql(u8, p.name, name)) return p;
     }
     const dup = try arena.dupe(u8, name);
-    try cfg.profiles.append(arena, .{ .name = dup });
+    // Seed from the Default settings parsed so far: profiles are
+    // complete copies, and the section's keys override from there.
+    // (No need to deep-copy the strings — they live in the same
+    // arena and are never mutated in place.)
+    try cfg.profiles.append(arena, .{ .name = dup, .settings = cfg.settings });
     return &cfg.profiles.items[cfg.profiles.items.len - 1];
 }
 
@@ -906,34 +946,52 @@ fn expandTilde(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}{s}", .{ home, value[1..] });
 }
 
-/// Apply one (key, value) line to a profile. Mirrors a subset of
-/// applyKv — only the per-pane fields the Profile struct holds.
-fn applyProfileKv(prof: *Profile, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+/// Apply one (key, value) line to a settings bundle — the shared
+/// pane-level key set used both at top level (Default settings) and
+/// inside [profile.<name>] sections. Returns false when the key is
+/// not a pane-level key (the caller decides whether that's an
+/// app-level key or an unknown one).
+fn applySettingsKv(s: *ProfileSettings, arena: std.mem.Allocator, key: []const u8, value: []const u8) !bool {
     if (std.mem.eql(u8, key, "shell")) {
-        prof.shell = try expandTilde(arena, value);
+        s.shell = try expandTilde(arena, value);
     } else if (std.mem.eql(u8, key, "font") or std.mem.eql(u8, key, "font_path")) {
-        prof.font_path = try expandTilde(arena, value);
+        s.font_path = try expandTilde(arena, value);
     } else if (std.mem.eql(u8, key, "font_family")) {
-        prof.font_family = try arena.dupe(u8, value);
+        s.font_family = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "font_features")) {
+        s.font_features = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "font_size")) {
-        prof.font_size = try parseU16(value);
+        s.font_size = try parseU16(value);
+    } else if (std.mem.eql(u8, key, "line_pad_px") or std.mem.eql(u8, key, "line_spacing")) {
+        s.line_pad_px = try parseI16(value);
+    } else if (std.mem.eql(u8, key, "padding")) {
+        s.padding = try parseFloat(value);
+    } else if (std.mem.eql(u8, key, "default_fg")) {
+        s.default_fg = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "default_bg")) {
+        s.default_bg = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "cursor_color")) {
+        s.cursor_color = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "cursor_color_default")) {
+        s.cursor_color_default = try parseBool(value);
     } else if (std.mem.eql(u8, key, "scheme")) {
-        prof.scheme = try arena.dupe(u8, value);
+        s.scheme = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "palette")) {
-        prof.palette = try parsePalette16(value);
+        s.palette = try parsePalette16(value);
     } else if (std.mem.eql(u8, key, "term") or std.mem.eql(u8, key, "term_env")) {
-        prof.term_env = try arena.dupe(u8, value);
+        s.term_env = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "color_term") or std.mem.eql(u8, key, "color_term_env")) {
-        prof.color_term_env = try arena.dupe(u8, value);
+        s.color_term_env = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "scrollback")) {
-        prof.scrollback = try parseU32(value);
+        s.scrollback = try parseU32(value);
     } else if (std.mem.eql(u8, key, "login_shell")) {
-        prof.login_shell = try parseBool(value);
+        s.login_shell = try parseBool(value);
     } else if (std.mem.eql(u8, key, "custom_shader")) {
-        prof.custom_shader = try expandTilde(arena, value);
+        s.custom_shader = try expandTilde(arena, value);
     } else {
-        warnConfig("unknown profile key '{s}' (ignoring)", .{key});
+        return false;
     }
+    return true;
 }
 
 fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -984,23 +1042,9 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         });
         return;
     }
-    if (std.mem.eql(u8, key, "font")) {
-        cfg.font_path = try expandTilde(arena, value);
-    } else if (std.mem.eql(u8, key, "font_family")) {
-        cfg.font_family = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "font_features")) {
-        cfg.font_features = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "font_size")) {
-        cfg.font_size = try parseU16(value);
-    } else if (std.mem.eql(u8, key, "line_pad_px") or std.mem.eql(u8, key, "line_spacing")) {
-        cfg.line_pad_px = try parseI16(value);
-    } else if (std.mem.eql(u8, key, "default_fg")) {
-        cfg.default_fg = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "default_bg")) {
-        cfg.default_bg = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "cursor_color")) {
-        cfg.cursor_color = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "cursor_shape")) {
+    // Pane-level keys at top level edit the Default settings.
+    if (try applySettingsKv(&cfg.settings, arena, key, value)) return;
+    if (std.mem.eql(u8, key, "cursor_shape")) {
         if (std.mem.eql(u8, value, "block")) cfg.cursor_shape = .block
         else if (std.mem.eql(u8, value, "underline")) cfg.cursor_shape = .underline
         else if (std.mem.eql(u8, value, "bar")) cfg.cursor_shape = .bar
@@ -1009,16 +1053,6 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.cursor_blink = try parseBool(value);
     } else if (std.mem.eql(u8, key, "cursor_blink_ms")) {
         cfg.cursor_blink_ms = try parseU32(value);
-    } else if (std.mem.eql(u8, key, "padding")) {
-        cfg.padding = try parseFloat(value);
-    } else if (std.mem.eql(u8, key, "scrollback")) {
-        cfg.scrollback = try parseU32(value);
-    } else if (std.mem.eql(u8, key, "shell")) {
-        cfg.shell = try expandTilde(arena, value);
-    } else if (std.mem.eql(u8, key, "term") or std.mem.eql(u8, key, "term_env")) {
-        cfg.term_env = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "color_term") or std.mem.eql(u8, key, "color_term_env")) {
-        cfg.color_term_env = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "bracketed_paste")) {
         cfg.bracketed_paste = try parseBool(value);
     } else if (std.mem.eql(u8, key, "modify_other_keys")) {
@@ -1048,10 +1082,6 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.scroll_on_output = try parseBool(value);
     } else if (std.mem.eql(u8, key, "smart_copy")) {
         cfg.smart_copy = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "login_shell")) {
-        cfg.login_shell = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "cursor_color_default")) {
-        cfg.cursor_color_default = try parseBool(value);
     } else if (std.mem.eql(u8, key, "close_button_on_tab")) {
         cfg.close_button_on_tab = try parseBool(value);
     } else if (std.mem.eql(u8, key, "word_chars")) {
@@ -1063,8 +1093,6 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         const hi = try std.fmt.parseInt(u16, value[colon + 1 ..], 10);
         if (lo == 0 or hi < lo) return error.BadPortRange;
         cfg.mux_udp_port_range = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "scheme")) {
-        cfg.scheme = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "exit_action")) {
         if (std.mem.eql(u8, value, "close")) cfg.exit_action = .close
         else if (std.mem.eql(u8, value, "restart")) cfg.exit_action = .restart
@@ -1074,8 +1102,6 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         if (std.mem.eql(u8, value, "top")) cfg.tab_position = .top
         else if (std.mem.eql(u8, value, "bottom")) cfg.tab_position = .bottom
         else return error.BadTabPosition;
-    } else if (std.mem.eql(u8, key, "palette")) {
-        cfg.palette = try parsePalette16(value);
     } else if (std.mem.eql(u8, key, "always_on_top")) {
         cfg.always_on_top = try parseBool(value);
     } else if (std.mem.eql(u8, key, "new_tab_after_current")) {
@@ -1129,8 +1155,6 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.background_image = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "background_image_opacity")) {
         cfg.background_image_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
-    } else if (std.mem.eql(u8, key, "custom_shader")) {
-        cfg.custom_shader = try expandTilde(arena, value);
     } else if (std.mem.eql(u8, key, "custom_shader_animation")) {
         cfg.custom_shader_animation = try parseBool(value);
     } else if (std.mem.eql(u8, key, "background_gradient_from")) {
@@ -1263,9 +1287,9 @@ fn parseColor(s: []const u8) ![4]f32 {
 test "config: defaults when body is empty" {
     var cfg = try Config.loadFromBytes(std.testing.allocator, "");
     defer cfg.deinit();
-    try std.testing.expectEqual(@as(u16, 14), cfg.font_size);
-    try std.testing.expectEqual(@as(u32, 10000), cfg.scrollback);
-    try std.testing.expectEqualStrings("xterm-256color", cfg.term_env);
+    try std.testing.expectEqual(@as(u16, 14), cfg.settings.font_size);
+    try std.testing.expectEqual(@as(u32, 10000), cfg.settings.scrollback);
+    try std.testing.expectEqualStrings("xterm-256color", cfg.settings.term_env);
 }
 
 test "config: parses key=value lines" {
@@ -1279,8 +1303,8 @@ test "config: parses key=value lines" {
     ;
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
-    try std.testing.expectEqual(@as(u16, 16), cfg.font_size);
-    try std.testing.expectEqual(@as(u32, 50000), cfg.scrollback);
+    try std.testing.expectEqual(@as(u16, 16), cfg.settings.font_size);
+    try std.testing.expectEqual(@as(u32, 50000), cfg.settings.scrollback);
     try std.testing.expectEqual(CursorShape.bar, cfg.cursor_shape);
     try std.testing.expectEqual(false, cfg.cursor_blink);
 }
@@ -1292,9 +1316,9 @@ test "config: parses #RRGGBB and RGB triplets" {
     ;
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
-    try std.testing.expectApproxEqAbs(@as(f32, 0xab) / 255.0, cfg.default_fg[0], 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 16) / 255.0, cfg.default_bg[0], 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 48) / 255.0, cfg.default_bg[2], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0xab) / 255.0, cfg.settings.default_fg[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 16) / 255.0, cfg.settings.default_bg[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 48) / 255.0, cfg.settings.default_bg[2], 0.001);
 }
 
 test "config: bools accept multiple forms" {
@@ -1312,7 +1336,7 @@ test "config: stores font path" {
     const body = "font = /usr/share/fonts/Hack/Hack-Regular.ttf";
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
-    try std.testing.expectEqualStrings("/usr/share/fonts/Hack/Hack-Regular.ttf", cfg.font_path.?);
+    try std.testing.expectEqualStrings("/usr/share/fonts/Hack/Hack-Regular.ttf", cfg.settings.font_path.?);
 }
 
 test "config: line_pad_px parses int (positive and negative)" {
@@ -1322,14 +1346,14 @@ test "config: line_pad_px parses int (positive and negative)" {
     ;
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
-    try std.testing.expectEqual(@as(i16, -2), cfg.line_pad_px);
+    try std.testing.expectEqual(@as(i16, -2), cfg.settings.line_pad_px);
 
     const body2 =
         \\line_spacing = 4
     ;
     var cfg2 = try Config.loadFromBytes(std.testing.allocator, body2);
     defer cfg2.deinit();
-    try std.testing.expectEqual(@as(i16, 4), cfg2.line_pad_px);
+    try std.testing.expectEqual(@as(i16, 4), cfg2.settings.line_pad_px);
 }
 
 test "config: serialise omits defaults" {
@@ -1347,8 +1371,8 @@ test "config: serialise omits defaults" {
 
 test "config: palette + scheme + new keys round-trip" {
     var cfg = Config{};
-    cfg.scheme = "solarized_dark";
-    cfg.palette = .{
+    cfg.settings.scheme = "solarized_dark";
+    cfg.settings.palette = .{
         .{ 0x07, 0x36, 0x42 }, .{ 0xdc, 0x32, 0x2f }, .{ 0x85, 0x99, 0x00 }, .{ 0xb5, 0x89, 0x00 },
         .{ 0x26, 0x8b, 0xd2 }, .{ 0xd3, 0x36, 0x82 }, .{ 0x2a, 0xa1, 0x98 }, .{ 0xee, 0xe8, 0xd5 },
         .{ 0x00, 0x2b, 0x36 }, .{ 0xcb, 0x4b, 0x16 }, .{ 0x58, 0x6e, 0x75 }, .{ 0x65, 0x7b, 0x83 },
@@ -1356,8 +1380,8 @@ test "config: palette + scheme + new keys round-trip" {
     };
     cfg.scroll_on_output = true;
     cfg.smart_copy = false;
-    cfg.login_shell = true;
-    cfg.cursor_color_default = false;
+    cfg.settings.login_shell = true;
+    cfg.settings.cursor_color_default = false;
     cfg.tab_position = .bottom;
     cfg.close_button_on_tab = false;
     cfg.exit_action = .hold;
@@ -1373,14 +1397,14 @@ test "config: palette + scheme + new keys round-trip" {
     var parsed = try Config.loadFromBytes(std.testing.allocator, w.buffered());
     defer parsed.deinit();
 
-    try std.testing.expectEqualStrings("solarized_dark", parsed.scheme);
-    try std.testing.expect(parsed.palette != null);
-    try std.testing.expectEqual(@as(u8, 0xdc), parsed.palette.?[1][0]);
-    try std.testing.expectEqual(@as(u8, 0xfd), parsed.palette.?[15][0]);
+    try std.testing.expectEqualStrings("solarized_dark", parsed.settings.scheme);
+    try std.testing.expect(parsed.settings.palette != null);
+    try std.testing.expectEqual(@as(u8, 0xdc), parsed.settings.palette.?[1][0]);
+    try std.testing.expectEqual(@as(u8, 0xfd), parsed.settings.palette.?[15][0]);
     try std.testing.expectEqual(true, parsed.scroll_on_output);
     try std.testing.expectEqual(false, parsed.smart_copy);
-    try std.testing.expectEqual(true, parsed.login_shell);
-    try std.testing.expectEqual(false, parsed.cursor_color_default);
+    try std.testing.expectEqual(true, parsed.settings.login_shell);
+    try std.testing.expectEqual(false, parsed.settings.cursor_color_default);
     try std.testing.expectEqual(TabPosition.bottom, parsed.tab_position);
     try std.testing.expectEqual(false, parsed.close_button_on_tab);
     try std.testing.expectEqual(ExitAction.hold, parsed.exit_action);
@@ -1393,16 +1417,16 @@ test "config: palette + scheme + new keys round-trip" {
 test "config: serialise round-trips through loadFromBytes" {
     // Set a few non-default values; serialise; re-parse; check.
     var cfg = Config{};
-    cfg.font_size = 18;
+    cfg.settings.font_size = 18;
     cfg.cursor_shape = .underline;
-    cfg.scrollback = 50000;
-    cfg.padding = 8.0;
+    cfg.settings.scrollback = 50000;
+    cfg.settings.padding = 8.0;
     cfg.bracketed_paste = false;
     cfg.modify_other_keys = 2;
-    cfg.line_pad_px = -1;
-    cfg.default_fg = .{ 1.0, 0.5, 0.0, 1.0 };
-    cfg.default_bg = .{ 0.0, 0.0, 0.0, 1.0 };
-    cfg.cursor_color = .{ 0.5, 1.0, 0.5, 1.0 };
+    cfg.settings.line_pad_px = -1;
+    cfg.settings.default_fg = .{ 1.0, 0.5, 0.0, 1.0 };
+    cfg.settings.default_bg = .{ 0.0, 0.0, 0.0, 1.0 };
+    cfg.settings.cursor_color = .{ 0.5, 1.0, 0.5, 1.0 };
     cfg.bell_audible = true;
     cfg.ligatures = false;
 
@@ -1414,21 +1438,21 @@ test "config: serialise round-trips through loadFromBytes" {
     var parsed = try Config.loadFromBytes(std.testing.allocator, out);
     defer parsed.deinit();
 
-    try std.testing.expectEqual(@as(u16, 18), parsed.font_size);
+    try std.testing.expectEqual(@as(u16, 18), parsed.settings.font_size);
     try std.testing.expectEqual(CursorShape.underline, parsed.cursor_shape);
-    try std.testing.expectEqual(@as(u32, 50000), parsed.scrollback);
-    try std.testing.expectEqual(@as(f32, 8.0), parsed.padding);
+    try std.testing.expectEqual(@as(u32, 50000), parsed.settings.scrollback);
+    try std.testing.expectEqual(@as(f32, 8.0), parsed.settings.padding);
     try std.testing.expectEqual(false, parsed.bracketed_paste);
     try std.testing.expectEqual(@as(u8, 2), parsed.modify_other_keys);
-    try std.testing.expectEqual(@as(i16, -1), parsed.line_pad_px);
+    try std.testing.expectEqual(@as(i16, -1), parsed.settings.line_pad_px);
     try std.testing.expectEqual(true, parsed.bell_audible);
     try std.testing.expectEqual(false, parsed.ligatures);
     // Colors round-trip through #RRGGBB so they may lose the lowest
     // byte of float precision but the high bits should match.
-    try std.testing.expect(@abs(parsed.default_fg[0] - 1.0) < 0.01);
-    try std.testing.expect(@abs(parsed.default_fg[1] - 0.5) < 0.01);
-    try std.testing.expect(@abs(parsed.default_fg[2] - 0.0) < 0.01);
-    try std.testing.expect(@abs(parsed.cursor_color[1] - 1.0) < 0.01);
+    try std.testing.expect(@abs(parsed.settings.default_fg[0] - 1.0) < 0.01);
+    try std.testing.expect(@abs(parsed.settings.default_fg[1] - 0.5) < 0.01);
+    try std.testing.expect(@abs(parsed.settings.default_fg[2] - 0.0) < 0.01);
+    try std.testing.expect(@abs(parsed.settings.cursor_color[1] - 1.0) < 0.01);
 }
 
 test "config: profile custom_shader parses and round-trips" {
@@ -1439,9 +1463,9 @@ test "config: profile custom_shader parses and round-trips" {
         "custom_shader = /tmp/crt.glsl\n";
     var cfg = try Config.loadFromBytes(std.testing.allocator, src);
     defer cfg.deinit();
-    try std.testing.expectEqualStrings("/tmp/global.glsl", cfg.custom_shader);
+    try std.testing.expectEqualStrings("/tmp/global.glsl", cfg.settings.custom_shader);
     try std.testing.expectEqual(@as(usize, 1), cfg.profiles.items.len);
-    try std.testing.expectEqualStrings("/tmp/crt.glsl", cfg.profiles.items[0].custom_shader);
+    try std.testing.expectEqualStrings("/tmp/crt.glsl", cfg.profiles.items[0].settings.custom_shader);
 
     var buf: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -1449,12 +1473,12 @@ test "config: profile custom_shader parses and round-trips" {
     const out = w.buffered();
     var re = try Config.loadFromBytes(std.testing.allocator, out);
     defer re.deinit();
-    try std.testing.expectEqualStrings("/tmp/crt.glsl", re.profiles.items[0].custom_shader);
+    try std.testing.expectEqualStrings("/tmp/crt.glsl", re.profiles.items[0].settings.custom_shader);
 
     // Clone keeps the profile shader (config-reload path).
     var cl = try cfg.clone(std.testing.allocator);
     defer cl.deinit();
-    try std.testing.expectEqualStrings("/tmp/crt.glsl", cl.profiles.items[0].custom_shader);
+    try std.testing.expectEqualStrings("/tmp/crt.glsl", cl.profiles.items[0].settings.custom_shader);
 }
 
 test "config: shader_param.<name> entries parse, dedupe, round-trip, clone" {
@@ -1531,17 +1555,17 @@ test "config: ~ expansion in path-valued keys" {
     ;
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
-    try std.testing.expect(cfg.font_path != null);
+    try std.testing.expect(cfg.settings.font_path != null);
 
     // Build expected string from the test runner's HOME.
     var expected_font_buf: [512]u8 = undefined;
     const expected_font = try std.fmt.bufPrint(&expected_font_buf, "{s}/fonts/Hack.ttf", .{home});
-    try std.testing.expectEqualStrings(expected_font, cfg.font_path.?);
+    try std.testing.expectEqualStrings(expected_font, cfg.settings.font_path.?);
 
     var expected_shell_buf: [512]u8 = undefined;
     const expected_shell = try std.fmt.bufPrint(&expected_shell_buf, "{s}/bin/myshell", .{home});
-    try std.testing.expect(cfg.shell != null);
-    try std.testing.expectEqualStrings(expected_shell, cfg.shell.?);
+    try std.testing.expect(cfg.settings.shell != null);
+    try std.testing.expectEqualStrings(expected_shell, cfg.settings.shell.?);
 }
 
 test "config: ~user (no slash after ~) is NOT expanded" {
@@ -1550,8 +1574,8 @@ test "config: ~user (no slash after ~) is NOT expanded" {
     const body = "shell = ~root/bin/sh\n";
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
-    try std.testing.expect(cfg.shell != null);
-    try std.testing.expectEqualStrings("~root/bin/sh", cfg.shell.?);
+    try std.testing.expect(cfg.settings.shell != null);
+    try std.testing.expectEqualStrings("~root/bin/sh", cfg.settings.shell.?);
 }
 
 test "config: visibility defaults are NOT emitted (terse output)" {
@@ -1646,6 +1670,7 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
 test "config: [profile.name] sections round-trip" {
     const body =
         \\font_size = 14
+        \\scrollback = 20000
         \\default_profile = dev
         \\
         \\[profile.dev]
@@ -1662,21 +1687,24 @@ test "config: [profile.name] sections round-trip" {
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
 
-    try std.testing.expectEqual(@as(u16, 14), cfg.font_size); // global
+    try std.testing.expectEqual(@as(u16, 14), cfg.settings.font_size); // Default
     try std.testing.expectEqualStrings("dev", cfg.default_profile);
     try std.testing.expectEqual(@as(usize, 2), cfg.profiles.items.len);
 
     const dev = cfg.profiles.items[0];
     try std.testing.expectEqualStrings("dev", dev.name);
-    try std.testing.expectEqualStrings("/usr/bin/fish", dev.shell);
-    try std.testing.expectEqualStrings("solarized_dark", dev.scheme);
-    try std.testing.expectEqual(@as(u16, 16), dev.font_size);
+    try std.testing.expectEqualStrings("/usr/bin/fish", dev.settings.shell.?);
+    try std.testing.expectEqualStrings("solarized_dark", dev.settings.scheme);
+    try std.testing.expectEqual(@as(u16, 16), dev.settings.font_size);
+    // Unset profile keys were seeded from the Default settings.
+    try std.testing.expectEqual(@as(u32, 20000), dev.settings.scrollback);
 
     const prod = cfg.profiles.items[1];
     try std.testing.expectEqualStrings("prod", prod.name);
-    try std.testing.expectEqualStrings("/usr/bin/bash", prod.shell);
-    try std.testing.expectEqual(@as(?bool, true), prod.login_shell);
-    try std.testing.expectEqual(@as(u32, 50000), prod.scrollback);
+    try std.testing.expectEqualStrings("/usr/bin/bash", prod.settings.shell.?);
+    try std.testing.expectEqual(true, prod.settings.login_shell);
+    try std.testing.expectEqual(@as(u32, 50000), prod.settings.scrollback);
+    try std.testing.expectEqual(@as(u16, 14), prod.settings.font_size); // seeded
 
     // Round-trip via serialise.
     var buf: [2048]u8 = undefined;
@@ -1685,6 +1713,29 @@ test "config: [profile.name] sections round-trip" {
     var parsed = try Config.loadFromBytes(std.testing.allocator, w.buffered());
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed.profiles.items.len);
-    try std.testing.expectEqualStrings("solarized_dark", parsed.profiles.items[0].scheme);
-    try std.testing.expectEqual(@as(?bool, true), parsed.profiles.items[1].login_shell);
+    try std.testing.expectEqualStrings("solarized_dark", parsed.profiles.items[0].settings.scheme);
+    try std.testing.expectEqual(@as(u16, 16), parsed.profiles.items[0].settings.font_size);
+    try std.testing.expectEqual(true, parsed.profiles.items[1].settings.login_shell);
+    try std.testing.expectEqual(@as(u32, 20000), parsed.profiles.items[0].settings.scrollback);
+}
+
+test "config: [profile.default] section edits the Default settings" {
+    const body =
+        \\font_size = 15
+        \\
+        \\[profile.default]
+        \\font_size = 18
+        \\scheme = nord
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u16, 18), cfg.settings.font_size);
+    try std.testing.expectEqualStrings("nord", cfg.settings.scheme);
+    // "default" never lands in the named-profile list.
+    try std.testing.expectEqual(@as(usize, 0), cfg.profiles.items.len);
+    // profileSettings resolves "", "default" and unknown names to it.
+    try std.testing.expectEqual(@as(u16, 18), cfg.profileSettings("").font_size);
+    try std.testing.expectEqual(@as(u16, 18), cfg.profileSettings("default").font_size);
+    try std.testing.expectEqual(@as(u16, 18), cfg.profileSettings("nope").font_size);
 }

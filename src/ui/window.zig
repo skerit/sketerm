@@ -1286,12 +1286,12 @@ pub const Window = struct {
                     arg_owners.deinit(self.allocator);
                 }
                 for (p.command, 0..) |cmd, i| {
-                    // Profile.shell overrides command[0] if set, so
-                    // duplicating an "ssh" profile keeps using ssh
-                    // even after a layout round-trip captured the
-                    // current $SHELL.
-                    const eff_cmd: []const u8 = if (i == 0 and profile != null and profile.?.shell.len > 0)
-                        profile.?.shell
+                    // The profile's shell overrides command[0] if
+                    // set, so duplicating an "ssh" profile keeps
+                    // using ssh even after a layout round-trip
+                    // captured the current $SHELL.
+                    const eff_cmd: []const u8 = if (i == 0 and profile != null and profile.?.settings.shell != null)
+                        profile.?.settings.shell.?
                     else
                         cmd;
                     const z = try self.allocator.allocSentinel(u8, eff_cmd.len, 0);
@@ -1406,7 +1406,7 @@ pub const Window = struct {
             .cwd = cwd,
             .rows = 24,
             .cols = 80,
-            .login_shell = self.config.login_shell,
+            .login_shell = self.config.settings.login_shell,
             .pane_id = pane_id,
             .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
             .shell_integration = self.shellIntegrationFor(argv[0]),
@@ -1580,9 +1580,9 @@ pub const Window = struct {
     }
 
     /// Spawn a shell with an optional starting cwd and named profile.
-    /// Profile fields override the global Config: shell, font path,
-    /// font size, $TERM, $COLORTERM, scrollback, login_shell, scheme,
-    /// palette. Empty profile string / null profile = global config.
+    /// The pane gets the profile's complete settings bundle (shell,
+    /// font, colors, scrollback, shader, …); empty/null profile = the
+    /// window default profile, falling back to the Default settings.
     fn spawnShellPaneOpts(self: *Window, inherit_cwd: ?[]const u8, profile_name: ?[]const u8) !*Pane {
         const profile: ?*const @import("../config.zig").Profile = if (profile_name) |n|
             self.findProfile(n)
@@ -1590,47 +1590,28 @@ pub const Window = struct {
             self.findProfile(self.config.default_profile)
         else
             null;
+        const s: *const @import("../config.zig").ProfileSettings =
+            if (profile) |p| &p.settings else &self.config.settings;
 
-        // Pick effective shell: profile.shell wins → Config.shell →
-        // $SHELL env → /bin/bash.
+        // Pick effective shell: settings.shell → $SHELL env → /bin/bash.
         var shell_buf: [256:0]u8 = undefined;
-        const eff_shell_str: ?[]const u8 = blk: {
-            if (profile) |p| if (p.shell.len > 0) break :blk p.shell;
-            if (self.config.shell) |s| break :blk s;
-            break :blk null;
-        };
-        const shell: [*:0]const u8 = if (eff_shell_str) |s| blk: {
-            const n = @min(s.len, shell_buf.len);
-            @memcpy(shell_buf[0..n], s[0..n]);
+        const shell: [*:0]const u8 = if (s.shell) |sh| blk: {
+            const n = @min(sh.len, shell_buf.len);
+            @memcpy(shell_buf[0..n], sh[0..n]);
             shell_buf[n] = 0;
             break :blk @ptrCast(&shell_buf);
         } else if (c.getenv("SHELL")) |env_ptr| @as([*:0]const u8, @ptrCast(env_ptr)) else "/bin/bash";
 
         const argv = [_][*:0]const u8{shell};
 
-        // TERM / COLORTERM, profile-overridable.
-        const eff_term: []const u8 = if (profile) |p|
-            (if (p.term_env.len > 0) p.term_env else self.config.term_env)
-        else
-            self.config.term_env;
-        const eff_color_term: []const u8 = if (profile) |p|
-            (if (p.color_term_env.len > 0) p.color_term_env else self.config.color_term_env)
-        else
-            self.config.color_term_env;
-
         var term_buf: [64:0]u8 = undefined;
         var ct_buf: [64:0]u8 = undefined;
-        const tlen = @min(eff_term.len, term_buf.len);
-        @memcpy(term_buf[0..tlen], eff_term[0..tlen]);
+        const tlen = @min(s.term_env.len, term_buf.len);
+        @memcpy(term_buf[0..tlen], s.term_env[0..tlen]);
         term_buf[tlen] = 0;
-        const ctlen = @min(eff_color_term.len, ct_buf.len);
-        @memcpy(ct_buf[0..ctlen], eff_color_term[0..ctlen]);
+        const ctlen = @min(s.color_term_env.len, ct_buf.len);
+        @memcpy(ct_buf[0..ctlen], s.color_term_env[0..ctlen]);
         ct_buf[ctlen] = 0;
-
-        const eff_login_shell: bool = if (profile) |p|
-            (p.login_shell orelse self.config.login_shell)
-        else
-            self.config.login_shell;
 
         const pane_id = self.allocPaneId();
         var pty = try Pty.spawn(.{
@@ -1640,7 +1621,7 @@ pub const Window = struct {
             .term = @ptrCast(&term_buf),
             .color_term = @ptrCast(&ct_buf),
             .cwd = inherit_cwd,
-            .login_shell = eff_login_shell,
+            .login_shell = s.login_shell,
             .pane_id = pane_id,
             .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
             .shell_integration = self.shellIntegrationFor(argv[0]),
@@ -1940,41 +1921,35 @@ pub const Window = struct {
 
     const PaneConfigOpts = struct {
         profile: ?*const @import("../config.zig").Profile = null,
-        /// Saved per-pane font size (layout restore). Loses to a
-        /// profile override, wins over the global config.
+        /// Saved per-pane font size (layout restore / Ctrl± zoom).
+        /// Wins over the profile's font_size.
         font_size_override: ?u16 = null,
     };
 
-    /// Push every config-derived (and profile-overridden) field onto
-    /// a fresh pane + its terminal. The single source of truth for
-    /// ALL pane-creation paths (new tab/split, layout restore,
+    /// Push the pane's effective settings bundle (its profile, or
+    /// the Default settings) + app-level config onto a fresh pane +
+    /// its terminal. The single source of truth for ALL
+    /// pane-creation paths (new tab/split, layout restore,
     /// addTabInternal) — restored panes used to skip the color push
     /// entirely and kept the built-in gray background.
     fn applyPaneConfig(self: *Window, pane: *Pane, opts: PaneConfigOpts) void {
-        const profile = opts.profile;
+        const s: *const @import("../config.zig").ProfileSettings =
+            if (opts.profile) |p| &p.settings else &self.config.settings;
         const term = pane.terminal;
 
-        // Effective values per-field: profile wins over global.
-        pane.font_size = if (profile) |p|
-            (if (p.font_size != 0) p.font_size else (opts.font_size_override orelse self.config.font_size))
-        else
-            (opts.font_size_override orelse self.config.font_size);
-        pane.font_path = if (profile) |p|
-            (if (p.font_path.len > 0) p.font_path else self.config.font_path)
-        else
-            self.config.font_path;
-        const eff_font_family: []const u8 = if (profile) |p|
-            (if (p.font_family.len > 0) p.font_family else self.config.font_family)
-        else
-            self.config.font_family;
-        pane.font_family = if (eff_font_family.len > 0) eff_font_family else null;
-        pane.font_features = if (self.config.font_features.len > 0) self.config.font_features else null;
+        pane.font_size = opts.font_size_override orelse s.font_size;
+        pane.font_path = s.font_path;
+        pane.font_family = if (s.font_family.len > 0) s.font_family else null;
+        pane.font_features = if (s.font_features.len > 0) s.font_features else null;
         pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
-        pane.line_pad_px = self.config.line_pad_px;
-        pane.grid_pass.pad = self.config.padding;
-        const fg_bg = self.resolveDefaultColors();
+        pane.line_pad_px = s.line_pad_px;
+        pane.grid_pass.pad = s.padding;
+        pane.cell_pass.pad = s.padding;
+        const fg_bg = self.resolveColorsFor(s);
         pane.grid_pass.default_fg = fg_bg.fg;
         pane.grid_pass.default_bg = fg_bg.bg;
+        pane.cell_pass.default_fg = fg_bg.fg;
+        pane.cell_pass.default_bg = fg_bg.bg;
         pane.grid_pass.enable_ligatures = self.config.ligatures;
         pane.grid_pass.enable_bidi = self.config.bidi;
         // Push config-driven defaults onto the screen so OSC 4/10/11
@@ -1983,14 +1958,11 @@ pub const Window = struct {
         term.screen.default_bg = fg_bg.bg;
         term.screen.configured_fg = fg_bg.fg;
         term.screen.configured_bg = fg_bg.bg;
-        term.screen.cursor_color = if (self.config.cursor_color_default)
+        term.screen.cursor_color = if (s.cursor_color_default)
             .{ 0, 0, 0, 0 }
         else
-            self.config.cursor_color;
-        term.screen.scrollback_capacity = if (profile) |p|
-            (if (p.scrollback != 0) p.scrollback else self.config.scrollback)
-        else
-            self.config.scrollback;
+            s.cursor_color;
+        term.screen.scrollback_capacity = s.scrollback;
         term.screen.bracketed_paste = self.config.bracketed_paste;
         term.screen.scroll_on_output = self.config.scroll_on_output;
         term.screen.allow_clipboard_read = self.config.clipboard_read;
@@ -1999,22 +1971,9 @@ pub const Window = struct {
         // actually want to know (vim background=dark/light).
         term.screen.color_scheme_dark = isDarkBg(fg_bg.bg);
         term.screen.word_chars = self.config.word_chars;
-        // Resolve effective palette: profile.palette > config.palette
-        // > profile.scheme lookup > config.scheme lookup > defaults.
-        const eff_pal: ?[16][3]u8 = blk: {
-            if (profile) |p| if (p.palette) |pp| break :blk pp;
-            if (self.config.palette) |gp| break :blk gp;
-            if (profile) |p| if (p.scheme.len > 0) {
-                if (@import("../grid/schemes.zig").lookup(p.scheme)) |sch| break :blk sch.palette;
-            };
-            if (self.config.scheme.len > 0) {
-                if (@import("../grid/schemes.zig").lookup(self.config.scheme)) |sch| {
-                    break :blk sch.palette;
-                }
-            }
-            break :blk null;
-        };
-        if (eff_pal) |pal| {
+        // Effective palette: explicit palette > scheme lookup >
+        // built-in defaults.
+        if (resolvePalette(s)) |pal| {
             var i: usize = 0;
             while (i < 16) : (i += 1) {
                 term.screen.palette[i] = pal[i];
@@ -2022,22 +1981,32 @@ pub const Window = struct {
             }
         }
 
-        // Shader resolution: explicit user pick / clear > profile >
-        // global. Both the pick and an explicit clear are sticky —
+        // Shader resolution: explicit user pick / clear > profile
+        // settings. Both the pick and an explicit clear are sticky —
         // config reloads / profile pushes leave them alone.
         pane.shader_default_source = &self.shader_source;
         if (!pane.hasOwnShaderParams())
             pane.shader_own.overrides = self.config.shader_params.items;
         if (!pane.custom_shader_user and !pane.shader_cleared) {
-            const prof_shader: []const u8 = if (profile) |p| p.custom_shader else "";
             _ = pane.setCustomShader(
-                if (prof_shader.len > 0) prof_shader else null,
+                if (s.custom_shader.len > 0) s.custom_shader else null,
                 self.config.custom_shader_animation,
                 false,
             );
         }
         pane.refreshShaderBinding();
         pane.updateShaderTick();
+    }
+
+    /// Effective 16-colour palette for a settings bundle: explicit
+    /// `palette` wins; `scheme` alone resolves through the built-in
+    /// table; null = keep the built-in 256-table values.
+    fn resolvePalette(s: *const @import("../config.zig").ProfileSettings) ?[16][3]u8 {
+        if (s.palette) |p| return p;
+        if (s.scheme.len > 0) {
+            if (@import("../grid/schemes.zig").lookup(s.scheme)) |sch| return sch.palette;
+        }
+        return null;
     }
 
     /// Split the focused pane: spawn a new pane and place the two
@@ -2726,20 +2695,27 @@ pub const Window = struct {
 
     pub fn resetFocusedFontSize(self: *Window) void {
         const pane = self.focusedPane() orelse return;
-        if (pane.font_size == self.config.font_size) return;
-        pane.setFontSize(self.config.font_size);
+        const base = self.config.profileSettings(pane.active_profile orelse "").font_size;
+        if (pane.font_size == base) return;
+        pane.setFontSize(base);
     }
 
     const ColorPair = struct { fg: [4]f32, bg: [4]f32 };
 
-    /// Derive the effective default fg/bg. When auto_theme is on we
-    /// follow AdwStyleManager's dark/light state so sketerm matches
-    /// the system appearance. Otherwise honour the explicit config.
-    /// `background_opacity` is applied to bg.a after theme resolution
-    /// so transparency works under both auto and manual themes.
+    /// Derive the effective default fg/bg for the Default settings.
     fn resolveDefaultColors(self: *const Window) ColorPair {
+        return self.resolveColorsFor(&self.config.settings);
+    }
+
+    /// Derive the effective default fg/bg for a settings bundle.
+    /// When auto_theme is on we follow AdwStyleManager's dark/light
+    /// state so sketerm matches the system appearance. Otherwise
+    /// honour the bundle's explicit colors. `background_opacity` is
+    /// applied to bg.a after theme resolution so transparency works
+    /// under both auto and manual themes.
+    fn resolveColorsFor(self: *const Window, s: *const @import("../config.zig").ProfileSettings) ColorPair {
         var pair: ColorPair = if (!self.config.auto_theme) blk: {
-            break :blk .{ .fg = self.config.default_fg, .bg = self.config.default_bg };
+            break :blk .{ .fg = s.default_fg, .bg = s.default_bg };
         } else blk: {
             const sm = c.adw_style_manager_get_default();
             const dark = c.adw_style_manager_get_dark(sm) != 0;
@@ -2828,13 +2804,6 @@ pub const Window = struct {
     /// persists the new values to disk so they survive restart.
     pub fn applyConfigChange(self: *Window, new_cfg: *const Config) void {
         // Compute diffs we need to react to BEFORE swapping config.
-        const old_size = self.config.font_size;
-        const old_pad = self.config.padding;
-        // Old font selection strings stay alive until the deferred
-        // old-arena free at function end, so comparing later is safe.
-        const old_font_path = self.config.font_path;
-        const old_font_family = self.config.font_family;
-        const old_font_features = self.config.font_features;
         const old_blink_ms = self.config.cursor_blink_ms;
         const old_tab_pos = self.config.tab_position;
         // Replace config wholesale via a deep copy into a fresh
@@ -2864,23 +2833,42 @@ pub const Window = struct {
             self.refreshBgSource();
         }
 
-        // Custom shader: re-read the file only when its keys moved —
-        // but ALWAYS re-point the param overrides, which live in the
+        // Window-level custom shader source follows the Default
+        // settings. Re-read the file only when its keys moved — but
+        // ALWAYS re-point the param overrides, which live in the
         // config arena that gets freed when this function returns.
-        if (!std.mem.eql(u8, old_cfg.custom_shader, self.config.custom_shader) or
+        if (!std.mem.eql(u8, old_cfg.settings.custom_shader, self.config.settings.custom_shader) or
             old_cfg.custom_shader_animation != self.config.custom_shader_animation)
         {
             self.refreshShaderSource();
         }
         self.shader_source.overrides = self.config.shader_params.items;
 
-        // Push into every pane.
-        const eff = self.resolveDefaultColors();
+        // Push into every pane, resolving each pane's profile to its
+        // settings bundle in the NEW config (deleted profiles degrade
+        // to the Default settings).
         for (self.panes.items) |p| {
             const screen = p.terminal.screen;
-            // Colors. resolveDefaultColors applies auto-theme +
+            // The pane's old effective settings — old name slice and
+            // old config arena both stay alive until function end.
+            const old_s = old_cfg.profileSettings(p.active_profile orelse "");
+            // Re-point active_profile at the new arena's copy (or
+            // drop it if the profile no longer exists).
+            if (p.active_profile) |pn| {
+                p.active_profile = null;
+                for (self.config.profiles.items) |*pr| {
+                    if (std.mem.eql(u8, pr.name, pn)) {
+                        p.active_profile = pr.name;
+                        break;
+                    }
+                }
+            }
+            const s = self.config.profileSettings(p.active_profile orelse "");
+
+            // Colors. resolveColorsFor applies auto-theme +
             // background_opacity so panes get the actual rendering
-            // values, not the raw config struct.
+            // values, not the raw settings struct.
+            const eff = self.resolveColorsFor(s);
             screen.default_fg = eff.fg;
             screen.default_bg = eff.bg;
             screen.configured_fg = eff.fg;
@@ -2889,26 +2877,17 @@ pub const Window = struct {
             screen.allow_clipboard_read = self.config.clipboard_read;
             // Renderer convention: alpha=0 means "use fg colour". We
             // map cursor_color_default → that sentinel.
-            screen.cursor_color = if (self.config.cursor_color_default)
+            screen.cursor_color = if (s.cursor_color_default)
                 .{ 0, 0, 0, 0 }
             else
-                self.config.cursor_color;
+                s.cursor_color;
             p.grid_pass.default_fg = eff.fg;
             p.grid_pass.default_bg = eff.bg;
             p.cell_pass.default_fg = eff.fg;
             p.cell_pass.default_bg = eff.bg;
-            // Palette (16 ANSI colours). Explicit `palette` wins;
-            // `scheme` alone resolves through the built-in table.
-            // Entries 16..255 keep their built-in 256-table values.
-            const eff_pal: ?[16][3]u8 = self.config.palette orelse blk: {
-                if (self.config.scheme.len > 0) {
-                    if (@import("../grid/schemes.zig").lookup(self.config.scheme)) |sch| {
-                        break :blk sch.palette;
-                    }
-                }
-                break :blk null;
-            };
-            if (eff_pal) |pal| {
+            // Palette (16 ANSI colours). Entries 16..255 keep their
+            // built-in 256-table values.
+            if (resolvePalette(s)) |pal| {
                 var i: usize = 0;
                 while (i < 16) : (i += 1) {
                     screen.palette[i] = pal[i];
@@ -2921,9 +2900,9 @@ pub const Window = struct {
                 p.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
             }
             // Padding.
-            if (self.config.padding != old_pad) {
-                p.grid_pass.pad = self.config.padding;
-                p.cell_pass.pad = self.config.padding;
+            if (s.padding != old_s.padding) {
+                p.grid_pass.pad = s.padding;
+                p.cell_pass.pad = s.padding;
                 c.gtk_widget_queue_resize(p.widget());
             }
             // Rendering.
@@ -2939,7 +2918,7 @@ pub const Window = struct {
             // Behavior.
             screen.bracketed_paste = self.config.bracketed_paste;
             screen.modify_other_keys = self.config.modify_other_keys;
-            screen.scrollback_capacity = self.config.scrollback;
+            screen.scrollback_capacity = s.scrollback;
             screen.scroll_on_output = self.config.scroll_on_output;
             screen.word_chars = self.config.word_chars;
             if (p.input_ctx) |ictx| {
@@ -2950,54 +2929,21 @@ pub const Window = struct {
             // These slices pointed into the old config arena (freed
             // when this function returns) — re-point them at the new
             // config's copies.
-            if (p.active_profile) |pn| {
-                p.active_profile = null;
-                for (self.config.profiles.items) |*pr| {
-                    if (std.mem.eql(u8, pr.name, pn)) {
-                        p.active_profile = pr.name;
-                        break;
-                    }
-                }
-            }
-            p.font_path = blk: {
-                if (p.active_profile) |pn| {
-                    for (self.config.profiles.items) |*pr| {
-                        if (std.mem.eql(u8, pr.name, pn) and pr.font_path.len > 0)
-                            break :blk pr.font_path;
-                    }
-                }
-                break :blk self.config.font_path;
-            };
-            p.font_family = blk: {
-                if (p.active_profile) |pn| {
-                    for (self.config.profiles.items) |*pr| {
-                        if (std.mem.eql(u8, pr.name, pn) and pr.font_family.len > 0)
-                            break :blk pr.font_family;
-                    }
-                }
-                break :blk if (self.config.font_family.len > 0) self.config.font_family else null;
-            };
-            p.font_features = if (self.config.font_features.len > 0) self.config.font_features else null;
+            p.font_path = s.font_path;
+            p.font_family = if (s.font_family.len > 0) s.font_family else null;
+            p.font_features = if (s.font_features.len > 0) s.font_features else null;
+            p.line_pad_px = s.line_pad_px;
             // Shader state: the overrides slice points into the
             // config arena (about to be freed) — re-point it
             // UNCONDITIONALLY (preset panes own their slice and skip
-            // this), then re-resolve profile/global shader for panes
+            // this), then re-resolve the settings shader for panes
             // without a sticky user pick.
             p.shader_default_source = &self.shader_source;
             if (!p.hasOwnShaderParams())
                 p.shader_own.overrides = self.config.shader_params.items;
             if (!p.custom_shader_user and !p.shader_cleared) {
-                const prof_shader: []const u8 = blk: {
-                    if (p.active_profile) |pn| {
-                        for (self.config.profiles.items) |*pr| {
-                            if (std.mem.eql(u8, pr.name, pn) and pr.custom_shader.len > 0)
-                                break :blk pr.custom_shader;
-                        }
-                    }
-                    break :blk "";
-                };
                 _ = p.setCustomShader(
-                    if (prof_shader.len > 0) prof_shader else null,
+                    if (s.custom_shader.len > 0) s.custom_shader else null,
                     self.config.custom_shader_animation,
                     false,
                 );
@@ -3020,6 +2966,22 @@ pub const Window = struct {
             p.inactive_darken = self.config.inactive_darken;
             p.inactive_desaturate = self.config.inactive_desaturate;
             p.applyDim();
+            // Font rebuilds, per pane against ITS settings bundle. A
+            // size change takes the heavy atlas-rebuild path (and
+            // resets any Ctrl± zoom, like before); same size with a
+            // different file/family/features rebuilds explicitly
+            // since setFontSize would early-return.
+            if (s.font_size != old_s.font_size) {
+                p.setFontSize(s.font_size);
+            } else {
+                const path_changed = !eqOptStr(old_s.font_path, s.font_path);
+                const family_changed = !std.mem.eql(u8, old_s.font_family, s.font_family);
+                const features_changed = !std.mem.eql(u8, old_s.font_features, s.font_features);
+                const line_pad_changed = old_s.line_pad_px != s.line_pad_px;
+                if (path_changed or family_changed or features_changed or line_pad_changed) {
+                    p.refreshFont();
+                }
+            }
             // Repaint.
             screen.dirty = true;
             p.cell_pass.markAllDirty();
@@ -3029,22 +2991,6 @@ pub const Window = struct {
         // Refresh CSS provider so any title_*_* color changes take
         // effect immediately on the active/inactive classes.
         self.refreshTitlebarCss();
-
-        // Font size needs the heavy atlas-rebuild path.
-        if (self.config.font_size != old_size) {
-            for (self.panes.items) |p| p.setFontSize(self.config.font_size);
-        } else {
-            // Same size, different font file/family: setFontSize would
-            // early-return, so rebuild the atlases explicitly.
-            const path_changed = !eqOptStr(old_font_path, self.config.font_path);
-            const family_changed = !std.mem.eql(u8, old_font_family, self.config.font_family);
-            // Feature changes need the same rebuild: cached shaped
-            // runs and atlas glyphs were produced under the old set.
-            const features_changed = !std.mem.eql(u8, old_font_features, self.config.font_features);
-            if (path_changed or family_changed or features_changed) {
-                for (self.panes.items) |p| p.refreshFont();
-            }
-        }
 
         // Tab position swap.
         if (self.config.tab_position != old_tab_pos) {
@@ -3245,7 +3191,7 @@ pub const Window = struct {
             // spawns send empty argv = "the remote's login shell"
             // and no cwd (local paths mean nothing over there).
             const argv: []const []const u8 = if (host != null) &.{} else blk: {
-                const sh: []const u8 = if (self.config.shell) |s| s else sh2: {
+                const sh: []const u8 = if (self.config.settings.shell) |s| s else sh2: {
                     const env = c.getenv("SHELL");
                     break :sh2 if (env != null) std.mem.span(env) else "/bin/sh";
                 };
@@ -3334,7 +3280,7 @@ pub const Window = struct {
                 // saved cwd + configured shell; remote spawns send
                 // empty argv = the remote's login shell.
                 const argv: []const []const u8 = if (host != null) &.{} else blk: {
-                    const sh: []const u8 = if (self.config.shell) |s| s else sh2: {
+                    const sh: []const u8 = if (self.config.settings.shell) |s| s else sh2: {
                         const env = c.getenv("SHELL");
                         break :sh2 if (env != null) std.mem.span(env) else "/bin/sh";
                     };
@@ -3525,7 +3471,7 @@ pub const Window = struct {
         self.shader_source.animate = self.config.custom_shader_animation;
         self.shader_source.overrides = self.config.shader_params.items;
 
-        const path = self.config.custom_shader;
+        const path = self.config.settings.custom_shader;
         if (path.len > 0) {
             // Shader-relative //@texture paths resolve against this.
             if (std.fs.path.dirname(path)) |d| {
@@ -4517,9 +4463,10 @@ pub const Window = struct {
                     out[0] = try arena.dupe(u8, @import("../util/profile.zig").getenv("SHELL") orelse "/bin/bash");
                     break :blk out;
                 };
-                // Save font_size only if it diverges from the global
-                // default — keeps layout files terse.
-                const fs: ?u16 = if (p.font_size != self.config.font_size) p.font_size else null;
+                // Save font_size only if it diverges from the pane's
+                // profile settings — keeps layout files terse.
+                const base_fs = self.config.profileSettings(p.active_profile orelse "").font_size;
+                const fs: ?u16 = if (p.font_size != base_fs) p.font_size else null;
                 // Carry profile name so split-tree restore / duplicate
                 // can reapply per-pane profile overrides.
                 const prof: []const u8 = if (p.active_profile) |pn|
