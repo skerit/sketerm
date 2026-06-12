@@ -5206,3 +5206,34 @@ docs/proposal-macos-remote-apps.md), built on the Linux machine:
 - Next: GUI compositor brain (render `foot`), then input, then
   damage diffing + compression.
 - 531 tests, smoke-mux, mux-portable, GUI build all PASS.
+
+## 2026-06-12: native app pipe milestone 3 — compositor brain + GUI windows
+
+Stock Wayland apps now run over the sketerm-native pipe end to end,
+zero waypipe:
+
+- `wlhost/compositor.zig`: the server-side protocol brain (pure
+  state machine, GTK/socket-free). Advertises low-version globals
+  (compositor 4 / shm 1 / seat 1 with caps 0 / output 2 /
+  xdg_wm_base 2), runs the xdg configure dance, latches commits,
+  fires frame callbacks, extracts tight-packed pixels from the
+  synced pool mirrors via View callbacks. Lenient where toolkits
+  are sloppy (seat get_* with caps 0 register silent devices).
+  Protocol violations send wl_display.error and mark dead.
+- smoke-mux "real app" stage: spawns weston-terminal in a native
+  session, pumps daemon ↔ compositor over the mux protocol, and
+  asserts a committed frame (806x539, non-zero pixels, 6 rounds).
+  Skips cleanly when weston-terminal isn't installed.
+- GUI: `src/wlapp.zig` AppHost renders each toplevel as GtkWindow +
+  GtkPicture (GdkMemoryTexture per commit; argb→B8G8R8A8_PREMULT,
+  xrgb→B8G8R8X8). terminal.zig routes wayland_native chan_* frames
+  into it (NApp list alongside the waypipe WlChan list). Close
+  button → xdg_toplevel.close. Title via set_title callback.
+- VERIFIED live (Xvfb, isolated XDG dirs): GUI + native-mode local
+  daemon, durable tab, `weston-terminal &` typed into the session —
+  a local window appears with correct CSD rendering, prompt,
+  cursor, drop shadow, and forwarded title. Screenshot-confirmed.
+- Next: input (wl_seat caps, keymap over the pipe, GTK event →
+  seat events), then damage diffing + compression, then popups.
+- 535 tests, smoke-mux (incl. real app), smoke-e2e, mux-portable,
+  aarch64-macos cross all PASS.
