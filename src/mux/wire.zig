@@ -55,6 +55,10 @@ pub const ChannelKind = enum(u8) {
     /// A waypipe-server connection from the session's Wayland
     /// display; bridge it to the local waypipe client.
     wayland = 1,
+    /// Sketerm-native app pipe: chan_data carries wlhost/pipe.zig
+    /// units (Wayland messages + shm pool side-band), no waypipe on
+    /// either end. The GUI compositor brain consumes it directly.
+    wayland_native = 2,
     _,
 };
 

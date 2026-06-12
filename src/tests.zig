@@ -63,6 +63,7 @@ comptime {
     _ = @import("wlhost/wire.zig");
     _ = @import("wlhost/protocol.zig");
     _ = @import("wlhost/track.zig");
+    _ = @import("wlhost/pipe.zig");
 }
 
 test {
