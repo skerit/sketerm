@@ -132,3 +132,48 @@ presents via shm), GPU-buffer (dmabuf) apps don't. For those,
 `SKETERM_MUX_WAYLAND=waypipe` in the daemon's environment opts back
 into the legacy waypipe wrap (needs waypipe installed remotely);
 `SKETERM_MUX_NO_WAYLAND=1` disables forwarding entirely.
+
+## Remote macOS apps (window streaming)
+
+macOS apps have no forwardable display protocol (they speak private
+Mach IPC to WindowServer), so a macOS host streams **pixels**: the
+daemon captures each app window with ScreenCaptureKit and the
+client renders it as a native window, with keyboard/mouse/scroll
+injected back via CGEvents. App sessions on a Mac use this
+automatically — same wire, same transports (ssh / mux socket /
+roaming UDP), nothing to choose.
+
+Host requirements, in order:
+
+1. **A capture-capable daemon.** `zig build mux` ON the Mac.
+   `sketerm-mux-portable` does not include capture (cross builds
+   have no macOS SDK); neither does a Linux-built binary.
+2. **A logged-in GUI session.** WindowServer must be running and
+   the daemon must belong to the console user's session. Launch the
+   daemon from a local terminal, or install it as a LaunchAgent
+   (`launchctl bootstrap gui/$UID <plist>`). A daemon started over
+   plain SSH can spawn apps and serve the wire, but TCC will refuse
+   capture for the sshd context — use the LaunchAgent.
+3. **One-time TCC grants** (not scriptable, by design). The first
+   capture attempt registers `sketerm-mux` — DISABLED — under
+   System Settings → Privacy & Security → **Screen Recording**;
+   the first input injection does the same under **Accessibility**.
+   Flip both toggles, then restart the daemon. Until then the
+   client shows a notice window titled with these instructions and
+   the daemon logs the exact failure — no silent hangs.
+4. **Re-grant after rebuilding.** Zig binaries are ad-hoc signed,
+   so a rebuilt daemon is a new TCC identity. Keep the granted copy
+   at a stable path (e.g. `~/.local/bin/sketerm-mux`) and re-toggle
+   after updating it.
+
+Caveats: system apps (Calculator, TextEdit, …) carry launch
+constraints on modern macOS and cannot be spawned as PTY children —
+launch third-party apps or your own binaries directly, e.g.
+`/Applications/Foo.app/Contents/MacOS/Foo`, from inside the
+session. Windows are matched to the session by pid ancestry and by
+controlling terminal, so apps launched from the session shell are
+picked up even after re-parenting; apps launched via `open` (which
+hands off to launchd) are not. Minimized windows close client-side
+and re-open when restored. `SKETERM_WINSTREAM=stub` (test pattern)
+and `=sck` (capture every session, not just app sessions) exist
+for testing.

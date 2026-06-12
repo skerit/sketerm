@@ -5435,3 +5435,39 @@ follows focus, fullscreen state round-trips, seat v4 + repeat_info,
 popup constraint sliding. 546 tests, smoke-mux, rig (crop verified
 visually: edge-to-edge content, popup placed right), both portable
 targets PASS.
+
+## 2026-06-12: winstream — the real ScreenCaptureKit backend (Mac)
+
+The Darwin half of macOS-apps-on-Linux, behind the stub's exact
+poll/handleInput surface:
+
+- sck_shim.m (ObjC, C ABI): SCShareableContent refresh every 500ms
+  filtered by pid ancestry OR shared controlling tty (survives
+  shell re-parenting); one SCStream per window, BGRA at point
+  resolution, content-rect cropped (resize between config updates
+  stays correct); latest-frame-wins buffers behind a mutex; a
+  wakeup pipe that joins the daemon poll set so frames don't wait
+  out the 500ms tick. Input: CGEventPost — keys via an
+  evdev→CGKeyCode table (keymap.zig, unit-tested everywhere),
+  pointer mapped through the live window frame, drag/click-count
+  tracking, scroll with fraction accumulation; close_req walks AX
+  windows (frame-matched) for the close button, falls back to app
+  terminate for the last window.
+- source.zig is now a stub/sck dispatch union; the sck arm
+  collapses to void unless build_options.winstream_sck (native
+  macOS builds only — Linux, musl, every cross target unchanged,
+  mux-portable explicitly never carries capture). App sessions on
+  capture hosts stream by default; explicit wl_mode wins;
+  SKETERM_WINSTREAM stub/all/sck gating for rigs.
+- TCC honesty: missing Screen Recording → a notice window with the
+  fix in its title + actionable daemon log, never a hang. Verified
+  live over a real daemon + mux socket. GUI scroll now forwarded
+  (input_ptr kind 3 = wheel deltas).
+- Hardware traps documented in macos.md: launchd-vs-sshd TCC
+  identity, ad-hoc cdhash re-grants, macOS 26 launch constraints
+  (system apps can't be PTY children), Darwin CMSG layout (smoke
+  fd-passing fixed → smoke-mux now passes natively on the Mac).
+- 549 tests, smoke-mux (Mac + stub), mux-portable x86_64+aarch64
+  musl, aarch64-macos portable, GUI build all green. Real-capture
+  live run pending the manual Screen Recording + Accessibility
+  toggles (registered, awaiting the human).

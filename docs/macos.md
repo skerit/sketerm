@@ -96,3 +96,34 @@ was needed — pkgconf's defaults cover the brew prefix.
   or hostname.
 - `.app` bundle / packaging not started (run from zig-out/bin).
 - Cmd-vs-Ctrl keybinding conventions not started.
+
+## Window-streaming agent friction (2026-06, hardware)
+
+Found while landing the ScreenCaptureKit winstream backend:
+
+1. **TCC identity is the whole game.** A daemon spawned from an SSH
+   shell gets attributed to `sshd-session` and capture is refused
+   outright ("user declined TCCs") — no prompt. Run the daemon as a
+   LaunchAgent in the gui domain (`launchctl bootstrap gui/$UID`);
+   the first capture attempt then registers the binary (disabled)
+   in System Settings → Screen Recording for the user to enable.
+   Ad-hoc-signed Zig binaries are re-identified per build (cdhash):
+   grant a stable copy, not `zig-out/bin/`.
+2. **System apps can't be PTY children.** macOS 26 launch
+   constraints kill `/System/Applications/Calculator.app/...` (and
+   friends) instantly when fork/exec'd from a shell — single-frame
+   sessions that exit before attach. Validate with third-party apps
+   or a custom AppKit binary; `src/winstream` testing here used a
+   60-line ObjC test app (window + event counter).
+3. **Darwin CMSG layout** bit the smoke: 12-byte cmsghdr, 4-byte
+   alignment, and XNU rejects a `msg_controllen` padded to Linux's
+   24 — `sendWithFd` now computes CMSG_SPACE per-OS. Same class of
+   bug to watch for in any future fd-passing code.
+4. **weston-terminal doesn't exist here**, so smoke-mux's real-app
+   stage skips and the Wayland hub numbering shifts — the pending
+   stage derives the hub id instead of hardcoding wl-3.
+
+Verified on this hardware: stub winstream round-trip (smoke-mux
+PASS natively), SCK daemon launch via LaunchAgent, missing-grant
+notice window + actionable daemon log end-to-end over the real mux
+socket. Real-capture validation requires the manual TCC toggles.
