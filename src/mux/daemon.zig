@@ -18,7 +18,8 @@ const wlwire = @import("../wlhost/wire.zig");
 const wltrack = @import("../wlhost/track.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
 const wsproto = @import("../winstream/proto.zig");
-const WsSource = @import("../winstream/source.zig").Source;
+const wssource = @import("../winstream/source.zig");
+const WsSource = wssource.Source;
 const snapshot = @import("snapshot.zig");
 const Pty = @import("../pty.zig").Pty;
 const Parser = @import("../parser/vt.zig").Parser;
@@ -362,6 +363,17 @@ pub const Daemon = struct {
         for (self.sessions.items) |s| {
             try fds.append(self.allocator, .{
                 .fd = s.wl_hub_fd, // -1 entries are ignored by poll
+                .events = c.POLLIN,
+                .revents = 0,
+            });
+        }
+        // Window-stream wakeup pipes: SCK delivers frames on its own
+        // dispatch queues — a readable byte here just ends the poll
+        // wait early so pumpWinstreams() drains with low latency.
+        // No revents handling: the source reads its pipe dry in poll().
+        for (self.sessions.items) |s| {
+            try fds.append(self.allocator, .{
+                .fd = if (s.winstream) |ws| ws.pollFd() else -1,
                 .events = c.POLLIN,
                 .revents = 0,
             });
@@ -1266,13 +1278,27 @@ pub const Daemon = struct {
         // back into the legacy `waypipe server` wrap (e.g. for
         // GPU-buffer transfer); SKETERM_MUX_NO_WAYLAND=1 disables
         // app forwarding entirely.
-        // Window-stream backend (pixel capture) for app sessions:
-        // today gated on SKETERM_WINSTREAM=stub (pipeline testing
-        // anywhere); the Darwin ScreenCaptureKit backend will key on
-        // builtin.os.tag once it exists.
+        // Window-stream backend (pixel capture). On macOS builds
+        // with the ScreenCaptureKit backend (winstream_sck), app
+        // sessions stream automatically — apps there have no
+        // forwardable display protocol. SKETERM_WINSTREAM keeps the
+        // test/rig gating: "stub" = test pattern for app sessions,
+        // "all" = stub for every session, "sck" = real capture for
+        // every session (launch GUI apps from a plain shell).
         const ws_env = std.c.getenv("SKETERM_WINSTREAM");
-        const want_winstream = req.winstream or (ws_env != null and
-            (req.app or std.mem.eql(u8, std.mem.span(ws_env.?), "all")));
+        const ws_val: ?[]const u8 = if (ws_env) |e| std.mem.span(e) else null;
+        const ws_widen = ws_val != null and
+            (std.mem.eql(u8, ws_val.?, "all") or std.mem.eql(u8, ws_val.?, "sck"));
+        // An explicit wl_mode is a client asking for the Wayland
+        // pipe (test rigs, `sketerm app -u`) — capture must not
+        // hijack it, even on a capture-capable host.
+        const want_winstream = req.winstream or
+            (ws_val != null and (req.app or ws_widen)) or
+            ((comptime wssource.have_sck) and req.app and req.wl_mode.len == 0);
+        // Env set to anything but "sck" forces the stub backend —
+        // smoke-mux and the Linux rigs rely on the test pattern.
+        const ws_use_sck = (comptime wssource.have_sck) and
+            (ws_val == null or std.mem.eql(u8, ws_val.?, "sck"));
 
         var use_waypipe = false;
         var forwarding_possible = !want_winstream;
@@ -1385,12 +1411,18 @@ pub const Daemon = struct {
             s.wl_native = native_wayland;
             hub = null; // ownership moved to the session
         }
-        if (want_winstream) {
-            const ws = allocator.create(WsSource) catch null;
-            if (ws) |w| {
-                w.* = WsSource.init(allocator);
-                s.winstream = w;
+        if (want_winstream) create_ws: {
+            const w = allocator.create(WsSource) catch break :create_ws;
+            if (ws_use_sck) {
+                w.* = WsSource.initSck(allocator, s.pty.child_pid) catch |err| {
+                    std.debug.print("sketerm-mux: window capture init failed ({s}) — session '{s}' has no app streaming\n", .{ @errorName(err), req.name });
+                    allocator.destroy(w);
+                    break :create_ws;
+                };
+            } else {
+                w.* = WsSource.initStub(allocator);
             }
+            s.winstream = w;
         }
         screen.sink = .{ .ctx = @ptrCast(s), .on_write_pty = Session.sinkWritePty };
         return s;
@@ -1457,6 +1489,10 @@ pub const Daemon = struct {
             if (ch.dead or ch.native != null) continue;
             const ws = ch.session.winstream orelse continue;
             if (ch.client.dead) continue;
+            // Backpressure: a slow link must not balloon the client
+            // write buffer — skip frame production until it drains
+            // (the source keeps streaming; only emission pauses).
+            if (ch.client.wbuf.items.len > 8 << 20) continue;
             var ts: c.struct_timespec = undefined;
             _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
             const now_ms: u64 = @intCast(ts.tv_sec * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));

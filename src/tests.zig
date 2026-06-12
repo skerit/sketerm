@@ -68,6 +68,7 @@ comptime {
     _ = @import("wlhost/zpool.zig");
     _ = @import("winstream/proto.zig");
     _ = @import("winstream/source.zig");
+    _ = @import("winstream/keymap.zig");
 }
 
 test {

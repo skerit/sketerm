@@ -43,11 +43,19 @@ pub fn build(b: *std.Build) void {
     // Build options: `glib` tells pty.zig whether a GLib main loop
     // exists (GUI) or not (sketerm-mux daemon, which must not link
     // glib and uses blocking fallbacks for the write queue).
+    // `winstream_sck` enables the ScreenCaptureKit window-stream
+    // backend (winstream/sck.zig + sck_shim.m): only on NATIVE
+    // macOS builds — cross builds (mux-portable from Linux) have no
+    // macOS SDK to link the frameworks against.
+    const native_sck = b.graph.host.result.os.tag == .macos and
+        target.result.os.tag == .macos;
     const glib_opts = b.addOptions();
     glib_opts.addOption(bool, "glib", true);
+    glib_opts.addOption(bool, "winstream_sck", native_sck);
     const glib_opts_mod = glib_opts.createModule();
     const noglib_opts = b.addOptions();
     noglib_opts.addOption(bool, "glib", false);
+    noglib_opts.addOption(bool, "winstream_sck", native_sck);
     const noglib_opts_mod = noglib_opts.createModule();
 
     const exe_mod = b.createModule(.{
@@ -87,6 +95,7 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, mux_mod, core_cbindings_mod);
     mux_mod.addImport("build_options", noglib_opts_mod);
+    if (native_sck) addSckBackend(b, mux_mod);
     const mux_exe = b.addExecutable(.{
         .name = "sketerm-mux",
         .root_module = mux_mod,
@@ -131,7 +140,15 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
     });
     mux_portable_mod.addIncludePath(b.path("vendor"));
-    mux_portable_mod.addImport("build_options", noglib_opts_mod);
+    // mux-portable NEVER carries the ScreenCaptureKit backend:
+    // explicit -Dportable-target triples count as cross builds, so
+    // zig adds no macOS SDK framework search paths — even on a Mac
+    // host. A capture-capable Mac daemon is the native `zig build
+    // mux`; portable stays the lowest-common-denominator artifact.
+    const portable_opts = b.addOptions();
+    portable_opts.addOption(bool, "glib", false);
+    portable_opts.addOption(bool, "winstream_sck", false);
+    mux_portable_mod.addImport("build_options", portable_opts.createModule());
     const mux_portable_exe = b.addExecutable(.{
         .name = "sketerm-mux-portable",
         .root_module = mux_portable_mod,
@@ -155,6 +172,7 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, smoke_mux_mod, core_cbindings_mod);
     smoke_mux_mod.addImport("build_options", noglib_opts_mod);
+    if (native_sck) addSckBackend(b, smoke_mux_mod);
     const smoke_mux = b.addExecutable(.{
         .name = "sketerm-smoke-mux",
         .root_module = smoke_mux_mod,
@@ -426,6 +444,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, tests_mod, cbindings_mod);
     tests_mod.addImport("build_options", glib_opts_mod);
+    if (native_sck) addSckBackend(b, tests_mod);
     const tests = b.addTest(.{
         .root_module = tests_mod,
         .use_lld = use_lld,
@@ -574,6 +593,23 @@ fn configureCoreDeps(
         .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
     });
     mod.addIncludePath(b.path("vendor"));
+}
+
+/// ScreenCaptureKit window-stream backend (macOS native builds
+/// only): the ObjC capture/input shim plus the frameworks it needs.
+/// Gated on `winstream_sck` — never call this for cross targets.
+fn addSckBackend(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addCSourceFile(.{
+        .file = b.path("src/winstream/sck_shim.m"),
+        .flags = &.{"-fobjc-arc"},
+    });
+    mod.linkFramework("ScreenCaptureKit", .{});
+    mod.linkFramework("CoreMedia", .{});
+    mod.linkFramework("CoreVideo", .{});
+    mod.linkFramework("CoreGraphics", .{});
+    mod.linkFramework("AppKit", .{});
+    mod.linkFramework("ApplicationServices", .{});
+    mod.linkFramework("Foundation", .{});
 }
 
 fn configureSysDeps(

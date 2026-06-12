@@ -1,16 +1,81 @@
 //! Frame source behind the window-stream agent (daemon side).
 //!
-//! Backends are comptime-selected: `stub` runs on ANY OS and
-//! streams an animated test pattern — it exists so the entire
-//! transport + render pipeline is testable without a Mac. The real
-//! ScreenCaptureKit backend lands on Darwin hardware and replaces
-//! it behind the same poll/handleInput surface.
+//! Two backends behind one `poll`/`handleInput` surface:
+//!
+//! - `Stub` runs on ANY OS and streams an animated test pattern —
+//!   it exists so the entire transport + render pipeline is
+//!   testable without a Mac (SKETERM_WINSTREAM=stub/all).
+//! - `Sck` is the real ScreenCaptureKit capture + CGEvent input
+//!   backend (sck.zig + sck_shim.m), compiled only when
+//!   build_options.winstream_sck is set (native macOS builds).
+//!
+//! `Source` is the tagged dispatch the daemon holds; the SCK arm
+//! collapses to `void` on builds without the backend so nothing
+//! Darwin ever reaches Linux or musl-cross targets.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const proto = @import("proto.zig");
 const zpool = @import("../wlhost/zpool.zig");
 
-pub const Source = struct {
+pub const have_sck = builtin.os.tag == .macos and build_options.winstream_sck;
+const SckImpl = if (have_sck) @import("sck.zig").Source else void;
+
+pub const Source = union(enum) {
+    stub: Stub,
+    sck: SckImpl,
+
+    pub fn initStub(allocator: std.mem.Allocator) Source {
+        return .{ .stub = Stub.init(allocator) };
+    }
+
+    /// Real capture of the app rooted at `app_pid` (the session's
+    /// PTY child) — windows of that process and its descendants.
+    pub fn initSck(allocator: std.mem.Allocator, app_pid: i32) !Source {
+        if (comptime have_sck) {
+            return .{ .sck = try SckImpl.init(allocator, app_pid) };
+        }
+        return error.Unsupported;
+    }
+
+    pub fn deinit(self: *Source) void {
+        switch (self.*) {
+            .stub => |*s| s.deinit(),
+            .sck => |*s| if (comptime have_sck) s.deinit(),
+        }
+    }
+
+    /// Called from the daemon poll loop: append any pending units
+    /// (window lifecycle + frames) for the attached client.
+    pub fn poll(self: *Source, out: *std.ArrayList(u8), out_allocator: std.mem.Allocator, now_ms: u64) !void {
+        switch (self.*) {
+            .stub => |*s| try s.poll(out, out_allocator, now_ms),
+            .sck => |*s| if (comptime have_sck) try s.poll(out, out_allocator, now_ms),
+        }
+    }
+
+    /// One unit from the client (input_* / close_req).
+    pub fn handleInput(self: *Source, unit: proto.Unit) void {
+        switch (self.*) {
+            .stub => |*s| s.handleInput(unit),
+            .sck => |*s| if (comptime have_sck) s.handleInput(unit),
+        }
+    }
+
+    /// fd the daemon adds to its poll set so out-of-band frame
+    /// arrival (SCK delivers on its own dispatch queues) ends the
+    /// poll wait early. -1 = none (the stub paces itself off the
+    /// tick cadence).
+    pub fn pollFd(self: *const Source) c_int {
+        return switch (self.*) {
+            .stub => -1,
+            .sck => |*s| if (comptime have_sck) s.pollFd() else -1,
+        };
+    }
+};
+
+pub const Stub = struct {
     allocator: std.mem.Allocator,
     opened: bool = false,
     tick: u32 = 0,
@@ -23,20 +88,18 @@ pub const Source = struct {
     frame_buf: std.ArrayList(u8) = .empty,
     zbuf: std.ArrayList(u8) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator) Source {
+    pub fn init(allocator: std.mem.Allocator) Stub {
         return .{ .allocator = allocator };
     }
 
-    pub fn deinit(self: *Source) void {
+    pub fn deinit(self: *Stub) void {
         self.frame_buf.deinit(self.allocator);
         self.zbuf.deinit(self.allocator);
     }
 
-    /// Called from the daemon poll loop: append any pending units
-    /// (window lifecycle + frames) for the attached client.
     /// `now_ms`: caller's monotonic clock — frames are limited to
     /// ~10 fps regardless of poll cadence.
-    pub fn poll(self: *Source, out: *std.ArrayList(u8), out_allocator: std.mem.Allocator, now_ms: u64) !void {
+    pub fn poll(self: *Stub, out: *std.ArrayList(u8), out_allocator: std.mem.Allocator, now_ms: u64) !void {
         if (self.opened and now_ms -| self.last_frame_ms < 100) return;
         self.last_frame_ms = now_ms;
         if (!self.opened) {
@@ -84,8 +147,7 @@ pub const Source = struct {
         }
     }
 
-    /// One unit from the client (input_* / close_req).
-    pub fn handleInput(self: *Source, unit: proto.Unit) void {
+    pub fn handleInput(self: *Stub, unit: proto.Unit) void {
         switch (unit.tag) {
             .input_key => {
                 const k = proto.decodeInputKey(unit.payload) orelse return;
@@ -105,9 +167,10 @@ pub const Source = struct {
 
 const t = std.testing;
 
-test "stub source: open, frames, input feedback" {
-    var src = Source.init(t.allocator);
+test "stub source: open, frames, input feedback (via Source dispatch)" {
+    var src = Source.initStub(t.allocator);
     defer src.deinit();
+    try t.expectEqual(@as(c_int, -1), src.pollFd());
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(t.allocator);
 
