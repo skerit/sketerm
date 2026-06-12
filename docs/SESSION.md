@@ -5347,3 +5347,15 @@ the mux wire (fds never leave their host):
   revisit when more protocol extensions land.
 - Pushed milestones 1-6 to origin (c875e4a..8ada0ca).
 - 541 tests, smoke-mux, mux-portable all PASS.
+
+## 2026-06-12: native pipe is the DEFAULT
+
+The strategic flip: durable sessions now provide the sketerm-native
+Wayland display by default — `scp sketerm-mux-portable` is the
+complete server install for terminals AND GUI apps. Legacy waypipe
+wrap survives as `SKETERM_MUX_WAYLAND=waypipe` (the one thing it
+still does better: dmabuf/GPU transfer); `SKETERM_MUX_NO_WAYLAND=1`
+still disables forwarding. smoke-mux runs the default path (env
+gate removed); REMOTE.md documents the feature + limits.
+Verified live without any gate env: GTK4 client maps, menus open.
+541 tests, smoke-mux, smoke-e2e, mux-portable, aarch64-macos PASS.
