@@ -1,77 +1,98 @@
-# macOS support (work in progress)
+# macOS support
 
-Status: the **terminal core is macOS-portable and cross-compiles from
-Linux** (`zig build mux-portable -Dportable-target=aarch64-macos`
-produces a native arm64 Mach-O `sketerm-mux`). The GUI is expected to
-build on a Mac against Homebrew GTK4 but has NOT yet been verified on
-real hardware.
+Status: **verified on real hardware** (Apple Silicon M2, macOS 26.4,
+Homebrew GTK 4.22, Zig 0.16.0). The GUI builds and runs natively, the
+full unit-test suite passes (500/507, 7 skipped), `smoke-mux` and
+`smoke-e2e` PASS, and mux interop with a Linux daemon works over both
+SSH and UDP transports. Remaining gaps are listed at the bottom.
 
-## What is already done
+## Verified on hardware (2026-06)
 
-- **GL API portability.** macOS GDK is desktop-GL-only (OpenGL 4.1
-  core via CGL); requesting GLES black-screens. All shaders now carry
-  no `#version`/`precision` lines — `src/render/gl.zig` injects
-  `#version 300 es` (Linux/GLES) or `#version 330 core` (macOS)
-  per-stage at compile time, and `Pane.onRealize` adopts whatever API
-  GDK actually realized. `zig build smoke-gl-core` proves every
-  shader compiles under a desktop-GL 3.3 core context (run on Linux
-  via Mesa).
-- **Platform layer** (`src/util/platform.zig`): exe-path discovery
-  (`/proc/self/exe` vs `_NSGetExecutablePath`), cross-thread wakeup
-  (eventfd vs pipe), runtime dir (`$XDG_RUNTIME_DIR` vs `$TMPDIR`),
-  close-on-exec sockets (`SOCK_CLOEXEC` is Linux-only).
-- **Header gating** in `vendor/cimport_root.h` / `cimport_core.h`:
-  `pty.h`/`sys/eventfd.h` are Linux; Darwin gets openpty/forkpty
-  declared directly (Zig's bundled libc headers lack `util.h`) and
-  `sys/random.h` for getentropy.
-- **Child cwd** (`layout.zig cwdOfPid`): `/proc/<pid>/cwd` on Linux,
-  `proc_pidinfo(PROC_PIDVNODEPATHINFO)` on macOS. The macOS struct
-  offsets (152/1024) match Apple's libproc.h but are UNVERIFIED on
-  hardware — check this first if layout-save cwd looks wrong.
-- **build.zig**: `use_lld` only on Linux targets (the LLD pin works
-  around gcc 15 `.sframe`; macOS wants Zig's self-hosted Mach-O
-  linker).
+- **Native mux daemon**: `zig build mux && zig build smoke-mux` —
+  PASS. The binary links libSystem + brew's libfribidi (the Mach-O
+  linker does not drop the unused fribidi dep the way `--as-needed`
+  does on Linux; harmless, but the native build is not
+  single-file-portable — use `mux-portable` for that).
+- **`cwdOfPid` offsets** (`layout.zig`): confirmed against the real
+  SDK and a live call — sizeof(struct vnode_info)=152, vip_path at
+  offset 152, MAXPATHLEN=1024, flavor 9, result matches getcwd().
+- **GUI**: builds, opens a window, panes realize (GL via GDK's
+  desktop-GL path), zsh runs, IPC socket + `sketerm cli` round-trips,
+  OSC 7 cwd reporting works, `zig build smoke-e2e` passes natively
+  (no DISPLAY env needed — gated on `platform.is_macos`).
+- **Cross-direction builds**: `zig build mux-portable` (x86_64- and
+  aarch64-linux-musl) cross-compiles green FROM macOS; a Mac-built
+  aarch64-musl daemon runs unmodified on Ubuntu aarch64.
+- **Mux interop from macOS**: `sketerm mux <host> list/new/attach`
+  against a Linux daemon over SSH; durable sessions survive GUI
+  restarts; snapshot-attach restores screen content. UDP transport
+  (`udp:<ip>`) verified Darwin↔Darwin and Darwin↔Linux (ChaCha20
+  datagrams, SSH bootstrap on Darwin, getentropy/clock paths in
+  rudp.zig all exercised on hardware).
+- **`sketerm app`** correctly refuses on macOS (no Wayland session) —
+  Linux-only by design.
 
-## Building the GUI on a Mac (untested recipe)
+## Real-hardware friction found (and fixed)
+
+1. **Aro SIGBUS on `<arm_neon.h>`** — the first GUI build failure.
+   graphene-config.h picks its NEON backend on any aarch64, and Zig's
+   translate-c (Aro) crashes outright on arm_neon.h. Fixed in
+   `vendor/cimport_root.h`: `GRAPHENE_SIMD_BENCHMARK` +
+   `GRAPHENE_HAS_SCALAR` force graphene's scalar backend during
+   translation (aarch64 only; x86_64 keeps SSE). Scalar simd4f is
+   layout-compatible and sketerm never calls graphene itself.
+2. **`c.stdout` is not a value on Darwin** — <stdio.h> defines the
+   std streams as macros over `__stdoutp` etc., which translate-c
+   renders as inline *functions*; glibc exports extern variables.
+   Use `platform.stdout()/stderr()/stdin()` — never `c.stdout`.
+3. **EGL smoke harnesses** don't exist on macOS (no EGL). They are
+   registered in build.zig only for Linux targets; the default
+   `zig build` would otherwise fail before compiling anything.
+4. **Font candidates** were Linux distro paths; a default config
+   found no font and panes never realized. macOS now falls back to
+   Menlo/Monaco/SF Mono/Courier New (`pane.zig FONT_CANDIDATES`).
+   FreeType opens Menlo.ttc fine (face index 0).
+5. **zsh OSC 7 trailing `%`** — `${PWD//%/%25}` in zsh anchors an
+   empty match at the END (it doesn't escape `%`), appending `%25` to
+   every reported cwd. All-platform bug, surfaced by cwd checks here.
+6. **`zig build mux` requires the full GTK dev set installed** even
+   though the daemon doesn't use GTK: build.zig resolves pkg-config
+   for every package eagerly at configure time. On a GTK-less host
+   the daemon can't be built from source (cross-compile mux-portable
+   from elsewhere instead). Known wart, not yet fixed.
+
+## Building on a Mac (verified recipe)
 
 ```bash
-# 1. Dependencies via Homebrew
-brew install zig gtk4 libadwaita adwaita-icon-theme \
-             freetype harfbuzz libepoxy fribidi fontconfig pkg-config
+brew install zig pkgconf gtk4 libadwaita adwaita-icon-theme \
+             freetype harfbuzz libepoxy fribidi fontconfig
 
-# 2. pkg-config must see brew's .pc files (Apple Silicon prefix)
-export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig"
-
-# 3. Build
-zig build            # GUI
+zig build            # GUI → zig-out/bin/sketerm
 zig build mux        # session daemon
-zig build test       # unit tests (all portable)
+zig build test       # 500/507 (7 skipped)
+zig build smoke-mux  # daemon end-to-end
+zig build smoke-e2e  # GUI end-to-end (opens a real window)
 ```
 
-Note: brew's `zig` must be 0.16.x (the pinned toolchain). If brew
-moved on, fetch the right tarball from ziglang.org/download.
+brew's zig 0.16.0 matches the pinned toolchain; `/opt/homebrew/bin`
+must be on PATH (pkg-config lives there). No PKG_CONFIG_PATH fiddling
+was needed — pkgconf's defaults cover the brew prefix.
 
-## Expected friction points (in likely order)
+## Known noise / open items
 
-1. **TranslateC on brew's GTK headers.** The out-of-process
-   translate-c step (see CLAUDE.md) may hit Darwin-specific Clang
-   constructs (availability attributes, blocks) needing new entries
-   in the sed fixup or `vendor/aro_shims/`. This is the most likely
-   first failure; capture the error output.
-2. **Fontconfig first run** builds its cache for /System/Library/Fonts
-   — takes a minute, looks like a hang.
-3. **`gtk_gl_area_get_error` at realize.** If panes render black,
-   check stderr for the realize error print; that's the GL-API path.
-4. **Monospace alias.** fontconfig on mac resolves "monospace" to
-   whatever its config says — Menlo usually. Set an explicit
-   `font_family` in the config if the default looks off.
-5. **Smoke binaries** (`smoke-cell`, `smoke-image`, …) are EGL-based
-   and Linux-only by nature; skip them on a Mac. `zig build test`
-   plus running the app is the verification path there.
-
-## Not yet done
-
-- `.app` bundle / packaging (run from zig-out/bin for now; gtk-osx +
-  gtk-mac-bundler is the known-good route if we ever ship).
-- Cmd-vs-Ctrl keybinding conventions.
-- GUI verification on hardware — everything above the terminal core.
+- GTK prints a stream of `Theme parser warning: gtk.css ...` at
+  startup (brew's default theme vs GTK 4.22) — cosmetic.
+- Two `gtk_gl_area_queue_render: assertion 'GTK_IS_GL_AREA' failed`
+  CRITICALs during smoke-e2e teardown — timing issue on the macOS
+  backend, not yet chased; test still passes.
+- Visual rendering confirmed only indirectly (no GL errors, e2e text
+  assertions pass). `screencapture` needs Screen Recording permission
+  — eyeball a window when working interactively.
+- Creating/attaching a remote tab runs the SSH/UDP bootstrap on the
+  GTK main thread — a slow or failing connect freezes the UI for the
+  duration (pre-existing on Linux too, just easier to hit over real
+  networks).
+- `udp:localhost` v4/v6 resolution bug still applies — use a real IP
+  or hostname.
+- `.app` bundle / packaging not started (run from zig-out/bin).
+- Cmd-vs-Ctrl keybinding conventions not started.

@@ -5078,3 +5078,43 @@ Tests 454 → 466.
 - NOT yet: flow control beyond write-buffering (pixel floods share
   the go-back-N stream with keystrokes — measure before separating
   associations), UDP-transport e2e rig, `sketerm app` over rudp.
+
+## 2026-06-12: macOS phase 2 — verified on real hardware (M2, macOS 26.4)
+
+- First execution of any sketerm code on Darwin. brew zig 0.16.0 +
+  gtk4 4.22.4. `zig build mux` + `smoke-mux` PASS natively;
+  `zig build test` 500/507 (7 skip); GUI builds, opens, renders,
+  serves IPC; `smoke-e2e` PASS natively (display gate now keys on
+  platform.is_macos — macOS always has a WindowServer, no env var).
+- Friction 1 (predicted "most likely"): translate-c. NOT the GTK
+  macros — Aro SIGBUSes on <arm_neon.h>, pulled in by graphene's
+  NEON backend on every aarch64. Fix: GRAPHENE_SIMD_BENCHMARK +
+  GRAPHENE_HAS_SCALAR in cimport_root.h (graphene's own escape
+  hatch), aarch64-gated; x86_64 SSE untouched. Scalar simd4f is
+  layout-compatible; we never call graphene.
+- Friction 2: Darwin stdout/stderr/stdin are macros → translate-c
+  inline FNS, not values. platform.stdout()/stderr()/stdin() added;
+  48 call sites migrated (the GUI-set files this time; mux side had
+  the same fix in phase 1).
+- Friction 3: default `zig build` failed on the 5 EGL harnesses (no
+  EGL on macOS) — now registered only for Linux targets.
+- Friction 4: FONT_CANDIDATES were Linux paths → "no usable font",
+  blank pane. macOS list: Menlo.ttc / Monaco / SFNSMono / Courier
+  New. Menlo.ttc opens fine via FreeType.
+- BONUS all-platform bug via cwd checks: zsh integration's
+  ${PWD//%/%25} APPENDS %25 (unescaped % anchors at end in zsh) →
+  every OSC 7 cwd carried a trailing %. Fixed with \%.
+- cwdOfPid offsets VERIFIED on hardware (152/152/1024, flavor 9,
+  matches getcwd) — comment updated, code was right.
+- Interop vs Linux daemon (colima Ubuntu aarch64 VM): mux-portable
+  cross-built FROM the Mac runs there; list/new/attach over SSH
+  (SKETERM_SSH wrapper), sessions survive GUI restart, snapshot
+  restores screen. UDP: Darwin↔Darwin AND Darwin↔Linux
+  (192.168.64.2) — bootstrap, ChaCha20 seal, rudp clock/getentropy
+  all exercised. `sketerm app` refuses cleanly (no Wayland) as
+  designed. mux-portable x86_64+aarch64 musl still green from macOS.
+- Known noise: GTK theme-parser warnings at startup; 2x
+  gtk_gl_area_queue_render CRITICALs at e2e teardown (unchased);
+  remote-tab bootstrap blocks the main loop (pre-existing).
+- NOT done: .app bundle, Cmd keybindings, visual screenshot
+  verification (screencapture needs Screen Recording permission).
