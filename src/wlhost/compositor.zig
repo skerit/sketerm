@@ -84,6 +84,10 @@ pub const View = struct {
     /// xdg_toplevel.resize with wayland edge flags (1 top, 2 bottom,
     /// 4 left, 8 right, combinable).
     toplevel_resize: ?*const fn (ctx: ?*anyopaque, surface: u32, edges: u32) void = null,
+    /// Committed window geometry: the app's visible rect within
+    /// its buffer. Frames are CROPPED to it — the view needs the
+    /// offset to translate widget coords back to surface coords.
+    toplevel_geometry: ?*const fn (ctx: ?*anyopaque, surface: u32, x: i32, y: i32, w: i32, h: i32) void = null,
     /// Committed input region (surface coords). Null slice = the
     /// whole surface accepts input (the default); empty/partial =
     /// only those rects do — CSD shadows become click-through.
@@ -157,6 +161,12 @@ const Surface = struct {
     input_pending: bool = false,
     input_whole: bool = true,
     input_rects: std.ArrayList(Rect) = .empty,
+    /// xdg_surface.set_window_geometry: the visible window rect
+    /// inside the buffer (everything else is CSD shadow). w=0 →
+    /// never set → the full buffer is the window.
+    geo_pending: bool = false,
+    geo_next: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    geo: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
 };
 
 /// xdg_positioner state — just enough geometry to place menus.
@@ -507,7 +517,7 @@ pub const Compositor = struct {
 
     /// View → client: the host window was resized — tell the app to
     /// redraw at the new size (it acks and commits a new buffer).
-    pub fn configureToplevel(self: *Compositor, sid: u32, w: i32, h: i32) Error!void {
+    pub fn configureToplevel(self: *Compositor, sid: u32, w: i32, h: i32, maximized: bool) Error!void {
         const surf = self.surfaces.getPtr(sid) orelse return;
         if (surf.toplevel == 0 or !surf.configured) return;
         if (w <= 0 or h <= 0) return;
@@ -517,7 +527,9 @@ pub const Compositor = struct {
         b.putInt(h);
         var states: [8]u8 = undefined;
         std.mem.writeInt(u32, states[0..4], 4, .little); // activated
-        std.mem.writeInt(u32, states[4..8], 3, .little); // resizing
+        // Maximized apps square their corners and drop shadows;
+        // unmaximized resizes carry the resizing state instead.
+        std.mem.writeInt(u32, states[4..8], if (maximized) 1 else 3, .little);
         b.putArray(&states);
         try self.send(try b.finish());
         var buf2: [16]u8 = undefined;
@@ -1036,7 +1048,16 @@ pub const Compositor = struct {
                 surf.ph = pos.h;
                 if (self.view.popup_new) |cb| cb(self.view.ctx, sid, parent_sid, at[0], at[1]);
             },
-            3 => {}, // set_window_geometry — buffer size rules v1
+            3 => { // set_window_geometry(x, y, w, h) — staged
+                const surf = self.surfaces.getPtr(sid) orelse return Error.Protocol;
+                surf.geo_pending = true;
+                surf.geo_next = .{
+                    .x = (try it.next()).?.int,
+                    .y = (try it.next()).?.int,
+                    .w = (try it.next()).?.int,
+                    .h = (try it.next()).?.int,
+                };
+            },
             4 => {}, // ack_configure
             else => return Error.Protocol,
         }
@@ -1083,6 +1104,12 @@ pub const Compositor = struct {
         if (surf.has_pending) {
             surf.committed_buffer = surf.pending_buffer;
             surf.has_pending = false;
+        }
+        if (surf.geo_pending) {
+            surf.geo_pending = false;
+            surf.geo = surf.geo_next;
+            if (self.view.toplevel_geometry) |cb|
+                cb(self.view.ctx, sid, surf.geo.x, surf.geo.y, surf.geo.w, surf.geo.h);
         }
         if (surf.input_pending) {
             surf.input_pending = false;
@@ -1143,27 +1170,39 @@ pub const Compositor = struct {
         surf.frame_cbs.clearRetainingCapacity();
     }
 
-    /// Copy the committed rows tightly packed and hand them to the
-    /// view. Bounds are clamped against the mirror, not trusted.
+    /// Copy the committed pixels tightly packed and hand them to
+    /// the view, CROPPED to the window geometry — the shadow margin
+    /// never leaves the compositor, so the host window's edges are
+    /// the app's real edges. Bounds are clamped, not trusted.
     fn pushFrame(self: *Compositor, sid: u32, info: Buffer) Error!void {
         const cb = self.view.toplevel_frame orelse return;
         const pool = self.pools.getPtr(info.pool) orelse return;
-        const w: usize = @intCast(info.width);
-        const h: usize = @intCast(info.height);
+        const surf = self.surfaces.get(sid) orelse return;
+        var gx: usize = 0;
+        var gy: usize = 0;
+        var gw: usize = @intCast(info.width);
+        var gh: usize = @intCast(info.height);
+        if (surf.geo.w > 0 and surf.geo.h > 0 and surf.geo.x >= 0 and surf.geo.y >= 0) {
+            gx = @min(@as(usize, @intCast(surf.geo.x)), gw);
+            gy = @min(@as(usize, @intCast(surf.geo.y)), gh);
+            gw = @min(@as(usize, @intCast(surf.geo.w)), gw - gx);
+            gh = @min(@as(usize, @intCast(surf.geo.h)), gh - gy);
+        }
+        if (gw == 0 or gh == 0) return;
         const stride: usize = @intCast(info.stride);
         const offset: usize = @intCast(info.offset);
-        const row_bytes = w * 4;
-        try self.frame_scratch.resize(self.allocator, row_bytes * h);
+        const row_bytes = gw * 4;
+        try self.frame_scratch.resize(self.allocator, row_bytes * gh);
         var y: usize = 0;
-        while (y < h) : (y += 1) {
-            const src_start = offset + y * stride;
+        while (y < gh) : (y += 1) {
+            const src_start = offset + (gy + y) * stride + gx * 4;
             if (src_start + row_bytes > pool.bytes.items.len) return; // stale mirror
             @memcpy(
                 self.frame_scratch.items[y * row_bytes ..][0..row_bytes],
                 pool.bytes.items[src_start..][0..row_bytes],
             );
         }
-        cb(self.view.ctx, sid, info.width, info.height, info.format, self.frame_scratch.items);
+        cb(self.view.ctx, sid, @intCast(gw), @intCast(gh), info.format, self.frame_scratch.items);
     }
 
     // ── server plumbing ─────────────────────────────────────────

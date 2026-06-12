@@ -54,6 +54,9 @@ pub const AppHost = struct {
     /// Surfaces whose app negotiated server-side decorations before
     /// the window existed (the normal order).
     pending_ssd: std.AutoHashMapUnmanaged(u32, bool) = .empty,
+    /// Window-geometry offsets per surface (frames are cropped to
+    /// the geometry; input coords must add the offset back).
+    geos: std.AutoHashMapUnmanaged(u32, [2]i32) = .empty,
 
     const Popup = struct {
         host: *AppHost,
@@ -83,17 +86,20 @@ pub const AppHost = struct {
         press_x: f64 = 0,
         press_y: f64 = 0,
 
-        /// Widget → surface coordinates (the picture stretches to
-        /// the widget, content-fit FILL).
+        /// Widget → surface coordinates: scale onto the cropped
+        /// frame, then add the window-geometry offset (the app
+        /// thinks in full-buffer coords, shadows included).
         fn mapXY(self: *Win, wx: f64, wy: f64) [2]f64 {
             const ww = c.gtk_widget_get_width(self.picture);
             const wh = c.gtk_widget_get_height(self.picture);
-            if (ww <= 0 or wh <= 0 or self.buf_w <= 0 or self.buf_h <= 0)
-                return .{ wx, wy };
-            return .{
-                wx * @as(f64, @floatFromInt(self.buf_w)) / @as(f64, @floatFromInt(ww)),
-                wy * @as(f64, @floatFromInt(self.buf_h)) / @as(f64, @floatFromInt(wh)),
-            };
+            var x = wx;
+            var y = wy;
+            if (ww > 0 and wh > 0 and self.buf_w > 0 and self.buf_h > 0) {
+                x = wx * @as(f64, @floatFromInt(self.buf_w)) / @as(f64, @floatFromInt(ww));
+                y = wy * @as(f64, @floatFromInt(self.buf_h)) / @as(f64, @floatFromInt(wh));
+            }
+            const geo = self.host.geos.get(self.surface) orelse return .{ x, y };
+            return .{ x + @as(f64, @floatFromInt(geo[0])), y + @as(f64, @floatFromInt(geo[1])) };
         }
     };
 
@@ -139,6 +145,7 @@ pub const AppHost = struct {
             .toplevel_move = onMove,
             .toplevel_resize = onResize,
             .input_region = onInputRegion,
+            .toplevel_geometry = onGeometry,
             .clipboard_offer = onClipOffer,
             .clipboard_data = onClipData,
             .clipboard_read = onClipRead,
@@ -166,6 +173,7 @@ pub const AppHost = struct {
         while (ait.next()) |v| self.allocator.free(v.*);
         self.pending_app_ids.deinit(self.allocator);
         self.pending_ssd.deinit(self.allocator);
+        self.geos.deinit(self.allocator);
         if (self.pending_reads > 0) {
             self.doomed = true;
             return;
@@ -389,6 +397,10 @@ pub const AppHost = struct {
         c.gtk_window_set_title(window, "remote app");
         ensureTransparentCss();
         c.gtk_widget_add_css_class(@ptrCast(window), "sketerm-remote-app");
+        // App-less windows are invisible to some taskbars/switchers.
+        if (c.g_application_get_default()) |app| {
+            c.gtk_application_add_window(@ptrCast(app), window);
+        }
         // Undecorated unless the app asked for host decorations —
         // Wayland apps default to drawing their own chrome, and a
         // second titlebar around it looks broken.
@@ -451,6 +463,9 @@ pub const AppHost = struct {
         // default-width/height live while the user resizes.
         _ = c.g_signal_connect_data(@ptrCast(window), "notify::default-width", @ptrCast(&onWinResize), win, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(window), "notify::default-height", @ptrCast(&onWinResize), win, null, 0);
+        // default-size does NOT track maximization — listen and
+        // configure with the real allocation + maximized state.
+        _ = c.g_signal_connect_data(@ptrCast(window), "notify::maximized", @ptrCast(&onWinResize), win, null, 0);
 
         c.gtk_window_present(window);
         return win;
@@ -600,6 +615,13 @@ pub const AppHost = struct {
     /// over terminals, hand over links…).
     /// The app's input region → the host GdkSurface, so clicks in
     /// CSD shadow margins pass through to whatever is underneath.
+    fn onGeometry(ctx: ?*anyopaque, surface: u32, x: i32, y: i32, gw: i32, gh: i32) void {
+        _ = gw;
+        _ = gh;
+        const self = cast.userData(AppHost, ctx);
+        self.geos.put(self.allocator, surface, .{ x, y }) catch {};
+    }
+
     fn onInputRegion(ctx: ?*anyopaque, surface: u32, rects: ?[]const @import("wlhost/compositor.zig").Rect) void {
         const self = cast.userData(AppHost, ctx);
         const win = self.windows.get(surface) orelse return;
@@ -608,10 +630,11 @@ pub const AppHost = struct {
             c.gdk_surface_set_input_region(gdk_surface, null);
             return;
         };
+        const geo = self.geos.get(surface) orelse [2]i32{ 0, 0 };
         const region = c.cairo_region_create() orelse return;
         defer c.cairo_region_destroy(region);
         for (list) |r| {
-            var cr = c.cairo_rectangle_int_t{ .x = r.x, .y = r.y, .width = r.w, .height = r.h };
+            var cr = c.cairo_rectangle_int_t{ .x = r.x - geo[0], .y = r.y - geo[1], .width = r.w, .height = r.h };
             _ = c.cairo_region_union_rectangle(region, &cr);
         }
         c.gdk_surface_set_input_region(gdk_surface, region);
@@ -723,16 +746,24 @@ pub const AppHost = struct {
 
     fn onWinResize(_: ?*c.GtkWindow, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
+        const maximized = c.gtk_window_is_maximized(win.window) != 0;
         var w: c_int = 0;
         var h: c_int = 0;
-        c.gtk_window_get_default_size(win.window, &w, &h);
+        if (maximized) {
+            // default-size keeps the unmaximized size; the real
+            // allocation is what the app must fill.
+            w = c.gtk_widget_get_width(@ptrCast(win.window));
+            h = c.gtk_widget_get_height(@ptrCast(win.window));
+        } else {
+            c.gtk_window_get_default_size(win.window, &w, &h);
+        }
         if (w <= 0 or h <= 0) return;
         // Skip echoes of the size the app already drew (or that we
         // already asked for) — configure storms upset some clients.
         if ((w == win.buf_w and h == win.buf_h) or (w == win.sent_w and h == win.sent_h)) return;
         win.sent_w = w;
         win.sent_h = h;
-        win.host.comp.configureToplevel(win.surface, w, h) catch return;
+        win.host.comp.configureToplevel(win.surface, w, h, maximized) catch return;
         win.host.flushHost();
     }
 
