@@ -532,6 +532,7 @@ pub const GridPass = struct {
                     .{ g.u1, g.v1 },
                     @floatFromInt(g.layer),
                     color,
+                    if (g.colored) 1.0 else 0.0,
                 );
             }
         }
@@ -558,6 +559,7 @@ pub const GridPass = struct {
                         .{ g.u1, g.v1 },
                         @floatFromInt(g.layer),
                         color,
+                        if (g.colored) 1.0 else 0.0,
                     );
                 }
             }
@@ -793,7 +795,7 @@ pub const GridPass = struct {
                     const gh: f32 = @floatFromInt(g.h);
                     // IME preedit text is treated as cell content — dim
                     // it the same way as bidi/DW glyphs when unfocused.
-                    try self.pushGlyphQuadDim(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), self.default_fg, 1.0);
+                    try self.pushGlyphQuadDim(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), self.default_fg, 1.0, if (g.colored) 1.0 else 0.0);
                 }
                 try self.pushQuadDim(
                     .{ x, y + ch - 2 },
@@ -1315,8 +1317,9 @@ pub const GridPass = struct {
         uv1: [2]f32,
         layer: f32,
         color: [4]f32,
+        colored: f32,
     ) !void {
-        return self.pushGlyphQuadDim(origin, size, uv0, uv1, layer, color, 0.0);
+        return self.pushGlyphQuadDim(origin, size, uv0, uv1, layer, color, 0.0, colored);
     }
 
     fn pushGlyphQuadDim(
@@ -1328,8 +1331,9 @@ pub const GridPass = struct {
         layer: f32,
         color: [4]f32,
         dim: f32,
+        colored: f32,
     ) !void {
-        return self.pushGlyphQuadStyled(origin, size, uv0, uv1, layer, color, dim, 0.0, 0.0, 0.0, 0.0);
+        return self.pushGlyphQuadStyled(origin, size, uv0, uv1, layer, color, dim, 0.0, 0.0, 0.0, colored);
     }
 
     /// Glyph quad with italic shear + faux-bold support. Used by the

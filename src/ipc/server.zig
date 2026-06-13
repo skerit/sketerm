@@ -102,6 +102,12 @@ fn onIncoming(
     _ = c.g_object_ref(connection);
     const in_stream = c.g_io_stream_get_input_stream(@ptrCast(connection));
     const din = c.g_data_input_stream_new(in_stream);
+    // Bound the read buffer so a client streaming a newline-less line
+    // can't make GLib buffer unbounded memory before handleLine's
+    // MAX_LINE check runs. GDataInputStream is a GBufferedInputStream;
+    // read_line stops filling once the buffer is full, so an oversize
+    // line is rejected at the transport. Small slack over MAX_LINE.
+    c.g_buffered_input_stream_set_buffer_size(@ptrCast(din), protocol.MAX_LINE + 64);
     conn.* = .{ .server = server, .connection = connection, .din = din };
     readNextLine(conn);
     return 1; // handled

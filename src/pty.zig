@@ -190,13 +190,16 @@ pub const Pty = struct {
             }
         }
 
-        // chdir if requested.
+        // chdir if requested. Skip rather than truncate: a path that
+        // doesn't fit (with its NUL terminator) would chdir to the
+        // WRONG directory, so spawn in the inherited cwd instead.
         if (opts.cwd) |cwd| {
             var buf: [4096]u8 = undefined;
-            const n = @min(cwd.len, 4095);
-            @memcpy(buf[0..n], cwd[0..n]);
-            buf[n] = 0;
-            _ = c.chdir(@ptrCast(&buf));
+            if (cwd.len < buf.len) {
+                @memcpy(buf[0..cwd.len], cwd);
+                buf[cwd.len] = 0;
+                _ = c.chdir(@ptrCast(&buf));
+            }
         }
 
         // Build argv on the stack. login_shell mode: replace argv[0]
