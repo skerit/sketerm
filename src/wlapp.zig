@@ -80,6 +80,33 @@ pub const AppHost = struct {
         press_btn: c_uint = 0,
         press_x: f64 = 0,
         press_y: f64 = 0,
+        /// Last host-edge band the pointer was in (Wayland edge mask,
+        /// 0 = interior). Drives the resize cursor and gates whether a
+        /// press starts a host-window resize vs. goes to the app.
+        hover_edge: u32 = 0,
+        /// The last press was forwarded to the app (not consumed as a
+        /// host-window resize) — so its release is forwarded too.
+        fwd_press: bool = false,
+
+        /// Host-window resize edge under (x, y) in picture coords, or 0
+        /// for the interior. Disabled while maximized/fullscreen (the
+        /// WM owns the size then).
+        fn resizeEdge(self: *Win, x: f64, y: f64) u32 {
+            if (c.gtk_window_is_maximized(self.window) != 0) return 0;
+            if (c.gtk_window_is_fullscreen(self.window) != 0) return 0;
+            return rw.resizeEdgeAt(c.gtk_widget_get_width(self.picture), c.gtk_widget_get_height(self.picture), x, y);
+        }
+
+        /// Apply the resize cursor (or hand the cursor back to the app)
+        /// when the pointer crosses into/out of an edge band.
+        fn applyEdge(self: *Win, edge: u32) void {
+            if (edge == self.hover_edge) return;
+            self.hover_edge = edge;
+            if (rw.edgeCursorName(edge)) |name|
+                c.gtk_widget_set_cursor_from_name(self.picture, name)
+            else
+                c.gtk_widget_set_cursor(self.picture, null);
+        }
 
         /// Widget → surface coordinates: scale onto the cropped
         /// frame, then add the window-geometry offset (the app
@@ -425,6 +452,9 @@ pub const AppHost = struct {
 
     fn onPtrEnter(_: ?*c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
+        const edge = win.resizeEdge(x, y);
+        win.applyEdge(edge);
+        if (edge != 0) return; // host resize band — not the app's pointer
         win.host.stampNow();
         const p = win.mapXY(x, y);
         win.host.comp.pointerEnter(win.surface, p[0], p[1]) catch return;
@@ -433,6 +463,9 @@ pub const AppHost = struct {
 
     fn onPtrMotion(_: ?*c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
+        const edge = win.resizeEdge(x, y);
+        win.applyEdge(edge);
+        if (edge != 0) return; // host resize band — not the app's pointer
         win.host.stampNow();
         const p = win.mapXY(x, y);
         // Enter may have been missed (window created under cursor).
@@ -443,6 +476,7 @@ pub const AppHost = struct {
 
     fn onPtrLeave(_: ?*c.GtkEventControllerMotion, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
+        win.applyEdge(0);
         win.host.stampNow();
         win.host.comp.pointerLeave() catch return;
         win.host.flushHost();
@@ -465,6 +499,17 @@ pub const AppHost = struct {
         win.press_btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
         win.press_x = x;
         win.press_y = y;
+        // A primary-button press in the host edge band resizes the host
+        // window itself — the app's cropped buffer has no CSD handles
+        // (they live in the shadow margin we crop away). Don't forward
+        // it, so the app sees no stray press/release pair.
+        const edge = win.resizeEdge(x, y);
+        if (edge != 0 and win.press_btn == 1) {
+            win.fwd_press = false;
+            rw.beginResize(win.window, edge, win.press_btn, x, y);
+            return;
+        }
+        win.fwd_press = true;
         win.host.stampNow();
         // A click on the main surface while a menu is up dismisses it.
         win.host.comp.dismissPopups() catch {};
@@ -477,6 +522,7 @@ pub const AppHost = struct {
 
     fn onBtnRelease(gesture: ?*c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
+        if (!win.fwd_press) return; // press started a host resize, not app input
         win.host.stampNow();
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
         win.host.comp.pointerButton(evdevButton(btn), false) catch return;

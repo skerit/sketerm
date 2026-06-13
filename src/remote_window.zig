@@ -135,6 +135,48 @@ pub fn beginResize(window: *c.GtkWindow, edges: u32, btn: c_uint, x: f64, y: f64
     c.gdk_toplevel_begin_resize(@ptrCast(gdk_surface), edge, device, @intCast(btn), x, y, 0);
 }
 
+/// Width of the host-window edge band that initiates an interactive
+/// resize. The window is undecorated and (for Wayland apps) cropped to
+/// the app's window geometry, so the app's own CSD resize handles —
+/// which live in the shadow margin OUTSIDE that geometry — are gone.
+/// The host window's edges ARE the app's real edges, so we resize the
+/// host directly and let configure feedback redraw the app.
+pub const resize_border: f64 = 8;
+
+/// Which window edge a point sits on, as the Wayland edge bitmask
+/// (1 top, 2 bottom, 4 left, 8 right; corners combine). 0 = interior.
+/// `w`/`h` are the host content size; `x`/`y` are content-local.
+pub fn resizeEdgeAt(w: i32, h: i32, x: f64, y: f64) u32 {
+    if (w <= 0 or h <= 0) return 0;
+    const fw: f64 = @floatFromInt(w);
+    const fh: f64 = @floatFromInt(h);
+    var edges: u32 = 0;
+    if (y < resize_border) edges |= 1; // top
+    if (y >= fh - resize_border) edges |= 2; // bottom
+    if (x < resize_border) edges |= 4; // left
+    if (x >= fw - resize_border) edges |= 8; // right
+    // Top+bottom or left+right at once (tiny window): drop the pair.
+    if (edges & 3 == 3) edges &= ~@as(u32, 3);
+    if (edges & 12 == 12) edges &= ~@as(u32, 12);
+    return edges;
+}
+
+/// CSS cursor name for a resize edge bitmask, or null for the
+/// interior (caller leaves the cursor to the app).
+pub fn edgeCursorName(edges: u32) ?[*:0]const u8 {
+    return switch (edges) {
+        1 => "n-resize",
+        2 => "s-resize",
+        4 => "w-resize",
+        8 => "e-resize",
+        5 => "nw-resize",
+        9 => "ne-resize",
+        6 => "sw-resize",
+        10 => "se-resize",
+        else => null,
+    };
+}
+
 /// BGRA-in-memory pixels → GdkMemoryTexture. `format` follows wl_shm:
 /// 0 = argb8888 premultiplied (also what winstream sends), 1 =
 /// xrgb8888 (opaque). Caller unrefs the returned texture.
@@ -146,4 +188,23 @@ pub fn newTexture(w: i32, h: i32, format: u32, pixels: []const u8) ?*c.GdkTextur
     const gbytes = c.g_bytes_new(pixels.ptr, pixels.len) orelse return null;
     defer c.g_bytes_unref(gbytes);
     return c.gdk_memory_texture_new(w, h, gdk_format, gbytes, @intCast(w * 4));
+}
+
+test "resizeEdgeAt: corners, edges, interior" {
+    // 200x100 window, 8px band.
+    try std.testing.expectEqual(@as(u32, 0), resizeEdgeAt(200, 100, 100, 50)); // interior
+    try std.testing.expectEqual(@as(u32, 4), resizeEdgeAt(200, 100, 2, 50)); // left
+    try std.testing.expectEqual(@as(u32, 8), resizeEdgeAt(200, 100, 199, 50)); // right
+    try std.testing.expectEqual(@as(u32, 1), resizeEdgeAt(200, 100, 100, 2)); // top
+    try std.testing.expectEqual(@as(u32, 2), resizeEdgeAt(200, 100, 100, 99)); // bottom
+    try std.testing.expectEqual(@as(u32, 10), resizeEdgeAt(200, 100, 199, 99)); // bottom-right
+    try std.testing.expectEqual(@as(u32, 5), resizeEdgeAt(200, 100, 1, 1)); // top-left
+    // Degenerate size never reports an edge.
+    try std.testing.expectEqual(@as(u32, 0), resizeEdgeAt(0, 0, 0, 0));
+}
+
+test "edgeCursorName: maps edges, null interior" {
+    try std.testing.expect(edgeCursorName(0) == null);
+    try std.testing.expectEqualStrings("se-resize", std.mem.span(edgeCursorName(10).?));
+    try std.testing.expectEqualStrings("n-resize", std.mem.span(edgeCursorName(1).?));
 }
