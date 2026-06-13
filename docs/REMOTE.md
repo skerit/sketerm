@@ -143,28 +143,52 @@ injected back via CGEvents. App sessions on a Mac use this
 automatically — same wire, same transports (ssh / mux socket /
 roaming UDP), nothing to choose.
 
-Host requirements, in order:
+Setup is a one-time dance with three non-obvious macOS constraints
+(all validated on hardware — frames + input + window-close confirmed
+end to end). `dist/deploy-macos.sh` automates the repeatable part.
 
 1. **A capture-capable daemon.** `zig build mux` ON the Mac.
    `sketerm-mux-portable` does not include capture (cross builds
    have no macOS SDK); neither does a Linux-built binary.
-2. **A logged-in GUI session.** WindowServer must be running and
-   the daemon must belong to the console user's session. Launch the
-   daemon from a local terminal, or install it as a LaunchAgent
-   (`launchctl bootstrap gui/$UID <plist>`). A daemon started over
-   plain SSH can spawn apps and serve the wire, but TCC will refuse
-   capture for the sshd context — use the LaunchAgent.
-3. **One-time TCC grants** (not scriptable, by design). The first
+2. **A stable code-signing identity (do this once).** TCC pins a
+   Screen Recording / Accessibility grant to the binary's *code
+   signature*. Zig binaries are ad-hoc signed, so a rebuild changes
+   the hash and the grant goes stale — re-granting every build.
+   Fix it by signing with a self-signed cert, which pins the CERT
+   (rebuilds re-signed with it keep the grant). Create it once:
+   **Keychain Access → Certificate Assistant → Create a Certificate**
+   → name `sketerm-dev`, **Self-Signed Root**, **Code Signing**.
+   (Self-signed roots you create are trusted for your user
+   automatically.)
+3. **Deploy as a GUI-session LaunchAgent.** Run `dist/deploy-macos.sh`
+   **from a Terminal in your GUI session** (not over SSH). It builds,
+   signs with `sketerm-dev`, writes `~/Library/LaunchAgents/
+   dev.sker.sketerm-mux.plist`, and bootstraps it into your session.
+   Two constraints force this exact shape:
+   - **WindowServer.** Capture's `SCContentFilter` makes in-process
+     WindowServer calls. A daemon must run in the Aqua login session
+     or it aborts (`CGS_REQUIRE_INIT`). An agent bootstrapped over
+     SSH lands in the wrong audit session; one bootstrapped from your
+     own session does not. (The daemon also self-promotes to a
+     UIElement app to establish the connection — no Dock icon.)
+   - **TCC attribution.** TCC blames the "responsible process". A
+     daemon launched from a shell is attributed to the *terminal*
+     (no grant → denied); a launchd agent is attributed to
+     sketerm-mux itself. So it must be an agent, never a shell job.
+4. **One-time TCC grants** (not scriptable, by design). The first
    capture attempt registers `sketerm-mux` — DISABLED — under
    System Settings → Privacy & Security → **Screen Recording**;
    the first input injection does the same under **Accessibility**.
-   Flip both toggles, then restart the daemon. Until then the
-   client shows a notice window titled with these instructions and
-   the daemon logs the exact failure — no silent hangs.
-4. **Re-grant after rebuilding.** Zig binaries are ad-hoc signed,
-   so a rebuilt daemon is a new TCC identity. Keep the granted copy
-   at a stable path (e.g. `~/.local/bin/sketerm-mux`) and re-toggle
-   after updating it.
+   Enable both. After enabling, `launchctl kickstart -k
+   gui/$UID/dev.sker.sketerm-mux` (Screen Recording only takes
+   effect on restart). Until granted, the client shows a notice
+   window titled with these instructions and the daemon logs the
+   exact failure — no silent hangs. If an entry was created against
+   an *older* binary (stale hash), remove it with the **−** button
+   first so the cert-signed binary re-registers.
+
+After this, rebuilds are just `dist/deploy-macos.sh` again — build,
+re-sign, kick. No re-grant, no clicking. The grants ride the cert.
 
 Caveats: system apps (Calculator, TextEdit, …) carry launch
 constraints on modern macOS and cannot be spawned as PTY children —

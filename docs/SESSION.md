@@ -5504,3 +5504,38 @@ compatible. No Zig changes — pure data shader. Validated by
 compiling the gl.zig-wrapped source under BOTH Mesa GLES 300 es and
 desktop GL 330 core (the two sketerm injects); GUI builds clean.
 Visual eyeball still pending a display.
+
+## 2026-06-13: winstream SCK backend — VALIDATED ON HARDWARE
+
+The macOS window-streaming backend works end to end on a real Mac.
+A cert-signed sketerm-mux LaunchAgent in the GUI session captured a
+live AppKit window (correct 480×352 + title, 1200+ deflated frames
+over the mux socket), injected keystrokes that changed the captured
+frames (zero drops once Accessibility was on), and closed the window
+via AX. Capture + keyboard/mouse + window-close all confirmed.
+
+The bring-up was a TCC/session gauntlet, now documented in
+REMOTE.md ("Remote macOS apps") + automated by dist/deploy-macos.sh:
+
+- **WindowServer**: SCContentFilter makes in-process WindowServer
+  calls; a bare daemon aborts with CGS_REQUIRE_INIT. Fix:
+  sck_shim promotes the process to a UIElement app
+  (NSApplicationActivationPolicyAccessory) at first capture — no
+  Dock icon, establishes the connection. AND the daemon must run in
+  the Aqua login session: an agent bootstrapped over SSH lands in
+  the wrong audit session and still can't reach WindowServer; one
+  bootstrapped from the user's own session can.
+- **TCC attribution**: a shell-launched daemon is blamed on the
+  terminal app (no grant → denied); a launchd agent is blamed on
+  sketerm-mux itself. So it must be a LaunchAgent, not a shell job.
+- **TCC cdhash pinning**: grants pin the binary's code signature.
+  Ad-hoc Zig builds change hash every rebuild → re-grant each time.
+  Signing with a self-signed `sketerm-dev` cert pins the cert
+  instead; rebuilds re-signed with it keep the grant. Creating the
+  cert is a one-time Keychain Access GUI step (CLI trust-settings
+  need GUI auth, unreachable over SSH).
+
+Tooling: dist/deploy-macos.sh (build → sign → bootstrap agent),
+run from a GUI terminal. The earlier commits (capture shim, input,
+gating, frame-codec refactor, WindowServer fix) all stand; this is
+the validation + deployment layer. 550 tests, smoke-mux green.
