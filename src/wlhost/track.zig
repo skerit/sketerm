@@ -92,6 +92,11 @@ pub const Tracker = struct {
     /// only these get partial copies (a client that never damages
     /// always full-copies).
     uses_damage: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// surface id → set_buffer_scale (default 1). wl_surface.damage is
+    /// in surface-local (logical) coords, so its rows are multiplied by
+    /// this to index the physical buffer; damage_buffer is already
+    /// physical. Without this HiDPI buffers copy only the top 1/scale.
+    scales: std.AutoHashMapUnmanaged(u32, i32) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Error!Tracker {
         var self = Tracker{ .allocator = allocator };
@@ -105,6 +110,7 @@ pub const Tracker = struct {
         self.buffers.deinit(self.allocator);
         self.damage.deinit(self.allocator);
         self.uses_damage.deinit(self.allocator);
+        self.scales.deinit(self.allocator);
     }
 
     /// One complete client→compositor message (header + body).
@@ -198,7 +204,24 @@ pub const Tracker = struct {
                 }
                 return .relay;
             },
-            2, 9 => { // damage / damage_buffer (scale 1: same space)
+            2 => { // damage — surface-local (logical) coords
+                var it = wire.ArgIter.init(body, msg.sig);
+                _ = try it.next(); // x
+                const y = (try it.next()).?.int;
+                _ = try it.next(); // width
+                const h = (try it.next()).?.int;
+                // Scale logical rows to physical buffer rows.
+                const sc: i32 = self.scales.get(hdr.object) orelse 1;
+                if (h > 0) try self.addDamage(hdr.object, y *| sc, (y +| h) *| sc);
+                return .relay;
+            },
+            8 => { // set_buffer_scale
+                var it = wire.ArgIter.init(body, msg.sig);
+                const sc = (try it.next()).?.int;
+                try self.scales.put(self.allocator, hdr.object, if (sc > 0) sc else 1);
+                return .relay;
+            },
+            9 => { // damage_buffer — already in physical buffer coords
                 var it = wire.ArgIter.init(body, msg.sig);
                 _ = try it.next(); // x
                 const y = (try it.next()).?.int;
@@ -260,6 +283,7 @@ pub const Tracker = struct {
             _ = self.buffers.remove(id);
             _ = self.damage.remove(id);
             _ = self.uses_damage.remove(id);
+            _ = self.scales.remove(id);
             return;
         }
         const iface = self.objects.get(hdr.object) orelse return;
@@ -429,6 +453,44 @@ test "damage rows: accumulate, reset on commit, trust-but-clamp semantics" {
     const c3 = enc(&buf, 4, 6, .{});
     const dmg3 = (try tr.clientMessage(c3.hdr, c3.body)).commit.damage.?;
     try t.expectEqual(@as(i32, 0), dmg3.y1 - dmg3.y0);
+}
+
+test "HiDPI: wl_surface.damage scales by buffer scale, damage_buffer does not" {
+    var tr = try Tracker.init(t.allocator);
+    defer tr.deinit();
+    var buf: [64]u8 = undefined;
+
+    const gr = enc(&buf, 1, 1, .{2});
+    _ = try tr.clientMessage(gr.hdr, gr.body);
+    const bindc = enc(&buf, 2, 0, .{ 1, @as([]const u8, "wl_compositor"), 6, 3 });
+    _ = try tr.clientMessage(bindc.hdr, bindc.body);
+    const cs = enc(&buf, 3, 0, .{4});
+    _ = try tr.clientMessage(cs.hdr, cs.body);
+    try bindShm(&tr, 2, 7);
+    const cp = enc(&buf, 7, 0, .{ 8, 1 << 20 });
+    _ = try tr.clientMessage(cp.hdr, cp.body);
+    const cb = enc(&buf, 8, 0, .{ 9, 0, 64, 128, 256, 1 });
+    _ = try tr.clientMessage(cb.hdr, cb.body);
+    const at = enc(&buf, 4, 1, .{ 9, 0, 0 });
+    _ = try tr.clientMessage(at.hdr, at.body);
+
+    // set_buffer_scale(2) → wl_surface.damage rows are logical, scale ×2.
+    const sbs = enc(&buf, 4, 8, .{2});
+    _ = try tr.clientMessage(sbs.hdr, sbs.body);
+    const d1 = enc(&buf, 4, 2, .{ 0, 10, 32, 20 }); // logical rows 10..30 → physical 20..60
+    _ = try tr.clientMessage(d1.hdr, d1.body);
+    const c1 = enc(&buf, 4, 6, .{});
+    const dmg = (try tr.clientMessage(c1.hdr, c1.body)).commit.damage.?;
+    try t.expectEqual(@as(i32, 20), dmg.y0);
+    try t.expectEqual(@as(i32, 60), dmg.y1);
+
+    // damage_buffer is already physical — unscaled even at buffer scale 2.
+    const d2 = enc(&buf, 4, 9, .{ 0, 100, 32, 8 }); // physical rows 100..108
+    _ = try tr.clientMessage(d2.hdr, d2.body);
+    const c2 = enc(&buf, 4, 6, .{});
+    const dmg2 = (try tr.clientMessage(c2.hdr, c2.body)).commit.damage.?;
+    try t.expectEqual(@as(i32, 100), dmg2.y0);
+    try t.expectEqual(@as(i32, 108), dmg2.y1);
 }
 
 test "protocol violations are errors" {

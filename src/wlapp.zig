@@ -59,12 +59,50 @@ pub const AppHost = struct {
     /// snaps/maximizes to this rect, not the shadow edge.
     geos: std.AutoHashMapUnmanaged(u32, [4]i32) = .empty,
 
+    /// An owned copy of a surface's physical (HiDPI) pixels, drawn by a
+    /// GtkDrawingArea sized to LOGICAL units — so overlay children are
+    /// correctly sized AND crisp (GtkPicture would treat the physical
+    /// pixel count as the logical size and render them oversized).
+    const OverlayTex = struct {
+        pixels: []u8 = &.{},
+        pw: i32 = 0,
+        ph: i32 = 0,
+        format: u32 = 0,
+
+        fn set(self: *OverlayTex, alloc: std.mem.Allocator, w: i32, h: i32, format: u32, pixels: []const u8) void {
+            const new = alloc.dupe(u8, pixels) catch return;
+            if (self.pixels.len > 0) alloc.free(self.pixels);
+            self.pixels = new;
+            self.pw = w;
+            self.ph = h;
+            self.format = format;
+        }
+        fn deinit(self: *OverlayTex, alloc: std.mem.Allocator) void {
+            if (self.pixels.len > 0) alloc.free(self.pixels);
+            self.pixels = &.{};
+        }
+        /// Paint at full resolution into a `lw`×`lh` logical area.
+        fn draw(self: *OverlayTex, cr: ?*c.cairo_t, lw: c_int, lh: c_int) void {
+            if (self.pixels.len == 0 or self.pw <= 0 or self.ph <= 0 or lw <= 0 or lh <= 0) return;
+            const fmt: c.cairo_format_t = if (self.format == 1) c.CAIRO_FORMAT_RGB24 else c.CAIRO_FORMAT_ARGB32;
+            const surf = c.cairo_image_surface_create_for_data(@constCast(self.pixels.ptr), fmt, self.pw, self.ph, self.pw * 4) orelse return;
+            defer c.cairo_surface_destroy(surf);
+            c.cairo_save(cr);
+            c.cairo_scale(cr, @as(f64, @floatFromInt(lw)) / @as(f64, @floatFromInt(self.pw)), @as(f64, @floatFromInt(lh)) / @as(f64, @floatFromInt(self.ph)));
+            c.cairo_set_source_surface(cr, surf, 0, 0);
+            if (c.cairo_get_source(cr)) |pat| c.cairo_pattern_set_filter(pat, c.CAIRO_FILTER_GOOD);
+            c.cairo_paint(cr);
+            c.cairo_restore(cr);
+        }
+    };
+
     const Popup = struct {
         host: *AppHost,
         surface: u32,
         /// Window hosting the overlay this popup renders into.
         win: *Win,
-        picture: *c.GtkWidget,
+        area: *c.GtkWidget, // GtkDrawingArea
+        tex: OverlayTex = .{},
     };
 
     /// A subsurface rendered into a parent window's overlay at a
@@ -75,7 +113,8 @@ pub const AppHost = struct {
         surface: u32,
         /// Window hosting the overlay this subsurface renders into.
         win: *Win,
-        picture: *c.GtkWidget,
+        area: *c.GtkWidget, // GtkDrawingArea
+        tex: OverlayTex = .{},
         /// Offset inherited from the parent chain (toplevel-relative).
         /// The subsurface's own set_position is added on top.
         cox: i32 = 0,
@@ -89,7 +128,9 @@ pub const AppHost = struct {
         /// GtkOverlay between window and picture — popups land here.
         overlay: *c.GtkWidget,
         picture: *c.GtkWidget,
-        /// Committed buffer size — the surface coordinate space.
+        /// Committed surface size in LOGICAL units (physical buffer
+        /// size ÷ buffer scale) — the surface coordinate space. The
+        /// texture itself is shown at full physical resolution.
         buf_w: i32 = 0,
         buf_h: i32 = 0,
         /// Last size sent via configureToplevel (resize feedback
@@ -198,7 +239,20 @@ pub const AppHost = struct {
             .clipboard_data = onClipData,
             .clipboard_read = onClipRead,
         });
+        // Advertise the local display scale so apps render HiDPI
+        // buffers (set before the app binds wl_output on first feed).
+        self.comp.output_scale = localScale();
         return self;
+    }
+
+    /// Integer scale factor of the primary monitor (1 unless HiDPI).
+    fn localScale() i32 {
+        const display = c.gdk_display_get_default() orelse return 1;
+        const monitors = c.gdk_display_get_monitors(display) orelse return 1;
+        const mon = c.g_list_model_get_item(@ptrCast(monitors), 0) orelse return 1;
+        defer c.g_object_unref(mon);
+        const sf = c.gdk_monitor_get_scale_factor(@ptrCast(@alignCast(mon)));
+        return if (sf > 0) sf else 1;
     }
 
     pub fn destroy(self: *AppHost) void {
@@ -212,10 +266,16 @@ pub const AppHost = struct {
         }
         self.windows.deinit(self.allocator);
         var pit = self.popups.valueIterator();
-        while (pit.next()) |p| self.allocator.destroy(p.*);
+        while (pit.next()) |p| {
+            p.*.tex.deinit(self.allocator);
+            self.allocator.destroy(p.*);
+        }
         self.popups.deinit(self.allocator);
         var sit = self.subsurfaces.valueIterator();
-        while (sit.next()) |s| self.allocator.destroy(s.*);
+        while (sit.next()) |s| {
+            s.*.tex.deinit(self.allocator);
+            self.allocator.destroy(s.*);
+        }
         self.subsurfaces.deinit(self.allocator);
         var tit = self.pending_titles.valueIterator();
         while (tit.next()) |v| self.allocator.free(v.*);
@@ -258,40 +318,54 @@ pub const AppHost = struct {
 
     // ── view callbacks (main thread — GTK is safe) ──────────────
 
-    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, format: u32, pixels: []const u8) void {
+    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, scale: i32, format: u32, pixels: []const u8) void {
         const self = cast.userData(AppHost, ctx);
+        // The buffer is physical pixels (scale× the surface-local size).
+        // GTK sizes (windows, overlay children, positions, the pointer
+        // map) are LOGICAL = physical ÷ the surface's buffer scale; the
+        // texture itself stays physical (HiDPI-crisp).
+        const s: i32 = if (scale > 0) scale else 1;
+        const lw = @divTrunc(w, s);
+        const lh = @divTrunc(h, s);
         if (self.popups.get(surface)) |popup| {
-            const tex = rw.newTexture(w, h, format, pixels) orelse return;
-            defer c.g_object_unref(tex);
-            c.gtk_widget_set_size_request(popup.picture, w, h);
-            c.gtk_picture_set_paintable(@ptrCast(popup.picture), @ptrCast(tex));
+            popup.tex.set(self.allocator, w, h, format, pixels);
+            c.gtk_drawing_area_set_content_width(@ptrCast(popup.area), lw);
+            c.gtk_drawing_area_set_content_height(@ptrCast(popup.area), lh);
+            c.gtk_widget_queue_draw(popup.area);
             // Constraint adjustment, slide-style: keep the popup
             // inside the host window now that its size is known.
             const pw = c.gtk_widget_get_width(popup.win.picture);
             const ph = c.gtk_widget_get_height(popup.win.picture);
             if (pw > 0 and ph > 0) {
-                const mx = c.gtk_widget_get_margin_start(popup.picture);
-                const my = c.gtk_widget_get_margin_top(popup.picture);
-                const cx = std.math.clamp(mx, 0, @max(0, pw - w));
-                const cy = std.math.clamp(my, 0, @max(0, ph - h));
-                if (cx != mx) c.gtk_widget_set_margin_start(popup.picture, cx);
-                if (cy != my) c.gtk_widget_set_margin_top(popup.picture, cy);
+                const mx = c.gtk_widget_get_margin_start(popup.area);
+                const my = c.gtk_widget_get_margin_top(popup.area);
+                const cx = std.math.clamp(mx, 0, @max(0, pw - lw));
+                const cy = std.math.clamp(my, 0, @max(0, ph - lh));
+                if (cx != mx) c.gtk_widget_set_margin_start(popup.area, cx);
+                if (cy != my) c.gtk_widget_set_margin_top(popup.area, cy);
             }
             return;
         }
         if (self.subsurfaces.get(surface)) |sub| {
-            const tex = rw.newTexture(w, h, format, pixels) orelse return;
-            defer c.g_object_unref(tex);
-            c.gtk_widget_set_size_request(sub.picture, w, h);
-            c.gtk_picture_set_paintable(@ptrCast(sub.picture), @ptrCast(tex));
+            sub.tex.set(self.allocator, w, h, format, pixels);
+            c.gtk_drawing_area_set_content_width(@ptrCast(sub.area), lw);
+            c.gtk_drawing_area_set_content_height(@ptrCast(sub.area), lh);
+            c.gtk_widget_queue_draw(sub.area);
             return;
         }
-        const win = self.winFor(surface, w, h) orelse return;
-        win.buf_w = w;
-        win.buf_h = h;
+        const win = self.winFor(surface, lw, lh) orelse return;
+        win.buf_w = lw;
+        win.buf_h = lh;
         const tex = rw.newTexture(w, h, format, pixels) orelse return;
         defer c.g_object_unref(tex);
         c.gtk_picture_set_paintable(@ptrCast(win.picture), @ptrCast(tex));
+    }
+
+    fn onPopupDraw(_: ?*c.GtkDrawingArea, cr: ?*c.cairo_t, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(Popup, user).tex.draw(cr, width, height);
+    }
+    fn onSubsurfaceDraw(_: ?*c.GtkDrawingArea, cr: ?*c.cairo_t, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(Subsurface, user).tex.draw(cr, width, height);
     }
 
     /// A subsurface gained its role: render it in the parent window's
@@ -314,42 +388,43 @@ pub const AppHost = struct {
             }
         } else if (self.popups.get(parent)) |pp| {
             win = pp.win;
-            cox += c.gtk_widget_get_margin_start(pp.picture);
-            coy += c.gtk_widget_get_margin_top(pp.picture);
+            cox += c.gtk_widget_get_margin_start(pp.area);
+            coy += c.gtk_widget_get_margin_top(pp.area);
         } else if (self.subsurfaces.get(parent)) |ps| {
             win = ps.win;
-            cox += c.gtk_widget_get_margin_start(ps.picture);
-            coy += c.gtk_widget_get_margin_top(ps.picture);
+            cox += c.gtk_widget_get_margin_start(ps.area);
+            coy += c.gtk_widget_get_margin_top(ps.area);
         } else return;
 
         const sub = self.allocator.create(Subsurface) catch return;
-        const picture = c.gtk_picture_new();
-        c.gtk_picture_set_content_fit(@ptrCast(picture), c.GTK_CONTENT_FIT_FILL);
-        c.gtk_widget_set_halign(picture, c.GTK_ALIGN_START);
-        c.gtk_widget_set_valign(picture, c.GTK_ALIGN_START);
-        c.gtk_widget_set_can_target(picture, 0); // input-transparent
-        c.gtk_widget_set_margin_start(picture, @max(0, cox));
-        c.gtk_widget_set_margin_top(picture, @max(0, coy));
-        sub.* = .{ .host = self, .surface = surface, .win = win, .picture = picture.?, .cox = cox, .coy = coy };
+        const area = c.gtk_drawing_area_new();
+        c.gtk_widget_set_halign(area, c.GTK_ALIGN_START);
+        c.gtk_widget_set_valign(area, c.GTK_ALIGN_START);
+        c.gtk_widget_set_can_target(area, 0); // input-transparent
+        c.gtk_widget_set_margin_start(area, @max(0, cox));
+        c.gtk_widget_set_margin_top(area, @max(0, coy));
+        sub.* = .{ .host = self, .surface = surface, .win = win, .area = area.?, .cox = cox, .coy = coy };
+        c.gtk_drawing_area_set_draw_func(@ptrCast(area), @ptrCast(&onSubsurfaceDraw), sub, null);
         self.subsurfaces.put(self.allocator, surface, sub) catch {
             self.allocator.destroy(sub);
             return;
         };
-        c.gtk_overlay_add_overlay(@ptrCast(win.overlay), picture);
+        c.gtk_overlay_add_overlay(@ptrCast(win.overlay), area);
     }
 
     fn onSubsurfacePos(ctx: ?*anyopaque, surface: u32, x: i32, y: i32) void {
         const self = cast.userData(AppHost, ctx);
         const sub = self.subsurfaces.get(surface) orelse return;
-        c.gtk_widget_set_margin_start(sub.picture, @max(0, sub.cox + x));
-        c.gtk_widget_set_margin_top(sub.picture, @max(0, sub.coy + y));
+        c.gtk_widget_set_margin_start(sub.area, @max(0, sub.cox + x));
+        c.gtk_widget_set_margin_top(sub.area, @max(0, sub.coy + y));
     }
 
     fn onSubsurfaceGone(ctx: ?*anyopaque, surface: u32) void {
         const self = cast.userData(AppHost, ctx);
         const sub = self.subsurfaces.get(surface) orelse return;
         _ = self.subsurfaces.remove(surface);
-        c.gtk_overlay_remove_overlay(@ptrCast(sub.win.overlay), sub.picture);
+        c.gtk_overlay_remove_overlay(@ptrCast(sub.win.overlay), sub.area);
+        sub.tex.deinit(self.allocator);
         self.allocator.destroy(sub);
     }
 
@@ -371,40 +446,41 @@ pub const AppHost = struct {
             }
         } else if (self.popups.get(parent)) |pp| {
             win = pp.win;
-            px += c.gtk_widget_get_margin_start(pp.picture);
-            py += c.gtk_widget_get_margin_top(pp.picture);
+            px += c.gtk_widget_get_margin_start(pp.area);
+            py += c.gtk_widget_get_margin_top(pp.area);
         } else return;
 
         const popup = self.allocator.create(Popup) catch return;
-        const picture = c.gtk_picture_new();
-        c.gtk_picture_set_content_fit(@ptrCast(picture), c.GTK_CONTENT_FIT_FILL);
-        c.gtk_widget_set_halign(picture, c.GTK_ALIGN_START);
-        c.gtk_widget_set_valign(picture, c.GTK_ALIGN_START);
-        c.gtk_widget_set_margin_start(picture, @max(0, px));
-        c.gtk_widget_set_margin_top(picture, @max(0, py));
-        popup.* = .{ .host = self, .surface = surface, .win = win, .picture = picture.? };
+        const area = c.gtk_drawing_area_new();
+        c.gtk_widget_set_halign(area, c.GTK_ALIGN_START);
+        c.gtk_widget_set_valign(area, c.GTK_ALIGN_START);
+        c.gtk_widget_set_margin_start(area, @max(0, px));
+        c.gtk_widget_set_margin_top(area, @max(0, py));
+        popup.* = .{ .host = self, .surface = surface, .win = win, .area = area.? };
+        c.gtk_drawing_area_set_draw_func(@ptrCast(area), @ptrCast(&onPopupDraw), popup, null);
         self.popups.put(self.allocator, surface, popup) catch {
             self.allocator.destroy(popup);
             return;
         };
-        c.gtk_overlay_add_overlay(@ptrCast(win.overlay), picture);
+        c.gtk_overlay_add_overlay(@ptrCast(win.overlay), area);
 
         const motion = c.gtk_event_controller_motion_new();
         _ = c.g_signal_connect_data(@ptrCast(motion), "enter", @ptrCast(&onPopupPtrEnter), popup, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(motion), "motion", @ptrCast(&onPopupPtrMotion), popup, null, 0);
-        c.gtk_widget_add_controller(picture, motion);
+        c.gtk_widget_add_controller(area, motion);
         const click = c.gtk_gesture_click_new();
         c.gtk_gesture_single_set_button(@ptrCast(click), 0);
         _ = c.g_signal_connect_data(@ptrCast(click), "pressed", @ptrCast(&onPopupBtnPress), popup, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(click), "released", @ptrCast(&onPopupBtnRelease), popup, null, 0);
-        c.gtk_widget_add_controller(picture, @ptrCast(click));
+        c.gtk_widget_add_controller(area, @ptrCast(click));
     }
 
     fn onPopupGone(ctx: ?*anyopaque, surface: u32) void {
         const self = cast.userData(AppHost, ctx);
         const popup = self.popups.get(surface) orelse return;
         _ = self.popups.remove(surface);
-        c.gtk_overlay_remove_overlay(@ptrCast(popup.win.overlay), popup.picture);
+        c.gtk_overlay_remove_overlay(@ptrCast(popup.win.overlay), popup.area);
+        popup.tex.deinit(self.allocator);
         self.allocator.destroy(popup);
     }
 
@@ -840,7 +916,7 @@ pub const AppHost = struct {
         const widget: ?*c.GtkWidget = if (self.windows.get(focus)) |win|
             win.picture
         else if (self.popups.get(focus)) |p|
-            p.picture
+            p.area
         else
             null;
         if (widget) |wd| c.gtk_widget_set_cursor_from_name(wd, cursor_names[shape - 1].ptr);

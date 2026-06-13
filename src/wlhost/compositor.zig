@@ -52,7 +52,7 @@ pub const View = struct {
     /// New committed content for a MAPPED surface (toplevel or
     /// popup). `pixels` is tightly packed w*4 rows (stride already
     /// applied), wl_shm format (0 argb, 1 xrgb).
-    toplevel_frame: ?*const fn (ctx: ?*anyopaque, surface: u32, w: i32, h: i32, format: u32, pixels: []const u8) void = null,
+    toplevel_frame: ?*const fn (ctx: ?*anyopaque, surface: u32, w: i32, h: i32, scale: i32, format: u32, pixels: []const u8) void = null,
     toplevel_title: ?*const fn (ctx: ?*anyopaque, surface: u32, title: []const u8) void = null,
     /// xdg_toplevel.set_app_id — desktop identity (icon, grouping).
     toplevel_app_id: ?*const fn (ctx: ?*anyopaque, surface: u32, app_id: []const u8) void = null,
@@ -131,11 +131,12 @@ const globals = [_]Global{
     // v1 = selection only, no dnd action machinery.
     .{ .name = 6, .iface = &protocol.wl_data_device_manager, .version = 1 },
     // Modern niceties many clients probe for. Viewporter is
-    // accept-and-ignore at scale 1; fractional scale always says
-    // 1.0; cursor shapes reach the view.
+    // accept-and-ignore at scale 1; cursor shapes reach the view.
+    // No fractional-scale: clients use the integer wl_output.scale +
+    // set_buffer_scale path; the host renders the HiDPI buffer crisply
+    // and the local compositor does any final fractional downscale.
     .{ .name = 7, .iface = &protocol.wp_cursor_shape_manager_v1, .version = 1 },
     .{ .name = 8, .iface = &protocol.wp_viewporter, .version = 1 },
-    .{ .name = 9, .iface = &protocol.wp_fractional_scale_manager_v1, .version = 1 },
     // Decoration negotiation: SSD-wanting apps (Qt, traditional
     // GTK) get the host window's decorations; CSD apps draw their
     // own into an undecorated host window.
@@ -160,6 +161,9 @@ const Surface = struct {
     /// has_pending = attach(null) → unmap.
     pending_buffer: u32 = 0,
     has_pending: bool = false,
+    /// set_buffer_scale: physical pixels per surface-local (logical)
+    /// unit in the committed buffer. 1 unless HiDPI.
+    buffer_scale: i32 = 1,
     /// Latched buffer id (content source after commit).
     committed_buffer: u32 = 0,
     xdg_surface: u32 = 0,
@@ -242,6 +246,14 @@ const Positioner = struct {
 pub const Compositor = struct {
     allocator: std.mem.Allocator,
     view: View,
+    /// Integer output scale advertised to clients (HiDPI). The view
+    /// sets this from the local display before the first feed; apps
+    /// render buffers at this scale and tag them with set_buffer_scale.
+    output_scale: i32 = 1,
+    /// wl_output object id the client bound (0 = not yet). Surfaces are
+    /// told they entered this output (wl_surface.enter) so GTK3 picks up
+    /// the output scale — without it GTK3 mis-scales (half-height).
+    output_id: u32 = 0,
     /// Outgoing pipe units (events). Caller drains via takeOut.
     out: std.ArrayList(u8) = .empty,
     /// Incoming unit reassembly (chan_data may split units).
@@ -699,6 +711,7 @@ pub const Compositor = struct {
                 return Error.Protocol;
             try self.register(id, g.iface);
             if (g.iface == &protocol.wl_seat) self.seat_version = ver;
+            if (g.iface == &protocol.wl_output) self.output_id = id;
             try self.boundGlobal(id, g.iface);
         } else if (iface == &protocol.wl_compositor) switch (hdr.opcode) {
             0 => { // create_surface
@@ -890,19 +903,6 @@ pub const Compositor = struct {
             // destination always equals the buffer size in practice.
             1, 2 => {},
             else => return Error.Protocol,
-        } else if (iface == &protocol.wp_fractional_scale_manager_v1) switch (hdr.opcode) {
-            0 => try self.destroyObject(hdr.object),
-            1 => { // get_fractional_scale(id, surface)
-                const id = (try it.next()).?.new_id;
-                try self.register(id, &protocol.wp_fractional_scale_v1);
-                var buf: [16]u8 = undefined;
-                var b = wire.Builder.init(&buf, id, 0); // preferred_scale
-                b.putUint(120); // 1.0 in 1/120ths
-                try self.send(try b.finish());
-            },
-            else => return Error.Protocol,
-        } else if (iface == &protocol.wp_fractional_scale_v1) {
-            try self.destroyObject(hdr.object); // destroy
         } else if (iface == &protocol.zxdg_decoration_manager_v1) switch (hdr.opcode) {
             0 => try self.destroyObject(hdr.object),
             1 => { // get_toplevel_decoration(id, xdg_toplevel)
@@ -1102,9 +1102,13 @@ pub const Compositor = struct {
                 }
             },
             6 => try self.commit(hdr.object, surf),
-            // damage/damage_buffer/opaque-region/transform/scale/
-            // offset: accepted, ignored (full-copy pipeline).
-            2, 4, 7, 8, 9, 10 => {},
+            8 => { // set_buffer_scale(scale) — HiDPI buffers
+                const sc = (try it.next()).?.int;
+                surf.buffer_scale = if (sc > 0) sc else 1;
+            },
+            // damage/damage_buffer/opaque-region/transform/offset:
+            // accepted, ignored (full-copy pipeline).
+            2, 4, 7, 9, 10 => {},
             else => return Error.Protocol,
         }
     }
@@ -1127,6 +1131,14 @@ pub const Compositor = struct {
                 try self.register(id, &protocol.xdg_toplevel);
                 try self.xdg_map.put(self.allocator, id, sid);
                 surf.toplevel = id;
+                // Tell the surface it's on our output so GTK3 reads the
+                // scale (without it GTK3 renders mis-scaled / half-height).
+                if (self.output_id != 0) {
+                    var ebuf: [16]u8 = undefined;
+                    var eb = wire.Builder.init(&ebuf, sid, 0); // wl_surface.enter
+                    eb.putObject(self.output_id);
+                    try self.send(try eb.finish());
+                }
                 if (self.view.toplevel_new) |cb| cb(self.view.ctx, sid);
             },
             2 => { // get_popup(id, parent, positioner)
@@ -1313,6 +1325,7 @@ pub const Compositor = struct {
     fn pushFrame(self: *Compositor, sid: u32, info: Buffer) Error!void {
         const cb = self.view.toplevel_frame orelse return;
         const pool = self.pools.getPtr(info.pool) orelse return;
+        const scale: i32 = if (self.surfaces.getPtr(sid)) |s| s.buffer_scale else 1;
         const w: usize = @intCast(info.width);
         const h: usize = @intCast(info.height);
         const stride: usize = @intCast(info.stride);
@@ -1328,7 +1341,7 @@ pub const Compositor = struct {
                 pool.bytes.items[src_start..][0..row_bytes],
             );
         }
-        cb(self.view.ctx, sid, @intCast(w), @intCast(h), info.format, self.frame_scratch.items);
+        cb(self.view.ctx, sid, @intCast(w), @intCast(h), scale, info.format, self.frame_scratch.items);
     }
 
     // ── server plumbing ─────────────────────────────────────────
@@ -1367,7 +1380,7 @@ pub const Compositor = struct {
             try self.send(try m.finish());
             var sbuf: [16]u8 = undefined;
             var s = wire.Builder.init(&sbuf, id, 3); // scale
-            s.putInt(1);
+            s.putInt(self.output_scale);
             try self.send(try s.finish());
             var dbuf: [8]u8 = undefined;
             var d = wire.Builder.init(&dbuf, id, 2); // done
@@ -1432,6 +1445,7 @@ const TestView = struct {
     new_count: usize = 0,
     frames: usize = 0,
     last_w: i32 = 0,
+    last_scale: i32 = 0,
     last_h: i32 = 0,
     last_pixels: [64]u8 = undefined,
     last_len: usize = 0,
@@ -1463,11 +1477,12 @@ const TestView = struct {
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
         self.new_count += 1;
     }
-    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, format: u32, pixels: []const u8) void {
+    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, scale: i32, format: u32, pixels: []const u8) void {
         _ = surface;
         _ = format;
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
         self.frames += 1;
+        self.last_scale = scale;
         self.last_w = w;
         self.last_h = h;
         self.last_len = @min(pixels.len, self.last_pixels.len);
@@ -2223,13 +2238,14 @@ test "set_cursor is not a destructor; cursor surfaces never reach the view" {
     try t.expectEqual(@as(?*const protocol.Interface, null), comp.objects.get(9));
 }
 
-test "extensions: cursor shape, viewporter, fractional scale" {
+test "extensions: cursor shape, viewporter, buffer scale" {
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
+    comp.output_scale = 2;
     defer comp.deinit();
     var buf: [80]u8 = undefined;
 
-    { // registry(2), bind all three managers -> 3, 4, 5
+    { // registry(2); bind cursor(7)->3, viewporter(8)->4, compositor(1)->7
         var b = wire.Builder.init(&buf, 1, 1);
         b.putNewId(2);
         try req(&comp, try b.finish());
@@ -2245,12 +2261,12 @@ test "extensions: cursor shape, viewporter, fractional scale" {
         b2.putUint(1);
         b2.putNewId(4);
         try req(&comp, try b2.finish());
-        var b3 = wire.Builder.init(&buf, 2, 0);
-        b3.putUint(9);
-        b3.putString("wp_fractional_scale_manager_v1");
-        b3.putUint(1);
-        b3.putNewId(5);
-        try req(&comp, try b3.finish());
+        var bc = wire.Builder.init(&buf, 2, 0);
+        bc.putUint(1);
+        bc.putString("wl_compositor");
+        bc.putUint(1);
+        bc.putNewId(7);
+        try req(&comp, try bc.finish());
     }
     { // cursor device(6) + set_shape(text=9) -> callback
         var b = wire.Builder.init(&buf, 3, 1);
@@ -2264,14 +2280,8 @@ test "extensions: cursor shape, viewporter, fractional scale" {
     }
     try t.expectEqual(@as(u32, 9), tv.cursor);
 
-    { // viewport on a surface: accepted, inert
-        var bc = wire.Builder.init(&buf, 2, 0);
-        bc.putUint(1);
-        bc.putString("wl_compositor");
-        bc.putUint(1);
-        bc.putNewId(7);
-        try req(&comp, try bc.finish());
-        var bs = wire.Builder.init(&buf, 7, 0);
+    { // surface(8): viewport inert, set_buffer_scale(2) tracked
+        var bs = wire.Builder.init(&buf, 7, 0); // create_surface(8)
         bs.putNewId(8);
         try req(&comp, try bs.finish());
         var b = wire.Builder.init(&buf, 4, 1); // get_viewport(9, surf 8)
@@ -2282,22 +2292,12 @@ test "extensions: cursor shape, viewporter, fractional scale" {
         b1.putInt(800);
         b1.putInt(600);
         try req(&comp, try b1.finish());
+        var b2 = wire.Builder.init(&buf, 8, 8); // wl_surface.set_buffer_scale(2)
+        b2.putInt(2);
+        try req(&comp, try b2.finish());
     }
     try t.expect(!comp.dead);
-
-    // fractional scale: preferred_scale(120) arrives on creation.
-    comp.clearOut();
-    {
-        var b = wire.Builder.init(&buf, 5, 1); // get_fractional_scale(10, surf 8)
-        b.putNewId(10);
-        b.putObject(8);
-        try req(&comp, try b.finish());
-    }
-    const p = (try pipe.peelUnit(comp.takeOut())).?;
-    const hdr = (try wire.parseHeader(p.unit.payload)).?;
-    try t.expectEqual(@as(u32, 10), hdr.object);
-    try t.expectEqual(@as(u16, 0), hdr.opcode); // preferred_scale
-    try t.expectEqual(@as(u32, 120), std.mem.readInt(u32, p.unit.payload[wire.header_size..][0..4], .little));
+    try t.expectEqual(@as(i32, 2), comp.surfaces.get(8).?.buffer_scale);
 }
 
 test "input region: staged on set, applied at commit" {
