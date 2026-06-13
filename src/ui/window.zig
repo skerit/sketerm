@@ -125,6 +125,38 @@ fn logActionError(action: []const u8, err: anyerror) void {
     std.debug.print("sketerm: action '{s}' failed: {s}\n", .{ action, @errorName(err) });
 }
 
+/// "closed" handler for popovers we build fresh per-open and parent
+/// manually with gtk_widget_set_parent. GTK does NOT destroy such a
+/// popover on popdown — it stays parented and leaks (the widget
+/// subtree plus every heap ctx whose GDestroyNotify only fires when
+/// its child widget is destroyed). Unparenting here on every dismissal
+/// (click-away, Escape, action-completed — "closed" covers all three)
+/// destroys the popover and its children, which in turn fires the
+/// child-signal GDestroyNotify callbacks that free the ctxs. `user` is
+/// the popover itself (same convention as menu.zig onItemClicked), so
+/// no extra heap state or destroy-notify is needed here.
+fn onManualPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const pop: *c.GtkWidget = @ptrCast(@alignCast(u));
+        if (c.gtk_widget_get_parent(pop) != null) {
+            c.gtk_widget_unparent(pop);
+        }
+    }
+}
+
+/// Wire the per-open unparent-on-close for a manually-parented
+/// popover. Call once, right after gtk_widget_set_parent.
+fn connectManualPopoverClose(popover: *c.GtkWidget) void {
+    _ = c.g_signal_connect_data(
+        popover,
+        "closed",
+        @ptrCast(&onManualPopoverClosed),
+        @ptrCast(popover),
+        null,
+        c.G_CONNECT_DEFAULT,
+    );
+}
+
 pub const Window = struct {
     app_window: *c.GtkWidget,
     tab_view: *c.AdwTabView,
@@ -2347,6 +2379,7 @@ pub const Window = struct {
         // anchor point to the click location when known; otherwise we
         // anchor the popover under the visual center of the tab bar.
         c.gtk_widget_set_parent(popover, self.tab_bar);
+        connectManualPopoverClose(popover);
         var alloc_w: c_int = 0;
         var alloc_h: c_int = 0;
         if (click) |pt| {
@@ -2499,6 +2532,7 @@ pub const Window = struct {
         c.gtk_scrolled_window_set_child(@ptrCast(scroller), content);
         c.gtk_popover_set_child(@ptrCast(popover), scroller);
         c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+        connectManualPopoverClose(popover);
         var rect = c.GdkRectangle{
             .x = @divTrunc(c.gtk_widget_get_width(@ptrCast(pane.area)), 2),
             .y = @divTrunc(c.gtk_widget_get_height(@ptrCast(pane.area)), 2),
@@ -2718,6 +2752,7 @@ pub const Window = struct {
             };
             c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
         }
+        connectManualPopoverClose(popover);
 
         const ctx = self.allocator.create(PaneTitleCtx) catch return;
         ctx.* = .{
@@ -2770,6 +2805,7 @@ pub const Window = struct {
 
         c.gtk_popover_set_child(@ptrCast(popover), entry);
         c.gtk_widget_set_parent(popover, @ptrCast(pane.area));
+        connectManualPopoverClose(popover);
         const w = c.gtk_widget_get_width(@ptrCast(pane.area));
         const rect = c.GdkRectangle{
             .x = @divFloor(w, 2),
