@@ -49,9 +49,12 @@ pub const AppHost = struct {
     /// Surfaces whose app negotiated server-side decorations before
     /// the window existed (the normal order).
     pending_ssd: std.AutoHashMapUnmanaged(u32, bool) = .empty,
-    /// Window-geometry offsets per surface (frames are cropped to
-    /// the geometry; input coords must add the offset back).
-    geos: std.AutoHashMapUnmanaged(u32, [2]i32) = .empty,
+    /// Committed window-geometry rect per surface ({x, y, w, h} in
+    /// buffer coords): the visible window inside the buffer, the rest
+    /// being CSD shadow. The full buffer is shown (shadow visible); the
+    /// shadow is reported as the host toplevel's shadow width so the WM
+    /// snaps/maximizes to this rect, not the shadow edge.
+    geos: std.AutoHashMapUnmanaged(u32, [4]i32) = .empty,
 
     const Popup = struct {
         host: *AppHost,
@@ -108,20 +111,34 @@ pub const AppHost = struct {
                 c.gtk_widget_set_cursor(self.picture, null);
         }
 
-        /// Widget → surface coordinates: scale onto the cropped
-        /// frame, then add the window-geometry offset (the app
-        /// thinks in full-buffer coords, shadows included).
+        /// Widget → surface coordinates: the picture shows the full
+        /// buffer, so widget coords scale straight onto buffer (=
+        /// surface) coordinates — no geometry offset.
         fn mapXY(self: *Win, wx: f64, wy: f64) [2]f64 {
             const ww = c.gtk_widget_get_width(self.picture);
             const wh = c.gtk_widget_get_height(self.picture);
-            var x = wx;
-            var y = wy;
             if (ww > 0 and wh > 0 and self.buf_w > 0 and self.buf_h > 0) {
-                x = wx * @as(f64, @floatFromInt(self.buf_w)) / @as(f64, @floatFromInt(ww));
-                y = wy * @as(f64, @floatFromInt(self.buf_h)) / @as(f64, @floatFromInt(wh));
+                return .{
+                    wx * @as(f64, @floatFromInt(self.buf_w)) / @as(f64, @floatFromInt(ww)),
+                    wy * @as(f64, @floatFromInt(self.buf_h)) / @as(f64, @floatFromInt(wh)),
+                };
             }
-            const geo = self.host.geos.get(self.surface) orelse return .{ x, y };
-            return .{ x + @as(f64, @floatFromInt(geo[0])), y + @as(f64, @floatFromInt(geo[1])) };
+            return .{ wx, wy };
+        }
+
+        /// Host toplevel shadow width {left, right, top, bottom} = the
+        /// buffer area outside the committed window geometry (the CSD
+        /// shadow margin). Reported via the compute-size signal so the
+        /// WM treats the geometry rect — not the shadow — as the window.
+        fn shadowMargins(self: *Win) [4]i32 {
+            const geo = self.host.geos.get(self.surface) orelse return .{ 0, 0, 0, 0 };
+            if (geo[2] <= 0 or geo[3] <= 0 or self.buf_w <= 0 or self.buf_h <= 0) return .{ 0, 0, 0, 0 };
+            return .{
+                @max(0, geo[0]), // left
+                @max(0, self.buf_w - geo[0] - geo[2]), // right
+                @max(0, geo[1]), // top
+                @max(0, self.buf_h - geo[1] - geo[3]), // bottom
+            };
         }
     };
 
@@ -399,6 +416,9 @@ pub const AppHost = struct {
         }
         _ = c.g_object_set_data(@ptrCast(window), "sketerm-wlapp", win);
         _ = c.g_signal_connect_data(@ptrCast(window), "close-request", @ptrCast(&onCloseRequest), win, null, 0);
+        // Report the CSD shadow as the toplevel's shadow width once the
+        // GdkSurface exists, so the WM snaps/maximizes to the geometry.
+        _ = c.g_signal_connect_data(@ptrCast(window), "realize", @ptrCast(&onWinRealize), win, null, 0);
 
         // Input: pointer on the picture (its coords), keyboard +
         // focus on the window. All feed the compositor's seat.
@@ -637,10 +657,43 @@ pub const AppHost = struct {
     }
 
     fn onGeometry(ctx: ?*anyopaque, surface: u32, x: i32, y: i32, gw: i32, gh: i32) void {
-        _ = gw;
-        _ = gh;
         const self = cast.userData(AppHost, ctx);
-        self.geos.put(self.allocator, surface, .{ x, y }) catch {};
+        self.geos.put(self.allocator, surface, .{ x, y, gw, gh }) catch {};
+        // Shadow margins changed → recompute the toplevel size so the
+        // WM picks up the new geometry (compute-size re-fires).
+        if (self.windows.get(surface)) |win| c.gtk_widget_queue_resize(@ptrCast(win.window));
+    }
+
+    /// GdkSurface exists now: report the CSD shadow as the toplevel's
+    /// shadow width. Connected AFTER GtkWindow's own compute-size
+    /// handler so ours wins (the default handler reports zero).
+    fn onWinRealize(window: ?*c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
+        const surface = c.gtk_native_get_surface(@ptrCast(window)) orelse return;
+        _ = c.g_signal_connect_data(@ptrCast(surface), "compute-size", @ptrCast(&onComputeSize), win, null, c.G_CONNECT_AFTER);
+    }
+
+    fn onComputeSize(_: ?*c.GdkToplevel, size: ?*c.GdkToplevelSize, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
+        const m = win.shadowMargins();
+        c.gdk_toplevel_size_set_shadow_width(size, m[0], m[1], m[2], m[3]);
+        // Maximize/fullscreen: the window allocation isn't settled when
+        // notify::maximized fires, so onWinResize reads a stale size and
+        // never tells the app to repaint (it just stretches the stale
+        // buffer, shadow and all). The toplevel bounds — the work area
+        // KWin hands us here — ARE the maximized geometry, so configure
+        // the app to that now and it repaints to fill.
+        const st = winStates(win);
+        if (!st.maximized and !st.fullscreen) return;
+        var bw: c_int = 0;
+        var bh: c_int = 0;
+        c.gdk_toplevel_size_get_bounds(size, &bw, &bh);
+        if (bw <= 0 or bh <= 0) return;
+        if (bw == win.sent_w and bh == win.sent_h) return;
+        win.sent_w = bw;
+        win.sent_h = bh;
+        win.host.comp.configureToplevel(win.surface, bw, bh, st) catch return;
+        win.host.flushHost();
     }
 
     fn onInputRegion(ctx: ?*anyopaque, surface: u32, rects: ?[]const @import("wlhost/compositor.zig").Rect) void {
@@ -651,11 +704,12 @@ pub const AppHost = struct {
             c.gdk_surface_set_input_region(gdk_surface, null);
             return;
         };
-        const geo = self.geos.get(surface) orelse [2]i32{ 0, 0 };
+        // Full buffer is shown, so input-region rects (surface coords)
+        // map straight to the host surface — no geometry offset.
         const region = c.cairo_region_create() orelse return;
         defer c.cairo_region_destroy(region);
         for (list) |r| {
-            var cr = c.cairo_rectangle_int_t{ .x = r.x - geo[0], .y = r.y - geo[1], .width = r.w, .height = r.h };
+            var cr = c.cairo_rectangle_int_t{ .x = r.x, .y = r.y, .width = r.w, .height = r.h };
             _ = c.cairo_region_union_rectangle(region, &cr);
         }
         c.gdk_surface_set_input_region(gdk_surface, region);
@@ -758,21 +812,24 @@ pub const AppHost = struct {
     fn onWinResize(_: ?*c.GtkWindow, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
         var st = winStates(win);
+        // Maximize/fullscreen sizing is driven from onComputeSize (the
+        // allocation isn't settled here). This handler owns the normal
+        // and unmaximize cases, where default-size tracks the target.
+        if (st.maximized or st.fullscreen) return;
+        st.resizing = true;
         var w: c_int = 0;
         var h: c_int = 0;
-        if (st.maximized or st.fullscreen) {
-            // default-size keeps the unmaximized size; the real
-            // allocation is what the app must fill.
-            w = c.gtk_widget_get_width(@ptrCast(win.window));
-            h = c.gtk_widget_get_height(@ptrCast(win.window));
-        } else {
-            st.resizing = true;
-            c.gtk_window_get_default_size(win.window, &w, &h);
-        }
+        c.gtk_window_get_default_size(win.window, &w, &h);
+        // GTK reports the full surface (buffer) size; the app wants its
+        // window-geometry size, so strip the shadow margins back off.
+        const m = win.shadowMargins();
+        w -= m[0] + m[1];
+        h -= m[2] + m[3];
         if (w <= 0 or h <= 0) return;
-        // Skip echoes of the size the app already drew (or that we
+        // Skip echoes of the geometry the app already drew (or that we
         // already asked for) — configure storms upset some clients.
-        if ((w == win.buf_w and h == win.buf_h) or (w == win.sent_w and h == win.sent_h)) return;
+        const geo = win.host.geos.get(win.surface) orelse [4]i32{ 0, 0, 0, 0 };
+        if ((w == geo[2] and h == geo[3]) or (w == win.sent_w and h == win.sent_h)) return;
         win.sent_w = w;
         win.sent_h = h;
         win.host.comp.configureToplevel(win.surface, w, h, st) catch return;
@@ -780,11 +837,12 @@ pub const AppHost = struct {
     }
 
     /// State-only change (focus in/out): configure at the current
-    /// size with fresh states — bypasses the size echo guard.
+    /// geometry size with fresh states — bypasses the size echo guard.
     fn onWinState(_: ?*c.GtkWindow, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
-        if (win.buf_w <= 0 or win.buf_h <= 0) return;
-        win.host.comp.configureToplevel(win.surface, win.buf_w, win.buf_h, winStates(win)) catch return;
+        const geo = win.host.geos.get(win.surface) orelse return;
+        if (geo[2] <= 0 or geo[3] <= 0) return;
+        win.host.comp.configureToplevel(win.surface, geo[2], geo[3], winStates(win)) catch return;
         win.host.flushHost();
     }
 

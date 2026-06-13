@@ -1243,39 +1243,33 @@ pub const Compositor = struct {
         surf.frame_cbs.clearRetainingCapacity();
     }
 
-    /// Copy the committed pixels tightly packed and hand them to
-    /// the view, CROPPED to the window geometry — the shadow margin
-    /// never leaves the compositor, so the host window's edges are
-    /// the app's real edges. Bounds are clamped, not trusted.
+    /// Copy the committed pixels tightly packed and hand them to the
+    /// view. Bounds are clamped against the mirror, not trusted.
+    ///
+    /// The FULL buffer is sent — CSD shadow included — so the host
+    /// shows the app's real drop shadow. The shadow is kept out of the
+    /// WM's window geometry (snapping/maximize hit the real edge) by
+    /// the view reporting it as the host toplevel's shadow width; the
+    /// committed window-geometry rect rides along via toplevel_geometry.
     fn pushFrame(self: *Compositor, sid: u32, info: Buffer) Error!void {
         const cb = self.view.toplevel_frame orelse return;
         const pool = self.pools.getPtr(info.pool) orelse return;
-        const surf = self.surfaces.get(sid) orelse return;
-        var gx: usize = 0;
-        var gy: usize = 0;
-        var gw: usize = @intCast(info.width);
-        var gh: usize = @intCast(info.height);
-        if (surf.geo.w > 0 and surf.geo.h > 0 and surf.geo.x >= 0 and surf.geo.y >= 0) {
-            gx = @min(@as(usize, @intCast(surf.geo.x)), gw);
-            gy = @min(@as(usize, @intCast(surf.geo.y)), gh);
-            gw = @min(@as(usize, @intCast(surf.geo.w)), gw - gx);
-            gh = @min(@as(usize, @intCast(surf.geo.h)), gh - gy);
-        }
-        if (gw == 0 or gh == 0) return;
+        const w: usize = @intCast(info.width);
+        const h: usize = @intCast(info.height);
         const stride: usize = @intCast(info.stride);
         const offset: usize = @intCast(info.offset);
-        const row_bytes = gw * 4;
-        try self.frame_scratch.resize(self.allocator, row_bytes * gh);
+        const row_bytes = w * 4;
+        try self.frame_scratch.resize(self.allocator, row_bytes * h);
         var y: usize = 0;
-        while (y < gh) : (y += 1) {
-            const src_start = offset + (gy + y) * stride + gx * 4;
+        while (y < h) : (y += 1) {
+            const src_start = offset + y * stride;
             if (src_start + row_bytes > pool.bytes.items.len) return; // stale mirror
             @memcpy(
                 self.frame_scratch.items[y * row_bytes ..][0..row_bytes],
                 pool.bytes.items[src_start..][0..row_bytes],
             );
         }
-        cb(self.view.ctx, sid, @intCast(gw), @intCast(gh), info.format, self.frame_scratch.items);
+        cb(self.view.ctx, sid, @intCast(w), @intCast(h), info.format, self.frame_scratch.items);
     }
 
     // ── server plumbing ─────────────────────────────────────────
