@@ -425,8 +425,9 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) bool {
         var h: i32 = 0;
         var sid: u32 = 0;
         var nonzero_px: bool = false;
-        fn onFrame(ctx: ?*anyopaque, surface: u32, fw: i32, fh: i32, format: u32, pixels: []const u8) void {
+        fn onFrame(ctx: ?*anyopaque, surface: u32, fw: i32, fh: i32, scale: i32, format: u32, pixels: []const u8) void {
             _ = ctx;
+            _ = scale;
             _ = format;
             frames += 1;
             sid = surface;
