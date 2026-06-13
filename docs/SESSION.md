@@ -5539,3 +5539,39 @@ Tooling: dist/deploy-macos.sh (build → sign → bootstrap agent),
 run from a GUI terminal. The earlier commits (capture shim, input,
 gating, frame-codec refactor, WindowServer fix) all stand; this is
 the validation + deployment layer. 550 tests, smoke-mux green.
+
+## 2026-06-13: macOS remote apps — transparent CLI + shared windows
+
+Closed the gaps between "the winstream backend works" and "you use it
+exactly like a Linux remote":
+
+- **Session parity** (daemon): winstreamGate now keys on a generic
+  "hosts_apps" notion instead of req.app, so on macOS a GUI app
+  launched from ANY durable session (a plain `sketerm mux` shell,
+  not just `sketerm app`) streams — the macOS equivalent of Linux's
+  per-session $WAYLAND_DISPLAY forwarding. `sketerm app <host> <cmd>`
+  was already OS-agnostic (runNativeApp → app session → GUI renders);
+  this widens it to durable shells too. SKETERM_WINSTREAM=off added
+  for the test rigs.
+- **Stable macOS socket**: runtimeDir() resolves the per-user temp
+  dir via confstr(_CS_DARWIN_USER_TEMP_DIR), not $TMPDIR — so the
+  GUI-session LaunchAgent and a non-interactive `--proxy` SSH bridge
+  agree on the default mux socket and actually find each other.
+- **Shared window chrome**: src/remote_window.zig now owns the
+  free-floating-dialog chrome (undecorated/transparent/taskbar/
+  identity/move-resize/texture) that BOTH wlapp.zig (Wayland) and
+  winapp.zig (winstream) build on — the winstream renderer is no
+  longer a primitive parallel system; its windows ARE the same
+  free-floating dialog as Wayland app windows. wlapp shrank 131
+  lines (de-duplicated); byte-for-byte extraction keeps the default
+  Linux path unchanged.
+- **Acceptance test**: dist/macos-winstream-check.sh self-checks a
+  Mac host (cert, capture-linked + signed daemon, default socket,
+  agent, cert-pinned TCC grants) then drives a live capture+input+
+  close round-trip.
+
+550 tests, smoke-mux, smoke-e2e, both portables green; mux stays
+GTK-free. PENDING (needs an unlocked GUI session / a Linux box — the
+validation Mac kept auto-locking): the Wayland AppHost VISUAL
+regression eyeball, the acceptance script's live leg, and a full
+Linux-client → Mac-app run.
