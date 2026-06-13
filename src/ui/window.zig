@@ -1899,11 +1899,27 @@ pub const Window = struct {
         self.panes.append(self.allocator, pane) catch return;
         self.terminals.append(self.allocator, pane.terminal) catch {};
         self.wirePaneSinks(pane);
-        // Re-point bindings, menu/shortcut sinks, bg/shader sources
-        // and push this window's config — the pane now renders under
-        // our atlas settings. Per-pane font zoom resets, same as a
-        // config reload.
-        self.applyPaneConfig(pane, .{});
+        // Re-point active_profile off the SOURCE window's config arena
+        // (which is freed on its next applyConfigChange / deinit) onto
+        // a name owned by OUR arena — same pattern as applyConfigChange.
+        // The source name is still valid here (source window is alive),
+        // so capture it before re-pointing. No matching profile in this
+        // window → drop to Default (null).
+        if (pane.active_profile) |pn| {
+            pane.active_profile = null;
+            for (self.config.profiles.items) |*pr| {
+                if (std.mem.eql(u8, pr.name, pn)) {
+                    pane.active_profile = pr.name;
+                    break;
+                }
+            }
+        }
+        // Re-point bindings, menu/shortcut sinks, bg/shader sources and
+        // push this window's config, resolving the pane's profile BY
+        // NAME so it keeps its font/colors/scrollback. The pane now
+        // renders under our atlas settings; per-pane font zoom resets,
+        // same as a config reload.
+        self.applyPaneConfigByName(pane);
     }
 
     /// Walk a transferred page's widget tree and adopt every pane in
