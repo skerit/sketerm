@@ -10,6 +10,7 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const cast = @import("util/cast.zig");
 const proto = @import("winstream/proto.zig");
+const rw = @import("remote_window.zig");
 
 pub const WsHost = struct {
     allocator: std.mem.Allocator,
@@ -118,9 +119,8 @@ pub const WsHost = struct {
 
     fn showFrame(self: *WsHost, id: u32, w: i32, h: i32, pixels: []const u8) void {
         const win = self.winFor(id, w, h, "remote window") orelse return;
-        const gbytes = c.g_bytes_new(pixels.ptr, pixels.len) orelse return;
-        defer c.g_bytes_unref(gbytes);
-        const tex = c.gdk_memory_texture_new(w, h, c.GDK_MEMORY_B8G8R8A8_PREMULTIPLIED, gbytes, @intCast(w * 4)) orelse return;
+        // 0 = premultiplied BGRA — what the winstream agent sends.
+        const tex = rw.newTexture(w, h, 0, pixels) orelse return;
         defer c.g_object_unref(tex);
         c.gtk_picture_set_paintable(@ptrCast(win.picture), @ptrCast(tex));
     }
@@ -128,16 +128,18 @@ pub const WsHost = struct {
     fn winFor(self: *WsHost, id: u32, w: i32, h: i32, title: []const u8) ?*Win {
         if (self.windows.get(id)) |win| return win;
         const win = self.allocator.create(Win) catch return null;
-        const window: *c.GtkWindow = @ptrCast(c.gtk_window_new());
-        const picture = c.gtk_picture_new();
-        c.gtk_picture_set_content_fit(@ptrCast(picture), c.GTK_CONTENT_FIT_FILL);
+        // Same free-floating chrome as a Wayland app window —
+        // undecorated (the macOS title bar is in the captured
+        // pixels), transparent, taskbar-joined. See remote_window.zig.
         var tbuf: [256:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&tbuf, "{s}", .{title})) |z| {
-            c.gtk_window_set_title(window, z.ptr);
-        } else |_| {}
-        c.gtk_window_set_default_size(window, w, h);
-        c.gtk_window_set_child(window, picture);
-        win.* = .{ .host = self, .id = id, .window = window, .picture = picture.? };
+        const tz: [:0]const u8 = std.fmt.bufPrintZ(&tbuf, "{s}", .{title}) catch "remote app";
+        const widgets = rw.create(tz, w, h, false) orelse {
+            self.allocator.destroy(win);
+            return null;
+        };
+        const window = widgets.window;
+        const picture = widgets.picture;
+        win.* = .{ .host = self, .id = id, .window = window, .picture = picture };
         self.windows.put(self.allocator, id, win) catch {
             c.gtk_window_destroy(window);
             self.allocator.destroy(win);

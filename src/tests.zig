@@ -69,6 +69,7 @@ comptime {
     _ = @import("winstream/proto.zig");
     _ = @import("winstream/source.zig");
     _ = @import("winstream/keymap.zig");
+    _ = @import("remote_window.zig");
 }
 
 test {

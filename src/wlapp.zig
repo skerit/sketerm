@@ -12,16 +12,11 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
-const builtin = @import("builtin");
-
-// Backend-specific identity calls; the headers are too heavy for
-// the cimport set, so declare the handful of symbols directly.
-// Referenced only on Linux (comptime-gated) — they resolve there.
-extern fn gdk_wayland_toplevel_set_application_id(toplevel: ?*c.GdkSurface, application_id: [*:0]const u8) void;
-extern fn gdk_x11_display_get_xdisplay(display: ?*c.GdkDisplay) ?*anyopaque;
-extern fn gdk_x11_surface_get_xid(surface: ?*c.GdkSurface) c_ulong;
-extern fn XChangeProperty(dpy: ?*anyopaque, win: c_ulong, prop: c_ulong, kind: c_ulong, format: c_int, mode: c_int, data: [*]const u8, n: c_int) c_int;
 const cast = @import("util/cast.zig");
+// Shared free-floating-window chrome (creation, transparent CSS, app
+// identity, move/resize, texture) — identical to what the winstream
+// renderer uses, so the two stay byte-for-byte the same window.
+const rw = @import("remote_window.zig");
 const Compositor = @import("wlhost/compositor.zig").Compositor;
 
 pub const AppHost = struct {
@@ -103,21 +98,6 @@ pub const AppHost = struct {
         }
     };
 
-    /// CSD apps carry alpha (drop shadows, rounded corners) in
-    /// their buffers; the host window must not paint a background
-    /// behind it or shadows composite onto theme gray.
-    fn ensureTransparentCss() void {
-        const S = struct {
-            var done: bool = false;
-        };
-        if (S.done) return;
-        S.done = true;
-        const display = c.gdk_display_get_default() orelse return;
-        const provider = c.gtk_css_provider_new();
-        c.gtk_css_provider_load_from_string(provider, "window.sketerm-remote-app { background: transparent; }");
-        c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-        c.g_object_unref(provider);
-    }
 
     /// Stamp the compositor clock (frame-callback and input event
     /// timestamps) from the GLib monotonic clock.
@@ -210,22 +190,10 @@ pub const AppHost = struct {
 
     // ── view callbacks (main thread — GTK is safe) ──────────────
 
-    fn newTexture(w: i32, h: i32, format: u32, pixels: []const u8) ?*c.GdkTexture {
-        // wl_shm: 0 = argb8888 (premultiplied), 1 = xrgb8888 — both
-        // little-endian BGRA in memory.
-        const gdk_format: c.GdkMemoryFormat = if (format == 1)
-            c.GDK_MEMORY_B8G8R8X8
-        else
-            c.GDK_MEMORY_B8G8R8A8_PREMULTIPLIED;
-        const gbytes = c.g_bytes_new(pixels.ptr, pixels.len) orelse return null;
-        defer c.g_bytes_unref(gbytes);
-        return c.gdk_memory_texture_new(w, h, gdk_format, gbytes, @intCast(w * 4));
-    }
-
     fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, format: u32, pixels: []const u8) void {
         const self = cast.userData(AppHost, ctx);
         if (self.popups.get(surface)) |popup| {
-            const tex = newTexture(w, h, format, pixels) orelse return;
+            const tex = rw.newTexture(w, h, format, pixels) orelse return;
             defer c.g_object_unref(tex);
             c.gtk_widget_set_size_request(popup.picture, w, h);
             c.gtk_picture_set_paintable(@ptrCast(popup.picture), @ptrCast(tex));
@@ -246,7 +214,7 @@ pub const AppHost = struct {
         const win = self.winFor(surface, w, h) orelse return;
         win.buf_w = w;
         win.buf_h = h;
-        const tex = newTexture(w, h, format, pixels) orelse return;
+        const tex = rw.newTexture(w, h, format, pixels) orelse return;
         defer c.g_object_unref(tex);
         c.gtk_picture_set_paintable(@ptrCast(win.picture), @ptrCast(tex));
     }
@@ -358,38 +326,7 @@ pub const AppHost = struct {
             }) |old| self.allocator.free(old.value);
             return;
         };
-        applyAppId(win, app_id);
-    }
-
-    /// Desktop identity: app ids double as icon names by convention
-    /// (org.gnome.Calculator etc.), and the window itself gets the
-    /// remote app's identity so taskbars group/iconify it as that
-    /// app instead of as sketerm.
-    fn applyAppId(win: *Win, app_id: []const u8) void {
-        var buf: [256:0]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&buf, "{s}", .{app_id}) catch return;
-        c.gtk_window_set_icon_name(win.window, z.ptr);
-        if (comptime !builtin.os.tag.isDarwin()) {
-            const display = c.gdk_display_get_default() orelse return;
-            const surface = c.gtk_native_get_surface(@ptrCast(win.window)) orelse return;
-            const backend = std.mem.span(c.g_type_name_from_instance(@ptrCast(@alignCast(display))));
-            if (std.mem.indexOf(u8, backend, "Wayland") != null) {
-                gdk_wayland_toplevel_set_application_id(surface, z.ptr);
-            } else if (std.mem.indexOf(u8, backend, "X11") != null) {
-                const xdpy = gdk_x11_display_get_xdisplay(display) orelse return;
-                const xid = gdk_x11_surface_get_xid(surface);
-                if (xid == 0) return;
-                // WM_CLASS (atom 67), XA_STRING (31), PropModeReplace:
-                // "instance\0class\0".
-                var cls: [520]u8 = undefined;
-                const n = @min(z.len, 255);
-                @memcpy(cls[0..n], z[0..n]);
-                cls[n] = 0;
-                @memcpy(cls[n + 1 ..][0..n], z[0..n]);
-                cls[n + 1 + n] = 0;
-                _ = XChangeProperty(xdpy, xid, 67, 31, 8, 0, &cls, @intCast(2 * n + 2));
-            }
-        }
+        rw.applyAppId(win.window, app_id);
     }
 
     fn onGone(ctx: ?*anyopaque, surface: u32) void {
@@ -407,25 +344,16 @@ pub const AppHost = struct {
         if (self.windows.get(surface)) |win| return win;
 
         const win = self.allocator.create(Win) catch return null;
-        const window: *c.GtkWindow = @ptrCast(c.gtk_window_new());
-        const picture = c.gtk_picture_new();
-        c.gtk_window_set_title(window, "remote app");
-        ensureTransparentCss();
-        c.gtk_widget_add_css_class(@ptrCast(window), "sketerm-remote-app");
-        // App-less windows are invisible to some taskbars/switchers.
-        if (c.g_application_get_default()) |app| {
-            c.gtk_application_add_window(@ptrCast(app), window);
-        }
-        // Undecorated unless the app asked for host decorations —
-        // Wayland apps default to drawing their own chrome, and a
-        // second titlebar around it looks broken.
-        c.gtk_window_set_decorated(window, @intFromBool(self.pending_ssd.get(surface) orelse false));
-        c.gtk_window_set_default_size(window, w, h);
-        const overlay = c.gtk_overlay_new();
-        c.gtk_overlay_set_child(@ptrCast(overlay), picture);
-        c.gtk_window_set_child(window, overlay);
-        c.gtk_picture_set_content_fit(@ptrCast(picture), c.GTK_CONTENT_FIT_FILL);
-        win.* = .{ .host = self, .surface = surface, .window = window, .overlay = overlay.?, .picture = picture.? };
+        // Same free-floating chrome the winstream renderer builds —
+        // undecorated (unless the app negotiated host decorations),
+        // transparent, taskbar-joined. See remote_window.zig.
+        const widgets = rw.create("remote app", w, h, self.pending_ssd.get(surface) orelse false) orelse {
+            self.allocator.destroy(win);
+            return null;
+        };
+        const window = widgets.window;
+        const picture = widgets.picture;
+        win.* = .{ .host = self, .surface = surface, .window = window, .overlay = widgets.overlay, .picture = picture };
         self.windows.put(self.allocator, surface, win) catch {
             c.gtk_window_destroy(window);
             self.allocator.destroy(win);
@@ -439,7 +367,7 @@ pub const AppHost = struct {
             self.allocator.free(kv.value);
         }
         if (self.pending_app_ids.fetchRemove(surface)) |kv| {
-            applyAppId(win, kv.value);
+            rw.applyAppId(win.window, kv.value);
             self.allocator.free(kv.value);
         }
         _ = c.g_object_set_data(@ptrCast(window), "sketerm-wlapp", win);
@@ -690,32 +618,13 @@ pub const AppHost = struct {
     fn onMove(ctx: ?*anyopaque, surface: u32) void {
         const self = cast.userData(AppHost, ctx);
         const win = self.windows.get(surface) orelse return;
-        const display = c.gdk_display_get_default() orelse return;
-        const device = c.gdk_seat_get_pointer(c.gdk_display_get_default_seat(display)) orelse return;
-        const gdk_surface = c.gtk_native_get_surface(@ptrCast(win.window)) orelse return;
-        c.gdk_toplevel_begin_move(@ptrCast(gdk_surface), device, @intCast(win.press_btn), win.press_x, win.press_y, 0);
+        rw.beginMove(win.window, win.press_btn, win.press_x, win.press_y);
     }
 
     fn onResize(ctx: ?*anyopaque, surface: u32, edges: u32) void {
         const self = cast.userData(AppHost, ctx);
         const win = self.windows.get(surface) orelse return;
-        const display = c.gdk_display_get_default() orelse return;
-        const device = c.gdk_seat_get_pointer(c.gdk_display_get_default_seat(display)) orelse return;
-        const gdk_surface = c.gtk_native_get_surface(@ptrCast(win.window)) orelse return;
-        // wayland edge bits (1 top, 2 bottom, 4 left, 8 right) →
-        // GdkSurfaceEdge enum.
-        const edge: c.GdkSurfaceEdge = switch (edges) {
-            1 => c.GDK_SURFACE_EDGE_NORTH,
-            2 => c.GDK_SURFACE_EDGE_SOUTH,
-            4 => c.GDK_SURFACE_EDGE_WEST,
-            5 => c.GDK_SURFACE_EDGE_NORTH_WEST,
-            6 => c.GDK_SURFACE_EDGE_SOUTH_WEST,
-            8 => c.GDK_SURFACE_EDGE_EAST,
-            9 => c.GDK_SURFACE_EDGE_NORTH_EAST,
-            10 => c.GDK_SURFACE_EDGE_SOUTH_EAST,
-            else => return,
-        };
-        c.gdk_toplevel_begin_resize(@ptrCast(gdk_surface), edge, device, @intCast(win.press_btn), win.press_x, win.press_y, 0);
+        rw.beginResize(win.window, edges, win.press_btn, win.press_x, win.press_y);
     }
 
     fn onDecoration(ctx: ?*anyopaque, surface: u32, ssd: bool) void {
