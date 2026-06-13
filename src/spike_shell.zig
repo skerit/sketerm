@@ -52,7 +52,7 @@ pub fn main() u8 {
         "echo done",
     };
     var pty = Pty.spawn(.{ .argv = &argv, .rows = 24, .cols = 80 }) catch return 1;
-    defer pty.closeAndReap();
+    defer _ = pty.closeAndReap();
 
     var pool = StylePool.init(allocator) catch return 1;
     defer pool.deinit();

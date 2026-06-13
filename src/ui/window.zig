@@ -1310,7 +1310,7 @@ pub const Window = struct {
                     .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
                     .shell_integration = self.shellIntegrationFor(argv_buf[0]),
                 });
-                errdefer pty.closeAndReap();
+                errdefer _ = pty.closeAndReap();
 
                 const term = try Terminal.init(self.allocator, pty, 80, 24);
                 errdefer term.deinit();
@@ -1411,7 +1411,7 @@ pub const Window = struct {
             .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
             .shell_integration = self.shellIntegrationFor(argv[0]),
         });
-        errdefer pty.closeAndReap();
+        errdefer _ = pty.closeAndReap();
 
         const term = try Terminal.init(self.allocator, pty, 80, 24);
         errdefer term.deinit();
@@ -1626,7 +1626,7 @@ pub const Window = struct {
             .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
             .shell_integration = self.shellIntegrationFor(argv[0]),
         });
-        errdefer pty.closeAndReap();
+        errdefer _ = pty.closeAndReap();
 
         const term = try Terminal.init(self.allocator, pty, 80, 24);
         errdefer term.deinit();

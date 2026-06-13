@@ -122,7 +122,7 @@ const Session = struct {
             if (pathZ(&z_buf, p)) |z| _ = c.unlink(z) else |_| {}
             self.allocator.free(p);
         }
-        self.pty.closeAndReap();
+        if (self.pty.closeAndReap()) |code| self.exit_status = code;
         self.parser.deinit();
         self.screen.deinit();
         self.pool.deinit();
@@ -924,9 +924,17 @@ pub const Daemon = struct {
                 const sz: usize = @intCast(p.size);
                 const ptr = c.mmap(null, sz, c.PROT_READ, c.MAP_SHARED, fd, 0);
                 if (ptr == null or ptr == c.MAP_FAILED) return error.MapFailed;
-                try nv.pools.put(a, p.id, .{ .fd = fd, .ptr = @ptrCast(ptr.?), .size = sz });
+                // munmap before close on the failure path, matching the
+                // teardown order in Native.deinit (errdefers run LIFO,
+                // and the fd's close errdefer was registered earlier).
+                // Emit the pipe units FIRST so the only remaining
+                // fallible step is pools.put: once put succeeds the map
+                // owns the mapping (deinit frees it) and this errdefer
+                // no longer fires.
+                errdefer _ = c.munmap(@ptrCast(ptr.?), sz);
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
                 try wlpipe.appendPoolMeta(units, a, .pool_create, p.id, @intCast(sz));
+                try nv.pools.put(a, p.id, .{ .fd = fd, .ptr = @ptrCast(ptr.?), .size = sz });
             },
             .pool_resize => |p| {
                 const mirror = nv.pools.getPtr(p.id) orelse return error.NoSuchPool;
@@ -1430,7 +1438,7 @@ pub const Daemon = struct {
             .cols = req.cols,
             .wayland_display = if (wl_disp_z) |z| z.ptr else null,
         });
-        errdefer pty.closeAndReap();
+        errdefer _ = pty.closeAndReap();
         // The poll loop does bounded read rounds — master must not
         // block (the GUI's dedicated reader thread blocks; we can't).
         const fl = c.fcntl(pty.master_fd, c.F_GETFL, @as(c_int, 0));
@@ -1744,6 +1752,12 @@ pub const Daemon = struct {
     fn sessionExited(self: *Daemon, s: *Session) void {
         if (s.exited) return;
         s.exited = true;
+        // We reach here on PTY EOF/EIO: the child has exited but is
+        // not yet waited. Reap it now (non-blocking) so the .exit
+        // frame carries the real WEXITSTATUS instead of the default 0.
+        // If it isn't reapable yet, leave the default — the teardown
+        // path (Session.deinit → closeAndReap) will wait it later.
+        if (s.pty.reap()) |code| s.exit_status = code;
         var st: [4]u8 = undefined;
         std.mem.writeInt(i32, &st, s.exit_status, .little);
         // Deliver the exit, then force-detach: nothing will ever flow

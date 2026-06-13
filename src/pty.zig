@@ -235,23 +235,55 @@ pub const Pty = struct {
         _ = c.ioctl(self.master_fd, c.TIOCSWINSZ, &ws);
     }
 
+    /// Decode a raw `waitpid` status into the WEXITSTATUS-style code
+    /// (or -signo for fatal signals). Same convention as the GUI's
+    /// `Terminal.reapStatus` — keep the two in lockstep.
+    pub fn decodeStatus(status: c_int) i32 {
+        if ((status & 0x7F) == 0) return @intCast((status >> 8) & 0xFF); // WIFEXITED
+        return -@as(i32, @intCast(status & 0x7F)); // WIFSIGNALED → -signo
+    }
+
+    /// Non-blocking reap of an already-exited child. Returns the
+    /// decoded exit status, or null if the child isn't reapable yet
+    /// (still running, no such pid, or a remote pty with child_pid<=0,
+    /// where waitpid(-1) would reap arbitrary children — never do
+    /// that). Idempotent enough for the EOF path: once the kernel has
+    /// reaped, a second call just returns null.
+    pub fn reap(self: *Pty) ?i32 {
+        if (self.child_pid <= 0) return null;
+        var status: c_int = 0;
+        const r = c.waitpid(self.child_pid, &status, c.WNOHANG);
+        if (r != self.child_pid) return null;
+        // Mark reaped so a later closeAndReap can't waitpid/signal the
+        // (now potentially recycled) pid. Today the two calls share one
+        // fork-free poll iteration, but make the invariant explicit.
+        self.child_pid = -1;
+        return decodeStatus(status);
+    }
+
     /// Close master and reap child. Closing the master delivers SIGHUP
     /// to the child via the kernel; most shells exit immediately. If
     /// the child ignores SIGHUP we escalate to TERM, then KILL.
-    pub fn closeAndReap(self: *Pty) void {
+    /// Returns the decoded exit status (WEXITSTATUS / -signo), or null
+    /// if the child could not be reaped (already gone, ECHILD, …).
+    pub fn closeAndReap(self: *Pty) ?i32 {
         self.releaseWriteResources();
         _ = c.close(self.master_fd);
+        // No child to reap: a remote pty (child_pid == -1) or one already
+        // reaped via reap(). Bail BEFORE waitpid — waitpid(-1) would reap
+        // an arbitrary unrelated child (e.g. another mux session's).
+        if (self.child_pid <= 0) return null;
         var status: c_int = 0;
         // Phase 1: poll for natural exit (~300 ms total).
         var i: u32 = 0;
         while (i < 30) : (i += 1) {
             const r = c.waitpid(self.child_pid, &status, c.WNOHANG);
-            if (r == self.child_pid) return;
+            if (r == self.child_pid) return decodeStatus(status);
             if (r < 0) {
                 // EINTR — try again. Other errors (ECHILD = no such
                 // child, EINVAL etc.) mean we can't reap; bail.
                 if (std.posix.errno(r) == .INTR) continue;
-                return;
+                return null;
             }
             _ = c.usleep(10 * 1000);
         }
@@ -260,10 +292,10 @@ pub const Pty = struct {
         i = 0;
         while (i < 20) : (i += 1) {
             const r = c.waitpid(self.child_pid, &status, c.WNOHANG);
-            if (r == self.child_pid) return;
+            if (r == self.child_pid) return decodeStatus(status);
             if (r < 0) {
                 if (std.posix.errno(r) == .INTR) continue;
-                return;
+                return null;
             }
             _ = c.usleep(10 * 1000);
         }
@@ -271,9 +303,9 @@ pub const Pty = struct {
         _ = c.kill(self.child_pid, c.SIGKILL);
         while (true) {
             const r = c.waitpid(self.child_pid, &status, 0);
-            if (r == self.child_pid) return;
+            if (r == self.child_pid) return decodeStatus(status);
             if (r < 0 and std.posix.errno(r) == .INTR) continue;
-            return;
+            return null;
         }
     }
 
@@ -296,7 +328,10 @@ pub const Pty = struct {
     pub fn closeAndReapAsync(self: *Pty) void {
         // Without a GLib main loop (sketerm-mux) there is nothing to
         // schedule the Reaper on — block briefly instead.
-        if (comptime !build_options.glib) return self.closeAndReap();
+        if (comptime !build_options.glib) {
+            _ = self.closeAndReap();
+            return;
+        }
         // Drop the POLLOUT watch + queued bytes BEFORE closing the
         // master fd — once closed, the watch's callback could fire
         // one more time and dereference a freed Pty otherwise. The
@@ -318,7 +353,7 @@ pub const Pty = struct {
             // Allocation failure — fall back to the blocking path.
             // Better to freeze the UI briefly than leak a child.
             var sync_pty = Pty{ .master_fd = -1, .child_pid = self.child_pid };
-            sync_pty.closeAndReap();
+            _ = sync_pty.closeAndReap();
             return;
         };
         reaper.* = .{ .pid = self.child_pid, .attempts = 0 };
