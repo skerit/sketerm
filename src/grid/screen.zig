@@ -1012,12 +1012,24 @@ pub const Screen = struct {
 
         const cols_changed = new_cols != self.cols;
         if (cols_changed and !self.use_alt) {
+            // reflowMain clears the (row, col)-keyed cluster map itself.
             try self.reflowMain(new_cols, new_rows);
         } else {
+            // resizeBuffer truncates/pads each line and shifts cells to
+            // new (row, col) positions (column resize, and row-count
+            // changes move cells to new row indices). The cluster map is
+            // keyed by (row, col), so drop it wholesale — same coarse
+            // approach reflowMain takes. Covers the main-buffer
+            // truncate/pad path and the alt buffer below.
+            self.clearAllClusters();
             try resizeBuffer(self.allocator, &self.active, self.rows, new_cols, new_rows, !self.use_alt, self);
         }
         if (self.alt) |alt_buf| {
             var alt_mut = alt_buf;
+            // Alt buffer always truncates/pads via resizeBuffer; if the
+            // reflowMain branch ran above, the cluster map is already
+            // cleared, so this is at worst a no-op fast-path return.
+            self.clearAllClusters();
             try resizeBuffer(self.allocator, &alt_mut, self.rows, new_cols, new_rows, false, self);
             self.alt = alt_mut;
         }
@@ -2892,6 +2904,10 @@ pub const Screen = struct {
 
         // IRM (insert mode) — shift cells right by `width` before placing.
         if (self.insert_mode and self.col < self.cols) {
+            // Shifted cells change column; clusters are keyed by (row, col)
+            // and would point at the wrong cells afterwards (matches the
+            // ICH/DCH clear-range approach).
+            if (self.clusters.count() > 0) self.clearClustersRange(self.row, self.col, self.cols);
             var k: u16 = self.cols;
             while (k > self.col + width) : (k -= 1) {
                 ln.cells[k - 1] = ln.cells[k - 1 - width];
