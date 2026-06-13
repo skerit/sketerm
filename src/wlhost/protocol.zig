@@ -113,6 +113,28 @@ pub const wl_compositor = Interface{
     },
 };
 
+pub const wl_subcompositor = Interface{
+    .name = "wl_subcompositor",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "get_subsurface", .sig = "noo", .new_id_iface = &wl_subsurface },
+    },
+};
+
+pub const wl_subsurface = Interface{
+    .name = "wl_subsurface",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "set_position", .sig = "ii" },
+        .{ .name = "place_above", .sig = "o" },
+        .{ .name = "place_below", .sig = "o" },
+        .{ .name = "set_sync", .sig = "" },
+        .{ .name = "set_desync", .sig = "" },
+    },
+};
+
 pub const wl_shm = Interface{
     .name = "wl_shm",
     .version = 2,
@@ -506,6 +528,7 @@ pub const xdg_popup = Interface{
 
 pub const all = [_]*const Interface{
     &wl_display,     &wl_registry,    &wl_callback,    &wl_compositor,
+    &wl_subcompositor, &wl_subsurface,
     &wl_shm,         &wl_shm_pool,    &wl_buffer,      &wl_surface,
     &wl_region,      &wl_seat,        &wl_pointer,     &wl_keyboard,
     &wl_touch,       &wl_output,      &xdg_wm_base,    &xdg_positioner,
@@ -525,7 +548,7 @@ test "find resolves every table entry, rejects unknowns" {
     for (all) |iface| {
         try t.expectEqual(iface, find(iface.name).?);
     }
-    try t.expectEqual(@as(?*const Interface, null), find("wl_subcompositor"));
+    try t.expectEqual(@as(?*const Interface, null), find("gtk_shell1"));
 }
 
 test "fd counting" {

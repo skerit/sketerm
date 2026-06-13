@@ -62,6 +62,13 @@ pub const View = struct {
     /// PARENT surface's coordinate space.
     popup_new: ?*const fn (ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void = null,
     popup_gone: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
+    /// A surface gained the subsurface role: render it as a child of
+    /// `parent` at (x, y) in the parent's coordinate space (GTK3
+    /// tooltips / tree-view type-ahead). `subsurface_pos` updates the
+    /// offset; frames arrive via toplevel_frame like any surface.
+    subsurface_new: ?*const fn (ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void = null,
+    subsurface_pos: ?*const fn (ctx: ?*anyopaque, surface: u32, x: i32, y: i32) void = null,
+    subsurface_gone: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
     /// The app announced a clipboard selection with a usable text
     /// mime. Call fetchClipboard to pull the content.
     clipboard_offer: ?*const fn (ctx: ?*anyopaque, source: u32, mime: []const u8) void = null,
@@ -112,6 +119,10 @@ const Global = struct {
 /// obliges events we don't implement.
 const globals = [_]Global{
     .{ .name = 1, .iface = &protocol.wl_compositor, .version = 4 },
+    // GTK3 maps tooltips / tree-view type-ahead popups as subsurfaces;
+    // without this its GdkDisplay->subcompositor is NULL and it crashes
+    // (wl_proxy_get_version(NULL)) the first time it shows one.
+    .{ .name = 11, .iface = &protocol.wl_subcompositor, .version = 1 },
     .{ .name = 2, .iface = &protocol.wl_shm, .version = 1 },
     // v4: keyboards get repeat_info — held keys repeat client-side.
     .{ .name = 3, .iface = &protocol.wl_seat, .version = 4 },
@@ -155,6 +166,11 @@ const Surface = struct {
     toplevel: u32 = 0,
     /// xdg_popup id when this surface is a popup.
     popup: u32 = 0,
+    /// Parent surface id when this surface is a subsurface (0 = not).
+    /// Position is in the parent's coordinate space.
+    subparent: u32 = 0,
+    sub_x: i32 = 0,
+    sub_y: i32 = 0,
     /// Popup placement (parent surface coords) from the positioner.
     parent: u32 = 0,
     px: i32 = 0,
@@ -236,6 +252,8 @@ pub const Compositor = struct {
     surfaces: std.AutoHashMapUnmanaged(u32, Surface) = .empty,
     /// xdg_surface id → wl_surface id; xdg_toplevel id → wl_surface id.
     xdg_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// wl_subsurface id → wl_surface id (the surface it gave the role to).
+    sub_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     positioners: std.AutoHashMapUnmanaged(u32, Positioner) = .empty,
     /// Surface id of the popup holding an explicit grab (0 = none).
     grabbed_popup: u32 = 0,
@@ -288,6 +306,7 @@ pub const Compositor = struct {
         }
         self.surfaces.deinit(a);
         self.xdg_map.deinit(a);
+        self.sub_map.deinit(a);
         self.positioners.deinit(a);
         var rit = self.regions.valueIterator();
         while (rit.next()) |r| r.deinit(a);
@@ -692,6 +711,43 @@ pub const Compositor = struct {
                 try self.register(id, &protocol.wl_region);
             },
             else => return Error.Protocol,
+        } else if (iface == &protocol.wl_subcompositor) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object), // destroy
+            1 => { // get_subsurface(id, surface, parent)
+                const id = (try it.next()).?.new_id;
+                const sid = (try it.next()).?.object;
+                const parent = (try it.next()).?.object;
+                try self.register(id, &protocol.wl_subsurface);
+                try self.sub_map.put(self.allocator, id, sid);
+                if (self.surfaces.getPtr(sid)) |surf| {
+                    surf.subparent = parent;
+                    if (self.view.subsurface_new) |cb| cb(self.view.ctx, sid, parent, 0, 0);
+                }
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wl_subsurface) switch (hdr.opcode) {
+            0 => { // destroy
+                if (self.sub_map.fetchRemove(hdr.object)) |kv| {
+                    if (self.surfaces.getPtr(kv.value)) |surf| surf.subparent = 0;
+                    if (self.view.subsurface_gone) |cb| cb(self.view.ctx, kv.value);
+                }
+                try self.destroyObject(hdr.object);
+            },
+            1 => { // set_position(x, y) — parent-relative, applied live
+                const x = (try it.next()).?.int;
+                const y = (try it.next()).?.int;
+                const sid = self.sub_map.get(hdr.object) orelse return;
+                if (self.surfaces.getPtr(sid)) |surf| {
+                    surf.sub_x = x;
+                    surf.sub_y = y;
+                }
+                if (self.view.subsurface_pos) |cb| cb(self.view.ctx, sid, x, y);
+            },
+            // place_above / place_below / set_sync / set_desync: the
+            // full-copy view stacks subsurfaces above the parent and
+            // commits them immediately, so these are no-ops.
+            2, 3, 4, 5 => {},
+            else => return Error.Protocol,
         } else if (iface == &protocol.wl_region) switch (hdr.opcode) {
             0 => { // destroy
                 if (self.regions.getPtr(hdr.object)) |r| {
@@ -1014,6 +1070,9 @@ pub const Compositor = struct {
                     if (self.grabbed_popup == hdr.object) self.grabbed_popup = 0;
                     if (self.view.popup_gone) |cb| cb(self.view.ctx, hdr.object);
                 }
+                if (surf.subparent != 0) {
+                    if (self.view.subsurface_gone) |cb| cb(self.view.ctx, hdr.object);
+                }
                 if (self.pointer_focus == hdr.object) self.pointer_focus = 0;
                 if (self.keyboard_focus == hdr.object) self.keyboard_focus = 0;
                 surf.frame_cbs.deinit(self.allocator);
@@ -1219,11 +1278,11 @@ pub const Compositor = struct {
 
         if (took_buffer and surf.committed_buffer != 0) {
             if (self.buffers.get(surf.committed_buffer)) |info| {
-                // Only mapped surfaces (toplevel/popup role) reach
-                // the view — cursor surfaces (set_cursor, no xdg
-                // role) commit buffers too and must NOT become
-                // windows.
-                if (surf.toplevel != 0 or surf.popup != 0) try self.pushFrame(sid, info);
+                // Only mapped surfaces (toplevel/popup/subsurface role)
+                // reach the view — cursor surfaces (set_cursor, no role)
+                // commit buffers too and must NOT become windows.
+                if (surf.toplevel != 0 or surf.popup != 0 or surf.subparent != 0)
+                    try self.pushFrame(sid, info);
                 // Released immediately: pixels were copied out (or
                 // ignored — either way we won't read them later).
                 var buf: [8]u8 = undefined;
@@ -1384,6 +1443,11 @@ const TestView = struct {
     popup_x: i32 = 0,
     popup_y: i32 = 0,
     popup_parent: u32 = 0,
+    subs: usize = 0,
+    subs_gone: usize = 0,
+    sub_x: i32 = 0,
+    sub_y: i32 = 0,
+    sub_parent: u32 = 0,
     clip_source: u32 = 0,
     clip_mime: [64]u8 = undefined,
     clip_mime_len: usize = 0,
@@ -1435,6 +1499,26 @@ const TestView = struct {
         self.popups_gone += 1;
     }
 
+    fn onSubNew(ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void {
+        _ = surface;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.subs += 1;
+        self.sub_parent = parent;
+        self.sub_x = x;
+        self.sub_y = y;
+    }
+    fn onSubPos(ctx: ?*anyopaque, surface: u32, x: i32, y: i32) void {
+        _ = surface;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.sub_x = x;
+        self.sub_y = y;
+    }
+    fn onSubGone(ctx: ?*anyopaque, surface: u32) void {
+        _ = surface;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.subs_gone += 1;
+    }
+
     fn onClipOffer(ctx: ?*anyopaque, source: u32, mime: []const u8) void {
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
         self.clip_source = source;
@@ -1475,6 +1559,9 @@ const TestView = struct {
             .toplevel_gone = onGone,
             .popup_new = onPopupNew,
             .popup_gone = onPopupGone,
+            .subsurface_new = onSubNew,
+            .subsurface_pos = onSubPos,
+            .subsurface_gone = onSubGone,
             .clipboard_offer = onClipOffer,
             .clipboard_data = onClipData,
             .clipboard_read = onClipRead,
@@ -1528,6 +1615,69 @@ test "registry dance announces our globals" {
         pos += p.consumed;
     }
     try t.expectEqual(globals.len, seen);
+}
+
+test "subsurface: get_subsurface, set_position, destroy" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [128]u8 = undefined;
+
+    { // get_registry(2)
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&comp, try b.finish());
+    }
+    { // bind wl_compositor(name 1) → id 3
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(1);
+        b.putString("wl_compositor");
+        b.putUint(4);
+        b.putNewId(3);
+        try req(&comp, try b.finish());
+    }
+    { // bind wl_subcompositor(name 11) → id 4
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(11);
+        b.putString("wl_subcompositor");
+        b.putUint(1);
+        b.putNewId(4);
+        try req(&comp, try b.finish());
+    }
+    { // create_surface → parent 5
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(5);
+        try req(&comp, try b.finish());
+    }
+    { // create_surface → child 6
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+    }
+    { // get_subsurface(id 7, surface 6, parent 5)
+        var b = wire.Builder.init(&buf, 4, 1);
+        b.putNewId(7);
+        b.putObject(6);
+        b.putObject(5);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.subs);
+    try t.expectEqual(@as(u32, 5), tv.sub_parent);
+
+    { // wl_subsurface.set_position(40, 60)
+        var b = wire.Builder.init(&buf, 7, 1);
+        b.putInt(40);
+        b.putInt(60);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(i32, 40), tv.sub_x);
+    try t.expectEqual(@as(i32, 60), tv.sub_y);
+
+    { // wl_subsurface.destroy
+        var b = wire.Builder.init(&buf, 7, 0);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.subs_gone);
 }
 
 test "full client lifecycle: bind, surface, xdg dance, commit, pixels" {
