@@ -5485,3 +5485,22 @@ the console (screencapture is TCC-blocked for the SSH shell);
 protocol level is green. Rig: fresh aarch64-musl daemon scp'd to
 the VM, weston installed there, SKETERM_SSH wrapper for the colima
 key.
+
+## 2026-06-13: CRT monitor bezel (cool-retro-term-style frame)
+
+crt.glsl grew a procedural plastic bezel where it used to draw flat
+black outside the curved tube. A rounded-rect SDF defines the glass;
+content is inset by the bezel width so the frame always has room
+(content sampling remaps the inner box back to [0,1]), and the
+surround is a lit bevel — inner seating-groove → crest with a
+top-left sheen → outer rounded edge fading to the black window
+background. Three new tunables flow through the existing
+shader-param plumbing (so they appear in "Configure Shader…" and
+are per-pane via the profile's custom_shader): `bezel` (width),
+`bezel_round` (screen + frame corner roundness), and the
+`bezelcolor` picker. bezel = 0 collapses the frame onto the screen
+edge → the original pure-black surround, so it's backward
+compatible. No Zig changes — pure data shader. Validated by
+compiling the gl.zig-wrapped source under BOTH Mesa GLES 300 es and
+desktop GL 330 core (the two sketerm injects); GUI builds clean.
+Visual eyeball still pending a display.
