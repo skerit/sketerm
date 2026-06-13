@@ -359,7 +359,23 @@ static void kick_refresh(SketermSckCtx *c, uint64_t now) {
 
 // ── C API ───────────────────────────────────────────────────────
 
+// ScreenCaptureKit's SCContentFilter calls SkyLight (the WindowServer
+// client lib) IN-PROCESS — SLSGetDisplaysWithRect. A bare launchd
+// daemon never connects to the WindowServer, so that call trips the
+// CGS_REQUIRE_INIT assertion and aborts. Promoting the process to a
+// UIElement app (an "accessory" — a GUI app with no Dock icon or
+// menu bar, like a status-item agent) establishes the connection
+// without a run loop or any visible UI. Must run on the main thread.
+static void ensure_windowserver(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    });
+}
+
 SckCtx *sketerm_sck_create(int32_t root_pid) {
+    ensure_windowserver();
     SketermSckCtx *c = [SketermSckCtx new];
     if (!c) return NULL;
     pthread_mutex_init(&c->mu, NULL);
