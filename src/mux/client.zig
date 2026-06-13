@@ -221,8 +221,24 @@ pub const Conn = struct {
         var off: usize = 0;
         while (off < out.items.len) {
             const n = c.write(self.fd, out.items.ptr + off, out.items.len - off);
-            if (n <= 0) return error.WriteFailed;
-            off += @intCast(n);
+            if (n > 0) {
+                off += @intCast(n);
+                continue;
+            }
+            // The GUI marks this fd O_NONBLOCK for its main-loop read
+            // watch, so a large frame (e.g. the ~70 KB keymap
+            // reflection) that overflows the socket buffer returns
+            // EAGAIN mid-write. Don't drop it — wait for the fd to
+            // drain and resume. EINTR likewise retries.
+            const e = std.posix.errno(n);
+            if (e == .AGAIN or e == .INTR) {
+                var pfd = [_]c.struct_pollfd{.{ .fd = self.fd, .events = c.POLLOUT, .revents = 0 }};
+                // Wait for drain; a timeout (link wedged) gives up
+                // rather than spinning forever.
+                if (c.poll(&pfd, 1, 30_000) <= 0 and e == .AGAIN) return error.WriteFailed;
+                continue;
+            }
+            return error.WriteFailed;
         }
     }
 
