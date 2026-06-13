@@ -731,7 +731,10 @@ pub const Compositor = struct {
                 const height = (try it.next()).?.int;
                 const stride = (try it.next()).?.int;
                 const format = (try it.next()).?.uint;
-                if (width <= 0 or height <= 0 or stride < width * 4 or offset < 0)
+                // width*4 is widened to i64 first: width is client-controlled
+                // i32, so the i32 multiply would overflow (UB/wrap in
+                // ReleaseFast) for width > ~536M and let the guard pass.
+                if (width <= 0 or height <= 0 or @as(i64, stride) < @as(i64, width) * 4 or offset < 0)
                     return Error.Protocol;
                 try self.register(id, &protocol.wl_buffer);
                 try self.buffers.put(self.allocator, id, .{
