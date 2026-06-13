@@ -157,6 +157,25 @@ pub fn runtimeDir() []const u8 {
         const s = std.mem.span(@as([*:0]const u8, @ptrCast(p)));
         if (s.len > 0) return s;
     }
+    if (is_macos) {
+        // $TMPDIR is the per-user temp dir, but a non-interactive SSH
+        // session may not have it in the environment — so a daemon
+        // launched at GUI login and a `sketerm-mux --proxy` bridge
+        // arriving over SSH would resolve DIFFERENT default sockets
+        // and never find each other. confstr returns the same
+        // /var/folders/.../T path directly, set or not. The static
+        // buffer outlives the slice (same as the env spans above).
+        const S = struct {
+            var buf: [128]u8 = undefined;
+        };
+        const n = c.confstr(c._CS_DARWIN_USER_TEMP_DIR, &S.buf, S.buf.len);
+        // confstr's count includes the trailing NUL; the path has a
+        // trailing slash. Keep it only if it fits Darwin's 104-byte
+        // sun_path with room for sketerm/<pid>.sock.
+        if (n > 1 and n <= S.buf.len and n < 70) {
+            return std.mem.trimEnd(u8, S.buf[0 .. n - 1], "/");
+        }
+    }
     if (c.getenv("TMPDIR")) |p| {
         const s = std.mem.span(@as([*:0]const u8, @ptrCast(p)));
         // Unix socket sun_path is 104 bytes on Darwin — a long

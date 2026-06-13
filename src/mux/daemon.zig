@@ -1335,7 +1335,16 @@ pub const Daemon = struct {
     /// session, "sck" = real capture for every session. Any value
     /// but "sck" forces the stub so smoke-mux and Linux rigs get a
     /// deterministic pattern.
-    fn winstreamGate(req: SpawnReq) struct { want: bool, use_sck: bool } {
+    /// `hosts_apps` = this session would forward GUI apps on Linux
+    /// (interactive command, forwarding not disabled, not the waypipe
+    /// wrapper itself). On macOS, winstream IS that forwarding
+    /// mechanism, so capture turns on for ANY such session — a GUI
+    /// app launched from a durable Mac shell streams exactly like one
+    /// launched from a Linux durable shell ($WAYLAND_DISPLAY). Env
+    /// overrides for the test rigs: "off" suppresses the macOS auto
+    /// gate (Linux-like behaviour), "all"/"sck" widen to every
+    /// session, "stub"/other force the test pattern.
+    fn winstreamGate(req: SpawnReq, hosts_apps: bool) struct { want: bool, use_sck: bool } {
         const env = std.c.getenv("SKETERM_WINSTREAM");
         const val: ?[]const u8 = if (env) |e| std.mem.span(e) else null;
         const eq = struct {
@@ -1343,11 +1352,16 @@ pub const Daemon = struct {
                 return v != null and std.mem.eql(u8, v.?, s);
             }
         }.f;
+        const off = eq(val, "off");
         const widen = eq(val, "all") or eq(val, "sck");
+        // macOS apps have no display protocol to forward — winstream
+        // is the only mechanism, so it stands in for Wayland
+        // forwarding on any app-hosting session (default wl_mode;
+        // explicit native/waypipe requests are Linux-specific).
+        const auto_mac = (comptime wssource.have_sck) and !off and
+            hosts_apps and req.wl_mode.len == 0;
         return .{
-            .want = req.winstream or
-                (val != null and (req.app or widen)) or
-                ((comptime wssource.have_sck) and req.app and req.wl_mode.len == 0),
+            .want = req.winstream or (val != null and !off and (req.app or widen)) or auto_mac,
             .use_sck = (comptime wssource.have_sck) and (val == null or eq(val, "sck")),
         };
     }
@@ -1361,8 +1375,17 @@ pub const Daemon = struct {
         // back into the legacy `waypipe server` wrap (e.g. for
         // GPU-buffer transfer); SKETERM_MUX_NO_WAYLAND=1 disables
         // app forwarding entirely.
+        // Does this session host GUI apps at all? Forwarding not
+        // disabled, an interactive command, not the waypipe wrapper
+        // itself. Drives BOTH Wayland forwarding (Linux) and
+        // winstream capture (macOS) — they're the same notion of
+        // "a session whose child apps should appear on the client".
+        const hosts_apps = std.c.getenv("SKETERM_MUX_NO_WAYLAND") == null and
+            req.argv.len > 0 and
+            !std.mem.eql(u8, std.fs.path.basename(req.argv[0]), "waypipe");
+
         // Window-stream backend (pixel capture): policy in winstreamGate.
-        const ws_gate = winstreamGate(req);
+        const ws_gate = winstreamGate(req, hosts_apps);
 
         var use_waypipe = false;
         var forwarding_possible = !ws_gate.want;
@@ -1379,9 +1402,7 @@ pub const Daemon = struct {
                 waypipeAvailable();
         }
         const native_wayland = !use_waypipe;
-        const want_wayland = forwarding_possible and
-            std.c.getenv("SKETERM_MUX_NO_WAYLAND") == null and
-            req.argv.len > 0 and !std.mem.eql(u8, std.fs.path.basename(req.argv[0]), "waypipe");
+        const want_wayland = forwarding_possible and hosts_apps;
         var hub: ?WaylandHub = if (want_wayland) self.setupWaylandHub(native_wayland) else null;
         errdefer if (hub) |h| {
             _ = c.close(h.fd);

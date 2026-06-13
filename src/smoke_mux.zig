@@ -553,7 +553,7 @@ fn winstreamStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     // a process-wide value would steal the Wayland hub from the
     // earlier app sessions (winstream excludes wayland).
     _ = c.setenv("SKETERM_WINSTREAM", "stub", 1);
-    defer _ = c.unsetenv("SKETERM_WINSTREAM");
+    defer _ = c.setenv("SKETERM_WINSTREAM", "off", 1); // restore the suite default
 
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("ws connect");
     defer conn.deinit();
@@ -786,6 +786,13 @@ pub fn main() u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
+
+    // On a capture-capable macOS build, the daemon would auto-enable
+    // winstream for every app-hosting session — which is correct in
+    // production but would divert this smoke's Wayland-pipe stages.
+    // Pin "off" so the suite runs the Linux-equivalent paths; the
+    // winstream stage opts back in explicitly.
+    _ = c.setenv("SKETERM_WINSTREAM", "off", 1);
 
     var path_buf: [128]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-mux-smoke-{d}/mux.sock", .{c.getpid()}) catch unreachable;

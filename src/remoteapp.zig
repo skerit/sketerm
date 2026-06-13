@@ -261,10 +261,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             return 1;
         },
         .darwin => {
-            // macOS apps stream as pixels via the mux daemon's
-            // ScreenCaptureKit agent — a durable-session feature,
-            // not a one-shot exec like the waypipe path.
-            errMsg("{s} is macOS — run the app in a durable session instead: `sketerm mux {s}`, then launch it from the session shell (needs a capture-enabled sketerm-mux on the Mac: docs/REMOTE.md \"Remote macOS apps\")", .{ host, host });
+            // We only reach the legacy waypipe dispatch when the
+            // native path (runNativeApp, above) bailed — and macOS
+            // has no waypipe. The native path streams macOS windows
+            // via ScreenCaptureKit, but it needs BOTH a running local
+            // sketerm GUI (to render the windows) and a capture-ready
+            // sketerm-mux on the Mac.
+            errMsg("{s} is macOS: streaming needs a running local sketerm GUI here AND a capture-enabled sketerm-mux on the Mac. Start a sketerm window, then retry — or set up the Mac per docs/macos-winstream-setup.md.", .{host});
             return 1;
         },
         .other => |u| {
