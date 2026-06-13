@@ -346,34 +346,24 @@ pub const GridPass = struct {
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
 
         const stride: c_int = @sizeOf(Vertex);
-        const a_pos: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_pos"));
-        const a_uv: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_uv"));
-        const a_color: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_color"));
-        const a_is_glyph: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_is_glyph"));
-        const a_dim: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_dim"));
-        const a_italic: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_italic"));
-        const a_bold: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_bold"));
-        const a_baseline_y: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_baseline_y"));
-        const a_colored: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_colored"));
-
-        c.glEnableVertexAttribArray(a_pos);
-        c.glVertexAttribPointer(a_pos, 2, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "pos")));
-        c.glEnableVertexAttribArray(a_uv);
-        c.glVertexAttribPointer(a_uv, 3, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "uv")));
-        c.glEnableVertexAttribArray(a_color);
-        c.glVertexAttribPointer(a_color, 4, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "color")));
-        c.glEnableVertexAttribArray(a_is_glyph);
-        c.glVertexAttribPointer(a_is_glyph, 1, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "is_glyph")));
-        c.glEnableVertexAttribArray(a_dim);
-        c.glVertexAttribPointer(a_dim, 1, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "dim")));
-        c.glEnableVertexAttribArray(a_italic);
-        c.glVertexAttribPointer(a_italic, 1, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "italic")));
-        c.glEnableVertexAttribArray(a_bold);
-        c.glVertexAttribPointer(a_bold, 1, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "bold")));
-        c.glEnableVertexAttribArray(a_baseline_y);
-        c.glVertexAttribPointer(a_baseline_y, 1, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "baseline_y")));
-        c.glEnableVertexAttribArray(a_colored);
-        c.glVertexAttribPointer(a_colored, 1, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "colored")));
+        const fields = [_]struct { name: [*:0]const u8, off: usize, count: c_int }{
+            .{ .name = "a_pos", .off = @offsetOf(Vertex, "pos"), .count = 2 },
+            .{ .name = "a_uv", .off = @offsetOf(Vertex, "uv"), .count = 3 },
+            .{ .name = "a_color", .off = @offsetOf(Vertex, "color"), .count = 4 },
+            .{ .name = "a_is_glyph", .off = @offsetOf(Vertex, "is_glyph"), .count = 1 },
+            .{ .name = "a_dim", .off = @offsetOf(Vertex, "dim"), .count = 1 },
+            .{ .name = "a_italic", .off = @offsetOf(Vertex, "italic"), .count = 1 },
+            .{ .name = "a_bold", .off = @offsetOf(Vertex, "bold"), .count = 1 },
+            .{ .name = "a_baseline_y", .off = @offsetOf(Vertex, "baseline_y"), .count = 1 },
+            .{ .name = "a_colored", .off = @offsetOf(Vertex, "colored"), .count = 1 },
+        };
+        for (fields) |f| {
+            const loc = c.glGetAttribLocation(self.program, f.name);
+            if (loc < 0) continue;
+            const idx: c_uint = @intCast(loc);
+            c.glEnableVertexAttribArray(idx);
+            c.glVertexAttribPointer(idx, f.count, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(f.off));
+        }
 
         c.glBindVertexArray(0);
     }

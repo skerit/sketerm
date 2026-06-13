@@ -99,12 +99,17 @@ pub const ImagePass = struct {
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
 
         const stride: c_int = @sizeOf(Vertex);
-        const a_pos: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_pos"));
-        const a_uv: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_uv"));
-        c.glEnableVertexAttribArray(a_pos);
-        c.glVertexAttribPointer(a_pos, 2, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "pos")));
-        c.glEnableVertexAttribArray(a_uv);
-        c.glVertexAttribPointer(a_uv, 2, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(@offsetOf(Vertex, "uv")));
+        const fields = [_]struct { name: [*:0]const u8, off: usize, count: c_int }{
+            .{ .name = "a_pos", .off = @offsetOf(Vertex, "pos"), .count = 2 },
+            .{ .name = "a_uv", .off = @offsetOf(Vertex, "uv"), .count = 2 },
+        };
+        for (fields) |f| {
+            const loc = c.glGetAttribLocation(self.program, f.name);
+            if (loc < 0) continue;
+            const idx: c_uint = @intCast(loc);
+            c.glEnableVertexAttribArray(idx);
+            c.glVertexAttribPointer(idx, f.count, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(f.off));
+        }
         c.glBindVertexArray(0);
     }
 

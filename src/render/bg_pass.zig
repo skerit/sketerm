@@ -142,9 +142,12 @@ pub const BgPass = struct {
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
         const quad = [_]f32{ -1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1 };
         c.glBufferData(c.GL_ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, c.GL_STATIC_DRAW);
-        const a_pos: c_uint = @intCast(c.glGetAttribLocation(self.program, "a_pos"));
-        c.glEnableVertexAttribArray(a_pos);
-        c.glVertexAttribPointer(a_pos, 2, c.GL_FLOAT, c.GL_FALSE, 2 * @sizeOf(f32), null);
+        const a_pos_loc = c.glGetAttribLocation(self.program, "a_pos");
+        if (a_pos_loc >= 0) {
+            const a_pos: c_uint = @intCast(a_pos_loc);
+            c.glEnableVertexAttribArray(a_pos);
+            c.glVertexAttribPointer(a_pos, 2, c.GL_FLOAT, c.GL_FALSE, 2 * @sizeOf(f32), null);
+        }
         c.glBindVertexArray(0);
     }
 
