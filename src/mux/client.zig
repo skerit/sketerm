@@ -195,23 +195,89 @@ pub const Conn = struct {
     /// (BatchMode fails instead of prompting on the protocol pipe).
     /// $SKETERM_SSH overrides the ssh binary (tests fake a remote).
     pub fn connectSsh(allocator: std.mem.Allocator, host: []const u8) !Conn {
+        // `sketerm app` opens TWO connections moments apart (the CLI to
+        // spawn the session, then the GUI to attach). When the remote
+        // sshd is slow to service new connections — a loaded box stalls
+        // the banner/key exchange even though TCP connects instantly —
+        // each fresh connection is a dice roll. Multiplexing (in
+        // connectSshOnce) collapses them onto one master so only the
+        // first pays that cost; this retry covers the master setup
+        // itself stalling. Both together turn an intermittent failure
+        // into a reliable connect.
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            if (connectSshOnce(allocator, host)) |conn| {
+                return conn;
+            } else |err| {
+                if (attempt + 1 >= 3) return err;
+                _ = c.usleep(400_000);
+            }
+        }
+    }
+
+    fn connectSshOnce(allocator: std.mem.Allocator, host: []const u8) !Conn {
         var host_z_buf: [256:0]u8 = undefined;
         const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{host}) catch return error.BadPath;
         const ssh_env = c.getenv("SKETERM_SSH");
         const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
 
-        const argv = [_:null]?[*:0]const u8{
-            ssh_bin, "-T", "-o", "BatchMode=yes", host_z.ptr, "sketerm-mux", "--proxy", null,
-        };
-        var conn = try spawnOverSocketpair(allocator, ssh_bin, &argv);
+        // Connection multiplexing — only with the real ssh (a test rig
+        // pointed at by $SKETERM_SSH keeps the plain positional argv).
+        // ControlMaster=auto reuses an existing master or becomes one;
+        // ControlPersist keeps it briefly after the spawning client
+        // exits so the GUI's attach a beat later rides the same master
+        // (instant — no second banner exchange). %C is a fixed-length
+        // hash, so the socket path stays well under the sun_path limit.
+        const mux = ssh_env == null;
+        var argv_buf: [16]?[*:0]const u8 = undefined;
+        var n: usize = 0;
+        const push = struct {
+            fn f(buf: *[16]?[*:0]const u8, i: *usize, v: ?[*:0]const u8) void {
+                buf[i.*] = v;
+                i.* += 1;
+            }
+        }.f;
+        push(&argv_buf, &n, ssh_bin);
+        push(&argv_buf, &n, "-T");
+        push(&argv_buf, &n, "-o");
+        push(&argv_buf, &n, "BatchMode=yes");
+        if (mux) {
+            push(&argv_buf, &n, "-o");
+            push(&argv_buf, &n, "ControlMaster=auto");
+            push(&argv_buf, &n, "-o");
+            push(&argv_buf, &n, "ControlPath=~/.ssh/sketerm-%C");
+            push(&argv_buf, &n, "-o");
+            push(&argv_buf, &n, "ControlPersist=120");
+        }
+        push(&argv_buf, &n, host_z.ptr);
+        push(&argv_buf, &n, "sketerm-mux");
+        push(&argv_buf, &n, "--proxy");
+        push(&argv_buf, &n, null);
+
+        var conn = try spawnOverSocketpair(allocator, ssh_bin, @ptrCast(&argv_buf));
         errdefer conn.deinit();
 
         // Probe the bridge: hello → welcome proves ssh + remote
         // binary + daemon all came up before we hand the conn out.
+        // Bound the welcome wait so a stalled banner surfaces as a
+        // retryable error instead of hanging the blocking read forever.
         conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION }) catch return error.SshTransportFailed;
+        try waitReadable(conn.fd, 20_000);
         const w = conn.recvExpect(&.{.welcome}) catch return error.SshTransportFailed;
         w.deinit(allocator);
         return conn;
+    }
+
+    /// Poll `fd` for readability, bounded by `timeout_ms`. A timeout or
+    /// poll error becomes a retryable SshTransportFailed.
+    fn waitReadable(fd: c_int, timeout_ms: c_int) !void {
+        var pfd = [_]c.struct_pollfd{.{ .fd = fd, .events = c.POLLIN, .revents = 0 }};
+        while (true) {
+            const r = c.poll(&pfd, 1, timeout_ms);
+            if (r > 0) return;
+            if (r < 0 and std.posix.errno(r) == .INTR) continue;
+            return error.SshTransportFailed;
+        }
     }
 
     pub fn sendFrame(self: *Conn, ftype: wire.FrameType, payload: []const u8) !void {
