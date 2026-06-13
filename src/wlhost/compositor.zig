@@ -1166,6 +1166,14 @@ pub const Compositor = struct {
     /// callbacks, release the buffer. The xdg dance: the first
     /// commit WITHOUT a buffer triggers the initial configure.
     fn commit(self: *Compositor, sid: u32, surf: *Surface) Error!void {
+        // A buffer is copied + released exactly once: on the commit
+        // that attaches it. A commit WITHOUT a fresh attach (frame
+        // callback / damage-only repaint — common in GTK on cursor
+        // and hover redraws) keeps the same content and must NOT
+        // re-release. Releasing the same wl_buffer twice underflows
+        // the client's cairo surface refcount and aborts the app
+        // (cairo_surface_reference assertion).
+        const took_buffer = surf.has_pending;
         if (surf.has_pending) {
             surf.committed_buffer = surf.pending_buffer;
             surf.has_pending = false;
@@ -1209,7 +1217,7 @@ pub const Compositor = struct {
             try self.send(try b2.finish());
         }
 
-        if (surf.committed_buffer != 0) {
+        if (took_buffer and surf.committed_buffer != 0) {
             if (self.buffers.get(surf.committed_buffer)) |info| {
                 // Only mapped surfaces (toplevel/popup role) reach
                 // the view — cursor surfaces (set_cursor, no xdg
@@ -1662,6 +1670,27 @@ test "full client lifecycle: bind, surface, xdg dance, commit, pixels" {
     try t.expectEqual([2]u32{ 10, 0 }, evs.items[0]); // release
     try t.expectEqual([2]u32{ 11, 0 }, evs.items[1]); // done
     try t.expectEqual([2]u32{ 1, 1 }, evs.items[2]); // delete_id
+
+    // Re-commit WITHOUT a fresh attach (frame-callback-only repaint,
+    // as GTK does on cursor/hover redraws). The buffer must NOT be
+    // released a second time — a double release underflows the
+    // client's cairo refcount and aborts the app. Only done +
+    // delete_id for the new frame callback should come back.
+    { // frame(12)
+        var b = wire.Builder.init(&buf, 6, 3);
+        b.putNewId(12);
+        try req(&comp, try b.finish());
+    }
+    { // commit (no attach)
+        var b = wire.Builder.init(&buf, 6, 6);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.frames); // no new frame pushed
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    try t.expectEqual(@as(usize, 2), evs.items.len); // NO release
+    try t.expectEqual([2]u32{ 12, 0 }, evs.items[0]); // done
+    try t.expectEqual([2]u32{ 1, 1 }, evs.items[1]); // delete_id(12)
 
     // Toplevel destroy → gone callback.
     { // xdg_toplevel.destroy
