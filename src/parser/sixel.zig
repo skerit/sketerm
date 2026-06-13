@@ -33,8 +33,15 @@ pub const Error = error{
 
 const PALETTE_SIZE = 256;
 
+/// Hard cap on decoded sixel dimensions. Raster attrs and pixel data are
+/// attacker-controlled (any PTY output); without a cap the width*height*4
+/// allocation wraps in u32 → undersized buffer → OOB heap write in
+/// paintSixel. 10000 is generous for real terminal sixels and keeps the
+/// u32 painting math safe: 10000*10000*4 ≈ 4e8 < 2^32.
+const MAX_DIM: u32 = 10000;
+
 pub fn decode(allocator: std.mem.Allocator, body: []const u8) Error!Decoded {
-    // Pass 1: scan dimensions.
+    // Pass 1: scan dimensions, clamped to MAX_DIM before any sizing/painting.
     const dims = scanDimensions(body);
     if (dims.width == 0 or dims.height == 0) return Error.EmptyImage;
 
@@ -43,7 +50,10 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8) Error!Decoded {
     var k: usize = 0;
     while (k < PALETTE_SIZE) : (k += 1) palette[k] = .{ 0, 0, 0, 255 };
 
-    const rgba = try allocator.alloc(u8, dims.width * dims.height * 4);
+    // usize multiply so the size cannot overflow even before the clamp
+    // (belt-and-suspenders; scanDimensions already caps each dim to MAX_DIM).
+    const size: usize = @as(usize, dims.width) * @as(usize, dims.height) * 4;
+    const rgba = try allocator.alloc(u8, size);
     @memset(rgba, 0);
 
     var x: u32 = 0;
@@ -277,7 +287,9 @@ fn scanDimensions(body: []const u8) Dims {
 
     const w = if (raster_w > 0) raster_w else max_x;
     const h = if (raster_h > 0) raster_h else band * 6;
-    return .{ .width = w, .height = h };
+    // Clamp to MAX_DIM so the allocation and paintSixel offset math
+    // (computed in u32) cannot overflow on attacker-controlled input.
+    return .{ .width = @min(w, MAX_DIM), .height = @min(h, MAX_DIM) };
 }
 
 fn parseParams(body: []const u8, i: *usize) []u32 {
