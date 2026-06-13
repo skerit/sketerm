@@ -1186,7 +1186,14 @@ pub const Terminal = struct {
         const self = handle.terminal orelse return 0;
         // Reset BEFORE draining: if worker pushes during drain it
         // will reschedule us on the next batch.
-        handle.drain_pending.store(false, .release);
+        // Clear the pending flag with an RMW, not a plain store: Zig 0.16
+        // has no seq_cst fence, so we rely on the fact that two RMWs on the
+        // same atomic are totally ordered in modification order. Paired with
+        // the worker's swap(true,.acq_rel) in scheduleDrain, this closes the
+        // StoreLoad lost-wakeup window — either the worker's push
+        // happens-before our drain, or the worker observes our false and
+        // reschedules. A plain store would NOT give that guarantee.
+        _ = handle.drain_pending.swap(false, .acq_rel);
 
         // Debug-trace events to stderr. Zig 0.16 removed
         // `std.fs.File.stderr()`; we accumulate into a fixed buffer
