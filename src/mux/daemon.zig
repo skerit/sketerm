@@ -346,12 +346,14 @@ pub const Daemon = struct {
 
         try fds.append(self.allocator, .{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 });
         const client_base = fds.items.len;
+        const n_clients_built = self.clients.items.len;
         for (self.clients.items) |cl| {
             var ev: c_short = c.POLLIN;
             if (cl.wbuf.items.len > 0) ev |= c.POLLOUT;
             try fds.append(self.allocator, .{ .fd = cl.fd, .events = ev, .revents = 0 });
         }
         const session_base = fds.items.len;
+        const n_sessions_built = self.sessions.items.len;
         for (self.sessions.items) |s| {
             try fds.append(self.allocator, .{
                 .fd = if (s.exited) -1 else s.pty.master_fd,
@@ -391,6 +393,7 @@ pub const Daemon = struct {
             });
         }
         const chan_base = fds.items.len;
+        const n_channels_built = self.channels.items.len;
         for (self.channels.items) |ch| {
             var ev: c_short = c.POLLIN;
             if (ch.pending.items.len > 0) ev |= c.POLLOUT;
@@ -418,7 +421,20 @@ pub const Daemon = struct {
 
         if (fds.items[0].revents & c.POLLIN != 0) self.acceptClient();
 
-        for (self.clients.items, 0..) |cl, i| {
+        // Snapshot counts: acceptClient/handleSpawn/attach run inside
+        // the loops below and APPEND to these lists. Entries appended
+        // this tick have no slot in this tick's poll set, so iterating
+        // them would read a stale slot (a later base's revents) and
+        // could fire a blocking read on a fd that was never polled.
+        // They get serviced next tick. Lists only grow during a tick,
+        // so n_* <= items.len always holds.
+        const n_clients = n_clients_built;
+        const n_sessions = n_sessions_built;
+        const n_channels = n_channels_built;
+
+        var i: usize = 0;
+        while (i < n_clients) : (i += 1) {
+            const cl = self.clients.items[i];
             const re = fds.items[client_base + i].revents;
             // POLLIN before POLLHUP: a client that writes its last
             // frame and closes raises both at once, and the data is
@@ -434,16 +450,22 @@ pub const Daemon = struct {
             if (re & c.POLLOUT != 0 and !cl.dead) self.clientWritable(cl);
         }
 
-        for (self.sessions.items, 0..) |s, i| {
+        i = 0;
+        while (i < n_sessions) : (i += 1) {
+            const s = self.sessions.items[i];
             const re = fds.items[session_base + i].revents;
             if (re & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0) self.drainSession(s);
         }
 
-        for (self.sessions.items, 0..) |s, i| {
+        i = 0;
+        while (i < n_sessions) : (i += 1) {
+            const s = self.sessions.items[i];
             if (fds.items[hub_base + i].revents & c.POLLIN != 0) self.acceptWaylandApp(s);
         }
 
-        for (self.channels.items, 0..) |ch, i| {
+        i = 0;
+        while (i < n_channels) : (i += 1) {
+            const ch = self.channels.items[i];
             const re = fds.items[chan_base + i].revents;
             if (ch.dead) continue;
             if (re & c.POLLIN != 0) self.channelReadable(ch);
@@ -456,7 +478,9 @@ pub const Daemon = struct {
         // shrink while we drain, never grow — chan reads above can
         // append, but those fds weren't polled this tick).
         var clip_idx: usize = 0;
-        for (self.channels.items) |ch| {
+        i = 0;
+        while (i < n_channels) : (i += 1) {
+            const ch = self.channels.items[i];
             const nv = ch.native orelse continue;
             var j: usize = 0;
             while (j < nv.clip_reads.items.len and clip_base + clip_idx < fds.items.len) {
@@ -477,6 +501,11 @@ pub const Daemon = struct {
         const fd = c.accept(self.listen_fd, null, null);
         if (fd < 0) return;
         _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+        // Non-blocking: the single-threaded poll loop must never block
+        // in read() on a silent client (a brand-new accept this tick
+        // isn't in the poll set yet, and a stale-slot read could fire).
+        const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+        _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
         const cl = self.allocator.create(Client) catch {
             _ = c.close(fd);
             return;
@@ -491,8 +520,13 @@ pub const Daemon = struct {
     fn clientReadable(self: *Daemon, cl: *Client) void {
         var tmp: [16384]u8 = undefined;
         const n_raw = c.read(cl.fd, &tmp, tmp.len);
-        if (n_raw <= 0) {
-            cl.dead = true;
+        if (n_raw < 0) {
+            // fd is O_NONBLOCK: EAGAIN just means "nothing right now".
+            if (std.posix.errno(n_raw) != .AGAIN) cl.dead = true;
+            return;
+        }
+        if (n_raw == 0) {
+            cl.dead = true; // EOF
             return;
         }
         const n: usize = @intCast(n_raw);
@@ -519,7 +553,9 @@ pub const Daemon = struct {
         _ = self;
         const n_raw = c.write(cl.fd, cl.wbuf.items.ptr, cl.wbuf.items.len);
         if (n_raw < 0) {
-            cl.dead = true;
+            // fd is O_NONBLOCK: EAGAIN means the send buffer is full;
+            // keep wbuf and retry on the next POLLOUT.
+            if (std.posix.errno(n_raw) != .AGAIN) cl.dead = true;
             return;
         }
         const n: usize = @intCast(n_raw);
@@ -1624,19 +1660,19 @@ pub const Daemon = struct {
                 cl.queueJson(.gone, .{ .reason = "session closed" });
             }
         }
-        // Mark only — removeSession runs mid-tick (kill frames), and
-        // dropping list entries here would desync the pollfd array
-        // built at tick start. reap() removes them at tick end.
         for (self.channels.items) |ch| {
             if (ch.session == s) self.closeChannel(ch, true);
         }
-        for (self.sessions.items, 0..) |it, i| {
-            if (it == s) {
-                _ = self.sessions.swapRemove(i);
-                break;
-            }
-        }
-        s.deinit();
+        // Mark only — removeSession runs mid-tick (kill frames), and
+        // dropping list entries here would desync the pollfd array
+        // built at tick start. Marking exited makes this tick poll the
+        // session fd as -1 (see tick()) so it stops draining
+        // immediately, and reap() at tick end removes it via
+        // swapRemove + s.deinit() — which calls pty.closeAndReap() to
+        // SIGHUP/SIGTERM/SIGKILL and reap the child. The kill still
+        // feels immediate: the client's .ok is queued by the caller
+        // and the session is gone within this same tick.
+        s.exited = true;
     }
 
     fn dropDeadChannels(self: *Daemon) void {
