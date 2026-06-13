@@ -132,11 +132,8 @@ pub const Terminal = struct {
         /// (password prompts) flushes even when no events arrive.
         predictor: predict_mod.Predictor,
         expire_timer: c_uint = 0,
-        /// Forwarded Wayland app streams (daemon chan_* frames ↔
-        /// local waypipe client), keyed by daemon channel id.
-        channels: std.ArrayList(*WlChan) = .empty,
         /// Sketerm-native app channels: the wlhost compositor brain
-        /// renders these as local windows — no waypipe involved.
+        /// renders these as local windows.
         napps: std.ArrayList(*NApp) = .empty,
         /// Window-stream channels (pixel capture remotes).
         wsapps: std.ArrayList(*WsApp) = .empty,
@@ -147,18 +144,6 @@ pub const Terminal = struct {
                 self.closed = true;
             };
         }
-    };
-
-    /// One forwarded Wayland app stream: a connection to the local
-    /// waypipe client, pumped against the daemon's chan_* frames.
-    const WlChan = struct {
-        terminal: *Terminal,
-        id: u32,
-        fd: c_int,
-        watch_in: c_uint = 0,
-        watch_out: c_uint = 0,
-        /// Daemon bytes not yet written to fd (partial writes).
-        pending: std.ArrayList(u8) = .empty,
     };
 
     /// One sketerm-native app channel (kind wayland_native).
@@ -374,7 +359,6 @@ pub const Terminal = struct {
             .chan_data => self.chanData(frame.payload),
             .chan_close => {
                 const id = mux_wire.decodeChanId(frame.payload) orelse return;
-                if (self.findChan(id)) |ch| self.destroyChan(ch, false);
                 if (self.findNApp(id)) |na| self.destroyNApp(na);
                 if (self.findWsApp(id)) |wa| self.destroyWsApp(wa);
             },
@@ -413,15 +397,7 @@ pub const Terminal = struct {
         if (self.on_render_request) |f| f(self.user_ctx);
     }
 
-    // ── Forwarded Wayland app channels ───────────────────────────
-
-    fn findChan(self: *Terminal, id: u32) ?*WlChan {
-        const remote = self.remote orelse return null;
-        for (remote.channels.items) |ch| {
-            if (ch.id == id) return ch;
-        }
-        return null;
-    }
+    // ── Forwarded app channels ───────────────────────────────────
 
     fn sendChanClose(self: *Terminal, id: u32) void {
         const remote = self.remote orelse return;
@@ -431,89 +407,22 @@ pub const Terminal = struct {
     }
 
     fn chanOpen(self: *Terminal, payload: []const u8) void {
-        const remote = self.remote orelse return;
         const open = mux_wire.decodeChanOpen(payload) orelse return;
-        if (open.kind == .wayland_native) {
-            self.nappOpen(open.id);
-            return;
+        switch (open.kind) {
+            .wayland_native => self.nappOpen(open.id),
+            .winstream => self.wsappOpen(open.id),
+            else => self.sendChanClose(open.id),
         }
-        if (open.kind == .winstream) {
-            self.wsappOpen(open.id);
-            return;
-        }
-        if (open.kind != .wayland) {
-            self.sendChanClose(open.id);
-            return;
-        }
-        const fd = @import("wlbridge.zig").connectApp() orelse {
-            self.sendChanClose(open.id);
-            return;
-        };
-        const ch = self.allocator.create(WlChan) catch {
-            _ = c.close(fd);
-            self.sendChanClose(open.id);
-            return;
-        };
-        ch.* = .{ .terminal = self, .id = open.id, .fd = fd };
-        remote.channels.append(self.allocator, ch) catch {
-            _ = c.close(fd);
-            self.allocator.destroy(ch);
-            self.sendChanClose(open.id);
-            return;
-        };
-        ch.watch_in = c.g_unix_fd_add(fd, c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR, @ptrCast(&wlChanInCb), @ptrCast(ch));
     }
 
     fn chanData(self: *Terminal, payload: []const u8) void {
         const id = mux_wire.decodeChanId(payload) orelse return;
         if (self.findNApp(id)) |na| return self.nappData(na, payload[4..]);
         if (self.findWsApp(id)) |wa| return self.wsappData(wa, payload[4..]);
-        const ch = self.findChan(id) orelse return;
-        const bytes = payload[4..];
-        // Write-through while the pipe keeps up; buffer the rest and
-        // flush from a G_IO_OUT watch.
-        var off: usize = 0;
-        if (ch.pending.items.len == 0) {
-            while (off < bytes.len) {
-                const n = c.write(ch.fd, bytes.ptr + off, bytes.len - off);
-                if (n <= 0) break;
-                off += @intCast(n);
-            }
-        }
-        if (off < bytes.len) {
-            ch.pending.appendSlice(self.allocator, bytes[off..]) catch {
-                self.sendChanClose(ch.id);
-                self.destroyChan(ch, false);
-                return;
-            };
-            if (ch.watch_out == 0) {
-                ch.watch_out = c.g_unix_fd_add(ch.fd, c.G_IO_OUT, @ptrCast(&wlChanOutCb), @ptrCast(ch));
-            }
-        }
-    }
-
-    fn destroyChan(self: *Terminal, ch: *WlChan, notify: bool) void {
-        if (notify) self.sendChanClose(ch.id);
-        if (ch.watch_in != 0) _ = c.g_source_remove(ch.watch_in);
-        if (ch.watch_out != 0) _ = c.g_source_remove(ch.watch_out);
-        _ = c.close(ch.fd);
-        ch.pending.deinit(self.allocator);
-        if (self.remote) |remote| {
-            for (remote.channels.items, 0..) |it, i| {
-                if (it == ch) {
-                    _ = remote.channels.swapRemove(i);
-                    break;
-                }
-            }
-        }
-        self.allocator.destroy(ch);
     }
 
     fn destroyAllChans(self: *Terminal) void {
         const remote = self.remote orelse return;
-        while (remote.channels.items.len > 0) {
-            self.destroyChan(remote.channels.items[remote.channels.items.len - 1], false);
-        }
         while (remote.napps.items.len > 0) {
             self.destroyNApp(remote.napps.items[remote.napps.items.len - 1]);
         }
@@ -673,69 +582,6 @@ pub const Terminal = struct {
             }
         }
         self.allocator.destroy(na);
-    }
-
-    /// Local waypipe client socket readable: forward to the daemon.
-    /// NOTE the conn fd is nonblocking — a full kernel buffer drops
-    /// the channel (same caveat as sendInput). Upstream Wayland
-    /// traffic is small (events/acks), so this is theoretical.
-    fn wlChanInCb(_: c_int, condition: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const ch: *WlChan = @ptrCast(@alignCast(user.?));
-        const self = ch.terminal;
-        if ((condition & c.G_IO_IN) != 0) {
-            var buf: [4 + 16384]u8 = undefined;
-            var rounds: u8 = 0;
-            while (rounds < 4) : (rounds += 1) {
-                const n = c.read(ch.fd, buf[4..].ptr, buf.len - 4);
-                if (n < 0) {
-                    if (std.posix.errno(n) == .AGAIN or std.posix.errno(n) == .INTR) break;
-                    ch.watch_in = 0;
-                    self.destroyChan(ch, true);
-                    return 0;
-                }
-                if (n == 0) {
-                    ch.watch_in = 0;
-                    self.destroyChan(ch, true);
-                    return 0;
-                }
-                std.mem.writeInt(u32, buf[0..4], ch.id, .little);
-                const remote = self.remote orelse break;
-                if (remote.closed) break;
-                remote.conn.sendFrame(.chan_data, buf[0 .. 4 + @as(usize, @intCast(n))]) catch {
-                    ch.watch_in = 0;
-                    self.destroyChan(ch, false);
-                    return 0;
-                };
-                if (@as(usize, @intCast(n)) < buf.len - 4) break;
-            }
-        }
-        if ((condition & (c.G_IO_HUP | c.G_IO_ERR)) != 0) {
-            ch.watch_in = 0;
-            self.destroyChan(ch, true);
-            return 0;
-        }
-        return 1;
-    }
-
-    /// Drain buffered daemon bytes once the socket unblocks.
-    fn wlChanOutCb(_: c_int, _: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const ch: *WlChan = @ptrCast(@alignCast(user.?));
-        const self = ch.terminal;
-        while (ch.pending.items.len > 0) {
-            const n = c.write(ch.fd, ch.pending.items.ptr, ch.pending.items.len);
-            if (n < 0) {
-                if (std.posix.errno(n) == .AGAIN or std.posix.errno(n) == .INTR) return 1;
-                ch.watch_out = 0;
-                self.destroyChan(ch, true);
-                return 0;
-            }
-            const w: usize = @intCast(n);
-            const remaining = ch.pending.items.len - w;
-            std.mem.copyForwards(u8, ch.pending.items[0..remaining], ch.pending.items[w..]);
-            ch.pending.shrinkRetainingCapacity(remaining);
-        }
-        ch.watch_out = 0;
-        return 0; // drained; remove this source
     }
 
     /// PTY-or-socket write for parser replies / mouse / focus
@@ -1032,7 +878,6 @@ pub const Terminal = struct {
             if (remote.watch_id != 0) _ = c.g_source_remove(remote.watch_id);
             if (remote.expire_timer != 0) _ = c.g_source_remove(remote.expire_timer);
             self.destroyAllChans();
-            remote.channels.deinit(self.allocator);
             remote.napps.deinit(self.allocator);
             remote.wsapps.deinit(self.allocator);
             remote.predictor.deinit();

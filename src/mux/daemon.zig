@@ -40,11 +40,6 @@ pub const SpawnReq = struct {
     /// explicit form of SKETERM_WINSTREAM; what `sketerm app`
     /// toward capture-only remotes will set).
     winstream: bool = false,
-    /// Wayland forwarding mode for this session: "" = daemon
-    /// default, "native" = sketerm-native pipe, "waypipe" = legacy
-    /// wrap. Headless clients (`sketerm app -u`) need waypipe —
-    /// they have no compositor brain, only a waypipe-client bridge.
-    wl_mode: []const u8 = "",
 };
 
 pub const AttachReq = struct {
@@ -79,21 +74,14 @@ const Session = struct {
     exit_status: i32 = 0,
     /// Spawned via `sketerm app -u` — a forwarded GUI app, not a shell.
     app: bool = false,
-    /// Wayland app forwarding: the session's shell runs wrapped in a
-    /// `waypipe server` that provides $WAYLAND_DISPLAY; each app
-    /// connection waypipe makes lands on this hub socket and is
-    /// tunneled to an attached client as a byte channel. -1 = no
-    /// Wayland support for this session (waypipe absent at spawn).
+    /// Wayland app forwarding: the daemon IS the Wayland display —
+    /// wl_hub_fd listens on the session's display socket itself, sets
+    /// the shell's $WAYLAND_DISPLAY, and each app connection is parsed
+    /// + shm-mirrored (Channel.native) and tunneled to the attached
+    /// client as a byte channel. -1 = no Wayland support this session.
     wl_hub_fd: c_int = -1,
-    /// Owned hub + display socket paths, unlinked on teardown.
-    wl_hub_path: ?[]u8 = null,
+    /// Owned display socket path, unlinked on teardown.
     wl_display_path: ?[]u8 = null,
-    /// Sketerm-native app pipe (the DEFAULT): the daemon IS the
-    /// Wayland display — wl_hub_fd listens on the display socket
-    /// itself, no waypipe wrap, and each app connection gets parsed
-    /// + shm-mirrored (Channel.native). False = legacy waypipe wrap
-    /// (SKETERM_MUX_WAYLAND=waypipe).
-    wl_native: bool = false,
     /// Window-stream agent (pixel capture, no display protocol):
     /// the macOS backend, or the stub for pipeline testing
     /// (SKETERM_WINSTREAM=stub). Mutually exclusive with Wayland
@@ -114,10 +102,6 @@ const Session = struct {
         }
         if (self.wl_hub_fd >= 0) _ = c.close(self.wl_hub_fd);
         var z_buf: [4096]u8 = undefined;
-        if (self.wl_hub_path) |p| {
-            if (pathZ(&z_buf, p)) |z| _ = c.unlink(z) else |_| {}
-            self.allocator.free(p);
-        }
         if (self.wl_display_path) |p| {
             if (pathZ(&z_buf, p)) |z| _ = c.unlink(z) else |_| {}
             self.allocator.free(p);
@@ -179,8 +163,9 @@ const Client = struct {
 
 const pathZ = @import("../util/pathz.zig").pathZ;
 
-/// One tunneled byte stream: an accepted waypipe-server connection
-/// on a session's Wayland hub, bridged to `client` as chan_* frames.
+/// One tunneled byte stream, bridged to `client` as chan_* frames:
+/// a Wayland app connection (`native` set) or a window-stream session
+/// (`native` null, fd -1, frames produced in the daemon).
 const Channel = struct {
     allocator: std.mem.Allocator,
     id: u32,
@@ -190,7 +175,7 @@ const Channel = struct {
     /// Bytes from the client not yet written to fd (partial writes).
     pending: std.ArrayList(u8) = .empty,
     dead: bool = false,
-    /// Non-null on a native-pipe channel: the app speaks raw Wayland
+    /// Non-null on a Wayland app channel: the app speaks raw Wayland
     /// to us and the byte stream toward the GUI is wlhost/pipe units.
     native: ?*Native = null,
 
@@ -202,9 +187,9 @@ const Channel = struct {
     }
 };
 
-/// Per-channel state of the sketerm-native app pipe (no waypipe:
-/// the session's app connects straight to the daemon). Owns the
-/// protocol tracker and the mmapped shm pool mirrors.
+/// Per-channel state of the sketerm-native app pipe: the session's
+/// app connects straight to the daemon. Owns the protocol tracker
+/// and the mmapped shm pool mirrors.
 const Native = struct {
     allocator: std.mem.Allocator,
     tracker: wltrack.Tracker,
@@ -620,13 +605,7 @@ pub const Daemon = struct {
                         ws.handleInput(p.unit);
                         pos += p.consumed;
                     }
-                    return;
                 }
-                ch.pending.appendSlice(ch.allocator, frame.payload[4..]) catch {
-                    self.closeChannel(ch, true);
-                    return;
-                };
-                self.channelWritable(ch);
             },
             .chan_close => {
                 const id = wire.decodeChanId(frame.payload) orelse return;
@@ -679,22 +658,19 @@ pub const Daemon = struct {
 
     /// Bridge one accepted app connection to `cl` as a channel.
     fn openAppChannel(self: *Daemon, s: *Session, cl: *Client, fd: c_int) void {
-        var native: ?*Native = null;
-        if (s.wl_native) {
-            native = self.allocator.create(Native) catch {
-                _ = c.close(fd);
-                return;
-            };
-            const tracker = wltrack.Tracker.init(self.allocator) catch {
-                self.allocator.destroy(native.?);
-                _ = c.close(fd);
-                return;
-            };
-            native.?.* = .{ .allocator = self.allocator, .tracker = tracker };
-        }
+        const native = self.allocator.create(Native) catch {
+            _ = c.close(fd);
+            return;
+        };
+        const tracker = wltrack.Tracker.init(self.allocator) catch {
+            self.allocator.destroy(native);
+            _ = c.close(fd);
+            return;
+        };
+        native.* = .{ .allocator = self.allocator, .tracker = tracker };
 
         const ch = self.allocator.create(Channel) catch {
-            if (native) |nv| nv.deinit();
+            native.deinit();
             _ = c.close(fd);
             return;
         };
@@ -712,32 +688,13 @@ pub const Daemon = struct {
             return;
         };
         var hdr: [5]u8 = undefined;
-        const kind: wire.ChannelKind = if (s.wl_native) .wayland_native else .wayland;
-        cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, kind));
+        cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .wayland_native));
     }
 
-    /// Forward hub-socket bytes to the channel's client as
-    /// chan_data frames. Bounded rounds keep one chatty app from
-    /// starving the loop.
+    /// App-socket bytes toward the client (the parsed sketerm-native
+    /// pipe). Winstream channels carry fd = -1 and never land here.
     fn channelReadable(self: *Daemon, ch: *Channel) void {
-        if (ch.native != null) return self.nativeReadable(ch);
-        var rounds: u8 = 0;
-        while (rounds < 4) : (rounds += 1) {
-            var buf: [4 + 16384]u8 = undefined;
-            const n_raw = c.read(ch.fd, buf[4..].ptr, buf.len - 4);
-            if (n_raw < 0) {
-                if (std.posix.errno(n_raw) != .AGAIN) self.closeChannel(ch, true);
-                return;
-            }
-            if (n_raw == 0) {
-                self.closeChannel(ch, true);
-                return;
-            }
-            const n: usize = @intCast(n_raw);
-            std.mem.writeInt(u32, buf[0..4], ch.id, .little);
-            ch.client.queueFrame(.chan_data, buf[0 .. 4 + n]);
-            if (n < buf.len - 4) return;
-        }
+        if (ch.native != null) self.nativeReadable(ch);
     }
 
     fn channelWritable(self: *Daemon, ch: *Channel) void {
@@ -1242,78 +1199,32 @@ pub const Daemon = struct {
         cl.queueJson(.ok, .{ .ok = true, .name = s.name });
     }
 
-    /// Vulkan ICD manifests installed on this host? waypipe needs
-    /// Vulkan for GPU-buffer (dmabuf) transfer and aborts app
-    /// connections without it — Vulkan-less hosts get --no-gpu.
-    fn hasVulkanIcd() bool {
-        for ([_][*:0]const u8{ "/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d" }) |dir| {
-            const d = c.opendir(dir) orelse continue;
-            defer _ = c.closedir(d);
-            while (c.readdir(d)) |ent| {
-                const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
-                if (std.mem.endsWith(u8, name, ".json")) return true;
-            }
-        }
-        return false;
-    }
-
-    /// waypipe present on this host? Cached after the first check.
-    fn waypipeAvailable() bool {
-        const S = struct {
-            var checked: bool = false;
-            var found: bool = false;
-        };
-        if (S.checked) return S.found;
-        S.checked = true;
-        const path_env = std.c.getenv("PATH") orelse return false;
-        var it = std.mem.splitScalar(u8, std.mem.span(path_env), ':');
-        var buf: [4096]u8 = undefined;
-        while (it.next()) |dir| {
-            if (dir.len == 0) continue;
-            const full = std.fmt.bufPrintZ(&buf, "{s}/waypipe", .{dir}) catch continue;
-            if (c.access(full.ptr, c.X_OK) == 0) {
-                S.found = true;
-                break;
-            }
-        }
-        return S.found;
-    }
-
     const WaylandHub = struct {
         fd: c_int,
-        hub_path: []u8,
         display_path: []u8,
     };
 
-    /// Create a session's Wayland hub socket + display paths next to
-    /// the daemon socket. Null on any failure — sessions must spawn
-    /// regardless, just without Wayland forwarding. In native mode
-    /// there is no waypipe between app and daemon, so the listening
-    /// socket IS the display socket (the .hub path goes unused).
-    fn setupWaylandHub(self: *Daemon, native: bool) ?WaylandHub {
+    /// Create a session's Wayland display socket next to the daemon
+    /// socket and listen on it — the daemon IS the display, so the
+    /// listening socket is the one the shell's $WAYLAND_DISPLAY points
+    /// at. Null on any failure (the session still spawns, just without
+    /// Wayland forwarding).
+    fn setupWaylandHub(self: *Daemon) ?WaylandHub {
         const dir_end = std.mem.lastIndexOfScalar(u8, self.sock_path, '/') orelse return null;
         const dir = self.sock_path[0..dir_end];
         const id = self.next_wl_id;
         self.next_wl_id += 1;
-        const hub_path = std.fmt.allocPrint(self.allocator, "{s}/wl-{d}.hub", .{ dir, id }) catch return null;
-        const display_path = std.fmt.allocPrint(self.allocator, "{s}/wl-{d}", .{ dir, id }) catch {
-            self.allocator.free(hub_path);
-            return null;
-        };
+        const display_path = std.fmt.allocPrint(self.allocator, "{s}/wl-{d}", .{ dir, id }) catch return null;
         var ok = false;
-        defer if (!ok) {
-            self.allocator.free(hub_path);
-            self.allocator.free(display_path);
-        };
+        defer if (!ok) self.allocator.free(display_path);
 
         var z_buf: [4096]u8 = undefined;
-        if (pathZ(&z_buf, hub_path)) |z| _ = c.unlink(z) else |_| return null;
         if (pathZ(&z_buf, display_path)) |z| _ = c.unlink(z) else |_| return null;
 
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
         if (fd < 0) return null;
         var addr: c.struct_sockaddr_un = undefined;
-        fillSockaddrUn(&addr, if (native) display_path else hub_path) catch {
+        fillSockaddrUn(&addr, display_path) catch {
             _ = c.close(fd);
             return null;
         };
@@ -1322,28 +1233,26 @@ pub const Daemon = struct {
             return null;
         }
         ok = true;
-        return .{ .fd = fd, .hub_path = hub_path, .display_path = display_path };
+        return .{ .fd = fd, .display_path = display_path };
     }
 
     /// Window-stream backend policy for a spawn. On macOS builds
     /// with the ScreenCaptureKit backend, app sessions capture
     /// automatically (their apps have no forwardable display
-    /// protocol) UNLESS the client pinned a wl_mode — an explicit
-    /// Wayland request (test rigs, `sketerm app -u`) wins. The
-    /// SKETERM_WINSTREAM env is the rig override: "stub" = test
-    /// pattern for app sessions, "all" = test pattern for every
-    /// session, "sck" = real capture for every session. Any value
-    /// but "sck" forces the stub so smoke-mux and Linux rigs get a
-    /// deterministic pattern.
+    /// protocol). The SKETERM_WINSTREAM env is the rig override:
+    /// "stub" = test pattern for app sessions, "all" = test pattern
+    /// for every session, "sck" = real capture for every session. Any
+    /// value but "sck" forces the stub so smoke-mux and Linux rigs get
+    /// a deterministic pattern.
     /// `hosts_apps` = this session would forward GUI apps on Linux
-    /// (interactive command, forwarding not disabled, not the waypipe
-    /// wrapper itself). On macOS, winstream IS that forwarding
-    /// mechanism, so capture turns on for ANY such session — a GUI
-    /// app launched from a durable Mac shell streams exactly like one
-    /// launched from a Linux durable shell ($WAYLAND_DISPLAY). Env
-    /// overrides for the test rigs: "off" suppresses the macOS auto
-    /// gate (Linux-like behaviour), "all"/"sck" widen to every
-    /// session, "stub"/other force the test pattern.
+    /// (interactive command, forwarding not disabled). On macOS,
+    /// winstream IS that forwarding mechanism, so capture turns on for
+    /// ANY such session — a GUI app launched from a durable Mac shell
+    /// streams exactly like one launched from a Linux durable shell
+    /// ($WAYLAND_DISPLAY). Env overrides for the test rigs: "off"
+    /// suppresses the macOS auto gate (Linux-like behaviour),
+    /// "all"/"sck" widen to every session, "stub"/other force the
+    /// test pattern.
     fn winstreamGate(req: SpawnReq, hosts_apps: bool) struct { want: bool, use_sck: bool } {
         const env = std.c.getenv("SKETERM_WINSTREAM");
         const val: ?[]const u8 = if (env) |e| std.mem.span(e) else null;
@@ -1356,10 +1265,8 @@ pub const Daemon = struct {
         const widen = eq(val, "all") or eq(val, "sck");
         // macOS apps have no display protocol to forward — winstream
         // is the only mechanism, so it stands in for Wayland
-        // forwarding on any app-hosting session (default wl_mode;
-        // explicit native/waypipe requests are Linux-specific).
-        const auto_mac = (comptime wssource.have_sck) and !off and
-            hosts_apps and req.wl_mode.len == 0;
+        // forwarding on any app-hosting session.
+        const auto_mac = (comptime wssource.have_sck) and !off and hosts_apps;
         return .{
             .want = req.winstream or (val != null and !off and (req.app or widen)) or auto_mac,
             .use_sck = (comptime wssource.have_sck) and (val == null or eq(val, "sck")),
@@ -1369,44 +1276,23 @@ pub const Daemon = struct {
     fn spawnSession(self: *Daemon, req: SpawnReq) !*Session {
         const allocator = self.allocator;
 
-        // Wayland forwarding. DEFAULT: the sketerm-native pipe —
-        // the daemon listens on the session's display socket itself,
-        // nothing else installed. SKETERM_MUX_WAYLAND=waypipe opts
-        // back into the legacy `waypipe server` wrap (e.g. for
-        // GPU-buffer transfer); SKETERM_MUX_NO_WAYLAND=1 disables
-        // app forwarding entirely.
-        // Does this session host GUI apps at all? Forwarding not
-        // disabled, an interactive command, not the waypipe wrapper
-        // itself. Drives BOTH Wayland forwarding (Linux) and
-        // winstream capture (macOS) — they're the same notion of
-        // "a session whose child apps should appear on the client".
+        // Wayland forwarding: the daemon IS the session's display —
+        // it listens on the display socket itself and parses each app
+        // connection. SKETERM_MUX_NO_WAYLAND=1 disables app forwarding.
+        // hosts_apps: forwarding enabled with an actual command —
+        // drives BOTH Wayland forwarding (Linux) and winstream capture
+        // (macOS), the same notion of "a session whose child apps
+        // should appear on the client".
         const hosts_apps = std.c.getenv("SKETERM_MUX_NO_WAYLAND") == null and
-            req.argv.len > 0 and
-            !std.mem.eql(u8, std.fs.path.basename(req.argv[0]), "waypipe");
+            req.argv.len > 0;
 
         // Window-stream backend (pixel capture): policy in winstreamGate.
         const ws_gate = winstreamGate(req, hosts_apps);
 
-        var use_waypipe = false;
-        var forwarding_possible = !ws_gate.want;
-        if (std.mem.eql(u8, req.wl_mode, "waypipe")) {
-            // The client can ONLY bridge waypipe (headless `sketerm
-            // app -u`): without waypipe here, forwarding is off —
-            // a native session would dead-end at that client.
-            use_waypipe = true;
-            forwarding_possible = waypipeAvailable();
-        } else if (!std.mem.eql(u8, req.wl_mode, "native")) {
-            const env = std.c.getenv("SKETERM_MUX_WAYLAND");
-            use_waypipe = env != null and
-                std.mem.eql(u8, std.mem.span(env.?), "waypipe") and
-                waypipeAvailable();
-        }
-        const native_wayland = !use_waypipe;
-        const want_wayland = forwarding_possible and hosts_apps;
-        var hub: ?WaylandHub = if (want_wayland) self.setupWaylandHub(native_wayland) else null;
+        const want_wayland = !ws_gate.want and hosts_apps;
+        var hub: ?WaylandHub = if (want_wayland) self.setupWaylandHub() else null;
         errdefer if (hub) |h| {
             _ = c.close(h.fd);
-            allocator.free(h.hub_path);
             allocator.free(h.display_path);
         };
 
@@ -1417,40 +1303,17 @@ pub const Daemon = struct {
         }
         var argv_ptrs: std.ArrayList([*:0]const u8) = .empty;
         defer argv_ptrs.deinit(allocator);
-        if (hub != null and !native_wayland) {
-            const h = hub.?;
-            // Options must precede the mode word (waypipe 0.11 CLI).
-            const base = [_][]const u8{ "waypipe", "--socket", h.hub_path, "--display", h.display_path };
-            const tail = [_][]const u8{ "server", "--" };
-            for (base) |a| {
-                const z = try allocator.dupeZ(u8, a);
-                try argv_z.append(allocator, z);
-                try argv_ptrs.append(allocator, z.ptr);
-            }
-            if (!hasVulkanIcd()) {
-                const z = try allocator.dupeZ(u8, "--no-gpu");
-                try argv_z.append(allocator, z);
-                try argv_ptrs.append(allocator, z.ptr);
-            }
-            for (tail) |a| {
-                const z = try allocator.dupeZ(u8, a);
-                try argv_z.append(allocator, z);
-                try argv_ptrs.append(allocator, z.ptr);
-            }
-        }
         for (req.argv) |a| {
             const z = try allocator.dupeZ(u8, a);
             try argv_z.append(allocator, z);
             try argv_ptrs.append(allocator, z.ptr);
         }
 
-        // Native mode: the daemon is the display, so the daemon must
-        // set the child's WAYLAND_DISPLAY (waypipe did it before).
+        // The daemon is the display, so it sets the child's
+        // WAYLAND_DISPLAY (= the hub's display socket).
         var wl_disp_z: ?[:0]u8 = null;
         defer if (wl_disp_z) |z| allocator.free(z);
-        if (native_wayland) {
-            if (hub) |h| wl_disp_z = try allocator.dupeZ(u8, h.display_path);
-        }
+        if (hub) |h| wl_disp_z = try allocator.dupeZ(u8, h.display_path);
 
         var pty = try Pty.spawn(.{
             .argv = argv_ptrs.items,
@@ -1491,9 +1354,7 @@ pub const Daemon = struct {
         };
         if (hub) |h| {
             s.wl_hub_fd = h.fd;
-            s.wl_hub_path = h.hub_path;
             s.wl_display_path = h.display_path;
-            s.wl_native = native_wayland;
             hub = null; // ownership moved to the session
         }
         if (ws_gate.want) create_ws: {
@@ -1795,7 +1656,7 @@ pub const Daemon = struct {
 
     fn reap(self: *Daemon) void {
         // A dying client takes its channels down — the remote apps'
-        // waypipe connections see EOF and fail cleanly.
+        // display connections see EOF and fail cleanly.
         for (self.channels.items) |ch| {
             if (ch.client.dead) ch.dead = true;
         }

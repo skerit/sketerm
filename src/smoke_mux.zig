@@ -414,10 +414,6 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) bool {
         .rows = @as(u16, 10),
         .cols = @as(u16, 60),
         .app = true,
-        // This stage asserts the NATIVE pipe: keep it pinned even
-        // on hosts where app sessions default to window streaming
-        // (macOS) or waypipe (SKETERM_MUX_WAYLAND).
-        .wl_mode = "native",
     }) catch fail("app-stage spawn");
     (conn.recvExpect(&.{.ok}) catch fail("app-stage spawn ok")).deinit(allocator);
     conn.sendJson(.attach, .{ .name = "wlapp" }) catch fail("app-stage attach");

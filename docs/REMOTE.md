@@ -128,10 +128,13 @@ Supported today: windows (resizable, titled, with the app's icon),
 keyboard + mouse, menus/popups, text clipboard both ways. Damage
 tracking + deflate keep buffer traffic reasonable over a network.
 Pixel transport is shm-only — software-rendered GL works (Mesa
-presents via shm), GPU-buffer (dmabuf) apps don't. For those,
-`SKETERM_MUX_WAYLAND=waypipe` in the daemon's environment opts back
-into the legacy waypipe wrap (needs waypipe installed remotely);
+presents via shm), GPU-buffer (dmabuf) apps don't.
 `SKETERM_MUX_NO_WAYLAND=1` disables forwarding entirely.
+
+`sketerm app [-u] <host> <cmd>` is the one-shot form: it spawns the
+app in a fresh durable session and hands it to the running sketerm
+window to render. A sketerm window must already be open on this
+desktop — it is the compositor.
 
 ## Remote macOS apps (window streaming)
 

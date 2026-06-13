@@ -40,24 +40,22 @@ pub const FrameType = enum(u8) {
     ok = 69,
     err = 70,
     // Byte channels (both directions). Generic multiplexed streams
-    // riding the mux connection — used to tunnel a session's
-    // Wayland (waypipe) traffic, so forwarded apps inherit whatever
-    // transport the terminal uses (incl. roaming UDP). The daemon
-    // initiates with chan_open; chan_data/chan_close flow both ways.
+    // riding the mux connection — used to tunnel a session's app
+    // protocol, so forwarded apps inherit whatever transport the
+    // terminal uses (incl. roaming UDP). The daemon initiates with
+    // chan_open; chan_data/chan_close flow both ways.
     chan_open = 80,
     chan_data = 81,
     chan_close = 82,
     _,
 };
 
-/// chan_open payload kinds. Append-only.
+/// chan_open payload kinds. Append-only — 1 (legacy waypipe bridge)
+/// is retired and never emitted.
 pub const ChannelKind = enum(u8) {
-    /// A waypipe-server connection from the session's Wayland
-    /// display; bridge it to the local waypipe client.
-    wayland = 1,
     /// Sketerm-native app pipe: chan_data carries wlhost/pipe.zig
-    /// units (Wayland messages + shm pool side-band), no waypipe on
-    /// either end. The GUI compositor brain consumes it directly.
+    /// units (Wayland messages + shm pool side-band). The GUI
+    /// compositor brain consumes it directly.
     wayland_native = 2,
     /// Window pixel stream (winstream/proto.zig units): remotes
     /// with no forwardable display protocol — macOS capture agent;

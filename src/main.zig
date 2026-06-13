@@ -48,12 +48,11 @@ const HELP_TEXT =
     \\                         with `sketerm mux <host>`).
     \\  sketerm app [-u] <host> <command...>
     \\                         Run a remote GUI app with its windows
-    \\                         on this desktop (compressed Wayland
-    \\                         forwarding — fast, unlike ssh -X).
-    \\                         Needs key auth; Linux remotes need
-    \\                         the `waypipe` package installed.
+    \\                         on this desktop (this sketerm window
+    \\                         renders them). Needs key auth and
+    \\                         sketerm-mux on the remote.
     \\                         -u: mosh-style encrypted UDP with
-    \\                         roaming (needs sketerm-mux remotely).
+    \\                         roaming.
     \\
     \\Options:
     \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json

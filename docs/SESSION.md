@@ -5575,3 +5575,30 @@ GTK-free. PENDING (needs an unlocked GUI session / a Linux box — the
 validation Mac kept auto-locking): the Wayland AppHost VISUAL
 regression eyeball, the acceptance script's live leg, and a full
 Linux-client → Mac-app run.
+
+## Remote-app fixes + waypipe removal (2026-06-13)
+
+- **Crash on hover (cairo double-free)**: `wlhost/compositor.zig` sent
+  `wl_buffer.release` on every commit, not just the one that attached
+  the buffer; GTK's frame-callback-only repaints (cursor/hover)
+  released the same buffer repeatedly, underflowing the client's cairo
+  refcount and aborting the app. Released once per attach now.
+- **Manual resize**: undecorated host windows got an 8px edge/corner
+  resize band (`remote_window.resizeEdgeAt` + `wlapp` input handlers).
+- **App CSD shadow restored**: stopped cropping the shadow out. The
+  full buffer is shown and the shadow margin is reported as the host
+  toplevel's shadow width (GdkToplevel `compute-size`, connected AFTER
+  GTK's handler), so KWin's geometry = the content rect — snapping,
+  tiling and maximize hit the real edge while the app's own shadow
+  stays visible. Maximize sizing comes from the toplevel bounds in the
+  compute-size handler (the allocation isn't settled at
+  notify::maximized).
+- **waypipe removed entirely**: the daemon is the only Wayland display
+  (no `waypipe server` wrap, no `wl_mode`); the GUI renders every app
+  via the `wlhost` compositor (no `waypipe client`/`wlbridge`). Deleted
+  `src/wlbridge.zig`, the `.wayland` channel kind/path, and the legacy
+  `sketerm app` waypipe + headless-UDP fallbacks. `sketerm app [-u]`
+  now always uses the native pipe and REQUIRES a running sketerm
+  window; `-u` routes through the native path over roaming UDP.
+
+551 tests, smoke-mux, mux + mux-portable green; mux stays GTK-free.

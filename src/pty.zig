@@ -41,7 +41,7 @@ pub const SpawnOpts = struct {
     shell_integration: ?ShellIntegration = null,
     /// WAYLAND_DISPLAY for the child (absolute socket path). Used by
     /// the mux daemon's native app pipe, where the daemon itself is
-    /// the display (waypipe used to set this for its wrapped child).
+    /// the session's Wayland display.
     wayland_display: ?[*:0]const u8 = null,
 };
 
