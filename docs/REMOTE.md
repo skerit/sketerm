@@ -143,6 +143,10 @@ injected back via CGEvents. App sessions on a Mac use this
 automatically — same wire, same transports (ssh / mux socket /
 roaming UDP), nothing to choose.
 
+> **Setting up a Mac host?** `docs/macos-winstream-setup.md` is the
+> complete copy-paste runbook (cert, deploy script, grants,
+> troubleshooting). The summary below covers the same ground.
+
 Setup is a one-time dance with three non-obvious macOS constraints
 (all validated on hardware — frames + input + window-close confirmed
 end to end). `dist/deploy-macos.sh` automates the repeatable part.

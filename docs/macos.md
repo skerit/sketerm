@@ -127,3 +127,11 @@ Verified on this hardware: stub winstream round-trip (smoke-mux
 PASS natively), SCK daemon launch via LaunchAgent, missing-grant
 notice window + actionable daemon log end-to-end over the real mux
 socket. Real-capture validation requires the manual TCC toggles.
+
+## Remote macOS apps (window streaming)
+
+Streaming this Mac's app windows to a sketerm client (ScreenCaptureKit
+capture + CGEvent input) has its own setup — code signing, a
+GUI-session LaunchAgent, and TCC grants. The complete runbook is
+**`docs/macos-winstream-setup.md`**; `dist/deploy-macos.sh` automates
+the repeatable build→sign→reload step.
