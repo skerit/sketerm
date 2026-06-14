@@ -15,7 +15,6 @@ const cast = @import("../util/cast.zig");
 const profile = @import("../util/profile.zig");
 
 const TAB_W: c_int = 170;
-const PIN_W: c_int = 56;
 /// Activity glow fade time once a tab goes quiet (after any sustain
 /// window): full → gone over this many microseconds.
 const GLOW_DECAY_US: f64 = 2_600_000;
@@ -73,8 +72,6 @@ var tab_gtype: c.GType = 0;
 var tabbar_gtype: c.GType = 0;
 var tabbox_gtype: c.GType = 0;
 var tabboxchild_gtype: c.GType = 0;
-/// Saved tabbox snapshot vfunc (unused: we draw children ourselves).
-var orig_tabbox_snapshot: ?*const fn (widget: [*c]c.GtkWidget, snapshot: ?*c.GtkSnapshot) callconv(.c) void = null;
 /// Saved GObject dispose for the tab widget, chained after unparenting.
 var orig_tab_dispose: ?*const fn (object: [*c]c.GObject) callconv(.c) void = null;
 
@@ -248,7 +245,6 @@ fn tabboxClassInit(klass: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
     // drawn by the widget machinery around each child, not inside the
     // child's own snapshot vfunc, so only the parent can shift the whole
     // tab decoration.
-    orig_tabbox_snapshot = wc.snapshot;
     wc.snapshot = tabboxSnapshot;
 }
 

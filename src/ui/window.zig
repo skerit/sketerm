@@ -1,7 +1,7 @@
 //! Window — wraps an AdwApplicationWindow with AdwTabView + TabBar.
 //!
-//! Each tab hosts one Pane (one Terminal). Multi-pane (split) per
-//! tab arrives in M7.
+//! Each tab owns a PaneTree (src/ui/tree.zig) of one or more split
+//! Panes, each wrapping a Terminal.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
