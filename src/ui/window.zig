@@ -25,6 +25,8 @@ const tree_mod = @import("tree.zig");
 /// below also updates the model. See src/ui/tree.zig.
 pub const PaneTree = tree_mod.Tree(*Pane);
 const TAB_TREE_KEY = "sketerm-tree";
+/// qdata key: monotonic-us timestamp of a tab's last visible activity.
+const TAB_ACTIVITY_KEY = "sketerm-tab-activity-us";
 const ipc_protocol = @import("../ipc/protocol.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
 const Screen = @import("../grid/screen.zig").Screen;
@@ -1703,6 +1705,8 @@ pub const Window = struct {
         pane.win_on_set_profile = onTermSetProfile;
         pane.win_focus_ctx = @ptrCast(self);
         pane.win_on_focus_enter = onPaneFocused;
+        pane.win_activity_ctx = @ptrCast(self);
+        pane.win_on_activity = onTermActivity;
         // OSC 0/1/2 titles drive the AdwTabPage title — but only
         // until the user explicitly renames the tab (which sets the
         // "user-locked" flag on the page). Renaming with an empty
@@ -2018,6 +2022,7 @@ pub const Window = struct {
         term.screen.scrollback_capacity = s.scrollback;
         term.screen.bracketed_paste = self.config.bracketed_paste;
         term.screen.scroll_on_output = self.config.scroll_on_output;
+        term.screen.track_activity = self.config.track_tab_activity;
         term.screen.allow_clipboard_read = self.config.clipboard_read;
         // Initial dark/light for DSR ?996 / mode 2031, derived from
         // the effective background's luminance — that's what apps
@@ -3050,6 +3055,7 @@ pub const Window = struct {
             screen.configured_bg = eff.bg;
             screen.notifyColorScheme(isDarkBg(eff.bg));
             screen.allow_clipboard_read = self.config.clipboard_read;
+            screen.track_activity = self.config.track_tab_activity;
             // Renderer convention: alpha=0 means "use fg colour". We
             // map cursor_color_default → that sentinel.
             screen.cursor_color = if (s.cursor_color_default)
@@ -6012,6 +6018,18 @@ fn onPaneFocused(ctx: ?*anyopaque, pane: *Pane) void {
     const self = cast.userData(Window, ctx);
     const page = tabPageForPane(self, pane) orelse return;
     if (Window.tabTreeOf(page)) |t| t.last_focused = pane;
+}
+
+/// A pane's visible grid changed (true content change, not just bytes).
+/// Stamp the tab with a monotonic-us timestamp; the tab bar reads it to
+/// drive the activity glow and decays it once output stops. The tab
+/// you're already looking at is trivially "active", so skip it.
+fn onTermActivity(ctx: ?*anyopaque, pane: *Pane) void {
+    const self = cast.userData(Window, ctx);
+    const page = tabPageForPane(self, pane) orelse return;
+    if (page == c.adw_tab_view_get_selected_page(self.tab_view)) return;
+    const now_us: usize = @intCast(c.g_get_monotonic_time());
+    c.g_object_set_data(@ptrCast(@alignCast(page)), TAB_ACTIVITY_KEY, @ptrFromInt(now_us));
 }
 
 fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {

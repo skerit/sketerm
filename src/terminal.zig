@@ -82,6 +82,15 @@ pub const Terminal = struct {
     /// the dirty bit — saves up to one frame of latency on
     /// keystroke echo + heavy output.
     on_render_request: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// Fired from the drain ONLY when the visible grid actually changed
+    /// this batch (content hash differs) — the tab-activity signal.
+    /// Distinct from on_render_request, which fires on any dirty.
+    on_activity: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// Last visible-content hash, to detect real change across drains.
+    last_content_hash: u64 = 0,
+    /// False after a scroll short-circuit left `last_content_hash` stale;
+    /// the next in-place drain re-baselines instead of firing.
+    hash_valid: bool = false,
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
     on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void = null,
@@ -792,6 +801,7 @@ pub const Terminal = struct {
         self.on_clipboard_set = null;
         self.on_clipboard_get = null;
         self.on_render_request = null;
+        self.on_activity = null;
         self.on_bell = null;
         self.on_image = null;
         self.on_image_delete_full = null;
@@ -1069,6 +1079,10 @@ pub const Terminal = struct {
         const max_events: u32 = 4096;
         const budget_ms: i64 = 3;
         const start_ms = profile_util.milliTimestamp();
+        // Snapshot the line-id counter so we can tell, after the drain,
+        // whether any new lines were born (scroll / append) — a definite
+        // visible change we can flag without hashing.
+        const line_id_before = self.screen.next_line_id;
         var processed: u32 = 0;
         var over_budget = false;
         while (self.ring.pop()) |ev| {
@@ -1098,6 +1112,32 @@ pub const Terminal = struct {
         // app will tell us when to flush.
         if (self.screen.dirty and !self.screen.sync_output) {
             if (self.on_render_request) |f| f(self.user_ctx);
+        }
+
+        // Tab-activity signal: fire only when the VISIBLE grid actually
+        // changed this batch, not merely when bytes arrived. Gated by
+        // config; skipped mid synchronized-update (DECSET 2026).
+        if (self.screen.track_activity and processed > 0 and !self.screen.sync_output) {
+            if (self.screen.next_line_id != line_id_before) {
+                // New lines were born (scroll / append): the screen
+                // definitely changed. Flag it without hashing — but the
+                // hash baseline is now stale.
+                self.hash_valid = false;
+                if (self.on_activity) |f| f(self.user_ctx);
+            } else {
+                // Nothing scrolled, so only an in-place change (TUI,
+                // status line, spinner) could have altered the screen.
+                // Hash it to tell a real change from an identical repaint.
+                const h = self.screen.contentHash();
+                if (!self.hash_valid) {
+                    // Re-baseline silently after a scroll short-circuit.
+                    self.last_content_hash = h;
+                    self.hash_valid = true;
+                } else if (h != self.last_content_hash) {
+                    self.last_content_hash = h;
+                    if (self.on_activity) |f| f(self.user_ctx);
+                }
+            }
         }
 
         // Ring not empty: re-arm with the same coalescing dance the

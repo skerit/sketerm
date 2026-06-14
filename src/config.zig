@@ -173,6 +173,11 @@ pub const Config = struct {
     /// the gnome-terminal "auto-tail" behaviour flip this.
     scroll_on_output: bool = false,
 
+    /// Show a per-tab activity indicator when a background tab's visible
+    /// output actually changes. The signal is computed in the event
+    /// drain (so it works for unfocused tabs); off skips that work.
+    track_tab_activity: bool = true,
+
     /// What to do when a pane's shell exits.
     exit_action: ExitAction = .close,
 
@@ -647,6 +652,7 @@ pub const Config = struct {
 
         // Behavioural extras.
         if (self.scroll_on_output) try w.writeAll("scroll_on_output = true\n");
+        if (!self.track_tab_activity) try w.writeAll("track_tab_activity = false\n");
         if (!self.smart_copy) try w.writeAll("smart_copy = false\n");
         if (!std.mem.eql(u8, self.word_chars, "-_.,/?:@&=+%~"))
             try w.print("word_chars = {s}\n", .{self.word_chars});
@@ -1080,6 +1086,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.bell_urgent = try parseBool(value);
     } else if (std.mem.eql(u8, key, "scroll_on_output")) {
         cfg.scroll_on_output = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "track_tab_activity")) {
+        cfg.track_tab_activity = try parseBool(value);
     } else if (std.mem.eql(u8, key, "smart_copy")) {
         cfg.smart_copy = try parseBool(value);
     } else if (std.mem.eql(u8, key, "close_button_on_tab")) {
@@ -1379,6 +1387,7 @@ test "config: palette + scheme + new keys round-trip" {
         .{ 0x83, 0x94, 0x96 }, .{ 0x6c, 0x71, 0xc4 }, .{ 0x93, 0xa1, 0xa1 }, .{ 0xfd, 0xf6, 0xe3 },
     };
     cfg.scroll_on_output = true;
+    cfg.track_tab_activity = false;
     cfg.smart_copy = false;
     cfg.settings.login_shell = true;
     cfg.settings.cursor_color_default = false;
@@ -1402,6 +1411,7 @@ test "config: palette + scheme + new keys round-trip" {
     try std.testing.expectEqual(@as(u8, 0xdc), parsed.settings.palette.?[1][0]);
     try std.testing.expectEqual(@as(u8, 0xfd), parsed.settings.palette.?[15][0]);
     try std.testing.expectEqual(true, parsed.scroll_on_output);
+    try std.testing.expectEqual(false, parsed.track_tab_activity);
     try std.testing.expectEqual(false, parsed.smart_copy);
     try std.testing.expectEqual(true, parsed.settings.login_shell);
     try std.testing.expectEqual(false, parsed.settings.cursor_color_default);
