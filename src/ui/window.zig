@@ -18,6 +18,7 @@ const bg_pass_mod = @import("../render/bg_pass.zig");
 const shader_pass_mod = @import("../render/shader_pass.zig");
 const shader_preset_mod = @import("../shader_preset.zig");
 const tree_mod = @import("tree.zig");
+const tabbar_mod = @import("tabbar.zig");
 
 /// Toolkit-free pane-tree model — one per tab, attached to the
 /// AdwTabPage as qdata (travels with cross-window tab drags). The
@@ -165,6 +166,9 @@ pub const Window = struct {
     /// Held so applyConfigChange can re-parent the tab bar between
     /// top and bottom of the toolbar view at runtime.
     tab_bar: *c.GtkWidget,
+    /// Custom tab strip controller (owns rendering; bound to tab_view).
+    /// `tab_bar` is its root widget, used for show/hide + toolbar moves.
+    tabbar: *tabbar_mod.TabBar,
     toolbar_view: *c.GtkWidget,
     title_buf: [256]u8 = undefined,
     panes: std.ArrayList(*Pane) = .empty,
@@ -307,10 +311,11 @@ pub const Window = struct {
         // no drag handle for the window.
         const toolbar_view = c.adw_toolbar_view_new();
         const header_bar = c.adw_header_bar_new();
-        const tab_bar_w = c.adw_tab_bar_new();
         const tab_view_w = c.adw_tab_view_new();
-        c.adw_tab_bar_set_view(@ptrCast(tab_bar_w), @ptrCast(tab_view_w));
-        c.adw_tab_bar_set_autohide(@ptrCast(tab_bar_w), 0);
+        // Custom tab strip in place of AdwTabBar — we own the rendering
+        // (activity glow). AdwTabView still owns the page model.
+        const tabbar = try tabbar_mod.TabBar.create(allocator, @ptrCast(tab_view_w));
+        const tab_bar_w = tabbar.root;
         c.gtk_widget_set_vexpand(@ptrCast(@alignCast(tab_view_w)), 1);
 
         // "+" button in the header bar to create a new tab even when
@@ -392,6 +397,7 @@ pub const Window = struct {
             .app_window = app_window,
             .tab_view = @ptrCast(tab_view_w),
             .tab_bar = @ptrCast(@alignCast(tab_bar_w)),
+            .tabbar = tabbar,
             .toolbar_view = @ptrCast(@alignCast(toolbar_view)),
             .allocator = allocator,
             .config = if (config_override) |co| co else Config.load(allocator),
@@ -400,6 +406,14 @@ pub const Window = struct {
             .search_entry = search_entry,
             .search_label = search_label,
         };
+
+        // Drag-a-tab-out-of-the-strip → new window.
+        self.tabbar.detach_ctx = @ptrCast(self);
+        self.tabbar.on_detach = onTabDetach;
+
+        // Honor the configured GTK theme (libadwaita otherwise ignores
+        // it) so the user's tab styling applies to our real `tab` nodes.
+        tabbar_mod.loadTheme(self.tabbar, self.config.gtk_theme);
 
         // Honour Config.show_tab_bar at startup. Default true matches
         // the GTK widget default; users can hide via config or the
@@ -6030,6 +6044,7 @@ fn onTermActivity(ctx: ?*anyopaque, pane: *Pane) void {
     if (page == c.adw_tab_view_get_selected_page(self.tab_view)) return;
     const now_us: usize = @intCast(c.g_get_monotonic_time());
     c.g_object_set_data(@ptrCast(@alignCast(page)), TAB_ACTIVITY_KEY, @ptrFromInt(now_us));
+    self.tabbar.ensureTick();
 }
 
 fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
@@ -6316,6 +6331,15 @@ fn onPageAttached(_: *c.AdwTabView, page: *c.AdwTabPage, _: c_int, user: ?*anyop
     const child = c.adw_tab_page_get_child(page) orelse return;
     self.adoptPanesInTree(@ptrCast(child));
     self.updateTaskbarProgress();
+}
+
+/// Custom-strip drag-out: a tab was dropped outside any strip. Spawn a
+/// secondary window and transfer the page into it (mirrors the AdwTabBar
+/// "create-window" behaviour, but driven by our own GtkDragSource).
+fn onTabDetach(ctx: ?*anyopaque, view: *c.AdwTabView, page: *c.AdwTabPage) void {
+    const self = cast.userData(Window, ctx);
+    const win = self.spawnSecondaryWindow() orelse return;
+    c.adw_tab_view_transfer_page(view, page, win.tab_view, 0);
 }
 
 /// AdwTabView "create-window": a tab is being dragged out of every

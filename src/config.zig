@@ -178,6 +178,13 @@ pub const Config = struct {
     /// drain (so it works for unfocused tabs); off skips that work.
     track_tab_activity: bool = true,
 
+    /// Name of a GTK theme to load (its `gtk-4.0/gtk.css` from
+    /// `~/.themes`, `~/.local/share/themes`, or the system theme dirs),
+    /// applied over libadwaita's stylesheet. Empty = honor the session's
+    /// GTK_THEME / active theme. Lets you style sketerm (e.g. its tabs)
+    /// with your desktop theme even though libadwaita ships its own.
+    gtk_theme: []const u8 = "",
+
     /// What to do when a pane's shell exits.
     exit_action: ExitAction = .close,
 
@@ -399,6 +406,7 @@ pub const Config = struct {
         out.hint_editor = try arena.dupe(u8, self.hint_editor);
         out.background_image = try arena.dupe(u8, self.background_image);
         out.word_chars = try arena.dupe(u8, self.word_chars);
+        out.gtk_theme = try arena.dupe(u8, self.gtk_theme);
         out.mux_udp_port_range = try arena.dupe(u8, self.mux_udp_port_range);
         out.default_profile = try arena.dupe(u8, self.default_profile);
         out.keybinds = .empty;
@@ -656,6 +664,7 @@ pub const Config = struct {
         if (!self.smart_copy) try w.writeAll("smart_copy = false\n");
         if (!std.mem.eql(u8, self.word_chars, "-_.,/?:@&=+%~"))
             try w.print("word_chars = {s}\n", .{self.word_chars});
+        if (self.gtk_theme.len > 0) try w.print("gtk_theme = {s}\n", .{self.gtk_theme});
         if (self.mux_udp_port_range.len > 0)
             try w.print("mux_udp_port_range = {s}\n", .{self.mux_udp_port_range});
 
@@ -1094,6 +1103,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.close_button_on_tab = try parseBool(value);
     } else if (std.mem.eql(u8, key, "word_chars")) {
         cfg.word_chars = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "gtk_theme")) {
+        cfg.gtk_theme = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "mux_udp_port_range")) {
         // Validate lo:hi here so a typo warns at load, not mid-ssh.
         const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.BadPortRange;
