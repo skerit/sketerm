@@ -14,9 +14,9 @@ const proto = @import("proto.zig");
 const keymap = @import("keymap.zig");
 
 const CEvent = extern struct {
-    kind: u32, // 0 open, 1 frame, 2 title, 3 close
+    kind: u32, // 0 open, 1 frame, 2 title, 3 close, 4 drag-rects
     win: u32,
-    w: i32,
+    w: i32, // kind 4: rect count
     h: i32,
     data: ?[*]const u8,
     len: usize,
@@ -155,6 +155,23 @@ pub const Source = struct {
                     var pbuf: [4]u8 = undefined;
                     std.mem.writeInt(u32, &pbuf, ev.win, .little);
                     try proto.appendUnit(out, out_allocator, .win_close, &pbuf);
+                },
+                4 => {
+                    // Drag-rect blob: i16[0]=ref_w, i16[1]=ref_h, then
+                    // ev.w rects of i16{x,y,w,h}. The shim keeps it alive
+                    // until the next drain (its drain_hold), so copy out
+                    // here. See sck_shim.m compute_drag_rects.
+                    const d = ev.data orelse continue;
+                    const vals: [*]align(1) const i16 = @ptrCast(d);
+                    const cnt = @min(@as(usize, @intCast(@max(ev.w, 0))), proto.max_drag_rects);
+                    var rects: [proto.max_drag_rects]proto.DragRect = undefined;
+                    for (0..cnt) |i| rects[i] = .{
+                        .x = vals[2 + i * 4],
+                        .y = vals[2 + i * 4 + 1],
+                        .w = vals[2 + i * 4 + 2],
+                        .h = vals[2 + i * 4 + 3],
+                    };
+                    try proto.appendWinDrag(out, out_allocator, ev.win, vals[0], vals[1], rects[0..cnt]);
                 },
                 else => {},
             }
