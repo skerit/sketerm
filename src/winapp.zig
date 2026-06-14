@@ -286,6 +286,13 @@ pub const WsHost = struct {
         // window and ours stays put.
         if (btn == 1 and win.inDragRegion(x, y)) {
             win.fwd_press = false;
+            // Claim the sequence BEFORE begin_move — as GtkWindowHandle
+            // does. The interactive move hands the pointer grab to the
+            // compositor, so this gesture never sees the button-release;
+            // claiming resolves the sequence cleanly so it resets and
+            // keeps firing for later clicks. Without it the gesture stays
+            // stuck on button 1 and every subsequent click is swallowed.
+            c.gtk_gesture_set_state(@ptrCast(g), c.GTK_EVENT_SEQUENCE_CLAIMED);
             rw.beginMove(win.window, btn, x, y);
             return;
         }
