@@ -26,8 +26,6 @@ const tabbar_mod = @import("tabbar.zig");
 /// below also updates the model. See src/ui/tree.zig.
 pub const PaneTree = tree_mod.Tree(*Pane);
 const TAB_TREE_KEY = "sketerm-tree";
-/// qdata key: monotonic-us timestamp of a tab's last visible activity.
-const TAB_ACTIVITY_KEY = "sketerm-tab-activity-us";
 const ipc_protocol = @import("../ipc/protocol.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
 const Screen = @import("../grid/screen.zig").Screen;
@@ -6042,8 +6040,7 @@ fn onTermActivity(ctx: ?*anyopaque, pane: *Pane) void {
     const self = cast.userData(Window, ctx);
     const page = tabPageForPane(self, pane) orelse return;
     if (page == c.adw_tab_view_get_selected_page(self.tab_view)) return;
-    const now_us: usize = @intCast(c.g_get_monotonic_time());
-    c.g_object_set_data(@ptrCast(@alignCast(page)), TAB_ACTIVITY_KEY, @ptrFromInt(now_us));
+    tabbar_mod.recordActivity(page);
     self.tabbar.ensureTick();
 }
 
