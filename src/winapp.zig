@@ -7,6 +7,7 @@
 //! end is pixels, not protocol.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const cast = @import("util/cast.zig");
 const proto = @import("winstream/proto.zig");
@@ -27,6 +28,33 @@ pub const WsHost = struct {
         id: u32,
         window: *c.GtkWindow,
         picture: *c.GtkWidget,
+        /// Last size applied to the GtkWindow, in points. The remote
+        /// window resizes (e.g. Calculator Basic↔Scientific) by sending
+        /// frames at a new resolution; we resize the window to match.
+        w: i32 = 0,
+        h: i32 = 0,
+        /// Pending revert of the macOS opaque-resize workaround (0 =
+        /// none). See armOpaqueResize.
+        opaque_settle_id: c_uint = 0,
+
+        /// macOS: a non-opaque NSWindow only composites the region its
+        /// backing was last painted into, so a growing window leaves the
+        /// new area transparent until the app repaints it. Make the
+        /// window opaque for the duration of a resize (the grown region
+        /// then composites), reverting ~400ms after it settles. Mirrors
+        /// wlapp.zig's armOpaqueResize for the winstream path.
+        fn armOpaqueResize(win: *Win) void {
+            c.gtk_widget_add_css_class(@ptrCast(win.window), "opaque-resize");
+            if (win.opaque_settle_id != 0) _ = c.g_source_remove(win.opaque_settle_id);
+            win.opaque_settle_id = c.g_timeout_add(400, @ptrCast(&opaqueRevertCb), win);
+        }
+
+        fn cancelOpaqueResize(win: *Win) void {
+            if (win.opaque_settle_id != 0) {
+                _ = c.g_source_remove(win.opaque_settle_id);
+                win.opaque_settle_id = 0;
+            }
+        }
 
         /// Queue a pointer unit for this window and flush. `detail`
         /// is the X11 button for press/release, ignored otherwise.
@@ -51,6 +79,7 @@ pub const WsHost = struct {
     pub fn destroy(self: *WsHost) void {
         var it = self.windows.valueIterator();
         while (it.next()) |w| {
+            w.*.cancelOpaqueResize();
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-winapp", null);
             c.gtk_window_destroy(w.*.window);
             self.allocator.destroy(w.*);
@@ -109,6 +138,7 @@ pub const WsHost = struct {
                 const id = std.mem.readInt(u32, u.payload[0..4], .little);
                 const win = self.windows.get(id) orelse return;
                 _ = self.windows.remove(id);
+                win.cancelOpaqueResize();
                 _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-winapp", null);
                 c.gtk_window_destroy(win.window);
                 self.allocator.destroy(win);
@@ -126,7 +156,17 @@ pub const WsHost = struct {
     }
 
     fn winFor(self: *WsHost, id: u32, w: i32, h: i32, title: []const u8) ?*Win {
-        if (self.windows.get(id)) |win| return win;
+        if (self.windows.get(id)) |win| {
+            // Remote window changed size — track it and resize the
+            // GtkWindow so the picture isn't scaled into a stale box.
+            if (w > 0 and h > 0 and (win.w != w or win.h != h)) {
+                win.w = w;
+                win.h = h;
+                c.gtk_window_set_default_size(win.window, w, h);
+                if (builtin.os.tag == .macos) win.armOpaqueResize();
+            }
+            return win;
+        }
         const win = self.allocator.create(Win) catch return null;
         // Same free-floating chrome as a Wayland app window —
         // undecorated (the macOS title bar is in the captured
@@ -139,7 +179,7 @@ pub const WsHost = struct {
         };
         const window = widgets.window;
         const picture = widgets.picture;
-        win.* = .{ .host = self, .id = id, .window = window, .picture = picture };
+        win.* = .{ .host = self, .id = id, .window = window, .picture = picture, .w = w, .h = h };
         self.windows.put(self.allocator, id, win) catch {
             c.gtk_window_destroy(window);
             self.allocator.destroy(win);
@@ -170,6 +210,13 @@ pub const WsHost = struct {
 
     fn flush(self: *WsHost) void {
         if (self.on_flush) |f| f(self.flush_ctx);
+    }
+
+    fn opaqueRevertCb(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const win = cast.userData(Win, user);
+        win.opaque_settle_id = 0;
+        c.gtk_widget_remove_css_class(@ptrCast(win.window), "opaque-resize");
+        return 0;
     }
 
     fn onCloseRequest(_: ?*c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gboolean {
