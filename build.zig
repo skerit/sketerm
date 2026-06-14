@@ -649,6 +649,19 @@ fn configureSysDeps(
 fn addPkgConfig(b: *std.Build, mod: *std.Build.Module, pkg: []const u8) void {
     addPkgConfigIncludes(b, mod, pkg);
 
+    // Library search paths (`-L`). Zig resolves dynamic system libs
+    // itself at the build-exe stage (`paths_first`) and only searches
+    // the SDK plus explicit `-L` dirs — it ignores `LIBRARY_PATH`. On a
+    // Homebrew (non-/usr/lib) prefix the dylibs are invisible without
+    // these, so feed pkg-config's `-L` output before the `-l` names.
+    const libdirs = b.run(&.{ "pkg-config", "--libs-only-L", pkg });
+    var it_dir = std.mem.tokenizeAny(u8, libdirs, " \r\n\t");
+    while (it_dir.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "-L")) {
+            mod.addLibraryPath(.{ .cwd_relative = b.dupe(tok[2..]) });
+        }
+    }
+
     const libs = b.run(&.{ "pkg-config", "--libs-only-l", pkg });
     var it_lib = std.mem.tokenizeAny(u8, libs, " \r\n\t");
     while (it_lib.next()) |tok| {
