@@ -112,6 +112,8 @@ const ENTRIES = [_]Entry{
        .desc = "Pick a path and save the current layout there.", .action = .save_layout_as },
     .{ .icon = "starred-symbolic", .title = "Save Default Layout",
        .desc = "Save current tabs and panes as the default for every new launch.", .action = .save_default_layout },
+    .{ .icon = "document-open-symbolic", .title = "Load Layout…",
+       .desc = "Pick a saved layout file and load its tabs into this window.", .action = .load_layout },
     .{ .icon = "view-refresh-symbolic", .title = "Reload Config",
        .desc = "Re-read config.conf from disk and apply live.", .action = .reload_config },
     .{ .icon = "preferences-other-symbolic", .title = "Apply Profile to Pane…",

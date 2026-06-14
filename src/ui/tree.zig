@@ -41,6 +41,10 @@ pub fn Tree(comptime Leaf: type) type {
 
         allocator: std.mem.Allocator,
         root: Node,
+        /// Leaf that last held keyboard focus in this tab. Restored when
+        /// the tab is re-selected (null → fall back to the first leaf).
+        /// Travels with the tree across cross-window tab drags.
+        last_focused: ?Leaf = null,
 
         pub fn initLeaf(allocator: std.mem.Allocator, leaf: Leaf) Self {
             return .{ .allocator = allocator, .root = .{ .leaf = leaf } };

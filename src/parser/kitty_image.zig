@@ -60,6 +60,9 @@ pub const Command = struct {
     /// `C=1`: don't move the cursor after placement (the app draws on
     /// top of the image without scrolling).
     no_cursor_move: u8 = 0,
+    /// `U=1`: this is a Unicode-placeholder (virtual) placement — the
+    /// image is positioned later by U+10EEEE cells, not at the cursor.
+    unicode_placement: u8 = 0,
     /// Raw payload after the ';'. May be empty.
     payload: []const u8 = &.{},
 };
@@ -134,6 +137,9 @@ fn applyKv(cmd: *Command, key: []const u8, val: []const u8) void {
         'C' => if (val.len > 0) {
             cmd.no_cursor_move = val[0];
         },
+        'U' => if (val.len > 0) {
+            cmd.unicode_placement = val[0] -% '0';
+        },
         't' => if (val.len > 0) {
             cmd.medium = val[0];
         },
@@ -181,4 +187,11 @@ test "delete by image id" {
 test "negative z" {
     const cmd = try parse("Ga=p,i=1,z=-3");
     try std.testing.expectEqual(@as(i32, -3), cmd.z);
+}
+
+test "unicode placement flag + grid size" {
+    const cmd = try parse("Ga=T,U=1,i=3,c=4,r=2");
+    try std.testing.expectEqual(@as(u8, 1), cmd.unicode_placement);
+    try std.testing.expectEqual(@as(u32, 4), cmd.cells_wide); // c=
+    try std.testing.expectEqual(@as(u32, 2), cmd.cells_high); // r=
 }

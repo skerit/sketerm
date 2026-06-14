@@ -1699,6 +1699,10 @@ pub const Window = struct {
         pane.win_on_child_exit = onTermChildExit;
         pane.win_cwd_ctx = @ptrCast(self);
         pane.win_on_cwd = onTermCwdChanged;
+        pane.win_setprofile_ctx = @ptrCast(self);
+        pane.win_on_set_profile = onTermSetProfile;
+        pane.win_focus_ctx = @ptrCast(self);
+        pane.win_on_focus_enter = onPaneFocused;
         // OSC 0/1/2 titles drive the AdwTabPage title — but only
         // until the user explicitly renames the tab (which sets the
         // "user-locked" flag on the page). Renaming with an empty
@@ -4821,6 +4825,21 @@ pub const Window = struct {
         );
     }
 
+    /// Open a GtkFileDialog to pick a saved layout (.json/.layout)
+    /// and append its tabs to the current window — same semantics as
+    /// the `--layout` CLI flag (existing tabs are kept).
+    pub fn loadLayoutAs(self: *Window) void {
+        const dialog = c.gtk_file_dialog_new();
+        c.gtk_file_dialog_set_title(dialog, "Load Layout");
+        c.gtk_file_dialog_open(
+            dialog,
+            @ptrCast(self.app_window),
+            null,
+            @ptrCast(&onLoadLayoutDone),
+            @ptrCast(self),
+        );
+    }
+
     /// Save current state to the default path. Best-effort.
     pub fn saveLayoutQuietly(self: *Window) void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
@@ -5097,6 +5116,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .save_layout => self.saveLayoutQuietly(),
         .save_layout_as => self.saveLayoutAs(),
         .save_default_layout => self.saveDefaultLayout(),
+        .load_layout => self.loadLayoutAs(),
         .prompt_prev => self.jumpPromptOnFocused(.prev),
         .prompt_next => self.jumpPromptOnFocused(.next),
         // tmux semantics: navigating away from a zoomed pane unzooms.
@@ -5344,6 +5364,18 @@ fn onSaveLayoutAsDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyop
     const arena = arena_state.allocator();
     const layout = self.collectLayout(arena) catch return;
     layout_mod.save(layout, path) catch return;
+}
+
+fn onLoadLayoutDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Window, user);
+    const dialog: *c.GtkFileDialog = @ptrCast(source);
+    const file = c.gtk_file_dialog_open_finish(dialog, result, null) orelse return;
+    defer c.g_object_unref(file);
+    const path_cstr = c.g_file_get_path(file) orelse return;
+    defer c.g_free(path_cstr);
+    const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
+    _ = self.loadLayoutFromPath(path) catch |err|
+        std.debug.print("sketerm: load layout failed: {s}\n", .{@errorName(err)});
 }
 
 fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
@@ -5648,6 +5680,15 @@ fn onTermBell(ctx: ?*anyopaque, pane: *Pane) void {
 /// OSC 7 cwd updated for `pane`. Find its AdwTabPage and rewrite
 /// the tooltip to include the live cwd, so hovering tells the user
 /// where each tab actually is. Format: "<title>\n<cwd>".
+/// OSC 1337 ; SetProfile=<name> — an app asked to restyle its pane.
+/// Untrusted input: applyProfileToPane maps unknown/empty names to the
+/// Default profile, so a hostile sequence can only swap between the
+/// user's own configured profiles, never inject arbitrary settings.
+fn onTermSetProfile(ctx: ?*anyopaque, pane: *Pane, name: []const u8) void {
+    const self = cast.userData(Window, ctx);
+    self.applyProfileToPane(pane, name);
+}
+
 fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
     const self = cast.userData(Window, ctx);
     {
@@ -5965,6 +6006,14 @@ fn onTabBarScroll(
 
 /// Move keyboard focus into the newly selected tab's pane so
 /// typing immediately reaches that PTY.
+/// Record the pane that just gained focus as its tab's last-focused, so
+/// re-selecting the tab restores it (instead of the first pane).
+fn onPaneFocused(ctx: ?*anyopaque, pane: *Pane) void {
+    const self = cast.userData(Window, ctx);
+    const page = tabPageForPane(self, pane) orelse return;
+    if (Window.tabTreeOf(page)) |t| t.last_focused = pane;
+}
+
 fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
     const page = c.adw_tab_view_get_selected_page(view);
@@ -5973,7 +6022,22 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
     c.adw_tab_page_set_needs_attention(page, 0);
     const child = c.adw_tab_page_get_child(page);
     if (child == null) return;
-    // Find the first Pane whose widget is a descendant of `child`.
+
+    // Restore the tab's last-focused pane. Validate the stored pointer is
+    // still a live pane in THIS tab (guards against a closed pane whose
+    // address was reused) before grabbing focus.
+    if (Window.tabTreeOf(page.?)) |t| {
+        if (t.last_focused) |lf| {
+            for (self.panes.items) |p| {
+                if (p == lf and widgetIsAncestor(@ptrCast(child), p.widget())) {
+                    _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
+                    return;
+                }
+            }
+        }
+    }
+
+    // No (valid) last-focused pane — fall back to the first pane.
     for (self.panes.items) |p| {
         if (widgetIsAncestor(@ptrCast(child), p.widget())) {
             _ = c.gtk_widget_grab_focus(@ptrCast(p.area));

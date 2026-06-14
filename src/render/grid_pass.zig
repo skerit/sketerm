@@ -166,6 +166,7 @@ const Snapshot = struct {
     selection_anchor_col: i32 = 0,
     selection_end_row: i32 = 0,
     selection_end_col: i32 = 0,
+    selection_bg: [4]f32 = .{ 0, 0, 0, 0 },
 
     search_count: u32 = 0,
     search_active_idx: i32 = -1,
@@ -701,6 +702,12 @@ pub const GridPass = struct {
         if (screen.selection.isActive()) {
             const r_opt = screen.selection.rect();
             if (r_opt) |r| {
+                // OSC 17 / OSC 21 selection-bg override; falls back to
+                // the built-in translucent blue when unset (alpha 0).
+                const sel_color: [4]f32 = if (screen.selection_bg[3] > 0)
+                    screen.selection_bg
+                else
+                    @import("../grid/screen.zig").default_selection_bg;
                 const is_rect = screen.selection.mode == .rectangular;
                 const lo_col: i32 = if (is_rect) @min(r.top_col, r.bot_col) else 0;
                 const hi_col: i32 = if (is_rect) @max(r.top_col, r.bot_col) else 0;
@@ -725,7 +732,7 @@ pub const GridPass = struct {
                     if (!row_has_bidi) {
                         const x: f32 = pad + @as(f32, @floatFromInt(@max(0, start_col))) * cw;
                         const w: f32 = @as(f32, @floatFromInt(end_col - @max(0, start_col))) * cw;
-                        try self.pushQuad(.{ x, y }, .{ w, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ 0.4, 0.55, 0.85, 0.45 }, 0.0);
+                        try self.pushQuad(.{ x, y }, .{ w, ch }, .{ 0, 0 }, .{ 0, 0 }, sel_color, 0.0);
                     } else {
                         // Per-cell remap. Coalesce visually-adjacent cells
                         // into a single quad to keep vertex count low.
@@ -733,7 +740,7 @@ pub const GridPass = struct {
                         while (col < end_col) : (col += 1) {
                             const visual: u16 = screen.logicalToVisualCol(self.allocator, sr, @intCast(col));
                             const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw;
-                            try self.pushQuad(.{ x, y }, .{ cw, ch }, .{ 0, 0 }, .{ 0, 0 }, .{ 0.4, 0.55, 0.85, 0.45 }, 0.0);
+                            try self.pushQuad(.{ x, y }, .{ cw, ch }, .{ 0, 0 }, .{ 0, 0 }, sel_color, 0.0);
                         }
                     }
                 }
@@ -987,6 +994,7 @@ pub const GridPass = struct {
             .selection_anchor_col = screen.selection.anchor_col,
             .selection_end_row = screen.selection.end_row,
             .selection_end_col = screen.selection.end_col,
+            .selection_bg = screen.selection_bg,
 
             .search_count = @intCast(screen.search_highlights.len),
             .search_active_idx = screen.search_active_idx,

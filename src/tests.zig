@@ -57,6 +57,7 @@ comptime {
     _ = @import("config.zig");
     _ = @import("remoteapp.zig");
     _ = @import("grid/kitty_images.zig");
+    _ = @import("grid/kitty_placeholder.zig");
     _ = @import("grid/image_pipeline_test.zig");
     _ = @import("grid/bidi.zig");
     _ = @import("grid/schemes.zig");
