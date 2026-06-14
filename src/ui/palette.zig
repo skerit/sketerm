@@ -337,9 +337,7 @@ pub fn open(window: *Window) !void {
 
 fn onSearchChanged(entry: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
-    const text_ptr = c.gtk_editable_get_text(@ptrCast(entry));
-    const text: []const u8 = if (text_ptr == null) &.{}
-        else std.mem.span(@as([*:0]const u8, @ptrCast(text_ptr)));
+    const text = cast.editableText(entry);
 
     var first_visible_idx: i32 = -1;
     var idx: i32 = 0;

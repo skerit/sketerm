@@ -71,7 +71,7 @@ fn maybeScheduleFree(ctx: *Ctx) void {
 }
 
 const RowCtx = struct {
-    /// Own copy — freeRowCtx (widget destroy-notify) can run AFTER
+    /// Own copy — the widget destroy-notify can run AFTER
     /// the dialog's Ctx was freed on "closed"; never deref ctx there.
     allocator: std.mem.Allocator,
     ctx: *Ctx,
@@ -167,7 +167,7 @@ pub fn open(win: *Window) bool {
                     "value-changed",
                     @ptrCast(&onSliderChanged),
                     @ptrCast(rctx),
-                    @ptrCast(&freeRowCtx),
+                    @ptrCast(cast.destroyCtx(RowCtx)),
                     c.G_CONNECT_DEFAULT,
                 );
                 c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), scale);
@@ -185,7 +185,7 @@ pub fn open(win: *Window) bool {
                     "notify::rgba",
                     @ptrCast(&onColorChanged),
                     @ptrCast(rctx),
-                    @ptrCast(&freeRowCtx),
+                    @ptrCast(cast.destroyCtx(RowCtx)),
                     c.G_CONNECT_DEFAULT,
                 );
                 c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), btn);
@@ -208,7 +208,7 @@ pub fn open(win: *Window) bool {
                 "clicked",
                 @ptrCast(&onResetClicked),
                 @ptrCast(r),
-                @ptrCast(&freeRowCtx),
+                @ptrCast(cast.destroyCtx(RowCtx)),
                 c.G_CONNECT_DEFAULT,
             );
         }
@@ -621,13 +621,6 @@ fn onSavePresetClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         }
     }
     updatePresetButtons(ctx);
-}
-
-fn freeRowCtx(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const rctx: *RowCtx = @ptrCast(@alignCast(u));
-        rctx.allocator.destroy(rctx);
-    }
 }
 
 fn onDialogClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {

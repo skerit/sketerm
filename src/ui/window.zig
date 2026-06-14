@@ -2438,7 +2438,7 @@ pub const Window = struct {
             "activate",
             @ptrCast(&onRenameActivate),
             @ptrCast(ctx),
-            @ptrCast(&freeRenameCtx),
+            @ptrCast(cast.destroyCtx(Window.RenameCtx)),
             c.G_CONNECT_DEFAULT,
         );
 
@@ -2790,7 +2790,7 @@ pub const Window = struct {
             "activate",
             @ptrCast(&onPaneTitleActivate),
             @ptrCast(ctx),
-            @ptrCast(&freePaneTitleCtx),
+            @ptrCast(cast.destroyCtx(Window.PaneTitleCtx)),
             c.G_CONNECT_DEFAULT,
         );
 
@@ -2851,7 +2851,7 @@ pub const Window = struct {
             "activate",
             @ptrCast(&onMuxRenameActivate),
             @ptrCast(ctx),
-            @ptrCast(&freeMuxRenameCtx),
+            @ptrCast(cast.destroyCtx(Window.MuxRenameCtx)),
             c.G_CONNECT_DEFAULT,
         );
 
@@ -5471,9 +5471,7 @@ fn freePanedRatio(user: ?*anyopaque) callconv(.c) void {
 
 fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Window.RenameCtx, user);
-    const text_c = c.gtk_editable_get_text(@ptrCast(entry));
-    const text: []const u8 = if (text_c == null) &.{}
-        else std.mem.span(@as([*:0]const u8, @ptrCast(text_c)));
+    const text = cast.editableText(entry);
 
     if (text.len == 0) {
         // Empty input → clear the user-lock and resume OSC tracking.
@@ -5495,8 +5493,8 @@ fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
             }
         }
     } else {
-        c.adw_tab_page_set_title(ctx.page, text_c);
-        c.adw_tab_page_set_tooltip(ctx.page, text_c);
+        c.adw_tab_page_set_title(ctx.page, text.ptr);
+        c.adw_tab_page_set_tooltip(ctx.page, text.ptr);
         // Mark the page as user-renamed so subsequent OSC titles
         // don't overwrite it. Stored as a non-null marker; the
         // pointer value is unused — `g_object_get_data` only checks
@@ -5504,13 +5502,8 @@ fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
         c.g_object_set_data(@ptrCast(@alignCast(ctx.page)), "sketerm-title-locked", @ptrCast(ctx.page));
     }
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
-    // ctx is freed via GDestroyNotify (freeRenameCtx) when the
+    // ctx is freed via GDestroyNotify when the
     // signal closure is destroyed.
-}
-
-fn freeRenameCtx(user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(Window.RenameCtx, user);
-    ctx.allocator.destroy(ctx);
 }
 
 fn onApplyProfilePicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -5587,11 +5580,6 @@ fn onPaneTitleActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void 
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
 }
 
-fn freePaneTitleCtx(user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(Window.PaneTitleCtx, user);
-    ctx.allocator.destroy(ctx);
-}
-
 fn onMuxRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Window.MuxRenameCtx, user);
     // The pane can close while the popover is open — verify it's
@@ -5611,11 +5599,6 @@ fn onMuxRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void 
         }
     }
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
-}
-
-fn freeMuxRenameCtx(user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(Window.MuxRenameCtx, user);
-    ctx.allocator.destroy(ctx);
 }
 
 /// Wired from `Pane.win_on_session_renamed` — the daemon confirmed a
