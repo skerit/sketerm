@@ -54,6 +54,12 @@ pub const Event = union(enum) {
     /// PTY reached EOF (child closed all references to the slave).
     child_eof: i32,
 
+    /// A recoverable parser error — e.g. a DCS/OSC/APC payload that
+    /// overflowed the collection buffer and was truncated. Fixed-size
+    /// (no heap), so it rides the SPSC ring and mux wire like any other
+    /// event; the consumer decides what to do (we log it main-thread).
+    parse_error: ParseError,
+
     /// Up to 64 printable bytes accumulated by the parser. After
     /// shrinking Csi/Dcs, PrintRun is the union-size limiter at
     /// 65 bytes. Bumping to 128 was tried and showed no measurable
@@ -141,6 +147,15 @@ pub const Event = union(enum) {
     pub const DcsFull = struct {
         proto: Dcs,
         body: []u8, // owned
+    };
+
+    pub const ParseError = struct {
+        kind: Kind,
+        pub const Kind = enum(u8) {
+            dcs_truncated,
+            osc_truncated,
+            apc_truncated,
+        };
     };
 
     /// Free any heap-owned payload. Call after processing.

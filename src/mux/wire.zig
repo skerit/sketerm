@@ -105,6 +105,7 @@ const EventTag = enum(u8) {
     apc = 8,
     dcs = 9,
     child_eof = 10,
+    parse_error = 11,
     _,
 };
 
@@ -189,6 +190,10 @@ pub const Writer = struct {
             .child_eof => |status| {
                 try self.buf.append(self.allocator, @intFromEnum(EventTag.child_eof));
                 try self.putInt(i32, status);
+            },
+            .parse_error => |pe| {
+                try self.buf.append(self.allocator, @intFromEnum(EventTag.parse_error));
+                try self.buf.append(self.allocator, @intFromEnum(pe.kind));
             },
             .dcs_start, .dcs_data, .dcs_end => return error.LegacyEventNotWireable,
         }
@@ -287,6 +292,10 @@ pub const Reader = struct {
                 return .{ .dcs = .{ .proto = proto, .body = body } };
             },
             .child_eof => return .{ .child_eof = try self.getInt(i32) },
+            .parse_error => {
+                const kind = std.enums.fromInt(Event.ParseError.Kind, try self.getByte()) orelse return error.BadTag;
+                return .{ .parse_error = .{ .kind = kind } };
+            },
             _ => return error.BadTag,
         }
     }
@@ -398,6 +407,17 @@ test "wire: owned payloads round-trip (osc / apc / dcs)" {
     try std.testing.expectEqual(@as(u16, 1), dcs_out.dcs.proto.params[0]);
     try std.testing.expectEqual(@as(u8, 'q'), dcs_out.dcs.proto.final);
     try std.testing.expectEqualStrings("#0;2;0;0;0sixels", dcs_out.dcs.body);
+}
+
+test "wire: parse_error round-trips every kind" {
+    const a = std.testing.allocator;
+    for ([_]Event.ParseError.Kind{ .dcs_truncated, .osc_truncated, .apc_truncated }) |kind| {
+        const out = try roundtrip(a, .{ .parse_error = .{ .kind = kind } });
+        try std.testing.expectEqual(kind, out.parse_error.kind);
+    }
+    // Unknown kind byte is rejected, not panicked.
+    var r = Reader.init(&[_]u8{ @intFromEnum(EventTag.parse_error), 99 });
+    try std.testing.expectError(error.BadTag, r.getEvent(a));
 }
 
 test "wire: corrupt input errors, never panics" {

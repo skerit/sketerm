@@ -2121,7 +2121,20 @@ pub const Screen = struct {
             .dcs => |d| self.onDcs(d),
             .dcs_start, .dcs_data, .dcs_end => {}, // legacy stubs
             .child_eof => |status| self.onChildEof(status),
+            .parse_error => |pe| onParseError(pe),
         }
+    }
+
+    /// A recoverable parser error reached the main thread (the payload was
+    /// still applied best-effort). Logged here rather than on the worker so
+    /// it travels through the normal event pipeline, including over mux.
+    fn onParseError(pe: Event.ParseError) void {
+        const what = switch (pe.kind) {
+            .dcs_truncated => "DCS",
+            .osc_truncated => "OSC",
+            .apc_truncated => "APC",
+        };
+        std.debug.print("sketerm: {s} payload truncated (too long)\n", .{what});
     }
 
     /// Reply current fg/bg/cursor color in xterm `rgb:RRRR/GGGG/BBBB` form.

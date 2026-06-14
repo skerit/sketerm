@@ -236,10 +236,7 @@ pub const Parser = struct {
 
     fn dispatchDcs(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {
         if (self.osc_truncated) {
-            // FIXME: should emit a structured parse-error Event (e.g.
-            // .parse_error = .{ .kind = .dcs_truncated }) once Event
-            // gains such a variant in event.zig.
-            std.debug.print("sketerm: DCS payload truncated\n", .{});
+            emit(ctx, .{ .parse_error = .{ .kind = .dcs_truncated } });
         }
         const body = self.allocator.dupe(u8, self.osc_buf.items) catch {
             return;
@@ -587,10 +584,7 @@ pub const Parser = struct {
 
     fn dispatchOsc(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {
         if (self.osc_truncated) {
-            // FIXME: should emit a structured parse-error Event (e.g.
-            // .parse_error = .{ .kind = .osc_truncated }) once Event
-            // gains such a variant in event.zig.
-            std.debug.print("sketerm: OSC payload truncated\n", .{});
+            emit(ctx, .{ .parse_error = .{ .kind = .osc_truncated } });
         }
         const bytes = self.allocator.dupe(u8, self.osc_buf.items) catch {
             self.transitionTo(.ground);
@@ -602,10 +596,7 @@ pub const Parser = struct {
 
     fn dispatchApc(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {
         if (self.osc_truncated) {
-            // FIXME: should emit a structured parse-error Event (e.g.
-            // .parse_error = .{ .kind = .apc_truncated }) once Event
-            // gains such a variant in event.zig.
-            std.debug.print("sketerm: APC payload truncated\n", .{});
+            emit(ctx, .{ .parse_error = .{ .kind = .apc_truncated } });
         }
         const bytes = self.allocator.dupe(u8, self.osc_buf.items) catch {
             self.transitionTo(.ground);
@@ -850,6 +841,23 @@ test "OSC dispatches on BEL terminator" {
         else => {},
     };
     try std.testing.expect(saw_osc);
+}
+
+test "truncated OSC emits a parse_error event before the payload" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    defer col.deinit();
+    // Simulate the overflow having been detected mid-collection.
+    p.osc_truncated = true;
+    try p.osc_buf.append(p.allocator, '0');
+    p.dispatchOsc(TestCollector.emit, &col);
+    var saw_err: ?Event.ParseError.Kind = null;
+    for (col.events.items) |ev| switch (ev) {
+        .parse_error => |pe| saw_err = pe.kind,
+        else => {},
+    };
+    try std.testing.expectEqual(Event.ParseError.Kind.osc_truncated, saw_err.?);
 }
 
 test "OSC dispatches on ESC backslash terminator" {
