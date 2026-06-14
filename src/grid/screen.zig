@@ -113,6 +113,9 @@ pub const Screen = struct {
     /// view_offset back to 0. Off by default — matches xterm.
     /// Mirrors gnome-terminal's "scroll on output" toggle.
     scroll_on_output: bool = false,
+    /// Gate for the tab-activity signal (config `track_tab_activity`).
+    /// When false, the drain skips the visible-change check entirely.
+    track_activity: bool = true,
     /// Punctuation chars considered "part of a word" for double-click
     /// selection. Default is sensible for paths + URLs. Set from
     /// Config.word_chars at pane spawn / applyConfigChange.
@@ -702,6 +705,23 @@ pub const Screen = struct {
         for (self.retained_images.items) |ri| self.allocator.free(ri.owned);
         self.retained_images.clearRetainingCapacity();
         self.retained_image_bytes = 0;
+    }
+
+    /// Hash of the currently-VISIBLE grid: every cell (rune + style +
+    /// flags) of the active/alt buffer, plus the cursor position. Used
+    /// to tell "the screen actually changed" from "bytes merely arrived"
+    /// — identical output (an app repainting the same frame, keep-alive
+    /// traffic, a cursor-position query) yields the same hash and so does
+    /// NOT count as activity. Cursor blink and selection are excluded
+    /// (not app-driven content).
+    pub fn contentHash(self: *Screen) u64 {
+        var h = std.hash.Wyhash.init(0);
+        for (self.buf()) |ln| {
+            h.update(std.mem.sliceAsBytes(ln.cells));
+        }
+        h.update(std.mem.asBytes(&self.row));
+        h.update(std.mem.asBytes(&self.col));
+        return h.final();
     }
 
     /// Where an anchored image should draw right now.
@@ -8120,6 +8140,60 @@ test "emitImage stamps an anchor id from the placement row" {
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 3, .col = 0 });
     try std.testing.expect(Sink.fired);
     try std.testing.expectEqual(s.buf()[3].id, Sink.anchor);
+}
+
+test "contentHash detects visible change, ignores identical repaint" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 20, 4);
+    defer s.deinit();
+
+    const h0 = s.contentHash();
+
+    // Print "hi" — visible change → hash differs.
+    s.apply(.{ .print = 'h' });
+    s.apply(.{ .print = 'i' });
+    const h1 = s.contentHash();
+    try std.testing.expect(h1 != h0);
+
+    // Repaint the exact same thing at the same spot: home the cursor and
+    // print "hi" again. No visible change → hash returns to h1.
+    s.apply(.{ .csi = blk: {
+        var ev = Event.Csi{};
+        ev.final = 'H'; // CUP → row1,col1
+        break :blk ev;
+    } });
+    s.apply(.{ .print = 'h' });
+    s.apply(.{ .print = 'i' });
+    try std.testing.expectEqual(h1, s.contentHash());
+
+    // Change one cell → hash differs again.
+    s.apply(.{ .csi = blk: {
+        var ev = Event.Csi{};
+        ev.final = 'H';
+        break :blk ev;
+    } });
+    s.apply(.{ .print = 'H' }); // 'H' instead of 'h'
+    try std.testing.expect(s.contentHash() != h1);
+}
+
+test "next_line_id advances on scroll, not on in-place print" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+
+    // Printing into an existing (blank) row births no new line — the
+    // activity drain would fall through to the content hash.
+    const before_print = s.next_line_id;
+    s.apply(.{ .print = 'x' });
+    try std.testing.expectEqual(before_print, s.next_line_id);
+
+    // Scrolling births new lines — the activity drain can short-circuit
+    // (definite visible change) without hashing.
+    const before_scroll = s.next_line_id;
+    s.scrollUp(1);
+    try std.testing.expect(s.next_line_id > before_scroll);
 }
 
 test "OSC 1337 SetProfile fires sink" {

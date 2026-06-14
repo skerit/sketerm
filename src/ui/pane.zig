@@ -123,6 +123,9 @@ pub const Pane = struct {
     /// record it as its tab's last-focused pane (restored on tab switch).
     win_focus_ctx: ?*anyopaque = null,
     win_on_focus_enter: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
+    /// Fired when this pane's visible grid changed (tab-activity signal).
+    win_activity_ctx: ?*anyopaque = null,
+    win_on_activity: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
     /// Fired exactly once when the PTY child exits. Window decides
     /// what to do (close pane / restart shell / hold).
     win_on_child_exit: ?*const fn (ctx: ?*anyopaque, pane: *Pane, status: i32) void = null,
@@ -355,6 +358,7 @@ pub const Pane = struct {
         terminal.on_clipboard_set = onClipboardEvent;
         terminal.on_clipboard_get = onClipboardGetEvent;
         terminal.on_render_request = onRenderRequest;
+        terminal.on_activity = onActivityEvent;
         terminal.on_notification = onNotificationEvent;
         terminal.on_progress = onProgressEvent;
         terminal.on_bell = onBellEvent;
@@ -1413,6 +1417,11 @@ fn onRenderRequest(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
     self.terminal.screen.dirty = false;
     c.gtk_gl_area_queue_render(@ptrCast(self.area));
+}
+
+fn onActivityEvent(ctx: ?*anyopaque) void {
+    const self = cast.userData(Pane, ctx);
+    if (self.win_on_activity) |f| f(self.win_activity_ctx, self);
 }
 
 fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {
