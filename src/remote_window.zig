@@ -62,6 +62,16 @@ pub fn create(title: [:0]const u8, w: i32, h: i32, decorated: bool) ?Widgets {
 /// CSD apps carry alpha (drop shadows, rounded corners) in their
 /// buffers; the host window must not paint a background behind it or
 /// shadows composite onto theme gray.
+///
+/// macOS exception: a NON-OPAQUE NSWindow only composites the region
+/// its backing was last painted into — when the window grows
+/// (maximize / large resize) the never-painted area stays clipped to
+/// the original size even though GTK reports the full allocation. So
+/// on macOS the window is kept OPAQUE. That's safe because the macOS
+/// path already crops the CSD shadow out of the displayed buffer
+/// (wlapp `onFrame`), so the rectangular app buffer fully covers the
+/// window and the opaque background never shows. (Linux keeps the
+/// transparent background so CSD shadows/rounded corners blend.)
 pub fn ensureTransparentCss() void {
     const S = struct {
         var done: bool = false;
@@ -70,7 +80,11 @@ pub fn ensureTransparentCss() void {
     S.done = true;
     const display = c.gdk_display_get_default() orelse return;
     const provider = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(provider, "window.sketerm-remote-app { background: transparent; }");
+    const css = if (builtin.os.tag == .macos)
+        "window.sketerm-remote-app { background: black; }"
+    else
+        "window.sketerm-remote-app { background: transparent; }";
+    c.gtk_css_provider_load_from_string(provider, css);
     c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     c.g_object_unref(provider);
 }
@@ -188,6 +202,26 @@ pub fn newTexture(w: i32, h: i32, format: u32, pixels: []const u8) ?*c.GdkTextur
     const gbytes = c.g_bytes_new(pixels.ptr, pixels.len) orelse return null;
     defer c.g_bytes_unref(gbytes);
     return c.gdk_memory_texture_new(w, h, gdk_format, gbytes, @intCast(w * 4));
+}
+
+/// Texture of a sub-rectangle (physical pixels) of a `w`×`h` buffer —
+/// used on macOS to crop away the app's CSD shadow margin. The
+/// sub-region keeps the full buffer stride, so no row repacking.
+pub fn newTextureCropped(w: i32, h: i32, format: u32, pixels: []const u8, cx: i32, cy: i32, cw: i32, ch: i32) ?*c.GdkTexture {
+    if (cw <= 0 or ch <= 0 or cx < 0 or cy < 0 or cx + cw > w or cy + ch > h) {
+        return newTexture(w, h, format, pixels);
+    }
+    const gdk_format: c.GdkMemoryFormat = if (format == 1)
+        c.GDK_MEMORY_B8G8R8X8
+    else
+        c.GDK_MEMORY_B8G8R8A8_PREMULTIPLIED;
+    const stride: usize = @intCast(w * 4);
+    const start: usize = @as(usize, @intCast(cy)) * stride + @as(usize, @intCast(cx)) * 4;
+    const len: usize = @as(usize, @intCast(ch - 1)) * stride + @as(usize, @intCast(cw)) * 4;
+    if (start + len > pixels.len) return newTexture(w, h, format, pixels);
+    const gbytes = c.g_bytes_new(pixels.ptr + start, len) orelse return null;
+    defer c.g_bytes_unref(gbytes);
+    return c.gdk_memory_texture_new(cw, ch, gdk_format, gbytes, @intCast(stride));
 }
 
 test "resizeEdgeAt: corners, edges, interior" {

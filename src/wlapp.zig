@@ -11,6 +11,7 @@
 //! window; the close button sends xdg_toplevel.close.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const cast = @import("util/cast.zig");
 // Shared free-floating-window chrome (creation, transparent CSS, app
@@ -133,6 +134,13 @@ pub const AppHost = struct {
         /// texture itself is shown at full physical resolution.
         buf_w: i32 = 0,
         buf_h: i32 = 0,
+        /// Displayed sub-rect of the buffer in LOGICAL surface coords
+        /// (x, y, w, h). Full buffer on Linux; the window-geometry rect
+        /// on macOS (CSD shadow cropped). mapXY + popups read these.
+        crop_x: i32 = 0,
+        crop_y: i32 = 0,
+        crop_w: i32 = 0,
+        crop_h: i32 = 0,
         /// Last size sent via configureToplevel (resize feedback
         /// guard: don't re-configure what the app already drew).
         sent_w: i32 = 0,
@@ -170,16 +178,18 @@ pub const AppHost = struct {
                 c.gtk_widget_set_cursor(self.picture, null);
         }
 
-        /// Widget → surface coordinates: the picture shows the full
-        /// buffer, so widget coords scale straight onto buffer (=
-        /// surface) coordinates — no geometry offset.
+        /// Widget → surface coordinates. The picture shows the displayed
+        /// crop rect (full buffer on Linux; the geometry rect on macOS),
+        /// so scale widget coords across that rect and add its origin.
         fn mapXY(self: *Win, wx: f64, wy: f64) [2]f64 {
             const ww = c.gtk_widget_get_width(self.picture);
             const wh = c.gtk_widget_get_height(self.picture);
-            if (ww > 0 and wh > 0 and self.buf_w > 0 and self.buf_h > 0) {
+            const cw = if (self.crop_w > 0) self.crop_w else self.buf_w;
+            const ch = if (self.crop_h > 0) self.crop_h else self.buf_h;
+            if (ww > 0 and wh > 0 and cw > 0 and ch > 0) {
                 return .{
-                    wx * @as(f64, @floatFromInt(self.buf_w)) / @as(f64, @floatFromInt(ww)),
-                    wy * @as(f64, @floatFromInt(self.buf_h)) / @as(f64, @floatFromInt(wh)),
+                    @as(f64, @floatFromInt(self.crop_x)) + wx * @as(f64, @floatFromInt(cw)) / @as(f64, @floatFromInt(ww)),
+                    @as(f64, @floatFromInt(self.crop_y)) + wy * @as(f64, @floatFromInt(ch)) / @as(f64, @floatFromInt(wh)),
                 };
             }
             return .{ wx, wy };
@@ -190,6 +200,9 @@ pub const AppHost = struct {
         /// shadow margin). Reported via the compute-size signal so the
         /// WM treats the geometry rect — not the shadow — as the window.
         fn shadowMargins(self: *Win) [4]i32 {
+            // macOS crops the shadow out of the displayed buffer, so the
+            // toplevel has no shadow margin to report.
+            if (builtin.os.tag == .macos) return .{ 0, 0, 0, 0 };
             const geo = self.host.geos.get(self.surface) orelse return .{ 0, 0, 0, 0 };
             if (geo[2] <= 0 or geo[3] <= 0 or self.buf_w <= 0 or self.buf_h <= 0) return .{ 0, 0, 0, 0 };
             return .{
@@ -200,7 +213,6 @@ pub const AppHost = struct {
             };
         }
     };
-
 
     /// Stamp the compositor clock (frame-callback and input event
     /// timestamps) from the GLib monotonic clock.
@@ -353,10 +365,42 @@ pub const AppHost = struct {
             c.gtk_widget_queue_draw(sub.area);
             return;
         }
-        const win = self.winFor(surface, lw, lh) orelse return;
+        // Displayed region in LOGICAL surface coords. Linux shows the
+        // full buffer and reports the CSD shadow as the toplevel's
+        // shadow width; macOS ignores shadow-width, so it crops the
+        // buffer to the window-geometry rect and sizes the window to it
+        // (otherwise the shadow shows as a fat border).
+        var dx: i32 = 0;
+        var dy: i32 = 0;
+        var dw: i32 = lw;
+        var dh: i32 = lh;
+        if (builtin.os.tag == .macos) {
+            if (self.geos.get(surface)) |g| {
+                if (g[2] > 0 and g[3] > 0 and g[0] >= 0 and g[1] >= 0 and g[0] + g[2] <= lw and g[1] + g[3] <= lh) {
+                    dx = g[0];
+                    dy = g[1];
+                    dw = g[2];
+                    dh = g[3];
+                }
+            }
+        }
+        const win = self.winFor(surface, dw, dh) orelse return;
         win.buf_w = lw;
         win.buf_h = lh;
-        const tex = rw.newTexture(w, h, format, pixels) orelse return;
+        // Geometry size changed (app self-resize or first frame): match
+        // the host window to it. Same-size calls no-op in GTK.
+        if (builtin.os.tag == .macos and (dw != win.crop_w or dh != win.crop_h)) {
+            c.gtk_window_set_default_size(win.window, dw, dh);
+        }
+        win.crop_x = dx;
+        win.crop_y = dy;
+        win.crop_w = dw;
+        win.crop_h = dh;
+        const cropped = (dx != 0 or dy != 0 or dw != lw or dh != lh);
+        const tex = (if (cropped)
+            rw.newTextureCropped(w, h, format, pixels, dx * s, dy * s, dw * s, dh * s)
+        else
+            rw.newTexture(w, h, format, pixels)) orelse return;
         defer c.g_object_unref(tex);
         c.gtk_picture_set_paintable(@ptrCast(win.picture), @ptrCast(tex));
     }
@@ -381,10 +425,14 @@ pub const AppHost = struct {
         if (self.windows.get(parent)) |w| {
             win = w;
             // Parent-relative coords are in the toplevel's window
-            // geometry; the overlay is in buffer coords (shadow shown).
-            if (self.geos.get(parent)) |g| {
-                cox += g[0];
-                coy += g[1];
+            // geometry; the Linux overlay is in buffer coords (shadow
+            // shown), so shift past the shadow. macOS crops to geometry,
+            // so the overlay origin already IS the geometry origin.
+            if (builtin.os.tag != .macos) {
+                if (self.geos.get(parent)) |g| {
+                    cox += g[0];
+                    coy += g[1];
+                }
             }
         } else if (self.popups.get(parent)) |pp| {
             win = pp.win;
@@ -439,10 +487,13 @@ pub const AppHost = struct {
         if (self.windows.get(parent)) |w| {
             win = w;
             // Positioner coords are in the parent's window geometry; the
-            // overlay is in buffer coords, so shift past the shadow.
-            if (self.geos.get(parent)) |g| {
-                px += g[0];
-                py += g[1];
+            // Linux overlay is in buffer coords, so shift past the shadow.
+            // macOS crops to geometry — origin already matches.
+            if (builtin.os.tag != .macos) {
+                if (self.geos.get(parent)) |g| {
+                    px += g[0];
+                    py += g[1];
+                }
             }
         } else if (self.popups.get(parent)) |pp| {
             win = pp.win;
