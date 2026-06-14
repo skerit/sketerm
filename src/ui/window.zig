@@ -6,6 +6,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const render_kick = @import("../util/render_kick.zig");
 const Pane = @import("pane.zig").Pane;
 const Pty = @import("../pty.zig").Pty;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -6156,7 +6157,9 @@ fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) call
     };
     pending.* = .{ .win = self, .page = page };
 
+    _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), self.app_window, null, c.G_CONNECT_DEFAULT);
     c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseTabResponse, @ptrCast(pending));
+    render_kick.kick(self.app_window);
     return 1;
 }
 
@@ -6207,7 +6210,9 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
     const pending = self.allocator.create(PendingCloseWin) catch return 0;
     pending.* = .{ .win = self };
 
+    _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), self.app_window, null, c.G_CONNECT_DEFAULT);
     c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseWinResponse, @ptrCast(pending));
+    render_kick.kick(self.app_window);
     return 1; // block while dialog is up
 }
 

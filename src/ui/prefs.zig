@@ -11,6 +11,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const render_kick = @import("../util/render_kick.zig");
 const Config = @import("../config.zig").Config;
 const CursorShape = @import("../config.zig").CursorShape;
 const ExitAction = @import("../config.zig").ExitAction;
@@ -144,7 +145,11 @@ fn openForProfile(
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &windowPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &keybindsPage);
 
+    // Force the on-demand GL panes to repaint so the overlay composites
+    // over an idle terminal (and the dimming clears on close).
+    _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), @ptrCast(parent_window), null, c.G_CONNECT_DEFAULT);
     c.adw_dialog_present(@ptrCast(@alignCast(dialog)), @ptrCast(parent_window));
+    render_kick.kick(@ptrCast(@alignCast(parent_window)));
 }
 
 fn onClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {

@@ -8,6 +8,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const render_kick = @import("../util/render_kick.zig");
 const Window = @import("window.zig").Window;
 const Pane = @import("pane.zig").Pane;
 const shader_pass = @import("../render/shader_pass.zig");
@@ -339,7 +340,9 @@ pub fn open(win: *Window) bool {
         c.G_CONNECT_DEFAULT,
     );
 
+    _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), @ptrCast(win.app_window), null, c.G_CONNECT_DEFAULT);
     c.adw_dialog_present(@ptrCast(@alignCast(dialog)), @ptrCast(win.app_window));
+    render_kick.kick(win.app_window);
     return true;
 }
 
