@@ -15,11 +15,10 @@
 //   trashy VHS-ish:  jitter 0.4, chroma 0.5, noise 0.2
 //   slow phosphor:   persistence 0.6 (+ animation on)
 //
-// The monitor BEZEL (procedural plastic frame around the tube) is on
-// by default — it fills the dead black that curvature would otherwise
-// leave in the corners. Tune width/roundness/color in "Configure
-// Shader…", or set bezel = 0 for a borderless screen (the surround
-// then falls back to plain black, as before).
+// The monitor BEZEL (procedural plastic frame around the tube) is OFF
+// by default (bezel = 0 → borderless, the screen fills the pane). Raise
+// "Bezel / frame width" in "Configure Shader…" to get a bevelled plastic
+// surround that fills the dead black curvature leaves in the corners.
 
 //@name CRT
 //@desc Retro tube engine: phosphor colorization (0 = keep colors), scanlines, curvature, glow, chromatic aberration, static noise, horizontal sync jitter, persistence trails, flicker, and a procedural monitor bezel. Animation recommended.
@@ -36,10 +35,10 @@
 #pragma parameter flicker "Flicker" 0.015 0.0 0.2 0.005
 #pragma parameter brightness "Brightness" 1.0 0.5 1.6 0.02
 #pragma parameter saturation "Saturation" 1.0 0.0 2.0 0.05
-#pragma parameter bezel "Bezel / frame width" 0.05 0.0 0.3 0.005
+#pragma parameter bezel "Bezel / frame width" 0.0 0.0 0.3 0.005
 #pragma parameter bezel_round "Screen + bezel roundness" 0.04 0.0 0.5 0.01
 //@color phosphor 1.00 0.70 0.20 "Phosphor tint"
-//@color bezelcolor 0.05 0.045 0.04 "Bezel color"
+//@color bezelcolor 0.12 0.115 0.105 "Bezel color"
 //@texture noiseTex builtin:noise
 
 uniform sampler2D noiseTex;
@@ -80,41 +79,68 @@ float sdRoundBox(vec2 p, vec2 b, float r) {
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0))) - r;
 }
 
-// Procedural monitor frame for the region OUTSIDE the glass. `p` is
-// the centered curved coord, `ssd` its distance beyond the screen
-// (>0), `hs` the screen half-extent. Reads as a rounded plastic
-// bevel: a lit crest between an inner seating-groove and the outer
-// edge, which fades to the black window background. bezel width 0
-// collapses the frame onto the screen edge → pure black surround,
-// i.e. this shader's original behaviour.
-vec3 bezelFrame(vec2 p, float ssd, float hs) {
+// Procedural monitor frame for the region OUTSIDE the glass. `p` is the
+// centered curved coord, `fc` the raw fragCoord (for grain), `ssd` the
+// distance beyond the screen (>0), `hs` the screen half-extent.
+//
+// Technique ported from cool-retro-term's terminal_frame.frag (ideas, not
+// code): the plastic moulding's 3-D look comes from DIRECTIONAL per-edge
+// shading — the frame is split into four triangles by its diagonals and
+// each edge is lit differently (bottom brightest, top dimmest, sides
+// mid), so the corners miter and catch light like real bevelled plastic.
+// Plus a soft seating shadow where the glass meets the frame and a faint
+// grain so the plastic isn't dead-flat. bezel = 0 disables it entirely
+// (see mainImage).
+vec3 bezelFrame(vec2 p, vec2 fc, float ssd, float hs) {
     float w = max(bezel, 1e-4);
-    float t = clamp(ssd / w, 0.0, 1.0);            // 0 at glass → 1 at outer edge
-    float crest = sin(t * 3.14159265);             // rounded bevel profile
-    vec3 col = bezelcolor * (0.45 + 0.85 * crest);
-    col *= mix(0.35, 1.0, smoothstep(0.0, 0.10 * w, ssd)); // seat the glass
-    vec2 n = normalize(p + vec2(1e-5));
-    float lit = clamp(0.5 - 0.5 * (n.x + n.y), 0.0, 1.0);  // top-left sheen
-    col += crest * lit * 0.10;
+
+    // Directional bevel: which of the 4 edges are we on, and how lit.
+    vec2 c = p + 0.5;                              // back to [0,1]
+    const float sw = 0.05;                         // diagonal seam softness
+    float e = min(smoothstep(-sw, sw, c.x - c.y), smoothstep(-sw, sw, c.x - (1.0 - c.y)));
+    float s = min(smoothstep(-sw, sw, c.y - c.x), smoothstep(-sw, sw, c.x - (1.0 - c.y)));
+    float wt = min(smoothstep(-sw, sw, c.y - c.x), smoothstep(-sw, sw, (1.0 - c.x) - c.y));
+    float nt = min(smoothstep(-sw, sw, c.x - c.y), smoothstep(-sw, sw, (1.0 - c.x) - c.y));
+    float shade = e * 0.66 + wt * 0.66 + nt * 0.33 + s * 1.0;   // ~0.33 → 1.0
+
+    // Soft seating shadow: the groove right at the glass is darkest.
+    float seat = smoothstep(0.0, 0.22 * w, ssd);
+
+    vec3 col = bezelcolor * (0.35 + shade) * seat;
+    col += (hash12(fc) - 0.5) * 0.035;             // plastic grain
+
     // Outer rounded edge → black beyond the cabinet.
     float osd = sdRoundBox(p, vec2(hs + w), bezel_round * hs + w * 0.7);
     float aa = max(fwidth(osd), 1e-5);
-    return col * (1.0 - smoothstep(-aa, aa, osd));
+    return clamp(col, 0.0, 1.0) * (1.0 - smoothstep(-aa, aa, osd));
 }
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     // Centered curved coords; the glass is the inner rounded box,
     // shrunk by the bezel width so the frame always has room.
     vec2 p = curve(fragCoord / iResolution.xy) - 0.5;
-    float hs = 0.5 - clamp(bezel, 0.0, 0.45);
-    float ssd = sdRoundBox(p, vec2(hs), bezel_round * hs);
-    if (ssd > 0.0) {
-        fragColor = vec4(bezelFrame(p, ssd, hs), 1.0);
-        return;
+
+    // bezel = 0 disables the frame entirely: the screen fills the whole
+    // area, with only the natural curvature falloff to black in the corners.
+    bool framed = bezel > 0.0;
+    float hs = framed ? (0.5 - clamp(bezel, 0.0, 0.45)) : 0.5;
+    if (framed) {
+        float ssd = sdRoundBox(p, vec2(hs), bezel_round * hs);
+        if (ssd > 0.0) {
+            fragColor = vec4(bezelFrame(p, fragCoord, ssd, hs), 1.0);
+            return;
+        }
     }
 
     // Map the glass box back to [0,1] for content sampling.
     vec2 uv = (p / hs) * 0.5 + 0.5;
+
+    // With the frame off, blacken anything curvature pushed past the edge
+    // (no rounded cabinet to hide it behind).
+    if (!framed && (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)) {
+        fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
 
     // Horizontal sync jitter: per-scanline random offset that only
     // moves while animating (uses iTime). Occasional bigger "tear".
