@@ -1202,5 +1202,6 @@ fn debugFormatEvent(w: *std.Io.Writer, ev: Event) !void {
         .dcs_data => try w.print("«DCS-data»", .{}),
         .dcs_end => try w.print("«DCS-end»", .{}),
         .child_eof => |s| try w.print("\n«child-eof status={d}»\n", .{s}),
+        .parse_error => |pe| try w.print("«parse-error {s}»", .{@tagName(pe.kind)}),
     }
 }
