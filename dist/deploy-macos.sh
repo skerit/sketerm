@@ -47,6 +47,19 @@ if ! codesign -f -s "$ID" --identifier "$LABEL" "$DEST" 2>/dev/null; then
     exit 1
 fi
 
+# A remote client reaches this daemon via `ssh <host> sketerm-mux
+# --proxy`, which sshd runs as `zsh -c …` — that sources ONLY ~/.zshenv,
+# not ~/.zprofile/.zshrc. So $DEST's dir must be on PATH there, or the
+# client fails with "command not found: sketerm-mux". Ensure it.
+BINDIR="$(dirname "$DEST")"
+ZSHENV="$HOME/.zshenv"
+REL="${BINDIR#"$HOME"/}"
+[ "$REL" != "$BINDIR" ] && PATHENTRY="\$HOME/$REL" || PATHENTRY="$BINDIR"
+if ! grep -qsF "$PATHENTRY" "$ZSHENV"; then
+    printf 'export PATH="%s:$PATH"  # sketerm-mux for non-interactive ssh (--proxy)\n' "$PATHENTRY" >> "$ZSHENV"
+    echo "› added $PATHENTRY to ~/.zshenv (so 'ssh … sketerm-mux --proxy' resolves it)"
+fi
+
 # Generate the agent plist (idempotent — path may differ per machine).
 mkdir -p "$(dirname "$PLIST")"
 cat > "$PLIST" <<PLISTEOF
