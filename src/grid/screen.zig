@@ -20,6 +20,7 @@ const Color = style_pool.Color;
 const Event = @import("../parser/event.zig").Event;
 const utf8 = @import("../util/utf8.zig");
 const palette_default_256 = @import("palette.zig").default_256;
+const kitty_ph = @import("kitty_placeholder.zig");
 
 pub const CMD_ZONE_CAP = 64;
 
@@ -38,6 +39,52 @@ pub const CmdZoneRows = struct {
     start_row: i32,
     end_row: i32,
     exit: i32,
+};
+
+/// Upper bound on distinct `OSC 1337 ; SetUserVar` names; keeps a
+/// runaway app from growing the store without limit.
+pub const USER_VAR_CAP = 64;
+
+/// One iTerm2 user variable. Both slices are GPA-owned.
+pub const UserVar = struct {
+    name: []u8,
+    value: []u8,
+};
+
+/// Built-in selection highlight color (RGBA) used when no OSC 17 /
+/// OSC 21 override is set. Must match the grid_pass selection quad.
+pub const default_selection_bg: [4]f32 = .{ 0.4, 0.55, 0.85, 0.45 };
+
+/// A kitty Unicode-placeholder virtual placement: the image is laid
+/// out across `rows` × `cols` cells. 0 = "derive from the image's
+/// native pixel size and the cell size".
+pub const VirtualPlacement = struct {
+    rows: u32 = 0,
+    cols: u32 = 0,
+    placement_id: u32 = 0,
+};
+
+/// A placeholder cell mid-assembly: base char printed at (screen_row,
+/// screen_col); up to three diacritics decode the image-cell row,
+/// column, and id high-byte.
+pub const PendingPlaceholder = struct {
+    screen_row: u16,
+    screen_col: u16,
+    /// Image id from the cell foreground (low 24 bits); the 3rd
+    /// diacritic may OR in the high byte at flush time.
+    image_id: u32,
+    diac: [3]u32 = .{ 0, 0, 0 },
+    n_diac: u8 = 0,
+};
+
+/// Coordinates of the most recently emitted placeholder tile, for the
+/// auto-increment of a following diacritic-less cell.
+pub const LastPlaceholder = struct {
+    screen_row: u16,
+    screen_col: u16,
+    image_id: u32,
+    img_row: u32,
+    img_col: u32,
 };
 
 pub const Screen = struct {
@@ -268,6 +315,19 @@ pub const Screen = struct {
     /// stored images for separate place actions, PNG decode).
     kitty_images: @import("kitty_images.zig").Manager,
 
+    /// Kitty Unicode-placeholder virtual placements, keyed by image_id.
+    /// A `U=1` placement registers here instead of drawing at the
+    /// cursor; U+10EEEE cells later tile the image across the grid.
+    virtual_placements: std.AutoHashMap(u32, VirtualPlacement),
+    /// The placeholder cell currently being assembled (base printed,
+    /// diacritics still arriving). Finalized into an image tile by
+    /// `flushPlaceholder` when the next base char or non-print event
+    /// lands. Null when not mid-placeholder.
+    ph_pending: ?PendingPlaceholder = null,
+    /// The last finalized placeholder tile — drives auto-increment for
+    /// the next cell when it omits row/column diacritics.
+    ph_last: ?LastPlaceholder = null,
+
     /// Default fg / bg / cursor color overrides, RGBA in 0..1.
     /// Set via OSC 10 / 11 / 12, reset via OSC 110 / 111 / 112.
     /// Renderer syncs from these. cursor_color all-zero = use fg.
@@ -279,6 +339,19 @@ pub const Screen = struct {
     /// The Window sets these alongside default_fg/bg.
     configured_fg: [4]f32 = .{ 0.92, 0.92, 0.92, 1.0 },
     configured_bg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 },
+
+    /// Selection (highlight) colors. Set via OSC 17 (bg) / 19 (fg),
+    /// reset via OSC 117 / 119. Sentinel alpha=0 = "unset": the
+    /// renderer falls back to its built-in translucent highlight and
+    /// leaves selected-cell foreground untouched.
+    selection_bg: [4]f32 = .{ 0, 0, 0, 0 },
+    selection_fg: [4]f32 = .{ 0, 0, 0, 0 },
+
+    /// iTerm2 `OSC 1337 ; SetUserVar=name=<b64value>` store. A small
+    /// app→terminal key/value channel (status bars, IPC). Names cap at
+    /// USER_VAR_CAP entries; setting an existing name overwrites it,
+    /// an empty value clears it. Owned by the GPA, freed in deinit.
+    user_vars: std.ArrayList(UserVar) = .empty,
 
     /// Runtime 256-color palette (overrides the comptime defaults).
     /// Set via OSC 4 ; n ; rgb:... ; reset via OSC 104.
@@ -464,6 +537,10 @@ pub const Screen = struct {
         /// asynchronously with `OSC 52 ; <sel> ; <base64>` via
         /// write-pty. `selection` is 'c' (clipboard) or 'p' (primary).
         on_clipboard_get: ?*const fn (ctx: ?*anyopaque, selection: u8) void = null,
+        /// OSC 1337 ; SetProfile=<name> — app requests this pane adopt
+        /// a configured profile. Untrusted: the GUI maps an unknown
+        /// name to the Default profile.
+        on_set_profile: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
     };
 
     /// Desktop-notification request flowing out of the screen. All
@@ -552,6 +629,11 @@ pub const Screen = struct {
         src_y: u32 = 0,
         src_w: u32 = 0,
         src_h: u32 = 0,
+        /// Stable line id of the placement's top row. The renderer
+        /// resolves this to a live display row every frame so the image
+        /// scrolls with its content (and into scrollback). 0 = no
+        /// anchor: the image stays pinned to `row` (legacy behavior).
+        anchor_id: u64 = 0,
     };
 
     /// An ImageEvent with owned pixels — what `retain_images` keeps
@@ -568,7 +650,15 @@ pub const Screen = struct {
     pub const RETAIN_IMAGE_BUDGET: usize = 12 * 1024 * 1024;
 
     /// Emit an image to the sink, retaining a copy when configured.
-    fn emitImage(self: *Screen, ev: ImageEvent) void {
+    fn emitImage(self: *Screen, ev_in: ImageEvent) void {
+        var ev = ev_in;
+        // Anchor to the stable line id of the placement's top row so the
+        // renderer can track it through scroll + scrollback. Guard the
+        // row against the buffer bounds; 0 leaves it pinned.
+        if (ev.anchor_id == 0) {
+            const b = self.buf();
+            if (ev.row < b.len) ev.anchor_id = b[ev.row].id;
+        }
         if (self.sink.on_image) |f| f(self.sink.ctx, ev);
         if (!self.retain_images) return;
         if (ev.rgba.len > RETAIN_IMAGE_BUDGET) return;
@@ -614,6 +704,62 @@ pub const Screen = struct {
         self.retained_image_bytes = 0;
     }
 
+    /// Where an anchored image should draw right now.
+    pub const ImageRow = union(enum) {
+        /// Display row (0 = top); may fall outside [0, rows) when the
+        /// image straddles an edge — GL clipping handles the overflow.
+        visible: i32,
+        /// The anchor line still exists but isn't in the current
+        /// viewport (scrolled away). Keep the image; don't draw it.
+        offscreen,
+        /// The anchor line has fallen out of the scrollback ring. The
+        /// image can never be shown again — free it.
+        evicted,
+    };
+
+    /// Resolve an image's stable anchor line id to its live display row,
+    /// mirroring grid_pass's row→line mapping (scrollback rows first
+    /// under `view_offset`, then the active/alt buffer). Costs at most
+    /// one buffer scan plus a bounded scrollback-window scan per call.
+    pub fn imageRowForAnchor(self: *Screen, anchor_id: u64) ImageRow {
+        if (anchor_id == 0) return .offscreen;
+        const b = self.buf();
+        const sb_count = self.scrollback.items.len;
+        const view_off: usize = @min(self.view_offset, sb_count);
+
+        // Current buffer: display row = buffer index + view_off.
+        for (b, 0..) |ln, i| {
+            if (ln.id == anchor_id) return .{ .visible = @as(i32, @intCast(i)) + @as(i32, @intCast(view_off)) };
+        }
+
+        // Visible scrollback window (top `view_off` display rows) plus a
+        // margin of one screen height above it, so a tall image whose
+        // anchor scrolled just past the top edge still draws its lower
+        // rows (GL clips the part above). Bounded by `rows`, so the scan
+        // stays cheap regardless of ring size.
+        if (sb_count > 0) {
+            const win_lo: usize = (sb_count -| view_off) -| self.rows;
+            var i: usize = win_lo;
+            while (i < sb_count) : (i += 1) {
+                if (self.scrollback.items[i].id == anchor_id) {
+                    return .{ .visible = @as(i32, @intCast(i)) - @as(i32, @intCast(sb_count)) + @as(i32, @intCast(view_off)) };
+                }
+            }
+        }
+
+        // Not in the buffer or the scanned window. Line ids are assigned
+        // in birth order, so anything older than the oldest surviving
+        // line has been evicted; otherwise it's simply scrolled away.
+        const oldest: u64 = if (sb_count > 0)
+            self.scrollback.items[0].id
+        else if (b.len > 0)
+            b[0].id
+        else
+            0;
+        if (anchor_id < oldest) return .evicted;
+        return .offscreen;
+    }
+
     pub fn init(allocator: std.mem.Allocator, pool: *Pool, cols: u16, rows: u16) !*Screen {
         const self = try allocator.create(Screen);
         errdefer allocator.destroy(self);
@@ -641,6 +787,7 @@ pub const Screen = struct {
             .links = std.AutoHashMap(u8, []u8).init(allocator),
             .clusters = std.AutoHashMap(u32, std.ArrayList(u32)).init(allocator),
             .kitty_images = @import("kitty_images.zig").Manager.init(allocator),
+            .virtual_placements = std.AutoHashMap(u32, VirtualPlacement).init(allocator),
             .next_line_id = id_counter,
         };
         try self.resetTabStops();
@@ -676,6 +823,12 @@ pub const Screen = struct {
         while (cl_it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         self.clusters.deinit();
         self.kitty_images.deinit();
+        self.virtual_placements.deinit();
+        for (self.user_vars.items) |uv| {
+            self.allocator.free(uv.name);
+            self.allocator.free(uv.value);
+        }
+        self.user_vars.deinit(self.allocator);
         if (self.preedit_text) |t| self.allocator.free(t);
         if (self.last_title) |t| self.allocator.free(t);
         for (&self.title_stack) |*entry| {
@@ -1853,6 +2006,14 @@ pub const Screen = struct {
 
     pub fn apply(self: *Screen, ev: Event) void {
         self.dirty = true;
+        // A pending Unicode placeholder is complete once anything other
+        // than more printable text arrives (cursor move, newline, CSI,
+        // …). Print events finalize it themselves as the next base char
+        // lands, so leave those alone.
+        switch (ev) {
+            .print, .print_byte, .print_run => {},
+            else => if (self.ph_pending != null) self.flushPlaceholder(),
+        }
         switch (ev) {
             .print => |cp| self.printCp(cp),
             .print_byte => |b| self.printByte(b),
@@ -2358,8 +2519,242 @@ pub const Screen = struct {
             // No-op: we don't accumulate streamed copy content.
             return;
         }
-        // Unknown key — silently drop. Includes SetUserVar,
-        // SetBadgeFormat, etc. (no internal state to attach to).
+        if (std.mem.eql(u8, key, "ReportCellSize")) {
+            // Reply `1337 ; ReportCellSize=<height>;<width>;<scale>`.
+            // Pixel dims come from Pane.onResize; 0 falls back to the
+            // CSI 14t defaults (8x16). Scale is always 1.0 — we report
+            // device pixels, not points.
+            const cw: u32 = if (self.cell_pixel_w > 0) self.cell_pixel_w else 8;
+            const ch: u32 = if (self.cell_pixel_h > 0) self.cell_pixel_h else 16;
+            var resp_buf: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&resp_buf, "\x1b]1337;ReportCellSize={d};{d};1.0\x1b\\", .{ ch, cw }) catch return;
+            self.respond(s);
+            return;
+        }
+        if (std.mem.eql(u8, key, "SetUserVar")) {
+            // `SetUserVar=<name>=<base64-value>`. Empty value clears.
+            const veq = std.mem.indexOfScalar(u8, val, '=') orelse return;
+            const name = val[0..veq];
+            const b64 = val[veq + 1 ..];
+            if (name.len == 0) return;
+            if (b64.len == 0) {
+                self.setUserVar(name, "");
+                return;
+            }
+            const decoder = std.base64.standard.Decoder;
+            const out_len = decoder.calcSizeForSlice(b64) catch return;
+            if (out_len > 4096) return; // sanity cap per value
+            var dec_buf: [4096]u8 = undefined;
+            decoder.decode(dec_buf[0..out_len], b64) catch return;
+            self.setUserVar(name, dec_buf[0..out_len]);
+            return;
+        }
+        if (std.mem.eql(u8, key, "SetColors")) {
+            // `SetColors=<name>=<spec>[ , <name>=<spec> ...]`. Maps the
+            // iTerm names we render onto our color state.
+            var it = std.mem.splitScalar(u8, val, ',');
+            while (it.next()) |pair| {
+                const peq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+                self.applyNamedColor(pair[0..peq], pair[peq + 1 ..]);
+            }
+            self.dirty = true;
+            return;
+        }
+        if (std.mem.eql(u8, key, "SetProfile")) {
+            // Request the GUI switch this pane's profile. Untrusted, so
+            // the sink decides whether to honor it (unknown name = Default).
+            if (self.sink.on_set_profile) |f| f(self.sink.ctx, val);
+            return;
+        }
+        // Unknown key — silently drop (SetBadgeFormat, etc.).
+    }
+
+    /// OSC 133 / 633 `C` — mark where the running command's output
+    /// begins. No-op on the alt screen.
+    fn cmdOutputStart(self: *Screen) void {
+        if (self.use_alt or self.row >= self.rows) return;
+        self.pending_output_start_id = self.active[self.row].id;
+    }
+
+    /// OSC 133 / 633 `D` — close the command-output zone opened by
+    /// `cmdOutputStart`. `exit_str` is the optional exit-code field
+    /// (empty = unknown → 0).
+    fn cmdOutputEnd(self: *Screen, exit_str: []const u8) void {
+        if (self.use_alt or self.row >= self.rows) return;
+        const start_id = self.pending_output_start_id;
+        if (start_id == 0) return;
+        self.pending_output_start_id = 0;
+        self.last_output_start_id = start_id;
+        self.last_output_end_id = self.active[self.row].id;
+        self.last_cmd_exit = if (exit_str.len > 0) (std.fmt.parseInt(i32, exit_str, 10) catch 0) else 0;
+        self.recordCmdZone(start_id, self.last_output_end_id, self.last_cmd_exit);
+    }
+
+    /// VS Code shell integration (`OSC 633`). A superset of OSC 133:
+    /// the A/B/C/D prompt marks behave identically, plus `E` (command
+    /// line text) and `P;key=value` properties (notably `Cwd`).
+    fn handleOsc633(self: *Screen, rest: []const u8) void {
+        if (rest.len == 0) return;
+        switch (rest[0]) {
+            'A' => self.recordPromptMark(),
+            'C' => self.cmdOutputStart(),
+            'D' => self.cmdOutputEnd(if (rest.len > 2 and rest[1] == ';') rest[2..] else ""),
+            // `E ; <command-line> [; <nonce>]` — informational; we have
+            // no command-history surface yet, so accept and drop.
+            'E' => {},
+            // `P ; key=value [; key=value …]` — properties. Only Cwd is
+            // actionable today.
+            'P' => {
+                if (rest.len < 2 or rest[1] != ';') return;
+                var it = std.mem.splitScalar(u8, rest[2..], ';');
+                while (it.next()) |prop| {
+                    const eq = std.mem.indexOfScalar(u8, prop, '=') orelse continue;
+                    if (std.mem.eql(u8, prop[0..eq], "Cwd")) {
+                        if (self.sink.on_cwd) |f| f(self.sink.ctx, prop[eq + 1 ..]);
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Set / overwrite / clear an iTerm2 user variable. Empty value
+    /// removes the entry. Caps the store at USER_VAR_CAP names.
+    fn setUserVar(self: *Screen, name: []const u8, value: []const u8) void {
+        for (self.user_vars.items, 0..) |uv, i| {
+            if (!std.mem.eql(u8, uv.name, name)) continue;
+            if (value.len == 0) {
+                self.allocator.free(uv.name);
+                self.allocator.free(uv.value);
+                _ = self.user_vars.swapRemove(i);
+                return;
+            }
+            const newval = self.allocator.dupe(u8, value) catch return;
+            self.allocator.free(self.user_vars.items[i].value);
+            self.user_vars.items[i].value = newval;
+            return;
+        }
+        if (value.len == 0 or self.user_vars.items.len >= USER_VAR_CAP) return;
+        const n = self.allocator.dupe(u8, name) catch return;
+        const v = self.allocator.dupe(u8, value) catch {
+            self.allocator.free(n);
+            return;
+        };
+        self.user_vars.append(self.allocator, .{ .name = n, .value = v }) catch {
+            self.allocator.free(n);
+            self.allocator.free(v);
+        };
+    }
+
+    /// Look up a user variable's value (borrowed). Null if unset.
+    pub fn userVar(self: *const Screen, name: []const u8) ?[]const u8 {
+        for (self.user_vars.items) |uv| {
+            if (std.mem.eql(u8, uv.name, name)) return uv.value;
+        }
+        return null;
+    }
+
+    /// Reply to an OSC 17 / 19 selection-color query. Unset (alpha 0)
+    /// falls back to the renderer's built-in highlight (bg) or the
+    /// default background read as the selected-text color (fg).
+    fn respondSelectionColor(self: *Screen, osc_num: u32) void {
+        const stored = if (osc_num == 17) self.selection_bg else self.selection_fg;
+        const rgba: [4]f32 = if (stored[3] > 0)
+            stored
+        else if (osc_num == 17)
+            default_selection_bg
+        else
+            self.default_bg;
+        const r16: u16 = @intFromFloat(@round(rgba[0] * 65535.0));
+        const g16: u16 = @intFromFloat(@round(rgba[1] * 65535.0));
+        const b16: u16 = @intFromFloat(@round(rgba[2] * 65535.0));
+        var resp_buf: [64]u8 = undefined;
+        const s = std.fmt.bufPrint(&resp_buf, "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}\x1b\\", .{ osc_num, r16, g16, b16 }) catch return;
+        self.respond(s);
+    }
+
+    /// Apply one iTerm2/kitty color name to our color state. Shared by
+    /// OSC 1337 SetColors and OSC 21.
+    fn applyNamedColor(self: *Screen, name: []const u8, spec: []const u8) void {
+        const rgba = Screen.parseColor(spec) orelse return;
+        if (std.mem.eql(u8, name, "fg") or std.mem.eql(u8, name, "foreground")) {
+            self.default_fg = rgba;
+        } else if (std.mem.eql(u8, name, "bg") or std.mem.eql(u8, name, "background")) {
+            self.default_bg = rgba;
+        } else if (std.mem.eql(u8, name, "cursor") or std.mem.eql(u8, name, "cursor_color")) {
+            self.cursor_color = rgba;
+        } else if (std.mem.eql(u8, name, "selection_foreground") or std.mem.eql(u8, name, "selection_text")) {
+            self.selection_fg = rgba;
+        } else if (std.mem.eql(u8, name, "selection_background") or std.mem.eql(u8, name, "selection")) {
+            self.selection_bg = rgba;
+        } else if (std.fmt.parseInt(u8, name, 10)) |idx| {
+            self.palette[idx] = .{
+                @intFromFloat(@round(rgba[0] * 255.0)),
+                @intFromFloat(@round(rgba[1] * 255.0)),
+                @intFromFloat(@round(rgba[2] * 255.0)),
+            };
+        } else |_| {}
+    }
+
+    /// OSC 21 — kitty's unified color query/set. Payload is a
+    /// `;`-separated list of `key=spec` (set) or `key=?` (query)
+    /// items. Queries are answered in a single `OSC 21 ; … ST` reply
+    /// echoing each queried key with its current rgb value.
+    fn handleOsc21(self: *Screen, rest: []const u8) void {
+        var resp: std.ArrayList(u8) = .empty;
+        defer resp.deinit(self.allocator);
+        var it = std.mem.splitScalar(u8, rest, ';');
+        var dirty_set = false;
+        while (it.next()) |item| {
+            const eq = std.mem.indexOfScalar(u8, item, '=') orelse continue;
+            const name = item[0..eq];
+            const spec = item[eq + 1 ..];
+            if (spec.len == 1 and spec[0] == '?') {
+                const rgba = self.namedColorValue(name) orelse continue;
+                const r16: u16 = @intFromFloat(@round(rgba[0] * 65535.0));
+                const g16: u16 = @intFromFloat(@round(rgba[1] * 65535.0));
+                const b16: u16 = @intFromFloat(@round(rgba[2] * 65535.0));
+                if (resp.items.len > 0) resp.append(self.allocator, ';') catch {};
+                var item_buf: [96]u8 = undefined;
+                const piece = std.fmt.bufPrint(&item_buf, "{s}=rgb:{x:0>4}/{x:0>4}/{x:0>4}", .{
+                    name, r16, g16, b16,
+                }) catch continue;
+                resp.appendSlice(self.allocator, piece) catch {};
+            } else {
+                self.applyNamedColor(name, spec);
+                dirty_set = true;
+            }
+        }
+        if (dirty_set) self.dirty = true;
+        if (resp.items.len > 0) {
+            var hdr: [8]u8 = undefined;
+            const h = std.fmt.bufPrint(&hdr, "\x1b]21;", .{}) catch return;
+            self.respond(h);
+            self.respond(resp.items);
+            self.respond("\x1b\\");
+        }
+    }
+
+    /// Resolve a color name to its current RGBA, for OSC 21 queries.
+    fn namedColorValue(self: *const Screen, name: []const u8) ?[4]f32 {
+        if (std.mem.eql(u8, name, "fg") or std.mem.eql(u8, name, "foreground")) return self.default_fg;
+        if (std.mem.eql(u8, name, "bg") or std.mem.eql(u8, name, "background")) return self.default_bg;
+        if (std.mem.eql(u8, name, "cursor") or std.mem.eql(u8, name, "cursor_color"))
+            return if (self.cursor_color[3] > 0) self.cursor_color else self.default_fg;
+        if (std.mem.eql(u8, name, "selection_foreground") or std.mem.eql(u8, name, "selection_text"))
+            return if (self.selection_fg[3] > 0) self.selection_fg else self.default_bg;
+        if (std.mem.eql(u8, name, "selection_background") or std.mem.eql(u8, name, "selection"))
+            return if (self.selection_bg[3] > 0) self.selection_bg else default_selection_bg;
+        if (std.fmt.parseInt(u8, name, 10)) |idx| {
+            const p = self.palette[idx];
+            return .{
+                @as(f32, @floatFromInt(p[0])) / 255.0,
+                @as(f32, @floatFromInt(p[1])) / 255.0,
+                @as(f32, @floatFromInt(p[2])) / 255.0,
+                1.0,
+            };
+        } else |_| {}
+        return null;
     }
 
     pub fn onApc(self: *Screen, body: []const u8) void {
@@ -2406,6 +2801,23 @@ pub const Screen = struct {
             };
             self.pruneRetainedImages(del_ev);
             if (self.sink.on_image_delete_full) |f| f(self.sink.ctx, del_ev);
+            self.dirty = true;
+            return;
+        }
+
+        // Unicode-placeholder (virtual) placement: register the grid
+        // size and DON'T draw at the cursor — U+10EEEE cells will tile
+        // the image later. The transmit half still has to run so the
+        // pixels get stored.
+        if (cmd.unicode_placement == 1) {
+            _ = self.kitty_images.ingest(cmd);
+            if (cmd.image_id != 0) {
+                self.virtual_placements.put(cmd.image_id, .{
+                    .rows = cmd.cells_high, // r=
+                    .cols = cmd.cells_wide, // c=
+                    .placement_id = cmd.placement_id,
+                }) catch {};
+            }
             self.dirty = true;
             return;
         }
@@ -2630,6 +3042,10 @@ pub const Screen = struct {
                 self.last_title = self.allocator.dupe(u8, rest) catch null;
                 if (self.sink.on_title) |f| f(self.sink.ctx, rest);
             },
+            // OSC 1 — set icon name only. We have no separate icon-name
+            // surface (GTK uses the window title), so accept and ignore
+            // rather than clobbering the title set by OSC 0/2.
+            1 => {},
             7 => {
                 if (self.sink.on_cwd) |f| f(self.sink.ctx, rest);
             },
@@ -2652,6 +3068,13 @@ pub const Screen = struct {
                     if (self.sink.on_progress) |f| f(self.sink.ctx, p.state, p.percent);
                     return;
                 }
+                // ConEmu/Cmder `OSC 9 ; 9 ; <path>` reports the cwd
+                // (Windows convention). Some emitters quote the path.
+                if (std.mem.startsWith(u8, rest, "9;")) {
+                    const path = std.mem.trim(u8, rest[2..], "\"");
+                    if (self.sink.on_cwd) |f| f(self.sink.ctx, path);
+                    return;
+                }
                 if (self.sink.on_notification) |f| f(self.sink.ctx, .{ .title = "sketerm", .body = rest });
             },
             10, 11, 12 => {
@@ -2668,6 +3091,29 @@ pub const Screen = struct {
                     self.dirty = true;
                 }
             },
+            // OSC 17 / 19 — selection (highlight) bg / fg color. Query
+            // form (`?`) replies with the active value; set parses a
+            // color spec. Resets are OSC 117 / 119.
+            17, 19 => {
+                if (rest.len == 1 and rest[0] == '?') {
+                    self.respondSelectionColor(num);
+                } else if (Screen.parseColor(rest)) |rgba| {
+                    if (num == 17) self.selection_bg = rgba else self.selection_fg = rgba;
+                    self.dirty = true;
+                }
+            },
+            117 => {
+                self.selection_bg = .{ 0, 0, 0, 0 };
+                self.dirty = true;
+            },
+            119 => {
+                self.selection_fg = .{ 0, 0, 0, 0 };
+                self.dirty = true;
+            },
+            // OSC 21 — kitty's unified color query/set protocol.
+            21 => self.handleOsc21(rest),
+            // OSC 633 — VS Code shell integration (superset of 133).
+            633 => self.handleOsc633(rest),
             // OSC 133 — FinalTerm shell-integration prompt marks.
             // A=prompt-start (navigable), B=prompt-end (input starts;
             // nothing to record), C=command-output-start, D=command
@@ -2677,23 +3123,9 @@ pub const Screen = struct {
                 if (rest.len == 0) return;
                 switch (rest[0]) {
                     'A' => self.recordPromptMark(),
-                    'C' => {
-                        if (self.use_alt or self.row >= self.rows) return;
-                        self.pending_output_start_id = self.active[self.row].id;
-                    },
-                    'D' => {
-                        if (self.use_alt or self.row >= self.rows) return;
-                        const start_id = self.pending_output_start_id;
-                        if (start_id == 0) return;
-                        self.pending_output_start_id = 0;
-                        self.last_output_start_id = start_id;
-                        self.last_output_end_id = self.active[self.row].id;
-                        self.last_cmd_exit = 0;
-                        if (rest.len > 2 and rest[1] == ';') {
-                            self.last_cmd_exit = std.fmt.parseInt(i32, rest[2..], 10) catch 0;
-                        }
-                        self.recordCmdZone(start_id, self.last_output_end_id, self.last_cmd_exit);
-                    },
+                    'C' => self.cmdOutputStart(),
+                    // `D` or `D;<exit-code>`.
+                    'D' => self.cmdOutputEnd(if (rest.len > 2 and rest[1] == ';') rest[2..] else ""),
                     else => {},
                 }
             },
@@ -2802,6 +3234,9 @@ pub const Screen = struct {
     /// itself doesn't need range-checking bytes — caller has done
     /// that. Handles autowrap mid-slice.
     fn fastAsciiSlice(self: *Screen, bytes: []const u8) void {
+        // ASCII can't be a placeholder diacritic, so any pending
+        // placeholder is finalized before this run overwrites cells.
+        if (self.ph_pending != null) self.flushPlaceholder();
         const total: u16 = @intCast(bytes.len);
         const link_id = self.current_link_id;
         const flags: u8 = if (link_id != 0) 0b0000_0100 else 0;
@@ -2880,12 +3315,35 @@ pub const Screen = struct {
         // to the previously-printed cell's cluster so selection
         // extraction can emit the full cluster. Renderer continues
         // to draw only the base.
+        // Kitty Unicode-placeholder diacritics decode the image-cell
+        // row/column/id-high for a pending placeholder. Routed here
+        // explicitly (not via isExtendingCp) so every entry in the
+        // 297-char table attaches, even ones outside the common
+        // combining blocks. Still stored as a cluster so copy/paste
+        // round-trips the bytes.
+        if (self.ph_pending) |*pp| {
+            if (kitty_ph.rowColIndex(cp)) |idx| {
+                if (pp.n_diac < 3) {
+                    pp.diac[pp.n_diac] = idx;
+                    pp.n_diac += 1;
+                }
+                const row: u16 = @intCast(self.last_print_key >> 16);
+                const col: u16 = @intCast(self.last_print_key & 0xFFFF);
+                self.appendCluster(row, col, cp);
+                return;
+            }
+        }
+
         if (self.last_print_cp != 0 and isExtendingCp(cp)) {
             const row: u16 = @intCast(self.last_print_key >> 16);
             const col: u16 = @intCast(self.last_print_key & 0xFFFF);
             self.appendCluster(row, col, cp);
             return;
         }
+
+        // A new base char finalizes any placeholder cell still waiting
+        // for diacritics.
+        if (self.ph_pending != null) self.flushPlaceholder();
 
         const width: u8 = if (isWideCp(cp)) 2 else 1;
 
@@ -2950,6 +3408,16 @@ pub const Screen = struct {
         // Remember where we placed the base for cluster attachment.
         self.last_print_key = cellKey(self.row, self.col);
 
+        // A placeholder base opens a pending tile; its image id comes
+        // from the current foreground, diacritics (if any) follow.
+        if (cp == kitty_ph.PLACEHOLDER) {
+            self.ph_pending = .{
+                .screen_row = self.row,
+                .screen_col = self.col,
+                .image_id = self.fgImageId(),
+            };
+        }
+
         self.col += width;
         if (self.col >= self.cols) {
             if (self.autowrap) {
@@ -2960,6 +3428,117 @@ pub const Screen = struct {
             }
         }
         self.last_print_cp = cp;
+    }
+
+    /// The current foreground rendered as a kitty image id: palette
+    /// index, or packed 24-bit truecolor. `.default` → 0 (no image).
+    fn fgImageId(self: *Screen) u32 {
+        return switch (self.pool.get(self.cur_style).fg) {
+            .default => 0,
+            .palette => |p| p,
+            .rgb => |c| (@as(u32, c.r) << 16) | (@as(u32, c.g) << 8) | c.b,
+        };
+    }
+
+    /// Finalize the pending placeholder cell into an image tile. Decodes
+    /// the image-cell row/column from its diacritics, applying the
+    /// auto-increment rule (a diacritic-less cell continues the previous
+    /// tile to its right), then emits a one-cell crop of the image.
+    fn flushPlaceholder(self: *Screen) void {
+        const pp = self.ph_pending orelse return;
+        self.ph_pending = null;
+
+        var image_id = pp.image_id;
+        // 3rd diacritic carries the most-significant byte of the id.
+        if (pp.n_diac >= 3) image_id |= pp.diac[2] << 24;
+        if (image_id == 0) {
+            self.ph_last = null;
+            return;
+        }
+
+        var img_row: u32 = if (pp.n_diac >= 1) pp.diac[0] else 0;
+        var img_col: u32 = if (pp.n_diac >= 2) pp.diac[1] else 0;
+        // Missing row and/or column: continue the previous tile when
+        // this cell sits immediately to its right, same row & image.
+        if (pp.n_diac < 2) {
+            if (self.ph_last) |last| {
+                if (last.image_id == image_id and
+                    last.screen_row == pp.screen_row and
+                    last.screen_col +% 1 == pp.screen_col)
+                {
+                    if (pp.n_diac == 0) img_row = last.img_row;
+                    img_col = last.img_col + 1;
+                }
+            }
+        }
+
+        self.emitPlaceholderTile(pp.screen_row, pp.screen_col, image_id, img_row, img_col);
+        self.ph_last = .{
+            .screen_row = pp.screen_row,
+            .screen_col = pp.screen_col,
+            .image_id = image_id,
+            .img_row = img_row,
+            .img_col = img_col,
+        };
+    }
+
+    /// Emit a single placeholder tile: the (img_row, img_col) cell of
+    /// the image's r×c grid, cropped to its own small pixel buffer and
+    /// placed at one terminal cell. The synthetic per-cell placement id
+    /// lets distinct tiles coexist while a re-print at the same cell
+    /// replaces cleanly.
+    fn emitPlaceholderTile(self: *Screen, srow: u16, scol: u16, image_id: u32, img_row: u32, img_col: u32) void {
+        const stored = self.kitty_images.get(image_id) orelse return;
+        if (stored.width == 0 or stored.height == 0) return;
+
+        var cols: u32 = 0;
+        var rows: u32 = 0;
+        if (self.virtual_placements.get(image_id)) |vp| {
+            cols = vp.cols;
+            rows = vp.rows;
+        }
+        // Grid size unspecified: derive from native pixel size / cell.
+        if (cols == 0) {
+            const cw: u32 = if (self.cell_pixel_w > 0) self.cell_pixel_w else 8;
+            cols = @max(1, (stored.width + cw - 1) / cw);
+        }
+        if (rows == 0) {
+            const ch: u32 = if (self.cell_pixel_h > 0) self.cell_pixel_h else 16;
+            rows = @max(1, (stored.height + ch - 1) / ch);
+        }
+        if (img_row >= rows or img_col >= cols) return;
+
+        const tile_w = stored.width / cols;
+        const tile_h = stored.height / rows;
+        if (tile_w == 0 or tile_h == 0) return;
+
+        const sx = img_col * tile_w;
+        const sy = img_row * tile_h;
+        const row_bytes = tile_w * 4;
+
+        const tile = self.allocator.alloc(u8, tile_w * tile_h * 4) catch return;
+        defer self.allocator.free(tile);
+        var ty: u32 = 0;
+        while (ty < tile_h) : (ty += 1) {
+            const src_off = ((sy + ty) * stored.width + sx) * 4;
+            const dst_off = ty * row_bytes;
+            @memcpy(tile[dst_off .. dst_off + row_bytes], stored.rgba[src_off .. src_off + row_bytes]);
+        }
+
+        // High bit tags it as placeholder-synthetic so it never clashes
+        // with an app-chosen placement id; position keeps tiles distinct.
+        const synth_pid: u32 = 0x4000_0000 | (@as(u32, srow) << 12) | scol;
+        self.emitImage(.{
+            .width = tile_w,
+            .height = tile_h,
+            .rgba = tile,
+            .row = srow,
+            .col = scol,
+            .image_id = image_id,
+            .placement_id = synth_pid,
+            .cells_wide = 1,
+            .cells_high = 1,
+        });
     }
 
     /// Returns true if the codepoint is a "combining" or "extending"
@@ -7341,6 +7920,226 @@ test "SGR 58 palette form (58:5:n)" {
     ev.setSub(2, true);
     s.csi(ev);
     try std.testing.expectEqual(@as(u8, 196), pool.get(s.cur_style).underline_color.palette);
+}
+
+const OscCapture = struct {
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    fn write(_: ?*anyopaque, bytes: []const u8) void {
+        const n = @min(bytes.len, buf.len - len);
+        @memcpy(buf[len .. len + n], bytes[0..n]);
+        len += n;
+    }
+    fn reset() void {
+        len = 0;
+    }
+    fn got() []const u8 {
+        return buf[0..len];
+    }
+};
+
+test "OSC 17/19 set + 117/119 reset selection colors" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+
+    s.onOsc("17;rgb:ffff/0000/0000"); // selection bg = red
+    try std.testing.expectEqual(@as(f32, 1.0), s.selection_bg[0]);
+    try std.testing.expectEqual(@as(f32, 1.0), s.selection_bg[3]); // opaque sentinel set
+
+    s.onOsc("19;#00ff00"); // selection fg = green
+    try std.testing.expectEqual(@as(f32, 1.0), s.selection_fg[1]);
+
+    s.onOsc("117"); // reset bg → unset sentinel
+    try std.testing.expectEqual(@as(f32, 0.0), s.selection_bg[3]);
+    s.onOsc("119");
+    try std.testing.expectEqual(@as(f32, 0.0), s.selection_fg[3]);
+}
+
+test "OSC 17 query replies with current selection bg" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = OscCapture.write };
+
+    s.onOsc("17;rgb:ffff/0000/0000");
+    OscCapture.reset();
+    s.onOsc("17;?");
+    try std.testing.expectEqualStrings("\x1b]17;rgb:ffff/0000/0000\x1b\\", OscCapture.got());
+}
+
+test "OSC 1337 SetUserVar stores, overwrites and clears" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+
+    // base64("hello") = aGVsbG8=
+    s.onOsc("1337;SetUserVar=greeting=aGVsbG8=");
+    try std.testing.expectEqualStrings("hello", s.userVar("greeting").?);
+
+    // base64("bye") = Ynll
+    s.onOsc("1337;SetUserVar=greeting=Ynll");
+    try std.testing.expectEqualStrings("bye", s.userVar("greeting").?);
+
+    // Empty value clears.
+    s.onOsc("1337;SetUserVar=greeting=");
+    try std.testing.expect(s.userVar("greeting") == null);
+}
+
+test "OSC 1337 ReportCellSize replies with pixel dims" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = OscCapture.write };
+    s.cell_pixel_w = 9;
+    s.cell_pixel_h = 18;
+
+    OscCapture.reset();
+    s.onOsc("1337;ReportCellSize");
+    try std.testing.expectEqualStrings("\x1b]1337;ReportCellSize=18;9;1.0\x1b\\", OscCapture.got());
+}
+
+test "OSC 9;9 reports cwd" {
+    const Sink = struct {
+        var seen: [256]u8 = undefined;
+        var seen_len: usize = 0;
+        fn cwd(_: ?*anyopaque, path: []const u8) void {
+            @memcpy(seen[0..path.len], path);
+            seen_len = path.len;
+        }
+    };
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    s.sink = .{ .on_cwd = Sink.cwd };
+
+    Sink.seen_len = 0;
+    s.onOsc("9;9;/home/user/project");
+    try std.testing.expectEqualStrings("/home/user/project", Sink.seen[0..Sink.seen_len]);
+}
+
+test "OSC 633 D records a command zone like 133" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 4);
+    defer s.deinit();
+
+    s.onOsc("633;C"); // output start
+    try std.testing.expect(s.pending_output_start_id != 0);
+    const start = s.pending_output_start_id;
+    s.onOsc("633;D;0"); // command finished, exit 0
+    try std.testing.expectEqual(start, s.last_output_start_id);
+    try std.testing.expectEqual(@as(i32, 0), s.last_cmd_exit);
+}
+
+test "OSC 21 query + set" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    s.sink = .{ .on_write_pty = OscCapture.write };
+
+    // Set background to black, then query it back.
+    s.onOsc("21;background=#000000");
+    try std.testing.expectEqual(@as(f32, 0.0), s.default_bg[0]);
+
+    OscCapture.reset();
+    s.onOsc("21;background=?");
+    try std.testing.expectEqualStrings("\x1b]21;background=rgb:0000/0000/0000\x1b\\", OscCapture.got());
+}
+
+test "imageRowForAnchor tracks a line through scroll, scrollback and eviction" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 8, 5);
+    defer s.deinit();
+    s.scrollback_capacity = 50;
+
+    // Anchor to the line currently at row 2 (id assigned at init).
+    const id = s.buf()[2].id;
+    try std.testing.expect(id != 0);
+
+    const Row = struct {
+        fn expectVisible(scr: *Screen, anchor: u64, want: i32) !void {
+            switch (scr.imageRowForAnchor(anchor)) {
+                .visible => |r| try std.testing.expectEqual(want, r),
+                else => return error.NotVisible,
+            }
+        }
+    };
+
+    // While the line stays in the active buffer it tracks up row by row.
+    // (scrollUp(n) caps n at the region height, so scroll one line at a
+    // time — exactly how lineFeed drives it.)
+    try Row.expectVisible(s, id, 2);
+    s.scrollUp(1);
+    try Row.expectVisible(s, id, 1);
+    s.scrollUp(1);
+    try Row.expectVisible(s, id, 0);
+
+    // Scroll it deep into scrollback (well past one screen height). It
+    // landed at scrollback index 2 (pushed 3rd). With no view offset it
+    // is off-screen but still alive.
+    for (0..15) |_| s.scrollUp(1);
+    try std.testing.expectEqual(Screen.ImageRow.offscreen, s.imageRowForAnchor(id));
+
+    // Offsetting the view to bring index 2 to the top row shows it again.
+    const sb_count: u32 = @intCast(s.scrollback.items.len);
+    s.view_offset = sb_count - 2;
+    try Row.expectVisible(s, id, 0);
+    s.view_offset = 0;
+
+    // Push past the 50-line ring so the anchor line is evicted entirely.
+    for (0..60) |_| s.scrollUp(1);
+    try std.testing.expectEqual(Screen.ImageRow.evicted, s.imageRowForAnchor(id));
+}
+
+test "emitImage stamps an anchor id from the placement row" {
+    const Sink = struct {
+        var anchor: u64 = 0;
+        var fired: bool = false;
+        fn img(_: ?*anyopaque, ev: Screen.ImageEvent) void {
+            anchor = ev.anchor_id;
+            fired = true;
+        }
+    };
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 8, 5);
+    defer s.deinit();
+    s.sink = .{ .on_image = Sink.img };
+    s.row = 3;
+
+    Sink.fired = false;
+    const px = [_]u8{ 0, 0, 0, 0 };
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 3, .col = 0 });
+    try std.testing.expect(Sink.fired);
+    try std.testing.expectEqual(s.buf()[3].id, Sink.anchor);
+}
+
+test "OSC 1337 SetProfile fires sink" {
+    const Sink = struct {
+        var name: [64]u8 = undefined;
+        var name_len: usize = 0;
+        fn setProfile(_: ?*anyopaque, n: []const u8) void {
+            @memcpy(name[0..n.len], n);
+            name_len = n.len;
+        }
+    };
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    s.sink = .{ .on_set_profile = Sink.setProfile };
+
+    Sink.name_len = 0;
+    s.onOsc("1337;SetProfile=Solarized");
+    try std.testing.expectEqualStrings("Solarized", Sink.name[0..Sink.name_len]);
 }
 
 test "SGR 38 colon form with colorspace slot still parses fg" {

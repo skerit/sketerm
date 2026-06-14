@@ -81,6 +81,10 @@ pub const Action = enum {
     /// Save the current tab/split layout as the user's default,
     /// auto-loaded on every subsequent cold start.
     save_default_layout,
+    /// Pick a saved layout file (.json/.layout) and load its tabs
+    /// into the current window — appends, mirroring the `--layout`
+    /// CLI flag's semantics (existing tabs are left in place).
+    load_layout,
     prompt_prev,
     prompt_next,
     pane_next,
@@ -285,6 +289,7 @@ pub fn actionName(a: Action) []const u8 {
         .save_layout => "save_layout",
         .save_layout_as => "save_layout_as",
         .save_default_layout => "save_default_layout",
+        .load_layout => "load_layout",
         .prompt_prev => "prompt_prev",
         .prompt_next => "prompt_next",
         .pane_next => "pane_next",
@@ -357,6 +362,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .save_layout => "Save layout",
         .save_layout_as => "Save layout as…",
         .save_default_layout => "Save layout as default",
+        .load_layout => "Load layout…",
         .prompt_prev => "Jump to previous prompt",
         .prompt_next => "Jump to next prompt",
         .pane_next => "Next pane",

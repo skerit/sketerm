@@ -87,6 +87,9 @@ pub const Terminal = struct {
     on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void = null,
     on_notification: ?*const fn (ctx: ?*anyopaque, ev: Screen.NotificationEvent) void = null,
     on_pointer_shape: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
+    /// OSC 1337 ; SetProfile=<name> — app asks the GUI to restyle this
+    /// pane with a configured profile.
+    on_set_profile: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
     on_progress: ?*const fn (ctx: ?*anyopaque, state: u8, percent: u8) void = null,
     /// Fired when the mux daemon confirmed a session rename. The new
     /// name is already committed to `remote.session`.
@@ -247,6 +250,7 @@ pub const Terminal = struct {
             .on_notification = sinkNotification,
             .on_progress = sinkProgress,
             .on_pointer_shape = sinkPointerShape,
+            .on_set_profile = sinkSetProfile,
         };
     }
 
@@ -670,6 +674,7 @@ pub const Terminal = struct {
             .on_notification = sinkNotification,
             .on_progress = sinkProgress,
             .on_pointer_shape = sinkPointerShape,
+            .on_set_profile = sinkSetProfile,
         };
 
         self.worker_thread = try std.Thread.spawn(.{}, workerMain, .{self});
@@ -771,6 +776,11 @@ pub const Terminal = struct {
         if (self.on_pointer_shape) |f| f(self.user_ctx, name);
     }
 
+    fn sinkSetProfile(ctx: ?*anyopaque, name: []const u8) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_set_profile) |f| f(self.user_ctx, name);
+    }
+
     /// Null out every external sink + the user_ctx pointer, so nothing
     /// dispatched after this call can reach into a freed Pane / Window.
     /// Used by Window.deinit to fence the terminals before tearing
@@ -788,6 +798,7 @@ pub const Terminal = struct {
         self.on_notification = null;
         self.on_progress = null;
         self.on_pointer_shape = null;
+        self.on_set_profile = null;
         self.on_session_renamed = null;
     }
 

@@ -112,10 +112,17 @@ pub const Pane = struct {
     /// Forward OSC 7 cwd updates so Window can rewrite the tab tooltip.
     win_cwd_ctx: ?*anyopaque = null,
     win_on_cwd: ?*const fn (ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void = null,
+    /// Forward OSC 1337 ; SetProfile so Window can restyle this pane.
+    win_setprofile_ctx: ?*anyopaque = null,
+    win_on_set_profile: ?*const fn (ctx: ?*anyopaque, pane: *Pane, name: []const u8) void = null,
     /// Forward BEL events for tab-bar attention.
     win_bell_ctx: ?*anyopaque = null,
     win_child_ctx: ?*anyopaque = null,
     win_on_bell: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
+    /// Fired when this pane gains keyboard focus, so the Window can
+    /// record it as its tab's last-focused pane (restored on tab switch).
+    win_focus_ctx: ?*anyopaque = null,
+    win_on_focus_enter: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
     /// Fired exactly once when the PTY child exits. Window decides
     /// what to do (close pane / restart shell / hold).
     win_on_child_exit: ?*const fn (ctx: ?*anyopaque, pane: *Pane, status: i32) void = null,
@@ -352,6 +359,7 @@ pub const Pane = struct {
         terminal.on_progress = onProgressEvent;
         terminal.on_bell = onBellEvent;
         terminal.on_pointer_shape = onPointerShapeEvent;
+        terminal.on_set_profile = onSetProfileEvent;
         terminal.on_session_renamed = onSessionRenamedEvent;
 
         _ = c.g_signal_connect_data(
@@ -1245,6 +1253,10 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     const cells_changed = self.cell_pass.cells_rebuilt;
     const rebuilt_rows = self.cell_pass.rebuilt_rows.items;
 
+    // Resolve each anchored image to its live display row (so images
+    // scroll with content and into scrollback) and reap any whose
+    // anchor line has fallen out of the scrollback ring.
+    resolveImageRows(self);
     // Z-ordering: images with z_index < 0 render BEHIND text/cells,
     // images with z_index >= 0 render in front (kitty default).
     // Sandwich the cell + overlay passes between two image passes.
@@ -1295,6 +1307,33 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     return @intFromBool(true);
 }
 
+/// Recompute each anchored image's live display row from the Screen
+/// before drawing. Pinned images (anchor_id == 0) keep their cell_row;
+/// images whose anchor line scrolled out of the ring are marked for
+/// deletion so flushUploads frees them.
+fn resolveImageRows(self: *Pane) void {
+    const screen = self.terminal.screen;
+    for (self.image_store.images.items) |*img| {
+        if (img.deleting) continue;
+        if (img.anchor_id == 0) {
+            img.draw_row = img.cell_row;
+            img.on_screen = true;
+            continue;
+        }
+        switch (screen.imageRowForAnchor(img.anchor_id)) {
+            .visible => |r| {
+                img.draw_row = r;
+                img.on_screen = true;
+            },
+            .offscreen => img.on_screen = false,
+            .evicted => {
+                img.on_screen = false;
+                img.deleting = true;
+            },
+        }
+    }
+}
+
 fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
     const self = cast.userData(Pane, ctx);
     self.image_store.addFull(.{
@@ -1312,6 +1351,7 @@ fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
         .src_y = img.src_y,
         .src_w = img.src_w,
         .src_h = img.src_h,
+        .anchor_id = img.anchor_id,
     }) catch |err| {
         std.debug.print("sketerm: image_store.addFull failed (id={d}): {s}\n", .{ img.image_id, @errorName(err) });
     };
@@ -1449,6 +1489,11 @@ fn onNotificationEvent(ctx: ?*anyopaque, ev: Screen.NotificationEvent) void {
 fn onSessionRenamedEvent(ctx: ?*anyopaque, name: []const u8) void {
     const self = cast.userData(Pane, ctx);
     if (self.win_on_session_renamed) |f| f(self.win_session_rename_ctx, self, name);
+}
+
+fn onSetProfileEvent(ctx: ?*anyopaque, name: []const u8) void {
+    const self = cast.userData(Pane, ctx);
+    if (self.win_on_set_profile) |f| f(self.win_setprofile_ctx, self, name);
 }
 
 fn onBellEvent(ctx: ?*anyopaque) void {
@@ -1850,6 +1895,8 @@ fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     // Inactive-pane dimming: full brightness now.
     self.is_focused = true;
     self.applyDim();
+    // Record this pane as its tab's last-focused, for tab-switch restore.
+    if (self.win_on_focus_enter) |f| f(self.win_focus_ctx, self);
     // Tick may have self-removed while idle. Cursor blink starts now.
     self.ensureTickRunning();
 }

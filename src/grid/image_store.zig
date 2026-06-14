@@ -10,9 +10,20 @@ const c = @import("../c.zig").c;
 pub const Image = struct {
     width: u32,
     height: u32,
-    /// Top-left cell of the placement.
+    /// Top-left cell of the placement. `cell_row` is the row at
+    /// placement time; the live draw row is `draw_row`, recomputed each
+    /// frame from `anchor_id` so the image scrolls with its content.
     cell_row: u16,
     cell_col: u16,
+    /// Stable line id of the placement's top row (0 = pinned: draw_row
+    /// stays at cell_row). Resolved against the Screen every frame.
+    anchor_id: u64 = 0,
+    /// Live display row, set by `Pane.resolveImageRows` before drawing.
+    /// Signed so an image straddling the top edge draws at a negative y.
+    draw_row: i32 = 0,
+    /// False when the anchor line is currently off-viewport — skip the
+    /// draw but keep the image (it may scroll back into view).
+    on_screen: bool = true,
     /// 0 until uploaded; cleared on forgetGL after context loss.
     gl_tex: c_uint = 0,
     /// Owned source RGBA. Retained AFTER upload too so that GL
@@ -138,6 +149,8 @@ pub const Store = struct {
         src_y: u32 = 0,
         src_w: u32 = 0,
         src_h: u32 = 0,
+        /// Stable line id of the placement's top row (0 = pin to `row`).
+        anchor_id: u64 = 0,
     };
 
     pub fn addFull(self: *Store, o: AddOpts) !void {
@@ -160,6 +173,8 @@ pub const Store = struct {
             .height = o.height,
             .cell_row = o.row,
             .cell_col = o.col,
+            .anchor_id = o.anchor_id,
+            .draw_row = o.row,
             .pending = copy,
             .image_id = o.image_id,
             .placement_id = o.placement_id,

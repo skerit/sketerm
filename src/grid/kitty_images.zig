@@ -7,11 +7,13 @@
 //! - Action `a=T` (transmit + place at cursor)
 //! - Action `a=p` (place by image_id)
 //! - Transmission medium `t=d` (direct base64) and `t=t`/`t=f` (file path)
+//! - `o=z` zlib decompression (in `finalize`)
+//! - Animation frames (`a=f`, `a=a`) — see `appendFrame` /
+//!   `advanceAnimations` / `applyAnimateControl`
 //!
-//! Not yet:
-//! - `o=z` zlib decompression
-//! - Animation frames (`a=f`)
-//! - Unicode placeholders
+//! Unicode placeholders (`U=1` + U+10EEEE cells) are handled in
+//! `screen.zig` (`virtual_placements` + `flushPlaceholder`), which
+//! tiles stored images from this manager.
 
 const std = @import("std");
 const c = @import("../c.zig").c;

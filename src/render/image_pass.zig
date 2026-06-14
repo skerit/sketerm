@@ -154,8 +154,11 @@ pub const ImagePass = struct {
                 if (self.debug) std.debug.print("[image] skip id={d}: tex=0\n", .{img.image_id});
                 continue;
             }
+            // Anchored images that scrolled out of the viewport are kept
+            // but not drawn (they may scroll back in).
+            if (!img.on_screen) continue;
             const x: f32 = self.pad + @as(f32, @floatFromInt(img.cell_col)) * store.cell_w;
-            const y: f32 = self.pad + @as(f32, @floatFromInt(img.cell_row)) * store.cell_h;
+            const y: f32 = self.pad + @as(f32, @floatFromInt(img.draw_row)) * store.cell_h;
 
             // Destination size:
             //   - cells_wide/cells_high > 0 → scale to that many cells

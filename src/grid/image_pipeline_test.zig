@@ -385,3 +385,95 @@ test "iterm2 OSC 1337 PNG fires sink" {
     try std.testing.expectEqual(@as(u32, 1), h.capture.width);
     try std.testing.expectEqual(@as(u32, 1), h.capture.height);
 }
+
+// Append a codepoint's UTF-8 to an ArrayList — placeholder + diacritic
+// helper for the Unicode-placeholder tests.
+fn appendCp(list: *std.ArrayList(u8), a: std.mem.Allocator, cp: u21) !void {
+    var buf: [4]u8 = undefined;
+    const n = try std.unicode.utf8Encode(cp, &buf);
+    try list.appendSlice(a, buf[0..n]);
+}
+
+// Kitty Unicode placeholder: a U=1 virtual placement registers without
+// drawing; U+10EEEE cells then tile the image. Cell (0,0) with two
+// "row 0 / col 0" diacritics shows the top-left tile.
+test "kitty unicode placeholder tiles the image" {
+    const a = std.testing.allocator;
+    var h = try Harness.init(a, 80, 24);
+    defer h.deinit();
+
+    // 2×2 RGBA: (0,0)=red (1,0)=green (0,1)=blue (1,1)=white.
+    const rgba = [_]u8{
+        0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+        0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    var b64_buf: [32]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &rgba);
+
+    // Transmit + virtual placement: i=5, U=1, 2×2 cell grid (c=2,r=2).
+    var tx_buf: [128]u8 = undefined;
+    const tx = try std.fmt.bufPrint(&tx_buf, "\x1b_Gi=5,a=T,U=1,f=32,s=2,v=2,c=2,r=2;{s}\x1b\\", .{b64});
+    h.feed(tx);
+    // Virtual placement does NOT draw at the cursor.
+    try std.testing.expect(!h.capture.fired);
+    try std.testing.expect(h.screen.kitty_images.get(5) != null);
+
+    // fg = palette 5 (the image id), then U+10EEEE + row(0) + col(0)
+    // diacritics (0x0305 = index 0), then a newline to finalize.
+    var seq = std.ArrayList(u8).empty;
+    defer seq.deinit(a);
+    try seq.appendSlice(a, "\x1b[38;5;5m");
+    try appendCp(&seq, a, 0x10EEEE);
+    try appendCp(&seq, a, 0x0305); // row 0
+    try appendCp(&seq, a, 0x0305); // col 0
+    try seq.append(a, '\n');
+    h.feed(seq.items);
+
+    try std.testing.expect(h.capture.fired);
+    // tile_w = 2/2 = 1, tile_h = 1 → single pixel.
+    try std.testing.expectEqual(@as(u32, 1), h.capture.width);
+    try std.testing.expectEqual(@as(u32, 1), h.capture.height);
+    try std.testing.expectEqual(@as(u32, 5), h.capture.image_id);
+    try std.testing.expectEqual(@as(u32, 1), h.capture.cells_wide);
+    // Top-left tile is the red pixel.
+    try std.testing.expectEqual(@as(u8, 0xFF), h.capture.rgba.?[0]);
+    try std.testing.expectEqual(@as(u8, 0x00), h.capture.rgba.?[1]);
+    try std.testing.expectEqual(@as(u8, 0x00), h.capture.rgba.?[2]);
+}
+
+// Column auto-increment: a second placeholder cell to the right with
+// only a row diacritic continues to the next image column.
+test "kitty unicode placeholder auto-increments the column" {
+    const a = std.testing.allocator;
+    var h = try Harness.init(a, 80, 24);
+    defer h.deinit();
+
+    const rgba = [_]u8{
+        0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+        0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    var b64_buf: [32]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &rgba);
+    var tx_buf: [128]u8 = undefined;
+    const tx = try std.fmt.bufPrint(&tx_buf, "\x1b_Gi=6,a=T,U=1,f=32,s=2,v=2,c=2,r=2;{s}\x1b\\", .{b64});
+    h.feed(tx);
+
+    // Two placeholder cells: first row 0 col 0 (explicit), second only a
+    // row(0) diacritic → column auto-increments to 1 (the green pixel).
+    var seq = std.ArrayList(u8).empty;
+    defer seq.deinit(a);
+    try seq.appendSlice(a, "\x1b[38;5;6m");
+    try appendCp(&seq, a, 0x10EEEE);
+    try appendCp(&seq, a, 0x0305); // row 0
+    try appendCp(&seq, a, 0x0305); // col 0
+    try appendCp(&seq, a, 0x10EEEE);
+    try appendCp(&seq, a, 0x0305); // row 0 only → col auto = 1
+    try seq.append(a, '\n');
+    h.feed(seq.items);
+
+    // The last tile emitted is image column 1 = the green pixel.
+    try std.testing.expect(h.capture.fired);
+    try std.testing.expectEqual(@as(u8, 0x00), h.capture.rgba.?[0]);
+    try std.testing.expectEqual(@as(u8, 0xFF), h.capture.rgba.?[1]);
+    try std.testing.expectEqual(@as(u8, 0x00), h.capture.rgba.?[2]);
+}

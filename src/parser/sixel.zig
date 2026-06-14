@@ -7,15 +7,19 @@
 //! Subset implemented (covers what chafa, img2sixel, yazi emit):
 //!   - `" Pan;Pad;Ph;Pv` raster attributes (parsed; Ph/Pv used as
 //!     hints for buffer sizing if present)
-//!   - `# Pc ; Pu ; Px ; Py ; Pz` color register definitions, RGB only (Pu=2)
+//!   - `# Pc ; Pu ; Px ; Py ; Pz` color register definitions —
+//!     RGB (Pu=2) and HLS (Pu=1, converted in `hlsToRgb`)
 //!   - `# Pc` color register selection
 //!   - `?`..`~` pixel chars (6 vertical pixels)
 //!   - `!N` RLE prefix
 //!   - `$` carriage return (back to col 0 of current 6-row band)
 //!   - `-` line feed (next 6-row band)
+//!   - transparency: unpainted pixels stay alpha 0 so the cell
+//!     background shows through (the image pass blends them out)
 //!
-//! Not implemented: HLS color (Pu=1), private modes (P1-P3),
-//! transparency, half-blocks.
+//! Not implemented: the DCS P1-P3 private params (aspect ratio /
+//! background-select / grid) — they ride on the DCS header, not this
+//! body, and every real emitter leaves unpainted pixels transparent.
 
 const std = @import("std");
 
