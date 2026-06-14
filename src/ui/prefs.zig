@@ -401,6 +401,12 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSpinRowF32Step(@ptrCast(@alignCast(dim_group)), ctx, "Desaturate", "Fade unfocused panes toward gray. 0 = full colour, 1 = grayscale.", 0.0, 1.0, 0.05, 2, &ctx.cfg.inactive_desaturate, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(dim_group)));
 
+    // Tab activity.
+    const tabact_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(tabact_group)), "Tab activity");
+    addSwitchRow(@ptrCast(@alignCast(tabact_group)), ctx, "Activity glow", "Animate a rainbow glow on a background tab while its content changes.", &ctx.cfg.track_tab_activity, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(tabact_group)));
+
     // Text legibility.
     const contrast_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(contrast_group)), "Legibility");
