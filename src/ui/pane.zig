@@ -2,10 +2,8 @@
 //!
 //! On `realize`, GL resources are constructed.
 //! On `render`, the screen state is rebuilt into the vertex buffer
-//! and drawn.
-//!
-//! For M3, this is the bare-minimum bridge: one Pane, no splits,
-//! no input handling. M4 wires keyboard/mouse.
+//! and drawn. Handles its own keyboard/mouse/scroll/drag input and
+//! participates in the tab's split-pane tree.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
