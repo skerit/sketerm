@@ -180,6 +180,13 @@ pub const AppHost = struct {
                 c.gtk_widget_set_cursor_from_name(self.picture, name)
             else
                 c.gtk_widget_set_cursor(self.picture, null);
+            // Go opaque as soon as the pointer enters a resize-edge band,
+            // BEFORE any begin_resize grab starts — toggling opacity
+            // *during* a macOS interactive resize disrupts its event
+            // session (the mouse-up gets lost, leaving the resize stuck).
+            // While hovering an edge the revert keeps deferring (see
+            // opaqueRevertCb), so it stays stable through the whole drag.
+            if (builtin.os.tag == .macos and edge != 0) self.armOpaqueResize();
         }
 
         /// Widget → surface coordinates. The picture shows the displayed
@@ -241,6 +248,13 @@ pub const AppHost = struct {
     fn opaqueRevertCb(user: ?*anyopaque) callconv(.c) c.gboolean {
         const win = cast.userData(Win, user);
         win.opaque_settle_id = 0;
+        // Still on a resize edge (a drag may be mid-flight, or about to
+        // start) — keep opaque and check again later, so opacity never
+        // flips during the macOS resize session.
+        if (win.hover_edge != 0) {
+            win.opaque_settle_id = c.g_timeout_add(400, @ptrCast(&opaqueRevertCb), win);
+            return 0;
+        }
         c.gtk_widget_remove_css_class(@ptrCast(win.window), "opaque-resize");
         return 0;
     }
