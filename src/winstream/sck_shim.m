@@ -283,10 +283,21 @@ static void apply_content(SketermSckCtx *c, SCShareableContent *content) {
         if (!cached) pid_cache[@(wpid)] = @(mine);
         if (!mine) continue;
 
+        NSString *title = scw.title ?: @"";
+        // Suppress transient launch/snapshot placeholder windows. During
+        // startup AppKit briefly maps a tiny generic window (observed on
+        // Calculator: 66x20, title "Window") that flashes over the real
+        // one and is then destroyed. Real content windows are larger or
+        // carry a meaningful title; drop windows that are both small and
+        // untitled / generically titled. The 16x16 floor above stays as
+        // a hard minimum for everything else.
+        bool generic_title = title.length == 0 || [title isEqualToString:@"Window"];
+        if (generic_title &&
+            (scw.frame.size.width < 120 || scw.frame.size.height < 60)) continue;
+
         NSNumber *key = @(scw.windowID);
         [seen addObject:key];
         SketermSckWin *sw = c->wins[key];
-        NSString *title = scw.title ?: @"";
         if (!sw) {
             sw = [SketermSckWin new];
             sw->win_id = scw.windowID;
