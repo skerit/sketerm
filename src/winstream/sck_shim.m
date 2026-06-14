@@ -63,6 +63,15 @@ typedef struct {
     uint8_t *snap;
     size_t snap_cap;
     BOOL closing;
+    // Draggable (title-bar) regions, measured by the AX hit-test in
+    // recompute_drags. Wire-ready int16 blob: [ref_w, ref_h, then
+    // drag_n × {x,y,w,h}] in window points. drain copies it out.
+    int16_t *drag_blob;
+    size_t drag_blob_cap;
+    int drag_n;
+    BOOL drag_dirty;  // re-send to the client on the next drain
+    BOOL drag_needs;  // (re)measure pending (window opened / resized)
+    int drag_tries;   // give up re-measuring an empty result after a few
 }
 @end
 
@@ -70,6 +79,7 @@ typedef struct {
 - (void)dealloc {
     free(latest);
     free(snap);
+    free(drag_blob);
 }
 @end
 
@@ -304,6 +314,7 @@ static void apply_content(SketermSckCtx *c, SCShareableContent *content) {
             sw->pid = wpid;
             sw->rect = scw.frame;
             sw->title = title;
+            sw->drag_needs = YES;
             c->wins[key] = sw;
             [c->pending addObject:@{
                 @"kind" : @0,
@@ -323,8 +334,14 @@ static void apply_content(SketermSckCtx *c, SCShareableContent *content) {
             }
             if (resized && sw->stream) {
                 [sw->stream updateConfiguration:stream_config(scw) completionHandler:^(NSError *e){ (void)e; }];
+                sw->drag_needs = YES;   // title-strip width changed
+                sw->drag_tries = 0;
             }
         }
+        // The AX tree is often empty for the first frames after launch;
+        // keep retrying a window that produced no draggable region until
+        // it does (bounded — some windows genuinely have none).
+        if (sw->drag_n == 0 && sw->drag_tries < 10) sw->drag_needs = YES;
     }
 
     // Anything tracked but gone from the on-screen list closed (or
@@ -337,6 +354,167 @@ static void apply_content(SketermSckCtx *c, SCShareableContent *content) {
         [sw->stream stopCaptureWithCompletionHandler:^(NSError *e){ (void)e; }];
         [c->pending addObject:@{ @"kind" : @3, @"win" : key }];
     }
+}
+
+// ── draggable-region measurement (Accessibility) ────────────────
+//
+// macOS apps speak Mach IPC to WindowServer, so dragging the streamed
+// title bar on the client would move the window ON THE MAC. Instead the
+// client moves its OWN window when a press lands on the title bar. We
+// can't ask "is this point title-bar?" synchronously per click without
+// a round-trip, so the daemon measures the draggable regions ahead of
+// time (on open/resize) and pushes them (proto win_drag); the client
+// hit-tests locally with zero latency.
+//
+// Method: grid-scan the top strip via AXUIElementCopyElementAtPosition
+// and classify each cell by AX role — non-interactive containers
+// (AXGroup/AXWindow/AXSplitGroup/AXLayoutArea/AXUnknown) are draggable
+// chrome (title bar, empty tab-strip/toolbar), everything else (buttons,
+// tabs, fields) is interactive. Contiguous draggable cells per row
+// become rects. Capping the scan to the top strip keeps the content
+// body (which also reports AXGroup) out of the drag region.
+//
+// Coarse-AX guard: apps that draw non-native chrome (Firefox, Electron)
+// expose NO leaf elements to a by-position query — the whole strip,
+// tabs and buttons included, reports as one draggable group. Marking
+// that as draggable would eat tab/button clicks (a press starts a
+// window move). So if the scan finds ZERO interactive cells, the tree
+// is untrustworthy and we suppress the region entirely (fall back to
+// forwarding — the WM shortcut still moves the window). Native apps and
+// Chromium, which expose their controls, are unaffected.
+//
+// Runs OFF c->mu (AX calls cross-process and can be slow) using a
+// snapshot of the window's frame; results are stored back under the
+// lock. Points are window-local, top-left origin — the same space the
+// client sends input in, so no coordinate translation on either end.
+
+static bool ax_role_draggable(CFStringRef role) {
+    return role && (CFEqual(role, CFSTR("AXGroup")) || CFEqual(role, CFSTR("AXWindow")) ||
+                    CFEqual(role, CFSTR("AXSplitGroup")) || CFEqual(role, CFSTR("AXLayoutArea")) ||
+                    CFEqual(role, CFSTR("AXUnknown")));
+}
+
+// Fill out[0]=ref_w, out[1]=ref_h, then up to cap rects of {x,y,w,h}.
+// Returns the rect count.
+static int compute_drag_rects(pid_t pid, CGRect frame, int16_t *out, int cap) {
+    int fw = (int)frame.size.width, fh = (int)frame.size.height;
+    out[0] = (int16_t)fw;
+    out[1] = (int16_t)fh;
+    if (!AXIsProcessTrusted() || fw < 8 || fh < 8) return 0;
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    if (!app) return 0;
+
+    const int dy = 8, dx = 10;
+    // Title strips run ~28pt (plain) to ~48pt (tab strips); 64 covers
+    // both while staying above the content body. Never more than the
+    // top third of a short window.
+    int strip = 64;
+    if (strip > fh / 2) strip = fh / 2;
+    if (strip < 16) strip = 16;
+
+    int n = 0;
+    int interactive = 0;
+    for (int ry = 2; ry < strip && n < cap; ry += dy) {
+        int run_start = -1;
+        int rx = 2;
+        for (;; rx += dx) {
+            bool past = rx >= fw;
+            bool drag = false;
+            if (!past) {
+                AXUIElementRef el = NULL;
+                if (AXUIElementCopyElementAtPosition(app, frame.origin.x + rx, frame.origin.y + ry, &el) == kAXErrorSuccess && el) {
+                    CFStringRef role = NULL;
+                    AXUIElementCopyAttributeValue(el, kAXRoleAttribute, (CFTypeRef *)&role);
+                    drag = ax_role_draggable(role);
+                    if (role) CFRelease(role);
+                    CFRelease(el);
+                }
+                if (!drag) interactive++;
+            }
+            if (drag && run_start < 0) run_start = rx;
+            if ((!drag || past) && run_start >= 0) {
+                int x0 = run_start - dx / 2;
+                if (x0 < 0) x0 = 0;
+                int x1 = (rx - dx) + dx / 2; // centre of the last draggable cell + half step
+                int w = x1 - x0;
+                if (w < 1) w = 1;
+                int y0 = ry - dy / 2 - 1;
+                if (y0 < 0) y0 = 0;
+                int16_t *r = &out[2 + n * 4];
+                r[0] = (int16_t)x0;
+                r[1] = (int16_t)y0;
+                r[2] = (int16_t)w;
+                r[3] = (int16_t)(dy + 2);
+                n++;
+                run_start = -1;
+                if (n >= cap) break;
+            }
+            if (past) break;
+        }
+    }
+    CFRelease(app);
+    // No interactive cell anywhere in the strip → coarse/custom AX tree
+    // (Firefox, Electron). Don't trust it; suppress the drag region.
+    if (interactive == 0) return 0;
+    return n;
+}
+
+// Measure every window flagged drag_needs and store the result. Called
+// from the refresh completion AFTER apply_content unlocks, so the AX
+// scan never blocks input injection or the drain.
+static void recompute_drags(SketermSckCtx *c) {
+    if (!AXIsProcessTrusted()) return;
+    NSMutableArray<NSDictionary *> *todo = [NSMutableArray array];
+    pthread_mutex_lock(&c->mu);
+    for (NSNumber *key in c->wins.allKeys) {
+        SketermSckWin *sw = c->wins[key];
+        if (!sw->drag_needs || sw->closing) continue;
+        sw->drag_needs = NO;
+        [todo addObject:@{
+            @"win" : key, @"pid" : @(sw->pid),
+            @"x" : @(sw->rect.origin.x), @"y" : @(sw->rect.origin.y),
+            @"w" : @(sw->rect.size.width), @"h" : @(sw->rect.size.height),
+        }];
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (todo.count == 0) return;
+
+    const int cap = 64; // matches proto.max_drag_rects
+    int16_t *buf = malloc((2 + cap * 4) * sizeof(int16_t));
+    if (!buf) return;
+    bool any = false;
+    for (NSDictionary *t in todo) {
+        CGRect fr = CGRectMake([t[@"x"] doubleValue], [t[@"y"] doubleValue],
+                               [t[@"w"] doubleValue], [t[@"h"] doubleValue]);
+        int n = compute_drag_rects((pid_t)[t[@"pid"] intValue], fr, buf, cap);
+        size_t bytes = (size_t)(2 + n * 4) * sizeof(int16_t);
+        if (getenv("SKETERM_DRAG_DEBUG")) {
+            fprintf(stderr, "winstream drag: win %u -> %d rects (ref %dx%d)\n",
+                    [t[@"win"] unsignedIntValue], n, buf[0], buf[1]);
+            for (int i = 0; i < n; i++)
+                fprintf(stderr, "    rect[%d] x=%d y=%d w=%d h=%d\n", i,
+                        buf[2 + i * 4], buf[2 + i * 4 + 1], buf[2 + i * 4 + 2], buf[2 + i * 4 + 3]);
+        }
+        pthread_mutex_lock(&c->mu);
+        SketermSckWin *sw = c->wins[t[@"win"]];
+        if (sw && !sw->closing) {
+            sw->drag_tries++;
+            if (sw->drag_blob_cap < bytes) {
+                free(sw->drag_blob);
+                sw->drag_blob = malloc(bytes);
+                sw->drag_blob_cap = sw->drag_blob ? bytes : 0;
+            }
+            if (sw->drag_blob) {
+                memcpy(sw->drag_blob, buf, bytes);
+                sw->drag_n = n;
+                sw->drag_dirty = YES;
+                any = true;
+            }
+        }
+        pthread_mutex_unlock(&c->mu);
+    }
+    free(buf);
+    if (any) wake(c);
 }
 
 static void kick_refresh(SketermSckCtx *c, uint64_t now) {
@@ -357,13 +535,18 @@ static void kick_refresh(SketermSckCtx *c, uint64_t now) {
             pthread_mutex_unlock(&c->mu);
             return;
         }
+        BOOL ok = NO;
         if (error) {
             set_err(c, [NSString stringWithFormat:@"shareable-content fetch failed: %@ — is Screen Recording granted and a GUI session logged in?", error.localizedDescription]);
         } else {
             c->fetch_ok = YES;
             apply_content(c, content);
+            ok = YES;
         }
         pthread_mutex_unlock(&c->mu);
+        // Measure draggable regions for newly opened/resized windows —
+        // off the lock (AX is cross-process and slow).
+        if (ok) recompute_drags(c);
         wake(c);
     }];
 }
@@ -453,6 +636,7 @@ void sketerm_sck_reannounce(SckCtx *ctx) {
             @"title" : sw->title.length ? sw->title : @"remote app",
         }];
         sw->dirty = sw->latest != NULL; // resend the current frame too
+        if (sw->drag_blob) sw->drag_dirty = YES; // and the drag regions
     }
     pthread_mutex_unlock(&c->mu);
     wake(c);
@@ -510,7 +694,7 @@ const SckEvent *sketerm_sck_drain(SckCtx *ctx, size_t *out_n) {
     kick_refresh(c, now_ms());
 
     [c->drain_hold removeAllObjects];
-    size_t cap_needed = c->pending.count + c->wins.count;
+    size_t cap_needed = c->pending.count + c->wins.count * 2; // frame + drag
     if (c->ev_cap < cap_needed) {
         free(c->ev_scratch);
         c->ev_scratch = malloc(cap_needed * sizeof(SckEvent));
@@ -552,6 +736,23 @@ const SckEvent *sketerm_sck_drain(SckCtx *ctx, size_t *out_n) {
             e->h = sw->fh;
             e->data = sw->snap;
             e->len = need;
+        }
+        // Draggable regions for windows whose measurement changed. The
+        // blob (ref dims + rects) rides drain_hold like titles do, so it
+        // stays valid until the next drain.
+        for (SketermSckWin *sw in c->wins.allValues) {
+            if (!sw->drag_dirty || sw->closing || !sw->drag_blob || n >= c->ev_cap) continue;
+            sw->drag_dirty = NO;
+            size_t bytes = (size_t)(2 + sw->drag_n * 4) * sizeof(int16_t);
+            NSData *d = [NSData dataWithBytes:sw->drag_blob length:bytes];
+            [c->drain_hold addObject:d];
+            SckEvent *e = &c->ev_scratch[n++];
+            memset(e, 0, sizeof(*e));
+            e->kind = 4;
+            e->win = sw->win_id;
+            e->w = sw->drag_n;
+            e->data = d.bytes;
+            e->len = d.length;
         }
     }
     [c->pending removeAllObjects];

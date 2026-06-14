@@ -37,6 +37,36 @@ pub const WsHost = struct {
         /// none). See armOpaqueResize.
         opaque_settle_id: c_uint = 0,
 
+        /// Draggable (title-bar) rects measured by the remote daemon's
+        /// Accessibility hit-test (proto win_drag), in the window's point
+        /// space (ref_w/ref_h). A primary press inside one moves THIS
+        /// window locally instead of forwarding the click — a forwarded
+        /// title-bar drag moves the window on the Mac, not here.
+        drag_rects: []proto.DragRect = &.{},
+        drag_ref_w: i16 = 0,
+        drag_ref_h: i16 = 0,
+        /// False between a title-bar press (which began a local move) and
+        /// its release, so the release isn't forwarded either. Mirrors
+        /// wlapp.zig's fwd_press for the host-resize band.
+        fwd_press: bool = true,
+
+        /// Is (x,y) — picture-local — inside a draggable region? Rects are
+        /// in point space; scale to the current frame size so the test
+        /// matches the press coordinates.
+        fn inDragRegion(win: *Win, x: f64, y: f64) bool {
+            if (win.drag_rects.len == 0 or win.drag_ref_w <= 0 or win.drag_ref_h <= 0) return false;
+            const sx = @as(f64, @floatFromInt(win.w)) / @as(f64, @floatFromInt(win.drag_ref_w));
+            const sy = @as(f64, @floatFromInt(win.h)) / @as(f64, @floatFromInt(win.drag_ref_h));
+            for (win.drag_rects) |r| {
+                const bx = @as(f64, @floatFromInt(r.x)) * sx;
+                const by = @as(f64, @floatFromInt(r.y)) * sy;
+                const bw = @as(f64, @floatFromInt(r.w)) * sx;
+                const bh = @as(f64, @floatFromInt(r.h)) * sy;
+                if (x >= bx and x < bx + bw and y >= by and y < by + bh) return true;
+            }
+            return false;
+        }
+
         /// macOS: a non-opaque NSWindow only composites the region its
         /// backing was last painted into, so a growing window leaves the
         /// new area transparent until the app repaints it. Make the
@@ -80,6 +110,7 @@ pub const WsHost = struct {
         var it = self.windows.valueIterator();
         while (it.next()) |w| {
             w.*.cancelOpaqueResize();
+            self.allocator.free(w.*.drag_rects);
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-winapp", null);
             c.gtk_window_destroy(w.*.window);
             self.allocator.destroy(w.*);
@@ -139,9 +170,23 @@ pub const WsHost = struct {
                 const win = self.windows.get(id) orelse return;
                 _ = self.windows.remove(id);
                 win.cancelOpaqueResize();
+                self.allocator.free(win.drag_rects);
                 _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-winapp", null);
                 c.gtk_window_destroy(win.window);
                 self.allocator.destroy(win);
+            },
+            .win_drag => {
+                const wd = proto.decodeWinDrag(u.payload) orelse return error.Protocol;
+                const win = self.windows.get(wd.win) orelse return;
+                self.allocator.free(win.drag_rects);
+                win.drag_rects = &.{};
+                if (wd.n > 0) {
+                    const buf = self.allocator.alloc(proto.DragRect, wd.n) catch return;
+                    for (0..wd.n) |i| buf[i] = proto.dragRectAt(wd.body, i);
+                    win.drag_rects = buf;
+                }
+                win.drag_ref_w = wd.ref_w;
+                win.drag_ref_h = wd.ref_h;
             },
             else => {},
         }
@@ -234,13 +279,25 @@ pub const WsHost = struct {
     }
 
     fn onPress(g: ?*c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(g));
-        cast.userData(Win, user).sendPtr(1, x, y, btn);
+        // A primary press on a title-bar region drags THIS window via the
+        // window manager — don't forward it, or the Mac moves its own
+        // window and ours stays put.
+        if (btn == 1 and win.inDragRegion(x, y)) {
+            win.fwd_press = false;
+            rw.beginMove(win.window, btn, x, y);
+            return;
+        }
+        win.fwd_press = true;
+        win.sendPtr(1, x, y, btn);
     }
 
     fn onRelease(g: ?*c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
+        if (!win.fwd_press) return; // press began a local move, not app input
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(g));
-        cast.userData(Win, user).sendPtr(2, x, y, btn);
+        win.sendPtr(2, x, y, btn);
     }
 
     fn onScroll(ctl: ?*c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {

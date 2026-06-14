@@ -26,6 +26,14 @@ pub const Tag = enum(u8) {
     win_title = 4,
     /// u32 win.
     win_close = 5,
+    /// u32 win, i16 ref_w, i16 ref_h, u16 n, then n × (i16 x,y,w,h):
+    /// draggable (title-bar) rects in the window's point space. The
+    /// client moves the host window locally for a press inside one
+    /// instead of forwarding the click (a forwarded title-bar drag
+    /// moves the window on the Mac, not on the client). ref_w/ref_h
+    /// are the window dims the rects were measured against — the
+    /// client scales them to its current frame size.
+    win_drag = 6,
     // client → agent
     /// u32 win, u32 evdev key, u8 pressed, u32 mods (X11 order).
     input_key = 16,
@@ -189,6 +197,67 @@ pub fn decodeFrameAny(
     }
 }
 
+// ── draggable-region payload (agent → client) ───────────────────
+
+/// Plenty for a title strip's draggable runs; the daemon caps here too.
+pub const max_drag_rects = 64;
+
+/// A draggable rectangle in the window's point space (top-left origin).
+pub const DragRect = extern struct { x: i16, y: i16, w: i16, h: i16 };
+
+pub fn appendWinDrag(
+    out: *std.ArrayList(u8),
+    a: std.mem.Allocator,
+    win: u32,
+    ref_w: i16,
+    ref_h: i16,
+    rects: []const DragRect,
+) !void {
+    const n: u16 = @intCast(@min(rects.len, max_drag_rects));
+    const body_len = 10 + @as(usize, n) * 8;
+    var hdr: [header_size + 10]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(body_len + 1), .little);
+    hdr[4] = @intFromEnum(Tag.win_drag);
+    std.mem.writeInt(u32, hdr[5..9], win, .little);
+    std.mem.writeInt(i16, hdr[9..11], ref_w, .little);
+    std.mem.writeInt(i16, hdr[11..13], ref_h, .little);
+    std.mem.writeInt(u16, hdr[13..15], n, .little);
+    try out.appendSlice(a, &hdr);
+    for (rects[0..n]) |r| {
+        var rb: [8]u8 = undefined;
+        std.mem.writeInt(i16, rb[0..2], r.x, .little);
+        std.mem.writeInt(i16, rb[2..4], r.y, .little);
+        std.mem.writeInt(i16, rb[4..6], r.w, .little);
+        std.mem.writeInt(i16, rb[6..8], r.h, .little);
+        try out.appendSlice(a, &rb);
+    }
+}
+
+pub const WinDrag = struct { win: u32, ref_w: i16, ref_h: i16, n: u16, body: []const u8 };
+
+pub fn decodeWinDrag(p: []const u8) ?WinDrag {
+    if (p.len < 10) return null;
+    const n = std.mem.readInt(u16, p[8..10], .little);
+    if (p.len < 10 + @as(usize, n) * 8) return null;
+    return .{
+        .win = std.mem.readInt(u32, p[0..4], .little),
+        .ref_w = std.mem.readInt(i16, p[4..6], .little),
+        .ref_h = std.mem.readInt(i16, p[6..8], .little),
+        .n = n,
+        .body = p[10 .. 10 + @as(usize, n) * 8],
+    };
+}
+
+pub fn dragRectAt(body: []const u8, i: usize) DragRect {
+    const o = i * 8;
+    return .{
+        .x = std.mem.readInt(i16, body[o..][0..2], .little),
+        .y = std.mem.readInt(i16, body[o + 2 ..][0..2], .little),
+        .w = std.mem.readInt(i16, body[o + 4 ..][0..2], .little),
+        .h = std.mem.readInt(i16, body[o + 6 ..][0..2], .little),
+    };
+}
+
 pub const InputKey = struct { win: u32, key: u32, pressed: bool, mods: u32 };
 
 pub fn appendInputKey(out: *std.ArrayList(u8), a: std.mem.Allocator, v: InputKey) !void {
@@ -279,6 +348,50 @@ test "winstream units round-trip" {
     var bad = u2_.unit.payload[0 .. u2_.unit.payload.len - 1];
     try t.expectEqual(@as(?Frame, null), decodeFrame(bad));
     _ = &bad;
+}
+
+test "win_drag round-trips rects + ref dims" {
+    const a = t.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+
+    const rects = [_]DragRect{
+        .{ .x = 0, .y = 0, .w = 200, .h = 28 },
+        .{ .x = 260, .y = 0, .w = 940, .h = 28 },
+        .{ .x = -4, .y = 28, .w = 60, .h = 12 },
+    };
+    try appendWinDrag(&out, a, 7, 1200, 1276, &rects);
+
+    const u = (try peelUnit(out.items)).?;
+    try t.expectEqual(Tag.win_drag, u.unit.tag);
+    const wd = decodeWinDrag(u.unit.payload).?;
+    try t.expectEqual(@as(u32, 7), wd.win);
+    try t.expectEqual(@as(i16, 1200), wd.ref_w);
+    try t.expectEqual(@as(i16, 1276), wd.ref_h);
+    try t.expectEqual(@as(u16, 3), wd.n);
+    for (rects, 0..) |want, i| {
+        const got = dragRectAt(wd.body, i);
+        try t.expectEqual(want.x, got.x);
+        try t.expectEqual(want.y, got.y);
+        try t.expectEqual(want.w, got.w);
+        try t.expectEqual(want.h, got.h);
+    }
+    try t.expectEqual(out.items.len, u.consumed);
+
+    // Empty list is valid (means "no draggable region").
+    out.clearRetainingCapacity();
+    try appendWinDrag(&out, a, 9, 800, 600, &.{});
+    const ue = (try peelUnit(out.items)).?;
+    const wde = decodeWinDrag(ue.unit.payload).?;
+    try t.expectEqual(@as(u16, 0), wde.n);
+    try t.expectEqual(@as(i16, 800), wde.ref_w);
+
+    // Over-cap input is truncated to max_drag_rects on append.
+    out.clearRetainingCapacity();
+    const many = [_]DragRect{.{ .x = 1, .y = 1, .w = 1, .h = 1 }} ** (max_drag_rects + 8);
+    try appendWinDrag(&out, a, 1, 10, 10, &many);
+    const um = (try peelUnit(out.items)).?;
+    try t.expectEqual(@as(u16, max_drag_rects), decodeWinDrag(um.unit.payload).?.n);
 }
 
 test "appendFrameMaybeZ ↔ decodeFrameAny round-trips both forms" {
