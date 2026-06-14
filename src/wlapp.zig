@@ -157,6 +157,10 @@ pub const AppHost = struct {
         /// The last press was forwarded to the app (not consumed as a
         /// host-window resize) — so its release is forwarded too.
         fwd_press: bool = false,
+        /// macOS only: debounce timer that reverts the window to
+        /// transparent after a resize settles (0 = inactive). See
+        /// armOpaqueResize.
+        opaque_settle_id: c_uint = 0,
 
         /// Host-window resize edge under (x, y) in picture coords, or 0
         /// for the interior. Disabled while maximized/fullscreen (the
@@ -212,7 +216,34 @@ pub const AppHost = struct {
                 @max(0, self.buf_h - geo[1] - geo[3]), // bottom
             };
         }
+
+        /// macOS: a non-opaque NSWindow only composites the region its
+        /// backing was last painted into, so a growing window clips the
+        /// new area. Make the window opaque for the duration of a resize
+        /// (the grown region then composites), reverting to transparent
+        /// ~400ms after it settles — the grown region stays painted, and
+        /// at rest the app's own transparency (rounded corners,
+        /// translucent terminals) is preserved. Idempotent per tick.
+        fn armOpaqueResize(self: *Win) void {
+            c.gtk_widget_add_css_class(@ptrCast(self.window), "opaque-resize");
+            if (self.opaque_settle_id != 0) _ = c.g_source_remove(self.opaque_settle_id);
+            self.opaque_settle_id = c.g_timeout_add(400, @ptrCast(&opaqueRevertCb), self);
+        }
+
+        fn cancelOpaqueResize(self: *Win) void {
+            if (self.opaque_settle_id != 0) {
+                _ = c.g_source_remove(self.opaque_settle_id);
+                self.opaque_settle_id = 0;
+            }
+        }
     };
+
+    fn opaqueRevertCb(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const win = cast.userData(Win, user);
+        win.opaque_settle_id = 0;
+        c.gtk_widget_remove_css_class(@ptrCast(win.window), "opaque-resize");
+        return 0;
+    }
 
     /// Stamp the compositor clock (frame-callback and input event
     /// timestamps) from the GLib monotonic clock.
@@ -272,6 +303,7 @@ pub const AppHost = struct {
         var it = self.windows.valueIterator();
         while (it.next()) |w| {
             // Break the close-request link before gtk teardown.
+            w.*.cancelOpaqueResize();
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-wlapp", null);
             c.gtk_window_destroy(w.*.window);
             self.allocator.destroy(w.*);
@@ -600,6 +632,7 @@ pub const AppHost = struct {
         const self = cast.userData(AppHost, ctx);
         const win = self.windows.get(surface) orelse return;
         _ = self.windows.remove(surface);
+        win.cancelOpaqueResize();
         _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-wlapp", null);
         c.gtk_window_destroy(win.window);
         self.allocator.destroy(win);
@@ -1034,6 +1067,10 @@ pub const AppHost = struct {
 
     fn onWinResize(_: ?*c.GtkWindow, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
+        // Before the maximize early-return so it also covers maximize:
+        // keep the window opaque while it grows (else macOS clips the
+        // new area), reverting after the resize settles.
+        if (builtin.os.tag == .macos) win.armOpaqueResize();
         var st = winStates(win);
         // Maximize/fullscreen sizing is driven from onComputeSize (the
         // allocation isn't settled here). This handler owns the normal

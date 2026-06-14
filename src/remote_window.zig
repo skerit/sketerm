@@ -81,7 +81,7 @@ pub fn ensureTransparentCss() void {
     const display = c.gdk_display_get_default() orelse return;
     const provider = c.gtk_css_provider_new();
     const css = if (builtin.os.tag == .macos)
-        "window.sketerm-remote-app { background: black; }"
+        "window.sketerm-remote-app { background: transparent; }\nwindow.sketerm-remote-app.opaque-resize { background: black; }"
     else
         "window.sketerm-remote-app { background: transparent; }";
     c.gtk_css_provider_load_from_string(provider, css);
