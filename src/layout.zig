@@ -62,6 +62,11 @@ pub const TabSpec = struct {
     /// field; restore treats those titles as renamed, matching the
     /// old behaviour where restored titles never followed OSC.
     title_locked: ?bool = null,
+    /// Per-tab "show activity glow" toggle. Defaults true (the new-tab
+    /// default) so older layout files restore with the glow on.
+    show_activity: bool = true,
+    /// Per-tab "warn when inactive" toggle. Defaults false.
+    warn_inactive: bool = false,
 };
 
 pub const Layout = struct {
@@ -280,6 +285,35 @@ test "round trip preserves TabSpec.pinned" {
     try std.testing.expectEqual(true, parsed.value.tabs[0].pinned);
     try std.testing.expectEqual(false, parsed.value.tabs[1].pinned);
     try std.testing.expectEqual(@as(?bool, false), parsed.value.tabs[0].title_locked);
+}
+
+test "round trip preserves per-tab effect toggles, defaults on old files" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
+    const file_path = try std.fmt.allocPrint(a, "{s}/fx.json", .{real_path});
+
+    const cmd = [_][]const u8{"bash"};
+    var tabs = [_]TabSpec{
+        // Non-default: glow off, warning on.
+        .{ .title = "watched", .tree = .{ .pane = .{ .cwd = "/", .command = &cmd } }, .show_activity = false, .warn_inactive = true },
+        // Defaults.
+        .{ .title = "plain", .tree = .{ .pane = .{ .cwd = "/", .command = &cmd } } },
+    };
+    try save(.{ .tabs = &tabs }, file_path);
+
+    const parsed = try load(a, file_path);
+    defer parsed.deinit();
+    try std.testing.expectEqual(false, parsed.value.tabs[0].show_activity);
+    try std.testing.expectEqual(true, parsed.value.tabs[0].warn_inactive);
+    // A tab saved with defaults — and any older file lacking the fields —
+    // restores with the glow on and the warning off.
+    try std.testing.expectEqual(true, parsed.value.tabs[1].show_activity);
+    try std.testing.expectEqual(false, parsed.value.tabs[1].warn_inactive);
 }
 
 test "load tolerates older JSON without profile / pinned fields" {

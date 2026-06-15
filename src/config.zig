@@ -178,6 +178,22 @@ pub const Config = struct {
     /// drain (so it works for unfocused tabs); off skips that work.
     track_tab_activity: bool = true,
 
+    /// Seconds of silence (no visible change in any pane) after the last
+    /// activity before a tab's per-tab inactivity warning fires. The toggle
+    /// itself is per-tab (right-click a tab); this is the shared threshold.
+    inactive_warn_secs: u32 = 60,
+    /// Seconds a tab must stay selected before viewing it acknowledges (and
+    /// clears) its inactivity warning. Guards against a quick scroll across
+    /// the tab bar wiping every warning. 0 = acknowledge immediately.
+    tab_ack_delay_secs: f32 = 1.0,
+
+    /// Per-pane cap on retained decoded-image memory (MiB). A program that
+    /// emits a stream of graphics (sixel/iTerm/kitty redraw loops) would
+    /// otherwise grow the image store without bound and the kernel OOM-kills
+    /// the whole session. Past the cap the oldest images are evicted FIFO.
+    /// 0 = unlimited (the old, unsafe behaviour).
+    image_memory_mb: u32 = 320,
+
     /// Name of a GTK theme to load (its `gtk-4.0/gtk.css` from
     /// `~/.themes`, `~/.local/share/themes`, or the system theme dirs),
     /// applied over libadwaita's stylesheet. Empty = honor the session's
@@ -661,6 +677,9 @@ pub const Config = struct {
         // Behavioural extras.
         if (self.scroll_on_output) try w.writeAll("scroll_on_output = true\n");
         if (!self.track_tab_activity) try w.writeAll("track_tab_activity = false\n");
+        if (self.inactive_warn_secs != 60) try w.print("inactive_warn_secs = {d}\n", .{self.inactive_warn_secs});
+        if (self.tab_ack_delay_secs != 1.0) try w.print("tab_ack_delay_secs = {d:.2}\n", .{self.tab_ack_delay_secs});
+        if (self.image_memory_mb != 320) try w.print("image_memory_mb = {d}\n", .{self.image_memory_mb});
         if (!self.smart_copy) try w.writeAll("smart_copy = false\n");
         if (!std.mem.eql(u8, self.word_chars, "-_.,/?:@&=+%~"))
             try w.print("word_chars = {s}\n", .{self.word_chars});
@@ -1097,6 +1116,12 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.scroll_on_output = try parseBool(value);
     } else if (std.mem.eql(u8, key, "track_tab_activity")) {
         cfg.track_tab_activity = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "inactive_warn_secs")) {
+        cfg.inactive_warn_secs = try parseU32(value);
+    } else if (std.mem.eql(u8, key, "tab_ack_delay_secs")) {
+        cfg.tab_ack_delay_secs = std.math.clamp(try parseFloat(value), 0.0, 6.0);
+    } else if (std.mem.eql(u8, key, "image_memory_mb")) {
+        cfg.image_memory_mb = try parseU32(value);
     } else if (std.mem.eql(u8, key, "smart_copy")) {
         cfg.smart_copy = try parseBool(value);
     } else if (std.mem.eql(u8, key, "close_button_on_tab")) {

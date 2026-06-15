@@ -402,7 +402,9 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     // Tab activity.
     const tabact_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(tabact_group)), "Tab activity");
-    addSwitchRow(@ptrCast(@alignCast(tabact_group)), ctx, "Activity glow", "Animate a rainbow glow on a background tab while its content changes.", &ctx.cfg.track_tab_activity, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(tabact_group)), ctx, "Track tab activity", "Master switch for per-tab activity effects (glow, inactivity warning). Right-click a tab to toggle each effect for that tab.", &ctx.cfg.track_tab_activity, applyOnly);
+    addSpinRowU32(@ptrCast(@alignCast(tabact_group)), ctx, "Inactive after (seconds)", "Silence before a tab's inactivity warning fires (per-tab toggle in the tab's right-click menu).", 1, 3600, &ctx.cfg.inactive_warn_secs, applyOnly);
+    addSpinRowF32Step(@ptrCast(@alignCast(tabact_group)), ctx, "Acknowledge delay (seconds)", "How long a tab must stay open before viewing it clears its inactivity warning. Stops a quick scroll across the tabs from wiping every warning.", 0.0, 6.0, 0.5, 1, &ctx.cfg.tab_ack_delay_secs, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(tabact_group)));
 
     // Text legibility.

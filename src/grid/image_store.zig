@@ -68,9 +68,40 @@ pub const Store = struct {
     /// When true, flushUploads prints upload outcomes to stderr.
     /// Toggled by `--debug-images` CLI flag.
     debug: bool = false,
+    /// Live bytes held in `pending` buffers across all images. Tracked so
+    /// the FIFO eviction in `addFull` can keep retained image memory under
+    /// `budget_bytes` instead of growing until the kernel OOM-kills us.
+    live_bytes: usize = 0,
+    /// Cap on `live_bytes` (0 = unlimited). Set from `config.image_memory_mb`.
+    budget_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
+    }
+
+    /// Free an image's pending buffer and keep `live_bytes` in sync.
+    fn freePending(self: *Store, img: *Image) void {
+        if (img.pending) |p| {
+            self.live_bytes -= p.len;
+            self.allocator.free(p);
+            img.pending = null;
+        }
+    }
+
+    /// Evict oldest non-deleting images (FIFO) until `incoming` more bytes
+    /// fit under the budget. Evicted images keep their entry (so the GL
+    /// texture is torn down by the next flush) but drop their CPU pixels
+    /// now. Never evicts so hard that a single over-budget image can't be
+    /// added — that one image is allowed through.
+    fn evictForBudget(self: *Store, incoming: usize) void {
+        if (self.budget_bytes == 0) return;
+        var i: usize = 0;
+        while (self.live_bytes + incoming > self.budget_bytes and i < self.images.items.len) : (i += 1) {
+            const img = &self.images.items[i];
+            if (img.deleting or img.pending == null) continue;
+            self.freePending(img);
+            img.deleting = true;
+        }
     }
 
     pub fn deinit(self: *Store) void {
@@ -78,9 +109,7 @@ pub const Store = struct {
         // context — when the widget is unrealized, GTK destroys the
         // context which frees the textures. Calling glDeleteTextures
         // here without a current context is a no-op or crash; skip.
-        for (self.images.items) |*img| {
-            if (img.pending) |p| self.allocator.free(p);
-        }
+        for (self.images.items) |*img| self.freePending(img);
         self.images.deinit(self.allocator);
     }
 
@@ -167,7 +196,12 @@ pub const Store = struct {
                 if (same_image and same_pid) img.deleting = true;
             }
         }
+        // Keep retained image memory bounded: evict oldest before adding.
+        self.evictForBudget(need);
         const copy = try self.allocator.dupe(u8, o.rgba[0..need]);
+        errdefer self.allocator.free(copy);
+        self.live_bytes += copy.len;
+        errdefer self.live_bytes -= copy.len;
         try self.images.append(self.allocator, .{
             .width = o.width,
             .height = o.height,
@@ -222,8 +256,9 @@ pub const Store = struct {
             if (img.last_seen_generation == generation) continue;
             const need: usize = @as(usize, img.width) * @as(usize, img.height) * 4;
             if (rgba.len < need) continue;
-            if (img.pending) |p| self.allocator.free(p);
+            self.freePending(img);
             const dup = try self.allocator.dupe(u8, rgba[0..need]);
+            self.live_bytes += dup.len;
             img.pending = dup;
             img.pending_dirty = true;
             img.last_seen_generation = generation;
@@ -267,9 +302,7 @@ pub const Store = struct {
     /// teardown — only safe to call after the GL context is gone
     /// or was never established. Used by tests.
     pub fn freeAllNoGL(self: *Store) void {
-        for (self.images.items) |*img| {
-            if (img.pending) |p| self.allocator.free(p);
-        }
+        for (self.images.items) |*img| self.freePending(img);
         self.images.clearRetainingCapacity();
     }
 
@@ -279,7 +312,7 @@ pub const Store = struct {
         while (i < self.images.items.len) {
             const img = &self.images.items[i];
             if (img.deleting) {
-                if (img.pending) |p| self.allocator.free(p);
+                self.freePending(img);
                 _ = self.images.orderedRemove(i);
                 continue;
             }
@@ -297,7 +330,7 @@ pub const Store = struct {
         while (i < self.images.items.len) {
             const img = &self.images.items[i];
             if (img.deleting) {
-                if (img.pending) |p| self.allocator.free(p);
+                self.freePending(img);
                 if (img.gl_tex != 0) c.glDeleteTextures(1, &img.gl_tex);
                 _ = self.images.orderedRemove(i);
                 continue;
@@ -455,4 +488,40 @@ test "forgetGL keeps all images, drops their GL handles" {
     try std.testing.expectEqual(@as(c_uint, 0), s.images.items[1].gl_tex);
     try std.testing.expect(s.images.items[0].pending != null);
     try std.testing.expect(s.images.items[1].pending != null);
+}
+
+test "budget evicts oldest images FIFO and bounds live_bytes" {
+    var s = Store.init(std.testing.allocator);
+    defer s.images.deinit(std.testing.allocator);
+    defer s.freeAllNoGL();
+    const px = [_]u8{0} ** (4 * 4 * 4); // 64 bytes per image
+    s.budget_bytes = 64 * 3; // room for exactly three live images
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        try s.addFull(.{ .rgba = &px, .width = 4, .height = 4, .row = 0, .col = 0, .image_id = i + 1 });
+    }
+    // Retained pixel memory never exceeds the budget.
+    try std.testing.expect(s.live_bytes <= s.budget_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * 3), s.live_bytes);
+    // The three newest survive (still hold pixels); the rest were evicted.
+    var live: usize = 0;
+    for (s.images.items) |*img| {
+        if (img.pending != null) live += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), live);
+    // The most recent image kept its pixels; the oldest lost them.
+    try std.testing.expect(s.images.items[s.images.items.len - 1].pending != null);
+    try std.testing.expect(s.images.items[0].pending == null);
+    try std.testing.expect(s.images.items[0].deleting);
+}
+
+test "budget = 0 means unlimited (no eviction)" {
+    var s = Store.init(std.testing.allocator);
+    defer s.images.deinit(std.testing.allocator);
+    defer s.freeAllNoGL();
+    const px = [_]u8{0} ** 16;
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) try s.addWithId(&px, 2, 2, 0, 0, i + 1);
+    for (s.images.items) |*img| try std.testing.expect(img.pending != null);
+    try std.testing.expectEqual(@as(usize, 50 * 16), s.live_bytes);
 }
