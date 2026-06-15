@@ -48,11 +48,33 @@ pub const StoredImage = struct {
     /// Remaining loop count: -1 = infinite, 0 = stopped, N>0 = play
     /// for N more loops.
     loops_remaining: i32 = -1,
+    /// Insertion order, for FIFO eviction under the memory budget.
+    seq: u64 = 0,
 
     fn rgbaLen(self: *const StoredImage) usize {
         return @as(usize, self.width) * @as(usize, self.height) * 4;
     }
+
+    /// Total decoded bytes retained by this image (all frames, or the
+    /// standalone buffer for a static image).
+    fn storedBytes(self: *const StoredImage) usize {
+        if (self.frames.items.len == 0) return self.rgba.len;
+        var t: usize = 0;
+        for (self.frames.items) |f| t += f.rgba.len;
+        return t;
+    }
 };
+
+/// Hard cap on frames retained for a single animated image, so one runaway
+/// `a=f` loop on a fixed id can't grow without bound (the per-image case the
+/// store-byte budget alone won't catch). Oldest frames are dropped past this.
+const MAX_FRAMES: usize = 1024;
+/// Cap on concurrent in-flight chunked transmissions. A stream that opens
+/// transmissions with distinct ids and never finalizes them would otherwise
+/// grow the accum table without bound.
+const MAX_ACCUMS: usize = 32;
+/// Fallback per-transmission payload cap when no memory budget is set.
+const DEFAULT_ACCUM_CAP: usize = 256 * 1024 * 1024;
 
 /// In-progress chunked transfer. Cleared on m=0 or first non-chunked.
 pub const Accum = struct {
@@ -98,6 +120,14 @@ pub const Manager = struct {
     /// When true, finalize errors print to stderr (PNG decode fail,
     /// bad base64, RGB undersize, etc.). Wired by `--debug-images`.
     debug: bool = false,
+    /// Cap on retained decoded-source bytes (0 = unlimited). Set from
+    /// `config.image_memory_mb`. Past it, oldest stored images are evicted.
+    budget_bytes: usize = 0,
+    /// Live decoded-source bytes across `store` (kept in sync by
+    /// `freeStoredImage` / the insert path).
+    store_bytes: usize = 0,
+    /// Monotonic insertion counter feeding `StoredImage.seq`.
+    seq_counter: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Manager {
         return .{
@@ -117,6 +147,9 @@ pub const Manager = struct {
     }
 
     fn freeStoredImage(self: *Manager, img: *StoredImage) void {
+        // All removal paths funnel here, so the budget accounting lives here.
+        const b = img.storedBytes();
+        self.store_bytes -= @min(self.store_bytes, b);
         if (img.frames.items.len == 0) {
             // Static: rgba is the standalone allocation.
             self.allocator.free(img.rgba);
@@ -125,6 +158,47 @@ pub const Manager = struct {
             for (img.frames.items) |f| self.allocator.free(f.rgba);
         }
         img.frames.deinit(self.allocator);
+    }
+
+    /// Insert a freshly-decoded static image, accounting its bytes and
+    /// stamping its insertion order, then evict oldest entries if the
+    /// store is over budget.
+    fn insertStored(self: *Manager, image_id: u32, img: StoredImage) !void {
+        var v = img;
+        v.seq = self.seq_counter;
+        self.seq_counter += 1;
+        try self.store.put(image_id, v);
+        self.store_bytes += v.storedBytes();
+        self.evictStoreForBudget(image_id);
+    }
+
+    /// Max bytes a single chunked transmission may accumulate before it is
+    /// poisoned. Ties to the memory budget when set, else a fixed fallback.
+    fn accumCap(self: *const Manager) usize {
+        return if (self.budget_bytes > 0) self.budget_bytes else DEFAULT_ACCUM_CAP;
+    }
+
+    /// Evict the oldest stored images (lowest `seq`) until the store fits
+    /// the budget. Never evicts `protect_id` (the one just touched).
+    fn evictStoreForBudget(self: *Manager, protect_id: u32) void {
+        if (self.budget_bytes == 0) return;
+        while (self.store_bytes > self.budget_bytes) {
+            var victim: ?u32 = null;
+            var lowest: u64 = std.math.maxInt(u64);
+            var it = self.store.iterator();
+            while (it.next()) |e| {
+                if (e.key_ptr.* == protect_id) continue;
+                if (e.value_ptr.seq < lowest) {
+                    lowest = e.value_ptr.seq;
+                    victim = e.key_ptr.*;
+                }
+            }
+            const vid = victim orelse break; // only the protected one left
+            if (self.store.fetchRemove(vid)) |entry| {
+                var sv = entry.value;
+                self.freeStoredImage(&sv);
+            }
+        }
     }
 
     /// Ingest a kitty graphics command. Returns:
@@ -199,6 +273,12 @@ pub const Manager = struct {
             .transmit, .transmit_and_place, .transmit_frame => {
                 // Chunked transfer: appended into accum until m=0.
                 const is_first = !self.accums.contains(effective_id);
+                if (is_first and self.accums.count() >= MAX_ACCUMS) {
+                    // Too many in-flight transmissions never finalized — a
+                    // misbehaving stream. Refuse new ones rather than letting
+                    // the accum table grow without bound.
+                    return default;
+                }
                 if (is_first) {
                     // Treat the original cmd.action as the source of
                     // truth for what to do on finalize. .unknown can
@@ -223,9 +303,18 @@ pub const Manager = struct {
                     self.active_transmit_id = effective_id;
                 }
                 if (self.accums.getPtr(effective_id)) |acc| {
-                    acc.payload.appendSlice(self.allocator, cmd.payload) catch {
+                    // Cap the in-flight payload: an unterminated `m=1` chunk
+                    // stream would otherwise grow one accumulator without
+                    // bound. Past the cap, poison it (finalize bails) and drop
+                    // the buffer so the memory is reclaimed immediately.
+                    if (acc.payload.items.len + cmd.payload.len > self.accumCap()) {
                         acc.poisoned = true;
-                    };
+                        acc.payload.clearAndFree(self.allocator);
+                    } else if (!acc.poisoned) {
+                        acc.payload.appendSlice(self.allocator, cmd.payload) catch {
+                            acc.poisoned = true;
+                        };
+                    }
                     if (cmd.more == 1) return default; // wait for more
                 }
                 // Capture the original action BEFORE finalize drops the accum.
@@ -433,7 +522,7 @@ pub const Manager = struct {
             var v = old.value;
             self.freeStoredImage(&v);
         }
-        try self.store.put(image_id, stored);
+        try self.insertStored(image_id, stored);
         return true;
     }
 
@@ -451,6 +540,11 @@ pub const Manager = struct {
             self.allocator.free(new_frame.rgba);
             return false;
         }
+
+        // Snapshot the image's byte footprint so we can apply the net delta
+        // (promote / compose / append / replace / frame-cap) to store_bytes
+        // in one place rather than tracking each branch.
+        const before_bytes = existing.storedBytes();
 
         // Promote: if static, move existing rgba into frames[0].
         if (existing.frames.items.len == 0) {
@@ -519,10 +613,25 @@ pub const Manager = struct {
                 .delay_ms = if (acc.frame_delay_ms == 0) 100 else acc.frame_delay_ms,
             };
         }
+        // Cap frame count: drop oldest frames so one runaway `a=f` loop on a
+        // fixed id can't grow without bound.
+        while (existing.frames.items.len > MAX_FRAMES) {
+            const dropped = existing.frames.orderedRemove(0);
+            self.allocator.free(dropped.rgba);
+            if (existing.current_frame > 0) existing.current_frame -= 1;
+        }
         // Re-anchor `existing.rgba` to the current frame in case the
-        // insertion replaced it.
+        // insertion replaced it (clamp in case the cap shifted indices).
+        if (existing.current_frame >= existing.frames.items.len) {
+            existing.current_frame = @intCast(existing.frames.items.len - 1);
+        }
         existing.rgba = existing.frames.items[existing.current_frame].rgba;
         existing.generation +%= 1;
+
+        // Apply the net byte delta and evict other images if over budget.
+        const after_bytes = existing.storedBytes();
+        self.store_bytes = self.store_bytes - @min(self.store_bytes, before_bytes) + after_bytes;
+        self.evictStoreForBudget(image_id);
         return true;
     }
 
@@ -833,4 +942,37 @@ test "animation: a=a stop pauses playback" {
     const run_cmd = kitty.Command{ .action = .animate, .image_id = 8, .cells_wide = 2 };
     _ = mgr.ingest(run_cmd);
     try std.testing.expect(mgr.store.getPtr(8).?.playing);
+}
+
+test "store budget evicts oldest images and bounds store_bytes" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+    mgr.budget_bytes = 64 * 3; // room for exactly three 4x4 images
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        const rgba = try std.testing.allocator.alloc(u8, 64);
+        @memset(rgba, 0);
+        try mgr.insertStored(i + 1, .{ .rgba = rgba, .width = 4, .height = 4 });
+    }
+    try std.testing.expect(mgr.store_bytes <= mgr.budget_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * 3), mgr.store_bytes);
+    try std.testing.expectEqual(@as(u32, 3), mgr.store.count());
+    // Newest survives; oldest evicted.
+    try std.testing.expect(mgr.store.contains(10));
+    try std.testing.expect(!mgr.store.contains(1));
+}
+
+test "unterminated chunked transmission is capped, not unbounded" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+    mgr.budget_bytes = 1024; // tiny accum cap
+    const chunk = [_]u8{'A'} ** 512;
+    // Keep sending m=1 chunks for one id; payload must not grow past the cap.
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        _ = mgr.ingest(.{ .action = .transmit, .image_id = 1, .payload = &chunk, .more = 1 });
+    }
+    const acc = mgr.accums.getPtr(1).?;
+    try std.testing.expect(acc.poisoned);
+    try std.testing.expect(acc.payload.items.len <= mgr.budget_bytes);
 }

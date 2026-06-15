@@ -13,44 +13,14 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const profile = @import("../util/profile.zig");
+const Config = @import("../config.zig").Config;
+const tab_effects = @import("tab_effects.zig");
 
 const TAB_W: c_int = 170;
-/// Activity glow fade time once a tab goes quiet (after any sustain
-/// window): full → gone over this many microseconds.
-const GLOW_DECAY_US: f64 = 2_600_000;
-/// Aurora glow: soft full-spectrum colour blobs that blend and drift
-/// right-to-left, breathing in and out of place so the colour flows
-/// organically instead of a hard rainbow sliding by.
-const AURORA_BLOBS: usize = 6;
-/// Period of the slow right-to-left drift, microseconds.
-const AURORA_DRIFT_US: f64 = 5_000_000;
-/// Period of each blob's in-place wobble, microseconds.
-const AURORA_WOBBLE_US: f64 = 2_600_000;
-/// Blob spread (fraction of tab width) and wobble amplitude.
-const AURORA_SIGMA: f64 = 0.17;
-const AURORA_WOBBLE: f64 = 0.06;
-/// Blending colours in RGB greys them out; push the blend back toward full
-/// saturation by this factor (1 = none) so the aurora stays vivid.
-const AURORA_SAT: f64 = 1.55;
-const ACTIVITY_KEY = "sketerm-tab-activity-us";
-/// EMA of the inter-arrival gap between activity events, per page.
-const GAP_KEY = "sketerm-tab-gap-us";
-/// A source whose refresh period is under this (e.g. htop every ~1.5s) is
-/// treated as "ongoing": the glow is held steady so it keeps sweeping
-/// smoothly instead of fading and snapping back on each refresh.
-const SUSTAIN_THRESHOLD_US: f64 = 4_500_000;
-/// Hold the glow for this multiple of the refresh period (generous margin
-/// so jitter / a slightly-late refresh never causes a visible dip).
-const SUSTAIN_FACTOR: f64 = 2.2;
-/// Cap on the sustain window so even near-threshold sources fade eventually.
-const SUSTAIN_MAX_US: f64 = 9_000_000;
-/// A gap larger than this means activity restarted; the average resets to
-/// it rather than blending, so a long pause never inflates the window.
-const SUSTAIN_RESET_GAP_US: i64 = 6_000_000;
-/// Gaps below this are intra-refresh noise (a full-screen TUI repaint emits
-/// several events milliseconds apart) and are ignored — only the quiet
-/// between refreshes reveals the true period.
-const MIN_MEANINGFUL_GAP_US: i64 = 500_000;
+
+/// Fallback config so `TabBar.config` is always valid before the owning
+/// Window points it at the real one (and in tests).
+var default_config: Config = .{};
 
 /// CSS installed once per display.
 var css_installed = false;
@@ -186,53 +156,41 @@ fn tabSizeAllocate(widget: [*c]c.GtkWidget, width: c_int, height: c_int, baselin
     }
 }
 
-/// Tab `snapshot`: draw the activity glow BEHIND, then the tab's children
+/// Tab `snapshot`: draw the active effects BEHIND, then the tab's children
 /// (icon, title, close) on top so the text/button stay legible.
 fn tabSnapshot(widget: [*c]c.GtkWidget, snapshot: ?*c.GtkSnapshot) callconv(.c) void {
-    drawGlow(widget, snapshot);
+    drawEffects(widget, snapshot);
     var child = c.gtk_widget_get_first_child(widget);
     while (child != null) : (child = c.gtk_widget_get_next_sibling(child)) {
         c.gtk_widget_snapshot_child(widget, child, snapshot);
     }
 }
 
-/// The aurora glow (full-width soft wash + opaque bottom border), drawn
-/// before the children so it sits underneath them.
-fn drawGlow(widget: [*c]c.GtkWidget, snapshot: ?*c.GtkSnapshot) void {
-    const data = c.g_object_get_data(@ptrCast(@alignCast(widget)), "sketerm-tab") orelse return;
-    const tab: *TabBar.Tab = @ptrCast(@alignCast(data));
+/// Iterate the effect registry and draw each enabled, active effect for this
+/// background tab (back-to-front). The selected tab is what you're looking
+/// at, so it carries no effects.
+fn drawEffects(widget: [*c]c.GtkWidget, snapshot: ?*c.GtkSnapshot) void {
+    const tab = tabOf(widget) orelse return;
     if (c.adw_tab_view_get_selected_page(tab.bar.view) == @as(?*c.AdwTabPage, tab.page)) return;
-    const intensity = activityIntensity(tab.page);
-    if (intensity <= 0.01) return;
-
-    const w: f64 = @floatFromInt(c.gtk_widget_get_width(@ptrCast(widget)));
-    const h: f64 = @floatFromInt(c.gtk_widget_get_height(@ptrCast(widget)));
-    var rect: c.graphene_rect_t = undefined;
-    _ = c.graphene_rect_init(&rect, 0, 0, @floatCast(w), @floatCast(h));
-    const cr = c.gtk_snapshot_append_cairo(snapshot, &rect) orelse return;
-    const t_us: f64 = @floatFromInt(c.g_get_monotonic_time());
-
-    // Soft aurora wash over the WHOLE tab, faint at the top and growing
-    // toward the bottom (a vertical alpha mask gives the glow gradient).
-    if (makeAurora(w, intensity, t_us)) |wash| {
-        defer c.cairo_pattern_destroy(wash);
-        c.cairo_set_source(cr, wash);
-        if (c.cairo_pattern_create_linear(0, 0, 0, h)) |mask| {
-            defer c.cairo_pattern_destroy(mask);
-            c.cairo_pattern_add_color_stop_rgba(mask, 0.0, 1, 1, 1, 0.04);
-            c.cairo_pattern_add_color_stop_rgba(mask, 0.75, 1, 1, 1, 0.16);
-            c.cairo_pattern_add_color_stop_rgba(mask, 1.0, 1, 1, 1, 0.38);
-            c.cairo_mask(cr, mask);
-        }
+    const cfg = tab.bar.config;
+    const s = tab_effects.tabSettings(tab.page);
+    for (tab_effects.registry) |effect| {
+        if (!effect.enabled(s)) continue;
+        const act = effect.eval(tab.page, cfg, s);
+        if (act.intensity <= 0.01) continue;
+        effect.draw(tab.page, @ptrCast(widget), snapshot, act);
     }
+}
 
-    // Opaque aurora bottom border.
-    if (makeAurora(w, intensity, t_us)) |bar| {
-        defer c.cairo_pattern_destroy(bar);
-        c.cairo_set_source(cr, bar);
-        c.cairo_rectangle(cr, 0, h - 3, w, 3);
-        c.cairo_fill(cr);
+/// True if any enabled effect on this page is still animating, so the tick
+/// loop should keep running.
+fn tabAnimating(cfg: *const Config, page: *c.AdwTabPage) bool {
+    const s = tab_effects.tabSettings(page);
+    for (tab_effects.registry) |effect| {
+        if (!effect.enabled(s)) continue;
+        if (effect.eval(page, cfg, s).animating) return true;
     }
+    return false;
 }
 fn tabbarClassInit(klass: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
     c.gtk_widget_class_set_css_name(@ptrCast(@alignCast(klass)), "tabbar");
@@ -325,6 +283,17 @@ pub const TabBar = struct {
     detach_ctx: ?*anyopaque = null,
     on_detach: ?*const fn (ctx: ?*anyopaque, view: *c.AdwTabView, page: *c.AdwTabPage) void = null,
     reorder: ?Reorder = null,
+    /// Config read by the tab effects (which gates fire, thresholds). Points
+    /// at the owning Window's `config` once wired; a static default keeps it
+    /// valid before that and in tests.
+    config: *const Config = &default_config,
+    /// One-shot timer that re-wakes the tick when a silent tab crosses the
+    /// inactive-warning threshold (see `armWarn`).
+    warn_arm_id: c.guint = 0,
+    /// Right-click-a-tab context menu, built by the owning Window. `anchor`
+    /// is the clicked tab widget and `x`/`y` are click coords within it.
+    context_ctx: ?*anyopaque = null,
+    on_context: ?*const fn (ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWidget, x: f64, y: f64) void = null,
 
     pub const Tab = struct {
         bar: *TabBar,
@@ -434,6 +403,19 @@ pub const TabBar = struct {
     pub fn ensureTick(self: *TabBar) void {
         if (self.tick_id != 0) return;
         self.tick_id = c.g_timeout_add(33, @ptrCast(&onTick), self);
+    }
+
+    /// The inactive-warning fires on *silence*, with no event to wake the
+    /// 33ms tick (which sleeps once the aurora has faded). Arm a single
+    /// coarse timer, reset on every activity, that re-runs the tick once the
+    /// silence threshold elapses so the warning can light up. No-op unless
+    /// the just-active tab has the per-tab warning enabled.
+    pub fn armWarn(self: *TabBar, page: *c.AdwTabPage) void {
+        if (!tab_effects.tabSettings(page).warn_inactive) return;
+        if (self.warn_arm_id != 0) _ = c.g_source_remove(self.warn_arm_id);
+        // +0.2s margin so warnEval is comfortably past the threshold.
+        const ms: c.guint = self.config.inactive_warn_secs * 1000 + 200;
+        self.warn_arm_id = c.g_timeout_add(ms, @ptrCast(&onWarnArm), self);
     }
 
     /// Mark the selected tab's `:selected` state (what libadwaita's
@@ -570,6 +552,13 @@ pub const TabBar = struct {
         _ = c.g_signal_connect_data(click, "pressed", @ptrCast(&onPressed), t, null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(tab_box, @ptrCast(@alignCast(click)));
 
+        // Right-click → tab context menu (rename, effect toggles, …). Owned
+        // by the Window via the `on_context` hook.
+        const rclick = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
+        _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRightPressed), t, null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(tab_box, @ptrCast(@alignCast(rclick)));
+
         t.title_handler = c.g_signal_connect_data(@ptrCast(page), "notify::title", @ptrCast(&onTitle), t, null, c.G_CONNECT_DEFAULT);
         t.icon_handler = c.g_signal_connect_data(@ptrCast(page), "notify::icon", @ptrCast(&onIcon), t, null, c.G_CONNECT_DEFAULT);
     }
@@ -578,6 +567,10 @@ pub const TabBar = struct {
         if (self.tick_id != 0) {
             _ = c.g_source_remove(self.tick_id);
             self.tick_id = 0;
+        }
+        if (self.warn_arm_id != 0) {
+            _ = c.g_source_remove(self.warn_arm_id);
+            self.warn_arm_id = 0;
         }
         self.clearTabs();
         self.tabs.deinit(self.allocator);
@@ -684,13 +677,21 @@ fn onPressed(_: ?*anyopaque, _: c_int, _: f64, _: f64, user: ?*anyopaque) callco
     _ = c.adw_tab_view_close_page(t.bar.view, t.page);
 }
 
+/// Right-click: select the tab (so menu actions target it) and ask the
+/// Window to pop its context menu anchored on this tab.
+fn onRightPressed(_: ?*anyopaque, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const t = cast.userData(TabBar.Tab, user);
+    c.adw_tab_view_set_selected_page(t.bar.view, t.page);
+    if (t.bar.on_context) |f| f(t.bar.context_ctx, t.page, t.tab_box, x, y);
+}
+
 fn onClose(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const t = cast.userData(TabBar.Tab, user);
     _ = c.adw_tab_view_close_page(t.bar.view, t.page);
 }
 
-/// Glow + reorder tick: redraw glows, ease neighbour slides toward their
-/// targets; stop once nothing is active and nothing is mid-slide.
+/// Effect + reorder tick: repaint effects, ease neighbour slides toward
+/// their targets; stop once nothing is animating and nothing is mid-slide.
 fn onTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(TabBar, user);
     var any_active = false;
@@ -704,7 +705,7 @@ fn onTick(user: ?*anyopaque) callconv(.c) c.gboolean {
             t.slide = t.slide_target;
         }
         const sel = c.adw_tab_view_get_selected_page(self.view) == @as(?*c.AdwTabPage, t.page);
-        if (!sel and activityIntensity(t.page) > 0.01) any_active = true;
+        if (!sel and tabAnimating(self.config, t.page)) any_active = true;
         c.gtk_widget_queue_draw(t.tab_box);
     }
     // Reorder offsets live on the tabbox snapshot; keep it repainting
@@ -715,6 +716,16 @@ fn onTick(user: ?*anyopaque) callconv(.c) c.gboolean {
         return 0;
     }
     return 1;
+}
+
+/// One-shot: a tab has now been silent past the warning threshold. Wake the
+/// tick so the inactive-warning effect can evaluate active and start
+/// flashing.
+fn onWarnArm(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(TabBar, user);
+    self.warn_arm_id = 0;
+    self.ensureTick();
+    return 0;
 }
 
 // ── drag and drop ────────────────────────────────────────────────────
@@ -928,127 +939,4 @@ fn onDrop(_: ?*anyopaque, _: ?*anyopaque, x: f64, _: f64, user: ?*anyopaque) cal
         c.adw_tab_view_transfer_page(src.bar.view, src.page, self.view, idx);
     }
     return 1;
-}
-
-// ── glow helpers (drawing is in tabSnapshot) ─────────────────────────
-
-/// Stamp a tab's page with an activity event, maintaining the
-/// inter-arrival-gap EMA used to sustain the glow for steady streams.
-pub fn recordActivity(page: *c.AdwTabPage) void {
-    const obj: [*c]c.GObject = @ptrCast(@alignCast(page));
-    const now = c.g_get_monotonic_time();
-    if (c.g_object_get_data(obj, ACTIVITY_KEY)) |prev| {
-        const prev_ts: i64 = @bitCast(@as(u64, @intFromPtr(prev)));
-        const gap = now - prev_ts;
-        // Only inter-refresh gaps reveal the period; ignore the burst of
-        // tiny gaps a TUI repaint produces (those would drag the average
-        // down to a few ms and defeat the sustain entirely).
-        if (gap >= MIN_MEANINGFUL_GAP_US) {
-            const gap_u: u64 = @intCast(gap);
-            const old = c.g_object_get_data(obj, GAP_KEY);
-            // Blend at 0.5 so it tracks the real cadence in a couple of
-            // refreshes; a long pause resets it so an idle tab doesn't
-            // inherit a stale rhythm.
-            const ema: u64 = if (old != null and gap < SUSTAIN_RESET_GAP_US)
-                (@as(u64, @intFromPtr(old)) + gap_u) / 2
-            else
-                gap_u;
-            c.g_object_set_data(obj, GAP_KEY, @ptrFromInt(@as(usize, @intCast(ema))));
-        }
-    }
-    c.g_object_set_data(obj, ACTIVITY_KEY, @ptrFromInt(@as(usize, @intCast(now))));
-}
-
-fn activityIntensity(page: *c.AdwTabPage) f64 {
-    const obj: [*c]c.GObject = @ptrCast(@alignCast(page));
-    const data = c.g_object_get_data(obj, ACTIVITY_KEY) orelse return 0;
-    const ts: i64 = @bitCast(@as(u64, @intFromPtr(data)));
-    const now = c.g_get_monotonic_time();
-    const elapsed: f64 = @floatFromInt(now - ts);
-    if (elapsed <= 0) return 1.0;
-
-    // Adaptive sustain: while a source keeps updating faster than the
-    // threshold, hold the glow at full so it sweeps continuously instead
-    // of fading and snapping on every update (e.g. htop's 2s refresh).
-    var hold: f64 = 0;
-    if (c.g_object_get_data(obj, GAP_KEY)) |g| {
-        const ema: f64 = @floatFromInt(@as(u64, @intFromPtr(g)));
-        if (ema < SUSTAIN_THRESHOLD_US) hold = @min(ema * SUSTAIN_FACTOR, SUSTAIN_MAX_US);
-    }
-    if (elapsed <= hold) return 1.0;
-
-    const fade = elapsed - hold;
-    if (fade >= GLOW_DECAY_US) return 0;
-    return 1.0 - fade / GLOW_DECAY_US;
-}
-
-/// An aurora ramp across `width`: full-spectrum colour blobs, evenly spaced
-/// in hue, that all drift right-to-left while each wobbles in place on its
-/// own cycle. The colour at every point is the soft (gaussian) blend of the
-/// blobs, computed toroidally so the drift is seamless. The wobble keeps the
-/// flow organic instead of a rigid translation.
-fn makeAurora(width: f64, alpha: f64, t_us: f64) ?*c.cairo_pattern_t {
-    const span = if (width > 1) width else 1;
-    const pat = c.cairo_pattern_create_linear(0, 0, span, 0) orelse return null;
-    const tau = 2.0 * std.math.pi;
-    const nb: f64 = @floatFromInt(AURORA_BLOBS);
-    const drift = t_us / AURORA_DRIFT_US;
-
-    var cx: [AURORA_BLOBS]f64 = undefined;
-    var col: [AURORA_BLOBS][3]f64 = undefined;
-    for (0..AURORA_BLOBS) |i| {
-        const fi: f64 = @floatFromInt(i);
-        const base = fi / nb;
-        const wob = AURORA_WOBBLE * @sin(tau * (t_us / AURORA_WOBBLE_US + base));
-        cx[i] = base - drift + wob; // toroidal distance handles the wrap
-        col[i] = hsv2rgb(base, 1.0, 1.0);
-    }
-
-    const inv2s2 = 1.0 / (2.0 * AURORA_SIGMA * AURORA_SIGMA);
-    const N: usize = 64;
-    var k: usize = 0;
-    while (k <= N) : (k += 1) {
-        const pos = @as(f64, @floatFromInt(k)) / @as(f64, @floatFromInt(N));
-        var r: f64 = 0;
-        var g: f64 = 0;
-        var b: f64 = 0;
-        var sw: f64 = 0;
-        for (0..AURORA_BLOBS) |i| {
-            var d = pos - cx[i];
-            d -= @round(d); // nearest copy on the [0,1) torus
-            const wt = @exp(-d * d * inv2s2);
-            r += wt * col[i][0];
-            g += wt * col[i][1];
-            b += wt * col[i][2];
-            sw += wt;
-        }
-        if (sw > 0) {
-            r /= sw;
-            g /= sw;
-            b /= sw;
-        }
-        // Re-saturate: push each channel away from the grey of the blend.
-        const grey = (r + g + b) / 3.0;
-        r = std.math.clamp(grey + (r - grey) * AURORA_SAT, 0.0, 1.0);
-        g = std.math.clamp(grey + (g - grey) * AURORA_SAT, 0.0, 1.0);
-        b = std.math.clamp(grey + (b - grey) * AURORA_SAT, 0.0, 1.0);
-        c.cairo_pattern_add_color_stop_rgba(pat, pos, r, g, b, alpha);
-    }
-    return pat;
-}
-
-fn hsv2rgb(hv: f64, s: f64, v: f64) [3]f64 {
-    const i = @floor(hv * 6.0);
-    const f = hv * 6.0 - i;
-    const p = v * (1.0 - s);
-    const q = v * (1.0 - f * s);
-    const tt = v * (1.0 - (1.0 - f) * s);
-    return switch (@as(i32, @intFromFloat(@mod(i, 6.0)))) {
-        0 => .{ v, tt, p },
-        1 => .{ q, v, p },
-        2 => .{ p, v, tt },
-        3 => .{ p, q, v },
-        4 => .{ tt, p, v },
-        else => .{ v, p, q },
-    };
 }

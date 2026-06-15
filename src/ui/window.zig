@@ -20,6 +20,7 @@ const shader_pass_mod = @import("../render/shader_pass.zig");
 const shader_preset_mod = @import("../shader_preset.zig");
 const tree_mod = @import("tree.zig");
 const tabbar_mod = @import("tabbar.zig");
+const tab_effects = @import("tab_effects.zig");
 
 /// Toolkit-free pane-tree model — one per tab, attached to the
 /// AdwTabPage as qdata (travels with cross-window tab drags). The
@@ -265,6 +266,10 @@ pub const Window = struct {
     /// Touchpads emit many small dy events per gesture; we sum them
     /// and only flip a tab once |accum| crosses 1.0.
     tab_scroll_accum: f64 = 0,
+    /// Pending delayed tab-acknowledge (clears the inactivity warning only
+    /// after the tab has stayed selected for `tab_ack_delay_secs`).
+    ack_timer_id: c.guint = 0,
+    ack_timer_page: ?*c.AdwTabPage = null,
     /// Broadcast typing mode. Off = each pane gets its own keystrokes
     /// (default). Group = fan out to every pane sharing the source's
     /// `group` name. All = fan out to every pane in this window.
@@ -409,6 +414,13 @@ pub const Window = struct {
         // Drag-a-tab-out-of-the-strip → new window.
         self.tabbar.detach_ctx = @ptrCast(self);
         self.tabbar.on_detach = onTabDetach;
+        // Right-click-a-tab → context menu.
+        self.tabbar.context_ctx = @ptrCast(self);
+        self.tabbar.on_context = onTabContextMenu;
+        // Let the tab effects read this window's live config (gates,
+        // thresholds). The Config value is embedded in Window, so its
+        // address is stable across applyConfigChange.
+        self.tabbar.config = &self.config;
 
         // Honor the configured GTK theme (libadwaita otherwise ignores
         // it) so the user's tab styling applies to our real `tab` nodes.
@@ -644,6 +656,10 @@ pub const Window = struct {
         // Reversing #2 and #3 — the obvious order — would let a
         // late mainDrain dispatch into a freed Pane, since worker
         // joins happen inside Terminal.deinit, not before it.
+        if (self.ack_timer_id != 0) {
+            _ = c.g_source_remove(self.ack_timer_id);
+            self.ack_timer_id = 0;
+        }
         for (self.terminals.items) |t| t.clearSinks();
         for (self.terminals.items) |t| t.deinit();
         for (self.panes.items) |p| p.deinit();
@@ -1235,7 +1251,7 @@ pub const Window = struct {
         c.gtk_widget_set_vexpand(wrapper, 1);
         c.gtk_box_append(@ptrCast(wrapper), pane.widget());
 
-        const page = self.appendOrInsertTab(wrapper, .{ .leaf = pane });
+        const page = self.appendOrInsertTab(wrapper, .{ .leaf = pane }, false);
         c.adw_tab_page_set_title(page, title_z);
         c.adw_tab_page_set_tooltip(page, title_z);
     }
@@ -1253,8 +1269,9 @@ pub const Window = struct {
     }
 
     /// Spawn a new tab from a layout TabSpec (used on --restore).
-    /// Handles both v2 (tree) and v1-compat (cwd/command) fields.
-    pub fn newTabFromSpec(self: *Window, spec: @import("../layout.zig").TabSpec) !void {
+    /// Handles both v2 (tree) and v1-compat (cwd/command) fields. `at_end`
+    /// forces an append so a multi-tab restore keeps its saved order.
+    pub fn newTabFromSpec(self: *Window, spec: @import("../layout.zig").TabSpec, at_end: bool) !void {
         const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
         c.gtk_widget_set_vexpand(wrapper, 1);
         c.gtk_widget_set_hexpand(wrapper, 1);
@@ -1267,7 +1284,7 @@ pub const Window = struct {
         defer self.allocator.free(title_z);
         @memcpy(title_z, spec.title);
 
-        const page = self.appendOrInsertTab(wrapper, model_root);
+        const page = self.appendOrInsertTab(wrapper, model_root, at_end);
         c.adw_tab_page_set_title(page, title_z.ptr);
         c.adw_tab_page_set_tooltip(page, title_z.ptr);
         // Re-arm the user-rename lock so OSC titles can't stomp a
@@ -1280,6 +1297,10 @@ pub const Window = struct {
         if (spec.color) |col_str| {
             if (parseHexRGB(col_str)) |col| self.setTabColor(page, col);
         }
+        tab_effects.setTabSettings(page, .{
+            .show_activity = spec.show_activity,
+            .warn_inactive = spec.warn_inactive,
+        });
     }
 
     /// Re-apply a PaneSpec's saved shader state: preset by name
@@ -1486,7 +1507,7 @@ pub const Window = struct {
         c.gtk_widget_set_vexpand(wrapper, 1);
         c.gtk_box_append(@ptrCast(wrapper), pane.widget());
 
-        const page = self.appendOrInsertTab(wrapper, .{ .leaf = pane });
+        const page = self.appendOrInsertTab(wrapper, .{ .leaf = pane }, false);
         c.adw_tab_page_set_title(page, title_z);
         // Full-title tooltip — useful when titles are truncated.
         c.adw_tab_page_set_tooltip(page, title_z);
@@ -1508,8 +1529,10 @@ pub const Window = struct {
         pane.menu_sink = onMenuAction;
         pane.menu_sink_ctx = @ptrCast(self);
         pane.image_store.debug = self.debug_images;
+        pane.image_store.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
         pane.image_pass.debug = self.debug_images;
         pane.terminal.screen.kitty_images.debug = self.debug_images;
+        pane.terminal.screen.kitty_images.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
         // Mouse / link flags from config.
         pane.copy_on_selection = self.config.copy_on_selection;
         pane.clear_select_on_copy = self.config.clear_select_on_copy;
@@ -1609,7 +1632,7 @@ pub const Window = struct {
         c.gtk_widget_set_hexpand(wrapper, 1);
         c.gtk_widget_set_vexpand(wrapper, 1);
         c.gtk_box_append(@ptrCast(wrapper), pane.widget());
-        const adw_page = self.appendOrInsertTab(wrapper, .{ .leaf = pane });
+        const adw_page = self.appendOrInsertTab(wrapper, .{ .leaf = pane }, false);
         const title_for_page: [*:0]const u8 = title_z orelse "Tab";
         c.adw_tab_page_set_title(adw_page, title_for_page);
         c.adw_tab_page_set_tooltip(adw_page, title_for_page);
@@ -2033,8 +2056,12 @@ pub const Window = struct {
         else
             s.cursor_color;
         term.screen.scrollback_capacity = s.scrollback;
+        pane.image_store.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
+        term.screen.kitty_images.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
         term.screen.bracketed_paste = self.config.bracketed_paste;
         term.screen.scroll_on_output = self.config.scroll_on_output;
+        // Master switch for the drain's visible-change detection; the
+        // per-tab effect toggles only control what's drawn from it.
         term.screen.track_activity = self.config.track_tab_activity;
         term.screen.allow_clipboard_read = self.config.clipboard_read;
         // Initial dark/light for DSR ?996 / mode 2031, derived from
@@ -2286,7 +2313,7 @@ pub const Window = struct {
         defer parsed.deinit();
 
         for (parsed.value.tabs) |tab| {
-            self.newTabFromSpec(tab) catch |err| {
+            self.newTabFromSpec(tab, true) catch |err| {
                 std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
             };
         }
@@ -2303,7 +2330,7 @@ pub const Window = struct {
         };
         defer parsed.deinit();
         for (parsed.value.tabs) |tab| {
-            self.newTabFromSpec(tab) catch |err| {
+            self.newTabFromSpec(tab, true) catch |err| {
                 std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
             };
         }
@@ -2340,7 +2367,7 @@ pub const Window = struct {
         };
         defer parsed.deinit();
         for (parsed.value.tabs) |tab| {
-            self.newTabFromSpec(tab) catch |err| {
+            self.newTabFromSpec(tab, true) catch |err| {
                 std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
             };
         }
@@ -2444,6 +2471,135 @@ pub const Window = struct {
 
         c.gtk_popover_popup(@ptrCast(popover));
         _ = c.gtk_widget_grab_focus(entry);
+    }
+
+    // ── tab context menu (right-click a tab) ─────────────────────────
+
+    const TabMenuAction = enum { rename, duplicate, color, pin, close };
+    const TabMenuToggleKind = enum { show_activity, warn_inactive };
+
+    const TabMenuActionCtx = struct {
+        allocator: std.mem.Allocator,
+        window: *Window,
+        popover: *c.GtkWidget,
+        action: TabMenuAction,
+    };
+    const TabMenuToggleCtx = struct {
+        allocator: std.mem.Allocator,
+        window: *Window,
+        page: *c.AdwTabPage,
+        kind: TabMenuToggleKind,
+    };
+
+    /// Build and pop the right-click tab menu, anchored on the clicked tab.
+    /// The standard actions all run on the selected page (the right-click
+    /// already selected it); the toggles target the clicked page directly.
+    fn onTabContextMenu(ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWidget, x: f64, y: f64) void {
+        const self = cast.userData(Window, ctx);
+
+        const popover = c.gtk_popover_new();
+        c.gtk_widget_set_parent(popover, anchor);
+        c.gtk_popover_set_has_arrow(@ptrCast(popover), 0);
+        const rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
+        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+        connectManualPopoverClose(popover);
+
+        const list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+
+        self.addTabMenuAction(popover, list, "Rename Tab…", "document-edit-symbolic", .rename);
+        self.addTabMenuAction(popover, list, "Duplicate Tab", "edit-copy-symbolic", .duplicate);
+        self.addTabMenuAction(popover, list, "Tab Colour…", "color-select-symbolic", .color);
+        self.addTabMenuAction(popover, list, "Pin / Unpin Tab", "view-pin-symbolic", .pin);
+
+        c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+
+        const s = tab_effects.tabSettings(page);
+        self.addTabMenuToggle(list, page, "Show activity", s.show_activity, .show_activity);
+        self.addTabMenuToggle(list, page, "Warn inactivity", s.warn_inactive, .warn_inactive);
+
+        c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+        self.addTabMenuAction(popover, list, "Close Tab", "window-close-symbolic", .close);
+
+        c.gtk_popover_set_child(@ptrCast(popover), list);
+        c.gtk_popover_popup(@ptrCast(popover));
+    }
+
+    /// Icon+label button row that runs a window method on the selected tab.
+    fn addTabMenuAction(self: *Window, popover: *c.GtkWidget, list: *c.GtkWidget, label: [*:0]const u8, icon: [*:0]const u8, action: TabMenuAction) void {
+        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
+        const img = c.gtk_image_new_from_icon_name(icon);
+        const lbl = c.gtk_label_new(label);
+        c.gtk_label_set_xalign(@ptrCast(lbl), 0.0);
+        c.gtk_widget_set_hexpand(lbl, 1);
+        c.gtk_box_append(@ptrCast(row), img);
+        c.gtk_box_append(@ptrCast(row), lbl);
+
+        const btn = c.gtk_button_new();
+        c.gtk_button_set_child(@ptrCast(btn), row);
+        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+        const actx = self.allocator.create(TabMenuActionCtx) catch return;
+        actx.* = .{ .allocator = self.allocator, .window = self, .popover = popover, .action = action };
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onTabMenuActionClicked), @ptrCast(actx), @ptrCast(cast.destroyCtx(TabMenuActionCtx)), c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(list), btn);
+    }
+
+    /// Checkbox row bound to one of the clicked page's effect toggles.
+    fn addTabMenuToggle(self: *Window, list: *c.GtkWidget, page: *c.AdwTabPage, label: [*:0]const u8, active: bool, kind: TabMenuToggleKind) void {
+        const check = c.gtk_check_button_new_with_label(label);
+        c.gtk_check_button_set_active(@ptrCast(check), @intFromBool(active));
+        const tctx = self.allocator.create(TabMenuToggleCtx) catch return;
+        tctx.* = .{ .allocator = self.allocator, .window = self, .page = page, .kind = kind };
+        _ = c.g_signal_connect_data(check, "toggled", @ptrCast(&onTabMenuToggled), @ptrCast(tctx), @ptrCast(cast.destroyCtx(TabMenuToggleCtx)), c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(list), check);
+    }
+
+    fn onTabMenuActionClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const a = cast.userData(TabMenuActionCtx, user);
+        c.gtk_popover_popdown(@ptrCast(a.popover));
+        switch (a.action) {
+            .rename => a.window.renameCurrentTab(),
+            .duplicate => a.window.duplicateCurrentTab(),
+            .color => a.window.chooseTabColor(),
+            .pin => a.window.togglePinCurrentTab(),
+            .close => a.window.closeCurrentTab(),
+        }
+    }
+
+    fn onTabMenuToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
+        const t = cast.userData(TabMenuToggleCtx, user);
+        const on = c.gtk_check_button_get_active(check) != 0;
+        var s = tab_effects.tabSettings(t.page);
+        switch (t.kind) {
+            .show_activity => s.show_activity = on,
+            .warn_inactive => s.warn_inactive = on,
+        }
+        tab_effects.setTabSettings(t.page, s);
+        // Repaint the strip and, if an effect just turned on, make sure the
+        // animation tick (and the warning's silence timer) are running.
+        t.window.tabbar.refresh();
+        if (on) {
+            t.window.tabbar.ensureTick();
+            if (t.kind == .warn_inactive) t.window.tabbar.armWarn(t.page);
+        }
+    }
+
+    /// Arm (or, with a zero delay, immediately run) the delayed acknowledge
+    /// for the now-selected `page`. Any previous pending acknowledge is
+    /// cancelled, so flicking through tabs never acknowledges the ones merely
+    /// passed over — only the tab dwelt on long enough.
+    fn scheduleTabAck(self: *Window, page: *c.AdwTabPage) void {
+        if (self.ack_timer_id != 0) {
+            _ = c.g_source_remove(self.ack_timer_id);
+            self.ack_timer_id = 0;
+        }
+        const delay = self.config.tab_ack_delay_secs;
+        if (delay <= 0) {
+            tab_effects.acknowledge(page);
+            return;
+        }
+        self.ack_timer_page = page;
+        const ms: c.guint = @intFromFloat(delay * 1000.0);
+        self.ack_timer_id = c.g_timeout_add(ms, @ptrCast(&onTabAckTimer), self);
     }
 
     const ProfileButtonCtx = struct {
@@ -3214,9 +3370,12 @@ pub const Window = struct {
     /// `new_tab_after_current` config: at the end (default) or
     /// immediately after the currently-selected page. Returns the
     /// AdwTabPage so callers can set its title/tooltip.
-    fn appendOrInsertTab(self: *Window, child: *c.GtkWidget, tree_root: PaneTree.Node) *c.AdwTabPage {
+    /// `at_end` forces an append regardless of the `new_tab_after_current`
+    /// preference — used by layout restore, which must preserve the saved
+    /// tab order (insert-after-current would reverse a bulk load).
+    fn appendOrInsertTab(self: *Window, child: *c.GtkWidget, tree_root: PaneTree.Node, at_end: bool) *c.AdwTabPage {
         const page = blk: {
-            if (self.config.new_tab_after_current) {
+            if (!at_end and self.config.new_tab_after_current) {
                 const sel = c.adw_tab_view_get_selected_page(self.tab_view);
                 if (sel != null) {
                     const idx = c.adw_tab_view_get_page_position(self.tab_view, sel);
@@ -3588,7 +3747,7 @@ pub const Window = struct {
             c.gtk_widget_set_hexpand(wrapper, 1);
             c.gtk_widget_set_vexpand(wrapper, 1);
             c.gtk_box_append(@ptrCast(wrapper), pane.widget());
-            break :blk self.appendOrInsertTab(wrapper, .{ .leaf = pane });
+            break :blk self.appendOrInsertTab(wrapper, .{ .leaf = pane }, false);
         };
         c.adw_tab_page_set_title(page, title_z.ptr);
         c.adw_tab_page_set_tooltip(page, title_z.ptr);
@@ -4636,6 +4795,8 @@ pub const Window = struct {
                 else
                     null,
                 .title_locked = c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null,
+                .show_activity = tab_effects.tabSettings(page.?).show_activity,
+                .warn_inactive = tab_effects.tabSettings(page.?).warn_inactive,
             });
         }
         return .{ .version = 2, .tabs = try tabs.toOwnedSlice(arena) };
@@ -4929,7 +5090,7 @@ pub const Window = struct {
             .tree = tree,
             .pinned = false, // duplicates start unpinned
         };
-        self.newTabFromSpec(spec) catch |err| {
+        self.newTabFromSpec(spec, false) catch |err| {
             std.debug.print("sketerm: duplicate split tree failed: {s}\n", .{@errorName(err)});
         };
     }
@@ -5111,7 +5272,7 @@ pub const Window = struct {
         defer parsed.deinit();
 
         for (parsed.value.tabs) |tab| {
-            self.newTabFromSpec(tab) catch |err| {
+            self.newTabFromSpec(tab, true) catch |err| {
                 std.debug.print("sketerm: load tab '{s}' failed: {s}\n", .{ tab.title, @errorName(err) });
             };
         }
@@ -5393,8 +5554,16 @@ fn onLoadLayoutDone(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaq
     const path_cstr = c.g_file_get_path(file) orelse return;
     defer c.g_free(path_cstr);
     const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
-    _ = self.loadLayoutFromPath(path) catch |err|
+    // Load into a fresh window so the current window's tabs are left intact
+    // (and the restored tabs keep their saved order). Fall back to this
+    // window if spawning one fails.
+    const target = self.spawnSecondaryWindow() orelse self;
+    const ok = target.loadLayoutFromPath(path) catch |err| blk: {
         std.debug.print("sketerm: load layout failed: {s}\n", .{@errorName(err)});
+        break :blk false;
+    };
+    // Nothing loaded into the brand-new window — don't leave it empty.
+    if (!ok and target != self) c.gtk_window_close(@ptrCast(target.app_window));
 }
 
 fn onThemeChanged(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
@@ -6024,8 +6193,10 @@ fn onTermActivity(ctx: ?*anyopaque, pane: *Pane) void {
     const self = cast.userData(Window, ctx);
     const page = tabPageForPane(self, pane) orelse return;
     if (page == c.adw_tab_view_get_selected_page(self.tab_view)) return;
-    tabbar_mod.recordActivity(page);
+    tab_effects.recordActivity(page);
     self.tabbar.ensureTick();
+    // Reset the silence timer that drives this tab's inactive-warning.
+    self.tabbar.armWarn(page);
 }
 
 fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
@@ -6034,6 +6205,10 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
     if (page == null) return;
     // Clear any needs-attention from the now-active tab.
     c.adw_tab_page_set_needs_attention(page, 0);
+    // Viewing the tab acknowledges it (clears the inactivity warning until
+    // fresh output goes silent again) — but only after a short dwell so a
+    // quick scroll across the tabs doesn't wipe every warning.
+    self.scheduleTabAck(page.?);
     const child = c.adw_tab_page_get_child(page);
     if (child == null) return;
 
@@ -6058,6 +6233,19 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
             return;
         }
     }
+}
+
+/// The dwell timer elapsed: acknowledge the tab only if it is STILL the
+/// selected one (the user stayed on it rather than scrolling past).
+fn onTabAckTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(Window, user);
+    self.ack_timer_id = 0;
+    const page = self.ack_timer_page orelse return 0;
+    self.ack_timer_page = null;
+    if (page == c.adw_tab_view_get_selected_page(self.tab_view)) {
+        tab_effects.acknowledge(page);
+    }
+    return 0; // one-shot
 }
 
 /// Wired into Terminal.broadcast_sink. Routes back to the Window

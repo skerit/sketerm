@@ -41,6 +41,7 @@ comptime {
     _ = @import("ui/tree.zig");
     _ = @import("ui/hints.zig");
     _ = @import("ui/pane.zig");
+    _ = @import("ui/tab_effects.zig");
     _ = @import("ipc/protocol.zig");
     _ = @import("render/bg_pass.zig");
     _ = @import("mux/wire.zig");
