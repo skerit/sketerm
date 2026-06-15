@@ -210,6 +210,25 @@ pub fn open(window: *Window) !void {
     c.gtk_box_append(@ptrCast(root), scrolled);
     ctx.listbox = listbox;
 
+    // Adwaita fallback theme for `iconImage`. A user's active icon theme
+    // can ship a stale icon-theme.cache that advertises HiDPI (@2x)
+    // variants it doesn't actually contain; the cache short-circuits the
+    // usual inheritance, so a plain GtkImage.from_icon_name renders the
+    // broken-image placeholder. Adwaita always resolves, so we route
+    // around the broken theme per-icon. Built once, freed at the bottom.
+    const fallback_theme: ?*c.GtkIconTheme = blk: {
+        const display = c.gtk_widget_get_display(window.app_window);
+        const ft = c.gtk_icon_theme_new() orelse break :blk null;
+        const sp = c.gtk_icon_theme_get_search_path(c.gtk_icon_theme_get_for_display(display));
+        if (sp != null) {
+            c.gtk_icon_theme_set_search_path(ft, @ptrCast(sp));
+            c.g_strfreev(sp);
+        }
+        c.gtk_icon_theme_set_theme_name(ft, "Adwaita");
+        break :blk ft;
+    };
+    defer if (fallback_theme) |ft| c.g_object_unref(ft);
+
     // Build rows: the curated static set plus one "New Tab on <name>"
     // per configured [domain.<name>].
     const domains = window.config.domains.items;
@@ -230,8 +249,7 @@ pub fn open(window: *Window) !void {
         // Activatable is on the GtkListBoxRow base class.
         c.gtk_list_box_row_set_activatable(@ptrCast(@alignCast(row)), 1);
 
-        const icon = c.gtk_image_new_from_icon_name(entry.icon);
-        c.gtk_image_set_pixel_size(@ptrCast(@alignCast(icon)), 20);
+        const icon = iconImage(window, fallback_theme, entry.icon, 20);
         c.adw_action_row_add_prefix(@ptrCast(@alignCast(row)), icon);
 
         // Keybind hint suffix — looks up the active binding for this
@@ -277,8 +295,7 @@ pub fn open(window: *Window) !void {
         c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title_z);
         c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), desc_z);
         c.gtk_list_box_row_set_activatable(@ptrCast(@alignCast(row)), 1);
-        const icon = c.gtk_image_new_from_icon_name("network-server-symbolic");
-        c.gtk_image_set_pixel_size(@ptrCast(@alignCast(icon)), 20);
+        const icon = iconImage(window, fallback_theme, "network-server-symbolic", 20);
         c.adw_action_row_add_prefix(@ptrCast(@alignCast(row)), icon);
         c.g_object_set_data(@ptrCast(@alignCast(row)), "palette-row", @ptrCast(rctx));
         c.gtk_list_box_append(@ptrCast(@alignCast(listbox)), row);
@@ -310,6 +327,11 @@ pub fn open(window: *Window) !void {
     // Up/Down/Enter on the search entry — keep typing-focus on the
     // entry but drive selection in the listbox below.
     const key_ctrl = c.gtk_event_controller_key_new();
+    // CAPTURE phase: the search entry's inner GtkText emits "activate" and
+    // swallows Return at the target phase, so a bubble-phase controller
+    // never sees Enter (Up/Down survive because a single-line GtkText
+    // ignores them). Capturing lets us intercept Return before GtkText.
+    c.gtk_event_controller_set_propagation_phase(@ptrCast(key_ctrl), c.GTK_PHASE_CAPTURE);
     _ = c.g_signal_connect_data(
         key_ctrl,
         "key-pressed",
@@ -477,6 +499,46 @@ fn freeCtx(user: ?*anyopaque) callconv(.c) void {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
+
+/// Resolve a symbolic icon into a prefix image that survives a broken
+/// active icon theme. We look the paintable up ourselves at the display
+/// scale; if the active theme resolves to a file that isn't on disk (a
+/// stale @2x cache entry), we re-resolve through Adwaita so the row never
+/// shows the broken-image placeholder. The returned GtkIconPaintable is
+/// a GtkSymbolicPaintable, so recolouring to the row's foreground still
+/// works, and SVG sources stay crisp at the requested size.
+fn iconImage(window: *Window, fallback: ?*c.GtkIconTheme, name: [*c]const u8, size: c_int) *c.GtkWidget {
+    const display = c.gtk_widget_get_display(window.app_window);
+    const scale = c.gtk_widget_get_scale_factor(window.app_window);
+    const theme = c.gtk_icon_theme_get_for_display(display);
+
+    var paintable = c.gtk_icon_theme_lookup_icon(theme, name, null, size, scale, c.GTK_TEXT_DIR_LTR, 0);
+    if (!iconFileExists(paintable)) {
+        if (fallback) |ft| {
+            const alt = c.gtk_icon_theme_lookup_icon(ft, name, null, size, scale, c.GTK_TEXT_DIR_LTR, 0);
+            if (iconFileExists(alt)) {
+                if (paintable != null) c.g_object_unref(paintable);
+                paintable = alt;
+            } else if (alt != null) {
+                c.g_object_unref(alt);
+            }
+        }
+    }
+
+    const img = c.gtk_image_new_from_paintable(@ptrCast(paintable));
+    c.gtk_image_set_pixel_size(@ptrCast(@alignCast(img)), size);
+    if (paintable != null) c.g_object_unref(paintable);
+    return img;
+}
+
+/// Whether a looked-up icon points at a real file. A null GFile means a
+/// resource/builtin icon (no on-disk path to check) — treat it as valid.
+fn iconFileExists(paintable: ?*c.GtkIconPaintable) bool {
+    if (paintable == null) return false;
+    const file = c.gtk_icon_paintable_get_file(paintable) orelse return true;
+    defer c.g_object_unref(file);
+    return c.g_file_query_exists(file, null) != 0;
+}
 
 fn toLowerOwned(arena: std.mem.Allocator, s: [:0]const u8) ![]u8 {
     const out = try arena.alloc(u8, s.len);
