@@ -669,11 +669,16 @@ fn addZstd(b: *std.Build, mod: *std.Build.Module) void {
 /// C-only build would be too slow, and the optional video path can be
 /// absent on the portable binary (→ lossless). Gated on build_options.video.
 fn addVideo(b: *std.Build, mod: *std.Build.Module) void {
+    // Encode: libx264 + shim. Decode: libavcodec/avutil + shim. Both
+    // link into any artifact under -Dvideo; the encoder is referenced
+    // only daemon-side and the decoder only GUI-side, so the "other"
+    // library is dead weight there — fine on native builds (it's the
+    // portable musl daemon that stays codec-free).
     addPkgConfig(b, mod, "x264");
-    mod.addCSourceFile(.{
-        .file = b.path("vendor/x264_shim.c"),
-        .flags = &.{"-O2"},
-    });
+    addPkgConfig(b, mod, "libavcodec");
+    addPkgConfig(b, mod, "libavutil");
+    mod.addCSourceFile(.{ .file = b.path("vendor/x264_shim.c"), .flags = &.{"-O2"} });
+    mod.addCSourceFile(.{ .file = b.path("vendor/avdec_shim.c"), .flags = &.{"-O2"} });
     mod.addIncludePath(b.path("vendor"));
 }
 

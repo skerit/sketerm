@@ -20,6 +20,7 @@ const yuv = @import("../util/yuv.zig");
 /// collapses to `void`, mirroring winstream/source.zig's SckImpl.
 const have_video = build_options.video;
 const X264Impl = if (have_video) X264 else void;
+const AvDecImpl = if (have_video) AvDec else void;
 
 pub const Error = error{ UnknownCodec, SizeMismatch, Malformed, TooLong, Decode, Unsupported, X264 };
 
@@ -228,14 +229,23 @@ pub const Stub = struct {
 
 pub const Decoder = union(enum) {
     stub: Stub_,
+    avcodec: AvDecImpl,
 
     pub fn initStub(allocator: std.mem.Allocator) Decoder {
         return .{ .stub = .{ .allocator = allocator } };
     }
 
+    /// Open a fixed-size H.264 software decoder (libavcodec) for `w`×`h`
+    /// tiles. Errors Unsupported without -Dvideo.
+    pub fn initAvcodec(allocator: std.mem.Allocator, w: i32, h: i32) !Decoder {
+        if (comptime have_video) return .{ .avcodec = try AvDec.init(allocator, w, h) };
+        return Error.Unsupported;
+    }
+
     pub fn deinit(self: *Decoder) void {
         switch (self.*) {
             .stub => |*s| s.deinit(),
+            .avcodec => |*s| if (comptime have_video) s.deinit(),
         }
     }
 
@@ -243,6 +253,7 @@ pub const Decoder = union(enum) {
     pub fn decodeTile(self: *Decoder, tile: Tile, dst: []u8) Error!void {
         return switch (self.*) {
             .stub => |*s| s.decodeTile(tile, dst),
+            .avcodec => |*s| if (comptime have_video) s.decodeTile(tile, dst) else Error.Unsupported,
         };
     }
 
@@ -264,6 +275,56 @@ pub const Decoder = union(enum) {
             @memcpy(dst, tile.payload);
         }
     };
+};
+
+/// libavcodec H.264 software decoder via vendor/avdec_shim.c. Fixed tile
+/// geometry; decodes an Annex-B tile to I420 then yuv.zig → BGRA. The
+/// daemon never instantiates this (it encodes); it's the GUI/compositor
+/// receive path. Compiled only when build_options.video is set.
+const AvDec = struct {
+    allocator: std.mem.Allocator,
+    handle: ?*anyopaque,
+    w: i32,
+    h: i32,
+    yp: []u8,
+    up: []u8,
+    vp: []u8,
+
+    extern fn sk_avdec_open() ?*anyopaque;
+    extern fn sk_avdec_decode(dec: ?*anyopaque, data: [*]const u8, len: c_int, exp_w: c_int, exp_h: c_int, y: [*]u8, u: [*]u8, v: [*]u8) c_int;
+    extern fn sk_avdec_close(dec: ?*anyopaque) void;
+
+    fn init(allocator: std.mem.Allocator, w: i32, h: i32) !AvDec {
+        if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return Error.SizeMismatch;
+        const uw: u32 = @intCast(w);
+        const uh: u32 = @intCast(h);
+        const handle = sk_avdec_open() orelse return Error.Decode;
+        errdefer sk_avdec_close(handle);
+        const yp = try allocator.alloc(u8, yuv.ySize(uw, uh));
+        errdefer allocator.free(yp);
+        const up = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
+        errdefer allocator.free(up);
+        const vp = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
+        return .{ .allocator = allocator, .handle = handle, .w = w, .h = h, .yp = yp, .up = up, .vp = vp };
+    }
+
+    fn deinit(self: *AvDec) void {
+        sk_avdec_close(self.handle);
+        self.allocator.free(self.yp);
+        self.allocator.free(self.up);
+        self.allocator.free(self.vp);
+    }
+
+    fn decodeTile(self: *AvDec, tile: Tile, dst: []u8) Error!void {
+        if (tile.codec != .h264) return Error.UnknownCodec;
+        if (tile.w != self.w or tile.h != self.h) return Error.SizeMismatch;
+        const uw: u32 = @intCast(self.w);
+        const uh: u32 = @intCast(self.h);
+        if (dst.len != @as(usize, uw) * uh * 4) return Error.SizeMismatch;
+        const n = sk_avdec_decode(self.handle, tile.payload.ptr, @intCast(tile.payload.len), self.w, self.h, self.yp.ptr, self.up.ptr, self.vp.ptr);
+        if (n != 1) return Error.Decode; // 0 = no frame yet, <0 = error
+        yuv.i420ToBgra(self.yp, self.up, self.vp, uw, uh, dst);
+    }
 };
 
 // ─── tests ──────────────────────────────────────────────────────
@@ -380,4 +441,45 @@ test "x264 backend encodes a keyframe Annex-B stream (when libx264 linked)" {
 
     // Wrong tile size is rejected.
     try t.expectError(Error.SizeMismatch, enc.encodeTile(32, 32, &px, false));
+}
+
+test "x264 encode → avcodec decode round-trips a frame (-Dvideo)" {
+    if (!have_video) return error.SkipZigTest;
+    const a = t.allocator;
+    const w = 64;
+    const h = 64;
+    var enc = try Encoder.initX264(a, w, h, 30);
+    defer enc.deinit();
+    var dec = try Decoder.initAvcodec(a, w, h);
+    defer dec.deinit();
+    try t.expectEqual(Codec.h264, enc.codec());
+
+    // Smooth grayscale gradient: neutral chroma + low frequency, so the
+    // lossy 4:2:0 H.264 round-trip stays close.
+    var px: [w * h * 4]u8 = undefined;
+    for (0..h) |yy| for (0..w) |xx| {
+        const o = (yy * w + xx) * 4;
+        const v: u8 = @truncate(40 + xx + yy);
+        px[o] = v;
+        px[o + 1] = v;
+        px[o + 2] = v;
+        px[o + 3] = 0xff;
+    };
+    const r = try enc.encodeTile(w, h, &px, true);
+    try t.expect(r.keyframe);
+
+    var dst: [w * h * 4]u8 = undefined;
+    try dec.decodeTile(.{ .codec = enc.codec(), .keyframe = r.keyframe, .x = 0, .y = 0, .w = w, .h = h, .seq = 0, .payload = r.bytes }, &dst);
+
+    // Lossy → compare by mean absolute error over RGB; alpha forced opaque.
+    var sum: u64 = 0;
+    for (0..w * h) |i| {
+        inline for (.{ 0, 1, 2 }) |ch| {
+            const dv: i32 = @as(i32, px[i * 4 + ch]) - @as(i32, dst[i * 4 + ch]);
+            sum += @abs(dv);
+        }
+        try t.expectEqual(@as(u8, 0xff), dst[i * 4 + 3]);
+    }
+    const mae = @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(w * h * 3));
+    try t.expect(mae < 15.0);
 }
