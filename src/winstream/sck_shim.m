@@ -470,9 +470,15 @@ static void apply_content(SketermSckCtx *c, SCShareableContent *content) {
 // client sends input in, so no coordinate translation on either end.
 
 static bool ax_role_draggable(CFStringRef role) {
+    // Non-interactive title-bar chrome: containers, plus the title label
+    // (AXStaticText) and the proxy / toolbar icons (AXImage). Those sit in
+    // the top strip and ARE draggable — dragging a window by its title is
+    // standard — so they must not be treated as interactive (which would
+    // forward the click to the app instead of moving the local window).
     return role && (CFEqual(role, CFSTR("AXGroup")) || CFEqual(role, CFSTR("AXWindow")) ||
                     CFEqual(role, CFSTR("AXSplitGroup")) || CFEqual(role, CFSTR("AXLayoutArea")) ||
-                    CFEqual(role, CFSTR("AXUnknown")));
+                    CFEqual(role, CFSTR("AXUnknown")) || CFEqual(role, CFSTR("AXStaticText")) ||
+                    CFEqual(role, CFSTR("AXImage")));
 }
 
 // Fill out[0]=ref_w, out[1]=ref_h, then up to cap rects of {x,y,w,h}.
