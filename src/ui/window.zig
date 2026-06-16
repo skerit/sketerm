@@ -180,6 +180,11 @@ pub const Window = struct {
     /// can carry SKETERM_PANE_ID.
     next_pane_id: u32 = 1,
     next_tab_id: u32 = 1,
+    /// Daemon's reason for the last failed `attachMux`, so the IPC /
+    /// `sketerm app` layer surfaces it ("no such session") instead of a
+    /// bare "DaemonError".
+    mux_attach_err: [192]u8 = undefined,
+    mux_attach_err_len: usize = 0,
     ipc: ?*ipc_server.Server = null,
     /// OSC 99 notifications awaiting a possible activation: token →
     /// originating pane + sanitized id (owned). Bounded ring — oldest
@@ -3725,11 +3730,20 @@ pub const Window = struct {
 
     pub fn attachMux(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane) !void {
         var conn = conn_in;
+        self.mux_attach_err_len = 0;
 
         const snap = blk: {
             errdefer conn.deinit();
             try conn.sendJson(.attach, .{ .name = name });
-            break :blk try conn.recvExpect(&.{.snapshot});
+            break :blk conn.recvExpect(&.{.snapshot}) catch |err| {
+                // Stash the daemon's reason while `conn` is still alive
+                // (the errdefer below frees it) so the caller surfaces it.
+                const m = conn.lastErr();
+                const n = @min(m.len, self.mux_attach_err.len);
+                @memcpy(self.mux_attach_err[0..n], m[0..n]);
+                self.mux_attach_err_len = n;
+                return err;
+            };
         };
         defer snap.deinit(self.allocator);
         const pane = try self.makeRemotePaneFromSnap(conn, name, host, snap.payload);
@@ -4233,8 +4247,14 @@ pub const Window = struct {
                 null;
             const conn = self.muxConnect(req.host) catch return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
             self.attachMux(conn, name, req.host, takeover) catch |err| {
-                var msg_buf: [128]u8 = undefined;
-                const msg = std.fmt.bufPrint(&msg_buf, "attach failed: {s}", .{@errorName(err)}) catch "attach failed";
+                // Prefer the daemon's own reason ("no such session", …)
+                // over the bare error name.
+                const detail = if (self.mux_attach_err_len > 0)
+                    self.mux_attach_err[0..self.mux_attach_err_len]
+                else
+                    @errorName(err);
+                var msg_buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "attach failed: {s}", .{detail}) catch "attach failed";
                 return ipc_protocol.writeErr(out, allocator, msg);
             };
             try ipc_protocol.writeOk(out, allocator, null, {});
