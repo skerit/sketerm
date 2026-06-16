@@ -24,6 +24,8 @@ const wire = @import("wire.zig");
 const protocol = @import("protocol.zig");
 const pipe = @import("pipe.zig");
 const pixcodec = @import("pixcodec.zig");
+const vcodec = @import("vcodec.zig");
+const build_options = @import("build_options");
 
 /// Fixed pc105/us xkb keymap (scope pin: layouts come later).
 /// Generated: `xkbcli compile-keymap --layout us --model pc105`.
@@ -146,6 +148,16 @@ const globals = [_]Global{
 
 const Pool = struct {
     bytes: std.ArrayList(u8) = .empty,
+    /// Lazily-created H.264 decoder for pool_vtile updates to this pool,
+    /// recreated when the tile dimensions change (build_options.video).
+    vdec: ?vcodec.Decoder = null,
+    vdec_w: i32 = 0,
+    vdec_h: i32 = 0,
+
+    fn deinit(self: *Pool, a: std.mem.Allocator) void {
+        self.bytes.deinit(a);
+        if (self.vdec) |*d| d.deinit();
+    }
 };
 
 const Buffer = struct {
@@ -261,6 +273,9 @@ pub const Compositor = struct {
     inbuf: std.ArrayList(u8) = .empty,
     objects: std.AutoHashMapUnmanaged(u32, *const protocol.Interface) = .empty,
     pools: std.AutoHashMapUnmanaged(u32, Pool) = .empty,
+    /// Scratch for a decoded video tile's BGRA before it's blitted into
+    /// the pool mirror (build_options.video).
+    vscratch: std.ArrayList(u8) = .empty,
     buffers: std.AutoHashMapUnmanaged(u32, Buffer) = .empty,
     surfaces: std.AutoHashMapUnmanaged(u32, Surface) = .empty,
     /// xdg_surface id → wl_surface id; xdg_toplevel id → wl_surface id.
@@ -309,8 +324,9 @@ pub const Compositor = struct {
         self.inbuf.deinit(a);
         self.objects.deinit(a);
         var pit = self.pools.valueIterator();
-        while (pit.next()) |p| p.bytes.deinit(a);
+        while (pit.next()) |p| p.deinit(a);
         self.pools.deinit(a);
+        self.vscratch.deinit(a);
         self.buffers.deinit(a);
         var sit = self.surfaces.valueIterator();
         while (sit.next()) |s| {
@@ -659,6 +675,32 @@ pub const Compositor = struct {
                 if (end > pool.bytes.items.len) return Error.Protocol;
                 pixcodec.decodeBody(upd.body, pool.bytes.items[upd.offset..end]) catch
                     return Error.Protocol;
+            },
+            .pool_vtile => if (comptime build_options.video) {
+                const vt = pipe.decodePoolVtile(payload) orelse return Error.Protocol;
+                const peeled = (vcodec.peelTile(vt.blob) catch return Error.Protocol) orelse return Error.Protocol;
+                const tile = peeled.tile;
+                if (tile.w <= 0 or tile.h <= 0) return Error.Protocol;
+                const pool = self.pools.getPtr(vt.pool) orelse return Error.Protocol;
+                const uw: usize = @intCast(tile.w);
+                const uh: usize = @intCast(tile.h);
+                // Per-pool decoder, recreated on a dimension change.
+                if (pool.vdec == null or pool.vdec_w != tile.w or pool.vdec_h != tile.h) {
+                    if (pool.vdec) |*d| d.deinit();
+                    pool.vdec = vcodec.Decoder.initAvcodec(self.allocator, tile.w, tile.h) catch return Error.Protocol;
+                    pool.vdec_w = tile.w;
+                    pool.vdec_h = tile.h;
+                }
+                try self.vscratch.resize(self.allocator, uw * uh * 4);
+                pool.vdec.?.decodeTile(tile, self.vscratch.items) catch return Error.Protocol;
+                // Blit the decoded BGRA into the pool mirror at offset,
+                // uw*4 bytes per row stepping by row_stride.
+                const stride: usize = vt.row_stride;
+                const base: usize = vt.offset;
+                if (stride < uw * 4 or base + (uh - 1) * stride + uw * 4 > pool.bytes.items.len) return Error.Protocol;
+                for (0..uh) |r| {
+                    @memcpy(pool.bytes.items[base + r * stride ..][0 .. uw * 4], self.vscratch.items[r * uw * 4 ..][0 .. uw * 4]);
+                }
             },
             .pool_destroy => {
                 if (payload.len >= 4) {
