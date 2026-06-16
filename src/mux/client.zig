@@ -76,7 +76,7 @@ pub const Conn = struct {
     fn helloProbe(allocator: std.mem.Allocator, conn_in: Conn) !Conn {
         var conn = conn_in;
         errdefer conn.deinit();
-        try conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION });
+        try conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video });
         const w = try conn.recvExpect(&.{.welcome});
         w.deinit(allocator);
         return conn;
@@ -181,7 +181,7 @@ pub const Conn = struct {
         var conn = try spawnOverSocketpair(allocator, mux_bin, &argv2);
         errdefer conn.deinit();
 
-        conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION }) catch return error.SshTransportFailed;
+        conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video }) catch return error.SshTransportFailed;
         const w = conn.recvExpect(&.{.welcome}) catch return error.SshTransportFailed;
         w.deinit(allocator);
         return conn;
@@ -261,7 +261,7 @@ pub const Conn = struct {
         // binary + daemon all came up before we hand the conn out.
         // Bound the welcome wait so a stalled banner surfaces as a
         // retryable error instead of hanging the blocking read forever.
-        conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION }) catch return error.SshTransportFailed;
+        conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video }) catch return error.SshTransportFailed;
         try waitReadable(conn.fd, 20_000);
         const w = conn.recvExpect(&.{.welcome}) catch return error.SshTransportFailed;
         w.deinit(allocator);

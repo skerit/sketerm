@@ -149,6 +149,10 @@ const Client = struct {
     /// Protocol version the client announced in hello. Channels are
     /// only opened toward proto >= 2 clients.
     proto: u32 = 1,
+    /// The client advertised it can decode the video codec (hello
+    /// `video`). Gates whether forwarded surfaces route through the lossy
+    /// video path — never send a tile a client can't decode.
+    video: bool = false,
 
     fn deinit(self: *Client) void {
         _ = c.close(self.fd);
@@ -695,11 +699,12 @@ pub const Daemon = struct {
     fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         switch (frame.ftype) {
             .hello => {
-                const HelloReq = struct { proto: u32 = 1 };
+                const HelloReq = struct { proto: u32 = 1, video: bool = false };
                 if (std.json.parseFromSlice(HelloReq, self.allocator, frame.payload, .{
                     .ignore_unknown_fields = true,
                 })) |p| {
                     cl.proto = p.value.proto;
+                    cl.video = p.value.video;
                     p.deinit();
                 } else |_| {}
                 cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION });
@@ -825,6 +830,10 @@ pub const Daemon = struct {
             .client = cl,
             .native = native,
         };
+        // Route this app's surfaces through the video coder only if the
+        // target client advertised it can decode (and we can encode —
+        // videoCommit is comptime-gated on build_options.video).
+        native.wants_video = cl.video;
         self.next_chan_id += 1;
         self.channels.append(self.allocator, ch) catch {
             ch.deinit();
