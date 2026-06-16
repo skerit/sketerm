@@ -12,6 +12,8 @@ const c = @import("c.zig").c;
 const cast = @import("util/cast.zig");
 const proto = @import("winstream/proto.zig");
 const rw = @import("remote_window.zig");
+const vcodec = @import("wlhost/vcodec.zig");
+const build_options = @import("build_options");
 
 pub const WsHost = struct {
     allocator: std.mem.Allocator,
@@ -19,6 +21,8 @@ pub const WsHost = struct {
     inbuf: std.ArrayList(u8) = .empty,
     out: std.ArrayList(u8) = .empty,
     zbuf: std.ArrayList(u8) = .empty,
+    /// Scratch for a decoded video tile's BGRA before blitting (-Dvideo).
+    vscratch: std.ArrayList(u8) = .empty,
     dead: bool = false,
     on_flush: ?*const fn (ctx: ?*anyopaque) void = null,
     flush_ctx: ?*anyopaque = null,
@@ -55,6 +59,12 @@ pub const WsHost = struct {
         /// present re-wraps it as a texture — so a damaged-rect source
         /// only has to ship the rect, not the whole window.
         backing: std.ArrayList(u8) = .empty,
+        /// Lazily-created video decoder for win_vtile updates, recreated
+        /// on a dimension/codec change (build_options.video).
+        vdec: ?vcodec.Decoder = null,
+        vdec_w: i32 = 0,
+        vdec_h: i32 = 0,
+        vdec_codec: vcodec.Codec = .stub,
 
         /// Is (x,y) — picture-local — inside a draggable region? Rects are
         /// in point space; scale to the current frame size so the test
@@ -129,6 +139,7 @@ pub const WsHost = struct {
             w.*.cancelOpaqueResize();
             self.allocator.free(w.*.drag_rects);
             w.*.backing.deinit(self.allocator);
+            if (w.*.vdec) |*d| d.deinit();
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-winapp", null);
             c.gtk_window_destroy(w.*.window);
             self.allocator.destroy(w.*);
@@ -137,6 +148,7 @@ pub const WsHost = struct {
         self.inbuf.deinit(self.allocator);
         self.out.deinit(self.allocator);
         self.zbuf.deinit(self.allocator);
+        self.vscratch.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -182,6 +194,26 @@ pub const WsHost = struct {
                 const p = (proto.decodePatchC(u.payload, &self.zbuf, self.allocator) catch return error.Protocol) orelse return error.Protocol;
                 self.showPatch(p);
             },
+            .win_vtile => if (comptime build_options.video) {
+                const wv = proto.decodeWinVtile(u.payload) orelse return error.Protocol;
+                const peeled = (vcodec.peelTile(wv.blob) catch return error.Protocol) orelse return error.Protocol;
+                const tile = peeled.tile;
+                if (tile.w <= 0 or tile.h <= 0) return error.Protocol;
+                const win = self.windows.get(wv.win) orelse return;
+                if (win.backing.items.len == 0) return; // need a base frame first
+                if (win.vdec == null or win.vdec_w != tile.w or win.vdec_h != tile.h or win.vdec_codec != tile.codec) {
+                    if (win.vdec) |*d| d.deinit();
+                    win.vdec = vcodec.Decoder.initAvcodec(self.allocator, tile.w, tile.h, tile.codec) catch return error.Protocol;
+                    win.vdec_w = tile.w;
+                    win.vdec_h = tile.h;
+                    win.vdec_codec = tile.codec;
+                }
+                const need: usize = @as(usize, @intCast(tile.w)) * @as(usize, @intCast(tile.h)) * 4;
+                try self.vscratch.resize(self.allocator, need);
+                win.vdec.?.decodeTile(tile, self.vscratch.items) catch return error.Protocol;
+                rw.blitRect(win.backing.items, win.w, win.h, self.vscratch.items, tile.x, tile.y, tile.w, tile.h);
+                win.present();
+            },
             .win_title => {
                 if (u.payload.len < 4) return error.Protocol;
                 const id = std.mem.readInt(u32, u.payload[0..4], .little);
@@ -198,6 +230,7 @@ pub const WsHost = struct {
                 win.cancelOpaqueResize();
                 self.allocator.free(win.drag_rects);
                 win.backing.deinit(self.allocator);
+                if (win.vdec) |*d| d.deinit();
                 _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-winapp", null);
                 c.gtk_window_destroy(win.window);
                 self.allocator.destroy(win);
