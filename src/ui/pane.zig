@@ -23,6 +23,29 @@ const Terminal = @import("../terminal.zig").Terminal;
 const DrainHandle = @import("../terminal.zig").DrainHandle;
 const input = @import("input.zig");
 const a11y = @import("../a11y/atspi.zig");
+const platform = @import("../util/platform.zig");
+/// macOS NSAccessibility bridge. GTK4 has no NSAccessibility backend
+/// (only AT-SPI, unavailable on macOS), so on macOS the pane's text
+/// reaches VoiceOver by attaching an element to the window's GdkMacos
+/// content NSView — `a11y` (atspi) does nothing there. On Linux this is
+/// a no-op stub so nothing references the macOS-only shim/externs.
+const nsax = if (platform.is_macos)
+    @import("../a11y/nsax.zig")
+else
+    struct {
+        pub fn contentView(_: *anyopaque) ?*anyopaque {
+            return null;
+        }
+        pub fn attach(_: *anyopaque, _: *Terminal) ?*anyopaque {
+            return null;
+        }
+        pub fn detach(_: *anyopaque, _: *anyopaque) void {}
+        pub fn setFrameInParent(_: *anyopaque, _: f64, _: f64, _: f64, _: f64) void {}
+        pub fn notifyChanged(_: *anyopaque) void {}
+        pub fn selfCheck(_: *anyopaque, _: *anyopaque) c_int {
+            return 0;
+        }
+    };
 const menu = @import("menu.zig");
 const clipboard = @import("clipboard.zig");
 const MouseAction = @import("../config.zig").MouseAction;
@@ -53,6 +76,13 @@ pub const Pane = struct {
     id: u32 = 0,
     area: *c.GtkGLArea,
     terminal: *Terminal,
+    /// macOS only: the SketermTermAXElement exposing this pane's text to
+    /// VoiceOver, and the GdkMacos content NSView it is attached to.
+    /// Attached on map, detached on unmap/close. Opaque `NSObject *`.
+    ax_element: ?*anyopaque = null,
+    ax_content_view: ?*anyopaque = null,
+    /// One-shot SKETERM_A11Y_SELFCHECK reporting guard.
+    ax_selfcheck_done: bool = false,
     atlas: ?*Atlas = null,
     grid_pass: GridPass,
     cell_pass: CellPass,
@@ -485,6 +515,9 @@ pub const Pane = struct {
         // tick: an animating shader self-removes it while unmapped, so
         // nothing else would resume the animation.
         _ = c.g_signal_connect_data(area_widget, "map", @ptrCast(&onAreaMap), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        // macOS: (de)attach the VoiceOver element as the pane's window
+        // backing comes and goes (no-op signal handler on Linux).
+        _ = c.g_signal_connect_data(area_widget, "unmap", @ptrCast(&onAreaUnmap), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
         return self;
     }
@@ -637,6 +670,9 @@ pub const Pane = struct {
     }
 
     pub fn deinit(self: *Pane) void {
+        // Defensive: unmap normally detaches first, but a pane torn down
+        // while still mapped must not leave a dangling AX child.
+        detachA11y(self);
         self.grid_pass.deinit();
         self.cell_pass.deinit();
         self.image_pass.deinit();
@@ -1421,8 +1457,76 @@ fn onRenderRequest(ctx: ?*anyopaque) void {
     c.gtk_gl_area_queue_render(@ptrCast(self.area));
     // Nudge AT clients (Orca/braille) that the caret/contents may have
     // moved. A no-op cost when no screen reader is attached, since GTK only
-    // activates its AT-SPI backend on demand.
-    a11y.notifyChanged(@ptrCast(self.area));
+    // activates its AT-SPI backend on demand. On macOS GTK has no
+    // NSAccessibility backend, so poke our own element instead.
+    if (platform.is_macos) {
+        if (self.ax_element) |el| {
+            nsax.notifyChanged(el);
+            updateA11yFrame(self);
+            selfCheckA11y(self);
+        }
+    } else {
+        a11y.notifyChanged(@ptrCast(self.area));
+    }
+}
+
+// ── macOS NSAccessibility attachment ─────────────────────────────────
+// GTK4 exposes no NSAccessibility, so reach the window's GdkMacos
+// content NSView and add a SketermTermAXElement for this pane's text.
+
+/// Attach the pane's accessibility element to the current window's
+/// content view (idempotent). Called on map — once realized + mapped
+/// the GdkMacosSurface has its NSWindow.
+fn attachA11y(self: *Pane) void {
+    if (!platform.is_macos) return;
+    if (self.ax_element != null) return;
+    const native = c.gtk_widget_get_native(@ptrCast(self.area)) orelse return;
+    const surface = c.gtk_native_get_surface(native) orelse return;
+    const cv = nsax.contentView(@ptrCast(surface)) orelse return;
+    const el = nsax.attach(cv, self.terminal) orelse return;
+    self.ax_content_view = cv;
+    self.ax_element = el;
+    self.ax_selfcheck_done = false;
+    updateA11yFrame(self);
+}
+
+/// Detach + release the element (on unmap, reparent, or close). The
+/// next map re-attaches against the (possibly new) window.
+fn detachA11y(self: *Pane) void {
+    if (!platform.is_macos) return;
+    const el = self.ax_element orelse return;
+    if (self.ax_content_view) |cv| nsax.detach(cv, el);
+    self.ax_element = null;
+    self.ax_content_view = null;
+}
+
+/// Re-point the element's frame at the pane's on-screen rect (GTK
+/// widget coords relative to the window; the shim handles AppKit's flip).
+fn updateA11yFrame(self: *Pane) void {
+    if (!platform.is_macos) return;
+    const el = self.ax_element orelse return;
+    const native = c.gtk_widget_get_native(@ptrCast(self.area)) orelse return;
+    var r: c.graphene_rect_t = undefined;
+    const native_widget: *c.GtkWidget = @ptrCast(@alignCast(native));
+    if (c.gtk_widget_compute_bounds(@ptrCast(self.area), native_widget, &r) == 0) return;
+    nsax.setFrameInParent(el, r.origin.x, r.origin.y, r.size.width, r.size.height);
+}
+
+/// SKETERM_A11Y_SELFCHECK=1: log once whether a VoiceOver client would
+/// find this pane's text via window→contentView→child. No TCC needed.
+fn selfCheckA11y(self: *Pane) void {
+    if (!platform.is_macos) return;
+    if (self.ax_selfcheck_done) return;
+    if (c.getenv("SKETERM_A11Y_SELFCHECK") == null) return;
+    const cv = self.ax_content_view orelse return;
+    const el = self.ax_element orelse return;
+    // Retry across renders until the screen has content (bit2), so a
+    // first render that beats the shell prompt isn't a false FAIL.
+    const bits = nsax.selfCheck(cv, el);
+    if (bits == 7) {
+        self.ax_selfcheck_done = true;
+        std.debug.print("A11Y-SELFCHECK: pane={d} bits={d} (PASS)\n", .{ self.id, bits });
+    }
 }
 
 fn onActivityEvent(ctx: ?*anyopaque) void {
@@ -1736,6 +1840,17 @@ fn shaderAnimates(self: *Pane) bool {
 fn onAreaMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
     if (shaderAnimates(self)) self.updateShaderTick();
+    // The window's GdkMacosSurface now has its NSWindow; expose the
+    // pane's text to VoiceOver. No-op on Linux.
+    attachA11y(self);
+}
+
+fn onAreaUnmap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Pane, user);
+    // Reparent (tab move / split) unmaps before unrealizing, and a
+    // closed pane unmaps too — drop the AX element from the old window's
+    // content view so a later map re-attaches against the right one.
+    detachA11y(self);
 }
 
 fn paneMenuSink(ctx: ?*anyopaque, action: menu.Action) void {
