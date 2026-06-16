@@ -82,6 +82,9 @@ echo "› (re)loading agent in your GUI session"
 launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$UID_NUM" "$PLIST"
 
-AUTH=$(codesign -dvv "$DEST" 2>&1 | awk -F= '/Authority/{print $2; exit}')
+# NB: no `awk … exit` here — closing the pipe early makes codesign take
+# SIGPIPE, which `set -o pipefail` turns into a spurious 141 exit AFTER a
+# successful reload (confusing when run via the GUI runner). Read it all.
+AUTH=$(codesign -dvv "$DEST" 2>&1 | awk -F= '/Authority/ && !seen {print $2; seen=1}')
 echo "✓ deployed — signed by '${AUTH:-?}', agent $LABEL running in gui/$UID_NUM"
 echo "  log: /tmp/sketerm-mux.log"
