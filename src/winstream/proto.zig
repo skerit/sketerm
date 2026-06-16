@@ -45,6 +45,11 @@ pub const Tag = enum(u8) {
     /// it into the window's backing buffer at (x,y) — the bandwidth win
     /// once a source declares damage (Phase 1 / macOS SCK dirty rects).
     win_patch_c = 8,
+    /// Video-coded window region (the LOSSY path for hot windows): u32
+    /// win, then an opaque wlhost/vcodec.zig tile blob (which carries its
+    /// own x/y/w/h). The receiver decodes it and blits into the window's
+    /// backing buffer — winstream's counterpart to the Wayland pool_vtile.
+    win_vtile = 9,
     // client → agent
     /// u32 win, u32 evdev key, u8 pressed, u32 mods (X11 order).
     input_key = 16,
@@ -304,6 +309,26 @@ pub fn decodePatchC(payload: []const u8, scratch: *std.ArrayList(u8), scratch_a:
     return .{ .win = pc.win, .x = pc.x, .y = pc.y, .w = pc.w, .h = pc.h, .pixels = scratch.items };
 }
 
+// ── video-coded window region (opaque vcodec tile) ──────────────
+
+/// Emit a video-coded region of window `win`. `blob` is an opaque
+/// wlhost/vcodec.zig tile (appendTile output) carrying the rect + codec.
+pub fn appendWinVtile(out: *std.ArrayList(u8), a: std.mem.Allocator, win: u32, blob: []const u8) !void {
+    var hdr: [header_size + 4]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(4 + blob.len + 1), .little);
+    hdr[4] = @intFromEnum(Tag.win_vtile);
+    std.mem.writeInt(u32, hdr[5..9], win, .little);
+    try out.appendSlice(a, &hdr);
+    try out.appendSlice(a, blob);
+}
+
+pub const WinVtile = struct { win: u32, blob: []const u8 };
+
+pub fn decodeWinVtile(p: []const u8) ?WinVtile {
+    if (p.len < 4) return null;
+    return .{ .win = std.mem.readInt(u32, p[0..4], .little), .blob = p[4..] };
+}
+
 // ── draggable-region payload (agent → client) ───────────────────
 
 /// Plenty for a title strip's draggable runs; the daemon caps here too.
@@ -493,6 +518,20 @@ test "win_frame_c round-trips through the shared codec" {
     var bad = u.unit.payload[0 .. u.unit.payload.len - 1];
     try t.expectEqual(@as(?Frame, null), try decodeFrameC(bad, &scratch, a));
     _ = &bad;
+}
+
+test "win_vtile carries win id + an opaque video blob" {
+    const a = t.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const blob = "opaque-vcodec-tile";
+    try appendWinVtile(&out, a, 7, blob);
+    const u = (try peelUnit(out.items)).?;
+    try t.expectEqual(Tag.win_vtile, u.unit.tag);
+    try t.expectEqual(out.items.len, u.consumed);
+    const wv = decodeWinVtile(u.unit.payload).?;
+    try t.expectEqual(@as(u32, 7), wv.win);
+    try t.expectEqualStrings(blob, wv.blob);
 }
 
 test "win_patch_c carries rect coords + a decodable body" {
