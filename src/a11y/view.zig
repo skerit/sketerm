@@ -30,11 +30,24 @@ pub const Snapshot = struct {
     line_starts: []u32,
     /// Byte offset of each character; len == n_chars + 1 (last = text.len).
     char_to_byte: []u32,
+    /// UTF-16 code-unit offset of each character; len == n_chars + 1 (last =
+    /// total UTF-16 length). AT-SPI ignores this and works in codepoints;
+    /// the macOS NSAccessibility bridge needs it because NSRange is in
+    /// UTF-16 units (astral chars — emoji — count as 2; BMP, incl. Nerd-font
+    /// glyphs, as 1). Pure arithmetic, so it stays in the neutral core.
+    char_to_utf16: []u32,
 
     pub fn deinit(self: *Snapshot) void {
         self.allocator.free(self.text);
         self.allocator.free(self.line_starts);
         self.allocator.free(self.char_to_byte);
+        self.allocator.free(self.char_to_utf16);
+    }
+
+    /// UTF-16 code-unit offset of character `c` (clamped). For mapping the
+    /// codepoint offsets used here onto NSRange on macOS.
+    pub fn utf16At(self: *const Snapshot, c: u32) u32 {
+        return self.char_to_utf16[@min(c, self.n_chars)];
     }
 
     /// UTF-8 bytes for the character range [c0, c1), clamped.
@@ -93,12 +106,15 @@ pub fn build(screen: *const Screen, allocator: std.mem.Allocator) !Snapshot {
     errdefer text.deinit(allocator);
     var c2b: std.ArrayList(u32) = .empty;
     errdefer c2b.deinit(allocator);
+    var c2u16: std.ArrayList(u32) = .empty;
+    errdefer c2u16.deinit(allocator);
 
     const nrows: usize = screen.rows;
     var line_starts = try allocator.alloc(u32, nrows);
     errdefer allocator.free(line_starts);
 
     var n_chars: u32 = 0;
+    var n_utf16: u32 = 0;
     var caret: u32 = 0;
 
     var r: usize = 0;
@@ -131,8 +147,10 @@ pub fn build(screen: *const Screen, allocator: std.mem.Allocator) !Snapshot {
                 break :blk 1;
             };
             try c2b.append(allocator, @intCast(text.items.len));
+            try c2u16.append(allocator, n_utf16);
             try text.appendSlice(allocator, enc[0..n]);
             n_chars += 1;
+            n_utf16 += if (cp >= 0x10000) 2 else 1; // surrogate pair for astral
             row_chars += 1;
         }
 
@@ -144,14 +162,17 @@ pub fn build(screen: *const Screen, allocator: std.mem.Allocator) !Snapshot {
         // Newline between rows (not after the last row).
         if (r + 1 < nrows) {
             try c2b.append(allocator, @intCast(text.items.len));
+            try c2u16.append(allocator, n_utf16);
             try text.append(allocator, '\n');
             n_chars += 1;
+            n_utf16 += 1;
         }
     }
 
-    // Sentinel: char_to_byte[n_chars] == text length, so byteRange of the
-    // final char (and an end-of-text caret) is well-defined.
+    // Sentinel: index n_chars holds the end (text length / total UTF-16 len),
+    // so a range ending at the last char (or an end-of-text caret) is defined.
     try c2b.append(allocator, @intCast(text.items.len));
+    try c2u16.append(allocator, n_utf16);
 
     return .{
         .allocator = allocator,
@@ -160,6 +181,7 @@ pub fn build(screen: *const Screen, allocator: std.mem.Allocator) !Snapshot {
         .caret = @min(caret, n_chars),
         .line_starts = line_starts,
         .char_to_byte = try c2b.toOwnedSlice(allocator),
+        .char_to_utf16 = try c2u16.toOwnedSlice(allocator),
     };
 }
 
@@ -215,4 +237,27 @@ test "snapshot: empty screen is well-formed" {
     // Two blank rows -> a single newline between them, nothing else.
     try testing.expectEqualStrings("\n", snap.text);
     try testing.expectEqual(@as(u32, @intCast(snap.text.len)), snap.char_to_byte[snap.n_chars]);
+}
+
+test "snapshot: UTF-16 offsets count astral chars as surrogate pairs" {
+    const testing = std.testing;
+    var pool = try Pool.init(testing.allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(testing.allocator, &pool, 6, 1);
+    defer screen.deinit();
+
+    // "a😀b": BMP 'a' = 1 unit, U+1F600 = 2 units (surrogate pair), 'b' = 1.
+    screen.apply(.{ .print = 'a' });
+    screen.apply(.{ .print = 0x1F600 });
+    screen.apply(.{ .print = 'b' });
+
+    var snap = try build(screen, testing.allocator);
+    defer snap.deinit();
+
+    // 3 codepoints; char_to_utf16 maps each char's UTF-16 start offset.
+    try testing.expectEqual(@as(u32, 3), snap.n_chars);
+    try testing.expectEqual(@as(u32, 0), snap.utf16At(0)); // 'a'
+    try testing.expectEqual(@as(u32, 1), snap.utf16At(1)); // emoji starts at 1
+    try testing.expectEqual(@as(u32, 3), snap.utf16At(2)); // 'b' after the pair
+    try testing.expectEqual(@as(u32, 4), snap.utf16At(3)); // total UTF-16 length
 }
