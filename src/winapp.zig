@@ -53,6 +53,17 @@ pub const WsHost = struct {
         /// its release, so the release isn't forwarded either. Mirrors
         /// wlapp.zig's fwd_press for the host-resize band.
         fwd_press: bool = true,
+        /// A primary press landed in a drag region; we're deciding click
+        /// vs window-drag. The WM move is deferred until the pointer moves
+        /// past a threshold, so a plain CLICK forwards to the app (so
+        /// title-bar buttons work) instead of being eaten as a 0-distance
+        /// drag. Resolved on motion (→ move) or release (→ forward click).
+        pending_drag: bool = false,
+        press_x: f64 = 0,
+        press_y: f64 = 0,
+        press_btn: c_uint = 0,
+        /// The click gesture, so a deferred move can claim its sequence.
+        click_gesture: ?*anyopaque = null,
 
         /// Persistent BGRA backing (w*h*4). Full frames fill it,
         /// damaged patches (win_patch_c) blit into it, and every
@@ -307,6 +318,7 @@ pub const WsHost = struct {
         _ = c.g_signal_connect_data(@ptrCast(motion), "motion", @ptrCast(&onMotion), win, null, 0);
         c.gtk_widget_add_controller(picture, motion);
         const click = c.gtk_gesture_click_new();
+        win.click_gesture = @ptrCast(click);
         c.gtk_gesture_single_set_button(@ptrCast(click), 0);
         _ = c.g_signal_connect_data(@ptrCast(click), "pressed", @ptrCast(&onPress), win, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(click), "released", @ptrCast(&onRelease), win, null, 0);
@@ -344,36 +356,63 @@ pub const WsHost = struct {
         return 1;
     }
 
+    /// Squared pointer travel (px²) past which a title-bar press becomes a
+    /// window-move rather than a click.
+    const drag_threshold_sq: f64 = 5 * 5;
+
     fn onMotion(_: ?*c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(Win, user).sendPtr(0, x, y, 0);
+        const win = cast.userData(Win, user);
+        if (win.pending_drag) {
+            // Deciding click vs window-drag: only once the pointer travels
+            // past the threshold do we hand the move to the WM. Until then
+            // suppress motion forwarding (it's a potential window drag, not
+            // app input).
+            const dx = x - win.press_x;
+            const dy = y - win.press_y;
+            if (dx * dx + dy * dy > drag_threshold_sq) {
+                win.pending_drag = false;
+                // Claim the gesture so it resolves cleanly when the WM takes
+                // the grab (the gesture then never sees the release).
+                if (win.click_gesture) |g| _ = c.gtk_gesture_set_state(@ptrCast(g), c.GTK_EVENT_SEQUENCE_CLAIMED);
+                rw.beginMove(win.window, win.press_btn, x, y);
+            }
+            return;
+        }
+        win.sendPtr(0, x, y, 0);
     }
 
     fn onPress(g: ?*c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(g));
-        // A primary press on a title-bar region drags THIS window via the
-        // window manager — don't forward it, or the Mac moves its own
-        // window and ours stays put.
+        // A primary press on a title-bar region MIGHT start a local
+        // window-move — but defer that until the pointer actually moves
+        // (see onMotion). A press+release with no movement is a real click
+        // and is forwarded (onRelease), so title-bar buttons work.
         if (btn == 1 and win.inDragRegion(x, y)) {
+            win.pending_drag = true;
+            win.press_x = x;
+            win.press_y = y;
+            win.press_btn = btn;
             win.fwd_press = false;
-            // Claim the sequence BEFORE begin_move — as GtkWindowHandle
-            // does. The interactive move hands the pointer grab to the
-            // compositor, so this gesture never sees the button-release;
-            // claiming resolves the sequence cleanly so it resets and
-            // keeps firing for later clicks. Without it the gesture stays
-            // stuck on button 1 and every subsequent click is swallowed.
-            _ = c.gtk_gesture_set_state(@ptrCast(g), c.GTK_EVENT_SEQUENCE_CLAIMED);
-            rw.beginMove(win.window, btn, x, y);
             return;
         }
+        win.pending_drag = false;
         win.fwd_press = true;
         win.sendPtr(1, x, y, btn);
     }
 
     fn onRelease(g: ?*c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
-        if (!win.fwd_press) return; // press began a local move, not app input
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(g));
+        if (win.pending_drag) {
+            // Released without dragging → it was a click on title-bar
+            // chrome (button/title). Forward the whole click to the app.
+            win.pending_drag = false;
+            win.sendPtr(1, win.press_x, win.press_y, win.press_btn);
+            win.sendPtr(2, x, y, btn);
+            return;
+        }
+        if (!win.fwd_press) return; // a window-move consumed the press
         win.sendPtr(2, x, y, btn);
     }
 
