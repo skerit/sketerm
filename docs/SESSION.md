@@ -5829,3 +5829,44 @@ routing + mixed lossless/video frames). Design: docs/proposal-phase4-video.md.
 617 tests (churn/content/yuv cases + the x264 keyframe-encode test, which
 skips without -Dvideo and passes under it), GUI build, smoke-mux,
 mux-portable static — all green.
+
+## 2026-06-16: Wayland lossy-video path end-to-end (Phase 4, x264 slice)
+
+The full hot-region video path now works end-to-end under `-Dvideo`,
+both sides built with it. Everything is comptime-off otherwise, so
+default builds and `mux-portable` are byte-identical and lossless.
+
+- **Carrier**: `pipe.zig` `pool_vtile` = {pool, offset, row_stride} + an
+  opaque vcodec tile blob. The receiver decodes it into the pool mirror
+  at the same destination `pool_update_c` fills — video and lossless
+  regions composite identically.
+- **Daemon send** (`daemon.zig` `videoCommit`): per-surface churn +
+  content classifier; a HOT + photographic surface encodes its whole
+  frame via x264 (vendor/x264_shim.c) → `pool_vtile`, else lossless.
+- **Decoder**: `vendor/avdec_shim.c` wraps libavcodec H.264 software
+  decode (single-thread + LOW_DELAY → immediate; accepts full-range
+  YUVJ420P); `vcodec` avcodec backend → I420 → yuv.zig → BGRA. x264↔
+  avcodec round-trip verified, mean abs error 0.62.
+- **Compositor receive** (`compositor.zig`): decodes `pool_vtile` (a
+  per-pool decoder, recreated on dim change) and blits into the pool
+  mirror.
+- **Negotiation**: the client advertises `video` in its hello; the
+  daemon sets `Native.wants_video` per forwarding channel. A surface
+  routes to video ONLY when the target client can decode AND the daemon
+  can encode — never sending an undecodable tile. Defaults keep it off.
+- **Decoder strategy**: software libavcodec now; VAAPI when present is a
+  later hwaccel optimization (decode-everywhere via ffmpeg is the
+  baseline, not a lossless fallback).
+
+Build: `-Dvideo` dynamically links system x264 + libavcodec/avutil on
+native builds (declared package deps); the musl-portable daemon omits
+them and stays static/lossless.
+
+619 tests under -Dvideo (617 + the 2 x264/round-trip tests; default
+skips those), GUI default + -Dvideo, smoke-mux default + -Dvideo,
+mux-portable static — all green.
+
+Remaining Phase 4 refinements: VAAPI hwaccel, AV1 (SVT-AV1+dav1d) behind
+the same backend, tile-grid encode (vs whole-surface), UDP keyframe-
+request/loss handling, and a winstream (macOS) video path. Phase 5
+(dmabuf) is a separate track.
