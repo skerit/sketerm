@@ -5775,3 +5775,26 @@ temporal coder (Phase 4) can be aimed only where it pays off.
 604 tests (incl. 6 churn cases: threshold ramp, one-shot stays cold,
 hot cools down, mixed coverage, OOB/empty safety, resize resets), GUI
 build, smoke-mux, mux-portable green.
+
+## 2026-06-16: vcodec — video-tile layer foundation (Phase 4 step 1)
+
+The lossy/temporal counterpart to pixcodec, for HOT regions. Design in
+`docs/proposal-phase4-video.md` (untracked); decision is codec behind a
+swappable backend, x264-first then AV1 (royalty-free), hardware
+opportunistic, AV2 once it matures.
+
+- **`src/wlhost/vcodec.zig`** — `Codec` enum (stub/h264/av1); a
+  length-prefixed tile wire (`appendTile`/`peelTile`:
+  codec/keyframe/x/y/w/h/seq + opaque payload, split-resilient like the
+  other unit streams); `Encoder`/`Decoder` tagged-union backends (the
+  winstream `Source`-style swap) with a `stub` raw-passthrough backend.
+  `seq`/`keyframe` already carry the UDP loss-recovery story.
+- **Stub-first**, so the whole transport → decode → composite path is
+  exercised with no codec linked — x264/AV1/hardware become new backend
+  variants. Not yet wired into the daemon/receivers (that's step 2:
+  churn routing + carrier units + mixed lossless/video composite + a
+  content signal so text stays lossless).
+
+609 tests (5 vcodec: wire round-trip + split peeling, malformed/too-long
+rejection, stub encode→wire→decode, wrong-codec/size guards), GUI build,
+smoke-mux, mux-portable green.
