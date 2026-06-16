@@ -23,6 +23,14 @@ const X264Impl = if (have_video) X264 else void;
 const AvEncImpl = if (have_video) AvEnc else void;
 const AvDecImpl = if (have_video) AvDec else void;
 
+/// VideoToolbox H.264 encoder (build_options.vtenc — native macOS only).
+/// The Mac-native encode path: hardware H.264 with NO libx264/libavcodec
+/// dependency, so the daemon can produce video tiles a `-Dvideo` client
+/// decodes (avdec) without the daemon itself linking the codec libs.
+/// Independent of `have_video`: a Mac daemon can have vtenc without video.
+const have_vtenc = build_options.vtenc;
+const VtImpl = if (have_vtenc) Vt else void;
+
 /// Codec → the int the C shims use (avdec/avenc): 0 = H.264, 1 = AV1.
 fn shimCodec(codec: Codec) c_int {
     return switch (codec) {
@@ -121,6 +129,7 @@ pub const Encoder = union(enum) {
     stub: Stub,
     x264: X264Impl,
     av1: AvEncImpl,
+    vtoolbox: VtImpl,
 
     pub fn initStub(allocator: std.mem.Allocator) Encoder {
         return .{ .stub = .{ .allocator = allocator } };
@@ -139,11 +148,20 @@ pub const Encoder = union(enum) {
         return Error.Unsupported;
     }
 
+    /// Open a fixed-size VideoToolbox H.264 encoder (native macOS). Emits
+    /// the SAME `.h264` Annex-B wire codec as x264, so any avdec client
+    /// decodes it. Unsupported when vtenc isn't linked.
+    pub fn initVtoolbox(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32) !Encoder {
+        if (comptime have_vtenc) return .{ .vtoolbox = try Vt.init(allocator, w, h, fps) };
+        return Error.Unsupported;
+    }
+
     pub fn deinit(self: *Encoder) void {
         switch (self.*) {
             .stub => |*s| s.deinit(),
             .x264 => |*s| if (comptime have_video) s.deinit(),
             .av1 => |*s| if (comptime have_video) s.deinit(),
+            .vtoolbox => |*s| if (comptime have_vtenc) s.deinit(),
         }
     }
 
@@ -152,6 +170,7 @@ pub const Encoder = union(enum) {
             .stub => .stub,
             .x264 => .h264,
             .av1 => .av1,
+            .vtoolbox => .h264, // VideoToolbox emits H.264 — same wire codec
         };
     }
 
@@ -164,6 +183,7 @@ pub const Encoder = union(enum) {
             .stub => |*s| s.encodeTile(w, h, pixels, force_keyframe),
             .x264 => |*s| if (comptime have_video) s.encodeTile(w, h, pixels, force_keyframe) else Error.Unsupported,
             .av1 => |*s| if (comptime have_video) s.encodeTile(w, h, pixels, force_keyframe) else Error.Unsupported,
+            .vtoolbox => |*s| if (comptime have_vtenc) s.encodeTile(w, h, pixels, force_keyframe) else Error.Unsupported,
         };
     }
 };
@@ -218,6 +238,64 @@ const X264 = struct {
         var is_kf: c_int = 0;
         const n = sk_x264_encode(self.handle, self.yp.ptr, self.up.ptr, self.vp.ptr, if (force_keyframe) 1 else 0, &out_ptr, &is_kf);
         if (n <= 0) return Error.X264; // zerolatency should never buffer
+        self.out.clearRetainingCapacity();
+        try self.out.appendSlice(self.allocator, out_ptr[0..@intCast(n)]);
+        return .{ .keyframe = is_kf != 0, .bytes = self.out.items };
+    }
+};
+
+/// VideoToolbox H.264 backend (vendor/vtenc_shim.c) — the macOS-native
+/// hardware encoder. Same shape as X264 (BGRA→I420 via yuv.zig, then
+/// encode), and emits the SAME Annex-B `.h264` stream the avdec decoder
+/// reads. Needs no libx264/libavcodec. Compiled only when
+/// build_options.vtenc is set (native macOS).
+const Vt = struct {
+    allocator: std.mem.Allocator,
+    handle: ?*anyopaque,
+    w: i32,
+    h: i32,
+    yp: []u8,
+    up: []u8,
+    vp: []u8,
+    out: std.ArrayList(u8) = .empty,
+
+    extern fn sk_vtenc_open(width: c_int, height: c_int, fps: c_int) ?*anyopaque;
+    extern fn sk_vtenc_encode(enc: ?*anyopaque, y: [*]const u8, u: [*]const u8, v: [*]const u8, force_kf: c_int, out: *[*]const u8, is_kf: *c_int) c_int;
+    extern fn sk_vtenc_close(enc: ?*anyopaque) void;
+
+    fn init(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32) !Vt {
+        if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return Error.SizeMismatch;
+        const uw: u32 = @intCast(w);
+        const uh: u32 = @intCast(h);
+        const handle = sk_vtenc_open(w, h, fps) orelse return Error.X264;
+        errdefer sk_vtenc_close(handle);
+        const yp = try allocator.alloc(u8, yuv.ySize(uw, uh));
+        errdefer allocator.free(yp);
+        const up = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
+        errdefer allocator.free(up);
+        const vp = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
+        return .{ .allocator = allocator, .handle = handle, .w = w, .h = h, .yp = yp, .up = up, .vp = vp };
+    }
+
+    fn deinit(self: *Vt) void {
+        sk_vtenc_close(self.handle);
+        self.allocator.free(self.yp);
+        self.allocator.free(self.up);
+        self.allocator.free(self.vp);
+        self.out.deinit(self.allocator);
+    }
+
+    fn encodeTile(self: *Vt, w: i32, h: i32, pixels: []const u8, force_keyframe: bool) !EncodeResult {
+        if (w != self.w or h != self.h) return Error.SizeMismatch;
+        const uw: u32 = @intCast(w);
+        const uh: u32 = @intCast(h);
+        if (pixels.len != @as(usize, uw) * uh * 4) return Error.SizeMismatch;
+        yuv.bgraToI420(pixels, uw, uh, self.yp, self.up, self.vp);
+
+        var out_ptr: [*]const u8 = undefined;
+        var is_kf: c_int = 0;
+        const n = sk_vtenc_encode(self.handle, self.yp.ptr, self.up.ptr, self.vp.ptr, if (force_keyframe) 1 else 0, &out_ptr, &is_kf);
+        if (n <= 0) return Error.X264; // RealTime+CompleteFrames never buffers
         self.out.clearRetainingCapacity();
         try self.out.appendSlice(self.allocator, out_ptr[0..@intCast(n)]);
         return .{ .keyframe = is_kf != 0, .bytes = self.out.items };
@@ -547,6 +625,78 @@ test "x264 encode → avcodec decode round-trips a frame (-Dvideo)" {
     try dec.decodeTile(.{ .codec = enc.codec(), .keyframe = r.keyframe, .x = 0, .y = 0, .w = w, .h = h, .seq = 0, .payload = r.bytes }, &dst);
 
     // Lossy → compare by mean absolute error over RGB; alpha forced opaque.
+    var sum: u64 = 0;
+    for (0..w * h) |i| {
+        inline for (.{ 0, 1, 2 }) |ch| {
+            const dv: i32 = @as(i32, px[i * 4 + ch]) - @as(i32, dst[i * 4 + ch]);
+            sum += @abs(dv);
+        }
+        try t.expectEqual(@as(u8, 0xff), dst[i * 4 + 3]);
+    }
+    const mae = @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(w * h * 3));
+    try t.expect(mae < 15.0);
+}
+
+test "VideoToolbox backend encodes an Annex-B H.264 keyframe (when vtenc linked)" {
+    if (!have_vtenc) return error.SkipZigTest;
+    const a = t.allocator;
+    const w = 64;
+    const h = 64;
+    var enc = try Encoder.initVtoolbox(a, w, h, 30);
+    defer enc.deinit();
+    try t.expectEqual(Codec.h264, enc.codec());
+
+    var px: [w * h * 4]u8 = undefined;
+    for (0..h) |yy| for (0..w) |xx| {
+        const o = (yy * w + xx) * 4;
+        px[o + 0] = @truncate(xx * 3);
+        px[o + 1] = @truncate(yy * 3);
+        px[o + 2] = @truncate((xx + yy) * 2);
+        px[o + 3] = 0xff;
+    };
+    const r = try enc.encodeTile(w, h, &px, true);
+    try t.expect(r.keyframe);
+    // Annex-B: a start code (00 00 00 01) leads the stream.
+    try t.expect(r.bytes.len >= 4);
+    try t.expectEqual(@as(u8, 0), r.bytes[0]);
+    try t.expectEqual(@as(u8, 0), r.bytes[1]);
+    try t.expectEqual(@as(u8, 0), r.bytes[2]);
+    try t.expectEqual(@as(u8, 1), r.bytes[3]);
+    // A follow-up frame still encodes without error.
+    const r2 = try enc.encodeTile(w, h, &px, false);
+    try t.expect(r2.bytes.len > 0);
+    // Wrong tile size is rejected.
+    try t.expectError(Error.SizeMismatch, enc.encodeTile(32, 32, &px, false));
+}
+
+test "VideoToolbox encode → avcodec decode round-trips a frame (vtenc + -Dvideo)" {
+    if (!have_vtenc or !have_video) return error.SkipZigTest;
+    const a = t.allocator;
+    const w = 64;
+    const h = 64;
+    var enc = try Encoder.initVtoolbox(a, w, h, 30);
+    defer enc.deinit();
+    var dec = try Decoder.initAvcodec(a, w, h, .h264);
+    defer dec.deinit();
+    try t.expectEqual(Codec.h264, enc.codec());
+
+    // Smooth grayscale gradient — lossy 4:2:0 H.264 stays close, and a
+    // range/matrix mismatch (full vs video) would blow the MAE bound.
+    var px: [w * h * 4]u8 = undefined;
+    for (0..h) |yy| for (0..w) |xx| {
+        const o = (yy * w + xx) * 4;
+        const v: u8 = @truncate(40 + xx + yy);
+        px[o] = v;
+        px[o + 1] = v;
+        px[o + 2] = v;
+        px[o + 3] = 0xff;
+    };
+    const r = try enc.encodeTile(w, h, &px, true);
+    try t.expect(r.keyframe);
+
+    var dst: [w * h * 4]u8 = undefined;
+    try dec.decodeTile(.{ .codec = enc.codec(), .keyframe = r.keyframe, .x = 0, .y = 0, .w = w, .h = h, .seq = 0, .payload = r.bytes }, &dst);
+
     var sum: u64 = 0;
     for (0..w * h) |i| {
         inline for (.{ 0, 1, 2 }) |ch| {

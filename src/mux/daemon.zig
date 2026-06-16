@@ -1628,8 +1628,13 @@ pub const Daemon = struct {
         var hdr: [5]u8 = undefined;
         cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .winstream));
         // Windows opened while nobody was attached (or for a prior
-        // client) must be replayed for this one.
-        if (s.winstream) |ws| ws.reannounce();
+        // client) must be replayed for this one. Route windows through the
+        // lossy video coder only if THIS client can decode it (mirrors the
+        // Wayland `native.wants_video = cl.video`).
+        if (s.winstream) |ws| {
+            ws.setWantsVideo(cl.video);
+            ws.reannounce();
+        }
     }
 
     /// Pump every live window-stream session: frames toward the

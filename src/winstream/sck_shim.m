@@ -121,6 +121,11 @@ typedef struct {
     SckEvent *ev_scratch;
     size_t ev_cap;
     NSMutableArray *drain_hold; // NSData backing title/open bytes
+    // Whole-frame snapshot for the video path (valid until the next
+    // snapshot call), so sck.zig can encode a hot window's whole frame
+    // even while the lossless path streams only patches.
+    uint8_t *vsnap;
+    size_t vsnap_cap;
     // Pointer-injection state.
     uint32_t btn_mask;
     double last_click_t;
@@ -693,6 +698,8 @@ void sketerm_sck_destroy(SckCtx *ctx) {
     close(c->pipe_w);
     free(c->ev_scratch);
     c->ev_scratch = NULL;
+    free(c->vsnap);
+    c->vsnap = NULL;
     pthread_mutex_destroy(&c->mu);
     CFBridgingRelease(ctx);
 }
@@ -888,6 +895,35 @@ const SckEvent *sketerm_sck_drain(SckCtx *ctx, size_t *out_n) {
     pthread_mutex_unlock(&c->mu);
     *out_n = n;
     return c->ev_scratch;
+}
+
+// Copy a window's whole current frame (tight BGRA, fw*4 stride) into a
+// context-owned buffer for the video encoder; valid until the next
+// snapshot call. Returns NULL if the window has no frame yet. Used by the
+// sck.zig video path: the lossless stream may carry only patches, but the
+// codec needs the whole tile each frame.
+const uint8_t *sketerm_sck_snapshot(SckCtx *ctx, uint32_t win, int32_t *out_w, int32_t *out_h, size_t *out_len) {
+    SketermSckCtx *c = (__bridge SketermSckCtx *)ctx;
+    const uint8_t *res = NULL;
+    pthread_mutex_lock(&c->mu);
+    SketermSckWin *sw = c->wins[@(win)];
+    if (sw && sw->latest && sw->fw > 0 && sw->fh > 0) {
+        size_t need = (size_t)sw->fw * (size_t)sw->fh * 4;
+        if (c->vsnap_cap < need) {
+            free(c->vsnap);
+            c->vsnap = malloc(need);
+            c->vsnap_cap = c->vsnap ? need : 0;
+        }
+        if (c->vsnap) {
+            memcpy(c->vsnap, sw->latest, need);
+            *out_w = sw->fw;
+            *out_h = sw->fh;
+            *out_len = need;
+            res = c->vsnap;
+        }
+    }
+    pthread_mutex_unlock(&c->mu);
+    return res;
 }
 
 // ── input injection ─────────────────────────────────────────────

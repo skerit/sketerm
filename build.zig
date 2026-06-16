@@ -58,15 +58,22 @@ pub fn build(b: *std.Build) void {
     // lossless. Auto-detected so the default `zig build`/`test` exercises
     // it wherever x264 is installed; `-Dvideo=false` forces it off.
     const have_x264 = b.option(bool, "video", "H.264 video-tile codec via libx264 — requires libx264 (default off)") orelse false;
+    // VideoToolbox H.264 encoder — the Mac-native video-tile encode path
+    // (no libx264/libavcodec needed; a system framework). Auto-on for a
+    // native macOS toolchain so the daemon can produce tiles a -Dvideo
+    // client decodes. Only activates when such a client attaches.
+    const have_vtenc = native_macos;
     const glib_opts = b.addOptions();
     glib_opts.addOption(bool, "glib", true);
     glib_opts.addOption(bool, "winstream_sck", native_sck);
     glib_opts.addOption(bool, "video", have_x264);
+    glib_opts.addOption(bool, "vtenc", have_vtenc);
     const glib_opts_mod = glib_opts.createModule();
     const noglib_opts = b.addOptions();
     noglib_opts.addOption(bool, "glib", false);
     noglib_opts.addOption(bool, "winstream_sck", native_sck);
     noglib_opts.addOption(bool, "video", have_x264);
+    noglib_opts.addOption(bool, "vtenc", have_vtenc);
     const noglib_opts_mod = noglib_opts.createModule();
 
     const exe_mod = b.createModule(.{
@@ -84,6 +91,7 @@ pub fn build(b: *std.Build) void {
     // present for the shim to resolve.
     if (native_macos) addNsaxBridge(b, exe_mod);
     if (have_x264) addVideo(b, exe_mod); // GUI-side H.264 decode (-Dvideo)
+    if (have_vtenc) addVtEnc(b, exe_mod); // VideoToolbox H.264 encode (macOS)
 
     const exe = b.addExecutable(.{
         .name = "sketerm",
@@ -114,6 +122,7 @@ pub fn build(b: *std.Build) void {
     mux_mod.addImport("build_options", noglib_opts_mod);
     if (native_sck) addSckBackend(b, mux_mod);
     if (have_x264) addVideo(b, mux_mod); // daemon-side x264 encode (-Dvideo)
+    if (have_vtenc) addVtEnc(b, mux_mod); // daemon-side VideoToolbox encode (macOS)
     const mux_exe = b.addExecutable(.{
         .name = "sketerm-mux",
         .root_module = mux_mod,
@@ -168,6 +177,7 @@ pub fn build(b: *std.Build) void {
     portable_opts.addOption(bool, "glib", false);
     portable_opts.addOption(bool, "winstream_sck", false);
     portable_opts.addOption(bool, "video", false);
+    portable_opts.addOption(bool, "vtenc", false);
     mux_portable_mod.addImport("build_options", portable_opts.createModule());
     const mux_portable_exe = b.addExecutable(.{
         .name = "sketerm-mux-portable",
@@ -194,6 +204,7 @@ pub fn build(b: *std.Build) void {
     smoke_mux_mod.addImport("build_options", noglib_opts_mod);
     if (native_sck) addSckBackend(b, smoke_mux_mod);
     if (have_x264) addVideo(b, smoke_mux_mod);
+    if (have_vtenc) addVtEnc(b, smoke_mux_mod);
     const smoke_mux = b.addExecutable(.{
         .name = "sketerm-smoke-mux",
         .root_module = smoke_mux_mod,
@@ -501,6 +512,7 @@ pub fn build(b: *std.Build) void {
     // libx264 + shim so `zig build test` compiles AND exercises the
     // vcodec x264 backend wherever x264 is installed.
     if (have_x264) addVideo(b, tests_mod);
+    if (have_vtenc) addVtEnc(b, tests_mod);
     const tests = b.addTest(.{
         .root_module = tests_mod,
         .use_lld = use_lld,
@@ -682,6 +694,18 @@ fn addVideo(b: *std.Build, mod: *std.Build.Module) void {
     mod.addCSourceFile(.{ .file = b.path("vendor/avdec_shim.c"), .flags = &.{"-O2"} });
     mod.addCSourceFile(.{ .file = b.path("vendor/avenc_shim.c"), .flags = &.{"-O2"} });
     mod.addIncludePath(b.path("vendor"));
+}
+
+/// VideoToolbox H.264 encoder shim (vendor/vtenc_shim.c) + the system
+/// frameworks it needs — the Mac-native video-tile encode path. No
+/// external codec lib: the daemon produces H.264 a `-Dvideo` (libavcodec)
+/// client decodes. Gated on `vtenc` (native macOS toolchain).
+fn addVtEnc(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addCSourceFile(.{ .file = b.path("vendor/vtenc_shim.c"), .flags = &.{"-O2"} });
+    mod.linkFramework("VideoToolbox", .{});
+    mod.linkFramework("CoreMedia", .{});
+    mod.linkFramework("CoreVideo", .{});
+    mod.linkFramework("CoreFoundation", .{});
 }
 
 /// ScreenCaptureKit window-stream backend (macOS native builds

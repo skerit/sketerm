@@ -5904,3 +5904,41 @@ skip-blocks already keep whole-surface encodes small on the wire.
 621 tests under -Dvideo (618 + the 3 video round-trip/encode tests that
 skip without it), GUI default + -Dvideo, smoke-mux default + -Dvideo,
 mux-portable static — all green.
+
+## 2026-06-16: macOS video encode — VideoToolbox + sck.zig win_vtile
+
+The Darwin half of the video-tile path: macOS apps now get the same
+H.264 compression Wayland apps have, via the hardware encoder.
+
+- **VideoToolbox backend** (`vendor/vtenc_shim.c` + `vcodec.zig` `Vt`):
+  a new `Encoder.vtoolbox` variant emitting the SAME Annex-B `.h264`
+  wire codec as x264, so the existing libavcodec receiver (`avdec`)
+  decodes it unchanged. I420 (from `yuv.zig`, full-range BT.601, like
+  x264) → NV12 full-range `CVPixelBuffer` → low-latency H.264
+  (RealTime, no reorder, baseline, keyint 120), AVCC→Annex-B with
+  SPS/PPS prepended on keyframes. **No libx264/libavcodec dependency**
+  — VideoToolbox is a system framework, so the native daemon encodes
+  video without the codec libs. Gated on `build_options.vtenc`
+  (auto-on for a native macOS toolchain). Hardware-validated:
+  `zig build test` runs a VT-encode keyframe check, and `-Dvideo` adds
+  a VT-encode → avdec-decode round-trip (MAE < 15, so the full-range
+  color path is correct).
+- **sck.zig routing** mirrors daemon.zig's Wayland `videoCommit`,
+  per window: a `churn.Tracker` + a VT `Encoder`, keyed by window id.
+  The poll is now three passes — (1) emit lifecycle + feed churn this
+  poll's damage (full-frame or dirty-rect events), (2) for each touched
+  window that's HOT and (snapshot) photographic, encode the whole frame
+  as one tile and emit `win_vtile`, (3) emit the lossless
+  win_frame_c/win_patch_c only for windows NOT sent as video. A new
+  shim call `sketerm_sck_snapshot` hands the source a window's whole
+  current frame on demand (the lossless stream carries only patches).
+- **Contract**: the receiver drops a `win_vtile` until a full
+  `win_frame_c` has established the window's backing (winapp.zig:203),
+  so a per-window `base_sent` gate forces a lossless base frame first
+  (and resets on resize / reattach, where it also forces a keyframe).
+  Capability-gated: `daemon.openWinstreamChan` calls
+  `source.setWantsVideo(cl.video)`, so a tile is only ever sent to a
+  client that advertised H.264 decode — exactly like the Wayland path.
+
+Native `zig build mux` (SCK + VideoToolbox), tests (default + -Dvideo),
+smoke-mux, GUI, and mux-portable (no codec) all green.
