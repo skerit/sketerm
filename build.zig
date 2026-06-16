@@ -112,6 +112,7 @@ pub fn build(b: *std.Build) void {
     configureCoreDeps(b, mux_mod, core_cbindings_mod);
     mux_mod.addImport("build_options", noglib_opts_mod);
     if (native_sck) addSckBackend(b, mux_mod);
+    if (have_x264) addVideo(b, mux_mod); // daemon-side x264 encode (-Dvideo)
     const mux_exe = b.addExecutable(.{
         .name = "sketerm-mux",
         .root_module = mux_mod,
@@ -191,6 +192,7 @@ pub fn build(b: *std.Build) void {
     configureCoreDeps(b, smoke_mux_mod, core_cbindings_mod);
     smoke_mux_mod.addImport("build_options", noglib_opts_mod);
     if (native_sck) addSckBackend(b, smoke_mux_mod);
+    if (have_x264) addVideo(b, smoke_mux_mod);
     const smoke_mux = b.addExecutable(.{
         .name = "sketerm-smoke-mux",
         .root_module = smoke_mux_mod,

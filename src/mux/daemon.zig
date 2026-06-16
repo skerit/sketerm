@@ -18,6 +18,10 @@ const wlwire = @import("../wlhost/wire.zig");
 const wltrack = @import("../wlhost/track.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
 const wlpixcodec = @import("../wlhost/pixcodec.zig");
+const build_options = @import("build_options");
+const wlvcodec = @import("../wlhost/vcodec.zig");
+const churnmod = @import("../util/churn.zig");
+const contentmod = @import("../util/content.zig");
 const wsproto = @import("../winstream/proto.zig");
 const wssource = @import("../winstream/source.zig");
 const WsSource = wssource.Source;
@@ -252,6 +256,33 @@ const Native = struct {
     /// pool id → mmapped mirror. Mirrors outlive wl_shm_pool
     /// destructors: existing buffers keep referencing the memory.
     pools: std.AutoHashMapUnmanaged(u32, PoolMirror) = .empty,
+    /// Per-surface lossy-video state (only populated under
+    /// build_options.video): a churn tracker + a fixed-resolution
+    /// encoder, keyed by surface id. Hot, photographic surfaces route
+    /// through here to pool_vtile instead of the lossless pool_update_c.
+    vstate: std.AutoHashMapUnmanaged(u32, VideoSurface) = .empty,
+    /// Scratch reused across commits: tight full-surface BGRA, and the
+    /// encoded vcodec tile blob.
+    vscratch: std.ArrayList(u8) = .empty,
+    vblob: std.ArrayList(u8) = .empty,
+    /// Set once the attached client advertises it can decode the video
+    /// codec (capability negotiation — not yet implemented). Until then
+    /// videoCommit stays dormant: never emit a tile no client can decode.
+    wants_video: bool = false,
+
+    const VideoSurface = struct {
+        churn: churnmod.Tracker,
+        enc: wlvcodec.Encoder,
+        w: i32,
+        h: i32,
+        seq: u32 = 0,
+        needs_kf: bool = true,
+
+        fn deinit(self: *VideoSurface) void {
+            self.churn.deinit();
+            self.enc.deinit();
+        }
+    };
 
     const ClipRead = struct {
         fd: c_int,
@@ -284,8 +315,78 @@ const Native = struct {
         self.clip_reads.deinit(self.allocator);
         self.inbuf.deinit(self.allocator);
         self.unitbuf.deinit(self.allocator);
+        var vit = self.vstate.valueIterator();
+        while (vit.next()) |v| v.deinit();
+        self.vstate.deinit(self.allocator);
+        self.vscratch.deinit(self.allocator);
+        self.vblob.deinit(self.allocator);
         self.tracker.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Lossy-video routing for a commit (build_options.video only). Feeds
+    /// per-surface churn; when the surface is HOT and looks photographic,
+    /// encodes the WHOLE surface as one H.264 tile and emits a pool_vtile,
+    /// returning true so the caller skips the lossless path. Any failure
+    /// (odd dims, encoder open, mirror too small) returns false → lossless.
+    fn videoCommit(nv: *Native, units: *std.ArrayList(u8), a: std.mem.Allocator, cm: anytype, mirror: PoolMirror, y0: i64, y1: i64) !bool {
+        if (!nv.wants_video) return false; // no client can decode video yet
+        const w = cm.info.width;
+        const h = cm.info.height;
+        if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return false; // codec needs even dims
+        const stride: usize = @intCast(cm.info.stride);
+        const base: usize = @intCast(cm.info.offset);
+        const uw: usize = @intCast(w);
+        const uh: usize = @intCast(h);
+        const tight = uw * 4;
+        if (base + (uh - 1) * stride + tight > mirror.size) return false; // whole surface must fit
+
+        const gop = try nv.vstate.getOrPut(nv.allocator, cm.surface);
+        if (!gop.found_existing or gop.value_ptr.w != w or gop.value_ptr.h != h) {
+            if (gop.found_existing) gop.value_ptr.deinit();
+            var enc = wlvcodec.Encoder.initX264(nv.allocator, w, h, 30) catch {
+                _ = nv.vstate.remove(cm.surface);
+                return false;
+            };
+            const tracker = churnmod.Tracker.init(nv.allocator, @intCast(w), @intCast(h), .{}) catch {
+                enc.deinit();
+                _ = nv.vstate.remove(cm.surface);
+                return false;
+            };
+            gop.value_ptr.* = .{ .churn = tracker, .enc = enc, .w = w, .h = h };
+        }
+        const vs = gop.value_ptr;
+
+        // Advance churn with this commit's damage (full-width rows).
+        vs.churn.noteDamage(0, @intCast(y0), w, @intCast(y1 - y0));
+        vs.churn.endFrame();
+        if (!vs.churn.hot(0, 0, w, h)) return false;
+
+        // Extract the whole surface tightly (drop stride padding).
+        try nv.vscratch.resize(nv.allocator, uw * uh * 4);
+        for (0..uh) |r| {
+            @memcpy(nv.vscratch.items[r * tight ..][0..tight], mirror.ptr[base + r * stride ..][0..tight]);
+        }
+        if (!contentmod.looksPhotographic(nv.vscratch.items, .{})) return false;
+
+        const res = vs.enc.encodeTile(w, h, nv.vscratch.items, vs.needs_kf) catch return false;
+        vs.needs_kf = false;
+
+        nv.vblob.clearRetainingCapacity();
+        wlvcodec.appendTile(&nv.vblob, nv.allocator, .{
+            .codec = vs.enc.codec(),
+            .keyframe = res.keyframe,
+            .x = 0,
+            .y = 0,
+            .w = w,
+            .h = h,
+            .seq = vs.seq,
+            .payload = res.bytes,
+        }) catch return false;
+        vs.seq +%= 1;
+
+        try wlpipe.appendPoolVtile(units, a, cm.info.pool, @intCast(base), @intCast(stride), nv.vblob.items);
+        return true;
     }
 
     fn popFd(self: *Native) ?c_int {
@@ -971,25 +1072,35 @@ pub const Daemon = struct {
                             y1 = @min(y1, @as(i64, d.y1));
                         }
                         if (y0 < y1) {
-                            // Chunk by WHOLE ROWS so each chunk starts at
-                            // column 0 — the pixcodec predictor resets per
-                            // row, and arbitrary byte cuts would misalign it.
-                            const stride: usize = @intCast(cm.info.stride);
-                            const rows_per_chunk: i64 = @intCast(@max(1, POOL_CHUNK / stride));
-                            var sc: wlpixcodec.Scratch = .{}; // arena-backed; reset on drain
-                            var y = y0;
-                            while (y < y1) {
-                                const yc = @min(y + rows_per_chunk, y1);
-                                const off: usize = @intCast(@as(i64, cm.info.offset) + y * cm.info.stride);
-                                const len: usize = @intCast((yc - y) * cm.info.stride);
-                                const end = @min(off +| len, mirror.size);
-                                if (off < end) {
-                                    const raw = mirror.ptr[off..end];
-                                    const enc = wlpixcodec.encodeRegion(&sc, a, raw, stride) catch
-                                        wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
-                                    try wlpipe.appendPoolUpdateC(units, a, cm.info.pool, @intCast(off), enc, @intCast(raw.len), @intCast(stride));
+                            // A hot + photographic surface routes through the
+                            // lossy video coder (pool_vtile) instead; the
+                            // whole branch is comptime-off without -Dvideo, so
+                            // default builds take the lossless path verbatim.
+                            var did_video = false;
+                            if (comptime build_options.video) {
+                                did_video = nv.videoCommit(units, a, cm, mirror, y0, y1) catch false;
+                            }
+                            if (!did_video) {
+                                // Chunk by WHOLE ROWS so each chunk starts at
+                                // column 0 — the pixcodec predictor resets per
+                                // row, and arbitrary byte cuts would misalign it.
+                                const stride: usize = @intCast(cm.info.stride);
+                                const rows_per_chunk: i64 = @intCast(@max(1, POOL_CHUNK / stride));
+                                var sc: wlpixcodec.Scratch = .{}; // arena-backed; reset on drain
+                                var y = y0;
+                                while (y < y1) {
+                                    const yc = @min(y + rows_per_chunk, y1);
+                                    const off: usize = @intCast(@as(i64, cm.info.offset) + y * cm.info.stride);
+                                    const len: usize = @intCast((yc - y) * cm.info.stride);
+                                    const end = @min(off +| len, mirror.size);
+                                    if (off < end) {
+                                        const raw = mirror.ptr[off..end];
+                                        const enc = wlpixcodec.encodeRegion(&sc, a, raw, stride) catch
+                                            wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
+                                        try wlpipe.appendPoolUpdateC(units, a, cm.info.pool, @intCast(off), enc, @intCast(raw.len), @intCast(stride));
+                                    }
+                                    y = yc;
                                 }
-                                y = yc;
                             }
                         }
                     }
