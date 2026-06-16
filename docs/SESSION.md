@@ -5653,3 +5653,43 @@ platform-neutral `a11y/view.zig` core (no text model duplicated).
 582 tests (incl. 3 new `nsax` conversion tests + the astral
 `char_to_utf16` core test), smoke-a11y + smoke-e2e PASS, mux-portable
 green.
+
+## 2026-06-16: shared pixel codec + zstd — unified Wayland/winstream wire
+
+First slice of the pixel-streaming unification: one compression layer
+under BOTH remote-app pixel paths (Wayland shm-pool mirror + macOS
+window capture), so classify→encode→decode becomes one implementation.
+
+- **`src/wlhost/pixcodec.zig`** — the shared codec. A region (BGRA rows
+  of `row_stride`) encodes as a self-describing body
+  `[coder|filter|raw_len|row_stride|bytes]`. `coder` ∈ {raw, zstd};
+  `filter` ∈ {none, sub, up, paeth} (PNG predictors, bpp=4). The encoder
+  picks the filter by PNG's minimum-sum-of-absolute-differences
+  heuristic — cheap scoring passes, then a SINGLE zstd pass — and keeps
+  it only if it beats the raw size (never regresses). `decodeBody`
+  reverses it.
+- **Unified wire.** `wlhost/pipe.zig` gains `pool_update_c`,
+  `winstream/proto.zig` gains `win_frame_c` + `decodeFrameC`; both embed
+  the same pixcodec body. The two addressing models (Wayland pool+offset
+  vs winstream win+w+h) stay separate — only the encoded body unifies.
+  The body carries `row_stride` because the GUI decodes a pool offset
+  without knowing the buffer's stride.
+- **Daemon** (`mux/daemon.zig`) commit path chunks by WHOLE ROWS (so the
+  predictor resets per row) and emits `pool_update_c`; `compositor.zig`
+  decodes it. The winstream stub source, `winapp.zig`, and
+  `smoke_mux.zig` moved to `win_frame_c`. `sck.zig` still emits legacy
+  `win_frame`/`win_frame_z` — Phase 1 switches it.
+- **zstd, vendored + static everywhere.** `vendor/zstd/zstd.c`
+  (single-file amalgamation, v1.5.7, BSD/GPLv2) compiled into every
+  artifact via `addZstd()` in build.zig (core + sys + portable), reached
+  by `extern fn` (no header through @cImport). The musl portable binary
+  stays fully static (`ldd`: not a dynamic executable) with zstd baked
+  in — a true drop-anywhere daemon that still does real zstd-coded
+  streaming.
+
+The lossless win is now live on both paths: best-of-4 predictors + zstd
+beat the old plain-deflate wire. `zpool` (deflate) is kept only to
+decode the legacy `pool_update_z`/`win_frame_z` units.
+
+596 tests, GUI build, smoke-mux (both paths round-trip through real
+zstd), mux-portable static — all green.
