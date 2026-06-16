@@ -1,9 +1,19 @@
 // sketerm — terminal emulator entry point.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const platform = @import("util/platform.zig");
 const Window = @import("ui/window.zig").Window;
+
+comptime {
+    // macOS: emit the NSAccessibility bridge's export callbacks into the
+    // GUI binary so the ObjC shim (linked via build.zig addNsaxBridge)
+    // resolves them. The AppKit pane frontend then calls a11y/nsax.zig's
+    // newView/notifyChanged with no further build wiring. No-op on Linux,
+    // where panes use the GtkAccessibleText (atspi.zig) bridge instead.
+    if (builtin.os.tag == .macos) _ = @import("a11y/nsax.zig");
+}
 
 const APP_ID: [*:0]const u8 = "dev.sker.sketerm";
 const VERSION = "0.1.0";

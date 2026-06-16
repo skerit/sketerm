@@ -49,6 +49,9 @@ pub fn build(b: *std.Build) void {
     // macOS SDK to link the frameworks against.
     const native_sck = b.graph.host.result.os.tag == .macos and
         target.result.os.tag == .macos;
+    // Same condition, named for the NSAccessibility bridge (a11y/nsax*):
+    // its ObjC shim only builds on a native macOS toolchain.
+    const native_macos = native_sck;
     const glib_opts = b.addOptions();
     glib_opts.addOption(bool, "glib", true);
     glib_opts.addOption(bool, "winstream_sck", native_sck);
@@ -67,6 +70,11 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, exe_mod, cbindings_mod);
     exe_mod.addImport("build_options", glib_opts_mod);
+    // NSAccessibility bridge for the (nascent) AppKit pane: link the
+    // ObjC shim so the future frontend can call a11y/nsax.zig. main.zig
+    // force-includes nsax.zig on macOS so its export callbacks are
+    // present for the shim to resolve.
+    if (native_macos) addNsaxBridge(b, exe_mod);
 
     const exe = b.addExecutable(.{
         .name = "sketerm",
@@ -316,6 +324,35 @@ pub fn build(b: *std.Build) void {
     const smoke_e2e_step = b.step("smoke-e2e", "End-to-end smoke via remote-control socket (needs display)");
     smoke_e2e_step.dependOn(&smoke_e2e_run.step);
 
+    // macOS NSAccessibility smoke — `zig build smoke-a11y`. Drives a
+    // real SketermTermView through the AX selectors VoiceOver uses and
+    // asserts they match a known screen (incl. an astral char, so the
+    // codepoint→UTF-16 translation is checked end-to-end). Native macOS
+    // only: it links the ObjC accessibility shim + a test probe.
+    if (native_macos) {
+        const smoke_a11y_mod = b.createModule(.{
+            .root_source_file = b.path("src/smoke_a11y_macos.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        configureSysDeps(b, smoke_a11y_mod, cbindings_mod);
+        smoke_a11y_mod.addImport("build_options", glib_opts_mod);
+        addNsaxBridge(b, smoke_a11y_mod);
+        smoke_a11y_mod.addCSourceFile(.{
+            .file = b.path("src/a11y/nsax_probe.m"),
+            .flags = &.{"-fobjc-arc"},
+        });
+        const smoke_a11y = b.addExecutable(.{
+            .name = "sketerm-smoke-a11y",
+            .root_module = smoke_a11y_mod,
+            .use_lld = use_lld,
+        });
+        const smoke_a11y_run = b.addRunArtifact(smoke_a11y);
+        const smoke_a11y_step = b.step("smoke-a11y", "macOS NSAccessibility round-trip check (native macOS only)");
+        smoke_a11y_step.dependOn(&smoke_a11y_run.step);
+    }
+
     // Headless cell-render smoke — `zig build smoke-cell`. Drives a
     // small Screen → Atlas → CellPass → GridPass through an EGL
     // surfaceless context, reads pixels back, asserts text + focus
@@ -445,6 +482,9 @@ pub fn build(b: *std.Build) void {
     configureSysDeps(b, tests_mod, cbindings_mod);
     tests_mod.addImport("build_options", glib_opts_mod);
     if (native_sck) addSckBackend(b, tests_mod);
+    // Link the NSAccessibility shim so `zig build test` compiles AND
+    // links the macOS a11y bridge end-to-end (tests.zig imports nsax.zig).
+    if (native_macos) addNsaxBridge(b, tests_mod);
     const tests = b.addTest(.{
         .root_module = tests_mod,
         .use_lld = use_lld,
@@ -609,6 +649,18 @@ fn addSckBackend(b: *std.Build, mod: *std.Build.Module) void {
     mod.linkFramework("CoreGraphics", .{});
     mod.linkFramework("AppKit", .{});
     mod.linkFramework("ApplicationServices", .{});
+    mod.linkFramework("Foundation", .{});
+}
+
+/// NSAccessibility (VoiceOver) bridge (macOS native builds only): the
+/// ObjC `SketermTermView` shim + the frameworks it needs. Pairs with
+/// the `export fn` callbacks in a11y/nsax.zig. Gated on `native_macos`.
+fn addNsaxBridge(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addCSourceFile(.{
+        .file = b.path("src/a11y/nsax_shim.m"),
+        .flags = &.{"-fobjc-arc"},
+    });
+    mod.linkFramework("AppKit", .{});
     mod.linkFramework("Foundation", .{});
 }
 

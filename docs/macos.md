@@ -128,6 +128,53 @@ PASS natively), SCK daemon launch via LaunchAgent, missing-grant
 notice window + actionable daemon log end-to-end over the real mux
 socket. Real-capture validation requires the manual TCC toggles.
 
+## Accessibility (VoiceOver / NSAccessibility)
+
+The macOS twin of the Linux AT-SPI bridge. `src/a11y/nsax.zig` (Zig) +
+`src/a11y/nsax_shim.m` (ObjC) implement the NSAccessibility text
+protocol (role `AXTextArea`; value, ranges, caret) over the SAME
+platform-neutral `src/a11y/view.zig` the Linux bridge uses — no text
+model duplicated. The one macOS wrinkle — NSRange is in **UTF-16 code
+units** while the neutral snapshot is in **codepoints** — is handled by
+`Snapshot.char_to_utf16` + the bridge's `charForUtf16` inverse; astral
+chars (emoji) count as 2 units, BMP (incl. Nerd-font glyphs) as 1.
+
+**Why it can't reuse `atspi.zig`:** GTK4 on macOS ships only the AT-SPI
+a11y backend, which is *unavailable on this platform* (`GTK_A11Y=help`
+lists `atspi - Not available`). So `GtkAccessibleText` (atspi.zig)
+reaches VoiceOver **not at all** here — the pane's text has to be put on
+an NSAccessibility object directly.
+
+**How it's wired (current GTK frontend):** there is no per-pane NSView
+(GTK draws everything into one `GtkMacosContentView`). So `pane.zig`,
+on the GL area's `map`, walks `gtk_widget_get_native` →
+`gtk_native_get_surface` → `gdk_macos_surface_get_native_window` →
+`[NSWindow contentView]` and attaches a `SketermTermAXElement`
+(`NSAccessibilityElement`, one per pane) as an accessibility child of
+that content view — which IS visible to VoiceOver. It detaches on
+`unmap`/close, updates the element frame from the pane's widget bounds,
+and posts value/selection-changed on each render (the macOS arm of the
+spot that calls `a11y.notifyChanged` on Linux). All of this is behind
+`platform.is_macos`; the Linux path is unchanged.
+
+`src/a11y/nsax_shim.m` also has a `SketermTermView : NSView` (same
+answers, shared statics) ready for the future de-GTK'd AppKit pane —
+that pane just uses `nsax.newView(term)` instead of attaching an element.
+
+**Verifying:**
+- `zig build smoke-a11y` (native macOS) — drives a real
+  `SketermTermView` through the AX selectors VoiceOver uses and asserts
+  value text, UTF-16 char count, caret range, substring across a 😀
+  surrogate pair, and line ranges against a known screen.
+- Live, in the real GUI (no TCC grant needed):
+  `SKETERM_A11Y_SELFCHECK=1 ./zig-out/bin/sketerm --no-save` logs
+  `A11Y-SELFCHECK: pane=N bits=7 (PASS)` once a VoiceOver client walking
+  window → contentView → child would find an `AXTextArea` whose value is
+  the live terminal text (bit0 in children, bit1 role, bit2 non-empty).
+- With VoiceOver (Cmd-F5) or Xcode's Accessibility Inspector, focus the
+  sketerm window: the terminal reads as a text area whose value is the
+  screen contents.
+
 ## Remote macOS apps (window streaming)
 
 Streaming this Mac's app windows to a sketerm client (ScreenCaptureKit

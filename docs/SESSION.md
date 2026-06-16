@@ -5602,3 +5602,54 @@ Linux-client → Mac-app run.
   window; `-u` routes through the native path over roaming UDP.
 
 551 tests, smoke-mux, mux + mux-portable green; mux stays GTK-free.
+
+## macOS NSAccessibility bridge (2026-06-16)
+
+VoiceOver/AppKit twin of the Linux AT-SPI bridge, over the same
+platform-neutral `a11y/view.zig` core (no text model duplicated).
+
+- **`src/a11y/nsax.zig`** — Zig bridge. Mirrors `atspi.zig` 1:1: each
+  query rebuilds a `view.Snapshot`, answers, frees it. `export fn`
+  callbacks (`sketerm_nsax_value/length/string_for_range/caret/
+  line_for_index/range_for_line`) own the one macOS-specific wrinkle —
+  **NSRange is UTF-16 code units, the snapshot is codepoints** — via
+  `Snapshot.char_to_utf16`/`utf16At` forward and a `charForUtf16`
+  binary-search inverse. Public `newView`/`notifyChanged`/`releaseView`
+  for the future AppKit pane.
+- **`src/a11y/nsax_shim.m`** — `SketermTermView : NSView` implementing
+  the NSAccessibility text protocol (role `AXTextArea`, value,
+  string-for-range, selected-text-range = zero-length caret, line
+  lookups, visible range), each method calling the Zig callbacks. Plain
+  C ABI, `-fobjc-arc`, like `winstream/sck_shim.m`. Stores a stable
+  `*Terminal` (deref `term.screen` live, since it swaps on a mux
+  snapshot).
+- **Actually wired to VoiceOver on the current GTK frontend.** GTK4 on
+  macOS ships only the AT-SPI backend (`atspi - Not available on this
+  platform`), so `GtkAccessibleText` reaches VoiceOver *not at all*
+  here. There's also no per-pane NSView (GTK draws into one
+  `GtkMacosContentView`). So `pane.zig`, on the GL area's `map`, walks
+  `gtk_widget_get_native` → `gtk_native_get_surface` →
+  `gdk_macos_surface_get_native_window` → `[NSWindow contentView]` and
+  attaches a `SketermTermAXElement` (an `NSAccessibilityElement`, one
+  per pane) as an accessibility child of that content view — visible to
+  VoiceOver. Detach on `unmap`/close, frame from widget bounds,
+  value/selection-changed posted per render. All behind
+  `platform.is_macos`; Linux unchanged.
+- **`build.zig addNsaxBridge`** links the shim + AppKit/Foundation on a
+  native-macOS toolchain; `main.zig` force-includes `nsax.zig` so the
+  exports are present. `SketermTermView : NSView` stays for the future
+  de-GTK'd AppKit pane (`docs/architecture.md` step 1).
+- **Verified end-to-end on hardware**:
+  - `zig build smoke-a11y` — real `SketermTermView` through the AX
+    selectors VoiceOver calls: value, UTF-16 char count, caret range,
+    substring across a 😀 surrogate pair, line ranges.
+  - `SKETERM_A11Y_SELFCHECK=1 sketerm` on the real GUI logs
+    `A11Y-SELFCHECK: pane=1 bits=7 (PASS)` — a VoiceOver client walking
+    window→contentView→child finds an `AXTextArea` whose value is the
+    live terminal text (no TCC grant needed for the in-process check).
+  - `smoke-e2e` PASS with the attach/detach lifecycle live (splits,
+    pane close, quit).
+
+582 tests (incl. 3 new `nsax` conversion tests + the astral
+`char_to_utf16` core test), smoke-a11y + smoke-e2e PASS, mux-portable
+green.
