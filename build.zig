@@ -52,13 +52,21 @@ pub fn build(b: *std.Build) void {
     // Same condition, named for the NSAccessibility bridge (a11y/nsax*):
     // its ObjC shim only builds on a native macOS toolchain.
     const native_macos = native_sck;
+    // Software H.264 (libx264) for the lossy video-tile path. Dynamically
+    // linked on native builds when present (declared a package dep, like
+    // gtk4); the musl-portable daemon never gets it and falls back to
+    // lossless. Auto-detected so the default `zig build`/`test` exercises
+    // it wherever x264 is installed; `-Dvideo=false` forces it off.
+    const have_x264 = b.option(bool, "video", "H.264 video-tile codec via libx264 — requires libx264 (default off)") orelse false;
     const glib_opts = b.addOptions();
     glib_opts.addOption(bool, "glib", true);
     glib_opts.addOption(bool, "winstream_sck", native_sck);
+    glib_opts.addOption(bool, "video", have_x264);
     const glib_opts_mod = glib_opts.createModule();
     const noglib_opts = b.addOptions();
     noglib_opts.addOption(bool, "glib", false);
     noglib_opts.addOption(bool, "winstream_sck", native_sck);
+    noglib_opts.addOption(bool, "video", have_x264);
     const noglib_opts_mod = noglib_opts.createModule();
 
     const exe_mod = b.createModule(.{
@@ -157,6 +165,7 @@ pub fn build(b: *std.Build) void {
     const portable_opts = b.addOptions();
     portable_opts.addOption(bool, "glib", false);
     portable_opts.addOption(bool, "winstream_sck", false);
+    portable_opts.addOption(bool, "video", false);
     mux_portable_mod.addImport("build_options", portable_opts.createModule());
     const mux_portable_exe = b.addExecutable(.{
         .name = "sketerm-mux-portable",
@@ -486,6 +495,9 @@ pub fn build(b: *std.Build) void {
     // Link the NSAccessibility shim so `zig build test` compiles AND
     // links the macOS a11y bridge end-to-end (tests.zig imports nsax.zig).
     if (native_macos) addNsaxBridge(b, tests_mod);
+    // libx264 + shim so `zig build test` compiles AND exercises the
+    // vcodec x264 backend wherever x264 is installed.
+    if (have_x264) addVideo(b, tests_mod);
     const tests = b.addTest(.{
         .root_module = tests_mod,
         .use_lld = use_lld,
@@ -647,6 +659,20 @@ fn addZstd(b: *std.Build, mod: *std.Build.Module) void {
         .file = b.path("vendor/zstd/zstd.c"),
         .flags = &.{ "-O3", "-Wno-unused-function", "-Wno-unused-but-set-variable", "-Wno-unused-parameter" },
     });
+}
+
+/// libx264 + the C shim (vendor/x264_shim.c) for the lossy video path.
+/// Dynamically links the SYSTEM x264 (declared a package dep) rather
+/// than vendoring it — x264's speed lives in per-arch asm, so a vendored
+/// C-only build would be too slow, and the optional video path can be
+/// absent on the portable binary (→ lossless). Gated on build_options.video.
+fn addVideo(b: *std.Build, mod: *std.Build.Module) void {
+    addPkgConfig(b, mod, "x264");
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/x264_shim.c"),
+        .flags = &.{"-O2"},
+    });
+    mod.addIncludePath(b.path("vendor"));
 }
 
 /// ScreenCaptureKit window-stream backend (macOS native builds

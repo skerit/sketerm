@@ -13,8 +13,15 @@
 //! daemon-safe; the future C backends link via extern fn like zstd.
 
 const std = @import("std");
+const build_options = @import("build_options");
+const yuv = @import("../util/yuv.zig");
 
-pub const Error = error{ UnknownCodec, SizeMismatch, Malformed, TooLong, Decode };
+/// libx264 is linked (build_options.video). When false the x264 backend
+/// collapses to `void`, mirroring winstream/source.zig's SckImpl.
+const have_video = build_options.video;
+const X264Impl = if (have_video) X264 else void;
+
+pub const Error = error{ UnknownCodec, SizeMismatch, Malformed, TooLong, Decode, Unsupported, X264 };
 
 /// Which codec produced a tile's bitstream — tells the receiver which
 /// decoder to run, chosen by capability negotiation. Append-only;
@@ -102,20 +109,30 @@ pub const EncodeResult = struct { keyframe: bool, bytes: []const u8 };
 /// reference state) even though the stub is stateless.
 pub const Encoder = union(enum) {
     stub: Stub,
+    x264: X264Impl,
 
     pub fn initStub(allocator: std.mem.Allocator) Encoder {
         return .{ .stub = .{ .allocator = allocator } };
     }
 
+    /// Open a fixed-size H.264 encoder for `w`×`h` tiles. Errors with
+    /// Unsupported when libx264 isn't linked (build_options.video off).
+    pub fn initX264(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32) !Encoder {
+        if (comptime have_video) return .{ .x264 = try X264.init(allocator, w, h, fps) };
+        return Error.Unsupported;
+    }
+
     pub fn deinit(self: *Encoder) void {
         switch (self.*) {
             .stub => |*s| s.deinit(),
+            .x264 => |*s| if (comptime have_video) s.deinit(),
         }
     }
 
     pub fn codec(self: *const Encoder) Codec {
         return switch (self.*) {
             .stub => .stub,
+            .x264 => .h264,
         };
     }
 
@@ -126,7 +143,64 @@ pub const Encoder = union(enum) {
     pub fn encodeTile(self: *Encoder, w: i32, h: i32, pixels: []const u8, force_keyframe: bool) !EncodeResult {
         return switch (self.*) {
             .stub => |*s| s.encodeTile(w, h, pixels, force_keyframe),
+            .x264 => |*s| if (comptime have_video) s.encodeTile(w, h, pixels, force_keyframe) else Error.Unsupported,
         };
+    }
+};
+
+/// libx264 backend via vendor/x264_shim.c. Fixed tile geometry (one
+/// encoder per tile size); BGRA→I420 through yuv.zig, then low-latency
+/// H.264. Compiled only when build_options.video is set.
+const X264 = struct {
+    allocator: std.mem.Allocator,
+    handle: ?*anyopaque,
+    w: i32,
+    h: i32,
+    yp: []u8,
+    up: []u8,
+    vp: []u8,
+    out: std.ArrayList(u8) = .empty,
+
+    extern fn sk_x264_open(width: c_int, height: c_int, fps: c_int) ?*anyopaque;
+    extern fn sk_x264_encode(enc: ?*anyopaque, y: [*]const u8, u: [*]const u8, v: [*]const u8, force_kf: c_int, out: *[*]const u8, is_kf: *c_int) c_int;
+    extern fn sk_x264_close(enc: ?*anyopaque) void;
+
+    fn init(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32) !X264 {
+        if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return Error.SizeMismatch;
+        const uw: u32 = @intCast(w);
+        const uh: u32 = @intCast(h);
+        const handle = sk_x264_open(w, h, fps) orelse return Error.X264;
+        errdefer sk_x264_close(handle);
+        const yp = try allocator.alloc(u8, yuv.ySize(uw, uh));
+        errdefer allocator.free(yp);
+        const up = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
+        errdefer allocator.free(up);
+        const vp = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
+        return .{ .allocator = allocator, .handle = handle, .w = w, .h = h, .yp = yp, .up = up, .vp = vp };
+    }
+
+    fn deinit(self: *X264) void {
+        sk_x264_close(self.handle);
+        self.allocator.free(self.yp);
+        self.allocator.free(self.up);
+        self.allocator.free(self.vp);
+        self.out.deinit(self.allocator);
+    }
+
+    fn encodeTile(self: *X264, w: i32, h: i32, pixels: []const u8, force_keyframe: bool) !EncodeResult {
+        if (w != self.w or h != self.h) return Error.SizeMismatch;
+        const uw: u32 = @intCast(w);
+        const uh: u32 = @intCast(h);
+        if (pixels.len != @as(usize, uw) * uh * 4) return Error.SizeMismatch;
+        yuv.bgraToI420(pixels, uw, uh, self.yp, self.up, self.vp);
+
+        var out_ptr: [*]const u8 = undefined;
+        var is_kf: c_int = 0;
+        const n = sk_x264_encode(self.handle, self.yp.ptr, self.up.ptr, self.vp.ptr, if (force_keyframe) 1 else 0, &out_ptr, &is_kf);
+        if (n <= 0) return Error.X264; // zerolatency should never buffer
+        self.out.clearRetainingCapacity();
+        try self.out.appendSlice(self.allocator, out_ptr[0..@intCast(n)]);
+        return .{ .keyframe = is_kf != 0, .bytes = self.out.items };
     }
 };
 
@@ -275,4 +349,35 @@ test "stub encoder rejects a pixel buffer that isn't w*h*4" {
     defer enc.deinit();
     var px: [10]u8 = undefined;
     try t.expectError(Error.SizeMismatch, enc.encodeTile(2, 2, &px, true)); // needs 16
+}
+
+test "x264 backend encodes a keyframe Annex-B stream (when libx264 linked)" {
+    if (!have_video) return error.SkipZigTest;
+    const a = t.allocator;
+    const w = 64;
+    const h = 64;
+    var enc = try Encoder.initX264(a, w, h, 30);
+    defer enc.deinit();
+    try t.expectEqual(Codec.h264, enc.codec());
+
+    var px: [w * h * 4]u8 = undefined;
+    for (0..h) |yy| for (0..w) |xx| {
+        const o = (yy * w + xx) * 4;
+        px[o + 0] = @truncate(xx * 3);
+        px[o + 1] = @truncate(yy * 3);
+        px[o + 2] = @truncate((xx + yy) * 2);
+        px[o + 3] = 0xff;
+    };
+    const r = try enc.encodeTile(w, h, &px, true);
+    try t.expect(r.keyframe);
+    // Real Annex-B H.264 begins with a start code (00 00 00 01 / 00 00 01).
+    try t.expect(r.bytes.len >= 4);
+    try t.expectEqual(@as(u8, 0), r.bytes[0]);
+    try t.expectEqual(@as(u8, 0), r.bytes[1]);
+    // A second frame (non-forced) still encodes without error.
+    const r2 = try enc.encodeTile(w, h, &px, false);
+    try t.expect(r2.bytes.len > 0);
+
+    // Wrong tile size is rejected.
+    try t.expectError(Error.SizeMismatch, enc.encodeTile(32, 32, &px, false));
 }
