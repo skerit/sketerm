@@ -18,6 +18,7 @@
 //! side-band unit the daemon materializes into a memfd.
 
 const std = @import("std");
+const pixcodec = @import("pixcodec.zig");
 
 pub const Tag = enum(u8) {
     /// Raw Wayland message, both directions.
@@ -47,6 +48,11 @@ pub const Tag = enum(u8) {
     /// GUI→daemon: paste bytes for the oldest held receive-fd
     /// (wl_data_offer.receive's fd, FIFO-paired).
     clip_data = 9,
+    /// Codec-tagged pool update: u32 pool id, u32 offset, then a
+    /// pixcodec body (tag + raw_len + row_stride + bytes). Supersedes
+    /// pool_update / pool_update_z — one tag covers raw, deflate, and
+    /// the predictor codecs. Receivers still accept the legacy two.
+    pool_update_c = 10,
     _,
 };
 
@@ -87,6 +93,40 @@ pub fn appendPoolUpdateZ(out: *std.ArrayList(u8), allocator: std.mem.Allocator, 
     std.mem.writeInt(u32, hdr[13..17], raw_len, .little);
     try out.appendSlice(allocator, &hdr);
     try out.appendSlice(allocator, z);
+}
+
+/// Codec-tagged pool update. `enc` is the chosen encoding from
+/// pixcodec.encodeRegion; `raw_len` is its decoded size and `row_stride`
+/// the buffer's bytes-per-row (for the predictor's inverse on the GUI).
+pub fn appendPoolUpdateC(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    pool: u32,
+    offset: u32,
+    enc: pixcodec.Encoded,
+    raw_len: u32,
+    row_stride: u32,
+) !void {
+    const payload_len = 8 + pixcodec.body_header + enc.bytes.len;
+    var hdr: [header_size + 8]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(payload_len + 1), .little);
+    hdr[4] = @intFromEnum(Tag.pool_update_c);
+    std.mem.writeInt(u32, hdr[5..9], pool, .little);
+    std.mem.writeInt(u32, hdr[9..13], offset, .little);
+    try out.appendSlice(allocator, &hdr);
+    try pixcodec.appendBody(out, allocator, enc, raw_len, row_stride);
+}
+
+pub const PoolUpdateC = struct { pool: u32, offset: u32, body: pixcodec.Body };
+
+pub fn decodePoolUpdateC(payload: []const u8) ?PoolUpdateC {
+    if (payload.len < 8) return null;
+    const body = pixcodec.peelBody(payload[8..]) orelse return null;
+    return .{
+        .pool = std.mem.readInt(u32, payload[0..4], .little),
+        .offset = std.mem.readInt(u32, payload[4..8], .little),
+        .body = body,
+    };
 }
 
 pub fn appendPoolMeta(out: *std.ArrayList(u8), allocator: std.mem.Allocator, tag: Tag, pool: u32, size: u32) !void {
@@ -184,6 +224,41 @@ test "units peel across arbitrary split points" {
     const upd = decodePoolUpdate(third.unit.payload).?;
     try t.expectEqual(@as(u32, 128), upd.offset);
     try t.expectEqualStrings("pixels", upd.bytes);
+}
+
+test "pool_update_c carries addressing + a decodable pixcodec body" {
+    const a = t.allocator;
+    var sc: pixcodec.Scratch = .{};
+    defer sc.deinit(a);
+
+    // A compressible BGRA region (horizontal ramp → predictor wins).
+    const stride = 8 * 4;
+    const rows = 4;
+    var px: [stride * rows]u8 = undefined;
+    for (0..rows) |y| for (0..8) |x| {
+        const i = (y * 8 + x) * 4;
+        px[i + 0] = @truncate(x * 11 + y * 7);
+        px[i + 1] = @truncate(x * 5);
+        px[i + 2] = 0x10;
+        px[i + 3] = 0xff;
+    };
+    const enc = try pixcodec.encodeRegion(&sc, a, &px, stride);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendPoolUpdateC(&out, a, 4, 256, enc, px.len, stride);
+
+    const p = (try peelUnit(out.items)).?;
+    try t.expectEqual(Tag.pool_update_c, p.unit.tag);
+    try t.expectEqual(out.items.len, p.consumed);
+    const upd = decodePoolUpdateC(p.unit.payload).?;
+    try t.expectEqual(@as(u32, 4), upd.pool);
+    try t.expectEqual(@as(u32, 256), upd.offset);
+    try t.expectEqual(@as(u32, px.len), upd.body.raw_len);
+
+    var dst: [stride * rows]u8 = undefined;
+    try pixcodec.decodeBody(upd.body, &dst);
+    try t.expectEqualSlices(u8, &px, &dst);
 }
 
 test "unknown tags peel cleanly for forward compat" {

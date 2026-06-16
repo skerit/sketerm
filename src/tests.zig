@@ -70,6 +70,7 @@ comptime {
     _ = @import("wlhost/pipe.zig");
     _ = @import("wlhost/compositor.zig");
     _ = @import("wlhost/zpool.zig");
+    _ = @import("wlhost/pixcodec.zig");
     _ = @import("winstream/proto.zig");
     _ = @import("winstream/source.zig");
     _ = @import("winstream/keymap.zig");

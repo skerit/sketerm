@@ -11,6 +11,7 @@ const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
 const wlwire = @import("wlhost/wire.zig");
 const wlpipe = @import("wlhost/pipe.zig");
+const wlpixcodec = @import("wlhost/pixcodec.zig");
 const snapshot = @import("mux/snapshot.zig");
 const Screen = @import("grid/screen.zig").Screen;
 const Pool = @import("grid/style_pool.zig").Pool;
@@ -217,6 +218,15 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
                 if (upd.pool != 4) fail("pool update id");
                 if (upd.offset != update_bytes.items.len) fail("pool update offset");
                 update_bytes.appendSlice(allocator, upd.bytes) catch fail("oom");
+            },
+            .pool_update_c => {
+                const upd = wlpipe.decodePoolUpdateC(p.unit.payload) orelse fail("pool update c");
+                if (upd.pool != 4) fail("pool update c id");
+                if (upd.offset != update_bytes.items.len) fail("pool update c offset");
+                const dst = allocator.alloc(u8, upd.body.raw_len) catch fail("oom");
+                defer allocator.free(dst);
+                wlpixcodec.decodeBody(upd.body, dst) catch fail("pool update c decode");
+                update_bytes.appendSlice(allocator, dst) catch fail("oom");
             },
             else => {},
         }
@@ -598,18 +608,12 @@ fn winstreamStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
                             if (wo.w != 320 or wo.h != 240) fail("ws open size");
                             saw_open = true;
                         },
-                        .win_frame, .win_frame_z => {
-                            var red: u8 = 0;
-                            if (p.unit.tag == .win_frame) {
-                                const fr = wsproto.decodeFrame(p.unit.payload) orelse fail("ws frame dec");
-                                red = fr.pixels[2];
-                            } else {
-                                const fz = wsproto.decodeFrameZ(p.unit.payload) orelse fail("ws framez dec");
-                                const scratch = allocator.alloc(u8, fz.raw_len) catch fail("oom");
-                                defer allocator.free(scratch);
-                                const rawpx = @import("wlhost/zpool.zig").decompress(fz.z, scratch) catch fail("ws inflate");
-                                red = rawpx[2];
-                            }
+                        .win_frame_c => {
+                            const fc = wsproto.decodeWinFrameC(p.unit.payload) orelse fail("ws frame_c dec");
+                            const scratch = allocator.alloc(u8, fc.body.raw_len) catch fail("oom");
+                            defer allocator.free(scratch);
+                            wlpixcodec.decodeBody(fc.body, scratch) catch fail("ws frame_c decode");
+                            const red = scratch[2];
                             if (!sent_key) {
                                 tint_before = red;
                             } else if (red != tint_before.?) {
