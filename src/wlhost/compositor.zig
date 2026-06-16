@@ -148,11 +148,12 @@ const globals = [_]Global{
 
 const Pool = struct {
     bytes: std.ArrayList(u8) = .empty,
-    /// Lazily-created H.264 decoder for pool_vtile updates to this pool,
-    /// recreated when the tile dimensions change (build_options.video).
+    /// Lazily-created video decoder for pool_vtile updates to this pool,
+    /// recreated when the tile dimensions or codec change (-Dvideo).
     vdec: ?vcodec.Decoder = null,
     vdec_w: i32 = 0,
     vdec_h: i32 = 0,
+    vdec_codec: vcodec.Codec = .stub,
 
     fn deinit(self: *Pool, a: std.mem.Allocator) void {
         self.bytes.deinit(a);
@@ -684,12 +685,13 @@ pub const Compositor = struct {
                 const pool = self.pools.getPtr(vt.pool) orelse return Error.Protocol;
                 const uw: usize = @intCast(tile.w);
                 const uh: usize = @intCast(tile.h);
-                // Per-pool decoder, recreated on a dimension change.
-                if (pool.vdec == null or pool.vdec_w != tile.w or pool.vdec_h != tile.h) {
+                // Per-pool decoder, recreated on a dimension or codec change.
+                if (pool.vdec == null or pool.vdec_w != tile.w or pool.vdec_h != tile.h or pool.vdec_codec != tile.codec) {
                     if (pool.vdec) |*d| d.deinit();
-                    pool.vdec = vcodec.Decoder.initAvcodec(self.allocator, tile.w, tile.h) catch return Error.Protocol;
+                    pool.vdec = vcodec.Decoder.initAvcodec(self.allocator, tile.w, tile.h, tile.codec) catch return Error.Protocol;
                     pool.vdec_w = tile.w;
                     pool.vdec_h = tile.h;
+                    pool.vdec_codec = tile.codec;
                 }
                 try self.vscratch.resize(self.allocator, uw * uh * 4);
                 pool.vdec.?.decodeTile(tile, self.vscratch.items) catch return Error.Protocol;

@@ -18,8 +18,10 @@ typedef struct {
 
 void sk_avdec_close(void *dec);
 
-void *sk_avdec_open(void) {
-    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+// `which`: 0 = H.264, 1 = AV1.
+void *sk_avdec_open(int which) {
+    enum AVCodecID id = (which == 1) ? AV_CODEC_ID_AV1 : AV_CODEC_ID_H264;
+    const AVCodec *codec = avcodec_find_decoder(id);
     if (!codec) return NULL;
     sk_avdec *d = (sk_avdec *)calloc(1, sizeof(sk_avdec));
     if (!d) return NULL;

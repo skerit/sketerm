@@ -680,6 +680,7 @@ fn addVideo(b: *std.Build, mod: *std.Build.Module) void {
     addPkgConfig(b, mod, "libavutil");
     mod.addCSourceFile(.{ .file = b.path("vendor/x264_shim.c"), .flags = &.{"-O2"} });
     mod.addCSourceFile(.{ .file = b.path("vendor/avdec_shim.c"), .flags = &.{"-O2"} });
+    mod.addCSourceFile(.{ .file = b.path("vendor/avenc_shim.c"), .flags = &.{"-O2"} });
     mod.addIncludePath(b.path("vendor"));
 }
 
