@@ -147,6 +147,7 @@ pub fn build(b: *std.Build) void {
         .file = b.path("vendor/stb_image_impl.c"),
         .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
     });
+    addZstd(b, mux_portable_mod);
     mux_portable_mod.addIncludePath(b.path("vendor"));
     // mux-portable NEVER carries the ScreenCaptureKit backend:
     // explicit -Dportable-target triples count as cross builds, so
@@ -632,7 +633,20 @@ fn configureCoreDeps(
         .file = b.path("vendor/stb_image_impl.c"),
         .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
     });
+    addZstd(b, mod);
     mod.addIncludePath(b.path("vendor"));
+}
+
+/// Vendored single-file zstd, compiled statically into every artifact
+/// that links src/wlhost/pixcodec.zig (called via extern fn — no header
+/// needed). Self-contained C (ASM + legacy disabled in the amalgamation),
+/// so it links the native daemon, the GUI, AND the musl-static portable
+/// binary alike. See vendor/zstd/PROVENANCE.txt.
+fn addZstd(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/zstd/zstd.c"),
+        .flags = &.{ "-O3", "-Wno-unused-function", "-Wno-unused-but-set-variable", "-Wno-unused-parameter" },
+    });
 }
 
 /// ScreenCaptureKit window-stream backend (macOS native builds
@@ -691,6 +705,7 @@ fn configureSysDeps(
         .file = b.path("vendor/stb_image_impl.c"),
         .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
     });
+    addZstd(b, mod);
     mod.addIncludePath(b.path("vendor"));
 }
 

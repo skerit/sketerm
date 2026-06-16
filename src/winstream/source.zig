@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const proto = @import("proto.zig");
 const zpool = @import("../wlhost/zpool.zig");
+const pixcodec = @import("../wlhost/pixcodec.zig");
 
 pub const have_sck = builtin.os.tag == .macos and build_options.winstream_sck;
 const SckImpl = if (have_sck) @import("sck.zig").Source else void;
@@ -96,6 +97,7 @@ pub const Stub = struct {
     h: i32 = 240,
     frame_buf: std.ArrayList(u8) = .empty,
     zbuf: std.ArrayList(u8) = .empty,
+    sc: pixcodec.Scratch = .{},
 
     pub fn init(allocator: std.mem.Allocator) Stub {
         return .{ .allocator = allocator };
@@ -104,6 +106,7 @@ pub const Stub = struct {
     pub fn deinit(self: *Stub) void {
         self.frame_buf.deinit(self.allocator);
         self.zbuf.deinit(self.allocator);
+        self.sc.deinit(self.allocator);
     }
 
     /// `now_ms`: caller's monotonic clock — frames are limited to
@@ -135,12 +138,9 @@ pub const Stub = struct {
                 self.frame_buf.items[i + 3] = 0xff;
             }
         }
-        try proto.appendFrameMaybeZ(out, out_allocator, &self.zbuf, self.allocator, .{
-            .win = 1,
-            .w = self.w,
-            .h = self.h,
-            .pixels = self.frame_buf.items,
-        });
+        const enc = pixcodec.encodeRegion(&self.sc, self.allocator, self.frame_buf.items, @intCast(self.w * 4)) catch
+            pixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = self.frame_buf.items };
+        try proto.appendWinFrameC(out, out_allocator, 1, self.w, self.h, enc);
     }
 
     pub fn handleInput(self: *Stub, unit: proto.Unit) void {
@@ -193,14 +193,13 @@ test "stub source: open, frames, input feedback (via Source dispatch)" {
 
     try src.poll(&out, t.allocator, 200);
     const u3_ = (try proto.peelUnit(out.items)).?;
-    try t.expect(u3_.unit.tag == .win_frame or u3_.unit.tag == .win_frame_z); // no re-open
+    try t.expectEqual(proto.Tag.win_frame_c, u3_.unit.tag); // no re-open
     try t.expect(frameRed(u3_.unit, &raw) != r_before);
 }
 
-/// Red byte of pixel 0, inflating frame_z when needed.
+/// Red byte of pixel 0, reconstructing the shared-codec body.
 fn frameRed(u: proto.Unit, scratch: []u8) u8 {
-    if (u.tag == .win_frame) return proto.decodeFrame(u.payload).?.pixels[2];
-    const fz = proto.decodeFrameZ(u.payload).?;
-    const raw = zpool.decompress(fz.z, scratch[0..fz.raw_len]) catch unreachable;
-    return raw[2];
+    const fc = proto.decodeWinFrameC(u.payload).?;
+    pixcodec.decodeBody(fc.body, scratch[0..fc.body.raw_len]) catch unreachable;
+    return scratch[2];
 }

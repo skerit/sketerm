@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const zpool = @import("../wlhost/zpool.zig");
+const pixcodec = @import("../wlhost/pixcodec.zig");
 
 pub const Tag = enum(u8) {
     /// u32 win, i32 w, i32 h, title bytes.
@@ -34,6 +35,11 @@ pub const Tag = enum(u8) {
     /// are the window dims the rects were measured against — the
     /// client scales them to its current frame size.
     win_drag = 6,
+    /// u32 win, i32 w, i32 h, then a pixcodec body (tag + raw_len +
+    /// row_stride + bytes). Supersedes win_frame / win_frame_z — one
+    /// tag spans raw, deflate, and the predictor codecs, shared with
+    /// the Wayland pool path. Receivers still accept the legacy two.
+    win_frame_c = 7,
     // client → agent
     /// u32 win, u32 evdev key, u8 pressed, u32 mods (X11 order).
     input_key = 16,
@@ -197,6 +203,53 @@ pub fn decodeFrameAny(
     }
 }
 
+// ── codec-tagged frame (shared pixcodec body) ───────────────────
+
+/// Emit a whole-window frame through the shared pixel codec. `enc` is
+/// the chosen encoding of `w`×`h` BGRA; raw_len and row_stride follow
+/// from the dimensions (tight stride). Phase 1 adds a damaged-rect
+/// variant; the body framing is identical.
+pub fn appendWinFrameC(out: *std.ArrayList(u8), a: std.mem.Allocator, win: u32, w: i32, h: i32, enc: pixcodec.Encoded) !void {
+    const raw_len: u32 = @intCast(@as(i64, w) * @as(i64, h) * 4);
+    const row_stride: u32 = @intCast(@as(i64, w) * 4);
+    const payload_len = 12 + pixcodec.body_header + enc.bytes.len;
+    var hdr: [header_size + 12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(payload_len + 1), .little);
+    hdr[4] = @intFromEnum(Tag.win_frame_c);
+    std.mem.writeInt(u32, hdr[5..9], win, .little);
+    std.mem.writeInt(i32, hdr[9..13], w, .little);
+    std.mem.writeInt(i32, hdr[13..17], h, .little);
+    try out.appendSlice(a, &hdr);
+    try pixcodec.appendBody(out, a, enc, raw_len, row_stride);
+}
+
+pub const WinFrameC = struct { win: u32, w: i32, h: i32, body: pixcodec.Body };
+
+pub fn decodeWinFrameC(p: []const u8) ?WinFrameC {
+    if (p.len < 12) return null;
+    const body = pixcodec.peelBody(p[12..]) orelse return null;
+    return .{
+        .win = std.mem.readInt(u32, p[0..4], .little),
+        .w = std.mem.readInt(i32, p[4..8], .little),
+        .h = std.mem.readInt(i32, p[8..12], .little),
+        .body = body,
+    };
+}
+
+/// Decode a win_frame_c unit to a pixel frame, reconstructing into
+/// caller-owned `scratch` (resized to fit). Mirrors decodeFrameAny so
+/// receivers treat legacy and codec frames the same way. Null on a
+/// malformed unit or a body that disagrees with the dimensions.
+pub fn decodeFrameC(payload: []const u8, scratch: *std.ArrayList(u8), scratch_a: std.mem.Allocator) !?Frame {
+    const fc = decodeWinFrameC(payload) orelse return null;
+    if (fc.w <= 0 or fc.h <= 0) return null;
+    const need = @as(usize, @intCast(fc.w)) * 4 * @as(usize, @intCast(fc.h));
+    if (fc.body.raw_len != need) return null;
+    try scratch.resize(scratch_a, fc.body.raw_len);
+    pixcodec.decodeBody(fc.body, scratch.items) catch return null;
+    return .{ .win = fc.win, .w = fc.w, .h = fc.h, .pixels = scratch.items };
+}
+
 // ── draggable-region payload (agent → client) ───────────────────
 
 /// Plenty for a title strip's draggable runs; the daemon caps here too.
@@ -347,6 +400,44 @@ test "winstream units round-trip" {
     // Frame size mismatch is rejected.
     var bad = u2_.unit.payload[0 .. u2_.unit.payload.len - 1];
     try t.expectEqual(@as(?Frame, null), decodeFrame(bad));
+    _ = &bad;
+}
+
+test "win_frame_c round-trips through the shared codec" {
+    const a = t.allocator;
+    var sc: pixcodec.Scratch = .{};
+    defer sc.deinit(a);
+
+    const w = 12;
+    const h = 5;
+    var px: [w * h * 4]u8 = undefined;
+    for (0..h) |y| for (0..w) |x| {
+        const i = (y * w + x) * 4;
+        px[i + 0] = @truncate(x * 9 + y * 3);
+        px[i + 1] = @truncate(x * 4);
+        px[i + 2] = 0x55;
+        px[i + 3] = 0xff;
+    };
+    const enc = try pixcodec.encodeRegion(&sc, a, &px, w * 4);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendWinFrameC(&out, a, 9, w, h, enc);
+
+    const u = (try peelUnit(out.items)).?;
+    try t.expectEqual(Tag.win_frame_c, u.unit.tag);
+    try t.expectEqual(out.items.len, u.consumed);
+
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(a);
+    const fr = (try decodeFrameC(u.unit.payload, &scratch, a)).?;
+    try t.expectEqual(@as(u32, 9), fr.win);
+    try t.expectEqual(@as(i32, w), fr.w);
+    try t.expectEqualSlices(u8, &px, fr.pixels);
+
+    // A body whose raw_len disagrees with the dims is rejected.
+    var bad = u.unit.payload[0 .. u.unit.payload.len - 1];
+    try t.expectEqual(@as(?Frame, null), try decodeFrameC(bad, &scratch, a));
     _ = &bad;
 }
 

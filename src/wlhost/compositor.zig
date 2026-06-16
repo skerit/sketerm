@@ -23,6 +23,7 @@ const std = @import("std");
 const wire = @import("wire.zig");
 const protocol = @import("protocol.zig");
 const pipe = @import("pipe.zig");
+const pixcodec = @import("pixcodec.zig");
 
 /// Fixed pc105/us xkb keymap (scope pin: layouts come later).
 /// Generated: `xkbcli compile-keymap --layout us --model pc105`.
@@ -649,6 +650,14 @@ pub const Compositor = struct {
                 const end = @as(usize, upd.offset) + upd.raw_len;
                 if (end > pool.bytes.items.len) return Error.Protocol;
                 _ = @import("zpool.zig").decompress(upd.z, pool.bytes.items[upd.offset..end]) catch
+                    return Error.Protocol;
+            },
+            .pool_update_c => {
+                const upd = pipe.decodePoolUpdateC(payload) orelse return Error.Protocol;
+                const pool = self.pools.getPtr(upd.pool) orelse return Error.Protocol;
+                const end = @as(usize, upd.offset) + upd.body.raw_len;
+                if (end > pool.bytes.items.len) return Error.Protocol;
+                pixcodec.decodeBody(upd.body, pool.bytes.items[upd.offset..end]) catch
                     return Error.Protocol;
             },
             .pool_destroy => {

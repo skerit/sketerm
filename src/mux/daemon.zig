@@ -17,6 +17,7 @@ const wire = @import("wire.zig");
 const wlwire = @import("../wlhost/wire.zig");
 const wltrack = @import("../wlhost/track.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
+const wlpixcodec = @import("../wlhost/pixcodec.zig");
 const wsproto = @import("../winstream/proto.zig");
 const wssource = @import("../winstream/source.zig");
 const WsSource = wssource.Source;
@@ -970,27 +971,25 @@ pub const Daemon = struct {
                             y1 = @min(y1, @as(i64, d.y1));
                         }
                         if (y0 < y1) {
-                            const off: usize = @intCast(@as(i64, cm.info.offset) + y0 * cm.info.stride);
-                            const len: usize = @intCast((y1 - y0) * cm.info.stride);
-                            const end = @min(off +| len, mirror.size);
-                            var chunk = @min(off, end);
-                            while (chunk < end) {
-                                const chunk_end = @min(chunk + POOL_CHUNK, end);
-                                const raw = mirror.ptr[chunk..chunk_end];
-                                // Deflate when it shrinks (pixel rows
-                                // usually do); raw otherwise.
-                                var sent_z = false;
-                                if (raw.len >= 1024) {
-                                    if (a.alloc(u8, raw.len)) |zbuf| {
-                                        defer a.free(zbuf);
-                                        if (@import("../wlhost/zpool.zig").compress(raw, zbuf)) |z| {
-                                            try wlpipe.appendPoolUpdateZ(units, a, cm.info.pool, @intCast(chunk), @intCast(raw.len), z);
-                                            sent_z = true;
-                                        }
-                                    } else |_| {}
+                            // Chunk by WHOLE ROWS so each chunk starts at
+                            // column 0 — the pixcodec predictor resets per
+                            // row, and arbitrary byte cuts would misalign it.
+                            const stride: usize = @intCast(cm.info.stride);
+                            const rows_per_chunk: i64 = @intCast(@max(1, POOL_CHUNK / stride));
+                            var sc: wlpixcodec.Scratch = .{}; // arena-backed; reset on drain
+                            var y = y0;
+                            while (y < y1) {
+                                const yc = @min(y + rows_per_chunk, y1);
+                                const off: usize = @intCast(@as(i64, cm.info.offset) + y * cm.info.stride);
+                                const len: usize = @intCast((yc - y) * cm.info.stride);
+                                const end = @min(off +| len, mirror.size);
+                                if (off < end) {
+                                    const raw = mirror.ptr[off..end];
+                                    const enc = wlpixcodec.encodeRegion(&sc, a, raw, stride) catch
+                                        wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
+                                    try wlpipe.appendPoolUpdateC(units, a, cm.info.pool, @intCast(off), enc, @intCast(raw.len), @intCast(stride));
                                 }
-                                if (!sent_z) try wlpipe.appendPoolUpdate(units, a, cm.info.pool, @intCast(chunk), raw);
-                                chunk = chunk_end;
+                                y = yc;
                             }
                         }
                     }

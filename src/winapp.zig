@@ -156,6 +156,10 @@ pub const WsHost = struct {
                 const fr = (proto.decodeFrameAny(u.tag, u.payload, &self.zbuf, self.allocator) catch return error.Protocol) orelse return error.Protocol;
                 self.showFrame(fr.win, fr.w, fr.h, fr.pixels);
             },
+            .win_frame_c => {
+                const fr = (proto.decodeFrameC(u.payload, &self.zbuf, self.allocator) catch return error.Protocol) orelse return error.Protocol;
+                self.showFrame(fr.win, fr.w, fr.h, fr.pixels);
+            },
             .win_title => {
                 if (u.payload.len < 4) return error.Protocol;
                 const id = std.mem.readInt(u32, u.payload[0..4], .little);
