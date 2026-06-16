@@ -53,6 +53,13 @@ pub const Tag = enum(u8) {
     /// pool_update / pool_update_z — one tag covers raw, deflate, and
     /// the predictor codecs. Receivers still accept the legacy two.
     pool_update_c = 10,
+    /// Video-coded pool region (the LOSSY path for hot regions): u32
+    /// pool id, u32 offset, u32 row_stride, then an opaque vcodec tile
+    /// blob (wlhost/vcodec.zig appendTile). The GUI decodes the tile to
+    /// BGRA and writes it into the pool mirror at offset, w*4 bytes per
+    /// row, stepping by row_stride — same destination as pool_update_c,
+    /// just a temporal coder instead of a per-region one.
+    pool_vtile = 11,
     _,
 };
 
@@ -126,6 +133,33 @@ pub fn decodePoolUpdateC(payload: []const u8) ?PoolUpdateC {
         .pool = std.mem.readInt(u32, payload[0..4], .little),
         .offset = std.mem.readInt(u32, payload[4..8], .little),
         .body = body,
+    };
+}
+
+/// Video-coded pool region. `blob` is an opaque wlhost/vcodec.zig tile
+/// (this layer doesn't decode it — the GUI does); we only carry the
+/// pool placement (id, byte offset, row stride).
+pub fn appendPoolVtile(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pool: u32, offset: u32, row_stride: u32, blob: []const u8) !void {
+    const payload_len = 12 + blob.len;
+    var hdr: [header_size + 12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(payload_len + 1), .little);
+    hdr[4] = @intFromEnum(Tag.pool_vtile);
+    std.mem.writeInt(u32, hdr[5..9], pool, .little);
+    std.mem.writeInt(u32, hdr[9..13], offset, .little);
+    std.mem.writeInt(u32, hdr[13..17], row_stride, .little);
+    try out.appendSlice(allocator, &hdr);
+    try out.appendSlice(allocator, blob);
+}
+
+pub const PoolVtile = struct { pool: u32, offset: u32, row_stride: u32, blob: []const u8 };
+
+pub fn decodePoolVtile(payload: []const u8) ?PoolVtile {
+    if (payload.len < 12) return null;
+    return .{
+        .pool = std.mem.readInt(u32, payload[0..4], .little),
+        .offset = std.mem.readInt(u32, payload[4..8], .little),
+        .row_stride = std.mem.readInt(u32, payload[8..12], .little),
+        .blob = payload[12..],
     };
 }
 
@@ -259,6 +293,23 @@ test "pool_update_c carries addressing + a decodable pixcodec body" {
     var dst: [stride * rows]u8 = undefined;
     try pixcodec.decodeBody(upd.body, &dst);
     try t.expectEqualSlices(u8, &px, &dst);
+}
+
+test "pool_vtile carries pool placement + an opaque video blob" {
+    const a = t.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const blob = "an-opaque-vcodec-tile-bitstream";
+    try appendPoolVtile(&out, a, 4, 4096, 1280, blob);
+
+    const p = (try peelUnit(out.items)).?;
+    try t.expectEqual(Tag.pool_vtile, p.unit.tag);
+    try t.expectEqual(out.items.len, p.consumed);
+    const vt = decodePoolVtile(p.unit.payload).?;
+    try t.expectEqual(@as(u32, 4), vt.pool);
+    try t.expectEqual(@as(u32, 4096), vt.offset);
+    try t.expectEqual(@as(u32, 1280), vt.row_stride);
+    try t.expectEqualStrings(blob, vt.blob);
 }
 
 test "unknown tags peel cleanly for forward compat" {
