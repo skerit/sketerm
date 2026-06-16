@@ -40,6 +40,11 @@ pub const Tag = enum(u8) {
     /// tag spans raw, deflate, and the predictor codecs, shared with
     /// the Wayland pool path. Receivers still accept the legacy two.
     win_frame_c = 7,
+    /// Damaged sub-rect of a window: u32 win, i32 x, i32 y, i32 w,
+    /// i32 h, then a pixcodec body for the w×h rect. The receiver blits
+    /// it into the window's backing buffer at (x,y) — the bandwidth win
+    /// once a source declares damage (Phase 1 / macOS SCK dirty rects).
+    win_patch_c = 8,
     // client → agent
     /// u32 win, u32 evdev key, u8 pressed, u32 mods (X11 order).
     input_key = 16,
@@ -250,6 +255,55 @@ pub fn decodeFrameC(payload: []const u8, scratch: *std.ArrayList(u8), scratch_a:
     return .{ .win = fc.win, .w = fc.w, .h = fc.h, .pixels = scratch.items };
 }
 
+// ── damaged sub-rect (shared pixcodec body) ─────────────────────
+
+/// Emit a damaged w×h rect at (x,y) of window `win`. `enc` encodes the
+/// rect's tight BGRA (row_stride = w*4); the receiver blits it into the
+/// window's backing buffer.
+pub fn appendWinPatchC(out: *std.ArrayList(u8), a: std.mem.Allocator, win: u32, x: i32, y: i32, w: i32, h: i32, enc: pixcodec.Encoded) !void {
+    const payload_len = 20 + pixcodec.body_header + enc.bytes.len;
+    var hdr: [header_size + 20]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(payload_len + 1), .little);
+    hdr[4] = @intFromEnum(Tag.win_patch_c);
+    std.mem.writeInt(u32, hdr[5..9], win, .little);
+    std.mem.writeInt(i32, hdr[9..13], x, .little);
+    std.mem.writeInt(i32, hdr[13..17], y, .little);
+    std.mem.writeInt(i32, hdr[17..21], w, .little);
+    std.mem.writeInt(i32, hdr[21..25], h, .little);
+    try out.appendSlice(a, &hdr);
+    try pixcodec.appendBody(out, a, enc, @intCast(@as(i64, w) * @as(i64, h) * 4), @intCast(@as(i64, w) * 4));
+}
+
+pub const WinPatchC = struct { win: u32, x: i32, y: i32, w: i32, h: i32, body: pixcodec.Body };
+
+pub fn decodeWinPatchC(p: []const u8) ?WinPatchC {
+    if (p.len < 20) return null;
+    const body = pixcodec.peelBody(p[20..]) orelse return null;
+    return .{
+        .win = std.mem.readInt(u32, p[0..4], .little),
+        .x = std.mem.readInt(i32, p[4..8], .little),
+        .y = std.mem.readInt(i32, p[8..12], .little),
+        .w = std.mem.readInt(i32, p[12..16], .little),
+        .h = std.mem.readInt(i32, p[16..20], .little),
+        .body = body,
+    };
+}
+
+pub const Patch = struct { win: u32, x: i32, y: i32, w: i32, h: i32, pixels: []const u8 };
+
+/// Decode a win_patch_c unit, reconstructing the rect pixels into
+/// caller-owned `scratch`. Null on a malformed unit or a body whose
+/// raw_len disagrees with w×h.
+pub fn decodePatchC(payload: []const u8, scratch: *std.ArrayList(u8), scratch_a: std.mem.Allocator) !?Patch {
+    const pc = decodeWinPatchC(payload) orelse return null;
+    if (pc.w <= 0 or pc.h <= 0) return null;
+    const need = @as(usize, @intCast(pc.w)) * 4 * @as(usize, @intCast(pc.h));
+    if (pc.body.raw_len != need) return null;
+    try scratch.resize(scratch_a, pc.body.raw_len);
+    pixcodec.decodeBody(pc.body, scratch.items) catch return null;
+    return .{ .win = pc.win, .x = pc.x, .y = pc.y, .w = pc.w, .h = pc.h, .pixels = scratch.items };
+}
+
 // ── draggable-region payload (agent → client) ───────────────────
 
 /// Plenty for a title strip's draggable runs; the daemon caps here too.
@@ -439,6 +493,41 @@ test "win_frame_c round-trips through the shared codec" {
     var bad = u.unit.payload[0 .. u.unit.payload.len - 1];
     try t.expectEqual(@as(?Frame, null), try decodeFrameC(bad, &scratch, a));
     _ = &bad;
+}
+
+test "win_patch_c carries rect coords + a decodable body" {
+    const a = t.allocator;
+    var sc: pixcodec.Scratch = .{};
+    defer sc.deinit(a);
+
+    const w = 10;
+    const h = 6;
+    var px: [w * h * 4]u8 = undefined;
+    for (0..h) |y| for (0..w) |x| {
+        const i = (y * w + x) * 4;
+        px[i + 0] = @truncate(x * 13 + y * 5);
+        px[i + 1] = @truncate(x * 2);
+        px[i + 2] = 0x40;
+        px[i + 3] = 0xff;
+    };
+    const enc = try pixcodec.encodeRegion(&sc, a, &px, w * 4);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendWinPatchC(&out, a, 3, 100, 50, w, h, enc);
+
+    const u = (try peelUnit(out.items)).?;
+    try t.expectEqual(Tag.win_patch_c, u.unit.tag);
+    try t.expectEqual(out.items.len, u.consumed);
+
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(a);
+    const p = (try decodePatchC(u.unit.payload, &scratch, a)).?;
+    try t.expectEqual(@as(u32, 3), p.win);
+    try t.expectEqual(@as(i32, 100), p.x);
+    try t.expectEqual(@as(i32, 50), p.y);
+    try t.expectEqual(@as(i32, w), p.w);
+    try t.expectEqualSlices(u8, &px, p.pixels);
 }
 
 test "win_drag round-trips rects + ref dims" {

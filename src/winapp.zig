@@ -50,6 +50,12 @@ pub const WsHost = struct {
         /// wlapp.zig's fwd_press for the host-resize band.
         fwd_press: bool = true,
 
+        /// Persistent BGRA backing (w*h*4). Full frames fill it,
+        /// damaged patches (win_patch_c) blit into it, and every
+        /// present re-wraps it as a texture — so a damaged-rect source
+        /// only has to ship the rect, not the whole window.
+        backing: std.ArrayList(u8) = .empty,
+
         /// Is (x,y) — picture-local — inside a draggable region? Rects are
         /// in point space; scale to the current frame size so the test
         /// matches the press coordinates.
@@ -98,6 +104,17 @@ pub const WsHost = struct {
             proto.appendInputKey(&win.host.out, win.host.allocator, .{ .win = win.id, .key = key, .pressed = pressed, .mods = @as(u32, @intCast(state)) & 0xff }) catch return;
             win.host.flush();
         }
+
+        /// Re-wrap the backing buffer as a texture and show it.
+        fn present(win: *Win) void {
+            if (win.w <= 0 or win.h <= 0) return;
+            const need: usize = @as(usize, @intCast(win.w)) * @as(usize, @intCast(win.h)) * 4;
+            if (win.backing.items.len < need) return;
+            // 0 = premultiplied BGRA — what the winstream agent sends.
+            const tex = rw.newTexture(win.w, win.h, 0, win.backing.items[0..need]) orelse return;
+            defer c.g_object_unref(tex);
+            c.gtk_picture_set_paintable(@ptrCast(win.picture), @ptrCast(tex));
+        }
     };
 
     pub fn create(allocator: std.mem.Allocator) !*WsHost {
@@ -111,6 +128,7 @@ pub const WsHost = struct {
         while (it.next()) |w| {
             w.*.cancelOpaqueResize();
             self.allocator.free(w.*.drag_rects);
+            w.*.backing.deinit(self.allocator);
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-winapp", null);
             c.gtk_window_destroy(w.*.window);
             self.allocator.destroy(w.*);
@@ -160,6 +178,10 @@ pub const WsHost = struct {
                 const fr = (proto.decodeFrameC(u.payload, &self.zbuf, self.allocator) catch return error.Protocol) orelse return error.Protocol;
                 self.showFrame(fr.win, fr.w, fr.h, fr.pixels);
             },
+            .win_patch_c => {
+                const p = (proto.decodePatchC(u.payload, &self.zbuf, self.allocator) catch return error.Protocol) orelse return error.Protocol;
+                self.showPatch(p);
+            },
             .win_title => {
                 if (u.payload.len < 4) return error.Protocol;
                 const id = std.mem.readInt(u32, u.payload[0..4], .little);
@@ -175,6 +197,7 @@ pub const WsHost = struct {
                 _ = self.windows.remove(id);
                 win.cancelOpaqueResize();
                 self.allocator.free(win.drag_rects);
+                win.backing.deinit(self.allocator);
                 _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-winapp", null);
                 c.gtk_window_destroy(win.window);
                 self.allocator.destroy(win);
@@ -198,10 +221,20 @@ pub const WsHost = struct {
 
     fn showFrame(self: *WsHost, id: u32, w: i32, h: i32, pixels: []const u8) void {
         const win = self.winFor(id, w, h, "remote window") orelse return;
-        // 0 = premultiplied BGRA — what the winstream agent sends.
-        const tex = rw.newTexture(w, h, 0, pixels) orelse return;
-        defer c.g_object_unref(tex);
-        c.gtk_picture_set_paintable(@ptrCast(win.picture), @ptrCast(tex));
+        const need: usize = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+        if (pixels.len < need) return;
+        win.backing.resize(self.allocator, need) catch return;
+        @memcpy(win.backing.items, pixels[0..need]);
+        win.present();
+    }
+
+    /// Apply a damaged sub-rect into the window's backing, then present.
+    /// Dropped if no full frame has established the backing yet.
+    fn showPatch(self: *WsHost, p: proto.Patch) void {
+        const win = self.windows.get(p.win) orelse return;
+        if (win.backing.items.len == 0) return;
+        rw.blitRect(win.backing.items, win.w, win.h, p.pixels, p.x, p.y, p.w, p.h);
+        win.present();
     }
 
     fn winFor(self: *WsHost, id: u32, w: i32, h: i32, title: []const u8) ?*Win {
