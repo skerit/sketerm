@@ -1581,6 +1581,19 @@ pub const Daemon = struct {
             return;
         }
         cl.attached = s;
+        // A (re)attaching client has no prior video reference frames, so
+        // force the next video tile on every live surface to be a
+        // keyframe. No-op unless video is active (vstate is otherwise
+        // empty). rudp makes the transport reliable, so this — not
+        // loss-recovery — is the only keyframe trigger needed.
+        for (self.channels.items) |ch| {
+            if (ch.session == s) {
+                if (ch.native) |nv| {
+                    var vit = nv.vstate.valueIterator();
+                    while (vit.next()) |v| v.needs_kf = true;
+                }
+            }
+        }
         self.queueSnapshot(cl, s);
         if (cl.proto >= 2) {
             if (s.winstream != null) self.openWinstreamChan(s, cl);
