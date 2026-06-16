@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) void {
     // force-includes nsax.zig on macOS so its export callbacks are
     // present for the shim to resolve.
     if (native_macos) addNsaxBridge(b, exe_mod);
+    if (have_x264) addVideo(b, exe_mod); // GUI-side H.264 decode (-Dvideo)
 
     const exe = b.addExecutable(.{
         .name = "sketerm",
