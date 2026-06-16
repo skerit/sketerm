@@ -5693,3 +5693,30 @@ decode the legacy `pool_update_z`/`win_frame_z` units.
 
 596 tests, GUI build, smoke-mux (both paths round-trip through real
 zstd), mux-portable static — all green.
+
+## 2026-06-16: winstream damaged-rect patches + receiver backing buffer
+
+Receiver half of damage-aware macOS streaming — so the SCK source can
+ship only the dirty rects instead of whole windows.
+
+- **`win_patch_c`** (winstream/proto.zig) — a damaged sub-rect:
+  `[win][x][y][w][h]` + a pixcodec body for the w×h rect, with
+  `decodeWinPatchC` / `decodePatchC`.
+- **`blitRect`** (remote_window.zig) — blits a tight w×h BGRA rect into
+  a backing buffer at (x,y), CLIPPING out-of-bounds rows/cols so a
+  malformed wire rect can never overrun. Unit-tested incl. edge/clip.
+- **Per-window backing buffer** (winapp.zig `WsHost.Win.backing`): full
+  frames (`win_frame_c`) fill it, patches blit into it, and a single
+  `present()` re-wraps the whole backing as a `GdkMemoryTexture`. Freed
+  in both teardown paths. The full-frame→backing→present path is what
+  the stub exercises today; patches are exercised by the SCK source.
+- **Wayland needed nothing**: the compositor's pool mirror already IS
+  the backing store, and the daemon already streams damaged rows into
+  it (`pool_update_c`). Only winstream had the gap.
+
+Receiver + wire are done and Linux-tested; the SCK source emitting
+`win_patch_c` from `SCStreamFrameInfoDirtyRects` is the Darwin-only
+follow-up (sck.zig / sck_shim.m), validated on Mac hardware.
+
+598 tests (win_patch_c round-trip + blitRect clipping), GUI build,
+smoke-mux green.
