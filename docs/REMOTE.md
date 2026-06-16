@@ -131,10 +131,22 @@ Pixel transport is shm-only — software-rendered GL works (Mesa
 presents via shm), GPU-buffer (dmabuf) apps don't.
 `SKETERM_MUX_NO_WAYLAND=1` disables forwarding entirely.
 
-`sketerm app [-u] <host> <cmd>` is the one-shot form: it spawns the
-app in a fresh durable session and hands it to the running sketerm
+`sketerm app [-u] [-i] <host> <cmd>` is the one-shot form: it spawns
+the app in a fresh durable session and hands it to the running sketerm
 window to render. A sketerm window must already be open on this
 desktop — it is the compositor.
+
+`-i` (isolate) runs the session under a private `XDG_RUNTIME_DIR` with
+the inherited D-Bus session bus dropped. Use it for **single-instance**
+apps (pcmanfm and other libfm tools, anything built on
+`GApplication` uniqueness): without it, a second `sketerm app <host>
+<same-app>` from a different client finds the first copy already
+running for that remote user and hands its window to it — so the new
+window pops up on the *first* client's desktop, not yours. Isolation
+gives the second copy its own session so it renders where it was
+launched. The cost is that an isolated session no longer shares the
+remote login's audio / notifications / portals; leave `-i` off for apps
+that aren't single-instance (e.g. `weston-terminal`, most editors).
 
 ## Remote macOS apps (window streaming)
 

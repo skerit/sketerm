@@ -779,6 +779,95 @@ fn daemonMain(d: *daemon_mod.Daemon) void {
     };
 }
 
+/// Isolated app session (`sketerm app -i`): the child must run under a
+/// private XDG_RUNTIME_DIR with the inherited D-Bus session bus dropped,
+/// and that dir — contents and all — must be recursively removed when
+/// the session dies. Exercises spawnSession's isolation path and the
+/// removeTreeBestEffort recursion.
+fn isolatedStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    const pathZ = @import("util/pathz.zig").pathZ;
+    // Seed a bogus session bus so "dropped" is observable, not merely
+    // "was already unset". The forked child unsets it; this process
+    // keeps it (nothing here reads DBUS).
+    _ = c.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/iso-fake-bus", 1);
+
+    var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("iso connect");
+    defer conn.deinit();
+    conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("iso hello");
+    (conn.recvExpect(&.{.welcome}) catch fail("iso welcome")).deinit(allocator);
+
+    conn.sendJson(.spawn, .{
+        .name = "iso",
+        .argv = [_][]const u8{"/bin/sh"},
+        .rows = @as(u16, 10),
+        .cols = @as(u16, 80),
+        .app = true,
+        .isolated = true,
+    }) catch fail("iso spawn send");
+    (conn.recvExpect(&.{.ok}) catch fail("iso spawn ok")).deinit(allocator);
+
+    var mirror = Mirror{ .allocator = allocator, .pool = allocator.create(Pool) catch fail("iso pool") };
+    mirror.pool.* = Pool.init(allocator) catch fail("iso pool init");
+    defer {
+        if (mirror.screen) |s| s.deinit();
+        mirror.pool.deinit();
+        allocator.destroy(mirror.pool);
+    }
+    conn.sendJson(.attach, .{ .name = "iso" }) catch fail("iso attach");
+    const snap = conn.recvExpect(&.{.snapshot}) catch fail("iso snapshot");
+    mirror.applySnapshot(snap.payload) catch fail("iso snapshot apply");
+    snap.deinit(allocator);
+
+    // Drop a file + subdir under the private runtime dir so teardown
+    // has a tree to recurse through, then echo the env we ended up with.
+    conn.sendFrame(.input, "mkdir -p \"$XDG_RUNTIME_DIR/sub\" && : > \"$XDG_RUNTIME_DIR/sub/f\" && : > \"$XDG_RUNTIME_DIR/g\"; " ++
+        "echo \"RT=$XDG_RUNTIME_DIR DB=${DBUS_SESSION_BUS_ADDRESS:-none}\"\n") catch fail("iso input");
+
+    var rt_path: ?[]u8 = null;
+    defer if (rt_path) |p| allocator.free(p);
+    var deadline: usize = 0;
+    while (deadline < 200) : (deadline += 1) {
+        const f = conn.recvFrame() catch fail("iso stream read");
+        defer f.deinit(allocator);
+        if (f.ftype == .events) mirror.applyEvents(f.payload) catch fail("iso events apply");
+        const txt = mirror.screenText() catch fail("iso extract");
+        defer allocator.free(txt);
+        // Match "RT=/" so we catch the OUTPUT line (expanded path), not
+        // the echoed command (which carries the literal "$XDG_...").
+        const at = std.mem.indexOf(u8, txt, "RT=/") orelse continue;
+        const rest = txt[at + 3 ..];
+        const end = std.mem.indexOfAny(u8, rest, " \n") orelse continue;
+        if (std.mem.indexOf(u8, txt, "DB=none") == null) fail("iso: D-Bus bus not dropped in child");
+        rt_path = allocator.dupe(u8, rest[0..end]) catch fail("iso oom");
+        break;
+    }
+    const rtp = rt_path orelse fail("iso: env line never appeared");
+    if (std.mem.indexOf(u8, rtp, "/rt-") == null) fail("iso: runtime dir not a private rt- path");
+
+    // Private dir + contents exist on disk while the session lives.
+    var z_buf: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    if (c.stat(pathZ(&z_buf, rtp) catch fail("iso pathz"), &st) != 0)
+        fail("iso: private runtime dir missing while session alive");
+    if (st.st_mode & c.S_IFDIR == 0) fail("iso: runtime dir is not a directory");
+
+    // Kill → the daemon recursively removes the dir (g + sub/f + sub).
+    conn.sendJson(.kill, .{ .name = "iso" }) catch fail("iso kill");
+    (conn.recvExpect(&.{.ok}) catch fail("iso kill ok")).deinit(allocator);
+    var gone = false;
+    var tries: usize = 0;
+    while (tries < 50) : (tries += 1) {
+        if (c.stat(pathZ(&z_buf, rtp) catch break, &st) != 0) {
+            gone = true;
+            break;
+        }
+        _ = c.usleep(20_000);
+    }
+    if (!gone) fail("iso: private runtime dir not removed on teardown");
+
+    std.debug.print("smoke-mux: isolated session env + recursive dir cleanup ok\n", .{});
+}
+
 pub fn main() u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
@@ -924,6 +1013,9 @@ pub fn main() u8 {
 
     // Apps that connect before a renderer attaches are parked.
     pendingAppStage(allocator, sock_path, if (wlapp_ran) 3 else 2);
+
+    // Isolated session: private runtime dir + dropped D-Bus + cleanup.
+    isolatedStage(allocator, sock_path);
 
     // A second client sees the session in LIST.
     var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("connect2");
