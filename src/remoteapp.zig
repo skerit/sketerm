@@ -162,7 +162,13 @@ fn runNativeApp(
     else
         host;
     if (!@import("ipc/mux_cli.zig").guiCommand(allocator, "attach-session", name, attach_host, true)) {
-        errMsg("session '{s}' spawned on {s}, but no sketerm window took it (attach manually: sketerm mux {s} attach {s})", .{ name, attach_host, attach_host, name });
+        // guiCommand already printed the specific reason (e.g. "no
+        // running sketerm window found", or "attach failed: no such
+        // session"). Add the likely cause + the manual fallback.
+        errMsg(
+            "couldn't display '{s}' on {s} (reason above). A 'no such session' right after spawn usually means the command exited on the host — the command + paths run THERE, so use host-absolute paths (no client-side ~). Manual attach: sketerm mux {s} attach {s}",
+            .{ name, attach_host, attach_host, name },
+        );
         return 1;
     }
     std.debug.print("sketerm: app session '{s}' on {s} — windows render via the sketerm GUI\n", .{ name, host });

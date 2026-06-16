@@ -29,6 +29,11 @@ pub const Conn = struct {
     allocator: std.mem.Allocator,
     fd: c_int,
     rbuf: std.ArrayList(u8) = .empty,
+    /// Message from the last daemon `.err` frame seen by `recvExpect`,
+    /// so callers can surface the REAL reason ("no such session", …)
+    /// instead of a bare `error.DaemonError`.
+    last_err: [192]u8 = undefined,
+    last_err_len: usize = 0,
 
     pub fn connect(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -372,16 +377,39 @@ pub const Conn = struct {
 
     /// Receive frames until one of `want` arrives; frames of other
     /// types are discarded (e.g. EVENTS noise while waiting for an
-    /// OK). Errors out on an `err` frame unless err is in `want`.
+    /// OK). On an `err` frame (not in `want`) it stashes the daemon's
+    /// message in `self.last_err` and returns `error.DaemonError` —
+    /// read `lastErr()` to surface WHY instead of a bare error name.
     pub fn recvExpect(self: *Conn, want: []const wire.FrameType) !OwnedFrame {
         while (true) {
             const f = try self.recvFrame();
             for (want) |w| {
                 if (f.ftype == w) return f;
             }
-            const was_err = f.ftype == .err;
+            if (f.ftype == .err) {
+                const msg = errFieldOf(f.payload);
+                const n = @min(msg.len, self.last_err.len);
+                @memcpy(self.last_err[0..n], msg[0..n]);
+                self.last_err_len = n;
+                f.deinit(self.allocator);
+                return error.DaemonError;
+            }
             f.deinit(self.allocator);
-            if (was_err) return error.DaemonError;
         }
     }
+
+    /// The message from the last `.err` frame `recvExpect` saw.
+    pub fn lastErr(self: *const Conn) []const u8 {
+        return self.last_err[0..self.last_err_len];
+    }
 };
+
+/// Pull the `error` string out of a daemon err payload (`{"error":"…"}`)
+/// without a full JSON parse. Falls back to the raw payload.
+fn errFieldOf(payload: []const u8) []const u8 {
+    const key = "\"error\":\"";
+    const i = std.mem.indexOf(u8, payload, key) orelse return payload;
+    const rest = payload[i + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return payload;
+    return rest[0..end];
+}
