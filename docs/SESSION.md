@@ -5754,3 +5754,24 @@ instead of whole window frames every time.
 
 Native `zig build mux` (SCK linked) + smoke-mux + 591/598 tests +
 mux-portable (x86_64/aarch64) all green.
+
+## 2026-06-16: per-tile churn classifier (Phase 3)
+
+The routing brain for the pixel pipeline — tells hot (frequently
+changing) regions apart from cold (static) ones, so a future lossy/
+temporal coder (Phase 4) can be aimed only where it pays off.
+
+- **`src/util/churn.zig`** `Tracker` — a tile grid (default 64px) with
+  one byte of heat per tile. `noteDamage(x,y,w,h)` flags overlapped
+  tiles; `endFrame()` heats touched tiles (capped) and decays untouched
+  ones; `hot(x,y,w,h)` reports whether a region is majority-hot.
+  Transport-agnostic (Wayland damage rows + SCK dirty rects feed the
+  same cycle), pure std, daemon-safe.
+- **Not wired in yet, by design**: the thing it routes *to* (the video
+  coder) lands in Phase 4, so wiring now would be dead code in the
+  daemon hot path. Everything still encodes lossless; zero behaviour
+  change. The classifier is ready to consume the moment Phase 4 exists.
+
+604 tests (incl. 6 churn cases: threshold ramp, one-shot stays cold,
+hot cools down, mixed coverage, OOB/empty safety, resize resets), GUI
+build, smoke-mux, mux-portable green.
