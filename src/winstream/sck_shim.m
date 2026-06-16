@@ -469,16 +469,33 @@ static void apply_content(SketermSckCtx *c, SCShareableContent *content) {
 // lock. Points are window-local, top-left origin — the same space the
 // client sends input in, so no coordinate translation on either end.
 
-static bool ax_role_draggable(CFStringRef role) {
-    // Non-interactive title-bar chrome: containers, plus the title label
-    // (AXStaticText) and the proxy / toolbar icons (AXImage). Those sit in
-    // the top strip and ARE draggable — dragging a window by its title is
-    // standard — so they must not be treated as interactive (which would
-    // forward the click to the app instead of moving the local window).
+// Non-interactive title-bar CONTAINER roles — draggable chrome.
+static bool ax_role_container(CFStringRef role) {
     return role && (CFEqual(role, CFSTR("AXGroup")) || CFEqual(role, CFSTR("AXWindow")) ||
                     CFEqual(role, CFSTR("AXSplitGroup")) || CFEqual(role, CFSTR("AXLayoutArea")) ||
-                    CFEqual(role, CFSTR("AXUnknown")) || CFEqual(role, CFSTR("AXStaticText")) ||
-                    CFEqual(role, CFSTR("AXImage")));
+                    CFEqual(role, CFSTR("AXUnknown")));
+}
+
+// Is the element at this position draggable chrome? Containers are. A bare
+// title label / proxy icon (AXStaticText / AXImage whose PARENT is a
+// container) is too — dragging a window by its title is standard. But the
+// SAME role INSIDE a control (a button's text/icon, parent = the AXButton)
+// must stay interactive, or the leaf classifier would eat clicks on
+// title-bar buttons. So labels/icons defer to their parent's role.
+static bool ax_pos_draggable(AXUIElementRef el, CFStringRef role) {
+    if (ax_role_container(role)) return true;
+    if (!role || !(CFEqual(role, CFSTR("AXStaticText")) || CFEqual(role, CFSTR("AXImage"))))
+        return false;
+    AXUIElementRef parent = NULL;
+    bool drag = false;
+    if (AXUIElementCopyAttributeValue(el, kAXParentAttribute, (CFTypeRef *)&parent) == kAXErrorSuccess && parent) {
+        CFStringRef prole = NULL;
+        AXUIElementCopyAttributeValue(parent, kAXRoleAttribute, (CFTypeRef *)&prole);
+        drag = ax_role_container(prole);
+        if (prole) CFRelease(prole);
+        CFRelease(parent);
+    }
+    return drag;
 }
 
 // Fill out[0]=ref_w, out[1]=ref_h, then up to cap rects of {x,y,w,h}.
@@ -512,7 +529,7 @@ static int compute_drag_rects(pid_t pid, CGRect frame, int16_t *out, int cap) {
                 if (AXUIElementCopyElementAtPosition(app, frame.origin.x + rx, frame.origin.y + ry, &el) == kAXErrorSuccess && el) {
                     CFStringRef role = NULL;
                     AXUIElementCopyAttributeValue(el, kAXRoleAttribute, (CFTypeRef *)&role);
-                    drag = ax_role_draggable(role);
+                    drag = ax_pos_draggable(el, role);
                     if (role) CFRelease(role);
                     CFRelease(el);
                 }
