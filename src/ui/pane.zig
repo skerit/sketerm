@@ -22,6 +22,7 @@ const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
 const DrainHandle = @import("../terminal.zig").DrainHandle;
 const input = @import("input.zig");
+const a11y = @import("../a11y/atspi.zig");
 const menu = @import("menu.zig");
 const clipboard = @import("clipboard.zig");
 const MouseAction = @import("../config.zig").MouseAction;
@@ -243,7 +244,10 @@ pub const Pane = struct {
         const self = try allocator.create(Pane);
         errdefer allocator.destroy(self);
 
-        const area_widget = c.gtk_gl_area_new();
+        // A SketermTermArea (GtkGLArea subclass) so the pane exposes its
+        // text + caret to AT-SPI / Orca via GtkAccessibleText; otherwise a
+        // bare GL area is an opaque box to a screen reader.
+        const area_widget = a11y.newArea(terminal);
         gl_mod.requestArea(@ptrCast(area_widget));
         // auto_render=FALSE → GtkGLArea only invokes the render
         // signal on demand (queue_draw / queue_render). With TRUE,
@@ -1415,6 +1419,10 @@ fn onRenderRequest(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
     self.terminal.screen.dirty = false;
     c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    // Nudge AT clients (Orca/braille) that the caret/contents may have
+    // moved. A no-op cost when no screen reader is attached, since GTK only
+    // activates its AT-SPI backend on demand.
+    a11y.notifyChanged(@ptrCast(self.area));
 }
 
 fn onActivityEvent(ctx: ?*anyopaque) void {
