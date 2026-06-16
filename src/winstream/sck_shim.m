@@ -36,11 +36,17 @@
 #include <stdbool.h>
 #include <string.h>
 
+// Max dirty rects accumulated for one window between drains. Damage
+// past this (or ≥ the area threshold) falls back to a whole frame —
+// many tiny patches cost more than one full frame.
+#define SCK_ACC_CAP 32
+
 typedef struct {
-    uint32_t kind; // 0 open, 1 frame, 2 title, 3 close
+    uint32_t kind; // 0 open, 1 frame, 2 title, 3 close, 4 drag, 5 patch
     uint32_t win;
-    int32_t w, h;
-    const uint8_t *data; // BGRA pixels (tight) or UTF-8 title
+    int32_t w, h;  // kind 4: w = rect count. kind 5: patch rect size.
+    int32_t x, y;  // kind 5 only: dirty-rect origin in window pixels.
+    const uint8_t *data; // BGRA pixels (tight) or UTF-8 title or blob
     size_t len;
 } SckEvent;
 
@@ -63,6 +69,16 @@ typedef struct {
     uint8_t *snap;
     size_t snap_cap;
     BOOL closing;
+    // Damage tracking for win_patch_c (Phase 1). `latest` always holds
+    // the whole current frame; `acc` accumulates the dirty sub-rects
+    // (content-local pixels, the same space as latest/the wire) seen
+    // across all frame callbacks since the last drain. `needs_full`
+    // forces a whole frame instead — set on open / resize / reattach,
+    // or when damage is unknown / too large. The receiver requires a
+    // full win_frame_c to establish the backing before any patch.
+    BOOL needs_full;
+    int32_t acc[SCK_ACC_CAP * 4]; // x, y, w, h per accumulated rect
+    int acc_n;
     // Draggable (title-bar) regions, measured by the AX hit-test in
     // recompute_drags. Wire-ready int16 blob: [ref_w, ref_h, then
     // drag_n × {x,y,w,h}] in window points. drain copies it out.
@@ -186,8 +202,11 @@ static bool pid_in_session(SketermSckCtx *c, pid_t pid) {
     CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, false);
     CGRect content = CGRectNull;
     double scale = 1.0;
+    NSArray *dirtyRects = nil;
     if (atts && CFArrayGetCount(atts) > 0) {
         NSDictionary *a = (__bridge NSDictionary *)CFArrayGetValueAtIndex(atts, 0);
+        // Skip idle/blank/suspended/started frames — only Complete frames
+        // carry new pixels.
         NSNumber *status = a[SCStreamFrameInfoStatus];
         if (status && status.intValue != SCFrameStatusComplete) return;
         NSDictionary *rectDict = a[SCStreamFrameInfoContentRect];
@@ -198,6 +217,9 @@ static bool pid_in_session(SketermSckCtx *c, pid_t pid) {
         }
         NSNumber *sf = a[SCStreamFrameInfoScaleFactor];
         if (sf) scale = sf.doubleValue;
+        // The set of rects that changed since the previous frame, in the
+        // output buffer's pixel space. Translated below to content-local.
+        dirtyRects = a[SCStreamFrameInfoDirtyRects];
     }
 
     CVImageBufferRef img = CMSampleBufferGetImageBuffer(sb);
@@ -233,9 +255,58 @@ static bool pid_in_session(SketermSckCtx *c, pid_t pid) {
             if (w->latest) {
                 for (size_t y = 0; y < ch; y++)
                     memcpy(w->latest + y * cw * 4, base + (y0 + y) * stride + x0 * 4, cw * 4);
+                // Frame geometry changed (a resize/letterbox can shrink the
+                // content rect before the ~500ms refresh reconfigures) —
+                // old damage coords no longer map onto the new `latest`, so
+                // re-baseline. Keeps every acc rect clamped to the CURRENT
+                // fw×fh, so the drain never reads out of bounds.
+                if (w->fw != (int32_t)cw || w->fh != (int32_t)ch) {
+                    w->needs_full = YES;
+                    w->acc_n = 0;
+                }
                 w->fw = (int32_t)cw;
                 w->fh = (int32_t)ch;
                 w->dirty = YES;
+                // Accumulate this frame's damage (→ win_patch_c). Once
+                // needs_full is set we'll send a whole frame regardless,
+                // so stop bothering. Missing damage info → whole frame.
+                if (!w->needs_full) {
+                    if (!dirtyRects || dirtyRects.count == 0) {
+                        w->needs_full = YES;
+                    } else {
+                        for (NSDictionary *rd in dirtyRects) {
+                            CGRect dr;
+                            if (![rd isKindOfClass:[NSDictionary class]] ||
+                                !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)rd, &dr)) {
+                                w->needs_full = YES;
+                                break;
+                            }
+                            // Buffer-pixel rect → content-local pixels
+                            // (the latest/wire space): drop the content
+                            // origin and clamp into [0,cw)×[0,ch).
+                            long ax0 = (long)floor(dr.origin.x) - (long)x0;
+                            long ay0 = (long)floor(dr.origin.y) - (long)y0;
+                            long ax1 = (long)ceil(dr.origin.x + dr.size.width) - (long)x0;
+                            long ay1 = (long)ceil(dr.origin.y + dr.size.height) - (long)y0;
+                            if (ax0 < 0) ax0 = 0;
+                            if (ay0 < 0) ay0 = 0;
+                            if (ax1 > (long)cw) ax1 = (long)cw;
+                            if (ay1 > (long)ch) ay1 = (long)ch;
+                            if (ax1 <= ax0 || ay1 <= ay0) continue;
+                            int32_t rx = (int32_t)ax0, ry = (int32_t)ay0;
+                            int32_t rw = (int32_t)(ax1 - ax0), rh = (int32_t)(ay1 - ay0);
+                            BOOL dup = NO;
+                            for (int j = 0; j < w->acc_n; j++)
+                                if (w->acc[j * 4] == rx && w->acc[j * 4 + 1] == ry &&
+                                    w->acc[j * 4 + 2] == rw && w->acc[j * 4 + 3] == rh) { dup = YES; break; }
+                            if (dup) continue;
+                            if (w->acc_n >= SCK_ACC_CAP) { w->needs_full = YES; break; }
+                            int32_t *r = &w->acc[w->acc_n * 4];
+                            r[0] = rx; r[1] = ry; r[2] = rw; r[3] = rh;
+                            w->acc_n++;
+                        }
+                    }
+                }
                 wake(c);
             }
         }
@@ -315,6 +386,7 @@ static void apply_content(SketermSckCtx *c, SCShareableContent *content) {
             sw->rect = scw.frame;
             sw->title = title;
             sw->drag_needs = YES;
+            sw->needs_full = YES; // first emitted frame must be whole
             c->wins[key] = sw;
             [c->pending addObject:@{
                 @"kind" : @0,
@@ -336,6 +408,10 @@ static void apply_content(SketermSckCtx *c, SCShareableContent *content) {
                 [sw->stream updateConfiguration:stream_config(scw) completionHandler:^(NSError *e){ (void)e; }];
                 sw->drag_needs = YES;   // title-strip width changed
                 sw->drag_tries = 0;
+                // Re-baseline the client's backing at the new size; the
+                // accumulated old-size damage no longer maps.
+                sw->needs_full = YES;
+                sw->acc_n = 0;
             }
         }
         // The AX tree is often empty for the first frames after launch;
@@ -636,6 +712,8 @@ void sketerm_sck_reannounce(SckCtx *ctx) {
             @"title" : sw->title.length ? sw->title : @"remote app",
         }];
         sw->dirty = sw->latest != NULL; // resend the current frame too
+        sw->needs_full = YES;           // new client's backing is empty
+        sw->acc_n = 0;
         if (sw->drag_blob) sw->drag_dirty = YES; // and the drag regions
     }
     pthread_mutex_unlock(&c->mu);
@@ -694,7 +772,9 @@ const SckEvent *sketerm_sck_drain(SckCtx *ctx, size_t *out_n) {
     kick_refresh(c, now_ms());
 
     [c->drain_hold removeAllObjects];
-    size_t cap_needed = c->pending.count + c->wins.count * 2; // frame + drag
+    // Worst case per window: SCK_ACC_CAP patches (or one whole frame) +
+    // one drag-rect event.
+    size_t cap_needed = c->pending.count + c->wins.count * (SCK_ACC_CAP + 2);
     if (c->ev_cap < cap_needed) {
         free(c->ev_scratch);
         c->ev_scratch = malloc(cap_needed * sizeof(SckEvent));
@@ -719,23 +799,72 @@ const SckEvent *sketerm_sck_drain(SckCtx *ctx, size_t *out_n) {
             }
         }
         for (SketermSckWin *sw in c->wins.allValues) {
-            if (!sw->dirty || sw->closing || n >= c->ev_cap) continue;
-            size_t need = (size_t)sw->fw * 4 * (size_t)sw->fh;
-            if (sw->snap_cap < need) {
-                free(sw->snap);
-                sw->snap = malloc(need);
-                sw->snap_cap = sw->snap ? need : 0;
+            if (!sw->dirty || sw->closing) continue;
+            if (n >= c->ev_cap) break;
+            size_t fw = (size_t)sw->fw, fh = (size_t)sw->fh;
+            size_t need = fw * 4 * fh;
+            if (need == 0) { sw->dirty = NO; sw->acc_n = 0; continue; }
+
+            // Whole frame when re-baselining (open/resize/reattach) or
+            // when nothing tracked damage; otherwise fall back to a whole
+            // frame if the dirty area is ≳60% of the window — many rects
+            // (or a near-full one) cost more than a single frame.
+            BOOL full = sw->needs_full || sw->acc_n == 0;
+            if (!full) {
+                uint64_t area = 0;
+                for (int i = 0; i < sw->acc_n; i++)
+                    area += (uint64_t)sw->acc[i * 4 + 2] * (uint64_t)sw->acc[i * 4 + 3];
+                if (area * 10 >= (uint64_t)fw * (uint64_t)fh * 6) full = YES;
             }
-            if (!sw->snap) continue;
-            memcpy(sw->snap, sw->latest, need);
+
+            if (full) {
+                if (sw->snap_cap < need) {
+                    free(sw->snap);
+                    sw->snap = malloc(need);
+                    sw->snap_cap = sw->snap ? need : 0;
+                }
+                if (!sw->snap) { sw->dirty = NO; sw->acc_n = 0; sw->needs_full = YES; continue; }
+                memcpy(sw->snap, sw->latest, need);
+                SckEvent *e = &c->ev_scratch[n++];
+                memset(e, 0, sizeof(*e));
+                e->kind = 1;
+                e->win = sw->win_id;
+                e->w = sw->fw;
+                e->h = sw->fh;
+                e->data = sw->snap;
+                e->len = need;
+                sw->needs_full = NO;
+            } else {
+                // One win_patch_c per accumulated rect: copy the rect out
+                // of `latest` (tight, content-local) into an NSData held
+                // until the next drain (like titles/drag blobs).
+                for (int i = 0; i < sw->acc_n; i++) {
+                    if (n >= c->ev_cap) { sw->needs_full = YES; break; }
+                    int32_t rx = sw->acc[i * 4], ry = sw->acc[i * 4 + 1];
+                    int32_t rw = sw->acc[i * 4 + 2], rh = sw->acc[i * 4 + 3];
+                    size_t psz = (size_t)rw * (size_t)rh * 4;
+                    NSMutableData *d = [NSMutableData dataWithLength:psz];
+                    if (!d) { sw->needs_full = YES; break; }
+                    uint8_t *dst = d.mutableBytes;
+                    for (int row = 0; row < rh; row++)
+                        memcpy(dst + (size_t)row * rw * 4,
+                               sw->latest + ((size_t)(ry + row) * fw + rx) * 4,
+                               (size_t)rw * 4);
+                    [c->drain_hold addObject:d];
+                    SckEvent *e = &c->ev_scratch[n++];
+                    memset(e, 0, sizeof(*e));
+                    e->kind = 5;
+                    e->win = sw->win_id;
+                    e->x = rx;
+                    e->y = ry;
+                    e->w = rw;
+                    e->h = rh;
+                    e->data = d.bytes;
+                    e->len = psz;
+                }
+            }
             sw->dirty = NO;
-            SckEvent *e = &c->ev_scratch[n++];
-            e->kind = 1;
-            e->win = sw->win_id;
-            e->w = sw->fw;
-            e->h = sw->fh;
-            e->data = sw->snap;
-            e->len = need;
+            sw->acc_n = 0;
         }
         // Draggable regions for windows whose measurement changed. The
         // blob (ref dims + rects) rides drain_hold like titles do, so it

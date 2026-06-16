@@ -5720,3 +5720,37 @@ follow-up (sck.zig / sck_shim.m), validated on Mac hardware.
 
 598 tests (win_patch_c round-trip + blitRect clipping), GUI build,
 smoke-mux green.
+
+## 2026-06-16: winstream SCK dirty-rect source (Phase 1 Darwin half)
+
+The capture source now emits `win_patch_c` for the changed sub-rects
+instead of whole window frames every time.
+
+- **`sck_shim.m`**: each `didOutputSampleBuffer` reads
+  `SCStreamFrameInfoDirtyRects`, translates them to content-local pixels
+  (the `latest`/wire space), clamps + dedups, and accumulates per window
+  across callbacks until the next drain (`acc`, cap `SCK_ACC_CAP`).
+  `latest` still holds the whole current frame, so the drain copies each
+  dirty rect tightly out of it into a drain-held `NSData`. `SckEvent`
+  gained `x,y` + `kind 5` (patch).
+- **Full-frame contract honoured via `needs_full`**: set on window open,
+  resize (incl. a content-rect/letterbox shrink detected in the frame
+  callback — re-baselines so stale large coords never read OOB), client
+  reattach (`reannounce`), missing/over-cap damage, or a dirty area
+  ≳60% of the window (many patches cost more than one frame). When set,
+  the drain sends a whole `win_frame_c`; otherwise one `win_patch_c` per
+  rect. So the first frame after open / a resize / a reattach is always
+  a full frame — exactly what the receiver's backing buffer requires.
+- **`sck.zig`**: full frames and patches both go through the shared
+  `pixcodec` now (`encodeRegion` + `appendWinFrameC` / `appendWinPatchC`,
+  one reused `Scratch`); dropped the old `appendFrameMaybeZ`/`zbuf` path.
+- **Hardware validation is human-in-the-loop**: real SCK capture needs
+  the Screen-Recording TCC grant, pinned to the daemon's signature and
+  only effective as the GUI-session LaunchAgent. Deploy with
+  `dist/deploy-macos.sh` (re-signs with the `sketerm-dev` cert from your
+  login keychain — not reachable from a non-interactive/SSH shell), then
+  drive a remote app: a small animated region should update only that
+  region and total bytes drop sharply vs. whole frames.
+
+Native `zig build mux` (SCK linked) + smoke-mux + 591/598 tests +
+mux-portable (x86_64/aarch64) all green.

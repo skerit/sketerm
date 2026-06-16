@@ -12,12 +12,15 @@
 const std = @import("std");
 const proto = @import("proto.zig");
 const keymap = @import("keymap.zig");
+const pixcodec = @import("../wlhost/pixcodec.zig");
 
 const CEvent = extern struct {
-    kind: u32, // 0 open, 1 frame, 2 title, 3 close, 4 drag-rects
+    kind: u32, // 0 open, 1 frame, 2 title, 3 close, 4 drag-rects, 5 patch
     win: u32,
-    w: i32, // kind 4: rect count
+    w: i32, // kind 4: rect count. kind 5: patch rect size.
     h: i32,
+    x: i32, // kind 5 only: dirty-rect origin in window pixels.
+    y: i32,
     data: ?[*]const u8,
     len: usize,
 };
@@ -47,7 +50,10 @@ const notice_title = "sketerm: grant Screen Recording to sketerm-mux on the Mac,
 pub const Source = struct {
     allocator: std.mem.Allocator,
     ctx: *anyopaque,
-    zbuf: std.ArrayList(u8) = .empty,
+    /// Reused across every frame/patch encode in a poll cycle — each
+    /// `Encoded` aliases it but is appended into `out` before the next
+    /// encode reuses it (same discipline as the stub).
+    sc: pixcodec.Scratch = .{},
     notice_open: bool = false,
     /// Dedupe for shim error reporting — refresh retries reproduce
     /// the same failure string every few seconds.
@@ -61,7 +67,7 @@ pub const Source = struct {
 
     pub fn deinit(self: *Source) void {
         sketerm_sck_destroy(self.ctx);
-        self.zbuf.deinit(self.allocator);
+        self.sc.deinit(self.allocator);
     }
 
     pub fn pollFd(self: *const Source) c_int {
@@ -135,14 +141,23 @@ pub const Source = struct {
                     .title = if (ev.data) |d| d[0..ev.len] else "remote app",
                 }),
                 1 => {
+                    // Whole window frame (open / resize / reattach, or a
+                    // patch-fallback). Tight w*4 stride → codec frame.
                     const d = ev.data orelse continue;
                     if (ev.w <= 0 or ev.h <= 0) continue;
-                    try proto.appendFrameMaybeZ(out, out_allocator, &self.zbuf, self.allocator, .{
-                        .win = ev.win,
-                        .w = ev.w,
-                        .h = ev.h,
-                        .pixels = d[0..ev.len],
-                    });
+                    const enc = pixcodec.encodeRegion(&self.sc, self.allocator, d[0..ev.len], @intCast(ev.w * 4)) catch
+                        pixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = d[0..ev.len] };
+                    try proto.appendWinFrameC(out, out_allocator, ev.win, ev.w, ev.h, enc);
+                },
+                5 => {
+                    // Damaged sub-rect at (x,y), tight w*4 stride. The
+                    // receiver blits it into the window's backing — which a
+                    // prior full frame (kind 1) must have established.
+                    const d = ev.data orelse continue;
+                    if (ev.w <= 0 or ev.h <= 0) continue;
+                    const enc = pixcodec.encodeRegion(&self.sc, self.allocator, d[0..ev.len], @intCast(ev.w * 4)) catch
+                        pixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = d[0..ev.len] };
+                    try proto.appendWinPatchC(out, out_allocator, ev.win, ev.x, ev.y, ev.w, ev.h, enc);
                 },
                 2 => {
                     var pbuf: [4 + 512]u8 = undefined;
