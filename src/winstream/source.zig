@@ -83,6 +83,16 @@ pub const Source = union(enum) {
             .sck => |*s| if (comptime have_sck) s.reannounce(),
         }
     }
+
+    /// The attached client's H.264 decode capability — gates the lossy
+    /// video route (hot + photographic windows → win_vtile). The stub
+    /// never encodes video, so it just records the flag.
+    pub fn setWantsVideo(self: *Source, wants: bool) void {
+        switch (self.*) {
+            .stub => |*s| s.wants_video = wants,
+            .sck => |*s| if (comptime have_sck) s.setWantsVideo(wants),
+        }
+    }
 };
 
 pub const Stub = struct {
@@ -92,6 +102,9 @@ pub const Stub = struct {
     /// Stub reacts to input by tinting the pattern (proof the
     /// input path works end to end).
     tint: u8 = 0,
+    /// Recorded for parity with the SCK source; the stub always streams
+    /// lossless (it has no encoder).
+    wants_video: bool = false,
     last_frame_ms: u64 = 0,
     w: i32 = 320,
     h: i32 = 240,
