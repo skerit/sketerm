@@ -5870,3 +5870,37 @@ Remaining Phase 4 refinements: VAAPI hwaccel, AV1 (SVT-AV1+dav1d) behind
 the same backend, tile-grid encode (vs whole-surface), UDP keyframe-
 request/loss handling, and a winstream (macOS) video path. Phase 5
 (dmabuf) is a separate track.
+
+## 2026-06-16: Phase 4 refinements — AV1, keyframe-on-attach, winstream video
+
+Three refinements landed and verified on Linux; the rest hit hardware
+walls on this box (no GPU) and are flagged for a GPU-equipped run.
+
+- **AV1 backend**: `vendor/avenc_shim.c` (generic libavcodec encoder,
+  used with libsvtav1 in a low-delay config: pred-struct=1, lookahead=0
+  so a frame in is a packet out); the decode shim gained a codec param
+  (H.264 or AV1). `vcodec` gets `Encoder.initAv1` and `Decoder` takes a
+  codec; the compositor recreates its per-pool decoder on a codec change.
+  H.264 keeps direct libx264 for lowest latency. SVT-AV1↔dav1d round-trip
+  verified. The royalty-free codec, swappable behind the same union.
+- **Keyframe on (re)attach**: rudp (go-back-N) makes the transport
+  reliable+ordered, so the video stream never sees loss — no
+  keyframe-request-on-loss machinery needed. The only trigger is a fresh
+  client: `handleAttach` resets `needs_kf` on the session's live video
+  surfaces (no-op without video).
+- **winstream video receive**: `win_vtile` carrier + winapp per-window
+  decoder → `blitRect` into the backing buffer — winstream's counterpart
+  to the Wayland `pool_vtile` path. The macOS `sck.zig` encode side is
+  the macOS developer's handoff (same split as Phase 1).
+
+Deferred / hardware-gated (this box has no `/dev/dri`): **VAAPI hwaccel**
+(can verify the software fallback but not the GPU path; decode is cheap
+anyway) and **dmabuf forwarding** (large; needs real GPU apps to
+validate) — both want a GPU-equipped run, like SCK wanted a Mac.
+**tile-grid encode** is doable here but is the riskiest change (daemon
+commit hot path) for a mostly-CPU benefit, since codec inter-frame
+skip-blocks already keep whole-surface encodes small on the wire.
+
+621 tests under -Dvideo (618 + the 3 video round-trip/encode tests that
+skip without it), GUI default + -Dvideo, smoke-mux default + -Dvideo,
+mux-portable static — all green.
