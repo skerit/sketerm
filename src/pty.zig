@@ -43,6 +43,12 @@ pub const SpawnOpts = struct {
     /// the mux daemon's native app pipe, where the daemon itself is
     /// the session's Wayland display.
     wayland_display: ?[*:0]const u8 = null,
+    /// Private XDG_RUNTIME_DIR for an isolated app session (`sketerm
+    /// app -i`). When set, the child's XDG_RUNTIME_DIR is pointed here
+    /// and DBUS_SESSION_BUS_ADDRESS is cleared, so single-instance apps
+    /// (pcmanfm's libfm socket, GApplication bus name) can't coalesce
+    /// into an instance bound to another client's display. Absolute path.
+    runtime_dir: ?[*:0]const u8 = null,
 };
 
 pub const ShellIntegration = struct {
@@ -164,6 +170,15 @@ pub const Pty = struct {
         }
         if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1);
         if (opts.wayland_display) |wd| _ = c.setenv("WAYLAND_DISPLAY", wd, 1);
+        // Isolated app session: give the child a private runtime dir
+        // and drop the inherited session bus. Both are how
+        // single-instance apps find a peer for the same user — cutting
+        // them keeps a second `sketerm app` invocation from handing its
+        // window to an instance already rendering on another client.
+        if (opts.runtime_dir) |rd| {
+            _ = c.setenv("XDG_RUNTIME_DIR", rd, 1);
+            _ = c.unsetenv("DBUS_SESSION_BUS_ADDRESS");
+        }
 
         // Auto shell-integration: hand the script path to the shim
         // and arrange the shell to read the shim first. zsh reads

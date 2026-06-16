@@ -40,6 +40,11 @@ pub const SpawnReq = struct {
     /// explicit form of SKETERM_WINSTREAM; what `sketerm app`
     /// toward capture-only remotes will set).
     winstream: bool = false,
+    /// Run the session under a private XDG_RUNTIME_DIR with the shared
+    /// D-Bus session bus dropped (`sketerm app -i`). Isolates
+    /// single-instance apps so each forwarded copy renders on its own
+    /// client instead of coalescing into the first one.
+    isolated: bool = false,
 };
 
 pub const AttachReq = struct {
@@ -82,6 +87,9 @@ const Session = struct {
     wl_hub_fd: c_int = -1,
     /// Owned display socket path, unlinked on teardown.
     wl_display_path: ?[]u8 = null,
+    /// Isolated session (`sketerm app -i`): owned private runtime-dir
+    /// path, recursively removed on teardown. null = not isolated.
+    runtime_dir_path: ?[]u8 = null,
     /// Window-stream agent (pixel capture, no display protocol):
     /// the macOS backend, or the stub for pipeline testing
     /// (SKETERM_WINSTREAM=stub). Mutually exclusive with Wayland
@@ -104,6 +112,10 @@ const Session = struct {
         var z_buf: [4096]u8 = undefined;
         if (self.wl_display_path) |p| {
             if (pathZ(&z_buf, p)) |z| _ = c.unlink(z) else |_| {}
+            self.allocator.free(p);
+        }
+        if (self.runtime_dir_path) |p| {
+            removeTreeBestEffort(p);
             self.allocator.free(p);
         }
         if (self.pty.closeAndReap()) |code| self.exit_status = code;
@@ -162,6 +174,32 @@ const Client = struct {
 };
 
 const pathZ = @import("../util/pathz.zig").pathZ;
+
+/// Recursively remove `path` and everything under it, best-effort:
+/// every failure is ignored (the dir lives on a tmpfs runtime dir that
+/// the OS reclaims at logout anyway). Used to tear down an isolated
+/// session's private XDG_RUNTIME_DIR, which apps fill with sockets and
+/// the odd subdir (dbus-1/, pulse/) we don't track individually.
+fn removeTreeBestEffort(path: []const u8) void {
+    var z_buf: [4096]u8 = undefined;
+    const zpath = pathZ(&z_buf, path) catch return;
+    if (c.opendir(zpath)) |dir| {
+        while (c.readdir(dir)) |ent| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            var child_buf: [4096]u8 = undefined;
+            const child = std.fmt.bufPrintZ(&child_buf, "{s}/{s}", .{ path, name }) catch continue;
+            // unlinkat fails on a directory (EISDIR/EPERM) → recurse,
+            // then drop the now-empty dir with AT_REMOVEDIR.
+            if (c.unlinkat(c.AT_FDCWD, child.ptr, 0) != 0) {
+                removeTreeBestEffort(child);
+                _ = c.unlinkat(c.AT_FDCWD, child.ptr, c.AT_REMOVEDIR);
+            }
+        }
+        _ = c.closedir(dir);
+    }
+    _ = c.rmdir(zpath);
+}
 
 /// One tunneled byte stream, bridged to `client` as chan_* frames:
 /// a Wayland app connection (`native` set) or a window-stream session
@@ -276,6 +314,9 @@ pub const Daemon = struct {
     /// Monotonic id for per-session Wayland socket paths (session
     /// names are user input — not path-safe).
     next_wl_id: u32 = 1,
+    /// Monotonic id for isolated sessions' private runtime dirs (same
+    /// path-safety reason as next_wl_id).
+    next_rt_id: u32 = 1,
     running: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, sock_path: []const u8) !*Daemon {
@@ -1315,12 +1356,36 @@ pub const Daemon = struct {
         defer if (wl_disp_z) |z| allocator.free(z);
         if (hub) |h| wl_disp_z = try allocator.dupeZ(u8, h.display_path);
 
+        // Isolated session: a private runtime dir (sibling of the wl
+        // sockets) so single-instance apps can't coalesce across
+        // clients. The wl socket stays in the shared dir — its absolute
+        // path in WAYLAND_DISPLAY is unaffected by XDG_RUNTIME_DIR.
+        var rt_dir_z: ?[:0]u8 = null;
+        defer if (rt_dir_z) |z| allocator.free(z);
+        var rt_dir_owned: ?[]u8 = null;
+        errdefer if (rt_dir_owned) |p| {
+            removeTreeBestEffort(p);
+            allocator.free(p);
+        };
+        if (req.isolated) {
+            const dir_end = std.mem.lastIndexOfScalar(u8, self.sock_path, '/') orelse 0;
+            const dir = self.sock_path[0..dir_end];
+            const id = self.next_rt_id;
+            self.next_rt_id += 1;
+            const p = try std.fmt.allocPrint(allocator, "{s}/rt-{d}", .{ dir, id });
+            rt_dir_owned = p;
+            var z_buf: [4096]u8 = undefined;
+            _ = c.mkdir(try pathZ(&z_buf, p), 0o700);
+            rt_dir_z = try allocator.dupeZ(u8, p);
+        }
+
         var pty = try Pty.spawn(.{
             .argv = argv_ptrs.items,
             .cwd = req.cwd,
             .rows = req.rows,
             .cols = req.cols,
             .wayland_display = if (wl_disp_z) |z| z.ptr else null,
+            .runtime_dir = if (rt_dir_z) |z| z.ptr else null,
         });
         errdefer _ = pty.closeAndReap();
         // The poll loop does bounded read rounds — master must not
@@ -1356,6 +1421,10 @@ pub const Daemon = struct {
             s.wl_hub_fd = h.fd;
             s.wl_display_path = h.display_path;
             hub = null; // ownership moved to the session
+        }
+        if (rt_dir_owned) |p| {
+            s.runtime_dir_path = p;
+            rt_dir_owned = null; // ownership moved to the session
         }
         if (ws_gate.want) create_ws: {
             const w = allocator.create(WsSource) catch break :create_ws;

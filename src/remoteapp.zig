@@ -22,7 +22,7 @@ fn errMsg(comptime fmt: []const u8, args: anytype) void {
 }
 
 const USAGE =
-    \\Usage: sketerm app [-u] [user@]<host|domain> <command...>
+    \\Usage: sketerm app [-u] [-i] [user@]<host|domain> <command...>
     \\
     \\Run a graphical application on a remote host with its windows on
     \\this desktop. A sketerm window must already be open here — it
@@ -31,9 +31,15 @@ const USAGE =
     \\
     \\  -u    mosh-style: bootstrap over SSH, then run over encrypted
     \\        UDP with roaming — the app survives network changes.
+    \\  -i    isolate: run under a private runtime dir + no shared D-Bus
+    \\        bus, so single-instance apps (pcmanfm, GApplication) open
+    \\        here instead of handing off to a copy already rendering on
+    \\        another client. Cost: this session won't share the remote's
+    \\        audio / notifications / portals.
     \\
     \\  sketerm app devbox gnome-calculator
     \\  sketerm app -u flaky-wifi-box firefox --new-window
+    \\  sketerm app -i archdev pcmanfm
     \\
     \\<domain> names from config.conf `[domain.<name>]` sections work
     \\(udp-transport domains imply -u).
@@ -44,21 +50,27 @@ pub const Parsed = struct {
     host: []const u8,
     command: []const []const u8,
     udp: bool = false,
+    isolated: bool = false,
 };
 
-/// Pure argv split: optional -u, then host, rest = remote command.
-/// Null = show usage (missing host/command, or -h/--help).
+/// Pure argv split: leading -u/-i flags (any order), then host, rest =
+/// remote command. Null = show usage (missing host/command, or -h/--help).
 pub fn parseArgs(args_in: []const []const u8) ?Parsed {
     var args = args_in;
     var udp = false;
-    if (args.len > 0 and std.mem.eql(u8, args[0], "-u")) {
-        udp = true;
+    var isolated = false;
+    while (args.len > 0) {
+        if (std.mem.eql(u8, args[0], "-u")) {
+            udp = true;
+        } else if (std.mem.eql(u8, args[0], "-i") or std.mem.eql(u8, args[0], "--isolated")) {
+            isolated = true;
+        } else break;
         args = args[1..];
     }
     if (args.len < 2) return null;
     if (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")) return null;
     if (args[0].len == 0) return null;
-    return .{ .host = args[0], .command = args[1..], .udp = udp };
+    return .{ .host = args[0], .command = args[1..], .udp = udp, .isolated = isolated };
 }
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
@@ -89,7 +101,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // Spawn an app-kind session on the host's daemon and hand it to
     // the running GUI, whose compositor brain renders the windows.
     // Null = no GUI to render into.
-    if (runNativeApp(allocator, host, parsed.command, use_udp, port_range)) |code| return code;
+    if (runNativeApp(allocator, host, parsed.command, use_udp, port_range, parsed.isolated)) |code| return code;
     errMsg("no sketerm window is open on this desktop to render the app — open one and retry", .{});
     return 1;
 }
@@ -105,6 +117,7 @@ fn runNativeApp(
     command: []const []const u8,
     use_udp: bool,
     port_range: ?[]const u8,
+    isolated: bool,
 ) ?u8 {
     const ipc_client = @import("ipc/client.zig");
     const gui_sock = ipc_client.resolveSocket(allocator, null) orelse return null;
@@ -133,6 +146,7 @@ fn runNativeApp(
         .rows = @as(u16, 24),
         .cols = @as(u16, 80),
         .app = true,
+        .isolated = isolated,
     }) catch return 1;
     const ok = conn.recvExpect(&.{.ok}) catch {
         errMsg("daemon on {s} refused the app session", .{host});
@@ -174,6 +188,24 @@ test "remoteapp: parseArgs handles -u" {
     try std.testing.expect(!parseArgs(&no_u).?.udp);
     const u_only = [_][]const u8{ "-u", "devbox" };
     try std.testing.expect(parseArgs(&u_only) == null);
+}
+
+test "remoteapp: parseArgs handles -i (any order, with -u)" {
+    const i_only = [_][]const u8{ "-i", "devbox", "pcmanfm" };
+    const p = parseArgs(&i_only).?;
+    try std.testing.expect(p.isolated and !p.udp);
+    try std.testing.expectEqualStrings("devbox", p.host);
+    try std.testing.expectEqualStrings("pcmanfm", p.command[0]);
+    // Long form and order-independence with -u.
+    const both = [_][]const u8{ "-u", "--isolated", "box", "app" };
+    const q = parseArgs(&both).?;
+    try std.testing.expect(q.isolated and q.udp);
+    const both_rev = [_][]const u8{ "-i", "-u", "box", "app" };
+    const r = parseArgs(&both_rev).?;
+    try std.testing.expect(r.isolated and r.udp);
+    // Default off; flags only consumed when leading.
+    try std.testing.expect(!parseArgs(&[_][]const u8{ "box", "app" }).?.isolated);
+    try std.testing.expect(!parseArgs(&[_][]const u8{ "box", "-i" }).?.isolated);
 }
 
 test "remoteapp: parseArgs rejects missing command / help" {
