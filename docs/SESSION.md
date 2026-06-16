@@ -5798,3 +5798,34 @@ opportunistic, AV2 once it matures.
 609 tests (5 vcodec: wire round-trip + split peeling, malformed/too-long
 rejection, stub encode→wire→decode, wrong-codec/size guards), GUI build,
 smoke-mux, mux-portable green.
+
+## 2026-06-16: Phase 4 routing brain + x264 encoder backend
+
+Routing logic + the real software encoder behind the vcodec abstraction.
+
+- **`src/util/content.zig`** — cheap sampled distinct-colour heuristic:
+  flat/texty regions (few colours, sharp edges a lossy DCT would ring)
+  stay lossless; photographic/continuous-tone regions are codec-safe.
+  `decide(hot, pixels)` routes to video only when churn says HOT **and**
+  content says photographic — biased to lossless (the safe error).
+- **`src/util/yuv.zig`** — full-range BT.601 BGRA↔I420 (integer
+  fixed-point, daemon-safe): the colour-space step every video codec needs.
+- **`vendor/x264_shim.c`** — a 3-function shim over libx264
+  (ultrafast/zerolatency, full-range, Annex-B), the sck_shim/nsax_shim
+  pattern so Zig calls it via extern fn without x264.h in @cImport.
+- **vcodec x264 backend** — `Encoder.initX264` BGRA→I420s a tile and
+  encodes H.264; gated on `build_options.video`, collapsing to `void`
+  (like SckImpl) when off.
+- **build.zig `-Dvideo`** (default OFF) dynamically links the SYSTEM
+  x264 (NOT vendored — its speed is per-arch asm; the optional video
+  path can be absent on portable) + compiles the shim. Default builds
+  and the musl-portable daemon stay video-free, fully static, lossless.
+
+Decoder stays OS/hardware (VideoToolbox/VAAPI) — don't ship an
+encumbered software H.264 decoder. Not yet wired into the daemon hot
+path (next: worker-thread encode offload + carrier units + churn/content
+routing + mixed lossless/video frames). Design: docs/proposal-phase4-video.md.
+
+617 tests (churn/content/yuv cases + the x264 keyframe-encode test, which
+skips without -Dvideo and passes under it), GUI build, smoke-mux,
+mux-portable static — all green.
