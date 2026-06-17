@@ -6047,3 +6047,75 @@ clean-exit worker leak and the missing spawn handshake behind the
 default flip — both fixed and now covered by smoke-broker. smoke-broker,
 smoke-mux, smoke-e2e (GUI via the broker), full tests, and GUI / mux /
 mux-portable builds all green.
+
+## File upload to remote sessions (drag-and-drop / "Upload File…")
+
+Drop a file onto a remote pane — or right-click → **Upload File…** — and
+it lands on the remote box, in the shell's current working directory.
+
+- **Wire (proto v3).** New append-only frames: `file_open` (JSON
+  `{xfer,name,size}`), `file_data` (`[u32 xfer | bytes]`), `file_close`
+  (client → daemon), and `file_reply` (daemon → client; JSON
+  `{xfer,status,written,path,message}`, status ∈
+  `ready|progress|done|error`). The handshake already requires an exact
+  proto match, so an attached daemon understands them by construction.
+- **Daemon is the writer.** No shell cooperation, no `base64 -d` paste:
+  the daemon owns the session, so it resolves the cwd via
+  `/proc/<pid>/cwd`, takes only the **basename** of the requested name
+  (no path traversal), opens it `O_CREAT|O_EXCL` with non-clobber
+  renaming (`notes.txt` → `notes (1).txt`), and streams the bytes
+  straight to disk. Per-chunk acks carry cumulative-written. Uploads are
+  bounded (8/client), abandoned on client drop, partials unlinked on a
+  write error. Works over local / SSH / UDP unchanged.
+- **GUI pump.** `Terminal.startUpload(paths)` queues files (one streams
+  at a time); a GLib idle source pumps 128 KB chunks, bounded by socket
+  backpressure. `pane.zig onFileDrop` branches to upload on remote panes
+  (local panes keep pasting the shell-quoted path); the menu item opens
+  a `GtkFileDialog`. Progress drives the tab ring; an `AdwToastOverlay`
+  (new, wraps the tab view) shows "Uploaded X → host:/path" / failures.
+- **Tests.** `smoke-mux` gained a real end-to-end upload stage: cd the
+  shell into a temp dir, stream a file over the wire, assert it lands
+  with the exact bytes, and assert a repeat name de-clobbers to
+  ` (1)`. smoke-mux, full tests, smoke-e2e, and GUI / mux / mux-portable
+  builds all green; `sketerm-mux` still links libc/libm only.
+
+### Download (the other direction) + a remote file browser
+
+Right-click → **Download File…** opens a **remote file picker** — a
+small window that browses the session's filesystem (no path typing):
+folders first, then files with human-readable sizes, an editable address
+bar, and an Up button. Click a folder to descend, click a file to
+download it into the local Downloads dir.
+
+- **Wire.** New frames: `file_get` (download) and `file_list` /
+  `file_listing` (directory browse). Download bytes flow back over the
+  SAME `file_data` frame — now bidirectional, disambiguated by which
+  side receives it (upload xfer vs download xfer). `file_reply` "ready"
+  gained a `size` field; `file_listing` carries
+  `{path, entries:[{name,dir,size}], error?, truncated?}` (dirs first,
+  case-insensitive sort, non-UTF-8 names skipped, capped at 4096).
+- **Daemon is the sender.** `handleFileGet` resolves the path (absolute
+  or relative to the shell cwd — the user already has shell access, so
+  no extra sandbox), opens it `O_RDONLY`, **rejects non-regular files**
+  (no FIFO/`/dev/zero` to block or stream forever), and replies "ready"
+  with size+basename. `pumpDownloads` (called each tick beside
+  `pumpWinstreams`) streams 256 KB chunks, **bounded by the client's
+  write-buffer high-water mark** (8 MB) so a multi-GB file can't balloon
+  memory — it fills to the mark, then waits for the socket to drain.
+- **GUI saves it.** `Terminal.startDownload` sends `file_get`; the
+  `file_data` bytes are written to a non-clobbering file in
+  `G_USER_DIRECTORY_DOWNLOAD` (→ `$HOME` fallback). The upload event
+  plumbing was generalized to `TransferEvent { dir: upload|download }`,
+  so the tab ring + toast ("Downloaded X → /local/path") are shared.
+  The browser is `src/ui/remote_browser.zig` — a heap-allocated
+  `Browser` that holds Window+Pane (not the Terminal) and re-fetches the
+  live Terminal from the window's pane list before each action, so a
+  pane closing under it can't dangle. `Terminal.requestList` /
+  `on_listing` (with a stale-xfer guard) carry the directory data.
+- **Tests.** The smoke stage now also downloads the just-uploaded file
+  back (byte-exact reassembly), checks a missing-file request fails
+  cleanly rather than hangs, and lists the cwd to find the uploaded
+  file. **Visually verified** headlessly (xvfb + xdotool): the menu, the
+  browser listing/navigation/Up/address-bar, and a real download landing
+  byte-identical with its toast. All builds + tests + both smokes +
+  smoke-e2e green; `sketerm-mux` still libc/libm only.
