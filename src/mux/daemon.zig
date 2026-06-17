@@ -210,19 +210,62 @@ const Worker = struct {
     /// client fds (SCM_RIGHTS), kill/rename control bytes, and metadata pushes.
     control_fd: c_int,
     dead: bool = false,
-    /// Cached for `list` (B3 keeps these current via metadata pushes).
+    /// Spawn handshake: the broker defers the spawn `.ok`/`.err` reply until
+    /// the worker confirms its session is up ('Y' ready) or dies first
+    /// (control EOF before ready = spawn failed). `pending_client` is the
+    /// client awaiting that reply (blocked in recvExpect(.ok)); validated
+    /// against the live client list before use (the GUI could vanish).
+    ready: bool = false,
+    pending_client: ?*Client = null,
+    /// Cached for `list`, kept current by the worker's metadata pushes ('M'
+    /// control datagrams). `last_activity_ms` is on the shared CLOCK_MONOTONIC
+    /// clock (same machine), so the broker computes idle_ms straight off it.
     rows: u16 = 24,
     cols: u16 = 80,
     exited: bool = false,
     app: bool = false,
     n_clients: u32 = 0,
     last_activity_ms: i64 = 0,
+    /// Owned copies of the worker's last-pushed title / cwd (null = none yet).
+    title: ?[]u8 = null,
+    cwd: ?[]u8 = null,
 
     fn deinit(self: *Worker) void {
         if (self.control_fd >= 0) _ = c.close(self.control_fd);
         self.allocator.free(self.name);
+        if (self.title) |t| self.allocator.free(t);
+        if (self.cwd) |cw| self.allocator.free(cw);
         self.allocator.destroy(self);
     }
+};
+
+/// Worker→broker metadata push payload (JSON over the 'M' control datagram).
+/// Excludes the session name — that is broker-authoritative (rename updates
+/// `Worker.name`; a stale name in a push must never clobber it).
+const WorkerMeta = struct {
+    rows: u16 = 24,
+    cols: u16 = 80,
+    clients: u32 = 0,
+    exited: bool = false,
+    app: bool = false,
+    activity: i64 = 0,
+    title: []const u8 = "",
+    cwd: []const u8 = "",
+};
+
+/// Worker-side throttle state for metadata pushes. Structural changes (client
+/// count, size, exit, title) push immediately; bare activity advances are
+/// rate-limited (the broker derives idle_ms from `activity` against its own
+/// clock, so a small lag costs nothing).
+const WorkerPush = struct {
+    inited: bool = false,
+    clients: u32 = 0,
+    exited: bool = false,
+    rows: u16 = 0,
+    cols: u16 = 0,
+    title_hash: u64 = 0,
+    activity: i64 = 0,
+    last_push_ms: i64 = 0,
 };
 
 const Client = struct {
@@ -521,6 +564,14 @@ pub const Daemon = struct {
     is_broker: bool = false,
     /// Broker only: forked session workers, by session name.
     workers: std.ArrayList(*Worker) = .empty,
+    /// Worker only: last metadata signature pushed to the broker, so
+    /// `maybePushMeta` only sends on a real change (and throttles activity).
+    wpush: WorkerPush = .{},
+    /// Worker only: runtime dir (owned) for the session's Wayland display /
+    /// isolated rt sockets. A worker has no listen socket, so it can't derive
+    /// the dir from `sock_path` ("") the way the monolith/broker does — the
+    /// broker hands it the dir at fork time. null in monolith/broker.
+    base_dir: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, sock_path: []const u8) !*Daemon {
         const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/') orelse return error.BadPath;
@@ -558,6 +609,7 @@ pub const Daemon = struct {
         self.workers.deinit(self.allocator);
         if (self.listen_fd >= 0) _ = c.close(self.listen_fd);
         if (self.control_fd >= 0) _ = c.close(self.control_fd);
+        if (self.base_dir) |d| self.allocator.free(d);
         // Only the broker/monolith owns the socket file; a worker has none.
         if (self.sock_path.len > 0) {
             var z_buf: [4096]u8 = undefined;
@@ -681,6 +733,17 @@ pub const Daemon = struct {
                 }
             }
         }
+        // Broker: each worker's control channel — readable = a metadata push
+        // ('M'); HUP/error = the worker process exited (reap removes it).
+        const worker_base = fds.items.len;
+        const n_workers_built = self.workers.items.len;
+        for (self.workers.items) |w| {
+            try fds.append(self.allocator, .{
+                .fd = if (w.dead) -1 else w.control_fd,
+                .events = c.POLLIN,
+                .revents = 0,
+            });
+        }
 
         const pr = c.poll(fds.items.ptr, @intCast(fds.items.len), timeout_ms);
         if (pr < 0) return; // EINTR etc — next tick retries
@@ -761,7 +824,23 @@ pub const Daemon = struct {
             }
         }
 
+        // Broker: drain worker control channels (metadata pushes + exit).
+        i = 0;
+        while (i < n_workers_built) : (i += 1) {
+            const w = self.workers.items[i];
+            if (w.dead) continue;
+            const re = fds.items[worker_base + i].revents;
+            if (re & c.POLLIN != 0) {
+                self.brokerOnWorkerControl(w);
+            } else if (re & (c.POLLHUP | c.POLLERR) != 0) {
+                // Worker process gone (clean exit or crash) — reap removes it.
+                w.dead = true;
+            }
+        }
+
         self.pumpWinstreams();
+        // Worker: tell the broker our latest metadata (throttled).
+        if (self.control_fd >= 0 and !self.is_broker) self.maybePushMeta();
         self.reap();
     }
 
@@ -815,6 +894,19 @@ pub const Daemon = struct {
                 for (self.clients.items) |cl| if (!cl.dead) cl.queueFrame(.gone, "");
                 self.running = false;
             },
+            'R' => {
+                // Rename our session to match the broker's new authoritative
+                // name (keeps the worker's own state consistent; the broker is
+                // the routing authority). Payload after 'R' is the raw name.
+                if (passed >= 0) _ = c.close(passed);
+                if (n > 1 and self.sessions.items.len > 0) {
+                    const new_name = buf[1..@intCast(n)];
+                    if (self.allocator.dupe(u8, new_name)) |fresh| {
+                        self.allocator.free(self.sessions.items[0].name);
+                        self.sessions.items[0].name = fresh;
+                    } else |_| {}
+                }
+            },
             else => if (passed >= 0) {
                 _ = c.close(passed);
             },
@@ -847,6 +939,120 @@ pub const Daemon = struct {
                 self.openAppChannel(s, cl, afd);
             }
         }
+    }
+
+    /// Broker side: read one control datagram from a worker. 'Y' = ready
+    /// (resolve the deferred spawn `.ok`), 'M' = metadata push; n<=0 means the
+    /// worker exited (before 'Y' = spawn failed → resolve spawn `.err`).
+    /// The buffer comfortably exceeds the worst-case 'M' JSON (a 256-byte
+    /// title + 1024-byte cwd, each up to ~6x under \uXXXX escaping).
+    fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
+        var buf: [16384]u8 = undefined;
+        var passed: c_int = -1;
+        const n = controlRecv(w.control_fd, &buf, &passed);
+        if (passed >= 0) _ = c.close(passed); // workers never pass fds up
+        if (n <= 0) {
+            if (!w.ready) self.replyPendingSpawn(w, false); // died before ready
+            w.dead = true;
+            return;
+        }
+        switch (buf[0]) {
+            'Y' => {
+                w.ready = true;
+                self.replyPendingSpawn(w, true);
+            },
+            'M' => {
+                var parsed = std.json.parseFromSlice(WorkerMeta, self.allocator, buf[1..@intCast(n)], .{
+                    .ignore_unknown_fields = true,
+                }) catch return;
+                defer parsed.deinit();
+                const m = parsed.value;
+                w.rows = m.rows;
+                w.cols = m.cols;
+                w.n_clients = m.clients;
+                w.exited = m.exited;
+                w.app = m.app;
+                w.last_activity_ms = m.activity;
+                if (self.allocator.dupe(u8, m.title)) |t| {
+                    if (w.title) |old| self.allocator.free(old);
+                    w.title = t;
+                } else |_| {}
+                if (self.allocator.dupe(u8, m.cwd)) |cw| {
+                    if (w.cwd) |old| self.allocator.free(old);
+                    w.cwd = cw;
+                } else |_| {}
+            },
+            else => {},
+        }
+    }
+
+    /// Resolve a worker's deferred spawn reply. `ok` = session up (`.ok`),
+    /// else spawn failed (`.err`). Validates the waiting client is still a live
+    /// connection (the GUI could have vanished while the worker came up).
+    fn replyPendingSpawn(self: *Daemon, w: *Worker, ok: bool) void {
+        const cl = w.pending_client orelse return;
+        w.pending_client = null;
+        for (self.clients.items) |c2| {
+            if (c2 == cl and !c2.dead) {
+                if (ok) c2.queueJson(.ok, .{ .ok = true, .name = w.name }) else c2.queueErr("spawn failed");
+                return;
+            }
+        }
+    }
+
+    /// Worker side: push current session metadata to the broker if it changed
+    /// since the last push. Structural changes go immediately; activity-only
+    /// advances are rate-limited to ~5/s.
+    fn maybePushMeta(self: *Daemon) void {
+        if (self.sessions.items.len == 0) return;
+        const s = self.sessions.items[0];
+        var n_clients: u32 = 0;
+        for (self.clients.items) |cl| {
+            if (!cl.dead) n_clients += 1;
+        }
+        const title: []const u8 = if (s.screen.last_title) |t| t else "";
+        const th = std.hash.Wyhash.hash(0, title);
+        const structural = !self.wpush.inited or
+            n_clients != self.wpush.clients or
+            s.exited != self.wpush.exited or
+            s.screen.rows != self.wpush.rows or
+            s.screen.cols != self.wpush.cols or
+            th != self.wpush.title_hash;
+        const activity_moved = s.last_activity_ms != self.wpush.activity;
+        const now = nowMs();
+        if (!structural and !(activity_moved and now - self.wpush.last_push_ms >= 200)) return;
+
+        var cwd: []const u8 = "";
+        var scratch: [4096]u8 = undefined;
+        if (cwdOfPid(s.pty.child_pid, &scratch)) |cw| cwd = cw;
+        const meta = WorkerMeta{
+            .rows = s.screen.rows,
+            .cols = s.screen.cols,
+            .clients = n_clients,
+            .exited = s.exited,
+            .app = s.app,
+            .activity = s.last_activity_ms,
+            // Bounded so one JSON datagram stays well under the broker's
+            // recv buffer (a SOCK_SEQPACKET over-long datagram is truncated).
+            .title = title[0..@min(title.len, 256)],
+            .cwd = cwd[0..@min(cwd.len, 1024)],
+        };
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        aw.writer.writeByte('M') catch return;
+        std.json.Stringify.value(meta, .{}, &aw.writer) catch return;
+        controlSend(self.control_fd, aw.written(), -1);
+
+        self.wpush = .{
+            .inited = true,
+            .clients = n_clients,
+            .exited = s.exited,
+            .rows = s.screen.rows,
+            .cols = s.screen.cols,
+            .title_hash = th,
+            .activity = s.last_activity_ms,
+            .last_push_ms = now,
+        };
     }
 
     /// recvmsg one control datagram: data into `buf`, the first SCM_RIGHTS fd
@@ -898,25 +1104,33 @@ pub const Daemon = struct {
     }
 
     /// Construct a worker-mode daemon (no listen socket; clients arrive over
-    /// `control_fd`). The caller spawns the one session and runs the loop.
-    pub fn initWorker(allocator: std.mem.Allocator, control_fd: c_int) !*Daemon {
+    /// `control_fd`). `base_dir` is the runtime dir for the session's Wayland /
+    /// isolated-rt sockets (the broker's socket dir). The caller spawns the one
+    /// session and runs the loop.
+    pub fn initWorker(allocator: std.mem.Allocator, control_fd: c_int, base_dir: []const u8) !*Daemon {
         const self = try allocator.create(Daemon);
         self.* = .{
             .allocator = allocator,
             .listen_fd = -1,
             .sock_path = try allocator.dupe(u8, ""),
             .control_fd = control_fd,
+            .base_dir = if (base_dir.len > 0) try allocator.dupe(u8, base_dir) else null,
         };
         return self;
     }
 
     /// Worker process entry: own one session (from `req`), serve clients the
     /// broker hands over `control_fd`, until killed or the broker goes away.
-    pub fn runWorker(allocator: std.mem.Allocator, control_fd: c_int, req: SpawnReq) !void {
-        const self = try initWorker(allocator, control_fd);
+    pub fn runWorker(allocator: std.mem.Allocator, control_fd: c_int, req: SpawnReq, base_dir: []const u8) !void {
+        const self = try initWorker(allocator, control_fd, base_dir);
         defer self.deinit();
+        // If spawnSession fails we return the error → the caller `_exit`s →
+        // the broker sees control EOF before any 'Y' → it replies `.err` to
+        // the waiting client. On success, signal 'Y' (ready) so the broker
+        // sends the spawn `.ok` only once the session truly exists.
         const s = try self.spawnSession(req);
         try self.sessions.append(allocator, s);
+        controlSend(control_fd, "Y", -1);
         try self.run();
     }
 
@@ -1013,6 +1227,16 @@ pub const Daemon = struct {
                 // (.gone) so they don't paint a crash sad-face on the EOF.
                 for (self.clients.items) |other| {
                     if (other != cl and !other.dead) other.queueFrame(.gone, "");
+                }
+                // Broker: a worker's clients are on the WORKER, not here — a
+                // bare control-fd close would read as a crash to them. Send
+                // each worker a graceful 'K' so it flushes `.gone` to its own
+                // clients before exiting (the buffered datagram is delivered
+                // even though we're about to stop).
+                if (self.is_broker) {
+                    for (self.workers.items) |w| {
+                        if (!w.dead) controlSend(w.control_fd, "K", -1);
+                    }
                 }
                 cl.queueJson(.ok, .{ .ok = true });
                 self.running = false;
@@ -1643,6 +1867,26 @@ pub const Daemon = struct {
         return null;
     }
 
+    /// Apply per-worker resource limits in the freshly forked child, before it
+    /// becomes a worker. Opt-in via SKETERM_WORKER_MEM_MB (megabytes of address
+    /// space, RLIMIT_AS); unset or 0 = no cap. A capped worker that runs away
+    /// hits ENOMEM and dies alone — the broker just sees it exit (containment),
+    /// so a single OOM never reaches the machine's global OOM killer. Off by
+    /// default because RLIMIT_AS bounds VIRTUAL space, which heavy-image
+    /// sessions can legitimately reserve; the knob is for hosts that want a
+    /// hard ceiling.
+    fn applyWorkerLimits() void {
+        const env = std.c.getenv("SKETERM_WORKER_MEM_MB") orelse return;
+        const mb = std.fmt.parseInt(u64, std.mem.span(env), 10) catch {
+            std.debug.print("sketerm-mux: ignoring unparseable SKETERM_WORKER_MEM_MB={s}\n", .{std.mem.span(env)});
+            return;
+        };
+        if (mb == 0) return;
+        const bytes = mb * 1024 * 1024;
+        const rl = c.struct_rlimit{ .rlim_cur = @intCast(bytes), .rlim_max = @intCast(bytes) };
+        _ = c.setrlimit(c.RLIMIT_AS, &rl);
+    }
+
     /// Broker side of spawn: fork a worker process that owns this session.
     /// fork-without-exec — the child runs `runWorker` against an inherited
     /// (COW) copy of the SpawnReq; it first drops every broker fd it inherited.
@@ -1694,7 +1938,12 @@ pub const Daemon = struct {
                 if (w.control_fd >= 0) _ = c.close(w.control_fd);
             }
             _ = c.setsid();
-            runWorker(self.allocator, sp[1], req) catch {};
+            applyWorkerLimits();
+            // Hand the worker the broker's socket dir so its Wayland display /
+            // isolated-rt sockets land in the right runtime dir (the worker has
+            // no listen socket of its own to derive it from). COW-valid here.
+            const dir_end = std.mem.lastIndexOfScalar(u8, self.sock_path, '/') orelse self.sock_path.len;
+            runWorker(self.allocator, sp[1], req, self.sock_path[0..dir_end]) catch {};
             c._exit(0);
         }
         // Broker parent.
@@ -1711,19 +1960,15 @@ pub const Daemon = struct {
             cl.queueErr("oom");
             return;
         };
-        w.* = .{ .allocator = self.allocator, .name = name_owned, .pid = pid, .control_fd = sp[0], .app = req.app };
+        w.* = .{ .allocator = self.allocator, .name = name_owned, .pid = pid, .control_fd = sp[0], .app = req.app, .pending_client = cl };
         self.workers.append(self.allocator, w) catch {
             w.deinit();
             cl.queueErr("oom");
             return;
         };
-        // NOTE: we reply `.ok` on a successful fork, before the worker has
-        // actually opened its PTY/session. If `spawnSession` fails in the
-        // child it `_exit`s silently and a later `.attach` would block on a
-        // snapshot that never comes. B3 adds a worker→broker "ready"/"failed"
-        // handshake so the broker can reflect spawn failure synchronously like
-        // the monolith does; until then the broker is not the default path.
-        cl.queueJson(.ok, .{ .ok = true, .name = w.name });
+        // Reply is deferred: `brokerOnWorkerControl` sends `.ok` when the
+        // worker reports 'Y' (session up), or `.err` if the worker dies first
+        // (spawnSession failed). The client is blocked in recvExpect(.ok).
     }
 
     /// Broker side of attach: hand the client's socket fd to the session's
@@ -1754,6 +1999,92 @@ pub const Daemon = struct {
         cl.dead = true;
     }
 
+    /// Broker side of list: answer from each worker's pushed metadata cache.
+    /// The broker holds no Screen, so every field here came over a worker 'M'
+    /// push; idle_ms is computed against the broker's own (shared) clock.
+    fn brokerList(self: *Daemon, cl: *Client) void {
+        var infos: std.ArrayList(SessionInfo) = .empty;
+        defer infos.deinit(self.allocator);
+        const now = nowMs();
+        for (self.workers.items) |w| {
+            if (w.dead) continue;
+            infos.append(self.allocator, .{
+                .name = w.name,
+                .rows = w.rows,
+                .cols = w.cols,
+                .clients = w.n_clients,
+                .exited = w.exited,
+                .title = if (w.title) |t| t else "",
+                .app = w.app,
+                // A worker that has never pushed (activity==0) reads as idle 0
+                // rather than a bogus multi-decade idle.
+                .idle_ms = if (w.last_activity_ms == 0) 0 else now - w.last_activity_ms,
+                .cwd = if (w.cwd) |cw| cw else "",
+            }) catch return;
+        }
+        cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .sessions = infos.items });
+    }
+
+    /// Broker side of kill: send the worker a graceful 'K' (it flushes `.gone`
+    /// to its clients and exits) and mark it dead so the name frees at once.
+    /// The buffered 'K' datagram is delivered to the worker even though reap
+    /// closes the broker's control end this tick.
+    fn brokerKill(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(AttachReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad kill request");
+            return;
+        };
+        defer parsed.deinit();
+        const w = self.brokerFindWorker(parsed.value.name) orelse {
+            cl.queueErr("no such session");
+            return;
+        };
+        controlSend(w.control_fd, "K", -1);
+        w.dead = true;
+        cl.queueJson(.ok, .{ .ok = true });
+    }
+
+    /// Broker side of rename: the broker is the routing authority, so update
+    /// `Worker.name` here, and forward an 'R' to the worker so its own session
+    /// state stays consistent.
+    fn brokerRename(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(RenameReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad rename request");
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+        if (req.new_name.len == 0 or req.new_name.len > 64) {
+            cl.queueErr("rename needs a name (1-64 chars)");
+            return;
+        }
+        const w = self.brokerFindWorker(req.name) orelse {
+            cl.queueErr("no such session");
+            return;
+        };
+        if (self.brokerFindWorker(req.new_name)) |other| {
+            if (other != w) {
+                cl.queueErr("session name already exists");
+                return;
+            }
+        }
+        const fresh = self.allocator.dupe(u8, req.new_name) catch {
+            cl.queueErr("oom");
+            return;
+        };
+        self.allocator.free(w.name);
+        w.name = fresh;
+        var msg: [1 + 64]u8 = undefined;
+        msg[0] = 'R';
+        @memcpy(msg[1..][0..req.new_name.len], req.new_name);
+        controlSend(w.control_fd, msg[0 .. 1 + req.new_name.len], -1);
+        cl.queueJson(.ok, .{ .ok = true, .name = w.name });
+    }
+
     const WaylandHub = struct {
         fd: c_int,
         display_path: []u8,
@@ -1764,12 +2095,34 @@ pub const Daemon = struct {
     /// listening socket is the one the shell's $WAYLAND_DISPLAY points
     /// at. Null on any failure (the session still spawns, just without
     /// Wayland forwarding).
-    fn setupWaylandHub(self: *Daemon) ?WaylandHub {
+    /// True in a forked session worker (owns one session over a control_fd,
+    /// no listen socket). Broker and monolith both have control_fd == -1.
+    inline fn isWorker(self: *const Daemon) bool {
+        return self.control_fd >= 0;
+    }
+
+    /// Directory the session's auxiliary sockets (Wayland display, isolated rt
+    /// dir) live in. The monolith/broker derive it from their listen socket
+    /// path; a worker was handed it at fork (it has no listen socket). Null if
+    /// neither is available.
+    fn runtimeBaseDir(self: *const Daemon) ?[]const u8 {
+        if (self.base_dir) |d| return d;
         const dir_end = std.mem.lastIndexOfScalar(u8, self.sock_path, '/') orelse return null;
-        const dir = self.sock_path[0..dir_end];
-        const id = self.next_wl_id;
-        self.next_wl_id += 1;
-        const display_path = std.fmt.allocPrint(self.allocator, "{s}/wl-{d}", .{ dir, id }) catch return null;
+        return self.sock_path[0..dir_end];
+    }
+
+    fn setupWaylandHub(self: *Daemon) ?WaylandHub {
+        const dir = self.runtimeBaseDir() orelse return null;
+        // Workers share the runtime dir, each with one session, so a per-worker
+        // counter would collide ("wl-1" in every worker) — name by pid instead.
+        // The monolith keeps the sequential "wl-N" the rigs expect.
+        const display_path = if (self.isWorker())
+            std.fmt.allocPrint(self.allocator, "{s}/wl-w{d}", .{ dir, c.getpid() }) catch return null
+        else blk: {
+            const id = self.next_wl_id;
+            self.next_wl_id += 1;
+            break :blk std.fmt.allocPrint(self.allocator, "{s}/wl-{d}", .{ dir, id }) catch return null;
+        };
         var ok = false;
         defer if (!ok) self.allocator.free(display_path);
 
@@ -1882,11 +2235,14 @@ pub const Daemon = struct {
             allocator.free(p);
         };
         if (req.isolated) {
-            const dir_end = std.mem.lastIndexOfScalar(u8, self.sock_path, '/') orelse 0;
-            const dir = self.sock_path[0..dir_end];
-            const id = self.next_rt_id;
-            self.next_rt_id += 1;
-            const p = try std.fmt.allocPrint(allocator, "{s}/rt-{d}", .{ dir, id });
+            const dir = self.runtimeBaseDir() orelse "";
+            const p = if (self.isWorker())
+                try std.fmt.allocPrint(allocator, "{s}/rt-w{d}", .{ dir, c.getpid() })
+            else blk: {
+                const id = self.next_rt_id;
+                self.next_rt_id += 1;
+                break :blk try std.fmt.allocPrint(allocator, "{s}/rt-{d}", .{ dir, id });
+            };
             rt_dir_owned = p;
             var z_buf: [4096]u8 = undefined;
             _ = c.mkdir(try pathZ(&z_buf, p), 0o700);
@@ -2108,6 +2464,7 @@ pub const Daemon = struct {
     }
 
     fn handleList(self: *Daemon, cl: *Client) void {
+        if (self.is_broker) return self.brokerList(cl);
         var infos: std.ArrayList(SessionInfo) = .empty;
         defer infos.deinit(self.allocator);
         // Per-session cwd strings, owned for the life of this call (the
@@ -2148,6 +2505,7 @@ pub const Daemon = struct {
     }
 
     fn handleKill(self: *Daemon, cl: *Client, payload: []const u8) void {
+        if (self.is_broker) return self.brokerKill(cl, payload);
         var parsed = std.json.parseFromSlice(AttachReq, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {
@@ -2164,6 +2522,7 @@ pub const Daemon = struct {
     }
 
     fn handleRename(self: *Daemon, cl: *Client, payload: []const u8) void {
+        if (self.is_broker) return self.brokerRename(cl, payload);
         var parsed = std.json.parseFromSlice(RenameReq, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {
@@ -2339,6 +2698,34 @@ pub const Daemon = struct {
                 }
                 _ = self.sessions.swapRemove(i);
                 s.deinit();
+                continue;
+            }
+            i += 1;
+        }
+        // A worker exists only to serve its one session. Once that session is
+        // gone (shell exited on its own, or was killed), the worker has no
+        // reason to live — tear it down so the broker sees control EOF and
+        // reaps it (otherwise it polls forever, orphaned, and `list` keeps a
+        // stale entry). The `.exit`/`.gone` already queued to the client is
+        // delivered by run()'s flushClientsFinal before we close. The monolith
+        // (no control_fd) keeps running client-less — that's its whole point.
+        if (self.isWorker() and self.sessions.items.len == 0) self.running = false;
+        // Broker: a dead worker (control EOF or killed) is removed once its
+        // process has been waitpid'd — otherwise it lingers as a zombie. We
+        // hold the record (with its pid) until the reap succeeds; WNOHANG==0
+        // means "not exited yet", retry next tick. ECHILD (<0) → already gone.
+        i = 0;
+        while (i < self.workers.items.len) {
+            const w = self.workers.items[i];
+            if (w.dead) {
+                var status: c_int = 0;
+                const r = c.waitpid(w.pid, &status, c.WNOHANG);
+                if (r == 0) {
+                    i += 1; // still alive; check again next tick
+                    continue;
+                }
+                _ = self.workers.swapRemove(i);
+                w.deinit();
                 continue;
             }
             i += 1;
