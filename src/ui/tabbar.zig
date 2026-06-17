@@ -406,15 +406,39 @@ pub const TabBar = struct {
     }
 
     /// The inactive-warning fires on *silence*, with no event to wake the
-    /// 33ms tick (which sleeps once the aurora has faded). Arm a single
-    /// coarse timer, reset on every activity, that re-runs the tick once the
-    /// silence threshold elapses so the warning can light up. No-op unless
-    /// the just-active tab has the per-tab warning enabled.
+    /// 33ms tick (which sleeps once the aurora has faded). A single timer
+    /// re-runs the tick when silence is reached — but it must target the
+    /// SOONEST deadline across ALL warn-enabled tabs, not just the one that
+    /// last changed. The old code armed a flat threshold from `page` and
+    /// clobbered the shared timer every call, so with two+ warn tabs one
+    /// tab's wake-up cancelled another's and that tab never lit up. `page` is
+    /// only a hint that something changed; we recompute globally.
     pub fn armWarn(self: *TabBar, page: *c.AdwTabPage) void {
-        if (!tab_effects.tabSettings(page).warn_inactive) return;
-        if (self.warn_arm_id != 0) _ = c.g_source_remove(self.warn_arm_id);
-        // +0.2s margin so warnEval is comfortably past the threshold.
-        const ms: c.guint = self.config.inactive_warn_secs * 1000 + 200;
+        _ = page;
+        self.rescheduleWarn();
+    }
+
+    /// Point the single silence wake-up at the nearest future inactive-warning
+    /// deadline among all warn-enabled tabs. Tabs already past their threshold
+    /// are excluded — the tick is animating those (warnEval keeps it awake);
+    /// they need no wake-up.
+    fn rescheduleWarn(self: *TabBar) void {
+        if (self.warn_arm_id != 0) {
+            _ = c.g_source_remove(self.warn_arm_id);
+            self.warn_arm_id = 0;
+        }
+        const now = c.g_get_monotonic_time();
+        const threshold_us: i64 = @as(i64, self.config.inactive_warn_secs) * 1_000_000;
+        var soonest: ?i64 = null;
+        for (self.tabs.items) |t| {
+            if (!tab_effects.tabSettings(t.page).warn_inactive) continue;
+            const deadline = tab_effects.warnDeadline(t.page, threshold_us) orelse continue;
+            if (deadline <= now) continue; // already past → tick is animating it
+            if (soonest == null or deadline < soonest.?) soonest = deadline;
+        }
+        const d = soonest orelse return;
+        // +50ms so warnEval is comfortably past the threshold when we wake.
+        const ms: c.guint = @intCast(@max(@divFloor(d - now, 1000) + 50, 1));
         self.warn_arm_id = c.g_timeout_add(ms, @ptrCast(&onWarnArm), self);
     }
 
@@ -725,6 +749,9 @@ fn onWarnArm(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(TabBar, user);
     self.warn_arm_id = 0;
     self.ensureTick();
+    // A nearer tab just crossed its threshold (the tick will draw it); arm
+    // for the NEXT-soonest deadline so later-silent tabs still wake the tick.
+    self.rescheduleWarn();
     return 0;
 }
 
