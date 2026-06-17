@@ -30,6 +30,7 @@ struct timespec { long tv_sec; long tv_nsec; };
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <sys/resource.h> /* broker: per-worker RLIMIT_AS memory containment */
 #ifdef __linux__
 #include <sys/eventfd.h> /* Wakeup fast path (pipe fallback elsewhere) */
 #include <pty.h>         /* openpty/forkpty live here on glibc/musl */

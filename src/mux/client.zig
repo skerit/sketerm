@@ -66,13 +66,23 @@ pub const Conn = struct {
             }
         } else |_| {}
 
+        // Process-isolation broker by default: each session runs in its own
+        // worker process, so one shell's crash/OOM can't take down the daemon
+        // or its siblings. SKETERM_NO_BROKER=1 falls back to the single-process
+        // monolith (escape hatch if the broker ever misbehaves in the field).
+        const use_broker = c.getenv("SKETERM_NO_BROKER") == null;
         const pid = c.fork();
         if (pid == 0) {
             _ = c.setsid();
             var bin_buf: [4096:0]u8 = undefined;
             const bin = findMuxBinary(&bin_buf);
-            const argv = [_:null]?[*:0]const u8{ bin, null };
-            _ = c.execvp(bin, @ptrCast(@constCast(&argv)));
+            if (use_broker) {
+                const argv = [_:null]?[*:0]const u8{ bin, "--broker", null };
+                _ = c.execvp(bin, @ptrCast(@constCast(&argv)));
+            } else {
+                const argv = [_:null]?[*:0]const u8{ bin, null };
+                _ = c.execvp(bin, @ptrCast(@constCast(&argv)));
+            }
             c._exit(127);
         }
         var tries: u32 = 0;

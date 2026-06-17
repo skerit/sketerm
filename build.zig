@@ -214,6 +214,27 @@ pub fn build(b: *std.Build) void {
     const smoke_mux_step = b.step("smoke-mux", "Mux daemon end-to-end smoke (headless)");
     smoke_mux_step.dependOn(&smoke_mux_run.step);
 
+    // Broker (process-isolation) smoke — `zig build smoke-broker` (headless).
+    const smoke_broker_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_broker.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, smoke_broker_mod, core_cbindings_mod);
+    smoke_broker_mod.addImport("build_options", noglib_opts_mod);
+    if (native_sck) addSckBackend(b, smoke_broker_mod);
+    if (have_x264) addVideo(b, smoke_broker_mod);
+    if (have_vtenc) addVtEnc(b, smoke_broker_mod);
+    const smoke_broker = b.addExecutable(.{
+        .name = "sketerm-smoke-broker",
+        .root_module = smoke_broker_mod,
+        .use_lld = use_lld,
+    });
+    const smoke_broker_run = b.addRunArtifact(smoke_broker);
+    const smoke_broker_step = b.step("smoke-broker", "Broker process-isolation end-to-end smoke (headless)");
+    smoke_broker_step.dependOn(&smoke_broker_run.step);
+
     // M0.5 GL spike — `zig build spike-gl`.
     const spike_mod = b.createModule(.{
         .root_source_file = b.path("src/spike_gl.zig"),
