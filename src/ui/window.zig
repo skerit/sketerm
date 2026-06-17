@@ -1310,13 +1310,9 @@ pub const Window = struct {
             .show_activity = spec.show_activity,
             .warn_inactive = spec.warn_inactive,
         });
-        // Anchor the silence countdown for a restored/duplicated warn-tab so
-        // it can fire even if the user never selects it — otherwise an idle
-        // background tab built with warn_inactive has no reference point.
-        if (spec.warn_inactive) {
-            tab_effects.markSeen(page);
-            self.tabbar.armWarn(page);
-        }
+        // A restored/duplicated warn-tab starts clean: the warning is edge-
+        // triggered on activity→silence, so it stays quiet until the tab
+        // actually produces output and then falls silent. Nothing to anchor.
     }
 
     /// Re-apply a PaneSpec's saved shader state: preset by name
@@ -2621,13 +2617,11 @@ pub const Window = struct {
         t.window.tabbar.refresh();
         if (on) {
             t.window.tabbar.ensureTick();
-            if (t.kind == .warn_inactive) {
-                // Anchor the silence countdown at enable-time so a tab that
-                // was never selected/active still starts warning after the
-                // threshold (otherwise it has no reference point).
-                tab_effects.markSeen(t.page);
-                t.window.tabbar.armWarn(t.page);
-            }
+            // Turning on warn_inactive doesn't itself arm anything: the warning
+            // is edge-triggered, so it waits for the tab's next activity→
+            // silence cycle. (Already-pending activity is picked up by the
+            // tab bar's reschedule.)
+            if (t.kind == .warn_inactive) t.window.tabbar.armWarn(t.page);
         }
     }
 
@@ -2642,7 +2636,8 @@ pub const Window = struct {
         }
         const delay = self.config.tab_ack_delay_secs;
         if (delay <= 0) {
-            tab_effects.markSeen(page);
+            tab_effects.markAck(page);
+            self.tabbar.armWarn(page);
             return;
         }
         self.ack_timer_page = page;
@@ -6331,16 +6326,16 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
     const self = cast.userData(Window, user);
     const page = c.adw_tab_view_get_selected_page(view);
     if (page == null) return;
-    // Anchor the silence countdown on the tab we're LEAVING: walking away
-    // restarts its quiet period, and we wake the warning tick so an idle
-    // background tab actually lights up at the threshold (no output event
-    // would otherwise rouse it). No-op for a tab without warn_inactive.
+    // Leaving a tab is NOT an acknowledgement (only dwelling on it is — see
+    // onTabAckTimer). But the tab we just left becomes a background tab, so
+    // any pending warning must now light up: reschedule the silence wake-up
+    // and run the tick so an already-silent left tab paints immediately.
     const prev = self.selected_page_now;
     self.selected_page_now = page;
     if (prev) |pp| {
         if (pp != page) {
-            tab_effects.markSeen(pp);
             self.tabbar.armWarn(pp);
+            self.tabbar.ensureTick();
         }
     }
     // Clear any needs-attention from the now-active tab.
@@ -6383,7 +6378,10 @@ fn onTabAckTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
     const page = self.ack_timer_page orelse return 0;
     self.ack_timer_page = null;
     if (page == c.adw_tab_view_get_selected_page(self.tab_view)) {
-        tab_effects.markSeen(page);
+        tab_effects.markAck(page);
+        // Acknowledged → drop this tab's pending silence wake-up (warnDeadline
+        // is now null for it) so the timer retargets the next-soonest tab.
+        self.tabbar.armWarn(page);
     }
     return 0; // one-shot
 }
