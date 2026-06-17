@@ -6003,3 +6003,47 @@ hub / winstream / clipboard / query answering), B6 no-regression +
 isolation sweep and flipping autostart to `--broker`.
 
 mux + GUI build, smoke-mux PASS, full test suite, and smoke-e2e PASS.
+
+## 2026-06-17: broker B3–B6 — the process-isolation daemon, by default
+
+Finished the Firefox-style broker (one worker process per session) and
+flipped the local autostart to use it, so a single shell's crash/OOM
+can no longer take down the daemon or its siblings.
+
+- **B3 control protocol.** Workers push session metadata
+  (rows/cols/clients/title/cwd/activity) as JSON 'M' datagrams over the
+  SEQPACKET control channel; the broker caches it per `Worker` and
+  answers `list` from the cache (idle_ms computed against its own shared
+  CLOCK_MONOTONIC). `kill` → graceful 'K' (worker flushes `.gone` +
+  exits); `rename` updates the authoritative `Worker.name` and forwards
+  'R'. The broker polls every worker control fd in `tick()`.
+- **B4 isolation + containment.** Worker control-EOF ⇒ `w.dead`;
+  `reap()` collects it via `waitpid(WNOHANG)` (retried; the pid is never
+  dropped, so no zombie). A worker whose only session exits sets
+  `running=false` and tears down (no orphan, no stale `list` row). Opt-in
+  `RLIMIT_AS` per worker (`SKETERM_WORKER_MEM_MB`). SIGKILL-a-worker is
+  proven to leave the broker + siblings alive and interactive.
+- **B5 parity.** A worker has no listen socket, so `setupWaylandHub`
+  (and the isolated-rt dir) used to fail on its empty `sock_path`. The
+  broker now hands the worker its socket dir at fork; workers name aux
+  sockets `wl-w<pid>` / `rt-w<pid>` (the monolith keeps `wl-<seq>` the
+  rigs expect). Confirmed a worker creates its display socket and exports
+  the right `$WAYLAND_DISPLAY`; the rest of the per-session machinery is
+  the same `spawnSession`/tick code the monolith runs.
+- **B6 default + tests.** `connectLocalAutostart` launches `sketerm-mux
+  --broker` by default; `SKETERM_NO_BROKER=1` is the monolith escape
+  hatch. New `zig build smoke-broker` forks a REAL broker process and
+  drives spawn / attach+echo / list / rename / kill / clean-exit reaping
+  / SIGKILL crash-isolation. Broker `.shutdown` sends each worker a
+  graceful 'K' so worker clients see `.gone`, not a crash-face EOF.
+- **Spawn handshake.** The spawn reply is deferred until the worker
+  signals 'Y' (session up) or dies first (spawn failed → `.err`), so a
+  worker that can't start (e.g. RLIMIT) can't leave the GUI blocked on a
+  snapshot that never comes. Validated: a 1 MB-capped worker fails spawn
+  cleanly (client gets an error fast, broker survives, no leak).
+
+A pre-commit review (jelle-ai) caught two real blockers — the
+clean-exit worker leak and the missing spawn handshake behind the
+default flip — both fixed and now covered by smoke-broker. smoke-broker,
+smoke-mux, smoke-e2e (GUI via the broker), full tests, and GUI / mux /
+mux-portable builds all green.
