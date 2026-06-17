@@ -216,6 +216,11 @@ fn auroraDraw(_: *c.AdwTabPage, widget: *c.GtkWidget, snapshot: ?*c.GtkSnapshot,
     var rect: c.graphene_rect_t = undefined;
     _ = c.graphene_rect_init(&rect, 0, 0, @floatCast(w), @floatCast(h));
     const cr = c.gtk_snapshot_append_cairo(snapshot, &rect) orelse return;
+    // gtk_snapshot_append_cairo is transfer-full: the returned cairo_t owns
+    // a fresh image surface (sized to `rect`) and MUST be destroyed, or both
+    // leak. This runs every frame while the glow animates — a missing
+    // destroy here leaked ~MB/s of C-heap surfaces.
+    defer c.cairo_destroy(cr);
     const t_us: f64 = @floatFromInt(c.g_get_monotonic_time());
 
     // Soft aurora wash over the WHOLE tab, faint at the top and growing
@@ -387,6 +392,9 @@ fn warnDraw(_: *c.AdwTabPage, widget: *c.GtkWidget, snapshot: ?*c.GtkSnapshot, a
     var rect: c.graphene_rect_t = undefined;
     _ = c.graphene_rect_init(&rect, 0, 0, @floatCast(w), @floatCast(h));
     if (c.gtk_snapshot_append_cairo(snapshot, &rect)) |cr| {
+        // Transfer-full: must destroy the cairo_t (and its surface) or it
+        // leaks every animated frame. See auroraDraw.
+        defer c.cairo_destroy(cr);
         if (c.cairo_pattern_create_linear(0, 0, 0, h)) |grad| {
             defer c.cairo_pattern_destroy(grad);
             c.cairo_pattern_add_color_stop_rgba(grad, 0.0, 0.85, 0.12, 0.12, 0.05 * strength);
