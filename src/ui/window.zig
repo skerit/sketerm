@@ -275,6 +275,10 @@ pub const Window = struct {
     /// after the tab has stayed selected for `tab_ack_delay_secs`).
     ack_timer_id: c.guint = 0,
     ack_timer_page: ?*c.AdwTabPage = null,
+    /// The currently-selected page, tracked so a selection change can anchor
+    /// the silence countdown on the tab being LEFT (the inactive-warning
+    /// measures quiet from when you walk away). null before the first select.
+    selected_page_now: ?*c.AdwTabPage = null,
     /// Broadcast typing mode. Off = each pane gets its own keystrokes
     /// (default). Group = fan out to every pane sharing the source's
     /// `group` name. All = fan out to every pane in this window.
@@ -1306,6 +1310,13 @@ pub const Window = struct {
             .show_activity = spec.show_activity,
             .warn_inactive = spec.warn_inactive,
         });
+        // Anchor the silence countdown for a restored/duplicated warn-tab so
+        // it can fire even if the user never selects it — otherwise an idle
+        // background tab built with warn_inactive has no reference point.
+        if (spec.warn_inactive) {
+            tab_effects.markSeen(page);
+            self.tabbar.armWarn(page);
+        }
     }
 
     /// Re-apply a PaneSpec's saved shader state: preset by name
@@ -1373,39 +1384,26 @@ pub const Window = struct {
                     argv_buf[i] = z.ptr;
                 }
 
-                const pane_id = self.allocPaneId();
-                var pty = try Pty.spawn(.{
-                    .argv = argv_buf,
+                // Convert argv to slices for the wire spawn. The restored
+                // local pane becomes a daemon-backed session (the unified
+                // model) — the factory tracks it in panes/terminals.
+                var argv_slices: std.ArrayList([]const u8) = .empty;
+                defer argv_slices.deinit(self.allocator);
+                for (argv_buf) |a| try argv_slices.append(self.allocator, std.mem.span(a));
+
+                const pane = try self.daemonSpawnPane(.{
+                    .argv = argv_slices.items,
                     .cwd = p.cwd,
-                    .rows = 24,
-                    .cols = 80,
-                    .pane_id = pane_id,
-                    .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
-                    .shell_integration = self.shellIntegrationFor(argv_buf[0]),
-                });
-                errdefer _ = pty.closeAndReap();
-
-                const term = try Terminal.init(self.allocator, pty, 80, 24);
-                errdefer term.deinit();
-                term.debug_to_stderr = self.debug_events;
-
-                const pane = try self.makePane(term);
-                pane.id = pane_id;
-                pane.setSpawnArgv(argv_buf);
-                self.wirePaneSinks(pane);
-                // Profile name on the pane so cycle/restore tracks it.
-                if (profile) |pr| pane.active_profile = pr.name;
-                self.applyPaneConfig(pane, .{
+                    .si = self.shellIntegrationFor(argv_buf[0]),
                     .profile = profile,
-                    .font_size_override = p.font_size,
                 });
-                // Explicit per-pane shader preset/pick (wins over the
-                // profile/global shader applyPaneConfig resolved), or
-                // an explicit clear that turns the shader off.
+                pane.setSpawnArgv(argv_buf);
+                // Restore extras the base factory doesn't cover: per-pane
+                // font-size override + explicit shader preset/clear.
+                if (p.font_size != null)
+                    self.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = p.font_size });
                 self.restorePaneShader(pane, p);
 
-                try self.panes.append(self.allocator, pane);
-                try self.terminals.append(self.allocator, term);
                 node_out.* = .{ .leaf = pane };
                 return pane.widget();
             },
@@ -1473,37 +1471,19 @@ pub const Window = struct {
         argv: []const [*:0]const u8,
         cwd: ?[]const u8,
     ) !void {
-        const pane_id = self.allocPaneId();
-        var pty = try Pty.spawn(.{
-            .argv = argv,
+        // Convert the null-terminated argv to slices for the wire spawn.
+        var argv_slices: std.ArrayList([]const u8) = .empty;
+        defer argv_slices.deinit(self.allocator);
+        for (argv) |a| try argv_slices.append(self.allocator, std.mem.span(a));
+
+        // Daemon-backed pane (the factory tracks it in panes/terminals).
+        const pane = try self.daemonSpawnPane(.{
+            .argv = argv_slices.items,
             .cwd = cwd,
-            .rows = 24,
-            .cols = 80,
             .login_shell = self.config.settings.login_shell,
-            .pane_id = pane_id,
-            .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
-            .shell_integration = self.shellIntegrationFor(argv[0]),
+            .si = self.shellIntegrationFor(argv[0]),
         });
-        errdefer _ = pty.closeAndReap();
-
-        const term = try Terminal.init(self.allocator, pty, 80, 24);
-        errdefer term.deinit();
-        term.debug_to_stderr = self.debug_events;
-
-        const pane = try self.makePane(term);
-        pane.id = pane_id;
         pane.setSpawnArgv(argv);
-        // If anything below this fails (alloc failure adding to the
-        // panes/terminals list, etc.) we'd otherwise leave a Pane
-        // alive whose Terminal we just reaped via the prior errdefer
-        // — its on_* callbacks would still point at the dead
-        // Terminal, and the next render would fault. Drop the Pane
-        // explicitly on failure so neither side outlives the other.
-        errdefer pane.deinit();
-
-        self.wirePaneSinks(pane);
-
-        self.applyPaneConfig(pane, .{});
 
         // Wrap pane.widget() in a Box so we can swap it for a Paned
         // when splits happen. Box always has exactly one child.
@@ -1516,9 +1496,6 @@ pub const Window = struct {
         c.adw_tab_page_set_title(page, title_z);
         // Full-title tooltip — useful when titles are truncated.
         c.adw_tab_page_set_tooltip(page, title_z);
-
-        try self.panes.append(self.allocator, pane);
-        try self.terminals.append(self.allocator, term);
     }
 
     fn makePane(self: *Window, term: *Terminal) !*Pane {
@@ -1677,48 +1654,95 @@ pub const Window = struct {
             break :blk @ptrCast(&shell_buf);
         } else if (c.getenv("SHELL")) |env_ptr| @as([*:0]const u8, @ptrCast(env_ptr)) else "/bin/bash";
 
-        const argv = [_][*:0]const u8{shell};
-
-        var term_buf: [64:0]u8 = undefined;
-        var ct_buf: [64:0]u8 = undefined;
-        const tlen = @min(s.term_env.len, term_buf.len);
-        @memcpy(term_buf[0..tlen], s.term_env[0..tlen]);
-        term_buf[tlen] = 0;
-        const ctlen = @min(s.color_term_env.len, ct_buf.len);
-        @memcpy(ct_buf[0..ctlen], s.color_term_env[0..ctlen]);
-        ct_buf[ctlen] = 0;
-
-        const pane_id = self.allocPaneId();
-        var pty = try Pty.spawn(.{
-            .argv = &argv,
-            .rows = 24,
-            .cols = 80,
-            .term = @ptrCast(&term_buf),
-            .color_term = @ptrCast(&ct_buf),
+        const pane = try self.daemonSpawnPane(.{
+            .argv = &[_][]const u8{std.mem.span(shell)},
             .cwd = inherit_cwd,
+            .term = s.term_env,
+            .color_term = s.color_term_env,
             .login_shell = s.login_shell,
-            .pane_id = pane_id,
-            .socket_path = if (self.ipc_path) |sp| sp.ptr else null,
-            .shell_integration = self.shellIntegrationFor(argv[0]),
+            .si = self.shellIntegrationFor(shell),
+            .profile = profile,
         });
-        errdefer _ = pty.closeAndReap();
+        // Record the spawn argv so layout-save serializes the real command
+        // (profile shell override included), not a $SHELL fallback — and so a
+        // restored ephemeral pane re-spawns the same shell. setSpawnArgv copies.
+        pane.setSpawnArgv(&[_][*:0]const u8{shell});
+        return pane;
+    }
 
-        const term = try Terminal.init(self.allocator, pty, 80, 24);
-        errdefer term.deinit();
-        term.debug_to_stderr = self.debug_events;
+    const SiWire = struct { kind: []const u8, script: []const u8, shim_dir: []const u8 };
 
-        const pane = try self.makePane(term);
-        pane.id = pane_id;
-        pane.setSpawnArgv(&argv);
-        self.wirePaneSinks(pane);
+    /// Everything needed to spawn one local pane through the daemon. Built by
+    /// each call site (new-tab/split, editor/scrollback, layout restore).
+    const DaemonSpawnSpec = struct {
+        argv: []const []const u8,
+        cwd: ?[]const u8 = null,
+        term: []const u8 = "",
+        color_term: []const u8 = "",
+        login_shell: bool = false,
+        si: ?@import("../pty.zig").ShellIntegration = null,
+        profile: ?*const @import("../config.zig").Profile = null,
+    };
 
-        // Profile name on the pane so cycle/restore knows which one
-        // it spawned with.
-        if (profile) |p| pane.active_profile = p.name;
+    /// THE local-pane factory. Now that there is no in-process PTY path, every
+    /// local shell is a GUI-owned (ephemeral) session on the auto-started local
+    /// daemon that the GUI attaches to — durable across a GUI crash, shareable,
+    /// one session model. Exports the pane id + IPC socket for
+    /// `sketerm cli --pane self`, forwards TERM/COLORTERM/login-shell/
+    /// shell-integration for full parity with the old in-process spawn, and
+    /// disables the predictor (the local socket hop is sub-ms, so speculative
+    /// echo would only add flicker).
+    fn daemonSpawnPane(self: *Window, spec: DaemonSpawnSpec) !*Pane {
+        self.tab_counter += 1;
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "s{d}-{d}", .{ c.getpid(), self.tab_counter }) catch "s0";
+        const pane_id = self.allocPaneId();
 
-        self.applyPaneConfig(pane, .{ .profile = profile });
-        try self.panes.append(self.allocator, pane);
-        try self.terminals.append(self.allocator, term);
+        const si_wire: ?SiWire = if (spec.si) |si| .{
+            .kind = switch (si.kind) {
+                .zsh => "zsh",
+                .fish => "fish",
+            },
+            .script = std.mem.span(si.script),
+            .shim_dir = std.mem.span(si.shim_dir),
+        } else null;
+
+        var conn = try self.muxConnect(null);
+        const Owned = @TypeOf(try conn.recvFrame());
+        var snap: Owned = undefined;
+        {
+            errdefer conn.deinit();
+            try conn.sendJson(.spawn, .{
+                .name = name,
+                .argv = spec.argv,
+                .cwd = spec.cwd,
+                .rows = @as(u16, 24),
+                .cols = @as(u16, 80),
+                .pane_id = pane_id,
+                .socket = if (self.ipc_path) |sp| @as([]const u8, sp) else "",
+                .term = spec.term,
+                .color_term = spec.color_term,
+                .login_shell = spec.login_shell,
+                .shell_integration = si_wire,
+            });
+            (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
+            try conn.sendJson(.attach, .{ .name = name });
+            snap = try conn.recvExpect(&.{.snapshot});
+        }
+        defer snap.deinit(self.allocator);
+        // Pass the pre-allocated id so it isn't double-allocated (keeps pane
+        // ids contiguous + matches the env-exported SKETERM_PANE_ID).
+        const pane = try self.makeRemotePaneFromSnap(conn, name, null, snap.payload, pane_id);
+        if (pane.terminal.remote) |r| {
+            r.ephemeral = true; // GUI-owned → close kills the session (no leak)
+            r.predictor.force = .never;
+        }
+        // Profile visuals: makeRemotePaneFromSnap applied the base config, so
+        // re-apply with the profile to pick up its font/colours.
+        if (spec.profile) |p| {
+            pane.active_profile = p.name;
+            self.applyPaneConfig(pane, .{ .profile = p });
+        }
         return pane;
     }
 
@@ -2584,7 +2608,13 @@ pub const Window = struct {
         t.window.tabbar.refresh();
         if (on) {
             t.window.tabbar.ensureTick();
-            if (t.kind == .warn_inactive) t.window.tabbar.armWarn(t.page);
+            if (t.kind == .warn_inactive) {
+                // Anchor the silence countdown at enable-time so a tab that
+                // was never selected/active still starts warning after the
+                // threshold (otherwise it has no reference point).
+                tab_effects.markSeen(t.page);
+                t.window.tabbar.armWarn(t.page);
+            }
         }
     }
 
@@ -2599,7 +2629,7 @@ pub const Window = struct {
         }
         const delay = self.config.tab_ack_delay_secs;
         if (delay <= 0) {
-            tab_effects.acknowledge(page);
+            tab_effects.markSeen(page);
             return;
         }
         self.ack_timer_page = page;
@@ -3586,6 +3616,11 @@ pub const Window = struct {
         name: []const u8,
         host: ?[]const u8,
         snap_payload: []const u8,
+        // Pre-allocated pane id, or null to allocate one. Daemon-backed local
+        // panes pre-allocate so they can export SKETERM_PANE_ID into the child
+        // env at spawn time; passing it here keeps that id (no double-alloc,
+        // so pane ids stay contiguous — `split --pane 2` must find pane 2).
+        pane_id: ?u32,
     ) !*Pane {
         var conn = conn_in;
         const term = blk: {
@@ -3601,7 +3636,7 @@ pub const Window = struct {
         }
 
         const pane = try self.makePane(term);
-        pane.id = self.allocPaneId();
+        pane.id = pane_id orelse self.allocPaneId();
         errdefer pane.deinit();
         self.wirePaneSinks(pane);
         // Fonts, colors, padding, palette — same push every other
@@ -3657,7 +3692,7 @@ pub const Window = struct {
             }
         }
         defer snap.deinit(self.allocator);
-        return self.makeRemotePaneFromSnap(conn, spec.mux_session, host, snap.payload);
+        return self.makeRemotePaneFromSnap(conn, spec.mux_session, host, snap.payload, null);
     }
 
     /// Put `pane` into `old`'s slot — tree model and widget tree in
@@ -3746,7 +3781,7 @@ pub const Window = struct {
             };
         };
         defer snap.deinit(self.allocator);
-        const pane = try self.makeRemotePaneFromSnap(conn, name, host, snap.payload);
+        const pane = try self.makeRemotePaneFromSnap(conn, name, host, snap.payload, null);
 
         var title_buf: [160:0]u8 = undefined;
         const title_z = if (host) |h|
@@ -4309,7 +4344,9 @@ pub const Window = struct {
                     .id = p.id,
                     .title = if (scr.last_title) |t| try arena.dupe(u8, t) else "",
                     .cwd = if (p.terminal.cwd) |cw| try arena.dupe(u8, cw) else "",
-                    .pid = p.terminal.pty.child_pid,
+                    // Daemon-backed panes have no local child pid; the shell
+                    // runs under the mux daemon. 0 = "not a local process".
+                    .pid = 0,
                     .rows = scr.rows,
                     .cols = scr.cols,
                     .focused = (p == focused),
@@ -4865,12 +4902,13 @@ pub const Window = struct {
     fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.PaneSpec {
         {
             {
-                // Prefer OSC 7 cwd if the shell reported it; fall
-                // back to /proc/<pid>/cwd; finally to "/".
+                // OSC 7 cwd if the shell reported it, else "/". (The shell
+                // runs under the mux daemon now — there's no local pid to
+                // resolve /proc against; the daemon-side cwd rides `list`.)
                 const cwd: []const u8 = if (p.terminal.cwd) |reported|
                     try arena.dupe(u8, reported)
                 else
-                    layout_mod.cwdOfPid(p.terminal.pty.child_pid, arena) catch try arena.dupe(u8, "/");
+                    try arena.dupe(u8, "/");
                 // Serialize the command the pane was actually spawned
                 // with; fall back to $SHELL for panes without a record.
                 const cmd: [][]const u8 = if (p.spawn_argv) |av| blk: {
@@ -4902,13 +4940,20 @@ pub const Window = struct {
                     try arena.dupe(u8, pn)
                 else
                     "";
-                // Durable mux panes: session + transport so restore
-                // can reattach (or recreate under the same name).
+                // Durable mux panes: session + transport so restore can
+                // reattach (or recreate under the same name). Skip EPHEMERAL
+                // (GUI-owned local) sessions — they're killed on quit, so
+                // saving their name would make restore recreate a non-ephemeral
+                // session (leaking it + losing env parity). They restore as a
+                // plain command/cwd local pane instead, re-routed through
+                // daemonSpawnPane (which re-marks them ephemeral).
                 var mux_session: []const u8 = "";
                 var mux_host: []const u8 = "";
                 if (p.terminal.remote) |r| {
-                    mux_session = try arena.dupe(u8, r.session);
-                    if (r.host) |h| mux_host = try arena.dupe(u8, h);
+                    if (!r.ephemeral) {
+                        mux_session = try arena.dupe(u8, r.session);
+                        if (r.host) |h| mux_host = try arena.dupe(u8, h);
+                    }
                 }
                 return .{
                     .cwd = cwd,
@@ -6223,11 +6268,23 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
     const self = cast.userData(Window, user);
     const page = c.adw_tab_view_get_selected_page(view);
     if (page == null) return;
+    // Anchor the silence countdown on the tab we're LEAVING: walking away
+    // restarts its quiet period, and we wake the warning tick so an idle
+    // background tab actually lights up at the threshold (no output event
+    // would otherwise rouse it). No-op for a tab without warn_inactive.
+    const prev = self.selected_page_now;
+    self.selected_page_now = page;
+    if (prev) |pp| {
+        if (pp != page) {
+            tab_effects.markSeen(pp);
+            self.tabbar.armWarn(pp);
+        }
+    }
     // Clear any needs-attention from the now-active tab.
     c.adw_tab_page_set_needs_attention(page, 0);
-    // Viewing the tab acknowledges it (clears the inactivity warning until
-    // fresh output goes silent again) — but only after a short dwell so a
-    // quick scroll across the tabs doesn't wipe every warning.
+    // Viewing the tab also anchors its countdown (so it gets a fresh quiet
+    // period after you leave) — but only after a short dwell so a quick
+    // scroll across the tabs doesn't reset every tab's clock.
     self.scheduleTabAck(page.?);
     const child = c.adw_tab_page_get_child(page);
     if (child == null) return;
@@ -6263,7 +6320,7 @@ fn onTabAckTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
     const page = self.ack_timer_page orelse return 0;
     self.ack_timer_page = null;
     if (page == c.adw_tab_view_get_selected_page(self.tab_view)) {
-        tab_effects.acknowledge(page);
+        tab_effects.markSeen(page);
     }
     return 0; // one-shot
 }

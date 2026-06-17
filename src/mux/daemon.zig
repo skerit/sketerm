@@ -32,6 +32,29 @@ const Event = @import("../parser/event.zig").Event;
 const Screen = @import("../grid/screen.zig").Screen;
 const Pool = @import("../grid/style_pool.zig").Pool;
 
+/// Monotonic milliseconds — the daemon's own clock. Idle durations are
+/// computed daemon-side (never as a client-vs-daemon timestamp diff) so a
+/// remote client whose clock differs still sees the right age.
+fn nowMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @intCast(ts.tv_sec * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));
+}
+
+/// The working directory of a session's child via `/proc/<pid>/cwd`. The
+/// daemon owns the PID, so this is authoritative even when the shell never
+/// emits OSC 7 — clients (which have no local pid for a daemon-backed pane)
+/// rely on it for `list` and layout-save. Writes into `buf`, returns the
+/// slice or null. Linux-only; harmless elsewhere (readlink fails → null).
+fn cwdOfPid(pid: c.pid_t, buf: []u8) ?[]const u8 {
+    if (pid <= 0) return null;
+    var path_buf: [64]u8 = undefined;
+    const link = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/cwd", .{pid}) catch return null;
+    const n = c.readlink(link.ptr, buf.ptr, buf.len);
+    if (n <= 0) return null;
+    return buf[0..@intCast(n)];
+}
+
 pub const SpawnReq = struct {
     name: []const u8 = "",
     argv: []const []const u8 = &.{},
@@ -50,6 +73,30 @@ pub const SpawnReq = struct {
     /// single-instance apps so each forwarded copy renders on its own
     /// client instead of coalescing into the first one.
     isolated: bool = false,
+    /// GUI pane id + IPC socket to export into the child env as
+    /// SKETERM_PANE_ID / SKETERM_SOCKET so `sketerm cli --pane self` works
+    /// from inside a daemon-backed pane. The GUI passes its own values; they
+    /// reflect the spawning client (may go stale after a cross-GUI reattach —
+    /// acceptable for the common case). 0 / "" = don't export.
+    pane_id: u32 = 0,
+    socket: []const u8 = "",
+    /// Child TERM / COLORTERM. Empty → Pty.spawn defaults. The GUI passes its
+    /// profile's term_env/color_term_env so a daemon-backed local pane gets
+    /// the same environment an in-process pane would.
+    term: []const u8 = "",
+    color_term: []const u8 = "",
+    /// Spawn argv[0] as a login shell (leading `-`).
+    login_shell: bool = false,
+    /// Auto shell-integration (OSC 7/133 without rc edits). All paths are on
+    /// the daemon host; the GUI only fills this for the LOCAL daemon, where
+    /// the integration scripts exist. null = off.
+    shell_integration: ?SpawnShellIntegration = null,
+};
+
+pub const SpawnShellIntegration = struct {
+    kind: []const u8 = "", // "zsh" | "fish"
+    script: []const u8 = "",
+    shim_dir: []const u8 = "",
 };
 
 pub const AttachReq = struct {
@@ -69,6 +116,14 @@ pub const SessionInfo = struct {
     exited: bool,
     title: []const u8 = "",
     app: bool = false,
+    /// Milliseconds since this session last produced output, computed on the
+    /// daemon's own clock at list time (never a client-vs-daemon timestamp
+    /// diff — a remote daemon's monotonic clock differs from the caller's).
+    idle_ms: i64 = 0,
+    /// Child's current working directory (from /proc, daemon-resolved). Empty
+    /// if unavailable. Lets `list` show it and gives layout-save a cwd source
+    /// for daemon-backed panes (which have no local pid).
+    cwd: []const u8 = "",
 };
 
 const Session = struct {
@@ -80,6 +135,11 @@ const Session = struct {
     screen: *Screen,
     /// Sequence number of the NEXT event to be broadcast.
     seq: u64 = 0,
+    /// Monotonic-ms timestamp of the last PTY output that produced parser
+    /// events (real terminal activity). Drives the active/idle indicator in
+    /// `list` — computed daemon-side so detached sessions are observable with
+    /// no client attached. Seeded at spawn (a fresh session is "active").
+    last_activity_ms: i64 = 0,
     exited: bool = false,
     exit_status: i32 = 0,
     /// Spawned via `sketerm app -u` — a forwarded GUI app, not a shell.
@@ -1498,11 +1558,41 @@ pub const Daemon = struct {
             rt_dir_z = try allocator.dupeZ(u8, p);
         }
 
+        // Null-terminated copies of the GUI-supplied env/identity strings,
+        // freed after spawn (the child has its own env copy by then). All
+        // optional — empty/absent falls back to Pty.spawn's defaults.
+        const sock_z: ?[:0]u8 = if (req.socket.len > 0) allocator.dupeZ(u8, req.socket) catch null else null;
+        defer if (sock_z) |z| allocator.free(z);
+        const term_z: ?[:0]u8 = if (req.term.len > 0) allocator.dupeZ(u8, req.term) catch null else null;
+        defer if (term_z) |z| allocator.free(z);
+        const cterm_z: ?[:0]u8 = if (req.color_term.len > 0) allocator.dupeZ(u8, req.color_term) catch null else null;
+        defer if (cterm_z) |z| allocator.free(z);
+        var si_script_z: ?[:0]u8 = null;
+        var si_shim_z: ?[:0]u8 = null;
+        defer if (si_script_z) |z| allocator.free(z);
+        defer if (si_shim_z) |z| allocator.free(z);
+        const PtyMod = @import("../pty.zig");
+        const shell_integration: ?PtyMod.ShellIntegration = blk: {
+            const si = req.shell_integration orelse break :blk null;
+            const kind: PtyMod.ShellIntegration.Kind =
+                if (std.mem.eql(u8, si.kind, "zsh")) .zsh
+                else if (std.mem.eql(u8, si.kind, "fish")) .fish
+                else break :blk null;
+            si_script_z = allocator.dupeZ(u8, si.script) catch break :blk null;
+            si_shim_z = allocator.dupeZ(u8, si.shim_dir) catch break :blk null;
+            break :blk .{ .kind = kind, .script = si_script_z.?.ptr, .shim_dir = si_shim_z.?.ptr };
+        };
         var pty = try Pty.spawn(.{
             .argv = argv_ptrs.items,
             .cwd = req.cwd,
             .rows = req.rows,
             .cols = req.cols,
+            .term = if (term_z) |z| z.ptr else "xterm-256color",
+            .color_term = if (cterm_z) |z| z.ptr else "truecolor",
+            .login_shell = req.login_shell,
+            .pane_id = req.pane_id,
+            .socket_path = if (sock_z) |z| z.ptr else null,
+            .shell_integration = shell_integration,
             .wayland_display = if (wl_disp_z) |z| z.ptr else null,
             .runtime_dir = if (rt_dir_z) |z| z.ptr else null,
         });
@@ -1535,6 +1625,7 @@ pub const Daemon = struct {
             .pool = pool,
             .screen = screen,
             .app = req.app,
+            .last_activity_ms = nowMs(),
         };
         if (hub) |h| {
             s.wl_hub_fd = h.fd;
@@ -1683,10 +1774,27 @@ pub const Daemon = struct {
     fn handleList(self: *Daemon, cl: *Client) void {
         var infos: std.ArrayList(SessionInfo) = .empty;
         defer infos.deinit(self.allocator);
+        // Per-session cwd strings, owned for the life of this call (the
+        // SessionInfo slices must stay valid through queueJson). One scratch
+        // buffer per session, kept alive in `cwd_bufs`.
+        var cwd_bufs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (cwd_bufs.items) |b| self.allocator.free(b);
+            cwd_bufs.deinit(self.allocator);
+        }
+        const now = nowMs();
         for (self.sessions.items) |s| {
             var n_clients: u32 = 0;
             for (self.clients.items) |c2| {
                 if (c2.attached == s) n_clients += 1;
+            }
+            var cwd: []const u8 = "";
+            var scratch: [4096]u8 = undefined;
+            if (cwdOfPid(s.pty.child_pid, &scratch)) |cw| {
+                if (self.allocator.dupe(u8, cw)) |owned| {
+                    cwd_bufs.append(self.allocator, owned) catch {};
+                    cwd = owned;
+                } else |_| {}
             }
             infos.append(self.allocator, .{
                 .name = s.name,
@@ -1696,6 +1804,8 @@ pub const Daemon = struct {
                 .exited = s.exited,
                 .title = if (s.screen.last_title) |t| t else "",
                 .app = s.app,
+                .idle_ms = now - s.last_activity_ms,
+                .cwd = cwd,
             }) catch return;
         }
         cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .sessions = infos.items });
@@ -1815,6 +1925,8 @@ pub const Daemon = struct {
 
         const n_events = total_events.count;
         if (n_events == 0) return;
+        // Real terminal output this drain → the session is active now.
+        s.last_activity_ms = nowMs();
         var any_attached = false;
         for (self.clients.items) |cl| {
             if (cl.attached == s and !cl.dead) {

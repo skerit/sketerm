@@ -55,11 +55,11 @@ There's no `--test-filter` wired through `build.zig`; to run a single test, eith
 
 ## Architecture (read `docs/architecture.md` for full detail)
 
-**Events, not callbacks, parser → grid.** One PTY worker thread per pane parses bytes into a tagged-union `Event` and pushes to a lock-free SPSC ring. The main thread drains the ring under GLib's main loop, applies events to `Screen`, and queues a redraw.
+**Unified client-server: the GUI is always a mux client.** Every terminal — local OR remote — is a session owned by the `sketerm-mux` daemon; the GUI process owns no PTY and runs no parser/worker thread. `Terminal` is `initRemote` only: it watches the daemon socket via `g_unix_fd_add`, applies parsed EVENTS straight to `Screen`, and swaps the whole grid on a SNAPSHOT. Local tabs/splits are minted as GUI-owned (`Remote.ephemeral`) sessions on the auto-started per-user daemon (`Window.daemonSpawnPane` → `muxConnect(null)` = `connectLocalAutostart`); the daemon does the PTY read + parse in its single-threaded poll loop. Closing a tab kills its session (no leak); a GUI crash skips teardown so sessions survive for reattach (durability). **The old in-process path (per-pane worker thread + lock-free SPSC ring + `drain_pending` cross-thread wakeup + `mainDrain`) was removed** — don't reintroduce it.
 
-**Cross-thread wakeup is coalesced via a per-Terminal `drain_pending: Atomic(bool)`.** Worker swaps it `true`; only the worker that observes the false→true transition calls `g_main_context_invoke(mainDrainEvents, term)`. Main-thread drain stores `false` *before* draining so the worker reschedules if it pushes during the drain. This guarantees one wake-up per drain cycle, regardless of event volume.
+**`DrainHandle` survives only for async-reply liveness.** It's still allocated per `Terminal`; its `alive` flag lets a deferred sink callback (e.g. the OSC 52 clipboard read reply, which the GUI answers asynchronously and writes back via `writeRaw` → INPUT frame → daemon PTY) detect a pane/terminal teardown between request and callback. `drain_pending`/`terminal` are now vestigial (the worker that used them is gone).
 
-**Threading rule:** all GTK/GDK/GL/Screen/ImageStore state lives on the main thread. The PTY worker only touches its PTY fd, parser state, ring producer, and shutdown eventfd. Never call GTK from a worker.
+**Threading rule:** all GTK/GDK/GL/Screen/ImageStore state lives on the main thread — the GUI is single-threaded (no worker). The daemon (separate process) does the off-thread parsing. Never block the GLib main loop on a socket read; the socket is non-blocking + watched.
 
 **`Cell` is `extern struct`, 8 bytes flat.** Heavy data (OSC 8 links, images, multi-codepoint clusters, styles) lives in side tables on `Screen` (`StylePool`, `links`, `clusters`, `cell_images`). `comptime` asserts pin the size at 8.
 
