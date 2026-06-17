@@ -138,6 +138,10 @@ pub const Pane = struct {
     /// Forward OSC 9;4 progress so Window can drive tab + taskbar.
     win_progress_ctx: ?*anyopaque = null,
     win_on_progress: ?*const fn (ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) void = null,
+    /// Forward remote file-transfer lifecycle (upload + download) so
+    /// Window can drive the tab ring + a completion toast. Reuses
+    /// win_progress_ctx.
+    win_on_transfer: ?*const fn (ctx: ?*anyopaque, pane: *Pane, ev: Terminal.TransferEvent) void = null,
     /// Forward OSC 7 cwd updates so Window can rewrite the tab tooltip.
     win_cwd_ctx: ?*anyopaque = null,
     win_on_cwd: ?*const fn (ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void = null,
@@ -398,6 +402,7 @@ pub const Pane = struct {
         terminal.on_activity = onActivityEvent;
         terminal.on_notification = onNotificationEvent;
         terminal.on_progress = onProgressEvent;
+        terminal.on_transfer = onTransferEvent;
         terminal.on_bell = onBellEvent;
         terminal.on_pointer_shape = onPointerShapeEvent;
         terminal.on_set_profile = onSetProfileEvent;
@@ -1610,6 +1615,11 @@ fn onProgressEvent(ctx: ?*anyopaque, state: u8, percent: u8) void {
     if (self.win_on_progress) |f| f(self.win_progress_ctx, self, state, percent);
 }
 
+fn onTransferEvent(ctx: ?*anyopaque, ev: Terminal.TransferEvent) void {
+    const self = cast.userData(Pane, ctx);
+    if (self.win_on_transfer) |f| f(self.win_progress_ctx, self, ev);
+}
+
 fn onNotificationEvent(ctx: ?*anyopaque, ev: Screen.NotificationEvent) void {
     const self = cast.userData(Pane, ctx);
     if (self.win_on_notification) |f| f(self.win_notify_ctx, self, ev);
@@ -1657,12 +1667,38 @@ fn onFileDrop(_: *c.GtkDropTarget, value: [*c]const c.GValue, _: f64, _: f64, us
     const self = cast.userData(Pane, user);
 
     if (c.g_type_check_value_holds(value, c.gdk_file_list_get_type()) != 0) {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(self.allocator);
         const flist: ?*c.GdkFileList = @ptrCast(c.g_value_get_boxed(value));
         // get_files is transfer-container: free the list, not the GFiles.
         const files = c.gdk_file_list_get_files(flist);
         defer c.g_slist_free(files);
+
+        // On a REMOTE pane, a dropped file is uploaded to the session's
+        // working directory instead of pasted as a path. (Local panes
+        // keep the paste-the-path behaviour — the file is already here.)
+        if (self.terminal.remote != null) {
+            var paths: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (paths.items) |p| self.allocator.free(p);
+                paths.deinit(self.allocator);
+            }
+            var rnode = files;
+            while (rnode != null) : (rnode = rnode.*.next) {
+                const gfile: ?*c.GFile = @ptrCast(rnode.*.data);
+                const path_c = c.g_file_get_path(gfile);
+                if (path_c == null) continue; // non-local URI (e.g. sftp://)
+                defer c.g_free(path_c);
+                const span = std.mem.span(@as([*:0]const u8, @ptrCast(path_c)));
+                const owned = self.allocator.dupe(u8, span) catch continue;
+                paths.append(self.allocator, owned) catch self.allocator.free(owned);
+            }
+            if (paths.items.len == 0) return 0;
+            self.terminal.startUpload(paths.items);
+            _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+            return 1;
+        }
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
         var node = files;
         while (node != null) : (node = node.*.next) {
             const gfile: ?*c.GFile = @ptrCast(node.*.data);

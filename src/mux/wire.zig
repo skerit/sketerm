@@ -14,8 +14,13 @@ const Event = @import("../parser/event.zig").Event;
 /// Version 2 adds the byte-channel frames (chan_*) used for Wayland
 /// app forwarding. The daemon only opens channels toward clients
 /// whose hello announced proto >= 2; older clients keep working
-/// without them.
-pub const PROTO_VERSION: u32 = 2;
+/// without them. Version 3 adds the file-transfer frames (file_*):
+/// the GUI streams a local file to the daemon, which writes it into
+/// the session shell's working directory — so "upload to remote"
+/// works over any transport (local/SSH/UDP) with no shell help. The
+/// handshake (helloProbe) requires an exact proto match, so an
+/// attached daemon is always the same build and understands them.
+pub const PROTO_VERSION: u32 = 3;
 
 /// Frame types. Append-only.
 pub const FrameType = enum(u8) {
@@ -31,6 +36,24 @@ pub const FrameType = enum(u8) {
     // client → daemon (continued; append-only)
     shutdown = 9,
     rename = 10,
+    // File upload (client → daemon). A transfer is a JSON `file_open`
+    // (name + size), a run of `file_data` chunks ([u32 xfer | bytes]),
+    // then `file_close` ([u32 xfer]). The daemon answers each with a
+    // JSON `file_reply` carrying cumulative-written for flow control.
+    file_open = 11,
+    file_data = 12,
+    file_close = 13,
+    // File download (client → daemon): JSON `file_get` ({xfer, path}).
+    // The daemon answers `file_reply` "ready" (with size + basename),
+    // streams `file_data` chunks the OTHER way (daemon → client), then
+    // `file_reply` "done". `file_data` is thus bidirectional — the
+    // receiver's context (upload vs download xfer) tells the directions
+    // apart.
+    file_get = 14,
+    // Remote directory browse (client → daemon): JSON `file_list`
+    // ({xfer, path}). The daemon answers `file_listing` (a JSON
+    // directory listing) so the GUI can offer a remote file picker.
+    file_list = 15,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -39,6 +62,12 @@ pub const FrameType = enum(u8) {
     gone = 68,
     ok = 69,
     err = 70,
+    /// JSON status for an in-flight upload: { xfer, status, written,
+    /// path?, message? }. status ∈ ready|progress|done|error.
+    file_reply = 71,
+    /// JSON directory listing answering `file_list`: { xfer, path,
+    /// entries: [{name, dir, size}], error?, truncated? }.
+    file_listing = 72,
     // Byte channels (both directions). Generic multiplexed streams
     // riding the mux connection — used to tunnel a session's app
     // protocol, so forwarded apps inherit whatever transport the

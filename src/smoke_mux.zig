@@ -872,6 +872,148 @@ fn isolatedStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     std.debug.print("smoke-mux: isolated session env + recursive dir cleanup ok\n", .{});
 }
 
+/// Stream a file to the attached "smoke" session over the file_*
+/// frames and verify it lands on disk in the shell's cwd — plus the
+/// daemon's non-clobber rename on a repeated name.
+fn uploadStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, mirror: *Mirror) void {
+    const pathZ = @import("util/pathz.zig").pathZ;
+    var z_buf: [4096]u8 = undefined;
+    var dir_buf: [128]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "/tmp/sketerm-mux-smoke-{d}-up", .{c.getpid()}) catch unreachable;
+    _ = c.mkdir(pathZ(&z_buf, dir) catch fail("up mkdir pathz"), 0o700);
+
+    // Move the shell into the temp dir; wait for the echo to confirm
+    // chdir ran (so /proc/<pid>/cwd is updated before we upload).
+    var cmd_buf: [256]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "cd {s} && echo UPCWDOK\n", .{dir}) catch unreachable;
+    conn.sendFrame(.input, cmd) catch fail("up cd send");
+    var deadline: usize = 0;
+    var cd_ok = false;
+    while (deadline < 200) : (deadline += 1) {
+        const f = conn.recvFrame() catch fail("up cd stream");
+        defer f.deinit(allocator);
+        if (f.ftype == .events) mirror.applyEvents(f.payload) catch fail("up events apply");
+        const txt = mirror.screenText() catch fail("up extract");
+        defer allocator.free(txt);
+        if (std.mem.count(u8, txt, "UPCWDOK") >= 2) {
+            cd_ok = true;
+            break;
+        }
+    }
+    if (!cd_ok) fail("up: cd confirmation never appeared");
+
+    const contents = "hello sketerm upload\n";
+
+    // file_open → "ready".
+    conn.sendJson(.file_open, .{ .xfer = @as(u32, 1), .name = "up.txt", .size = @as(u32, contents.len) }) catch fail("up file_open");
+    {
+        const r = conn.recvExpect(&.{.file_reply}) catch fail("up open reply");
+        defer r.deinit(allocator);
+        if (std.mem.indexOf(u8, r.payload, "\"status\":\"ready\"") == null) fail("up: open not ready");
+    }
+
+    // file_data [u32 xfer | bytes] → "progress".
+    var data_buf: [4 + contents.len]u8 = undefined;
+    std.mem.writeInt(u32, data_buf[0..4], 1, .little);
+    @memcpy(data_buf[4..], contents);
+    conn.sendFrame(.file_data, &data_buf) catch fail("up file_data");
+    {
+        const r = conn.recvExpect(&.{.file_reply}) catch fail("up data reply");
+        defer r.deinit(allocator);
+        if (std.mem.indexOf(u8, r.payload, "\"status\":\"progress\"") == null) fail("up: data not progress");
+    }
+
+    // file_close [u32 xfer] → "done".
+    var close_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, close_buf[0..4], 1, .little);
+    conn.sendFrame(.file_close, &close_buf) catch fail("up file_close");
+    {
+        const r = conn.recvExpect(&.{.file_reply}) catch fail("up close reply");
+        defer r.deinit(allocator);
+        if (std.mem.indexOf(u8, r.payload, "\"status\":\"done\"") == null) fail("up: close not done");
+    }
+
+    // The file must exist in the shell cwd with the exact contents.
+    var fpath_buf: [256]u8 = undefined;
+    const fpath = std.fmt.bufPrint(&fpath_buf, "{s}/up.txt", .{dir}) catch unreachable;
+    {
+        const fd = c.open(pathZ(&z_buf, fpath) catch fail("up open pathz"), c.O_RDONLY, @as(c_uint, 0));
+        if (fd < 0) fail("up: uploaded file missing");
+        defer _ = c.close(fd);
+        var rd: [64]u8 = undefined;
+        const n = c.read(fd, &rd, rd.len);
+        if (n != contents.len or !std.mem.eql(u8, rd[0..@intCast(n)], contents)) fail("up: contents mismatch");
+    }
+
+    // A second upload of the same name must NOT clobber: the daemon
+    // renames it to "up (1).txt" and reports that path.
+    conn.sendJson(.file_open, .{ .xfer = @as(u32, 2), .name = "up.txt", .size = @as(u32, 0) }) catch fail("up2 open");
+    {
+        const r = conn.recvExpect(&.{.file_reply}) catch fail("up2 open reply");
+        defer r.deinit(allocator);
+        if (std.mem.indexOf(u8, r.payload, "up (1).txt") == null) fail("up: clobber not avoided");
+    }
+    var close2: [4]u8 = undefined;
+    std.mem.writeInt(u32, close2[0..4], 2, .little);
+    conn.sendFrame(.file_close, &close2) catch fail("up2 close");
+    (conn.recvExpect(&.{.file_reply}) catch fail("up2 close reply")).deinit(allocator);
+
+    // Download the file back (relative to cwd): daemon streams it as
+    // reverse file_data; verify we reassemble the exact contents.
+    conn.sendJson(.file_get, .{ .xfer = @as(u32, 3), .path = "up.txt" }) catch fail("dl file_get");
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(allocator);
+    var dl_ready = false;
+    var dl_done = false;
+    var dline: usize = 0;
+    while (dline < 500 and !dl_done) : (dline += 1) {
+        const f = conn.recvFrame() catch fail("dl stream");
+        defer f.deinit(allocator);
+        switch (f.ftype) {
+            .file_reply => {
+                if (std.mem.indexOf(u8, f.payload, "\"status\":\"ready\"") != null) dl_ready = true;
+                if (std.mem.indexOf(u8, f.payload, "\"status\":\"error\"") != null) fail("dl: daemon error");
+                if (std.mem.indexOf(u8, f.payload, "\"status\":\"done\"") != null) dl_done = true;
+            },
+            .file_data => {
+                if (wire.decodeChanId(f.payload)) |id| {
+                    if (id == 3) got.appendSlice(allocator, f.payload[4..]) catch fail("dl oom");
+                }
+            },
+            else => {},
+        }
+    }
+    if (!dl_ready) fail("dl: never got ready");
+    if (!dl_done) fail("dl: never completed");
+    if (!std.mem.eql(u8, got.items, contents)) fail("dl: contents mismatch");
+
+    // A missing file must fail cleanly, not hang.
+    conn.sendJson(.file_get, .{ .xfer = @as(u32, 4), .path = "nope-not-here.txt" }) catch fail("dl miss get");
+    {
+        const r = conn.recvExpect(&.{.file_reply}) catch fail("dl miss reply");
+        defer r.deinit(allocator);
+        if (std.mem.indexOf(u8, r.payload, "\"status\":\"error\"") == null) fail("dl: missing file not refused");
+    }
+
+    // Directory browse: list the cwd (path="") and find the uploaded file.
+    conn.sendJson(.file_list, .{ .xfer = @as(u32, 5), .path = "" }) catch fail("ls send");
+    {
+        const r = conn.recvExpect(&.{.file_listing}) catch fail("ls reply");
+        defer r.deinit(allocator);
+        if (std.mem.indexOf(u8, r.payload, "\"name\":\"up.txt\"") == null) fail("ls: uploaded file not listed");
+        if (std.mem.indexOf(u8, r.payload, "\"dir\":false") == null) fail("ls: file not marked as a file");
+    }
+
+    // Cleanup (rmdir works even though it's the shell's cwd on Linux).
+    _ = c.unlink(pathZ(&z_buf, fpath) catch unreachable);
+    var f2_buf: [256]u8 = undefined;
+    const f2 = std.fmt.bufPrint(&f2_buf, "{s}/up (1).txt", .{dir}) catch unreachable;
+    _ = c.unlink(pathZ(&z_buf, f2) catch unreachable);
+    _ = c.rmdir(pathZ(&z_buf, dir) catch unreachable);
+
+    std.debug.print("smoke-mux: file upload + download round-trip + non-clobber ok\n", .{});
+}
+
 pub fn main() u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
@@ -939,6 +1081,9 @@ pub fn main() u8 {
         }
     }
     if (!seen) fail("marker never appeared via event stream");
+
+    // File upload (file_* frames) → daemon writes into the shell cwd.
+    uploadStage(allocator, &conn, &mirror);
 
     // Kitty t=f image: the file lives on the DAEMON's host. The
     // daemon must fetch + inline it (t=d rewrite) so the client can
