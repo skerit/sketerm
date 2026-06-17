@@ -199,6 +199,32 @@ const Session = struct {
     }
 };
 
+/// Broker-side record of a forked session worker. The broker holds no Screen;
+/// it tracks just enough to route clients (control_fd), answer `list` (cached
+/// metadata pushed by the worker, filled in B3), and reap (pid + dead).
+const Worker = struct {
+    allocator: std.mem.Allocator,
+    name: []u8,
+    pid: c.pid_t,
+    /// Broker end of the broker↔worker control socketpair. Carries passed
+    /// client fds (SCM_RIGHTS), kill/rename control bytes, and metadata pushes.
+    control_fd: c_int,
+    dead: bool = false,
+    /// Cached for `list` (B3 keeps these current via metadata pushes).
+    rows: u16 = 24,
+    cols: u16 = 80,
+    exited: bool = false,
+    app: bool = false,
+    n_clients: u32 = 0,
+    last_activity_ms: i64 = 0,
+
+    fn deinit(self: *Worker) void {
+        if (self.control_fd >= 0) _ = c.close(self.control_fd);
+        self.allocator.free(self.name);
+        self.allocator.destroy(self);
+    }
+};
+
 const Client = struct {
     allocator: std.mem.Allocator,
     fd: c_int,
@@ -484,6 +510,17 @@ pub const Daemon = struct {
     /// path-safety reason as next_wl_id).
     next_rt_id: u32 = 1,
     running: bool = true,
+    /// Process-isolation mode (Firefox-style). A WORKER process owns exactly
+    /// one session and has `control_fd` >= 0 (a socketpair to the broker)
+    /// instead of a listen socket — new clients arrive as passed fds, not via
+    /// accept(). A BROKER process listens, holds NO sessions, and forks one
+    /// worker per session, handing client fds to workers on attach. The
+    /// default (both -1 / false) is the legacy monolith — kept working until
+    /// the broker path is the proven default.
+    control_fd: c_int = -1,
+    is_broker: bool = false,
+    /// Broker only: forked session workers, by session name.
+    workers: std.ArrayList(*Worker) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, sock_path: []const u8) !*Daemon {
         const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/') orelse return error.BadPath;
@@ -517,11 +554,17 @@ pub const Daemon = struct {
         self.clients.deinit(self.allocator);
         for (self.sessions.items) |s| s.deinit();
         self.sessions.deinit(self.allocator);
-        _ = c.close(self.listen_fd);
-        var z_buf: [4096]u8 = undefined;
-        if (pathZ(&z_buf, self.sock_path)) |p| {
-            _ = c.unlink(p);
-        } else |_| {}
+        for (self.workers.items) |w| w.deinit();
+        self.workers.deinit(self.allocator);
+        if (self.listen_fd >= 0) _ = c.close(self.listen_fd);
+        if (self.control_fd >= 0) _ = c.close(self.control_fd);
+        // Only the broker/monolith owns the socket file; a worker has none.
+        if (self.sock_path.len > 0) {
+            var z_buf: [4096]u8 = undefined;
+            if (pathZ(&z_buf, self.sock_path)) |p| {
+                _ = c.unlink(p);
+            } else |_| {}
+        }
         self.allocator.free(self.sock_path);
         self.allocator.destroy(self);
     }
@@ -529,6 +572,33 @@ pub const Daemon = struct {
     /// Run until a SHUTDOWN frame arrives or `running` is cleared.
     pub fn run(self: *Daemon) !void {
         while (self.running) try self.tick(500);
+        // The run loop exits the same tick `running` is cleared, so any frame
+        // queued by the shutdown path (`.gone` on `.shutdown`, or a worker's
+        // `.gone` on a broker `'K'`) is still sitting in each client's wbuf —
+        // POLLOUT for this tick was computed before the frame existed, so
+        // `clientWritable` never ran for it. Without a final flush the client
+        // sees a bare EOF and the GUI mistakes a clean retire for a crash
+        // (sad-face). Drain the small tail before deinit closes the fds; the
+        // kernel still delivers it after we close.
+        self.flushClientsFinal();
+    }
+
+    /// Best-effort final drain of every client's wbuf before teardown. The
+    /// only frames queued at this point are tiny shutdown notices, so a short
+    /// bounded POLLOUT wait per round is plenty.
+    fn flushClientsFinal(self: *Daemon) void {
+        var rounds: usize = 0;
+        while (rounds < 8) : (rounds += 1) {
+            var pending = false;
+            for (self.clients.items) |cl| {
+                if (cl.dead or cl.wbuf.items.len == 0) continue;
+                var pfd = c.struct_pollfd{ .fd = cl.fd, .events = c.POLLOUT, .revents = 0 };
+                _ = c.poll(&pfd, 1, 50);
+                if (pfd.revents & c.POLLOUT != 0) self.clientWritable(cl);
+                if (!cl.dead and cl.wbuf.items.len > 0) pending = true;
+            }
+            if (!pending) break;
+        }
     }
 
     /// One poll iteration. Exposed for tests.
@@ -537,6 +607,10 @@ pub const Daemon = struct {
         defer fds.deinit(self.allocator);
 
         try fds.append(self.allocator, .{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 });
+        // Worker: the broker↔worker control channel (passed client fds + kill/
+        // rename/metadata). -1 in broker/monolith → ignored by poll.
+        const control_idx = fds.items.len;
+        try fds.append(self.allocator, .{ .fd = self.control_fd, .events = c.POLLIN, .revents = 0 });
         const client_base = fds.items.len;
         const n_clients_built = self.clients.items.len;
         for (self.clients.items) |cl| {
@@ -611,7 +685,9 @@ pub const Daemon = struct {
         const pr = c.poll(fds.items.ptr, @intCast(fds.items.len), timeout_ms);
         if (pr < 0) return; // EINTR etc — next tick retries
 
-        if (fds.items[0].revents & c.POLLIN != 0) self.acceptClient();
+        if (self.listen_fd >= 0 and fds.items[0].revents & c.POLLIN != 0) self.acceptClient();
+        if (self.control_fd >= 0 and fds.items[control_idx].revents & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0)
+            self.workerOnControl();
 
         // Snapshot counts: acceptClient/handleSpawn/attach run inside
         // the loops below and APPEND to these lists. Entries appended
@@ -709,6 +785,141 @@ pub const Daemon = struct {
         };
     }
 
+    // ── broker ↔ worker control channel (process isolation) ─────────
+    //
+    // A worker process owns one session and receives its clients as fds
+    // passed by the broker over a SOCK_SEQPACKET control socketpair. Each
+    // control message is one datagram: [opcode][payload], with at most one
+    // fd in SCM_RIGHTS. Opcodes: 'A' attach (payload [proto][video] + the
+    // client fd), 'K' kill. (list/rename/metadata join in B3.)
+
+    /// Worker side: drain one control datagram and act on it.
+    fn workerOnControl(self: *Daemon) void {
+        var buf: [256]u8 = undefined;
+        var passed: c_int = -1;
+        const n = controlRecv(self.control_fd, &buf, &passed);
+        if (n <= 0) {
+            // Broker closed the control channel — no supervisor left; exit.
+            if (passed >= 0) _ = c.close(passed);
+            self.running = false;
+            return;
+        }
+        switch (buf[0]) {
+            'A' => {
+                if (passed < 0) return;
+                const proto: u32 = if (n >= 2) buf[1] else 1;
+                const video: bool = n >= 3 and buf[2] != 0;
+                self.addPassedClient(passed, proto, video);
+            },
+            'K' => {
+                for (self.clients.items) |cl| if (!cl.dead) cl.queueFrame(.gone, "");
+                self.running = false;
+            },
+            else => if (passed >= 0) {
+                _ = c.close(passed);
+            },
+        }
+    }
+
+    /// Worker side: adopt a broker-passed client fd as a client attached to
+    /// our one session, and send it the attach snapshot.
+    fn addPassedClient(self: *Daemon, fd: c_int, proto: u32, video: bool) void {
+        _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+        const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+        _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+        const cl = self.allocator.create(Client) catch {
+            _ = c.close(fd);
+            return;
+        };
+        cl.* = .{ .allocator = self.allocator, .fd = fd, .proto = proto, .video = video };
+        self.clients.append(self.allocator, cl) catch {
+            cl.deinit();
+            return;
+        };
+        if (self.sessions.items.len == 0) return;
+        const s = self.sessions.items[0];
+        cl.attached = s;
+        self.queueSnapshot(cl, s);
+        if (proto >= 2) {
+            if (s.winstream != null) self.openWinstreamChan(s, cl);
+            while (s.wl_pending.items.len > 0) {
+                const afd = s.wl_pending.orderedRemove(0);
+                self.openAppChannel(s, cl, afd);
+            }
+        }
+    }
+
+    /// recvmsg one control datagram: data into `buf`, the first SCM_RIGHTS fd
+    /// (or -1) into `fd_out`. Returns datagram length (0 = peer closed).
+    fn controlRecv(fd: c_int, buf: []u8, fd_out: *c_int) isize {
+        fd_out.* = -1;
+        var iov = c.struct_iovec{ .iov_base = buf.ptr, .iov_len = buf.len };
+        var cbuf: [64]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([64]u8);
+        var mh = std.mem.zeroes(c.struct_msghdr);
+        mh.msg_iov = @ptrCast(&iov);
+        mh.msg_iovlen = 1;
+        mh.msg_control = &cbuf;
+        mh.msg_controllen = cbuf.len;
+        const n = c.recvmsg(fd, &mh, 0);
+        if (n <= 0) return n;
+        const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
+        if (@as(usize, @intCast(mh.msg_controllen)) >= hdr_size) {
+            const hdr: *const c.struct_cmsghdr = @alignCast(@ptrCast(&cbuf));
+            if (hdr.cmsg_level == c.SOL_SOCKET and hdr.cmsg_type == c.SCM_RIGHTS and
+                @as(usize, @intCast(hdr.cmsg_len)) >= hdr_size + @sizeOf(c_int))
+            {
+                var passed: c_int = undefined;
+                @memcpy(std.mem.asBytes(&passed), cbuf[hdr_size..][0..@sizeOf(c_int)]);
+                fd_out.* = passed;
+            }
+        }
+        return n;
+    }
+
+    /// Broker side: send a control datagram (+ optional fd) to a worker.
+    fn controlSend(fd: c_int, bytes: []const u8, pass_fd: c_int) void {
+        var iov = c.struct_iovec{ .iov_base = @constCast(bytes.ptr), .iov_len = bytes.len };
+        var cbuf: [64]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([64]u8);
+        var mh = std.mem.zeroes(c.struct_msghdr);
+        mh.msg_iov = @ptrCast(&iov);
+        mh.msg_iovlen = 1;
+        if (pass_fd >= 0) {
+            const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
+            const cmsg: *c.struct_cmsghdr = @ptrCast(&cbuf);
+            cmsg.cmsg_len = @intCast(hdr_size + @sizeOf(c_int));
+            cmsg.cmsg_level = c.SOL_SOCKET;
+            cmsg.cmsg_type = c.SCM_RIGHTS;
+            @memcpy(cbuf[hdr_size..][0..@sizeOf(c_int)], std.mem.asBytes(&pass_fd));
+            mh.msg_control = &cbuf;
+            const space = (cmsg.cmsg_len + @sizeOf(usize) - 1) & ~@as(usize, @sizeOf(usize) - 1);
+            mh.msg_controllen = @intCast(space);
+        }
+        _ = c.sendmsg(fd, &mh, 0);
+    }
+
+    /// Construct a worker-mode daemon (no listen socket; clients arrive over
+    /// `control_fd`). The caller spawns the one session and runs the loop.
+    pub fn initWorker(allocator: std.mem.Allocator, control_fd: c_int) !*Daemon {
+        const self = try allocator.create(Daemon);
+        self.* = .{
+            .allocator = allocator,
+            .listen_fd = -1,
+            .sock_path = try allocator.dupe(u8, ""),
+            .control_fd = control_fd,
+        };
+        return self;
+    }
+
+    /// Worker process entry: own one session (from `req`), serve clients the
+    /// broker hands over `control_fd`, until killed or the broker goes away.
+    pub fn runWorker(allocator: std.mem.Allocator, control_fd: c_int, req: SpawnReq) !void {
+        const self = try initWorker(allocator, control_fd);
+        defer self.deinit();
+        const s = try self.spawnSession(req);
+        try self.sessions.append(allocator, s);
+        try self.run();
+    }
+
     fn clientReadable(self: *Daemon, cl: *Client) void {
         var tmp: [16384]u8 = undefined;
         const n_raw = c.read(cl.fd, &tmp, tmp.len);
@@ -798,6 +1009,11 @@ pub const Daemon = struct {
             .kill => self.handleKill(cl, frame.payload),
             .rename => self.handleRename(cl, frame.payload),
             .shutdown => {
+                // Clean shutdown: tell attached clients it's intentional
+                // (.gone) so they don't paint a crash sad-face on the EOF.
+                for (self.clients.items) |other| {
+                    if (other != cl and !other.dead) other.queueFrame(.gone, "");
+                }
                 cl.queueJson(.ok, .{ .ok = true });
                 self.running = false;
             },
@@ -1384,6 +1600,7 @@ pub const Daemon = struct {
     }
 
     fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
+        if (self.is_broker) return self.brokerSpawn(cl, payload);
         var parsed = std.json.parseFromSlice(SpawnReq, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {
@@ -1417,6 +1634,124 @@ pub const Daemon = struct {
             return;
         };
         cl.queueJson(.ok, .{ .ok = true, .name = s.name });
+    }
+
+    fn brokerFindWorker(self: *Daemon, name: []const u8) ?*Worker {
+        for (self.workers.items) |w| {
+            if (!w.dead and std.mem.eql(u8, w.name, name)) return w;
+        }
+        return null;
+    }
+
+    /// Broker side of spawn: fork a worker process that owns this session.
+    /// fork-without-exec — the child runs `runWorker` against an inherited
+    /// (COW) copy of the SpawnReq; it first drops every broker fd it inherited.
+    fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(SpawnReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad spawn request");
+            return;
+        };
+        defer parsed.deinit();
+        var req = parsed.value;
+        if (req.name.len == 0 or req.name.len > 64) {
+            cl.queueErr("spawn needs a name");
+            return;
+        }
+        const default_shell: []const []const u8 = &.{blk: {
+            const sh = std.c.getenv("SHELL");
+            break :blk if (sh != null) std.mem.span(sh.?) else "/bin/sh";
+        }};
+        if (req.argv.len == 0) req.argv = default_shell;
+        if (self.brokerFindWorker(req.name) != null) {
+            cl.queueErr("session name already exists");
+            return;
+        }
+
+        // SEQPACKET so each control message (and its SCM_RIGHTS fd) is one
+        // clean datagram on the broker↔worker channel.
+        var sp: [2]c_int = undefined;
+        if (c.socketpair(c.AF_UNIX, c.SOCK_SEQPACKET, 0, &sp) != 0) {
+            cl.queueErr("spawn failed");
+            return;
+        }
+        const pid = c.fork();
+        if (pid < 0) {
+            _ = c.close(sp[0]);
+            _ = c.close(sp[1]);
+            cl.queueErr("spawn failed");
+            return;
+        }
+        if (pid == 0) {
+            // Worker child: drop every inherited broker fd, then become a
+            // single-session worker. `req` is valid here via COW; we _exit
+            // before the parent's `defer parsed.deinit()` matters to us.
+            _ = c.close(sp[0]);
+            if (self.listen_fd >= 0) _ = c.close(self.listen_fd);
+            for (self.clients.items) |cc| _ = c.close(cc.fd);
+            for (self.workers.items) |w| {
+                if (w.control_fd >= 0) _ = c.close(w.control_fd);
+            }
+            _ = c.setsid();
+            runWorker(self.allocator, sp[1], req) catch {};
+            c._exit(0);
+        }
+        // Broker parent.
+        _ = c.close(sp[1]);
+        _ = c.fcntl(sp[0], c.F_SETFD, c.FD_CLOEXEC);
+        const name_owned = self.allocator.dupe(u8, req.name) catch {
+            _ = c.close(sp[0]);
+            cl.queueErr("oom");
+            return;
+        };
+        const w = self.allocator.create(Worker) catch {
+            self.allocator.free(name_owned);
+            _ = c.close(sp[0]);
+            cl.queueErr("oom");
+            return;
+        };
+        w.* = .{ .allocator = self.allocator, .name = name_owned, .pid = pid, .control_fd = sp[0], .app = req.app };
+        self.workers.append(self.allocator, w) catch {
+            w.deinit();
+            cl.queueErr("oom");
+            return;
+        };
+        // NOTE: we reply `.ok` on a successful fork, before the worker has
+        // actually opened its PTY/session. If `spawnSession` fails in the
+        // child it `_exit`s silently and a later `.attach` would block on a
+        // snapshot that never comes. B3 adds a worker→broker "ready"/"failed"
+        // handshake so the broker can reflect spawn failure synchronously like
+        // the monolith does; until then the broker is not the default path.
+        cl.queueJson(.ok, .{ .ok = true, .name = w.name });
+    }
+
+    /// Broker side of attach: hand the client's socket fd to the session's
+    /// worker (SCM_RIGHTS) and drop our copy — the worker serves it directly.
+    fn brokerAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(AttachReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad attach request");
+            return;
+        };
+        defer parsed.deinit();
+        const w = self.brokerFindWorker(parsed.value.name) orelse {
+            cl.queueErr("no such session");
+            return;
+        };
+        const msg = [_]u8{ 'A', @truncate(cl.proto), @intFromBool(cl.video) };
+        controlSend(w.control_fd, &msg, cl.fd);
+        // Handed off: the kernel duplicated the fd into the worker. Drop our
+        // copy + the Client (reap closes the broker's fd; the worker's stays).
+        //
+        // ASSUMPTION: the client is synchronous — it sends `.attach` and then
+        // blocks on the snapshot, so nothing is pipelined behind `.attach`. If
+        // it ever weren't, bytes the broker already pulled into `cl.rbuf` would
+        // be stranded here (the kernel buffer the worker inherits no longer has
+        // them). Revisit (forward leftover rbuf in the 'A' frame) before any
+        // client starts streaming input ahead of the snapshot.
+        cl.dead = true;
     }
 
     const WaylandHub = struct {
@@ -1654,6 +1989,7 @@ pub const Daemon = struct {
     }
 
     fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
+        if (self.is_broker) return self.brokerAttach(cl, payload);
         var parsed = std.json.parseFromSlice(AttachReq, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {

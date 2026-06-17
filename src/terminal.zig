@@ -82,6 +82,11 @@ pub const Terminal = struct {
     /// the dirty bit — saves up to one frame of latency on
     /// keystroke echo + heavy output.
     on_render_request: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// Fired when the session died UNEXPECTEDLY (worker/daemon crash — the
+    /// conn dropped without a clean .exit/.gone). The GUI shows a crashed-tab
+    /// overlay (sad face + "Start new session"). Distinct from a clean exit,
+    /// which goes through the child-exit / exit_action path.
+    on_crashed: ?*const fn (ctx: ?*anyopaque) void = null,
     /// Fired from the drain ONLY when the visible grid actually changed
     /// this batch (content hash differs) — the tab-activity signal.
     /// Distinct from on_render_request, which fires on any dirty.
@@ -271,7 +276,7 @@ pub const Terminal = struct {
         const self: *Terminal = @ptrCast(@alignCast(user.?));
         const remote = self.remote orelse return 0;
         if ((condition & (c.G_IO_HUP | c.G_IO_ERR)) != 0) {
-            self.remoteClosed("connection lost");
+            self.remoteClosed("connection lost", true);
             return 0;
         }
 
@@ -281,11 +286,11 @@ pub const Terminal = struct {
             const n = c.read(remote.conn.fd, &tmp, tmp.len);
             if (n < 0) {
                 if (std.posix.errno(n) == .AGAIN or std.posix.errno(n) == .INTR) break;
-                self.remoteClosed("read error");
+                self.remoteClosed("read error", true);
                 return 0;
             }
             if (n == 0) {
-                self.remoteClosed("daemon closed");
+                self.remoteClosed("daemon closed", true);
                 return 0;
             }
             remote.conn.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]) catch break;
@@ -294,7 +299,7 @@ pub const Terminal = struct {
 
         while (true) {
             const peeled = mux_wire.peelFrame(remote.conn.rbuf.items) catch {
-                self.remoteClosed("protocol error");
+                self.remoteClosed("protocol error", true);
                 return 0;
             } orelse break;
             self.handleRemoteFrame(peeled.frame);
@@ -378,7 +383,9 @@ pub const Terminal = struct {
                 self.replayRetainedImages();
                 if (self.on_render_request) |f| f(self.user_ctx);
             },
-            .exit, .gone => self.remoteClosed("session ended"),
+            // A clean termination frame — shell exited (.exit) or the session
+            // was killed / the daemon shut down (.gone). Not a crash.
+            .exit, .gone => self.remoteClosed("session ended", false),
             // The only request the GUI sends that's answered with
             // OK/ERR while attached is a rename (resize answers with
             // a SNAPSHOT; detach is sent during teardown). Guarded by
@@ -429,16 +436,56 @@ pub const Terminal = struct {
         };
     }
 
-    fn remoteClosed(self: *Terminal, reason: []const u8) void {
+    /// The session ended. `crashed` = the connection dropped WITHOUT a clean
+    /// .exit/.gone frame (worker process died — crash/OOM/SIGKILL — or the
+    /// daemon vanished). A clean exit runs the normal exit_action; a crash
+    /// paints a sad-face over the pane and keeps it open (browser-style), so
+    /// the user sees that this one session died — not the others.
+    fn remoteClosed(self: *Terminal, reason: []const u8, crashed: bool) void {
         const remote = self.remote orelse return;
         if (remote.closed) return;
         remote.closed = true;
         remote.watch_id = 0; // we return 0 from the cb; source removed
         self.destroyAllChans();
-        self.screen.child_exited = true;
+        if (crashed) {
+            // Prefer the GUI's crashed-tab overlay (sad face + recover button);
+            // fall back to painting the grid if no GUI is wired.
+            if (self.on_crashed) |f| f(self.user_ctx) else self.paintCrashFace();
+        } else {
+            self.screen.child_exited = true; // → pane fires exit_action
+        }
         self.screen.dirty = true;
-        std.debug.print("sketerm: mux session '{s}': {s}\n", .{ remote.session, reason });
+        std.debug.print("sketerm: mux session '{s}': {s}{s}\n", .{ remote.session, reason, if (crashed) " (crashed)" else "" });
         if (self.on_render_request) |f| f(self.user_ctx);
+    }
+
+    /// Replace the visible grid with a centred sad face — the pane's session
+    /// died unexpectedly. Reuses the normal cell renderer (no new draw path).
+    fn paintCrashFace(self: *Terminal) void {
+        const s = self.screen;
+        if (s.rows == 0 or s.cols == 0) return;
+        const grid = if (s.use_alt) (s.alt orelse s.active) else s.active;
+        for (grid) |*ln| {
+            for (ln.cells) |*cell| cell.* = .{};
+            ln.dirty = true;
+        }
+        const mid = s.rows / 2;
+        writeCentered(grid, s.cols, if (mid >= 1) mid - 1 else 0, ":(");
+        writeCentered(grid, s.cols, mid, "session crashed");
+        if (mid + 2 < s.rows) writeCentered(grid, s.cols, mid + 2, "this tab can be closed");
+    }
+
+    fn writeCentered(grid: []@import("grid/line.zig").Line, cols: u16, row: u16, text: []const u8) void {
+        if (row >= grid.len) return;
+        const ln = &grid[row];
+        const start: usize = if (text.len < cols) (cols - text.len) / 2 else 0;
+        var col = start;
+        for (text) |ch| {
+            if (col >= cols) break;
+            ln.cells[col] = .{ .rune = ch };
+            col += 1;
+        }
+        ln.dirty = true;
     }
 
     // ── Forwarded app channels ───────────────────────────────────
@@ -760,6 +807,7 @@ pub const Terminal = struct {
         self.on_clipboard_set = null;
         self.on_clipboard_get = null;
         self.on_render_request = null;
+        self.on_crashed = null;
         self.on_activity = null;
         self.on_bell = null;
         self.on_image = null;

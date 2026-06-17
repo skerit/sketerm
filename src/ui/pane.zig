@@ -158,6 +158,10 @@ pub const Pane = struct {
     /// Fired exactly once when the PTY child exits. Window decides
     /// what to do (close pane / restart shell / hold).
     win_on_child_exit: ?*const fn (ctx: ?*anyopaque, pane: *Pane, status: i32) void = null,
+    /// Fired when the session died unexpectedly (crash/OOM). Window shows the
+    /// crashed-tab overlay (sad face + "Start new session").
+    win_crash_ctx: ?*anyopaque = null,
+    win_on_crashed: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
     /// Forward mux session renames so Window can retitle the tab.
     win_session_rename_ctx: ?*anyopaque = null,
     win_on_session_renamed: ?*const fn (ctx: ?*anyopaque, pane: *Pane, name: []const u8) void = null,
@@ -390,6 +394,7 @@ pub const Pane = struct {
         terminal.on_clipboard_set = onClipboardEvent;
         terminal.on_clipboard_get = onClipboardGetEvent;
         terminal.on_render_request = onRenderRequest;
+        terminal.on_crashed = onCrashEvent;
         terminal.on_activity = onActivityEvent;
         terminal.on_notification = onNotificationEvent;
         terminal.on_progress = onProgressEvent;
@@ -1532,6 +1537,11 @@ fn selfCheckA11y(self: *Pane) void {
 fn onActivityEvent(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
     if (self.win_on_activity) |f| f(self.win_activity_ctx, self);
+}
+
+fn onCrashEvent(ctx: ?*anyopaque) void {
+    const self = cast.userData(Pane, ctx);
+    if (self.win_on_crashed) |f| f(self.win_crash_ctx, self);
 }
 
 fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {
