@@ -5942,3 +5942,64 @@ H.264 compression Wayland apps have, via the hardware encoder.
 
 Native `zig build mux` (SCK + VideoToolbox), tests (default + -Dvideo),
 smoke-mux, GUI, and mux-portable (no codec) all green.
+
+## 2026-06-17: one session handler — GUI is always a mux client
+
+Collapsed the two parallel session paths (in-process worker/ring vs
+remote socket) into one. The `sketerm-mux` daemon now owns **every**
+session, local included; the GUI is always a thin client over the wire.
+
+- **Killed the in-process path**: deleted the per-pane PTY worker thread,
+  the SPSC ring, and `mainDrainEvents`. `Terminal` is `initRemote`-only —
+  `writeRaw`/`requestResize` are socket-only, `child_pid` is always -1.
+  New local tabs route through `connectLocalAutostart` (spawns/attaches
+  the per-user daemon) like durable tabs always did. Visible-change
+  detection for the activity glow moved into the remote `.events` path
+  (it used to live in the deleted `mainDrain`).
+- **Daemon-side activity tracking**: each `Session` stamps
+  `last_activity_ms` on any event-producing drain; `SessionInfo` carries
+  `idle_ms` + `cwd`, so `sketerm list` / the TUI picker show live
+  active/idle state for *detached* sessions, not just attached ones.
+- **Silence monitor rewrite**: the long-broken "Warn inactivity" tab
+  flag now follows tmux `monitor-silence` semantics (fires once after N
+  seconds of no output, re-arms on activity) instead of doing nothing.
+- **Two regressions caught on real hardware, fixed**: multi-tab layout
+  load opened only one tab (a per-window session-name counter collided
+  with a shared pid across windows → daemon rejected dup names; fixed
+  with a process-global `nextSessionName`); and the activity glow
+  stopped rendering (the `on_activity` fire lived only in the deleted
+  `mainDrain`; re-wired into the remote frame path).
+
+## 2026-06-17: crash-recovery UX + process-isolation broker (B1/B2)
+
+A session that dies unexpectedly (conn EOF / read error / protocol
+error — **not** a clean `.exit`/`.gone`) now paints a sad face plus a
+"Start new session" button on the pane instead of a silent black
+GLArea; the button respawns a fresh daemon session in place via
+`detachPaneToShell`. Clean shell exits and clean daemon retires stay
+quiet. `onPaneCrashed` hides the offload wrapper (and the per-pane
+titlebar) and appends the recovery panel to the pane's box.
+
+To keep the clean-vs-crash split honest, the daemon sends `.gone` to
+other clients on `.shutdown`, and `Daemon.run()` now does a bounded
+best-effort POLLOUT flush of each client's wbuf before teardown.
+Without it the `.gone` queued in the final tick was discarded (the run
+loop exits before POLLOUT is recomputed), clients saw a bare EOF, and a
+clean stale-daemon retire (`retireStaleDaemon`) was misread as a crash.
+The flush fixes both the `.shutdown` site and the future worker-`'K'`
+path. (A SIGTERM'd daemon still EOFs → crash face, which is correct —
+those sessions genuinely died with it.)
+
+Landed flag-gated (`sketerm-mux --broker`) Firefox-style isolation
+scaffolding: a broker process forks one worker per session
+(fork-without-exec, dropping every inherited broker fd) and routes
+clients to workers by passing the client socket fd over SCM_RIGHTS
+(`brokerSpawn`/`brokerAttach`, `controlSend`/`controlRecv` on a
+`SOCK_SEQPACKET` control channel, `runWorker`). Default stays the
+monolith. Still to come: B3 list/kill/rename + worker→broker metadata
+(incl. a ready/failed handshake so spawn errors surface synchronously),
+B4 zombie reaping + `RLIMIT_AS`, B5 per-worker feature parity (Wayland
+hub / winstream / clipboard / query answering), B6 no-regression +
+isolation sweep and flipping autostart to `--broker`.
+
+mux + GUI build, smoke-mux PASS, full test suite, and smoke-e2e PASS.
