@@ -86,6 +86,12 @@ pub const Terminal = struct {
     /// this batch (content hash differs) — the tab-activity signal.
     /// Distinct from on_render_request, which fires on any dirty.
     on_activity: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// Tab-activity detection state (drives the aurora glow + inactivity
+    /// warning): the last visible-content hash and whether it's valid. The
+    /// remote event-apply path compares against these to fire `on_activity`
+    /// only on a real visible change — ported from the old in-process drain.
+    last_content_hash: u64 = 0,
+    hash_valid: bool = false,
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
     on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void = null,
@@ -307,11 +313,35 @@ pub const Terminal = struct {
         switch (frame.ftype) {
             .events => {
                 if (frame.payload.len < 12) return;
+                // Snapshot the line-id counter so we can tell, after applying,
+                // whether new lines were born (scroll/append) — a definite
+                // visible change — vs. an in-place repaint that needs hashing.
+                const line_id_before = self.screen.next_line_id;
+                var any = false;
                 var r = mux_wire.Reader.init(frame.payload[12..]);
                 while (!r.atEnd()) {
                     var ev = r.getEvent(self.allocator) catch return;
                     self.screen.apply(ev);
                     ev.deinit(self.allocator);
+                    any = true;
+                }
+                // Tab-activity signal (drives the aurora glow + inactivity
+                // warning). Ported from the old in-process drain: fire only on
+                // a real VISIBLE change, gated by config + DECSET 2026 sync.
+                if (any and self.screen.track_activity and !self.screen.sync_output) {
+                    if (self.screen.next_line_id != line_id_before) {
+                        self.hash_valid = false;
+                        if (self.on_activity) |f| f(self.user_ctx);
+                    } else {
+                        const h = self.screen.contentHash();
+                        if (!self.hash_valid) {
+                            self.last_content_hash = h;
+                            self.hash_valid = true;
+                        } else if (h != self.last_content_hash) {
+                            self.last_content_hash = h;
+                            if (self.on_activity) |f| f(self.user_ctx);
+                        }
+                    }
                 }
                 if (self.remote) |remote| {
                     remote.predictor.reconcile(
@@ -336,6 +366,10 @@ pub const Terminal = struct {
                 self.screen = fresh;
                 self.wireScreenSink();
                 old.deinit();
+                // Grid replaced wholesale — the activity hash baseline is now
+                // stale; rebaseline on the next events batch (don't glow on a
+                // reattach/resize snapshot).
+                self.hash_valid = false;
                 // Predicted positions are meaningless on a new grid.
                 if (self.remote) |remote| {
                     remote.predictor.pending.clearRetainingCapacity();
