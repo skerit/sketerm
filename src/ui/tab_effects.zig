@@ -79,10 +79,11 @@ pub fn setTabSettings(page: *c.AdwTabPage, s: TabSettings) void {
 const ACTIVITY_KEY = "sketerm-tab-activity-us";
 /// EMA of the inter-arrival gap between activity events, per page.
 const GAP_KEY = "sketerm-tab-gap-us";
-/// Monotonic-us timestamp of the last time the user viewed (selected) this
-/// tab. The inactivity warning is suppressed unless there has been fresh
-/// output SINCE this — visiting a tab acknowledges it.
-const ACK_KEY = "sketerm-tab-ack-us";
+/// Monotonic-us timestamp anchoring this tab's silence countdown: the last
+/// time the user left (or viewed) the tab. The inactivity warning measures
+/// quiet from the LATER of this and the last output, so leaving a tab — or
+/// viewing it — restarts the countdown. See `warnActivation`.
+const SEEN_KEY = "sketerm-tab-seen-us";
 
 /// Read a monotonic-us timestamp stored as a qdata pointer, or null/0.
 fn tsOf(page: *c.AdwTabPage, key: [*:0]const u8) ?i64 {
@@ -90,11 +91,12 @@ fn tsOf(page: *c.AdwTabPage, key: [*:0]const u8) ?i64 {
     return @bitCast(@as(u64, @intFromPtr(d)));
 }
 
-/// Mark this tab as seen now, clearing any standing inactivity warning until
-/// fresh output arrives. Called when the tab becomes selected.
-pub fn acknowledge(page: *c.AdwTabPage) void {
+/// Anchor this tab's silence countdown at "now" — called when the user
+/// leaves the tab (or views it). Restarts the inactive-warning timer so a
+/// freshly-left tab gets a full quiet period before it warns again.
+pub fn markSeen(page: *c.AdwTabPage) void {
     const now = c.g_get_monotonic_time();
-    c.g_object_set_data(@ptrCast(@alignCast(page)), ACK_KEY, @ptrFromInt(@as(usize, @intCast(now))));
+    c.g_object_set_data(@ptrCast(@alignCast(page)), SEEN_KEY, @ptrFromInt(@as(usize, @intCast(now))));
 }
 
 /// A gap larger than this means activity restarted; the average resets to
@@ -332,21 +334,23 @@ fn warnEnabled(s: TabSettings) bool {
 }
 
 fn warnEval(page: *c.AdwTabPage, cfg: *const Config, _: TabSettings) Activation {
-    // No activity stamp at all = the tab never produced output, so it is
-    // not "inactive" in the sense we warn about — it never started.
-    const activity_ts = tsOf(page, ACTIVITY_KEY) orelse return .{};
-    const ack_ts = tsOf(page, ACK_KEY) orelse 0;
+    const activity_ts = tsOf(page, ACTIVITY_KEY) orelse 0;
+    const seen_ts = tsOf(page, SEEN_KEY) orelse 0;
     const threshold: i64 = @as(i64, cfg.inactive_warn_secs) * 1_000_000;
-    return warnActivation(activity_ts, ack_ts, c.g_get_monotonic_time(), threshold);
+    return warnActivation(activity_ts, seen_ts, c.g_get_monotonic_time(), threshold);
 }
 
-/// Warning strength, suppressed once the tab has been acknowledged (viewed)
-/// with no newer output. Pure: testable core.
-fn warnActivation(activity_ts: i64, ack_ts: i64, now: i64, threshold_us: i64) Activation {
-    // Viewed since the last output → acknowledged, no warning until the next
-    // burst of activity goes silent again.
-    if (activity_ts <= ack_ts) return .{};
-    const idle = now - activity_ts;
+/// Warning strength for a background tab that has gone quiet (tmux
+/// monitor-silence semantics). The silence countdown is anchored at the LATER
+/// of {last output, last time the user left/viewed the tab}, so a tab warns
+/// once it's been quiet for the threshold — whether it fell silent on its own
+/// or you walked away from an already-quiet tab. Pure: testable core.
+fn warnActivation(activity_ts: i64, seen_ts: i64, now: i64, threshold_us: i64) Activation {
+    const anchor = @max(activity_ts, seen_ts);
+    // No anchor at all → the tab was never seen and never produced output, so
+    // there is nothing that could have "gone silent" yet.
+    if (anchor <= 0) return .{};
+    const idle = now - anchor;
     if (idle < threshold_us) return .{};
     const over: f64 = @floatFromInt(idle - threshold_us);
     const intensity = std.math.clamp(over / WARN_RAMP_US, 0.0, 1.0);
@@ -459,7 +463,7 @@ test "aurora sustain: a steady source holds full past the bare decay" {
 test "inactive warning: silent below the threshold, ramps in above it" {
     const threshold: i64 = 60_000_000;
     const now: i64 = 1_000_000_000;
-    // idle = now - activity_ts; ack_ts = 0 means never acknowledged.
+    // idle = now - activity_ts; seen_ts = 0 (irrelevant — older than output).
     const at = struct {
         fn f(idle: i64, n: i64, th: i64) Activation {
             return warnActivation(n - idle, 0, n, th);
@@ -472,13 +476,23 @@ test "inactive warning: silent below the threshold, ramps in above it" {
     try std.testing.expectEqual(@as(f64, 1.0), at(threshold + @as(i64, @intFromFloat(WARN_RAMP_US * 4.0)), now, threshold).intensity);
 }
 
-test "inactive warning: acknowledged tab stays silent until newer output" {
+test "inactive warning: silence counts from the later of output and last-seen" {
     const threshold: i64 = 60_000_000;
     const now: i64 = 1_000_000_000;
-    const activity_ts = now - threshold * 10; // long idle, would warn
-    // Acknowledged AFTER that output → suppressed despite the long silence.
-    try std.testing.expectEqual(Activation{}, warnActivation(activity_ts, activity_ts + 1, now, threshold));
-    // Fresh output arrived AFTER the acknowledgement → warns again.
-    const fresh = warnActivation(now - threshold * 2, activity_ts + 1, now, threshold);
-    try std.testing.expectEqual(@as(f64, 1.0), fresh.intensity);
+
+    // Left the tab long ago with no output since → quiet past the threshold,
+    // anchored at last-seen. This is the case the old code missed: an idle
+    // tab that never produced background output still warns.
+    try std.testing.expectEqual(@as(f64, 1.0), warnActivation(0, now - threshold * 2, now, threshold).intensity);
+
+    // Just left it (seen == now) → countdown restarts → no warning, even
+    // though it produced output long ago. Viewing a tab clears the warning.
+    try std.testing.expectEqual(Activation{}, warnActivation(now - threshold * 5, now, now, threshold));
+
+    // Output arrived AFTER you left (activity newer than seen) → re-anchored
+    // to the output; still quiet long enough → warns.
+    try std.testing.expectEqual(@as(f64, 1.0), warnActivation(now - threshold * 2, now - threshold * 3, now, threshold).intensity);
+
+    // Never seen, never active → nothing could have gone silent.
+    try std.testing.expectEqual(Activation{}, warnActivation(0, 0, now, threshold));
 }

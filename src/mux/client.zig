@@ -54,7 +54,16 @@ pub const Conn = struct {
         const path = try daemon.defaultSocketPath(allocator);
         defer allocator.free(path);
         if (Conn.connect(allocator, path)) |conn| {
-            return helloProbe(allocator, conn);
+            if (helloProbe(allocator, conn)) |ready| {
+                return ready;
+            } else |err| {
+                // A handshake failure other than a version skew is real —
+                // propagate. On a version skew the running daemon is a stale
+                // build of OUR per-user local daemon: retire it and respawn
+                // the matching version below (the spawn/retry path).
+                if (err != error.MuxProtoMismatch) return err;
+                retireStaleDaemon(allocator, path);
+            }
         } else |_| {}
 
         const pid = c.fork();
@@ -76,6 +85,27 @@ pub const Conn = struct {
         return error.MuxDaemonUnreachable;
     }
 
+    /// Tell a running-but-version-mismatched LOCAL daemon (a stale build of
+    /// the per-user daemon we own) to shut down, then wait for it to release
+    /// the socket so the fresh, matching daemon can bind. Best-effort.
+    fn retireStaleDaemon(allocator: std.mem.Allocator, path: []const u8) void {
+        if (Conn.connect(allocator, path)) |conn| {
+            var c2 = conn;
+            defer c2.deinit();
+            // `.shutdown` is a stable (append-only) frame type, so even an
+            // older daemon understands it.
+            c2.sendFrame(.shutdown, "") catch {};
+        } else |_| return;
+        var tries: u32 = 0;
+        while (tries < 60) : (tries += 1) {
+            _ = c.usleep(50_000);
+            if (Conn.connect(allocator, path)) |probe| {
+                var pc = probe;
+                pc.deinit();
+            } else |_| return; // no longer accepting connections → gone
+        }
+    }
+
     /// hello → welcome round trip; consumes the welcome so the
     /// stream is clean for the caller's own frames.
     fn helloProbe(allocator: std.mem.Allocator, conn_in: Conn) !Conn {
@@ -83,7 +113,15 @@ pub const Conn = struct {
         errdefer conn.deinit();
         try conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video });
         const w = try conn.recvExpect(&.{.welcome});
-        w.deinit(allocator);
+        defer w.deinit(allocator);
+        // Version-skew guard: a daemon left running from a previous build
+        // speaks an older protocol. Refuse rather than corrupt the stream
+        // (the wire carries parsed events — a mismatched daemon desyncs).
+        const Probe = struct { proto: u32 = 0 };
+        if (std.json.parseFromSlice(Probe, allocator, w.payload, .{ .ignore_unknown_fields = true })) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value.proto != @import("wire.zig").PROTO_VERSION) return error.MuxProtoMismatch;
+        } else |_| {}
         return conn;
     }
 

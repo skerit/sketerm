@@ -1,10 +1,12 @@
-//! Composes pty + parser + ring + worker thread for one pane.
+//! One pane's terminal: a thin client of the mux daemon, which owns the
+//! PTY + parser + authoritative Screen.
 //!
-//! Lifecycle: `init` spawns the worker thread and starts reading
-//! from the PTY master fd. Events flow through the SPSC ring; the
-//! main thread drains them via `g_main_context_invoke` (coalesced
-//! by `drain_pending`). `deinit` joins the worker and reaps the
-//! child.
+//! `initRemote` is the only constructor — it restores the attach snapshot
+//! into a local mirror Screen and watches the daemon socket via
+//! `g_unix_fd_add`; inbound EVENTS apply directly to the mirror and a
+//! SNAPSHOT swaps it wholesale. `writeRaw`/`requestResize` send INPUT/RESIZE
+//! frames back. There is NO in-process PTY path anymore (no worker thread,
+//! no ring) — local shells are daemon sessions the GUI attaches to.
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -41,24 +43,22 @@ pub const EventRing = ring_mod.Ring(Event, RING_CAP);
 /// O(panes) terminals over their lifetime; per-handle leak is < 32
 /// bytes. Reclaiming would require tracking pending invocations,
 /// which glib doesn't expose.
+/// Outlives the Terminal so a deferred glib callback (e.g. the async OSC 52
+/// clipboard-read reply) can detect a pane/terminal teardown between request
+/// and dispatch: it checks `alive` (cleared in deinit) before touching
+/// `terminal` (nulled in deinit).
 pub const DrainHandle = struct {
-    drain_pending: std.atomic.Value(bool) = .{ .raw = false },
-    /// Cleared in Terminal.deinit. mainDrain bails when alive=false.
     alive: std.atomic.Value(bool) = .{ .raw = true },
     /// Borrowed; nulled in deinit.
     terminal: ?*Terminal = null,
 };
 
 pub const Terminal = struct {
-    pty: Pty,
     parser: Parser,
-    ring: *EventRing,
-    worker_thread: std.Thread,
-    /// Worker shutdown wakeup (eventfd on Linux, pipe elsewhere).
-    shutdown: platform.Wakeup,
     /// Heap-allocated handle that outlives the Terminal so glib
     /// callbacks queued before deinit can safely run after deinit.
-    /// drain_pending lives on the handle.
+    /// (Async sink replies — e.g. OSC 52 clipboard reads — check
+    /// `alive` to detect a teardown between request and callback.)
     drain: *DrainHandle,
     allocator: std.mem.Allocator,
 
@@ -86,11 +86,6 @@ pub const Terminal = struct {
     /// this batch (content hash differs) — the tab-activity signal.
     /// Distinct from on_render_request, which fires on any dirty.
     on_activity: ?*const fn (ctx: ?*anyopaque) void = null,
-    /// Last visible-content hash, to detect real change across drains.
-    last_content_hash: u64 = 0,
-    /// False after a scroll short-circuit left `last_content_hash` stale;
-    /// the next in-place drain re-baselines instead of firing.
-    hash_valid: bool = false,
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
     on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void = null,
@@ -139,6 +134,12 @@ pub const Terminal = struct {
         watch_id: c_uint = 0,
         /// Set when the daemon said GONE/EXIT — no more writes.
         closed: bool = false,
+        /// This session is GUI-owned (a flipped local tab, not an explicit
+        /// durable/remote one): tearing the terminal down KILLS the session
+        /// rather than detaching, so closing a tab doesn't leak a daemon
+        /// session. A GUI crash skips deinit, so the session still survives
+        /// for reattach — that is the durability.
+        ephemeral: bool = false,
         /// Predictive local echo (mosh-style). The expiry timer only
         /// runs while predictions are outstanding, so echo-less input
         /// (password prompts) flushes even when no events arrive.
@@ -210,11 +211,7 @@ pub const Terminal = struct {
         errdefer allocator.free(remote.session);
 
         self.* = .{
-            .pty = .{ .master_fd = -1, .child_pid = -1 },
             .parser = Parser.init(allocator),
-            .ring = undefined,
-            .worker_thread = undefined,
-            .shutdown = .{ .read_fd = -1, .write_fd = -1 },
             .drain = drain,
             .allocator = allocator,
             .pool = pool,
@@ -597,97 +594,25 @@ pub const Terminal = struct {
         self.allocator.destroy(na);
     }
 
-    /// PTY-or-socket write for parser replies / mouse / focus
-    /// reports. Use this instead of touching `pty` directly.
+    /// Socket write for parser replies / mouse / focus reports / user
+    /// input. Routed to the mux daemon (every Terminal is daemon-backed).
     pub fn writeRaw(self: *Terminal, bytes: []const u8) void {
-        if (self.remote) |r| {
-            r.sendInput(bytes);
-            return;
-        }
-        _ = self.pty.writeAll(bytes);
+        const r = self.remote orelse return;
+        r.sendInput(bytes);
     }
 
-    /// Resize, routed to the PTY or the mux daemon. The daemon
-    /// answers with a fresh snapshot, so remote panes skip the local
-    /// screen.resize (the snapshot replaces the grid wholesale).
+    /// Resize, routed to the mux daemon. The daemon answers with a fresh
+    /// snapshot, so the pane skips a local screen.resize (the snapshot
+    /// replaces the grid wholesale).
     pub fn requestResize(self: *Terminal, rows: u16, cols: u16) void {
-        if (self.remote) |r| {
-            if (r.closed) return;
-            var payload: [4]u8 = undefined;
-            std.mem.writeInt(u16, payload[0..2], rows, .little);
-            std.mem.writeInt(u16, payload[2..4], cols, .little);
-            r.conn.sendFrame(.resize, &payload) catch {
-                r.closed = true;
-            };
-            return;
-        }
-        self.pty.setSize(rows, cols);
-    }
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        pty: Pty,
-        cols: u16,
-        rows: u16,
-    ) !*Terminal {
-        const self = try allocator.create(Terminal);
-        errdefer allocator.destroy(self);
-
-        const ring = try allocator.create(EventRing);
-        errdefer allocator.destroy(ring);
-        ring.* = .{};
-
-        const shutdown_wk = try platform.Wakeup.init();
-        errdefer shutdown_wk.close();
-
-        var pool = try Pool.init(allocator);
-        errdefer pool.deinit();
-
-        const screen = try Screen.init(allocator, undefined, cols, rows);
-        // Screen.init takes a *Pool; we'll wire the real pointer below.
-        // (the field can be re-assigned safely before any apply runs.)
-        errdefer screen.deinit();
-
-        // Heap handle for glib callbacks. Intentionally never freed.
-        const drain = try allocator.create(DrainHandle);
-        drain.* = .{};
-        errdefer allocator.destroy(drain);
-
-        self.* = .{
-            .pty = pty,
-            .parser = Parser.init(allocator),
-            .ring = ring,
-            .worker_thread = undefined,
-            .shutdown = shutdown_wk,
-            .drain = drain,
-            .allocator = allocator,
-            .pool = pool,
-            .screen = screen,
+        const r = self.remote orelse return;
+        if (r.closed) return;
+        var payload: [4]u8 = undefined;
+        std.mem.writeInt(u16, payload[0..2], rows, .little);
+        std.mem.writeInt(u16, payload[2..4], cols, .little);
+        r.conn.sendFrame(.resize, &payload) catch {
+            r.closed = true;
         };
-        // Back-link: handle holds a borrowed pointer, cleared in deinit.
-        drain.terminal = self;
-        // Now that the Terminal exists, point Screen at our pool +
-        // wire the side-effect sink.
-        self.screen.pool = &self.pool;
-        self.screen.sink = .{
-            .ctx = @ptrCast(self),
-            .on_title = sinkTitle,
-            .on_bell = sinkBell,
-            .on_write_pty = sinkWritePty,
-            .on_clipboard_set = sinkClipboard,
-            .on_clipboard_get = sinkClipboardGet,
-            .on_cwd = sinkCwd,
-            .on_image = sinkImage,
-            .on_image_delete_full = sinkImageDeleteFull,
-            .on_decanm = sinkDecanm,
-            .on_notification = sinkNotification,
-            .on_progress = sinkProgress,
-            .on_pointer_shape = sinkPointerShape,
-            .on_set_profile = sinkSetProfile,
-        };
-
-        self.worker_thread = try std.Thread.spawn(.{}, workerMain, .{self});
-        return self;
     }
 
     fn sinkTitle(ctx: ?*anyopaque, title: []const u8) void {
@@ -902,7 +827,19 @@ pub const Terminal = struct {
             remote.napps.deinit(self.allocator);
             remote.wsapps.deinit(self.allocator);
             remote.predictor.deinit();
-            if (!remote.closed) remote.conn.sendFrame(.detach, "") catch {};
+            if (!remote.closed) {
+                if (remote.ephemeral) {
+                    // GUI-owned session: kill it so a closed tab doesn't
+                    // leak a daemon session. Session names are GUI-minted
+                    // (`s<pid>-<n>`), so the inline JSON is safe.
+                    var kbuf: [128]u8 = undefined;
+                    if (std.fmt.bufPrint(&kbuf, "{{\"name\":\"{s}\"}}", .{remote.session})) |payload| {
+                        remote.conn.sendFrame(.kill, payload) catch {};
+                    } else |_| {}
+                } else {
+                    remote.conn.sendFrame(.detach, "") catch {};
+                }
+            }
             remote.conn.deinit();
             if (remote.host) |h| self.allocator.free(h);
             if (remote.pending_rename) |p| self.allocator.free(p);
@@ -915,293 +852,10 @@ pub const Terminal = struct {
             self.allocator.destroy(self);
             return;
         }
-        // Mark the drain handle dead BEFORE freeing anything else, so
-        // any g_main_context_invoke(mainDrain) that was queued before
-        // this call but hasn't been dispatched yet will safely no-op
-        // when it eventually runs. The handle itself is intentionally
-        // leaked — glib doesn't expose a way to cancel one-shot
-        // invocations. The leak is bounded by terminal-creation count.
-        self.drain.terminal = null;
-        self.drain.alive.store(false, .release);
-
-        // Signal worker (EINTR-safe inside Wakeup.signal).
-        self.shutdown.signal();
-        self.worker_thread.join();
-
-        self.shutdown.close();
-        // Async reap: closes master_fd + sends SIGHUP synchronously,
-        // then escalates SIGTERM / SIGKILL on a g_timeout chain so
-        // a child that ignores HUP doesn't freeze the GLib main
-        // thread for ~500 ms while we close a tab.
-        self.pty.closeAndReapAsync();
-
-        // Drain remaining events to free their owned payloads.
-        while (self.ring.pop()) |ev| {
-            var mut_ev = ev;
-            mut_ev.deinit(self.allocator);
-        }
-
-        self.screen.deinit();
-        self.pool.deinit();
-        self.parser.deinit();
-        if (self.cwd) |path| self.allocator.free(path);
-        self.allocator.destroy(self.ring);
-        self.allocator.destroy(self);
+        // Every Terminal is daemon-backed (initRemote) now — `remote` is
+        // always set, so the branch above always returns. This is unreachable.
+        unreachable;
     }
 
-    fn workerMain(self: *Terminal) void {
-        // Block SIGCHLD; only main thread handles it.
-        var set: c.sigset_t = undefined;
-        _ = c.sigemptyset(&set);
-        _ = c.sigaddset(&set, c.SIGCHLD);
-        _ = c.pthread_sigmask(c.SIG_BLOCK, &set, null);
-
-        var pfds = [_]c.struct_pollfd{
-            .{ .fd = self.pty.master_fd, .events = c.POLLIN, .revents = 0 },
-            .{ .fd = self.shutdown.read_fd, .events = c.POLLIN, .revents = 0 },
-        };
-
-        while (true) {
-            const n = c.poll(&pfds, pfds.len, -1);
-            if (n < 0) {
-                // EINTR — signal arrived during the blocking poll.
-                // Resume; SIGTERM/HUP will reach us through the
-                // shutdown_fd, not via interrupting the syscall.
-                const errn = std.posix.errno(n);
-                if (errn == .INTR) continue;
-                break;
-            }
-
-            // Shutdown event takes priority.
-            if (pfds[1].revents & c.POLLIN != 0) break;
-
-            if (pfds[0].revents & c.POLLIN != 0) {
-                var buf: [16384]u8 = undefined;
-                const r = c.read(self.pty.master_fd, &buf, buf.len);
-                if (r < 0) {
-                    // EINTR / EAGAIN are transient — resume the poll
-                    // loop. Other errors fall through as EOF.
-                    const errn = std.posix.errno(r);
-                    if (errn == .INTR or errn == .AGAIN) continue;
-                    self.pushSpinning(.{ .child_eof = self.reapStatus() });
-                    self.scheduleDrain();
-                    break;
-                }
-                if (r == 0) {
-                    self.pushSpinning(.{ .child_eof = self.reapStatus() });
-                    self.scheduleDrain();
-                    break;
-                }
-                self.parser.advance(buf[0..@intCast(r)], emitFromWorker, @ptrCast(self));
-                self.scheduleDrain();
-            }
-
-            if (pfds[0].revents & (c.POLLHUP | c.POLLERR) != 0) {
-                self.pushSpinning(.{ .child_eof = self.reapStatus() });
-                self.scheduleDrain();
-                break;
-            }
-        }
-    }
-
-    /// Non-blocking waitpid; returns 0 if child not yet reaped or
-    /// the WEXITSTATUS-style code (or -signo for fatal signals).
-    fn reapStatus(self: *Terminal) i32 {
-        var status: c_int = 0;
-        // Remote terminals have child_pid == -1; waitpid(-1) would
-        // reap ARBITRARY children of the GUI (the forked mux daemon,
-        // file-chooser portals…). Never let that happen.
-        if (self.pty.child_pid <= 0) return 0;
-        const r = c.waitpid(self.pty.child_pid, &status, c.WNOHANG);
-        if (r != self.pty.child_pid) return 0;
-        if ((status & 0x7F) == 0) return @intCast((status >> 8) & 0xFF); // WIFEXITED
-        return -@as(i32, @intCast(status & 0x7F)); // WIFSIGNALED → -signo
-    }
-
-    fn emitFromWorker(ctx: ?*anyopaque, ev: Event) void {
-        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
-        self.pushSpinning(ev);
-    }
-
-    fn pushSpinning(self: *Terminal, ev: Event) void {
-        // If ring is full, yield until space appears (back-pressure).
-        var attempts: u32 = 0;
-        while (!self.ring.push(ev)) {
-            attempts +%= 1;
-            if (attempts & 0x3FF == 0) {
-                std.Thread.yield() catch {};
-            } else {
-                std.atomic.spinLoopHint();
-            }
-        }
-    }
-
-    fn scheduleDrain(self: *Terminal) void {
-        const was_pending = self.drain.drain_pending.swap(true, .acq_rel);
-        if (!was_pending) {
-            _ = c.g_main_context_invoke(null, mainDrain, @ptrCast(self.drain));
-        }
-    }
-
-    fn mainDrain(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const handle: *DrainHandle = @ptrCast(@alignCast(user.?));
-        // First check: was the Terminal torn down between the worker's
-        // schedule and this dispatch? If so the handle is still valid
-        // (intentionally leaked) but the back-pointer is null. Bail.
-        if (!handle.alive.load(.acquire)) return 0; // G_SOURCE_REMOVE
-        const self = handle.terminal orelse return 0;
-        // Reset BEFORE draining: if worker pushes during drain it
-        // will reschedule us on the next batch.
-        // Clear the pending flag with an RMW, not a plain store: Zig 0.16
-        // has no seq_cst fence, so we rely on the fact that two RMWs on the
-        // same atomic are totally ordered in modification order. Paired with
-        // the worker's swap(true,.acq_rel) in scheduleDrain, this closes the
-        // StoreLoad lost-wakeup window — either the worker's push
-        // happens-before our drain, or the worker observes our false and
-        // reschedules. A plain store would NOT give that guarantee.
-        _ = handle.drain_pending.swap(false, .acq_rel);
-
-        // Debug-trace events to stderr. Zig 0.16 removed
-        // `std.fs.File.stderr()`; we accumulate into a fixed buffer
-        // and flush via libc's stderr.
-        var stderr_buf: [4096]u8 = undefined;
-        var stderr_writer: ?std.Io.Writer = if (self.debug_to_stderr)
-            std.Io.Writer.fixed(&stderr_buf)
-        else
-            null;
-
-        // Budgeted drain: an output flood (cat largefile, fast TUI)
-        // can refill the ring as fast as we pop it. Without a cap
-        // this loop owns the main thread for the whole burst and GTK
-        // can't paint or process input. Cap by event count, with a
-        // coarse time check so heavyweight events (images) can't
-        // blow the budget — then re-arm and yield back to the loop.
-        const max_events: u32 = 4096;
-        const budget_ms: i64 = 3;
-        const start_ms = profile_util.milliTimestamp();
-        // Snapshot the line-id counter so we can tell, after the drain,
-        // whether any new lines were born (scroll / append) — a definite
-        // visible change we can flag without hashing.
-        const line_id_before = self.screen.next_line_id;
-        var processed: u32 = 0;
-        var over_budget = false;
-        while (self.ring.pop()) |ev| {
-            var mut_ev = ev;
-            if (stderr_writer) |*w| {
-                debugFormatEvent(w, ev) catch {};
-            }
-            // Apply to grid.
-            self.screen.apply(ev);
-            mut_ev.deinit(self.allocator);
-            processed += 1;
-            if (processed >= max_events or
-                (processed & 0xFF == 0 and profile_util.milliTimestamp() - start_ms >= budget_ms))
-            {
-                over_budget = true;
-                break;
-            }
-        }
-
-        if (stderr_writer) |*w| {
-            const bytes = w.buffered();
-            if (bytes.len > 0) _ = c.fwrite(bytes.ptr, 1, bytes.len, platform.stderr());
-        }
-
-        // Direct render dispatch: drain cleared the ring, leaving the
-        // screen dirty. Skip in DECSET 2026 sync mode — the running
-        // app will tell us when to flush.
-        if (self.screen.dirty and !self.screen.sync_output) {
-            if (self.on_render_request) |f| f(self.user_ctx);
-        }
-
-        // Tab-activity signal: fire only when the VISIBLE grid actually
-        // changed this batch, not merely when bytes arrived. Gated by
-        // config; skipped mid synchronized-update (DECSET 2026).
-        if (self.screen.track_activity and processed > 0 and !self.screen.sync_output) {
-            if (self.screen.next_line_id != line_id_before) {
-                // New lines were born (scroll / append): the screen
-                // definitely changed. Flag it without hashing — but the
-                // hash baseline is now stale.
-                self.hash_valid = false;
-                if (self.on_activity) |f| f(self.user_ctx);
-            } else {
-                // Nothing scrolled, so only an in-place change (TUI,
-                // status line, spinner) could have altered the screen.
-                // Hash it to tell a real change from an identical repaint.
-                const h = self.screen.contentHash();
-                if (!self.hash_valid) {
-                    // Re-baseline silently after a scroll short-circuit.
-                    self.last_content_hash = h;
-                    self.hash_valid = true;
-                } else if (h != self.last_content_hash) {
-                    self.last_content_hash = h;
-                    if (self.on_activity) |f| f(self.user_ctx);
-                }
-            }
-        }
-
-        // Ring not empty: re-arm with the same coalescing dance the
-        // worker uses, so we never double-queue an invoke.
-        if (over_budget) {
-            const was_pending = handle.drain_pending.swap(true, .acq_rel);
-            if (!was_pending) {
-                _ = c.g_main_context_invoke(null, mainDrain, @ptrCast(handle));
-            }
-        }
-
-        return @intFromBool(false); // G_SOURCE_REMOVE
-    }
 };
 
-fn debugFormatEvent(w: *std.Io.Writer, ev: Event) !void {
-    switch (ev) {
-        .print => |cp| try w.print("U+{X:0>4} ", .{cp}),
-        .print_byte => |b| {
-            if (b >= 0x20 and b < 0x7F) {
-                try w.print("{c}", .{b});
-            } else {
-                try w.print("\\x{x:0>2}", .{b});
-            }
-        },
-        .print_run => |run| {
-            for (run.bytes[0..run.len]) |b| {
-                if (b >= 0x20 and b < 0x7F) {
-                    try w.print("{c}", .{b});
-                } else {
-                    try w.print("\\x{x:0>2}", .{b});
-                }
-            }
-        },
-        .execute => |b| {
-            switch (b) {
-                '\r' => try w.print("[CR]", .{}),
-                '\n' => try w.print("[LF]\n", .{}),
-                '\t' => try w.print("[TAB]", .{}),
-                0x08 => try w.print("[BS]", .{}),
-                0x07 => try w.print("[BEL]", .{}),
-                else => try w.print("[exec 0x{x:0>2}]", .{b}),
-            }
-        },
-        .csi => |csi| {
-            try w.print("«CSI", .{});
-            if (csi.private != 0) try w.print(" {c}", .{csi.private});
-            if (csi.n_params > 0) {
-                try w.print(" ", .{});
-                for (csi.params[0..csi.n_params], 0..) |p, i| {
-                    if (i > 0) try w.print(";", .{});
-                    try w.print("{d}", .{p});
-                }
-            }
-            try w.print(" {c}»", .{csi.final});
-        },
-        .esc_final => |ef| try w.print("«ESC {c}»", .{ef.final}),
-        .osc => |o| try w.print("«OSC {s}»", .{o.bytes}),
-        .apc => |a| try w.print("«APC {s}»", .{a.bytes}),
-        .dcs => |d| try w.print("«DCS {c} body={d}B»", .{ d.proto.final, d.body.len }),
-        .dcs_start => |d| try w.print("«DCS-start {c}»", .{d.final}),
-        .dcs_data => try w.print("«DCS-data»", .{}),
-        .dcs_end => try w.print("«DCS-end»", .{}),
-        .child_eof => |s| try w.print("\n«child-eof status={d}»\n", .{s}),
-        .parse_error => |pe| try w.print("«parse-error {s}»", .{@tagName(pe.kind)}),
-    }
-}

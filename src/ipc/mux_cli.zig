@@ -54,7 +54,37 @@ const SessionInfo = struct {
     exited: bool = false,
     title: []const u8 = "",
     app: bool = false,
+    /// Ms since last output, computed daemon-side. 0 from an older daemon
+    /// that doesn't report it → shown as "active" (harmless default).
+    idle_ms: i64 = 0,
+    /// Child cwd (daemon-resolved). Empty from an older daemon.
+    cwd: []const u8 = "",
 };
+
+/// Human-readable activity for the `idle_ms` a session reports. Recent output
+/// reads as "active"; otherwise a coarse age ("idle 5m", "idle 2h13m").
+fn fmtIdle(buf: []u8, idle_ms: i64) [:0]const u8 {
+    if (idle_ms < 2000) return "active";
+    const secs: i64 = @divTrunc(idle_ms, 1000);
+    if (secs < 60) return std.fmt.bufPrintZ(buf, "idle {d}s", .{secs}) catch "idle";
+    const mins = @divTrunc(secs, 60);
+    if (mins < 60) return std.fmt.bufPrintZ(buf, "idle {d}m", .{mins}) catch "idle";
+    const hours = @divTrunc(mins, 60);
+    if (hours < 24) return std.fmt.bufPrintZ(buf, "idle {d}h{d}m", .{ hours, @mod(mins, 60) }) catch "idle";
+    const days = @divTrunc(hours, 24);
+    return std.fmt.bufPrintZ(buf, "idle {d}d{d}h", .{ days, @mod(hours, 24) }) catch "idle";
+}
+
+test "fmtIdle: thresholds and coarse buckets" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("active", fmtIdle(&buf, 0));
+    try std.testing.expectEqualStrings("active", fmtIdle(&buf, 1999));
+    try std.testing.expectEqualStrings("idle 2s", fmtIdle(&buf, 2000));
+    try std.testing.expectEqualStrings("idle 59s", fmtIdle(&buf, 59_000));
+    try std.testing.expectEqualStrings("idle 1m", fmtIdle(&buf, 60_000));
+    try std.testing.expectEqualStrings("idle 2h13m", fmtIdle(&buf, (2 * 3600 + 13 * 60) * 1000));
+    try std.testing.expectEqualStrings("idle 3d4h", fmtIdle(&buf, (3 * 86400 + 4 * 3600) * 1000));
+}
 
 const Welcome = struct {
     proto: u32 = 0,
@@ -98,15 +128,19 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
         var sessions = fetchSessions(allocator, host) orelse return 1;
         defer sessions.deinit();
         for (sessions.value.sessions) |s| {
+            var idle_buf: [32]u8 = undefined;
             _ = c.printf(
-                "%-24.*s %-5s %ux%u  %u client(s)%s  %.*s\n",
+                "%-24.*s %-5s %ux%u  %u client(s)  %-11s%s  %.*s  %.*s\n",
                 @as(c_int, @intCast(s.name.len)),
                 s.name.ptr,
                 @as([*:0]const u8, if (s.app) "app" else "shell"),
                 @as(c_uint, s.cols),
                 @as(c_uint, s.rows),
                 @as(c_uint, s.clients),
+                fmtIdle(&idle_buf, s.idle_ms).ptr,
                 @as([*:0]const u8, if (s.exited) " [exited]" else ""),
+                @as(c_int, @intCast(s.cwd.len)),
+                s.cwd.ptr,
                 @as(c_int, @intCast(s.title.len)),
                 s.title.ptr,
             );
@@ -570,8 +604,10 @@ fn drawTui(sessions: []const SessionInfo, selected: usize, drawn_lines: *usize) 
     var lines: usize = 1;
     for (sessions, 0..) |s, i| {
         const marker: [*:0]const u8 = if (i == selected) "\x1b[7m \xe2\x96\xb8 " else "   ";
+        var idle_buf: [32]u8 = undefined;
+        const active = s.idle_ms < 2000;
         _ = c.printf(
-            "%s%-24.*s %s%3ux%-3u %u client(s)%s  \x1b[2m%.*s\x1b[0m\x1b[27m\r\n",
+            "%s%-24.*s %s%3ux%-3u %u client(s)  %s%-11s\x1b[22;39m%s  \x1b[2m%.*s\x1b[0m\x1b[27m\r\n",
             marker,
             @as(c_int, @intCast(s.name.len)),
             s.name.ptr,
@@ -579,6 +615,8 @@ fn drawTui(sessions: []const SessionInfo, selected: usize, drawn_lines: *usize) 
             @as(c_uint, s.cols),
             @as(c_uint, s.rows),
             @as(c_uint, s.clients),
+            @as([*:0]const u8, if (active) "\x1b[32m" else "\x1b[2m"),
+            fmtIdle(&idle_buf, s.idle_ms).ptr,
             @as([*:0]const u8, if (s.exited) " [exited]" else ""),
             @as(c_int, @intCast(@min(s.title.len, 30))),
             s.title.ptr,
