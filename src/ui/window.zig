@@ -170,6 +170,8 @@ pub const Window = struct {
     /// `tab_bar` is its root widget, used for show/hide + toolbar moves.
     tabbar: *tabbar_mod.TabBar,
     toolbar_view: *c.GtkWidget,
+    /// Floats transient notices (upload finished/failed) over the grid.
+    toast_overlay: *c.AdwToastOverlay,
     title_buf: [256]u8 = undefined,
     panes: std.ArrayList(*Pane) = .empty,
     terminals: std.ArrayList(*Terminal) = .empty,
@@ -340,7 +342,12 @@ pub const Window = struct {
 
         c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), header_bar);
         c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar_view), @ptrCast(@alignCast(tab_bar_w)));
-        c.adw_toolbar_view_set_content(@ptrCast(toolbar_view), @ptrCast(@alignCast(tab_view_w)));
+        // Toast overlay wraps the tab area so transient notices (file
+        // upload finished / failed) float over the terminal grid.
+        const toast_overlay = c.adw_toast_overlay_new();
+        c.gtk_widget_set_vexpand(toast_overlay, 1);
+        c.adw_toast_overlay_set_child(@ptrCast(@alignCast(toast_overlay)), @ptrCast(@alignCast(tab_view_w)));
+        c.adw_toolbar_view_set_content(@ptrCast(toolbar_view), toast_overlay);
 
         // Scrollback search bar — bottom of the window. Hidden by
         // default; revealed by Ctrl+F (search_open shortcut).
@@ -412,6 +419,7 @@ pub const Window = struct {
             .tab_bar = @ptrCast(@alignCast(tab_bar_w)),
             .tabbar = tabbar,
             .toolbar_view = @ptrCast(@alignCast(toolbar_view)),
+            .toast_overlay = @ptrCast(@alignCast(toast_overlay)),
             .allocator = allocator,
             .config = if (config_override) |co| co else Config.load(allocator),
             .is_primary = is_primary,
@@ -1767,6 +1775,7 @@ pub const Window = struct {
         pane.win_on_notification = onTermNotification;
         pane.win_progress_ctx = @ptrCast(self);
         pane.win_on_progress = onTermProgress;
+        pane.win_on_transfer = onTermTransfer;
         pane.win_bell_ctx = @ptrCast(self);
         pane.win_on_bell = onTermBell;
         pane.win_child_ctx = @ptrCast(self);
@@ -5599,6 +5608,8 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .set_pane_title => self.setFocusedPaneTitle(),
         // Detach = close the pane; Terminal.deinit on a remote pane
         // sends DETACH and leaves the session running in the daemon.
+        .upload_file => openUploadDialog(self),
+        .download_file => if (self.focusedPane()) |p| @import("remote_browser.zig").open(self, p),
         .mux_detach => if (self.focusedPane()) |p| self.detachPaneToShell(p),
         .mux_rename => self.renameFocusedMuxSession(),
         .mux_kill => self.killFocusedMuxSession(),
@@ -5613,6 +5624,94 @@ const ShaderPickCtx = struct {
     win: *Window,
     pane: *Pane,
 };
+
+const UploadPickCtx = struct {
+    win: *Window,
+    pane: *Pane,
+};
+
+/// "Upload File…" — pick a local file, then stream it to the focused
+/// remote pane's session (which writes it into the shell's cwd).
+fn openUploadDialog(self: *Window) void {
+    const pane = self.focusedPane() orelse return;
+    if (pane.terminal.remote == null) return; // remote panes only
+    const ctx = self.allocator.create(UploadPickCtx) catch return;
+    ctx.* = .{ .win = self, .pane = pane };
+    const dialog = c.gtk_file_dialog_new();
+    c.gtk_file_dialog_set_title(dialog, "Upload File to Remote");
+    c.gtk_file_dialog_open(dialog, @ptrCast(self.app_window), null, @ptrCast(&onUploadFilePicked), @ptrCast(ctx));
+}
+
+fn onUploadFilePicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(UploadPickCtx, user);
+    defer ctx.win.allocator.destroy(ctx);
+    const dialog: *c.GtkFileDialog = @ptrCast(source);
+    const file = c.gtk_file_dialog_open_finish(dialog, result, null) orelse return;
+    defer c.g_object_unref(file);
+    const path_cstr = c.g_file_get_path(file) orelse return;
+    defer c.g_free(path_cstr);
+
+    // The pane may have closed while the dialog was up.
+    var alive = false;
+    for (ctx.win.panes.items) |p| {
+        if (p == ctx.pane) {
+            alive = true;
+            break;
+        }
+    }
+    if (!alive) return;
+    const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr)));
+    ctx.pane.terminal.startUpload(&[_][]const u8{path});
+}
+
+/// Float a transient toast over the grid (transfer finished / failed).
+pub fn showToast(self: *Window, text: []const u8) void {
+    var buf: [512]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{text}) catch return;
+    const toast = c.adw_toast_new(z.ptr);
+    c.adw_toast_set_timeout(toast, 4);
+    c.adw_toast_overlay_add_toast(self.toast_overlay, toast);
+}
+
+/// A pane's file transfer (upload or download) changed state: drive
+/// the tab progress ring and, on completion/failure, a toast. Mirrors
+/// onTermProgress' ownership.
+fn onTermTransfer(ctx: ?*anyopaque, pane: *Pane, ev: Terminal.TransferEvent) void {
+    const self = cast.userData(Window, ctx);
+    const page = tabPageForPane(self, pane);
+    const host = if (pane.terminal.remote) |r| (if (r.host) |h| h else "local") else "remote";
+    switch (ev.phase) {
+        .started => if (page) |p| self.setTabProgress(p, 3, 0), // indeterminate
+        .progress => if (page) |p| {
+            const pct: u8 = if (ev.total > 0)
+                @intCast(@min(@as(u64, 100), ev.sent * 100 / ev.total))
+            else
+                0;
+            self.setTabProgress(p, if (ev.total > 0) @as(u8, 1) else @as(u8, 3), pct);
+        },
+        .done => {
+            if (page) |p| self.setTabProgress(p, 0, 0);
+            var buf: [768]u8 = undefined;
+            // Upload dest is a remote path (show host); download dest is
+            // the local file it saved to.
+            const msg = switch (ev.dir) {
+                .upload => std.fmt.bufPrint(&buf, "Uploaded {s} → {s}:{s}", .{ ev.name, host, ev.dest }) catch return,
+                .download => std.fmt.bufPrint(&buf, "Downloaded {s} → {s}", .{ ev.name, ev.dest }) catch return,
+            };
+            showToast(self, msg);
+        },
+        .failed => {
+            if (page) |p| self.setTabProgress(p, 0, 0);
+            var buf: [768]u8 = undefined;
+            const verb = switch (ev.dir) {
+                .upload => "Upload",
+                .download => "Download",
+            };
+            const msg = std.fmt.bufPrint(&buf, "{s} of {s} failed: {s}", .{ verb, ev.name, ev.message }) catch return;
+            showToast(self, msg);
+        },
+    }
+}
 
 fn onShaderPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(ShaderPickCtx, user);

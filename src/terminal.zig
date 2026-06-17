@@ -109,6 +109,15 @@ pub const Terminal = struct {
     /// Fired when the mux daemon confirmed a session rename. The new
     /// name is already committed to `remote.session`.
     on_session_renamed: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
+    /// Fired as a file transfer (upload OR download) to/from a remote
+    /// session progresses. The GUI drives the tab progress ring + a
+    /// completion/failure toast.
+    on_transfer: ?*const fn (ctx: ?*anyopaque, ev: TransferEvent) void = null,
+    /// Fired with a remote directory listing (answer to `requestList`).
+    /// The remote-file-picker dialog consumes this. `listing_ctx` is its
+    /// own context, independent of `user_ctx`.
+    on_listing: ?*const fn (ctx: ?*anyopaque, listing: Listing) void = null,
+    listing_ctx: ?*anyopaque = null,
 
     /// Optional broadcast-typing filter. When set, every byte from
     /// USER input (keystrokes, paste, hyperlink launch) goes through
@@ -131,6 +140,43 @@ pub const Terminal = struct {
     /// socket is watched on the GLib main loop and decoded events
     /// are applied to the Screen directly.
     remote: ?*Remote = null,
+
+    /// One entry of a remote directory listing.
+    pub const DirEntry = struct { name: []const u8, is_dir: bool, size: u64 };
+
+    /// A remote directory listing (answer to `requestList`). Slices are
+    /// valid only for the duration of the `on_listing` callback — the
+    /// consumer must copy anything it keeps.
+    pub const Listing = struct {
+        /// Resolved (canonical) directory path that was listed.
+        path: []const u8,
+        entries: []const DirEntry,
+        /// Non-empty on failure (e.g. permission denied); entries empty.
+        err: []const u8 = "",
+        /// Listing was capped (very large directory).
+        truncated: bool = false,
+    };
+
+    pub const TransferPhase = enum { started, progress, done, failed };
+    pub const TransferDir = enum { upload, download };
+
+    /// One step of a file transfer's lifecycle, reported to the GUI.
+    pub const TransferEvent = struct {
+        dir: TransferDir,
+        phase: TransferPhase,
+        /// File's display name (basename).
+        name: []const u8,
+        /// The "other end" path: for an upload, the resolved remote
+        /// path; for a download, the local path it saved to. Empty
+        /// until known.
+        dest: []const u8 = "",
+        /// Bytes transferred so far.
+        sent: u64 = 0,
+        /// Total file size, 0 if unknown.
+        total: u64 = 0,
+        /// Human-readable reason on `.failed`.
+        message: []const u8 = "",
+    };
 
     /// Remote (mux) attachment state.
     pub const Remote = struct {
@@ -161,6 +207,18 @@ pub const Terminal = struct {
         napps: std.ArrayList(*NApp) = .empty,
         /// Window-stream channels (pixel capture remotes).
         wsapps: std.ArrayList(*WsApp) = .empty,
+        /// File uploads to this session. One streams at a time (`upload`);
+        /// the rest wait in `upload_queue` as owned local-path strings.
+        upload: ?*Upload = null,
+        upload_queue: std.ArrayList([]u8) = .empty,
+        /// Per-connection transfer-id counter (unique on our side, shared
+        /// by uploads and downloads so ids never collide).
+        upload_next_id: u32 = 1,
+        /// Active file download (one at a time), null = none.
+        download: ?*Download = null,
+        /// xfer id of the most recent directory-list request; a listing
+        /// with a different id is stale (we navigated away) and ignored.
+        list_xfer: u32 = 0,
 
         pub fn sendInput(self: *Remote, bytes: []const u8) void {
             if (self.closed) return;
@@ -182,6 +240,42 @@ pub const Terminal = struct {
         terminal: *Terminal,
         id: u32,
         host: *@import("winapp.zig").WsHost,
+    };
+
+    /// Chunk size for a streamed upload. Small enough that one
+    /// blocking socket write never stalls the GLib loop noticeably,
+    /// big enough to keep the pipe full.
+    const upload_chunk = 128 * 1024;
+
+    /// One in-flight file upload: a local file streamed to the daemon
+    /// as file_* frames. `buf` holds the 4-byte transfer-id header
+    /// followed by the read chunk, so each pump is a single send.
+    const Upload = struct {
+        terminal: *Terminal,
+        xfer: u32,
+        /// Local source fd (O_RDONLY), -1 once finished.
+        fd: c_int,
+        name: []u8, // basename, owned (display)
+        dest: ?[]u8 = null, // remote path once known, owned
+        size: u64 = 0,
+        sent: u64 = 0, // bytes handed to the socket
+        acked: u64 = 0, // bytes the daemon confirmed written
+        idle_id: c_uint = 0, // GLib idle pump, 0 = not armed
+        eof_sent: bool = false,
+        buf: [4 + upload_chunk]u8 = undefined,
+    };
+
+    /// One in-flight file download: the daemon streams a remote file's
+    /// bytes (file_data frames) and we write them to a local file.
+    const Download = struct {
+        terminal: *Terminal,
+        xfer: u32,
+        /// Local destination fd (O_WRONLY), -1 until "ready" / once done.
+        fd: c_int = -1,
+        name: []u8, // remote basename, owned (display)
+        local_path: ?[]u8 = null, // resolved local path, owned
+        size: u64 = 0, // expected total, from "ready"
+        recv: u64 = 0, // bytes written locally
     };
 
     /// Attach to an existing sketerm-mux session. `conn` must have
@@ -406,6 +500,9 @@ pub const Terminal = struct {
                     remote.pending_rename = null;
                 }
             },
+            .file_reply => self.handleFileReply(frame.payload),
+            .file_listing => self.handleFileListing(frame.payload),
+            .file_data => self.downloadData(frame.payload),
             .chan_open => self.chanOpen(frame.payload),
             .chan_data => self.chanData(frame.payload),
             .chan_close => {
@@ -446,6 +543,8 @@ pub const Terminal = struct {
         if (remote.closed) return;
         remote.closed = true;
         remote.watch_id = 0; // we return 0 from the cb; source removed
+        self.cancelUploads();
+        self.cancelDownload();
         self.destroyAllChans();
         if (crashed) {
             // Prefer the GUI's crashed-tab overlay (sad face + recover button);
@@ -504,6 +603,402 @@ pub const Terminal = struct {
             .winstream => self.wsappOpen(open.id),
             else => self.sendChanClose(open.id),
         }
+    }
+
+    // ── File upload (file_* frames) ──────────────────────────────
+    // Stream local files to the daemon, which writes them into the
+    // remote session's working directory. One transfer streams at a
+    // time; the rest wait in remote.upload_queue.
+
+    /// Queue local files for upload to this remote session. No-op on a
+    /// local (non-remote) or closed terminal. Paths are copied.
+    pub fn startUpload(self: *Terminal, paths: []const []const u8) void {
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        for (paths) |p| {
+            if (p.len == 0) continue;
+            const owned = self.allocator.dupe(u8, p) catch continue;
+            remote.upload_queue.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+            };
+        }
+        self.kickUploadQueue();
+    }
+
+    fn kickUploadQueue(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        while (remote.upload == null and remote.upload_queue.items.len > 0) {
+            const path = remote.upload_queue.orderedRemove(0);
+            defer self.allocator.free(path);
+            self.beginUpload(path);
+        }
+    }
+
+    fn beginUpload(self: *Terminal, path: []const u8) void {
+        const remote = self.remote orelse return;
+        const base = std.fs.path.basename(path);
+        var zbuf: [4096]u8 = undefined;
+        const zpath = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch {
+            self.emitUploadFail(base, "path too long");
+            return;
+        };
+        const fd = c.open(zpath.ptr, c.O_RDONLY, @as(c_uint, 0));
+        if (fd < 0) {
+            self.emitUploadFail(base, "cannot open file");
+            return;
+        }
+        var st: c.struct_stat = undefined;
+        var size: u64 = 0;
+        if (c.fstat(fd, &st) == 0) {
+            if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
+                _ = c.close(fd);
+                self.emitUploadFail(base, "directories can't be uploaded");
+                return;
+            }
+            if (st.st_size > 0) size = @intCast(st.st_size);
+        }
+        const name = self.allocator.dupe(u8, base) catch {
+            _ = c.close(fd);
+            return;
+        };
+        const up = self.allocator.create(Upload) catch {
+            _ = c.close(fd);
+            self.allocator.free(name);
+            return;
+        };
+        up.* = .{ .terminal = self, .xfer = remote.upload_next_id, .fd = fd, .name = name, .size = size };
+        remote.upload_next_id += 1;
+        remote.upload = up;
+        // Ask the daemon to create the destination; we stream on "ready".
+        remote.conn.sendJson(.file_open, .{ .xfer = up.xfer, .name = base, .size = size }) catch {
+            self.finishUpload(.failed, "connection lost");
+            return;
+        };
+        self.emitUpload(.started, up, "");
+    }
+
+    /// GLib idle pump: send one chunk (or the closing frame) per tick,
+    /// yielding to the loop between chunks. Socket backpressure (the
+    /// blocking write in sendFrame) bounds how far we read ahead.
+    fn uploadPumpCb(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const up: *Upload = @ptrCast(@alignCast(user.?));
+        const self = up.terminal;
+        const remote = self.remote orelse {
+            up.idle_id = 0;
+            return 0; // G_SOURCE_REMOVE
+        };
+        if (remote.closed or remote.upload != up) {
+            up.idle_id = 0;
+            return 0; // G_SOURCE_REMOVE
+        }
+        const n = c.read(up.fd, up.buf[4..], upload_chunk);
+        if (n < 0) {
+            if (std.posix.errno(n) == .INTR) return 1; // G_SOURCE_CONTINUE
+            up.idle_id = 0;
+            self.finishUpload(.failed, "read error");
+            return 0; // G_SOURCE_REMOVE
+        }
+        if (n == 0) {
+            // EOF: send the close frame; the daemon answers "done".
+            up.idle_id = 0;
+            up.eof_sent = true;
+            var hdr: [4]u8 = undefined;
+            remote.conn.sendFrame(.file_close, mux_wire.putChanHeader(&hdr, up.xfer)) catch {
+                self.finishUpload(.failed, "connection lost");
+            };
+            return 0; // G_SOURCE_REMOVE
+        }
+        _ = mux_wire.putChanHeader(up.buf[0..4], up.xfer);
+        const len: usize = @intCast(n);
+        remote.conn.sendFrame(.file_data, up.buf[0 .. 4 + len]) catch {
+            up.idle_id = 0;
+            self.finishUpload(.failed, "connection lost");
+            return 0; // G_SOURCE_REMOVE
+        };
+        up.sent += len;
+        return 1; // G_SOURCE_CONTINUE
+    }
+
+    fn armUploadPump(self: *Terminal, up: *Upload) void {
+        _ = self;
+        if (up.idle_id != 0 or up.eof_sent) return;
+        up.idle_id = c.g_idle_add(@ptrCast(&uploadPumpCb), @ptrCast(up));
+    }
+
+    /// JSON shape of a daemon file_reply (upload acks + download status).
+    const FileReplyMsg = struct {
+        xfer: u32 = 0,
+        status: []const u8 = "",
+        written: u64 = 0,
+        path: []const u8 = "",
+        message: []const u8 = "",
+        size: u64 = 0,
+    };
+
+    /// Route a file_reply to the matching upload or download by xfer.
+    fn handleFileReply(self: *Terminal, payload: []const u8) void {
+        const remote = self.remote orelse return;
+        const parsed = std.json.parseFromSlice(FileReplyMsg, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const r = parsed.value;
+        if (remote.upload) |up| {
+            if (r.xfer == up.xfer) return self.uploadReply(up, r);
+        }
+        if (remote.download) |dl| {
+            if (r.xfer == dl.xfer) return self.downloadReply(dl, r);
+        }
+    }
+
+    fn uploadReply(self: *Terminal, up: *Upload, r: FileReplyMsg) void {
+        if (std.mem.eql(u8, r.status, "ready")) {
+            if (up.dest == null and r.path.len > 0) up.dest = self.allocator.dupe(u8, r.path) catch null;
+            self.armUploadPump(up);
+        } else if (std.mem.eql(u8, r.status, "progress")) {
+            up.acked = r.written;
+            self.emitUpload(.progress, up, "");
+        } else if (std.mem.eql(u8, r.status, "done")) {
+            up.acked = r.written;
+            if (up.dest == null and r.path.len > 0) up.dest = self.allocator.dupe(u8, r.path) catch null;
+            self.finishUpload(.done, "");
+        } else if (std.mem.eql(u8, r.status, "error")) {
+            self.finishUpload(.failed, if (r.message.len > 0) r.message else "upload failed");
+        }
+    }
+
+    /// Tear down the active upload, emit its terminal event, and start
+    /// the next queued one.
+    fn finishUpload(self: *Terminal, phase: TransferPhase, message: []const u8) void {
+        const remote = self.remote orelse return;
+        const up = remote.upload orelse return;
+        self.emitUpload(phase, up, message);
+        if (up.idle_id != 0) _ = c.g_source_remove(up.idle_id);
+        if (up.fd >= 0) _ = c.close(up.fd);
+        self.allocator.free(up.name);
+        if (up.dest) |d| self.allocator.free(d);
+        self.allocator.destroy(up);
+        remote.upload = null;
+        self.kickUploadQueue();
+    }
+
+    /// Cancel the active upload and drop the queue (terminal teardown /
+    /// connection loss). No events emitted — the pane is going away.
+    fn cancelUploads(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        if (remote.upload) |up| {
+            if (up.idle_id != 0) _ = c.g_source_remove(up.idle_id);
+            if (up.fd >= 0) _ = c.close(up.fd);
+            self.allocator.free(up.name);
+            if (up.dest) |d| self.allocator.free(d);
+            self.allocator.destroy(up);
+            remote.upload = null;
+        }
+        for (remote.upload_queue.items) |p| self.allocator.free(p);
+        remote.upload_queue.clearRetainingCapacity();
+    }
+
+    fn emitUpload(self: *Terminal, phase: TransferPhase, up: *Upload, message: []const u8) void {
+        const f = self.on_transfer orelse return;
+        f(self.user_ctx, .{
+            .dir = .upload,
+            .phase = phase,
+            .name = up.name,
+            .dest = if (up.dest) |d| d else "",
+            .sent = up.acked,
+            .total = up.size,
+            .message = message,
+        });
+    }
+
+    fn emitUploadFail(self: *Terminal, name: []const u8, message: []const u8) void {
+        const f = self.on_transfer orelse return;
+        f(self.user_ctx, .{ .dir = .upload, .phase = .failed, .name = name, .message = message });
+    }
+
+    // ── File download (file_get + reverse file_data) ─────────────
+
+    /// Request a remote file and stream it to the local Downloads dir.
+    /// `remote_path` may be absolute, relative to the session cwd, or a
+    /// file:// URI. One download runs at a time.
+    pub fn startDownload(self: *Terminal, remote_path: []const u8) void {
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        const path = stripFileUri(remote_path);
+        const base = std.fs.path.basename(path);
+        if (path.len == 0 or base.len == 0) return;
+        if (remote.download != null) {
+            self.emitTransferFail(.download, base, "a download is already in progress");
+            return;
+        }
+        const name = self.allocator.dupe(u8, base) catch return;
+        const dl = self.allocator.create(Download) catch {
+            self.allocator.free(name);
+            return;
+        };
+        dl.* = .{ .terminal = self, .xfer = remote.upload_next_id, .name = name };
+        remote.upload_next_id += 1;
+        remote.download = dl;
+        remote.conn.sendJson(.file_get, .{ .xfer = dl.xfer, .path = path }) catch {
+            self.finishDownload(.failed, "connection lost");
+            return;
+        };
+        self.emitDownload(.started, dl, "");
+    }
+
+    fn downloadReply(self: *Terminal, dl: *Download, r: FileReplyMsg) void {
+        if (std.mem.eql(u8, r.status, "ready")) {
+            dl.size = r.size;
+            const dest = self.openDownloadDest(dl.name) orelse {
+                self.finishDownload(.failed, "cannot create local file");
+                return;
+            };
+            dl.fd = dest.fd;
+            dl.local_path = dest.path;
+            // bytes now arrive as file_data frames (handled in downloadData)
+        } else if (std.mem.eql(u8, r.status, "done")) {
+            if (dl.fd >= 0) _ = c.fsync(dl.fd);
+            self.finishDownload(.done, "");
+        } else if (std.mem.eql(u8, r.status, "error")) {
+            self.finishDownload(.failed, if (r.message.len > 0) r.message else "download failed");
+        }
+    }
+
+    /// Reverse file_data ([u32 xfer | bytes]): write to the local file.
+    fn downloadData(self: *Terminal, payload: []const u8) void {
+        const remote = self.remote orelse return;
+        const xfer = mux_wire.decodeChanId(payload) orelse return;
+        const dl = remote.download orelse return;
+        if (xfer != dl.xfer or dl.fd < 0) return;
+        const bytes = payload[4..];
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = c.write(dl.fd, bytes.ptr + off, bytes.len - off);
+            if (n > 0) {
+                off += @intCast(n);
+                continue;
+            }
+            if (std.posix.errno(n) == .INTR) continue;
+            self.finishDownload(.failed, "local write failed");
+            return;
+        }
+        dl.recv += bytes.len;
+        self.emitDownload(.progress, dl, "");
+    }
+
+    fn finishDownload(self: *Terminal, phase: TransferPhase, message: []const u8) void {
+        const remote = self.remote orelse return;
+        const dl = remote.download orelse return;
+        self.emitDownload(phase, dl, message);
+        if (dl.fd >= 0) _ = c.close(dl.fd);
+        self.allocator.free(dl.name);
+        if (dl.local_path) |p| self.allocator.free(p);
+        self.allocator.destroy(dl);
+        remote.download = null;
+    }
+
+    fn cancelDownload(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        const dl = remote.download orelse return;
+        if (dl.fd >= 0) _ = c.close(dl.fd);
+        self.allocator.free(dl.name);
+        if (dl.local_path) |p| self.allocator.free(p);
+        self.allocator.destroy(dl);
+        remote.download = null;
+    }
+
+    fn emitDownload(self: *Terminal, phase: TransferPhase, dl: *Download, message: []const u8) void {
+        const f = self.on_transfer orelse return;
+        f(self.user_ctx, .{
+            .dir = .download,
+            .phase = phase,
+            .name = dl.name,
+            .dest = if (dl.local_path) |p| p else "",
+            .sent = dl.recv,
+            .total = dl.size,
+            .message = message,
+        });
+    }
+
+    fn emitTransferFail(self: *Terminal, dir: TransferDir, name: []const u8, message: []const u8) void {
+        const f = self.on_transfer orelse return;
+        f(self.user_ctx, .{ .dir = dir, .phase = .failed, .name = name, .message = message });
+    }
+
+    // ── Remote directory browse (file_list) ──────────────────────
+
+    /// Request a remote directory listing (empty path = the shell cwd).
+    /// The reply arrives via `on_listing`.
+    pub fn requestList(self: *Terminal, path: []const u8) void {
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        remote.list_xfer = remote.upload_next_id;
+        remote.upload_next_id += 1;
+        remote.conn.sendJson(.file_list, .{ .xfer = remote.list_xfer, .path = path }) catch {};
+    }
+
+    fn handleFileListing(self: *Terminal, payload: []const u8) void {
+        const remote = self.remote orelse return;
+        const f = self.on_listing orelse return;
+        const Msg = struct {
+            xfer: u32 = 0,
+            path: []const u8 = "",
+            entries: []const struct { name: []const u8 = "", dir: bool = false, size: u64 = 0 } = &.{},
+            @"error": []const u8 = "",
+            truncated: bool = false,
+        };
+        const parsed = std.json.parseFromSlice(Msg, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const m = parsed.value;
+        if (m.xfer != remote.list_xfer) return; // stale (navigated away)
+
+        // Repack into the public DirEntry shape (transient — valid only
+        // for the callback).
+        var entries = self.allocator.alloc(DirEntry, m.entries.len) catch return;
+        defer self.allocator.free(entries);
+        for (m.entries, 0..) |e, i| entries[i] = .{ .name = e.name, .is_dir = e.dir, .size = e.size };
+        f(self.listing_ctx, .{
+            .path = m.path,
+            .entries = entries,
+            .err = m.@"error",
+            .truncated = m.truncated,
+        });
+    }
+
+    /// "file://host/path" → "/path"; otherwise unchanged.
+    fn stripFileUri(p: []const u8) []const u8 {
+        const pfx = "file://";
+        if (!std.mem.startsWith(u8, p, pfx)) return p;
+        const after = p[pfx.len..];
+        const slash = std.mem.indexOfScalar(u8, after, '/') orelse return p;
+        return after[slash..];
+    }
+
+    /// Open a non-clobbering file named `name` in the user's Downloads
+    /// dir (or $HOME). Returns the open fd + owned absolute path.
+    fn openDownloadDest(self: *Terminal, name: []const u8) ?struct { fd: c_int, path: []u8 } {
+        const dir_c = c.g_get_user_special_dir(c.G_USER_DIRECTORY_DOWNLOAD) orelse c.g_get_home_dir();
+        if (dir_c == null) return null;
+        const dir = std.mem.span(@as([*:0]const u8, @ptrCast(dir_c)));
+        const dot = std.mem.lastIndexOfScalar(u8, name, '.');
+        const stem = if (dot) |d| (if (d == 0) name else name[0..d]) else name;
+        const ext = if (dot) |d| (if (d == 0) "" else name[d..]) else "";
+        var buf: [4096]u8 = undefined;
+        var n: u32 = 0;
+        while (n < 1000) : (n += 1) {
+            const path = if (n == 0)
+                std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return null
+            else
+                std.fmt.bufPrintZ(&buf, "{s}/{s} ({d}){s}", .{ dir, stem, n, ext }) catch return null;
+            const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o644));
+            if (fd >= 0) {
+                const owned = self.allocator.dupe(u8, path) catch {
+                    _ = c.close(fd);
+                    return null;
+                };
+                return .{ .fd = fd, .path = owned };
+            }
+            if (std.posix.errno(fd) != .EXIST) return null;
+        }
+        return null;
     }
 
     fn chanData(self: *Terminal, payload: []const u8) void {
@@ -905,6 +1400,9 @@ pub const Terminal = struct {
             self.drain.alive.store(false, .release);
             if (remote.watch_id != 0) _ = c.g_source_remove(remote.watch_id);
             if (remote.expire_timer != 0) _ = c.g_source_remove(remote.expire_timer);
+            self.cancelUploads();
+            self.cancelDownload();
+            remote.upload_queue.deinit(self.allocator);
             self.destroyAllChans();
             remote.napps.deinit(self.allocator);
             remote.wsapps.deinit(self.allocator);

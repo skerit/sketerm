@@ -360,6 +360,24 @@ path the local PTY worker uses.
   protocol is unchanged. `rudp.zig` is a pure state machine with
   injectable clock/emit — loss, replay, and tamper are unit-tested.
 
+**File transfer (proto v3).** Because the daemon *is* the session,
+moving a file is just streaming bytes over the mux connection.
+*Upload*: the GUI sends `file_open`/`file_data`/`file_close`, the daemon
+writes into the shell's working directory (`/proc/<pid>/cwd`), using
+only the basename (no traversal) and a non-clobber rename. *Download*:
+the GUI sends `file_get`, the daemon opens the file (regular files only)
+and streams it back over the SAME `file_data` frame the other way —
+paced by the client's write-buffer high-water mark (`pumpDownloads`,
+beside `pumpWinstreams`) so a huge file can't balloon memory. Both
+answer with `file_reply` (ready/progress/done/error). A third pair,
+`file_list`/`file_listing`, reads a remote directory (dirs-first,
+size-stamped) so the GUI can offer a **remote file picker** instead of
+making the user type a path. No shell help, no transport-specific code —
+works over local/SSH/UDP alike. The GUI drives upload from a
+drag-and-drop onto a remote pane or "Upload File…", and download from
+"Download File…" (which opens the `src/ui/remote_browser.zig` picker); a
+tab progress ring + `AdwToastOverlay` report both.
+
 **GUI side.** `Terminal.initRemote` builds a Terminal with no PTY
 and no worker thread: the connection fd is watched via
 `g_unix_fd_add` on the main loop, EVENTS frames apply directly to

@@ -537,6 +537,49 @@ pub fn fillSockaddrUn(addr: *c.struct_sockaddr_un, path: []const u8) error{BadPa
     @memcpy(addr.sun_path[0..path.len], path);
 }
 
+/// An in-flight file upload from a client. The client streams bytes
+/// (file_data frames); we write them straight into a file opened in
+/// the session shell's working directory. Lives only for the duration
+/// of one transfer — finalized by file_close or dropped with its
+/// client. `xfer` is the CLIENT's id (unique per client, not globally).
+const Upload = struct {
+    allocator: std.mem.Allocator,
+    client: *Client,
+    xfer: u32,
+    /// Open destination fd (O_WRONLY), or -1 once closed/aborted.
+    fd: c_int,
+    /// Bytes written so far — echoed back in file_reply for flow control.
+    written: u64 = 0,
+    /// Resolved absolute destination path (owned), reported to the client.
+    path: []u8,
+
+    fn deinit(self: *Upload) void {
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.allocator.free(self.path);
+        self.allocator.destroy(self);
+    }
+};
+
+/// An in-flight file download to a client. The daemon reads a file
+/// from the remote filesystem and streams it out as file_data frames
+/// (the reverse of Upload). Paced by `pumpDownloads` against the
+/// client's write-buffer high-water mark so a big file can't balloon
+/// memory. `xfer` is the CLIENT's id.
+const Download = struct {
+    allocator: std.mem.Allocator,
+    client: *Client,
+    xfer: u32,
+    /// Open source fd (O_RDONLY), or -1 once finished.
+    fd: c_int,
+    size: u64 = 0,
+    sent: u64 = 0,
+
+    fn deinit(self: *Download) void {
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.allocator.destroy(self);
+    }
+};
+
 pub const Daemon = struct {
     allocator: std.mem.Allocator,
     listen_fd: c_int,
@@ -545,6 +588,10 @@ pub const Daemon = struct {
     sessions: std.ArrayList(*Session) = .empty,
     clients: std.ArrayList(*Client) = .empty,
     channels: std.ArrayList(*Channel) = .empty,
+    /// In-flight file uploads (file_* frames), keyed by (client, xfer).
+    uploads: std.ArrayList(*Upload) = .empty,
+    /// In-flight file downloads (file_get), keyed by (client, xfer).
+    downloads: std.ArrayList(*Download) = .empty,
     next_chan_id: u32 = 1,
     /// Monotonic id for per-session Wayland socket paths (session
     /// names are user input — not path-safe).
@@ -599,6 +646,10 @@ pub const Daemon = struct {
     }
 
     pub fn deinit(self: *Daemon) void {
+        for (self.uploads.items) |u| u.deinit();
+        self.uploads.deinit(self.allocator);
+        for (self.downloads.items) |dl| dl.deinit();
+        self.downloads.deinit(self.allocator);
         for (self.channels.items) |ch| ch.deinit();
         self.channels.deinit(self.allocator);
         for (self.clients.items) |cl| cl.deinit();
@@ -839,6 +890,7 @@ pub const Daemon = struct {
         }
 
         self.pumpWinstreams();
+        self.pumpDownloads();
         // Worker: tell the broker our latest metadata (throttled).
         if (self.control_fd >= 0 and !self.is_broker) self.maybePushMeta();
         self.reap();
@@ -1241,6 +1293,11 @@ pub const Daemon = struct {
                 cl.queueJson(.ok, .{ .ok = true });
                 self.running = false;
             },
+            .file_open => self.handleFileOpen(cl, frame.payload),
+            .file_data => self.handleFileData(cl, frame.payload),
+            .file_close => self.handleFileClose(cl, frame.payload),
+            .file_get => self.handleFileGet(cl, frame.payload),
+            .file_list => self.handleFileList(cl, frame.payload),
             .chan_data => {
                 const id = wire.decodeChanId(frame.payload) orelse return;
                 const ch = self.findChannel(id) orelse return;
@@ -1271,6 +1328,452 @@ pub const Daemon = struct {
             if (ch.id == id) return ch;
         }
         return null;
+    }
+
+    // === File upload (file_* frames) ===========================
+    // The GUI streams a local file to the daemon, which writes it into
+    // the session shell's working directory — so "drag a file onto a
+    // remote pane" lands it on the remote box, over any transport.
+
+    /// Most concurrent uploads a single client may have open. Bounds
+    /// the open-fd + partial-file footprint of a misbehaving client.
+    const max_uploads_per_client = 8;
+
+    fn findUpload(self: *Daemon, cl: *Client, xfer: u32) ?*Upload {
+        for (self.uploads.items) |u| {
+            if (u.client == cl and u.xfer == xfer) return u;
+        }
+        return null;
+    }
+
+    fn fileReply(cl: *Client, xfer: u32, status: []const u8, written: u64, path: []const u8, message: []const u8) void {
+        cl.queueJson(.file_reply, .{
+            .xfer = xfer,
+            .status = status,
+            .written = written,
+            .path = path,
+            .message = message,
+        });
+    }
+
+    /// Remove an upload from the list and free it. `unlink_partial`
+    /// removes the on-disk file too (used on a write error — the
+    /// half-written file we created is ours to clean up).
+    fn dropUpload(self: *Daemon, up: *Upload, unlink_partial: bool) void {
+        if (unlink_partial) {
+            var z: [4096]u8 = undefined;
+            if (pathZ(&z, up.path)) |p| {
+                _ = c.unlink(p);
+            } else |_| {}
+        }
+        for (self.uploads.items, 0..) |item, i| {
+            if (item == up) {
+                _ = self.uploads.swapRemove(i);
+                break;
+            }
+        }
+        up.deinit();
+    }
+
+    /// The last path component of `name`, with any directory part
+    /// stripped — a client can't write outside the session cwd.
+    fn uploadBaseName(name: []const u8) []const u8 {
+        if (std.mem.lastIndexOfScalar(u8, name, '/')) |slash| return name[slash + 1 ..];
+        return name;
+    }
+
+    /// Open a fresh file named `base` in `cwd`, never clobbering an
+    /// existing one: on a name collision, insert " (N)" before the
+    /// extension ("notes.txt" → "notes (1).txt"). Writes the chosen
+    /// absolute path into `out` and returns it plus the open fd.
+    fn openUploadDest(cwd: []const u8, base: []const u8, out: *[4096]u8) !struct { fd: c_int, path: []const u8 } {
+        // Split "stem.ext" so the suffix lands before the extension.
+        const dot = std.mem.lastIndexOfScalar(u8, base, '.');
+        const stem = if (dot) |d| (if (d == 0) base else base[0..d]) else base;
+        const ext = if (dot) |d| (if (d == 0) "" else base[d..]) else "";
+
+        var n: u32 = 0;
+        while (n < 1000) : (n += 1) {
+            const path = if (n == 0)
+                std.fmt.bufPrintZ(out, "{s}/{s}", .{ cwd, base }) catch return error.NameTooLong
+            else
+                std.fmt.bufPrintZ(out, "{s}/{s} ({d}){s}", .{ cwd, stem, n, ext }) catch return error.NameTooLong;
+            const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o644));
+            if (fd >= 0) return .{ .fd = fd, .path = path };
+            if (std.posix.errno(fd) != .EXIST) return error.OpenFailed;
+        }
+        return error.OpenFailed;
+    }
+
+    fn handleFileOpen(self: *Daemon, cl: *Client, payload: []const u8) void {
+        const Req = struct { xfer: u32 = 0, name: []const u8 = "", size: u64 = 0 };
+        const parsed = std.json.parseFromSlice(Req, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch {
+            cl.queueErr("bad file_open");
+            return;
+        };
+        defer parsed.deinit();
+        const xfer = parsed.value.xfer;
+
+        const s = cl.attached orelse {
+            fileReply(cl, xfer, "error", 0, "", "not attached to a session");
+            return;
+        };
+        if (self.findUpload(cl, xfer) != null) {
+            fileReply(cl, xfer, "error", 0, "", "duplicate transfer id");
+            return;
+        }
+        var n_for_client: usize = 0;
+        for (self.uploads.items) |u| {
+            if (u.client == cl) n_for_client += 1;
+        }
+        if (n_for_client >= max_uploads_per_client) {
+            fileReply(cl, xfer, "error", 0, "", "too many concurrent uploads");
+            return;
+        }
+
+        const base = uploadBaseName(parsed.value.name);
+        if (base.len == 0 or base.len > 200 or
+            std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..") or
+            std.mem.indexOfScalar(u8, base, 0) != null)
+        {
+            fileReply(cl, xfer, "error", 0, "", "invalid file name");
+            return;
+        }
+
+        var cwd_buf: [4096]u8 = undefined;
+        const cwd = cwdOfPid(s.pty.child_pid, &cwd_buf) orelse {
+            fileReply(cl, xfer, "error", 0, "", "cannot determine session directory");
+            return;
+        };
+
+        var path_buf: [4096]u8 = undefined;
+        const dest = openUploadDest(cwd, base, &path_buf) catch {
+            fileReply(cl, xfer, "error", 0, "", "cannot create destination file");
+            return;
+        };
+
+        const up = self.allocator.create(Upload) catch {
+            _ = c.close(dest.fd);
+            cl.queueErr("oom");
+            return;
+        };
+        const owned_path = self.allocator.dupe(u8, dest.path) catch {
+            _ = c.close(dest.fd);
+            self.allocator.destroy(up);
+            cl.queueErr("oom");
+            return;
+        };
+        up.* = .{ .allocator = self.allocator, .client = cl, .xfer = xfer, .fd = dest.fd, .path = owned_path };
+        self.uploads.append(self.allocator, up) catch {
+            up.deinit();
+            cl.queueErr("oom");
+            return;
+        };
+        // "ready" greenlights the client to start streaming; the path
+        // is the real (possibly de-clobbered) name the file landed under.
+        fileReply(cl, xfer, "ready", 0, owned_path, "");
+    }
+
+    fn handleFileData(self: *Daemon, cl: *Client, payload: []const u8) void {
+        const xfer = wire.decodeChanId(payload) orelse return;
+        const up = self.findUpload(cl, xfer) orelse return; // aborted/unknown
+        const bytes = payload[4..];
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = c.write(up.fd, bytes.ptr + off, bytes.len - off);
+            if (n > 0) {
+                off += @intCast(n);
+                continue;
+            }
+            if (std.posix.errno(n) == .INTR) continue;
+            fileReply(cl, xfer, "error", up.written, up.path, "write failed");
+            self.dropUpload(up, true);
+            return;
+        }
+        up.written += bytes.len;
+        // Per-chunk ack: the client gates how much it keeps in flight
+        // on the gap between bytes sent and bytes acked.
+        fileReply(cl, xfer, "progress", up.written, "", "");
+    }
+
+    fn handleFileClose(self: *Daemon, cl: *Client, payload: []const u8) void {
+        const xfer = wire.decodeChanId(payload) orelse return;
+        const up = self.findUpload(cl, xfer) orelse return;
+        _ = c.fsync(up.fd);
+        _ = c.close(up.fd);
+        up.fd = -1;
+        fileReply(cl, xfer, "done", up.written, up.path, "");
+        self.dropUpload(up, false);
+    }
+
+    // === File download (file_get + reverse file_data) ==========
+    // The reverse of upload: the daemon reads a file from the remote
+    // filesystem and streams it to the requesting client.
+
+    const max_downloads_per_client = 4;
+
+    fn dropDownload(self: *Daemon, dl: *Download) void {
+        for (self.downloads.items, 0..) |item, i| {
+            if (item == dl) {
+                _ = self.downloads.swapRemove(i);
+                break;
+            }
+        }
+        dl.deinit();
+    }
+
+    fn handleFileGet(self: *Daemon, cl: *Client, payload: []const u8) void {
+        const Req = struct { xfer: u32 = 0, path: []const u8 = "" };
+        const parsed = std.json.parseFromSlice(Req, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch {
+            cl.queueErr("bad file_get");
+            return;
+        };
+        defer parsed.deinit();
+        const xfer = parsed.value.xfer;
+
+        const s = cl.attached orelse {
+            fileReply(cl, xfer, "error", 0, "", "not attached to a session");
+            return;
+        };
+        var n_for_client: usize = 0;
+        for (self.downloads.items) |dl| {
+            if (dl.client == cl) n_for_client += 1;
+        }
+        if (n_for_client >= max_downloads_per_client) {
+            fileReply(cl, xfer, "error", 0, "", "too many concurrent downloads");
+            return;
+        }
+
+        const req_path = parsed.value.path;
+        if (req_path.len == 0 or std.mem.indexOfScalar(u8, req_path, 0) != null) {
+            fileReply(cl, xfer, "error", 0, "", "invalid path");
+            return;
+        }
+
+        // Resolve: absolute as-is, otherwise relative to the shell cwd.
+        // The user already has shell access to this session, so reading
+        // any file they can read is within their existing privilege.
+        var abs_buf: [4096]u8 = undefined;
+        const abs = blk: {
+            if (req_path[0] == '/') break :blk std.fmt.bufPrintZ(&abs_buf, "{s}", .{req_path}) catch {
+                fileReply(cl, xfer, "error", 0, "", "path too long");
+                return;
+            };
+            var cwd_buf: [4096]u8 = undefined;
+            const cwd = cwdOfPid(s.pty.child_pid, &cwd_buf) orelse {
+                fileReply(cl, xfer, "error", 0, "", "cannot determine session directory");
+                return;
+            };
+            break :blk std.fmt.bufPrintZ(&abs_buf, "{s}/{s}", .{ cwd, req_path }) catch {
+                fileReply(cl, xfer, "error", 0, "", "path too long");
+                return;
+            };
+        };
+
+        const fd = c.open(abs.ptr, c.O_RDONLY, @as(c_uint, 0));
+        if (fd < 0) {
+            fileReply(cl, xfer, "error", 0, "", "cannot open file");
+            return;
+        }
+        var st: c.struct_stat = undefined;
+        if (c.fstat(fd, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFREG) {
+            _ = c.close(fd);
+            fileReply(cl, xfer, "error", 0, "", "not a regular file");
+            return;
+        }
+        const size: u64 = if (st.st_size > 0) @intCast(st.st_size) else 0;
+
+        const dl = self.allocator.create(Download) catch {
+            _ = c.close(fd);
+            cl.queueErr("oom");
+            return;
+        };
+        dl.* = .{ .allocator = self.allocator, .client = cl, .xfer = xfer, .fd = fd, .size = size };
+        self.downloads.append(self.allocator, dl) catch {
+            dl.deinit();
+            cl.queueErr("oom");
+            return;
+        };
+        // "ready" carries the size + the basename the client saves under;
+        // pumpDownloads then streams the bytes as file_data.
+        cl.queueJson(.file_reply, .{
+            .xfer = xfer,
+            .status = "ready",
+            .written = @as(u64, 0),
+            .path = uploadBaseName(req_path),
+            .message = "",
+            .size = size,
+        });
+    }
+
+    // === Remote directory browse (file_list) ===================
+    // Lets the GUI offer a "remote file picker" without the user
+    // typing paths. Read-only; no state kept (a one-shot reply).
+
+    /// Cap on entries per listing — bounds the reply size for huge dirs.
+    const max_list_entries = 4096;
+
+    /// One directory entry on the wire (JSON-serialized in file_listing).
+    const ListEntry = struct { name: []const u8, dir: bool, size: u64 };
+
+    fn listingError(cl: *Client, xfer: u32, path: []const u8, msg: []const u8) void {
+        cl.queueJson(.file_listing, .{
+            .xfer = xfer,
+            .path = path,
+            .entries = &[_]ListEntry{},
+            .@"error" = msg,
+            .truncated = false,
+        });
+    }
+
+    fn handleFileList(self: *Daemon, cl: *Client, payload: []const u8) void {
+        const Req = struct { xfer: u32 = 0, path: []const u8 = "" };
+        const parsed = std.json.parseFromSlice(Req, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch {
+            cl.queueErr("bad file_list");
+            return;
+        };
+        defer parsed.deinit();
+        const xfer = parsed.value.xfer;
+
+        const s = cl.attached orelse {
+            listingError(cl, xfer, "", "not attached to a session");
+            return;
+        };
+
+        // Resolve the directory: empty → cwd, absolute as-is, else
+        // relative to cwd.
+        var dir_z: [4096]u8 = undefined;
+        const req_path = parsed.value.path;
+        const dirpath: [:0]const u8 = blk: {
+            if (req_path.len == 0 or req_path[0] != '/') {
+                var cwd_buf: [4096]u8 = undefined;
+                const cwd = cwdOfPid(s.pty.child_pid, &cwd_buf) orelse {
+                    listingError(cl, xfer, "", "cannot determine session directory");
+                    return;
+                };
+                if (req_path.len == 0) {
+                    break :blk std.fmt.bufPrintZ(&dir_z, "{s}", .{cwd}) catch {
+                        listingError(cl, xfer, "", "path too long");
+                        return;
+                    };
+                }
+                break :blk std.fmt.bufPrintZ(&dir_z, "{s}/{s}", .{ cwd, req_path }) catch {
+                    listingError(cl, xfer, "", "path too long");
+                    return;
+                };
+            }
+            break :blk std.fmt.bufPrintZ(&dir_z, "{s}", .{req_path}) catch {
+                listingError(cl, xfer, "", "path too long");
+                return;
+            };
+        };
+
+        // Canonicalize for the reported path (collapses .. and symlinks)
+        // so the GUI's address bar stays clean.
+        var real_buf: [4096]u8 = undefined;
+        const resolved: []const u8 = if (c.realpath(dirpath.ptr, &real_buf)) |r|
+            std.mem.span(@as([*:0]const u8, @ptrCast(r)))
+        else
+            dirpath;
+
+        const dir = c.opendir(dirpath.ptr) orelse {
+            listingError(cl, xfer, resolved, "cannot open directory");
+            return;
+        };
+        defer _ = c.closedir(dir);
+
+        const Entry = ListEntry;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var entries: std.ArrayList(Entry) = .empty;
+        var truncated = false;
+
+        while (c.readdir(dir)) |de| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            // JSON can't carry non-UTF-8; skip such names (very rare).
+            if (!std.unicode.utf8ValidateSlice(name)) continue;
+            if (entries.items.len >= max_list_entries) {
+                truncated = true;
+                break;
+            }
+            // Resolve type/size. d_type is a fast path; fall back to a
+            // stat (following symlinks so a link to a dir browses).
+            var is_dir = de.*.d_type == c.DT_DIR;
+            var size: u64 = 0;
+            if (de.*.d_type != c.DT_DIR) {
+                var full_z: [4096]u8 = undefined;
+                if (std.fmt.bufPrintZ(&full_z, "{s}/{s}", .{ dirpath, name })) |fp| {
+                    var st: c.struct_stat = undefined;
+                    if (c.stat(fp.ptr, &st) == 0) {
+                        is_dir = (st.st_mode & c.S_IFMT) == c.S_IFDIR;
+                        if (!is_dir and st.st_size > 0) size = @intCast(st.st_size);
+                    }
+                } else |_| {}
+            }
+            const owned = arena.dupe(u8, name) catch continue;
+            entries.append(arena, .{ .name = owned, .dir = is_dir, .size = size }) catch break;
+        }
+
+        // Directories first, then case-insensitive by name.
+        std.mem.sort(Entry, entries.items, {}, struct {
+            fn lt(_: void, a: Entry, b: Entry) bool {
+                if (a.dir != b.dir) return a.dir;
+                return std.ascii.lessThanIgnoreCase(a.name, b.name);
+            }
+        }.lt);
+
+        cl.queueJson(.file_listing, .{
+            .xfer = xfer,
+            .path = resolved,
+            .entries = entries.items,
+            .@"error" = "",
+            .truncated = truncated,
+        });
+    }
+
+    /// Stream each active download toward its client, bounded by the
+    /// client's write-buffer high-water mark (same backpressure rule as
+    /// pumpWinstreams). Fills up to the mark each tick, then waits for
+    /// the socket to drain (POLLOUT re-wakes the loop).
+    fn pumpDownloads(self: *Daemon) void {
+        const watermark = 8 << 20;
+        const chunk = 256 * 1024;
+        var buf: [4 + chunk]u8 = undefined; // reused across downloads/chunks
+        var i: usize = 0;
+        while (i < self.downloads.items.len) {
+            const dl = self.downloads.items[i];
+            if (dl.client.dead) {
+                i += 1;
+                continue;
+            }
+            var done_or_dropped = false;
+            while (dl.client.wbuf.items.len < watermark) {
+                const n = c.read(dl.fd, buf[4..], chunk);
+                if (n < 0) {
+                    if (std.posix.errno(n) == .INTR) continue;
+                    fileReply(dl.client, dl.xfer, "error", dl.sent, "", "read failed");
+                    self.dropDownload(dl);
+                    done_or_dropped = true;
+                    break;
+                }
+                if (n == 0) {
+                    fileReply(dl.client, dl.xfer, "done", dl.sent, "", "");
+                    self.dropDownload(dl);
+                    done_or_dropped = true;
+                    break;
+                }
+                _ = wire.putChanHeader(buf[0..4], dl.xfer);
+                const len: usize = @intCast(n);
+                dl.client.queueFrame(.file_data, buf[0 .. 4 + len]);
+                dl.sent += len;
+            }
+            // dropDownload swap-removed index i — re-check it; otherwise
+            // advance past the still-streaming download.
+            if (!done_or_dropped) i += 1;
+        }
     }
 
     /// A Wayland app connected to the session's hub: tunnel it to an
@@ -2674,6 +3177,25 @@ pub const Daemon = struct {
             if (ch.client.dead) ch.dead = true;
         }
         self.dropDeadChannels();
+        // A dying client abandons its uploads: close the partial file
+        // (it stays on disk under its chosen name — no auto-delete; a
+        // half-written upload is the user's to discard).
+        {
+            var i: usize = 0;
+            while (i < self.uploads.items.len) {
+                if (self.uploads.items[i].client.dead) {
+                    self.uploads.swapRemove(i).deinit();
+                } else i += 1;
+            }
+        }
+        {
+            var i: usize = 0;
+            while (i < self.downloads.items.len) {
+                if (self.downloads.items[i].client.dead) {
+                    self.downloads.swapRemove(i).deinit();
+                } else i += 1;
+            }
+        }
         var i: usize = 0;
         while (i < self.clients.items.len) {
             const cl = self.clients.items[i];
