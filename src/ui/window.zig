@@ -1672,6 +1672,18 @@ pub const Window = struct {
 
     const SiWire = struct { kind: []const u8, script: []const u8, shim_dir: []const u8 };
 
+    /// Process-global counter for daemon session names. MUST NOT be per-window:
+    /// two windows in one process (e.g. palette "Load layout" opens a new
+    /// window) share the same pid, so a per-window counter mints colliding
+    /// `s<pid>-N` names and the daemon rejects the dupes ("session name already
+    /// exists" → DaemonError), which dropped most tabs on a multi-tab load.
+    /// pid + this counter is unique within and across GUI processes/restarts.
+    var session_seq: u64 = 0;
+    fn nextSessionName(buf: []u8) []const u8 {
+        session_seq += 1;
+        return std.fmt.bufPrint(buf, "s{d}-{d}", .{ c.getpid(), session_seq }) catch "s0";
+    }
+
     /// Everything needed to spawn one local pane through the daemon. Built by
     /// each call site (new-tab/split, editor/scrollback, layout restore).
     const DaemonSpawnSpec = struct {
@@ -1693,9 +1705,8 @@ pub const Window = struct {
     /// disables the predictor (the local socket hop is sub-ms, so speculative
     /// echo would only add flicker).
     fn daemonSpawnPane(self: *Window, spec: DaemonSpawnSpec) !*Pane {
-        self.tab_counter += 1;
         var name_buf: [64]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "s{d}-{d}", .{ c.getpid(), self.tab_counter }) catch "s0";
+        const name = nextSessionName(&name_buf);
         const pane_id = self.allocPaneId();
 
         const si_wire: ?SiWire = if (spec.si) |si| .{
@@ -3565,9 +3576,8 @@ pub const Window = struct {
     /// `sketerm mux` CLI running inside that pane.
     pub fn newDurableSession(self: *Window, host: ?[]const u8, takeover: ?*Pane) !void {
         var name_buf: [64]u8 = undefined;
-        // Unique-enough name: pid + monotonic counter.
-        self.tab_counter += 1;
-        const name = std.fmt.bufPrint(&name_buf, "s{d}-{d}", .{ c.getpid(), self.tab_counter }) catch "s0";
+        // Process-unique name (pid + global counter); see nextSessionName.
+        const name = nextSessionName(&name_buf);
 
         var conn = try self.muxConnect(host);
         {
