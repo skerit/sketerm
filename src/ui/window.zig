@@ -1775,6 +1775,8 @@ pub const Window = struct {
         pane.win_on_bell = onTermBell;
         pane.win_child_ctx = @ptrCast(self);
         pane.win_on_child_exit = onTermChildExit;
+        pane.win_crash_ctx = @ptrCast(self);
+        pane.win_on_crashed = onPaneCrashed;
         pane.win_cwd_ctx = @ptrCast(self);
         pane.win_on_cwd = onTermCwdChanged;
         pane.win_setprofile_ctx = @ptrCast(self);
@@ -3773,6 +3775,44 @@ pub const Window = struct {
         _ = c.gtk_widget_grab_focus(@ptrCast(fresh.area));
     }
 
+    const CrashBtnCtx = struct { allocator: std.mem.Allocator, window: *Window, pane: *Pane };
+
+    /// The pane's session died unexpectedly — replace the GL terminal with a
+    /// crashed-tab panel (sad face + "Start new session" button). The pane
+    /// stays so the crash is visible; the button spawns a fresh session into
+    /// the same slot (reusing the detach-to-shell swap).
+    fn onPaneCrashed(ctx: ?*anyopaque, pane: *Pane) void {
+        const self = cast.userData(Window, ctx);
+        const wrap = pane.widget();
+        // The GLArea sits inside a graphics-offload widget (black bg); hide
+        // that whole subtree, not just the GLArea, so the crash panel fills.
+        if (c.gtk_widget_get_parent(@ptrCast(pane.area))) |offload| {
+            c.gtk_widget_set_visible(offload, 0);
+        } else {
+            c.gtk_widget_set_visible(@ptrCast(pane.area), 0);
+        }
+        // Drop the per-pane titlebar too (if any): its stale session title
+        // above a "session crashed" panel reads as a contradiction.
+        if (pane.titlebar_box) |tb| c.gtk_widget_set_visible(tb, 0);
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 12) orelse return;
+        c.gtk_widget_set_hexpand(box, 1);
+        c.gtk_widget_set_vexpand(box, 1);
+        c.gtk_widget_set_valign(box, c.GTK_ALIGN_CENTER);
+        c.gtk_widget_set_halign(box, c.GTK_ALIGN_CENTER);
+        const face = c.gtk_label_new(null);
+        c.gtk_label_set_markup(@ptrCast(face), "<span size=\"xx-large\">:(</span>");
+        const msg = c.gtk_label_new("This session crashed.");
+        const btn = c.gtk_button_new_with_label("Start new session");
+        c.gtk_widget_set_halign(btn, c.GTK_ALIGN_CENTER);
+        const cctx = self.allocator.create(CrashBtnCtx) catch return;
+        cctx.* = .{ .allocator = self.allocator, .window = self, .pane = pane };
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onCrashRestartClicked), @ptrCast(cctx), @ptrCast(&freeCrashBtnCtx), c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(box), face);
+        c.gtk_box_append(@ptrCast(box), msg);
+        c.gtk_box_append(@ptrCast(box), btn);
+        c.gtk_box_append(@ptrCast(wrap), box);
+    }
+
     pub fn attachMux(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane) !void {
         var conn = conn_in;
         self.mux_attach_err_len = 0;
@@ -5709,6 +5749,19 @@ fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
 fn freePanedRatio(user: ?*anyopaque) callconv(.c) void {
     if (user) |u| {
         const ctx: *PanedRatioCtx = @ptrCast(@alignCast(u));
+        ctx.allocator.destroy(ctx);
+    }
+}
+
+fn onCrashRestartClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const cctx: *Window.CrashBtnCtx = @ptrCast(@alignCast(user.?));
+    // Reuse the detach-to-shell swap: spawn a fresh session into this slot.
+    cctx.window.detachPaneToShell(cctx.pane);
+}
+
+fn freeCrashBtnCtx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const ctx: *Window.CrashBtnCtx = @ptrCast(@alignCast(u));
         ctx.allocator.destroy(ctx);
     }
 }

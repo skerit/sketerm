@@ -47,6 +47,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const allocator = gpa_state.allocator();
 
     var sock_path: ?[]const u8 = null;
+    var broker_mode = false;
     const argv = init.args.vector;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -54,6 +55,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.eql(u8, a, "--socket") and i + 1 < argv.len) {
             i += 1;
             sock_path = std.mem.span(argv[i]);
+        } else if (std.mem.eql(u8, a, "--broker")) {
+            // Process-isolation mode: hold no sessions; fork one worker per
+            // session and hand client fds to workers (Firefox-style).
+            broker_mode = true;
         } else if (std.mem.eql(u8, a, "--proxy")) {
             return runProxy(allocator);
         } else if (std.mem.eql(u8, a, "--udp-listen")) {
@@ -93,6 +98,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         std.debug.print("sketerm-mux: bind {s} failed: {s}\n", .{ path, @errorName(err) });
         return 1;
     };
+    d.is_broker = broker_mode;
     defer d.deinit();
     g_daemon = d;
 
