@@ -16,6 +16,7 @@ const c = @import("../c.zig").c;
 const wire = @import("wire.zig");
 const wlwire = @import("../wlhost/wire.zig");
 const wltrack = @import("../wlhost/track.zig");
+const wlproto = @import("../wlhost/protocol.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
 const wlpixcodec = @import("../wlhost/pixcodec.zig");
 const build_options = @import("build_options");
@@ -87,6 +88,18 @@ pub const SpawnReq = struct {
     color_term: []const u8 = "",
     /// Spawn argv[0] as a login shell (leading `-`).
     login_shell: bool = false,
+    /// GUI-owned LOCAL session sharing the user's desktop: skip the
+    /// wlhost Wayland hub so child GUI apps talk to the real desktop
+    /// compositor directly (via `host_wayland_display`) instead of
+    /// sketerm's embedded one. Remote/durable sessions leave this
+    /// false and get the forwarding hub (which roams with the
+    /// session). Only the local ephemeral pane factory sets it.
+    local: bool = false,
+    /// The GUI's own $WAYLAND_DISPLAY, applied to the child when
+    /// `local` is set — the daemon's inherited value may be stale
+    /// (it outlives the GUI that started it) or absent. Empty leaves
+    /// the child to inherit the daemon's env (X11 / no Wayland).
+    host_wayland_display: []const u8 = "",
     /// Auto shell-integration (OSC 7/133 without rc edits). All paths are on
     /// the daemon host; the GUI only fills this for the LOCAL daemon, where
     /// the integration scripts exist. null = off.
@@ -2262,8 +2275,15 @@ pub const Daemon = struct {
                     const fl = c.fcntl(pfds[0], c.F_GETFL, @as(c_int, 0));
                     _ = c.fcntl(pfds[0], c.F_SETFL, fl | c.O_NONBLOCK);
 
+                    // `send` is opcode 1 on wl_data_source but opcode 0
+                    // on zwlr_data_control_source_v1 — pick by the
+                    // source object's tracked interface.
+                    const send_op: u16 = if (nv.tracker.objects.get(source)) |sif|
+                        (if (sif == &wlproto.zwlr_data_control_source_v1) 0 else 1)
+                    else
+                        1;
                     var mbuf: [256]u8 = undefined;
-                    var b = wlwire.Builder.init(&mbuf, source, 1); // send
+                    var b = wlwire.Builder.init(&mbuf, source, send_op); // send
                     b.putString(mime);
                     const msg = b.finish() catch {
                         _ = c.close(pfds[0]);
@@ -2700,7 +2720,9 @@ pub const Daemon = struct {
         // Window-stream backend (pixel capture): policy in winstreamGate.
         const ws_gate = winstreamGate(req, hosts_apps);
 
-        const want_wayland = !ws_gate.want and hosts_apps;
+        // A local GUI-owned session passes its apps through to the
+        // real desktop compositor — no embedded hub for it.
+        const want_wayland = !ws_gate.want and hosts_apps and !req.local;
         var hub: ?WaylandHub = if (want_wayland) self.setupWaylandHub() else null;
         errdefer if (hub) |h| {
             _ = c.close(h.fd);
@@ -2724,7 +2746,12 @@ pub const Daemon = struct {
         // WAYLAND_DISPLAY (= the hub's display socket).
         var wl_disp_z: ?[:0]u8 = null;
         defer if (wl_disp_z) |z| allocator.free(z);
-        if (hub) |h| wl_disp_z = try allocator.dupeZ(u8, h.display_path);
+        if (hub) |h| {
+            wl_disp_z = try allocator.dupeZ(u8, h.display_path);
+        } else if (req.local and req.host_wayland_display.len > 0) {
+            // Local passthrough: point the child at the host compositor.
+            wl_disp_z = try allocator.dupeZ(u8, req.host_wayland_display);
+        }
 
         // Isolated session: a private runtime dir (sibling of the wl
         // sockets) so single-instance apps can't coalesce across

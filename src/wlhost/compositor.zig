@@ -133,6 +133,10 @@ const globals = [_]Global{
     .{ .name = 5, .iface = &protocol.xdg_wm_base, .version = 2 },
     // v1 = selection only, no dnd action machinery.
     .{ .name = 6, .iface = &protocol.wl_data_device_manager, .version = 1 },
+    // Surface-less clipboard: wl-copy/wl-paste set/read the selection
+    // without a throwaway focus surface (no taskbar flash). v1 =
+    // selection only, no primary selection.
+    .{ .name = 12, .iface = &protocol.zwlr_data_control_manager_v1, .version = 1 },
     // Modern niceties many clients probe for. Viewporter is
     // accept-and-ignore at scale 1; cursor shapes reach the view.
     // No fractional-scale: clients use the integer wl_output.scale +
@@ -294,6 +298,10 @@ pub const Compositor = struct {
     /// (owned strings), bound data devices, server-created offers.
     data_sources: std.AutoHashMapUnmanaged(u32, std.ArrayList([]u8)) = .empty,
     data_devices: std.ArrayList(u32) = .empty,
+    /// Bound zwlr_data_control devices (surface-less clipboard). Kept
+    /// separate from data_devices because the wlr `selection` event
+    /// uses a different opcode and offers go to a different interface.
+    data_control_devices: std.ArrayList(u32) = .empty,
     /// Next server-allocated object id (data offers).
     next_server_id: u32 = 0xff000000,
     /// Bound input devices (a client may bind several of each).
@@ -348,6 +356,7 @@ pub const Compositor = struct {
         }
         self.data_sources.deinit(a);
         self.data_devices.deinit(a);
+        self.data_control_devices.deinit(a);
         self.pointers.deinit(a);
         self.keyboards.deinit(a);
         self.frame_scratch.deinit(a);
@@ -537,25 +546,37 @@ pub const Compositor = struct {
 
     /// View → client: announce the HOST clipboard to the app so it
     /// can paste: a fresh server-created data offer per call, sent
-    /// to every bound data device.
+    /// to every bound data device (both wl_data_device and the
+    /// surface-less wlr-data-control devices).
     pub fn offerSelection(self: *Compositor, mime: []const u8) Error!void {
-        for (self.data_devices.items) |dev| {
-            const id = self.next_server_id;
-            self.next_server_id += 1;
-            try self.objects.put(self.allocator, id, &protocol.wl_data_offer);
-            var buf: [16]u8 = undefined;
-            var b = wire.Builder.init(&buf, dev, 0); // data_offer(new_id)
-            b.putNewId(id);
-            try self.send(try b.finish());
-            var mbuf: [128]u8 = undefined;
-            var bm = wire.Builder.init(&mbuf, id, 0); // offer(mime)
-            bm.putString(mime);
-            try self.send(try bm.finish());
-            var sbuf: [16]u8 = undefined;
-            var bs = wire.Builder.init(&sbuf, dev, 5); // selection(offer)
-            bs.putObject(id);
-            try self.send(try bs.finish());
-        }
+        for (self.data_devices.items) |dev| try self.offerToDevice(dev, mime, false);
+        for (self.data_control_devices.items) |dev| try self.offerToDevice(dev, mime, true);
+    }
+
+    /// Emit data_offer → offer(mime) → selection(offer) toward one
+    /// device. The data_offer/offer opcodes match across the two
+    /// device families; only `selection` differs (wl_data_device op 5
+    /// vs zwlr_data_control_device_v1 op 1), as does the offer's
+    /// interface type so the client's later receive() dispatches.
+    fn offerToDevice(self: *Compositor, dev: u32, mime: []const u8, control: bool) Error!void {
+        const id = self.next_server_id;
+        self.next_server_id += 1;
+        try self.objects.put(self.allocator, id, if (control)
+            &protocol.zwlr_data_control_offer_v1
+        else
+            &protocol.wl_data_offer);
+        var buf: [16]u8 = undefined;
+        var b = wire.Builder.init(&buf, dev, 0); // data_offer(new_id)
+        b.putNewId(id);
+        try self.send(try b.finish());
+        var mbuf: [128]u8 = undefined;
+        var bm = wire.Builder.init(&mbuf, id, 0); // offer(mime)
+        bm.putString(mime);
+        try self.send(try bm.finish());
+        var sbuf: [16]u8 = undefined;
+        var bs = wire.Builder.init(&sbuf, dev, if (control) 1 else 5); // selection(offer)
+        bs.putObject(id);
+        try self.send(try bs.finish());
     }
 
     /// View → client: a click landed outside a grabbed popup —
@@ -1037,6 +1058,62 @@ pub const Compositor = struct {
             },
             2 => try self.destroyObject(hdr.object), // destroy
             else => {}, // finish/set_actions — dnd, ignored
+        } else if (iface == &protocol.zwlr_data_control_manager_v1) switch (hdr.opcode) {
+            0 => { // create_data_source
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.zwlr_data_control_source_v1);
+                try self.data_sources.put(self.allocator, id, .empty);
+            },
+            1 => { // get_data_device(id, seat)
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.zwlr_data_control_device_v1);
+                try self.data_control_devices.append(self.allocator, id);
+                // The protocol requires advertising the current
+                // selection right after the device is created — a
+                // data-control client (wl-paste) has no focus event to
+                // trigger offerSelection, so send it now.
+                try self.offerToDevice(id, "text/plain;charset=utf-8", true);
+            },
+            2 => try self.destroyObject(hdr.object), // destroy
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwlr_data_control_source_v1) switch (hdr.opcode) {
+            0 => { // offer(mime) — same store as wl_data_source
+                const mime = (try it.next()).?.string orelse return Error.Protocol;
+                const mimes = self.data_sources.getPtr(hdr.object) orelse return Error.Protocol;
+                const owned = try self.allocator.dupe(u8, mime);
+                errdefer self.allocator.free(owned);
+                try mimes.append(self.allocator, owned);
+            },
+            1 => { // destroy
+                if (self.data_sources.getPtr(hdr.object)) |mimes| {
+                    for (mimes.items) |m| self.allocator.free(m);
+                    mimes.deinit(self.allocator);
+                    _ = self.data_sources.remove(hdr.object);
+                }
+                try self.destroyObject(hdr.object);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwlr_data_control_device_v1) switch (hdr.opcode) {
+            0 => { // set_selection(?source) — no serial, unlike wl
+                const source = (try it.next()).?.object;
+                if (source != 0) {
+                    if (self.bestTextMime(source)) |mime| {
+                        if (self.view.clipboard_offer) |cb| cb(self.view.ctx, source, mime);
+                    }
+                }
+            },
+            1 => { // destroy
+                removeId(&self.data_control_devices, hdr.object);
+                try self.destroyObject(hdr.object);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwlr_data_control_offer_v1) switch (hdr.opcode) {
+            0 => { // receive(mime, fd) — same paste path as wl_data_offer
+                const mime = (try it.next()).?.string orelse return Error.Protocol;
+                if (self.view.clipboard_read) |cb| cb(self.view.ctx, mime);
+            },
+            1 => try self.destroyObject(hdr.object), // destroy
+            else => return Error.Protocol,
         } else if (iface == &protocol.xdg_wm_base) switch (hdr.opcode) {
             0 => try self.destroyObject(hdr.object), // destroy
             1 => { // create_positioner
@@ -2081,6 +2158,66 @@ test "clipboard: copy offer, fetch, paste offer, receive answer" {
         try t.expectEqual(pipe.Tag.clip_data, p.unit.tag);
         try t.expectEqualStrings("PASTED", p.unit.payload);
     }
+}
+
+test "wlr-data-control: surfaceless copy + paste, distinct opcodes" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [80]u8 = undefined;
+
+    { // registry(2) + bind manager(name 12) → 3
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 2, 0);
+        b1.putUint(12);
+        b1.putString("zwlr_data_control_manager_v1");
+        b1.putUint(1);
+        b1.putNewId(3);
+        try req(&comp, try b1.finish());
+    }
+    comp.clearOut(); // drop the registry globals; only events below matter
+    { // create_data_source(4) + offer + get_data_device(5, seat 0)
+        var b = wire.Builder.init(&buf, 3, 0); // create_data_source
+        b.putNewId(4);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 4, 0); // source.offer(mime)
+        b1.putString("text/plain;charset=utf-8");
+        try req(&comp, try b1.finish());
+        var b2 = wire.Builder.init(&buf, 3, 1); // get_data_device(id, seat)
+        b2.putNewId(5);
+        b2.putObject(0);
+        try req(&comp, try b2.finish());
+    }
+    // get_data_device must advertise the current selection right away
+    // (no focus event drives it for a surfaceless client): data_offer,
+    // offer(mime), selection — selection on op 1 (vs wl_data_device 5).
+    {
+        var evs: std.ArrayList([2]u32) = .empty;
+        defer evs.deinit(t.allocator);
+        try drainEvents(&comp, &evs);
+        try t.expectEqual(@as(usize, 3), evs.items.len);
+        try t.expectEqual([2]u32{ 5, 0 }, evs.items[0]); // data_offer
+        try t.expectEqual([2]u32{ 0xff000000, 0 }, evs.items[1]); // offer(mime)
+        try t.expectEqual([2]u32{ 5, 1 }, evs.items[2]); // selection (op 1)
+    }
+    { // device.set_selection(source 4) — op 0, no serial arg
+        var b = wire.Builder.init(&buf, 5, 0);
+        b.putObject(4);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(u32, 4), tv.clip_source);
+    try t.expectEqualStrings("text/plain;charset=utf-8", tv.clip_mime[0..tv.clip_mime_len]);
+
+    // The other direction: receive on the offer-on-bind object → read.
+    comp.clearOut();
+    {
+        var b = wire.Builder.init(&buf, 0xff000000, 0); // offer.receive (op 0)
+        b.putString("text/plain;charset=utf-8");
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.clip_reads);
 }
 
 test "popup lifecycle: positioner place, configure, frame, grab dismiss" {

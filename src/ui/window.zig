@@ -1727,6 +1727,14 @@ pub const Window = struct {
         var snap: Owned = undefined;
         {
             errdefer conn.deinit();
+            // Local GUI-owned pane: let its child GUI apps render on
+            // THIS desktop's compositor (no sketerm Wayland hub). Pass
+            // our own $WAYLAND_DISPLAY so the daemon points the child at
+            // it directly (its inherited value may be stale/absent).
+            const host_wl: []const u8 = if (c.getenv("WAYLAND_DISPLAY")) |w|
+                std.mem.span(w)
+            else
+                "";
             try conn.sendJson(.spawn, .{
                 .name = name,
                 .argv = spec.argv,
@@ -1739,6 +1747,8 @@ pub const Window = struct {
                 .color_term = spec.color_term,
                 .login_shell = spec.login_shell,
                 .shell_integration = si_wire,
+                .local = true,
+                .host_wayland_display = host_wl,
             });
             (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
             try conn.sendJson(.attach, .{ .name = name });

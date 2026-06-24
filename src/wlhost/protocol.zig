@@ -354,6 +354,66 @@ pub const wl_data_device_manager = Interface{
     },
 };
 
+// ─── wlr-data-control (surface-less clipboard) ──────────────────
+//
+// The headless clipboard path: a client sets/reads the selection
+// WITHOUT owning a surface or holding keyboard focus, so tools like
+// wl-copy/wl-paste don't flash a throwaway toplevel (taskbar entry)
+// just to grab focus. We advertise v1 (selection only; no primary
+// selection, which is the v2 addition). Mirrors the wl_data_*
+// family, with different opcodes for `selection`/`send`/`receive`.
+
+pub const zwlr_data_control_offer_v1 = Interface{
+    .name = "zwlr_data_control_offer_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "receive", .sig = "sh" },
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "offer", .sig = "s" },
+    },
+};
+
+pub const zwlr_data_control_source_v1 = Interface{
+    .name = "zwlr_data_control_source_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "offer", .sig = "s" },
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "send", .sig = "sh" },
+        .{ .name = "cancelled", .sig = "" },
+    },
+};
+
+pub const zwlr_data_control_device_v1 = Interface{
+    .name = "zwlr_data_control_device_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "set_selection", .sig = "?o" },
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        // Server-created offer object; tracker + client register it
+        // from this event (like wl_data_device.data_offer).
+        .{ .name = "data_offer", .sig = "n", .new_id_iface = &zwlr_data_control_offer_v1 },
+        .{ .name = "selection", .sig = "?o" },
+        .{ .name = "finished", .sig = "" },
+    },
+};
+
+pub const zwlr_data_control_manager_v1 = Interface{
+    .name = "zwlr_data_control_manager_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "create_data_source", .sig = "n", .new_id_iface = &zwlr_data_control_source_v1 },
+        .{ .name = "get_data_device", .sig = "no", .new_id_iface = &zwlr_data_control_device_v1 },
+        .{ .name = "destroy", .sig = "" },
+    },
+};
+
 // ─── modern niceties (cursor-shape / viewporter / fractional) ───
 
 pub const wp_cursor_shape_manager_v1 = Interface{
@@ -534,6 +594,8 @@ pub const all = [_]*const Interface{
     &wl_touch,       &wl_output,      &xdg_wm_base,    &xdg_positioner,
     &xdg_surface,    &xdg_toplevel,   &xdg_popup,      &wl_data_offer,
     &wl_data_source, &wl_data_device, &wl_data_device_manager,
+    &zwlr_data_control_offer_v1,       &zwlr_data_control_source_v1,
+    &zwlr_data_control_device_v1,      &zwlr_data_control_manager_v1,
     &wp_cursor_shape_manager_v1,      &wp_cursor_shape_device_v1,
     &wp_viewporter,  &wp_viewport,    &wp_fractional_scale_manager_v1,
     &wp_fractional_scale_v1,            &zxdg_decoration_manager_v1,
@@ -564,12 +626,13 @@ test "every 'n' signature names its interface (except registry.bind)" {
             if (iface == &wl_registry) continue;
             try t.expectEqual(has_n, msg.new_id_iface != null);
         }
-        // wl_data_device.data_offer is the lone server-created
-        // object; every other event creates nothing.
+        // data_offer (wl_data_device + the wlr-data-control device)
+        // is the only server-created object; every other event
+        // creates nothing.
         for (iface.events) |*msg| {
             const has_n = std.mem.indexOfScalar(u8, msg.sig, 'n') != null;
             try t.expectEqual(has_n, msg.new_id_iface != null);
-            if (has_n) try t.expectEqual(&wl_data_device, iface);
+            if (has_n) try t.expect(iface == &wl_data_device or iface == &zwlr_data_control_device_v1);
         }
     }
 }
