@@ -193,6 +193,10 @@ pub const Tracker = struct {
             return .{ .buffer_destroy = .{ .id = hdr.object } };
         if (iface == &protocol.wl_data_offer and hdr.opcode == 1)
             return .{ .clip_receive = .{ .offer = hdr.object } };
+        // wlr-data-control offer.receive (opcode 0) carries the paste
+        // fd just like wl_data_offer.receive.
+        if (iface == &protocol.zwlr_data_control_offer_v1 and hdr.opcode == 0)
+            return .{ .clip_receive = .{ .offer = hdr.object } };
         if (iface == &protocol.wl_surface) switch (hdr.opcode) {
             1 => { // attach
                 var it = wire.ArgIter.init(body, msg.sig);
@@ -511,6 +515,37 @@ test "protocol violations are errors" {
 
     const dup = enc(&buf, 1, 1, .{2}); // id 2 again
     try t.expectError(Error.IdInUse, tr.clientMessage(dup.hdr, dup.body));
+}
+
+test "wlr-data-control: objects register, offer.receive yields clip_receive" {
+    var tr = try Tracker.init(t.allocator);
+    defer tr.deinit();
+    var buf: [96]u8 = undefined;
+
+    // get_registry(2), bind manager(name 12) → 3
+    const gr = enc(&buf, 1, 1, .{2});
+    _ = try tr.clientMessage(gr.hdr, gr.body);
+    const bind = enc(&buf, 2, 0, .{ 12, @as([]const u8, "zwlr_data_control_manager_v1"), 1, 3 });
+    try t.expectEqual(Action.relay, try tr.clientMessage(bind.hdr, bind.body));
+    try t.expectEqual(&protocol.zwlr_data_control_manager_v1, tr.objects.get(3).?);
+
+    // create_data_source(4) [op 0], get_data_device(5, seat 0) [op 1]
+    const cds = enc(&buf, 3, 0, .{4});
+    _ = try tr.clientMessage(cds.hdr, cds.body);
+    try t.expectEqual(&protocol.zwlr_data_control_source_v1, tr.objects.get(4).?);
+    const gdd = enc(&buf, 3, 1, .{ 5, 0 });
+    _ = try tr.clientMessage(gdd.hdr, gdd.body);
+    try t.expectEqual(&protocol.zwlr_data_control_device_v1, tr.objects.get(5).?);
+
+    // Server emits device.data_offer(op 0) creating offer 0xff000000.
+    const off = enc(&buf, 5, 0, .{0xff000000});
+    try tr.serverMessage(off.hdr, off.body);
+    try t.expectEqual(&protocol.zwlr_data_control_offer_v1, tr.objects.get(0xff000000).?);
+
+    // offer.receive(op 0) carries the paste fd → daemon holds it.
+    const rcv = enc(&buf, 0xff000000, 0, .{@as([]const u8, "text/plain;charset=utf-8")});
+    const a = try tr.clientMessage(rcv.hdr, rcv.body);
+    try t.expectEqual(@as(u32, 0xff000000), a.clip_receive.offer);
 }
 
 test "server delete_id frees the object" {

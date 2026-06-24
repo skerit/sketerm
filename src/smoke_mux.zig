@@ -378,6 +378,167 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
         std.debug.print("smoke-mux: clipboard paste+copy round-trip ok\n", .{});
     }
 
+    // Surface-less clipboard (wlr-data-control): same daemon plumbing,
+    // but the `send`/`receive` opcodes differ from wl_data_device and
+    // the daemon must pick them by the source's tracked interface.
+    {
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, chan_id, .little);
+
+        // App binds zwlr_data_control_manager_v1 (obj 30) + device 31.
+        var b = wlwire.Builder.init(&mbuf, 2, 0); // registry.bind
+        b.putUint(12);
+        b.putString("zwlr_data_control_manager_v1");
+        b.putUint(1);
+        b.putNewId(30);
+        var m = b.finish() catch unreachable;
+        if (c.write(app_fd, m.ptr, m.len) != @as(isize, @intCast(m.len))) fail("dc bind write");
+        b = wlwire.Builder.init(&mbuf, 30, 1); // get_data_device(31, seat 0)
+        b.putNewId(31);
+        b.putObject(0);
+        m = b.finish() catch unreachable;
+        if (c.write(app_fd, m.ptr, m.len) != @as(isize, @intCast(m.len))) fail("dc dev write");
+
+        // Wait for the daemon to relay get_data_device (tracker learns 31).
+        {
+            var seen = false;
+            var dl: usize = 0;
+            while (!seen and dl < 200) : (dl += 1) {
+                const f = conn.recvFrame() catch fail("dc dev relay read");
+                defer f.deinit(allocator);
+                if (f.ftype != .chan_data) continue;
+                units_raw.clearRetainingCapacity();
+                units_raw.appendSlice(allocator, f.payload[4..]) catch fail("oom");
+                var upos: usize = 0;
+                while ((wlpipe.peelUnit(units_raw.items[upos..]) catch fail("dc unit")) != null) {
+                    const p = (wlpipe.peelUnit(units_raw.items[upos..]) catch unreachable).?;
+                    if (p.unit.tag == .wl_msg) {
+                        const h = (wlwire.parseHeader(p.unit.payload) catch fail("dc hdr")) orelse fail("dc hdr");
+                        if (h.object == 30 and h.opcode == 1) seen = true;
+                    }
+                    upos += p.consumed;
+                }
+            }
+            if (!seen) fail("dc get_data_device never relayed");
+        }
+
+        // GUI announces a data_offer (device 31, op 0) → offer 0xff000002.
+        var ub: std.ArrayList(u8) = .empty;
+        defer ub.deinit(allocator);
+        ub.appendSlice(allocator, &idb) catch fail("oom");
+        b = wlwire.Builder.init(&mbuf, 31, 0); // data_offer(new_id)
+        b.putNewId(0xff000002);
+        wlpipe.appendUnit(&ub, allocator, .wl_msg, b.finish() catch unreachable) catch fail("oom");
+        conn.sendFrame(.chan_data, ub.items) catch fail("dc offer send");
+
+        // App reads the event, then pastes: offer.receive(mime, fd) at OP 0.
+        var evb: [64]u8 = undefined;
+        if (c.read(app_fd, &evb, 12) != 12) fail("dc data_offer not delivered");
+        var pfds: [2]c_int = undefined;
+        if (c.pipe(&pfds) != 0) fail("dc paste pipe");
+        b = wlwire.Builder.init(&mbuf, 0xff000002, 0); // receive (op 0)
+        b.putString("text/plain;charset=utf-8");
+        sendWithFd(app_fd, b.finish() catch unreachable, pfds[1]) catch fail("dc receive sendmsg");
+        _ = c.close(pfds[1]);
+
+        // Daemon must relay the receive up + hold the fd; GUI answers.
+        var got_receive = false;
+        var dl2: usize = 0;
+        while (!got_receive and dl2 < 200) : (dl2 += 1) {
+            const f = conn.recvFrame() catch fail("dc clip stream read");
+            defer f.deinit(allocator);
+            if (f.ftype != .chan_data) continue;
+            units_raw.clearRetainingCapacity();
+            units_raw.appendSlice(allocator, f.payload[4..]) catch fail("oom");
+            var upos: usize = 0;
+            while ((wlpipe.peelUnit(units_raw.items[upos..]) catch fail("dc unit")) != null) {
+                const p = (wlpipe.peelUnit(units_raw.items[upos..]) catch unreachable).?;
+                if (p.unit.tag == .wl_msg) {
+                    const h = (wlwire.parseHeader(p.unit.payload) catch fail("dc hdr")) orelse fail("dc hdr");
+                    if (h.object == 0xff000002 and h.opcode == 0) got_receive = true;
+                }
+                upos += p.consumed;
+            }
+        }
+        if (!got_receive) fail("dc receive never relayed to the GUI");
+        var ub2: std.ArrayList(u8) = .empty;
+        defer ub2.deinit(allocator);
+        ub2.appendSlice(allocator, &idb) catch fail("oom");
+        wlpipe.appendUnit(&ub2, allocator, .clip_data, "DC-PASTE") catch fail("oom");
+        conn.sendFrame(.chan_data, ub2.items) catch fail("dc clip_data send");
+        var paste: [32]u8 = undefined;
+        const pn = c.read(pfds[0], &paste, paste.len);
+        if (pn != 8 or !std.mem.eql(u8, paste[0..8], "DC-PASTE")) fail("dc paste bytes wrong");
+        _ = c.close(pfds[0]);
+
+        // COPY: app creates a data-control source (obj 32); GUI fetches.
+        b = wlwire.Builder.init(&mbuf, 30, 0); // create_data_source(32)
+        b.putNewId(32);
+        m = b.finish() catch unreachable;
+        if (c.write(app_fd, m.ptr, m.len) != @as(isize, @intCast(m.len))) fail("dc src write");
+        // Wait for the daemon to relay create_data_source so its tracker
+        // knows obj 32 is a data-control source BEFORE clip_send arrives —
+        // otherwise it can't pick the op-0 `send` opcode (the whole point).
+        {
+            var seen = false;
+            var dl: usize = 0;
+            while (!seen and dl < 200) : (dl += 1) {
+                const f = conn.recvFrame() catch fail("dc src relay read");
+                defer f.deinit(allocator);
+                if (f.ftype != .chan_data) continue;
+                units_raw.clearRetainingCapacity();
+                units_raw.appendSlice(allocator, f.payload[4..]) catch fail("oom");
+                var upos: usize = 0;
+                while ((wlpipe.peelUnit(units_raw.items[upos..]) catch fail("dc unit")) != null) {
+                    const p = (wlpipe.peelUnit(units_raw.items[upos..]) catch unreachable).?;
+                    if (p.unit.tag == .wl_msg) {
+                        const h = (wlwire.parseHeader(p.unit.payload) catch fail("dc hdr")) orelse fail("dc hdr");
+                        if (h.object == 30 and h.opcode == 0) seen = true;
+                    }
+                    upos += p.consumed;
+                }
+            }
+            if (!seen) fail("dc create_data_source never relayed");
+        }
+        var ub3: std.ArrayList(u8) = .empty;
+        defer ub3.deinit(allocator);
+        ub3.appendSlice(allocator, &idb) catch fail("oom");
+        var sendp: std.ArrayList(u8) = .empty;
+        defer sendp.deinit(allocator);
+        var srcb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &srcb, 32, .little);
+        sendp.appendSlice(allocator, &srcb) catch fail("oom");
+        sendp.appendSlice(allocator, "text/plain;charset=utf-8") catch fail("oom");
+        wlpipe.appendUnit(&ub3, allocator, .clip_send, sendp.items) catch fail("oom");
+        conn.sendFrame(.chan_data, ub3.items) catch fail("dc clip_send send");
+
+        // The daemon must emit zwlr_data_control_source_v1.send at OP 0
+        // (wl_data_source.send is op 1) — the crux of the opcode fix.
+        const got = recvWithFd(app_fd) orelse fail("dc send event missing fd");
+        if (got.fd < 0) fail("dc send event missing fd");
+        if (got.obj != 32 or got.opcode != 0) fail("dc send wrong object/opcode (expected source 32 op 0)");
+        if (c.write(got.fd, "DC-COPY", 7) != 7) fail("dc copy write");
+        _ = c.close(got.fd);
+
+        var copy_ok = false;
+        dl2 = 0;
+        while (!copy_ok and dl2 < 200) : (dl2 += 1) {
+            const f = conn.recvFrame() catch fail("dc copy stream read");
+            defer f.deinit(allocator);
+            if (f.ftype != .chan_data) continue;
+            units_raw.clearRetainingCapacity();
+            units_raw.appendSlice(allocator, f.payload[4..]) catch fail("oom");
+            var upos: usize = 0;
+            while ((wlpipe.peelUnit(units_raw.items[upos..]) catch fail("dc unit")) != null) {
+                const p = (wlpipe.peelUnit(units_raw.items[upos..]) catch unreachable).?;
+                if (p.unit.tag == .clip_data and std.mem.eql(u8, p.unit.payload, "DC-COPY")) copy_ok = true;
+                upos += p.consumed;
+            }
+        }
+        if (!copy_ok) fail("dc copied bytes never came back up");
+        std.debug.print("smoke-mux: wlr-data-control surfaceless clipboard round-trip ok\n", .{});
+    }
+
     // GUI→app: an event unit must come out of the app socket verbatim.
     {
         var b = wlwire.Builder.init(&mbuf, 3, 0); // wl_shm.format(1)
@@ -725,7 +886,7 @@ fn commitNeedle() [8]u8 {
 
 /// recvmsg expecting one SCM_RIGHTS fd (the wl_data_source.send
 /// event from the daemon). fd = -1 when none was attached.
-fn recvWithFd(sock: c_int) ?struct { fd: c_int } {
+fn recvWithFd(sock: c_int) ?struct { fd: c_int, obj: u32 = 0, opcode: u16 = 0 } {
     var data: [256]u8 = undefined;
     var cbuf: [64]u8 align(@alignOf(c.struct_cmsghdr)) = undefined;
     var iov = c.struct_iovec{ .iov_base = &data, .iov_len = data.len };
@@ -736,6 +897,15 @@ fn recvWithFd(sock: c_int) ?struct { fd: c_int } {
     mh.msg_controllen = cbuf.len;
     const r = c.recvmsg(sock, &mh, 0);
     if (r <= 0) return null;
+    // Parse the message header so callers can assert object/opcode.
+    var obj: u32 = 0;
+    var opcode: u16 = 0;
+    if (r >= wlwire.header_size) {
+        if (wlwire.parseHeader(data[0..@intCast(r)]) catch null) |h| {
+            obj = h.object;
+            opcode = h.opcode;
+        }
+    }
     const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
     var off: usize = 0;
     const clen: usize = @intCast(mh.msg_controllen);
@@ -746,11 +916,11 @@ fn recvWithFd(sock: c_int) ?struct { fd: c_int } {
         if (hdr.cmsg_level == c.SOL_SOCKET and hdr.cmsg_type == c.SCM_RIGHTS) {
             var fd: c_int = undefined;
             @memcpy(std.mem.asBytes(&fd), cbuf[off + hdr_size ..][0..@sizeOf(c_int)]);
-            return .{ .fd = fd };
+            return .{ .fd = fd, .obj = obj, .opcode = opcode };
         }
         off += (cl + @sizeOf(usize) - 1) & ~@as(usize, @sizeOf(usize) - 1);
     }
-    return .{ .fd = -1 };
+    return .{ .fd = -1, .obj = obj, .opcode = opcode };
 }
 
 /// sendmsg with one SCM_RIGHTS fd attached (CMSG_* macros don't
