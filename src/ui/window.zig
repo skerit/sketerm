@@ -3733,12 +3733,34 @@ pub const Window = struct {
         return self.makeRemotePaneFromSnap(conn, spec.mux_session, host, snap.payload, null);
     }
 
+    /// Carry a pane's per-pane shader choice onto its in-place
+    /// replacement, so a mux takeover or a detach-to-shell doesn't
+    /// silently snap the shader back to the profile/global default.
+    /// Mirrors the layout save/restore precedence (preset, then an
+    /// explicit pick, then a sticky clear); `new` already had the
+    /// default applied by its config push, so this is an override.
+    fn transferPaneShader(self: *Window, old: *Pane, new: *Pane) void {
+        if (old.preset_name) |pn| {
+            if (self.applyShaderPresetByName(new, pn)) return;
+        }
+        if (old.custom_shader_user) {
+            if (old.custom_shader_path) |sp| {
+                _ = new.setCustomShader(sp, self.config.custom_shader_animation, true);
+                return;
+            }
+        }
+        if (old.shader_cleared) new.clearShader();
+    }
+
     /// Put `pane` into `old`'s slot — tree model and widget tree in
     /// the same function — then unlist `old` (its teardown is
     /// deferred past GTK's destroy chain). Shared by the mux takeover
     /// and the detach-to-local-shell path.
     fn swapPaneInPlace(self: *Window, old: *Pane, pane: *Pane) !*c.AdwTabPage {
         const page = tabPageForPane(self, old) orelse return error.PaneHasNoTab;
+        // Preserve the user's per-pane shader across the swap (old's
+        // Zig-side shader fields stay valid until the deferred unlist).
+        self.transferPaneShader(old, pane);
         // Mirror in the tree model: the new pane takes the old
         // leaf's slot in place.
         if (tabTreeOf(page)) |t| {
