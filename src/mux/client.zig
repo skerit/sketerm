@@ -7,6 +7,15 @@ const c = @import("../c.zig").c;
 const wire = @import("wire.zig");
 const daemon = @import("daemon.zig");
 
+/// Proto version advertised by the remote daemon's `welcome` the last
+/// time a handshake returned `error.MuxProtoMismatch`. The wire format
+/// is version-intolerant (parsed events + versioned snapshots), so a
+/// skew between this build and the remote `sketerm-mux` desyncs the
+/// stream — callers read this to tell the user which side is stale.
+/// Single-threaded (GUI main loop / blocking CLI), so a plain var is
+/// safe.
+pub var last_remote_proto: u32 = 0;
+
 /// Resolve the sketerm-mux binary: sibling of our own executable
 /// first (works for `zig build run` trees), then bare name ($PATH).
 pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
@@ -262,6 +271,8 @@ pub const Conn = struct {
             if (connectSshOnce(allocator, host)) |conn| {
                 return conn;
             } else |err| {
+                // A version skew won't heal on retry — surface it now.
+                if (err == error.MuxProtoMismatch) return err;
                 if (attempt + 1 >= 3) return err;
                 _ = c.usleep(400_000);
             }
@@ -317,7 +328,20 @@ pub const Conn = struct {
         conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video }) catch return error.SshTransportFailed;
         try waitReadable(conn.fd, 20_000);
         const w = conn.recvExpect(&.{.welcome}) catch return error.SshTransportFailed;
-        w.deinit(allocator);
+        defer w.deinit(allocator);
+        // Version-skew guard: the remote `sketerm-mux` is a different
+        // build that speaks another protocol. `list` (plain JSON) would
+        // still work, but `attach` ships a versioned snapshot the other
+        // side can't decode — so fail HERE with a clear, non-retryable
+        // error instead of desyncing the stream deep in the attach.
+        const Probe = struct { proto: u32 = 0 };
+        if (std.json.parseFromSlice(Probe, allocator, w.payload, .{ .ignore_unknown_fields = true })) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value.proto != @import("wire.zig").PROTO_VERSION) {
+                last_remote_proto = parsed.value.proto;
+                return error.MuxProtoMismatch;
+            }
+        } else |_| {}
         return conn;
     }
 

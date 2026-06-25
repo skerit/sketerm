@@ -3564,6 +3564,18 @@ pub const Window = struct {
 
     /// Connect to the mux daemon — local (spawning it if absent) or
     /// on an SSH host (`ssh <host> sketerm-mux --proxy`).
+    /// Human-readable reason for a mux version skew, naming both
+    /// sides so the user knows which `sketerm`/`sketerm-mux` to update.
+    fn muxProtoMismatchMsg(buf: []u8) []const u8 {
+        const mux_client = @import("../mux/client.zig");
+        const wire = @import("../mux/wire.zig");
+        return std.fmt.bufPrint(
+            buf,
+            "version mismatch: remote sketerm-mux speaks protocol {d}, this build needs {d}; update sketerm to the same version on both machines",
+            .{ mux_client.last_remote_proto, wire.PROTO_VERSION },
+        ) catch "version mismatch; update sketerm to the same version on both machines";
+    }
+
     fn muxConnect(self: *Window, host: ?[]const u8) !@import("../mux/client.zig").Conn {
         const mux_client = @import("../mux/client.zig");
         if (host) |h| {
@@ -4336,7 +4348,13 @@ pub const Window = struct {
                 self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane")
             else
                 null;
-            self.newDurableSession(req.host, takeover) catch return ipc_protocol.writeErr(out, allocator, "durable spawn failed (ssh/key auth?)");
+            self.newDurableSession(req.host, takeover) catch |err| {
+                if (err == error.MuxProtoMismatch) {
+                    var pm_buf: [192]u8 = undefined;
+                    return ipc_protocol.writeErr(out, allocator, muxProtoMismatchMsg(&pm_buf));
+                }
+                return ipc_protocol.writeErr(out, allocator, "durable spawn failed (ssh/key auth?)");
+            };
             try ipc_protocol.writeOk(out, allocator, "pane", self.next_pane_id - 1);
         } else if (eql(u8, req.cmd, "attach-session")) {
             const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "attach-session requires data (session name)");
@@ -4344,7 +4362,13 @@ pub const Window = struct {
                 self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane")
             else
                 null;
-            const conn = self.muxConnect(req.host) catch return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
+            const conn = self.muxConnect(req.host) catch |err| {
+                if (err == error.MuxProtoMismatch) {
+                    var pm_buf: [192]u8 = undefined;
+                    return ipc_protocol.writeErr(out, allocator, muxProtoMismatchMsg(&pm_buf));
+                }
+                return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
+            };
             self.attachMux(conn, name, req.host, takeover) catch |err| {
                 // Prefer the daemon's own reason ("no such session", …)
                 // over the bare error name.
