@@ -397,6 +397,12 @@ pub const Terminal = struct {
                 return 0;
             } orelse break;
             self.handleRemoteFrame(peeled.frame);
+            // A frame (e.g. .exit/.gone) may have run remoteClosed, which
+            // zeroes watch_id on the assumption this callback returns
+            // G_SOURCE_REMOVE. Stop touching `remote` and drop the source
+            // NOW — returning G_SOURCE_CONTINUE here would leave a live fd
+            // watch on a Terminal that detachPaneToShell is about to free.
+            if (remote.closed) return 0;
             const remaining = remote.conn.rbuf.items.len - peeled.consumed;
             std.mem.copyForwards(u8, remote.conn.rbuf.items[0..remaining], remote.conn.rbuf.items[peeled.consumed..]);
             remote.conn.rbuf.shrinkRetainingCapacity(remaining);
