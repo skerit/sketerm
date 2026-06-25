@@ -6119,3 +6119,23 @@ download it into the local Downloads dir.
   browser listing/navigation/Up/address-bar, and a real download landing
   byte-identical with its toast. All builds + tests + both smokes +
   smoke-e2e green; `sketerm-mux` still libc/libm only.
+
+## Fix: `sketerm mux <host>` attach failing with "no such pane"
+
+`SKETERM_PANE_ID` is baked into the shell env at PTY spawn (`pty.zig`),
+but the GUI reassigns pane ids from 1 on every launch — so after a GUI
+restart/reattach a surviving session's shell carries a stale id. The
+`attach-session` / `new-durable-tab` IPC handlers resolved that id with
+`paneById(req.pane) orelse <err "no such pane">`, hard-failing the
+attach. Since those commands' pane always comes from `SKETERM_PANE_ID`
+("the pane I'm in"), a stale id now falls back to the current pane
+(`paneById(null)` = focused/selected) instead of erroring. Reproduced
+(stale id → "no such pane", valid id → ok) and a smoke-e2e regression
+asserts a stale-id attach no longer returns "no such pane".
+
+Known latent issue (surfaced, not fixed): because ids reset to 1 each
+launch, a stale id can also *collide* with a different live pane and
+silently take it over. A real fix is to namespace pane ids per launch
+(e.g. random high bits, or a launch token in `SKETERM_PANE_ID`) so a
+stale id never resolves — but that makes `cli list` show large ids and
+could surprise scripts, so it's a design call.
