@@ -393,7 +393,20 @@ fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn 
                 return null;
             };
         }
-        return mux_client.Conn.connectSsh(allocator, h) catch {
+        return mux_client.Conn.connectSsh(allocator, h) catch |err| {
+            if (err == error.MuxProtoMismatch) {
+                _ = c.fprintf(
+                    platform.stderr(),
+                    "sketerm mux: version mismatch with %.*s\n" ++
+                        "  remote sketerm-mux speaks protocol %u, this build needs %u\n" ++
+                        "  update sketerm to the same version on both machines\n",
+                    @as(c_int, @intCast(h.len)),
+                    h.ptr,
+                    @as(c_uint, mux_client.last_remote_proto),
+                    @as(c_uint, @import("../mux/wire.zig").PROTO_VERSION),
+                );
+                return null;
+            }
             _ = c.fprintf(
                 platform.stderr(),
                 "sketerm mux: ssh transport to %.*s failed\n" ++
