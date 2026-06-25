@@ -125,7 +125,18 @@ pub fn main() u8 {
     if (std.mem.count(u8, list3, "\"id\":") != std.mem.count(u8, list2, "\"id\":"))
         return fail("close-pane wrong pane count");
 
-    // 6. unknown command must error.
+    // 6. A stale SKETERM_PANE_ID (the GUI restarted since the pane's
+    // shell was spawned, so its baked-in id no longer matches a live
+    // pane) must NOT fail an attach with "no such pane" — the takeover
+    // falls back to the current pane. Using a bogus session name keeps
+    // this non-destructive: attachMux fails at the snapshot step (after
+    // the pane resolution we're testing), for a reason that ISN'T
+    // "no such pane".
+    const stale = roundtrip(allocator, sock_path, "{\"cmd\":\"attach-session\",\"pane\":99999,\"data\":\"no-such-sess-e2e\"}\n") orelse return fail("stale-pane roundtrip");
+    defer allocator.free(stale);
+    if (std.mem.indexOf(u8, stale, "no such pane") != null) return fail("stale SKETERM_PANE_ID regressed to 'no such pane'");
+
+    // 7. unknown command must error.
     const bad = roundtrip(allocator, sock_path, "{\"cmd\":\"nope\"}\n") orelse return fail("bad-cmd roundtrip");
     defer allocator.free(bad);
     if (std.mem.indexOf(u8, bad, "\"ok\":false") == null) return fail("unknown cmd not rejected");

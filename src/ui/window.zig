@@ -4365,9 +4365,13 @@ pub const Window = struct {
         } else if (eql(u8, req.cmd, "new-durable-tab")) {
             // req.pane set = the CLI runs inside that pane (SKETERM_
             // PANE_ID): the session takes the pane over, tmux-style,
-            // instead of opening a tab.
+            // instead of opening a tab. SKETERM_PANE_ID is baked into the
+            // shell env at spawn, so it goes stale once the GUI restarts
+            // and reassigns pane ids — a stale id must NOT fail the
+            // takeover, it falls back to the current pane (the one the
+            // interactive command ran in).
             const takeover: ?*Pane = if (req.pane != null)
-                self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane")
+                (self.paneById(req.pane) orelse self.paneById(null))
             else
                 null;
             self.newDurableSession(req.host, takeover) catch |err| {
@@ -4380,8 +4384,10 @@ pub const Window = struct {
             try ipc_protocol.writeOk(out, allocator, "pane", self.next_pane_id - 1);
         } else if (eql(u8, req.cmd, "attach-session")) {
             const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "attach-session requires data (session name)");
+            // Stale SKETERM_PANE_ID (GUI restarted since spawn) falls back
+            // to the current pane rather than failing — see new-durable-tab.
             const takeover: ?*Pane = if (req.pane != null)
-                self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane")
+                (self.paneById(req.pane) orelse self.paneById(null))
             else
                 null;
             const conn = self.muxConnect(req.host) catch |err| {
