@@ -6139,3 +6139,38 @@ silently take it over. A real fix is to namespace pane ids per launch
 (e.g. random high bits, or a launch token in `SKETERM_PANE_ID`) so a
 stale id never resolves — but that makes `cli list` show large ids and
 could surprise scripts, so it's a design call.
+
+## Best fix: stable session-based pane identity (replaces the pane id)
+
+The real fix for the above. The fragility was never env vars themselves
+(tmux/kitty/iterm all use them); it was the VALUE: an ephemeral,
+GUI-client-side pane id baked into a daemon-side, long-lived shell env.
+The codebase already treats `(host, session-name)` as the durable pane
+identity (layout persistence keys on it), so "my pane" now resolves by
+the stable session name, which the daemon owns:
+
+- The daemon exports `SKETERM_SESSION=<name>` at PTY spawn (`pty.zig` /
+  `daemon.zig`) — no GUI plumbing, it owns the name and it lives exactly
+  as long as the shell, so it never goes stale across a GUI restart.
+- The IPC request gained a `session` field; the GUI's new `reqPane`
+  resolves session-name -> pane (live), falling back to the (stale-prone)
+  pane id, then the current pane. Every command's pane resolution and
+  both `sketerm mux` takeover commands go through it.
+- `sketerm cli --pane self` and `sketerm mux` send `$SKETERM_SESSION`
+  (pane id kept only as a fallback for an older GUI).
+
+Verified end-to-end (xvfb): `$SKETERM_SESSION` is exported; `--pane self`
+and a `sketerm mux` takeover both resolve the correct pane via session
+even with a bogus/stale pane id present. smoke-mux now asserts the
+daemon exports it. The pane-id collision concern above is gone: the
+session name is the identity, so a stale id is never consulted when a
+session match exists.
+
+## Verified: layout remembers `sketerm mux` connections
+
+This already worked and is now confirmed end-to-end. `paneSpec` saves
+`mux_session` + `mux_host` for non-ephemeral remote/durable panes;
+`restoreMuxPane` reattaches the session if it still exists, or recreates
+it under the same name if gone. Tested both branches under xvfb: a saved
+durable pane restored with its scrollback marker intact (reattach), and
+after killing the session, `--restore` recreated it as a working shell.
