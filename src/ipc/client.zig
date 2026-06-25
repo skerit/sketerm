@@ -258,14 +258,40 @@ pub fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
         // The mux daemon's socket lives in the same dir; it speaks a
         // different protocol and must never match GUI discovery.
         if (std.mem.eql(u8, name, "mux.sock")) continue;
+        const path = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_z, name }, 0) catch return null;
+        // A GUI crash (SIGSEGV) orphans its socket file — counting it
+        // would wrongly trip "multiple instances". Only a socket with a
+        // live listener is a real instance; reap the dead ones so the
+        // directory self-heals after a crash.
+        if (!socketAlive(path)) {
+            _ = c.unlink(path.ptr);
+            allocator.free(path);
+            continue;
+        }
         if (found != null) {
             allocator.free(found.?);
+            allocator.free(path);
             _ = c.fprintf(platform.stderr(), "sketerm cli: multiple instances; pass --socket\n");
             return null;
         }
-        found = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_z, name }, 0) catch return null;
+        found = path;
     }
     return found;
+}
+
+/// True when a Unix socket path has a listener accepting connections.
+/// A stale file from a crashed instance refuses the connect.
+fn socketAlive(path_z: [:0]const u8) bool {
+    const client = c.g_socket_client_new();
+    defer c.g_object_unref(client);
+    const addr = c.g_unix_socket_address_new(path_z.ptr);
+    defer c.g_object_unref(addr);
+    var gerr: [*c]c.GError = null;
+    const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
+    if (gerr != null) c.g_error_free(gerr);
+    if (conn == null) return false;
+    c.g_object_unref(conn);
+    return true;
 }
 
 fn talk(allocator: std.mem.Allocator, sock_path: [:0]u8, req: protocol.Request) u8 {
