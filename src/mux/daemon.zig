@@ -2784,6 +2784,10 @@ pub const Daemon = struct {
         // optional — empty/absent falls back to Pty.spawn's defaults.
         const sock_z: ?[:0]u8 = if (req.socket.len > 0) allocator.dupeZ(u8, req.socket) catch null else null;
         defer if (sock_z) |z| allocator.free(z);
+        // The daemon owns the session name, so it (not the GUI) exports the
+        // stable SKETERM_SESSION identity — no plumbing through the client.
+        const name_z: ?[:0]u8 = if (req.name.len > 0) allocator.dupeZ(u8, req.name) catch null else null;
+        defer if (name_z) |z| allocator.free(z);
         const term_z: ?[:0]u8 = if (req.term.len > 0) allocator.dupeZ(u8, req.term) catch null else null;
         defer if (term_z) |z| allocator.free(z);
         const cterm_z: ?[:0]u8 = if (req.color_term.len > 0) allocator.dupeZ(u8, req.color_term) catch null else null;
@@ -2813,6 +2817,7 @@ pub const Daemon = struct {
             .login_shell = req.login_shell,
             .pane_id = req.pane_id,
             .socket_path = if (sock_z) |z| z.ptr else null,
+            .session_name = if (name_z) |z| z.ptr else null,
             .shell_integration = shell_integration,
             .wayland_display = if (wl_disp_z) |z| z.ptr else null,
             .runtime_dir = if (rt_dir_z) |z| z.ptr else null,

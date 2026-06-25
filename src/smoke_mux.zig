@@ -1252,6 +1252,25 @@ pub fn main() u8 {
     }
     if (!seen) fail("marker never appeared via event stream");
 
+    // The daemon must export the STABLE session identity into the shell
+    // env — this is what `sketerm cli --pane self` / `sketerm mux` resolve
+    // "my pane" by (instead of the GUI's stale-prone pane id).
+    conn.sendFrame(.input, "printf 'SESCHK=[%s]\\n' \"$SKETERM_SESSION\"\n") catch fail("ses input");
+    deadline = 0;
+    var ses_ok = false;
+    while (deadline < 200) : (deadline += 1) {
+        const f = conn.recvFrame() catch fail("ses stream read");
+        defer f.deinit(allocator);
+        if (f.ftype == .events) mirror.applyEvents(f.payload) catch fail("ses events apply");
+        const txt = mirror.screenText() catch fail("ses extract");
+        defer allocator.free(txt);
+        if (std.mem.indexOf(u8, txt, "SESCHK=[smoke]") != null) {
+            ses_ok = true;
+            break;
+        }
+    }
+    if (!ses_ok) fail("SKETERM_SESSION not exported as the session name");
+
     // File upload (file_* frames) → daemon writes into the shell cwd.
     uploadStage(allocator, &conn, &mirror);
 

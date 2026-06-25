@@ -36,6 +36,11 @@ pub const SpawnOpts = struct {
     /// (SKETERM_PANE_ID / SKETERM_SOCKET). 0 / null = not exported.
     pane_id: u32 = 0,
     socket_path: ?[*:0]const u8 = null,
+    /// Stable session name exported as SKETERM_SESSION — the daemon owns
+    /// it and it lives as long as the shell, so unlike the GUI pane id it
+    /// never goes stale across a GUI restart/reattach. This is what
+    /// `sketerm cli --pane self` / `sketerm mux` resolve "my pane" by.
+    session_name: ?[*:0]const u8 = null,
     /// Auto shell-integration (OSC 7/133 marks without rc edits).
     /// null = off / unsupported shell.
     shell_integration: ?ShellIntegration = null,
@@ -168,6 +173,7 @@ pub const Pty = struct {
                 _ = c.setenv("SKETERM_PANE_ID", s.ptr, 1);
             } else |_| {}
         }
+        if (opts.session_name) |sn| _ = c.setenv("SKETERM_SESSION", sn, 1);
         if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1);
         if (opts.wayland_display) |wd| _ = c.setenv("WAYLAND_DISPLAY", wd, 1);
         // Isolated app session: give the child a private runtime dir

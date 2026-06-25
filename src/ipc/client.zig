@@ -80,10 +80,21 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         const a = args[i];
         if (std.mem.eql(u8, a, "--pane") and i + 1 < args.len) {
             i += 1;
-            req.pane = parsePaneArg(args[i]) orelse {
-                _ = c.fprintf(platform.stderr(), "sketerm cli: bad --pane value\n");
-                return 2;
-            };
+            if (std.mem.eql(u8, args[i], "self")) {
+                // Stable identity first (session name), pane id as a
+                // fallback for an older GUI that can't resolve sessions.
+                if (c.getenv("SKETERM_SESSION")) |env| req.session = std.mem.span(env);
+                if (c.getenv("SKETERM_PANE_ID")) |env| req.pane = std.fmt.parseInt(u32, std.mem.span(env), 10) catch null;
+                if (req.session == null and req.pane == null) {
+                    _ = c.fprintf(platform.stderr(), "sketerm cli: --pane self but not inside a sketerm pane\n");
+                    return 2;
+                }
+            } else {
+                req.pane = parsePaneArg(args[i]) orelse {
+                    _ = c.fprintf(platform.stderr(), "sketerm cli: bad --pane value\n");
+                    return 2;
+                };
+            }
         } else if (std.mem.eql(u8, a, "--tab") and i + 1 < args.len) {
             i += 1;
             req.tab = std.fmt.parseInt(u32, args[i], 10) catch {
@@ -146,7 +157,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             std.fmt.allocPrint(allocator, "{s}\r", .{text_raw}) catch return 1
         else
             text_raw;
-        return typeText(allocator, sock_path, req.pane, text, type_delay, type_jitter);
+        return typeText(allocator, sock_path, req.pane, req.session, text, type_delay, type_jitter);
     }
 
     return talk(allocator, sock_path, req);
@@ -155,7 +166,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
 /// Stream one send-text request per keystroke over a single
 /// connection, sleeping a randomized inter-key delay in between.
 /// Pacing lives client-side so a Ctrl-C stops the "typing" cold.
-fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, text: []const u8, delay: u32, jitter: u32) u8 {
+fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, session: ?[]const u8, text: []const u8, delay: u32, jitter: u32) u8 {
     defer allocator.free(sock_path);
     const humantype = @import("../util/humantype.zig");
 
@@ -198,7 +209,7 @@ fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, text: [
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
-        const line_req: protocol.Request = .{ .cmd = "send-text", .pane = pane, .data = chunk };
+        const line_req: protocol.Request = .{ .cmd = "send-text", .pane = pane, .session = session, .data = chunk };
         std.json.Stringify.value(line_req, .{}, &aw.writer) catch return 1;
         aw.writer.writeAll("\n") catch return 1;
         const line = aw.written();
@@ -231,12 +242,9 @@ fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, text: [
     return 0;
 }
 
-/// "--pane self" resolves via $SKETERM_PANE_ID.
+/// Numeric "--pane N". ("self" is handled in the arg loop, where it
+/// resolves to the stable session identity, not a pane number.)
 fn parsePaneArg(arg: []const u8) ?u32 {
-    if (std.mem.eql(u8, arg, "self")) {
-        const env = c.getenv("SKETERM_PANE_ID") orelse return null;
-        return std.fmt.parseInt(u32, std.mem.span(env), 10) catch null;
-    }
     return std.fmt.parseInt(u32, arg, 10) catch null;
 }
 
