@@ -3547,6 +3547,29 @@ pub const Window = struct {
         return null;
     }
 
+    /// The pane currently rendering the daemon session `name` — the
+    /// stable identity behind `$SKETERM_SESSION`. Local panes match a
+    /// local session (host == null); that's all a `--pane self` from a
+    /// local shell ever needs.
+    fn paneBySession(self: *Window, name: []const u8) ?*Pane {
+        if (name.len == 0) return null;
+        for (self.panes.items) |p| {
+            const r = p.terminal.remote orelse continue;
+            if (std.mem.eql(u8, r.session, name)) return p;
+        }
+        return null;
+    }
+
+    /// Resolve a request's target pane: prefer the stable session name,
+    /// fall back to the (possibly stale) pane id, then the current pane.
+    /// This is the one place "which pane" is decided for IPC commands.
+    fn reqPane(self: *Window, req: ipc_protocol.Request) ?*Pane {
+        if (req.session) |s| {
+            if (self.paneBySession(s)) |p| return p;
+        }
+        return self.paneById(req.pane);
+    }
+
     fn tabPageById(self: *Window, id_opt: ?u32) ?*c.AdwTabPage {
         if (id_opt) |id| {
             const n = c.adw_tab_view_get_n_pages(self.tab_view);
@@ -4286,14 +4309,14 @@ pub const Window = struct {
             try self.ipcList(out, allocator);
         } else if (eql(u8, req.cmd, "send-text")) {
             const data = req.data orelse return ipc_protocol.writeErr(out, allocator, "send-text requires data");
-            const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
             if (req.paste)
                 clipboard.pasteText(pane.terminal, data)
             else
                 pane.terminal.writeUserInput(data);
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (eql(u8, req.cmd, "get-text")) {
-            const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
             const screen = pane.terminal.screen;
             const text = if (req.scrollback > 0)
                 try screen.extractScrollback(allocator)
@@ -4323,7 +4346,7 @@ pub const Window = struct {
                 .pane = self.next_pane_id - 1,
             });
         } else if (eql(u8, req.cmd, "split")) {
-            const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
             _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
             const dir = req.direction orelse "h";
             const orient: c_uint = if (eql(u8, dir, "v"))
@@ -4335,8 +4358,8 @@ pub const Window = struct {
                 .pane = self.next_pane_id - 1,
             });
         } else if (eql(u8, req.cmd, "focus")) {
-            if (req.pane != null) {
-                const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            if (req.pane != null or req.session != null) {
+                const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
                 if (tabPageForPane(self, pane)) |page| c.adw_tab_view_set_selected_page(self.tab_view, page);
                 _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
                 try ipc_protocol.writeOk(out, allocator, null, {});
@@ -4348,30 +4371,28 @@ pub const Window = struct {
                 try ipc_protocol.writeErr(out, allocator, "focus requires pane or tab");
             }
         } else if (eql(u8, req.cmd, "close-pane")) {
-            const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
             self.closePane(pane);
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (eql(u8, req.cmd, "set-title")) {
             const text = req.title orelse req.data orelse return ipc_protocol.writeErr(out, allocator, "set-title requires title");
             var z_buf: [512:0]u8 = undefined;
             const z = std.fmt.bufPrintZ(&z_buf, "{s}", .{text}) catch return ipc_protocol.writeErr(out, allocator, "title too long");
-            const page = if (req.pane != null) pg: {
-                const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const page = if (req.pane != null or req.session != null) pg: {
+                const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
                 break :pg tabPageForPane(self, pane) orelse return ipc_protocol.writeErr(out, allocator, "pane has no tab");
             } else self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
             c.adw_tab_page_set_title(page, z.ptr);
             c.adw_tab_page_set_tooltip(page, z.ptr);
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (eql(u8, req.cmd, "new-durable-tab")) {
-            // req.pane set = the CLI runs inside that pane (SKETERM_
-            // PANE_ID): the session takes the pane over, tmux-style,
-            // instead of opening a tab. SKETERM_PANE_ID is baked into the
-            // shell env at spawn, so it goes stale once the GUI restarts
-            // and reassigns pane ids — a stale id must NOT fail the
-            // takeover, it falls back to the current pane (the one the
-            // interactive command ran in).
-            const takeover: ?*Pane = if (req.pane != null)
-                (self.paneById(req.pane) orelse self.paneById(null))
+            // A self-identity (session name preferred, pane id fallback) =
+            // the CLI ran inside a pane: take that pane over tmux-style.
+            // reqPane resolves session -> pane id -> current, so a stale id
+            // (GUI restarted since spawn) lands on the current pane instead
+            // of failing. No identity at all = open a fresh tab.
+            const takeover: ?*Pane = if (req.session != null or req.pane != null)
+                self.reqPane(req)
             else
                 null;
             self.newDurableSession(req.host, takeover) catch |err| {
@@ -4384,10 +4405,10 @@ pub const Window = struct {
             try ipc_protocol.writeOk(out, allocator, "pane", self.next_pane_id - 1);
         } else if (eql(u8, req.cmd, "attach-session")) {
             const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "attach-session requires data (session name)");
-            // Stale SKETERM_PANE_ID (GUI restarted since spawn) falls back
-            // to the current pane rather than failing — see new-durable-tab.
-            const takeover: ?*Pane = if (req.pane != null)
-                (self.paneById(req.pane) orelse self.paneById(null))
+            // Self-identity -> take over that pane (stale id falls back to
+            // the current pane); none -> new tab. See new-durable-tab.
+            const takeover: ?*Pane = if (req.session != null or req.pane != null)
+                self.reqPane(req)
             else
                 null;
             const conn = self.muxConnect(req.host) catch |err| {
@@ -4427,8 +4448,8 @@ pub const Window = struct {
             const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "action needs data=<name>");
             const action = @import("input.zig").actionFromName(name) orelse
                 return ipc_protocol.writeErr(out, allocator, "unknown action");
-            if (req.pane != null) {
-                const pane = self.paneById(req.pane) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            if (req.pane != null or req.session != null) {
+                const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
                 _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
             }
             dispatchAction(self, action);

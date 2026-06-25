@@ -460,10 +460,17 @@ pub fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const 
         const env = c.getenv("SKETERM_PANE_ID") orelse break :blk null;
         break :blk std.fmt.parseInt(u32, std.mem.span(@as([*:0]const u8, @ptrCast(env))), 10) catch null;
     };
+    // The stable identity: the daemon-owned session name, which the GUI
+    // prefers over the pane id (the latter goes stale across a restart).
+    const self_session: ?[]const u8 = blk: {
+        if (!use_pane) break :blk null;
+        const env = c.getenv("SKETERM_SESSION") orelse break :blk null;
+        break :blk std.mem.span(@as([*:0]const u8, @ptrCast(env)));
+    };
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    std.json.Stringify.value(.{ .cmd = cmd, .data = data, .host = host, .pane = self_pane }, .{}, &aw.writer) catch return false;
+    std.json.Stringify.value(.{ .cmd = cmd, .data = data, .host = host, .pane = self_pane, .session = self_session }, .{}, &aw.writer) catch return false;
     aw.writer.writeAll("\n") catch return false;
 
     const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);

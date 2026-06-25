@@ -15,6 +15,11 @@ pub const Request = struct {
     cmd: []const u8 = "",
     /// Pane address. null = focused pane.
     pane: ?u32 = null,
+    /// Self-pane address by STABLE session name (`$SKETERM_SESSION`),
+    /// preferred over `pane` because the GUI pane id goes stale across a
+    /// restart/reattach. Resolved to the pane currently rendering that
+    /// session; falls back to `pane`, then the current pane.
+    session: ?[]const u8 = null,
     /// Tab address. null = selected tab.
     tab: ?u32 = null,
     /// send-text payload / set-title text.
