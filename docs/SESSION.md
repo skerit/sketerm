@@ -6206,3 +6206,30 @@ resolved by session across windows and taken over in that window (window
 count unchanged, no stray window), then addressable as the durable
 session. The `X11 forwarding request failed` noise is also gone — the
 mux SSH transport now passes `-x` (the proxy channel never needs X11).
+
+## Fix: colours swap (green to red) when resizing a remote pane
+
+On resize the daemon rebroadcasts a full snapshot, and `snapshot.restore`
+swapped the style pool's `entries` table but left the pool's `index`
+dedup map (entryKey -> slot) stale. Cells store only a slot index, so the
+restored grid rendered fine, but the next interned colour (live SGR
+events re-intern into the GUI's own pool, then print with that
+`cur_style`) short-circuited on `Pool.intern`'s stale `index.get`,
+resolving e.g. green to the slot green USED to occupy, which after the
+rebuild held a different colour. Hence green drew as red. Only on
+resize/reattach, which reuse an already-populated pool.
+
+Fix: `restore` builds the table into a fresh list and hands it to
+`Pool.replaceEntries` -- the same path `compactStylePool` already uses,
+which adopts the entries AND rebuilds the index in lockstep -- instead of
+mutating `entries` in place and forgetting the index. Regression test
+orders the snapshot green-then-red, restores into a pool pre-populated
+red-then-green, asserts each colour resolves to a slot holding it; fails
+without the fix. VERIFIED IN A REAL GUI (xvfb screenshots, not just the
+unit test): startup colours correct, and after 60 distinct 256-colours +
+four window resizes everything still renders the right colour.
+
+(Process hygiene: a by-name `pkill` (even `pkill -x sketerm-mux`) kills
+the USER's real daemon + durable sessions, not just isolated test ones.
+CLAUDE.md now forbids it; test cleanup is by exact pid, the daemon found
+via its isolated `XDG_RUNTIME_DIR` in `/proc/<pid>/environ`.)

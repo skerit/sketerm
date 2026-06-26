@@ -110,7 +110,7 @@ User entry points: `sketerm ssh [-u] <host>`, `sketerm mux [host] [list|attach <
 
 - `zig build replay -- capture.bin [cols rows]` replays raw PTY bytes through parser→Screen and dumps the grid — invaluable for "app X renders wrong" reports. Capture with a small `pty.fork` tee script.
 - **Headless GUI testing works**: `xvfb-run -a zig build smoke-e2e`; for interactive visual checks run `Xvfb :99` + the app with `DISPLAY=:99 GDK_BACKEND=x11`, drive it with `xdotool` (clicks/keys) and screenshot with ImageMagick `import`. ALWAYS isolate `XDG_CONFIG_HOME`/`XDG_STATE_HOME` (prefs auto-saves would clobber the real config.conf) and set `SKETERM_APP_ID` so GApplication uniqueness doesn't reuse a live instance.
-- **Never `pkill -f`/`pgrep -f` with a "sketerm" pattern** from a wrapper shell — the shell's own command string matches and you kill your session. Use `pkill -x sketerm-mux` or explicit PIDs.
+- **NEVER `pkill`/`killall`/`pgrep -f` on ANY "sketerm" name, including `pkill -x sketerm-mux`.** A by-name kill destroys the USER's real daemon and durable sessions (their running work), not just isolated test instances. There is no safe `pkill` here. Clean up a test instance by exact PID only: launch it under an isolated `XDG_RUNTIME_DIR`, capture the GUI pid at launch and kill just that; for its daemon, list read-only with `pgrep -x sketerm-mux` and kill ONLY the pid whose `/proc/<pid>/environ` contains YOUR isolated `XDG_RUNTIME_DIR=`. When unsure, leave the isolated process running rather than risk a broad kill.
 
 ## Commit style
 

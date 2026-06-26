@@ -262,23 +262,33 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
     const rows = try src.int(u16);
     if (cols == 0 or rows == 0 or cols > 4096 or rows > 4096) return error.BadSnapshot;
 
-    // Pool: replace contents wholesale.
+    // Pool: replace contents wholesale via replaceEntries, which also
+    // rebuilds the dedup `index` map in lockstep. The grid reuses an
+    // existing pool across resize/reattach snapshots, so just swapping
+    // `entries` (and leaving `index` stale) would make the next interned
+    // colour resolve to a slot it no longer occupies -- green renders as
+    // red after a resize. replaceEntries is the same path compactStylePool
+    // uses, so the index stays correct.
     const n_styles = try src.int(u16);
     if (n_styles == 0) return error.BadSnapshot; // index 0 = default always exists
-    pool.entries.clearRetainingCapacity();
-    for (0..n_styles) |_| {
-        const fg = try src.color();
-        const bg = try src.color();
-        const ul = try src.color();
-        const attrs_raw = try src.int(u16);
-        try pool.entries.append(pool.allocator, .{
-            .fg = fg,
-            .bg = bg,
-            .underline_color = ul,
-            .attrs = @bitCast(attrs_raw),
-        });
+    {
+        var new_entries: std.ArrayList(style_pool.Entry) = .empty;
+        errdefer new_entries.deinit(pool.allocator);
+        try new_entries.ensureTotalCapacity(pool.allocator, n_styles);
+        for (0..n_styles) |_| {
+            const fg = try src.color();
+            const bg = try src.color();
+            const ul = try src.color();
+            const attrs_raw = try src.int(u16);
+            new_entries.appendAssumeCapacity(.{
+                .fg = fg,
+                .bg = bg,
+                .underline_color = ul,
+                .attrs = @bitCast(attrs_raw),
+            });
+        }
+        pool.replaceEntries(new_entries); // adopts new_entries + rebuilds index
     }
-    pool.last_idx = 0;
 
     const screen = try Screen.init(allocator, pool, cols, rows);
     errdefer screen.deinit();
@@ -418,6 +428,42 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
 
 const testing = std.testing;
 const Harness = @import("../parser/test_harness.zig").Harness;
+
+test "restore rebuilds the pool index: colours don't swap after a resize" {
+    const a = testing.allocator;
+    const Entry = style_pool.Entry;
+
+    // Source screen: green THEN red, so its pool orders green at a lower
+    // slot than red. The snapshot serializes that order.
+    var h = try Harness.init(a, 10, 2);
+    defer h.deinit();
+    h.feed("\x1b[32mG\x1b[0m\x1b[31mR\x1b[0m");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try serialize(h.screen, &buf, a);
+
+    const green = h.pool.get(h.screen.active[0].cells[0].style_ref);
+    const red = h.pool.get(h.screen.active[0].cells[1].style_ref);
+    try testing.expect(!Entry.equal(green, red));
+
+    // Target pool pre-populated in the OPPOSITE order (red before green),
+    // exactly like a GUI pool reused across a resize: its dedup index now
+    // disagrees with the snapshot's slot ordering.
+    var p = try Pool.init(a);
+    defer p.deinit();
+    _ = try p.intern(red);
+    _ = try p.intern(green);
+
+    const back = try restore(a, &p, buf.items);
+    defer back.deinit();
+
+    // The bug: a stale index made the next intern of a colour return the
+    // wrong slot (green -> red). After restore, interning a colour must
+    // land on a slot that actually holds it, with no duplicate appended.
+    try testing.expect(Entry.equal(p.get(try p.intern(green)), green));
+    try testing.expect(Entry.equal(p.get(try p.intern(red)), red));
+    try testing.expectEqual(h.pool.entries.items.len, p.entries.items.len);
+}
 
 test "snapshot: populated screen round-trips" {
     const a = testing.allocator;
