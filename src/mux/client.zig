@@ -303,6 +303,11 @@ pub const Conn = struct {
         }.f;
         push(&argv_buf, &n, ssh_bin);
         push(&argv_buf, &n, "-T");
+        // The proxy channel carries the mux binary protocol — never X11.
+        // `-x` disables X11 forwarding so a user's `ForwardX11 yes` config
+        // can't print "X11 forwarding request failed" onto the terminal
+        // (and can't perturb the protocol pipe).
+        push(&argv_buf, &n, "-x");
         push(&argv_buf, &n, "-o");
         push(&argv_buf, &n, "BatchMode=yes");
         if (mux) {
