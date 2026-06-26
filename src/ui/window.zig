@@ -428,6 +428,11 @@ pub const Window = struct {
             .search_label = search_label,
         };
 
+        // Make this Zig Window reachable from its GtkWindow, so any
+        // window can be found by walking gtk_application_get_windows
+        // (cross-window pane resolution for IPC / `sketerm mux`).
+        c.g_object_set_data(@ptrCast(@alignCast(app_window)), WINDOW_QDATA, @ptrCast(self));
+
         // Drag-a-tab-out-of-the-strip → new window.
         self.tabbar.detach_ctx = @ptrCast(self);
         self.tabbar.on_detach = onTabDetach;
@@ -3547,27 +3552,115 @@ pub const Window = struct {
         return null;
     }
 
-    /// The pane currently rendering the daemon session `name` — the
-    /// stable identity behind `$SKETERM_SESSION`. Local panes match a
-    /// local session (host == null); that's all a `--pane self` from a
-    /// local shell ever needs.
-    fn paneBySession(self: *Window, name: []const u8) ?*Pane {
-        if (name.len == 0) return null;
-        for (self.panes.items) |p| {
-            const r = p.terminal.remote orelse continue;
-            if (std.mem.eql(u8, r.session, name)) return p;
+    const WINDOW_QDATA = "sketerm-window";
+
+    /// The Zig Window behind a GtkWindow (set as qdata at init), or null
+    /// for a window we don't own.
+    fn windowFromGtk(gw: ?*c.GtkWindow) ?*Window {
+        const g = gw orelse return null;
+        const d = c.g_object_get_data(@ptrCast(@alignCast(g)), WINDOW_QDATA) orelse return null;
+        return @ptrCast(@alignCast(d));
+    }
+
+    /// Run `f(win)` for every Window in this application until it returns
+    /// a pane; the first non-null wins. The IPC server lives on the
+    /// primary window, but panes can sit in secondary windows (tab
+    /// drag-out), so pane resolution MUST span them all.
+    fn findPaneAcrossWindows(self: *Window, ctx: anytype, f: *const fn (@TypeOf(ctx), *Window) ?*Pane) ?*Pane {
+        const app = c.gtk_window_get_application(@ptrCast(self.app_window)) orelse return f(ctx, self);
+        var node = c.gtk_application_get_windows(app);
+        while (node != null) : (node = node.*.next) {
+            const gw: ?*c.GtkWindow = @ptrCast(@alignCast(node.*.data));
+            if (windowFromGtk(gw)) |w| {
+                if (f(ctx, w)) |p| return p;
+            }
         }
         return null;
     }
 
-    /// Resolve a request's target pane: prefer the stable session name,
-    /// fall back to the (possibly stale) pane id, then the current pane.
-    /// This is the one place "which pane" is decided for IPC commands.
+    /// The pane rendering daemon session `name` — the stable identity
+    /// behind `$SKETERM_SESSION`. Searched across all windows.
+    fn paneBySession(self: *Window, name: []const u8) ?*Pane {
+        if (name.len == 0) return null;
+        return self.findPaneAcrossWindows(name, struct {
+            fn f(n: []const u8, w: *Window) ?*Pane {
+                for (w.panes.items) |p| {
+                    const r = p.terminal.remote orelse continue;
+                    if (std.mem.eql(u8, r.session, n)) return p;
+                }
+                return null;
+            }
+        }.f);
+    }
+
+    /// The pane with `id`, across all windows.
+    fn paneByIdGlobal(self: *Window, id: u32) ?*Pane {
+        return self.findPaneAcrossWindows(id, struct {
+            fn f(want: u32, w: *Window) ?*Pane {
+                for (w.panes.items) |p| if (p.id == want) return p;
+                return null;
+            }
+        }.f);
+    }
+
+    /// The pane that currently has keyboard focus anywhere — the active
+    /// window's focused pane, else any focused pane, else the first pane
+    /// in any window. The guaranteed floor for "the pane I'm in": as long
+    /// as a single pane exists, this returns one.
+    fn globallyFocusedPane(self: *Window) ?*Pane {
+        const app = c.gtk_window_get_application(@ptrCast(self.app_window));
+        if (app != null) {
+            if (c.gtk_application_get_active_window(app)) |aw| {
+                if (windowFromGtk(@ptrCast(aw))) |w| if (w.focusedPane()) |p| return p;
+            }
+            if (self.findPaneAcrossWindows({}, struct {
+                fn f(_: void, w: *Window) ?*Pane {
+                    return w.focusedPane();
+                }
+            }.f)) |p| return p;
+            if (self.findPaneAcrossWindows({}, struct {
+                fn f(_: void, w: *Window) ?*Pane {
+                    return if (w.panes.items.len > 0) w.panes.items[0] else null;
+                }
+            }.f)) |p| return p;
+        }
+        return self.paneById(null);
+    }
+
+    /// Resolve a request's target pane for an EXPLICIT command (send-text,
+    /// split, …): stable session name first, then the pane id, both across
+    /// all windows. No current-pane fallback — an explicit bad id should
+    /// error, not silently hit some other pane. Use `takeoverPane` for the
+    /// "the pane I'm in" commands.
     fn reqPane(self: *Window, req: ipc_protocol.Request) ?*Pane {
         if (req.session) |s| {
             if (self.paneBySession(s)) |p| return p;
         }
-        return self.paneById(req.pane);
+        if (req.pane) |id| return self.paneByIdGlobal(id);
+        // No address at all = the focused pane (default for omitted --pane).
+        return self.globallyFocusedPane();
+    }
+
+    /// Resolve the pane for a "take over the pane I'm in" command
+    /// (`sketerm mux` attach / new-durable). This MUST NOT fail when run
+    /// from inside a pane: session name -> pane id -> the globally-focused
+    /// pane. Returns null only when no pane exists anywhere (then the
+    /// caller opens a fresh tab, which is correct).
+    fn takeoverPane(self: *Window, req: ipc_protocol.Request) ?*Pane {
+        if (req.session) |s| {
+            if (self.paneBySession(s)) |p| return p;
+        }
+        if (req.pane) |id| {
+            if (self.paneByIdGlobal(id)) |p| return p;
+        }
+        return self.globallyFocusedPane();
+    }
+
+    /// The Window that owns `pane` (set as `win_clip_ctx` when the pane is
+    /// listed). Falls back to `self` if somehow unset.
+    fn ownerWindow(self: *Window, pane: *Pane) *Window {
+        if (pane.win_clip_ctx) |w| return @ptrCast(@alignCast(w));
+        return self;
     }
 
     fn tabPageById(self: *Window, id_opt: ?u32) ?*c.AdwTabPage {
@@ -4347,20 +4440,23 @@ pub const Window = struct {
             });
         } else if (eql(u8, req.cmd, "split")) {
             const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const win = self.ownerWindow(pane);
             _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
             const dir = req.direction orelse "h";
             const orient: c_uint = if (eql(u8, dir, "v"))
                 @intCast(c.GTK_ORIENTATION_VERTICAL)
             else
                 @intCast(c.GTK_ORIENTATION_HORIZONTAL);
-            try self.splitFocused(orient);
+            try win.splitFocused(orient);
             try ipc_protocol.writeOk(out, allocator, "created", .{
-                .pane = self.next_pane_id - 1,
+                .pane = win.next_pane_id - 1,
             });
         } else if (eql(u8, req.cmd, "focus")) {
             if (req.pane != null or req.session != null) {
                 const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
-                if (tabPageForPane(self, pane)) |page| c.adw_tab_view_set_selected_page(self.tab_view, page);
+                const win = self.ownerWindow(pane);
+                if (tabPageForPane(win, pane)) |page| c.adw_tab_view_set_selected_page(win.tab_view, page);
+                c.gtk_window_present(@ptrCast(win.app_window));
                 _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
                 try ipc_protocol.writeOk(out, allocator, null, {});
             } else if (req.tab != null) {
@@ -4372,7 +4468,7 @@ pub const Window = struct {
             }
         } else if (eql(u8, req.cmd, "close-pane")) {
             const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
-            self.closePane(pane);
+            self.ownerWindow(pane).closePane(pane);
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (eql(u8, req.cmd, "set-title")) {
             const text = req.title orelse req.data orelse return ipc_protocol.writeErr(out, allocator, "set-title requires title");
@@ -4380,49 +4476,52 @@ pub const Window = struct {
             const z = std.fmt.bufPrintZ(&z_buf, "{s}", .{text}) catch return ipc_protocol.writeErr(out, allocator, "title too long");
             const page = if (req.pane != null or req.session != null) pg: {
                 const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
-                break :pg tabPageForPane(self, pane) orelse return ipc_protocol.writeErr(out, allocator, "pane has no tab");
+                break :pg tabPageForPane(self.ownerWindow(pane), pane) orelse return ipc_protocol.writeErr(out, allocator, "pane has no tab");
             } else self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
             c.adw_tab_page_set_title(page, z.ptr);
             c.adw_tab_page_set_tooltip(page, z.ptr);
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (eql(u8, req.cmd, "new-durable-tab")) {
-            // A self-identity (session name preferred, pane id fallback) =
-            // the CLI ran inside a pane: take that pane over tmux-style.
-            // reqPane resolves session -> pane id -> current, so a stale id
-            // (GUI restarted since spawn) lands on the current pane instead
-            // of failing. No identity at all = open a fresh tab.
+            // Invoked from inside a pane (it carried a self-identity) =
+            // take THAT pane over, tmux-style. takeoverPane never fails to
+            // find a pane when one exists (session name -> pane id ->
+            // globally-focused), so this can't silently spill into a new
+            // tab/window. Run it in the pane's OWN window. No identity at
+            // all (run from outside any pane) = open a fresh tab here.
             const takeover: ?*Pane = if (req.session != null or req.pane != null)
-                self.reqPane(req)
+                self.takeoverPane(req)
             else
                 null;
-            self.newDurableSession(req.host, takeover) catch |err| {
+            const win = if (takeover) |p| self.ownerWindow(p) else self;
+            win.newDurableSession(req.host, takeover) catch |err| {
                 if (err == error.MuxProtoMismatch) {
                     var pm_buf: [192]u8 = undefined;
                     return ipc_protocol.writeErr(out, allocator, muxProtoMismatchMsg(&pm_buf));
                 }
                 return ipc_protocol.writeErr(out, allocator, "durable spawn failed (ssh/key auth?)");
             };
-            try ipc_protocol.writeOk(out, allocator, "pane", self.next_pane_id - 1);
+            try ipc_protocol.writeOk(out, allocator, "pane", win.next_pane_id - 1);
         } else if (eql(u8, req.cmd, "attach-session")) {
             const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "attach-session requires data (session name)");
-            // Self-identity -> take over that pane (stale id falls back to
-            // the current pane); none -> new tab. See new-durable-tab.
+            // Take over the pane it ran in (never fails to a new tab when a
+            // pane exists), in that pane's own window. See new-durable-tab.
             const takeover: ?*Pane = if (req.session != null or req.pane != null)
-                self.reqPane(req)
+                self.takeoverPane(req)
             else
                 null;
-            const conn = self.muxConnect(req.host) catch |err| {
+            const win = if (takeover) |p| self.ownerWindow(p) else self;
+            const conn = win.muxConnect(req.host) catch |err| {
                 if (err == error.MuxProtoMismatch) {
                     var pm_buf: [192]u8 = undefined;
                     return ipc_protocol.writeErr(out, allocator, muxProtoMismatchMsg(&pm_buf));
                 }
                 return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
             };
-            self.attachMux(conn, name, req.host, takeover) catch |err| {
+            win.attachMux(conn, name, req.host, takeover) catch |err| {
                 // Prefer the daemon's own reason ("no such session", …)
                 // over the bare error name.
-                const detail = if (self.mux_attach_err_len > 0)
-                    self.mux_attach_err[0..self.mux_attach_err_len]
+                const detail = if (win.mux_attach_err_len > 0)
+                    win.mux_attach_err[0..win.mux_attach_err_len]
                 else
                     @errorName(err);
                 var msg_buf: [256]u8 = undefined;
@@ -4448,11 +4547,13 @@ pub const Window = struct {
             const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "action needs data=<name>");
             const action = @import("input.zig").actionFromName(name) orelse
                 return ipc_protocol.writeErr(out, allocator, "unknown action");
+            var target: *Window = self;
             if (req.pane != null or req.session != null) {
                 const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+                target = self.ownerWindow(pane);
                 _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
             }
-            dispatchAction(self, action);
+            dispatchAction(target, action);
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else {
             try ipc_protocol.writeErr(out, allocator, "unknown command");

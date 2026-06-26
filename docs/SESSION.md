@@ -6174,3 +6174,35 @@ This already worked and is now confirmed end-to-end. `paneSpec` saves
 it under the same name if gone. Tested both branches under xvfb: a saved
 durable pane restored with its scrollback marker intact (reattach), and
 after killing the session, `--restore` recreated it as a working shell.
+
+## `sketerm mux` takeover is now bulletproof (never a stray tab/window)
+
+Two real failure modes were making `sketerm mux <host>` attach into a
+NEW tab/window instead of taking over the pane it ran in:
+
+1. A refactor regression: `reqPane` returned null on a stale pane id
+   (the current-pane fallback got dropped), so the takeover saw "no
+   pane" and opened a tab.
+2. Multi-window blindness: the IPC server runs only on the PRIMARY
+   window, and pane resolution (`paneBySession`/`focusedPane`) only
+   searched that window's panes — so a pane in a SECONDARY window (tab
+   drag-out) was invisible and the takeover landed in the primary =
+   "another window".
+
+Fix: pane resolution now spans every window. Each `Window` is reachable
+from its `GtkWindow` via qdata (`sketerm-window`);
+`findPaneAcrossWindows` walks `gtk_application_get_windows`.
+`takeoverPane` resolves session-name -> pane-id -> the globally-focused
+pane, so when invoked from inside a pane it CANNOT fail to find one (the
+focused pane is the guaranteed floor) and never spills into a new tab.
+The takeover then executes in the resolved pane's OWN window
+(`ownerWindow`), and the other pane-addressed commands (split, close,
+focus, set-title, action) likewise act on the owning window. Explicit
+commands keep strict id semantics (a bad `--pane N` still errors).
+
+Verified under xvfb: (a) single window, stale/absent identity -> in-place
+takeover, still one tab; (b) a pane moved to a secondary window is
+resolved by session across windows and taken over in that window (window
+count unchanged, no stray window), then addressable as the durable
+session. The `X11 forwarding request failed` noise is also gone — the
+mux SSH transport now passes `-x` (the proxy channel never needs X11).
