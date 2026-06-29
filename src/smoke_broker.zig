@@ -34,12 +34,12 @@ const Mirror = struct {
     screen: ?*Screen = null,
 
     fn applySnapshot(self: *Mirror, payload: []const u8) !void {
-        if (payload.len < 8) return error.Truncated;
+        if (payload.len < 9) return error.Truncated; // [seq:u64][app:u8] header
         if (self.screen) |s| s.deinit();
         self.screen = null;
         self.pool.deinit();
         self.pool.* = try Pool.init(self.allocator);
-        self.screen = try snapshot.restore(self.allocator, self.pool, payload[8..]);
+        self.screen = try snapshot.restore(self.allocator, self.pool, payload[9..]);
     }
 
     fn applyEvents(self: *Mirror, payload: []const u8) !void {
