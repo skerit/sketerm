@@ -3939,6 +3939,22 @@ pub const Window = struct {
         _ = c.gtk_widget_grab_focus(@ptrCast(fresh.area));
     }
 
+    /// A forwarded app (`sketerm app`) exited before ever showing a
+    /// window — almost always a failed launch. Keep the pane and its
+    /// now-frozen log on screen (the user's only diagnostic) instead of
+    /// detaching to a shell, and retitle the tab to flag the exit. The
+    /// user reads the log and closes the tab manually.
+    fn holdExitedAppPane(self: *Window, pane: *Pane, status: i32) void {
+        std.debug.print("sketerm: forwarded app exited ({d}) without opening a window — holding pane so the log stays visible\n", .{status});
+        const page = tabPageForPane(self, pane) orelse return;
+        var buf: [96:0]u8 = undefined;
+        const t = std.fmt.bufPrintZ(&buf, "app exited ({d})", .{status}) catch "app exited";
+        c.adw_tab_page_set_title(page, t.ptr);
+        c.adw_tab_page_set_tooltip(page, t.ptr);
+        if (page != c.adw_tab_view_get_selected_page(self.tab_view))
+            c.adw_tab_page_set_needs_attention(page, 1);
+    }
+
     const CrashBtnCtx = struct { allocator: std.mem.Allocator, window: *Window, pane: *Pane };
 
     /// The pane's session died unexpectedly — replace the GL terminal with a
@@ -6203,11 +6219,17 @@ fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
 
 fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {
     const self = cast.userData(Window, ctx);
-    _ = status;
     // A remote pane "exiting" means the mux session ended or the
-    // connection dropped — never close the pane for that; land in a
-    // local shell instead (exit_action governs local children only).
-    if (pane.terminal.remote != null) {
+    // connection dropped — normally land in a local shell so the tab
+    // survives (exit_action governs local children only). Exception: a
+    // forwarded app (`sketerm app`) that exited before ever showing a
+    // window has failed to launch, and its log is the only useful
+    // output — hold the pane with that log visible instead of wiping it.
+    if (pane.terminal.remote) |remote| {
+        if (remote.is_app and !remote.app_window_opened) {
+            self.holdExitedAppPane(pane, status);
+            return;
+        }
         self.detachPaneToShell(pane);
         return;
     }

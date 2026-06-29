@@ -40,12 +40,12 @@ const Mirror = struct {
     screen: ?*Screen = null,
 
     fn applySnapshot(self: *Mirror, payload: []const u8) !void {
-        if (payload.len < 8) return error.Truncated;
+        if (payload.len < 9) return error.Truncated; // [seq:u64][app:u8] header
         if (self.screen) |s| s.deinit();
         self.screen = null;
         self.pool.deinit();
         self.pool.* = try Pool.init(self.allocator);
-        self.screen = try snapshot.restore(self.allocator, self.pool, payload[8..]);
+        self.screen = try snapshot.restore(self.allocator, self.pool, payload[9..]);
     }
 
     fn applyEvents(self: *Mirror, payload: []const u8) !void {
@@ -808,6 +808,39 @@ fn winstreamStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     std.debug.print("smoke-mux: winstream stub round-trip ok\n", .{});
 }
 
+/// The snapshot header's app byte: an attaching client must be able to
+/// tell a forwarded GUI app (`sketerm app`, spawn app=true) from a plain
+/// shell session, so it can hold the pane open on app exit. Proto v4
+/// widened the header to [seq:u64][app:u8].
+fn appFlagStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    const cases = [_]struct { name: []const u8, app: bool }{
+        .{ .name = "flag-app", .app = true },
+        .{ .name = "flag-shell", .app = false },
+    };
+    for (cases) |cse| {
+        var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("flag connect");
+        defer conn.deinit();
+        conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("flag hello");
+        (conn.recvExpect(&.{.welcome}) catch fail("flag welcome")).deinit(allocator);
+        conn.sendJson(.spawn, .{
+            .name = cse.name,
+            .argv = [_][]const u8{ "/bin/sleep", "60" },
+            .rows = @as(u16, 10),
+            .cols = @as(u16, 40),
+            .app = cse.app,
+        }) catch fail("flag spawn");
+        (conn.recvExpect(&.{.ok}) catch fail("flag spawn ok")).deinit(allocator);
+        conn.sendJson(.attach, .{ .name = cse.name }) catch fail("flag attach");
+        const snap = conn.recvExpect(&.{.snapshot}) catch fail("flag snapshot");
+        defer snap.deinit(allocator);
+        if (snap.payload.len < 9) fail("flag snapshot header too short");
+        const want: u8 = if (cse.app) 1 else 0;
+        if (snap.payload[8] != want) fail("flag snapshot app byte wrong");
+        conn.sendJson(.kill, .{ .name = cse.name }) catch fail("flag kill");
+    }
+    std.debug.print("smoke-mux: snapshot app-flag header ok\n", .{});
+}
+
 /// The spawn→GUI-attach handover gap (`sketerm app` via the GUI):
 /// an app that connects to its display BEFORE any client attached
 /// must be parked, not refused — and bridged on the next attach.
@@ -1351,6 +1384,9 @@ pub fn main() u8 {
 
     // Apps that connect before a renderer attaches are parked.
     pendingAppStage(allocator, sock_path, if (wlapp_ran) 3 else 2);
+
+    // Snapshot header carries the app flag (drives GUI hold-on-exit).
+    appFlagStage(allocator, sock_path);
 
     // Isolated session: private runtime dir + dropped D-Bus + cleanup.
     isolatedStage(allocator, sock_path);

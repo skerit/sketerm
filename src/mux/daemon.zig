@@ -2979,8 +2979,12 @@ pub const Daemon = struct {
     fn queueSnapshot(self: *Daemon, cl: *Client, s: *Session) void {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
-        var seq_hdr: [8]u8 = undefined;
-        std.mem.writeInt(u64, &seq_hdr, s.seq, .little);
+        // Header: [seq:u64][app:u8]. The app byte lets an attaching
+        // client hold the pane open with the log visible when a
+        // forwarded app exits, instead of detaching to a shell.
+        var seq_hdr: [9]u8 = undefined;
+        std.mem.writeInt(u64, seq_hdr[0..8], s.seq, .little);
+        seq_hdr[8] = if (s.app) 1 else 0;
         buf.appendSlice(self.allocator, &seq_hdr) catch {
             cl.dead = true;
             return;

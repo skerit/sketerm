@@ -20,7 +20,11 @@ const Event = @import("../parser/event.zig").Event;
 /// works over any transport (local/SSH/UDP) with no shell help. The
 /// handshake (helloProbe) requires an exact proto match, so an
 /// attached daemon is always the same build and understands them.
-pub const PROTO_VERSION: u32 = 3;
+/// Version 4 widens the snapshot frame header from [seq:u64] to
+/// [seq:u64][app:u8], so an attaching client learns whether the
+/// session is a forwarded GUI app (`sketerm app`) and can hold the
+/// pane open on app exit instead of detaching to a shell.
+pub const PROTO_VERSION: u32 = 4;
 
 /// Frame types. Append-only.
 pub const FrameType = enum(u8) {

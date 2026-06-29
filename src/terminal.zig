@@ -197,6 +197,14 @@ pub const Terminal = struct {
         /// session. A GUI crash skips deinit, so the session still survives
         /// for reattach — that is the durability.
         ephemeral: bool = false,
+        /// This session is a forwarded GUI app (`sketerm app`), per the
+        /// daemon's snapshot header. On app exit the pane holds open with
+        /// the log visible instead of detaching to a shell.
+        is_app: bool = false,
+        /// An app channel (Wayland or pixel-stream window) opened at least
+        /// once. Distinguishes "app ran and its window closed" (detach as
+        /// usual) from "app died before showing anything" (hold the log).
+        app_window_opened: bool = false,
         /// Predictive local echo (mosh-style). The expiry timer only
         /// runs while predictions are outstanding, so echo-less input
         /// (password prompts) flushes even when no events arrive.
@@ -289,7 +297,7 @@ pub const Terminal = struct {
         session_name: []const u8,
         snap_payload: []const u8,
     ) !*Terminal {
-        if (snap_payload.len < 8) return error.BadSnapshot;
+        if (snap_payload.len < 9) return error.BadSnapshot;
         const self = try allocator.create(Terminal);
         errdefer allocator.destroy(self);
 
@@ -308,6 +316,7 @@ pub const Terminal = struct {
             .conn = conn,
             .session = try allocator.dupe(u8, session_name),
             .predictor = predict_mod.Predictor.init(allocator),
+            .is_app = snap_payload[8] != 0,
         };
         if (profile_util.getenv("SKETERM_PREDICT")) |v| {
             if (std.mem.eql(u8, v, "always")) remote.predictor.force = .always;
@@ -326,7 +335,7 @@ pub const Terminal = struct {
         drain.terminal = self;
 
         // Restore the snapshot into our pool; wire sinks like init.
-        self.screen = try mux_snapshot.restore(allocator, &self.pool, snap_payload[8..]);
+        self.screen = try mux_snapshot.restore(allocator, &self.pool, snap_payload[9..]);
         errdefer self.screen.deinit();
         // Mirror screens never answer protocol queries — the daemon's
         // authoritative Screen already does; replying here would
@@ -457,8 +466,8 @@ pub const Terminal = struct {
                 }
             },
             .snapshot => {
-                if (frame.payload.len < 8) return;
-                const fresh = mux_snapshot.restore(self.allocator, &self.pool, frame.payload[8..]) catch return;
+                if (frame.payload.len < 9) return;
+                const fresh = mux_snapshot.restore(self.allocator, &self.pool, frame.payload[9..]) catch return;
                 // Carry over GUI-side fields the snapshot doesn't own.
                 fresh.scrollback_capacity = self.screen.scrollback_capacity;
                 fresh.word_chars = self.screen.word_chars;
@@ -484,8 +493,15 @@ pub const Terminal = struct {
                 if (self.on_render_request) |f| f(self.user_ctx);
             },
             // A clean termination frame — shell exited (.exit) or the session
-            // was killed / the daemon shut down (.gone). Not a crash.
-            .exit, .gone => self.remoteClosed("session ended", false),
+            // was killed / the daemon shut down (.gone). Not a crash. The
+            // .exit frame carries the child's i32 WEXITSTATUS; record it so
+            // the exit handler can show it (e.g. an app that died nonzero).
+            .exit, .gone => {
+                if (frame.ftype == .exit and frame.payload.len >= 4) {
+                    self.screen.child_exit_status = std.mem.readInt(i32, frame.payload[0..4], .little);
+                }
+                self.remoteClosed("session ended", false);
+            },
             // The only request the GUI sends that's answered with
             // OK/ERR while attached is a rename (resize answers with
             // a SNAPSHOT; detach is sent during teardown). Guarded by
@@ -1053,6 +1069,7 @@ pub const Terminal = struct {
             self.sendChanClose(id);
             return;
         };
+        remote.app_window_opened = true;
     }
 
     fn wsappData(self: *Terminal, wa: *WsApp, bytes: []const u8) void {
@@ -1129,6 +1146,7 @@ pub const Terminal = struct {
             self.sendChanClose(id);
             return;
         };
+        remote.app_window_opened = true;
     }
 
     fn nappData(self: *Terminal, na: *NApp, bytes: []const u8) void {
