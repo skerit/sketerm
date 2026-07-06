@@ -693,43 +693,49 @@ pub const Pane = struct {
         self.freePresetData();
         self.preset_params.deinit(self.allocator);
         if (self.atlas) |a| a.deinit();
-        if (self.input_ctx) |ictx| {
-            // Disconnect every signal handler we connected with `ctx`
-            // as user-data, then drop the IM context's ref. Without
-            // this, fcitx5 / ibus may still emit `commit` or
-            // `preedit-changed` against the freed Ctx (we're not the
-            // sole owner of the IM context's lifetime — the GTK IM
-            // module routes events asynchronously through D-Bus).
-            // Also leaks one GtkIMMulticontext (and its inner D-Bus
-            // name watch) per closed pane, which is what we're
-            // really fixing here.
-            if (ictx.im_ctx) |im| {
-                // Disconnect every handler we attached with `ictx` as
-                // user_data. `g_signal_handlers_disconnect_by_data`
-                // is a macro in glib; spell out the underlying call
-                // because the cImport translation of the macro form
-                // loses the gpointer target types.
-                const im_obj: ?*anyopaque = @ptrCast(im);
-                const ictx_data: ?*anyopaque = @ptrCast(ictx);
-                _ = c.g_signal_handlers_disconnect_matched(
-                    im_obj,
-                    c.G_SIGNAL_MATCH_DATA,
-                    0,
-                    0,
-                    null,
-                    null,
-                    ictx_data,
-                );
-                c.gtk_im_context_set_client_widget(@ptrCast(im), null);
-                c.g_object_unref(im_obj);
-            }
-            self.allocator.destroy(ictx);
-        }
+        // Fallback for teardown paths that never ran detachIm() —
+        // the pane-close/swap paths sever the IM context BEFORE the
+        // widget surgery destroys the GtkGLArea.
+        self.detachIm();
+        if (self.input_ctx) |ictx| self.allocator.destroy(ictx);
         if (self.menu_link_uri) |uri| self.allocator.free(uri);
         if (self.titlebar_text) |t| self.allocator.free(t);
         self.freeSpawnArgv();
         self.menu_arena.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Sever the standalone IM context from the pane NOW. Must run
+    /// before the GtkGLArea is destroyed: the IM context is not owned
+    /// by the widget tree, so GTK can still emit `commit` /
+    /// `preedit-changed` (fcitx5/ibus route asynchronously through
+    /// D-Bus) between the widget surgery and the deferred Pane.deinit,
+    /// and those handlers dereference the dangling GLArea
+    /// (Gtk-CRITICAL in gtk_gl_area_queue_render). Idempotent.
+    /// Dropping the ref here also plugs the one-IM-context-per-closed-
+    /// pane leak (and its inner D-Bus name watch).
+    pub fn detachIm(self: *Pane) void {
+        const ictx = self.input_ctx orelse return;
+        const im = ictx.im_ctx orelse return;
+        ictx.im_ctx = null;
+        // Disconnect every handler attached with `ictx` as user_data.
+        // `g_signal_handlers_disconnect_by_data` is a macro in glib;
+        // spell out the underlying call because the cImport
+        // translation of the macro form loses the gpointer target
+        // types.
+        const im_obj: ?*anyopaque = @ptrCast(im);
+        const ictx_data: ?*anyopaque = @ptrCast(ictx);
+        _ = c.g_signal_handlers_disconnect_matched(
+            im_obj,
+            c.G_SIGNAL_MATCH_DATA,
+            0,
+            0,
+            null,
+            null,
+            ictx_data,
+        );
+        c.gtk_im_context_set_client_widget(@ptrCast(im), null);
+        c.g_object_unref(im_obj);
     }
 
     fn freeSpawnArgv(self: *Pane) void {
