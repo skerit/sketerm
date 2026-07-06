@@ -6233,3 +6233,36 @@ four window resizes everything still renders the right colour.
 the USER's real daemon + durable sessions, not just isolated test ones.
 CLAUDE.md now forbids it; test cleanup is by exact pid, the daemon found
 via its isolated `XDG_RUNTIME_DIR` in `/proc/<pid>/environ`.)
+
+## Feature: `sketerm mcp` — assistants can drive the terminal (MCP server)
+
+`sketerm mcp` is a Model Context Protocol server on stdio (JSON-RPC
+2.0, one object per line) that adapts tool calls onto the existing
+remote-control socket, so an AI assistant can drive real panes:
+list_terminals, read_screen (parsed grid + cursor/flags metadata,
+i.e. what a human sees, not raw stdout), send_text, send_keys,
+run_command (type + Enter + wait-until-settled + return the screen),
+wait_idle, new_tab, split_pane, focus_pane, close_pane. Register in
+an MCP client as command `sketerm`, args `["mcp"]`. Trust boundary
+is unchanged: it is the same user-owned Unix socket `sketerm cli`
+uses.
+
+Supporting IPC additions: `send-keys` (named chords — "ctrl+c",
+"enter", "up", "f5", "alt+x", "shift+tab" — encoded xterm-style via
+the new pure `src/ipc/keys.zig`, honouring DECCKM app-cursor mode)
+and `screen-info` (rows/cols, cursor, alt-screen, view offset,
+sync-output flag, title, and `seq` — a new Terminal.activity_seq
+bumped per applied EVENTS batch/snapshot). Settle detection polls
+`seq` client-side every 50ms until quiet_ms passes unchanged; the
+GUI's dispatch stays synchronous (no deferred-reply surgery in
+ipc/server.zig).
+
+MCP dispatch is structured around an injectable Backend (talk /
+sleep / clock), so the JSON-RPC layer, tool routing, and the
+quiesce loop are unit-tested with a scripted fake (9 new tests, 638
+total). Verified end-to-end against a real GUI under Xvfb: initialize
+/ tools/list handshake, run_command returning the echoed output,
+driving interactive `cat` (send_text then ctrl+c via send_keys),
+split_pane + run_command in the new pane. Gotcha found in testing:
+the tools/list JSON was a Zig multiline literal whose embedded
+newlines broke NDJSON framing — stripped at comptime now.
