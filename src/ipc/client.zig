@@ -22,9 +22,14 @@ const CLI_HELP =
     \\      --enter     append Enter (CR) after the text
     \\      --delay MS  base inter-key delay  (default 60)
     \\      --jitter MS random extra delay    (default 90)
+    \\  send-keys [--pane N] <chords...>  press named keys: "ctrl+c",
+    \\                                    "enter", "up", "f5", "alt+x",
+    \\                                    "shift+tab" — space-separated
     \\  get-text [--pane N] [--scrollback N]
     \\                                    read screen text back (JSON);
     \\                                    --scrollback dumps the ring too
+    \\  screen-info [--pane N]            cursor pos, size, alt-screen
+    \\                                    flag, activity seq (JSON)
     \\  new-tab [--cwd DIR] [--title T]   open a shell tab
     \\  split [--pane N] [--dir h|v]      split a pane (h = side by side)
     \\  focus (--pane N | --tab N)        focus a pane or select a tab

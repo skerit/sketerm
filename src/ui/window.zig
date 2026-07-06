@@ -4432,6 +4432,32 @@ pub const Window = struct {
             else
                 pane.terminal.writeUserInput(data);
             try ipc_protocol.writeOk(out, allocator, null, {});
+        } else if (eql(u8, req.cmd, "send-keys")) {
+            const data = req.data orelse return ipc_protocol.writeErr(out, allocator, "send-keys requires data (chords like \"ctrl+c up enter\")");
+            const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(allocator);
+            @import("../ipc/keys.zig").encode(&bytes, allocator, data, pane.terminal.screen.app_cursor_keys) catch |err| switch (err) {
+                error.UnknownKey => return ipc_protocol.writeErr(out, allocator, "unknown key chord"),
+                error.OutOfMemory => return err,
+            };
+            pane.terminal.writeUserInput(bytes.items);
+            try ipc_protocol.writeOk(out, allocator, null, {});
+        } else if (eql(u8, req.cmd, "screen-info")) {
+            const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const scr = pane.terminal.screen;
+            try ipc_protocol.writeOk(out, allocator, "screen", .{
+                .rows = scr.rows,
+                .cols = scr.cols,
+                .cursor_row = scr.row,
+                .cursor_col = scr.col,
+                .alt_screen = scr.use_alt,
+                .view_offset = scr.view_offset,
+                .app_cursor_keys = scr.app_cursor_keys,
+                .sync_output = scr.sync_output,
+                .title = scr.last_title orelse "",
+                .seq = pane.terminal.activity_seq,
+            });
         } else if (eql(u8, req.cmd, "get-text")) {
             const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
             const screen = pane.terminal.screen;

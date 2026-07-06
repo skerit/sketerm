@@ -97,6 +97,10 @@ pub const Terminal = struct {
     /// only on a real visible change — ported from the old in-process drain.
     last_content_hash: u64 = 0,
     hash_valid: bool = false,
+    /// Bumped on every applied EVENTS batch and on a SNAPSHOT swap.
+    /// IPC `screen-info` exposes it so remote drivers (MCP) can
+    /// detect output quiescence by polling.
+    activity_seq: u64 = 0,
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
     on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void = null,
@@ -439,6 +443,7 @@ pub const Terminal = struct {
                     ev.deinit(self.allocator);
                     any = true;
                 }
+                if (any) self.activity_seq +%= 1;
                 // Tab-activity signal (drives the aurora glow + inactivity
                 // warning). Ported from the old in-process drain: fire only on
                 // a real VISIBLE change, gated by config + DECSET 2026 sync.
@@ -484,6 +489,7 @@ pub const Terminal = struct {
                 // stale; rebaseline on the next events batch (don't glow on a
                 // reattach/resize snapshot).
                 self.hash_valid = false;
+                self.activity_seq +%= 1;
                 // Predicted positions are meaningless on a new grid.
                 if (self.remote) |remote| {
                     remote.predictor.pending.clearRetainingCapacity();

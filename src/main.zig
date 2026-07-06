@@ -43,6 +43,12 @@ const HELP_TEXT =
     \\                         details. Inside a sketerm pane,
     \\                         $SKETERM_SOCKET/$SKETERM_PANE_ID are
     \\                         preset; `--pane self` self-addresses.
+    \\  sketerm mcp            Model Context Protocol server on stdio:
+    \\                         lets an AI assistant drive terminals in
+    \\                         the running instance (read screens, type,
+    \\                         press keys, run commands). Register in an
+    \\                         MCP client as command "sketerm", args
+    \\                         ["mcp"]. `sketerm mcp --help` for details.
     \\
     \\Durable sessions (sketerm-mux):
     \\  sketerm mux [host]     TUI picker: attach / spawn / kill
@@ -173,6 +179,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer allocator.free(cli_args);
         for (argv[2..], 0..) |a, n| cli_args[n] = std.mem.span(a);
         return @import("ipc/client.zig").run(allocator, cli_args);
+    }
+
+    // `sketerm mcp` — Model Context Protocol server on stdio; lets an
+    // AI assistant drive the running instance through the same socket
+    // the cli uses. Blocking stdio loop, no GApplication.
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "mcp")) {
+        const mcp_args = allocator.alloc([]const u8, argv.len - 2) catch return 1;
+        defer allocator.free(mcp_args);
+        for (argv[2..], 0..) |a, n| mcp_args[n] = std.mem.span(a);
+        return @import("ipc/mcp.zig").run(allocator, mcp_args);
     }
 
     // `sketerm app <host> <command...>` — run a remote GUI app with
