@@ -1196,6 +1196,15 @@ pub const Screen = struct {
             // truncate/pad path and the alt buffer below.
             self.clearAllClusters();
             try resizeBuffer(self.allocator, &self.active, self.rows, new_cols, new_rows, !self.use_alt, self);
+            // resizeBuffer's shrink branch drops rows from the TOP and
+            // shifts surviving content up — move the cursor with its
+            // line, or it ends up pointing rows below the content it
+            // was on (the clamp below alone is not enough).
+            if (new_rows < self.rows) {
+                const drop = self.rows - new_rows;
+                self.row -|= drop;
+                self.saved_row -|= drop;
+            }
         }
         if (self.alt) |alt_buf| {
             var alt_mut = alt_buf;
@@ -5567,6 +5576,45 @@ test "resize preserves active rows" {
     try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
     try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 1).rune);
     try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(0, 2).rune);
+}
+
+test "rows-only shrink keeps cursor on its content line" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 4, 6);
+    defer s.deinit();
+    var i: usize = 0;
+    while (i < 4) : (i += 1) s.execute('\n');
+    s.printCp('$');
+    s.saved_row = 4;
+    try std.testing.expectEqual(@as(u16, 4), s.row);
+    // Height-only shrink: the top 2 rows drop into scrollback and the
+    // '$' line shifts from row 4 to row 2 — the cursor must follow.
+    try s.resize(4, 4);
+    try std.testing.expectEqual(@as(u16, 2), s.row);
+    try std.testing.expectEqual(@as(u16, 1), s.col);
+    try std.testing.expectEqual(@as(u16, 2), s.saved_row);
+    try std.testing.expectEqual(@as(u32, '$'), s.cellAt(2, 0).rune);
+}
+
+test "alt-screen rows shrink keeps cursor on its content line" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 4, 6);
+    defer s.deinit();
+    var csi = Event.Csi{};
+    csi.private = '?';
+    csi.params[0] = 1049;
+    csi.n_params = 1;
+    csi.final = 'h';
+    s.csi(csi);
+    var i: usize = 0;
+    while (i < 4) : (i += 1) s.execute('\n');
+    s.printCp('x');
+    try std.testing.expectEqual(@as(u16, 4), s.row);
+    try s.resize(4, 4);
+    try std.testing.expectEqual(@as(u16, 2), s.row);
+    try std.testing.expectEqual(@as(u32, 'x'), s.cellAt(2, 0).rune);
 }
 
 test "SGR colon-separated parses (NF spec)" {
