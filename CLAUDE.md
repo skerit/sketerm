@@ -79,7 +79,9 @@ There's no `--test-filter` wired through `build.zig`; to run a single test, eith
 
 ## Remote control (IPC)
 
-Every GUI instance serves a JSON-lines protocol on `$XDG_RUNTIME_DIR/sketerm/<pid>.sock` (a `GSocketService`, so everything runs on the main loop). `sketerm cli <command>` is the client: `list`, `send-text`, `get-text`, `new-tab`, `split`, `focus`, `close-pane`, `set-title`, `set-tab-color`, `new-durable-tab`, `attach-session`. Child processes inherit `SKETERM_SOCKET` and `SKETERM_PANE_ID`, so `--pane self` works from inside any pane. Code in `src/ipc/` (`protocol.zig`, `server.zig`, `client.zig`, `mux_cli.zig`). Socket discovery in `resolveSocket` must skip `mux.sock`.
+Every GUI instance serves a JSON-lines protocol on `$XDG_RUNTIME_DIR/sketerm/<pid>.sock` (a `GSocketService`, so everything runs on the main loop). `sketerm cli <command>` is the client: `list`, `send-text`, `send-keys`, `get-text`, `screen-info`, `new-tab`, `split`, `focus`, `close-pane`, `set-title`, `set-tab-color`, `new-durable-tab`, `attach-session`. Child processes inherit `SKETERM_SOCKET` and `SKETERM_PANE_ID`, so `--pane self` works from inside any pane. Code in `src/ipc/` (`protocol.zig`, `server.zig`, `client.zig`, `mux_cli.zig`, `keys.zig` = pure chord→bytes encoder for send-keys). Socket discovery in `resolveSocket` must skip `mux.sock`.
+
+`sketerm mcp` (`src/ipc/mcp.zig`) is a Model Context Protocol server on stdio for AI assistants: JSON-RPC 2.0 NDJSON in/out, tools (list_terminals, read_screen, send_text, send_keys, run_command, wait_idle, new_tab, split_pane, focus_pane, close_pane) adapted onto the same socket. run_command/wait_idle detect output quiescence by polling `screen-info`'s `seq` (= `Terminal.activity_seq`) — the GUI dispatch stays synchronous. Dispatch takes an injectable `Backend` so it unit-tests with a scripted fake. Responses must stay newline-free (NDJSON framing).
 
 `zig build smoke-e2e` uses this to drive a real GUI instance end-to-end. For manual testing: `SKETERM_APP_ID=dev.sker.sketerm.test ./zig-out/bin/sketerm --no-save &`, then `./zig-out/bin/sketerm cli --socket /run/user/$(id -u)/sketerm/<pid>.sock ...`.
 
