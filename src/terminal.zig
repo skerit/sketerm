@@ -122,6 +122,10 @@ pub const Terminal = struct {
     /// own context, independent of `user_ctx`.
     on_listing: ?*const fn (ctx: ?*anyopaque, listing: Listing) void = null,
     listing_ctx: ?*anyopaque = null,
+    /// Fired with the remote host's installed-app list (answer to
+    /// `requestApps`). The launcher dialog consumes it.
+    on_apps: ?*const fn (ctx: ?*anyopaque, apps: []const AppEntry) void = null,
+    apps_ctx: ?*anyopaque = null,
 
     /// Optional broadcast-typing filter. When set, every byte from
     /// USER input (keystrokes, paste, hyperlink launch) goes through
@@ -147,6 +151,10 @@ pub const Terminal = struct {
 
     /// One entry of a remote directory listing.
     pub const DirEntry = struct { name: []const u8, is_dir: bool, size: u64 };
+
+    /// One installed app (answer to `requestApps`). Slices valid only
+    /// for the `on_apps` callback.
+    pub const AppEntry = struct { name: []const u8, exec: []const u8, icon: []const u8 };
 
     /// A remote directory listing (answer to `requestList`). Slices are
     /// valid only for the duration of the `on_listing` callback — the
@@ -530,6 +538,7 @@ pub const Terminal = struct {
             },
             .file_reply => self.handleFileReply(frame.payload),
             .file_listing => self.handleFileListing(frame.payload),
+            .app_listing => self.handleAppListing(frame.payload),
             .file_data => self.downloadData(frame.payload),
             .chan_open => self.chanOpen(frame.payload),
             .chan_data => self.chanData(frame.payload),
@@ -989,6 +998,27 @@ pub const Terminal = struct {
             .err = m.@"error",
             .truncated = m.truncated,
         });
+    }
+
+    /// Request the remote host's installed-app list. Reply → `on_apps`.
+    pub fn requestApps(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        remote.conn.sendFrame(.app_list, "") catch {};
+    }
+
+    fn handleAppListing(self: *Terminal, payload: []const u8) void {
+        const f = self.on_apps orelse return;
+        const Msg = struct {
+            apps: []const struct { name: []const u8 = "", exec: []const u8 = "", icon: []const u8 = "" } = &.{},
+            @"error": []const u8 = "",
+        };
+        const parsed = std.json.parseFromSlice(Msg, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        var entries = self.allocator.alloc(AppEntry, parsed.value.apps.len) catch return;
+        defer self.allocator.free(entries);
+        for (parsed.value.apps, 0..) |e, i| entries[i] = .{ .name = e.name, .exec = e.exec, .icon = e.icon };
+        f(self.apps_ctx, entries);
     }
 
     /// "file://host/path" → "/path"; otherwise unchanged.

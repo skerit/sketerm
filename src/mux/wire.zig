@@ -63,6 +63,11 @@ pub const FrameType = enum(u8) {
     // ({xfer, path}). The daemon answers `file_listing` (a JSON
     // directory listing) so the GUI can offer a remote file picker.
     file_list = 15,
+    // Installed-app discovery (client → daemon): empty payload. The
+    // daemon scans its own $XDG_DATA_DIRS/applications/*.desktop and
+    // answers `app_listing`, so a client can offer a launcher for the
+    // apps on the session's host (the remote, over SSH/UDP).
+    app_list = 16,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -77,6 +82,9 @@ pub const FrameType = enum(u8) {
     /// JSON directory listing answering `file_list`: { xfer, path,
     /// entries: [{name, dir, size}], error?, truncated? }.
     file_listing = 72,
+    /// JSON app listing answering `app_list`: { apps: [{name, exec,
+    /// icon, terminal}], truncated? }.
+    app_listing = 73,
     // Byte channels (both directions). Generic multiplexed streams
     // riding the mux connection — used to tunnel a session's app
     // protocol, so forwarded apps inherit whatever transport the

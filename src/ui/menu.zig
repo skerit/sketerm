@@ -40,6 +40,7 @@ pub const Action = enum {
     mux_kill,
     reset_terminal,
     screenshot_pane,
+    launch_remote_app,
     open_link,
     copy_link,
     prefs_open,
@@ -139,6 +140,7 @@ const MENU = [_]Item{
     } } },
     .separator,
     .{ .submenu = .{ .label = "Session", .icon = "network-server-symbolic", .remote_only = true, .items = &.{
+        .{ .name = "launch-app", .label = "Launch App…", .detailed = "term.launch-app", .icon = "application-x-executable-symbolic", .action = .launch_remote_app },
         .{ .name = "upload-file", .label = "Upload File…", .detailed = "term.upload-file", .icon = "document-send-symbolic", .action = .upload_file, .host_only = true },
         .{ .name = "download-file", .label = "Download File…", .detailed = "term.download-file", .icon = "folder-download-symbolic", .action = .download_file, .host_only = true },
         .{ .name = "mux-detach", .label = "Detach Session", .detailed = "term.mux-detach", .icon = "network-offline-symbolic", .action = .mux_detach },

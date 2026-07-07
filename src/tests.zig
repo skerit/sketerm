@@ -56,6 +56,7 @@ comptime {
     _ = @import("render/bg_pass.zig");
     _ = @import("mux/wire.zig");
     _ = @import("mux/snapshot.zig");
+    _ = @import("mux/desktop.zig");
     _ = @import("mux/rudp.zig");
     _ = @import("render/atlas_test.zig");
     _ = @import("render/atlas.zig");

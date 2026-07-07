@@ -28,6 +28,25 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Query the daemon host's installed GUI apps (name + exec) without
+/// spawning anything. `host` null = local autostart daemon. Returns a
+/// JSON array string (arena-owned via the passed allocator's arena
+/// semantics: caller frees with allocator.free).
+pub fn listInstalledApps(allocator: std.mem.Allocator, host: ?[]const u8) Error![]u8 {
+    var conn = blk: {
+        if (host) |h| break :blk muxclient.Conn.connectSsh(allocator, h) catch return Error.SpawnFailed;
+        break :blk muxclient.Conn.connectLocalAutostart(allocator) catch return Error.SpawnFailed;
+    };
+    defer conn.deinit();
+    conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.NotConnected;
+    (conn.recvExpect(&.{.welcome}) catch return Error.NotConnected).deinit(allocator);
+    // app_list needs no session attach — the daemon scans its own host.
+    conn.sendFrame(.app_list, "") catch return Error.NotConnected;
+    const f = conn.recvExpect(&.{.app_listing}) catch return Error.Timeout;
+    defer f.deinit(allocator);
+    return allocator.dupe(u8, f.payload) catch return Error.OutOfMemory;
+}
+
 /// One rendered toplevel (or popup) surface of one app channel.
 pub const Window = struct {
     /// Stable public id (MCP-facing), unique within the App.
