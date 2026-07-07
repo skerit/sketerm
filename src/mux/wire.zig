@@ -68,8 +68,10 @@ pub const FrameType = enum(u8) {
     // answers `app_listing`, so a client can offer a launcher for the
     // apps on the session's host (the remote, over SSH/UDP).
     app_list = 16,
-    /// Request the attached app session's AT-SPI accessibility tree.
-    /// Empty payload; answered with app_a11y_tree.
+    /// AT-SPI request for the attached app session. Empty payload (or
+    /// {op:"tree"}) = tree walk; {op:"action"|"set_text"|"set_value",
+    /// id, index?/text?/value?} performs the op on one node. Answered
+    /// with app_a11y_tree ({tree}, {ok:true}, or {error}).
     app_a11y = 17,
     /// Start recording the ATTACHED session's raw PTY output as an
     /// asciicast v2 file on the daemon's host. JSON { path }.

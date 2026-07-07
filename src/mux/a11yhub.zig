@@ -271,7 +271,9 @@ pub const Hub = struct {
     /// Connect to the a11y bus and serialize the tree from the
     /// registry root to JSON (arena/caller-owned). Null on any
     /// failure (bus down, no apps registered, toolkit without AT-SPI).
-    pub fn treeJson(self: *Hub, allocator: std.mem.Allocator) ?[]u8 {
+    /// Connect to the session's a11y bus (enabling toolkit a11y on
+    /// first use). Caller deinits the returned Conn.
+    fn openA11yBus(self: *Hub, allocator: std.mem.Allocator) ?Conn {
         var sess = Conn.connect(allocator, self.bus_path) catch return null;
         defer sess.deinit();
         sess.authAndHello() catch return null;
@@ -303,8 +305,16 @@ pub const Hub = struct {
         const a11y_path = parseUnixPath(a11y_addr) orelse return null;
 
         var bus = Conn.connect(allocator, a11y_path) catch return null;
+        bus.authAndHello() catch {
+            bus.deinit();
+            return null;
+        };
+        return bus;
+    }
+
+    pub fn treeJson(self: *Hub, allocator: std.mem.Allocator) ?[]u8 {
+        var bus = self.openA11yBus(allocator) orelse return null;
         defer bus.deinit();
-        bus.authAndHello() catch return null;
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
@@ -315,7 +325,111 @@ pub const Hub = struct {
         };
         return out.toOwnedSlice(allocator) catch null;
     }
+
+    /// org.a11y.atspi.Action.DoAction(index) on the node `id` (a tree
+    /// "id" value). Index 0 is the toolkit's default action (press /
+    /// activate / toggle). False on any failure.
+    pub fn doAction(self: *Hub, allocator: std.mem.Allocator, id: []const u8, index: i32) bool {
+        var path_buf: [256]u8 = undefined;
+        const ref = splitId(id, &path_buf) orelse return false;
+        var bus = self.openA11yBus(allocator) orelse return false;
+        defer bus.deinit();
+        var bw = dbus.Writer.init(allocator);
+        defer bw.deinit();
+        bw.putI32(index) catch return false;
+        const r = bus.call(.{
+            .mtype = .method_call,
+            .path = ref.path,
+            .interface = "org.a11y.atspi.Action",
+            .member = "DoAction",
+            .destination = ref.dest,
+            .signature = "i",
+            .body = bw.buf.items,
+        }) catch return false;
+        allocator.free(r.body);
+        return true;
+    }
+
+    /// org.a11y.atspi.EditableText.SetTextContents on node `id` —
+    /// replaces a text field's whole content. False on failure (node
+    /// not editable, gone, ...).
+    pub fn setTextContents(self: *Hub, allocator: std.mem.Allocator, id: []const u8, text: []const u8) bool {
+        var path_buf: [256]u8 = undefined;
+        const ref = splitId(id, &path_buf) orelse return false;
+        var bus = self.openA11yBus(allocator) orelse return false;
+        defer bus.deinit();
+        var bw = dbus.Writer.init(allocator);
+        defer bw.deinit();
+        bw.putString(text) catch return false;
+        const r = bus.call(.{
+            .mtype = .method_call,
+            .path = ref.path,
+            .interface = "org.a11y.atspi.EditableText",
+            .member = "SetTextContents",
+            .destination = ref.dest,
+            .signature = "s",
+            .body = bw.buf.items,
+        }) catch return false;
+        allocator.free(r.body);
+        return true;
+    }
+
+    /// Set org.a11y.atspi.Value.CurrentValue (sliders, spinners,
+    /// scrollbars) on node `id`. False on failure.
+    pub fn setCurrentValue(self: *Hub, allocator: std.mem.Allocator, id: []const u8, value: f64) bool {
+        var path_buf: [256]u8 = undefined;
+        const ref = splitId(id, &path_buf) orelse return false;
+        var bus = self.openA11yBus(allocator) orelse return false;
+        defer bus.deinit();
+        var bw = dbus.Writer.init(allocator);
+        defer bw.deinit();
+        bw.putString("org.a11y.atspi.Value") catch return false;
+        bw.putString("CurrentValue") catch return false;
+        bw.putSig("d") catch return false;
+        bw.putF64(value) catch return false;
+        const r = bus.call(.{
+            .mtype = .method_call,
+            .path = ref.path,
+            .interface = "org.freedesktop.DBus.Properties",
+            .member = "Set",
+            .destination = ref.dest,
+            .signature = "ssv",
+            .body = bw.buf.items,
+        }) catch return false;
+        allocator.free(r.body);
+        return true;
+    }
 };
+
+/// Standard AT-SPI object-path prefix; node ids compress it away.
+const ATSPI_PATH_PREFIX = "/org/a11y/atspi/accessible/";
+
+/// Compose a compact node id from a (dest, path) pair: "<dest>#<tail>"
+/// where tail is the path with the standard prefix stripped (full
+/// paths that don't match keep their leading '/').
+fn makeId(out: *std.ArrayList(u8), a: std.mem.Allocator, dest: []const u8, path: []const u8) !void {
+    try out.appendSlice(a, dest);
+    try out.append(a, '#');
+    if (std.mem.startsWith(u8, path, ATSPI_PATH_PREFIX)) {
+        try out.appendSlice(a, path[ATSPI_PATH_PREFIX.len..]);
+    } else {
+        try out.appendSlice(a, path);
+    }
+}
+
+const IdRef = struct { dest: []const u8, path: []const u8 };
+
+/// Parse a node id back into (dest, path). `path_buf` backs a
+/// reconstructed standard path.
+fn splitId(id: []const u8, path_buf: *[256]u8) ?IdRef {
+    const hash = std.mem.indexOfScalar(u8, id, '#') orelse return null;
+    const dest = id[0..hash];
+    const tail = id[hash + 1 ..];
+    if (dest.len == 0 or tail.len == 0) return null;
+    if (tail[0] == '/') return .{ .dest = dest, .path = tail };
+    const p = std.fmt.bufPrint(path_buf, ATSPI_PATH_PREFIX ++ "{s}", .{tail}) catch return null;
+    return .{ .dest = dest, .path = p };
+}
 
 /// Set a boolean org.a11y.Status property on /org/a11y/bus (session
 /// bus) via org.freedesktop.DBus.Properties.Set(ssv). This is how an
@@ -494,7 +608,9 @@ const Walker = struct {
         const st = self.states(dest, path) catch [2]u32{ 0, 0 };
         const ext = self.extents(dest, path);
 
-        try w.appendSlice(a, "{\"role\":");
+        try w.appendSlice(a, "{\"id\":\"");
+        try makeId(w, a, dest, path);
+        try w.appendSlice(a, "\",\"role\":");
         try printInt(w, a, role_num);
         try w.appendSlice(a, ",\"name\":");
         try printJsonString(w, a, name);
@@ -517,6 +633,15 @@ const Walker = struct {
             try w.appendSlice(a, ",");
             try printIntI(w, a, e[3]);
             try w.appendSlice(a, "]");
+        }
+        // Value.CurrentValue for nodes that expose the Value interface
+        // (sliders, spinners, progress, scrollbars) — lets the
+        // assistant read a control's setting and confirm set_value.
+        if (self.currentValue(dest, path)) |v| {
+            var vbuf: [32]u8 = undefined;
+            const vs = std.fmt.bufPrint(&vbuf, "{d}", .{v}) catch "";
+            try w.appendSlice(a, ",\"value\":");
+            try w.appendSlice(a, vs);
         }
 
         var kids = self.children(dest, path) catch std.ArrayList(Ref).empty;
@@ -627,6 +752,29 @@ const Walker = struct {
         const wd = rd.i32v() catch return null;
         const ht = rd.i32v() catch return null;
         return .{ x, y, wd, ht };
+    }
+
+    /// org.a11y.atspi.Value.CurrentValue (a double), or null when the
+    /// node has no Value interface (Properties.Get errors / wrong type).
+    fn currentValue(self: *Walker, dest: []const u8, path: []const u8) ?f64 {
+        var bw = dbus.Writer.init(self.allocator);
+        defer bw.deinit();
+        bw.putString("org.a11y.atspi.Value") catch return null;
+        bw.putString("CurrentValue") catch return null;
+        const r = self.conn.call(.{
+            .mtype = .method_call,
+            .path = path,
+            .interface = "org.freedesktop.DBus.Properties",
+            .member = "Get",
+            .destination = dest,
+            .signature = "ss",
+            .body = bw.buf.items,
+        }) catch return null;
+        defer self.allocator.free(r.body);
+        var rd = dbus.Reader.init(r.body);
+        const vsig = rd.sig() catch return null;
+        if (vsig.len != 1 or vsig[0] != 'd') return null;
+        return rd.f64v() catch null;
     }
 
     fn stringProp(self: *Walker, dest: []const u8, path: []const u8, iface: []const u8, prop: []const u8) ![]u8 {
