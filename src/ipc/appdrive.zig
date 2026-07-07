@@ -38,10 +38,10 @@ pub const Error = error{
 /// spawning anything. `host` null = local autostart daemon. Returns a
 /// JSON array string (arena-owned via the passed allocator's arena
 /// semantics: caller frees with allocator.free).
-pub fn listInstalledApps(allocator: std.mem.Allocator, host: ?[]const u8) Error![]u8 {
+pub fn listInstalledApps(allocator: std.mem.Allocator, host: ?[]const u8, local_sock: ?[]const u8) Error![]u8 {
     var conn = blk: {
         if (host) |h| break :blk muxclient.Conn.connectSsh(allocator, h) catch return Error.SpawnFailed;
-        break :blk muxclient.Conn.connectLocalAutostart(allocator) catch return Error.SpawnFailed;
+        break :blk muxclient.Conn.connectLocalAutostartAt(allocator, local_sock) catch return Error.SpawnFailed;
     };
     defer conn.deinit();
     conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.NotConnected;
@@ -51,6 +51,46 @@ pub fn listInstalledApps(allocator: std.mem.Allocator, host: ?[]const u8) Error!
     const f = conn.recvExpect(&.{.app_listing}) catch return Error.Timeout;
     defer f.deinit(allocator);
     return allocator.dupe(u8, f.payload) catch return Error.OutOfMemory;
+}
+
+/// Names of live app sessions on the daemon at `sock`, WITHOUT
+/// autostarting one (no daemon = empty). Caller frees each name and
+/// the slice.
+pub fn listAppSessions(allocator: std.mem.Allocator, sock: []const u8) Error![][]u8 {
+    var conn = muxclient.Conn.connect(allocator, sock) catch return Error.SpawnFailed;
+    defer conn.deinit();
+    conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.NotConnected;
+    (conn.recvExpect(&.{.welcome}) catch return Error.NotConnected).deinit(allocator);
+    conn.sendFrame(.list, "") catch return Error.NotConnected;
+    const f = conn.recvExpect(&.{.welcome}) catch return Error.Timeout;
+    defer f.deinit(allocator);
+
+    const Listing = struct {
+        sessions: []const struct {
+            name: []const u8,
+            app: bool = false,
+            exited: bool = false,
+        } = &.{},
+    };
+    const parsed = std.json.parseFromSlice(Listing, allocator, f.payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return Error.NotConnected;
+    defer parsed.deinit();
+
+    var names: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+    for (parsed.value.sessions) |s| {
+        if (!s.app or s.exited) continue;
+        const n = allocator.dupe(u8, s.name) catch return Error.OutOfMemory;
+        names.append(allocator, n) catch {
+            allocator.free(n);
+            return Error.OutOfMemory;
+        };
+    }
+    return names.toOwnedSlice(allocator) catch Error.OutOfMemory;
 }
 
 /// One rendered toplevel (or popup) surface of one app channel.
@@ -119,7 +159,8 @@ pub const App = struct {
     /// Spawn an app session on the local (autostart) daemon, or on
     /// `host` over SSH, and attach as a proto-v5 viewer. `kb_layout`
     /// picks the session keymap (wlhost/keymaps.zig; null/"" = us) —
-    /// typing is encoded against the same blob.
+    /// typing is encoded against the same blob. `local_sock` targets a
+    /// private daemon instance (MCP isolation); null = shared daemon.
     pub fn launch(
         allocator: std.mem.Allocator,
         argv: []const []const u8,
@@ -127,6 +168,7 @@ pub const App = struct {
         rows: u16,
         host: ?[]const u8,
         kb_layout: ?[]const u8,
+        local_sock: ?[]const u8,
     ) Error!*App {
         const layout_name = kb_layout orelse "";
         const blob = keymaps.get(layout_name) orelse return Error.BadLayout;
@@ -134,7 +176,7 @@ pub const App = struct {
         errdefer if (layout) |*l| l.deinit(allocator);
         var conn = blk: {
             if (host) |h| break :blk muxclient.Conn.connectSsh(allocator, h) catch return Error.SpawnFailed;
-            break :blk muxclient.Conn.connectLocalAutostart(allocator) catch return Error.SpawnFailed;
+            break :blk muxclient.Conn.connectLocalAutostartAt(allocator, local_sock) catch return Error.SpawnFailed;
         };
         errdefer conn.deinit();
 
@@ -162,6 +204,45 @@ pub const App = struct {
         self.* = .{ .allocator = allocator, .conn = conn, .name = name, .layout = layout };
         layout = null; // ownership moved
         return self;
+    }
+
+    /// Attach to an EXISTING app session (named-instance reconnect).
+    /// Same wire flow as `launch` minus the spawn — the daemon replays
+    /// pool bytes + state_sync, so windows rebuild with pixels. The
+    /// session's keymap isn't recoverable from the wire; `kb_layout`
+    /// should repeat the launch-time value (null = us).
+    pub fn attachExisting(
+        allocator: std.mem.Allocator,
+        session_name: []const u8,
+        kb_layout: ?[]const u8,
+        local_sock: ?[]const u8,
+    ) Error!*App {
+        const layout_name = kb_layout orelse "";
+        const blob = keymaps.get(layout_name) orelse return Error.BadLayout;
+        var layout: ?xkblayout.Layout = xkblayout.parse(allocator, blob) catch null;
+        errdefer if (layout) |*l| l.deinit(allocator);
+        var conn = muxclient.Conn.connectLocalAutostartAt(allocator, local_sock) catch return Error.SpawnFailed;
+        errdefer conn.deinit();
+
+        conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.SpawnFailed;
+        (conn.recvExpect(&.{.welcome}) catch return Error.SpawnFailed).deinit(allocator);
+
+        const name = allocator.dupe(u8, session_name) catch return Error.OutOfMemory;
+        errdefer allocator.free(name);
+        conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
+        (conn.recvExpect(&.{.snapshot}) catch return Error.SpawnFailed).deinit(allocator);
+
+        const self = allocator.create(App) catch return Error.OutOfMemory;
+        self.* = .{ .allocator = allocator, .conn = conn, .name = name, .layout = layout };
+        layout = null; // ownership moved
+        return self;
+    }
+
+    /// Free the client-side state WITHOUT killing the session — a
+    /// durable instance's apps outlive the MCP process.
+    pub fn detach(self: *App) void {
+        self.exited = true; // suppress deinit's kill frame
+        self.deinit();
     }
 
     /// Kill the session (the app dies with it) and free everything.

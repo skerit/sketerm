@@ -341,7 +341,7 @@ const pathZ = @import("../util/pathz.zig").pathZ;
 /// the OS reclaims at logout anyway). Used to tear down an isolated
 /// session's private XDG_RUNTIME_DIR, which apps fill with sockets and
 /// the odd subdir (dbus-1/, pulse/) we don't track individually.
-fn removeTreeBestEffort(path: []const u8) void {
+pub fn removeTreeBestEffort(path: []const u8) void {
     var z_buf: [4096]u8 = undefined;
     const zpath = pathZ(&z_buf, path) catch return;
     if (c.opendir(zpath)) |dir| {

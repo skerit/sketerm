@@ -60,7 +60,17 @@ pub const Conn = struct {
     /// it announces OUR proto version, which gates whether the
     /// daemon offers byte channels (Wayland app forwarding).
     pub fn connectLocalAutostart(allocator: std.mem.Allocator) !Conn {
-        const path = try daemon.defaultSocketPath(allocator);
+        return connectLocalAutostartAt(allocator, null);
+    }
+
+    /// Like `connectLocalAutostart`, but against `sock_path` when given —
+    /// a PRIVATE daemon instance (its aux sockets live next to the socket),
+    /// used by `sketerm mcp` isolation. null = the shared per-user daemon.
+    pub fn connectLocalAutostartAt(allocator: std.mem.Allocator, sock_path: ?[]const u8) !Conn {
+        const path = if (sock_path) |p|
+            try allocator.dupe(u8, p)
+        else
+            try daemon.defaultSocketPath(allocator);
         defer allocator.free(path);
         if (Conn.connect(allocator, path)) |conn| {
             if (helloProbe(allocator, conn)) |ready| {
@@ -80,18 +90,29 @@ pub const Conn = struct {
         // or its siblings. SKETERM_NO_BROKER=1 falls back to the single-process
         // monolith (escape hatch if the broker ever misbehaves in the field).
         const use_broker = c.getenv("SKETERM_NO_BROKER") == null;
+        // NUL-terminated socket arg for the child; prepared before fork
+        // (no allocation between fork and exec).
+        var sock_z_buf: [4096:0]u8 = undefined;
+        const sock_z: ?[*:0]const u8 = if (sock_path != null)
+            (std.fmt.bufPrintZ(&sock_z_buf, "{s}", .{path}) catch return error.BadPath).ptr
+        else
+            null;
         const pid = c.fork();
         if (pid == 0) {
             _ = c.setsid();
             var bin_buf: [4096:0]u8 = undefined;
             const bin = findMuxBinary(&bin_buf);
+            var argv: [5:null]?[*:0]const u8 = .{ bin, null, null, null, null };
+            var n: usize = 1;
             if (use_broker) {
-                const argv = [_:null]?[*:0]const u8{ bin, "--broker", null };
-                _ = c.execvp(bin, @ptrCast(@constCast(&argv)));
-            } else {
-                const argv = [_:null]?[*:0]const u8{ bin, null };
-                _ = c.execvp(bin, @ptrCast(@constCast(&argv)));
+                argv[n] = "--broker";
+                n += 1;
             }
+            if (sock_z) |z| {
+                argv[n] = "--socket";
+                argv[n + 1] = z;
+            }
+            _ = c.execvp(bin, @ptrCast(@constCast(&argv)));
             c._exit(127);
         }
         var tries: u32 = 0;
