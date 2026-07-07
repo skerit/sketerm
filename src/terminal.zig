@@ -113,6 +113,12 @@ pub const Terminal = struct {
     /// Fired when the mux daemon confirmed a session rename. The new
     /// name is already committed to `remote.session`.
     on_session_renamed: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
+    /// Fired when the daemon acks a recording start/stop (see
+    /// `recording`), so the UI can toggle its menu/indicator.
+    on_recording_changed: ?*const fn (ctx: ?*anyopaque, recording: bool) void = null,
+    /// True while the daemon records this session as an asciicast
+    /// (client-side mirror; set on the daemon's rec_start/stop OK).
+    recording: bool = false,
     /// Fired as a file transfer (upload OR download) to/from a remote
     /// session progresses. The GUI drives the tab progress ring + a
     /// completion/failure toast.
@@ -211,6 +217,10 @@ pub const Terminal = struct {
         /// Rename sent to the daemon, awaiting its OK. Committed to
         /// `session` on .ok, dropped on .err. Owned while non-null.
         pending_rename: ?[]u8 = null,
+        /// rec_start (1) / rec_stop (2) awaiting the daemon's OK.
+        /// Interactive actions are one-at-a-time, so a single slot
+        /// suffices (like pending_rename).
+        pending_record: u8 = 0,
         watch_id: c_uint = 0,
         /// Set when the daemon said GONE/EXIT — no more writes.
         closed: bool = false,
@@ -527,12 +537,18 @@ pub const Terminal = struct {
                 }
                 self.remoteClosed("session ended", false);
             },
-            // The only request the GUI sends that's answered with
-            // OK/ERR while attached is a rename (resize answers with
-            // a SNAPSHOT; detach is sent during teardown). Guarded by
-            // pending_rename anyway, so a future frame can't misfire.
+            // OK/ERR answer renames and rec_start/rec_stop (resize
+            // answers with a SNAPSHOT; detach is sent during
+            // teardown). Both are one-at-a-time interactive actions;
+            // record is checked first, rename keeps its guard.
             .ok => {
                 const remote = self.remote orelse return;
+                if (remote.pending_record != 0) {
+                    self.recording = remote.pending_record == 1;
+                    remote.pending_record = 0;
+                    if (self.on_recording_changed) |f| f(self.user_ctx, self.recording);
+                    return;
+                }
                 const pending = remote.pending_rename orelse return;
                 remote.pending_rename = null;
                 self.allocator.free(remote.session);
@@ -541,6 +557,13 @@ pub const Terminal = struct {
             },
             .err => {
                 const remote = self.remote orelse return;
+                if (remote.pending_record != 0) {
+                    std.debug.print("sketerm: session record request rejected: {s}\n", .{frame.payload});
+                    remote.pending_record = 0;
+                    self.recording = false;
+                    if (self.on_recording_changed) |f| f(self.user_ctx, false);
+                    return;
+                }
                 if (remote.pending_rename) |pending| {
                     std.debug.print("sketerm: mux rename of '{s}' rejected: {s}\n", .{ remote.session, frame.payload });
                     self.allocator.free(pending);
@@ -1017,6 +1040,23 @@ pub const Terminal = struct {
         const remote = self.remote orelse return;
         if (remote.closed) return;
         remote.conn.sendFrame(.app_list, "") catch {};
+    }
+
+    /// Start recording this session as an asciicast v2 file. The file
+    /// is written by the DAEMON on its host — remote sessions record
+    /// to a remote path. `recording` flips when the daemon acks.
+    pub fn requestRecordStart(self: *Terminal, path: []const u8) void {
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        remote.pending_record = 1;
+        remote.conn.sendJson(.rec_start, .{ .path = path }) catch {};
+    }
+
+    pub fn requestRecordStop(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        remote.pending_record = 2;
+        remote.conn.sendFrame(.rec_stop, "") catch {};
     }
 
     fn handleAppListing(self: *Terminal, payload: []const u8) void {

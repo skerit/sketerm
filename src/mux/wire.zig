@@ -71,6 +71,13 @@ pub const FrameType = enum(u8) {
     /// Request the attached app session's AT-SPI accessibility tree.
     /// Empty payload; answered with app_a11y_tree.
     app_a11y = 17,
+    /// Start recording the ATTACHED session's raw PTY output as an
+    /// asciicast v2 file on the daemon's host. JSON { path }.
+    /// Answered with ok / err. Recording survives detach; a second
+    /// rec_start replaces the previous recording.
+    rec_start = 18,
+    /// Stop the attached session's recording. Empty payload; ok/err.
+    rec_stop = 19,
     // daemon → client
     welcome = 64,
     snapshot = 65,

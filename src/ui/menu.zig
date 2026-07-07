@@ -40,6 +40,8 @@ pub const Action = enum {
     mux_kill,
     reset_terminal,
     screenshot_pane,
+    record_session,
+    record_session_stop,
     launch_remote_app,
     open_link,
     copy_link,
@@ -79,6 +81,10 @@ const Bind = struct {
     /// is pointless. Hidden when the pre-popup hook leaves
     /// "upload-file" disabled.
     host_only: bool = false,
+    /// Recording-state pair: 1 = "start recording" row (hidden while
+    /// the session records), 2 = "stop" row (shown only while it
+    /// does). The pre-popup hook drives the actions' enabled state.
+    rec_row: u8 = 0,
 };
 
 const Submenu = struct {
@@ -120,6 +126,8 @@ const MENU = [_]Item{
         .{ .name = "set-pane-title", .label = "Set Pane Title…", .detailed = "term.set-pane-title", .icon = "document-edit-symbolic", .action = .set_pane_title },
         .{ .name = "apply-profile", .label = "Apply Profile to Pane…", .detailed = "term.apply-profile", .icon = "preferences-other-symbolic", .action = .apply_profile },
         .{ .name = "screenshot-pane", .label = "Screenshot Pane…", .detailed = "term.screenshot-pane", .icon = "camera-photo-symbolic", .action = .screenshot_pane },
+        .{ .name = "record-session", .label = "Record Session (asciicast)…", .detailed = "term.record-session", .icon = "media-record-symbolic", .action = .record_session, .rec_row = 1 },
+        .{ .name = "record-stop", .label = "Stop Session Recording", .detailed = "term.record-stop", .icon = "media-playback-stop-symbolic", .action = .record_session_stop, .rec_row = 2 },
         .{ .name = "close-pane", .label = "Close Pane", .detailed = "term.close-pane", .icon = "window-close-symbolic", .action = .close_pane },
     } } },
     .{ .submenu = .{ .label = "Shader", .icon = "sketerm-rendering-symbolic", .items = &.{
@@ -231,6 +239,10 @@ const ClickCtx = struct {
     /// the pre-popup hook enabled the mux actions. Children of the
     /// popover, so the pointers never outlive it.
     remote_widgets: [N_REMOTE_WIDGETS]?*c.GtkWidget = @splat(null),
+    /// Recording start/stop rows; visibility mirrors the session's
+    /// recording state via the pre-popup hook.
+    rec_start_widgets: [1]?*c.GtkWidget = @splat(null),
+    rec_stop_widgets: [1]?*c.GtkWidget = @splat(null),
     /// Link rows + their trailing separator; shown only when the
     /// pre-popup hook found a link under the click.
     link_widgets: [N_LINK_WIDGETS]?*c.GtkWidget = @splat(null),
@@ -288,7 +300,7 @@ pub fn attachWithPrePopup(
     // Link + mux + file-transfer actions default disabled; the pane's
     // pre-popup hook enables them per-popup. Their rows show/hide on
     // that state.
-    for ([_][*:0]const u8{ "open-link", "copy-link", "mux-detach", "mux-rename", "mux-kill", "upload-file", "download-file" }) |name| {
+    for ([_][*:0]const u8{ "open-link", "copy-link", "mux-detach", "mux-rename", "mux-kill", "upload-file", "download-file", "record-stop" }) |name| {
         if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
             c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), 0);
         }
@@ -364,6 +376,8 @@ pub fn attachWithPrePopup(
                         cctx.host_widgets[n_host] = child;
                         n_host += 1;
                     }
+                    if (b.rec_row == 1) cctx.rec_start_widgets[0] = child;
+                    if (b.rec_row == 2) cctx.rec_stop_widgets[0] = child;
                 }
                 c.gtk_popover_set_child(@ptrCast(sub_pop), sub_list);
                 // Click also opens the submenu (keyboard / touch path).
@@ -568,6 +582,8 @@ fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaq
     setGroupVisible(ctx.group, "mux-detach", &ctx.remote_widgets);
     setGroupVisible(ctx.group, "copy-link", &ctx.link_widgets);
     setGroupVisible(ctx.group, "upload-file", &ctx.host_widgets);
+    setGroupVisible(ctx.group, "record-session", &ctx.rec_start_widgets);
+    setGroupVisible(ctx.group, "record-stop", &ctx.rec_stop_widgets);
     // Fresh popup: no submenu open.
     for (ctx.subs) |maybe_sub| {
         const sub = maybe_sub orelse continue;
