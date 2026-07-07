@@ -5759,6 +5759,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .toggle_pin_tab => self.togglePinCurrentTab(),
         .toggle_tab_bar => self.toggleTabBarVisibility(),
         .reload_config => self.reloadConfigFromDisk(),
+        .launch_app => if (self.focusedPane()) |p| @import("app_launcher.zig").open(self, p),
         .goto_tab_1 => self.gotoTab(0),
         .goto_tab_2 => self.gotoTab(1),
         .goto_tab_3 => self.gotoTab(2),

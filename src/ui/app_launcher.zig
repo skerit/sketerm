@@ -12,6 +12,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const pathz = @import("../util/pathz.zig");
 const Window = @import("window.zig").Window;
 const Pane = @import("pane.zig").Pane;
 const Terminal = @import("../terminal.zig").Terminal;
@@ -26,6 +27,8 @@ const Launcher = struct {
     status: *c.GtkWidget,
     /// Owned host string for spawning ("" = local).
     host: []u8,
+    /// Recently launched apps (persisted), most recent first.
+    recents: ?std.json.Parsed([]RecentEntry) = null,
 
     fn liveTerminal(self: *Launcher) ?*Terminal {
         for (self.win.panes.items) |p| {
@@ -34,6 +37,80 @@ const Launcher = struct {
         return null;
     }
 };
+
+// ── recent-apps persistence ($XDG_STATE_HOME/sketerm) ────────────
+
+const RecentEntry = struct {
+    host: []const u8 = "",
+    name: []const u8 = "",
+    exec: []const u8 = "",
+    icon: []const u8 = "",
+};
+
+const max_recents = 12;
+
+fn recentsPath(allocator: std.mem.Allocator) ![]u8 {
+    const profile = @import("../util/profile.zig");
+    if (profile.getenv("XDG_STATE_HOME")) |xs| {
+        return std.fmt.allocPrint(allocator, "{s}/sketerm/recent-apps.json", .{xs});
+    }
+    if (profile.getenv("HOME")) |home| {
+        return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/recent-apps.json", .{home});
+    }
+    return error.NoHome;
+}
+
+fn loadRecents(allocator: std.mem.Allocator) ?std.json.Parsed([]RecentEntry) {
+    const path = recentsPath(allocator) catch return null;
+    defer allocator.free(path);
+    var zbuf: [4096]u8 = undefined;
+    const z = pathz.pathZ(&zbuf, path) catch return null;
+    const f = c.fopen(z, "rb") orelse return null;
+    defer _ = c.fclose(f);
+    var buf: [64 * 1024]u8 = undefined;
+    const n = c.fread(&buf, 1, buf.len, f);
+    if (n == 0) return null;
+    return std.json.parseFromSlice([]RecentEntry, allocator, buf[0..n], .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch null;
+}
+
+/// Prepend (host, name, exec, icon), dedupe by host+exec, cap, save.
+fn saveRecent(allocator: std.mem.Allocator, host: []const u8, name: []const u8, exec: []const u8, icon: []const u8) void {
+    var list: std.ArrayList(RecentEntry) = .empty;
+    defer list.deinit(allocator);
+    list.append(allocator, .{ .host = host, .name = name, .exec = exec, .icon = icon }) catch return;
+    const old = loadRecents(allocator);
+    defer if (old) |o| o.deinit();
+    if (old) |o| {
+        for (o.value) |e| {
+            if (std.mem.eql(u8, e.host, host) and std.mem.eql(u8, e.exec, exec)) continue;
+            if (list.items.len >= max_recents) break;
+            list.append(allocator, e) catch break;
+        }
+    }
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    std.json.Stringify.value(list.items, .{}, &aw.writer) catch return;
+    const path = recentsPath(allocator) catch return;
+    defer allocator.free(path);
+    pathz.makeParentDirs(path) catch return;
+    var zbuf: [4096]u8 = undefined;
+    const z = pathz.pathZ(&zbuf, path) catch return;
+    const f = c.fopen(z, "wb") orelse return;
+    defer _ = c.fclose(f);
+    _ = c.fwrite(aw.written().ptr, 1, aw.written().len, f);
+}
+
+/// 1-based recency rank of (host, exec), 0 = not recent.
+fn recentRank(self: *Launcher, exec: []const u8) usize {
+    const parsed = self.recents orelse return 0;
+    for (parsed.value, 0..) |e, i| {
+        if (std.mem.eql(u8, e.host, self.host) and std.mem.eql(u8, e.exec, exec)) return i + 1;
+    }
+    return 0;
+}
 
 /// Open the launcher for `pane` (a remote/durable session pane).
 pub fn open(win: *Window, pane: *Pane) void {
@@ -61,6 +138,8 @@ pub fn open(win: *Window, pane: *Pane) void {
         },
     };
 
+    self.recents = loadRecents(allocator);
+
     var title_buf: [256]u8 = undefined;
     const disp = if (host_str.len > 0) host_str else "this machine";
     const title = std.fmt.bufPrintZ(&title_buf, "Launch App on {s}", .{disp}) catch "Launch App";
@@ -74,13 +153,26 @@ pub fn open(win: *Window, pane: *Pane) void {
     c.gtk_widget_set_margin_top(search, 8);
     c.gtk_widget_set_margin_bottom(search, 4);
     _ = c.g_signal_connect_data(search, "search-changed", @ptrCast(&onSearchChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    // Enter launches the first (best) visible match; Esc closes.
+    _ = c.g_signal_connect_data(search, "activate", @ptrCast(&onSearchActivate), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(search, "stop-search", @ptrCast(&onStopSearch), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(root), search);
+    const esc = c.gtk_shortcut_controller_new();
+    c.gtk_shortcut_controller_add_shortcut(
+        @ptrCast(esc),
+        c.gtk_shortcut_new(
+            c.gtk_keyval_trigger_new(c.GDK_KEY_Escape, 0),
+            c.gtk_callback_action_new(@ptrCast(&onEscape), @ptrCast(self), null),
+        ),
+    );
+    c.gtk_widget_add_controller(window, esc);
 
     const scroller = c.gtk_scrolled_window_new();
     c.gtk_widget_set_vexpand(scroller, 1);
     c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
     c.gtk_scrolled_window_set_child(@ptrCast(scroller), list);
     c.gtk_list_box_set_filter_func(@ptrCast(list), @ptrCast(&filterRow), @ptrCast(self), null);
+    c.gtk_list_box_set_sort_func(@ptrCast(list), @ptrCast(&sortRow), @ptrCast(self), null);
     _ = c.g_signal_connect_data(list, "row-activated", @ptrCast(&onRowActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(root), scroller);
 
@@ -98,7 +190,31 @@ pub fn open(win: *Window, pane: *Pane) void {
     pane.terminal.apps_ctx = @ptrCast(self);
     pane.terminal.on_apps = onApps;
     c.gtk_window_present(@ptrCast(window));
+    _ = c.gtk_widget_grab_focus(search);
     pane.terminal.requestApps();
+}
+
+fn onEscape(_: ?*c.GtkWidget, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(Launcher, user);
+    c.gtk_window_destroy(@ptrCast(self.window));
+    return 1;
+}
+
+fn onStopSearch(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Launcher, user);
+    c.gtk_window_destroy(@ptrCast(self.window));
+}
+
+/// Enter in the search box: launch the first visible row.
+fn onSearchActivate(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Launcher, user);
+    var i: c_int = 0;
+    while (c.gtk_list_box_get_row_at_index(@ptrCast(self.listbox), i)) |row| : (i += 1) {
+        if (filterRow(@ptrCast(row), @ptrCast(self)) != 0) {
+            launchRow(self, @ptrCast(row));
+            return;
+        }
+    }
 }
 
 fn onDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
@@ -109,6 +225,7 @@ fn onDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
             term.apps_ctx = null;
         }
     }
+    if (self.recents) |r| r.deinit();
     self.allocator.free(self.host);
     self.allocator.destroy(self);
 }
@@ -153,20 +270,65 @@ fn addRow(self: *Launcher, app: Terminal.AppEntry) void {
     c.gtk_box_append(@ptrCast(box), label);
     c.gtk_list_box_row_set_child(@ptrCast(row), box);
 
-    // Stash exec + name (GLib-owned copies) for filtering/activation.
+    // Stash exec + name (GLib-owned copies) for filtering/activation,
+    // recency rank (as pointer-sized int) for sorting, and the icon
+    // for the recents file.
     var exec_buf: [4096]u8 = undefined;
     if (std.fmt.bufPrintZ(&exec_buf, "{s}", .{app.exec})) |ez| {
         c.g_object_set_data_full(@ptrCast(@alignCast(row)), "al-exec", c.g_strdup(ez.ptr), c.g_free);
     } else |_| return;
     c.g_object_set_data_full(@ptrCast(@alignCast(row)), "al-name", c.g_strdup(name_z.ptr), c.g_free);
+    if (app.icon.len > 0) {
+        var icon_buf2: [256]u8 = undefined;
+        if (std.fmt.bufPrintZ(&icon_buf2, "{s}", .{app.icon})) |iz| {
+            c.g_object_set_data_full(@ptrCast(@alignCast(row)), "al-icon", c.g_strdup(iz.ptr), c.g_free);
+        } else |_| {}
+    }
+    const rank = recentRank(self, app.exec);
+    c.g_object_set_data(@ptrCast(@alignCast(row)), "al-rank", @ptrFromInt(rank));
+    if (rank > 0) {
+        const star = c.gtk_image_new_from_icon_name("document-open-recent-symbolic");
+        c.gtk_widget_set_tooltip_text(star, "Recently launched");
+        c.gtk_box_append(@ptrCast(box), star);
+    }
     c.gtk_list_box_append(@ptrCast(self.listbox), row);
 }
 
+fn rowRank(row: *c.GtkListBoxRow) usize {
+    return @intFromPtr(c.g_object_get_data(@ptrCast(@alignCast(row)), "al-rank"));
+}
+
+/// Recently launched first (most recent on top), then alphabetical.
+fn sortRow(r1: *c.GtkListBoxRow, r2: *c.GtkListBoxRow, _: ?*anyopaque) callconv(.c) c_int {
+    const a = rowRank(r1);
+    const b = rowRank(r2);
+    if (a != b) {
+        if (a == 0) return 1;
+        if (b == 0) return -1;
+        return if (a < b) -1 else 1;
+    }
+    const n1 = c.g_object_get_data(@ptrCast(@alignCast(r1)), "al-name");
+    const n2 = c.g_object_get_data(@ptrCast(@alignCast(r2)), "al-name");
+    if (n1 == null or n2 == null) return 0;
+    return c.g_ascii_strcasecmp(@ptrCast(n1), @ptrCast(n2));
+}
+
 fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
-    const self = cast.userData(Launcher, user);
+    launchRow(cast.userData(Launcher, user), row);
+}
+
+fn launchRow(self: *Launcher, row: *c.GtkListBoxRow) void {
     const exec_c = c.g_object_get_data(@ptrCast(@alignCast(row)), "al-exec") orelse return;
     const exec = std.mem.span(@as([*:0]const u8, @ptrCast(exec_c)));
     if (exec.len == 0) return;
+    const name: []const u8 = if (c.g_object_get_data(@ptrCast(@alignCast(row)), "al-name")) |n|
+        std.mem.span(@as([*:0]const u8, @ptrCast(n)))
+    else
+        "";
+    const icon: []const u8 = if (c.g_object_get_data(@ptrCast(@alignCast(row)), "al-icon")) |i|
+        std.mem.span(@as([*:0]const u8, @ptrCast(i)))
+    else
+        "";
 
     // Spawn via the host's shell so full Exec strings work.
     const host_opt: ?[]const u8 = if (self.host.len > 0) self.host else null;
@@ -175,6 +337,7 @@ fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) ca
         c.gtk_label_set_text(@ptrCast(self.status), "Launch failed (daemon refused the app session)");
         return;
     };
+    saveRecent(self.allocator, self.host, name, exec, icon);
     c.gtk_window_destroy(@ptrCast(self.window));
 }
 

@@ -104,6 +104,9 @@ pub const Action = enum {
     /// Honours XDG search path; --config override paths are not
     /// re-honoured (user would need to restart).
     reload_config,
+    /// Open the app launcher (installed GUI apps on the focused
+    /// pane's host — local daemon or SSH remote).
+    launch_app,
     /// Jump to a specific tab by 1-based index. Defaults: Alt+1
     /// through Alt+9 — gnome-terminal / Firefox / most multi-tab
     /// apps use this. Out-of-range index is a no-op.
@@ -209,6 +212,7 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_g, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .broadcast_cycle },
     .{ .keyval = c.GDK_KEY_e, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .hints_open },
     .{ .keyval = c.GDK_KEY_z, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .restore_closed_tab },
+    .{ .keyval = c.GDK_KEY_o, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .launch_app },
     .{ .keyval = c.GDK_KEY_a, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_screen },
     // Kitty's default for show_scrollback.
     .{ .keyval = c.GDK_KEY_h, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .show_scrollback },
@@ -300,6 +304,7 @@ pub fn actionName(a: Action) []const u8 {
         .toggle_pin_tab => "toggle_pin_tab",
         .toggle_tab_bar => "toggle_tab_bar",
         .reload_config => "reload_config",
+        .launch_app => "launch_app",
         .goto_tab_1 => "goto_tab_1",
         .goto_tab_2 => "goto_tab_2",
         .goto_tab_3 => "goto_tab_3",
@@ -373,6 +378,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .toggle_pin_tab => "Pin / unpin current tab",
         .toggle_tab_bar => "Show / hide tab bar",
         .reload_config => "Reload config from disk",
+        .launch_app => "Launch app on this host…",
         .goto_tab_1 => "Jump to tab 1",
         .goto_tab_2 => "Jump to tab 2",
         .goto_tab_3 => "Jump to tab 3",
