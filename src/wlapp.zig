@@ -38,6 +38,8 @@ pub const AppHost = struct {
     /// Hook for shipping requestClose (and other view-initiated
     /// events) immediately rather than on the next feed.
     on_flush: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// A headless MCP client is attached (drives the badge).
+    driven: bool = false,
     flush_ctx: ?*anyopaque = null,
     /// Outgoing seat-intent units (proto v5). The local compositor
     /// is a passive replica whose protocol output is discarded — the
@@ -155,6 +157,9 @@ pub const AppHost = struct {
         press_btn: c_uint = 0,
         press_x: f64 = 0,
         press_y: f64 = 0,
+        /// "AI" corner badge, shown while a headless MCP client is
+        /// attached to the session (assistant-is-driving indicator).
+        badge: ?*c.GtkWidget = null,
         /// Last host-edge band the pointer was in (Wayland edge mask,
         /// 0 = interior). Drives the resize cursor and gates whether a
         /// press starts a host-window resize vs. goes to the app.
@@ -749,6 +754,17 @@ pub const AppHost = struct {
         self.allocator.destroy(win);
     }
 
+    /// Show/hide the AI badge on every window (assistant attached to
+    /// the session). Remembered for windows created later.
+    pub fn setDriven(self: *AppHost, on: bool) void {
+        if (self.driven == on) return;
+        self.driven = on;
+        var it = self.windows.valueIterator();
+        while (it.next()) |w| {
+            if (w.*.badge) |b| c.gtk_widget_set_visible(b, @intFromBool(on));
+        }
+    }
+
     /// Window for a surface, created on first frame (when the size
     /// is finally known).
     fn winFor(self: *AppHost, surface: u32, w: i32, h: i32) ?*Win {
@@ -781,6 +797,17 @@ pub const AppHost = struct {
             rw.applyAppId(win.window, kv.value);
             self.allocator.free(kv.value);
         }
+        // Assistant-is-driving badge, toggled by setDriven.
+        const badge = c.gtk_label_new("AI");
+        c.gtk_widget_add_css_class(badge, "sketerm-ai-badge");
+        c.gtk_widget_set_halign(badge, c.GTK_ALIGN_END);
+        c.gtk_widget_set_valign(badge, c.GTK_ALIGN_START);
+        c.gtk_widget_set_tooltip_text(badge, "An AI assistant is attached to this app's session");
+        c.gtk_widget_set_can_target(badge, 0);
+        c.gtk_overlay_add_overlay(@ptrCast(widgets.overlay), badge);
+        c.gtk_widget_set_visible(badge, @intFromBool(self.driven));
+        win.badge = badge;
+
         _ = c.g_object_set_data(@ptrCast(window), "sketerm-wlapp", win);
         _ = c.g_signal_connect_data(@ptrCast(window), "close-request", @ptrCast(&onCloseRequest), win, null, 0);
         // Report the CSD shadow as the toplevel's shadow width once the

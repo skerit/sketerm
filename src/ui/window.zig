@@ -1774,7 +1774,7 @@ pub const Window = struct {
                 .host_wayland_display = host_wl,
             });
             (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
-            try conn.sendJson(.attach, .{ .name = name });
+            try conn.sendJson(.attach, .{ .name = name, .kind = "gui" });
             snap = try conn.recvExpect(&.{.snapshot});
         }
         defer snap.deinit(self.allocator);
@@ -3877,7 +3877,7 @@ pub const Window = struct {
         var snap: Owned = undefined;
         {
             errdefer conn.deinit();
-            try conn.sendJson(.attach, .{ .name = spec.mux_session });
+            try conn.sendJson(.attach, .{ .name = spec.mux_session, .kind = "gui" });
             const reply = try conn.recvExpect(&.{ .snapshot, .err });
             if (reply.ftype == .snapshot) {
                 snap = reply;
@@ -3902,7 +3902,7 @@ pub const Window = struct {
                     .kb_layout = self.config.app_keyboard_layout,
                 });
                 (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
-                try conn.sendJson(.attach, .{ .name = spec.mux_session });
+                try conn.sendJson(.attach, .{ .name = spec.mux_session, .kind = "gui" });
                 snap = try conn.recvExpect(&.{.snapshot});
             }
         }
@@ -4063,7 +4063,7 @@ pub const Window = struct {
 
         const snap = blk: {
             errdefer conn.deinit();
-            try conn.sendJson(.attach, .{ .name = name });
+            try conn.sendJson(.attach, .{ .name = name, .kind = "gui" });
             break :blk conn.recvExpect(&.{.snapshot}) catch |err| {
                 // Stash the daemon's reason while `conn` is still alive
                 // (the errdefer below frees it) so the caller surfaces it.
@@ -4933,6 +4933,19 @@ pub const Window = struct {
             \\.sketerm-titlebar-inactive {{ background-color: rgba({d}, {d}, {d}, {d:.3}); color: rgba({d}, {d}, {d}, {d:.3}); }}
             \\.sketerm-titlebar-label {{ font-weight: bold; }}
             \\.sketerm-titlebar.sketerm-broadcast {{ box-shadow: inset 0 0 0 2px rgba(255, 200, 60, 0.95); }}
+            \\
+            \\/* Assistant-is-driving indicator: accent border on the
+            \\   pane whose session has a headless MCP client attached,
+            \\   and the corner badge on forwarded app windows. */
+            \\.sketerm-driven {{ box-shadow: inset 0 0 0 2px rgba(255, 120, 40, 0.9); }}
+            \\.sketerm-ai-badge {{
+            \\    background-color: rgba(255, 120, 40, 0.92);
+            \\    color: white;
+            \\    font-weight: bold;
+            \\    font-size: 10px;
+            \\    padding: 1px 7px;
+            \\    border-radius: 0 0 0 8px;
+            \\}}
             \\
             \\/* Active-tab indicator — accent line under the selected
             \\   tab plus a stronger background tint, à la Terminator.

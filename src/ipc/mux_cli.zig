@@ -254,7 +254,7 @@ fn muxSpawn(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, r
 /// snapshot we discard.
 fn attachForIo(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8) ?struct { conn: mux_client.Conn, snap: mux_client.Conn.OwnedFrame } {
     var conn = muxConnect(allocator, host) orelse return null;
-    conn.sendJson(.attach, .{ .name = name }) catch {
+    conn.sendJson(.attach, .{ .name = name, .kind = "cli" }) catch {
         conn.deinit();
         return null;
     };

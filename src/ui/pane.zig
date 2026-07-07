@@ -407,6 +407,7 @@ pub const Pane = struct {
         terminal.on_pointer_shape = onPointerShapeEvent;
         terminal.on_set_profile = onSetProfileEvent;
         terminal.on_session_renamed = onSessionRenamedEvent;
+        terminal.on_peers = onPeersChanged;
 
         _ = c.g_signal_connect_data(
             area_widget,
@@ -1689,6 +1690,23 @@ fn onNotificationEvent(ctx: ?*anyopaque, ev: Screen.NotificationEvent) void {
 fn onSessionRenamedEvent(ctx: ?*anyopaque, name: []const u8) void {
     const self = cast.userData(Pane, ctx);
     if (self.win_on_session_renamed) |f| f(self.win_session_rename_ctx, self, name);
+}
+
+/// Attach roster changed: show/hide the "assistant is driving"
+/// indicator — an accent border on the pane, plus the AI badge on
+/// every forwarded app window of this session.
+fn onPeersChanged(ctx: ?*anyopaque) void {
+    const self = cast.userData(Pane, ctx);
+    const driven = self.terminal.peer_drivers > 0;
+    if (self.wrapper_box) |wrap| {
+        if (driven)
+            c.gtk_widget_add_css_class(wrap, "sketerm-driven")
+        else
+            c.gtk_widget_remove_css_class(wrap, "sketerm-driven");
+    }
+    if (self.terminal.remote) |remote| {
+        for (remote.napps.items) |na| na.host.setDriven(driven);
+    }
 }
 
 fn onSetProfileEvent(ctx: ?*anyopaque, name: []const u8) void {
