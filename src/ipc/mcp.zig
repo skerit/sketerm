@@ -527,7 +527,10 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_windows","description":"List one app's rendered windows (ids, sizes, titles).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
     \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Downscaled when larger than max_px; the caption tells you the multiplier to map image coordinates back to app_click coordinates.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"}}}},
     \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer"}}}},
-    \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). button: 1 left (default), 2 middle, 3 right.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x","y"]}},
+    \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x","y"]}},
+    \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
+    \\{"name":"app_set_value","description":"Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value). Faster and more reliable than typing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}},
+    \\{"name":"app_wait_for_element","description":"Wait until a widget appears in the app's accessibility tree (dialog opened, page loaded, ...). Match by role number and/or case-insensitive name substring; returns the matched node with its id and rect.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"role":{"type":"integer","description":"AT-SPI role number (e.g. 42 push-button)"},"name":{"type":"string","description":"Name substring, case-insensitive"},"timeout_ms":{"type":"integer","description":"Default 10000"}}}},
     \\{"name":"app_drag","description":"Press-move-release drag inside an app window (sliders, drag-and-drop, text selection). Surface-local pixel coordinates.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x1":{"type":"integer"},"y1":{"type":"integer"},"x2":{"type":"integer"},"y2":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x1","y1","x2","y2"]}},
     \\{"name":"app_type","description":"Type literal text into an app window. Non-ASCII text is delivered via a clipboard paste (Ctrl+V) automatically.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"text":{"type":"string"}},"required":["text"]}},
     \\{"name":"app_clipboard_get","description":"Read what the app last copied to the clipboard (requires the app to have copied something).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
@@ -762,6 +765,84 @@ fn appErr(arena: std.mem.Allocator, msg: []const u8) ![]const u8 {
     return toolResult(arena, msg, true) orelse error.OutOfMemory;
 }
 
+// ── a11y tree helpers (element-targeted tools) ───────────────────
+
+/// Fetch + parse the app's a11y tree into a Value (arena-owned), or
+/// an error string to hand the assistant.
+const A11yFetch = union(enum) {
+    tree: std.json.Value,
+    err: []const u8,
+};
+
+fn a11yFetch(arena: std.mem.Allocator, app: *appdrive.App, timeout_ms: i64) A11yFetch {
+    const raw = app.a11yTree(timeout_ms) catch |err| return .{ .err = switch (err) {
+        appdrive.Error.Timeout => "timed out reading the accessibility tree",
+        else => "accessibility read failed",
+    } };
+    defer app_state.allocator.free(raw);
+    const copy = arena.dupe(u8, raw) catch return .{ .err = "oom" };
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, copy, .{}) catch
+        return .{ .err = "malformed accessibility reply" };
+    if (parsed != .object) return .{ .err = "malformed accessibility reply" };
+    if (parsed.object.get("error")) |e| {
+        if (e == .string) return .{ .err = e.string };
+        return .{ .err = "accessibility error" };
+    }
+    const tree = parsed.object.get("tree") orelse return .{ .err = "no tree in reply" };
+    return .{ .tree = tree };
+}
+
+/// DFS for the first node matching `role` (when non-null) and/or a
+/// case-insensitive `name` substring (when non-null).
+fn a11yFindMatch(node: std.json.Value, role: ?i64, name_sub: ?[]const u8) ?std.json.Value {
+    if (node != .object) return null;
+    var ok = true;
+    if (role) |r| {
+        const nr = node.object.get("role") orelse std.json.Value{ .integer = -1 };
+        if (nr != .integer or nr.integer != r) ok = false;
+    }
+    if (ok) {
+        if (name_sub) |sub| {
+            const nn = node.object.get("name") orelse std.json.Value{ .string = "" };
+            if (nn != .string or std.ascii.indexOfIgnoreCase(nn.string, sub) == null) ok = false;
+        } else if (role == null) ok = false; // no criteria = no match
+    }
+    if (ok) return node;
+    if (node.object.get("children")) |kids| {
+        if (kids == .array) for (kids.array.items) |k| {
+            if (a11yFindMatch(k, role, name_sub)) |hit| return hit;
+        };
+    }
+    return null;
+}
+
+/// One-line JSON of a node WITHOUT its children (summary for replies).
+fn a11yNodeSummary(arena: std.mem.Allocator, node: std.json.Value) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("{");
+    var first = true;
+    if (node == .object) {
+        var it = node.object.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, "children")) continue;
+            if (!first) try w.writeAll(",");
+            first = false;
+            try std.json.Stringify.value(e.key_ptr.*, .{}, w);
+            try w.writeAll(":");
+            try std.json.Stringify.value(e.value_ptr.*, .{}, w);
+        }
+    }
+    try w.writeAll("}");
+    return aw.written();
+}
+
+fn monoMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+}
+
 fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
     if (!app_state.ready)
@@ -916,15 +997,82 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         return toolResult(arena, "ok (the app sees this as the host clipboard)", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_click")) {
+        const button: u32 = @intCast(argInt(args, "button") orelse 1);
         const win_id: u32 = @intCast(argInt(args, "window") orelse
-            return appErr(arena, "app_click requires 'window'"));
+            return appErr(arena, "app_click requires 'window' and x/y. To target a widget by name/role use app_perform_action (coordinate-free)."));
         const x = argInt(args, "x") orelse return appErr(arena, "app_click requires 'x'");
         const y = argInt(args, "y") orelse return appErr(arena, "app_click requires 'y'");
-        const button: u32 = @intCast(argInt(args, "button") orelse 1);
         app.click(win_id, @floatFromInt(x), @floatFromInt(y), button) catch
             return appErr(arena, "click failed (bad window?)");
         _ = app.waitIdle(200, 2_000);
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_perform_action")) {
+        const elem_id = argStr(args, "element") orelse
+            return appErr(arena, "app_perform_action requires 'element' (an id from app_a11y_tree)");
+        const index: i64 = argInt(args, "index") orelse 0;
+        const payload = try std.fmt.allocPrint(arena, "{{\"op\":\"action\",\"id\":{f},\"index\":{d}}}", .{
+            std.json.fmt(elem_id, .{}),
+            index,
+        });
+        const reply = app.a11yOp(payload, argInt(args, "timeout_ms") orelse 5_000) catch
+            return appErr(arena, "a11y action failed (daemon unreachable?)");
+        defer app_state.allocator.free(reply);
+        if (std.mem.indexOf(u8, reply, "\"ok\"") == null)
+            return appErr(arena, try arena.dupe(u8, reply));
+        _ = app.waitIdle(200, 2_000);
+        return toolResult(arena, "action performed", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_set_value")) {
+        const elem_id = argStr(args, "element") orelse
+            return appErr(arena, "app_set_value requires 'element' (an id from app_a11y_tree)");
+        var payload: []const u8 = undefined;
+        if (argStr(args, "text")) |text| {
+            payload = try std.fmt.allocPrint(arena, "{{\"op\":\"set_text\",\"id\":{f},\"text\":{f}}}", .{
+                std.json.fmt(elem_id, .{}),
+                std.json.fmt(text, .{}),
+            });
+        } else if (args == .object and args.object.get("value") != null) {
+            const v = args.object.get("value").?;
+            const num: f64 = switch (v) {
+                .integer => |iv| @floatFromInt(iv),
+                .float => |fl| fl,
+                else => return appErr(arena, "'value' must be a number"),
+            };
+            payload = try std.fmt.allocPrint(arena, "{{\"op\":\"set_value\",\"id\":{f},\"value\":{d}}}", .{
+                std.json.fmt(elem_id, .{}),
+                num,
+            });
+        } else return appErr(arena, "app_set_value requires 'text' (text fields) or 'value' (sliders/spinners)");
+        const reply = app.a11yOp(payload, argInt(args, "timeout_ms") orelse 5_000) catch
+            return appErr(arena, "a11y set failed (daemon unreachable?)");
+        defer app_state.allocator.free(reply);
+        if (std.mem.indexOf(u8, reply, "\"ok\"") == null)
+            return appErr(arena, try arena.dupe(u8, reply));
+        _ = app.waitIdle(200, 2_000);
+        return toolResult(arena, "value set", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_wait_for_element")) {
+        const role: ?i64 = argInt(args, "role");
+        const name_sub = argStr(args, "name");
+        if (role == null and name_sub == null)
+            return appErr(arena, "app_wait_for_element requires 'role' and/or 'name'");
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
+        const deadline = monoMs() + timeout_ms;
+        while (true) {
+            switch (a11yFetch(arena, app, 5_000)) {
+                .tree => |t| if (a11yFindMatch(t, role, name_sub)) |node| {
+                    const summary = try a11yNodeSummary(arena, node);
+                    return toolResult(arena, summary, false) orelse error.OutOfMemory;
+                },
+                .err => {}, // tree not up yet — keep polling
+            }
+            if (monoMs() >= deadline)
+                return appErr(arena, "element did not appear before the timeout");
+            var ts = c.struct_timespec{ .tv_sec = 0, .tv_nsec = 300 * 1000 * 1000 };
+            _ = c.nanosleep(&ts, null);
+            app.drain();
+        }
     }
     if (eql(u8, name, "app_type")) {
         const text = argStr(args, "text") orelse return appErr(arena, "app_type requires 'text'");
@@ -990,7 +1138,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         // Prepend the AT-SPI role legend so the assistant can read
         // numeric roles without a lookup.
         const msg = try std.fmt.allocPrint(arena,
-            \\AT-SPI tree. Roles (common): 8 checkbox, 14 dialog/frame, 18 filler, 25 label, 28 menu, 29 menubar, 30 menuitem, 34 canvas, 35 page-tab, 37 panel, 42 push-button, 43 radiobutton, 44 root/desktop, 46 scrollbar, 60 table, 62 text, 71 toolbar, 74 tree, 75 application, 84 entry. Coordinates in "rect":[x,y,w,h] are screen pixels; for app_click use surface-local (subtract the window origin from a screenshot).
+            \\AT-SPI tree. Each node has an "id" — pass it to app_perform_action (press/activate/toggle a widget) or app_set_value (write a text field/slider) to drive the app WITHOUT coordinates; that is the reliable path. Roles (common): 8 checkbox, 14 dialog/frame, 18 filler, 25 label, 28 menu, 29 menubar, 30 menuitem, 34 canvas, 35 page-tab, 37 panel, 42 push-button, 43 radiobutton, 44 root/desktop, 46 scrollbar, 60 table, 62 text, 71 toolbar, 74 tree, 75 application, 84 entry. Note: "rect" is unreliable for headless apps (no screen position), so prefer perform_action/set_value over pixel clicks.
             \\{s}
         , .{copy});
         return toolResult(arena, msg, false) orelse error.OutOfMemory;

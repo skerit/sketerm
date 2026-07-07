@@ -589,9 +589,20 @@ pub const App = struct {
     /// Fetch the app's AT-SPI accessibility tree as JSON (the daemon
     /// reads it from the session's private a11y bus). Caller owns.
     pub fn a11yTree(self: *App, timeout_ms: i64) Error![]u8 {
+        return self.a11yRequest("", timeout_ms);
+    }
+
+    /// One AT-SPI node op — payload is the JSON op object the daemon
+    /// expects ({op, id, ...}). Returns the raw JSON reply
+    /// ({"ok":true} or {"error":...}); caller owns it.
+    pub fn a11yOp(self: *App, payload: []const u8, timeout_ms: i64) Error![]u8 {
+        return self.a11yRequest(payload, timeout_ms);
+    }
+
+    fn a11yRequest(self: *App, payload: []const u8, timeout_ms: i64) Error![]u8 {
         self.drain();
         if (self.exited) return Error.NotConnected;
-        self.conn.sendFrame(.app_a11y, "") catch return Error.NotConnected;
+        self.conn.sendFrame(.app_a11y, payload) catch return Error.NotConnected;
         // The reply may take a moment (the daemon walks the bus).
         const deadline = nowMs() + timeout_ms;
         while (nowMs() < deadline) {

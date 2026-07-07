@@ -93,6 +93,14 @@ pub const Writer = struct {
         try self.putU32(@intFromBool(v));
     }
 
+    /// d (double): 8-aligned little-endian IEEE 754 bits.
+    pub fn putF64(self: *Writer, v: f64) Error!void {
+        try self.pad(8);
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, @bitCast(v), .little);
+        try self.buf.appendSlice(self.allocator, &b);
+    }
+
     /// s and o (both: u32 length + bytes + NUL).
     pub fn putString(self: *Writer, s: []const u8) Error!void {
         try self.putU32(@intCast(s.len));
@@ -173,6 +181,11 @@ pub const Reader = struct {
         const v = std.mem.readInt(u64, self.bytes[self.pos..][0..8], .little);
         self.pos += 8;
         return v;
+    }
+
+    /// d (double).
+    pub fn f64v(self: *Reader) Error!f64 {
+        return @bitCast(try self.u64v());
     }
 
     /// s and o.

@@ -1343,7 +1343,7 @@ pub const Daemon = struct {
             .file_get => self.handleFileGet(cl, frame.payload),
             .file_list => self.handleFileList(cl, frame.payload),
             .app_list => self.handleAppList(cl),
-            .app_a11y => self.handleAppA11y(cl),
+            .app_a11y => self.handleAppA11y(cl, frame.payload),
             .rec_start => self.handleRecStart(cl, frame.payload),
             .rec_stop => {
                 const s = cl.attached orelse {
@@ -1697,7 +1697,7 @@ pub const Daemon = struct {
 
     /// Serialize the attached app session's AT-SPI tree. The tree
     /// JSON is already a bare node object; wrap it as {"tree":...}.
-    fn handleAppA11y(self: *Daemon, cl: *Client) void {
+    fn handleAppA11y(self: *Daemon, cl: *Client, payload: []const u8) void {
         const s = cl.attached orelse {
             cl.queueJson(.app_a11y_tree, .{ .@"error" = "not attached" });
             return;
@@ -1706,20 +1706,62 @@ pub const Daemon = struct {
             cl.queueJson(.app_a11y_tree, .{ .@"error" = "no accessibility bus for this session (not an app session, or dbus-daemon unavailable)" });
             return;
         });
+
+        // Optional op payload: {op:"action"|"set_text"|"set_value",
+        // id, index?, text?, value?}. Empty / op:"tree" = tree walk.
+        if (payload.len > 0) {
+            const Op = struct {
+                op: []const u8 = "tree",
+                id: []const u8 = "",
+                index: i32 = 0,
+                text: []const u8 = "",
+                value: f64 = 0,
+            };
+            var parsed = std.json.parseFromSlice(Op, self.allocator, payload, .{
+                .ignore_unknown_fields = true,
+            }) catch {
+                cl.queueJson(.app_a11y_tree, .{ .@"error" = "bad a11y op request" });
+                return;
+            };
+            defer parsed.deinit();
+            const op = parsed.value;
+            if (!std.mem.eql(u8, op.op, "tree")) {
+                if (op.id.len == 0) {
+                    cl.queueJson(.app_a11y_tree, .{ .@"error" = "a11y op requires 'id' (from the tree)" });
+                    return;
+                }
+                const done = if (std.mem.eql(u8, op.op, "action"))
+                    hub.doAction(self.allocator, op.id, op.index)
+                else if (std.mem.eql(u8, op.op, "set_text"))
+                    hub.setTextContents(self.allocator, op.id, op.text)
+                else if (std.mem.eql(u8, op.op, "set_value"))
+                    hub.setCurrentValue(self.allocator, op.id, op.value)
+                else {
+                    cl.queueJson(.app_a11y_tree, .{ .@"error" = "unknown a11y op" });
+                    return;
+                };
+                if (done)
+                    cl.queueJson(.app_a11y_tree, .{ .ok = true })
+                else
+                    cl.queueJson(.app_a11y_tree, .{ .@"error" = "a11y op failed (node gone, interface unsupported, or bus error)" });
+                return;
+            }
+        }
+
         const tree = hub.treeJson(self.allocator) orelse {
             cl.queueJson(.app_a11y_tree, .{ .@"error" = "no accessibility tree (the app has not published one; GTK/Qt apps only)" });
             return;
         };
         defer self.allocator.free(tree);
-        var payload: std.ArrayList(u8) = .empty;
-        defer payload.deinit(self.allocator);
-        payload.appendSlice(self.allocator, "{\"tree\":") catch {
+        var reply: std.ArrayList(u8) = .empty;
+        defer reply.deinit(self.allocator);
+        reply.appendSlice(self.allocator, "{\"tree\":") catch {
             cl.queueErr("oom");
             return;
         };
-        payload.appendSlice(self.allocator, tree) catch return;
-        payload.appendSlice(self.allocator, "}") catch return;
-        cl.queueFrame(.app_a11y_tree, payload.items);
+        reply.appendSlice(self.allocator, tree) catch return;
+        reply.appendSlice(self.allocator, "}") catch return;
+        cl.queueFrame(.app_a11y_tree, reply.items);
     }
 
     /// Start an asciicast v2 recording of the attached session. The
