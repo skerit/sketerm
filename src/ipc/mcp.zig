@@ -15,6 +15,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const protocol = @import("protocol.zig");
+const appdrive = @import("appdrive.zig");
 
 const MCP_HELP =
     \\Usage: sketerm mcp [--socket PATH]
@@ -23,12 +24,19 @@ const MCP_HELP =
     \\running sketerm instance. Register it in an MCP client (Claude
     \\Code, etc.) as command "sketerm" with args ["mcp"].
     \\
-    \\Tools exposed: list_terminals, read_screen, send_text,
+    \\Terminal tools: list_terminals, read_screen, send_text,
     \\send_keys, run_command, wait_idle, new_tab, split_pane,
     \\focus_pane, close_pane.
     \\
-    \\Socket resolution: --socket, then $SKETERM_SOCKET, then the
-    \\single *.sock under $XDG_RUNTIME_DIR/sketerm/.
+    \\Headless GUI-app tools (no GUI needed; apps render into the mux
+    \\daemon, never on a screen): launch_app, list_apps, app_windows,
+    \\screenshot_app (inline PNG), app_click, app_type, app_key,
+    \\app_scroll, app_resize, app_wait, close_app_window, close_app.
+    \\
+    \\Socket resolution (terminal tools): --socket, then
+    \\$SKETERM_SOCKET, then the single *.sock under
+    \\$XDG_RUNTIME_DIR/sketerm/. App tools use the mux daemon socket
+    \\and work with no sketerm window open.
     \\
 ;
 
@@ -62,18 +70,26 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         }
     }
 
-    const sock_path = @import("client.zig").resolveSocket(allocator, socket_arg) orelse {
-        _ = c.fprintf(platform.stderr(), "sketerm mcp: no socket found (is sketerm running? use --socket or $SKETERM_SOCKET)\n");
-        return 1;
-    };
-    var real = RealBackend{ .sock_path = sock_path };
-    defer allocator.free(sock_path);
-    const backend = Backend{
+    // Terminal tools need a running GUI's socket; app tools talk to
+    // the mux daemon directly and work fully headless — a missing
+    // GUI therefore degrades, not aborts.
+    const sock_path = @import("client.zig").resolveSocket(allocator, socket_arg);
+    defer if (sock_path) |p| allocator.free(p);
+    var real = RealBackend{ .sock_path = sock_path orelse "" };
+    var stub = StubBackend{};
+    const backend = if (sock_path != null) Backend{
         .ctx = @ptrCast(&real),
         .talk = RealBackend.talk,
         .sleepMs = RealBackend.sleepMs,
         .nowMs = RealBackend.nowMs,
+    } else Backend{
+        .ctx = @ptrCast(&stub),
+        .talk = StubBackend.talk,
+        .sleepMs = RealBackend.sleepMs,
+        .nowMs = RealBackend.nowMs,
     };
+    app_state = .{ .allocator = allocator };
+    defer app_state.deinit();
 
     // stdin loop: one JSON-RPC message per line.
     var lineptr: [*c]u8 = null;
@@ -97,6 +113,17 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     }
     return 0;
 }
+
+/// Backend when no GUI is running: terminal tools fail with a clear
+/// message; app tools never route through it.
+const StubBackend = struct {
+    fn talk(ctx: *anyopaque, allocator: std.mem.Allocator, line: []const u8) anyerror![]u8 {
+        _ = ctx;
+        _ = allocator;
+        _ = line;
+        return error.NoGuiSocket;
+    }
+};
 
 const RealBackend = struct {
     sock_path: [:0]const u8,
@@ -232,6 +259,23 @@ fn rpcError(arena: std.mem.Allocator, id: std.json.Value, code: i32, msg: []cons
     return aw.written();
 }
 
+/// Wrap a PNG (+ a text caption) as an MCP tool result with an
+/// inline image content block. base64 emits no newlines, so the
+/// NDJSON framing is safe.
+fn imageResult(arena: std.mem.Allocator, caption: []const u8, png_bytes: []const u8) ?[]const u8 {
+    const enc = std.base64.standard.Encoder;
+    const b64 = arena.alloc(u8, enc.calcSize(png_bytes.len)) catch return null;
+    _ = enc.encode(b64, png_bytes);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":") catch return null;
+    std.json.Stringify.value(caption, .{}, w) catch return null;
+    w.writeAll("},{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"") catch return null;
+    w.writeAll(b64) catch return null;
+    w.writeAll("\"}]}") catch return null;
+    return aw.written();
+}
+
 /// Wrap plain text as an MCP tool result: {"content":[{"type":"text",...}]}.
 fn toolResult(arena: std.mem.Allocator, text: []const u8, is_error: bool) ?[]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
@@ -273,7 +317,19 @@ const TOOLS_JSON_RAW =
     \\{"name":"new_tab","description":"Open a new shell tab. Returns the new tab and pane ids.","inputSchema":{"type":"object","properties":{"cwd":{"type":"string"},"title":{"type":"string"}}}},
     \\{"name":"split_pane","description":"Split a pane. direction 'h' = side by side, 'v' = stacked. Returns the new pane id.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"direction":{"type":"string","enum":["h","v"]}}}},
     \\{"name":"focus_pane","description":"Focus a pane (selects its tab and grabs keyboard focus).","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
-    \\{"name":"close_pane","description":"Close a pane. Destructive: the shell and any running process in it are terminated.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}}
+    \\{"name":"close_pane","description":"Close a pane. Destructive: the shell and any running process in it are terminated.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
+    \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns an app id and its windows. Drive it with screenshot_app/app_click/app_type/app_key.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"wait_ms":{"type":"integer","description":"Max wait for the first window (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"}},"required":["command"]}},
+    \\{"name":"list_apps","description":"List launched headless apps and their windows.","inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"app_windows","description":"List one app's rendered windows (ids, sizes, titles).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
+    \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Coordinates for app_click are surface-local pixels in this image.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"}}}},
+    \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app). button: 1 left (default), 2 middle, 3 right.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x","y"]}},
+    \\{"name":"app_type","description":"Type literal text into an app window (US keyboard layout; ASCII only).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"text":{"type":"string"}},"required":["text"]}},
+    \\{"name":"app_key","description":"Press key chords in an app window: space-separated, e.g. 'ctrl+s', 'enter', 'alt+F4', 'down down enter'.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
+    \\{"name":"app_scroll","description":"Scroll inside an app window. dy>0 scrolls down, dx>0 right (wheel steps).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"}},"required":["window"]}},
+    \\{"name":"app_resize","description":"Ask an app window to redraw at a new size (deterministic screenshots).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["window","w","h"]}},
+    \\{"name":"app_wait","description":"Wait until an app stopped producing new frames for quiet_ms (render quiescence). Returns the window list.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"close_app_window","description":"Ask the app to close one window (like the titlebar button; the app decides).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"}},"required":["window"]}},
+    \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}}
     \\]
 ;
 
@@ -389,8 +445,254 @@ fn readScreenText(arena: std.mem.Allocator, backend: Backend, pane: ?u32, scroll
     return aw.written();
 }
 
+// ── forwarded-app tools (headless GUI apps via the mux daemon) ────
+
+/// Long-lived registry of launched app sessions (module state: MCP
+/// serves one assistant on stdio; tool calls are sequential).
+const AppState = struct {
+    allocator: std.mem.Allocator,
+    apps: std.AutoArrayHashMapUnmanaged(u32, *appdrive.App) = .empty,
+    next_id: u32 = 1,
+    ready: bool = true,
+
+    fn deinit(self: *AppState) void {
+        for (self.apps.values()) |app| app.deinit();
+        self.apps.deinit(self.allocator);
+        self.ready = false;
+    }
+};
+
+var app_state: AppState = .{ .allocator = undefined, .ready = false };
+
+fn appFromArgs(args: std.json.Value) ?*appdrive.App {
+    const id = argInt(args, "app") orelse {
+        // Single-app convenience: omit `app` when only one exists.
+        if (app_state.apps.count() == 1) return app_state.apps.values()[0];
+        return null;
+    };
+    if (id < 0) return null;
+    return app_state.apps.get(@intCast(id));
+}
+
+fn appIdOf(app: *appdrive.App) u32 {
+    var it = app_state.apps.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.* == app) return e.key_ptr.*;
+    }
+    return 0;
+}
+
+/// JSON summary of an app's windows (arena-owned).
+fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("{{\"app\":{d},\"session\":", .{appIdOf(app)});
+    try std.json.Stringify.value(app.name, .{}, w);
+    if (app.exited) try w.print(",\"exited\":true,\"exit_status\":{d}", .{app.exit_status});
+    try w.writeAll(",\"windows\":[");
+    var first = true;
+    for (app.windows.items) |win| {
+        if (win.frames == 0) continue;
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.print("{{\"window\":{d},\"w\":{d},\"h\":{d},\"scale\":{d}", .{ win.id, win.w, win.h, win.scale });
+        if (win.popup) try w.writeAll(",\"popup\":true");
+        if (win.title) |t| {
+            try w.writeAll(",\"title\":");
+            try std.json.Stringify.value(t, .{}, w);
+        }
+        if (win.app_id) |aid| {
+            try w.writeAll(",\"app_id\":");
+            try std.json.Stringify.value(aid, .{}, w);
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
+    return aw.written();
+}
+
+fn appErr(arena: std.mem.Allocator, msg: []const u8) ![]const u8 {
+    return toolResult(arena, msg, true) orelse error.OutOfMemory;
+}
+
+fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
+    const eql = std.mem.eql;
+    if (!app_state.ready)
+        return appErr(arena, "app tools unavailable (server not fully started)");
+
+    if (eql(u8, name, "launch_app")) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(arena);
+        if (args == .object) {
+            if (args.object.get("command")) |cmd| switch (cmd) {
+                .string => {
+                    try argv.append(arena, "/bin/sh");
+                    try argv.append(arena, "-c");
+                    try argv.append(arena, cmd.string);
+                },
+                .array => for (cmd.array.items) |item| {
+                    if (item != .string) return appErr(arena, "command array must be strings");
+                    try argv.append(arena, item.string);
+                },
+                else => {},
+            };
+        }
+        if (argv.items.len == 0) return appErr(arena, "launch_app requires 'command' (string or argv array)");
+        const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 80, 10, 500));
+        const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 24, 4, 300));
+        const wait_ms: i64 = argInt(args, "wait_ms") orelse 10_000;
+        const app = appdrive.App.launch(app_state.allocator, argv.items, cols, rows, argStr(args, "host")) catch |err|
+            return appErr(arena, switch (err) {
+                appdrive.Error.SpawnFailed => "spawn failed (mux daemon unreachable or spawn refused)",
+                else => "launch failed",
+            });
+        const id = app_state.next_id;
+        app_state.next_id += 1;
+        app_state.apps.put(app_state.allocator, id, app) catch {
+            app.deinit();
+            return error.OutOfMemory;
+        };
+        const got_window = app.waitFirstWindow(wait_ms);
+        _ = got_window;
+        const summary = try appSummary(arena, app);
+        return toolResult(arena, summary, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "list_apps")) {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("[");
+        var first = true;
+        for (app_state.apps.values()) |app| {
+            app.drain();
+            if (!first) try w.writeAll(",");
+            first = false;
+            try w.writeAll(try appSummary(arena, app));
+        }
+        try w.writeAll("]");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+
+    const app = appFromArgs(args) orelse
+        return appErr(arena, "unknown app (pass 'app' from launch_app; use list_apps)");
+    app.drain();
+
+    if (eql(u8, name, "app_windows")) {
+        const summary = try appSummary(arena, app);
+        return toolResult(arena, summary, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "screenshot_app")) {
+        var win_id: u32 = 0;
+        if (argInt(args, "window")) |v| {
+            win_id = @intCast(v);
+        } else {
+            for (app.windows.items) |win| {
+                if (!win.popup and win.frames > 0) {
+                    win_id = win.id;
+                    break;
+                }
+            }
+        }
+        if (win_id == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        const png_bytes = app.screenshotPng(win_id) catch
+            return appErr(arena, "no such window / no pixels yet");
+        defer app_state.allocator.free(png_bytes);
+        const win = app.winById(win_id).?;
+        const caption = try std.fmt.allocPrint(
+            arena,
+            "window {d}: {d}x{d} (scale {d}){s}{s} — coordinates for app_click are surface-local in this image's pixel space",
+            .{ win.id, win.w, win.h, win.scale, if (win.title != null) " title=" else "", win.title orelse "" },
+        );
+        return imageResult(arena, caption, png_bytes) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_click")) {
+        const win_id: u32 = @intCast(argInt(args, "window") orelse
+            return appErr(arena, "app_click requires 'window'"));
+        const x = argInt(args, "x") orelse return appErr(arena, "app_click requires 'x'");
+        const y = argInt(args, "y") orelse return appErr(arena, "app_click requires 'y'");
+        const button: u32 = @intCast(argInt(args, "button") orelse 1);
+        app.click(win_id, @floatFromInt(x), @floatFromInt(y), button) catch
+            return appErr(arena, "click failed (bad window?)");
+        _ = app.waitIdle(200, 2_000);
+        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_type")) {
+        const text = argStr(args, "text") orelse return appErr(arena, "app_type requires 'text'");
+        const win: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
+        app.typeText(win, text) catch |err| return appErr(arena, switch (err) {
+            appdrive.Error.BadKey => "text contains a character outside the us keymap",
+            else => "type failed (no window?)",
+        });
+        _ = app.waitIdle(200, 2_000);
+        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_key")) {
+        const keys = argStr(args, "keys") orelse return appErr(arena, "app_key requires 'keys'");
+        const win: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
+        var it = std.mem.tokenizeScalar(u8, keys, ' ');
+        while (it.next()) |spec| {
+            app.pressKey(win, spec) catch |err| return appErr(arena, switch (err) {
+                appdrive.Error.BadKey => "unknown key chord",
+                else => "key press failed (no window?)",
+            });
+        }
+        _ = app.waitIdle(200, 2_000);
+        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_scroll")) {
+        const win_id: u32 = @intCast(argInt(args, "window") orelse
+            return appErr(arena, "app_scroll requires 'window'"));
+        const x = argInt(args, "x") orelse 10;
+        const y = argInt(args, "y") orelse 10;
+        const dx = argInt(args, "dx") orelse 0;
+        const dy = argInt(args, "dy") orelse 0;
+        app.scroll(win_id, @floatFromInt(x), @floatFromInt(y), @floatFromInt(dx), @floatFromInt(dy)) catch
+            return appErr(arena, "scroll failed (bad window?)");
+        _ = app.waitIdle(200, 2_000);
+        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_resize")) {
+        const win_id: u32 = @intCast(argInt(args, "window") orelse
+            return appErr(arena, "app_resize requires 'window'"));
+        const w = argInt(args, "w") orelse return appErr(arena, "app_resize requires 'w'");
+        const h = argInt(args, "h") orelse return appErr(arena, "app_resize requires 'h'");
+        app.resizeWindow(win_id, @intCast(w), @intCast(h)) catch
+            return appErr(arena, "resize failed (bad window?)");
+        _ = app.waitIdle(300, 3_000);
+        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_wait")) {
+        const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
+        const settled = app.waitIdle(quiet_ms, timeout_ms);
+        const summary = try appSummary(arena, app);
+        const msg = try std.fmt.allocPrint(arena, "{s}\n{s}", .{ if (settled) "settled" else "timeout: still rendering", summary });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "close_app_window")) {
+        const win_id: u32 = @intCast(argInt(args, "window") orelse
+            return appErr(arena, "close_app_window requires 'window'"));
+        app.closeWindow(win_id) catch return appErr(arena, "close failed (bad window?)");
+        return toolResult(arena, "close requested (the app decides)", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "close_app")) {
+        const id = appIdOf(app);
+        _ = app_state.apps.swapRemove(id);
+        app.deinit();
+        return toolResult(arena, "app session killed", false) orelse error.OutOfMemory;
+    }
+    return appErr(arena, "unknown tool");
+}
+
 fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
+
+    if (eql(u8, name, "launch_app") or eql(u8, name, "list_apps") or eql(u8, name, "close_app") or
+        eql(u8, name, "close_app_window") or eql(u8, name, "screenshot_app") or
+        std.mem.startsWith(u8, name, "app_"))
+    {
+        return appTool(arena, name, args);
+    }
+
     const pane = paneFromArgs(args);
 
     if (eql(u8, name, "list_terminals")) {

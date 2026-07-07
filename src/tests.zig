@@ -52,6 +52,7 @@ comptime {
     _ = @import("ipc/mux_cli.zig");
     _ = @import("ipc/keys.zig");
     _ = @import("ipc/mcp.zig");
+    _ = @import("ipc/evkeys.zig");
     _ = @import("render/bg_pass.zig");
     _ = @import("mux/wire.zig");
     _ = @import("mux/snapshot.zig");
