@@ -85,6 +85,10 @@ pub const FrameType = enum(u8) {
     /// JSON app listing answering `app_list`: { apps: [{name, exec,
     /// icon, terminal}], truncated? }.
     app_listing = 73,
+    /// JSON attach roster for the client's session, pushed whenever
+    /// it changes: { total, guis, drivers } (drivers = headless MCP
+    /// clients). Lets viewers show an "assistant is driving" badge.
+    peer_info = 74,
     // Byte channels (both directions). Generic multiplexed streams
     // riding the mux connection — used to tunnel a session's app
     // protocol, so forwarded apps inherit whatever transport the

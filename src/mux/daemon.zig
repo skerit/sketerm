@@ -119,6 +119,9 @@ pub const SpawnShellIntegration = struct {
 
 pub const AttachReq = struct {
     name: []const u8 = "",
+    /// Client self-identification for the peer roster: "gui", "cli",
+    /// "mcp" (headless assistant driver) or "" (unknown).
+    kind: []const u8 = "",
 };
 
 pub const RenameReq = struct {
@@ -295,6 +298,8 @@ const Client = struct {
     /// `video`). Gates whether forwarded surfaces route through the lossy
     /// video path — never send a tile a client can't decode.
     video: bool = false,
+    /// Self-declared attach kind (peer roster / driving indicator).
+    kind: enum { unknown, gui, cli, mcp } = .unknown,
 
     fn deinit(self: *Client) void {
         _ = c.close(self.fd);
@@ -1275,8 +1280,10 @@ pub const Daemon = struct {
             .spawn => self.handleSpawn(cl, frame.payload),
             .attach => self.handleAttach(cl, frame.payload),
             .detach => {
+                const was = cl.attached;
                 cl.attached = null;
                 cl.queueJson(.ok, .{ .ok = true });
+                if (was) |s| self.broadcastPeerInfo(s);
             },
             .input => {
                 const s = cl.attached orelse {
@@ -3039,6 +3046,14 @@ pub const Daemon = struct {
             return;
         }
         cl.attached = s;
+        cl.kind = if (std.mem.eql(u8, parsed.value.kind, "gui"))
+            .gui
+        else if (std.mem.eql(u8, parsed.value.kind, "cli"))
+            .cli
+        else if (std.mem.eql(u8, parsed.value.kind, "mcp"))
+            .mcp
+        else
+            .unknown;
         // A (re)attaching client has no prior video reference frames, so
         // force the next video tile on every live surface to be a
         // keyframe. No-op unless video is active (vstate is otherwise
@@ -3056,6 +3071,29 @@ pub const Daemon = struct {
         if (cl.proto >= 2 and s.winstream != null) self.openWinstreamChan(s, cl);
         if (cl.proto >= 5) self.replayNativeChannels(cl, s);
         self.refreshVideoGates();
+        self.broadcastPeerInfo(s);
+    }
+
+    /// Push the session's attach roster to every attached client.
+    /// Fired on attach, detach and client death so viewers can show
+    /// (or drop) the "assistant is driving" indicator promptly.
+    fn broadcastPeerInfo(self: *Daemon, s: *Session) void {
+        var total: u32 = 0;
+        var guis: u32 = 0;
+        var drivers: u32 = 0;
+        for (self.clients.items) |cl| {
+            if (cl.dead or cl.attached != s) continue;
+            total += 1;
+            switch (cl.kind) {
+                .gui => guis += 1,
+                .mcp => drivers += 1,
+                else => {},
+            }
+        }
+        for (self.clients.items) |cl| {
+            if (cl.dead or cl.attached != s) continue;
+            cl.queueJson(.peer_info, .{ .total = total, .guis = guis, .drivers = drivers });
+        }
     }
 
     /// A proto>=5 client just attached: for every live native app
@@ -3437,8 +3475,14 @@ pub const Daemon = struct {
         while (i < self.clients.items.len) {
             const cl = self.clients.items[i];
             if (cl.dead) {
+                const was = cl.attached;
                 _ = self.clients.swapRemove(i);
                 cl.deinit();
+                // Duplicate rosters (several deaths, one session) are
+                // harmless; correctness beats coalescing here.
+                if (was) |s| {
+                    if (!s.exited) self.broadcastPeerInfo(s);
+                }
             } else {
                 i += 1;
             }

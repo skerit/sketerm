@@ -150,7 +150,7 @@ pub const App = struct {
             .kb_layout = layout_name,
         }) catch return Error.SpawnFailed;
         (conn.recvExpect(&.{.ok}) catch return Error.SpawnFailed).deinit(allocator);
-        conn.sendJson(.attach, .{ .name = name }) catch return Error.SpawnFailed;
+        conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
         (conn.recvExpect(&.{.snapshot}) catch return Error.SpawnFailed).deinit(allocator);
 
         const self = allocator.create(App) catch return Error.OutOfMemory;

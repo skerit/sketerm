@@ -126,6 +126,12 @@ pub const Terminal = struct {
     /// `requestApps`). The launcher dialog consumes it.
     on_apps: ?*const fn (ctx: ?*anyopaque, apps: []const AppEntry) void = null,
     apps_ctx: ?*anyopaque = null,
+    /// Attach roster of this session (peer_info frames). `drivers` =
+    /// headless MCP clients: the "assistant is driving" signal.
+    peer_total: u32 = 0,
+    peer_drivers: u32 = 0,
+    /// Fired when the attach roster changes.
+    on_peers: ?*const fn (ctx: ?*anyopaque) void = null,
 
     /// Optional broadcast-typing filter. When set, every byte from
     /// USER input (keystrokes, paste, hyperlink launch) goes through
@@ -539,6 +545,7 @@ pub const Terminal = struct {
             .file_reply => self.handleFileReply(frame.payload),
             .file_listing => self.handleFileListing(frame.payload),
             .app_listing => self.handleAppListing(frame.payload),
+            .peer_info => self.handlePeerInfo(frame.payload),
             .file_data => self.downloadData(frame.payload),
             .chan_open => self.chanOpen(frame.payload),
             .chan_data => self.chanData(frame.payload),
@@ -1021,6 +1028,18 @@ pub const Terminal = struct {
         f(self.apps_ctx, entries);
     }
 
+    fn handlePeerInfo(self: *Terminal, payload: []const u8) void {
+        const Msg = struct { total: u32 = 0, guis: u32 = 0, drivers: u32 = 0 };
+        const parsed = std.json.parseFromSlice(Msg, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const changed = self.peer_total != parsed.value.total or self.peer_drivers != parsed.value.drivers;
+        self.peer_total = parsed.value.total;
+        self.peer_drivers = parsed.value.drivers;
+        if (changed) {
+            if (self.on_peers) |f| f(self.user_ctx);
+        }
+    }
+
     /// "file://host/path" → "/path"; otherwise unchanged.
     fn stripFileUri(p: []const u8) []const u8 {
         const pfx = "file://";
@@ -1176,6 +1195,7 @@ pub const Terminal = struct {
         na.* = .{ .terminal = self, .id = id, .host = host };
         host.on_flush = nappFlushCb;
         host.flush_ctx = na;
+        host.setDriven(self.peer_drivers > 0);
         remote.napps.append(self.allocator, na) catch {
             host.destroy();
             self.allocator.destroy(na);
