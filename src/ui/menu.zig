@@ -39,6 +39,7 @@ pub const Action = enum {
     mux_rename,
     mux_kill,
     reset_terminal,
+    open_link,
     copy_link,
     prefs_open,
 };
@@ -59,12 +60,138 @@ const ActionSlot = struct {
 /// paste) — the hook may perform its own action instead.
 pub const PrePopupFn = *const fn (ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f64) bool;
 
-const N_REMOTE_ROWS = blk: {
+const Bind = struct {
+    name: [*:0]const u8,
+    label: [*:0]const u8,
+    detailed: [*:0]const u8,
+    /// Symbolic icon name (stock Adwaita, or a bundled sketerm-* icon).
+    icon: [*:0]const u8,
+    action: Action,
+    /// Row only makes sense when the right-click landed on a
+    /// hyperlink / detected URL. These rows (and their section
+    /// separator) hide when the pre-popup hook leaves "copy-link"
+    /// disabled.
+    link_only: bool = false,
+};
+
+const Submenu = struct {
+    label: [*:0]const u8,
+    icon: [*:0]const u8,
+    items: []const Bind,
+    /// Submenu only makes sense on a mux-attached (remote) pane; the
+    /// parent row (and its section separator) hides when the
+    /// pre-popup hook leaves the mux actions disabled.
+    remote_only: bool = false,
+};
+
+const Item = union(enum) {
+    bind: Bind,
+    submenu: Submenu,
+    separator,
+};
+
+/// Top-level menu layout. Submenu children open in a nested popover
+/// on hover (and on click), classic-menu style.
+const MENU = [_]Item{
+    .{ .bind = .{ .name = "open-link", .label = "Open Link", .detailed = "term.open-link", .icon = "web-browser-symbolic", .action = .open_link, .link_only = true } },
+    .{ .bind = .{ .name = "copy-link", .label = "Copy Link", .detailed = "term.copy-link", .icon = "insert-link-symbolic", .action = .copy_link, .link_only = true } },
+    .separator,
+    .{ .bind = .{ .name = "copy", .label = "Copy", .detailed = "term.copy", .icon = "edit-copy-symbolic", .action = .copy } },
+    .{ .bind = .{ .name = "paste", .label = "Paste", .detailed = "term.paste", .icon = "edit-paste-symbolic", .action = .paste } },
+    .{ .submenu = .{ .label = "Copy More", .icon = "edit-select-all-symbolic", .items = &.{
+        .{ .name = "copy-screen", .label = "Copy Screen", .detailed = "term.copy-screen", .icon = "edit-select-all-symbolic", .action = .copy_screen },
+        .{ .name = "copy-scrollback", .label = "Copy Scrollback", .detailed = "term.copy-scrollback", .icon = "edit-select-all-symbolic", .action = .copy_scrollback },
+        .{ .name = "copy-output", .label = "Copy Command Output", .detailed = "term.copy-output", .icon = "utilities-terminal-symbolic", .action = .copy_output },
+    } } },
+    .separator,
+    .{ .bind = .{ .name = "split-h", .label = "Split Left / Right", .detailed = "term.split-h", .icon = "sketerm-split-left-right-symbolic", .action = .split_h } },
+    .{ .bind = .{ .name = "split-v", .label = "Split Top / Bottom", .detailed = "term.split-v", .icon = "sketerm-split-top-bottom-symbolic", .action = .split_v } },
+    .{ .submenu = .{ .label = "Pane", .icon = "view-grid-symbolic", .items = &.{
+        .{ .name = "zoom-pane", .label = "Zoom / Unzoom Pane", .detailed = "term.zoom-pane", .icon = "view-fullscreen-symbolic", .action = .zoom_pane },
+        .{ .name = "set-pane-title", .label = "Set Pane Title…", .detailed = "term.set-pane-title", .icon = "document-edit-symbolic", .action = .set_pane_title },
+        .{ .name = "apply-profile", .label = "Apply Profile to Pane…", .detailed = "term.apply-profile", .icon = "preferences-other-symbolic", .action = .apply_profile },
+        .{ .name = "close-pane", .label = "Close Pane", .detailed = "term.close-pane", .icon = "window-close-symbolic", .action = .close_pane },
+    } } },
+    .{ .submenu = .{ .label = "Shader", .icon = "sketerm-rendering-symbolic", .items = &.{
+        .{ .name = "shader-pick", .label = "Pane Shader…", .detailed = "term.shader-pick", .icon = "sketerm-rendering-symbolic", .action = .shader_pick },
+        .{ .name = "shader-preset", .label = "Shader Preset…", .detailed = "term.shader-preset", .icon = "starred-symbolic", .action = .shader_preset },
+        .{ .name = "shader-config", .label = "Configure Shader…", .detailed = "term.shader-config", .icon = "preferences-other-symbolic", .action = .shader_config },
+        .{ .name = "shader-clear", .label = "Clear Pane Shader", .detailed = "term.shader-clear", .icon = "edit-clear-symbolic", .action = .shader_clear },
+    } } },
+    .separator,
+    .{ .submenu = .{ .label = "Tab", .icon = "tab-new-symbolic", .items = &.{
+        .{ .name = "new-tab", .label = "New Tab", .detailed = "term.new-tab", .icon = "tab-new-symbolic", .action = .new_tab },
+        .{ .name = "new-tab-as-profile", .label = "New Tab as Profile…", .detailed = "term.new-tab-as-profile", .icon = "tab-new-symbolic", .action = .new_tab_as_profile },
+        .{ .name = "duplicate-tab", .label = "Duplicate Tab", .detailed = "term.duplicate-tab", .icon = "edit-copy-symbolic", .action = .duplicate_tab },
+        .{ .name = "rename-tab", .label = "Rename Tab…", .detailed = "term.rename-tab", .icon = "document-edit-symbolic", .action = .rename_tab },
+        .{ .name = "color-tab", .label = "Tab Colour…", .detailed = "term.color-tab", .icon = "color-select-symbolic", .action = .color_tab },
+        .{ .name = "pin-tab", .label = "Pin / Unpin Tab", .detailed = "term.pin-tab", .icon = "view-pin-symbolic", .action = .pin_tab },
+        .{ .name = "close-tab", .label = "Close Tab", .detailed = "term.close-tab", .icon = "window-close-symbolic", .action = .close_tab },
+    } } },
+    .separator,
+    .{ .submenu = .{ .label = "Session", .icon = "network-server-symbolic", .remote_only = true, .items = &.{
+        .{ .name = "upload-file", .label = "Upload File…", .detailed = "term.upload-file", .icon = "document-send-symbolic", .action = .upload_file },
+        .{ .name = "download-file", .label = "Download File…", .detailed = "term.download-file", .icon = "folder-download-symbolic", .action = .download_file },
+        .{ .name = "mux-detach", .label = "Detach Session", .detailed = "term.mux-detach", .icon = "network-offline-symbolic", .action = .mux_detach },
+        .{ .name = "mux-rename", .label = "Rename Session…", .detailed = "term.mux-rename", .icon = "document-edit-symbolic", .action = .mux_rename },
+        .{ .name = "mux-kill", .label = "Kill Session", .detailed = "term.mux-kill", .icon = "process-stop-symbolic", .action = .mux_kill },
+    } } },
+    .separator,
+    .{ .bind = .{ .name = "reset", .label = "Reset Terminal", .detailed = "term.reset", .icon = "view-refresh-symbolic", .action = .reset_terminal } },
+    .{ .bind = .{ .name = "prefs", .label = "Preferences…", .detailed = "term.prefs", .icon = "preferences-system-symbolic", .action = .prefs_open } },
+};
+
+/// Flat view of every action row (top-level and submenu children) —
+/// the action-group registration source.
+const BINDS = blk: {
     var n: usize = 0;
-    for (BINDS) |b| {
-        if (b.remote_only) n += 1;
+    for (MENU) |it| switch (it) {
+        .bind => n += 1,
+        .submenu => |s| n += s.items.len,
+        .separator => {},
+    };
+    var arr: [n]Bind = undefined;
+    var i: usize = 0;
+    for (MENU) |it| switch (it) {
+        .bind => |b| {
+            arr[i] = b;
+            i += 1;
+        },
+        .submenu => |s| for (s.items) |b| {
+            arr[i] = b;
+            i += 1;
+        },
+        .separator => {},
+    };
+    break :blk arr;
+};
+
+const N_SUBMENUS = blk: {
+    var n: usize = 0;
+    for (MENU) |it| {
+        if (it == .submenu) n += 1;
     }
     break :blk n;
+};
+
+/// Remote-only conditional widgets: each remote submenu's parent row
+/// plus the separator leading into it.
+const N_REMOTE_WIDGETS = blk: {
+    var n: usize = 0;
+    for (MENU) |it| {
+        if (it == .submenu and it.submenu.remote_only) n += 2;
+    }
+    break :blk n;
+};
+
+/// Link-only conditional widgets: the link rows plus the separator
+/// that trails them.
+const N_LINK_WIDGETS = blk: {
+    var n: usize = 0;
+    for (MENU) |it| {
+        if (it == .bind and it.bind.link_only) n += 1;
+    }
+    break :blk n + 1;
 };
 
 const ClickCtx = struct {
@@ -73,60 +200,25 @@ const ClickCtx = struct {
     group: *c.GSimpleActionGroup,
     pre_popup_fn: ?PrePopupFn = null,
     pre_popup_ctx: ?*anyopaque = null,
-    /// Remote-only row buttons + their leading separator; shown only
-    /// when the pre-popup hook enabled the mux actions. Children of
-    /// the popover, so the pointers never outlive it.
-    remote_widgets: [N_REMOTE_ROWS + 1]?*c.GtkWidget = @splat(null),
+    /// Nested submenu popovers; hover management pops down every
+    /// sibling when a top-level row is entered. Parented to row
+    /// buttons inside the popover.
+    subs: [N_SUBMENUS]?*c.GtkWidget = @splat(null),
+    /// Remote-only rows + their leading separator; shown only when
+    /// the pre-popup hook enabled the mux actions. Children of the
+    /// popover, so the pointers never outlive it.
+    remote_widgets: [N_REMOTE_WIDGETS]?*c.GtkWidget = @splat(null),
+    /// Link rows + their trailing separator; shown only when the
+    /// pre-popup hook found a link under the click.
+    link_widgets: [N_LINK_WIDGETS]?*c.GtkWidget = @splat(null),
 };
 
-const Bind = struct {
-    name: [*:0]const u8,
-    label: [*:0]const u8,
-    detailed: [*:0]const u8,
-    /// Symbolic icon name (stock Adwaita, or a bundled sketerm-* icon).
-    icon: [*:0]const u8,
-    action: Action,
-    /// Section index; a separator is drawn where it changes. BINDS is
-    /// ordered for display (it doubles as the row list and the action
-    /// source).
-    section: u8,
-    /// Row only makes sense on a mux-attached (remote) pane. These
-    /// rows (and their section separator) are hidden when the
-    /// pre-popup hook leaves their action disabled.
-    remote_only: bool = false,
-};
-
-const BINDS = [_]Bind{
-    .{ .name = "copy", .label = "Copy", .detailed = "term.copy", .icon = "edit-copy-symbolic", .action = .copy, .section = 0 },
-    .{ .name = "copy-screen", .label = "Copy Screen", .detailed = "term.copy-screen", .icon = "edit-select-all-symbolic", .action = .copy_screen, .section = 0 },
-    .{ .name = "copy-scrollback", .label = "Copy Scrollback", .detailed = "term.copy-scrollback", .icon = "edit-select-all-symbolic", .action = .copy_scrollback, .section = 0 },
-    .{ .name = "copy-output", .label = "Copy Command Output", .detailed = "term.copy-output", .icon = "utilities-terminal-symbolic", .action = .copy_output, .section = 0 },
-    .{ .name = "paste", .label = "Paste", .detailed = "term.paste", .icon = "edit-paste-symbolic", .action = .paste, .section = 0 },
-    .{ .name = "copy-link", .label = "Copy Link", .detailed = "term.copy-link", .icon = "insert-link-symbolic", .action = .copy_link, .section = 0 },
-    .{ .name = "split-h", .label = "Split Left / Right", .detailed = "term.split-h", .icon = "sketerm-split-left-right-symbolic", .action = .split_h, .section = 1 },
-    .{ .name = "split-v", .label = "Split Top / Bottom", .detailed = "term.split-v", .icon = "sketerm-split-top-bottom-symbolic", .action = .split_v, .section = 1 },
-    .{ .name = "zoom-pane", .label = "Zoom / Unzoom Pane", .detailed = "term.zoom-pane", .icon = "view-fullscreen-symbolic", .action = .zoom_pane, .section = 1 },
-    .{ .name = "set-pane-title", .label = "Set Pane Title…", .detailed = "term.set-pane-title", .icon = "document-edit-symbolic", .action = .set_pane_title, .section = 1 },
-    .{ .name = "apply-profile", .label = "Apply Profile to Pane…", .detailed = "term.apply-profile", .icon = "preferences-other-symbolic", .action = .apply_profile, .section = 1 },
-    .{ .name = "shader-pick", .label = "Pane Shader…", .detailed = "term.shader-pick", .icon = "sketerm-rendering-symbolic", .action = .shader_pick, .section = 1 },
-    .{ .name = "shader-preset", .label = "Shader Preset…", .detailed = "term.shader-preset", .icon = "starred-symbolic", .action = .shader_preset, .section = 1 },
-    .{ .name = "shader-config", .label = "Configure Shader…", .detailed = "term.shader-config", .icon = "preferences-other-symbolic", .action = .shader_config, .section = 1 },
-    .{ .name = "shader-clear", .label = "Clear Pane Shader", .detailed = "term.shader-clear", .icon = "edit-clear-symbolic", .action = .shader_clear, .section = 1 },
-    .{ .name = "close-pane", .label = "Close Pane", .detailed = "term.close-pane", .icon = "window-close-symbolic", .action = .close_pane, .section = 1 },
-    .{ .name = "upload-file", .label = "Upload File…", .detailed = "term.upload-file", .icon = "document-send-symbolic", .action = .upload_file, .section = 4, .remote_only = true },
-    .{ .name = "download-file", .label = "Download File…", .detailed = "term.download-file", .icon = "folder-download-symbolic", .action = .download_file, .section = 4, .remote_only = true },
-    .{ .name = "mux-detach", .label = "Detach Session", .detailed = "term.mux-detach", .icon = "network-offline-symbolic", .action = .mux_detach, .section = 4, .remote_only = true },
-    .{ .name = "mux-rename", .label = "Rename Session…", .detailed = "term.mux-rename", .icon = "document-edit-symbolic", .action = .mux_rename, .section = 4, .remote_only = true },
-    .{ .name = "mux-kill", .label = "Kill Session", .detailed = "term.mux-kill", .icon = "process-stop-symbolic", .action = .mux_kill, .section = 4, .remote_only = true },
-    .{ .name = "new-tab", .label = "New Tab", .detailed = "term.new-tab", .icon = "tab-new-symbolic", .action = .new_tab, .section = 2 },
-    .{ .name = "new-tab-as-profile", .label = "New Tab as Profile…", .detailed = "term.new-tab-as-profile", .icon = "tab-new-symbolic", .action = .new_tab_as_profile, .section = 2 },
-    .{ .name = "duplicate-tab", .label = "Duplicate Tab", .detailed = "term.duplicate-tab", .icon = "edit-copy-symbolic", .action = .duplicate_tab, .section = 2 },
-    .{ .name = "rename-tab", .label = "Rename Tab…", .detailed = "term.rename-tab", .icon = "document-edit-symbolic", .action = .rename_tab, .section = 2 },
-    .{ .name = "color-tab", .label = "Tab Colour…", .detailed = "term.color-tab", .icon = "color-select-symbolic", .action = .color_tab, .section = 2 },
-    .{ .name = "pin-tab", .label = "Pin / Unpin Tab", .detailed = "term.pin-tab", .icon = "view-pin-symbolic", .action = .pin_tab, .section = 2 },
-    .{ .name = "close-tab", .label = "Close Tab", .detailed = "term.close-tab", .icon = "window-close-symbolic", .action = .close_tab, .section = 2 },
-    .{ .name = "reset", .label = "Reset Terminal", .detailed = "term.reset", .icon = "view-refresh-symbolic", .action = .reset_terminal, .section = 3 },
-    .{ .name = "prefs", .label = "Preferences…", .detailed = "term.prefs", .icon = "preferences-system-symbolic", .action = .prefs_open, .section = 3 },
+/// Per-top-level-row hover context: entering any row pops down every
+/// submenu except this row's own (if any), which pops up.
+const HoverCtx = struct {
+    allocator: std.mem.Allocator,
+    cctx: *ClickCtx,
+    sub: ?*c.GtkWidget,
 };
 
 pub fn attach(
@@ -167,15 +259,9 @@ pub fn attachWithPrePopup(
     c.gtk_widget_insert_action_group(widget, "term", @ptrCast(group));
     c.g_object_unref(group);
 
-    // Default the copy-link action to disabled so its button stays grey
-    // when no link is under the cursor; pre_popup_fn flips it true when
-    // there is one. Buttons bound by action-name track this live.
-    if (c.g_action_map_lookup_action(@ptrCast(group), "copy-link")) |act| {
-        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), 0);
-    }
-    // Mux rows default hidden; the pane's pre-popup hook enables them
-    // when its terminal is a remote (mux) attachment.
-    for ([_][*:0]const u8{ "mux-detach", "mux-rename", "mux-kill" }) |name| {
+    // Link + mux actions default disabled; the pane's pre-popup hook
+    // enables them per-popup. Their rows show/hide on that state.
+    for ([_][*:0]const u8{ "open-link", "copy-link", "mux-detach", "mux-rename", "mux-kill" }) |name| {
         if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
             c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), 0);
         }
@@ -189,44 +275,88 @@ pub fn attachWithPrePopup(
     c.gtk_widget_set_parent(popover, widget);
     c.gtk_popover_set_has_arrow(@ptrCast(popover), 0);
 
+    // The shared context is filled while rows are built (submenu /
+    // conditional-row pointers), then handed to the click gesture,
+    // whose destroy-notify owns it.
+    const cctx = try allocator.create(ClickCtx);
+    cctx.* = .{
+        .allocator = allocator,
+        .popover = popover,
+        .group = @ptrCast(group),
+        .pre_popup_fn = pre_popup_fn,
+        .pre_popup_ctx = pre_popup_ctx,
+    };
+    errdefer allocator.destroy(cctx);
+
     const list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-    var remote_widgets: [N_REMOTE_ROWS + 1]?*c.GtkWidget = @splat(null);
+    var n_sub: usize = 0;
     var n_remote: usize = 0;
-    var first = true;
-    var prev_section: u8 = 0;
-    for (BINDS) |b| {
-        if (!first and b.section != prev_section) {
-            const sep = c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL);
-            c.gtk_box_append(@ptrCast(list), sep);
-            // The separator leading INTO the remote section hides
-            // together with its rows.
-            if (b.remote_only) {
-                remote_widgets[n_remote] = sep;
-                n_remote += 1;
-            }
+    var n_link: usize = 0;
+    var prev_was_link = false;
+    var prev_sep: ?*c.GtkWidget = null;
+    for (MENU) |item| {
+        switch (item) {
+            .separator => {
+                const sep = c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL);
+                c.gtk_box_append(@ptrCast(list), sep);
+                // The separator trailing the link rows hides with them.
+                if (prev_was_link) {
+                    cctx.link_widgets[n_link] = sep;
+                    n_link += 1;
+                }
+                prev_was_link = false;
+                prev_sep = sep;
+            },
+            .bind => |b| {
+                const btn = makeRow(b.icon, b.label, false);
+                c.gtk_actionable_set_action_name(@ptrCast(btn), b.detailed);
+                _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
+                c.gtk_box_append(@ptrCast(list), btn);
+                if (b.link_only) {
+                    cctx.link_widgets[n_link] = btn;
+                    n_link += 1;
+                }
+                try addHover(allocator, btn, cctx, null);
+                prev_was_link = b.link_only;
+            },
+            .submenu => |s| {
+                const btn = makeRow(s.icon, s.label, true);
+                const sub_pop = c.gtk_popover_new();
+                c.gtk_widget_set_parent(sub_pop, btn);
+                c.gtk_popover_set_has_arrow(@ptrCast(sub_pop), 0);
+                c.gtk_popover_set_autohide(@ptrCast(sub_pop), 0);
+                c.gtk_popover_set_position(@ptrCast(sub_pop), c.GTK_POS_RIGHT);
+                const sub_list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+                for (s.items) |b| {
+                    const child = makeRow(b.icon, b.label, false);
+                    c.gtk_actionable_set_action_name(@ptrCast(child), b.detailed);
+                    _ = c.g_signal_connect_data(child, "clicked", @ptrCast(&onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
+                    c.gtk_box_append(@ptrCast(sub_list), child);
+                }
+                c.gtk_popover_set_child(@ptrCast(sub_pop), sub_list);
+                // Click also opens the submenu (keyboard / touch path).
+                _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onSubParentClicked), @ptrCast(sub_pop), null, c.G_CONNECT_DEFAULT);
+                c.gtk_box_append(@ptrCast(list), btn);
+                cctx.subs[n_sub] = sub_pop;
+                n_sub += 1;
+                if (s.remote_only) {
+                    // The separator leading INTO the remote section
+                    // hides together with its row.
+                    if (prev_sep) |sep| {
+                        cctx.remote_widgets[n_remote] = sep;
+                        n_remote += 1;
+                    }
+                    cctx.remote_widgets[n_remote] = btn;
+                    n_remote += 1;
+                }
+                try addHover(allocator, btn, cctx, sub_pop);
+                prev_was_link = false;
+            },
         }
-        first = false;
-        prev_section = b.section;
-
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-        const img = c.gtk_image_new_from_icon_name(b.icon);
-        const lbl = c.gtk_label_new(b.label);
-        c.gtk_label_set_xalign(@ptrCast(lbl), 0.0);
-        c.gtk_widget_set_hexpand(lbl, 1);
-        c.gtk_box_append(@ptrCast(row), img);
-        c.gtk_box_append(@ptrCast(row), lbl);
-
-        const btn = c.gtk_button_new();
-        c.gtk_button_set_child(@ptrCast(btn), row);
-        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-        c.gtk_actionable_set_action_name(@ptrCast(btn), b.detailed);
-        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(list), btn);
-        if (b.remote_only) {
-            remote_widgets[n_remote] = btn;
-            n_remote += 1;
-        }
+        if (item != .separator) prev_sep = null;
     }
+    // Any open submenu pops down with the main menu.
+    _ = c.g_signal_connect_data(popover, "closed", @ptrCast(&onPopoverClosed), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
     // Wrap the list in a scroller with natural-height propagation.
     // Not for scrolling per se: GTK4 silently popdowns an autohide
     // popover whose MINIMUM size doesn't fit the space the compositor
@@ -245,15 +375,6 @@ pub fn attachWithPrePopup(
 
     const click = c.gtk_gesture_click_new();
     c.gtk_gesture_single_set_button(@ptrCast(click), 3);
-    const cctx = try allocator.create(ClickCtx);
-    cctx.* = .{
-        .allocator = allocator,
-        .popover = popover,
-        .group = @ptrCast(group),
-        .pre_popup_fn = pre_popup_fn,
-        .pre_popup_ctx = pre_popup_ctx,
-        .remote_widgets = remote_widgets,
-    };
     _ = c.g_signal_connect_data(
         click,
         "pressed",
@@ -263,6 +384,77 @@ pub fn attachWithPrePopup(
         c.G_CONNECT_DEFAULT,
     );
     c.gtk_widget_add_controller(widget, @ptrCast(click));
+}
+
+/// Build one flat icon+label menu-row button. `arrow` appends the
+/// submenu chevron at the trailing edge.
+fn makeRow(icon: [*:0]const u8, label: [*:0]const u8, arrow: bool) *c.GtkWidget {
+    const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
+    const img = c.gtk_image_new_from_icon_name(icon);
+    const lbl = c.gtk_label_new(label);
+    c.gtk_label_set_xalign(@ptrCast(lbl), 0.0);
+    c.gtk_widget_set_hexpand(lbl, 1);
+    c.gtk_box_append(@ptrCast(row), img);
+    c.gtk_box_append(@ptrCast(row), lbl);
+    if (arrow) {
+        c.gtk_box_append(@ptrCast(row), c.gtk_image_new_from_icon_name("pan-end-symbolic"));
+    }
+    const btn = c.gtk_button_new();
+    c.gtk_button_set_child(@ptrCast(btn), row);
+    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+    return btn;
+}
+
+/// Attach the hover controller that gives top-level rows classic
+/// menu behaviour: entering a row closes sibling submenus and opens
+/// this row's own (if it has one).
+fn addHover(allocator: std.mem.Allocator, btn: *c.GtkWidget, cctx: *ClickCtx, sub: ?*c.GtkWidget) !void {
+    const hctx = try allocator.create(HoverCtx);
+    hctx.* = .{ .allocator = allocator, .cctx = cctx, .sub = sub };
+    const motion = c.gtk_event_controller_motion_new();
+    _ = c.g_signal_connect_data(
+        motion,
+        "enter",
+        @ptrCast(&onRowEnter),
+        @ptrCast(hctx),
+        @ptrCast(&freeHoverCtx),
+        c.G_CONNECT_DEFAULT,
+    );
+    c.gtk_widget_add_controller(btn, motion);
+}
+
+fn onRowEnter(_: *c.GtkEventControllerMotion, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    const hctx = cast.userData(HoverCtx, user);
+    for (hctx.cctx.subs) |maybe_sub| {
+        const sub = maybe_sub orelse continue;
+        if (hctx.sub == sub) continue;
+        if (c.gtk_widget_get_visible(sub) != 0) c.gtk_popover_popdown(@ptrCast(sub));
+    }
+    if (hctx.sub) |sub| {
+        if (c.gtk_widget_get_visible(sub) == 0) c.gtk_popover_popup(@ptrCast(sub));
+    }
+}
+
+fn onSubParentClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const sub: *c.GtkWidget = @ptrCast(@alignCast(u));
+        if (c.gtk_widget_get_visible(sub) == 0) c.gtk_popover_popup(@ptrCast(sub));
+    }
+}
+
+fn onPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(ClickCtx, user);
+    for (ctx.subs) |maybe_sub| {
+        const sub = maybe_sub orelse continue;
+        if (c.gtk_widget_get_visible(sub) != 0) c.gtk_popover_popdown(@ptrCast(sub));
+    }
+}
+
+fn freeHoverCtx(user: ?*anyopaque) callconv(.c) void {
+    if (user) |u| {
+        const hctx: *HoverCtx = @ptrCast(@alignCast(u));
+        hctx.allocator.destroy(hctx);
+    }
 }
 
 fn onActivate(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
@@ -296,7 +488,15 @@ fn freeClickCtx(user: ?*anyopaque) callconv(.c) void {
         // otherwise GTK warns "Finalizing GtkGLArea, but it still
         // has children left". This destroy-notify fires when the
         // click controller is removed from the widget — i.e. on
-        // widget destruction — making it the right hook.
+        // widget destruction — making it the right hook. Submenu
+        // popovers (parented to row buttons) go first for the same
+        // reason.
+        for (ctx.subs) |maybe_sub| {
+            const sub = maybe_sub orelse continue;
+            if (c.gtk_widget_get_parent(sub) != null) {
+                c.gtk_widget_unparent(sub);
+            }
+        }
         if (c.gtk_widget_get_parent(ctx.popover) != null) {
             c.gtk_widget_unparent(ctx.popover);
         }
@@ -325,6 +525,20 @@ fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaq
     }
     for (ctx.remote_widgets) |maybe_w| {
         if (maybe_w) |w| c.gtk_widget_set_visible(w, @intFromBool(show_remote));
+    }
+    // Link rows: visible iff the pre-popup hook found a link (OSC 8
+    // or auto-detected URL) under the click.
+    var show_link = false;
+    if (c.g_action_map_lookup_action(@ptrCast(ctx.group), "copy-link")) |act| {
+        show_link = c.g_action_get_enabled(@ptrCast(act)) != 0;
+    }
+    for (ctx.link_widgets) |maybe_w| {
+        if (maybe_w) |w| c.gtk_widget_set_visible(w, @intFromBool(show_link));
+    }
+    // Fresh popup: no submenu open.
+    for (ctx.subs) |maybe_sub| {
+        const sub = maybe_sub orelse continue;
+        if (c.gtk_widget_get_visible(sub) != 0) c.gtk_popover_popdown(@ptrCast(sub));
     }
     var rect = c.GdkRectangle{
         .x = @intFromFloat(x),
