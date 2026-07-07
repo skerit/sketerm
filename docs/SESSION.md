@@ -6379,3 +6379,78 @@ affects the single-static-binary story for SSH remotes -- and (b)
 environment-specific validation against a real a11y bus that the
 sandbox can't provide safely. Left for a focused follow-up rather than
 shipped half-validated.
+
+## Feature batch: GUI-app driving polish + AT-SPI a11y (12 items)
+
+Twelve requested items, all shipped and verified. Commits `a7ea3ad`
+(mode 47) through `f517249` (AT-SPI).
+
+**MCP app-driving surface** (`src/ipc/appdrive.zig`, `src/ipc/mcp.zig`):
+- `app_drag` -- press-interpolated-motions-release over the seat
+  intents (sliders, drag-drop, text selection).
+- `app_clipboard_get` / `app_clipboard_set` over the existing
+  clip_send/clip_data/offer_selection units; `app_type` now falls back
+  to a clipboard paste for non-ASCII text.
+- `get_app_state` -- windows + screenshot (+ coordinate mapping) in one
+  call. Screenshots downscale past `max_px` (default 1568) and report
+  the multiplier (`util/png.zig downscaleRgba`).
+- `app_a11y_tree` -- see below.
+- `app_record_start`/`app_record_stop` -- animated-GIF capture of a
+  window (`util/gifrec.zig` on vendored `msf_gif.h`).
+
+**Configurable keyboard layouts** (`src/ipc/xkblayout.zig`,
+`src/wlhost/keymaps.zig`): sessions pick a keymap (us/gb/fr/be/de) via
+spawn `kb_layout` (config `app_keyboard_layout`, MCP `launch_app
+layout`). MCP typing parses the SAME compiled-xkb blob so chars,
+chords and AltGr symbols encode right on azerty/qwertz. Was pinned to
+pc105/us.
+
+**Assistant-is-driving indicator**: clients self-ID on attach
+(gui/cli/mcp); the daemon pushes a per-session roster (new wire frame
+`peer_info` = 74) on attach/detach/death. Panes get an accent border,
+forwarded app windows an "AI" corner badge, while a headless MCP
+client is attached.
+
+**GUI**: Ctrl+right-click host menu on forwarded app windows
+(Screenshot Window, Record Window, Close); app-session tabs mirror the
+app's primary window as tab content so the tab overview shows the live
+app; the launcher moved out of the remote-only Session submenu
+(local panes launch on the autostart daemon), gained recents
+(`$XDG_STATE_HOME/sketerm/recent-apps.json`), Enter-launches-first,
+Esc, and `Ctrl+Shift+O` / palette entry.
+
+**Legacy alt-screen mode `CSI ?47h/l`** implemented in
+`src/grid/screen.zig` (was only 1047/1049).
+
+**AT-SPI accessibility tree, daemon-side** (`src/mux/dbus.zig`,
+`src/mux/a11yhub.zig`). The user's call: "part of the muxer, works
+everywhere -- no local/remote difference." The daemon (always on the
+app's machine) spawns a PRIVATE `dbus-daemon` + `at-spi2-registryd`
+per app session under a private `XDG_RUNTIME_DIR` (so the a11y bus is
+per-session), sets `GTK_A11Y=atspi` + `org.a11y.Status.IsEnabled`
+BEFORE the app starts, then reads the tree with a pure-Zig D-Bus
+client (`mux/dbus.zig` -- no libdbus, musl-clean) and serializes
+role/name/states/rect to JSON. New wire `app_a11y`/`app_a11y_tree`
+frames + MCP `app_a11y_tree` tool. `SKETERM_NO_A11Y=1` disables.
+
+The **hard-won gotchas** (each cost real debugging):
+1. D-Bus SASL EXTERNAL wants the uid as DECIMAL ascii, hex-encoded
+   byte-by-byte (not the uid formatted as hex).
+2. `GTK_A11Y=atspi` -- NOT `GTK_A11Y=1` (a GTK3-ism GTK4 ignores).
+   This was the difference between a 1-node empty tree and the full
+   316-node calculator tree.
+3. Ordering is load-bearing: `at-spi2-registryd` must own its name
+   BEFORE the app starts (toolkits don't retry a11y registration), so
+   `Hub.setup` blocks on a readiness poll.
+4. `at-spi2-registryd` wants the SESSION bus in its env (it finds the
+   a11y bus itself via `org.a11y.Bus.GetAddress`); the systemd-based
+   on-demand activation of the Registry is unreliable in a bare
+   session, so we spawn it directly.
+5. `ATSPI_DBUS_IMPLEMENTATION=dbus-daemon` (dbus-broker silently
+   reuses the host a11y bus, breaking per-session isolation).
+
+Verified end-to-end on isolated invisible instances: launched
+gnome-calculator headless via MCP, read a 316-node AT-SPI tree
+(application/window/every button by role+name). Full suite 656/661
+(5 skip), all three builds green, daemon links no GTK/GLib/dbus,
+`smoke-mux` and `smoke-e2e` (under fatal-criticals) PASS.
