@@ -16,6 +16,7 @@ const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const protocol = @import("protocol.zig");
 const appdrive = @import("appdrive.zig");
+const termdrive = @import("termdrive.zig");
 
 const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
@@ -46,9 +47,16 @@ const MCP_HELP =
     \\Headless GUI-app tools (no GUI needed; apps render into the mux
     \\daemon, never on a screen): launch_app, list_apps, app_windows,
     \\screenshot_app (inline PNG), app_click, app_type, app_key,
-    \\app_scroll, app_resize, app_wait, close_app_window, close_app.
-    \\SSH app launches (`host` param) always target the REMOTE host's
-    \\daemon; isolation applies to local launches.
+    \\app_scroll, app_resize, app_wait, app_a11y_tree,
+    \\app_perform_action, app_set_value, app_wait_for_element,
+    \\close_app_window, close_app. SSH app launches (`host` param)
+    \\always target the REMOTE host's daemon; isolation applies to
+    \\local launches.
+    \\
+    \\Headless terminal tools (isolated mode; real shells on the
+    \\private daemon, no GUI): term_open, term_run, term_send_text,
+    \\term_send_keys, term_read, term_wait_idle, term_resize,
+    \\term_list, term_close.
     \\
 ;
 
@@ -271,6 +279,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         .keep_apps = if (iso) |i| i.durable else false,
     };
     defer app_state.deinit();
+    // Headless terminal tools run on the private daemon (isolated
+    // mode only); --shared keeps the GUI-backed terminal tools.
+    term_state = .{
+        .allocator = allocator,
+        .mux_sock = if (iso) |i| i.sock else null,
+    };
+    defer term_state.deinit();
 
     // Named/durable instance: pick up app sessions still running on
     // the private daemon from a previous run.
@@ -304,6 +319,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // Ephemeral teardown: detach app viewers first (deinit is
     // idempotent; the deferred call becomes a no-op), then retire the
     // private daemon and remove its dir. Durable/named instances stay.
+    term_state.deinit();
     app_state.deinit();
     if (iso) |i| {
         if (!i.durable) {
@@ -543,7 +559,16 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_record_start","description":"Start recording a window's frames into an animated GIF (a visual log of what you do). Frames are captured while other app tools run; finish with app_record_stop.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"max_px":{"type":"integer","description":"Bound on the longest dimension (default 800)"}}}},
     \\{"name":"app_record_stop","description":"Stop the recording and save the GIF. Returns the file path and frame count.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"path":{"type":"string","description":"Output .gif path (default under /tmp)"}}}},
     \\{"name":"close_app_window","description":"Ask the app to close one window (like the titlebar button; the app decides).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"}},"required":["window"]}},
-    \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}}
+    \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
+    \\{"name":"term_open","description":"Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
+    \\{"name":"term_list","description":"List open headless terminals and their exit state.","inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"term_run","description":"Run a command line in a headless terminal and return the screen once output settles (like run_command but for headless shells). Sends the command + Enter, waits for quiescence.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"quiet_ms":{"type":"integer","description":"Idle window that counts as settled (default 400)"},"timeout_ms":{"type":"integer","description":"Default 30000"}},"required":["command"]}},
+    \\{"name":"term_send_text","description":"Write text to a headless terminal's PTY. 'enter' appends a carriage return.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean"}},"required":["text"]}},
+    \\{"name":"term_send_keys","description":"Press named key chords in a headless terminal: 'ctrl+c', 'enter', 'up', 'tab', space-separated.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
+    \\{"name":"term_read","description":"Read a headless terminal's rendered screen text. 'scrollback' true dumps the scrollback too.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
+    \\{"name":"term_wait_idle","description":"Wait until a headless terminal's output stops changing (or timeout).","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"term_resize","description":"Resize a headless terminal's grid.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
+    \\{"name":"term_close","description":"Close a headless terminal (kills its shell). Destructive.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"}}}}
     \\]
 ;
 
@@ -689,6 +714,43 @@ const AppState = struct {
 };
 
 var app_state: AppState = .{ .allocator = undefined, .ready = false };
+
+/// Registry of headless SHELL sessions (term_*) on the private daemon,
+/// parallel to AppState. Only used in isolated mode; in --shared mode
+/// the GUI-backed terminal tools are used instead.
+const TermState = struct {
+    allocator: std.mem.Allocator,
+    terms: std.AutoArrayHashMapUnmanaged(u32, *termdrive.Term) = .empty,
+    next_id: u32 = 1,
+    /// Isolated daemon socket (null = feature off; term tools then
+    /// error, directing the user to the GUI-backed terminal tools).
+    mux_sock: ?[]const u8 = null,
+
+    fn deinit(self: *TermState) void {
+        for (self.terms.values()) |t| t.deinit();
+        self.terms.deinit(self.allocator);
+        self.terms = .empty;
+    }
+};
+
+var term_state: TermState = .{ .allocator = undefined };
+
+fn termFromArgs(args: std.json.Value) ?*termdrive.Term {
+    if (argInt(args, "term")) |id| {
+        if (id < 0) return null;
+        return term_state.terms.get(@intCast(id));
+    }
+    if (term_state.terms.count() == 1) return term_state.terms.values()[0];
+    return null;
+}
+
+fn termIdOf(t: *termdrive.Term) u32 {
+    var it = term_state.terms.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.* == t) return e.key_ptr.*;
+    }
+    return 0;
+}
 
 /// Reconnect a durable instance to app sessions still running on its
 /// private daemon, so `list_apps` etc. see them after an MCP restart.
@@ -1193,6 +1255,129 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
     return appErr(arena, "unknown tool");
 }
 
+// ── headless terminal tools (shell sessions on the private daemon) ─
+
+fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
+    const eql = std.mem.eql;
+    const sock = term_state.mux_sock orelse
+        return appErr(arena, "headless terminal tools need isolated mode; in --shared mode use the GUI-backed terminal tools (list_terminals, run_command, ...)");
+
+    if (eql(u8, name, "term_open")) {
+        const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 120, 10, 500));
+        const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 40, 4, 300));
+        var argv_store: std.ArrayList([]const u8) = .empty;
+        defer argv_store.deinit(arena);
+        var argv: ?[]const []const u8 = null;
+        if (args == .object) {
+            if (args.object.get("command")) |cmd| switch (cmd) {
+                .string => {
+                    try argv_store.append(arena, "/bin/sh");
+                    try argv_store.append(arena, "-c");
+                    try argv_store.append(arena, cmd.string);
+                    argv = argv_store.items;
+                },
+                .array => {
+                    for (cmd.array.items) |item| {
+                        if (item != .string) return appErr(arena, "command array must be strings");
+                        try argv_store.append(arena, item.string);
+                    }
+                    if (argv_store.items.len > 0) argv = argv_store.items;
+                },
+                else => {},
+            };
+        }
+        const t = termdrive.Term.spawn(term_state.allocator, argv, cols, rows, sock) catch
+            return appErr(arena, "spawn failed (mux daemon unreachable?)");
+        const id = term_state.next_id;
+        term_state.next_id += 1;
+        term_state.terms.put(term_state.allocator, id, t) catch {
+            t.deinit();
+            return error.OutOfMemory;
+        };
+        // Let the shell print its first prompt.
+        _ = t.waitIdle(250, 3_000);
+        const msg = try std.fmt.allocPrint(arena, "opened headless terminal {d} ({d}x{d})", .{ id, cols, rows });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "term_list")) {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("[");
+        var first = true;
+        var it = term_state.terms.iterator();
+        while (it.next()) |e| {
+            if (!first) try w.writeAll(",");
+            first = false;
+            const t = e.value_ptr.*;
+            try w.print("{{\"term\":{d},\"exited\":{}", .{ e.key_ptr.*, t.exited });
+            if (t.exited) try w.print(",\"exit_status\":{d}", .{t.exit_status});
+            try w.writeAll("}");
+        }
+        try w.writeAll("]");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+
+    const t = termFromArgs(args) orelse
+        return appErr(arena, "no such terminal (pass 'term' id, or omit it when only one is open)");
+
+    if (eql(u8, name, "term_send_text")) {
+        const text = argStr(args, "text") orelse return appErr(arena, "term_send_text requires 'text'");
+        const data = if (argBool(args, "enter"))
+            try std.fmt.allocPrint(arena, "{s}\r", .{text})
+        else
+            text;
+        t.sendText(data) catch return appErr(arena, "send failed (terminal exited?)");
+        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "term_send_keys")) {
+        const keychords = argStr(args, "keys") orelse return appErr(arena, "term_send_keys requires 'keys'");
+        t.sendKeys(keychords) catch |err| return appErr(arena, switch (err) {
+            termdrive.Error.BadKey => "unknown key chord",
+            else => "send failed (terminal exited?)",
+        });
+        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "term_read")) {
+        const sb = argBool(args, "scrollback");
+        const text = t.readScreen(sb) catch return appErr(arena, "read failed (terminal exited?)");
+        defer term_state.allocator.free(text);
+        return toolResult(arena, try arena.dupe(u8, text), false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "term_run")) {
+        const cmd = argStr(args, "command") orelse return appErr(arena, "term_run requires 'command'");
+        const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
+        t.sendText(line) catch return appErr(arena, "send failed (terminal exited?)");
+        const settled = t.waitIdle(quiet_ms, timeout_ms);
+        const text = t.readScreen(false) catch return appErr(arena, "read failed");
+        defer term_state.allocator.free(text);
+        const note = if (settled) "" else "\n[note: output still flowing at timeout]";
+        const msg = try std.fmt.allocPrint(arena, "{s}{s}", .{ text, note });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "term_wait_idle")) {
+        const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 500;
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        const settled = t.waitIdle(quiet_ms, timeout_ms);
+        return toolResult(arena, if (settled) "idle" else "still active at timeout", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "term_resize")) {
+        const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 120, 10, 500));
+        const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 40, 4, 300));
+        t.resize(cols, rows) catch return appErr(arena, "resize failed (terminal exited?)");
+        _ = t.waitIdle(200, 2_000);
+        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "term_close")) {
+        const id = termIdOf(t);
+        _ = term_state.terms.swapRemove(id);
+        t.deinit();
+        return toolResult(arena, "terminal closed", false) orelse error.OutOfMemory;
+    }
+    return appErr(arena, "unknown tool");
+}
+
 fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
 
@@ -1202,6 +1387,9 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
         eql(u8, name, "list_installed_apps") or std.mem.startsWith(u8, name, "app_"))
     {
         return appTool(arena, name, args);
+    }
+    if (std.mem.startsWith(u8, name, "term_")) {
+        return termTool(arena, name, args);
     }
 
     const pane = paneFromArgs(args);
