@@ -1317,6 +1317,7 @@ pub const Daemon = struct {
             .file_close => self.handleFileClose(cl, frame.payload),
             .file_get => self.handleFileGet(cl, frame.payload),
             .file_list => self.handleFileList(cl, frame.payload),
+            .app_list => self.handleAppList(cl),
             .chan_data => {
                 const id = wire.decodeChanId(frame.payload) orelse return;
                 const ch = self.findChannel(id) orelse return;
@@ -1633,6 +1634,27 @@ pub const Daemon = struct {
             .message = "",
             .size = size,
         });
+    }
+
+    /// Installed-app discovery: scan the daemon host's .desktop
+    /// entries and answer app_listing. On an SSH/UDP daemon this is
+    /// the REMOTE's app list — the whole point of the remote launcher.
+    fn handleAppList(self: *Daemon, cl: *Client) void {
+        const AppOut = struct { name: []const u8, exec: []const u8, icon: []const u8 };
+        const desktop = @import("desktop.zig");
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const entries = desktop.scan(arena, 2048) catch {
+            cl.queueJson(.app_listing, .{ .apps = &[_]AppOut{}, .@"error" = "scan failed" });
+            return;
+        };
+        var out = arena.alloc(AppOut, entries.len) catch {
+            cl.queueJson(.app_listing, .{ .apps = &[_]AppOut{}, .@"error" = "oom" });
+            return;
+        };
+        for (entries, 0..) |e, i| out[i] = .{ .name = e.name, .exec = e.exec, .icon = e.icon };
+        cl.queueJson(.app_listing, .{ .apps = out });
     }
 
     // === Remote directory browse (file_list) ===================

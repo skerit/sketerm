@@ -319,6 +319,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"split_pane","description":"Split a pane. direction 'h' = side by side, 'v' = stacked. Returns the new pane id.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"direction":{"type":"string","enum":["h","v"]}}}},
     \\{"name":"focus_pane","description":"Focus a pane (selects its tab and grabs keyboard focus).","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
     \\{"name":"close_pane","description":"Close a pane. Destructive: the shell and any running process in it are terminated.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
+    \\{"name":"list_installed_apps","description":"List installed GUI apps on the host (name + launch command), from its .desktop entries. Pass host for a remote machine. Use before launch_app to discover what can run.","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH host (user@box); omit = local"}}}},
     \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns an app id and its windows. Drive it with screenshot_app/app_click/app_type/app_key.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"wait_ms":{"type":"integer","description":"Max wait for the first window (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"}},"required":["command"]}},
     \\{"name":"list_apps","description":"List launched headless apps and their windows.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"app_windows","description":"List one app's rendered windows (ids, sizes, titles).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
@@ -558,6 +559,15 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         const summary = try appSummary(arena, app);
         return toolResult(arena, summary, false) orelse error.OutOfMemory;
     }
+    if (eql(u8, name, "list_installed_apps")) {
+        const listing = appdrive.listInstalledApps(app_state.allocator, argStr(args, "host")) catch |err|
+            return appErr(arena, switch (err) {
+                appdrive.Error.SpawnFailed => "cannot reach the daemon (is sketerm-mux running / host reachable?)",
+                else => "app discovery failed",
+            });
+        defer app_state.allocator.free(listing);
+        return toolResult(arena, listing, false) orelse error.OutOfMemory;
+    }
     if (eql(u8, name, "list_apps")) {
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
@@ -689,7 +699,7 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
 
     if (eql(u8, name, "launch_app") or eql(u8, name, "list_apps") or eql(u8, name, "close_app") or
         eql(u8, name, "close_app_window") or eql(u8, name, "screenshot_app") or
-        std.mem.startsWith(u8, name, "app_"))
+        eql(u8, name, "list_installed_apps") or std.mem.startsWith(u8, name, "app_"))
     {
         return appTool(arena, name, args);
     }

@@ -3760,6 +3760,28 @@ pub const Window = struct {
         try self.attachMux(conn_in, name, host, null);
     }
 
+    /// Spawn a forwarded GUI-app session (`app=true`) running `argv`
+    /// on `host`'s daemon and attach it in a new tab; its windows
+    /// render locally via the compositor brain. Used by the remote
+    /// app launcher. `host` null = the local autostart daemon.
+    pub fn launchRemoteAppSession(self: *Window, host: ?[]const u8, argv: []const []const u8) !void {
+        var name_buf: [64]u8 = undefined;
+        const name = nextSessionName(&name_buf);
+        var conn = try self.muxConnect(host);
+        {
+            errdefer conn.deinit();
+            try conn.sendJson(.spawn, .{
+                .name = name,
+                .argv = argv,
+                .rows = @as(u16, 24),
+                .cols = @as(u16, 80),
+                .app = true,
+            });
+            (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
+        }
+        try self.attachMux(conn, name, host, null);
+    }
+
     /// Attach `conn` to session `name` — wrapped in a new tab, or
     /// replacing `takeover`'s spot in its split tree (the pane the
     /// `sketerm mux` CLI was invoked from; its shell — including that
@@ -5872,6 +5894,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .copy_screen => self.copyFocusedScreen(),
         .copy_scrollback => self.copyFocusedScrollback(),
         .screenshot_pane => screenshotFocusedPane(self),
+        .launch_remote_app => if (self.focusedPane()) |p| @import("app_launcher.zig").open(self, p),
         .prefs_open => self.openPrefs(),
         else => {},
     }
