@@ -584,6 +584,11 @@ pub const Pane = struct {
                 c.gdk_clipboard_set_text(clip, cstr.ptr);
                 return true;
             },
+            .open_link => {
+                const uri = self.menu_link_uri orelse return true;
+                launchUri(uri);
+                return true;
+            },
             else => return false,
         }
     }
@@ -677,6 +682,23 @@ pub const Pane = struct {
             @intCast(c0.col),
         );
         return .{ .col = @intCast(logical_col), .row = c0.row };
+    }
+
+    /// Hover tooltip for a link: the URI, plus the Ctrl+click hint
+    /// when single-click open is off (otherwise the pointer-cursor
+    /// affordance lies — plain clicks do nothing).
+    fn setLinkTooltip(self: *Pane, uri: []const u8) void {
+        const hint = "\nCtrl+click to open";
+        var buf: [4096 + hint.len]u8 = undefined;
+        const n = @min(uri.len, 4095);
+        @memcpy(buf[0..n], uri[0..n]);
+        var end = n;
+        if (!self.link_single_click) {
+            @memcpy(buf[end .. end + hint.len], hint);
+            end += hint.len;
+        }
+        buf[end] = 0;
+        c.gtk_widget_set_tooltip_text(@ptrCast(self.area), &buf);
     }
 
     pub fn deinit(self: *Pane) void {
@@ -2034,8 +2056,19 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
         }
     }
 
-    if (c.g_action_map_lookup_action(@ptrCast(group), "copy-link")) |act| {
-        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), if (has_link) 1 else 0);
+    // No OSC 8 link — fall back to the auto-URL detector, same as
+    // hover and Ctrl+click do.
+    if (!has_link and self.grid_pass.enable_url_underline) {
+        if (screen.urlAtVisible(self.allocator, cell.row, cell.col) catch null) |url| {
+            self.menu_link_uri = url;
+            has_link = true;
+        }
+    }
+
+    for ([_][*:0]const u8{ "copy-link", "open-link" }) |name| {
+        if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
+            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), if (has_link) 1 else 0);
+        }
     }
     return true;
 }
@@ -2155,22 +2188,14 @@ fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
         const cell_data = screen.cellAt(c_row, c_col);
         if (cell_data.flags & 0b0000_0100 != 0) {
             if (screen.linkUri(cell_data.reserved)) |uri| {
-                var buf: [4096]u8 = undefined;
-                const n = @min(uri.len, buf.len - 1);
-                @memcpy(buf[0..n], uri[0..n]);
-                buf[n] = 0;
-                c.gtk_widget_set_tooltip_text(@ptrCast(self.area), &buf);
+                self.setLinkTooltip(uri);
                 over_link = true;
             }
         }
         if (!over_link and self.grid_pass.enable_url_underline) {
             if (screen.urlAtVisible(self.allocator, @intCast(c_row), @intCast(c_col)) catch null) |url| {
                 defer self.allocator.free(url);
-                const max = @min(url.len, 4095);
-                var buf: [4096]u8 = undefined;
-                @memcpy(buf[0..max], url[0..max]);
-                buf[max] = 0;
-                c.gtk_widget_set_tooltip_text(@ptrCast(self.area), &buf);
+                self.setLinkTooltip(url);
                 over_link = true;
             }
         }
@@ -2479,11 +2504,7 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
     // OSC 8 hyperlink — preferred path when the cell carries one.
     if (cell_data.flags & 0b0000_0100 != 0) {
         if (screen.linkUri(cell_data.reserved)) |uri| {
-            var buf: [4096]u8 = undefined;
-            const n = @min(uri.len, buf.len - 1);
-            @memcpy(buf[0..n], uri[0..n]);
-            buf[n] = 0;
-            _ = c.g_app_info_launch_default_for_uri(&buf, null, null);
+            launchUri(uri);
             return;
         }
     }
@@ -2492,11 +2513,22 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
     if (!self.grid_pass.enable_url_underline) return;
     const url = (screen.urlAtVisible(self.allocator, cell.row, cell.col) catch null) orelse return;
     defer self.allocator.free(url);
+    launchUri(url);
+}
+
+/// Open a URI with the desktop's default handler.
+fn launchUri(uri: []const u8) void {
     var buf: [4096]u8 = undefined;
-    const n = @min(url.len, buf.len - 1);
-    @memcpy(buf[0..n], url[0..n]);
+    const n = @min(uri.len, buf.len - 1);
+    @memcpy(buf[0..n], uri[0..n]);
     buf[n] = 0;
-    _ = c.g_app_info_launch_default_for_uri(&buf, null, null);
+    var err: ?*c.GError = null;
+    if (c.g_app_info_launch_default_for_uri(&buf, null, &err) == 0) {
+        if (err) |e| {
+            std.log.warn("open link failed: {s}", .{e.message});
+            c.g_error_free(e);
+        }
+    }
 }
 
 fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
