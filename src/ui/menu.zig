@@ -139,8 +139,8 @@ const MENU = [_]Item{
         .{ .name = "close-tab", .label = "Close Tab", .detailed = "term.close-tab", .icon = "window-close-symbolic", .action = .close_tab },
     } } },
     .separator,
+    .{ .bind = .{ .name = "launch-app", .label = "Launch App…", .detailed = "term.launch-app", .icon = "application-x-executable-symbolic", .action = .launch_remote_app } },
     .{ .submenu = .{ .label = "Session", .icon = "network-server-symbolic", .remote_only = true, .items = &.{
-        .{ .name = "launch-app", .label = "Launch App…", .detailed = "term.launch-app", .icon = "application-x-executable-symbolic", .action = .launch_remote_app },
         .{ .name = "upload-file", .label = "Upload File…", .detailed = "term.upload-file", .icon = "document-send-symbolic", .action = .upload_file, .host_only = true },
         .{ .name = "download-file", .label = "Download File…", .detailed = "term.download-file", .icon = "folder-download-symbolic", .action = .download_file, .host_only = true },
         .{ .name = "mux-detach", .label = "Detach Session", .detailed = "term.mux-detach", .icon = "network-offline-symbolic", .action = .mux_detach },

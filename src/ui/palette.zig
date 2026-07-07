@@ -117,6 +117,8 @@ const ENTRIES = [_]Entry{
        .desc = "Pick a saved layout file and open its tabs in a new window.", .action = .load_layout },
     .{ .icon = "view-refresh-symbolic", .title = "Reload Config",
        .desc = "Re-read config.conf from disk and apply live.", .action = .reload_config },
+    .{ .icon = "application-x-executable-symbolic", .title = "Launch App…",
+       .desc = "Pick an installed GUI app on this pane's host and run it as a forwarded app.", .action = .launch_app },
     .{ .icon = "preferences-other-symbolic", .title = "Apply Profile to Pane…",
        .desc = "Re-style the focused pane with a profile's font/colors/scrollback.", .action = .apply_profile },
 
