@@ -1961,12 +1961,25 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
         c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(avail));
     }
 
-    // Mux session rows (detach / rename / kill) only make sense on a
-    // remote pane; menu.zig hides the rows of disabled mux actions.
-    const is_remote = self.terminal.remote != null;
+    // The Session submenu splits into two independent conditions:
+    //   - detach / rename / kill make sense on any DURABLE session
+    //     (one that survives the pane closing). A plain local shell
+    //     tab is GUI-owned and ephemeral, so they are meaningless.
+    //   - upload / download only make sense when the PTY lives on
+    //     ANOTHER machine (SSH / UDP host); file transfer to a local
+    //     session is pointless.
+    // menu.zig hides each group's rows (and the submenu shell) when
+    // its representative action is left disabled.
+    const is_durable = if (self.terminal.remote) |r| !r.ephemeral else false;
+    const is_host_remote = if (self.terminal.remote) |r| r.host != null else false;
     for ([_][*:0]const u8{ "mux-detach", "mux-rename", "mux-kill" }) |name| {
         if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
-            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(is_remote));
+            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(is_durable));
+        }
+    }
+    for ([_][*:0]const u8{ "upload-file", "download-file" }) |name| {
+        if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
+            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(is_host_remote));
         }
     }
 
