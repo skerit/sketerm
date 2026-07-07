@@ -19,6 +19,7 @@ const wltrack = @import("../wlhost/track.zig");
 const wlproto = @import("../wlhost/protocol.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
 const wlpixcodec = @import("../wlhost/pixcodec.zig");
+const wlcomp = @import("../wlhost/compositor.zig");
 const build_options = @import("build_options");
 const wlvcodec = @import("../wlhost/vcodec.zig");
 const churnmod = @import("../util/churn.zig");
@@ -173,15 +174,7 @@ const Session = struct {
     /// (SKETERM_WINSTREAM=stub). Mutually exclusive with Wayland
     /// forwarding.
     winstream: ?*WsSource = null,
-    /// App display connections accepted BEFORE any channel-capable
-    /// client attached. Wayland clients block on an unanswered
-    /// socket, so queueing here keeps a freshly-spawned app alive
-    /// through the spawn→GUI-attach handover gap.
-    wl_pending: std.ArrayList(c_int) = .empty,
-
     fn deinit(self: *Session) void {
-        for (self.wl_pending.items) |fd| _ = c.close(fd);
-        self.wl_pending.deinit(self.allocator);
         if (self.winstream) |ws| {
             ws.deinit();
             self.allocator.destroy(ws);
@@ -352,15 +345,22 @@ fn removeTreeBestEffort(path: []const u8) void {
     _ = c.rmdir(zpath);
 }
 
-/// One tunneled byte stream, bridged to `client` as chan_* frames:
+/// One tunneled byte stream, bridged to clients as chan_* frames:
 /// a Wayland app connection (`native` set) or a window-stream session
 /// (`native` null, fd -1, frames produced in the daemon).
+///
+/// Ownership split (proto v5): a NATIVE channel belongs to the
+/// SESSION — `client` is null, its unit stream broadcasts to every
+/// attached proto>=5 client, and it survives client death (durable
+/// GUI apps; the daemon-side brain keeps answering the protocol). A
+/// winstream channel keeps the legacy 1:1 client binding.
 const Channel = struct {
     allocator: std.mem.Allocator,
     id: u32,
     fd: c_int,
     session: *Session,
-    client: *Client,
+    /// Winstream only; null on native channels (broadcast).
+    client: ?*Client,
     /// Bytes from the client not yet written to fd (partial writes).
     pending: std.ArrayList(u8) = .empty,
     dead: bool = false,
@@ -382,6 +382,14 @@ const Channel = struct {
 const Native = struct {
     allocator: std.mem.Allocator,
     tracker: wltrack.Tracker,
+    /// The authoritative compositor answering this app's protocol —
+    /// lives HERE so the app runs with zero clients attached and
+    /// survives client churn. Fed the request unit stream (minus
+    /// pool bytes: its View has no frame callback, so it never needs
+    /// pixels); its output is applied straight back to the app.
+    /// serializeState() of this instance is what reattaching
+    /// replicas restore from.
+    brain: *wlcomp.Compositor,
     /// Raw bytes from the app socket; messages may arrive split.
     inbuf: std.ArrayList(u8) = .empty,
     /// SCM_RIGHTS fds awaiting their create_pool message (Wayland
@@ -442,6 +450,8 @@ const Native = struct {
     };
 
     fn deinit(self: *Native) void {
+        self.brain.deinit();
+        self.allocator.destroy(self.brain);
         var it = self.pools.valueIterator();
         while (it.next()) |p| {
             _ = c.munmap(p.ptr, p.size);
@@ -762,7 +772,7 @@ pub const Daemon = struct {
             var ws_fd: c_int = -1;
             if (s.winstream) |ws| {
                 for (self.channels.items) |ch| {
-                    if (ch.session == s and !ch.dead and ch.native == null and !ch.client.dead) {
+                    if (ch.session == s and !ch.dead and ch.native == null and ch.client != null and !ch.client.?.dead) {
                         ws_fd = ws.pollFd();
                         break;
                     }
@@ -997,13 +1007,9 @@ pub const Daemon = struct {
         const s = self.sessions.items[0];
         cl.attached = s;
         self.queueSnapshot(cl, s);
-        if (proto >= 2) {
-            if (s.winstream != null) self.openWinstreamChan(s, cl);
-            while (s.wl_pending.items.len > 0) {
-                const afd = s.wl_pending.orderedRemove(0);
-                self.openAppChannel(s, cl, afd);
-            }
-        }
+        if (proto >= 2 and s.winstream != null) self.openWinstreamChan(s, cl);
+        if (proto >= 5) self.replayNativeChannels(cl, s);
+        self.refreshVideoGates();
     }
 
     /// Broker side: read one control datagram from a worker. 'Y' = ready
@@ -1314,8 +1320,13 @@ pub const Daemon = struct {
             .chan_data => {
                 const id = wire.decodeChanId(frame.payload) orelse return;
                 const ch = self.findChannel(id) orelse return;
-                if (ch.client != cl or ch.dead) return;
-                if (ch.native != null) return self.nativeClientData(ch, frame.payload[4..]);
+                if (ch.dead) return;
+                if (ch.native != null) {
+                    // Any attached viewer may drive input (shared seat).
+                    if (!nativeViewer(cl, ch.session)) return;
+                    return self.nativeClientData(ch, frame.payload[4..]);
+                }
+                if (ch.client != cl) return;
                 if (ch.session.winstream) |ws| {
                     var pos: usize = 0;
                     const bytes = frame.payload[4..];
@@ -1328,8 +1339,13 @@ pub const Daemon = struct {
             .chan_close => {
                 const id = wire.decodeChanId(frame.payload) orelse return;
                 const ch = self.findChannel(id) orelse return;
+                // A viewer dropping its side of a NATIVE channel is
+                // just that viewer going away — the app is durable
+                // and keeps running for everyone else (and for a
+                // later reattach). Only winstream dies with its
+                // client.
+                if (ch.native != null) return;
                 if (ch.client != cl) return;
-                // Client already dropped its side — no echo needed.
                 ch.dead = true;
             },
             else => cl.queueErr("unknown frame type"),
@@ -1789,39 +1805,45 @@ pub const Daemon = struct {
         }
     }
 
-    /// A Wayland app connected to the session's hub: tunnel it to an
-    /// attached channel-capable client, or refuse (the app gets a
-    /// clean "cannot connect to display" instead of a hang).
+    /// A Wayland app connected to the session's hub. The daemon IS
+    /// the compositor (Native.brain) — the connection is accepted
+    /// unconditionally, with or without clients to render it.
     fn acceptWaylandApp(self: *Daemon, s: *Session) void {
         const fd = c.accept(s.wl_hub_fd, null, null);
         if (fd < 0) return;
         _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
         const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
         _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
-
-        // Latest attached client wins (multiple GUIs on one session
-        // is rare; the newest attachment is the active human).
-        var target: ?*Client = null;
-        for (self.clients.items) |cl| {
-            if (cl.attached == s and !cl.dead and cl.proto >= 2) target = cl;
-        }
-        const cl = target orelse {
-            // Nobody to render yet — park the connection; the app
-            // blocks harmlessly. Drained on the next attach.
-            if (s.wl_pending.items.len >= 16) {
-                _ = c.close(fd);
-                return;
-            }
-            s.wl_pending.append(self.allocator, fd) catch {
-                _ = c.close(fd);
-            };
-            return;
-        };
-        self.openAppChannel(s, cl, fd);
+        self.openAppChannel(s, fd);
     }
 
-    /// Bridge one accepted app connection to `cl` as a channel.
-    fn openAppChannel(self: *Daemon, s: *Session, cl: *Client, fd: c_int) void {
+    /// True when `cl` should receive this session's native app units.
+    fn nativeViewer(cl: *const Client, s: *const Session) bool {
+        return cl.attached == s and !cl.dead and cl.proto >= 5;
+    }
+
+    /// Re-evaluate the per-channel video consensus after client churn.
+    fn refreshVideoGates(self: *Daemon) void {
+        for (self.channels.items) |ch| {
+            if (ch.dead) continue;
+            if (ch.native) |nv| nv.wants_video = self.videoOk(ch.session);
+        }
+    }
+
+    /// Video tiles may only flow when every viewer can decode them
+    /// (a tile one client can't decode is a black window there).
+    fn videoOk(self: *Daemon, s: *Session) bool {
+        var any = false;
+        for (self.clients.items) |cl| {
+            if (!nativeViewer(cl, s)) continue;
+            if (!cl.video) return false;
+            any = true;
+        }
+        return any;
+    }
+
+    /// Bridge one accepted app connection as a session-owned channel.
+    fn openAppChannel(self: *Daemon, s: *Session, fd: c_int) void {
         const native = self.allocator.create(Native) catch {
             _ = c.close(fd);
             return;
@@ -1831,7 +1853,22 @@ pub const Daemon = struct {
             _ = c.close(fd);
             return;
         };
-        native.* = .{ .allocator = self.allocator, .tracker = tracker };
+        const brain = self.allocator.create(wlcomp.Compositor) catch {
+            var tr = tracker;
+            tr.deinit();
+            self.allocator.destroy(native);
+            _ = c.close(fd);
+            return;
+        };
+        brain.* = wlcomp.Compositor.init(self.allocator, .{}) catch {
+            self.allocator.destroy(brain);
+            var tr = tracker;
+            tr.deinit();
+            self.allocator.destroy(native);
+            _ = c.close(fd);
+            return;
+        };
+        native.* = .{ .allocator = self.allocator, .tracker = tracker, .brain = brain };
 
         const ch = self.allocator.create(Channel) catch {
             native.deinit();
@@ -1843,20 +1880,20 @@ pub const Daemon = struct {
             .id = self.next_chan_id,
             .fd = fd,
             .session = s,
-            .client = cl,
+            .client = null,
             .native = native,
         };
-        // Route this app's surfaces through the video coder only if the
-        // target client advertised it can decode (and we can encode —
-        // videoCommit is comptime-gated on build_options.video).
-        native.wants_video = cl.video;
+        native.wants_video = self.videoOk(s);
         self.next_chan_id += 1;
         self.channels.append(self.allocator, ch) catch {
             ch.deinit();
             return;
         };
         var hdr: [5]u8 = undefined;
-        cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .wayland_native));
+        for (self.clients.items) |cl| {
+            if (nativeViewer(cl, s))
+                cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .wayland_native));
+        }
     }
 
     /// App-socket bytes toward the client (the parsed sketerm-native
@@ -1993,6 +2030,11 @@ pub const Daemon = struct {
         const nv = ch.native.?;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(self.allocator);
+        // The brain's copy of the request stream: wl_msg units only —
+        // its View has no frame callback, so pool bytes would be
+        // allocated and decoded for nothing.
+        var brain_in: std.ArrayList(u8) = .empty;
+        defer brain_in.deinit(self.allocator);
 
         var pos: usize = 0;
         var fail = false;
@@ -2012,6 +2054,10 @@ pub const Daemon = struct {
                 fail = true;
                 break;
             };
+            wlpipe.appendUnit(&brain_in, self.allocator, .wl_msg, msgb) catch {
+                fail = true;
+                break;
+            };
             pos += mh.size;
         }
         if (pos > 0) {
@@ -2019,8 +2065,33 @@ pub const Daemon = struct {
             std.mem.copyForwards(u8, nv.inbuf.items[0..rem], nv.inbuf.items[pos..]);
             nv.inbuf.shrinkRetainingCapacity(rem);
         }
-        if (units.items.len > 0) self.queueUnits(ch, units.items);
+        if (!fail and brain_in.items.len > 0) {
+            nv.brain.now_ms = @truncate(@as(u64, @intCast(nowMs())));
+            nv.brain.feed(brain_in.items) catch {
+                fail = true;
+            };
+            self.flushBrain(ch);
+        }
+        if (units.items.len > 0 and !ch.dead) self.queueUnits(ch, units.items);
         if (fail) self.closeChannel(ch, true);
+    }
+
+    /// Apply the brain's queued output (events toward the app,
+    /// keymap/clip side-band) and close the channel on a brain-fatal
+    /// protocol error.
+    fn flushBrain(self: *Daemon, ch: *Channel) void {
+        const nv = ch.native.?;
+        const out = nv.brain.takeOut();
+        if (out.len > 0) {
+            var pos: usize = 0;
+            while (wlpipe.peelUnit(out[pos..]) catch null) |p| {
+                self.applyAppUnit(ch, p.unit.tag, p.unit.payload);
+                if (ch.dead) break;
+                pos += p.consumed;
+            }
+        }
+        nv.brain.clearOut();
+        if (nv.brain.dead and !ch.dead) self.closeChannel(ch, true);
     }
 
     /// Bound on pool bytes per pipe unit — also the granularity at
@@ -2135,22 +2206,36 @@ pub const Daemon = struct {
         }
     }
 
-    /// Ship a unit stream to the channel's client, split into
+    /// Ship a unit stream to the channel's viewers, split into
     /// chan_data frames well below MAX_FRAME (units may split across
-    /// frames — pipe.zig receivers reassemble).
+    /// frames — pipe.zig receivers reassemble). Native channels
+    /// broadcast to every attached proto>=5 client; winstream keeps
+    /// its 1:1 client.
     fn queueUnits(self: *Daemon, ch: *Channel, bytes: []const u8) void {
+        if (ch.native != null) {
+            for (self.clients.items) |cl| {
+                if (nativeViewer(cl, ch.session)) self.queueUnitsTo(cl, ch, bytes);
+            }
+        } else if (ch.client) |cl| {
+            if (!cl.dead) self.queueUnitsTo(cl, ch, bytes);
+        }
+    }
+
+    fn queueUnitsTo(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const u8) void {
         const MAX_CHUNK: usize = 4 << 20;
         var off: usize = 0;
         while (off < bytes.len) {
             const end = @min(off + MAX_CHUNK, bytes.len);
             const payload = self.allocator.alloc(u8, 4 + (end - off)) catch {
-                self.closeChannel(ch, true);
+                // Starving one viewer must not kill the app: drop the
+                // client, keep the channel.
+                cl.dead = true;
                 return;
             };
             defer self.allocator.free(payload);
             std.mem.writeInt(u32, payload[0..4], ch.id, .little);
             @memcpy(payload[4..], bytes[off..end]);
-            ch.client.queueFrame(.chan_data, payload);
+            cl.queueFrame(.chan_data, payload);
             off = end;
         }
     }
@@ -2190,8 +2275,11 @@ pub const Daemon = struct {
         return true;
     }
 
-    /// GUI→app bytes on a native channel: peel pipe units, write the
-    /// Wayland events through to the app, watch for delete_id.
+    /// Viewer→daemon bytes on a native channel: seat intents drive
+    /// the brain; clipboard units keep their legacy handling. Raw
+    /// wl_msg from viewers is IGNORED — the daemon brain is the only
+    /// protocol driver (a replica answering too would double-drive
+    /// the app).
     fn nativeClientData(self: *Daemon, ch: *Channel, bytes: []const u8) void {
         const nv = ch.native.?;
         nv.unitbuf.appendSlice(nv.allocator, bytes) catch {
@@ -2199,19 +2287,41 @@ pub const Daemon = struct {
             return;
         };
         var pos: usize = 0;
-        while (true) {
+        while (!ch.dead) {
             const peeled = wlpipe.peelUnit(nv.unitbuf.items[pos..]) catch {
                 self.closeChannel(ch, true);
                 return;
             } orelse break;
             switch (peeled.unit.tag) {
+                .seat_enter, .seat_leave, .seat_motion, .seat_button, .seat_axis, .seat_kbd_enter, .seat_kbd_leave, .seat_key, .seat_mods, .configure, .dismiss_popups, .offer_selection, .request_close => {
+                    nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload);
+                },
+                .clip_send, .clip_data => self.applyAppUnit(ch, peeled.unit.tag, peeled.unit.payload),
+                else => {},
+            }
+            pos += peeled.consumed;
+        }
+        if (pos > 0) {
+            const rem = nv.unitbuf.items.len - pos;
+            std.mem.copyForwards(u8, nv.unitbuf.items[0..rem], nv.unitbuf.items[pos..]);
+            nv.unitbuf.shrinkRetainingCapacity(rem);
+        }
+        if (!ch.dead) self.flushBrain(ch);
+        if (!ch.dead) self.channelWritable(ch);
+    }
+
+    /// Apply one unit TOWARD the app socket: brain output (wl_msg
+    /// events, keymap side-band) and viewer clipboard units.
+    fn applyAppUnit(self: *Daemon, ch: *Channel, tag: wlpipe.Tag, payload: []const u8) void {
+        const nv = ch.native.?;
+        switch (tag) {
                 .wl_msg => {
                     // One Wayland message per unit (pipe contract).
-                    const maybe_hdr = wlwire.parseHeader(peeled.unit.payload) catch null;
+                    const maybe_hdr = wlwire.parseHeader(payload) catch null;
                     if (maybe_hdr) |h| {
-                        nv.tracker.serverMessage(h, peeled.unit.payload[wlwire.header_size..]) catch {};
+                        nv.tracker.serverMessage(h, payload[wlwire.header_size..]) catch {};
                     }
-                    ch.pending.appendSlice(ch.allocator, peeled.unit.payload) catch {
+                    ch.pending.appendSlice(ch.allocator, payload) catch {
                         self.closeChannel(ch, true);
                         return;
                     };
@@ -2220,14 +2330,14 @@ pub const Daemon = struct {
                     // u32 keyboard id, u32 format, keymap bytes.
                     // Materialize an anon fd and emit the real
                     // wl_keyboard.keymap(format, fd, size) event.
-                    const pl = peeled.unit.payload;
-                    if (pl.len < 8) break;
+                    const pl = payload;
+                    if (pl.len < 8) return;
                     const kbd = std.mem.readInt(u32, pl[0..4], .little);
                     const format = std.mem.readInt(u32, pl[4..8], .little);
                     const blob = pl[8..];
                     // NUL-terminated per xkb convention.
                     const fd = @import("../util/platform.zig").anonFileFd(blob.len + 1);
-                    if (fd < 0) break;
+                    if (fd < 0) return;
                     var written: usize = 0;
                     var w_ok = true;
                     while (written < blob.len) {
@@ -2240,7 +2350,7 @@ pub const Daemon = struct {
                     }
                     if (!w_ok) {
                         _ = c.close(fd);
-                        break;
+                        return;
                     }
                     var mbuf: [24]u8 = undefined;
                     var b = wlwire.Builder.init(&mbuf, kbd, 0); // keymap
@@ -2249,7 +2359,7 @@ pub const Daemon = struct {
                     b.putUint(@intCast(blob.len + 1));
                     const msg = b.finish() catch {
                         _ = c.close(fd);
-                        break;
+                        return;
                     };
                     ch.pending.appendSlice(ch.allocator, msg) catch {
                         _ = c.close(fd);
@@ -2264,12 +2374,12 @@ pub const Daemon = struct {
                     // GUI fetches the app's clipboard: pipe(), the
                     // write-end rides a wl_data_source.send event,
                     // the read-end is polled until the app's EOF.
-                    const pl = peeled.unit.payload;
-                    if (pl.len < 4) break;
+                    const pl = payload;
+                    if (pl.len < 4) return;
                     const source = std.mem.readInt(u32, pl[0..4], .little);
                     const mime = pl[4..];
                     var pfds: [2]c_int = undefined;
-                    if (c.pipe(&pfds) != 0) break;
+                    if (c.pipe(&pfds) != 0) return;
                     _ = c.fcntl(pfds[0], c.F_SETFD, c.FD_CLOEXEC);
                     _ = c.fcntl(pfds[1], c.F_SETFD, c.FD_CLOEXEC);
                     const fl = c.fcntl(pfds[0], c.F_GETFL, @as(c_int, 0));
@@ -2288,7 +2398,7 @@ pub const Daemon = struct {
                     const msg = b.finish() catch {
                         _ = c.close(pfds[0]);
                         _ = c.close(pfds[1]);
-                        break;
+                        return;
                     };
                     ch.pending.appendSlice(ch.allocator, msg) catch {
                         _ = c.close(pfds[0]);
@@ -2305,12 +2415,11 @@ pub const Daemon = struct {
                 },
                 .clip_data => {
                     // Paste bytes for the oldest held receive-fd.
-                    if (nv.clip_paste_fds.items.len == 0) break;
+                    if (nv.clip_paste_fds.items.len == 0) return;
                     const fd = nv.clip_paste_fds.orderedRemove(0);
-                    const data = peeled.unit.payload;
                     var written: usize = 0;
-                    while (written < data.len) {
-                        const w = c.write(fd, data.ptr + written, data.len - written);
+                    while (written < payload.len) {
+                        const w = c.write(fd, payload.ptr + written, payload.len - written);
                         if (w <= 0) break;
                         written += @intCast(w);
                     }
@@ -2318,24 +2427,21 @@ pub const Daemon = struct {
                 },
                 // Unknown tags skip for forward compat.
                 else => {},
-            }
-            pos += peeled.consumed;
         }
-        if (pos > 0) {
-            const rem = nv.unitbuf.items.len - pos;
-            std.mem.copyForwards(u8, nv.unitbuf.items[0..rem], nv.unitbuf.items[pos..]);
-            nv.unitbuf.shrinkRetainingCapacity(rem);
-        }
-        self.channelWritable(ch);
     }
 
     fn closeChannel(self: *Daemon, ch: *Channel, notify: bool) void {
-        _ = self;
         if (ch.dead) return;
         ch.dead = true;
-        if (notify and !ch.client.dead) {
-            var hdr: [4]u8 = undefined;
-            ch.client.queueFrame(.chan_close, wire.putChanHeader(&hdr, ch.id));
+        if (!notify) return;
+        var hdr: [4]u8 = undefined;
+        const frame = wire.putChanHeader(&hdr, ch.id);
+        if (ch.native != null) {
+            for (self.clients.items) |cl| {
+                if (nativeViewer(cl, ch.session)) cl.queueFrame(.chan_close, frame);
+            }
+        } else if (ch.client) |cl| {
+            if (!cl.dead) cl.queueFrame(.chan_close, frame);
         }
     }
 
@@ -2913,13 +3019,62 @@ pub const Daemon = struct {
             }
         }
         self.queueSnapshot(cl, s);
-        if (cl.proto >= 2) {
-            if (s.winstream != null) self.openWinstreamChan(s, cl);
-            // Apps that connected before any renderer was attached.
-            while (s.wl_pending.items.len > 0) {
-                const fd = s.wl_pending.orderedRemove(0);
-                self.openAppChannel(s, cl, fd);
+        if (cl.proto >= 2 and s.winstream != null) self.openWinstreamChan(s, cl);
+        if (cl.proto >= 5) self.replayNativeChannels(cl, s);
+        self.refreshVideoGates();
+    }
+
+    /// A proto>=5 client just attached: for every live native app
+    /// channel on `s`, announce the channel and rebuild its replica —
+    /// current pool bytes from the mirrors, then the brain's
+    /// serialized protocol state. Windows reappear with current
+    /// pixels (durable GUI apps, multi-viewer).
+    fn replayNativeChannels(self: *Daemon, cl: *Client, s: *Session) void {
+        for (self.channels.items) |ch| {
+            if (ch.session != s or ch.dead) continue;
+            const nv = ch.native orelse continue;
+            var hdr: [5]u8 = undefined;
+            cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .wayland_native));
+            var units: std.ArrayList(u8) = .empty;
+            defer units.deinit(self.allocator);
+            var ok = true;
+            var it = nv.pools.iterator();
+            while (it.next()) |e| {
+                const pool_id = e.key_ptr.*;
+                const mirror = e.value_ptr.*;
+                wlpipe.appendPoolMeta(&units, self.allocator, .pool_create, pool_id, @intCast(mirror.size)) catch {
+                    ok = false;
+                    break;
+                };
+                var off: usize = 0;
+                while (off < mirror.size) {
+                    const len = @min(POOL_CHUNK, mirror.size - off);
+                    const raw = mirror.ptr[off..][0..len];
+                    var sc: wlpixcodec.Scratch = .{};
+                    defer sc.deinit(self.allocator);
+                    const enc = wlpixcodec.encodeRegion(&sc, self.allocator, raw, len) catch
+                        wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
+                    wlpipe.appendPoolUpdateC(&units, self.allocator, pool_id, @intCast(off), enc, @intCast(len), @intCast(len)) catch {
+                        ok = false;
+                        break;
+                    };
+                    off += len;
+                }
+                if (!ok) break;
             }
+            if (ok) {
+                if (nv.brain.serializeState(self.allocator)) |blob| {
+                    defer self.allocator.free(blob);
+                    wlpipe.appendUnit(&units, self.allocator, .state_sync, blob) catch {
+                        ok = false;
+                    };
+                } else |_| ok = false;
+            }
+            if (!ok) {
+                cl.dead = true;
+                return;
+            }
+            self.queueUnitsTo(cl, ch, units.items);
         }
     }
 
@@ -2964,11 +3119,12 @@ pub const Daemon = struct {
         for (self.channels.items) |ch| {
             if (ch.dead or ch.native != null) continue;
             const ws = ch.session.winstream orelse continue;
-            if (ch.client.dead) continue;
+            const cl = ch.client orelse continue;
+            if (cl.dead) continue;
             // Backpressure: a slow link must not balloon the client
             // write buffer — skip frame production until it drains
             // (the source keeps streaming; only emission pauses).
-            if (ch.client.wbuf.items.len > 8 << 20) continue;
+            if (cl.wbuf.items.len > 8 << 20) continue;
             var units: std.ArrayList(u8) = .empty;
             defer units.deinit(self.allocator);
             ws.poll(&units, self.allocator, now_ms) catch continue;
@@ -3207,11 +3363,22 @@ pub const Daemon = struct {
     }
 
     fn reap(self: *Daemon) void {
-        // A dying client takes its channels down — the remote apps'
-        // display connections see EOF and fail cleanly.
+        // A dying client takes its WINSTREAM channels down. Native
+        // channels are session-owned and deliberately survive client
+        // death — the daemon brain keeps the app alive for the next
+        // attach (durable GUI apps). They die only with the session
+        // or on app-socket EOF.
         for (self.channels.items) |ch| {
-            if (ch.client.dead) ch.dead = true;
+            if (ch.client) |cl| {
+                if (cl.dead) ch.dead = true;
+            }
         }
+        // Client churn changes the video-decode consensus.
+        var any_client_died = false;
+        for (self.clients.items) |cl| {
+            if (cl.dead) any_client_died = true;
+        }
+        if (any_client_died) self.refreshVideoGates();
         self.dropDeadChannels();
         // A dying client abandons its uploads: close the partial file
         // (it stays on disk under its chosen name — no auto-delete; a
@@ -3254,6 +3421,12 @@ pub const Daemon = struct {
                 for (self.clients.items) |cl| {
                     if (cl.attached == s) cl.attached = null;
                 }
+                // Session-owned channels must not outlive the session
+                // (ch.session would dangle in the poll loop).
+                for (self.channels.items) |ch| {
+                    if (ch.session == s) self.closeChannel(ch, true);
+                }
+                self.dropDeadChannels();
                 _ = self.sessions.swapRemove(i);
                 s.deinit();
                 continue;

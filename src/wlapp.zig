@@ -19,6 +19,7 @@ const cast = @import("util/cast.zig");
 // renderer uses, so the two stay byte-for-byte the same window.
 const rw = @import("remote_window.zig");
 const Compositor = @import("wlhost/compositor.zig").Compositor;
+const wlpipe = @import("wlhost/pipe.zig");
 
 pub const AppHost = struct {
     allocator: std.mem.Allocator,
@@ -38,6 +39,10 @@ pub const AppHost = struct {
     /// events) immediately rather than on the next feed.
     on_flush: ?*const fn (ctx: ?*anyopaque) void = null,
     flush_ctx: ?*anyopaque = null,
+    /// Outgoing seat-intent units (proto v5). The local compositor
+    /// is a passive replica whose protocol output is discarded — the
+    /// daemon brain answers the app; only these intents travel.
+    intents: std.ArrayList(u8) = .empty,
     /// GTK async clipboard reads in flight — their callbacks hold
     /// this AppHost, so destroy() defers the final free until they
     /// all land (doomed marks the limbo state).
@@ -299,6 +304,9 @@ pub const AppHost = struct {
         // Advertise the local display scale so apps render HiDPI
         // buffers (set before the app binds wl_output on first feed).
         self.comp.output_scale = localScale();
+        // Passive replica: the daemon brain owns server-created
+        // object ids (clipboard offers) this side never learns.
+        self.comp.lenient = true;
         return self;
     }
 
@@ -351,6 +359,7 @@ pub const AppHost = struct {
     }
 
     fn finalFree(self: *AppHost) void {
+        self.intents.deinit(self.allocator);
         self.comp.deinit();
         self.allocator.destroy(self);
     }
@@ -364,14 +373,102 @@ pub const AppHost = struct {
         if (self.comp.dead) return error.Protocol;
     }
 
-    /// Pending event bytes toward the daemon. Caller ships them as
-    /// chan_data and then calls clearOut.
+    /// Pending intent bytes toward the daemon. Caller ships them as
+    /// chan_data and then calls clearOut. The replica compositor's
+    /// own protocol output is discarded here — sending it would
+    /// double-drive the app against the daemon brain.
     pub fn takeOut(self: *AppHost) []const u8 {
-        return self.comp.takeOut();
+        self.comp.clearOut();
+        return self.intents.items;
     }
 
     pub fn clearOut(self: *AppHost) void {
-        self.comp.clearOut();
+        self.intents.clearRetainingCapacity();
+    }
+
+    // ── seat intents (viewer → daemon brain) ────────────────────
+    // Each wrapper updates the local replica (focus bookkeeping for
+    // cursor shapes / popup grabs) AND queues the intent unit.
+
+    fn seatEnter(self: *AppHost, sid: u32, x: f64, y: f64) void {
+        self.comp.pointerEnter(sid, x, y) catch {};
+        wlpipe.appendSeatEnter(&self.intents, self.allocator, sid, x, y) catch {};
+    }
+
+    fn seatMotion(self: *AppHost, x: f64, y: f64) void {
+        self.comp.pointerMotion(x, y) catch {};
+        wlpipe.appendSeatMotion(&self.intents, self.allocator, x, y) catch {};
+    }
+
+    fn seatLeave(self: *AppHost) void {
+        self.comp.pointerLeave() catch {};
+        wlpipe.appendUnit(&self.intents, self.allocator, .seat_leave, "") catch {};
+    }
+
+    fn seatButton(self: *AppHost, button: u32, pressed: bool) void {
+        self.comp.pointerButton(button, pressed) catch {};
+        wlpipe.appendSeatButton(&self.intents, self.allocator, button, pressed) catch {};
+    }
+
+    fn seatAxis(self: *AppHost, axis: u32, value: f64) void {
+        self.comp.pointerAxis(axis, value) catch {};
+        wlpipe.appendSeatAxis(&self.intents, self.allocator, axis, value) catch {};
+    }
+
+    fn seatKbdEnter(self: *AppHost, sid: u32) void {
+        self.comp.keyboardEnter(sid) catch {};
+        wlpipe.appendSeatKbdEnter(&self.intents, self.allocator, sid) catch {};
+    }
+
+    fn seatKbdLeave(self: *AppHost) void {
+        self.comp.keyboardLeave() catch {};
+        wlpipe.appendUnit(&self.intents, self.allocator, .seat_kbd_leave, "") catch {};
+    }
+
+    fn seatKey(self: *AppHost, key: u32, pressed: bool) void {
+        self.comp.keyboardKey(key, pressed) catch {};
+        wlpipe.appendSeatKey(&self.intents, self.allocator, key, pressed) catch {};
+    }
+
+    fn seatMods(self: *AppHost, depressed: u32, latched: u32, locked: u32, group: u32) void {
+        self.comp.keyboardModifiers(depressed, latched, locked, group) catch {};
+        wlpipe.appendSeatMods(&self.intents, self.allocator, depressed, latched, locked, group) catch {};
+    }
+
+    fn dismissPopupsIntent(self: *AppHost) void {
+        self.comp.dismissPopups() catch {};
+        wlpipe.appendUnit(&self.intents, self.allocator, .dismiss_popups, "") catch {};
+    }
+
+    fn configureIntent(self: *AppHost, sid: u32, w: i32, h: i32, st: Compositor.ToplevelState) void {
+        var bits: u32 = 0;
+        if (st.activated) bits |= 1;
+        if (st.maximized) bits |= 2;
+        if (st.fullscreen) bits |= 4;
+        if (st.resizing) bits |= 8;
+        wlpipe.appendConfigure(&self.intents, self.allocator, sid, w, h, bits) catch {};
+    }
+
+    fn requestCloseIntent(self: *AppHost, sid: u32) void {
+        wlpipe.appendRequestClose(&self.intents, self.allocator, sid) catch {};
+    }
+
+    fn offerSelectionIntent(self: *AppHost, mime: []const u8) void {
+        wlpipe.appendUnit(&self.intents, self.allocator, .offer_selection, mime) catch {};
+    }
+
+    fn clipSendIntent(self: *AppHost, source: u32, mime: []const u8) void {
+        var pl: std.ArrayList(u8) = .empty;
+        defer pl.deinit(self.allocator);
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, source, .little);
+        pl.appendSlice(self.allocator, &idb) catch return;
+        pl.appendSlice(self.allocator, mime) catch return;
+        wlpipe.appendUnit(&self.intents, self.allocator, .clip_send, pl.items) catch {};
+    }
+
+    fn clipDataIntent(self: *AppHost, bytes: []const u8) void {
+        wlpipe.appendUnit(&self.intents, self.allocator, .clip_data, bytes) catch {};
     }
 
     // ── view callbacks (main thread — GTK is safe) ──────────────
@@ -584,24 +681,24 @@ pub const AppHost = struct {
     fn onPopupPtrEnter(_: ?*c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const popup = cast.userData(Popup, user);
         popup.host.stampNow();
-        popup.host.comp.pointerEnter(popup.surface, x, y) catch return;
+        popup.host.seatEnter(popup.surface, x, y);
         popup.host.flushHost();
     }
 
     fn onPopupPtrMotion(_: ?*c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const popup = cast.userData(Popup, user);
         popup.host.stampNow();
-        popup.host.comp.pointerEnter(popup.surface, x, y) catch return;
-        popup.host.comp.pointerMotion(x, y) catch return;
+        popup.host.seatEnter(popup.surface, x, y);
+        popup.host.seatMotion(x, y);
         popup.host.flushHost();
     }
 
     fn onPopupBtnPress(gesture: ?*c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
         const popup = cast.userData(Popup, user);
         popup.host.stampNow();
-        popup.host.comp.pointerEnter(popup.surface, x, y) catch return;
+        popup.host.seatEnter(popup.surface, x, y);
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
-        popup.host.comp.pointerButton(evdevButton(btn), true) catch return;
+        popup.host.seatButton(evdevButton(btn), true);
         popup.host.flushHost();
     }
 
@@ -609,7 +706,7 @@ pub const AppHost = struct {
         const popup = cast.userData(Popup, user);
         popup.host.stampNow();
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
-        popup.host.comp.pointerButton(evdevButton(btn), false) catch return;
+        popup.host.seatButton(evdevButton(btn), false);
         popup.host.flushHost();
     }
 
@@ -747,7 +844,7 @@ pub const AppHost = struct {
         if (edge != 0) return; // host resize band — not the app's pointer
         win.host.stampNow();
         const p = win.mapXY(x, y);
-        win.host.comp.pointerEnter(win.surface, p[0], p[1]) catch return;
+        win.host.seatEnter(win.surface, p[0], p[1]);
         win.host.flushHost();
     }
 
@@ -759,8 +856,8 @@ pub const AppHost = struct {
         win.host.stampNow();
         const p = win.mapXY(x, y);
         // Enter may have been missed (window created under cursor).
-        win.host.comp.pointerEnter(win.surface, p[0], p[1]) catch return;
-        win.host.comp.pointerMotion(p[0], p[1]) catch return;
+        win.host.seatEnter(win.surface, p[0], p[1]);
+        win.host.seatMotion(p[0], p[1]);
         win.host.flushHost();
     }
 
@@ -768,7 +865,7 @@ pub const AppHost = struct {
         const win = cast.userData(Win, user);
         win.applyEdge(0);
         win.host.stampNow();
-        win.host.comp.pointerLeave() catch return;
+        win.host.seatLeave();
         win.host.flushHost();
     }
 
@@ -802,11 +899,11 @@ pub const AppHost = struct {
         win.fwd_press = true;
         win.host.stampNow();
         // A click on the main surface while a menu is up dismisses it.
-        win.host.comp.dismissPopups() catch {};
+        win.host.dismissPopupsIntent();
         const p = win.mapXY(x, y);
-        win.host.comp.pointerEnter(win.surface, p[0], p[1]) catch return;
+        win.host.seatEnter(win.surface, p[0], p[1]);
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
-        win.host.comp.pointerButton(evdevButton(btn), true) catch return;
+        win.host.seatButton(evdevButton(btn), true);
         win.host.flushHost();
     }
 
@@ -815,7 +912,7 @@ pub const AppHost = struct {
         if (!win.fwd_press) return; // press started a host resize, not app input
         win.host.stampNow();
         const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
-        win.host.comp.pointerButton(evdevButton(btn), false) catch return;
+        win.host.seatButton(evdevButton(btn), false);
         win.host.flushHost();
     }
 
@@ -824,8 +921,8 @@ pub const AppHost = struct {
         win.host.stampNow();
         // Discrete wheel steps arrive as ±1; ~10 surface px per
         // step matches what stock compositors send.
-        if (dy != 0) win.host.comp.pointerAxis(0, dy * 10.0) catch return 0;
-        if (dx != 0) win.host.comp.pointerAxis(1, dx * 10.0) catch return 0;
+        if (dy != 0) win.host.seatAxis(0, dy * 10.0);
+        if (dx != 0) win.host.seatAxis(1, dx * 10.0);
         win.host.flushHost();
         return 1;
     }
@@ -833,19 +930,19 @@ pub const AppHost = struct {
     fn sendKey(win: *Win, keycode: c_uint, state: c.GdkModifierType, pressed: bool) void {
         win.host.stampNow();
         const target = if (win.host.comp.grabbed_popup != 0) win.host.comp.grabbed_popup else win.surface;
-        win.host.comp.keyboardEnter(target) catch return;
+        win.host.seatKbdEnter(target);
         // First key toward a newly focused surface: make sure it
         // has a host-clipboard offer to paste from (the focus
         // controller alone is unreliable under bare X).
         if (win.host.offered_focus != win.host.comp.keyboard_focus) {
             win.host.offered_focus = win.host.comp.keyboard_focus;
-            win.host.comp.offerSelection("text/plain;charset=utf-8") catch {};
+            win.host.offerSelectionIntent("text/plain;charset=utf-8");
         }
         // GDK's low modifier bits are the X11/xkb mod order the
         // pc105/us keymap uses (shift, lock, ctrl, mod1…).
-        win.host.comp.keyboardModifiers(@as(u32, @intCast(state)) & 0xff, 0, 0, 0) catch return;
+        win.host.seatMods(@as(u32, @intCast(state)) & 0xff, 0, 0, 0);
         if (keycode >= 8)
-            win.host.comp.keyboardKey(@intCast(keycode - 8), pressed) catch return;
+            win.host.seatKey(@intCast(keycode - 8), pressed);
         win.host.flushHost();
     }
 
@@ -863,19 +960,19 @@ pub const AppHost = struct {
     fn onFocusEnter(_: ?*c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
         win.host.stampNow();
-        win.host.comp.keyboardEnter(win.surface) catch return;
+        win.host.seatKbdEnter(win.surface);
         // Fresh offer per focus: the host clipboard may have changed
         // while the app was unfocused. Empty clipboards just paste
         // empty (the async read answers honestly either way).
         win.host.offered_focus = win.host.comp.keyboard_focus;
-        win.host.comp.offerSelection("text/plain;charset=utf-8") catch {};
+        win.host.offerSelectionIntent("text/plain;charset=utf-8");
         win.host.flushHost();
     }
 
     fn onFocusLeave(_: ?*c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(Win, user);
         win.host.stampNow();
-        win.host.comp.keyboardLeave() catch return;
+        win.host.seatKbdLeave();
         win.host.flushHost();
     }
 
@@ -962,7 +1059,7 @@ pub const AppHost = struct {
         if (bw == win.sent_w and bh == win.sent_h) return;
         win.sent_w = bw;
         win.sent_h = bh;
-        win.host.comp.configureToplevel(win.surface, bw, bh, st) catch return;
+        win.host.configureIntent(win.surface, bw, bh, st);
         win.host.flushHost();
     }
 
@@ -1031,7 +1128,7 @@ pub const AppHost = struct {
     /// answer lands in onClipData.
     fn onClipOffer(ctx: ?*anyopaque, source: u32, mime: []const u8) void {
         const self = cast.userData(AppHost, ctx);
-        self.comp.fetchClipboard(source, mime) catch return;
+        self.clipSendIntent(source, mime);
         self.flushHost();
     }
 
@@ -1050,7 +1147,7 @@ pub const AppHost = struct {
         _ = mime; // text-only scope
         const self = cast.userData(AppHost, ctx);
         const clipboard = gdkClipboard() orelse {
-            self.comp.sendClipData("") catch return;
+            self.clipDataIntent("");
             self.flushHost();
             return;
         };
@@ -1064,7 +1161,8 @@ pub const AppHost = struct {
         defer if (text != null) c.g_free(text);
         if (!self.dead) {
             const bytes: []const u8 = if (text) |tp| std.mem.span(@as([*:0]const u8, @ptrCast(tp))) else "";
-            if (self.comp.sendClipData(bytes)) self.flushHost() else |_| {}
+            self.clipDataIntent(bytes);
+            self.flushHost();
         }
         self.pending_reads -= 1;
         if (self.doomed and self.pending_reads == 0) self.finalFree();
@@ -1106,7 +1204,7 @@ pub const AppHost = struct {
         if ((w == geo[2] and h == geo[3]) or (w == win.sent_w and h == win.sent_h)) return;
         win.sent_w = w;
         win.sent_h = h;
-        win.host.comp.configureToplevel(win.surface, w, h, st) catch return;
+        win.host.configureIntent(win.surface, w, h, st);
         win.host.flushHost();
     }
 
@@ -1116,7 +1214,7 @@ pub const AppHost = struct {
         const win = cast.userData(Win, user);
         const geo = win.host.geos.get(win.surface) orelse return;
         if (geo[2] <= 0 or geo[3] <= 0) return;
-        win.host.comp.configureToplevel(win.surface, geo[2], geo[3], winStates(win)) catch return;
+        win.host.configureIntent(win.surface, geo[2], geo[3], winStates(win));
         win.host.flushHost();
     }
 
@@ -1128,7 +1226,7 @@ pub const AppHost = struct {
         const win = cast.userData(Win, user);
         const self = win.host;
         if (self.dead) return 0; // app is gone — really close
-        self.comp.requestClose(win.surface) catch return 0;
+        self.requestCloseIntent(win.surface);
         if (self.on_flush) |f| f(self.flush_ctx);
         return 1; // handled; wait for the app
     }

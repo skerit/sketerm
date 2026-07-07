@@ -24,7 +24,12 @@ const Event = @import("../parser/event.zig").Event;
 /// [seq:u64][app:u8], so an attaching client learns whether the
 /// session is a forwarded GUI app (`sketerm app`) and can hold the
 /// pane open on app exit instead of detaching to a shell.
-pub const PROTO_VERSION: u32 = 4;
+/// Version 5 moves the Wayland compositor brain into the daemon:
+/// wayland_native channels broadcast to every attached client
+/// (passive replicas), viewers drive input via seat-intent pipe
+/// units, and attach replays pool bytes + a state_sync unit so app
+/// windows survive detach/reattach (durable GUI apps).
+pub const PROTO_VERSION: u32 = 5;
 
 /// Frame types. Append-only.
 pub const FrameType = enum(u8) {

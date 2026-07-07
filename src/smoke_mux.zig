@@ -69,6 +69,39 @@ const Mirror = struct {
 /// buffer, attach+commit) and the attached client must receive the
 /// pipe-unit stream: every message relayed, pool mirror announced,
 /// committed pixels replicated. Then one event flows back down.
+/// Drain the app-side socket until `dev` receives its selection
+/// event (opcode `sel_op`), returning the offer id announced by the
+/// preceding data_offer event on that device. Skips every other
+/// event (registry globals, shm formats, other devices' offers).
+fn awaitSelection(allocator: std.mem.Allocator, app_fd: c_int, dev: u32, sel_op: u16) u32 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var offer: u32 = 0;
+    var rounds: usize = 0;
+    while (rounds < 400) : (rounds += 1) {
+        var pos: usize = 0;
+        while (true) {
+            const h = (wlwire.parseHeader(buf.items[pos..]) catch fail("app event header")) orelse break;
+            if (buf.items[pos..].len < h.size) break;
+            const body = buf.items[pos + wlwire.header_size .. pos + h.size];
+            if (h.object == dev and h.opcode == 0 and body.len >= 4)
+                offer = std.mem.readInt(u32, body[0..4], .little);
+            if (h.object == dev and h.opcode == sel_op) return offer;
+            pos += h.size;
+        }
+        if (pos > 0) {
+            const rem = buf.items.len - pos;
+            std.mem.copyForwards(u8, buf.items[0..rem], buf.items[pos..]);
+            buf.shrinkRetainingCapacity(rem);
+        }
+        var chunk: [4096]u8 = undefined;
+        const r = c.read(app_fd, &chunk, chunk.len);
+        if (r <= 0) fail("app socket read while awaiting selection");
+        buf.appendSlice(allocator, chunk[0..@intCast(r)]) catch fail("oom");
+    }
+    fail("selection event never arrived");
+}
+
 fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_path: []const u8) void {
     // Hang guard: any stall in the pipe machinery fails the stage.
     const tv = c.struct_timeval{ .tv_sec = 15, .tv_usec = 0 };
@@ -95,6 +128,7 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
     daemon_mod.fillSockaddrUn(&addr, disp_path) catch fail("app sockaddr");
     if (c.connect(app_fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) fail("app connect (native display socket missing?)");
     defer _ = c.close(app_fd);
+    _ = c.setsockopt(app_fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
 
     // The client request stream. create_pool's fd rides SCM_RIGHTS
     // attached to its own bytes.
@@ -107,19 +141,21 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
             b.putNewId(2);
             break :blk b.finish() catch unreachable;
         },
-        blk: { // wl_registry.bind(1, "wl_shm", 1, id=3)
+        blk: { // wl_registry.bind(2, "wl_shm", 1, id=3) — real global names:
+            // the daemon brain (proto v5) resolves binds strictly
+            // against its advertised globals (wl_shm = name 2).
             var b = wlwire.Builder.init(mbuf[32..], 2, 0);
-            b.putUint(1);
+            b.putUint(2);
             b.putString("wl_shm");
             b.putUint(1);
             b.putNewId(3);
             break :blk b.finish() catch unreachable;
         },
-        blk: { // wl_registry.bind(2, "wl_compositor", 6, id=6)
+        blk: { // wl_registry.bind(1, "wl_compositor", 4, id=6)
             var b = wlwire.Builder.init(mbuf[96..], 2, 0);
-            b.putUint(2);
+            b.putUint(1);
             b.putString("wl_compositor");
-            b.putUint(6);
+            b.putUint(4);
             b.putNewId(6);
             break :blk b.finish() catch unreachable;
         },
@@ -244,7 +280,7 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
     {
         // App binds the data-device manager + a device.
         var b = wlwire.Builder.init(&mbuf, 2, 0); // registry.bind
-        b.putUint(9);
+        b.putUint(6); // real global name — the v5 brain resolves strictly
         b.putString("wl_data_device_manager");
         b.putUint(1);
         b.putNewId(20);
@@ -282,24 +318,23 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
             if (!seen_dev) fail("get_data_device never relayed");
         }
 
-        // GUI announces an offer (server-created id) + selection.
+        // Viewer announces a host selection via the v5 intent; the
+        // daemon BRAIN creates the server-side offer and emits
+        // data_offer/offer/selection toward the app.
         var ub: std.ArrayList(u8) = .empty;
         defer ub.deinit(allocator);
         var idb: [4]u8 = undefined;
         std.mem.writeInt(u32, &idb, chan_id, .little);
         ub.appendSlice(allocator, &idb) catch fail("oom");
-        b = wlwire.Builder.init(&mbuf, 21, 0); // data_offer(new_id)
-        b.putNewId(0xff000001);
-        wlpipe.appendUnit(&ub, allocator, .wl_msg, b.finish() catch unreachable) catch fail("oom");
+        wlpipe.appendUnit(&ub, allocator, .offer_selection, "text/plain;charset=utf-8") catch fail("oom");
         conn.sendFrame(.chan_data, ub.items) catch fail("clip offer send");
 
-        // App consumes the event, then pastes: receive(mime, fd).
-        var evb: [64]u8 = undefined;
-        const evn = c.read(app_fd, &evb, 12); // data_offer event = 8 hdr + 4
-        if (evn != 12) fail("data_offer event not delivered");
+        // App parses the brain's events, then pastes: receive(mime, fd).
+        const offer_id = awaitSelection(allocator, app_fd, 21, 5);
+        if (offer_id == 0) fail("brain never announced a data offer");
         var pfds: [2]c_int = undefined;
         if (c.pipe(&pfds) != 0) fail("paste pipe");
-        b = wlwire.Builder.init(&mbuf, 0xff000001, 1); // receive
+        b = wlwire.Builder.init(&mbuf, offer_id, 1); // receive
         b.putString("text/plain;charset=utf-8");
         sendWithFd(app_fd, b.finish() catch unreachable, pfds[1]) catch fail("receive sendmsg");
         _ = c.close(pfds[1]);
@@ -318,7 +353,7 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
                 const p = (wlpipe.peelUnit(units_raw.items[upos..]) catch unreachable).?;
                 if (p.unit.tag == .wl_msg) {
                     const h = (wlwire.parseHeader(p.unit.payload) catch fail("clip hdr")) orelse fail("clip hdr");
-                    if (h.object == 0xff000001 and h.opcode == 1) got_receive = true;
+                    if (h.object == offer_id and h.opcode == 1) got_receive = true;
                 }
                 upos += p.consumed;
             }
@@ -422,21 +457,15 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
             if (!seen) fail("dc get_data_device never relayed");
         }
 
-        // GUI announces a data_offer (device 31, op 0) → offer 0xff000002.
-        var ub: std.ArrayList(u8) = .empty;
-        defer ub.deinit(allocator);
-        ub.appendSlice(allocator, &idb) catch fail("oom");
-        b = wlwire.Builder.init(&mbuf, 31, 0); // data_offer(new_id)
-        b.putNewId(0xff000002);
-        wlpipe.appendUnit(&ub, allocator, .wl_msg, b.finish() catch unreachable) catch fail("oom");
-        conn.sendFrame(.chan_data, ub.items) catch fail("dc offer send");
-
-        // App reads the event, then pastes: offer.receive(mime, fd) at OP 0.
-        var evb: [64]u8 = undefined;
-        if (c.read(app_fd, &evb, 12) != 12) fail("dc data_offer not delivered");
+        // No intent needed: the data-control protocol requires the
+        // compositor to announce the current selection right after
+        // get_data_device, and the brain does — the app just waits
+        // for the zwlr selection (op 1) and pastes at OP 0.
+        const dc_offer = awaitSelection(allocator, app_fd, 31, 1);
+        if (dc_offer == 0) fail("brain never announced a dc offer");
         var pfds: [2]c_int = undefined;
         if (c.pipe(&pfds) != 0) fail("dc paste pipe");
-        b = wlwire.Builder.init(&mbuf, 0xff000002, 0); // receive (op 0)
+        b = wlwire.Builder.init(&mbuf, dc_offer, 0); // receive (op 0)
         b.putString("text/plain;charset=utf-8");
         sendWithFd(app_fd, b.finish() catch unreachable, pfds[1]) catch fail("dc receive sendmsg");
         _ = c.close(pfds[1]);
@@ -455,7 +484,7 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
                 const p = (wlpipe.peelUnit(units_raw.items[upos..]) catch unreachable).?;
                 if (p.unit.tag == .wl_msg) {
                     const h = (wlwire.parseHeader(p.unit.payload) catch fail("dc hdr")) orelse fail("dc hdr");
-                    if (h.object == 0xff000002 and h.opcode == 0) got_receive = true;
+                    if (h.object == dc_offer and h.opcode == 0) got_receive = true;
                 }
                 upos += p.consumed;
             }
@@ -539,7 +568,13 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
         std.debug.print("smoke-mux: wlr-data-control surfaceless clipboard round-trip ok\n", .{});
     }
 
-    // GUI→app: an event unit must come out of the app socket verbatim.
+    // Viewer→app, v5: raw wl_msg from a viewer must be DROPPED (the
+    // daemon brain is the only protocol driver — a replica answering
+    // too would double-drive the app). An intent through the brain
+    // must still reach the app: request_close emits
+    // xdg_toplevel.close... but this scripted app has no toplevel, so
+    // use dismiss_popups (inert, proves intent parsing is harmless)
+    // plus a seat intent path exercised by the real-app stage below.
     {
         var b = wlwire.Builder.init(&mbuf, 3, 0); // wl_shm.format(1)
         b.putUint(1);
@@ -552,9 +587,14 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
         wlpipe.appendUnit(&unit, allocator, .wl_msg, ev) catch fail("oom");
         conn.sendFrame(.chan_data, unit.items) catch fail("chan_data send");
 
+        // The forged event must NOT reach the app. Give the daemon a
+        // moment, then confirm the app socket stays silent.
+        const short = c.struct_timeval{ .tv_sec = 0, .tv_usec = 300_000 };
+        _ = c.setsockopt(app_fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &short, @sizeOf(c.struct_timeval));
         var got: [64]u8 = undefined;
         const r = c.read(app_fd, &got, got.len);
-        if (r != @as(isize, @intCast(ev.len)) or !std.mem.eql(u8, got[0..ev.len], ev)) fail("event did not reach the app");
+        if (r > 0) fail("forged viewer wl_msg reached the app (v5 must drop it)");
+        std.debug.print("smoke-mux: forged viewer event dropped ok\n", .{});
     }
 }
 
@@ -616,9 +656,13 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) bool {
     ViewState.sid = 0;
     ViewState.nonzero_px = false;
 
+    // Proto v5: this compositor is a passive REPLICA — the daemon
+    // brain answers the app; replica output is discarded and input
+    // travels as seat-intent units.
     var comp = compositor_mod.Compositor.init(allocator, .{
         .toplevel_frame = ViewState.onFrame,
     }) catch fail("compositor init");
+    comp.lenient = true;
     defer comp.deinit();
 
     var chan_id: u32 = 0;
@@ -635,17 +679,7 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) bool {
             .chan_data => {
                 if ((wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
                 comp.feed(f.payload[4..]) catch fail("compositor feed");
-                const out = comp.takeOut();
-                if (out.len > 0) {
-                    var payload: std.ArrayList(u8) = .empty;
-                    defer payload.deinit(allocator);
-                    var idb: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &idb, chan_id, .little);
-                    payload.appendSlice(allocator, &idb) catch fail("oom");
-                    payload.appendSlice(allocator, out) catch fail("oom");
-                    comp.clearOut();
-                    conn.sendFrame(.chan_data, payload.items) catch fail("app-stage chan send");
-                }
+                comp.clearOut(); // replica output is DISCARDED (v5)
                 if (comp.dead) fail("compositor flagged protocol error from a stock client");
             },
             .exit => fail("weston-terminal exited before committing a frame"),
@@ -657,27 +691,25 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) bool {
     if (!ViewState.nonzero_px) fail("toplevel frame is all zeros");
     std.debug.print("smoke-mux: real app frame {d}x{d} after {d} rounds\n", .{ ViewState.w, ViewState.h, rounds });
 
-    // Keyboard input through the full pipe: the keymap fd was
-    // materialized by the daemon when weston-terminal bound the
-    // keyboard; now type "ls" and expect echo redraws (new frames).
+    // Keyboard input through the full pipe, v5 style: seat-intent
+    // units toward the daemon brain; expect echo redraws (frames).
     const frames_before_input = ViewState.frames;
-    comp.now_ms = 1000;
-    comp.keyboardEnter(ViewState.sid) catch fail("kbd enter");
-    comp.keyboardModifiers(0, 0, 0, 0) catch fail("kbd mods");
-    for ([_]u32{ 38, 31 }) |key| { // evdev l, s
-        comp.keyboardKey(key, true) catch fail("kbd key");
-        comp.keyboardKey(key, false) catch fail("kbd key");
-    }
     {
-        const out = comp.takeOut();
-        if (out.len == 0) fail("no input events queued (keyboard never bound?)");
+        const pipe_mod = @import("wlhost/pipe.zig");
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(allocator);
+        pipe_mod.appendSeatKbdEnter(&units, allocator, ViewState.sid) catch fail("oom");
+        pipe_mod.appendSeatMods(&units, allocator, 0, 0, 0, 0) catch fail("oom");
+        for ([_]u32{ 38, 31 }) |key| { // evdev l, s
+            pipe_mod.appendSeatKey(&units, allocator, key, true) catch fail("oom");
+            pipe_mod.appendSeatKey(&units, allocator, key, false) catch fail("oom");
+        }
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(allocator);
         var idb: [4]u8 = undefined;
         std.mem.writeInt(u32, &idb, chan_id, .little);
         payload.appendSlice(allocator, &idb) catch fail("oom");
-        payload.appendSlice(allocator, out) catch fail("oom");
-        comp.clearOut();
+        payload.appendSlice(allocator, units.items) catch fail("oom");
         conn.sendFrame(.chan_data, payload.items) catch fail("input chan send");
     }
     rounds = 0;
@@ -687,24 +719,59 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) bool {
         if (f.ftype != .chan_data) continue;
         if ((wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
         comp.feed(f.payload[4..]) catch fail("compositor feed (input)");
-        const out = comp.takeOut();
-        if (out.len > 0) {
-            var payload: std.ArrayList(u8) = .empty;
-            defer payload.deinit(allocator);
-            var idb: [4]u8 = undefined;
-            std.mem.writeInt(u32, &idb, chan_id, .little);
-            payload.appendSlice(allocator, &idb) catch fail("oom");
-            payload.appendSlice(allocator, out) catch fail("oom");
-            comp.clearOut();
-            conn.sendFrame(.chan_data, payload.items) catch fail("chan send");
-        }
+        comp.clearOut();
         if (comp.dead) fail("protocol error after input injection");
     }
     if (ViewState.frames == frames_before_input) fail("typed keys never produced a redraw");
     std.debug.print("smoke-mux: input echo ok ({d} frames after typing)\n", .{ViewState.frames});
 
+    // ── durability: the app must survive this client dying ──────
+    // Drop the connection WITHOUT detaching (a GUI crash), then
+    // reattach fresh: the daemon replays chan_open + pool bytes +
+    // state_sync, and the replica's windows come back with pixels.
+    conn.deinit();
+    var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("reattach connect");
+    defer conn2.deinit();
+    const tv2 = c.struct_timeval{ .tv_sec = 20, .tv_usec = 0 };
+    _ = c.setsockopt(conn2.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv2, @sizeOf(c.struct_timeval));
+    conn2.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("reattach hello");
+    (conn2.recvExpect(&.{.welcome}) catch fail("reattach welcome")).deinit(allocator);
+    conn2.sendJson(.attach, .{ .name = "wlapp" }) catch fail("reattach attach");
+
+    var comp2 = compositor_mod.Compositor.init(allocator, .{
+        .toplevel_frame = ViewState.onFrame,
+    }) catch fail("replica2 init");
+    comp2.lenient = true;
+    defer comp2.deinit();
+    ViewState.frames = 0;
+    ViewState.nonzero_px = false;
+    var chan2: u32 = 0;
+    rounds = 0;
+    while (ViewState.frames == 0 and rounds < 2000) : (rounds += 1) {
+        const f = conn2.recvFrame() catch fail("reattach stream read (timeout = no replay)");
+        defer f.deinit(allocator);
+        switch (f.ftype) {
+            .chan_open => {
+                const open = wire.decodeChanOpen(f.payload) orelse fail("reattach chan_open");
+                if (open.kind == .wayland_native) chan2 = open.id;
+            },
+            .chan_data => {
+                if ((wire.decodeChanId(f.payload) orelse 0) != chan2) continue;
+                comp2.feed(f.payload[4..]) catch fail("replica2 feed");
+                comp2.clearOut();
+                if (comp2.dead) fail("replica2 protocol error during replay");
+            },
+            .exit => fail("app died when its client went away (durability regression)"),
+            else => {},
+        }
+    }
+    if (ViewState.frames == 0) fail("reattach never replayed a frame (state_sync missing?)");
+    if (!ViewState.nonzero_px) fail("replayed frame is all zeros");
+    if (ViewState.w < 100 or ViewState.h < 100) fail("replayed frame has implausible size");
+    std.debug.print("smoke-mux: durable reattach ok ({d}x{d} replayed)\n", .{ ViewState.w, ViewState.h });
+
     // Tear the session down; the daemon must survive the app dying.
-    conn.sendJson(.kill, .{ .name = "wlapp" }) catch fail("app-stage kill");
+    conn2.sendJson(.kill, .{ .name = "wlapp" }) catch fail("app-stage kill");
     return true;
 }
 
@@ -841,10 +908,12 @@ fn appFlagStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     std.debug.print("smoke-mux: snapshot app-flag header ok\n", .{});
 }
 
-/// The spawn→GUI-attach handover gap (`sketerm app` via the GUI):
-/// an app that connects to its display BEFORE any client attached
-/// must be parked, not refused — and bridged on the next attach.
+/// Headless + durable apps (proto v5): the daemon brain must answer
+/// an app with ZERO clients attached; a later attach must replay
+/// chan_open + pool bytes + state_sync so a replica rebuilds the
+/// window with pixels; and the app must survive its client dying.
 fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8, wl_id: usize) void {
+    const compositor_mod = @import("wlhost/compositor.zig");
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("pend connect");
     defer conn.deinit();
     const tv = c.struct_timeval{ .tv_sec = 15, .tv_usec = 0 };
@@ -859,9 +928,8 @@ fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8, wl_id: u
     }) catch fail("pend spawn");
     (conn.recvExpect(&.{.ok}) catch fail("pend spawn ok")).deinit(allocator);
 
-    // App connects + speaks BEFORE anyone attached. `wl_id` is the
-    // hub number this spawn got: smoke=wl-1, wlapp=wl-2 (only when
-    // the real-app stage ran), wsapp=no hub.
+    // The scripted app connects BEFORE anyone attached and runs the
+    // full xdg dance. The daemon brain must answer immediately.
     const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/').?;
     var disp_buf: [128]u8 = undefined;
     const disp = std.fmt.bufPrint(&disp_buf, "{s}/wl-{d}", .{ sock_path[0..dir_end], wl_id }) catch unreachable;
@@ -870,43 +938,258 @@ fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8, wl_id: u
     daemon_mod.fillSockaddrUn(&addr, disp) catch fail("pend sockaddr");
     if (c.connect(app_fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) fail("pend app connect");
     defer _ = c.close(app_fd);
-    var mbuf: [16]u8 = undefined;
-    var b = wlwire.Builder.init(&mbuf, 1, 1); // get_registry(2)
-    b.putNewId(2);
-    const m = b.finish() catch unreachable;
-    if (c.write(app_fd, m.ptr, m.len) != @as(isize, @intCast(m.len))) fail("pend app write");
+    _ = c.setsockopt(app_fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
 
-    // Give the daemon a tick to accept-and-park, then attach.
-    _ = c.usleep(100_000);
+    var mbuf: [256]u8 = undefined;
+    { // get_registry(2) — globals must come back with NO client attached
+        var b = wlwire.Builder.init(&mbuf, 1, 1);
+        b.putNewId(2);
+        const m = b.finish() catch unreachable;
+        if (c.write(app_fd, m.ptr, m.len) != @as(isize, @intCast(m.len))) fail("pend app write");
+        var got: [512]u8 = undefined;
+        const r = c.read(app_fd, &got, got.len);
+        if (r <= 0) fail("brain never answered a client-less app (headless regression)");
+        const h = (wlwire.parseHeader(got[0..@intCast(r)]) catch fail("pend global hdr")) orelse fail("pend global hdr");
+        if (h.object != 2 or h.opcode != 0) fail("expected wl_registry.global from the brain");
+    }
+    std.debug.print("smoke-mux: headless brain answered pre-attach ok\n", .{});
+
+    // Bind + surface + toplevel + title + pixels (2x2, values 100..115).
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(allocator);
+    inline for (.{
+        .{ 1, "wl_compositor", 4, 3 },
+        .{ 2, "wl_shm", 1, 4 },
+        .{ 5, "xdg_wm_base", 2, 5 },
+    }) |bind| {
+        var b = wlwire.Builder.init(&mbuf, 2, 0);
+        b.putUint(bind[0]);
+        b.putString(bind[1]);
+        b.putUint(bind[2]);
+        b.putNewId(bind[3]);
+        stream.appendSlice(allocator, b.finish() catch unreachable) catch fail("oom");
+    }
+    {
+        var b = wlwire.Builder.init(&mbuf, 3, 0); // create_surface(6)
+        b.putNewId(6);
+        stream.appendSlice(allocator, b.finish() catch unreachable) catch fail("oom");
+        var b2 = wlwire.Builder.init(&mbuf, 5, 2); // get_xdg_surface(7, 6)
+        b2.putNewId(7);
+        b2.putObject(6);
+        stream.appendSlice(allocator, b2.finish() catch unreachable) catch fail("oom");
+        var b3 = wlwire.Builder.init(&mbuf, 7, 1); // get_toplevel(8)
+        b3.putNewId(8);
+        stream.appendSlice(allocator, b3.finish() catch unreachable) catch fail("oom");
+        var b4 = wlwire.Builder.init(&mbuf, 8, 2); // set_title("DUR")
+        b4.putString("DUR");
+        stream.appendSlice(allocator, b4.finish() catch unreachable) catch fail("oom");
+        var b5 = wlwire.Builder.init(&mbuf, 6, 6); // commit (xdg dance)
+        stream.appendSlice(allocator, b5.finish() catch unreachable) catch fail("oom");
+    }
+    if (c.write(app_fd, stream.items.ptr, stream.items.len) != @as(isize, @intCast(stream.items.len))) fail("pend dance write");
+
+    // Pool + buffer + attach + commit (pool fd via SCM_RIGHTS).
+    var pool_bytes: [16]u8 = undefined;
+    for (&pool_bytes, 0..) |*bt, i| bt.* = @intCast(i + 100);
+    var tmp_buf: [128]u8 = undefined;
+    const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "/tmp/sketerm-mux-smoke-{d}-pend", .{c.getpid()}) catch unreachable;
+    const pool_fd = c.open(tmp_path.ptr, c.O_RDWR | c.O_CREAT | c.O_TRUNC, @as(c.mode_t, 0o600));
+    if (pool_fd < 0) fail("pend pool open");
+    _ = c.unlink(tmp_path.ptr);
+    if (c.write(pool_fd, &pool_bytes, pool_bytes.len) != pool_bytes.len) fail("pend pool write");
+    {
+        var b = wlwire.Builder.init(&mbuf, 4, 0); // create_pool(9, fd, 16)
+        b.putNewId(9);
+        b.putInt(16);
+        sendWithFd(app_fd, b.finish() catch unreachable, pool_fd) catch fail("pend pool sendmsg");
+        _ = c.close(pool_fd);
+    }
+    stream.clearRetainingCapacity();
+    {
+        var b = wlwire.Builder.init(&mbuf, 9, 0); // create_buffer(10, 0, 2x2, 8, xrgb)
+        b.putNewId(10);
+        b.putInt(0);
+        b.putInt(2);
+        b.putInt(2);
+        b.putInt(8);
+        b.putUint(1);
+        stream.appendSlice(allocator, b.finish() catch unreachable) catch fail("oom");
+        var b2 = wlwire.Builder.init(&mbuf, 6, 1); // attach(10)
+        b2.putObject(10);
+        b2.putInt(0);
+        b2.putInt(0);
+        stream.appendSlice(allocator, b2.finish() catch unreachable) catch fail("oom");
+        var b3 = wlwire.Builder.init(&mbuf, 6, 6); // commit
+        stream.appendSlice(allocator, b3.finish() catch unreachable) catch fail("oom");
+    }
+    if (c.write(app_fd, stream.items.ptr, stream.items.len) != @as(isize, @intCast(stream.items.len))) fail("pend pixels write");
+    _ = c.usleep(150_000); // let the daemon drain the app socket
+
+    // Shared replica view: records what replay reconstructs.
+    const RView = struct {
+        var toplevels: usize = 0;
+        var frames: usize = 0;
+        var w: i32 = 0;
+        var h: i32 = 0;
+        var px0: u8 = 0;
+        var title_buf: [64]u8 = undefined;
+        var title_len: usize = 0;
+        fn onNew(ctx: ?*anyopaque, surface: u32) void {
+            _ = ctx;
+            _ = surface;
+            toplevels += 1;
+        }
+        fn onTitle(ctx: ?*anyopaque, surface: u32, title: []const u8) void {
+            _ = ctx;
+            _ = surface;
+            title_len = @min(title.len, title_buf.len);
+            @memcpy(title_buf[0..title_len], title[0..title_len]);
+        }
+        fn onFrame(ctx: ?*anyopaque, surface: u32, fw: i32, fh: i32, scale: i32, format: u32, pixels: []const u8) void {
+            _ = ctx;
+            _ = surface;
+            _ = scale;
+            _ = format;
+            frames += 1;
+            w = fw;
+            h = fh;
+            if (pixels.len > 0) px0 = pixels[0];
+        }
+        fn reset() void {
+            toplevels = 0;
+            frames = 0;
+            w = 0;
+            h = 0;
+            px0 = 0;
+            title_len = 0;
+        }
+    };
+
+    // Attach viewer #1: replay must rebuild the window + pixels.
+    RView.reset();
     conn.sendJson(.attach, .{ .name = "pend" }) catch fail("pend attach");
+    {
+        var replica = compositor_mod.Compositor.init(allocator, .{
+            .toplevel_new = RView.onNew,
+            .toplevel_title = RView.onTitle,
+            .toplevel_frame = RView.onFrame,
+        }) catch fail("pend replica init");
+        replica.lenient = true;
+        defer replica.deinit();
+        var chan_id: u32 = 0;
+        var rounds: usize = 0;
+        while (RView.frames == 0 and rounds < 400) : (rounds += 1) {
+            const f = conn.recvFrame() catch fail("pend replay read (state_sync missing?)");
+            defer f.deinit(allocator);
+            switch (f.ftype) {
+                .chan_open => {
+                    const open = wire.decodeChanOpen(f.payload) orelse fail("pend chan_open");
+                    if (open.kind == .wayland_native) chan_id = open.id;
+                },
+                .chan_data => {
+                    if ((wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
+                    replica.feed(f.payload[4..]) catch fail("pend replica feed");
+                    replica.clearOut();
+                    if (replica.dead) fail("pend replica protocol error");
+                },
+                else => {},
+            }
+        }
+        if (RView.toplevels != 1) fail("replay did not rebuild the toplevel");
+        if (!std.mem.eql(u8, RView.title_buf[0..RView.title_len], "DUR")) fail("replay lost the title");
+        if (RView.w != 2 or RView.h != 2) fail("replayed frame size wrong");
+        if (RView.px0 != 100) fail("replayed pixels wrong");
+    }
+    std.debug.print("smoke-mux: attach replay rebuilt window + pixels ok\n", .{});
 
-    var got_relay = false;
-    var rounds: usize = 0;
-    var chan_id: u32 = 0;
-    while (!got_relay and rounds < 200) : (rounds += 1) {
-        const f = conn.recvFrame() catch fail("pend read (parked app never bridged)");
-        defer f.deinit(allocator);
-        switch (f.ftype) {
-            .chan_open => {
-                const open = wire.decodeChanOpen(f.payload) orelse fail("pend chan_open");
-                if (open.kind != .wayland_native) fail("pend chan kind");
-                chan_id = open.id;
-            },
-            .chan_data => {
-                if ((wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
-                // First unit must be the parked get_registry.
-                const p = (wlpipe.peelUnit(f.payload[4..]) catch fail("pend unit")) orelse continue;
-                if (p.unit.tag == .wl_msg) {
-                    const h = (wlwire.parseHeader(p.unit.payload) catch fail("pend hdr")) orelse fail("pend hdr");
-                    if (h.object == 1 and h.opcode == 1) got_relay = true;
-                }
-            },
-            else => {},
+    // Viewer dies WITHOUT detaching (GUI crash). The app must stay
+    // alive: a title change afterwards must be accepted and visible
+    // to the NEXT viewer's state_sync.
+    _ = c.close(conn.fd);
+    conn.fd = -1;
+    _ = c.usleep(150_000); // let the daemon reap the client
+    {
+        var b = wlwire.Builder.init(&mbuf, 8, 2); // set_title("AGAIN")
+        b.putString("AGAIN");
+        const m = b.finish() catch unreachable;
+        if (c.write(app_fd, m.ptr, m.len) != @as(isize, @intCast(m.len))) fail("app died with its viewer (durability regression)");
+    }
+    _ = c.usleep(150_000);
+
+    var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("pend reconnect");
+    defer conn2.deinit();
+    _ = c.setsockopt(conn2.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+    conn2.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("pend hello2");
+    (conn2.recvExpect(&.{.welcome}) catch fail("pend welcome2")).deinit(allocator);
+    RView.reset();
+    conn2.sendJson(.attach, .{ .name = "pend" }) catch fail("pend attach2");
+    {
+        var replica = compositor_mod.Compositor.init(allocator, .{
+            .toplevel_new = RView.onNew,
+            .toplevel_title = RView.onTitle,
+            .toplevel_frame = RView.onFrame,
+        }) catch fail("pend replica2 init");
+        replica.lenient = true;
+        defer replica.deinit();
+        var chan_id: u32 = 0;
+        var rounds: usize = 0;
+        while (RView.frames == 0 and rounds < 400) : (rounds += 1) {
+            const f = conn2.recvFrame() catch fail("pend replay2 read");
+            defer f.deinit(allocator);
+            switch (f.ftype) {
+                .chan_open => {
+                    const open = wire.decodeChanOpen(f.payload) orelse fail("pend chan_open2");
+                    if (open.kind == .wayland_native) chan_id = open.id;
+                },
+                .chan_data => {
+                    if ((wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
+                    replica.feed(f.payload[4..]) catch fail("pend replica2 feed");
+                    replica.clearOut();
+                    if (replica.dead) fail("pend replica2 protocol error");
+                },
+                else => {},
+            }
+        }
+        if (RView.toplevels != 1) fail("post-crash replay did not rebuild the toplevel");
+        if (!std.mem.eql(u8, RView.title_buf[0..RView.title_len], "AGAIN")) fail("post-crash title change lost (app not durable)");
+        if (RView.w != 2 or RView.h != 2 or RView.px0 != 100) fail("post-crash pixels wrong");
+    }
+    std.debug.print("smoke-mux: durable headless app survived viewer crash ok\n", .{});
+
+    // Multi-viewer fan-out: with a SECOND live viewer attached, a
+    // fresh app request must reach BOTH viewers' unit streams.
+    var conn3 = client_mod.Conn.connect(allocator, sock_path) catch fail("pend third connect");
+    defer conn3.deinit();
+    _ = c.setsockopt(conn3.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+    conn3.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("pend hello3");
+    (conn3.recvExpect(&.{.welcome}) catch fail("pend welcome3")).deinit(allocator);
+    conn3.sendJson(.attach, .{ .name = "pend" }) catch fail("pend attach3");
+    var needle_buf: [32]u8 = undefined;
+    const needle = blk: {
+        var b = wlwire.Builder.init(&needle_buf, 8, 2); // set_title("BOTH")
+        b.putString("BOTH");
+        break :blk b.finish() catch unreachable;
+    };
+    if (c.write(app_fd, needle.ptr, needle.len) != @as(isize, @intCast(needle.len))) fail("pend title3 write");
+    inline for (.{ &conn2, &conn3 }, 0..) |cn, viewer| {
+        var seen = false;
+        var acc: std.ArrayList(u8) = .empty;
+        defer acc.deinit(allocator);
+        var rounds: usize = 0;
+        while (!seen and rounds < 400) : (rounds += 1) {
+            const f = cn.recvFrame() catch fail("fan-out read (viewer starved)");
+            defer f.deinit(allocator);
+            if (f.ftype != .chan_data) continue;
+            acc.appendSlice(allocator, f.payload[4..]) catch fail("oom");
+            seen = std.mem.indexOf(u8, acc.items, needle) != null;
+        }
+        if (!seen) {
+            std.debug.print("smoke-mux: viewer {d} never saw the fan-out unit\n", .{viewer});
+            fail("fan-out: a live viewer missed a broadcast unit");
         }
     }
-    if (!got_relay) fail("parked app connection never reached the client");
-    conn.sendJson(.kill, .{ .name = "pend" }) catch fail("pend kill");
-    std.debug.print("smoke-mux: pre-attach app parking ok\n", .{});
+    conn2.sendJson(.kill, .{ .name = "pend" }) catch fail("pend kill");
+    std.debug.print("smoke-mux: two-viewer fan-out ok\n", .{});
 }
 
 /// wl_surface.commit on surface 7 — 8 header bytes, no args.
