@@ -72,15 +72,22 @@ const Bind = struct {
     /// separator) hide when the pre-popup hook leaves "copy-link"
     /// disabled.
     link_only: bool = false,
+    /// Row only makes sense on a session whose PTY lives on another
+    /// machine (SSH / UDP host) — file transfer to a local session
+    /// is pointless. Hidden when the pre-popup hook leaves
+    /// "upload-file" disabled.
+    host_only: bool = false,
 };
 
 const Submenu = struct {
     label: [*:0]const u8,
     icon: [*:0]const u8,
     items: []const Bind,
-    /// Submenu only makes sense on a mux-attached (remote) pane; the
-    /// parent row (and its section separator) hides when the
-    /// pre-popup hook leaves the mux actions disabled.
+    /// Submenu only makes sense on a durable (non-ephemeral) session:
+    /// a plain local shell tab is GUI-owned and killed on close, so
+    /// detach/rename/kill are meaningless. The parent row (and its
+    /// leading separator) hides when the pre-popup hook leaves the
+    /// mux actions disabled.
     remote_only: bool = false,
 };
 
@@ -130,8 +137,8 @@ const MENU = [_]Item{
     } } },
     .separator,
     .{ .submenu = .{ .label = "Session", .icon = "network-server-symbolic", .remote_only = true, .items = &.{
-        .{ .name = "upload-file", .label = "Upload File…", .detailed = "term.upload-file", .icon = "document-send-symbolic", .action = .upload_file },
-        .{ .name = "download-file", .label = "Download File…", .detailed = "term.download-file", .icon = "folder-download-symbolic", .action = .download_file },
+        .{ .name = "upload-file", .label = "Upload File…", .detailed = "term.upload-file", .icon = "document-send-symbolic", .action = .upload_file, .host_only = true },
+        .{ .name = "download-file", .label = "Download File…", .detailed = "term.download-file", .icon = "folder-download-symbolic", .action = .download_file, .host_only = true },
         .{ .name = "mux-detach", .label = "Detach Session", .detailed = "term.mux-detach", .icon = "network-offline-symbolic", .action = .mux_detach },
         .{ .name = "mux-rename", .label = "Rename Session…", .detailed = "term.mux-rename", .icon = "document-edit-symbolic", .action = .mux_rename },
         .{ .name = "mux-kill", .label = "Kill Session", .detailed = "term.mux-kill", .icon = "process-stop-symbolic", .action = .mux_kill },
@@ -194,6 +201,18 @@ const N_LINK_WIDGETS = blk: {
     break :blk n + 1;
 };
 
+/// Host-only conditional widgets: submenu child rows that only apply
+/// to a session on a remote machine (upload / download).
+const N_HOST_WIDGETS = blk: {
+    var n: usize = 0;
+    for (MENU) |it| {
+        if (it == .submenu) for (it.submenu.items) |b| {
+            if (b.host_only) n += 1;
+        };
+    }
+    break :blk n;
+};
+
 const ClickCtx = struct {
     allocator: std.mem.Allocator,
     popover: *c.GtkWidget,
@@ -211,6 +230,9 @@ const ClickCtx = struct {
     /// Link rows + their trailing separator; shown only when the
     /// pre-popup hook found a link under the click.
     link_widgets: [N_LINK_WIDGETS]?*c.GtkWidget = @splat(null),
+    /// Submenu child rows (upload / download) shown only when the
+    /// pre-popup hook found a remote-host session.
+    host_widgets: [N_HOST_WIDGETS]?*c.GtkWidget = @splat(null),
 };
 
 /// Per-top-level-row hover context: entering any row pops down every
@@ -259,9 +281,10 @@ pub fn attachWithPrePopup(
     c.gtk_widget_insert_action_group(widget, "term", @ptrCast(group));
     c.g_object_unref(group);
 
-    // Link + mux actions default disabled; the pane's pre-popup hook
-    // enables them per-popup. Their rows show/hide on that state.
-    for ([_][*:0]const u8{ "open-link", "copy-link", "mux-detach", "mux-rename", "mux-kill" }) |name| {
+    // Link + mux + file-transfer actions default disabled; the pane's
+    // pre-popup hook enables them per-popup. Their rows show/hide on
+    // that state.
+    for ([_][*:0]const u8{ "open-link", "copy-link", "mux-detach", "mux-rename", "mux-kill", "upload-file", "download-file" }) |name| {
         if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
             c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), 0);
         }
@@ -292,6 +315,7 @@ pub fn attachWithPrePopup(
     var n_sub: usize = 0;
     var n_remote: usize = 0;
     var n_link: usize = 0;
+    var n_host: usize = 0;
     var prev_was_link = false;
     var prev_sep: ?*c.GtkWidget = null;
     for (MENU) |item| {
@@ -332,6 +356,10 @@ pub fn attachWithPrePopup(
                     c.gtk_actionable_set_action_name(@ptrCast(child), b.detailed);
                     _ = c.g_signal_connect_data(child, "clicked", @ptrCast(&onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
                     c.gtk_box_append(@ptrCast(sub_list), child);
+                    if (b.host_only) {
+                        cctx.host_widgets[n_host] = child;
+                        n_host += 1;
+                    }
                 }
                 c.gtk_popover_set_child(@ptrCast(sub_pop), sub_list);
                 // Click also opens the submenu (keyboard / touch path).
@@ -504,6 +532,18 @@ fn freeClickCtx(user: ?*anyopaque) callconv(.c) void {
     }
 }
 
+/// Show/hide a group of conditional rows to match `action`'s enabled
+/// state (set per-pane by the pre-popup hook).
+fn setGroupVisible(group: *c.GSimpleActionGroup, action: [*:0]const u8, widgets: []const ?*c.GtkWidget) void {
+    var show = false;
+    if (c.g_action_map_lookup_action(@ptrCast(group), action)) |act| {
+        show = c.g_action_get_enabled(@ptrCast(act)) != 0;
+    }
+    for (widgets) |maybe_w| {
+        if (maybe_w) |w| c.gtk_widget_set_visible(w, @intFromBool(show));
+    }
+}
+
 fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(ClickCtx, user);
     if (ctx.pre_popup_fn) |f| {
@@ -516,25 +556,14 @@ fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaq
     // the menu the instant it opened. Timing-dependent, so it
     // presented as "right-click often does nothing".
     _ = c.gtk_gesture_set_state(@ptrCast(@alignCast(g)), c.GTK_EVENT_SEQUENCE_CLAIMED);
-    // Remote-only rows: visible iff the pre-popup hook enabled the
-    // mux actions (i.e. the pane renders a mux session). All three
-    // share one fate, so probing "mux-detach" decides for the lot.
-    var show_remote = false;
-    if (c.g_action_map_lookup_action(@ptrCast(ctx.group), "mux-detach")) |act| {
-        show_remote = c.g_action_get_enabled(@ptrCast(act)) != 0;
-    }
-    for (ctx.remote_widgets) |maybe_w| {
-        if (maybe_w) |w| c.gtk_widget_set_visible(w, @intFromBool(show_remote));
-    }
-    // Link rows: visible iff the pre-popup hook found a link (OSC 8
-    // or auto-detected URL) under the click.
-    var show_link = false;
-    if (c.g_action_map_lookup_action(@ptrCast(ctx.group), "copy-link")) |act| {
-        show_link = c.g_action_get_enabled(@ptrCast(act)) != 0;
-    }
-    for (ctx.link_widgets) |maybe_w| {
-        if (maybe_w) |w| c.gtk_widget_set_visible(w, @intFromBool(show_link));
-    }
+    // Conditional rows: each group's visibility tracks a representative
+    // action's enabled state, which the pre-popup hook set per-pane.
+    //   - Session submenu (detach/rename/kill) → durable session.
+    //   - Link rows (open/copy) → a link under the click.
+    //   - File-transfer rows (upload/download) → a remote-host session.
+    setGroupVisible(ctx.group, "mux-detach", &ctx.remote_widgets);
+    setGroupVisible(ctx.group, "copy-link", &ctx.link_widgets);
+    setGroupVisible(ctx.group, "upload-file", &ctx.host_widgets);
     // Fresh popup: no submenu open.
     for (ctx.subs) |maybe_sub| {
         const sub = maybe_sub orelse continue;
