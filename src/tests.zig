@@ -61,6 +61,7 @@ comptime {
     _ = @import("mux/desktop.zig");
     _ = @import("mux/dbus.zig");
     _ = @import("mux/a11yhub.zig");
+    _ = @import("mux/cast.zig");
     _ = @import("mux/rudp.zig");
     _ = @import("render/atlas_test.zig");
     _ = @import("render/atlas.zig");

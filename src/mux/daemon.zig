@@ -22,6 +22,7 @@ const wlpixcodec = @import("../wlhost/pixcodec.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
 const wlkeymaps = @import("../wlhost/keymaps.zig");
 const a11yhub = @import("a11yhub.zig");
+const cast_rec = @import("cast.zig");
 const build_options = @import("build_options");
 const wlvcodec = @import("../wlhost/vcodec.zig");
 const churnmod = @import("../util/churn.zig");
@@ -188,7 +189,11 @@ const Session = struct {
     /// (SKETERM_WINSTREAM=stub). Mutually exclusive with Wayland
     /// forwarding.
     winstream: ?*WsSource = null,
+    /// Live asciicast v2 recording of this session's PTY output
+    /// (rec_start/rec_stop). Survives client detach.
+    cast: ?cast_rec.Rec = null,
     fn deinit(self: *Session) void {
+        if (self.cast) |*rec| rec.finish();
         if (self.winstream) |ws| {
             ws.deinit();
             self.allocator.destroy(ws);
@@ -1305,6 +1310,7 @@ pub const Daemon = struct {
                 if (rows == 0 or cols == 0 or rows > 1000 or cols > 1000) return;
                 s.screen.resize(cols, rows) catch return;
                 s.pty.setSize(rows, cols);
+                if (s.cast) |*rec| rec.resize(nowMs(), cols, rows);
                 // Geometry changed: every attached client needs a
                 // fresh snapshot (event streams assume fixed grids).
                 self.broadcastSnapshot(s);
@@ -1338,6 +1344,18 @@ pub const Daemon = struct {
             .file_list => self.handleFileList(cl, frame.payload),
             .app_list => self.handleAppList(cl),
             .app_a11y => self.handleAppA11y(cl),
+            .rec_start => self.handleRecStart(cl, frame.payload),
+            .rec_stop => {
+                const s = cl.attached orelse {
+                    cl.queueErr("not attached");
+                    return;
+                };
+                if (s.cast) |*rec| {
+                    rec.finish();
+                    s.cast = null;
+                    cl.queueJson(.ok, .{ .ok = true });
+                } else cl.queueErr("session is not recording");
+            },
             .chan_data => {
                 const id = wire.decodeChanId(frame.payload) orelse return;
                 const ch = self.findChannel(id) orelse return;
@@ -1702,6 +1720,44 @@ pub const Daemon = struct {
         payload.appendSlice(self.allocator, tree) catch return;
         payload.appendSlice(self.allocator, "}") catch return;
         cl.queueFrame(.app_a11y_tree, payload.items);
+    }
+
+    /// Start an asciicast v2 recording of the attached session. The
+    /// file lands on the DAEMON's host (that's where the bytes are) —
+    /// for SSH/UDP sessions the path is remote.
+    fn handleRecStart(self: *Daemon, cl: *Client, payload: []const u8) void {
+        const s = cl.attached orelse {
+            cl.queueErr("not attached");
+            return;
+        };
+        const Req = struct { path: []const u8 };
+        var parsed = std.json.parseFromSlice(Req, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad rec_start request");
+            return;
+        };
+        defer parsed.deinit();
+        if (parsed.value.path.len == 0 or parsed.value.path[0] != '/') {
+            cl.queueErr("rec_start path must be absolute");
+            return;
+        }
+        if (s.cast) |*old| {
+            old.finish();
+            s.cast = null;
+        }
+        s.cast = cast_rec.Rec.start(
+            self.allocator,
+            parsed.value.path,
+            s.screen.cols,
+            s.screen.rows,
+            s.name,
+            nowMs(),
+        ) catch {
+            cl.queueErr("cannot open recording file");
+            return;
+        };
+        cl.queueJson(.ok, .{ .ok = true });
     }
 
     // === Remote directory browse (file_list) ===================
@@ -3438,6 +3494,7 @@ pub const Daemon = struct {
                 break;
             }
             const n: usize = @intCast(n_raw);
+            if (s.cast) |*rec| rec.output(nowMs(), chunk[0..n]);
             s.parser.advance(chunk[0..n], EventCollector.emit, @ptrCast(&total_events));
             if (n < chunk.len) break;
         }

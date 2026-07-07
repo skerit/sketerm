@@ -511,6 +511,8 @@ const TOOLS_JSON_RAW =
     \\{"name":"list_terminals","description":"List all sketerm tabs and panes (ids, titles, sizes, cwd, focus). Pane ids address every other tool.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"read_screen","description":"Read a pane's rendered screen: text content plus cursor position, size and flags. This is the parsed terminal grid (what a human sees), not raw output.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"},"scrollback":{"type":"integer","description":"Also include up to N scrollback lines"}}}},
     \\{"name":"screenshot_pane","description":"Screenshot a terminal pane as a lossless PNG (inline image) exactly as rendered, including colours, cursor and any shader. Needs a running sketerm window.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"}}}},
+    \\{"name":"record_pane_start","description":"Start recording a terminal pane's session as an asciicast v2 (.cast) file — raw output with timestamps, playable with asciinema. Recorded by the session daemon (no wrapper); a remote session records to a path on ITS host.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"},"path":{"type":"string","description":"Absolute output path ending in .cast"}},"required":["path"]}},
+    \\{"name":"record_pane_stop","description":"Stop the asciicast recording of a terminal pane's session.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"}}}},
     \\{"name":"send_text","description":"Type literal text into a pane's terminal. Set enter=true to press Enter afterwards. Use send_keys for control keys.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean","description":"Press Enter after the text"}},"required":["text"]}},
     \\{"name":"send_keys","description":"Press named keys in a pane: space-separated chords like 'ctrl+c', 'enter', 'up', 'escape', 'f5', 'alt+x', 'shift+tab', 'pagedown'. Single characters are typed literally.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
     \\{"name":"run_command","description":"Type a shell command, press Enter, wait until output settles, and return the resulting screen text. For interactive programs prefer send_text/send_keys + read_screen.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"Max wait (default 15000)"},"quiet_ms":{"type":"integer","description":"Idle window that counts as settled (default 400)"}},"required":["command"]}},
@@ -1077,6 +1079,18 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
         _ = c.unlink(path_z.ptr);
         if (rd != len) return appErr(arena, "short read of screenshot");
         return imageResult(arena, "terminal pane screenshot", buf) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "record_pane_start")) {
+        const path = argStr(args, "path") orelse
+            return toolResult(arena, "record_pane_start requires 'path' (absolute .cast output)", true) orelse error.OutOfMemory;
+        const reply = try ipcParsed(arena, backend, .{ .cmd = "record-start", .pane = pane, .data = path });
+        if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
+        return toolResult(arena, "recording started (asciicast v2; stop with record_pane_stop)", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "record_pane_stop")) {
+        const reply = try ipcParsed(arena, backend, .{ .cmd = "record-stop", .pane = pane });
+        if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
+        return toolResult(arena, "recording stopped", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "read_screen")) {
         const sb: u32 = if (argInt(args, "scrollback")) |s|

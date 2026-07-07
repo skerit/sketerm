@@ -31,6 +31,12 @@ const CLI_HELP =
     \\  screen-info [--pane N]            cursor pos, size, alt-screen
     \\                                    flag, activity seq (JSON)
     \\  screenshot [--pane N] --out FILE  save a PNG of the pane as shown
+    \\  record-start [--pane N] --out FILE.cast
+    \\                                    record the pane's session as
+    \\                                    asciicast v2 (daemon-side; a
+    \\                                    remote session records to a
+    \\                                    REMOTE path)
+    \\  record-stop [--pane N]            stop the session recording
     \\  new-tab [--cwd DIR] [--title T]   open a shell tab
     \\  split [--pane N] [--dir h|v]      split a pane (h = side by side)
     \\  focus (--pane N | --tab N)        focus a pane or select a tab
@@ -146,6 +152,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         // Leaked into the request; process exits right after.
         if (std.mem.eql(u8, cmd, "set-title")) {
             if (req.title == null) req.title = joined;
+        } else if (press_enter and std.mem.eql(u8, cmd, "send-text")) {
+            // type-text appends its CR below (paced); send-text gets
+            // it here — previously --enter was silently dropped.
+            req.data = std.fmt.allocPrint(allocator, "{s}\r", .{joined}) catch return 1;
         } else {
             req.data = joined;
         }

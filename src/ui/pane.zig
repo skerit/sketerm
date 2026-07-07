@@ -2086,6 +2086,15 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
         }
     }
 
+    // Recording rows: exactly one of the start/stop pair shows,
+    // tracking the session's asciicast recording state.
+    if (c.g_action_map_lookup_action(@ptrCast(group), "record-session")) |act| {
+        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(!self.terminal.recording));
+    }
+    if (c.g_action_map_lookup_action(@ptrCast(group), "record-stop")) |act| {
+        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(self.terminal.recording));
+    }
+
     // Free any URI captured from a previous popup.
     if (self.menu_link_uri) |old| {
         self.allocator.free(old);

@@ -4530,6 +4530,20 @@ pub const Window = struct {
             _ = c.fclose(f);
             if (wrote != sz) return ipc_protocol.writeErr(out, allocator, "short write to output path");
             try ipc_protocol.writeOk(out, allocator, "screenshot", .{ .path = path, .bytes = @as(u64, sz) });
+        } else if (eql(u8, req.cmd, "record-start")) {
+            // The daemon writes the file (on ITS host); the OK here
+            // acknowledges the request, not the daemon's ack.
+            const path = req.data orelse return ipc_protocol.writeErr(out, allocator, "record-start requires data (output .cast path)");
+            if (path.len == 0 or path[0] != '/') return ipc_protocol.writeErr(out, allocator, "record-start path must be absolute");
+            const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            if (pane.terminal.remote == null) return ipc_protocol.writeErr(out, allocator, "pane has no daemon session");
+            pane.terminal.requestRecordStart(path);
+            try ipc_protocol.writeOk(out, allocator, "record", .{ .path = path, .recording = true });
+        } else if (eql(u8, req.cmd, "record-stop")) {
+            const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            if (pane.terminal.remote == null) return ipc_protocol.writeErr(out, allocator, "pane has no daemon session");
+            pane.terminal.requestRecordStop();
+            try ipc_protocol.writeOk(out, allocator, "record", .{ .recording = false });
         } else if (eql(u8, req.cmd, "get-text")) {
             const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
             const screen = pane.terminal.screen;
@@ -5942,6 +5956,8 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .copy_screen => self.copyFocusedScreen(),
         .copy_scrollback => self.copyFocusedScrollback(),
         .screenshot_pane => screenshotFocusedPane(self),
+        .record_session => recordFocusedSession(self),
+        .record_session_stop => if (self.focusedPane()) |p| p.terminal.requestRecordStop(),
         .launch_remote_app => if (self.focusedPane()) |p| @import("app_launcher.zig").open(self, p),
         .prefs_open => self.openPrefs(),
         else => {},
@@ -5952,6 +5968,42 @@ const ScreenshotCtx = struct {
     win: *Window,
     pane: *Pane,
 };
+
+/// "Record Session (asciicast)…" — pick a .cast destination, then ask
+/// the daemon to start recording the focused pane's session. The file
+/// is written by the daemon: for SSH/UDP sessions the picked path is
+/// interpreted on the REMOTE host.
+fn recordFocusedSession(self: *Window) void {
+    const pane = self.focusedPane() orelse return;
+    if (pane.terminal.remote == null) return;
+    const ctx = self.allocator.create(ScreenshotCtx) catch return;
+    ctx.* = .{ .win = self, .pane = pane };
+    const dialog = c.gtk_file_dialog_new();
+    c.gtk_file_dialog_set_title(dialog, "Record Session As");
+    c.gtk_file_dialog_set_initial_name(dialog, "session.cast");
+    c.gtk_file_dialog_save(dialog, @ptrCast(self.app_window), null, @ptrCast(&onRecordPicked), @ptrCast(ctx));
+}
+
+fn onRecordPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(ScreenshotCtx, user);
+    defer ctx.win.allocator.destroy(ctx);
+    const dialog: *c.GtkFileDialog = @ptrCast(source);
+    const file = c.gtk_file_dialog_save_finish(dialog, result, null) orelse return;
+    defer c.g_object_unref(file);
+    const path_cstr = c.g_file_get_path(file) orelse return;
+    defer c.g_free(path_cstr);
+
+    // The pane may have closed while the dialog was up.
+    var alive = false;
+    for (ctx.win.panes.items) |p| {
+        if (p == ctx.pane) {
+            alive = true;
+            break;
+        }
+    }
+    if (!alive) return;
+    ctx.pane.terminal.requestRecordStart(std.mem.span(@as([*:0]const u8, @ptrCast(path_cstr))));
+}
 
 /// "Screenshot Pane…" — render the focused pane to a PNG the user
 /// picks a destination for.
