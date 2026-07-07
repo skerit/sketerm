@@ -92,6 +92,54 @@ pub fn shmToRgba(
     return out;
 }
 
+/// Box-filter downscale of tightly-packed RGBA to dst_w x dst_h
+/// (each destination pixel averages its full source footprint, so
+/// thin UI lines darken instead of vanishing). Caller owns the result.
+pub fn downscaleRgba(
+    allocator: std.mem.Allocator,
+    rgba: []const u8,
+    w: u32,
+    h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) Error![]u8 {
+    std.debug.assert(dst_w > 0 and dst_h > 0 and dst_w <= w and dst_h <= h);
+    std.debug.assert(rgba.len >= @as(usize, w) * h * 4);
+    const out = try allocator.alloc(u8, @as(usize, dst_w) * dst_h * 4);
+    errdefer allocator.free(out);
+    var dy: u32 = 0;
+    while (dy < dst_h) : (dy += 1) {
+        const sy0: u32 = @intCast(@as(u64, dy) * h / dst_h);
+        var sy1: u32 = @intCast((@as(u64, dy) + 1) * h / dst_h);
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        var dx: u32 = 0;
+        while (dx < dst_w) : (dx += 1) {
+            const sx0: u32 = @intCast(@as(u64, dx) * w / dst_w);
+            var sx1: u32 = @intCast((@as(u64, dx) + 1) * w / dst_w);
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            var acc = [4]u64{ 0, 0, 0, 0 };
+            var sy = sy0;
+            while (sy < sy1) : (sy += 1) {
+                var sx = sx0;
+                while (sx < sx1) : (sx += 1) {
+                    const o = (@as(usize, sy) * w + sx) * 4;
+                    acc[0] += rgba[o];
+                    acc[1] += rgba[o + 1];
+                    acc[2] += rgba[o + 2];
+                    acc[3] += rgba[o + 3];
+                }
+            }
+            const n: u64 = @as(u64, sy1 - sy0) * (sx1 - sx0);
+            const d = (@as(usize, dy) * dst_w + dx) * 4;
+            out[d] = @intCast((acc[0] + n / 2) / n);
+            out[d + 1] = @intCast((acc[1] + n / 2) / n);
+            out[d + 2] = @intCast((acc[2] + n / 2) / n);
+            out[d + 3] = @intCast((acc[3] + n / 2) / n);
+        }
+    }
+    return out;
+}
+
 /// shmToRgba + encodeRgba in one step. Caller owns the result.
 pub fn encodeShm(
     allocator: std.mem.Allocator,
@@ -143,6 +191,26 @@ test "png round-trips through stb_image decode" {
     try std.testing.expectEqual(@as(c_int, w), dw);
     try std.testing.expectEqual(@as(c_int, h), dh);
     try std.testing.expectEqualSlices(u8, &rgba, decoded[0 .. w * h * 4]);
+}
+
+test "downscaleRgba box-averages the full source footprint" {
+    const allocator = std.testing.allocator;
+    // 4x2 -> 2x1: each output pixel averages a 2x2 block.
+    var src = [_]u8{0} ** (4 * 2 * 4);
+    // Left 2x2 block: two black + two white pixels -> mid gray.
+    src[0 * 4] = 255;
+    src[0 * 4 + 1] = 255;
+    src[0 * 4 + 2] = 255;
+    src[4 * 4] = 255;
+    src[4 * 4 + 1] = 255;
+    src[4 * 4 + 2] = 255;
+    for (0..8) |i| src[i * 4 + 3] = 255;
+    const out = try downscaleRgba(allocator, &src, 4, 2, 2, 1);
+    defer allocator.free(out);
+    try std.testing.expectEqual(@as(u8, 128), out[0]);
+    try std.testing.expectEqual(@as(u8, 255), out[3]);
+    // Right block was all black.
+    try std.testing.expectEqual(@as(u8, 0), out[4]);
 }
 
 test "shmToRgba swizzles BGRA and forces xrgb opaque" {

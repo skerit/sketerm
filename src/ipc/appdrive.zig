@@ -25,6 +25,7 @@ pub const Error = error{
     NoSuchWindow,
     BadKey,
     Timeout,
+    NoClipboard,
     OutOfMemory,
 };
 
@@ -94,6 +95,15 @@ pub const App = struct {
     exit_status: i32 = 0,
     /// Toplevel the keyboard was last aimed at (0 = none yet).
     kbd_focus: u32 = 0, // public window id
+    /// Latest clipboard selection the app announced (copy source).
+    clip_offer: ?ClipOffer = null,
+    /// Fetched app-clipboard bytes (answer to a clip_send).
+    clip_buf: std.ArrayList(u8) = .empty,
+    clip_got: bool = false,
+    /// Text we offered as the host clipboard; served on app paste.
+    paste_data: ?[]u8 = null,
+
+    const ClipOffer = struct { chan: u32, source: u32, mime: []u8 };
 
     /// Spawn an app session on the local (autostart) daemon, or on
     /// `host` over SSH, and attach as a proto-v5 viewer.
@@ -151,6 +161,9 @@ pub const App = struct {
             a.destroy(w);
         }
         self.windows.deinit(a);
+        if (self.clip_offer) |o| a.free(o.mime);
+        self.clip_buf.deinit(a);
+        if (self.paste_data) |p| a.free(p);
         a.free(self.name);
         a.destroy(self);
     }
@@ -198,6 +211,9 @@ pub const App = struct {
                     .toplevel_gone = onGone,
                     .popup_new = onPopupNew,
                     .popup_gone = onGone,
+                    .clipboard_offer = onClipOffer,
+                    .clipboard_data = onClipData,
+                    .clipboard_read = onClipRead,
                 }) catch {
                     self.allocator.destroy(ch);
                     return;
@@ -315,6 +331,31 @@ pub const App = struct {
         win.app_id = copy;
     }
 
+    fn onClipOffer(ctx: ?*anyopaque, source: u32, mime: []const u8) void {
+        const ch = chanOf(ctx);
+        const a = ch.app.allocator;
+        const copy = a.dupe(u8, mime) catch return;
+        if (ch.app.clip_offer) |old| a.free(old.mime);
+        ch.app.clip_offer = .{ .chan = ch.id, .source = source, .mime = copy };
+    }
+
+    fn onClipData(ctx: ?*anyopaque, bytes: []const u8) void {
+        const ch = chanOf(ctx);
+        ch.app.clip_buf.clearRetainingCapacity();
+        ch.app.clip_buf.appendSlice(ch.app.allocator, bytes) catch return;
+        ch.app.clip_got = true;
+    }
+
+    fn onClipRead(ctx: ?*anyopaque, mime: []const u8) void {
+        _ = mime;
+        const ch = chanOf(ctx);
+        const data = ch.app.paste_data orelse "";
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(ch.app.allocator);
+        wlpipe.appendUnit(&units, ch.app.allocator, .clip_data, data) catch return;
+        ch.app.sendIntents(ch.id, units.items) catch {};
+    }
+
     fn onGone(ctx: ?*anyopaque, sid: u32) void {
         const ch = chanOf(ctx);
         var i: usize = 0;
@@ -412,6 +453,85 @@ pub const App = struct {
         try self.sendIntents(win.chan, units.items);
     }
 
+    /// Press-move-release drag. Motions go out in small bursts with
+    /// pumps between so the app sees a gesture, not one event blob.
+    pub fn drag(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32) Error!void {
+        const win = self.winById(win_id) orelse return Error.NoSuchWindow;
+        const a = self.allocator;
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(a);
+        wlpipe.appendSeatEnter(&units, a, win.sid, x1, y1) catch return Error.OutOfMemory;
+        wlpipe.appendSeatMotion(&units, a, x1, y1) catch return Error.OutOfMemory;
+        wlpipe.appendSeatButton(&units, a, evdevButton(button), true) catch return Error.OutOfMemory;
+        try self.sendIntents(win.chan, units.items);
+        const dist = @max(@abs(x2 - x1), @abs(y2 - y1));
+        const steps: u32 = @intFromFloat(std.math.clamp(dist / 16.0, 4.0, 40.0));
+        var i: u32 = 1;
+        while (i <= steps) : (i += 1) {
+            const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps));
+            units.clearRetainingCapacity();
+            wlpipe.appendSeatMotion(&units, a, x1 + (x2 - x1) * t, y1 + (y2 - y1) * t) catch return Error.OutOfMemory;
+            try self.sendIntents(win.chan, units.items);
+            if (i % 4 == 0) _ = self.pumpOnce(5);
+        }
+        units.clearRetainingCapacity();
+        wlpipe.appendSeatButton(&units, a, evdevButton(button), false) catch return Error.OutOfMemory;
+        try self.sendIntents(win.chan, units.items);
+    }
+
+    // ── clipboard ───────────────────────────────────────────────
+
+    /// Fetch what the app last copied. Requires the app to have
+    /// announced a selection (clip_offer); pumps until the daemon
+    /// pipes the bytes back. Caller owns the result.
+    pub fn getClipboard(self: *App, timeout_ms: i64) Error![]u8 {
+        self.drain();
+        const offer = self.clip_offer orelse return Error.NoClipboard;
+        const a = self.allocator;
+        self.clip_got = false;
+        var pl: std.ArrayList(u8) = .empty;
+        defer pl.deinit(a);
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, offer.source, .little);
+        pl.appendSlice(a, &idb) catch return Error.OutOfMemory;
+        pl.appendSlice(a, offer.mime) catch return Error.OutOfMemory;
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(a);
+        wlpipe.appendUnit(&units, a, .clip_send, pl.items) catch return Error.OutOfMemory;
+        try self.sendIntents(offer.chan, units.items);
+        const deadline = nowMs() + timeout_ms;
+        while (!self.clip_got and nowMs() < deadline) {
+            if (self.exited) return Error.NotConnected;
+            _ = self.pumpOnce(25);
+        }
+        if (!self.clip_got) return Error.Timeout;
+        return a.dupe(u8, self.clip_buf.items) catch Error.OutOfMemory;
+    }
+
+    /// Announce `text` as the host clipboard toward every app
+    /// connection; served when the app pastes (onClipRead).
+    pub fn setClipboard(self: *App, text: []const u8) Error!void {
+        const a = self.allocator;
+        const copy = a.dupe(u8, text) catch return Error.OutOfMemory;
+        if (self.paste_data) |old| a.free(old);
+        self.paste_data = copy;
+        for (self.chans.values()) |ch| {
+            var units: std.ArrayList(u8) = .empty;
+            defer units.deinit(a);
+            wlpipe.appendUnit(&units, a, .offer_selection, "text/plain;charset=utf-8") catch
+                return Error.OutOfMemory;
+            self.sendIntents(ch.id, units.items) catch {};
+        }
+    }
+
+    /// Clipboard-paste text into a window: offer + Ctrl+V. The paste
+    /// itself completes during subsequent pumps (waitIdle/drain).
+    pub fn pasteText(self: *App, win_id: ?u32, text: []const u8) Error!void {
+        try self.setClipboard(text);
+        _ = try self.resolveKbd(win_id);
+        try self.pressKey(win_id, "ctrl+v");
+    }
+
     /// Aim the keyboard at a window (idempotent).
     fn kbdTarget(self: *App, win_id: u32) Error!*Window {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
@@ -437,6 +557,13 @@ pub const App = struct {
     }
 
     pub fn typeText(self: *App, win_id: ?u32, text: []const u8) Error!void {
+        // Anything the keymap can't express (non-ASCII, unmapped
+        // symbols) goes through the clipboard-paste path instead.
+        for (text) |chr| {
+            if (chr == '\n' or chr == '\t') continue;
+            if (chr >= 0x80 or evkeys.charKey(chr) == null)
+                return self.pasteText(win_id, text);
+        }
         const win = try self.resolveKbd(win_id);
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
@@ -490,13 +617,44 @@ pub const App = struct {
 
     // ── capture ─────────────────────────────────────────────────
 
-    /// Latest committed pixels of one window as a PNG. Caller owns.
-    pub fn screenshotPng(self: *App, win_id: u32) Error![]u8 {
+    pub const Shot = struct {
+        png: []u8,
+        /// Emitted image dimensions (after any downscale).
+        img_w: u32,
+        img_h: u32,
+        /// Surface pixels per image pixel; multiply image coords by
+        /// this to get click coordinates. 1.0 = no downscale.
+        scale: f64,
+    };
+
+    /// Latest committed pixels of one window as a PNG, downscaled so
+    /// neither dimension exceeds `max_dim` (0 = no bound). Caller
+    /// owns `.png`.
+    pub fn screenshotPng(self: *App, win_id: u32, max_dim: u32) Error!Shot {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         if (win.w <= 0 or win.h <= 0 or win.pixels.items.len == 0) return Error.NoSuchWindow;
         const uw: u32 = @intCast(win.w);
         const uh: u32 = @intCast(win.h);
-        return png.encodeShm(self.allocator, win.pixels.items, uw, uh, uw * 4, win.format) catch
+        const a = self.allocator;
+        const longest = @max(uw, uh);
+        if (max_dim == 0 or longest <= max_dim) {
+            const bytes = png.encodeShm(a, win.pixels.items, uw, uh, uw * 4, win.format) catch
+                return Error.OutOfMemory;
+            return .{ .png = bytes, .img_w = uw, .img_h = uh, .scale = 1.0 };
+        }
+        const rgba = png.shmToRgba(a, win.pixels.items, uw, uh, uw * 4, win.format) catch
             return Error.OutOfMemory;
+        defer a.free(rgba);
+        const dw: u32 = @max(1, uw * max_dim / longest);
+        const dh: u32 = @max(1, uh * max_dim / longest);
+        const small = png.downscaleRgba(a, rgba, uw, uh, dw, dh) catch return Error.OutOfMemory;
+        defer a.free(small);
+        const bytes = png.encodeRgba(a, small, dw, dh) catch return Error.OutOfMemory;
+        return .{
+            .png = bytes,
+            .img_w = dw,
+            .img_h = dh,
+            .scale = @as(f64, @floatFromInt(uw)) / @as(f64, @floatFromInt(dw)),
+        };
     }
 };

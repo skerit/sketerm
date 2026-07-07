@@ -323,9 +323,13 @@ const TOOLS_JSON_RAW =
     \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns an app id and its windows. Drive it with screenshot_app/app_click/app_type/app_key.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"wait_ms":{"type":"integer","description":"Max wait for the first window (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"}},"required":["command"]}},
     \\{"name":"list_apps","description":"List launched headless apps and their windows.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"app_windows","description":"List one app's rendered windows (ids, sizes, titles).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
-    \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Coordinates for app_click are surface-local pixels in this image.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"}}}},
-    \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app). button: 1 left (default), 2 middle, 3 right.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x","y"]}},
-    \\{"name":"app_type","description":"Type literal text into an app window (US keyboard layout; ASCII only).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"text":{"type":"string"}},"required":["text"]}},
+    \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Downscaled when larger than max_px; the caption tells you the multiplier to map image coordinates back to app_click coordinates.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"}}}},
+    \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer"}}}},
+    \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). button: 1 left (default), 2 middle, 3 right.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x","y"]}},
+    \\{"name":"app_drag","description":"Press-move-release drag inside an app window (sliders, drag-and-drop, text selection). Surface-local pixel coordinates.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x1":{"type":"integer"},"y1":{"type":"integer"},"x2":{"type":"integer"},"y2":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x1","y1","x2","y2"]}},
+    \\{"name":"app_type","description":"Type literal text into an app window. Non-ASCII text is delivered via a clipboard paste (Ctrl+V) automatically.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"text":{"type":"string"}},"required":["text"]}},
+    \\{"name":"app_clipboard_get","description":"Read what the app last copied to the clipboard (requires the app to have copied something).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"app_clipboard_set","description":"Offer text to the app as the host clipboard. Set paste=true to immediately press Ctrl+V in a window.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"text":{"type":"string"},"paste":{"type":"boolean"},"window":{"type":"integer"}},"required":["text"]}},
     \\{"name":"app_key","description":"Press key chords in an app window: space-separated, e.g. 'ctrl+s', 'enter', 'alt+F4', 'down down enter'.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
     \\{"name":"app_scroll","description":"Scroll inside an app window. dy>0 scrolls down, dx>0 right (wheel steps).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"}},"required":["window"]}},
     \\{"name":"app_resize","description":"Ask an app window to redraw at a new size (deterministic screenshots).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["window","w","h"]}},
@@ -591,7 +595,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         const summary = try appSummary(arena, app);
         return toolResult(arena, summary, false) orelse error.OutOfMemory;
     }
-    if (eql(u8, name, "screenshot_app")) {
+    if (eql(u8, name, "screenshot_app") or eql(u8, name, "get_app_state")) {
         var win_id: u32 = 0;
         if (argInt(args, "window")) |v| {
             win_id = @intCast(v);
@@ -604,16 +608,70 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             }
         }
         if (win_id == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
-        const png_bytes = app.screenshotPng(win_id) catch
+        const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 1568, 0, 8192));
+        const shot = app.screenshotPng(win_id, max_px) catch
             return appErr(arena, "no such window / no pixels yet");
-        defer app_state.allocator.free(png_bytes);
+        defer app_state.allocator.free(shot.png);
         const win = app.winById(win_id).?;
+        const coord_note = if (shot.scale == 1.0)
+            try std.fmt.allocPrint(arena, "coordinates for app_click are this image's pixel coordinates", .{})
+        else
+            try std.fmt.allocPrint(
+                arena,
+                "image downscaled {d}x{d} -> {d}x{d}: MULTIPLY image coordinates by {d:.3} before app_click",
+                .{ win.w, win.h, shot.img_w, shot.img_h, shot.scale },
+            );
+        const extra: []const u8 = if (eql(u8, name, "get_app_state"))
+            try std.fmt.allocPrint(arena, "{s}\n", .{try appSummary(arena, app)})
+        else
+            "";
         const caption = try std.fmt.allocPrint(
             arena,
-            "window {d}: {d}x{d} (scale {d}){s}{s} — coordinates for app_click are surface-local in this image's pixel space",
-            .{ win.id, win.w, win.h, win.scale, if (win.title != null) " title=" else "", win.title orelse "" },
+            "{s}window {d}: {d}x{d} (scale {d}){s}{s} — {s}",
+            .{ extra, win.id, win.w, win.h, win.scale, if (win.title != null) " title=" else "", win.title orelse "", coord_note },
         );
-        return imageResult(arena, caption, png_bytes) orelse error.OutOfMemory;
+        return imageResult(arena, caption, shot.png) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_drag")) {
+        const win_id: u32 = @intCast(argInt(args, "window") orelse
+            return appErr(arena, "app_drag requires 'window'"));
+        const x1 = argInt(args, "x1") orelse return appErr(arena, "app_drag requires x1,y1,x2,y2");
+        const y1 = argInt(args, "y1") orelse return appErr(arena, "app_drag requires x1,y1,x2,y2");
+        const x2 = argInt(args, "x2") orelse return appErr(arena, "app_drag requires x1,y1,x2,y2");
+        const y2 = argInt(args, "y2") orelse return appErr(arena, "app_drag requires x1,y1,x2,y2");
+        const button: u32 = @intCast(argInt(args, "button") orelse 1);
+        app.drag(
+            win_id,
+            @floatFromInt(x1),
+            @floatFromInt(y1),
+            @floatFromInt(x2),
+            @floatFromInt(y2),
+            button,
+        ) catch return appErr(arena, "drag failed (bad window?)");
+        _ = app.waitIdle(200, 2_000);
+        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_clipboard_get")) {
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 3_000;
+        const bytes = app.getClipboard(timeout_ms) catch |err| return appErr(arena, switch (err) {
+            appdrive.Error.NoClipboard => "the app has not announced a clipboard selection (copy something in it first)",
+            appdrive.Error.Timeout => "app did not deliver clipboard data in time",
+            else => "clipboard fetch failed",
+        });
+        defer app_state.allocator.free(bytes);
+        const copy = try arena.dupe(u8, bytes);
+        return toolResult(arena, copy, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_clipboard_set")) {
+        const text = argStr(args, "text") orelse
+            return appErr(arena, "app_clipboard_set requires 'text'");
+        app.setClipboard(text) catch return appErr(arena, "clipboard set failed");
+        if (argBool(args, "paste")) {
+            const win: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
+            app.pressKey(win, "ctrl+v") catch return appErr(arena, "paste keystroke failed (no window?)");
+            _ = app.waitIdle(200, 2_000);
+        }
+        return toolResult(arena, "ok (the app sees this as the host clipboard)", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_click")) {
         const win_id: u32 = @intCast(argInt(args, "window") orelse
@@ -699,6 +757,7 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
 
     if (eql(u8, name, "launch_app") or eql(u8, name, "list_apps") or eql(u8, name, "close_app") or
         eql(u8, name, "close_app_window") or eql(u8, name, "screenshot_app") or
+        eql(u8, name, "get_app_state") or
         eql(u8, name, "list_installed_apps") or std.mem.startsWith(u8, name, "app_"))
     {
         return appTool(arena, name, args);
