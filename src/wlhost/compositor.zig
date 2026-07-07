@@ -214,6 +214,26 @@ const Surface = struct {
     geo_pending: bool = false,
     geo_next: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     geo: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    /// Retained copies of pass-through toplevel metadata so
+    /// state_sync replay can re-fire the View callbacks (the live
+    /// path fires them directly without storing). Owned strings.
+    title: ?[]u8 = null,
+    app_id: ?[]u8 = null,
+    /// Decoration mode: 0 never negotiated, 1 CSD, 2 SSD.
+    deco: u8 = 0,
+    min_w: i32 = 0,
+    min_h: i32 = 0,
+    /// set_parent target (surface id, 0 = none).
+    tl_parent: u32 = 0,
+
+    fn freeOwned(self: *Surface, a: std.mem.Allocator) void {
+        self.frame_cbs.deinit(a);
+        self.input_rects.deinit(a);
+        if (self.title) |s| a.free(s);
+        if (self.app_id) |s| a.free(s);
+        self.title = null;
+        self.app_id = null;
+    }
 };
 
 /// xdg_positioner state — just enough geometry to place menus.
@@ -320,6 +340,11 @@ pub const Compositor = struct {
     /// Set on fatal protocol error after wl_display.error went out;
     /// the caller should close the channel once out is drained.
     dead: bool = false,
+    /// Replica mode (proto v5 viewers): tolerate requests on unknown
+    /// objects instead of declaring a protocol error — the daemon
+    /// brain is authoritative and its server-created object ids are
+    /// invisible to replicas. Never set on the brain itself.
+    lenient: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, view: View) Error!Compositor {
         var self = Compositor{ .allocator = allocator, .view = view };
@@ -338,10 +363,7 @@ pub const Compositor = struct {
         self.vscratch.deinit(a);
         self.buffers.deinit(a);
         var sit = self.surfaces.valueIterator();
-        while (sit.next()) |s| {
-            s.frame_cbs.deinit(a);
-            s.input_rects.deinit(a);
-        }
+        while (sit.next()) |s| s.freeOwned(a);
         self.surfaces.deinit(a);
         self.xdg_map.deinit(a);
         self.sub_map.deinit(a);
@@ -738,6 +760,7 @@ pub const Compositor = struct {
                 // Fetched app clipboard content (answer to clip_send).
                 if (self.view.clipboard_data) |cb| cb(self.view.ctx, payload);
             },
+            .state_sync => try self.restoreState(payload),
             else => {}, // forward compat
         }
     }
@@ -745,7 +768,13 @@ pub const Compositor = struct {
     // ── request dispatch ────────────────────────────────────────
 
     fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void {
-        const iface = self.objects.get(hdr.object) orelse return Error.Protocol;
+        const iface = self.objects.get(hdr.object) orelse {
+            // Replicas never learn the brain's server-created objects
+            // (clipboard data offers): requests on them are skipped,
+            // not fatal. The authoritative brain stays strict.
+            if (self.lenient) return;
+            return Error.Protocol;
+        };
         if (hdr.opcode >= iface.requests.len) return Error.Protocol;
         const msg = &iface.requests[hdr.opcode];
         var it = wire.ArgIter.init(body, msg.sig);
@@ -1001,6 +1030,7 @@ pub const Compositor = struct {
                 b.putUint(mode);
                 try self.send(try b.finish());
                 if (self.xdg_map.get(hdr.object)) |sid| {
+                    if (self.surfaces.getPtr(sid)) |surf| surf.deco = @intCast(mode);
                     if (self.view.toplevel_decoration) |cb| cb(self.view.ctx, sid, mode == 2);
                 }
             },
@@ -1205,8 +1235,7 @@ pub const Compositor = struct {
                 }
                 if (self.pointer_focus == hdr.object) self.pointer_focus = 0;
                 if (self.keyboard_focus == hdr.object) self.keyboard_focus = 0;
-                surf.frame_cbs.deinit(self.allocator);
-                surf.input_rects.deinit(self.allocator);
+                surf.freeOwned(self.allocator);
                 _ = self.surfaces.remove(hdr.object);
                 try self.destroyObject(hdr.object);
             },
@@ -1318,20 +1347,35 @@ pub const Compositor = struct {
             },
             2 => { // set_title(s)
                 const title = (try it.next()).?.string orelse return;
+                if (self.surfaces.getPtr(sid)) |surf| {
+                    const copy = try self.allocator.dupe(u8, title);
+                    if (surf.title) |old| self.allocator.free(old);
+                    surf.title = copy;
+                }
                 if (self.view.toplevel_title) |cb| cb(self.view.ctx, sid, title);
             },
             3 => { // set_app_id(s)
                 const app_id = (try it.next()).?.string orelse return;
+                if (self.surfaces.getPtr(sid)) |surf| {
+                    const copy = try self.allocator.dupe(u8, app_id);
+                    if (surf.app_id) |old| self.allocator.free(old);
+                    surf.app_id = copy;
+                }
                 if (self.view.toplevel_app_id) |cb| cb(self.view.ctx, sid, app_id);
             },
             1 => { // set_parent(?toplevel)
                 const ptl = (try it.next()).?.object;
                 const psid = if (ptl != 0) (self.xdg_map.get(ptl) orelse 0) else 0;
+                if (self.surfaces.getPtr(sid)) |surf| surf.tl_parent = psid;
                 if (self.view.toplevel_parent) |cb| cb(self.view.ctx, sid, psid);
             },
             8 => { // set_min_size(w, h)
                 const mw = (try it.next()).?.int;
                 const mh = (try it.next()).?.int;
+                if (self.surfaces.getPtr(sid)) |surf| {
+                    surf.min_w = mw;
+                    surf.min_h = mh;
+                }
                 if (self.view.toplevel_min_size) |cb| cb(self.view.ctx, sid, mw, mh);
             },
             9, 10, 12, 13 => { // maximize / unmaximize / unfullscreen / minimize
@@ -1551,6 +1595,435 @@ pub const Compositor = struct {
 
     fn send(self: *Compositor, msg: []const u8) Error!void {
         try pipe.appendUnit(&self.out, self.allocator, .wl_msg, msg);
+    }
+
+    // ── state sync (daemon brain → replica) ─────────────────────
+    // Everything a freshly attached replica needs to keep consuming
+    // the live request stream and render current windows, EXCEPT
+    // pool bytes — those precede the state_sync unit as pool_create
+    // + pool_update_c units replayed from the daemon's mirrors.
+
+    const state_sync_version: u8 = 1;
+
+    fn putU8(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u8) Error!void {
+        try out.append(a, v);
+    }
+
+    fn putU32(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u32) Error!void {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, v, .little);
+        try out.appendSlice(a, &b);
+    }
+
+    fn putI32(out: *std.ArrayList(u8), a: std.mem.Allocator, v: i32) Error!void {
+        try putU32(out, a, @bitCast(v));
+    }
+
+    /// Length-prefixed optional string (0xffffffff = null).
+    fn putStr(out: *std.ArrayList(u8), a: std.mem.Allocator, s: ?[]const u8) Error!void {
+        const v = s orelse {
+            try putU32(out, a, 0xffff_ffff);
+            return;
+        };
+        try putU32(out, a, @intCast(v.len));
+        try out.appendSlice(a, v);
+    }
+
+    const StateReader = struct {
+        buf: []const u8,
+        pos: usize = 0,
+
+        fn u8v(r: *StateReader) Error!u8 {
+            if (r.pos + 1 > r.buf.len) return Error.Protocol;
+            defer r.pos += 1;
+            return r.buf[r.pos];
+        }
+
+        fn u32v(r: *StateReader) Error!u32 {
+            if (r.pos + 4 > r.buf.len) return Error.Protocol;
+            defer r.pos += 4;
+            return std.mem.readInt(u32, r.buf[r.pos..][0..4], .little);
+        }
+
+        fn i32v(r: *StateReader) Error!i32 {
+            return @bitCast(try r.u32v());
+        }
+
+        fn str(r: *StateReader, a: std.mem.Allocator) Error!?[]u8 {
+            const len = try r.u32v();
+            if (len == 0xffff_ffff) return null;
+            if (len > pipe.max_unit or r.pos + len > r.buf.len) return Error.Protocol;
+            defer r.pos += len;
+            return try a.dupe(u8, r.buf[r.pos..][0..len]);
+        }
+    };
+
+    /// Serialize the full protocol-tracking state. Caller owns the
+    /// result. Pool bytes are excluded by design (see above).
+    pub fn serializeState(self: *const Compositor, a: std.mem.Allocator) Error![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(a);
+
+        try putU8(&out, a, state_sync_version);
+        try putI32(&out, a, self.output_scale);
+        try putU32(&out, a, self.output_id);
+        try putU32(&out, a, self.grabbed_popup);
+        try putU32(&out, a, self.next_server_id);
+        try putU32(&out, a, self.seat_version);
+        try putU32(&out, a, self.serial);
+        try putU32(&out, a, self.pointer_focus);
+        try putU32(&out, a, self.keyboard_focus);
+
+        try putU32(&out, a, self.objects.count());
+        var oit = self.objects.iterator();
+        while (oit.next()) |e| {
+            try putU32(&out, a, e.key_ptr.*);
+            try putStr(&out, a, e.value_ptr.*.name);
+        }
+
+        try putU32(&out, a, self.buffers.count());
+        var bit = self.buffers.iterator();
+        while (bit.next()) |e| {
+            const b = e.value_ptr;
+            try putU32(&out, a, e.key_ptr.*);
+            try putU32(&out, a, b.pool);
+            try putI32(&out, a, b.offset);
+            try putI32(&out, a, b.width);
+            try putI32(&out, a, b.height);
+            try putI32(&out, a, b.stride);
+            try putU32(&out, a, b.format);
+        }
+
+        try putU32(&out, a, self.surfaces.count());
+        var sit = self.surfaces.iterator();
+        while (sit.next()) |e| {
+            const s = e.value_ptr;
+            try putU32(&out, a, e.key_ptr.*);
+            try putU32(&out, a, s.pending_buffer);
+            try putU8(&out, a, @intFromBool(s.has_pending));
+            try putI32(&out, a, s.buffer_scale);
+            try putU32(&out, a, s.committed_buffer);
+            try putU32(&out, a, s.xdg_surface);
+            try putU32(&out, a, s.toplevel);
+            try putU32(&out, a, s.popup);
+            try putU32(&out, a, s.subparent);
+            try putI32(&out, a, s.sub_x);
+            try putI32(&out, a, s.sub_y);
+            try putU32(&out, a, s.parent);
+            try putI32(&out, a, s.px);
+            try putI32(&out, a, s.py);
+            try putI32(&out, a, s.pw);
+            try putI32(&out, a, s.ph);
+            try putU8(&out, a, @intFromBool(s.configured));
+            try putU8(&out, a, @intFromBool(s.input_pending));
+            try putU8(&out, a, @intFromBool(s.input_whole));
+            try putU8(&out, a, @intFromBool(s.geo_pending));
+            inline for (.{ s.geo_next, s.geo }) |r| {
+                try putI32(&out, a, r.x);
+                try putI32(&out, a, r.y);
+                try putI32(&out, a, r.w);
+                try putI32(&out, a, r.h);
+            }
+            try putStr(&out, a, s.title);
+            try putStr(&out, a, s.app_id);
+            try putU8(&out, a, s.deco);
+            try putI32(&out, a, s.min_w);
+            try putI32(&out, a, s.min_h);
+            try putU32(&out, a, s.tl_parent);
+            try putU32(&out, a, @intCast(s.frame_cbs.items.len));
+            for (s.frame_cbs.items) |cb| try putU32(&out, a, cb);
+            try putU32(&out, a, @intCast(s.input_rects.items.len));
+            for (s.input_rects.items) |r| {
+                try putI32(&out, a, r.x);
+                try putI32(&out, a, r.y);
+                try putI32(&out, a, r.w);
+                try putI32(&out, a, r.h);
+            }
+        }
+
+        inline for (.{ self.xdg_map, self.sub_map }) |map| {
+            try putU32(&out, a, map.count());
+            var mit = map.iterator();
+            while (mit.next()) |e| {
+                try putU32(&out, a, e.key_ptr.*);
+                try putU32(&out, a, e.value_ptr.*);
+            }
+        }
+
+        try putU32(&out, a, self.positioners.count());
+        var pit = self.positioners.iterator();
+        while (pit.next()) |e| {
+            const p = e.value_ptr;
+            try putU32(&out, a, e.key_ptr.*);
+            inline for (.{ p.w, p.h, p.ax, p.ay, p.aw, p.ah }) |v| try putI32(&out, a, v);
+            try putU32(&out, a, p.anchor);
+            try putU32(&out, a, p.gravity);
+            try putI32(&out, a, p.ox);
+            try putI32(&out, a, p.oy);
+        }
+
+        try putU32(&out, a, self.regions.count());
+        var rit = self.regions.iterator();
+        while (rit.next()) |e| {
+            try putU32(&out, a, e.key_ptr.*);
+            try putU32(&out, a, @intCast(e.value_ptr.items.len));
+            for (e.value_ptr.items) |r| {
+                try putI32(&out, a, r.x);
+                try putI32(&out, a, r.y);
+                try putI32(&out, a, r.w);
+                try putI32(&out, a, r.h);
+            }
+        }
+
+        try putU32(&out, a, self.data_sources.count());
+        var dit = self.data_sources.iterator();
+        while (dit.next()) |e| {
+            try putU32(&out, a, e.key_ptr.*);
+            try putU32(&out, a, @intCast(e.value_ptr.items.len));
+            for (e.value_ptr.items) |m| try putStr(&out, a, m);
+        }
+
+        inline for (.{ self.data_devices, self.data_control_devices, self.pointers, self.keyboards }) |list| {
+            try putU32(&out, a, @intCast(list.items.len));
+            for (list.items) |v| try putU32(&out, a, v);
+        }
+
+        return out.toOwnedSlice(a);
+    }
+
+    /// Restore serialized state into a FRESH compositor (replica on
+    /// attach), then re-fire the View callbacks so windows rebuild.
+    /// Feed the pool units before this so frames have pixels.
+    pub fn restoreState(self: *Compositor, blob: []const u8) Error!void {
+        var r = StateReader{ .buf = blob };
+        const a = self.allocator;
+        if (try r.u8v() != state_sync_version) return Error.Protocol;
+        self.output_scale = try r.i32v();
+        self.output_id = try r.u32v();
+        self.grabbed_popup = try r.u32v();
+        self.next_server_id = try r.u32v();
+        self.seat_version = try r.u32v();
+        self.serial = try r.u32v();
+        self.pointer_focus = try r.u32v();
+        self.keyboard_focus = try r.u32v();
+
+        self.objects.clearRetainingCapacity();
+        const n_obj = try r.u32v();
+        for (0..n_obj) |_| {
+            const id = try r.u32v();
+            const name = (try r.str(a)) orelse return Error.Protocol;
+            defer a.free(name);
+            const iface = protocol.find(name) orelse return Error.Protocol;
+            try self.objects.put(a, id, iface);
+        }
+
+        const n_buf = try r.u32v();
+        for (0..n_buf) |_| {
+            const id = try r.u32v();
+            try self.buffers.put(a, id, .{
+                .pool = try r.u32v(),
+                .offset = try r.i32v(),
+                .width = try r.i32v(),
+                .height = try r.i32v(),
+                .stride = try r.i32v(),
+                .format = try r.u32v(),
+            });
+        }
+
+        const n_surf = try r.u32v();
+        for (0..n_surf) |_| {
+            const id = try r.u32v();
+            var s = Surface{};
+            errdefer s.freeOwned(a);
+            s.pending_buffer = try r.u32v();
+            s.has_pending = try r.u8v() != 0;
+            s.buffer_scale = try r.i32v();
+            s.committed_buffer = try r.u32v();
+            s.xdg_surface = try r.u32v();
+            s.toplevel = try r.u32v();
+            s.popup = try r.u32v();
+            s.subparent = try r.u32v();
+            s.sub_x = try r.i32v();
+            s.sub_y = try r.i32v();
+            s.parent = try r.u32v();
+            s.px = try r.i32v();
+            s.py = try r.i32v();
+            s.pw = try r.i32v();
+            s.ph = try r.i32v();
+            s.configured = try r.u8v() != 0;
+            s.input_pending = try r.u8v() != 0;
+            s.input_whole = try r.u8v() != 0;
+            s.geo_pending = try r.u8v() != 0;
+            s.geo_next = .{ .x = try r.i32v(), .y = try r.i32v(), .w = try r.i32v(), .h = try r.i32v() };
+            s.geo = .{ .x = try r.i32v(), .y = try r.i32v(), .w = try r.i32v(), .h = try r.i32v() };
+            s.title = try r.str(a);
+            s.app_id = try r.str(a);
+            s.deco = try r.u8v();
+            s.min_w = try r.i32v();
+            s.min_h = try r.i32v();
+            s.tl_parent = try r.u32v();
+            const n_cbs = try r.u32v();
+            for (0..n_cbs) |_| try s.frame_cbs.append(a, try r.u32v());
+            const n_rects = try r.u32v();
+            for (0..n_rects) |_| try s.input_rects.append(a, .{
+                .x = try r.i32v(),
+                .y = try r.i32v(),
+                .w = try r.i32v(),
+                .h = try r.i32v(),
+            });
+            try self.surfaces.put(a, id, s);
+        }
+
+        inline for (.{ &self.xdg_map, &self.sub_map }) |map| {
+            const n = try r.u32v();
+            for (0..n) |_| {
+                const k = try r.u32v();
+                try map.put(a, k, try r.u32v());
+            }
+        }
+
+        const n_pos = try r.u32v();
+        for (0..n_pos) |_| {
+            const id = try r.u32v();
+            var p = Positioner{};
+            p.w = try r.i32v();
+            p.h = try r.i32v();
+            p.ax = try r.i32v();
+            p.ay = try r.i32v();
+            p.aw = try r.i32v();
+            p.ah = try r.i32v();
+            p.anchor = try r.u32v();
+            p.gravity = try r.u32v();
+            p.ox = try r.i32v();
+            p.oy = try r.i32v();
+            try self.positioners.put(a, id, p);
+        }
+
+        const n_reg = try r.u32v();
+        for (0..n_reg) |_| {
+            const id = try r.u32v();
+            var rects: std.ArrayList(Rect) = .empty;
+            errdefer rects.deinit(a);
+            const n = try r.u32v();
+            for (0..n) |_| try rects.append(a, .{
+                .x = try r.i32v(),
+                .y = try r.i32v(),
+                .w = try r.i32v(),
+                .h = try r.i32v(),
+            });
+            try self.regions.put(a, id, rects);
+        }
+
+        const n_src = try r.u32v();
+        for (0..n_src) |_| {
+            const id = try r.u32v();
+            var mimes: std.ArrayList([]u8) = .empty;
+            errdefer {
+                for (mimes.items) |m| a.free(m);
+                mimes.deinit(a);
+            }
+            const n = try r.u32v();
+            for (0..n) |_| {
+                const m = (try r.str(a)) orelse return Error.Protocol;
+                try mimes.append(a, m);
+            }
+            try self.data_sources.put(a, id, mimes);
+        }
+
+        inline for (.{ &self.data_devices, &self.data_control_devices, &self.pointers, &self.keyboards }) |list| {
+            const n = try r.u32v();
+            for (0..n) |_| try list.append(a, try r.u32v());
+        }
+
+        try self.replayToView();
+    }
+
+    /// Re-fire View callbacks for restored state: hosts before
+    /// children before pixels (children pushed before their host
+    /// window exists would be dropped by the view).
+    fn replayToView(self: *Compositor) Error!void {
+        var it = self.surfaces.iterator();
+        while (it.next()) |e| {
+            const sid = e.key_ptr.*;
+            const s = e.value_ptr;
+            if (s.toplevel == 0) continue;
+            if (self.view.toplevel_new) |cb| cb(self.view.ctx, sid);
+            if (s.title) |title| if (self.view.toplevel_title) |cb| cb(self.view.ctx, sid, title);
+            if (s.app_id) |id| if (self.view.toplevel_app_id) |cb| cb(self.view.ctx, sid, id);
+            if (s.deco != 0) if (self.view.toplevel_decoration) |cb| cb(self.view.ctx, sid, s.deco == 2);
+            if (s.tl_parent != 0) if (self.view.toplevel_parent) |cb| cb(self.view.ctx, sid, s.tl_parent);
+            if (s.min_w != 0 or s.min_h != 0) if (self.view.toplevel_min_size) |cb| cb(self.view.ctx, sid, s.min_w, s.min_h);
+            if (s.geo.w != 0) if (self.view.toplevel_geometry) |cb| cb(self.view.ctx, sid, s.geo.x, s.geo.y, s.geo.w, s.geo.h);
+            if (!s.input_whole) if (self.view.input_region) |cb| cb(self.view.ctx, sid, s.input_rects.items);
+        }
+        it = self.surfaces.iterator();
+        while (it.next()) |e| {
+            const sid = e.key_ptr.*;
+            const s = e.value_ptr;
+            if (s.subparent != 0) {
+                if (self.view.subsurface_new) |cb| cb(self.view.ctx, sid, s.subparent, s.sub_x, s.sub_y);
+            } else if (s.popup != 0) {
+                if (self.view.popup_new) |cb| cb(self.view.ctx, sid, s.parent, s.px, s.py);
+            }
+        }
+        // Pixels, same host-then-child order.
+        it = self.surfaces.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.toplevel == 0) continue;
+            try self.replayFrame(e.key_ptr.*, e.value_ptr);
+        }
+        it = self.surfaces.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.toplevel != 0) continue;
+            try self.replayFrame(e.key_ptr.*, e.value_ptr);
+        }
+    }
+
+    fn replayFrame(self: *Compositor, sid: u32, s: *const Surface) Error!void {
+        if (s.committed_buffer == 0) return;
+        const info = self.buffers.get(s.committed_buffer) orelse return;
+        try self.pushFrame(sid, info);
+    }
+
+    /// Apply one viewer intent unit to this (brain) compositor.
+    /// Malformed or unknown intents are ignored: a viewer must never
+    /// be able to kill the app's session.
+    pub fn applyIntent(self: *Compositor, tag: pipe.Tag, pl: []const u8) void {
+        const g = struct {
+            fn f64At(b: []const u8, off: usize) f64 {
+                return @bitCast(std.mem.readInt(u64, b[off..][0..8], .little));
+            }
+            fn u32At(b: []const u8, off: usize) u32 {
+                return std.mem.readInt(u32, b[off..][0..4], .little);
+            }
+            fn i32At(b: []const u8, off: usize) i32 {
+                return @bitCast(u32At(b, off));
+            }
+        };
+        switch (tag) {
+            .seat_enter => if (pl.len >= 20) self.pointerEnter(g.u32At(pl, 0), g.f64At(pl, 4), g.f64At(pl, 12)) catch {},
+            .seat_leave => self.pointerLeave() catch {},
+            .seat_motion => if (pl.len >= 16) self.pointerMotion(g.f64At(pl, 0), g.f64At(pl, 8)) catch {},
+            .seat_button => if (pl.len >= 5) self.pointerButton(g.u32At(pl, 0), pl[4] != 0) catch {},
+            .seat_axis => if (pl.len >= 12) self.pointerAxis(g.u32At(pl, 0), g.f64At(pl, 4)) catch {},
+            .seat_kbd_enter => if (pl.len >= 4) self.keyboardEnter(g.u32At(pl, 0)) catch {},
+            .seat_kbd_leave => self.keyboardLeave() catch {},
+            .seat_key => if (pl.len >= 5) self.keyboardKey(g.u32At(pl, 0), pl[4] != 0) catch {},
+            .seat_mods => if (pl.len >= 16) self.keyboardModifiers(g.u32At(pl, 0), g.u32At(pl, 4), g.u32At(pl, 8), g.u32At(pl, 12)) catch {},
+            .configure => if (pl.len >= 16) {
+                const bits = g.u32At(pl, 12);
+                self.configureToplevel(g.u32At(pl, 0), g.i32At(pl, 4), g.i32At(pl, 8), .{
+                    .activated = bits & 1 != 0,
+                    .maximized = bits & 2 != 0,
+                    .fullscreen = bits & 4 != 0,
+                    .resizing = bits & 8 != 0,
+                }) catch {};
+            },
+            .dismiss_popups => self.dismissPopups() catch {},
+            .offer_selection => self.offerSelection(pl) catch {},
+            .request_close => if (pl.len >= 4) self.requestClose(g.u32At(pl, 0)) catch {},
+            else => {},
+        }
     }
 
     /// wl_display.error + dead-mark. The object may be anything the
@@ -2655,4 +3128,195 @@ test "stale mirror bounds are never trusted" {
     // No crash, no frame callback with garbage.
     try t.expectEqual(@as(usize, 0), tv.frames);
     try t.expect(!comp.dead);
+}
+
+test "state_sync: serialize, restore into replica, windows replay" {
+    var tv = TestView{};
+    var brain = try Compositor.init(t.allocator, tv.view());
+    defer brain.deinit();
+    var buf: [128]u8 = undefined;
+
+    { // get_registry(2)
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&brain, try b.finish());
+    }
+    inline for (.{
+        .{ 1, "wl_compositor", 4, 3 },
+        .{ 2, "wl_shm", 1, 4 },
+        .{ 5, "xdg_wm_base", 2, 5 },
+    }) |bind| {
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(bind[0]);
+        b.putString(bind[1]);
+        b.putUint(bind[2]);
+        b.putNewId(bind[3]);
+        try req(&brain, try b.finish());
+    }
+    { // create_surface -> 6
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&brain, try b.finish());
+    }
+    { // get_xdg_surface(7, 6)
+        var b = wire.Builder.init(&buf, 5, 2);
+        b.putNewId(7);
+        b.putObject(6);
+        try req(&brain, try b.finish());
+    }
+    { // get_toplevel(8)
+        var b = wire.Builder.init(&buf, 7, 1);
+        b.putNewId(8);
+        try req(&brain, try b.finish());
+    }
+    { // set_title("hello")
+        var b = wire.Builder.init(&buf, 8, 2);
+        b.putString("hello");
+        try req(&brain, try b.finish());
+    }
+    { // initial commit (xdg dance)
+        var b = wire.Builder.init(&buf, 6, 6);
+        try req(&brain, try b.finish());
+    }
+    { // create_pool(9, fd, 16)
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(9);
+        b.putInt(16);
+        try req(&brain, try b.finish());
+    }
+    var px: [16]u8 = undefined;
+    for (&px, 0..) |*p, i| p.* = @intCast(i + 100);
+    { // pool bytes side-band
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        try pipe.appendPoolUpdate(&unit, t.allocator, 9, 0, &px);
+        try brain.feed(unit.items);
+    }
+    { // create_buffer(10, 0, 2x2, stride 8, xrgb)
+        var b = wire.Builder.init(&buf, 9, 0);
+        b.putNewId(10);
+        b.putInt(0);
+        b.putInt(2);
+        b.putInt(2);
+        b.putInt(8);
+        b.putUint(1);
+        try req(&brain, try b.finish());
+    }
+    { // attach + commit
+        var b = wire.Builder.init(&buf, 6, 1);
+        b.putObject(10);
+        b.putInt(0);
+        b.putInt(0);
+        try req(&brain, try b.finish());
+        var b2 = wire.Builder.init(&buf, 6, 6);
+        try req(&brain, try b2.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.frames);
+
+    const blob = try brain.serializeState(t.allocator);
+    defer t.allocator.free(blob);
+
+    // Replica: pool units first (as the daemon replays its mirrors),
+    // then state_sync -- windows and pixels must re-fire.
+    var tv2 = TestView{};
+    var replica = try Compositor.init(t.allocator, tv2.view());
+    defer replica.deinit();
+    {
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(t.allocator);
+        try pipe.appendPoolMeta(&units, t.allocator, .pool_create, 9, 16);
+        try pipe.appendPoolUpdate(&units, t.allocator, 9, 0, &px);
+        try pipe.appendUnit(&units, t.allocator, .state_sync, blob);
+        try replica.feed(units.items);
+    }
+    try t.expectEqual(@as(usize, 1), tv2.new_count);
+    try t.expectEqualStrings("hello", tv2.title_buf[0..tv2.title_len]);
+    try t.expectEqual(@as(usize, 1), tv2.frames);
+    try t.expectEqual(@as(i32, 2), tv2.last_w);
+    try t.expectEqual(@as(i32, 2), tv2.last_h);
+    try t.expectEqual(@as(u8, 100), tv2.last_pixels[0]);
+
+    // The replica keeps tracking the LIVE stream: a set_title on the
+    // restored object id must land (objects map survived the trip).
+    { // set_title("world") on toplevel 8
+        var b = wire.Builder.init(&buf, 8, 2);
+        b.putString("world");
+        try req(&replica, try b.finish());
+    }
+    try t.expectEqualStrings("world", tv2.title_buf[0..tv2.title_len]);
+
+    // Replica output is DISCARDED by callers; verify discarding is
+    // safe (events were generated but nobody ships them).
+    replica.clearOut();
+    try t.expect(!replica.dead);
+}
+
+test "applyIntent: configure and request_close reach the app" {
+    var tv = TestView{};
+    var brain = try Compositor.init(t.allocator, tv.view());
+    defer brain.deinit();
+    var buf: [128]u8 = undefined;
+
+    { // registry + binds + surface + toplevel (condensed)
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&brain, try b.finish());
+    }
+    inline for (.{
+        .{ 1, "wl_compositor", 4, 3 },
+        .{ 5, "xdg_wm_base", 2, 5 },
+    }) |bind| {
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(bind[0]);
+        b.putString(bind[1]);
+        b.putUint(bind[2]);
+        b.putNewId(bind[3]);
+        try req(&brain, try b.finish());
+    }
+    {
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&brain, try b.finish());
+        var b2 = wire.Builder.init(&buf, 5, 2);
+        b2.putNewId(7);
+        b2.putObject(6);
+        try req(&brain, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 7, 1);
+        b3.putNewId(8);
+        try req(&brain, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 6, 6); // commit -> configured
+        try req(&brain, try b4.finish());
+    }
+    brain.clearOut();
+
+    { // configure intent: 640x480, activated|maximized
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(t.allocator);
+        try pipe.appendConfigure(&units, t.allocator, 6, 640, 480, 1 | 2);
+        const p = (try pipe.peelUnit(units.items)).?;
+        brain.applyIntent(p.unit.tag, p.unit.payload);
+    }
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&brain, &evs);
+    try t.expectEqual(@as(usize, 2), evs.items.len);
+    try t.expectEqual([2]u32{ 8, 0 }, evs.items[0]); // toplevel.configure
+    try t.expectEqual([2]u32{ 7, 0 }, evs.items[1]); // xdg.configure
+
+    { // request_close intent
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(t.allocator);
+        try pipe.appendRequestClose(&units, t.allocator, 6);
+        const p = (try pipe.peelUnit(units.items)).?;
+        brain.applyIntent(p.unit.tag, p.unit.payload);
+    }
+    evs.clearRetainingCapacity();
+    try drainEvents(&brain, &evs);
+    try t.expectEqual(@as(usize, 1), evs.items.len);
+    try t.expectEqual([2]u32{ 8, 1 }, evs.items[0]); // toplevel.close
+
+    // Malformed intents must be inert, never fatal.
+    brain.applyIntent(.seat_enter, "xx");
+    brain.applyIntent(.configure, "");
+    try t.expect(!brain.dead);
 }

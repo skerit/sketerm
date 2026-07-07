@@ -60,6 +60,29 @@ pub const Tag = enum(u8) {
     /// row, stepping by row_stride — same destination as pool_update_c,
     /// just a temporal coder instead of a per-region one.
     pool_vtile = 11,
+    /// Serialized Compositor protocol state (compositor.zig
+    /// serializeState), daemon brain -> freshly attached replica.
+    /// Pool BYTES are not inside — they precede it as pool_create +
+    /// pool_update_c units replayed from the daemon's mirrors.
+    state_sync = 12,
+    /// Seat intents, replica -> daemon brain (proto>=5). Little-endian
+    /// payloads; f64 rides as its u64 bit pattern.
+    seat_enter = 13, // u32 sid, u64 x, u64 y
+    seat_leave = 14,
+    seat_motion = 15, // u64 x, u64 y
+    seat_button = 16, // u32 button, u8 pressed
+    seat_axis = 17, // u32 axis, u64 value
+    seat_kbd_enter = 18, // u32 sid
+    seat_kbd_leave = 19,
+    seat_key = 20, // u32 key, u8 pressed
+    seat_mods = 21, // u32 depressed, latched, locked, group
+    /// u32 sid, i32 w, i32 h, u32 state bits (1 activated,
+    /// 2 maximized, 4 fullscreen, 8 resizing).
+    configure = 22,
+    dismiss_popups = 23,
+    /// mime string; the brain announces a host-clipboard selection.
+    offer_selection = 24,
+    request_close = 25, // u32 sid
     _,
 };
 
@@ -168,6 +191,83 @@ pub fn appendPoolMeta(out: *std.ArrayList(u8), allocator: std.mem.Allocator, tag
     std.mem.writeInt(u32, payload[0..4], pool, .little);
     std.mem.writeInt(u32, payload[4..8], size, .little);
     try appendUnit(out, allocator, tag, &payload);
+}
+
+// ── seat-intent encoders (viewer → daemon brain) ────────────────
+
+fn putF64(b: []u8, off: usize, v: f64) void {
+    std.mem.writeInt(u64, b[off..][0..8], @bitCast(v), .little);
+}
+
+fn putU32At(b: []u8, off: usize, v: u32) void {
+    std.mem.writeInt(u32, b[off..][0..4], v, .little);
+}
+
+pub fn appendSeatEnter(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32, x: f64, y: f64) !void {
+    var pl: [20]u8 = undefined;
+    putU32At(&pl, 0, sid);
+    putF64(&pl, 4, x);
+    putF64(&pl, 12, y);
+    try appendUnit(out, a, .seat_enter, &pl);
+}
+
+pub fn appendSeatMotion(out: *std.ArrayList(u8), a: std.mem.Allocator, x: f64, y: f64) !void {
+    var pl: [16]u8 = undefined;
+    putF64(&pl, 0, x);
+    putF64(&pl, 8, y);
+    try appendUnit(out, a, .seat_motion, &pl);
+}
+
+pub fn appendSeatButton(out: *std.ArrayList(u8), a: std.mem.Allocator, button: u32, pressed: bool) !void {
+    var pl: [5]u8 = undefined;
+    putU32At(&pl, 0, button);
+    pl[4] = @intFromBool(pressed);
+    try appendUnit(out, a, .seat_button, &pl);
+}
+
+pub fn appendSeatAxis(out: *std.ArrayList(u8), a: std.mem.Allocator, axis: u32, value: f64) !void {
+    var pl: [12]u8 = undefined;
+    putU32At(&pl, 0, axis);
+    putF64(&pl, 4, value);
+    try appendUnit(out, a, .seat_axis, &pl);
+}
+
+pub fn appendSeatKbdEnter(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32) !void {
+    var pl: [4]u8 = undefined;
+    putU32At(&pl, 0, sid);
+    try appendUnit(out, a, .seat_kbd_enter, &pl);
+}
+
+pub fn appendSeatKey(out: *std.ArrayList(u8), a: std.mem.Allocator, key: u32, pressed: bool) !void {
+    var pl: [5]u8 = undefined;
+    putU32At(&pl, 0, key);
+    pl[4] = @intFromBool(pressed);
+    try appendUnit(out, a, .seat_key, &pl);
+}
+
+pub fn appendSeatMods(out: *std.ArrayList(u8), a: std.mem.Allocator, depressed: u32, latched: u32, locked: u32, group: u32) !void {
+    var pl: [16]u8 = undefined;
+    putU32At(&pl, 0, depressed);
+    putU32At(&pl, 4, latched);
+    putU32At(&pl, 8, locked);
+    putU32At(&pl, 12, group);
+    try appendUnit(out, a, .seat_mods, &pl);
+}
+
+/// state bits: 1 activated, 2 maximized, 4 fullscreen, 8 resizing.
+pub fn appendConfigure(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32, w: i32, h: i32, state_bits: u32) !void {
+    var pl: [16]u8 = undefined;
+    putU32At(&pl, 0, sid);
+    putU32At(&pl, 4, @bitCast(w));
+    putU32At(&pl, 8, @bitCast(h));
+    putU32At(&pl, 12, state_bits);
+    try appendUnit(out, a, .configure, &pl);
+}
+
+pub fn appendRequestClose(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32) !void {
+    var pl: [4]u8 = undefined;
+    putU32At(&pl, 0, sid);
+    try appendUnit(out, a, .request_close, &pl);
 }
 
 pub const max_unit = 16 << 20; // matches mux MAX_FRAME; sanity bound
