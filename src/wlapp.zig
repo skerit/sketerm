@@ -172,6 +172,87 @@ pub const AppHost = struct {
         /// armOpaqueResize.
         opaque_settle_id: c_uint = 0,
 
+        /// Ctrl+right-click host menu: the only host-side chrome a
+        /// forwarded window has (everything else goes to the app).
+        fn showHostMenu(self: *Win, x: f64, y: f64) void {
+            const pop = c.gtk_popover_new();
+            const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+            const shot = c.gtk_button_new_with_label("Screenshot Window…");
+            c.gtk_button_set_has_frame(@ptrCast(shot), 0);
+            _ = c.g_signal_connect_data(@ptrCast(shot), "clicked", @ptrCast(&onMenuScreenshot), self, null, 0);
+            c.gtk_box_append(@ptrCast(box), shot);
+            const close_btn = c.gtk_button_new_with_label("Close Window");
+            c.gtk_button_set_has_frame(@ptrCast(close_btn), 0);
+            _ = c.g_signal_connect_data(@ptrCast(close_btn), "clicked", @ptrCast(&onMenuClose), self, null, 0);
+            c.gtk_box_append(@ptrCast(box), close_btn);
+            c.gtk_popover_set_child(@ptrCast(pop), box);
+            c.gtk_widget_set_parent(pop, self.picture);
+            var rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
+            c.gtk_popover_set_pointing_to(@ptrCast(pop), &rect);
+            _ = c.g_signal_connect_data(@ptrCast(pop), "closed", @ptrCast(&onHostMenuClosed), null, null, 0);
+            c.gtk_popover_popup(@ptrCast(pop));
+        }
+
+        fn popdownFrom(btn: ?*c.GtkButton) void {
+            const pop = c.gtk_widget_get_ancestor(@ptrCast(btn), c.gtk_popover_get_type()) orelse return;
+            c.gtk_popover_popdown(@ptrCast(pop));
+        }
+
+        /// Snapshot the CURRENT frame texture immediately (its GBytes
+        /// outlives the window), then ask where to save it.
+        fn onMenuScreenshot(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+            const win = cast.userData(Win, user);
+            popdownFrom(btn);
+            const paintable = c.gtk_picture_get_paintable(@ptrCast(win.picture)) orelse return;
+            if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(paintable)), c.gdk_texture_get_type()) == 0) return;
+            const bytes = c.gdk_texture_save_to_png_bytes(@ptrCast(paintable)) orelse return;
+            const dialog = c.gtk_file_dialog_new();
+            c.gtk_file_dialog_set_title(dialog, "Save App Screenshot");
+            c.gtk_file_dialog_set_initial_name(dialog, "sketerm-app.png");
+            c.gtk_file_dialog_save(dialog, win.window, null, @ptrCast(&onShotPicked), bytes);
+        }
+
+        fn onShotPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+            const bytes: *c.GBytes = @ptrCast(@alignCast(user.?));
+            defer c.g_bytes_unref(bytes);
+            const dialog: *c.GtkFileDialog = @ptrCast(source);
+            const file = c.gtk_file_dialog_save_finish(dialog, result, null) orelse return;
+            defer c.g_object_unref(file);
+            var sz: usize = 0;
+            const data = c.g_bytes_get_data(bytes, &sz) orelse return;
+            _ = c.g_file_replace_contents(
+                file,
+                @ptrCast(data),
+                sz,
+                null,
+                0,
+                c.G_FILE_CREATE_REPLACE_DESTINATION,
+                null,
+                null,
+                null,
+            );
+        }
+
+        fn onMenuClose(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+            const win = cast.userData(Win, user);
+            popdownFrom(btn);
+            c.gtk_window_close(win.window);
+        }
+
+        fn onHostMenuClosed(pop: ?*c.GtkPopover, _: ?*anyopaque) callconv(.c) void {
+            // Unparent OUTSIDE the closed emission; ref-held so a
+            // window teardown racing the idle can't leave a dangler.
+            _ = c.g_object_ref(@ptrCast(pop));
+            _ = c.g_idle_add(@ptrCast(&idleUnparentPopover), pop);
+        }
+
+        fn idleUnparentPopover(user: ?*anyopaque) callconv(.c) c_int {
+            const w: *c.GtkWidget = @ptrCast(@alignCast(user.?));
+            if (c.gtk_widget_get_parent(w) != null) c.gtk_widget_unparent(w);
+            c.g_object_unref(@ptrCast(w));
+            return 0; // G_SOURCE_REMOVE
+        }
+
         /// Host-window resize edge under (x, y) in picture coords, or 0
         /// for the interior. Disabled while maximized/fullscreen (the
         /// WM owns the size then).
@@ -913,6 +994,14 @@ pub const AppHost = struct {
         win.press_btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
         win.press_x = x;
         win.press_y = y;
+        // Ctrl+right-click is the HOST menu (screenshot etc.) — the
+        // only chrome a forwarded window has. Never forwarded.
+        const state = c.gtk_event_controller_get_current_event_state(@ptrCast(gesture));
+        if (win.press_btn == 3 and (state & c.GDK_CONTROL_MASK) != 0) {
+            win.fwd_press = false;
+            win.showHostMenu(x, y);
+            return;
+        }
         // A primary-button press in the host edge band resizes the host
         // window itself — the app's cropped buffer has no CSD handles
         // (they live in the shadow margin we crop away). Don't forward
