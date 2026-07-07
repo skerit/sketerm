@@ -505,6 +505,26 @@ pub const App = struct {
         try self.sendIntents(win.chan, units.items);
     }
 
+    /// Fetch the app's AT-SPI accessibility tree as JSON (the daemon
+    /// reads it from the session's private a11y bus). Caller owns.
+    pub fn a11yTree(self: *App, timeout_ms: i64) Error![]u8 {
+        self.drain();
+        if (self.exited) return Error.NotConnected;
+        self.conn.sendFrame(.app_a11y, "") catch return Error.NotConnected;
+        // The reply may take a moment (the daemon walks the bus).
+        const deadline = nowMs() + timeout_ms;
+        while (nowMs() < deadline) {
+            if (!pollIn(self.conn.fd, 100)) continue;
+            const f = self.conn.recvFrame() catch return Error.NotConnected;
+            defer f.deinit(self.allocator);
+            if (f.ftype == .app_a11y_tree)
+                return self.allocator.dupe(u8, f.payload) catch Error.OutOfMemory;
+            // Any other frame (events, chan data) is handled normally.
+            self.handleFrame(f.ftype, f.payload);
+        }
+        return Error.Timeout;
+    }
+
     // ── clipboard ───────────────────────────────────────────────
 
     /// Fetch what the app last copied. Requires the app to have

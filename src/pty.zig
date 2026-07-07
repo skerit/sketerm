@@ -54,6 +54,10 @@ pub const SpawnOpts = struct {
     /// (pcmanfm's libfm socket, GApplication bus name) can't coalesce
     /// into an instance bound to another client's display. Absolute path.
     runtime_dir: ?[*:0]const u8 = null,
+    /// Private session-bus address ("unix:path=...") for forwarded app
+    /// sessions: the daemon reads the app's AT-SPI tree from this bus.
+    /// Sets DBUS_SESSION_BUS_ADDRESS + the toolkit a11y-enable vars.
+    a11y_bus_addr: ?[*:0]const u8 = null,
 };
 
 pub const ShellIntegration = struct {
@@ -184,6 +188,21 @@ pub const Pty = struct {
         if (opts.runtime_dir) |rd| {
             _ = c.setenv("XDG_RUNTIME_DIR", rd, 1);
             _ = c.unsetenv("DBUS_SESSION_BUS_ADDRESS");
+        }
+        // Private a11y session bus: the daemon spawned a dbus-daemon
+        // for this app and reads its AT-SPI tree there. Point the app
+        // at it and force toolkit accessibility on (GTK/Qt only
+        // publish when it's enabled). Applied AFTER runtime_dir so it
+        // wins over the DBUS unset above.
+        if (opts.a11y_bus_addr) |addr| {
+            _ = c.setenv("DBUS_SESSION_BUS_ADDRESS", addr, 1);
+            // GTK4 takes GTK_A11Y=atspi|test|none (NOT "1", a GTK3-ism).
+            _ = c.setenv("GTK_A11Y", "atspi", 1);
+            _ = c.setenv("QT_ACCESSIBILITY", "1", 1);
+            _ = c.setenv("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1", 1);
+            // dbus-broker silently reuses the HOST a11y bus, breaking
+            // per-session isolation; force the reference dbus-daemon.
+            _ = c.setenv("ATSPI_DBUS_IMPLEMENTATION", "dbus-daemon", 1);
         }
 
         // Auto shell-integration: hand the script path to the shim

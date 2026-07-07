@@ -68,6 +68,9 @@ pub const FrameType = enum(u8) {
     // answers `app_listing`, so a client can offer a launcher for the
     // apps on the session's host (the remote, over SSH/UDP).
     app_list = 16,
+    /// Request the attached app session's AT-SPI accessibility tree.
+    /// Empty payload; answered with app_a11y_tree.
+    app_a11y = 17,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -89,6 +92,9 @@ pub const FrameType = enum(u8) {
     /// it changes: { total, guis, drivers } (drivers = headless MCP
     /// clients). Lets viewers show an "assistant is driving" badge.
     peer_info = 74,
+    /// JSON AT-SPI tree answering app_a11y: { tree: <node> } or
+    /// { error: "..." }. Node = { role, name, states, rect?, children? }.
+    app_a11y_tree = 75,
     // Byte channels (both directions). Generic multiplexed streams
     // riding the mux connection — used to tunnel a session's app
     // protocol, so forwarded apps inherit whatever transport the

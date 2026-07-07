@@ -1327,7 +1327,11 @@ fn isolatedStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
         const at = std.mem.indexOf(u8, txt, "RT=/") orelse continue;
         const rest = txt[at + 3 ..];
         const end = std.mem.indexOfAny(u8, rest, " \n") orelse continue;
-        if (std.mem.indexOf(u8, txt, "DB=none") == null) fail("iso: D-Bus bus not dropped in child");
+        // The parent's shared bus must never leak into the child.
+        // App sessions get a PRIVATE a11y bus (DB=.../dbus-...) when
+        // dbus-daemon exists, else the bus is dropped (DB=none) — both
+        // isolate; only the inherited /tmp/iso-fake-bus is a failure.
+        if (std.mem.indexOf(u8, txt, "iso-fake-bus") != null) fail("iso: shared D-Bus bus leaked into child");
         rt_path = allocator.dupe(u8, rest[0..end]) catch fail("iso oom");
         break;
     }

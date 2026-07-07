@@ -21,6 +21,7 @@ const wlpipe = @import("../wlhost/pipe.zig");
 const wlpixcodec = @import("../wlhost/pixcodec.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
 const wlkeymaps = @import("../wlhost/keymaps.zig");
+const a11yhub = @import("a11yhub.zig");
 const build_options = @import("build_options");
 const wlvcodec = @import("../wlhost/vcodec.zig");
 const churnmod = @import("../util/churn.zig");
@@ -168,6 +169,9 @@ const Session = struct {
     /// Compiled xkb keymap for this session's app keyboards (points
     /// at an embedded wlhost/keymaps.zig blob; never freed).
     kb_keymap: []const u8 = wlcomp.us_keymap,
+    /// Private a11y D-Bus session bus for a forwarded-app session —
+    /// the daemon reads the app's AT-SPI tree from it. Null = none.
+    a11y: ?a11yhub.Hub = null,
     /// Wayland app forwarding: the daemon IS the Wayland display —
     /// wl_hub_fd listens on the session's display socket itself, sets
     /// the shell's $WAYLAND_DISPLAY, and each app connection is parsed
@@ -199,6 +203,7 @@ const Session = struct {
             removeTreeBestEffort(p);
             self.allocator.free(p);
         }
+        if (self.a11y) |*h| h.deinit();
         if (self.pty.closeAndReap()) |code| self.exit_status = code;
         self.parser.deinit();
         self.screen.deinit();
@@ -1332,6 +1337,7 @@ pub const Daemon = struct {
             .file_get => self.handleFileGet(cl, frame.payload),
             .file_list => self.handleFileList(cl, frame.payload),
             .app_list => self.handleAppList(cl),
+            .app_a11y => self.handleAppA11y(cl),
             .chan_data => {
                 const id = wire.decodeChanId(frame.payload) orelse return;
                 const ch = self.findChannel(id) orelse return;
@@ -1669,6 +1675,33 @@ pub const Daemon = struct {
         };
         for (entries, 0..) |e, i| out[i] = .{ .name = e.name, .exec = e.exec, .icon = e.icon };
         cl.queueJson(.app_listing, .{ .apps = out });
+    }
+
+    /// Serialize the attached app session's AT-SPI tree. The tree
+    /// JSON is already a bare node object; wrap it as {"tree":...}.
+    fn handleAppA11y(self: *Daemon, cl: *Client) void {
+        const s = cl.attached orelse {
+            cl.queueJson(.app_a11y_tree, .{ .@"error" = "not attached" });
+            return;
+        };
+        var hub = &(s.a11y orelse {
+            cl.queueJson(.app_a11y_tree, .{ .@"error" = "no accessibility bus for this session (not an app session, or dbus-daemon unavailable)" });
+            return;
+        });
+        const tree = hub.treeJson(self.allocator) orelse {
+            cl.queueJson(.app_a11y_tree, .{ .@"error" = "no accessibility tree (the app has not published one; GTK/Qt apps only)" });
+            return;
+        };
+        defer self.allocator.free(tree);
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        payload.appendSlice(self.allocator, "{\"tree\":") catch {
+            cl.queueErr("oom");
+            return;
+        };
+        payload.appendSlice(self.allocator, tree) catch return;
+        payload.appendSlice(self.allocator, "}") catch return;
+        cl.queueFrame(.app_a11y_tree, payload.items);
     }
 
     // === Remote directory browse (file_list) ===================
@@ -2922,6 +2955,25 @@ pub const Daemon = struct {
             rt_dir_z = try allocator.dupeZ(u8, p);
         }
 
+        // Forwarded-app sessions get a private D-Bus session bus so
+        // the daemon can read their AT-SPI tree (disable with
+        // SKETERM_NO_A11Y=1). Best-effort: null if dbus-daemon absent.
+        var a11y_hub: ?a11yhub.Hub = null;
+        errdefer if (a11y_hub) |*h| h.deinit();
+        if (req.app and c.getenv("SKETERM_NO_A11Y") == null) {
+            if (self.runtimeBaseDir()) |dir| {
+                var idbuf: [32]u8 = undefined;
+                const idstr = if (self.isWorker())
+                    std.fmt.bufPrint(&idbuf, "w{d}", .{c.getpid()}) catch "app"
+                else blk: {
+                    const id = self.next_wl_id;
+                    break :blk std.fmt.bufPrint(&idbuf, "{d}", .{id}) catch "app";
+                };
+                a11y_hub = a11yhub.Hub.setup(allocator, dir, idstr);
+            }
+        }
+        const a11y_addr_z: ?[:0]const u8 = if (a11y_hub) |h| h.bus_addr_z else null;
+
         // Null-terminated copies of the GUI-supplied env/identity strings,
         // freed after spawn (the child has its own env copy by then). All
         // optional — empty/absent falls back to Pty.spawn's defaults.
@@ -2964,6 +3016,7 @@ pub const Daemon = struct {
             .shell_integration = shell_integration,
             .wayland_display = if (wl_disp_z) |z| z.ptr else null,
             .runtime_dir = if (rt_dir_z) |z| z.ptr else null,
+            .a11y_bus_addr = if (a11y_addr_z) |z| z.ptr else null,
         });
         errdefer _ = pty.closeAndReap();
         // The poll loop does bounded read rounds — master must not
@@ -3008,6 +3061,10 @@ pub const Daemon = struct {
         if (rt_dir_owned) |p| {
             s.runtime_dir_path = p;
             rt_dir_owned = null; // ownership moved to the session
+        }
+        if (a11y_hub) |h| {
+            s.a11y = h;
+            a11y_hub = null; // ownership moved to the session
         }
         if (ws_gate.want) create_ws: {
             const w = allocator.create(WsSource) catch break :create_ws;
