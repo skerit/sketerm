@@ -320,7 +320,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"focus_pane","description":"Focus a pane (selects its tab and grabs keyboard focus).","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
     \\{"name":"close_pane","description":"Close a pane. Destructive: the shell and any running process in it are terminated.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
     \\{"name":"list_installed_apps","description":"List installed GUI apps on the host (name + launch command), from its .desktop entries. Pass host for a remote machine. Use before launch_app to discover what can run.","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH host (user@box); omit = local"}}}},
-    \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns an app id and its windows. Drive it with screenshot_app/app_click/app_type/app_key.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"wait_ms":{"type":"integer","description":"Max wait for the first window (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"}},"required":["command"]}},
+    \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns an app id and its windows. Drive it with get_app_state/app_click/app_type/app_key.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"wait_ms":{"type":"integer","description":"Max wait for the first window (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"},"layout":{"type":"string","description":"Session keyboard layout: us (default), gb, fr, be, de"}},"required":["command"]}},
     \\{"name":"list_apps","description":"List launched headless apps and their windows.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"app_windows","description":"List one app's rendered windows (ids, sizes, titles).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
     \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Downscaled when larger than max_px; the caption tells you the multiplier to map image coordinates back to app_click coordinates.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"}}}},
@@ -547,9 +547,10 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 80, 10, 500));
         const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 24, 4, 300));
         const wait_ms: i64 = argInt(args, "wait_ms") orelse 10_000;
-        const app = appdrive.App.launch(app_state.allocator, argv.items, cols, rows, argStr(args, "host")) catch |err|
+        const app = appdrive.App.launch(app_state.allocator, argv.items, cols, rows, argStr(args, "host"), argStr(args, "layout")) catch |err|
             return appErr(arena, switch (err) {
                 appdrive.Error.SpawnFailed => "spawn failed (mux daemon unreachable or spawn refused)",
+                appdrive.Error.BadLayout => "unknown keyboard layout (available: us, gb, fr, be, de)",
                 else => "launch failed",
             });
         const id = app_state.next_id;

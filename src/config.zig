@@ -212,6 +212,11 @@ pub const Config = struct {
     /// punctuation characters. Anything OUTSIDE this set is treated
     /// as a word boundary.
     word_chars: []const u8 = "-_.,/?:@&=+%~",
+    /// xkb layout for forwarded-app session keyboards (us, gb, fr,
+    /// be, de — wlhost/keymaps.zig). Set this to YOUR physical
+    /// layout: your keystrokes pass through as raw keycodes, and the
+    /// app decodes them with this keymap. Empty = us.
+    app_keyboard_layout: []const u8 = "",
     /// UDP port range "lo:hi" passed to the remote `--udp-listen`
     /// bootstrap (mosh-style; firewalls usually need a pinned range
     /// like "60000:61000"). Empty = ephemeral port.
@@ -423,6 +428,7 @@ pub const Config = struct {
         out.background_image = try arena.dupe(u8, self.background_image);
         out.word_chars = try arena.dupe(u8, self.word_chars);
         out.gtk_theme = try arena.dupe(u8, self.gtk_theme);
+        out.app_keyboard_layout = try arena.dupe(u8, self.app_keyboard_layout);
         out.mux_udp_port_range = try arena.dupe(u8, self.mux_udp_port_range);
         out.default_profile = try arena.dupe(u8, self.default_profile);
         out.keybinds = .empty;
@@ -684,6 +690,8 @@ pub const Config = struct {
         if (!std.mem.eql(u8, self.word_chars, "-_.,/?:@&=+%~"))
             try w.print("word_chars = {s}\n", .{self.word_chars});
         if (self.gtk_theme.len > 0) try w.print("gtk_theme = {s}\n", .{self.gtk_theme});
+        if (self.app_keyboard_layout.len > 0)
+            try w.print("app_keyboard_layout = {s}\n", .{self.app_keyboard_layout});
         if (self.mux_udp_port_range.len > 0)
             try w.print("mux_udp_port_range = {s}\n", .{self.mux_udp_port_range});
 
@@ -1130,6 +1138,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.word_chars = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "gtk_theme")) {
         cfg.gtk_theme = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "app_keyboard_layout")) {
+        cfg.app_keyboard_layout = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "mux_udp_port_range")) {
         // Validate lo:hi here so a typo warns at load, not mid-ssh.
         const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.BadPortRange;

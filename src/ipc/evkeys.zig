@@ -6,12 +6,13 @@
 
 const std = @import("std");
 
-/// xkb modifier mask bits under the pc105/us keymap.
+/// xkb modifier mask bits under the pc105 keymaps.
 pub const Mods = struct {
     shift: bool = false,
     ctrl: bool = false,
     alt: bool = false,
     super: bool = false,
+    altgr: bool = false,
 
     pub fn bits(self: Mods) u32 {
         var v: u32 = 0;
@@ -19,11 +20,12 @@ pub const Mods = struct {
         if (self.ctrl) v |= 4; // Control
         if (self.alt) v |= 8; // Mod1
         if (self.super) v |= 64; // Mod4
+        if (self.altgr) v |= 128; // Mod5 (ISO_Level3_Shift)
         return v;
     }
 
     pub fn any(self: Mods) bool {
-        return self.shift or self.ctrl or self.alt or self.super;
+        return self.bits() != 0;
     }
 };
 
@@ -129,7 +131,13 @@ pub fn namedKey(name: []const u8) ?u32 {
     return null;
 }
 
-pub const Chord = struct { mods: Mods, key: Key };
+pub const Chord = struct {
+    mods: Mods,
+    key: Key,
+    /// The literal character the key part came from (null for named
+    /// keys) — lets layout-aware callers re-resolve the keycode.
+    ch: ?u8 = null,
+};
 
 /// "ctrl+shift+t", "alt+F4", "enter", "ctrl+c" → mods + evdev key.
 pub fn parseChord(spec: []const u8) ?Chord {
@@ -162,7 +170,7 @@ pub fn parseChord(spec: []const u8) ?Chord {
         const k = charKey(key_part[0]) orelse return null;
         var m = mods;
         if (k.shift) m.shift = true;
-        return .{ .mods = m, .key = .{ .code = k.code } };
+        return .{ .mods = m, .key = .{ .code = k.code }, .ch = key_part[0] };
     }
     return null;
 }

@@ -12,6 +12,8 @@ const wlpipe = @import("../wlhost/pipe.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
 const png = @import("../util/png.zig");
 const evkeys = @import("evkeys.zig");
+const xkblayout = @import("xkblayout.zig");
+const keymaps = @import("../wlhost/keymaps.zig");
 
 fn nowMs() i64 {
     var ts: c.struct_timespec = undefined;
@@ -24,6 +26,7 @@ pub const Error = error{
     NotConnected,
     NoSuchWindow,
     BadKey,
+    BadLayout,
     Timeout,
     NoClipboard,
     OutOfMemory,
@@ -102,18 +105,28 @@ pub const App = struct {
     clip_got: bool = false,
     /// Text we offered as the host clipboard; served on app paste.
     paste_data: ?[]u8 = null,
+    /// Parsed session keymap for layout-aware typing (null = the
+    /// builtin us tables in evkeys.zig).
+    layout: ?xkblayout.Layout = null,
 
     const ClipOffer = struct { chan: u32, source: u32, mime: []u8 };
 
     /// Spawn an app session on the local (autostart) daemon, or on
-    /// `host` over SSH, and attach as a proto-v5 viewer.
+    /// `host` over SSH, and attach as a proto-v5 viewer. `kb_layout`
+    /// picks the session keymap (wlhost/keymaps.zig; null/"" = us) —
+    /// typing is encoded against the same blob.
     pub fn launch(
         allocator: std.mem.Allocator,
         argv: []const []const u8,
         cols: u16,
         rows: u16,
         host: ?[]const u8,
+        kb_layout: ?[]const u8,
     ) Error!*App {
+        const layout_name = kb_layout orelse "";
+        const blob = keymaps.get(layout_name) orelse return Error.BadLayout;
+        var layout: ?xkblayout.Layout = xkblayout.parse(allocator, blob) catch null;
+        errdefer if (layout) |*l| l.deinit(allocator);
         var conn = blk: {
             if (host) |h| break :blk muxclient.Conn.connectSsh(allocator, h) catch return Error.SpawnFailed;
             break :blk muxclient.Conn.connectLocalAutostart(allocator) catch return Error.SpawnFailed;
@@ -134,13 +147,15 @@ pub const App = struct {
             .rows = rows,
             .cols = cols,
             .app = true,
+            .kb_layout = layout_name,
         }) catch return Error.SpawnFailed;
         (conn.recvExpect(&.{.ok}) catch return Error.SpawnFailed).deinit(allocator);
         conn.sendJson(.attach, .{ .name = name }) catch return Error.SpawnFailed;
         (conn.recvExpect(&.{.snapshot}) catch return Error.SpawnFailed).deinit(allocator);
 
         const self = allocator.create(App) catch return Error.OutOfMemory;
-        self.* = .{ .allocator = allocator, .conn = conn, .name = name };
+        self.* = .{ .allocator = allocator, .conn = conn, .name = name, .layout = layout };
+        layout = null; // ownership moved
         return self;
     }
 
@@ -164,6 +179,7 @@ pub const App = struct {
         if (self.clip_offer) |o| a.free(o.mime);
         self.clip_buf.deinit(a);
         if (self.paste_data) |p| a.free(p);
+        if (self.layout) |*l| l.deinit(a);
         a.free(self.name);
         a.destroy(self);
     }
@@ -556,34 +572,58 @@ pub const App = struct {
         return Error.NoSuchWindow;
     }
 
+    /// Codepoint -> keycode+mods against the session's keymap (or
+    /// the builtin us tables when no layout was parsed).
+    fn charEntry(self: *App, cp: u21) ?xkblayout.Entry {
+        if (cp == '\n') return .{ .code = evkeys.KEY_ENTER };
+        if (cp == '\t') return .{ .code = 15 };
+        if (self.layout) |*l| return l.lookup(cp);
+        if (cp > 127) return null;
+        const k = evkeys.charKey(@intCast(cp)) orelse return null;
+        return .{ .code = k.code, .shift = k.shift };
+    }
+
     pub fn typeText(self: *App, win_id: ?u32, text: []const u8) Error!void {
-        // Anything the keymap can't express (non-ASCII, unmapped
-        // symbols) goes through the clipboard-paste path instead.
-        for (text) |chr| {
-            if (chr == '\n' or chr == '\t') continue;
-            if (chr >= 0x80 or evkeys.charKey(chr) == null)
-                return self.pasteText(win_id, text);
+        // Anything the keymap can't express goes through the
+        // clipboard-paste path instead.
+        const view = std.unicode.Utf8View.init(text) catch
+            return self.pasteText(win_id, text);
+        var probe = view.iterator();
+        while (probe.nextCodepoint()) |cp| {
+            if (self.charEntry(cp) == null) return self.pasteText(win_id, text);
         }
         const win = try self.resolveKbd(win_id);
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
-        var shift_held = false;
-        for (text) |chr| {
-            const key = evkeys.charKey(chr) orelse return Error.BadKey;
-            if (key.shift != shift_held) {
-                shift_held = key.shift;
-                wlpipe.appendSeatMods(&units, a, if (shift_held) 1 else 0, 0, 0, 0) catch return Error.OutOfMemory;
+        var held: u32 = 0;
+        var it = view.iterator();
+        while (it.nextCodepoint()) |cp| {
+            const e = self.charEntry(cp) orelse return Error.BadKey;
+            const want: u32 = (@as(u32, @intFromBool(e.shift))) | (@as(u32, @intFromBool(e.altgr)) * 128);
+            if (want != held) {
+                held = want;
+                wlpipe.appendSeatMods(&units, a, held, 0, 0, 0) catch return Error.OutOfMemory;
             }
-            wlpipe.appendSeatKey(&units, a, key.code, true) catch return Error.OutOfMemory;
-            wlpipe.appendSeatKey(&units, a, key.code, false) catch return Error.OutOfMemory;
+            wlpipe.appendSeatKey(&units, a, e.code, true) catch return Error.OutOfMemory;
+            wlpipe.appendSeatKey(&units, a, e.code, false) catch return Error.OutOfMemory;
         }
-        if (shift_held) wlpipe.appendSeatMods(&units, a, 0, 0, 0, 0) catch return Error.OutOfMemory;
+        if (held != 0) wlpipe.appendSeatMods(&units, a, 0, 0, 0, 0) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);
     }
 
     pub fn pressKey(self: *App, win_id: ?u32, spec: []const u8) Error!void {
-        const chord = evkeys.parseChord(spec) orelse return Error.BadKey;
+        var chord = evkeys.parseChord(spec) orelse return Error.BadKey;
+        if (chord.ch) |ch| {
+            // Chord letters name CHARACTERS ("ctrl+c" means the key
+            // that types 'c'), so they follow the session layout.
+            if (self.layout != null) {
+                const e = self.charEntry(ch) orelse return Error.BadKey;
+                chord.key.code = e.code;
+                chord.mods.shift = chord.mods.shift or e.shift;
+                chord.mods.altgr = e.altgr;
+            }
+        }
         const win = try self.resolveKbd(win_id);
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
