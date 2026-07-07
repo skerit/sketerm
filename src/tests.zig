@@ -15,6 +15,8 @@ comptime {
     _ = @import("util/platform.zig");
     _ = @import("util/png.zig");
     _ = @import("util/gifrec.zig");
+    _ = @import("util/webm.zig");
+    _ = @import("util/videorec.zig");
     _ = @import("util/churn.zig");
     _ = @import("util/content.zig");
     _ = @import("util/yuv.zig");

@@ -164,8 +164,9 @@ pub const AppHost = struct {
         /// "AI" corner badge, shown while a headless MCP client is
         /// attached to the session (assistant-is-driving indicator).
         badge: ?*c.GtkWidget = null,
-        /// Active GIF recording of this window (host menu).
+        /// Active recording of this window (host menu): GIF or WebM.
         rec: ?@import("util/gifrec.zig").Rec = null,
+        vrec: ?@import("util/videorec.zig").Rec = null,
         /// Last host-edge band the pointer was in (Wayland edge mask,
         /// 0 = interior). Drives the resize cursor and gates whether a
         /// press starts a host-window resize vs. goes to the app.
@@ -187,10 +188,17 @@ pub const AppHost = struct {
             c.gtk_button_set_has_frame(@ptrCast(shot), 0);
             _ = c.g_signal_connect_data(@ptrCast(shot), "clicked", @ptrCast(&onMenuScreenshot), self, null, 0);
             c.gtk_box_append(@ptrCast(box), shot);
-            const rec_btn = c.gtk_button_new_with_label(if (self.rec != null) "Stop Recording…" else "Record Window (GIF)");
+            const recording = self.rec != null or self.vrec != null;
+            const rec_btn = c.gtk_button_new_with_label(if (recording) "Stop Recording…" else "Record Window (WebM)");
             c.gtk_button_set_has_frame(@ptrCast(rec_btn), 0);
-            _ = c.g_signal_connect_data(@ptrCast(rec_btn), "clicked", @ptrCast(&onMenuRecord), self, null, 0);
+            _ = c.g_signal_connect_data(@ptrCast(rec_btn), "clicked", @ptrCast(&onMenuRecordWebm), self, null, 0);
             c.gtk_box_append(@ptrCast(box), rec_btn);
+            if (!recording) {
+                const gif_btn = c.gtk_button_new_with_label("Record Window (GIF)");
+                c.gtk_button_set_has_frame(@ptrCast(gif_btn), 0);
+                _ = c.g_signal_connect_data(@ptrCast(gif_btn), "clicked", @ptrCast(&onMenuRecord), self, null, 0);
+                c.gtk_box_append(@ptrCast(box), gif_btn);
+            }
             const close_btn = c.gtk_button_new_with_label("Close Window");
             c.gtk_button_set_has_frame(@ptrCast(close_btn), 0);
             _ = c.g_signal_connect_data(@ptrCast(close_btn), "clicked", @ptrCast(&onMenuClose), self, null, 0);
@@ -267,6 +275,43 @@ pub const AppHost = struct {
                 return;
             }
             win.rec = gifrec.Rec.init(win.host.allocator, 0);
+        }
+
+        /// Toggle WebM/VP9 recording of this window's committed frames.
+        fn onMenuRecordWebm(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+            const win = cast.userData(Win, user);
+            popdownFrom(btn);
+            const videorec = @import("util/videorec.zig");
+            // Stop whichever recording is active (WebM or GIF).
+            if (win.rec) |*r| {
+                const gif = r.finish(recNowMs()) catch {
+                    win.rec = null;
+                    return;
+                };
+                win.rec = null;
+                const bytes = c.g_bytes_new(gif.ptr, gif.len);
+                win.host.allocator.free(gif);
+                const dialog = c.gtk_file_dialog_new();
+                c.gtk_file_dialog_set_title(dialog, "Save Recording");
+                c.gtk_file_dialog_set_initial_name(dialog, "sketerm-recording.gif");
+                c.gtk_file_dialog_save(dialog, win.window, null, @ptrCast(&onShotPicked), bytes);
+                return;
+            }
+            if (win.vrec) |*r| {
+                const webm = r.finish(recNowMs()) catch {
+                    win.vrec = null;
+                    return;
+                };
+                win.vrec = null;
+                const bytes = c.g_bytes_new(webm.ptr, webm.len);
+                win.host.allocator.free(webm);
+                const dialog = c.gtk_file_dialog_new();
+                c.gtk_file_dialog_set_title(dialog, "Save Recording");
+                c.gtk_file_dialog_set_initial_name(dialog, "sketerm-recording.webm");
+                c.gtk_file_dialog_save(dialog, win.window, null, @ptrCast(&onShotPicked), bytes);
+                return;
+            }
+            win.vrec = videorec.Rec.init(win.host.allocator, 0);
         }
 
         fn onMenuClose(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -671,6 +716,9 @@ pub const AppHost = struct {
         if (win.rec) |*r| {
             r.addShmFrame(pixels, @intCast(w), @intCast(h), format, Win.recNowMs()) catch {};
         }
+        if (win.vrec) |*r| {
+            r.addShmFrame(pixels, @intCast(w), @intCast(h), format, Win.recNowMs()) catch {};
+        }
         // Mirror the primary toplevel into the pane's app view (tab
         // content + live overview thumbnail). Texture is refcounted;
         // both pictures share it.
@@ -890,6 +938,7 @@ pub const AppHost = struct {
         _ = self.windows.remove(surface);
         if (self.mirror_surface == surface) self.mirror_surface = 0;
         if (win.rec) |*r| r.abort();
+        if (win.vrec) |*r| r.abort();
         win.cancelOpaqueResize();
         _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-wlapp", null);
         c.gtk_window_destroy(win.window);

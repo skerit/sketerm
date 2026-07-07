@@ -785,6 +785,10 @@ fn configureSysDeps(
         .file = b.path("vendor/stb_image_impl.c"),
         .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
     });
+    // VP9/WebM app-window recording (videorec.zig) — GUI-side only; the
+    // daemon (configureCoreDeps) links no libvpx and stays libc-clean.
+    addPkgConfig(b, mod, "vpx");
+    mod.addCSourceFile(.{ .file = b.path("vendor/vpxenc_shim.c"), .flags = &.{"-O2"} });
     addZstd(b, mod);
     mod.addIncludePath(b.path("vendor"));
 }
