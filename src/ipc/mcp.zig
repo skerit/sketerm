@@ -310,6 +310,7 @@ const TOOLS_JSON_RAW =
     \\[
     \\{"name":"list_terminals","description":"List all sketerm tabs and panes (ids, titles, sizes, cwd, focus). Pane ids address every other tool.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"read_screen","description":"Read a pane's rendered screen: text content plus cursor position, size and flags. This is the parsed terminal grid (what a human sees), not raw output.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"},"scrollback":{"type":"integer","description":"Also include up to N scrollback lines"}}}},
+    \\{"name":"screenshot_pane","description":"Screenshot a terminal pane as a lossless PNG (inline image) exactly as rendered, including colours, cursor and any shader. Needs a running sketerm window.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"}}}},
     \\{"name":"send_text","description":"Type literal text into a pane's terminal. Set enter=true to press Enter afterwards. Use send_keys for control keys.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean","description":"Press Enter after the text"}},"required":["text"]}},
     \\{"name":"send_keys","description":"Press named keys in a pane: space-separated chords like 'ctrl+c', 'enter', 'up', 'escape', 'f5', 'alt+x', 'shift+tab', 'pagedown'. Single characters are typed literally.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
     \\{"name":"run_command","description":"Type a shell command, press Enter, wait until output settles, and return the resulting screen text. For interactive programs prefer send_text/send_keys + read_screen.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"Max wait (default 15000)"},"quiet_ms":{"type":"integer","description":"Idle window that counts as settled (default 400)"}},"required":["command"]}},
@@ -698,6 +699,24 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
     if (eql(u8, name, "list_terminals")) {
         const resp = try ipc(arena, backend, .{ .cmd = "list" });
         return toolResult(arena, resp, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "screenshot_pane")) {
+        // The GUI renders the PNG to a temp file (IPC is line-JSON),
+        // then we read it back and return it as an inline image.
+        const path_z = std.fmt.allocPrint(arena, "/tmp/sketerm-shot-{d}-{d}.png\x00", .{ c.getpid(), backend.nowMs(backend.ctx) }) catch return error.OutOfMemory;
+        const path = path_z[0 .. path_z.len - 1];
+        const reply = try ipcParsed(arena, backend, .{ .cmd = "screenshot", .pane = pane, .data = path });
+        if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
+        const f = c.fopen(path_z.ptr, "rb") orelse return appErr(arena, "screenshot file vanished");
+        defer _ = c.fclose(f);
+        _ = c.fseek(f, 0, c.SEEK_END);
+        const len: usize = @intCast(@max(0, c.ftell(f)));
+        _ = c.fseek(f, 0, c.SEEK_SET);
+        const buf = arena.alloc(u8, len) catch return error.OutOfMemory;
+        const rd = c.fread(buf.ptr, 1, len, f);
+        _ = c.unlink(path_z.ptr);
+        if (rd != len) return appErr(arena, "short read of screenshot");
+        return imageResult(arena, "terminal pane screenshot", buf) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "read_screen")) {
         const sb: u32 = if (argInt(args, "scrollback")) |s|

@@ -4458,6 +4458,22 @@ pub const Window = struct {
                 .title = scr.last_title orelse "",
                 .seq = pane.terminal.activity_seq,
             });
+        } else if (eql(u8, req.cmd, "screenshot")) {
+            const path = req.data orelse return ipc_protocol.writeErr(out, allocator, "screenshot requires data (output .png path)");
+            const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const bytes = pane.screenshotPng() orelse
+                return ipc_protocol.writeErr(out, allocator, "screenshot failed (pane not mapped/realized yet)");
+            defer c.g_bytes_unref(bytes);
+            var sz: c.gsize = 0;
+            const ptr = c.g_bytes_get_data(bytes, &sz);
+            const path_z = try allocator.dupeZ(u8, path);
+            defer allocator.free(path_z);
+            const f = c.fopen(path_z.ptr, "wb") orelse
+                return ipc_protocol.writeErr(out, allocator, "cannot open output path for writing");
+            const wrote = c.fwrite(ptr, 1, sz, f);
+            _ = c.fclose(f);
+            if (wrote != sz) return ipc_protocol.writeErr(out, allocator, "short write to output path");
+            try ipc_protocol.writeOk(out, allocator, "screenshot", .{ .path = path, .bytes = @as(u64, sz) });
         } else if (eql(u8, req.cmd, "get-text")) {
             const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
             const screen = pane.terminal.screen;
@@ -5855,9 +5871,55 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .mux_kill => self.killFocusedMuxSession(),
         .copy_screen => self.copyFocusedScreen(),
         .copy_scrollback => self.copyFocusedScrollback(),
+        .screenshot_pane => screenshotFocusedPane(self),
         .prefs_open => self.openPrefs(),
         else => {},
     }
+}
+
+const ScreenshotCtx = struct {
+    win: *Window,
+    pane: *Pane,
+};
+
+/// "Screenshot Pane…" — render the focused pane to a PNG the user
+/// picks a destination for.
+fn screenshotFocusedPane(self: *Window) void {
+    const pane = self.focusedPane() orelse return;
+    const ctx = self.allocator.create(ScreenshotCtx) catch return;
+    ctx.* = .{ .win = self, .pane = pane };
+    const dialog = c.gtk_file_dialog_new();
+    c.gtk_file_dialog_set_title(dialog, "Save Pane Screenshot");
+    c.gtk_file_dialog_set_initial_name(dialog, "sketerm.png");
+    c.gtk_file_dialog_save(dialog, @ptrCast(self.app_window), null, @ptrCast(&onScreenshotPicked), @ptrCast(ctx));
+}
+
+fn onScreenshotPicked(source: *c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(ScreenshotCtx, user);
+    defer ctx.win.allocator.destroy(ctx);
+    const dialog: *c.GtkFileDialog = @ptrCast(source);
+    const file = c.gtk_file_dialog_save_finish(dialog, result, null) orelse return;
+    defer c.g_object_unref(file);
+    const path_cstr = c.g_file_get_path(file) orelse return;
+    defer c.g_free(path_cstr);
+
+    // The pane may have closed while the dialog was up.
+    var alive = false;
+    for (ctx.win.panes.items) |p| {
+        if (p == ctx.pane) {
+            alive = true;
+            break;
+        }
+    }
+    if (!alive) return;
+    const bytes = ctx.pane.screenshotPng() orelse return;
+    defer c.g_bytes_unref(bytes);
+    var gerr: [*c]c.GError = null;
+    // g_file_replace_contents wants the raw buffer; pull it from GBytes.
+    var sz: c.gsize = 0;
+    const ptr = c.g_bytes_get_data(bytes, &sz);
+    _ = c.g_file_replace_contents(file, @ptrCast(ptr), sz, null, 0, c.G_FILE_CREATE_NONE, null, null, &gerr);
+    if (gerr != null) c.g_error_free(gerr);
 }
 
 const ShaderPickCtx = struct {
