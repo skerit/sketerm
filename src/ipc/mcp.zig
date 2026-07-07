@@ -18,25 +18,37 @@ const protocol = @import("protocol.zig");
 const appdrive = @import("appdrive.zig");
 
 const MCP_HELP =
-    \\Usage: sketerm mcp [--socket PATH]
+    \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
     \\
-    \\Runs a Model Context Protocol server on stdio that drives the
-    \\running sketerm instance. Register it in an MCP client (Claude
-    \\Code, etc.) as command "sketerm" with args ["mcp"].
+    \\Runs a Model Context Protocol server on stdio. Register it in an
+    \\MCP client (Claude Code, etc.) as command "sketerm" with args
+    \\["mcp"].
+    \\
+    \\Isolation (default): app tools run against a PRIVATE mux daemon
+    \\under $XDG_RUNTIME_DIR/sketerm/mcp-*/ — the assistant cannot see
+    \\or touch your real sessions or windows. The private daemon and
+    \\its apps are torn down when the MCP server exits.
+    \\  --durable      keep the private daemon (and its apps) running
+    \\                 across MCP restarts (instance name "default")
+    \\  --name NAME    named durable instance; a later `sketerm mcp
+    \\                 --name NAME` reconnects to the same daemon
+    \\  --shared       OPT-IN to the user's real per-user daemon and
+    \\                 running GUI (pre-isolation behavior): terminal
+    \\                 tools drive live panes, apps share the daemon
     \\
     \\Terminal tools: list_terminals, read_screen, send_text,
     \\send_keys, run_command, wait_idle, new_tab, split_pane,
-    \\focus_pane, close_pane.
+    \\focus_pane, close_pane. These need a GUI socket: --socket, or
+    \\--shared (then $SKETERM_SOCKET / the single *.sock under
+    \\$XDG_RUNTIME_DIR/sketerm/). Isolated mode without --socket
+    \\leaves them disabled with a clear error.
     \\
     \\Headless GUI-app tools (no GUI needed; apps render into the mux
     \\daemon, never on a screen): launch_app, list_apps, app_windows,
     \\screenshot_app (inline PNG), app_click, app_type, app_key,
     \\app_scroll, app_resize, app_wait, close_app_window, close_app.
-    \\
-    \\Socket resolution (terminal tools): --socket, then
-    \\$SKETERM_SOCKET, then the single *.sock under
-    \\$XDG_RUNTIME_DIR/sketerm/. App tools use the mux daemon socket
-    \\and work with no sketerm window open.
+    \\SSH app launches (`host` param) always target the REMOTE host's
+    \\daemon; isolation applies to local launches.
     \\
 ;
 
@@ -54,26 +66,191 @@ pub const Backend = struct {
     nowMs: *const fn (ctx: *anyopaque) i64,
 };
 
-pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
-    var socket_arg: ?[]const u8 = null;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--socket") and i + 1 < args.len) {
-            i += 1;
-            socket_arg = args[i];
-        } else if (std.mem.eql(u8, args[i], "--help")) {
-            _ = c.fputs(MCP_HELP, platform.stdout());
-            return 0;
-        } else {
-            _ = c.fprintf(platform.stderr(), "sketerm mcp: unknown flag\n");
-            return 2;
+/// Parsed `sketerm mcp` flags. Pure so flag combos unit-test.
+pub const Opts = struct {
+    socket: ?[]const u8 = null,
+    shared: bool = false,
+    durable: bool = false,
+    name: ?[]const u8 = null,
+    help: bool = false,
+
+    pub const ParseError = error{ UnknownFlag, MissingValue, BadName, SharedConflict };
+
+    pub fn parse(args: []const []const u8) ParseError!Opts {
+        var o = Opts{};
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const a = args[i];
+            if (std.mem.eql(u8, a, "--socket")) {
+                if (i + 1 >= args.len) return error.MissingValue;
+                i += 1;
+                o.socket = args[i];
+            } else if (std.mem.eql(u8, a, "--shared")) {
+                o.shared = true;
+            } else if (std.mem.eql(u8, a, "--durable")) {
+                o.durable = true;
+            } else if (std.mem.eql(u8, a, "--name")) {
+                if (i + 1 >= args.len) return error.MissingValue;
+                i += 1;
+                if (!validInstanceName(args[i])) return error.BadName;
+                o.name = args[i];
+                o.durable = true; // a name exists to be found again
+            } else if (std.mem.eql(u8, a, "--help")) {
+                o.help = true;
+            } else {
+                return error.UnknownFlag;
+            }
         }
+        if (o.shared and (o.durable or o.name != null)) return error.SharedConflict;
+        return o;
+    }
+};
+
+fn validInstanceName(n: []const u8) bool {
+    if (n.len == 0 or n.len > 48) return false;
+    for (n) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '-' or ch == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// The private daemon instance of an isolated (non `--shared`) run.
+const Isolation = struct {
+    /// $XDG_RUNTIME_DIR/sketerm/mcp-<name> or .../mcp-tmp-<pid> (owned).
+    dir: []u8,
+    /// `dir`/mux.sock (owned).
+    sock: []u8,
+    durable: bool,
+
+    fn deinit(self: *Isolation, allocator: std.mem.Allocator) void {
+        allocator.free(self.dir);
+        allocator.free(self.sock);
+    }
+};
+
+/// Create (or reuse) the isolated instance dir. The daemon itself is
+/// autostarted lazily by the first app tool call.
+fn setupIsolation(allocator: std.mem.Allocator, name: ?[]const u8, durable: bool) ?Isolation {
+    const rt = platform.runtimeDir();
+    var z_buf: [4096]u8 = undefined;
+    const base = std.fmt.bufPrintZ(&z_buf, "{s}/sketerm", .{rt}) catch return null;
+    _ = c.mkdir(base.ptr, 0o700);
+    const dir = if (name) |n|
+        std.fmt.allocPrint(allocator, "{s}/sketerm/mcp-{s}", .{ rt, n }) catch return null
+    else
+        std.fmt.allocPrint(allocator, "{s}/sketerm/mcp-tmp-{d}", .{ rt, c.getpid() }) catch return null;
+    errdefer allocator.free(dir);
+    const dir_z = std.fmt.bufPrintZ(&z_buf, "{s}", .{dir}) catch {
+        allocator.free(dir);
+        return null;
+    };
+    _ = c.mkdir(dir_z.ptr, 0o700);
+    const sock = std.fmt.allocPrint(allocator, "{s}/mux.sock", .{dir}) catch {
+        allocator.free(dir);
+        return null;
+    };
+    return .{ .dir = dir, .sock = sock, .durable = durable };
+}
+
+/// Ask the daemon at `sock` to shut down and wait (briefly) for it to
+/// stop accepting connections. Best-effort.
+fn shutdownDaemonAt(allocator: std.mem.Allocator, sock: []const u8) void {
+    const muxclient = @import("../mux/client.zig");
+    if (muxclient.Conn.connect(allocator, sock)) |conn| {
+        var conn2 = conn;
+        defer conn2.deinit();
+        conn2.sendFrame(.shutdown, "") catch {};
+    } else |_| return;
+    var tries: u32 = 0;
+    while (tries < 40) : (tries += 1) {
+        _ = c.usleep(50_000);
+        if (muxclient.Conn.connect(allocator, sock)) |probe| {
+            var pc = probe;
+            pc.deinit();
+        } else |_| return;
+    }
+}
+
+/// Reap ephemeral instances (mcp-tmp-<pid>) whose owning MCP process
+/// is gone — a SIGKILLed server can't run its own teardown, so every
+/// startup sweeps for orphans. Named (durable) instances are kept.
+fn sweepStaleEphemeral(allocator: std.mem.Allocator) void {
+    const muxdaemon = @import("../mux/daemon.zig");
+    const rt = platform.runtimeDir();
+    var base_buf: [4096]u8 = undefined;
+    const base = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm", .{rt}) catch return;
+    const d = c.opendir(base.ptr) orelse return;
+    defer _ = c.closedir(d);
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (!std.mem.startsWith(u8, name, "mcp-tmp-")) continue;
+        const pid = std.fmt.parseInt(c.pid_t, name["mcp-tmp-".len..], 10) catch continue;
+        if (pid == c.getpid()) continue;
+        const rc = c.kill(pid, 0);
+        if (rc == 0 or std.posix.errno(rc) != .SRCH) continue;
+        var path_buf: [4096]u8 = undefined;
+        const sock = std.fmt.bufPrint(&path_buf, "{s}/{s}/mux.sock", .{ base, name }) catch continue;
+        shutdownDaemonAt(allocator, sock);
+        const dir = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ base, name }) catch continue;
+        muxdaemon.removeTreeBestEffort(dir);
+    }
+}
+
+var quit_flag: bool = false;
+
+fn onQuitSignal(_: c_int) callconv(.c) void {
+    quit_flag = true;
+}
+
+/// SIGTERM/SIGINT must interrupt the blocking getline (no SA_RESTART)
+/// so an ephemeral run still tears its private daemon down when the
+/// MCP client kills us instead of closing stdin.
+fn installQuitSignals() void {
+    var sa: c.struct_sigaction = std.mem.zeroes(c.struct_sigaction);
+    sa.__sigaction_handler.sa_handler = onQuitSignal;
+    sa.sa_flags = 0;
+    _ = c.sigaction(c.SIGTERM, &sa, null);
+    _ = c.sigaction(c.SIGINT, &sa, null);
+}
+
+pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
+    const opts = Opts.parse(args) catch |err| {
+        const msg = switch (err) {
+            error.UnknownFlag => "sketerm mcp: unknown flag (see --help)\n",
+            error.MissingValue => "sketerm mcp: flag needs a value\n",
+            error.BadName => "sketerm mcp: --name must be 1-48 chars of [A-Za-z0-9_-]\n",
+            error.SharedConflict => "sketerm mcp: --shared conflicts with --durable/--name\n",
+        };
+        _ = c.fputs(msg, platform.stderr());
+        return 2;
+    };
+    if (opts.help) {
+        _ = c.fputs(MCP_HELP, platform.stdout());
+        return 0;
     }
 
-    // Terminal tools need a running GUI's socket; app tools talk to
-    // the mux daemon directly and work fully headless — a missing
-    // GUI therefore degrades, not aborts.
-    const sock_path = @import("client.zig").resolveSocket(allocator, socket_arg);
+    // Isolated (default): app tools get a private daemon; the user's
+    // per-user daemon and GUI stay out of reach. --shared opts into
+    // the real daemon + running GUI.
+    var iso: ?Isolation = null;
+    if (!opts.shared) {
+        sweepStaleEphemeral(allocator);
+        iso = setupIsolation(allocator, opts.name, opts.durable) orelse {
+            _ = c.fputs("sketerm mcp: cannot create isolated runtime dir\n", platform.stderr());
+            return 1;
+        };
+    }
+    defer if (iso) |*i| i.deinit(allocator);
+
+    // Terminal tools need a running GUI's socket. Shared mode resolves
+    // it like `sketerm cli`; isolated mode only honors an EXPLICIT
+    // --socket (no auto-discovery — that would pierce the isolation).
+    const sock_path = if (opts.shared or opts.socket != null)
+        @import("client.zig").resolveSocket(allocator, opts.socket)
+    else
+        null;
     defer if (sock_path) |p| allocator.free(p);
     var real = RealBackend{ .sock_path = sock_path orelse "" };
     var stub = StubBackend{};
@@ -88,16 +265,28 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         .sleepMs = RealBackend.sleepMs,
         .nowMs = RealBackend.nowMs,
     };
-    app_state = .{ .allocator = allocator };
+    app_state = .{
+        .allocator = allocator,
+        .mux_sock = if (iso) |i| i.sock else null,
+        .keep_apps = if (iso) |i| i.durable else false,
+    };
     defer app_state.deinit();
+
+    // Named/durable instance: pick up app sessions still running on
+    // the private daemon from a previous run.
+    if (iso) |i| {
+        if (i.durable) reattachApps(i.sock);
+    }
+
+    installQuitSignals();
 
     // stdin loop: one JSON-RPC message per line.
     var lineptr: [*c]u8 = null;
     var linecap: usize = 0;
     defer if (lineptr != null) c.free(lineptr);
-    while (true) {
+    while (!quit_flag) {
         const n = c.getline(&lineptr, &linecap, platform.stdin());
-        if (n < 0) break; // EOF — client closed us down.
+        if (n < 0) break; // EOF or EINTR — client closed us down.
         var line: []const u8 = lineptr[0..@intCast(n)];
         line = std.mem.trim(u8, line, " \t\r\n");
         if (line.len == 0) continue;
@@ -109,6 +298,17 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             _ = c.fwrite(r.ptr, 1, r.len, platform.stdout());
             _ = c.fputc('\n', platform.stdout());
             _ = c.fflush(platform.stdout());
+        }
+    }
+
+    // Ephemeral teardown: detach app viewers first (deinit is
+    // idempotent; the deferred call becomes a no-op), then retire the
+    // private daemon and remove its dir. Durable/named instances stay.
+    app_state.deinit();
+    if (iso) |i| {
+        if (!i.durable) {
+            shutdownDaemonAt(allocator, i.sock);
+            @import("../mux/daemon.zig").removeTreeBestEffort(i.dir);
         }
     }
     return 0;
@@ -463,15 +663,51 @@ const AppState = struct {
     apps: std.AutoArrayHashMapUnmanaged(u32, *appdrive.App) = .empty,
     next_id: u32 = 1,
     ready: bool = true,
+    /// Socket of the private (isolated) daemon local app launches
+    /// target; null = the shared per-user daemon.
+    mux_sock: ?[]const u8 = null,
+    /// Durable instance: on exit, detach from app sessions instead of
+    /// killing them (they outlive the MCP process for reconnect).
+    keep_apps: bool = false,
 
+    /// Idempotent: run() calls it explicitly before retiring an
+    /// ephemeral daemon, and again via defer.
     fn deinit(self: *AppState) void {
-        for (self.apps.values()) |app| app.deinit();
+        if (!self.ready) return;
+        for (self.apps.values()) |app| {
+            if (self.keep_apps) app.detach() else app.deinit();
+        }
         self.apps.deinit(self.allocator);
+        self.apps = .empty;
         self.ready = false;
     }
 };
 
 var app_state: AppState = .{ .allocator = undefined, .ready = false };
+
+/// Reconnect a durable instance to app sessions still running on its
+/// private daemon, so `list_apps` etc. see them after an MCP restart.
+/// Best-effort: no daemon (or none attachable) just means no apps.
+fn reattachApps(sock: []const u8) void {
+    const a = app_state.allocator;
+    const names = appdrive.listAppSessions(a, sock) catch return;
+    defer {
+        for (names) |n| a.free(n);
+        a.free(names);
+    }
+    for (names) |n| {
+        const app = appdrive.App.attachExisting(a, n, null, sock) catch continue;
+        const id = app_state.next_id;
+        app_state.next_id += 1;
+        app_state.apps.put(a, id, app) catch {
+            app.detach();
+            continue;
+        };
+        // Let the attach replay build the windows before the first
+        // tool call reads them (bounded; frames are already in flight).
+        _ = app.waitFirstWindow(1500);
+    }
+}
 
 fn appFromArgs(args: std.json.Value) ?*appdrive.App {
     const id = argInt(args, "app") orelse {
@@ -550,7 +786,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 80, 10, 500));
         const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 24, 4, 300));
         const wait_ms: i64 = argInt(args, "wait_ms") orelse 10_000;
-        const app = appdrive.App.launch(app_state.allocator, argv.items, cols, rows, argStr(args, "host"), argStr(args, "layout")) catch |err|
+        const app = appdrive.App.launch(app_state.allocator, argv.items, cols, rows, argStr(args, "host"), argStr(args, "layout"), app_state.mux_sock) catch |err|
             return appErr(arena, switch (err) {
                 appdrive.Error.SpawnFailed => "spawn failed (mux daemon unreachable or spawn refused)",
                 appdrive.Error.BadLayout => "unknown keyboard layout (available: us, gb, fr, be, de)",
@@ -568,7 +804,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         return toolResult(arena, summary, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "list_installed_apps")) {
-        const listing = appdrive.listInstalledApps(app_state.allocator, argStr(args, "host")) catch |err|
+        const listing = appdrive.listInstalledApps(app_state.allocator, argStr(args, "host"), app_state.mux_sock) catch |err|
             return appErr(arena, switch (err) {
                 appdrive.Error.SpawnFailed => "cannot reach the daemon (is sketerm-mux running / host reachable?)",
                 else => "app discovery failed",
@@ -1071,4 +1307,39 @@ test "wait_idle times out when output keeps flowing" {
         \\{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wait_idle","arguments":{"quiet_ms":100,"timeout_ms":200}}}
     ).?;
     try std.testing.expect(std.mem.indexOf(u8, resp, "timeout") != null);
+}
+
+test "mcp flag parsing: isolation modes" {
+    const t = std.testing;
+    // Default: isolated, ephemeral.
+    const def = try Opts.parse(&.{});
+    try t.expect(!def.shared and !def.durable and def.name == null);
+    // --name implies durable.
+    const named = try Opts.parse(&.{ "--name", "agent-1" });
+    try t.expect(named.durable);
+    try t.expectEqualStrings("agent-1", named.name.?);
+    // --durable alone (unnamed durable instance).
+    const dur = try Opts.parse(&.{"--durable"});
+    try t.expect(dur.durable and dur.name == null);
+    // --shared excludes isolation flags.
+    try t.expectError(error.SharedConflict, Opts.parse(&.{ "--shared", "--durable" }));
+    try t.expectError(error.SharedConflict, Opts.parse(&.{ "--shared", "--name", "x" }));
+    // --socket still parses in both modes.
+    const sock = try Opts.parse(&.{ "--socket", "/tmp/x.sock", "--shared" });
+    try t.expect(sock.shared);
+    try t.expectEqualStrings("/tmp/x.sock", sock.socket.?);
+    // Errors.
+    try t.expectError(error.MissingValue, Opts.parse(&.{"--name"}));
+    try t.expectError(error.BadName, Opts.parse(&.{ "--name", "a/b" }));
+    try t.expectError(error.BadName, Opts.parse(&.{ "--name", "" }));
+    try t.expectError(error.UnknownFlag, Opts.parse(&.{"--bogus"}));
+}
+
+test "instance name validation" {
+    const t = std.testing;
+    try t.expect(validInstanceName("default"));
+    try t.expect(validInstanceName("Agent_2-b"));
+    try t.expect(!validInstanceName("has space"));
+    try t.expect(!validInstanceName("dot.dot"));
+    try t.expect(!validInstanceName("a" ** 49));
 }

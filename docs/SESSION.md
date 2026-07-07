@@ -6454,3 +6454,37 @@ gnome-calculator headless via MCP, read a 316-node AT-SPI tree
 (application/window/every button by role+name). Full suite 656/661
 (5 skip), all three builds green, daemon links no GTK/GLib/dbus,
 `smoke-mux` and `smoke-e2e` (under fatal-criticals) PASS.
+
+## Feature: MCP isolation modes (private daemon by default)
+
+`sketerm mcp` no longer touches the user's real daemon or GUI unless
+asked. Default = ISOLATED + EPHEMERAL: app tools autostart a private
+`sketerm-mux` on `$XDG_RUNTIME_DIR/sketerm/mcp-tmp-<pid>/mux.sock`
+(the daemon derives its Wayland hub / a11y dirs from the socket dir,
+so the whole instance lives in that one dir); on MCP exit (stdin EOF
+or SIGTERM/SIGINT, caught via sigaction without SA_RESTART so getline
+EINTRs) the private daemon is retired with a `.shutdown` frame and
+the dir removed. Orphans from a SIGKILL are reaped by a startup sweep
+(`mcp-tmp-<pid>` dirs whose owning pid is gone). Terminal tools no
+longer auto-discover the GUI socket in isolated mode -- explicit
+`--socket` only.
+
+`--durable` / `--name <n>` = named persistent instance under
+`mcp-<n>/`: the daemon and its app sessions survive MCP restarts, and
+a reconnecting `sketerm mcp --name <n>` lists the daemon's app
+sessions and reattaches to each (attach-replay rebuilds windows with
+pixels). On exit a durable instance DETACHES from its apps instead of
+killing them (new `App.detach`). `--shared` opts into the old
+behavior: the user's per-user daemon plus the running GUI.
+
+Plumbing: `Conn.connectLocalAutostartAt(alloc, sock)` (spawns
+`sketerm-mux --broker --socket <path>`), `appdrive.App.attachExisting`
++ `appdrive.listAppSessions` (`.list` reply already carried the `app`
+flag), `local_sock` threaded through `App.launch`/`listInstalledApps`,
+`Opts.parse` extracted pure for unit tests (2 new test blocks, suite
+now 658/663). Verified e2e headless: isolated launch creates only the
+private socket (shared `mux.sock` absent), EOF/SIGTERM teardown
+removes dir + daemon, named instance survives restart and the
+reconnected MCP drives the still-running calculator, `--shared` hits
+the shared daemon with no `mcp-*` dirs, stale sweep reaps a planted
+dead-pid dir. `smoke-mux` + `smoke-e2e` (fatal-criticals) PASS.
