@@ -334,6 +334,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_scroll","description":"Scroll inside an app window. dy>0 scrolls down, dx>0 right (wheel steps).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"}},"required":["window"]}},
     \\{"name":"app_resize","description":"Ask an app window to redraw at a new size (deterministic screenshots).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["window","w","h"]}},
     \\{"name":"app_wait","description":"Wait until an app stopped producing new frames for quiet_ms (render quiescence). Returns the window list.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"app_a11y_tree","description":"Read the app's accessibility (AT-SPI) tree as JSON: every widget's role, name, description, states and screen rectangle. Target elements by name/role instead of pixel-hunting a screenshot. Works for GTK/Qt apps; empty for apps without accessibility (games, some Electron).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"app_record_start","description":"Start recording a window's frames into an animated GIF (a visual log of what you do). Frames are captured while other app tools run; finish with app_record_stop.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"max_px":{"type":"integer","description":"Bound on the longest dimension (default 800)"}}}},
     \\{"name":"app_record_stop","description":"Stop the recording and save the GIF. Returns the file path and frame count.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"path":{"type":"string","description":"Output .gif path (default under /tmp)"}}}},
     \\{"name":"close_app_window","description":"Ask the app to close one window (like the titlebar button; the app decides).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"}},"required":["window"]}},
@@ -738,6 +739,22 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         const settled = app.waitIdle(quiet_ms, timeout_ms);
         const summary = try appSummary(arena, app);
         const msg = try std.fmt.allocPrint(arena, "{s}\n{s}", .{ if (settled) "settled" else "timeout: still rendering", summary });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_a11y_tree")) {
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 5_000;
+        const tree = app.a11yTree(timeout_ms) catch |err| return appErr(arena, switch (err) {
+            appdrive.Error.Timeout => "timed out reading the accessibility tree",
+            else => "accessibility read failed",
+        });
+        defer app_state.allocator.free(tree);
+        const copy = try arena.dupe(u8, tree);
+        // Prepend the AT-SPI role legend so the assistant can read
+        // numeric roles without a lookup.
+        const msg = try std.fmt.allocPrint(arena,
+            \\AT-SPI tree. Roles (common): 8 checkbox, 14 dialog/frame, 18 filler, 25 label, 28 menu, 29 menubar, 30 menuitem, 34 canvas, 35 page-tab, 37 panel, 42 push-button, 43 radiobutton, 44 root/desktop, 46 scrollbar, 60 table, 62 text, 71 toolbar, 74 tree, 75 application, 84 entry. Coordinates in "rect":[x,y,w,h] are screen pixels; for app_click use surface-local (subtract the window origin from a screenshot).
+            \\{s}
+        , .{copy});
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_record_start")) {
