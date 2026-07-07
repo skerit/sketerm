@@ -277,6 +277,9 @@ pub const Window = struct {
     /// after the tab has stayed selected for `tab_ack_delay_secs`).
     ack_timer_id: c.guint = 0,
     ack_timer_page: ?*c.AdwTabPage = null,
+    /// Most recent page created via appendOrInsertTab — the tab
+    /// overview's create-tab callback returns it.
+    last_created_page: ?*c.AdwTabPage = null,
     /// The currently-selected page, tracked so a selection change can anchor
     /// the silence countdown on the tab being LEFT (the inactive-warning
     /// measures quiet from when you walk away). null before the first select.
@@ -373,7 +376,22 @@ pub const Window = struct {
         c.gtk_box_append(@ptrCast(search_bar), close_btn);
         c.adw_toolbar_view_add_bottom_bar(@ptrCast(toolbar_view), search_bar);
 
-        c.adw_application_window_set_content(@ptrCast(app_window), toolbar_view);
+        // Tab overview: a grid of live thumbnails of every tab's pane
+        // (AdwTabOverview snapshots each page child on open — the GL
+        // panes render via the same paintable path as screenshots).
+        // Wraps the whole toolbar view; a tab-count button in the
+        // header toggles it, and its "+" creates a tab.
+        const overview = c.adw_tab_overview_new();
+        c.adw_tab_overview_set_view(@ptrCast(overview), @ptrCast(tab_view_w));
+        c.adw_tab_overview_set_child(@ptrCast(overview), toolbar_view);
+        c.adw_tab_overview_set_enable_new_tab(@ptrCast(overview), 1);
+        _ = c.g_signal_connect_data(overview, "create-tab", @ptrCast(&onOverviewCreateTab), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        const tab_btn = c.adw_tab_button_new();
+        c.adw_tab_button_set_view(@ptrCast(tab_btn), @ptrCast(tab_view_w));
+        c.gtk_widget_set_tooltip_text(tab_btn, "Tab Overview");
+        c.gtk_actionable_set_action_name(@ptrCast(tab_btn), "overview.open");
+        c.adw_header_bar_pack_end(@ptrCast(header_bar), tab_btn);
+        c.adw_application_window_set_content(@ptrCast(app_window), overview);
 
         // Double-click on the tab bar → rename the selected tab.
         // AdwTabBar handles single-click selection internally, so
@@ -3461,7 +3479,20 @@ pub const Window = struct {
         c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-id", @ptrFromInt(self.next_tab_id));
         self.next_tab_id += 1;
         self.attachTabTree(page, tree_root);
+        self.last_created_page = page;
         return page;
+    }
+
+    /// AdwTabOverview "create-tab": the "+" tile in the overview.
+    /// Must return the new page so the overview can select it.
+    fn onOverviewCreateTab(_: *c.AdwTabOverview, user: ?*anyopaque) callconv(.c) ?*c.AdwTabPage {
+        const self = cast.userData(Window, user);
+        self.last_created_page = null;
+        self.newShellTab(null) catch |err| {
+            logActionError("overview_create_tab", err);
+            return null;
+        };
+        return self.last_created_page;
     }
 
     /// Attach the pane-tree model to a tab page. Best-effort on OOM
