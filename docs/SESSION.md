@@ -6266,3 +6266,38 @@ driving interactive `cat` (send_text then ctrl+c via send_keys),
 split_pane + run_command in the new pane. Gotcha found in testing:
 the tools/list JSON was a Zig multiline literal whose embedded
 newlines broke NDJSON framing — stripped at comptime now.
+
+## Feature: compact context menu with hover submenus + link actions
+
+The right-click menu shrank from ~24 always-visible rows to ~12 by
+grouping rarely-used actions under hover submenus (classic nested
+menus, not slide-in pages): "Copy More" (Copy Screen / Scrollback /
+Command Output), "Pane" (Zoom, Set Title, Apply Profile, Close),
+"Shader" (Pick / Preset / Configure / Clear), "Tab" (all seven tab
+actions), and "Session" (the remote-only upload/download/detach/
+rename/kill rows — the whole submenu hides on non-mux panes). Copy,
+Paste, both Splits, Reset and Preferences stay top-level.
+
+menu.zig now declares the layout as a comptime `MENU` tree (binds,
+submenus, separators); the flat action list is derived from it, so
+adding a row is one entry. Submenus are nested GtkPopovers parented
+to their row button, `autohide=false` (the main popover keeps the
+grab), popped up on row hover and popped down when the pointer
+enters a sibling row / the main menu closes. Teardown unparents the
+sub-popovers before the main one (same GTK4 finalize-warning rule).
+
+Right-clicking a link now shows "Open Link" / "Copy Link" at the
+top of the menu (hidden entirely when the click isn't on a link),
+and both work for auto-detected URLs as well as OSC 8 hyperlinks —
+previously the menu only recognised OSC 8, and there was no open
+action at all. The hover tooltip gained a "Ctrl+click to open" hint
+when `link_single_click` is off, since the pointer cursor otherwise
+suggests a plain click would work. Link launches now log a warning
+on failure instead of swallowing the GError.
+
+Verified on an isolated Xvfb instance: submenu hover open/close and
+sibling switching, submenu item activation (New Tab via the Tab
+submenu), Open Link end-to-end against a fake x-scheme-handler
+(both auto-detected and OSC 8 URIs land in the handler), Copy Link
+via clipboard paste-back, Ctrl+click opens exactly once, and
+`smoke-e2e` passes with `G_DEBUG=fatal-criticals`.
