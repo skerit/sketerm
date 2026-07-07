@@ -101,7 +101,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // Spawn an app-kind session on the host's daemon and hand it to
     // the running GUI, whose compositor brain renders the windows.
     // Null = no GUI to render into.
-    if (runNativeApp(allocator, host, parsed.command, use_udp, port_range, parsed.isolated)) |code| return code;
+    if (runNativeApp(allocator, host, parsed.command, use_udp, port_range, parsed.isolated, cfg.app_keyboard_layout)) |code| return code;
     errMsg("no sketerm window is open on this desktop to render the app — open one and retry", .{});
     return 1;
 }
@@ -118,6 +118,7 @@ fn runNativeApp(
     use_udp: bool,
     port_range: ?[]const u8,
     isolated: bool,
+    kb_layout: []const u8,
 ) ?u8 {
     const ipc_client = @import("ipc/client.zig");
     const gui_sock = ipc_client.resolveSocket(allocator, null) orelse return null;
@@ -147,6 +148,7 @@ fn runNativeApp(
         .cols = @as(u16, 80),
         .app = true,
         .isolated = isolated,
+        .kb_layout = kb_layout,
     }) catch return 1;
     const ok = conn.recvExpect(&.{.ok}) catch {
         errMsg("daemon on {s} refused the app session", .{host});

@@ -3781,6 +3781,7 @@ pub const Window = struct {
                 .cwd = if (host != null) null else self.focusedPaneCwd(),
                 .rows = @as(u16, 24),
                 .cols = @as(u16, 80),
+                .kb_layout = self.config.app_keyboard_layout,
             });
             (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
         }
@@ -3807,6 +3808,7 @@ pub const Window = struct {
                 .rows = @as(u16, 24),
                 .cols = @as(u16, 80),
                 .app = true,
+                .kb_layout = self.config.app_keyboard_layout,
             });
             (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
         }
@@ -3897,6 +3899,7 @@ pub const Window = struct {
                     .cwd = if (host != null or spec.cwd.len == 0) null else spec.cwd,
                     .rows = @as(u16, 24),
                     .cols = @as(u16, 80),
+                    .kb_layout = self.config.app_keyboard_layout,
                 });
                 (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
                 try conn.sendJson(.attach, .{ .name = spec.mux_session });

@@ -27,9 +27,9 @@ const pixcodec = @import("pixcodec.zig");
 const vcodec = @import("vcodec.zig");
 const build_options = @import("build_options");
 
-/// Fixed pc105/us xkb keymap (scope pin: layouts come later).
-/// Generated: `xkbcli compile-keymap --layout us --model pc105`.
-pub const us_keymap = @embedFile("us_keymap.txt");
+/// Default pc105/us xkb keymap; alternatives in keymaps.zig, chosen
+/// per session via the spawn `kb_layout` option (Compositor.keymap).
+pub const us_keymap = @import("keymaps.zig").us;
 
 fn removeId(list: *std.ArrayList(u32), id: u32) void {
     for (list.items, 0..) |v, i| {
@@ -345,6 +345,9 @@ pub const Compositor = struct {
     /// brain is authoritative and its server-created object ids are
     /// invisible to replicas. Never set on the brain itself.
     lenient: bool = false,
+    /// Compiled xkb keymap announced to the app's keyboards. Must
+    /// match whoever drives the seat (see keymaps.zig).
+    keymap: []const u8 = us_keymap,
 
     pub fn init(allocator: std.mem.Allocator, view: View) Error!Compositor {
         var self = Compositor{ .allocator = allocator, .view = view };
@@ -947,7 +950,7 @@ pub const Compositor = struct {
                 std.mem.writeInt(u32, meta[0..4], id, .little);
                 std.mem.writeInt(u32, meta[4..8], 1, .little); // xkb_v1
                 try payload.appendSlice(self.allocator, &meta);
-                try payload.appendSlice(self.allocator, us_keymap);
+                try payload.appendSlice(self.allocator, self.keymap);
                 try pipe.appendUnit(&self.out, self.allocator, .keymap, payload.items);
                 if (self.seat_version >= 4) {
                     var rbuf: [16]u8 = undefined;

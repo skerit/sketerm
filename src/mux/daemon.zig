@@ -20,6 +20,7 @@ const wlproto = @import("../wlhost/protocol.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
 const wlpixcodec = @import("../wlhost/pixcodec.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
+const wlkeymaps = @import("../wlhost/keymaps.zig");
 const build_options = @import("build_options");
 const wlvcodec = @import("../wlhost/vcodec.zig");
 const churnmod = @import("../util/churn.zig");
@@ -87,6 +88,9 @@ pub const SpawnReq = struct {
     /// the same environment an in-process pane would.
     term: []const u8 = "",
     color_term: []const u8 = "",
+    /// xkb layout for forwarded-app keyboards (wlhost/keymaps.zig
+    /// names; "" = us). Must match whoever drives the seat.
+    kb_layout: []const u8 = "",
     /// Spawn argv[0] as a login shell (leading `-`).
     login_shell: bool = false,
     /// GUI-owned LOCAL session sharing the user's desktop: skip the
@@ -158,6 +162,9 @@ const Session = struct {
     exit_status: i32 = 0,
     /// Spawned via `sketerm app -u` — a forwarded GUI app, not a shell.
     app: bool = false,
+    /// Compiled xkb keymap for this session's app keyboards (points
+    /// at an embedded wlhost/keymaps.zig blob; never freed).
+    kb_keymap: []const u8 = wlcomp.us_keymap,
     /// Wayland app forwarding: the daemon IS the Wayland display —
     /// wl_hub_fd listens on the session's display socket itself, sets
     /// the shell's $WAYLAND_DISPLAY, and each app connection is parsed
@@ -1890,6 +1897,7 @@ pub const Daemon = struct {
             _ = c.close(fd);
             return;
         };
+        brain.keymap = s.kb_keymap;
         native.* = .{ .allocator = self.allocator, .tracker = tracker, .brain = brain };
 
         const ch = self.allocator.create(Channel) catch {
@@ -2979,6 +2987,10 @@ pub const Daemon = struct {
             .pool = pool,
             .screen = screen,
             .app = req.app,
+            .kb_keymap = wlkeymaps.get(req.kb_layout) orelse blk: {
+                std.debug.print("sketerm-mux: unknown kb_layout '{s}' (have: {s}) — using us\n", .{ req.kb_layout, wlkeymaps.names });
+                break :blk wlcomp.us_keymap;
+            },
             .last_activity_ms = nowMs(),
         };
         if (hub) |h| {
