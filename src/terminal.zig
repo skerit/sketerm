@@ -132,6 +132,11 @@ pub const Terminal = struct {
     peer_drivers: u32 = 0,
     /// Fired when the attach roster changes.
     on_peers: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// Fired when this session's primary app host changes: non-null
+    /// (an `*wlapp.AppHost`, erased to keep this header GTK-light)
+    /// when app windows exist, null when the last one closed. The
+    /// pane uses it to swap in a live app view.
+    on_app_view: ?*const fn (ctx: ?*anyopaque, host: ?*anyopaque) void = null,
 
     /// Optional broadcast-typing filter. When set, every byte from
     /// USER input (keystrokes, paste, hyperlink launch) goes through
@@ -1196,6 +1201,7 @@ pub const Terminal = struct {
         host.on_flush = nappFlushCb;
         host.flush_ctx = na;
         host.setDriven(self.peer_drivers > 0);
+        if (self.on_app_view) |f| f(self.user_ctx, @ptrCast(remote.napps.items[0].host));
         remote.napps.append(self.allocator, na) catch {
             host.destroy();
             self.allocator.destroy(na);
@@ -1245,6 +1251,12 @@ pub const Terminal = struct {
                     _ = remote.napps.swapRemove(i);
                     break;
                 }
+            }
+            if (self.on_app_view) |f| {
+                f(self.user_ctx, if (remote.napps.items.len > 0)
+                    @ptrCast(remote.napps.items[0].host)
+                else
+                    null);
             }
         }
         self.allocator.destroy(na);

@@ -40,6 +40,10 @@ pub const AppHost = struct {
     on_flush: ?*const fn (ctx: ?*anyopaque) void = null,
     /// A headless MCP client is attached (drives the badge).
     driven: bool = false,
+    /// Pane-owned picture mirroring the primary toplevel (app view
+    /// in the tab + live overview thumbnail). Not owned here.
+    mirror: ?*c.GtkWidget = null,
+    mirror_surface: u32 = 0,
     flush_ctx: ?*anyopaque = null,
     /// Outgoing seat-intent units (proto v5). The local compositor
     /// is a passive replica whose protocol output is discarded — the
@@ -632,6 +636,26 @@ pub const AppHost = struct {
             rw.newTexture(w, h, format, pixels)) orelse return;
         defer c.g_object_unref(tex);
         c.gtk_picture_set_paintable(@ptrCast(win.picture), @ptrCast(tex));
+        // Mirror the primary toplevel into the pane's app view (tab
+        // content + live overview thumbnail). Texture is refcounted;
+        // both pictures share it.
+        if (self.mirror) |m| {
+            if (self.mirror_surface == 0) self.mirror_surface = surface;
+            if (self.mirror_surface == surface)
+                c.gtk_picture_set_paintable(@ptrCast(m), @ptrCast(tex));
+        }
+    }
+
+    /// Point the pane-side mirror picture at this host (null detaches).
+    pub fn setMirror(self: *AppHost, pic: ?*c.GtkWidget) void {
+        self.mirror = pic;
+        self.mirror_surface = 0;
+    }
+
+    /// Raise every window of this app (mirror click).
+    pub fn presentAll(self: *AppHost) void {
+        var it = self.windows.valueIterator();
+        while (it.next()) |w| c.gtk_window_present(w.*.window);
     }
 
     fn onPopupDraw(_: ?*c.GtkDrawingArea, cr: ?*c.cairo_t, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
@@ -829,6 +853,7 @@ pub const AppHost = struct {
         const self = cast.userData(AppHost, ctx);
         const win = self.windows.get(surface) orelse return;
         _ = self.windows.remove(surface);
+        if (self.mirror_surface == surface) self.mirror_surface = 0;
         win.cancelOpaqueResize();
         _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-wlapp", null);
         c.gtk_window_destroy(win.window);

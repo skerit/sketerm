@@ -243,6 +243,14 @@ pub const Pane = struct {
     /// a Window-level GtkCssProvider that supplies the actual rgba
     /// values from Config.title_*_*.
     wrapper_box: ?*c.GtkWidget = null,
+    /// The GraphicsOffload wrapping the GLArea — hidden while an app
+    /// view (mirror of the session's forwarded windows) is shown.
+    offload_widget: ?*c.GtkWidget = null,
+    /// Live mirror of the session's primary app window: the tab
+    /// content for app sessions, and thus the overview thumbnail.
+    /// Click raises the floating windows.
+    app_mirror: ?*c.GtkWidget = null,
+    app_mirror_host: ?*anyopaque = null,
     titlebar_box: ?*c.GtkWidget = null,
     titlebar_label: ?*c.GtkLabel = null,
     titlebar_visible: bool = false,
@@ -383,6 +391,7 @@ pub const Pane = struct {
             .menu_arena = std.heap.ArenaAllocator.init(allocator),
             .allocator = allocator,
             .wrapper_box = wrap,
+            .offload_widget = offload,
             .titlebar_box = tb_box,
             .titlebar_label = @ptrCast(@alignCast(tb_label_w)),
         };
@@ -408,6 +417,7 @@ pub const Pane = struct {
         terminal.on_set_profile = onSetProfileEvent;
         terminal.on_session_renamed = onSessionRenamedEvent;
         terminal.on_peers = onPeersChanged;
+        terminal.on_app_view = onAppViewEvent;
 
         _ = c.g_signal_connect_data(
             area_widget,
@@ -1690,6 +1700,48 @@ fn onNotificationEvent(ctx: ?*anyopaque, ev: Screen.NotificationEvent) void {
 fn onSessionRenamedEvent(ctx: ?*anyopaque, name: []const u8) void {
     const self = cast.userData(Pane, ctx);
     if (self.win_on_session_renamed) |f| f(self.win_session_rename_ctx, self, name);
+}
+
+/// The session's primary app host changed. For app sessions the
+/// pane swaps the terminal for a live mirror of the app's primary
+/// window — so the tab (and its overview thumbnail) SHOWS the app.
+/// Null host = last app window gone: the terminal (app log) returns.
+fn onAppViewEvent(ctx: ?*anyopaque, host_opaque: ?*anyopaque) void {
+    const self = cast.userData(Pane, ctx);
+    const AppHost = @import("../wlapp.zig").AppHost;
+    const is_app = if (self.terminal.remote) |r| r.is_app else false;
+    if (!is_app) return; // shells keep their terminal front and center
+    const old: ?*AppHost = @ptrCast(@alignCast(self.app_mirror_host));
+    const new: ?*AppHost = @ptrCast(@alignCast(host_opaque));
+    if (old == new) return;
+    if (old) |h| h.setMirror(null);
+    self.app_mirror_host = host_opaque;
+    if (new) |h| {
+        if (self.app_mirror == null) {
+            const pic = c.gtk_picture_new();
+            c.gtk_picture_set_content_fit(@ptrCast(pic), c.GTK_CONTENT_FIT_CONTAIN);
+            c.gtk_widget_set_vexpand(pic, 1);
+            c.gtk_widget_set_hexpand(pic, 1);
+            c.gtk_widget_set_tooltip_text(pic, "Live app view — click to raise the app's windows");
+            const click = c.gtk_gesture_click_new();
+            _ = c.g_signal_connect_data(@ptrCast(click), "released", @ptrCast(&onMirrorClick), @ptrCast(self), null, 0);
+            c.gtk_widget_add_controller(pic, @ptrCast(click));
+            if (self.wrapper_box) |wrap| c.gtk_box_append(@ptrCast(wrap), pic);
+            self.app_mirror = pic;
+        }
+        h.setMirror(self.app_mirror);
+        c.gtk_widget_set_visible(self.app_mirror.?, 1);
+        if (self.offload_widget) |o| c.gtk_widget_set_visible(o, 0);
+    } else {
+        if (self.app_mirror) |pic| c.gtk_widget_set_visible(pic, 0);
+        if (self.offload_widget) |o| c.gtk_widget_set_visible(o, 1);
+    }
+}
+
+fn onMirrorClick(_: ?*c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Pane, user);
+    const remote = self.terminal.remote orelse return;
+    for (remote.napps.items) |na| na.host.presentAll();
 }
 
 /// Attach roster changed: show/hide the "assistant is driving"
