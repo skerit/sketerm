@@ -6301,3 +6301,81 @@ submenu), Open Link end-to-end against a fake x-scheme-handler
 (both auto-detected and OSC 8 URIs land in the handler), Copy Link
 via clipboard paste-back, Ctrl+click opens exactly once, and
 `smoke-e2e` passes with `G_DEBUG=fatal-criticals`.
+
+## Feature: headless GUI-app driving, durable apps, multi-viewer, screenshots, remote launcher, tab thumbnails
+
+A large batch turning sketerm into a platform for running and driving
+GUI apps (for assistants and users alike). Six shipped features on one
+architectural change.
+
+**Daemon-hosted Wayland brain (proto v4 -> v5).** The authoritative
+`wlhost/compositor.zig` moved from the GUI into the daemon: one brain
+per forwarded app connection (`Native.brain` in `mux/daemon.zig`).
+GUI panes became passive REPLICAS that render the broadcast request +
+pool stream and drive input via new seat-intent pipe units
+(`wlhost/pipe.zig` `seat_*`/`configure`/`state_sync`/... tags,
+append-only). Consequences, all new: forwarded apps run with ZERO
+clients attached (headless), survive a viewer crash (durable GUI
+apps), and a reattach replays pool bytes + a serialized brain state
+(`serializeState`/`restoreState`) so windows reappear with current
+pixels. Native channels are session-owned and broadcast to every
+attached proto>=5 client (multi-viewer fan-out; shared seat). Raw
+`wl_msg` from a viewer is rejected (the brain is the sole driver).
+`smoke-mux` gained stages proving headless answer, replay-with-pixels,
+viewer-crash durability, and two-viewer fan-out against the real
+daemon.
+
+**PNG encoder** (`util/png.zig`, vendored `stb_image_write.h`):
+`encodeRgba` + wl_shm BGRA/stride/premultiply-aware `encodeShm`.
+
+**Headless MCP app driving** (`sketerm mcp`, `ipc/appdrive.zig`,
+`ipc/evkeys.zig`): 13 tools -- launch_app, list_installed_apps,
+screenshot_app (inline PNG image content), app_click/type/key/scroll/
+resize, app_wait, close_app... A proto-v5 mux client spawns app
+sessions, renders them in in-memory replica compositors (no display
+anywhere), and injects seat intents. `evkeys.zig` is the pure
+char/chord->evdev encoder (us layout, table ported from kwin-mcp,
+MIT). The GUI socket is now optional -- app tools work standalone.
+`screenshot_pane` MCP tool + terminal `read_screen` unchanged.
+
+**User screenshots** (`Pane.screenshotPng` via widget-paintable ->
+GSK texture -> PNG): "Screenshot Pane..." in the Pane submenu,
+`sketerm cli screenshot --out FILE`, and the MCP `screenshot_pane`
+tool. New `screenshot` IPC command.
+
+**Remote app launcher**: the daemon scans its host's .desktop entries
+(`mux/desktop.zig`, musl-clean) and answers a new `app_list` wire
+request, so a client sees the REMOTE's installed apps. "Launch App..."
+in the Session submenu opens a searchable icon list
+(`ui/app_launcher.zig`); picking one spawns it as an `app=true`
+session on that host (`Window.launchRemoteAppSession`) and renders it.
+Same path backs the MCP `list_installed_apps` tool.
+
+**Tab overview with live thumbnails**: the toolbar view is wrapped in
+an `AdwTabOverview` with a header tab-count button; opening it shows a
+grid of live per-tab pane thumbnails (GTK snapshots each GtkGLArea via
+the same paintable path as screenshots), with search, per-tab close,
+and a New Tab tile.
+
+Verified: full suite 642/647 (5 skip, +9 new tests); mux +
+mux-portable build (daemon stays libc-only); `smoke-mux` PASS;
+`smoke-e2e` PASS under `G_DEBUG=fatal-criticals`; and on isolated
+invisible Xvfb instances -- gnome-calculator launched headless via
+MCP, screenshotted, "12+34=" typed -> 46; a GUI viewer rendering the
+same assistant-driven app; the app surviving a hard GUI kill; the
+remote launcher listing 428 local apps, filtering, and rendering a
+launched calculator in-window; the pane-screenshot CLI; and the tab
+overview showing two distinct live thumbnails.
+
+**Not shipped: AT-SPI accessibility tree for forwarded apps.** The
+one planned piece deferred. A spike (isolated `dbus-run-session` +
+`at-spi-bus-launcher` + gnome-calculator, read back via libatspi/
+pyatspi) returned `desktop children: -1` -- the a11y registry was not
+cleanly reachable from a separate client, the dbus-broker-vs-daemon
+isolation gotcha the prior research flagged. libatspi 2.60 is present
+to link, but delivering a *proven-correct* reader needs (a) a design
+decision -- local libatspi vs a deployed remote reader binary, which
+affects the single-static-binary story for SSH remotes -- and (b)
+environment-specific validation against a real a11y bus that the
+sandbox can't provide safely. Left for a focused follow-up rather than
+shipped half-validated.
