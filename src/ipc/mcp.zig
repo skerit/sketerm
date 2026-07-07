@@ -334,6 +334,8 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_scroll","description":"Scroll inside an app window. dy>0 scrolls down, dx>0 right (wheel steps).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"}},"required":["window"]}},
     \\{"name":"app_resize","description":"Ask an app window to redraw at a new size (deterministic screenshots).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["window","w","h"]}},
     \\{"name":"app_wait","description":"Wait until an app stopped producing new frames for quiet_ms (render quiescence). Returns the window list.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"app_record_start","description":"Start recording a window's frames into an animated GIF (a visual log of what you do). Frames are captured while other app tools run; finish with app_record_stop.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"max_px":{"type":"integer","description":"Bound on the longest dimension (default 800)"}}}},
+    \\{"name":"app_record_stop","description":"Stop the recording and save the GIF. Returns the file path and frame count.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"path":{"type":"string","description":"Output .gif path (default under /tmp)"}}}},
     \\{"name":"close_app_window","description":"Ask the app to close one window (like the titlebar button; the app decides).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"}},"required":["window"]}},
     \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}}
     \\]
@@ -736,6 +738,41 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         const settled = app.waitIdle(quiet_ms, timeout_ms);
         const summary = try appSummary(arena, app);
         const msg = try std.fmt.allocPrint(arena, "{s}\n{s}", .{ if (settled) "settled" else "timeout: still rendering", summary });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_record_start")) {
+        var win_id: u32 = 0;
+        if (argInt(args, "window")) |v| {
+            win_id = @intCast(v);
+        } else {
+            for (app.windows.items) |win| {
+                if (!win.popup and win.frames > 0) {
+                    win_id = win.id;
+                    break;
+                }
+            }
+        }
+        if (win_id == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 800, 0, 4096));
+        app.recordStart(win_id, max_px) catch return appErr(arena, "no such window");
+        return toolResult(arena, "recording — frames are captured while other app tools run (click/type/wait); call app_record_stop to finish", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_record_stop")) {
+        const result = app.recordStop() catch |err| return appErr(arena, switch (err) {
+            appdrive.Error.NotRecording => "no recording in progress (app_record_start first)",
+            else => "recording produced no frames",
+        });
+        defer app_state.allocator.free(result.gif);
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+        const path = argStr(args, "path") orelse
+            try std.fmt.allocPrint(arena, "/tmp/sketerm-rec-{d}-{d}.gif", .{ c.getpid(), ts.tv_sec });
+        const path_z = try std.fmt.allocPrint(arena, "{s}\x00", .{path});
+        const f = c.fopen(path_z.ptr, "wb") orelse return appErr(arena, "cannot write the output path");
+        const wr = c.fwrite(result.gif.ptr, 1, result.gif.len, f);
+        _ = c.fclose(f);
+        if (wr != result.gif.len) return appErr(arena, "short write saving the recording");
+        const msg = try std.fmt.allocPrint(arena, "saved {d} frames ({d} KiB) to {s}", .{ result.frames, result.gif.len / 1024, path });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "close_app_window")) {

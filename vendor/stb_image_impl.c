@@ -8,3 +8,6 @@
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+
+#define MSF_GIF_IMPL
+#include "msf_gif.h"

@@ -14,6 +14,7 @@ comptime {
     _ = @import("util/humantype.zig");
     _ = @import("util/platform.zig");
     _ = @import("util/png.zig");
+    _ = @import("util/gifrec.zig");
     _ = @import("util/churn.zig");
     _ = @import("util/content.zig");
     _ = @import("util/yuv.zig");
