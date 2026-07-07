@@ -39,6 +39,7 @@ pub const Action = enum {
     mux_rename,
     mux_kill,
     reset_terminal,
+    screenshot_pane,
     open_link,
     copy_link,
     prefs_open,
@@ -117,6 +118,7 @@ const MENU = [_]Item{
         .{ .name = "zoom-pane", .label = "Zoom / Unzoom Pane", .detailed = "term.zoom-pane", .icon = "view-fullscreen-symbolic", .action = .zoom_pane },
         .{ .name = "set-pane-title", .label = "Set Pane Title…", .detailed = "term.set-pane-title", .icon = "document-edit-symbolic", .action = .set_pane_title },
         .{ .name = "apply-profile", .label = "Apply Profile to Pane…", .detailed = "term.apply-profile", .icon = "preferences-other-symbolic", .action = .apply_profile },
+        .{ .name = "screenshot-pane", .label = "Screenshot Pane…", .detailed = "term.screenshot-pane", .icon = "camera-photo-symbolic", .action = .screenshot_pane },
         .{ .name = "close-pane", .label = "Close Pane", .detailed = "term.close-pane", .icon = "window-close-symbolic", .action = .close_pane },
     } } },
     .{ .submenu = .{ .label = "Shader", .icon = "sketerm-rendering-symbolic", .items = &.{

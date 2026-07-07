@@ -30,6 +30,7 @@ const CLI_HELP =
     \\                                    --scrollback dumps the ring too
     \\  screen-info [--pane N]            cursor pos, size, alt-screen
     \\                                    flag, activity seq (JSON)
+    \\  screenshot [--pane N] --out FILE  save a PNG of the pane as shown
     \\  new-tab [--cwd DIR] [--title T]   open a shell tab
     \\  split [--pane N] [--dir h|v]      split a pane (h = side by side)
     \\  focus (--pane N | --tab N)        focus a pane or select a tab
@@ -118,6 +119,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, a, "--dir") and i + 1 < args.len) {
             i += 1;
             req.direction = args[i];
+        } else if (std.mem.eql(u8, a, "--out") and i + 1 < args.len) {
+            i += 1;
+            req.data = args[i]; // screenshot output path
         } else if (std.mem.eql(u8, a, "--paste")) {
             req.paste = true;
         } else if (std.mem.eql(u8, a, "--delay") and i + 1 < args.len) {

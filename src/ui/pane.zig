@@ -789,6 +789,39 @@ pub const Pane = struct {
         return @ptrCast(self.area);
     }
 
+    /// Render the pane's current pixels to a PNG (owned GBytes) via a
+    /// GtkWidgetPaintable → texture → PNG round-trip, capturing the
+    /// live GL content exactly as shown. Null if unrealized or the
+    /// GSK renderer isn't available (widget not mapped yet).
+    pub fn screenshotPng(self: *Pane) ?*c.GBytes {
+        const w: *c.GtkWidget = @ptrCast(self.area);
+        const width = c.gtk_widget_get_width(w);
+        const height = c.gtk_widget_get_height(w);
+        if (width <= 0 or height <= 0) return null;
+        const native = c.gtk_widget_get_native(w) orelse return null;
+        const renderer = c.gtk_native_get_renderer(native) orelse return null;
+
+        const paintable = c.gtk_widget_paintable_new(w) orelse return null;
+        defer c.g_object_unref(paintable);
+        const snapshot = c.gtk_snapshot_new();
+        c.gdk_paintable_snapshot(
+            @ptrCast(paintable),
+            @ptrCast(snapshot),
+            @floatFromInt(width),
+            @floatFromInt(height),
+        );
+        const node = c.gtk_snapshot_free_to_node(snapshot) orelse return null;
+        defer c.gsk_render_node_unref(node);
+
+        var bounds = c.graphene_rect_t{
+            .origin = .{ .x = 0, .y = 0 },
+            .size = .{ .width = @floatFromInt(width), .height = @floatFromInt(height) },
+        };
+        const texture = c.gsk_renderer_render_texture(renderer, node, &bounds) orelse return null;
+        defer c.g_object_unref(texture);
+        return c.gdk_texture_save_to_png_bytes(texture);
+    }
+
     /// Build an Atlas at the pane's current size. Resolution order:
     /// explicit file path → family name via fontconfig → $SKETERM_FONT
     /// → built-in candidate list. Returns null when nothing loads.
