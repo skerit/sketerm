@@ -164,6 +164,8 @@ pub const AppHost = struct {
         /// "AI" corner badge, shown while a headless MCP client is
         /// attached to the session (assistant-is-driving indicator).
         badge: ?*c.GtkWidget = null,
+        /// Active GIF recording of this window (host menu).
+        rec: ?@import("util/gifrec.zig").Rec = null,
         /// Last host-edge band the pointer was in (Wayland edge mask,
         /// 0 = interior). Drives the resize cursor and gates whether a
         /// press starts a host-window resize vs. goes to the app.
@@ -185,6 +187,10 @@ pub const AppHost = struct {
             c.gtk_button_set_has_frame(@ptrCast(shot), 0);
             _ = c.g_signal_connect_data(@ptrCast(shot), "clicked", @ptrCast(&onMenuScreenshot), self, null, 0);
             c.gtk_box_append(@ptrCast(box), shot);
+            const rec_btn = c.gtk_button_new_with_label(if (self.rec != null) "Stop Recording…" else "Record Window (GIF)");
+            c.gtk_button_set_has_frame(@ptrCast(rec_btn), 0);
+            _ = c.g_signal_connect_data(@ptrCast(rec_btn), "clicked", @ptrCast(&onMenuRecord), self, null, 0);
+            c.gtk_box_append(@ptrCast(box), rec_btn);
             const close_btn = c.gtk_button_new_with_label("Close Window");
             c.gtk_button_set_has_frame(@ptrCast(close_btn), 0);
             _ = c.g_signal_connect_data(@ptrCast(close_btn), "clicked", @ptrCast(&onMenuClose), self, null, 0);
@@ -235,6 +241,32 @@ pub const AppHost = struct {
                 null,
                 null,
             );
+        }
+
+        fn recNowMs() i64 {
+            return @divTrunc(c.g_get_monotonic_time(), 1000);
+        }
+
+        /// Toggle GIF recording of this window's committed frames.
+        fn onMenuRecord(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+            const win = cast.userData(Win, user);
+            popdownFrom(btn);
+            const gifrec = @import("util/gifrec.zig");
+            if (win.rec) |*r| {
+                const gif = r.finish(recNowMs()) catch {
+                    win.rec = null;
+                    return;
+                };
+                win.rec = null;
+                const bytes = c.g_bytes_new(gif.ptr, gif.len);
+                win.host.allocator.free(gif);
+                const dialog = c.gtk_file_dialog_new();
+                c.gtk_file_dialog_set_title(dialog, "Save Recording");
+                c.gtk_file_dialog_set_initial_name(dialog, "sketerm-recording.gif");
+                c.gtk_file_dialog_save(dialog, win.window, null, @ptrCast(&onShotPicked), bytes);
+                return;
+            }
+            win.rec = gifrec.Rec.init(win.host.allocator, 0);
         }
 
         fn onMenuClose(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -636,6 +668,9 @@ pub const AppHost = struct {
             rw.newTexture(w, h, format, pixels)) orelse return;
         defer c.g_object_unref(tex);
         c.gtk_picture_set_paintable(@ptrCast(win.picture), @ptrCast(tex));
+        if (win.rec) |*r| {
+            r.addShmFrame(pixels, @intCast(w), @intCast(h), format, Win.recNowMs()) catch {};
+        }
         // Mirror the primary toplevel into the pane's app view (tab
         // content + live overview thumbnail). Texture is refcounted;
         // both pictures share it.
@@ -854,6 +889,7 @@ pub const AppHost = struct {
         const win = self.windows.get(surface) orelse return;
         _ = self.windows.remove(surface);
         if (self.mirror_surface == surface) self.mirror_surface = 0;
+        if (win.rec) |*r| r.abort();
         win.cancelOpaqueResize();
         _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-wlapp", null);
         c.gtk_window_destroy(win.window);
