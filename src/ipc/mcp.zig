@@ -556,8 +556,8 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_resize","description":"Ask an app window to redraw at a new size (deterministic screenshots).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["window","w","h"]}},
     \\{"name":"app_wait","description":"Wait until an app stopped producing new frames for quiet_ms (render quiescence). Returns the window list.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"app_a11y_tree","description":"Read the app's accessibility (AT-SPI) tree as JSON: every widget's role, name, description, states and screen rectangle. Target elements by name/role instead of pixel-hunting a screenshot. Works for GTK/Qt apps; empty for apps without accessibility (games, some Electron).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
-    \\{"name":"app_record_start","description":"Start recording a window's frames into an animated GIF (a visual log of what you do). Frames are captured while other app tools run; finish with app_record_stop.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"max_px":{"type":"integer","description":"Bound on the longest dimension (default 800)"}}}},
-    \\{"name":"app_record_stop","description":"Stop the recording and save the GIF. Returns the file path and frame count.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"path":{"type":"string","description":"Output .gif path (default under /tmp)"}}}},
+    \\{"name":"app_record_start","description":"Start recording a window's frames (a visual log of what you do). Default format is WebM/VP9 (smaller, higher quality); pass format:\"gif\" for an animated GIF. Frames are captured while other app tools run; finish with app_record_stop.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"format":{"type":"string","enum":["webm","gif"],"description":"Default webm"},"max_px":{"type":"integer","description":"Bound on the longest dimension (default 1280 webm / 800 gif)"}}}},
+    \\{"name":"app_record_stop","description":"Stop the recording and save it (WebM or GIF per app_record_start). Returns the file path and frame count.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"path":{"type":"string","description":"Output path (extension set automatically if omitted)"}}}},
     \\{"name":"close_app_window","description":"Ask the app to close one window (like the titlebar button; the app decides).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"}},"required":["window"]}},
     \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
     \\{"name":"term_open","description":"Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
@@ -1218,8 +1218,11 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             }
         }
         if (win_id == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
-        const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 800, 0, 4096));
-        app.recordStart(win_id, max_px) catch return appErr(arena, "no such window");
+        // WebM/VP9 is the default (smaller, higher quality); format:"gif"
+        // for the animated GIF.
+        const want_gif = if (argStr(args, "format")) |fmt| std.mem.eql(u8, fmt, "gif") else false;
+        const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse (if (want_gif) @as(i64, 800) else 1280), 0, 4096));
+        app.recordStart(win_id, max_px, !want_gif) catch return appErr(arena, "no such window");
         return toolResult(arena, "recording — frames are captured while other app tools run (click/type/wait); call app_record_stop to finish", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_record_stop")) {
@@ -1227,17 +1230,18 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             appdrive.Error.NotRecording => "no recording in progress (app_record_start first)",
             else => "recording produced no frames",
         });
-        defer app_state.allocator.free(result.gif);
+        defer app_state.allocator.free(result.data);
         var ts: c.struct_timespec = undefined;
         _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+        const ext = if (result.webm) "webm" else "gif";
         const path = argStr(args, "path") orelse
-            try std.fmt.allocPrint(arena, "/tmp/sketerm-rec-{d}-{d}.gif", .{ c.getpid(), ts.tv_sec });
+            try std.fmt.allocPrint(arena, "/tmp/sketerm-rec-{d}-{d}.{s}", .{ c.getpid(), ts.tv_sec, ext });
         const path_z = try std.fmt.allocPrint(arena, "{s}\x00", .{path});
         const f = c.fopen(path_z.ptr, "wb") orelse return appErr(arena, "cannot write the output path");
-        const wr = c.fwrite(result.gif.ptr, 1, result.gif.len, f);
+        const wr = c.fwrite(result.data.ptr, 1, result.data.len, f);
         _ = c.fclose(f);
-        if (wr != result.gif.len) return appErr(arena, "short write saving the recording");
-        const msg = try std.fmt.allocPrint(arena, "saved {d} frames ({d} KiB) to {s}", .{ result.frames, result.gif.len / 1024, path });
+        if (wr != result.data.len) return appErr(arena, "short write saving the recording");
+        const msg = try std.fmt.allocPrint(arena, "saved {d} frames ({d} KiB {s}) to {s}", .{ result.frames, result.data.len / 1024, ext, path });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "close_app_window")) {

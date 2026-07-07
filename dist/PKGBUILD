@@ -9,7 +9,7 @@
 
 pkgname=sketerm-git
 _pkgname=sketerm
-pkgver=0.1.0.r717.g1d298f5
+pkgver=0.1.0.r847.g386a354
 pkgrel=1
 pkgdesc='Native GTK4 terminal emulator written in Zig'
 arch=('x86_64')
@@ -23,6 +23,7 @@ depends=(
     'libepoxy'
     'fribidi'
     'fontconfig'
+    'libvpx'  # VP9/WebM app-window recording (GUI only)
 )
 makedepends=(
     'zig'

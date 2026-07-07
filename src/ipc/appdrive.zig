@@ -12,6 +12,7 @@ const wlpipe = @import("../wlhost/pipe.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
 const png = @import("../util/png.zig");
 const gifrec = @import("../util/gifrec.zig");
+const videorec = @import("../util/videorec.zig");
 const evkeys = @import("evkeys.zig");
 const xkblayout = @import("xkblayout.zig");
 const keymaps = @import("../wlhost/keymaps.zig");
@@ -150,8 +151,10 @@ pub const App = struct {
     /// Parsed session keymap for layout-aware typing (null = the
     /// builtin us tables in evkeys.zig).
     layout: ?xkblayout.Layout = null,
-    /// Active GIF recording of one window's frames (app_record_*).
+    /// Active recording of one window's frames (app_record_*): GIF or
+    /// WebM/VP9. At most one is set at a time.
     rec: ?gifrec.Rec = null,
+    vrec: ?videorec.Rec = null,
     rec_win: u32 = 0,
 
     const ClipOffer = struct { chan: u32, source: u32, mime: []u8 };
@@ -267,6 +270,7 @@ pub const App = struct {
         if (self.paste_data) |p| a.free(p);
         if (self.layout) |*l| l.deinit(a);
         if (self.rec) |*r| r.abort();
+        if (self.vrec) |*r| r.abort();
         a.free(self.name);
         a.destroy(self);
     }
@@ -416,9 +420,10 @@ pub const App = struct {
         win.pixels.appendSlice(ch.app.allocator, pixels) catch {};
         win.frames += 1;
         ch.app.frame_seq += 1;
-        if (ch.app.rec) |*r| {
-            if (win.id == ch.app.rec_win and w > 0 and h > 0)
-                r.addShmFrame(pixels, @intCast(w), @intCast(h), format, nowMs()) catch {};
+        if (win.id == ch.app.rec_win and w > 0 and h > 0) {
+            const t = nowMs();
+            if (ch.app.rec) |*r| r.addShmFrame(pixels, @intCast(w), @intCast(h), format, t) catch {};
+            if (ch.app.vrec) |*r| r.addShmFrame(pixels, @intCast(w), @intCast(h), format, t) catch {};
         }
     }
 
@@ -779,22 +784,40 @@ pub const App = struct {
 
     // ── capture ─────────────────────────────────────────────────
 
-    /// Start recording a window's frames into an animated GIF.
-    /// Replaces any recording in progress (the old one is dropped).
-    pub fn recordStart(self: *App, win_id: u32, max_dim: u32) Error!void {
+    /// Start recording a window's frames as GIF (`webm` false) or
+    /// WebM/VP9 (`webm` true). Replaces any recording in progress.
+    pub fn recordStart(self: *App, win_id: u32, max_dim: u32, webm: bool) Error!void {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         if (self.rec) |*r| r.abort();
-        self.rec = gifrec.Rec.init(self.allocator, max_dim);
+        if (self.vrec) |*r| r.abort();
+        self.rec = null;
+        self.vrec = null;
+        if (webm)
+            self.vrec = videorec.Rec.init(self.allocator, max_dim)
+        else
+            self.rec = gifrec.Rec.init(self.allocator, max_dim);
         self.rec_win = win.id;
-        // Seed with the current frame so the GIF starts from "now".
+        // Seed with the current frame so recording starts from "now".
         if (win.w > 0 and win.pixels.items.len > 0) {
-            self.rec.?.addShmFrame(win.pixels.items, @intCast(win.w), @intCast(win.h), win.format, nowMs()) catch {};
+            const t = nowMs();
+            if (self.rec) |*r| r.addShmFrame(win.pixels.items, @intCast(win.w), @intCast(win.h), win.format, t) catch {};
+            if (self.vrec) |*r| r.addShmFrame(win.pixels.items, @intCast(win.w), @intCast(win.h), win.format, t) catch {};
         }
     }
 
-    /// Stop recording; returns the GIF bytes (caller owns) and the
-    /// frame count.
-    pub fn recordStop(self: *App) Error!struct { gif: []u8, frames: usize } {
+    /// Stop recording; returns the encoded bytes (caller owns), the
+    /// frame count, and whether it is WebM (else GIF).
+    pub fn recordStop(self: *App) Error!struct { data: []u8, frames: usize, webm: bool } {
+        if (self.vrec) |vr| {
+            var r = vr; // copy out before clearing the optional
+            self.vrec = null;
+            const frames = r.frames;
+            const data = r.finish(nowMs()) catch |err| return switch (err) {
+                videorec.Error.OutOfMemory => Error.OutOfMemory,
+                else => Error.Timeout,
+            };
+            return .{ .data = data, .frames = frames, .webm = true };
+        }
         var r = self.rec orelse return Error.NotRecording;
         self.rec = null;
         const frames = r.frames + @intFromBool(r.pend != null);
@@ -804,7 +827,7 @@ pub const App = struct {
                 else => Error.Timeout, // no frames captured
             };
         };
-        return .{ .gif = gif, .frames = frames };
+        return .{ .data = gif, .frames = frames, .webm = false };
     }
 
     pub const Shot = struct {
