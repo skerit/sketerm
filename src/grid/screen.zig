@@ -4106,7 +4106,7 @@ pub const Screen = struct {
             2048 => self.in_band_resize,
             // 1007 (alt-screen scroll): we don't, treat as off.
             1007 => false,
-            1047, 1049 => self.use_alt,
+            47, 1047, 1049 => self.use_alt,
             2004 => self.bracketed_paste,
             else => null,
         };
@@ -4885,7 +4885,7 @@ pub const Screen = struct {
                 },
                 1015 => self.mouse_enc = if (set) .urxvt else .legacy,
                 1016 => self.mouse_enc = if (set) .sgr_pixel else .legacy,
-                1047 => self.toggleAltScreen(set),
+                47, 1047 => self.toggleAltScreen(set),
                 1049 => {
                     // 1049 = save cursor + switch alt + clear alt on
                     // set; restore cursor + switch main on reset.
@@ -6156,6 +6156,30 @@ test "1049 saves and restores cursor" {
     try std.testing.expect(s.use_alt);
     try std.testing.expectEqual(@as(u16, 0), s.row);
     try std.testing.expectEqual(@as(u16, 0), s.col);
+    csi.final = 'l';
+    s.csi(csi);
+    try std.testing.expect(!s.use_alt);
+    try std.testing.expectEqual(@as(u16, 2), s.row);
+    try std.testing.expectEqual(@as(u16, 3), s.col);
+}
+
+test "legacy mode 47 toggles alt screen without cursor moves" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 5);
+    defer s.deinit();
+    s.row = 2;
+    s.col = 3;
+    var csi = Event.Csi{};
+    csi.private = '?';
+    csi.params[0] = 47;
+    csi.n_params = 1;
+    csi.final = 'h';
+    s.csi(csi);
+    try std.testing.expect(s.use_alt);
+    // 47 is the plain switch: no clear, no cursor save/home.
+    try std.testing.expectEqual(@as(u16, 2), s.row);
+    try std.testing.expectEqual(@as(u16, 3), s.col);
     csi.final = 'l';
     s.csi(csi);
     try std.testing.expect(!s.use_alt);
