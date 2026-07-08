@@ -83,6 +83,11 @@ pub const AppHost = struct {
     /// Surfaces whose app negotiated server-side decorations before
     /// the window existed (the normal order).
     pending_ssd: std.AutoHashMapUnmanaged(u32, bool) = .empty,
+    /// Icon textures that arrived BEFORE the first frame (the usual
+    /// order — the daemon injects the icon right after the app_id,
+    /// before any buffer commit). Owned refs; moved to the Win in
+    /// winFor, or unref'd in destroy if the window never opened.
+    pending_icons: std.AutoHashMapUnmanaged(u32, *c.GdkTexture) = .empty,
     /// Committed window-geometry rect per surface ({x, y, w, h} in
     /// buffer coords): the visible window inside the buffer, the rest
     /// being CSD shadow. The full buffer is shown (shadow visible); the
@@ -218,6 +223,29 @@ pub const AppHost = struct {
         /// re-applied in onWinRealize. Gives the floating window the
         /// remote app's taskbar icon + name instead of sketerm's.
         app_id: ?[]u8 = null,
+        /// The app's icon as a GdkTexture (owned ref), applied via
+        /// gdk_toplevel_set_icon_list on realize. Ships PIXELS, so it
+        /// works for REMOTE apps whose icon isn't installed locally
+        /// (xdg-toplevel-icon on Wayland, _NET_WM_ICON on X11).
+        icon_tex: ?*c.GdkTexture = null,
+
+        /// Store the icon texture and apply it (needs the surface;
+        /// onWinRealize re-applies). Takes ownership of one ref.
+        fn setIconTexture(self: *Win, tex: *c.GdkTexture) void {
+            if (self.icon_tex) |old| c.g_object_unref(old);
+            self.icon_tex = tex;
+            self.applyIcon();
+        }
+
+        /// gdk_toplevel_set_icon_list with our single texture, once the
+        /// GdkSurface (a GdkToplevel) exists. No-op before realize.
+        fn applyIcon(self: *Win) void {
+            const tex = self.icon_tex orelse return;
+            const surface = c.gtk_native_get_surface(@ptrCast(self.window)) orelse return;
+            const list = c.g_list_append(null, tex);
+            c.gdk_toplevel_set_icon_list(@ptrCast(surface), list);
+            c.g_list_free(list);
+        }
 
         /// Store the app_id and apply it. Called pre- and post-realize
         /// (idempotent): pre-realize only the icon-name lands (no
@@ -530,6 +558,7 @@ pub const AppHost = struct {
             .toplevel_frame = onFrame,
             .toplevel_title = onTitle,
             .toplevel_app_id = onAppId,
+            .toplevel_icon = onIcon,
             .toplevel_gone = onGone,
             .popup_new = onPopupNew,
             .popup_gone = onPopupGone,
@@ -582,6 +611,7 @@ pub const AppHost = struct {
             // Break the close-request link before gtk teardown.
             w.*.cancelOpaqueResize();
             if (w.*.app_id) |aid| self.allocator.free(aid);
+            if (w.*.icon_tex) |tex| c.g_object_unref(tex);
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-wlapp", null);
             c.gtk_window_destroy(w.*.window);
             self.allocator.destroy(w.*);
@@ -605,6 +635,9 @@ pub const AppHost = struct {
         var ait = self.pending_app_ids.valueIterator();
         while (ait.next()) |v| self.allocator.free(v.*);
         self.pending_app_ids.deinit(self.allocator);
+        var iit = self.pending_icons.valueIterator();
+        while (iit.next()) |v| c.g_object_unref(v.*);
+        self.pending_icons.deinit(self.allocator);
         self.pending_ssd.deinit(self.allocator);
         self.geos.deinit(self.allocator);
         if (self.pending_reads > 0) {
@@ -1024,6 +1057,36 @@ pub const AppHost = struct {
         win.setAppId(app_id);
     }
 
+    /// The app's icon bytes (daemon-injected). Decode to a GdkTexture
+    /// and set it on the window; stash if the window isn't up yet.
+    fn onIcon(ctx: ?*anyopaque, surface: u32, kind: u8, bytes: []const u8) void {
+        const self = cast.userData(AppHost, ctx);
+        const tex = decodeIcon(kind, bytes) orelse return;
+        if (self.windows.get(surface)) |win| {
+            win.setIconTexture(tex);
+            return;
+        }
+        if (self.pending_icons.fetchPut(self.allocator, surface, tex) catch {
+            c.g_object_unref(tex);
+            return;
+        }) |old| c.g_object_unref(old.value);
+    }
+
+    /// Icon bytes → GdkTexture. PNG via GdkTexture's native loader;
+    /// SVG through gdk-pixbuf (librsvg) at a taskbar-ish size.
+    fn decodeIcon(kind: u8, bytes: []const u8) ?*c.GdkTexture {
+        const gb = c.g_bytes_new(bytes.ptr, bytes.len) orelse return null;
+        defer c.g_bytes_unref(gb);
+        if (kind == 2) { // svg
+            const stream = c.g_memory_input_stream_new_from_bytes(gb);
+            defer c.g_object_unref(stream);
+            const pb = c.gdk_pixbuf_new_from_stream_at_scale(@ptrCast(stream), 128, 128, 1, null, null) orelse return null;
+            defer c.g_object_unref(pb);
+            return c.gdk_texture_new_for_pixbuf(@ptrCast(pb));
+        }
+        return c.gdk_texture_new_from_bytes(gb, null);
+    }
+
     fn onGone(ctx: ?*anyopaque, surface: u32) void {
         const self = cast.userData(AppHost, ctx);
         const win = self.windows.get(surface) orelse return;
@@ -1040,6 +1103,7 @@ pub const AppHost = struct {
         if (win.rec) |*r| r.abort();
         if (win.vrec) |*r| r.abort();
         if (win.app_id) |aid| self.allocator.free(aid);
+        if (win.icon_tex) |tex| c.g_object_unref(tex);
         win.cancelOpaqueResize();
         _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-wlapp", null);
         c.gtk_window_destroy(win.window);
@@ -1088,6 +1152,9 @@ pub const AppHost = struct {
         if (self.pending_app_ids.fetchRemove(surface)) |kv| {
             win.setAppId(kv.value);
             self.allocator.free(kv.value);
+        }
+        if (self.pending_icons.fetchRemove(surface)) |kv| {
+            win.icon_tex = kv.value; // applied on realize
         }
         // Assistant-is-driving badge, toggled by setDriven.
         const badge = c.gtk_label_new("AI");
@@ -1559,6 +1626,7 @@ pub const AppHost = struct {
         // skipped when it arrived before the first frame. Set before
         // the first commit so the WM reads it on map.
         if (win.app_id) |aid| rw.applyAppId(win.window, aid);
+        win.applyIcon();
     }
 
     fn onComputeSize(_: ?*c.GdkToplevel, size: ?*c.GdkToplevelSize, user: ?*anyopaque) callconv(.c) void {

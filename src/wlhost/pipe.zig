@@ -83,6 +83,11 @@ pub const Tag = enum(u8) {
     /// mime string; the brain announces a host-clipboard selection.
     offer_selection = 24,
     request_close = 25, // u32 sid
+    /// The app's window icon as image bytes, daemon -> client. u32
+    /// sid, u8 kind (icons.Kind: 1 png, 2 svg), then the file bytes.
+    /// Daemon-injected (only the daemon can read the app host's icon
+    /// theme); the client decodes and calls gdk_toplevel_set_icon_list.
+    toplevel_icon = 26,
     _,
 };
 
@@ -262,6 +267,16 @@ pub fn appendConfigure(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32, 
     putU32At(&pl, 8, @bitCast(h));
     putU32At(&pl, 12, state_bits);
     try appendUnit(out, a, .configure, &pl);
+}
+
+pub fn appendToplevelIcon(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32, kind: u8, bytes: []const u8) !void {
+    var hdr: [header_size + 5]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(5 + bytes.len + 1), .little);
+    hdr[4] = @intFromEnum(Tag.toplevel_icon);
+    std.mem.writeInt(u32, hdr[5..9], sid, .little);
+    hdr[9] = kind;
+    try out.appendSlice(a, &hdr);
+    try out.appendSlice(a, bytes);
 }
 
 pub fn appendRequestClose(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32) !void {

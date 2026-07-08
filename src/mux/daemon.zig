@@ -18,6 +18,7 @@ const wlwire = @import("../wlhost/wire.zig");
 const wltrack = @import("../wlhost/track.zig");
 const wlproto = @import("../wlhost/protocol.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
+const icons = @import("icons.zig");
 const wlpixcodec = @import("../wlhost/pixcodec.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
 const wlkeymaps = @import("../wlhost/keymaps.zig");
@@ -445,6 +446,17 @@ const Native = struct {
     /// codec (capability negotiation — not yet implemented). Until then
     /// videoCommit stays dormant: never emit a tile no client can decode.
     wants_video: bool = false,
+    /// Icon injection back-pointers (set after the Channel exists) so
+    /// the brain's toplevel_app_id callback can resolve the app's icon
+    /// on THIS host and queue it toward clients.
+    daemon: ?*Daemon = null,
+    chan: ?*Channel = null,
+    /// app_ids already resolved (icon sent or none found), so repeated
+    /// set_app_id / extra windows don't re-scan the icon theme. Keys owned.
+    icon_seen: std.StringHashMapUnmanaged(void) = .empty,
+    /// Accumulated toplevel_icon units, replayed to clients that
+    /// attach after the icon was first sent (durable reattach).
+    icon_replay: std.ArrayList(u8) = .empty,
 
     const VideoSurface = struct {
         churn: churnmod.Tracker,
@@ -498,6 +510,10 @@ const Native = struct {
         self.vstate.deinit(self.allocator);
         self.vscratch.deinit(self.allocator);
         self.vblob.deinit(self.allocator);
+        var kit = self.icon_seen.keyIterator();
+        while (kit.next()) |k| self.allocator.free(k.*);
+        self.icon_seen.deinit(self.allocator);
+        self.icon_replay.deinit(self.allocator);
         self.tracker.deinit();
         self.allocator.destroy(self);
     }
@@ -1985,6 +2001,32 @@ pub const Daemon = struct {
     }
 
     /// True when `cl` should receive this session's native app units.
+    /// Brain saw the app announce its app_id: resolve the app's icon
+    /// on THIS host (works for remote apps — the client can't) and
+    /// ship the bytes to attached clients + stash for reattach.
+    fn onBrainAppId(ctx: ?*anyopaque, sid: u32, app_id: []const u8) void {
+        const nv: *Native = @ptrCast(@alignCast(ctx.?));
+        const self = nv.daemon orelse return;
+        const ch = nv.chan orelse return;
+        if (app_id.len == 0) return;
+        if (nv.icon_seen.contains(app_id)) return;
+        const key = self.allocator.dupe(u8, app_id) catch return;
+        nv.icon_seen.put(self.allocator, key, {}) catch {
+            self.allocator.free(key);
+            return;
+        };
+        var icon = (icons.resolve(self.allocator, app_id) catch return) orelse return;
+        defer icon.deinit(self.allocator);
+        // Cap what we ship (a runaway icon file shouldn't flood the wire).
+        if (icon.bytes.len > 2 * 1024 * 1024) return;
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(self.allocator);
+        wlpipe.appendToplevelIcon(&unit, self.allocator, sid, @intFromEnum(icon.kind), icon.bytes) catch return;
+        // Stash for reattach replay, then queue to current viewers.
+        nv.icon_replay.appendSlice(self.allocator, unit.items) catch {};
+        if (!ch.dead) self.queueUnits(ch, unit.items);
+    }
+
     fn nativeViewer(cl: *const Client, s: *const Session) bool {
         return cl.attached == s and !cl.dead and cl.proto >= 5;
     }
@@ -2052,6 +2094,11 @@ pub const Daemon = struct {
             .native = native,
         };
         native.wants_video = self.videoOk(s);
+        // Wire the brain to resolve + inject the app's icon when it
+        // announces its app_id. Stable pointers (native/ch are heap).
+        native.daemon = self;
+        native.chan = ch;
+        brain.view = .{ .ctx = native, .toplevel_app_id = onBrainAppId };
         self.next_chan_id += 1;
         self.channels.append(self.allocator, ch) catch {
             ch.deinit();
@@ -3297,6 +3344,10 @@ pub const Daemon = struct {
                     };
                 } else |_| ok = false;
             }
+            // Icons are daemon-injected, not part of brain state — replay
+            // them so a reattaching client's windows keep their icon.
+            if (ok and nv.icon_replay.items.len > 0)
+                units.appendSlice(self.allocator, nv.icon_replay.items) catch {};
             if (!ok) {
                 cl.dead = true;
                 return;

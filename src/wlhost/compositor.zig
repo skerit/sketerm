@@ -59,6 +59,10 @@ pub const View = struct {
     toplevel_title: ?*const fn (ctx: ?*anyopaque, surface: u32, title: []const u8) void = null,
     /// xdg_toplevel.set_app_id — desktop identity (icon, grouping).
     toplevel_app_id: ?*const fn (ctx: ?*anyopaque, surface: u32, app_id: []const u8) void = null,
+    /// The app's window icon as image bytes (daemon-injected via the
+    /// toplevel_icon unit; the client sets it on the toplevel).
+    /// `kind`: 1 png, 2 svg. Slices valid only for the call.
+    toplevel_icon: ?*const fn (ctx: ?*anyopaque, surface: u32, kind: u8, bytes: []const u8) void = null,
     /// Toplevel destroyed (or its surface) — drop the window.
     toplevel_gone: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
     /// A surface gained the popup role: render it at (x, y) in the
@@ -764,6 +768,13 @@ pub const Compositor = struct {
                 if (self.view.clipboard_data) |cb| cb(self.view.ctx, payload);
             },
             .state_sync => try self.restoreState(payload),
+            .toplevel_icon => {
+                if (payload.len >= 5) {
+                    const sid = std.mem.readInt(u32, payload[0..4], .little);
+                    const kind = payload[4];
+                    if (self.view.toplevel_icon) |cb| cb(self.view.ctx, sid, kind, payload[5..]);
+                }
+            },
             else => {}, // forward compat
         }
     }
