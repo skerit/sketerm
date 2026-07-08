@@ -6730,3 +6730,54 @@ still fall back to a generic icon — Wayland carries no icon pixels
 over the wire (X11's `_NET_WM_ICON` does; Wayland dropped it). Would
 need shipping icon bytes over the mux channel + installing a local
 hicolor entry; not done (bigger job, not requested).
+
+## Feature: forwarded-app taskbar icons via shipped pixels (Jul 8, remote fix)
+
+Follow-up to the app_id fix: setting the app_id only helps if the
+CLIENT can resolve that app_id to a local .desktop/icon — which fails
+for the primary use case, a REMOTE app not installed on the client
+(Wayland carries no icon pixels the way X11's _NET_WM_ICON does). Fix:
+ship the actual icon bytes from the app's host.
+
+Mechanism: GDK's `gdk_toplevel_set_icon_list(GdkToplevel, GList of
+GdkTexture)` drives KWin's `xdg-toplevel-icon` protocol on Wayland
+(present in libgtk 4.22; KWin 6.2+) and `_NET_WM_ICON` on X11 — both
+take PIXELS. So:
+- `src/mux/icons.zig` (NEW): freedesktop icon resolution on the app's
+  host. app_id -> `<datadir>/applications/<app_id>.desktop` Icon= ->
+  the actual PNG/SVG file, searching XDG icon roots x {hicolor,
+  Adwaita, breeze, gnome, Papirus, oxygen} x size dirs (128 first,
+  then 96/64/48/256/scalable/32/symbolic) x {.png,.svg}, plus
+  `<root>/../pixmaps/<name>`, plus absolute-path Icon= values. libc
+  file IO (fopen/fread), musl-clean (in the daemon graph). 4 tests
+  (kindFromPath, parseIconKey x2, absolute-path read).
+- `wlhost/pipe.zig`: new append-only `toplevel_icon = 26` unit
+  (`u32 sid, u8 kind {1 png,2 svg}, bytes`) + `appendToplevelIcon`.
+- `wlhost/compositor.zig`: `View.toplevel_icon` callback + feedUnit
+  parse case.
+- `mux/daemon.zig`: the app-channel brain now gets a View with
+  `toplevel_app_id = onBrainAppId`; on set_app_id it resolves the icon
+  (cached per app_id in `Native.icon_seen`; ships <=2MB), queues the
+  unit to viewers, and stashes it in `Native.icon_replay` for
+  reattach (replayed after state_sync in replayNativeChannels).
+- `wlapp.zig`: `onIcon` decodes bytes -> GdkTexture (PNG via
+  `gdk_texture_new_from_bytes`; SVG via `gdk_pixbuf_new_from_stream_at_scale`
+  at 128px -> `gdk_texture_new_for_pixbuf`), stashed in `pending_icons`
+  until the window exists, stored per-Win, applied in `Win.applyIcon`
+  (`gdk_toplevel_set_icon_list`) on realize. Freed in onGone/destroy.
+
+Verified end-to-end on X11 (Xvfb): a forwarded gnome-calculator's
+window gets `_NET_WM_ICON (128 x 128)` with 113 distinct colors (the
+real icon, not a fallback square), WM_CLASS org.gnome.Calculator; the
+window renders + interacts, GUI stays alive, no leak. On Wayland the
+identical set_icon_list path drives xdg-toplevel-icon so KWin shows
+it. 671/676 tests, mux + mux-portable + purity (0, gdk-pixbuf is
+GUI-only) clean, smoke-mux/mcp/e2e PASS.
+
+Coverage note: works whenever the app's host has the icon installed
+(the normal case — the app IS installed there). Falls back to no
+custom icon (sketerm's) only if the host lacks the icon file or it's
+a format gdk-pixbuf can't read. Icon-theme resolution is pragmatic
+(the listed themes + hicolor + pixmaps), not full index.theme
+inheritance — sufficient for app_id/reverse-DNS icons, which live in
+hicolor.
