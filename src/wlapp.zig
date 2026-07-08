@@ -40,10 +40,21 @@ pub const AppHost = struct {
     on_flush: ?*const fn (ctx: ?*anyopaque) void = null,
     /// A headless MCP client is attached (drives the badge).
     driven: bool = false,
-    /// Pane-owned picture mirroring the primary toplevel (app view
-    /// in the tab + live overview thumbnail). Not owned here.
-    mirror: ?*c.GtkWidget = null,
-    mirror_surface: u32 = 0,
+    /// Pane-provided container for the embedded (in-tab) app view.
+    /// When set before the first toplevel frame, that toplevel
+    /// renders inside it instead of a floating window; later
+    /// toplevels (dialogs) always float. Not owned here.
+    embed_box: ?*c.GtkWidget = null,
+    /// Surface currently embedded in embed_box (0 = none).
+    embed_surface: u32 = 0,
+    /// Fired when the embedded view appears/disappears, so the pane
+    /// can toggle the terminal (app log) underneath.
+    on_embed: ?*const fn (ctx: ?*anyopaque, active: bool) void = null,
+    /// Fired by the host menu's "Show in Tab" on a floating window;
+    /// the pane answers by installing embed_box and calling popIn.
+    /// Null = no pane offers a tab (menu row hidden).
+    on_request_embed: ?*const fn (ctx: ?*anyopaque) void = null,
+    embed_ctx: ?*anyopaque = null,
     flush_ctx: ?*anyopaque = null,
     /// Fired once, on the first frame of the app's FIRST toplevel
     /// window. Distinguishes "the app really showed a window" from
@@ -186,6 +197,21 @@ pub const AppHost = struct {
         /// transparent after a resize settles (0 = inactive). See
         /// armOpaqueResize.
         opaque_settle_id: c_uint = 0,
+        /// Rendered inside the pane's embed box instead of a floating
+        /// window. The GtkWindow still exists (hidden, childless) so
+        /// window-based code paths stay valid; pop-out re-childs and
+        /// presents it.
+        embedded: bool = false,
+        /// The floating-window signal set is connected (wired lazily
+        /// at pop-out for windows born embedded).
+        float_wired: bool = false,
+        /// The embedded input set is connected (key/focus controllers
+        /// on the picture; wired lazily on first embed).
+        embed_wired: bool = false,
+        /// Embedded resize sensor: input-transparent GtkDrawingArea
+        /// filling the overlay — its "resize" signal is GTK4's only
+        /// clean allocation-change hook.
+        embed_sensor: ?*c.GtkWidget = null,
 
         /// Ctrl+right-click host menu: the only host-side chrome a
         /// forwarded window has (everything else goes to the app).
@@ -206,6 +232,17 @@ pub const AppHost = struct {
                 c.gtk_button_set_has_frame(@ptrCast(gif_btn), 0);
                 _ = c.g_signal_connect_data(@ptrCast(gif_btn), "clicked", @ptrCast(&onMenuRecord), self, null, 0);
                 c.gtk_box_append(@ptrCast(box), gif_btn);
+            }
+            if (self.embedded) {
+                const out_btn = c.gtk_button_new_with_label("Pop Out Window");
+                c.gtk_button_set_has_frame(@ptrCast(out_btn), 0);
+                _ = c.g_signal_connect_data(@ptrCast(out_btn), "clicked", @ptrCast(&onMenuPopOut), self, null, 0);
+                c.gtk_box_append(@ptrCast(box), out_btn);
+            } else if (self.host.on_request_embed != null and self.host.embed_surface == 0) {
+                const in_btn = c.gtk_button_new_with_label("Show in Tab");
+                c.gtk_button_set_has_frame(@ptrCast(in_btn), 0);
+                _ = c.g_signal_connect_data(@ptrCast(in_btn), "clicked", @ptrCast(&onMenuShowInTab), self, null, 0);
+                c.gtk_box_append(@ptrCast(box), in_btn);
             }
             const close_btn = c.gtk_button_new_with_label("Close Window");
             c.gtk_button_set_has_frame(@ptrCast(close_btn), 0);
@@ -325,7 +362,26 @@ pub const AppHost = struct {
         fn onMenuClose(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             const win = cast.userData(Win, user);
             popdownFrom(btn);
+            if (win.embedded) {
+                // No close-request path on the hidden window: ask the
+                // app directly, exactly like the floating handler.
+                win.host.requestCloseIntent(win.surface);
+                win.host.flushHost();
+                return;
+            }
             c.gtk_window_close(win.window);
+        }
+
+        fn onMenuPopOut(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+            const win = cast.userData(Win, user);
+            popdownFrom(btn);
+            win.host.popOut();
+        }
+
+        fn onMenuShowInTab(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+            const win = cast.userData(Win, user);
+            popdownFrom(btn);
+            if (win.host.on_request_embed) |f| f(win.host.embed_ctx);
         }
 
         fn onHostMenuClosed(pop: ?*c.GtkPopover, _: ?*anyopaque) callconv(.c) void {
@@ -346,6 +402,7 @@ pub const AppHost = struct {
         /// for the interior. Disabled while maximized/fullscreen (the
         /// WM owns the size then).
         fn resizeEdge(self: *Win, x: f64, y: f64) u32 {
+            if (self.embedded) return 0; // the pane owns the size
             if (c.gtk_window_is_maximized(self.window) != 0) return 0;
             if (c.gtk_window_is_fullscreen(self.window) != 0) return 0;
             return rw.resizeEdgeAt(c.gtk_widget_get_width(self.picture), c.gtk_widget_get_height(self.picture), x, y);
@@ -499,6 +556,13 @@ pub const AppHost = struct {
         self.dead = true;
         var it = self.windows.valueIterator();
         while (it.next()) |w| {
+            // Belt-and-braces: a still-embedded overlay lives in the
+            // pane's box — pull it out before the window teardown.
+            // (The pane normally releases first via on_app_view.)
+            if (w.*.embedded) {
+                w.*.embedded = false;
+                if (self.embed_box) |box| c.gtk_box_remove(@ptrCast(box), w.*.overlay);
+            }
             // Break the close-request link before gtk teardown.
             w.*.cancelOpaqueResize();
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-wlapp", null);
@@ -685,11 +749,12 @@ pub const AppHost = struct {
             c.gtk_widget_queue_draw(sub.area);
             return;
         }
-        // Displayed region in LOGICAL surface coords. Linux shows the
-        // full buffer and reports the CSD shadow as the toplevel's
-        // shadow width; macOS ignores shadow-width, so it crops the
-        // buffer to the window-geometry rect and sizes the window to it
-        // (otherwise the shadow shows as a fat border).
+        // Displayed region in LOGICAL surface coords. Linux floating
+        // windows show the full buffer and report the CSD shadow as
+        // the toplevel's shadow width; macOS — and embedded views,
+        // which have no WM to report shadows to — crop the buffer to
+        // the window-geometry rect instead (otherwise the shadow
+        // shows as a fat border inside the tab).
         var dx: i32 = 0;
         var dy: i32 = 0;
         var dw: i32 = lw;
@@ -708,6 +773,16 @@ pub const AppHost = struct {
         if (!self.saw_window) {
             self.saw_window = true;
             if (self.on_first_window) |f| f(self.first_window_ctx);
+        }
+        if (builtin.os.tag != .macos and win.embedded) {
+            if (self.geos.get(surface)) |g| {
+                if (g[2] > 0 and g[3] > 0 and g[0] >= 0 and g[1] >= 0 and g[0] + g[2] <= lw and g[1] + g[3] <= lh) {
+                    dx = g[0];
+                    dy = g[1];
+                    dw = g[2];
+                    dh = g[3];
+                }
+            }
         }
         win.buf_w = lw;
         win.buf_h = lh;
@@ -733,20 +808,6 @@ pub const AppHost = struct {
         if (win.vrec) |*r| {
             r.addShmFrame(pixels, @intCast(w), @intCast(h), format, Win.recNowMs()) catch {};
         }
-        // Mirror the primary toplevel into the pane's app view (tab
-        // content + live overview thumbnail). Texture is refcounted;
-        // both pictures share it.
-        if (self.mirror) |m| {
-            if (self.mirror_surface == 0) self.mirror_surface = surface;
-            if (self.mirror_surface == surface)
-                c.gtk_picture_set_paintable(@ptrCast(m), @ptrCast(tex));
-        }
-    }
-
-    /// Point the pane-side mirror picture at this host (null detaches).
-    pub fn setMirror(self: *AppHost, pic: ?*c.GtkWidget) void {
-        self.mirror = pic;
-        self.mirror_surface = 0;
     }
 
     /// Raise every window of this app (mirror click).
@@ -950,7 +1011,15 @@ pub const AppHost = struct {
         const self = cast.userData(AppHost, ctx);
         const win = self.windows.get(surface) orelse return;
         _ = self.windows.remove(surface);
-        if (self.mirror_surface == surface) self.mirror_surface = 0;
+        if (win.embedded) {
+            // Pull the overlay out of the pane's box before the
+            // (childless) window teardown, and tell the pane its
+            // embedded view is gone.
+            self.embed_surface = 0;
+            win.embedded = false;
+            if (self.embed_box) |box| c.gtk_box_remove(@ptrCast(box), win.overlay);
+            if (self.on_embed) |f| f(self.embed_ctx, false);
+        }
         if (win.rec) |*r| r.abort();
         if (win.vrec) |*r| r.abort();
         win.cancelOpaqueResize();
@@ -1014,13 +1083,10 @@ pub const AppHost = struct {
         win.badge = badge;
 
         _ = c.g_object_set_data(@ptrCast(window), "sketerm-wlapp", win);
-        _ = c.g_signal_connect_data(@ptrCast(window), "close-request", @ptrCast(&onCloseRequest), win, null, 0);
-        // Report the CSD shadow as the toplevel's shadow width once the
-        // GdkSurface exists, so the WM snaps/maximizes to the geometry.
-        _ = c.g_signal_connect_data(@ptrCast(window), "realize", @ptrCast(&onWinRealize), win, null, 0);
 
-        // Input: pointer on the picture (its coords), keyboard +
-        // focus on the window. All feed the compositor's seat.
+        // Input: pointer on the picture (its coords — the picture
+        // travels between the floating window and the embed box, so
+        // these work in both modes). All feed the compositor's seat.
         const motion = c.gtk_event_controller_motion_new();
         _ = c.g_signal_connect_data(@ptrCast(motion), "enter", @ptrCast(&onPtrEnter), win, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(motion), "motion", @ptrCast(&onPtrMotion), win, null, 0);
@@ -1037,6 +1103,30 @@ pub const AppHost = struct {
         _ = c.g_signal_connect_data(@ptrCast(scroll), "scroll", @ptrCast(&onScroll), win, null, 0);
         c.gtk_widget_add_controller(picture, scroll);
 
+        // Only the FIRST toplevel embeds; dialogs and secondary
+        // windows always float (transient over the embedded view).
+        if (self.embed_box != null and self.embed_surface == 0) {
+            self.embedWin(win);
+        } else {
+            self.wireFloating(win);
+            c.gtk_window_present(window);
+        }
+        return win;
+    }
+
+    /// Connect the floating-window signal set (idempotent — windows
+    /// born embedded get it lazily at pop-out).
+    fn wireFloating(self: *AppHost, win: *Win) void {
+        _ = self;
+        if (win.float_wired) return;
+        win.float_wired = true;
+        const window = win.window;
+        _ = c.g_signal_connect_data(@ptrCast(window), "close-request", @ptrCast(&onCloseRequest), win, null, 0);
+        // Report the CSD shadow as the toplevel's shadow width once the
+        // GdkSurface exists, so the WM snaps/maximizes to the geometry.
+        _ = c.g_signal_connect_data(@ptrCast(window), "realize", @ptrCast(&onWinRealize), win, null, 0);
+
+        // Keyboard + focus on the window.
         const key = c.gtk_event_controller_key_new();
         _ = c.g_signal_connect_data(@ptrCast(key), "key-pressed", @ptrCast(&onKeyPress), win, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(key), "key-released", @ptrCast(&onKeyRelease), win, null, 0);
@@ -1058,9 +1148,128 @@ pub const AppHost = struct {
         _ = c.g_signal_connect_data(@ptrCast(window), "notify::fullscreened", @ptrCast(&onWinResize), win, null, 0);
         // Apps render inactive chrome when not activated.
         _ = c.g_signal_connect_data(@ptrCast(window), "notify::is-active", @ptrCast(&onWinState), win, null, 0);
+    }
 
-        c.gtk_window_present(window);
+    /// Move a window's content (the overlay: picture + popups +
+    /// subsurfaces) into the pane's embed box; the GtkWindow stays
+    /// alive but hidden and childless so window-based code paths
+    /// remain valid.
+    fn embedWin(self: *AppHost, win: *Win) void {
+        const box = self.embed_box orelse return;
+        c.gtk_widget_set_visible(@ptrCast(win.window), 0);
+        _ = c.g_object_ref(@ptrCast(win.overlay));
+        c.gtk_window_set_child(win.window, null);
+        c.gtk_box_append(@ptrCast(box), win.overlay);
+        c.g_object_unref(@ptrCast(win.overlay));
+        c.gtk_widget_set_hexpand(win.overlay, 1);
+        c.gtk_widget_set_vexpand(win.overlay, 1);
+        win.embedded = true;
+        self.embed_surface = win.surface;
+        self.wireEmbedded(win);
+        // Reset the size-echo guard: the pane's size is authoritative
+        // now, whatever the floating window last asked for.
+        win.sent_w = 0;
+        win.sent_h = 0;
+        if (self.on_embed) |f| f(self.embed_ctx, true);
+    }
+
+    /// Connect the embedded input set (idempotent): key + focus on
+    /// the picture (there is no window to catch them), plus the
+    /// resize sensor that drives configure at the pane's size.
+    fn wireEmbedded(self: *AppHost, win: *Win) void {
+        _ = self;
+        if (win.embed_wired) {
+            if (win.embed_sensor) |s| c.gtk_widget_set_visible(s, 1);
+            return;
+        }
+        win.embed_wired = true;
+        c.gtk_widget_set_focusable(win.picture, 1);
+
+        const key = c.gtk_event_controller_key_new();
+        _ = c.g_signal_connect_data(@ptrCast(key), "key-pressed", @ptrCast(&onEmbedKeyPress), win, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(key), "key-released", @ptrCast(&onEmbedKeyRelease), win, null, 0);
+        c.gtk_widget_add_controller(win.picture, key);
+
+        const focus = c.gtk_event_controller_focus_new();
+        _ = c.g_signal_connect_data(@ptrCast(focus), "enter", @ptrCast(&onEmbedFocusEnter), win, null, 0);
+        _ = c.g_signal_connect_data(@ptrCast(focus), "leave", @ptrCast(&onEmbedFocusLeave), win, null, 0);
+        c.gtk_widget_add_controller(win.picture, focus);
+
+        const sensor = c.gtk_drawing_area_new();
+        c.gtk_widget_set_can_target(sensor, 0);
+        c.gtk_widget_set_hexpand(sensor, 1);
+        c.gtk_widget_set_vexpand(sensor, 1);
+        _ = c.g_signal_connect_data(@ptrCast(sensor), "resize", @ptrCast(&onEmbedResize), win, null, 0);
+        c.gtk_overlay_add_overlay(@ptrCast(win.overlay), sensor);
+        win.embed_sensor = sensor;
+    }
+
+    /// Detach the embedded view back into its floating window
+    /// ("Pop Out" — and the mechanical half of releaseEmbed).
+    pub fn popOut(self: *AppHost) void {
+        const win = self.unembed() orelse return;
+        self.wireFloating(win);
+        // Size the floating window to the full committed buffer (the
+        // Linux floating path shows buffer + CSD shadow and reports
+        // the shadow width to the WM).
+        if (win.buf_w > 0 and win.buf_h > 0)
+            c.gtk_window_set_default_size(win.window, win.buf_w, win.buf_h);
+        c.gtk_window_present(win.window);
+        if (self.on_embed) |f| f(self.embed_ctx, false);
+    }
+
+    /// Embed the primary floating window into the pane's embed box
+    /// ("Show in Tab"). The pane installs embed_box before calling.
+    pub fn popIn(self: *AppHost) void {
+        if (self.embed_box == null or self.embed_surface != 0) return;
+        // Primary = first non-transient window (dialogs stay afloat).
+        var pick: ?*Win = null;
+        var it = self.windows.valueIterator();
+        while (it.next()) |w| {
+            if (c.gtk_window_get_transient_for(w.*.window) == null) {
+                pick = w.*;
+                break;
+            }
+            if (pick == null) pick = w.*;
+        }
+        const win = pick orelse return;
+        self.embedWin(win);
+    }
+
+    /// Return the embedded overlay to its hidden window WITHOUT
+    /// presenting; clears embed state. Returns the window, or null
+    /// if nothing was embedded.
+    fn unembed(self: *AppHost) ?*Win {
+        const sid = self.embed_surface;
+        if (sid == 0) return null;
+        self.embed_surface = 0;
+        const win = self.windows.get(sid) orelse return null;
+        if (win.embed_sensor) |s| c.gtk_widget_set_visible(s, 0);
+        if (self.embed_box) |box| {
+            _ = c.g_object_ref(@ptrCast(win.overlay));
+            c.gtk_box_remove(@ptrCast(box), win.overlay);
+            c.gtk_window_set_child(win.window, win.overlay);
+            c.g_object_unref(@ptrCast(win.overlay));
+        }
+        win.embedded = false;
+        // Display switches from the geometry crop back to the full
+        // buffer next frame; keep mapXY consistent meanwhile.
+        win.crop_x = 0;
+        win.crop_y = 0;
+        win.crop_w = win.buf_w;
+        win.crop_h = win.buf_h;
         return win;
+    }
+
+    /// The pane is going away or switching hosts: silently return
+    /// the embedded view to its (hidden) window and forget the
+    /// pane's box + callbacks. Safe when nothing is embedded.
+    pub fn releaseEmbed(self: *AppHost) void {
+        _ = self.unembed();
+        self.embed_box = null;
+        self.on_embed = null;
+        self.on_request_embed = null;
+        self.embed_ctx = null;
     }
 
     // ── input handlers (GTK → compositor seat) ──────────────────
@@ -1137,6 +1346,9 @@ pub const AppHost = struct {
             return;
         }
         win.fwd_press = true;
+        // Embedded: the picture must own keyboard focus for the
+        // picture-level key controller to see keystrokes.
+        if (win.embedded) _ = c.gtk_widget_grab_focus(win.picture);
         win.host.stampNow();
         // A click on the main surface while a menu is up dismisses it.
         win.host.dismissPopupsIntent();
@@ -1213,6 +1425,52 @@ pub const AppHost = struct {
         const win = cast.userData(Win, user);
         win.host.stampNow();
         win.host.seatKbdLeave();
+        win.host.flushHost();
+    }
+
+    // ── embedded-mode input (controllers on the picture; guarded so
+    //    they stay inert after a pop-out returns the picture to the
+    //    window, whose own controllers take over) ──────────────────
+
+    fn onEmbedKeyPress(_: ?*c.GtkEventControllerKey, _: c_uint, keycode: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const win = cast.userData(Win, user);
+        if (!win.embedded) return 0;
+        sendKey(win, keycode, state, true);
+        return 1;
+    }
+
+    fn onEmbedKeyRelease(_: ?*c.GtkEventControllerKey, _: c_uint, keycode: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
+        if (!win.embedded) return;
+        sendKey(win, keycode, state, false);
+    }
+
+    fn onEmbedFocusEnter(_: ?*c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
+        if (!win.embedded) return;
+        onFocusEnter(null, user);
+    }
+
+    fn onEmbedFocusLeave(_: ?*c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
+        if (!win.embedded) return;
+        onFocusLeave(null, user);
+    }
+
+    /// The embed sensor resized: the pane's size is authoritative —
+    /// configure the app to draw at it (fresh frames replace the
+    /// briefly-stretched FILL picture).
+    fn onEmbedResize(_: ?*c.GtkDrawingArea, w: c_int, h: c_int, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
+        if (!win.embedded) return;
+        if (w <= 0 or h <= 0) return;
+        // Skip echoes of what the app already drew or what we already
+        // asked for (configure storms upset some clients).
+        const geo = win.host.geos.get(win.surface) orelse [4]i32{ 0, 0, 0, 0 };
+        if ((w == geo[2] and h == geo[3]) or (w == win.sent_w and h == win.sent_h)) return;
+        win.sent_w = w;
+        win.sent_h = h;
+        win.host.configureIntent(win.surface, w, h, .{ .activated = true });
         win.host.flushHost();
     }
 
@@ -1409,6 +1667,9 @@ pub const AppHost = struct {
     }
 
     fn winStates(win: *Win) @import("wlhost/compositor.zig").Compositor.ToplevelState {
+        // Embedded: the hidden GtkWindow is never active — report the
+        // app as activated so it renders live chrome in its tab.
+        if (win.embedded) return .{ .activated = true };
         return .{
             .activated = c.gtk_window_is_active(win.window) != 0,
             .maximized = c.gtk_window_is_maximized(win.window) != 0,

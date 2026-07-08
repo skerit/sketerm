@@ -962,6 +962,12 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addExitActionRow(@ptrCast(@alignCast(shell_group)), ctx);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(shell_group)));
 
+    // Forwarded GUI apps.
+    const apps_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(apps_group)), "Applications");
+    addAppViewRow(@ptrCast(@alignCast(apps_group)), ctx);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(apps_group)));
+
     // Input.
     const input_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(input_group)), "Input");
@@ -1099,6 +1105,23 @@ fn addExitActionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = exitActionSelected };
     _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn addAppViewRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "Floating window", "Embedded in tab" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "App windows open as");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), if (ctx.cfg.app_view == .tab) 1 else 0);
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = appViewSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn appViewSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.app_view = if (idx == 1) .tab else .window;
+    ctx.ev();
 }
 
 fn exitActionSelected(ctx: *Ctx, idx: c_uint) void {

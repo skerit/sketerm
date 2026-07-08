@@ -143,6 +143,10 @@ pub const Terminal = struct {
     /// when app windows exist, null when the last one closed. The
     /// pane uses it to swap in a live app view.
     on_app_view: ?*const fn (ctx: ?*anyopaque, host: ?*anyopaque) void = null,
+    /// Fired once per app channel when its FIRST toplevel window
+    /// actually appears (see app_window_opened). The pane shows its
+    /// "app window open" banner off this in window view mode.
+    on_app_window: ?*const fn (ctx: ?*anyopaque) void = null,
 
     /// Optional broadcast-typing filter. When set, every byte from
     /// USER input (keystrokes, paste, hyperlink launch) goes through
@@ -1261,8 +1265,10 @@ pub const Terminal = struct {
     /// those must take the hold-with-log exit path, not detach).
     fn nappFirstWindow(ctx: ?*anyopaque) void {
         const na = @import("util/cast.zig").userData(NApp, ctx);
-        const remote = na.terminal.remote orelse return;
+        const t = na.terminal;
+        const remote = t.remote orelse return;
         remote.app_window_opened = true;
+        if (t.on_app_window) |f| f(t.user_ctx);
     }
 
     fn nappData(self: *Terminal, na: *NApp, bytes: []const u8) void {
@@ -1472,6 +1478,7 @@ pub const Terminal = struct {
         // fence; a still-set on_app_view would fire into the freed
         // Pane with a nulled user_ctx (was a crash on app-tab close).
         self.on_app_view = null;
+        self.on_app_window = null;
         self.broadcast_sink = null;
         self.broadcast_ctx = null;
     }
@@ -1627,6 +1634,7 @@ test "nappOpen appends before firing on_app_view (empty-list deref regression)" 
     term.allocator = alloc;
     term.remote = &remote;
     term.peer_drivers = 0;
+    term.on_app_window = null;
     term.user_ctx = &cap;
     term.on_app_view = Cb.onView;
 
@@ -1679,6 +1687,7 @@ test "destroyNApp fires on_app_view before destroying the host" {
     term.allocator = alloc;
     term.remote = &remote;
     term.peer_drivers = 0;
+    term.on_app_window = null;
     term.user_ctx = null;
     term.on_app_view = null;
 
@@ -1734,6 +1743,7 @@ test "clearSinks fences on_app_view (fenced-pane teardown crash regression)" {
     term.allocator = alloc;
     term.remote = &remote;
     term.peer_drivers = 0;
+    term.on_app_window = null;
     term.user_ctx = &cap;
     term.on_app_view = Cb.onView;
 

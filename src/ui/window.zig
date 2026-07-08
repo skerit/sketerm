@@ -1871,6 +1871,9 @@ pub const Window = struct {
         // Not in disownPane: adoption (cross-window tab drag) also
         // disowns, but there the pane lives on and must keep its IM.
         pane.detachIm();
+        // Return any embedded app view to its hidden window before the
+        // widget surgery destroys the pane subtree it lives in.
+        pane.detachAppHost();
         const term = pane.terminal;
         term.clearSinks();
         schedulePaneTeardown(pane, term);
@@ -2120,6 +2123,7 @@ pub const Window = struct {
         pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
         pane.restartBlinkTimer();
         pane.setGraphicsOffload(self.config.graphics_offload);
+        pane.app_view_tab = self.config.app_view == .tab;
         pane.line_pad_px = s.line_pad_px;
         pane.grid_pass.pad = s.padding;
         pane.cell_pass.pad = s.padding;
@@ -3351,6 +3355,9 @@ pub const Window = struct {
             }
             // Rendering.
             p.setGraphicsOffload(self.config.graphics_offload);
+            // Affects the next app launch; live views keep their mode
+            // (pop in/out via the window's host menu).
+            p.app_view_tab = self.config.app_view == .tab;
             p.grid_pass.enable_ligatures = self.config.ligatures;
             p.grid_pass.enable_bidi = self.config.bidi;
             p.grid_pass.enable_url_underline = self.config.auto_url_detect;
@@ -4967,6 +4974,16 @@ pub const Window = struct {
             \\    font-size: 10px;
             \\    padding: 1px 7px;
             \\    border-radius: 0 0 0 8px;
+            \\}}
+            \\
+            \\/* "App window open — click to raise" strip above an app
+            \\   session's log while its windows float. */
+            \\.sketerm-app-banner {{
+            \\    background-color: rgba(53, 132, 228, 0.25);
+            \\    font-size: 11px;
+            \\    min-height: 20px;
+            \\    padding: 1px 6px;
+            \\    border-radius: 0;
             \\}}
             \\
             \\/* Active-tab indicator — accent line under the selected
