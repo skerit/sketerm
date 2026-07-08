@@ -6667,3 +6667,36 @@ back; Show in Tab re-embeds; closing the app tab (live channel) no
 longer crashes; app quit now lands in detach-to-shell instead of the
 crash face. 667/672 tests, mux + mux-portable green, daemon purity
 ldd grep = 0, smoke-mux + smoke-mcp + smoke-e2e PASS.
+
+## Feature: tabless app launch (Jul 8, follow-up)
+
+User feedback: launching an app must not open a terminal AT ALL (a
+desktop launcher doesn't). Window view mode now attaches app sessions
+with no pane and no tab: `Window.AppSession` is a bare mux client
+(Terminal.initRemote, minimal callbacks) whose AppHost floating
+windows are the only UI. Routed in attachMux off the snapshot app
+flag (byte 8), so the launcher, `sketerm app`, and attach-session all
+behave the same; takeover attaches keep the tab path. A tab appears
+only when useful: exit-without-window materializes the terminal into
+a held "app exited (N)" tab (adoptAppSessionIntoTab — the log is the
+only diagnostic for failed launches / single-instance handoffs), and
+"Show in Tab" on a floating window adopts + embeds it
+(Pane.adoptAppHost). Clean quits reap silently (deferred to an idle:
+the exit signal fires inside the terminal's own socket callback).
+GUI teardown detaches (apps are durable like any session). AI-driven
+badge still works tabless (on_peers -> AppHost.setDriven).
+
+Validated on isolated Xvfb: launch = floating window + zero tabs;
+quit = silent reap; windowless exit = held log tab (text verified);
+Show in Tab = interactive embedded tab (clicked 7); tab mode
+regression = embedded tab, no float. 667/672 tests, daemon builds +
+purity green, smoke-mux/mcp/e2e PASS.
+
+Testing note: three GUI crashes in the isolated env (2x pango SEGV,
+1x malloc abort) were heap corruption from concurrent fontconfig
+cache-rebuild threads racing in system libs — isolated
+XDG_CONFIG_HOME invalidates the fc cache key, so every launch
+rescans fonts on worker threads. No sketerm frames in any faulting
+stack; never reproduces with warm caches. Mitigation for isolated
+GUI testing: run `fc-cache` under the isolated XDG_CONFIG_HOME once
+before launching.
