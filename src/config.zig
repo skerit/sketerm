@@ -227,6 +227,11 @@ pub const Config = struct {
 
     // Rendering
     ligatures: bool = true,
+    /// GtkGraphicsOffload for pane GL content (Wayland subsurface +
+    /// dmabuf scanout fast path). Disable to force GSK compositing —
+    /// escape hatch for compositor/GTK subsurface bugs (a KWin/GTK
+    /// frame-callback object-id leak crashed long sessions).
+    graphics_offload: bool = true,
     /// Bidirectional text reorder via fribidi. Only affects lines
     /// containing non-ASCII codepoints; pure-ASCII lines skip it.
     bidi: bool = true,
@@ -673,6 +678,7 @@ pub const Config = struct {
         if (!self.ligatures) try w.writeAll("ligatures = false\n");
         if (!self.bidi) try w.writeAll("bidi = false\n");
         if (!self.auto_theme) try w.writeAll("auto_theme = false\n");
+        if (!self.graphics_offload) try w.writeAll("graphics_offload = false\n");
 
         // Bell.
         if (!self.shell_integration) try w.writeAll("shell_integration = off\n");
@@ -1107,6 +1113,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.bidi = try parseBool(value);
     } else if (std.mem.eql(u8, key, "auto_theme")) {
         cfg.auto_theme = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "graphics_offload")) {
+        cfg.graphics_offload = try parseBool(value);
     } else if (std.mem.eql(u8, key, "shell_integration")) {
         cfg.shell_integration = if (std.mem.eql(u8, value, "auto"))
             true
@@ -1485,6 +1493,7 @@ test "config: serialise round-trips through loadFromBytes" {
     cfg.settings.cursor_color = .{ 0.5, 1.0, 0.5, 1.0 };
     cfg.bell_audible = true;
     cfg.ligatures = false;
+    cfg.graphics_offload = false;
 
     var buf: [2048]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -1503,6 +1512,7 @@ test "config: serialise round-trips through loadFromBytes" {
     try std.testing.expectEqual(@as(i16, -1), parsed.settings.line_pad_px);
     try std.testing.expectEqual(true, parsed.bell_audible);
     try std.testing.expectEqual(false, parsed.ligatures);
+    try std.testing.expectEqual(false, parsed.graphics_offload);
     // Colors round-trip through #RRGGBB so they may lose the lowest
     // byte of float precision but the high bits should match.
     try std.testing.expect(@abs(parsed.settings.default_fg[0] - 1.0) < 0.01);
