@@ -6607,3 +6607,63 @@ always valid and equals the new host on the first window -- matching
 what destroyNApp already does. Regression test in terminal.zig drives
 the real nappOpen + AppHost; it crashes on the pre-fix ordering and
 passes after. 665/670 tests, all builds green, daemon purity clean.
+
+## Feature: app view modes + three crash/UX fixes around forwarded apps (Jul 8)
+
+Batch driven by user feedback after the first real remote-app use:
+the double view (floating window AND a fake tab mirror), the
+uninteractable tab view, the confusing single-instance handoff
+(pcmanfm), and a fresh GUI segfault on closing an app.
+
+- `🐛 terminal:` closing a tab whose app session still had a live
+  Wayland channel crashed: `clearSinks` nulled `user_ctx` but not
+  `on_app_view` (nor `on_peers`/`on_transfer`/`on_recording_changed`/
+  `on_listing`/`on_apps`/broadcast), so the deferred Terminal.deinit's
+  `destroyAllChans` fired the callback into the fenced Pane with a
+  null ctx (coredump 73126: rdi=0, fault at Pane.terminal offset
+  0x1cd0, frame #1 = destroyAllChans loop). Also fixed the sibling
+  UAF: `destroyNApp` destroyed the AppHost BEFORE firing on_app_view,
+  handing the pane a freed host to `setMirror(null)` on. Both have
+  regression tests (the fence test reproduces the exact SEGV pre-fix).
+- `🐛 wlapp:` `app_window_opened` flipped when the app merely
+  CONNECTED to the Wayland display (nappOpen/channel open). GTK apps
+  connect during gtk_init, then single-instance ones hand off to a
+  running instance and exit windowless — so pcmanfm's exit took the
+  detach-to-shell path (confusing local pane) instead of holding the
+  app log. AppHost now fires `on_first_window` on the first toplevel
+  frame; the hold-tab tooltip explains the single-instance case.
+- `✨ app view modes:` launching an app no longer produces two views.
+  Window mode (default): floating windows only; the tab keeps the app
+  log plus a clickable "App window open — click to raise" banner (new
+  `Terminal.on_app_window` event). Tab mode (`app_view = tab`, prefs
+  Behavior > Applications, or "Show in Tab" in the Ctrl+right-click
+  host menu): the toplevel's overlay (picture + popups + subsurfaces)
+  reparents into the pane and is FULLY interactive — pointer/scroll
+  controllers travel with the picture, a picture-level key/focus
+  controller pair handles the keyboard, an input-transparent
+  GtkDrawingArea "resize" sensor configures the app to the pane size
+  (FILL fit keeps mapXY exact), and the buffer is cropped to the
+  window geometry (no CSD shadow inside the tab). "Pop Out Window" in
+  the host menu floats it again; the hidden GtkWindow is kept alive
+  (childless) so window-based code paths stay valid and pop-out just
+  re-childs + presents it. Dialogs/secondary toplevels always float.
+  Only the wlhost/native path embeds (winstream/macOS remotes float).
+- `🐛 terminal:` quitting a forwarded app painted the crash sad-face:
+  G_IO_HUP arrives together with the final readable data when the
+  worker flushes `.exit` and closes, and remoteSocketCb declared the
+  crash before draining the socket. Wire-level repro (python client)
+  proved the daemon sends chan_close + exit + EOF cleanly; the GUI
+  threw the exit frame away. Now: drain + peel first, close after.
+  Pre-existing bug (reproduced at the previous HEAD), timing-dependent
+  — which is why some exits looked clean before.
+
+Verified end-to-end on isolated Xvfb + clean-env daemon (so forwarded
+apps use the Wayland hub, not X11 fallback): window mode = floating
+window + banner tab with live log; tab mode = gnome-calculator
+embedded, clicked "7" by coordinate, typed "+5" Enter = 12 (pointer
+AND keyboard through the embed), app's own right-click popup and
+tooltips render in-tab; Pop Out preserves state and brings the banner
+back; Show in Tab re-embeds; closing the app tab (live channel) no
+longer crashes; app quit now lands in detach-to-shell instead of the
+crash face. 667/672 tests, mux + mux-portable green, daemon purity
+ldd grep = 0, smoke-mux + smoke-mcp + smoke-e2e PASS.
