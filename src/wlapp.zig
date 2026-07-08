@@ -525,7 +525,9 @@ pub const AppHost = struct {
         self.finalFree();
     }
 
-    fn finalFree(self: *AppHost) void {
+    /// Reachable from tests that park a host via `pending_reads`;
+    /// production paths get here through destroy()/onClipReadDone.
+    pub fn finalFree(self: *AppHost) void {
         self.intents.deinit(self.allocator);
         self.comp.deinit();
         self.allocator.destroy(self);

@@ -1287,7 +1287,6 @@ pub const Terminal = struct {
     }
 
     fn destroyNApp(self: *Terminal, na: *NApp) void {
-        na.host.destroy();
         if (self.remote) |remote| {
             for (remote.napps.items, 0..) |it, i| {
                 if (it == na) {
@@ -1295,6 +1294,9 @@ pub const Terminal = struct {
                     break;
                 }
             }
+            // Fire BEFORE destroying the host: the pane's handler
+            // detaches its mirror from the OLD host via setMirror,
+            // which must still be alive here (was a use-after-free).
             if (self.on_app_view) |f| {
                 f(self.user_ctx, if (remote.napps.items.len > 0)
                     @ptrCast(remote.napps.items[0].host)
@@ -1302,6 +1304,7 @@ pub const Terminal = struct {
                     null);
             }
         }
+        na.host.destroy();
         self.allocator.destroy(na);
     }
 
@@ -1447,6 +1450,19 @@ pub const Terminal = struct {
         self.on_pointer_shape = null;
         self.on_set_profile = null;
         self.on_session_renamed = null;
+        self.on_recording_changed = null;
+        self.on_transfer = null;
+        self.on_listing = null;
+        self.listing_ctx = null;
+        self.on_apps = null;
+        self.apps_ctx = null;
+        self.on_peers = null;
+        // Deferred Terminal.deinit runs destroyAllChans AFTER this
+        // fence; a still-set on_app_view would fire into the freed
+        // Pane with a nulled user_ctx (was a crash on app-tab close).
+        self.on_app_view = null;
+        self.broadcast_sink = null;
+        self.broadcast_ctx = null;
     }
 
     /// Send user input bytes (keystrokes, paste, etc) to the PTY,
@@ -1617,3 +1633,101 @@ test "nappOpen appends before firing on_app_view (empty-list deref regression)" 
     remote.napps.deinit(alloc);
 }
 
+test "destroyNApp fires on_app_view before destroying the host" {
+    // Regression: destroyNApp used to destroy the AppHost FIRST and fire
+    // on_app_view after. The pane's handler calls setMirror(null) on the
+    // OLD host -- freed memory by then (use-after-free on every app-window
+    // close). The callback must observe the departing host still alive.
+    const alloc = std.testing.allocator;
+
+    const Captured = struct { fired: bool = false, host: ?*anyopaque = null, old_dead: bool = true, old: ?*@import("wlapp.zig").AppHost = null };
+    var cap: Captured = .{};
+    const Cb = struct {
+        fn onView(ctx: ?*anyopaque, host: ?*anyopaque) void {
+            const c2: *Captured = @ptrCast(@alignCast(ctx.?));
+            c2.fired = true;
+            c2.host = host;
+            if (c2.old) |h| c2.old_dead = h.dead;
+        }
+    };
+
+    var remote: Terminal.Remote = undefined;
+    remote.napps = .empty;
+    remote.wsapps = .empty;
+    remote.app_window_opened = false;
+    remote.closed = true; // sendChanClose must not touch conn
+
+    var term: Terminal = undefined;
+    term.allocator = alloc;
+    term.remote = &remote;
+    term.peer_drivers = 0;
+    term.user_ctx = null;
+    term.on_app_view = null;
+
+    term.nappOpen(7);
+    try std.testing.expectEqual(@as(usize, 1), remote.napps.items.len);
+    const na = remote.napps.items[0];
+    cap.old = na.host;
+    term.user_ctx = &cap;
+    term.on_app_view = Cb.onView;
+
+    // Park the host: destroy() defers finalFree while a clipboard read
+    // is outstanding, keeping the memory valid so the dead flag stays
+    // observable under BOTH orderings (deterministic, no UAF in-test).
+    na.host.pending_reads = 1;
+    term.destroyNApp(na);
+
+    try std.testing.expect(cap.fired);
+    try std.testing.expectEqual(@as(?*anyopaque, null), cap.host);
+    try std.testing.expect(!cap.old_dead); // host alive at callback time
+
+    // Drain the parked read so the doomed host frees (no test leak).
+    cap.old.?.pending_reads = 0;
+    try std.testing.expect(cap.old.?.doomed);
+    cap.old.?.finalFree();
+    remote.napps.deinit(alloc);
+    remote.wsapps.deinit(alloc);
+}
+
+test "clearSinks fences on_app_view (fenced-pane teardown crash regression)" {
+    // Regression: clearSinks nulled user_ctx but left on_app_view set, so
+    // the deferred Terminal.deinit -> destroyAllChans fired the callback
+    // into the freed Pane with a null ctx (SIGSEGV on closing a tab whose
+    // app session still had a live Wayland channel).
+    const alloc = std.testing.allocator;
+
+    const Captured = struct { fired: bool = false };
+    var cap: Captured = .{};
+    const Cb = struct {
+        fn onView(ctx: ?*anyopaque, host: ?*anyopaque) void {
+            _ = host;
+            const c2: *Captured = @ptrCast(@alignCast(ctx.?));
+            c2.fired = true;
+        }
+    };
+
+    var remote: Terminal.Remote = undefined;
+    remote.napps = .empty;
+    remote.wsapps = .empty;
+    remote.app_window_opened = false;
+    remote.closed = true; // sendChanClose must not touch conn
+
+    var term: Terminal = undefined;
+    term.allocator = alloc;
+    term.remote = &remote;
+    term.peer_drivers = 0;
+    term.user_ctx = &cap;
+    term.on_app_view = Cb.onView;
+
+    term.nappOpen(9);
+    cap.fired = false;
+
+    term.clearSinks();
+    try std.testing.expectEqual(@as(?*anyopaque, null), term.user_ctx);
+    term.destroyAllChans();
+
+    try std.testing.expect(!cap.fired); // fence held: nothing reached the pane
+    try std.testing.expectEqual(@as(usize, 0), remote.napps.items.len);
+    remote.napps.deinit(alloc);
+    remote.wsapps.deinit(alloc);
+}
