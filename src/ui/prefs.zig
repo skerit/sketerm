@@ -1004,6 +1004,12 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSwitchRow(@ptrCast(@alignCast(bold_group)), ctx, "Allow bold", "Honour the bold attribute (font weight + bright color).", &ctx.cfg.allow_bold, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(bold_group)), ctx, "Bold is bright", "Bold text uses bright palette 8..15 instead of normal 0..7.", &ctx.cfg.bold_is_bright, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(bold_group)));
+
+    // Compositing.
+    const comp_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(comp_group)), "Compositing");
+    addSwitchRow(@ptrCast(@alignCast(comp_group)), ctx, "Graphics offload", "Wayland subsurface scanout fast path. Turn off if your compositor misbehaves with subsurfaces.", &ctx.cfg.graphics_offload, applyOnly);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(comp_group)));
 }
 
 const StringFieldCtx = struct {
