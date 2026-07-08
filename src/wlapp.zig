@@ -212,6 +212,22 @@ pub const AppHost = struct {
         /// filling the overlay — its "resize" signal is GTK4's only
         /// clean allocation-change hook.
         embed_sensor: ?*c.GtkWidget = null,
+        /// The app's Wayland app_id (owned). The full apply (Wayland
+        /// set_application_id / X11 WM_CLASS) needs the GdkSurface,
+        /// which doesn't exist until realize — so it's stored here and
+        /// re-applied in onWinRealize. Gives the floating window the
+        /// remote app's taskbar icon + name instead of sketerm's.
+        app_id: ?[]u8 = null,
+
+        /// Store the app_id and apply it. Called pre- and post-realize
+        /// (idempotent): pre-realize only the icon-name lands (no
+        /// surface); onWinRealize re-applies the surface-bound parts.
+        fn setAppId(self: *Win, app_id: []const u8) void {
+            const owned = self.host.allocator.dupe(u8, app_id) catch return;
+            if (self.app_id) |old| self.host.allocator.free(old);
+            self.app_id = owned;
+            rw.applyAppId(self.window, owned);
+        }
 
         /// Ctrl+right-click host menu: the only host-side chrome a
         /// forwarded window has (everything else goes to the app).
@@ -565,6 +581,7 @@ pub const AppHost = struct {
             }
             // Break the close-request link before gtk teardown.
             w.*.cancelOpaqueResize();
+            if (w.*.app_id) |aid| self.allocator.free(aid);
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-wlapp", null);
             c.gtk_window_destroy(w.*.window);
             self.allocator.destroy(w.*);
@@ -1004,7 +1021,7 @@ pub const AppHost = struct {
             }) |old| self.allocator.free(old.value);
             return;
         };
-        rw.applyAppId(win.window, app_id);
+        win.setAppId(app_id);
     }
 
     fn onGone(ctx: ?*anyopaque, surface: u32) void {
@@ -1022,6 +1039,7 @@ pub const AppHost = struct {
         }
         if (win.rec) |*r| r.abort();
         if (win.vrec) |*r| r.abort();
+        if (win.app_id) |aid| self.allocator.free(aid);
         win.cancelOpaqueResize();
         _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-wlapp", null);
         c.gtk_window_destroy(win.window);
@@ -1068,7 +1086,7 @@ pub const AppHost = struct {
             self.allocator.free(kv.value);
         }
         if (self.pending_app_ids.fetchRemove(surface)) |kv| {
-            rw.applyAppId(win.window, kv.value);
+            win.setAppId(kv.value);
             self.allocator.free(kv.value);
         }
         // Assistant-is-driving badge, toggled by setDriven.
@@ -1536,6 +1554,11 @@ pub const AppHost = struct {
         const win = cast.userData(Win, user);
         const surface = c.gtk_native_get_surface(@ptrCast(window)) orelse return;
         _ = c.g_signal_connect_data(@ptrCast(surface), "compute-size", @ptrCast(&onComputeSize), win, null, c.G_CONNECT_AFTER);
+        // The surface exists now: apply the app_id's surface-bound
+        // parts (Wayland set_application_id / X11 WM_CLASS) that were
+        // skipped when it arrived before the first frame. Set before
+        // the first commit so the WM reads it on map.
+        if (win.app_id) |aid| rw.applyAppId(win.window, aid);
     }
 
     fn onComputeSize(_: ?*c.GdkToplevel, size: ?*c.GdkToplevelSize, user: ?*anyopaque) callconv(.c) void {
