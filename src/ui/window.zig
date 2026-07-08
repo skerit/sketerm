@@ -4019,7 +4019,10 @@ pub const Window = struct {
         var buf: [96:0]u8 = undefined;
         const t = std.fmt.bufPrintZ(&buf, "app exited ({d})", .{status}) catch "app exited";
         c.adw_tab_page_set_title(page, t.ptr);
-        c.adw_tab_page_set_tooltip(page, t.ptr);
+        c.adw_tab_page_set_tooltip(page, "The app exited without opening a window here. " ++
+            "Single-instance apps hand off to an already-running instance " ++
+            "(its window opened THERE); otherwise the launch failed — " ++
+            "see the log in this tab.");
         if (page != c.adw_tab_view_get_selected_page(self.tab_view))
             c.adw_tab_page_set_needs_attention(page, 1);
     }

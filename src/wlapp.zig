@@ -45,6 +45,14 @@ pub const AppHost = struct {
     mirror: ?*c.GtkWidget = null,
     mirror_surface: u32 = 0,
     flush_ctx: ?*anyopaque = null,
+    /// Fired once, on the first frame of the app's FIRST toplevel
+    /// window. Distinguishes "the app really showed a window" from
+    /// "the app merely connected to the display" — single-instance
+    /// apps (pcmanfm) hand off to a running instance and exit
+    /// without ever mapping one.
+    on_first_window: ?*const fn (ctx: ?*anyopaque) void = null,
+    first_window_ctx: ?*anyopaque = null,
+    saw_window: bool = false,
     /// Outgoing seat-intent units (proto v5). The local compositor
     /// is a passive replica whose protocol output is discarded — the
     /// daemon brain answers the app; only these intents travel.
@@ -697,6 +705,10 @@ pub const AppHost = struct {
             }
         }
         const win = self.winFor(surface, dw, dh) orelse return;
+        if (!self.saw_window) {
+            self.saw_window = true;
+            if (self.on_first_window) |f| f(self.first_window_ctx);
+        }
         win.buf_w = lw;
         win.buf_h = lh;
         // Geometry size changed (app self-resize or first frame): match
