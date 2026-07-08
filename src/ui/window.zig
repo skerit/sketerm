@@ -175,6 +175,12 @@ pub const Window = struct {
     title_buf: [256]u8 = undefined,
     panes: std.ArrayList(*Pane) = .empty,
     terminals: std.ArrayList(*Terminal) = .empty,
+    /// Tabless forwarded-app sessions (window view mode): the mux
+    /// attach client feeding the app's floating windows — no pane,
+    /// no tab, nothing in the workspace. A tab materializes only on
+    /// "Show in Tab" or when the app exits without ever opening a
+    /// window (the log is the user's only diagnostic).
+    app_sessions: std.ArrayList(*AppSession) = .empty,
     allocator: std.mem.Allocator,
     tab_counter: u32 = 0,
     /// Remote control: monotonic pane / tab ids + the socket server.
@@ -705,6 +711,14 @@ pub const Window = struct {
         for (self.panes.items) |p| p.deinit();
         self.panes.deinit(self.allocator);
         self.terminals.deinit(self.allocator);
+        // Tabless app sessions: detach (apps are durable — they keep
+        // running in the daemon like any other session).
+        for (self.app_sessions.items) |as| {
+            as.terminal.clearSinks();
+            as.terminal.deinit();
+            self.allocator.destroy(as);
+        }
+        self.app_sessions.deinit(self.allocator);
         for (self.zoom_hidden.items) |w| c.g_object_unref(w);
         self.zoom_hidden.deinit(self.allocator);
         for (self.notify_slots.items) |slot| self.allocator.free(slot.id);
@@ -3804,10 +3818,140 @@ pub const Window = struct {
         try self.attachMux(conn_in, name, host, null);
     }
 
+    /// Tabless forwarded-app session (window view mode): the mux
+    /// attach client feeding the app's floating windows. See the
+    /// `app_sessions` field docs.
+    pub const AppSession = struct {
+        window: *Window,
+        terminal: *Terminal,
+        /// Exit handled — reap is deferred to an idle (the exit
+        /// fires inside the terminal's own socket callback).
+        doomed: bool = false,
+    };
+
+    /// Attach an app session with NO pane and NO tab: like a desktop
+    /// launcher, the app's own windows are the only thing that
+    /// appears. Takes ownership of `conn`.
+    fn attachMuxApp(
+        self: *Window,
+        conn_in: @import("../mux/client.zig").Conn,
+        name: []const u8,
+        host: ?[]const u8,
+        snap_payload: []const u8,
+    ) !void {
+        var conn = conn_in;
+        const term = blk: {
+            errdefer conn.deinit();
+            break :blk try Terminal.initRemote(self.allocator, conn, name, snap_payload);
+        };
+        errdefer term.deinit();
+        term.debug_to_stderr = self.debug_events;
+        if (host) |h| {
+            term.remote.?.host = self.allocator.dupe(u8, h) catch null;
+        }
+        const as = try self.allocator.create(AppSession);
+        errdefer self.allocator.destroy(as);
+        as.* = .{ .window = self, .terminal = term };
+        try self.app_sessions.append(self.allocator, as);
+        term.user_ctx = @ptrCast(as);
+        // Render requests only matter as the exit signal here
+        // (remoteClosed sets child_exited, then fires this).
+        term.on_render_request = appSessionRender;
+        term.on_crashed = appSessionCrashed;
+        term.on_peers = appSessionPeers;
+        term.on_app_view = appSessionAppView;
+    }
+
+    /// A tabless app session ended. Normal quit (a window was shown)
+    /// drops it quietly; an exit with NO window ever shown means the
+    /// log is the user's only diagnostic (failed launch, or a
+    /// single-instance handoff) — materialize a held tab around it.
+    fn appSessionExited(self: *Window, as: *AppSession) void {
+        if (as.doomed) return;
+        as.doomed = true;
+        if (!as.terminal.remote.?.app_window_opened) {
+            const status = as.terminal.screen.child_exit_status;
+            if (self.adoptAppSessionIntoTab(as)) |pane| {
+                self.holdExitedAppPane(pane, status);
+                return; // the terminal lives on inside the pane
+            }
+            return; // adoption freed everything on failure
+        }
+        // Deferred: we are inside the terminal's own socket callback.
+        _ = c.g_idle_add(@ptrCast(&appSessionReapIdle), @ptrCast(as));
+    }
+
+    fn appSessionReapIdle(user: ?*anyopaque) callconv(.c) c_int {
+        const as = cast.userData(AppSession, user);
+        as.window.unlistAppSession(as);
+        return 0; // G_SOURCE_REMOVE
+    }
+
+    /// Drop a tabless app session: fence, deinit terminal, free.
+    fn unlistAppSession(self: *Window, as: *AppSession) void {
+        for (self.app_sessions.items, 0..) |it, i| {
+            if (it == as) {
+                _ = self.app_sessions.swapRemove(i);
+                break;
+            }
+        }
+        as.terminal.clearSinks();
+        as.terminal.deinit();
+        self.allocator.destroy(as);
+    }
+
+    /// Materialize a real pane + tab around a live tabless app
+    /// terminal ("Show in Tab", or exit-without-window feedback).
+    /// Pane.init rewires user_ctx and callbacks; the AppSession is
+    /// freed (terminal ownership moves to panes/terminals). On
+    /// failure the whole session is dropped and null returned.
+    fn adoptAppSessionIntoTab(self: *Window, as: *AppSession) ?*Pane {
+        const term = as.terminal;
+        for (self.app_sessions.items, 0..) |it, i| {
+            if (it == as) {
+                _ = self.app_sessions.swapRemove(i);
+                break;
+            }
+        }
+        self.allocator.destroy(as);
+        term.clearSinks();
+        // Clear host callbacks still pointing at the freed AppSession;
+        // the pane re-wires its own (adoptAppHost) after.
+        if (term.remote) |r| {
+            for (r.napps.items) |na| na.host.releaseEmbed();
+        }
+        const pane = self.makePane(term) catch {
+            term.deinit();
+            return null;
+        };
+        pane.id = self.allocPaneId();
+        self.wirePaneSinks(pane);
+        self.applyPaneConfig(pane, .{});
+        self.panes.append(self.allocator, pane) catch {};
+        self.terminals.append(self.allocator, term) catch {};
+        term.replayRetainedImages();
+
+        var title_buf: [160:0]u8 = undefined;
+        const title_z = if (term.remote.?.host) |h|
+            std.fmt.bufPrintZ(&title_buf, "⌁ {s} @ {s}", .{ term.remote.?.session, h }) catch "app"
+        else
+            std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{term.remote.?.session}) catch "app";
+        const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        c.gtk_widget_set_hexpand(wrapper, 1);
+        c.gtk_widget_set_vexpand(wrapper, 1);
+        c.gtk_box_append(@ptrCast(wrapper), pane.widget());
+        const page = self.appendOrInsertTab(wrapper, .{ .leaf = pane }, false);
+        c.adw_tab_page_set_title(page, title_z.ptr);
+        c.adw_tab_page_set_tooltip(page, title_z.ptr);
+        c.adw_tab_view_set_selected_page(self.tab_view, page);
+        return pane;
+    }
+
     /// Spawn a forwarded GUI-app session (`app=true`) running `argv`
-    /// on `host`'s daemon and attach it in a new tab; its windows
-    /// render locally via the compositor brain. Used by the remote
-    /// app launcher. `host` null = the local autostart daemon.
+    /// on `host`'s daemon and attach it; in window view mode this is
+    /// TABLESS (floating windows only), in tab mode it's an embedded
+    /// tab. Used by the app launcher. `host` null = the local
+    /// autostart daemon.
     pub fn launchRemoteAppSession(self: *Window, host: ?[]const u8, argv: []const []const u8) !void {
         var name_buf: [64]u8 = undefined;
         const name = nextSessionName(&name_buf);
@@ -4090,6 +4234,18 @@ pub const Window = struct {
             };
         };
         defer snap.deinit(self.allocator);
+
+        // App sessions in window view mode attach TABLESS (their
+        // floating windows are the only UI — a desktop launcher does
+        // not open a terminal). Snapshot header byte 8 is the app
+        // flag. Takeover keeps the tab path: the user explicitly
+        // attached from inside a pane.
+        if (takeover == null and self.config.app_view == .window and
+            snap.payload.len > 8 and snap.payload[8] != 0)
+        {
+            return self.attachMuxApp(conn, name, host, snap.payload);
+        }
+
         const pane = try self.makeRemotePaneFromSnap(conn, name, host, snap.payload, null);
 
         var title_buf: [160:0]u8 = undefined;
@@ -6465,6 +6621,55 @@ fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
     defer self.allocator.free(cstr);
     @memcpy(cstr, text);
     c.gdk_clipboard_set_text(clip, cstr.ptr);
+}
+
+// ── tabless app-session callbacks (Terminal → AppSession) ────────
+
+/// Exit signal for tabless app sessions: remoteClosed sets
+/// child_exited then fires on_render_request (there is no pane tick
+/// to notice it).
+fn appSessionRender(ctx: ?*anyopaque) void {
+    const as = cast.userData(Window.AppSession, ctx);
+    if (!as.terminal.screen.child_exited) return;
+    as.terminal.screen.child_exited = false;
+    as.window.appSessionExited(as);
+}
+
+/// Connection dropped uncleanly — same cleanup path.
+fn appSessionCrashed(ctx: ?*anyopaque) void {
+    const as = cast.userData(Window.AppSession, ctx);
+    as.window.appSessionExited(as);
+}
+
+/// AI-driving badge on the floating windows (no pane border to tint).
+fn appSessionPeers(ctx: ?*anyopaque) void {
+    const as = cast.userData(Window.AppSession, ctx);
+    const t = as.terminal;
+    const remote = t.remote orelse return;
+    for (remote.napps.items) |na| na.host.setDriven(t.peer_drivers > 0);
+}
+
+/// New app host on a tabless session: offer "Show in Tab" via the
+/// host menu (materializes a tab, then embeds).
+fn appSessionAppView(ctx: ?*anyopaque, host_opaque: ?*anyopaque) void {
+    const as = cast.userData(Window.AppSession, ctx);
+    const AppHost = @import("../wlapp.zig").AppHost;
+    const new: ?*AppHost = @ptrCast(@alignCast(host_opaque));
+    if (new) |h| {
+        h.embed_ctx = @ptrCast(as);
+        h.on_request_embed = appSessionRequestEmbed;
+        h.on_embed = null;
+    }
+}
+
+fn appSessionRequestEmbed(ctx: ?*anyopaque) void {
+    const as = cast.userData(Window.AppSession, ctx);
+    const win = as.window;
+    const term = as.terminal;
+    const pane = win.adoptAppSessionIntoTab(as) orelse return;
+    const remote = term.remote orelse return;
+    if (remote.napps.items.len > 0)
+        pane.adoptAppHost(@ptrCast(remote.napps.items[0].host));
 }
 
 fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {
