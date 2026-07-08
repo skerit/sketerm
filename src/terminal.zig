@@ -1240,6 +1240,8 @@ pub const Terminal = struct {
         na.* = .{ .terminal = self, .id = id, .host = host };
         host.on_flush = nappFlushCb;
         host.flush_ctx = na;
+        host.on_first_window = nappFirstWindow;
+        host.first_window_ctx = na;
         host.setDriven(self.peer_drivers > 0);
         // Append BEFORE firing on_app_view: the callback reads napps.items[0],
         // which dereferences the empty-slice sentinel (addr 0x8) on the first
@@ -1250,8 +1252,17 @@ pub const Terminal = struct {
             self.sendChanClose(id);
             return;
         };
-        remote.app_window_opened = true;
         if (self.on_app_view) |f| f(self.user_ctx, @ptrCast(remote.napps.items[0].host));
+    }
+
+    /// First toplevel frame of this app channel: NOW the session
+    /// counts as having shown a window (channel-open alone doesn't —
+    /// single-instance apps connect, hand off, and exit windowless;
+    /// those must take the hold-with-log exit path, not detach).
+    fn nappFirstWindow(ctx: ?*anyopaque) void {
+        const na = @import("util/cast.zig").userData(NApp, ctx);
+        const remote = na.terminal.remote orelse return;
+        remote.app_window_opened = true;
     }
 
     fn nappData(self: *Terminal, na: *NApp, bytes: []const u8) void {
@@ -1626,6 +1637,13 @@ test "nappOpen appends before firing on_app_view (empty-list deref regression)" 
     const na = remote.napps.items[0];
     try std.testing.expectEqual(@as(u32, 123), na.id);
     try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(na.host)), cap.host);
+
+    // Channel open alone must NOT count as a shown window: single-
+    // instance apps connect to the display, hand off, and exit
+    // windowless — only the first toplevel frame flips the flag.
+    try std.testing.expect(!remote.app_window_opened);
+    try std.testing.expect(na.host.on_first_window != null);
+    na.host.on_first_window.?(na.host.first_window_ctx);
     try std.testing.expect(remote.app_window_opened);
 
     na.host.destroy();
