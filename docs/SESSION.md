@@ -6700,3 +6700,33 @@ rescans fonts on worker threads. No sketerm frames in any faulting
 stack; never reproduces with warm caches. Mitigation for isolated
 GUI testing: run `fc-cache` under the isolated XDG_CONFIG_HOME once
 before launching.
+
+## Fix: forwarded-app taskbar icon + name (Jul 8, follow-up)
+
+User (KDE Plasma): a forwarded app got its own taskbar entry but with
+sketerm's icon and hover name. Root cause: `applyAppId`
+(`remote_window.zig`) sets the icon-name + Wayland
+`set_application_id` + X11 `WM_CLASS`, but it ran inside `winFor`
+BEFORE `gtk_window_present`, so the GdkSurface didn't exist yet and
+both surface-bound parts silently early-returned (only the
+Wayland-ignored `gtk_window_set_icon_name` landed). Apps announce
+their app_id during startup, before the first buffer commit, so this
+was the normal path. The window kept GTK's default app_id
+(`SKETERM_APP_ID`), which KDE maps to sketerm's `.desktop` → sketerm
+icon. Fix: store the app_id on the `Win` struct (`setAppId`, owned,
+freed in onGone + AppHost.destroy) and re-apply it in `onWinRealize`
+once the surface exists — before the first commit, so the WM reads it
+on map. Verified on X11 (Xvfb): a forwarded gnome-calculator reports
+`WM_CLASS = org.gnome.Calculator` (was `dev.sker.sketerm`) and
+`_NET_WM_NAME = Calculator`; the window still renders + interacts. On
+Wayland the same code calls `gdk_wayland_toplevel_set_application_id`,
+which KDE resolves to the app's real icon + name. 667/672 tests, mux
++ mux-portable + purity clean, smoke-mux/mcp/e2e PASS.
+
+Caveat (unchanged, fundamental): this fixes LOCAL forwarded apps
+(their `.desktop`/icon is installed locally, so KDE resolves it).
+REMOTE (SSH) apps whose `.desktop`/icon isn't installed on the client
+still fall back to a generic icon — Wayland carries no icon pixels
+over the wire (X11's `_NET_WM_ICON` does; Wayland dropped it). Would
+need shipping icon bytes over the mux channel + installing a local
+hicolor entry; not done (bigger job, not requested).
