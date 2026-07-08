@@ -34,6 +34,7 @@ zig build mux-portable          # static-musl baseline-CPU daemon for scp-to-ser
 zig build test                  # full test suite (currently 663 tests)
 zig build test --summary all    # show test count + timings
 zig build smoke-mux             # mux daemon end-to-end smoke (headless)
+zig build smoke-mcp             # `sketerm mcp` isolation + headless-terminal smoke (headless)
 zig build smoke-e2e             # drives the real GUI via the IPC socket (needs display)
 zig build replay -- cap.bin [cols rows]  # replay raw PTY bytes → Screen grid dump
 zig build spike-gl              # GL share-group + driver-info spike
