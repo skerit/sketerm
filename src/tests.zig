@@ -62,6 +62,7 @@ comptime {
     _ = @import("mux/wire.zig");
     _ = @import("mux/snapshot.zig");
     _ = @import("mux/desktop.zig");
+    _ = @import("mux/icons.zig");
     _ = @import("mux/dbus.zig");
     _ = @import("mux/a11yhub.zig");
     _ = @import("mux/cast.zig");
