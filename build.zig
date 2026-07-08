@@ -214,6 +214,31 @@ pub fn build(b: *std.Build) void {
     const smoke_mux_step = b.step("smoke-mux", "Mux daemon end-to-end smoke (headless)");
     smoke_mux_step.dependOn(&smoke_mux_run.step);
 
+    // MCP isolation + headless-terminal smoke — `zig build smoke-mcp`.
+    // Spawns `zig-out/bin/sketerm mcp` and drives it over stdio; only
+    // needs /bin/sh (no display / GUI apps / a11y bus).
+    const smoke_mcp_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_mcp.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, smoke_mcp_mod, core_cbindings_mod);
+    smoke_mcp_mod.addImport("build_options", noglib_opts_mod);
+    if (native_sck) addSckBackend(b, smoke_mcp_mod);
+    if (have_x264) addVideo(b, smoke_mcp_mod);
+    if (have_vtenc) addVtEnc(b, smoke_mcp_mod);
+    const smoke_mcp = b.addExecutable(.{
+        .name = "sketerm-smoke-mcp",
+        .root_module = smoke_mcp_mod,
+        .use_lld = use_lld,
+    });
+    const smoke_mcp_run = b.addRunArtifact(smoke_mcp);
+    smoke_mcp_run.step.dependOn(b.getInstallStep()); // execs zig-out/bin/sketerm
+    smoke_mcp_run.setCwd(b.path("."));
+    const smoke_mcp_step = b.step("smoke-mcp", "MCP isolation + headless-terminal smoke (headless)");
+    smoke_mcp_step.dependOn(&smoke_mcp_run.step);
+
     // Broker (process-isolation) smoke — `zig build smoke-broker` (headless).
     const smoke_broker_mod = b.createModule(.{
         .root_source_file = b.path("src/smoke_broker.zig"),
