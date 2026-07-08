@@ -6488,3 +6488,70 @@ removes dir + daemon, named instance survives restart and the
 reconnected MCP drives the still-running calculator, `--shared` hits
 the shared daemon with no `mcp-*` dirs, stale sweep reaps a planted
 dead-pid dir. `smoke-mux` + `smoke-e2e` (fatal-criticals) PASS.
+
+## Feature batch: recording, a11y actions, headless terminals, smoke-mcp
+
+Six features on top of the MCP-isolation work.
+
+### Asciicast v2 session recording, daemon-side (no wrapper)
+The daemon taps each session's raw PTY output (`src/mux/cast.zig`,
+UTF-8-safe JSON escaping with split-sequence carry) into an asciinema
+`.cast` v2 file. Wire frames `rec_start`/`rec_stop` (client->daemon);
+tapped in `drainSession` + the resize handler. Any RUNNING session
+records live -- context menu (Pane submenu, start/stop rows gated on
+`Terminal.recording`), `sketerm cli record-start/-stop --out`, and MCP
+`record_pane_start`/`record_pane_stop`. Remote sessions record to a
+path on the remote host (that's where the bytes are). Also fixed
+`send-text --enter`, which was silently dropped (only `type-text`
+honored it). Validated: recorded a session, replayed it through the
+real `asciinema` binary.
+
+### AT-SPI element actions: perform_action / set_value / wait_for_element
+`a11yhub.zig` gained `doAction` (org.a11y.atspi.Action.DoAction),
+`setTextContents` (EditableText) and `setCurrentValue` (Value); tree
+nodes now carry a stable `id` (dest#path) and a `value`
+(Value.CurrentValue). Wire: `app_a11y` payload carries an optional op
+(`{op,id,index/text/value}`). MCP: `app_perform_action` (the reliable
+coordinate-free "click"), `app_set_value` (text fields + sliders),
+`app_wait_for_element` (poll the tree for a role/name). Dropped
+element-click-by-rect: AT-SPI screen extents collapse to the origin
+for headless apps, so coordinate clicks off the tree are unreliable --
+the action API is the right path. Validated headless: gnome-calculator
+7+5=12 via perform_action; a GtkScale slider 10->55 via set_value
+(read back through the tree); a GtkEntry text set + clipboard read-back.
+
+### Headless terminal tools on the private daemon
+`src/ipc/termdrive.zig` -- a GTK-free mux client that spawns/drives
+plain SHELL sessions on the isolated daemon, keeping a client-side
+`Screen` mirror (snapshot restore + event apply). MCP `term_open`,
+`term_run`, `term_send_text`, `term_send_keys`, `term_read`,
+`term_wait_idle`, `term_resize`, `term_list`, `term_close`. So
+`sketerm mcp` is now a complete sandboxed computer-use kit -- real
+shells AND GUI apps, no display, nothing of the user's reachable.
+Validated: echo/uname captured, interactive `rev` (abcdef->fedcba)
+proves input+output, ctrl+c returns to the prompt, second independent
+terminal, isolation intact.
+
+### WebM/VP9 app-window recording (default) alongside GIF
+`vendor/vpxenc_shim.c` (libvpx VP9, x264-shim discipline) +
+`src/util/webm.zig` (hand-rolled live EBML/WebM muxer, the
+msf_gif-equivalent for video) + `src/util/videorec.zig` (BGRA->I420 +
+encode + mux). MCP `app_record_start` defaults to webm (`format:"gif"`
+for the old path); the GUI host menu offers both. libvpx links
+GUI-side only (`configureSysDeps`); the daemon stays libc-clean
+(verified by `ldd`). Fixed a use-after-clear in `recordStop` (pointer
+into the optional survived `self.vrec = null`). Validated: ffprobe
+reads 13 VP9 frames at 1078x834, ffmpeg decodes the stream cleanly.
+`libvpx` added to PKGBUILD depends + the CLAUDE.md dep list.
+
+### smoke-mcp build target
+`zig build smoke-mcp` spawns `sketerm mcp` and drives it over stdio,
+asserting the isolation lifecycle (private socket created, shared
+mux.sock absent, ephemeral teardown on exit) + headless terminal
+tools + named-durable-daemon survival across an MCP restart. Uses only
+/bin/sh (no display/apps/a11y). Note: `std.debug.print` segfaults in
+this ReleaseFast core-deps build -- the harness prints via a libc
+`write(2)` helper.
+
+Baseline after the batch: 664/669 tests (5 skip), all builds green,
+daemon links no gtk/glib/dbus/vpx, `smoke-mux` + `smoke-mcp` PASS.
