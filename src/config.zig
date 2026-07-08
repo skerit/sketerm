@@ -35,6 +35,11 @@ pub const CursorShape = enum { block, underline, bar };
 /// so users can see why a command died.
 pub const ExitAction = enum { close, restart, hold };
 
+/// Where a forwarded app's primary window renders: free-floating
+/// window (the tab keeps the app log + a raise banner), or embedded
+/// interactively inside the tab (pop-out available either way).
+pub const AppView = enum { window, tab };
+
 /// AdwTabBar position relative to the window.
 pub const TabPosition = enum { top, bottom };
 
@@ -217,6 +222,8 @@ pub const Config = struct {
     /// layout: your keystrokes pass through as raw keycodes, and the
     /// app decodes them with this keymap. Empty = us.
     app_keyboard_layout: []const u8 = "",
+    /// Default view for forwarded-app sessions (see AppView).
+    app_view: AppView = .window,
     /// UDP port range "lo:hi" passed to the remote `--udp-listen`
     /// bootstrap (mosh-style; firewalls usually need a pinned range
     /// like "60000:61000"). Empty = ephemeral port.
@@ -698,6 +705,7 @@ pub const Config = struct {
         if (self.gtk_theme.len > 0) try w.print("gtk_theme = {s}\n", .{self.gtk_theme});
         if (self.app_keyboard_layout.len > 0)
             try w.print("app_keyboard_layout = {s}\n", .{self.app_keyboard_layout});
+        if (self.app_view != .window) try w.print("app_view = {s}\n", .{@tagName(self.app_view)});
         if (self.mux_udp_port_range.len > 0)
             try w.print("mux_udp_port_range = {s}\n", .{self.mux_udp_port_range});
 
@@ -1148,6 +1156,10 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.gtk_theme = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "app_keyboard_layout")) {
         cfg.app_keyboard_layout = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "app_view")) {
+        if (std.mem.eql(u8, value, "window")) cfg.app_view = .window
+        else if (std.mem.eql(u8, value, "tab")) cfg.app_view = .tab
+        else return error.BadAppView;
     } else if (std.mem.eql(u8, key, "mux_udp_port_range")) {
         // Validate lo:hi here so a typo warns at load, not mid-ssh.
         const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.BadPortRange;
@@ -1448,6 +1460,7 @@ test "config: palette + scheme + new keys round-trip" {
     cfg.tab_position = .bottom;
     cfg.close_button_on_tab = false;
     cfg.exit_action = .hold;
+    cfg.app_view = .tab;
     cfg.bell_visible = false;
     cfg.bell_urgent = false;
     cfg.word_chars = "abc";
@@ -1472,6 +1485,7 @@ test "config: palette + scheme + new keys round-trip" {
     try std.testing.expectEqual(TabPosition.bottom, parsed.tab_position);
     try std.testing.expectEqual(false, parsed.close_button_on_tab);
     try std.testing.expectEqual(ExitAction.hold, parsed.exit_action);
+    try std.testing.expectEqual(AppView.tab, parsed.app_view);
     try std.testing.expectEqual(false, parsed.bell_visible);
     try std.testing.expectEqual(false, parsed.bell_urgent);
     try std.testing.expectEqualStrings("abc", parsed.word_chars);

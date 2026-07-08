@@ -257,11 +257,20 @@ pub const Pane = struct {
     /// The GraphicsOffload wrapping the GLArea — hidden while an app
     /// view (mirror of the session's forwarded windows) is shown.
     offload_widget: ?*c.GtkWidget = null,
-    /// Live mirror of the session's primary app window: the tab
-    /// content for app sessions, and thus the overview thumbnail.
-    /// Click raises the floating windows.
-    app_mirror: ?*c.GtkWidget = null,
-    app_mirror_host: ?*anyopaque = null,
+    /// Current primary AppHost of an app session (erased *AppHost;
+    /// pane installs its embed box + callbacks on it).
+    app_host: ?*anyopaque = null,
+    /// Container hosting the embedded (in-tab, interactive) app view
+    /// — the AppHost reparents its window overlay into this.
+    app_embed_box: ?*c.GtkWidget = null,
+    /// True while the embedded view is showing (terminal hidden).
+    app_embed_active: bool = false,
+    /// "App window open — click to raise" banner, shown in window
+    /// view mode while the app has floating windows.
+    app_banner: ?*c.GtkWidget = null,
+    /// Config app_view pushed by the Window: embed apps in the tab
+    /// (true) or float them with a banner tab (false, default).
+    app_view_tab: bool = false,
     titlebar_box: ?*c.GtkWidget = null,
     titlebar_label: ?*c.GtkLabel = null,
     titlebar_visible: bool = false,
@@ -429,6 +438,7 @@ pub const Pane = struct {
         terminal.on_session_renamed = onSessionRenamedEvent;
         terminal.on_peers = onPeersChanged;
         terminal.on_app_view = onAppViewEvent;
+        terminal.on_app_window = onAppWindowEvent;
 
         _ = c.g_signal_connect_data(
             area_widget,
@@ -735,6 +745,10 @@ pub const Pane = struct {
         // Defensive: unmap normally detaches first, but a pane torn down
         // while still mapped must not leave a dangling AX child.
         detachA11y(self);
+        // Same for the app host: an embedded overlay inside our widget
+        // tree must be returned to its (hidden) window before GTK
+        // destroys the tree under it. Normally done in unlistPane.
+        self.detachAppHost();
         self.grid_pass.deinit();
         self.cell_pass.deinit();
         self.image_pass.deinit();
@@ -766,6 +780,20 @@ pub const Pane = struct {
     /// (Gtk-CRITICAL in gtk_gl_area_queue_render). Idempotent.
     /// Dropping the ref here also plugs the one-IM-context-per-closed-
     /// pane leak (and its inner D-Bus name watch).
+    /// Sever the pane from its AppHost: return any embedded view to
+    /// its hidden window and drop the host's pane callbacks. Must run
+    /// BEFORE the pane's widget tree is torn down (the embedded
+    /// overlay lives inside it). Idempotent.
+    pub fn detachAppHost(self: *Pane) void {
+        const AppHost = @import("../wlapp.zig").AppHost;
+        if (self.app_host) |hp| {
+            const h: *AppHost = @ptrCast(@alignCast(hp));
+            h.releaseEmbed();
+        }
+        self.app_host = null;
+        self.app_embed_active = false;
+    }
+
     pub fn detachIm(self: *Pane) void {
         const ictx = self.input_ctx orelse return;
         const im = ictx.im_ctx orelse return;
@@ -1775,47 +1803,107 @@ fn onSessionRenamedEvent(ctx: ?*anyopaque, name: []const u8) void {
     if (self.win_on_session_renamed) |f| f(self.win_session_rename_ctx, self, name);
 }
 
-/// The session's primary app host changed. For app sessions the
-/// pane swaps the terminal for a live mirror of the app's primary
-/// window — so the tab (and its overview thumbnail) SHOWS the app.
-/// Null host = last app window gone: the terminal (app log) returns.
+/// The session's primary app host changed (fires at channel open —
+/// BEFORE the first frame, so embed_box installed here catches the
+/// first toplevel). Null host = last app channel gone: the terminal
+/// (app log) returns.
 fn onAppViewEvent(ctx: ?*anyopaque, host_opaque: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
     const AppHost = @import("../wlapp.zig").AppHost;
     const is_app = if (self.terminal.remote) |r| r.is_app else false;
     if (!is_app) return; // shells keep their terminal front and center
-    const old: ?*AppHost = @ptrCast(@alignCast(self.app_mirror_host));
+    const old: ?*AppHost = @ptrCast(@alignCast(self.app_host));
     const new: ?*AppHost = @ptrCast(@alignCast(host_opaque));
     if (old == new) return;
-    if (old) |h| h.setMirror(null);
-    self.app_mirror_host = host_opaque;
+    if (old) |h| h.releaseEmbed();
+    self.app_host = host_opaque;
+    setAppEmbedActive(self, false);
     if (new) |h| {
-        if (self.app_mirror == null) {
-            const pic = c.gtk_picture_new();
-            c.gtk_picture_set_content_fit(@ptrCast(pic), c.GTK_CONTENT_FIT_CONTAIN);
-            c.gtk_widget_set_vexpand(pic, 1);
-            c.gtk_widget_set_hexpand(pic, 1);
-            c.gtk_widget_set_tooltip_text(pic, "Live app view — click to raise the app's windows");
-            const click = c.gtk_gesture_click_new();
-            _ = c.g_signal_connect_data(@ptrCast(click), "released", @ptrCast(&onMirrorClick), @ptrCast(self), null, 0);
-            c.gtk_widget_add_controller(pic, @ptrCast(click));
-            if (self.wrapper_box) |wrap| c.gtk_box_append(@ptrCast(wrap), pic);
-            self.app_mirror = pic;
-        }
-        h.setMirror(self.app_mirror);
-        c.gtk_widget_set_visible(self.app_mirror.?, 1);
-        if (self.offload_widget) |o| c.gtk_widget_set_visible(o, 0);
+        h.embed_ctx = @ptrCast(self);
+        h.on_embed = onAppEmbedChanged;
+        h.on_request_embed = onAppRequestEmbed;
+        if (self.app_view_tab) installEmbedBox(self, h);
     } else {
-        if (self.app_mirror) |pic| c.gtk_widget_set_visible(pic, 0);
-        if (self.offload_widget) |o| c.gtk_widget_set_visible(o, 1);
+        setAppBanner(self, false);
     }
 }
 
-fn onMirrorClick(_: ?*c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+/// The app's first real window appeared. In window view mode (or
+/// after a pop-out) the tab shows the raise banner over the log.
+fn onAppWindowEvent(ctx: ?*anyopaque) void {
+    const self = cast.userData(Pane, ctx);
+    if (self.app_embed_active) return; // embedded view shows itself
+    setAppBanner(self, true);
+}
+
+/// The embedded app view appeared/disappeared: swap it against the
+/// terminal (app log). A disappearance with windows still open
+/// (pop-out) brings the banner back.
+fn onAppEmbedChanged(ctx: ?*anyopaque, active: bool) void {
+    const self = cast.userData(Pane, ctx);
+    setAppEmbedActive(self, active);
+    if (active) {
+        setAppBanner(self, false);
+    } else if (self.terminal.remote) |r| {
+        if (r.app_window_opened and r.napps.items.len > 0) setAppBanner(self, true);
+    }
+}
+
+/// Host menu "Show in Tab" on a floating window: install the embed
+/// box and pull the primary window in.
+fn onAppRequestEmbed(ctx: ?*anyopaque) void {
+    const self = cast.userData(Pane, ctx);
+    const AppHost = @import("../wlapp.zig").AppHost;
+    const h: *AppHost = @ptrCast(@alignCast(self.app_host orelse return));
+    installEmbedBox(self, h);
+    h.popIn();
+}
+
+fn onAppBannerClick(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
     const remote = self.terminal.remote orelse return;
     for (remote.napps.items) |na| na.host.presentAll();
 }
+
+/// Ensure the embed container exists and hand it to the host (the
+/// AppHost reparents its window overlay into it on the next embed).
+fn installEmbedBox(self: *Pane, host: *@import("../wlapp.zig").AppHost) void {
+    if (self.app_embed_box == null) {
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        c.gtk_widget_set_hexpand(box, 1);
+        c.gtk_widget_set_vexpand(box, 1);
+        c.gtk_widget_set_visible(box, 0);
+        if (self.wrapper_box) |wrap| c.gtk_box_append(@ptrCast(wrap), box);
+        self.app_embed_box = box;
+    }
+    host.embed_box = self.app_embed_box;
+}
+
+/// Swap the embedded app view against the terminal (app log).
+fn setAppEmbedActive(self: *Pane, active: bool) void {
+    if (self.app_embed_active == active) return;
+    self.app_embed_active = active;
+    if (self.app_embed_box) |box| c.gtk_widget_set_visible(box, @intFromBool(active));
+    if (self.offload_widget) |o| c.gtk_widget_set_visible(o, @intFromBool(!active));
+}
+
+/// Show/hide the "app window open" banner above the log.
+fn setAppBanner(self: *Pane, show: bool) void {
+    if (show) {
+        if (self.app_banner == null) {
+            const btn = c.gtk_button_new_with_label("App window open — click to raise");
+            c.gtk_widget_add_css_class(btn, "sketerm-app-banner");
+            c.gtk_widget_set_hexpand(btn, 1);
+            _ = c.g_signal_connect_data(@ptrCast(btn), "clicked", @ptrCast(&onAppBannerClick), @ptrCast(self), null, 0);
+            if (self.wrapper_box) |wrap| c.gtk_box_prepend(@ptrCast(wrap), btn);
+            self.app_banner = btn;
+        }
+        c.gtk_widget_set_visible(self.app_banner.?, 1);
+    } else if (self.app_banner) |b| {
+        c.gtk_widget_set_visible(b, 0);
+    }
+}
+
 
 /// Attach roster changed: show/hide the "assistant is driving"
 /// indicator — an accent border on the pane, plus the AI badge on
