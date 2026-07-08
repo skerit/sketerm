@@ -780,6 +780,20 @@ pub const Pane = struct {
     /// (Gtk-CRITICAL in gtk_gl_area_queue_render). Idempotent.
     /// Dropping the ref here also plugs the one-IM-context-per-closed-
     /// pane leak (and its inner D-Bus name watch).
+    /// Adopt an existing AppHost (a tabless session materialized
+    /// into this pane): wire the pane callbacks and embed its
+    /// primary window.
+    pub fn adoptAppHost(self: *Pane, host_opaque: *anyopaque) void {
+        const AppHost = @import("../wlapp.zig").AppHost;
+        const h: *AppHost = @ptrCast(@alignCast(host_opaque));
+        self.app_host = host_opaque;
+        h.embed_ctx = @ptrCast(self);
+        h.on_embed = onAppEmbedChanged;
+        h.on_request_embed = onAppRequestEmbed;
+        installEmbedBox(self, h);
+        h.popIn();
+    }
+
     /// Sever the pane from its AppHost: return any embedded view to
     /// its hidden window and drop the host's pane callbacks. Must run
     /// BEFORE the pane's widget tree is torn down (the embedded
