@@ -6555,3 +6555,37 @@ this ReleaseFast core-deps build -- the harness prints via a libc
 
 Baseline after the batch: 664/669 tests (5 skip), all builds green,
 daemon links no gtk/glib/dbus/vpx, `smoke-mux` + `smoke-mcp` PASS.
+
+## Fix: frame-clock idle churn + Wayland object-id leak crash (Jul 8)
+
+Root-caused the overnight crash of the installed build (coredumpctl
+9539): GTK 4.22 offloads the pane GL content to Wayland subsurfaces
+and requests a frame callback on each one per frame-clock cycle; on
+KWin those callbacks are never retired, so every destroyed proxy
+stays a zombie in libwayland's object map. Our tick callback kept the
+frame clock cycling at monitor refresh 24/7 (cursor blink counted as
+tick work), producing ~147 leaked ids/second for 30 hours until the
+0xf00000 id cap made wl_surface_frame return NULL and GTK crashed on
+the missing NULL check (gdksubsurface-wayland.c:1002). Evidence: the
+core held 15,728,642 map slots, all zombies, free list empty.
+
+Two-sided fix:
+- `⚡ pane:` cursor blink + bell fade moved off the frame clock onto
+  GLib timeouts at their real cadence (500ms half-cycle / 33ms fade
+  burst); the tick callback now exists only for per-frame animation
+  (shader, kitty images), both gated on `gtk_widget_get_mapped`.
+  Idle wakeups measured on isolated Xvfb: old build 2038/10s
+  focused-idle, new build 0/10s (blink adds ~2 renders/s only while
+  a blinking cursor is focused). Also fixed: exit_action never fired
+  when a child exited while no tick was alive (onRenderRequest now
+  re-arms it); kitty animations pause on unmapped background tabs
+  and resume via onAreaMap.
+- `✨ config:` `graphics_offload = false` kill-switch (+ prefs toggle
+  under Rendering > Compositing) forces plain GSK compositing — no
+  subsurfaces at all, so the leak class is unreachable on affected
+  compositors. Applied live on config change.
+
+Verified: 664/669 tests, smoke-mux + smoke-mcp + smoke-e2e PASS
+(fatal-criticals), blink proven toggling via interval screenshots,
+offload-off instance renders + echoes over IPC. Upstream report to
+GTK still owed (missing NULL check + the callback zombie leak).
