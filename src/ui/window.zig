@@ -2118,6 +2118,8 @@ pub const Window = struct {
         pane.font_family = if (s.font_family.len > 0) s.font_family else null;
         pane.font_features = if (s.font_features.len > 0) s.font_features else null;
         pane.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
+        pane.restartBlinkTimer();
+        pane.setGraphicsOffload(self.config.graphics_offload);
         pane.line_pad_px = s.line_pad_px;
         pane.grid_pass.pad = s.padding;
         pane.cell_pass.pad = s.padding;
@@ -3334,11 +3336,13 @@ pub const Window = struct {
                     p.grid_pass.palette[i] = pal[i];
                 }
             }
-            // Cursor.
+            // Cursor. Shape or interval changes re-arm (or drop) the
+            // blink timer — it only runs while the shape blinks.
             screen.cursor_shape = mapCursorShape(self.config.cursor_shape, self.config.cursor_blink);
             if (self.config.cursor_blink_ms != old_blink_ms) {
                 p.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
             }
+            p.restartBlinkTimer();
             // Padding.
             if (s.padding != old_s.padding) {
                 p.grid_pass.pad = s.padding;
@@ -3346,6 +3350,7 @@ pub const Window = struct {
                 c.gtk_widget_queue_resize(p.widget());
             }
             // Rendering.
+            p.setGraphicsOffload(self.config.graphics_offload);
             p.grid_pass.enable_ligatures = self.config.ligatures;
             p.grid_pass.enable_bidi = self.config.bidi;
             p.grid_pass.enable_url_underline = self.config.auto_url_detect;

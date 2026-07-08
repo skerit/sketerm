@@ -169,13 +169,24 @@ pub const Pane = struct {
     /// Forward mux session renames so Window can retitle the tab.
     win_session_rename_ctx: ?*anyopaque = null,
     win_on_session_renamed: ?*const fn (ctx: ?*anyopaque, pane: *Pane, name: []const u8) void = null,
-    /// Cursor blink timing.
-    last_blink_us: i64 = 0,
-    /// GTK tick callback id (0 = not registered). The tick is the
-    /// only thing pumping at frame rate; we self-remove it when no
-    /// time-driven work is active (cursor blink, bell flash,
-    /// animation) and re-install on triggers that need it.
+    /// GTK tick callback id (0 = not registered). The tick pumps at
+    /// frame rate, so it is reserved for genuinely per-frame work
+    /// (shader animation, kitty image animation) and self-removes
+    /// when none is active. Slow timers (cursor blink, bell fade)
+    /// run on GLib timeouts instead: an installed tick callback
+    /// forces GDK's frame clock to cycle at monitor refresh even
+    /// when nothing is drawn, and on Wayland each of those empty
+    /// cycles requests frame callbacks on every offload subsurface
+    /// (observed leaking one object id per tick per subsurface on
+    /// KWin until the 0xf00000 id-space cap crashed the process).
     tick_id: c_uint = 0,
+    /// GLib timeout id driving cursor blink (0 = not running). Armed
+    /// while the pane is focused with a blinking cursor shape;
+    /// self-removes otherwise.
+    blink_timer: c_uint = 0,
+    /// GLib timeout id driving the 200 ms bell-flash fade (0 = not
+    /// running). One-shot burst per bell.
+    bell_timer: c_uint = 0,
     /// Last cursor (row, col) reported to the IM context. -1 = never
     /// reported — first call sets the actual coords.
     last_im_row: i32 = -1,
@@ -713,6 +724,14 @@ pub const Pane = struct {
     }
 
     pub fn deinit(self: *Pane) void {
+        // GLib timeouts hold a raw *Pane — sever them before freeing.
+        // (The frame-clock tick is widget-owned and dies with the
+        // GtkGLArea; these g_timeout sources are not.)
+        self.stopBlinkTimer();
+        if (self.bell_timer != 0) {
+            _ = c.g_source_remove(self.bell_timer);
+            self.bell_timer = 0;
+        }
         // Defensive: unmap normally detaches first, but a pane torn down
         // while still mapped must not leave a dangling AX child.
         detachA11y(self);
@@ -875,9 +894,10 @@ pub const Pane = struct {
 
     /// Install the frame-clock tick callback if it isn't already
     /// running. Cheap idempotent — can be called from event handlers
-    /// without checking state. Triggers that start time-driven work
-    /// (focus-in with blinking cursor, bell event, image arrival
-    /// with animation) call this so the tick is alive to pump.
+    /// without checking state. Triggers that start per-frame work
+    /// (shader animation, image arrival with animation, child exit)
+    /// call this so the tick is alive to pump. Keep the tick OFF for
+    /// slow timers — see the `tick_id` field doc for why.
     pub fn ensureTickRunning(self: *Pane) void {
         if (self.tick_id != 0) return;
         self.tick_id = c.gtk_widget_add_tick_callback(
@@ -885,6 +905,50 @@ pub const Pane = struct {
             @ptrCast(&onTick),
             @ptrCast(self),
             null,
+        );
+    }
+
+    /// Whether the current cursor shape is a blinking variant.
+    fn cursorBlinks(self: *Pane) bool {
+        return switch (self.terminal.screen.cursor_shape) {
+            .block_blink, .underline_blink, .bar_blink => true,
+            else => false,
+        };
+    }
+
+    /// Arm the blink timeout when focused with a blinking cursor
+    /// shape. Idempotent; the timer self-removes when either
+    /// condition stops holding, so callers just poke this on focus-in
+    /// and on redraws (DECSCUSR can flip the shape mid-session).
+    pub fn ensureBlinkTimer(self: *Pane) void {
+        if (self.blink_timer != 0) return;
+        if (!self.is_focused or !self.cursorBlinks()) return;
+        const half_ms: i64 = @divTrunc(self.cursor_blink_us, 1000);
+        const ms: c_uint = if (half_ms <= 0) 500 else @intCast(half_ms);
+        self.blink_timer = c.g_timeout_add(ms, @ptrCast(&onBlinkTimer), @ptrCast(self));
+    }
+
+    pub fn stopBlinkTimer(self: *Pane) void {
+        if (self.blink_timer != 0) {
+            _ = c.g_source_remove(self.blink_timer);
+            self.blink_timer = 0;
+        }
+    }
+
+    /// Config change (blink interval) — pick up the new period.
+    pub fn restartBlinkTimer(self: *Pane) void {
+        self.stopBlinkTimer();
+        self.ensureBlinkTimer();
+    }
+
+    /// Toggle the GtkGraphicsOffload fast path (config
+    /// `graphics_offload`). DISABLED falls back to normal GSK
+    /// compositing — no Wayland subsurfaces, no dmabuf scanout.
+    pub fn setGraphicsOffload(self: *Pane, enabled: bool) void {
+        const w = self.offload_widget orelse return;
+        c.gtk_graphics_offload_set_enabled(
+            @ptrCast(w),
+            if (enabled) c.GTK_GRAPHICS_OFFLOAD_ENABLED else c.GTK_GRAPHICS_OFFLOAD_DISABLED,
         );
     }
 
@@ -1537,6 +1601,15 @@ fn onRenderRequest(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
     self.terminal.screen.dirty = false;
     c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    // DECSCUSR can switch a steady shape to a blinking one mid-
+    // session; the blink timer self-removed while the shape was
+    // steady, so re-arm here (no-op unless focused + blink shape).
+    self.ensureBlinkTimer();
+    // Child exit is acted on by onTick (deferring to the next frame
+    // avoids tearing the pane down from inside its own apply). The
+    // tick may have self-removed while idle — put it back or the
+    // exit_action would only fire on the next unrelated tick trigger.
+    if (self.terminal.screen.child_exited) self.ensureTickRunning();
     // Nudge AT clients (Orca/braille) that the caret/contents may have
     // moved. A no-op cost when no screen reader is attached, since GTK only
     // activates its AT-SPI backend on demand. On macOS GTK has no
@@ -1769,9 +1842,11 @@ fn onSetProfileEvent(ctx: ?*anyopaque, name: []const u8) void {
 fn onBellEvent(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
     if (self.win_on_bell) |f| f(self.win_bell_ctx, self);
-    // Visual bell flash fades over 200ms — tick must be alive to
-    // drive the fade. Idle path may have stopped it.
-    self.ensureTickRunning();
+    // Visual bell flash fades over 200ms — a short ~30 fps timeout
+    // drives the fade (NOT the frame-clock tick; see tick_id doc).
+    if (self.bell_timer == 0) {
+        self.bell_timer = c.g_timeout_add(33, @ptrCast(&onBellTimer), @ptrCast(self));
+    }
     c.gtk_gl_area_queue_render(@ptrCast(self.area));
 }
 
@@ -1895,35 +1970,11 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         return 0; // G_SOURCE_REMOVE
     }
 
-    // Cursor blink — toggle every 500ms for blinking shapes, but
-    // only on the focused pane. Unfocused panes always show a static
-    // (hollow) cursor and don't waste redraws toggling phase.
+    // NOTE: cursor blink and bell fade are NOT tick work — they run
+    // on GLib timeouts (onBlinkTimer / onBellTimer) so an idle
+    // focused pane keeps the frame clock stopped. See `tick_id` doc.
     const now = @import("../util/profile.zig").microTimestamp();
-    if (self.last_blink_us == 0) self.last_blink_us = now;
-    // Use the cached is_focused — saves a GTK round-trip on every
-    // tick. Updated by onFocusEnter/Leave handlers.
-    const focused = self.is_focused;
-    const blinking = focused and switch (screen.cursor_shape) {
-        .block_blink, .underline_blink, .bar_blink => true,
-        else => false,
-    };
-    const elapsed = now - self.last_blink_us;
-    if (blinking and elapsed > self.cursor_blink_us) {
-        self.last_blink_us = now;
-        screen.cursor_blink_on = !screen.cursor_blink_on;
-        screen.dirty = true;
-    } else if (!focused and !screen.cursor_blink_on) {
-        // Coming back into focus from a mid-blink "off" phase would
-        // leave the cursor invisible until the next toggle. Snap on.
-        screen.cursor_blink_on = true;
-        screen.dirty = true;
-    }
-
-    // Keep redrawing while bell flash is fading.
-    if (screen.bell_at_us > 0) {
-        const since_bell = now - screen.bell_at_us;
-        if (since_bell < 200_000) screen.dirty = true;
-    }
+    const mapped = c.gtk_widget_get_mapped(@ptrCast(self.area)) != 0;
 
     // Custom-shader animation: redraw every frame so iTime advances —
     // but only while the pane is actually on screen. A pane on a
@@ -1931,13 +1982,15 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
     // pixels nobody sees (and GTK may still tick it briefly during
     // tab transitions). Tying this to visibility, not focus, keeps
     // side-by-side splits animating in lockstep.
-    const shader_animating = shaderAnimates(self) and c.gtk_widget_get_mapped(@ptrCast(self.area)) != 0;
+    const shader_animating = shaderAnimates(self) and mapped;
     if (shader_animating) screen.dirty = true;
 
     // Animation: advance frames in the kitty-graphics manager. When
     // any image stepped to a new frame, pull its bytes into the
     // matching placements so the next render shows the new frame.
-    if (screen.kitty_images.advanceAnimations(now)) {
+    // Unmapped panes skip the advance entirely (nobody sees the
+    // frames; onAreaMap re-arms the tick and playback resumes).
+    if (mapped and screen.kitty_images.advanceAnimations(now)) {
         var it = screen.kitty_images.store.iterator();
         while (it.next()) |entry| {
             const img = entry.value_ptr;
@@ -1981,14 +2034,13 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         c.gtk_gl_area_queue_render(@ptrCast(area));
     }
 
-    // Self-remove when no time-driven work is active: with the
-    // drain → render direct dispatch, the tick is only needed for
-    // cursor blink, bell flash fade, and kitty-graphics animation.
-    // Triggers (focus-in, bell, image-arrival) call ensureTickRunning
-    // to put us back. Idle multi-pane setups drop to ~0% CPU here.
-    const has_blink_work = blinking;
-    const has_bell_work = screen.bell_at_us > 0 and (now - screen.bell_at_us) < 200_000;
-    const has_anim_work = blk: {
+    // Self-remove when no per-frame work is active: the tick only
+    // exists for shader animation and kitty-graphics playback, both
+    // gated on mapped. Triggers (image-arrival, shader change,
+    // onAreaMap) call ensureTickRunning to put us back. Idle panes —
+    // including focused ones with a blinking cursor — keep the frame
+    // clock fully stopped.
+    const has_anim_work = mapped and blk: {
         var it = screen.kitty_images.store.iterator();
         while (it.next()) |e| {
             const img = e.value_ptr;
@@ -1996,13 +2048,45 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
         }
         break :blk false;
     };
-    // An animating shader on a visible pane is time-driven work too —
-    // without this the tick self-removed the moment the pane lost
-    // focus (cursor blink stopped keeping it alive) and the shader
-    // froze. Goes idle on its own when the pane is unmapped.
-    if (!has_blink_work and !has_bell_work and !has_anim_work and !shader_animating) {
+    if (!has_anim_work and !shader_animating) {
         self.tick_id = 0;
         return 0; // G_SOURCE_REMOVE
+    }
+    return 1; // G_SOURCE_CONTINUE
+}
+
+/// Blink timeout body — toggles the cursor phase and self-removes
+/// when the pane loses focus or the shape stops blinking.
+fn onBlinkTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(Pane, user);
+    const screen = self.terminal.screen;
+    if (!self.is_focused or !self.cursorBlinks()) {
+        // Don't strand a hidden cursor: snap visible on the way out.
+        if (!screen.cursor_blink_on) {
+            screen.cursor_blink_on = true;
+            c.gtk_gl_area_queue_render(@ptrCast(self.area));
+        }
+        self.blink_timer = 0;
+        return 0; // G_SOURCE_REMOVE
+    }
+    // Synchronized output (DECSET 2026): hold phase, keep ticking.
+    // `screen.dirty` is the drain path's latch — never touch it here.
+    if (screen.sync_output) return 1;
+    screen.cursor_blink_on = !screen.cursor_blink_on;
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    return 1; // G_SOURCE_CONTINUE
+}
+
+/// Bell-fade timeout body — redraws at ~30 fps while the 200 ms
+/// flash decays, then stops itself with one final clearing frame.
+fn onBellTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(Pane, user);
+    const screen = self.terminal.screen;
+    const now = @import("../util/profile.zig").microTimestamp();
+    c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    if (screen.bell_at_us == 0 or now - screen.bell_at_us >= 200_000) {
+        self.bell_timer = 0;
+        return 0; // G_SOURCE_REMOVE (that render clears the flash)
     }
     return 1; // G_SOURCE_CONTINUE
 }
@@ -2017,6 +2101,10 @@ fn shaderAnimates(self: *Pane) bool {
 fn onAreaMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
     if (shaderAnimates(self)) self.updateShaderTick();
+    // Kitty animations paused while unmapped (tick self-removed);
+    // resume playback now that the pane is visible again. The tick
+    // drops right back out if nothing is actually playing.
+    self.ensureTickRunning();
     // The window's GdkMacosSurface now has its NSWindow; expose the
     // pane's text to VoiceOver. No-op on Linux.
     attachA11y(self);
@@ -2237,8 +2325,8 @@ fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     self.applyDim();
     // Record this pane as its tab's last-focused, for tab-switch restore.
     if (self.win_on_focus_enter) |f| f(self.win_focus_ctx, self);
-    // Tick may have self-removed while idle. Cursor blink starts now.
-    self.ensureTickRunning();
+    // Cursor blink starts now (timer self-removes on focus loss).
+    self.ensureBlinkTimer();
 }
 
 fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
@@ -2256,6 +2344,7 @@ fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     self.setTitlebarActive(false);
     // Inactive-pane dimming: apply the configured factors.
     self.is_focused = false;
+    self.stopBlinkTimer();
     self.applyDim();
 }
 
