@@ -415,10 +415,13 @@ pub const Terminal = struct {
     fn remoteSocketCb(_: c_int, condition: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
         const self: *Terminal = @ptrCast(@alignCast(user.?));
         const remote = self.remote orelse return 0;
-        if ((condition & (c.G_IO_HUP | c.G_IO_ERR)) != 0) {
-            self.remoteClosed("connection lost", true);
-            return 0;
-        }
+        // HUP/ERR arrive TOGETHER with the final readable data when the
+        // daemon flushes .exit/.gone and closes right after (an app
+        // session's worker exits the moment its session dies). Declaring
+        // the crash before draining threw the clean termination frame
+        // away and painted a false crash face on every app quit — so
+        // drain and peel first, close only after.
+        var dead = (condition & (c.G_IO_HUP | c.G_IO_ERR)) != 0;
 
         var tmp: [32768]u8 = undefined;
         var rounds: u8 = 0;
@@ -426,12 +429,12 @@ pub const Terminal = struct {
             const n = c.read(remote.conn.fd, &tmp, tmp.len);
             if (n < 0) {
                 if (std.posix.errno(n) == .AGAIN or std.posix.errno(n) == .INTR) break;
-                self.remoteClosed("read error", true);
-                return 0;
+                dead = true;
+                break;
             }
             if (n == 0) {
-                self.remoteClosed("daemon closed", true);
-                return 0;
+                dead = true;
+                break;
             }
             remote.conn.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]) catch break;
             if (@as(usize, @intCast(n)) < tmp.len) break;
@@ -452,6 +455,11 @@ pub const Terminal = struct {
             const remaining = remote.conn.rbuf.items.len - peeled.consumed;
             std.mem.copyForwards(u8, remote.conn.rbuf.items[0..remaining], remote.conn.rbuf.items[peeled.consumed..]);
             remote.conn.rbuf.shrinkRetainingCapacity(remaining);
+        }
+
+        if (dead) {
+            self.remoteClosed("connection lost", true);
+            return 0;
         }
 
         if (self.screen.dirty and !self.screen.sync_output) {
