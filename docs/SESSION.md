@@ -6589,3 +6589,21 @@ Verified: 664/669 tests, smoke-mux + smoke-mcp + smoke-e2e PASS
 (fatal-criticals), blink proven toggling via interval screenshots,
 offload-off instance renders + echoes over IPC. Upstream report to
 GTK still owed (missing NULL check + the callback zombie leak).
+
+## Fix: GUI segfault on first forwarded-app window (Jul 8)
+
+`Terminal.nappOpen` fired the `on_app_view` callback with
+`remote.napps.items[0].host` BEFORE appending the newly-created NApp.
+On the first app window the list was still empty, so `items[0]`
+dereferenced Zig's empty-slice sentinel pointer (address 0x8) and the
+GUI crashed the moment any forwarded app opened its first window (the
+live-tab-mirror path from a1cef6a). Coredump 40483 confirmed:
+`mov (%rdx),%rcx` with rdx=0x8, in a GLib source dispatch about to call
+onAppViewEvent (gtk_picture_new mirror setter). The headless MCP
+appdrive path never hit it (separate compositor), so it slipped past
+the earlier app-view verification. Fix: append the NApp (with its
+existing error handling) before firing on_app_view, so items[0] is
+always valid and equals the new host on the first window -- matching
+what destroyNApp already does. Regression test in terminal.zig drives
+the real nappOpen + AppHost; it crashes on the pre-fix ordering and
+passes after. 665/670 tests, all builds green, daemon purity clean.

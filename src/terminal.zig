@@ -1241,7 +1241,9 @@ pub const Terminal = struct {
         host.on_flush = nappFlushCb;
         host.flush_ctx = na;
         host.setDriven(self.peer_drivers > 0);
-        if (self.on_app_view) |f| f(self.user_ctx, @ptrCast(remote.napps.items[0].host));
+        // Append BEFORE firing on_app_view: the callback reads napps.items[0],
+        // which dereferences the empty-slice sentinel (addr 0x8) on the first
+        // app if the list is still empty.
         remote.napps.append(self.allocator, na) catch {
             host.destroy();
             self.allocator.destroy(na);
@@ -1249,6 +1251,7 @@ pub const Terminal = struct {
             return;
         };
         remote.app_window_opened = true;
+        if (self.on_app_view) |f| f(self.user_ctx, @ptrCast(remote.napps.items[0].host));
     }
 
     fn nappData(self: *Terminal, na: *NApp, bytes: []const u8) void {
@@ -1570,4 +1573,47 @@ pub const Terminal = struct {
     }
 
 };
+
+test "nappOpen appends before firing on_app_view (empty-list deref regression)" {
+    // Regression: nappOpen used to read remote.napps.items[0] to source the
+    // on_app_view host BEFORE appending the new NApp. On the first app window
+    // the list was still empty, so items[0] dereferenced the empty-slice
+    // sentinel (address 0x8) and the GUI segfaulted the moment any forwarded
+    // app opened its first window.
+    const alloc = std.testing.allocator;
+
+    const Captured = struct { fired: bool = false, host: ?*anyopaque = null };
+    var cap: Captured = .{};
+    const Cb = struct {
+        fn onView(ctx: ?*anyopaque, host: ?*anyopaque) void {
+            const c2: *Captured = @ptrCast(@alignCast(ctx.?));
+            c2.fired = true;
+            c2.host = host;
+        }
+    };
+
+    var remote: Terminal.Remote = undefined;
+    remote.napps = .empty;
+    remote.app_window_opened = false;
+
+    var term: Terminal = undefined;
+    term.allocator = alloc;
+    term.remote = &remote;
+    term.peer_drivers = 0;
+    term.user_ctx = &cap;
+    term.on_app_view = Cb.onView;
+
+    term.nappOpen(123);
+
+    try std.testing.expectEqual(@as(usize, 1), remote.napps.items.len);
+    try std.testing.expect(cap.fired);
+    const na = remote.napps.items[0];
+    try std.testing.expectEqual(@as(u32, 123), na.id);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(na.host)), cap.host);
+    try std.testing.expect(remote.app_window_opened);
+
+    na.host.destroy();
+    alloc.destroy(na);
+    remote.napps.deinit(alloc);
+}
 
