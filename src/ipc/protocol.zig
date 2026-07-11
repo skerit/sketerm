@@ -30,6 +30,10 @@ pub const Request = struct {
     /// get-text: also include the last N scrollback lines. 0 = just
     /// the visible screen.
     scrollback: u32 = 0,
+    /// get-text: return only the last completed command's output
+    /// (OSC 133 C/D zone) plus its exit code — needs shell
+    /// integration in the pane's shell.
+    last_command: bool = false,
     /// split: "h" (side by side) or "v" (stacked).
     direction: ?[]const u8 = null,
     /// new-tab: working directory and title.

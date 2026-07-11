@@ -4718,6 +4718,20 @@ pub const Window = struct {
         } else if (eql(u8, req.cmd, "get-text")) {
             const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
             const screen = pane.terminal.screen;
+            if (req.last_command) {
+                // A completed zone with no output (e.g. `true`) is
+                // still an answer — its exit code matters.
+                if (screen.last_output_start_id == 0 or screen.last_output_end_id == 0)
+                    return ipc_protocol.writeErr(out, allocator, "no completed command zone (shell integration not active?)");
+                const text = (try screen.extractLastCommandOutput(allocator)) orelse
+                    try allocator.dupe(u8, "");
+                defer allocator.free(text);
+                try ipc_protocol.writeOk(out, allocator, "last", .{
+                    .text = text,
+                    .exit = screen.last_cmd_exit,
+                });
+                return;
+            }
             const text = if (req.scrollback > 0)
                 try screen.extractScrollback(allocator)
             else

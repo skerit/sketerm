@@ -25,9 +25,12 @@ const CLI_HELP =
     \\  send-keys [--pane N] <chords...>  press named keys: "ctrl+c",
     \\                                    "enter", "up", "f5", "alt+x",
     \\                                    "shift+tab" — space-separated
-    \\  get-text [--pane N] [--scrollback N]
+    \\  get-text [--pane N] [--scrollback N] [--last-command]
     \\                                    read screen text back (JSON);
-    \\                                    --scrollback dumps the ring too
+    \\                                    --scrollback dumps the ring too;
+    \\                                    --last-command returns only the
+    \\                                    last command's output + exit
+    \\                                    (needs shell integration)
     \\  screen-info [--pane N]            cursor pos, size, alt-screen
     \\                                    flag, activity seq (JSON)
     \\  screenshot [--pane N] --out FILE  save a PNG of the pane as shown
@@ -116,6 +119,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, a, "--scrollback") and i + 1 < args.len) {
             i += 1;
             req.scrollback = std.fmt.parseInt(u32, args[i], 10) catch 0;
+        } else if (std.mem.eql(u8, a, "--last-command")) {
+            req.last_command = true;
         } else if (std.mem.eql(u8, a, "--cwd") and i + 1 < args.len) {
             i += 1;
             req.cwd = args[i];
