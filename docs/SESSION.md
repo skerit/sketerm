@@ -6840,3 +6840,28 @@ smoke-mux/mcp PASS; live: a generated-scanner C client gets
 preferred_scale and an accepted viewport destination through the real
 daemon, zenity (GTK4 binds fractional-scale itself now) still takes
 clicks and exits 0.
+
+## Command-block IPC + watch mode
+
+Two additions riding the OSC 133 shell-integration zones (which were
+already parsed and navigable): `sketerm cli get-text --last-command`
+returns the last completed command's output and exit code as JSON
+(empty-output zones still answer — the exit code is the point), and
+MCP `read_screen` gained `last_command=true` for prompt-free output
+reads. Verified end-to-end under Xvfb with fish 4.8's NATIVE OSC 133
+emission (fish >= 4 emits parameterized marks like `133;C;cmdline_url=...`;
+the dispatcher already tolerated the params).
+
+`sketerm cli watch [--pane N] [--timeout SEC] [--interval MS] <regex>`
+blocks until a line of the pane (screen + 100 scrollback lines)
+matches a GRegex pattern, prints the line, exits 0 (3 on timeout).
+Long-running-build babysitting: `watch --pane 2 'error|FAILED'`.
+Pre-existing matches fire immediately by design. One persistent IPC
+connection, client-side polling.
+
+Also confirmed: "persistent scrollback across reattach" already
+exists — mux snapshots serialize + restore the full scrollback ring.
+
+683/688 tests; e2e under Xvfb: last-command extraction returned exact
+printf output with exit 0 and a `false` zone with exit 1; watch fired
+on a later-appearing pattern and timed out cleanly on a non-match.
