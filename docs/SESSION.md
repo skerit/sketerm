@@ -6992,3 +6992,42 @@ search + palette dialog driven by xdotool (screenshot-verified hit →
 attach), attach-all pulling two daemon sessions into tabs while
 skipping the shown one, and curl through the forward tunnel
 (concurrent connections, refused-port, client-kill cleanup).
+
+## Linear-dmabuf import (opt-in) + two bugs it flushed out
+
+GL apps in forwarded sessions: default stays software GL
+(LIBGL_ALWAYS_SOFTWARE at spawn — Mesa's EGL device probe crashes
+GL apps against an shm-only compositor). New opt-in GPU path:
+`SKETERM_MUX_DMABUF=1` on the daemon announces zwp_linux_dmabuf_v1
+v3 (XRGB/ARGB8888, LINEAR modifier only) AND drops the softgl
+force. The daemon imports each plane fd with fstat+mmap
+(DMA_BUF_IOCTL_SYNC around reads; zero GPU libraries, musl-clean)
+and ships pixels through the existing pool_update_c units under a
+synthetic pool id equal to the buffer id — replicas can't tell
+dmabuf from shm. Non-immed `create` answers `failed` (client falls
+back to shm); state-sync bumped to v3 (in-flight params layouts);
+reattach replays dmabuf mirrors as synthetic pools.
+
+Why opt-in, learned the hard way: GTK4 probes dmabuf support with
+`create_immed` — which has NO per-buffer failure signal — and real
+GPU drivers can refuse CPU mmap (EPERM, VRAM placement), so
+advertising by default would regress every GTK app. Refused mmaps
+now degrade to a logged stale buffer instead of killing the app.
+
+Bugs found while validating:
+- `sketerm mux get-text`/`send` read the attach snapshot at the old
+  8-byte header offset (the [app:u8] byte shifted the version) —
+  every headless get-text failed with "bad snapshot".
+- recvExpect(.snapshot) buffers frames PAST the snapshot into
+  conn.rbuf; appdrive's pump and the GUI's fd watch only woke on new
+  socket bytes, so a small reattach replay sat unprocessed forever
+  (dmabuf mirrors compress to ~600 bytes and exposed it
+  deterministically; big shm replays masked it). Fixed both sides.
+
+Verified: 691/697 unit tests (tracker actions, brain bind/create/
+release/failed, announce gate, state-sync v3 replica round-trip
+with pixels); live via MCP: a wayland-scanner C client presenting a
+memfd-backed create_immed buffer renders solid red pixel-perfect,
+survives detach → reattach with identical pixels; zenity (GTK4/shm)
+regression green in default mode; smoke-mux/mcp/e2e PASS; all three
+binaries build, mux-portable static.
