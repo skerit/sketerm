@@ -1154,6 +1154,7 @@ fn renderingPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSwitchRow(@ptrCast(@alignCast(bell_group)), ctx, "Audible (system beep)", "Fire gdk_display_beep on BEL. Off by default.", &ctx.cfg.bell_audible, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(bell_group)), ctx, "Visible flash", "Briefly flash the affected pane on BEL.", &ctx.cfg.bell_visible, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(bell_group)), ctx, "Tab needs-attention", "Non-focused tabs get an attention indicator.", &ctx.cfg.bell_urgent, applyOnly);
+    addSpinRowU32(@ptrCast(@alignCast(bell_group)), ctx, "Notify finished commands (s)", "Desktop notification when a background command ran at least this long. 0 = off; needs shell integration.", 0, 3600, &ctx.cfg.notify_command_secs, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(bell_group)));
 }
 

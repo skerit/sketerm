@@ -1823,6 +1823,7 @@ pub const Window = struct {
         pane.win_progress_ctx = @ptrCast(self);
         pane.win_on_progress = onTermProgress;
         pane.win_on_transfer = onTermTransfer;
+        pane.win_on_cmd_status = onTermCmdStatus;
         pane.win_bell_ctx = @ptrCast(self);
         pane.win_on_bell = onTermBell;
         pane.win_child_ctx = @ptrCast(self);
@@ -4460,10 +4461,11 @@ pub const Window = struct {
     /// the GObject (marker 1<<24 | state<<8 | percent) so the taskbar
     /// aggregate can walk pages without touching panes.
     pub fn setTabProgress(self: *Window, page: ?*c.AdwTabPage, state: u8, percent: u8) void {
-        _ = self;
         if (state == 0) {
-            c.adw_tab_page_set_indicator_icon(page, null);
             c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-progress", null);
+            // A latched command-status dot (set while the ring was
+            // active) takes the indicator back; else clear it.
+            self.drawTabCmdDot(page);
             return;
         }
         const color: [3]u8 = switch (state) {
@@ -4513,6 +4515,60 @@ pub const Window = struct {
         c.g_object_unref(tex);
         const packed_val: usize = (1 << 24) | (@as(usize, state) << 8) | percent;
         c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-progress", @ptrFromInt(packed_val));
+    }
+
+    /// OSC 133 command status for a tab: 0 clear, 1 running, 2 ok,
+    /// 3 failed. Latched on the GObject ("sketerm-tab-cmd"); the
+    /// indicator icon only changes when no OSC 9;4 progress ring is
+    /// active (the ring wins, the dot lands when it clears).
+    pub fn setTabCmdStatus(self: *Window, page: ?*c.AdwTabPage, status: u8) void {
+        if (page == null) return;
+        c.g_object_set_data(
+            @ptrCast(@alignCast(page)),
+            "sketerm-tab-cmd",
+            if (status == 0) null else @ptrFromInt((@as(usize, 1) << 8) | status),
+        );
+        if (c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-tab-progress") != null) return;
+        self.drawTabCmdDot(page);
+    }
+
+    /// Render the latched command-status dot into the indicator icon
+    /// (or clear it when none is latched).
+    fn drawTabCmdDot(self: *Window, page: ?*c.AdwTabPage) void {
+        _ = self;
+        const raw = c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-tab-cmd");
+        const status: u8 = if (raw == null) 0 else @intCast(@intFromPtr(raw) & 0xff);
+        if (status == 0) {
+            c.adw_tab_page_set_indicator_icon(page, null);
+            return;
+        }
+        const color: [3]u8 = switch (status) {
+            2 => .{ 0x2E, 0xC2, 0x7E }, // ok: green
+            3 => .{ 0xE0, 0x1B, 0x24 }, // failed: red
+            else => .{ 0x35, 0x84, 0xE4 }, // running: blue
+        };
+        // Same 4×-supersampled canvas as the progress ring; a plain
+        // filled dot with a ~1px soft rim.
+        const S = 64;
+        const ctr = (@as(f32, S) - 1.0) / 2.0;
+        const r_dot = 18.0;
+        var px: [S * S * 4]u8 = undefined;
+        for (0..S) |yy| {
+            for (0..S) |xx| {
+                const dx = @as(f32, @floatFromInt(xx)) - ctr;
+                const dy = @as(f32, @floatFromInt(yy)) - ctr;
+                const r = @sqrt(dx * dx + dy * dy);
+                const o = (yy * S + xx) * 4;
+                px[o + 0] = color[0];
+                px[o + 1] = color[1];
+                px[o + 2] = color[2];
+                const cov = std.math.clamp(r_dot - r + 0.5, 0.0, 1.0);
+                px[o + 3] = @intFromFloat(255.0 * cov);
+            }
+        }
+        const tex = iconTexture64(&px) orelse return;
+        c.adw_tab_page_set_indicator_icon(page, @ptrCast(@alignCast(tex)));
+        c.g_object_unref(tex);
     }
 
     /// Aggregate every tab's progress into one window-level value and
@@ -6745,6 +6801,54 @@ fn onTermBell(ctx: ?*anyopaque, pane: *Pane) void {
     c.adw_tab_page_set_needs_attention(page, 1);
 }
 
+/// OSC 133 command lifecycle → tab status dot, plus needs-attention
+/// and a desktop notification when a long-running command finishes
+/// in a pane the user isn't watching.
+fn onTermCmdStatus(ctx: ?*anyopaque, pane: *Pane, running: bool, exit: i32, duration_ms: i64) void {
+    const self = cast.userData(Window, ctx);
+    const page = tabPageForPane(self, pane) orelse return;
+    if (running) {
+        self.setTabCmdStatus(page, 1);
+        return;
+    }
+    const selected = page == c.adw_tab_view_get_selected_page(self.tab_view);
+    const win_active = c.gtk_window_is_active(@ptrCast(self.app_window)) != 0;
+    if (selected and win_active) {
+        // The user watched it finish — the prompt already tells the
+        // story; a lingering dot would be noise.
+        self.setTabCmdStatus(page, 0);
+        return;
+    }
+    self.setTabCmdStatus(page, if (exit == 0) 2 else 3);
+
+    const min_s = self.config.notify_command_secs;
+    if (min_s == 0 or duration_ms < @as(i64, min_s) * 1000) return;
+    c.adw_tab_page_set_needs_attention(page, 1);
+
+    const app = c.gtk_window_get_application(@ptrCast(self.app_window));
+    if (app == null) return;
+    var title_buf: [64]u8 = undefined;
+    const title_z = if (exit == 0)
+        std.fmt.bufPrintZ(&title_buf, "Command finished", .{}) catch return
+    else
+        std.fmt.bufPrintZ(&title_buf, "Command failed (exit {d})", .{exit}) catch return;
+    const notif = c.g_notification_new(title_z.ptr);
+    if (notif == null) return;
+    defer c.g_object_unref(notif);
+    const tab_title = c.adw_tab_page_get_title(page);
+    const secs = @divTrunc(duration_ms, 1000);
+    var body_buf: [256]u8 = undefined;
+    if (std.fmt.bufPrintZ(&body_buf, "{s} ({d}m {d}s)", .{
+        if (tab_title != null) std.mem.span(tab_title) else "sketerm",
+        @divTrunc(secs, 60),
+        @mod(secs, 60),
+    })) |body_z| {
+        c.g_notification_set_body(notif, body_z.ptr);
+    } else |_| {}
+    if (exit != 0) c.g_notification_set_priority(notif, c.G_NOTIFICATION_PRIORITY_HIGH);
+    c.g_application_send_notification(@ptrCast(app), null, notif);
+}
+
 /// OSC 7 cwd updated for `pane`. Find its AdwTabPage and rewrite
 /// the tooltip to include the live cwd, so hovering tells the user
 /// where each tab actually is. Format: "<title>\n<cwd>".
@@ -7114,6 +7218,12 @@ fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque)
     }
     // Clear any needs-attention from the now-active tab.
     c.adw_tab_page_set_needs_attention(page, 0);
+    // A finished-command dot is acknowledged by viewing the tab; a
+    // still-running dot stays.
+    {
+        const raw = c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-tab-cmd");
+        if (raw != null and (@intFromPtr(raw) & 0xff) != 1) self.setTabCmdStatus(page, 0);
+    }
     // Viewing the tab also anchors its countdown (so it gets a fresh quiet
     // period after you leave) — but only after a short dwell so a quick
     // scroll across the tabs doesn't reset every tab's clock.

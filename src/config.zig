@@ -255,6 +255,10 @@ pub const Config = struct {
     bell_audible: bool = false,
     bell_visible: bool = true,
     bell_urgent: bool = true,
+    /// Desktop-notify when a command in a non-visible pane finishes
+    /// after at least this many seconds (0 = off). Needs OSC 133
+    /// shell integration.
+    notify_command_secs: u32 = 15,
 
     // Window
     /// Position of the AdwTabBar relative to the window content.
@@ -692,6 +696,7 @@ pub const Config = struct {
         if (self.bell_audible) try w.writeAll("bell_audible = true\n");
         if (!self.bell_visible) try w.writeAll("bell_visible = false\n");
         if (!self.bell_urgent) try w.writeAll("bell_urgent = false\n");
+        if (self.notify_command_secs != 15) try w.print("notify_command_secs = {d}\n", .{self.notify_command_secs});
 
         // Behavioural extras.
         if (self.scroll_on_output) try w.writeAll("scroll_on_output = true\n");
@@ -1136,6 +1141,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.bell_visible = try parseBool(value);
     } else if (std.mem.eql(u8, key, "bell_urgent")) {
         cfg.bell_urgent = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "notify_command_secs")) {
+        cfg.notify_command_secs = try parseU32(value);
     } else if (std.mem.eql(u8, key, "scroll_on_output")) {
         cfg.scroll_on_output = try parseBool(value);
     } else if (std.mem.eql(u8, key, "track_tab_activity")) {

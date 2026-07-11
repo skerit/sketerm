@@ -143,6 +143,9 @@ pub const Pane = struct {
     /// Window can drive the tab ring + a completion toast. Reuses
     /// win_progress_ctx.
     win_on_transfer: ?*const fn (ctx: ?*anyopaque, pane: *Pane, ev: Terminal.TransferEvent) void = null,
+    /// Forward OSC 133 command lifecycle so Window can drive the tab
+    /// status dot + finished notifications. Reuses win_progress_ctx.
+    win_on_cmd_status: ?*const fn (ctx: ?*anyopaque, pane: *Pane, running: bool, exit: i32, duration_ms: i64) void = null,
     /// Forward OSC 7 cwd updates so Window can rewrite the tab tooltip.
     win_cwd_ctx: ?*anyopaque = null,
     win_on_cwd: ?*const fn (ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void = null,
@@ -433,6 +436,7 @@ pub const Pane = struct {
         terminal.on_notification = onNotificationEvent;
         terminal.on_progress = onProgressEvent;
         terminal.on_transfer = onTransferEvent;
+        terminal.on_cmd_status = onCmdStatusEvent;
         terminal.on_bell = onBellEvent;
         terminal.on_pointer_shape = onPointerShapeEvent;
         terminal.on_set_profile = onSetProfileEvent;
@@ -1811,6 +1815,11 @@ fn onProgressEvent(ctx: ?*anyopaque, state: u8, percent: u8) void {
 fn onTransferEvent(ctx: ?*anyopaque, ev: Terminal.TransferEvent) void {
     const self = cast.userData(Pane, ctx);
     if (self.win_on_transfer) |f| f(self.win_progress_ctx, self, ev);
+}
+
+fn onCmdStatusEvent(ctx: ?*anyopaque, running: bool, exit: i32, duration_ms: i64) void {
+    const self = cast.userData(Pane, ctx);
+    if (self.win_on_cmd_status) |f| f(self.win_progress_ctx, self, running, exit, duration_ms);
 }
 
 fn onNotificationEvent(ctx: ?*anyopaque, ev: Screen.NotificationEvent) void {

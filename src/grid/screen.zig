@@ -544,6 +544,12 @@ pub const Screen = struct {
         /// a configured profile. Untrusted: the GUI maps an unknown
         /// name to the Default profile.
         on_set_profile: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
+        /// OSC 133/633 `C` — a command's output began (running).
+        on_cmd_start: ?*const fn (ctx: ?*anyopaque) void = null,
+        /// OSC 133/633 `D` — the command-output zone closed. Only
+        /// fires when a matching `C` opened a zone (a bare `D` after
+        /// attach mid-command is dropped, like the zone itself).
+        on_cmd_end: ?*const fn (ctx: ?*anyopaque, exit: i32) void = null,
     };
 
     /// Desktop-notification request flowing out of the screen. All
@@ -2616,6 +2622,7 @@ pub const Screen = struct {
     fn cmdOutputStart(self: *Screen) void {
         if (self.use_alt or self.row >= self.rows) return;
         self.pending_output_start_id = self.active[self.row].id;
+        if (self.sink.on_cmd_start) |f| f(self.sink.ctx);
     }
 
     /// OSC 133 / 633 `D` — close the command-output zone opened by
@@ -2630,6 +2637,7 @@ pub const Screen = struct {
         self.last_output_end_id = self.active[self.row].id;
         self.last_cmd_exit = if (exit_str.len > 0) (std.fmt.parseInt(i32, exit_str, 10) catch 0) else 0;
         self.recordCmdZone(start_id, self.last_output_end_id, self.last_cmd_exit);
+        if (self.sink.on_cmd_end) |f| f(self.sink.ctx, self.last_cmd_exit);
     }
 
     /// VS Code shell integration (`OSC 633`). A superset of OSC 133:
@@ -8322,4 +8330,43 @@ test "SGR 38 colon form with colorspace slot still parses fg" {
     try std.testing.expectEqual(@as(u8, 1), e.fg.rgb.r);
     try std.testing.expectEqual(@as(u8, 2), e.fg.rgb.g);
     try std.testing.expectEqual(@as(u8, 3), e.fg.rgb.b);
+}
+
+test "OSC 133 C/D fire cmd start/end sinks with exit code" {
+    const TestSink = struct {
+        var starts: u32 = 0;
+        var ends: u32 = 0;
+        var last_exit: i32 = -1;
+        fn cmdStart(_: ?*anyopaque) void {
+            starts += 1;
+        }
+        fn cmdEnd(_: ?*anyopaque, exit: i32) void {
+            ends += 1;
+            last_exit = exit;
+        }
+    };
+    TestSink.starts = 0;
+    TestSink.ends = 0;
+
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.sink = .{ .on_cmd_start = TestSink.cmdStart, .on_cmd_end = TestSink.cmdEnd };
+
+    // D with no open zone (attach mid-command): dropped, no callback.
+    s.onOsc("133;D;9");
+    try std.testing.expectEqual(@as(u32, 0), TestSink.ends);
+
+    s.onOsc("133;C");
+    try std.testing.expectEqual(@as(u32, 1), TestSink.starts);
+    s.onOsc("133;D;3");
+    try std.testing.expectEqual(@as(u32, 1), TestSink.ends);
+    try std.testing.expectEqual(@as(i32, 3), TestSink.last_exit);
+
+    // Bare D (no exit field) reports 0; OSC 633 dialect works too.
+    s.onOsc("633;C");
+    s.onOsc("633;D");
+    try std.testing.expectEqual(@as(u32, 2), TestSink.ends);
+    try std.testing.expectEqual(@as(i32, 0), TestSink.last_exit);
 }
