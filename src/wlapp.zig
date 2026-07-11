@@ -602,6 +602,14 @@ pub const AppHost = struct {
         // Advertise the local display scale so apps render HiDPI
         // buffers (set before the app binds wl_output on first feed).
         self.comp.output_scale = localScale();
+        // The TRUE (possibly fractional) scale rides to the daemon
+        // brain as a set_scale intent — it drives wp_fractional_scale
+        // preferred_scale so apps render for the real pixel grid.
+        // Queued now; ships with the first flush after attach.
+        self.comp.scale120 = localScale120();
+        var spl: [4]u8 = undefined;
+        std.mem.writeInt(u32, &spl, self.comp.scale120, .little);
+        wlpipe.appendUnit(&self.intents, allocator, .set_scale, &spl) catch {};
         // Passive replica: the daemon brain owns server-created
         // object ids (clipboard offers) this side never learns.
         self.comp.lenient = true;
@@ -616,6 +624,18 @@ pub const AppHost = struct {
         defer c.g_object_unref(mon);
         const sf = c.gdk_monitor_get_scale_factor(@ptrCast(@alignCast(mon)));
         return if (sf > 0) sf else 1;
+    }
+
+    /// TRUE scale of the primary monitor × 120 (the fractional-scale
+    /// wire unit): 1.5 → 180. Falls back to the integer factor.
+    fn localScale120() u32 {
+        const display = c.gdk_display_get_default() orelse return 120;
+        const monitors = c.gdk_display_get_monitors(display) orelse return 120;
+        const mon = c.g_list_model_get_item(@ptrCast(monitors), 0) orelse return 120;
+        defer c.g_object_unref(mon);
+        const sf = c.gdk_monitor_get_scale(@ptrCast(@alignCast(mon)));
+        if (sf <= 0) return @intCast(localScale() * 120);
+        return @intFromFloat(@round(sf * 120.0));
     }
 
     pub fn destroy(self: *AppHost) void {
@@ -799,15 +819,17 @@ pub const AppHost = struct {
 
     // ── view callbacks (main thread — GTK is safe) ──────────────
 
-    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, scale: i32, format: u32, pixels: []const u8) void {
+    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, scale: i32, lwp: i32, lhp: i32, format: u32, pixels: []const u8) void {
         const self = cast.userData(AppHost, ctx);
-        // The buffer is physical pixels (scale× the surface-local size).
-        // GTK sizes (windows, overlay children, positions, the pointer
-        // map) are LOGICAL = physical ÷ the surface's buffer scale; the
-        // texture itself stays physical (HiDPI-crisp).
+        // The buffer is physical pixels. GTK sizes (windows, overlay
+        // children, positions, the pointer map) are LOGICAL — the
+        // compositor's lw/lh: the viewport destination for
+        // fractional-scale clients, physical ÷ buffer_scale otherwise.
+        // The texture itself stays physical (HiDPI-crisp: GTK renders
+        // fractionally, so logical widget × real scale maps 1:1).
         const s: i32 = if (scale > 0) scale else 1;
-        const lw = @divTrunc(w, s);
-        const lh = @divTrunc(h, s);
+        const lw = if (lwp > 0) lwp else @divTrunc(w, s);
+        const lh = if (lhp > 0) lhp else @divTrunc(h, s);
         if (self.popups.get(surface)) |popup| {
             popup.tex.set(self.allocator, w, h, format, pixels);
             c.gtk_drawing_area_set_content_width(@ptrCast(popup.area), lw);
@@ -881,8 +903,17 @@ pub const AppHost = struct {
         win.crop_w = dw;
         win.crop_h = dh;
         const cropped = (dx != 0 or dy != 0 or dw != lw or dh != lh);
+        // Crop coords are logical; pixel coords scale by the REAL
+        // physical/logical ratio (fractional under a viewport, where
+        // buffer_scale stays 1 and s would under-shoot).
+        const fx = @as(f64, @floatFromInt(w)) / @as(f64, @floatFromInt(@max(1, lw)));
+        const fy = @as(f64, @floatFromInt(h)) / @as(f64, @floatFromInt(@max(1, lh)));
+        const cpx: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(dx)) * fx));
+        const cpy: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(dy)) * fy));
+        const cpw: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(dw)) * fx));
+        const cph: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(dh)) * fy));
         const tex = (if (cropped)
-            rw.newTextureCropped(w, h, format, pixels, dx * s, dy * s, dw * s, dh * s)
+            rw.newTextureCropped(w, h, format, pixels, cpx, cpy, @min(cpw, w - cpx), @min(cph, h - cpy))
         else
             rw.newTexture(w, h, format, pixels)) orelse return;
         defer c.g_object_unref(tex);

@@ -636,7 +636,9 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) bool {
         var h: i32 = 0;
         var sid: u32 = 0;
         var nonzero_px: bool = false;
-        fn onFrame(ctx: ?*anyopaque, surface: u32, fw: i32, fh: i32, scale: i32, format: u32, pixels: []const u8) void {
+        fn onFrame(ctx: ?*anyopaque, surface: u32, fw: i32, fh: i32, scale: i32, lw: i32, lh: i32, format: u32, pixels: []const u8) void {
+            _ = lw;
+            _ = lh;
             _ = ctx;
             _ = scale;
             _ = format;
@@ -1045,7 +1047,9 @@ fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8, wl_id: u
             title_len = @min(title.len, title_buf.len);
             @memcpy(title_buf[0..title_len], title[0..title_len]);
         }
-        fn onFrame(ctx: ?*anyopaque, surface: u32, fw: i32, fh: i32, scale: i32, format: u32, pixels: []const u8) void {
+        fn onFrame(ctx: ?*anyopaque, surface: u32, fw: i32, fh: i32, scale: i32, lw: i32, lh: i32, format: u32, pixels: []const u8) void {
+            _ = lw;
+            _ = lh;
             _ = ctx;
             _ = surface;
             _ = scale;

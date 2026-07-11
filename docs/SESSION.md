@@ -6815,3 +6815,28 @@ full dnd lifecycle and a state-sync v2 round trip); GUI + mux +
 mux-portable clean; smoke-mux/mcp PASS; live against the real daemon
 `wayland-info` binds all 19 globals with zero errors, a JBR-init
 replica client passes, zenity takes scroll/type/click and exits 0.
+
+## Fractional scaling for forwarded apps
+
+Forwarded apps looked soft for two reasons: the daemon brain's
+output_scale was NEVER set (default 1 — apps always rendered 1x and
+got upscaled, even on integer-HiDPI displays), and fractional monitor
+scales meant an integer-rendered buffer was resampled at 1.25/1.5x.
+Both fixed: the GUI ships its true monitor scale (gdk_monitor_get_scale
+× 120) as a new `set_scale` intent; the brain advertises
+wp_fractional_scale_manager_v1 and answers preferred_scale with it,
+honors wp_viewport set_destination as the surface's LOGICAL size
+(toplevel_frame gained lw/lh; buffer_scale stays 1 on that path), and
+re-announces every scale channel when the intent lands — apps that
+connected before the viewer attached converge a moment later. The
+tracker expands logical wl_surface.damage rows by buffer_h/vp_h at
+commit so partial copies stay correct. GTK4 renders sketerm itself
+fractionally, so a logical-sized GtkPicture holding the app's
+physical-pixel texture maps 1:1 — no resample, no blur.
+
+Verified: 682/687 tests (new: set_scale re-announce + viewport'd
+150x75 buffer reporting 100x50 logical at scale 1); all builds +
+smoke-mux/mcp PASS; live: a generated-scanner C client gets
+preferred_scale and an accepted viewport destination through the real
+daemon, zenity (GTK4 binds fractional-scale itself now) still takes
+clicks and exits 0.

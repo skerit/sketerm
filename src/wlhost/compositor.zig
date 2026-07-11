@@ -55,8 +55,10 @@ pub const View = struct {
     toplevel_new: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
     /// New committed content for a MAPPED surface (toplevel or
     /// popup). `pixels` is tightly packed w*4 rows (stride already
-    /// applied), wl_shm format (0 argb, 1 xrgb).
-    toplevel_frame: ?*const fn (ctx: ?*anyopaque, surface: u32, w: i32, h: i32, scale: i32, format: u32, pixels: []const u8) void = null,
+    /// applied), wl_shm format (0 argb, 1 xrgb). `lw`/`lh` is the
+    /// surface's LOGICAL size: the viewport destination when set
+    /// (fractional-scale clients), else physical ÷ buffer scale.
+    toplevel_frame: ?*const fn (ctx: ?*anyopaque, surface: u32, w: i32, h: i32, scale: i32, lw: i32, lh: i32, format: u32, pixels: []const u8) void = null,
     toplevel_title: ?*const fn (ctx: ?*anyopaque, surface: u32, title: []const u8) void = null,
     /// xdg_toplevel.set_app_id — desktop identity (icon, grouping).
     toplevel_app_id: ?*const fn (ctx: ?*anyopaque, surface: u32, app_id: []const u8) void = null,
@@ -205,13 +207,15 @@ const globals = [_]Global{
     // without a throwaway focus surface (no taskbar flash). v1 =
     // selection only, no primary selection.
     .{ .name = 12, .iface = &protocol.zwlr_data_control_manager_v1, .version = 1 },
-    // Modern niceties many clients probe for. Viewporter is
-    // accept-and-ignore at scale 1; cursor shapes reach the view.
-    // No fractional-scale: clients use the integer wl_output.scale +
-    // set_buffer_scale path; the host renders the HiDPI buffer crisply
-    // and the local compositor does any final fractional downscale.
+    // Cursor shapes reach the view. Viewport destinations define the
+    // surface's LOGICAL size — fractional-scale clients render the
+    // buffer at scale120/120 × logical with buffer_scale 1.
     .{ .name = 7, .iface = &protocol.wp_cursor_shape_manager_v1, .version = 1 },
     .{ .name = 8, .iface = &protocol.wp_viewporter, .version = 1 },
+    // True fractional scaling: preferred_scale carries the viewer's
+    // scale120 (set_scale intent) so apps render for the real pixel
+    // grid instead of an integer approximation the host resamples.
+    .{ .name = 21, .iface = &protocol.wp_fractional_scale_manager_v1, .version = 1 },
     // Decoration negotiation: SSD-wanting apps (Qt, traditional
     // GTK) get the host window's decorations; CSD apps draw their
     // own into an undecorated host window.
@@ -269,6 +273,10 @@ const Surface = struct {
     /// set_buffer_scale: physical pixels per surface-local (logical)
     /// unit in the committed buffer. 1 unless HiDPI.
     buffer_scale: i32 = 1,
+    /// wp_viewport destination — the surface's LOGICAL size when set
+    /// (fractional-scale clients); 0 = unset (derive from scale).
+    vp_w: i32 = 0,
+    vp_h: i32 = 0,
     /// Latched buffer id (content source after commit).
     committed_buffer: u32 = 0,
     xdg_surface: u32 = 0,
@@ -453,6 +461,13 @@ pub const Compositor = struct {
     source_actions: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Within-app drag state (wl_data_device.start_drag).
     drag: Drag = .{},
+    /// Viewer display scale × 120 (set_scale intent); 0 = derive
+    /// from output_scale. Announced via wp_fractional_scale.
+    scale120: u32 = 0,
+    /// wp_viewport object id → surface id.
+    viewport_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// wp_fractional_scale_v1 object id → surface id.
+    fs_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Tight-packed copy handed to toplevel_frame.
     frame_scratch: std.ArrayList(u8) = .empty,
     serial: u32 = 1,
@@ -510,6 +525,8 @@ pub const Compositor = struct {
         self.text_inputs.deinit(a);
         self.primary_devices.deinit(a);
         self.source_actions.deinit(a);
+        self.viewport_map.deinit(a);
+        self.fs_map.deinit(a);
         self.frame_scratch.deinit(a);
     }
 
@@ -1442,16 +1459,53 @@ pub const Compositor = struct {
             else => return Error.Protocol,
         } else if (iface == &protocol.wp_viewporter) switch (hdr.opcode) {
             0 => try self.destroyObject(hdr.object),
-            1 => { // get_viewport
+            1 => { // get_viewport(id, surface)
                 const id = (try it.next()).?.new_id;
+                const sid = (try it.next()).?.object;
                 try self.register(id, &protocol.wp_viewport);
+                try self.viewport_map.put(self.allocator, id, sid);
             },
             else => return Error.Protocol,
         } else if (iface == &protocol.wp_viewport) switch (hdr.opcode) {
+            0 => { // destroy — the surface reverts to buffer-derived size
+                if (self.viewport_map.fetchRemove(hdr.object)) |kv| {
+                    if (self.surfaces.getPtr(kv.value)) |surf| {
+                        surf.vp_w = 0;
+                        surf.vp_h = 0;
+                    }
+                }
+                try self.destroyObject(hdr.object);
+            },
+            1 => {}, // set_source — full-buffer scope, accepted
+            2 => { // set_destination(w, h) — the surface's LOGICAL size
+                const vw = (try it.next()).?.int;
+                const vh = (try it.next()).?.int;
+                const sid = self.viewport_map.get(hdr.object) orelse return Error.Protocol;
+                if (self.surfaces.getPtr(sid)) |surf| {
+                    // -1,-1 unsets per spec.
+                    surf.vp_w = if (vw > 0) vw else 0;
+                    surf.vp_h = if (vh > 0) vh else 0;
+                }
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wp_fractional_scale_manager_v1) switch (hdr.opcode) {
             0 => try self.destroyObject(hdr.object),
-            // set_source / set_destination: scale-1 scope — the
-            // destination always equals the buffer size in practice.
-            1, 2 => {},
+            1 => { // get_fractional_scale(id, surface)
+                const id = (try it.next()).?.new_id;
+                const sid = (try it.next()).?.object;
+                try self.register(id, &protocol.wp_fractional_scale_v1);
+                try self.fs_map.put(self.allocator, id, sid);
+                var buf: [16]u8 = undefined;
+                var b = wire.Builder.init(&buf, id, 0); // preferred_scale
+                b.putUint(self.effScale120());
+                try self.send(try b.finish());
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wp_fractional_scale_v1) switch (hdr.opcode) {
+            0 => { // destroy
+                _ = self.fs_map.remove(hdr.object);
+                try self.destroyObject(hdr.object);
+            },
             else => return Error.Protocol,
         } else if (iface == &protocol.zxdg_decoration_manager_v1) switch (hdr.opcode) {
             0 => try self.destroyObject(hdr.object),
@@ -2325,7 +2379,21 @@ pub const Compositor = struct {
     fn pushFrame(self: *Compositor, sid: u32, info: Buffer) Error!void {
         const cb = self.view.toplevel_frame orelse return;
         const pool = self.pools.getPtr(info.pool) orelse return;
-        const scale: i32 = if (self.surfaces.getPtr(sid)) |s| s.buffer_scale else 1;
+        var scale: i32 = 1;
+        var lw: i32 = info.width;
+        var lh: i32 = info.height;
+        if (self.surfaces.getPtr(sid)) |s| {
+            scale = s.buffer_scale;
+            if (s.vp_w > 0 and s.vp_h > 0) {
+                // Viewport destination IS the logical size — the
+                // fractional-scale path (buffer_scale stays 1).
+                lw = s.vp_w;
+                lh = s.vp_h;
+            } else {
+                lw = @divTrunc(info.width, @max(1, scale));
+                lh = @divTrunc(info.height, @max(1, scale));
+            }
+        }
         const w: usize = @intCast(info.width);
         const h: usize = @intCast(info.height);
         const stride: usize = @intCast(info.stride);
@@ -2341,7 +2409,47 @@ pub const Compositor = struct {
                 pool.bytes.items[src_start..][0..row_bytes],
             );
         }
-        cb(self.view.ctx, sid, @intCast(w), @intCast(h), scale, info.format, self.frame_scratch.items);
+        cb(self.view.ctx, sid, @intCast(w), @intCast(h), scale, lw, lh, info.format, self.frame_scratch.items);
+    }
+
+    /// The effective display scale × 120 (fractional-scale wire unit).
+    fn effScale120(self: *const Compositor) u32 {
+        if (self.scale120 != 0) return self.scale120;
+        return @intCast(self.output_scale * 120);
+    }
+
+    /// The viewer told us its true display scale (set_scale intent):
+    /// re-announce every scale channel so a mid-session change (or
+    /// the app having connected before the viewer attached) converges.
+    pub fn setScale120(self: *Compositor, v: u32) Error!void {
+        if (v == 0 or v == self.scale120) return;
+        self.scale120 = v;
+        self.output_scale = @intCast(@divTrunc(v + 119, 120)); // ceil
+        var it = self.fs_map.keyIterator();
+        while (it.next()) |id| {
+            var buf: [16]u8 = undefined;
+            var b = wire.Builder.init(&buf, id.*, 0); // preferred_scale
+            b.putUint(v);
+            try self.send(try b.finish());
+        }
+        if (self.compositor_version >= 6) {
+            var sit = self.surfaces.keyIterator();
+            while (sit.next()) |sid| {
+                var buf: [16]u8 = undefined;
+                var b = wire.Builder.init(&buf, sid.*, 2); // preferred_buffer_scale
+                b.putInt(self.output_scale);
+                try self.send(try b.finish());
+            }
+        }
+        if (self.output_id != 0) {
+            var sbuf: [16]u8 = undefined;
+            var sb = wire.Builder.init(&sbuf, self.output_id, 3); // scale
+            sb.putInt(self.output_scale);
+            try self.send(try sb.finish());
+            var dbuf: [8]u8 = undefined;
+            var db = wire.Builder.init(&dbuf, self.output_id, 2); // done
+            try self.send(try db.finish());
+        }
     }
 
     // ── server plumbing ─────────────────────────────────────────
@@ -2696,6 +2804,32 @@ pub const Compositor = struct {
             try putU32(&out, a, e.value_ptr.*);
         }
 
+        try putU32(&out, a, self.scale120);
+        inline for (.{ self.viewport_map, self.fs_map }) |map| {
+            try putU32(&out, a, map.count());
+            var mit = map.iterator();
+            while (mit.next()) |e| {
+                try putU32(&out, a, e.key_ptr.*);
+                try putU32(&out, a, e.value_ptr.*);
+            }
+        }
+        // Viewport destinations ride separately from the fixed
+        // per-surface layout (appended later than it was designed).
+        var vp_count: u32 = 0;
+        var vit = self.surfaces.iterator();
+        while (vit.next()) |e| {
+            if (e.value_ptr.vp_w > 0 or e.value_ptr.vp_h > 0) vp_count += 1;
+        }
+        try putU32(&out, a, vp_count);
+        vit = self.surfaces.iterator();
+        while (vit.next()) |e| {
+            if (e.value_ptr.vp_w > 0 or e.value_ptr.vp_h > 0) {
+                try putU32(&out, a, e.key_ptr.*);
+                try putI32(&out, a, e.value_ptr.vp_w);
+                try putI32(&out, a, e.value_ptr.vp_h);
+            }
+        }
+
         return out.toOwnedSlice(a);
     }
 
@@ -2894,6 +3028,25 @@ pub const Compositor = struct {
                 const id = try r.u32v();
                 try self.source_actions.put(a, id, try r.u32v());
             }
+
+            self.scale120 = try r.u32v();
+            inline for (.{ &self.viewport_map, &self.fs_map }) |map| {
+                const n = try r.u32v();
+                for (0..n) |_| {
+                    const k = try r.u32v();
+                    try map.put(a, k, try r.u32v());
+                }
+            }
+            const n_vp = try r.u32v();
+            for (0..n_vp) |_| {
+                const sid = try r.u32v();
+                const vw = try r.i32v();
+                const vh = try r.i32v();
+                if (self.surfaces.getPtr(sid)) |surf| {
+                    surf.vp_w = vw;
+                    surf.vp_h = vh;
+                }
+            }
         }
 
         try self.replayToView();
@@ -3001,6 +3154,7 @@ pub const Compositor = struct {
             .offer_selection => self.offerSelection(pl) catch {},
             .offer_primary => self.offerPrimary(pl) catch {},
             .text_commit => self.commitString(pl) catch {},
+            .set_scale => if (pl.len >= 4) self.setScale120(g.u32At(pl, 0)) catch {},
             .request_close => if (pl.len >= 4) self.requestClose(g.u32At(pl, 0)) catch {},
             else => {},
         }
@@ -3062,13 +3216,15 @@ const TestView = struct {
     primary_source: u32 = 0,
     primary_reads: usize = 0,
     raised: u32 = 0,
+    last_lw: i32 = 0,
+    last_lh: i32 = 0,
 
     fn onNew(ctx: ?*anyopaque, surface: u32) void {
         _ = surface;
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
         self.new_count += 1;
     }
-    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, scale: i32, format: u32, pixels: []const u8) void {
+    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, scale: i32, lw: i32, lh: i32, format: u32, pixels: []const u8) void {
         _ = surface;
         _ = format;
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
@@ -3076,6 +3232,8 @@ const TestView = struct {
         self.last_scale = scale;
         self.last_w = w;
         self.last_h = h;
+        self.last_lw = lw;
+        self.last_lh = lh;
         self.last_len = @min(pixels.len, self.last_pixels.len);
         @memcpy(self.last_pixels[0..self.last_len], pixels[0..self.last_len]);
     }
@@ -5047,4 +5205,109 @@ test "state sync v2: versions and input-protocol state round-trip" {
     try t.expectEqual(@as(u32, 1), replica.text_inputs.count());
     // The replica's view learns the enabled text input on replay.
     try t.expect(tv2.text_active);
+}
+
+test "fractional scale: set_scale re-announces, viewport sets logical size" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 6, 3);
+    try bindGlobal(&comp, 8, "wp_viewporter", 1, 4);
+    try bindGlobal(&comp, 21, "wp_fractional_scale_manager_v1", 1, 5);
+    try bindGlobal(&comp, 2, "wl_shm", 1, 6);
+    { // surface 7
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(7);
+        try req(&comp, try b.finish());
+    }
+    comp.clearOut();
+    { // get_fractional_scale(8, surface 7) → immediate preferred_scale
+        var b = wire.Builder.init(&buf, 5, 1);
+        b.putNewId(8);
+        b.putObject(7);
+        try req(&comp, try b.finish());
+    }
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    try t.expectEqualSlices([2]u32, &[_][2]u32{.{ 8, 0 }}, evs.items);
+
+    // Viewer announces 1.5×: preferred_scale re-fires with 180 and
+    // preferred_buffer_scale (v6) says ceil = 2.
+    comp.applyIntent(.set_scale, &[_]u8{ 180, 0, 0, 0 });
+    try t.expectEqual(@as(u32, 180), comp.scale120);
+    try t.expectEqual(@as(i32, 2), comp.output_scale);
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    const rescale_expect = [_][2]u32{
+        .{ 8, 0 }, // preferred_scale(180)
+        .{ 7, 2 }, // preferred_buffer_scale(2)
+    };
+    try t.expectEqualSlices([2]u32, &rescale_expect, evs.items);
+
+    { // viewport(9) destination 100×50 logical
+        var b = wire.Builder.init(&buf, 4, 1); // get_viewport
+        b.putNewId(9);
+        b.putObject(7);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 9, 2); // set_destination
+        b2.putInt(100);
+        b2.putInt(50);
+        try req(&comp, try b2.finish());
+    }
+
+    // Commit a 150×75 physical buffer (1.5 × the 100×50 logical):
+    // toplevel_frame must report lw=100, lh=50 with scale 1.
+    { // pool 10 (via side-band), buffer 11, attach + commit
+        var meta: [8]u8 = undefined;
+        std.mem.writeInt(u32, meta[0..4], 10, .little);
+        std.mem.writeInt(u32, meta[4..8], 150 * 75 * 4, .little);
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        try pipe.appendUnit(&unit, t.allocator, .pool_create, &meta);
+        try comp.feed(unit.items);
+
+        // create_pool wl_msg so the object exists — the 'h' fd arg
+        // carries no wire bytes (pool bytes ride the side-band unit).
+        var pb = wire.Builder.init(&buf, 6, 0);
+        pb.putNewId(10);
+        pb.putInt(150 * 75 * 4);
+        try req(&comp, try pb.finish());
+        var bb = wire.Builder.init(&buf, 10, 0); // create_buffer
+        bb.putNewId(11);
+        bb.putInt(0);
+        bb.putInt(150);
+        bb.putInt(75);
+        bb.putInt(150 * 4);
+        bb.putUint(0);
+        try req(&comp, try bb.finish());
+        var ab = wire.Builder.init(&buf, 7, 1); // attach
+        ab.putObject(11);
+        ab.putInt(0);
+        ab.putInt(0);
+        try req(&comp, try ab.finish());
+        // Needs a mapped role for pushFrame — make it a subsurface-free
+        // toplevel via xdg? Simpler: subsurface role isn't available
+        // here; bind wm_base and do the dance.
+        try bindGlobal(&comp, 5, "xdg_wm_base", 6, 12);
+        var xb = wire.Builder.init(&buf, 12, 2); // get_xdg_surface(13, 7)
+        xb.putNewId(13);
+        xb.putObject(7);
+        try req(&comp, try xb.finish());
+        var tb = wire.Builder.init(&buf, 13, 1); // get_toplevel(14)
+        tb.putNewId(14);
+        try req(&comp, try tb.finish());
+        var cb = wire.Builder.init(&buf, 7, 6); // commit
+        try req(&comp, try cb.finish());
+    }
+    try t.expect(tv.frames >= 1);
+    try t.expectEqual(@as(i32, 150), tv.last_w);
+    try t.expectEqual(@as(i32, 75), tv.last_h);
+    try t.expectEqual(@as(i32, 100), tv.last_lw);
+    try t.expectEqual(@as(i32, 50), tv.last_lh);
+    try t.expectEqual(@as(i32, 1), tv.last_scale);
+    try t.expect(!comp.dead);
 }
