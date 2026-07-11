@@ -3819,6 +3819,23 @@ pub const Window = struct {
         try self.attachMux(conn_in, name, host, null);
     }
 
+    /// Focus the pane already rendering local mux session `name`, or
+    /// attach it as a new tab. Cross-session-search jump target.
+    pub fn focusOrAttachSession(self: *Window, name: []const u8) void {
+        for (self.panes.items) |p| {
+            const r = p.terminal.remote orelse continue;
+            if (r.host != null) continue;
+            if (!std.mem.eql(u8, r.session, name)) continue;
+            if (tabPageForPane(self, p)) |page| {
+                c.adw_tab_view_set_selected_page(self.tab_view, page);
+                _ = c.gtk_widget_grab_focus(@ptrCast(p.area));
+                return;
+            }
+        }
+        const conn = self.muxConnect(null) catch return;
+        self.attachMux(conn, name, null, null) catch {};
+    }
+
     /// Tabless forwarded-app session (window view mode): the mux
     /// attach client feeding the app's floating windows. See the
     /// `app_sessions` field docs.
@@ -6002,6 +6019,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .font_dec => self.adjustFocusedFontSize(-1),
         .font_reset => self.resetFocusedFontSize(),
         .search_open => self.openSearch(),
+        .cross_search => @import("xsearch.zig").open(self) catch |err| logActionError("cross_search", err),
         .save_layout => self.saveLayoutQuietly(),
         .save_layout_as => self.saveLayoutAs(),
         .save_default_layout => self.saveDefaultLayout(),

@@ -80,6 +80,11 @@ pub const FrameType = enum(u8) {
     rec_start = 18,
     /// Stop the attached session's recording. Empty payload; ok/err.
     rec_stop = 19,
+    /// Search the ATTACHED session's scrollback + live grid. JSON
+    /// { pattern, max? } (case-insensitive substring). Answered with
+    /// `search_hits`. Attach-scoped so it reaches the worker that
+    /// owns the Screen in broker mode.
+    search = 20,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -104,6 +109,10 @@ pub const FrameType = enum(u8) {
     /// JSON AT-SPI tree answering app_a11y: { tree: <node> } or
     /// { error: "..." }. Node = { role, name, states, rect?, children? }.
     app_a11y_tree = 75,
+    /// JSON answer to `search`: { hits: [{back, text}], total } —
+    /// `back` = display lines up from the bottom of the live grid,
+    /// `total` = matches found (hits capped at the request's max).
+    search_hits = 76,
     // Byte channels (both directions). Generic multiplexed streams
     // riding the mux connection — used to tunnel a session's app
     // protocol, so forwarded apps inherit whatever transport the

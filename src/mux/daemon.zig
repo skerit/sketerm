@@ -1415,6 +1415,7 @@ pub const Daemon = struct {
             .app_list => self.handleAppList(cl),
             .app_a11y => self.handleAppA11y(cl, frame.payload),
             .rec_start => self.handleRecStart(cl, frame.payload),
+            .search => self.handleSearch(cl, frame.payload),
             .rec_stop => {
                 const s = cl.attached orelse {
                     cl.queueErr("not attached");
@@ -3793,6 +3794,66 @@ pub const Daemon = struct {
             }) catch return;
         }
         cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = build_options.audio_opus, .video = build_options.video, .sessions = infos.items });
+    }
+
+    const SearchReq = struct { pattern: []const u8, max: u32 = 50 };
+
+    /// Case-insensitive substring search over the attached session's
+    /// scrollback + live grid. Attach-scoped so it runs in whichever
+    /// process owns the Screen (worker, in broker mode). `back` is
+    /// display lines up from the bottom at search time.
+    fn handleSearch(self: *Daemon, cl: *Client, payload: []const u8) void {
+        const s = cl.attached orelse {
+            cl.queueErr("not attached");
+            return;
+        };
+        var parsed = std.json.parseFromSlice(SearchReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad search request");
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+        if (req.pattern.len == 0 or req.pattern.len > 512) {
+            cl.queueErr("bad pattern length");
+            return;
+        }
+        const max = @min(req.max, 500);
+
+        const text = s.screen.extractScrollback(self.allocator) catch {
+            cl.queueErr("search: out of memory");
+            return;
+        };
+        defer self.allocator.free(text);
+
+        var n_lines: u32 = 0;
+        {
+            var it = std.mem.splitScalar(u8, text, '\n');
+            while (it.next()) |_| n_lines += 1;
+        }
+
+        const Hit = struct { back: u32, text: []const u8 };
+        var hits: std.ArrayList(Hit) = .empty;
+        defer hits.deinit(self.allocator);
+        var total: u32 = 0;
+        var idx: u32 = 0;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| : (idx += 1) {
+            if (line.len == 0) continue;
+            if (std.ascii.indexOfIgnoreCase(line, req.pattern) == null) continue;
+            total += 1;
+            if (hits.items.len < max) {
+                // Cap hit lines; back off a mid-UTF-8 cut so the JSON
+                // string stays valid.
+                var end: usize = @min(line.len, 500);
+                if (end < line.len) {
+                    while (end > 0 and (line[end] & 0xC0) == 0x80) end -= 1;
+                }
+                hits.append(self.allocator, .{ .back = n_lines - 1 - idx, .text = line[0..end] }) catch break;
+            }
+        }
+        cl.queueJson(.search_hits, .{ .hits = hits.items, .total = total });
     }
 
     fn handleKill(self: *Daemon, cl: *Client, payload: []const u8) void {
