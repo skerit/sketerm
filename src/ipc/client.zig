@@ -33,6 +33,10 @@ const CLI_HELP =
     \\                                    (needs shell integration)
     \\  screen-info [--pane N]            cursor pos, size, alt-screen
     \\                                    flag, activity seq (JSON)
+    \\  watch [--pane N] <regex>          block until a line matches the
+    \\      --timeout SEC  give up (exit 3) pattern (GRegex/PCRE), print
+    \\      --interval MS  poll rate (300)  it and exit 0; scans screen
+    \\                                    + 100 scrollback lines
     \\  screenshot [--pane N] --out FILE  save a PNG of the pane as shown
     \\  record-start [--pane N] --out FILE.cast
     \\                                    record the pane's session as
@@ -90,6 +94,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     var type_delay: u32 = 60;
     var type_jitter: u32 = 90;
     var press_enter = false;
+    var watch_timeout_ms: u64 = 0; // 0 = wait forever
+    var watch_interval_ms: u32 = 300;
 
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -121,6 +127,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             req.scrollback = std.fmt.parseInt(u32, args[i], 10) catch 0;
         } else if (std.mem.eql(u8, a, "--last-command")) {
             req.last_command = true;
+        } else if (std.mem.eql(u8, a, "--regex") and i + 1 < args.len) {
+            i += 1;
+            req.data = args[i];
+        } else if (std.mem.eql(u8, a, "--timeout") and i + 1 < args.len) {
+            i += 1;
+            watch_timeout_ms = (std.fmt.parseInt(u64, args[i], 10) catch 0) * 1000;
+        } else if (std.mem.eql(u8, a, "--interval") and i + 1 < args.len) {
+            i += 1;
+            watch_interval_ms = std.fmt.parseInt(u32, args[i], 10) catch 300;
         } else if (std.mem.eql(u8, a, "--cwd") and i + 1 < args.len) {
             i += 1;
             req.cwd = args[i];
@@ -171,6 +186,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         return 1;
     };
 
+    if (std.mem.eql(u8, cmd, "watch")) {
+        const pattern = req.data orelse {
+            _ = c.fprintf(platform.stderr(), "sketerm cli: watch requires a pattern (--regex or positional)\n");
+            allocator.free(sock_path);
+            return 2;
+        };
+        return watchPane(allocator, sock_path, req.pane, req.session, pattern, watch_timeout_ms, watch_interval_ms);
+    }
+
     if (std.mem.eql(u8, cmd, "type-text")) {
         const text_raw = req.data orelse {
             _ = c.fprintf(platform.stderr(), "sketerm cli: type-text requires text\n");
@@ -185,6 +209,104 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     }
 
     return talk(allocator, sock_path, req);
+}
+
+/// Poll a pane's text until a GRegex pattern matches a line; print
+/// the matching line and exit 0. Exit 3 on timeout. Matching runs
+/// against the visible screen + 100 scrollback lines each poll, so
+/// pre-existing matches fire immediately (usually what you want:
+/// "wait until ERROR appears — or tell me it already did").
+fn watchPane(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, session: ?[]const u8, pattern: []const u8, timeout_ms: u64, interval_ms: u32) u8 {
+    defer allocator.free(sock_path);
+
+    const pat_z = allocator.dupeZ(u8, pattern) catch return 1;
+    defer allocator.free(pat_z);
+    var gerr: [*c]c.GError = null;
+    const regex = c.g_regex_new(pat_z.ptr, 0, 0, &gerr) orelse {
+        const msg: [*c]const u8 = if (gerr != null) gerr.*.message else "bad pattern";
+        _ = c.fprintf(platform.stderr(), "sketerm cli: bad regex: %s\n", msg);
+        if (gerr != null) c.g_error_free(gerr);
+        return 2;
+    };
+    defer c.g_regex_unref(regex);
+
+    const client = c.g_socket_client_new();
+    defer c.g_object_unref(client);
+    const addr = c.g_unix_socket_address_new(sock_path.ptr);
+    defer c.g_object_unref(addr);
+    const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
+    if (conn == null) {
+        const msg: [*c]const u8 = if (gerr != null) gerr.*.message else "unknown";
+        _ = c.fprintf(platform.stderr(), "sketerm cli: connect failed: %s\n", msg);
+        if (gerr != null) c.g_error_free(gerr);
+        return 1;
+    }
+    defer c.g_object_unref(conn);
+    const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn));
+    const din = c.g_data_input_stream_new(c.g_io_stream_get_input_stream(@ptrCast(conn)));
+    defer c.g_object_unref(din);
+
+    const start_us = c.g_get_monotonic_time();
+    while (true) {
+        // One get-text request per poll on the persistent connection.
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        const poll_req = protocol.Request{
+            .cmd = "get-text",
+            .pane = pane,
+            .session = session,
+            .scrollback = 100,
+        };
+        std.json.Stringify.value(poll_req, .{}, &aw.writer) catch return 1;
+        aw.writer.writeAll("\n") catch return 1;
+        const line = aw.written();
+        var written: c.gsize = 0;
+        if (c.g_output_stream_write_all(out_stream, line.ptr, line.len, &written, null, &gerr) == 0) {
+            if (gerr != null) c.g_error_free(gerr);
+            _ = c.fprintf(platform.stderr(), "sketerm cli: write failed\n");
+            return 1;
+        }
+        var rlen: c.gsize = 0;
+        const resp = c.g_data_input_stream_read_line(din, &rlen, null, &gerr);
+        if (resp == null) {
+            if (gerr != null) c.g_error_free(gerr);
+            _ = c.fprintf(platform.stderr(), "sketerm cli: connection closed\n");
+            return 1;
+        }
+        defer c.g_free(resp);
+
+        const Reply = struct { ok: bool = false, text: []const u8 = "" };
+        const parsed = std.json.parseFromSlice(Reply, allocator, resp[0..rlen], .{
+            .ignore_unknown_fields = true,
+        }) catch return 1;
+        defer parsed.deinit();
+        if (!parsed.value.ok) {
+            _ = c.fwrite(resp, 1, rlen, platform.stderr());
+            _ = c.fputc('\n', platform.stderr());
+            return 1;
+        }
+
+        var lines = std.mem.splitScalar(u8, parsed.value.text, '\n');
+        while (lines.next()) |ln| {
+            if (ln.len == 0) continue;
+            const ln_z = allocator.dupeZ(u8, ln) catch return 1;
+            defer allocator.free(ln_z);
+            if (c.g_regex_match(regex, ln_z.ptr, 0, null) != 0) {
+                _ = c.fwrite(ln.ptr, 1, ln.len, platform.stdout());
+                _ = c.fputc('\n', platform.stdout());
+                return 0;
+            }
+        }
+
+        if (timeout_ms > 0) {
+            const elapsed_ms: u64 = @intCast(@divTrunc(c.g_get_monotonic_time() - start_us, 1000));
+            if (elapsed_ms >= timeout_ms) {
+                _ = c.fprintf(platform.stderr(), "sketerm cli: watch timed out\n");
+                return 3;
+            }
+        }
+        c.g_usleep(@as(c.gulong, interval_ms) * 1000);
+    }
 }
 
 /// Stream one send-text request per keystroke over a single
