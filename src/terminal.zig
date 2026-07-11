@@ -411,7 +411,26 @@ pub const Terminal = struct {
             @ptrCast(&remoteSocketCb),
             @ptrCast(self),
         );
+        // Attach-time recvExpect may have buffered frames PAST the
+        // snapshot into conn.rbuf; the fd watch only fires on NEW
+        // socket bytes, so a quiet session would leave them
+        // unprocessed. One idle-time poke drains them after the
+        // caller finished wiring (routed through the DrainHandle so
+        // a teardown-before-idle can't dangle).
+        _ = c.g_idle_add(@ptrCast(&remoteIdleKick), @ptrCast(drain));
         return self;
+    }
+
+    /// One-shot idle: drain frames recvExpect buffered before the
+    /// fd watch existed. G_SOURCE_REMOVE either way.
+    fn remoteIdleKick(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const drain: *DrainHandle = @ptrCast(@alignCast(user.?));
+        if (drain.alive.load(.acquire)) {
+            if (drain.terminal) |term| {
+                _ = remoteSocketCb(-1, c.G_IO_IN, @ptrCast(term));
+            }
+        }
+        return 0;
     }
 
     fn wireScreenSink(self: *Terminal) void {
