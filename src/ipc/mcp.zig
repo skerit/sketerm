@@ -525,7 +525,7 @@ const TOOLS_JSON = blk: {
 const TOOLS_JSON_RAW =
     \\[
     \\{"name":"list_terminals","description":"List all sketerm tabs and panes (ids, titles, sizes, cwd, focus). Pane ids address every other tool.","inputSchema":{"type":"object","properties":{}}},
-    \\{"name":"read_screen","description":"Read a pane's rendered screen: text content plus cursor position, size and flags. This is the parsed terminal grid (what a human sees), not raw output.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"},"scrollback":{"type":"integer","description":"Also include up to N scrollback lines"}}}},
+    \\{"name":"read_screen","description":"Read a pane's rendered screen: text content plus cursor position, size and flags. This is the parsed terminal grid (what a human sees), not raw output. Pass last_command=true to get ONLY the last completed command's output and exit code (precise — no prompt noise; requires shell integration, which sketerm injects by default).","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"},"scrollback":{"type":"integer","description":"Also include up to N scrollback lines"},"last_command":{"type":"boolean","description":"Return only the last completed command's output + exit code"}}}},
     \\{"name":"screenshot_pane","description":"Screenshot a terminal pane as a lossless PNG (inline image) exactly as rendered, including colours, cursor and any shader. Needs a running sketerm window.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"}}}},
     \\{"name":"record_pane_start","description":"Start recording a terminal pane's session as an asciicast v2 (.cast) file — raw output with timestamps, playable with asciinema. Recorded by the session daemon (no wrapper); a remote session records to a path on ITS host.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"},"path":{"type":"string","description":"Absolute output path ending in .cast"}},"required":["path"]}},
     \\{"name":"record_pane_stop","description":"Stop the asciicast recording of a terminal pane's session.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"}}}},
@@ -1433,6 +1433,19 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
         return toolResult(arena, "recording stopped", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "read_screen")) {
+        if (argBool(args, "last_command")) {
+            const reply = try ipcParsed(arena, backend, .{ .cmd = "get-text", .pane = pane, .last_command = true });
+            if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
+            const last = reply.value.object.get("last") orelse
+                return toolResult(arena, "malformed reply", true) orelse error.OutOfMemory;
+            const text = (if (last == .object) last.object.get("text") else null) orelse std.json.Value{ .string = "" };
+            const exit = (if (last == .object) last.object.get("exit") else null) orelse std.json.Value{ .integer = 0 };
+            const blob = try std.fmt.allocPrint(arena, "exit: {d}\n---\n{s}", .{
+                if (exit == .integer) exit.integer else 0,
+                if (text == .string) text.string else "",
+            });
+            return toolResult(arena, blob, false) orelse error.OutOfMemory;
+        }
         const sb: u32 = if (argInt(args, "scrollback")) |s|
             (if (s > 0) @intCast(@min(s, 100_000)) else 0)
         else
@@ -1605,6 +1618,25 @@ test "tools/call send_keys routes to IPC send-keys" {
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"cmd\":\"send-keys\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"pane\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "ctrl+c enter") != null);
+}
+
+test "read_screen last_command extracts the OSC 133 zone" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake = FakeBackend{
+        .responses = &.{"{\"ok\":true,\"last\":{\"text\":\"hi\\n\",\"exit\":3}}"},
+        .allocator = std.testing.allocator,
+    };
+    defer fake.deinit();
+
+    const resp = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"read_screen","arguments":{"pane":2,"last_command":true}}}
+    ).?;
+    try std.testing.expect(std.mem.indexOf(u8, resp, "exit: 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "hi\\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), fake.requests.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"last_command\":true") != null);
 }
 
 test "run_command settles via seq polling" {
