@@ -182,7 +182,17 @@ pub const Pty = struct {
         }
         if (opts.session_name) |sn| _ = c.setenv("SKETERM_SESSION", sn, 1);
         if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1);
-        if (opts.wayland_display) |wd| _ = c.setenv("WAYLAND_DISPLAY", wd, 1);
+        if (opts.wayland_display) |wd| {
+            _ = c.setenv("WAYLAND_DISPLAY", wd, 1);
+            // The daemon compositor is shm-only (no dmabuf/wl_drm), so
+            // EGL can't reach a GPU through it — without this, Mesa's
+            // device probe fails and GL apps abort/crash at startup.
+            // llvmpipe renders into shm buffers, which is exactly what
+            // the pixel pipeline ships. SKETERM_MUX_NO_SOFTGL=1 (on the
+            // daemon) opts out; an explicit user value is respected.
+            if (c.getenv("SKETERM_MUX_NO_SOFTGL") == null)
+                _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
+        }
         if (opts.pulse_server) |ps| _ = c.setenv("PULSE_SERVER", ps, 1);
         // Isolated app session: give the child a private runtime dir
         // and drop the inherited session bus. Both are how
