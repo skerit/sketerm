@@ -91,6 +91,14 @@ pub const AppHost = struct {
     /// Surfaces whose app negotiated server-side decorations before
     /// the window existed (the normal order).
     pending_ssd: std.AutoHashMapUnmanaged(u32, bool) = .empty,
+    /// Surface → parent surface for xdg_toplevel.set_parent. Toolkits
+    /// (JBR/AWT, GTK dialogs) send set_parent at toplevel creation,
+    /// BEFORE the first frame builds the window — so the transient-for
+    /// must be latched here and applied in winFor, or the dialog opens
+    /// as a standalone taskbar window instead of a modal over its
+    /// parent. Also the live source of truth for re-parenting. 0 = the
+    /// parent was unset.
+    pending_parents: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Icon textures that arrived BEFORE the first frame (the usual
     /// order — the daemon injects the icon right after the app_id,
     /// before any buffer commit). Owned refs; moved to the Win in
@@ -681,6 +689,7 @@ pub const AppHost = struct {
         while (iit.next()) |v| c.g_object_unref(v.*);
         self.pending_icons.deinit(self.allocator);
         self.pending_ssd.deinit(self.allocator);
+        self.pending_parents.deinit(self.allocator);
         self.geos.deinit(self.allocator);
         self.fetch_kinds.deinit(self.allocator);
         if (self.pending_reads > 0) {
@@ -1161,6 +1170,7 @@ pub const AppHost = struct {
         const self = cast.userData(AppHost, ctx);
         const win = self.windows.get(surface) orelse return;
         _ = self.windows.remove(surface);
+        _ = self.pending_parents.remove(surface);
         if (win.embedded) {
             // Pull the overlay out of the pane's box before the
             // (childless) window teardown, and tell the pane its
@@ -1265,6 +1275,13 @@ pub const AppHost = struct {
         c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
         _ = c.g_signal_connect_data(@ptrCast(drop), "drop", @ptrCast(&onHostDrop), win, null, 0);
         c.gtk_widget_add_controller(picture, @ptrCast(drop));
+
+        // Apply any latched set_parent now that the window exists —
+        // both as a child (our parent may already be up) and as a
+        // parent (children that raced ahead of us can now bind).
+        self.applyParent(surface);
+        var pit = self.pending_parents.iterator();
+        while (pit.next()) |e| if (e.value_ptr.* == surface) self.applyParent(e.key_ptr.*);
 
         // Only the FIRST toplevel embeds; dialogs and secondary
         // windows always float (transient over the embedded view).
@@ -1705,7 +1722,20 @@ pub const AppHost = struct {
     /// CSD shadow margins pass through to whatever is underneath.
     fn onParent(ctx: ?*anyopaque, surface: u32, parent: u32) void {
         const self = cast.userData(AppHost, ctx);
+        // Latch the relationship — set_parent routinely lands before
+        // the window exists (dialogs set it at creation, the window is
+        // built on first frame) — then apply if both ends are present.
+        self.pending_parents.put(self.allocator, surface, parent) catch {};
+        self.applyParent(surface);
+    }
+
+    /// Set (or clear) a window's transient-for from the latched parent,
+    /// once the child window exists. The parent window may still be
+    /// absent (frames race) — leave it unset until its winFor sweep
+    /// picks up this child.
+    fn applyParent(self: *AppHost, surface: u32) void {
         const win = self.windows.get(surface) orelse return;
+        const parent = self.pending_parents.get(surface) orelse return;
         const pwin: ?*c.GtkWindow = if (parent != 0)
             (if (self.windows.get(parent)) |p| p.window else null)
         else
