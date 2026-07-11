@@ -6952,3 +6952,43 @@ latches OPUS and streams the full window through encode → mux wire →
 GUI decode → local playback → consumed clock; 44.1 kHz latches raw
 and still plays. Default builds unchanged, smoke-mux/mcp PASS,
 `ldd`: only the -Daudio-opus daemon links libopus.
+
+## Quality-of-life batch: doctor, command status, search, handoff, forwarding
+
+Five features in one pass, each riding existing machinery:
+
+- **Command status + notifications (OSC 133).** New Screen sink hooks
+  at 133/633 C/D flow through Terminal (duration-timed) to a per-tab
+  indicator dot (blue running / green ok / red fail; the OSC 9;4
+  progress ring wins while active, the dot lands when it clears) and
+  a GNotification when a background command ran >=
+  `notify_command_secs` (default 15, 0 = off). Viewing the tab acks a
+  finished dot; a running dot stays.
+- **`sketerm doctor [host]`.** Canonical version now in
+  `src/version.zig`; the daemon's welcome/list replies carry version +
+  opus/video capability flags (append-only JSON). Doctor reports
+  binary-vs-daemon skew (local and remote over SSH/UDP), GUI socket
+  liveness, terminfo. Found a real stale daemon on first run.
+- **Cross-session search.** Attach-scoped `search` frame (20) — in
+  broker mode the frame lands in the worker that owns the Screen, so
+  no broker fan-out was needed. Case-insensitive substring over
+  extractScrollback lines, hits as lines-from-bottom + `search_hits`
+  (76). CLI `sketerm mux [host] search <pat>`; GUI palette dialog
+  (`xsearch.zig`) whose hits focus-or-attach the session.
+- **`attach-all` bulk handoff.** GUI IPC command + palette action +
+  `sketerm mux [host] attach-all`: attaches every non-exited session
+  the window isn't already showing (dedup by session+host, incl.
+  tabless app sessions). The "move my desktop" command.
+- **TCP port forwarding.** Client-initiated `forward_open` (21) +
+  `tcp_forward` channel kind (5): daemon connects loopback:port on
+  its host, raw bytes ride chan_data — works over local socket, SSH
+  and roaming UDP. `sketerm mux [host] forward <local[:remote]>`.
+  `Channel.session` became optional (forwards are host-scoped); a
+  dying client's forwards die with it, native/audio channels don't.
+
+Verified: 688/694 unit tests, smoke-mux/mcp/e2e PASS, plus live runs:
+OSC 133 lifecycle in a real GUI, doctor against the user's daemon,
+search + palette dialog driven by xdotool (screenshot-verified hit →
+attach), attach-all pulling two daemon sessions into tabs while
+skipping the shown one, and curl through the forward tunnel
+(concurrent connections, refused-port, client-kill cleanup).
