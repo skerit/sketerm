@@ -3321,16 +3321,29 @@ const TestView = struct {
     raised: u32 = 0,
     last_lw: i32 = 0,
     last_lh: i32 = 0,
+    // set_parent ordering: the test sets child_sid; onParent/onFrame
+    // record whether the parent arrived before the child's first frame.
+    child_sid: u32 = 0,
+    child_frames: usize = 0,
+    child_parent: u32 = 0,
+    child_parent_before_frame: ?bool = null,
 
     fn onNew(ctx: ?*anyopaque, surface: u32) void {
         _ = surface;
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
         self.new_count += 1;
     }
+    fn onParent(ctx: ?*anyopaque, surface: u32, parent: u32) void {
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        if (surface == self.child_sid) {
+            self.child_parent = parent;
+            self.child_parent_before_frame = (self.child_frames == 0);
+        }
+    }
     fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, scale: i32, lw: i32, lh: i32, format: u32, pixels: []const u8) void {
-        _ = surface;
         _ = format;
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        if (surface == self.child_sid) self.child_frames += 1;
         self.frames += 1;
         self.last_scale = scale;
         self.last_w = w;
@@ -3474,6 +3487,7 @@ const TestView = struct {
             .primary_offer = onPrimaryOffer,
             .primary_read = onPrimaryRead,
             .toplevel_raise = onRaise,
+            .toplevel_parent = onParent,
         };
     }
 };
@@ -5413,6 +5427,98 @@ test "fractional scale: set_scale re-announces, viewport sets logical size" {
     try t.expectEqual(@as(i32, 100), tv.last_lw);
     try t.expectEqual(@as(i32, 50), tv.last_lh);
     try t.expectEqual(@as(i32, 1), tv.last_scale);
+    try t.expect(!comp.dead);
+}
+
+test "transient dialog: set_parent is delivered before the child's first frame" {
+    // Reproduces the JBR/AWT modal-dialog sequence: a second toplevel
+    // that calls set_parent(first) at creation, then commits its first
+    // buffer later. The parent MUST reach the view before the frame —
+    // the GUI builds the window on that first frame, so a parent that
+    // arrived earlier has to be latched (pending_parents in wlapp) or
+    // the dialog opens as a standalone taskbar window instead of a
+    // modal over its parent.
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 6, 3);
+    try bindGlobal(&comp, 5, "xdg_wm_base", 6, 4);
+    try bindGlobal(&comp, 2, "wl_shm", 1, 12);
+
+    // Parent toplevel: surface 6 → xdg_surface 7 → toplevel 8.
+    {
+        var b = wire.Builder.init(&buf, 3, 0); // create_surface(6)
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+        var xb = wire.Builder.init(&buf, 4, 2); // get_xdg_surface(7, 6)
+        xb.putNewId(7);
+        xb.putObject(6);
+        try req(&comp, try xb.finish());
+        var tb = wire.Builder.init(&buf, 7, 1); // get_toplevel(8)
+        tb.putNewId(8);
+        try req(&comp, try tb.finish());
+    }
+
+    // Dialog toplevel: surface 9 → xdg_surface 10 → toplevel 11, and
+    // set_parent(8) at creation — BEFORE any buffer commit.
+    tv.child_sid = 9;
+    {
+        var b = wire.Builder.init(&buf, 3, 0); // create_surface(9)
+        b.putNewId(9);
+        try req(&comp, try b.finish());
+        var xb = wire.Builder.init(&buf, 4, 2); // get_xdg_surface(10, 9)
+        xb.putNewId(10);
+        xb.putObject(9);
+        try req(&comp, try xb.finish());
+        var tb = wire.Builder.init(&buf, 10, 1); // get_toplevel(11)
+        tb.putNewId(11);
+        try req(&comp, try tb.finish());
+        var pb = wire.Builder.init(&buf, 11, 1); // set_parent(8)
+        pb.putObject(8);
+        try req(&comp, try pb.finish());
+    }
+
+    // Parent resolved to the parent surface, and no frame yet.
+    try t.expectEqual(@as(u32, 6), tv.child_parent);
+    try t.expectEqual(@as(usize, 0), tv.child_frames);
+
+    // Now the dialog commits its first buffer (400×300).
+    {
+        var meta: [8]u8 = undefined;
+        std.mem.writeInt(u32, meta[0..4], 20, .little);
+        std.mem.writeInt(u32, meta[4..8], 400 * 300 * 4, .little);
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        try pipe.appendUnit(&unit, t.allocator, .pool_create, &meta);
+        try comp.feed(unit.items);
+        var pb = wire.Builder.init(&buf, 12, 0); // wl_shm.create_pool(20)
+        pb.putNewId(20);
+        pb.putInt(400 * 300 * 4);
+        try req(&comp, try pb.finish());
+        var bb = wire.Builder.init(&buf, 20, 0); // create_buffer(21)
+        bb.putNewId(21);
+        bb.putInt(0);
+        bb.putInt(400);
+        bb.putInt(300);
+        bb.putInt(400 * 4);
+        bb.putUint(0);
+        try req(&comp, try bb.finish());
+        var ab = wire.Builder.init(&buf, 9, 1); // attach(21) to surface 9
+        ab.putObject(21);
+        ab.putInt(0);
+        ab.putInt(0);
+        try req(&comp, try ab.finish());
+        var cb = wire.Builder.init(&buf, 9, 6); // commit
+        try req(&comp, try cb.finish());
+    }
+
+    // The frame landed, and the parent was known strictly before it.
+    try t.expect(tv.child_frames >= 1);
+    try t.expect(tv.child_parent_before_frame != null);
+    try t.expect(tv.child_parent_before_frame.?);
     try t.expect(!comp.dead);
 }
 
