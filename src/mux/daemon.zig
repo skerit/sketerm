@@ -16,6 +16,7 @@ const c = @import("../c.zig").c;
 const wire = @import("wire.zig");
 const wlwire = @import("../wlhost/wire.zig");
 const wltrack = @import("../wlhost/track.zig");
+const pulse = @import("pulse.zig");
 const wlproto = @import("../wlhost/protocol.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
 const icons = @import("icons.zig");
@@ -182,6 +183,11 @@ const Session = struct {
     wl_hub_fd: c_int = -1,
     /// Owned display socket path, unlinked on teardown.
     wl_display_path: ?[]u8 = null,
+    /// Audio hub: the daemon IS the session's PulseAudio server
+    /// (mux/pulse.zig). -1 = no audio forwarding for this session.
+    pa_hub_fd: c_int = -1,
+    /// Owned audio socket path, unlinked on teardown.
+    pa_socket_path: ?[]u8 = null,
     /// Isolated session (`sketerm app -i`): owned private runtime-dir
     /// path, recursively removed on teardown. null = not isolated.
     runtime_dir_path: ?[]u8 = null,
@@ -200,8 +206,13 @@ const Session = struct {
             self.allocator.destroy(ws);
         }
         if (self.wl_hub_fd >= 0) _ = c.close(self.wl_hub_fd);
+        if (self.pa_hub_fd >= 0) _ = c.close(self.pa_hub_fd);
         var z_buf: [4096]u8 = undefined;
         if (self.wl_display_path) |p| {
+            if (pathZ(&z_buf, p)) |z| _ = c.unlink(z) else |_| {}
+            self.allocator.free(p);
+        }
+        if (self.pa_socket_path) |p| {
             if (pathZ(&z_buf, p)) |z| _ = c.unlink(z) else |_| {}
             self.allocator.free(p);
         }
@@ -305,6 +316,10 @@ const Client = struct {
     /// Protocol version the client announced in hello. Channels are
     /// only opened toward proto >= 2 clients.
     proto: u32 = 1,
+    /// The client sent an audio `subscribe` unit: it drains PCM.
+    /// Audio units flow only to subscribed clients (a terminal-only
+    /// viewer must never be flooded into its output cap).
+    audio_ok: bool = false,
     /// The client advertised it can decode the video codec (hello
     /// `video`). Gates whether forwarded surfaces route through the lossy
     /// video path — never send a tile a client can't decode.
@@ -390,9 +405,16 @@ const Channel = struct {
     /// Non-null on a Wayland app channel: the app speaks raw Wayland
     /// to us and the byte stream toward the GUI is wlhost/pipe units.
     native: ?*Native = null,
+    /// Non-null on an audio channel: the app speaks the PulseAudio
+    /// native protocol; the stream toward the GUI is pulse.zig units.
+    pa: ?*pulse.Server = null,
 
     fn deinit(self: *Channel) void {
         if (self.native) |nv| nv.deinit();
+        if (self.pa) |srv| {
+            srv.deinit();
+            self.allocator.destroy(srv);
+        }
         _ = c.close(self.fd);
         self.pending.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -669,6 +691,9 @@ pub const Daemon = struct {
     /// Monotonic id for per-session Wayland socket paths (session
     /// names are user input — not path-safe).
     next_wl_id: u32 = 1,
+    /// Audio hub sockets ("pa-N") — separate counter so wl-N naming
+    /// stays sequential (the smoke rigs derive it).
+    next_pa_id: u32 = 1,
     /// Monotonic id for isolated sessions' private runtime dirs (same
     /// path-safety reason as next_wl_id).
     next_rt_id: u32 = 1,
@@ -811,6 +836,14 @@ pub const Daemon = struct {
                 .revents = 0,
             });
         }
+        const pa_base = fds.items.len;
+        for (self.sessions.items) |s| {
+            try fds.append(self.allocator, .{
+                .fd = s.pa_hub_fd, // audio hub listener (-1 = none)
+                .events = c.POLLIN,
+                .revents = 0,
+            });
+        }
         // Window-stream wakeup pipes: SCK delivers frames on its own
         // dispatch queues — a readable byte here just ends the poll
         // wait early so pumpWinstreams() drains with low latency.
@@ -916,6 +949,7 @@ pub const Daemon = struct {
         while (i < n_sessions) : (i += 1) {
             const s = self.sessions.items[i];
             if (fds.items[hub_base + i].revents & c.POLLIN != 0) self.acceptWaylandApp(s);
+            if (fds.items[pa_base + i].revents & c.POLLIN != 0) self.acceptAudioApp(s);
         }
 
         i = 0;
@@ -1393,6 +1427,10 @@ pub const Daemon = struct {
                     if (!nativeViewer(cl, ch.session)) return;
                     return self.nativeClientData(ch, frame.payload[4..]);
                 }
+                if (ch.pa != null) {
+                    if (!nativeViewer(cl, ch.session)) return;
+                    return self.paClientData(cl, ch, frame.payload[4..]);
+                }
                 if (ch.client != cl) return;
                 if (ch.session.winstream) |ws| {
                     var pos: usize = 0;
@@ -1406,12 +1444,12 @@ pub const Daemon = struct {
             .chan_close => {
                 const id = wire.decodeChanId(frame.payload) orelse return;
                 const ch = self.findChannel(id) orelse return;
-                // A viewer dropping its side of a NATIVE channel is
-                // just that viewer going away — the app is durable
-                // and keeps running for everyone else (and for a
-                // later reattach). Only winstream dies with its
+                // A viewer dropping its side of a NATIVE (or audio)
+                // channel is just that viewer going away — the app is
+                // durable and keeps running for everyone else (and
+                // for a later reattach). Only winstream dies with its
                 // client.
-                if (ch.native != null) return;
+                if (ch.native != null or ch.pa != null) return;
                 if (ch.client != cl) return;
                 ch.dead = true;
             },
@@ -2012,6 +2050,116 @@ pub const Daemon = struct {
         self.openAppChannel(s, fd);
     }
 
+    fn acceptAudioApp(self: *Daemon, s: *Session) void {
+        const fd = c.accept(s.pa_hub_fd, null, null);
+        if (fd < 0) return;
+        _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+        const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+        _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+        self.openAudioChannel(s, fd);
+    }
+
+    fn openAudioChannel(self: *Daemon, s: *Session, fd: c_int) void {
+        const srv = self.allocator.create(pulse.Server) catch {
+            _ = c.close(fd);
+            return;
+        };
+        srv.* = pulse.Server.init(self.allocator);
+        const ch = self.allocator.create(Channel) catch {
+            srv.deinit();
+            self.allocator.destroy(srv);
+            _ = c.close(fd);
+            return;
+        };
+        ch.* = .{
+            .allocator = self.allocator,
+            .id = self.next_chan_id,
+            .fd = fd,
+            .session = s,
+            .client = null,
+            .pa = srv,
+        };
+        self.next_chan_id += 1;
+        self.channels.append(self.allocator, ch) catch {
+            ch.deinit();
+            return;
+        };
+        var hdr: [5]u8 = undefined;
+        for (self.clients.items) |cl| {
+            if (nativeViewer(cl, s)) {
+                cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio));
+                srv.has_viewer = true;
+            }
+        }
+    }
+
+    /// PA-app socket readable: feed the protocol server, replies go
+    /// back to the app, PCM/stream units toward attached viewers.
+    fn paReadable(self: *Daemon, ch: *Channel) void {
+        const srv = ch.pa.?;
+        srv.has_viewer = blk: {
+            for (self.clients.items) |cl| {
+                if (nativeViewer(cl, ch.session)) break :blk true;
+            }
+            break :blk false;
+        };
+        var buf: [64 * 1024]u8 = undefined;
+        var rounds: u32 = 0;
+        while (rounds < 16) : (rounds += 1) {
+            const n = c.read(ch.fd, &buf, buf.len);
+            if (n == 0) {
+                self.closeChannel(ch, true);
+                return;
+            }
+            if (n < 0) break; // EAGAIN
+            srv.feed(buf[0..@intCast(n)]) catch {
+                self.closeChannel(ch, true);
+                return;
+            };
+            if (srv.dead) {
+                self.closeChannel(ch, true);
+                return;
+            }
+        }
+        const out = srv.takeOut();
+        if (out.len > 0) {
+            ch.pending.appendSlice(self.allocator, out) catch {
+                self.closeChannel(ch, true);
+                return;
+            };
+            srv.clearOut();
+        }
+        const units = srv.takeUnits();
+        if (units.len > 0) {
+            if (srv.has_viewer) self.queueUnits(ch, units);
+            srv.clearUnits();
+        }
+        self.channelWritable(ch);
+    }
+
+    /// Viewer → audio channel data (subscribe/consumed/latency).
+    fn paClientData(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const u8) void {
+        const srv = ch.pa.?;
+        var pos: usize = 0;
+        while (pulse.peelUnit(bytes[pos..])) |p| {
+            if (p.tag == .subscribe) {
+                cl.audio_ok = true;
+            } else {
+                srv.applyUnit(p.tag, p.payload) catch {};
+            }
+            pos += p.consumed;
+        }
+        const out = srv.takeOut();
+        if (out.len > 0) {
+            ch.pending.appendSlice(self.allocator, out) catch {
+                self.closeChannel(ch, true);
+                return;
+            };
+            srv.clearOut();
+        }
+        self.channelWritable(ch);
+    }
+
     /// True when `cl` should receive this session's native app units.
     /// Brain saw the app announce its app_id: resolve the app's icon
     /// on THIS host (works for remote apps — the client can't) and
@@ -2127,6 +2275,7 @@ pub const Daemon = struct {
     /// pipe). Winstream channels carry fd = -1 and never land here.
     fn channelReadable(self: *Daemon, ch: *Channel) void {
         if (ch.native != null) self.nativeReadable(ch);
+        if (ch.pa != null) self.paReadable(ch);
     }
 
     fn channelWritable(self: *Daemon, ch: *Channel) void {
@@ -2454,6 +2603,13 @@ pub const Daemon = struct {
             for (self.clients.items) |cl| {
                 if (nativeViewer(cl, ch.session)) self.queueUnitsTo(cl, ch, bytes);
             }
+        } else if (ch.pa != null) {
+            // PCM only flows to viewers that SUBSCRIBED — flooding a
+            // terminal-only client would blow its output cap and take
+            // the whole connection down.
+            for (self.clients.items) |cl| {
+                if (nativeViewer(cl, ch.session) and cl.audio_ok) self.queueUnitsTo(cl, ch, bytes);
+            }
         } else if (ch.client) |cl| {
             if (!cl.dead) self.queueUnitsTo(cl, ch, bytes);
         }
@@ -2739,7 +2895,7 @@ pub const Daemon = struct {
         if (!notify) return;
         var hdr: [4]u8 = undefined;
         const frame = wire.putChanHeader(&hdr, ch.id);
-        if (ch.native != null) {
+        if (ch.native != null or ch.pa != null) {
             for (self.clients.items) |cl| {
                 if (nativeViewer(cl, ch.session)) cl.queueFrame(.chan_close, frame);
             }
@@ -3044,17 +3200,35 @@ pub const Daemon = struct {
     }
 
     fn setupWaylandHub(self: *Daemon) ?WaylandHub {
+        const id = if (self.isWorker()) 0 else blk: {
+            const v = self.next_wl_id;
+            self.next_wl_id += 1;
+            break :blk v;
+        };
+        return self.setupHubSocket("wl", id);
+    }
+
+    /// PulseAudio hub: same listener shape, "pa-N" socket (its own
+    /// counter — the rigs rely on sequential "wl-N"). Each app
+    /// connection becomes an `audio` channel (mux/pulse.zig server).
+    fn setupAudioHub(self: *Daemon) ?WaylandHub {
+        const id = if (self.isWorker()) 0 else blk: {
+            const v = self.next_pa_id;
+            self.next_pa_id += 1;
+            break :blk v;
+        };
+        return self.setupHubSocket("pa", id);
+    }
+
+    fn setupHubSocket(self: *Daemon, comptime prefix: []const u8, id: u32) ?WaylandHub {
         const dir = self.runtimeBaseDir() orelse return null;
         // Workers share the runtime dir, each with one session, so a per-worker
         // counter would collide ("wl-1" in every worker) — name by pid instead.
         // The monolith keeps the sequential "wl-N" the rigs expect.
         const display_path = if (self.isWorker())
-            std.fmt.allocPrint(self.allocator, "{s}/wl-w{d}", .{ dir, c.getpid() }) catch return null
-        else blk: {
-            const id = self.next_wl_id;
-            self.next_wl_id += 1;
-            break :blk std.fmt.allocPrint(self.allocator, "{s}/wl-{d}", .{ dir, id }) catch return null;
-        };
+            std.fmt.allocPrint(self.allocator, "{s}/" ++ prefix ++ "-w{d}", .{ dir, c.getpid() }) catch return null
+        else
+            std.fmt.allocPrint(self.allocator, "{s}/" ++ prefix ++ "-{d}", .{ dir, id }) catch return null;
         var ok = false;
         defer if (!ok) self.allocator.free(display_path);
 
@@ -3138,6 +3312,17 @@ pub const Daemon = struct {
             allocator.free(h.display_path);
         };
 
+        // Remote audio rides the same gate: the daemon IS the
+        // session's PulseAudio server (SKETERM_MUX_NO_AUDIO=1 opts out).
+        var audio_hub: ?WaylandHub = if (want_wayland and std.c.getenv("SKETERM_MUX_NO_AUDIO") == null)
+            self.setupAudioHub()
+        else
+            null;
+        errdefer if (audio_hub) |h| {
+            _ = c.close(h.fd);
+            allocator.free(h.display_path);
+        };
+
         var argv_z: std.ArrayList([:0]u8) = .empty;
         defer {
             for (argv_z.items) |a| allocator.free(a);
@@ -3160,6 +3345,12 @@ pub const Daemon = struct {
         } else if (req.local and req.host_wayland_display.len > 0) {
             // Local passthrough: point the child at the host compositor.
             wl_disp_z = try allocator.dupeZ(u8, req.host_wayland_display);
+        }
+        // Likewise the audio server: PULSE_SERVER=unix:<hub socket>.
+        var pa_env_z: ?[:0]u8 = null;
+        defer if (pa_env_z) |z| allocator.free(z);
+        if (audio_hub) |h| {
+            pa_env_z = try std.fmt.allocPrintSentinel(allocator, "unix:{s}", .{h.display_path}, 0);
         }
 
         // Isolated session: a private runtime dir (sibling of the wl
@@ -3248,6 +3439,7 @@ pub const Daemon = struct {
             .session_name = if (name_z) |z| z.ptr else null,
             .shell_integration = shell_integration,
             .wayland_display = if (wl_disp_z) |z| z.ptr else null,
+            .pulse_server = if (pa_env_z) |z| z.ptr else null,
             .runtime_dir = if (rt_dir_z) |z| z.ptr else null,
             .a11y_bus_addr = if (a11y_addr_z) |z| z.ptr else null,
         });
@@ -3290,6 +3482,11 @@ pub const Daemon = struct {
             s.wl_hub_fd = h.fd;
             s.wl_display_path = h.display_path;
             hub = null; // ownership moved to the session
+        }
+        if (audio_hub) |h| {
+            s.pa_hub_fd = h.fd;
+            s.pa_socket_path = h.display_path;
+            audio_hub = null; // ownership moved to the session
         }
         if (rt_dir_owned) |p| {
             s.runtime_dir_path = p;
@@ -3392,6 +3589,27 @@ pub const Daemon = struct {
     /// serialized protocol state. Windows reappear with current
     /// pixels (durable GUI apps, multi-viewer).
     fn replayNativeChannels(self: *Daemon, cl: *Client, s: *Session) void {
+        // Audio channels: announce + re-open live streams so the
+        // reattaching viewer builds its local sinks.
+        for (self.channels.items) |ch| {
+            if (ch.session != s or ch.dead) continue;
+            const srv = ch.pa orelse continue;
+            var hdr: [5]u8 = undefined;
+            cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio));
+            srv.has_viewer = true;
+            var units: std.ArrayList(u8) = .empty;
+            defer units.deinit(self.allocator);
+            var it = srv.streams.iterator();
+            while (it.next()) |e| {
+                var pl: [10]u8 = undefined;
+                std.mem.writeInt(u32, pl[0..4], e.key_ptr.*, .little);
+                pl[4] = e.value_ptr.format;
+                pl[5] = e.value_ptr.channels;
+                std.mem.writeInt(u32, pl[6..10], e.value_ptr.rate, .little);
+                pulse.appendUnit(&units, self.allocator, .open, &pl) catch break;
+            }
+            if (units.items.len > 0) self.queueUnitsTo(cl, ch, units.items);
+        }
         for (self.channels.items) |ch| {
             if (ch.session != s or ch.dead) continue;
             const nv = ch.native orelse continue;

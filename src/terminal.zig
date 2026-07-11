@@ -9,6 +9,7 @@
 //! no ring) — local shells are daemon sessions the GUI attaches to.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const Parser = @import("parser/vt.zig").Parser;
 const Event = @import("parser/event.zig").Event;
@@ -252,6 +253,8 @@ pub const Terminal = struct {
         napps: std.ArrayList(*NApp) = .empty,
         /// Window-stream channels (pixel capture remotes).
         wsapps: std.ArrayList(*WsApp) = .empty,
+        /// Remote-audio channels (local playback via audio_sink.zig).
+        aapps: std.ArrayList(*AApp) = .empty,
         /// File uploads to this session. One streams at a time (`upload`);
         /// the rest wait in `upload_queue` as owned local-path strings.
         upload: ?*Upload = null,
@@ -285,6 +288,17 @@ pub const Terminal = struct {
         terminal: *Terminal,
         id: u32,
         host: *@import("winapp.zig").WsHost,
+    };
+
+    /// One remote-audio channel (kind audio; Linux GUIs only —
+    /// audio_sink.zig plays through libpulse on the GLib loop).
+    const AApp = if (builtin.os.tag == .linux) struct {
+        terminal: *Terminal,
+        id: u32,
+        sink: *@import("audio_sink.zig").AudioSink,
+    } else struct {
+        terminal: *Terminal,
+        id: u32,
     };
 
     /// Chunk size for a streamed upload. Small enough that one
@@ -593,6 +607,7 @@ pub const Terminal = struct {
                 const id = mux_wire.decodeChanId(frame.payload) orelse return;
                 if (self.findNApp(id)) |na| self.destroyNApp(na);
                 if (self.findWsApp(id)) |wa| self.destroyWsApp(wa);
+                if (self.findAApp(id)) |aa| self.destroyAApp(aa);
             },
             else => {},
         }
@@ -685,8 +700,98 @@ pub const Terminal = struct {
         switch (open.kind) {
             .wayland_native => self.nappOpen(open.id),
             .winstream => self.wsappOpen(open.id),
+            .audio => self.aappOpen(open.id),
             else => self.sendChanClose(open.id),
         }
+    }
+
+    // ── remote-audio channels (local playback) ──────────────────
+
+    fn findAApp(self: *Terminal, id: u32) ?*AApp {
+        const remote = self.remote orelse return null;
+        for (remote.aapps.items) |aa| {
+            if (aa.id == id) return aa;
+        }
+        return null;
+    }
+
+    fn aappOpen(self: *Terminal, id: u32) void {
+        if (comptime builtin.os.tag != .linux) return self.sendChanClose(id);
+        const remote = self.remote orelse return;
+        const sink = @import("audio_sink.zig").AudioSink.create(self.allocator) catch {
+            self.sendChanClose(id);
+            return;
+        };
+        const aa = self.allocator.create(AApp) catch {
+            sink.destroy();
+            self.sendChanClose(id);
+            return;
+        };
+        aa.* = .{ .terminal = self, .id = id, .sink = sink };
+        sink.on_flush = aappFlushCb;
+        sink.flush_ctx = aa;
+        remote.aapps.append(self.allocator, aa) catch {
+            sink.destroy();
+            self.allocator.destroy(aa);
+            self.sendChanClose(id);
+            return;
+        };
+        // Opt into PCM: the daemon only ships audio to subscribers.
+        const pulse = @import("mux/pulse.zig");
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(self.allocator);
+        pulse.appendUnit(&units, self.allocator, .subscribe, "") catch return;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, id, .little);
+        payload.appendSlice(self.allocator, &idb) catch return;
+        payload.appendSlice(self.allocator, units.items) catch return;
+        remote.conn.sendFrame(.chan_data, payload.items) catch {
+            remote.closed = true;
+        };
+    }
+
+    fn aappData(self: *Terminal, aa: *AApp, bytes: []const u8) void {
+        if (comptime builtin.os.tag != .linux) return;
+        aa.sink.feed(bytes);
+        self.aappFlush(aa);
+    }
+
+    fn aappFlush(self: *Terminal, aa: *AApp) void {
+        if (comptime builtin.os.tag != .linux) return;
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        const out = aa.sink.takeOut();
+        if (out.len == 0) return;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, aa.id, .little);
+        payload.appendSlice(self.allocator, &idb) catch return;
+        payload.appendSlice(self.allocator, out) catch return;
+        aa.sink.clearOut();
+        remote.conn.sendFrame(.chan_data, payload.items) catch {
+            remote.closed = true;
+        };
+    }
+
+    fn aappFlushCb(ctx: ?*anyopaque) void {
+        const aa = @import("util/cast.zig").userData(AApp, ctx);
+        aa.terminal.aappFlush(aa);
+    }
+
+    fn destroyAApp(self: *Terminal, aa: *AApp) void {
+        if (comptime builtin.os.tag == .linux) aa.sink.destroy();
+        if (self.remote) |remote| {
+            for (remote.aapps.items, 0..) |it, i| {
+                if (it == aa) {
+                    _ = remote.aapps.swapRemove(i);
+                    break;
+                }
+            }
+        }
+        self.allocator.destroy(aa);
     }
 
     // ── File upload (file_* frames) ──────────────────────────────
@@ -1139,6 +1244,7 @@ pub const Terminal = struct {
         const id = mux_wire.decodeChanId(payload) orelse return;
         if (self.findNApp(id)) |na| return self.nappData(na, payload[4..]);
         if (self.findWsApp(id)) |wa| return self.wsappData(wa, payload[4..]);
+        if (self.findAApp(id)) |aa| return self.aappData(aa, payload[4..]);
     }
 
     fn destroyAllChans(self: *Terminal) void {
@@ -1148,6 +1254,9 @@ pub const Terminal = struct {
         }
         while (remote.wsapps.items.len > 0) {
             self.destroyWsApp(remote.wsapps.items[remote.wsapps.items.len - 1]);
+        }
+        while (remote.aapps.items.len > 0) {
+            self.destroyAApp(remote.aapps.items[remote.aapps.items.len - 1]);
         }
     }
 
@@ -1583,6 +1692,7 @@ pub const Terminal = struct {
             self.destroyAllChans();
             remote.napps.deinit(self.allocator);
             remote.wsapps.deinit(self.allocator);
+            remote.aapps.deinit(self.allocator);
             remote.predictor.deinit();
             if (!remote.closed) {
                 if (remote.ephemeral) {
@@ -1688,6 +1798,7 @@ test "destroyNApp fires on_app_view before destroying the host" {
     var remote: Terminal.Remote = undefined;
     remote.napps = .empty;
     remote.wsapps = .empty;
+    remote.aapps = .empty;
     remote.app_window_opened = false;
     remote.closed = true; // sendChanClose must not touch conn
 
@@ -1722,6 +1833,7 @@ test "destroyNApp fires on_app_view before destroying the host" {
     cap.old.?.finalFree();
     remote.napps.deinit(alloc);
     remote.wsapps.deinit(alloc);
+    remote.aapps.deinit(alloc);
 }
 
 test "clearSinks fences on_app_view (fenced-pane teardown crash regression)" {
@@ -1744,6 +1856,7 @@ test "clearSinks fences on_app_view (fenced-pane teardown crash regression)" {
     var remote: Terminal.Remote = undefined;
     remote.napps = .empty;
     remote.wsapps = .empty;
+    remote.aapps = .empty;
     remote.app_window_opened = false;
     remote.closed = true; // sendChanClose must not touch conn
 
@@ -1766,4 +1879,5 @@ test "clearSinks fences on_app_view (fenced-pane teardown crash regression)" {
     try std.testing.expectEqual(@as(usize, 0), remote.napps.items.len);
     remote.napps.deinit(alloc);
     remote.wsapps.deinit(alloc);
+    remote.aapps.deinit(alloc);
 }

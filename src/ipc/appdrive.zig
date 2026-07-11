@@ -133,6 +133,9 @@ pub const App = struct {
     conn: muxclient.Conn,
     name: []u8,
     chans: std.AutoArrayHashMapUnmanaged(u32, *Chan) = .empty,
+    /// Audio channels: headless — no playback, but the consumed
+    /// clock must keep ticking or the app blocks on a full sink.
+    audio_ids: std.AutoHashMapUnmanaged(u32, void) = .empty,
     windows: std.ArrayList(*Window) = .empty,
     next_win_id: u32 = 1,
     /// Bumped on every committed frame — the quiescence signal.
@@ -260,6 +263,7 @@ pub const App = struct {
             a.destroy(ch);
         }
         self.chans.deinit(a);
+        self.audio_ids.deinit(a);
         for (self.windows.items) |w| {
             w.deinit(a);
             a.destroy(w);
@@ -306,6 +310,16 @@ pub const App = struct {
         switch (ftype) {
             .chan_open => {
                 const open = wire.decodeChanOpen(payload) orelse return;
+                if (open.kind == .audio) {
+                    self.audio_ids.put(self.allocator, open.id, {}) catch {};
+                    // Subscribe: we drain PCM (instant-consume clock).
+                    const pulse = @import("../mux/pulse.zig");
+                    var units: std.ArrayList(u8) = .empty;
+                    defer units.deinit(self.allocator);
+                    pulse.appendUnit(&units, self.allocator, .subscribe, "") catch return;
+                    self.sendIntents(open.id, units.items) catch {};
+                    return;
+                }
                 if (open.kind != .wayland_native) return;
                 const ch = self.allocator.create(Chan) catch return;
                 ch.* = .{ .app = self, .id = open.id, .comp = undefined };
@@ -342,6 +356,10 @@ pub const App = struct {
             },
             .chan_data => {
                 const id = wire.decodeChanId(payload) orelse return;
+                if (self.audio_ids.contains(id)) {
+                    self.drainAudio(id, payload[4..]);
+                    return;
+                }
                 const ch = self.chans.get(id) orelse return;
                 ch.comp.feed(payload[4..]) catch {};
                 ch.comp.clearOut(); // replica output is discarded
@@ -538,6 +556,35 @@ pub const App = struct {
     }
 
     // ── input intents ───────────────────────────────────────────
+
+    /// Headless audio: acknowledge PCM as instantly played so the
+    /// remote app never stalls on a full sink buffer.
+    fn drainAudio(self: *App, id: u32, bytes: []const u8) void {
+        const pulse = @import("../mux/pulse.zig");
+        var consumed: u64 = 0;
+        var pos: usize = 0;
+        while (pulse.peelUnit(bytes[pos..])) |p| {
+            if (p.tag == .pcm and p.payload.len > 4) consumed += p.payload.len - 4;
+            pos += p.consumed;
+        }
+        if (consumed == 0) return;
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(self.allocator);
+        var pl: [12]u8 = undefined;
+        // Stream id: first pcm unit's header (one stream per report
+        // is fine — multiple streams re-report on their own data).
+        pos = 0;
+        while (pulse.peelUnit(bytes[pos..])) |p| {
+            if (p.tag == .pcm and p.payload.len > 4) {
+                @memcpy(pl[0..4], p.payload[0..4]);
+                std.mem.writeInt(u64, pl[4..12], consumed, .little);
+                pulse.appendUnit(&units, self.allocator, .consumed, &pl) catch return;
+                break;
+            }
+            pos += p.consumed;
+        }
+        if (units.items.len > 0) self.sendIntents(id, units.items) catch {};
+    }
 
     fn sendIntents(self: *App, chan: u32, units: []const u8) Error!void {
         if (self.exited) return Error.NotConnected;

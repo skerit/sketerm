@@ -805,6 +805,11 @@ fn configureSysDeps(
     // it). Linux-only; the macOS GUI has no X11.
     if (mod.resolved_target.?.result.os.tag == .linux) {
         mod.linkSystemLibrary("X11", .{ .use_pkg_config = .yes });
+        // Remote-audio playback (audio_sink.zig): async libpulse on
+        // the GLib main loop. GUI-only — the daemon's PA *server*
+        // (mux/pulse.zig) is hand-rolled and links nothing.
+        addPkgConfig(b, mod, "libpulse");
+        addPkgConfig(b, mod, "libpulse-mainloop-glib");
     }
     mod.addCSourceFile(.{
         .file = b.path("vendor/stb_image_impl.c"),

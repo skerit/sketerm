@@ -48,6 +48,9 @@ pub const SpawnOpts = struct {
     /// the mux daemon's native app pipe, where the daemon itself is
     /// the session's Wayland display.
     wayland_display: ?[*:0]const u8 = null,
+    /// PULSE_SERVER for the child ("unix:<absolute path>"): the mux
+    /// daemon is the session's PulseAudio server too (remote audio).
+    pulse_server: ?[*:0]const u8 = null,
     /// Private XDG_RUNTIME_DIR for an isolated app session (`sketerm
     /// app -i`). When set, the child's XDG_RUNTIME_DIR is pointed here
     /// and DBUS_SESSION_BUS_ADDRESS is cleared, so single-instance apps
@@ -180,6 +183,7 @@ pub const Pty = struct {
         if (opts.session_name) |sn| _ = c.setenv("SKETERM_SESSION", sn, 1);
         if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1);
         if (opts.wayland_display) |wd| _ = c.setenv("WAYLAND_DISPLAY", wd, 1);
+        if (opts.pulse_server) |ps| _ = c.setenv("PULSE_SERVER", ps, 1);
         // Isolated app session: give the child a private runtime dir
         // and drop the inherited session bus. Both are how
         // single-instance apps find a peer for the same user — cutting
