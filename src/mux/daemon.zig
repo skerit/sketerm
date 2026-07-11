@@ -431,6 +431,17 @@ const Channel = struct {
 /// Per-channel state of the sketerm-native app pipe: the session's
 /// app connects straight to the daemon. Owns the protocol tracker
 /// and the mmapped shm pool mirrors.
+/// DMA_BUF_IOCTL_SYNC bracket around CPU reads of a dmabuf mapping.
+/// Best-effort: memfd/udmabuf exporters answer ENOTTY (fine); real
+/// GPU exporters need it for cache coherency.
+fn dmabufSync(fd: c_int, end: bool) void {
+    const DmaBufSync = extern struct { flags: u64 };
+    const DMA_BUF_SYNC_READ: u64 = 1;
+    const DMA_BUF_SYNC_END: u64 = 1 << 2;
+    var s = DmaBufSync{ .flags = DMA_BUF_SYNC_READ | (if (end) DMA_BUF_SYNC_END else 0) };
+    _ = c.ioctl(fd, 0x40086200, &s); // DMA_BUF_IOCTL_SYNC = _IOW('b', 0, u64)
+}
+
 const Native = struct {
     allocator: std.mem.Allocator,
     tracker: wltrack.Tracker,
@@ -467,6 +478,12 @@ const Native = struct {
     /// pool id → mmapped mirror. Mirrors outlive wl_shm_pool
     /// destructors: existing buffers keep referencing the memory.
     pools: std.AutoHashMapUnmanaged(u32, PoolMirror) = .empty,
+    /// zwp_linux_buffer_params_v1 id → plane fd awaiting create_immed.
+    dmabuf_pending: std.AutoHashMapUnmanaged(u32, c_int) = .empty,
+    /// dmabuf wl_buffer id → CPU-mapped mirror (LINEAR-only import).
+    /// Shipped through the same pipe units as pools, under a
+    /// synthetic pool id equal to the buffer id.
+    dmabufs: std.AutoHashMapUnmanaged(u32, PoolMirror) = .empty,
     /// Per-surface lossy-video state (only populated under
     /// build_options.video): a churn tracker + a fixed-resolution
     /// encoder, keyed by surface id. Hot, photographic surfaces route
@@ -531,6 +548,15 @@ const Native = struct {
             _ = c.close(p.fd);
         }
         self.pools.deinit(self.allocator);
+        var dbit = self.dmabufs.valueIterator();
+        while (dbit.next()) |m| {
+            _ = c.munmap(m.ptr, m.size);
+            _ = c.close(m.fd);
+        }
+        self.dmabufs.deinit(self.allocator);
+        var dpit = self.dmabuf_pending.valueIterator();
+        while (dpit.next()) |fd| _ = c.close(fd.*);
+        self.dmabuf_pending.deinit(self.allocator);
         for (self.fds.items) |fd| _ = c.close(fd);
         self.fds.deinit(self.allocator);
         for (self.out_fds.items) |fd| _ = c.close(fd);
@@ -2267,6 +2293,10 @@ pub const Daemon = struct {
             return;
         };
         brain.keymap = s.kb_keymap;
+        // Opt-in (see get_registry): only useful where the exporting
+        // driver allows CPU mmap of linear buffers; the softgl force
+        // in pty.zig is dropped by the same env var.
+        brain.advertise_dmabuf = c.getenv("SKETERM_MUX_DMABUF") != null;
         native.* = .{ .allocator = self.allocator, .tracker = tracker, .brain = brain };
 
         const ch = self.allocator.create(Channel) catch {
@@ -2517,7 +2547,65 @@ pub const Daemon = struct {
     fn nativeAction(self: *Daemon, nv: *Native, units: *std.ArrayList(u8), msgb: []const u8, action: wltrack.Action) !void {
         const a = self.allocator;
         switch (action) {
-            .relay, .buffer_create, .buffer_destroy => try wlpipe.appendUnit(units, a, .wl_msg, msgb),
+            .relay, .buffer_create => try wlpipe.appendUnit(units, a, .wl_msg, msgb),
+            .buffer_destroy => |bd| {
+                if (nv.dmabufs.fetchRemove(bd.id)) |kv| {
+                    _ = c.munmap(kv.value.ptr, kv.value.size);
+                    _ = c.close(kv.value.fd);
+                }
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+            },
+            .dmabuf_add => |da| {
+                // The fd rides the same SCM_RIGHTS queue as create_pool;
+                // pop it even for a rejected plane to stay aligned.
+                const fd = nv.popFd() orelse return error.MissingFd;
+                if (!da.ok) {
+                    _ = c.close(fd);
+                } else {
+                    if (nv.dmabuf_pending.fetchRemove(da.params)) |old| _ = c.close(old.value);
+                    nv.dmabuf_pending.put(a, da.params, fd) catch {
+                        _ = c.close(fd);
+                        return error.MissingFd;
+                    };
+                }
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+            },
+            .dmabuf_create_failed => |dcf| {
+                // Non-immed create: the brain answers `failed` (client
+                // falls back to shm); just drop the pending fd.
+                if (nv.dmabuf_pending.fetchRemove(dcf.params)) |old| _ = c.close(old.value);
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+            },
+            .params_destroy => |pd| {
+                if (nv.dmabuf_pending.fetchRemove(pd.id)) |old| _ = c.close(old.value);
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+            },
+            .dmabuf_create => |dc| {
+                const kv = nv.dmabuf_pending.fetchRemove(dc.params) orelse return error.MissingFd;
+                const fd = kv.value;
+                errdefer _ = c.close(fd);
+                var st: c.struct_stat = undefined;
+                if (c.fstat(fd, &st) != 0) return error.MapFailed;
+                const need = @as(usize, dc.offset) + @as(usize, dc.stride) * @as(usize, @intCast(dc.height));
+                if (st.st_size <= 0 or @as(usize, @intCast(st.st_size)) < need) return error.BadSize;
+                const sz: usize = @intCast(st.st_size);
+                const ptr = c.mmap(null, sz, c.PROT_READ, c.MAP_SHARED, fd, 0);
+                if (ptr == null or ptr == c.MAP_FAILED) {
+                    // Exporter refuses CPU mapping (VRAM-placed or
+                    // NVIDIA buffers). create_immed has no per-buffer
+                    // failure signal, so degrade: the buffer exists
+                    // but ships no pixels (stale window; GTK's tiny
+                    // probe buffer is never attached at all). The
+                    // brain still releases it, so the app never hangs.
+                    std.debug.print("sketerm-mux: dmabuf mmap refused (errno {d}) — buffer {d} will not update; unset SKETERM_MUX_DMABUF for this driver\n", .{ @intFromEnum(std.posix.errno(@as(isize, -1))), dc.id });
+                    _ = c.close(fd);
+                    try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+                    return;
+                }
+                errdefer _ = c.munmap(@ptrCast(ptr.?), sz);
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+                try nv.dmabufs.put(a, dc.id, .{ .fd = fd, .ptr = @ptrCast(ptr.?), .size = sz });
+            },
             .clip_receive => |cr| {
                 // App wants to paste: hold the write-end (tagged with
                 // the offer id) until the GUI ships clip_data — or a
@@ -2583,8 +2671,14 @@ pub const Daemon = struct {
             .commit => |cm| {
                 // Copy the damaged rows (full buffer when the client
                 // never declares damage). Rows are contiguous in the
-                // pool, so the range is one linear copy.
-                if (nv.pools.get(cm.info.pool)) |mirror| {
+                // pool, so the range is one linear copy. A dmabuf
+                // buffer reads from its CPU mapping instead, bracketed
+                // by DMA_BUF_SYNC for coherency with the GPU.
+                const mirror_opt: ?Native.PoolMirror = if (cm.info.dmabuf)
+                    nv.dmabufs.get(cm.buffer)
+                else
+                    nv.pools.get(cm.info.pool);
+                if (mirror_opt) |mirror| {
                     if (cm.info.offset >= 0 and cm.info.stride > 0 and cm.info.height > 0) {
                         var y0: i64 = 0;
                         var y1: i64 = cm.info.height;
@@ -2599,9 +2693,12 @@ pub const Daemon = struct {
                             // default builds take the lossless path verbatim.
                             var did_video = false;
                             if (comptime build_options.video) {
-                                did_video = nv.videoCommit(units, a, cm, mirror, y0, y1) catch false;
+                                if (!cm.info.dmabuf)
+                                    did_video = nv.videoCommit(units, a, cm, mirror, y0, y1) catch false;
                             }
                             if (!did_video) {
+                                if (cm.info.dmabuf) dmabufSync(mirror.fd, false);
+                                defer if (cm.info.dmabuf) dmabufSync(mirror.fd, true);
                                 // Chunk by WHOLE ROWS so each chunk starts at
                                 // column 0 — the pixcodec predictor resets per
                                 // row, and arbitrary byte cuts would misalign it.
@@ -3679,6 +3776,37 @@ pub const Daemon = struct {
                     off += len;
                 }
                 if (!ok) break;
+            }
+            // Dmabuf mirrors replay as their synthetic pools (pool id
+            // == buffer id) so a reattaching replica has pixels for
+            // the restored buffers.
+            if (ok) {
+                var dit = nv.dmabufs.iterator();
+                while (dit.next()) |e| {
+                    const pool_id = e.key_ptr.*;
+                    const mirror = e.value_ptr.*;
+                    wlpipe.appendPoolMeta(&units, self.allocator, .pool_create, pool_id, @intCast(mirror.size)) catch {
+                        ok = false;
+                        break;
+                    };
+                    dmabufSync(mirror.fd, false);
+                    defer dmabufSync(mirror.fd, true);
+                    var off: usize = 0;
+                    while (off < mirror.size) {
+                        const len = @min(POOL_CHUNK, mirror.size - off);
+                        const raw = mirror.ptr[off..][0..len];
+                        var sc: wlpixcodec.Scratch = .{};
+                        defer sc.deinit(self.allocator);
+                        const enc = wlpixcodec.encodeRegion(&sc, self.allocator, raw, len) catch
+                            wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
+                        wlpipe.appendPoolUpdateC(&units, self.allocator, pool_id, @intCast(off), enc, @intCast(len), @intCast(len)) catch {
+                            ok = false;
+                            break;
+                        };
+                        off += len;
+                    }
+                    if (!ok) break;
+                }
             }
             if (ok) {
                 if (nv.brain.serializeState(self.allocator)) |blob| {

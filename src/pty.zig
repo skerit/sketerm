@@ -184,13 +184,16 @@ pub const Pty = struct {
         if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1);
         if (opts.wayland_display) |wd| {
             _ = c.setenv("WAYLAND_DISPLAY", wd, 1);
-            // The daemon compositor is shm-only (no dmabuf/wl_drm), so
-            // EGL can't reach a GPU through it — without this, Mesa's
-            // device probe fails and GL apps abort/crash at startup.
-            // llvmpipe renders into shm buffers, which is exactly what
-            // the pixel pipeline ships. SKETERM_MUX_NO_SOFTGL=1 (on the
-            // daemon) opts out; an explicit user value is respected.
-            if (c.getenv("SKETERM_MUX_NO_SOFTGL") == null)
+            // Software GL by default: without a GPU device the EGL
+            // probe can crash GL apps at startup, and llvmpipe renders
+            // into shm, exactly what the pixel pipeline ships. The
+            // compositor DOES speak linux-dmabuf (LINEAR-only, CPU-
+            // mapped import) — SKETERM_MUX_DMABUF=1 on the daemon
+            // drops this force so Mesa renders on the real GPU and
+            // presents linear dmabufs. SKETERM_MUX_NO_SOFTGL=1 also
+            // opts out; an explicit user value is respected.
+            if (c.getenv("SKETERM_MUX_NO_SOFTGL") == null and
+                c.getenv("SKETERM_MUX_DMABUF") == null)
                 _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
         }
         if (opts.pulse_server) |ps| _ = c.setenv("PULSE_SERVER", ps, 1);

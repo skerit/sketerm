@@ -2,9 +2,10 @@
 //! compositor advertises: core wayland + xdg-shell + the modern
 //! client staples (selections incl. primary, relative pointer +
 //! constraints, text-input v3, xdg-activation, presentation-time,
-//! idle-inhibit, pointer gestures). Deliberately shm-only — no
-//! dmabuf: GPU clients fall back to shm, which is what the
-//! pixel-shipping pipeline wants.
+//! idle-inhibit, pointer gestures). Buffers are shm plus an opt-in
+//! LINEAR-only linux-dmabuf (SKETERM_MUX_DMABUF): the daemon reads
+//! dmabufs with plain mmap — no GPU libraries — and clients whose
+//! drivers refuse CPU mapping stay on shm by default.
 //!
 //! Signature letters match wire.zig's ArgIter:
 //!   i int · u uint · f fixed · s string · o object · n new_id ·
@@ -170,6 +171,43 @@ pub const wl_buffer = Interface{
         .{ .name = "release", .sig = "" },
     },
 };
+
+/// linux-dmabuf at v3 exactly: v4's feedback objects need a main DRM
+/// device identity we don't have. Import policy is LINEAR-only —
+/// the daemon reads buffers with plain mmap, no GPU libraries.
+pub const zwp_linux_dmabuf_v1 = Interface{
+    .name = "zwp_linux_dmabuf_v1",
+    .version = 3,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "create_params", .sig = "n", .new_id_iface = &zwp_linux_buffer_params_v1 },
+    },
+    .events = &.{
+        .{ .name = "format", .sig = "u" },
+        .{ .name = "modifier", .sig = "uuu", .since = 3 },
+    },
+};
+
+pub const zwp_linux_buffer_params_v1 = Interface{
+    .name = "zwp_linux_buffer_params_v1",
+    .version = 3,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "add", .sig = "huuuuu" },
+        .{ .name = "create", .sig = "iiuu" },
+        .{ .name = "create_immed", .sig = "niiuu", .new_id_iface = &wl_buffer },
+    },
+    .events = &.{
+        .{ .name = "created", .sig = "n", .new_id_iface = &wl_buffer },
+        .{ .name = "failed", .sig = "" },
+    },
+};
+
+/// DRM fourcc codes for the two formats we import (byte layout is
+/// identical to the matching wl_shm formats on little-endian).
+pub const DRM_FORMAT_ARGB8888: u32 = 0x34325241; // 'AR24'
+pub const DRM_FORMAT_XRGB8888: u32 = 0x34325258; // 'XR24'
+pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 pub const wl_surface = Interface{
     .name = "wl_surface",
@@ -878,7 +916,8 @@ pub const all = [_]*const Interface{
     &wp_presentation_feedback,          &zwp_idle_inhibit_manager_v1,
     &zwp_idle_inhibitor_v1,             &zwp_pointer_gestures_v1,
     &zwp_pointer_gesture_swipe_v1,      &zwp_pointer_gesture_pinch_v1,
-    &zwp_pointer_gesture_hold_v1,
+    &zwp_pointer_gesture_hold_v1,       &zwp_linux_dmabuf_v1,
+    &zwp_linux_buffer_params_v1,
 };
 
 // ─── tests ──────────────────────────────────────────────────────
@@ -913,7 +952,11 @@ test "every 'n' signature names its interface (except registry.bind)" {
             try t.expectEqual(has_n, msg.new_id_iface != null);
             if (has_n) try t.expect(iface == &wl_data_device or
                 iface == &zwlr_data_control_device_v1 or
-                iface == &zwp_primary_selection_device_v1);
+                iface == &zwp_primary_selection_device_v1 or
+                // `created` is never emitted (non-immed create is
+                // answered with `failed`); the entry only keeps
+                // `failed` at its spec opcode.
+                iface == &zwp_linux_buffer_params_v1);
         }
     }
 }
