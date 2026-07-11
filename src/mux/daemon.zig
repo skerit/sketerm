@@ -26,6 +26,7 @@ const wlkeymaps = @import("../wlhost/keymaps.zig");
 const a11yhub = @import("a11yhub.zig");
 const cast_rec = @import("cast.zig");
 const build_options = @import("build_options");
+const version = @import("../version.zig");
 const wlvcodec = @import("../wlhost/vcodec.zig");
 const churnmod = @import("../util/churn.zig");
 const contentmod = @import("../util/content.zig");
@@ -1349,7 +1350,12 @@ pub const Daemon = struct {
                     cl.video = p.value.video;
                     p.deinit();
                 } else |_| {}
-                cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION });
+                cl.queueJson(.welcome, .{
+                    .proto = wire.PROTO_VERSION,
+                    .version = version.string,
+                    .audio_opus = build_options.audio_opus,
+                    .video = build_options.video,
+                });
             },
             .spawn => self.handleSpawn(cl, frame.payload),
             .attach => self.handleAttach(cl, frame.payload),
@@ -3116,7 +3122,7 @@ pub const Daemon = struct {
                 .cwd = if (w.cwd) |cw| cw else "",
             }) catch return;
         }
-        cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .sessions = infos.items });
+        cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = build_options.audio_opus, .video = build_options.video, .sessions = infos.items });
     }
 
     /// Broker side of kill: send the worker a graceful 'K' (it flushes `.gone`
@@ -3786,7 +3792,7 @@ pub const Daemon = struct {
                 .cwd = cwd,
             }) catch return;
         }
-        cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .sessions = infos.items });
+        cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = build_options.audio_opus, .video = build_options.video, .sessions = infos.items });
     }
 
     fn handleKill(self: *Daemon, cl: *Client, payload: []const u8) void {

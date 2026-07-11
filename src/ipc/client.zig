@@ -435,7 +435,7 @@ pub fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
 
 /// True when a Unix socket path has a listener accepting connections.
 /// A stale file from a crashed instance refuses the connect.
-fn socketAlive(path_z: [:0]const u8) bool {
+pub fn socketAlive(path_z: [:0]const u8) bool {
     const client = c.g_socket_client_new();
     defer c.g_object_unref(client);
     const addr = c.g_unix_socket_address_new(path_z.ptr);

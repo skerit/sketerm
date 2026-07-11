@@ -379,7 +379,7 @@ fn renameSession(allocator: std.mem.Allocator, host: ?[]const u8, old: []const u
     return true;
 }
 
-fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn {
+pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn {
     if (host) |h| {
         if (std.mem.startsWith(u8, h, "udp:")) {
             var cfg = @import("../config.zig").Config.load(allocator);

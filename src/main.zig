@@ -16,7 +16,7 @@ comptime {
 }
 
 const APP_ID: [*:0]const u8 = "dev.sker.sketerm";
-const VERSION = "0.1.0";
+const VERSION = @import("version.zig").string;
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -69,6 +69,10 @@ const HELP_TEXT =
     \\                         sketerm-mux on the remote.
     \\                         -u: mosh-style encrypted UDP with
     \\                         roaming.
+    \\  sketerm doctor [host]  Health check: binary/daemon version skew,
+    \\                         socket liveness, terminfo, capabilities.
+    \\                         With a host, also probes the REMOTE
+    \\                         daemon (SSH/UDP) for skew.
     \\
     \\Options:
     \\  --restore             Load tabs from $XDG_STATE_HOME/sketerm/last.json
@@ -208,6 +212,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer allocator.free(mux_args);
         for (argv[2..], 0..) |a, n| mux_args[n] = std.mem.span(a);
         return @import("ipc/mux_cli.zig").run(allocator, mux_args);
+    }
+
+    // `sketerm doctor [host]` — health check; socket-only, no
+    // GApplication.
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "doctor")) {
+        const doc_args = allocator.alloc([]const u8, argv.len - 2) catch return 1;
+        defer allocator.free(doc_args);
+        for (argv[2..], 0..) |a, n| doc_args[n] = std.mem.span(a);
+        return @import("doctor.zig").run(allocator, doc_args);
     }
 
     // `sketerm ssh [-u] <host>` — mosh-style: open a durable remote
