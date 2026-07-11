@@ -253,6 +253,12 @@ const globals = [_]Global{
     // gesture objects never fire (no gestures detected — legal).
     .{ .name = 19, .iface = &protocol.zwp_idle_inhibit_manager_v1, .version = 1 },
     .{ .name = 20, .iface = &protocol.zwp_pointer_gestures_v1, .version = 3 },
+    // linux-dmabuf v3 (v4 needs a main DRM device we don't have):
+    // LINEAR-only XRGB/ARGB — the daemon mmaps the plane fd and ships
+    // pixels exactly like an shm pool (no GPU libraries anywhere).
+    // GPU clients render natively and blit linear; import failure
+    // falls back to shm via `failed`.
+    .{ .name = 22, .iface = &protocol.zwp_linux_dmabuf_v1, .version = 3 },
 };
 
 const Pool = struct {
@@ -278,6 +284,10 @@ const Buffer = struct {
     stride: i32,
     format: u32,
 };
+
+/// Plane-0 layout of a zwp_linux_buffer_params_v1 between add and
+/// create_immed. ok = single plane with the LINEAR modifier.
+const DmabufP = struct { offset: u32 = 0, stride: u32 = 0, ok: bool = false };
 
 const Surface = struct {
     /// Pending (attach happened since last commit). 0 with
@@ -414,6 +424,10 @@ pub const Compositor = struct {
     /// the pool mirror (build_options.video).
     vscratch: std.ArrayList(u8) = .empty,
     buffers: std.AutoHashMapUnmanaged(u32, Buffer) = .empty,
+    /// Dmabuf params negotiation state; a completed create_immed
+    /// turns into a plain Buffer whose pool is the buffer's own id
+    /// (a synthetic pool the pipe units fill like any shm pool).
+    dmabuf_params: std.AutoHashMapUnmanaged(u32, DmabufP) = .empty,
     surfaces: std.AutoHashMapUnmanaged(u32, Surface) = .empty,
     /// xdg_surface id → wl_surface id; xdg_toplevel id → wl_surface id.
     xdg_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
@@ -498,6 +512,11 @@ pub const Compositor = struct {
     /// brain is authoritative and its server-created object ids are
     /// invisible to replicas. Never set on the brain itself.
     lenient: bool = false,
+    /// Announce zwp_linux_dmabuf_v1 in get_registry. The daemon
+    /// brain sets this from SKETERM_MUX_DMABUF; replicas leave it
+    /// false (their announcements are discarded, and binds validate
+    /// against the static table regardless).
+    advertise_dmabuf: bool = false,
     /// Compiled xkb keymap announced to the app's keyboards. Must
     /// match whoever drives the seat (see keymaps.zig).
     keymap: []const u8 = us_keymap,
@@ -518,6 +537,7 @@ pub const Compositor = struct {
         self.pools.deinit(a);
         self.vscratch.deinit(a);
         self.buffers.deinit(a);
+        self.dmabuf_params.deinit(a);
         var sit = self.surfaces.valueIterator();
         while (sit.next()) |s| s.freeOwned(a);
         self.surfaces.deinit(a);
@@ -1319,6 +1339,14 @@ pub const Compositor = struct {
                 const reg = (try it.next()).?.new_id;
                 try self.register(reg, &protocol.wl_registry);
                 for (globals) |g| {
+                    // dmabuf is announce-gated (SKETERM_MUX_DMABUF):
+                    // drivers that refuse CPU mmap can't degrade
+                    // per-buffer under create_immed, so the safe
+                    // default keeps clients on shm. Binds stay
+                    // table-validated either way (replicas re-parse
+                    // them; their announcements are discarded).
+                    if (g.iface == &protocol.zwp_linux_dmabuf_v1 and !self.advertise_dmabuf)
+                        continue;
                     var buf: [64]u8 = undefined;
                     var b = wire.Builder.init(&buf, reg, 0); // global
                     b.putUint(g.name);
@@ -1466,9 +1494,83 @@ pub const Compositor = struct {
             2 => {}, // resize — side-band already grew the mirror
             else => return Error.Protocol,
         } else if (iface == &protocol.wl_buffer) {
-            // destroy
-            _ = self.buffers.remove(hdr.object);
+            // destroy — a dmabuf buffer also owns its synthetic pool
+            // (pool id == buffer id).
+            if (self.buffers.fetchRemove(hdr.object)) |kv| {
+                if (kv.value.pool == hdr.object) {
+                    if (self.pools.fetchRemove(hdr.object)) |pkv| {
+                        var p = pkv.value;
+                        p.deinit(self.allocator);
+                    }
+                }
+            }
             try self.destroyObject(hdr.object);
+        } else if (iface == &protocol.zwp_linux_dmabuf_v1) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object),
+            1 => { // create_params
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.zwp_linux_buffer_params_v1);
+                try self.dmabuf_params.put(self.allocator, id, .{});
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_linux_buffer_params_v1) switch (hdr.opcode) {
+            0 => { // destroy
+                _ = self.dmabuf_params.remove(hdr.object);
+                try self.destroyObject(hdr.object);
+            },
+            1 => { // add(fd, plane_idx, offset, stride, mod_hi, mod_lo)
+                _ = (try it.next()).?; // fd placeholder
+                const plane = (try it.next()).?.uint;
+                const offset = (try it.next()).?.uint;
+                const stride = (try it.next()).?.uint;
+                const mod_hi = (try it.next()).?.uint;
+                const mod_lo = (try it.next()).?.uint;
+                const p = self.dmabuf_params.getPtr(hdr.object) orelse return Error.Protocol;
+                if (plane == 0) {
+                    p.* = .{
+                        .offset = offset,
+                        .stride = stride,
+                        .ok = (@as(u64, mod_hi) << 32 | mod_lo) == protocol.DRM_FORMAT_MOD_LINEAR,
+                    };
+                } else p.ok = false;
+            },
+            2 => { // create (non-immed) — declined: failed → shm fallback
+                var buf: [8]u8 = undefined;
+                var b = wire.Builder.init(&buf, hdr.object, 1); // failed
+                try self.send(try b.finish());
+            },
+            3 => { // create_immed(new_id, w, h, format, flags)
+                const id = (try it.next()).?.new_id;
+                const width = (try it.next()).?.int;
+                const height = (try it.next()).?.int;
+                const format = (try it.next()).?.uint;
+                const flags = (try it.next()).?.uint;
+                const p = self.dmabuf_params.get(hdr.object) orelse return Error.Protocol;
+                const shm_format: u32 = switch (format) {
+                    protocol.DRM_FORMAT_ARGB8888 => 0,
+                    protocol.DRM_FORMAT_XRGB8888 => 1,
+                    else => return Error.Protocol,
+                };
+                if (!p.ok or flags != 0 or width <= 0 or height <= 0 or
+                    @as(u64, p.stride) < @as(u64, @intCast(width)) * 4)
+                    return Error.Protocol;
+                try self.register(id, &protocol.wl_buffer);
+                // Synthetic pool, laid out exactly like the mapped
+                // dmabuf so the daemon's pool_update offsets line up.
+                const pool_size = @as(usize, p.offset) + @as(usize, p.stride) * @as(usize, @intCast(height));
+                const slot = try self.pools.getOrPut(self.allocator, id);
+                if (!slot.found_existing) slot.value_ptr.* = .{};
+                try slot.value_ptr.bytes.resize(self.allocator, pool_size);
+                try self.buffers.put(self.allocator, id, .{
+                    .pool = id,
+                    .offset = @intCast(p.offset),
+                    .width = width,
+                    .height = height,
+                    .stride = @intCast(p.stride),
+                    .format = shm_format,
+                });
+            },
+            else => return Error.Protocol,
         } else if (iface == &protocol.wl_surface) {
             try self.surfaceRequest(hdr, &it);
         } else if (iface == &protocol.wl_seat) switch (hdr.opcode) {
@@ -2559,6 +2661,21 @@ pub const Compositor = struct {
                 b.putUint(fmt);
                 try self.send(try b.finish());
             }
+        } else if (iface == &protocol.zwp_linux_dmabuf_v1) {
+            for ([_]u32{ protocol.DRM_FORMAT_ARGB8888, protocol.DRM_FORMAT_XRGB8888 }) |fmt| {
+                var fbuf: [16]u8 = undefined;
+                var fb = wire.Builder.init(&fbuf, id, 0); // format (legacy)
+                fb.putUint(fmt);
+                try self.send(try fb.finish());
+                if (ver >= 3) {
+                    var mbuf: [24]u8 = undefined;
+                    var mb = wire.Builder.init(&mbuf, id, 1); // modifier
+                    mb.putUint(fmt);
+                    mb.putUint(0); // LINEAR hi
+                    mb.putUint(0); // LINEAR lo
+                    try self.send(try mb.finish());
+                }
+            }
         } else if (iface == &protocol.wl_seat) {
             var buf: [16]u8 = undefined;
             var b = wire.Builder.init(&buf, id, 0); // capabilities
@@ -2646,7 +2763,7 @@ pub const Compositor = struct {
 
     // v2 appends the modern-protocol state (bind versions, relative
     // pointers, constraints, text inputs, primary devices, drag).
-    const state_sync_version: u8 = 2;
+    const state_sync_version: u8 = 3;
 
     fn putU8(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u8) Error!void {
         try out.append(a, v);
@@ -2921,6 +3038,17 @@ pub const Compositor = struct {
             }
         }
 
+        // v3: in-flight dmabuf params (a replica attaching between
+        // add and create_immed must know plane-0 layout).
+        try putU32(&out, a, self.dmabuf_params.count());
+        var dpit = self.dmabuf_params.iterator();
+        while (dpit.next()) |e| {
+            try putU32(&out, a, e.key_ptr.*);
+            try putU32(&out, a, e.value_ptr.offset);
+            try putU32(&out, a, e.value_ptr.stride);
+            try putU8(&out, a, @intFromBool(e.value_ptr.ok));
+        }
+
         return out.toOwnedSlice(a);
     }
 
@@ -2931,7 +3059,7 @@ pub const Compositor = struct {
         var r = StateReader{ .buf = blob };
         const a = self.allocator;
         const ver = try r.u8v();
-        if (ver != 1 and ver != state_sync_version) return Error.Protocol;
+        if (ver < 1 or ver > state_sync_version) return Error.Protocol;
         self.output_scale = try r.i32v();
         self.output_id = try r.u32v();
         self.grabbed_popup = try r.u32v();
@@ -3137,6 +3265,18 @@ pub const Compositor = struct {
                     surf.vp_w = vw;
                     surf.vp_h = vh;
                 }
+            }
+        }
+
+        if (ver >= 3) {
+            const n_dp = try r.u32v();
+            for (0..n_dp) |_| {
+                const id = try r.u32v();
+                var dp = DmabufP{};
+                dp.offset = try r.u32v();
+                dp.stride = try r.u32v();
+                dp.ok = try r.u8v() != 0;
+                try self.dmabuf_params.put(a, id, dp);
             }
         }
 
@@ -3518,6 +3658,8 @@ test "registry dance announces our globals" {
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
     defer comp.deinit();
+    // Opt-in global; announced here so the count covers the full table.
+    comp.advertise_dmabuf = true;
 
     var buf: [64]u8 = undefined;
     var b = wire.Builder.init(&buf, 1, 1); // get_registry(2)
@@ -3535,6 +3677,25 @@ test "registry dance announces our globals" {
         pos += p.consumed;
     }
     try t.expectEqual(globals.len, seen);
+
+    // Default (no SKETERM_MUX_DMABUF): dmabuf is NOT announced —
+    // clients that would create unmappable GPU buffers stay on shm.
+    var tv2 = TestView{};
+    var comp2 = try Compositor.init(t.allocator, tv2.view());
+    defer comp2.deinit();
+    var b2 = wire.Builder.init(&buf, 1, 1);
+    b2.putNewId(2);
+    try req(&comp2, try b2.finish());
+    seen = 0;
+    pos = 0;
+    const bytes2 = comp2.takeOut();
+    while (try pipe.peelUnit(bytes2[pos..])) |p| {
+        const body = p.unit.payload[wire.header_size..];
+        try t.expect(std.mem.indexOf(u8, body, "zwp_linux_dmabuf") == null);
+        seen += 1;
+        pos += p.consumed;
+    }
+    try t.expectEqual(globals.len - 1, seen);
 }
 
 test "subsurface: get_subsurface, set_position, destroy" {
@@ -5592,4 +5753,261 @@ test "host_drop: synthesized dnd delivers host data via drop_data" {
     }
     try t.expectEqual(@as(u32, 0), comp.host_drag.offer);
     try t.expect(!comp.dead);
+}
+
+test "linux-dmabuf: modifiers at bind, create_immed pixels + release, create fails over to shm" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    { // get_registry(2)
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&comp, try b.finish());
+    }
+    comp.clearOut();
+    { // bind dmabuf(name 22) v3 -> id 3
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(22);
+        b.putString("zwp_linux_dmabuf_v1");
+        b.putUint(3);
+        b.putNewId(3);
+        try req(&comp, try b.finish());
+    }
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    // ARGB + XRGB, each as legacy format + LINEAR modifier.
+    const bind_expect = [_][2]u32{
+        .{ 3, 0 }, .{ 3, 1 },
+        .{ 3, 0 }, .{ 3, 1 },
+    };
+    try t.expectEqualSlices([2]u32, &bind_expect, evs.items);
+
+    { // bind compositor(name 1) -> 4
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(1);
+        b.putString("wl_compositor");
+        b.putUint(4);
+        b.putNewId(4);
+        try req(&comp, try b.finish());
+    }
+    { // bind xdg_wm_base(name 5) -> 5
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(5);
+        b.putString("xdg_wm_base");
+        b.putUint(2);
+        b.putNewId(5);
+        try req(&comp, try b.finish());
+    }
+    { // create_surface -> 6
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+    }
+    { // get_xdg_surface(7, 6)
+        var b = wire.Builder.init(&buf, 5, 2);
+        b.putNewId(7);
+        b.putObject(6);
+        try req(&comp, try b.finish());
+    }
+    { // get_toplevel(8)
+        var b = wire.Builder.init(&buf, 7, 1);
+        b.putNewId(8);
+        try req(&comp, try b.finish());
+    }
+    { // initial commit (no buffer)
+        var b = wire.Builder.init(&buf, 6, 6);
+        try req(&comp, try b.finish());
+    }
+
+    { // create_params(9)
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putNewId(9);
+        try req(&comp, try b.finish());
+    }
+    { // add(fd, plane 0, offset 0, stride 8, LINEAR)
+        var b = wire.Builder.init(&buf, 9, 1);
+        b.putUint(0);
+        b.putUint(0);
+        b.putUint(8);
+        b.putUint(0);
+        b.putUint(0);
+        try req(&comp, try b.finish());
+    }
+    { // create_immed(10, 2x2, XR24, 0)
+        var b = wire.Builder.init(&buf, 9, 3);
+        b.putNewId(10);
+        b.putInt(2);
+        b.putInt(2);
+        b.putUint(protocol.DRM_FORMAT_XRGB8888);
+        b.putUint(0);
+        try req(&comp, try b.finish());
+    }
+    // Synthetic pool under the buffer id, filled by pipe units like
+    // any shm pool.
+    try t.expect(comp.pools.get(10) != null);
+    try t.expectEqual(@as(usize, 16), comp.pools.get(10).?.bytes.items.len);
+    {
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        var px: [16]u8 = undefined;
+        for (&px, 0..) |*p, i| p.* = @intCast(i + 50);
+        try pipe.appendPoolUpdate(&unit, t.allocator, 10, 0, &px);
+        try comp.feed(unit.items);
+    }
+    { // attach(10)
+        var b = wire.Builder.init(&buf, 6, 1);
+        b.putObject(10);
+        b.putInt(0);
+        b.putInt(0);
+        try req(&comp, try b.finish());
+    }
+    comp.clearOut();
+    { // commit
+        var b = wire.Builder.init(&buf, 6, 6);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.frames);
+    try t.expectEqual(@as(i32, 2), tv.last_w);
+    try t.expectEqual(@as(i32, 2), tv.last_h);
+    try t.expectEqual(@as(u8, 50), tv.last_pixels[0]);
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    try t.expect(evs.items.len >= 1);
+    try t.expectEqual([2]u32{ 10, 0 }, evs.items[0]); // wl_buffer.release
+
+    // Non-immed create is declined with `failed` -> shm fallback.
+    { // create_params(11)
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putNewId(11);
+        try req(&comp, try b.finish());
+    }
+    {
+        var b = wire.Builder.init(&buf, 11, 1);
+        b.putUint(0);
+        b.putUint(0);
+        b.putUint(8);
+        b.putUint(0);
+        b.putUint(0);
+        try req(&comp, try b.finish());
+    }
+    comp.clearOut();
+    { // create (non-immed)
+        var b = wire.Builder.init(&buf, 11, 2);
+        b.putInt(2);
+        b.putInt(2);
+        b.putUint(protocol.DRM_FORMAT_XRGB8888);
+        b.putUint(0);
+        try req(&comp, try b.finish());
+    }
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    try t.expectEqualSlices([2]u32, &[_][2]u32{.{ 11, 1 }}, evs.items); // failed
+    try t.expect(!comp.dead);
+
+    // Destroying the dmabuf buffer frees its synthetic pool.
+    {
+        var b = wire.Builder.init(&buf, 10, 0);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(comp.pools.get(10) == null);
+}
+
+test "state_sync v3: dmabuf buffer survives replica restore with pixels" {
+    var tv = TestView{};
+    var brain = try Compositor.init(t.allocator, tv.view());
+    defer brain.deinit();
+    var buf: [96]u8 = undefined;
+
+    { // get_registry(2)
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&brain, try b.finish());
+    }
+    inline for (.{
+        .{ 1, "wl_compositor", 4, 3 },
+        .{ 5, "xdg_wm_base", 2, 5 },
+        .{ 22, "zwp_linux_dmabuf_v1", 3, 4 },
+    }) |bind| {
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(bind[0]);
+        b.putString(bind[1]);
+        b.putUint(bind[2]);
+        b.putNewId(bind[3]);
+        try req(&brain, try b.finish());
+    }
+    { // surface(6) + xdg(7) + toplevel(8) + initial commit
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&brain, try b.finish());
+        var b2 = wire.Builder.init(&buf, 5, 2);
+        b2.putNewId(7);
+        b2.putObject(6);
+        try req(&brain, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 7, 1);
+        b3.putNewId(8);
+        try req(&brain, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 6, 6);
+        try req(&brain, try b4.finish());
+    }
+    { // create_params(9) + add(plane 0, stride 8, LINEAR) + create_immed(10, 2x2 XR24)
+        var b = wire.Builder.init(&buf, 4, 1);
+        b.putNewId(9);
+        try req(&brain, try b.finish());
+        var b2 = wire.Builder.init(&buf, 9, 1);
+        b2.putUint(0);
+        b2.putUint(0);
+        b2.putUint(8);
+        b2.putUint(0);
+        b2.putUint(0);
+        try req(&brain, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 9, 3);
+        b3.putNewId(10);
+        b3.putInt(2);
+        b3.putInt(2);
+        b3.putUint(protocol.DRM_FORMAT_XRGB8888);
+        b3.putUint(0);
+        try req(&brain, try b3.finish());
+    }
+    var px: [16]u8 = undefined;
+    for (&px, 0..) |*p, i| p.* = @intCast(i + 60);
+    { // pixels side-band into the synthetic pool (as the daemon ships)
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        try pipe.appendPoolUpdate(&unit, t.allocator, 10, 0, &px);
+        try brain.feed(unit.items);
+    }
+    { // attach + commit
+        var b = wire.Builder.init(&buf, 6, 1);
+        b.putObject(10);
+        b.putInt(0);
+        b.putInt(0);
+        try req(&brain, try b.finish());
+        var b2 = wire.Builder.init(&buf, 6, 6);
+        try req(&brain, try b2.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.frames);
+
+    const blob = try brain.serializeState(t.allocator);
+    defer t.allocator.free(blob);
+
+    // Replica: synthetic-pool units first (as replayNativeChannels
+    // ships dmabuf mirrors), then state_sync.
+    var tv2 = TestView{};
+    var replica = try Compositor.init(t.allocator, tv2.view());
+    defer replica.deinit();
+    {
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(t.allocator);
+        try pipe.appendPoolMeta(&units, t.allocator, .pool_create, 10, 16);
+        try pipe.appendPoolUpdate(&units, t.allocator, 10, 0, &px);
+        try pipe.appendUnit(&units, t.allocator, .state_sync, blob);
+        try replica.feed(units.items);
+    }
+    try t.expectEqual(@as(usize, 1), tv2.new_count);
+    try t.expectEqual(@as(usize, 1), tv2.frames);
+    try t.expectEqual(@as(u8, 60), tv2.last_pixels[0]);
+    try t.expect(!replica.dead);
 }
