@@ -361,14 +361,14 @@ fn muxGetText(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8,
     var io = attachForIo(allocator, host, name) orelse return 1;
     defer io.conn.deinit();
     defer io.snap.deinit(allocator);
-    // Snapshot payload = u64 sequence stamp, then the screen.
-    if (io.snap.payload.len < 8) return 1;
+    // Snapshot payload = [seq:u64][app:u8], then the screen.
+    if (io.snap.payload.len < 9) return 1;
 
     const Pool = @import("../grid/style_pool.zig").Pool;
     const snapshot = @import("../mux/snapshot.zig");
     var pool = Pool.init(allocator) catch return 1;
     defer pool.deinit();
-    const screen = snapshot.restore(allocator, &pool, io.snap.payload[8..]) catch {
+    const screen = snapshot.restore(allocator, &pool, io.snap.payload[9..]) catch {
         _ = c.fprintf(platform.stderr(), "sketerm mux: bad snapshot\n");
         return 1;
     };
