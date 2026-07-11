@@ -353,7 +353,7 @@ pub fn open(window: *Window) !void {
     c.adw_dialog_set_child(dialog, root);
     _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), @ptrCast(window.app_window), null, c.G_CONNECT_DEFAULT);
     c.adw_dialog_present(dialog, @ptrCast(window.app_window));
-    render_kick.kick(window.app_window);
+    render_kick.dialogPresented(window.app_window);
     // Defer focus-grab to after the dialog is shown — grabbing during
     // construction races with AdwDialog's own focus handling.
     _ = c.gtk_widget_grab_focus(search);

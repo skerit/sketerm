@@ -149,7 +149,7 @@ fn openForProfile(
     // over an idle terminal (and the dimming clears on close).
     _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), @ptrCast(parent_window), null, c.G_CONNECT_DEFAULT);
     c.adw_dialog_present(@ptrCast(@alignCast(dialog)), @ptrCast(parent_window));
-    render_kick.kick(@ptrCast(@alignCast(parent_window)));
+    render_kick.dialogPresented(@ptrCast(@alignCast(parent_window)));
 }
 
 fn onClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {

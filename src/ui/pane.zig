@@ -24,6 +24,7 @@ const DrainHandle = @import("../terminal.zig").DrainHandle;
 const input = @import("input.zig");
 const a11y = @import("../a11y/atspi.zig");
 const platform = @import("../util/platform.zig");
+const render_kick = @import("../util/render_kick.zig");
 /// macOS NSAccessibility bridge. GTK4 has no NSAccessibility backend
 /// (only AT-SPI, unavailable on macOS), so on macOS the pane's text
 /// reaches VoiceOver by attaching an element to the window's GdkMacos
@@ -988,6 +989,11 @@ pub const Pane = struct {
     /// compositing — no Wayland subsurfaces, no dmabuf scanout.
     pub fn setGraphicsOffload(self: *Pane, enabled: bool) void {
         const w = self.offload_widget orelse return;
+        // While an in-window dialog has offload suspended (render_kick),
+        // enabling now would put the subsurface back above the dialog —
+        // the suspend mark already means "re-enable on dialog close".
+        if (enabled and render_kick.offloadSuspended(w)) return;
+        if (!enabled) render_kick.clearOffloadSuspended(w);
         c.gtk_graphics_offload_set_enabled(
             @ptrCast(w),
             if (enabled) c.GTK_GRAPHICS_OFFLOAD_ENABLED else c.GTK_GRAPHICS_OFFLOAD_DISABLED,

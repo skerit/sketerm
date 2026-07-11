@@ -7242,7 +7242,7 @@ fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) call
 
     _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), self.app_window, null, c.G_CONNECT_DEFAULT);
     c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseTabResponse, @ptrCast(pending));
-    render_kick.kick(self.app_window);
+    render_kick.dialogPresented(self.app_window);
     return 1;
 }
 
@@ -7295,7 +7295,7 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
 
     _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), self.app_window, null, c.G_CONNECT_DEFAULT);
     c.adw_alert_dialog_choose(dialog, self.app_window, null, onCloseWinResponse, @ptrCast(pending));
-    render_kick.kick(self.app_window);
+    render_kick.dialogPresented(self.app_window);
     return 1; // block while dialog is up
 }
 
