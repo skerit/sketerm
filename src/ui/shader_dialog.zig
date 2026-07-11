@@ -342,7 +342,7 @@ pub fn open(win: *Window) bool {
 
     _ = c.g_signal_connect_data(dialog, "closed", @ptrCast(&render_kick.onDialogClosed), @ptrCast(win.app_window), null, c.G_CONNECT_DEFAULT);
     c.adw_dialog_present(@ptrCast(@alignCast(dialog)), @ptrCast(win.app_window));
-    render_kick.kick(win.app_window);
+    render_kick.dialogPresented(win.app_window);
     return true;
 }
 
