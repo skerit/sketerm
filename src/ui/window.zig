@@ -3819,6 +3819,47 @@ pub const Window = struct {
         try self.attachMux(conn_in, name, host, null);
     }
 
+    /// True when a pane or tabless app session in this window already
+    /// renders mux session `name` on `host` (null = local daemon).
+    fn sessionShown(self: *Window, name: []const u8, host: ?[]const u8) bool {
+        for (self.panes.items) |p| {
+            const r = p.terminal.remote orelse continue;
+            if (!hostEql(r.host, host)) continue;
+            if (std.mem.eql(u8, r.session, name)) return true;
+        }
+        for (self.app_sessions.items) |as| {
+            const r = as.terminal.remote orelse continue;
+            if (!hostEql(r.host, host)) continue;
+            if (std.mem.eql(u8, r.session, name)) return true;
+        }
+        return false;
+    }
+
+    fn hostEql(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        return std.mem.eql(u8, a.?, b.?);
+    }
+
+    /// Bulk handoff: attach every non-exited session on `host` that
+    /// this window isn't already showing. Terminal sessions become
+    /// tabs; app sessions follow app_view (tabless in window mode).
+    /// Returns the number attached.
+    pub fn attachAllSessions(self: *Window, host: ?[]const u8) u32 {
+        const mux_cli = @import("../ipc/mux_cli.zig");
+        var sessions = mux_cli.fetchSessions(self.allocator, host) orelse return 0;
+        defer sessions.deinit();
+        var n: u32 = 0;
+        for (sessions.value.sessions) |s| {
+            if (s.exited) continue;
+            if (self.sessionShown(s.name, host)) continue;
+            const conn = self.muxConnect(host) catch return n;
+            self.attachMux(conn, s.name, host, null) catch continue;
+            n += 1;
+        }
+        return n;
+    }
+
     /// Focus the pane already rendering local mux session `name`, or
     /// attach it as a new tab. Cross-session-search jump target.
     pub fn focusOrAttachSession(self: *Window, name: []const u8) void {
@@ -4923,6 +4964,11 @@ pub const Window = struct {
                 return ipc_protocol.writeErr(out, allocator, msg);
             };
             try ipc_protocol.writeOk(out, allocator, null, {});
+        } else if (eql(u8, req.cmd, "attach-all")) {
+            // Bulk handoff: attach every session on the daemon that
+            // this window isn't already showing.
+            const n = self.attachAllSessions(req.host);
+            try ipc_protocol.writeOk(out, allocator, "attached", n);
         } else if (eql(u8, req.cmd, "set-tab-color")) {
             const page = self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
             const spec = req.data orelse return ipc_protocol.writeErr(out, allocator, "set-tab-color requires data (#RRGGBB or none)");
@@ -6020,6 +6066,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .font_reset => self.resetFocusedFontSize(),
         .search_open => self.openSearch(),
         .cross_search => @import("xsearch.zig").open(self) catch |err| logActionError("cross_search", err),
+        .attach_all => _ = self.attachAllSessions(null),
         .save_layout => self.saveLayoutQuietly(),
         .save_layout_as => self.saveLayoutAs(),
         .save_default_layout => self.saveDefaultLayout(),
