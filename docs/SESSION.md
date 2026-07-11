@@ -6781,3 +6781,37 @@ a format gdk-pixbuf can't read. Icon-theme resolution is pragmatic
 (the listed themes + hicolor + pixmaps), not full index.theme
 inheritance — sufficient for app_id/reverse-DNS icons, which live in
 hicolor.
+
+## Modern Wayland protocol surface for forwarded apps
+
+Trigger: IntelliJ's JBR toolkit died on `wl_display_dispatch() failed`
+— it binds wl_seat@5 and wl_data_device_manager@3 unconditionally and
+our compositor fatals on over-version binds. Fixed, then implemented
+the full modern-client surface.
+
+The compositor (`wlhost/compositor.zig`) now advertises 19 globals:
+core bumped to wl_compositor v6 (preferred_buffer_scale/transform),
+wl_seat v8 (frame-grouped pointer events — v5+ clients buffer input
+until wl_pointer.frame — plus axis_value120 wheel detents),
+wl_output v4 (name/description), xdg_wm_base v6 (configure_bounds,
+wm_capabilities, working popup reposition), ddm v3; new: primary
+selection (own daemon fd FIFO, GDK primary clipboard in the GUI),
+relative-pointer + pointer-constraints (locks suppress absolute
+motion + hide the host cursor), text-input v3 (GUI attaches a
+GtkIMMulticontext while the app has an enabled text input; commits
+travel as text_commit intents), WITHIN-app dnd (start_drag state
+machine; the drop transfer is daemon-local — the target's receive fd
+feeds the source's send via the dnd_send unit), xdg-activation,
+presentation-time, idle-inhibit + pointer-gestures (accepted-inert).
+dmabuf stays deliberately out: GPU clients fall back to shm, which
+the pixel pipeline wants. seat_axis intents grew an optional
+value120 field; state_sync bumped to v2 (reader accepts v1). The
+daemon logs the interface/opcode when it kills an app connection and
+the compositor logs rejected binds — the next non-GTK client failure
+names itself.
+
+Verified: 681/686 tests (9 new: per-feature wire sequences incl. the
+full dnd lifecycle and a state-sync v2 round trip); GUI + mux +
+mux-portable clean; smoke-mux/mcp PASS; live against the real daemon
+`wayland-info` binds all 19 globals with zero errors, a JBR-init
+replica client passes, zenity takes scroll/type/click and exits 0.
