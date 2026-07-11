@@ -6865,3 +6865,23 @@ exists — mux snapshots serialize + restore the full scrollback ring.
 683/688 tests; e2e under Xvfb: last-command extraction returned exact
 printf output with exit 0 and a `false` zone with exit 1; watch fired
 on a later-appearing pattern and timed out cleanly on a non-match.
+
+## Host→app drag-and-drop
+
+Dropping local files or text onto a forwarded app's window now works:
+a GtkDropTarget on the window's picture converts the drop to a
+host_drop intent (sid, surface-local x/y, mime, payload); the daemon
+brain synthesizes a server-sourced Wayland dnd burst (data_offer →
+offer(mime) → source_actions → enter → action → motion → drop) and
+answers the app's receive() from the stored payload via a drop_data
+unit. The daemon's held receive-fd queue became OFFER-KEYED so a dnd
+transfer can never steal the fd of a clipboard paste still awaiting
+its async GUI answer (dnd_send now carries the offer id too — fixing
+a latent same-race in the within-app path). Files ship as
+text/uri-list (local paths — they resolve for local apps; text drops
+work for remote apps too). App→host dnd (dragging OUT of a forwarded
+window) remains out of scope.
+
+684/689 tests (new: full host_drop wire sequence + drop_data answer +
+finish cleanup); builds + smoke-mux/mcp PASS. The GTK drop gesture
+itself is the one untested-live link (needs a real pointer drag).

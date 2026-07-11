@@ -161,6 +161,20 @@ const TextInput = struct {
     serial: u32 = 0,
 };
 
+const HostDrag = struct {
+    /// Server-created offer id (0 = no host drop in flight).
+    offer: u32 = 0,
+    /// Owned payload handed out on receive.
+    mime: []u8 = &.{},
+    data: []u8 = &.{},
+
+    fn free(self: *HostDrag, a: std.mem.Allocator) void {
+        if (self.mime.len > 0) a.free(self.mime);
+        if (self.data.len > 0) a.free(self.data);
+        self.* = .{};
+    }
+};
+
 const Drag = struct {
     active: bool = false,
     /// True between drop and dnd_finished/offer-destroy (the data
@@ -461,6 +475,9 @@ pub const Compositor = struct {
     source_actions: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Within-app drag state (wl_data_device.start_drag).
     drag: Drag = .{},
+    /// Host→app drop in flight: a server-sourced dnd offer whose
+    /// receive is answered from `host_drag.data` (drop_data unit).
+    host_drag: HostDrag = .{},
     /// Viewer display scale × 120 (set_scale intent); 0 = derive
     /// from output_scale. Announced via wp_fractional_scale.
     scale120: u32 = 0,
@@ -527,6 +544,7 @@ pub const Compositor = struct {
         self.source_actions.deinit(a);
         self.viewport_map.deinit(a);
         self.fs_map.deinit(a);
+        self.host_drag.free(a);
         self.frame_scratch.deinit(a);
     }
 
@@ -1036,6 +1054,67 @@ pub const Compositor = struct {
             }
             self.drag = .{};
         }
+    }
+
+    /// View → client: the user dropped host data onto surface `sid`
+    /// at surface-local (x, y). Synthesizes a server-sourced dnd:
+    /// offer → enter → action → motion → drop in one burst (the
+    /// client accepts during its enter processing and calls receive
+    /// after drop — answered from `host_drag.data` via drop_data).
+    pub fn hostDrop(self: *Compositor, sid: u32, x: f64, y: f64, mime: []const u8, data: []const u8) Error!void {
+        if (self.drag.active or self.host_drag.offer != 0) return;
+        if (!self.surfaces.contains(sid)) return;
+        if (self.data_devices.items.len == 0) return;
+        const mime_copy = try self.allocator.dupe(u8, mime);
+        errdefer self.allocator.free(mime_copy);
+        const data_copy = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(data_copy);
+
+        const serial = self.nextSerial();
+        var offer_id: u32 = 0;
+        for (self.data_devices.items) |dev| {
+            offer_id = self.next_server_id;
+            self.next_server_id += 1;
+            try self.objects.put(self.allocator, offer_id, &protocol.wl_data_offer);
+            var buf: [16]u8 = undefined;
+            var b = wire.Builder.init(&buf, dev, 0); // data_offer(new_id)
+            b.putNewId(offer_id);
+            try self.send(try b.finish());
+            var mbuf: [256]u8 = undefined;
+            var bm = wire.Builder.init(&mbuf, offer_id, 0); // offer(mime)
+            bm.putString(mime);
+            try self.send(try bm.finish());
+            if (self.ddm_version >= 3) {
+                var abuf: [16]u8 = undefined;
+                var ab = wire.Builder.init(&abuf, offer_id, 1); // source_actions
+                ab.putUint(1); // copy
+                try self.send(try ab.finish());
+            }
+            var ebuf: [40]u8 = undefined;
+            var eb = wire.Builder.init(&ebuf, dev, 1); // enter
+            eb.putUint(serial);
+            eb.putObject(sid);
+            eb.putFixed(wire.fixedFromF64(x));
+            eb.putFixed(wire.fixedFromF64(y));
+            eb.putObject(offer_id);
+            try self.send(try eb.finish());
+            if (self.ddm_version >= 3) {
+                var cbuf: [16]u8 = undefined;
+                var cb = wire.Builder.init(&cbuf, offer_id, 2); // action(copy)
+                cb.putUint(1);
+                try self.send(try cb.finish());
+            }
+            var obuf: [24]u8 = undefined;
+            var ob = wire.Builder.init(&obuf, dev, 3); // motion
+            ob.putUint(self.now_ms);
+            ob.putFixed(wire.fixedFromF64(x));
+            ob.putFixed(wire.fixedFromF64(y));
+            try self.send(try ob.finish());
+            var dbuf: [8]u8 = undefined;
+            var db = wire.Builder.init(&dbuf, dev, 4); // drop
+            try self.send(try db.finish());
+        }
+        self.host_drag = .{ .offer = offer_id, .mime = mime_copy, .data = data_copy };
     }
 
     /// View → client: a click landed outside a grabbed popup —
@@ -1622,26 +1701,38 @@ pub const Compositor = struct {
                     }
                 }
             },
-            1 => { // receive(mime, fd) — dnd offers pull from the
-                // SOURCE (daemon pairs the held fd via dnd_send);
-                // selection offers paste the HOST clipboard.
+            1 => { // receive(mime, fd) — host-drop offers answer from
+                // the stored payload (drop_data); within-app dnd
+                // offers pull from the SOURCE (dnd_send); selection
+                // offers paste the HOST clipboard.
                 const mime = (try it.next()).?.string orelse return Error.Protocol;
-                if (hdr.object == self.drag.offer and self.drag.source != 0) {
+                if (hdr.object == self.host_drag.offer and self.host_drag.offer != 0) {
                     var payload: std.ArrayList(u8) = .empty;
                     defer payload.deinit(self.allocator);
                     var idb: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &idb, self.drag.source, .little);
+                    std.mem.writeInt(u32, &idb, self.host_drag.offer, .little);
+                    try payload.appendSlice(self.allocator, &idb);
+                    try payload.appendSlice(self.allocator, self.host_drag.data);
+                    try pipe.appendUnit(&self.out, self.allocator, .drop_data, payload.items);
+                } else if (hdr.object == self.drag.offer and self.drag.source != 0) {
+                    var payload: std.ArrayList(u8) = .empty;
+                    defer payload.deinit(self.allocator);
+                    var idb: [8]u8 = undefined;
+                    std.mem.writeInt(u32, idb[0..4], self.drag.source, .little);
+                    std.mem.writeInt(u32, idb[4..8], hdr.object, .little);
                     try payload.appendSlice(self.allocator, &idb);
                     try payload.appendSlice(self.allocator, mime);
                     try pipe.appendUnit(&self.out, self.allocator, .dnd_send, payload.items);
                 } else if (self.view.clipboard_read) |cb| cb(self.view.ctx, mime);
             },
             2 => { // destroy
+                if (hdr.object == self.host_drag.offer) self.host_drag.free(self.allocator);
                 if (hdr.object == self.drag.offer) self.drag.offer = 0;
                 if (self.drag.dropped and !self.drag.active) self.drag = .{};
                 try self.destroyObject(hdr.object);
             },
             3 => { // finish — dnd transfer complete
+                if (hdr.object == self.host_drag.offer) self.host_drag.free(self.allocator);
                 if (hdr.object == self.drag.offer and self.drag.source != 0) {
                     var buf: [8]u8 = undefined;
                     var b = wire.Builder.init(&buf, self.drag.source, 4); // dnd_finished
@@ -3155,6 +3246,18 @@ pub const Compositor = struct {
             .offer_primary => self.offerPrimary(pl) catch {},
             .text_commit => self.commitString(pl) catch {},
             .set_scale => if (pl.len >= 4) self.setScale120(g.u32At(pl, 0)) catch {},
+            .host_drop => if (pl.len >= 24) {
+                const mime_len: usize = g.u32At(pl, 20);
+                if (24 + mime_len <= pl.len) {
+                    self.hostDrop(
+                        g.u32At(pl, 0),
+                        g.f64At(pl, 4),
+                        g.f64At(pl, 12),
+                        pl[24 .. 24 + mime_len],
+                        pl[24 + mime_len ..],
+                    ) catch {};
+                }
+            },
             .request_close => if (pl.len >= 4) self.requestClose(g.u32At(pl, 0)) catch {},
             else => {},
         }
@@ -4975,7 +5078,8 @@ test "within-app dnd: start_drag through drop, transfer, finish" {
         while (try pipe.peelUnit(bytes[pos..])) |p| {
             if (p.unit.tag == .dnd_send) {
                 try t.expectEqual(@as(u32, 7), std.mem.readInt(u32, p.unit.payload[0..4], .little));
-                try t.expectEqualStrings("text/uri-list", p.unit.payload[4..]);
+                try t.expectEqual(offer_id, std.mem.readInt(u32, p.unit.payload[4..8], .little));
+                try t.expectEqualStrings("text/uri-list", p.unit.payload[8..]);
                 saw_dnd_send = true;
             }
             pos += p.consumed;
@@ -5309,5 +5413,77 @@ test "fractional scale: set_scale re-announces, viewport sets logical size" {
     try t.expectEqual(@as(i32, 100), tv.last_lw);
     try t.expectEqual(@as(i32, 50), tv.last_lh);
     try t.expectEqual(@as(i32, 1), tv.last_scale);
+    try t.expect(!comp.dead);
+}
+
+test "host_drop: synthesized dnd delivers host data via drop_data" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 3);
+    try bindGlobal(&comp, 3, "wl_seat", 8, 4);
+    try bindGlobal(&comp, 6, "wl_data_device_manager", 3, 5);
+    { // surface 6, data device 7
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 5, 1);
+        b2.putNewId(7);
+        b2.putObject(4);
+        try req(&comp, try b2.finish());
+    }
+    comp.clearOut();
+
+    { // host_drop intent: file uri onto surface 6 at (12, 34)
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(t.allocator);
+        try pipe.appendHostDrop(&units, t.allocator, 6, 12.0, 34.0, "text/uri-list", "file:///tmp/x.txt\r\n");
+        const p = (try pipe.peelUnit(units.items)).?;
+        comp.applyIntent(p.unit.tag, p.unit.payload);
+    }
+    const offer_id = comp.host_drag.offer;
+    try t.expect(offer_id != 0);
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    const drop_expect = [_][2]u32{
+        .{ 7, 0 }, // data_offer
+        .{ offer_id, 0 }, // offer(mime)
+        .{ offer_id, 1 }, // source_actions
+        .{ 7, 1 }, // enter
+        .{ offer_id, 2 }, // action
+        .{ 7, 3 }, // motion
+        .{ 7, 4 }, // drop
+    };
+    try t.expectEqualSlices([2]u32, &drop_expect, evs.items);
+
+    { // client receives → drop_data unit with the payload
+        var b = wire.Builder.init(&buf, offer_id, 1); // receive
+        b.putString("text/uri-list");
+        try req(&comp, try b.finish());
+    }
+    {
+        const bytes = comp.takeOut();
+        var pos: usize = 0;
+        var saw = false;
+        while (try pipe.peelUnit(bytes[pos..])) |p| {
+            if (p.unit.tag == .drop_data) {
+                try t.expectEqual(offer_id, std.mem.readInt(u32, p.unit.payload[0..4], .little));
+                try t.expectEqualStrings("file:///tmp/x.txt\r\n", p.unit.payload[4..]);
+                saw = true;
+            }
+            pos += p.consumed;
+        }
+        try t.expect(saw);
+        comp.clearOut();
+    }
+    { // finish clears the host drag
+        var b = wire.Builder.init(&buf, offer_id, 3);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(u32, 0), comp.host_drag.offer);
     try t.expect(!comp.dead);
 }

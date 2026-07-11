@@ -803,6 +803,10 @@ pub const AppHost = struct {
         wlpipe.appendUnit(&self.intents, self.allocator, .text_commit, text) catch {};
     }
 
+    fn hostDropIntent(self: *AppHost, sid: u32, x: f64, y: f64, mime: []const u8, data: []const u8) void {
+        wlpipe.appendHostDrop(&self.intents, self.allocator, sid, x, y, mime, data) catch {};
+    }
+
     fn clipSendIntent(self: *AppHost, source: u32, mime: []const u8) void {
         var pl: std.ArrayList(u8) = .empty;
         defer pl.deinit(self.allocator);
@@ -1254,6 +1258,14 @@ pub const AppHost = struct {
         _ = c.g_signal_connect_data(@ptrCast(scroll), "scroll", @ptrCast(&onScroll), win, null, 0);
         c.gtk_widget_add_controller(picture, scroll);
 
+        // Host→app dnd: dropping local files or text onto the
+        // forwarded window synthesizes a Wayland drop in the app.
+        const drop = c.gtk_drop_target_new(c.G_TYPE_INVALID, c.GDK_ACTION_COPY);
+        var drop_types = [_]c.GType{ c.gdk_file_list_get_type(), c.G_TYPE_STRING };
+        c.gtk_drop_target_set_gtypes(drop, &drop_types, drop_types.len);
+        _ = c.g_signal_connect_data(@ptrCast(drop), "drop", @ptrCast(&onHostDrop), win, null, 0);
+        c.gtk_widget_add_controller(picture, @ptrCast(drop));
+
         // Only the FIRST toplevel embeds; dialogs and secondary
         // windows always float (transient over the embedded view).
         if (self.embed_box != null and self.embed_surface == 0) {
@@ -1537,6 +1549,43 @@ pub const AppHost = struct {
         if (dx != 0) win.host.seatAxis(1, dx * 10.0, v120x);
         win.host.flushHost();
         return 1;
+    }
+
+    /// A local drop landed on the forwarded window: files become a
+    /// text/uri-list, plain text stays text. NOTE: file URIs name
+    /// LOCAL paths — for apps running on a remote host they won't
+    /// resolve (text drops work everywhere).
+    fn onHostDrop(_: ?*c.GtkDropTarget, value: ?*c.GValue, x: f64, y: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const win = cast.userData(Win, user);
+        const v = value orelse return 0;
+        const host = win.host;
+        const p = win.mapXY(x, y);
+        host.stampNow();
+        if (c.g_type_check_value_holds(v, c.G_TYPE_STRING) != 0) {
+            const s = c.g_value_get_string(v) orelse return 0;
+            host.hostDropIntent(win.surface, p[0], p[1], "text/plain;charset=utf-8", std.mem.span(@as([*:0]const u8, @ptrCast(s))));
+            host.flushHost();
+            return 1;
+        }
+        if (c.g_type_check_value_holds(v, c.gdk_file_list_get_type()) != 0) {
+            const flist: ?*c.GdkFileList = @ptrCast(@alignCast(c.g_value_get_boxed(v)));
+            const files = c.gdk_file_list_get_files(flist orelse return 0);
+            var uris: std.ArrayList(u8) = .empty;
+            defer uris.deinit(host.allocator);
+            var it = files;
+            while (it != null) : (it = it.*.next) {
+                const gf: ?*c.GFile = @ptrCast(@alignCast(it.*.data));
+                const uri = c.g_file_get_uri(gf orelse continue) orelse continue;
+                defer c.g_free(uri);
+                uris.appendSlice(host.allocator, std.mem.span(@as([*:0]const u8, @ptrCast(uri)))) catch return 0;
+                uris.appendSlice(host.allocator, "\r\n") catch return 0;
+            }
+            if (uris.items.len == 0) return 0;
+            host.hostDropIntent(win.surface, p[0], p[1], "text/uri-list", uris.items);
+            host.flushHost();
+            return 1;
+        }
+        return 0;
     }
 
     fn sendKey(win: *Win, keycode: c_uint, state: c.GdkModifierType, pressed: bool) void {

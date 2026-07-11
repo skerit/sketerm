@@ -98,15 +98,26 @@ pub const Tag = enum(u8) {
     /// utf8 string, viewer → daemon brain: IME-committed text for
     /// the focused+enabled zwp_text_input_v3.
     text_commit = 29,
-    /// u32 source id, mime string. Brain → daemon (LOCAL, never on
-    /// the mux wire): a within-app dnd drop wants the source's data —
-    /// take the oldest held receive-fd and emit source.send(mime, fd).
+    /// u32 source id, u32 offer id, mime string. Brain → daemon
+    /// (LOCAL, never on the mux wire): a within-app dnd drop wants
+    /// the source's data — take the held receive-fd FOR THAT OFFER
+    /// and emit source.send(mime, fd). Offer-keyed so it can't steal
+    /// the fd of a clipboard paste still awaiting its GUI answer.
     dnd_send = 30,
     /// u32 scale×120, viewer → daemon brain: the display's TRUE
     /// (possibly fractional) scale. The brain re-announces
     /// wl_output.scale (ceil), preferred_buffer_scale (ceil) and
     /// wp_fractional_scale preferred_scale to the app.
     set_scale = 31,
+    /// Viewer → daemon brain: the user dropped host data onto a
+    /// forwarded window. u32 sid, f64 x, f64 y (surface-local), u32
+    /// mime len, mime, then the payload bytes. The brain synthesizes
+    /// a server-sourced dnd (enter/action/drop) at those coords.
+    host_drop = 32,
+    /// u32 offer id, payload bytes. Brain → daemon (LOCAL): answer a
+    /// host_drop offer's receive — write the bytes into the held fd
+    /// for that offer.
+    drop_data = 33,
     _,
 };
 
@@ -280,6 +291,20 @@ pub fn appendSeatMods(out: *std.ArrayList(u8), a: std.mem.Allocator, depressed: 
     putU32At(&pl, 8, locked);
     putU32At(&pl, 12, group);
     try appendUnit(out, a, .seat_mods, &pl);
+}
+
+/// Host data dropped onto surface `sid` at surface-local (x, y).
+pub fn appendHostDrop(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32, x: f64, y: f64, mime: []const u8, data: []const u8) !void {
+    var hdr: [header_size + 24]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(24 + mime.len + data.len + 1), .little);
+    hdr[4] = @intFromEnum(Tag.host_drop);
+    std.mem.writeInt(u32, hdr[5..9], sid, .little);
+    std.mem.writeInt(u64, hdr[9..17], @bitCast(x), .little);
+    std.mem.writeInt(u64, hdr[17..25], @bitCast(y), .little);
+    std.mem.writeInt(u32, hdr[25..29], @intCast(mime.len), .little);
+    try out.appendSlice(a, &hdr);
+    try out.appendSlice(a, mime);
+    try out.appendSlice(a, data);
 }
 
 /// state bits: 1 activated, 2 maximized, 4 fullscreen, 8 resizing.
