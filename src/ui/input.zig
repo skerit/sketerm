@@ -78,6 +78,8 @@ pub const Action = enum {
     search_open,
     /// Search across every mux session's scrollback (local daemon).
     cross_search,
+    /// Attach every local mux session not already shown (bulk handoff).
+    attach_all,
     save_layout,
     save_layout_as,
     /// Save the current tab/split layout as the user's default,
@@ -293,6 +295,7 @@ pub fn actionName(a: Action) []const u8 {
         .font_reset => "font_reset",
         .search_open => "search_open",
         .cross_search => "cross_search",
+        .attach_all => "attach_all",
         .save_layout => "save_layout",
         .save_layout_as => "save_layout_as",
         .save_default_layout => "save_default_layout",
@@ -368,6 +371,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .font_reset => "Reset font size",
         .search_open => "Open search",
         .cross_search => "Search all sessions",
+        .attach_all => "Attach all sessions",
         .save_layout => "Save layout",
         .save_layout_as => "Save layout as…",
         .save_default_layout => "Save layout as default",

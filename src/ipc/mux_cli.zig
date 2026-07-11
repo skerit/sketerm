@@ -27,6 +27,8 @@ const MUX_HELP =
     \\Commands (each accepts an optional leading host):
     \\  list                  print sessions
     \\  attach <name>         attach a session as a GUI tab
+    \\  attach-all            attach EVERY session not already shown
+    \\                        (bulk handoff after a move/crash)
     \\  new                   spawn a durable tab in the GUI
     \\  kill <name>           kill a session
     \\  rename <old> <new>    rename a session
@@ -95,7 +97,7 @@ pub const Welcome = struct {
 };
 
 fn isSubcommand(s2: []const u8) bool {
-    const known = [_][]const u8{ "list", "attach", "new", "kill", "rename", "spawn", "send", "get-text", "search" };
+    const known = [_][]const u8{ "list", "attach", "attach-all", "new", "kill", "rename", "spawn", "send", "get-text", "search" };
     for (known) |k| {
         if (std.mem.eql(u8, s2, k)) return true;
     }
@@ -152,6 +154,9 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
     }
     if (std.mem.eql(u8, cmd, "attach") and args.len >= 2) {
         return if (guiCommand(allocator, "attach-session", args[1], host, true)) 0 else 1;
+    }
+    if (std.mem.eql(u8, cmd, "attach-all")) {
+        return if (guiCommand(allocator, "attach-all", null, host, false)) 0 else 1;
     }
     if (std.mem.eql(u8, cmd, "new")) {
         return if (guiCommand(allocator, "new-durable-tab", null, host, true)) 0 else 1;
