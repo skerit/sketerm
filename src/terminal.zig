@@ -149,6 +149,14 @@ pub const Terminal = struct {
     /// "app window open" banner off this in window view mode.
     on_app_window: ?*const fn (ctx: ?*anyopaque) void = null,
 
+    /// OSC 133/633 shell-integration command lifecycle: running=true
+    /// at C (output starts), running=false at D with the exit code.
+    /// duration_ms is 0 on the running=true call and when the C was
+    /// never seen (attach mid-command).
+    on_cmd_status: ?*const fn (ctx: ?*anyopaque, running: bool, exit: i32, duration_ms: i64) void = null,
+    /// Monotonic µs of the last OSC 133 C, 0 = no command running.
+    cmd_started_us: i64 = 0,
+
     /// Optional broadcast-typing filter. When set, every byte from
     /// USER input (keystrokes, paste, hyperlink launch) goes through
     /// here instead of straight to the local PTY. Parser reply
@@ -422,6 +430,8 @@ pub const Terminal = struct {
             .on_progress = sinkProgress,
             .on_pointer_shape = sinkPointerShape,
             .on_set_profile = sinkSetProfile,
+            .on_cmd_start = sinkCmdStart,
+            .on_cmd_end = sinkCmdEnd,
         };
     }
 
@@ -1566,6 +1576,22 @@ pub const Terminal = struct {
         if (self.on_set_profile) |f| f(self.user_ctx, name);
     }
 
+    fn sinkCmdStart(ctx: ?*anyopaque) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        self.cmd_started_us = c.g_get_monotonic_time();
+        if (self.on_cmd_status) |f| f(self.user_ctx, true, 0, 0);
+    }
+
+    fn sinkCmdEnd(ctx: ?*anyopaque, exit: i32) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        const dur_ms: i64 = if (self.cmd_started_us > 0)
+            @divTrunc(c.g_get_monotonic_time() - self.cmd_started_us, 1000)
+        else
+            0;
+        self.cmd_started_us = 0;
+        if (self.on_cmd_status) |f| f(self.user_ctx, false, exit, dur_ms);
+    }
+
     /// Null out every external sink + the user_ctx pointer, so nothing
     /// dispatched after this call can reach into a freed Pane / Window.
     /// Used by Window.deinit to fence the terminals before tearing
@@ -1599,6 +1625,7 @@ pub const Terminal = struct {
         // Pane with a nulled user_ctx (was a crash on app-tab close).
         self.on_app_view = null;
         self.on_app_window = null;
+        self.on_cmd_status = null;
         self.broadcast_sink = null;
         self.broadcast_ctx = null;
     }
