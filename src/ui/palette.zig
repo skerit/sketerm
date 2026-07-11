@@ -79,6 +79,8 @@ const ENTRIES = [_]Entry{
     // Search & scrollback
     .{ .icon = "edit-find-symbolic", .title = "Search",
        .desc = "Search the scrollback for a string.", .action = .search_open },
+    .{ .icon = "system-search-symbolic", .title = "Search All Sessions",
+       .desc = "Search every mux session's scrollback (local daemon).", .action = .cross_search },
     .{ .icon = "go-up-symbolic", .title = "Previous Prompt",
        .desc = "Jump to the previous shell prompt (uses OSC 133 marks).", .action = .prompt_prev },
     .{ .icon = "go-down-symbolic", .title = "Next Prompt",

@@ -40,13 +40,16 @@ const MUX_HELP =
     \\      --delay MS  base inter-key delay  (default 60)
     \\      --jitter MS random extra delay    (default 90)
     \\  get-text <name> [--scrollback]     print the session's screen
+    \\  search <pattern>                   case-insensitive substring
+    \\      search across every session's scrollback + screen; prints
+    \\      "name:-N: line" (N = lines up from the bottom)
     \\
     \\`sketerm ssh <host>` = `sketerm mux <host> new` — open a
     \\remote shell that survives disconnects (key auth required).
     \\
 ;
 
-const SessionInfo = struct {
+pub const SessionInfo = struct {
     name: []const u8,
     rows: u16 = 0,
     cols: u16 = 0,
@@ -86,13 +89,13 @@ test "fmtIdle: thresholds and coarse buckets" {
     try std.testing.expectEqualStrings("idle 3d4h", fmtIdle(&buf, (3 * 86400 + 4 * 3600) * 1000));
 }
 
-const Welcome = struct {
+pub const Welcome = struct {
     proto: u32 = 0,
     sessions: []SessionInfo = &.{},
 };
 
 fn isSubcommand(s2: []const u8) bool {
-    const known = [_][]const u8{ "list", "attach", "new", "kill", "rename", "spawn", "send", "get-text" };
+    const known = [_][]const u8{ "list", "attach", "new", "kill", "rename", "spawn", "send", "get-text", "search" };
     for (known) |k| {
         if (std.mem.eql(u8, s2, k)) return true;
     }
@@ -175,6 +178,9 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
     }
     if (std.mem.eql(u8, cmd, "get-text") and args.len >= 2) {
         return muxGetText(allocator, host, args[1], args[2..]);
+    }
+    if (std.mem.eql(u8, cmd, "search") and args.len >= 2) {
+        return muxSearch(allocator, host, args[1]);
     }
     _ = c.fputs(MUX_HELP, platform.stdout());
     return 2;
@@ -367,6 +373,66 @@ fn muxGetText(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8,
     return 0;
 }
 
+/// One search hit as the daemon reports it.
+pub const SearchHit = struct { back: u32 = 0, text: []const u8 = "" };
+pub const SearchReply = struct { hits: []const SearchHit = &.{}, total: u32 = 0 };
+
+/// Search ONE attached session server-side. Returns the parsed reply
+/// (caller deinits) or null on transport/attach failure.
+pub fn searchSession(
+    allocator: std.mem.Allocator,
+    host: ?[]const u8,
+    name: []const u8,
+    pattern: []const u8,
+    max: u32,
+) ?std.json.Parsed(SearchReply) {
+    var io = attachForIo(allocator, host, name) orelse return null;
+    defer io.conn.deinit();
+    io.snap.deinit(allocator);
+    io.conn.sendJson(.search, .{ .pattern = pattern, .max = max }) catch return null;
+    const f = io.conn.recvExpect(&.{.search_hits}) catch return null;
+    defer f.deinit(allocator);
+    // alloc_always: hit texts must not alias the frame payload freed
+    // by the deinit above.
+    return std.json.parseFromSlice(SearchReply, allocator, f.payload, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch null;
+}
+
+/// `sketerm mux [host] search <pattern>` — case-insensitive substring
+/// search across every session on the daemon (scrollback + screen).
+fn muxSearch(allocator: std.mem.Allocator, host: ?[]const u8, pattern: []const u8) u8 {
+    var sessions = fetchSessions(allocator, host) orelse return 1;
+    defer sessions.deinit();
+    var total_hits: u32 = 0;
+    for (sessions.value.sessions) |s| {
+        if (s.exited) continue;
+        const reply = searchSession(allocator, host, s.name, pattern, 50) orelse continue;
+        defer reply.deinit();
+        for (reply.value.hits) |h| {
+            _ = c.printf(
+                "%.*s:-%u: %.*s\n",
+                @as(c_int, @intCast(s.name.len)),
+                s.name.ptr,
+                @as(c_uint, h.back),
+                @as(c_int, @intCast(h.text.len)),
+                h.text.ptr,
+            );
+        }
+        if (reply.value.total > reply.value.hits.len) {
+            _ = c.printf(
+                "%.*s: (+%u more)\n",
+                @as(c_int, @intCast(s.name.len)),
+                s.name.ptr,
+                @as(c_uint, reply.value.total - @as(u32, @intCast(reply.value.hits.len))),
+            );
+        }
+        total_hits += reply.value.total;
+    }
+    return if (total_hits > 0) 0 else 1;
+}
+
 fn renameSession(allocator: std.mem.Allocator, host: ?[]const u8, old: []const u8, new: []const u8) bool {
     var conn = muxConnect(allocator, host) orelse return false;
     defer conn.deinit();
@@ -430,7 +496,7 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
     };
 }
 
-fn fetchSessions(allocator: std.mem.Allocator, host: ?[]const u8) ?std.json.Parsed(Welcome) {
+pub fn fetchSessions(allocator: std.mem.Allocator, host: ?[]const u8) ?std.json.Parsed(Welcome) {
     var conn = muxConnect(allocator, host) orelse return null;
     defer conn.deinit();
     conn.sendFrame(.list, "") catch return null;
