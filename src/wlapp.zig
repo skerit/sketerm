@@ -76,6 +76,14 @@ pub const AppHost = struct {
     /// Surface that last got a clipboard offer — re-offer happens
     /// per keyboard-focus change, not per keystroke.
     offered_focus: u32 = 0,
+    /// Kinds of in-flight clip_send fetches, FIFO-paired with the
+    /// clip_data answers (0 = clipboard, 1 = primary) — the wire
+    /// carries no kind, so ordering routes the result.
+    fetch_kinds: std.ArrayList(u8) = .empty,
+    /// The app has an enabled zwp_text_input_v3: route keystrokes
+    /// through the host IM context so local IMEs (and compose/dead
+    /// keys) commit text instead of raw evdev codes.
+    text_active: bool = false,
     /// Title/app_id that arrived BEFORE the first frame created the
     /// window (the usual order) — applied in winFor. Owned strings.
     pending_titles: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
@@ -228,6 +236,13 @@ pub const AppHost = struct {
         /// works for REMOTE apps whose icon isn't installed locally
         /// (xdg-toplevel-icon on Wayland, _NET_WM_ICON on X11).
         icon_tex: ?*c.GdkTexture = null,
+        /// Key controllers (floating window / embedded picture) — kept
+        /// so the IM context can be attached when text-input activates.
+        key_ctl: ?*c.GtkEventControllerKey = null,
+        embed_key_ctl: ?*c.GtkEventControllerKey = null,
+        /// Host IM context; its "commit" ships text_commit intents
+        /// while the app has an enabled text input.
+        im: ?*c.GtkIMContext = null,
 
         /// Store the icon texture and apply it (needs the surface;
         /// onWinRealize re-applies). Takes ownership of one ref.
@@ -577,6 +592,12 @@ pub const AppHost = struct {
             .clipboard_offer = onClipOffer,
             .clipboard_data = onClipData,
             .clipboard_read = onClipRead,
+            .popup_moved = onPopupMoved,
+            .pointer_locked = onPointerLocked,
+            .text_input_active = onTextInputActive,
+            .primary_offer = onPrimaryOffer,
+            .primary_read = onPrimaryRead,
+            .toplevel_raise = onRaise,
         });
         // Advertise the local display scale so apps render HiDPI
         // buffers (set before the app binds wl_output on first feed).
@@ -612,6 +633,7 @@ pub const AppHost = struct {
             w.*.cancelOpaqueResize();
             if (w.*.app_id) |aid| self.allocator.free(aid);
             if (w.*.icon_tex) |tex| c.g_object_unref(tex);
+            if (w.*.im) |im| c.g_object_unref(im);
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-wlapp", null);
             c.gtk_window_destroy(w.*.window);
             self.allocator.destroy(w.*);
@@ -640,6 +662,7 @@ pub const AppHost = struct {
         self.pending_icons.deinit(self.allocator);
         self.pending_ssd.deinit(self.allocator);
         self.geos.deinit(self.allocator);
+        self.fetch_kinds.deinit(self.allocator);
         if (self.pending_reads > 0) {
             self.doomed = true;
             return;
@@ -701,9 +724,9 @@ pub const AppHost = struct {
         wlpipe.appendSeatButton(&self.intents, self.allocator, button, pressed) catch {};
     }
 
-    fn seatAxis(self: *AppHost, axis: u32, value: f64) void {
-        self.comp.pointerAxis(axis, value) catch {};
-        wlpipe.appendSeatAxis(&self.intents, self.allocator, axis, value) catch {};
+    fn seatAxis(self: *AppHost, axis: u32, value: f64, value120: i32) void {
+        self.comp.pointerAxis(axis, value, value120) catch {};
+        wlpipe.appendSeatAxis(&self.intents, self.allocator, axis, value, value120) catch {};
     }
 
     fn seatKbdEnter(self: *AppHost, sid: u32) void {
@@ -746,6 +769,18 @@ pub const AppHost = struct {
 
     fn offerSelectionIntent(self: *AppHost, mime: []const u8) void {
         wlpipe.appendUnit(&self.intents, self.allocator, .offer_selection, mime) catch {};
+    }
+
+    fn offerPrimaryIntent(self: *AppHost, mime: []const u8) void {
+        wlpipe.appendUnit(&self.intents, self.allocator, .offer_primary, mime) catch {};
+    }
+
+    fn primaryDataIntent(self: *AppHost, bytes: []const u8) void {
+        wlpipe.appendUnit(&self.intents, self.allocator, .primary_data, bytes) catch {};
+    }
+
+    fn textCommitIntent(self: *AppHost, text: []const u8) void {
+        wlpipe.appendUnit(&self.intents, self.allocator, .text_commit, text) catch {};
     }
 
     fn clipSendIntent(self: *AppHost, source: u32, mime: []const u8) void {
@@ -1216,6 +1251,8 @@ pub const AppHost = struct {
         _ = c.g_signal_connect_data(@ptrCast(key), "key-pressed", @ptrCast(&onKeyPress), win, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(key), "key-released", @ptrCast(&onKeyRelease), win, null, 0);
         c.gtk_widget_add_controller(@ptrCast(window), key);
+        win.key_ctl = @ptrCast(key);
+        win.host.applyImRouting(win);
 
         const focus = c.gtk_event_controller_focus_new();
         _ = c.g_signal_connect_data(@ptrCast(focus), "enter", @ptrCast(&onFocusEnter), win, null, 0);
@@ -1274,6 +1311,8 @@ pub const AppHost = struct {
         _ = c.g_signal_connect_data(@ptrCast(key), "key-pressed", @ptrCast(&onEmbedKeyPress), win, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(key), "key-released", @ptrCast(&onEmbedKeyRelease), win, null, 0);
         c.gtk_widget_add_controller(win.picture, key);
+        win.embed_key_ctl = @ptrCast(key);
+        win.host.applyImRouting(win);
 
         const focus = c.gtk_event_controller_focus_new();
         _ = c.g_signal_connect_data(@ptrCast(focus), "enter", @ptrCast(&onEmbedFocusEnter), win, null, 0);
@@ -1453,13 +1492,18 @@ pub const AppHost = struct {
         win.host.flushHost();
     }
 
-    fn onScroll(_: ?*c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+    fn onScroll(scroll: ?*c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
         const win = cast.userData(Win, user);
         win.host.stampNow();
         // Discrete wheel steps arrive as ±1; ~10 surface px per
-        // step matches what stock compositors send.
-        if (dy != 0) win.host.seatAxis(0, dy * 10.0);
-        if (dx != 0) win.host.seatAxis(1, dx * 10.0);
+        // step matches what stock compositors send. Wheel-unit
+        // scrolls additionally carry axis_value120 (±120/detent)
+        // for v8-seat clients.
+        const wheel = c.gtk_event_controller_scroll_get_unit(scroll) == c.GDK_SCROLL_UNIT_WHEEL;
+        const v120y: i32 = if (wheel) @intFromFloat(dy * 120.0) else 0;
+        const v120x: i32 = if (wheel) @intFromFloat(dx * 120.0) else 0;
+        if (dy != 0) win.host.seatAxis(0, dy * 10.0, v120y);
+        if (dx != 0) win.host.seatAxis(1, dx * 10.0, v120x);
         win.host.flushHost();
         return 1;
     }
@@ -1474,6 +1518,7 @@ pub const AppHost = struct {
         if (win.host.offered_focus != win.host.comp.keyboard_focus) {
             win.host.offered_focus = win.host.comp.keyboard_focus;
             win.host.offerSelectionIntent("text/plain;charset=utf-8");
+            win.host.offerPrimaryIntent("text/plain;charset=utf-8");
         }
         // GDK's low modifier bits are the X11/xkb mod order the
         // pc105/us keymap uses (shift, lock, ctrl, mod1…).
@@ -1503,6 +1548,7 @@ pub const AppHost = struct {
         // empty (the async read answers honestly either way).
         win.host.offered_focus = win.host.comp.keyboard_focus;
         win.host.offerSelectionIntent("text/plain;charset=utf-8");
+        win.host.offerPrimaryIntent("text/plain;charset=utf-8");
         win.host.flushHost();
     }
 
@@ -1713,18 +1759,38 @@ pub const AppHost = struct {
         return c.gdk_display_get_clipboard(display);
     }
 
+    fn gdkPrimary() ?*c.GdkClipboard {
+        const display = c.gdk_display_get_default() orelse return null;
+        return c.gdk_display_get_primary_clipboard(display);
+    }
+
     /// App announced a copy: pull the content through the pipe; the
     /// answer lands in onClipData.
     fn onClipOffer(ctx: ?*anyopaque, source: u32, mime: []const u8) void {
         const self = cast.userData(AppHost, ctx);
+        self.fetch_kinds.append(self.allocator, 0) catch return;
         self.clipSendIntent(source, mime);
         self.flushHost();
     }
 
-    /// Fetched app clipboard content → host clipboard.
+    /// App announced a PRIMARY selection: same fetch pipe, routed to
+    /// the host primary clipboard by the fetch-kind FIFO.
+    fn onPrimaryOffer(ctx: ?*anyopaque, source: u32, mime: []const u8) void {
+        const self = cast.userData(AppHost, ctx);
+        self.fetch_kinds.append(self.allocator, 1) catch return;
+        self.clipSendIntent(source, mime);
+        self.flushHost();
+    }
+
+    /// Fetched app selection content → host clipboard (regular or
+    /// primary, by the FIFO kind recorded at fetch time).
     fn onClipData(ctx: ?*anyopaque, bytes: []const u8) void {
         const self = cast.userData(AppHost, ctx);
-        const clipboard = gdkClipboard() orelse return;
+        const kind: u8 = if (self.fetch_kinds.items.len > 0)
+            self.fetch_kinds.orderedRemove(0)
+        else
+            0;
+        const clipboard = (if (kind == 1) gdkPrimary() else gdkClipboard()) orelse return;
         const z = self.allocator.dupeZ(u8, bytes) catch return;
         defer self.allocator.free(z);
         c.gdk_clipboard_set_text(clipboard, z.ptr);
@@ -1755,6 +1821,104 @@ pub const AppHost = struct {
         }
         self.pending_reads -= 1;
         if (self.doomed and self.pending_reads == 0) self.finalFree();
+    }
+
+    /// App wants a PRIMARY paste: async-read the host primary
+    /// selection; ALWAYS answer (separate daemon fd FIFO).
+    fn onPrimaryRead(ctx: ?*anyopaque, mime: []const u8) void {
+        _ = mime; // text-only scope
+        const self = cast.userData(AppHost, ctx);
+        const clipboard = gdkPrimary() orelse {
+            self.primaryDataIntent("");
+            self.flushHost();
+            return;
+        };
+        self.pending_reads += 1;
+        c.gdk_clipboard_read_text_async(clipboard, null, @ptrCast(&onPrimaryReadDone), self);
+    }
+
+    fn onPrimaryReadDone(src: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(AppHost, user);
+        const text = c.gdk_clipboard_read_text_finish(@ptrCast(src), res, null);
+        defer if (text != null) c.g_free(text);
+        if (!self.dead) {
+            const bytes: []const u8 = if (text) |tp| std.mem.span(@as([*:0]const u8, @ptrCast(tp))) else "";
+            self.primaryDataIntent(bytes);
+            self.flushHost();
+        }
+        self.pending_reads -= 1;
+        if (self.doomed and self.pending_reads == 0) self.finalFree();
+    }
+
+    /// xdg_popup.reposition landed: move the existing popup area to
+    /// its new parent-relative spot (offset math mirrors onPopupNew).
+    fn onPopupMoved(ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void {
+        const self = cast.userData(AppHost, ctx);
+        const popup = self.popups.get(surface) orelse return;
+        var px = x;
+        var py = y;
+        if (self.windows.get(parent) != null) {
+            if (builtin.os.tag != .macos) {
+                if (self.geos.get(parent)) |g| {
+                    px += g[0];
+                    py += g[1];
+                }
+            }
+        } else if (self.popups.get(parent)) |pp| {
+            px += c.gtk_widget_get_margin_start(pp.area);
+            py += c.gtk_widget_get_margin_top(pp.area);
+        }
+        c.gtk_widget_set_margin_start(popup.area, @max(0, px));
+        c.gtk_widget_set_margin_top(popup.area, @max(0, py));
+    }
+
+    /// Pointer lock: hide the host cursor over the app while locked
+    /// (the app steers via relative_motion), restore on unlock.
+    fn onPointerLocked(ctx: ?*anyopaque, surface: u32, locked: bool) void {
+        const self = cast.userData(AppHost, ctx);
+        const win = self.windows.get(surface) orelse return;
+        c.gtk_widget_set_cursor_from_name(win.picture, if (locked) "none" else "default");
+    }
+
+    /// xdg-activation activate: present the window.
+    fn onRaise(ctx: ?*anyopaque, surface: u32) void {
+        const self = cast.userData(AppHost, ctx);
+        const win = self.windows.get(surface) orelse return;
+        if (!win.embedded) c.gtk_window_present(win.window);
+    }
+
+    /// The app toggled its text input: attach/detach the host IM on
+    /// every window's key controllers.
+    fn onTextInputActive(ctx: ?*anyopaque, active: bool) void {
+        const self = cast.userData(AppHost, ctx);
+        if (self.text_active == active) return;
+        self.text_active = active;
+        var it = self.windows.valueIterator();
+        while (it.next()) |w| self.applyImRouting(w.*);
+    }
+
+    /// Attach or detach the IM context on a window's key controllers
+    /// per the current text_active state (idempotent; called on wire
+    /// and on state flips).
+    fn applyImRouting(self: *AppHost, win: *Win) void {
+        if (self.text_active and win.im == null) {
+            const im = c.gtk_im_multicontext_new();
+            _ = c.g_signal_connect_data(@ptrCast(im), "commit", @ptrCast(&onImCommit), win, null, 0);
+            win.im = im;
+        }
+        const im: ?*c.GtkIMContext = if (self.text_active) win.im else null;
+        if (win.key_ctl) |k| c.gtk_event_controller_key_set_im_context(k, im);
+        if (win.embed_key_ctl) |k| c.gtk_event_controller_key_set_im_context(k, im);
+    }
+
+    /// Host IM committed text (IME result, compose, dead keys) —
+    /// deliver it via zwp_text_input_v3.commit_string.
+    fn onImCommit(_: ?*c.GtkIMContext, str: ?[*:0]const u8, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
+        const text = str orelse return;
+        win.host.stampNow();
+        win.host.textCommitIntent(std.mem.span(text));
+        win.host.flushHost();
     }
 
     fn winStates(win: *Win) @import("wlhost/compositor.zig").Compositor.ToplevelState {

@@ -51,6 +51,9 @@ pub const Action = union(enum) {
     /// carries one fd the daemon must hold until the GUI ships the
     /// clipboard bytes (clip_data unit, FIFO-paired).
     clip_receive: struct { offer: u32 },
+    /// zwp_primary_selection_offer_v1.receive — same fd-holding
+    /// dance, but paired with primary_data units (separate FIFO).
+    primary_receive: struct { offer: u32 },
     /// wl_surface.commit with a live attached buffer: replicate
     /// that buffer's bytes before relaying the commit. Geometry is
     /// resolved from the tracked buffer so the daemon can copy
@@ -197,6 +200,8 @@ pub const Tracker = struct {
         // fd just like wl_data_offer.receive.
         if (iface == &protocol.zwlr_data_control_offer_v1 and hdr.opcode == 0)
             return .{ .clip_receive = .{ .offer = hdr.object } };
+        if (iface == &protocol.zwp_primary_selection_offer_v1 and hdr.opcode == 0)
+            return .{ .primary_receive = .{ .offer = hdr.object } };
         if (iface == &protocol.wl_surface) switch (hdr.opcode) {
             1 => { // attach
                 var it = wire.ArgIter.init(body, msg.sig);

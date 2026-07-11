@@ -427,6 +427,9 @@ const Native = struct {
     /// Paste: write-ends from wl_data_offer.receive, FIFO-paired
     /// with clip_data units coming from the GUI.
     clip_paste_fds: std.ArrayList(c_int) = .empty,
+    /// PRIMARY-selection paste fds, FIFO-paired with primary_data
+    /// units (separate queue so interleaved pastes can't swap).
+    primary_paste_fds: std.ArrayList(c_int) = .empty,
     /// Copy: read-ends of pipes whose write-ends went to the app
     /// via wl_data_source.send; EOF ships a clip_data unit up.
     clip_reads: std.ArrayList(ClipRead) = .empty,
@@ -498,6 +501,8 @@ const Native = struct {
         self.out_fds.deinit(self.allocator);
         for (self.clip_paste_fds.items) |fd| _ = c.close(fd);
         self.clip_paste_fds.deinit(self.allocator);
+        for (self.primary_paste_fds.items) |fd| _ = c.close(fd);
+        self.primary_paste_fds.deinit(self.allocator);
         for (self.clip_reads.items) |*cr| {
             _ = c.close(cr.fd);
             cr.buf.deinit(self.allocator);
@@ -2261,7 +2266,9 @@ pub const Daemon = struct {
             } orelse break;
             if (avail.len < mh.size) break;
             const msgb = avail[0..mh.size];
-            const action = nv.tracker.clientMessage(mh, msgb[wlwire.header_size..]) catch {
+            const action = nv.tracker.clientMessage(mh, msgb[wlwire.header_size..]) catch |err| {
+                const iname = if (nv.tracker.objects.get(mh.object)) |i| i.name else "?";
+                std.debug.print("sketerm-mux: killing wayland app connection: {s} on {s}#{d} opcode {d}\n", .{ @errorName(err), iname, mh.object, mh.opcode });
                 fail = true;
                 break;
             };
@@ -2323,6 +2330,15 @@ pub const Daemon = struct {
                 // mime asked for.
                 const fd = nv.popFd() orelse return error.MissingFd;
                 nv.clip_paste_fds.append(a, fd) catch {
+                    _ = c.close(fd);
+                    return error.MissingFd;
+                };
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+            },
+            .primary_receive => {
+                // Primary paste: same dance, separate FIFO.
+                const fd = nv.popFd() orelse return error.MissingFd;
+                nv.primary_paste_fds.append(a, fd) catch {
                     _ = c.close(fd);
                     return error.MissingFd;
                 };
@@ -2508,10 +2524,10 @@ pub const Daemon = struct {
                 return;
             } orelse break;
             switch (peeled.unit.tag) {
-                .seat_enter, .seat_leave, .seat_motion, .seat_button, .seat_axis, .seat_kbd_enter, .seat_kbd_leave, .seat_key, .seat_mods, .configure, .dismiss_popups, .offer_selection, .request_close => {
+                .seat_enter, .seat_leave, .seat_motion, .seat_button, .seat_axis, .seat_kbd_enter, .seat_kbd_leave, .seat_key, .seat_mods, .configure, .dismiss_popups, .offer_selection, .offer_primary, .text_commit, .request_close => {
                     nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload);
                 },
-                .clip_send, .clip_data => self.applyAppUnit(ch, peeled.unit.tag, peeled.unit.payload),
+                .clip_send, .clip_data, .primary_data => self.applyAppUnit(ch, peeled.unit.tag, peeled.unit.payload),
                 else => {},
             }
             pos += peeled.consumed;
@@ -2601,10 +2617,11 @@ pub const Daemon = struct {
                     _ = c.fcntl(pfds[0], c.F_SETFL, fl | c.O_NONBLOCK);
 
                     // `send` is opcode 1 on wl_data_source but opcode 0
-                    // on zwlr_data_control_source_v1 — pick by the
-                    // source object's tracked interface.
+                    // on the zwlr-data-control and primary-selection
+                    // sources — pick by the tracked interface.
                     const send_op: u16 = if (nv.tracker.objects.get(source)) |sif|
-                        (if (sif == &wlproto.zwlr_data_control_source_v1) 0 else 1)
+                        (if (sif == &wlproto.zwlr_data_control_source_v1 or
+                            sif == &wlproto.zwp_primary_selection_source_v1) 0 else 1)
                     else
                         1;
                     var mbuf: [256]u8 = undefined;
@@ -2639,6 +2656,44 @@ pub const Daemon = struct {
                         written += @intCast(w);
                     }
                     _ = c.close(fd);
+                },
+                .primary_data => {
+                    // Primary-paste bytes for the oldest PRIMARY fd.
+                    if (nv.primary_paste_fds.items.len == 0) return;
+                    const fd = nv.primary_paste_fds.orderedRemove(0);
+                    var written: usize = 0;
+                    while (written < payload.len) {
+                        const w = c.write(fd, payload.ptr + written, payload.len - written);
+                        if (w <= 0) break;
+                        written += @intCast(w);
+                    }
+                    _ = c.close(fd);
+                },
+                .dnd_send => {
+                    // Within-app dnd transfer: the drop target's
+                    // receive-fd (oldest held) becomes the SOURCE's
+                    // send fd — data never leaves the app's host.
+                    const pl = payload;
+                    if (pl.len < 4) return;
+                    if (nv.clip_paste_fds.items.len == 0) return;
+                    const source = std.mem.readInt(u32, pl[0..4], .little);
+                    const mime = pl[4..];
+                    const fd = nv.clip_paste_fds.orderedRemove(0);
+                    var mbuf: [256]u8 = undefined;
+                    var b = wlwire.Builder.init(&mbuf, source, 1); // wl_data_source.send
+                    b.putString(mime);
+                    const msg = b.finish() catch {
+                        _ = c.close(fd);
+                        return;
+                    };
+                    ch.pending.appendSlice(ch.allocator, msg) catch {
+                        _ = c.close(fd);
+                        self.closeChannel(ch, true);
+                        return;
+                    };
+                    nv.out_fds.append(nv.allocator, fd) catch {
+                        _ = c.close(fd);
+                    };
                 },
                 // Unknown tags skip for forward compat.
                 else => {},

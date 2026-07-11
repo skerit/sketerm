@@ -321,6 +321,7 @@ pub const App = struct {
                     .clipboard_offer = onClipOffer,
                     .clipboard_data = onClipData,
                     .clipboard_read = onClipRead,
+                    .primary_read = onPrimaryRead,
                 }) catch {
                     self.allocator.destroy(ch);
                     return;
@@ -468,6 +469,18 @@ pub const App = struct {
         ch.app.sendIntents(ch.id, units.items) catch {};
     }
 
+    /// Primary paste: answer the offered text (same buffer as the
+    /// regular paste) — the daemon holds a fd until we do.
+    fn onPrimaryRead(ctx: ?*anyopaque, mime: []const u8) void {
+        _ = mime;
+        const ch = chanOf(ctx);
+        const data = ch.app.paste_data orelse "";
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(ch.app.allocator);
+        wlpipe.appendUnit(&units, ch.app.allocator, .primary_data, data) catch return;
+        ch.app.sendIntents(ch.id, units.items) catch {};
+    }
+
     fn onGone(ctx: ?*anyopaque, sid: u32) void {
         const ch = chanOf(ctx);
         var i: usize = 0;
@@ -560,8 +573,8 @@ pub const App = struct {
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
         wlpipe.appendSeatEnter(&units, a, win.sid, x, y) catch return Error.OutOfMemory;
-        if (dy != 0) wlpipe.appendSeatAxis(&units, a, 0, dy * 10.0) catch return Error.OutOfMemory;
-        if (dx != 0) wlpipe.appendSeatAxis(&units, a, 1, dx * 10.0) catch return Error.OutOfMemory;
+        if (dy != 0) wlpipe.appendSeatAxis(&units, a, 0, dy * 10.0, @intFromFloat(dy * 120.0)) catch return Error.OutOfMemory;
+        if (dx != 0) wlpipe.appendSeatAxis(&units, a, 1, dx * 10.0, @intFromFloat(dx * 120.0)) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);
     }
 

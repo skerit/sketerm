@@ -71,7 +71,7 @@ pub const Tag = enum(u8) {
     seat_leave = 14,
     seat_motion = 15, // u64 x, u64 y
     seat_button = 16, // u32 button, u8 pressed
-    seat_axis = 17, // u32 axis, u64 value
+    seat_axis = 17, // u32 axis, u64 value, [i32 value120 — len>=16]
     seat_kbd_enter = 18, // u32 sid
     seat_kbd_leave = 19,
     seat_key = 20, // u32 key, u8 pressed
@@ -88,6 +88,20 @@ pub const Tag = enum(u8) {
     /// Daemon-injected (only the daemon can read the app host's icon
     /// theme); the client decodes and calls gdk_toplevel_set_icon_list.
     toplevel_icon = 26,
+    /// mime string; the brain announces a host PRIMARY selection
+    /// (middle-click paste) — the wl-clipboard twin of offer_selection.
+    offer_primary = 27,
+    /// Raw primary-selection paste bytes. GUI→daemon: for the oldest
+    /// held PRIMARY receive-fd (separate FIFO from clip_data so
+    /// interleaved clipboard/primary pastes can't swap).
+    primary_data = 28,
+    /// utf8 string, viewer → daemon brain: IME-committed text for
+    /// the focused+enabled zwp_text_input_v3.
+    text_commit = 29,
+    /// u32 source id, mime string. Brain → daemon (LOCAL, never on
+    /// the mux wire): a within-app dnd drop wants the source's data —
+    /// take the oldest held receive-fd and emit source.send(mime, fd).
+    dnd_send = 30,
     _,
 };
 
@@ -230,10 +244,14 @@ pub fn appendSeatButton(out: *std.ArrayList(u8), a: std.mem.Allocator, button: u
     try appendUnit(out, a, .seat_button, &pl);
 }
 
-pub fn appendSeatAxis(out: *std.ArrayList(u8), a: std.mem.Allocator, axis: u32, value: f64) !void {
-    var pl: [12]u8 = undefined;
+/// `value120` is the high-resolution wheel amount (±120 per detent,
+/// wl_pointer.axis_value120 semantics); 0 = smooth/finger scroll.
+/// Old receivers read only the first 12 bytes — compatible both ways.
+pub fn appendSeatAxis(out: *std.ArrayList(u8), a: std.mem.Allocator, axis: u32, value: f64, value120: i32) !void {
+    var pl: [16]u8 = undefined;
     putU32At(&pl, 0, axis);
     putF64(&pl, 4, value);
+    putU32At(&pl, 12, @bitCast(value120));
     try appendUnit(out, a, .seat_axis, &pl);
 }
 
