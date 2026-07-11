@@ -13,7 +13,8 @@
 //! toplevels only (popups refused), single output, integer scale 1.
 //! Frame callbacks fire at commit time.
 //!
-//! Input: wl_seat v1 with pointer+keyboard. The view injects via
+//! Input: wl_seat (v5 advertised) with pointer+keyboard. The view
+//! injects via
 //! pointer*/keyboard* methods; key codes are evdev (GTK hardware
 //! keycode - 8). The keymap is a fixed pc105/us blob shipped as a
 //! pipe `keymap` unit — the DAEMON materializes the fd and emits
@@ -114,6 +115,24 @@ pub const View = struct {
     /// whole surface accepts input (the default); empty/partial =
     /// only those rects do — CSD shadows become click-through.
     input_region: ?*const fn (ctx: ?*anyopaque, surface: u32, rects: ?[]const Rect) void = null,
+    /// xdg_popup.reposition: move an existing popup to (x, y) in the
+    /// parent's coordinate space (same frame as popup_new).
+    popup_moved: ?*const fn (ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void = null,
+    /// A pointer lock (zwp_locked_pointer_v1) activated/deactivated
+    /// on this surface — the host should hide/restore its cursor.
+    pointer_locked: ?*const fn (ctx: ?*anyopaque, surface: u32, locked: bool) void = null,
+    /// The app enabled/disabled a zwp_text_input_v3: route the host
+    /// IM (IME) at the app while true, raw keys only while false.
+    text_input_active: ?*const fn (ctx: ?*anyopaque, active: bool) void = null,
+    /// The app announced a PRIMARY selection (middle-click paste)
+    /// with a usable text mime. Fetch via fetchClipboard — the
+    /// answer routing is the caller's (FIFO with clipboard fetches).
+    primary_offer: ?*const fn (ctx: ?*anyopaque, source: u32, mime: []const u8) void = null,
+    /// The app wants a primary paste: read the host PRIMARY
+    /// selection and ALWAYS answer via sendPrimaryData.
+    primary_read: ?*const fn (ctx: ?*anyopaque, mime: []const u8) void = null,
+    /// xdg-activation activate: raise/present this surface's window.
+    toplevel_raise: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
 };
 
 const Global = struct {
@@ -122,21 +141,66 @@ const Global = struct {
     version: u32,
 };
 
+const RelPointer = struct { id: u32, pointer: u32 };
+
+const Constraint = struct {
+    sid: u32,
+    /// 0 = lock (motion suppressed, cursor hidden), 1 = confine.
+    kind: u8,
+    /// 1 oneshot (defunct after deactivation), 2 persistent.
+    lifetime: u32,
+    active: bool = false,
+};
+
+const TextInput = struct {
+    enabled: bool = false,
+    pending_enabled: bool = false,
+    /// Incremented per commit request; echoed in done events.
+    serial: u32 = 0,
+};
+
+const Drag = struct {
+    active: bool = false,
+    /// True between drop and dnd_finished/offer-destroy (the data
+    /// transfer window — receive() still routes to the source).
+    dropped: bool = false,
+    source: u32 = 0,
+    origin: u32 = 0,
+    focus: u32 = 0,
+    /// Server-created wl_data_offer mirroring the drag source.
+    offer: u32 = 0,
+    accepted: bool = false,
+    /// Negotiated dnd action (1 copy, 2 move, 4 ask; 0 = none yet).
+    action: u32 = 0,
+};
+
 /// What we advertise — deliberately low versions: nothing here
 /// obliges events we don't implement.
 const globals = [_]Global{
-    .{ .name = 1, .iface = &protocol.wl_compositor, .version = 4 },
+    // v6: surfaces get preferred_buffer_scale/transform on creation
+    // (GTK4 at v6 sizes buffers from it instead of wl_output scale).
+    .{ .name = 1, .iface = &protocol.wl_compositor, .version = 6 },
     // GTK3 maps tooltips / tree-view type-ahead popups as subsurfaces;
     // without this its GdkDisplay->subcompositor is NULL and it crashes
     // (wl_proxy_get_version(NULL)) the first time it shows one.
     .{ .name = 11, .iface = &protocol.wl_subcompositor, .version = 1 },
     .{ .name = 2, .iface = &protocol.wl_shm, .version = 1 },
     // v4: keyboards get repeat_info — held keys repeat client-side.
-    .{ .name = 3, .iface = &protocol.wl_seat, .version = 4 },
-    .{ .name = 4, .iface = &protocol.wl_output, .version = 2 },
-    .{ .name = 5, .iface = &protocol.xdg_wm_base, .version = 2 },
-    // v1 = selection only, no dnd action machinery.
-    .{ .name = 6, .iface = &protocol.wl_data_device_manager, .version = 1 },
+    // v5: pointer events are frame-grouped (JBR hard-requires >= 5
+    // and binds 5 unconditionally; v5-bound clients queue pointer
+    // events until the frame, so every injection emits one).
+    // v8: wheel scrolls carry axis_value120.
+    .{ .name = 3, .iface = &protocol.wl_seat, .version = 8 },
+    // v4: name/description events at bind.
+    .{ .name = 4, .iface = &protocol.wl_output, .version = 4 },
+    // v3 popup reposition; v4 configure_bounds; v5 wm_capabilities
+    // (all honored in the configure/reposition paths).
+    .{ .name = 5, .iface = &protocol.xdg_wm_base, .version = 6 },
+    // v3 wire surface (JBR binds 3 unconditionally). Selection plus
+    // WITHIN-APP dnd (start_drag drives a real drag state machine —
+    // both ends are the same client, so data flows daemon-locally);
+    // cross-app dnd stays out of scope.
+    .{ .name = 6, .iface = &protocol.wl_data_device_manager, .version = 3 },
     // Surface-less clipboard: wl-copy/wl-paste set/read the selection
     // without a throwaway focus surface (no taskbar flash). v1 =
     // selection only, no primary selection.
@@ -152,6 +216,25 @@ const globals = [_]Global{
     // GTK) get the host window's decorations; CSD apps draw their
     // own into an undecorated host window.
     .{ .name = 10, .iface = &protocol.zxdg_decoration_manager_v1, .version = 1 },
+    // Primary selection (middle-click paste), mirroring the
+    // wl_data_device selection path with its own daemon fd FIFO.
+    .{ .name = 13, .iface = &protocol.zwp_primary_selection_device_manager_v1, .version = 1 },
+    // Relative pointer + constraints: mouse-look/pointer-lock apps
+    // (games, Blender viewports). Relative motion is derived from
+    // absolute injections; locks hide the host cursor via the view.
+    .{ .name = 14, .iface = &protocol.zwp_relative_pointer_manager_v1, .version = 1 },
+    .{ .name = 15, .iface = &protocol.zwp_pointer_constraints_v1, .version = 1 },
+    // text-input v3: host IME commits arrive as text_commit intents.
+    .{ .name = 16, .iface = &protocol.zwp_text_input_manager_v3, .version = 1 },
+    // xdg-activation: tokens are minted freely; activate = raise.
+    .{ .name = 17, .iface = &protocol.xdg_activation_v1, .version = 1 },
+    // presentation-time: feedbacks answer at commit time with the
+    // brain clock (frame-callback semantics — good enough for A/V).
+    .{ .name = 18, .iface = &protocol.wp_presentation, .version = 1 },
+    // Accepted-inert: inhibitors are tracked objects with no effect;
+    // gesture objects never fire (no gestures detected — legal).
+    .{ .name = 19, .iface = &protocol.zwp_idle_inhibit_manager_v1, .version = 1 },
+    .{ .name = 20, .iface = &protocol.zwp_pointer_gestures_v1, .version = 3 },
 };
 
 const Pool = struct {
@@ -205,6 +288,8 @@ const Surface = struct {
     ph: i32 = 0,
     /// wl_callback ids awaiting frame done.
     frame_cbs: std.ArrayList(u32) = .empty,
+    /// wp_presentation_feedback ids answered at the next commit.
+    feedbacks: std.ArrayList(u32) = .empty,
     /// Initial configure sent (xdg dance).
     configured: bool = false,
     /// Double-buffered input region: set_input_region stages, the
@@ -232,6 +317,7 @@ const Surface = struct {
 
     fn freeOwned(self: *Surface, a: std.mem.Allocator) void {
         self.frame_cbs.deinit(a);
+        self.feedbacks.deinit(a);
         self.input_rects.deinit(a);
         if (self.title) |s| a.free(s);
         if (self.app_id) |s| a.free(s);
@@ -334,8 +420,39 @@ pub const Compositor = struct {
     /// Surface currently holding pointer / keyboard focus (0 = none).
     pointer_focus: u32 = 0,
     keyboard_focus: u32 = 0,
-    /// Version the client bound wl_seat at (gates repeat_info).
+    /// Version the client bound wl_seat at (gates repeat_info,
+    /// pointer frame grouping, axis_value120).
     seat_version: u32 = 1,
+    /// Version the client bound wl_compositor at (gates the
+    /// preferred_buffer_scale/transform events on new surfaces).
+    compositor_version: u32 = 1,
+    /// Version the client bound xdg_wm_base at (gates
+    /// configure_bounds and wm_capabilities).
+    wm_base_version: u32 = 1,
+    /// Version the client bound wl_data_device_manager at (gates the
+    /// v3 dnd-action events during within-app drags).
+    ddm_version: u32 = 1,
+    /// Last injected absolute pointer position — relative_motion
+    /// deltas derive from it.
+    last_px: f64 = 0,
+    last_py: f64 = 0,
+    /// Last still-held pointer button (evdev code, 0 = none); its
+    /// release ends a within-app drag.
+    pressed_button: u32 = 0,
+    /// Bound zwp_relative_pointer_v1 objects and the wl_pointer each
+    /// one shadows.
+    rel_pointers: std.ArrayList(RelPointer) = .empty,
+    /// Pointer constraints by locked/confined object id.
+    constraints: std.AutoHashMapUnmanaged(u32, Constraint) = .empty,
+    /// zwp_text_input_v3 objects (enable/disable is double-buffered:
+    /// applied on commit, per spec).
+    text_inputs: std.AutoHashMapUnmanaged(u32, TextInput) = .empty,
+    /// Bound zwp_primary_selection_device_v1 objects.
+    primary_devices: std.ArrayList(u32) = .empty,
+    /// wl_data_source.set_actions values (dnd negotiation).
+    source_actions: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Within-app drag state (wl_data_device.start_drag).
+    drag: Drag = .{},
     /// Tight-packed copy handed to toplevel_frame.
     frame_scratch: std.ArrayList(u8) = .empty,
     serial: u32 = 1,
@@ -388,6 +505,11 @@ pub const Compositor = struct {
         self.data_control_devices.deinit(a);
         self.pointers.deinit(a);
         self.keyboards.deinit(a);
+        self.rel_pointers.deinit(a);
+        self.constraints.deinit(a);
+        self.text_inputs.deinit(a);
+        self.primary_devices.deinit(a);
+        self.source_actions.deinit(a);
         self.frame_scratch.deinit(a);
     }
 
@@ -415,9 +537,12 @@ pub const Compositor = struct {
 
     pub fn pointerEnter(self: *Compositor, sid: u32, x: f64, y: f64) Error!void {
         if (!self.surfaces.contains(sid)) return;
+        if (self.drag.active) return self.dragEnter(sid, x, y);
         if (self.pointer_focus == sid) return;
         try self.pointerLeave();
         self.pointer_focus = sid;
+        self.last_px = x;
+        self.last_py = y;
         const serial = self.nextSerial();
         for (self.pointers.items) |p| {
             var buf: [32]u8 = undefined;
@@ -427,11 +552,15 @@ pub const Compositor = struct {
             b.putFixed(wire.fixedFromF64(x));
             b.putFixed(wire.fixedFromF64(y));
             try self.send(try b.finish());
+            try self.pointerFrame(p);
         }
+        try self.activateConstraints(sid);
     }
 
     pub fn pointerLeave(self: *Compositor) Error!void {
+        if (self.drag.active) return self.dragLeave();
         if (self.pointer_focus == 0) return;
+        try self.deactivateConstraints(self.pointer_focus);
         const serial = self.nextSerial();
         for (self.pointers.items) |p| {
             var buf: [16]u8 = undefined;
@@ -439,24 +568,46 @@ pub const Compositor = struct {
             b.putUint(serial);
             b.putObject(self.pointer_focus);
             try self.send(try b.finish());
+            try self.pointerFrame(p);
         }
         self.pointer_focus = 0;
     }
 
     pub fn pointerMotion(self: *Compositor, x: f64, y: f64) Error!void {
+        if (self.drag.active) return self.dragMotion(x, y);
         if (self.pointer_focus == 0) return;
+        const dx = x - self.last_px;
+        const dy = y - self.last_py;
+        self.last_px = x;
+        self.last_py = y;
+        // An active lock suppresses absolute motion (the pointer is
+        // pinned); relative_motion keeps flowing for mouse-look.
+        const locked = self.hasActiveLock(self.pointer_focus);
         for (self.pointers.items) |p| {
-            var buf: [24]u8 = undefined;
-            var b = wire.Builder.init(&buf, p, 2); // motion
-            b.putUint(self.now_ms);
-            b.putFixed(wire.fixedFromF64(x));
-            b.putFixed(wire.fixedFromF64(y));
-            try self.send(try b.finish());
+            if (!locked) {
+                var buf: [24]u8 = undefined;
+                var b = wire.Builder.init(&buf, p, 2); // motion
+                b.putUint(self.now_ms);
+                b.putFixed(wire.fixedFromF64(x));
+                b.putFixed(wire.fixedFromF64(y));
+                try self.send(try b.finish());
+            }
+            const had_rel = try self.relativeMotion(p, dx, dy);
+            if (!locked or had_rel) try self.pointerFrame(p);
         }
     }
 
     /// `button` is an evdev code (BTN_LEFT 0x110 …).
     pub fn pointerButton(self: *Compositor, button: u32, pressed: bool) Error!void {
+        if (pressed) {
+            self.pressed_button = button;
+        } else if (self.pressed_button == button) {
+            self.pressed_button = 0;
+        }
+        if (self.drag.active) {
+            if (!pressed) try self.dragDrop();
+            return; // drag swallows all button events
+        }
         if (self.pointer_focus == 0) return;
         const serial = self.nextSerial();
         for (self.pointers.items) |p| {
@@ -467,20 +618,118 @@ pub const Compositor = struct {
             b.putUint(button);
             b.putUint(if (pressed) 1 else 0);
             try self.send(try b.finish());
+            try self.pointerFrame(p);
         }
     }
 
     /// `axis`: 0 vertical, 1 horizontal. `value` in surface px.
-    pub fn pointerAxis(self: *Compositor, axis: u32, value: f64) Error!void {
-        if (self.pointer_focus == 0) return;
+    /// `value120`: high-resolution wheel amount (±120 per detent),
+    /// 0 for smooth/finger scroll.
+    pub fn pointerAxis(self: *Compositor, axis: u32, value: f64, value120: i32) Error!void {
+        if (self.pointer_focus == 0 or self.drag.active) return;
         for (self.pointers.items) |p| {
+            if (value120 != 0) {
+                if (self.seat_version >= 8) {
+                    var vbuf: [16]u8 = undefined;
+                    var vb = wire.Builder.init(&vbuf, p, 9); // axis_value120
+                    vb.putUint(axis);
+                    vb.putInt(value120);
+                    try self.send(try vb.finish());
+                } else if (self.seat_version >= 5) {
+                    var dbuf: [16]u8 = undefined;
+                    var db = wire.Builder.init(&dbuf, p, 8); // axis_discrete
+                    db.putUint(axis);
+                    db.putInt(@divTrunc(value120, 120));
+                    try self.send(try db.finish());
+                }
+            }
             var buf: [24]u8 = undefined;
             var b = wire.Builder.init(&buf, p, 4); // axis
             b.putUint(self.now_ms);
             b.putUint(axis);
             b.putFixed(wire.fixedFromF64(value));
             try self.send(try b.finish());
+            try self.pointerFrame(p);
         }
+    }
+
+    /// v5-bound clients buffer pointer events until the frame that
+    /// closes the group — skipping it means input arrives never.
+    fn pointerFrame(self: *Compositor, p: u32) Error!void {
+        if (self.seat_version < 5) return;
+        var buf: [16]u8 = undefined;
+        var b = wire.Builder.init(&buf, p, 5); // frame
+        try self.send(try b.finish());
+    }
+
+    /// relative_motion toward the rel-pointer objects shadowing `p`.
+    /// Returns true if any event went out (the caller frames it).
+    fn relativeMotion(self: *Compositor, p: u32, dx: f64, dy: f64) Error!bool {
+        var sent = false;
+        const utime: u64 = @as(u64, self.now_ms) * 1000;
+        for (self.rel_pointers.items) |rp| {
+            if (rp.pointer != p) continue;
+            var buf: [40]u8 = undefined;
+            var b = wire.Builder.init(&buf, rp.id, 0); // relative_motion
+            b.putUint(@truncate(utime >> 32));
+            b.putUint(@truncate(utime));
+            b.putFixed(wire.fixedFromF64(dx));
+            b.putFixed(wire.fixedFromF64(dy));
+            b.putFixed(wire.fixedFromF64(dx)); // unaccelerated = same
+            b.putFixed(wire.fixedFromF64(dy));
+            try self.send(try b.finish());
+            sent = true;
+        }
+        return sent;
+    }
+
+    fn hasActiveLock(self: *Compositor, sid: u32) bool {
+        var it = self.constraints.valueIterator();
+        while (it.next()) |con| {
+            if (con.sid == sid and con.kind == 0 and con.active) return true;
+        }
+        return false;
+    }
+
+    /// Pointer focus landed on `sid`: activate its constraints.
+    fn activateConstraints(self: *Compositor, sid: u32) Error!void {
+        var it = self.constraints.iterator();
+        while (it.next()) |e| {
+            const con = e.value_ptr;
+            if (con.sid != sid or con.active) continue;
+            con.active = true;
+            var buf: [8]u8 = undefined;
+            var b = wire.Builder.init(&buf, e.key_ptr.*, 0); // locked / confined
+            try self.send(try b.finish());
+            if (con.kind == 0) {
+                if (self.view.pointer_locked) |cb| cb(self.view.ctx, sid, true);
+            }
+        }
+    }
+
+    /// Pointer focus left `sid`: deactivate; oneshot constraints
+    /// become defunct (removed from the map, object id stays alive
+    /// until the client destroys it).
+    fn deactivateConstraints(self: *Compositor, sid: u32) Error!void {
+        var defunct: [8]u32 = undefined;
+        var n_defunct: usize = 0;
+        var it = self.constraints.iterator();
+        while (it.next()) |e| {
+            const con = e.value_ptr;
+            if (con.sid != sid or !con.active) continue;
+            con.active = false;
+            var buf: [8]u8 = undefined;
+            var b = wire.Builder.init(&buf, e.key_ptr.*, 1); // unlocked / unconfined
+            try self.send(try b.finish());
+            if (con.kind == 0) {
+                if (self.view.pointer_locked) |cb| cb(self.view.ctx, sid, false);
+            }
+            if (con.lifetime == 1 and n_defunct < defunct.len) {
+                defunct[n_defunct] = e.key_ptr.*;
+                n_defunct += 1;
+            }
+        }
+        for (defunct[0..n_defunct]) |id| _ = self.constraints.remove(id);
     }
 
     pub fn keyboardEnter(self: *Compositor, sid: u32) Error!void {
@@ -497,10 +746,12 @@ pub const Compositor = struct {
             b.putArray(&.{}); // no keys held
             try self.send(try b.finish());
         }
+        try self.textInputFocus(sid, true);
     }
 
     pub fn keyboardLeave(self: *Compositor) Error!void {
         if (self.keyboard_focus == 0) return;
+        try self.textInputFocus(self.keyboard_focus, false);
         const serial = self.nextSerial();
         for (self.keyboards.items) |k| {
             var buf: [16]u8 = undefined;
@@ -510,6 +761,35 @@ pub const Compositor = struct {
             try self.send(try b.finish());
         }
         self.keyboard_focus = 0;
+    }
+
+    /// zwp_text_input_v3 enter/leave rides keyboard focus.
+    fn textInputFocus(self: *Compositor, sid: u32, entered: bool) Error!void {
+        var it = self.text_inputs.keyIterator();
+        while (it.next()) |id| {
+            var buf: [16]u8 = undefined;
+            var b = wire.Builder.init(&buf, id.*, if (entered) @as(u16, 0) else 1);
+            b.putObject(sid);
+            try self.send(try b.finish());
+        }
+    }
+
+    /// View → client: IME-committed text toward every enabled text
+    /// input (there is one seat; focused apps enable exactly one).
+    pub fn commitString(self: *Compositor, text: []const u8) Error!void {
+        if (self.keyboard_focus == 0) return;
+        var it = self.text_inputs.iterator();
+        while (it.next()) |e| {
+            if (!e.value_ptr.enabled) continue;
+            var buf: [4096]u8 = undefined;
+            var b = wire.Builder.init(&buf, e.key_ptr.*, 3); // commit_string
+            b.putString(text);
+            try self.send(try b.finish());
+            var dbuf: [16]u8 = undefined;
+            var db = wire.Builder.init(&dbuf, e.key_ptr.*, 5); // done
+            db.putUint(e.value_ptr.serial);
+            try self.send(try db.finish());
+        }
     }
 
     /// `key` is an evdev code (GTK hardware keycode - 8).
@@ -608,6 +888,139 @@ pub const Compositor = struct {
         try self.send(try bs.finish());
     }
 
+    /// View → client: announce the HOST primary selection so the
+    /// app can middle-click paste.
+    pub fn offerPrimary(self: *Compositor, mime: []const u8) Error!void {
+        for (self.primary_devices.items) |dev| {
+            const id = self.next_server_id;
+            self.next_server_id += 1;
+            try self.objects.put(self.allocator, id, &protocol.zwp_primary_selection_offer_v1);
+            var buf: [16]u8 = undefined;
+            var b = wire.Builder.init(&buf, dev, 0); // data_offer(new_id)
+            b.putNewId(id);
+            try self.send(try b.finish());
+            var mbuf: [128]u8 = undefined;
+            var bm = wire.Builder.init(&mbuf, id, 0); // offer(mime)
+            bm.putString(mime);
+            try self.send(try bm.finish());
+            var sbuf: [16]u8 = undefined;
+            var bs = wire.Builder.init(&sbuf, dev, 1); // selection(offer)
+            bs.putObject(id);
+            try self.send(try bs.finish());
+        }
+    }
+
+    /// View → client: primary-paste bytes for the oldest outstanding
+    /// primary_read (separate daemon fd FIFO from clipboard pastes).
+    pub fn sendPrimaryData(self: *Compositor, bytes: []const u8) Error!void {
+        try pipe.appendUnit(&self.out, self.allocator, .primary_data, bytes);
+    }
+
+    // ── within-app dnd (wl_data_device.start_drag) ──────────────
+    // Both drag ends are the same client, so the transfer is local:
+    // offer.receive's fd feeds the source's send (dnd_send unit —
+    // the daemon pairs the held fd, like the clipboard path).
+
+    fn dragEnter(self: *Compositor, sid: u32, x: f64, y: f64) Error!void {
+        if (self.drag.focus == sid) return;
+        try self.dragLeave();
+        self.drag.focus = sid;
+        const serial = self.nextSerial();
+        for (self.data_devices.items) |dev| {
+            var offer_id: u32 = 0;
+            if (self.drag.source != 0) {
+                offer_id = self.next_server_id;
+                self.next_server_id += 1;
+                try self.objects.put(self.allocator, offer_id, &protocol.wl_data_offer);
+                var buf: [16]u8 = undefined;
+                var b = wire.Builder.init(&buf, dev, 0); // data_offer(new_id)
+                b.putNewId(offer_id);
+                try self.send(try b.finish());
+                if (self.data_sources.get(self.drag.source)) |mimes| {
+                    for (mimes.items) |m| {
+                        var mbuf: [256]u8 = undefined;
+                        var bm = wire.Builder.init(&mbuf, offer_id, 0); // offer(mime)
+                        bm.putString(m);
+                        try self.send(try bm.finish());
+                    }
+                }
+                if (self.ddm_version >= 3) {
+                    const acts = self.source_actions.get(self.drag.source) orelse 0;
+                    var abuf: [16]u8 = undefined;
+                    var ab = wire.Builder.init(&abuf, offer_id, 1); // source_actions
+                    ab.putUint(acts);
+                    try self.send(try ab.finish());
+                }
+                self.drag.offer = offer_id;
+            }
+            var ebuf: [40]u8 = undefined;
+            var eb = wire.Builder.init(&ebuf, dev, 1); // enter
+            eb.putUint(serial);
+            eb.putObject(sid);
+            eb.putFixed(wire.fixedFromF64(x));
+            eb.putFixed(wire.fixedFromF64(y));
+            eb.putObject(offer_id);
+            try self.send(try eb.finish());
+        }
+    }
+
+    fn dragLeave(self: *Compositor) Error!void {
+        if (self.drag.focus == 0) return;
+        for (self.data_devices.items) |dev| {
+            var buf: [8]u8 = undefined;
+            var b = wire.Builder.init(&buf, dev, 2); // leave
+            try self.send(try b.finish());
+        }
+        self.drag.focus = 0;
+        self.drag.accepted = false;
+        self.drag.action = 0;
+        // The offer is defunct once left; the client destroys it.
+        self.drag.offer = 0;
+    }
+
+    fn dragMotion(self: *Compositor, x: f64, y: f64) Error!void {
+        self.last_px = x;
+        self.last_py = y;
+        if (self.drag.focus == 0) return;
+        for (self.data_devices.items) |dev| {
+            var buf: [24]u8 = undefined;
+            var b = wire.Builder.init(&buf, dev, 3); // motion
+            b.putUint(self.now_ms);
+            b.putFixed(wire.fixedFromF64(x));
+            b.putFixed(wire.fixedFromF64(y));
+            try self.send(try b.finish());
+        }
+    }
+
+    /// The drag button was released: drop if the target accepted
+    /// (and, at ddm v3, an action was negotiated), else cancel.
+    fn dragDrop(self: *Compositor) Error!void {
+        const can_drop = self.drag.focus != 0 and self.drag.accepted and
+            (self.ddm_version < 3 or self.drag.action != 0);
+        if (can_drop) {
+            for (self.data_devices.items) |dev| {
+                var buf: [8]u8 = undefined;
+                var b = wire.Builder.init(&buf, dev, 4); // drop
+                try self.send(try b.finish());
+            }
+            if (self.drag.source != 0 and self.ddm_version >= 3) {
+                var buf: [8]u8 = undefined;
+                var b = wire.Builder.init(&buf, self.drag.source, 3); // dnd_drop_performed
+                try self.send(try b.finish());
+            }
+            self.drag.active = false;
+            self.drag.dropped = true; // receive/finish still route
+        } else {
+            try self.dragLeave();
+            if (self.drag.source != 0) {
+                var buf: [8]u8 = undefined;
+                var b = wire.Builder.init(&buf, self.drag.source, 2); // cancelled
+                try self.send(try b.finish());
+            }
+            self.drag = .{};
+        }
+    }
+
     /// View → client: a click landed outside a grabbed popup —
     /// tell the app to dismiss it (xdg_popup.popup_done). No-op
     /// when nothing is grabbed.
@@ -695,7 +1108,11 @@ pub const Compositor = struct {
                 if (payload.len < hdr.size) return Error.Protocol;
                 self.request(hdr, payload[wire.header_size..hdr.size]) catch |err| switch (err) {
                     Error.OutOfMemory => return err,
-                    else => try self.fatal(hdr.object, "protocol error"),
+                    else => {
+                        const iname = if (self.objects.get(hdr.object)) |i| i.name else "?";
+                        std.debug.print("wlhost: protocol error on {s}#{d} opcode {d}\n", .{ iname, hdr.object, hdr.opcode });
+                        try self.fatal(hdr.object, "protocol error");
+                    },
                 };
             },
             .pool_create, .pool_resize => {
@@ -824,17 +1241,32 @@ pub const Compositor = struct {
             const g = for (globals) |g| {
                 if (g.name == name) break g;
             } else return Error.Protocol;
-            if (!std.mem.eql(u8, g.iface.name, iname) or ver == 0 or ver > g.version)
+            if (!std.mem.eql(u8, g.iface.name, iname) or ver == 0 or ver > g.version) {
+                std.debug.print("wlhost: bad bind {s} v{d} (advertised {s} v{d})\n", .{ iname, ver, g.iface.name, g.version });
                 return Error.Protocol;
+            }
             try self.register(id, g.iface);
             if (g.iface == &protocol.wl_seat) self.seat_version = ver;
+            if (g.iface == &protocol.wl_compositor) self.compositor_version = ver;
+            if (g.iface == &protocol.xdg_wm_base) self.wm_base_version = ver;
+            if (g.iface == &protocol.wl_data_device_manager) self.ddm_version = ver;
             if (g.iface == &protocol.wl_output) self.output_id = id;
-            try self.boundGlobal(id, g.iface);
+            try self.boundGlobal(id, g.iface, ver);
         } else if (iface == &protocol.wl_compositor) switch (hdr.opcode) {
             0 => { // create_surface
                 const id = (try it.next()).?.new_id;
                 try self.register(id, &protocol.wl_surface);
                 try self.surfaces.put(self.allocator, id, .{});
+                if (self.compositor_version >= 6) {
+                    var buf: [16]u8 = undefined;
+                    var b = wire.Builder.init(&buf, id, 2); // preferred_buffer_scale
+                    b.putInt(self.output_scale);
+                    try self.send(try b.finish());
+                    var tbuf: [16]u8 = undefined;
+                    var tb = wire.Builder.init(&tbuf, id, 3); // preferred_buffer_transform
+                    tb.putUint(0); // normal
+                    try self.send(try tb.finish());
+                }
             },
             1 => { // create_region — tracked, contents ignored
                 const id = (try it.next()).?.new_id;
@@ -974,6 +1406,7 @@ pub const Compositor = struct {
             2 => { // get_touch — registered, never speaks
                 try self.register((try it.next()).?.new_id, &protocol.wl_touch);
             },
+            3 => try self.destroyObject(hdr.object), // release (v5)
             else => return Error.Protocol,
         } else if (iface == &protocol.wl_pointer) switch (hdr.opcode) {
             // set_cursor: accepted, ignored — the local pointer
@@ -1075,11 +1508,39 @@ pub const Compositor = struct {
                     mimes.deinit(self.allocator);
                     _ = self.data_sources.remove(hdr.object);
                 }
+                _ = self.source_actions.remove(hdr.object);
+                if (self.drag.source == hdr.object) {
+                    if (self.drag.active) try self.dragLeave();
+                    self.drag = .{};
+                }
                 try self.destroyObject(hdr.object);
             },
-            else => {}, // set_actions — dnd, ignored at v1
+            2 => { // set_actions(actions) — stored for dnd negotiation
+                const acts = (try it.next()).?.uint;
+                try self.source_actions.put(self.allocator, hdr.object, acts);
+            },
+            else => return Error.Protocol,
         } else if (iface == &protocol.wl_data_device) switch (hdr.opcode) {
-            0 => {}, // start_drag — dnd unsupported in v1
+            0 => { // start_drag(?source, origin, ?icon, serial)
+                const source = (try it.next()).?.object;
+                const origin = (try it.next()).?.object;
+                if (self.drag.active or !self.surfaces.contains(origin)) return;
+                // No held button = nothing to release; refuse inert.
+                if (self.pressed_button == 0) {
+                    if (source != 0) {
+                        var buf: [8]u8 = undefined;
+                        var b = wire.Builder.init(&buf, source, 2); // cancelled
+                        try self.send(try b.finish());
+                    }
+                    return;
+                }
+                // The pointer leaves the origin surface for the drag.
+                const px = self.last_px;
+                const py = self.last_py;
+                try self.pointerLeave();
+                self.drag = .{ .active = true, .source = source, .origin = origin };
+                try self.dragEnter(origin, px, py);
+            },
             1 => { // set_selection(?source, serial)
                 const source = (try it.next()).?.object;
                 if (source != 0) {
@@ -1094,14 +1555,74 @@ pub const Compositor = struct {
             },
             else => return Error.Protocol,
         } else if (iface == &protocol.wl_data_offer) switch (hdr.opcode) {
-            0 => {}, // accept — dnd negotiation, ignored
-            1 => { // receive(mime, fd) — the paste; fd is held by
-                // the daemon, FIFO-paired with sendClipData answers.
-                const mime = (try it.next()).?.string orelse return Error.Protocol;
-                if (self.view.clipboard_read) |cb| cb(self.view.ctx, mime);
+            0 => { // accept(serial, ?mime) — dnd target feedback
+                if (hdr.object == self.drag.offer and self.drag.offer != 0) {
+                    _ = (try it.next()).?; // serial
+                    const mime = (try it.next()).?.string;
+                    self.drag.accepted = mime != null;
+                    if (self.drag.source != 0) {
+                        var buf: [256]u8 = undefined;
+                        var b = wire.Builder.init(&buf, self.drag.source, 0); // target
+                        b.putString(mime);
+                        try self.send(try b.finish());
+                    }
+                }
             },
-            2 => try self.destroyObject(hdr.object), // destroy
-            else => {}, // finish/set_actions — dnd, ignored
+            1 => { // receive(mime, fd) — dnd offers pull from the
+                // SOURCE (daemon pairs the held fd via dnd_send);
+                // selection offers paste the HOST clipboard.
+                const mime = (try it.next()).?.string orelse return Error.Protocol;
+                if (hdr.object == self.drag.offer and self.drag.source != 0) {
+                    var payload: std.ArrayList(u8) = .empty;
+                    defer payload.deinit(self.allocator);
+                    var idb: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &idb, self.drag.source, .little);
+                    try payload.appendSlice(self.allocator, &idb);
+                    try payload.appendSlice(self.allocator, mime);
+                    try pipe.appendUnit(&self.out, self.allocator, .dnd_send, payload.items);
+                } else if (self.view.clipboard_read) |cb| cb(self.view.ctx, mime);
+            },
+            2 => { // destroy
+                if (hdr.object == self.drag.offer) self.drag.offer = 0;
+                if (self.drag.dropped and !self.drag.active) self.drag = .{};
+                try self.destroyObject(hdr.object);
+            },
+            3 => { // finish — dnd transfer complete
+                if (hdr.object == self.drag.offer and self.drag.source != 0) {
+                    var buf: [8]u8 = undefined;
+                    var b = wire.Builder.init(&buf, self.drag.source, 4); // dnd_finished
+                    try self.send(try b.finish());
+                    self.drag = .{};
+                }
+            },
+            4 => { // set_actions(actions, preferred) — negotiate
+                if (hdr.object == self.drag.offer and self.drag.offer != 0) {
+                    const acts = (try it.next()).?.uint;
+                    const preferred = (try it.next()).?.uint;
+                    const src = self.source_actions.get(self.drag.source) orelse 0;
+                    const overlap = acts & src;
+                    const chosen: u32 = if (preferred & overlap != 0)
+                        preferred
+                    else if (overlap & 1 != 0)
+                        1 // copy
+                    else if (overlap & 2 != 0)
+                        2 // move
+                    else
+                        0;
+                    self.drag.action = chosen;
+                    var obuf: [16]u8 = undefined;
+                    var ob = wire.Builder.init(&obuf, hdr.object, 2); // action
+                    ob.putUint(chosen);
+                    try self.send(try ob.finish());
+                    if (self.drag.source != 0) {
+                        var sbuf: [16]u8 = undefined;
+                        var sb = wire.Builder.init(&sbuf, self.drag.source, 5); // action
+                        sb.putUint(chosen);
+                        try self.send(try sb.finish());
+                    }
+                }
+            },
+            else => return Error.Protocol,
         } else if (iface == &protocol.zwlr_data_control_manager_v1) switch (hdr.opcode) {
             0 => { // create_data_source
                 const id = (try it.next()).?.new_id;
@@ -1223,13 +1744,257 @@ pub const Compositor = struct {
                 1 => { // grab(seat, serial)
                     self.grabbed_popup = sid;
                 },
-                2 => {}, // reposition — v1 keeps the original spot
+                2 => { // reposition(positioner, token)
+                    const pos_id = (try it.next()).?.object;
+                    const token = (try it.next()).?.uint;
+                    const pos = self.positioners.get(pos_id) orelse return Error.Protocol;
+                    const surf = self.surfaces.getPtr(sid) orelse return Error.Protocol;
+                    const at = pos.place();
+                    surf.px = at[0];
+                    surf.py = at[1];
+                    surf.pw = pos.w;
+                    surf.ph = pos.h;
+                    var rbuf: [16]u8 = undefined;
+                    var rb = wire.Builder.init(&rbuf, hdr.object, 2); // repositioned
+                    rb.putUint(token);
+                    try self.send(try rb.finish());
+                    var cbuf: [32]u8 = undefined;
+                    var cb = wire.Builder.init(&cbuf, hdr.object, 0); // configure
+                    cb.putInt(surf.px);
+                    cb.putInt(surf.py);
+                    cb.putInt(surf.pw);
+                    cb.putInt(surf.ph);
+                    try self.send(try cb.finish());
+                    var sbuf: [16]u8 = undefined;
+                    var sb = wire.Builder.init(&sbuf, surf.xdg_surface, 0); // configure
+                    sb.putUint(self.nextSerial());
+                    try self.send(try sb.finish());
+                    if (self.view.popup_moved) |vcb|
+                        vcb(self.view.ctx, sid, surf.parent, at[0], at[1]);
+                },
                 else => return Error.Protocol,
             }
         } else if (iface == &protocol.xdg_surface) {
             try self.xdgSurfaceRequest(hdr, &it);
         } else if (iface == &protocol.xdg_toplevel) {
             try self.toplevelRequest(hdr, body, &it);
+        } else if (iface == &protocol.zwp_primary_selection_device_manager_v1) switch (hdr.opcode) {
+            0 => { // create_source
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.zwp_primary_selection_source_v1);
+                try self.data_sources.put(self.allocator, id, .empty);
+            },
+            1 => { // get_device(id, seat)
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.zwp_primary_selection_device_v1);
+                try self.primary_devices.append(self.allocator, id);
+            },
+            2 => try self.destroyObject(hdr.object), // destroy
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_primary_selection_source_v1) switch (hdr.opcode) {
+            0 => { // offer(mime) — same store as wl_data_source
+                const mime = (try it.next()).?.string orelse return Error.Protocol;
+                const mimes = self.data_sources.getPtr(hdr.object) orelse return Error.Protocol;
+                const owned = try self.allocator.dupe(u8, mime);
+                errdefer self.allocator.free(owned);
+                try mimes.append(self.allocator, owned);
+            },
+            1 => { // destroy
+                if (self.data_sources.getPtr(hdr.object)) |mimes| {
+                    for (mimes.items) |m| self.allocator.free(m);
+                    mimes.deinit(self.allocator);
+                    _ = self.data_sources.remove(hdr.object);
+                }
+                try self.destroyObject(hdr.object);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_primary_selection_device_v1) switch (hdr.opcode) {
+            0 => { // set_selection(?source, serial)
+                const source = (try it.next()).?.object;
+                if (source != 0) {
+                    if (self.bestTextMime(source)) |mime| {
+                        if (self.view.primary_offer) |cb| cb(self.view.ctx, source, mime);
+                    }
+                }
+            },
+            1 => { // destroy
+                removeId(&self.primary_devices, hdr.object);
+                try self.destroyObject(hdr.object);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_primary_selection_offer_v1) switch (hdr.opcode) {
+            0 => { // receive(mime, fd) — host PRIMARY selection paste
+                const mime = (try it.next()).?.string orelse return Error.Protocol;
+                if (self.view.primary_read) |cb| cb(self.view.ctx, mime);
+            },
+            1 => try self.destroyObject(hdr.object), // destroy
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_relative_pointer_manager_v1) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object), // destroy
+            1 => { // get_relative_pointer(id, pointer)
+                const id = (try it.next()).?.new_id;
+                const ptr = (try it.next()).?.object;
+                try self.register(id, &protocol.zwp_relative_pointer_v1);
+                try self.rel_pointers.append(self.allocator, .{ .id = id, .pointer = ptr });
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_relative_pointer_v1) switch (hdr.opcode) {
+            0 => { // destroy
+                for (self.rel_pointers.items, 0..) |rp, i| {
+                    if (rp.id == hdr.object) {
+                        _ = self.rel_pointers.swapRemove(i);
+                        break;
+                    }
+                }
+                try self.destroyObject(hdr.object);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_pointer_constraints_v1) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object), // destroy
+            1, 2 => { // lock_pointer / confine_pointer(id, surface, pointer, ?region, lifetime)
+                const id = (try it.next()).?.new_id;
+                const sid = (try it.next()).?.object;
+                _ = (try it.next()).?; // pointer
+                _ = (try it.next()).?; // region — whole surface in scope
+                const lifetime = (try it.next()).?.uint;
+                const kind: u8 = if (hdr.opcode == 1) 0 else 1;
+                try self.register(id, if (kind == 0)
+                    &protocol.zwp_locked_pointer_v1
+                else
+                    &protocol.zwp_confined_pointer_v1);
+                try self.constraints.put(self.allocator, id, .{
+                    .sid = sid,
+                    .kind = kind,
+                    .lifetime = lifetime,
+                });
+                // Already hovering the surface: activate immediately.
+                if (self.pointer_focus == sid) try self.activateConstraints(sid);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_locked_pointer_v1 or
+            iface == &protocol.zwp_confined_pointer_v1)
+        {
+            switch (hdr.opcode) {
+                0 => { // destroy
+                    if (self.constraints.getPtr(hdr.object)) |con| {
+                        if (con.active and con.kind == 0) {
+                            if (self.view.pointer_locked) |cb| cb(self.view.ctx, con.sid, false);
+                        }
+                        _ = self.constraints.remove(hdr.object);
+                    }
+                    try self.destroyObject(hdr.object);
+                },
+                // set_cursor_position_hint / set_region: accepted,
+                // unused (whole-surface constraints, host cursor).
+                else => {},
+            }
+        } else if (iface == &protocol.zwp_text_input_manager_v3) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object), // destroy
+            1 => { // get_text_input(id, seat)
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.zwp_text_input_v3);
+                try self.text_inputs.put(self.allocator, id, .{});
+                if (self.keyboard_focus != 0) {
+                    var buf: [16]u8 = undefined;
+                    var b = wire.Builder.init(&buf, id, 0); // enter
+                    b.putObject(self.keyboard_focus);
+                    try self.send(try b.finish());
+                }
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_text_input_v3) {
+            const ti = self.text_inputs.getPtr(hdr.object) orelse return Error.Protocol;
+            switch (hdr.opcode) {
+                0 => { // destroy
+                    if (ti.enabled) {
+                        if (self.view.text_input_active) |cb| cb(self.view.ctx, false);
+                    }
+                    _ = self.text_inputs.remove(hdr.object);
+                    try self.destroyObject(hdr.object);
+                },
+                1 => ti.pending_enabled = true, // enable
+                2 => ti.pending_enabled = false, // disable
+                // surrounding text / change cause / content type /
+                // cursor rectangle: accepted (no IM popup to place).
+                3, 4, 5, 6 => {},
+                7 => { // commit — latch double-buffered state
+                    ti.serial +%= 1;
+                    if (ti.enabled != ti.pending_enabled) {
+                        ti.enabled = ti.pending_enabled;
+                        if (self.view.text_input_active) |cb| cb(self.view.ctx, ti.enabled);
+                    }
+                },
+                else => return Error.Protocol,
+            }
+        } else if (iface == &protocol.xdg_activation_v1) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object), // destroy
+            1 => { // get_activation_token
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.xdg_activation_token_v1);
+            },
+            2 => { // activate(token, surface)
+                _ = (try it.next()).?; // token — minted freely, not checked
+                const sid = (try it.next()).?.object;
+                if (self.surfaces.contains(sid)) {
+                    if (self.view.toplevel_raise) |cb| cb(self.view.ctx, sid);
+                }
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.xdg_activation_token_v1) switch (hdr.opcode) {
+            0, 1, 2 => {}, // set_serial / set_app_id / set_surface
+            3 => { // commit → done(token)
+                var tok: [48]u8 = undefined;
+                const s = std.fmt.bufPrint(&tok, "sketerm-{d}", .{self.nextSerial()}) catch
+                    return Error.Protocol;
+                var buf: [64]u8 = undefined;
+                var b = wire.Builder.init(&buf, hdr.object, 0); // done
+                b.putString(s);
+                try self.send(try b.finish());
+            },
+            4 => try self.destroyObject(hdr.object), // destroy
+            else => return Error.Protocol,
+        } else if (iface == &protocol.wp_presentation) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object), // destroy
+            1 => { // feedback(surface, id)
+                const sid = (try it.next()).?.object;
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.wp_presentation_feedback);
+                if (self.surfaces.getPtr(sid)) |surf| {
+                    try surf.feedbacks.append(self.allocator, id);
+                } else {
+                    // Unknown surface: discard immediately.
+                    var buf: [8]u8 = undefined;
+                    var b = wire.Builder.init(&buf, id, 2); // discarded
+                    try self.send(try b.finish());
+                    try self.deleteId(id);
+                }
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_idle_inhibit_manager_v1) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object), // destroy
+            1 => { // create_inhibitor(id, surface) — tracked, inert
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.zwp_idle_inhibitor_v1);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_idle_inhibitor_v1) {
+            try self.destroyObject(hdr.object); // destroy (only request)
+        } else if (iface == &protocol.zwp_pointer_gestures_v1) switch (hdr.opcode) {
+            0, 1, 3 => { // get_{swipe,pinch,hold}_gesture(id, pointer)
+                const id = (try it.next()).?.new_id;
+                try self.register(id, switch (hdr.opcode) {
+                    0 => &protocol.zwp_pointer_gesture_swipe_v1,
+                    1 => &protocol.zwp_pointer_gesture_pinch_v1,
+                    else => &protocol.zwp_pointer_gesture_hold_v1,
+                });
+            },
+            2 => try self.destroyObject(hdr.object), // release
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zwp_pointer_gesture_swipe_v1 or
+            iface == &protocol.zwp_pointer_gesture_pinch_v1 or
+            iface == &protocol.zwp_pointer_gesture_hold_v1)
+        {
+            try self.destroyObject(hdr.object); // destroy (only request)
         } else {
             return Error.Protocol;
         }
@@ -1249,6 +2014,18 @@ pub const Compositor = struct {
                 }
                 if (self.pointer_focus == hdr.object) self.pointer_focus = 0;
                 if (self.keyboard_focus == hdr.object) self.keyboard_focus = 0;
+                // Constraints on a dead surface are defunct (their
+                // objects survive until the client destroys them).
+                var cit = self.constraints.valueIterator();
+                while (cit.next()) |con| {
+                    if (con.sid == hdr.object) con.active = false;
+                }
+                if (self.drag.active and
+                    (self.drag.focus == hdr.object or self.drag.origin == hdr.object))
+                {
+                    self.drag.focus = 0;
+                    try self.dragDrop(); // cancels (focus is gone)
+                }
                 surf.freeOwned(self.allocator);
                 _ = self.surfaces.remove(hdr.object);
                 try self.destroyObject(hdr.object);
@@ -1453,6 +2230,23 @@ pub const Compositor = struct {
         if (surf.xdg_surface != 0 and !surf.configured) {
             surf.configured = true;
             if (surf.toplevel != 0) {
+                if (self.wm_base_version >= 4) {
+                    var bbuf: [24]u8 = undefined;
+                    var bb = wire.Builder.init(&bbuf, surf.toplevel, 2); // configure_bounds
+                    bb.putInt(1920);
+                    bb.putInt(1080);
+                    try self.send(try bb.finish());
+                }
+                if (self.wm_base_version >= 5) {
+                    var cbuf: [32]u8 = undefined;
+                    var cb = wire.Builder.init(&cbuf, surf.toplevel, 3); // wm_capabilities
+                    var caps: [12]u8 = undefined;
+                    std.mem.writeInt(u32, caps[0..4], 2, .little); // maximize
+                    std.mem.writeInt(u32, caps[4..8], 3, .little); // fullscreen
+                    std.mem.writeInt(u32, caps[8..12], 4, .little); // minimize
+                    cb.putArray(&caps);
+                    try self.send(try cb.finish());
+                }
                 var buf: [64]u8 = undefined;
                 var b = wire.Builder.init(&buf, surf.toplevel, 0); // configure
                 b.putInt(0); // width: client decides
@@ -1500,6 +2294,24 @@ pub const Compositor = struct {
             try self.deleteId(cb);
         }
         surf.frame_cbs.clearRetainingCapacity();
+
+        // Presentation feedbacks: answered at commit time with the
+        // brain clock (frame-callback timing, not real vsync — no
+        // flags claimed). One-shot: server-destroyed after the event.
+        for (surf.feedbacks.items) |fb| {
+            var buf: [48]u8 = undefined;
+            var b = wire.Builder.init(&buf, fb, 1); // presented
+            b.putUint(0); // tv_sec_hi
+            b.putUint(self.now_ms / 1000); // tv_sec_lo
+            b.putUint((self.now_ms % 1000) * 1_000_000); // tv_nsec
+            b.putUint(16_666_666); // refresh (60 Hz)
+            b.putUint(0); // seq_hi
+            b.putUint(0); // seq_lo
+            b.putUint(0); // flags
+            try self.send(try b.finish());
+            try self.deleteId(fb);
+        }
+        surf.feedbacks.clearRetainingCapacity();
     }
 
     /// Copy the committed pixels tightly packed and hand them to the
@@ -1534,7 +2346,13 @@ pub const Compositor = struct {
 
     // ── server plumbing ─────────────────────────────────────────
 
-    fn boundGlobal(self: *Compositor, id: u32, iface: *const protocol.Interface) Error!void {
+    fn boundGlobal(self: *Compositor, id: u32, iface: *const protocol.Interface, ver: u32) Error!void {
+        if (iface == &protocol.wp_presentation) {
+            var buf: [16]u8 = undefined;
+            var b = wire.Builder.init(&buf, id, 0); // clock_id
+            b.putUint(1); // CLOCK_MONOTONIC
+            try self.send(try b.finish());
+        }
         if (iface == &protocol.wl_shm) {
             for ([_]u32{ 0, 1 }) |fmt| { // argb8888, xrgb8888
                 var buf: [16]u8 = undefined;
@@ -1570,6 +2388,16 @@ pub const Compositor = struct {
             var s = wire.Builder.init(&sbuf, id, 3); // scale
             s.putInt(self.output_scale);
             try self.send(try s.finish());
+            if (ver >= 4) {
+                var nbuf: [32]u8 = undefined;
+                var nb = wire.Builder.init(&nbuf, id, 4); // name
+                nb.putString("sketerm-0");
+                try self.send(try nb.finish());
+                var ebuf: [48]u8 = undefined;
+                var eb = wire.Builder.init(&ebuf, id, 5); // description
+                eb.putString("sketerm remote output");
+                try self.send(try eb.finish());
+            }
             var dbuf: [8]u8 = undefined;
             var d = wire.Builder.init(&dbuf, id, 2); // done
             try self.send(try d.finish());
@@ -1617,7 +2445,9 @@ pub const Compositor = struct {
     // pool bytes — those precede the state_sync unit as pool_create
     // + pool_update_c units replayed from the daemon's mirrors.
 
-    const state_sync_version: u8 = 1;
+    // v2 appends the modern-protocol state (bind versions, relative
+    // pointers, constraints, text inputs, primary devices, drag).
+    const state_sync_version: u8 = 2;
 
     fn putU8(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u8) Error!void {
         try out.append(a, v);
@@ -1631,6 +2461,12 @@ pub const Compositor = struct {
 
     fn putI32(out: *std.ArrayList(u8), a: std.mem.Allocator, v: i32) Error!void {
         try putU32(out, a, @bitCast(v));
+    }
+
+    fn putF64(out: *std.ArrayList(u8), a: std.mem.Allocator, v: f64) Error!void {
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, @bitCast(v), .little);
+        try out.appendSlice(a, &b);
     }
 
     /// Length-prefixed optional string (0xffffffff = null).
@@ -1661,6 +2497,12 @@ pub const Compositor = struct {
 
         fn i32v(r: *StateReader) Error!i32 {
             return @bitCast(try r.u32v());
+        }
+
+        fn f64v(r: *StateReader) Error!f64 {
+            if (r.pos + 8 > r.buf.len) return Error.Protocol;
+            defer r.pos += 8;
+            return @bitCast(std.mem.readInt(u64, r.buf[r.pos..][0..8], .little));
         }
 
         fn str(r: *StateReader, a: std.mem.Allocator) Error!?[]u8 {
@@ -1802,6 +2644,58 @@ pub const Compositor = struct {
             for (list.items) |v| try putU32(&out, a, v);
         }
 
+        // ── v2 tail ──────────────────────────────────────────────
+        try putU32(&out, a, self.compositor_version);
+        try putU32(&out, a, self.wm_base_version);
+        try putU32(&out, a, self.ddm_version);
+        try putF64(&out, a, self.last_px);
+        try putF64(&out, a, self.last_py);
+        try putU32(&out, a, self.pressed_button);
+
+        try putU8(&out, a, @intFromBool(self.drag.active));
+        try putU8(&out, a, @intFromBool(self.drag.dropped));
+        try putU32(&out, a, self.drag.source);
+        try putU32(&out, a, self.drag.origin);
+        try putU32(&out, a, self.drag.focus);
+        try putU32(&out, a, self.drag.offer);
+        try putU8(&out, a, @intFromBool(self.drag.accepted));
+        try putU32(&out, a, self.drag.action);
+
+        try putU32(&out, a, @intCast(self.rel_pointers.items.len));
+        for (self.rel_pointers.items) |rp| {
+            try putU32(&out, a, rp.id);
+            try putU32(&out, a, rp.pointer);
+        }
+
+        try putU32(&out, a, self.constraints.count());
+        var cit = self.constraints.iterator();
+        while (cit.next()) |e| {
+            try putU32(&out, a, e.key_ptr.*);
+            try putU32(&out, a, e.value_ptr.sid);
+            try putU8(&out, a, e.value_ptr.kind);
+            try putU32(&out, a, e.value_ptr.lifetime);
+            try putU8(&out, a, @intFromBool(e.value_ptr.active));
+        }
+
+        try putU32(&out, a, self.text_inputs.count());
+        var tit = self.text_inputs.iterator();
+        while (tit.next()) |e| {
+            try putU32(&out, a, e.key_ptr.*);
+            try putU8(&out, a, @intFromBool(e.value_ptr.enabled));
+            try putU8(&out, a, @intFromBool(e.value_ptr.pending_enabled));
+            try putU32(&out, a, e.value_ptr.serial);
+        }
+
+        try putU32(&out, a, @intCast(self.primary_devices.items.len));
+        for (self.primary_devices.items) |v| try putU32(&out, a, v);
+
+        try putU32(&out, a, self.source_actions.count());
+        var ait = self.source_actions.iterator();
+        while (ait.next()) |e| {
+            try putU32(&out, a, e.key_ptr.*);
+            try putU32(&out, a, e.value_ptr.*);
+        }
+
         return out.toOwnedSlice(a);
     }
 
@@ -1811,7 +2705,8 @@ pub const Compositor = struct {
     pub fn restoreState(self: *Compositor, blob: []const u8) Error!void {
         var r = StateReader{ .buf = blob };
         const a = self.allocator;
-        if (try r.u8v() != state_sync_version) return Error.Protocol;
+        const ver = try r.u8v();
+        if (ver != 1 and ver != state_sync_version) return Error.Protocol;
         self.output_scale = try r.i32v();
         self.output_id = try r.u32v();
         self.grabbed_popup = try r.u32v();
@@ -1949,6 +2844,58 @@ pub const Compositor = struct {
             for (0..n) |_| try list.append(a, try r.u32v());
         }
 
+        if (ver >= 2) {
+            self.compositor_version = try r.u32v();
+            self.wm_base_version = try r.u32v();
+            self.ddm_version = try r.u32v();
+            self.last_px = try r.f64v();
+            self.last_py = try r.f64v();
+            self.pressed_button = try r.u32v();
+
+            self.drag.active = try r.u8v() != 0;
+            self.drag.dropped = try r.u8v() != 0;
+            self.drag.source = try r.u32v();
+            self.drag.origin = try r.u32v();
+            self.drag.focus = try r.u32v();
+            self.drag.offer = try r.u32v();
+            self.drag.accepted = try r.u8v() != 0;
+            self.drag.action = try r.u32v();
+
+            const n_rel = try r.u32v();
+            for (0..n_rel) |_| {
+                const id = try r.u32v();
+                try self.rel_pointers.append(a, .{ .id = id, .pointer = try r.u32v() });
+            }
+
+            const n_con = try r.u32v();
+            for (0..n_con) |_| {
+                const id = try r.u32v();
+                var con = Constraint{ .sid = try r.u32v(), .kind = try r.u8v(), .lifetime = 0 };
+                con.lifetime = try r.u32v();
+                con.active = try r.u8v() != 0;
+                try self.constraints.put(a, id, con);
+            }
+
+            const n_ti = try r.u32v();
+            for (0..n_ti) |_| {
+                const id = try r.u32v();
+                var ti = TextInput{};
+                ti.enabled = try r.u8v() != 0;
+                ti.pending_enabled = try r.u8v() != 0;
+                ti.serial = try r.u32v();
+                try self.text_inputs.put(a, id, ti);
+            }
+
+            const n_pd = try r.u32v();
+            for (0..n_pd) |_| try self.primary_devices.append(a, try r.u32v());
+
+            const n_sa = try r.u32v();
+            for (0..n_sa) |_| {
+                const id = try r.u32v();
+                try self.source_actions.put(a, id, try r.u32v());
+            }
+        }
+
         try self.replayToView();
     }
 
@@ -1978,6 +2925,20 @@ pub const Compositor = struct {
                 if (self.view.subsurface_new) |cb| cb(self.view.ctx, sid, s.subparent, s.sub_x, s.sub_y);
             } else if (s.popup != 0) {
                 if (self.view.popup_new) |cb| cb(self.view.ctx, sid, s.parent, s.px, s.py);
+            }
+        }
+        // Restored input-protocol state the view acts on.
+        var tvit = self.text_inputs.valueIterator();
+        while (tvit.next()) |ti| {
+            if (ti.enabled) {
+                if (self.view.text_input_active) |cb| cb(self.view.ctx, true);
+                break;
+            }
+        }
+        var cvit = self.constraints.valueIterator();
+        while (cvit.next()) |con| {
+            if (con.active and con.kind == 0) {
+                if (self.view.pointer_locked) |cb| cb(self.view.ctx, con.sid, true);
             }
         }
         // Pixels, same host-then-child order.
@@ -2019,7 +2980,10 @@ pub const Compositor = struct {
             .seat_leave => self.pointerLeave() catch {},
             .seat_motion => if (pl.len >= 16) self.pointerMotion(g.f64At(pl, 0), g.f64At(pl, 8)) catch {},
             .seat_button => if (pl.len >= 5) self.pointerButton(g.u32At(pl, 0), pl[4] != 0) catch {},
-            .seat_axis => if (pl.len >= 12) self.pointerAxis(g.u32At(pl, 0), g.f64At(pl, 4)) catch {},
+            .seat_axis => if (pl.len >= 12) {
+                const v120: i32 = if (pl.len >= 16) g.i32At(pl, 12) else 0;
+                self.pointerAxis(g.u32At(pl, 0), g.f64At(pl, 4), v120) catch {};
+            },
             .seat_kbd_enter => if (pl.len >= 4) self.keyboardEnter(g.u32At(pl, 0)) catch {},
             .seat_kbd_leave => self.keyboardLeave() catch {},
             .seat_key => if (pl.len >= 5) self.keyboardKey(g.u32At(pl, 0), pl[4] != 0) catch {},
@@ -2035,6 +2999,8 @@ pub const Compositor = struct {
             },
             .dismiss_popups => self.dismissPopups() catch {},
             .offer_selection => self.offerSelection(pl) catch {},
+            .offer_primary => self.offerPrimary(pl) catch {},
+            .text_commit => self.commitString(pl) catch {},
             .request_close => if (pl.len >= 4) self.requestClose(g.u32At(pl, 0)) catch {},
             else => {},
         }
@@ -2088,6 +3054,14 @@ const TestView = struct {
     cursor: u32 = 0,
     ssd: ?bool = null,
     input_rects: usize = 999,
+    popup_moves: usize = 0,
+    locked_sid: u32 = 0,
+    locked: bool = false,
+    text_active: bool = false,
+    text_flips: usize = 0,
+    primary_source: u32 = 0,
+    primary_reads: usize = 0,
+    raised: u32 = 0,
 
     fn onNew(ctx: ?*anyopaque, surface: u32) void {
         _ = surface;
@@ -2182,6 +3156,39 @@ const TestView = struct {
         self.ssd = ssd;
     }
 
+    fn onPopupMoved(ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void {
+        _ = surface;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.popup_moves += 1;
+        self.popup_parent = parent;
+        self.popup_x = x;
+        self.popup_y = y;
+    }
+    fn onLocked(ctx: ?*anyopaque, surface: u32, locked: bool) void {
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.locked_sid = surface;
+        self.locked = locked;
+    }
+    fn onTextActive(ctx: ?*anyopaque, active: bool) void {
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.text_active = active;
+        self.text_flips += 1;
+    }
+    fn onPrimaryOffer(ctx: ?*anyopaque, source: u32, mime: []const u8) void {
+        _ = mime;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.primary_source = source;
+    }
+    fn onPrimaryRead(ctx: ?*anyopaque, mime: []const u8) void {
+        _ = mime;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.primary_reads += 1;
+    }
+    fn onRaise(ctx: ?*anyopaque, surface: u32) void {
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.raised = surface;
+    }
+
     fn view(self: *TestView) View {
         return .{
             .ctx = self,
@@ -2200,6 +3207,12 @@ const TestView = struct {
             .cursor_shape = onCursor,
             .toplevel_decoration = onDeco,
             .input_region = onInputRegion,
+            .popup_moved = onPopupMoved,
+            .pointer_locked = onLocked,
+            .text_input_active = onTextActive,
+            .primary_offer = onPrimaryOffer,
+            .primary_read = onPrimaryRead,
+            .toplevel_raise = onRaise,
         };
     }
 };
@@ -2561,6 +3574,81 @@ test "seat: devices bind, keymap unit emitted, input events flow" {
     try comp.pointerMotion(1, 1);
     try comp.keyboardKey(38, false);
     try t.expectEqual(@as(usize, 0), comp.takeOut().len);
+}
+
+test "JBR binds: seat v5 frame-grouped input, data_device_manager v3" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    { // get_registry(2)
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&comp, try b.finish());
+    }
+    { // bind seat(name 3) at v5 → id 3 — JBR binds 5 unconditionally
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(3);
+        b.putString("wl_seat");
+        b.putUint(5);
+        b.putNewId(3);
+        try req(&comp, try b.finish());
+    }
+    { // bind data_device_manager(name 6) at v3 → id 4
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(6);
+        b.putString("wl_data_device_manager");
+        b.putUint(3);
+        b.putNewId(4);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(!comp.dead);
+    try t.expectEqual(@as(u32, 5), comp.seat_version);
+
+    { // bind compositor → 5, create surface 6
+        var b = wire.Builder.init(&buf, 2, 0);
+        b.putUint(1);
+        b.putString("wl_compositor");
+        b.putUint(4);
+        b.putNewId(5);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 5, 0);
+        b2.putNewId(6);
+        try req(&comp, try b2.finish());
+    }
+    { // get_pointer(7)
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(7);
+        try req(&comp, try b.finish());
+    }
+    comp.clearOut();
+
+    // Every pointer event group must close with frame (opcode 5) —
+    // v5-bound clients buffer input until it arrives.
+    try comp.pointerEnter(6, 1.0, 2.0);
+    try comp.pointerMotion(3.0, 4.0);
+    try comp.pointerButton(0x110, true);
+    try comp.pointerAxis(0, 15.0, 0);
+    try comp.pointerLeave();
+
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    const expect = [_][2]u32{
+        .{ 7, 0 }, .{ 7, 5 }, // enter + frame
+        .{ 7, 2 }, .{ 7, 5 }, // motion + frame
+        .{ 7, 3 }, .{ 7, 5 }, // button + frame
+        .{ 7, 4 }, .{ 7, 5 }, // axis + frame
+        .{ 7, 1 }, .{ 7, 5 }, // leave + frame
+    };
+    try t.expectEqualSlices([2]u32, &expect, evs.items);
+
+    { // wl_seat.release (v5 request) must not be a protocol error
+        var b = wire.Builder.init(&buf, 3, 3);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(!comp.dead);
 }
 
 test "clipboard: copy offer, fetch, paste offer, receive answer" {
@@ -3333,4 +4421,630 @@ test "applyIntent: configure and request_close reach the app" {
     brain.applyIntent(.seat_enter, "xx");
     brain.applyIntent(.configure, "");
     try t.expect(!brain.dead);
+}
+
+// ─── modern-protocol tests ──────────────────────────────────────
+
+/// registry(2) + one bind, matching the client-side dance.
+fn bindGlobal(comp: *Compositor, name: u32, iface: []const u8, ver: u32, id: u32) !void {
+    var buf: [96]u8 = undefined;
+    var b = wire.Builder.init(&buf, 2, 0);
+    b.putUint(name);
+    b.putString(iface);
+    b.putUint(ver);
+    b.putNewId(id);
+    try req(comp, try b.finish());
+}
+
+fn getRegistry(comp: *Compositor) !void {
+    var buf: [16]u8 = undefined;
+    var b = wire.Builder.init(&buf, 1, 1);
+    b.putNewId(2);
+    try req(comp, try b.finish());
+}
+
+test "v6 compositor / v6 wm_base / v4 output obligations" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 6, 3);
+    try bindGlobal(&comp, 5, "xdg_wm_base", 6, 4);
+    comp.clearOut();
+
+    try bindGlobal(&comp, 4, "wl_output", 4, 5);
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    // geometry, mode, scale, name, description, done — in order.
+    const out_expect = [_][2]u32{
+        .{ 5, 0 }, .{ 5, 1 }, .{ 5, 3 }, .{ 5, 4 }, .{ 5, 5 }, .{ 5, 2 },
+    };
+    try t.expectEqualSlices([2]u32, &out_expect, evs.items);
+
+    { // create_surface → preferred buffer scale + transform
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+    }
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    const surf_expect = [_][2]u32{ .{ 6, 2 }, .{ 6, 3 } };
+    try t.expectEqualSlices([2]u32, &surf_expect, evs.items);
+
+    { // xdg dance
+        var b = wire.Builder.init(&buf, 4, 2); // get_xdg_surface(7, 6)
+        b.putNewId(7);
+        b.putObject(6);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 7, 1); // get_toplevel(8)
+        b2.putNewId(8);
+        try req(&comp, try b2.finish());
+    }
+    comp.clearOut();
+    { // first commit → bounds + capabilities + configure
+        var b = wire.Builder.init(&buf, 6, 6);
+        try req(&comp, try b.finish());
+    }
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    const cfg_expect = [_][2]u32{
+        .{ 8, 2 }, // configure_bounds
+        .{ 8, 3 }, // wm_capabilities
+        .{ 8, 0 }, // toplevel configure
+        .{ 7, 0 }, // xdg_surface configure
+    };
+    try t.expectEqualSlices([2]u32, &cfg_expect, evs.items);
+    try t.expect(!comp.dead);
+}
+
+test "seat v8: wheel scrolls carry axis_value120" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 3, "wl_seat", 8, 3);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 4);
+    { // surface 5, pointer 6
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(5);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 3, 0);
+        b2.putNewId(6);
+        try req(&comp, try b2.finish());
+    }
+    try comp.pointerEnter(5, 1, 1);
+    comp.clearOut();
+
+    try comp.pointerAxis(0, 20.0, 240); // two wheel detents
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    const wheel_expect = [_][2]u32{
+        .{ 6, 9 }, // axis_value120
+        .{ 6, 4 }, // axis
+        .{ 6, 5 }, // frame
+    };
+    try t.expectEqualSlices([2]u32, &wheel_expect, evs.items);
+
+    try comp.pointerAxis(0, 3.5, 0); // touchpad: no discrete info
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    const smooth_expect = [_][2]u32{ .{ 6, 4 }, .{ 6, 5 } };
+    try t.expectEqualSlices([2]u32, &smooth_expect, evs.items);
+}
+
+test "relative pointer + pointer lock: locked suppresses absolute motion" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 3, "wl_seat", 8, 3);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 4);
+    try bindGlobal(&comp, 14, "zwp_relative_pointer_manager_v1", 1, 5);
+    try bindGlobal(&comp, 15, "zwp_pointer_constraints_v1", 1, 6);
+    { // surface 7, pointer 8, relative pointer 9, lock 10
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(7);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 3, 0);
+        b2.putNewId(8);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 5, 1); // get_relative_pointer
+        b3.putNewId(9);
+        b3.putObject(8);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 6, 1); // lock_pointer
+        b4.putNewId(10);
+        b4.putObject(7);
+        b4.putObject(8);
+        b4.putObject(0); // region: whole surface
+        b4.putUint(2); // persistent
+        try req(&comp, try b4.finish());
+    }
+    comp.clearOut();
+
+    try comp.pointerEnter(7, 5, 5);
+    try t.expect(tv.locked);
+    try t.expectEqual(@as(u32, 7), tv.locked_sid);
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    const enter_expect = [_][2]u32{
+        .{ 8, 0 }, .{ 8, 5 }, // enter + frame
+        .{ 10, 0 }, // locked
+    };
+    try t.expectEqualSlices([2]u32, &enter_expect, evs.items);
+
+    try comp.pointerMotion(8, 6);
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    const motion_expect = [_][2]u32{
+        .{ 9, 0 }, // relative_motion (NO absolute 8,2)
+        .{ 8, 5 }, // frame
+    };
+    try t.expectEqualSlices([2]u32, &motion_expect, evs.items);
+
+    try comp.pointerLeave();
+    try t.expect(!tv.locked);
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    const leave_expect = [_][2]u32{
+        .{ 10, 1 }, // unlocked
+        .{ 8, 1 }, .{ 8, 5 }, // leave + frame
+    };
+    try t.expectEqualSlices([2]u32, &leave_expect, evs.items);
+}
+
+test "primary selection: offer both ways + receive routing" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 13, "zwp_primary_selection_device_manager_v1", 1, 3);
+    { // source 4 with a text mime, device 5
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(4);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 4, 0);
+        b2.putString("text/plain;charset=utf-8");
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 3, 1);
+        b3.putNewId(5);
+        b3.putObject(0);
+        try req(&comp, try b3.finish());
+    }
+    { // app sets its primary selection → view offer
+        var b = wire.Builder.init(&buf, 5, 0);
+        b.putObject(4);
+        b.putUint(1);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(u32, 4), tv.primary_source);
+
+    // Host announces ITS primary selection toward the device.
+    comp.clearOut();
+    try comp.offerPrimary("text/plain;charset=utf-8");
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    const offer_id = comp.next_server_id - 1;
+    const offer_expect = [_][2]u32{
+        .{ 5, 0 }, // data_offer
+        .{ offer_id, 0 }, // offer(mime)
+        .{ 5, 1 }, // selection
+    };
+    try t.expectEqualSlices([2]u32, &offer_expect, evs.items);
+
+    { // app pastes from it → primary_read (separate fd FIFO)
+        var b = wire.Builder.init(&buf, offer_id, 0); // receive
+        b.putString("text/plain;charset=utf-8");
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.primary_reads);
+
+    // Answer flows as a primary_data unit, not clip_data.
+    comp.clearOut();
+    try comp.sendPrimaryData("hi");
+    const bytes = comp.takeOut();
+    const p = (try pipe.peelUnit(bytes)).?;
+    try t.expectEqual(pipe.Tag.primary_data, p.unit.tag);
+    try t.expectEqualStrings("hi", p.unit.payload);
+}
+
+test "text-input v3: enable/commit gates IM, commit_string + done" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 16, "zwp_text_input_manager_v3", 1, 3);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 4);
+    { // surface 5, text input 6
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(5);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 3, 1); // get_text_input
+        b2.putNewId(6);
+        b2.putObject(0);
+        try req(&comp, try b2.finish());
+    }
+    try comp.keyboardEnter(5);
+    comp.clearOut();
+
+    { // enable + commit → active
+        var b = wire.Builder.init(&buf, 6, 1);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 6, 7);
+        try req(&comp, try b2.finish());
+    }
+    try t.expect(tv.text_active);
+    try t.expectEqual(@as(usize, 1), tv.text_flips);
+
+    try comp.commitString("héllo");
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    const ti_expect = [_][2]u32{
+        .{ 6, 3 }, // commit_string
+        .{ 6, 5 }, // done
+    };
+    try t.expectEqualSlices([2]u32, &ti_expect, evs.items);
+
+    { // disable + commit → inactive
+        var b = wire.Builder.init(&buf, 6, 2);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 6, 7);
+        try req(&comp, try b2.finish());
+    }
+    try t.expect(!tv.text_active);
+    try t.expectEqual(@as(usize, 2), tv.text_flips);
+}
+
+test "within-app dnd: start_drag through drop, transfer, finish" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 3, "wl_seat", 8, 3);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 4);
+    try bindGlobal(&comp, 6, "wl_data_device_manager", 3, 5);
+    { // surface 6, source 7 (uri-list, copy|move), device 8, pointer 9
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 5, 0);
+        b2.putNewId(7);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 7, 0);
+        b3.putString("text/uri-list");
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 7, 2); // set_actions(copy|move)
+        b4.putUint(3);
+        try req(&comp, try b4.finish());
+        var b5 = wire.Builder.init(&buf, 5, 1);
+        b5.putNewId(8);
+        b5.putObject(3);
+        try req(&comp, try b5.finish());
+        var b6 = wire.Builder.init(&buf, 3, 0);
+        b6.putNewId(9);
+        try req(&comp, try b6.finish());
+    }
+    try comp.pointerEnter(6, 4, 4);
+    try comp.pointerButton(0x110, true);
+    comp.clearOut();
+
+    { // start_drag(source 7, origin 6, no icon, serial)
+        var b = wire.Builder.init(&buf, 8, 0);
+        b.putObject(7);
+        b.putObject(6);
+        b.putObject(0);
+        b.putUint(99);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(comp.drag.active);
+    const offer_id = comp.drag.offer;
+    try t.expect(offer_id != 0);
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    const start_expect = [_][2]u32{
+        .{ 9, 1 }, .{ 9, 5 }, // pointer leave + frame
+        .{ 8, 0 }, // data_offer
+        .{ offer_id, 0 }, // offer(mime)
+        .{ offer_id, 1 }, // source_actions
+        .{ 8, 1 }, // dd enter
+    };
+    try t.expectEqualSlices([2]u32, &start_expect, evs.items);
+
+    // Motion is dd.motion, not pointer.motion.
+    try comp.pointerMotion(10, 10);
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    try t.expectEqualSlices([2]u32, &[_][2]u32{.{ 8, 3 }}, evs.items);
+
+    { // target negotiates: set_actions + accept
+        var b = wire.Builder.init(&buf, offer_id, 4); // set_actions(copy, copy)
+        b.putUint(1);
+        b.putUint(1);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, offer_id, 0); // accept
+        b2.putUint(99);
+        b2.putString("text/uri-list");
+        try req(&comp, try b2.finish());
+    }
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    const nego_expect = [_][2]u32{
+        .{ offer_id, 2 }, // offer.action
+        .{ 7, 5 }, // source.action
+        .{ 7, 0 }, // source.target
+    };
+    try t.expectEqualSlices([2]u32, &nego_expect, evs.items);
+
+    // Release → drop.
+    try comp.pointerButton(0x110, false);
+    try t.expect(!comp.drag.active);
+    try t.expect(comp.drag.dropped);
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    const drop_expect = [_][2]u32{
+        .{ 8, 4 }, // drop
+        .{ 7, 3 }, // dnd_drop_performed
+    };
+    try t.expectEqualSlices([2]u32, &drop_expect, evs.items);
+
+    { // receive routes to the SOURCE via a dnd_send unit
+        var b = wire.Builder.init(&buf, offer_id, 1);
+        b.putString("text/uri-list");
+        try req(&comp, try b.finish());
+    }
+    {
+        const bytes = comp.takeOut();
+        var pos: usize = 0;
+        var saw_dnd_send = false;
+        while (try pipe.peelUnit(bytes[pos..])) |p| {
+            if (p.unit.tag == .dnd_send) {
+                try t.expectEqual(@as(u32, 7), std.mem.readInt(u32, p.unit.payload[0..4], .little));
+                try t.expectEqualStrings("text/uri-list", p.unit.payload[4..]);
+                saw_dnd_send = true;
+            }
+            pos += p.consumed;
+        }
+        try t.expect(saw_dnd_send);
+        comp.clearOut();
+    }
+
+    { // finish → dnd_finished, drag state cleared
+        var b = wire.Builder.init(&buf, offer_id, 3);
+        try req(&comp, try b.finish());
+    }
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    try t.expectEqualSlices([2]u32, &[_][2]u32{.{ 7, 4 }}, evs.items);
+    try t.expect(!comp.drag.dropped);
+    try t.expect(!comp.dead);
+}
+
+test "xdg-activation, presentation-time, idle-inhibit, gestures" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 17, "xdg_activation_v1", 1, 3);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 4);
+    { // surface 5
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(5);
+        try req(&comp, try b.finish());
+    }
+    comp.clearOut();
+    { // token dance: get(6), commit → done
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 6, 3); // commit
+        try req(&comp, try b2.finish());
+    }
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    try t.expectEqualSlices([2]u32, &[_][2]u32{.{ 6, 0 }}, evs.items);
+    { // activate(token, surface 5) → raise
+        var b = wire.Builder.init(&buf, 3, 2);
+        b.putString("whatever");
+        b.putObject(5);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(u32, 5), tv.raised);
+
+    // Presentation: clock_id at bind, presented at commit.
+    comp.clearOut();
+    try bindGlobal(&comp, 18, "wp_presentation", 1, 7);
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    try t.expectEqualSlices([2]u32, &[_][2]u32{.{ 7, 0 }}, evs.items); // clock_id
+    { // feedback(surface 5, id 8) + commit
+        var b = wire.Builder.init(&buf, 7, 1);
+        b.putObject(5);
+        b.putNewId(8);
+        try req(&comp, try b.finish());
+        comp.clearOut();
+        var b2 = wire.Builder.init(&buf, 5, 6); // commit
+        try req(&comp, try b2.finish());
+    }
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    const pres_expect = [_][2]u32{
+        .{ 8, 1 }, // presented
+        .{ 1, 1 }, // delete_id(8) — one-shot object
+    };
+    try t.expectEqualSlices([2]u32, &pres_expect, evs.items);
+
+    // Idle inhibit + gestures: accepted, inert, never fatal.
+    try bindGlobal(&comp, 19, "zwp_idle_inhibit_manager_v1", 1, 9);
+    try bindGlobal(&comp, 20, "zwp_pointer_gestures_v1", 3, 10);
+    {
+        var b = wire.Builder.init(&buf, 9, 1); // create_inhibitor(11, 5)
+        b.putNewId(11);
+        b.putObject(5);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 11, 0); // inhibitor destroy
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 10, 0); // get_swipe(12, pointer 0)
+        b3.putNewId(12);
+        b3.putObject(0);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 10, 3); // get_hold(13, pointer 0)
+        b4.putNewId(13);
+        b4.putObject(0);
+        try req(&comp, try b4.finish());
+        var b5 = wire.Builder.init(&buf, 12, 0); // swipe destroy
+        try req(&comp, try b5.finish());
+    }
+    try t.expect(!comp.dead);
+}
+
+test "xdg_popup.reposition: repositioned + configure + view move" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 3);
+    try bindGlobal(&comp, 5, "xdg_wm_base", 6, 4);
+    { // parent: surface 5 → xdg 6 → toplevel 7, committed
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(5);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 4, 2);
+        b2.putNewId(6);
+        b2.putObject(5);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 6, 1);
+        b3.putNewId(7);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 5, 6); // commit
+        try req(&comp, try b4.finish());
+    }
+    { // popup: surface 8 → xdg 9, positioner 10 (anchor tl, gravity br)
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(8);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 4, 2);
+        b2.putNewId(9);
+        b2.putObject(8);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 4, 1); // create_positioner
+        b3.putNewId(10);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 10, 1); // set_size(100, 50)
+        b4.putInt(100);
+        b4.putInt(50);
+        try req(&comp, try b4.finish());
+        var b5 = wire.Builder.init(&buf, 10, 2); // set_anchor_rect(10, 20, 1, 1)
+        b5.putInt(10);
+        b5.putInt(20);
+        b5.putInt(1);
+        b5.putInt(1);
+        try req(&comp, try b5.finish());
+        var b6 = wire.Builder.init(&buf, 10, 3); // anchor top-left
+        b6.putUint(5);
+        try req(&comp, try b6.finish());
+        var b7 = wire.Builder.init(&buf, 10, 4); // gravity bottom-right
+        b7.putUint(8);
+        try req(&comp, try b7.finish());
+        var b8 = wire.Builder.init(&buf, 9, 2); // get_popup(11, parent 6, pos 10)
+        b8.putNewId(11);
+        b8.putObject(6);
+        b8.putObject(10);
+        try req(&comp, try b8.finish());
+        var b9 = wire.Builder.init(&buf, 8, 6); // commit → initial configure
+        try req(&comp, try b9.finish());
+    }
+    try t.expectEqual(@as(i32, 10), tv.popup_x);
+    try t.expectEqual(@as(i32, 20), tv.popup_y);
+    comp.clearOut();
+
+    { // move the anchor, reposition(pos 10, token 77)
+        var b = wire.Builder.init(&buf, 10, 2); // set_anchor_rect(30, 40, 1, 1)
+        b.putInt(30);
+        b.putInt(40);
+        b.putInt(1);
+        b.putInt(1);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 11, 2); // reposition
+        b2.putObject(10);
+        b2.putUint(77);
+        try req(&comp, try b2.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.popup_moves);
+    try t.expectEqual(@as(i32, 30), tv.popup_x);
+    try t.expectEqual(@as(i32, 40), tv.popup_y);
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    const repos_expect = [_][2]u32{
+        .{ 11, 2 }, // repositioned(token)
+        .{ 11, 0 }, // popup configure
+        .{ 9, 0 }, // xdg_surface configure
+    };
+    try t.expectEqualSlices([2]u32, &repos_expect, evs.items);
+}
+
+test "state sync v2: versions and input-protocol state round-trip" {
+    var tv = TestView{};
+    var brain = try Compositor.init(t.allocator, tv.view());
+    defer brain.deinit();
+    var buf: [64]u8 = undefined;
+
+    try getRegistry(&brain);
+    try bindGlobal(&brain, 3, "wl_seat", 8, 3);
+    try bindGlobal(&brain, 1, "wl_compositor", 6, 4);
+    try bindGlobal(&brain, 5, "xdg_wm_base", 6, 5);
+    try bindGlobal(&brain, 16, "zwp_text_input_manager_v3", 1, 6);
+    { // surface 7, text input 8, enabled
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(7);
+        try req(&brain, try b.finish());
+        var b2 = wire.Builder.init(&buf, 6, 1);
+        b2.putNewId(8);
+        b2.putObject(0);
+        try req(&brain, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 8, 1); // enable
+        try req(&brain, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 8, 7); // commit
+        try req(&brain, try b4.finish());
+    }
+    try brain.keyboardEnter(7);
+
+    const blob = try brain.serializeState(t.allocator);
+    defer t.allocator.free(blob);
+
+    var tv2 = TestView{};
+    var replica = try Compositor.init(t.allocator, tv2.view());
+    defer replica.deinit();
+    replica.lenient = true;
+    try replica.restoreState(blob);
+
+    try t.expectEqual(@as(u32, 8), replica.seat_version);
+    try t.expectEqual(@as(u32, 6), replica.compositor_version);
+    try t.expectEqual(@as(u32, 6), replica.wm_base_version);
+    try t.expectEqual(@as(u32, 1), replica.text_inputs.count());
+    // The replica's view learns the enabled text input on replay.
+    try t.expect(tv2.text_active);
 }

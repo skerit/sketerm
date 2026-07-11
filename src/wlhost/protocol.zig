@@ -1,7 +1,10 @@
 //! Hand-written interface tables for the protocols the sketerm
-//! compositor advertises: core wayland + xdg-shell, the v1 scope
-//! pinned in docs/proposal-macos-remote-apps.md (shm-only, no
-//! dmabuf, no data-device — extend as real apps demand).
+//! compositor advertises: core wayland + xdg-shell + the modern
+//! client staples (selections incl. primary, relative pointer +
+//! constraints, text-input v3, xdg-activation, presentation-time,
+//! idle-inhibit, pointer gestures). Deliberately shm-only — no
+//! dmabuf: GPU clients fall back to shm, which is what the
+//! pixel-shipping pipeline wants.
 //!
 //! Signature letters match wire.zig's ArgIter:
 //!   i int · u uint · f fixed · s string · o object · n new_id ·
@@ -496,6 +499,271 @@ pub const zxdg_toplevel_decoration_v1 = Interface{
     },
 };
 
+// ─── primary selection (middle-click paste) ─────────────────────
+
+pub const zwp_primary_selection_offer_v1 = Interface{
+    .name = "zwp_primary_selection_offer_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "receive", .sig = "sh" },
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "offer", .sig = "s" },
+    },
+};
+
+pub const zwp_primary_selection_source_v1 = Interface{
+    .name = "zwp_primary_selection_source_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "offer", .sig = "s" },
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "send", .sig = "sh" },
+        .{ .name = "cancelled", .sig = "" },
+    },
+};
+
+pub const zwp_primary_selection_device_v1 = Interface{
+    .name = "zwp_primary_selection_device_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "set_selection", .sig = "?ou" },
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        // Server-created offer object (like wl_data_device.data_offer).
+        .{ .name = "data_offer", .sig = "n", .new_id_iface = &zwp_primary_selection_offer_v1 },
+        .{ .name = "selection", .sig = "?o" },
+    },
+};
+
+pub const zwp_primary_selection_device_manager_v1 = Interface{
+    .name = "zwp_primary_selection_device_manager_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "create_source", .sig = "n", .new_id_iface = &zwp_primary_selection_source_v1 },
+        .{ .name = "get_device", .sig = "no", .new_id_iface = &zwp_primary_selection_device_v1 },
+        .{ .name = "destroy", .sig = "" },
+    },
+};
+
+// ─── relative pointer + constraints (pointer lock) ──────────────
+
+pub const zwp_relative_pointer_manager_v1 = Interface{
+    .name = "zwp_relative_pointer_manager_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "get_relative_pointer", .sig = "no", .new_id_iface = &zwp_relative_pointer_v1 },
+    },
+};
+
+pub const zwp_relative_pointer_v1 = Interface{
+    .name = "zwp_relative_pointer_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "relative_motion", .sig = "uuffff" },
+    },
+};
+
+pub const zwp_pointer_constraints_v1 = Interface{
+    .name = "zwp_pointer_constraints_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "lock_pointer", .sig = "noo?ou", .new_id_iface = &zwp_locked_pointer_v1 },
+        .{ .name = "confine_pointer", .sig = "noo?ou", .new_id_iface = &zwp_confined_pointer_v1 },
+    },
+};
+
+pub const zwp_locked_pointer_v1 = Interface{
+    .name = "zwp_locked_pointer_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "set_cursor_position_hint", .sig = "ff" },
+        .{ .name = "set_region", .sig = "?o" },
+    },
+    .events = &.{
+        .{ .name = "locked", .sig = "" },
+        .{ .name = "unlocked", .sig = "" },
+    },
+};
+
+pub const zwp_confined_pointer_v1 = Interface{
+    .name = "zwp_confined_pointer_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "set_region", .sig = "?o" },
+    },
+    .events = &.{
+        .{ .name = "confined", .sig = "" },
+        .{ .name = "unconfined", .sig = "" },
+    },
+};
+
+// ─── text-input v3 (IME) ────────────────────────────────────────
+
+pub const zwp_text_input_manager_v3 = Interface{
+    .name = "zwp_text_input_manager_v3",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "get_text_input", .sig = "no", .new_id_iface = &zwp_text_input_v3 },
+    },
+};
+
+pub const zwp_text_input_v3 = Interface{
+    .name = "zwp_text_input_v3",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "enable", .sig = "" },
+        .{ .name = "disable", .sig = "" },
+        .{ .name = "set_surrounding_text", .sig = "sii" },
+        .{ .name = "set_text_change_cause", .sig = "u" },
+        .{ .name = "set_content_type", .sig = "uu" },
+        .{ .name = "set_cursor_rectangle", .sig = "iiii" },
+        .{ .name = "commit", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "enter", .sig = "o" },
+        .{ .name = "leave", .sig = "o" },
+        .{ .name = "preedit_string", .sig = "?sii" },
+        .{ .name = "commit_string", .sig = "?s" },
+        .{ .name = "delete_surrounding_text", .sig = "uu" },
+        .{ .name = "done", .sig = "u" },
+    },
+};
+
+// ─── xdg-activation (focus/raise tokens) ────────────────────────
+
+pub const xdg_activation_v1 = Interface{
+    .name = "xdg_activation_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "get_activation_token", .sig = "n", .new_id_iface = &xdg_activation_token_v1 },
+        .{ .name = "activate", .sig = "so" },
+    },
+};
+
+pub const xdg_activation_token_v1 = Interface{
+    .name = "xdg_activation_token_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "set_serial", .sig = "uo" },
+        .{ .name = "set_app_id", .sig = "s" },
+        .{ .name = "set_surface", .sig = "o" },
+        .{ .name = "commit", .sig = "" },
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "done", .sig = "s" },
+    },
+};
+
+// ─── presentation-time ──────────────────────────────────────────
+
+pub const wp_presentation = Interface{
+    .name = "wp_presentation",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "feedback", .sig = "on", .new_id_iface = &wp_presentation_feedback },
+    },
+    .events = &.{
+        .{ .name = "clock_id", .sig = "u" },
+    },
+};
+
+pub const wp_presentation_feedback = Interface{
+    .name = "wp_presentation_feedback",
+    .version = 1,
+    .events = &.{
+        .{ .name = "sync_output", .sig = "o" },
+        .{ .name = "presented", .sig = "uuuuuuu" },
+        .{ .name = "discarded", .sig = "" },
+    },
+};
+
+// ─── idle-inhibit (accepted, inert) ─────────────────────────────
+
+pub const zwp_idle_inhibit_manager_v1 = Interface{
+    .name = "zwp_idle_inhibit_manager_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "create_inhibitor", .sig = "no", .new_id_iface = &zwp_idle_inhibitor_v1 },
+    },
+};
+
+pub const zwp_idle_inhibitor_v1 = Interface{
+    .name = "zwp_idle_inhibitor_v1",
+    .version = 1,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+    },
+};
+
+// ─── pointer gestures (accepted, inert — no gestures detected) ──
+
+pub const zwp_pointer_gestures_v1 = Interface{
+    .name = "zwp_pointer_gestures_v1",
+    .version = 3,
+    .requests = &.{
+        .{ .name = "get_swipe_gesture", .sig = "no", .new_id_iface = &zwp_pointer_gesture_swipe_v1 },
+        .{ .name = "get_pinch_gesture", .sig = "no", .new_id_iface = &zwp_pointer_gesture_pinch_v1 },
+        .{ .name = "release", .sig = "", .since = 2 },
+        .{ .name = "get_hold_gesture", .sig = "no", .since = 3, .new_id_iface = &zwp_pointer_gesture_hold_v1 },
+    },
+};
+
+pub const zwp_pointer_gesture_swipe_v1 = Interface{
+    .name = "zwp_pointer_gesture_swipe_v1",
+    .version = 2,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "begin", .sig = "uuou" },
+        .{ .name = "update", .sig = "uff" },
+        .{ .name = "end", .sig = "uui" },
+    },
+};
+
+pub const zwp_pointer_gesture_pinch_v1 = Interface{
+    .name = "zwp_pointer_gesture_pinch_v1",
+    .version = 2,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "begin", .sig = "uuou" },
+        .{ .name = "update", .sig = "uffff" },
+        .{ .name = "end", .sig = "uui" },
+    },
+};
+
+pub const zwp_pointer_gesture_hold_v1 = Interface{
+    .name = "zwp_pointer_gesture_hold_v1",
+    .version = 3,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "begin", .sig = "uuou" },
+        .{ .name = "end", .sig = "uui" },
+    },
+};
+
 // ─── xdg-shell ──────────────────────────────────────────────────
 
 pub const xdg_wm_base = Interface{
@@ -600,6 +868,17 @@ pub const all = [_]*const Interface{
     &wp_viewporter,  &wp_viewport,    &wp_fractional_scale_manager_v1,
     &wp_fractional_scale_v1,            &zxdg_decoration_manager_v1,
     &zxdg_toplevel_decoration_v1,
+    &zwp_primary_selection_device_manager_v1, &zwp_primary_selection_device_v1,
+    &zwp_primary_selection_source_v1,   &zwp_primary_selection_offer_v1,
+    &zwp_relative_pointer_manager_v1,   &zwp_relative_pointer_v1,
+    &zwp_pointer_constraints_v1,        &zwp_locked_pointer_v1,
+    &zwp_confined_pointer_v1,           &zwp_text_input_manager_v3,
+    &zwp_text_input_v3,                 &xdg_activation_v1,
+    &xdg_activation_token_v1,           &wp_presentation,
+    &wp_presentation_feedback,          &zwp_idle_inhibit_manager_v1,
+    &zwp_idle_inhibitor_v1,             &zwp_pointer_gestures_v1,
+    &zwp_pointer_gesture_swipe_v1,      &zwp_pointer_gesture_pinch_v1,
+    &zwp_pointer_gesture_hold_v1,
 };
 
 // ─── tests ──────────────────────────────────────────────────────
@@ -626,13 +905,15 @@ test "every 'n' signature names its interface (except registry.bind)" {
             if (iface == &wl_registry) continue;
             try t.expectEqual(has_n, msg.new_id_iface != null);
         }
-        // data_offer (wl_data_device + the wlr-data-control device)
-        // is the only server-created object; every other event
-        // creates nothing.
+        // data_offer (the three selection device families) is the
+        // only server-created object; every other event creates
+        // nothing.
         for (iface.events) |*msg| {
             const has_n = std.mem.indexOfScalar(u8, msg.sig, 'n') != null;
             try t.expectEqual(has_n, msg.new_id_iface != null);
-            if (has_n) try t.expect(iface == &wl_data_device or iface == &zwlr_data_control_device_v1);
+            if (has_n) try t.expect(iface == &wl_data_device or
+                iface == &zwlr_data_control_device_v1 or
+                iface == &zwp_primary_selection_device_v1);
         }
     }
 }
