@@ -9,7 +9,7 @@
 
 pkgname=sketerm-git
 _pkgname=sketerm
-pkgver=0.1.0.r847.g386a354
+pkgver=0.1.0.r902.g3a61082
 pkgrel=1
 pkgdesc='Native GTK4 terminal emulator written in Zig'
 arch=('x86_64')
@@ -24,6 +24,8 @@ depends=(
     'fribidi'
     'fontconfig'
     'libvpx'  # VP9/WebM app-window recording (GUI only)
+    'libpulse' # remote-audio playback (GUI links libpulse + glib mainloop)
+    'opus'     # remote-audio Opus compression (-Daudio-opus builds)
 )
 makedepends=(
     'zig'
@@ -53,13 +55,16 @@ pkgver() {
 
 build() {
     cd "$(_srcroot)"
-    zig build -Doptimize=ReleaseFast
+    # -Daudio-opus: Opus-compressed remote audio for the GUI + native
+    # daemon. The portable daemon stays codec-free by design (raw PCM;
+    # both ends negotiate, so mixed deployments just fall back).
+    zig build -Doptimize=ReleaseFast -Daudio-opus
     zig build mux-portable -Doptimize=ReleaseFast
 }
 
 check() {
     cd "$(_srcroot)"
-    zig build test
+    zig build test -Daudio-opus
 }
 
 package() {
