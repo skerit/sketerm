@@ -17,6 +17,7 @@
 //! type-tagged values); anything else = PCM for that stream.
 
 const std = @import("std");
+const opuscodec = @import("opuscodec.zig");
 
 pub const Error = error{ Protocol, OutOfMemory };
 
@@ -89,10 +90,16 @@ pub const UnitTag = enum(u8) {
     /// u32 stream, u64 usec of local sink latency. Viewer → daemon;
     /// folded into GET_PLAYBACK_LATENCY answers (lip-sync).
     latency = 17,
-    /// Empty payload, viewer → daemon: "I drain audio units". PCM
-    /// only flows to subscribed viewers — a terminal-only client
-    /// that ignores audio must never be flooded into its output cap.
+    /// Viewer → daemon: "I drain audio units". PCM only flows to
+    /// subscribed viewers — a terminal-only client that ignores
+    /// audio must never be flooded into its output cap. Optional
+    /// flags byte: bit0 = "I decode Opus" (pcm_opus units OK).
     subscribe = 18,
+    /// u32 stream, u32 raw byte count, one 20 ms Opus packet.
+    /// Daemon → viewer (-Daudio-opus, negotiated via subscribe
+    /// flags). raw_len lets a non-decoding consumer keep the
+    /// consumed-bytes clock without touching libopus.
+    pcm_opus = 19,
     _,
 };
 
@@ -320,6 +327,19 @@ pub const Stream = struct {
     /// server self-clocks — a viewer that ignores audio units
     /// (terminal-only MCP clients) must never stall the app.
     viewer_clocked: bool = false,
+    /// Opus decision made (latched at first data, sticky).
+    opus_latched: bool = false,
+    /// Live encoder (-Daudio-opus + subscriber wants it + s16 in
+    /// the 48 kHz family). null = ship raw pcm units.
+    opus_enc: ?opuscodec.Encoder = null,
+    /// Partial 20 ms frame awaiting more samples.
+    fbuf: std.ArrayList(u8) = .empty,
+
+    fn deinitOwned(self: *Stream, a: std.mem.Allocator) void {
+        if (self.opus_enc) |*e| e.deinit();
+        self.opus_enc = null;
+        self.fbuf.deinit(a);
+    }
 };
 
 pub const Server = struct {
@@ -337,6 +357,9 @@ pub const Server = struct {
     /// Any proto>=5 viewer attached (the daemon updates this each
     /// read round). false resets every stream to self-clocking.
     has_viewer: bool = false,
+    /// A subscribed viewer advertised Opus decode (daemon-set).
+    /// Latched per stream at first data.
+    opus_wanted: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Server {
         return .{ .allocator = allocator };
@@ -346,6 +369,8 @@ pub const Server = struct {
         self.inbuf.deinit(self.allocator);
         self.out.deinit(self.allocator);
         self.units.deinit(self.allocator);
+        var it = self.streams.valueIterator();
+        while (it.next()) |st| st.deinitOwned(self.allocator);
         self.streams.deinit(self.allocator);
     }
 
@@ -416,9 +441,8 @@ pub const Server = struct {
 
     // ── frame handling ───────────────────────────────────────────
 
-    fn pcm(self: *Server, channel: u32, payload: []const u8) Error!void {
-        const s = self.streams.getPtr(channel) orelse return; // stale stream: drop
-        s.write_index +|= payload.len;
+    fn rawPcmUnit(self: *Server, channel: u32, payload: []const u8) Error!void {
+        if (payload.len == 0) return;
         var pl: std.ArrayList(u8) = .empty;
         defer pl.deinit(self.allocator);
         var idb: [4]u8 = undefined;
@@ -426,6 +450,55 @@ pub const Server = struct {
         try pl.appendSlice(self.allocator, &idb);
         try pl.appendSlice(self.allocator, payload);
         try appendUnit(&self.units, self.allocator, .pcm, pl.items);
+    }
+
+    fn pcm(self: *Server, channel: u32, payload: []const u8) Error!void {
+        const s = self.streams.getPtr(channel) orelse return; // stale stream: drop
+        s.write_index +|= payload.len;
+        // Opus decision is sticky per stream, made at first data:
+        // -Daudio-opus built, a subscriber decodes it, and the spec
+        // is s16 in the 48 kHz family (44.1 k stays raw — Opus
+        // doesn't eat it and we don't resample).
+        if (!s.opus_latched) {
+            s.opus_latched = true;
+            if (opuscodec.enabled and self.opus_wanted and s.format == 3)
+                s.opus_enc = opuscodec.Encoder.init(s.rate, s.channels);
+            if (std.c.getenv("SKETERM_PA_DEBUG") != null)
+                std.debug.print("pulse: stream {d} latched {s} ({d} Hz, {d} ch)\n", .{ channel, if (s.opus_enc != null) "OPUS" else "raw", s.rate, s.channels });
+        }
+        if (s.opus_enc) |*enc| {
+            try s.fbuf.appendSlice(self.allocator, payload);
+            const fb = enc.frameBytes();
+            var off: usize = 0;
+            var packet_buf: [opuscodec.MAX_PACKET]u8 = undefined;
+            while (s.fbuf.items.len - off >= fb) : (off += fb) {
+                const frame = s.fbuf.items[off .. off + fb];
+                const packet = enc.encode(frame, &packet_buf) orelse {
+                    // Encoder wedged: fall back to raw from here on.
+                    var e2 = s.opus_enc.?;
+                    e2.deinit();
+                    s.opus_enc = null;
+                    try self.rawPcmUnit(channel, s.fbuf.items[off..]);
+                    off = s.fbuf.items.len;
+                    break;
+                };
+                var pl: std.ArrayList(u8) = .empty;
+                defer pl.deinit(self.allocator);
+                var hdr: [8]u8 = undefined;
+                std.mem.writeInt(u32, hdr[0..4], channel, .little);
+                std.mem.writeInt(u32, hdr[4..8], @intCast(fb), .little);
+                try pl.appendSlice(self.allocator, &hdr);
+                try pl.appendSlice(self.allocator, packet);
+                try appendUnit(&self.units, self.allocator, .pcm_opus, pl.items);
+            }
+            if (off > 0) {
+                const rem = s.fbuf.items.len - off;
+                std.mem.copyForwards(u8, s.fbuf.items[0..rem], s.fbuf.items[off..]);
+                s.fbuf.shrinkRetainingCapacity(rem);
+            }
+        } else {
+            try self.rawPcmUnit(channel, payload);
+        }
         if (!self.has_viewer) s.viewer_clocked = false;
         if (!s.viewer_clocked) {
             // Self-clock: pretend instant playback so the app never
@@ -500,7 +573,9 @@ pub const Server = struct {
             CMD_CREATE_PLAYBACK_STREAM => try self.createPlayback(&r, tag),
             CMD_DELETE_PLAYBACK_STREAM => {
                 const idx = try r.u32be();
-                if (self.streams.remove(idx)) {
+                if (self.streams.fetchRemove(idx)) |kv| {
+                    var st = kv.value;
+                    st.deinitOwned(self.allocator);
                     var idb: [4]u8 = undefined;
                     std.mem.writeInt(u32, &idb, idx, .little);
                     try appendUnit(&self.units, self.allocator, .close, &idb);

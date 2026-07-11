@@ -6927,3 +6927,28 @@ tests); all builds + smoke-mux/mcp PASS. Debugging note: every
 racing (MCP teardown killing sessions when stdin ended) — the
 timestamped kill trace (handleKill via addr2line on an unstripped
 daemon) was what finally proved the audio path innocent.
+
+## Opus compression for remote audio (-Daudio-opus)
+
+`mux/opuscodec.zig` follows the vcodec pattern exactly: optional codec
+behind a build flag (default off — the stock daemon stays
+dependency-free, mux-portable pinned off), libopus declared via
+extern fn (no headers), every impl collapsing to void without the
+flag. Negotiation rides the subscribe unit's new flags byte (bit0 =
+"I decode Opus"); the daemon latches per stream at first data: Opus
+only when built + a subscriber decodes it + the spec is s16 in the
+48 kHz family — 44.1 k streams stay raw (Opus can't eat them and we
+don't resample). 20 ms frames at 128 kbit/s ≈ 16 KB/s vs 187 KB/s
+raw (~12x). pcm_opus units carry a raw-byte count so non-decoding
+consumers (appdrive) keep the consumed clock without libopus. The
+GUI decodes lazily per voice; a broken decoder substitutes silence
+at the right byte rate so the remote app never stalls. Encoder
+failure mid-stream falls back to raw.
+
+Verified: opus round-trip unit test against real libopus (skips
+without the flag; both flag states green — 687/692 with, 686/692
+without); full GUI e2e with -Daudio-opus builds: 48 kHz pacat
+latches OPUS and streams the full window through encode → mux wire →
+GUI decode → local playback → consumed clock; 44.1 kHz latches raw
+and still plays. Default builds unchanged, smoke-mux/mcp PASS,
+`ldd`: only the -Daudio-opus daemon links libopus.
