@@ -126,6 +126,10 @@ pub const ChannelKind = enum(u8) {
     /// with no forwardable display protocol — macOS capture agent;
     /// the stub backend tests the pipeline anywhere.
     winstream = 3,
+    /// Remote audio (mux/pulse.zig units): the daemon is the
+    /// session's PulseAudio server; PCM streams toward the viewer,
+    /// consumed/latency reports flow back as the playback clock.
+    audio = 4,
     _,
 };
 

@@ -6885,3 +6885,45 @@ window) remains out of scope.
 684/689 tests (new: full host_drop wire sequence + drop_data answer +
 finish cleanup); builds + smoke-mux/mcp PASS. The GTK drop gesture
 itself is the one untested-live link (needs a real pointer drag).
+
+## Remote audio: the daemon IS the session's PulseAudio server
+
+Same doctrine as Wayland forwarding — no bridge processes. New
+`mux/pulse.zig`: a hand-rolled PulseAudio native-protocol server
+(pure state machine, musl-clean, zero deps daemon-side; layouts
+transcribed from pulsecore/protocol-native.c, negotiated down to
+protocol v13, SHM/memfd refused so PCM rides the socket). Sessions
+that forward apps also get a "pa-N" hub socket + PULSE_SERVER env
+(SKETERM_MUX_NO_AUDIO=1 opts out). Each PA client connection is an
+`audio` channel (wire.zig kind 4) carrying pulse.zig units: open /
+pcm / cork / close down; subscribe / consumed / latency up.
+
+Clocking is the load-bearing design: the app paces itself via PA
+REQUESTs. Streams start SELF-CLOCKED (instant-consume, so headless
+apps and terminal-only viewers never stall); a viewer's first
+`consumed` report flips the stream to VIEWER-CLOCKED — the GUI's
+local pa_stream acceptance becomes the clock, so a remote player
+paces to real speaker output. PCM only flows to viewers that sent
+`subscribe` (flooding a terminal-only client would blow its output
+cap and take the connection down). Viewer-reported sink latency +
+in-flight bytes answer GET_PLAYBACK_LATENCY for lip-sync.
+
+GUI playback: `audio_sink.zig`, async libpulse on the GLib main loop
+(pa_glib_mainloop — no threads, Linux GUI-only deps libpulse +
+libpulse-mainloop-glib; the mux graph links nothing). Context failure
+degrades to silent-consume so remote apps keep running. appdrive
+subscribes and instant-consumes (headless MCP apps play silently).
+Playback only — capture (mic) is deliberately out of scope.
+
+Verified with REAL libpulse clients against the daemon: `pactl info`
+negotiates v13 and round-trips rc=0; `pacat --raw` streams full
+3-second windows (rc=124) in all four environments — monolith
+no-viewer, broker no-viewer, MCP terminal session (self-clock), MCP
+app session (subscribed appdrive clock) — plus the full GUI path
+under Xvfb (durable tab -> daemon hub -> audio channel -> AudioSink
+-> local PipeWire). 686/691 tests (pulse handshake/stream/clock unit
+tests); all builds + smoke-mux/mcp PASS. Debugging note: every
+"failure" after the first protocol fixes was the TEST HARNESS
+racing (MCP teardown killing sessions when stdin ended) — the
+timestamped kill trace (handleKill via addr2line on an unstripped
+daemon) was what finally proved the audio path innocent.

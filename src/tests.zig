@@ -60,6 +60,7 @@ comptime {
     _ = @import("ipc/xkblayout.zig");
     _ = @import("render/bg_pass.zig");
     _ = @import("mux/wire.zig");
+    _ = @import("mux/pulse.zig");
     _ = @import("mux/snapshot.zig");
     _ = @import("mux/desktop.zig");
     _ = @import("mux/icons.zig");

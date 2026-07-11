@@ -62,6 +62,10 @@
 #ifdef __linux__
 #include <sys/eventfd.h> /* Wakeup fast path (pipe fallback elsewhere) */
 #include <pty.h>         /* openpty/forkpty live here on glibc/musl */
+/* Remote-audio playback: async libpulse on the GLib main loop
+ * (audio_sink.zig). GUI-only — never in the mux graph. */
+#include <pulse/pulseaudio.h>
+#include <pulse/glib-mainloop.h>
 #else
 #include <util.h>        /* macOS: openpty/forkpty */
 #include <sys/random.h>  /* macOS: getentropy lives here */
