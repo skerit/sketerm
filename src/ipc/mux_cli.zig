@@ -45,6 +45,9 @@ const MUX_HELP =
     \\  search <pattern>                   case-insensitive substring
     \\      search across every session's scrollback + screen; prints
     \\      "name:-N: line" (N = lines up from the bottom)
+    \\  forward <local[:remote]>           tunnel 127.0.0.1:<local> to
+    \\      127.0.0.1:<remote> on the daemon's host over the mux
+    \\      connection (SSH/UDP transports included); runs until killed
     \\
     \\`sketerm ssh <host>` = `sketerm mux <host> new` — open a
     \\remote shell that survives disconnects (key auth required).
@@ -97,7 +100,7 @@ pub const Welcome = struct {
 };
 
 fn isSubcommand(s2: []const u8) bool {
-    const known = [_][]const u8{ "list", "attach", "attach-all", "new", "kill", "rename", "spawn", "send", "get-text", "search" };
+    const known = [_][]const u8{ "list", "attach", "attach-all", "new", "kill", "rename", "spawn", "send", "get-text", "search", "forward" };
     for (known) |k| {
         if (std.mem.eql(u8, s2, k)) return true;
     }
@@ -186,6 +189,9 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
     }
     if (std.mem.eql(u8, cmd, "search") and args.len >= 2) {
         return muxSearch(allocator, host, args[1]);
+    }
+    if (std.mem.eql(u8, cmd, "forward") and args.len >= 2) {
+        return muxForward(allocator, host, args[1]);
     }
     _ = c.fputs(MUX_HELP, platform.stdout());
     return 2;
@@ -376,6 +382,157 @@ fn muxGetText(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8,
     _ = c.fwrite(text.ptr, 1, text.len, platform.stdout());
     if (text.len == 0 or text[text.len - 1] != '\n') _ = c.fputc('\n', platform.stdout());
     return 0;
+}
+
+/// `sketerm mux [host] forward <local[:remote]>` — bind
+/// 127.0.0.1:<local> here and tunnel every accepted connection to
+/// 127.0.0.1:<remote> on the daemon's host over the mux connection
+/// (so it rides SSH/UDP transports unchanged). Runs until killed.
+fn muxForward(allocator: std.mem.Allocator, host: ?[]const u8, spec: []const u8) u8 {
+    var local: u16 = 0;
+    var remote: u16 = 0;
+    if (std.mem.indexOfScalar(u8, spec, ':')) |colon| {
+        local = std.fmt.parseInt(u16, spec[0..colon], 10) catch 0;
+        remote = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch 0;
+    } else {
+        local = std.fmt.parseInt(u16, spec, 10) catch 0;
+        remote = local;
+    }
+    if (local == 0 or remote == 0) {
+        _ = c.fprintf(platform.stderr(), "sketerm mux forward: bad port spec '%.*s' (want <local[:remote]>)\n", @as(c_int, @intCast(spec.len)), spec.ptr);
+        return 2;
+    }
+
+    var conn = muxConnect(allocator, host) orelse return 1;
+    defer conn.deinit();
+
+    const lfd = platform.socketCloexec(c.AF_INET, c.SOCK_STREAM, 0);
+    if (lfd < 0) return 1;
+    defer _ = c.close(lfd);
+    var one: c_int = 1;
+    _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
+    var sa = std.mem.zeroes(c.struct_sockaddr_in);
+    sa.sin_family = c.AF_INET;
+    sa.sin_port = std.mem.nativeToBig(u16, local);
+    sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
+    if (c.bind(lfd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or c.listen(lfd, 16) != 0) {
+        _ = c.fprintf(platform.stderr(), "sketerm mux forward: bind 127.0.0.1:%u failed (port in use?)\n", @as(c_uint, local));
+        return 1;
+    }
+    _ = c.printf("forwarding 127.0.0.1:%u -> remote 127.0.0.1:%u (Ctrl+C stops)\n", @as(c_uint, local), @as(c_uint, remote));
+
+    const MAXC = 64;
+    const Fwd = struct { id: u32 = 0, fd: c_int = -1 };
+    var fwds = [_]Fwd{.{}} ** MAXC;
+    // Accepted fds whose chan_open hasn't arrived yet; the daemon
+    // answers forward_opens in order, so a FIFO correlates them.
+    var pending = [_]c_int{-1} ** MAXC;
+    var pending_n: usize = 0;
+
+    while (true) {
+        var fds: [2 + MAXC]c.struct_pollfd = undefined;
+        fds[0] = .{ .fd = conn.fd, .events = c.POLLIN, .revents = 0 };
+        fds[1] = .{ .fd = lfd, .events = c.POLLIN, .revents = 0 };
+        for (fwds, 0..) |fw, i| fds[2 + i] = .{ .fd = fw.fd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&fds, fds.len, -1) < 0) return 1;
+
+        if (fds[1].revents & c.POLLIN != 0) {
+            const afd = c.accept(lfd, null, null);
+            if (afd >= 0) {
+                var free_slots: usize = 0;
+                for (fwds) |fw| {
+                    if (fw.fd == -1) free_slots += 1;
+                }
+                if (pending_n >= MAXC or free_slots <= pending_n) {
+                    _ = c.close(afd);
+                } else if (conn.sendJson(.forward_open, .{ .port = remote })) |_| {
+                    pending[pending_n] = afd;
+                    pending_n += 1;
+                } else |_| {
+                    _ = c.close(afd);
+                    _ = c.fprintf(platform.stderr(), "sketerm mux forward: connection lost\n");
+                    return 1;
+                }
+            }
+        }
+
+        if (fds[0].revents & (c.POLLIN | c.POLLHUP) != 0) {
+            const f = conn.recvFrame() catch {
+                _ = c.fprintf(platform.stderr(), "sketerm mux forward: connection lost\n");
+                return 1;
+            };
+            defer f.deinit(allocator);
+            switch (f.ftype) {
+                .chan_open => blk: {
+                    const open = mux_wire.decodeChanOpen(f.payload) orelse break :blk;
+                    if (open.kind != .tcp_forward) break :blk;
+                    if (pending_n == 0) break :blk;
+                    const afd = pending[0];
+                    std.mem.copyForwards(c_int, pending[0 .. pending_n - 1], pending[1..pending_n]);
+                    pending_n -= 1;
+                    for (&fwds) |*fw| {
+                        if (fw.fd == -1) {
+                            fw.* = .{ .id = open.id, .fd = afd };
+                            break;
+                        }
+                    }
+                },
+                .chan_data => blk: {
+                    if (f.payload.len < 4) break :blk;
+                    const id = mux_wire.decodeChanId(f.payload) orelse break :blk;
+                    for (&fwds) |*fw| {
+                        if (fw.fd != -1 and fw.id == id) {
+                            var off: usize = 4;
+                            while (off < f.payload.len) {
+                                const n = c.write(fw.fd, f.payload.ptr + off, f.payload.len - off);
+                                if (n <= 0) break;
+                                off += @intCast(n);
+                            }
+                            break;
+                        }
+                    }
+                },
+                .chan_close => blk: {
+                    const id = mux_wire.decodeChanId(f.payload) orelse break :blk;
+                    for (&fwds) |*fw| {
+                        if (fw.fd != -1 and fw.id == id) {
+                            _ = c.close(fw.fd);
+                            fw.* = .{};
+                            break;
+                        }
+                    }
+                },
+                .err => {
+                    // A refused forward_open: drop the oldest waiter.
+                    if (pending_n > 0) {
+                        _ = c.close(pending[0]);
+                        std.mem.copyForwards(c_int, pending[0 .. pending_n - 1], pending[1..pending_n]);
+                        pending_n -= 1;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        for (&fwds, 0..) |*fw, i| {
+            if (fw.fd == -1) continue;
+            if (fds[2 + i].revents & (c.POLLIN | c.POLLHUP) == 0) continue;
+            var buf: [4 + 32768]u8 = undefined;
+            const n = c.read(fw.fd, buf[4..].ptr, buf.len - 4);
+            if (n <= 0) {
+                var hdr: [4]u8 = undefined;
+                conn.sendFrame(.chan_close, mux_wire.putChanHeader(&hdr, fw.id)) catch {};
+                _ = c.close(fw.fd);
+                fw.* = .{};
+                continue;
+            }
+            std.mem.writeInt(u32, buf[0..4], fw.id, .little);
+            conn.sendFrame(.chan_data, buf[0 .. 4 + @as(usize, @intCast(n))]) catch {
+                _ = c.fprintf(platform.stderr(), "sketerm mux forward: connection lost\n");
+                return 1;
+            };
+        }
+    }
 }
 
 /// One search hit as the daemon reports it.

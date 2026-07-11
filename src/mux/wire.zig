@@ -85,6 +85,11 @@ pub const FrameType = enum(u8) {
     /// `search_hits`. Attach-scoped so it reaches the worker that
     /// owns the Screen in broker mode.
     search = 20,
+    /// Open a TCP forward: JSON { port } — the daemon connects to
+    /// 127.0.0.1:port ON ITS HOST and answers with a `chan_open`
+    /// (kind tcp_forward) owned by the requesting client; raw bytes
+    /// then flow as chan_data both ways. No attach required.
+    forward_open = 21,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -139,6 +144,9 @@ pub const ChannelKind = enum(u8) {
     /// session's PulseAudio server; PCM streams toward the viewer,
     /// consumed/latency reports flow back as the playback clock.
     audio = 4,
+    /// Raw TCP forward (answering `forward_open`): chan_data carries
+    /// unframed socket bytes; 1:1 with the requesting client.
+    tcp_forward = 5,
     _,
 };
 

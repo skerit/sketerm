@@ -399,9 +399,13 @@ const Channel = struct {
     allocator: std.mem.Allocator,
     id: u32,
     fd: c_int,
-    session: *Session,
-    /// Winstream only; null on native channels (broadcast).
+    /// Null on a TCP-forward channel (daemon-host scoped, no session).
+    session: ?*Session,
+    /// Winstream/tcp only; null on native channels (broadcast).
     client: ?*Client,
+    /// Raw TCP forward (kind tcp_forward): chan_data is unframed
+    /// socket bytes, strictly 1:1 with `client`.
+    tcp: bool = false,
     /// Bytes from the client not yet written to fd (partial writes).
     pending: std.ArrayList(u8) = .empty,
     dead: bool = false,
@@ -1416,6 +1420,7 @@ pub const Daemon = struct {
             .app_a11y => self.handleAppA11y(cl, frame.payload),
             .rec_start => self.handleRecStart(cl, frame.payload),
             .search => self.handleSearch(cl, frame.payload),
+            .forward_open => self.handleForward(cl, frame.payload),
             .rec_stop => {
                 const s = cl.attached orelse {
                     cl.queueErr("not attached");
@@ -1433,15 +1438,26 @@ pub const Daemon = struct {
                 if (ch.dead) return;
                 if (ch.native != null) {
                     // Any attached viewer may drive input (shared seat).
-                    if (!nativeViewer(cl, ch.session)) return;
+                    if (!nativeViewer(cl, ch.session.?)) return;
                     return self.nativeClientData(ch, frame.payload[4..]);
                 }
                 if (ch.pa != null) {
-                    if (!nativeViewer(cl, ch.session)) return;
+                    if (!nativeViewer(cl, ch.session.?)) return;
                     return self.paClientData(cl, ch, frame.payload[4..]);
                 }
                 if (ch.client != cl) return;
-                if (ch.session.winstream) |ws| {
+                if (ch.tcp) {
+                    // Raw bytes toward the forward target; the
+                    // writable path drains `pending` (EAGAIN-safe).
+                    ch.pending.appendSlice(self.allocator, frame.payload[4..]) catch {
+                        self.closeChannel(ch, true);
+                        return;
+                    };
+                    self.channelWritable(ch);
+                    return;
+                }
+                const chs = ch.session orelse return;
+                if (chs.winstream) |ws| {
                     var pos: usize = 0;
                     const bytes = frame.payload[4..];
                     while (wsproto.peelUnit(bytes[pos..]) catch null) |p| {
@@ -2109,7 +2125,7 @@ pub const Daemon = struct {
         srv.has_viewer = false;
         srv.opus_wanted = false;
         for (self.clients.items) |cl| {
-            if (!nativeViewer(cl, ch.session)) continue;
+            if (!nativeViewer(cl, ch.session.?)) continue;
             srv.has_viewer = true;
             if (cl.audio_ok and cl.audio_opus) srv.opus_wanted = true;
         }
@@ -2208,7 +2224,7 @@ pub const Daemon = struct {
     fn refreshVideoGates(self: *Daemon) void {
         for (self.channels.items) |ch| {
             if (ch.dead) continue;
-            if (ch.native) |nv| nv.wants_video = self.videoOk(ch.session);
+            if (ch.native) |nv| nv.wants_video = self.videoOk(ch.session.?);
         }
     }
 
@@ -2289,6 +2305,15 @@ pub const Daemon = struct {
     fn channelReadable(self: *Daemon, ch: *Channel) void {
         if (ch.native != null) self.nativeReadable(ch);
         if (ch.pa != null) self.paReadable(ch);
+        if (ch.tcp) {
+            var buf: [64 << 10]u8 = undefined;
+            const n = c.read(ch.fd, &buf, buf.len);
+            if (n <= 0) {
+                if (n == 0 or std.posix.errno(n) != .AGAIN) self.closeChannel(ch, true);
+                return;
+            }
+            self.queueUnits(ch, buf[0..@intCast(n)]);
+        }
     }
 
     fn channelWritable(self: *Daemon, ch: *Channel) void {
@@ -2614,14 +2639,14 @@ pub const Daemon = struct {
     fn queueUnits(self: *Daemon, ch: *Channel, bytes: []const u8) void {
         if (ch.native != null) {
             for (self.clients.items) |cl| {
-                if (nativeViewer(cl, ch.session)) self.queueUnitsTo(cl, ch, bytes);
+                if (nativeViewer(cl, ch.session.?)) self.queueUnitsTo(cl, ch, bytes);
             }
         } else if (ch.pa != null) {
             // PCM only flows to viewers that SUBSCRIBED — flooding a
             // terminal-only client would blow its output cap and take
             // the whole connection down.
             for (self.clients.items) |cl| {
-                if (nativeViewer(cl, ch.session) and cl.audio_ok) self.queueUnitsTo(cl, ch, bytes);
+                if (nativeViewer(cl, ch.session.?) and cl.audio_ok) self.queueUnitsTo(cl, ch, bytes);
             }
         } else if (ch.client) |cl| {
             if (!cl.dead) self.queueUnitsTo(cl, ch, bytes);
@@ -2910,7 +2935,7 @@ pub const Daemon = struct {
         const frame = wire.putChanHeader(&hdr, ch.id);
         if (ch.native != null or ch.pa != null) {
             for (self.clients.items) |cl| {
-                if (nativeViewer(cl, ch.session)) cl.queueFrame(.chan_close, frame);
+                if (nativeViewer(cl, ch.session.?)) cl.queueFrame(.chan_close, frame);
             }
         } else if (ch.client) |cl| {
             if (!cl.dead) cl.queueFrame(.chan_close, frame);
@@ -3715,7 +3740,8 @@ pub const Daemon = struct {
         const now_ms: u64 = @intCast(ts.tv_sec * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));
         for (self.channels.items) |ch| {
             if (ch.dead or ch.native != null) continue;
-            const ws = ch.session.winstream orelse continue;
+            const chs = ch.session orelse continue;
+            const ws = chs.winstream orelse continue;
             const cl = ch.client orelse continue;
             if (cl.dead) continue;
             // Backpressure: a slow link must not balloon the client
@@ -3794,6 +3820,67 @@ pub const Daemon = struct {
             }) catch return;
         }
         cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = build_options.audio_opus, .video = build_options.video, .sessions = infos.items });
+    }
+
+    const ForwardReq = struct { port: u16 };
+
+    /// TCP forward toward 127.0.0.1:<port> on THIS host. Loopback
+    /// only (same trust boundary as the shell the socket already
+    /// grants); nonblocking connect — a refused port surfaces as
+    /// POLLERR → chan_close, exactly like a mid-stream drop.
+    fn handleForward(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(ForwardReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad forward request");
+            return;
+        };
+        defer parsed.deinit();
+        const port = parsed.value.port;
+        if (port == 0) {
+            cl.queueErr("bad forward port");
+            return;
+        }
+
+        const fd = @import("../util/platform.zig").socketCloexec(c.AF_INET, c.SOCK_STREAM, 0);
+        if (fd < 0) {
+            cl.queueErr("forward: socket failed");
+            return;
+        }
+        const fl = c.fcntl(fd, c.F_GETFL);
+        _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+        var sa = std.mem.zeroes(c.struct_sockaddr_in);
+        sa.sin_family = c.AF_INET;
+        sa.sin_port = std.mem.nativeToBig(u16, port);
+        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
+        const r = c.connect(fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in));
+        if (r != 0 and std.posix.errno(r) != .INPROGRESS) {
+            _ = c.close(fd);
+            cl.queueErr("forward: connect failed");
+            return;
+        }
+
+        const ch = self.allocator.create(Channel) catch {
+            _ = c.close(fd);
+            cl.queueErr("forward: out of memory");
+            return;
+        };
+        ch.* = .{
+            .allocator = self.allocator,
+            .id = self.next_chan_id,
+            .fd = fd,
+            .session = null,
+            .client = cl,
+            .tcp = true,
+        };
+        self.next_chan_id += 1;
+        self.channels.append(self.allocator, ch) catch {
+            ch.deinit();
+            cl.queueErr("forward: out of memory");
+            return;
+        };
+        var ob: [5]u8 = undefined;
+        cl.queueFrame(.chan_open, wire.encodeChanOpen(&ob, ch.id, .tcp_forward));
     }
 
     const SearchReq = struct { pattern: []const u8, max: u32 = 50 };
@@ -4061,6 +4148,11 @@ pub const Daemon = struct {
         while (i < self.clients.items.len) {
             const cl = self.clients.items[i];
             if (cl.dead) {
+                // A dying client's TCP forwards die with it (native
+                // and audio channels are session-owned and survive).
+                for (self.channels.items) |ch| {
+                    if (ch.tcp and ch.client == cl) ch.dead = true;
+                }
                 const was = cl.attached;
                 _ = self.clients.swapRemove(i);
                 cl.deinit();
