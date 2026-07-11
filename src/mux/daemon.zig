@@ -424,9 +424,11 @@ const Native = struct {
     /// Early arrival is fine — libwayland queues fds until the
     /// consuming message shows up; late is the only fatal order.
     out_fds: std.ArrayList(c_int) = .empty,
-    /// Paste: write-ends from wl_data_offer.receive, FIFO-paired
-    /// with clip_data units coming from the GUI.
-    clip_paste_fds: std.ArrayList(c_int) = .empty,
+    /// Paste: write-ends from wl_data_offer.receive, tagged with the
+    /// offer id. GUI clip_data answers consume front-of-queue (FIFO);
+    /// dnd_send / drop_data consume BY OFFER so a dnd transfer can't
+    /// steal the fd of a clipboard paste awaiting its async answer.
+    clip_paste_fds: std.ArrayList(PasteFd) = .empty,
     /// PRIMARY-selection paste fds, FIFO-paired with primary_data
     /// units (separate queue so interleaved pastes can't swap).
     primary_paste_fds: std.ArrayList(c_int) = .empty,
@@ -480,6 +482,11 @@ const Native = struct {
         buf: std.ArrayList(u8) = .empty,
     };
 
+    const PasteFd = struct {
+        offer: u32,
+        fd: c_int,
+    };
+
     const PoolMirror = struct {
         fd: c_int,
         ptr: [*]u8,
@@ -499,7 +506,7 @@ const Native = struct {
         self.fds.deinit(self.allocator);
         for (self.out_fds.items) |fd| _ = c.close(fd);
         self.out_fds.deinit(self.allocator);
-        for (self.clip_paste_fds.items) |fd| _ = c.close(fd);
+        for (self.clip_paste_fds.items) |p| _ = c.close(p.fd);
         self.clip_paste_fds.deinit(self.allocator);
         for (self.primary_paste_fds.items) |fd| _ = c.close(fd);
         self.primary_paste_fds.deinit(self.allocator);
@@ -2324,12 +2331,12 @@ pub const Daemon = struct {
         const a = self.allocator;
         switch (action) {
             .relay, .buffer_create, .buffer_destroy => try wlpipe.appendUnit(units, a, .wl_msg, msgb),
-            .clip_receive => {
-                // App wants to paste: hold the write-end until the
-                // GUI ships clip_data; relay so the GUI knows the
-                // mime asked for.
+            .clip_receive => |cr| {
+                // App wants to paste: hold the write-end (tagged with
+                // the offer id) until the GUI ships clip_data — or a
+                // dnd transfer claims it by offer.
                 const fd = nv.popFd() orelse return error.MissingFd;
-                nv.clip_paste_fds.append(a, fd) catch {
+                nv.clip_paste_fds.append(a, .{ .offer = cr.offer, .fd = fd }) catch {
                     _ = c.close(fd);
                     return error.MissingFd;
                 };
@@ -2524,7 +2531,7 @@ pub const Daemon = struct {
                 return;
             } orelse break;
             switch (peeled.unit.tag) {
-                .seat_enter, .seat_leave, .seat_motion, .seat_button, .seat_axis, .seat_kbd_enter, .seat_kbd_leave, .seat_key, .seat_mods, .configure, .dismiss_popups, .offer_selection, .offer_primary, .text_commit, .set_scale, .request_close => {
+                .seat_enter, .seat_leave, .seat_motion, .seat_button, .seat_axis, .seat_kbd_enter, .seat_kbd_leave, .seat_key, .seat_mods, .configure, .dismiss_popups, .offer_selection, .offer_primary, .text_commit, .set_scale, .host_drop, .request_close => {
                     nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload);
                 },
                 .clip_send, .clip_data, .primary_data => self.applyAppUnit(ch, peeled.unit.tag, peeled.unit.payload),
@@ -2539,6 +2546,16 @@ pub const Daemon = struct {
         }
         if (!ch.dead) self.flushBrain(ch);
         if (!ch.dead) self.channelWritable(ch);
+    }
+
+    /// Take the held paste-fd for `offer` (falls back to the oldest
+    /// entry — pre-tagging senders). Caller owns the fd.
+    fn takePasteFd(nv: *Native, offer: u32) ?c_int {
+        for (nv.clip_paste_fds.items, 0..) |p, i| {
+            if (p.offer == offer) return nv.clip_paste_fds.orderedRemove(i).fd;
+        }
+        if (nv.clip_paste_fds.items.len == 0) return null;
+        return nv.clip_paste_fds.orderedRemove(0).fd;
     }
 
     /// Apply one unit TOWARD the app socket: brain output (wl_msg
@@ -2648,10 +2665,26 @@ pub const Daemon = struct {
                 .clip_data => {
                     // Paste bytes for the oldest held receive-fd.
                     if (nv.clip_paste_fds.items.len == 0) return;
-                    const fd = nv.clip_paste_fds.orderedRemove(0);
+                    const fd = nv.clip_paste_fds.orderedRemove(0).fd;
                     var written: usize = 0;
                     while (written < payload.len) {
                         const w = c.write(fd, payload.ptr + written, payload.len - written);
+                        if (w <= 0) break;
+                        written += @intCast(w);
+                    }
+                    _ = c.close(fd);
+                },
+                .drop_data => {
+                    // Host-drop transfer: write the payload into the
+                    // fd held FOR THAT OFFER.
+                    const pl = payload;
+                    if (pl.len < 4) return;
+                    const offer = std.mem.readInt(u32, pl[0..4], .little);
+                    const data = pl[4..];
+                    const fd = takePasteFd(nv, offer) orelse return;
+                    var written: usize = 0;
+                    while (written < data.len) {
+                        const w = c.write(fd, data.ptr + written, data.len - written);
                         if (w <= 0) break;
                         written += @intCast(w);
                     }
@@ -2671,14 +2704,14 @@ pub const Daemon = struct {
                 },
                 .dnd_send => {
                     // Within-app dnd transfer: the drop target's
-                    // receive-fd (oldest held) becomes the SOURCE's
-                    // send fd — data never leaves the app's host.
+                    // receive-fd (held, keyed by offer) becomes the
+                    // SOURCE's send fd — data never leaves the host.
                     const pl = payload;
-                    if (pl.len < 4) return;
-                    if (nv.clip_paste_fds.items.len == 0) return;
+                    if (pl.len < 8) return;
                     const source = std.mem.readInt(u32, pl[0..4], .little);
-                    const mime = pl[4..];
-                    const fd = nv.clip_paste_fds.orderedRemove(0);
+                    const offer = std.mem.readInt(u32, pl[4..8], .little);
+                    const mime = pl[8..];
+                    const fd = takePasteFd(nv, offer) orelse return;
                     var mbuf: [256]u8 = undefined;
                     var b = wlwire.Builder.init(&mbuf, source, 1); // wl_data_source.send
                     b.putString(mime);
