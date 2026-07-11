@@ -291,7 +291,12 @@ pub const App = struct {
     /// Returns false when nothing arrived in time (or after exit).
     pub fn pumpOnce(self: *App, wait_ms: i32) bool {
         if (self.exited) return false;
-        if (!pollIn(self.conn.fd, wait_ms)) return false;
+        // Attach-time recvExpect may have buffered frames PAST the
+        // snapshot into conn.rbuf (a small dmabuf replay fits in one
+        // read); those never make the fd readable again — drain the
+        // buffer before polling for new bytes.
+        const buffered = (wire.peelFrame(self.conn.rbuf.items) catch null) != null;
+        if (!buffered and !pollIn(self.conn.fd, wait_ms)) return false;
         const f = self.conn.recvFrame() catch {
             self.exited = true;
             return false;
@@ -361,7 +366,9 @@ pub const App = struct {
                     return;
                 }
                 const ch = self.chans.get(id) orelse return;
-                ch.comp.feed(payload[4..]) catch {};
+                ch.comp.feed(payload[4..]) catch |err| {
+                    std.debug.print("appdrive: replica feed error: {s}\n", .{@errorName(err)});
+                };
                 ch.comp.clearOut(); // replica output is discarded
             },
             .exit => {
