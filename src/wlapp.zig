@@ -1168,9 +1168,18 @@ pub const AppHost = struct {
 
     fn onGone(ctx: ?*anyopaque, surface: u32) void {
         const self = cast.userData(AppHost, ctx);
+        // Purge parent latches BEFORE the window lookup: a toplevel can
+        // die between set_parent and its first frame (no Win yet), and
+        // clients recycle surface ids — a stale entry would re-parent an
+        // unrelated future window. A dying PARENT unsets its children
+        // (value → 0, per xdg-shell semantics; in-place, iteration-safe).
+        _ = self.pending_parents.remove(surface);
+        var pvit = self.pending_parents.valueIterator();
+        while (pvit.next()) |v| {
+            if (v.* == surface) v.* = 0;
+        }
         const win = self.windows.get(surface) orelse return;
         _ = self.windows.remove(surface);
-        _ = self.pending_parents.remove(surface);
         if (win.embedded) {
             // Pull the overlay out of the pane's box before the
             // (childless) window teardown, and tell the pane its
@@ -1725,7 +1734,9 @@ pub const AppHost = struct {
         // Latch the relationship — set_parent routinely lands before
         // the window exists (dialogs set it at creation, the window is
         // built on first frame) — then apply if both ends are present.
-        self.pending_parents.put(self.allocator, surface, parent) catch {};
+        self.pending_parents.put(self.allocator, surface, parent) catch {
+            std.debug.print("wlapp: OOM latching parent for surface#{d} — dialog will open standalone\n", .{surface});
+        };
         self.applyParent(surface);
     }
 
@@ -1736,11 +1747,14 @@ pub const AppHost = struct {
     fn applyParent(self: *AppHost, surface: u32) void {
         const win = self.windows.get(surface) orelse return;
         const parent = self.pending_parents.get(surface) orelse return;
-        const pwin: ?*c.GtkWindow = if (parent != 0)
-            (if (self.windows.get(parent)) |p| p.window else null)
-        else
-            null;
-        c.gtk_window_set_transient_for(win.window, pwin);
+        if (parent == 0) {
+            c.gtk_window_set_transient_for(win.window, null);
+            return;
+        }
+        // Parent window not built yet: keep whatever transient-for the
+        // child has — the parent's winFor sweep applies this latch later.
+        const p = self.windows.get(parent) orelse return;
+        c.gtk_window_set_transient_for(win.window, p.window);
     }
 
     fn onMinSize(ctx: ?*anyopaque, surface: u32, mw: i32, mh: i32) void {
