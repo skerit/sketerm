@@ -63,17 +63,24 @@ pub fn build(b: *std.Build) void {
     // native macOS toolchain so the daemon can produce tiles a -Dvideo
     // client decodes. Only activates when such a client attaches.
     const have_vtenc = native_macos;
+    // Opus for the remote-audio path (mux/opuscodec.zig): ~12x less
+    // bandwidth than raw PCM. Optional so the default daemon stays
+    // dependency-free; both ends negotiate (subscribe flags), so
+    // mixed builds fall back to raw.
+    const have_opus = b.option(bool, "audio-opus", "Opus compression for remote audio — requires libopus (default off)") orelse false;
     const glib_opts = b.addOptions();
     glib_opts.addOption(bool, "glib", true);
     glib_opts.addOption(bool, "winstream_sck", native_sck);
     glib_opts.addOption(bool, "video", have_x264);
     glib_opts.addOption(bool, "vtenc", have_vtenc);
+    glib_opts.addOption(bool, "audio_opus", have_opus);
     const glib_opts_mod = glib_opts.createModule();
     const noglib_opts = b.addOptions();
     noglib_opts.addOption(bool, "glib", false);
     noglib_opts.addOption(bool, "winstream_sck", native_sck);
     noglib_opts.addOption(bool, "video", have_x264);
     noglib_opts.addOption(bool, "vtenc", have_vtenc);
+    noglib_opts.addOption(bool, "audio_opus", have_opus);
     const noglib_opts_mod = noglib_opts.createModule();
 
     const exe_mod = b.createModule(.{
@@ -91,6 +98,7 @@ pub fn build(b: *std.Build) void {
     // present for the shim to resolve.
     if (native_macos) addNsaxBridge(b, exe_mod);
     if (have_x264) addVideo(b, exe_mod); // GUI-side H.264 decode (-Dvideo)
+    if (have_opus) addPkgConfig(b, exe_mod, "opus"); // GUI-side Opus decode
     if (have_vtenc) addVtEnc(b, exe_mod); // VideoToolbox H.264 encode (macOS)
 
     const exe = b.addExecutable(.{
@@ -122,6 +130,7 @@ pub fn build(b: *std.Build) void {
     mux_mod.addImport("build_options", noglib_opts_mod);
     if (native_sck) addSckBackend(b, mux_mod);
     if (have_x264) addVideo(b, mux_mod); // daemon-side x264 encode (-Dvideo)
+    if (have_opus) addPkgConfig(b, mux_mod, "opus"); // daemon-side Opus encode
     if (have_vtenc) addVtEnc(b, mux_mod); // daemon-side VideoToolbox encode (macOS)
     const mux_exe = b.addExecutable(.{
         .name = "sketerm-mux",
@@ -178,6 +187,7 @@ pub fn build(b: *std.Build) void {
     portable_opts.addOption(bool, "winstream_sck", false);
     portable_opts.addOption(bool, "video", false);
     portable_opts.addOption(bool, "vtenc", false);
+    portable_opts.addOption(bool, "audio_opus", false);
     mux_portable_mod.addImport("build_options", portable_opts.createModule());
     const mux_portable_exe = b.addExecutable(.{
         .name = "sketerm-mux-portable",
@@ -202,6 +212,7 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, smoke_mux_mod, core_cbindings_mod);
     smoke_mux_mod.addImport("build_options", noglib_opts_mod);
+    if (have_opus) addPkgConfig(b, smoke_mux_mod, "opus");
     if (native_sck) addSckBackend(b, smoke_mux_mod);
     if (have_x264) addVideo(b, smoke_mux_mod);
     if (have_vtenc) addVtEnc(b, smoke_mux_mod);
@@ -225,6 +236,7 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, smoke_mcp_mod, core_cbindings_mod);
     smoke_mcp_mod.addImport("build_options", noglib_opts_mod);
+    if (have_opus) addPkgConfig(b, smoke_mcp_mod, "opus");
     if (native_sck) addSckBackend(b, smoke_mcp_mod);
     if (have_x264) addVideo(b, smoke_mcp_mod);
     if (have_vtenc) addVtEnc(b, smoke_mcp_mod);
@@ -248,6 +260,7 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, smoke_broker_mod, core_cbindings_mod);
     smoke_broker_mod.addImport("build_options", noglib_opts_mod);
+    if (have_opus) addPkgConfig(b, smoke_broker_mod, "opus");
     if (native_sck) addSckBackend(b, smoke_broker_mod);
     if (have_x264) addVideo(b, smoke_broker_mod);
     if (have_vtenc) addVtEnc(b, smoke_broker_mod);
@@ -551,6 +564,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, tests_mod, cbindings_mod);
     tests_mod.addImport("build_options", glib_opts_mod);
+    if (have_opus) addPkgConfig(b, tests_mod, "opus");
     if (native_sck) addSckBackend(b, tests_mod);
     // Link the NSAccessibility shim so `zig build test` compiles AND
     // links the macOS a11y bridge end-to-end (tests.zig imports nsax.zig).

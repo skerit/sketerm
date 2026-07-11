@@ -16,6 +16,7 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const pulse = @import("mux/pulse.zig");
+const opuscodec = @import("mux/opuscodec.zig");
 const cast = @import("util/cast.zig");
 
 pub const AudioSink = struct {
@@ -42,6 +43,9 @@ pub const AudioSink = struct {
         rate: u32 = 44100,
         corked: bool = false,
         last_latency_us: u64 = 0,
+        /// Lazily-created Opus decoder for pcm_opus units.
+        dec: ?opuscodec.Decoder = null,
+        dec_failed: bool = false,
     };
 
     pub fn create(allocator: std.mem.Allocator) !*AudioSink {
@@ -80,6 +84,7 @@ pub const AudioSink = struct {
     }
 
     fn freeVoice(self: *AudioSink, v: *Voice) void {
+        if (v.dec) |*d| d.deinit();
         if (v.stream) |s| {
             c.pa_stream_set_write_callback(s, null, null);
             c.pa_stream_set_state_callback(s, null, null);
@@ -124,6 +129,34 @@ pub const AudioSink = struct {
                 const id = std.mem.readInt(u32, payload[0..4], .little);
                 const v = self.voices.get(id) orelse return;
                 v.pending.appendSlice(self.allocator, payload[4..]) catch return;
+                self.pump(v);
+            },
+            .pcm_opus => {
+                if (payload.len < 8) return;
+                const id = std.mem.readInt(u32, payload[0..4], .little);
+                const raw_len = std.mem.readInt(u32, payload[4..8], .little);
+                const v = self.voices.get(id) orelse return;
+                if (v.dec == null and !v.dec_failed) {
+                    v.dec = opuscodec.Decoder.init(v.rate, v.channels);
+                    if (v.dec == null) v.dec_failed = true;
+                }
+                if (v.dec) |*d| {
+                    var out: [opuscodec.MAX_DECODE_SAMPLES]i16 = undefined;
+                    if (d.decode(payload[8..], &out)) |decoded| {
+                        v.pending.appendSlice(self.allocator, decoded) catch return;
+                        self.pump(v);
+                        return;
+                    }
+                }
+                // Can't decode: substitute silence so the consumed
+                // clock (raw bytes) keeps the remote app flowing.
+                const zeros = [_]u8{0} ** 512;
+                var left: usize = raw_len;
+                while (left > 0) {
+                    const n = @min(left, zeros.len);
+                    v.pending.appendSlice(self.allocator, zeros[0..n]) catch return;
+                    left -= n;
+                }
                 self.pump(v);
             },
             .close => {

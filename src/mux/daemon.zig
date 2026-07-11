@@ -320,6 +320,8 @@ const Client = struct {
     /// Audio units flow only to subscribed clients (a terminal-only
     /// viewer must never be flooded into its output cap).
     audio_ok: bool = false,
+    /// Subscribe flags bit0: the client decodes Opus (pcm_opus).
+    audio_opus: bool = false,
     /// The client advertised it can decode the video codec (hello
     /// `video`). Gates whether forwarded surfaces route through the lossy
     /// video path — never send a tile a client can't decode.
@@ -2097,12 +2099,13 @@ pub const Daemon = struct {
     /// back to the app, PCM/stream units toward attached viewers.
     fn paReadable(self: *Daemon, ch: *Channel) void {
         const srv = ch.pa.?;
-        srv.has_viewer = blk: {
-            for (self.clients.items) |cl| {
-                if (nativeViewer(cl, ch.session)) break :blk true;
-            }
-            break :blk false;
-        };
+        srv.has_viewer = false;
+        srv.opus_wanted = false;
+        for (self.clients.items) |cl| {
+            if (!nativeViewer(cl, ch.session)) continue;
+            srv.has_viewer = true;
+            if (cl.audio_ok and cl.audio_opus) srv.opus_wanted = true;
+        }
         var buf: [64 * 1024]u8 = undefined;
         var rounds: u32 = 0;
         while (rounds < 16) : (rounds += 1) {
@@ -2144,6 +2147,9 @@ pub const Daemon = struct {
         while (pulse.peelUnit(bytes[pos..])) |p| {
             if (p.tag == .subscribe) {
                 cl.audio_ok = true;
+                // Flags byte (optional): bit0 = decodes Opus.
+                if (p.payload.len >= 1 and p.payload[0] & 1 != 0) cl.audio_opus = true;
+                srv.opus_wanted = srv.opus_wanted or cl.audio_opus;
             } else {
                 srv.applyUnit(p.tag, p.payload) catch {};
             }

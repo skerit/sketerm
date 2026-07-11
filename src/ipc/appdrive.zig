@@ -565,6 +565,8 @@ pub const App = struct {
         var pos: usize = 0;
         while (pulse.peelUnit(bytes[pos..])) |p| {
             if (p.tag == .pcm and p.payload.len > 4) consumed += p.payload.len - 4;
+            if (p.tag == .pcm_opus and p.payload.len >= 8)
+                consumed += std.mem.readInt(u32, p.payload[4..8], .little);
             pos += p.consumed;
         }
         if (consumed == 0) return;
@@ -575,7 +577,7 @@ pub const App = struct {
         // is fine — multiple streams re-report on their own data).
         pos = 0;
         while (pulse.peelUnit(bytes[pos..])) |p| {
-            if (p.tag == .pcm and p.payload.len > 4) {
+            if ((p.tag == .pcm or p.tag == .pcm_opus) and p.payload.len > 4) {
                 @memcpy(pl[0..4], p.payload[0..4]);
                 std.mem.writeInt(u64, pl[4..12], consumed, .little);
                 pulse.appendUnit(&units, self.allocator, .consumed, &pl) catch return;

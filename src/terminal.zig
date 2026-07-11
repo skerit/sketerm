@@ -737,10 +737,13 @@ pub const Terminal = struct {
             return;
         };
         // Opt into PCM: the daemon only ships audio to subscribers.
+        // Flags bit0 advertises Opus decode (-Daudio-opus builds).
         const pulse = @import("mux/pulse.zig");
+        const opuscodec = @import("mux/opuscodec.zig");
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(self.allocator);
-        pulse.appendUnit(&units, self.allocator, .subscribe, "") catch return;
+        const flags: []const u8 = if (opuscodec.enabled) "\x01" else "";
+        pulse.appendUnit(&units, self.allocator, .subscribe, flags) catch return;
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);
         var idb: [4]u8 = undefined;
