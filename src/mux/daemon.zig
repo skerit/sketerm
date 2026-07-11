@@ -2524,7 +2524,7 @@ pub const Daemon = struct {
                 return;
             } orelse break;
             switch (peeled.unit.tag) {
-                .seat_enter, .seat_leave, .seat_motion, .seat_button, .seat_axis, .seat_kbd_enter, .seat_kbd_leave, .seat_key, .seat_mods, .configure, .dismiss_popups, .offer_selection, .offer_primary, .text_commit, .request_close => {
+                .seat_enter, .seat_leave, .seat_motion, .seat_button, .seat_axis, .seat_kbd_enter, .seat_kbd_leave, .seat_key, .seat_mods, .configure, .dismiss_popups, .offer_selection, .offer_primary, .text_commit, .set_scale, .request_close => {
                     nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload);
                 },
                 .clip_send, .clip_data, .primary_data => self.applyAppUnit(ch, peeled.unit.tag, peeled.unit.payload),

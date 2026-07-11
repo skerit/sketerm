@@ -102,6 +102,11 @@ pub const Tag = enum(u8) {
     /// the mux wire): a within-app dnd drop wants the source's data —
     /// take the oldest held receive-fd and emit source.send(mime, fd).
     dnd_send = 30,
+    /// u32 scale×120, viewer → daemon brain: the display's TRUE
+    /// (possibly fractional) scale. The brain re-announces
+    /// wl_output.scale (ceil), preferred_buffer_scale (ceil) and
+    /// wp_fractional_scale preferred_scale to the app.
+    set_scale = 31,
     _,
 };
 

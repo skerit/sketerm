@@ -100,6 +100,12 @@ pub const Tracker = struct {
     /// this to index the physical buffer; damage_buffer is already
     /// physical. Without this HiDPI buffers copy only the top 1/scale.
     scales: std.AutoHashMapUnmanaged(u32, i32) = .empty,
+    /// wp_viewport object id → surface id.
+    viewports: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// surface id → viewport destination height (LOGICAL — the
+    /// fractional-scale path). Logical damage rows are expanded by
+    /// buffer_height/vp_h at commit time, when the ratio is known.
+    vp_heights: std.AutoHashMapUnmanaged(u32, i32) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Error!Tracker {
         var self = Tracker{ .allocator = allocator };
@@ -114,6 +120,8 @@ pub const Tracker = struct {
         self.damage.deinit(self.allocator);
         self.uses_damage.deinit(self.allocator);
         self.scales.deinit(self.allocator);
+        self.viewports.deinit(self.allocator);
+        self.vp_heights.deinit(self.allocator);
     }
 
     /// One complete client→compositor message (header + body).
@@ -202,6 +210,36 @@ pub const Tracker = struct {
             return .{ .clip_receive = .{ .offer = hdr.object } };
         if (iface == &protocol.zwp_primary_selection_offer_v1 and hdr.opcode == 0)
             return .{ .primary_receive = .{ .offer = hdr.object } };
+        if (iface == &protocol.wp_viewporter and hdr.opcode == 1) {
+            // get_viewport(id, surface) — remember whose viewport.
+            var it = wire.ArgIter.init(body, msg.sig);
+            _ = try it.next(); // n
+            const sid = (try it.next()).?.object;
+            try self.viewports.put(self.allocator, new_id, sid);
+            return .relay;
+        }
+        if (iface == &protocol.wp_viewport) switch (hdr.opcode) {
+            0 => { // destroy — logical sizing reverts
+                if (self.viewports.fetchRemove(hdr.object)) |kv| {
+                    _ = self.vp_heights.remove(kv.value);
+                }
+                return .relay;
+            },
+            2 => { // set_destination(w, h) — logical size (-1 unsets)
+                var it = wire.ArgIter.init(body, msg.sig);
+                _ = try it.next(); // w
+                const vh = (try it.next()).?.int;
+                if (self.viewports.get(hdr.object)) |sid| {
+                    if (vh > 0) {
+                        try self.vp_heights.put(self.allocator, sid, vh);
+                    } else {
+                        _ = self.vp_heights.remove(sid);
+                    }
+                }
+                return .relay;
+            },
+            else => return .relay,
+        };
         if (iface == &protocol.wl_surface) switch (hdr.opcode) {
             1 => { // attach
                 var it = wire.ArgIter.init(body, msg.sig);
@@ -250,10 +288,25 @@ pub const Tracker = struct {
                 // Damage-using clients: absent damage on a commit
                 // means "content unchanged" → copy nothing (empty
                 // range), not everything.
-                const dmg: ?RowRange = if (self.uses_damage.contains(hdr.object))
+                var dmg: ?RowRange = if (self.uses_damage.contains(hdr.object))
                     (self.damage.get(hdr.object) orelse RowRange{ .y0 = 0, .y1 = 0 })
                 else
                     null;
+                // Fractional-scale surfaces (viewport destination set,
+                // buffer_scale 1): logical damage rows under-cover the
+                // physical buffer — expand by buffer_h/logical_h now
+                // that both are known. Over-covers damage_buffer rows,
+                // which only costs copy bytes, never correctness.
+                if (dmg) |*d| {
+                    if (self.vp_heights.get(hdr.object)) |vh| {
+                        if (vh > 0 and info.height > vh) {
+                            const bh: i64 = info.height;
+                            const lh: i64 = vh;
+                            d.y0 = @intCast(@max(0, @divTrunc(@as(i64, d.y0) * bh, lh)));
+                            d.y1 = @intCast(@min(bh, @divTrunc(@as(i64, d.y1) * bh + lh - 1, lh)));
+                        }
+                    }
+                }
                 _ = self.damage.remove(hdr.object);
                 return .{ .commit = .{
                     .surface = hdr.object,
@@ -293,6 +346,8 @@ pub const Tracker = struct {
             _ = self.damage.remove(id);
             _ = self.uses_damage.remove(id);
             _ = self.scales.remove(id);
+            _ = self.viewports.remove(id);
+            _ = self.vp_heights.remove(id); // id may be a surface
             return;
         }
         const iface = self.objects.get(hdr.object) orelse return;

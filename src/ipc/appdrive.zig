@@ -410,7 +410,11 @@ pub const App = struct {
         _ = ch.app.ensureWindow(ch.id, sid, true);
     }
 
-    fn onFrame(ctx: ?*anyopaque, sid: u32, w: i32, h: i32, scale: i32, format: u32, pixels: []const u8) void {
+    fn onFrame(ctx: ?*anyopaque, sid: u32, w: i32, h: i32, scale: i32, lw: i32, lh: i32, format: u32, pixels: []const u8) void {
+        // Headless sessions run at scale 1 (no viewer sends
+        // set_scale), so logical == physical here.
+        _ = lw;
+        _ = lh;
         const ch = chanOf(ctx);
         const win = ch.app.ensureWindow(ch.id, sid, false) orelse return;
         win.w = w;
