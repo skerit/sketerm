@@ -377,6 +377,11 @@ pub const Screen = struct {
     /// stable line IDs so the zone survives scrolling into scrollback.
     /// `last_*` describe the most recently COMPLETED command.
     pending_output_start_id: u64 = 0,
+    /// C arrived mid-line (bash's DEBUG trap fires before the shell's
+    /// accept-line newline is echoed): the zone start is the NEXT
+    /// line, captured at the following linefeed so the echoed command
+    /// row stays out of the extracted output.
+    pending_output_awaits_nl: bool = false,
     last_output_start_id: u64 = 0,
     last_output_end_id: u64 = 0,
     /// Exit status from `OSC 133 ; D ; <code>` (0 when not reported).
@@ -1648,7 +1653,10 @@ pub const Screen = struct {
         if (self.last_output_start_id == 0 or self.last_output_end_id == 0) return null;
         const start = self.rowForLineId(self.last_output_start_id) orelse return null;
         const end = self.rowForLineId(self.last_output_end_id) orelse return null;
-        if (end <= start) return null;
+        if (end < start) return null;
+        // An empty range is a real, completed zone: the command just
+        // produced no output (its exit code is still meaningful).
+        if (end == start) return try allocator.dupe(u8, "");
         return try self.extractRowRange(allocator, start, end);
     }
 
@@ -2618,10 +2626,18 @@ pub const Screen = struct {
     }
 
     /// OSC 133 / 633 `C` — mark where the running command's output
-    /// begins. No-op on the alt screen.
+    /// begins. No-op on the alt screen. Mid-line C (cursor not at
+    /// column 0) means the command-echo line is still current — defer
+    /// the capture to the next linefeed so the zone holds only output.
     fn cmdOutputStart(self: *Screen) void {
         if (self.use_alt or self.row >= self.rows) return;
-        self.pending_output_start_id = self.active[self.row].id;
+        if (self.col == 0) {
+            self.pending_output_start_id = self.active[self.row].id;
+            self.pending_output_awaits_nl = false;
+        } else {
+            self.pending_output_start_id = 0;
+            self.pending_output_awaits_nl = true;
+        }
         if (self.sink.on_cmd_start) |f| f(self.sink.ctx);
     }
 
@@ -2630,6 +2646,13 @@ pub const Screen = struct {
     /// (empty = unknown → 0).
     fn cmdOutputEnd(self: *Screen, exit_str: []const u8) void {
         if (self.use_alt or self.row >= self.rows) return;
+        // C deferred to a newline that never came (command printed
+        // nothing, D reached first): an empty zone at the current row
+        // still carries the exit code.
+        if (self.pending_output_awaits_nl) {
+            self.pending_output_awaits_nl = false;
+            self.pending_output_start_id = self.active[self.row].id;
+        }
         const start_id = self.pending_output_start_id;
         if (start_id == 0) return;
         self.pending_output_start_id = 0;
@@ -3797,6 +3820,12 @@ pub const Screen = struct {
             self.scrollUp(1);
         } else if (self.row + 1 < self.rows) {
             self.row += 1;
+        }
+        // Deferred OSC 133 C capture: the first newline after a
+        // mid-line C lands on the command output's first row.
+        if (self.pending_output_awaits_nl and !self.use_alt and self.row < self.rows) {
+            self.pending_output_awaits_nl = false;
+            self.pending_output_start_id = self.active[self.row].id;
         }
         self.pending_wrap = false;
         if (self.scroll_on_output) self.view_offset = 0;
@@ -6875,6 +6904,45 @@ test "OSC 133 C/D bounds the last-command-output zone" {
     s.onOsc("133;C");
     s.onOsc("133;D;0");
     try std.testing.expect(!s.lastCommandOutputAvailable());
+}
+
+test "OSC 133 mid-line C (bash DEBUG trap) excludes the command echo" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 20, 4);
+    defer s.deinit();
+
+    const nl = struct {
+        fn go(scr: *Screen) void {
+            scr.apply(.{ .execute = '\n' });
+            scr.apply(.{ .execute = '\r' });
+        }
+    }.go;
+
+    // bash: C fires from the DEBUG trap BEFORE the accept-line
+    // newline reaches the terminal — cursor still at the end of the
+    // echoed command. The zone must start on the NEXT line.
+    s.onOsc("133;A");
+    for ("$ echo hi") |b| s.printCp(b);
+    s.onOsc("133;C");
+    nl(s);
+    for ("hi") |b| s.printCp(b);
+    nl(s);
+    s.onOsc("133;D;0");
+
+    const out = (try s.extractLastCommandOutput(std.testing.allocator)).?;
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("hi\n", out);
+
+    // Mid-line C, no output at all: empty zone, exit code preserved.
+    for ("$ false") |b| s.printCp(b);
+    s.onOsc("133;C");
+    nl(s);
+    s.onOsc("133;D;1");
+    try std.testing.expectEqual(@as(i32, 1), s.last_cmd_exit);
+    const empty = (try s.extractLastCommandOutput(std.testing.allocator)).?;
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqualStrings("", empty);
 }
 
 test "command-zone ring: membership, selection, fast row lookup" {
