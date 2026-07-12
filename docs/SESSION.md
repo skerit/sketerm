@@ -7170,3 +7170,30 @@ Live MCP drive (bash $SHELL): term_run output_only returned
 "a && b; false" captured both lines, bare `false` returned an empty
 zone with exit 1, /bin/sh fell back WITH the announcement, and fish
 zones work through the same plumbing.
+
+## Pulse server no longer crashes SDL clients
+
+ds9dw round-3: every SDL2/SDL3 app SIGSEGVd in its client-side
+PulseMainloop during audio init under sketerm (backtrace: libc <-
+libSDL3 x2 <- libpulse <- pa_pdispatch_run — i.e. inside SDL's own
+reply callback; Arch's SDL2 is sdl2-compat on SDL3, hence the SDL3
+frames). Root cause in mux/pulse.zig: GET_SERVER_INFO reported the
+default source as NULL. No genuine PulseAudio server ever does that
+(a sink always has a monitor source), so SDL3's ServerInfoCallback
+dereferences the name unchecked -> strcmp(NULL) -> SIGSEGV. Fixed by
+naming sketerm.monitor as the default source and backing it with a
+real monitor-source object (GET_SOURCE_INFO/_LIST, LOOKUP_SOURCE;
+capture enumeration skips monitors so nothing records from it).
+Audit fallout fixed too: STAT now returns its real five-u32
+pa_stat_info instead of an empty ack, and the sink flags value was
+PA_SINK_SET_FORMATS (0x0100) where PA_SINK_LATENCY (0x0002) was
+meant.
+
+Verified: minimal SDL2 repro (SDL_Init(AUDIO)+OpenAudioDevice)
+SIGSEGVd before, now opens s16/48k, plays 1.5s through the daemon,
+exits clean; pactl info / list sinks+sources / stat all parse; paplay
+streams a full WAV (rc 0); the user's actual game (ds9dw) boots past
+audio init with live audio — previously only SDL_AUDIODRIVER=dummy
+got it there. +1 regression test parsing the server-info /
+source-list / stat reply layouts exactly. 700/706 tests,
+smoke-mux/mcp PASS, portable + macOS cross OK.
