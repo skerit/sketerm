@@ -181,6 +181,10 @@ pub const Window = struct {
     /// "Show in Tab" or when the app exits without ever opening a
     /// window (the log is the user's only diagnostic).
     app_sessions: std.ArrayList(*AppSession) = .empty,
+    /// In-flight async remote-mux reattaches from layout restore
+    /// (one background thread each; results land via g_idle_add).
+    /// Window teardown marks them canceled — the idle frees them.
+    mux_restore_jobs: std.ArrayList(*MuxRestoreJob) = .empty,
     allocator: std.mem.Allocator,
     tab_counter: u32 = 0,
     /// Remote control: monotonic pane / tab ids + the socket server.
@@ -719,6 +723,11 @@ pub const Window = struct {
             self.allocator.destroy(as);
         }
         self.app_sessions.deinit(self.allocator);
+        // In-flight async reattaches: mark canceled so their idle
+        // callbacks drop results without touching the freed window
+        // (each idle frees its own job).
+        for (self.mux_restore_jobs.items) |job| job.canceled = true;
+        self.mux_restore_jobs.deinit(self.allocator);
         for (self.zoom_hidden.items) |w| c.g_object_unref(w);
         self.zoom_hidden.deinit(self.allocator);
         for (self.notify_slots.items) |slot| self.allocator.free(slot.id);
@@ -1377,19 +1386,23 @@ pub const Window = struct {
     fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_out: *PaneTree.Node) !*c.GtkWidget {
         switch (tree) {
             .pane => |p| {
-                // Durable mux pane: reattach (or recreate under the
-                // same name) instead of spawning a local PTY. A dead
-                // host / failed daemon falls through to the plain
-                // spawn below so startup never wedges on a layout.
-                if (p.mux_session.len > 0) {
+                // Durable LOCAL mux pane: reattach (or recreate under
+                // the same name) instead of spawning a local PTY. A
+                // failed daemon falls through to the plain spawn below
+                // so startup never wedges on a layout. REMOTE mux panes
+                // never connect here — ssh/udp to a dead host would
+                // freeze the whole GUI (this runs on the main loop);
+                // they spawn the local placeholder below and reattach
+                // asynchronously (startMuxRestoreJob).
+                if (p.mux_session.len > 0 and p.mux_host.len == 0) {
                     if (self.restoreMuxPane(p)) |pane| {
                         self.restorePaneShader(pane, p);
                         node_out.* = .{ .leaf = pane };
                         return pane.widget();
                     } else |err| {
                         std.debug.print(
-                            "sketerm: mux restore '{s}'{s}{s} failed ({s}) — spawning local shell\n",
-                            .{ p.mux_session, if (p.mux_host.len > 0) " @ " else "", p.mux_host, @errorName(err) },
+                            "sketerm: mux restore '{s}' failed ({s}) — spawning local shell\n",
+                            .{ p.mux_session, @errorName(err) },
                         );
                     }
                 }
@@ -1444,6 +1457,12 @@ pub const Window = struct {
                 if (p.font_size != null)
                     self.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = p.font_size });
                 self.restorePaneShader(pane, p);
+
+                // Remote durable pane: the local shell above is a live
+                // placeholder; the reattach runs off the main loop and
+                // swaps in when (if) the host answers.
+                if (p.mux_session.len > 0 and p.mux_host.len > 0)
+                    self.startMuxRestoreJob(pane, p);
 
                 node_out.* = .{ .leaf = pane };
                 return pane.widget();
@@ -4126,6 +4145,219 @@ pub const Window = struct {
         return self.makeRemotePaneFromSnap(conn, spec.mux_session, host, snap.payload, null);
     }
 
+    /// One in-flight async remote-mux reattach (layout restore).
+    /// The background thread touches ONLY the connect/handshake
+    /// fields; `canceled` and the result consumption are main-thread
+    /// (g_idle_add's internal lock orders the hand-off).
+    const MuxRestoreJob = struct {
+        allocator: std.mem.Allocator,
+        window: *Window,
+        /// Placeholder pane to take over; resolved by id on completion
+        /// (the pane may have been closed meanwhile).
+        pane_id: u32,
+        session: []u8,
+        host: []u8,
+        port_range: []u8,
+        kb_layout: []u8,
+        /// Thread results — set before g_idle_add, read after.
+        conn: ?@import("../mux/client.zig").Conn = null,
+        snap: ?[]u8 = null,
+        err_name: []const u8 = "unknown",
+        /// Main-thread only: window torn down; idle must not touch it.
+        canceled: bool = false,
+
+        fn destroy(job: *MuxRestoreJob) void {
+            if (job.conn) |*cn| cn.deinit();
+            if (job.snap) |s| job.allocator.free(s);
+            job.allocator.free(job.session);
+            job.allocator.free(job.host);
+            job.allocator.free(job.port_range);
+            job.allocator.free(job.kb_layout);
+            job.allocator.destroy(job);
+        }
+    };
+
+    /// Kick off the background reattach for a restored remote mux
+    /// pane. Failure to start just leaves the placeholder shell.
+    fn startMuxRestoreJob(self: *Window, pane: *Pane, spec: layout_mod.PaneSpec) void {
+        const a = self.allocator;
+        const session = a.dupe(u8, spec.mux_session) catch return;
+        const host = a.dupe(u8, spec.mux_host) catch {
+            a.free(session);
+            return;
+        };
+        const port_range = a.dupe(u8, self.config.mux_udp_port_range) catch {
+            a.free(session);
+            a.free(host);
+            return;
+        };
+        const kb_layout = a.dupe(u8, self.config.app_keyboard_layout) catch {
+            a.free(session);
+            a.free(host);
+            a.free(port_range);
+            return;
+        };
+        const job = a.create(MuxRestoreJob) catch {
+            a.free(session);
+            a.free(host);
+            a.free(port_range);
+            a.free(kb_layout);
+            return;
+        };
+        job.* = .{
+            .allocator = a,
+            .window = self,
+            .pane_id = pane.id,
+            .session = session,
+            .host = host,
+            .port_range = port_range,
+            .kb_layout = kb_layout,
+        };
+        self.mux_restore_jobs.append(a, job) catch {
+            job.destroy();
+            return;
+        };
+        const th = std.Thread.spawn(.{}, muxRestoreThreadMain, .{job}) catch {
+            std.debug.print(
+                "sketerm: mux restore '{s}' @ {s}: thread spawn failed — pane stays a local shell\n",
+                .{ job.session, job.host },
+            );
+            self.removeMuxRestoreJob(job);
+            job.destroy();
+            return;
+        };
+        th.detach();
+    }
+
+    fn removeMuxRestoreJob(self: *Window, job: *MuxRestoreJob) void {
+        for (self.mux_restore_jobs.items, 0..) |it, i| {
+            if (it == job) {
+                _ = self.mux_restore_jobs.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Pending reattach targeting `pane_id`, if any — lets a layout
+    /// save while the connect is still in flight keep the mux
+    /// identity instead of demoting the pane to a plain local shell.
+    fn muxRestoreJobFor(self: *Window, pane_id: u32) ?*MuxRestoreJob {
+        for (self.mux_restore_jobs.items) |job| {
+            if (job.pane_id == pane_id) return job;
+        }
+        return null;
+    }
+
+    /// Background thread: connect + attach handshake, no GTK/Window
+    /// access. Results (or err_name) land on the job, then the idle
+    /// finishes on the main thread.
+    fn muxRestoreThreadMain(job: *MuxRestoreJob) void {
+        muxRestoreConnect(job) catch |err| {
+            job.err_name = @errorName(err);
+        };
+        _ = c.g_idle_add(@ptrCast(&onMuxRestoreDone), @ptrCast(job));
+    }
+
+    fn muxRestoreConnect(job: *MuxRestoreJob) !void {
+        const mux_client = @import("../mux/client.zig");
+        var conn = if (std.mem.startsWith(u8, job.host, "udp:"))
+            try mux_client.Conn.connectUdp(
+                job.allocator,
+                job.host[4..],
+                if (job.port_range.len > 0) job.port_range else null,
+            )
+        else
+            try mux_client.Conn.connectSsh(job.allocator, job.host);
+        errdefer conn.deinit();
+
+        // Bound the attach handshake: a remote that answers the hello
+        // but then wedges would otherwise hang this thread (and leave
+        // the placeholder pending) forever. Cleared before hand-off —
+        // the GUI switches the fd to non-blocking anyway.
+        setRecvTimeout(conn.fd, 30);
+        defer setRecvTimeout(conn.fd, 0);
+
+        try conn.sendJson(.attach, .{ .name = job.session, .kind = "gui" });
+        const reply = try conn.recvExpect(&.{ .snapshot, .err });
+        if (reply.ftype == .snapshot) {
+            job.snap = reply.payload;
+        } else {
+            reply.deinit(job.allocator);
+            // Session gone (daemon restarted / server rebooted) —
+            // recreate under the SAME name, mirroring restoreMuxPane.
+            // Empty argv = the remote's login shell; no cwd (local
+            // paths mean nothing over there).
+            try conn.sendJson(.spawn, .{
+                .name = job.session,
+                .argv = @as([]const []const u8, &.{}),
+                .cwd = @as(?[]const u8, null),
+                .rows = @as(u16, 24),
+                .cols = @as(u16, 80),
+                .kb_layout = job.kb_layout,
+            });
+            (try conn.recvExpect(&.{.ok})).deinit(job.allocator);
+            try conn.sendJson(.attach, .{ .name = job.session, .kind = "gui" });
+            const snap2 = try conn.recvExpect(&.{.snapshot});
+            job.snap = snap2.payload;
+        }
+        job.conn = conn;
+    }
+
+    fn setRecvTimeout(fd: c_int, seconds: c_long) void {
+        var tv: c.struct_timeval = .{ .tv_sec = seconds, .tv_usec = 0 };
+        _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+    }
+
+    /// Main-thread completion: swap the reattached session into the
+    /// placeholder pane's slot, or surface the failure as a toast.
+    fn onMuxRestoreDone(user: ?*anyopaque) callconv(.c) c_int {
+        const job = cast.userData(MuxRestoreJob, user);
+        defer job.destroy();
+        // Window gone — job.window dangles; just drop everything
+        // (destroy deinits the conn = clean detach, session persists).
+        if (job.canceled) return 0;
+        const win = job.window;
+        win.removeMuxRestoreJob(job);
+
+        if (job.conn == null or job.snap == null) {
+            std.debug.print(
+                "sketerm: mux restore '{s}' @ {s} failed ({s}) — pane stays a local shell\n",
+                .{ job.session, job.host, job.err_name },
+            );
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &buf,
+                "Couldn't reattach '{s}' @ {s} ({s}) — pane is a local shell",
+                .{ job.session, job.host, job.err_name },
+            ) catch "Couldn't reattach remote mux session";
+            showToast(win, msg);
+            return 0;
+        }
+
+        // Placeholder closed meanwhile, or the user already put a
+        // durable session in its place — drop the attach quietly.
+        const old = win.paneById(job.pane_id) orelse return 0;
+        if (old.terminal.remote) |r| {
+            if (!r.ephemeral) return 0;
+        }
+
+        const conn = job.conn.?;
+        job.conn = null; // ownership moves to makeRemotePaneFromSnap
+        const pane = win.makeRemotePaneFromSnap(conn, job.session, job.host, job.snap.?, null) catch |err| {
+            std.debug.print(
+                "sketerm: mux restore '{s}' @ {s}: pane build failed ({s})\n",
+                .{ job.session, job.host, @errorName(err) },
+            );
+            return 0;
+        };
+        _ = win.swapPaneInPlace(old, pane) catch {
+            // No tab slot to land in (mid-teardown) — drop the new pane.
+            win.unlistPane(pane);
+            return 0;
+        };
+        return 0;
+    }
+
     /// Carry a pane's per-pane shader choice onto its in-place
     /// replacement, so a mux takeover or a detach-to-shell doesn't
     /// silently snap the shader back to the profile/global default.
@@ -5661,6 +5893,15 @@ pub const Window = struct {
                     if (!r.ephemeral) {
                         mux_session = try arena.dupe(u8, r.session);
                         if (r.host) |h| mux_host = try arena.dupe(u8, h);
+                    }
+                }
+                // Placeholder for an async remote reattach still in
+                // flight: keep the saved mux identity so quitting
+                // mid-connect doesn't demote the pane to a plain shell.
+                if (mux_session.len == 0) {
+                    if (self.muxRestoreJobFor(p.id)) |job| {
+                        mux_session = try arena.dupe(u8, job.session);
+                        mux_host = try arena.dupe(u8, job.host);
                     }
                 }
                 return .{
