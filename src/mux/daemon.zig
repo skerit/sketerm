@@ -4295,12 +4295,21 @@ pub const Daemon = struct {
     fn sessionExited(self: *Daemon, s: *Session) void {
         if (s.exited) return;
         s.exited = true;
-        // We reach here on PTY EOF/EIO: the child has exited but is
-        // not yet waited. Reap it now (non-blocking) so the .exit
-        // frame carries the real WEXITSTATUS instead of the default 0.
-        // If it isn't reapable yet, leave the default — the teardown
-        // path (Session.deinit → closeAndReap) will wait it later.
-        if (s.pty.reap()) |code| s.exit_status = code;
+        // We reach here on PTY EOF/EIO: the child has exited but may
+        // not be waitpid-able for another scheduler tick, and a single
+        // WNOHANG try races it — the .exit frame then ships the
+        // default 0 even for a SIGSEGV death (reported by MCP users as
+        // "segfault exited 0"). Retry briefly; EOF implies the exit
+        // already happened, so this converges in microseconds. The
+        // bound only bites when a child closed its stdio and lives on.
+        var tries: u32 = 0;
+        while (tries < 50) : (tries += 1) {
+            if (s.pty.reap()) |code| {
+                s.exit_status = code;
+                break;
+            }
+            _ = c.usleep(1000);
+        }
         var st: [4]u8 = undefined;
         std.mem.writeInt(i32, &st, s.exit_status, .little);
         // Deliver the exit, then force-detach: nothing will ever flow
