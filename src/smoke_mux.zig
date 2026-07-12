@@ -611,7 +611,10 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) bool {
     const compositor_mod = @import("wlhost/compositor.zig");
 
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("app-stage connect");
-    defer conn.deinit();
+    // The durability step below deinits this conn EXPLICITLY (drop
+    // without detach); the deferred call must not run a second time.
+    var conn_alive = true;
+    defer if (conn_alive) conn.deinit();
     // Hang guard: a silent stall fails the stage instead of wedging
     // the smoke. Generous because weston-terminal loads fonts.
     const tv = c.struct_timeval{ .tv_sec = 20, .tv_usec = 0 };
@@ -732,6 +735,7 @@ fn realAppStage(allocator: std.mem.Allocator, sock_path: []const u8) bool {
     // reattach fresh: the daemon replays chan_open + pool bytes +
     // state_sync, and the replica's windows come back with pixels.
     conn.deinit();
+    conn_alive = false;
     var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("reattach connect");
     defer conn2.deinit();
     const tv2 = c.struct_timeval{ .tv_sec = 20, .tv_usec = 0 };
@@ -1508,7 +1512,13 @@ fn uploadStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, mirror: *Mi
     std.debug.print("smoke-mux: file upload + download round-trip + non-clobber ok\n", .{});
 }
 
+/// No-op SIGPIPE handler, same rationale as mux_main.zig: the daemon
+/// runs IN-PROCESS here, and its write() to a dropped client (the
+/// durability stage does exactly that) must EPIPE, not kill the smoke.
+fn sigNoop(_: c_int) callconv(.c) void {}
+
 pub fn main() u8 {
+    _ = c.signal(c.SIGPIPE, &sigNoop);
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
