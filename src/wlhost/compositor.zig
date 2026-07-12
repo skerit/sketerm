@@ -263,6 +263,11 @@ const globals = [_]Global{
 
 const Pool = struct {
     bytes: std.ArrayList(u8) = .empty,
+    /// Live wl_buffers created from this pool; the bytes are freed
+    /// only when this reaches 0 on a destroyed pool (wl_shm_pool
+    /// destructor semantics keep the memory alive for buffers).
+    buffers: u32 = 0,
+    destroyed: bool = false,
     /// Lazily-created video decoder for pool_vtile updates to this pool,
     /// recreated when the tile dimensions or codec change (-Dvideo).
     vdec: ?vcodec.Decoder = null,
@@ -1462,6 +1467,10 @@ pub const Compositor = struct {
                 try self.register(id, &protocol.wl_shm_pool);
                 const slot = try self.pools.getOrPut(self.allocator, id);
                 if (!slot.found_existing) slot.value_ptr.* = .{};
+                // Recycled id: the old pool's buffers can no longer
+                // resolve — start the lifecycle over.
+                slot.value_ptr.buffers = 0;
+                slot.value_ptr.destroyed = false;
                 try slot.value_ptr.bytes.resize(self.allocator, @intCast(size));
             },
             else => return Error.Protocol, // release is since-2; we advertise 1
@@ -1487,20 +1496,37 @@ pub const Compositor = struct {
                     .stride = stride,
                     .format = format,
                 });
+                if (self.pools.getPtr(hdr.object)) |p| p.buffers += 1;
             },
-            1 => { // destroy — mirror stays while buffers reference it
+            1 => { // destroy — bytes reclaim once no buffer references them
+                if (self.pools.getPtr(hdr.object)) |p| {
+                    if (p.buffers == 0) {
+                        var pool = self.pools.fetchRemove(hdr.object).?.value;
+                        pool.deinit(self.allocator);
+                    } else {
+                        p.destroyed = true;
+                    }
+                }
                 try self.destroyObject(hdr.object);
             },
             2 => {}, // resize — side-band already grew the mirror
             else => return Error.Protocol,
         } else if (iface == &protocol.wl_buffer) {
             // destroy — a dmabuf buffer also owns its synthetic pool
-            // (pool id == buffer id).
+            // (pool id == buffer id); an shm buffer releases its pool
+            // reference and reclaims a destroyed pool's bytes when it
+            // was the last one.
             if (self.buffers.fetchRemove(hdr.object)) |kv| {
                 if (kv.value.pool == hdr.object) {
                     if (self.pools.fetchRemove(hdr.object)) |pkv| {
                         var p = pkv.value;
                         p.deinit(self.allocator);
+                    }
+                } else if (self.pools.getPtr(kv.value.pool)) |p| {
+                    if (p.buffers > 0) p.buffers -= 1;
+                    if (p.destroyed and p.buffers == 0) {
+                        var pool = self.pools.fetchRemove(kv.value.pool).?.value;
+                        pool.deinit(self.allocator);
                     }
                 }
             }
@@ -3090,6 +3116,13 @@ pub const Compositor = struct {
                 .stride = try r.i32v(),
                 .format = try r.u32v(),
             });
+        }
+        // Recompute pool refcounts: the pools arrived via replayed
+        // pool_create units with counts at 0, and freeing a pool
+        // under a restored live buffer would drop its frames.
+        var bit = self.buffers.valueIterator();
+        while (bit.next()) |b| {
+            if (self.pools.getPtr(b.pool)) |p| p.buffers += 1;
         }
 
         const n_surf = try r.u32v();
@@ -6011,3 +6044,59 @@ test "state_sync v3: dmabuf buffer survives replica restore with pixels" {
     try t.expectEqual(@as(u8, 60), tv2.last_pixels[0]);
     try t.expect(!replica.dead);
 }
+
+test "shm pool bytes reclaim only after pool destroy AND last buffer destroy" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 2, "wl_shm", 1, 4);
+    { // create_pool(9, fd, 16)
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(9);
+        b.putInt(16);
+        try req(&comp, try b.finish());
+    }
+    { // create_buffer(10, 0, 2x2, stride 8, xrgb)
+        var b = wire.Builder.init(&buf, 9, 0);
+        b.putNewId(10);
+        b.putInt(0);
+        b.putInt(2);
+        b.putInt(2);
+        b.putInt(8);
+        b.putUint(1);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(u32, 1), comp.pools.get(9).?.buffers);
+
+    { // wl_shm_pool.destroy(9) — buffer 10 still references the bytes
+        var b = wire.Builder.init(&buf, 9, 1);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(comp.pools.get(9) != null);
+    try t.expect(comp.pools.get(9).?.destroyed);
+
+    { // wl_buffer.destroy(10) — last reference: bytes reclaim
+        var b = wire.Builder.init(&buf, 10, 0);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(comp.pools.get(9) == null);
+
+    // Reverse order: destroying a buffer-less pool reclaims at once.
+    { // create_pool(11, fd, 16)
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(11);
+        b.putInt(16);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(comp.pools.get(11) != null);
+    { // destroy(11)
+        var b = wire.Builder.init(&buf, 11, 1);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(comp.pools.get(11) == null);
+    try t.expect(!comp.dead);
+}
+

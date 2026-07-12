@@ -276,7 +276,6 @@ const Worker = struct {
     /// Owned copies of the worker's last-pushed title / cwd (null = none yet).
     title: ?[]u8 = null,
     cwd: ?[]u8 = null,
-
     fn deinit(self: *Worker) void {
         if (self.control_fd >= 0) _ = c.close(self.control_fd);
         self.allocator.free(self.name);
@@ -345,10 +344,21 @@ const Client = struct {
         self.allocator.destroy(self);
     }
 
+    /// Hard ceiling on queued outbound bytes. A client this far
+    /// behind is not draining (dead peer, stalled MCP consumer);
+    /// keeping the backlog grows RSS without bound. Dropping it is
+    /// safe: a live client reattaches with a fresh snapshot/replay.
+    /// Sized above the largest legitimate burst (attach replay of a
+    /// multi-window app's pools).
+    const MAX_WBUF: usize = 256 << 20;
+
     fn queueFrame(self: *Client, ftype: wire.FrameType, payload: []const u8) void {
+        if (self.dead) return;
         wire.appendFrame(&self.wbuf, self.allocator, ftype, payload) catch {
             self.dead = true;
+            return;
         };
+        if (self.wbuf.items.len > MAX_WBUF) self.dead = true;
     }
 
     fn queueJson(self: *Client, ftype: wire.FrameType, value: anytype) void {
@@ -545,7 +555,22 @@ const Native = struct {
         fd: c_int,
         ptr: [*]u8,
         size: usize,
+        /// Live wl_buffers created from this pool. The mmap (and the
+        /// tmpfs pages it pins via the open fd) is reclaimed only when
+        /// this hits 0 on a destroyed pool — wl_shm_pool destructor
+        /// semantics keep the memory alive for existing buffers.
+        buffers: u32 = 0,
+        destroyed: bool = false,
     };
+
+    /// Unmap + close a pool mirror and tell replicas to drop their
+    /// copy (the pool_destroy pipe unit compositor.zig frees on).
+    fn reclaimPool(nv: *Native, units: *std.ArrayList(u8), a: std.mem.Allocator, id: u32) !void {
+        const kv = nv.pools.fetchRemove(id) orelse return;
+        _ = c.munmap(kv.value.ptr, kv.value.size);
+        _ = c.close(kv.value.fd);
+        try wlpipe.appendPoolMeta(units, a, .pool_destroy, id, 0);
+    }
 
     fn deinit(self: *Native) void {
         self.brain.deinit();
@@ -1360,6 +1385,9 @@ pub const Daemon = struct {
             cl.rbuf.shrinkRetainingCapacity(remaining);
             if (cl.dead) return;
         }
+        // Don't let one big INPUT paste pin its high-water capacity.
+        if (cl.rbuf.items.len == 0 and cl.rbuf.capacity > (4 << 20))
+            cl.rbuf.clearAndFree(cl.allocator);
     }
 
     fn clientWritable(self: *Daemon, cl: *Client) void {
@@ -1375,6 +1403,10 @@ pub const Daemon = struct {
         const remaining = cl.wbuf.items.len - n;
         std.mem.copyForwards(u8, cl.wbuf.items[0..remaining], cl.wbuf.items[n..]);
         cl.wbuf.shrinkRetainingCapacity(remaining);
+        // A snapshot/replay burst can leave a many-MB high-water
+        // capacity pinned forever; release it once fully drained.
+        if (remaining == 0 and cl.wbuf.capacity > (4 << 20))
+            cl.wbuf.clearAndFree(cl.allocator);
     }
 
     fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
@@ -2556,11 +2588,32 @@ pub const Daemon = struct {
     fn nativeAction(self: *Daemon, nv: *Native, units: *std.ArrayList(u8), msgb: []const u8, action: wltrack.Action) !void {
         const a = self.allocator;
         switch (action) {
-            .relay, .buffer_create => try wlpipe.appendUnit(units, a, .wl_msg, msgb),
+            .relay => try wlpipe.appendUnit(units, a, .wl_msg, msgb),
+            .buffer_create => |bc| {
+                if (nv.pools.getPtr(bc.pool)) |m| m.buffers += 1;
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+            },
             .buffer_destroy => |bd| {
                 if (nv.dmabufs.fetchRemove(bd.id)) |kv| {
                     _ = c.munmap(kv.value.ptr, kv.value.size);
                     _ = c.close(kv.value.fd);
+                } else if (nv.tracker.buffers.get(bd.id)) |info| {
+                    // Last buffer of an already-destroyed shm pool:
+                    // the mirror is finally reclaimable.
+                    if (!info.dmabuf) {
+                        if (nv.pools.getPtr(info.pool)) |m| {
+                            if (m.buffers > 0) m.buffers -= 1;
+                            if (m.destroyed and m.buffers == 0)
+                                try nv.reclaimPool(units, a, info.pool);
+                        }
+                    }
+                }
+                try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+            },
+            .surface_destroy => |sd| {
+                if (nv.vstate.fetchRemove(sd.id)) |kv| {
+                    var vs = kv.value;
+                    vs.deinit();
                 }
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
             },
@@ -2652,7 +2705,15 @@ pub const Daemon = struct {
                 errdefer _ = c.munmap(@ptrCast(ptr.?), sz);
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
                 try wlpipe.appendPoolMeta(units, a, .pool_create, p.id, @intCast(sz));
-                try nv.pools.put(a, p.id, .{ .fd = fd, .ptr = @ptrCast(ptr.?), .size = sz });
+                const gop = try nv.pools.getOrPut(a, p.id);
+                if (gop.found_existing) {
+                    // Recycled pool id (delete_id reuse): the old
+                    // mirror is unreachable from here — free it or it
+                    // leaks one full-pool mmap per recycle.
+                    _ = c.munmap(gop.value_ptr.ptr, gop.value_ptr.size);
+                    _ = c.close(gop.value_ptr.fd);
+                }
+                gop.value_ptr.* = .{ .fd = fd, .ptr = @ptrCast(ptr.?), .size = sz };
             },
             .pool_resize => |p| {
                 const mirror = nv.pools.getPtr(p.id) orelse return error.NoSuchPool;
@@ -2672,10 +2733,18 @@ pub const Daemon = struct {
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
                 try wlpipe.appendPoolMeta(units, a, .pool_resize, p.id, @intCast(sz));
             },
-            .pool_destroy => {
-                // Keep the mirror: live buffers still reference the
-                // pool memory (wl_shm_pool destructor semantics).
+            .pool_destroy => |pd| {
+                // Reclaim now if no buffer references the pool memory;
+                // otherwise mark it and reclaim on the last
+                // buffer_destroy (wl_shm_pool destructor semantics).
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+                if (nv.pools.getPtr(pd.id)) |m| {
+                    if (m.buffers == 0) {
+                        try nv.reclaimPool(units, a, pd.id);
+                    } else {
+                        m.destroyed = true;
+                    }
+                }
             },
             .commit => |cm| {
                 // Copy the damaged rows (full buffer when the client
