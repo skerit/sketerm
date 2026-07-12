@@ -1519,8 +1519,20 @@ fn sigNoop(_: c_int) callconv(.c) void {}
 
 pub fn main() u8 {
     _ = c.signal(c.SIGPIPE, &sigNoop);
-    var gpa_state: std.heap.DebugAllocator(.{}) = .{};
-    defer _ = gpa_state.deinit();
+    // safety=true forces allocation tracking even in ReleaseFast (the
+    // repo's default optimize mode), where it is off by default — so
+    // the leak check below actually runs.
+    var gpa_state: std.heap.DebugAllocator(.{ .safety = true }) = .{};
+    // The daemon is fully deinit'd before we return (thread joined,
+    // d.deinit called), so a clean run must leave ZERO outstanding
+    // allocations. Failing on a leak here is the regression guard for
+    // the daemon-side memory leaks (unreclaimed pool mirrors, and the
+    // per-commit pixel-encode scratch that ballooned an animated
+    // forwarded app to 15GB) — both exercised by realAppStage.
+    defer if (gpa_state.deinit() == .leak) {
+        std.debug.print("smoke-mux: FAIL — daemon leaked memory (see GPA report above)\n", .{});
+        std.process.exit(1);
+    };
     const allocator = gpa_state.allocator();
 
     // On a capture-capable macOS build, the daemon would auto-enable

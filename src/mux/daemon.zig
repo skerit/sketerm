@@ -519,6 +519,13 @@ const Native = struct {
     /// encoded vcodec tile blob.
     vscratch: std.ArrayList(u8) = .empty,
     vblob: std.ArrayList(u8) = .empty,
+    /// Lossless pixel-encode scratch (filter work buffer + zstd out),
+    /// reused across EVERY commit. Persisting it here is both the
+    /// leak fix (a per-commit local was never deinit'd — a
+    /// continuously-rendering app leaked a frame-sized buffer per
+    /// frame) and an allocation-churn win (buffers stay at high
+    /// water instead of realloc-per-frame).
+    pixscratch: wlpixcodec.Scratch = .{},
     /// Set once the attached client advertises it can decode the video
     /// codec (capability negotiation — not yet implemented). Until then
     /// videoCommit stays dormant: never emit a tile no client can decode.
@@ -618,6 +625,7 @@ const Native = struct {
         self.vstate.deinit(self.allocator);
         self.vscratch.deinit(self.allocator);
         self.vblob.deinit(self.allocator);
+        self.pixscratch.deinit(self.allocator);
         var kit = self.icon_seen.keyIterator();
         while (kit.next()) |k| self.allocator.free(k.*);
         self.icon_seen.deinit(self.allocator);
@@ -2317,6 +2325,31 @@ pub const Daemon = struct {
         return cl.attached == s and !cl.dead and cl.proto >= 5;
     }
 
+    /// Per-viewer outbound backlog above which the native commit path
+    /// stops producing new pixel frames for that viewer — the same
+    /// backpressure the winstream path applies (:pumpWinstreams). A
+    /// Wayland surface's state lives in the mirror, so a viewer that
+    /// falls behind doesn't need every intermediate frame: it catches
+    /// up on the NEXT commit it can receive (or via reattach replay).
+    const NATIVE_BACKLOG: usize = 8 << 20;
+
+    /// Should the commit path copy+encode this frame at all? True only
+    /// when some attached proto>=5 viewer has room in its wbuf. With
+    /// no viewer, OR every viewer already backed up, skip: the units
+    /// would only pile into a wbuf (growing toward the reap cap) for
+    /// frames the viewer can't keep up with. This is what stops a
+    /// headless daemon running an animated app from ballooning —
+    /// previously each commit encoded a frame nobody drained and a
+    /// per-commit scratch leaked on top. Conservative: a channel with
+    /// no session (shouldn't happen) reports ready so pixels flow.
+    fn hasNativeViewer(self: *const Daemon, nv: *const Native) bool {
+        const s = (nv.chan orelse return true).session orelse return true;
+        for (self.clients.items) |cl| {
+            if (nativeViewer(cl, s) and cl.wbuf.items.len < NATIVE_BACKLOG) return true;
+        }
+        return false;
+    }
+
     /// Re-evaluate the per-channel video consensus after client churn.
     fn refreshVideoGates(self: *Daemon) void {
         for (self.channels.items) |ch| {
@@ -2783,10 +2816,17 @@ pub const Daemon = struct {
                 // pool, so the range is one linear copy. A dmabuf
                 // buffer reads from its CPU mapping instead, bracketed
                 // by DMA_BUF_SYNC for coherency with the GPU.
-                const mirror_opt: ?Native.PoolMirror = if (cm.info.dmabuf)
-                    nv.dmabufs.get(cm.buffer)
+                //
+                // Skip the whole pixel copy+encode when no client is
+                // watching this session: the units would be dropped by
+                // queueUnits anyway, and a reattaching viewer gets the
+                // live mirror re-encoded by replayNativeChannels. Saves
+                // a headless daemon (MCP running an animated app) from
+                // burning CPU zstd-encoding frames for nobody.
+                const mirror_opt: ?Native.PoolMirror = if (self.hasNativeViewer(nv))
+                    (if (cm.info.dmabuf) nv.dmabufs.get(cm.buffer) else nv.pools.get(cm.info.pool))
                 else
-                    nv.pools.get(cm.info.pool);
+                    null;
                 if (mirror_opt) |mirror| {
                     if (cm.info.offset >= 0 and cm.info.stride > 0 and cm.info.height > 0) {
                         var y0: i64 = 0;
@@ -2813,7 +2853,11 @@ pub const Daemon = struct {
                                 // row, and arbitrary byte cuts would misalign it.
                                 const stride: usize = @intCast(cm.info.stride);
                                 const rows_per_chunk: i64 = @intCast(@max(1, POOL_CHUNK / stride));
-                                var sc: wlpixcodec.Scratch = .{}; // arena-backed; reset on drain
+                                // Persistent scratch (reused every commit) — a
+                                // per-commit local here leaked a frame-sized
+                                // buffer per frame (the 15GB daemon: any
+                                // continuously-rendering forwarded app).
+                                const sc = &nv.pixscratch;
                                 var y = y0;
                                 while (y < y1) {
                                     const yc = @min(y + rows_per_chunk, y1);
@@ -2822,7 +2866,7 @@ pub const Daemon = struct {
                                     const end = @min(off +| len, mirror.size);
                                     if (off < end) {
                                         const raw = mirror.ptr[off..end];
-                                        const enc = wlpixcodec.encodeRegion(&sc, a, raw, stride) catch
+                                        const enc = wlpixcodec.encodeRegion(sc, a, raw, stride) catch
                                             wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
                                         try wlpipe.appendPoolUpdateC(units, a, cm.info.pool, @intCast(off), enc, @intCast(raw.len), @intCast(stride));
                                     }
@@ -2850,9 +2894,16 @@ pub const Daemon = struct {
         } else if (ch.pa != null) {
             // PCM only flows to viewers that SUBSCRIBED — flooding a
             // terminal-only client would blow its output cap and take
-            // the whole connection down.
+            // the whole connection down. And only to a subscriber with
+            // room: an attached-but-idle viewer (e.g. an MCP client
+            // between tool calls) sends no `consumed` reports, so the
+            // stream self-clocks and would otherwise pour PCM into its
+            // wbuf at the app's full production rate. Dropping audio
+            // for a viewer that isn't draining is correct — it isn't
+            // playing it anyway, and fresh PCM resumes when it does.
             for (self.clients.items) |cl| {
-                if (nativeViewer(cl, ch.session.?) and cl.audio_ok) self.queueUnitsTo(cl, ch, bytes);
+                if (nativeViewer(cl, ch.session.?) and cl.audio_ok and cl.wbuf.items.len < NATIVE_BACKLOG)
+                    self.queueUnitsTo(cl, ch, bytes);
             }
         } else if (ch.client) |cl| {
             if (!cl.dead) self.queueUnitsTo(cl, ch, bytes);
