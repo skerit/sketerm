@@ -7137,3 +7137,36 @@ Live MCP drive over stdio: sh SIGSEGV reported as -11/SIGSEGV,
 env/cwd echoed in recent_output, weston-terminal launch returned an
 inline PNG, region{10,10,40,20}+zoom4 captioned "MULTIPLY by 0.250
 then ADD (10,10)", app_output showed the app's real stderr.
+
+## output_only actually delivers (bash integration) + zxdg confirmed
+
+Round-2 feedback: botf reported output_only had no effect. Three
+stacked causes, all fixed. (1) bash had no auto-injection (zsh/fish
+only) — added: bare interactive bash spawns get `--rcfile <shim>`
+(no env override exists; the shim sources /etc/bash.bashrc +
+~/.bashrc then the integration script), resolution shared with
+headless spawns via the new util/shellintegration.zig. (2) The bash
+script's DEBUG-trap C fired for the distro's own PROMPT_COMMAND
+entries too (verified with a raw `script` capture on Arch), opening
+a spurious zone at the next-prompt row — C now comes from PS0
+(bash >= 4.4), which expands exactly once per interactive command.
+(3) Screen-side, a mid-line C captured the command-echo row as the
+zone start; the capture now defers to the next linefeed, and a
+completed zone with zero output rows extracts as "" + exit code
+instead of "no zone". Also: term_open never requested integration at
+all — termdrive now resolves and sends it in the SpawnReq — and when
+no zone exists (unsupported shell) term_run/run_command SAY SO
+instead of silently returning the screen shape.
+
+ds9dw's residual (SDL dying in Wayland init, missing xdg-output) was
+already fixed by the zxdg_output_manager_v1 commit — their session
+ran a pre-fix daemon. Confirmed live: launch_app wayland-info on a
+fresh isolated daemon lists zxdg_output_manager_v1 v3.
+
+Verified: 699/705 tests (+1 shellintegration resolve, +1 mid-line-C
+zone); smoke-mux/mcp/e2e PASS, mux-portable + aarch64-macos cross OK.
+Live MCP drive (bash $SHELL): term_run output_only returned
+"exit: 1\n---\nout-only-works" (no prompt/echo/padding), compound
+"a && b; false" captured both lines, bare `false` returned an empty
+zone with exit 1, /bin/sh fell back WITH the announcement, and fish
+zones work through the same plumbing.
