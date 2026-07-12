@@ -7059,3 +7059,29 @@ announced; default -> softgl + no global); full GUI chain under Xvfb
 with a planted GpuProbe.desktop: context-menu launch went GPU, plain
 activate stayed software, gpu_apps config flipped the default;
 smoke-mux/mcp/e2e PASS.
+
+## Async remote-mux reattach on layout restore (no more startup freeze)
+
+Loading a layout with remote mux panes connected synchronously on the
+GTK main loop — a dead/stalling host froze the whole GUI for the full
+ssh retry window (~61s) or forever (the attach recvExpect had no
+bound). Restore now spawns the local fallback pane immediately as a
+live placeholder and runs connect + attach in a detached thread
+(MuxRestoreJob in window.zig); the result lands via g_idle_add and
+swaps the placeholder in place through the existing takeover path
+(swapPaneInPlace), so splits/shaders/titles survive. Failure = toast +
+the pane stays a usable local shell. Local-daemon panes keep the sync
+path.
+
+Safety: jobs tracked on Window.mux_restore_jobs; window teardown marks
+them canceled (idle just drops the conn), a pane closed mid-connect is
+caught by pane-id lookup, and paneSpec consults pending jobs so saving
+mid-connect keeps mux_session/mux_host instead of demoting to a plain
+shell. The attach handshake gets SO_RCVTIMEO=30s so a remote that
+answers hello but wedges surfaces as a failure, not a stuck thread.
+
+Verified: 693/699 tests; e2e under Xvfb with fake $SKETERM_SSH — hang
+case kept IPC at ~50ms through the whole retry window, success case
+swapped pane 1 -> 2 and round-tripped send-text/get-text, second GUI
+attached the existing session with scrollback, Ctrl+Shift+S
+mid-connect saved the mux identity.
