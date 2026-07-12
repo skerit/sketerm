@@ -7085,3 +7085,55 @@ case kept IPC at ~50ms through the whole retry window, success case
 swapped pane 1 -> 2 and round-tripped send-text/get-text, second GUI
 attached the existing session with scrollback, Ctrl+Shift+S
 mid-connect saved the mux identity.
+
+## Mux memory leaks (the 15GB daemon) + MCP observability batch
+
+A user killed an MCP-owned isolated daemon at 15GB RSS. Root cause
+(confirmed by code, not repro): shm pool mirrors were NEVER reclaimed
+— pool_destroy was a deliberate no-op ("buffers still reference the
+memory") but buffer_destroy never re-checked, so every destroyed pool
+pinned its mmap AND its memfd's tmpfs pages forever; a recycled pool
+id even orphaned the old mapping on the spot. Fixed with a per-mirror
+live-buffer refcount (reclaim at destroyed+0), an id-recycle free, and
+the daemon now emits the pool_destroy pipe unit so replicas free too
+(compositor.zig had the handler all along; the same refcount now also
+runs in the compositor's own request path — brain + GUI replicas
+leaked pool bytes identically). Also: Client.wbuf gets a 256MB hard
+ceiling (a stalled-but-alive viewer is reaped and can reattach; the
+native unit stream is stateful so skipping frames winstream-style
+would corrupt it), drained rbuf/wbuf release multi-MB high-water
+capacity, and per-surface video encoders die with their surface.
+Separate race fix: sessionExited now retries the WNOHANG reap briefly
+before shipping .exit, so a segfaulting app reports -11/SIGSEGV
+instead of the default 0.
+
+MCP app tools, from two rounds of assistant feedback (observability
+was the gap; interaction was fine): appdrive keeps a termdrive-style
+Screen mirror of the app session's PTY — new app_output tool,
+recent_output + signal_name inlined once an app exits, exited apps
+report exit+output instead of "no such window". launch_app gained
+cwd/env (SpawnReq.env -> putenv in the PTY child), wait_for
+window|exit, and returns the first window's screenshot inline.
+screenshot_app/get_app_state gained region crop + integer zoom
+(png.upscaleRgba) with caption math back to app_click coords, plus
+wait_change=true (block until the window renders something newer than
+your last screenshot). run_command/term_run output_only=true returns
+just the OSC 133 zone output + exit code. Launch/attach handshakes are
+deadline-bounded (Conn.recvFrameFor/recvExpectFor); timeouts name the
+step and any half-arrived frame (wire.partialInfo). Spawn failures
+carry the real reason end to end (worker 'E' control datagram ->
+broker .err -> appdrive.lastLaunchErr() -> tool text). Compositor now
+implements zxdg_output_manager_v1 v3 (SDL stops logging "protocol
+missing" and gets real logical geometry, rescaled on set_scale).
+
+Also fixed in passing: smoke-mux had a latent double conn.deinit AND
+died of SIGPIPE from its in-process daemon (the real binary ignores
+it) — the two masked each other past the durability stage.
+
+Verified: 697/703 tests (+4: pool refcount lifecycle, zxdg event
+sequence, wire.partialInfo, png.upscaleRgba); smoke-mux/mcp/e2e PASS,
+mux-portable + aarch64-macos cross OK, sketerm-mux still libc-only.
+Live MCP drive over stdio: sh SIGSEGV reported as -11/SIGSEGV,
+env/cwd echoed in recent_output, weston-terminal launch returned an
+inline PNG, region{10,10,40,20}+zoom4 captioned "MULTIPLY by 0.250
+then ADD (10,10)", app_output showed the app's real stderr.
