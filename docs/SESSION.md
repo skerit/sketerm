@@ -7197,3 +7197,27 @@ audio init with live audio — previously only SDL_AUDIODRIVER=dummy
 got it there. +1 regression test parsing the server-info /
 source-list / stat reply layouts exactly. 700/706 tests,
 smoke-mux/mcp PASS, portable + macOS cross OK.
+
+## MCP: --log DIR trace + fail-fast on over-long socket paths
+
+`sketerm mcp --log DIR` traces everything the server does: one JSONL
+entry per JSON-RPC request/response in mcp-<pid>.jsonl (payloads over
+4KB truncated with full_len recorded, never mid-UTF-8; start/exit
+notes carry pid/mode/instance/GUI socket), and every inline
+screenshot saved verbatim as img-<pid>-NNNN.png via the imageResult
+choke point (catches screenshot_app, screenshot_pane, launch_app's
+first-window shot) with an "image" entry referencing the file. Works
+in all modes; pid-prefixed names keep restarts appending into one dir
+collision-free. Dir open failure is a startup error, not silent.
+
+Also: isolated mode now validates the private daemon's mux.sock path
+against the sun_path limit at startup (reusing fillSockaddrUn) — a
+deep XDG_RUNTIME_DIR used to surface only as MuxDaemonUnreachable on
+the first app tool call; now it exits immediately naming the path,
+the limit, and the fix.
+
+Verified: 701/707 tests (+2: flag parsing, McpLog file behavior incl.
+truncation and PNG round-trip), smoke-mcp PASS, live e2e (gedit via
+launch_app + screenshot_app under --log produced valid 1568x993 PNGs
+and a fully JSON-parseable trace), long-path repro now errors at
+startup with exit 1 while normal startup is unaffected.
