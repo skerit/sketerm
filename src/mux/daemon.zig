@@ -81,6 +81,11 @@ pub const SpawnReq = struct {
     /// single-instance apps so each forwarded copy renders on its own
     /// client instead of coalescing into the first one.
     isolated: bool = false,
+    /// GPU rendering for this session (`sketerm app --gpu`): skip the
+    /// LIBGL_ALWAYS_SOFTWARE force and announce linux-dmabuf on the
+    /// session's compositor. Only useful where the exporting driver
+    /// allows CPU mmap of linear buffers.
+    gpu: bool = false,
     /// GUI pane id + IPC socket to export into the child env as
     /// SKETERM_PANE_ID / SKETERM_SOCKET so `sketerm cli --pane self` works
     /// from inside a daemon-backed pane. The GUI passes its own values; they
@@ -170,6 +175,9 @@ const Session = struct {
     exit_status: i32 = 0,
     /// Spawned via `sketerm app -u` — a forwarded GUI app, not a shell.
     app: bool = false,
+    /// GPU opt-in (SpawnReq.gpu): the session's compositor announces
+    /// linux-dmabuf and the child keeps its real GL driver.
+    gpu: bool = false,
     /// Compiled xkb keymap for this session's app keyboards (points
     /// at an embedded wlhost/keymaps.zig blob; never freed).
     kb_keymap: []const u8 = wlcomp.us_keymap,
@@ -2295,8 +2303,9 @@ pub const Daemon = struct {
         brain.keymap = s.kb_keymap;
         // Opt-in (see get_registry): only useful where the exporting
         // driver allows CPU mmap of linear buffers; the softgl force
-        // in pty.zig is dropped by the same env var.
-        brain.advertise_dmabuf = c.getenv("SKETERM_MUX_DMABUF") != null;
+        // in pty.zig is dropped by the same switches. Per-session via
+        // SpawnReq.gpu (`sketerm app --gpu`), daemon-wide via env.
+        brain.advertise_dmabuf = s.gpu or c.getenv("SKETERM_MUX_DMABUF") != null;
         native.* = .{ .allocator = self.allocator, .tracker = tracker, .brain = brain };
 
         const ch = self.allocator.create(Channel) catch {
@@ -3577,6 +3586,7 @@ pub const Daemon = struct {
             .pulse_server = if (pa_env_z) |z| z.ptr else null,
             .runtime_dir = if (rt_dir_z) |z| z.ptr else null,
             .a11y_bus_addr = if (a11y_addr_z) |z| z.ptr else null,
+            .gpu = req.gpu,
         });
         errdefer _ = pty.closeAndReap();
         // The poll loop does bounded read rounds — master must not
@@ -3607,6 +3617,7 @@ pub const Daemon = struct {
             .pool = pool,
             .screen = screen,
             .app = req.app,
+            .gpu = req.gpu,
             .kb_keymap = wlkeymaps.get(req.kb_layout) orelse blk: {
                 std.debug.print("sketerm-mux: unknown kb_layout '{s}' (have: {s}) — using us\n", .{ req.kb_layout, wlkeymaps.names });
                 break :blk wlcomp.us_keymap;

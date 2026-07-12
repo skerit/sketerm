@@ -61,6 +61,11 @@ pub const SpawnOpts = struct {
     /// sessions: the daemon reads the app's AT-SPI tree from this bus.
     /// Sets DBUS_SESSION_BUS_ADDRESS + the toolkit a11y-enable vars.
     a11y_bus_addr: ?[*:0]const u8 = null,
+    /// Per-session GPU opt-in (`sketerm app --gpu`): skip the
+    /// LIBGL_ALWAYS_SOFTWARE force so Mesa renders on the real GPU and
+    /// presents linear dmabufs (the session's compositor announces
+    /// linux-dmabuf when this is set).
+    gpu: bool = false,
 };
 
 pub const ShellIntegration = struct {
@@ -188,11 +193,13 @@ pub const Pty = struct {
             // probe can crash GL apps at startup, and llvmpipe renders
             // into shm, exactly what the pixel pipeline ships. The
             // compositor DOES speak linux-dmabuf (LINEAR-only, CPU-
-            // mapped import) — SKETERM_MUX_DMABUF=1 on the daemon
-            // drops this force so Mesa renders on the real GPU and
-            // presents linear dmabufs. SKETERM_MUX_NO_SOFTGL=1 also
-            // opts out; an explicit user value is respected.
-            if (c.getenv("SKETERM_MUX_NO_SOFTGL") == null and
+            // mapped import) — opts.gpu (per session) or
+            // SKETERM_MUX_DMABUF=1 (daemon-wide) drops this force so
+            // Mesa renders on the real GPU and presents linear
+            // dmabufs. SKETERM_MUX_NO_SOFTGL=1 also opts out; an
+            // explicit user value is respected.
+            if (!opts.gpu and
+                c.getenv("SKETERM_MUX_NO_SOFTGL") == null and
                 c.getenv("SKETERM_MUX_DMABUF") == null)
                 _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
         }
