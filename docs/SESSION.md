@@ -7031,3 +7031,31 @@ memfd-backed create_immed buffer renders solid red pixel-perfect,
 survives detach → reattach with identical pixels; zenity (GTK4/shm)
 regression green in default mode; smoke-mux/mcp/e2e PASS; all three
 binaries build, mux-portable static.
+
+## Per-session GPU opt-in: --gpu / launcher menu / gpu_apps
+
+Replaced the daemon-wide SKETERM_MUX_DMABUF env juggle with a
+per-session switch: SpawnReq.gpu (append-only JSON; old daemons
+ignore it) stores on the Session, skips the LIBGL_ALWAYS_SOFTWARE
+force in pty.zig for that child only, and flips advertise_dmabuf on
+that session's compositor brain. The env vars remain as daemon-wide
+overrides.
+
+Entry points:
+- `sketerm app --gpu <host> <cmd>` (leading flag, like -u/-i, so the
+  app's own flags pass through untouched).
+- MCP launch_app gained an optional `gpu` boolean.
+- GUI app launcher: right-click a row -> "Launch with GPU" context
+  menu (popover parented to the ROOT box, not the listbox —
+  clearList walks the listbox children and a non-row child wedges it
+  in an infinite remove loop; found live under Xvfb).
+- `gpu_apps = Blender, mpv` config key: launcher activations match
+  the .desktop Name or Exec basename case-insensitively and default
+  those apps to GPU (Config.appWantsGpu).
+
+Verified: 693/699 unit tests (+2: --gpu parse, gpu_apps matcher);
+MCP probe both ways (gpu:true -> LIBGL unset + zwp_linux_dmabuf
+announced; default -> softgl + no global); full GUI chain under Xvfb
+with a planted GpuProbe.desktop: context-menu launch went GPU, plain
+activate stayed software, gpu_apps config flipped the default;
+smoke-mux/mcp/e2e PASS.
