@@ -20,6 +20,7 @@ const termdrive = @import("termdrive.zig");
 
 const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
+    \\                   [--log DIR]
     \\
     \\Runs a Model Context Protocol server on stdio. Register it in an
     \\MCP client (Claude Code, etc.) as command "sketerm" with args
@@ -43,6 +44,11 @@ const MCP_HELP =
     \\--shared (then $SKETERM_SOCKET / the single *.sock under
     \\$XDG_RUNTIME_DIR/sketerm/). Isolated mode without --socket
     \\leaves them disabled with a clear error.
+    \\
+    \\  --log DIR      trace everything to DIR: every JSON-RPC request
+    \\                 and response as one line in mcp-<pid>.jsonl
+    \\                 (long lines truncated), and every inline
+    \\                 screenshot saved as img-<pid>-NNNN.png
     \\
     \\Headless GUI-app tools (no GUI needed; apps render into the mux
     \\daemon, never on a screen): launch_app, list_apps, app_windows,
@@ -80,6 +86,7 @@ pub const Opts = struct {
     shared: bool = false,
     durable: bool = false,
     name: ?[]const u8 = null,
+    log_dir: ?[]const u8 = null,
     help: bool = false,
 
     pub const ParseError = error{ UnknownFlag, MissingValue, BadName, SharedConflict };
@@ -103,6 +110,10 @@ pub const Opts = struct {
                 if (!validInstanceName(args[i])) return error.BadName;
                 o.name = args[i];
                 o.durable = true; // a name exists to be found again
+            } else if (std.mem.eql(u8, a, "--log")) {
+                if (i + 1 >= args.len) return error.MissingValue;
+                i += 1;
+                o.log_dir = args[i];
             } else if (std.mem.eql(u8, a, "--help")) {
                 o.help = true;
             } else {
@@ -123,6 +134,111 @@ fn validInstanceName(n: []const u8) bool {
     }
     return true;
 }
+
+/// `--log DIR` trace: one JSONL entry per MCP message plus every
+/// inline screenshot as a standalone PNG so the trace stays small.
+const McpLog = struct {
+    allocator: std.mem.Allocator,
+    /// Owned copy of the --log flag value, no trailing slash assumed.
+    dir: []u8,
+    file: *c.FILE,
+    img_seq: u32 = 0,
+
+    /// Longest raw payload kept verbatim per entry; base64 screenshot
+    /// replies would otherwise dominate the file (the PNG is saved
+    /// separately anyway).
+    const LINE_MAX: usize = 4096;
+
+    fn open(allocator: std.mem.Allocator, dir_arg: []const u8) ?McpLog {
+        var z: [4096]u8 = undefined;
+        const dir_z = std.fmt.bufPrintZ(&z, "{s}", .{dir_arg}) catch return null;
+        _ = c.mkdir(dir_z.ptr, 0o700); // parent must exist; fopen below is the real check
+        const path = std.fmt.bufPrintZ(&z, "{s}/mcp-{d}.jsonl", .{ dir_arg, c.getpid() }) catch return null;
+        const f = c.fopen(path.ptr, "a") orelse return null;
+        const dir = allocator.dupe(u8, dir_arg) catch {
+            _ = c.fclose(f);
+            return null;
+        };
+        return .{ .allocator = allocator, .dir = dir, .file = f };
+    }
+
+    fn close(self: *McpLog) void {
+        _ = c.fclose(self.file);
+        self.allocator.free(self.dir);
+    }
+
+    fn stamp(buf: *[40]u8) []const u8 {
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+        var tm: c.struct_tm = undefined;
+        _ = c.localtime_r(&ts.tv_sec, &tm);
+        const ms: u32 = @intCast(@divTrunc(ts.tv_nsec, 1_000_000));
+        return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+            @as(u32, @intCast(@as(i64, tm.tm_year) + 1900)), @as(u32, @intCast(tm.tm_mon + 1)),
+            @as(u32, @intCast(tm.tm_mday)), @as(u32, @intCast(tm.tm_hour)),
+            @as(u32, @intCast(tm.tm_min)),  @as(u32, @intCast(tm.tm_sec)),
+            ms,
+        }) catch buf[0..0];
+    }
+
+    fn emit(self: *McpLog, entry: []const u8) void {
+        _ = c.fwrite(entry.ptr, 1, entry.len, self.file);
+        _ = c.fputc('\n', self.file);
+        _ = c.fflush(self.file);
+    }
+
+    /// Log one raw JSON-RPC message. `event` is "in" or "out".
+    fn logMessage(self: *McpLog, event: []const u8, raw: []const u8) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        var aw: std.Io.Writer.Allocating = .init(arena_state.allocator());
+        const w = &aw.writer;
+        var tbuf: [40]u8 = undefined;
+        w.print("{{\"ts\":\"{s}\",\"event\":\"{s}\",\"line\":", .{ stamp(&tbuf), event }) catch return;
+        var keep = @min(raw.len, LINE_MAX);
+        // Never split a UTF-8 sequence — Stringify wants valid UTF-8.
+        while (keep > 0 and (raw[keep - 1] & 0xC0) == 0x80) keep -= 1;
+        std.json.Stringify.value(raw[0..keep], .{}, w) catch return;
+        if (keep < raw.len) w.print(",\"truncated\":true,\"full_len\":{d}", .{raw.len}) catch return;
+        w.writeAll("}") catch return;
+        self.emit(aw.written());
+    }
+
+    /// Save an inline screenshot as img-<pid>-NNNN.png + a trace entry.
+    fn logImage(self: *McpLog, caption: []const u8, png: []const u8) void {
+        self.img_seq += 1;
+        var z: [4096]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&z, "{s}/img-{d}-{d:0>4}.png", .{ self.dir, c.getpid(), self.img_seq }) catch return;
+        if (c.fopen(path.ptr, "wb")) |f| {
+            _ = c.fwrite(png.ptr, 1, png.len, f);
+            _ = c.fclose(f);
+        }
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        var aw: std.Io.Writer.Allocating = .init(arena_state.allocator());
+        const w = &aw.writer;
+        var tbuf: [40]u8 = undefined;
+        w.print("{{\"ts\":\"{s}\",\"event\":\"image\",\"file\":\"img-{d}-{d:0>4}.png\",\"bytes\":{d},\"caption\":", .{ stamp(&tbuf), c.getpid(), self.img_seq, png.len }) catch return;
+        std.json.Stringify.value(caption, .{}, w) catch return;
+        w.writeAll("}") catch return;
+        self.emit(aw.written());
+    }
+
+    /// Free-form marker entry (session start/stop, mode info).
+    fn logNote(self: *McpLog, note: []const u8) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        var aw: std.Io.Writer.Allocating = .init(arena_state.allocator());
+        const w = &aw.writer;
+        var tbuf: [40]u8 = undefined;
+        w.print("{{\"ts\":\"{s}\",\"event\":\"note\",\"note\":", .{stamp(&tbuf)}) catch return;
+        std.json.Stringify.value(note, .{}, w) catch return;
+        w.writeAll("}") catch return;
+        self.emit(aw.written());
+    }
+};
+
+var mcp_log: ?McpLog = null;
 
 /// The private daemon instance of an isolated (non `--shared`) run.
 const Isolation = struct {
@@ -239,6 +355,18 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         return 0;
     }
 
+    if (opts.log_dir) |ld| {
+        mcp_log = McpLog.open(allocator, ld) orelse {
+            _ = c.fputs("sketerm mcp: cannot open --log dir (parent must exist and be writable)\n", platform.stderr());
+            return 1;
+        };
+    }
+    defer if (mcp_log) |*l| {
+        l.logNote("mcp server exiting");
+        l.close();
+        mcp_log = null;
+    };
+
     // Isolated (default): app tools get a private daemon; the user's
     // per-user daemon and GUI stay out of reach. --shared opts into
     // the real daemon + running GUI.
@@ -295,6 +423,17 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
 
     installQuitSignals();
 
+    if (mcp_log) |*l| {
+        var nbuf: [512]u8 = undefined;
+        const note = std.fmt.bufPrint(&nbuf, "mcp server started: pid={d} mode={s} name={s} gui_socket={s}", .{
+            c.getpid(),
+            if (opts.shared) "shared" else "isolated",
+            opts.name orelse "-",
+            sock_path orelse "-",
+        }) catch "mcp server started";
+        l.logNote(note);
+    }
+
     // stdin loop: one JSON-RPC message per line.
     var lineptr: [*c]u8 = null;
     var linecap: usize = 0;
@@ -305,11 +444,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         var line: []const u8 = lineptr[0..@intCast(n)];
         line = std.mem.trim(u8, line, " \t\r\n");
         if (line.len == 0) continue;
+        if (mcp_log) |*l| l.logMessage("in", line);
 
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const reply = handleMessage(arena_state.allocator(), backend, line);
         if (reply) |r| {
+            if (mcp_log) |*l| l.logMessage("out", r);
             _ = c.fwrite(r.ptr, 1, r.len, platform.stdout());
             _ = c.fputc('\n', platform.stdout());
             _ = c.fflush(platform.stdout());
@@ -479,6 +620,7 @@ fn rpcError(arena: std.mem.Allocator, id: std.json.Value, code: i32, msg: []cons
 /// inline image content block. base64 emits no newlines, so the
 /// NDJSON framing is safe.
 fn imageResult(arena: std.mem.Allocator, caption: []const u8, png_bytes: []const u8) ?[]const u8 {
+    if (mcp_log) |*l| l.logImage(caption, png_bytes);
     const enc = std.base64.standard.Encoder;
     const b64 = arena.alloc(u8, enc.calcSize(png_bytes.len)) catch return null;
     _ = enc.encode(b64, png_bytes);
@@ -1921,11 +2063,68 @@ test "mcp flag parsing: isolation modes" {
     const sock = try Opts.parse(&.{ "--socket", "/tmp/x.sock", "--shared" });
     try t.expect(sock.shared);
     try t.expectEqualStrings("/tmp/x.sock", sock.socket.?);
+    // --log works alongside every mode.
+    const logged = try Opts.parse(&.{ "--log", "/tmp/trace", "--durable" });
+    try t.expectEqualStrings("/tmp/trace", logged.log_dir.?);
+    try t.expect(logged.durable);
+    try t.expectError(error.MissingValue, Opts.parse(&.{"--log"}));
     // Errors.
     try t.expectError(error.MissingValue, Opts.parse(&.{"--name"}));
     try t.expectError(error.BadName, Opts.parse(&.{ "--name", "a/b" }));
     try t.expectError(error.BadName, Opts.parse(&.{ "--name", "" }));
     try t.expectError(error.UnknownFlag, Opts.parse(&.{"--bogus"}));
+}
+
+test "mcp log: entries and screenshot files land in the dir" {
+    const t = std.testing;
+    var dbuf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dbuf, "/tmp/sketerm-mcplog-test-{d}", .{c.getpid()});
+
+    var log = McpLog.open(t.allocator, dir) orelse return error.OpenFailed;
+    log.logNote("hello");
+    log.logMessage("in", "{\"method\":\"ping\"}");
+    // Oversized payload gets truncated, with the real length recorded.
+    const big = try t.allocator.alloc(u8, McpLog.LINE_MAX + 100);
+    defer t.allocator.free(big);
+    @memset(big, 'x');
+    log.logMessage("out", big);
+    log.logImage("shot of app 1", "\x89PNG-fake-bytes");
+    log.close();
+
+    var pbuf: [512]u8 = undefined;
+    const jsonl_z = try std.fmt.bufPrintZ(&pbuf, "{s}/mcp-{d}.jsonl", .{ dir, c.getpid() });
+    const f = c.fopen(jsonl_z.ptr, "r") orelse return error.NoLogFile;
+    var content: [16384]u8 = undefined;
+    const n = c.fread(&content, 1, content.len, f);
+    _ = c.fclose(f);
+    const text = content[0..n];
+
+    try t.expect(std.mem.indexOf(u8, text, "\"event\":\"note\",\"note\":\"hello\"") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"event\":\"in\"") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"truncated\":true,\"full_len\":4196") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"event\":\"image\"") != null);
+    try t.expect(std.mem.indexOf(u8, text, "\"caption\":\"shot of app 1\"") != null);
+    // Every entry parses as standalone JSON.
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, text, "\n"), '\n');
+    while (it.next()) |entry| {
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        _ = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), entry, .{});
+    }
+
+    // The PNG bytes were written out verbatim.
+    const img_z = try std.fmt.bufPrintZ(&pbuf, "{s}/img-{d}-0001.png", .{ dir, c.getpid() });
+    const imgf = c.fopen(img_z.ptr, "r") orelse return error.NoImageFile;
+    var ibuf: [64]u8 = undefined;
+    const in = c.fread(&ibuf, 1, ibuf.len, imgf);
+    _ = c.fclose(imgf);
+    try t.expectEqualStrings("\x89PNG-fake-bytes", ibuf[0..in]);
+
+    _ = c.unlink(img_z.ptr);
+    const jsonl_z2 = try std.fmt.bufPrintZ(&pbuf, "{s}/mcp-{d}.jsonl", .{ dir, c.getpid() });
+    _ = c.unlink(jsonl_z2.ptr);
+    const dir_z = try std.fmt.bufPrintZ(&pbuf, "{s}", .{dir});
+    _ = c.rmdir(dir_z.ptr);
 }
 
 test "instance name validation" {
