@@ -380,6 +380,19 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     }
     defer if (iso) |*i| i.deinit(allocator);
 
+    // Fail fast on a socket path over the sun_path limit — otherwise
+    // the daemon's bind fails only at the first app tool call, as an
+    // opaque MuxDaemonUnreachable.
+    if (iso) |i| {
+        var probe: c.struct_sockaddr_un = undefined;
+        @import("../mux/daemon.zig").fillSockaddrUn(&probe, i.sock) catch {
+            var msg_buf: [4224]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: socket path too long for a Unix socket ({d} chars, limit {d}):\n  {s}\npoint XDG_RUNTIME_DIR at a shorter path\n", .{ i.sock.len, probe.sun_path.len - 1, i.sock }) catch "sketerm mcp: socket path too long for a Unix socket\n";
+            _ = c.fputs(msg.ptr, platform.stderr());
+            return 1;
+        };
+    }
+
     // Terminal tools need a running GUI's socket. Shared mode resolves
     // it like `sketerm cli`; isolated mode only honors an EXPLICIT
     // --socket (no auto-discovery — that would pierce the isolation).
