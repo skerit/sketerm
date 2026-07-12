@@ -72,11 +72,13 @@ pub const SpawnOpts = struct {
 };
 
 pub const ShellIntegration = struct {
-    pub const Kind = enum { zsh, fish };
+    pub const Kind = enum { zsh, fish, bash };
     kind: Kind,
     /// Absolute path of the per-shell integration script.
     script: [*:0]const u8,
-    /// zsh: the ZDOTDIR shim dir; fish: the XDG_DATA_DIRS shim dir.
+    /// zsh: the ZDOTDIR shim dir; fish: the XDG_DATA_DIRS shim dir;
+    /// bash: the rcfile FILE injected as `--rcfile` (bash has no env
+    /// override for its interactive startup file).
     shim_dir: [*:0]const u8,
 };
 
@@ -254,6 +256,9 @@ pub const Pty = struct {
                         _ = c.setenv("XDG_DATA_DIRS", joined.ptr, 1);
                     } else |_| {}
                 },
+                // bash has no env override for its interactive rc
+                // file — injected via `--rcfile` on the argv below.
+                .bash => {},
             }
         }
 
@@ -280,7 +285,19 @@ pub const Pty = struct {
         var argv_buf: [64]?[*:0]u8 = undefined;
         var login_buf: [128:0]u8 = undefined;
         for (opts.argv, 0..) |arg, i| argv_buf[i] = @constCast(arg);
-        argv_buf[opts.argv.len] = null;
+        var argv_len = opts.argv.len;
+        // bash integration: inject `--rcfile <shim>` — but only for a
+        // BARE shell spawn (extra argv means a script/-c invocation,
+        // where trailing options would become the script's arguments).
+        // Login bash never reads an rcfile, so this stays inert there.
+        if (opts.shell_integration) |si| {
+            if (si.kind == .bash and argv_len == 1) {
+                argv_buf[argv_len] = @constCast("--rcfile");
+                argv_buf[argv_len + 1] = @constCast(si.shim_dir);
+                argv_len += 2;
+            }
+        }
+        argv_buf[argv_len] = null;
         if (opts.login_shell and opts.argv.len > 0) {
             const argv0_slice = std.mem.span(opts.argv[0]);
             // Find basename of the executable path.
