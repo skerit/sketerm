@@ -420,6 +420,17 @@ pub fn peelFrame(bytes: []const u8) error{ TooLong, Malformed }!?struct { frame:
     };
 }
 
+/// Progress of a PARTIALLY buffered frame: bytes the frame declares
+/// vs bytes arrived. Null when the buffer is empty or holds a
+/// complete frame — only useful for "stuck at N of M" diagnostics.
+pub fn partialInfo(bytes: []const u8) ?struct { expected: usize, have: usize } {
+    if (bytes.len == 0) return null;
+    if (bytes.len < 5) return .{ .expected = 5, .have = bytes.len };
+    const len = std.mem.readInt(u32, bytes[0..4], .little);
+    if (bytes.len >= 4 + @as(usize, len)) return null; // complete
+    return .{ .expected = 4 + @as(usize, len), .have = bytes.len };
+}
+
 // ── tests ───────────────────────────────────────────────────────
 
 fn roundtrip(allocator: std.mem.Allocator, ev: Event) !Event {
@@ -545,4 +556,20 @@ test "wire: frame peel handles partial + complete + unknown type" {
     // Zero-length frame is malformed.
     const zero = [_]u8{ 0, 0, 0, 0, 0 };
     try std.testing.expectError(error.Malformed, peelFrame(&zero));
+}
+
+test "partialInfo reports expected-vs-buffered for a half frame" {
+    const t2 = std.testing;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t2.allocator);
+    try appendFrame(&out, t2.allocator, .events, "hello world");
+    // Complete frame → null.
+    try t2.expectEqual(@as(?@TypeOf(partialInfo("").?), null), partialInfo(out.items));
+    // Half a frame → declared total vs buffered so far.
+    const half = out.items[0 .. out.items.len - 4];
+    const p = partialInfo(half).?;
+    try t2.expectEqual(out.items.len, p.expected);
+    try t2.expectEqual(half.len, p.have);
+    // Empty buffer → null.
+    try t2.expectEqual(@as(?@TypeOf(p), null), partialInfo(""));
 }

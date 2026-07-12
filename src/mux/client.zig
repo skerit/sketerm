@@ -467,6 +467,66 @@ pub const Conn = struct {
         }
     }
 
+    /// `recvFrame` with a deadline: error.Timeout when no COMPLETE
+    /// frame arrived within `timeout_ms` (partial bytes stay buffered
+    /// — inspect `pendingPartial` for a useful diagnostic).
+    pub fn recvFrameFor(self: *Conn, timeout_ms: i64) !OwnedFrame {
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+        const deadline = @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000) + timeout_ms;
+        while (true) {
+            if (try self.takeFrame()) |owned| return owned;
+            _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+            const remain = deadline - (@as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));
+            if (remain <= 0) return error.Timeout;
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            const pr = c.poll(&pfd, 1, @intCast(@min(remain, 100)));
+            if (pr < 0 and std.posix.errno(pr) != .INTR) return error.Disconnected;
+            if (pr <= 0) continue;
+            var tmp: [16384]u8 = undefined;
+            const n = c.read(self.fd, &tmp, tmp.len);
+            if (n == 0) return error.Disconnected;
+            if (n < 0) {
+                const e = std.posix.errno(n);
+                if (e == .AGAIN or e == .INTR) continue;
+                return error.Disconnected;
+            }
+            try self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]);
+        }
+    }
+
+    /// Half-arrived frame in the receive buffer, if any — for
+    /// timeout diagnostics ("2.1 MB of an 8.3 MB frame buffered").
+    pub fn pendingPartial(self: *const Conn) ?struct { expected: usize, have: usize } {
+        const p = wire.partialInfo(self.rbuf.items) orelse return null;
+        return .{ .expected = p.expected, .have = p.have };
+    }
+
+    /// Deadline-aware `recvExpect`; error.Timeout applies to the WHOLE
+    /// wait, however many unrelated frames arrive meanwhile.
+    pub fn recvExpectFor(self: *Conn, want: []const wire.FrameType, timeout_ms: i64) !OwnedFrame {
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+        const deadline = @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000) + timeout_ms;
+        while (true) {
+            _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+            const remain = deadline - (@as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));
+            if (remain <= 0) return error.Timeout;
+            const f = try self.recvFrameFor(remain);
+            for (want) |w| {
+                if (f.ftype == w) return f;
+            }
+            if (f.ftype == .err) {
+                const msg = errFieldOf(f.payload);
+                const n = @min(msg.len, self.last_err.len);
+                @memcpy(self.last_err[0..n], msg[0..n]);
+                self.last_err_len = n;
+                f.deinit(self.allocator);
+                return error.DaemonError;
+            }
+            f.deinit(self.allocator);
+        }
+    }
 
     /// Peel one complete frame out of the read buffer, or null when what is
     /// buffered so far is only PART of a frame. Never touches the fd, so it

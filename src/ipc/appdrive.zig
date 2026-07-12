@@ -8,6 +8,9 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const muxclient = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
+const snapshot = @import("../mux/snapshot.zig");
+const Screen = @import("../grid/screen.zig").Screen;
+const Pool = @import("../grid/style_pool.zig").Pool;
 const wlpipe = @import("../wlhost/pipe.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
 const png = @import("../util/png.zig");
@@ -34,6 +37,43 @@ pub const Error = error{
     NotRecording,
     OutOfMemory,
 };
+
+/// WHY the last `App.launch`/`attachExisting` failed, human-readable
+/// (the daemon's own error message when there was one). Error enums
+/// can't carry strings; MCP serves one assistant sequentially, so a
+/// module-level slot is safe.
+var launch_err_buf: [256]u8 = undefined;
+var launch_err_len: usize = 0;
+
+pub fn lastLaunchErr() []const u8 {
+    return launch_err_buf[0..launch_err_len];
+}
+
+fn setLaunchErr(comptime fmt: []const u8, args: anytype) void {
+    const s = std.fmt.bufPrint(&launch_err_buf, fmt, args) catch {
+        launch_err_len = 0;
+        return;
+    };
+    launch_err_len = s.len;
+}
+
+/// Describe a handshake-step failure, folding in the daemon's `.err`
+/// message and any half-arrived frame ("2.1 MB of 8.3 MB buffered").
+fn setStepErr(step: []const u8, conn: *muxclient.Conn, err: anyerror) void {
+    if (err == error.DaemonError) {
+        setLaunchErr("{s}: {s}", .{ step, conn.lastErr() });
+        return;
+    }
+    if (err == error.Timeout) {
+        if (conn.pendingPartial()) |p| {
+            setLaunchErr("{s}: timed out mid-frame ({d} of {d} bytes buffered)", .{ step, p.have, p.expected });
+        } else {
+            setLaunchErr("{s}: timed out waiting for the daemon's reply", .{step});
+        }
+        return;
+    }
+    setLaunchErr("{s}: {s}", .{ step, @errorName(err) });
+}
 
 /// Query the daemon host's installed GUI apps (name + exec) without
 /// spawning anything. `host` null = local autostart daemon. Returns a
@@ -110,6 +150,10 @@ pub const Window = struct {
     app_id: ?[]u8 = null,
     popup: bool = false,
     frames: u64 = 0,
+    /// `frames` at the last screenshot of this window — lets a
+    /// wait-for-change screenshot block until content actually differs
+    /// from what the caller last saw.
+    shot_frames: u64 = 0,
 
     fn deinit(self: *Window, a: std.mem.Allocator) void {
         self.pixels.deinit(a);
@@ -159,8 +203,31 @@ pub const App = struct {
     rec: ?gifrec.Rec = null,
     vrec: ?videorec.Rec = null,
     rec_win: u32 = 0,
+    /// Client-side Screen mirror of the app session's PTY (the app's
+    /// stdout/stderr as a rendered terminal — the "held log tab"),
+    /// built from the attach snapshot + the event stream, exactly like
+    /// termdrive.Term. This is what `output()` reads.
+    term_pool: ?*Pool = null,
+    term_screen: ?*Screen = null,
+    term_seq: u64 = 0,
 
     const ClipOffer = struct { chan: u32, source: u32, mime: []u8 };
+
+    /// Optional launch parameters (`launch_app` schema mirrors this).
+    pub const LaunchOpts = struct {
+        cols: u16 = 80,
+        rows: u16 = 24,
+        host: ?[]const u8 = null,
+        kb_layout: ?[]const u8 = null,
+        local_sock: ?[]const u8 = null,
+        gpu: bool = false,
+        cwd: ?[]const u8 = null,
+        /// "KEY=VALUE" strings for the child environment.
+        env: []const []const u8 = &.{},
+        /// Per-step handshake deadline; a stalled daemon surfaces as a
+        /// described SpawnFailed instead of a hung tool call.
+        step_timeout_ms: i64 = 15_000,
+    };
 
     /// Spawn an app session on the local (autostart) daemon, or on
     /// `host` over SSH, and attach as a proto-v5 viewer. `kb_layout`
@@ -171,25 +238,30 @@ pub const App = struct {
     pub fn launch(
         allocator: std.mem.Allocator,
         argv: []const []const u8,
-        cols: u16,
-        rows: u16,
-        host: ?[]const u8,
-        kb_layout: ?[]const u8,
-        local_sock: ?[]const u8,
-        gpu: bool,
+        opts: LaunchOpts,
     ) Error!*App {
-        const layout_name = kb_layout orelse "";
+        launch_err_len = 0;
+        const layout_name = opts.kb_layout orelse "";
         const blob = keymaps.get(layout_name) orelse return Error.BadLayout;
         var layout: ?xkblayout.Layout = xkblayout.parse(allocator, blob) catch null;
         errdefer if (layout) |*l| l.deinit(allocator);
         var conn = blk: {
-            if (host) |h| break :blk muxclient.Conn.connectSsh(allocator, h) catch return Error.SpawnFailed;
-            break :blk muxclient.Conn.connectLocalAutostartAt(allocator, local_sock) catch return Error.SpawnFailed;
+            if (opts.host) |h| break :blk muxclient.Conn.connectSsh(allocator, h) catch |err| {
+                setLaunchErr("ssh connect to {s}: {s}", .{ h, @errorName(err) });
+                return Error.SpawnFailed;
+            };
+            break :blk muxclient.Conn.connectLocalAutostartAt(allocator, opts.local_sock) catch |err| {
+                setLaunchErr("daemon connect: {s}", .{@errorName(err)});
+                return Error.SpawnFailed;
+            };
         };
         errdefer conn.deinit();
 
         conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.SpawnFailed;
-        (conn.recvExpect(&.{.welcome}) catch return Error.SpawnFailed).deinit(allocator);
+        (conn.recvExpectFor(&.{.welcome}, opts.step_timeout_ms) catch |err| {
+            setStepErr("hello handshake", &conn, err);
+            return Error.SpawnFailed;
+        }).deinit(allocator);
 
         name_counter += 1;
         const name = std.fmt.allocPrint(allocator, "mcpapp-{d}-{d}", .{ c.getpid(), name_counter }) catch
@@ -199,19 +271,29 @@ pub const App = struct {
         conn.sendJson(.spawn, .{
             .name = name,
             .argv = argv,
-            .rows = rows,
-            .cols = cols,
+            .rows = opts.rows,
+            .cols = opts.cols,
             .app = true,
             .kb_layout = layout_name,
-            .gpu = gpu,
+            .gpu = opts.gpu,
+            .cwd = opts.cwd,
+            .env = opts.env,
         }) catch return Error.SpawnFailed;
-        (conn.recvExpect(&.{.ok}) catch return Error.SpawnFailed).deinit(allocator);
+        (conn.recvExpectFor(&.{.ok}, opts.step_timeout_ms) catch |err| {
+            setStepErr("spawn", &conn, err);
+            return Error.SpawnFailed;
+        }).deinit(allocator);
         conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
-        (conn.recvExpect(&.{.snapshot}) catch return Error.SpawnFailed).deinit(allocator);
+        const snap = conn.recvExpectFor(&.{.snapshot}, opts.step_timeout_ms) catch |err| {
+            setStepErr("attach", &conn, err);
+            return Error.SpawnFailed;
+        };
+        defer snap.deinit(allocator);
 
         const self = allocator.create(App) catch return Error.OutOfMemory;
         self.* = .{ .allocator = allocator, .conn = conn, .name = name, .layout = layout };
         layout = null; // ownership moved
+        self.applyTermSnapshot(snap.payload);
         return self;
     }
 
@@ -226,24 +308,36 @@ pub const App = struct {
         kb_layout: ?[]const u8,
         local_sock: ?[]const u8,
     ) Error!*App {
+        launch_err_len = 0;
         const layout_name = kb_layout orelse "";
         const blob = keymaps.get(layout_name) orelse return Error.BadLayout;
         var layout: ?xkblayout.Layout = xkblayout.parse(allocator, blob) catch null;
         errdefer if (layout) |*l| l.deinit(allocator);
-        var conn = muxclient.Conn.connectLocalAutostartAt(allocator, local_sock) catch return Error.SpawnFailed;
+        var conn = muxclient.Conn.connectLocalAutostartAt(allocator, local_sock) catch |err| {
+            setLaunchErr("daemon connect: {s}", .{@errorName(err)});
+            return Error.SpawnFailed;
+        };
         errdefer conn.deinit();
 
         conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.SpawnFailed;
-        (conn.recvExpect(&.{.welcome}) catch return Error.SpawnFailed).deinit(allocator);
+        (conn.recvExpectFor(&.{.welcome}, 15_000) catch |err| {
+            setStepErr("hello handshake", &conn, err);
+            return Error.SpawnFailed;
+        }).deinit(allocator);
 
         const name = allocator.dupe(u8, session_name) catch return Error.OutOfMemory;
         errdefer allocator.free(name);
         conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
-        (conn.recvExpect(&.{.snapshot}) catch return Error.SpawnFailed).deinit(allocator);
+        const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch |err| {
+            setStepErr("attach", &conn, err);
+            return Error.SpawnFailed;
+        };
+        defer snap.deinit(allocator);
 
         const self = allocator.create(App) catch return Error.OutOfMemory;
         self.* = .{ .allocator = allocator, .conn = conn, .name = name, .layout = layout };
         layout = null; // ownership moved
+        self.applyTermSnapshot(snap.payload);
         return self;
     }
 
@@ -278,8 +372,68 @@ pub const App = struct {
         if (self.layout) |*l| l.deinit(a);
         if (self.rec) |*r| r.abort();
         if (self.vrec) |*r| r.abort();
+        if (self.term_screen) |s| s.deinit();
+        if (self.term_pool) |p| {
+            p.deinit();
+            a.destroy(p);
+        }
         a.free(self.name);
         a.destroy(self);
+    }
+
+    /// Rebuild the terminal mirror from an attach snapshot
+    /// ([seq:u64][app:u8] + serialized Screen). Best-effort: a decode
+    /// failure just leaves the mirror empty (output unavailable).
+    fn applyTermSnapshot(self: *App, payload: []const u8) void {
+        if (payload.len < 9) return;
+        const a = self.allocator;
+        self.term_seq = std.mem.readInt(u64, payload[0..8], .little);
+        if (self.term_screen) |s| s.deinit();
+        self.term_screen = null;
+        if (self.term_pool == null) {
+            const p = a.create(Pool) catch return;
+            p.* = Pool.init(a) catch {
+                a.destroy(p);
+                return;
+            };
+            self.term_pool = p;
+        } else {
+            self.term_pool.?.deinit();
+            self.term_pool.?.* = Pool.init(a) catch {
+                a.destroy(self.term_pool.?);
+                self.term_pool = null;
+                return;
+            };
+        }
+        self.term_screen = snapshot.restore(a, self.term_pool.?, payload[9..]) catch null;
+    }
+
+    /// Apply an `.events` frame ([seq:u64][count:u32] + wire events)
+    /// to the terminal mirror.
+    fn applyTermEvents(self: *App, payload: []const u8) void {
+        if (payload.len < 12) return;
+        const base = std.mem.readInt(u64, payload[0..8], .little);
+        const n = std.mem.readInt(u32, payload[8..12], .little);
+        const screen = self.term_screen orelse return;
+        var r = wire.Reader.init(payload[12..]);
+        while (!r.atEnd()) {
+            var ev = r.getEvent(self.allocator) catch break;
+            screen.apply(ev);
+            ev.deinit(self.allocator);
+        }
+        self.term_seq = base + n;
+    }
+
+    /// The app's PTY output (stdout+stderr as rendered by the
+    /// terminal). `scrollback` includes history above the grid.
+    /// Caller owns the bytes.
+    pub fn output(self: *App, scrollback: bool) Error![]u8 {
+        self.drain();
+        const screen = self.term_screen orelse return Error.NotConnected;
+        return (if (scrollback)
+            screen.extractScrollback(self.allocator)
+        else
+            screen.extractScreen(self.allocator)) catch Error.OutOfMemory;
     }
 
     // ── stream pumping ──────────────────────────────────────────
@@ -392,6 +546,8 @@ pub const App = struct {
                 };
                 ch.comp.clearOut(); // replica output is discarded
             },
+            .snapshot => self.applyTermSnapshot(payload),
+            .events => self.applyTermEvents(payload),
             .exit => {
                 self.exited = true;
                 if (payload.len >= 4) self.exit_status = std.mem.readInt(i32, payload[0..4], .little);
@@ -926,42 +1082,111 @@ pub const App = struct {
 
     pub const Shot = struct {
         png: []u8,
-        /// Emitted image dimensions (after any downscale).
+        /// Emitted image dimensions (after crop/zoom/downscale).
         img_w: u32,
         img_h: u32,
         /// Surface pixels per image pixel; multiply image coords by
-        /// this to get click coordinates. 1.0 = no downscale.
+        /// this (then add ox/oy) to get click coordinates. 1.0 = 1:1.
         scale: f64,
+        /// Surface coordinates of the image's top-left (crop origin).
+        ox: u32 = 0,
+        oy: u32 = 0,
     };
 
-    /// Latest committed pixels of one window as a PNG, downscaled so
-    /// neither dimension exceeds `max_dim` (0 = no bound). Caller
-    /// owns `.png`.
-    pub fn screenshotPng(self: *App, win_id: u32, max_dim: u32) Error!Shot {
+    /// Sub-rectangle of a window in surface pixels (screenshot crop).
+    pub const Region = struct { x: u32, y: u32, w: u32, h: u32 };
+
+    /// Latest committed pixels of one window as a PNG: optional
+    /// `region` crop, optional integer `zoom` (nearest-neighbor, for
+    /// pixel inspection), then downscaled so neither dimension exceeds
+    /// `max_dim` (0 = no bound). Caller owns `.png`.
+    pub fn screenshotPng(self: *App, win_id: u32, max_dim: u32, region: ?Region, zoom_req: u32) Error!Shot {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         if (win.w <= 0 or win.h <= 0 or win.pixels.items.len == 0) return Error.NoSuchWindow;
         const uw: u32 = @intCast(win.w);
         const uh: u32 = @intCast(win.h);
         const a = self.allocator;
-        const longest = @max(uw, uh);
-        if (max_dim == 0 or longest <= max_dim) {
+        win.shot_frames = win.frames;
+
+        var ox: u32 = 0;
+        var oy: u32 = 0;
+        var cw: u32 = uw;
+        var ch: u32 = uh;
+        if (region) |r| {
+            if (r.x >= uw or r.y >= uh or r.w == 0 or r.h == 0) return Error.NoSuchWindow;
+            ox = r.x;
+            oy = r.y;
+            cw = @min(r.w, uw - r.x);
+            ch = @min(r.h, uh - r.y);
+        }
+        const zoom: u32 = @max(1, zoom_req);
+        const longest = @max(cw, ch) * zoom;
+
+        // Fast path: whole window, no zoom, within the bound.
+        if (region == null and zoom == 1 and (max_dim == 0 or longest <= max_dim)) {
             const bytes = png.encodeShm(a, win.pixels.items, uw, uh, uw * 4, win.format) catch
                 return Error.OutOfMemory;
             return .{ .png = bytes, .img_w = uw, .img_h = uh, .scale = 1.0 };
         }
-        const rgba = png.shmToRgba(a, win.pixels.items, uw, uh, uw * 4, win.format) catch
+
+        var rgba = png.shmToRgba(a, win.pixels.items, uw, uh, uw * 4, win.format) catch
             return Error.OutOfMemory;
+        var rw: u32 = uw;
+        var rh: u32 = uh;
         defer a.free(rgba);
-        const dw: u32 = @max(1, uw * max_dim / longest);
-        const dh: u32 = @max(1, uh * max_dim / longest);
-        const small = png.downscaleRgba(a, rgba, uw, uh, dw, dh) catch return Error.OutOfMemory;
-        defer a.free(small);
-        const bytes = png.encodeRgba(a, small, dw, dh) catch return Error.OutOfMemory;
+
+        if (region != null) {
+            const crop = a.alloc(u8, @as(usize, cw) * ch * 4) catch return Error.OutOfMemory;
+            var y: usize = 0;
+            while (y < ch) : (y += 1) {
+                const src = ((@as(usize, oy) + y) * uw + ox) * 4;
+                @memcpy(crop[y * cw * 4 ..][0 .. @as(usize, cw) * 4], rgba[src..][0 .. @as(usize, cw) * 4]);
+            }
+            a.free(rgba);
+            rgba = crop;
+            rw = cw;
+            rh = ch;
+        }
+        if (zoom > 1) {
+            const big = png.upscaleRgba(a, rgba, rw, rh, zoom) catch return Error.OutOfMemory;
+            a.free(rgba);
+            rgba = big;
+            rw *= zoom;
+            rh *= zoom;
+        }
+        if (max_dim != 0 and @max(rw, rh) > max_dim) {
+            const l = @max(rw, rh);
+            const dw: u32 = @max(1, rw * max_dim / l);
+            const dh: u32 = @max(1, rh * max_dim / l);
+            const small = png.downscaleRgba(a, rgba, rw, rh, dw, dh) catch return Error.OutOfMemory;
+            a.free(rgba);
+            rgba = small;
+            rw = dw;
+            rh = dh;
+        }
+        const bytes = png.encodeRgba(a, rgba, rw, rh) catch return Error.OutOfMemory;
         return .{
             .png = bytes,
-            .img_w = dw,
-            .img_h = dh,
-            .scale = @as(f64, @floatFromInt(uw)) / @as(f64, @floatFromInt(dw)),
+            .img_w = rw,
+            .img_h = rh,
+            // Surface px per image px over the CROPPED region.
+            .scale = @as(f64, @floatFromInt(cw)) / @as(f64, @floatFromInt(rw)),
+            .ox = ox,
+            .oy = oy,
         };
+    }
+
+    /// Pump until this window has committed a frame NEWER than its
+    /// last screenshot (bounded). True when new content arrived.
+    pub fn waitWindowChange(self: *App, win_id: u32, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (nowMs() < deadline) {
+            const win = self.winById(win_id) orelse return false;
+            if (win.frames != win.shot_frames) return true;
+            if (self.exited) return false;
+            _ = self.pumpOnce(25);
+        }
+        const win = self.winById(win_id) orelse return false;
+        return win.frames != win.shot_frames;
     }
 };

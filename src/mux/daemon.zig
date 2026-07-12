@@ -67,6 +67,9 @@ pub const SpawnReq = struct {
     name: []const u8 = "",
     argv: []const []const u8 = &.{},
     cwd: ?[]const u8 = null,
+    /// Extra child environment, "KEY=VALUE" strings applied after the
+    /// daemon's own exports (so they win).
+    env: []const []const u8 = &.{},
     rows: u16 = 24,
     cols: u16 = 80,
     /// One-shot forwarded GUI app (`sketerm app -u`), not an
@@ -276,11 +279,16 @@ const Worker = struct {
     /// Owned copies of the worker's last-pushed title / cwd (null = none yet).
     title: ?[]u8 = null,
     cwd: ?[]u8 = null,
+    /// The worker's reported spawn-failure reason ('E' control datagram,
+    /// sent just before it dies), surfaced in the deferred `.err` reply.
+    spawn_err: ?[]u8 = null,
+
     fn deinit(self: *Worker) void {
         if (self.control_fd >= 0) _ = c.close(self.control_fd);
         self.allocator.free(self.name);
         if (self.title) |t| self.allocator.free(t);
         if (self.cwd) |cw| self.allocator.free(cw);
+        if (self.spawn_err) |e| self.allocator.free(e);
         self.allocator.destroy(self);
     }
 };
@@ -1182,6 +1190,14 @@ pub const Daemon = struct {
                 w.ready = true;
                 self.replyPendingSpawn(w, true);
             },
+            'E' => {
+                // Spawn-failure reason; the control EOF that follows
+                // triggers the actual `.err` reply.
+                if (self.allocator.dupe(u8, buf[1..@intCast(n)])) |e| {
+                    if (w.spawn_err) |old| self.allocator.free(old);
+                    w.spawn_err = e;
+                } else |_| {}
+            },
             'M' => {
                 var parsed = std.json.parseFromSlice(WorkerMeta, self.allocator, buf[1..@intCast(n)], .{
                     .ignore_unknown_fields = true,
@@ -1215,7 +1231,15 @@ pub const Daemon = struct {
         w.pending_client = null;
         for (self.clients.items) |c2| {
             if (c2 == cl and !c2.dead) {
-                if (ok) c2.queueJson(.ok, .{ .ok = true, .name = w.name }) else c2.queueErr("spawn failed");
+                if (ok) {
+                    c2.queueJson(.ok, .{ .ok = true, .name = w.name });
+                } else if (w.spawn_err) |reason| {
+                    var ebuf: [192]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&ebuf, "spawn failed: {s}", .{reason}) catch "spawn failed";
+                    c2.queueErr(msg);
+                } else {
+                    c2.queueErr("spawn failed (worker died during session setup)");
+                }
                 return;
             }
         }
@@ -1345,11 +1369,18 @@ pub const Daemon = struct {
     pub fn runWorker(allocator: std.mem.Allocator, control_fd: c_int, req: SpawnReq, base_dir: []const u8) !void {
         const self = try initWorker(allocator, control_fd, base_dir);
         defer self.deinit();
-        // If spawnSession fails we return the error → the caller `_exit`s →
-        // the broker sees control EOF before any 'Y' → it replies `.err` to
-        // the waiting client. On success, signal 'Y' (ready) so the broker
-        // sends the spawn `.ok` only once the session truly exists.
-        const s = try self.spawnSession(req);
+        // If spawnSession fails, report WHY over the control channel ('E' +
+        // error name) before dying — the broker folds it into the deferred
+        // spawn `.err` so the client sees the reason, not a generic "spawn
+        // failed". Then the caller `_exit`s → control EOF → `.err` sent.
+        // On success, signal 'Y' (ready) so the broker sends the spawn
+        // `.ok` only once the session truly exists.
+        const s = self.spawnSession(req) catch |err| {
+            var ebuf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&ebuf, "E{s}", .{@errorName(err)}) catch "E?";
+            controlSend(control_fd, msg, -1);
+            return err;
+        };
         try self.sessions.append(allocator, s);
         controlSend(control_fd, "Y", -1);
         try self.run();
@@ -3149,8 +3180,10 @@ pub const Daemon = struct {
             cl.queueErr("session name already exists");
             return;
         }
-        const s = self.spawnSession(req) catch {
-            cl.queueErr("spawn failed");
+        const s = self.spawnSession(req) catch |err| {
+            var ebuf: [192]u8 = undefined;
+            const msg = std.fmt.bufPrint(&ebuf, "spawn failed: {s}", .{@errorName(err)}) catch "spawn failed";
+            cl.queueErr(msg);
             return;
         };
         self.sessions.append(self.allocator, s) catch {
@@ -3218,14 +3251,14 @@ pub const Daemon = struct {
         // clean datagram on the broker↔worker channel.
         var sp: [2]c_int = undefined;
         if (c.socketpair(c.AF_UNIX, c.SOCK_SEQPACKET, 0, &sp) != 0) {
-            cl.queueErr("spawn failed");
+            cl.queueErr("spawn failed: socketpair (fd exhaustion?)");
             return;
         }
         const pid = c.fork();
         if (pid < 0) {
             _ = c.close(sp[0]);
             _ = c.close(sp[1]);
-            cl.queueErr("spawn failed");
+            cl.queueErr("spawn failed: fork (process/memory limit?)");
             return;
         }
         if (pid == 0) {
@@ -3639,9 +3672,24 @@ pub const Daemon = struct {
             si_shim_z = allocator.dupeZ(u8, si.shim_dir) catch break :blk null;
             break :blk .{ .kind = kind, .script = si_script_z.?.ptr, .shim_dir = si_shim_z.?.ptr };
         };
+        var env_z: std.ArrayList([:0]u8) = .empty;
+        defer {
+            for (env_z.items) |e| allocator.free(e);
+            env_z.deinit(allocator);
+        }
+        var env_ptrs: std.ArrayList([*:0]const u8) = .empty;
+        defer env_ptrs.deinit(allocator);
+        for (req.env) |kv| {
+            if (std.mem.indexOfScalar(u8, kv, '=') == null) continue; // not K=V
+            const z = try allocator.dupeZ(u8, kv);
+            try env_z.append(allocator, z);
+            try env_ptrs.append(allocator, z.ptr);
+        }
+
         var pty = try Pty.spawn(.{
             .argv = argv_ptrs.items,
             .cwd = req.cwd,
+            .env = env_ptrs.items,
             .rows = req.rows,
             .cols = req.cols,
             .term = if (term_z) |z| z.ptr else "xterm-256color",

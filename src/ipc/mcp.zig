@@ -510,7 +510,7 @@ fn toolResult(arena: std.mem.Allocator, text: []const u8, is_error: bool) ?[]con
 /// raw '\n' inside a response splits it). Kept readable as a
 /// multiline literal; newlines stripped at comptime.
 const TOOLS_JSON = blk: {
-    @setEvalBranchQuota(20_000);
+    @setEvalBranchQuota(60_000);
     var buf: [TOOLS_JSON_RAW.len]u8 = undefined;
     var n: usize = 0;
     for (TOOLS_JSON_RAW) |ch| {
@@ -531,18 +531,19 @@ const TOOLS_JSON_RAW =
     \\{"name":"record_pane_stop","description":"Stop the asciicast recording of a terminal pane's session.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"}}}},
     \\{"name":"send_text","description":"Type literal text into a pane's terminal. Set enter=true to press Enter afterwards. Use send_keys for control keys.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean","description":"Press Enter after the text"}},"required":["text"]}},
     \\{"name":"send_keys","description":"Press named keys in a pane: space-separated chords like 'ctrl+c', 'enter', 'up', 'escape', 'f5', 'alt+x', 'shift+tab', 'pagedown'. Single characters are typed literally.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
-    \\{"name":"run_command","description":"Type a shell command, press Enter, wait until output settles, and return the resulting screen text. For interactive programs prefer send_text/send_keys + read_screen.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"Max wait (default 15000)"},"quiet_ms":{"type":"integer","description":"Idle window that counts as settled (default 400)"}},"required":["command"]}},
+    \\{"name":"run_command","description":"Type a shell command, press Enter, wait until output settles, and return the resulting screen text. Pass output_only=true to get ONLY the command's output + exit code (no prompt/echo noise; needs shell integration, on by default). For interactive programs prefer send_text/send_keys + read_screen.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"Max wait (default 15000)"},"quiet_ms":{"type":"integer","description":"Idle window that counts as settled (default 400)"},"output_only":{"type":"boolean","description":"Return just the command's output and exit code instead of the whole screen"}},"required":["command"]}},
     \\{"name":"wait_idle","description":"Wait until a pane produced no output for quiet_ms (or timeout_ms elapsed). Returns whether it settled.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"timeout_ms":{"type":"integer"},"quiet_ms":{"type":"integer"}}}},
     \\{"name":"new_tab","description":"Open a new shell tab. Returns the new tab and pane ids.","inputSchema":{"type":"object","properties":{"cwd":{"type":"string"},"title":{"type":"string"}}}},
     \\{"name":"split_pane","description":"Split a pane. direction 'h' = side by side, 'v' = stacked. Returns the new pane id.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"direction":{"type":"string","enum":["h","v"]}}}},
     \\{"name":"focus_pane","description":"Focus a pane (selects its tab and grabs keyboard focus).","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
     \\{"name":"close_pane","description":"Close a pane. Destructive: the shell and any running process in it are terminated.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
     \\{"name":"list_installed_apps","description":"List installed GUI apps on the host (name + launch command), from its .desktop entries. Pass host for a remote machine. Use before launch_app to discover what can run.","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH host (user@box); omit = local"}}}},
-    \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns an app id and its windows. Drive it with get_app_state/app_click/app_type/app_key.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"wait_ms":{"type":"integer","description":"Max wait for the first window (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"},"layout":{"type":"string","description":"Session keyboard layout: us (default), gb, fr, be, de"},"gpu":{"type":"boolean","description":"Render on the host's real GPU via linux-dmabuf instead of software GL. Needs a driver whose linear buffers allow CPU mmap."}},"required":["command"]}},
+    \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns the app id, its windows AND the first window's screenshot inline (launch-and-look in one call). If the app exits early, the reply includes exit status, terminating signal and its recent output. Drive it with get_app_state/app_click/app_type/app_key; read its stdout/stderr with app_output.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"cwd":{"type":"string","description":"Working directory for the app"},"env":{"type":"object","description":"Extra environment variables, e.g. {\"FOO\":\"1\"}","additionalProperties":{"type":"string"}},"wait_for":{"type":"string","enum":["window","exit"],"description":"What to wait for before replying: first window (default) or process exit (short-lived/CLI runs)"},"wait_ms":{"type":"integer","description":"Max wait (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"},"layout":{"type":"string","description":"Session keyboard layout: us (default), gb, fr, be, de"},"gpu":{"type":"boolean","description":"Render on the host's real GPU via linux-dmabuf instead of software GL. Needs a driver whose linear buffers allow CPU mmap."}},"required":["command"]}},
     \\{"name":"list_apps","description":"List launched headless apps and their windows.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"app_windows","description":"List one app's rendered windows (ids, sizes, titles).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
-    \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Downscaled when larger than max_px; the caption tells you the multiplier to map image coordinates back to app_click coordinates.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"}}}},
-    \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer"}}}},
+    \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Optional region crop and integer zoom for pixel-level inspection; downscaled when larger than max_px. The caption tells you how to map image coordinates back to app_click coordinates. wait_change=true blocks until the window renders something NEWER than your last screenshot (verify a click did something).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"},"region":{"type":"object","description":"Crop to a sub-rectangle in surface pixels","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer","description":"Nearest-neighbor integer upscale (1-32) — crop a small region and zoom to inspect pixels"},"wait_change":{"type":"boolean","description":"Wait until the window content changed since the last screenshot before capturing"},"timeout_ms":{"type":"integer","description":"Bound for wait_change (default 10000)"}}}},
+    \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app. If the app exited, reports exit status, signal and recent output instead. Accepts the same region/zoom/wait_change options as screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer"},"wait_change":{"type":"boolean"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as rendered by a terminal). THE tool for 'why did my app print/exit that'. scrollback=true includes history beyond the visible grid. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
     \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x","y"]}},
     \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
     \\{"name":"app_set_value","description":"Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value). Faster and more reliable than typing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}},
@@ -562,7 +563,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
     \\{"name":"term_open","description":"Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
     \\{"name":"term_list","description":"List open headless terminals and their exit state.","inputSchema":{"type":"object","properties":{}}},
-    \\{"name":"term_run","description":"Run a command line in a headless terminal and return the screen once output settles (like run_command but for headless shells). Sends the command + Enter, waits for quiescence.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"quiet_ms":{"type":"integer","description":"Idle window that counts as settled (default 400)"},"timeout_ms":{"type":"integer","description":"Default 30000"}},"required":["command"]}},
+    \\{"name":"term_run","description":"Run a command line in a headless terminal and return the screen once output settles (like run_command but for headless shells). Pass output_only=true to get ONLY the command's output + exit code (no prompt/echo noise; needs shell integration, on by default).","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"quiet_ms":{"type":"integer","description":"Idle window that counts as settled (default 400)"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the command's output and exit code instead of the whole screen"}},"required":["command"]}},
     \\{"name":"term_send_text","description":"Write text to a headless terminal's PTY. 'enter' appends a carriage return.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean"}},"required":["text"]}},
     \\{"name":"term_send_keys","description":"Press named key chords in a headless terminal: 'ctrl+c', 'enter', 'up', 'tab', space-separated.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
     \\{"name":"term_read","description":"Read a headless terminal's rendered screen text. 'scrollback' true dumps the scrollback too.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
@@ -794,13 +795,51 @@ fn appIdOf(app: *appdrive.App) u32 {
     return 0;
 }
 
+/// Human name for the common fatal signals (exit_status = -signo).
+fn signalName(signo: i32) []const u8 {
+    return switch (signo) {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        else => "signal",
+    };
+}
+
+/// Last `n` lines of `text`, trailing blank lines dropped.
+fn tailLines(text: []const u8, n: usize) []const u8 {
+    var end = text.len;
+    while (end > 0 and (text[end - 1] == '\n' or text[end - 1] == ' ')) end -= 1;
+    var lines: usize = 0;
+    var i = end;
+    while (i > 0) {
+        i -= 1;
+        if (text[i] == '\n') {
+            lines += 1;
+            if (lines == n) return text[i + 1 .. end];
+        }
+    }
+    return text[0..end];
+}
+
 /// JSON summary of an app's windows (arena-owned).
 fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.print("{{\"app\":{d},\"session\":", .{appIdOf(app)});
     try std.json.Stringify.value(app.name, .{}, w);
-    if (app.exited) try w.print(",\"exited\":true,\"exit_status\":{d}", .{app.exit_status});
+    if (app.exited) {
+        try w.print(",\"exited\":true,\"exit_status\":{d}", .{app.exit_status});
+        // decodeStatus convention: negative = killed by that signal.
+        if (app.exit_status < 0)
+            try w.print(",\"signal\":{d},\"signal_name\":\"{s}\"", .{ -app.exit_status, signalName(-app.exit_status) });
+    }
     try w.writeAll(",\"windows\":[");
     var first = true;
     for (app.windows.items) |win| {
@@ -819,12 +858,58 @@ fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
         }
         try w.writeAll("}");
     }
-    try w.writeAll("]}");
+    try w.writeAll("]");
+    // An app that died is otherwise a dead end — inline what it
+    // printed (the last screen lines) so one call shows WHY.
+    if (app.exited) {
+        if (app.output(false)) |text| {
+            defer app_state.allocator.free(text);
+            try w.writeAll(",\"recent_output\":");
+            try std.json.Stringify.value(tailLines(text, 25), .{}, w);
+        } else |_| {}
+    }
+    try w.writeAll("}");
     return aw.written();
 }
 
 fn appErr(arena: std.mem.Allocator, msg: []const u8) ![]const u8 {
     return toolResult(arena, msg, true) orelse error.OutOfMemory;
+}
+
+/// Screenshot caption: window identity + how to map image coordinates
+/// back to app_click surface coordinates (crop origin + scale).
+/// `extra` (a summary, or "") is prepended on its own line.
+fn screenshotCaption(arena: std.mem.Allocator, app: *appdrive.App, win_id: u32, shot: appdrive.App.Shot, extra: []const u8) ![]const u8 {
+    const win = app.winById(win_id) orelse return error.OutOfMemory;
+    const coord_note = if (shot.scale == 1.0 and shot.ox == 0 and shot.oy == 0)
+        try std.fmt.allocPrint(arena, "coordinates for app_click are this image's pixel coordinates", .{})
+    else if (shot.ox == 0 and shot.oy == 0)
+        try std.fmt.allocPrint(
+            arena,
+            "image is {d}x{d} for a {d}x{d} surface: MULTIPLY image coordinates by {d:.3} before app_click",
+            .{ shot.img_w, shot.img_h, win.w, win.h, shot.scale },
+        )
+    else
+        try std.fmt.allocPrint(
+            arena,
+            "cropped at ({d},{d}): MULTIPLY image coordinates by {d:.3} then ADD ({d},{d}) before app_click",
+            .{ shot.ox, shot.oy, shot.scale, shot.ox, shot.oy },
+        );
+    return std.fmt.allocPrint(
+        arena,
+        "{s}{s}window {d}: {d}x{d} (scale {d}){s}{s} — {s}",
+        .{
+            extra,
+            if (extra.len > 0) "\n" else "",
+            win.id,
+            win.w,
+            win.h,
+            win.scale,
+            if (win.title != null) " title=" else "",
+            win.title orelse "",
+            coord_note,
+        },
+    );
 }
 
 // ── a11y tree helpers (element-targeted tools) ───────────────────
@@ -931,9 +1016,37 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 80, 10, 500));
         const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 24, 4, 300));
         const wait_ms: i64 = argInt(args, "wait_ms") orelse 10_000;
-        const app = appdrive.App.launch(app_state.allocator, argv.items, cols, rows, argStr(args, "host"), argStr(args, "layout"), app_state.mux_sock, argBool(args, "gpu")) catch |err|
+        var env_list: std.ArrayList([]const u8) = .empty;
+        defer env_list.deinit(arena);
+        if (args == .object) {
+            if (args.object.get("env")) |e| {
+                if (e != .object) return appErr(arena, "'env' must be an object of KEY: \"value\" strings");
+                var it = e.object.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.* != .string)
+                        return appErr(arena, "'env' values must be strings");
+                    try env_list.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.string }));
+                }
+            }
+        }
+        const app = appdrive.App.launch(app_state.allocator, argv.items, .{
+            .cols = cols,
+            .rows = rows,
+            .host = argStr(args, "host"),
+            .kb_layout = argStr(args, "layout"),
+            .local_sock = app_state.mux_sock,
+            .gpu = argBool(args, "gpu"),
+            .cwd = argStr(args, "cwd"),
+            .env = env_list.items,
+        }) catch |err|
             return appErr(arena, switch (err) {
-                appdrive.Error.SpawnFailed => "spawn failed (mux daemon unreachable or spawn refused)",
+                appdrive.Error.SpawnFailed => blk: {
+                    const why = appdrive.lastLaunchErr();
+                    break :blk if (why.len > 0)
+                        try std.fmt.allocPrint(arena, "spawn failed — {s}", .{why})
+                    else
+                        "spawn failed (mux daemon unreachable or spawn refused)";
+                },
                 appdrive.Error.BadLayout => "unknown keyboard layout (available: us, gb, fr, be, de)",
                 else => "launch failed",
             });
@@ -943,9 +1056,30 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             app.deinit();
             return error.OutOfMemory;
         };
-        const got_window = app.waitFirstWindow(wait_ms);
-        _ = got_window;
+        const wait_for = argStr(args, "wait_for") orelse "window";
+        if (eql(u8, wait_for, "exit")) {
+            const deadline = monoMs() + wait_ms;
+            while (!app.exited and monoMs() < deadline) _ = app.pumpOnce(50);
+        } else {
+            _ = app.waitFirstWindow(wait_ms);
+        }
         const summary = try appSummary(arena, app);
+        // Launch-and-look is THE common case: when a window rendered,
+        // fold the first screenshot into the launch reply.
+        var shot_win: u32 = 0;
+        for (app.windows.items) |win| {
+            if (!win.popup and win.frames > 0) {
+                shot_win = win.id;
+                break;
+            }
+        }
+        if (shot_win != 0) {
+            if (app.screenshotPng(shot_win, 1568, null, 1)) |shot| {
+                defer app_state.allocator.free(shot.png);
+                const caption = try screenshotCaption(arena, app, shot_win, shot, summary);
+                if (imageResult(arena, caption, shot.png)) |r| return r;
+            } else |_| {}
+        }
         return toolResult(arena, summary, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "list_installed_apps")) {
@@ -980,6 +1114,20 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         const summary = try appSummary(arena, app);
         return toolResult(arena, summary, false) orelse error.OutOfMemory;
     }
+    if (eql(u8, name, "app_output")) {
+        const text = app.output(argBool(args, "scrollback")) catch
+            return appErr(arena, "no terminal mirror for this app (output unavailable)");
+        defer app_state.allocator.free(text);
+        var msg: []const u8 = try arena.dupe(u8, text);
+        if (app.exited) {
+            msg = try std.fmt.allocPrint(arena, "[app exited, status {d}{s}]\n{s}", .{
+                app.exit_status,
+                if (app.exit_status < 0) try std.fmt.allocPrint(arena, " = killed by {s}", .{signalName(-app.exit_status)}) else "",
+                msg,
+            });
+        }
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
     if (eql(u8, name, "screenshot_app") or eql(u8, name, "get_app_state")) {
         var win_id: u32 = 0;
         if (argInt(args, "window")) |v| {
@@ -992,29 +1140,48 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                 }
             }
         }
-        if (win_id == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        if (win_id == 0) {
+            // "No window" and "the app died" are different answers —
+            // report the exit (status, signal, output) when it applies.
+            if (app.exited) {
+                const summary = try appSummary(arena, app);
+                const msg = try std.fmt.allocPrint(arena, "the app has exited — no window to screenshot\n{s}", .{summary});
+                return toolResult(arena, msg, true) orelse error.OutOfMemory;
+            }
+            return appErr(arena, "no rendered window yet (try app_wait first)");
+        }
+        if (argBool(args, "wait_change")) {
+            // Block (bounded) until the window commits a frame newer
+            // than its last screenshot — "did my click do anything".
+            const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
+            if (!app.waitWindowChange(win_id, timeout_ms))
+                return appErr(arena, "window content did not change before the timeout");
+        }
         const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 1568, 0, 8192));
-        const shot = app.screenshotPng(win_id, max_px) catch
-            return appErr(arena, "no such window / no pixels yet");
+        var region: ?appdrive.App.Region = null;
+        if (args == .object) {
+            if (args.object.get("region")) |rv| {
+                if (rv != .object) return appErr(arena, "'region' must be {x,y,w,h}");
+                const gi = struct {
+                    fn f(o: std.json.Value, k: []const u8) ?i64 {
+                        const v = o.object.get(k) orelse return null;
+                        return if (v == .integer) v.integer else null;
+                    }
+                }.f;
+                const rx = gi(rv, "x") orelse 0;
+                const ry = gi(rv, "y") orelse 0;
+                const rw = gi(rv, "w") orelse return appErr(arena, "'region' must be {x,y,w,h}");
+                const rh = gi(rv, "h") orelse return appErr(arena, "'region' must be {x,y,w,h}");
+                if (rx < 0 or ry < 0 or rw <= 0 or rh <= 0) return appErr(arena, "'region' values must be non-negative (w/h > 0)");
+                region = .{ .x = @intCast(rx), .y = @intCast(ry), .w = @intCast(rw), .h = @intCast(rh) };
+            }
+        }
+        const zoom: u32 = @intCast(std.math.clamp(argInt(args, "zoom") orelse 1, 1, 32));
+        const shot = app.screenshotPng(win_id, max_px, region, zoom) catch
+            return appErr(arena, "no such window / no pixels yet (a region must lie inside the window)");
         defer app_state.allocator.free(shot.png);
-        const win = app.winById(win_id).?;
-        const coord_note = if (shot.scale == 1.0)
-            try std.fmt.allocPrint(arena, "coordinates for app_click are this image's pixel coordinates", .{})
-        else
-            try std.fmt.allocPrint(
-                arena,
-                "image downscaled {d}x{d} -> {d}x{d}: MULTIPLY image coordinates by {d:.3} before app_click",
-                .{ win.w, win.h, shot.img_w, shot.img_h, shot.scale },
-            );
-        const extra: []const u8 = if (eql(u8, name, "get_app_state"))
-            try std.fmt.allocPrint(arena, "{s}\n", .{try appSummary(arena, app)})
-        else
-            "";
-        const caption = try std.fmt.allocPrint(
-            arena,
-            "{s}window {d}: {d}x{d} (scale {d}){s}{s} — {s}",
-            .{ extra, win.id, win.w, win.h, win.scale, if (win.title != null) " title=" else "", win.title orelse "", coord_note },
-        );
+        const extra: []const u8 = if (eql(u8, name, "get_app_state")) try appSummary(arena, app) else "";
+        const caption = try screenshotCaption(arena, app, win_id, shot, extra);
         return imageResult(arena, caption, shot.png) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_drag")) {
@@ -1354,9 +1521,18 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
         t.sendText(line) catch return appErr(arena, "send failed (terminal exited?)");
         const settled = t.waitIdle(quiet_ms, timeout_ms);
+        const note = if (settled) "" else "\n[note: output still flowing at timeout]";
+        if (argBool(args, "output_only")) {
+            // OSC 133 zone: output + exit code only. Screen scrape
+            // fallback when no zone completed.
+            if (t.lastCommand() catch null) |lc| {
+                defer term_state.allocator.free(lc.text);
+                const msg = try std.fmt.allocPrint(arena, "exit: {d}\n---\n{s}{s}", .{ lc.exit, lc.text, note });
+                return toolResult(arena, msg, false) orelse error.OutOfMemory;
+            }
+        }
         const text = t.readScreen(false) catch return appErr(arena, "read failed");
         defer term_state.allocator.free(text);
-        const note = if (settled) "" else "\n[note: output still flowing at timeout]";
         const msg = try std.fmt.allocPrint(arena, "{s}{s}", .{ text, note });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
@@ -1486,6 +1662,26 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
             error.NoSuchPane => return toolResult(arena, "no such pane", true) orelse error.OutOfMemory,
             else => return err,
         };
+        if (argBool(args, "output_only")) {
+            // OSC 133 command zone: just the command's output + exit
+            // code, no prompt/echo noise. Falls through to the screen
+            // scrape when no zone exists (shell integration off).
+            const reply = try ipcParsed(arena, backend, .{ .cmd = "get-text", .pane = pane, .last_command = true });
+            if (reply.ok) {
+                if (reply.value.object.get("last")) |last| {
+                    if (last == .object) {
+                        const text = (last.object.get("text") orelse std.json.Value{ .string = "" });
+                        const exit = (last.object.get("exit") orelse std.json.Value{ .integer = 0 });
+                        const blob = try std.fmt.allocPrint(arena, "{s}exit: {d}\n---\n{s}", .{
+                            if (settled) "" else "[still producing output after timeout]\n",
+                            if (exit == .integer) exit.integer else 0,
+                            if (text == .string) text.string else "",
+                        });
+                        return toolResult(arena, blob, false) orelse error.OutOfMemory;
+                    }
+                }
+            }
+        }
         var blob = try readScreenText(arena, backend, pane, 0);
         if (!settled) {
             blob = try std.fmt.allocPrint(arena, "[still producing output after timeout]\n{s}", .{blob});
