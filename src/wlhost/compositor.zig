@@ -259,6 +259,9 @@ const globals = [_]Global{
     // GPU clients render natively and blit linear; import failure
     // falls back to shm via `failed`.
     .{ .name = 22, .iface = &protocol.zwp_linux_dmabuf_v1, .version = 3 },
+    // xdg-output: wl_output's LOGICAL geometry. SDL probes for it and
+    // logs a scary "protocol missing: disabling" without it.
+    .{ .name = 23, .iface = &protocol.zxdg_output_manager_v1, .version = 3 },
 };
 
 const Pool = struct {
@@ -419,6 +422,12 @@ pub const Compositor = struct {
     /// told they entered this output (wl_surface.enter) so GTK3 picks up
     /// the output scale — without it GTK3 mis-scales (half-height).
     output_id: u32 = 0,
+    /// Version the client bound zxdg_output_manager_v1 at (0 = not
+    /// bound). Gates name/description (since 2) and the deprecated
+    /// per-object done (v1/2 only; v3 relies on wl_output.done). Not
+    /// serialized: a post-restore default of 0 just re-gates to v1
+    /// behavior, which every client tolerates.
+    xdg_output_ver: u32 = 0,
     /// Outgoing pipe units (events). Caller drains via takeOut.
     out: std.ArrayList(u8) = .empty,
     /// Incoming unit reassembly (chan_data may split units).
@@ -1380,6 +1389,7 @@ pub const Compositor = struct {
             if (g.iface == &protocol.xdg_wm_base) self.wm_base_version = ver;
             if (g.iface == &protocol.wl_data_device_manager) self.ddm_version = ver;
             if (g.iface == &protocol.wl_output) self.output_id = id;
+            if (g.iface == &protocol.zxdg_output_manager_v1) self.xdg_output_ver = ver;
             try self.boundGlobal(id, g.iface, ver);
         } else if (iface == &protocol.wl_compositor) switch (hdr.opcode) {
             0 => { // create_surface
@@ -1648,6 +1658,17 @@ pub const Compositor = struct {
             try self.destroyObject(hdr.object);
         } else if (iface == &protocol.wl_output) {
             // release — lenient even though we advertise v2.
+            try self.destroyObject(hdr.object);
+        } else if (iface == &protocol.zxdg_output_manager_v1) switch (hdr.opcode) {
+            0 => try self.destroyObject(hdr.object),
+            1 => { // get_xdg_output(id, output)
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.zxdg_output_v1);
+                try self.sendXdgOutputState(id);
+            },
+            else => return Error.Protocol,
+        } else if (iface == &protocol.zxdg_output_v1) {
+            // destroy — the only request.
             try self.destroyObject(hdr.object);
         } else if (iface == &protocol.wp_cursor_shape_manager_v1) switch (hdr.opcode) {
             0 => try self.destroyObject(hdr.object),
@@ -2660,6 +2681,13 @@ pub const Compositor = struct {
                 try self.send(try b.finish());
             }
         }
+        // Logical geometry scales with the output — re-announce every
+        // live xdg_output BEFORE wl_output.done (v3 completion order).
+        var oit = self.objects.iterator();
+        while (oit.next()) |e| {
+            if (e.value_ptr.* == &protocol.zxdg_output_v1)
+                try self.sendXdgOutputState(e.key_ptr.*);
+        }
         if (self.output_id != 0) {
             var sbuf: [16]u8 = undefined;
             var sb = wire.Builder.init(&sbuf, self.output_id, 3); // scale
@@ -2667,6 +2695,45 @@ pub const Compositor = struct {
             try self.send(try sb.finish());
             var dbuf: [8]u8 = undefined;
             var db = wire.Builder.init(&dbuf, self.output_id, 2); // done
+            try self.send(try db.finish());
+        }
+    }
+
+    /// Announce an xdg_output's logical geometry. The fixed 1920x1080
+    /// mode divided by the effective scale — matches what fractional-
+    /// scale clients will render at.
+    fn sendXdgOutputState(self: *Compositor, id: u32) Error!void {
+        const s120 = self.effScale120();
+        const lw: i32 = @intCast(@as(u64, 1920) * 120 / @max(120, s120));
+        const lh: i32 = @intCast(@as(u64, 1080) * 120 / @max(120, s120));
+        var pbuf: [24]u8 = undefined;
+        var pb = wire.Builder.init(&pbuf, id, 0); // logical_position
+        pb.putInt(0);
+        pb.putInt(0);
+        try self.send(try pb.finish());
+        var sbuf: [24]u8 = undefined;
+        var sb = wire.Builder.init(&sbuf, id, 1); // logical_size
+        sb.putInt(lw);
+        sb.putInt(lh);
+        try self.send(try sb.finish());
+        if (self.xdg_output_ver >= 2) {
+            var nbuf: [32]u8 = undefined;
+            var nb = wire.Builder.init(&nbuf, id, 3); // name
+            nb.putString("sketerm-0");
+            try self.send(try nb.finish());
+            var ebuf: [48]u8 = undefined;
+            var eb = wire.Builder.init(&ebuf, id, 4); // description
+            eb.putString("sketerm remote output");
+            try self.send(try eb.finish());
+        }
+        if (self.xdg_output_ver < 3) {
+            var dbuf: [8]u8 = undefined;
+            var db = wire.Builder.init(&dbuf, id, 2); // done (deprecated in v3)
+            try self.send(try db.finish());
+        } else if (self.output_id != 0) {
+            // v3: state completes via wl_output.done instead.
+            var dbuf: [8]u8 = undefined;
+            var db = wire.Builder.init(&dbuf, self.output_id, 2);
             try self.send(try db.finish());
         }
     }
@@ -6100,3 +6167,33 @@ test "shm pool bytes reclaim only after pool destroy AND last buffer destroy" {
     try t.expect(!comp.dead);
 }
 
+test "zxdg_output v3: logical geometry then wl_output.done" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 23, "zxdg_output_manager_v1", 3, 3);
+    try bindGlobal(&comp, 4, "wl_output", 4, 4);
+    comp.clearOut();
+
+    { // get_xdg_output(5, output 4)
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putNewId(5);
+        b.putObject(4);
+        try req(&comp, try b.finish());
+    }
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    // v3 + name/description (since 2), completion via wl_output.done.
+    try t.expectEqualSlices([2]u32, &[_][2]u32{
+        .{ 5, 0 }, // logical_position
+        .{ 5, 1 }, // logical_size
+        .{ 5, 3 }, // name
+        .{ 5, 4 }, // description
+        .{ 4, 2 }, // wl_output.done (xdg done is deprecated at v3)
+    }, evs.items);
+    try t.expect(!comp.dead);
+}

@@ -329,6 +329,33 @@ pub const wl_output = Interface{
     },
 };
 
+/// xdg-output: augments wl_output with LOGICAL geometry. SDL/Vulkan
+/// clients probe for it and change behavior when absent.
+pub const zxdg_output_manager_v1 = Interface{
+    .name = "zxdg_output_manager_v1",
+    .version = 3,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+        .{ .name = "get_xdg_output", .sig = "no", .new_id_iface = &zxdg_output_v1 },
+    },
+    .events = &.{},
+};
+
+pub const zxdg_output_v1 = Interface{
+    .name = "zxdg_output_v1",
+    .version = 3,
+    .requests = &.{
+        .{ .name = "destroy", .sig = "" },
+    },
+    .events = &.{
+        .{ .name = "logical_position", .sig = "ii" },
+        .{ .name = "logical_size", .sig = "ii" },
+        .{ .name = "done", .sig = "" },
+        .{ .name = "name", .sig = "s", .since = 2 },
+        .{ .name = "description", .sig = "s", .since = 2 },
+    },
+};
+
 // ─── data device (clipboard / dnd) ──────────────────────────────
 
 pub const wl_data_offer = Interface{
@@ -917,7 +944,8 @@ pub const all = [_]*const Interface{
     &zwp_idle_inhibitor_v1,             &zwp_pointer_gestures_v1,
     &zwp_pointer_gesture_swipe_v1,      &zwp_pointer_gesture_pinch_v1,
     &zwp_pointer_gesture_hold_v1,       &zwp_linux_dmabuf_v1,
-    &zwp_linux_buffer_params_v1,
+    &zwp_linux_buffer_params_v1,        &zxdg_output_manager_v1,
+    &zxdg_output_v1,
 };
 
 // ─── tests ──────────────────────────────────────────────────────
