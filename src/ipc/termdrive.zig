@@ -179,6 +179,18 @@ pub const Term = struct {
         self.conn.sendFrame(.resize, &buf) catch return Error.NotConnected;
     }
 
+    /// Output + exit code of the last COMPLETED command (OSC 133
+    /// zone, mirrored from the daemon's event stream). Null when no
+    /// zone exists yet (shell integration off, or nothing ran).
+    /// Caller owns `.text`.
+    pub fn lastCommand(self: *Term) Error!?struct { text: []u8, exit: i32 } {
+        self.drain();
+        const screen = self.screen orelse return Error.NotConnected;
+        const text = (screen.extractLastCommandOutput(self.allocator) catch return Error.OutOfMemory) orelse
+            return null;
+        return .{ .text = text, .exit = screen.last_cmd_exit };
+    }
+
     /// Rendered screen text (drains pending events first).
     pub fn readScreen(self: *Term, scrollback: bool) Error![]u8 {
         self.drain();

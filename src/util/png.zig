@@ -140,6 +140,36 @@ pub fn downscaleRgba(
     return out;
 }
 
+/// Nearest-neighbor integer upscale (pixel-inspection zoom — no
+/// smoothing, every source pixel becomes a zoom x zoom block).
+/// Caller owns the result.
+pub fn upscaleRgba(
+    allocator: std.mem.Allocator,
+    rgba: []const u8,
+    w: u32,
+    h: u32,
+    zoom: u32,
+) Error![]u8 {
+    std.debug.assert(zoom >= 1);
+    std.debug.assert(rgba.len >= @as(usize, w) * h * 4);
+    const dw: usize = @as(usize, w) * zoom;
+    const dh: usize = @as(usize, h) * zoom;
+    const out = try allocator.alloc(u8, dw * dh * 4);
+    errdefer allocator.free(out);
+    var dy: usize = 0;
+    while (dy < dh) : (dy += 1) {
+        const sy = dy / zoom;
+        var dx: usize = 0;
+        while (dx < dw) : (dx += 1) {
+            const sx = dx / zoom;
+            const s = (sy * w + sx) * 4;
+            const d = (dy * dw + dx) * 4;
+            @memcpy(out[d..][0..4], rgba[s..][0..4]);
+        }
+    }
+    return out;
+}
+
 /// shmToRgba + encodeRgba in one step. Caller owns the result.
 pub fn encodeShm(
     allocator: std.mem.Allocator,
@@ -233,4 +263,26 @@ test "shmToRgba swizzles BGRA and forces xrgb opaque" {
     defer allocator.free(xrgb);
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, xrgb[0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 128, 0, 255 }, xrgb[4..8]);
+}
+
+test "upscaleRgba blocks pixels without smoothing" {
+    const allocator = std.testing.allocator;
+    // 2x1: red then green.
+    const src = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255 };
+    const big = try upscaleRgba(allocator, &src, 2, 1, 3);
+    defer allocator.free(big);
+    try std.testing.expectEqual(@as(usize, 6 * 3 * 4), big.len);
+    // First 3 columns of every row red, next 3 green — exact copies.
+    for (0..3) |row| {
+        for (0..3) |x| {
+            const o = (row * 6 + x) * 4;
+            try std.testing.expectEqual(@as(u8, 255), big[o]);
+            try std.testing.expectEqual(@as(u8, 0), big[o + 1]);
+        }
+        for (3..6) |x| {
+            const o = (row * 6 + x) * 4;
+            try std.testing.expectEqual(@as(u8, 0), big[o]);
+            try std.testing.expectEqual(@as(u8, 255), big[o + 1]);
+        }
+    }
 }

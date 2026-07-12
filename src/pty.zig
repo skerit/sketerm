@@ -66,6 +66,9 @@ pub const SpawnOpts = struct {
     /// presents linear dmabufs (the session's compositor announces
     /// linux-dmabuf when this is set).
     gpu: bool = false,
+    /// Extra child environment as NUL-terminated "KEY=VALUE" strings,
+    /// applied last (wins over the defaults above).
+    env: []const [*:0]const u8 = &.{},
 };
 
 pub const ShellIntegration = struct {
@@ -253,6 +256,11 @@ pub const Pty = struct {
                 },
             }
         }
+
+        // Caller-supplied env last, so `launch_app env:{...}` can
+        // override anything set above. putenv is exec-safe here (the
+        // strings outlive us; exec copies the environment).
+        for (opts.env) |kv| _ = c.putenv(@constCast(kv));
 
         // chdir if requested. Skip rather than truncate: a path that
         // doesn't fit (with its NUL terminator) would chdir to the
