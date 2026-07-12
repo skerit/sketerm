@@ -7221,3 +7221,48 @@ truncation and PNG round-trip), smoke-mcp PASS, live e2e (gedit via
 launch_app + screenshot_app under --log produced valid 1568x993 PNGs
 and a fully JSON-parseable trace), long-path repro now errors at
 startup with exit 1 while normal startup is unaffected.
+
+## The REAL 15GB leak: per-commit pixel-encode scratch
+
+The daemon leaked to 15GB AGAIN after the earlier pool-mirror fix
+shipped — because the pool mirrors were never the dominant leak for
+this workload. Reproduced exactly with the reporter's game (ds9dw)
+under an isolated MCP daemon: the session worker climbed ~30MB/s
+(92M -> 1.4G in 57s), and crucially it leaked with NO viewer attached
+at all (MCP killed, durable game still rendering: 40M -> 1GB in 27s).
+smaps showed pure anonymous heap (not mmap), fds flat at 11 — so not
+the pool/fd class.
+
+Root cause: the native `.commit` handler created a wlpixcodec.Scratch
+(a filter work buffer + a zstd output buffer, both frame-sized
+ArrayLists) as a per-commit local and never called sc.deinit — the
+pool-replay path frees its identical scratch, this one was missed. So
+every committed frame leaked ~2 frame-sized buffers. It only surfaced
+now because the recent pulse fix let audio-using apps (games) get
+past init and render continuously; static GUI apps commit rarely.
+
+Why it was reachable at 15GB and not caught: the encode ran on every
+commit regardless of whether any viewer would receive the units, and
+the leaked scratch accumulated unbounded. Fix:
+- hoist the scratch onto Native, reused across every commit (leak
+  gone; also removes per-frame alloc churn);
+- gate the copy+encode on some attached proto>=5 viewer having room
+  in its wbuf (< 8MB, matching the winstream backpressure) — a
+  headless or backed-up viewer produces nothing; it catches up from
+  the live mirror on the next commit or via reattach replay;
+- gate the PCM broadcast the same way: a subscribed-but-idle viewer
+  (MCP between tool calls) sends no `consumed` reports, so the stream
+  self-clocks and would otherwise flood its wbuf with audio.
+
+Regression guard (would have caught BOTH this and the pool-mirror
+leak): smoke-mux now runs its in-process daemon under a leak-tracking
+DebugAllocator (safety=true — off by default in ReleaseFast) and
+exits non-zero if any allocation is outstanding after the daemon is
+fully deinit'd. Proven by reintroducing the leak (FAIL) and restoring
+(PASS). realAppStage drives the native path via weston-terminal.
+
+Verified live (ds9dw, isolated MCP daemon): no-viewer flat 6M,
+viewer-attached-idle flat 15M, active screenshotting flat 16M with
+the frame hash updating (viewer stays current). 701/707 tests,
+smoke-mux (with the new leak guard) + smoke-mcp PASS, mux-portable +
+aarch64-macos cross OK.
