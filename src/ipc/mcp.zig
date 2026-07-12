@@ -1522,9 +1522,11 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         t.sendText(line) catch return appErr(arena, "send failed (terminal exited?)");
         const settled = t.waitIdle(quiet_ms, timeout_ms);
         const note = if (settled) "" else "\n[note: output still flowing at timeout]";
-        if (argBool(args, "output_only")) {
-            // OSC 133 zone: output + exit code only. Screen scrape
-            // fallback when no zone completed.
+        const want_output_only = argBool(args, "output_only");
+        if (want_output_only) {
+            // OSC 133 zone: output + exit code only. Screen-scrape
+            // fallback when no zone completed — announced below,
+            // never a silent shape change.
             if (t.lastCommand() catch null) |lc| {
                 defer term_state.allocator.free(lc.text);
                 const msg = try std.fmt.allocPrint(arena, "exit: {d}\n---\n{s}{s}", .{ lc.exit, lc.text, note });
@@ -1533,7 +1535,11 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         }
         const text = t.readScreen(false) catch return appErr(arena, "read failed");
         defer term_state.allocator.free(text);
-        const msg = try std.fmt.allocPrint(arena, "{s}{s}", .{ text, note });
+        const fallback_note = if (want_output_only)
+            "[output_only unavailable: no completed OSC 133 command zone — shell integration is inactive in this terminal (unsupported shell, or the command emitted no marks); returning the rendered screen]\n"
+        else
+            "";
+        const msg = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ fallback_note, text, note });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "term_wait_idle")) {
@@ -1662,10 +1668,12 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
             error.NoSuchPane => return toolResult(arena, "no such pane", true) orelse error.OutOfMemory,
             else => return err,
         };
-        if (argBool(args, "output_only")) {
+        const want_output_only = argBool(args, "output_only");
+        if (want_output_only) {
             // OSC 133 command zone: just the command's output + exit
             // code, no prompt/echo noise. Falls through to the screen
-            // scrape when no zone exists (shell integration off).
+            // scrape when no zone exists (shell integration inactive)
+            // — announced below, never a silent shape change.
             const reply = try ipcParsed(arena, backend, .{ .cmd = "get-text", .pane = pane, .last_command = true });
             if (reply.ok) {
                 if (reply.value.object.get("last")) |last| {
@@ -1683,6 +1691,9 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
             }
         }
         var blob = try readScreenText(arena, backend, pane, 0);
+        if (want_output_only) {
+            blob = try std.fmt.allocPrint(arena, "[output_only unavailable: no completed OSC 133 command zone — shell integration is inactive in this pane (unsupported shell, or the command emitted no marks); returning the rendered screen]\n{s}", .{blob});
+        }
         if (!settled) {
             blob = try std.fmt.allocPrint(arena, "[still producing output after timeout]\n{s}", .{blob});
         }
