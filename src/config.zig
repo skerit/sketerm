@@ -253,9 +253,9 @@ pub const Config = struct {
     /// Bell behaviour: visual flash, system beep, and / or marking
     /// the AdwTabPage as needs-attention. Independent toggles.
     /// Auto shell-integration: inject the OSC 7/133 scripts into
-    /// zsh/fish at spawn (ZDOTDIR / XDG_DATA_DIRS shims) — command
-    /// blocks, cwd inheritance and prompt nav work without rc edits.
-    /// bash still needs the manual `source` line.
+    /// zsh/fish/bash at spawn (ZDOTDIR / XDG_DATA_DIRS shims; bash
+    /// via --rcfile, bare interactive spawns only) — command blocks,
+    /// cwd inheritance and prompt nav work without rc edits.
     shell_integration: bool = true,
     bell_audible: bool = false,
     bell_visible: bool = true,

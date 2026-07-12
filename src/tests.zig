@@ -13,6 +13,7 @@ comptime {
     _ = @import("util/shellquote.zig");
     _ = @import("util/humantype.zig");
     _ = @import("util/platform.zig");
+    _ = @import("util/shellintegration.zig");
     _ = @import("util/png.zig");
     _ = @import("util/gifrec.zig");
     _ = @import("util/webm.zig");

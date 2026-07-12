@@ -125,7 +125,7 @@ pub const SpawnReq = struct {
 };
 
 pub const SpawnShellIntegration = struct {
-    kind: []const u8 = "", // "zsh" | "fish"
+    kind: []const u8 = "", // "zsh" | "fish" | "bash"
     script: []const u8 = "",
     shim_dir: []const u8 = "",
 };
@@ -3667,6 +3667,7 @@ pub const Daemon = struct {
             const kind: PtyMod.ShellIntegration.Kind =
                 if (std.mem.eql(u8, si.kind, "zsh")) .zsh
                 else if (std.mem.eql(u8, si.kind, "fish")) .fish
+                else if (std.mem.eql(u8, si.kind, "bash")) .bash
                 else break :blk null;
             si_script_z = allocator.dupeZ(u8, si.script) catch break :blk null;
             si_shim_z = allocator.dupeZ(u8, si.shim_dir) catch break :blk null;

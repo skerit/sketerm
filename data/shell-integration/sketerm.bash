@@ -36,28 +36,30 @@ _sketerm_emit_cwd() {
 # them. FinalTerm spec:
 #   A = start of prompt          (PS1 prefix)
 #   B = end of prompt / input    (PS1 suffix)
-#   C = start of command output  (DEBUG trap, post-Enter)
+#   C = start of command output  (PS0, post-Enter pre-exec)
 #   D = end of output            (PROMPT_COMMAND, before next prompt)
 #
 # Wraps PS1 with A / B markers if not already wrapped.
+#
+# C comes from PS0 (bash >= 4.4), NOT a DEBUG trap: bash expands PS0
+# exactly once per interactive command, after the accept-line newline
+# and before execution. A DEBUG trap also fires for the commands
+# INSIDE the (possibly distro-provided) PROMPT_COMMAND, emitting a
+# spurious C at the next-prompt row — the zone then swallowed the
+# prompt and command echo. Older bash: prompt marks only, no zones.
 
 if [[ -z "${SKETERM_OSC133_INSTALLED:-}" && "$PS1" != *$'\001\033]133;A\033\\\002'* ]]; then
     PS1=$'\001\033]133;A\033\\\002'"$PS1"$'\001\033]133;B\033\\\002'
+    if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+        PS0=$'\033]133;C\033\\'"${PS0:-}"
+    fi
     SKETERM_OSC133_INSTALLED=1
 fi
 
-_sketerm_emit_133c() {
-    # Skip when invoked from the prompt itself (PROMPT_COMMAND
-    # callbacks); only emit on real commands.
-    [[ "$BASH_COMMAND" == "$PROMPT_COMMAND" ]] && return
-    [[ "$BASH_COMMAND" == "_sketerm_emit_cwd" ]] && return
-    [[ "$BASH_COMMAND" == _sketerm_* ]] && return
-    printf '\033]133;C\033\\'
-}
-trap '_sketerm_emit_133c' DEBUG
-
 _sketerm_emit_133d() {
     local rc=$?
+    # A D with no C open is dropped by the terminal, so the bare-Enter
+    # case (PROMPT_COMMAND reruns, PS0 never expanded) is harmless.
     printf '\033]133;D;%d\033\\' "$rc"
     return $rc
 }

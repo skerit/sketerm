@@ -226,8 +226,10 @@ pub const Window = struct {
     /// found; gated on Config.shell_integration at spawn time.
     si_zsh_script: ?[:0]u8 = null,
     si_fish_script: ?[:0]u8 = null,
+    si_bash_script: ?[:0]u8 = null,
     si_zsh_shim: ?[:0]u8 = null,
     si_fish_shim: ?[:0]u8 = null,
+    si_bash_shim: ?[:0]u8 = null,
     /// Socket path, computed at init (before any spawn) so every
     /// child gets SKETERM_SOCKET even if the listener starts later.
     ipc_path: ?[:0]u8 = null,
@@ -745,8 +747,10 @@ pub const Window = struct {
         if (self.shader_source.dir) |d| self.allocator.free(d);
         if (self.si_zsh_script) |s| self.allocator.free(s);
         if (self.si_fish_script) |s| self.allocator.free(s);
+        if (self.si_bash_script) |s| self.allocator.free(s);
         if (self.si_zsh_shim) |s| self.allocator.free(s);
         if (self.si_fish_shim) |s| self.allocator.free(s);
+        if (self.si_bash_shim) |s| self.allocator.free(s);
         self.config.deinit();
         self.allocator.destroy(self);
     }
@@ -1773,6 +1777,7 @@ pub const Window = struct {
             .kind = switch (si.kind) {
                 .zsh => "zsh",
                 .fish => "fish",
+                .bash => "bash",
             },
             .script = std.mem.span(si.script),
             .shim_dir = std.mem.span(si.shim_dir),
@@ -4563,38 +4568,20 @@ pub const Window = struct {
 
     // ── Background layer (image / gradient) ─────────────────────
 
-    /// Locate the shell-integration script directory and cache the
-    /// per-shell script + shim paths. Resolution: env override →
-    /// installed share dir next to the exe → repo data/ (dev tree)
-    /// → /usr/share. Missing dir = feature silently off.
+    /// Locate the shell-integration script directory (shared
+    /// resolution in util/shellintegration.zig) and cache the
+    /// per-shell script + shim paths. Missing dir = feature
+    /// silently off.
     fn resolveShellIntegration(self: *Window) void {
         const ally = self.allocator;
         var base_buf: [4096]u8 = undefined;
-        const base: []const u8 = blk: {
-            if (@import("../util/profile.zig").getenv("SKETERM_SHELL_INTEGRATION_DIR")) |env| break :blk env;
-            var exe_buf: [4096]u8 = undefined;
-            if (@import("../util/platform.zig").exePath(&exe_buf)) |exe_path| {
-                const exe_dir = std.fs.path.dirname(exe_path) orelse "/usr/bin";
-                const candidates = [_][]const u8{
-                    "/../share/sketerm/shell-integration",
-                    "/../../data/shell-integration",
-                };
-                for (candidates) |suffix| {
-                    const cand = std.fmt.bufPrintZ(&base_buf, "{s}{s}/sketerm.zsh", .{ exe_dir, suffix }) catch continue;
-                    if (c.access(cand.ptr, c.R_OK) == 0) {
-                        break :blk base_buf[0 .. exe_dir.len + suffix.len];
-                    }
-                }
-            }
-            const sys = "/usr/share/sketerm/shell-integration";
-            const sys_probe = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm.zsh", .{sys}) catch return;
-            if (c.access(sys_probe.ptr, c.R_OK) == 0) break :blk sys;
-            return;
-        };
+        const base = @import("../util/shellintegration.zig").baseDir(&base_buf) orelse return;
         self.si_zsh_script = std.fmt.allocPrintSentinel(ally, "{s}/sketerm.zsh", .{base}, 0) catch null;
         self.si_fish_script = std.fmt.allocPrintSentinel(ally, "{s}/sketerm.fish", .{base}, 0) catch null;
+        self.si_bash_script = std.fmt.allocPrintSentinel(ally, "{s}/sketerm.bash", .{base}, 0) catch null;
         self.si_zsh_shim = std.fmt.allocPrintSentinel(ally, "{s}/zsh", .{base}, 0) catch null;
         self.si_fish_shim = std.fmt.allocPrintSentinel(ally, "{s}/fish-xdg", .{base}, 0) catch null;
+        self.si_bash_shim = std.fmt.allocPrintSentinel(ally, "{s}/bash/sketerm-rc.bash", .{base}, 0) catch null;
     }
 
     /// Pick the injection setup for the program being spawned, or
@@ -4612,6 +4599,11 @@ pub const Window = struct {
             const script = self.si_fish_script orelse return null;
             const shim = self.si_fish_shim orelse return null;
             return .{ .kind = .fish, .script = script.ptr, .shim_dir = shim.ptr };
+        }
+        if (std.mem.eql(u8, base, "bash")) {
+            const script = self.si_bash_script orelse return null;
+            const shim = self.si_bash_shim orelse return null;
+            return .{ .kind = .bash, .script = script.ptr, .shim_dir = shim.ptr };
         }
         return null;
     }

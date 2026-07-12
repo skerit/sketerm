@@ -9,7 +9,7 @@
 
 pkgname=sketerm-git
 _pkgname=sketerm
-pkgver=0.1.0.r902.g3a61082
+pkgver=0.1.0.r929.g9fb4391
 pkgrel=1
 pkgdesc='Native GTK4 terminal emulator written in Zig'
 arch=('x86_64')
@@ -130,6 +130,8 @@ package() {
         "$pkgdir/usr/share/$_pkgname/shell-integration/sketerm.fish"
     install -Dm644 data/shell-integration/zsh/.zshenv \
         "$pkgdir/usr/share/$_pkgname/shell-integration/zsh/.zshenv"
+    install -Dm644 data/shell-integration/bash/sketerm-rc.bash \
+        "$pkgdir/usr/share/$_pkgname/shell-integration/bash/sketerm-rc.bash"
     install -Dm644 data/shell-integration/fish-xdg/fish/vendor_conf.d/sketerm.fish \
         "$pkgdir/usr/share/$_pkgname/shell-integration/fish-xdg/fish/vendor_conf.d/sketerm.fish"
 
