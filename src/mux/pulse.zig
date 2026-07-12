@@ -32,12 +32,14 @@ const CMD_EXIT = 7;
 const CMD_AUTH = 8;
 const CMD_SET_CLIENT_NAME = 9;
 const CMD_LOOKUP_SINK = 10;
+const CMD_LOOKUP_SOURCE = 11;
 const CMD_DRAIN_PLAYBACK_STREAM = 12;
 const CMD_STAT = 13;
 const CMD_GET_PLAYBACK_LATENCY = 14;
 const CMD_GET_SERVER_INFO = 20;
 const CMD_GET_SINK_INFO = 21;
 const CMD_GET_SINK_INFO_LIST = 22;
+const CMD_GET_SOURCE_INFO = 23;
 const CMD_GET_SOURCE_INFO_LIST = 24;
 const CMD_SUBSCRIBE = 35;
 const CMD_SET_SINK_INPUT_VOLUME = 37;
@@ -546,7 +548,11 @@ pub const Server = struct {
                 try t.str("sketerm");
                 try t.sampleSpec(3, 2, 44100); // s16le stereo
                 try t.str("sketerm"); // default sink
-                try t.str(null); // no default source
+                // The default SOURCE must be a real, non-null name: no
+                // genuine server ever reports none (a sink always has
+                // a monitor), so clients dereference it unchecked —
+                // SDL3's ServerInfoCallback SIGSEGVd on our old NULL.
+                try t.str("sketerm.monitor");
                 try t.u32be(0x5EE7); // instance cookie
                 try self.finishFrame();
             },
@@ -559,15 +565,40 @@ pub const Server = struct {
                 try self.putSink(&t);
                 try self.finishFrame();
             },
-            CMD_GET_SOURCE_INFO_LIST => {
-                // No sources — an empty list is a bare reply.
-                _ = try self.replyHead(tag);
+            CMD_GET_SOURCE_INFO, CMD_GET_SOURCE_INFO_LIST => {
+                // One source: the sink's monitor (backs the non-null
+                // default source above; capture-side clients skip
+                // monitors, so nothing tries to record from it).
+                if (command == CMD_GET_SOURCE_INFO) {
+                    _ = try r.u32be(); // index
+                    _ = try r.str(); // name
+                }
+                var t = try self.replyHead(tag);
+                try self.putSource(&t);
                 try self.finishFrame();
             },
             CMD_LOOKUP_SINK => {
                 _ = try r.str();
                 var t = try self.replyHead(tag);
                 try t.u32be(0);
+                try self.finishFrame();
+            },
+            CMD_LOOKUP_SOURCE => {
+                _ = try r.str();
+                var t = try self.replyHead(tag);
+                try t.u32be(0);
+                try self.finishFrame();
+            },
+            CMD_STAT => {
+                // pa_stat_info: five u32s (memblock counts/sizes and
+                // the sample-cache size). An empty reply here made
+                // pa_context_stat callbacks fail their parse.
+                var t = try self.replyHead(tag);
+                try t.u32be(0); // memblock_total
+                try t.u32be(0); // memblock_total_size
+                try t.u32be(0); // memblock_allocated
+                try t.u32be(0); // memblock_allocated_size
+                try t.u32be(0); // scache_size
                 try self.finishFrame();
             },
             CMD_CREATE_PLAYBACK_STREAM => try self.createPlayback(&r, tag),
@@ -639,7 +670,10 @@ pub const Server = struct {
                 if (self.version >= 13) try t.usec(20_000);
                 try self.finishFrame();
             },
-            // Accepted, trivially acknowledged.
+            // Accepted, trivially acknowledged (their real replies
+            // ARE empty acks — anything with a payload gets its own
+            // handler above; an empty reply where the client expects
+            // fields fails its parse, or worse).
             CMD_SUBSCRIBE,
             CMD_EXIT,
             CMD_FLUSH_PLAYBACK_STREAM,
@@ -650,7 +684,6 @@ pub const Server = struct {
             CMD_UPDATE_PLAYBACK_STREAM_SAMPLE_RATE,
             CMD_UPDATE_PLAYBACK_STREAM_PROPLIST,
             CMD_REMOVE_PLAYBACK_STREAM_PROPLIST,
-            CMD_STAT,
             => {
                 _ = try self.replyHead(tag);
                 try self.finishFrame();
@@ -750,11 +783,35 @@ pub const Server = struct {
         try t.u32be(INVALID_INDEX); // owner module
         try t.cvolume(2, 0x10000); // norm
         try t.boolean(false); // mute
-        try t.u32be(INVALID_INDEX); // monitor source
-        try t.str(null); // monitor source name
+        try t.u32be(0); // monitor source (see putSource)
+        try t.str("sketerm.monitor");
         try t.usec(20_000); // latency
         try t.str("sketerm"); // driver
-        try t.u32be(0x0100); // PA_SINK_LATENCY
+        try t.u32be(0x0002); // PA_SINK_LATENCY
+        if (self.version >= 13) {
+            try t.emptyProplist();
+            try t.usec(20_000); // requested latency
+        }
+    }
+
+    /// The sink's monitor source (source_fill_tagstruct, v13). Exists
+    /// so the server-info default source is a real object — clients
+    /// dereference that name unchecked; capture-side enumeration
+    /// skips monitors, so nothing records from it.
+    fn putSource(self: *Server, t: *const Tw) Error!void {
+        try t.u32be(0); // index
+        try t.str("sketerm.monitor");
+        try t.str("Monitor of sketerm remote audio");
+        try t.sampleSpec(3, 2, 44100);
+        try t.channelMap(2);
+        try t.u32be(INVALID_INDEX); // owner module
+        try t.cvolume(2, 0x10000); // norm
+        try t.boolean(false); // mute
+        try t.u32be(0); // monitor OF sink 0
+        try t.str("sketerm"); // monitored sink name
+        try t.usec(20_000); // latency
+        try t.str("sketerm"); // driver
+        try t.u32be(0x0002); // PA_SOURCE_LATENCY
         if (self.version >= 13) {
             try t.emptyProplist();
             try t.usec(20_000); // requested latency
@@ -993,4 +1050,86 @@ test "viewer consumed reports drive REQUESTs" {
     try t_.expectEqual(@as(u32, 0), try r.u32be());
     try t_.expectEqual(@as(u32, 9600), try r.u32be());
     try t_.expectEqual(@as(u64, 9600), srv.streams.get(0).?.read_index);
+}
+
+test "server/sink/source/stat replies parse fully (SDL crash regression)" {
+    const a = t_.allocator;
+    var srv = Server.init(a);
+    defer srv.deinit();
+    srv.authorized = true;
+
+    var fields: std.ArrayList(u8) = .empty;
+    defer fields.deinit(a);
+    const w = Tw{ .buf = &fields, .a = a };
+
+    { // GET_SERVER_INFO: the default SOURCE must be a real name —
+        // SDL3's ServerInfoCallback dereferences it unchecked and
+        // SIGSEGVd on the NULL we used to send.
+        try w.u32be(CMD_GET_SERVER_INFO);
+        try w.u32be(7);
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(a);
+        try clientFrame(a, &frame, fields.items);
+        try srv.feed(frame.items);
+        fields.clearRetainingCapacity();
+        var r = Tr{ .buf = srv.takeOut()[DESC_SIZE..] };
+        try t_.expectEqual(@as(u32, CMD_REPLY), try r.u32be());
+        try t_.expectEqual(@as(u32, 7), try r.u32be());
+        _ = try r.str(); // package
+        _ = try r.str(); // version
+        _ = try r.str(); // user
+        _ = try r.str(); // host
+        _ = try r.sampleSpec();
+        try t_.expectEqualStrings("sketerm", (try r.str()).?); // default sink
+        try t_.expectEqualStrings("sketerm.monitor", (try r.str()).?); // default source: NON-NULL
+        _ = try r.u32be(); // cookie
+        try t_.expectEqual(r.buf.len, r.pos); // consumed exactly
+        srv.clearOut();
+    }
+    { // GET_SOURCE_INFO_LIST: one monitor source, v13 layout exact.
+        try w.u32be(CMD_GET_SOURCE_INFO_LIST);
+        try w.u32be(8);
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(a);
+        try clientFrame(a, &frame, fields.items);
+        try srv.feed(frame.items);
+        fields.clearRetainingCapacity();
+        var r = Tr{ .buf = srv.takeOut()[DESC_SIZE..] };
+        try t_.expectEqual(@as(u32, CMD_REPLY), try r.u32be());
+        try t_.expectEqual(@as(u32, 8), try r.u32be());
+        try t_.expectEqual(@as(u32, 0), try r.u32be()); // index
+        try t_.expectEqualStrings("sketerm.monitor", (try r.str()).?);
+        _ = try r.str(); // description
+        _ = try r.sampleSpec();
+        _ = try r.channelMap();
+        try t_.expectEqual(INVALID_INDEX, try r.u32be()); // owner module
+        try r.cvolume();
+        try t_.expectEqual(false, try r.boolean()); // mute
+        try t_.expectEqual(@as(u32, 0), try r.u32be()); // monitor of sink 0
+        try t_.expectEqualStrings("sketerm", (try r.str()).?);
+        _ = try r.tag(); // usec latency
+        _ = try r.rawU32();
+        _ = try r.rawU32();
+        _ = try r.str(); // driver
+        try t_.expectEqual(@as(u32, 0x0002), try r.u32be()); // flags
+        try r.skipProplist();
+        srv.clearOut();
+    }
+    { // STAT: five u32s (an empty reply broke pa_context_stat).
+        try w.u32be(CMD_STAT);
+        try w.u32be(9);
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(a);
+        try clientFrame(a, &frame, fields.items);
+        try srv.feed(frame.items);
+        fields.clearRetainingCapacity();
+        var r = Tr{ .buf = srv.takeOut()[DESC_SIZE..] };
+        try t_.expectEqual(@as(u32, CMD_REPLY), try r.u32be());
+        try t_.expectEqual(@as(u32, 9), try r.u32be());
+        var i: u32 = 0;
+        while (i < 5) : (i += 1) _ = try r.u32be();
+        try t_.expectEqual(r.buf.len, r.pos);
+        srv.clearOut();
+    }
+    try t_.expect(!srv.dead);
 }
