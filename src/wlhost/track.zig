@@ -48,6 +48,9 @@ pub const Action = union(enum) {
         format: u32,
     },
     buffer_destroy: struct { id: u32 },
+    /// wl_surface destructor — per-surface daemon state (video
+    /// encoders) can be dropped.
+    surface_destroy: struct { id: u32 },
     /// wl_data_offer.receive — the app wants to paste: the message
     /// carries one fd the daemon must hold until the GUI ships the
     /// clipboard bytes (clip_data unit, FIFO-paired).
@@ -334,6 +337,7 @@ pub const Tracker = struct {
             else => return .relay,
         };
         if (iface == &protocol.wl_surface) switch (hdr.opcode) {
+            0 => return .{ .surface_destroy = .{ .id = hdr.object } },
             1 => { // attach
                 var it = wire.ArgIter.init(body, msg.sig);
                 const buffer = (try it.next()).?.object;

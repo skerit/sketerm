@@ -467,6 +467,7 @@ pub const Conn = struct {
         }
     }
 
+
     /// Peel one complete frame out of the read buffer, or null when what is
     /// buffered so far is only PART of a frame. Never touches the fd, so it
     /// cannot block.
@@ -476,6 +477,10 @@ pub const Conn = struct {
         const remaining = self.rbuf.items.len - peeled.consumed;
         std.mem.copyForwards(u8, self.rbuf.items[0..remaining], self.rbuf.items[peeled.consumed..]);
         self.rbuf.shrinkRetainingCapacity(remaining);
+        // One big frame (a multi-MB window buffer) must not pin its
+        // high-water capacity for the connection's lifetime.
+        if (remaining == 0 and self.rbuf.capacity > (4 << 20))
+            self.rbuf.clearAndFree(self.allocator);
         return .{ .ftype = peeled.frame.ftype, .payload = owned };
     }
 
