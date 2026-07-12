@@ -63,10 +63,26 @@ pub const Term = struct {
             return Error.OutOfMemory;
         errdefer allocator.free(name);
 
+        // Auto shell-integration, like a GUI pane would get: the OSC
+        // 133 zones it injects are what powers term_run output_only.
+        // The daemon is local (term tools are isolated-mode only), so
+        // client-resolved script paths are valid on its host. With no
+        // explicit argv the daemon spawns ITS $SHELL — same process
+        // environment, so resolving against ours matches.
+        const shellintegration = @import("../util/shellintegration.zig");
+        const shell: []const u8 = if (argv) |av| av[0] else blk: {
+            const sh = c.getenv("SHELL");
+            break :blk if (sh != null) std.mem.span(@as([*:0]const u8, @ptrCast(sh))) else "/bin/sh";
+        };
+        const si = shellintegration.resolve(allocator, shell);
+        defer if (si) |r| r.deinit(allocator);
+        const SiWire = struct { kind: []const u8, script: []const u8, shim_dir: []const u8 };
+        const si_wire: ?SiWire = if (si) |r| .{ .kind = r.kind, .script = r.script, .shim_dir = r.shim } else null;
+
         if (argv) |av| {
-            conn.sendJson(.spawn, .{ .name = name, .argv = av, .rows = rows, .cols = cols }) catch return Error.SpawnFailed;
+            conn.sendJson(.spawn, .{ .name = name, .argv = av, .rows = rows, .cols = cols, .shell_integration = si_wire }) catch return Error.SpawnFailed;
         } else {
-            conn.sendJson(.spawn, .{ .name = name, .rows = rows, .cols = cols }) catch return Error.SpawnFailed;
+            conn.sendJson(.spawn, .{ .name = name, .rows = rows, .cols = cols, .shell_integration = si_wire }) catch return Error.SpawnFailed;
         }
         (conn.recvExpect(&.{.ok}) catch return Error.SpawnFailed).deinit(allocator);
         conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
