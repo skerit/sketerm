@@ -459,17 +459,43 @@ pub const Conn = struct {
 
     pub fn recvFrame(self: *Conn) !OwnedFrame {
         while (true) {
-            if (try wire.peelFrame(self.rbuf.items)) |peeled| {
-                const owned = try self.allocator.dupe(u8, peeled.frame.payload);
-                const remaining = self.rbuf.items.len - peeled.consumed;
-                std.mem.copyForwards(u8, self.rbuf.items[0..remaining], self.rbuf.items[peeled.consumed..]);
-                self.rbuf.shrinkRetainingCapacity(remaining);
-                return .{ .ftype = peeled.frame.ftype, .payload = owned };
-            }
+            if (try self.takeFrame()) |owned| return owned;
             var tmp: [16384]u8 = undefined;
             const n = c.read(self.fd, &tmp, tmp.len);
             if (n <= 0) return error.Disconnected;
             try self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]);
+        }
+    }
+
+    /// Peel one complete frame out of the read buffer, or null when what is
+    /// buffered so far is only PART of a frame. Never touches the fd, so it
+    /// cannot block.
+    pub fn takeFrame(self: *Conn) !?OwnedFrame {
+        const peeled = (try wire.peelFrame(self.rbuf.items)) orelse return null;
+        const owned = try self.allocator.dupe(u8, peeled.frame.payload);
+        const remaining = self.rbuf.items.len - peeled.consumed;
+        std.mem.copyForwards(u8, self.rbuf.items[0..remaining], self.rbuf.items[peeled.consumed..]);
+        self.rbuf.shrinkRetainingCapacity(remaining);
+        return .{ .ftype = peeled.frame.ftype, .payload = owned };
+    }
+
+    /// Top the read buffer up with whatever bytes have already arrived, without
+    /// blocking. Returns false only if the peer hung up.
+    ///
+    /// This exists because recvFrame's read() BLOCKS: a big frame (an 8 MB window
+    /// buffer, say) arrives in many chunks, so "the fd is readable" does NOT mean a
+    /// whole frame is there. A caller that only wants what is already queued must
+    /// not be made to wait for a tail that may never come.
+    pub fn fillAvailable(self: *Conn) bool {
+        while (true) {
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&pfd, 1, 0) <= 0) return true;
+            if ((pfd.revents & (c.POLLIN | c.POLLHUP)) == 0) return true;
+            var tmp: [16384]u8 = undefined;
+            const n = c.read(self.fd, &tmp, tmp.len);
+            if (n <= 0) return false;           // hung up
+            self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]) catch return false;
+            if (@as(usize, @intCast(n)) < tmp.len) return true;   // drained the socket
         }
     }
 

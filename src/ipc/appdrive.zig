@@ -291,19 +291,37 @@ pub const App = struct {
     }
 
     /// Process at most one incoming frame, waiting up to `wait_ms`.
-    /// Returns false when nothing arrived in time (or after exit).
+    /// Returns false when nothing COMPLETE arrived in time (or after exit).
+    ///
+    /// This must never block past `wait_ms`, which is why it does not call
+    /// recvFrame: recvFrame read()s until it has a whole frame, and a big frame (an
+    /// 8 MB window buffer) arrives in many chunks. A readable fd therefore does NOT
+    /// mean a whole frame is there, and waiting for the tail of one that has not
+    /// been sent yet hangs the caller. Partial bytes simply stay in the buffer and
+    /// are peeled once the rest lands.
     pub fn pumpOnce(self: *App, wait_ms: i32) bool {
         if (self.exited) return false;
+
         // Attach-time recvExpect may have buffered frames PAST the
         // snapshot into conn.rbuf (a small dmabuf replay fits in one
         // read); those never make the fd readable again — drain the
         // buffer before polling for new bytes.
-        const buffered = (wire.peelFrame(self.conn.rbuf.items) catch null) != null;
-        if (!buffered and !pollIn(self.conn.fd, wait_ms)) return false;
-        const f = self.conn.recvFrame() catch {
+        if (self.takeOne()) return true;
+
+        if (!pollIn(self.conn.fd, wait_ms)) return false;
+        if (!self.conn.fillAvailable()) {
             self.exited = true;
             return false;
-        };
+        }
+        return self.takeOne();
+    }
+
+    /// Handle one complete buffered frame, if there is one.
+    fn takeOne(self: *App) bool {
+        const f = (self.conn.takeFrame() catch {
+            self.exited = true;
+            return false;
+        }) orelse return false;
         defer f.deinit(self.allocator);
         self.handleFrame(f.ftype, f.payload);
         return true;
