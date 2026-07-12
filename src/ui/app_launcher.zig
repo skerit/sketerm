@@ -25,6 +25,10 @@ const Launcher = struct {
     listbox: *c.GtkWidget,
     search: *c.GtkWidget,
     status: *c.GtkWidget,
+    /// Right-click context menu (parented to the listbox) and the row
+    /// it was opened on.
+    row_menu: *c.GtkWidget,
+    menu_row: ?*c.GtkListBoxRow = null,
     /// Owned host string for spawning ("" = local).
     host: []u8,
     /// Recently launched apps (persisted), most recent first.
@@ -123,6 +127,7 @@ pub fn open(win: *Window, pane: *Pane) void {
     const list = c.gtk_list_box_new();
     const search = c.gtk_search_entry_new();
     const status = c.gtk_label_new("Loading apps…");
+    const row_menu = c.gtk_popover_new();
     self.* = .{
         .allocator = allocator,
         .win = win,
@@ -131,6 +136,7 @@ pub fn open(win: *Window, pane: *Pane) void {
         .listbox = list,
         .search = search,
         .status = status,
+        .row_menu = row_menu,
         .host = allocator.dupe(u8, host_str) catch {
             allocator.destroy(self);
             c.gtk_window_destroy(@ptrCast(window));
@@ -176,6 +182,25 @@ pub fn open(win: *Window, pane: *Pane) void {
     _ = c.g_signal_connect_data(list, "row-activated", @ptrCast(&onRowActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(root), scroller);
 
+    // Right-click context menu on a row: "Launch with GPU" (the
+    // activate default follows the `gpu_apps` config list). Parented
+    // to the root box, NOT the listbox — clearList walks the listbox's
+    // children and a non-row child would wedge it.
+    c.gtk_widget_set_parent(row_menu, root);
+    c.gtk_popover_set_has_arrow(@ptrCast(row_menu), 0);
+    const gpu_btn = c.gtk_button_new();
+    const gpu_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
+    c.gtk_box_append(@ptrCast(gpu_box), c.gtk_image_new_from_icon_name("video-display-symbolic"));
+    c.gtk_box_append(@ptrCast(gpu_box), c.gtk_label_new("Launch with GPU"));
+    c.gtk_button_set_child(@ptrCast(gpu_btn), gpu_box);
+    c.gtk_widget_add_css_class(gpu_btn, "flat");
+    _ = c.g_signal_connect_data(gpu_btn, "clicked", @ptrCast(&onGpuLaunch), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    c.gtk_popover_set_child(@ptrCast(row_menu), gpu_btn);
+    const rclick = c.gtk_gesture_click_new();
+    c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
+    _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRowRightClick), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(list, @ptrCast(rclick));
+
     c.gtk_label_set_xalign(@ptrCast(status), 0.0);
     c.gtk_widget_set_margin_start(status, 10);
     c.gtk_widget_set_margin_end(status, 10);
@@ -211,10 +236,42 @@ fn onSearchActivate(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
     var i: c_int = 0;
     while (c.gtk_list_box_get_row_at_index(@ptrCast(self.listbox), i)) |row| : (i += 1) {
         if (filterRow(@ptrCast(row), @ptrCast(self)) != 0) {
-            launchRow(self, @ptrCast(row));
+            launchRow(self, @ptrCast(row), null);
             return;
         }
     }
+}
+
+/// Right-click on a row: select it and pop the context menu at the
+/// pointer.
+fn onRowRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Launcher, user);
+    const row = c.gtk_list_box_get_row_at_y(@ptrCast(self.listbox), @intFromFloat(y)) orelse return;
+    self.menu_row = @ptrCast(row);
+    c.gtk_list_box_select_row(@ptrCast(self.listbox), @ptrCast(row));
+    // Gesture coords are listbox-relative; the popover hangs off the
+    // root box (see open) — translate.
+    var pt: c.graphene_point_t = undefined;
+    _ = c.graphene_point_init(&pt, @floatCast(x), @floatCast(y));
+    var out: c.graphene_point_t = undefined;
+    const parent = c.gtk_widget_get_parent(self.row_menu);
+    if (c.gtk_widget_compute_point(self.listbox, parent, &pt, &out) == 0) out = pt;
+    const rect = c.GdkRectangle{
+        .x = @intFromFloat(out.x),
+        .y = @intFromFloat(out.y),
+        .width = 1,
+        .height = 1,
+    };
+    c.gtk_popover_set_pointing_to(@ptrCast(self.row_menu), &rect);
+    c.gtk_popover_popup(@ptrCast(self.row_menu));
+}
+
+fn onGpuLaunch(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Launcher, user);
+    c.gtk_popover_popdown(@ptrCast(self.row_menu));
+    const row = self.menu_row orelse return;
+    self.menu_row = null;
+    launchRow(self, row, true);
 }
 
 fn onDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
@@ -314,10 +371,12 @@ fn sortRow(r1: *c.GtkListBoxRow, r2: *c.GtkListBoxRow, _: ?*anyopaque) callconv(
 }
 
 fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
-    launchRow(cast.userData(Launcher, user), row);
+    launchRow(cast.userData(Launcher, user), row, null);
 }
 
-fn launchRow(self: *Launcher, row: *c.GtkListBoxRow) void {
+/// `gpu_override` forces GPU on/off; null follows the `gpu_apps`
+/// config list.
+fn launchRow(self: *Launcher, row: *c.GtkListBoxRow, gpu_override: ?bool) void {
     const exec_c = c.g_object_get_data(@ptrCast(@alignCast(row)), "al-exec") orelse return;
     const exec = std.mem.span(@as([*:0]const u8, @ptrCast(exec_c)));
     if (exec.len == 0) return;
@@ -333,7 +392,8 @@ fn launchRow(self: *Launcher, row: *c.GtkListBoxRow) void {
     // Spawn via the host's shell so full Exec strings work.
     const host_opt: ?[]const u8 = if (self.host.len > 0) self.host else null;
     const argv = [_][]const u8{ "/bin/sh", "-c", exec };
-    self.win.launchRemoteAppSession(host_opt, &argv) catch {
+    const gpu = gpu_override orelse self.win.config.appWantsGpu(name, exec);
+    self.win.launchRemoteAppSession(host_opt, &argv, gpu) catch {
         c.gtk_label_set_text(@ptrCast(self.status), "Launch failed (daemon refused the app session)");
         return;
     };

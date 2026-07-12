@@ -4010,8 +4010,8 @@ pub const Window = struct {
     /// on `host`'s daemon and attach it; in window view mode this is
     /// TABLESS (floating windows only), in tab mode it's an embedded
     /// tab. Used by the app launcher. `host` null = the local
-    /// autostart daemon.
-    pub fn launchRemoteAppSession(self: *Window, host: ?[]const u8, argv: []const []const u8) !void {
+    /// autostart daemon. `gpu` = per-session dmabuf opt-in.
+    pub fn launchRemoteAppSession(self: *Window, host: ?[]const u8, argv: []const []const u8, gpu: bool) !void {
         var name_buf: [64]u8 = undefined;
         const name = nextSessionName(&name_buf);
         var conn = try self.muxConnect(host);
@@ -4023,6 +4023,7 @@ pub const Window = struct {
                 .rows = @as(u16, 24),
                 .cols = @as(u16, 80),
                 .app = true,
+                .gpu = gpu,
                 .kb_layout = self.config.app_keyboard_layout,
             });
             (try conn.recvExpect(&.{.ok})).deinit(self.allocator);

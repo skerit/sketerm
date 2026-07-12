@@ -224,6 +224,11 @@ pub const Config = struct {
     app_keyboard_layout: []const u8 = "",
     /// Default view for forwarded-app sessions (see AppView).
     app_view: AppView = .window,
+    /// Comma-separated app names the launcher always starts with GPU
+    /// rendering (linux-dmabuf instead of software GL) — matched
+    /// case-insensitively against the .desktop Name or the Exec
+    /// binary's basename, e.g. "Blender, mpv". Empty = none.
+    gpu_apps: []const u8 = "",
     /// UDP port range "lo:hi" passed to the remote `--udp-listen`
     /// bootstrap (mosh-style; firewalls usually need a pinned range
     /// like "60000:61000"). Empty = ephemeral port.
@@ -445,6 +450,7 @@ pub const Config = struct {
         out.word_chars = try arena.dupe(u8, self.word_chars);
         out.gtk_theme = try arena.dupe(u8, self.gtk_theme);
         out.app_keyboard_layout = try arena.dupe(u8, self.app_keyboard_layout);
+        out.gpu_apps = try arena.dupe(u8, self.gpu_apps);
         out.mux_udp_port_range = try arena.dupe(u8, self.mux_udp_port_range);
         out.default_profile = try arena.dupe(u8, self.default_profile);
         out.keybinds = .empty;
@@ -711,6 +717,7 @@ pub const Config = struct {
         if (self.app_keyboard_layout.len > 0)
             try w.print("app_keyboard_layout = {s}\n", .{self.app_keyboard_layout});
         if (self.app_view != .window) try w.print("app_view = {s}\n", .{@tagName(self.app_view)});
+        if (self.gpu_apps.len > 0) try w.print("gpu_apps = {s}\n", .{self.gpu_apps});
         if (self.mux_udp_port_range.len > 0)
             try w.print("mux_udp_port_range = {s}\n", .{self.mux_udp_port_range});
 
@@ -839,6 +846,13 @@ pub const Config = struct {
         return &self.settings;
     }
 
+    /// Whether the launcher should start this app with GPU rendering:
+    /// a `gpu_apps` entry matches the .desktop Name or the Exec
+    /// binary's basename (both case-insensitive).
+    pub fn appWantsGpu(self: *const Config, name: []const u8, exec: []const u8) bool {
+        return gpuAppsMatch(self.gpu_apps, name, exec);
+    }
+
     /// Look up a domain by name and allocate its transport-prefixed
     /// host spec ("udp:host" / "host"). Null when no such domain or
     /// the section never set a host.
@@ -851,6 +865,25 @@ pub const Config = struct {
         return null;
     }
 };
+
+/// Pure matcher behind Config.appWantsGpu (testable without a Config).
+fn gpuAppsMatch(gpu_apps: []const u8, name: []const u8, exec: []const u8) bool {
+    if (gpu_apps.len == 0) return false;
+    // Exec's binary basename: first whitespace-delimited token, after
+    // the last '/' (Exec lines carry args; env wrappers are rare
+    // enough to ignore).
+    const first_end = std.mem.indexOfAny(u8, exec, " \t") orelse exec.len;
+    const first = exec[0..first_end];
+    const base = if (std.mem.lastIndexOfScalar(u8, first, '/')) |i| first[i + 1 ..] else first;
+    var it = std.mem.splitScalar(u8, gpu_apps, ',');
+    while (it.next()) |raw| {
+        const entry = std.mem.trim(u8, raw, " \t");
+        if (entry.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(entry, name) or std.ascii.eqlIgnoreCase(entry, base))
+            return true;
+    }
+    return false;
+}
 
 fn eqColor(a: [4]f32, b: [4]f32) bool {
     return a[0] == b[0] and a[1] == b[1] and a[2] == b[2] and a[3] == b[3];
@@ -1167,6 +1200,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         if (std.mem.eql(u8, value, "window")) cfg.app_view = .window
         else if (std.mem.eql(u8, value, "tab")) cfg.app_view = .tab
         else return error.BadAppView;
+    } else if (std.mem.eql(u8, key, "gpu_apps")) {
+        cfg.gpu_apps = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "mux_udp_port_range")) {
         // Validate lo:hi here so a typo warns at load, not mid-ssh.
         const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.BadPortRange;
@@ -1825,4 +1860,18 @@ test "config: [profile.default] section edits the Default settings" {
     try std.testing.expectEqual(@as(u16, 18), cfg.profileSettings("").font_size);
     try std.testing.expectEqual(@as(u16, 18), cfg.profileSettings("default").font_size);
     try std.testing.expectEqual(@as(u16, 18), cfg.profileSettings("nope").font_size);
+}
+
+test "config: gpu_apps parses and appWantsGpu matches name or exec basename" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator, "gpu_apps = Blender, mpv\n");
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("Blender, mpv", cfg.gpu_apps);
+    // .desktop Name, case-insensitive.
+    try std.testing.expect(cfg.appWantsGpu("blender", "/usr/bin/blender-launcher %f"));
+    // Exec basename (with args and path stripped).
+    try std.testing.expect(cfg.appWantsGpu("Media Player", "/usr/bin/mpv --player-operation-mode=pseudo-gui %U"));
+    try std.testing.expect(!cfg.appWantsGpu("Files", "/usr/bin/nautilus %U"));
+    // Args never match; empty list never matches.
+    try std.testing.expect(!cfg.appWantsGpu("X", "foo mpv"));
+    try std.testing.expect(!gpuAppsMatch("", "Blender", "blender"));
 }

@@ -167,6 +167,7 @@ pub const App = struct {
     /// picks the session keymap (wlhost/keymaps.zig; null/"" = us) —
     /// typing is encoded against the same blob. `local_sock` targets a
     /// private daemon instance (MCP isolation); null = shared daemon.
+    /// `gpu` = per-session dmabuf opt-in (real GL driver on the host).
     pub fn launch(
         allocator: std.mem.Allocator,
         argv: []const []const u8,
@@ -175,6 +176,7 @@ pub const App = struct {
         host: ?[]const u8,
         kb_layout: ?[]const u8,
         local_sock: ?[]const u8,
+        gpu: bool,
     ) Error!*App {
         const layout_name = kb_layout orelse "";
         const blob = keymaps.get(layout_name) orelse return Error.BadLayout;
@@ -201,6 +203,7 @@ pub const App = struct {
             .cols = cols,
             .app = true,
             .kb_layout = layout_name,
+            .gpu = gpu,
         }) catch return Error.SpawnFailed;
         (conn.recvExpect(&.{.ok}) catch return Error.SpawnFailed).deinit(allocator);
         conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;

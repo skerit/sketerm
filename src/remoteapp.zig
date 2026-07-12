@@ -22,7 +22,7 @@ fn errMsg(comptime fmt: []const u8, args: anytype) void {
 }
 
 const USAGE =
-    \\Usage: sketerm app [-u] [-i] [user@]<host|domain> <command...>
+    \\Usage: sketerm app [-u] [-i] [--gpu] [user@]<host|domain> <command...>
     \\
     \\Run a graphical application on a remote host with its windows on
     \\this desktop. A sketerm window must already be open here — it
@@ -36,6 +36,10 @@ const USAGE =
     \\        here instead of handing off to a copy already rendering on
     \\        another client. Cost: this session won't share the remote's
     \\        audio / notifications / portals.
+    \\  --gpu render on the host's real GPU: the session compositor
+    \\        announces linux-dmabuf and the app keeps its hardware GL
+    \\        driver (default is software GL). Needs a driver whose
+    \\        linear buffers allow CPU mmap; otherwise windows go stale.
     \\
     \\  sketerm app devbox gnome-calculator
     \\  sketerm app -u flaky-wifi-box firefox --new-window
@@ -51,26 +55,31 @@ pub const Parsed = struct {
     command: []const []const u8,
     udp: bool = false,
     isolated: bool = false,
+    gpu: bool = false,
 };
 
-/// Pure argv split: leading -u/-i flags (any order), then host, rest =
-/// remote command. Null = show usage (missing host/command, or -h/--help).
+/// Pure argv split: leading -u/-i/--gpu flags (any order), then host,
+/// rest = remote command (so the app's own flags pass through). Null =
+/// show usage (missing host/command, or -h/--help).
 pub fn parseArgs(args_in: []const []const u8) ?Parsed {
     var args = args_in;
     var udp = false;
     var isolated = false;
+    var gpu = false;
     while (args.len > 0) {
         if (std.mem.eql(u8, args[0], "-u")) {
             udp = true;
         } else if (std.mem.eql(u8, args[0], "-i") or std.mem.eql(u8, args[0], "--isolated")) {
             isolated = true;
+        } else if (std.mem.eql(u8, args[0], "--gpu")) {
+            gpu = true;
         } else break;
         args = args[1..];
     }
     if (args.len < 2) return null;
     if (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")) return null;
     if (args[0].len == 0) return null;
-    return .{ .host = args[0], .command = args[1..], .udp = udp, .isolated = isolated };
+    return .{ .host = args[0], .command = args[1..], .udp = udp, .isolated = isolated, .gpu = gpu };
 }
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
@@ -101,7 +110,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // Spawn an app-kind session on the host's daemon and hand it to
     // the running GUI, whose compositor brain renders the windows.
     // Null = no GUI to render into.
-    if (runNativeApp(allocator, host, parsed.command, use_udp, port_range, parsed.isolated, cfg.app_keyboard_layout)) |code| return code;
+    if (runNativeApp(allocator, host, parsed.command, use_udp, port_range, parsed.isolated, parsed.gpu, cfg.app_keyboard_layout)) |code| return code;
     errMsg("no sketerm window is open on this desktop to render the app — open one and retry", .{});
     return 1;
 }
@@ -118,6 +127,7 @@ fn runNativeApp(
     use_udp: bool,
     port_range: ?[]const u8,
     isolated: bool,
+    gpu: bool,
     kb_layout: []const u8,
 ) ?u8 {
     const ipc_client = @import("ipc/client.zig");
@@ -148,6 +158,7 @@ fn runNativeApp(
         .cols = @as(u16, 80),
         .app = true,
         .isolated = isolated,
+        .gpu = gpu,
         .kb_layout = kb_layout,
     }) catch return 1;
     const ok = conn.recvExpect(&.{.ok}) catch {
@@ -214,6 +225,21 @@ test "remoteapp: parseArgs handles -i (any order, with -u)" {
     // Default off; flags only consumed when leading.
     try std.testing.expect(!parseArgs(&[_][]const u8{ "box", "app" }).?.isolated);
     try std.testing.expect(!parseArgs(&[_][]const u8{ "box", "-i" }).?.isolated);
+}
+
+test "remoteapp: parseArgs handles --gpu (any order, pass-through after host)" {
+    const g = [_][]const u8{ "--gpu", "devbox", "blender" };
+    const p = parseArgs(&g).?;
+    try std.testing.expect(p.gpu and !p.udp and !p.isolated);
+    try std.testing.expectEqualStrings("devbox", p.host);
+    const mixed = [_][]const u8{ "-u", "--gpu", "-i", "box", "app" };
+    const q = parseArgs(&mixed).?;
+    try std.testing.expect(q.gpu and q.udp and q.isolated);
+    // Default off; a trailing --gpu belongs to the app, not us.
+    const trailing = [_][]const u8{ "box", "app", "--gpu" };
+    const r = parseArgs(&trailing).?;
+    try std.testing.expect(!r.gpu);
+    try std.testing.expectEqualStrings("--gpu", r.command[1]);
 }
 
 test "remoteapp: parseArgs rejects missing command / help" {
