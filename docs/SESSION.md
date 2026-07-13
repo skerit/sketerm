@@ -7426,3 +7426,12 @@ smoke-mcp PASS, mux-portable OK, and an 11-check e2e driver: 200-
 marker flood admits exactly 8 (192 counted; real output survives;
 tools stay <2s), +2 marker captures after the wait, +500 marker on an
 exiting app resolves with an explanatory no-screenshot message.
+
+Addendum: same-instant marker bursts now store ONE image per
+committed frame — later markers reference it (`MarkerShot.same_as`)
+instead of holding byte-copies, and only png-bearing entries count
+toward the 8-image cap (total entries capped at 40). Previously a
+burst burned all 8 slots and evicted earlier legit screenshots.
+E2e-verified: a pre-burst marker's screenshot survives a 50-marker
+burst, and burst members serve the shared image with a "frame
+unchanged since marker N" caption.
