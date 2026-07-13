@@ -501,9 +501,14 @@ const Native = struct {
     /// Copy: read-ends of pipes whose write-ends went to the app
     /// via wl_data_source.send; EOF ships a clip_data unit up.
     clip_reads: std.ArrayList(ClipRead) = .empty,
-    /// pool id → mmapped mirror. Mirrors outlive wl_shm_pool
-    /// destructors: existing buffers keep referencing the memory.
+    /// pool id → mmapped mirror of the CURRENT incarnation under that
+    /// id. Mirrors outlive wl_shm_pool destructors: existing buffers
+    /// keep referencing the memory.
     pools: std.AutoHashMapUnmanaged(u32, PoolMirror) = .empty,
+    /// Incarnation serial → mirror displaced from `pools` by id reuse
+    /// while old buffers still referenced it (Vulkan WSI destroys its
+    /// probe pools early; the recycled id must not cross refcounts).
+    orphan_pools: std.AutoHashMapUnmanaged(u64, PoolMirror) = .empty,
     /// zwp_linux_buffer_params_v1 id → plane fd awaiting create_immed.
     dmabuf_pending: std.AutoHashMapUnmanaged(u32, c_int) = .empty,
     /// dmabuf wl_buffer id → CPU-mapped mirror (LINEAR-only import).
@@ -576,7 +581,25 @@ const Native = struct {
         /// semantics keep the memory alive for existing buffers.
         buffers: u32 = 0,
         destroyed: bool = false,
+        /// Tracker incarnation serial (0 for dmabuf mirrors).
+        serial: u64 = 0,
+
+        fn unmap(m: *const PoolMirror) void {
+            _ = c.munmap(m.ptr, m.size);
+            _ = c.close(m.fd);
+        }
     };
+
+    /// Drop one buffer reference from an orphaned mirror; the last
+    /// one frees it (orphans are destroyed by construction).
+    fn releaseOrphan(nv: *Native, serial: u64) void {
+        const om = nv.orphan_pools.getPtr(serial) orelse return;
+        if (om.buffers > 0) om.buffers -= 1;
+        if (om.buffers == 0) {
+            om.unmap();
+            _ = nv.orphan_pools.remove(serial);
+        }
+    }
 
     /// Unmap + close a pool mirror and tell replicas to drop their
     /// copy (the pool_destroy pipe unit compositor.zig frees on).
@@ -591,11 +614,11 @@ const Native = struct {
         self.brain.deinit();
         self.allocator.destroy(self.brain);
         var it = self.pools.valueIterator();
-        while (it.next()) |p| {
-            _ = c.munmap(p.ptr, p.size);
-            _ = c.close(p.fd);
-        }
+        while (it.next()) |p| p.unmap();
         self.pools.deinit(self.allocator);
+        var oit = self.orphan_pools.valueIterator();
+        while (oit.next()) |p| p.unmap();
+        self.orphan_pools.deinit(self.allocator);
         var dbit = self.dmabufs.valueIterator();
         while (dbit.next()) |m| {
             _ = c.munmap(m.ptr, m.size);
@@ -2659,16 +2682,22 @@ pub const Daemon = struct {
             },
             .buffer_destroy => |bd| {
                 if (nv.dmabufs.fetchRemove(bd.id)) |kv| {
-                    _ = c.munmap(kv.value.ptr, kv.value.size);
-                    _ = c.close(kv.value.fd);
+                    kv.value.unmap();
                 } else if (nv.tracker.buffers.get(bd.id)) |info| {
                     // Last buffer of an already-destroyed shm pool:
-                    // the mirror is finally reclaimable.
+                    // the mirror is finally reclaimable. The buffer's
+                    // incarnation serial decides WHICH mirror it
+                    // releases — the current holder of the pool id,
+                    // or a displaced (orphaned) predecessor.
                     if (!info.dmabuf) {
-                        if (nv.pools.getPtr(info.pool)) |m| {
+                        const cur = nv.pools.getPtr(info.pool);
+                        if (cur != null and cur.?.serial == info.serial) {
+                            const m = cur.?;
                             if (m.buffers > 0) m.buffers -= 1;
                             if (m.destroyed and m.buffers == 0)
                                 try nv.reclaimPool(units, a, info.pool);
+                        } else {
+                            nv.releaseOrphan(info.serial);
                         }
                     }
                 }
@@ -2771,13 +2800,18 @@ pub const Daemon = struct {
                 try wlpipe.appendPoolMeta(units, a, .pool_create, p.id, @intCast(sz));
                 const gop = try nv.pools.getOrPut(a, p.id);
                 if (gop.found_existing) {
-                    // Recycled pool id (delete_id reuse): the old
-                    // mirror is unreachable from here — free it or it
-                    // leaks one full-pool mmap per recycle.
-                    _ = c.munmap(gop.value_ptr.ptr, gop.value_ptr.size);
-                    _ = c.close(gop.value_ptr.fd);
+                    // Recycled pool id (delete_id reuse). Old buffers
+                    // may still reference the displaced mirror — park
+                    // it under its serial until the last one dies;
+                    // with no referents, free it now or it leaks one
+                    // full-pool mmap per recycle.
+                    if (gop.value_ptr.buffers > 0) {
+                        nv.orphan_pools.put(a, gop.value_ptr.serial, gop.value_ptr.*) catch gop.value_ptr.unmap();
+                    } else {
+                        gop.value_ptr.unmap();
+                    }
                 }
-                gop.value_ptr.* = .{ .fd = fd, .ptr = @ptrCast(ptr.?), .size = sz };
+                gop.value_ptr.* = .{ .fd = fd, .ptr = @ptrCast(ptr.?), .size = sz, .serial = p.serial };
             },
             .pool_resize => |p| {
                 const mirror = nv.pools.getPtr(p.id) orelse return error.NoSuchPool;
@@ -2823,10 +2857,17 @@ pub const Daemon = struct {
                 // live mirror re-encoded by replayNativeChannels. Saves
                 // a headless daemon (MCP running an animated app) from
                 // burning CPU zstd-encoding frames for nobody.
-                const mirror_opt: ?Native.PoolMirror = if (self.hasNativeViewer(nv))
-                    (if (cm.info.dmabuf) nv.dmabufs.get(cm.buffer) else nv.pools.get(cm.info.pool))
-                else
-                    null;
+                //
+                // Pixel units address pools by ID, so only commits
+                // against the pool id's CURRENT incarnation may ship
+                // them — an orphaned mirror's bytes would land in the
+                // wrong (recycled) replica pool. Replicas render
+                // orphan-backed buffers from their own retained copy.
+                const mirror_opt: ?Native.PoolMirror = if (self.hasNativeViewer(nv)) blk: {
+                    if (cm.info.dmabuf) break :blk nv.dmabufs.get(cm.buffer);
+                    const m = nv.pools.get(cm.info.pool) orelse break :blk null;
+                    break :blk if (m.serial == cm.info.serial) m else null;
+                } else null;
                 if (mirror_opt) |mirror| {
                     if (cm.info.offset >= 0 and cm.info.stride > 0 and cm.info.height > 0) {
                         var y0: i64 = 0;
