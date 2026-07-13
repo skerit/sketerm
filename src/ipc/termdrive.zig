@@ -55,8 +55,11 @@ pub const Term = struct {
     ) Error!*Term {
         var conn = muxclient.Conn.connectLocalAutostartAt(allocator, local_sock) catch return Error.SpawnFailed;
         errdefer conn.deinit();
+        // Non-blocking + deadline recv everywhere: a wedged daemon
+        // costs a bounded error, never a hung MCP tool call.
+        conn.setNonBlocking();
         conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.SpawnFailed;
-        (conn.recvExpect(&.{.welcome}) catch return Error.SpawnFailed).deinit(allocator);
+        (conn.recvExpectFor(&.{.welcome}, 15_000) catch return Error.SpawnFailed).deinit(allocator);
 
         name_counter += 1;
         const name = std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch
@@ -84,9 +87,9 @@ pub const Term = struct {
         } else {
             conn.sendJson(.spawn, .{ .name = name, .rows = rows, .cols = cols, .shell_integration = si_wire }) catch return Error.SpawnFailed;
         }
-        (conn.recvExpect(&.{.ok}) catch return Error.SpawnFailed).deinit(allocator);
+        (conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed).deinit(allocator);
         conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
-        const snap = conn.recvExpect(&.{.snapshot}) catch return Error.SpawnFailed;
+        const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch return Error.SpawnFailed;
         defer snap.deinit(allocator);
 
         const pool = allocator.create(Pool) catch return Error.OutOfMemory;
@@ -155,21 +158,39 @@ pub const Term = struct {
         return c.poll(&pfd, 1, ms) > 0 and (pfd.revents & (c.POLLIN | c.POLLHUP)) != 0;
     }
 
-    /// Process at most one queued frame, waiting up to `wait_ms`.
+    /// Process at most one COMPLETE queued frame, waiting up to
+    /// `wait_ms`. Never blocks past that: a readable fd does not mean
+    /// a whole frame arrived, so this peels from the buffer instead
+    /// of calling recvFrame (whose read() would park on a frame tail
+    /// a wedged daemon never sends).
     pub fn pumpOnce(self: *Term, wait_ms: i32) bool {
         if (self.exited) return false;
+        if (self.takeOne()) return true;
         if (!pollIn(self.conn.fd, wait_ms)) return false;
-        const f = self.conn.recvFrame() catch {
+        if (!self.conn.fillAvailable()) {
             self.exited = true;
             return false;
-        };
+        }
+        return self.takeOne();
+    }
+
+    fn takeOne(self: *Term) bool {
+        const f = (self.conn.takeFrame() catch {
+            self.exited = true;
+            return false;
+        }) orelse return false;
         defer f.deinit(self.allocator);
         self.handleFrame(f.ftype, f.payload);
         return true;
     }
 
+    /// Time-boxed like appdrive.drain: a flooding shell (`cat` of a
+    /// huge file) must not wedge the single-threaded MCP loop.
     pub fn drain(self: *Term) void {
-        while (self.pumpOnce(0)) {}
+        const deadline = nowMs() + 100;
+        while (self.pumpOnce(0)) {
+            if (nowMs() >= deadline) break;
+        }
     }
 
     /// Raw bytes to the shell's PTY.

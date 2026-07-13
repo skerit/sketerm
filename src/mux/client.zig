@@ -43,6 +43,10 @@ pub const Conn = struct {
     /// instead of a bare `error.DaemonError`.
     last_err: [192]u8 = undefined,
     last_err_len: usize = 0,
+    /// Bound on how long sendFrame waits for a full socket buffer to
+    /// drain before failing (a wedged daemon must cost an error, not
+    /// a hung caller).
+    write_timeout_ms: c_int = 30_000,
 
     pub fn connect(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -152,7 +156,9 @@ pub const Conn = struct {
         var conn = conn_in;
         errdefer conn.deinit();
         try conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video });
-        const w = try conn.recvExpect(&.{.welcome});
+        // Bounded: a daemon that accepts but never answers (wedged,
+        // swap-thrashing) must fail the connect, not hang the caller.
+        const w = try conn.recvExpectFor(&.{.welcome}, 10_000);
         defer w.deinit(allocator);
         // Version-skew guard: a daemon left running from a previous build
         // speaks an older protocol. Refuse rather than corrupt the stream
@@ -265,7 +271,7 @@ pub const Conn = struct {
         errdefer conn.deinit();
 
         conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video }) catch return error.SshTransportFailed;
-        const w = conn.recvExpect(&.{.welcome}) catch return error.SshTransportFailed;
+        const w = conn.recvExpectFor(&.{.welcome}, 20_000) catch return error.SshTransportFailed;
         w.deinit(allocator);
         return conn;
     }
@@ -353,7 +359,7 @@ pub const Conn = struct {
         // retryable error instead of hanging the blocking read forever.
         conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video }) catch return error.SshTransportFailed;
         try waitReadable(conn.fd, 20_000);
-        const w = conn.recvExpect(&.{.welcome}) catch return error.SshTransportFailed;
+        const w = conn.recvExpectFor(&.{.welcome}, 20_000) catch return error.SshTransportFailed;
         defer w.deinit(allocator);
         // Version-skew guard: the remote `sketerm-mux` is a different
         // build that speaks another protocol. `list` (plain JSON) would
@@ -369,6 +375,17 @@ pub const Conn = struct {
             }
         } else |_| {}
         return conn;
+    }
+
+    /// Switch the fd to non-blocking so NO call on this connection can
+    /// park forever: sendFrame bounds a full-buffer write with a
+    /// write_timeout_ms poll (its EAGAIN path), and reads must go
+    /// through recvFrameFor/recvExpectFor/fillAvailable — plain
+    /// recvFrame's blocking read() would misread EAGAIN as a hangup.
+    pub fn setNonBlocking(self: *Conn) void {
+        const fl = c.fcntl(self.fd, c.F_GETFL);
+        if (fl < 0) return;
+        _ = c.fcntl(self.fd, c.F_SETFL, fl | c.O_NONBLOCK);
     }
 
     /// Poll `fd` for readability, bounded by `timeout_ms`. A timeout or
@@ -404,7 +421,7 @@ pub const Conn = struct {
                 var pfd = [_]c.struct_pollfd{.{ .fd = self.fd, .events = c.POLLOUT, .revents = 0 }};
                 // Wait for drain; a timeout (link wedged) gives up
                 // rather than spinning forever.
-                if (c.poll(&pfd, 1, 30_000) <= 0 and e == .AGAIN) return error.WriteFailed;
+                if (c.poll(&pfd, 1, self.write_timeout_ms) <= 0 and e == .AGAIN) return error.WriteFailed;
                 continue;
             }
             return error.WriteFailed;

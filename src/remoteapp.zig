@@ -161,7 +161,7 @@ fn runNativeApp(
         .gpu = gpu,
         .kb_layout = kb_layout,
     }) catch return 1;
-    const ok = conn.recvExpect(&.{.ok}) catch {
+    const ok = conn.recvExpectFor(&.{.ok}, 20_000) catch {
         errMsg("daemon on {s} refused the app session", .{host});
         return 1;
     };
