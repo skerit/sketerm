@@ -7435,3 +7435,59 @@ burst burned all 8 slots and evicted earlier legit screenshots.
 E2e-verified: a pre-burst marker's screenshot survives a 50-marker
 burst, and burst members serve the shared image with a "frame
 unchanged since marker N" caption.
+
+## 2026-07-13 (later still) — MCP feedback round 4: no-hang, mouse motion, batched actions
+
+Fourth round of agent feedback (a DOS-game-port session driving a
+native SDL3 build + DOSBox side by side). Four asks; all landed.
+
+**1. No-hang invariant (the reported blocker).** The reporter's build
+predated the round-3 drain fix, but three genuinely unbounded paths
+remained and are now closed:
+- `Conn.sendFrame` on a BLOCKING fd could park in write() forever
+  against a wedged daemon (the exact 15GB-leak failure mode).
+  appdrive/termdrive conns now run NON-BLOCKING (`Conn.setNonBlocking`)
+  so sendFrame's EAGAIN path bounds the wait (`Conn.write_timeout_ms`).
+- Every remaining blocking `recvExpect` became `recvExpectFor`:
+  `helloProbe` (10s — a daemon that accepts but never answers now
+  fails the connect), listInstalledApps/listAppSessions (10s), the
+  termdrive spawn handshake (15s), remoteapp + SSH/UDP welcomes (20s).
+- termdrive.pumpOnce had the pre-b275f44 bug appdrive already fixed
+  (poll says readable != whole frame buffered; recvFrame then blocks
+  on the tail) — now peels via fillAvailable/takeFrame, and its
+  drain() is time-boxed like appdrive's. `RealBackend.talk` (GUI
+  socket) gets a 30s GLib socket timeout.
+E2e: launch → self-exit(3) → screenshot_app / list_apps / app_actions
+/ app_output all answer in ~2s total with explicit exited+status+
+recent_output (the reported 15-minute wedge scenario).
+
+**2. Pointer motion (`app_mouse_move`).** Button-free move: x/y
+absolute, dx/dy RELATIVE, no-args = query. appdrive tracks the
+injected position per app (click/drag/scroll update it too); the
+compositor brain already derives zwp_relative_pointer relative_motion
+from successive absolute motions and suppresses absolute events under
+pointer-lock, so DOSBox-style relative-mouse apps move by exactly the
+delta. Tool description documents the corner-slam calibration trick
+(one huge negative delta). Bonus fix: app_scroll now emits a real
+motion (enter alone is a no-op on unchanged focus, so scrolling never
+actually positioned the pointer before).
+
+**3. `app_actions` batch.** One call runs an ordered step list
+server-side: move/move_rel/click/drag/key/type/scroll/wait/wait_idle
+(incl. change_pct)/wait_change/screenshot (max 8 inline, max 32
+steps), per-step report, stops early with the exit summary when the
+app dies mid-sequence. E2e: a 9-step batch against weston-terminal
+typed `echo BATCH-OK`, settled, and returned both screenshots — the
+output visible in the shot.
+
+**4. Animating-app waits + capture rate.** `app_wait change_pct` =
+VISUAL quiescence via `appdrive.waitVisualSettle`: commits diffing
+less than the threshold don't reset the quiet timer AND don't move
+the baseline (tiny animations settle; slow cumulative drift still
+counts as change). The timeout message now says which mode to use.
+`app_record_start fps` caps encoder feeding (e2e: same script, 9
+frames uncapped vs 2 at fps 2). app_output distinguishes "blank
+visible grid" from "never printed" instead of returning silence.
+
+Verified: 714/720 unit tests, smoke-mux + smoke-mcp PASS, mux +
+mux-portable build, plus the three e2e MCP drives above.
