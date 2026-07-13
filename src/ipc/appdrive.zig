@@ -94,10 +94,16 @@ pub fn listInstalledApps(allocator: std.mem.Allocator, host: ?[]const u8, local_
     return allocator.dupe(u8, f.payload) catch return Error.OutOfMemory;
 }
 
-/// Names of live app sessions on the daemon at `sock`, WITHOUT
-/// autostarting one (no daemon = empty). Caller frees each name and
-/// the slice.
-pub fn listAppSessions(allocator: std.mem.Allocator, sock: []const u8) Error![][]u8 {
+/// One live app session in a daemon's `list` reply.
+pub const AppSessionRef = struct {
+    name: []u8,
+    /// Session child pid on the daemon's host (0 = unknown).
+    pid: i32 = 0,
+};
+
+/// Live app sessions on the daemon at `sock`, WITHOUT autostarting one
+/// (no daemon = empty). Caller frees each `.name` and the slice.
+pub fn listAppSessions(allocator: std.mem.Allocator, sock: []const u8) Error![]AppSessionRef {
     var conn = muxclient.Conn.connect(allocator, sock) catch return Error.SpawnFailed;
     defer conn.deinit();
     conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.NotConnected;
@@ -111,6 +117,7 @@ pub fn listAppSessions(allocator: std.mem.Allocator, sock: []const u8) Error![][
             name: []const u8,
             app: bool = false,
             exited: bool = false,
+            pid: i32 = 0,
         } = &.{},
     };
     const parsed = std.json.parseFromSlice(Listing, allocator, f.payload, .{
@@ -118,20 +125,20 @@ pub fn listAppSessions(allocator: std.mem.Allocator, sock: []const u8) Error![][
     }) catch return Error.NotConnected;
     defer parsed.deinit();
 
-    var names: std.ArrayList([]u8) = .empty;
+    var refs: std.ArrayList(AppSessionRef) = .empty;
     errdefer {
-        for (names.items) |n| allocator.free(n);
-        names.deinit(allocator);
+        for (refs.items) |r| allocator.free(r.name);
+        refs.deinit(allocator);
     }
     for (parsed.value.sessions) |s| {
         if (!s.app or s.exited) continue;
         const n = allocator.dupe(u8, s.name) catch return Error.OutOfMemory;
-        names.append(allocator, n) catch {
+        refs.append(allocator, .{ .name = n, .pid = s.pid }) catch {
             allocator.free(n);
             return Error.OutOfMemory;
         };
     }
-    return names.toOwnedSlice(allocator) catch Error.OutOfMemory;
+    return refs.toOwnedSlice(allocator) catch Error.OutOfMemory;
 }
 
 /// One rendered toplevel (or popup) surface of one app channel.
@@ -186,6 +193,10 @@ pub const App = struct {
     frame_seq: u64 = 0,
     exited: bool = false,
     exit_status: i32 = 0,
+    /// Session child pid ON THE DAEMON'S HOST (0 = unknown). A string
+    /// command spawns via `/bin/sh -c`, so this is the shell; argv-array
+    /// launches exec directly and the pid IS the app.
+    pid: i32 = 0,
     /// Toplevel the keyboard was last aimed at (0 = none yet).
     kbd_focus: u32 = 0, // public window id
     /// Latest clipboard selection the app announced (copy source).
@@ -279,10 +290,21 @@ pub const App = struct {
             .cwd = opts.cwd,
             .env = opts.env,
         }) catch return Error.SpawnFailed;
-        (conn.recvExpectFor(&.{.ok}, opts.step_timeout_ms) catch |err| {
-            setStepErr("spawn", &conn, err);
-            return Error.SpawnFailed;
-        }).deinit(allocator);
+        var spawn_pid: i32 = 0;
+        {
+            const ok = conn.recvExpectFor(&.{.ok}, opts.step_timeout_ms) catch |err| {
+                setStepErr("spawn", &conn, err);
+                return Error.SpawnFailed;
+            };
+            defer ok.deinit(allocator);
+            const OkReply = struct { pid: i32 = 0 };
+            if (std.json.parseFromSlice(OkReply, allocator, ok.payload, .{
+                .ignore_unknown_fields = true,
+            })) |p| {
+                spawn_pid = p.value.pid;
+                p.deinit();
+            } else |_| {}
+        }
         conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
         const snap = conn.recvExpectFor(&.{.snapshot}, opts.step_timeout_ms) catch |err| {
             setStepErr("attach", &conn, err);
@@ -291,7 +313,7 @@ pub const App = struct {
         defer snap.deinit(allocator);
 
         const self = allocator.create(App) catch return Error.OutOfMemory;
-        self.* = .{ .allocator = allocator, .conn = conn, .name = name, .layout = layout };
+        self.* = .{ .allocator = allocator, .conn = conn, .name = name, .layout = layout, .pid = spawn_pid };
         layout = null; // ownership moved
         self.applyTermSnapshot(snap.payload);
         return self;
