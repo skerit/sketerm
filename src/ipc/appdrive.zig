@@ -85,11 +85,12 @@ pub fn listInstalledApps(allocator: std.mem.Allocator, host: ?[]const u8, local_
         break :blk muxclient.Conn.connectLocalAutostartAt(allocator, local_sock) catch return Error.SpawnFailed;
     };
     defer conn.deinit();
+    conn.setNonBlocking();
     conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.NotConnected;
-    (conn.recvExpect(&.{.welcome}) catch return Error.NotConnected).deinit(allocator);
+    (conn.recvExpectFor(&.{.welcome}, 10_000) catch return Error.NotConnected).deinit(allocator);
     // app_list needs no session attach — the daemon scans its own host.
     conn.sendFrame(.app_list, "") catch return Error.NotConnected;
-    const f = conn.recvExpect(&.{.app_listing}) catch return Error.Timeout;
+    const f = conn.recvExpectFor(&.{.app_listing}, 10_000) catch return Error.Timeout;
     defer f.deinit(allocator);
     return allocator.dupe(u8, f.payload) catch return Error.OutOfMemory;
 }
@@ -106,10 +107,11 @@ pub const AppSessionRef = struct {
 pub fn listAppSessions(allocator: std.mem.Allocator, sock: []const u8) Error![]AppSessionRef {
     var conn = muxclient.Conn.connect(allocator, sock) catch return Error.SpawnFailed;
     defer conn.deinit();
+    conn.setNonBlocking();
     conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.NotConnected;
-    (conn.recvExpect(&.{.welcome}) catch return Error.NotConnected).deinit(allocator);
+    (conn.recvExpectFor(&.{.welcome}, 10_000) catch return Error.NotConnected).deinit(allocator);
     conn.sendFrame(.list, "") catch return Error.NotConnected;
-    const f = conn.recvExpect(&.{.welcome}) catch return Error.Timeout;
+    const f = conn.recvExpectFor(&.{.welcome}, 10_000) catch return Error.Timeout;
     defer f.deinit(allocator);
 
     const Listing = struct {
@@ -188,20 +190,23 @@ pub const Window = struct {
     /// Fraction (0..100) of pixels differing from the baseline; 100
     /// when the window was resized or no baseline exists yet.
     fn pctVsBaseline(self: *const Window) f64 {
-        const n = self.pixels.items.len;
-        if (self.shot_pixels.items.len != n or self.shot_w != self.w or self.shot_h != self.h or n < 4)
-            return 100.0;
-        const cur = self.pixels.items;
-        const base = self.shot_pixels.items;
-        var diff: usize = 0;
-        var i: usize = 0;
-        while (i + 4 <= n) : (i += 4) {
-            if (!std.mem.eql(u8, cur[i..][0..4], base[i..][0..4])) diff += 1;
-        }
-        const total = n / 4;
-        return @as(f64, @floatFromInt(diff)) * 100.0 / @as(f64, @floatFromInt(total));
+        if (self.shot_w != self.w or self.shot_h != self.h) return 100.0;
+        return pctDiffBuf(self.pixels.items, self.shot_pixels.items);
     }
 };
+
+/// Fraction (0..100) of 4-byte pixels differing between two equally
+/// sized buffers; 100 on a length mismatch.
+fn pctDiffBuf(cur: []const u8, base: []const u8) f64 {
+    const n = cur.len;
+    if (base.len != n or n < 4) return 100.0;
+    var diff: usize = 0;
+    var i: usize = 0;
+    while (i + 4 <= n) : (i += 4) {
+        if (!std.mem.eql(u8, cur[i..][0..4], base[i..][0..4])) diff += 1;
+    }
+    return @as(f64, @floatFromInt(diff)) * 100.0 / @as(f64, @floatFromInt(n / 4));
+}
 
 /// One wayland_native channel = one app display connection, with its
 /// own replica compositor.
@@ -233,6 +238,13 @@ pub const App = struct {
     pid: i32 = 0,
     /// Toplevel the keyboard was last aimed at (0 = none yet).
     kbd_focus: u32 = 0, // public window id
+    /// Tracked pointer: last surface-local position injected on the
+    /// seat (matches the compositor's relative_motion delta base;
+    /// enter on an unchanged focus does NOT reset it). ptr_win 0 =
+    /// no motion injected yet.
+    ptr_win: u32 = 0,
+    ptr_x: f64 = 0,
+    ptr_y: f64 = 0,
     /// Latest clipboard selection the app announced (copy source).
     clip_offer: ?ClipOffer = null,
     /// Fetched app-clipboard bytes (answer to a clip_send).
@@ -248,6 +260,10 @@ pub const App = struct {
     rec: ?gifrec.Rec = null,
     vrec: ?videorec.Rec = null,
     rec_win: u32 = 0,
+    /// Recording rate cap (`fps` on app_record_start): commits closer
+    /// together than this are not fed to the encoder. 0 = every frame.
+    rec_min_interval_ms: i64 = 0,
+    rec_last_add: i64 = 0,
     /// Client-side Screen mirror of the app session's PTY (the app's
     /// stdout/stderr as a rendered terminal — the "held log tab"),
     /// built from the attach snapshot + the event stream, exactly like
@@ -338,6 +354,10 @@ pub const App = struct {
             };
         };
         errdefer conn.deinit();
+        // Non-blocking: sendFrame then bounds a full-buffer write with
+        // its EAGAIN+poll path — a wedged daemon can no longer park an
+        // intent/screenshot/log request in write() forever.
+        conn.setNonBlocking();
 
         conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.SpawnFailed;
         (conn.recvExpectFor(&.{.welcome}, opts.step_timeout_ms) catch |err| {
@@ -411,6 +431,7 @@ pub const App = struct {
             return Error.SpawnFailed;
         };
         errdefer conn.deinit();
+        conn.setNonBlocking();
 
         conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.SpawnFailed;
         (conn.recvExpectFor(&.{.welcome}, 15_000) catch |err| {
@@ -912,8 +933,11 @@ pub const App = struct {
         ch.app.tickPendingMarkers(win);
         if (win.id == ch.app.rec_win and w > 0 and h > 0) {
             const t = nowMs();
-            if (ch.app.rec) |*r| r.addShmFrame(pixels, @intCast(w), @intCast(h), format, t) catch {};
-            if (ch.app.vrec) |*r| r.addShmFrame(pixels, @intCast(w), @intCast(h), format, t) catch {};
+            if (ch.app.rec_min_interval_ms <= 0 or t - ch.app.rec_last_add >= ch.app.rec_min_interval_ms) {
+                ch.app.rec_last_add = t;
+                if (ch.app.rec) |*r| r.addShmFrame(pixels, @intCast(w), @intCast(h), format, t) catch {};
+                if (ch.app.vrec) |*r| r.addShmFrame(pixels, @intCast(w), @intCast(h), format, t) catch {};
+            }
         }
     }
 
@@ -1075,6 +1099,70 @@ pub const App = struct {
         };
     }
 
+    pub const PtrPos = struct { win: u32, x: f64, y: f64 };
+
+    /// Where the tracked pointer is (null until the first injected
+    /// motion/click).
+    pub fn pointerPos(self: *const App) ?PtrPos {
+        if (self.ptr_win == 0) return null;
+        return .{ .win = self.ptr_win, .x = self.ptr_x, .y = self.ptr_y };
+    }
+
+    /// Pointer target: explicit id, else the window the pointer is
+    /// already on, else the first toplevel.
+    fn resolvePtrWin(self: *App, win_id: ?u32) Error!*Window {
+        if (win_id) |id| return self.winById(id) orelse Error.NoSuchWindow;
+        if (self.ptr_win != 0) {
+            if (self.winById(self.ptr_win)) |w| return w;
+        }
+        for (self.windows.items) |w| {
+            if (!w.popup) return w;
+        }
+        return Error.NoSuchWindow;
+    }
+
+    /// Inject enter+motion to (x,y) and move the tracked position.
+    fn sendPointer(self: *App, win: *Window, x: f64, y: f64) Error!void {
+        const a = self.allocator;
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(a);
+        wlpipe.appendSeatEnter(&units, a, win.sid, x, y) catch return Error.OutOfMemory;
+        wlpipe.appendSeatMotion(&units, a, x, y) catch return Error.OutOfMemory;
+        try self.sendIntents(win.chan, units.items);
+        self.rememberPtr(win.id, x, y);
+    }
+
+    fn rememberPtr(self: *App, win_id: u32, x: f64, y: f64) void {
+        self.ptr_win = win_id;
+        self.ptr_x = x;
+        self.ptr_y = y;
+    }
+
+    /// Move the pointer WITHOUT any button (hover; and the motion
+    /// primitive for relative-pointer apps — the compositor derives
+    /// relative_motion deltas from successive absolute positions).
+    pub fn moveMouse(self: *App, win_id: ?u32, x: f64, y: f64) Error!PtrPos {
+        const win = try self.resolvePtrWin(win_id);
+        try self.sendPointer(win, x, y);
+        return .{ .win = win.id, .x = x, .y = y };
+    }
+
+    /// Relative move: delta from the tracked position (window center
+    /// when the pointer has not been placed on this window yet).
+    /// Deliberately UNCLAMPED — a pointer-locked app only consumes
+    /// the deltas, and clamping would silently absorb part of one.
+    pub fn moveMouseRel(self: *App, win_id: ?u32, dx: f64, dy: f64) Error!PtrPos {
+        const win = try self.resolvePtrWin(win_id);
+        var bx = @as(f64, @floatFromInt(win.w)) / 2.0;
+        var by = @as(f64, @floatFromInt(win.h)) / 2.0;
+        if (self.ptr_win == win.id) {
+            bx = self.ptr_x;
+            by = self.ptr_y;
+        }
+        try self.sendPointer(win, bx + dx, by + dy);
+        return .{ .win = win.id, .x = bx + dx, .y = by + dy };
+    }
+
     pub fn click(self: *App, win_id: u32, x: f64, y: f64, button: u32) Error!void {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         const a = self.allocator;
@@ -1085,6 +1173,7 @@ pub const App = struct {
         wlpipe.appendSeatButton(&units, a, evdevButton(button), true) catch return Error.OutOfMemory;
         wlpipe.appendSeatButton(&units, a, evdevButton(button), false) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);
+        self.rememberPtr(win.id, x, y);
     }
 
     pub fn scroll(self: *App, win_id: u32, x: f64, y: f64, dx: f64, dy: f64) Error!void {
@@ -1093,9 +1182,13 @@ pub const App = struct {
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
         wlpipe.appendSeatEnter(&units, a, win.sid, x, y) catch return Error.OutOfMemory;
+        // Enter is a no-op when focus is unchanged, so the motion is
+        // what actually puts the pointer at the scroll point.
+        wlpipe.appendSeatMotion(&units, a, x, y) catch return Error.OutOfMemory;
         if (dy != 0) wlpipe.appendSeatAxis(&units, a, 0, dy * 10.0, @intFromFloat(dy * 120.0)) catch return Error.OutOfMemory;
         if (dx != 0) wlpipe.appendSeatAxis(&units, a, 1, dx * 10.0, @intFromFloat(dx * 120.0)) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);
+        self.rememberPtr(win.id, x, y);
     }
 
     /// Press-move-release drag. Motions go out in small bursts with
@@ -1122,6 +1215,7 @@ pub const App = struct {
         units.clearRetainingCapacity();
         wlpipe.appendSeatButton(&units, a, evdevButton(button), false) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);
+        self.rememberPtr(win.id, x2, y2);
     }
 
     /// Fetch the app's AT-SPI accessibility tree as JSON (the daemon
@@ -1323,12 +1417,15 @@ pub const App = struct {
 
     /// Start recording a window's frames as GIF (`webm` false) or
     /// WebM/VP9 (`webm` true). Replaces any recording in progress.
-    pub fn recordStart(self: *App, win_id: u32, max_dim: u32, webm: bool) Error!void {
+    /// `fps` caps the capture rate (0 = every committed frame).
+    pub fn recordStart(self: *App, win_id: u32, max_dim: u32, webm: bool, fps: u32) Error!void {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         if (self.rec) |*r| r.abort();
         if (self.vrec) |*r| r.abort();
         self.rec = null;
         self.vrec = null;
+        self.rec_min_interval_ms = if (fps == 0) 0 else @divTrunc(@as(i64, 1000), @as(i64, fps));
+        self.rec_last_add = 0;
         if (webm)
             self.vrec = videorec.Rec.init(self.allocator, max_dim)
         else
@@ -1337,6 +1434,7 @@ pub const App = struct {
         // Seed with the current frame so recording starts from "now".
         if (win.w > 0 and win.pixels.items.len > 0) {
             const t = nowMs();
+            self.rec_last_add = t;
             if (self.rec) |*r| r.addShmFrame(win.pixels.items, @intCast(win.w), @intCast(win.h), win.format, t) catch {};
             if (self.vrec) |*r| r.addShmFrame(win.pixels.items, @intCast(win.w), @intCast(win.h), win.format, t) catch {};
         }
@@ -1500,6 +1598,50 @@ pub const App = struct {
                 last = win.frames;
                 quiet_since = nowMs();
             } else if (nowMs() - quiet_since >= stable_ms) return true;
+        }
+        return false;
+    }
+
+    /// Pump until every new commit changes LESS than `max_change_pct`
+    /// of the window's pixels for `quiet_ms` straight (VISUAL
+    /// quiescence), bounded by `timeout_ms`. A continuously-repainting
+    /// app (a game) never passes frame-commit quiescence, but an
+    /// unchanging or tiny-animation scene passes this one: commits
+    /// below the threshold do not move the comparison baseline, so a
+    /// slow cumulative drift still eventually counts as change.
+    pub fn waitVisualSettle(self: *App, win_id: u32, quiet_ms: i64, timeout_ms: i64, max_change_pct: f64) bool {
+        const a = self.allocator;
+        var base: std.ArrayList(u8) = .empty;
+        defer base.deinit(a);
+        var base_w: i32 = 0;
+        var base_h: i32 = 0;
+        var last_frames: u64 = 0;
+        {
+            const win = self.winById(win_id) orelse return false;
+            base.appendSlice(a, win.pixels.items) catch return false;
+            base_w = win.w;
+            base_h = win.h;
+            last_frames = win.frames;
+        }
+        const deadline = nowMs() + timeout_ms;
+        var quiet_since = nowMs();
+        while (nowMs() < deadline) {
+            if (self.exited) return true;
+            _ = self.pumpOnce(25);
+            const win = self.winById(win_id) orelse return false;
+            if (win.frames != last_frames) {
+                last_frames = win.frames;
+                const resized = win.w != base_w or win.h != base_h;
+                const pct = if (resized) 100.0 else pctDiffBuf(win.pixels.items, base.items);
+                if (pct >= max_change_pct) {
+                    base.clearRetainingCapacity();
+                    base.appendSlice(a, win.pixels.items) catch return false;
+                    base_w = win.w;
+                    base_h = win.h;
+                    quiet_since = nowMs();
+                }
+            }
+            if (nowMs() - quiet_since >= quiet_ms) return true;
         }
         return false;
     }

@@ -502,6 +502,9 @@ const RealBackend = struct {
         const self: *RealBackend = @ptrCast(@alignCast(ctx));
         const client = c.g_socket_client_new();
         defer c.g_object_unref(client);
+        // A wedged GUI must cost a bounded error, never a hung tool
+        // call (the timeout applies to connect and all stream IO).
+        c.g_socket_client_set_timeout(client, 30);
         const addr = c.g_unix_socket_address_new(self.sock_path.ptr);
         defer c.g_object_unref(addr);
         var gerr: [*c]c.GError = null;
@@ -722,6 +725,8 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as rendered by a terminal — right for TUI-style redraws). For log-style output prefer app_log: indexed lines with stable ids, re-readable in full. scrollback=true includes history beyond the visible grid. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
     \\{"name":"app_log","description":"A headless app's stdout/stderr as an INDEXED LOG: each complete line gets a stable numeric id and a timestamp; the tail view shortens long lines (marked [+]) and any line can be re-read in full by id. The ring is bounded (oldest lines drop; the reply says how many). MARKERS: the app (or your injected code) can emit the escape  printf '\\033]5522;my-label\\033\\\\'  — it becomes a labelled log line AND sketerm stashes a screenshot of the app window at that exact instant; fetch label+image with {\"id\":<that line's id>}. Variant printf '\\033]5522;+N;my-label\\033\\\\' captures the Nth FUTURE frame commit instead (e.g. +1 = the next repaint after this point; resolved with the final frame if the app exits first). Markers are rate-limited (burst 8, then 2/s; excess are dropped and counted) so escape-laden files cat'ed to the terminal cannot flood the log. Survives app exit: the final log is delivered with the exit.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"tail":{"type":"integer","description":"Last N lines (default 60, max 500)"},"from_id":{"type":"integer","description":"Return lines starting at this id instead of the tail"},"id":{"type":"integer","description":"Return ONE line in full; for a marker line also returns the stashed screenshot"}}}},
     \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x","y"]}},
+    \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} | {\"wait_change\":timeout_ms} | {\"screenshot\":true or {\"max_px\":N}}. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
+    \\{"name":"app_mouse_move","description":"Move the pointer in an app window WITHOUT clicking. Absolute: x,y in surface pixels (hover a widget, position before a click). Relative: dx,dy — a delta from the current pointer position, for apps that consume RELATIVE mouse motion (SDL games, DOSBox, anything with pointer-lock): sketerm derives relative_motion events from the move, so the app's own cursor moves by exactly your delta. Calibration for such apps: one large negative move (e.g. dx:-30000, dy:-30000) slams their internal cursor to the top-left corner, after which exact deltas land where you aim. With neither x/y nor dx/dy it just returns the tracked pointer position.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = window under the pointer, else first toplevel)"},"x":{"type":"number","description":"Absolute surface x (with y)"},"y":{"type":"number"},"dx":{"type":"number","description":"Relative delta x (with dy; exclusive with x/y)"},"dy":{"type":"number"}}}},
     \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
     \\{"name":"app_set_value","description":"Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value). Faster and more reliable than typing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}},
     \\{"name":"app_wait_for_element","description":"Wait until a widget appears in the app's accessibility tree (dialog opened, page loaded, ...). Match by role number and/or case-insensitive name substring; returns the matched node with its id and rect.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"role":{"type":"integer","description":"AT-SPI role number (e.g. 42 push-button)"},"name":{"type":"string","description":"Name substring, case-insensitive"},"timeout_ms":{"type":"integer","description":"Default 10000"}}}},
@@ -732,9 +737,9 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_key","description":"Press key chords in an app window: space-separated, e.g. 'ctrl+s', 'enter', 'alt+F4', 'down down enter'.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
     \\{"name":"app_scroll","description":"Scroll inside an app window. dy>0 scrolls down, dx>0 right (wheel steps).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"}},"required":["window"]}},
     \\{"name":"app_resize","description":"Ask an app window to redraw at a new size (deterministic screenshots).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["window","w","h"]}},
-    \\{"name":"app_wait","description":"Wait until an app stopped producing new frames for quiet_ms (render quiescence). Returns the window list.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"app_wait","description":"Wait until an app stopped producing new frames for quiet_ms (render quiescence), or — pass change_pct — until each new frame changes less than that percentage of pixels for quiet_ms (VISUAL quiescence: use this for games and other continuously-animating apps, which never stop committing frames but do reach a visually stable screen). Reports which outcome happened and returns the window list.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window for change_pct pixel diffing (omit = first toplevel)"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"},"change_pct":{"type":"number","description":"Settle when frames change less than this %% of pixels (e.g. 2). Omit = strict no-new-frames quiescence"}}}},
     \\{"name":"app_a11y_tree","description":"Read the app's accessibility (AT-SPI) tree as JSON: every widget's role, name, description, states and screen rectangle. Target elements by name/role instead of pixel-hunting a screenshot. Works for GTK/Qt apps; empty for apps without accessibility (games, some Electron).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
-    \\{"name":"app_record_start","description":"Start recording a window's frames (a visual log of what you do). Default format is WebM/VP9 (smaller, higher quality); pass format:\"gif\" for an animated GIF. Frames are captured while other app tools run; finish with app_record_stop.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"format":{"type":"string","enum":["webm","gif"],"description":"Default webm"},"max_px":{"type":"integer","description":"Bound on the longest dimension (default 1280 webm / 800 gif)"}}}},
+    \\{"name":"app_record_start","description":"Start recording a window's frames (a visual log of what you do). Default format is WebM/VP9 (smaller, higher quality); pass format:\"gif\" for an animated GIF. Frames are captured while other app tools run; finish with app_record_stop.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"format":{"type":"string","enum":["webm","gif"],"description":"Default webm"},"max_px":{"type":"integer","description":"Bound on the longest dimension (default 1280 webm / 800 gif)"},"fps":{"type":"integer","description":"Cap the capture rate (frames/second, 1-60; default = every committed frame)"}}}},
     \\{"name":"app_record_stop","description":"Stop the recording and save it (WebM or GIF per app_record_start). Returns the file path and frame count.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"path":{"type":"string","description":"Output path (extension set automatically if omitted)"}}}},
     \\{"name":"close_app_window","description":"Ask the app to close one window (like the titlebar button; the app decides).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"}},"required":["window"]}},
     \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
@@ -1175,6 +1180,28 @@ fn a11yNodeSummary(arena: std.mem.Allocator, node: std.json.Value) ![]const u8 {
     return aw.written();
 }
 
+/// First rendered non-popup window (0 = none yet).
+fn firstToplevelId(app: *appdrive.App) u32 {
+    for (app.windows.items) |win| {
+        if (!win.popup and win.frames > 0) return win.id;
+    }
+    return 0;
+}
+
+/// Fixed-length array of numbers out of a JSON value ([x,y], …).
+fn numArray(v: std.json.Value, comptime n: usize) ?[n]f64 {
+    if (v != .array or v.array.items.len != n) return null;
+    var out: [n]f64 = undefined;
+    for (v.array.items, 0..) |item, i| {
+        out[i] = switch (item) {
+            .integer => |iv| @floatFromInt(iv),
+            .float => |fv| fv,
+            else => return null,
+        };
+    }
+    return out;
+}
+
 fn monoMs() i64 {
     var ts: c.struct_timespec = undefined;
     _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
@@ -1319,6 +1346,11 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             return appErr(arena, "no terminal mirror for this app (output unavailable)");
         defer app_state.allocator.free(text);
         var msg: []const u8 = try arena.dupe(u8, text);
+        if (std.mem.trim(u8, text, " \n\t\r").len == 0)
+            msg = if (argBool(args, "scrollback"))
+                "(the app has written nothing to its stdout/stderr PTY — GUI apps often print little; stderr redirected elsewhere by the app itself is not visible here)"
+            else
+                "(no output on the visible terminal grid — pass scrollback:true for scrolled-off history, or use app_log for indexed lines)";
         if (app.exited) {
             msg = try std.fmt.allocPrint(arena, "[app exited, status {d}{s}]\n{s}", .{
                 app.exit_status,
@@ -1605,6 +1637,238 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         _ = app.waitIdle(200, 2_000);
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
     }
+    if (eql(u8, name, "app_actions")) {
+        const actions_v = (if (args == .object) args.object.get("actions") else null) orelse
+            return appErr(arena, "app_actions requires 'actions' (an array of step objects)");
+        if (actions_v != .array) return appErr(arena, "'actions' must be an array of step objects");
+        const steps = actions_v.array.items;
+        if (steps.len == 0) return appErr(arena, "'actions' is empty");
+        if (steps.len > 32) return appErr(arena, "too many steps (max 32)");
+        const win_arg: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
+        const MAX_SHOTS = 8;
+
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        var pngs: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (pngs.items) |p| app_state.allocator.free(p);
+            pngs.deinit(arena);
+        }
+        var stopped = false;
+        for (steps, 0..) |st, idx| {
+            const n = idx + 1;
+            if (app.exited) {
+                try w.print("step {d}: SKIPPED — app exited (status {d}); remaining steps skipped\n", .{ n, app.exit_status });
+                stopped = true;
+                break;
+            }
+            if (st != .object) {
+                try w.print("step {d}: ERROR — each step must be an object\n", .{n});
+                stopped = true;
+                break;
+            }
+            const win_step: ?u32 = if (argInt(st, "window")) |v| @intCast(v) else win_arg;
+            const button: u32 = @intCast(argInt(st, "button") orelse 1);
+
+            if (st.object.get("wait")) |wv| {
+                const ms: i64 = std.math.clamp(if (wv == .integer) wv.integer else 0, 0, 30_000);
+                _ = app.waitIdle(std.math.maxInt(i32), ms); // pure pumped sleep
+                try w.print("step {d}: waited {d}ms\n", .{ n, ms });
+            } else if (st.object.get("move")) |mv| {
+                const xy = numArray(mv, 2) orelse {
+                    try w.print("step {d}: ERROR — \"move\" wants [x,y]\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                const pos = app.moveMouse(win_step, xy[0], xy[1]) catch {
+                    try w.print("step {d}: ERROR — move failed (bad window?)\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                try w.print("step {d}: moved to ({d:.0},{d:.0}) window {d}\n", .{ n, pos.x, pos.y, pos.win });
+            } else if (st.object.get("move_rel")) |mv| {
+                const dd = numArray(mv, 2) orelse {
+                    try w.print("step {d}: ERROR — \"move_rel\" wants [dx,dy]\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                const pos = app.moveMouseRel(win_step, dd[0], dd[1]) catch {
+                    try w.print("step {d}: ERROR — move_rel failed (bad window?)\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                try w.print("step {d}: moved by ({d:.0},{d:.0}) to ({d:.0},{d:.0}) window {d}\n", .{ n, dd[0], dd[1], pos.x, pos.y, pos.win });
+            } else if (st.object.get("click")) |cv| {
+                const xy = numArray(cv, 2) orelse {
+                    try w.print("step {d}: ERROR — \"click\" wants [x,y]\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                const wid = win_step orelse firstToplevelId(app);
+                app.click(wid, xy[0], xy[1], button) catch {
+                    try w.print("step {d}: ERROR — click failed (bad window?)\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                _ = app.waitIdle(100, 1_000);
+                try w.print("step {d}: clicked ({d:.0},{d:.0}) button {d} window {d}\n", .{ n, xy[0], xy[1], button, wid });
+            } else if (st.object.get("drag")) |dv| {
+                const q = numArray(dv, 4) orelse {
+                    try w.print("step {d}: ERROR — \"drag\" wants [x1,y1,x2,y2]\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                const wid = win_step orelse firstToplevelId(app);
+                app.drag(wid, q[0], q[1], q[2], q[3], button) catch {
+                    try w.print("step {d}: ERROR — drag failed (bad window?)\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                _ = app.waitIdle(100, 1_000);
+                try w.print("step {d}: dragged ({d:.0},{d:.0})→({d:.0},{d:.0}) window {d}\n", .{ n, q[0], q[1], q[2], q[3], wid });
+            } else if (st.object.get("key")) |kv| {
+                if (kv != .string) {
+                    try w.print("step {d}: ERROR — \"key\" wants a string of chords\n", .{n});
+                    stopped = true;
+                    break;
+                }
+                var bad = false;
+                var it = std.mem.tokenizeScalar(u8, kv.string, ' ');
+                while (it.next()) |spec| {
+                    app.pressKey(win_step, spec) catch {
+                        bad = true;
+                        break;
+                    };
+                }
+                if (bad) {
+                    try w.print("step {d}: ERROR — key press failed (unknown chord / no window?)\n", .{n});
+                    stopped = true;
+                    break;
+                }
+                _ = app.waitIdle(100, 1_000);
+                try w.print("step {d}: pressed \"{s}\"\n", .{ n, kv.string });
+            } else if (st.object.get("type")) |tv| {
+                if (tv != .string) {
+                    try w.print("step {d}: ERROR — \"type\" wants a string\n", .{n});
+                    stopped = true;
+                    break;
+                }
+                app.typeText(win_step, tv.string) catch {
+                    try w.print("step {d}: ERROR — type failed (no window?)\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                _ = app.waitIdle(100, 1_000);
+                try w.print("step {d}: typed {d} chars\n", .{ n, tv.string.len });
+            } else if (st.object.get("scroll")) |sv| {
+                const dd = numArray(sv, 2) orelse {
+                    try w.print("step {d}: ERROR — \"scroll\" wants [dx,dy]\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                var sx: f64 = 10;
+                var sy: f64 = 10;
+                if (st.object.get("at")) |atv| {
+                    if (numArray(atv, 2)) |at| {
+                        sx = at[0];
+                        sy = at[1];
+                    }
+                } else if (app.pointerPos()) |p| {
+                    sx = p.x;
+                    sy = p.y;
+                }
+                const wid = win_step orelse firstToplevelId(app);
+                app.scroll(wid, sx, sy, dd[0], dd[1]) catch {
+                    try w.print("step {d}: ERROR — scroll failed (bad window?)\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                _ = app.waitIdle(100, 1_000);
+                try w.print("step {d}: scrolled ({d:.0},{d:.0}) at ({d:.0},{d:.0}) window {d}\n", .{ n, dd[0], dd[1], sx, sy, wid });
+            } else if (st.object.get("wait_idle")) |wv| {
+                var quiet_ms: i64 = 400;
+                var timeout_ms: i64 = 10_000;
+                var change_pct: ?f64 = null;
+                if (wv == .object) {
+                    if (argInt(wv, "quiet_ms")) |q| quiet_ms = q;
+                    if (argInt(wv, "timeout_ms")) |t| timeout_ms = t;
+                    change_pct = argFloat(wv, "change_pct");
+                }
+                var settled: bool = undefined;
+                if (change_pct) |pct| {
+                    const wid = win_step orelse firstToplevelId(app);
+                    settled = if (wid == 0) false else app.waitVisualSettle(wid, quiet_ms, timeout_ms, pct);
+                } else {
+                    settled = app.waitIdle(quiet_ms, timeout_ms);
+                }
+                try w.print("step {d}: wait_idle — {s}\n", .{ n, if (settled) "settled" else "timeout (still rendering)" });
+            } else if (st.object.get("wait_change")) |wv| {
+                const timeout_ms: i64 = if (wv == .integer) wv.integer else 10_000;
+                const wid = win_step orelse firstToplevelId(app);
+                const changed = if (wid == 0) false else app.waitWindowChange(wid, timeout_ms);
+                try w.print("step {d}: wait_change — {s}\n", .{ n, if (changed) "content changed" else "no change before timeout" });
+            } else if (st.object.get("screenshot")) |sv| {
+                const wid = win_step orelse firstToplevelId(app);
+                if (wid == 0) {
+                    try w.print("step {d}: ERROR — no rendered window to screenshot\n", .{n});
+                    stopped = true;
+                    break;
+                }
+                if (pngs.items.len >= MAX_SHOTS) {
+                    try w.print("step {d}: screenshot SKIPPED (max {d} per call)\n", .{ n, MAX_SHOTS });
+                    continue;
+                }
+                var max_px: u32 = 1568;
+                if (sv == .object) {
+                    if (argInt(sv, "max_px")) |m| max_px = @intCast(std.math.clamp(m, 0, 8192));
+                }
+                const shot = app.screenshotPng(wid, max_px, null, 1) catch {
+                    try w.print("step {d}: ERROR — screenshot failed (no pixels yet?)\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                pngs.append(arena, shot.png) catch {
+                    app_state.allocator.free(shot.png);
+                    return error.OutOfMemory;
+                };
+                if (shot.scale == 1.0) {
+                    try w.print("step {d}: screenshot #{d} of window {d} ({d}x{d})\n", .{ n, pngs.items.len, wid, shot.img_w, shot.img_h });
+                } else {
+                    try w.print("step {d}: screenshot #{d} of window {d} — image {d}x{d}, MULTIPLY its coordinates by {d:.3} for clicks\n", .{ n, pngs.items.len, wid, shot.img_w, shot.img_h, shot.scale });
+                }
+            } else {
+                try w.print("step {d}: ERROR — unknown step (want move/move_rel/click/drag/key/type/scroll/wait/wait_idle/wait_change/screenshot)\n", .{n});
+                stopped = true;
+                break;
+            }
+        }
+        if (!stopped) try w.print("all {d} steps completed\n", .{steps.len});
+        if (app.exited) try w.writeAll(try appSummary(arena, app));
+        if (pngs.items.len > 0)
+            return imagesResult(arena, aw.written(), pngs.items) orelse error.OutOfMemory;
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_mouse_move")) {
+        const win: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
+        const has_abs = argFloat(args, "x") != null and argFloat(args, "y") != null;
+        const has_rel = argFloat(args, "dx") != null or argFloat(args, "dy") != null;
+        if (has_abs and has_rel)
+            return appErr(arena, "pass x/y (absolute) OR dx/dy (relative), not both");
+        var pos: appdrive.App.PtrPos = undefined;
+        if (has_abs) {
+            pos = app.moveMouse(win, argFloat(args, "x").?, argFloat(args, "y").?) catch
+                return appErr(arena, "move failed (bad window?)");
+        } else if (has_rel) {
+            pos = app.moveMouseRel(win, argFloat(args, "dx") orelse 0, argFloat(args, "dy") orelse 0) catch
+                return appErr(arena, "move failed (bad window?)");
+        } else {
+            pos = app.pointerPos() orelse
+                return toolResult(arena, "no pointer position tracked yet (nothing moved/clicked in this app)", false) orelse error.OutOfMemory;
+        }
+        if (has_abs or has_rel) _ = app.waitIdle(100, 1_000);
+        const msg = try std.fmt.allocPrint(arena, "{{\"window\":{d},\"x\":{d:.0},\"y\":{d:.0}}}", .{ pos.win, pos.x, pos.y });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
     if (eql(u8, name, "app_perform_action")) {
         const elem_id = argStr(args, "element") orelse
             return appErr(arena, "app_perform_action requires 'element' (an id from app_a11y_tree)");
@@ -1720,9 +1984,24 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
     if (eql(u8, name, "app_wait")) {
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
         const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
-        const settled = app.waitIdle(quiet_ms, timeout_ms);
+        var outcome: []const u8 = undefined;
+        if (argFloat(args, "change_pct")) |pct| {
+            // Visual quiescence: frames may keep committing (a game
+            // always renders) — settle when they stop CHANGING much.
+            const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
+            if (wid == 0) return appErr(arena, "no rendered window yet (change_pct needs one)");
+            outcome = if (app.waitVisualSettle(wid, quiet_ms, timeout_ms, pct))
+                try std.fmt.allocPrint(arena, "settled (frames changed <{d:.1}% of pixels for {d}ms)", .{ pct, quiet_ms })
+            else
+                try std.fmt.allocPrint(arena, "timeout: still changing >{d:.1}% of pixels per frame after {d}ms", .{ pct, timeout_ms });
+        } else {
+            outcome = if (app.waitIdle(quiet_ms, timeout_ms))
+                "settled (no new frames)"
+            else
+                "timeout: still rendering — a continuously-animating app never settles this way; pass change_pct (e.g. 2) to wait for VISUAL quiescence instead";
+        }
         const summary = try appSummary(arena, app);
-        const msg = try std.fmt.allocPrint(arena, "{s}\n{s}", .{ if (settled) "settled" else "timeout: still rendering", summary });
+        const msg = try std.fmt.allocPrint(arena, "{s}\n{s}", .{ outcome, summary });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_a11y_tree")) {
@@ -1758,7 +2037,8 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         // for the animated GIF.
         const want_gif = if (argStr(args, "format")) |fmt| std.mem.eql(u8, fmt, "gif") else false;
         const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse (if (want_gif) @as(i64, 800) else 1280), 0, 4096));
-        app.recordStart(win_id, max_px, !want_gif) catch return appErr(arena, "no such window");
+        const fps: u32 = @intCast(std.math.clamp(argInt(args, "fps") orelse 0, 0, 60));
+        app.recordStart(win_id, max_px, !want_gif, fps) catch return appErr(arena, "no such window");
         return toolResult(arena, "recording — frames are captured while other app tools run (click/type/wait); call app_record_stop to finish", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_record_stop")) {
