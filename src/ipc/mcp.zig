@@ -647,6 +647,27 @@ fn imageResult(arena: std.mem.Allocator, caption: []const u8, png_bytes: []const
     return aw.written();
 }
 
+/// Multi-image tool result: one caption text block, then every PNG as
+/// its own inline image content block (burst capture).
+fn imagesResult(arena: std.mem.Allocator, caption: []const u8, pngs: []const []const u8) ?[]const u8 {
+    const enc = std.base64.standard.Encoder;
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":") catch return null;
+    std.json.Stringify.value(caption, .{}, w) catch return null;
+    w.writeAll("}") catch return null;
+    for (pngs) |p| {
+        if (mcp_log) |*l| l.logImage(caption, p);
+        const b64 = arena.alloc(u8, enc.calcSize(p.len)) catch return null;
+        _ = enc.encode(b64, p);
+        w.writeAll(",{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"") catch return null;
+        w.writeAll(b64) catch return null;
+        w.writeAll("\"}") catch return null;
+    }
+    w.writeAll("]}") catch return null;
+    return aw.written();
+}
+
 /// Wrap plain text as an MCP tool result: {"content":[{"type":"text",...}]}.
 fn toolResult(arena: std.mem.Allocator, text: []const u8, is_error: bool) ?[]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
@@ -696,8 +717,8 @@ const TOOLS_JSON_RAW =
     \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns the app id, the child pid on the daemon's host (attach a debugger with gdb -p; with a string command the pid is the wrapping /bin/sh — pass an argv array to make it the app itself), its windows AND the first window's screenshot inline (launch-and-look in one call). If the app exits early, the reply includes exit status, terminating signal and its recent output. Drive it with get_app_state/app_click/app_type/app_key; read its stdout/stderr with app_output.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"cwd":{"type":"string","description":"Working directory for the app"},"env":{"type":"object","description":"Extra environment variables, e.g. {\"FOO\":\"1\"}","additionalProperties":{"type":"string"}},"wait_for":{"type":"string","enum":["window","exit"],"description":"What to wait for before replying: first window (default) or process exit (short-lived/CLI runs)"},"wait_ms":{"type":"integer","description":"Max wait (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"},"layout":{"type":"string","description":"Session keyboard layout: us (default), gb, fr, be, de"},"gpu":{"type":"boolean","description":"Render on the host's real GPU via linux-dmabuf instead of software GL. Needs a driver whose linear buffers allow CPU mmap."}},"required":["command"]}},
     \\{"name":"list_apps","description":"List launched headless apps and their windows.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"app_windows","description":"List one app's rendered windows (ids, sizes, titles).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
-    \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Optional region crop and integer zoom for pixel-level inspection; downscaled when larger than max_px. The caption tells you how to map image coordinates back to app_click coordinates. wait_change=true blocks until the window renders something NEWER than your last screenshot (verify a click did something).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"},"region":{"type":"object","description":"Crop to a sub-rectangle in surface pixels","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer","description":"Nearest-neighbor integer upscale (1-32) — crop a small region and zoom to inspect pixels"},"wait_change":{"type":"boolean","description":"Wait until the window content changed since the last screenshot before capturing"},"timeout_ms":{"type":"integer","description":"Bound for wait_change (default 10000)"}}}},
-    \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app. If the app exited, reports exit status, signal and recent output instead. Accepts the same region/zoom/wait_change options as screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer"},"wait_change":{"type":"boolean"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Optional region crop and integer zoom for pixel-level inspection; downscaled when larger than max_px. The caption tells you how to map image coordinates back to app_click coordinates. wait_change=true blocks until the window renders something NEWER than your last screenshot (verify a click did something); stable_ms waits until repainting stops before capturing (settle-then-capture — combine both to catch 'changed, then went quiet'). stats_only=true skips the image and just reports whether/how much the window changed since your last look (cheap polling). burst=N captures up to N frames over burst_ms, each at least min_change_pct different from the previous — one call across an animated transition.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"},"region":{"type":"object","description":"Crop to a sub-rectangle in surface pixels","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer","description":"Nearest-neighbor integer upscale (1-32) — crop a small region and zoom to inspect pixels"},"wait_change":{"type":"boolean","description":"Wait until the window content changed since the last screenshot before capturing"},"stable_ms":{"type":"integer","description":"Capture only after the window committed no new frame for this long (settle-then-capture)"},"stats_only":{"type":"boolean","description":"Return {changed, diff_pct, resized, w, h, frames} instead of an image"},"burst":{"type":"integer","description":"Capture up to N distinct frames (2-8) over burst_ms"},"burst_ms":{"type":"integer","description":"Burst time window (default 5000)"},"min_change_pct":{"type":"number","description":"Minimum %% of pixels changed vs the previous burst frame (default 1.0)"},"timeout_ms":{"type":"integer","description":"Bound for wait_change/stable_ms (default 10000)"}}}},
+    \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app. If the app exited, reports exit status, signal and recent output instead. Accepts the same region/zoom/wait_change/stable_ms/stats_only/burst options as screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer"},"wait_change":{"type":"boolean"},"stable_ms":{"type":"integer"},"stats_only":{"type":"boolean"},"burst":{"type":"integer"},"burst_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as rendered by a terminal). THE tool for 'why did my app print/exit that'. scrollback=true includes history beyond the visible grid. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
     \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x","y"]}},
     \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
@@ -752,6 +773,16 @@ fn argBool(args: std.json.Value, key: []const u8) bool {
     return switch (v) {
         .bool => v.bool,
         else => false,
+    };
+}
+
+fn argFloat(args: std.json.Value, key: []const u8) ?f64 {
+    if (args != .object) return null;
+    const v = args.object.get(key) orelse return null;
+    return switch (v) {
+        .float => v.float,
+        .integer => @floatFromInt(v.integer),
+        else => null,
     };
 }
 
@@ -1309,12 +1340,32 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             }
             return appErr(arena, "no rendered window yet (try app_wait first)");
         }
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
         if (argBool(args, "wait_change")) {
             // Block (bounded) until the window commits a frame newer
             // than its last screenshot — "did my click do anything".
-            const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
             if (!app.waitWindowChange(win_id, timeout_ms))
                 return appErr(arena, "window content did not change before the timeout");
+        }
+        var settle_note: []const u8 = "";
+        if (argInt(args, "stable_ms")) |sm| {
+            // Settle-then-capture: wait until the window stops
+            // repainting before shooting (composes with wait_change:
+            // "changed, then went quiet").
+            if (sm > 0 and !app.waitWindowSettle(win_id, sm, timeout_ms))
+                settle_note = "\n[note: frames were still arriving at timeout_ms — captured anyway]";
+        }
+        if (argBool(args, "stats_only")) {
+            // Cheap change probe: no PNG, just "did it change and how
+            // much" vs whatever the caller last saw.
+            const st = app.diffStats(win_id) catch
+                return appErr(arena, "no such window / no pixels yet");
+            const msg = try std.fmt.allocPrint(
+                arena,
+                "{{\"changed\":{},\"diff_pct\":{d:.2},\"resized\":{},\"w\":{d},\"h\":{d},\"frames\":{d}}}{s}",
+                .{ st.changed, st.diff_pct, st.resized, st.w, st.h, st.frames, settle_note },
+            );
+            return toolResult(arena, msg, false) orelse error.OutOfMemory;
         }
         const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 1568, 0, 8192));
         var region: ?appdrive.App.Region = null;
@@ -1336,11 +1387,66 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             }
         }
         const zoom: u32 = @intCast(std.math.clamp(argInt(args, "zoom") orelse 1, 1, 32));
+
+        if (argInt(args, "burst")) |bn| if (bn > 1) {
+            // Burst: up to N shots over a window of time, each gated on
+            // a minimum pixel change vs the PREVIOUS shot — one call
+            // instead of a screenshot-poll loop across a transition.
+            const count: usize = @intCast(@min(bn, 8));
+            const burst_ms: i64 = argInt(args, "burst_ms") orelse 5_000;
+            const min_pct: f64 = argFloat(args, "min_change_pct") orelse 1.0;
+            var pngs: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (pngs.items) |p| app_state.allocator.free(p);
+                pngs.deinit(arena);
+            }
+            var offsets: std.ArrayList(i64) = .empty;
+            defer offsets.deinit(arena);
+            const t0 = monoMs();
+            var first: ?appdrive.App.Shot = null;
+            while (monoMs() - t0 < burst_ms and pngs.items.len < count) {
+                if (pngs.items.len > 0) {
+                    _ = app.pumpOnce(25);
+                    if (app.peekDiffPct(win_id) < min_pct) {
+                        if (app.exited) break;
+                        continue;
+                    }
+                }
+                const shot = app.screenshotPng(win_id, max_px, region, zoom) catch break;
+                pngs.append(arena, shot.png) catch {
+                    app_state.allocator.free(shot.png);
+                    break;
+                };
+                offsets.append(arena, monoMs() - t0) catch break;
+                if (first == null) first = shot;
+                if (app.exited) break;
+            }
+            const fshot = first orelse
+                return appErr(arena, "no such window / no pixels yet (a region must lie inside the window)");
+            var ob: std.ArrayList(u8) = .empty;
+            defer ob.deinit(arena);
+            for (offsets.items, 0..) |o, i| {
+                var nb: [24]u8 = undefined;
+                const s = std.fmt.bufPrint(&nb, "{s}{d}ms", .{ if (i > 0) ", " else "", o }) catch break;
+                try ob.appendSlice(arena, s);
+            }
+            const extra: []const u8 = if (eql(u8, name, "get_app_state")) try appSummary(arena, app) else "";
+            const base_caption = try screenshotCaption(arena, app, win_id, fshot, extra);
+            const caption = try std.fmt.allocPrint(arena, "{s}\nburst: {d} frame(s) captured at [{s}] (each >= {d:.1}% changed from the previous){s}", .{
+                base_caption, pngs.items.len, ob.items, min_pct, settle_note,
+            });
+            return imagesResult(arena, caption, pngs.items) orelse error.OutOfMemory;
+        };
+
         const shot = app.screenshotPng(win_id, max_px, region, zoom) catch
             return appErr(arena, "no such window / no pixels yet (a region must lie inside the window)");
         defer app_state.allocator.free(shot.png);
         const extra: []const u8 = if (eql(u8, name, "get_app_state")) try appSummary(arena, app) else "";
-        const caption = try screenshotCaption(arena, app, win_id, shot, extra);
+        const base_caption = try screenshotCaption(arena, app, win_id, shot, extra);
+        const caption = if (settle_note.len > 0)
+            try std.fmt.allocPrint(arena, "{s}{s}", .{ base_caption, settle_note })
+        else
+            base_caption;
         return imageResult(arena, caption, shot.png) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_drag")) {
