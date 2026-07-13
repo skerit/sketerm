@@ -7491,3 +7491,48 @@ visible grid" from "never printed" instead of returning silence.
 
 Verified: 714/720 unit tests, smoke-mux + smoke-mcp PASS, mux +
 mux-portable build, plus the three e2e MCP drives above.
+
+## 2026-07-13 (round 5) — central hard timeout: the hang class, closed for good
+
+Round-4 shipped per-path deadlines; the reporter came back with a
+close_app hang on a self-exited app. The trivial repro (sleep 3 →
+close_app) did NOT reproduce against HEAD, but re-auditing with
+fresh eyes found two genuinely unbounded holes that fit the "video
+harness" workload, plus the structural fix the reporter demanded:
+
+- **`Conn.fillAvailable` could loop forever.** Its caller's deadline
+  (drain's 100ms box, waitIdle's timeout) is only checked BETWEEN
+  pumps — but one fillAvailable call read until the fd went quiet.
+  An app streaming frames faster than the client consumes (video
+  playback through the resync cycle) keeps the fd readable
+  indefinitely = one pump that never returns. Now byte-budgeted
+  (4MB per call; the rest stays queued for the next pump).
+- **`zoom` could demand gigapixel intermediates.** zoom 32 on a big
+  region = a ~1GB upscale buffer and minutes of CPU that look
+  exactly like a hung call. The upscale area is clamped to 64MP
+  (Shot.scale still reports the truth, captions stay correct).
+- **Central `Watchdog` (mcp.zig).** One mechanism over EVERY tool
+  call, not per-tool special cases: a thread checks the in-flight
+  call each second; past the hard cap (150s default,
+  SKETERM_MCP_HARD_TIMEOUT_MS override, min 30s) it shutdown()s all
+  app/term conn fds snapshotted at call start. Every bounded IO loop
+  on them errors within its own deadline, the call returns an error,
+  the server keeps serving; affected sessions surface as exited
+  (harsh, but strictly better than a hang an agent cannot cancel).
+  Zig 0.16 has no std.Thread.Mutex — publication is an atomic
+  started_ms with release stores (fds are written only while idle).
+- **"App exited" is a normal state, centrally.** appTool gates every
+  interaction tool (needsLiveApp: click/drag/type/key/scroll/resize/
+  mouse_move/clipboard/a11y/record_start/close_app_window) with an
+  immediate exit-summary error; close_app is IDEMPOTENT ("closed —
+  the app had already exited with status N"); double-close says
+  "unknown app" instead of anything worse.
+
+Verified: 714/720 tests, smoke-mcp PASS, mux/mux-portable build, and
+three e2e drives: (1) torture — spam-streaming weston-terminal with
+an active WebM recording exits on its own, close_app + list_apps
+answer instantly; (2) watchdog — a 10-minute app_wait against `yes`
+with a 30s cap returns at ~30s, stderr notes the abort, the next
+call still works; (3) the reporter's acceptance script (sleep 3 →
+wait 5 → screenshot_app/app_output/app_click/close_app/close_app/
+list_apps) completes in 6s wall with explicit per-call answers.
