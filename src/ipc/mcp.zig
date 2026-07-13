@@ -1368,18 +1368,21 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                 return appErr(arena, "line not available (dropped from the ring, never emitted, or beyond the post-exit stash)");
             const age_s = @as(f64, @floatFromInt(now_wall - l.t)) / 1000.0;
             if (l.marker) {
-                const cap = try std.fmt.allocPrint(arena, "marker line {d} ({d:.1}s ago): '{s}'{s}", .{
-                    l.id, age_s, l.text,
-                    if (app.markerShot(line_id) != null and app.markerShot(line_id).?.png != null)
-                        " — window at that instant below"
+                if (app.markerImage(line_id)) |img| {
+                    const note = if (img.shared_from != 0)
+                        try std.fmt.allocPrint(arena, " — window at that instant below (frame unchanged since marker {d}; screenshot shared)", .{img.shared_from})
                     else
-                        " (no screenshot was stashed: no rendered window at the time, or the marker aged out)",
-                });
-                if (app.markerShot(line_id)) |m| {
-                    if (m.png) |p| {
-                        if (imageResult(arena, cap, p)) |res| return res;
-                    }
+                        " — window at that instant below";
+                    const cap = try std.fmt.allocPrint(arena, "marker line {d} ({d:.1}s ago): '{s}'{s}", .{
+                        l.id, age_s, l.text, note,
+                    });
+                    if (imageResult(arena, cap, img.png)) |res| return res;
                 }
+                const cap = try std.fmt.allocPrint(
+                    arena,
+                    "marker line {d} ({d:.1}s ago): '{s}' (no screenshot was stashed: no rendered window at the time, or the marker aged out)",
+                    .{ l.id, age_s, l.text },
+                );
                 return toolResult(arena, cap, false) orelse error.OutOfMemory;
             }
             const msg = try std.fmt.allocPrint(arena, "line {d} ({d:.1}s ago{s}):\n{s}", .{
@@ -1404,7 +1407,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             for (r.lines) |l| {
                 const age_s = @as(f64, @floatFromInt(now_wall - l.t)) / 1000.0;
                 if (l.marker) {
-                    const has_shot = app.markerShot(l.id) != null and app.markerShot(l.id).?.png != null;
+                    const has_shot = app.markerImage(l.id) != null;
                     try w.print("{d} [-{d:.1}s] [marker '{s}'{s}]\n", .{
                         l.id, age_s, l.text,
                         if (has_shot) " — screenshot stashed, view it via {\"id\":this line's id}" else "",

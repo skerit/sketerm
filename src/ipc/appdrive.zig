@@ -277,10 +277,19 @@ pub const App = struct {
     pub const MarkerShot = struct {
         id: u64,
         label: []u8,
-        /// Full-window PNG at marker time (null = no rendered window).
+        /// Full-window PNG at marker time. Null when no window had
+        /// rendered — or when `same_as` points at the marker whose
+        /// screenshot this one shares (no commit in between, so the
+        /// pixels are identical; storing a copy would only burn RAM
+        /// and image slots).
         png: ?[]u8,
+        same_as: u64 = 0,
     };
+    /// Cap on stored IMAGES (png-bearing entries). Shared/imageless
+    /// entries are near-free and capped separately, so a same-instant
+    /// marker burst cannot evict earlier real screenshots.
     const MAX_MARKER_SHOTS = 8;
+    const MAX_MARKER_ENTRIES = 40;
     const PendingMarker = struct { id: u64, label: []u8, remaining: u32 };
     const MAX_PENDING_MARKERS = 32;
 
@@ -698,29 +707,31 @@ pub const App = struct {
     }
 
     /// Stash a marker screenshot of the primary window as it is right
-    /// now. A burst against an UNCHANGED frame reuses the previous
-    /// stash's PNG bytes instead of re-encoding.
+    /// now. Markers with NO commit since the previous stash share
+    /// that screenshot by reference (`same_as`) — one stored image
+    /// per committed frame, however many markers land on it.
     fn doStash(self: *App, id: u64, label: []const u8) void {
         const a = self.allocator;
         var shot_png: ?[]u8 = null;
+        var same_as: u64 = 0;
         for (self.windows.items) |w| {
             if (w.popup or w.frames == 0) continue;
             if (self.last_stash_win == w.id and self.last_stash_frames == w.frames) {
                 var i = self.markers.items.len;
                 while (i > 0) {
                     i -= 1;
-                    if (self.markers.items[i].png) |p| {
-                        shot_png = a.dupe(u8, p) catch null;
+                    if (self.markers.items[i].png != null) {
+                        same_as = self.markers.items[i].id;
                         break;
                     }
                 }
             }
-            if (shot_png == null) {
-                if (self.encodeWindowPng(w, 1568, null, 1)) |shot| shot_png = shot.png else |_| {}
-            }
-            if (shot_png != null) {
-                self.last_stash_win = w.id;
-                self.last_stash_frames = w.frames;
+            if (same_as == 0) {
+                if (self.encodeWindowPng(w, 1568, null, 1)) |shot| {
+                    shot_png = shot.png;
+                    self.last_stash_win = w.id;
+                    self.last_stash_frames = w.frames;
+                } else |_| {}
             }
             break;
         }
@@ -728,16 +739,43 @@ pub const App = struct {
             if (shot_png) |p| a.free(p);
             return;
         };
-        self.markers.append(a, .{ .id = id, .label = label_copy, .png = shot_png }) catch {
+        self.markers.append(a, .{ .id = id, .label = label_copy, .png = shot_png, .same_as = same_as }) catch {
             a.free(label_copy);
             if (shot_png) |p| a.free(p);
             return;
         };
-        while (self.markers.items.len > MAX_MARKER_SHOTS) {
+        self.evictMarkers();
+    }
+
+    /// Enforce the marker caps: total entries, and png-bearing
+    /// entries separately (images are the expensive part). Oldest go
+    /// first; a shared entry whose source image was evicted degrades
+    /// to the "aged out" message on fetch.
+    fn evictMarkers(self: *App) void {
+        const a = self.allocator;
+        var png_count: usize = 0;
+        for (self.markers.items) |m| {
+            if (m.png != null) png_count += 1;
+        }
+        while (self.markers.items.len > MAX_MARKER_ENTRIES or png_count > MAX_MARKER_SHOTS) {
             const old = self.markers.orderedRemove(0);
+            if (old.png != null) png_count -= 1;
             a.free(old.label);
             if (old.png) |p| a.free(p);
         }
+    }
+
+    /// Resolve a marker's image, following a shared-frame reference.
+    /// `shared_from` != 0 names the marker whose screenshot is served.
+    pub fn markerImage(self: *const App, id: u64) ?struct { png: []const u8, shared_from: u64 } {
+        const m = self.markerShot(id) orelse return null;
+        if (m.png) |p| return .{ .png = p, .shared_from = 0 };
+        if (m.same_as != 0) {
+            if (self.markerShot(m.same_as)) |src| {
+                if (src.png) |p| return .{ .png = p, .shared_from = m.same_as };
+            }
+        }
+        return null;
     }
 
     /// A frame just committed on `win`: advance `+N` markers when it
