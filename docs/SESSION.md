@@ -7400,3 +7400,29 @@ log_data=77, marker=78 (append-only).
 Verified: 712/718 unit tests, smoke-mux + smoke-mcp PASS,
 mux-portable OK, and four scripted end-to-end MCP drivers (flood,
 pid, screenshot trio, log/marker/post-mortem) all green.
+
+## 2026-07-13 (later) — marker rate limit + OSC 5522;+N
+
+Follow-up to the marker feature, same day. Two additions:
+
+- **Rate limit (the cat'ed-log hole):** markers now pass a per-session
+  token bucket in logring.zig (burst 8, refill 2/s; unit-tested with
+  injected clocks). Over-limit markers vanish entirely — no ring line
+  (a flood would evict real output) and no `.marker` push (each costs
+  the viewer a PNG encode) — with a cumulative counter surfaced in the
+  app_log header and one "[marker rate limit hit]" note line per
+  drop-run. Client side, a marker burst against an UNCHANGED frame
+  reuses the previous stash's PNG bytes instead of re-encoding, and
+  the pushed label is capped at 256B.
+- **`OSC 5522;+N;label`:** capture the primary window's Nth FUTURE
+  commit instead of "now" (leading `+N;` field, clamped to 600;
+  backward compatible — labels not starting with a parseable `+N`
+  are unchanged). appdrive keeps pending markers ticked in onFrame;
+  app exit resolves stragglers against the final state so a marker
+  id never dangles.
+
+Verified: 714/720 unit tests (2 new bucket tests), smoke-mux +
+smoke-mcp PASS, mux-portable OK, and an 11-check e2e driver: 200-
+marker flood admits exactly 8 (192 counted; real output survives;
+tools stay <2s), +2 marker captures after the wait, +500 marker on an
+exiting app resolves with an explanatory no-screenshot message.
