@@ -28,6 +28,13 @@ pub const LogRing = struct {
     pub const MAX_LINES: usize = 1000;
     pub const MAX_TOTAL_BYTES: usize = 2 << 20;
 
+    /// Marker admission (token bucket): an accidentally `cat`ed log
+    /// full of OSC 5522 escapes must not evict real lines from the
+    /// ring or flood viewers with pushes (each push costs the client
+    /// a PNG encode).
+    pub const MARKER_BURST: f64 = 8.0;
+    pub const MARKER_PER_SEC: f64 = 2.0;
+
     allocator: std.mem.Allocator,
     lines: std.ArrayList(Line) = .empty,
     next_id: u64 = 1,
@@ -42,6 +49,13 @@ pub const LogRing = struct {
     /// keep the new segment). Resolving eagerly on CR would wipe
     /// every CRLF-terminated line — which is ALL PTY output.
     cur_cr: bool = false,
+    /// Marker token bucket state.
+    marker_tokens: f64 = MARKER_BURST,
+    marker_refill_ms: i64 = 0,
+    /// Markers rejected by the bucket, ever (surfaced in log_get).
+    markers_dropped: u64 = 0,
+    /// A drop-run is in progress (one note line per run, not per drop).
+    marker_limiting: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) LogRing {
         return .{ .allocator = allocator };
@@ -92,18 +106,51 @@ pub const LogRing = struct {
         }
     }
 
+    /// Admit or reject a marker at `t_ms` (token bucket). Rejected
+    /// markers vanish entirely — no ring line (a flood would evict
+    /// real output) and no viewer push (each costs a PNG encode) —
+    /// except ONE note line at the start of each drop-run.
+    pub fn admitMarker(self: *LogRing, t_ms: i64) bool {
+        if (self.marker_refill_ms == 0) self.marker_refill_ms = t_ms;
+        const elapsed = t_ms - self.marker_refill_ms;
+        if (elapsed > 0) {
+            self.marker_tokens = @min(
+                MARKER_BURST,
+                self.marker_tokens + @as(f64, @floatFromInt(elapsed)) * MARKER_PER_SEC / 1000.0,
+            );
+            self.marker_refill_ms = t_ms;
+        }
+        if (self.marker_tokens >= 1.0) {
+            self.marker_tokens -= 1.0;
+            self.marker_limiting = false;
+            return true;
+        }
+        self.markers_dropped += 1;
+        if (!self.marker_limiting) {
+            self.marker_limiting = true;
+            _ = self.commitStandalone("[marker rate limit hit: dropping excess markers]", false, t_ms);
+        }
+        return false;
+    }
+
     /// Commit an OSC-marker line (its own line; a partial normal line
     /// stays pending). Returns the marker's line id.
     pub fn addMarker(self: *LogRing, label: []const u8, t_ms: i64) u64 {
+        return self.commitStandalone(label, true, t_ms);
+    }
+
+    /// Commit `text` as its own line without disturbing the pending
+    /// partial-line accumulator. Returns the new line's id.
+    fn commitStandalone(self: *LogRing, text: []const u8, marker: bool, t_ms: i64) u64 {
         const save = self.cur;
         const save_trunc = self.cur_truncated;
         const save_cr = self.cur_cr;
         self.cur = .empty;
         self.cur_truncated = false;
         self.cur_cr = false;
-        self.feedBytes(label);
+        self.feedBytes(text);
         const id = self.next_id;
-        self.commit(true, t_ms);
+        self.commit(marker, t_ms);
         self.cur.deinit(self.allocator);
         self.cur = save;
         self.cur_truncated = save_trunc;
@@ -289,6 +336,44 @@ test "scrub strips controls and invalid utf8" {
     r.feedBytes("a\x01b\xffc\xc3\xa9");
     r.feedControl('\n', 0);
     try std.testing.expectEqualStrings("ab?c\xc3\xa9", r.lines.items[0].bytes);
+}
+
+test "marker bucket: burst admits, flood drops with one note line" {
+    var r = LogRing.init(std.testing.allocator);
+    defer r.deinit();
+    var admitted: usize = 0;
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        if (r.admitMarker(5000)) {
+            _ = r.addMarker("m", 5000);
+            admitted += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 8), admitted); // MARKER_BURST
+    try std.testing.expectEqual(@as(u64, 92), r.markers_dropped);
+    // Exactly one rate-limit note line, after the admitted markers.
+    var notes: usize = 0;
+    for (r.lines.items) |l| {
+        if (!l.marker and std.mem.indexOf(u8, l.bytes, "rate limit") != null) notes += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), notes);
+}
+
+test "marker bucket refills over time and starts a new drop-run note" {
+    var r = LogRing.init(std.testing.allocator);
+    defer r.deinit();
+    var i: usize = 0;
+    while (i < 20) : (i += 1) _ = r.admitMarker(1000); // exhaust + drop-run 1
+    try std.testing.expect(!r.admitMarker(1000));
+    // 1s later: 2 tokens refilled.
+    try std.testing.expect(r.admitMarker(2000));
+    try std.testing.expect(r.admitMarker(2000));
+    try std.testing.expect(!r.admitMarker(2000)); // drop-run 2
+    var notes: usize = 0;
+    for (r.lines.items) |l| {
+        if (std.mem.indexOf(u8, l.bytes, "rate limit") != null) notes += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), notes);
 }
 
 test "byId finds lines and reports dropped ones as null" {

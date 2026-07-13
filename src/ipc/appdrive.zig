@@ -265,6 +265,15 @@ pub const App = struct {
     /// log-line id. Bounded ring, oldest dropped.
     markers: std.ArrayList(MarkerShot) = .empty,
 
+    /// `OSC 5522;+N;label` markers waiting for the primary window's
+    /// Nth future commit before stashing.
+    pending_markers: std.ArrayList(PendingMarker) = .empty,
+    /// Window id + frame counter at the last stash encode — a marker
+    /// burst against an unchanged frame reuses the previous PNG
+    /// instead of paying another encode.
+    last_stash_win: u32 = 0,
+    last_stash_frames: u64 = 0,
+
     pub const MarkerShot = struct {
         id: u64,
         label: []u8,
@@ -272,6 +281,8 @@ pub const App = struct {
         png: ?[]u8,
     };
     const MAX_MARKER_SHOTS = 8;
+    const PendingMarker = struct { id: u64, label: []u8, remaining: u32 };
+    const MAX_PENDING_MARKERS = 32;
 
     const ClipOffer = struct { chan: u32, source: u32, mime: []u8 };
 
@@ -447,6 +458,8 @@ pub const App = struct {
             if (m.png) |p| a.free(p);
         }
         self.markers.deinit(a);
+        for (self.pending_markers.items) |pm| a.free(pm.label);
+        self.pending_markers.deinit(a);
         if (self.paste_data) |p| a.free(p);
         if (self.layout) |*l| l.deinit(a);
         if (self.rec) |*r| r.abort();
@@ -645,34 +658,78 @@ pub const App = struct {
             .exit => {
                 self.exited = true;
                 if (payload.len >= 4) self.exit_status = std.mem.readInt(i32, payload[0..4], .little);
+                self.resolvePendingMarkers();
             },
             else => {},
         }
     }
 
-    /// The app emitted the OSC 5522 marker escape: stash a screenshot
-    /// of its primary window at this instant, keyed by the marker's
-    /// log-line id (fetched later via app_log {id}).
+    /// The app emitted the OSC 5522 marker escape. `after` == 0:
+    /// stash a screenshot of the primary window NOW; `after` > 0
+    /// (the `+N` syntax): wait for that many future commits first.
     fn stashMarker(self: *App, payload: []const u8) void {
         const a = self.allocator;
-        const P = struct { id: u64 = 0, label: []const u8 = "" };
+        const P = struct { id: u64 = 0, label: []const u8 = "", after: u32 = 0 };
         const parsed = std.json.parseFromSlice(P, a, payload, .{
             .ignore_unknown_fields = true,
         }) catch return;
         defer parsed.deinit();
         if (parsed.value.id == 0) return;
+        if (parsed.value.after > 0) {
+            const label = a.dupe(u8, parsed.value.label) catch return;
+            self.pending_markers.append(a, .{
+                .id = parsed.value.id,
+                .label = label,
+                .remaining = parsed.value.after,
+            }) catch {
+                a.free(label);
+                return;
+            };
+            while (self.pending_markers.items.len > MAX_PENDING_MARKERS) {
+                // Resolve rather than lose: the oldest gets the
+                // current frame instead of the one it waited for.
+                const old = self.pending_markers.orderedRemove(0);
+                self.doStash(old.id, old.label);
+                a.free(old.label);
+            }
+            return;
+        }
+        self.doStash(parsed.value.id, parsed.value.label);
+    }
+
+    /// Stash a marker screenshot of the primary window as it is right
+    /// now. A burst against an UNCHANGED frame reuses the previous
+    /// stash's PNG bytes instead of re-encoding.
+    fn doStash(self: *App, id: u64, label: []const u8) void {
+        const a = self.allocator;
         var shot_png: ?[]u8 = null;
         for (self.windows.items) |w| {
             if (w.popup or w.frames == 0) continue;
-            if (self.encodeWindowPng(w, 1568, null, 1)) |shot| shot_png = shot.png else |_| {}
+            if (self.last_stash_win == w.id and self.last_stash_frames == w.frames) {
+                var i = self.markers.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (self.markers.items[i].png) |p| {
+                        shot_png = a.dupe(u8, p) catch null;
+                        break;
+                    }
+                }
+            }
+            if (shot_png == null) {
+                if (self.encodeWindowPng(w, 1568, null, 1)) |shot| shot_png = shot.png else |_| {}
+            }
+            if (shot_png != null) {
+                self.last_stash_win = w.id;
+                self.last_stash_frames = w.frames;
+            }
             break;
         }
-        const label = a.dupe(u8, parsed.value.label) catch {
+        const label_copy = a.dupe(u8, label) catch {
             if (shot_png) |p| a.free(p);
             return;
         };
-        self.markers.append(a, .{ .id = parsed.value.id, .label = label, .png = shot_png }) catch {
-            a.free(label);
+        self.markers.append(a, .{ .id = id, .label = label_copy, .png = shot_png }) catch {
+            a.free(label_copy);
             if (shot_png) |p| a.free(p);
             return;
         };
@@ -680,6 +737,39 @@ pub const App = struct {
             const old = self.markers.orderedRemove(0);
             a.free(old.label);
             if (old.png) |p| a.free(p);
+        }
+    }
+
+    /// A frame just committed on `win`: advance `+N` markers when it
+    /// is the primary toplevel, stashing those that reach zero.
+    fn tickPendingMarkers(self: *App, win: *Window) void {
+        if (self.pending_markers.items.len == 0) return;
+        for (self.windows.items) |w| {
+            if (w.popup or w.frames == 0) continue;
+            if (w != win) return; // only the primary's commits count
+            break;
+        }
+        var i: usize = 0;
+        while (i < self.pending_markers.items.len) {
+            const pm = &self.pending_markers.items[i];
+            pm.remaining -= 1;
+            if (pm.remaining == 0) {
+                const done = self.pending_markers.orderedRemove(i);
+                self.doStash(done.id, done.label);
+                self.allocator.free(done.label);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// The app is gone: `+N` markers that never saw their Nth commit
+    /// resolve against the final frame (an id must never dangle).
+    fn resolvePendingMarkers(self: *App) void {
+        while (self.pending_markers.items.len > 0) {
+            const pm = self.pending_markers.orderedRemove(0);
+            self.doStash(pm.id, pm.label);
+            self.allocator.free(pm.label);
         }
     }
 
@@ -781,6 +871,7 @@ pub const App = struct {
         win.pixels.appendSlice(ch.app.allocator, pixels) catch {};
         win.frames += 1;
         ch.app.frame_seq += 1;
+        ch.app.tickPendingMarkers(win);
         if (win.id == ch.app.rec_win and w > 0 and h > 0) {
             const t = nowMs();
             if (ch.app.rec) |*r| r.addShmFrame(pixels, @intCast(w), @intCast(h), format, t) catch {};
