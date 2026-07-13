@@ -1512,7 +1512,13 @@ pub const App = struct {
             cw = @min(r.w, uw - r.x);
             ch = @min(r.h, uh - r.y);
         }
-        const zoom: u32 = @max(1, zoom_req);
+        // Clamp the upscaled intermediate to a sane area: zoom 32 on a
+        // big region would demand a gigapixel buffer — minutes of CPU
+        // and an OOM risk that LOOKS like a hung tool call. The final
+        // max_dim bound still applies; Shot.scale reports the truth.
+        var zoom: u32 = @max(1, zoom_req);
+        const MAX_ZOOM_AREA: u64 = 64 << 20; // pixels
+        while (zoom > 1 and @as(u64, cw) * ch * zoom * zoom > MAX_ZOOM_AREA) zoom -= 1;
         const longest = @max(cw, ch) * zoom;
 
         // Fast path: whole window, no zoom, within the bound.
