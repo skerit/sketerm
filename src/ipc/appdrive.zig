@@ -161,11 +161,45 @@ pub const Window = struct {
     /// wait-for-change screenshot block until content actually differs
     /// from what the caller last saw.
     shot_frames: u64 = 0,
+    /// Pixel copy taken at the last screenshot / stats observation:
+    /// the diff baseline for stats_only and burst min-change gating.
+    shot_pixels: std.ArrayList(u8) = .empty,
+    shot_w: i32 = 0,
+    shot_h: i32 = 0,
 
     fn deinit(self: *Window, a: std.mem.Allocator) void {
         self.pixels.deinit(a);
+        self.shot_pixels.deinit(a);
         if (self.title) |s| a.free(s);
         if (self.app_id) |s| a.free(s);
+    }
+
+    /// Record the current committed pixels as the observation baseline
+    /// (what the caller "last saw"). Best-effort: OOM just leaves the
+    /// previous baseline, which only skews a later diff percentage.
+    fn rememberShot(self: *Window, a: std.mem.Allocator) void {
+        self.shot_frames = self.frames;
+        self.shot_pixels.clearRetainingCapacity();
+        self.shot_pixels.appendSlice(a, self.pixels.items) catch return;
+        self.shot_w = self.w;
+        self.shot_h = self.h;
+    }
+
+    /// Fraction (0..100) of pixels differing from the baseline; 100
+    /// when the window was resized or no baseline exists yet.
+    fn pctVsBaseline(self: *const Window) f64 {
+        const n = self.pixels.items.len;
+        if (self.shot_pixels.items.len != n or self.shot_w != self.w or self.shot_h != self.h or n < 4)
+            return 100.0;
+        const cur = self.pixels.items;
+        const base = self.shot_pixels.items;
+        var diff: usize = 0;
+        var i: usize = 0;
+        while (i + 4 <= n) : (i += 4) {
+            if (!std.mem.eql(u8, cur[i..][0..4], base[i..][0..4])) diff += 1;
+        }
+        const total = n / 4;
+        return @as(f64, @floatFromInt(diff)) * 100.0 / @as(f64, @floatFromInt(total));
     }
 };
 
@@ -1141,7 +1175,7 @@ pub const App = struct {
         const uw: u32 = @intCast(win.w);
         const uh: u32 = @intCast(win.h);
         const a = self.allocator;
-        win.shot_frames = win.frames;
+        win.rememberShot(a);
 
         var ox: u32 = 0;
         var oy: u32 = 0;
@@ -1223,5 +1257,63 @@ pub const App = struct {
         }
         const win = self.winById(win_id) orelse return false;
         return win.frames != win.shot_frames;
+    }
+
+    /// Pump until the window has committed NO new frame for
+    /// `stable_ms` (settle-then-capture), bounded by `timeout_ms`.
+    /// False = frames were still landing at the deadline.
+    pub fn waitWindowSettle(self: *App, win_id: u32, stable_ms: i64, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        var last: u64 = (self.winById(win_id) orelse return false).frames;
+        var quiet_since = nowMs();
+        while (nowMs() < deadline) {
+            if (self.exited) return true;
+            _ = self.pumpOnce(25);
+            const win = self.winById(win_id) orelse return false;
+            if (win.frames != last) {
+                last = win.frames;
+                quiet_since = nowMs();
+            } else if (nowMs() - quiet_since >= stable_ms) return true;
+        }
+        return false;
+    }
+
+    pub const DiffStats = struct {
+        changed: bool,
+        resized: bool,
+        diff_pct: f64,
+        w: i32,
+        h: i32,
+        frames: u64,
+    };
+
+    /// Changed fraction vs the baseline WITHOUT moving it — burst
+    /// capture gates on this before paying for a PNG encode.
+    pub fn peekDiffPct(self: *App, win_id: u32) f64 {
+        const win = self.winById(win_id) orelse return 0;
+        // Pixels only change on a commit; same frame counter = same content.
+        if (win.frames == win.shot_frames) return 0;
+        return win.pctVsBaseline();
+    }
+
+    /// Cheap "did it change" answer: compare current pixels against the
+    /// baseline from the last screenshot/stats call, then move the
+    /// baseline forward. No image is encoded.
+    pub fn diffStats(self: *App, win_id: u32) Error!DiffStats {
+        const win = self.winById(win_id) orelse return Error.NoSuchWindow;
+        if (win.w <= 0 or win.h <= 0 or win.pixels.items.len == 0) return Error.NoSuchWindow;
+        const had_baseline = win.shot_pixels.items.len != 0;
+        const resized = had_baseline and (win.shot_w != win.w or win.shot_h != win.h);
+        const pct = win.pctVsBaseline();
+        const stats = DiffStats{
+            .changed = win.frames != win.shot_frames and pct > 0,
+            .resized = resized,
+            .diff_pct = pct,
+            .w = win.w,
+            .h = win.h,
+            .frames = win.frames,
+        };
+        win.rememberShot(self.allocator);
+        return stats;
     }
 };
