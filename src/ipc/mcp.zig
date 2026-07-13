@@ -386,15 +386,29 @@ fn onQuitSignal(_: c_int) callconv(.c) void {
     quit_flag = true;
 }
 
+/// No-op SIGPIPE handler (same rationale as mux_main.zig: the SIG_IGN
+/// macro fails translate-c). Equivalent to ignoring: write() returns
+/// EPIPE, the process doesn't die.
+fn sigNoop(_: c_int) callconv(.c) void {}
+
 /// SIGTERM/SIGINT must interrupt the blocking getline (no SA_RESTART)
 /// so an ephemeral run still tears its private daemon down when the
 /// MCP client kills us instead of closing stdin.
+///
+/// SIGPIPE must be neutered: a session worker dying (its app exited)
+/// closes our attach socket, and the next write to it — e.g. an audio
+/// `consumed` report inside a routine drain — would otherwise KILL the
+/// whole MCP server silently (no core, no stderr), which the client
+/// experiences as a forever-hanging tool call.
 fn installQuitSignals() void {
     var sa: c.struct_sigaction = std.mem.zeroes(c.struct_sigaction);
     sa.__sigaction_handler.sa_handler = onQuitSignal;
     sa.sa_flags = 0;
     _ = c.sigaction(c.SIGTERM, &sa, null);
     _ = c.sigaction(c.SIGINT, &sa, null);
+    var sp: c.struct_sigaction = std.mem.zeroes(c.struct_sigaction);
+    sp.__sigaction_handler.sa_handler = sigNoop;
+    _ = c.sigaction(c.SIGPIPE, &sp, null);
 }
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {

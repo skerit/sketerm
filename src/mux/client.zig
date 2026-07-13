@@ -406,7 +406,16 @@ pub const Conn = struct {
         try wire.appendFrame(&out, self.allocator, ftype, payload);
         var off: usize = 0;
         while (off < out.items.len) {
-            const n = c.write(self.fd, out.items.ptr + off, out.items.len - off);
+            // MSG_NOSIGNAL: a peer that died (session worker gone)
+            // must yield EPIPE, not a SIGPIPE that kills the whole
+            // process (the GUI and `sketerm mcp` don't ignore it).
+            // macOS lacks the flag; callers there rely on a SIGPIPE
+            // handler (the daemon installs one; GUI-side writes go
+            // through GSocket which sets SO_NOSIGPIPE).
+            const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
+                c.send(self.fd, out.items.ptr + off, out.items.len - off, c.MSG_NOSIGNAL)
+            else
+                c.write(self.fd, out.items.ptr + off, out.items.len - off);
             if (n > 0) {
                 off += @intCast(n);
                 continue;
