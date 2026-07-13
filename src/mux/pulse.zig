@@ -402,7 +402,7 @@ pub const Server = struct {
                             std.mem.readInt(u32, payload[1..5], .big)
                         else
                             0xffff_ffff;
-                        std.debug.print("sketerm-mux: pulse protocol error on command {d} (payload {d} bytes)\n", .{ cmd, payload.len });
+                        @import("log.zig").warn("pulse protocol error on command {d} (payload {d} bytes)", .{ cmd, payload.len });
                         self.dead = true;
                     },
                 };

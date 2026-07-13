@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const log = @import("log.zig");
 const wire = @import("wire.zig");
 const wlwire = @import("../wlhost/wire.zig");
 const wltrack = @import("../wlhost/track.zig");
@@ -540,6 +541,9 @@ const Native = struct {
     /// on THIS host and queue it toward clients.
     daemon: ?*Daemon = null,
     chan: ?*Channel = null,
+    /// Last logged commit pixel-path state (see nativeAction .commit)
+    /// so the debug log records transitions, not every frame.
+    pix_state: u8 = 0,
     /// app_ids already resolved (icon sent or none found), so repeated
     /// set_app_id / extra windows don't re-scan the icon theme. Keys owned.
     icon_seen: std.StringHashMapUnmanaged(void) = .empty,
@@ -596,6 +600,7 @@ const Native = struct {
         const om = nv.orphan_pools.getPtr(serial) orelse return;
         if (om.buffers > 0) om.buffers -= 1;
         if (om.buffers == 0) {
+            log.debug("orphaned pool serial={d} freed on last buffer destroy", .{serial});
             om.unmap();
             _ = nv.orphan_pools.remove(serial);
         }
@@ -877,7 +882,14 @@ pub const Daemon = struct {
 
     /// Run until a SHUTDOWN frame arrives or `running` is cleared.
     pub fn run(self: *Daemon) !void {
+        log.init();
+        log.info("daemon up v{s} mode={s} socket={s}", .{
+            version.string,
+            if (self.is_broker) "broker" else if (self.isWorker()) "worker" else "monolith",
+            if (self.sock_path.len > 0) self.sock_path else "-",
+        });
         while (self.running) try self.tick(500);
+        log.info("daemon shutting down", .{});
         // The run loop exits the same tick `running` is cleared, so any frame
         // queued by the shutdown path (`.gone` on `.shutdown`, or a worker's
         // `.gone` on a broker `'K'`) is still sitting in each client's wbuf —
@@ -1195,6 +1207,7 @@ pub const Daemon = struct {
         if (self.sessions.items.len == 0) return;
         const s = self.sessions.items[0];
         cl.attached = s;
+        log.info("client attached session='{s}' proto={d} video={} (worker handoff)", .{ s.name, proto, video });
         self.queueSnapshot(cl, s);
         if (proto >= 2 and s.winstream != null) self.openWinstreamChan(s, cl);
         if (proto >= 5) self.replayNativeChannels(cl, s);
@@ -2451,11 +2464,15 @@ pub const Daemon = struct {
             ch.deinit();
             return;
         };
+        var viewers: usize = 0;
         var hdr: [5]u8 = undefined;
         for (self.clients.items) |cl| {
-            if (nativeViewer(cl, s))
+            if (nativeViewer(cl, s)) {
                 cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .wayland_native));
+                viewers += 1;
+            }
         }
+        log.info("wayland app connected: session='{s}' chan={d} viewers={d}", .{ s.name, ch.id, viewers });
     }
 
     /// App-socket bytes toward the client (the parsed sketerm-native
@@ -2620,7 +2637,7 @@ pub const Daemon = struct {
             const msgb = avail[0..mh.size];
             const action = nv.tracker.clientMessage(mh, msgb[wlwire.header_size..]) catch |err| {
                 const iname = if (nv.tracker.objects.get(mh.object)) |i| i.name else "?";
-                std.debug.print("sketerm-mux: killing wayland app connection: {s} on {s}#{d} opcode {d}\n", .{ @errorName(err), iname, mh.object, mh.opcode });
+                log.warn("killing wayland app connection: {s} on {s}#{d} opcode {d} (session '{s}')", .{ @errorName(err), iname, mh.object, mh.opcode, if (ch.session) |s| s.name else "?" });
                 fail = true;
                 break;
             };
@@ -2752,7 +2769,7 @@ pub const Daemon = struct {
                     // but ships no pixels (stale window; GTK's tiny
                     // probe buffer is never attached at all). The
                     // brain still releases it, so the app never hangs.
-                    std.debug.print("sketerm-mux: dmabuf mmap refused (errno {d}) — buffer {d} will not update; unset SKETERM_MUX_DMABUF for this driver\n", .{ @intFromEnum(std.posix.errno(@as(isize, -1))), dc.id });
+                    log.warn("dmabuf mmap refused (errno {d}) — buffer {d} will not update; unset SKETERM_MUX_DMABUF for this driver", .{ @intFromEnum(std.posix.errno(@as(isize, -1))), dc.id });
                     _ = c.close(fd);
                     try wlpipe.appendUnit(units, a, .wl_msg, msgb);
                     return;
@@ -2806,12 +2823,14 @@ pub const Daemon = struct {
                     // with no referents, free it now or it leaks one
                     // full-pool mmap per recycle.
                     if (gop.value_ptr.buffers > 0) {
+                        log.debug("pool {d}: id recycled, orphaning serial={d} ({d} buffer refs)", .{ p.id, gop.value_ptr.serial, gop.value_ptr.buffers });
                         nv.orphan_pools.put(a, gop.value_ptr.serial, gop.value_ptr.*) catch gop.value_ptr.unmap();
                     } else {
                         gop.value_ptr.unmap();
                     }
                 }
                 gop.value_ptr.* = .{ .fd = fd, .ptr = @ptrCast(ptr.?), .size = sz, .serial = p.serial };
+                log.debug("pool {d} mapped size={d} serial={d}", .{ p.id, sz, p.serial });
             },
             .pool_resize => |p| {
                 const mirror = nv.pools.getPtr(p.id) orelse return error.NoSuchPool;
@@ -2838,8 +2857,10 @@ pub const Daemon = struct {
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
                 if (nv.pools.getPtr(pd.id)) |m| {
                     if (m.buffers == 0) {
+                        log.debug("pool {d} destroyed: mirror reclaimed", .{pd.id});
                         try nv.reclaimPool(units, a, pd.id);
                     } else {
+                        log.debug("pool {d} destroyed: reclaim deferred ({d} buffer refs)", .{ pd.id, m.buffers });
                         m.destroyed = true;
                     }
                 }
@@ -2863,11 +2884,41 @@ pub const Daemon = struct {
                 // them — an orphaned mirror's bytes would land in the
                 // wrong (recycled) replica pool. Replicas render
                 // orphan-backed buffers from their own retained copy.
-                const mirror_opt: ?Native.PoolMirror = if (self.hasNativeViewer(nv)) blk: {
-                    if (cm.info.dmabuf) break :blk nv.dmabufs.get(cm.buffer);
-                    const m = nv.pools.get(cm.info.pool) orelse break :blk null;
-                    break :blk if (m.serial == cm.info.serial) m else null;
-                } else null;
+                var pix_state: u8 = 1; // shipping
+                const mirror_opt: ?Native.PoolMirror = blk: {
+                    if (!self.hasNativeViewer(nv)) {
+                        pix_state = 2;
+                        break :blk null;
+                    }
+                    if (cm.info.dmabuf) {
+                        if (nv.dmabufs.get(cm.buffer)) |m| break :blk m;
+                        pix_state = 4;
+                        break :blk null;
+                    }
+                    if (nv.pools.get(cm.info.pool)) |m| {
+                        if (m.serial == cm.info.serial) break :blk m;
+                        pix_state = 3;
+                        break :blk null;
+                    }
+                    pix_state = 4;
+                    break :blk null;
+                };
+                // Log transitions, not frames — state 4 is the "app
+                // renders but nothing ships, silently" failure class.
+                if (pix_state != nv.pix_state) {
+                    nv.pix_state = pix_state;
+                    switch (pix_state) {
+                        1 => log.debug("commit pixels: shipping (surface {d}, pool {d})", .{ cm.surface, cm.info.pool }),
+                        2 => log.debug("commit pixels: skipped, no attached viewer (mirror stays current for reattach)", .{}),
+                        3 => log.debug("commit pixels: buffer {d} is orphan-backed — viewers render their retained copy", .{cm.buffer}),
+                        4 => log.warn("commit resolves NO mirror ({s} {d}, session '{s}') — window will not update", .{
+                            if (cm.info.dmabuf) "dmabuf buffer" else "pool",
+                            if (cm.info.dmabuf) cm.buffer else cm.info.pool,
+                            if (nv.chan) |chan| (if (chan.session) |s| s.name else "?") else "?",
+                        }),
+                        else => {},
+                    }
+                }
                 if (mirror_opt) |mirror| {
                     if (cm.info.offset >= 0 and cm.info.stride > 0 and cm.info.height > 0) {
                         var y0: i64 = 0;
@@ -3228,6 +3279,8 @@ pub const Daemon = struct {
     fn closeChannel(self: *Daemon, ch: *Channel, notify: bool) void {
         if (ch.dead) return;
         ch.dead = true;
+        if (ch.native != null)
+            log.info("wayland app channel {d} closed (session '{s}')", .{ ch.id, if (ch.session) |s| s.name else "?" });
         if (!notify) return;
         var hdr: [4]u8 = undefined;
         const frame = wire.putChanHeader(&hdr, ch.id);
@@ -3304,7 +3357,7 @@ pub const Daemon = struct {
     fn applyWorkerLimits() void {
         const env = std.c.getenv("SKETERM_WORKER_MEM_MB") orelse return;
         const mb = std.fmt.parseInt(u64, std.mem.span(env), 10) catch {
-            std.debug.print("sketerm-mux: ignoring unparseable SKETERM_WORKER_MEM_MB={s}\n", .{std.mem.span(env)});
+            log.warn("ignoring unparseable SKETERM_WORKER_MEM_MB={s}", .{std.mem.span(env)});
             return;
         };
         if (mb == 0) return;
@@ -3392,6 +3445,7 @@ pub const Daemon = struct {
             cl.queueErr("oom");
             return;
         };
+        log.info("worker forked pid={d} session='{s}' kind={s}", .{ pid, w.name, if (req.app) "app" else "shell" });
         // Reply is deferred: `brokerOnWorkerControl` sends `.ok` when the
         // worker reports 'Y' (session up), or `.err` if the worker dies first
         // (spawnSession failed). The client is blocked in recvExpect(.ok).
@@ -3732,6 +3786,8 @@ pub const Daemon = struct {
                     break :blk std.fmt.bufPrint(&idbuf, "{d}", .{id}) catch "app";
                 };
                 a11y_hub = a11yhub.Hub.setup(allocator, dir, idstr);
+                if (a11y_hub == null)
+                    log.warn("a11y hub setup failed for session '{s}' — app_a11y_tree will be empty (dbus-daemon / at-spi2-registryd missing?)", .{req.name});
             }
         }
         const a11y_addr_z: ?[:0]const u8 = if (a11y_hub) |h| h.bus_addr_z else null;
@@ -3829,7 +3885,7 @@ pub const Daemon = struct {
             .app = req.app,
             .gpu = req.gpu,
             .kb_keymap = wlkeymaps.get(req.kb_layout) orelse blk: {
-                std.debug.print("sketerm-mux: unknown kb_layout '{s}' (have: {s}) — using us\n", .{ req.kb_layout, wlkeymaps.names });
+                log.warn("unknown kb_layout '{s}' (have: {s}) — using us", .{ req.kb_layout, wlkeymaps.names });
                 break :blk wlcomp.us_keymap;
             },
             .last_activity_ms = nowMs(),
@@ -3856,7 +3912,7 @@ pub const Daemon = struct {
             const w = allocator.create(WsSource) catch break :create_ws;
             if (ws_gate.use_sck) {
                 w.* = WsSource.initSck(allocator, s.pty.child_pid) catch |err| {
-                    std.debug.print("sketerm-mux: window capture init failed ({s}) — session '{s}' has no app streaming\n", .{ @errorName(err), req.name });
+                    log.warn("window capture init failed ({s}) — session '{s}' has no app streaming", .{ @errorName(err), req.name });
                     allocator.destroy(w);
                     break :create_ws;
                 };
@@ -3866,6 +3922,15 @@ pub const Daemon = struct {
             s.winstream = w;
         }
         screen.sink = .{ .ctx = @ptrCast(s), .on_write_pty = Session.sinkWritePty };
+        log.info("session '{s}' spawned kind={s} child_pid={d} {d}x{d} wl={s} a11y={s}", .{
+            req.name,
+            if (req.app) "app" else "shell",
+            s.pty.child_pid,
+            req.cols,
+            req.rows,
+            s.wl_display_path orelse "-",
+            if (s.a11y != null) "on" else "off",
+        });
         return s;
     }
 
@@ -3889,6 +3954,7 @@ pub const Daemon = struct {
             return;
         }
         cl.attached = s;
+        log.info("client attach session='{s}' kind={s} proto={d}", .{ s.name, parsed.value.kind, cl.proto });
         cl.kind = if (std.mem.eql(u8, parsed.value.kind, "gui"))
             .gui
         else if (std.mem.eql(u8, parsed.value.kind, "cli"))
@@ -4436,6 +4502,7 @@ pub const Daemon = struct {
     fn sessionExited(self: *Daemon, s: *Session) void {
         if (s.exited) return;
         s.exited = true;
+        log.info("session '{s}' exited", .{s.name});
         // We reach here on PTY EOF/EIO: the child has exited but may
         // not be waitpid-able for another scheduler tick, and a single
         // WNOHANG try races it — the .exit frame then ships the
@@ -4512,6 +4579,7 @@ pub const Daemon = struct {
                     if (ch.tcp and ch.client == cl) ch.dead = true;
                 }
                 const was = cl.attached;
+                if (was) |s| log.info("client gone (session '{s}')", .{s.name});
                 _ = self.clients.swapRemove(i);
                 cl.deinit();
                 // Duplicate rosters (several deaths, one session) are
