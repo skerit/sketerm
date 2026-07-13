@@ -7536,3 +7536,42 @@ with a 30s cap returns at ~30s, stderr notes the abort, the next
 call still works; (3) the reporter's acceptance script (sleep 3 →
 wait 5 → screenshot_app/app_output/app_click/close_app/close_app/
 list_apps) completes in 6s wall with explicit per-call answers.
+
+## 2026-07-14 — the close_app "hang" was a silent SIGPIPE DEATH
+
+Rounds 4 and 5 hardened deadlines; the reporter still hit a wedge on
+the round-5 binary. This time the trace log (--log) plus the actual
+app (the st-afu game port) made it reproducible, and the story is
+embarrassing but simple: the MCP server was not hanging — it was
+DYING, silently.
+
+Root cause: `sketerm mcp` (unlike the daemon, mux_main.zig) never
+neutered SIGPIPE, and `Conn.sendFrame` wrote with plain write(). When
+an app session's broker WORKER dies (the app exited on its own), the
+client's attach socket closes. The afu app has AUDIO, so pcm units
+keep flowing until exit and appdrive answers them with `consumed`
+reports during every routine drain — the first such write after the
+worker died raised SIGPIPE and killed the whole server: no core, no
+stderr, and the client's in-flight call (their close_app; in the
+repro, a plain list_apps) "hangs" forever. Every symptom across all
+three reports fits — including one dead app "blocking" unrelated
+tools (the server was simply gone).
+
+Why earlier repros passed: sh -c sleep sessions have no audio channel
+and nothing writes to the conn after exit; weston-terminal tortures
+never raced a write against the worker teardown.
+
+Fix, both layers: a no-op SIGPIPE handler in installQuitSignals()
+(SIG_IGN macro fails translate-c, same trick as mux_main), and
+MSG_NOSIGNAL in Conn.sendFrame (@hasDecl-gated; macOS callers rely on
+handlers / GSocket's SO_NOSIGPIPE) — the latter also protects the GUI
+process, which talks to the daemon with the same Conn and would die
+the same way if a daemon/worker vanished mid-write.
+
+Verified with the reporter's real workload: launch the afu movie
+harness, poll list_apps every 5s across its ~40s lifetime, then
+close_app — pre-fix the server died at the poll coinciding with app
+exit (twice, deterministic); post-fix all polls answer, close_app
+returns "app session closed (the app had already exited with status
+0)", server alive (run twice). 714/720 tests, smoke-mux + smoke-mcp
+PASS.
