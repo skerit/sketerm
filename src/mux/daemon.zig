@@ -26,6 +26,7 @@ const wlcomp = @import("../wlhost/compositor.zig");
 const wlkeymaps = @import("../wlhost/keymaps.zig");
 const a11yhub = @import("a11yhub.zig");
 const cast_rec = @import("cast.zig");
+const logring = @import("logring.zig");
 const build_options = @import("build_options");
 const version = @import("../version.zig");
 const wlvcodec = @import("../wlhost/vcodec.zig");
@@ -40,6 +41,15 @@ const Parser = @import("../parser/vt.zig").Parser;
 const Event = @import("../parser/event.zig").Event;
 const Screen = @import("../grid/screen.zig").Screen;
 const Pool = @import("../grid/style_pool.zig").Pool;
+
+/// Wall-clock epoch milliseconds — ONLY for log-line timestamps that a
+/// client renders as "how long ago"; everything scheduling-related
+/// stays on the monotonic clock below.
+fn wallMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+}
 
 /// Monotonic milliseconds — the daemon's own clock. Idle durations are
 /// computed daemon-side (never as a client-vs-daemon timestamp diff) so a
@@ -138,6 +148,17 @@ pub const AttachReq = struct {
     kind: []const u8 = "",
 };
 
+/// `log_get` request. Exactly one selector applies, in this order:
+/// `id` (one line, full bytes) > `from_id` (up to 500 lines from that
+/// id) > `tail` (last N lines). `max_chars` bounds each line in the
+/// reply (0 = full stored bytes).
+pub const LogGetReq = struct {
+    tail: u32 = 100,
+    from_id: u64 = 0,
+    id: u64 = 0,
+    max_chars: u32 = 300,
+};
+
 pub const RenameReq = struct {
     name: []const u8 = "",
     new_name: []const u8 = "",
@@ -215,7 +236,11 @@ const Session = struct {
     /// Live asciicast v2 recording of this session's PTY output
     /// (rec_start/rec_stop). Survives client detach.
     cast: ?cast_rec.Rec = null,
+    /// Indexed escape-free log of the child's output (log_get / MCP
+    /// app_log): one monotonically-increasing id per line, bounded.
+    log: logring.LogRing,
     fn deinit(self: *Session) void {
+        self.log.deinit();
         if (self.cast) |*rec| rec.finish();
         if (self.winstream) |ws| {
             ws.deinit();
@@ -1599,6 +1624,7 @@ pub const Daemon = struct {
             .app_a11y => self.handleAppA11y(cl, frame.payload),
             .rec_start => self.handleRecStart(cl, frame.payload),
             .search => self.handleSearch(cl, frame.payload),
+            .log_get => self.handleLogGet(cl, frame.payload),
             .forward_open => self.handleForward(cl, frame.payload),
             .rec_stop => {
                 const s = cl.attached orelse {
@@ -3928,6 +3954,7 @@ pub const Daemon = struct {
                 break :blk wlcomp.us_keymap;
             },
             .last_activity_ms = nowMs(),
+            .log = logring.LogRing.init(allocator),
         };
         if (hub) |h| {
             s.wl_hub_fd = h.fd;
@@ -4207,6 +4234,79 @@ pub const Daemon = struct {
             ws.poll(&units, self.allocator, now_ms) catch continue;
             if (units.items.len > 0) self.queueUnits(ch, units.items);
         }
+    }
+
+    /// Serve `log_get`: a slice of the attached session's log ring as
+    /// a `log_data` JSON frame. Also used at session exit to push the
+    /// final log toward clients before the `.exit` frame (post-mortem
+    /// without a round trip — the exit force-detaches them).
+    fn queueLogData(self: *Daemon, cl: *Client, s: *Session, req: LogGetReq) void {
+        const ring = &s.log;
+        const items = ring.lines.items;
+        var start: usize = 0;
+        var end: usize = items.len;
+        if (req.id != 0) {
+            if (ring.indexOfId(req.id)) |i| {
+                if (items[i].id == req.id) {
+                    start = i;
+                    end = i + 1;
+                } else {
+                    start = end; // dropped / never emitted
+                }
+            } else start = end;
+        } else if (req.from_id != 0) {
+            start = ring.indexOfId(req.from_id) orelse end;
+            end = @min(end, start + 500);
+        } else {
+            const tail: usize = @min(@max(req.tail, 1), 500);
+            if (end > tail) start = end - tail;
+        }
+        // Single-line fetches return the FULL stored line.
+        const max_chars: usize = if (req.id != 0) 0 else req.max_chars;
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.print("{{\"next_id\":{d},\"dropped\":{d},\"lines\":[", .{ ring.next_id, ring.dropped }) catch return;
+        var first = true;
+        for (items[start..end]) |l| {
+            if (!first) w.writeAll(",") catch return;
+            first = false;
+            var text = l.bytes;
+            var cut = false;
+            if (max_chars != 0 and text.len > max_chars) {
+                // Cut on a UTF-8 boundary (bytes are scrubbed-valid).
+                var n = max_chars;
+                while (n > 0 and (text[n] & 0xC0) == 0x80) n -= 1;
+                text = text[0..n];
+                cut = true;
+            }
+            w.print("{{\"id\":{d},\"t\":{d},\"text\":", .{ l.id, l.t_ms }) catch return;
+            std.json.Stringify.value(text, .{}, w) catch return;
+            if (l.truncated) w.writeAll(",\"truncated\":true") catch return;
+            if (cut) w.writeAll(",\"cut\":true") catch return;
+            if (l.marker) w.writeAll(",\"marker\":true") catch return;
+            w.writeAll("}") catch return;
+        }
+        w.writeAll("]}") catch return;
+        cl.queueFrame(.log_data, aw.written());
+    }
+
+    fn handleLogGet(self: *Daemon, cl: *Client, payload: []const u8) void {
+        const s = cl.attached orelse {
+            cl.queueErr("not attached");
+            return;
+        };
+        var req = LogGetReq{};
+        if (payload.len > 0) {
+            if (std.json.parseFromSlice(LogGetReq, self.allocator, payload, .{
+                .ignore_unknown_fields = true,
+            })) |p| {
+                req = p.value;
+                p.deinit();
+            } else |_| {}
+        }
+        self.queueLogData(cl, s, req);
     }
 
     fn queueSnapshot(self: *Daemon, cl: *Client, s: *Session) void {
@@ -4496,8 +4596,11 @@ pub const Daemon = struct {
             .allocator = self.allocator,
             .screen = s.screen,
             .writer = wire.Writer.init(self.allocator),
+            .ring = &s.log,
+            .wall_ms = wallMs(),
         };
         defer total_events.writer.deinit();
+        defer total_events.deinitMarkers();
 
         var rounds: u8 = 0;
         while (rounds < 8) : (rounds += 1) {
@@ -4518,7 +4621,7 @@ pub const Daemon = struct {
         }
 
         const n_events = total_events.count;
-        if (n_events == 0) return;
+        if (n_events == 0 and total_events.markers.items.len == 0) return;
         // Real terminal output this drain → the session is active now.
         s.last_activity_ms = nowMs();
         var any_attached = false;
@@ -4528,7 +4631,7 @@ pub const Daemon = struct {
                 break;
             }
         }
-        if (any_attached) {
+        if (any_attached and n_events > 0) {
             var payload: std.ArrayList(u8) = .empty;
             defer payload.deinit(self.allocator);
             var hdr: [12]u8 = undefined;
@@ -4551,6 +4654,16 @@ pub const Daemon = struct {
                 }
                 cl.queueFrame(.events, payload.items);
             }
+        }
+        // Markers push to every attached client regardless of the
+        // events backpressure — they are tiny and time-sensitive (the
+        // viewer stashes "the app right now" against them).
+        for (total_events.markers.items) |m| {
+            for (self.clients.items) |cl| {
+                if (cl.attached == s and !cl.dead)
+                    cl.queueJson(.marker, .{ .id = m.id, .label = m.label, .t = total_events.wall_ms });
+            }
+            log.debug("marker #{d} '{s}' (session '{s}')", .{ m.id, m.label, s.name });
         }
         s.seq += n_events;
     }
@@ -4576,6 +4689,8 @@ pub const Daemon = struct {
         }
         var st: [4]u8 = undefined;
         std.mem.writeInt(i32, &st, s.exit_status, .little);
+        // A crash mid-line must keep the tail in the log ring.
+        s.log.flush(wallMs());
         // Deliver the exit, then force-detach: nothing will ever flow
         // on this session again, and a client that vanished without a
         // clean goodbye (UDP peer roamed away for good) must not pin
@@ -4588,6 +4703,9 @@ pub const Daemon = struct {
                     // (the FINAL screen — the crash post-mortem) must go
                     // out ahead of the exit frame, not after.
                     if (cl.needs_resync) self.queueSnapshot(cl, s);
+                    // Post-mortem log push: the exit force-detaches the
+                    // client, so a later log_get would find no session.
+                    self.queueLogData(cl, s, .{ .tail = 300, .max_chars = 1000 });
                     cl.queueFrame(.exit, &st);
                 }
                 cl.attached = null;
@@ -4716,9 +4834,38 @@ const EventCollector = struct {
     screen: *Screen,
     writer: wire.Writer,
     count: u32 = 0,
+    /// Session log ring to feed (escape-free lines); null = don't.
+    ring: ?*logring.LogRing = null,
+    /// Wall-clock stamp for lines committed during this drain.
+    wall_ms: i64 = 0,
+    /// OSC 5522 markers seen this drain; drainSession pushes them to
+    /// attached clients and frees the labels.
+    markers: std.ArrayList(Marker) = .empty,
+
+    const Marker = struct { id: u64, label: []u8 };
 
     fn emit(user: ?*anyopaque, ev: Event) void {
         const self: *EventCollector = @ptrCast(@alignCast(user.?));
+        // sketerm marker escape (OSC 5522 ; label): private — swallowed
+        // rather than forwarded. It becomes a labelled log-ring line
+        // and a `.marker` push so viewers can stash a screenshot of
+        // "the app right now".
+        if (ev == .osc) {
+            const bytes = ev.osc.bytes;
+            if (std.mem.eql(u8, bytes, "5522") or std.mem.startsWith(u8, bytes, "5522;")) {
+                if (self.ring) |r| {
+                    const label = if (bytes.len > 5) bytes[5..] else "";
+                    const id = r.addMarker(label, self.wall_ms);
+                    if (self.allocator.dupe(u8, label)) |copy| {
+                        self.markers.append(self.allocator, .{ .id = id, .label = copy }) catch
+                            self.allocator.free(copy);
+                    } else |_| {}
+                }
+                var mut = ev;
+                mut.deinit(self.allocator);
+                return;
+            }
+        }
         // Kitty file/tempfile/shm transmissions reference THIS
         // host's filesystem — fetch and inline them so the client
         // (which can't read our disk) gets the data. Apply the
@@ -4733,11 +4880,23 @@ const EventCollector = struct {
                 fwd = .{ .apc = .{ .bytes = nb } };
             }
         }
+        if (self.ring) |r| switch (fwd) {
+            .print => |cp| r.feedCodepoint(cp),
+            .print_byte => |b| r.feedBytes(&.{b}),
+            .print_run => |run| r.feedBytes(run.bytes[0..run.len]),
+            .execute => |b| r.feedControl(b, self.wall_ms),
+            else => {},
+        };
         self.writer.putEvent(fwd) catch {};
         self.screen.apply(fwd);
         self.count += 1;
         var mut = ev;
         mut.deinit(self.allocator);
+    }
+
+    fn deinitMarkers(self: *EventCollector) void {
+        for (self.markers.items) |m| self.allocator.free(m.label);
+        self.markers.deinit(self.allocator);
     }
 };
 

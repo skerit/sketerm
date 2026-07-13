@@ -719,7 +719,8 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_windows","description":"List one app's rendered windows (ids, sizes, titles).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
     \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Optional region crop and integer zoom for pixel-level inspection; downscaled when larger than max_px. The caption tells you how to map image coordinates back to app_click coordinates. wait_change=true blocks until the window renders something NEWER than your last screenshot (verify a click did something); stable_ms waits until repainting stops before capturing (settle-then-capture — combine both to catch 'changed, then went quiet'). stats_only=true skips the image and just reports whether/how much the window changed since your last look (cheap polling). burst=N captures up to N frames over burst_ms, each at least min_change_pct different from the previous — one call across an animated transition.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"},"region":{"type":"object","description":"Crop to a sub-rectangle in surface pixels","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer","description":"Nearest-neighbor integer upscale (1-32) — crop a small region and zoom to inspect pixels"},"wait_change":{"type":"boolean","description":"Wait until the window content changed since the last screenshot before capturing"},"stable_ms":{"type":"integer","description":"Capture only after the window committed no new frame for this long (settle-then-capture)"},"stats_only":{"type":"boolean","description":"Return {changed, diff_pct, resized, w, h, frames} instead of an image"},"burst":{"type":"integer","description":"Capture up to N distinct frames (2-8) over burst_ms"},"burst_ms":{"type":"integer","description":"Burst time window (default 5000)"},"min_change_pct":{"type":"number","description":"Minimum %% of pixels changed vs the previous burst frame (default 1.0)"},"timeout_ms":{"type":"integer","description":"Bound for wait_change/stable_ms (default 10000)"}}}},
     \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app. If the app exited, reports exit status, signal and recent output instead. Accepts the same region/zoom/wait_change/stable_ms/stats_only/burst options as screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer"},"wait_change":{"type":"boolean"},"stable_ms":{"type":"integer"},"stats_only":{"type":"boolean"},"burst":{"type":"integer"},"burst_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"}}}},
-    \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as rendered by a terminal). THE tool for 'why did my app print/exit that'. scrollback=true includes history beyond the visible grid. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
+    \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as rendered by a terminal — right for TUI-style redraws). For log-style output prefer app_log: indexed lines with stable ids, re-readable in full. scrollback=true includes history beyond the visible grid. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
+    \\{"name":"app_log","description":"A headless app's stdout/stderr as an INDEXED LOG: each complete line gets a stable numeric id and a timestamp; the tail view shortens long lines (marked [+]) and any line can be re-read in full by id. The ring is bounded (oldest lines drop; the reply says how many). MARKERS: the app (or your injected code) can emit the escape  printf '\\033]5522;my-label\\033\\\\'  — it becomes a labelled log line AND sketerm stashes a screenshot of the app window at that exact instant; fetch label+image with {\"id\":<that line's id>}. Survives app exit: the final log is delivered with the exit.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"tail":{"type":"integer","description":"Last N lines (default 60, max 500)"},"from_id":{"type":"integer","description":"Return lines starting at this id instead of the tail"},"id":{"type":"integer","description":"Return ONE line in full; for a marker line also returns the stashed screenshot"}}}},
     \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x","y"]}},
     \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
     \\{"name":"app_set_value","description":"Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value). Faster and more reliable than typing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}},
@@ -1180,6 +1181,15 @@ fn monoMs() i64 {
     return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
 }
 
+/// Wall-clock ms, matching the daemon's log-line timestamps. Full ms
+/// precision — a seconds-truncated "now" makes fresh lines look like
+/// they are from the future ("-0.5s ago").
+fn wallNowMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+}
+
 fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
     if (!app_state.ready)
@@ -1317,6 +1327,96 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             });
         }
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_log")) {
+        const line_id: u64 = @intCast(@max(argInt(args, "id") orelse 0, 0));
+        const from_id: u64 = @intCast(@max(argInt(args, "from_id") orelse 0, 0));
+        const tail: i64 = std.math.clamp(argInt(args, "tail") orelse 60, 1, 500);
+        const req = try std.fmt.allocPrint(
+            arena,
+            "{{\"tail\":{d},\"from_id\":{d},\"id\":{d},\"max_chars\":300}}",
+            .{ tail, from_id, line_id },
+        );
+        const reply = app.logGet(req, 5_000) catch |err| return appErr(arena, switch (err) {
+            appdrive.Error.Timeout => "daemon did not answer the log request in time",
+            else => "no log data for this app",
+        });
+        defer app_state.allocator.free(reply);
+        const LineJ = struct {
+            id: u64 = 0,
+            t: i64 = 0,
+            text: []const u8 = "",
+            truncated: bool = false,
+            cut: bool = false,
+            marker: bool = false,
+        };
+        const ReplyJ = struct { next_id: u64 = 0, dropped: u64 = 0, lines: []const LineJ = &.{} };
+        const parsed = std.json.parseFromSlice(ReplyJ, arena, reply, .{
+            .ignore_unknown_fields = true,
+        }) catch return appErr(arena, "malformed log reply");
+        const r = parsed.value;
+        const now_wall: i64 = wallNowMs();
+
+        if (line_id != 0) {
+            // One line in full — the post-exit stash may return the whole
+            // final log, so filter by id here.
+            var found: ?LineJ = null;
+            for (r.lines) |l| {
+                if (l.id == line_id) found = l;
+            }
+            const l = found orelse
+                return appErr(arena, "line not available (dropped from the ring, never emitted, or beyond the post-exit stash)");
+            const age_s = @as(f64, @floatFromInt(now_wall - l.t)) / 1000.0;
+            if (l.marker) {
+                const cap = try std.fmt.allocPrint(arena, "marker line {d} ({d:.1}s ago): '{s}'{s}", .{
+                    l.id, age_s, l.text,
+                    if (app.markerShot(line_id) != null and app.markerShot(line_id).?.png != null)
+                        " — window at that instant below"
+                    else
+                        " (no screenshot was stashed: no rendered window at the time, or the marker aged out)",
+                });
+                if (app.markerShot(line_id)) |m| {
+                    if (m.png) |p| {
+                        if (imageResult(arena, cap, p)) |res| return res;
+                    }
+                }
+                return toolResult(arena, cap, false) orelse error.OutOfMemory;
+            }
+            const msg = try std.fmt.allocPrint(arena, "line {d} ({d:.1}s ago{s}):\n{s}", .{
+                l.id, age_s,
+                if (l.truncated) ", was longer than the 4KB line cap" else "",
+                l.text,
+            });
+            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        }
+
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        if (r.lines.len == 0) {
+            try w.writeAll("(log empty — the app has not printed any complete line yet)");
+        } else {
+            try w.print("log lines {d}..{d} (newest id {d})", .{
+                r.lines[0].id, r.lines[r.lines.len - 1].id, r.next_id - 1,
+            });
+            if (r.dropped > 0) try w.print(", {d} oldest dropped by the ring cap", .{r.dropped});
+            try w.writeAll(" — [+] = shortened, fetch in full with {\"id\":N}\n");
+            for (r.lines) |l| {
+                const age_s = @as(f64, @floatFromInt(now_wall - l.t)) / 1000.0;
+                if (l.marker) {
+                    const has_shot = app.markerShot(l.id) != null and app.markerShot(l.id).?.png != null;
+                    try w.print("{d} [-{d:.1}s] [marker '{s}'{s}]\n", .{
+                        l.id, age_s, l.text,
+                        if (has_shot) " — screenshot stashed, view it via {\"id\":this line's id}" else "",
+                    });
+                } else {
+                    try w.print("{d} [-{d:.1}s] {s}{s}\n", .{
+                        l.id, age_s, l.text,
+                        if (l.cut or l.truncated) " [+]" else "",
+                    });
+                }
+            }
+        }
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "screenshot_app") or eql(u8, name, "get_app_state")) {
         var win_id: u32 = 0;

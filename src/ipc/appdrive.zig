@@ -255,6 +255,23 @@ pub const App = struct {
     term_pool: ?*Pool = null,
     term_screen: ?*Screen = null,
     term_seq: u64 = 0,
+    /// Latest `.log_data` payload (a logGet reply, or the daemon's
+    /// unsolicited post-mortem push just before `.exit`).
+    log_buf: std.ArrayList(u8) = .empty,
+    /// Bumped per received `.log_data` — logGet waits on this.
+    log_seq: u64 = 0,
+    /// Screenshots stashed when the app emitted the OSC 5522 marker
+    /// escape: "the window at that instant", keyed by the marker's
+    /// log-line id. Bounded ring, oldest dropped.
+    markers: std.ArrayList(MarkerShot) = .empty,
+
+    pub const MarkerShot = struct {
+        id: u64,
+        label: []u8,
+        /// Full-window PNG at marker time (null = no rendered window).
+        png: ?[]u8,
+    };
+    const MAX_MARKER_SHOTS = 8;
 
     const ClipOffer = struct { chan: u32, source: u32, mime: []u8 };
 
@@ -424,6 +441,12 @@ pub const App = struct {
         self.windows.deinit(a);
         if (self.clip_offer) |o| a.free(o.mime);
         self.clip_buf.deinit(a);
+        self.log_buf.deinit(a);
+        for (self.markers.items) |m| {
+            a.free(m.label);
+            if (m.png) |p| a.free(p);
+        }
+        self.markers.deinit(a);
         if (self.paste_data) |p| a.free(p);
         if (self.layout) |*l| l.deinit(a);
         if (self.rec) |*r| r.abort();
@@ -613,12 +636,78 @@ pub const App = struct {
             },
             .snapshot => self.applyTermSnapshot(payload),
             .events => self.applyTermEvents(payload),
+            .log_data => {
+                self.log_buf.clearRetainingCapacity();
+                self.log_buf.appendSlice(self.allocator, payload) catch return;
+                self.log_seq += 1;
+            },
+            .marker => self.stashMarker(payload),
             .exit => {
                 self.exited = true;
                 if (payload.len >= 4) self.exit_status = std.mem.readInt(i32, payload[0..4], .little);
             },
             else => {},
         }
+    }
+
+    /// The app emitted the OSC 5522 marker escape: stash a screenshot
+    /// of its primary window at this instant, keyed by the marker's
+    /// log-line id (fetched later via app_log {id}).
+    fn stashMarker(self: *App, payload: []const u8) void {
+        const a = self.allocator;
+        const P = struct { id: u64 = 0, label: []const u8 = "" };
+        const parsed = std.json.parseFromSlice(P, a, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
+        defer parsed.deinit();
+        if (parsed.value.id == 0) return;
+        var shot_png: ?[]u8 = null;
+        for (self.windows.items) |w| {
+            if (w.popup or w.frames == 0) continue;
+            if (self.encodeWindowPng(w, 1568, null, 1)) |shot| shot_png = shot.png else |_| {}
+            break;
+        }
+        const label = a.dupe(u8, parsed.value.label) catch {
+            if (shot_png) |p| a.free(p);
+            return;
+        };
+        self.markers.append(a, .{ .id = parsed.value.id, .label = label, .png = shot_png }) catch {
+            a.free(label);
+            if (shot_png) |p| a.free(p);
+            return;
+        };
+        while (self.markers.items.len > MAX_MARKER_SHOTS) {
+            const old = self.markers.orderedRemove(0);
+            a.free(old.label);
+            if (old.png) |p| a.free(p);
+        }
+    }
+
+    pub fn markerShot(self: *const App, id: u64) ?*const MarkerShot {
+        for (self.markers.items) |*m| {
+            if (m.id == id) return m;
+        }
+        return null;
+    }
+
+    /// Fetch log lines from the daemon (`req_json` = a LogGetReq
+    /// object). For an EXITED app the daemon already pushed the final
+    /// log ahead of `.exit`; that stash is served instead (the session
+    /// is gone daemon-side). Caller owns the returned JSON.
+    pub fn logGet(self: *App, req_json: []const u8, timeout_ms: i64) Error![]u8 {
+        self.drain();
+        if (!self.exited) {
+            const before = self.log_seq;
+            self.conn.sendFrame(.log_get, req_json) catch return Error.NotConnected;
+            const deadline = nowMs() + timeout_ms;
+            while (self.log_seq == before and nowMs() < deadline) {
+                if (self.exited) break;
+                _ = self.pumpOnce(25);
+            }
+            if (self.log_seq == before and !self.exited) return Error.Timeout;
+        }
+        if (self.log_buf.items.len == 0) return Error.NotConnected;
+        return self.allocator.dupe(u8, self.log_buf.items) catch Error.OutOfMemory;
     }
 
     fn dropChanWindows(self: *App, chan: u32) void {
@@ -1168,14 +1257,22 @@ pub const App = struct {
     /// Latest committed pixels of one window as a PNG: optional
     /// `region` crop, optional integer `zoom` (nearest-neighbor, for
     /// pixel inspection), then downscaled so neither dimension exceeds
-    /// `max_dim` (0 = no bound). Caller owns `.png`.
+    /// `max_dim` (0 = no bound). Caller owns `.png`. Moves the
+    /// wait_change/diff baseline ("what the caller last saw").
     pub fn screenshotPng(self: *App, win_id: u32, max_dim: u32, region: ?Region, zoom_req: u32) Error!Shot {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
+        if (win.w <= 0 or win.h <= 0 or win.pixels.items.len == 0) return Error.NoSuchWindow;
+        win.rememberShot(self.allocator);
+        return self.encodeWindowPng(win, max_dim, region, zoom_req);
+    }
+
+    /// PNG-encode a window WITHOUT touching the observation baseline
+    /// (marker stashes must not eat a pending wait_change).
+    fn encodeWindowPng(self: *App, win: *Window, max_dim: u32, region: ?Region, zoom_req: u32) Error!Shot {
         if (win.w <= 0 or win.h <= 0 or win.pixels.items.len == 0) return Error.NoSuchWindow;
         const uw: u32 = @intCast(win.w);
         const uh: u32 = @intCast(win.h);
         const a = self.allocator;
-        win.rememberShot(a);
 
         var ox: u32 = 0;
         var oy: u32 = 0;

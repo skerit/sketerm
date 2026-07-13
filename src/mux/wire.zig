@@ -90,6 +90,12 @@ pub const FrameType = enum(u8) {
     /// (kind tcp_forward) owned by the requesting client; raw bytes
     /// then flow as chan_data both ways. No attach required.
     forward_open = 21,
+    /// Fetch lines from the ATTACHED session's indexed log ring
+    /// (escape-free PTY output, one monotonically-increasing id per
+    /// line). JSON { tail?, from_id?, id?, max_chars? }; answered
+    /// with `log_data`. Attach-scoped so it reaches the worker that
+    /// owns the Session in broker mode.
+    log_get = 22,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -118,6 +124,16 @@ pub const FrameType = enum(u8) {
     /// `back` = display lines up from the bottom of the live grid,
     /// `total` = matches found (hits capped at the request's max).
     search_hits = 76,
+    /// JSON answer to `log_get`: { next_id, dropped, lines: [{id, t,
+    /// text, truncated?, cut?, marker?}] }. `t` = epoch ms on the
+    /// daemon's host; `truncated` = stored line was capped at ingest;
+    /// `cut` = shortened to the request's max_chars in this reply.
+    log_data = 77,
+    /// Pushed to every attached client when the session's child emits
+    /// the sketerm marker escape (OSC 5522 ; label): JSON { id, label,
+    /// t } where `id` is the marker's log-ring line id. Viewers may
+    /// stash a screenshot of the app's current frame against it.
+    marker = 78,
     // Byte channels (both directions). Generic multiplexed streams
     // riding the mux connection — used to tunnel a session's app
     // protocol, so forwarded apps inherit whatever transport the
