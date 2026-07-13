@@ -345,6 +345,13 @@ const Client = struct {
     video: bool = false,
     /// Self-declared attach kind (peer roster / driving indicator).
     kind: enum { unknown, gui, cli, mcp } = .unknown,
+    /// Terminal `.events` were withheld because this client's wbuf
+    /// exceeded EVENTS_BACKLOG (a flooding session vs a slow/idle
+    /// consumer — e.g. an MCP client between tool calls). Once the
+    /// wbuf fully drains, a fresh snapshot resyncs the client and
+    /// event streaming resumes. Keeps a flooded client's backlog
+    /// bounded instead of racing toward the MAX_WBUF reap.
+    needs_resync: bool = false,
 
     fn deinit(self: *Client) void {
         _ = c.close(self.fd);
@@ -360,6 +367,12 @@ const Client = struct {
     /// Sized above the largest legitimate burst (attach replay of a
     /// multi-window app's pools).
     const MAX_WBUF: usize = 256 << 20;
+
+    /// Queued-bytes threshold past which terminal `.events` stop being
+    /// streamed to this client (snapshot resync takes over once it
+    /// drains). Matches NATIVE_BACKLOG, the equivalent guard on the
+    /// Wayland frame path.
+    const EVENTS_BACKLOG: usize = 8 << 20;
 
     fn queueFrame(self: *Client, ftype: wire.FrameType, payload: []const u8) void {
         if (self.dead) return;
@@ -1466,7 +1479,6 @@ pub const Daemon = struct {
     }
 
     fn clientWritable(self: *Daemon, cl: *Client) void {
-        _ = self;
         const n_raw = c.write(cl.fd, cl.wbuf.items.ptr, cl.wbuf.items.len);
         if (n_raw < 0) {
             // fd is O_NONBLOCK: EAGAIN means the send buffer is full;
@@ -1482,6 +1494,18 @@ pub const Daemon = struct {
         // capacity pinned forever; release it once fully drained.
         if (remaining == 0 and cl.wbuf.capacity > (4 << 20))
             cl.wbuf.clearAndFree(cl.allocator);
+        // Events were withheld while this client was backlogged; it has
+        // caught up, so hand it a fresh snapshot (stamped with the
+        // current seq) and resume streaming. Sent even for an exited
+        // session — the final screen is exactly what a crash-flood
+        // post-mortem needs.
+        if (remaining == 0 and cl.needs_resync) {
+            cl.needs_resync = false;
+            if (cl.attached) |s| {
+                log.debug("resync snapshot toward drained client (session '{s}')", .{s.name});
+                self.queueSnapshot(cl, s);
+            }
+        }
     }
 
     fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
@@ -4171,6 +4195,10 @@ pub const Daemon = struct {
     }
 
     fn queueSnapshot(self: *Daemon, cl: *Client, s: *Session) void {
+        // A full snapshot supersedes any withheld events — whatever
+        // triggered it (attach, resize, resync), the client is current
+        // again once this lands.
+        cl.needs_resync = false;
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
         // Header: [seq:u64][app:u8]. The app byte lets an attaching
@@ -4493,7 +4521,19 @@ pub const Daemon = struct {
             payload.appendSlice(self.allocator, &hdr) catch return;
             payload.appendSlice(self.allocator, total_events.writer.buf.items) catch return;
             for (self.clients.items) |cl| {
-                if (cl.attached == s and !cl.dead) cl.queueFrame(.events, payload.items);
+                if (cl.attached != s or cl.dead) continue;
+                // Backpressure: a client this far behind (flooding
+                // session, consumer idle between MCP tool calls) stops
+                // receiving events — clientWritable resyncs it with a
+                // fresh snapshot once its wbuf drains. Without this a
+                // sustained flood grows wbuf to the MAX_WBUF reap.
+                if (cl.needs_resync) continue;
+                if (cl.wbuf.items.len > Client.EVENTS_BACKLOG) {
+                    cl.needs_resync = true;
+                    log.debug("client wbuf {d}B over events backlog; snapshot resync scheduled (session '{s}')", .{ cl.wbuf.items.len, s.name });
+                    continue;
+                }
+                cl.queueFrame(.events, payload.items);
             }
         }
         s.seq += n_events;
@@ -4526,7 +4566,14 @@ pub const Daemon = struct {
         // the dead session in the list forever.
         for (self.clients.items) |cl| {
             if (cl.attached == s) {
-                if (!cl.dead) cl.queueFrame(.exit, &st);
+                if (!cl.dead) {
+                    // A backlogged client had events withheld; clients
+                    // stop pumping after `.exit`, so the resync snapshot
+                    // (the FINAL screen — the crash post-mortem) must go
+                    // out ahead of the exit frame, not after.
+                    if (cl.needs_resync) self.queueSnapshot(cl, s);
+                    cl.queueFrame(.exit, &st);
+                }
                 cl.attached = null;
             }
         }
