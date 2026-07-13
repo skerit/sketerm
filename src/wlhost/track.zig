@@ -33,7 +33,11 @@ pub const Action = union(enum) {
     relay,
     /// wl_shm.create_pool — message carries one fd (SCM_RIGHTS,
     /// arrival order). Daemon mmaps it and starts mirroring.
-    pool_create: struct { id: u32, size: i32 },
+    /// `serial` identifies this pool INCARNATION: wl object ids are
+    /// recycled after delete_id, but buffers keep the old storage
+    /// alive past the pool object — refcounting by id alone crosses
+    /// incarnations (the GTK4/Vulkan probe-pool bug).
+    pool_create: struct { id: u32, size: i32, serial: u64 },
     pool_resize: struct { id: u32, size: i32 },
     /// Destructor request seen; the mapping may be dropped once
     /// no buffer references it (daemon's call).
@@ -99,6 +103,10 @@ pub const BufferInfo = struct {
     /// True for a dmabuf-backed buffer: pixels live in the daemon's
     /// DmabufMirror (keyed by buffer id; `pool` is the buffer id).
     dmabuf: bool = false,
+    /// Incarnation serial of `pool` at create_buffer time (0 for
+    /// dmabuf). Refcount/mirror operations must target this
+    /// incarnation, not whatever currently owns the pool id.
+    serial: u64 = 0,
 };
 
 pub const Tracker = struct {
@@ -132,6 +140,9 @@ pub const Tracker = struct {
     /// zwp_linux_buffer_params_v1 id → plane-0 layout from `add`.
     /// ok = single plane, LINEAR modifier.
     dmabuf_params: std.AutoHashMapUnmanaged(u32, DmabufParams) = .empty,
+    /// pool id → incarnation serial of the CURRENT pool under that id.
+    pool_serials: std.AutoHashMapUnmanaged(u32, u64) = .empty,
+    pool_serial_ctr: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Error!Tracker {
         var self = Tracker{ .allocator = allocator };
@@ -149,6 +160,7 @@ pub const Tracker = struct {
         self.viewports.deinit(self.allocator);
         self.vp_heights.deinit(self.allocator);
         self.dmabuf_params.deinit(self.allocator);
+        self.pool_serials.deinit(self.allocator);
     }
 
     /// One complete client→compositor message (header + body).
@@ -188,7 +200,9 @@ pub const Tracker = struct {
             _ = try it.next(); // n
             _ = try it.next(); // h (no bytes)
             const size = (try it.next()).?.int;
-            return .{ .pool_create = .{ .id = new_id, .size = size } };
+            self.pool_serial_ctr += 1;
+            try self.pool_serials.put(self.allocator, new_id, self.pool_serial_ctr);
+            return .{ .pool_create = .{ .id = new_id, .size = size, .serial = self.pool_serial_ctr } };
         }
         if (iface == &protocol.wl_shm_pool) switch (hdr.opcode) {
             0 => { // create_buffer
@@ -206,6 +220,7 @@ pub const Tracker = struct {
                     .height = height,
                     .stride = stride,
                     .format = format,
+                    .serial = self.pool_serials.get(hdr.object) orelse 0,
                 });
                 return .{ .buffer_create = .{
                     .id = new_id,
@@ -446,6 +461,7 @@ pub const Tracker = struct {
             _ = self.viewports.remove(id);
             _ = self.vp_heights.remove(id); // id may be a surface
             _ = self.dmabuf_params.remove(id);
+            _ = self.pool_serials.remove(id);
             return;
         }
         const iface = self.objects.get(hdr.object) orelse return;
@@ -524,6 +540,35 @@ test "shm pool and buffer lifecycle" {
     try t.expectEqual(@as(u32, 4), (try tr.clientMessage(pd.hdr, pd.body)).pool_destroy.id);
     const bd = enc(&buf, 5, 0, .{});
     try t.expectEqual(@as(u32, 5), (try tr.clientMessage(bd.hdr, bd.body)).buffer_destroy.id);
+}
+
+test "pool id recycling: buffer serials pin incarnations" {
+    var tr = try Tracker.init(t.allocator);
+    defer tr.deinit();
+    try bindShm(&tr, 2, 3);
+    var buf: [64]u8 = undefined;
+
+    // Probe pool (id 4) + buffer 5, pool destroyed, id freed.
+    const cp1 = enc(&buf, 3, 0, .{ 4, 256 });
+    const a1 = try tr.clientMessage(cp1.hdr, cp1.body);
+    const s1 = a1.pool_create.serial;
+    const cb1 = enc(&buf, 4, 0, .{ 5, 0, 1, 1, 64, 0 });
+    _ = try tr.clientMessage(cb1.hdr, cb1.body);
+    try t.expectEqual(s1, tr.buffers.get(5).?.serial);
+    const pd = enc(&buf, 4, 1, .{});
+    _ = try tr.clientMessage(pd.hdr, pd.body);
+    const del = enc(&buf, 1, 1, .{4});
+    try tr.serverMessage(del.hdr, del.body);
+
+    // Client recycles id 4 for a bigger pool (the GTK4/Vulkan
+    // swapchain pattern) while buffer 5 still holds the old storage.
+    const cp2 = enc(&buf, 3, 0, .{ 4, 4096 });
+    const a2 = try tr.clientMessage(cp2.hdr, cp2.body);
+    try t.expect(a2.pool_create.serial != s1);
+    const cb2 = enc(&buf, 4, 0, .{ 6, 0, 32, 32, 128, 0 });
+    _ = try tr.clientMessage(cb2.hdr, cb2.body);
+    try t.expectEqual(a2.pool_create.serial, tr.buffers.get(6).?.serial);
+    try t.expectEqual(s1, tr.buffers.get(5).?.serial);
 }
 
 test "attach + commit reports replication, null attach clears" {

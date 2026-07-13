@@ -271,6 +271,10 @@ const Pool = struct {
     /// destructor semantics keep the memory alive for buffers).
     buffers: u32 = 0,
     destroyed: bool = false,
+    /// Incarnation serial: pool ids are recycled after delete_id
+    /// while old buffers may still reference the displaced storage
+    /// (Vulkan WSI probe pools). Buffers match on this, not the id.
+    serial: u64 = 0,
     /// Lazily-created video decoder for pool_vtile updates to this pool,
     /// recreated when the tile dimensions or codec change (-Dvideo).
     vdec: ?vcodec.Decoder = null,
@@ -291,6 +295,9 @@ const Buffer = struct {
     height: i32,
     stride: i32,
     format: u32,
+    /// Serial of the pool incarnation this buffer was created from
+    /// (0 = unresolvable, e.g. restored from a pre-v4 state_sync).
+    pool_serial: u64 = 0,
 };
 
 /// Plane-0 layout of a zwp_linux_buffer_params_v1 between add and
@@ -434,6 +441,10 @@ pub const Compositor = struct {
     inbuf: std.ArrayList(u8) = .empty,
     objects: std.AutoHashMapUnmanaged(u32, *const protocol.Interface) = .empty,
     pools: std.AutoHashMapUnmanaged(u32, Pool) = .empty,
+    /// Incarnation serial → pool displaced from `pools` by id reuse
+    /// while buffers still referenced it; freed on the last release.
+    orphan_pools: std.AutoHashMapUnmanaged(u64, Pool) = .empty,
+    pool_serial_ctr: u64 = 0,
     /// Scratch for a decoded video tile's BGRA before it's blitted into
     /// the pool mirror (build_options.video).
     vscratch: std.ArrayList(u8) = .empty,
@@ -541,6 +552,55 @@ pub const Compositor = struct {
         return self;
     }
 
+    /// Install a fresh pool incarnation under `id`. A displaced
+    /// predecessor still referenced by buffers is parked in
+    /// orphan_pools under its serial; an unreferenced one is freed.
+    fn freshPool(self: *Compositor, id: u32, size: usize) Error!*Pool {
+        const slot = try self.pools.getOrPut(self.allocator, id);
+        if (slot.found_existing) {
+            if (slot.value_ptr.buffers > 0) {
+                try self.orphan_pools.put(self.allocator, slot.value_ptr.serial, slot.value_ptr.*);
+            } else {
+                slot.value_ptr.deinit(self.allocator);
+            }
+        }
+        self.pool_serial_ctr += 1;
+        slot.value_ptr.* = .{ .serial = self.pool_serial_ctr };
+        try slot.value_ptr.bytes.resize(self.allocator, size);
+        return slot.value_ptr;
+    }
+
+    /// The pool a buffer reads from: the current holder of its pool
+    /// id when the incarnation matches, else the orphaned one.
+    fn poolFor(self: *Compositor, info: Buffer) ?*Pool {
+        if (self.pools.getPtr(info.pool)) |p| {
+            if (p.serial == info.pool_serial) return p;
+        }
+        return self.orphan_pools.getPtr(info.pool_serial);
+    }
+
+    /// Release one buffer reference against its pool incarnation,
+    /// reclaiming bytes when it was the last on a destroyed pool.
+    fn releaseBufferRef(self: *Compositor, info: Buffer) void {
+        if (self.pools.getPtr(info.pool)) |p| {
+            if (p.serial == info.pool_serial) {
+                if (p.buffers > 0) p.buffers -= 1;
+                if (p.destroyed and p.buffers == 0) {
+                    var pool = self.pools.fetchRemove(info.pool).?.value;
+                    pool.deinit(self.allocator);
+                }
+                return;
+            }
+        }
+        if (self.orphan_pools.getPtr(info.pool_serial)) |op| {
+            if (op.buffers > 0) op.buffers -= 1;
+            if (op.buffers == 0) {
+                var pool = self.orphan_pools.fetchRemove(info.pool_serial).?.value;
+                pool.deinit(self.allocator);
+            }
+        }
+    }
+
     pub fn deinit(self: *Compositor) void {
         const a = self.allocator;
         self.out.deinit(a);
@@ -549,6 +609,9 @@ pub const Compositor = struct {
         var pit = self.pools.valueIterator();
         while (pit.next()) |p| p.deinit(a);
         self.pools.deinit(a);
+        var opit = self.orphan_pools.valueIterator();
+        while (opit.next()) |p| p.deinit(a);
+        self.orphan_pools.deinit(a);
         self.vscratch.deinit(a);
         self.buffers.deinit(a);
         self.dmabuf_params.deinit(a);
@@ -1246,9 +1309,16 @@ pub const Compositor = struct {
                 };
             },
             .pool_create, .pool_resize => {
+                // In the live stream the wl_msg handler already
+                // installed the incarnation (this unit trails it);
+                // only the replay path (fresh replica, no wl_msg)
+                // creates pools here — give those a serial too.
                 const meta = pipe.decodePoolMeta(payload) orelse return Error.Protocol;
                 const slot = try self.pools.getOrPut(self.allocator, meta.pool);
-                if (!slot.found_existing) slot.value_ptr.* = .{};
+                if (!slot.found_existing) {
+                    self.pool_serial_ctr += 1;
+                    slot.value_ptr.* = .{ .serial = self.pool_serial_ctr };
+                }
                 try slot.value_ptr.bytes.resize(self.allocator, meta.size);
             },
             .pool_update => {
@@ -1302,11 +1372,19 @@ pub const Compositor = struct {
                 }
             },
             .pool_destroy => {
+                // Daemon reclaim notice. Respect the local refcount:
+                // if buffers still reference this incarnation (the
+                // daemon and replica should agree, but a stale notice
+                // must not strand them), defer to the last release.
                 if (payload.len >= 4) {
                     const id = std.mem.readInt(u32, payload[0..4], .little);
                     if (self.pools.getPtr(id)) |p| {
-                        p.bytes.deinit(self.allocator);
-                        _ = self.pools.remove(id);
+                        if (p.buffers == 0) {
+                            var pool = self.pools.fetchRemove(id).?.value;
+                            pool.deinit(self.allocator);
+                        } else {
+                            p.destroyed = true;
+                        }
                     }
                 }
             },
@@ -1475,13 +1553,9 @@ pub const Compositor = struct {
                 const size = (try it.next()).?.int;
                 if (size <= 0) return Error.Protocol;
                 try self.register(id, &protocol.wl_shm_pool);
-                const slot = try self.pools.getOrPut(self.allocator, id);
-                if (!slot.found_existing) slot.value_ptr.* = .{};
-                // Recycled id: the old pool's buffers can no longer
-                // resolve — start the lifecycle over.
-                slot.value_ptr.buffers = 0;
-                slot.value_ptr.destroyed = false;
-                try slot.value_ptr.bytes.resize(self.allocator, @intCast(size));
+                // Recycled id: old buffers keep resolving to the
+                // displaced incarnation via their serial.
+                _ = try self.freshPool(id, @intCast(size));
             },
             else => return Error.Protocol, // release is since-2; we advertise 1
         } else if (iface == &protocol.wl_shm_pool) switch (hdr.opcode) {
@@ -1498,6 +1572,11 @@ pub const Compositor = struct {
                 if (width <= 0 or height <= 0 or @as(i64, stride) < @as(i64, width) * 4 or offset < 0)
                     return Error.Protocol;
                 try self.register(id, &protocol.wl_buffer);
+                var serial: u64 = 0;
+                if (self.pools.getPtr(hdr.object)) |p| {
+                    p.buffers += 1;
+                    serial = p.serial;
+                }
                 try self.buffers.put(self.allocator, id, .{
                     .pool = hdr.object,
                     .offset = offset,
@@ -1505,8 +1584,8 @@ pub const Compositor = struct {
                     .height = height,
                     .stride = stride,
                     .format = format,
+                    .pool_serial = serial,
                 });
-                if (self.pools.getPtr(hdr.object)) |p| p.buffers += 1;
             },
             1 => { // destroy — bytes reclaim once no buffer references them
                 if (self.pools.getPtr(hdr.object)) |p| {
@@ -1525,19 +1604,22 @@ pub const Compositor = struct {
             // destroy — a dmabuf buffer also owns its synthetic pool
             // (pool id == buffer id); an shm buffer releases its pool
             // reference and reclaims a destroyed pool's bytes when it
-            // was the last one.
+            // was the last one. Both resolve by incarnation serial so
+            // a recycled pool id can't cross refcounts.
             if (self.buffers.fetchRemove(hdr.object)) |kv| {
                 if (kv.value.pool == hdr.object) {
-                    if (self.pools.fetchRemove(hdr.object)) |pkv| {
-                        var p = pkv.value;
-                        p.deinit(self.allocator);
+                    if (self.pools.getPtr(hdr.object)) |p| {
+                        if (p.serial == kv.value.pool_serial) {
+                            var pool = self.pools.fetchRemove(hdr.object).?.value;
+                            pool.deinit(self.allocator);
+                        } else {
+                            self.releaseBufferRef(kv.value);
+                        }
+                    } else {
+                        self.releaseBufferRef(kv.value);
                     }
-                } else if (self.pools.getPtr(kv.value.pool)) |p| {
-                    if (p.buffers > 0) p.buffers -= 1;
-                    if (p.destroyed and p.buffers == 0) {
-                        var pool = self.pools.fetchRemove(kv.value.pool).?.value;
-                        pool.deinit(self.allocator);
-                    }
+                } else {
+                    self.releaseBufferRef(kv.value);
                 }
             }
             try self.destroyObject(hdr.object);
@@ -1594,9 +1676,8 @@ pub const Compositor = struct {
                 // Synthetic pool, laid out exactly like the mapped
                 // dmabuf so the daemon's pool_update offsets line up.
                 const pool_size = @as(usize, p.offset) + @as(usize, p.stride) * @as(usize, @intCast(height));
-                const slot = try self.pools.getOrPut(self.allocator, id);
-                if (!slot.found_existing) slot.value_ptr.* = .{};
-                try slot.value_ptr.bytes.resize(self.allocator, pool_size);
+                const pool = try self.freshPool(id, pool_size);
+                pool.buffers = 1;
                 try self.buffers.put(self.allocator, id, .{
                     .pool = id,
                     .offset = @intCast(p.offset),
@@ -1604,6 +1685,7 @@ pub const Compositor = struct {
                     .height = height,
                     .stride = @intCast(p.stride),
                     .format = shm_format,
+                    .pool_serial = pool.serial,
                 });
             },
             else => return Error.Protocol,
@@ -2618,7 +2700,7 @@ pub const Compositor = struct {
     /// committed window-geometry rect rides along via toplevel_geometry.
     fn pushFrame(self: *Compositor, sid: u32, info: Buffer) Error!void {
         const cb = self.view.toplevel_frame orelse return;
-        const pool = self.pools.getPtr(info.pool) orelse return;
+        const pool = self.poolFor(info) orelse return;
         var scale: i32 = 1;
         var lw: i32 = info.width;
         var lh: i32 = info.height;
@@ -2856,7 +2938,12 @@ pub const Compositor = struct {
 
     // v2 appends the modern-protocol state (bind versions, relative
     // pointers, constraints, text inputs, primary devices, drag).
-    const state_sync_version: u8 = 3;
+    // v4 appends a per-buffer flag: 1 = the buffer references the
+    // CURRENT incarnation of its pool id (restored refcounts bind to
+    // it), 0 = it referenced a displaced incarnation whose bytes are
+    // not replayed (the buffer restores unresolvable, never frees a
+    // stranger's pool).
+    const state_sync_version: u8 = 4;
 
     fn putU8(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u8) Error!void {
         try out.append(a, v);
@@ -2957,6 +3044,8 @@ pub const Compositor = struct {
             try putI32(&out, a, b.height);
             try putI32(&out, a, b.stride);
             try putU32(&out, a, b.format);
+            const current = if (self.pools.get(b.pool)) |p| p.serial == b.pool_serial else false;
+            try putU8(&out, a, @intFromBool(current));
         }
 
         try putU32(&out, a, self.surfaces.count());
@@ -3175,21 +3264,32 @@ pub const Compositor = struct {
         const n_buf = try r.u32v();
         for (0..n_buf) |_| {
             const id = try r.u32v();
-            try self.buffers.put(a, id, .{
+            var b = Buffer{
                 .pool = try r.u32v(),
                 .offset = try r.i32v(),
                 .width = try r.i32v(),
                 .height = try r.i32v(),
                 .stride = try r.i32v(),
                 .format = try r.u32v(),
-            });
+            };
+            // v4: bind only current-incarnation buffers to the
+            // replayed pool; displaced ones restore unresolvable
+            // (their bytes weren't replayed). Pre-v4 senders never
+            // distinguished — treat all as current, as before.
+            const current = if (ver >= 4) (try r.u8v()) != 0 else true;
+            if (current) {
+                if (self.pools.getPtr(b.pool)) |p| b.pool_serial = p.serial;
+            }
+            try self.buffers.put(a, id, b);
         }
         // Recompute pool refcounts: the pools arrived via replayed
         // pool_create units with counts at 0, and freeing a pool
         // under a restored live buffer would drop its frames.
         var bit = self.buffers.valueIterator();
         while (bit.next()) |b| {
-            if (self.pools.getPtr(b.pool)) |p| p.buffers += 1;
+            if (self.pools.getPtr(b.pool)) |p| {
+                if (p.serial == b.pool_serial) p.buffers += 1;
+            }
         }
 
         const n_surf = try r.u32v();
@@ -6164,6 +6264,153 @@ test "shm pool bytes reclaim only after pool destroy AND last buffer destroy" {
         try req(&comp, try b.finish());
     }
     try t.expect(comp.pools.get(11) == null);
+    try t.expect(!comp.dead);
+}
+
+test "recycled pool id: old buffer's destroy must not reclaim the new incarnation (GTK4 Vulkan probe pools)" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 3);
+    try bindGlobal(&comp, 2, "wl_shm", 1, 4);
+    try bindGlobal(&comp, 5, "xdg_wm_base", 2, 5);
+
+    { // create_surface(6), get_xdg_surface(7), get_toplevel(8), map
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 5, 2);
+        b.putNewId(7);
+        b.putObject(6);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 7, 1);
+        b.putNewId(8);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 6, 6); // initial commit
+        try req(&comp, try b.finish());
+    }
+
+    // Probe pool (id 9) + probe buffer 10; pool destroyed at once —
+    // Vulkan WSI's format probing. Buffer 10 stays alive.
+    { // create_pool(9, fd, 16)
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(9);
+        b.putInt(16);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 9, 0); // create_buffer(10, 2x2)
+        b.putNewId(10);
+        b.putInt(0);
+        b.putInt(2);
+        b.putInt(2);
+        b.putInt(8);
+        b.putUint(1);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 9, 1); // pool destroy
+        try req(&comp, try b.finish());
+    }
+
+    // Client recycles id 9 for the real 4x4 swapchain pool.
+    { // create_pool(9, fd, 64) — recycled id
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(9);
+        b.putInt(64);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), comp.orphan_pools.count());
+    { // pool bytes via side-band update
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        var px: [64]u8 = undefined;
+        for (&px, 0..) |*p, i| p.* = @intCast((i + 200) & 0xff);
+        try pipe.appendPoolUpdate(&unit, t.allocator, 9, 0, &px);
+        try comp.feed(unit.items);
+    }
+    { // create_buffer(11, 4x4), pool destroy — swapchain steady state
+        var b = wire.Builder.init(&buf, 9, 0);
+        b.putNewId(11);
+        b.putInt(0);
+        b.putInt(4);
+        b.putInt(4);
+        b.putInt(16);
+        b.putUint(1);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 9, 1);
+        try req(&comp, try b.finish());
+    }
+
+    // THE regression: destroying the probe buffer released the NEW
+    // pool's refcount (same id) and reclaimed the swapchain bytes,
+    // so baobab's first frame silently vanished.
+    { // wl_buffer.destroy(10)
+        var b = wire.Builder.init(&buf, 10, 0);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 0), comp.orphan_pools.count());
+    try t.expect(comp.pools.get(9) != null);
+    try t.expectEqual(@as(usize, 64), comp.pools.get(9).?.bytes.items.len);
+
+    { // attach(11) + commit → the frame MUST reach the view
+        var b = wire.Builder.init(&buf, 6, 1);
+        b.putObject(11);
+        b.putInt(0);
+        b.putInt(0);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 6, 6);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.frames);
+    try t.expectEqual(@as(i32, 4), tv.last_w);
+    try t.expectEqual(@as(u8, 200), tv.last_pixels[0]);
+
+    // state_sync v4: the still-live buffer 11 binds to the replayed
+    // pool; a buffer referencing a displaced incarnation must not.
+    { // fresh orphan-referencing buffer: pool 12 + buffer 13, pool
+        // destroyed, id 12 recycled — buffer 13 now references the
+        // orphaned incarnation.
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(12);
+        b.putInt(16);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 12, 0);
+        b.putNewId(13);
+        b.putInt(0);
+        b.putInt(2);
+        b.putInt(2);
+        b.putInt(8);
+        b.putUint(1);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 12, 1);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(12);
+        b.putInt(16);
+        try req(&comp, try b.finish());
+    }
+    const blob = try comp.serializeState(t.allocator);
+    defer t.allocator.free(blob);
+
+    var rv = TestView{};
+    var replica = try Compositor.init(t.allocator, rv.view());
+    defer replica.deinit();
+    replica.lenient = true;
+    {
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(t.allocator);
+        try pipe.appendPoolMeta(&units, t.allocator, .pool_create, 9, 64);
+        try pipe.appendPoolMeta(&units, t.allocator, .pool_create, 12, 16);
+        try pipe.appendUnit(&units, t.allocator, .state_sync, blob);
+        try replica.feed(units.items);
+    }
+    // Buffer 11 bound to the replayed pool 9; buffer 13 unresolvable
+    // (its incarnation was displaced — it must not count against the
+    // current pool 12, and destroying it must not free pool 12).
+    try t.expectEqual(@as(u32, 1), replica.pools.get(9).?.buffers);
+    try t.expectEqual(replica.pools.get(9).?.serial, replica.buffers.get(11).?.pool_serial);
+    try t.expectEqual(@as(u32, 0), replica.pools.get(12).?.buffers);
+    try t.expectEqual(@as(u64, 0), replica.buffers.get(13).?.pool_serial);
     try t.expect(!comp.dead);
 }
 
