@@ -4267,7 +4267,9 @@ pub const Daemon = struct {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         const w = &aw.writer;
-        w.print("{{\"next_id\":{d},\"dropped\":{d},\"lines\":[", .{ ring.next_id, ring.dropped }) catch return;
+        w.print("{{\"next_id\":{d},\"dropped\":{d},\"markers_dropped\":{d},\"lines\":[", .{
+            ring.next_id, ring.dropped, ring.markers_dropped,
+        }) catch return;
         var first = true;
         for (items[start..end]) |l| {
             if (!first) w.writeAll(",") catch return;
@@ -4661,9 +4663,9 @@ pub const Daemon = struct {
         for (total_events.markers.items) |m| {
             for (self.clients.items) |cl| {
                 if (cl.attached == s and !cl.dead)
-                    cl.queueJson(.marker, .{ .id = m.id, .label = m.label, .t = total_events.wall_ms });
+                    cl.queueJson(.marker, .{ .id = m.id, .label = m.label, .t = total_events.wall_ms, .after = m.after });
             }
-            log.debug("marker #{d} '{s}' (session '{s}')", .{ m.id, m.label, s.name });
+            log.debug("marker #{d} '{s}' after={d} (session '{s}')", .{ m.id, m.label, m.after, s.name });
         }
         s.seq += n_events;
     }
@@ -4842,24 +4844,44 @@ const EventCollector = struct {
     /// attached clients and frees the labels.
     markers: std.ArrayList(Marker) = .empty,
 
-    const Marker = struct { id: u64, label: []u8 };
+    const Marker = struct { id: u64, label: []u8, after: u32 };
+
+    /// Hard bound on `+N` frame delays (a runaway value must not arm
+    /// a capture that effectively never fires).
+    const MAX_MARKER_AFTER: u32 = 600;
+    /// Pushed-label bound; the full label still lands in the ring
+    /// line (4KB line cap), this only caps the `.marker` frame.
+    const MAX_MARKER_LABEL: usize = 256;
 
     fn emit(user: ?*anyopaque, ev: Event) void {
         const self: *EventCollector = @ptrCast(@alignCast(user.?));
-        // sketerm marker escape (OSC 5522 ; label): private — swallowed
-        // rather than forwarded. It becomes a labelled log-ring line
-        // and a `.marker` push so viewers can stash a screenshot of
-        // "the app right now".
+        // sketerm marker escape: private — swallowed rather than
+        // forwarded. `OSC 5522;label` = a labelled log-ring line and a
+        // `.marker` push so viewers stash a screenshot of "the app
+        // right now"; `OSC 5522;+N;label` asks viewers to capture the
+        // Nth FUTURE commit instead. Admission is token-bucket gated
+        // (LogRing.admitMarker) so a cat'ed log full of these can't
+        // evict real lines or flood viewers with encode work.
         if (ev == .osc) {
             const bytes = ev.osc.bytes;
             if (std.mem.eql(u8, bytes, "5522") or std.mem.startsWith(u8, bytes, "5522;")) {
                 if (self.ring) |r| {
-                    const label = if (bytes.len > 5) bytes[5..] else "";
-                    const id = r.addMarker(label, self.wall_ms);
-                    if (self.allocator.dupe(u8, label)) |copy| {
-                        self.markers.append(self.allocator, .{ .id = id, .label = copy }) catch
-                            self.allocator.free(copy);
-                    } else |_| {}
+                    if (r.admitMarker(self.wall_ms)) {
+                        var label = if (bytes.len > 5) bytes[5..] else "";
+                        var after: u32 = 0;
+                        if (label.len > 1 and label[0] == '+') parse: {
+                            const semi = std.mem.indexOfScalar(u8, label, ';') orelse label.len;
+                            const n = std.fmt.parseInt(u32, label[1..semi], 10) catch break :parse;
+                            after = @min(n, MAX_MARKER_AFTER);
+                            label = if (semi < label.len) label[semi + 1 ..] else "";
+                        }
+                        const id = r.addMarker(label, self.wall_ms);
+                        const pushed = label[0..@min(label.len, MAX_MARKER_LABEL)];
+                        if (self.allocator.dupe(u8, pushed)) |copy| {
+                            self.markers.append(self.allocator, .{ .id = id, .label = copy, .after = after }) catch
+                                self.allocator.free(copy);
+                        } else |_| {}
+                    }
                 }
                 var mut = ev;
                 mut.deinit(self.allocator);
