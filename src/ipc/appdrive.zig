@@ -481,9 +481,18 @@ pub const App = struct {
         return true;
     }
 
-    /// Drain whatever is queued without blocking.
+    /// Drain whatever is queued without blocking — TIME-BOXED. A
+    /// flooding app (debug spam on its PTY) produces `.events` frames
+    /// at least as fast as we consume them, so an unbounded loop here
+    /// never returns and one wedged tool call stalls every MCP request
+    /// behind it. The daemon stops streaming events to a backlogged
+    /// client and resyncs it with a fresh snapshot once it drains, so
+    /// cutting out early loses nothing.
     pub fn drain(self: *App) void {
-        while (self.pumpOnce(0)) {}
+        const deadline = nowMs() + 100;
+        while (self.pumpOnce(0)) {
+            if (nowMs() >= deadline) break;
+        }
     }
 
     fn handleFrame(self: *App, ftype: wire.FrameType, payload: []const u8) void {
@@ -859,10 +868,14 @@ pub const App = struct {
         if (self.exited) return Error.NotConnected;
         self.conn.sendFrame(.app_a11y, payload) catch return Error.NotConnected;
         // The reply may take a moment (the daemon walks the bus).
+        // recvFrameFor, not recvFrame: a half-arrived frame from a
+        // stalled daemon must time out, not block forever.
         const deadline = nowMs() + timeout_ms;
         while (nowMs() < deadline) {
-            if (!pollIn(self.conn.fd, 100)) continue;
-            const f = self.conn.recvFrame() catch return Error.NotConnected;
+            const f = self.conn.recvFrameFor(100) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return Error.NotConnected,
+            };
             defer f.deinit(self.allocator);
             if (f.ftype == .app_a11y_tree)
                 return self.allocator.dupe(u8, f.payload) catch Error.OutOfMemory;
