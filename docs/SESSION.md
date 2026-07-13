@@ -7308,3 +7308,37 @@ E2E: MCP launch_app baobab returns a real window + screenshot
 isolated GUI's daemon spawned baobab and the GUI rendered it
 (wlapp/AppHost replica). Note for the field: the running packaged
 daemon still has the bug until reinstalled + restarted.
+
+## 2026-07-13 — SKETERM_MUX_LOG: the daemon finally has a voice
+
+Follow-up to the pool-incarnation fix: that bug was invisible because
+the daemon has no logging and its stderr goes nowhere when the GUI or
+MCP autostarts it. New `src/mux/log.zig` (libc-only, allocator-free,
+musl-clean; fork-inherits into workers, O_APPEND + [pid] prefix keeps
+the shared file readable):
+
+- default (env unset): lifecycle info + warnings to
+  $XDG_STATE_HOME/sketerm/mux.log, rotated at 2MB to one .old
+  generation; warnings still hit stderr as before.
+- SKETERM_MUX_LOG=debug (or 1): adds wlhost tracing — pool mirror
+  lifecycle (mapped/orphaned/reclaimed, incarnation serials) and
+  commit pixel-path TRANSITIONS (shipping / no-viewer / orphan-backed
+  / "commit resolves NO mirror" warn — the silent-black-window class
+  that was yesterday's bug).
+- =off/0: no file; =<path>: that file, debug level.
+
+Instrumented: daemon up/shutdown (mode+socket+version), worker fork,
+session spawn (kind, child pid, wl display, a11y on/off) and exit,
+client attach/detach (proto — a proto<5 attach explains "no app
+pixels" instantly), wayland channel open/close (viewer count), a11y
+hub setup failure (was silently null → empty app_a11y_tree), and the
+previously stderr-only warns (protocol kill, dmabuf mmap refusal,
+kb_layout, winstream init, pulse protocol error) now also land in the
+file.
+
+Verified: 704/710 tests (log.zig parseEnv), smoke-mux + smoke-mcp
+PASS, mux-portable + aarch64-macos cross OK, ldd unchanged (libc
+only). Live: debug-mode baobab launch writes the complete pool-
+recycle story (orphaning serial=1 ... freed on last buffer destroy
+... commit pixels: shipping); default mode logs lifecycle only;
+3MB pre-grown log rotates to .old on daemon start.
