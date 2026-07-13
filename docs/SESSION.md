@@ -7266,3 +7266,45 @@ viewer-attached-idle flat 15M, active screenshotting flat 16M with
 the frame hash updating (viewer stays current). 701/707 tests,
 smoke-mux (with the new leak guard) + smoke-mcp PASS, mux-portable +
 aarch64-macos cross OK.
+
+## 2026-07-13 — shm pool id recycling killed GTK4/Vulkan app windows
+
+Report: launching baobab (Disk Usage Analyzer) over `sketerm app`
+showed a window for an instant, then nothing — no error anywhere, and
+the baobab processes stayed alive on the host, connected to their
+session's Wayland socket.
+
+WAYLAND_DEBUG trace of a headless repro (MCP launch_app) showed the
+trigger: GTK 4.22 renders via Vulkan (lavapipe headless), and mesa's
+WSI creates four 256-byte probe pools (create_pool → create_buffer →
+pool.destroy), later recycling a freed pool id for the real 6MB
+swapchain pool. Every pool-refcount site keyed by pool ID:
+- daemon nv.pools: pool_create on a recycled id clobbered the old
+  mirror's refcount; the old probe buffer's later destroy then
+  decremented the NEW pool to zero and munmapped the swapchain mirror
+  (plus emitted a stale pool_destroy unit);
+- compositor.zig (brain + GUI/appdrive replicas): same flaw in the
+  wl_msg handlers, so replicas freed their byte copy independently.
+The app's one startup commit then resolved no pool anywhere:
+pushFrame returned silently, no toplevel_frame, no window — while the
+protocol stayed healthy (frame callbacks + presentation feedback keep
+answering), so the app never knew either.
+
+Fix (`1cddd8e`): every pool incarnation gets a serial (tracker
+assigns; BufferInfo/Buffer carry it). The current incarnation stays
+keyed by id; a displaced-but-referenced one moves to an orphan map
+keyed by serial and frees on its last buffer destroy. Commits ship
+pixel units only for current-incarnation buffers (units address pools
+by id; orphan-backed frames render from the replica's retained copy).
+state_sync v4 adds a per-buffer current-incarnation flag so a restore
+can't bind an old buffer to a recycled id's new pool (pre-v4 blobs
+read as before).
+
+Verified: 703/709 tests (2 new: tracker serials + a compositor replay
+of the exact baobab sequence incl. state_sync v4 round-trip),
+smoke-mux + smoke-mcp PASS, mux-portable + aarch64-macos cross OK.
+E2E: MCP launch_app baobab returns a real window + screenshot
+(Devices & Locations fully drawn); GUI path proven under Xvfb — an
+isolated GUI's daemon spawned baobab and the GUI rendered it
+(wlapp/AppHost replica). Note for the field: the running packaged
+daemon still has the bug until reinstalled + restarted.
