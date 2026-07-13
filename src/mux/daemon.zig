@@ -159,6 +159,9 @@ pub const SessionInfo = struct {
     /// if unavailable. Lets `list` show it and gives layout-save a cwd source
     /// for daemon-backed panes (which have no local pid).
     cwd: []const u8 = "",
+    /// The session child's pid ON THE DAEMON'S HOST (0 = unknown). For a
+    /// string-command spawn this is the wrapping `/bin/sh`, not the app.
+    pid: i32 = 0,
 };
 
 const Session = struct {
@@ -277,6 +280,9 @@ const Worker = struct {
     app: bool = false,
     n_clients: u32 = 0,
     last_activity_ms: i64 = 0,
+    /// The SESSION's child pid on this host (not the worker's own pid) —
+    /// carried in the 'Y' ready datagram so the spawn `.ok` can ship it.
+    child_pid: i32 = 0,
     /// Owned copies of the worker's last-pushed title / cwd (null = none yet).
     title: ?[]u8 = null,
     cwd: ?[]u8 = null,
@@ -304,6 +310,7 @@ const WorkerMeta = struct {
     exited: bool = false,
     app: bool = false,
     activity: i64 = 0,
+    child_pid: i32 = 0,
     title: []const u8 = "",
     cwd: []const u8 = "",
 };
@@ -1245,6 +1252,7 @@ pub const Daemon = struct {
         switch (buf[0]) {
             'Y' => {
                 w.ready = true;
+                if (n > 1) w.child_pid = std.fmt.parseInt(i32, buf[1..@intCast(n)], 10) catch 0;
                 self.replyPendingSpawn(w, true);
             },
             'E' => {
@@ -1267,6 +1275,7 @@ pub const Daemon = struct {
                 w.exited = m.exited;
                 w.app = m.app;
                 w.last_activity_ms = m.activity;
+                if (m.child_pid != 0) w.child_pid = m.child_pid;
                 if (self.allocator.dupe(u8, m.title)) |t| {
                     if (w.title) |old| self.allocator.free(old);
                     w.title = t;
@@ -1289,7 +1298,7 @@ pub const Daemon = struct {
         for (self.clients.items) |c2| {
             if (c2 == cl and !c2.dead) {
                 if (ok) {
-                    c2.queueJson(.ok, .{ .ok = true, .name = w.name });
+                    c2.queueJson(.ok, .{ .ok = true, .name = w.name, .pid = w.child_pid });
                 } else if (w.spawn_err) |reason| {
                     var ebuf: [192]u8 = undefined;
                     const msg = std.fmt.bufPrint(&ebuf, "spawn failed: {s}", .{reason}) catch "spawn failed";
@@ -1334,6 +1343,7 @@ pub const Daemon = struct {
             .exited = s.exited,
             .app = s.app,
             .activity = s.last_activity_ms,
+            .child_pid = s.pty.child_pid,
             // Bounded so one JSON datagram stays well under the broker's
             // recv buffer (a SOCK_SEQPACKET over-long datagram is truncated).
             .title = title[0..@min(title.len, 256)],
@@ -1439,7 +1449,11 @@ pub const Daemon = struct {
             return err;
         };
         try self.sessions.append(allocator, s);
-        controlSend(control_fd, "Y", -1);
+        // 'Y' carries the session's child pid so the deferred spawn
+        // `.ok` can hand callers a debugger-attachable handle.
+        var ybuf: [16]u8 = undefined;
+        const ymsg = std.fmt.bufPrint(&ybuf, "Y{d}", .{s.pty.child_pid}) catch "Y";
+        controlSend(control_fd, ymsg, -1);
         try self.run();
     }
 
@@ -3360,7 +3374,7 @@ pub const Daemon = struct {
             cl.queueErr("oom");
             return;
         };
-        cl.queueJson(.ok, .{ .ok = true, .name = s.name });
+        cl.queueJson(.ok, .{ .ok = true, .name = s.name, .pid = s.pty.child_pid });
     }
 
     fn brokerFindWorker(self: *Daemon, name: []const u8) ?*Worker {
@@ -3524,6 +3538,7 @@ pub const Daemon = struct {
                 // rather than a bogus multi-decade idle.
                 .idle_ms = if (w.last_activity_ms == 0) 0 else now - w.last_activity_ms,
                 .cwd = if (w.cwd) |cw| cw else "",
+                .pid = w.child_pid,
             }) catch return;
         }
         cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = build_options.audio_opus, .video = build_options.video, .sessions = infos.items });
@@ -4260,6 +4275,7 @@ pub const Daemon = struct {
                 .app = s.app,
                 .idle_ms = now - s.last_activity_ms,
                 .cwd = cwd,
+                .pid = s.pty.child_pid,
             }) catch return;
         }
         cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = build_options.audio_opus, .video = build_options.video, .sessions = infos.items });
