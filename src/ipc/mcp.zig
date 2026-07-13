@@ -322,6 +322,64 @@ fn sweepStaleEphemeral(allocator: std.mem.Allocator) void {
     }
 }
 
+/// Central hard timeout — ONE watchdog covering EVERY tool call, not
+/// per-tool special cases. If a call exceeds the cap, the watchdog
+/// shuts down all mux connection fds registered at call start; every
+/// bounded IO loop on them then errors within its own (much shorter)
+/// deadline, the call returns an error, and the server keeps serving.
+/// A backstop for wedges no per-path deadline anticipated — not a
+/// substitute for them. Affected app sessions surface as exited/
+/// disconnected afterwards: harsh, but strictly better than a hung
+/// server an agent can neither cancel nor distinguish from "slow".
+const Watchdog = struct {
+    /// Monotonic ms when the in-flight call started; 0 = idle. The
+    /// release-store in begin() publishes fds/fd_count (written only
+    /// while idle, so the watchdog never reads them concurrently).
+    var started_ms: std.atomic.Value(i64) = .init(0);
+    /// Conn fds snapshotted at call start. An fd closed AND reused
+    /// mid-call could be shut down wrongly, but a wedged main thread
+    /// cannot close fds, and normal calls finish far under the cap.
+    var fds: [128]c_int = undefined;
+    var fd_count: usize = 0;
+    var fired: bool = false;
+    var hard_ms: i64 = 150_000;
+
+    fn begin() void {
+        started_ms.store(0, .release);
+        fd_count = 0;
+        for (app_state.apps.values()) |a| addFd(a.conn.fd);
+        for (term_state.terms.values()) |t| addFd(t.conn.fd);
+        fired = false;
+        started_ms.store(monoMs(), .release);
+    }
+
+    fn addFd(fd: c_int) void {
+        if (fd_count < fds.len) {
+            fds[fd_count] = fd;
+            fd_count += 1;
+        }
+    }
+
+    fn end() void {
+        started_ms.store(0, .release);
+    }
+
+    fn loop() void {
+        while (true) {
+            var ts = c.struct_timespec{ .tv_sec = 1, .tv_nsec = 0 };
+            _ = c.nanosleep(&ts, null);
+            const started = started_ms.load(.acquire);
+            if (started != 0 and !fired and monoMs() - started > hard_ms) {
+                fired = true;
+                for (fds[0..fd_count]) |fd| _ = c.shutdown(fd, c.SHUT_RDWR);
+                // stderr only: mcp_log is main-thread-owned (its
+                // close at exit would race a note from this thread).
+                _ = c.fputs("sketerm mcp: tool call exceeded the hard timeout; mux connections aborted to unwedge it\n", platform.stderr());
+            }
+        }
+    }
+};
+
 var quit_flag: bool = false;
 
 fn onQuitSignal(_: c_int) callconv(.c) void {
@@ -436,6 +494,16 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
 
     installQuitSignals();
 
+    // Central hard timeout (SKETERM_MCP_HARD_TIMEOUT_MS overrides;
+    // min 30s so it always outlasts the per-path deadlines).
+    if (c.getenv("SKETERM_MCP_HARD_TIMEOUT_MS")) |v| {
+        const span = std.mem.span(@as([*:0]const u8, @ptrCast(v)));
+        if (std.fmt.parseInt(i64, span, 10)) |ms| {
+            Watchdog.hard_ms = @max(ms, 30_000);
+        } else |_| {}
+    }
+    if (std.Thread.spawn(.{}, Watchdog.loop, .{})) |t| t.detach() else |_| {}
+
     if (mcp_log) |*l| {
         var nbuf: [512]u8 = undefined;
         const note = std.fmt.bufPrint(&nbuf, "mcp server started: pid={d} mode={s} name={s} gui_socket={s}", .{
@@ -461,7 +529,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
 
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
+        Watchdog.begin();
         const reply = handleMessage(arena_state.allocator(), backend, line);
+        Watchdog.end();
+        if (Watchdog.fired) {
+            // Main-thread, post-call: safe to touch the trace log.
+            if (mcp_log) |*l| l.logNote("watchdog fired during the previous call: hard timeout exceeded, mux connections were aborted");
+        }
         if (reply) |r| {
             if (mcp_log) |*l| l.logMessage("out", r);
             _ = c.fwrite(r.ptr, 1, r.len, platform.stdout());
@@ -1180,6 +1254,22 @@ fn a11yNodeSummary(arena: std.mem.Allocator, node: std.json.Value) ![]const u8 {
     return aw.written();
 }
 
+/// Tools that inject input into / query a RUNNING app — pointless
+/// (or a dangling wait) once it exited.
+fn needsLiveApp(name: []const u8) bool {
+    const live = [_][]const u8{
+        "app_click",         "app_drag",          "app_type",
+        "app_key",           "app_scroll",        "app_resize",
+        "app_mouse_move",    "app_clipboard_get", "app_clipboard_set",
+        "app_perform_action", "app_set_value",    "app_wait_for_element",
+        "app_a11y_tree",     "app_record_start",  "close_app_window",
+    };
+    for (live) |l| {
+        if (std.mem.eql(u8, name, l)) return true;
+    }
+    return false;
+}
+
 /// First rendered non-popup window (0 = none yet).
 fn firstToplevelId(app: *appdrive.App) u32 {
     for (app.windows.items) |win| {
@@ -1336,6 +1426,18 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
     const app = appFromArgs(args) orelse
         return appErr(arena, "unknown app (pass 'app' from launch_app; use list_apps)");
     app.drain();
+
+    // "The app exited" is a NORMAL state, handled centrally: every
+    // interaction tool answers with the exit summary IMMEDIATELY
+    // (short-lived programs and observing crashes are routine).
+    // Observation tools (output/log/windows/screenshot/state/actions/
+    // wait/record_stop) handle exit themselves; close_app stays
+    // idempotent.
+    if (app.exited and needsLiveApp(name)) {
+        const summary = try appSummary(arena, app);
+        const msg = try std.fmt.allocPrint(arena, "the app has exited — {s} needs a running app\n{s}", .{ name, summary });
+        return toolResult(arena, msg, true) orelse error.OutOfMemory;
+    }
 
     if (eql(u8, name, "app_windows")) {
         const summary = try appSummary(arena, app);
@@ -2067,10 +2169,17 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         return toolResult(arena, "close requested (the app decides)", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "close_app")) {
+        // Idempotent: closing an already-dead app is a no-op success.
         const id = appIdOf(app);
+        const was_exited = app.exited;
+        const status = app.exit_status;
         _ = app_state.apps.swapRemove(id);
         app.deinit();
-        return toolResult(arena, "app session killed", false) orelse error.OutOfMemory;
+        const msg = if (was_exited)
+            try std.fmt.allocPrint(arena, "app session closed (the app had already exited with status {d})", .{status})
+        else
+            "app session killed";
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     return appErr(arena, "unknown tool");
 }

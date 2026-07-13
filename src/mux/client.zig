@@ -569,6 +569,11 @@ pub const Conn = struct {
     /// whole frame is there. A caller that only wants what is already queued must
     /// not be made to wait for a tail that may never come.
     pub fn fillAvailable(self: *Conn) bool {
+        // Byte budget: a peer that streams faster than we consume
+        // (video-playing app at full tilt) keeps the fd readable
+        // FOREVER — without a cap this loop never returns and the
+        // caller's own deadline (checked between calls) never fires.
+        var budget: usize = 4 << 20;
         while (true) {
             var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
             if (c.poll(&pfd, 1, 0) <= 0) return true;
@@ -578,6 +583,8 @@ pub const Conn = struct {
             if (n <= 0) return false;           // hung up
             self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]) catch return false;
             if (@as(usize, @intCast(n)) < tmp.len) return true;   // drained the socket
+            if (budget <= @as(usize, @intCast(n))) return true;   // cap hit; rest next pump
+            budget -= @intCast(n);
         }
     }
 
