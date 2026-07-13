@@ -7342,3 +7342,61 @@ only). Live: debug-mode baobab launch writes the complete pool-
 recycle story (orphaning serial=1 ... freed on last buffer destroy
 ... commit pixels: shipping); default mode logs lifecycle only;
 3MB pre-grown log rotates to .old on daemon start.
+
+## 2026-07-13 — MCP feedback round 3: flood wedge fix + observability batch
+
+Third round of assistant feedback on `sketerm mcp` (the cider session:
+"one noisy app killed the whole server"). Everything landed + verified
+end-to-end with scripted MCP stdio drivers against real apps.
+
+**The wedge (root-caused + fixed).** `CIDER_DEBUG_LEVEL=3` PTY spam:
+appdrive's `drain()` was `while (pumpOnce(0))` — unbounded, so it
+spins for as long as event production keeps pace with consumption
+(machine-load dependent; unreproducible on a fast idle box, which is
+why it looked intermittent). One wedged call serializes every later
+tool call behind the single-threaded stdio loop = the reported
+"everything hung 1800s". Fix is two-sided: drain() gets a 100ms
+budget, and the daemon stops streaming `.events` to any client whose
+wbuf exceeds 8MB (`Client.needs_resync`), resyncing with a fresh
+snapshot once it drains — so an idle MCP client under flood no longer
+races toward the 256MB reap either, and correctness is preserved via
+the snapshot-swap path both GUI and appdrive already had. The exit
+path pushes the resync snapshot BEFORE `.exit` (clients stop pumping
+after exit) so crash post-mortems see the final screen. Verified: yes-
+flood app, all tools < 2.2s, mux.log shows the backlog trip + resync,
+output content stays current.
+
+**launch_app/list_apps ship the pid.** Worker 'Y' ready datagram +
+WorkerMeta carry the session child pid; spawn `.ok` and `list` include
+it; appSummary prints it. argv-array commands exec directly (pid IS
+the app); string commands report the wrapping /bin/sh. Verified
+against /proc.
+
+**screenshot_app: stable_ms / stats_only / burst.** stable_ms =
+settle-then-capture (composes with wait_change); stats_only compares
+against a per-window pixel baseline and returns changed/diff_pct
+without encoding an image; burst=N captures up to 8 frames over
+burst_ms, each gated on min_change_pct vs the previous, returned as
+multiple inline images (`imagesResult`). Verified on weston-terminal:
+0.00% after shot, 0.53% after typing, 3 burst frames across an
+animating date loop, non-settle note on animation.
+
+**Indexed log ring + OSC 5522 markers (app_log).** New
+`src/mux/logring.zig` (pure std, musl-clean, 8 unit tests): per-
+session daemon-side ring of escape-free lines fed from parser events
+in drainSession — stable increasing ids, 4KB/line, 1000 lines/2MB
+drop-oldest with a counter. Gotcha found by the e2e test: PTY line
+endings are CRLF, so CR must mark a PENDING rewrite (resolved by the
+next byte) instead of clearing eagerly, or every line commits empty.
+`app_log`: numbered tail with relative ages ([+] = shortened), full
+line by id, dropped count. `OSC 5522;label` is swallowed by the
+daemon, becomes a labelled marker line + a `.marker` push; appdrive
+stashes a screenshot of the primary window at that instant (bounded
+ring of 8, baseline-neutral encode) and serves it inline via app_log
+{id}. Session exit pushes the final log (tail 300) ahead of `.exit`,
+so app_log keeps working post-mortem. Wire adds log_get=22,
+log_data=77, marker=78 (append-only).
+
+Verified: 712/718 unit tests, smoke-mux + smoke-mcp PASS,
+mux-portable OK, and four scripted end-to-end MCP drivers (flood,
+pid, screenshot trio, log/marker/post-mortem) all green.
