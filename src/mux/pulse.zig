@@ -5,11 +5,13 @@
 //! plus "audio units" toward the attached viewer (GUI), which plays
 //! them through ITS local audio stack.
 //!
-//! Scope: playback only, protocol v13 (every libpulse since 0.9.11
+//! Scope: playback only, protocol v15 (every libpulse since 0.9.15
 //! negotiates down to it; the version-gated reply layouts below match
-//! pulsecore/protocol-native.c exactly). SHM/memfd memblocks are
-//! REFUSED in the AUTH reply, so all sample data arrives inline on
-//! the socket — which is what can ride the mux wire.
+//! pulsecore/protocol-native.c exactly — v15 is the floor for the
+//! sink STATE field, which `pactl` shows and probes read). SHM/memfd
+//! memblocks are REFUSED in the AUTH reply, so all sample data
+//! arrives inline on the socket — which is what can ride the mux
+//! wire.
 //!
 //! Wire format notes (all BIG-endian, unlike everything else here):
 //! frames are a 20-byte descriptor (length, channel, offset hi/lo,
@@ -60,9 +62,13 @@ const ERR_NOENTITY = 5;
 const ERR_NOTSUPPORTED = 19;
 
 /// The version we negotiate down to (protocol-native.c reply layouts
-/// below are exact for it).
-pub const VERSION: u32 = 13;
+/// below are exact for it). 15 = the sink/source STATE field floor.
+pub const VERSION: u32 = 15;
 const VERSION_MASK: u32 = 0x0000_FFFF;
+
+/// pa_sink_state_t / pa_source_state_t (pulse/def.h).
+const STATE_RUNNING: u32 = 0;
+const STATE_IDLE: u32 = 1;
 
 const CONTROL_CHANNEL: u32 = 0xffff_ffff;
 const INVALID_INDEX: u32 = 0xffff_ffff;
@@ -189,6 +195,12 @@ const Tw = struct {
             var i: u8 = 0;
             while (i < channels) : (i += 1) try w.buf.append(w.a, 1 + i); // FL, FR, ...
         }
+    }
+    fn volume(w: *const Tw, v: u32) Error!void {
+        try w.buf.append(w.a, 'V');
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, v, .big);
+        try w.buf.appendSlice(w.a, &b);
     }
     fn cvolume(w: *const Tw, channels: u8, vol: u32) Error!void {
         try w.buf.append(w.a, 'v');
@@ -386,6 +398,11 @@ pub const Server = struct {
     /// applyUnit, and by tick). The self-clock pace source — the
     /// state machine never reads the OS clock itself.
     now_ms: i64 = 0,
+    /// Daemon-set: some OTHER connection in this session has active
+    /// playback. The v15 sink state is session-wide, but a Server
+    /// only sees its own connection's streams (pactl's own
+    /// connection never has any).
+    sink_running: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Server {
         return .{ .allocator = allocator };
@@ -673,6 +690,7 @@ pub const Server = struct {
                 // SDL3's ServerInfoCallback SIGSEGVd on our old NULL.
                 try t.str("sketerm.monitor");
                 try t.u32be(0x5EE7); // instance cookie
+                if (self.version >= 15) try t.channelMap(2); // default map
                 try self.finishFrame();
             },
             CMD_GET_SINK_INFO, CMD_GET_SINK_INFO_LIST => {
@@ -875,6 +893,15 @@ pub const Server = struct {
             _ = try r.boolean(); // adjust_latency
             try r.skipProplist();
         }
+        if (self.version >= 14) {
+            _ = try r.boolean(); // volume_set
+            _ = try r.boolean(); // early_requests
+        }
+        if (self.version >= 15) {
+            _ = try r.boolean(); // muted_set
+            _ = try r.boolean(); // dont_inhibit_auto_suspend
+            _ = try r.boolean(); // fail_on_suspend
+        }
 
         const frame_bytes: u32 = @max(@as(u32, ss.channels) * sampleSize(ss.format), 1);
         const bytes_per_sec: u64 = @as(u64, frame_bytes) * ss.rate;
@@ -942,6 +969,18 @@ pub const Server = struct {
         return s.gui_latency_us + (in_flight * 1_000_000) / bytes_per_sec;
     }
 
+    /// v15 sink/source state: RUNNING while any stream on this
+    /// connection is uncorked, or the daemon flagged playback on a
+    /// sibling connection of the same session.
+    fn sinkState(self: *const Server) u32 {
+        if (self.sink_running) return STATE_RUNNING;
+        var it = self.streams.valueIterator();
+        while (it.next()) |s| {
+            if (!s.corked) return STATE_RUNNING;
+        }
+        return STATE_IDLE;
+    }
+
     fn putSink(self: *Server, t: *const Tw) Error!void {
         try t.u32be(0); // index
         try t.str("sketerm");
@@ -959,6 +998,12 @@ pub const Server = struct {
         if (self.version >= 13) {
             try t.emptyProplist();
             try t.usec(20_000); // requested latency
+        }
+        if (self.version >= 15) {
+            try t.volume(0x10000); // base volume: norm
+            try t.u32be(self.sinkState());
+            try t.u32be(0x10000 + 1); // n_volume_steps (digital)
+            try t.u32be(INVALID_INDEX); // card
         }
     }
 
@@ -983,6 +1028,12 @@ pub const Server = struct {
         if (self.version >= 13) {
             try t.emptyProplist();
             try t.usec(20_000); // requested latency
+        }
+        if (self.version >= 15) {
+            try t.volume(0x10000); // base volume: norm
+            try t.u32be(self.sinkState()); // monitor mirrors the sink
+            try t.u32be(0x10000 + 1); // n_volume_steps
+            try t.u32be(INVALID_INDEX); // card
         }
     }
 
@@ -1138,6 +1189,11 @@ test "auth + client name + create stream + pcm flows to units" {
         try w.boolean(false); // muted
         try w.boolean(true); // adjust_latency
         try w.emptyProplist();
+        try w.boolean(false); // v14: volume_set
+        try w.boolean(false); // v14: early_requests
+        try w.boolean(false); // v15: muted_set
+        try w.boolean(false); // v15: dont_inhibit_auto_suspend
+        try w.boolean(false); // v15: fail_on_suspend
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(a);
         try clientFrame(a, &frame, fields.items);
@@ -1215,6 +1271,20 @@ fn peelControl(buf: []const u8) ?struct { command: u32, tag: u32, size: usize } 
     const command = r.u32be() catch return null;
     const tag = r.u32be() catch return null;
     return .{ .command = command, .tag = tag, .size = DESC_SIZE + len };
+}
+
+test "v15 sink state: IDLE empty, RUNNING with playback (own or sibling)" {
+    const a = t_.allocator;
+    var srv = Server.init(a);
+    defer srv.deinit();
+    try t_.expectEqual(STATE_IDLE, srv.sinkState());
+    srv.sink_running = true; // another connection in the session plays
+    try t_.expectEqual(STATE_RUNNING, srv.sinkState());
+    srv.sink_running = false;
+    try srv.streams.put(a, 0, .{ .corked = true });
+    try t_.expectEqual(STATE_IDLE, srv.sinkState());
+    srv.streams.getPtr(0).?.corked = false;
+    try t_.expectEqual(STATE_RUNNING, srv.sinkState());
 }
 
 test "self-clock paces read_index and REQUESTs on real time" {
@@ -1431,6 +1501,7 @@ test "server/sink/source/stat replies parse fully (SDL crash regression)" {
         try t_.expectEqualStrings("sketerm", (try r.str()).?); // default sink
         try t_.expectEqualStrings("sketerm.monitor", (try r.str()).?); // default source: NON-NULL
         _ = try r.u32be(); // cookie
+        _ = try r.channelMap(); // v15: default channel map (pactl info parse)
         try t_.expectEqual(r.buf.len, r.pos); // consumed exactly
         srv.clearOut();
     }
@@ -1461,6 +1532,15 @@ test "server/sink/source/stat replies parse fully (SDL crash regression)" {
         _ = try r.str(); // driver
         try t_.expectEqual(@as(u32, 0x0002), try r.u32be()); // flags
         try r.skipProplist();
+        _ = try r.tag(); // requested latency (usec)
+        _ = try r.rawU32();
+        _ = try r.rawU32();
+        try t_.expectEqual(@as(u8, 'V'), try r.tag()); // v15 base volume
+        _ = try r.rawU32();
+        try t_.expectEqual(STATE_IDLE, try r.u32be()); // v15 state
+        _ = try r.u32be(); // n_volume_steps
+        try t_.expectEqual(INVALID_INDEX, try r.u32be()); // card
+        try t_.expectEqual(r.buf.len, r.pos); // consumed exactly
         srv.clearOut();
     }
     { // STAT: five u32s (an empty reply broke pa_context_stat).

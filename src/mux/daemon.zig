@@ -18,6 +18,7 @@ const wire = @import("wire.zig");
 const wlwire = @import("../wlhost/wire.zig");
 const wltrack = @import("../wlhost/track.zig");
 const pulse = @import("pulse.zig");
+const wavcap = @import("wavcap.zig");
 const wlproto = @import("../wlhost/protocol.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
 const icons = @import("icons.zig");
@@ -104,6 +105,11 @@ pub const SpawnReq = struct {
     /// PULSE_SERVER stays unset, so clients fall back to their own
     /// null/dummy audio drivers instead of sketerm's sink.
     no_audio: bool = false,
+    /// Capture the session's audio to WAV on the DAEMON's host
+    /// (`launch_app audio_path`): path base — the first stream lands
+    /// at "<base>.wav", later ones at "<base>-N.wav". The sink still
+    /// paces/forwards normally; this only tees the PCM. "" = off.
+    audio_capture: []const u8 = "",
     /// GUI pane id + IPC socket to export into the child env as
     /// SKETERM_PANE_ID / SKETERM_SOCKET so `sketerm cli --pane self` works
     /// from inside a daemon-backed pane. The GUI passes its own values; they
@@ -229,6 +235,11 @@ const Session = struct {
     pa_hub_fd: c_int = -1,
     /// Owned audio socket path, unlinked on teardown.
     pa_socket_path: ?[]u8 = null,
+    /// Owned WAV-capture path base (SpawnReq.audio_capture). Non-null
+    /// = tee every stream's PCM to "<base>.wav" / "<base>-N.wav".
+    audio_capture_base: ?[]u8 = null,
+    /// Next capture-file ordinal (1 = plain "<base>.wav").
+    next_capture_id: u32 = 1,
     /// Isolated session (`sketerm app -i`): owned private runtime-dir
     /// path, recursively removed on teardown. null = not isolated.
     runtime_dir_path: ?[]u8 = null,
@@ -261,6 +272,7 @@ const Session = struct {
             if (pathZ(&z_buf, p)) |z| _ = c.unlink(z) else |_| {}
             self.allocator.free(p);
         }
+        if (self.audio_capture_base) |p| self.allocator.free(p);
         if (self.runtime_dir_path) |p| {
             removeTreeBestEffort(p);
             self.allocator.free(p);
@@ -491,6 +503,10 @@ const Channel = struct {
     /// Non-null on an audio channel: the app speaks the PulseAudio
     /// native protocol; the stream toward the GUI is pulse.zig units.
     pa: ?*pulse.Server = null,
+    /// Per-stream WAV capture (Session.audio_capture_base set):
+    /// stream index → live writer. Finalized here on teardown so the
+    /// RIFF sizes get patched even when the app never closed cleanly.
+    caps: std.AutoHashMapUnmanaged(u32, wavcap.Writer) = .empty,
 
     fn deinit(self: *Channel) void {
         if (self.native) |nv| nv.deinit();
@@ -498,6 +514,9 @@ const Channel = struct {
             srv.deinit();
             self.allocator.destroy(srv);
         }
+        var cap_it = self.caps.valueIterator();
+        while (cap_it.next()) |w| w.close();
+        self.caps.deinit(self.allocator);
         _ = c.close(self.fd);
         self.pending.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -2368,15 +2387,34 @@ pub const Daemon = struct {
 
     /// PA-app socket readable: feed the protocol server, replies go
     /// back to the app, PCM/stream units toward attached viewers.
+    /// Any OTHER audio connection of this session with an uncorked
+    /// stream — feeds the v15 sink STATE (a pactl connection has no
+    /// streams of its own but must still see the sink RUNNING).
+    fn sessionAudioRunning(self: *Daemon, s: *Session, except: *Channel) bool {
+        for (self.channels.items) |ch| {
+            if (ch == except or ch.dead or ch.session != s) continue;
+            const srv = ch.pa orelse continue;
+            var it = srv.streams.valueIterator();
+            while (it.next()) |st| {
+                if (!st.corked) return true;
+            }
+        }
+        return false;
+    }
+
     fn paReadable(self: *Daemon, ch: *Channel) void {
         const srv = ch.pa.?;
         srv.now_ms = nowMs(); // self-clock pace source
+        srv.sink_running = self.sessionAudioRunning(ch.session.?, ch);
         srv.has_viewer = false;
         srv.opus_wanted = false;
         for (self.clients.items) |cl| {
             if (!nativeViewer(cl, ch.session.?) or !cl.audio_ok) continue;
             srv.has_viewer = true;
-            if (cl.audio_opus) srv.opus_wanted = true;
+            // Opus units can't be captured (no decoder in the mux
+            // graph) — capture forces raw pcm units for everyone.
+            if (cl.audio_opus and ch.session.?.audio_capture_base == null)
+                srv.opus_wanted = true;
         }
         var buf: [64 * 1024]u8 = undefined;
         var rounds: u32 = 0;
@@ -2406,10 +2444,66 @@ pub const Daemon = struct {
         }
         const units = srv.takeUnits();
         if (units.len > 0) {
+            if (ch.session.?.audio_capture_base != null) self.captureUnits(ch, units);
             if (srv.has_viewer) self.queueUnits(ch, units);
             srv.clearUnits();
         }
         self.channelWritable(ch);
+    }
+
+    /// Tee this channel's audio units into per-stream WAV files
+    /// (Session.audio_capture_base). Open/close follow the stream
+    /// lifecycle; a stream that never closes is finalized by
+    /// Channel.deinit. Failures log once and drop that stream.
+    fn captureUnits(self: *Daemon, ch: *Channel, bytes: []const u8) void {
+        const s = ch.session.?;
+        const base = s.audio_capture_base orelse return;
+        var pos: usize = 0;
+        while (pulse.peelUnit(bytes[pos..])) |p| {
+            pos += p.consumed;
+            switch (p.tag) {
+                .open => {
+                    if (p.payload.len < 10) continue;
+                    const stream = std.mem.readInt(u32, p.payload[0..4], .little);
+                    if (ch.caps.contains(stream)) continue;
+                    const fmt = p.payload[4];
+                    const chans = p.payload[5];
+                    const rate = std.mem.readInt(u32, p.payload[6..10], .little);
+                    const stem = if (std.mem.endsWith(u8, base, ".wav")) base[0 .. base.len - 4] else base;
+                    const id = s.next_capture_id;
+                    var path_buf: [4096]u8 = undefined;
+                    const path = (if (id <= 1)
+                        std.fmt.bufPrintZ(&path_buf, "{s}.wav", .{stem})
+                    else
+                        std.fmt.bufPrintZ(&path_buf, "{s}-{d}.wav", .{ stem, id })) catch continue;
+                    const w = wavcap.Writer.open(path.ptr, fmt, chans, rate) orelse {
+                        log.warn("audio capture: cannot open '{s}' (or unmappable PA format {d}) — stream {d} not captured", .{ path, fmt, stream });
+                        continue;
+                    };
+                    ch.caps.put(self.allocator, stream, w) catch {
+                        var w2 = w;
+                        w2.close();
+                        continue;
+                    };
+                    s.next_capture_id = id + 1;
+                    log.info("audio capture: stream {d} ({d} Hz) -> {s}", .{ stream, rate, path });
+                },
+                .pcm => {
+                    if (p.payload.len <= 4) continue;
+                    const stream = std.mem.readInt(u32, p.payload[0..4], .little);
+                    if (ch.caps.getPtr(stream)) |w| w.write(p.payload[4..]);
+                },
+                .close => {
+                    if (p.payload.len < 4) continue;
+                    const stream = std.mem.readInt(u32, p.payload[0..4], .little);
+                    if (ch.caps.fetchRemove(stream)) |kv| {
+                        var w = kv.value;
+                        w.close();
+                    }
+                },
+                else => {},
+            }
+        }
     }
 
     /// Viewer → audio channel data (subscribe/consumed/latency).
@@ -2423,7 +2517,8 @@ pub const Daemon = struct {
                 srv.has_viewer = true;
                 // Flags byte (optional): bit0 = decodes Opus.
                 if (p.payload.len >= 1 and p.payload[0] & 1 != 0) cl.audio_opus = true;
-                srv.opus_wanted = srv.opus_wanted or cl.audio_opus;
+                if (ch.session.?.audio_capture_base == null)
+                    srv.opus_wanted = srv.opus_wanted or cl.audio_opus;
             } else {
                 srv.applyUnit(p.tag, p.payload) catch {};
             }
@@ -4017,6 +4112,10 @@ pub const Daemon = struct {
             s.pa_socket_path = h.display_path;
             audio_hub = null; // ownership moved to the session
         }
+        // WAV capture rides the hub: without one no PCM ever reaches
+        // the daemon, so silently dropping the request would lie.
+        if (req.audio_capture.len > 0 and s.pa_hub_fd >= 0)
+            s.audio_capture_base = allocator.dupe(u8, req.audio_capture) catch null;
         if (rt_dir_owned) |p| {
             s.runtime_dir_path = p;
             rt_dir_owned = null; // ownership moved to the session

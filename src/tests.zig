@@ -64,6 +64,7 @@ comptime {
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");
     _ = @import("mux/pulse.zig");
+    _ = @import("mux/wavcap.zig");
     _ = @import("mux/opuscodec.zig");
     _ = @import("mux/snapshot.zig");
     _ = @import("mux/desktop.zig");
