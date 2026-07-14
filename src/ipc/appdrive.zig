@@ -160,6 +160,10 @@ pub const Window = struct {
     app_id: ?[]u8 = null,
     popup: bool = false,
     frames: u64 = 0,
+    /// Monotonic ms of the last committed frame — ranks the "primary
+    /// content" window (a game's render surface keeps painting while
+    /// its frame window sits static).
+    last_commit_ms: i64 = 0,
     /// `frames` at the last screenshot of this window — lets a
     /// wait-for-change screenshot block until content actually differs
     /// from what the caller last saw.
@@ -938,6 +942,7 @@ pub const App = struct {
         win.pixels.clearRetainingCapacity();
         win.pixels.appendSlice(ch.app.allocator, pixels) catch {};
         win.frames += 1;
+        win.last_commit_ms = nowMs();
         ch.app.frame_seq += 1;
         ch.app.tickPendingMarkers(win);
         if (win.id == ch.app.rec_win and w > 0 and h > 0) {
@@ -1579,16 +1584,19 @@ pub const App = struct {
 
     /// Pump until this window has committed a frame NEWER than its
     /// last screenshot (bounded). True when new content arrived.
-    pub fn waitWindowChange(self: *App, win_id: u32, timeout_ms: i64) bool {
+    /// `min_pct > 0` additionally requires that many % of pixels to
+    /// differ from the screenshot baseline — a 60Hz software cursor
+    /// or blinking caret no longer counts as change. No baseline yet
+    /// (never screenshotted) counts as 100% different.
+    pub fn waitWindowChange(self: *App, win_id: u32, timeout_ms: i64, min_pct: f64) bool {
         const deadline = nowMs() + timeout_ms;
-        while (nowMs() < deadline) {
+        while (true) {
             const win = self.winById(win_id) orelse return false;
-            if (win.frames != win.shot_frames) return true;
-            if (self.exited) return false;
+            if (win.frames != win.shot_frames and
+                (min_pct <= 0 or win.pctVsBaseline() >= min_pct)) return true;
+            if (self.exited or nowMs() >= deadline) return false;
             _ = self.pumpOnce(25);
         }
-        const win = self.winById(win_id) orelse return false;
-        return win.frames != win.shot_frames;
     }
 
     /// Pump until the window has committed NO new frame for

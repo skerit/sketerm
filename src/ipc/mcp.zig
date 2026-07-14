@@ -852,12 +852,12 @@ const TOOLS_JSON_RAW =
     \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns the app id, the child pid on the daemon's host (attach a debugger with gdb -p; with a string command the pid is the wrapping /bin/sh — pass an argv array to make it the app itself), its windows AND the first window's screenshot inline (launch-and-look in one call). If the app exits early, the reply includes exit status, terminating signal and its recent output. Drive it with get_app_state/app_click/app_type/app_key; read its stdout/stderr with app_output.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"cwd":{"type":"string","description":"Working directory for the app"},"env":{"type":"object","description":"Extra environment variables, e.g. {\"FOO\":\"1\"}","additionalProperties":{"type":"string"}},"wait_for":{"type":"string","enum":["window","exit"],"description":"What to wait for before replying: first window (default) or process exit (short-lived/CLI runs)"},"wait_ms":{"type":"integer","description":"Max wait (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"},"layout":{"type":"string","description":"Session keyboard layout: us (default), gb, fr, be, de"},"gpu":{"type":"boolean","description":"Render on the host's real GPU via linux-dmabuf instead of software GL. Needs a driver whose linear buffers allow CPU mmap."},"audio":{"type":"string","enum":["forward","none"],"description":"forward (default): PULSE_SERVER points at sketerm's per-session audio sink, which paces playback in real time (samples are discarded unless a GUI viewer is attached). none: no PULSE_SERVER, so the app falls back to its own dummy/null audio driver."},"audio_path":{"type":"string","description":"Capture the app's audio to WAV at this absolute path base ON THE DAEMON'S HOST (first stream: <base>.wav, later streams: <base>-N.wav; a trailing .wav in the base is stripped). Playback pacing is unaffected — this tees the PCM the sink consumes, so you can verify the app actually produced sound. Incompatible with audio:\"none\"."},"debug":{"type":"string","enum":["gdb","valgrind"],"description":"Run the app under a debug wrapper: gdb (batch mode — on a crash the full backtrace + registers land in app_log) or valgrind (report in app_log at exit). The reported pid is the wrapper's."}},"required":["command"]}},
     \\{"name":"list_apps","description":"List launched headless apps and their windows.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"app_windows","description":"List one app's rendered windows (ids, sizes, titles).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
-    \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Optional region crop and integer zoom for pixel-level inspection; downscaled when larger than max_px. The caption tells you how to map image coordinates back to app_click coordinates. wait_change=true blocks until the window renders something NEWER than your last screenshot (verify a click did something); stable_ms waits until repainting stops before capturing (settle-then-capture — combine both to catch 'changed, then went quiet'). stats_only=true skips the image and just reports whether/how much the window changed since your last look (cheap polling). burst=N captures up to N frames over burst_ms, each at least min_change_pct different from the previous — one call across an animated transition.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"},"region":{"type":"object","description":"Crop to a sub-rectangle in surface pixels","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer","description":"Nearest-neighbor integer upscale (1-32) — crop a small region and zoom to inspect pixels"},"wait_change":{"type":"boolean","description":"Wait until the window content changed since the last screenshot before capturing"},"stable_ms":{"type":"integer","description":"Capture only after the window committed no new frame for this long (settle-then-capture)"},"stats_only":{"type":"boolean","description":"Return {changed, diff_pct, resized, w, h, frames} instead of an image"},"burst":{"type":"integer","description":"Capture up to N distinct frames (2-8) over burst_ms"},"burst_ms":{"type":"integer","description":"Burst time window (default 5000)"},"min_change_pct":{"type":"number","description":"Minimum %% of pixels changed vs the previous burst frame (default 1.0)"},"timeout_ms":{"type":"integer","description":"Bound for wait_change/stable_ms (default 10000)"}}}},
-    \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app. If the app exited, reports exit status, signal and recent output instead. Accepts the same region/zoom/wait_change/stable_ms/stats_only/burst options as screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer"},"wait_change":{"type":"boolean"},"stable_ms":{"type":"integer"},"stats_only":{"type":"boolean"},"burst":{"type":"integer"},"burst_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Optional region crop and integer zoom for pixel-level inspection; downscaled when larger than max_px. The caption tells you how to map image coordinates back to app_click coordinates. wait_change=true blocks until the window renders something NEWER than your last screenshot (verify a click did something); stable_ms waits until repainting stops before capturing (settle-then-capture — combine both to catch 'changed, then went quiet'). stats_only=true skips the image and just reports whether/how much the window changed since your last look (cheap polling). burst=N captures up to N frames over burst_ms, each at least min_change_pct different from the previous — one call across an animated transition.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"},"region":{"type":"object","description":"Crop to a sub-rectangle in surface pixels","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer","description":"Nearest-neighbor integer upscale (1-32) — crop a small region and zoom to inspect pixels"},"wait_change":{"type":"boolean","description":"Wait until the window content changed since the last screenshot before capturing. Combine with min_change_pct to ignore trivial repaints (a software cursor)."},"stable_ms":{"type":"integer","description":"Capture only after the window committed no new frame for this long (settle-then-capture). With min_change_pct set, frames changing less than that %% don't reset the timer (VISUAL settle — works on continuously-animating apps)."},"stats_only":{"type":"boolean","description":"Return {changed, diff_pct, resized, w, h, frames} instead of an image"},"burst":{"type":"integer","description":"Capture up to N distinct frames (2-8) over burst_ms"},"burst_ms":{"type":"integer","description":"Burst time window (default 5000)"},"min_change_pct":{"type":"number","description":"Pixel-change threshold (%%): burst frames must differ this much from the previous one (default 1.0), and when set it also gates wait_change and turns stable_ms into a visual settle (default 0 = any repaint counts)"},"timeout_ms":{"type":"integer","description":"Bound for wait_change/stable_ms (default 10000)"}}}},
+    \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app. If the app exited, reports exit status, signal and recent output instead. Accepts the same region/zoom/wait_change/stable_ms/stats_only/burst options as screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"max_px":{"type":"integer"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer"},"wait_change":{"type":"boolean"},"stable_ms":{"type":"integer"},"stats_only":{"type":"boolean"},"burst":{"type":"integer"},"burst_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as RENDERED BY A TERMINAL — a fixed-width grid, so long lines wrap and scrolled-off content needs scrollback=true; right for TUI-style redraws). For log-style output app_log is the SOURCE OF TRUTH: indexed unwrapped lines with stable ids, re-readable in full — prefer it. When the grid mirror is blank after an exit, the log ring's last lines are served instead. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
     \\{"name":"app_log","description":"A headless app's stdout/stderr as an INDEXED LOG: each complete line gets a stable numeric id and a timestamp; the tail view shortens long lines (marked [+]) and any line can be re-read in full by id. The ring is bounded (oldest lines drop; the reply says how many). MARKERS: the app (or your injected code) can emit the escape  printf '\\033]5522;my-label\\033\\\\'  — it becomes a labelled log line AND sketerm stashes a screenshot of the app window at that exact instant; fetch label+image with {\"id\":<that line's id>}. Variant printf '\\033]5522;+N;my-label\\033\\\\' captures the Nth FUTURE frame commit instead (e.g. +1 = the next repaint after this point; resolved with the final frame if the app exits first). Markers are rate-limited (burst 8, then 2/s; excess are dropped and counted) so escape-laden files cat'ed to the terminal cannot flood the log. Survives app exit: the final log is delivered with the exit.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"tail":{"type":"integer","description":"Last N lines (default 60, max 500)"},"from_id":{"type":"integer","description":"Return lines starting at this id instead of the tail"},"id":{"type":"integer","description":"Return ONE line in full; for a marker line also returns the stashed screenshot"}}}},
     \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right. mark=true returns a post-click screenshot with a crosshair drawn at the exact click pixel — see where the click landed relative to the UI AND what it did, in one image; screenshot=true returns the post-click frame without the marker.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"},"mark":{"type":"boolean","description":"Return a post-click screenshot with a crosshair marker at the click point"},"screenshot":{"type":"boolean","description":"Return a post-click screenshot (no marker)"},"max_px":{"type":"integer","description":"Bound on the screenshot's longest dimension (default 1568)"}},"required":["window","x","y"]}},
-    \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} (MILLISECONDS, max 30000) | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} (with change_pct = VISUAL settle: blocks until frames change less than that %% — use for scene transitions of unknown duration instead of guessing a fixed wait) | {\"wait_change\":timeout_ms} | {\"screenshot\":true or {\"max_px\":N}}. MARKERS: add \"mark\":true to a click/move/move_rel/drag/scroll step to draw a labelled crosshair at that step's position (red = click, cyan = move; the number is the step index) onto the NEXT screenshot — several marked steps can share one image. Combine in one step: {\"click\":[x,y],\"mark\":true,\"screenshot\":true} captures the post-click frame with the click point marked. Leftover marks with no later screenshot are flushed as a final image automatically. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
+    \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} (MILLISECONDS, max 30000) | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} (with change_pct = VISUAL settle: blocks until frames change less than that %% — use for scene transitions of unknown duration instead of guessing a fixed wait) | {\"wait_change\":timeout_ms or {\"timeout_ms\":N,\"min_change_pct\":P}} (P = ignore repaints below that %% of pixels) | {\"screenshot\":true or {\"max_px\":N}}. MARKERS: add \"mark\":true to a click/move/move_rel/drag/scroll step to draw a labelled crosshair at that step's position (red = click, cyan = move; the number is the step index) onto the NEXT screenshot — several marked steps can share one image. Combine in one step: {\"click\":[x,y],\"mark\":true,\"screenshot\":true} captures the post-click frame with the click point marked. Leftover marks with no later screenshot are flushed as a final image automatically. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
     \\{"name":"app_mouse_move","description":"Move the pointer in an app window WITHOUT clicking. Absolute: x,y in surface pixels (hover a widget, position before a click). Relative: dx,dy — a delta from the current pointer position, for apps that consume RELATIVE mouse motion (SDL games, DOSBox, anything with pointer-lock): sketerm derives relative_motion events from the move, so the app's own cursor moves by exactly your delta. Calibration for such apps: one large negative move (e.g. dx:-30000, dy:-30000) slams their internal cursor to the top-left corner, after which exact deltas land where you aim. With neither x/y nor dx/dy it just returns the tracked pointer position.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = window under the pointer, else first toplevel)"},"x":{"type":"number","description":"Absolute surface x (with y)"},"y":{"type":"number"},"dx":{"type":"number","description":"Relative delta x (with dy; exclusive with x/y)"},"dy":{"type":"number"}}}},
     \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
     \\{"name":"app_set_value","description":"Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value). Faster and more reliable than typing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}},
@@ -869,7 +869,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_key","description":"Press key chords in an app window: space-separated, e.g. 'ctrl+s', 'enter', 'alt+F4', 'down down enter'.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
     \\{"name":"app_scroll","description":"Scroll inside an app window. dy>0 scrolls down, dx>0 right (wheel steps).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"}},"required":["window"]}},
     \\{"name":"app_resize","description":"Ask an app window to redraw at a new size (deterministic screenshots).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["window","w","h"]}},
-    \\{"name":"app_wait","description":"Wait until an app stopped producing new frames for quiet_ms (render quiescence), or — pass change_pct — until each new frame changes less than that percentage of pixels for quiet_ms (VISUAL quiescence: use this for games and other continuously-animating apps, which never stop committing frames but do reach a visually stable screen). Reports which outcome happened and returns the window list.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window for change_pct pixel diffing (omit = first toplevel)"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"},"change_pct":{"type":"number","description":"Settle when frames change less than this %% of pixels (e.g. 2). Omit = strict no-new-frames quiescence"}}}},
+    \\{"name":"app_wait","description":"Wait until an app stopped producing new frames for quiet_ms (render quiescence), or — pass change_pct — until each new frame changes less than that percentage of pixels for quiet_ms (VISUAL quiescence: use this for games and other continuously-animating apps, which never stop committing frames but do reach a visually stable screen). Reports which outcome happened and returns the window list.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window for change_pct pixel diffing (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"},"change_pct":{"type":"number","description":"Settle when frames change less than this %% of pixels (e.g. 2). Omit = strict no-new-frames quiescence"}}}},
     \\{"name":"app_a11y_tree","description":"Read the app's accessibility (AT-SPI) tree as JSON: every widget's role, name, description, states and screen rectangle. Target elements by name/role instead of pixel-hunting a screenshot. Works for GTK/Qt apps; empty for apps without accessibility (games, some Electron).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"app_record_start","description":"Start recording a window's frames (a visual log of what you do). Default format is WebM/VP9 (smaller, higher quality); pass format:\"gif\" for an animated GIF. Frames are captured while other app tools run; finish with app_record_stop.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"format":{"type":"string","enum":["webm","gif"],"description":"Default webm"},"max_px":{"type":"integer","description":"Bound on the longest dimension (default 1280 webm / 800 gif)"},"fps":{"type":"integer","description":"Cap the capture rate (frames/second, 1-60; default = every committed frame)"}}}},
     \\{"name":"app_record_stop","description":"Stop the recording and save it (WebM or GIF per app_record_start). Returns the file path and frame count.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"path":{"type":"string","description":"Output path (extension set automatically if omitted)"}}}},
@@ -1244,11 +1244,15 @@ fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
     }
     try w.writeAll(",\"windows\":[");
     var first = true;
+    const primary_id = firstToplevelId(app);
     for (app.windows.items) |win| {
         if (win.frames == 0) continue;
         if (!first) try w.writeAll(",");
         first = false;
-        try w.print("{{\"window\":{d},\"w\":{d},\"h\":{d},\"scale\":{d}", .{ win.id, win.w, win.h, win.scale });
+        try w.print("{{\"window\":{d},\"w\":{d},\"h\":{d},\"scale\":{d},\"frames\":{d}", .{ win.id, win.w, win.h, win.scale, win.frames });
+        // The default target for window-less tool calls: the most
+        // recently painted non-popup toplevel (see firstToplevelId).
+        if (win.id == primary_id) try w.writeAll(",\"primary\":true");
         if (win.popup) try w.writeAll(",\"popup\":true");
         if (win.title) |t| {
             try w.writeAll(",\"title\":");
@@ -1416,12 +1420,25 @@ fn needsLiveApp(name: []const u8) bool {
     return false;
 }
 
-/// First rendered non-popup window (0 = none yet).
+/// The PRIMARY content window (0 = none rendered yet): among painted
+/// non-popup windows, the most recently committed one — a game keeps
+/// painting its render surface while its outer frame window sits
+/// static. Commits within 1s of each other tie; larger area wins the
+/// tie, so a multi-window app at rest still yields its main window.
 fn firstToplevelId(app: *appdrive.App) u32 {
+    var best: ?*appdrive.Window = null;
     for (app.windows.items) |win| {
-        if (!win.popup and win.frames > 0) return win.id;
+        if (win.popup or win.frames == 0) continue;
+        const b = best orelse {
+            best = win;
+            continue;
+        };
+        const newer = win.last_commit_ms > b.last_commit_ms + 1000;
+        const older = win.last_commit_ms + 1000 < b.last_commit_ms;
+        const bigger = @as(i64, win.w) * win.h > @as(i64, b.w) * b.h;
+        if (newer or (!older and bigger)) best = win;
     }
-    return 0;
+    return if (best) |b| b.id else 0;
 }
 
 /// Fixed-length array of numbers out of a JSON value ([x,y], …).
@@ -1789,12 +1806,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         if (argInt(args, "window")) |v| {
             win_id = @intCast(v);
         } else {
-            for (app.windows.items) |win| {
-                if (!win.popup and win.frames > 0) {
-                    win_id = win.id;
-                    break;
-                }
-            }
+            win_id = firstToplevelId(app);
         }
         if (win_id == 0) {
             // "No window" and "the app died" are different answers —
@@ -1807,18 +1819,30 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             return appErr(arena, "no rendered window yet (try app_wait first)");
         }
         const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
+        // min_change_pct also thresholds wait_change/stable_ms so
+        // continuously-animating apps (a 60Hz software cursor) can
+        // still signal/settle on CONTENT changes. Burst reads its own
+        // copy below (different default).
+        const wait_min_pct: f64 = argFloat(args, "min_change_pct") orelse 0;
         if (argBool(args, "wait_change")) {
             // Block (bounded) until the window commits a frame newer
             // than its last screenshot — "did my click do anything".
-            if (!app.waitWindowChange(win_id, timeout_ms))
+            if (!app.waitWindowChange(win_id, timeout_ms, wait_min_pct))
                 return appErr(arena, "window content did not change before the timeout");
         }
         var settle_note: []const u8 = "";
         if (argInt(args, "stable_ms")) |sm| {
             // Settle-then-capture: wait until the window stops
             // repainting before shooting (composes with wait_change:
-            // "changed, then went quiet").
-            if (sm > 0 and !app.waitWindowSettle(win_id, sm, timeout_ms))
+            // "changed, then went quiet"). With a threshold this is
+            // VISUAL settle: sub-threshold repaints don't reset it.
+            const settled = if (sm <= 0)
+                true
+            else if (wait_min_pct > 0)
+                app.waitVisualSettle(win_id, sm, timeout_ms, wait_min_pct)
+            else
+                app.waitWindowSettle(win_id, sm, timeout_ms);
+            if (!settled)
                 settle_note = "\n[note: frames were still arriving at timeout_ms — captured anyway]";
         }
         if (argBool(args, "stats_only")) {
@@ -2176,9 +2200,16 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                 }
                 try w.print("step {d}: wait_idle — {s}\n", .{ n, if (settled) "settled" else "timeout (still rendering)" });
             } else if (st.object.get("wait_change")) |wv| {
-                const timeout_ms: i64 = if (wv == .integer) wv.integer else 10_000;
+                var timeout_ms: i64 = 10_000;
+                var min_pct: f64 = 0;
+                if (wv == .integer) {
+                    timeout_ms = wv.integer;
+                } else if (wv == .object) {
+                    if (argInt(wv, "timeout_ms")) |t| timeout_ms = t;
+                    if (argFloat(wv, "min_change_pct")) |p| min_pct = p;
+                }
                 const wid = win_step orelse firstToplevelId(app);
-                const changed = if (wid == 0) false else app.waitWindowChange(wid, timeout_ms);
+                const changed = if (wid == 0) false else app.waitWindowChange(wid, timeout_ms, min_pct);
                 try w.print("step {d}: wait_change — {s}\n", .{ n, if (changed) "content changed" else "no change before timeout" });
             } else if (st.object.get("screenshot")) |sv| {
                 const wid = win_step orelse firstToplevelId(app);
@@ -2414,12 +2445,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         if (argInt(args, "window")) |v| {
             win_id = @intCast(v);
         } else {
-            for (app.windows.items) |win| {
-                if (!win.popup and win.frames > 0) {
-                    win_id = win.id;
-                    break;
-                }
-            }
+            win_id = firstToplevelId(app);
         }
         if (win_id == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
         // WebM/VP9 is the default (smaller, higher quality); format:"gif"
