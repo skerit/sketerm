@@ -223,8 +223,9 @@ pub const App = struct {
     conn: muxclient.Conn,
     name: []u8,
     chans: std.AutoArrayHashMapUnmanaged(u32, *Chan) = .empty,
-    /// Audio channels: headless — no playback, but the consumed
-    /// clock must keep ticking or the app blocks on a full sink.
+    /// Audio channels (tracked to discard stray data). Headless: we
+    /// never subscribe, so the daemon's real-time self-clock paces
+    /// the app's playback (samples discarded on schedule).
     audio_ids: std.AutoHashMapUnmanaged(u32, void) = .empty,
     windows: std.ArrayList(*Window) = .empty,
     next_win_id: u32 = 1,
@@ -319,6 +320,9 @@ pub const App = struct {
         kb_layout: ?[]const u8 = null,
         local_sock: ?[]const u8 = null,
         gpu: bool = false,
+        /// Skip the session's PulseAudio hub: PULSE_SERVER stays
+        /// unset and the app falls back to its own dummy driver.
+        no_audio: bool = false,
         cwd: ?[]const u8 = null,
         /// "KEY=VALUE" strings for the child environment.
         env: []const []const u8 = &.{},
@@ -378,6 +382,7 @@ pub const App = struct {
             .app = true,
             .kb_layout = layout_name,
             .gpu = opts.gpu,
+            .no_audio = opts.no_audio,
             .cwd = opts.cwd,
             .env = opts.env,
         }) catch return Error.SpawnFailed;
@@ -622,13 +627,14 @@ pub const App = struct {
             .chan_open => {
                 const open = wire.decodeChanOpen(payload) orelse return;
                 if (open.kind == .audio) {
+                    // Deliberately NOT subscribed: we can't play PCM,
+                    // and consuming it here would out-clock the
+                    // daemon's real-time sink pacing (mux/pulse.zig
+                    // self-clock) — the exact accept-everything-
+                    // instantly black hole that hung apps gating
+                    // logic on audio progress. Unsubscribed, no PCM
+                    // is shipped and the daemon paces the app itself.
                     self.audio_ids.put(self.allocator, open.id, {}) catch {};
-                    // Subscribe: we drain PCM (instant-consume clock).
-                    const pulse = @import("../mux/pulse.zig");
-                    var units: std.ArrayList(u8) = .empty;
-                    defer units.deinit(self.allocator);
-                    pulse.appendUnit(&units, self.allocator, .subscribe, "") catch return;
-                    self.sendIntents(open.id, units.items) catch {};
                     return;
                 }
                 if (open.kind != .wayland_native) return;
@@ -667,10 +673,7 @@ pub const App = struct {
             },
             .chan_data => {
                 const id = wire.decodeChanId(payload) orelse return;
-                if (self.audio_ids.contains(id)) {
-                    self.drainAudio(id, payload[4..]);
-                    return;
-                }
+                if (self.audio_ids.contains(id)) return; // unsubscribed: ignore strays
                 const ch = self.chans.get(id) orelse return;
                 ch.comp.feed(payload[4..]) catch |err| {
                     std.debug.print("appdrive: replica feed error: {s}\n", .{@errorName(err)});
@@ -1047,37 +1050,6 @@ pub const App = struct {
     }
 
     // ── input intents ───────────────────────────────────────────
-
-    /// Headless audio: acknowledge PCM as instantly played so the
-    /// remote app never stalls on a full sink buffer.
-    fn drainAudio(self: *App, id: u32, bytes: []const u8) void {
-        const pulse = @import("../mux/pulse.zig");
-        var consumed: u64 = 0;
-        var pos: usize = 0;
-        while (pulse.peelUnit(bytes[pos..])) |p| {
-            if (p.tag == .pcm and p.payload.len > 4) consumed += p.payload.len - 4;
-            if (p.tag == .pcm_opus and p.payload.len >= 8)
-                consumed += std.mem.readInt(u32, p.payload[4..8], .little);
-            pos += p.consumed;
-        }
-        if (consumed == 0) return;
-        var units: std.ArrayList(u8) = .empty;
-        defer units.deinit(self.allocator);
-        var pl: [12]u8 = undefined;
-        // Stream id: first pcm unit's header (one stream per report
-        // is fine — multiple streams re-report on their own data).
-        pos = 0;
-        while (pulse.peelUnit(bytes[pos..])) |p| {
-            if ((p.tag == .pcm or p.tag == .pcm_opus) and p.payload.len > 4) {
-                @memcpy(pl[0..4], p.payload[0..4]);
-                std.mem.writeInt(u64, pl[4..12], consumed, .little);
-                pulse.appendUnit(&units, self.allocator, .consumed, &pl) catch return;
-                break;
-            }
-            pos += p.consumed;
-        }
-        if (units.items.len > 0) self.sendIntents(id, units.items) catch {};
-    }
 
     fn sendIntents(self: *App, chan: u32, units: []const u8) Error!void {
         if (self.exited) return Error.NotConnected;

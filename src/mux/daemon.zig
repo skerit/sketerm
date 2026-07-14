@@ -100,6 +100,10 @@ pub const SpawnReq = struct {
     /// session's compositor. Only useful where the exporting driver
     /// allows CPU mmap of linear buffers.
     gpu: bool = false,
+    /// Skip this session's PulseAudio hub (`launch_app audio:"none"`):
+    /// PULSE_SERVER stays unset, so clients fall back to their own
+    /// null/dummy audio drivers instead of sketerm's sink.
+    no_audio: bool = false,
     /// GUI pane id + IPC socket to export into the child env as
     /// SKETERM_PANE_ID / SKETERM_SOCKET so `sketerm cli --pane self` works
     /// from inside a daemon-backed pane. The GUI passes its own values; they
@@ -964,8 +968,44 @@ pub const Daemon = struct {
         }
     }
 
+    /// Pace self-clocked audio (mux/pulse.zig): advance every audio
+    /// channel's stream clocks to now, flush the REQUESTs / drain
+    /// replies they emit toward the app, and return the poll timeout
+    /// clamped to the nearest audio deadline so pacing stays on time.
+    fn pulseTick(self: *Daemon, timeout_ms: i32) i32 {
+        var to = timeout_ms;
+        const now = nowMs();
+        for (self.channels.items) |ch| {
+            if (ch.dead) continue;
+            const srv = ch.pa orelse continue;
+            srv.has_viewer = false;
+            for (self.clients.items) |cl| {
+                if (nativeViewer(cl, ch.session.?) and cl.audio_ok) srv.has_viewer = true;
+            }
+            const deadline = srv.tick(now) catch {
+                self.closeChannel(ch, true);
+                continue;
+            };
+            const out = srv.takeOut();
+            if (out.len > 0) {
+                ch.pending.appendSlice(self.allocator, out) catch {
+                    self.closeChannel(ch, true);
+                    continue;
+                };
+                srv.clearOut();
+                self.channelWritable(ch);
+            }
+            if (deadline) |d| {
+                const rel: i32 = @intCast(std.math.clamp(d - now, 1, 1000));
+                if (rel < to) to = rel;
+            }
+        }
+        return to;
+    }
+
     /// One poll iteration. Exposed for tests.
     pub fn tick(self: *Daemon, timeout_ms: i32) !void {
+        const poll_timeout = self.pulseTick(timeout_ms);
         var fds: std.ArrayList(c.struct_pollfd) = .empty;
         defer fds.deinit(self.allocator);
 
@@ -1064,7 +1104,7 @@ pub const Daemon = struct {
             });
         }
 
-        const pr = c.poll(fds.items.ptr, @intCast(fds.items.len), timeout_ms);
+        const pr = c.poll(fds.items.ptr, @intCast(fds.items.len), poll_timeout);
         if (pr < 0) return; // EINTR etc — next tick retries
 
         if (self.listen_fd >= 0 and fds.items[0].revents & c.POLLIN != 0) self.acceptClient();
@@ -2318,7 +2358,10 @@ pub const Daemon = struct {
         for (self.clients.items) |cl| {
             if (nativeViewer(cl, s)) {
                 cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio));
-                srv.has_viewer = true;
+                // Only a SUBSCRIBED viewer counts as the clock owner:
+                // attached-but-deaf clients (MCP) must leave streams
+                // on the daemon's real-time self-clock.
+                if (cl.audio_ok) srv.has_viewer = true;
             }
         }
     }
@@ -2327,12 +2370,13 @@ pub const Daemon = struct {
     /// back to the app, PCM/stream units toward attached viewers.
     fn paReadable(self: *Daemon, ch: *Channel) void {
         const srv = ch.pa.?;
+        srv.now_ms = nowMs(); // self-clock pace source
         srv.has_viewer = false;
         srv.opus_wanted = false;
         for (self.clients.items) |cl| {
-            if (!nativeViewer(cl, ch.session.?)) continue;
+            if (!nativeViewer(cl, ch.session.?) or !cl.audio_ok) continue;
             srv.has_viewer = true;
-            if (cl.audio_ok and cl.audio_opus) srv.opus_wanted = true;
+            if (cl.audio_opus) srv.opus_wanted = true;
         }
         var buf: [64 * 1024]u8 = undefined;
         var rounds: u32 = 0;
@@ -2371,10 +2415,12 @@ pub const Daemon = struct {
     /// Viewer → audio channel data (subscribe/consumed/latency).
     fn paClientData(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const u8) void {
         const srv = ch.pa.?;
+        srv.now_ms = nowMs();
         var pos: usize = 0;
         while (pulse.peelUnit(bytes[pos..])) |p| {
             if (p.tag == .subscribe) {
                 cl.audio_ok = true;
+                srv.has_viewer = true;
                 // Flags byte (optional): bit0 = decodes Opus.
                 if (p.payload.len >= 1 and p.payload[0] & 1 != 0) cl.audio_opus = true;
                 srv.opus_wanted = srv.opus_wanted or cl.audio_opus;
@@ -3771,7 +3817,7 @@ pub const Daemon = struct {
 
         // Remote audio rides the same gate: the daemon IS the
         // session's PulseAudio server (SKETERM_MUX_NO_AUDIO=1 opts out).
-        var audio_hub: ?WaylandHub = if (want_wayland and std.c.getenv("SKETERM_MUX_NO_AUDIO") == null)
+        var audio_hub: ?WaylandHub = if (want_wayland and !req.no_audio and std.c.getenv("SKETERM_MUX_NO_AUDIO") == null)
             self.setupAudioHub()
         else
             null;
@@ -3915,6 +3961,11 @@ pub const Daemon = struct {
             .shell_integration = shell_integration,
             .wayland_display = if (wl_disp_z) |z| z.ptr else null,
             .pulse_server = if (pa_env_z) |z| z.ptr else null,
+            // No hub for this session (audio:"none" / disabled /
+            // setup failed): scrub any PULSE_SERVER the daemon itself
+            // inherited. Local desktop panes keep their inheritance —
+            // that's the user's own environment.
+            .clear_pulse_server = pa_env_z == null and !req.local,
             .runtime_dir = if (rt_dir_z) |z| z.ptr else null,
             .a11y_bus_addr = if (a11y_addr_z) |z| z.ptr else null,
             .gpu = req.gpu,
@@ -4084,7 +4135,9 @@ pub const Daemon = struct {
             const srv = ch.pa orelse continue;
             var hdr: [5]u8 = undefined;
             cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio));
-            srv.has_viewer = true;
+            // Clock ownership needs a subscription (paReadable /
+            // pulseTick re-derive this each round anyway).
+            if (cl.audio_ok) srv.has_viewer = true;
             var units: std.ArrayList(u8) = .empty;
             defer units.deinit(self.allocator);
             var it = srv.streams.iterator();

@@ -7575,3 +7575,70 @@ exit (twice, deterministic); post-fix all polls answer, close_app
 returns "app session closed (the app had already exited with status
 0)", server alive (run twice). 714/720 tests, smoke-mux + smoke-mcp
 PASS.
+
+## Audio sink: real-time self-clock (the accept-and-never-play black hole)
+
+Bug report from the st-afu game harness: the per-session Pulse shim
+accepted audio and never consumed it on any clock. `paplay` of a 2 s
+WAV returned in 21 ms (DRAIN was acked instantly); an SDL3 client's
+queued bytes never decreased, so a game gating dialogue/FMV logic on
+"is this voice still playing" hung forever while looking healthy.
+
+Three compounding defects, all fixed:
+
+1. `mux/pulse.zig` self-clock was instant-consume: `read_index =
+   write_index` + REQUEST on every pcm frame, and DRAIN replied
+   immediately. Now the self clock is REAL TIME: a host-injected
+   monotonic `now_ms` (daemon sets it before feed/applyUnit; the new
+   `Server.tick(now)` advances it), `read_index` moves at the
+   stream's declared byte rate, REQUESTs keep a `read + tlength`
+   window at `minreq` granularity, DRAIN is queued in `drain_tag` and
+   replied only when playback catches the write head (either clock),
+   FLUSH jumps to the write head, CORK banks/freezes/rebases the
+   clock, UPDATE_SAMPLE_RATE re-paces. Underrun parks the clock so
+   late data plays from "now". `tick` returns the next deadline; the
+   daemon's new `pulseTick` (top of `Daemon.tick`) drives every audio
+   channel and clamps the poll timeout to the nearest deadline.
+
+2. `appdrive.zig` subscribed to audio units and acked every PCM byte
+   as instantly consumed (`drainAudio`) — a client-side copy of the
+   same flaw that made streams viewer-clocked with a broken clock
+   (and only while a tool call happened to be pumping). appdrive now
+   NEVER subscribes: no PCM is shipped to MCP clients and the daemon
+   paces the app itself. Server-side, `has_viewer` now counts only
+   SUBSCRIBED viewers (audio_ok), and both `pcm()` and `tick()`
+   revert a viewer-clocked stream to the self clock when the last
+   subscriber detaches (previously: REQUESTs stopped forever = the
+   SDL stall with a GUI that left).
+
+3. REQUEST sizes were not frame-aligned (read_index is a time
+   computation). libpulse clients asked to write e.g. 4057 bytes of
+   4-byte frames fail `pa_stream_write` — SDL3 zombifies the whole
+   device on the first failed write and dumps its queue as if played
+   (3 s "drained" in 150 ms). Everything is now frame-aligned:
+   advanceSelfClock's position, request deltas, and the negotiated
+   tlength/minreq defaults.
+
+Plus: `launch_app` gained `audio: "forward" | "none"`. "none"
+(SpawnReq.no_audio) skips the session's audio hub AND — new
+`Pty.spawn clear_pulse_server` — unsets an inherited PULSE_SERVER (a
+daemon started from inside a sketerm session used to leak its own
+session's sink socket into hub-less children; that leak applies to
+every hub-less non-local spawn and is now scrubbed).
+
+Verified end-to-end via a stdio MCP driver on an isolated daemon:
+`time paplay t.wav` (2 s WAV) = real 2.01–2.03 s (was 0.01); an SDL3
+client queueing 3 s of s16 stereo drains smoothly in 3107 ms with 139
+paced REQUESTs (SDL dummy driver reference: 3004 ms; was: 150 ms
+cliff), `audio:"none"` leaves the child with no PULSE_SERVER
+(paplay: connection refused → SDL would use its dummy driver). New
+pulse.zig tests: real-time pacing + underrun clamp, clocked DRAIN,
+viewer-detach revert, FLUSH semantics. 718/724 tests, smoke-mux +
+smoke-mcp + smoke-e2e PASS, mux-portable (incl. aarch64-macos) green,
+sketerm-mux still libc-only.
+
+Known limitation: `pactl list short sinks` shows state "n/a" — sink
+state is a protocol v15 field and the shim speaks v13; harmless.
+Headless audible playback (forwarding an MCP session's audio to the
+host's real server) remains a design decision — the daemon is
+libc-only and would need to speak the Pulse CLIENT protocol itself.
