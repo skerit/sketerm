@@ -7642,3 +7642,44 @@ state is a protocol v15 field and the shim speaks v13; harmless.
 Headless audible playback (forwarding an MCP session's audio to the
 host's real server) remains a design decision — the daemon is
 libc-only and would need to speak the Pulse CLIENT protocol itself.
+
+## Audio round 2: protocol v15 (real sink state) + WAV capture target
+
+Follow-up on the real-time sink clock: the shim now negotiates Pulse
+protocol v15 instead of 13, and headless runs can capture the audio
+the sink consumes to WAV files for offline verification (the "did the
+app actually produce sound" probe that a discarding sink can't answer).
+
+v15 (`mux/pulse.zig`): version-gated additions, layouts matching
+protocol-native.c exactly — create-stream request gains volume_set +
+early_requests (v14) and muted_set + dont_inhibit_auto_suspend +
+fail_on_suspend (v15); sink/source info replies gain base volume,
+STATE, n_volume_steps, card; GET_SERVER_INFO gains the default
+channel map (missing it = pactl info "Protocol error", found the hard
+way). Sink state is session-wide: a pactl connection owns no streams,
+so `Server.sink_running` is daemon-fed from sibling connections of the
+same session (`sessionAudioRunning`) and `sinkState()` reports
+RUNNING/IDLE accordingly.
+
+WAV capture: `launch_app audio_path:"/abs/base"` (SpawnReq
+.audio_capture, appdrive LaunchOpts.audio_capture). New
+`mux/wavcap.zig` — libc-only WAV writer (u8/s16le/f32le/s32le/s24le;
+RIFF sizes patched on close), unit-tested. The daemon tees the audio
+UNITS stream in `paReadable` (`captureUnits`: open → writer, pcm →
+append, close → finalize; Channel.deinit finalizes stragglers), so
+pulse.zig stays a pure state machine and pacing/forwarding are
+untouched. Files: first stream `<base>.wav`, later `<base>-N.wav`
+(session counter). Capture gates Opus off (pcm_opus can't be decoded
+daemon-side). MCP validates: absolute path, incompatible with
+audio:"none"; the launch reply echoes the capture path. WAV not
+mp3/ogg because the daemon links libc only — no encoder libs.
+
+Verified end-to-end (isolated MCP daemon): pactl info reports Server
+Protocol Version 15; `pactl list short sinks` shows IDLE → RUNNING
+during paplay → IDLE after; paplay still paces (real 2.01 s for a 2 s
+WAV); SDL3 (which now sends the v15 create fields) still drains a 3 s
+clip in 3189 ms; captured cap.wav / cap-2.wav decode to exactly
+2.000 s @ 22050 Hz mono with samples byte-identical to the source
+sine. 721/727 tests (3 new: v15 sink state, wavcap round-trip,
+wavcap format refusal), smoke-mux + smoke-mcp + smoke-e2e PASS,
+mux-portable incl. aarch64-macos green, sketerm-mux still libc-only.

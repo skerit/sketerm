@@ -323,6 +323,10 @@ pub const App = struct {
         /// Skip the session's PulseAudio hub: PULSE_SERVER stays
         /// unset and the app falls back to its own dummy driver.
         no_audio: bool = false,
+        /// WAV-capture path base on the DAEMON's host: the sink tees
+        /// every stream's PCM to "<base>.wav" / "<base>-N.wav" while
+        /// pacing normally. null = no capture.
+        audio_capture: ?[]const u8 = null,
         cwd: ?[]const u8 = null,
         /// "KEY=VALUE" strings for the child environment.
         env: []const []const u8 = &.{},
@@ -383,6 +387,7 @@ pub const App = struct {
             .kb_layout = layout_name,
             .gpu = opts.gpu,
             .no_audio = opts.no_audio,
+            .audio_capture = opts.audio_capture orelse "",
             .cwd = opts.cwd,
             .env = opts.env,
         }) catch return Error.SpawnFailed;
