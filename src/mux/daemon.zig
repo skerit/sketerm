@@ -3020,6 +3020,10 @@ pub const Daemon = struct {
                 errdefer _ = c.munmap(@ptrCast(ptr.?), sz);
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
                 try wlpipe.appendPoolMeta(units, a, .pool_create, p.id, @intCast(sz));
+                // Replicas adopt the tracker's incarnation serial so
+                // serial-addressed units resolve on mid-session
+                // attaches (their self-counted serials diverge).
+                try wlpipe.appendPoolSerial(units, a, p.id, p.serial);
                 const gop = try nv.pools.getOrPut(a, p.id);
                 if (gop.found_existing) {
                     // Recycled pool id (delete_id reuse). Old buffers
@@ -3084,12 +3088,15 @@ pub const Daemon = struct {
                 // a headless daemon (MCP running an animated app) from
                 // burning CPU zstd-encoding frames for nobody.
                 //
-                // Pixel units address pools by ID, so only commits
-                // against the pool id's CURRENT incarnation may ship
-                // them — an orphaned mirror's bytes would land in the
-                // wrong (recycled) replica pool. Replicas render
-                // orphan-backed buffers from their own retained copy.
+                // pool_update_c addresses pools by ID, so only commits
+                // against the pool id's CURRENT incarnation ship that
+                // way; a buffer from a displaced (orphaned) incarnation
+                // — a client that keeps committing old-pool storage
+                // across a recreate, like Wine's DirectDraw on a mode
+                // switch — ships SERIAL-addressed (pool_update_s) from
+                // the orphan mirror, which holds the live bytes.
                 var pix_state: u8 = 1; // shipping
+                var orphan_route = false;
                 const mirror_opt: ?Native.PoolMirror = blk: {
                     if (!self.hasNativeViewer(nv)) {
                         pix_state = 2;
@@ -3102,8 +3109,11 @@ pub const Daemon = struct {
                     }
                     if (nv.pools.get(cm.info.pool)) |m| {
                         if (m.serial == cm.info.serial) break :blk m;
+                    }
+                    if (nv.orphan_pools.get(cm.info.serial)) |m| {
                         pix_state = 3;
-                        break :blk null;
+                        orphan_route = true;
+                        break :blk m;
                     }
                     pix_state = 4;
                     break :blk null;
@@ -3115,7 +3125,7 @@ pub const Daemon = struct {
                     switch (pix_state) {
                         1 => log.debug("commit pixels: shipping (surface {d}, pool {d})", .{ cm.surface, cm.info.pool }),
                         2 => log.debug("commit pixels: skipped, no attached viewer (mirror stays current for reattach)", .{}),
-                        3 => log.debug("commit pixels: buffer {d} is orphan-backed — viewers render their retained copy", .{cm.buffer}),
+                        3 => log.debug("commit pixels: buffer {d} is orphan-backed — shipping serial-addressed (serial={d})", .{ cm.buffer, cm.info.serial }),
                         4 => log.warn("commit resolves NO mirror ({s} {d}, session '{s}') — window will not update", .{
                             if (cm.info.dmabuf) "dmabuf buffer" else "pool",
                             if (cm.info.dmabuf) cm.buffer else cm.info.pool,
@@ -3139,7 +3149,9 @@ pub const Daemon = struct {
                             // default builds take the lossless path verbatim.
                             var did_video = false;
                             if (comptime build_options.video) {
-                                if (!cm.info.dmabuf)
+                                // The video path is pool-id addressed;
+                                // orphan commits stay lossless+serial.
+                                if (!cm.info.dmabuf and !orphan_route)
                                     did_video = nv.videoCommit(units, a, cm, mirror, y0, y1) catch false;
                             }
                             if (!did_video) {
@@ -3165,7 +3177,10 @@ pub const Daemon = struct {
                                         const raw = mirror.ptr[off..end];
                                         const enc = wlpixcodec.encodeRegion(sc, a, raw, stride) catch
                                             wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
-                                        try wlpipe.appendPoolUpdateC(units, a, cm.info.pool, @intCast(off), enc, @intCast(raw.len), @intCast(stride));
+                                        if (orphan_route)
+                                            try wlpipe.appendPoolUpdateS(units, a, cm.info.serial, @intCast(off), enc, @intCast(raw.len), @intCast(stride))
+                                        else
+                                            try wlpipe.appendPoolUpdateC(units, a, cm.info.pool, @intCast(off), enc, @intCast(raw.len), @intCast(stride));
                                     }
                                     y = yc;
                                 }
@@ -4266,6 +4281,12 @@ pub const Daemon = struct {
                     ok = false;
                     break;
                 };
+                // The replica must adopt this incarnation's serial
+                // BEFORE state_sync binds buffers to it.
+                wlpipe.appendPoolSerial(&units, self.allocator, pool_id, mirror.serial) catch {
+                    ok = false;
+                    break;
+                };
                 var off: usize = 0;
                 while (off < mirror.size) {
                     const len = @min(POOL_CHUNK, mirror.size - off);
@@ -4281,6 +4302,35 @@ pub const Daemon = struct {
                     off += len;
                 }
                 if (!ok) break;
+            }
+            // Orphaned incarnations still referenced by live buffers:
+            // without them a reattached replica freezes (or blacks)
+            // every window whose client commits displaced storage.
+            if (ok) {
+                var oit = nv.orphan_pools.iterator();
+                while (oit.next()) |e| {
+                    const serial = e.key_ptr.*;
+                    const mirror = e.value_ptr.*;
+                    wlpipe.appendPoolOrphan(&units, self.allocator, serial, @intCast(mirror.size)) catch {
+                        ok = false;
+                        break;
+                    };
+                    var off: usize = 0;
+                    while (off < mirror.size) {
+                        const len = @min(POOL_CHUNK, mirror.size - off);
+                        const raw = mirror.ptr[off..][0..len];
+                        var sc: wlpixcodec.Scratch = .{};
+                        defer sc.deinit(self.allocator);
+                        const enc = wlpixcodec.encodeRegion(&sc, self.allocator, raw, len) catch
+                            wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
+                        wlpipe.appendPoolUpdateS(&units, self.allocator, serial, @intCast(off), enc, @intCast(len), @intCast(len)) catch {
+                            ok = false;
+                            break;
+                        };
+                        off += len;
+                    }
+                    if (!ok) break;
+                }
             }
             // Dmabuf mirrors replay as their synthetic pools (pool id
             // == buffer id) so a reattaching replica has pixels for

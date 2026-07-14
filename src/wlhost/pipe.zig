@@ -118,6 +118,22 @@ pub const Tag = enum(u8) {
     /// host_drop offer's receive — write the bytes into the held fd
     /// for that offer.
     drop_data = 33,
+    /// u32 pool id, u64 incarnation serial. Daemon → replica, trails
+    /// every pool_create (live AND replay): the replica ADOPTS the
+    /// daemon's serial for that pool incarnation, so serial-addressed
+    /// units (pool_update_s) and state_sync buffer serials resolve on
+    /// replicas attached mid-session (their self-counted serials
+    /// would otherwise diverge from the daemon's).
+    pool_serial = 34,
+    /// u64 serial, u32 size. Replay only: recreate a displaced
+    /// (orphaned) pool incarnation still referenced by live buffers,
+    /// filled by pool_update_s units.
+    pool_orphan = 35,
+    /// Serial-addressed pool_update_c: u64 incarnation serial, u32
+    /// offset, pixcodec body. Reaches a pool the id can no longer
+    /// address — a client committing a buffer from a displaced pool
+    /// incarnation (Wine's DirectDraw mode switches) keeps updating.
+    pool_update_s = 36,
     _,
 };
 
@@ -226,6 +242,70 @@ pub fn appendPoolMeta(out: *std.ArrayList(u8), allocator: std.mem.Allocator, tag
     std.mem.writeInt(u32, payload[0..4], pool, .little);
     std.mem.writeInt(u32, payload[4..8], size, .little);
     try appendUnit(out, allocator, tag, &payload);
+}
+
+/// pool_serial: the daemon's incarnation serial for a pool id.
+pub fn appendPoolSerial(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pool: u32, serial: u64) !void {
+    var payload: [12]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], pool, .little);
+    std.mem.writeInt(u64, payload[4..12], serial, .little);
+    try appendUnit(out, allocator, .pool_serial, &payload);
+}
+
+pub fn decodePoolSerial(payload: []const u8) ?struct { pool: u32, serial: u64 } {
+    if (payload.len < 12) return null;
+    return .{
+        .pool = std.mem.readInt(u32, payload[0..4], .little),
+        .serial = std.mem.readInt(u64, payload[4..12], .little),
+    };
+}
+
+/// pool_orphan: (re)create a displaced pool incarnation, replay only.
+pub fn appendPoolOrphan(out: *std.ArrayList(u8), allocator: std.mem.Allocator, serial: u64, size: u32) !void {
+    var payload: [12]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], serial, .little);
+    std.mem.writeInt(u32, payload[8..12], size, .little);
+    try appendUnit(out, allocator, .pool_orphan, &payload);
+}
+
+pub fn decodePoolOrphan(payload: []const u8) ?struct { serial: u64, size: u32 } {
+    if (payload.len < 12) return null;
+    return .{
+        .serial = std.mem.readInt(u64, payload[0..8], .little),
+        .size = std.mem.readInt(u32, payload[8..12], .little),
+    };
+}
+
+/// Serial-addressed codec-tagged pool update (see Tag.pool_update_s).
+pub fn appendPoolUpdateS(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    serial: u64,
+    offset: u32,
+    enc: pixcodec.Encoded,
+    raw_len: u32,
+    row_stride: u32,
+) !void {
+    const payload_len = 12 + pixcodec.body_header + enc.bytes.len;
+    var hdr: [header_size + 12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(payload_len + 1), .little);
+    hdr[4] = @intFromEnum(Tag.pool_update_s);
+    std.mem.writeInt(u64, hdr[5..13], serial, .little);
+    std.mem.writeInt(u32, hdr[13..17], offset, .little);
+    try out.appendSlice(allocator, &hdr);
+    try pixcodec.appendBody(out, allocator, enc, raw_len, row_stride);
+}
+
+pub const PoolUpdateS = struct { serial: u64, offset: u32, body: pixcodec.Body };
+
+pub fn decodePoolUpdateS(payload: []const u8) ?PoolUpdateS {
+    if (payload.len < 12) return null;
+    const body = pixcodec.peelBody(payload[12..]) orelse return null;
+    return .{
+        .serial = std.mem.readInt(u64, payload[0..8], .little),
+        .offset = std.mem.readInt(u32, payload[8..12], .little),
+        .body = body,
+    };
 }
 
 // ── seat-intent encoders (viewer → daemon brain) ────────────────

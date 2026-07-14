@@ -579,6 +579,18 @@ pub const Compositor = struct {
         return self.orphan_pools.getPtr(info.pool_serial);
     }
 
+    /// Resolve a pool by incarnation serial (pool_update_s target):
+    /// usually an orphan, but a commit raced ahead of the recycling
+    /// create_pool still finds the current holder.
+    fn poolBySerial(self: *Compositor, serial: u64) ?*Pool {
+        if (self.orphan_pools.getPtr(serial)) |p| return p;
+        var it = self.pools.valueIterator();
+        while (it.next()) |p| {
+            if (p.serial == serial) return p;
+        }
+        return null;
+    }
+
     /// Release one buffer reference against its pool incarnation,
     /// reclaiming bytes when it was the last on a destroyed pool.
     fn releaseBufferRef(self: *Compositor, info: Buffer) void {
@@ -1339,6 +1351,38 @@ pub const Compositor = struct {
             .pool_update_c => {
                 const upd = pipe.decodePoolUpdateC(payload) orelse return Error.Protocol;
                 const pool = self.pools.getPtr(upd.pool) orelse return Error.Protocol;
+                const end = @as(usize, upd.offset) + upd.body.raw_len;
+                if (end > pool.bytes.items.len) return Error.Protocol;
+                pixcodec.decodeBody(upd.body, pool.bytes.items[upd.offset..end]) catch
+                    return Error.Protocol;
+            },
+            .pool_serial => {
+                // Adopt the daemon's incarnation serial (trails every
+                // pool_create): serial-addressed units and state_sync
+                // buffer serials then resolve on replicas attached
+                // mid-session, whose self-counted serials diverge.
+                const ps = pipe.decodePoolSerial(payload) orelse return Error.Protocol;
+                if (self.pools.getPtr(ps.pool)) |p| p.serial = ps.serial;
+                if (ps.serial > self.pool_serial_ctr) self.pool_serial_ctr = ps.serial;
+            },
+            .pool_orphan => {
+                // Replayed displaced incarnation; pool_update_s units
+                // fill it. Refcounts are recomputed by restoreState.
+                const po = pipe.decodePoolOrphan(payload) orelse return Error.Protocol;
+                const slot = try self.orphan_pools.getOrPut(self.allocator, po.serial);
+                if (slot.found_existing) slot.value_ptr.deinit(self.allocator);
+                slot.value_ptr.* = .{ .serial = po.serial };
+                try slot.value_ptr.bytes.resize(self.allocator, po.size);
+                if (po.serial > self.pool_serial_ctr) self.pool_serial_ctr = po.serial;
+            },
+            .pool_update_s => {
+                // Serial-addressed pixels: reach a displaced pool the
+                // id can't name anymore (a client still committing
+                // buffers from a recycled pool's old incarnation).
+                const upd = pipe.decodePoolUpdateS(payload) orelse return Error.Protocol;
+                // A serial we no longer retain (freed on the last
+                // buffer release) is stale data, not a protocol fault.
+                const pool = self.poolBySerial(upd.serial) orelse return;
                 const end = @as(usize, upd.offset) + upd.body.raw_len;
                 if (end > pool.bytes.items.len) return Error.Protocol;
                 pixcodec.decodeBody(upd.body, pool.bytes.items[upd.offset..end]) catch
@@ -2943,7 +2987,7 @@ pub const Compositor = struct {
     // it), 0 = it referenced a displaced incarnation whose bytes are
     // not replayed (the buffer restores unresolvable, never frees a
     // stranger's pool).
-    const state_sync_version: u8 = 4;
+    const state_sync_version: u8 = 5;
 
     fn putU8(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u8) Error!void {
         try out.append(a, v);
@@ -3046,6 +3090,11 @@ pub const Compositor = struct {
             try putU32(&out, a, b.format);
             const current = if (self.pools.get(b.pool)) |p| p.serial == b.pool_serial else false;
             try putU8(&out, a, @intFromBool(current));
+            // v5: the raw incarnation serial — displaced buffers bind
+            // to a replayed orphan pool (pool_orphan units) instead of
+            // restoring unresolvable (frozen windows on reattach).
+            try putU32(&out, a, @intCast(b.pool_serial & 0xffff_ffff));
+            try putU32(&out, a, @intCast(b.pool_serial >> 32));
         }
 
         try putU32(&out, a, self.surfaces.count());
@@ -3273,23 +3322,37 @@ pub const Compositor = struct {
                 .format = try r.u32v(),
             };
             // v4: bind only current-incarnation buffers to the
-            // replayed pool; displaced ones restore unresolvable
-            // (their bytes weren't replayed). Pre-v4 senders never
-            // distinguished — treat all as current, as before.
+            // replayed pool; pre-v4 senders never distinguished —
+            // treat all as current, as before. v5 adds the raw
+            // serial: displaced buffers bind to a replayed orphan
+            // pool (pool_orphan units) instead of restoring
+            // unresolvable (frozen windows on reattach).
             const current = if (ver >= 4) (try r.u8v()) != 0 else true;
+            var raw_serial: u64 = 0;
+            if (ver >= 5) {
+                const lo: u64 = try r.u32v();
+                const hi: u64 = try r.u32v();
+                raw_serial = lo | (hi << 32);
+            }
             if (current) {
                 if (self.pools.getPtr(b.pool)) |p| b.pool_serial = p.serial;
+            } else {
+                b.pool_serial = raw_serial;
             }
             try self.buffers.put(a, id, b);
         }
         // Recompute pool refcounts: the pools arrived via replayed
-        // pool_create units with counts at 0, and freeing a pool
-        // under a restored live buffer would drop its frames.
+        // pool_create/pool_orphan units with counts at 0, and freeing
+        // a pool under a restored live buffer would drop its frames.
         var bit = self.buffers.valueIterator();
         while (bit.next()) |b| {
             if (self.pools.getPtr(b.pool)) |p| {
-                if (p.serial == b.pool_serial) p.buffers += 1;
+                if (p.serial == b.pool_serial) {
+                    p.buffers += 1;
+                    continue;
+                }
             }
+            if (self.orphan_pools.getPtr(b.pool_serial)) |op| op.buffers += 1;
         }
 
         const n_surf = try r.u32v();
@@ -6404,14 +6467,204 @@ test "recycled pool id: old buffer's destroy must not reclaim the new incarnatio
         try pipe.appendUnit(&units, t.allocator, .state_sync, blob);
         try replica.feed(units.items);
     }
-    // Buffer 11 bound to the replayed pool 9; buffer 13 unresolvable
-    // (its incarnation was displaced — it must not count against the
-    // current pool 12, and destroying it must not free pool 12).
+    // Buffer 11 bound to the replayed pool 9; buffer 13 keeps its
+    // displaced incarnation's raw serial (v5) — it must not count
+    // against the current pool 12 (destroying it must not free pool
+    // 12), and with no replayed orphan pool it stays unresolvable.
     try t.expectEqual(@as(u32, 1), replica.pools.get(9).?.buffers);
     try t.expectEqual(replica.pools.get(9).?.serial, replica.buffers.get(11).?.pool_serial);
     try t.expectEqual(@as(u32, 0), replica.pools.get(12).?.buffers);
-    try t.expectEqual(@as(u64, 0), replica.buffers.get(13).?.pool_serial);
+    try t.expectEqual(comp.buffers.get(13).?.pool_serial, replica.buffers.get(13).?.pool_serial);
+    try t.expect(replica.buffers.get(13).?.pool_serial != replica.pools.get(12).?.serial);
     try t.expect(!comp.dead);
+}
+
+test "orphaned pool incarnation: serial adoption + pool_update_s keep a displaced buffer's pixels live" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 3);
+    try bindGlobal(&comp, 2, "wl_shm", 1, 4);
+    try bindGlobal(&comp, 5, "xdg_wm_base", 2, 5);
+
+    { // surface 6 → xdg_surface 7 → toplevel 8, initial commit
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 5, 2);
+        b.putNewId(7);
+        b.putObject(6);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 7, 1);
+        b.putNewId(8);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 6, 6);
+        try req(&comp, try b.finish());
+    }
+
+    { // create_pool(9, 64) — then ADOPT the daemon's serial (7000)
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(9);
+        b.putInt(64);
+        try req(&comp, try b.finish());
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        try pipe.appendPoolSerial(&unit, t.allocator, 9, 7000);
+        try comp.feed(unit.items);
+    }
+    try t.expectEqual(@as(u64, 7000), comp.pools.get(9).?.serial);
+
+    { // create_buffer(10, 4x4) — inherits the adopted serial
+        var b = wire.Builder.init(&buf, 9, 0);
+        b.putNewId(10);
+        b.putInt(0);
+        b.putInt(4);
+        b.putInt(4);
+        b.putInt(16);
+        b.putUint(1);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(u64, 7000), comp.buffers.get(10).?.pool_serial);
+
+    { // destroy pool 9, recycle its id (DirectDraw mode switch)
+        var b = wire.Builder.init(&buf, 9, 1);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(9);
+        b.putInt(64);
+        try req(&comp, try b.finish());
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        try pipe.appendPoolSerial(&unit, t.allocator, 9, 7001);
+        try comp.feed(unit.items);
+    }
+    // Old incarnation orphaned under its ADOPTED serial.
+    try t.expect(comp.orphan_pools.get(7000) != null);
+
+    { // serial-addressed pixels land in the orphan
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        var px: [64]u8 = undefined;
+        for (&px, 0..) |*p, i| p.* = @intCast((i + 40) & 0xff);
+        const enc = pixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = &px };
+        try pipe.appendPoolUpdateS(&unit, t.allocator, 7000, 0, enc, 64, 16);
+        try comp.feed(unit.items);
+    }
+    try t.expectEqual(@as(u8, 40), comp.orphan_pools.get(7000).?.bytes.items[0]);
+
+    { // attach the displaced buffer + commit → frame with the bytes
+        var b = wire.Builder.init(&buf, 6, 1);
+        b.putObject(10);
+        b.putInt(0);
+        b.putInt(0);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 6, 6);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), tv.frames);
+    try t.expectEqual(@as(u8, 40), tv.last_pixels[0]);
+
+    // A stale serial (already released) must be skipped, not fatal.
+    {
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        var px: [16]u8 = undefined;
+        @memset(&px, 1);
+        const enc = pixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = &px };
+        try pipe.appendPoolUpdateS(&unit, t.allocator, 4242, 0, enc, 16, 16);
+        try comp.feed(unit.items);
+    }
+    try t.expect(!comp.dead);
+}
+
+test "pool_orphan replay: v5 state_sync binds a displaced buffer to the replayed orphan" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 3);
+    try bindGlobal(&comp, 2, "wl_shm", 1, 4);
+    try bindGlobal(&comp, 5, "xdg_wm_base", 2, 5);
+
+    { // surface 6 → toplevel 8, mapped
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 5, 2);
+        b.putNewId(7);
+        b.putObject(6);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 7, 1);
+        b.putNewId(8);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 6, 6);
+        try req(&comp, try b.finish());
+    }
+    { // pool 9 (serial 1) + buffer 10, pool destroyed, id recycled
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(9);
+        b.putInt(64);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 9, 0);
+        b.putNewId(10);
+        b.putInt(0);
+        b.putInt(4);
+        b.putInt(4);
+        b.putInt(16);
+        b.putUint(1);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 9, 1);
+        try req(&comp, try b.finish());
+        b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(9);
+        b.putInt(64);
+        try req(&comp, try b.finish());
+    }
+    const orphan_serial = comp.buffers.get(10).?.pool_serial;
+    try t.expect(comp.orphan_pools.get(orphan_serial) != null);
+
+    const blob = try comp.serializeState(t.allocator);
+    defer t.allocator.free(blob);
+
+    var rv = TestView{};
+    var replica = try Compositor.init(t.allocator, rv.view());
+    defer replica.deinit();
+    replica.lenient = true;
+    {
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(t.allocator);
+        // Daemon replay: current pool + its serial, the orphan, its
+        // bytes serial-addressed, then the state blob.
+        try pipe.appendPoolMeta(&units, t.allocator, .pool_create, 9, 64);
+        try pipe.appendPoolSerial(&units, t.allocator, 9, comp.pools.get(9).?.serial);
+        try pipe.appendPoolOrphan(&units, t.allocator, orphan_serial, 64);
+        var px: [64]u8 = undefined;
+        for (&px, 0..) |*p, i| p.* = @intCast((i + 90) & 0xff);
+        const enc = pixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = &px };
+        try pipe.appendPoolUpdateS(&units, t.allocator, orphan_serial, 0, enc, 64, 16);
+        try pipe.appendUnit(&units, t.allocator, .state_sync, blob);
+        try replica.feed(units.items);
+    }
+    // The displaced buffer resolves to the replayed orphan (refcount
+    // included), and a commit renders ITS bytes.
+    try t.expectEqual(orphan_serial, replica.buffers.get(10).?.pool_serial);
+    try t.expectEqual(@as(u32, 1), replica.orphan_pools.get(orphan_serial).?.buffers);
+    {
+        var b = wire.Builder.init(&buf, 6, 1);
+        b.putObject(10);
+        b.putInt(0);
+        b.putInt(0);
+        try req(&replica, try b.finish());
+        b = wire.Builder.init(&buf, 6, 6);
+        try req(&replica, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 1), rv.frames);
+    try t.expectEqual(@as(u8, 90), rv.last_pixels[0]);
 }
 
 test "zxdg_output v3: logical geometry then wl_output.done" {
