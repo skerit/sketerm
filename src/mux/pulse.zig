@@ -317,17 +317,33 @@ pub const Stream = struct {
     channels: u8 = 2,
     rate: u32 = 44100,
     tlength: u32 = 0,
+    minreq: u32 = 0,
     corked: bool = false,
     /// Bytes received from the app (its write clock).
     write_index: u64 = 0,
     /// Bytes the viewer reported played (the read clock).
     read_index: u64 = 0,
+    /// Cumulative bytes REQUESTed from the app on the self-clock path
+    /// (seeded with the create reply's `missing`). Pacing keeps it at
+    /// read_index + tlength, minreq-granular.
+    req_sent: u64 = 0,
+    /// Self-clock base: read_index stood at `clock_base_bytes` at
+    /// monotonic `clock_base_ms`. null = clock parked (no data in
+    /// flight yet, corked, underrun, or viewer-clocked).
+    clock_base_ms: ?i64 = null,
+    clock_base_bytes: u64 = 0,
+    /// A DRAIN awaiting read_index catching write_index; the tag is
+    /// replied when playback (either clock) actually finishes.
+    drain_tag: ?u32 = null,
     /// Viewer-reported local sink latency.
     gui_latency_us: u64 = 0,
     /// A viewer's `consumed` reports drive this stream's REQUESTs.
     /// Until the FIRST report (or after all viewers detach) the
-    /// server self-clocks — a viewer that ignores audio units
-    /// (terminal-only MCP clients) must never stall the app.
+    /// server self-clocks: read_index advances at the stream's
+    /// declared byte rate on the host-injected monotonic clock —
+    /// NEVER instantly. Apps that gate logic on playback progress
+    /// (drain, latency queries, write requests) see real pacing even
+    /// when every sample is discarded.
     viewer_clocked: bool = false,
     /// Opus decision made (latched at first data, sticky).
     opus_latched: bool = false,
@@ -341,6 +357,10 @@ pub const Stream = struct {
         if (self.opus_enc) |*e| e.deinit();
         self.opus_enc = null;
         self.fbuf.deinit(a);
+    }
+
+    fn bytesPerSec(self: *const Stream) u64 {
+        return @as(u64, self.channels) * sampleSize(self.format) * self.rate;
     }
 };
 
@@ -362,6 +382,10 @@ pub const Server = struct {
     /// A subscribed viewer advertised Opus decode (daemon-set).
     /// Latched per stream at first data.
     opus_wanted: bool = false,
+    /// Host-injected monotonic milliseconds (set before feed/
+    /// applyUnit, and by tick). The self-clock pace source — the
+    /// state machine never reads the OS clock itself.
+    now_ms: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Server {
         return .{ .allocator = allocator };
@@ -427,9 +451,11 @@ pub const Server = struct {
                 const n = std.mem.readInt(u64, payload[4..12], .little);
                 const s = self.streams.getPtr(idx) orelse return;
                 s.viewer_clocked = true;
+                s.clock_base_ms = null; // real playback took the clock
                 s.read_index +|= n;
                 // The viewer played n bytes: ask the app for n more.
                 try self.sendRequest(idx, @intCast(@min(n, 0xffff_ffff)));
+                try self.maybeFinishDrain(s);
             },
             .latency => {
                 if (payload.len < 12) return;
@@ -501,14 +527,107 @@ pub const Server = struct {
         } else {
             try self.rawPcmUnit(channel, payload);
         }
-        if (!self.has_viewer) s.viewer_clocked = false;
-        if (!s.viewer_clocked) {
-            // Self-clock: pretend instant playback so the app never
-            // stalls while nobody consumes (headless / terminal-only
-            // viewers). A viewer's first consumed report takes over.
+        if (!self.has_viewer and s.viewer_clocked) revertToSelfClock(s);
+        if (!s.viewer_clocked) try self.pumpSelfClock(channel, s);
+    }
+
+    /// All viewers detached from a viewer-clocked stream: the self
+    /// clock takes back over from the viewer's last reported position
+    /// (otherwise the app waits forever for REQUESTs nobody sends).
+    fn revertToSelfClock(s: *Stream) void {
+        s.viewer_clocked = false;
+        s.clock_base_ms = null;
+        // Everything already received was implicitly requested.
+        if (s.req_sent < s.write_index) s.req_sent = s.write_index;
+    }
+
+    /// Advance a self-clocked stream's read_index to `now_ms` at the
+    /// declared byte rate, clamped to what was actually written. On
+    /// underrun the clock parks so later data plays from "now" instead
+    /// of instantly replaying the silent gap.
+    fn advanceSelfClock(self: *Server, s: *Stream) void {
+        if (s.viewer_clocked or s.corked) return;
+        const bps = s.bytesPerSec();
+        if (bps == 0) return;
+        const base_ms = s.clock_base_ms orelse {
+            if (s.write_index > s.read_index) {
+                s.clock_base_ms = self.now_ms;
+                s.clock_base_bytes = s.read_index;
+            }
+            return;
+        };
+        const elapsed: u64 = @intCast(@max(self.now_ms - base_ms, 0));
+        // Frame-aligned, ALWAYS: an unaligned read_index yields
+        // unaligned REQUESTs, and libpulse clients then attempt
+        // unaligned writes that fail and kill their stream (SDL3
+        // zombifies the whole device on the first one).
+        const fb = @as(u64, s.channels) * sampleSize(s.format);
+        var pos = s.clock_base_bytes +| elapsed * bps / 1000;
+        if (fb > 0) pos -= pos % fb;
+        if (pos >= s.write_index) {
             s.read_index = s.write_index;
-            try self.sendRequest(channel, @intCast(payload.len));
+            s.clock_base_ms = null;
+        } else {
+            s.read_index = pos;
         }
+    }
+
+    /// One self-clock pump: advance the clock, top up the app's write
+    /// window (REQUESTs, minreq-granular), complete a pending drain.
+    fn pumpSelfClock(self: *Server, idx: u32, s: *Stream) Error!void {
+        self.advanceSelfClock(s);
+        const want = s.read_index +| s.tlength;
+        if (want > s.req_sent) {
+            var delta = want - s.req_sent;
+            const fb = @as(u64, s.channels) * sampleSize(s.format);
+            if (fb > 0) delta -= delta % fb; // frame-aligned (see advance)
+            if (delta >= @max(s.minreq, 1)) {
+                try self.sendRequest(idx, @intCast(@min(delta, 0xffff_ffff)));
+                s.req_sent += delta;
+            }
+        }
+        try self.maybeFinishDrain(s);
+    }
+
+    fn maybeFinishDrain(self: *Server, s: *Stream) Error!void {
+        const dtag = s.drain_tag orelse return;
+        if (s.read_index < s.write_index) return;
+        s.drain_tag = null;
+        _ = try self.replyHead(dtag);
+        try self.finishFrame();
+    }
+
+    /// Host-driven pacing: advance every self-clocked stream to
+    /// `now_ms` (emitting REQUESTs / drain replies into `out`) and
+    /// return the monotonic deadline of the next due event, or null
+    /// when no stream needs pacing.
+    pub fn tick(self: *Server, now_ms: i64) Error!?i64 {
+        self.now_ms = now_ms;
+        var next: ?i64 = null;
+        var it = self.streams.iterator();
+        while (it.next()) |e| {
+            const s = e.value_ptr;
+            if (!self.has_viewer and s.viewer_clocked) revertToSelfClock(s);
+            if (s.viewer_clocked) continue;
+            try self.pumpSelfClock(e.key_ptr.*, s);
+            if (s.corked) continue;
+            const bps = s.bytesPerSec();
+            if (bps == 0) continue;
+            const in_flight = s.write_index -| s.read_index;
+            if (in_flight == 0 and s.drain_tag == null) continue;
+            // Wake at whichever comes first: the drain/underrun point
+            // or the next minreq-sized REQUEST becoming due.
+            var target_bytes: u64 = in_flight;
+            const want = s.read_index +| s.tlength;
+            if (s.req_sent >= want) {
+                const until_req = (s.req_sent - want) +| @max(s.minreq, 1);
+                if (until_req < target_bytes) target_bytes = until_req;
+            }
+            const ms: i64 = @intCast(@max(target_bytes * 1000 / bps, 1));
+            const d = now_ms +| ms;
+            if (next == null or d < next.?) next = d;
+        }
+        return next;
     }
 
     fn control(self: *Server, payload: []const u8) Error!void {
@@ -615,17 +734,27 @@ pub const Server = struct {
                 try self.finishFrame();
             },
             CMD_DRAIN_PLAYBACK_STREAM => {
-                // Approximation: everything received is already
-                // shipped toward the viewer — report drained.
-                _ = try r.u32be();
-                _ = try self.replyHead(tag);
-                try self.finishFrame();
+                // Replied only when playback catches the write head —
+                // an instant ack here made `paplay` swallow whole
+                // files in milliseconds. A superseded pending drain is
+                // acked immediately (real PA cancels it likewise).
+                const idx = try r.u32be();
+                const s = self.streams.getPtr(idx) orelse
+                    return self.sendError(tag, ERR_NOENTITY);
+                if (s.drain_tag) |old| {
+                    _ = try self.replyHead(old);
+                    try self.finishFrame();
+                }
+                s.drain_tag = tag;
+                if (!s.viewer_clocked) self.advanceSelfClock(s);
+                try self.maybeFinishDrain(s);
             },
             CMD_GET_PLAYBACK_LATENCY => {
                 const idx = try r.u32be();
                 const tv = try r.timeval();
                 const s = self.streams.getPtr(idx) orelse
                     return self.sendError(tag, ERR_NOENTITY);
+                if (!s.viewer_clocked) self.advanceSelfClock(s);
                 var t = try self.replyHead(tag);
                 try t.usec(streamLatencyUsec(s));
                 try t.usec(0); // source latency
@@ -644,7 +773,11 @@ pub const Server = struct {
                 const idx = try r.u32be();
                 const b = try r.boolean();
                 if (self.streams.getPtr(idx)) |s| {
+                    // Bank played-so-far before freezing; uncork parks
+                    // the base so playback resumes from "now".
+                    if (!s.viewer_clocked) self.advanceSelfClock(s);
                     s.corked = b;
+                    s.clock_base_ms = null;
                     var pl: [5]u8 = undefined;
                     std.mem.writeInt(u32, pl[0..4], idx, .little);
                     pl[4] = @intFromBool(b);
@@ -661,7 +794,10 @@ pub const Server = struct {
                 const minreq = try r.u32be();
                 _ = maxlength;
                 _ = prebuf;
-                if (self.streams.getPtr(idx)) |s| s.tlength = tlength;
+                if (self.streams.getPtr(idx)) |s| {
+                    if (tlength != 0 and tlength != 0xffff_ffff) s.tlength = tlength;
+                    if (minreq != 0 and minreq != 0xffff_ffff) s.minreq = minreq;
+                }
                 var t = try self.replyHead(tag);
                 try t.u32be(4 * 1024 * 1024); // maxlength
                 try t.u32be(tlength);
@@ -670,18 +806,41 @@ pub const Server = struct {
                 if (self.version >= 13) try t.usec(20_000);
                 try self.finishFrame();
             },
+            CMD_FLUSH_PLAYBACK_STREAM => {
+                // Discard in-flight: playback jumps to the write head
+                // and a pending drain completes trivially.
+                const idx = try r.u32be();
+                if (self.streams.getPtr(idx)) |s| {
+                    s.read_index = s.write_index;
+                    s.clock_base_ms = null;
+                    try self.maybeFinishDrain(s);
+                }
+                _ = try self.replyHead(tag);
+                try self.finishFrame();
+            },
+            CMD_UPDATE_PLAYBACK_STREAM_SAMPLE_RATE => {
+                // The rate drives self-clock pacing — rebase so
+                // already-played bytes keep their old rate.
+                const idx = try r.u32be();
+                const rate = try r.u32be();
+                if (self.streams.getPtr(idx)) |s| {
+                    if (!s.viewer_clocked) self.advanceSelfClock(s);
+                    s.clock_base_ms = null;
+                    if (rate > 0) s.rate = rate;
+                }
+                _ = try self.replyHead(tag);
+                try self.finishFrame();
+            },
             // Accepted, trivially acknowledged (their real replies
             // ARE empty acks — anything with a payload gets its own
             // handler above; an empty reply where the client expects
             // fields fails its parse, or worse).
             CMD_SUBSCRIBE,
             CMD_EXIT,
-            CMD_FLUSH_PLAYBACK_STREAM,
             CMD_TRIGGER_PLAYBACK_STREAM,
             CMD_SET_PLAYBACK_STREAM_NAME,
             CMD_SET_SINK_INPUT_VOLUME,
             CMD_SET_SINK_INPUT_MUTE,
-            CMD_UPDATE_PLAYBACK_STREAM_SAMPLE_RATE,
             CMD_UPDATE_PLAYBACK_STREAM_PROPLIST,
             CMD_REMOVE_PLAYBACK_STREAM_PROPLIST,
             => {
@@ -717,24 +876,33 @@ pub const Server = struct {
             try r.skipProplist();
         }
 
-        const frame_bytes: u32 = @as(u32, ss.channels) * sampleSize(ss.format);
+        const frame_bytes: u32 = @max(@as(u32, ss.channels) * sampleSize(ss.format), 1);
         const bytes_per_sec: u64 = @as(u64, frame_bytes) * ss.rate;
         // Fill in "whatever" (0xffffffff) requests with ~200 ms.
-        if (tlength == 0 or tlength == 0xffff_ffff)
+        // Frame-aligned: unaligned server sizes lead clients into
+        // unaligned writes that fail (see advanceSelfClock).
+        if (tlength < frame_bytes or tlength == 0xffff_ffff)
             tlength = @intCast(@max(bytes_per_sec / 5, 4096));
+        tlength -= tlength % frame_bytes;
         if (maxlength == 0 or maxlength == 0xffff_ffff)
             maxlength = 4 * 1024 * 1024;
-        if (minreq == 0 or minreq == 0xffff_ffff)
+        if (minreq < frame_bytes or minreq == 0xffff_ffff)
             minreq = @intCast(@max(bytes_per_sec / 50, 1024));
+        minreq -= minreq % frame_bytes;
 
         const idx = self.next_stream;
         self.next_stream += 1;
+        if (std.c.getenv("SKETERM_PA_DEBUG") != null)
+            std.debug.print("pulse: create stream {d}: fmt {d} ch {d} rate {d} tlength {d} minreq {d} maxlength {d}\n", .{ idx, ss.format, ss.channels, ss.rate, tlength, minreq, maxlength });
         try self.streams.put(self.allocator, idx, .{
             .format = ss.format,
             .channels = ss.channels,
             .rate = ss.rate,
             .tlength = tlength,
+            .minreq = minreq,
             .corked = corked,
+            // The reply's `missing` below grants a full buffer.
+            .req_sent = tlength,
         });
         {
             var pl: [10]u8 = undefined;
@@ -841,6 +1009,8 @@ pub const Server = struct {
 
     /// Server-initiated: ask the app for `nbytes` more of stream.
     fn sendRequest(self: *Server, idx: u32, nbytes: u32) Error!void {
+        if (std.c.getenv("SKETERM_PA_DEBUG") != null)
+            std.debug.print("pulse: REQUEST stream {d} nbytes {d}\n", .{ idx, nbytes });
         try self.beginFrame();
         const t = Tw{ .buf = &self.out, .a = self.allocator };
         try t.u32be(CMD_REQUEST);
@@ -992,7 +1162,7 @@ test "auth + client name + create stream + pcm flows to units" {
         srv.clearUnits();
     }
 
-    { // PCM frame on channel 0 → pcm unit; no viewer → self-request
+    { // PCM frame on channel 0 → pcm unit; no viewer → self-CLOCKED
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(a);
         var desc: [DESC_SIZE]u8 = [_]u8{0} ** DESC_SIZE;
@@ -1008,9 +1178,12 @@ test "auth + client name + create stream + pcm flows to units" {
         try t_.expectEqual(@as(u32, 0), std.mem.readInt(u32, u.payload[0..4], .little));
         try t_.expectEqualStrings("\x01\x02\x03\x04\x05\x06\x07\x08", u.payload[4..]);
         srv.clearUnits();
-        // Self-clock REQUEST went to the app.
-        var r = Tr{ .buf = srv.takeOut()[DESC_SIZE..] };
-        try t_.expectEqual(@as(u32, CMD_REQUEST), try r.u32be());
+        // NOT consumed instantly anymore: the self-clock paces it.
+        try t_.expectEqual(@as(usize, 0), srv.takeOut().len);
+        try t_.expectEqual(@as(u64, 0), srv.streams.get(0).?.read_index);
+        // A tick well past the 8 bytes' duration plays them out.
+        _ = try srv.tick(1000);
+        try t_.expectEqual(@as(u64, 8), srv.streams.get(0).?.read_index);
         srv.clearOut();
     }
 
@@ -1030,6 +1203,181 @@ test "auth + client name + create stream + pcm flows to units" {
         srv.clearOut();
     }
     try t_.expect(!srv.dead);
+}
+
+/// Read one control frame from `buf`, returning command + a reader
+/// positioned after (command, tag) plus the total frame size.
+fn peelControl(buf: []const u8) ?struct { command: u32, tag: u32, size: usize } {
+    if (buf.len < DESC_SIZE) return null;
+    const len = std.mem.readInt(u32, buf[0..4], .big);
+    if (buf.len < DESC_SIZE + len) return null;
+    var r = Tr{ .buf = buf[DESC_SIZE .. DESC_SIZE + len] };
+    const command = r.u32be() catch return null;
+    const tag = r.u32be() catch return null;
+    return .{ .command = command, .tag = tag, .size = DESC_SIZE + len };
+}
+
+test "self-clock paces read_index and REQUESTs on real time" {
+    const a = t_.allocator;
+    var srv = Server.init(a);
+    defer srv.deinit();
+    srv.authorized = true;
+    // 48 kHz s16 stereo: 192000 B/s; ~200 ms tlength, ~20 ms minreq.
+    try srv.streams.put(a, 0, .{ .rate = 48000, .tlength = 38400, .minreq = 3840, .req_sent = 38400 });
+
+    // App writes 50 ms of audio (9600 bytes) at t=0.
+    srv.now_ms = 0;
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(a);
+    var desc: [DESC_SIZE]u8 = [_]u8{0} ** DESC_SIZE;
+    std.mem.writeInt(u32, desc[0..4], 9600, .big);
+    std.mem.writeInt(u32, desc[4..8], 0, .big);
+    try frame.appendSlice(a, &desc);
+    try frame.appendSlice(a, &([_]u8{0} ** 9600));
+    try srv.feed(frame.items);
+    srv.clearUnits();
+    try t_.expectEqual(@as(usize, 0), srv.takeOut().len); // nothing played yet
+
+    // 25 ms in: 4800 bytes played, one REQUEST(4800) due.
+    const d1 = try srv.tick(25);
+    try t_.expectEqual(@as(u64, 4800), srv.streams.get(0).?.read_index);
+    const pc = peelControl(srv.takeOut()).?;
+    try t_.expectEqual(@as(u32, CMD_REQUEST), pc.command);
+    srv.clearOut();
+    try t_.expect(d1 != null); // in-flight remains → wants another tick
+
+    // Way past the end: clamps at write_index (underrun), never beyond.
+    _ = try srv.tick(10_000);
+    try t_.expectEqual(@as(u64, 9600), srv.streams.get(0).?.read_index);
+    srv.clearOut();
+
+    // Fully played, no drain pending → idle, no deadline.
+    try t_.expectEqual(@as(?i64, null), try srv.tick(10_001));
+}
+
+test "drain completes on the clock, not instantly" {
+    const a = t_.allocator;
+    var srv = Server.init(a);
+    defer srv.deinit();
+    srv.authorized = true;
+    try srv.streams.put(a, 0, .{ .rate = 48000, .tlength = 38400, .minreq = 3840, .req_sent = 38400 });
+
+    srv.now_ms = 0;
+    { // 100 ms of audio
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(a);
+        var desc: [DESC_SIZE]u8 = [_]u8{0} ** DESC_SIZE;
+        std.mem.writeInt(u32, desc[0..4], 19200, .big);
+        std.mem.writeInt(u32, desc[4..8], 0, .big);
+        try frame.appendSlice(a, &desc);
+        try frame.appendSlice(a, &([_]u8{0} ** 19200));
+        try srv.feed(frame.items);
+        srv.clearUnits();
+    }
+    { // DRAIN at t=0: no reply yet
+        var fields: std.ArrayList(u8) = .empty;
+        defer fields.deinit(a);
+        const w = Tw{ .buf = &fields, .a = a };
+        try w.u32be(CMD_DRAIN_PLAYBACK_STREAM);
+        try w.u32be(42);
+        try w.u32be(0);
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(a);
+        try clientFrame(a, &frame, fields.items);
+        try srv.feed(frame.items);
+    }
+    try t_.expectEqual(@as(usize, 0), srv.takeOut().len);
+    try t_.expectEqual(@as(?u32, 42), srv.streams.get(0).?.drain_tag);
+
+    // Halfway: still draining (REQUESTs may flow, but no REPLY 42).
+    _ = try srv.tick(50);
+    {
+        var buf = srv.takeOut();
+        while (peelControl(buf)) |pc2| {
+            try t_.expect(pc2.command != CMD_REPLY);
+            buf = buf[pc2.size..];
+        }
+        srv.clearOut();
+    }
+
+    // Past the 100 ms mark: the drain reply lands with its tag.
+    _ = try srv.tick(101);
+    var found = false;
+    var buf = srv.takeOut();
+    while (peelControl(buf)) |pc2| {
+        if (pc2.command == CMD_REPLY and pc2.tag == 42) found = true;
+        buf = buf[pc2.size..];
+    }
+    try t_.expect(found);
+    try t_.expectEqual(@as(?u32, null), srv.streams.get(0).?.drain_tag);
+}
+
+test "viewer detach mid-stream reverts to the self clock" {
+    const a = t_.allocator;
+    var srv = Server.init(a);
+    defer srv.deinit();
+    srv.authorized = true;
+    srv.has_viewer = true;
+    try srv.streams.put(a, 0, .{ .rate = 48000, .tlength = 38400, .minreq = 3840, .req_sent = 38400 });
+
+    // Viewer clocks the stream, then the app banks unplayed data.
+    var pl: [12]u8 = undefined;
+    std.mem.writeInt(u32, pl[0..4], 0, .little);
+    std.mem.writeInt(u64, pl[4..12], 4800, .little);
+    srv.now_ms = 0;
+    try srv.applyUnit(.consumed, &pl);
+    srv.clearOut();
+    try t_.expect(srv.streams.get(0).?.viewer_clocked);
+    srv.streams.getPtr(0).?.write_index = 48000; // in-flight backlog
+
+    // Viewer gone: with the old code REQUESTs stopped forever here.
+    srv.has_viewer = false;
+    const deadline = try srv.tick(1000); // arms the self clock from the backlog
+    try t_.expect(deadline != null); // backlog in flight → wants pacing
+    _ = try srv.tick(1500);
+    const s = srv.streams.get(0).?;
+    try t_.expect(!s.viewer_clocked);
+    try t_.expect(s.read_index > 4800); // playback resumed on our clock
+    var found_req = false;
+    var buf = srv.takeOut();
+    while (peelControl(buf)) |pc2| {
+        if (pc2.command == CMD_REQUEST) found_req = true;
+        buf = buf[pc2.size..];
+    }
+    try t_.expect(found_req);
+}
+
+test "flush jumps playback to the write head" {
+    const a = t_.allocator;
+    var srv = Server.init(a);
+    defer srv.deinit();
+    srv.authorized = true;
+    try srv.streams.put(a, 0, .{ .rate = 48000, .tlength = 38400, .minreq = 3840, .req_sent = 38400, .write_index = 19200, .drain_tag = 7 });
+
+    var fields: std.ArrayList(u8) = .empty;
+    defer fields.deinit(a);
+    const w = Tw{ .buf = &fields, .a = a };
+    try w.u32be(CMD_FLUSH_PLAYBACK_STREAM);
+    try w.u32be(8);
+    try w.u32be(0);
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(a);
+    try clientFrame(a, &frame, fields.items);
+    try srv.feed(frame.items);
+
+    const s = srv.streams.get(0).?;
+    try t_.expectEqual(@as(u64, 19200), s.read_index);
+    try t_.expectEqual(@as(?u32, null), s.drain_tag);
+    // Both the pending drain (tag 7) and the flush (tag 8) got replies.
+    var seen7 = false;
+    var seen8 = false;
+    var buf = srv.takeOut();
+    while (peelControl(buf)) |pc2| {
+        if (pc2.command == CMD_REPLY and pc2.tag == 7) seen7 = true;
+        if (pc2.command == CMD_REPLY and pc2.tag == 8) seen8 = true;
+        buf = buf[pc2.size..];
+    }
+    try t_.expect(seen7 and seen8);
 }
 
 test "viewer consumed reports drive REQUESTs" {

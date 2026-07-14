@@ -51,6 +51,11 @@ pub const SpawnOpts = struct {
     /// PULSE_SERVER for the child ("unix:<absolute path>"): the mux
     /// daemon is the session's PulseAudio server too (remote audio).
     pulse_server: ?[*:0]const u8 = null,
+    /// Unset PULSE_SERVER when `pulse_server` is null. A daemon
+    /// started from inside a sketerm session inherits that session's
+    /// PULSE_SERVER; without this a hub-less child (audio disabled)
+    /// points at another session's — possibly dead — sink socket.
+    clear_pulse_server: bool = false,
     /// Private XDG_RUNTIME_DIR for an isolated app session (`sketerm
     /// app -i`). When set, the child's XDG_RUNTIME_DIR is pointed here
     /// and DBUS_SESSION_BUS_ADDRESS is cleared, so single-instance apps
@@ -208,7 +213,11 @@ pub const Pty = struct {
                 c.getenv("SKETERM_MUX_DMABUF") == null)
                 _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
         }
-        if (opts.pulse_server) |ps| _ = c.setenv("PULSE_SERVER", ps, 1);
+        if (opts.pulse_server) |ps| {
+            _ = c.setenv("PULSE_SERVER", ps, 1);
+        } else if (opts.clear_pulse_server) {
+            _ = c.unsetenv("PULSE_SERVER");
+        }
         // Isolated app session: give the child a private runtime dir
         // and drop the inherited session bus. Both are how
         // single-instance apps find a peer for the same user — cutting
