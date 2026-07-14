@@ -51,7 +51,8 @@ const MCP_HELP =
     \\                 holding every JSON-RPC request and response as
     \\                 one line in mcp-<pid>.jsonl (long lines
     \\                 truncated) and every inline screenshot as
-    \\                 img-<pid>-NNNN.png
+    \\                 img-<pid>-NNNN.png (click/move-marked shots
+    \\                 get a -click / -move filename suffix)
     \\
     \\Headless GUI-app tools (no GUI needed; apps render into the mux
     \\daemon, never on a screen): launch_app, list_apps, app_windows,
@@ -228,11 +229,18 @@ const McpLog = struct {
         self.emit(aw.written());
     }
 
-    /// Save an inline screenshot as img-<pid>-NNNN.png + a trace entry.
-    fn logImage(self: *McpLog, caption: []const u8, png: []const u8) void {
+    /// Save an inline screenshot as img-<pid>-NNNN[-tag].png + a trace
+    /// entry. `tag` names what triggered the shot ("click", "move");
+    /// "" for plain captures.
+    fn logImage(self: *McpLog, caption: []const u8, png: []const u8, tag: []const u8) void {
         self.img_seq += 1;
+        var nbuf: [64]u8 = undefined;
+        const fname = std.fmt.bufPrint(&nbuf, "img-{d}-{d:0>4}{s}{s}.png", .{
+            c.getpid(), self.img_seq,
+            if (tag.len > 0) "-" else "", tag,
+        }) catch return;
         var z: [4096]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&z, "{s}/img-{d}-{d:0>4}.png", .{ self.dir, c.getpid(), self.img_seq }) catch return;
+        const path = std.fmt.bufPrintZ(&z, "{s}/{s}", .{ self.dir, fname }) catch return;
         if (c.fopen(path.ptr, "wb")) |f| {
             _ = c.fwrite(png.ptr, 1, png.len, f);
             _ = c.fclose(f);
@@ -242,7 +250,7 @@ const McpLog = struct {
         var aw: std.Io.Writer.Allocating = .init(arena_state.allocator());
         const w = &aw.writer;
         var tbuf: [40]u8 = undefined;
-        w.print("{{\"ts\":\"{s}\",\"event\":\"image\",\"file\":\"img-{d}-{d:0>4}.png\",\"bytes\":{d},\"caption\":", .{ stamp(&tbuf), c.getpid(), self.img_seq, png.len }) catch return;
+        w.print("{{\"ts\":\"{s}\",\"event\":\"image\",\"file\":\"{s}\",\"bytes\":{d},\"caption\":", .{ stamp(&tbuf), fname, png.len }) catch return;
         std.json.Stringify.value(caption, .{}, w) catch return;
         w.writeAll("}") catch return;
         self.emit(aw.written());
@@ -748,7 +756,13 @@ fn rpcError(arena: std.mem.Allocator, id: std.json.Value, code: i32, msg: []cons
 /// inline image content block. base64 emits no newlines, so the
 /// NDJSON framing is safe.
 fn imageResult(arena: std.mem.Allocator, caption: []const u8, png_bytes: []const u8) ?[]const u8 {
-    if (mcp_log) |*l| l.logImage(caption, png_bytes);
+    return imageResultTagged(arena, caption, png_bytes, "");
+}
+
+/// Like imageResult, but the --log trace file gets a "-tag" filename
+/// suffix (img-<pid>-NNNN-click.png) so shot kinds sort apart.
+fn imageResultTagged(arena: std.mem.Allocator, caption: []const u8, png_bytes: []const u8, tag: []const u8) ?[]const u8 {
+    if (mcp_log) |*l| l.logImage(caption, png_bytes, tag);
     const enc = std.base64.standard.Encoder;
     const b64 = arena.alloc(u8, enc.calcSize(png_bytes.len)) catch return null;
     _ = enc.encode(b64, png_bytes);
@@ -765,14 +779,20 @@ fn imageResult(arena: std.mem.Allocator, caption: []const u8, png_bytes: []const
 /// Multi-image tool result: one caption text block, then every PNG as
 /// its own inline image content block (burst capture).
 fn imagesResult(arena: std.mem.Allocator, caption: []const u8, pngs: []const []const u8) ?[]const u8 {
+    return imagesResultTagged(arena, caption, pngs, null);
+}
+
+/// Like imagesResult, with an optional per-image tag list (parallel
+/// to `pngs`) for the --log trace filenames.
+fn imagesResultTagged(arena: std.mem.Allocator, caption: []const u8, pngs: []const []const u8, tags: ?[]const []const u8) ?[]const u8 {
     const enc = std.base64.standard.Encoder;
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":") catch return null;
     std.json.Stringify.value(caption, .{}, w) catch return null;
     w.writeAll("}") catch return null;
-    for (pngs) |p| {
-        if (mcp_log) |*l| l.logImage(caption, p);
+    for (pngs, 0..) |p, i| {
+        if (mcp_log) |*l| l.logImage(caption, p, if (tags) |ts| (if (i < ts.len) ts[i] else "") else "");
         const b64 = arena.alloc(u8, enc.calcSize(p.len)) catch return null;
         _ = enc.encode(b64, p);
         w.writeAll(",{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"") catch return null;
@@ -1441,12 +1461,22 @@ fn actionsCapture(
     app: *appdrive.App,
     w: *std.Io.Writer,
     pngs: *std.ArrayList([]const u8),
+    tags: *std.ArrayList([]const u8),
     pending: *std.ArrayList(marks_mod.Mark),
     wid: u32,
     max_px: u32,
     prefix: []const u8,
 ) !bool {
     const marks_n = pending.items.len;
+    // Trace-filename tag: what the marks in this shot depict.
+    var tag: []const u8 = "";
+    for (pending.items) |m| {
+        if (m.kind == .click) {
+            tag = "click";
+            break;
+        }
+        tag = "move";
+    }
     const shot = app.screenshotPngMarked(wid, max_px, null, 1, pending.items) catch {
         try w.print("{s}: ERROR — screenshot failed (no pixels yet?)\n", .{prefix});
         return false;
@@ -1455,6 +1485,7 @@ fn actionsCapture(
         app_state.allocator.free(shot.png);
         return error.OutOfMemory;
     };
+    tags.append(arena, tag) catch return error.OutOfMemory;
     pending.clearRetainingCapacity();
     if (shot.scale == 1.0) {
         try w.print("{s}: screenshot #{d} of window {d} ({d}x{d})", .{ prefix, pngs.items.len, wid, shot.img_w, shot.img_h });
@@ -1952,7 +1983,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                     "",
             });
             const caption = try screenshotCaption(arena, app, win_id, shot, extra);
-            return imageResult(arena, caption, shot.png) orelse error.OutOfMemory;
+            return imageResultTagged(arena, caption, shot.png, "click") orelse error.OutOfMemory;
         }
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
     }
@@ -1973,6 +2004,9 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             for (pngs.items) |p| app_state.allocator.free(p);
             pngs.deinit(arena);
         }
+        // Per-image trace-filename tags, parallel to `pngs`.
+        var shot_tags: std.ArrayList([]const u8) = .empty;
+        defer shot_tags.deinit(arena);
         var stopped = false;
         // Marks accumulated by `"mark": true` steps; drawn onto (and
         // consumed by) the next screenshot so several clicks can share
@@ -2167,7 +2201,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                         pending_marks.append(arena, .{ .x = p.x, .y = p.y, .kind = .move, .label = @intCast(n) }) catch {};
                 }
                 const prefix = try std.fmt.allocPrint(arena, "step {d}", .{n});
-                if (!try actionsCapture(arena, app, w, &pngs, &pending_marks, wid, max_px, prefix)) {
+                if (!try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, max_px, prefix)) {
                     stopped = true;
                     break;
                 }
@@ -2186,7 +2220,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                     try w.print("step {d}: screenshot SKIPPED (max {d} per call)\n", .{ n, MAX_SHOTS });
                 } else if (wid != 0) {
                     const prefix = try std.fmt.allocPrint(arena, "step {d}", .{n});
-                    _ = try actionsCapture(arena, app, w, &pngs, &pending_marks, wid, 1568, prefix);
+                    _ = try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, 1568, prefix);
                 }
             }
         }
@@ -2195,12 +2229,12 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         if (pending_marks.items.len > 0 and pngs.items.len < MAX_SHOTS) {
             const wid = win_arg orelse firstToplevelId(app);
             if (wid != 0)
-                _ = try actionsCapture(arena, app, w, &pngs, &pending_marks, wid, 1568, "end of batch");
+                _ = try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, 1568, "end of batch");
         }
         if (!stopped) try w.print("all {d} steps completed\n", .{steps.len});
         if (app.exited) try w.writeAll(try appSummary(arena, app));
         if (pngs.items.len > 0)
-            return imagesResult(arena, aw.written(), pngs.items) orelse error.OutOfMemory;
+            return imagesResultTagged(arena, aw.written(), pngs.items, shot_tags.items) orelse error.OutOfMemory;
         return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_mouse_move")) {
@@ -2967,7 +3001,8 @@ test "mcp log: entries and screenshot files land in the dir" {
     defer t.allocator.free(big);
     @memset(big, 'x');
     log.logMessage("out", big);
-    log.logImage("shot of app 1", "\x89PNG-fake-bytes");
+    log.logImage("shot of app 1", "\x89PNG-fake-bytes", "");
+    log.logImage("post-click shot", "\x89PNG-click-bytes", "click");
     log.close();
 
     var pbuf: [512]u8 = undefined;
@@ -2998,6 +3033,16 @@ test "mcp log: entries and screenshot files land in the dir" {
     const in = c.fread(&ibuf, 1, ibuf.len, imgf);
     _ = c.fclose(imgf);
     try t.expectEqualStrings("\x89PNG-fake-bytes", ibuf[0..in]);
+
+    // A tagged shot gets the "-click" filename suffix.
+    var cbuf: [512]u8 = undefined;
+    const click_z = try std.fmt.bufPrintZ(&cbuf, "{s}/img-{d}-0002-click.png", .{ session_dir, c.getpid() });
+    const clickf = c.fopen(click_z.ptr, "r") orelse return error.NoClickImageFile;
+    const cn = c.fread(&ibuf, 1, ibuf.len, clickf);
+    _ = c.fclose(clickf);
+    try t.expectEqualStrings("\x89PNG-click-bytes", ibuf[0..cn]);
+    try t.expect(std.mem.indexOf(u8, text, "-click.png") != null);
+    _ = c.unlink(click_z.ptr);
 
     _ = c.unlink(img_z.ptr);
     const jsonl_z2 = try std.fmt.bufPrintZ(&pbuf, "{s}/mcp-{d}.jsonl", .{ session_dir, c.getpid() });
