@@ -58,6 +58,16 @@ pub const Conn = struct {
         return .{ .allocator = allocator, .fd = fd };
     }
 
+    /// Connect to a specific daemon socket and complete the
+    /// hello/welcome probe (proto negotiation — without it the daemon
+    /// treats the client as proto 1 and never streams app channels).
+    /// NO autostart and no stale-daemon retire: viewer semantics — a
+    /// dead or mismatched daemon is an error, not a spawn.
+    pub fn connectProbed(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
+        const conn = try Conn.connect(allocator, sock_path);
+        return helloProbe(allocator, conn);
+    }
+
     /// Connect to the local daemon, spawning it (sibling binary,
     /// $PATH fallback) and retrying for ~2s when it isn't running.
     /// Sends the hello/welcome probe like the remote transports do —

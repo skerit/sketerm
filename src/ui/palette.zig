@@ -123,6 +123,8 @@ const ENTRIES = [_]Entry{
        .desc = "Re-read config.conf from disk and apply live.", .action = .reload_config },
     .{ .icon = "application-x-executable-symbolic", .title = "Launch App…",
        .desc = "Pick an installed GUI app on this pane's host and run it as a forwarded app.", .action = .launch_app },
+    .{ .icon = "view-grid-symbolic", .title = "App Windows…",
+       .desc = "Open forwarded-app windows (raise/focus) and attachable app sessions, incl. assistant (MCP) daemons.", .action = .app_windows },
     .{ .icon = "preferences-other-symbolic", .title = "Apply Profile to Pane…",
        .desc = "Re-style the focused pane with a profile's font/colors/scrollback.", .action = .apply_profile },
 

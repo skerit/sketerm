@@ -1851,6 +1851,7 @@ fn onAppViewEvent(ctx: ?*anyopaque, host_opaque: ?*anyopaque) void {
         h.embed_ctx = @ptrCast(self);
         h.on_embed = onAppEmbedChanged;
         h.on_request_embed = onAppRequestEmbed;
+        h.on_windows_changed = onAppWindowsChanged;
         if (self.app_view_tab) installEmbedBox(self, h);
     } else {
         setAppBanner(self, false);
@@ -1892,6 +1893,21 @@ fn onAppBannerClick(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
     const remote = self.terminal.remote orelse return;
     for (remote.napps.items) |na| na.host.presentAll();
+}
+
+/// The app's open-window count changed. Zero windows with the app
+/// still running (mode switch, single-instance handoff) must retire
+/// the banner — clicking it would be a silent no-op; a later window
+/// brings it back.
+fn onAppWindowsChanged(ctx: ?*anyopaque, count: usize) void {
+    const self = cast.userData(Pane, ctx);
+    if (count == 0) {
+        setAppBanner(self, false);
+    } else if (!self.app_embed_active) {
+        if (self.terminal.remote) |r| {
+            if (r.app_window_opened) setAppBanner(self, true);
+        }
+    }
 }
 
 /// Ensure the embed container exists and hand it to the host (the

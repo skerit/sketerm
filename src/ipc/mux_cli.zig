@@ -621,6 +621,14 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
                 return null;
             };
         }
+        // "sock:/path" = a specific daemon instance's unix socket (an
+        // MCP private daemon). Connect only — never autostart one.
+        if (std.mem.startsWith(u8, h, "sock:")) {
+            return mux_client.Conn.connectProbed(allocator, h[5..]) catch {
+                _ = c.fprintf(platform.stderr(), "sketerm mux: no daemon at that socket (or version mismatch)\n");
+                return null;
+            };
+        }
         return mux_client.Conn.connectSsh(allocator, h) catch |err| {
             if (err == error.MuxProtoMismatch) {
                 _ = c.fprintf(
