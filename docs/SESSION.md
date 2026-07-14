@@ -7683,3 +7683,68 @@ clip in 3189 ms; captured cap.wav / cap-2.wav decode to exactly
 sine. 721/727 tests (3 new: v15 sink state, wavcap round-trip,
 wavcap format refusal), smoke-mux + smoke-mcp + smoke-e2e PASS,
 mux-portable incl. aarch64-macos green, sketerm-mux still libc-only.
+
+## 2026-07-14 (round 6) — click markers, exit-decode everywhere, log-ring recent_output
+
+Sixth MCP feedback round (same DOS-game-port reporter). One feature,
+two reliability fixes, several ergonomics wishes; all landed.
+
+**1. Click/hover marker visualization (the headline request).** New
+`src/util/marks.zig`: pure-RGBA crosshair+ring markers with a black
+backing (visible on any background), red = click, cyan = move/hover,
+plus a tiny 3x5 bitmap-digit label (the step number). appdrive gained
+`screenshotPngMarked` (marks in surface coordinates, drawn post-crop
+pre-zoom so they scale with the pixels; the no-marks fast path is
+untouched). Exposed as:
+- `app_click mark:true` — returns the POST-click frame with the click
+  pixel marked (screenshot:true = frame without marker).
+- `app_actions` per-step `"mark":true` on click/move/move_rel/drag/
+  scroll: marks accumulate and are drawn onto the NEXT screenshot
+  (several labelled clicks can share one image); the combined form
+  {"click":[x,y],"mark":true,"screenshot":true} captures right after
+  the action; leftover marks auto-flush as a final image.
+The guest-cursor caveat is documented in the caption: coordinates are
+delivered verbatim, only pointer-LOCKED apps track their own cursor
+(calibrate via app_mouse_move deltas).
+
+**2. Exit decode everywhere (reported "segfault exited 0").** The
+reap-race retry landed in an earlier round; what remained was decode
+coverage: appSummary now emits `signaled/signal/signal_name` plus
+`crashed:true` (ILL/ABRT/BUS/FPE/SEGV) for -signo statuses, and
+decodes shell-wrapped deaths (`exit 139 = 128+11`) as
+`likely_signal`/`likely_signal_name` + note. The app_actions
+"app exited (status N)" skip line and app_output's header carry the
+same suffix. A gdb-wrapped run exits 0 — appSummary spots "Program
+received signal" in the log stash and flags `debugger_caught_signal`.
+
+**3. recent_output now comes from the log ring, not the grid.** The
+reporter saw exit summaries with ~2 mid-token-wrapped lines (the 80col
+grid mirror) while app_log had everything. appSummary and app_output
+now prefer the daemon's pre-exit log stash: escape-free FULL lines,
+never wrapped, `recent_output_source` says so. Grid extract remains
+the fallback; a blank grid after exit serves the log tail instead of
+"the app has written nothing". Sanitizer reports in the log flag
+`sanitizer_report:true`.
+
+**4. launch_app `debug:"gdb"|"valgrind"`.** Wraps the command (gdb
+-q -batch -ex run -ex "bt full" -ex "info registers" --args ...);
+works for string commands too (sh execs simple commands, gdb follows
+the exec). The crash backtrace + registers land in app_log; the reply
+notes the pid is the wrapper's.
+
+**5. --log per-session subfolders (user request).** Each `sketerm mcp
+--log DIR` run now writes into DIR/YYYYMMDD-HHMMSS/ (jsonl + PNGs)
+instead of dumping everything into DIR directly.
+
+**6. Doc fixes.** app_actions schema: `wait` is MILLISECONDS;
+`wait_idle change_pct` called out as the scene-transition wait (the
+requested "wait_until framebuffer settles" already existed);
+app_output's description names app_log as the source of truth.
+
+Verified: 725/731 tests (5 new: marks module x4, per-session log
+subdir), smoke-mcp PASS, GUI + mux-portable build, and a live e2e
+drive: argv crashy → -11/SIGSEGV/crashed + unwrapped recent_output;
+`crashy && echo` → 139 decoded as likely SIGSEGV; debug:gdb → bt full
+with source line in app_log; weston-terminal app_click mark:true and
+a 4-step marked app_actions batch → labelled crosshairs verified
+pixel-level in the trace PNGs; log dirs 20260714-*/ created per run.
