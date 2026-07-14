@@ -54,6 +54,9 @@ pub const AppHost = struct {
     /// the pane answers by installing embed_box and calling popIn.
     /// Null = no pane offers a tab (menu row hidden).
     on_request_embed: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// Open-window count changed (uses embed_ctx). Lets the pane
+    /// retire its raise banner when the app drops all toplevels.
+    on_windows_changed: ?*const fn (ctx: ?*anyopaque, count: usize) void = null,
     embed_ctx: ?*anyopaque = null,
     flush_ctx: ?*anyopaque = null,
     /// Fired once, on the first frame of the app's FIRST toplevel
@@ -939,10 +942,46 @@ pub const AppHost = struct {
         }
     }
 
-    /// Raise every window of this app (mirror click).
+    /// Raise every floating window of this app (mirror click).
+    /// Embedded windows live in a pane; their host window is hidden
+    /// and childless — presenting it would map an empty shell.
     pub fn presentAll(self: *AppHost) void {
         var it = self.windows.valueIterator();
-        while (it.next()) |w| c.gtk_window_present(w.*.window);
+        while (it.next()) |w| {
+            if (!w.*.embedded) c.gtk_window_present(w.*.window);
+        }
+    }
+
+    /// One open window as a picker/switcher sees it. `paintable` is
+    /// the picture's current paintable (borrowed — ref it to keep it).
+    pub const WinInfo = struct {
+        surface: u32,
+        title: [*:0]const u8,
+        embedded: bool,
+        paintable: ?*c.GdkPaintable,
+    };
+
+    /// Snapshot of the open windows (caller frees the slice).
+    pub fn windowInfos(self: *AppHost, allocator: std.mem.Allocator) []WinInfo {
+        var out: std.ArrayList(WinInfo) = .empty;
+        var it = self.windows.valueIterator();
+        while (it.next()) |w| {
+            const t = c.gtk_window_get_title(w.*.window);
+            out.append(allocator, .{
+                .surface = w.*.surface,
+                .title = if (t) |tt| tt else "",
+                .embedded = w.*.embedded,
+                .paintable = c.gtk_picture_get_paintable(@ptrCast(w.*.picture)),
+            }) catch break;
+        }
+        return out.toOwnedSlice(allocator) catch &.{};
+    }
+
+    /// Raise ONE floating window (switcher activate). Embedded
+    /// windows are raised by focusing their pane instead.
+    pub fn presentSurface(self: *AppHost, surface: u32) void {
+        const win = self.windows.get(surface) orelse return;
+        if (!win.embedded) c.gtk_window_present(win.window);
     }
 
     fn onPopupDraw(_: ?*c.GtkDrawingArea, cr: ?*c.cairo_t, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
@@ -1197,6 +1236,7 @@ pub const AppHost = struct {
         _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-wlapp", null);
         c.gtk_window_destroy(win.window);
         self.allocator.destroy(win);
+        if (self.on_windows_changed) |f| f(self.embed_ctx, self.windows.count());
     }
 
     /// Show/hide the AI badge on every window (assistant attached to
@@ -1300,6 +1340,7 @@ pub const AppHost = struct {
             self.wireFloating(win);
             c.gtk_window_present(window);
         }
+        if (self.on_windows_changed) |f| f(self.embed_ctx, self.windows.count());
         return win;
     }
 
@@ -1462,6 +1503,7 @@ pub const AppHost = struct {
         self.embed_box = null;
         self.on_embed = null;
         self.on_request_embed = null;
+        self.on_windows_changed = null;
         self.embed_ctx = null;
     }
 

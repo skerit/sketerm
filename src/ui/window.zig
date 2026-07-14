@@ -3791,9 +3791,35 @@ pub const Window = struct {
                     null;
                 return mux_client.Conn.connectUdp(self.allocator, h[4..], range);
             }
+            // "sock:/path" targets a specific daemon instance's unix
+            // socket (an MCP private/named daemon) — connect only,
+            // NEVER autostart: a dead assistant daemon must not be
+            // resurrected empty by a viewer.
+            if (std.mem.startsWith(u8, h, "sock:")) {
+                return mux_client.Conn.connectProbed(self.allocator, h[5..]);
+            }
             return mux_client.Conn.connectSsh(self.allocator, h);
         }
         return mux_client.Conn.connectLocalAutostart(self.allocator);
+    }
+
+    /// Connect + attach a session as a viewer tab/app (switcher rows,
+    /// `sketerm cli attach-session`). Host semantics of muxConnect
+    /// (null local, "user@box", "udp:box", "sock:/path").
+    pub fn attachSessionByHost(self: *Window, name: []const u8, host: ?[]const u8) bool {
+        const conn = self.muxConnect(host) catch return false;
+        self.attachMux(conn, name, host, null) catch return false;
+        return true;
+    }
+
+    /// Select the tab containing `pane`, focus it and raise the
+    /// window (switcher activate on an embedded app / pane row).
+    pub fn focusPaneTab(self: *Window, pane: *Pane) void {
+        if (tabPageForPane(self, pane)) |page| {
+            c.adw_tab_view_set_selected_page(self.tab_view, page);
+            _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
+        }
+        c.gtk_window_present(@ptrCast(self.app_window));
     }
 
     /// Spawn a shell session in the daemon (local or `host`'s) and
@@ -3845,7 +3871,7 @@ pub const Window = struct {
 
     /// True when a pane or tabless app session in this window already
     /// renders mux session `name` on `host` (null = local daemon).
-    fn sessionShown(self: *Window, name: []const u8, host: ?[]const u8) bool {
+    pub fn sessionShown(self: *Window, name: []const u8, host: ?[]const u8) bool {
         for (self.panes.items) |p| {
             const r = p.terminal.remote orelse continue;
             if (!hostEql(r.host, host)) continue;
@@ -6324,6 +6350,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .toggle_tab_bar => self.toggleTabBarVisibility(),
         .reload_config => self.reloadConfigFromDisk(),
         .launch_app => if (self.focusedPane()) |p| @import("app_launcher.zig").open(self, p),
+        .app_windows => @import("app_switcher.zig").open(self),
         .goto_tab_1 => self.gotoTab(0),
         .goto_tab_2 => self.gotoTab(1),
         .goto_tab_3 => self.gotoTab(2),

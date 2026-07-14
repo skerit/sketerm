@@ -111,6 +111,10 @@ pub const Action = enum {
     /// Open the app launcher (installed GUI apps on the focused
     /// pane's host — local daemon or SSH remote).
     launch_app,
+    /// Open the app-window switcher: every open forwarded-app window
+    /// (with thumbnails) plus attachable app sessions on the local
+    /// daemon and on assistant (MCP) daemon instances.
+    app_windows,
     /// Jump to a specific tab by 1-based index. Defaults: Alt+1
     /// through Alt+9 — gnome-terminal / Firefox / most multi-tab
     /// apps use this. Out-of-range index is a no-op.
@@ -311,6 +315,7 @@ pub fn actionName(a: Action) []const u8 {
         .toggle_tab_bar => "toggle_tab_bar",
         .reload_config => "reload_config",
         .launch_app => "launch_app",
+        .app_windows => "app_windows",
         .goto_tab_1 => "goto_tab_1",
         .goto_tab_2 => "goto_tab_2",
         .goto_tab_3 => "goto_tab_3",
@@ -387,6 +392,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .toggle_tab_bar => "Show / hide tab bar",
         .reload_config => "Reload config from disk",
         .launch_app => "Launch app on this host…",
+        .app_windows => "App windows (raise / attach)…",
         .goto_tab_1 => "Jump to tab 1",
         .goto_tab_2 => "Jump to tab 2",
         .goto_tab_3 => "Jump to tab 3",
