@@ -17,6 +17,7 @@ const platform = @import("../util/platform.zig");
 const protocol = @import("protocol.zig");
 const appdrive = @import("appdrive.zig");
 const termdrive = @import("termdrive.zig");
+const marks_mod = @import("../util/marks.zig");
 
 const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
@@ -45,10 +46,12 @@ const MCP_HELP =
     \\$XDG_RUNTIME_DIR/sketerm/). Isolated mode without --socket
     \\leaves them disabled with a clear error.
     \\
-    \\  --log DIR      trace everything to DIR: every JSON-RPC request
-    \\                 and response as one line in mcp-<pid>.jsonl
-    \\                 (long lines truncated), and every inline
-    \\                 screenshot saved as img-<pid>-NNNN.png
+    \\  --log DIR      trace everything to DIR: each session gets its
+    \\                 own datetime subfolder DIR/YYYYMMDD-HHMMSS/
+    \\                 holding every JSON-RPC request and response as
+    \\                 one line in mcp-<pid>.jsonl (long lines
+    \\                 truncated) and every inline screenshot as
+    \\                 img-<pid>-NNNN.png
     \\
     \\Headless GUI-app tools (no GUI needed; apps render into the mux
     \\daemon, never on a screen): launch_app, list_apps, app_windows,
@@ -137,9 +140,10 @@ fn validInstanceName(n: []const u8) bool {
 
 /// `--log DIR` trace: one JSONL entry per MCP message plus every
 /// inline screenshot as a standalone PNG so the trace stays small.
+/// Each session logs into its own DIR/YYYYMMDD-HHMMSS/ subfolder.
 const McpLog = struct {
     allocator: std.mem.Allocator,
-    /// Owned copy of the --log flag value, no trailing slash assumed.
+    /// Owned per-session subdirectory (DIR/YYYYMMDD-HHMMSS).
     dir: []u8,
     file: *c.FILE,
     img_seq: u32 = 0,
@@ -153,10 +157,30 @@ const McpLog = struct {
         var z: [4096]u8 = undefined;
         const dir_z = std.fmt.bufPrintZ(&z, "{s}", .{dir_arg}) catch return null;
         _ = c.mkdir(dir_z.ptr, 0o700); // parent must exist; fopen below is the real check
-        const path = std.fmt.bufPrintZ(&z, "{s}/mcp-{d}.jsonl", .{ dir_arg, c.getpid() }) catch return null;
-        const f = c.fopen(path.ptr, "a") orelse return null;
-        const dir = allocator.dupe(u8, dir_arg) catch {
-            _ = c.fclose(f);
+        // Each session logs into its own datetime-named subfolder so
+        // traces and screenshots of separate runs never interleave.
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+        var tm: c.struct_tm = undefined;
+        _ = c.localtime_r(&ts.tv_sec, &tm);
+        const sub = std.fmt.bufPrintZ(&z, "{s}/{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
+            dir_arg,
+            @as(u32, @intCast(@as(i64, tm.tm_year) + 1900)),
+            @as(u32, @intCast(tm.tm_mon + 1)),
+            @as(u32, @intCast(tm.tm_mday)),
+            @as(u32, @intCast(tm.tm_hour)),
+            @as(u32, @intCast(tm.tm_min)),
+            @as(u32, @intCast(tm.tm_sec)),
+        }) catch return null;
+        _ = c.mkdir(sub.ptr, 0o700);
+        const dir = allocator.dupe(u8, sub) catch return null;
+        var pz: [4096]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&pz, "{s}/mcp-{d}.jsonl", .{ dir, c.getpid() }) catch {
+            allocator.free(dir);
+            return null;
+        };
+        const f = c.fopen(path.ptr, "a") orelse {
+            allocator.free(dir);
             return null;
         };
         return .{ .allocator = allocator, .dir = dir, .file = f };
@@ -805,15 +829,15 @@ const TOOLS_JSON_RAW =
     \\{"name":"focus_pane","description":"Focus a pane (selects its tab and grabs keyboard focus).","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
     \\{"name":"close_pane","description":"Close a pane. Destructive: the shell and any running process in it are terminated.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
     \\{"name":"list_installed_apps","description":"List installed GUI apps on the host (name + launch command), from its .desktop entries. Pass host for a remote machine. Use before launch_app to discover what can run.","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH host (user@box); omit = local"}}}},
-    \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns the app id, the child pid on the daemon's host (attach a debugger with gdb -p; with a string command the pid is the wrapping /bin/sh — pass an argv array to make it the app itself), its windows AND the first window's screenshot inline (launch-and-look in one call). If the app exits early, the reply includes exit status, terminating signal and its recent output. Drive it with get_app_state/app_click/app_type/app_key; read its stdout/stderr with app_output.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"cwd":{"type":"string","description":"Working directory for the app"},"env":{"type":"object","description":"Extra environment variables, e.g. {\"FOO\":\"1\"}","additionalProperties":{"type":"string"}},"wait_for":{"type":"string","enum":["window","exit"],"description":"What to wait for before replying: first window (default) or process exit (short-lived/CLI runs)"},"wait_ms":{"type":"integer","description":"Max wait (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"},"layout":{"type":"string","description":"Session keyboard layout: us (default), gb, fr, be, de"},"gpu":{"type":"boolean","description":"Render on the host's real GPU via linux-dmabuf instead of software GL. Needs a driver whose linear buffers allow CPU mmap."},"audio":{"type":"string","enum":["forward","none"],"description":"forward (default): PULSE_SERVER points at sketerm's per-session audio sink, which paces playback in real time (samples are discarded unless a GUI viewer is attached). none: no PULSE_SERVER, so the app falls back to its own dummy/null audio driver."},"audio_path":{"type":"string","description":"Capture the app's audio to WAV at this absolute path base ON THE DAEMON'S HOST (first stream: <base>.wav, later streams: <base>-N.wav; a trailing .wav in the base is stripped). Playback pacing is unaffected — this tees the PCM the sink consumes, so you can verify the app actually produced sound. Incompatible with audio:\"none\"."}},"required":["command"]}},
+    \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns the app id, the child pid on the daemon's host (attach a debugger with gdb -p; with a string command the pid is the wrapping /bin/sh — pass an argv array to make it the app itself), its windows AND the first window's screenshot inline (launch-and-look in one call). If the app exits early, the reply includes exit status, terminating signal and its recent output. Drive it with get_app_state/app_click/app_type/app_key; read its stdout/stderr with app_output.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"cwd":{"type":"string","description":"Working directory for the app"},"env":{"type":"object","description":"Extra environment variables, e.g. {\"FOO\":\"1\"}","additionalProperties":{"type":"string"}},"wait_for":{"type":"string","enum":["window","exit"],"description":"What to wait for before replying: first window (default) or process exit (short-lived/CLI runs)"},"wait_ms":{"type":"integer","description":"Max wait (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"},"layout":{"type":"string","description":"Session keyboard layout: us (default), gb, fr, be, de"},"gpu":{"type":"boolean","description":"Render on the host's real GPU via linux-dmabuf instead of software GL. Needs a driver whose linear buffers allow CPU mmap."},"audio":{"type":"string","enum":["forward","none"],"description":"forward (default): PULSE_SERVER points at sketerm's per-session audio sink, which paces playback in real time (samples are discarded unless a GUI viewer is attached). none: no PULSE_SERVER, so the app falls back to its own dummy/null audio driver."},"audio_path":{"type":"string","description":"Capture the app's audio to WAV at this absolute path base ON THE DAEMON'S HOST (first stream: <base>.wav, later streams: <base>-N.wav; a trailing .wav in the base is stripped). Playback pacing is unaffected — this tees the PCM the sink consumes, so you can verify the app actually produced sound. Incompatible with audio:\"none\"."},"debug":{"type":"string","enum":["gdb","valgrind"],"description":"Run the app under a debug wrapper: gdb (batch mode — on a crash the full backtrace + registers land in app_log) or valgrind (report in app_log at exit). The reported pid is the wrapper's."}},"required":["command"]}},
     \\{"name":"list_apps","description":"List launched headless apps and their windows.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"app_windows","description":"List one app's rendered windows (ids, sizes, titles).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
     \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Optional region crop and integer zoom for pixel-level inspection; downscaled when larger than max_px. The caption tells you how to map image coordinates back to app_click coordinates. wait_change=true blocks until the window renders something NEWER than your last screenshot (verify a click did something); stable_ms waits until repainting stops before capturing (settle-then-capture — combine both to catch 'changed, then went quiet'). stats_only=true skips the image and just reports whether/how much the window changed since your last look (cheap polling). burst=N captures up to N frames over burst_ms, each at least min_change_pct different from the previous — one call across an animated transition.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"},"region":{"type":"object","description":"Crop to a sub-rectangle in surface pixels","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer","description":"Nearest-neighbor integer upscale (1-32) — crop a small region and zoom to inspect pixels"},"wait_change":{"type":"boolean","description":"Wait until the window content changed since the last screenshot before capturing"},"stable_ms":{"type":"integer","description":"Capture only after the window committed no new frame for this long (settle-then-capture)"},"stats_only":{"type":"boolean","description":"Return {changed, diff_pct, resized, w, h, frames} instead of an image"},"burst":{"type":"integer","description":"Capture up to N distinct frames (2-8) over burst_ms"},"burst_ms":{"type":"integer","description":"Burst time window (default 5000)"},"min_change_pct":{"type":"number","description":"Minimum %% of pixels changed vs the previous burst frame (default 1.0)"},"timeout_ms":{"type":"integer","description":"Bound for wait_change/stable_ms (default 10000)"}}}},
     \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app. If the app exited, reports exit status, signal and recent output instead. Accepts the same region/zoom/wait_change/stable_ms/stats_only/burst options as screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = first toplevel)"},"max_px":{"type":"integer"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer"},"wait_change":{"type":"boolean"},"stable_ms":{"type":"integer"},"stats_only":{"type":"boolean"},"burst":{"type":"integer"},"burst_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"}}}},
-    \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as rendered by a terminal — right for TUI-style redraws). For log-style output prefer app_log: indexed lines with stable ids, re-readable in full. scrollback=true includes history beyond the visible grid. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
+    \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as RENDERED BY A TERMINAL — a fixed-width grid, so long lines wrap and scrolled-off content needs scrollback=true; right for TUI-style redraws). For log-style output app_log is the SOURCE OF TRUTH: indexed unwrapped lines with stable ids, re-readable in full — prefer it. When the grid mirror is blank after an exit, the log ring's last lines are served instead. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
     \\{"name":"app_log","description":"A headless app's stdout/stderr as an INDEXED LOG: each complete line gets a stable numeric id and a timestamp; the tail view shortens long lines (marked [+]) and any line can be re-read in full by id. The ring is bounded (oldest lines drop; the reply says how many). MARKERS: the app (or your injected code) can emit the escape  printf '\\033]5522;my-label\\033\\\\'  — it becomes a labelled log line AND sketerm stashes a screenshot of the app window at that exact instant; fetch label+image with {\"id\":<that line's id>}. Variant printf '\\033]5522;+N;my-label\\033\\\\' captures the Nth FUTURE frame commit instead (e.g. +1 = the next repaint after this point; resolved with the final frame if the app exits first). Markers are rate-limited (burst 8, then 2/s; excess are dropped and counted) so escape-laden files cat'ed to the terminal cannot flood the log. Survives app exit: the final log is delivered with the exit.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"tail":{"type":"integer","description":"Last N lines (default 60, max 500)"},"from_id":{"type":"integer","description":"Return lines starting at this id instead of the tail"},"id":{"type":"integer","description":"Return ONE line in full; for a marker line also returns the stashed screenshot"}}}},
-    \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x","y"]}},
-    \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} | {\"wait_change\":timeout_ms} | {\"screenshot\":true or {\"max_px\":N}}. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
+    \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right. mark=true returns a post-click screenshot with a crosshair drawn at the exact click pixel — see where the click landed relative to the UI AND what it did, in one image; screenshot=true returns the post-click frame without the marker.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"},"mark":{"type":"boolean","description":"Return a post-click screenshot with a crosshair marker at the click point"},"screenshot":{"type":"boolean","description":"Return a post-click screenshot (no marker)"},"max_px":{"type":"integer","description":"Bound on the screenshot's longest dimension (default 1568)"}},"required":["window","x","y"]}},
+    \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} (MILLISECONDS, max 30000) | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} (with change_pct = VISUAL settle: blocks until frames change less than that %% — use for scene transitions of unknown duration instead of guessing a fixed wait) | {\"wait_change\":timeout_ms} | {\"screenshot\":true or {\"max_px\":N}}. MARKERS: add \"mark\":true to a click/move/move_rel/drag/scroll step to draw a labelled crosshair at that step's position (red = click, cyan = move; the number is the step index) onto the NEXT screenshot — several marked steps can share one image. Combine in one step: {\"click\":[x,y],\"mark\":true,\"screenshot\":true} captures the post-click frame with the click point marked. Leftover marks with no later screenshot are flushed as a final image automatically. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
     \\{"name":"app_mouse_move","description":"Move the pointer in an app window WITHOUT clicking. Absolute: x,y in surface pixels (hover a widget, position before a click). Relative: dx,dy — a delta from the current pointer position, for apps that consume RELATIVE mouse motion (SDL games, DOSBox, anything with pointer-lock): sketerm derives relative_motion events from the move, so the app's own cursor moves by exactly your delta. Calibration for such apps: one large negative move (e.g. dx:-30000, dy:-30000) slams their internal cursor to the top-left corner, after which exact deltas land where you aim. With neither x/y nor dx/dy it just returns the tracked pointer position.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = window under the pointer, else first toplevel)"},"x":{"type":"number","description":"Absolute surface x (with y)"},"y":{"type":"number"},"dx":{"type":"number","description":"Relative delta x (with dy; exclusive with x/y)"},"dy":{"type":"number"}}}},
     \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
     \\{"name":"app_set_value","description":"Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value). Faster and more reliable than typing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}},
@@ -1093,6 +1117,70 @@ fn signalName(signo: i32) []const u8 {
     };
 }
 
+/// Signals whose death means "the app crashed" (as opposed to being
+/// told to stop).
+fn crashSignal(signo: i32) bool {
+    return switch (signo) {
+        4, 6, 7, 8, 11 => true, // ILL, ABRT, BUS, FPE, SEGV
+        else => false,
+    };
+}
+
+/// Human-readable death suffix for an exit status; "" for plain codes.
+/// Shell-wrapped commands (string `command`) report a child's signal
+/// death as exit 128+signo — decode that too, flagged as inferred.
+fn exitSuffix(arena: std.mem.Allocator, status: i32) ![]const u8 {
+    if (status < 0)
+        return std.fmt.allocPrint(arena, " = killed by {s} (signal {d})", .{ signalName(-status), -status });
+    if (status >= 129 and status <= 128 + 31)
+        return std.fmt.allocPrint(arena, " (= 128+{d}: the wrapping shell reports the app was killed by {s})", .{ status - 128, signalName(status - 128) });
+    return "";
+}
+
+/// The daemon's log_get reply / pre-exit log stash, JSON shape.
+const LogLineJ = struct {
+    id: u64 = 0,
+    t: i64 = 0,
+    text: []const u8 = "",
+    truncated: bool = false,
+    cut: bool = false,
+    marker: bool = false,
+};
+const LogReplyJ = struct {
+    next_id: u64 = 0,
+    dropped: u64 = 0,
+    markers_dropped: u64 = 0,
+    lines: []const LogLineJ = &.{},
+};
+
+/// Last `n` non-marker lines from the app's stashed log ring (the
+/// daemon pushes the final log ahead of `.exit`), newline-joined.
+/// Null when no stash exists or it holds no output lines — unlike the
+/// grid mirror these lines are escape-free and never wrapped.
+fn logStashTail(arena: std.mem.Allocator, app: *appdrive.App, n: usize) ?[]const u8 {
+    if (app.log_buf.items.len == 0) return null;
+    const parsed = std.json.parseFromSliceLeaky(LogReplyJ, arena, app.log_buf.items, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    if (parsed.lines.len == 0) return null;
+    var kept: usize = 0;
+    var start = parsed.lines.len;
+    while (start > 0 and kept < n) {
+        if (!parsed.lines[start - 1].marker) kept += 1;
+        start -= 1;
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    var wrote = false;
+    for (parsed.lines[start..]) |l| {
+        if (l.marker) continue;
+        if (wrote) aw.writer.writeAll("\n") catch return null;
+        aw.writer.writeAll(l.text) catch return null;
+        wrote = true;
+    }
+    if (!wrote) return null;
+    return aw.written();
+}
+
 /// Last `n` lines of `text`, trailing blank lines dropped.
 fn tailLines(text: []const u8, n: usize) []const u8 {
     var end = text.len;
@@ -1121,8 +1209,18 @@ fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
     if (app.exited) {
         try w.print(",\"exited\":true,\"exit_status\":{d}", .{app.exit_status});
         // decodeStatus convention: negative = killed by that signal.
-        if (app.exit_status < 0)
-            try w.print(",\"signal\":{d},\"signal_name\":\"{s}\"", .{ -app.exit_status, signalName(-app.exit_status) });
+        if (app.exit_status < 0) {
+            try w.print(",\"signaled\":true,\"signal\":{d},\"signal_name\":\"{s}\"", .{ -app.exit_status, signalName(-app.exit_status) });
+            if (crashSignal(-app.exit_status)) try w.writeAll(",\"crashed\":true");
+        } else if (app.exit_status >= 129 and app.exit_status <= 128 + 31) {
+            // A string `command` runs under /bin/sh, which reports a
+            // child killed by signal N as exit 128+N.
+            try w.print(",\"likely_signal\":{d},\"likely_signal_name\":\"{s}\",\"exit_status_note\":\"exit {d} = 128+{d}: shell-wrapped commands report signal deaths this way\"", .{
+                app.exit_status - 128, signalName(app.exit_status - 128),
+                app.exit_status,       app.exit_status - 128,
+            });
+            if (crashSignal(app.exit_status - 128)) try w.writeAll(",\"crashed\":true");
+        }
     }
     try w.writeAll(",\"windows\":[");
     var first = true;
@@ -1144,13 +1242,27 @@ fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
     }
     try w.writeAll("]");
     // An app that died is otherwise a dead end — inline what it
-    // printed (the last screen lines) so one call shows WHY.
+    // printed so one call shows WHY. The log-ring stash (pushed by
+    // the daemon ahead of `.exit`) is preferred: escape-free FULL
+    // lines, never wrapped at the grid width, includes scrolled-off
+    // output. The rendered-grid tail is only the fallback.
     if (app.exited) {
-        if (app.output(false)) |text| {
+        if (logStashTail(arena, app, 15)) |tail_text| {
+            try w.writeAll(",\"recent_output\":");
+            try std.json.Stringify.value(tail_text, .{}, w);
+            try w.writeAll(",\"recent_output_source\":\"app_log (indexed; read more/older lines with the app_log tool)\"");
+        } else if (app.output(false)) |text| {
             defer app_state.allocator.free(text);
             try w.writeAll(",\"recent_output\":");
             try std.json.Stringify.value(tailLines(text, 25), .{}, w);
         } else |_| {}
+        if (std.mem.indexOf(u8, app.log_buf.items, "Sanitizer") != null or
+            std.mem.indexOf(u8, app.log_buf.items, "runtime error:") != null)
+            try w.writeAll(",\"sanitizer_report\":true,\"sanitizer_note\":\"a sanitizer wrote a report to stderr — read it in full with app_log\"");
+        // A gdb wrapper exits 0 after catching the fault; the log
+        // headline is the real story.
+        if (std.mem.indexOf(u8, app.log_buf.items, "Program received signal ") != null)
+            try w.writeAll(",\"debugger_caught_signal\":true,\"debugger_note\":\"the debug wrapper caught a fatal signal — backtrace in app_log\"");
     }
     try w.writeAll("}");
     return aw.written();
@@ -1321,6 +1433,39 @@ fn wallNowMs() i64 {
     return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
 }
 
+/// One app_actions screenshot: draws (and consumes) the pending step
+/// marks, stores the PNG, writes the report line. Returns false when
+/// the capture failed (the caller decides whether that is fatal).
+fn actionsCapture(
+    arena: std.mem.Allocator,
+    app: *appdrive.App,
+    w: *std.Io.Writer,
+    pngs: *std.ArrayList([]const u8),
+    pending: *std.ArrayList(marks_mod.Mark),
+    wid: u32,
+    max_px: u32,
+    prefix: []const u8,
+) !bool {
+    const marks_n = pending.items.len;
+    const shot = app.screenshotPngMarked(wid, max_px, null, 1, pending.items) catch {
+        try w.print("{s}: ERROR — screenshot failed (no pixels yet?)\n", .{prefix});
+        return false;
+    };
+    pngs.append(arena, shot.png) catch {
+        app_state.allocator.free(shot.png);
+        return error.OutOfMemory;
+    };
+    pending.clearRetainingCapacity();
+    if (shot.scale == 1.0) {
+        try w.print("{s}: screenshot #{d} of window {d} ({d}x{d})", .{ prefix, pngs.items.len, wid, shot.img_w, shot.img_h });
+    } else {
+        try w.print("{s}: screenshot #{d} of window {d} — image {d}x{d}, MULTIPLY its coordinates by {d:.3} for clicks", .{ prefix, pngs.items.len, wid, shot.img_w, shot.img_h, shot.scale });
+    }
+    if (marks_n > 0) try w.print(" [{d} marker(s) drawn: red crosshair = click, cyan = move/hover, number = step]", .{marks_n});
+    try w.writeAll("\n");
+    return true;
+}
+
 fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
     if (!app_state.ready)
@@ -1344,6 +1489,27 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             };
         }
         if (argv.items.len == 0) return appErr(arena, "launch_app requires 'command' (string or argv array)");
+        var debug_note: []const u8 = "";
+        if (argStr(args, "debug")) |dm| {
+            // Run-under-wrapper: the wrapper's report (backtrace,
+            // leak/error output) goes to the PTY = app_log. Works for
+            // string commands too: gdb/valgrind follow the exec that
+            // /bin/sh performs for a simple command.
+            var wrapped: std.ArrayList([]const u8) = .empty;
+            defer wrapped.deinit(arena);
+            if (eql(u8, dm, "gdb")) {
+                try wrapped.appendSlice(arena, &.{ "gdb", "-q", "-batch", "-ex", "run", "-ex", "bt full", "-ex", "info registers", "--args" });
+                debug_note = "\ndebug wrapper: gdb — the reported pid is gdb, not the app; on a crash the full backtrace lands in app_log";
+            } else if (eql(u8, dm, "valgrind")) {
+                try wrapped.appendSlice(arena, &.{ "valgrind", "--track-origins=yes" });
+                debug_note = "\ndebug wrapper: valgrind — the reported pid is valgrind; its report lands in app_log when the app exits";
+            } else {
+                return appErr(arena, "'debug' must be \"gdb\" or \"valgrind\"");
+            }
+            try wrapped.appendSlice(arena, argv.items);
+            argv.clearRetainingCapacity();
+            try argv.appendSlice(arena, wrapped.items);
+        }
         const audio_mode = argStr(args, "audio") orelse "forward";
         if (!eql(u8, audio_mode, "forward") and !eql(u8, audio_mode, "none"))
             return appErr(arena, "'audio' must be \"forward\" or \"none\"");
@@ -1407,6 +1573,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             _ = app.waitFirstWindow(wait_ms);
         }
         var summary = try appSummary(arena, app);
+        if (debug_note.len > 0) summary = try std.fmt.allocPrint(arena, "{s}{s}", .{ summary, debug_note });
         if (audio_path) |ap| {
             const stem = if (std.mem.endsWith(u8, ap, ".wav")) ap[0 .. ap.len - 4] else ap;
             summary = try std.fmt.allocPrint(arena, "{s}\naudio capture: {s}.wav on the daemon host (later streams: {s}-N.wav; finalized when the stream or app closes)", .{ summary, stem, stem });
@@ -1478,15 +1645,24 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             return appErr(arena, "no terminal mirror for this app (output unavailable)");
         defer app_state.allocator.free(text);
         var msg: []const u8 = try arena.dupe(u8, text);
-        if (std.mem.trim(u8, text, " \n\t\r").len == 0)
-            msg = if (argBool(args, "scrollback"))
-                "(the app has written nothing to its stdout/stderr PTY — GUI apps often print little; stderr redirected elsewhere by the app itself is not visible here)"
-            else
-                "(no output on the visible terminal grid — pass scrollback:true for scrolled-off history, or use app_log for indexed lines)";
+        if (std.mem.trim(u8, text, " \n\t\r").len == 0) {
+            // A blank grid mirror does not mean "no output" — the log
+            // ring (app_log) is the source of truth for line output.
+            // Only the post-exit stash is served here; a live app's
+            // log_buf may hold a stale earlier log_get reply.
+            if (if (app.exited) logStashTail(arena, app, 25) else null) |tail_text| {
+                msg = try std.fmt.allocPrint(arena, "(terminal grid mirror is blank — serving the last lines from the log ring instead; app_log is the source of truth for line output)\n{s}", .{tail_text});
+            } else {
+                msg = if (argBool(args, "scrollback"))
+                    "(the app has written nothing to its stdout/stderr PTY — GUI apps often print little; stderr redirected elsewhere by the app itself is not visible here. app_log is the indexed view of the same PTY)"
+                else
+                    "(no output on the visible terminal grid — pass scrollback:true for scrolled-off history, or use app_log for indexed lines)";
+            }
+        }
         if (app.exited) {
             msg = try std.fmt.allocPrint(arena, "[app exited, status {d}{s}]\n{s}", .{
                 app.exit_status,
-                if (app.exit_status < 0) try std.fmt.allocPrint(arena, " = killed by {s}", .{signalName(-app.exit_status)}) else "",
+                try exitSuffix(arena, app.exit_status),
                 msg,
             });
         }
@@ -1506,16 +1682,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             else => "no log data for this app",
         });
         defer app_state.allocator.free(reply);
-        const LineJ = struct {
-            id: u64 = 0,
-            t: i64 = 0,
-            text: []const u8 = "",
-            truncated: bool = false,
-            cut: bool = false,
-            marker: bool = false,
-        };
-        const ReplyJ = struct { next_id: u64 = 0, dropped: u64 = 0, markers_dropped: u64 = 0, lines: []const LineJ = &.{} };
-        const parsed = std.json.parseFromSlice(ReplyJ, arena, reply, .{
+        const parsed = std.json.parseFromSlice(LogReplyJ, arena, reply, .{
             .ignore_unknown_fields = true,
         }) catch return appErr(arena, "malformed log reply");
         const r = parsed.value;
@@ -1524,7 +1691,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         if (line_id != 0) {
             // One line in full — the post-exit stash may return the whole
             // final log, so filter by id here.
-            var found: ?LineJ = null;
+            var found: ?LogLineJ = null;
             for (r.lines) |l| {
                 if (l.id == line_id) found = l;
             }
@@ -1767,6 +1934,26 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         app.click(win_id, @floatFromInt(x), @floatFromInt(y), button) catch
             return appErr(arena, "click failed (bad window?)");
         _ = app.waitIdle(200, 2_000);
+        const want_mark = argBool(args, "mark");
+        if (want_mark or argBool(args, "screenshot")) {
+            // Post-click frame, optionally with the click point drawn
+            // in — one call shows where the click landed AND what the
+            // UI did with it.
+            const annot = [_]marks_mod.Mark{.{ .x = @floatFromInt(x), .y = @floatFromInt(y) }};
+            const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 1568, 0, 8192));
+            const shot = app.screenshotPngMarked(win_id, max_px, null, 1, if (want_mark) &annot else &.{}) catch
+                return toolResult(arena, "clicked, but the post-click screenshot failed (no pixels yet?)", false) orelse error.OutOfMemory;
+            defer app_state.allocator.free(shot.png);
+            const extra = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}", .{
+                x, y, button,
+                if (want_mark)
+                    " — the red crosshair marks the click point on the post-click frame. Coordinates are delivered to the app verbatim; a pointer-LOCKED app tracks its own cursor from relative deltas, so its internal cursor can differ (calibrate with app_mouse_move dx/dy)."
+                else
+                    "",
+            });
+            const caption = try screenshotCaption(arena, app, win_id, shot, extra);
+            return imageResult(arena, caption, shot.png) orelse error.OutOfMemory;
+        }
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_actions")) {
@@ -1787,10 +1974,15 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             pngs.deinit(arena);
         }
         var stopped = false;
+        // Marks accumulated by `"mark": true` steps; drawn onto (and
+        // consumed by) the next screenshot so several clicks can share
+        // one annotated image, each labelled with its step number.
+        var pending_marks: std.ArrayList(marks_mod.Mark) = .empty;
+        defer pending_marks.deinit(arena);
         for (steps, 0..) |st, idx| {
             const n = idx + 1;
             if (app.exited) {
-                try w.print("step {d}: SKIPPED — app exited (status {d}); remaining steps skipped\n", .{ n, app.exit_status });
+                try w.print("step {d}: SKIPPED — app exited (status {d}{s}); remaining steps skipped\n", .{ n, app.exit_status, try exitSuffix(arena, app.exit_status) });
                 stopped = true;
                 break;
             }
@@ -1817,7 +2009,9 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                     stopped = true;
                     break;
                 };
-                try w.print("step {d}: moved to ({d:.0},{d:.0}) window {d}\n", .{ n, pos.x, pos.y, pos.win });
+                const marked = argBool(st, "mark");
+                if (marked) pending_marks.append(arena, .{ .x = pos.x, .y = pos.y, .kind = .move, .label = @intCast(n) }) catch {};
+                try w.print("step {d}: moved to ({d:.0},{d:.0}) window {d}{s}\n", .{ n, pos.x, pos.y, pos.win, if (marked) " [marked]" else "" });
             } else if (st.object.get("move_rel")) |mv| {
                 const dd = numArray(mv, 2) orelse {
                     try w.print("step {d}: ERROR — \"move_rel\" wants [dx,dy]\n", .{n});
@@ -1829,7 +2023,9 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                     stopped = true;
                     break;
                 };
-                try w.print("step {d}: moved by ({d:.0},{d:.0}) to ({d:.0},{d:.0}) window {d}\n", .{ n, dd[0], dd[1], pos.x, pos.y, pos.win });
+                const marked = argBool(st, "mark");
+                if (marked) pending_marks.append(arena, .{ .x = pos.x, .y = pos.y, .kind = .move, .label = @intCast(n) }) catch {};
+                try w.print("step {d}: moved by ({d:.0},{d:.0}) to ({d:.0},{d:.0}) window {d}{s}\n", .{ n, dd[0], dd[1], pos.x, pos.y, pos.win, if (marked) " [marked]" else "" });
             } else if (st.object.get("click")) |cv| {
                 const xy = numArray(cv, 2) orelse {
                     try w.print("step {d}: ERROR — \"click\" wants [x,y]\n", .{n});
@@ -1843,7 +2039,9 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                     break;
                 };
                 _ = app.waitIdle(100, 1_000);
-                try w.print("step {d}: clicked ({d:.0},{d:.0}) button {d} window {d}\n", .{ n, xy[0], xy[1], button, wid });
+                const marked = argBool(st, "mark");
+                if (marked) pending_marks.append(arena, .{ .x = xy[0], .y = xy[1], .kind = .click, .label = @intCast(n) }) catch {};
+                try w.print("step {d}: clicked ({d:.0},{d:.0}) button {d} window {d}{s}\n", .{ n, xy[0], xy[1], button, wid, if (marked) " [marked]" else "" });
             } else if (st.object.get("drag")) |dv| {
                 const q = numArray(dv, 4) orelse {
                     try w.print("step {d}: ERROR — \"drag\" wants [x1,y1,x2,y2]\n", .{n});
@@ -1857,7 +2055,14 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                     break;
                 };
                 _ = app.waitIdle(100, 1_000);
-                try w.print("step {d}: dragged ({d:.0},{d:.0})→({d:.0},{d:.0}) window {d}\n", .{ n, q[0], q[1], q[2], q[3], wid });
+                const marked = argBool(st, "mark");
+                if (marked) {
+                    // Start point unlabelled (hover color), end point
+                    // carries the step number.
+                    pending_marks.append(arena, .{ .x = q[0], .y = q[1], .kind = .move }) catch {};
+                    pending_marks.append(arena, .{ .x = q[2], .y = q[3], .kind = .click, .label = @intCast(n) }) catch {};
+                }
+                try w.print("step {d}: dragged ({d:.0},{d:.0})→({d:.0},{d:.0}) window {d}{s}\n", .{ n, q[0], q[1], q[2], q[3], wid, if (marked) " [marked]" else "" });
             } else if (st.object.get("key")) |kv| {
                 if (kv != .string) {
                     try w.print("step {d}: ERROR — \"key\" wants a string of chords\n", .{n});
@@ -1916,7 +2121,9 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                     break;
                 };
                 _ = app.waitIdle(100, 1_000);
-                try w.print("step {d}: scrolled ({d:.0},{d:.0}) at ({d:.0},{d:.0}) window {d}\n", .{ n, dd[0], dd[1], sx, sy, wid });
+                const marked = argBool(st, "mark");
+                if (marked) pending_marks.append(arena, .{ .x = sx, .y = sy, .kind = .move, .label = @intCast(n) }) catch {};
+                try w.print("step {d}: scrolled ({d:.0},{d:.0}) at ({d:.0},{d:.0}) window {d}{s}\n", .{ n, dd[0], dd[1], sx, sy, wid, if (marked) " [marked]" else "" });
             } else if (st.object.get("wait_idle")) |wv| {
                 var quiet_ms: i64 = 400;
                 var timeout_ms: i64 = 10_000;
@@ -1954,25 +2161,41 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                 if (sv == .object) {
                     if (argInt(sv, "max_px")) |m| max_px = @intCast(std.math.clamp(m, 0, 8192));
                 }
-                const shot = app.screenshotPng(wid, max_px, null, 1) catch {
-                    try w.print("step {d}: ERROR — screenshot failed (no pixels yet?)\n", .{n});
+                if (argBool(st, "mark") or (sv == .object and argBool(sv, "mark"))) {
+                    // Mark the current pointer position (hover check).
+                    if (app.pointerPos()) |p|
+                        pending_marks.append(arena, .{ .x = p.x, .y = p.y, .kind = .move, .label = @intCast(n) }) catch {};
+                }
+                const prefix = try std.fmt.allocPrint(arena, "step {d}", .{n});
+                if (!try actionsCapture(arena, app, w, &pngs, &pending_marks, wid, max_px, prefix)) {
                     stopped = true;
                     break;
-                };
-                pngs.append(arena, shot.png) catch {
-                    app_state.allocator.free(shot.png);
-                    return error.OutOfMemory;
-                };
-                if (shot.scale == 1.0) {
-                    try w.print("step {d}: screenshot #{d} of window {d} ({d}x{d})\n", .{ n, pngs.items.len, wid, shot.img_w, shot.img_h });
-                } else {
-                    try w.print("step {d}: screenshot #{d} of window {d} — image {d}x{d}, MULTIPLY its coordinates by {d:.3} for clicks\n", .{ n, pngs.items.len, wid, shot.img_w, shot.img_h, shot.scale });
                 }
+                continue;
             } else {
                 try w.print("step {d}: ERROR — unknown step (want move/move_rel/click/drag/key/type/scroll/wait/wait_idle/wait_change/screenshot)\n", .{n});
                 stopped = true;
                 break;
             }
+            // Combined form: {"click":[x,y],"screenshot":true} — capture
+            // right after the action, with any pending marks drawn in.
+            // (Dedicated screenshot steps `continue`d above.)
+            if (argBool(st, "screenshot")) {
+                const wid = win_step orelse firstToplevelId(app);
+                if (pngs.items.len >= MAX_SHOTS) {
+                    try w.print("step {d}: screenshot SKIPPED (max {d} per call)\n", .{ n, MAX_SHOTS });
+                } else if (wid != 0) {
+                    const prefix = try std.fmt.allocPrint(arena, "step {d}", .{n});
+                    _ = try actionsCapture(arena, app, w, &pngs, &pending_marks, wid, 1568, prefix);
+                }
+            }
+        }
+        // `mark` without any screenshot still yields an image: capture
+        // the final state with the leftover marks drawn in.
+        if (pending_marks.items.len > 0 and pngs.items.len < MAX_SHOTS) {
+            const wid = win_arg orelse firstToplevelId(app);
+            if (wid != 0)
+                _ = try actionsCapture(arena, app, w, &pngs, &pending_marks, wid, 1568, "end of batch");
         }
         if (!stopped) try w.print("all {d} steps completed\n", .{steps.len});
         if (app.exited) try w.writeAll(try appSummary(arena, app));
@@ -2727,6 +2950,16 @@ test "mcp log: entries and screenshot files land in the dir" {
     const dir = try std.fmt.bufPrint(&dbuf, "/tmp/sketerm-mcplog-test-{d}", .{c.getpid()});
 
     var log = McpLog.open(t.allocator, dir) orelse return error.OpenFailed;
+    // Per-session subfolder: <dir>/YYYYMMDD-HHMMSS.
+    const session_dir = try t.allocator.dupe(u8, log.dir);
+    defer t.allocator.free(session_dir);
+    try t.expect(session_dir.len == dir.len + 1 + 15);
+    try t.expect(std.mem.startsWith(u8, session_dir, dir));
+    try t.expectEqual(@as(u8, '-'), session_dir[dir.len + 1 + 8]);
+    for (session_dir[dir.len + 1 ..], 0..) |ch, i| {
+        if (i == 8) continue; // the dash
+        try t.expect(ch >= '0' and ch <= '9');
+    }
     log.logNote("hello");
     log.logMessage("in", "{\"method\":\"ping\"}");
     // Oversized payload gets truncated, with the real length recorded.
@@ -2738,7 +2971,7 @@ test "mcp log: entries and screenshot files land in the dir" {
     log.close();
 
     var pbuf: [512]u8 = undefined;
-    const jsonl_z = try std.fmt.bufPrintZ(&pbuf, "{s}/mcp-{d}.jsonl", .{ dir, c.getpid() });
+    const jsonl_z = try std.fmt.bufPrintZ(&pbuf, "{s}/mcp-{d}.jsonl", .{ session_dir, c.getpid() });
     const f = c.fopen(jsonl_z.ptr, "r") orelse return error.NoLogFile;
     var content: [16384]u8 = undefined;
     const n = c.fread(&content, 1, content.len, f);
@@ -2758,8 +2991,8 @@ test "mcp log: entries and screenshot files land in the dir" {
         _ = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), entry, .{});
     }
 
-    // The PNG bytes were written out verbatim.
-    const img_z = try std.fmt.bufPrintZ(&pbuf, "{s}/img-{d}-0001.png", .{ dir, c.getpid() });
+    // The PNG bytes were written out verbatim, into the session dir.
+    const img_z = try std.fmt.bufPrintZ(&pbuf, "{s}/img-{d}-0001.png", .{ session_dir, c.getpid() });
     const imgf = c.fopen(img_z.ptr, "r") orelse return error.NoImageFile;
     var ibuf: [64]u8 = undefined;
     const in = c.fread(&ibuf, 1, ibuf.len, imgf);
@@ -2767,8 +3000,10 @@ test "mcp log: entries and screenshot files land in the dir" {
     try t.expectEqualStrings("\x89PNG-fake-bytes", ibuf[0..in]);
 
     _ = c.unlink(img_z.ptr);
-    const jsonl_z2 = try std.fmt.bufPrintZ(&pbuf, "{s}/mcp-{d}.jsonl", .{ dir, c.getpid() });
+    const jsonl_z2 = try std.fmt.bufPrintZ(&pbuf, "{s}/mcp-{d}.jsonl", .{ session_dir, c.getpid() });
     _ = c.unlink(jsonl_z2.ptr);
+    const sub_z = try std.fmt.bufPrintZ(&pbuf, "{s}", .{session_dir});
+    _ = c.rmdir(sub_z.ptr);
     const dir_z = try std.fmt.bufPrintZ(&pbuf, "{s}", .{dir});
     _ = c.rmdir(dir_z.ptr);
 }

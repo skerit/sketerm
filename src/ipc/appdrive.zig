@@ -14,6 +14,7 @@ const Pool = @import("../grid/style_pool.zig").Pool;
 const wlpipe = @import("../wlhost/pipe.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
 const png = @import("../util/png.zig");
+const marks_mod = @import("../util/marks.zig");
 const gifrec = @import("../util/gifrec.zig");
 const videorec = @import("../util/videorec.zig");
 const evkeys = @import("evkeys.zig");
@@ -1464,15 +1465,25 @@ pub const App = struct {
     /// `max_dim` (0 = no bound). Caller owns `.png`. Moves the
     /// wait_change/diff baseline ("what the caller last saw").
     pub fn screenshotPng(self: *App, win_id: u32, max_dim: u32, region: ?Region, zoom_req: u32) Error!Shot {
+        return self.screenshotPngMarked(win_id, max_dim, region, zoom_req, &.{});
+    }
+
+    /// Screenshot with click/hover markers drawn in (mark positions in
+    /// SURFACE coordinates — the same space app_click takes).
+    pub fn screenshotPngMarked(self: *App, win_id: u32, max_dim: u32, region: ?Region, zoom_req: u32, annot: []const marks_mod.Mark) Error!Shot {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         if (win.w <= 0 or win.h <= 0 or win.pixels.items.len == 0) return Error.NoSuchWindow;
         win.rememberShot(self.allocator);
-        return self.encodeWindowPng(win, max_dim, region, zoom_req);
+        return self.encodeWindowPngMarked(win, max_dim, region, zoom_req, annot);
     }
 
     /// PNG-encode a window WITHOUT touching the observation baseline
     /// (marker stashes must not eat a pending wait_change).
     fn encodeWindowPng(self: *App, win: *Window, max_dim: u32, region: ?Region, zoom_req: u32) Error!Shot {
+        return self.encodeWindowPngMarked(win, max_dim, region, zoom_req, &.{});
+    }
+
+    fn encodeWindowPngMarked(self: *App, win: *Window, max_dim: u32, region: ?Region, zoom_req: u32, annot: []const marks_mod.Mark) Error!Shot {
         if (win.w <= 0 or win.h <= 0 or win.pixels.items.len == 0) return Error.NoSuchWindow;
         const uw: u32 = @intCast(win.w);
         const uh: u32 = @intCast(win.h);
@@ -1498,8 +1509,8 @@ pub const App = struct {
         while (zoom > 1 and @as(u64, cw) * ch * zoom * zoom > MAX_ZOOM_AREA) zoom -= 1;
         const longest = @max(cw, ch) * zoom;
 
-        // Fast path: whole window, no zoom, within the bound.
-        if (region == null and zoom == 1 and (max_dim == 0 or longest <= max_dim)) {
+        // Fast path: whole window, no zoom, no marks, within the bound.
+        if (annot.len == 0 and region == null and zoom == 1 and (max_dim == 0 or longest <= max_dim)) {
             const bytes = png.encodeShm(a, win.pixels.items, uw, uh, uw * 4, win.format) catch
                 return Error.OutOfMemory;
             return .{ .png = bytes, .img_w = uw, .img_h = uh, .scale = 1.0 };
@@ -1522,6 +1533,20 @@ pub const App = struct {
             rgba = crop;
             rw = cw;
             rh = ch;
+        }
+        if (annot.len > 0) {
+            // Marks arrive in surface coordinates; the buffer is at
+            // surface scale here (post-crop, pre-zoom/downscale), so
+            // only the crop origin shifts them. Zoom/downscale below
+            // scales the drawn marker with the pixels.
+            var shifted: [32]marks_mod.Mark = undefined;
+            const n = @min(annot.len, shifted.len);
+            for (annot[0..n], 0..) |m, i| {
+                shifted[i] = m;
+                shifted[i].x -= @floatFromInt(ox);
+                shifted[i].y -= @floatFromInt(oy);
+            }
+            marks_mod.draw(rgba, rw, rh, shifted[0..n]);
         }
         if (zoom > 1) {
             const big = png.upscaleRgba(a, rgba, rw, rh, zoom) catch return Error.OutOfMemory;
