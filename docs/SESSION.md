@@ -7748,3 +7748,67 @@ drive: argv crashy → -11/SIGSEGV/crashed + unwrapped recent_output;
 with source line in app_log; weston-terminal app_click mark:true and
 a 4-step marked app_actions batch → labelled crosshairs verified
 pixel-level in the trace PNGs; log dirs 20260714-*/ created per run.
+
+## 2026-07-15 — MCP round 7: the DirectDraw black window, GUI viewers for assistant apps
+
+Driven by a field report: driving a 1999 Win32 game (DirectDraw,
+8bpp, 800x600 surface) under Wine via launch_app — plus Jelle's own
+asks (dead raise banner, "can I see what the assistant is doing?").
+
+**1. Orphaned-pool pixels: the "renders, then static black forever"
+class.** Pixel units addressed pools by ID, so once a shm pool was
+displaced (id recycled with live buffers — Wine's DirectDraw mode
+switch), the viewer's copy could never be updated again while
+re-attach commits kept bumping `frames` (the reported 1815 frames /
+diff 0.00). Now: `pool_serial` units make incarnation serials
+wire-authoritative (replicas ADOPT the daemon's serials — mid-session
+attaches used to self-count and diverge), orphan-backed commits ship
+serial-addressed `pool_update_s` from the orphan mirror, replay
+includes orphan pools (`pool_orphan`), and state_sync v5 carries each
+buffer's serial so displaced buffers restore resolvable instead of
+frozen. Log line at the transition: "orphan-backed — shipping
+serial-addressed". Old GUIs can't read v5 state_sync — restart
+daemons after upgrading (same lockstep as the v4 bump).
+
+**2. Threshold waits.** `min_change_pct` now also gates
+screenshot_app/get_app_state `wait_change` and turns `stable_ms`
+into a VISUAL settle (waitVisualSettle), so a 60Hz software cursor
+no longer defeats settling. app_actions `wait_change` accepts
+`{"timeout_ms":N,"min_change_pct":P}`.
+
+**3. Primary-content window default.** Window-less tool calls now
+target the most recently painted non-popup toplevel (area breaks
+ties) instead of the first-created one — a game's render surface
+wins over its static frame window, and a flicker-free toplevel swap
+follows the new surface. get_app_state marks it `"primary":true`
+and lists per-window `frames`.
+
+**4. Raise banner fixed.** presentAll skips embedded windows, and a
+new AppHost `on_windows_changed` retires the pane banner when the
+app drops all its toplevels (clicking used to be a silent no-op),
+bringing it back if a window reappears.
+
+**5. GUI viewers for assistant apps.** New `sock:<path>` host
+transport (muxConnect + mux_cli + `Conn.connectProbed` — hello'd for
+proto 5, NEVER autostarts a dead daemon): the GUI can attach as a
+live viewer to sessions on MCP private daemons while the assistant
+stays attached (daemon already broadcasts to every proto>=5 viewer;
+shared seat). `sketerm mux sock:/run/user/N/sketerm/mcp-x/mux.sock
+attach <name>` works too.
+
+**6. App-window switcher.** `app_windows` action + palette entry
+("App Windows…"): lists every open forwarded-app window with a live
+thumbnail (session · window/tab · assistant attached), plus
+attachable app sessions on the local daemon and on every mcp-*/
+daemon instance found in the runtime dir. Enter raises the floating
+window / focuses the embedded window's tab / attaches a viewer.
+src/ui/app_switcher.zig, modeled on the launcher.
+
+Verified: 727/733 tests (2 new: serial adoption + pool_update_s
+routing, pool_orphan replay binding), smoke-mux/smoke-mcp/smoke-e2e
+PASS, mux-portable builds; live e2e under Xvfb: MCP-launched
+weston-terminal attached via sock: renders + takes input in the GUI
+with MCP still attached (2 clients), switcher discovered the second
+(unattached) MCP app, attach-from-row worked, thumbnail row correct.
+The orphan fix is not yet confirmed against the real Wine game (no
+Wine here) — the new debug log line is the smoking-gun check.
