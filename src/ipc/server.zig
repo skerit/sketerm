@@ -89,6 +89,7 @@ const Conn = struct {
     server: *Server,
     connection: *c.GSocketConnection,
     din: *c.GDataInputStream,
+    pending_out: ?[]u8 = null,
 };
 
 fn onIncoming(
@@ -129,7 +130,24 @@ fn closeConn(conn: *Conn) void {
     if (gerr != null) c.g_error_free(gerr);
     c.g_object_unref(conn.din);
     c.g_object_unref(conn.connection);
+    if (conn.pending_out) |out| conn.server.allocator.free(out);
     conn.server.allocator.destroy(conn);
+}
+
+fn onWrite(_: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+    const conn: *Conn = @ptrCast(@alignCast(user.?));
+    var written: c.gsize = 0;
+    var gerr: [*c]c.GError = null;
+    const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn.connection));
+    const ok = c.g_output_stream_write_all_finish(out_stream, res, &written, &gerr);
+    if (gerr != null) c.g_error_free(gerr);
+    if (conn.pending_out) |out| conn.server.allocator.free(out);
+    conn.pending_out = null;
+    if (ok == 0) {
+        closeConn(conn);
+        return;
+    }
+    readNextLine(conn);
 }
 
 fn onLine(source: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
@@ -148,19 +166,15 @@ fn onLine(source: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callcon
     const line = line_raw[0..len];
 
     var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(server.allocator);
     handleLine(server, line, &out);
-
-    const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn.connection));
-    var written: c.gsize = 0;
-    var werr: [*c]c.GError = null;
-    const ok = c.g_output_stream_write_all(out_stream, out.items.ptr, out.items.len, &written, null, &werr);
-    if (werr != null) c.g_error_free(werr);
-    if (ok == 0) {
+    const owned = out.toOwnedSlice(server.allocator) catch {
+        out.deinit(server.allocator);
         closeConn(conn);
         return;
-    }
-    readNextLine(conn);
+    };
+    conn.pending_out = owned;
+    const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn.connection));
+    c.g_output_stream_write_all_async(out_stream, owned.ptr, owned.len, c.G_PRIORITY_DEFAULT, null, @ptrCast(&onWrite), @ptrCast(conn));
 }
 
 fn handleLine(server: *Server, line: []const u8, out: *std.ArrayList(u8)) void {

@@ -38,6 +38,10 @@ pub const Conn = struct {
     allocator: std.mem.Allocator,
     fd: c_int,
     rbuf: std.ArrayList(u8) = .empty,
+    /// Complete frames queued by GUI main-loop producers. These are
+    /// flushed incrementally without polling so backpressure cannot freeze
+    /// GTK.
+    wbuf: std.ArrayList(u8) = .empty,
     /// Message from the last daemon `.err` frame seen by `recvExpect`,
     /// so callers can surface the REAL reason ("no such session", …)
     /// instead of a bare `error.DaemonError`.
@@ -184,6 +188,7 @@ pub const Conn = struct {
     pub fn deinit(self: *Conn) void {
         _ = c.close(self.fd);
         self.rbuf.deinit(self.allocator);
+        self.wbuf.deinit(self.allocator);
     }
 
     /// Mosh-style UDP transport: bootstrap over SSH (run
@@ -410,39 +415,62 @@ pub const Conn = struct {
         }
     }
 
+    /// Deliver one frame fully (bounded-blocking on backpressure) — the
+    /// historical contract callers like Terminal.deinit's .kill rely on.
+    /// When an upload backlog already sits in wbuf, the frame queues
+    /// behind it and only the nonblocking flush runs; the upload pump
+    /// (or a later flushQueuedFor) finishes the delivery.
     pub fn sendFrame(self: *Conn, ftype: wire.FrameType, payload: []const u8) !void {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(self.allocator);
-        try wire.appendFrame(&out, self.allocator, ftype, payload);
+        const had_backlog = self.wbuf.items.len > 0;
+        try wire.appendFrame(&self.wbuf, self.allocator, ftype, payload);
+        if (had_backlog) return self.flushQueued();
+        return self.flushQueuedFor(self.write_timeout_ms);
+    }
+
+    /// Queue one complete frame and write only what the nonblocking fd
+    /// accepts immediately. Partial writes remain resumable in `wbuf`.
+    pub fn queueFrame(self: *Conn, ftype: wire.FrameType, payload: []const u8) !void {
+        try wire.appendFrame(&self.wbuf, self.allocator, ftype, payload);
+        try self.flushQueued();
+    }
+
+    pub fn flushQueued(self: *Conn) !void {
         var off: usize = 0;
-        while (off < out.items.len) {
-            // MSG_NOSIGNAL: a peer that died (session worker gone)
-            // must yield EPIPE, not a SIGPIPE that kills the whole
-            // process (the GUI and `sketerm mcp` don't ignore it).
-            // macOS lacks the flag; callers there rely on a SIGPIPE
-            // handler (the daemon installs one; GUI-side writes go
-            // through GSocket which sets SO_NOSIGPIPE).
+        while (off < self.wbuf.items.len) {
+            // MSG_NOSIGNAL: a dead peer must yield EPIPE, not a
+            // process-killing SIGPIPE. macOS lacks the flag; callers
+            // there rely on a SIGPIPE handler / GSocket's SO_NOSIGPIPE.
             const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
-                c.send(self.fd, out.items.ptr + off, out.items.len - off, c.MSG_NOSIGNAL)
+                c.send(self.fd, self.wbuf.items.ptr + off, self.wbuf.items.len - off, c.MSG_NOSIGNAL)
             else
-                c.write(self.fd, out.items.ptr + off, out.items.len - off);
+                c.write(self.fd, self.wbuf.items.ptr + off, self.wbuf.items.len - off);
             if (n > 0) {
                 off += @intCast(n);
                 continue;
             }
-            // The GUI marks this fd O_NONBLOCK for its main-loop read
-            // watch, so a large frame (e.g. the ~70 KB keymap
-            // reflection) that overflows the socket buffer returns
-            // EAGAIN mid-write. Don't drop it — wait for the fd to
-            // drain and resume. EINTR likewise retries.
             const e = std.posix.errno(n);
-            if (e == .AGAIN or e == .INTR) {
-                var pfd = [_]c.struct_pollfd{.{ .fd = self.fd, .events = c.POLLOUT, .revents = 0 }};
-                // Wait for drain; a timeout (link wedged) gives up
-                // rather than spinning forever.
-                if (c.poll(&pfd, 1, self.write_timeout_ms) <= 0 and e == .AGAIN) return error.WriteFailed;
-                continue;
-            }
+            if (e == .INTR) continue;
+            if (e == .AGAIN) break;
+            return error.WriteFailed;
+        }
+        if (off > 0) {
+            const rem = self.wbuf.items.len - off;
+            std.mem.copyForwards(u8, self.wbuf.items[0..rem], self.wbuf.items[off..]);
+            self.wbuf.shrinkRetainingCapacity(rem);
+        }
+    }
+
+    /// Drain queued frames, waiting (bounded) for the fd on backpressure.
+    /// Teardown-critical frames (.kill/.detach) queued behind an upload
+    /// backlog must reach the daemon before the fd closes.
+    pub fn flushQueuedFor(self: *Conn, timeout_ms: c_int) !void {
+        while (true) {
+            try self.flushQueued();
+            if (self.wbuf.items.len == 0) return;
+            var pfd = [_]c.struct_pollfd{.{ .fd = self.fd, .events = c.POLLOUT, .revents = 0 }};
+            const r = c.poll(&pfd, 1, timeout_ms);
+            if (r > 0) continue;
+            if (r < 0 and std.posix.errno(r) == .INTR) continue;
             return error.WriteFailed;
         }
     }
@@ -599,10 +627,10 @@ pub const Conn = struct {
             if ((pfd.revents & (c.POLLIN | c.POLLHUP)) == 0) return true;
             var tmp: [16384]u8 = undefined;
             const n = c.read(self.fd, &tmp, tmp.len);
-            if (n <= 0) return false;           // hung up
+            if (n <= 0) return false; // hung up
             self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]) catch return false;
-            if (@as(usize, @intCast(n)) < tmp.len) return true;   // drained the socket
-            if (budget <= @as(usize, @intCast(n))) return true;   // cap hit; rest next pump
+            if (@as(usize, @intCast(n)) < tmp.len) return true; // drained the socket
+            if (budget <= @as(usize, @intCast(n))) return true; // cap hit; rest next pump
             budget -= @intCast(n);
         }
     }

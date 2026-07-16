@@ -712,6 +712,7 @@ pub const Window = struct {
             _ = c.g_source_remove(self.ack_timer_id);
             self.ack_timer_id = 0;
         }
+        for (self.panes.items) |p| p.detachAppHost();
         for (self.terminals.items) |t| t.clearSinks();
         for (self.terminals.items) |t| t.deinit();
         for (self.panes.items) |p| p.deinit();
@@ -1089,13 +1090,20 @@ pub const Window = struct {
         const row = self.copymode_row;
         const col: i32 = self.copymode_col;
         switch (keyval) {
-            c.GDK_KEY_Shift_L, c.GDK_KEY_Shift_R,
-            c.GDK_KEY_Control_L, c.GDK_KEY_Control_R,
-            c.GDK_KEY_Alt_L, c.GDK_KEY_Alt_R,
-            c.GDK_KEY_Super_L, c.GDK_KEY_Super_R,
-            c.GDK_KEY_Hyper_L, c.GDK_KEY_Hyper_R,
-            c.GDK_KEY_Meta_L, c.GDK_KEY_Meta_R,
-            c.GDK_KEY_Caps_Lock, c.GDK_KEY_Num_Lock,
+            c.GDK_KEY_Shift_L,
+            c.GDK_KEY_Shift_R,
+            c.GDK_KEY_Control_L,
+            c.GDK_KEY_Control_R,
+            c.GDK_KEY_Alt_L,
+            c.GDK_KEY_Alt_R,
+            c.GDK_KEY_Super_L,
+            c.GDK_KEY_Super_R,
+            c.GDK_KEY_Hyper_L,
+            c.GDK_KEY_Hyper_R,
+            c.GDK_KEY_Meta_L,
+            c.GDK_KEY_Meta_R,
+            c.GDK_KEY_Caps_Lock,
+            c.GDK_KEY_Num_Lock,
             => return false,
             c.GDK_KEY_Escape, c.GDK_KEY_q => self.exitCopyMode(),
             c.GDK_KEY_y, c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => self.copyModeYank(),
@@ -2166,6 +2174,7 @@ pub const Window = struct {
         pane.line_pad_px = s.line_pad_px;
         pane.grid_pass.pad = s.padding;
         pane.cell_pass.pad = s.padding;
+        pane.bg_pass.source = &self.bg_source;
         const fg_bg = self.resolveColorsFor(s);
         pane.grid_pass.default_fg = fg_bg.fg;
         pane.grid_pass.default_bg = fg_bg.bg;
@@ -3167,8 +3176,8 @@ pub const Window = struct {
     }
 
     /// Bump the focused pane's font size by `delta` points (clamped
-     /// 6..72) and rebuild the atlas. -1 / +1 / reset are exposed via
-     /// Ctrl+- / Ctrl+= / Ctrl+0.
+    /// 6..72) and rebuild the atlas. -1 / +1 / reset are exposed via
+    /// Ctrl+- / Ctrl+= / Ctrl+0.
     pub fn adjustFocusedFontSize(self: *Window, delta: i32) void {
         const pane = self.focusedPane() orelse return;
         const new: i32 = @as(i32, @intCast(pane.font_size)) + delta;
@@ -6408,7 +6417,6 @@ pub fn dispatchAction(window: *Window, action: @import("input.zig").Action) void
     onShortcut(@ptrCast(window), action);
 }
 
-
 fn onSearchChanged(entry: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
     const text_ptr = c.gtk_editable_get_text(@ptrCast(entry));
@@ -7962,6 +7970,7 @@ fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
             // detached page drops its last ref, before the deferred
             // Pane.deinit idle runs.
             pane.detachIm();
+            pane.detachAppHost();
             term.clearSinks();
             schedulePaneTeardown(pane, term);
             continue;
@@ -7997,11 +8006,16 @@ fn onHintKey(ctx: ?*anyopaque, keyval: c_uint) bool {
             }
             return true;
         },
-        c.GDK_KEY_Shift_L, c.GDK_KEY_Shift_R,
-        c.GDK_KEY_Control_L, c.GDK_KEY_Control_R,
-        c.GDK_KEY_Alt_L, c.GDK_KEY_Alt_R,
-        c.GDK_KEY_Super_L, c.GDK_KEY_Super_R,
-        c.GDK_KEY_Caps_Lock, c.GDK_KEY_Num_Lock,
+        c.GDK_KEY_Shift_L,
+        c.GDK_KEY_Shift_R,
+        c.GDK_KEY_Control_L,
+        c.GDK_KEY_Control_R,
+        c.GDK_KEY_Alt_L,
+        c.GDK_KEY_Alt_R,
+        c.GDK_KEY_Super_L,
+        c.GDK_KEY_Super_R,
+        c.GDK_KEY_Caps_Lock,
+        c.GDK_KEY_Num_Lock,
         => return false,
         else => {},
     }

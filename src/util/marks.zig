@@ -89,8 +89,15 @@ fn drawLabel(rgba: []u8, w: u32, h: u32, cx: i32, cy: i32, label: u32) void {
 }
 
 fn drawOne(rgba: []u8, w: u32, h: u32, m: Mark) void {
-    const cx: i32 = @intFromFloat(@round(m.x));
-    const cy: i32 = @intFromFloat(@round(m.y));
+    if (!std.math.isFinite(m.x) or !std.math.isFinite(m.y)) return;
+    const rx = @round(m.x);
+    const ry = @round(m.y);
+    if (rx < @as(f64, @floatFromInt(std.math.minInt(i32))) or
+        rx > @as(f64, @floatFromInt(std.math.maxInt(i32))) or
+        ry < @as(f64, @floatFromInt(std.math.minInt(i32))) or
+        ry > @as(f64, @floatFromInt(std.math.maxInt(i32)))) return;
+    const cx: i32 = @intFromFloat(rx);
+    const cy: i32 = @intFromFloat(ry);
     const col = colorOf(m.kind);
 
     // Pass 1: black backing (3px-wide crosshair arms + a 3px ring
@@ -178,6 +185,17 @@ test "marks at and beyond the edges clip without touching out-of-range memory" {
     // stays untouched.
     const i = (2 * 32 + 16) * 4;
     try t.expectEqual(@as(u8, 7), buf[i]);
+}
+
+test "non-finite and non-i32 coordinates are ignored" {
+    const buf = try mkBuf(t.allocator, 8, 8, 19);
+    defer t.allocator.free(buf);
+    draw(buf, 8, 8, &.{
+        .{ .x = 5_000_000_000, .y = 1 },
+        .{ .x = std.math.inf(f64), .y = 1 },
+        .{ .x = 1, .y = std.math.nan(f64) },
+    });
+    for (buf) |b| try t.expectEqual(@as(u8, 19), b);
 }
 
 test "label digits render as white-on-black" {

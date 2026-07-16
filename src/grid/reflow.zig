@@ -194,9 +194,8 @@ pub fn positionAfterRechunk(
             }
             // The target_col might fall past the last chunk of this
             // logical line — clamp to the last cell of the last chunk.
-            if (idx > target_idx) {
-                return .{ .row = r - 1, .col = @intCast(@min(new_cols - 1, target_col)) };
-            }
+        } else if (idx > target_idx) {
+            return .{ .row = r - 1, .col = new_cols - 1 };
         }
         col_acc += new_cols;
     }

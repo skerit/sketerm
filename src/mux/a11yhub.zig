@@ -483,6 +483,10 @@ const Conn = struct {
     serial: u32 = 1,
     rbuf: std.ArrayList(u8) = .empty,
     allocator: std.mem.Allocator,
+    /// Total budget for this connection/operation, not a fresh timeout per
+    /// tree node. A peer replying just before every per-call timeout must
+    /// not monopolize the daemon for MAX_NODES × timeout.
+    deadline_ms: i64,
 
     fn connect(allocator: std.mem.Allocator, path: []const u8) !Conn {
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -494,12 +498,17 @@ const Conn = struct {
         if (path.len == 0 or path.len >= dst.len) return error.BadPath;
         if (path[0] == '@') {
             dst[0] = 0; // abstract namespace
-            @memcpy(dst[1 .. path.len], path[1..]);
+            @memcpy(dst[1..path.len], path[1..]);
         } else {
             @memcpy(dst[0..path.len], path);
         }
         if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return error.Connect;
-        return .{ .fd = fd, .allocator = allocator };
+        const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+        if (fl >= 0) _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+        // Budget sized for a full MAX_NODES tree walk (thousands of local
+        // D-Bus round trips) on a healthy bus, while still bounding how
+        // long a wedged peer can stall the daemon poll loop.
+        return .{ .fd = fd, .allocator = allocator, .deadline_ms = nowMs() + 30_000 };
     }
 
     fn deinit(self: *Conn) void {
@@ -507,12 +516,35 @@ const Conn = struct {
         self.rbuf.deinit(self.allocator);
     }
 
+    fn waitFd(self: *Conn, events: c_short, deadline: i64) !void {
+        while (true) {
+            const left: c_int = @intCast(@max(0, @min(deadline - nowMs(), std.math.maxInt(c_int))));
+            if (left == 0) return error.Timeout;
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = events, .revents = 0 };
+            const rc = c.poll(&pfd, 1, left);
+            if (rc > 0 and pfd.revents & events != 0) return;
+            if (rc < 0 and std.posix.errno(rc) == .INTR) continue;
+            if (rc == 0) return error.Timeout;
+            return error.Closed;
+        }
+    }
+
     fn writeAll(self: *Conn, bytes: []const u8) !void {
+        const deadline = self.deadline_ms;
         var off: usize = 0;
         while (off < bytes.len) {
             const n = c.write(self.fd, bytes[off..].ptr, bytes.len - off);
-            if (n <= 0) return error.Write;
-            off += @intCast(n);
+            if (n > 0) {
+                off += @intCast(n);
+                continue;
+            }
+            const e = std.posix.errno(n);
+            if (e == .INTR) continue;
+            if (e == .AGAIN) {
+                try self.waitFd(c.POLLOUT, deadline);
+                continue;
+            }
+            return error.Write;
         }
     }
 
@@ -533,6 +565,7 @@ const Conn = struct {
         try line.appendSlice(self.allocator, "\r\n");
         try self.writeAll(line.items);
         var buf: [256]u8 = undefined;
+        try self.waitFd(c.POLLIN, self.deadline_ms);
         const n = c.read(self.fd, &buf, buf.len);
         if (n <= 0) return error.AuthRead;
         if (!std.mem.startsWith(u8, buf[0..@intCast(n)], "OK")) return error.AuthRejected;
@@ -557,7 +590,7 @@ const Conn = struct {
         defer self.allocator.free(bytes);
         try self.writeAll(bytes);
 
-        var spins: usize = 0;
+        const deadline = self.deadline_ms;
         while (true) {
             while (dbus.unmarshal(self.rbuf.items) catch return error.Proto) |got| {
                 const m = got.msg;
@@ -575,10 +608,11 @@ const Conn = struct {
                 }
                 try self.rbuf.replaceRange(self.allocator, 0, got.consumed, &.{});
             }
-            spins += 1;
-            if (spins > 10_000) return error.Timeout;
+            try self.waitFd(c.POLLIN, deadline);
             var tmp: [16384]u8 = undefined;
             const n = c.read(self.fd, &tmp, tmp.len);
+            if (n < 0 and std.posix.errno(n) == .INTR) continue;
+            if (n < 0 and std.posix.errno(n) == .AGAIN) continue;
             if (n <= 0) return error.Closed;
             try self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]);
         }

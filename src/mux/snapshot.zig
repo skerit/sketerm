@@ -230,17 +230,27 @@ const Src = struct {
         return v;
     }
 
-    /// Read a line into a fresh allocation owned by `allocator`.
-    fn line(self: *Src, allocator: std.mem.Allocator) Error!Line {
+    /// Read a line into a fresh allocation owned by `allocator`, padded or
+    /// truncated to exactly `cols` cells. Width normalization (rather than
+    /// rejection) keeps snapshots from pre-normalization daemons — whose
+    /// scrollback widths legitimately diverge after an alt-screen resize —
+    /// attachable, while preserving the every-line-has-cols-cells invariant
+    /// the scroll hot path relies on when recycling scrollback buffers.
+    fn line(self: *Src, allocator: std.mem.Allocator, cols: u16, n_styles: u16) Error!Line {
         const id = try self.int(u64);
         const cont = try self.boolean();
         const scaling_raw = try self.byte();
         if (scaling_raw > 3) return error.BadSnapshot;
         const n_cells = try self.int(u16);
-        const cells = allocator.alloc(Cell, n_cells) catch return error.OutOfMemory;
-        errdefer allocator.free(cells);
         const raw = try self.take(@as(usize, n_cells) * @sizeOf(Cell));
-        @memcpy(std.mem.sliceAsBytes(cells), raw);
+        const cells = allocator.alloc(Cell, cols) catch return error.OutOfMemory;
+        errdefer allocator.free(cells);
+        @memset(cells, .{});
+        const keep = @min(n_cells, cols);
+        @memcpy(std.mem.sliceAsBytes(cells[0..keep]), raw[0 .. @as(usize, keep) * @sizeOf(Cell)]);
+        for (cells) |cell| {
+            if (cell.style_ref >= n_styles) return error.BadSnapshot;
+        }
         return .{
             .cells = cells,
             .dirty = true,
@@ -295,11 +305,7 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
 
     // Active rows: swap each freshly-built line for the snapshot one.
     for (screen.active) |*ln| {
-        var loaded = try src.line(allocator);
-        if (loaded.cells.len != cols) {
-            loaded.deinit(allocator);
-            return error.BadSnapshot;
-        }
+        const loaded = try src.line(allocator, cols, n_styles);
         ln.deinit(allocator);
         ln.* = loaded;
     }
@@ -311,9 +317,8 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
             allocator.free(alt);
         }
         for (alt) |*ln| {
-            ln.* = try src.line(allocator);
+            ln.* = try src.line(allocator, cols, n_styles);
             done += 1;
-            if (ln.cells.len != cols) return error.BadSnapshot;
         }
         screen.alt = alt;
     }
@@ -322,7 +327,7 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
     const sb_count = try src.int(u32);
     try screen.scrollback.ensureTotalCapacity(allocator, sb_count);
     for (0..sb_count) |_| {
-        const ln = try src.line(allocator);
+        const ln = try src.line(allocator, cols, n_styles);
         screen.scrollback.appendAssumeCapacity(ln);
     }
     screen.scrollback_head = 0;
@@ -600,4 +605,54 @@ test "snapshot: corrupt input errors cleanly" {
     var pool3 = try Pool.init(a);
     defer pool3.deinit();
     try testing.expectError(error.Truncated, restore(a, &pool3, buf.items[0 .. buf.items.len / 2]));
+
+    // Locate the first serialized cell and give it a style reference beyond
+    // the advertised pool. Restore must reject it before render-side Pool.get.
+    var src = Src{ .bytes = buf.items };
+    _ = try src.int(u32); // version
+    _ = try src.int(u16); // cols
+    _ = try src.int(u16); // rows
+    const n_styles = try src.int(u16);
+    for (0..n_styles) |_| {
+        _ = try src.color();
+        _ = try src.color();
+        _ = try src.color();
+        _ = try src.int(u16);
+    }
+    _ = try src.int(u64);
+    _ = try src.boolean();
+    _ = try src.byte();
+    _ = try src.int(u16);
+    const style_off = src.pos + @offsetOf(Cell, "style_ref");
+    std.mem.writeInt(u16, buf.items[style_off..][0..2], n_styles, .little);
+    var pool4 = try Pool.init(a);
+    defer pool4.deinit();
+    try testing.expectError(error.BadSnapshot, restore(a, &pool4, buf.items));
+}
+
+test "restore normalizes lines whose serialized width diverges from cols" {
+    const a = testing.allocator;
+    var wide: Cell = .{};
+    wide.rune = 'W';
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(a);
+    var w: std.Io.Writer.Allocating = .init(a);
+    defer w.deinit();
+    try w.writer.writeInt(u64, 7, .little); // id
+    try w.writer.writeByte(0); // continues_above
+    try w.writer.writeByte(0); // scaling
+    try w.writer.writeInt(u16, 5, .little); // n_cells: wider than cols
+    for (0..5) |_| try w.writer.writeAll(std.mem.asBytes(&wide));
+    var src = Src{ .bytes = w.writer.buffered() };
+    var narrow = try src.line(a, 3, 1);
+    defer narrow.deinit(a);
+    try testing.expectEqual(@as(usize, 3), narrow.cells.len);
+    try testing.expectEqual(@as(u32, 'W'), narrow.cells[0].rune);
+
+    var src2 = Src{ .bytes = w.writer.buffered() };
+    var padded = try src2.line(a, 8, 1);
+    defer padded.deinit(a);
+    try testing.expectEqual(@as(usize, 8), padded.cells.len);
+    try testing.expectEqual(@as(u32, 'W'), padded.cells[4].rune);
+    try testing.expectEqual(@as(u32, 0), padded.cells[5].rune);
 }

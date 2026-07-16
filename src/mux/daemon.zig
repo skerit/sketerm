@@ -997,10 +997,7 @@ pub const Daemon = struct {
         for (self.channels.items) |ch| {
             if (ch.dead) continue;
             const srv = ch.pa orelse continue;
-            srv.has_viewer = false;
-            for (self.clients.items) |cl| {
-                if (nativeViewer(cl, ch.session.?) and cl.audio_ok) srv.has_viewer = true;
-            }
+            srv.has_viewer = self.sessionHasReadyAudioViewer(ch.session.?);
             const deadline = srv.tick(now) catch {
                 self.closeChannel(ch, true);
                 continue;
@@ -1466,7 +1463,7 @@ pub const Daemon = struct {
         if (n <= 0) return n;
         const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
         if (@as(usize, @intCast(mh.msg_controllen)) >= hdr_size) {
-            const hdr: *const c.struct_cmsghdr = @alignCast(@ptrCast(&cbuf));
+            const hdr: *const c.struct_cmsghdr = @ptrCast(@alignCast(&cbuf));
             if (hdr.cmsg_level == c.SOL_SOCKET and hdr.cmsg_type == c.SCM_RIGHTS and
                 @as(usize, @intCast(hdr.cmsg_len)) >= hdr_size + @sizeOf(c_int))
             {
@@ -2402,6 +2399,21 @@ pub const Daemon = struct {
         return false;
     }
 
+    /// An attached audio-capable viewer that is also draining its wbuf.
+    /// A backlogged viewer must not count: it can't ack PCM, so counting
+    /// it would deadlock the REQUEST credit loop instead of letting the
+    /// stream revert to self-clocking.
+    fn readyAudioViewer(cl: *const Client, s: *const Session) bool {
+        return nativeViewer(cl, s) and cl.audio_ok and cl.wbuf.items.len < NATIVE_BACKLOG;
+    }
+
+    fn sessionHasReadyAudioViewer(self: *Daemon, s: *Session) bool {
+        for (self.clients.items) |cl| {
+            if (readyAudioViewer(cl, s)) return true;
+        }
+        return false;
+    }
+
     fn paReadable(self: *Daemon, ch: *Channel) void {
         const srv = ch.pa.?;
         srv.now_ms = nowMs(); // self-clock pace source
@@ -2409,7 +2421,7 @@ pub const Daemon = struct {
         srv.has_viewer = false;
         srv.opus_wanted = false;
         for (self.clients.items) |cl| {
-            if (!nativeViewer(cl, ch.session.?) or !cl.audio_ok) continue;
+            if (!readyAudioViewer(cl, ch.session.?)) continue;
             srv.has_viewer = true;
             // Opus units can't be captured (no decoder in the mux
             // graph) — capture forces raw pcm units for everyone.
@@ -2797,7 +2809,7 @@ pub const Daemon = struct {
         const alignment: usize = @sizeOf(usize);
         var off: usize = 0;
         while (off + hdr_size <= clen) {
-            const hdr: *const c.struct_cmsghdr = @alignCast(@ptrCast(ctl + off));
+            const hdr: *const c.struct_cmsghdr = @ptrCast(@alignCast(ctl + off));
             const cl: usize = @intCast(hdr.cmsg_len);
             if (cl < hdr_size or off + cl > clen) break;
             if (hdr.cmsg_level == c.SOL_SOCKET and hdr.cmsg_type == c.SCM_RIGHTS) {
@@ -3214,7 +3226,7 @@ pub const Daemon = struct {
             // for a viewer that isn't draining is correct — it isn't
             // playing it anyway, and fresh PCM resumes when it does.
             for (self.clients.items) |cl| {
-                if (nativeViewer(cl, ch.session.?) and cl.audio_ok and cl.wbuf.items.len < NATIVE_BACKLOG)
+                if (readyAudioViewer(cl, ch.session.?))
                     self.queueUnitsTo(cl, ch, bytes);
             }
         } else if (ch.client) |cl| {
@@ -3326,173 +3338,184 @@ pub const Daemon = struct {
     fn applyAppUnit(self: *Daemon, ch: *Channel, tag: wlpipe.Tag, payload: []const u8) void {
         const nv = ch.native.?;
         switch (tag) {
-                .wl_msg => {
-                    // One Wayland message per unit (pipe contract).
-                    const maybe_hdr = wlwire.parseHeader(payload) catch null;
-                    if (maybe_hdr) |h| {
-                        nv.tracker.serverMessage(h, payload[wlwire.header_size..]) catch {};
+            .wl_msg => {
+                // One Wayland message per unit (pipe contract).
+                const maybe_hdr = wlwire.parseHeader(payload) catch null;
+                if (maybe_hdr) |h| {
+                    nv.tracker.serverMessage(h, payload[wlwire.header_size..]) catch {};
+                }
+                ch.pending.appendSlice(ch.allocator, payload) catch {
+                    self.closeChannel(ch, true);
+                    return;
+                };
+            },
+            .keymap => {
+                // u32 keyboard id, u32 format, keymap bytes.
+                // Materialize an anon fd and emit the real
+                // wl_keyboard.keymap(format, fd, size) event.
+                const pl = payload;
+                if (pl.len < 8) return;
+                const kbd = std.mem.readInt(u32, pl[0..4], .little);
+                const format = std.mem.readInt(u32, pl[4..8], .little);
+                const blob = pl[8..];
+                // NUL-terminated per xkb convention.
+                const fd = @import("../util/platform.zig").anonFileFd(blob.len + 1);
+                if (fd < 0) return;
+                var written: usize = 0;
+                var w_ok = true;
+                while (written < blob.len) {
+                    const w = c.write(fd, blob.ptr + written, blob.len - written);
+                    if (w <= 0) {
+                        w_ok = false;
+                        break;
                     }
-                    ch.pending.appendSlice(ch.allocator, payload) catch {
-                        self.closeChannel(ch, true);
-                        return;
-                    };
-                },
-                .keymap => {
-                    // u32 keyboard id, u32 format, keymap bytes.
-                    // Materialize an anon fd and emit the real
-                    // wl_keyboard.keymap(format, fd, size) event.
-                    const pl = payload;
-                    if (pl.len < 8) return;
-                    const kbd = std.mem.readInt(u32, pl[0..4], .little);
-                    const format = std.mem.readInt(u32, pl[4..8], .little);
-                    const blob = pl[8..];
-                    // NUL-terminated per xkb convention.
-                    const fd = @import("../util/platform.zig").anonFileFd(blob.len + 1);
-                    if (fd < 0) return;
-                    var written: usize = 0;
-                    var w_ok = true;
-                    while (written < blob.len) {
-                        const w = c.write(fd, blob.ptr + written, blob.len - written);
-                        if (w <= 0) {
-                            w_ok = false;
-                            break;
-                        }
-                        written += @intCast(w);
-                    }
-                    if (!w_ok) {
-                        _ = c.close(fd);
-                        return;
-                    }
-                    var mbuf: [24]u8 = undefined;
-                    var b = wlwire.Builder.init(&mbuf, kbd, 0); // keymap
-                    b.putUint(format);
-                    // 'h' fd arg: no bytes on the wire
-                    b.putUint(@intCast(blob.len + 1));
-                    const msg = b.finish() catch {
-                        _ = c.close(fd);
-                        return;
-                    };
-                    ch.pending.appendSlice(ch.allocator, msg) catch {
-                        _ = c.close(fd);
-                        self.closeChannel(ch, true);
-                        return;
-                    };
-                    nv.out_fds.append(nv.allocator, fd) catch {
-                        _ = c.close(fd);
-                    };
-                },
-                .clip_send => {
-                    // GUI fetches the app's clipboard: pipe(), the
-                    // write-end rides a wl_data_source.send event,
-                    // the read-end is polled until the app's EOF.
-                    const pl = payload;
-                    if (pl.len < 4) return;
-                    const source = std.mem.readInt(u32, pl[0..4], .little);
-                    const mime = pl[4..];
-                    var pfds: [2]c_int = undefined;
-                    if (c.pipe(&pfds) != 0) return;
-                    _ = c.fcntl(pfds[0], c.F_SETFD, c.FD_CLOEXEC);
-                    _ = c.fcntl(pfds[1], c.F_SETFD, c.FD_CLOEXEC);
-                    const fl = c.fcntl(pfds[0], c.F_GETFL, @as(c_int, 0));
-                    _ = c.fcntl(pfds[0], c.F_SETFL, fl | c.O_NONBLOCK);
+                    written += @intCast(w);
+                }
+                if (!w_ok) {
+                    _ = c.close(fd);
+                    return;
+                }
+                var mbuf: [24]u8 = undefined;
+                var b = wlwire.Builder.init(&mbuf, kbd, 0); // keymap
+                b.putUint(format);
+                // 'h' fd arg: no bytes on the wire
+                b.putUint(@intCast(blob.len + 1));
+                const msg = b.finish() catch {
+                    _ = c.close(fd);
+                    return;
+                };
+                ch.pending.appendSlice(ch.allocator, msg) catch {
+                    _ = c.close(fd);
+                    self.closeChannel(ch, true);
+                    return;
+                };
+                nv.out_fds.append(nv.allocator, fd) catch {
+                    _ = c.close(fd);
+                };
+            },
+            .clip_send => {
+                // GUI fetches the app's clipboard: pipe(), the
+                // write-end rides a wl_data_source.send event,
+                // the read-end is polled until the app's EOF.
+                const pl = payload;
+                if (pl.len < 4) return;
+                const source = std.mem.readInt(u32, pl[0..4], .little);
+                const mime = pl[4..];
 
-                    // `send` is opcode 1 on wl_data_source but opcode 0
-                    // on the zwlr-data-control and primary-selection
-                    // sources — pick by the tracked interface.
-                    const send_op: u16 = if (nv.tracker.objects.get(source)) |sif|
-                        (if (sif == &wlproto.zwlr_data_control_source_v1 or
-                            sif == &wlproto.zwp_primary_selection_source_v1) 0 else 1)
-                    else
-                        1;
-                    var mbuf: [256]u8 = undefined;
-                    var b = wlwire.Builder.init(&mbuf, source, send_op); // send
-                    b.putString(mime);
-                    const msg = b.finish() catch {
-                        _ = c.close(pfds[0]);
-                        _ = c.close(pfds[1]);
-                        return;
-                    };
-                    ch.pending.appendSlice(ch.allocator, msg) catch {
-                        _ = c.close(pfds[0]);
-                        _ = c.close(pfds[1]);
-                        self.closeChannel(ch, true);
-                        return;
-                    };
-                    nv.out_fds.append(nv.allocator, pfds[1]) catch {
-                        _ = c.close(pfds[1]);
-                    };
-                    nv.clip_reads.append(nv.allocator, .{ .fd = pfds[0] }) catch {
-                        _ = c.close(pfds[0]);
-                    };
-                },
-                .clip_data => {
-                    // Paste bytes for the oldest held receive-fd.
-                    if (nv.clip_paste_fds.items.len == 0) return;
-                    const fd = nv.clip_paste_fds.orderedRemove(0).fd;
-                    var written: usize = 0;
-                    while (written < payload.len) {
-                        const w = c.write(fd, payload.ptr + written, payload.len - written);
-                        if (w <= 0) break;
-                        written += @intCast(w);
-                    }
+                // `send` is opcode 1 on wl_data_source but opcode 0
+                // on the zwlr-data-control and primary-selection
+                // sources — pick by the tracked interface.
+                const send_op: u16 = if (nv.tracker.objects.get(source)) |sif|
+                    (if (sif == &wlproto.zwlr_data_control_source_v1 or
+                        sif == &wlproto.zwp_primary_selection_source_v1) 0 else 1)
+                else
+                    1;
+                // Build the message before pipe() so every early exit
+                // from here on either precedes the fds or closes them.
+                const msg_cap = wlwire.header_size + 4 + ((mime.len + 1 + 3) & ~@as(usize, 3));
+                if (msg_cap > 0xffff) return;
+                const mbuf = ch.allocator.alloc(u8, msg_cap) catch return;
+                defer ch.allocator.free(mbuf);
+                var b = wlwire.Builder.init(mbuf, source, send_op); // send
+                b.putString(mime);
+                const msg = b.finish() catch return;
+
+                var pfds: [2]c_int = undefined;
+                if (c.pipe(&pfds) != 0) return;
+                _ = c.fcntl(pfds[0], c.F_SETFD, c.FD_CLOEXEC);
+                _ = c.fcntl(pfds[1], c.F_SETFD, c.FD_CLOEXEC);
+                const fl = c.fcntl(pfds[0], c.F_GETFL, @as(c_int, 0));
+                _ = c.fcntl(pfds[0], c.F_SETFL, fl | c.O_NONBLOCK);
+                ch.pending.appendSlice(ch.allocator, msg) catch {
+                    _ = c.close(pfds[0]);
+                    _ = c.close(pfds[1]);
+                    self.closeChannel(ch, true);
+                    return;
+                };
+                nv.out_fds.append(nv.allocator, pfds[1]) catch {
+                    _ = c.close(pfds[1]);
+                };
+                nv.clip_reads.append(nv.allocator, .{ .fd = pfds[0] }) catch {
+                    _ = c.close(pfds[0]);
+                };
+            },
+            .clip_data => {
+                // Paste bytes for the oldest held receive-fd.
+                if (nv.clip_paste_fds.items.len == 0) return;
+                const fd = nv.clip_paste_fds.orderedRemove(0).fd;
+                var written: usize = 0;
+                while (written < payload.len) {
+                    const w = c.write(fd, payload.ptr + written, payload.len - written);
+                    if (w <= 0) break;
+                    written += @intCast(w);
+                }
+                _ = c.close(fd);
+            },
+            .drop_data => {
+                // Host-drop transfer: write the payload into the
+                // fd held FOR THAT OFFER.
+                const pl = payload;
+                if (pl.len < 4) return;
+                const offer = std.mem.readInt(u32, pl[0..4], .little);
+                const data = pl[4..];
+                const fd = takePasteFd(nv, offer) orelse return;
+                var written: usize = 0;
+                while (written < data.len) {
+                    const w = c.write(fd, data.ptr + written, data.len - written);
+                    if (w <= 0) break;
+                    written += @intCast(w);
+                }
+                _ = c.close(fd);
+            },
+            .primary_data => {
+                // Primary-paste bytes for the oldest PRIMARY fd.
+                if (nv.primary_paste_fds.items.len == 0) return;
+                const fd = nv.primary_paste_fds.orderedRemove(0);
+                var written: usize = 0;
+                while (written < payload.len) {
+                    const w = c.write(fd, payload.ptr + written, payload.len - written);
+                    if (w <= 0) break;
+                    written += @intCast(w);
+                }
+                _ = c.close(fd);
+            },
+            .dnd_send => {
+                // Within-app dnd transfer: the drop target's
+                // receive-fd (held, keyed by offer) becomes the
+                // SOURCE's send fd — data never leaves the host.
+                const pl = payload;
+                if (pl.len < 8) return;
+                const source = std.mem.readInt(u32, pl[0..4], .little);
+                const offer = std.mem.readInt(u32, pl[4..8], .little);
+                const mime = pl[8..];
+                const fd = takePasteFd(nv, offer) orelse return;
+                const msg_cap = wlwire.header_size + 4 + ((mime.len + 1 + 3) & ~@as(usize, 3));
+                if (msg_cap > 0xffff) {
                     _ = c.close(fd);
-                },
-                .drop_data => {
-                    // Host-drop transfer: write the payload into the
-                    // fd held FOR THAT OFFER.
-                    const pl = payload;
-                    if (pl.len < 4) return;
-                    const offer = std.mem.readInt(u32, pl[0..4], .little);
-                    const data = pl[4..];
-                    const fd = takePasteFd(nv, offer) orelse return;
-                    var written: usize = 0;
-                    while (written < data.len) {
-                        const w = c.write(fd, data.ptr + written, data.len - written);
-                        if (w <= 0) break;
-                        written += @intCast(w);
-                    }
+                    return;
+                }
+                const mbuf = ch.allocator.alloc(u8, msg_cap) catch {
                     _ = c.close(fd);
-                },
-                .primary_data => {
-                    // Primary-paste bytes for the oldest PRIMARY fd.
-                    if (nv.primary_paste_fds.items.len == 0) return;
-                    const fd = nv.primary_paste_fds.orderedRemove(0);
-                    var written: usize = 0;
-                    while (written < payload.len) {
-                        const w = c.write(fd, payload.ptr + written, payload.len - written);
-                        if (w <= 0) break;
-                        written += @intCast(w);
-                    }
+                    return;
+                };
+                defer ch.allocator.free(mbuf);
+                var b = wlwire.Builder.init(mbuf, source, 1); // wl_data_source.send
+                b.putString(mime);
+                const msg = b.finish() catch {
                     _ = c.close(fd);
-                },
-                .dnd_send => {
-                    // Within-app dnd transfer: the drop target's
-                    // receive-fd (held, keyed by offer) becomes the
-                    // SOURCE's send fd — data never leaves the host.
-                    const pl = payload;
-                    if (pl.len < 8) return;
-                    const source = std.mem.readInt(u32, pl[0..4], .little);
-                    const offer = std.mem.readInt(u32, pl[4..8], .little);
-                    const mime = pl[8..];
-                    const fd = takePasteFd(nv, offer) orelse return;
-                    var mbuf: [256]u8 = undefined;
-                    var b = wlwire.Builder.init(&mbuf, source, 1); // wl_data_source.send
-                    b.putString(mime);
-                    const msg = b.finish() catch {
-                        _ = c.close(fd);
-                        return;
-                    };
-                    ch.pending.appendSlice(ch.allocator, msg) catch {
-                        _ = c.close(fd);
-                        self.closeChannel(ch, true);
-                        return;
-                    };
-                    nv.out_fds.append(nv.allocator, fd) catch {
-                        _ = c.close(fd);
-                    };
-                },
-                // Unknown tags skip for forward compat.
-                else => {},
+                    return;
+                };
+                ch.pending.appendSlice(ch.allocator, msg) catch {
+                    _ = c.close(fd);
+                    self.closeChannel(ch, true);
+                    return;
+                };
+                nv.out_fds.append(nv.allocator, fd) catch {
+                    _ = c.close(fd);
+                };
+            },
+            // Unknown tags skip for forward compat.
+            else => {},
         }
     }
 
@@ -4034,10 +4057,7 @@ pub const Daemon = struct {
         const shell_integration: ?PtyMod.ShellIntegration = blk: {
             const si = req.shell_integration orelse break :blk null;
             const kind: PtyMod.ShellIntegration.Kind =
-                if (std.mem.eql(u8, si.kind, "zsh")) .zsh
-                else if (std.mem.eql(u8, si.kind, "fish")) .fish
-                else if (std.mem.eql(u8, si.kind, "bash")) .bash
-                else break :blk null;
+                if (std.mem.eql(u8, si.kind, "zsh")) .zsh else if (std.mem.eql(u8, si.kind, "fish")) .fish else if (std.mem.eql(u8, si.kind, "bash")) .bash else break :blk null;
             si_script_z = allocator.dupeZ(u8, si.script) catch break :blk null;
             si_shim_z = allocator.dupeZ(u8, si.shim_dir) catch break :blk null;
             break :blk .{ .kind = kind, .script = si_script_z.?.ptr, .shim_dir = si_shim_z.?.ptr };

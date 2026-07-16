@@ -472,7 +472,7 @@ pub const GridPass = struct {
                 break :blk screen.scrollbackLine(sb_idx);
             } else &buf[row - view_off];
             const ln = ln_ptr.*;
-            const cells = ln.cells[0..screen.cols];
+            const cells = ln.cells[0..@min(ln.cells.len, @as(usize, screen.cols))];
 
             if (!self.row_caches_valid.items[row]) {
                 self.row_overlay_needed.items[row] =
@@ -715,10 +715,8 @@ pub const GridPass = struct {
                 while (sr <= r.bot_row) : (sr += 1) {
                     const visible_row: i32 = sr + @as(i32, @intCast(view_off));
                     if (visible_row < 0 or visible_row >= @as(i32, @intCast(screen.rows))) continue;
-                    const start_col: i32 = if (is_rect) lo_col
-                        else if (sr == r.top_row) r.top_col else 0;
-                    const end_col: i32 = if (is_rect) hi_col
-                        else if (sr == r.bot_row) r.bot_col else screen.cols;
+                    const start_col: i32 = if (is_rect) lo_col else if (sr == r.top_row) r.top_col else 0;
+                    const end_col: i32 = if (is_rect) hi_col else if (sr == r.bot_row) r.bot_col else screen.cols;
                     if (end_col <= start_col) continue;
                     const y: f32 = pad + @as(f32, @floatFromInt(visible_row)) * ch;
 
@@ -726,7 +724,10 @@ pub const GridPass = struct {
                     var row_has_bidi = false;
                     if (self.enable_bidi) {
                         const cells = screen.lineCellsAtPub(sr) orelse &.{};
-                        for (cells) |cl| if (cl.rune > 0x7F) { row_has_bidi = true; break; };
+                        for (cells) |cl| if (cl.rune > 0x7F) {
+                            row_has_bidi = true;
+                            break;
+                        };
                     }
 
                     if (!row_has_bidi) {
@@ -754,10 +755,8 @@ pub const GridPass = struct {
             if (elapsed >= 0 and elapsed < 200_000) {
                 const t: f32 = @floatCast(@as(f64, @floatFromInt(elapsed)) / 200_000.0);
                 const alpha: f32 = 0.4 * (1.0 - t);
-                const w: f32 = if (self.canvas_w > 0) self.canvas_w
-                    else @as(f32, @floatFromInt(screen.cols)) * cw + 2 * pad;
-                const h: f32 = if (self.canvas_h > 0) self.canvas_h
-                    else @as(f32, @floatFromInt(screen.rows)) * ch + 2 * pad;
+                const w: f32 = if (self.canvas_w > 0) self.canvas_w else @as(f32, @floatFromInt(screen.cols)) * cw + 2 * pad;
+                const h: f32 = if (self.canvas_h > 0) self.canvas_h else @as(f32, @floatFromInt(screen.rows)) * ch + 2 * pad;
                 try self.pushQuad(.{ 0, 0 }, .{ w, h }, .{ 0, 0 }, .{ 0, 0 }, .{ 1.0, 1.0, 1.0, alpha }, 0.0);
             }
         }
@@ -898,10 +897,8 @@ pub const GridPass = struct {
             }
         }
 
-        const w_full: f32 = if (self.canvas_w > 0) self.canvas_w
-            else @as(f32, @floatFromInt(screen.cols)) * cw + 2 * pad;
-        const h_full: f32 = if (self.canvas_h > 0) self.canvas_h
-            else @as(f32, @floatFromInt(screen.rows)) * ch + 2 * pad;
+        const w_full: f32 = if (self.canvas_w > 0) self.canvas_w else @as(f32, @floatFromInt(screen.cols)) * cw + 2 * pad;
+        const h_full: f32 = if (self.canvas_h > 0) self.canvas_h else @as(f32, @floatFromInt(screen.rows)) * ch + 2 * pad;
         if (focused) {
             const border: f32 = 2.0;
             const accent = .{ 0.40, 0.55, 0.85, 0.75 };

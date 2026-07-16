@@ -135,7 +135,8 @@ pub fn decodeFrame(p: []const u8) ?Frame {
     const w = std.mem.readInt(i32, p[4..8], .little);
     const h = std.mem.readInt(i32, p[8..12], .little);
     if (w <= 0 or h <= 0) return null;
-    const need = @as(usize, @intCast(w)) * 4 * @as(usize, @intCast(h));
+    const row = std.math.mul(usize, @intCast(w), 4) catch return null;
+    const need = std.math.mul(usize, row, @intCast(h)) catch return null;
     if (p.len - 12 != need) return null;
     return .{
         .win = std.mem.readInt(u32, p[0..4], .little),
@@ -203,8 +204,10 @@ pub fn decodeFrameAny(
         .win_frame => return decodeFrame(payload),
         .win_frame_z => {
             const fz = decodeFrameZ(payload) orelse return null;
-            const need = @as(usize, @intCast(@max(fz.w, 1))) * 4 * @as(usize, @intCast(@max(fz.h, 1)));
-            if (fz.raw_len != need) return null;
+            if (fz.w <= 0 or fz.h <= 0) return null;
+            const need = std.math.mul(usize, @intCast(fz.w), 4) catch return null;
+            const total = std.math.mul(usize, need, @intCast(fz.h)) catch return null;
+            if (fz.raw_len != total) return null;
             try scratch.resize(scratch_a, fz.raw_len);
             _ = zpool.decompress(fz.z, scratch.items) catch return null;
             return .{ .win = fz.win, .w = fz.w, .h = fz.h, .pixels = scratch.items };
@@ -253,7 +256,8 @@ pub fn decodeWinFrameC(p: []const u8) ?WinFrameC {
 pub fn decodeFrameC(payload: []const u8, scratch: *std.ArrayList(u8), scratch_a: std.mem.Allocator) !?Frame {
     const fc = decodeWinFrameC(payload) orelse return null;
     if (fc.w <= 0 or fc.h <= 0) return null;
-    const need = @as(usize, @intCast(fc.w)) * 4 * @as(usize, @intCast(fc.h));
+    const row = std.math.mul(usize, @intCast(fc.w), 4) catch return null;
+    const need = std.math.mul(usize, row, @intCast(fc.h)) catch return null;
     if (fc.body.raw_len != need) return null;
     try scratch.resize(scratch_a, fc.body.raw_len);
     pixcodec.decodeBody(fc.body, scratch.items) catch return null;
@@ -647,4 +651,10 @@ test "appendFrameMaybeZ ↔ decodeFrameAny round-trips both forms" {
     try appendFrameZ(&bad, a, .{ .win = 1, .w = 4, .h = 4, .raw_len = 999, .z = "\x00\x00" });
     const bu = (try peelUnit(bad.items)).?;
     try t.expectEqual(@as(?Frame, null), try decodeFrameAny(bu.unit.tag, bu.unit.payload, &scratch, a));
+
+    // Signed dimensions are protocol fields, not values to coerce to 1.
+    bad.clearRetainingCapacity();
+    try appendFrameZ(&bad, a, .{ .win = 1, .w = -1, .h = 1, .raw_len = 4, .z = "\x00" });
+    const neg = (try peelUnit(bad.items)).?;
+    try t.expectEqual(@as(?Frame, null), try decodeFrameAny(neg.unit.tag, neg.unit.payload, &scratch, a));
 }

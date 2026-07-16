@@ -510,10 +510,13 @@ pub const Atlas = struct {
         if (gid != 0 or codepoint == 0) {
             const g = self.loadGlyphFromFace(sf.face, gid, sf.embolden) catch return self.cacheEmpty(key);
             try self.cache.put(key, g);
-            try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+            self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
                 .key = key,
                 .kind = .codepoint,
-            });
+            }) catch |err| {
+                _ = self.cache.remove(key);
+                return err;
+            };
             return g;
         }
         // Styled face doesn't have this codepoint — try the regular
@@ -524,10 +527,13 @@ pub const Atlas = struct {
             if (reg_gid != 0) {
                 const g = self.loadGlyphFromFace(self.ft_face, reg_gid, bold) catch return self.cacheEmpty(key);
                 try self.cache.put(key, g);
-                try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+                self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
                     .key = key,
                     .kind = .codepoint,
-                });
+                }) catch |err| {
+                    _ = self.cache.remove(key);
+                    return err;
+                };
                 return g;
             }
         }
@@ -540,10 +546,13 @@ pub const Atlas = struct {
             if (fb_gid != 0) {
                 const g = self.loadGlyphFromFace(fb_face, fb_gid, bold) catch return self.cacheEmpty(key);
                 try self.cache.put(key, g);
-                try self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
+                self.pages[g.layer].glyphs_on_page.append(self.allocator, .{
                     .key = key,
                     .kind = .codepoint,
-                });
+                }) catch |err| {
+                    _ = self.cache.remove(key);
+                    return err;
+                };
                 return g;
             }
         }
@@ -1074,7 +1083,6 @@ pub const Atlas = struct {
         _ = self.cache.put(key, empty) catch {};
         return empty;
     }
-
 };
 
 test "atlas page eviction recycles space" {
