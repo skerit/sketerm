@@ -1690,6 +1690,18 @@ pub const Terminal = struct {
         // Pane with a nulled user_ctx (was a crash on app-tab close).
         self.on_app_view = null;
         self.on_app_window = null;
+        // The app hosts' pane-facing callbacks (banner window-count
+        // tracking, embed notifications) point at the Pane too and
+        // must be fenced with the rest — window closes arriving after
+        // pane teardown would fire into freed memory.
+        if (self.remote) |remote| {
+            for (remote.napps.items) |na| {
+                na.host.on_embed = null;
+                na.host.on_request_embed = null;
+                na.host.on_windows_changed = null;
+                na.host.embed_ctx = null;
+            }
+        }
         self.on_cmd_status = null;
         self.broadcast_sink = null;
         self.broadcast_ctx = null;

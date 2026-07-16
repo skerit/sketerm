@@ -945,6 +945,11 @@ pub const AppHost = struct {
     /// Raise every floating window of this app (mirror click).
     /// Embedded windows live in a pane; their host window is hidden
     /// and childless — presenting it would map an empty shell.
+    /// Number of live windows (embedded or floating).
+    pub fn windowCount(self: *AppHost) usize {
+        return self.windows.count();
+    }
+
     pub fn presentAll(self: *AppHost) void {
         var it = self.windows.valueIterator();
         while (it.next()) |w| {
