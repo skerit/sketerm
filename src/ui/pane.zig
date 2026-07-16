@@ -1840,7 +1840,14 @@ fn onAppViewEvent(ctx: ?*anyopaque, host_opaque: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
     const AppHost = @import("../wlapp.zig").AppHost;
     const is_app = if (self.terminal.remote) |r| r.is_app else false;
-    if (!is_app) return; // shells keep their terminal front and center
+    if (!is_app) {
+        // Shell pane: no embed behavior, but apps launched FROM the
+        // shell still float windows. Recompute the banner (this also
+        // wires window-count tracking on every host) so it retires
+        // when the last app goes away instead of going stale.
+        updateAppBanner(self);
+        return;
+    }
     const old: ?*AppHost = @ptrCast(@alignCast(self.app_host));
     const new: ?*AppHost = @ptrCast(@alignCast(host_opaque));
     if (old == new) return;
@@ -1861,9 +1868,7 @@ fn onAppViewEvent(ctx: ?*anyopaque, host_opaque: ?*anyopaque) void {
 /// The app's first real window appeared. In window view mode (or
 /// after a pop-out) the tab shows the raise banner over the log.
 fn onAppWindowEvent(ctx: ?*anyopaque) void {
-    const self = cast.userData(Pane, ctx);
-    if (self.app_embed_active) return; // embedded view shows itself
-    setAppBanner(self, true);
+    updateAppBanner(cast.userData(Pane, ctx));
 }
 
 /// The embedded app view appeared/disappeared: swap it against the
@@ -1872,11 +1877,7 @@ fn onAppWindowEvent(ctx: ?*anyopaque) void {
 fn onAppEmbedChanged(ctx: ?*anyopaque, active: bool) void {
     const self = cast.userData(Pane, ctx);
     setAppEmbedActive(self, active);
-    if (active) {
-        setAppBanner(self, false);
-    } else if (self.terminal.remote) |r| {
-        if (r.app_window_opened and r.napps.items.len > 0) setAppBanner(self, true);
-    }
+    updateAppBanner(self);
 }
 
 /// Host menu "Show in Tab" on a floating window: install the embed
@@ -1895,19 +1896,31 @@ fn onAppBannerClick(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     for (remote.napps.items) |na| na.host.presentAll();
 }
 
-/// The app's open-window count changed. Zero windows with the app
-/// still running (mode switch, single-instance handoff) must retire
-/// the banner — clicking it would be a silent no-op; a later window
-/// brings it back.
+/// The app's open-window count changed. Zero windows across every
+/// channel (app exit, mode switch, single-instance handoff) must
+/// retire the banner — clicking it would be a silent no-op; a later
+/// window brings it back.
 fn onAppWindowsChanged(ctx: ?*anyopaque, count: usize) void {
-    const self = cast.userData(Pane, ctx);
-    if (count == 0) {
-        setAppBanner(self, false);
-    } else if (!self.app_embed_active) {
-        if (self.terminal.remote) |r| {
-            if (r.app_window_opened) setAppBanner(self, true);
+    _ = count; // one host's count; the banner needs the cross-host sum
+    updateAppBanner(cast.userData(Pane, ctx));
+}
+
+/// Recompute banner visibility from ground truth: any live window
+/// across ALL of the terminal's app channels. Also (re)wires window-
+/// count tracking on every host — hosts beyond napps[0] never arrive
+/// via on_app_view, and shell panes skip the app-view path entirely,
+/// so this is the only place they get wired. Terminal.clearSinks
+/// fences these callbacks again at pane teardown.
+fn updateAppBanner(self: *Pane) void {
+    var open: usize = 0;
+    if (self.terminal.remote) |r| {
+        for (r.napps.items) |na| {
+            na.host.embed_ctx = @ptrCast(self);
+            na.host.on_windows_changed = onAppWindowsChanged;
+            open += na.host.windowCount();
         }
     }
+    setAppBanner(self, open > 0 and !self.app_embed_active);
 }
 
 /// Ensure the embed container exists and hand it to the host (the
