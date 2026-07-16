@@ -67,7 +67,7 @@ pub const Command = struct {
     payload: []const u8 = &.{},
 };
 
-pub const Error = error{ InvalidFormat };
+pub const Error = error{InvalidFormat};
 
 pub fn parse(body: []const u8) Error!Command {
     if (body.len == 0) return Error.InvalidFormat;
@@ -153,7 +153,7 @@ fn applyKv(cmd: *Command, key: []const u8, val: []const u8) void {
 fn parseUint(s: []const u8) u32 {
     var n: u32 = 0;
     for (s) |b| {
-        if (b >= '0' and b <= '9') n = n * 10 + (b - '0') else break;
+        if (b >= '0' and b <= '9') n = n *| 10 +| (b - '0') else break;
     }
     return n;
 }
@@ -161,9 +161,11 @@ fn parseUint(s: []const u8) u32 {
 fn parseInt(s: []const u8) i32 {
     if (s.len == 0) return 0;
     if (s[0] == '-') {
-        return -@as(i32, @intCast(parseUint(s[1..])));
+        const mag = @min(parseUint(s[1..]), @as(u32, std.math.maxInt(i32)) + 1);
+        if (mag == @as(u32, std.math.maxInt(i32)) + 1) return std.math.minInt(i32);
+        return -@as(i32, @intCast(mag));
     }
-    return @intCast(parseUint(s));
+    return @intCast(@min(parseUint(s), std.math.maxInt(i32)));
 }
 
 test "transmit and place RGBA" {
@@ -187,6 +189,14 @@ test "delete by image id" {
 test "negative z" {
     const cmd = try parse("Ga=p,i=1,z=-3");
     try std.testing.expectEqual(@as(i32, -3), cmd.z);
+}
+
+test "oversized numeric fields saturate instead of overflowing" {
+    const cmd = try parse("Ga=p,i=99999999999999999999,z=3000000000");
+    try std.testing.expectEqual(std.math.maxInt(u32), cmd.image_id);
+    try std.testing.expectEqual(std.math.maxInt(i32), cmd.z);
+    const neg = try parse("Ga=p,z=-99999999999999999999");
+    try std.testing.expectEqual(std.math.minInt(i32), neg.z);
 }
 
 test "unicode placement flag + grid size" {

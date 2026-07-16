@@ -7,34 +7,39 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const Terminal = @import("../terminal.zig").Terminal;
 
+const PasteCtx = struct {
+    allocator: std.mem.Allocator,
+    drain: *@import("../terminal.zig").DrainHandle,
+};
+
+fn readClipboard(clipboard_opt: ?*c.GdkClipboard, terminal: *Terminal) void {
+    const clipboard = clipboard_opt orelse return;
+    const ctx = terminal.allocator.create(PasteCtx) catch return;
+    ctx.* = .{ .allocator = terminal.allocator, .drain = terminal.drain };
+    c.gdk_clipboard_read_text_async(clipboard, null, @ptrCast(&onPasteRead), @ptrCast(ctx));
+}
+
 pub fn pasteFromClipboard(widget: *c.GtkWidget, terminal: *Terminal) void {
     const display = c.gtk_widget_get_display(widget);
     const clipboard = c.gdk_display_get_clipboard(display);
-    c.gdk_clipboard_read_text_async(
-        clipboard,
-        null,
-        @ptrCast(&onPasteRead),
-        @ptrCast(terminal),
-    );
+    readClipboard(clipboard, terminal);
 }
 
 pub fn pastePrimaryFromClipboard(widget: *c.GtkWidget, terminal: *Terminal) void {
     const display = c.gtk_widget_get_display(widget);
     const clipboard = c.gdk_display_get_primary_clipboard(display);
-    c.gdk_clipboard_read_text_async(
-        clipboard,
-        null,
-        @ptrCast(&onPasteRead),
-        @ptrCast(terminal),
-    );
+    readClipboard(clipboard, terminal);
 }
 
 fn onPasteRead(source: ?*c.GObject, result: *c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
     const clipboard: *c.GdkClipboard = @ptrCast(source);
-    const term: *Terminal = @ptrCast(@alignCast(user.?));
+    const ctx: *PasteCtx = @ptrCast(@alignCast(user.?));
+    defer ctx.allocator.destroy(ctx);
     const text_ptr = c.gdk_clipboard_read_text_finish(clipboard, result, null);
     if (text_ptr == null) return;
     defer c.g_free(text_ptr);
+    if (!ctx.drain.alive.load(.acquire)) return;
+    const term = ctx.drain.terminal orelse return;
 
     const cstr: [*:0]const u8 = @ptrCast(text_ptr);
     pasteText(term, cstr[0..std.mem.len(cstr)]);

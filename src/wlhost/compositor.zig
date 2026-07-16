@@ -552,6 +552,16 @@ pub const Compositor = struct {
         return self;
     }
 
+    /// Replica pool storage must never expose allocator contents.  Pool
+    /// updates may legitimately cover only damaged rows, so bytes outside
+    /// those updates remain visible to frame assembly and must start at a
+    /// deterministic value.
+    fn resizePoolBytes(self: *Compositor, pool: *Pool, size: usize) Error!void {
+        const old_len = pool.bytes.items.len;
+        try pool.bytes.resize(self.allocator, size);
+        if (size > old_len) @memset(pool.bytes.items[old_len..], 0);
+    }
+
     /// Install a fresh pool incarnation under `id`. A displaced
     /// predecessor still referenced by buffers is parked in
     /// orphan_pools under its serial; an unreferenced one is freed.
@@ -566,7 +576,7 @@ pub const Compositor = struct {
         }
         self.pool_serial_ctr += 1;
         slot.value_ptr.* = .{ .serial = self.pool_serial_ctr };
-        try slot.value_ptr.bytes.resize(self.allocator, size);
+        try self.resizePoolBytes(slot.value_ptr, size);
         return slot.value_ptr;
     }
 
@@ -1006,6 +1016,17 @@ pub const Compositor = struct {
         for (self.data_control_devices.items) |dev| try self.offerToDevice(dev, mime, true);
     }
 
+    fn sendStringEvent(self: *Compositor, object: u32, opcode: u16, value: ?[]const u8) Error!void {
+        const len = if (value) |v| v.len else 0;
+        const cap = wire.header_size + 4 + ((len + 1 + 3) & ~@as(usize, 3));
+        if (cap > 0xffff) return Error.Protocol;
+        const buf = try self.allocator.alloc(u8, cap);
+        defer self.allocator.free(buf);
+        var b = wire.Builder.init(buf, object, opcode);
+        b.putString(value);
+        try self.send(try b.finish());
+    }
+
     /// Emit data_offer → offer(mime) → selection(offer) toward one
     /// device. The data_offer/offer opcodes match across the two
     /// device families; only `selection` differs (wl_data_device op 5
@@ -1022,10 +1043,7 @@ pub const Compositor = struct {
         var b = wire.Builder.init(&buf, dev, 0); // data_offer(new_id)
         b.putNewId(id);
         try self.send(try b.finish());
-        var mbuf: [128]u8 = undefined;
-        var bm = wire.Builder.init(&mbuf, id, 0); // offer(mime)
-        bm.putString(mime);
-        try self.send(try bm.finish());
+        try self.sendStringEvent(id, 0, mime); // offer(mime)
         var sbuf: [16]u8 = undefined;
         var bs = wire.Builder.init(&sbuf, dev, if (control) 1 else 5); // selection(offer)
         bs.putObject(id);
@@ -1043,10 +1061,7 @@ pub const Compositor = struct {
             var b = wire.Builder.init(&buf, dev, 0); // data_offer(new_id)
             b.putNewId(id);
             try self.send(try b.finish());
-            var mbuf: [128]u8 = undefined;
-            var bm = wire.Builder.init(&mbuf, id, 0); // offer(mime)
-            bm.putString(mime);
-            try self.send(try bm.finish());
+            try self.sendStringEvent(id, 0, mime); // offer(mime)
             var sbuf: [16]u8 = undefined;
             var bs = wire.Builder.init(&sbuf, dev, 1); // selection(offer)
             bs.putObject(id);
@@ -1082,10 +1097,7 @@ pub const Compositor = struct {
                 try self.send(try b.finish());
                 if (self.data_sources.get(self.drag.source)) |mimes| {
                     for (mimes.items) |m| {
-                        var mbuf: [256]u8 = undefined;
-                        var bm = wire.Builder.init(&mbuf, offer_id, 0); // offer(mime)
-                        bm.putString(m);
-                        try self.send(try bm.finish());
+                        try self.sendStringEvent(offer_id, 0, m); // offer(mime)
                     }
                 }
                 if (self.ddm_version >= 3) {
@@ -1189,10 +1201,7 @@ pub const Compositor = struct {
             var b = wire.Builder.init(&buf, dev, 0); // data_offer(new_id)
             b.putNewId(offer_id);
             try self.send(try b.finish());
-            var mbuf: [256]u8 = undefined;
-            var bm = wire.Builder.init(&mbuf, offer_id, 0); // offer(mime)
-            bm.putString(mime);
-            try self.send(try bm.finish());
+            try self.sendStringEvent(offer_id, 0, mime); // offer(mime)
             if (self.ddm_version >= 3) {
                 var abuf: [16]u8 = undefined;
                 var ab = wire.Builder.init(&abuf, offer_id, 1); // source_actions
@@ -1331,7 +1340,7 @@ pub const Compositor = struct {
                     self.pool_serial_ctr += 1;
                     slot.value_ptr.* = .{ .serial = self.pool_serial_ctr };
                 }
-                try slot.value_ptr.bytes.resize(self.allocator, meta.size);
+                try self.resizePoolBytes(slot.value_ptr, meta.size);
             },
             .pool_update => {
                 const upd = pipe.decodePoolUpdate(payload) orelse return Error.Protocol;
@@ -1372,7 +1381,7 @@ pub const Compositor = struct {
                 const slot = try self.orphan_pools.getOrPut(self.allocator, po.serial);
                 if (slot.found_existing) slot.value_ptr.deinit(self.allocator);
                 slot.value_ptr.* = .{ .serial = po.serial };
-                try slot.value_ptr.bytes.resize(self.allocator, po.size);
+                try self.resizePoolBytes(slot.value_ptr, po.size);
                 if (po.serial > self.pool_serial_ctr) self.pool_serial_ctr = po.serial;
             },
             .pool_update_s => {
@@ -1969,8 +1978,12 @@ pub const Compositor = struct {
                     const mime = (try it.next()).?.string;
                     self.drag.accepted = mime != null;
                     if (self.drag.source != 0) {
-                        var buf: [256]u8 = undefined;
-                        var b = wire.Builder.init(&buf, self.drag.source, 0); // target
+                        const mime_len = if (mime) |m| m.len else 0;
+                        const cap = wire.header_size + 4 + ((mime_len + 1 + 3) & ~@as(usize, 3));
+                        if (cap > 0xffff) return Error.Protocol;
+                        const buf = try self.allocator.alloc(u8, cap);
+                        defer self.allocator.free(buf);
+                        var b = wire.Builder.init(buf, self.drag.source, 0); // target
                         b.putString(mime);
                         try self.send(try b.finish());
                     }
@@ -3903,6 +3916,14 @@ fn req(comp: *Compositor, msg: []const u8) !void {
     try comp.feed(unit.items);
 }
 
+test "replica pool storage starts zeroed before partial updates" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    const pool = try comp.freshPool(77, 64);
+    for (pool.bytes.items) |b| try t.expectEqual(@as(u8, 0), b);
+}
+
 /// Collect every event (object, opcode) pair currently queued.
 fn drainEvents(comp: *Compositor, list: *std.ArrayList([2]u32)) !void {
     var pos: usize = 0;
@@ -4419,6 +4440,16 @@ test "clipboard: copy offer, fetch, paste offer, receive answer" {
     try t.expectEqual([2]u32{ 5, 0 }, evs.items[0]); // data_offer
     try t.expectEqual([2]u32{ 0xff000000, 0 }, .{ evs.items[1][0], evs.items[1][1] }); // offer(mime)
     try t.expectEqual([2]u32{ 5, 5 }, evs.items[2]); // selection
+
+    // Wayland strings are not limited to the old fixed 128/256-byte
+    // scratch buffers. A long but legal MIME must remain a normal offer.
+    comp.clearOut();
+    evs.clearRetainingCapacity();
+    const long_mime = "application/x-sketerm-" ++ ("a" ** 512);
+    try comp.offerSelection(long_mime);
+    try drainEvents(&comp, &evs);
+    try t.expectEqual(@as(usize, 3), evs.items.len);
+    try t.expect(!comp.dead);
     {
         var b = wire.Builder.init(&buf, 0xff000000, 1); // receive
         b.putString("text/plain;charset=utf-8");

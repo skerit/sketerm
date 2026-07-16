@@ -200,8 +200,8 @@ const McpLog = struct {
         const ms: u32 = @intCast(@divTrunc(ts.tv_nsec, 1_000_000));
         return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
             @as(u32, @intCast(@as(i64, tm.tm_year) + 1900)), @as(u32, @intCast(tm.tm_mon + 1)),
-            @as(u32, @intCast(tm.tm_mday)), @as(u32, @intCast(tm.tm_hour)),
-            @as(u32, @intCast(tm.tm_min)),  @as(u32, @intCast(tm.tm_sec)),
+            @as(u32, @intCast(tm.tm_mday)),                  @as(u32, @intCast(tm.tm_hour)),
+            @as(u32, @intCast(tm.tm_min)),                   @as(u32, @intCast(tm.tm_sec)),
             ms,
         }) catch buf[0..0];
     }
@@ -236,7 +236,7 @@ const McpLog = struct {
         self.img_seq += 1;
         var nbuf: [64]u8 = undefined;
         const fname = std.fmt.bufPrint(&nbuf, "img-{d}-{d:0>4}{s}{s}.png", .{
-            c.getpid(), self.img_seq,
+            c.getpid(),                   self.img_seq,
             if (tag.len > 0) "-" else "", tag,
         }) catch return;
         var z: [4096]u8 = undefined;
@@ -364,25 +364,34 @@ fn sweepStaleEphemeral(allocator: std.mem.Allocator) void {
 /// disconnected afterwards: harsh, but strictly better than a hung
 /// server an agent can neither cancel nor distinguish from "slow".
 const Watchdog = struct {
-    /// Monotonic ms when the in-flight call started; 0 = idle. The
-    /// release-store in begin() publishes fds/fd_count (written only
-    /// while idle, so the watchdog never reads them concurrently).
-    var started_ms: std.atomic.Value(i64) = .init(0);
+    /// Guards started_ms/fds/fd_count against the check-then-shutdown in
+    /// loop(): without it, a call ending right at the cap can race begin()
+    /// resetting the state, aborting the NEXT call's connections at t=0.
+    /// Uncontended in practice (the thread wakes once per second).
+    /// pthread via libc: Zig 0.16 std.Thread has no Mutex.
+    var mu: c.pthread_mutex_t = undefined;
+
+    fn initLock() void {
+        _ = c.pthread_mutex_init(&mu, null);
+    }
+    /// Monotonic ms when the in-flight call started; 0 = idle.
+    var started_ms: i64 = 0;
     /// Conn fds snapshotted at call start. An fd closed AND reused
     /// mid-call could be shut down wrongly, but a wedged main thread
     /// cannot close fds, and normal calls finish far under the cap.
     var fds: [128]c_int = undefined;
     var fd_count: usize = 0;
-    var fired: bool = false;
+    var fired: std.atomic.Value(bool) = .init(false);
     var hard_ms: i64 = 150_000;
 
     fn begin() void {
-        started_ms.store(0, .release);
+        _ = c.pthread_mutex_lock(&mu);
+        defer _ = c.pthread_mutex_unlock(&mu);
         fd_count = 0;
         for (app_state.apps.values()) |a| addFd(a.conn.fd);
         for (term_state.terms.values()) |t| addFd(t.conn.fd);
-        fired = false;
-        started_ms.store(monoMs(), .release);
+        fired.store(false, .release);
+        started_ms = monoMs();
     }
 
     fn addFd(fd: c_int) void {
@@ -393,17 +402,23 @@ const Watchdog = struct {
     }
 
     fn end() void {
-        started_ms.store(0, .release);
+        _ = c.pthread_mutex_lock(&mu);
+        defer _ = c.pthread_mutex_unlock(&mu);
+        started_ms = 0;
     }
 
     fn loop() void {
         while (true) {
             var ts = c.struct_timespec{ .tv_sec = 1, .tv_nsec = 0 };
             _ = c.nanosleep(&ts, null);
-            const started = started_ms.load(.acquire);
-            if (started != 0 and !fired and monoMs() - started > hard_ms) {
-                fired = true;
+            _ = c.pthread_mutex_lock(&mu);
+            const overdue = started_ms != 0 and !fired.load(.acquire) and monoMs() - started_ms > hard_ms;
+            if (overdue) {
+                fired.store(true, .release);
                 for (fds[0..fd_count]) |fd| _ = c.shutdown(fd, c.SHUT_RDWR);
+            }
+            _ = c.pthread_mutex_unlock(&mu);
+            if (overdue) {
                 // stderr only: mcp_log is main-thread-owned (its
                 // close at exit would race a note from this thread).
                 _ = c.fputs("sketerm mcp: tool call exceeded the hard timeout; mux connections aborted to unwedge it\n", platform.stderr());
@@ -548,6 +563,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             Watchdog.hard_ms = @max(ms, 30_000);
         } else |_| {}
     }
+    Watchdog.initLock();
     if (std.Thread.spawn(.{}, Watchdog.loop, .{})) |t| t.detach() else |_| {}
 
     if (mcp_log) |*l| {
@@ -578,7 +594,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         Watchdog.begin();
         const reply = handleMessage(arena_state.allocator(), backend, line);
         Watchdog.end();
-        if (Watchdog.fired) {
+        if (Watchdog.fired.load(.acquire)) {
             // Main-thread, post-call: safe to touch the trace log.
             if (mcp_log) |*l| l.logNote("watchdog fired during the previous call: hard timeout exceeded, mux connections were aborted");
         }
@@ -1408,11 +1424,11 @@ fn a11yNodeSummary(arena: std.mem.Allocator, node: std.json.Value) ![]const u8 {
 /// (or a dangling wait) once it exited.
 fn needsLiveApp(name: []const u8) bool {
     const live = [_][]const u8{
-        "app_click",         "app_drag",          "app_type",
-        "app_key",           "app_scroll",        "app_resize",
-        "app_mouse_move",    "app_clipboard_get", "app_clipboard_set",
-        "app_perform_action", "app_set_value",    "app_wait_for_element",
-        "app_a11y_tree",     "app_record_start",  "close_app_window",
+        "app_click",          "app_drag",          "app_type",
+        "app_key",            "app_scroll",        "app_resize",
+        "app_mouse_move",     "app_clipboard_get", "app_clipboard_set",
+        "app_perform_action", "app_set_value",     "app_wait_for_element",
+        "app_a11y_tree",      "app_record_start",  "close_app_window",
     };
     for (live) |l| {
         if (std.mem.eql(u8, name, l)) return true;
@@ -1765,9 +1781,8 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                 return toolResult(arena, cap, false) orelse error.OutOfMemory;
             }
             const msg = try std.fmt.allocPrint(arena, "line {d} ({d:.1}s ago{s}):\n{s}", .{
-                l.id, age_s,
-                if (l.truncated) ", was longer than the 4KB line cap" else "",
-                l.text,
+                l.id,                                                          age_s,
+                if (l.truncated) ", was longer than the 4KB line cap" else "", l.text,
             });
             return toolResult(arena, msg, false) orelse error.OutOfMemory;
         }
@@ -1793,7 +1808,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                     });
                 } else {
                     try w.print("{d} [-{d:.1}s] {s}{s}\n", .{
-                        l.id, age_s, l.text,
+                        l.id,                                     age_s, l.text,
                         if (l.cut or l.truncated) " [+]" else "",
                     });
                 }
@@ -1818,7 +1833,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             }
             return appErr(arena, "no rendered window yet (try app_wait first)");
         }
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, Watchdog.hard_ms);
         // min_change_pct also thresholds wait_change/stable_ms so
         // continuously-animating apps (a 60Hz software cursor) can
         // still signal/settle on CONTENT changes. Burst reads its own
@@ -2349,11 +2364,18 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                 },
                 .err => {}, // tree not up yet — keep polling
             }
+            app.drain();
+            if (app.exited) {
+                const summary = try appSummary(arena, app);
+                const msg = try std.fmt.allocPrint(arena, "the app exited while waiting for an element\n{s}", .{summary});
+                return toolResult(arena, msg, true) orelse error.OutOfMemory;
+            }
+            if (Watchdog.fired.load(.acquire))
+                return appErr(arena, "element wait aborted by the MCP hard timeout");
             if (monoMs() >= deadline)
                 return appErr(arena, "element did not appear before the timeout");
             var ts = c.struct_timespec{ .tv_sec = 0, .tv_nsec = 300 * 1000 * 1000 };
             _ = c.nanosleep(&ts, null);
-            app.drain();
         }
     }
     if (eql(u8, name, "app_type")) {

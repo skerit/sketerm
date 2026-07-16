@@ -229,6 +229,7 @@ fn addEditingProfileRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Profile");
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Switching reopens the dialog bound to that profile.");
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), profileModelIndex(ctx, ctx.edit_name));
     const cctx = ctx.allocator.create(ComboCtx) catch return;
     cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = editingProfileSelected };
@@ -344,6 +345,7 @@ fn addDefaultProfileRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Profile for new panes");
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Used by new tabs and splits unless one is picked explicitly.");
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), profileModelIndex(ctx, ctx.cfg.default_profile));
     const cctx = ctx.allocator.create(ComboCtx) catch return;
     cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = defaultProfileSelected };
@@ -633,6 +635,7 @@ fn addCursorShapeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Shape");
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Block, underline or vertical bar");
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
     const initial: c_uint = switch (ctx.cfg.cursor_shape) {
         .block => 0,
         .underline => 1,
@@ -662,6 +665,7 @@ fn addMouseActionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, title: [*:0]const
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title);
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), subtitle);
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), @intFromEnum(field.*));
     const mctx = ctx.allocator.create(MouseActionCtx) catch return;
     mctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field };
@@ -843,9 +847,15 @@ fn addPaletteRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, idx: usize) void {
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title.ptr);
 
     // Pull current value: prefer cfg.palette override; else scheme;
-    // else built-in default 256-table first 16.
+    // else built-in default 256-table first 16. Must match the seed in
+    // paletteRowChanged or editing preserves colors the dialog never showed.
     const default_pal = @import("../grid/palette.zig").default_256;
-    const cur: [3]u8 = if (ctx.edit.palette) |p| p[idx] else default_pal[idx];
+    const cur: [3]u8 = if (ctx.edit.palette) |p|
+        p[idx]
+    else if (@import("../grid/schemes.zig").lookup(ctx.edit.scheme)) |scheme|
+        scheme.palette[idx]
+    else
+        default_pal[idx];
 
     const dlg = c.gtk_color_dialog_new();
     const btn = c.gtk_color_dialog_button_new(dlg);
@@ -873,8 +883,12 @@ fn paletteRowChanged(btn: *c.GtkColorDialogButton, _: *c.GParamSpec, user: ?*any
     if (pctx.parent.edit.palette == null) {
         const default_pal = @import("../grid/palette.zig").default_256;
         var pal: [16][3]u8 = undefined;
-        var i: usize = 0;
-        while (i < 16) : (i += 1) pal[i] = default_pal[i];
+        if (@import("../grid/schemes.zig").lookup(pctx.parent.edit.scheme)) |scheme| {
+            pal = scheme.palette;
+        } else {
+            var i: usize = 0;
+            while (i < 16) : (i += 1) pal[i] = default_pal[i];
+        }
         pctx.parent.edit.palette = pal;
     }
     var pal = pctx.parent.edit.palette.?;
@@ -902,6 +916,7 @@ fn addSchemeRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_combo_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Built-in scheme");
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
     var sel: c_uint = 0;
     for (SCHEMES, 0..) |sch, i| {
         if (std.mem.eql(u8, sch.key, ctx.edit.scheme)) {
@@ -1078,6 +1093,7 @@ fn addModifyOtherKeysRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "modifyOtherKeys");
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Send Ctrl/Alt + alphabetic keys as CSI u sequences.");
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), ctx.cfg.modify_other_keys);
     const cctx = ctx.allocator.create(ComboCtx) catch return;
     cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = modifyOtherKeysSelected };
@@ -1095,6 +1111,7 @@ fn addExitActionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_combo_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "On shell exit");
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
     const initial: c_uint = switch (ctx.cfg.exit_action) {
         .close => 0,
         .restart => 1,
@@ -1112,6 +1129,7 @@ fn addAppViewRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_combo_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "App windows open as");
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
     c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), if (ctx.cfg.app_view == .tab) 1 else 0);
     const cctx = ctx.allocator.create(ComboCtx) catch return;
     cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = appViewSelected };
@@ -1192,6 +1210,7 @@ fn addConfirmCloseRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Confirm before closing");
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Show a dialog before destroying tabs / windows.");
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
     const initial: c_uint = switch (ctx.cfg.confirm_close) {
         .never => 0,
         .multiple => 1,
@@ -1219,6 +1238,7 @@ fn addTabPositionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_combo_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Position");
     c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
     const initial: c_uint = switch (ctx.cfg.tab_position) {
         .top => 0,
         .bottom => 1,
@@ -1256,8 +1276,7 @@ fn keybindsPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
 
     const group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(group)), "Keybindings");
-    c.adw_preferences_group_set_description(@ptrCast(@alignCast(group)),
-        "Click an action's button to record a new shortcut. Esc cancels; " ++
+    c.adw_preferences_group_set_description(@ptrCast(@alignCast(group)), "Click an action's button to record a new shortcut. Esc cancels; " ++
         "Backspace unbinds. Conflicts log a warning to stderr.");
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(group)));
 
@@ -1370,12 +1389,18 @@ fn onKeybindCapture(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, stat
     }
     // Modifier-only keys ignored; wait for the actual key.
     switch (keyval) {
-        c.GDK_KEY_Shift_L, c.GDK_KEY_Shift_R,
-        c.GDK_KEY_Control_L, c.GDK_KEY_Control_R,
-        c.GDK_KEY_Alt_L, c.GDK_KEY_Alt_R,
-        c.GDK_KEY_Super_L, c.GDK_KEY_Super_R,
-        c.GDK_KEY_Hyper_L, c.GDK_KEY_Hyper_R,
-        c.GDK_KEY_Meta_L, c.GDK_KEY_Meta_R,
+        c.GDK_KEY_Shift_L,
+        c.GDK_KEY_Shift_R,
+        c.GDK_KEY_Control_L,
+        c.GDK_KEY_Control_R,
+        c.GDK_KEY_Alt_L,
+        c.GDK_KEY_Alt_R,
+        c.GDK_KEY_Super_L,
+        c.GDK_KEY_Super_R,
+        c.GDK_KEY_Hyper_L,
+        c.GDK_KEY_Hyper_R,
+        c.GDK_KEY_Meta_L,
+        c.GDK_KEY_Meta_R,
         => return 1,
         else => {},
     }

@@ -420,6 +420,17 @@ pub const Parser = struct {
     }
 
     fn byteCsi(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
+        // CSI ignore is sticky until a final byte returns to ground.
+        // Parameter/intermediate bytes after the sequence became invalid
+        // must not transition it back into a dispatchable state.
+        if (self.state == .csi_ignore) {
+            switch (b) {
+                0x00...0x17, 0x19, 0x1C...0x1F => emit(ctx, .{ .execute = b }),
+                0x40...0x7E => self.transitionTo(.ground),
+                else => {},
+            }
+            return;
+        }
         switch (b) {
             0x00...0x17, 0x19, 0x1C...0x1F => emit(ctx, .{ .execute = b }),
             0x30...0x39 => {
@@ -798,9 +809,13 @@ test "cancel via can/sub" {
     try std.testing.expect(col.events.items.len >= 2);
     var saw_print_a = false;
     for (col.events.items) |ev| switch (ev) {
-        .print_byte => |b| if (b == 'A') { saw_print_a = true; },
+        .print_byte => |b| if (b == 'A') {
+            saw_print_a = true;
+        },
         .print_run => |run| {
-            for (run.bytes[0..run.len]) |b| if (b == 'A') { saw_print_a = true; };
+            for (run.bytes[0..run.len]) |b| if (b == 'A') {
+                saw_print_a = true;
+            };
         },
         else => {},
     };
@@ -951,6 +966,20 @@ test "DECRQM (CSI ? 1 \\$ p) parses with intermediate" {
         else => {},
     };
     try std.testing.expect(found);
+}
+
+test "CSI ignore remains sticky through parameter and intermediate bytes" {
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    defer col.deinit();
+    // A private marker after parameters invalidates the sequence. The
+    // following parameter/intermediate bytes must not revive it.
+    p.advance("\x1b[1?2$m", TestCollector.emit, &col);
+    for (col.events.items) |ev| switch (ev) {
+        .csi => return error.TestUnexpectedResult,
+        else => {},
+    };
 }
 
 // VT52 mode: ESC <letter> dispatches as VT52 commands.

@@ -105,7 +105,7 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8) Error!Decoded {
             },
             '-' => {
                 x = 0;
-                band += 1;
+                band +|= 1;
                 i += 1;
             },
             '!' => {
@@ -113,14 +113,14 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8) Error!Decoded {
                 // Parse N.
                 var n: u32 = 0;
                 while (i < body.len and body[i] >= '0' and body[i] <= '9') : (i += 1) {
-                    n = n * 10 + (body[i] - '0');
+                    n = n *| 10 +| (body[i] - '0');
                 }
                 if (n == 0) n = 1;
                 // Next char must be a sixel pixel char.
                 if (i < body.len and body[i] >= '?' and body[i] <= '~') {
                     const bits: u8 = body[i] - '?';
                     paintSixel(rgba, dims.width, dims.height, palette[current_color], x, band, bits, n);
-                    x += n;
+                    x +|= n;
                     i += 1;
                 }
             },
@@ -128,7 +128,7 @@ pub fn decode(allocator: std.mem.Allocator, body: []const u8) Error!Decoded {
                 if (ch >= '?' and ch <= '~') {
                     const bits: u8 = ch - '?';
                     paintSixel(rgba, dims.width, dims.height, palette[current_color], x, band, bits, 1);
-                    x += 1;
+                    x +|= 1;
                 }
                 i += 1;
             },
@@ -156,12 +156,25 @@ fn hlsToRgb(h_in: u32, l_in: u32, s_in: u32) [3]u8 {
     var r: f32 = 0;
     var g: f32 = 0;
     var b: f32 = 0;
-    if (hp < 1) { r = c; g = x; }
-    else if (hp < 2) { r = x; g = c; }
-    else if (hp < 3) { g = c; b = x; }
-    else if (hp < 4) { g = x; b = c; }
-    else if (hp < 5) { r = x; b = c; }
-    else { r = c; b = x; }
+    if (hp < 1) {
+        r = c;
+        g = x;
+    } else if (hp < 2) {
+        r = x;
+        g = c;
+    } else if (hp < 3) {
+        g = c;
+        b = x;
+    } else if (hp < 4) {
+        g = x;
+        b = c;
+    } else if (hp < 5) {
+        r = x;
+        b = c;
+    } else {
+        r = c;
+        b = x;
+    }
     const m = l - c / 2.0;
     return .{
         @intFromFloat(@max(0.0, @min(255.0, (r + m) * 255.0))),
@@ -180,7 +193,7 @@ fn paintSixel(
     bits: u8,
     repeat: u32,
 ) void {
-    if (x >= width) return;
+    if (x >= width or band >= (height + 5) / 6) return;
     const max_run = @min(repeat, width - x);
     var run: u32 = 0;
     while (run < max_run) : (run += 1) {
@@ -214,7 +227,7 @@ fn scanDimensions(body: []const u8) Dims {
         while (i < body.len and n < params.len) : (i += 1) {
             const ch = body[i];
             if (ch >= '0' and ch <= '9') {
-                cur = cur * 10 + (ch - '0');
+                cur = cur *| 10 +| (ch - '0');
                 has_cur = true;
             } else if (ch == ';') {
                 if (has_cur) {
@@ -247,9 +260,12 @@ fn scanDimensions(body: []const u8) Dims {
     while (i < body.len) {
         const ch = body[i];
         switch (ch) {
-            '$' => { x = 0; i += 1; },
+            '$' => {
+                x = 0;
+                i += 1;
+            },
             '-' => {
-                if (saw_band_pixel) band += 1;
+                if (saw_band_pixel) band +|= 1;
                 saw_band_pixel = false;
                 x = 0;
                 i += 1;
@@ -267,11 +283,11 @@ fn scanDimensions(body: []const u8) Dims {
                 i += 1;
                 var n: u32 = 0;
                 while (i < body.len and body[i] >= '0' and body[i] <= '9') : (i += 1) {
-                    n = n * 10 + (body[i] - '0');
+                    n = n *| 10 +| (body[i] - '0');
                 }
                 if (n == 0) n = 1;
                 if (i < body.len and body[i] >= '?' and body[i] <= '~') {
-                    x += n;
+                    x +|= n;
                     if (x > max_x) max_x = x;
                     saw_band_pixel = true;
                     i += 1;
@@ -279,7 +295,7 @@ fn scanDimensions(body: []const u8) Dims {
             },
             else => {
                 if (ch >= '?' and ch <= '~') {
-                    x += 1;
+                    x +|= 1;
                     if (x > max_x) max_x = x;
                     saw_band_pixel = true;
                 }
@@ -287,10 +303,10 @@ fn scanDimensions(body: []const u8) Dims {
             },
         }
     }
-    if (saw_band_pixel) band += 1;
+    if (saw_band_pixel) band +|= 1;
 
     const w = if (raster_w > 0) raster_w else max_x;
-    const h = if (raster_h > 0) raster_h else band * 6;
+    const h = if (raster_h > 0) raster_h else band *| 6;
     // Clamp to MAX_DIM so the allocation and paintSixel offset math
     // (computed in u32) cannot overflow on attacker-controlled input.
     return .{ .width = @min(w, MAX_DIM), .height = @min(h, MAX_DIM) };
@@ -306,7 +322,7 @@ fn parseParams(body: []const u8, i: *usize) []u32 {
     while (i.* < body.len and n < Storage.slots.len) {
         const ch = body[i.*];
         if (ch >= '0' and ch <= '9') {
-            cur = cur * 10 + (ch - '0');
+            cur = cur *| 10 +| (ch - '0');
             has_cur = true;
             i.* += 1;
         } else if (ch == ';') {
@@ -360,6 +376,15 @@ test "RLE expansion" {
     defer std.testing.allocator.free(out.rgba);
     try std.testing.expectEqual(@as(u32, 5), out.width);
     try std.testing.expectEqual(@as(u32, 6), out.height);
+}
+
+test "oversized RLE and raster numbers saturate before dimension clamp" {
+    const rle = scanDimensions("!999999999999999999999999~");
+    try std.testing.expectEqual(MAX_DIM, rle.width);
+    try std.testing.expectEqual(@as(u32, 6), rle.height);
+    const raster = scanDimensions("\"1;1;999999999999999999999;2~");
+    try std.testing.expectEqual(MAX_DIM, raster.width);
+    try std.testing.expectEqual(@as(u32, 2), raster.height);
 }
 
 test "raster attrs honored" {

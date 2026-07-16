@@ -1226,6 +1226,15 @@ pub const Screen = struct {
             try resizeBuffer(self.allocator, &alt_mut, self.rows, new_cols, new_rows, false, self);
             self.alt = alt_mut;
         }
+        // While the alternate screen is active, the main buffer is resized
+        // without reflow. Its scrollback must follow the new width too:
+        // evicted scrollback cell slices are reused as active rows by the
+        // scroll hot path after returning to the main screen.
+        if (cols_changed and self.use_alt) {
+            for (self.scrollback.items) |*ln| {
+                try resizeLineCells(self.allocator, ln, new_cols);
+            }
+        }
 
         self.resizeTabStops(new_cols);
         self.cols = new_cols;
@@ -1352,14 +1361,7 @@ pub const Screen = struct {
     ) !void {
         // First, resize each line's cells to new width.
         for (slot.*) |*ln| {
-            if (ln.cells.len == new_cols) continue;
-            const new_cells = try allocator.alloc(Cell, new_cols);
-            @memset(new_cells, .{});
-            const n = @min(ln.cells.len, @as(usize, new_cols));
-            @memcpy(new_cells[0..n], ln.cells[0..n]);
-            if (ln.cells.len > 0) allocator.free(ln.cells);
-            ln.cells = new_cells;
-            ln.dirty = true;
+            try resizeLineCells(allocator, ln, new_cols);
         }
 
         // Then adjust row count.
@@ -1385,6 +1387,17 @@ pub const Screen = struct {
             const new_buf = try allocator.realloc(slot.*, new_rows);
             slot.* = new_buf;
         }
+    }
+
+    fn resizeLineCells(allocator: std.mem.Allocator, ln: *Line, new_cols: u16) !void {
+        if (ln.cells.len == new_cols) return;
+        const new_cells = try allocator.alloc(Cell, new_cols);
+        @memset(new_cells, .{});
+        const n = @min(ln.cells.len, @as(usize, new_cols));
+        @memcpy(new_cells[0..n], ln.cells[0..n]);
+        if (ln.cells.len > 0) allocator.free(ln.cells);
+        ln.cells = new_cells;
+        ln.dirty = true;
     }
 
     /// Push a line into scrollback. Caller transfers ownership of
@@ -1457,10 +1470,8 @@ pub const Screen = struct {
         var row = r.top_row;
         while (row <= r.bot_row) : (row += 1) {
             const line_cells = self.lineCellsAt(row) orelse continue;
-            const start_col: i32 = if (is_rect) rect_lo
-                else if (row == r.top_row) r.top_col else 0;
-            const end_col: i32 = if (is_rect) rect_hi
-                else if (row == r.bot_row) r.bot_col else @intCast(line_cells.len);
+            const start_col: i32 = if (is_rect) rect_lo else if (row == r.top_row) r.top_col else 0;
+            const end_col: i32 = if (is_rect) rect_hi else if (row == r.bot_row) r.bot_col else @intCast(line_cells.len);
             const lo: usize = @intCast(@max(@as(i32, 0), start_col));
             const hi: usize = @intCast(@max(@as(i32, 0), end_col));
             const hi_clamped = @min(hi, line_cells.len);
@@ -2105,10 +2116,7 @@ pub const Screen = struct {
                                 }
                                 continue;
                             }
-                            const cp_len: usize = if ((b0 & 0xE0) == 0xC0) 2
-                                else if ((b0 & 0xF0) == 0xE0) 3
-                                else if ((b0 & 0xF8) == 0xF0) 4
-                                else 0;
+                            const cp_len: usize = if ((b0 & 0xE0) == 0xC0) 2 else if ((b0 & 0xF0) == 0xE0) 3 else if ((b0 & 0xF8) == 0xF0) 4 else 0;
                             if (cp_len == 0) {
                                 // Invalid leading byte — drop.
                                 i += 1;
@@ -3709,7 +3717,8 @@ pub const Screen = struct {
             0xFFE0...0xFFE6, // Fullwidth Signs
             0x231A...0x231B, // Watch / hourglass
             0x23E9...0x23EC, // Media buttons
-            0x23F0, 0x23F3, // Alarm clock, hourglass
+            0x23F0,
+            0x23F3, // Alarm clock, hourglass
             0x25FD...0x25FE, // Medium small white/black squares
             0x2614...0x2615, // Umbrella, hot beverage
             0x2648...0x2653, // Zodiac
@@ -3719,16 +3728,26 @@ pub const Screen = struct {
             0x26AA...0x26AB, // White / black circle
             0x26BD...0x26BE, // Soccer / baseball
             0x26C4...0x26C5, // Snowman / sun behind cloud
-            0x26CE, 0x26D4, 0x26EA, // Ophiuchus, no entry, church
+            0x26CE,
+            0x26D4,
+            0x26EA, // Ophiuchus, no entry, church
             0x26F2...0x26F3, // Fountain, flag in hole
-            0x26F5, 0x26FA, 0x26FD, // Sailboat, tent, fuel pump
-            0x2705, 0x270A...0x270B, 0x2728, // Check mark, raised hand, sparkles
-            0x274C, 0x274E, // Cross mark
-            0x2753...0x2755, 0x2757, // Question / exclamation
+            0x26F5,
+            0x26FA,
+            0x26FD, // Sailboat, tent, fuel pump
+            0x2705,
+            0x270A...0x270B,
+            0x2728, // Check mark, raised hand, sparkles
+            0x274C,
+            0x274E, // Cross mark
+            0x2753...0x2755,
+            0x2757, // Question / exclamation
             0x2795...0x2797, // Plus / minus / division signs
-            0x27B0, 0x27BF, // Curly loop / double curly
+            0x27B0,
+            0x27BF, // Curly loop / double curly
             0x2B1B...0x2B1C, // Black / white large square
-            0x2B50, 0x2B55, // Star / circle
+            0x2B50,
+            0x2B55, // Star / circle
             0x1F000...0x1F02F, // Mahjong tiles
             0x1F0A0...0x1F0FF, // Playing cards
             0x1F300...0x1F64F, // Misc Symbols / Emoji
@@ -5102,10 +5121,20 @@ pub const Screen = struct {
                 8 => entry.attrs.invisible = true,
                 9 => entry.attrs.strikethrough = true,
                 21 => entry.attrs.double_underline = true,
-                22 => { entry.attrs.bold = false; entry.attrs.dim = false; },
+                22 => {
+                    entry.attrs.bold = false;
+                    entry.attrs.dim = false;
+                },
                 23 => entry.attrs.italic = false,
-                24 => { entry.attrs.underline = false; entry.attrs.double_underline = false; entry.attrs.curly_underline = false; },
-                25 => { entry.attrs.blink = false; entry.attrs.fast_blink = false; },
+                24 => {
+                    entry.attrs.underline = false;
+                    entry.attrs.double_underline = false;
+                    entry.attrs.curly_underline = false;
+                },
+                25 => {
+                    entry.attrs.blink = false;
+                    entry.attrs.fast_blink = false;
+                },
                 27 => entry.attrs.reverse = false,
                 28 => entry.attrs.invisible = false,
                 29 => entry.attrs.strikethrough = false,
@@ -5530,13 +5559,46 @@ test "alt screen toggle" {
     try std.testing.expectEqual(@as(u32, 'M'), s.cellAt(0, 0).rune); // main preserved
 }
 
+test "column resize in alt screen normalizes main scrollback width" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 5, 3);
+    defer s.deinit();
+    s.scrollback_capacity = 2;
+    // Fill the ring so its buffers will be recycled on the next scroll.
+    s.printCp('a');
+    s.execute('\r');
+    s.execute('\n');
+    s.printCp('b');
+    s.execute('\r');
+    s.execute('\n');
+    s.printCp('c');
+    s.execute('\r');
+    s.execute('\n');
+    s.printCp('d');
+    s.execute('\r');
+    s.execute('\n');
+    try std.testing.expectEqual(@as(usize, 2), s.scrollback.items.len);
+
+    s.toggleAltScreen(true);
+    try s.resize(9, 3);
+    for (s.scrollback.items) |ln| try std.testing.expectEqual(@as(usize, 9), ln.cells.len);
+    s.toggleAltScreen(false);
+    s.scrollUp(1);
+    for (s.active) |ln| try std.testing.expectEqual(@as(usize, 9), ln.cells.len);
+}
+
 test "scroll up moves content" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
     var s = try Screen.init(std.testing.allocator, &pool, 3, 3);
     defer s.deinit();
-    s.printCp('a'); s.execute('\r'); s.execute('\n');
-    s.printCp('b'); s.execute('\r'); s.execute('\n');
+    s.printCp('a');
+    s.execute('\r');
+    s.execute('\n');
+    s.printCp('b');
+    s.execute('\r');
+    s.execute('\n');
     s.printCp('c');
     s.scrollUp(1);
     try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 0).rune);
@@ -5675,9 +5737,15 @@ test "SGR 0 resets style" {
     var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
     defer s.deinit();
     var csi = Event.Csi{};
-    csi.params[0] = 1; csi.n_params = 1; csi.final = 'm'; s.csi(csi);
+    csi.params[0] = 1;
+    csi.n_params = 1;
+    csi.final = 'm';
+    s.csi(csi);
     try std.testing.expect(pool.get(s.cur_style).attrs.bold);
-    csi.params[0] = 0; csi.n_params = 1; csi.final = 'm'; s.csi(csi);
+    csi.params[0] = 0;
+    csi.n_params = 1;
+    csi.final = 'm';
+    s.csi(csi);
     try std.testing.expect(!pool.get(s.cur_style).attrs.bold);
 }
 
@@ -5746,9 +5814,15 @@ test "ED 3 clears scrollback" {
     var s = try Screen.init(std.testing.allocator, &pool, 3, 2);
     defer s.deinit();
     // Fill enough lines to push some into scrollback.
-    s.printCp('a'); s.execute('\r'); s.execute('\n');
-    s.printCp('b'); s.execute('\r'); s.execute('\n');
-    s.printCp('c'); s.execute('\r'); s.execute('\n');
+    s.printCp('a');
+    s.execute('\r');
+    s.execute('\n');
+    s.printCp('b');
+    s.execute('\r');
+    s.execute('\n');
+    s.printCp('c');
+    s.execute('\r');
+    s.execute('\n');
     s.printCp('d');
     try std.testing.expect(s.scrollbackCount() > 0);
     var csi = Event.Csi{};
@@ -5767,7 +5841,9 @@ test "ED 3 resets scrollback_head so eviction order survives a clear" {
     s.scrollback_capacity = 3; // tiny ring so we wrap quickly
     // Fill the ring + wrap a few times to advance scrollback_head.
     inline for (0..6) |_| {
-        s.printCp('x'); s.execute('\r'); s.execute('\n');
+        s.printCp('x');
+        s.execute('\r');
+        s.execute('\n');
     }
     try std.testing.expect(s.scrollback_head > 0);
 
@@ -5782,7 +5858,9 @@ test "ED 3 resets scrollback_head so eviction order survives a clear" {
 
     // Now refill — scrollbackLine indexing must produce sane output.
     inline for ("abc") |ch| {
-        s.printCp(ch); s.execute('\r'); s.execute('\n');
+        s.printCp(ch);
+        s.execute('\r');
+        s.execute('\n');
     }
     // Walking scrollbackLine 0..N from oldest should return entries
     // in the order they were pushed.
@@ -8319,11 +8397,13 @@ test "contentHash detects visible change, ignores identical repaint" {
 
     // Repaint the exact same thing at the same spot: home the cursor and
     // print "hi" again. No visible change → hash returns to h1.
-    s.apply(.{ .csi = blk: {
-        var ev = Event.Csi{};
-        ev.final = 'H'; // CUP → row1,col1
-        break :blk ev;
-    } });
+    s.apply(.{
+        .csi = blk: {
+            var ev = Event.Csi{};
+            ev.final = 'H'; // CUP → row1,col1
+            break :blk ev;
+        },
+    });
     s.apply(.{ .print = 'h' });
     s.apply(.{ .print = 'i' });
     try std.testing.expectEqual(h1, s.contentHash());

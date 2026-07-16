@@ -25,10 +25,26 @@ var default_config: Config = .{};
 /// CSS installed once per display.
 var css_installed = false;
 
-/// The tab currently being dragged. In-process DnD across windows shares
-/// one address space, so a module global is the simplest reliable
-/// carrier; the GdkContentProvider just supplies a matching marker type.
-var dragged: ?*TabBar.Tab = null;
+const Dragged = struct {
+    view: *c.AdwTabView,
+    page: *c.AdwTabPage,
+    detach_ctx: ?*anyopaque,
+    on_detach: ?*const fn (ctx: ?*anyopaque, view: *c.AdwTabView, page: *c.AdwTabPage) void,
+};
+
+/// Owns GObject refs rather than a heap `Tab`: structure notifications can
+/// rebuild the strip while a GDK drag is still alive.
+var dragged: ?Dragged = null;
+
+fn releaseDragged(d: Dragged) void {
+    c.g_object_unref(d.page);
+    c.g_object_unref(d.view);
+}
+
+fn clearDragged() void {
+    if (dragged) |d| releaseDragged(d);
+    dragged = null;
+}
 
 // ── custom widget types ──────────────────────────────────────────────
 //
@@ -467,6 +483,9 @@ pub const TabBar = struct {
     }
 
     fn clearTabs(self: *TabBar) void {
+        // Structure signals can rebuild during an in-bar reorder. Do not
+        // retain a pointer to a Tab that this loop is about to free.
+        self.reorder = null;
         for (self.tabs.items) |t| {
             if (t.title_handler != 0) c.g_signal_handler_disconnect(@ptrCast(t.page), t.title_handler);
             if (t.icon_handler != 0) c.g_signal_handler_disconnect(@ptrCast(t.page), t.icon_handler);
@@ -595,6 +614,9 @@ pub const TabBar = struct {
         if (self.warn_arm_id != 0) {
             _ = c.g_source_remove(self.warn_arm_id);
             self.warn_arm_id = 0;
+        }
+        if (dragged) |d| {
+            if (d.view == self.view) clearDragged();
         }
         self.clearTabs();
         self.tabs.deinit(self.allocator);
@@ -915,10 +937,13 @@ fn beginExternalDrag(self: *TabBar, controller: *c.GtkEventController, tab: *Tab
     const native = c.gtk_widget_get_native(self.box) orelse return;
     const surface = c.gtk_native_get_surface(native) orelse return;
     const device = c.gtk_event_controller_get_current_event_device(controller) orelse return;
-    dragged = tab;
+    clearDragged();
+    _ = c.g_object_ref(self.view);
+    _ = c.g_object_ref(tab.page);
+    dragged = .{ .view = self.view, .page = tab.page, .detach_ctx = self.detach_ctx, .on_detach = self.on_detach };
     const content = c.gdk_content_provider_new_typed(c.G_TYPE_INT, @as(c_int, 1));
     const drag = c.gdk_drag_begin(surface, device, content, c.GDK_ACTION_MOVE, -hot_x, -hot_y) orelse {
-        dragged = null;
+        clearDragged();
         return;
     };
     const icon = c.gtk_drag_icon_get_for_drag(drag);
@@ -926,24 +951,25 @@ fn beginExternalDrag(self: *TabBar, controller: *c.GtkEventController, tab: *Tab
     const img = c.gtk_image_new_from_paintable(paintable);
     c.gtk_drag_icon_set_child(@ptrCast(@alignCast(icon)), img);
     if (paintable) |p| c.g_object_unref(p);
-    _ = c.g_signal_connect_data(drag, "cancel", @ptrCast(&onGdkDragCancel), tab, null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(drag, "cancel", @ptrCast(&onGdkDragCancel), null, null, c.G_CONNECT_DEFAULT);
     _ = c.g_signal_connect_data(drag, "dnd-finished", @ptrCast(&onGdkDragFinished), null, null, c.G_CONNECT_DEFAULT);
 }
 
 /// GDK drag ended with no drop target: spawn a new window for the tab
 /// (drag-out), the create-window half of libadwaita's behaviour.
 fn onGdkDragCancel(_: ?*anyopaque, reason: c_int, user: ?*anyopaque) callconv(.c) c.gboolean {
-    const t = cast.userData(TabBar.Tab, user);
-    defer dragged = null;
+    _ = user;
+    const d = dragged orelse return 0;
+    defer clearDragged();
     if (reason == c.GDK_DRAG_CANCEL_NO_TARGET) {
-        if (t.bar.on_detach) |f| f(t.bar.detach_ctx, t.bar.view, t.page);
+        if (d.on_detach) |f| f(d.detach_ctx, d.view, d.page);
         return 1;
     }
     return 0;
 }
 
 fn onGdkDragFinished(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
-    dragged = null;
+    clearDragged();
 }
 
 /// A tab dragged out of another window's strip was dropped on ours.
@@ -951,19 +977,20 @@ fn onDrop(_: ?*anyopaque, _: ?*anyopaque, x: f64, _: f64, user: ?*anyopaque) cal
     const self = cast.userData(TabBar, user);
     const src = dragged orelse return 0;
     dragged = null;
+    defer releaseDragged(src);
 
     const slot: f64 = @floatFromInt(TAB_W);
     var idx: c_int = @intFromFloat(@max(0.0, (x + slot / 2.0) / slot));
     const n = c.adw_tab_view_get_n_pages(self.view);
     if (idx > n) idx = n;
 
-    if (src.bar.view == self.view) {
+    if (src.view == self.view) {
         var pos = idx;
         if (pos >= n) pos = n - 1;
         if (pos < 0) pos = 0;
         _ = c.adw_tab_view_reorder_page(self.view, src.page, pos);
     } else {
-        c.adw_tab_view_transfer_page(src.bar.view, src.page, self.view, idx);
+        c.adw_tab_view_transfer_page(src.view, src.page, self.view, idx);
     }
     return 1;
 }

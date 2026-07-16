@@ -329,6 +329,12 @@ pub const Terminal = struct {
         acked: u64 = 0, // bytes the daemon confirmed written
         idle_id: c_uint = 0, // GLib idle pump, 0 = not armed
         eof_sent: bool = false,
+        /// True while the pump runs on a 20ms timeout source instead of an
+        /// idle source: socket backpressure must not busy-spin the loop.
+        pump_timer: bool = false,
+        /// g_get_monotonic_time() when backpressure was first seen, 0 when
+        /// the socket is keeping up. Bounds a wedged link.
+        stall_start_us: i64 = 0,
         buf: [4 + upload_chunk]u8 = undefined,
     };
 
@@ -361,7 +367,8 @@ pub const Terminal = struct {
         errdefer allocator.destroy(self);
 
         var pool = try Pool.init(allocator);
-        errdefer pool.deinit();
+        var pool_is_local = true;
+        errdefer if (pool_is_local) pool.deinit();
 
         const drain = try allocator.create(DrainHandle);
         drain.* = .{};
@@ -391,6 +398,8 @@ pub const Terminal = struct {
             .screen = undefined,
             .remote = remote,
         };
+        pool_is_local = false;
+        errdefer self.pool.deinit();
         drain.terminal = self;
 
         // Restore the snapshot into our pool; wire sinks like init.
@@ -899,8 +908,8 @@ pub const Terminal = struct {
     }
 
     /// GLib idle pump: send one chunk (or the closing frame) per tick,
-    /// yielding to the loop between chunks. Socket backpressure (the
-    /// blocking write in sendFrame) bounds how far we read ahead.
+    /// yielding to the loop between chunks. Socket backpressure leaves a
+    /// resumable partial frame in Conn.wbuf; no poll blocks the main loop.
     fn uploadPumpCb(user: ?*anyopaque) callconv(.c) c.gboolean {
         const up: *Upload = @ptrCast(@alignCast(user.?));
         const self = up.terminal;
@@ -912,6 +921,38 @@ pub const Terminal = struct {
             up.idle_id = 0;
             return 0; // G_SOURCE_REMOVE
         }
+        remote.conn.flushQueued() catch {
+            up.idle_id = 0;
+            self.finishUpload(.failed, "connection lost");
+            return 0;
+        };
+        if (remote.conn.wbuf.items.len > 0) {
+            // Backpressure: an idle source re-fires immediately and would
+            // spin a core. Poll on a 20ms timer instead, bounded by the
+            // connection's write timeout so a wedged link fails the upload.
+            const now = c.g_get_monotonic_time();
+            if (up.stall_start_us == 0) up.stall_start_us = now;
+            if (now - up.stall_start_us > @as(i64, remote.conn.write_timeout_ms) * 1000) {
+                up.idle_id = 0;
+                self.finishUpload(.failed, "connection lost");
+                return 0;
+            }
+            if (up.pump_timer) return 1; // stay on the 20ms timer
+            up.pump_timer = true;
+            up.idle_id = c.g_timeout_add(20, @ptrCast(&uploadPumpCb), @ptrCast(up));
+            return 0; // remove the idle source
+        }
+        up.stall_start_us = 0;
+        if (up.pump_timer) {
+            // Drained: move back to an idle source for full throughput.
+            up.pump_timer = false;
+            up.idle_id = c.g_idle_add(@ptrCast(&uploadPumpCb), @ptrCast(up));
+            return 0; // remove the timer source
+        }
+        if (up.eof_sent) {
+            up.idle_id = 0;
+            return 0;
+        }
         const n = c.read(up.fd, up.buf[4..], upload_chunk);
         if (n < 0) {
             if (std.posix.errno(n) == .INTR) return 1; // G_SOURCE_CONTINUE
@@ -921,17 +962,22 @@ pub const Terminal = struct {
         }
         if (n == 0) {
             // EOF: send the close frame; the daemon answers "done".
-            up.idle_id = 0;
             up.eof_sent = true;
             var hdr: [4]u8 = undefined;
-            remote.conn.sendFrame(.file_close, mux_wire.putChanHeader(&hdr, up.xfer)) catch {
+            remote.conn.queueFrame(.file_close, mux_wire.putChanHeader(&hdr, up.xfer)) catch {
+                up.idle_id = 0;
                 self.finishUpload(.failed, "connection lost");
+                return 0;
             };
-            return 0; // G_SOURCE_REMOVE
+            if (remote.conn.wbuf.items.len == 0) {
+                up.idle_id = 0;
+                return 0;
+            }
+            return 1;
         }
         _ = mux_wire.putChanHeader(up.buf[0..4], up.xfer);
         const len: usize = @intCast(n);
-        remote.conn.sendFrame(.file_data, up.buf[0 .. 4 + len]) catch {
+        remote.conn.queueFrame(.file_data, up.buf[0 .. 4 + len]) catch {
             up.idle_id = 0;
             self.finishUpload(.failed, "connection lost");
             return 0; // G_SOURCE_REMOVE
@@ -1744,6 +1790,10 @@ pub const Terminal = struct {
             remote.aapps.deinit(self.allocator);
             remote.predictor.deinit();
             if (!remote.closed) {
+                // A stalled upload can leave queued frames in conn.wbuf;
+                // the kill/detach below must not silently queue behind
+                // them and die with the fd. Bounded, best-effort drain.
+                remote.conn.flushQueuedFor(remote.conn.write_timeout_ms) catch {};
                 if (remote.ephemeral) {
                     // GUI-owned session: kill it so a closed tab doesn't
                     // leak a daemon session. Session names are GUI-minted
@@ -1772,7 +1822,6 @@ pub const Terminal = struct {
         // always set, so the branch above always returns. This is unreachable.
         unreachable;
     }
-
 };
 
 test "nappOpen appends before firing on_app_view (empty-list deref regression)" {
