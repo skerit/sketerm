@@ -7878,3 +7878,29 @@ probe on the open C zone) instead of a flaky 700ms wall-clock bound,
 and all redirects go to /dev/null instead of fixed world-shared /tmp
 paths. termdrive.spawn no longer leaks the style pool if the Term
 allocation fails.
+
+## Remote audio survives graphical congestion
+
+Choppy forwarded-app audio had two coupled causes. Pulse clients that
+asked for a 20-50ms low-latency tlength turned every refill into a
+just-in-time round trip over the mux transport, while native window
+pixels and PCM shared one FIFO client buffer. Once pixels pushed that
+buffer over 8MB, the daemon classified the live GUI like an idle
+viewer, dropped PCM, and self-clocked past samples that could never be
+replayed.
+
+Playback streams now negotiate at least a 500ms producer window (PCM
+still forwards immediately; this is jitter capacity, not a forced
+half-second start delay). Subscribed audio is never dropped because of
+the graphical backlog: consumed credits already bound production to
+what the local Pulse stream accepts. Each client has a separate audio
+write lane which wins at wire-frame boundaries, and native unit streams
+use 64KB frames so even a multi-megabyte surface commit yields quickly.
+Terminal-only and MCP appdrive clients remain unsubscribed and receive
+no PCM.
+
+The real create-stream protocol test now requests an intentionally tiny
+5ms buffer and asserts the 500ms negotiated window; a queue regression
+test pins audio-first selection and no mid-frame interleaving. Full
+tests, smoke-mux, mux, and mux-portable verify the transport and
+libc-only daemon paths.
