@@ -7,6 +7,8 @@
 //!
 //! v2: image placements retained by the daemon's Screen
 //! (`retain_images`) ride along, so reattach restores images.
+//! v4: OSC 133 command state (open C marker, last zone, exit code,
+//! completion sequence), so command waits survive resyncs.
 
 const std = @import("std");
 const Screen = @import("../grid/screen.zig").Screen;
@@ -15,7 +17,7 @@ const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
 const Pool = style_pool.Pool;
 
-pub const SNAPSHOT_VERSION: u32 = 3;
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 const Sink = struct {
     out: *std.ArrayList(u8),
@@ -187,6 +189,16 @@ pub fn serialize(screen: *const Screen, out: *std.ArrayList(u8), allocator: std.
         try s.int(u32, ev.src_h);
         try s.bytes(ri.owned);
     }
+
+    // v4: OSC 133 command state, LAST in the stream so a v3 payload is
+    // exactly a v4 one without this tail. Keeping an open C marker and
+    // the completion sequence makes command waits survive mux resyncs.
+    try s.int(u64, screen.pending_output_start_id);
+    try s.boolean(screen.pending_output_awaits_nl);
+    try s.int(u64, screen.last_output_start_id);
+    try s.int(u64, screen.last_output_end_id);
+    try s.int(i32, screen.last_cmd_exit);
+    try s.int(u64, screen.cmd_completion_seq);
 }
 
 const Src = struct {
@@ -267,7 +279,9 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
     var src = Src{ .bytes = bytes };
 
     const version = try src.int(u32);
-    if (version != SNAPSHOT_VERSION) return error.SnapshotVersionMismatch;
+    // v3 is still accepted: an already-running pre-upgrade daemon must
+    // stay attachable or upgrading sketerm strands durable sessions.
+    if (version != 3 and version != SNAPSHOT_VERSION) return error.SnapshotVersionMismatch;
     const cols = try src.int(u16);
     const rows = try src.int(u16);
     if (cols == 0 or rows == 0 or cols > 4096 or rows > 4096) return error.BadSnapshot;
@@ -425,6 +439,17 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
         screen.retained_image_bytes += owned.len;
     }
 
+    // v4 tail: OSC 133 command state. A v3 payload simply ends here;
+    // the fields keep their zero defaults (no completed zone known).
+    if (version >= 4) {
+        screen.pending_output_start_id = try src.int(u64);
+        screen.pending_output_awaits_nl = try src.boolean();
+        screen.last_output_start_id = try src.int(u64);
+        screen.last_output_end_id = try src.int(u64);
+        screen.last_cmd_exit = try src.int(i32);
+        screen.cmd_completion_seq = try src.int(u64);
+    }
+
     screen.dirty = true;
     return screen;
 }
@@ -484,6 +509,8 @@ test "snapshot: populated screen round-trips" {
     h.feed("\x1b]0;snap title\x07");
     h.feed("\x1b[?2004h");
     h.feed("\x1b]8;;https://sker.dev\x07link\x1b]8;;\x07");
+    h.feed("\r\x1b]133;A\x07\x1b]133;C\x07command output\r\n\x1b]133;D;7\x07");
+    h.feed("\x1b]133;C\x07");
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
@@ -500,6 +527,12 @@ test "snapshot: populated screen round-trips" {
     try testing.expectEqual(screen.col, back.col);
     try testing.expectEqual(screen.scrollbackCount(), back.scrollbackCount());
     try testing.expectEqual(screen.bracketed_paste, back.bracketed_paste);
+    try testing.expectEqual(screen.pending_output_start_id, back.pending_output_start_id);
+    try testing.expectEqual(screen.pending_output_awaits_nl, back.pending_output_awaits_nl);
+    try testing.expectEqual(screen.last_output_start_id, back.last_output_start_id);
+    try testing.expectEqual(screen.last_output_end_id, back.last_output_end_id);
+    try testing.expectEqual(screen.last_cmd_exit, back.last_cmd_exit);
+    try testing.expectEqual(screen.cmd_completion_seq, back.cmd_completion_seq);
     try testing.expectEqualStrings("snap title", back.last_title.?);
     try testing.expectEqual(h.pool.entries.items.len, pool2.entries.items.len);
 
@@ -525,6 +558,37 @@ test "snapshot: populated screen round-trips" {
     const txt_b = try back.extractScreen(a);
     defer a.free(txt_b);
     try testing.expectEqualStrings(txt_a, txt_b);
+}
+
+test "snapshot: v3 payload (no command tail) restores with defaults" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 20, 6);
+    defer h.deinit();
+    h.feed("\x1b]133;A\x07\x1b]133;C\x07out\r\n\x1b]133;D;7\x07");
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try serialize(h.screen, &buf, a);
+
+    // A v3 payload is exactly a v4 one without the 37-byte command
+    // tail — chop it off and stamp version 3.
+    const tail = 8 + 1 + 8 + 8 + 4 + 8;
+    const legacy = try a.dupe(u8, buf.items[0 .. buf.items.len - tail]);
+    defer a.free(legacy);
+    std.mem.writeInt(u32, legacy[0..4], 3, .little);
+
+    var pool2 = try Pool.init(a);
+    defer pool2.deinit();
+    const back = try restore(a, &pool2, legacy);
+    defer back.deinit();
+    try testing.expectEqual(@as(u64, 0), back.cmd_completion_seq);
+    try testing.expectEqual(@as(i32, 0), back.last_cmd_exit);
+    try testing.expectEqual(@as(u64, 0), back.last_output_start_id);
+
+    // And a v4 payload with the tail MISSING is corrupt, not v3.
+    var pool3 = try Pool.init(a);
+    defer pool3.deinit();
+    try testing.expectError(error.Truncated, restore(a, &pool3, buf.items[0 .. buf.items.len - tail]));
 }
 
 test "snapshot: retained image placements round-trip" {

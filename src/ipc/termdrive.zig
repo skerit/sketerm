@@ -29,6 +29,33 @@ pub const Error = error{
     OutOfMemory,
 };
 
+pub const CompletionSource = enum { none, shell_integration, process_tracking };
+
+pub const CommandCompletion = struct {
+    state: enum { unsupported, running, completed, unknown },
+    exit_status: ?i32 = null,
+    timed_out: bool = false,
+    source: CompletionSource = .none,
+};
+
+pub const CommandToken = struct {
+    completion_seq: u64,
+};
+
+pub const TokenResult = union(enum) {
+    /// No shell integration was injected for this shell.
+    unsupported,
+    /// Integration is injected but no prompt mark has arrived within
+    /// the wait — slow shell startup, or a shell whose rc files broke
+    /// the injection. Retryable, unlike `unsupported`.
+    not_ready,
+    /// A foreground command (started outside command mode) is still
+    /// between OSC 133 C and D; its D would be misattributed to a new
+    /// command-mode send.
+    busy,
+    token: CommandToken,
+};
+
 var name_counter: u32 = 0;
 
 pub const Term = struct {
@@ -41,7 +68,14 @@ pub const Term = struct {
     seq: u64 = 0,
     exited: bool = false,
     exit_status: i32 = 0,
+    exit_status_known: bool = false,
     app_cursor: bool = false,
+    integration: bool = false,
+    /// One full-length first-prompt wait already expired with no mark:
+    /// later commandToken calls fail fast instead of re-burning it.
+    /// Never blocks success — a mark that shows up later still wins.
+    prompt_wait_exhausted: bool = false,
+    pending_command: ?CommandToken = null,
 
     /// Spawn a shell session on the daemon at `local_sock` (null = the
     /// shared per-user daemon) and attach. `argv` null = the login
@@ -93,12 +127,11 @@ pub const Term = struct {
         defer snap.deinit(allocator);
 
         const pool = allocator.create(Pool) catch return Error.OutOfMemory;
-        pool.* = Pool.init(allocator) catch {
-            allocator.destroy(pool);
-            return Error.OutOfMemory;
-        };
+        errdefer allocator.destroy(pool);
+        pool.* = Pool.init(allocator) catch return Error.OutOfMemory;
+        errdefer pool.deinit();
         const self = allocator.create(Term) catch return Error.OutOfMemory;
-        self.* = .{ .allocator = allocator, .conn = conn, .name = name, .pool = pool };
+        self.* = .{ .allocator = allocator, .conn = conn, .name = name, .pool = pool, .integration = si != null };
         self.applySnapshot(snap.payload) catch {};
         return self;
     }
@@ -146,7 +179,10 @@ pub const Term = struct {
             .events => self.applyEvents(payload),
             .exit => {
                 self.exited = true;
-                if (payload.len >= 4) self.exit_status = std.mem.readInt(i32, payload[0..4], .little);
+                if (payload.len >= 4) {
+                    self.exit_status = std.mem.readInt(i32, payload[0..4], .little);
+                    self.exit_status_known = true;
+                }
             },
             .gone => self.exited = true,
             else => {},
@@ -228,6 +264,95 @@ pub const Term = struct {
         return .{ .text = text, .exit = screen.last_cmd_exit };
     }
 
+    fn commandTokenFor(screen: *const Screen) CommandToken {
+        return .{ .completion_seq = screen.cmd_completion_seq };
+    }
+
+    /// Capture the completed-zone baseline for a command-mode send.
+    /// Integration was injected at spawn but the first prompt may not
+    /// have rendered yet on a freshly opened terminal, so this waits
+    /// (bounded by `wait_ms`) for the first OSC 133 prompt mark
+    /// instead of misreporting a race as unsupported.
+    pub fn commandToken(self: *Term, wait_ms: i64) Error!TokenResult {
+        self.drain();
+        if (self.exited) return Error.NotConnected;
+        if (self.screen == null) return Error.NotConnected;
+        if (!self.integration) return .unsupported;
+        const deadline = nowMs() + wait_ms;
+        while (true) {
+            // Re-fetch each pass: a resync snapshot swaps self.screen.
+            const screen = self.screen orelse return Error.NotConnected;
+            if (screen.prompt_marks_len > 0) break;
+            if (self.exited) return Error.NotConnected;
+            if (self.prompt_wait_exhausted or nowMs() >= deadline) {
+                self.prompt_wait_exhausted = true;
+                return .not_ready;
+            }
+            _ = self.pumpOnce(50);
+        }
+        // A raw send's Enter races its OSC 133 C mark: settle briefly
+        // so an in-flight command surfaces before the busy judgment,
+        // or its D would complete the new command-mode wait.
+        _ = self.waitIdle(100, 500);
+        if (self.exited) return Error.NotConnected;
+        const screen = self.screen orelse return Error.NotConnected;
+        if (screen.pending_output_start_id != 0 or screen.pending_output_awaits_nl)
+            return .busy;
+        return .{ .token = commandTokenFor(screen) };
+    }
+
+    pub fn trackCommand(self: *Term, token: CommandToken) void {
+        self.pending_command = token;
+    }
+
+    pub fn hasPendingCommand(self: *const Term) bool {
+        return self.pending_command != null;
+    }
+
+    /// Wait for a new OSC 133 command zone or a tracked shell-process exit.
+    pub fn waitCommand(self: *Term, token: CommandToken, timeout_ms: i64) CommandCompletion {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            _ = self.pumpOnce(50);
+            if (self.screen) |screen| {
+                const current = commandTokenFor(screen);
+                if (!std.meta.eql(token, current)) {
+                    self.pending_command = null;
+                    return .{
+                        .state = .completed,
+                        .exit_status = screen.last_cmd_exit,
+                        .source = .shell_integration,
+                    };
+                }
+            }
+            if (self.exited) {
+                if (self.exit_status_known) {
+                    self.pending_command = null;
+                    return .{
+                        .state = .completed,
+                        .exit_status = self.exit_status,
+                        .source = .process_tracking,
+                    };
+                }
+                self.pending_command = null;
+                return .{ .state = .unknown };
+            }
+            if (nowMs() >= deadline) {
+                // Nothing completed: no source to attribute.
+                return .{
+                    .state = .running,
+                    .timed_out = true,
+                    .source = .none,
+                };
+            }
+        }
+    }
+
+    pub fn waitPendingCommand(self: *Term, timeout_ms: i64) ?CommandCompletion {
+        const token = self.pending_command orelse return null;
+        return self.waitCommand(token, timeout_ms);
+    }
+
     /// Rendered screen text (drains pending events first).
     pub fn readScreen(self: *Term, scrollback: bool) Error![]u8 {
         self.drain();
@@ -238,8 +363,7 @@ pub const Term = struct {
             screen.extractScreen(self.allocator)) catch Error.OutOfMemory;
     }
 
-    /// Block until `quiet_ms` passes with no new events, or `timeout_ms`
-    /// elapses. Returns true if it settled (false = timed out / exited).
+    /// Block until output is quiet; this does not imply the foreground command exited.
     pub fn waitIdle(self: *Term, quiet_ms: i64, timeout_ms: i64) bool {
         const deadline = nowMs() + timeout_ms;
         var last_seq = self.seq;

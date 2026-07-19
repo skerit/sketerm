@@ -234,7 +234,7 @@ pub fn main() u8 {
         if (std.mem.indexOf(u8, tools, "error") != null and std.mem.indexOf(u8, tools, "[]") == null)
             fail("term_list did not return a list");
 
-        const open = m.callTool("term_open", "{\"command\":[\"/bin/sh\"],\"cols\":80,\"rows\":24}");
+        const open = m.callTool("term_open", "{\"command\":[\"/bin/bash\"],\"cols\":80,\"rows\":24}");
         if (std.mem.indexOf(u8, open, "opened headless terminal") == null) fail("term_open failed");
 
         // Private daemon socket exists; shared one does NOT.
@@ -247,6 +247,88 @@ pub fn main() u8 {
 
         const run = m.callTool("term_run", "{\"command\":\"echo SMOKE-MCP-OK\"}");
         if (std.mem.indexOf(u8, run, "SMOKE-MCP-OK") == null) fail("term_run did not capture output");
+
+        // Backward-compatible idle mode must still return while a
+        // silent foreground command is running. Proven semantically,
+        // not by wall clock (loaded machines made a timing bound
+        // flaky): if idle mode returned early, the command's OSC 133 C
+        // zone is still open, so a command-mode send must see busy.
+        const idle_run = m.callTool("term_run", "{\"command\":\"sleep 1.5 >/dev/null 2>&1\",\"quiet_ms\":100,\"timeout_ms\":3000}");
+        if (std.mem.indexOf(u8, idle_run, "output_only unavailable") != null) fail("plain idle-mode term_run changed output shape");
+        const idle_probe = m.callTool("term_run", "{\"command\":\"echo MUST-NOT-RUN-IDLE\",\"wait_for\":\"command\"}");
+        if (std.mem.indexOf(u8, idle_probe, "\\\"command_sent\\\":false") == null or
+            std.mem.indexOf(u8, idle_probe, "outside command mode") == null)
+            fail("term_run idle mode waited for command completion");
+        const idle = m.callTool("term_wait_idle", "{\"quiet_ms\":100,\"timeout_ms\":500}");
+        if (std.mem.indexOf(u8, idle, "idle") == null) fail("term_wait_idle no longer reports output quiescence");
+        _ = c.usleep(1_600_000);
+
+        const silent_ok = m.callTool("term_run", "{\"command\":\"sleep 0.1 >/dev/null 2>&1\",\"wait_for\":\"command\",\"output_only\":true}");
+        if (std.mem.indexOf(u8, silent_ok, "\\\"state\\\":\\\"completed") == null or
+            std.mem.indexOf(u8, silent_ok, "\\\"exit_status\\\":0") == null or
+            std.mem.indexOf(u8, silent_ok, "shell_integration") == null)
+            fail("silent successful command did not complete via OSC 133");
+
+        const status_124 = m.callTool("term_run", "{\"command\":\"timeout 0.1 sh -c 'sleep 1' >/dev/null 2>&1\",\"wait_for\":\"command\",\"output_only\":true}");
+        if (std.mem.indexOf(u8, status_124, "\\\"exit_status\\\":124") == null)
+            fail("silent timeout command did not return status 124");
+
+        const delayed = m.callTool("term_run", "{\"command\":\"sleep 0.2; printf 'MCP-DELAYED-OUTPUT\\\\n'\",\"wait_for\":\"command\",\"output_only\":true}");
+        if (std.mem.indexOf(u8, delayed, "MCP-DELAYED-OUTPUT") == null or
+            std.mem.indexOf(u8, delayed, "\\\"state\\\":\\\"completed") == null)
+            fail("command completion missed delayed output");
+
+        const command_timeout = m.callTool("term_run", "{\"command\":\"sleep 0.6 >/dev/null 2>&1\",\"wait_for\":\"command\",\"timeout_ms\":100}");
+        if (std.mem.indexOf(u8, command_timeout, "\\\"state\\\":\\\"running") == null or
+            std.mem.indexOf(u8, command_timeout, "\\\"timed_out\\\":true") == null or
+            std.mem.indexOf(u8, command_timeout, "\\\"completion_source\\\":\\\"none") == null)
+            fail("command timeout did not report a still-running command");
+        const duplicate = m.callTool("term_run", "{\"command\":\"echo MUST-NOT-BE-SENT\",\"wait_for\":\"command\"}");
+        if (std.mem.indexOf(u8, duplicate, "term_wait_command") == null or
+            std.mem.indexOf(u8, duplicate, "\\\"command_sent\\\":false") == null)
+            fail("second command was not rejected while completion remained pending");
+        _ = c.usleep(650_000);
+        const waited = m.callTool("term_wait_command", "{\"timeout_ms\":1000,\"output_only\":true}");
+        if (std.mem.indexOf(u8, waited, "\\\"state\\\":\\\"completed") == null or
+            std.mem.indexOf(u8, waited, "\\\"exit_status\\\":0") == null)
+            fail("term_wait_command did not finish a timed-out command");
+
+        const no_integration = m.callTool("term_open", "{\"command\":[\"/bin/sh\"]}");
+        if (std.mem.indexOf(u8, no_integration, "opened headless terminal 2") == null) fail("plain sh terminal failed");
+        const unsupported = m.callTool("term_run", "{\"term\":2,\"command\":\"echo MUST-NOT-RUN\",\"wait_for\":\"command\"}");
+        if (std.mem.indexOf(u8, unsupported, "\\\"state\\\":\\\"unsupported") == null or
+            std.mem.indexOf(u8, unsupported, "\\\"command_sent\\\":false") == null or
+            std.mem.indexOf(u8, unsupported, "\\\"exit_status\\\":null") == null)
+            fail("shell-integration absence was not reported safely");
+
+        const signaled = m.callTool("term_run", "{\"term\":1,\"command\":\"exec sh -c 'kill -TERM $$'\",\"wait_for\":\"command\",\"timeout_ms\":3000}");
+        if (std.mem.indexOf(u8, signaled, "\\\"exit_status\\\":-15") == null or
+            std.mem.indexOf(u8, signaled, "process_tracking") == null)
+            fail("signal-killed command did not use tracked process status");
+
+        // Command mode straight after term_open: the first prompt mark
+        // may not have rendered yet — the bounded wait must cover the
+        // race instead of misreporting "unsupported".
+        const fresh = m.callTool("term_open", "{\"command\":[\"/bin/bash\"],\"cols\":80,\"rows\":24}");
+        if (std.mem.indexOf(u8, fresh, "opened headless terminal 3") == null) fail("fresh bash terminal failed");
+        const fresh_run = m.callTool("term_run", "{\"term\":3,\"command\":\"true\",\"wait_for\":\"command\"}");
+        if (std.mem.indexOf(u8, fresh_run, "\\\"state\\\":\\\"completed") == null or
+            std.mem.indexOf(u8, fresh_run, "\\\"exit_status\\\":0") == null)
+            fail("command mode raced the first prompt mark on a fresh terminal");
+
+        // A foreground command started in idle mode must block a
+        // command-mode send (its D would be misattributed), and the
+        // rejection must not send the command.
+        _ = m.callTool("term_run", "{\"term\":3,\"command\":\"sleep 0.5 >/dev/null 2>&1\",\"quiet_ms\":100,\"timeout_ms\":2000}");
+        const busy = m.callTool("term_run", "{\"term\":3,\"command\":\"echo MUST-NOT-BE-SENT-BUSY\",\"wait_for\":\"command\"}");
+        if (std.mem.indexOf(u8, busy, "\\\"command_sent\\\":false") == null or
+            std.mem.indexOf(u8, busy, "outside command mode") == null)
+            fail("busy shell did not reject a command-mode send");
+        _ = c.usleep(600_000);
+        const after_busy = m.callTool("term_run", "{\"term\":3,\"command\":\"echo BUSY-CLEARED\",\"wait_for\":\"command\",\"output_only\":true}");
+        if (std.mem.indexOf(u8, after_busy, "BUSY-CLEARED") == null or
+            std.mem.indexOf(u8, after_busy, "\\\"state\\\":\\\"completed") == null)
+            fail("command mode did not recover once the busy command finished");
 
         // Ephemeral teardown on stdin close removes the private dir.
         var dir_buf: [512]u8 = undefined;
