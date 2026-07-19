@@ -55,6 +55,14 @@ const CMD_UPDATE_PLAYBACK_STREAM_SAMPLE_RATE = 74;
 const CMD_UPDATE_PLAYBACK_STREAM_PROPLIST = 81;
 const CMD_REMOVE_PLAYBACK_STREAM_PROPLIST = 84;
 const CMD_REQUEST = 61;
+
+/// The application-facing playback window must cover a real remote round
+/// trip plus ordinary SSH/graphics jitter.  Low-latency clients commonly ask
+/// PulseAudio for only 20-50 ms; honoring that literally turns every REQUEST
+/// into a just-in-time network round trip and underruns continuously.  This
+/// does not force 500 ms of speaker latency: PCM is forwarded immediately and
+/// the GUI's local Pulse stream consumes from the resulting jitter reservoir.
+const REMOTE_TLENGTH_US: u64 = 500_000;
 const CMD_UNDERFLOW = 63;
 
 const ERR_INVALID = 3;
@@ -905,14 +913,18 @@ pub const Server = struct {
 
         const frame_bytes: u32 = @max(@as(u32, ss.channels) * sampleSize(ss.format), 1);
         const bytes_per_sec: u64 = @as(u64, frame_bytes) * ss.rate;
-        // Fill in "whatever" (0xffffffff) requests with ~200 ms.
+        // A remote sink needs a real jitter window even when the client asks
+        // for a tiny low-latency buffer.  Without this floor, replenishing a
+        // 20-50 ms tlength takes a complete viewer<->daemon round trip and
+        // inevitably underruns on SSH or behind a graphical frame.
         // Frame-aligned: unaligned server sizes lead clients into
         // unaligned writes that fail (see advanceSelfClock).
-        if (tlength < frame_bytes or tlength == 0xffff_ffff)
-            tlength = @intCast(@max(bytes_per_sec / 5, 4096));
+        const remote_tlength: u32 = @intCast(@max(bytes_per_sec * REMOTE_TLENGTH_US / 1_000_000, 4096));
+        if (tlength < remote_tlength or tlength == 0xffff_ffff)
+            tlength = remote_tlength;
         tlength -= tlength % frame_bytes;
-        if (maxlength == 0 or maxlength == 0xffff_ffff)
-            maxlength = 4 * 1024 * 1024;
+        if (maxlength == 0 or maxlength == 0xffff_ffff or maxlength < tlength)
+            maxlength = @max(4 * 1024 * 1024, tlength);
         if (minreq < frame_bytes or minreq == 0xffff_ffff)
             minreq = @intCast(@max(bytes_per_sec / 50, 1024));
         minreq -= minreq % frame_bytes;
@@ -1179,7 +1191,7 @@ test "auth + client name + create stream + pcm flows to units" {
         try w.str(null); // sink name
         try w.u32be(0xffff_ffff); // maxlength
         try w.boolean(false); // corked
-        try w.u32be(0xffff_ffff); // tlength
+        try w.u32be(960); // tiny 5 ms tlength: remote floor must enlarge it
         try w.u32be(0xffff_ffff); // prebuf
         try w.u32be(0xffff_ffff); // minreq
         try w.u32be(0); // syncid
@@ -1201,14 +1213,15 @@ test "auth + client name + create stream + pcm flows to units" {
         fields.clearRetainingCapacity();
     }
     try t_.expectEqual(@as(u32, 1), srv.streams.count());
-    { // reply: channel 0, sink input 0, missing > 0
+    { // reply: channel 0, sink input 0, missing = 500 ms jitter window
         var r = Tr{ .buf = srv.takeOut()[DESC_SIZE..] };
         try t_.expectEqual(@as(u32, CMD_REPLY), try r.u32be());
         try t_.expectEqual(@as(u32, 3), try r.u32be());
         try t_.expectEqual(@as(u32, 0), try r.u32be()); // channel
         try t_.expectEqual(@as(u32, 0), try r.u32be()); // sink input
         const missing = try r.u32be();
-        try t_.expect(missing > 0);
+        try t_.expectEqual(@as(u32, 96_000), missing);
+        try t_.expectEqual(@as(u32, 96_000), srv.streams.get(0).?.tlength);
         srv.clearOut();
     }
     { // open unit went out

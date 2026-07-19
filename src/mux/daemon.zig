@@ -372,10 +372,19 @@ const WorkerPush = struct {
 };
 
 const Client = struct {
+    const WriteLane = enum { none, normal, audio };
+
     allocator: std.mem.Allocator,
     fd: c_int,
     rbuf: std.ArrayList(u8) = .empty,
+    /// Ordinary mux traffic. Audio has its own priority lane so a large
+    /// graphical commit cannot strand PCM behind the whole queued backlog.
     wbuf: std.ArrayList(u8) = .empty,
+    audio_wbuf: std.ArrayList(u8) = .empty,
+    /// Once a frame has been partially written its bytes cannot be
+    /// interleaved with another lane. At the next frame boundary audio wins.
+    write_lane: WriteLane = .none,
+    write_frame_left: usize = 0,
     attached: ?*Session = null,
     dead: bool = false,
     /// Protocol version the client announced in hello. Channels are
@@ -405,6 +414,7 @@ const Client = struct {
         _ = c.close(self.fd);
         self.rbuf.deinit(self.allocator);
         self.wbuf.deinit(self.allocator);
+        self.audio_wbuf.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -423,12 +433,44 @@ const Client = struct {
     const EVENTS_BACKLOG: usize = 8 << 20;
 
     fn queueFrame(self: *Client, ftype: wire.FrameType, payload: []const u8) void {
+        self.queueFrameIn(&self.wbuf, ftype, payload);
+    }
+
+    fn queueAudioFrame(self: *Client, ftype: wire.FrameType, payload: []const u8) void {
+        self.queueFrameIn(&self.audio_wbuf, ftype, payload);
+    }
+
+    fn queueFrameIn(self: *Client, out: *std.ArrayList(u8), ftype: wire.FrameType, payload: []const u8) void {
         if (self.dead) return;
-        wire.appendFrame(&self.wbuf, self.allocator, ftype, payload) catch {
+        wire.appendFrame(out, self.allocator, ftype, payload) catch {
             self.dead = true;
             return;
         };
-        if (self.wbuf.items.len > MAX_WBUF) self.dead = true;
+        if (self.queuedBytes() > MAX_WBUF) self.dead = true;
+    }
+
+    fn queuedBytes(self: *const Client) usize {
+        return self.wbuf.items.len +| self.audio_wbuf.items.len;
+    }
+
+    /// Choose the next complete wire frame. A partially-written frame keeps
+    /// its lane; otherwise latency-sensitive audio preempts normal traffic.
+    fn startNextWriteFrame(self: *Client) bool {
+        if (self.write_lane != .none) return true;
+        self.write_lane = if (self.audio_wbuf.items.len > 0) .audio else if (self.wbuf.items.len > 0) .normal else return false;
+        const selected = if (self.write_lane == .audio) self.audio_wbuf.items else self.wbuf.items;
+        if (selected.len < 5) {
+            self.dead = true;
+            return false;
+        }
+        const payload_len = std.mem.readInt(u32, selected[0..4], .little);
+        const frame_len = @as(usize, payload_len) + 4;
+        if (payload_len == 0 or frame_len > selected.len) {
+            self.dead = true;
+            return false;
+        }
+        self.write_frame_left = frame_len;
+        return true;
     }
 
     fn queueJson(self: *Client, ftype: wire.FrameType, value: anytype) void {
@@ -445,6 +487,28 @@ const Client = struct {
         self.queueJson(.err, .{ .@"error" = msg });
     }
 };
+
+test "client audio lane preempts normal traffic only at frame boundaries" {
+    const a = std.testing.allocator;
+    var cl = Client{ .allocator = a, .fd = -1 };
+    defer cl.rbuf.deinit(a);
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+
+    cl.queueFrame(.events, "pixels");
+    cl.queueAudioFrame(.chan_data, "pcm");
+    try std.testing.expect(cl.startNextWriteFrame());
+    try std.testing.expectEqual(Client.WriteLane.audio, cl.write_lane);
+    try std.testing.expectEqual(@as(usize, 8), cl.write_frame_left);
+
+    // Once bytes of a normal frame are on the stream, newly queued audio
+    // cannot split that frame; it wins immediately after the boundary.
+    cl.write_lane = .normal;
+    cl.write_frame_left = 3;
+    try std.testing.expect(cl.startNextWriteFrame());
+    try std.testing.expectEqual(Client.WriteLane.normal, cl.write_lane);
+    try std.testing.expectEqual(@as(usize, 3), cl.write_frame_left);
+}
 
 const pathZ = @import("../util/pathz.zig").pathZ;
 
@@ -969,7 +1033,7 @@ pub const Daemon = struct {
         self.flushClientsFinal();
     }
 
-    /// Best-effort final drain of every client's wbuf before teardown. The
+    /// Best-effort final drain of every client's outbound queues before teardown. The
     /// only frames queued at this point are tiny shutdown notices, so a short
     /// bounded POLLOUT wait per round is plenty.
     fn flushClientsFinal(self: *Daemon) void {
@@ -977,11 +1041,11 @@ pub const Daemon = struct {
         while (rounds < 8) : (rounds += 1) {
             var pending = false;
             for (self.clients.items) |cl| {
-                if (cl.dead or cl.wbuf.items.len == 0) continue;
+                if (cl.dead or cl.queuedBytes() == 0) continue;
                 var pfd = c.struct_pollfd{ .fd = cl.fd, .events = c.POLLOUT, .revents = 0 };
                 _ = c.poll(&pfd, 1, 50);
                 if (pfd.revents & c.POLLOUT != 0) self.clientWritable(cl);
-                if (!cl.dead and cl.wbuf.items.len > 0) pending = true;
+                if (!cl.dead and cl.queuedBytes() > 0) pending = true;
             }
             if (!pending) break;
         }
@@ -1034,7 +1098,7 @@ pub const Daemon = struct {
         const n_clients_built = self.clients.items.len;
         for (self.clients.items) |cl| {
             var ev: c_short = c.POLLIN;
-            if (cl.wbuf.items.len > 0) ev |= c.POLLOUT;
+            if (cl.queuedBytes() > 0) ev |= c.POLLOUT;
             try fds.append(self.allocator, .{ .fd = cl.fd, .events = ev, .revents = 0 });
         }
         const session_base = fds.items.len;
@@ -1574,27 +1638,36 @@ pub const Daemon = struct {
     }
 
     fn clientWritable(self: *Daemon, cl: *Client) void {
-        const n_raw = c.write(cl.fd, cl.wbuf.items.ptr, cl.wbuf.items.len);
+        // Ordinary frames keep FIFO order, but at every wire-frame boundary
+        // pending PCM gets the next slot instead of waiting behind megabytes
+        // of surface updates.
+        if (!cl.startNextWriteFrame()) return;
+
+        const out = if (cl.write_lane == .audio) &cl.audio_wbuf else &cl.wbuf;
+        const amount = @min(out.items.len, cl.write_frame_left);
+        const n_raw = c.write(cl.fd, out.items.ptr, amount);
         if (n_raw < 0) {
             // fd is O_NONBLOCK: EAGAIN means the send buffer is full;
-            // keep wbuf and retry on the next POLLOUT.
+            // keep the active frame and retry on the next POLLOUT.
             if (std.posix.errno(n_raw) != .AGAIN) cl.dead = true;
             return;
         }
         const n: usize = @intCast(n_raw);
-        const remaining = cl.wbuf.items.len - n;
-        std.mem.copyForwards(u8, cl.wbuf.items[0..remaining], cl.wbuf.items[n..]);
-        cl.wbuf.shrinkRetainingCapacity(remaining);
+        const remaining = out.items.len - n;
+        std.mem.copyForwards(u8, out.items[0..remaining], out.items[n..]);
+        out.shrinkRetainingCapacity(remaining);
+        cl.write_frame_left -= n;
+        if (cl.write_frame_left == 0) cl.write_lane = .none;
         // A snapshot/replay burst can leave a many-MB high-water
         // capacity pinned forever; release it once fully drained.
-        if (remaining == 0 and cl.wbuf.capacity > (4 << 20))
-            cl.wbuf.clearAndFree(cl.allocator);
+        if (remaining == 0 and out.capacity > (4 << 20))
+            out.clearAndFree(cl.allocator);
         // Events were withheld while this client was backlogged; it has
         // caught up, so hand it a fresh snapshot (stamped with the
         // current seq) and resume streaming. Sent even for an exited
         // session — the final screen is exactly what a crash-flood
         // post-mortem needs.
-        if (remaining == 0 and cl.needs_resync) {
+        if (cl.queuedBytes() == 0 and cl.write_lane == .none and cl.needs_resync) {
             cl.needs_resync = false;
             if (cl.attached) |s| {
                 log.debug("resync snapshot toward drained client (session '{s}')", .{s.name});
@@ -2298,7 +2371,7 @@ pub const Daemon = struct {
                 continue;
             }
             var done_or_dropped = false;
-            while (dl.client.wbuf.items.len < watermark) {
+            while (dl.client.queuedBytes() < watermark) {
                 const n = c.read(dl.fd, buf[4..], chunk);
                 if (n < 0) {
                     if (std.posix.errno(n) == .INTR) continue;
@@ -2399,17 +2472,16 @@ pub const Daemon = struct {
         return false;
     }
 
-    /// An attached audio-capable viewer that is also draining its wbuf.
-    /// A backlogged viewer must not count: it can't ack PCM, so counting
-    /// it would deadlock the REQUEST credit loop instead of letting the
-    /// stream revert to self-clocking.
-    fn readyAudioViewer(cl: *const Client, s: *const Session) bool {
-        return nativeViewer(cl, s) and cl.audio_ok and cl.wbuf.items.len < NATIVE_BACKLOG;
+    /// An attached viewer that explicitly subscribed to playback. Its
+    /// consumed reports already bound production to the local sink, so PCM
+    /// remains bounded without tying liveness to the graphical backlog.
+    fn subscribedAudioViewer(cl: *const Client, s: *const Session) bool {
+        return nativeViewer(cl, s) and cl.audio_ok;
     }
 
     fn sessionHasReadyAudioViewer(self: *Daemon, s: *Session) bool {
         for (self.clients.items) |cl| {
-            if (readyAudioViewer(cl, s)) return true;
+            if (subscribedAudioViewer(cl, s)) return true;
         }
         return false;
     }
@@ -2421,7 +2493,7 @@ pub const Daemon = struct {
         srv.has_viewer = false;
         srv.opus_wanted = false;
         for (self.clients.items) |cl| {
-            if (!readyAudioViewer(cl, ch.session.?)) continue;
+            if (!subscribedAudioViewer(cl, ch.session.?)) continue;
             srv.has_viewer = true;
             // Opus units can't be captured (no decoder in the mux
             // graph) — capture forces raw pcm units for everyone.
@@ -3216,18 +3288,14 @@ pub const Daemon = struct {
                 if (nativeViewer(cl, ch.session.?)) self.queueUnitsTo(cl, ch, bytes);
             }
         } else if (ch.pa != null) {
-            // PCM only flows to viewers that SUBSCRIBED — flooding a
-            // terminal-only client would blow its output cap and take
-            // the whole connection down. And only to a subscriber with
-            // room: an attached-but-idle viewer (e.g. an MCP client
-            // between tool calls) sends no `consumed` reports, so the
-            // stream self-clocks and would otherwise pour PCM into its
-            // wbuf at the app's full production rate. Dropping audio
-            // for a viewer that isn't draining is correct — it isn't
-            // playing it anyway, and fresh PCM resumes when it does.
+            // PCM only flows to viewers that SUBSCRIBED — terminal-only
+            // clients and appdrive deliberately do not. Never drop PCM just
+            // because graphical traffic filled the normal queue: consumed
+            // reports bound production, and the priority lane drains audio
+            // at the next frame boundary.
             for (self.clients.items) |cl| {
-                if (readyAudioViewer(cl, ch.session.?))
-                    self.queueUnitsTo(cl, ch, bytes);
+                if (subscribedAudioViewer(cl, ch.session.?))
+                    self.queueAudioUnitsTo(cl, ch, bytes);
             }
         } else if (ch.client) |cl| {
             if (!cl.dead) self.queueUnitsTo(cl, ch, bytes);
@@ -3235,10 +3303,21 @@ pub const Daemon = struct {
     }
 
     fn queueUnitsTo(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const u8) void {
-        const MAX_CHUNK: usize = 4 << 20;
+        self.queueUnitsToLane(cl, ch, bytes, false);
+    }
+
+    fn queueAudioUnitsTo(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const u8) void {
+        self.queueUnitsToLane(cl, ch, bytes, true);
+    }
+
+    fn queueUnitsToLane(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const u8, audio: bool) void {
+        // Native units may split across frames. Keeping graphical frames
+        // small gives the priority audio lane a frequent preemption point;
+        // a 4 MiB frame can itself take seconds on a modest SSH link.
+        const max_chunk: usize = if (audio or ch.native != null) 64 << 10 else 4 << 20;
         var off: usize = 0;
         while (off < bytes.len) {
-            const end = @min(off + MAX_CHUNK, bytes.len);
+            const end = @min(off + max_chunk, bytes.len);
             const payload = self.allocator.alloc(u8, 4 + (end - off)) catch {
                 // Starving one viewer must not kill the app: drop the
                 // client, keep the channel.
@@ -3248,7 +3327,10 @@ pub const Daemon = struct {
             defer self.allocator.free(payload);
             std.mem.writeInt(u32, payload[0..4], ch.id, .little);
             @memcpy(payload[4..], bytes[off..end]);
-            cl.queueFrame(.chan_data, payload);
+            if (audio)
+                cl.queueAudioFrame(.chan_data, payload)
+            else
+                cl.queueFrame(.chan_data, payload);
             off = end;
         }
     }
@@ -4450,7 +4532,7 @@ pub const Daemon = struct {
             // Backpressure: a slow link must not balloon the client
             // write buffer — skip frame production until it drains
             // (the source keeps streaming; only emission pauses).
-            if (cl.wbuf.items.len > 8 << 20) continue;
+            if (cl.queuedBytes() > 8 << 20) continue;
             var units: std.ArrayList(u8) = .empty;
             defer units.deinit(self.allocator);
             ws.poll(&units, self.allocator, now_ms) catch continue;
@@ -4871,9 +4953,9 @@ pub const Daemon = struct {
                 // fresh snapshot once its wbuf drains. Without this a
                 // sustained flood grows wbuf to the MAX_WBUF reap.
                 if (cl.needs_resync) continue;
-                if (cl.wbuf.items.len > Client.EVENTS_BACKLOG) {
+                if (cl.queuedBytes() > Client.EVENTS_BACKLOG) {
                     cl.needs_resync = true;
-                    log.debug("client wbuf {d}B over events backlog; snapshot resync scheduled (session '{s}')", .{ cl.wbuf.items.len, s.name });
+                    log.debug("client queues {d}B over events backlog; snapshot resync scheduled (session '{s}')", .{ cl.queuedBytes(), s.name });
                     continue;
                 }
                 cl.queueFrame(.events, payload.items);
