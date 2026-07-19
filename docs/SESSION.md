@@ -7928,3 +7928,44 @@ compress, but no longer needs a special build flag. Doctor compares
 runtime codec availability on the binary and daemon hosts. The Opus
 round-trip runs in the default test suite when libopus is installed;
 the explicit-off suite skips it and verifies the raw fallback build.
+
+## Visual toolkit for driving framebuffer apps over MCP
+
+Custom-drawn apps (games, immediate-mode UIs) expose no AT-SPI tree,
+which reduced MCP driving to guess-a-pixel, click, screenshot,
+eyeball. Three new capability families turn pixels back into
+queryable, assertable state.
+
+OCR: `app_read_text` extracts the text rendered in a window (or a
+region) plus per-word boxes in surface coordinates with click
+centers; `app_wait_text` polls until a string is visible and can
+click the matched words ("wait for the label, then click it").
+Tesseract is dlopen'd at runtime (the Opus pattern, `src/util/ocr.zig`)
+so no target gains an ELF dependency; a missing library degrades to
+one described error naming the package to install. Small pixel fonts
+are auto-upscaled before recognition.
+
+Template matching: `app_template_save` crops a distinctive element
+out of a live window (or accepts inline PNG) into a named persistent
+template; `app_find_image`/`app_wait_image` locate it by pure-Zig
+coarse-to-fine SAD matching (`src/util/template.zig`, alpha-masked
+needles supported so transparent-background sprites match), with
+wait-then-click as the coordinate-free substitute for an a11y tree.
+
+Input macros: every successful injected input (app_click/app_key/
+app_type/app_scroll/app_drag/app_mouse_move and each app_actions
+step) is journaled per app; `app_macro_save last_steps:N` snapshots
+the tail — think-time gaps preserved as waits — into a named macro,
+`app_macro_run` replays it through the same step engine (the
+app_actions body now lives in `runActionSteps`, shared by both), and
+`app_macros` lists/shows/deletes and exposes the journal. New action
+steps `wait_image`/`click_image`/`wait_text` make batches and macros
+state-driven rather than timing-driven. Assets persist under
+`$XDG_STATE_HOME/sketerm/{templates,macros}` (`src/ipc/mcpassets.zig`).
+
+Verified by unit tests (matcher exact/masked/coarse paths, TSV word
+parsing, asset round-trip) and a live end-to-end run driving
+weston-terminal through a real `sketerm mcp` instance: OCR reads
+typed text back, a cropped template matches at its exact origin, the
+journal round-trips through save/show/run, and the no-tesseract path
+returns the documented error.
