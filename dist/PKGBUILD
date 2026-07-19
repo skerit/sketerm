@@ -25,7 +25,7 @@ depends=(
     'fontconfig'
     'libvpx'  # VP9/WebM app-window recording (GUI only)
     'libpulse' # remote-audio playback (GUI links libpulse + glib mainloop)
-    'opus'     # remote-audio Opus compression (-Daudio-opus builds)
+    'opus'     # runtime-loaded remote-audio compression
 )
 makedepends=(
     'zig'
@@ -55,16 +55,15 @@ pkgver() {
 
 build() {
     cd "$(_srcroot)"
-    # -Daudio-opus: Opus-compressed remote audio for the GUI + native
-    # daemon. The portable daemon stays codec-free by design (raw PCM;
-    # both ends negotiate, so mixed deployments just fall back).
-    zig build -Doptimize=ReleaseFast -Daudio-opus
+    # Normal builds runtime-load Opus automatically. The portable daemon
+    # compiles the probe out and stays static/codec-free by design.
+    zig build -Doptimize=ReleaseFast
     zig build mux-portable -Doptimize=ReleaseFast
 }
 
 check() {
     cd "$(_srcroot)"
-    zig build test -Daudio-opus
+    zig build test
 }
 
 package() {

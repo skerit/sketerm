@@ -1,8 +1,8 @@
-//! Opus codec layer for the remote-audio path (-Daudio-opus).
-//! Mirrors vcodec.zig's shape: with the flag off every impl
-//! collapses to `void` and nothing links — the daemon stays
-//! dependency-free and PCM ships raw. libopus is declared via
-//! extern fn (like zstd), no headers needed.
+//! Opus codec layer for the remote-audio path. Normal builds probe
+//! libopus at runtime, so compression works automatically wherever
+//! the library is installed without adding it to sketerm-mux's ELF
+//! dependency graph. `-Daudio-opus=false` compiles the probe out for
+//! static portable builds; missing libopus degrades to raw PCM.
 //!
 //! Scope: s16 interleaved, 20 ms frames, the 48 kHz family only
 //! (Opus can't eat 44.1 k — those streams stay raw).
@@ -31,35 +31,126 @@ pub fn rateSupported(rate: u32) bool {
     };
 }
 
-const c_opus = if (enabled) struct {
-    extern fn opus_encoder_create(fs: i32, channels: c_int, application: c_int, err: ?*c_int) ?*anyopaque;
-    extern fn opus_encoder_destroy(st: ?*anyopaque) void;
-    extern fn opus_encoder_ctl(st: ?*anyopaque, request: c_int, ...) c_int;
-    extern fn opus_encode(st: ?*anyopaque, pcm: [*]const i16, frame_size: c_int, data: [*]u8, max_bytes: i32) i32;
-    extern fn opus_decoder_create(fs: i32, channels: c_int, err: ?*c_int) ?*anyopaque;
-    extern fn opus_decoder_destroy(st: ?*anyopaque) void;
-    extern fn opus_decode(st: ?*anyopaque, data: ?[*]const u8, len: i32, pcm: [*]i16, frame_size: c_int, decode_fec: c_int) c_int;
-} else struct {};
+const EncoderCreate = *const fn (i32, c_int, c_int, ?*c_int) callconv(.c) ?*anyopaque;
+const EncoderDestroy = *const fn (?*anyopaque) callconv(.c) void;
+const EncoderCtl = *const fn (?*anyopaque, c_int, ...) callconv(.c) c_int;
+const Encode = *const fn (?*anyopaque, [*]const i16, c_int, [*]u8, i32) callconv(.c) i32;
+const DecoderCreate = *const fn (i32, c_int, ?*c_int) callconv(.c) ?*anyopaque;
+const DecoderDestroy = *const fn (?*anyopaque) callconv(.c) void;
+const Decode = *const fn (?*anyopaque, ?[*]const u8, i32, [*]i16, c_int, c_int) callconv(.c) i32;
+
+const Api = struct {
+    handle: *anyopaque,
+    encoder_create: EncoderCreate,
+    encoder_destroy: EncoderDestroy,
+    encoder_ctl: EncoderCtl,
+    encode: Encode,
+    decoder_create: DecoderCreate,
+    decoder_destroy: DecoderDestroy,
+    decode: Decode,
+};
+
+extern fn dlopen(filename: [*:0]const u8, flags: c_int) ?*anyopaque;
+extern fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
+extern fn dlclose(handle: ?*anyopaque) c_int;
+
+const RTLD_LAZY: c_int = 0x1;
+var load_attempted = false;
+var loaded_api: ?Api = null;
+
+fn sym(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
+    return @ptrCast(dlsym(handle, name) orelse return null);
+}
+
+fn loadApi() ?Api {
+    const names = [_][*:0]const u8{
+        "libopus.so.0",
+        "libopus.so",
+        "libopus.0.dylib",
+        "libopus.dylib",
+    };
+    var handle: ?*anyopaque = null;
+    for (names) |name| {
+        handle = dlopen(name, RTLD_LAZY);
+        if (handle != null) break;
+    }
+    const h = handle orelse return null;
+    const encoder_create = sym(EncoderCreate, h, "opus_encoder_create") orelse {
+        _ = dlclose(h);
+        return null;
+    };
+    const encoder_destroy = sym(EncoderDestroy, h, "opus_encoder_destroy") orelse {
+        _ = dlclose(h);
+        return null;
+    };
+    const encoder_ctl = sym(EncoderCtl, h, "opus_encoder_ctl") orelse {
+        _ = dlclose(h);
+        return null;
+    };
+    const encode = sym(Encode, h, "opus_encode") orelse {
+        _ = dlclose(h);
+        return null;
+    };
+    const decoder_create = sym(DecoderCreate, h, "opus_decoder_create") orelse {
+        _ = dlclose(h);
+        return null;
+    };
+    const decoder_destroy = sym(DecoderDestroy, h, "opus_decoder_destroy") orelse {
+        _ = dlclose(h);
+        return null;
+    };
+    const decode = sym(Decode, h, "opus_decode") orelse {
+        _ = dlclose(h);
+        return null;
+    };
+    return .{
+        .handle = h,
+        .encoder_create = encoder_create,
+        .encoder_destroy = encoder_destroy,
+        .encoder_ctl = encoder_ctl,
+        .encode = encode,
+        .decoder_create = decoder_create,
+        .decoder_destroy = decoder_destroy,
+        .decode = decode,
+    };
+}
+
+fn getApi() ?*const Api {
+    if (comptime !enabled) return null;
+    if (!load_attempted) {
+        load_attempted = true;
+        loaded_api = loadApi();
+    }
+    return if (loaded_api) |*api| api else null;
+}
+
+/// Runtime capability advertised over the mux handshake. A build may support
+/// probing while the current machine has no libopus installed.
+pub fn available() bool {
+    return getApi() != null;
+}
 
 pub const Encoder = if (enabled) struct {
+    api: *const Api,
     st: *anyopaque,
     channels: u8,
     rate: u32,
 
     pub fn init(rate: u32, channels: u8) ?Encoder {
         if (!rateSupported(rate) or channels == 0 or channels > 2) return null;
+        const api = getApi() orelse return null;
         var err: c_int = 0;
-        const st = c_opus.opus_encoder_create(@intCast(rate), channels, APPLICATION_AUDIO, &err) orelse return null;
+        const st = api.encoder_create(@intCast(rate), channels, APPLICATION_AUDIO, &err) orelse return null;
         if (err != 0) {
-            c_opus.opus_encoder_destroy(st);
+            api.encoder_destroy(st);
             return null;
         }
-        _ = c_opus.opus_encoder_ctl(st, SET_BITRATE_REQUEST, BITRATE);
-        return .{ .st = st, .channels = channels, .rate = rate };
+        _ = api.encoder_ctl(st, SET_BITRATE_REQUEST, BITRATE);
+        return .{ .api = api, .st = st, .channels = channels, .rate = rate };
     }
 
     pub fn deinit(self: *Encoder) void {
-        c_opus.opus_encoder_destroy(self.st);
+        self.api.encoder_destroy(self.st);
     }
 
     /// Samples per channel in one 20 ms frame.
@@ -76,7 +167,7 @@ pub const Encoder = if (enabled) struct {
     /// packet slice into `out` (null on encoder error).
     pub fn encode(self: *Encoder, pcm: []const u8, out: *[MAX_PACKET]u8) ?[]const u8 {
         std.debug.assert(pcm.len == self.frameBytes());
-        const n = c_opus.opus_encode(
+        const n = self.api.encode(
             self.st,
             @ptrCast(@alignCast(pcm.ptr)),
             @intCast(self.frameSamples()),
@@ -112,29 +203,31 @@ pub const Encoder = if (enabled) struct {
 };
 
 pub const Decoder = if (enabled) struct {
+    api: *const Api,
     st: *anyopaque,
     channels: u8,
     rate: u32,
 
     pub fn init(rate: u32, channels: u8) ?Decoder {
         if (!rateSupported(rate) or channels == 0 or channels > 2) return null;
+        const api = getApi() orelse return null;
         var err: c_int = 0;
-        const st = c_opus.opus_decoder_create(@intCast(rate), channels, &err) orelse return null;
+        const st = api.decoder_create(@intCast(rate), channels, &err) orelse return null;
         if (err != 0) {
-            c_opus.opus_decoder_destroy(st);
+            api.decoder_destroy(st);
             return null;
         }
-        return .{ .st = st, .channels = channels, .rate = rate };
+        return .{ .api = api, .st = st, .channels = channels, .rate = rate };
     }
 
     pub fn deinit(self: *Decoder) void {
-        c_opus.opus_decoder_destroy(self.st);
+        self.api.decoder_destroy(self.st);
     }
 
     /// Decode one packet into interleaved s16; returns the byte
     /// slice into `out` (null on decode error).
     pub fn decode(self: *Decoder, packet: []const u8, out: *[MAX_DECODE_SAMPLES]i16) ?[]const u8 {
-        const n = c_opus.opus_decode(
+        const n = self.api.decode(
             self.st,
             packet.ptr,
             @intCast(packet.len),
@@ -166,7 +259,7 @@ pub const Decoder = if (enabled) struct {
 // ─── tests (skip without -Daudio-opus) ──────────────────────────
 
 test "opus round-trip: a 20 ms stereo sine survives" {
-    if (!enabled) return error.SkipZigTest;
+    if (!available()) return error.SkipZigTest;
     var enc = Encoder.init(48000, 2) orelse return error.TestUnexpectedResult;
     defer enc.deinit();
     var dec = Decoder.init(48000, 2) orelse return error.TestUnexpectedResult;
