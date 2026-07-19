@@ -60,6 +60,9 @@ comptime {
     _ = @import("ipc/mcp.zig");
     _ = @import("ipc/evkeys.zig");
     _ = @import("ipc/xkblayout.zig");
+    _ = @import("ipc/mcpassets.zig");
+    _ = @import("util/template.zig");
+    _ = @import("util/ocr.zig");
     _ = @import("render/bg_pass.zig");
     _ = @import("mux/wire.zig");
     _ = @import("mux/log.zig");

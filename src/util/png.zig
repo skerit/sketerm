@@ -170,6 +170,23 @@ pub fn upscaleRgba(
     return out;
 }
 
+pub const Decoded = struct { rgba: []u8, w: u32, h: u32 };
+
+/// Decode an in-memory PNG (or anything stb_image reads) to
+/// tightly-packed RGBA. Caller owns `.rgba`.
+pub fn decodeRgba(allocator: std.mem.Allocator, bytes: []const u8) Error!Decoded {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var comp: c_int = 0;
+    const px = c.stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &comp, 4) orelse
+        return Error.EncodeFailed;
+    defer c.stbi_image_free(px);
+    if (w <= 0 or h <= 0) return Error.EncodeFailed;
+    const n = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+    const out = allocator.dupe(u8, @as([*]const u8, @ptrCast(px))[0..n]) catch return Error.OutOfMemory;
+    return .{ .rgba = out, .w = @intCast(w), .h = @intCast(h) };
+}
+
 /// shmToRgba + encodeRgba in one step. Caller owns the result.
 pub fn encodeShm(
     allocator: std.mem.Allocator,
@@ -221,6 +238,18 @@ test "png round-trips through stb_image decode" {
     try std.testing.expectEqual(@as(c_int, w), dw);
     try std.testing.expectEqual(@as(c_int, h), dh);
     try std.testing.expectEqualSlices(u8, &rgba, decoded[0 .. w * h * 4]);
+}
+
+test "decodeRgba round-trips encodeRgba output" {
+    const allocator = std.testing.allocator;
+    const src = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 9, 9, 9, 255 };
+    const bytes = try encodeRgba(allocator, &src, 2, 2);
+    defer allocator.free(bytes);
+    const dec = try decodeRgba(allocator, bytes);
+    defer allocator.free(dec.rgba);
+    try std.testing.expectEqual(@as(u32, 2), dec.w);
+    try std.testing.expectEqual(@as(u32, 2), dec.h);
+    try std.testing.expectEqualSlices(u8, &src, dec.rgba);
 }
 
 test "downscaleRgba box-averages the full source footprint" {
