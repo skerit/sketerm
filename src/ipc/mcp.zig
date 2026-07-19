@@ -858,8 +858,8 @@ const TOOLS_JSON_RAW =
     \\{"name":"record_pane_stop","description":"Stop the asciicast recording of a terminal pane's session.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"}}}},
     \\{"name":"send_text","description":"Type literal text into a pane's terminal. Set enter=true to press Enter afterwards. Use send_keys for control keys.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean","description":"Press Enter after the text"}},"required":["text"]}},
     \\{"name":"send_keys","description":"Press named keys in a pane: space-separated chords like 'ctrl+c', 'enter', 'up', 'escape', 'f5', 'alt+x', 'shift+tab', 'pagedown'. Single characters are typed literally.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
-    \\{"name":"run_command","description":"Type a shell command, press Enter, wait until output settles, and return the resulting screen text. Pass output_only=true to get ONLY the command's output + exit code (no prompt/echo noise; needs shell integration, on by default). For interactive programs prefer send_text/send_keys + read_screen.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"Max wait (default 15000)"},"quiet_ms":{"type":"integer","description":"Idle window that counts as settled (default 400)"},"output_only":{"type":"boolean","description":"Return just the command's output and exit code instead of the whole screen"}},"required":["command"]}},
-    \\{"name":"wait_idle","description":"Wait until a pane produced no output for quiet_ms (or timeout_ms elapsed). Returns whether it settled.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"timeout_ms":{"type":"integer"},"quiet_ms":{"type":"integer"}}}},
+    \\{"name":"run_command","description":"Type a shell command, press Enter, wait until OUTPUT settles, and return the resulting screen text. Output idle does not imply that a silent foreground command exited. Pass output_only=true to get ONLY a completed OSC 133 command zone when one is already available. For reliable headless completion use term_run with wait_for=command; for interactive programs prefer send_text/send_keys + read_screen.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"Max output-idle wait (default 15000)"},"quiet_ms":{"type":"integer","description":"No-output window that counts as idle (default 400)"},"output_only":{"type":"boolean","description":"Return just a completed command zone and exit code instead of the whole screen"}},"required":["command"]}},
+    \\{"name":"wait_idle","description":"Wait until a pane produced no output for quiet_ms (or timeout_ms elapsed). Output idle does NOT imply that the foreground command exited.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"timeout_ms":{"type":"integer"},"quiet_ms":{"type":"integer"}}}},
     \\{"name":"new_tab","description":"Open a new shell tab. Returns the new tab and pane ids.","inputSchema":{"type":"object","properties":{"cwd":{"type":"string"},"title":{"type":"string"}}}},
     \\{"name":"split_pane","description":"Split a pane. direction 'h' = side by side, 'v' = stacked. Returns the new pane id.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"direction":{"type":"string","enum":["h","v"]}}}},
     \\{"name":"focus_pane","description":"Focus a pane (selects its tab and grabs keyboard focus).","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
@@ -893,11 +893,12 @@ const TOOLS_JSON_RAW =
     \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
     \\{"name":"term_open","description":"Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
     \\{"name":"term_list","description":"List open headless terminals and their exit state.","inputSchema":{"type":"object","properties":{}}},
-    \\{"name":"term_run","description":"Run a command line in a headless terminal and return the screen once output settles (like run_command but for headless shells). Pass output_only=true to get ONLY the command's output + exit code (no prompt/echo noise; needs shell integration, on by default).","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"quiet_ms":{"type":"integer","description":"Idle window that counts as settled (default 400)"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the command's output and exit code instead of the whole screen"}},"required":["command"]}},
+    \\{"name":"term_run","description":"Run a command line in a headless terminal. wait_for=idle (default, backward compatible) returns after OUTPUT quiescence and does not imply child exit. wait_for=command waits for an OSC 133 command boundary (or tracked shell exit), returns structured running/completed state, exact exit_status, timed_out, and completion_source, and refuses to send (command_sent=false) when shell integration is unavailable or a foreground command started outside command mode is still running. If it times out, use term_wait_command to continue waiting without resending. output_only selects the completed command zone instead of the rendered screen.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"wait_for":{"type":"string","enum":["idle","command"],"description":"idle (default) waits for output quiescence; command waits for actual shell-command completion"},"quiet_ms":{"type":"integer","description":"Idle mode only: no-output window (default 400)"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the command's output instead of the whole screen"}},"required":["command"]}},
     \\{"name":"term_send_text","description":"Write text to a headless terminal's PTY. 'enter' appends a carriage return.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean"}},"required":["text"]}},
     \\{"name":"term_send_keys","description":"Press named key chords in a headless terminal: 'ctrl+c', 'enter', 'up', 'tab', space-separated.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
     \\{"name":"term_read","description":"Read a headless terminal's rendered screen text. 'scrollback' true dumps the scrollback too.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
-    \\{"name":"term_wait_idle","description":"Wait until a headless terminal's output stops changing (or timeout).","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"term_wait_idle","description":"Wait until a headless terminal's output stops changing (or timeout). Output idle does NOT imply that the foreground command exited.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"term_wait_command","description":"Continue waiting for a term_run wait_for=command request that timed out. Returns structured running/completed state, exact exit_status, timed_out, and completion_source without resending the command.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the completed command's output instead of the whole screen"}}}},
     \\{"name":"term_resize","description":"Resize a headless terminal's grid.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
     \\{"name":"term_close","description":"Close a headless terminal (kills its shell). Destructive.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"}}}}
     \\]
@@ -1091,6 +1092,38 @@ fn termIdOf(t: *termdrive.Term) u32 {
         if (e.value_ptr.* == t) return e.key_ptr.*;
     }
     return 0;
+}
+
+fn commandCompletionResult(
+    arena: std.mem.Allocator,
+    result: termdrive.CommandCompletion,
+    command_sent: bool,
+    output: ?[]const u8,
+    output_kind: ?[]const u8,
+    reason: ?[]const u8,
+) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("{\"state\":");
+    try std.json.Stringify.value(@tagName(result.state), .{}, w);
+    try w.print(",\"command_sent\":{},\"exit_status\":", .{command_sent});
+    if (result.exit_status) |status| try w.print("{d}", .{status}) else try w.writeAll("null");
+    try w.print(",\"timed_out\":{},\"completion_source\":", .{result.timed_out});
+    try std.json.Stringify.value(@tagName(result.source), .{}, w);
+    if (output_kind) |kind| {
+        try w.writeAll(",\"output_kind\":");
+        try std.json.Stringify.value(kind, .{}, w);
+    }
+    if (output) |text| {
+        try w.writeAll(",\"output\":");
+        try std.json.Stringify.value(text, .{}, w);
+    }
+    if (reason) |text| {
+        try w.writeAll(",\"reason\":");
+        try std.json.Stringify.value(text, .{}, w);
+    }
+    try w.writeAll("}");
+    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
 }
 
 /// Reconnect a durable instance to app sessions still running on its
@@ -2611,6 +2644,56 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         const cmd = argStr(args, "command") orelse return appErr(arena, "term_run requires 'command'");
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
         const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        const wait_for = argStr(args, "wait_for") orelse "idle";
+        if (!eql(u8, wait_for, "idle") and !eql(u8, wait_for, "command"))
+            return appErr(arena, "wait_for must be 'idle' or 'command'");
+        if (eql(u8, wait_for, "command")) {
+            // A tracked command may have completed since its timeout:
+            // one short drain clears it so the new send is accepted.
+            if (t.hasPendingCommand()) _ = t.waitPendingCommand(0);
+            if (t.hasPendingCommand()) {
+                return commandCompletionResult(arena, .{ .state = .running }, false, null, null, "a previously timed-out command is still running; use term_wait_command instead of resending");
+            }
+            // The token wait spends from the same budget as the
+            // completion wait, so the call never outlives timeout_ms.
+            const started = monoMs();
+            const token_res = t.commandToken(@min(timeout_ms, 10_000)) catch return appErr(arena, "command completion unavailable (terminal exited?)");
+            const token = switch (token_res) {
+                .unsupported => return commandCompletionResult(arena, .{ .state = .unsupported }, false, null, null, "shell integration is unavailable for this shell; command was not sent and no exit status was fabricated"),
+                .not_ready => return commandCompletionResult(arena, .{ .state = .unsupported, .timed_out = true }, false, null, null, "shell integration is injected but no prompt mark has arrived yet (shell still starting, or its rc files broke the injection); command was not sent — retry shortly"),
+                .busy => return commandCompletionResult(arena, .{ .state = .running }, false, null, null, "a foreground command started outside command mode is still running; its completion would be misattributed. Wait for it (term_wait_idle) before sending in command mode"),
+                .token => |tok| tok,
+            };
+            const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
+            t.sendText(line) catch return appErr(arena, "send failed (terminal exited?)");
+            t.trackCommand(token);
+            const result = t.waitCommand(token, @max(0, timeout_ms - (monoMs() - started)));
+
+            var owned_output: ?[]u8 = null;
+            defer if (owned_output) |text| term_state.allocator.free(text);
+            var output_kind: []const u8 = "screen";
+            if (result.state == .completed and result.source == .shell_integration and argBool(args, "output_only")) {
+                if (t.lastCommand() catch null) |lc| {
+                    owned_output = lc.text;
+                    output_kind = "command";
+                }
+            }
+            if (owned_output == null) {
+                owned_output = t.readScreen(false) catch null;
+            }
+            return commandCompletionResult(arena, result, true, owned_output, output_kind, switch (result.state) {
+                .running => "timeout expired while the command was still running; output may have been idle",
+                .unknown => "terminal disconnected before a reliable completion status was received",
+                .unsupported => unreachable,
+                .completed => null,
+            });
+        }
+        // Idle mode must not run a NEW command while a command-mode
+        // token is unresolved: the interloper's OSC 133 D would be
+        // reported by term_wait_command as the tracked command's exit.
+        if (t.hasPendingCommand()) _ = t.waitPendingCommand(0);
+        if (t.hasPendingCommand())
+            return appErr(arena, "a command-mode command is still being tracked; resolve it with term_wait_command before running another command, or its exit status would be misattributed");
         const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
         t.sendText(line) catch return appErr(arena, "send failed (terminal exited?)");
         const settled = t.waitIdle(quiet_ms, timeout_ms);
@@ -2634,6 +2717,27 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
             "";
         const msg = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ fallback_note, text, note });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "term_wait_command")) {
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        const result = t.waitPendingCommand(timeout_ms) orelse
+            return appErr(arena, "no timed-out command is being tracked");
+        var owned_output: ?[]u8 = null;
+        defer if (owned_output) |text| term_state.allocator.free(text);
+        var output_kind: []const u8 = "screen";
+        if (result.state == .completed and result.source == .shell_integration and argBool(args, "output_only")) {
+            if (t.lastCommand() catch null) |lc| {
+                owned_output = lc.text;
+                output_kind = "command";
+            }
+        }
+        if (owned_output == null) owned_output = t.readScreen(false) catch null;
+        return commandCompletionResult(arena, result, true, owned_output, output_kind, switch (result.state) {
+            .running => "timeout expired while the command was still running; output may have been idle",
+            .unknown => "terminal disconnected before a reliable completion status was received",
+            .unsupported => unreachable,
+            .completed => null,
+        });
     }
     if (eql(u8, name, "term_wait_idle")) {
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 500;

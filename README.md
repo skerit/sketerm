@@ -158,6 +158,7 @@ zig-out/bin/sketerm --help
 - [Config](docs/config.md) — config file schema, keybinding model
 - [Testing](docs/testing.md) — parser fixtures, record/replay,
   differential diffing, fuzzing, benchmarks
+- [MCP tools](docs/mcp.md) — command completion vs output-idle waits
 
 **Reference**
 - [Protocols](docs/protocols.md) — escape sequences supported

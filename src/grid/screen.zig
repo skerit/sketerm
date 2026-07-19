@@ -386,6 +386,9 @@ pub const Screen = struct {
     last_output_end_id: u64 = 0,
     /// Exit status from `OSC 133 ; D ; <code>` (0 when not reported).
     last_cmd_exit: i32 = 0,
+    /// Monotonic completed-command identity for mux clients waiting
+    /// across snapshots without mistaking output quiescence for exit.
+    cmd_completion_seq: u64 = 0,
 
     /// Ring of completed command zones (command-block UX: gutter
     /// marks, click-to-select, failed-command minimap). extern so the
@@ -2653,7 +2656,21 @@ pub const Screen = struct {
     /// `cmdOutputStart`. `exit_str` is the optional exit-code field
     /// (empty = unknown → 0).
     fn cmdOutputEnd(self: *Screen, exit_str: []const u8) void {
-        if (self.use_alt or self.row >= self.rows) return;
+        if (self.use_alt or self.row >= self.rows) {
+            // A dead TUI can leave the alt screen active while the
+            // shell prints its next prompt (and this D) into it. No
+            // zone to record there, but with an open C the completion
+            // signal must still fire or command-mode waiters and the
+            // busy check wedge until the whole shell exits.
+            if (self.pending_output_start_id != 0 or self.pending_output_awaits_nl) {
+                self.pending_output_start_id = 0;
+                self.pending_output_awaits_nl = false;
+                self.last_cmd_exit = if (exit_str.len > 0) (std.fmt.parseInt(i32, exit_str, 10) catch 0) else 0;
+                self.cmd_completion_seq +%= 1;
+                if (self.sink.on_cmd_end) |f| f(self.sink.ctx, self.last_cmd_exit);
+            }
+            return;
+        }
         // C deferred to a newline that never came (command printed
         // nothing, D reached first): an empty zone at the current row
         // still carries the exit code.
@@ -2667,6 +2684,7 @@ pub const Screen = struct {
         self.last_output_start_id = start_id;
         self.last_output_end_id = self.active[self.row].id;
         self.last_cmd_exit = if (exit_str.len > 0) (std.fmt.parseInt(i32, exit_str, 10) catch 0) else 0;
+        self.cmd_completion_seq +%= 1;
         self.recordCmdZone(start_id, self.last_output_end_id, self.last_cmd_exit);
         if (self.sink.on_cmd_end) |f| f(self.sink.ctx, self.last_cmd_exit);
     }
@@ -6982,6 +7000,30 @@ test "OSC 133 C/D bounds the last-command-output zone" {
     s.onOsc("133;C");
     s.onOsc("133;D;0");
     try std.testing.expect(!s.lastCommandOutputAvailable());
+}
+
+test "OSC 133 D on the alt screen still signals command completion" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 4);
+    defer s.deinit();
+
+    // Command starts on the main screen, TUI enters the alt screen and
+    // dies without leaving it; the shell prompt (with D) lands on alt.
+    s.onOsc("133;A");
+    s.onOsc("133;C");
+    const seq_before = s.cmd_completion_seq;
+    s.toggleAltScreen(true);
+    s.onOsc("133;D;137");
+    try std.testing.expectEqual(seq_before + 1, s.cmd_completion_seq);
+    try std.testing.expectEqual(@as(i32, 137), s.last_cmd_exit);
+    try std.testing.expectEqual(@as(u64, 0), s.pending_output_start_id);
+    try std.testing.expect(!s.pending_output_awaits_nl);
+
+    // A stray alt-screen D with no open C does NOT fabricate one.
+    s.onOsc("133;D;0");
+    try std.testing.expectEqual(seq_before + 1, s.cmd_completion_seq);
+    try std.testing.expectEqual(@as(i32, 137), s.last_cmd_exit);
 }
 
 test "OSC 133 mid-line C (bash DEBUG trap) excludes the command echo" {
