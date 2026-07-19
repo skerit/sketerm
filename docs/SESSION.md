@@ -7904,3 +7904,27 @@ The real create-stream protocol test now requests an intentionally tiny
 test pins audio-first selection and no mid-frame interleaving. Full
 tests, smoke-mux, mux, and mux-portable verify the transport and
 libc-only daemon paths.
+
+## Opus is automatic without becoming a daemon dependency
+
+The packetized 20ms/128kbit Opus path already compressed eligible
+s16 streams about 12x, but ordinary `zig build` compiled it out and
+the enabled form hard-linked libopus. That made development builds
+silently ship raw PCM and violated the native daemon's libc-only link
+contract when compression was requested.
+
+Normal builds now compile Opus support by default and resolve the
+seven libopus entry points once at runtime (`libopus.so.0`/`.so`, or
+the macOS dylib names). The hello/list capability and the GUI's audio
+subscribe flag report actual runtime availability, not merely a build
+boolean; a missing/incomplete library therefore negotiates clean raw
+PCM rather than failing at process load or sending undecodable units.
+`-Daudio-opus=false` remains an explicit opt-out and mux-portable pins
+it off, so static-musl and Linux→macOS portable builds never reference
+the loader. The native daemon no longer has a libopus ELF dependency.
+
+The Arch package still depends on opus so installed builds reliably
+compress, but no longer needs a special build flag. Doctor compares
+runtime codec availability on the binary and daemon hosts. The Opus
+round-trip runs in the default test suite when libopus is installed;
+the explicit-off suite skips it and verifies the raw fallback build.

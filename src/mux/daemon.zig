@@ -18,6 +18,7 @@ const wire = @import("wire.zig");
 const wlwire = @import("../wlhost/wire.zig");
 const wltrack = @import("../wlhost/track.zig");
 const pulse = @import("pulse.zig");
+const opuscodec = @import("opuscodec.zig");
 const wavcap = @import("wavcap.zig");
 const wlproto = @import("../wlhost/protocol.zig");
 const wlpipe = @import("../wlhost/pipe.zig");
@@ -1690,7 +1691,7 @@ pub const Daemon = struct {
                 cl.queueJson(.welcome, .{
                     .proto = wire.PROTO_VERSION,
                     .version = version.string,
-                    .audio_opus = build_options.audio_opus,
+                    .audio_opus = opuscodec.available(),
                     .video = build_options.video,
                 });
             },
@@ -3828,7 +3829,7 @@ pub const Daemon = struct {
                 .pid = w.child_pid,
             }) catch return;
         }
-        cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = build_options.audio_opus, .video = build_options.video, .sessions = infos.items });
+        cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
     }
 
     /// Broker side of kill: send the worker a graceful 'K' (it flushes `.gone`
@@ -4684,7 +4685,7 @@ pub const Daemon = struct {
                 .pid = s.pty.child_pid,
             }) catch return;
         }
-        cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = build_options.audio_opus, .video = build_options.video, .sessions = infos.items });
+        cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
     }
 
     const ForwardReq = struct { port: u16 };

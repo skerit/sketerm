@@ -112,8 +112,8 @@ pub const UnitTag = enum(u8) {
     /// flags byte: bit0 = "I decode Opus" (pcm_opus units OK).
     subscribe = 18,
     /// u32 stream, u32 raw byte count, one 20 ms Opus packet.
-    /// Daemon → viewer (-Daudio-opus, negotiated via subscribe
-    /// flags). raw_len lets a non-decoding consumer keep the
+    /// Daemon → viewer (runtime Opus, negotiated via subscribe flags).
+    /// raw_len lets a non-decoding consumer keep the
     /// consumed-bytes clock without touching libopus.
     pcm_opus = 19,
     _,
@@ -367,8 +367,8 @@ pub const Stream = struct {
     viewer_clocked: bool = false,
     /// Opus decision made (latched at first data, sticky).
     opus_latched: bool = false,
-    /// Live encoder (-Daudio-opus + subscriber wants it + s16 in
-    /// the 48 kHz family). null = ship raw pcm units.
+    /// Live encoder (libopus available + subscriber wants it + s16 in the
+    /// 48 kHz family). null = ship raw pcm units.
     opus_enc: ?opuscodec.Encoder = null,
     /// Partial 20 ms frame awaiting more samples.
     fbuf: std.ArrayList(u8) = .empty,
@@ -509,12 +509,12 @@ pub const Server = struct {
         const s = self.streams.getPtr(channel) orelse return; // stale stream: drop
         s.write_index +|= payload.len;
         // Opus decision is sticky per stream, made at first data:
-        // -Daudio-opus built, a subscriber decodes it, and the spec
+        // libopus is available, a subscriber decodes it, and the spec
         // is s16 in the 48 kHz family (44.1 k stays raw — Opus
         // doesn't eat it and we don't resample).
         if (!s.opus_latched) {
             s.opus_latched = true;
-            if (opuscodec.enabled and self.opus_wanted and s.format == 3)
+            if (opuscodec.available() and self.opus_wanted and s.format == 3)
                 s.opus_enc = opuscodec.Encoder.init(s.rate, s.channels);
             if (std.c.getenv("SKETERM_PA_DEBUG") != null)
                 std.debug.print("pulse: stream {d} latched {s} ({d} Hz, {d} ch)\n", .{ channel, if (s.opus_enc != null) "OPUS" else "raw", s.rate, s.channels });

@@ -774,13 +774,13 @@ pub const Terminal = struct {
             self.sendChanClose(id);
             return;
         };
-        // Opt into PCM: the daemon only ships audio to subscribers.
-        // Flags bit0 advertises Opus decode (-Daudio-opus builds).
+        // Opt into audio: the daemon only ships samples to subscribers.
+        // Flags bit0 advertises that libopus is available for decode.
         const pulse = @import("mux/pulse.zig");
         const opuscodec = @import("mux/opuscodec.zig");
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(self.allocator);
-        const flags: []const u8 = if (opuscodec.enabled) "\x01" else "";
+        const flags: []const u8 = if (opuscodec.available()) "\x01" else "";
         pulse.appendUnit(&units, self.allocator, .subscribe, flags) catch return;
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);

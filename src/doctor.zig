@@ -13,6 +13,7 @@ const mux_daemon = @import("mux/daemon.zig");
 const ipc_client = @import("ipc/client.zig");
 const version = @import("version.zig");
 const build_options = @import("build_options");
+const opuscodec = @import("mux/opuscodec.zig");
 
 /// Daemon `list` reply; pre-doctor daemons omit version/caps fields
 /// and show up as version "" (reported as "pre-0.1.0 or stale").
@@ -57,7 +58,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         "binary    %s  proto %u  opus:%s video:%s\n",
         @as([*:0]const u8, version.string),
         @as(c_uint, wire.PROTO_VERSION),
-        onOff(build_options.audio_opus),
+        onOff(opuscodec.available()),
         onOff(build_options.video),
     );
 
@@ -162,8 +163,8 @@ fn checkDaemon(allocator: std.mem.Allocator, host: ?[]const u8) u32 {
         );
         warns += 1;
     }
-    if (build_options.audio_opus != w.audio_opus) {
-        _ = c.printf("          note: opus mismatch (binary %s, daemon %s) - audio falls back to raw PCM\n", onOff(build_options.audio_opus), onOff(w.audio_opus));
+    if (opuscodec.available() != w.audio_opus) {
+        _ = c.printf("          note: opus mismatch (binary %s, daemon %s) - audio falls back to raw PCM\n", onOff(opuscodec.available()), onOff(w.audio_opus));
     }
     return warns;
 }
