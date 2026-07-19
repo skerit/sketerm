@@ -7812,3 +7812,69 @@ with MCP still attached (2 clients), switcher discovered the second
 (unattached) MCP app, attach-from-row worked, thumbnail row correct.
 The orphan fix is not yet confirmed against the real Wine game (no
 Wine here) — the new debug log line is the smoking-gun check.
+
+## MCP command completion is distinct from output idle
+
+`term_run` now accepts `wait_for: "command"`. The headless terminal
+driver snapshots its latest completed OSC 133 zone before sending and
+waits for a different zone, returning structured running/completed
+state, exact exit status, timeout state, and whether completion came
+from shell integration or the daemon's tracked shell-process exit.
+Shells without integration return unsupported without sending; no
+status is fabricated. Timed-out commands retain their zone token and
+finish through `term_wait_command`, while another command-mode send is
+rejected to prevent associating the wrong OSC 133 `D`.
+
+The default `term_run`, `term_wait_idle`, GUI `run_command`, and GUI
+`wait_idle` remain output-quiescence operations for interactive use;
+their schemas now say explicitly that idle output does not imply child
+exit. `Screen` owns the monotonic completion sequence, and mux
+snapshots preserve it plus an in-flight C marker so resync cannot
+fabricate completion. Appdrive and GUI app-tool behavior are unchanged.
+
+`smoke-mcp` covers silent status 0, silent status 124, delayed output,
+missing shell integration, output-idle compatibility, command timeout
+plus resumed waiting, duplicate-send rejection, and a signal-killed
+shell replacement reported as -15 by process tracking.
+
+Review follow-ups: SNAPSHOT_VERSION bumped to 4 (the new OSC 133
+fields changed the wire format; a stale daemon now fails attach with
+a clean version mismatch instead of misparsing). A timed-out command
+reports `completion_source: "none"` (nothing completed). `commandToken`
+knows whether integration was injected at spawn: uninstrumented shells
+fail fast, instrumented ones get a bounded wait for the first prompt
+mark so command mode right after `term_open` is not misreported as
+unsupported. A foreground command started outside command mode (open
+OSC 133 C marker) now refuses a command-mode send — its `D` would have
+been misattributed to the new command. smoke-mcp asserts all four.
+
+## Command-completion review round 2 (workflow findings)
+
+An OSC 133 `D` arriving while the alt screen is active (a TUI killed
+without restoring the main screen) now still clears the open C zone,
+sets the exit code, bumps `cmd_completion_seq`, and fires on_cmd_end —
+previously the D was dropped entirely, wedging command-mode waits AND
+the busy check until the shell died. Zone recording still skips the
+alt screen. Unit test added.
+
+The snapshot v4 command tail moved to the END of the stream and
+restore accepts v3 again (fields keep zero defaults): a still-running
+pre-upgrade daemon stays attachable after a package upgrade instead of
+stranding durable sessions on SnapshotVersionMismatch. v3-compat test
+added.
+
+Command-token hardening: `not_ready` (integration injected, no prompt
+mark yet — retryable, latched so only the first call pays the full
+wait) is now distinct from `unsupported`; the token wait spends from
+the same budget as the completion wait so term_run no longer overruns
+timeout_ms by the token wait; a 100ms settle before the busy judgment
+closes the raw-send-Enter vs C-mark race; idle-mode term_run is
+refused while a command-mode token is unresolved (interleaved D =
+misattributed exit status), and an already-completed tracked command
+is auto-cleared instead of forcing a term_wait_command round-trip.
+
+smoke-mcp: the idle-mode "returned early" check is now semantic (busy
+probe on the open C zone) instead of a flaky 700ms wall-clock bound,
+and all redirects go to /dev/null instead of fixed world-shared /tmp
+paths. termdrive.spawn no longer leaks the style pool if the Term
+allocation fails.
