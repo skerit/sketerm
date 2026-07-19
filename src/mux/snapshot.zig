@@ -19,6 +19,9 @@ const Pool = style_pool.Pool;
 
 pub const SNAPSHOT_VERSION: u32 = 4;
 
+/// Fixed-size OSC 133 state appended to every v4 snapshot.
+const V4_COMMAND_TAIL_LEN: usize = 8 + 1 + 8 + 8 + 4 + 8;
+
 const Sink = struct {
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -412,7 +415,17 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
     // Retained image placements — parked on the screen; the client
     // replays them into its image sink once a pane is wired
     // (Terminal.replayRetainedImages) and then frees them.
-    const n_images = try src.int(u32);
+    var n_images = try src.int(u32);
+    // A transitional v4 writer shipped before the command-state format was
+    // finalized. Its legacy u32 occupies the slot now used by n_images and is
+    // followed immediately by the fixed 37-byte command tail. When non-zero,
+    // current readers mistake it for an image count and run off the end of the
+    // snapshot with Truncated. The shape is unambiguous: even one legitimate
+    // image needs metadata beyond the tail, so a non-zero count with exactly
+    // the tail remaining can only be that legacy v4 form. A zero legacy value
+    // already decodes normally as zero images.
+    if (version == 4 and n_images != 0 and src.bytes.len - src.pos == V4_COMMAND_TAIL_LEN)
+        n_images = 0;
     for (0..n_images) |_| {
         var ev = Screen.ImageEvent{
             .width = try src.int(u32),
@@ -572,7 +585,7 @@ test "snapshot: v3 payload (no command tail) restores with defaults" {
 
     // A v3 payload is exactly a v4 one without the 37-byte command
     // tail — chop it off and stamp version 3.
-    const tail = 8 + 1 + 8 + 8 + 4 + 8;
+    const tail = V4_COMMAND_TAIL_LEN;
     const legacy = try a.dupe(u8, buf.items[0 .. buf.items.len - tail]);
     defer a.free(legacy);
     std.mem.writeInt(u32, legacy[0..4], 3, .little);
@@ -589,6 +602,44 @@ test "snapshot: v3 payload (no command tail) restores with defaults" {
     var pool3 = try Pool.init(a);
     defer pool3.deinit();
     try testing.expectError(error.Truncated, restore(a, &pool3, buf.items[0 .. buf.items.len - tail]));
+}
+
+test "snapshot: transitional v4 legacy field is not an image count" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 20, 6);
+    defer h.deinit();
+    h.feed("legacy v4 screen\r\n");
+    h.screen.pending_output_start_id = 111;
+    h.screen.pending_output_awaits_nl = true;
+    h.screen.last_output_start_id = 222;
+    h.screen.last_output_end_id = 333;
+    h.screen.last_cmd_exit = 7;
+    h.screen.cmd_completion_seq = 444;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try serialize(h.screen, &buf, a);
+    try testing.expectEqual(@as(usize, 0), h.screen.retained_images.items.len);
+
+    // The transitional writer put a legacy non-zero u32 immediately before
+    // the same 37-byte command tail. Reproduce a value observed in a live,
+    // still-running daemon; the finalized writer has zero here (n_images).
+    const legacy_field_pos = buf.items.len - V4_COMMAND_TAIL_LEN - @sizeOf(u32);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf.items[legacy_field_pos..][0..4], .little));
+    std.mem.writeInt(u32, buf.items[legacy_field_pos..][0..4], 208, .little);
+
+    var pool2 = try Pool.init(a);
+    defer pool2.deinit();
+    const back = try restore(a, &pool2, buf.items);
+    defer back.deinit();
+
+    try testing.expectEqual(@as(usize, 0), back.retained_images.items.len);
+    try testing.expectEqual(@as(u64, 111), back.pending_output_start_id);
+    try testing.expect(back.pending_output_awaits_nl);
+    try testing.expectEqual(@as(u64, 222), back.last_output_start_id);
+    try testing.expectEqual(@as(u64, 333), back.last_output_end_id);
+    try testing.expectEqual(@as(i32, 7), back.last_cmd_exit);
+    try testing.expectEqual(@as(u64, 444), back.cmd_completion_seq);
 }
 
 test "snapshot: retained image placements round-trip" {
