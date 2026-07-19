@@ -1,0 +1,188 @@
+//! Persistent MCP assets: named screenshot templates (PNG) and named
+//! input macros (JSON step lists) under $XDG_STATE_HOME/sketerm.
+//! Shared across MCP instances deliberately — a macro recorded in one
+//! session must replay in the next (that is the whole point).
+//!
+//! libc file IO only (Zig 0.16 has no std.fs.cwd); bounded reads —
+//! a template above MAX_BYTES is rejected rather than truncated.
+
+const std = @import("std");
+const c = @import("../c.zig").c;
+const pathz = @import("../util/pathz.zig");
+
+pub const Error = error{ BadName, NotFound, TooBig, IoFailed, OutOfMemory };
+
+pub const Kind = enum {
+    template,
+    macro,
+
+    fn dir(self: Kind) []const u8 {
+        return switch (self) {
+            .template => "templates",
+            .macro => "macros",
+        };
+    }
+
+    fn ext(self: Kind) []const u8 {
+        return switch (self) {
+            .template => ".png",
+            .macro => ".json",
+        };
+    }
+};
+
+/// 8 MB: a full-window PNG template fits many times over; a macro is
+/// text. Anything bigger is a mistake, not an asset.
+pub const MAX_BYTES: usize = 8 << 20;
+
+fn getenv(name: [*:0]const u8) ?[]const u8 {
+    const v = c.getenv(name) orelse return null;
+    const s = std.mem.span(@as([*:0]const u8, @ptrCast(v)));
+    return if (s.len == 0) null else s;
+}
+
+/// Asset names are file names: short, no separators, no dotfiles.
+pub fn validName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    if (name[0] == '.') return false;
+    for (name) |ch| {
+        switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn assetPath(allocator: std.mem.Allocator, kind: Kind, name: []const u8) Error![]u8 {
+    if (!validName(name)) return Error.BadName;
+    if (getenv("XDG_STATE_HOME")) |xs| {
+        return std.fmt.allocPrint(allocator, "{s}/sketerm/{s}/{s}{s}", .{ xs, kind.dir(), name, kind.ext() }) catch Error.OutOfMemory;
+    }
+    if (getenv("HOME")) |home| {
+        return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/{s}/{s}{s}", .{ home, kind.dir(), name, kind.ext() }) catch Error.OutOfMemory;
+    }
+    return Error.IoFailed;
+}
+
+fn dirPath(allocator: std.mem.Allocator, kind: Kind) Error![]u8 {
+    if (getenv("XDG_STATE_HOME")) |xs| {
+        return std.fmt.allocPrint(allocator, "{s}/sketerm/{s}", .{ xs, kind.dir() }) catch Error.OutOfMemory;
+    }
+    if (getenv("HOME")) |home| {
+        return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/{s}", .{ home, kind.dir() }) catch Error.OutOfMemory;
+    }
+    return Error.IoFailed;
+}
+
+pub fn save(allocator: std.mem.Allocator, kind: Kind, name: []const u8, bytes: []const u8) Error!void {
+    if (bytes.len > MAX_BYTES) return Error.TooBig;
+    const path = try assetPath(allocator, kind, name);
+    defer allocator.free(path);
+    pathz.makeParentDirs(path) catch return Error.IoFailed;
+    var zbuf: [4096]u8 = undefined;
+    const z = pathz.pathZ(&zbuf, path) catch return Error.IoFailed;
+    const f = c.fopen(z, "wb") orelse return Error.IoFailed;
+    defer _ = c.fclose(f);
+    if (c.fwrite(bytes.ptr, 1, bytes.len, f) != bytes.len) return Error.IoFailed;
+}
+
+/// Caller frees the returned bytes.
+pub fn load(allocator: std.mem.Allocator, kind: Kind, name: []const u8) Error![]u8 {
+    const path = try assetPath(allocator, kind, name);
+    defer allocator.free(path);
+    var zbuf: [4096]u8 = undefined;
+    const z = pathz.pathZ(&zbuf, path) catch return Error.IoFailed;
+    const f = c.fopen(z, "rb") orelse return Error.NotFound;
+    defer _ = c.fclose(f);
+    _ = c.fseek(f, 0, c.SEEK_END);
+    const len: usize = @intCast(@max(0, c.ftell(f)));
+    _ = c.fseek(f, 0, c.SEEK_SET);
+    if (len > MAX_BYTES) return Error.TooBig;
+    const buf = allocator.alloc(u8, len) catch return Error.OutOfMemory;
+    errdefer allocator.free(buf);
+    if (c.fread(buf.ptr, 1, len, f) != len) return Error.IoFailed;
+    return buf;
+}
+
+pub fn delete(allocator: std.mem.Allocator, kind: Kind, name: []const u8) Error!void {
+    const path = try assetPath(allocator, kind, name);
+    defer allocator.free(path);
+    var zbuf: [4096]u8 = undefined;
+    const z = pathz.pathZ(&zbuf, path) catch return Error.IoFailed;
+    if (c.unlink(z) != 0) return Error.NotFound;
+}
+
+/// Names (extension stripped) of every stored asset of `kind`,
+/// sorted. Caller frees each name and the slice.
+pub fn list(allocator: std.mem.Allocator, kind: Kind) Error![][]u8 {
+    const path = try dirPath(allocator, kind);
+    defer allocator.free(path);
+    var zbuf: [4096]u8 = undefined;
+    const z = pathz.pathZ(&zbuf, path) catch return Error.IoFailed;
+    var names: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+    const d = c.opendir(z) orelse return names.toOwnedSlice(allocator) catch Error.OutOfMemory;
+    defer _ = c.closedir(d);
+    while (c.readdir(d)) |ent| {
+        const fname = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (!std.mem.endsWith(u8, fname, kind.ext())) continue;
+        const stem = fname[0 .. fname.len - kind.ext().len];
+        if (!validName(stem)) continue;
+        const copy = allocator.dupe(u8, stem) catch return Error.OutOfMemory;
+        names.append(allocator, copy) catch {
+            allocator.free(copy);
+            return Error.OutOfMemory;
+        };
+    }
+    std.mem.sort([]u8, names.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    return names.toOwnedSlice(allocator) catch Error.OutOfMemory;
+}
+
+// ─── tests ──────────────────────────────────────────────────────
+
+test "asset names are validated" {
+    try std.testing.expect(validName("conversation-frame"));
+    try std.testing.expect(validName("a.b_C-9"));
+    try std.testing.expect(!validName(""));
+    try std.testing.expect(!validName(".hidden"));
+    try std.testing.expect(!validName("a/b"));
+    try std.testing.expect(!validName("a b"));
+    try std.testing.expect(!validName("x" ** 65));
+}
+
+test "save/load/list/delete round-trip in an isolated state dir" {
+    const a = std.testing.allocator;
+    var dirbuf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dirbuf, "/tmp/sketerm-assets-test-{d}", .{c.getpid()});
+    var zbuf: [4096]u8 = undefined;
+    _ = c.mkdir(try pathz.pathZ(&zbuf, dir), 0o755);
+    var envbuf: [160]u8 = undefined;
+    const env = try std.fmt.bufPrintZ(&envbuf, "{s}", .{dir});
+    _ = c.setenv("XDG_STATE_HOME", env, 1);
+    defer _ = c.unsetenv("XDG_STATE_HOME");
+
+    try save(a, .macro, "walk-to-riker", "{\"actions\":[{\"wait\":100}]}");
+    const bytes = try load(a, .macro, "walk-to-riker");
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("{\"actions\":[{\"wait\":100}]}", bytes);
+
+    const names = try list(a, .macro);
+    defer {
+        for (names) |n| a.free(n);
+        a.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("walk-to-riker", names[0]);
+
+    try delete(a, .macro, "walk-to-riker");
+    try std.testing.expectError(Error.NotFound, load(a, .macro, "walk-to-riker"));
+    try std.testing.expectError(Error.BadName, save(a, .macro, "../evil", "x"));
+}

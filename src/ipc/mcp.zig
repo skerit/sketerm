@@ -18,6 +18,10 @@ const protocol = @import("protocol.zig");
 const appdrive = @import("appdrive.zig");
 const termdrive = @import("termdrive.zig");
 const marks_mod = @import("../util/marks.zig");
+const template = @import("../util/template.zig");
+const ocr = @import("../util/ocr.zig");
+const png_util = @import("../util/png.zig");
+const mcpassets = @import("mcpassets.zig");
 
 const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
@@ -62,6 +66,13 @@ const MCP_HELP =
     \\close_app_window, close_app. SSH app launches (`host` param)
     \\always target the REMOTE host's daemon; isolation applies to
     \\local launches.
+    \\
+    \\Framebuffer-app helpers (games/custom UIs with no a11y tree):
+    \\app_read_text + app_wait_text (OCR via runtime-loaded
+    \\tesseract), app_template_save/app_templates + app_find_image /
+    \\app_wait_image (pixel template matching), app_macro_save /
+    \\app_macro_run / app_macros (recorded, replayable input macros;
+    \\persisted in $XDG_STATE_HOME/sketerm).
     \\
     \\Headless terminal tools (isolated mode; real shells on the
     \\private daemon, no GUI): term_open, term_run, term_send_text,
@@ -539,6 +550,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         .keep_apps = if (iso) |i| i.durable else false,
     };
     defer app_state.deinit();
+    defer Journal.deinitAll();
     // Headless terminal tools run on the private daemon (isolated
     // mode only); --shared keeps the GUI-backed terminal tools.
     term_state = .{
@@ -873,7 +885,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as RENDERED BY A TERMINAL — a fixed-width grid, so long lines wrap and scrolled-off content needs scrollback=true; right for TUI-style redraws). For log-style output app_log is the SOURCE OF TRUTH: indexed unwrapped lines with stable ids, re-readable in full — prefer it. When the grid mirror is blank after an exit, the log ring's last lines are served instead. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
     \\{"name":"app_log","description":"A headless app's stdout/stderr as an INDEXED LOG: each complete line gets a stable numeric id and a timestamp; the tail view shortens long lines (marked [+]) and any line can be re-read in full by id. The ring is bounded (oldest lines drop; the reply says how many). MARKERS: the app (or your injected code) can emit the escape  printf '\\033]5522;my-label\\033\\\\'  — it becomes a labelled log line AND sketerm stashes a screenshot of the app window at that exact instant; fetch label+image with {\"id\":<that line's id>}. Variant printf '\\033]5522;+N;my-label\\033\\\\' captures the Nth FUTURE frame commit instead (e.g. +1 = the next repaint after this point; resolved with the final frame if the app exits first). Markers are rate-limited (burst 8, then 2/s; excess are dropped and counted) so escape-laden files cat'ed to the terminal cannot flood the log. Survives app exit: the final log is delivered with the exit.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"tail":{"type":"integer","description":"Last N lines (default 60, max 500)"},"from_id":{"type":"integer","description":"Return lines starting at this id instead of the tail"},"id":{"type":"integer","description":"Return ONE line in full; for a marker line also returns the stashed screenshot"}}}},
     \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right. mark=true returns a post-click screenshot with a crosshair drawn at the exact click pixel — see where the click landed relative to the UI AND what it did, in one image; screenshot=true returns the post-click frame without the marker.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"},"mark":{"type":"boolean","description":"Return a post-click screenshot with a crosshair marker at the click point"},"screenshot":{"type":"boolean","description":"Return a post-click screenshot (no marker)"},"max_px":{"type":"integer","description":"Bound on the screenshot's longest dimension (default 1568)"}},"required":["window","x","y"]}},
-    \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} (MILLISECONDS, max 30000) | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} (with change_pct = VISUAL settle: blocks until frames change less than that %% — use for scene transitions of unknown duration instead of guessing a fixed wait) | {\"wait_change\":timeout_ms or {\"timeout_ms\":N,\"min_change_pct\":P}} (P = ignore repaints below that %% of pixels) | {\"screenshot\":true or {\"max_px\":N}}. MARKERS: add \"mark\":true to a click/move/move_rel/drag/scroll step to draw a labelled crosshair at that step's position (red = click, cyan = move; the number is the step index) onto the NEXT screenshot — several marked steps can share one image. Combine in one step: {\"click\":[x,y],\"mark\":true,\"screenshot\":true} captures the post-click frame with the click point marked. Leftover marks with no later screenshot are flushed as a final image automatically. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
+    \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} (MILLISECONDS, max 30000) | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} (with change_pct = VISUAL settle: blocks until frames change less than that %% — use for scene transitions of unknown duration instead of guessing a fixed wait) | {\"wait_change\":timeout_ms or {\"timeout_ms\":N,\"min_change_pct\":P}} (P = ignore repaints below that %% of pixels) | {\"screenshot\":true or {\"max_px\":N}} | {\"wait_image\":{\"template\":name,\"timeout_ms\":N,\"click\":true}} (wait for a saved template to appear, optionally click its center) | {\"click_image\":{\"template\":name}} (find + click NOW, error if absent) | {\"wait_text\":{\"text\":s,\"click\":true}} (OCR-wait for a string, optionally click it) — these three make batches STATE-driven instead of coordinate/timing-driven. MARKERS: add \"mark\":true to a click/move/move_rel/drag/scroll step to draw a labelled crosshair at that step's position (red = click, cyan = move; the number is the step index) onto the NEXT screenshot — several marked steps can share one image. Combine in one step: {\"click\":[x,y],\"mark\":true,\"screenshot\":true} captures the post-click frame with the click point marked. Leftover marks with no later screenshot are flushed as a final image automatically. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
     \\{"name":"app_mouse_move","description":"Move the pointer in an app window WITHOUT clicking. Absolute: x,y in surface pixels (hover a widget, position before a click). Relative: dx,dy — a delta from the current pointer position, for apps that consume RELATIVE mouse motion (SDL games, DOSBox, anything with pointer-lock): sketerm derives relative_motion events from the move, so the app's own cursor moves by exactly your delta. Calibration for such apps: one large negative move (e.g. dx:-30000, dy:-30000) slams their internal cursor to the top-left corner, after which exact deltas land where you aim. With neither x/y nor dx/dy it just returns the tracked pointer position.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = window under the pointer, else first toplevel)"},"x":{"type":"number","description":"Absolute surface x (with y)"},"y":{"type":"number"},"dx":{"type":"number","description":"Relative delta x (with dy; exclusive with x/y)"},"dy":{"type":"number"}}}},
     \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
     \\{"name":"app_set_value","description":"Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value). Faster and more reliable than typing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}},
@@ -889,6 +901,15 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_a11y_tree","description":"Read the app's accessibility (AT-SPI) tree as JSON: every widget's role, name, description, states and screen rectangle. Target elements by name/role instead of pixel-hunting a screenshot. Works for GTK/Qt apps; empty for apps without accessibility (games, some Electron).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"app_record_start","description":"Start recording a window's frames (a visual log of what you do). Default format is WebM/VP9 (smaller, higher quality); pass format:\"gif\" for an animated GIF. Frames are captured while other app tools run; finish with app_record_stop.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"format":{"type":"string","enum":["webm","gif"],"description":"Default webm"},"max_px":{"type":"integer","description":"Bound on the longest dimension (default 1280 webm / 800 gif)"},"fps":{"type":"integer","description":"Cap the capture rate (frames/second, 1-60; default = every committed frame)"}}}},
     \\{"name":"app_record_stop","description":"Stop the recording and save it (WebM or GIF per app_record_start). Returns the file path and frame count.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"path":{"type":"string","description":"Output path (extension set automatically if omitted)"}}}},
+    \\{"name":"app_read_text","description":"OCR: read the TEXT rendered in an app window (or a region of it) — for custom-drawn UIs and games with no accessibility tree, this turns pixels into assertable strings. Returns the recognized text plus per-word boxes in surface coordinates with click centers (cx,cy) — read a label, then app_click its cx/cy. Needs tesseract installed on the machine running the MCP server (loaded at runtime; install tesseract + tesseract-data-eng). Crop with region for speed and accuracy; small pixel fonts are auto-upscaled (override with scale).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = the PRIMARY toplevel)"},"region":{"type":"object","description":"Read only this sub-rectangle (surface pixels)","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"scale":{"type":"integer","description":"Integer pre-upscale for tiny bitmap fonts (1-8; 0/omit = auto)"},"psm":{"type":"integer","description":"Tesseract page segmentation: 6 uniform text block (default, dialogs), 11 sparse scattered labels, 7 single line, 3 full auto"},"lang":{"type":"string","description":"Language code(s), default eng (e.g. \"eng+deu\")"}}}},
+    \\{"name":"app_wait_text","description":"Wait until a text string becomes visible in an app window (OCR-polled, case-insensitive substring) — assert 'the dialog opened' / 'the menu lists Repairs' without eyeballing screenshots. click=true also clicks the matched words' center (coordinate-free clicking by label for apps without an a11y tree). Returns the match box; on timeout returns the last text read so you see what WAS on screen.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"text":{"type":"string"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"timeout_ms":{"type":"integer","description":"Default 15000"},"click":{"type":"boolean","description":"Click the matched text's center once found"},"scale":{"type":"integer"},"psm":{"type":"integer"},"lang":{"type":"string"}},"required":["text"]}},
+    \\{"name":"app_template_save","description":"Save a named image template for visual matching: crop a distinctive UI element (a button, sprite, dialog frame) out of an app window via region, or pass image_b64 (PNG). Stored persistently ($XDG_STATE_HOME/sketerm/templates), shared across sessions. Transparent template pixels are ignored during matching (non-rectangular sprites). Use with app_find_image/app_wait_image and the wait_image/click_image action steps.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"app":{"type":"integer"},"window":{"type":"integer"},"region":{"type":"object","description":"Crop rectangle in surface pixels (required when capturing from a window)","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["w","h"]},"image_b64":{"type":"string","description":"Inline PNG instead of capturing from a window"}},"required":["name"]}},
+    \\{"name":"app_templates","description":"List saved image templates (name + dimensions), or delete one.","inputSchema":{"type":"object","properties":{"delete":{"type":"string","description":"Template name to delete"}}}},
+    \\{"name":"app_find_image","description":"Find a saved template (or inline PNG) in an app window RIGHT NOW by pixel matching — 'is the conversation frame on screen, and where?'. Returns non-overlapping matches best-first with surface coordinates and click centers (cx,cy). min_score is 0..1 similarity (default 0.9; exact sprites score ~1.0).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"template":{"type":"string","description":"A saved template name"},"image_b64":{"type":"string","description":"Inline PNG instead of a saved template"},"region":{"type":"object","description":"Search only this sub-rectangle","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"min_score":{"type":"number"},"max_matches":{"type":"integer"}}}},
+    \\{"name":"app_wait_image","description":"Wait until a template appears in an app window (pixel matching, polled), then optionally click its center (click=true) — the coordinate-free 'wait for this sprite, then click it' primitive for apps without an accessibility tree. Returns the match position and score.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"template":{"type":"string"},"image_b64":{"type":"string"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"min_score":{"type":"number"},"timeout_ms":{"type":"integer","description":"Default 10000"},"click":{"type":"boolean"},"button":{"type":"integer"}}}},
+    \\{"name":"app_macro_save","description":"Save a named, replayable input macro. Two sources: (a) the automatic per-app input JOURNAL — every successful app_click/app_key/app_type/app_scroll/app_drag/app_mouse_move and app_actions step is recorded; last_steps:N saves the journal tail with think-time gaps preserved as waits ('record what I just did'); (b) an explicit 'actions' array (app_actions vocabulary, incl. wait_image/click_image/wait_text — robust coordinate-free macros). Persisted in $XDG_STATE_HOME/sketerm/macros, shared across sessions. Inspect the journal with app_macros journal:true.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"app":{"type":"integer","description":"Journal source app (omit with explicit actions)"},"last_steps":{"type":"integer","description":"Save only the last N journal steps"},"actions":{"type":"array","items":{"type":"object"},"description":"Explicit step list instead of the journal"}},"required":["name"]}},
+    \\{"name":"app_macro_run","description":"Replay a saved macro against an app: runs its steps through the app_actions engine (deterministic order, per-step report, stops on failure/exit; wait_image/wait_text steps make the replay state-driven rather than timing-driven). Reach a deep app state in one call, then vary the next step by hand.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"name":{"type":"string"},"window":{"type":"integer","description":"Default window for all steps"}},"required":["name"]}},
+    \\{"name":"app_macros","description":"List saved macros; show one's steps (show); delete one (delete); or view an app's recorded input journal (journal:true + app) to pick last_steps for app_macro_save.","inputSchema":{"type":"object","properties":{"delete":{"type":"string"},"show":{"type":"string"},"journal":{"type":"boolean"},"app":{"type":"integer"}}}},
     \\{"name":"close_app_window","description":"Ask the app to close one window (like the titlebar button; the app decides).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"}},"required":["window"]}},
     \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
     \\{"name":"term_open","description":"Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
@@ -1462,6 +1483,8 @@ fn needsLiveApp(name: []const u8) bool {
         "app_mouse_move",     "app_clipboard_get", "app_clipboard_set",
         "app_perform_action", "app_set_value",     "app_wait_for_element",
         "app_a11y_tree",      "app_record_start",  "close_app_window",
+        "app_read_text",      "app_wait_text",     "app_find_image",
+        "app_wait_image",     "app_macro_run",
     };
     for (live) |l| {
         if (std.mem.eql(u8, name, l)) return true;
@@ -1561,6 +1584,224 @@ fn actionsCapture(
     if (marks_n > 0) try w.print(" [{d} marker(s) drawn: red crosshair = click, cyan = move/hover, number = step]", .{marks_n});
     try w.writeAll("\n");
     return true;
+}
+
+// ── input journal, macros, template matching, OCR ─────────────────
+
+/// Per-app journal of successfully injected input steps (canonical
+/// step JSON, the app_actions vocabulary). app_macro_save snapshots
+/// its tail into a named replayable macro — "record what I just did".
+const Journal = struct {
+    const Entry = struct { step: []u8, t: i64 };
+    const MAX_ENTRIES = 400;
+    var map: std.AutoArrayHashMapUnmanaged(u32, std.ArrayList(Entry)) = .empty;
+
+    /// Best-effort: OOM just loses the entry.
+    fn record(app_id: u32, step_json: []const u8) void {
+        if (app_id == 0 or step_json.len == 0) return;
+        const a = app_state.allocator;
+        const gop = map.getOrPut(a, app_id) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        const copy = a.dupe(u8, step_json) catch return;
+        gop.value_ptr.append(a, .{ .step = copy, .t = monoMs() }) catch {
+            a.free(copy);
+            return;
+        };
+        while (gop.value_ptr.items.len > MAX_ENTRIES) {
+            const old = gop.value_ptr.orderedRemove(0);
+            a.free(old.step);
+        }
+    }
+
+    fn entriesOf(app_id: u32) []Entry {
+        const list = map.getPtr(app_id) orelse return &.{};
+        return list.items;
+    }
+
+    fn deinitAll() void {
+        const a = app_state.allocator;
+        for (map.values()) |*list| {
+            for (list.items) |e| a.free(e.step);
+            list.deinit(a);
+        }
+        map.deinit(a);
+        map = .empty;
+    }
+};
+
+/// Format-and-record one journal step for `app` (bounded; an
+/// overlong step is dropped, not truncated into invalid JSON).
+fn journalStep(app: *appdrive.App, comptime fmt: []const u8, fmt_args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, fmt, fmt_args) catch return;
+    Journal.record(appIdOf(app), s);
+}
+
+/// Journal a step whose payload needs real JSON escaping (type text).
+fn journalStepJson(app: *appdrive.App, arena: std.mem.Allocator, key: []const u8, text: []const u8) void {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    w.print("{{\"{s}\":", .{key}) catch return;
+    std.json.Stringify.value(text, .{}, w) catch return;
+    w.writeAll("}") catch return;
+    Journal.record(appIdOf(app), aw.written());
+}
+
+/// Optional {"region":{x,y,w,h}} sub-object of a tool/step arg.
+fn regionFrom(v: std.json.Value) ?appdrive.App.Region {
+    if (v != .object) return null;
+    const r = v.object.get("region") orelse return null;
+    if (r != .object) return null;
+    const x = argInt(r, "x") orelse 0;
+    const y = argInt(r, "y") orelse 0;
+    const w = argInt(r, "w") orelse return null;
+    const h = argInt(r, "h") orelse return null;
+    if (x < 0 or y < 0 or w <= 0 or h <= 0) return null;
+    return .{ .x = @intCast(x), .y = @intCast(y), .w = @intCast(w), .h = @intCast(h) };
+}
+
+const Needle = struct { px: []u8, w: u32, h: u32, name: []const u8 };
+
+/// Resolve a template reference: "template" (a saved name) or
+/// "image_b64" (inline PNG). Pixels land in the arena.
+fn resolveNeedle(arena: std.mem.Allocator, v: std.json.Value) !union(enum) { needle: Needle, err: []const u8 } {
+    if (argStr(v, "template")) |name| {
+        const bytes = mcpassets.load(arena, .template, name) catch |err| return .{ .err = switch (err) {
+            mcpassets.Error.NotFound => try std.fmt.allocPrint(arena, "no saved template \"{s}\" (save one with app_template_save; list with app_templates)", .{name}),
+            mcpassets.Error.BadName => "invalid template name (letters, digits, . _ - only, max 64)",
+            mcpassets.Error.OutOfMemory => return error.OutOfMemory,
+            else => "template load failed",
+        } };
+        const dec = png_util.decodeRgba(arena, bytes) catch
+            return .{ .err = "stored template is not a decodable image" };
+        return .{ .needle = .{ .px = dec.rgba, .w = dec.w, .h = dec.h, .name = name } };
+    }
+    if (argStr(v, "image_b64")) |b64| {
+        const decoder = std.base64.standard.Decoder;
+        const max = decoder.calcSizeForSlice(b64) catch return .{ .err = "image_b64 is not valid base64" };
+        const raw = try arena.alloc(u8, max);
+        decoder.decode(raw, b64) catch return .{ .err = "image_b64 is not valid base64" };
+        const dec = png_util.decodeRgba(arena, raw) catch
+            return .{ .err = "image_b64 does not decode as an image" };
+        return .{ .needle = .{ .px = dec.rgba, .w = dec.w, .h = dec.h, .name = "(inline)" } };
+    }
+    return .{ .err = "pass 'template' (a saved template name) or 'image_b64' (inline PNG)" };
+}
+
+/// One template hit in SURFACE coordinates (center included — the
+/// click point).
+const FoundMatch = struct { x: u32, y: u32, cx: u32, cy: u32, score: f64 };
+
+/// Match `needle` against a window's current pixels. `.err` is a
+/// human message (no pixels / bad template); an empty `.matches`
+/// slice just means "not there right now".
+fn findInWindow(
+    arena: std.mem.Allocator,
+    app: *appdrive.App,
+    win_id: u32,
+    region: ?appdrive.App.Region,
+    needle: Needle,
+    min_score: f64,
+    max_matches: usize,
+) !union(enum) { matches: []FoundMatch, err: []const u8 } {
+    const shot = app.snapshotRgba(win_id, region) catch
+        return .{ .err = "no rendered pixels in that window (yet?)" };
+    defer app_state.allocator.free(shot.px);
+    const ms = template.find(arena, shot.px, shot.w, shot.h, needle.px, needle.w, needle.h, .{
+        .min_score = min_score,
+        .max_matches = max_matches,
+    }) catch |err| switch (err) {
+        template.Error.BadTemplate => return .{ .err = "template is unusable (empty or fully transparent)" },
+        template.Error.OutOfMemory => return error.OutOfMemory,
+    };
+    const out = try arena.alloc(FoundMatch, ms.len);
+    for (ms, 0..) |m, i| {
+        out[i] = .{
+            .x = shot.ox + m.x,
+            .y = shot.oy + m.y,
+            .cx = shot.ox + m.x + needle.w / 2,
+            .cy = shot.oy + m.y + needle.h / 2,
+            .score = m.score,
+        };
+    }
+    return .{ .matches = out };
+}
+
+const OcrOut = struct { text: []u8, words: []ocr.Word, scale: u32 };
+
+/// OCR a window (optionally a region), word boxes mapped back to
+/// SURFACE coordinates. scale_req 0 = auto (upscale small captures;
+/// game bitmap fonts need it). Results live in the arena.
+fn ocrWindow(
+    arena: std.mem.Allocator,
+    app: *appdrive.App,
+    win_id: u32,
+    region: ?appdrive.App.Region,
+    scale_req: u32,
+    psm: i32,
+    lang: []const u8,
+) !union(enum) { out: OcrOut, err: []const u8 } {
+    const shot = app.snapshotRgba(win_id, region) catch
+        return .{ .err = "no rendered pixels in that window (yet?)" };
+    defer app_state.allocator.free(shot.px);
+    var scale: u32 = @min(scale_req, 8);
+    if (scale == 0) scale = std.math.clamp(4096 / @max(1, @max(shot.w, shot.h)), 1, 3);
+    var px: []const u8 = shot.px;
+    var w = shot.w;
+    var h = shot.h;
+    if (scale > 1) {
+        px = png_util.upscaleRgba(arena, shot.px, w, h, scale) catch return error.OutOfMemory;
+        w *= scale;
+        h *= scale;
+    }
+    const res = ocr.recognize(arena, px, w, h, .{ .lang = lang, .psm = psm }) catch |err| return .{ .err = switch (err) {
+        ocr.Error.Unavailable => "OCR unavailable: libtesseract was not found on this machine. Install tesseract plus a language pack (e.g. tesseract-data-eng) — sketerm loads it at runtime, no rebuild needed.",
+        ocr.Error.InitFailed => "tesseract loaded but could not initialize the language — install its traineddata (e.g. tesseract-data-eng) or set TESSDATA_PREFIX",
+        ocr.Error.OutOfMemory => return error.OutOfMemory,
+        else => "text recognition failed",
+    } };
+    for (res.words) |*wd| {
+        wd.x = shot.ox + wd.x / scale;
+        wd.y = shot.oy + wd.y / scale;
+        wd.w = @max(1, wd.w / scale);
+        wd.h = @max(1, wd.h / scale);
+    }
+    return .{ .out = .{ .text = res.text, .words = res.words, .scale = scale } };
+}
+
+/// Bounding box of a run of consecutive OCR words matching the
+/// space-separated query, case-insensitive (each query token must
+/// appear in its word). Null = no run (the query may still occur in
+/// the plain text with different word splits).
+fn findWordRun(words: []const ocr.Word, query: []const u8) ?struct { x: u32, y: u32, w: u32, h: u32 } {
+    var toks: [8][]const u8 = undefined;
+    var ntok: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, query, ' ');
+    while (it.next()) |t| {
+        if (ntok == toks.len) break;
+        toks[ntok] = t;
+        ntok += 1;
+    }
+    if (ntok == 0) return null;
+    if (words.len < ntok) return null;
+    var i: usize = 0;
+    outer: while (i + ntok <= words.len) : (i += 1) {
+        for (toks[0..ntok], 0..) |tok, j| {
+            if (std.ascii.indexOfIgnoreCase(words[i + j].text, tok) == null) continue :outer;
+        }
+        var x0 = words[i].x;
+        var y0 = words[i].y;
+        var x1 = words[i].x + words[i].w;
+        var y1 = words[i].y + words[i].h;
+        for (words[i .. i + ntok]) |wd| {
+            x0 = @min(x0, wd.x);
+            y0 = @min(y0, wd.y);
+            x1 = @max(x1, wd.x + wd.w);
+            y1 = @max(y1, wd.y + wd.h);
+        }
+        return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+    }
+    return null;
 }
 
 fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
@@ -1715,6 +1956,184 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         }
         try w.writeAll("]");
         return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+
+    if (eql(u8, name, "app_templates")) {
+        if (argStr(args, "delete")) |del| {
+            mcpassets.delete(app_state.allocator, .template, del) catch |err| return appErr(arena, switch (err) {
+                mcpassets.Error.NotFound => "no such template",
+                mcpassets.Error.BadName => "invalid template name",
+                else => "delete failed",
+            });
+            return toolResult(arena, "template deleted", false) orelse error.OutOfMemory;
+        }
+        const names = mcpassets.list(app_state.allocator, .template) catch
+            return appErr(arena, "listing templates failed");
+        defer {
+            for (names) |nm| app_state.allocator.free(nm);
+            app_state.allocator.free(names);
+        }
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("[");
+        for (names, 0..) |nm, i| {
+            if (i > 0) try w.writeAll(",");
+            var dims: []const u8 = "";
+            if (mcpassets.load(arena, .template, nm)) |bytes| {
+                if (png_util.decodeRgba(arena, bytes)) |dec| {
+                    arena.free(dec.rgba);
+                    dims = try std.fmt.allocPrint(arena, ",\"w\":{d},\"h\":{d}", .{ dec.w, dec.h });
+                } else |_| {}
+            } else |_| {}
+            try w.print("{{\"name\":{f}{s}}}", .{ std.json.fmt(nm, .{}), dims });
+        }
+        try w.writeAll("]");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_template_save")) {
+        const tname = argStr(args, "name") orelse return appErr(arena, "app_template_save requires 'name'");
+        if (!mcpassets.validName(tname))
+            return appErr(arena, "invalid template name (letters, digits, . _ - only, max 64)");
+        var png_bytes: []const u8 = undefined;
+        var dw: u32 = 0;
+        var dh: u32 = 0;
+        if (argStr(args, "image_b64")) |b64| {
+            const decoder = std.base64.standard.Decoder;
+            const max = decoder.calcSizeForSlice(b64) catch return appErr(arena, "image_b64 is not valid base64");
+            const raw = try arena.alloc(u8, max);
+            decoder.decode(raw, b64) catch return appErr(arena, "image_b64 is not valid base64");
+            const dec = png_util.decodeRgba(arena, raw) catch
+                return appErr(arena, "image_b64 does not decode as an image");
+            arena.free(dec.rgba);
+            dw = dec.w;
+            dh = dec.h;
+            png_bytes = raw;
+        } else {
+            const capp = appFromArgs(args) orelse
+                return appErr(arena, "pass 'app' (capture from its window) or 'image_b64' (inline PNG)");
+            capp.drain();
+            const region = regionFrom(args) orelse
+                return appErr(arena, "capturing needs 'region' {x,y,w,h} — crop JUST the distinctive UI element (a whole window makes a useless template)");
+            const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(capp);
+            if (wid == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+            const shot = capp.snapshotRgba(wid, region) catch
+                return appErr(arena, "no rendered pixels in that window (yet?)");
+            defer app_state.allocator.free(shot.px);
+            dw = shot.w;
+            dh = shot.h;
+            png_bytes = png_util.encodeRgba(arena, shot.px, shot.w, shot.h) catch return error.OutOfMemory;
+        }
+        mcpassets.save(app_state.allocator, .template, tname, png_bytes) catch |err| return appErr(arena, switch (err) {
+            mcpassets.Error.TooBig => "template too large (8 MB cap)",
+            else => "saving the template failed (state dir not writable?)",
+        });
+        const msg = try std.fmt.allocPrint(arena, "template \"{s}\" saved ({d}x{d}) — match it with app_find_image / app_wait_image or the wait_image / click_image action steps", .{ tname, dw, dh });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_macros")) {
+        if (argStr(args, "delete")) |del| {
+            mcpassets.delete(app_state.allocator, .macro, del) catch |err| return appErr(arena, switch (err) {
+                mcpassets.Error.NotFound => "no such macro",
+                mcpassets.Error.BadName => "invalid macro name",
+                else => "delete failed",
+            });
+            return toolResult(arena, "macro deleted", false) orelse error.OutOfMemory;
+        }
+        if (argStr(args, "show")) |nm| {
+            const bytes = mcpassets.load(arena, .macro, nm) catch |err| return appErr(arena, switch (err) {
+                mcpassets.Error.NotFound => "no such macro",
+                mcpassets.Error.BadName => "invalid macro name",
+                mcpassets.Error.OutOfMemory => return error.OutOfMemory,
+                else => "macro load failed",
+            });
+            return toolResult(arena, bytes, false) orelse error.OutOfMemory;
+        }
+        if (argBool(args, "journal")) {
+            const capp = appFromArgs(args) orelse
+                return appErr(arena, "the journal view needs 'app' (recorded steps are per app)");
+            const entries = Journal.entriesOf(appIdOf(capp));
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            const w = &aw.writer;
+            try w.print("{d} recorded input step(s), oldest first (save the tail with app_macro_save last_steps:N):\n", .{entries.len});
+            for (entries, 0..) |e, i| {
+                try w.print("{d}. {s}\n", .{ i + 1, e.step });
+            }
+            return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        }
+        const names = mcpassets.list(app_state.allocator, .macro) catch
+            return appErr(arena, "listing macros failed");
+        defer {
+            for (names) |nm| app_state.allocator.free(nm);
+            app_state.allocator.free(names);
+        }
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("[");
+        for (names, 0..) |nm, i| {
+            if (i > 0) try w.writeAll(",");
+            try w.print("{f}", .{std.json.fmt(nm, .{})});
+        }
+        try w.writeAll("]");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_macro_save")) {
+        const mname = argStr(args, "name") orelse return appErr(arena, "app_macro_save requires 'name'");
+        if (!mcpassets.validName(mname))
+            return appErr(arena, "invalid macro name (letters, digits, . _ - only, max 64)");
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("{\"actions\":[");
+        var count: usize = 0;
+        var from_journal = false;
+        if (args == .object and args.object.get("actions") != null) {
+            const av = args.object.get("actions").?;
+            if (av != .array or av.array.items.len == 0)
+                return appErr(arena, "'actions' must be a non-empty array of step objects");
+            if (av.array.items.len > 200) return appErr(arena, "too many steps (max 200)");
+            for (av.array.items, 0..) |st, i| {
+                if (st != .object) return appErr(arena, "each action step must be an object");
+                if (i > 0) try w.writeAll(",");
+                std.json.Stringify.value(st, .{}, w) catch return error.OutOfMemory;
+            }
+            count = av.array.items.len;
+        } else {
+            from_journal = true;
+            const capp = appFromArgs(args) orelse
+                return appErr(arena, "recording from the journal needs 'app' (or pass explicit 'actions')");
+            const entries = Journal.entriesOf(appIdOf(capp));
+            if (entries.len == 0)
+                return appErr(arena, "no recorded input steps for this app yet — drive it (app_click / app_key / app_actions / ...), then save");
+            var take: usize = entries.len;
+            if (argInt(args, "last_steps")) |ls| {
+                if (ls <= 0) return appErr(arena, "'last_steps' must be positive");
+                take = @min(take, @as(usize, @intCast(ls)));
+            }
+            var first = true;
+            var prev_t: i64 = 0;
+            for (entries[entries.len - take ..], 0..) |e, i| {
+                // Preserve think-time between recorded inputs as wait
+                // steps (clamped) so the replay paces like the drive.
+                if (i > 0 and e.t - prev_t >= 250) {
+                    if (!first) try w.writeAll(",");
+                    first = false;
+                    try w.print("{{\"wait\":{d}}}", .{@min(e.t - prev_t, 10_000)});
+                }
+                prev_t = e.t;
+                if (!first) try w.writeAll(",");
+                first = false;
+                try w.writeAll(e.step);
+                count += 1;
+            }
+        }
+        try w.writeAll("]}");
+        mcpassets.save(app_state.allocator, .macro, mname, aw.written()) catch |err| return appErr(arena, switch (err) {
+            mcpassets.Error.TooBig => "macro too large",
+            else => "saving the macro failed (state dir not writable?)",
+        });
+        const msg = try std.fmt.allocPrint(arena, "macro \"{s}\" saved ({d} step(s){s}) — replay with app_macro_run, inspect with app_macros show", .{
+            mname, count, if (from_journal) ", wait gaps preserved" else "",
+        });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
 
     const app = appFromArgs(args) orelse
@@ -2004,6 +2423,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             button,
         ) catch return appErr(arena, "drag failed (bad window?)");
         _ = app.waitIdle(200, 2_000);
+        journalStep(app, "{{\"drag\":[{d},{d},{d},{d}],\"button\":{d},\"window\":{d}}}", .{ x1, y1, x2, y2, button, win_id });
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_clipboard_get")) {
@@ -2037,6 +2457,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         app.click(win_id, @floatFromInt(x), @floatFromInt(y), button) catch
             return appErr(arena, "click failed (bad window?)");
         _ = app.waitIdle(200, 2_000);
+        journalStep(app, "{{\"click\":[{d},{d}],\"button\":{d},\"window\":{d}}}", .{ x, y, button, win_id });
         const want_mark = argBool(args, "mark");
         if (want_mark or argBool(args, "screenshot")) {
             // Post-click frame, optionally with the click point drawn
@@ -2067,255 +2488,400 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         if (steps.len == 0) return appErr(arena, "'actions' is empty");
         if (steps.len > 32) return appErr(arena, "too many steps (max 32)");
         const win_arg: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
-        const MAX_SHOTS = 8;
-
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        var pngs: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (pngs.items) |p| app_state.allocator.free(p);
-            pngs.deinit(arena);
-        }
-        // Per-image trace-filename tags, parallel to `pngs`.
-        var shot_tags: std.ArrayList([]const u8) = .empty;
-        defer shot_tags.deinit(arena);
-        var stopped = false;
-        // Marks accumulated by `"mark": true` steps; drawn onto (and
-        // consumed by) the next screenshot so several clicks can share
-        // one annotated image, each labelled with its step number.
-        var pending_marks: std.ArrayList(marks_mod.Mark) = .empty;
-        defer pending_marks.deinit(arena);
-        for (steps, 0..) |st, idx| {
-            const n = idx + 1;
-            if (app.exited) {
-                try w.print("step {d}: SKIPPED — app exited (status {d}{s}); remaining steps skipped\n", .{ n, app.exit_status, try exitSuffix(arena, app.exit_status) });
-                stopped = true;
-                break;
-            }
-            if (st != .object) {
-                try w.print("step {d}: ERROR — each step must be an object\n", .{n});
-                stopped = true;
-                break;
-            }
-            const win_step: ?u32 = if (argInt(st, "window")) |v| @intCast(v) else win_arg;
-            const button: u32 = @intCast(argInt(st, "button") orelse 1);
-
-            if (st.object.get("wait")) |wv| {
-                const ms: i64 = std.math.clamp(if (wv == .integer) wv.integer else 0, 0, 30_000);
-                _ = app.waitIdle(std.math.maxInt(i32), ms); // pure pumped sleep
-                try w.print("step {d}: waited {d}ms\n", .{ n, ms });
-            } else if (st.object.get("move")) |mv| {
-                const xy = numArray(mv, 2) orelse {
-                    try w.print("step {d}: ERROR — \"move\" wants [x,y]\n", .{n});
-                    stopped = true;
-                    break;
-                };
-                const pos = app.moveMouse(win_step, xy[0], xy[1]) catch {
-                    try w.print("step {d}: ERROR — move failed (bad window?)\n", .{n});
-                    stopped = true;
-                    break;
-                };
-                const marked = argBool(st, "mark");
-                if (marked) pending_marks.append(arena, .{ .x = pos.x, .y = pos.y, .kind = .move, .label = @intCast(n) }) catch {};
-                try w.print("step {d}: moved to ({d:.0},{d:.0}) window {d}{s}\n", .{ n, pos.x, pos.y, pos.win, if (marked) " [marked]" else "" });
-            } else if (st.object.get("move_rel")) |mv| {
-                const dd = numArray(mv, 2) orelse {
-                    try w.print("step {d}: ERROR — \"move_rel\" wants [dx,dy]\n", .{n});
-                    stopped = true;
-                    break;
-                };
-                const pos = app.moveMouseRel(win_step, dd[0], dd[1]) catch {
-                    try w.print("step {d}: ERROR — move_rel failed (bad window?)\n", .{n});
-                    stopped = true;
-                    break;
-                };
-                const marked = argBool(st, "mark");
-                if (marked) pending_marks.append(arena, .{ .x = pos.x, .y = pos.y, .kind = .move, .label = @intCast(n) }) catch {};
-                try w.print("step {d}: moved by ({d:.0},{d:.0}) to ({d:.0},{d:.0}) window {d}{s}\n", .{ n, dd[0], dd[1], pos.x, pos.y, pos.win, if (marked) " [marked]" else "" });
-            } else if (st.object.get("click")) |cv| {
-                const xy = numArray(cv, 2) orelse {
-                    try w.print("step {d}: ERROR — \"click\" wants [x,y]\n", .{n});
-                    stopped = true;
-                    break;
-                };
-                const wid = win_step orelse firstToplevelId(app);
-                app.click(wid, xy[0], xy[1], button) catch {
-                    try w.print("step {d}: ERROR — click failed (bad window?)\n", .{n});
-                    stopped = true;
-                    break;
-                };
-                _ = app.waitIdle(100, 1_000);
-                const marked = argBool(st, "mark");
-                if (marked) pending_marks.append(arena, .{ .x = xy[0], .y = xy[1], .kind = .click, .label = @intCast(n) }) catch {};
-                try w.print("step {d}: clicked ({d:.0},{d:.0}) button {d} window {d}{s}\n", .{ n, xy[0], xy[1], button, wid, if (marked) " [marked]" else "" });
-            } else if (st.object.get("drag")) |dv| {
-                const q = numArray(dv, 4) orelse {
-                    try w.print("step {d}: ERROR — \"drag\" wants [x1,y1,x2,y2]\n", .{n});
-                    stopped = true;
-                    break;
-                };
-                const wid = win_step orelse firstToplevelId(app);
-                app.drag(wid, q[0], q[1], q[2], q[3], button) catch {
-                    try w.print("step {d}: ERROR — drag failed (bad window?)\n", .{n});
-                    stopped = true;
-                    break;
-                };
-                _ = app.waitIdle(100, 1_000);
-                const marked = argBool(st, "mark");
-                if (marked) {
-                    // Start point unlabelled (hover color), end point
-                    // carries the step number.
-                    pending_marks.append(arena, .{ .x = q[0], .y = q[1], .kind = .move }) catch {};
-                    pending_marks.append(arena, .{ .x = q[2], .y = q[3], .kind = .click, .label = @intCast(n) }) catch {};
-                }
-                try w.print("step {d}: dragged ({d:.0},{d:.0})→({d:.0},{d:.0}) window {d}{s}\n", .{ n, q[0], q[1], q[2], q[3], wid, if (marked) " [marked]" else "" });
-            } else if (st.object.get("key")) |kv| {
-                if (kv != .string) {
-                    try w.print("step {d}: ERROR — \"key\" wants a string of chords\n", .{n});
-                    stopped = true;
-                    break;
-                }
-                var bad = false;
-                var it = std.mem.tokenizeScalar(u8, kv.string, ' ');
-                while (it.next()) |spec| {
-                    app.pressKey(win_step, spec) catch {
-                        bad = true;
-                        break;
-                    };
-                }
-                if (bad) {
-                    try w.print("step {d}: ERROR — key press failed (unknown chord / no window?)\n", .{n});
-                    stopped = true;
-                    break;
-                }
-                _ = app.waitIdle(100, 1_000);
-                try w.print("step {d}: pressed \"{s}\"\n", .{ n, kv.string });
-            } else if (st.object.get("type")) |tv| {
-                if (tv != .string) {
-                    try w.print("step {d}: ERROR — \"type\" wants a string\n", .{n});
-                    stopped = true;
-                    break;
-                }
-                app.typeText(win_step, tv.string) catch {
-                    try w.print("step {d}: ERROR — type failed (no window?)\n", .{n});
-                    stopped = true;
-                    break;
-                };
-                _ = app.waitIdle(100, 1_000);
-                try w.print("step {d}: typed {d} chars\n", .{ n, tv.string.len });
-            } else if (st.object.get("scroll")) |sv| {
-                const dd = numArray(sv, 2) orelse {
-                    try w.print("step {d}: ERROR — \"scroll\" wants [dx,dy]\n", .{n});
-                    stopped = true;
-                    break;
-                };
-                var sx: f64 = 10;
-                var sy: f64 = 10;
-                if (st.object.get("at")) |atv| {
-                    if (numArray(atv, 2)) |at| {
-                        sx = at[0];
-                        sy = at[1];
-                    }
-                } else if (app.pointerPos()) |p| {
-                    sx = p.x;
-                    sy = p.y;
-                }
-                const wid = win_step orelse firstToplevelId(app);
-                app.scroll(wid, sx, sy, dd[0], dd[1]) catch {
-                    try w.print("step {d}: ERROR — scroll failed (bad window?)\n", .{n});
-                    stopped = true;
-                    break;
-                };
-                _ = app.waitIdle(100, 1_000);
-                const marked = argBool(st, "mark");
-                if (marked) pending_marks.append(arena, .{ .x = sx, .y = sy, .kind = .move, .label = @intCast(n) }) catch {};
-                try w.print("step {d}: scrolled ({d:.0},{d:.0}) at ({d:.0},{d:.0}) window {d}{s}\n", .{ n, dd[0], dd[1], sx, sy, wid, if (marked) " [marked]" else "" });
-            } else if (st.object.get("wait_idle")) |wv| {
-                var quiet_ms: i64 = 400;
-                var timeout_ms: i64 = 10_000;
-                var change_pct: ?f64 = null;
-                if (wv == .object) {
-                    if (argInt(wv, "quiet_ms")) |q| quiet_ms = q;
-                    if (argInt(wv, "timeout_ms")) |t| timeout_ms = t;
-                    change_pct = argFloat(wv, "change_pct");
-                }
-                var settled: bool = undefined;
-                if (change_pct) |pct| {
-                    const wid = win_step orelse firstToplevelId(app);
-                    settled = if (wid == 0) false else app.waitVisualSettle(wid, quiet_ms, timeout_ms, pct);
-                } else {
-                    settled = app.waitIdle(quiet_ms, timeout_ms);
-                }
-                try w.print("step {d}: wait_idle — {s}\n", .{ n, if (settled) "settled" else "timeout (still rendering)" });
-            } else if (st.object.get("wait_change")) |wv| {
-                var timeout_ms: i64 = 10_000;
-                var min_pct: f64 = 0;
-                if (wv == .integer) {
-                    timeout_ms = wv.integer;
-                } else if (wv == .object) {
-                    if (argInt(wv, "timeout_ms")) |t| timeout_ms = t;
-                    if (argFloat(wv, "min_change_pct")) |p| min_pct = p;
-                }
-                const wid = win_step orelse firstToplevelId(app);
-                const changed = if (wid == 0) false else app.waitWindowChange(wid, timeout_ms, min_pct);
-                try w.print("step {d}: wait_change — {s}\n", .{ n, if (changed) "content changed" else "no change before timeout" });
-            } else if (st.object.get("screenshot")) |sv| {
-                const wid = win_step orelse firstToplevelId(app);
-                if (wid == 0) {
-                    try w.print("step {d}: ERROR — no rendered window to screenshot\n", .{n});
-                    stopped = true;
-                    break;
-                }
-                if (pngs.items.len >= MAX_SHOTS) {
-                    try w.print("step {d}: screenshot SKIPPED (max {d} per call)\n", .{ n, MAX_SHOTS });
-                    continue;
-                }
-                var max_px: u32 = 1568;
-                if (sv == .object) {
-                    if (argInt(sv, "max_px")) |m| max_px = @intCast(std.math.clamp(m, 0, 8192));
-                }
-                if (argBool(st, "mark") or (sv == .object and argBool(sv, "mark"))) {
-                    // Mark the current pointer position (hover check).
-                    if (app.pointerPos()) |p|
-                        pending_marks.append(arena, .{ .x = p.x, .y = p.y, .kind = .move, .label = @intCast(n) }) catch {};
-                }
-                const prefix = try std.fmt.allocPrint(arena, "step {d}", .{n});
-                if (!try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, max_px, prefix)) {
-                    stopped = true;
-                    break;
-                }
-                continue;
-            } else {
-                try w.print("step {d}: ERROR — unknown step (want move/move_rel/click/drag/key/type/scroll/wait/wait_idle/wait_change/screenshot)\n", .{n});
-                stopped = true;
-                break;
-            }
-            // Combined form: {"click":[x,y],"screenshot":true} — capture
-            // right after the action, with any pending marks drawn in.
-            // (Dedicated screenshot steps `continue`d above.)
-            if (argBool(st, "screenshot")) {
-                const wid = win_step orelse firstToplevelId(app);
-                if (pngs.items.len >= MAX_SHOTS) {
-                    try w.print("step {d}: screenshot SKIPPED (max {d} per call)\n", .{ n, MAX_SHOTS });
-                } else if (wid != 0) {
-                    const prefix = try std.fmt.allocPrint(arena, "step {d}", .{n});
-                    _ = try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, 1568, prefix);
-                }
-            }
-        }
-        // `mark` without any screenshot still yields an image: capture
-        // the final state with the leftover marks drawn in.
-        if (pending_marks.items.len > 0 and pngs.items.len < MAX_SHOTS) {
-            const wid = win_arg orelse firstToplevelId(app);
-            if (wid != 0)
-                _ = try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, 1568, "end of batch");
-        }
-        if (!stopped) try w.print("all {d} steps completed\n", .{steps.len});
-        if (app.exited) try w.writeAll(try appSummary(arena, app));
-        if (pngs.items.len > 0)
-            return imagesResultTagged(arena, aw.written(), pngs.items, shot_tags.items) orelse error.OutOfMemory;
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        return runActionSteps(arena, app, steps, win_arg, true, "");
     }
+    return appToolTail(arena, name, args, app);
+}
+
+/// Execute an ordered batch of action steps against `app` — the
+/// app_actions vocabulary, shared with macro replay (app_macro_run).
+/// `record` journals each successful step for app_macro_save; `intro`
+/// is written ahead of the per-step report.
+fn runActionSteps(
+    arena: std.mem.Allocator,
+    app: *appdrive.App,
+    steps: []const std.json.Value,
+    win_arg: ?u32,
+    record: bool,
+    intro: []const u8,
+) ![]const u8 {
+    const MAX_SHOTS = 8;
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    var pngs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (pngs.items) |p| app_state.allocator.free(p);
+        pngs.deinit(arena);
+    }
+    // Per-image trace-filename tags, parallel to `pngs`.
+    var shot_tags: std.ArrayList([]const u8) = .empty;
+    defer shot_tags.deinit(arena);
+    var stopped = false;
+    // Marks accumulated by `"mark": true` steps; drawn onto (and
+    // consumed by) the next screenshot so several clicks can share
+    // one annotated image, each labelled with its step number.
+    var pending_marks: std.ArrayList(marks_mod.Mark) = .empty;
+    defer pending_marks.deinit(arena);
+    if (intro.len > 0) try w.writeAll(intro);
+    for (steps, 0..) |st, idx| {
+        const n = idx + 1;
+        if (app.exited) {
+            try w.print("step {d}: SKIPPED — app exited (status {d}{s}); remaining steps skipped\n", .{ n, app.exit_status, try exitSuffix(arena, app.exit_status) });
+            stopped = true;
+            break;
+        }
+        if (st != .object) {
+            try w.print("step {d}: ERROR — each step must be an object\n", .{n});
+            stopped = true;
+            break;
+        }
+        const win_step: ?u32 = if (argInt(st, "window")) |v| @intCast(v) else win_arg;
+        const button: u32 = @intCast(argInt(st, "button") orelse 1);
+
+        if (st.object.get("wait")) |wv| {
+            const ms: i64 = std.math.clamp(if (wv == .integer) wv.integer else 0, 0, 30_000);
+            _ = app.waitIdle(std.math.maxInt(i32), ms); // pure pumped sleep
+            try w.print("step {d}: waited {d}ms\n", .{ n, ms });
+        } else if (st.object.get("move")) |mv| {
+            const xy = numArray(mv, 2) orelse {
+                try w.print("step {d}: ERROR — \"move\" wants [x,y]\n", .{n});
+                stopped = true;
+                break;
+            };
+            const pos = app.moveMouse(win_step, xy[0], xy[1]) catch {
+                try w.print("step {d}: ERROR — move failed (bad window?)\n", .{n});
+                stopped = true;
+                break;
+            };
+            const marked = argBool(st, "mark");
+            if (marked) pending_marks.append(arena, .{ .x = pos.x, .y = pos.y, .kind = .move, .label = @intCast(n) }) catch {};
+            try w.print("step {d}: moved to ({d:.0},{d:.0}) window {d}{s}\n", .{ n, pos.x, pos.y, pos.win, if (marked) " [marked]" else "" });
+        } else if (st.object.get("move_rel")) |mv| {
+            const dd = numArray(mv, 2) orelse {
+                try w.print("step {d}: ERROR — \"move_rel\" wants [dx,dy]\n", .{n});
+                stopped = true;
+                break;
+            };
+            const pos = app.moveMouseRel(win_step, dd[0], dd[1]) catch {
+                try w.print("step {d}: ERROR — move_rel failed (bad window?)\n", .{n});
+                stopped = true;
+                break;
+            };
+            const marked = argBool(st, "mark");
+            if (marked) pending_marks.append(arena, .{ .x = pos.x, .y = pos.y, .kind = .move, .label = @intCast(n) }) catch {};
+            try w.print("step {d}: moved by ({d:.0},{d:.0}) to ({d:.0},{d:.0}) window {d}{s}\n", .{ n, dd[0], dd[1], pos.x, pos.y, pos.win, if (marked) " [marked]" else "" });
+        } else if (st.object.get("click")) |cv| {
+            const xy = numArray(cv, 2) orelse {
+                try w.print("step {d}: ERROR — \"click\" wants [x,y]\n", .{n});
+                stopped = true;
+                break;
+            };
+            const wid = win_step orelse firstToplevelId(app);
+            app.click(wid, xy[0], xy[1], button) catch {
+                try w.print("step {d}: ERROR — click failed (bad window?)\n", .{n});
+                stopped = true;
+                break;
+            };
+            _ = app.waitIdle(100, 1_000);
+            const marked = argBool(st, "mark");
+            if (marked) pending_marks.append(arena, .{ .x = xy[0], .y = xy[1], .kind = .click, .label = @intCast(n) }) catch {};
+            try w.print("step {d}: clicked ({d:.0},{d:.0}) button {d} window {d}{s}\n", .{ n, xy[0], xy[1], button, wid, if (marked) " [marked]" else "" });
+        } else if (st.object.get("drag")) |dv| {
+            const q = numArray(dv, 4) orelse {
+                try w.print("step {d}: ERROR — \"drag\" wants [x1,y1,x2,y2]\n", .{n});
+                stopped = true;
+                break;
+            };
+            const wid = win_step orelse firstToplevelId(app);
+            app.drag(wid, q[0], q[1], q[2], q[3], button) catch {
+                try w.print("step {d}: ERROR — drag failed (bad window?)\n", .{n});
+                stopped = true;
+                break;
+            };
+            _ = app.waitIdle(100, 1_000);
+            const marked = argBool(st, "mark");
+            if (marked) {
+                // Start point unlabelled (hover color), end point
+                // carries the step number.
+                pending_marks.append(arena, .{ .x = q[0], .y = q[1], .kind = .move }) catch {};
+                pending_marks.append(arena, .{ .x = q[2], .y = q[3], .kind = .click, .label = @intCast(n) }) catch {};
+            }
+            try w.print("step {d}: dragged ({d:.0},{d:.0})→({d:.0},{d:.0}) window {d}{s}\n", .{ n, q[0], q[1], q[2], q[3], wid, if (marked) " [marked]" else "" });
+        } else if (st.object.get("key")) |kv| {
+            if (kv != .string) {
+                try w.print("step {d}: ERROR — \"key\" wants a string of chords\n", .{n});
+                stopped = true;
+                break;
+            }
+            var bad = false;
+            var it = std.mem.tokenizeScalar(u8, kv.string, ' ');
+            while (it.next()) |spec| {
+                app.pressKey(win_step, spec) catch {
+                    bad = true;
+                    break;
+                };
+            }
+            if (bad) {
+                try w.print("step {d}: ERROR — key press failed (unknown chord / no window?)\n", .{n});
+                stopped = true;
+                break;
+            }
+            _ = app.waitIdle(100, 1_000);
+            try w.print("step {d}: pressed \"{s}\"\n", .{ n, kv.string });
+        } else if (st.object.get("type")) |tv| {
+            if (tv != .string) {
+                try w.print("step {d}: ERROR — \"type\" wants a string\n", .{n});
+                stopped = true;
+                break;
+            }
+            app.typeText(win_step, tv.string) catch {
+                try w.print("step {d}: ERROR — type failed (no window?)\n", .{n});
+                stopped = true;
+                break;
+            };
+            _ = app.waitIdle(100, 1_000);
+            try w.print("step {d}: typed {d} chars\n", .{ n, tv.string.len });
+        } else if (st.object.get("scroll")) |sv| {
+            const dd = numArray(sv, 2) orelse {
+                try w.print("step {d}: ERROR — \"scroll\" wants [dx,dy]\n", .{n});
+                stopped = true;
+                break;
+            };
+            var sx: f64 = 10;
+            var sy: f64 = 10;
+            if (st.object.get("at")) |atv| {
+                if (numArray(atv, 2)) |at| {
+                    sx = at[0];
+                    sy = at[1];
+                }
+            } else if (app.pointerPos()) |p| {
+                sx = p.x;
+                sy = p.y;
+            }
+            const wid = win_step orelse firstToplevelId(app);
+            app.scroll(wid, sx, sy, dd[0], dd[1]) catch {
+                try w.print("step {d}: ERROR — scroll failed (bad window?)\n", .{n});
+                stopped = true;
+                break;
+            };
+            _ = app.waitIdle(100, 1_000);
+            const marked = argBool(st, "mark");
+            if (marked) pending_marks.append(arena, .{ .x = sx, .y = sy, .kind = .move, .label = @intCast(n) }) catch {};
+            try w.print("step {d}: scrolled ({d:.0},{d:.0}) at ({d:.0},{d:.0}) window {d}{s}\n", .{ n, dd[0], dd[1], sx, sy, wid, if (marked) " [marked]" else "" });
+        } else if (st.object.get("wait_idle")) |wv| {
+            var quiet_ms: i64 = 400;
+            var timeout_ms: i64 = 10_000;
+            var change_pct: ?f64 = null;
+            if (wv == .object) {
+                if (argInt(wv, "quiet_ms")) |q| quiet_ms = q;
+                if (argInt(wv, "timeout_ms")) |t| timeout_ms = t;
+                change_pct = argFloat(wv, "change_pct");
+            }
+            var settled: bool = undefined;
+            if (change_pct) |pct| {
+                const wid = win_step orelse firstToplevelId(app);
+                settled = if (wid == 0) false else app.waitVisualSettle(wid, quiet_ms, timeout_ms, pct);
+            } else {
+                settled = app.waitIdle(quiet_ms, timeout_ms);
+            }
+            try w.print("step {d}: wait_idle — {s}\n", .{ n, if (settled) "settled" else "timeout (still rendering)" });
+        } else if (st.object.get("wait_change")) |wv| {
+            var timeout_ms: i64 = 10_000;
+            var min_pct: f64 = 0;
+            if (wv == .integer) {
+                timeout_ms = wv.integer;
+            } else if (wv == .object) {
+                if (argInt(wv, "timeout_ms")) |t| timeout_ms = t;
+                if (argFloat(wv, "min_change_pct")) |p| min_pct = p;
+            }
+            const wid = win_step orelse firstToplevelId(app);
+            const changed = if (wid == 0) false else app.waitWindowChange(wid, timeout_ms, min_pct);
+            try w.print("step {d}: wait_change — {s}\n", .{ n, if (changed) "content changed" else "no change before timeout" });
+        } else if (st.object.get("screenshot")) |sv| {
+            const wid = win_step orelse firstToplevelId(app);
+            if (wid == 0) {
+                try w.print("step {d}: ERROR — no rendered window to screenshot\n", .{n});
+                stopped = true;
+                break;
+            }
+            if (pngs.items.len >= MAX_SHOTS) {
+                try w.print("step {d}: screenshot SKIPPED (max {d} per call)\n", .{ n, MAX_SHOTS });
+                continue;
+            }
+            var max_px: u32 = 1568;
+            if (sv == .object) {
+                if (argInt(sv, "max_px")) |m| max_px = @intCast(std.math.clamp(m, 0, 8192));
+            }
+            if (argBool(st, "mark") or (sv == .object and argBool(sv, "mark"))) {
+                // Mark the current pointer position (hover check).
+                if (app.pointerPos()) |p|
+                    pending_marks.append(arena, .{ .x = p.x, .y = p.y, .kind = .move, .label = @intCast(n) }) catch {};
+            }
+            const prefix = try std.fmt.allocPrint(arena, "step {d}", .{n});
+            if (!try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, max_px, prefix)) {
+                stopped = true;
+                break;
+            }
+            continue;
+        } else if (st.object.get("wait_image") != null or st.object.get("click_image") != null) {
+            const is_wait = st.object.get("wait_image") != null;
+            const wv = st.object.get("wait_image") orelse st.object.get("click_image").?;
+            if (wv != .object) {
+                try w.print("step {d}: ERROR — \"{s}\" wants an object with 'template' or 'image_b64'\n", .{ n, if (is_wait) "wait_image" else "click_image" });
+                stopped = true;
+                break;
+            }
+            const needle = switch (try resolveNeedle(arena, wv)) {
+                .needle => |nd| nd,
+                .err => |e| {
+                    try w.print("step {d}: ERROR — {s}\n", .{ n, e });
+                    stopped = true;
+                    break;
+                },
+            };
+            const min_score = argFloat(wv, "min_score") orelse 0.9;
+            const timeout_ms: i64 = if (is_wait) (argInt(wv, "timeout_ms") orelse 10_000) else 0;
+            // click_image clicks by definition; wait_image opts in.
+            const do_click = if (is_wait) argBool(wv, "click") else true;
+            const btn: u32 = @intCast(argInt(wv, "button") orelse 1);
+            const region = regionFrom(wv);
+            const wid = win_step orelse firstToplevelId(app);
+            const deadline = monoMs() + timeout_ms;
+            var found: ?FoundMatch = null;
+            while (true) {
+                switch (try findInWindow(arena, app, wid, region, needle, min_score, 1)) {
+                    .matches => |ms| if (ms.len > 0) {
+                        found = ms[0];
+                    },
+                    .err => {}, // window not rendered yet — keep waiting
+                }
+                if (found != null or app.exited or monoMs() >= deadline) break;
+                _ = app.pumpOnce(50);
+            }
+            const m = found orelse {
+                try w.print("step {d}: ERROR — template \"{s}\" not found{s}\n", .{ n, needle.name, if (is_wait) " before timeout" else "" });
+                stopped = true;
+                break;
+            };
+            if (do_click) {
+                app.click(wid, @floatFromInt(m.cx), @floatFromInt(m.cy), btn) catch {
+                    try w.print("step {d}: ERROR — template matched but the click failed (bad window?)\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                _ = app.waitIdle(100, 1_000);
+                if (argBool(st, "mark"))
+                    pending_marks.append(arena, .{ .x = @floatFromInt(m.cx), .y = @floatFromInt(m.cy), .kind = .click, .label = @intCast(n) }) catch {};
+            }
+            try w.print("step {d}: template \"{s}\" matched at ({d},{d}) score {d:.3}{s}\n", .{ n, needle.name, m.x, m.y, m.score, if (do_click) " — clicked its center" else "" });
+        } else if (st.object.get("wait_text")) |wv| {
+            if (wv != .object) {
+                try w.print("step {d}: ERROR — \"wait_text\" wants an object with 'text'\n", .{n});
+                stopped = true;
+                break;
+            }
+            const query = argStr(wv, "text") orelse {
+                try w.print("step {d}: ERROR — \"wait_text\" requires 'text'\n", .{n});
+                stopped = true;
+                break;
+            };
+            const timeout_ms: i64 = argInt(wv, "timeout_ms") orelse 15_000;
+            const do_click = argBool(wv, "click");
+            const region = regionFrom(wv);
+            const scale: u32 = @intCast(std.math.clamp(argInt(wv, "scale") orelse 0, 0, 8));
+            const psm: i32 = @intCast(argInt(wv, "psm") orelse 6);
+            const lang = argStr(wv, "lang") orelse "eng";
+            const wid = win_step orelse firstToplevelId(app);
+            const deadline = monoMs() + timeout_ms;
+            var seen: ?OcrOut = null;
+            var fatal: ?[]const u8 = null;
+            while (true) {
+                switch (try ocrWindow(arena, app, wid, region, scale, psm, lang)) {
+                    .out => |o| {
+                        if (std.ascii.indexOfIgnoreCase(o.text, query) != null) seen = o;
+                    },
+                    .err => |e| {
+                        // "not rendered yet" is transient; a missing
+                        // OCR engine never resolves — stop now.
+                        if (!std.mem.startsWith(u8, e, "no rendered")) fatal = e;
+                    },
+                }
+                if (seen != null or fatal != null or app.exited or monoMs() >= deadline) break;
+                _ = app.waitIdle(std.math.maxInt(i32), 300); // pumped sleep between OCR passes
+            }
+            if (fatal) |e| {
+                try w.print("step {d}: ERROR — {s}\n", .{ n, e });
+                stopped = true;
+                break;
+            }
+            const o = seen orelse {
+                try w.print("step {d}: ERROR — text \"{s}\" not visible before timeout\n", .{ n, query });
+                stopped = true;
+                break;
+            };
+            var note: []const u8 = "";
+            if (do_click) {
+                const box = findWordRun(o.words, query) orelse {
+                    try w.print("step {d}: ERROR — text \"{s}\" is visible but OCR gave no clickable word box for it\n", .{ n, query });
+                    stopped = true;
+                    break;
+                };
+                app.click(wid, @floatFromInt(box.x + box.w / 2), @floatFromInt(box.y + box.h / 2), 1) catch {
+                    try w.print("step {d}: ERROR — text found but the click failed (bad window?)\n", .{n});
+                    stopped = true;
+                    break;
+                };
+                _ = app.waitIdle(100, 1_000);
+                if (argBool(st, "mark"))
+                    pending_marks.append(arena, .{ .x = @floatFromInt(box.x + box.w / 2), .y = @floatFromInt(box.y + box.h / 2), .kind = .click, .label = @intCast(n) }) catch {};
+                note = " — clicked it";
+            }
+            try w.print("step {d}: text \"{s}\" is visible{s}\n", .{ n, query, note });
+        } else {
+            try w.print("step {d}: ERROR — unknown step (want move/move_rel/click/drag/key/type/scroll/wait/wait_idle/wait_change/screenshot/wait_image/click_image/wait_text)\n", .{n});
+            stopped = true;
+            break;
+        }
+        // Combined form: {"click":[x,y],"screenshot":true} — capture
+        // right after the action, with any pending marks drawn in.
+        // (Dedicated screenshot steps `continue`d above.)
+        if (argBool(st, "screenshot")) {
+            const wid = win_step orelse firstToplevelId(app);
+            if (pngs.items.len >= MAX_SHOTS) {
+                try w.print("step {d}: screenshot SKIPPED (max {d} per call)\n", .{ n, MAX_SHOTS });
+            } else if (wid != 0) {
+                const prefix = try std.fmt.allocPrint(arena, "step {d}", .{n});
+                _ = try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, 1568, prefix);
+            }
+        }
+        // Journal the step VERBATIM once it succeeded (pure
+        // screenshot steps `continue`d above and are not steps a
+        // macro needs to repeat).
+        if (record) {
+            var jw: std.Io.Writer.Allocating = .init(arena);
+            std.json.Stringify.value(st, .{}, &jw.writer) catch {};
+            Journal.record(appIdOf(app), jw.written());
+        }
+    }
+    // `mark` without any screenshot still yields an image: capture
+    // the final state with the leftover marks drawn in.
+    if (pending_marks.items.len > 0 and pngs.items.len < MAX_SHOTS) {
+        const wid = win_arg orelse firstToplevelId(app);
+        if (wid != 0)
+            _ = try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, 1568, "end of batch");
+    }
+    if (!stopped) try w.print("all {d} steps completed\n", .{steps.len});
+    if (app.exited) try w.writeAll(try appSummary(arena, app));
+    if (pngs.items.len > 0)
+        return imagesResultTagged(arena, aw.written(), pngs.items, shot_tags.items) orelse error.OutOfMemory;
+    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+}
+
+/// Continuation of appTool (split around the step engine so
+/// runActionSteps can live between the two halves).
+fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Value, app: *appdrive.App) ![]const u8 {
+    const eql = std.mem.eql;
     if (eql(u8, name, "app_mouse_move")) {
         const win: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
         const has_abs = argFloat(args, "x") != null and argFloat(args, "y") != null;
@@ -2334,6 +2900,11 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                 return toolResult(arena, "no pointer position tracked yet (nothing moved/clicked in this app)", false) orelse error.OutOfMemory;
         }
         if (has_abs or has_rel) _ = app.waitIdle(100, 1_000);
+        if (has_abs) {
+            journalStep(app, "{{\"move\":[{d:.0},{d:.0}]}}", .{ pos.x, pos.y });
+        } else if (has_rel) {
+            journalStep(app, "{{\"move_rel\":[{d:.0},{d:.0}]}}", .{ argFloat(args, "dx") orelse 0, argFloat(args, "dy") orelse 0 });
+        }
         const msg = try std.fmt.allocPrint(arena, "{{\"window\":{d},\"x\":{d:.0},\"y\":{d:.0}}}", .{ pos.win, pos.x, pos.y });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
@@ -2419,6 +2990,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             else => "type failed (no window?)",
         });
         _ = app.waitIdle(200, 2_000);
+        journalStepJson(app, arena, "type", text);
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_key")) {
@@ -2432,6 +3004,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             });
         }
         _ = app.waitIdle(200, 2_000);
+        journalStepJson(app, arena, "key", keys);
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_scroll")) {
@@ -2444,6 +3017,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         app.scroll(win_id, @floatFromInt(x), @floatFromInt(y), @floatFromInt(dx), @floatFromInt(dy)) catch
             return appErr(arena, "scroll failed (bad window?)");
         _ = app.waitIdle(200, 2_000);
+        journalStep(app, "{{\"scroll\":[{d},{d}],\"at\":[{d},{d}],\"window\":{d}}}", .{ dx, dy, x, y, win_id });
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_resize")) {
@@ -2529,6 +3103,183 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         if (wr != result.data.len) return appErr(arena, "short write saving the recording");
         const msg = try std.fmt.allocPrint(arena, "saved {d} frames ({d} KiB {s}) to {s}", .{ result.frames, result.data.len / 1024, ext, path });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_read_text")) {
+        const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
+        if (wid == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        const region = regionFrom(args);
+        const scale: u32 = @intCast(std.math.clamp(argInt(args, "scale") orelse 0, 0, 8));
+        const psm: i32 = @intCast(std.math.clamp(argInt(args, "psm") orelse 6, 0, 13));
+        const lang = argStr(args, "lang") orelse "eng";
+        switch (try ocrWindow(arena, app, wid, region, scale, psm, lang)) {
+            .err => |e| return appErr(arena, e),
+            .out => |o| {
+                var aw: std.Io.Writer.Allocating = .init(arena);
+                const w = &aw.writer;
+                try w.print("{{\"window\":{d},\"ocr_scale\":{d},\"text\":", .{ wid, o.scale });
+                try std.json.Stringify.value(o.text, .{}, w);
+                try w.writeAll(",\"words\":[");
+                for (o.words, 0..) |wd, i| {
+                    if (i > 0) try w.writeAll(",");
+                    try w.print("{{\"text\":{f},\"x\":{d},\"y\":{d},\"w\":{d},\"h\":{d},\"cx\":{d},\"cy\":{d},\"conf\":{d:.0}}}", .{
+                        std.json.fmt(wd.text, .{}), wd.x,            wd.y,    wd.w, wd.h,
+                        wd.x + wd.w / 2,            wd.y + wd.h / 2, wd.conf,
+                    });
+                }
+                try w.writeAll("]}");
+                return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+            },
+        }
+    }
+    if (eql(u8, name, "app_wait_text")) {
+        const query = argStr(args, "text") orelse return appErr(arena, "app_wait_text requires 'text'");
+        const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
+        if (wid == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        const region = regionFrom(args);
+        const scale: u32 = @intCast(std.math.clamp(argInt(args, "scale") orelse 0, 0, 8));
+        const psm: i32 = @intCast(std.math.clamp(argInt(args, "psm") orelse 6, 0, 13));
+        const lang = argStr(args, "lang") orelse "eng";
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 15_000;
+        const do_click = argBool(args, "click");
+        const deadline = monoMs() + timeout_ms;
+        var seen: ?OcrOut = null;
+        var last_text: []const u8 = "";
+        while (true) {
+            switch (try ocrWindow(arena, app, wid, region, scale, psm, lang)) {
+                .out => |o| {
+                    last_text = o.text;
+                    if (std.ascii.indexOfIgnoreCase(o.text, query) != null) seen = o;
+                },
+                .err => |e| {
+                    if (!std.mem.startsWith(u8, e, "no rendered")) return appErr(arena, e);
+                },
+            }
+            if (seen != null or app.exited or monoMs() >= deadline) break;
+            _ = app.waitIdle(std.math.maxInt(i32), 300); // pumped sleep between OCR passes
+        }
+        const o = seen orelse {
+            const tail = if (last_text.len > 500) last_text[last_text.len - 500 ..] else last_text;
+            const msg = try std.fmt.allocPrint(arena, "text \"{s}\" not visible before timeout; last OCR read:\n{s}", .{ query, tail });
+            return toolResult(arena, msg, true) orelse error.OutOfMemory;
+        };
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.print("{{\"found\":true,\"window\":{d}", .{wid});
+        if (findWordRun(o.words, query)) |box| {
+            try w.print(",\"match\":{{\"x\":{d},\"y\":{d},\"w\":{d},\"h\":{d},\"cx\":{d},\"cy\":{d}}}", .{
+                box.x, box.y, box.w, box.h, box.x + box.w / 2, box.y + box.h / 2,
+            });
+            if (do_click) {
+                app.click(wid, @floatFromInt(box.x + box.w / 2), @floatFromInt(box.y + box.h / 2), 1) catch
+                    return appErr(arena, "text found but the click failed (bad window?)");
+                _ = app.waitIdle(100, 1_000);
+                // Journal as a replayable wait_text step (the macro
+                // form of "wait for this label, then click it").
+                {
+                    var jw: std.Io.Writer.Allocating = .init(arena);
+                    const jwr = &jw.writer;
+                    jwr.writeAll("{\"wait_text\":{\"text\":") catch return error.OutOfMemory;
+                    std.json.Stringify.value(query, .{}, jwr) catch return error.OutOfMemory;
+                    jwr.writeAll(",\"click\":true}}") catch return error.OutOfMemory;
+                    Journal.record(appIdOf(app), jw.written());
+                }
+                try w.writeAll(",\"clicked\":true");
+            }
+        } else if (do_click) {
+            try w.writeAll(",\"match\":null,\"clicked\":false,\"note\":\"text visible but OCR gave no clickable word box\"");
+        } else {
+            try w.writeAll(",\"match\":null");
+        }
+        try w.writeAll("}");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_find_image")) {
+        const needle = switch (try resolveNeedle(arena, args)) {
+            .needle => |nd| nd,
+            .err => |e| return appErr(arena, e),
+        };
+        const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
+        if (wid == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        const min_score = argFloat(args, "min_score") orelse 0.9;
+        const max_matches: usize = @intCast(std.math.clamp(argInt(args, "max_matches") orelse 8, 1, 32));
+        switch (try findInWindow(arena, app, wid, regionFrom(args), needle, min_score, max_matches)) {
+            .err => |e| return appErr(arena, e),
+            .matches => |ms| {
+                var aw: std.Io.Writer.Allocating = .init(arena);
+                const w = &aw.writer;
+                try w.print("{{\"template\":{f},\"template_w\":{d},\"template_h\":{d},\"window\":{d},\"matches\":[", .{
+                    std.json.fmt(needle.name, .{}), needle.w, needle.h, wid,
+                });
+                for (ms, 0..) |m, i| {
+                    if (i > 0) try w.writeAll(",");
+                    try w.print("{{\"x\":{d},\"y\":{d},\"cx\":{d},\"cy\":{d},\"score\":{d:.3}}}", .{ m.x, m.y, m.cx, m.cy, m.score });
+                }
+                try w.writeAll("]}");
+                return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+            },
+        }
+    }
+    if (eql(u8, name, "app_wait_image")) {
+        const needle = switch (try resolveNeedle(arena, args)) {
+            .needle => |nd| nd,
+            .err => |e| return appErr(arena, e),
+        };
+        const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
+        if (wid == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        const region = regionFrom(args);
+        const min_score = argFloat(args, "min_score") orelse 0.9;
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 10_000;
+        const do_click = argBool(args, "click");
+        const btn: u32 = @intCast(argInt(args, "button") orelse 1);
+        const deadline = monoMs() + timeout_ms;
+        var found: ?FoundMatch = null;
+        while (true) {
+            switch (try findInWindow(arena, app, wid, region, needle, min_score, 1)) {
+                .matches => |ms| if (ms.len > 0) {
+                    found = ms[0];
+                },
+                .err => {}, // window not rendered yet — keep waiting
+            }
+            if (found != null or app.exited or monoMs() >= deadline) break;
+            _ = app.pumpOnce(50);
+        }
+        const m = found orelse {
+            const msg = try std.fmt.allocPrint(arena, "template \"{s}\" did not appear before timeout", .{needle.name});
+            return toolResult(arena, msg, true) orelse error.OutOfMemory;
+        };
+        var clicked = false;
+        if (do_click) {
+            app.click(wid, @floatFromInt(m.cx), @floatFromInt(m.cy), btn) catch
+                return appErr(arena, "template matched but the click failed (bad window?)");
+            _ = app.waitIdle(100, 1_000);
+            clicked = true;
+            // Journal as a replayable step (named templates only —
+            // an inline image has no stable reference to replay).
+            if (!std.mem.eql(u8, needle.name, "(inline)"))
+                journalStep(app, "{{\"wait_image\":{{\"template\":\"{s}\",\"click\":true,\"min_score\":{d:.2}}}}}", .{ needle.name, min_score });
+        }
+        const msg = try std.fmt.allocPrint(arena, "{{\"found\":true,\"window\":{d},\"x\":{d},\"y\":{d},\"cx\":{d},\"cy\":{d},\"score\":{d:.3},\"clicked\":{}}}", .{
+            wid, m.x, m.y, m.cx, m.cy, m.score, clicked,
+        });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "app_macro_run")) {
+        const mname = argStr(args, "name") orelse return appErr(arena, "app_macro_run requires 'name'");
+        const bytes = mcpassets.load(arena, .macro, mname) catch |err| return appErr(arena, switch (err) {
+            mcpassets.Error.NotFound => try std.fmt.allocPrint(arena, "no saved macro \"{s}\" (list with app_macros)", .{mname}),
+            mcpassets.Error.BadName => "invalid macro name",
+            mcpassets.Error.OutOfMemory => return error.OutOfMemory,
+            else => "macro load failed",
+        });
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch
+            return appErr(arena, "stored macro is not valid JSON");
+        if (parsed != .object) return appErr(arena, "stored macro is malformed (want {\"actions\":[...]})");
+        const av = parsed.object.get("actions") orelse return appErr(arena, "stored macro has no 'actions'");
+        if (av != .array or av.array.items.len == 0) return appErr(arena, "stored macro has no steps");
+        if (av.array.items.len > 200) return appErr(arena, "macro too long (max 200 steps)");
+        const win_arg: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
+        const intro = try std.fmt.allocPrint(arena, "replaying macro \"{s}\" ({d} steps)\n", .{ mname, av.array.items.len });
+        return runActionSteps(arena, app, av.array.items, win_arg, false, intro);
     }
     if (eql(u8, name, "close_app_window")) {
         const win_id: u32 = @intCast(argInt(args, "window") orelse

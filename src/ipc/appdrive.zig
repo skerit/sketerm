@@ -1582,6 +1582,47 @@ pub const App = struct {
         };
     }
 
+    pub const RgbaShot = struct {
+        /// Tightly-packed straight RGBA; caller frees.
+        px: []u8,
+        w: u32,
+        h: u32,
+        /// Surface coordinates of the top-left (crop origin).
+        ox: u32 = 0,
+        oy: u32 = 0,
+    };
+
+    /// Current committed pixels of a window as straight RGBA, with an
+    /// optional crop — the input for template matching and OCR. Does
+    /// NOT move the wait_change/diff observation baseline.
+    pub fn snapshotRgba(self: *App, win_id: u32, region: ?Region) Error!RgbaShot {
+        const win = self.winById(win_id) orelse return Error.NoSuchWindow;
+        if (win.w <= 0 or win.h <= 0 or win.pixels.items.len == 0) return Error.NoSuchWindow;
+        const a = self.allocator;
+        const uw: u32 = @intCast(win.w);
+        const uh: u32 = @intCast(win.h);
+        var rgba = png.shmToRgba(a, win.pixels.items, uw, uh, uw * 4, win.format) catch
+            return Error.OutOfMemory;
+        const r = region orelse return .{ .px = rgba, .w = uw, .h = uh };
+        if (r.x >= uw or r.y >= uh or r.w == 0 or r.h == 0) {
+            a.free(rgba);
+            return Error.NoSuchWindow;
+        }
+        const cw = @min(r.w, uw - r.x);
+        const ch = @min(r.h, uh - r.y);
+        const crop = a.alloc(u8, @as(usize, cw) * ch * 4) catch {
+            a.free(rgba);
+            return Error.OutOfMemory;
+        };
+        var y: usize = 0;
+        while (y < ch) : (y += 1) {
+            const src = ((@as(usize, r.y) + y) * uw + r.x) * 4;
+            @memcpy(crop[y * cw * 4 ..][0 .. @as(usize, cw) * 4], rgba[src..][0 .. @as(usize, cw) * 4]);
+        }
+        a.free(rgba);
+        return .{ .px = crop, .w = cw, .h = ch, .ox = r.x, .oy = r.y };
+    }
+
     /// Pump until this window has committed a frame NEWER than its
     /// last screenshot (bounded). True when new content arrived.
     /// `min_pct > 0` additionally requires that many % of pixels to
