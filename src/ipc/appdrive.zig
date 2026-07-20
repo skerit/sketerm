@@ -219,6 +219,15 @@ const Chan = struct {
     app: *App,
     id: u32,
     comp: wlcomp.Compositor,
+    /// Child surfaces are composited into their parent and must never
+    /// become independently selectable headless "windows". JBR uses
+    /// one such surface for every drop shadow.
+    subsurfaces: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
+    fn deinit(self: *Chan) void {
+        self.subsurfaces.deinit(self.app.allocator);
+        self.comp.deinit();
+    }
 };
 
 var name_counter: u32 = 0;
@@ -485,7 +494,7 @@ pub const App = struct {
         }
         self.conn.deinit();
         for (self.chans.values()) |ch| {
-            ch.comp.deinit();
+            ch.deinit();
             a.destroy(ch);
         }
         self.chans.deinit(a);
@@ -659,6 +668,8 @@ pub const App = struct {
                     .toplevel_gone = onGone,
                     .popup_new = onPopupNew,
                     .popup_gone = onGone,
+                    .subsurface_new = onSubsurfaceNew,
+                    .subsurface_gone = onSubsurfaceGone,
                     .clipboard_offer = onClipOffer,
                     .clipboard_data = onClipData,
                     .clipboard_read = onClipRead,
@@ -669,7 +680,7 @@ pub const App = struct {
                 };
                 ch.comp.lenient = true;
                 self.chans.put(self.allocator, open.id, ch) catch {
-                    ch.comp.deinit();
+                    ch.deinit();
                     self.allocator.destroy(ch);
                 };
             },
@@ -677,7 +688,7 @@ pub const App = struct {
                 const id = wire.decodeChanId(payload) orelse return;
                 if (self.chans.fetchSwapRemove(id)) |kv| {
                     self.dropChanWindows(id);
-                    kv.value.comp.deinit();
+                    kv.value.deinit();
                     self.allocator.destroy(kv.value);
                 }
             },
@@ -928,12 +939,44 @@ pub const App = struct {
         _ = ch.app.ensureWindow(ch.id, sid, true);
     }
 
+    fn onSubsurfaceNew(ctx: ?*anyopaque, sid: u32, parent: u32, x: i32, y: i32) void {
+        _ = parent;
+        _ = x;
+        _ = y;
+        const ch = chanOf(ctx);
+        ch.subsurfaces.put(ch.app.allocator, sid, {}) catch {};
+        // Defensive cleanup for a malformed/replayed stream whose
+        // frame raced the role notification.
+        onSubsurfaceGoneWindow(ch, sid);
+    }
+
+    fn onSubsurfaceGoneWindow(ch: *Chan, sid: u32) void {
+        var i: usize = 0;
+        while (i < ch.app.windows.items.len) {
+            const win = ch.app.windows.items[i];
+            if (win.chan == ch.id and win.sid == sid) {
+                _ = ch.app.windows.swapRemove(i);
+                win.deinit(ch.app.allocator);
+                ch.app.allocator.destroy(win);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn onSubsurfaceGone(ctx: ?*anyopaque, sid: u32) void {
+        const ch = chanOf(ctx);
+        _ = ch.subsurfaces.remove(sid);
+        onSubsurfaceGoneWindow(ch, sid);
+    }
+
     fn onFrame(ctx: ?*anyopaque, sid: u32, w: i32, h: i32, scale: i32, lw: i32, lh: i32, format: u32, pixels: []const u8) void {
         // Headless sessions run at scale 1 (no viewer sends
         // set_scale), so logical == physical here.
         _ = lw;
         _ = lh;
         const ch = chanOf(ctx);
+        if (ch.subsurfaces.contains(sid)) return;
         const win = ch.app.ensureWindow(ch.id, sid, false) orelse return;
         win.w = w;
         win.h = h;
