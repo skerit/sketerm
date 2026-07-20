@@ -78,6 +78,10 @@ pub const View = struct {
     /// offset; frames arrive via toplevel_frame like any surface.
     subsurface_new: ?*const fn (ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void = null,
     subsurface_pos: ?*const fn (ctx: ?*anyopaque, surface: u32, x: i32, y: i32) void = null,
+    /// Whether a subsurface is stacked below its parent. This matters
+    /// for toolkits such as JBR, which put the drop shadow in a larger,
+    /// input-transparent subsurface below the actual toplevel.
+    subsurface_below: ?*const fn (ctx: ?*anyopaque, surface: u32, below: bool) void = null,
     subsurface_gone: ?*const fn (ctx: ?*anyopaque, surface: u32) void = null,
     /// The app announced a clipboard selection with a usable text
     /// mime. Call fetchClipboard to pull the content.
@@ -327,6 +331,10 @@ const Surface = struct {
     subparent: u32 = 0,
     sub_x: i32 = 0,
     sub_y: i32 = 0,
+    /// Effective stacking relative to the parent. Other sibling-order
+    /// details are immaterial to the full-copy views, but below-parent
+    /// decorations must not become independent windows.
+    sub_below: bool = false,
     /// Popup placement (parent surface coords) from the positioner.
     parent: u32 = 0,
     px: i32 = 0,
@@ -1575,10 +1583,19 @@ pub const Compositor = struct {
                 }
                 if (self.view.subsurface_pos) |cb| cb(self.view.ctx, sid, x, y);
             },
-            // place_above / place_below / set_sync / set_desync: the
-            // full-copy view stacks subsurfaces above the parent and
-            // commits them immediately, so these are no-ops.
-            2, 3, 4, 5 => {},
+            2, 3 => { // place_above / place_below(sibling)
+                const sibling = (try it.next()).?.object;
+                const sid = self.sub_map.get(hdr.object) orelse return;
+                if (self.surfaces.getPtr(sid)) |surf| {
+                    // We only need the parent boundary. Ordering among
+                    // sibling overlays remains their creation order.
+                    surf.sub_below = hdr.opcode == 3 and sibling == surf.subparent;
+                    if (self.view.subsurface_below) |cb| cb(self.view.ctx, sid, surf.sub_below);
+                }
+            },
+            // set_sync / set_desync: pixels are copied at each commit,
+            // so synchronized commit grouping is not observable here.
+            4, 5 => {},
             else => return Error.Protocol,
         } else if (iface == &protocol.wl_region) switch (hdr.opcode) {
             0 => { // destroy
@@ -3000,7 +3017,7 @@ pub const Compositor = struct {
     // it), 0 = it referenced a displaced incarnation whose bytes are
     // not replayed (the buffer restores unresolvable, never frees a
     // stranger's pool).
-    const state_sync_version: u8 = 5;
+    const state_sync_version: u8 = 6;
 
     fn putU8(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u8) Error!void {
         try out.append(a, v);
@@ -3125,6 +3142,7 @@ pub const Compositor = struct {
             try putU32(&out, a, s.subparent);
             try putI32(&out, a, s.sub_x);
             try putI32(&out, a, s.sub_y);
+            try putU8(&out, a, @intFromBool(s.sub_below));
             try putU32(&out, a, s.parent);
             try putI32(&out, a, s.px);
             try putI32(&out, a, s.py);
@@ -3383,6 +3401,7 @@ pub const Compositor = struct {
             s.subparent = try r.u32v();
             s.sub_x = try r.i32v();
             s.sub_y = try r.i32v();
+            if (ver >= 6) s.sub_below = try r.u8v() != 0;
             s.parent = try r.u32v();
             s.px = try r.i32v();
             s.py = try r.i32v();
@@ -3583,6 +3602,7 @@ pub const Compositor = struct {
             const s = e.value_ptr;
             if (s.subparent != 0) {
                 if (self.view.subsurface_new) |cb| cb(self.view.ctx, sid, s.subparent, s.sub_x, s.sub_y);
+                if (s.sub_below) if (self.view.subsurface_below) |cb| cb(self.view.ctx, sid, true);
             } else if (s.popup != 0) {
                 if (self.view.popup_new) |cb| cb(self.view.ctx, sid, s.parent, s.px, s.py);
             }
@@ -3718,6 +3738,7 @@ const TestView = struct {
     sub_x: i32 = 0,
     sub_y: i32 = 0,
     sub_parent: u32 = 0,
+    sub_below: bool = false,
     clip_source: u32 = 0,
     clip_mime: [64]u8 = undefined,
     clip_mime_len: usize = 0,
@@ -3809,6 +3830,11 @@ const TestView = struct {
         self.sub_x = x;
         self.sub_y = y;
     }
+    fn onSubBelow(ctx: ?*anyopaque, surface: u32, below: bool) void {
+        _ = surface;
+        const self: *TestView = @ptrCast(@alignCast(ctx.?));
+        self.sub_below = below;
+    }
     fn onSubGone(ctx: ?*anyopaque, surface: u32) void {
         _ = surface;
         const self: *TestView = @ptrCast(@alignCast(ctx.?));
@@ -3890,6 +3916,7 @@ const TestView = struct {
             .popup_gone = onPopupGone,
             .subsurface_new = onSubNew,
             .subsurface_pos = onSubPos,
+            .subsurface_below = onSubBelow,
             .subsurface_gone = onSubGone,
             .clipboard_offer = onClipOffer,
             .clipboard_data = onClipData,
@@ -4037,6 +4064,20 @@ test "subsurface: get_subsurface, set_position, destroy" {
     }
     try t.expectEqual(@as(i32, 40), tv.sub_x);
     try t.expectEqual(@as(i32, 60), tv.sub_y);
+
+    { // JBR shadow pattern: child is explicitly placed below parent.
+        var b = wire.Builder.init(&buf, 7, 3);
+        b.putObject(5);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(tv.sub_below);
+
+    { // Moving it back above the parent updates the retained state.
+        var b = wire.Builder.init(&buf, 7, 2);
+        b.putObject(5);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(!tv.sub_below);
 
     { // wl_subsurface.destroy
         var b = wire.Builder.init(&buf, 7, 0);

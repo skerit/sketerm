@@ -32,6 +32,12 @@ pub const AppHost = struct {
     /// Subsurface surfaces (GTK3 tooltips / tree-view type-ahead),
     /// rendered as overlay children at a parent-relative offset.
     subsurfaces: std.AutoHashMapUnmanaged(u32, *Subsurface) = .empty,
+    /// Child roles routinely arrive before the parent's first frame
+    /// creates its GtkWindow (notably JBR's below-parent shadow). Keep
+    /// them typed while they wait; otherwise onFrame mistakes their
+    /// first buffer for a new toplevel/taskbar window.
+    pending_popups: std.AutoHashMapUnmanaged(u32, PendingOverlay) = .empty,
+    pending_subsurfaces: std.AutoHashMapUnmanaged(u32, PendingOverlay) = .empty,
     /// Channel is gone — feed() refuses, windows show stale frames
     /// until the user closes them.
     dead: bool = false,
@@ -151,6 +157,20 @@ pub const AppHost = struct {
         }
     };
 
+    const PendingOverlay = struct {
+        parent: u32,
+        x: i32,
+        y: i32,
+        below: bool = false,
+        tex: OverlayTex = .{},
+        lw: i32 = 0,
+        lh: i32 = 0,
+
+        fn deinit(self: *PendingOverlay, alloc: std.mem.Allocator) void {
+            self.tex.deinit(alloc);
+        }
+    };
+
     const Popup = struct {
         host: *AppHost,
         surface: u32,
@@ -170,6 +190,12 @@ pub const AppHost = struct {
         win: *Win,
         area: *c.GtkWidget, // GtkDrawingArea
         tex: OverlayTex = .{},
+        parent: u32,
+        x: i32 = 0,
+        y: i32 = 0,
+        below: bool = false,
+        lw: i32 = 0,
+        lh: i32 = 0,
         /// Offset inherited from the parent chain (toplevel-relative).
         /// The subsurface's own set_position is added on top.
         cox: i32 = 0,
@@ -195,6 +221,9 @@ pub const AppHost = struct {
         crop_y: i32 = 0,
         crop_w: i32 = 0,
         crop_h: i32 = 0,
+        /// Extents contributed by below-parent decoration subsurfaces
+        /// (JBR renders its 20px drop shadow this way).
+        sub_shadow: [4]i32 = .{ 0, 0, 0, 0 },
         /// Last size sent via configureToplevel (resize feedback
         /// guard: don't re-configure what the app already drew).
         sent_w: i32 = 0,
@@ -521,14 +550,16 @@ pub const AppHost = struct {
             // macOS crops the shadow out of the displayed buffer, so the
             // toplevel has no shadow margin to report.
             if (builtin.os.tag == .macos) return .{ 0, 0, 0, 0 };
-            const geo = self.host.geos.get(self.surface) orelse return .{ 0, 0, 0, 0 };
-            if (geo[2] <= 0 or geo[3] <= 0 or self.buf_w <= 0 or self.buf_h <= 0) return .{ 0, 0, 0, 0 };
-            return .{
-                @max(0, geo[0]), // left
-                @max(0, self.buf_w - geo[0] - geo[2]), // right
-                @max(0, geo[1]), // top
-                @max(0, self.buf_h - geo[1] - geo[3]), // bottom
-            };
+            var out = self.sub_shadow;
+            if (self.host.geos.get(self.surface)) |geo| {
+                if (geo[2] > 0 and geo[3] > 0 and self.buf_w > 0 and self.buf_h > 0) {
+                    out[0] += @max(0, geo[0]);
+                    out[1] += @max(0, self.buf_w - geo[0] - geo[2]);
+                    out[2] += @max(0, geo[1]);
+                    out[3] += @max(0, self.buf_h - geo[1] - geo[3]);
+                }
+            }
+            return out;
         }
 
         /// macOS: a non-opaque NSWindow only composites the region its
@@ -590,6 +621,7 @@ pub const AppHost = struct {
             .popup_gone = onPopupGone,
             .subsurface_new = onSubsurfaceNew,
             .subsurface_pos = onSubsurfacePos,
+            .subsurface_below = onSubsurfaceBelow,
             .subsurface_gone = onSubsurfaceGone,
             .cursor_shape = onCursorShape,
             .toplevel_decoration = onDecoration,
@@ -682,6 +714,12 @@ pub const AppHost = struct {
             self.allocator.destroy(s.*);
         }
         self.subsurfaces.deinit(self.allocator);
+        var ppit = self.pending_popups.valueIterator();
+        while (ppit.next()) |p| p.deinit(self.allocator);
+        self.pending_popups.deinit(self.allocator);
+        var psit = self.pending_subsurfaces.valueIterator();
+        while (psit.next()) |s| s.deinit(self.allocator);
+        self.pending_subsurfaces.deinit(self.allocator);
         var tit = self.pending_titles.valueIterator();
         while (tit.next()) |v| self.allocator.free(v.*);
         self.pending_titles.deinit(self.allocator);
@@ -867,9 +905,26 @@ pub const AppHost = struct {
         }
         if (self.subsurfaces.get(surface)) |sub| {
             sub.tex.set(self.allocator, w, h, format, pixels);
+            sub.lw = lw;
+            sub.lh = lh;
             c.gtk_drawing_area_set_content_width(@ptrCast(sub.area), lw);
             c.gtk_drawing_area_set_content_height(@ptrCast(sub.area), lh);
             c.gtk_widget_queue_draw(sub.area);
+            self.updateShadowLayout(sub.win);
+            return;
+        }
+        if (self.pending_popups.getPtr(surface)) |pending| {
+            pending.tex.set(self.allocator, w, h, format, pixels);
+            pending.lw = lw;
+            pending.lh = lh;
+            self.resolvePendingOverlays();
+            return;
+        }
+        if (self.pending_subsurfaces.getPtr(surface)) |pending| {
+            pending.tex.set(self.allocator, w, h, format, pixels);
+            pending.lw = lw;
+            pending.lh = lh;
+            self.resolvePendingOverlays();
             return;
         }
         // Displayed region in LOGICAL surface coords. Linux floating
@@ -909,6 +964,7 @@ pub const AppHost = struct {
         }
         win.buf_w = lw;
         win.buf_h = lh;
+        self.updateShadowLayout(win);
         // Geometry size changed (app self-resize or first frame): match
         // the host window to it. Same-size calls no-op in GTK.
         if (builtin.os.tag == .macos and (dw != win.crop_w or dh != win.crop_h)) {
@@ -996,122 +1052,281 @@ pub const AppHost = struct {
         cast.userData(Subsurface, user).tex.draw(cr, width, height);
     }
 
-    /// A subsurface gained its role: render it in the parent window's
-    /// overlay. Parent may be a toplevel, a popup, or another
-    /// subsurface — offsets accumulate up the chain.
-    fn onSubsurfaceNew(ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void {
-        const self = cast.userData(AppHost, ctx);
-        // x,y from the compositor is the initial (0,0); set_position
-        // follows. Capture only the inherited chain offset here.
-        var cox = x;
-        var coy = y;
-        var win: *Win = undefined;
-        if (self.windows.get(parent)) |w| {
-            win = w;
-            // Parent-relative coords are in the toplevel's window
-            // geometry; the Linux overlay is in buffer coords (shadow
-            // shown), so shift past the shadow. macOS crops to geometry,
-            // so the overlay origin already IS the geometry origin.
+    const Placement = struct { win: *Win, x: i32, y: i32 };
+
+    /// Resolve a child surface's parent to an absolute GtkOverlay
+    /// position. The extra shadow inset is the space reserved around
+    /// the main picture for below-parent decoration subsurfaces.
+    fn parentPlacement(self: *AppHost, parent: u32) ?Placement {
+        if (self.windows.get(parent)) |win| {
+            var x: i32 = if (builtin.os.tag == .macos) 0 else win.sub_shadow[0];
+            var y: i32 = if (builtin.os.tag == .macos) 0 else win.sub_shadow[2];
             if (builtin.os.tag != .macos) {
                 if (self.geos.get(parent)) |g| {
-                    cox += g[0];
-                    coy += g[1];
+                    x += g[0];
+                    y += g[1];
                 }
             }
-        } else if (self.popups.get(parent)) |pp| {
-            win = pp.win;
-            cox += c.gtk_widget_get_margin_start(pp.area);
-            coy += c.gtk_widget_get_margin_top(pp.area);
-        } else if (self.subsurfaces.get(parent)) |ps| {
-            win = ps.win;
-            cox += c.gtk_widget_get_margin_start(ps.area);
-            coy += c.gtk_widget_get_margin_top(ps.area);
-        } else return;
-
-        const sub = self.allocator.create(Subsurface) catch return;
-        const area = c.gtk_drawing_area_new();
-        c.gtk_widget_set_halign(area, c.GTK_ALIGN_START);
-        c.gtk_widget_set_valign(area, c.GTK_ALIGN_START);
-        c.gtk_widget_set_can_target(area, 0); // input-transparent
-        c.gtk_widget_set_margin_start(area, @max(0, cox));
-        c.gtk_widget_set_margin_top(area, @max(0, coy));
-        sub.* = .{ .host = self, .surface = surface, .win = win, .area = area.?, .cox = cox, .coy = coy };
-        c.gtk_drawing_area_set_draw_func(@ptrCast(area), @ptrCast(&onSubsurfaceDraw), sub, null);
-        self.subsurfaces.put(self.allocator, surface, sub) catch {
-            self.allocator.destroy(sub);
-            return;
+            return .{ .win = win, .x = x, .y = y };
+        }
+        if (self.popups.get(parent)) |popup| return .{
+            .win = popup.win,
+            .x = c.gtk_widget_get_margin_start(popup.area),
+            .y = c.gtk_widget_get_margin_top(popup.area),
         };
-        c.gtk_overlay_add_overlay(@ptrCast(win.overlay), area);
-    }
-
-    fn onSubsurfacePos(ctx: ?*anyopaque, surface: u32, x: i32, y: i32) void {
-        const self = cast.userData(AppHost, ctx);
-        const sub = self.subsurfaces.get(surface) orelse return;
-        c.gtk_widget_set_margin_start(sub.area, @max(0, sub.cox + x));
-        c.gtk_widget_set_margin_top(sub.area, @max(0, sub.coy + y));
-    }
-
-    fn onSubsurfaceGone(ctx: ?*anyopaque, surface: u32) void {
-        const self = cast.userData(AppHost, ctx);
-        const sub = self.subsurfaces.get(surface) orelse return;
-        _ = self.subsurfaces.remove(surface);
-        c.gtk_overlay_remove_overlay(@ptrCast(sub.win.overlay), sub.area);
-        sub.tex.deinit(self.allocator);
-        self.allocator.destroy(sub);
-    }
-
-    /// A popup landed: hang its picture in the parent window's
-    /// overlay at (x, y) — parent may itself be a popup (nested
-    /// menus), in which case offsets accumulate.
-    fn onPopupNew(ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void {
-        const self = cast.userData(AppHost, ctx);
-        var px = x;
-        var py = y;
-        var win: *Win = undefined;
-        if (self.windows.get(parent)) |w| {
-            win = w;
-            // Positioner coords are in the parent's window geometry; the
-            // Linux overlay is in buffer coords, so shift past the shadow.
-            // macOS crops to geometry — origin already matches.
-            if (builtin.os.tag != .macos) {
-                if (self.geos.get(parent)) |g| {
-                    px += g[0];
-                    py += g[1];
-                }
-            }
-        } else if (self.popups.get(parent)) |pp| {
-            win = pp.win;
-            px += c.gtk_widget_get_margin_start(pp.area);
-            py += c.gtk_widget_get_margin_top(pp.area);
-        } else return;
-
-        const popup = self.allocator.create(Popup) catch return;
-        const area = c.gtk_drawing_area_new();
-        c.gtk_widget_set_halign(area, c.GTK_ALIGN_START);
-        c.gtk_widget_set_valign(area, c.GTK_ALIGN_START);
-        c.gtk_widget_set_margin_start(area, @max(0, px));
-        c.gtk_widget_set_margin_top(area, @max(0, py));
-        popup.* = .{ .host = self, .surface = surface, .win = win, .area = area.? };
-        c.gtk_drawing_area_set_draw_func(@ptrCast(area), @ptrCast(&onPopupDraw), popup, null);
-        self.popups.put(self.allocator, surface, popup) catch {
-            self.allocator.destroy(popup);
-            return;
+        if (self.subsurfaces.get(parent)) |sub| return .{
+            .win = sub.win,
+            .x = c.gtk_widget_get_margin_start(sub.area),
+            .y = c.gtk_widget_get_margin_top(sub.area),
         };
-        c.gtk_overlay_add_overlay(@ptrCast(win.overlay), area);
+        return null;
+    }
 
+    fn wirePopup(self: *AppHost, popup: *Popup) void {
+        _ = self;
         const motion = c.gtk_event_controller_motion_new();
         _ = c.g_signal_connect_data(@ptrCast(motion), "enter", @ptrCast(&onPopupPtrEnter), popup, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(motion), "motion", @ptrCast(&onPopupPtrMotion), popup, null, 0);
-        c.gtk_widget_add_controller(area, motion);
+        c.gtk_widget_add_controller(popup.area, motion);
         const click = c.gtk_gesture_click_new();
         c.gtk_gesture_single_set_button(@ptrCast(click), 0);
         _ = c.g_signal_connect_data(@ptrCast(click), "pressed", @ptrCast(&onPopupBtnPress), popup, null, 0);
         _ = c.g_signal_connect_data(@ptrCast(click), "released", @ptrCast(&onPopupBtnRelease), popup, null, 0);
-        c.gtk_widget_add_controller(area, @ptrCast(click));
+        c.gtk_widget_add_controller(popup.area, @ptrCast(click));
+    }
+
+    /// Reserve space around the main picture for decoration
+    /// subsurfaces stacked below their direct parent. GtkOverlay does
+    /// not measure overlay children, so without these margins JBR's
+    /// larger shadow buffer would be clipped to the content bounds.
+    fn updateShadowLayout(self: *AppHost, win: *Win) void {
+        if (builtin.os.tag == .macos) return;
+        const old = win.sub_shadow;
+        var next = [4]i32{ 0, 0, 0, 0 };
+        if (!win.embedded and win.buf_w > 0 and win.buf_h > 0) {
+            var it = self.subsurfaces.valueIterator();
+            while (it.next()) |sp| {
+                const sub = sp.*;
+                if (sub.win != win or sub.parent != win.surface or !sub.below or sub.lw <= 0 or sub.lh <= 0) continue;
+                next[0] = @max(next[0], @max(0, -sub.x));
+                next[1] = @max(next[1], @max(0, sub.x + sub.lw - win.buf_w));
+                next[2] = @max(next[2], @max(0, -sub.y));
+                next[3] = @max(next[3], @max(0, sub.y + sub.lh - win.buf_h));
+            }
+        }
+        const changed = !std.mem.eql(i32, &old, &next);
+        win.sub_shadow = next;
+
+        if (changed) {
+            c.gtk_widget_set_margin_start(win.picture, next[0]);
+            c.gtk_widget_set_margin_end(win.picture, next[1]);
+            c.gtk_widget_set_margin_top(win.picture, next[2]);
+            c.gtk_widget_set_margin_bottom(win.picture, next[3]);
+        }
+
+        // Existing popup coordinates are absolute in the overlay. A
+        // newly discovered left/top shadow inset moves the content
+        // origin, so move them by the same delta.
+        const dx = next[0] - old[0];
+        const dy = next[2] - old[2];
+        var pit = self.popups.valueIterator();
+        while (pit.next()) |pp| {
+            const popup = pp.*;
+            if (popup.win != win) continue;
+            c.gtk_widget_set_margin_start(popup.area, @max(0, c.gtk_widget_get_margin_start(popup.area) + dx));
+            c.gtk_widget_set_margin_top(popup.area, @max(0, c.gtk_widget_get_margin_top(popup.area) + dy));
+        }
+        // Re-resolve all subsurfaces from their retained parent and
+        // local position. This also handles nested child chains.
+        var sit = self.subsurfaces.valueIterator();
+        while (sit.next()) |sp| {
+            const sub = sp.*;
+            if (sub.win != win) continue;
+            const visible = !(win.embedded and sub.parent == win.surface and sub.below);
+            c.gtk_widget_set_visible(sub.area, @intFromBool(visible));
+            const base = self.parentPlacement(sub.parent) orelse continue;
+            sub.cox = base.x;
+            sub.coy = base.y;
+            c.gtk_widget_set_margin_start(sub.area, @max(0, base.x + sub.x));
+            c.gtk_widget_set_margin_top(sub.area, @max(0, base.y + sub.y));
+        }
+        if (changed and !win.embedded and win.buf_w > 0 and win.buf_h > 0) {
+            c.gtk_window_set_default_size(win.window, win.buf_w + next[0] + next[1], win.buf_h + next[2] + next[3]);
+        }
+        if (changed) c.gtk_widget_queue_resize(win.overlay);
+    }
+
+    fn materializePopup(self: *AppHost, surface: u32) bool {
+        const p = self.pending_popups.get(surface) orelse return false;
+        const base = self.parentPlacement(p.parent) orelse return false;
+        const popup = self.allocator.create(Popup) catch return false;
+        const area = c.gtk_drawing_area_new() orelse {
+            self.allocator.destroy(popup);
+            return false;
+        };
+        const removed = self.pending_popups.fetchRemove(surface).?;
+        popup.* = .{ .host = self, .surface = surface, .win = base.win, .area = area, .tex = removed.value.tex };
+        c.gtk_widget_set_halign(area, c.GTK_ALIGN_START);
+        c.gtk_widget_set_valign(area, c.GTK_ALIGN_START);
+        c.gtk_widget_set_margin_start(area, @max(0, base.x + removed.value.x));
+        c.gtk_widget_set_margin_top(area, @max(0, base.y + removed.value.y));
+        if (removed.value.lw > 0) c.gtk_drawing_area_set_content_width(@ptrCast(area), removed.value.lw);
+        if (removed.value.lh > 0) c.gtk_drawing_area_set_content_height(@ptrCast(area), removed.value.lh);
+        c.gtk_drawing_area_set_draw_func(@ptrCast(area), @ptrCast(&onPopupDraw), popup, null);
+        self.popups.put(self.allocator, surface, popup) catch {
+            popup.tex.deinit(self.allocator);
+            self.allocator.destroy(popup);
+            return false;
+        };
+        c.gtk_overlay_add_overlay(@ptrCast(base.win.overlay), area);
+        self.wirePopup(popup);
+        if (popup.tex.pixels.len > 0) c.gtk_widget_queue_draw(area);
+        return true;
+    }
+
+    fn materializeSubsurface(self: *AppHost, surface: u32) bool {
+        const p = self.pending_subsurfaces.get(surface) orelse return false;
+        const base = self.parentPlacement(p.parent) orelse return false;
+        const sub = self.allocator.create(Subsurface) catch return false;
+        const area = c.gtk_drawing_area_new() orelse {
+            self.allocator.destroy(sub);
+            return false;
+        };
+        const removed = self.pending_subsurfaces.fetchRemove(surface).?;
+        sub.* = .{
+            .host = self,
+            .surface = surface,
+            .win = base.win,
+            .area = area,
+            .tex = removed.value.tex,
+            .parent = removed.value.parent,
+            .x = removed.value.x,
+            .y = removed.value.y,
+            .below = removed.value.below,
+            .lw = removed.value.lw,
+            .lh = removed.value.lh,
+        };
+        c.gtk_widget_set_halign(area, c.GTK_ALIGN_START);
+        c.gtk_widget_set_valign(area, c.GTK_ALIGN_START);
+        c.gtk_widget_set_can_target(area, 0);
+        c.gtk_drawing_area_set_draw_func(@ptrCast(area), @ptrCast(&onSubsurfaceDraw), sub, null);
+        self.subsurfaces.put(self.allocator, surface, sub) catch {
+            sub.tex.deinit(self.allocator);
+            self.allocator.destroy(sub);
+            return false;
+        };
+        c.gtk_overlay_add_overlay(@ptrCast(base.win.overlay), area);
+        if (sub.lw > 0) c.gtk_drawing_area_set_content_width(@ptrCast(area), sub.lw);
+        if (sub.lh > 0) c.gtk_drawing_area_set_content_height(@ptrCast(area), sub.lh);
+        sub.cox = base.x;
+        sub.coy = base.y;
+        c.gtk_widget_set_margin_start(area, @max(0, base.x + sub.x));
+        c.gtk_widget_set_margin_top(area, @max(0, base.y + sub.y));
+        if (sub.tex.pixels.len > 0) c.gtk_widget_queue_draw(area);
+        self.updateShadowLayout(base.win);
+        return true;
+    }
+
+    /// Resolve child roles after any parent materializes. Repeat to
+    /// cover nested popup/subsurface chains in one replay batch.
+    fn resolvePendingOverlays(self: *AppHost) void {
+        while (true) {
+            var progressed = false;
+            var pit = self.pending_popups.keyIterator();
+            while (pit.next()) |sid| {
+                const id = sid.*;
+                if (self.materializePopup(id)) {
+                    progressed = true;
+                    break;
+                }
+            }
+            if (progressed) continue;
+            var sit = self.pending_subsurfaces.keyIterator();
+            while (sit.next()) |sid| {
+                const id = sid.*;
+                if (self.materializeSubsurface(id)) {
+                    progressed = true;
+                    break;
+                }
+            }
+            if (!progressed) break;
+        }
+    }
+
+    fn onSubsurfaceNew(ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void {
+        const self = cast.userData(AppHost, ctx);
+        const entry = self.pending_subsurfaces.getOrPut(self.allocator, surface) catch return;
+        if (!entry.found_existing) entry.value_ptr.* = .{ .parent = parent, .x = x, .y = y } else {
+            entry.value_ptr.parent = parent;
+            entry.value_ptr.x = x;
+            entry.value_ptr.y = y;
+        }
+        self.resolvePendingOverlays();
+    }
+
+    fn onSubsurfacePos(ctx: ?*anyopaque, surface: u32, x: i32, y: i32) void {
+        const self = cast.userData(AppHost, ctx);
+        if (self.pending_subsurfaces.getPtr(surface)) |pending| {
+            pending.x = x;
+            pending.y = y;
+            return;
+        }
+        const sub = self.subsurfaces.get(surface) orelse return;
+        sub.x = x;
+        sub.y = y;
+        self.updateShadowLayout(sub.win);
+        const base = self.parentPlacement(sub.parent) orelse return;
+        sub.cox = base.x;
+        sub.coy = base.y;
+        c.gtk_widget_set_margin_start(sub.area, @max(0, base.x + x));
+        c.gtk_widget_set_margin_top(sub.area, @max(0, base.y + y));
+    }
+
+    fn onSubsurfaceBelow(ctx: ?*anyopaque, surface: u32, below: bool) void {
+        const self = cast.userData(AppHost, ctx);
+        if (self.pending_subsurfaces.getPtr(surface)) |pending| {
+            pending.below = below;
+            return;
+        }
+        const sub = self.subsurfaces.get(surface) orelse return;
+        sub.below = below;
+        self.updateShadowLayout(sub.win);
+    }
+
+    fn onSubsurfaceGone(ctx: ?*anyopaque, surface: u32) void {
+        const self = cast.userData(AppHost, ctx);
+        if (self.pending_subsurfaces.fetchRemove(surface)) |kv| {
+            var pending = kv.value;
+            pending.deinit(self.allocator);
+            return;
+        }
+        const sub = self.subsurfaces.get(surface) orelse return;
+        _ = self.subsurfaces.remove(surface);
+        const win = sub.win;
+        c.gtk_overlay_remove_overlay(@ptrCast(win.overlay), sub.area);
+        sub.tex.deinit(self.allocator);
+        self.allocator.destroy(sub);
+        self.updateShadowLayout(win);
+    }
+
+    fn onPopupNew(ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void {
+        const self = cast.userData(AppHost, ctx);
+        const entry = self.pending_popups.getOrPut(self.allocator, surface) catch return;
+        if (!entry.found_existing) entry.value_ptr.* = .{ .parent = parent, .x = x, .y = y } else {
+            entry.value_ptr.parent = parent;
+            entry.value_ptr.x = x;
+            entry.value_ptr.y = y;
+        }
+        self.resolvePendingOverlays();
     }
 
     fn onPopupGone(ctx: ?*anyopaque, surface: u32) void {
         const self = cast.userData(AppHost, ctx);
+        if (self.pending_popups.fetchRemove(surface)) |kv| {
+            var pending = kv.value;
+            pending.deinit(self.allocator);
+            return;
+        }
         const popup = self.popups.get(surface) orelse return;
         _ = self.popups.remove(surface);
         c.gtk_overlay_remove_overlay(@ptrCast(popup.win.overlay), popup.area);
@@ -1343,8 +1558,9 @@ pub const AppHost = struct {
             self.embedWin(win);
         } else {
             self.wireFloating(win);
-            c.gtk_window_present(window);
         }
+        self.resolvePendingOverlays();
+        if (!win.embedded) c.gtk_window_present(window);
         if (self.on_windows_changed) |f| f(self.embed_ctx, self.windows.count());
         return win;
     }
@@ -1402,6 +1618,7 @@ pub const AppHost = struct {
         c.gtk_widget_set_vexpand(win.overlay, 1);
         win.embedded = true;
         self.embed_surface = win.surface;
+        self.updateShadowLayout(win);
         self.wireEmbedded(win);
         // Reset the size-echo guard: the pane's size is authoritative
         // now, whatever the floating window last asked for.
@@ -1451,8 +1668,11 @@ pub const AppHost = struct {
         // Size the floating window to the full committed buffer (the
         // Linux floating path shows buffer + CSD shadow and reports
         // the shadow width to the WM).
-        if (win.buf_w > 0 and win.buf_h > 0)
-            c.gtk_window_set_default_size(win.window, win.buf_w, win.buf_h);
+        self.updateShadowLayout(win);
+        if (win.buf_w > 0 and win.buf_h > 0) {
+            const m = win.sub_shadow;
+            c.gtk_window_set_default_size(win.window, win.buf_w + m[0] + m[1], win.buf_h + m[2] + m[3]);
+        }
         c.gtk_window_present(win.window);
         if (self.on_embed) |f| f(self.embed_ctx, false);
     }
@@ -1491,6 +1711,7 @@ pub const AppHost = struct {
             c.g_object_unref(@ptrCast(win.overlay));
         }
         win.embedded = false;
+        self.updateShadowLayout(win);
         // Display switches from the geometry crop back to the full
         // buffer next frame; keep mapXY consistent meanwhile.
         win.crop_x = 0;
@@ -1760,14 +1981,14 @@ pub const AppHost = struct {
 
     /// cursor-shape-v1 enum → CSS cursor names (GDK speaks CSS).
     const cursor_names = [_][:0]const u8{
-        "default",     "context-menu", "help",        "pointer",
-        "progress",    "wait",         "cell",        "crosshair",
-        "text",        "vertical-text", "alias",      "copy",
-        "move",        "no-drop",      "not-allowed", "grab",
-        "grabbing",    "e-resize",     "n-resize",    "ne-resize",
-        "nw-resize",   "s-resize",     "se-resize",   "sw-resize",
-        "w-resize",    "ew-resize",    "ns-resize",   "nesw-resize",
-        "nwse-resize", "col-resize",   "row-resize",  "all-scroll",
+        "default",     "context-menu",  "help",        "pointer",
+        "progress",    "wait",          "cell",        "crosshair",
+        "text",        "vertical-text", "alias",       "copy",
+        "move",        "no-drop",       "not-allowed", "grab",
+        "grabbing",    "e-resize",      "n-resize",    "ne-resize",
+        "nw-resize",   "s-resize",      "se-resize",   "sw-resize",
+        "w-resize",    "ew-resize",     "ns-resize",   "nesw-resize",
+        "nwse-resize", "col-resize",    "row-resize",  "all-scroll",
         "zoom-in",     "zoom-out",
     };
 
@@ -1828,7 +2049,10 @@ pub const AppHost = struct {
         self.geos.put(self.allocator, surface, .{ x, y, gw, gh }) catch {};
         // Shadow margins changed → recompute the toplevel size so the
         // WM picks up the new geometry (compute-size re-fires).
-        if (self.windows.get(surface)) |win| c.gtk_widget_queue_resize(@ptrCast(win.window));
+        if (self.windows.get(surface)) |win| {
+            self.updateShadowLayout(win);
+            c.gtk_widget_queue_resize(@ptrCast(win.window));
+        }
     }
 
     /// GdkSurface exists now: report the CSD shadow as the toplevel's
@@ -2025,22 +2249,17 @@ pub const AppHost = struct {
     /// its new parent-relative spot (offset math mirrors onPopupNew).
     fn onPopupMoved(ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void {
         const self = cast.userData(AppHost, ctx);
-        const popup = self.popups.get(surface) orelse return;
-        var px = x;
-        var py = y;
-        if (self.windows.get(parent) != null) {
-            if (builtin.os.tag != .macos) {
-                if (self.geos.get(parent)) |g| {
-                    px += g[0];
-                    py += g[1];
-                }
-            }
-        } else if (self.popups.get(parent)) |pp| {
-            px += c.gtk_widget_get_margin_start(pp.area);
-            py += c.gtk_widget_get_margin_top(pp.area);
+        if (self.pending_popups.getPtr(surface)) |pending| {
+            pending.parent = parent;
+            pending.x = x;
+            pending.y = y;
+            self.resolvePendingOverlays();
+            return;
         }
-        c.gtk_widget_set_margin_start(popup.area, @max(0, px));
-        c.gtk_widget_set_margin_top(popup.area, @max(0, py));
+        const popup = self.popups.get(surface) orelse return;
+        const base = self.parentPlacement(parent) orelse return;
+        c.gtk_widget_set_margin_start(popup.area, @max(0, base.x + x));
+        c.gtk_widget_set_margin_top(popup.area, @max(0, base.y + y));
     }
 
     /// Pointer lock: hide the host cursor over the app while locked
