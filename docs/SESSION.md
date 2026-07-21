@@ -7969,3 +7969,70 @@ weston-terminal through a real `sketerm mcp` instance: OCR reads
 typed text back, a cropped template matches at its exact origin, the
 journal round-trips through save/show/run, and the no-tesseract path
 returns the documented error.
+
+## 2026-07-22 — Remote-ops suite + CDP browser automation (feedback round 8)
+
+A field report from an assistant provisioning a VPS through sketerm
+MCP (persistent SSH shell, scp uploads inferred via term_list, a
+hand-rolled `ssh -N -L` tunnel, Chromium driven blind by coordinates)
+listed 14 improvements. All landed, in two families.
+
+Remote ops. `term_open host:` opens a persistent SSH session
+(ssh -tt + ServerAlive keepalives). `term_exec` runs one command in a
+LIVE interactive shell and returns structured `{completed,
+exit_status, output, timed_out}` via echo-safe sentinel markers —
+default mode ships the script base64→`sh` (dialect-independent: works
+typed into fish/zsh/bash, local or over SSH; the command runs in a
+`sh -c` child so `exit` can't eat the end marker; an interactive
+`set -e` can't kill the session — the exact incident from the
+report), `subshell:false` types a POSIX construction directly so
+cd/export persist. `term_exec_wait` continues a timed-out exec;
+`term_wait_exit` waits for real process exit (distinct from output
+idleness); term_list drains and reports last_line + pending trackers,
+and term_read on an exited terminal carries an explicit exit banner
+(no more stale "1%" scp frames). `upload_file`/`download_file` do
+scp → SHA-256 verify → atomic mv (corrupt transfers discarded; local
+mode without a host). `port_forward_open` is a structured resource:
+auto-picked free local port, TCP-connect readiness proof,
+`port_forward_check` respawns a dead ssh on the same port
+(reconnects counted), list/close. `capabilities` preflights
+OCR/browser/ssh/mode before a workflow starts; `new_tab` falls back
+to opening a headless terminal when no GUI socket exists.
+`app_actions` wait steps accept `required:true` (timeout fails the
+batch); launch_app auto-injects `--ozone-platform=wayland` for
+Chromium-family argv and exports ELECTRON_OZONE_PLATFORM_HINT.
+
+Browser automation. `src/ipc/cdp.zig` is a hand-rolled CDP client:
+libc TCP + RFC 6455 client WebSocket + JSON calls, every operation
+deadline-bounded per the no-hang invariant (gotcha: Chromium's
+DevTools HTTP server ignores `Connection: close` — Content-Length
+must terminate the read). `browser_open` launches Chromium headless
+under the Wayland session with `--remote-debugging-port=0`, discovers
+the real port from the app log ring, attaches the newest page target,
+and registers a per-app session; navigation that replaces the target
+reattaches transparently. Tools: browser_info (url/title/ready/
+scroll), browser_navigate (url/back/forward/reload + load wait),
+browser_read (innerText/outerHTML/links, selector-scoped),
+browser_elements (visible interactive elements with viewport-CSS
+click centers), browser_click (selector/text lookup → scrollIntoView
+→ TRUSTED Input.dispatchMouseEvent), browser_fill (select-all +
+Input.insertText; <select> option matching; password readback is
+count-only), browser_wait (selector/text/url_contains/gone — timeout
+is an ERROR, never silent success), browser_scroll (top/bottom/
+selector/y/dy — deterministic), browser_eval. Screenshot captions of
+browser apps append the live page url+title (`browserPageSuffix`).
+`--force-renderer-accessibility` is always passed so app_a11y_tree
+sees web content where AT-SPI works.
+
+Verified: 764 unit tests (sentinel builder/parser incl. quoting and
+truncation, WS framing round-trip, DevTools port parse,
+Content-Length, chromiumFamily, findHex64, free-port pick, local
+atomic copy); smoke-mcp extended (capabilities, new_tab fallback,
+term_exec transport + set -e survival + state persistence,
+term_wait_exit real status 7, exit banner, local upload); live runs
+against a real fish login shell over SSH to localhost (exec edge
+cases: exit 42, quoting, timeout→wait continuation), byte-identical
+100KB upload+download round-trip with checksum verify, forward
+kill→check→reconnect on the same port, and a full Chromium session
+(fill, select, trusted click mutating the DOM, wait condition,
+scroll, link navigation crossing pages, history back, eval).
