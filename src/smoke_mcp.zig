@@ -330,6 +330,85 @@ pub fn main() u8 {
             std.mem.indexOf(u8, after_busy, "\\\"state\\\":\\\"completed") == null)
             fail("command mode did not recover once the busy command finished");
 
+        // ── capabilities preflight ────────────────────────────────
+        const caps = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, caps, "\\\"mode\\\":\\\"isolated\\\"") == null or
+            std.mem.indexOf(u8, caps, "\\\"headless_terminals\\\":true") == null or
+            std.mem.indexOf(u8, caps, "\\\"ocr\\\":") == null)
+            fail("capabilities report incomplete");
+
+        // ── new_tab falls back to a headless terminal (no GUI) ────
+        const nt = m.callTool("new_tab", "{}");
+        if (std.mem.indexOf(u8, nt, "\\\"headless\\\":true") == null or
+            std.mem.indexOf(u8, nt, "\\\"term\\\":") == null)
+            fail("new_tab did not fall back to a headless terminal");
+
+        // ── term_exec: sentinel-based structured exec ─────────────
+        const ex1 = m.callTool("term_exec", "{\"term\":3,\"command\":\"echo EXEC-STRUCT; false\"}");
+        if (std.mem.indexOf(u8, ex1, "\\\"completed\\\":true") == null or
+            std.mem.indexOf(u8, ex1, "\\\"exit_status\\\":1") == null or
+            std.mem.indexOf(u8, ex1, "EXEC-STRUCT") == null)
+            fail("term_exec did not return structured output + status");
+        // Works without shell integration too (plain /bin/sh, term 2).
+        const ex2 = m.callTool("term_exec", "{\"term\":2,\"command\":\"echo SH-EXEC-OK\"}");
+        if (std.mem.indexOf(u8, ex2, "\\\"completed\\\":true") == null or
+            std.mem.indexOf(u8, ex2, "\\\"exit_status\\\":0") == null or
+            std.mem.indexOf(u8, ex2, "SH-EXEC-OK") == null)
+            fail("term_exec failed on an integration-less shell");
+        // subshell=true keeps state out of the session.
+        _ = m.callTool("term_exec", "{\"term\":3,\"command\":\"SMOKE_LEAK=xyz\",\"subshell\":true}");
+        const leak = m.callTool("term_exec", "{\"term\":3,\"command\":\"echo LEAK=[$SMOKE_LEAK]\"}");
+        if (std.mem.indexOf(u8, leak, "LEAK=[]") == null or std.mem.indexOf(u8, leak, "LEAK=[xyz]") != null)
+            fail("subshell exec leaked state into the session");
+        // set -e in the session must not kill it when a command fails
+        // (the feedback scenario: a probe curl closed the whole SSH
+        // connection).
+        _ = m.callTool("term_exec", "{\"term\":3,\"command\":\"set -e\",\"subshell\":false}");
+        const under_e = m.callTool("term_exec", "{\"term\":3,\"command\":\"false\",\"subshell\":false}");
+        if (std.mem.indexOf(u8, under_e, "\\\"completed\\\":true") == null or
+            std.mem.indexOf(u8, under_e, "\\\"exit_status\\\":1") == null)
+            fail("failing command under set -e did not report status 1");
+        const survived = m.callTool("term_exec", "{\"term\":3,\"command\":\"echo STILL-ALIVE\",\"subshell\":false}");
+        if (std.mem.indexOf(u8, survived, "STILL-ALIVE") == null)
+            fail("shell died from a failing command under set -e");
+        // Persistent-mode state (cwd) is visible to later isolated
+        // execs (the sh child inherits the session's cwd).
+        _ = m.callTool("term_exec", "{\"term\":3,\"command\":\"cd /tmp\",\"subshell\":false}");
+        const cwd = m.callTool("term_exec", "{\"term\":3,\"command\":\"pwd\"}");
+        if (std.mem.indexOf(u8, cwd, "/tmp") == null)
+            fail("persistent-mode cd did not stick in the session");
+
+        // ── term_wait_exit: real process exit, not output idle ────
+        const t4 = m.callTool("term_open", "{\"command\":[\"sh\",\"-c\",\"sleep 0.3; exit 7\"]}");
+        if (std.mem.indexOf(u8, t4, "opened headless terminal") == null) fail("short-lived term_open failed");
+        const wexit = m.callTool("term_wait_exit", "{\"term\":5,\"timeout_ms\":5000}");
+        if (std.mem.indexOf(u8, wexit, "\\\"exited\\\":true") == null or
+            std.mem.indexOf(u8, wexit, "\\\"exit_status\\\":7") == null)
+            fail("term_wait_exit missed the real exit status");
+        const listing = m.callTool("term_list", "{}");
+        if (std.mem.indexOf(u8, listing, "\\\"exit_status\\\":7") == null)
+            fail("term_list does not show the exit status");
+        const post_read = m.callTool("term_read", "{\"term\":5}");
+        if (std.mem.indexOf(u8, post_read, "process exited with status 7") == null)
+            fail("term_read on an exited terminal lacks the exit banner");
+
+        // ── upload_file (local): checksum + atomic rename ─────────
+        var src_buf: [512]u8 = undefined;
+        var dst_buf: [512]u8 = undefined;
+        const xsrc = std.fmt.bufPrintZ(&src_buf, "{s}/xfer-src.bin", .{rt}) catch unreachable;
+        const xdst = std.fmt.bufPrint(&dst_buf, "{s}/xfer-dst.bin", .{rt}) catch unreachable;
+        const xf = c.fopen(xsrc.ptr, "wb") orelse fail("cannot create transfer source");
+        _ = c.fwrite("transfer-payload", 1, 16, xf);
+        _ = c.fclose(xf);
+        var xargs_buf: [1200]u8 = undefined;
+        const xargs = std.fmt.bufPrint(&xargs_buf, "{{\"local_path\":\"{s}\",\"remote_path\":\"{s}\"}}", .{ xsrc, xdst }) catch unreachable;
+        const up = m.callTool("upload_file", xargs);
+        if (std.mem.indexOf(u8, up, "\\\"ok\\\":true") == null or
+            std.mem.indexOf(u8, up, "\\\"verified\\\":true") == null or
+            std.mem.indexOf(u8, up, "\\\"atomic\\\":true") == null)
+            fail("local upload_file did not verify");
+        if (!fileExists(xdst)) fail("upload_file destination missing");
+
         // Ephemeral teardown on stdin close removes the private dir.
         var dir_buf: [512]u8 = undefined;
         const dir = std.fmt.bufPrint(&dir_buf, "{s}/sketerm/mcp-tmp-{d}", .{ rt, m.pid }) catch unreachable;
