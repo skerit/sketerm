@@ -42,6 +42,178 @@ pub const CommandToken = struct {
     completion_seq: u64,
 };
 
+/// Result of a sentinel-based exec (term_exec): structured completion
+/// for commands run inside an EXISTING interactive shell, including
+/// remote SSH sessions where OSC 133 integration cannot reach.
+pub const ExecOutcome = struct {
+    completed: bool,
+    exit_status: ?i32 = null,
+    timed_out: bool = false,
+    /// Output between the sentinel markers (rendered lines; wrapped at
+    /// the terminal width). Allocator-owned by the caller.
+    output: []u8 = &.{},
+    /// The begin marker scrolled out of the mirror's scrollback: the
+    /// output is a TAIL, not the whole thing.
+    truncated: bool = false,
+    /// The terminal/shell itself died before the end marker.
+    shell_died: bool = false,
+};
+
+const ExecPending = struct {
+    nonce: [12]u8,
+};
+
+/// POSIX single-quote: wrap in '...', embedded ' becomes '\''.
+fn posixSquote(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    try w.writeByte('\'');
+    for (s) |ch| {
+        if (ch == '\'') try w.writeAll("'\\''") else try w.writeByte(ch);
+    }
+    try w.writeByte('\'');
+    return allocator.dupe(u8, aw.written());
+}
+
+/// Where a sentinel scan landed in the rendered text.
+pub const SentinelParse = union(enum) {
+    pending,
+    done: struct { status: i32, start: usize, end: usize, truncated: bool },
+};
+
+/// Build the one-line command that brackets `command` with echo-safe
+/// sentinel markers.
+///
+/// subshell=true (the robust default): the script travels base64-
+/// encoded and runs under a fresh `sh` from a temp file — DIALECT-
+/// INDEPENDENT (works typed into fish/zsh/bash/dash sessions alike,
+/// local or over SSH) and shell state stays out of the session. The
+/// pipeline uses only syntax every shell family shares (`|`, `>`,
+/// `&&`, `;`) and the script always exits 0, so an active `set -e` in
+/// the session never kills it.
+///
+/// subshell=false: the POSIX construction is typed directly so state
+/// changes (cd/export/set) PERSIST in the session; needs a POSIX-ish
+/// interactive shell (bash/zsh/dash — not fish). Marker strings are
+/// quote-split in the typed text so the command echo can never be
+/// mistaken for a marker; the `if` wrapper keeps a failing command
+/// from tripping an active `set -e`.
+pub fn buildExecLine(allocator: std.mem.Allocator, nonce: []const u8, command: []const u8, subshell: bool) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    if (subshell) {
+        // The command runs in a `sh -c` CHILD of the script's sh, so
+        // an `exit`/`exec` in the command can only leave the child —
+        // the end marker always prints with the child's real status.
+        const quoted_cmd = try posixSquote(allocator, command);
+        defer allocator.free(quoted_cmd);
+        const script = try std.fmt.allocPrint(
+            allocator,
+            "printf '\\n%s\\n' SKB{s}\nsh -c {s}\n__sk_s=$?\nprintf '\\n%s%d\\n' SKE{s}. \"$__sk_s\"\n",
+            .{ nonce, quoted_cmd, nonce },
+        );
+        defer allocator.free(script);
+        const enc = std.base64.standard.Encoder;
+        const b64 = try allocator.alloc(u8, enc.calcSize(script.len));
+        defer allocator.free(b64);
+        _ = enc.encode(b64, script);
+        try w.print("echo {s} | base64 -d > /tmp/.sk_{s} && sh /tmp/.sk_{s}; rm -f /tmp/.sk_{s}", .{ b64, nonce, nonce, nonce });
+        return allocator.dupe(u8, aw.written());
+    }
+    try w.print("printf '\\n%s\\n' SKB''{s}; if {{ {s}\n}}; then __sk_s=0; else __sk_s=$?; fi; printf '\\n%s%d\\n' SKE''{s}. \"$__sk_s\"", .{ nonce, command, nonce });
+    return allocator.dupe(u8, aw.written());
+}
+
+/// Scan rendered terminal text (scrollback + screen) for the LAST
+/// begin marker and its matching end marker. Markers sit on their own
+/// lines (printed after \n) so line-exact matching is safe from wrap.
+pub fn findSentinel(text: []const u8, nonce: []const u8) SentinelParse {
+    var begin_after: ?usize = null;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var off: usize = 0;
+    var end_line_start: ?usize = null;
+    var status: i32 = 0;
+    while (it.next()) |line| {
+        const line_start = off;
+        off += line.len + 1;
+        const trimmed = std.mem.trimEnd(u8, line, " \r");
+        if (trimmed.len == 3 + nonce.len and std.mem.startsWith(u8, trimmed, "SKB") and
+            std.mem.eql(u8, trimmed[3..], nonce))
+        {
+            begin_after = @min(off, text.len);
+            end_line_start = null;
+            continue;
+        }
+        if (trimmed.len > 4 + nonce.len and std.mem.startsWith(u8, trimmed, "SKE") and
+            std.mem.eql(u8, trimmed[3 .. 3 + nonce.len], nonce) and trimmed[3 + nonce.len] == '.')
+        {
+            const digits = trimmed[4 + nonce.len ..];
+            const st = std.fmt.parseInt(i32, digits, 10) catch continue;
+            status = st;
+            end_line_start = line_start;
+        }
+    }
+    if (end_line_start) |endpos| {
+        const truncated = begin_after == null or begin_after.? > endpos;
+        const start = if (truncated) 0 else begin_after.?;
+        return .{ .done = .{ .status = status, .start = start, .end = endpos, .truncated = truncated } };
+    }
+    return .pending;
+}
+
+test "buildExecLine wraps and quote-splits markers" {
+    const t = std.testing;
+    const line = try buildExecLine(t.allocator, "aabbccddeeff", "echo hi", false);
+    defer t.allocator.free(line);
+    // The typed text never contains a contiguous marker string.
+    try t.expect(std.mem.indexOf(u8, line, "SKBaabbccddeeff") == null);
+    try t.expect(std.mem.indexOf(u8, line, "SKB''aabbccddeeff") != null);
+    try t.expect(std.mem.indexOf(u8, line, "{ echo hi\n}") != null);
+    // Subshell mode: dialect-independent base64 → sh transport, and
+    // the decoded script carries the plain markers + set -e guard.
+    const sub = try buildExecLine(t.allocator, "aabbccddeeff", "cd /tmp && pwd", true);
+    defer t.allocator.free(sub);
+    try t.expect(std.mem.startsWith(u8, sub, "echo "));
+    try t.expect(std.mem.indexOf(u8, sub, "| base64 -d > /tmp/.sk_aabbccddeeff && sh /tmp/.sk_aabbccddeeff; rm -f /tmp/.sk_aabbccddeeff") != null);
+    try t.expect(std.mem.indexOf(u8, sub, "SKBaabbccddeeff") == null); // only inside the b64 payload
+    const b64 = sub["echo ".len..std.mem.indexOf(u8, sub, " |").?];
+    const dec = std.base64.standard.Decoder;
+    const buf = try t.allocator.alloc(u8, try dec.calcSizeForSlice(b64));
+    defer t.allocator.free(buf);
+    try dec.decode(buf, b64);
+    try t.expect(std.mem.indexOf(u8, buf, "SKBaabbccddeeff") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "sh -c 'cd /tmp && pwd'\n__sk_s=$?") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "SKEaabbccddeeff.") != null);
+    // Embedded single quotes survive the POSIX quoting.
+    const q = try buildExecLine(t.allocator, "aabbccddeeff", "echo 'it''s'", true);
+    defer t.allocator.free(q);
+    const qb64 = q["echo ".len..std.mem.indexOf(u8, q, " |").?];
+    const qbuf = try t.allocator.alloc(u8, try dec.calcSizeForSlice(qb64));
+    defer t.allocator.free(qbuf);
+    try dec.decode(qbuf, qb64);
+    try t.expect(std.mem.indexOf(u8, qbuf, "sh -c 'echo '\\''it'\\'''\\''s'\\'''") != null);
+}
+
+test "findSentinel extracts output and status" {
+    const t = std.testing;
+    const nonce = "aabbccddeeff";
+    const text = "$ printf ... SKB''aabbccddeeff; ...\nSKBaabbccddeeff\nhello\nworld\nSKEaabbccddeeff.3\n$ ";
+    const r = findSentinel(text, nonce);
+    try t.expect(r == .done);
+    try t.expectEqual(@as(i32, 3), r.done.status);
+    try t.expectEqualStrings("hello\nworld\n", text[r.done.start..r.done.end]);
+    try t.expect(!r.done.truncated);
+    // No end marker yet: pending.
+    try t.expect(findSentinel("SKBaabbccddeeff\npartial", nonce) == .pending);
+    // Begin marker scrolled away: truncated tail.
+    const tail = findSentinel("late output\nSKEaabbccddeeff.0\n", nonce);
+    try t.expect(tail == .done and tail.done.truncated);
+    // The echoed quote-split typed text never matches.
+    try t.expect(findSentinel("$ printf '\\n%s\\n' SKB''aabbccddeeff; if ...", nonce) == .pending);
+}
+
 pub const TokenResult = union(enum) {
     /// No shell integration was injected for this shell.
     unsupported,
@@ -76,6 +248,7 @@ pub const Term = struct {
     /// Never blocks success — a mark that shows up later still wins.
     prompt_wait_exhausted: bool = false,
     pending_command: ?CommandToken = null,
+    pending_exec: ?ExecPending = null,
 
     /// Spawn a shell session on the daemon at `local_sock` (null = the
     /// shared per-user daemon) and attach. `argv` null = the login
@@ -351,6 +524,92 @@ pub const Term = struct {
     pub fn waitPendingCommand(self: *Term, timeout_ms: i64) ?CommandCompletion {
         const token = self.pending_command orelse return null;
         return self.waitCommand(token, timeout_ms);
+    }
+
+    /// Block until the terminal's child process exits (or timeout).
+    /// Returns true when it exited; exit_status/exit_status_known then
+    /// carry the result.
+    pub fn waitExit(self: *Term, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (!self.exited) {
+            if (nowMs() >= deadline) return false;
+            _ = self.pumpOnce(50);
+        }
+        return true;
+    }
+
+    pub fn hasPendingExec(self: *const Term) bool {
+        return self.pending_exec != null;
+    }
+
+    /// Sentinel-based structured exec inside the LIVE interactive
+    /// shell (works over SSH, where OSC 133 integration cannot reach).
+    /// On timeout the sentinel stays pending; continue with
+    /// waitExecResult. Caller frees `.output`.
+    pub fn execCommand(self: *Term, command: []const u8, subshell: bool, timeout_ms: i64) Error!ExecOutcome {
+        self.drain();
+        if (self.exited) return Error.NotConnected;
+        if (self.pending_exec != null) return Error.BadKey; // caller checks hasPendingExec first
+        var pend: ExecPending = undefined;
+        var raw: [6]u8 = undefined;
+        if (c.getentropy(&raw, raw.len) != 0) return Error.SpawnFailed;
+        const hex = "0123456789abcdef";
+        for (raw, 0..) |b, i| {
+            pend.nonce[i * 2] = hex[b >> 4];
+            pend.nonce[i * 2 + 1] = hex[b & 0xf];
+        }
+        const line = buildExecLine(self.allocator, &pend.nonce, command, subshell) catch return Error.OutOfMemory;
+        defer self.allocator.free(line);
+        const with_cr = std.fmt.allocPrint(self.allocator, "{s}\r", .{line}) catch return Error.OutOfMemory;
+        defer self.allocator.free(with_cr);
+        try self.sendText(with_cr);
+        self.pending_exec = pend;
+        return self.waitExecResult(timeout_ms) orelse Error.NotConnected;
+    }
+
+    /// Continue waiting for a pending exec sentinel. Null when none is
+    /// pending. Caller frees `.output`.
+    pub fn waitExecResult(self: *Term, timeout_ms: i64) ?ExecOutcome {
+        const pend = self.pending_exec orelse return null;
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            _ = self.pumpOnce(50);
+            // Scan at a coarse cadence: extracting the whole
+            // scrollback per pump would hurt under output floods.
+            const text = blk: {
+                const screen = self.screen orelse break :blk null;
+                break :blk screen.extractScrollback(self.allocator) catch null;
+            };
+            if (text) |t| {
+                defer self.allocator.free(t);
+                switch (findSentinel(t, &pend.nonce)) {
+                    .done => |d| {
+                        self.pending_exec = null;
+                        const out = self.allocator.dupe(u8, t[d.start..d.end]) catch &[_]u8{};
+                        return .{
+                            .completed = true,
+                            .exit_status = d.status,
+                            .output = @constCast(out),
+                            .truncated = d.truncated,
+                        };
+                    },
+                    .pending => {},
+                }
+            }
+            if (self.exited) {
+                self.pending_exec = null;
+                return .{ .completed = false, .shell_died = true, .exit_status = if (self.exit_status_known) self.exit_status else null };
+            }
+            if (nowMs() >= deadline) {
+                return .{ .completed = false, .timed_out = true };
+            }
+            // Pace the scrollback scans.
+            var waited: i64 = 0;
+            while (waited < 100 and nowMs() < deadline) {
+                if (self.pumpOnce(50)) {} else waited += 50;
+                if (self.exited) break;
+            }
+        }
     }
 
     /// Rendered screen text (drains pending events first).
