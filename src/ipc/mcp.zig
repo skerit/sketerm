@@ -22,6 +22,8 @@ const template = @import("../util/template.zig");
 const ocr = @import("../util/ocr.zig");
 const png_util = @import("../util/png.zig");
 const mcpassets = @import("mcpassets.zig");
+const cdp = @import("cdp.zig");
+const shellquote = @import("../util/shellquote.zig");
 
 const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
@@ -401,6 +403,10 @@ const Watchdog = struct {
         fd_count = 0;
         for (app_state.apps.values()) |a| addFd(a.conn.fd);
         for (term_state.terms.values()) |t| addFd(t.conn.fd);
+        for (forward_state.forwards.values()) |f| addFd(f.term.conn.fd);
+        for (browser_state.sessions.values()) |s| {
+            if (s.client.fd >= 0) addFd(s.client.fd);
+        }
         fired.store(false, .release);
         started_ms = monoMs();
     }
@@ -558,6 +564,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         .mux_sock = if (iso) |i| i.sock else null,
     };
     defer term_state.deinit();
+    forward_state = .{ .allocator = allocator };
+    defer forward_state.deinit();
+    browser_state = .{ .allocator = allocator };
+    defer browser_state.deinit();
+    srv_mode = if (opts.shared) "shared" else if (iso != null and iso.?.durable) "durable" else "isolated";
+    srv_gui_socket = sock_path != null;
 
     // Named/durable instance: pick up app sessions still running on
     // the private daemon from a previous run.
@@ -621,6 +633,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // Ephemeral teardown: detach app viewers first (deinit is
     // idempotent; the deferred call becomes a no-op), then retire the
     // private daemon and remove its dir. Durable/named instances stay.
+    browser_state.deinit();
+    forward_state.deinit();
     term_state.deinit();
     app_state.deinit();
     if (iso) |i| {
@@ -849,7 +863,7 @@ fn toolResult(arena: std.mem.Allocator, text: []const u8, is_error: bool) ?[]con
 /// raw '\n' inside a response splits it). Kept readable as a
 /// multiline literal; newlines stripped at comptime.
 const TOOLS_JSON = blk: {
-    @setEvalBranchQuota(60_000);
+    @setEvalBranchQuota(300_000);
     var buf: [TOOLS_JSON_RAW.len]u8 = undefined;
     var n: usize = 0;
     for (TOOLS_JSON_RAW) |ch| {
@@ -872,7 +886,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"send_keys","description":"Press named keys in a pane: space-separated chords like 'ctrl+c', 'enter', 'up', 'escape', 'f5', 'alt+x', 'shift+tab', 'pagedown'. Single characters are typed literally.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
     \\{"name":"run_command","description":"Type a shell command, press Enter, wait until OUTPUT settles, and return the resulting screen text. Output idle does not imply that a silent foreground command exited. Pass output_only=true to get ONLY a completed OSC 133 command zone when one is already available. For reliable headless completion use term_run with wait_for=command; for interactive programs prefer send_text/send_keys + read_screen.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"Max output-idle wait (default 15000)"},"quiet_ms":{"type":"integer","description":"No-output window that counts as idle (default 400)"},"output_only":{"type":"boolean","description":"Return just a completed command zone and exit code instead of the whole screen"}},"required":["command"]}},
     \\{"name":"wait_idle","description":"Wait until a pane produced no output for quiet_ms (or timeout_ms elapsed). Output idle does NOT imply that the foreground command exited.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"timeout_ms":{"type":"integer"},"quiet_ms":{"type":"integer"}}}},
-    \\{"name":"new_tab","description":"Open a new shell tab. Returns the new tab and pane ids.","inputSchema":{"type":"object","properties":{"cwd":{"type":"string"},"title":{"type":"string"}}}},
+    \\{"name":"new_tab","description":"Open a new shell tab in the GUI. Returns the new tab and pane ids. With no GUI running it falls back to opening a HEADLESS terminal and returns its term id instead (drive that one with term_* tools).","inputSchema":{"type":"object","properties":{"cwd":{"type":"string"},"title":{"type":"string"}}}},
     \\{"name":"split_pane","description":"Split a pane. direction 'h' = side by side, 'v' = stacked. Returns the new pane id.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"},"direction":{"type":"string","enum":["h","v"]}}}},
     \\{"name":"focus_pane","description":"Focus a pane (selects its tab and grabs keyboard focus).","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
     \\{"name":"close_pane","description":"Close a pane. Destructive: the shell and any running process in it are terminated.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
@@ -885,7 +899,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as RENDERED BY A TERMINAL — a fixed-width grid, so long lines wrap and scrolled-off content needs scrollback=true; right for TUI-style redraws). For log-style output app_log is the SOURCE OF TRUTH: indexed unwrapped lines with stable ids, re-readable in full — prefer it. When the grid mirror is blank after an exit, the log ring's last lines are served instead. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
     \\{"name":"app_log","description":"A headless app's stdout/stderr as an INDEXED LOG: each complete line gets a stable numeric id and a timestamp; the tail view shortens long lines (marked [+]) and any line can be re-read in full by id. The ring is bounded (oldest lines drop; the reply says how many). MARKERS: the app (or your injected code) can emit the escape  printf '\\033]5522;my-label\\033\\\\'  — it becomes a labelled log line AND sketerm stashes a screenshot of the app window at that exact instant; fetch label+image with {\"id\":<that line's id>}. Variant printf '\\033]5522;+N;my-label\\033\\\\' captures the Nth FUTURE frame commit instead (e.g. +1 = the next repaint after this point; resolved with the final frame if the app exits first). Markers are rate-limited (burst 8, then 2/s; excess are dropped and counted) so escape-laden files cat'ed to the terminal cannot flood the log. Survives app exit: the final log is delivered with the exit.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"tail":{"type":"integer","description":"Last N lines (default 60, max 500)"},"from_id":{"type":"integer","description":"Return lines starting at this id instead of the tail"},"id":{"type":"integer","description":"Return ONE line in full; for a marker line also returns the stashed screenshot"}}}},
     \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right. mark=true returns a post-click screenshot with a crosshair drawn at the exact click pixel — see where the click landed relative to the UI AND what it did, in one image; screenshot=true returns the post-click frame without the marker.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"},"mark":{"type":"boolean","description":"Return a post-click screenshot with a crosshair marker at the click point"},"screenshot":{"type":"boolean","description":"Return a post-click screenshot (no marker)"},"max_px":{"type":"integer","description":"Bound on the screenshot's longest dimension (default 1568)"}},"required":["window","x","y"]}},
-    \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} (MILLISECONDS, max 30000) | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} (with change_pct = VISUAL settle: blocks until frames change less than that %% — use for scene transitions of unknown duration instead of guessing a fixed wait) | {\"wait_change\":timeout_ms or {\"timeout_ms\":N,\"min_change_pct\":P}} (P = ignore repaints below that %% of pixels) | {\"screenshot\":true or {\"max_px\":N}} | {\"wait_image\":{\"template\":name,\"timeout_ms\":N,\"click\":true}} (wait for a saved template to appear, optionally click its center) | {\"click_image\":{\"template\":name}} (find + click NOW, error if absent) | {\"wait_text\":{\"text\":s,\"click\":true}} (OCR-wait for a string, optionally click it) — these three make batches STATE-driven instead of coordinate/timing-driven. MARKERS: add \"mark\":true to a click/move/move_rel/drag/scroll step to draw a labelled crosshair at that step's position (red = click, cyan = move; the number is the step index) onto the NEXT screenshot — several marked steps can share one image. Combine in one step: {\"click\":[x,y],\"mark\":true,\"screenshot\":true} captures the post-click frame with the click point marked. Leftover marks with no later screenshot are flushed as a final image automatically. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
+    \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} (MILLISECONDS, max 30000) | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} (with change_pct = VISUAL settle: blocks until frames change less than that %% — use for scene transitions of unknown duration instead of guessing a fixed wait) | {\"wait_change\":timeout_ms or {\"timeout_ms\":N,\"min_change_pct\":P}} (P = ignore repaints below that %% of pixels; add \"required\":true to a wait_idle/wait_change step to make a timeout FAIL the batch instead of continuing — a timeout is then structurally distinct from success) | {\"screenshot\":true or {\"max_px\":N}} | {\"wait_image\":{\"template\":name,\"timeout_ms\":N,\"click\":true}} (wait for a saved template to appear, optionally click its center) | {\"click_image\":{\"template\":name}} (find + click NOW, error if absent) | {\"wait_text\":{\"text\":s,\"click\":true}} (OCR-wait for a string, optionally click it) — these three make batches STATE-driven instead of coordinate/timing-driven. MARKERS: add \"mark\":true to a click/move/move_rel/drag/scroll step to draw a labelled crosshair at that step's position (red = click, cyan = move; the number is the step index) onto the NEXT screenshot — several marked steps can share one image. Combine in one step: {\"click\":[x,y],\"mark\":true,\"screenshot\":true} captures the post-click frame with the click point marked. Leftover marks with no later screenshot are flushed as a final image automatically. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
     \\{"name":"app_mouse_move","description":"Move the pointer in an app window WITHOUT clicking. Absolute: x,y in surface pixels (hover a widget, position before a click). Relative: dx,dy — a delta from the current pointer position, for apps that consume RELATIVE mouse motion (SDL games, DOSBox, anything with pointer-lock): sketerm derives relative_motion events from the move, so the app's own cursor moves by exactly your delta. Calibration for such apps: one large negative move (e.g. dx:-30000, dy:-30000) slams their internal cursor to the top-left corner, after which exact deltas land where you aim. With neither x/y nor dx/dy it just returns the tracked pointer position.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = window under the pointer, else first toplevel)"},"x":{"type":"number","description":"Absolute surface x (with y)"},"y":{"type":"number"},"dx":{"type":"number","description":"Relative delta x (with dy; exclusive with x/y)"},"dy":{"type":"number"}}}},
     \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
     \\{"name":"app_set_value","description":"Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value). Faster and more reliable than typing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}},
@@ -912,8 +926,8 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_macros","description":"List saved macros; show one's steps (show); delete one (delete); or view an app's recorded input journal (journal:true + app) to pick last_steps for app_macro_save.","inputSchema":{"type":"object","properties":{"delete":{"type":"string"},"show":{"type":"string"},"journal":{"type":"boolean"},"app":{"type":"integer"}}}},
     \\{"name":"close_app_window","description":"Ask the app to close one window (like the titlebar button; the app decides).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"}},"required":["window"]}},
     \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
-    \\{"name":"term_open","description":"Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
-    \\{"name":"term_list","description":"List open headless terminals and their exit state.","inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"term_open","description":"Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read. Pass 'host' for a PERSISTENT SSH session (keepalives preconfigured, survives long provisioning waits): run remote commands in it with term_exec for structured output + exit status.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional; with 'host' a string is the remote command)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH destination (user@box): opens ssh -tt with ServerAlive keepalives. Auth prompts appear on the screen — answer with term_send_text."},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
+    \\{"name":"term_list","description":"List open headless terminals: exit state + real exit_status, pending command/exec trackers, and the last rendered screen line (drained first, so a finished process never shows a stale progress frame).","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"term_run","description":"Run a command line in a headless terminal. wait_for=idle (default, backward compatible) returns after OUTPUT quiescence and does not imply child exit. wait_for=command waits for an OSC 133 command boundary (or tracked shell exit), returns structured running/completed state, exact exit_status, timed_out, and completion_source, and refuses to send (command_sent=false) when shell integration is unavailable or a foreground command started outside command mode is still running. If it times out, use term_wait_command to continue waiting without resending. output_only selects the completed command zone instead of the rendered screen.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"wait_for":{"type":"string","enum":["idle","command"],"description":"idle (default) waits for output quiescence; command waits for actual shell-command completion"},"quiet_ms":{"type":"integer","description":"Idle mode only: no-output window (default 400)"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the command's output instead of the whole screen"}},"required":["command"]}},
     \\{"name":"term_send_text","description":"Write text to a headless terminal's PTY. 'enter' appends a carriage return.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean"}},"required":["text"]}},
     \\{"name":"term_send_keys","description":"Press named key chords in a headless terminal: 'ctrl+c', 'enter', 'up', 'tab', space-separated.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
@@ -921,7 +935,27 @@ const TOOLS_JSON_RAW =
     \\{"name":"term_wait_idle","description":"Wait until a headless terminal's output stops changing (or timeout). Output idle does NOT imply that the foreground command exited.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"term_wait_command","description":"Continue waiting for a term_run wait_for=command request that timed out. Returns structured running/completed state, exact exit_status, timed_out, and completion_source without resending the command.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the completed command's output instead of the whole screen"}}}},
     \\{"name":"term_resize","description":"Resize a headless terminal's grid.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
-    \\{"name":"term_close","description":"Close a headless terminal (kills its shell). Destructive.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"}}}}
+    \\{"name":"term_close","description":"Close a headless terminal (kills its shell). Destructive.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"}}}},
+    \\{"name":"term_exec","description":"Run one command inside a LIVE interactive shell (including a persistent SSH session from term_open host) and get STRUCTURED results: exact exit_status and the exact output between sentinel markers, independent of shell integration. By default the command runs ISOLATED in a fresh `sh` (works typed into any shell dialect — fish/zsh/bash, local or remote — and cd/export/set -e cannot leak into or kill the session; the feedback scenario 'set -e + failing probe closed my SSH connection' cannot happen). Pass subshell=false to run IN the session shell so state persists (cd/export) — that mode needs a POSIX-ish shell (bash/zsh/dash, not fish). On timeout the command keeps running — continue with term_exec_wait, never resend. Not for interactive programs (editors, REPLs) — use term_send_text/term_send_keys for those.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"subshell":{"type":"boolean","description":"Default true (isolated, dialect-independent). false = run in the session shell itself: state persists, POSIX shells only"},"timeout_ms":{"type":"integer","description":"Default 30000"}},"required":["command"]}},
+    \\{"name":"term_exec_wait","description":"Continue waiting for a term_exec that timed out, without resending. Returns the same structured completed/exit_status/output shape.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"}}}},
+    \\{"name":"term_wait_exit","description":"Wait until a headless terminal's child PROCESS exits (distinct from output idleness — a silent scp can be running while output is idle, and an exited one can leave a stale progress frame). Returns the real exit status and the final screen tail.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"}}}},
+    \\{"name":"upload_file","description":"Copy a LOCAL file to a host with integrity + atomicity built in: scp to <path>.sketerm-part, remote SHA-256 verify against the local hash, then an atomic mv into place (a corrupt transfer is discarded, never half-written). Omit 'host' for a checksummed atomic local copy. Requires key/agent SSH auth (BatchMode).","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box); omit = local copy"},"local_path":{"type":"string"},"remote_path":{"type":"string","description":"Destination path (on the host, or locally when host is omitted)"},"timeout_ms":{"type":"integer","description":"scp budget, default 120000"}},"required":["local_path","remote_path"]}},
+    \\{"name":"download_file","description":"Copy a remote file here with integrity + atomicity: scp to <local>.sketerm-part, SHA-256 compare against the remote hash, atomic rename into place. Omit 'host' for a local copy.","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"remote_path":{"type":"string","description":"Source path on the host"},"local_path":{"type":"string","description":"Destination path here"},"timeout_ms":{"type":"integer","description":"Default 120000"}},"required":["local_path","remote_path"]}},
+    \\{"name":"port_forward_open","description":"Open a STRUCTURED SSH port forward (ssh -N -L with keepalives + ExitOnForwardFailure): picks a free local port when none is given, verifies the listener actually accepts before replying, and returns a forward id. Health-check/reconnect with port_forward_check. Requires key/agent auth (BatchMode).","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box)"},"remote_port":{"type":"integer","description":"Port on the remote side"},"remote_host":{"type":"string","description":"Remote-side connect address (default 127.0.0.1)"},"local_port":{"type":"integer","description":"Local listen port (omit = auto-pick a free one; the reply tells you which)"},"timeout_ms":{"type":"integer","description":"Readiness budget, default 20000"}},"required":["host","remote_port"]}},
+    \\{"name":"port_forward_list","description":"List open port forwards with liveness and reconnect counts.","inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"port_forward_check","description":"Health-check one forward: verifies the ssh process AND that the local port accepts connections; if the ssh died (network blip, sshd restart) it RECONNECTS by respawning the same spec on the same local port.","inputSchema":{"type":"object","properties":{"forward":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Reconnect readiness budget, default 20000"}}}},
+    \\{"name":"port_forward_close","description":"Close a port forward (kills its ssh).","inputSchema":{"type":"object","properties":{"forward":{"type":"integer"}},"required":["forward"]}},
+    \\{"name":"capabilities","description":"Preflight report of what THIS MCP server can do right now: isolation mode, GUI socket presence, OCR (tesseract) availability, which browser binary browser_open would use, ssh/scp presence, and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.","inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"browser_open","description":"Launch a Chromium-family browser HEADLESSLY (Wayland, never on any screen) with DevTools (CDP) attached: you get real DOM access — browser_read (text/html/links), browser_elements, browser_click, browser_fill, browser_wait, browser_eval — plus everything an app has (screenshot via get_app_state, app_key for keyboard, app_scroll). Wayland + remote-debugging flags are applied automatically; renderer accessibility is enabled. Replies with the app id, DevTools port, page info and a first screenshot. Local daemon only.","inputSchema":{"type":"object","properties":{"url":{"type":"string","description":"Initial page (default about:blank)"},"profile":{"type":"string","description":"Named PERSISTENT profile (cookies/logins survive across sessions); omit = throwaway profile"},"browser_path":{"type":"string","description":"Specific browser binary (default: first Chromium-family binary on PATH)"},"width":{"type":"integer","description":"Window width, default 1280"},"height":{"type":"integer","description":"Window height, default 900"},"wait_ms":{"type":"integer","description":"Startup budget, default 25000"}}}},
+    \\{"name":"browser_info","description":"Current URL, title, readyState, scroll position and viewport of a browser_open app — confirm soft navigations without reading the address bar pixels.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"browser_navigate","description":"Navigate a browser_open app: a URL (https:// assumed when schemeless), or \"back\"/\"forward\"/\"reload\". Waits for document readyState complete (bounded) and returns the landed URL + title.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"url":{"type":"string"},"timeout_ms":{"type":"integer","description":"Load wait, default 20000"}},"required":["url"]}},
+    \\{"name":"browser_read","description":"Read the page as DATA instead of pixels: format text (rendered innerText, default), html (outerHTML) or links (anchor list with hrefs). Scope with a CSS 'selector'. The reply is prefixed with the page URL + title.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"format":{"type":"string","enum":["text","html","links"]},"selector":{"type":"string","description":"CSS selector to scope the read (omit = whole page)"},"max_chars":{"type":"integer","description":"Default 20000"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"browser_elements","description":"List VISIBLE interactive elements (links, buttons, inputs, menu items ...) with their text and viewport-CSS-pixel centers — the map for browser_click/browser_fill targeting. Filter with 'selector' (CSS) and/or 'text' (substring of text/aria-label/placeholder).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text":{"type":"string"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"browser_click","description":"Click a page element by CSS 'selector' and/or visible 'text' (tightest text match first; 'nth' disambiguates): scrolls it into view, then dispatches a TRUSTED click via CDP at its center. Alternatively pass explicit viewport x/y. Reports what was clicked and where the page is afterwards (catches navigations).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text":{"type":"string","description":"Visible text / aria-label / placeholder substring"},"nth":{"type":"integer","description":"Which match (0-based, default 0)"},"button":{"type":"integer","description":"1 left (default), 2 middle, 3 right"},"clicks":{"type":"integer","description":"1 single (default), 2 double"},"x":{"type":"number","description":"Explicit viewport CSS x (with y; skips element lookup)"},"y":{"type":"number"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"browser_fill","description":"Fill a form field: locate by CSS 'selector' or 'text_label' (placeholder/label/aria text), focus, select-all, then type the value as TRUSTED input (frameworks see real events). <select> dropdowns pick the option matching the value. enter=true presses Enter after. Reads the field back for confirmation — password fields report only the character count, never the value.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text_label":{"type":"string"},"value":{"type":"string"},"nth":{"type":"integer"},"enter":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["value"]}},
+    \\{"name":"browser_wait","description":"Wait until the page reaches a state: 'selector' visible, 'text' present in the page, 'url_contains' matches, and/or 'gone' (selector absent/hidden). Combine freely; all given conditions must hold. On timeout the reply is an ERROR that says which condition failed and where the page currently is — a timeout can never read as success.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text":{"type":"string"},"url_contains":{"type":"string"},"gone":{"type":"string","description":"CSS selector that must be absent/hidden (spinners, modals)"},"timeout_ms":{"type":"integer","description":"Default 15000"}}}},
+    \\{"name":"browser_scroll","description":"DETERMINISTIC page scrolling: to \"top\"/\"bottom\", a CSS 'selector' into view (block center), an absolute 'y', or a relative 'dy' in CSS pixels — no wheel-delta guessing. Returns the resulting scroll position and document height.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"to":{"type":"string","enum":["top","bottom"]},"selector":{"type":"string"},"y":{"type":"integer"},"dy":{"type":"integer"}}}},
+    \\{"name":"browser_eval","description":"Evaluate JavaScript in the page (awaits promises, returns the value as JSON). The escape hatch when the structured browser tools don't cover it.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"js":{"type":"string"},"timeout_ms":{"type":"integer","description":"Default 10000"}},"required":["js"]}}
     \\]
 ;
 
@@ -1097,6 +1131,86 @@ const TermState = struct {
 };
 
 var term_state: TermState = .{ .allocator = undefined };
+
+/// Server mode facts for the `capabilities` preflight tool.
+var srv_mode: []const u8 = "isolated";
+var srv_gui_socket: bool = false;
+
+/// One structured SSH port forward: an owned `ssh -N -L` headless
+/// terminal plus its spec, so it can be health-checked and respawned.
+const Forward = struct {
+    id: u32,
+    host: []u8,
+    local_port: u16,
+    remote_host: []u8,
+    remote_port: u16,
+    term: *termdrive.Term,
+    reconnects: u32 = 0,
+};
+
+const ForwardState = struct {
+    allocator: std.mem.Allocator,
+    forwards: std.AutoArrayHashMapUnmanaged(u32, *Forward) = .empty,
+    next_id: u32 = 1,
+
+    fn removeOne(self: *ForwardState, f: *Forward) void {
+        _ = self.forwards.swapRemove(f.id);
+        f.term.deinit();
+        self.allocator.free(f.host);
+        self.allocator.free(f.remote_host);
+        self.allocator.destroy(f);
+    }
+
+    fn deinit(self: *ForwardState) void {
+        for (self.forwards.values()) |f| {
+            f.term.deinit();
+            self.allocator.free(f.host);
+            self.allocator.free(f.remote_host);
+            self.allocator.destroy(f);
+        }
+        self.forwards.deinit(self.allocator);
+        self.forwards = .empty;
+    }
+};
+
+var forward_state: ForwardState = .{ .allocator = undefined };
+
+fn forwardFromArgs(args: std.json.Value) ?*Forward {
+    if (argInt(args, "forward")) |id| {
+        if (id < 0) return null;
+        return forward_state.forwards.get(@intCast(id));
+    }
+    if (forward_state.forwards.count() == 1) return forward_state.forwards.values()[0];
+    return null;
+}
+
+/// CDP session per browser app id (browser_open populates it).
+const BrowserSession = struct {
+    client: cdp.Client,
+};
+
+const BrowserState = struct {
+    allocator: std.mem.Allocator,
+    sessions: std.AutoArrayHashMapUnmanaged(u32, *BrowserSession) = .empty,
+
+    fn remove(self: *BrowserState, app_id: u32) void {
+        if (self.sessions.fetchSwapRemove(app_id)) |kv| {
+            kv.value.client.deinit();
+            self.allocator.destroy(kv.value);
+        }
+    }
+
+    fn deinit(self: *BrowserState) void {
+        for (self.sessions.values()) |s| {
+            s.client.deinit();
+            self.allocator.destroy(s);
+        }
+        self.sessions.deinit(self.allocator);
+        self.sessions = .empty;
+    }
+};
+
+var browser_state: BrowserState = .{ .allocator = undefined };
 
 fn termFromArgs(args: std.json.Value) ?*termdrive.Term {
     if (argInt(args, "term")) |id| {
@@ -1387,7 +1501,7 @@ fn screenshotCaption(arena: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
         );
     return std.fmt.allocPrint(
         arena,
-        "{s}{s}window {d}: {d}x{d} (scale {d}){s}{s} — {s}",
+        "{s}{s}window {d}: {d}x{d} (scale {d}){s}{s} — {s}{s}",
         .{
             extra,
             if (extra.len > 0) "\n" else "",
@@ -1398,8 +1512,26 @@ fn screenshotCaption(arena: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
             if (win.title != null) " title=" else "",
             win.title orelse "",
             coord_note,
+            browserPageSuffix(arena, app),
         },
     );
+}
+
+/// " | page: <url> — <title>" for apps with a live CDP session, so
+/// every screenshot confirms soft navigation without reading the
+/// address bar pixels. Empty when not a browser (or CDP is down —
+/// screenshots must not stall on a wedged page).
+fn browserPageSuffix(arena: std.mem.Allocator, app: *appdrive.App) []const u8 {
+    const bs = browser_state.sessions.get(appIdOf(app)) orelse return "";
+    if (!bs.client.connected()) return "";
+    const r = bs.client.eval(arena, "location.href + '\\u0001' + document.title", 1_500) catch return "";
+    const vj = r.value_json orelse return "";
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, vj, .{}) catch return "";
+    if (parsed != .string) return "";
+    const sep = std.mem.indexOfScalar(u8, parsed.string, 1) orelse return "";
+    const url = parsed.string[0..sep];
+    const title = parsed.string[sep + 1 ..];
+    return std.fmt.allocPrint(arena, "\npage: {s}{s}{s}", .{ url, if (title.len > 0) " — " else "", title }) catch "";
 }
 
 // ── a11y tree helpers (element-targeted tools) ───────────────────
@@ -1827,6 +1959,22 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             };
         }
         if (argv.items.len == 0) return appErr(arena, "launch_app requires 'command' (string or argv array)");
+        // Chromium-family binaries default to X11 and die in the
+        // Wayland-only session; inject the ozone flag unless the
+        // caller chose one (argv form only — a shell string cannot be
+        // rewritten safely).
+        var browser_note: []const u8 = "";
+        const argv_form = args == .object and args.object.get("command") != null and args.object.get("command").? == .array;
+        if (argv_form and chromiumFamily(argv.items[0])) {
+            var has_ozone = false;
+            for (argv.items) |a| {
+                if (std.mem.startsWith(u8, a, "--ozone-platform")) has_ozone = true;
+            }
+            if (!has_ozone) {
+                try argv.insert(arena, 1, "--ozone-platform=wayland");
+                browser_note = "\n(auto-added --ozone-platform=wayland: Chromium-family app in a Wayland-only session)";
+            }
+        }
         var debug_note: []const u8 = "";
         if (argStr(args, "debug")) |dm| {
             // Run-under-wrapper: the wrapper's report (backtrace,
@@ -1863,6 +2011,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         const wait_ms: i64 = argInt(args, "wait_ms") orelse 10_000;
         var env_list: std.ArrayList([]const u8) = .empty;
         defer env_list.deinit(arena);
+        var user_set_ozone_hint = false;
         if (args == .object) {
             if (args.object.get("env")) |e| {
                 if (e != .object) return appErr(arena, "'env' must be an object of KEY: \"value\" strings");
@@ -1870,10 +2019,15 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                 while (it.next()) |entry| {
                     if (entry.value_ptr.* != .string)
                         return appErr(arena, "'env' values must be strings");
+                    if (std.mem.eql(u8, entry.key_ptr.*, "ELECTRON_OZONE_PLATFORM_HINT")) user_set_ozone_hint = true;
                     try env_list.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.string }));
                 }
             }
         }
+        // Electron apps honor this hint and ignore it otherwise; the
+        // session has no X server, so wayland is the right default.
+        if (!user_set_ozone_hint)
+            try env_list.append(arena, "ELECTRON_OZONE_PLATFORM_HINT=wayland");
         const app = appdrive.App.launch(app_state.allocator, argv.items, .{
             .cols = cols,
             .rows = rows,
@@ -1911,6 +2065,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             _ = app.waitFirstWindow(wait_ms);
         }
         var summary = try appSummary(arena, app);
+        if (browser_note.len > 0) summary = try std.fmt.allocPrint(arena, "{s}{s}", .{ summary, browser_note });
         if (debug_note.len > 0) summary = try std.fmt.allocPrint(arena, "{s}{s}", .{ summary, debug_note });
         if (audio_path) |ap| {
             const stem = if (std.mem.endsWith(u8, ap, ".wav")) ap[0 .. ap.len - 4] else ap;
@@ -2685,7 +2840,12 @@ fn runActionSteps(
             } else {
                 settled = app.waitIdle(quiet_ms, timeout_ms);
             }
-            try w.print("step {d}: wait_idle — {s}\n", .{ n, if (settled) "settled" else "timeout (still rendering)" });
+            if (!settled and (argBool(st, "required") or (wv == .object and argBool(wv, "required")))) {
+                try w.print("step {d}: ERROR — wait_idle did not settle before timeout (required); remaining steps skipped\n", .{n});
+                stopped = true;
+                break;
+            }
+            try w.print("step {d}: wait_idle — {s}\n", .{ n, if (settled) "settled" else "TIMED OUT (still rendering)" });
         } else if (st.object.get("wait_change")) |wv| {
             var timeout_ms: i64 = 10_000;
             var min_pct: f64 = 0;
@@ -2697,7 +2857,12 @@ fn runActionSteps(
             }
             const wid = win_step orelse firstToplevelId(app);
             const changed = if (wid == 0) false else app.waitWindowChange(wid, timeout_ms, min_pct);
-            try w.print("step {d}: wait_change — {s}\n", .{ n, if (changed) "content changed" else "no change before timeout" });
+            if (!changed and (argBool(st, "required") or (wv == .object and argBool(wv, "required")))) {
+                try w.print("step {d}: ERROR — wait_change saw no change before timeout (required); remaining steps skipped\n", .{n});
+                stopped = true;
+                break;
+            }
+            try w.print("step {d}: wait_change — {s}\n", .{ n, if (changed) "content changed" else "TIMED OUT (no change)" });
         } else if (st.object.get("screenshot")) |sv| {
             const wid = win_step orelse firstToplevelId(app);
             if (wid == 0) {
@@ -3292,6 +3457,7 @@ fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Value,
         const id = appIdOf(app);
         const was_exited = app.exited;
         const status = app.exit_status;
+        browser_state.remove(id);
         _ = app_state.apps.swapRemove(id);
         app.deinit();
         const msg = if (was_exited)
@@ -3305,9 +3471,56 @@ fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Value,
 
 // ── headless terminal tools (shell sessions on the private daemon) ─
 
+/// Spawn + register a headless terminal; returns its id.
+fn spawnRegisteredTerm(argv: ?[]const []const u8, cols: u16, rows: u16) !u32 {
+    const t = termdrive.Term.spawn(term_state.allocator, argv, cols, rows, term_state.mux_sock) catch
+        return error.SpawnFailed;
+    const id = term_state.next_id;
+    term_state.next_id += 1;
+    term_state.terms.put(term_state.allocator, id, t) catch {
+        t.deinit();
+        return error.OutOfMemory;
+    };
+    return id;
+}
+
+/// Last non-empty rendered line of a term's screen (for term_list), or
+/// "". Arena-owned.
+fn termLastLine(arena: std.mem.Allocator, t: *termdrive.Term) []const u8 {
+    const text = t.readScreen(false) catch return "";
+    defer term_state.allocator.free(text);
+    var it = std.mem.splitBackwardsScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\t");
+        if (trimmed.len == 0) continue;
+        const cap = @min(trimmed.len, 160);
+        return arena.dupe(u8, trimmed[0..cap]) catch "";
+    }
+    return "";
+}
+
+/// Serialize a termdrive exec outcome as the term_exec reply.
+fn execResultJson(arena: std.mem.Allocator, r: termdrive.ExecOutcome) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("{{\"completed\":{},\"exit_status\":", .{r.completed});
+    if (r.exit_status) |st| try w.print("{d}", .{st}) else try w.writeAll("null");
+    try w.print(",\"timed_out\":{},\"truncated\":{},\"shell_died\":{}", .{ r.timed_out, r.truncated, r.shell_died });
+    // Bound the payload; the tail is what diagnosis needs.
+    const MAX_OUT = 200_000;
+    const out = if (r.output.len > MAX_OUT) r.output[r.output.len - MAX_OUT ..] else r.output;
+    try w.writeAll(",\"output\":");
+    try std.json.Stringify.value(out, .{}, w);
+    if (r.output.len > MAX_OUT) try w.print(",\"output_dropped_chars\":{d}", .{r.output.len - MAX_OUT});
+    if (r.timed_out) try w.writeAll(",\"reason\":\"still running at timeout — continue with term_exec_wait (do not resend)\"");
+    if (r.shell_died) try w.writeAll(",\"reason\":\"the shell/connection died before the command finished\"");
+    try w.writeAll("}");
+    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+}
+
 fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
-    const sock = term_state.mux_sock orelse
+    if (term_state.mux_sock == null)
         return appErr(arena, "headless terminal tools need isolated mode; in --shared mode use the GUI-backed terminal tools (list_terminals, run_command, ...)");
 
     if (eql(u8, name, "term_open")) {
@@ -3315,36 +3528,49 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 40, 4, 300));
         var argv_store: std.ArrayList([]const u8) = .empty;
         defer argv_store.deinit(arena);
-        var argv: ?[]const []const u8 = null;
+        const host = argStr(args, "host");
+        if (host) |h| {
+            // Persistent SSH session with keepalives: survives long
+            // provisioning waits; interactive (auth prompts reach the
+            // screen — drive them with term_send_text).
+            try argv_store.appendSlice(arena, &.{
+                "ssh", "-tt",
+                "-o",  "ServerAliveInterval=15",
+                "-o",  "ServerAliveCountMax=4",
+            });
+            try argv_store.append(arena, h);
+        }
         if (args == .object) {
             if (args.object.get("command")) |cmd| switch (cmd) {
                 .string => {
-                    try argv_store.append(arena, "/bin/sh");
-                    try argv_store.append(arena, "-c");
-                    try argv_store.append(arena, cmd.string);
-                    argv = argv_store.items;
+                    if (host != null) {
+                        try argv_store.append(arena, cmd.string);
+                    } else {
+                        try argv_store.appendSlice(arena, &.{ "/bin/sh", "-c", cmd.string });
+                    }
                 },
                 .array => {
                     for (cmd.array.items) |item| {
                         if (item != .string) return appErr(arena, "command array must be strings");
                         try argv_store.append(arena, item.string);
                     }
-                    if (argv_store.items.len > 0) argv = argv_store.items;
                 },
                 else => {},
             };
         }
-        const t = termdrive.Term.spawn(term_state.allocator, argv, cols, rows, sock) catch
-            return appErr(arena, "spawn failed (mux daemon unreachable?)");
-        const id = term_state.next_id;
-        term_state.next_id += 1;
-        term_state.terms.put(term_state.allocator, id, t) catch {
-            t.deinit();
-            return error.OutOfMemory;
+        const argv: ?[]const []const u8 = if (argv_store.items.len > 0) argv_store.items else null;
+        const id = spawnRegisteredTerm(argv, cols, rows) catch |err| switch (err) {
+            error.SpawnFailed => return appErr(arena, "spawn failed (mux daemon unreachable?)"),
+            else => return err,
         };
+        const t = term_state.terms.get(id).?;
         // Let the shell print its first prompt.
         _ = t.waitIdle(250, 3_000);
-        const msg = try std.fmt.allocPrint(arena, "opened headless terminal {d} ({d}x{d})", .{ id, cols, rows });
+        const where = if (host) |h|
+            try std.fmt.allocPrint(arena, " running ssh to {s} (watch term_read for auth prompts; term_exec gives structured remote command results)", .{h})
+        else
+            "";
+        const msg = try std.fmt.allocPrint(arena, "opened headless terminal {d} ({d}x{d}){s}", .{ id, cols, rows, where });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "term_list")) {
@@ -3357,8 +3583,16 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
             if (!first) try w.writeAll(",");
             first = false;
             const t = e.value_ptr.*;
+            t.drain();
             try w.print("{{\"term\":{d},\"exited\":{}", .{ e.key_ptr.*, t.exited });
-            if (t.exited) try w.print(",\"exit_status\":{d}", .{t.exit_status});
+            if (t.exited and t.exit_status_known) try w.print(",\"exit_status\":{d}", .{t.exit_status});
+            if (t.hasPendingCommand()) try w.writeAll(",\"pending_command\":true");
+            if (t.hasPendingExec()) try w.writeAll(",\"pending_exec\":true");
+            const last = termLastLine(arena, t);
+            if (last.len > 0) {
+                try w.writeAll(",\"last_line\":");
+                try std.json.Stringify.value(last, .{}, w);
+            }
             try w.writeAll("}");
         }
         try w.writeAll("]");
@@ -3386,10 +3620,74 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "term_read")) {
+        t.drain();
         const sb = argBool(args, "scrollback");
         const text = t.readScreen(sb) catch return appErr(arena, "read failed (terminal exited?)");
         defer term_state.allocator.free(text);
+        if (t.exited) {
+            // Make an exited terminal's state unambiguous: the final
+            // rendered frame plus the real exit status, so a stale
+            // progress line (scp "1%") cannot be mistaken for truth.
+            const msg = if (t.exit_status_known)
+                try std.fmt.allocPrint(arena, "[process exited with status {d} — final rendered screen below]\n{s}", .{ t.exit_status, text })
+            else
+                try std.fmt.allocPrint(arena, "[process exited (status unknown) — final rendered screen below]\n{s}", .{text});
+            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        }
         return toolResult(arena, try arena.dupe(u8, text), false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "term_exec")) {
+        const cmd = argStr(args, "command") orelse return appErr(arena, "term_exec requires 'command'");
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        // Default true: the isolated transport works typed into ANY
+        // shell dialect (fish/zsh/bash, local or remote); false is the
+        // POSIX-only state-persisting mode.
+        const subshell = if (args == .object) blk: {
+            const v = args.object.get("subshell") orelse break :blk true;
+            break :blk v == .bool and v.bool;
+        } else true;
+        if (t.hasPendingExec()) {
+            // A previously timed-out exec may have finished since;
+            // resolve it silently so the new send is accepted.
+            if (t.waitExecResult(0)) |r0| term_state.allocator.free(r0.output);
+            if (t.hasPendingExec())
+                return appErr(arena, "a previous term_exec is still running in this terminal; continue it with term_exec_wait (or interrupt with term_send_keys ctrl+c)");
+        }
+        if (t.hasPendingCommand())
+            return appErr(arena, "a term_run wait_for=command command is still tracked; resolve it with term_wait_command first");
+        const r = t.execCommand(cmd, subshell, timeout_ms) catch |err| return appErr(arena, switch (err) {
+            termdrive.Error.NotConnected => "terminal exited",
+            else => "exec failed",
+        });
+        defer term_state.allocator.free(r.output);
+        return execResultJson(arena, r);
+    }
+    if (eql(u8, name, "term_exec_wait")) {
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        const r = t.waitExecResult(timeout_ms) orelse
+            return appErr(arena, "no pending term_exec in this terminal");
+        defer term_state.allocator.free(r.output);
+        return execResultJson(arena, r);
+    }
+    if (eql(u8, name, "term_wait_exit")) {
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        const exited = t.waitExit(timeout_ms);
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.print("{{\"exited\":{}", .{exited});
+        if (exited and t.exit_status_known) try w.print(",\"exit_status\":{d}", .{t.exit_status});
+        if (!exited) try w.writeAll(",\"timed_out\":true");
+        const tail = blk: {
+            const text = t.readScreen(false) catch break :blk "";
+            defer term_state.allocator.free(text);
+            break :blk try arena.dupe(u8, tailLines(text, 8));
+        };
+        if (tail.len > 0) {
+            try w.writeAll(",\"screen_tail\":");
+            try std.json.Stringify.value(tail, .{}, w);
+        }
+        try w.writeAll("}");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "term_run")) {
         const cmd = argStr(args, "command") orelse return appErr(arena, "term_run requires 'command'");
@@ -3512,6 +3810,1059 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
     return appErr(arena, "unknown tool");
 }
 
+// ── File transfer + port forwards ─────────────────────────────────
+
+/// Streaming SHA-256 of a local file; null when unreadable.
+fn sha256File(path: []const u8) ?[64]u8 {
+    var pbuf: [4096]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return null;
+    const f = c.fopen(path_z.ptr, "rb") orelse return null;
+    defer _ = c.fclose(f);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, f);
+        if (n == 0) break;
+        h.update(buf[0..n]);
+    }
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    var hex: [64]u8 = undefined;
+    const alphabet = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        hex[i * 2] = alphabet[b >> 4];
+        hex[i * 2 + 1] = alphabet[b & 0xf];
+    }
+    return hex;
+}
+
+fn fileSize(path: []const u8) ?u64 {
+    var pbuf: [4096]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return null;
+    var st: c.struct_stat = undefined;
+    if (c.stat(path_z.ptr, &st) != 0) return null;
+    return @intCast(@max(st.st_size, 0));
+}
+
+/// Local copy with checksum + atomic rename (the host==null transfer path).
+fn localCopyAtomic(arena: std.mem.Allocator, src: []const u8, dst: []const u8) !union(enum) { ok: struct { bytes: u64, sha: [64]u8 }, err: []const u8 } {
+    var sbuf: [4096]u8 = undefined;
+    const src_z = std.fmt.bufPrintZ(&sbuf, "{s}", .{src}) catch return .{ .err = "path too long" };
+    const part = try std.fmt.allocPrint(arena, "{s}.sketerm-part", .{dst});
+    var dbuf: [4096]u8 = undefined;
+    const part_z = std.fmt.bufPrintZ(&dbuf, "{s}", .{part}) catch return .{ .err = "path too long" };
+    const in = c.fopen(src_z.ptr, "rb") orelse return .{ .err = "cannot read the source file" };
+    defer _ = c.fclose(in);
+    const out = c.fopen(part_z.ptr, "wb") orelse return .{ .err = "cannot write the destination (parent dir missing or not writable?)" };
+    var total: u64 = 0;
+    var buf: [65536]u8 = undefined;
+    var write_failed = false;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, in);
+        if (n == 0) break;
+        if (c.fwrite(&buf, 1, n, out) != n) {
+            write_failed = true;
+            break;
+        }
+        total += n;
+    }
+    const flush_bad = c.fclose(out) != 0;
+    if (write_failed or flush_bad) {
+        _ = c.unlink(part_z.ptr);
+        return .{ .err = "short write copying the file (disk full?)" };
+    }
+    const src_sha = sha256File(src) orelse return .{ .err = "cannot hash the source file" };
+    const part_sha = sha256File(part) orelse return .{ .err = "cannot hash the copied file" };
+    if (!std.mem.eql(u8, &src_sha, &part_sha)) {
+        _ = c.unlink(part_z.ptr);
+        return .{ .err = "checksum mismatch after local copy" };
+    }
+    var fbuf: [4096]u8 = undefined;
+    const dst_z = std.fmt.bufPrintZ(&fbuf, "{s}", .{dst}) catch return .{ .err = "path too long" };
+    if (c.rename(part_z.ptr, dst_z.ptr) != 0) {
+        _ = c.unlink(part_z.ptr);
+        return .{ .err = "atomic rename to the destination failed" };
+    }
+    return .{ .ok = .{ .bytes = total, .sha = src_sha } };
+}
+
+/// Ask the kernel for a free loopback TCP port.
+fn pickFreePort() ?u16 {
+    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+    var addr: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_port = 0;
+    _ = c.inet_pton(c.AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) != 0) return null;
+    var out: c.struct_sockaddr_in = undefined;
+    var olen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+    if (c.getsockname(fd, @ptrCast(&out), &olen) != 0) return null;
+    const port = std.mem.bigToNative(u16, out.sin_port);
+    if (port == 0) return null;
+    return port;
+}
+
+/// Can something be connected to on 127.0.0.1:port right now?
+fn tcpListening(port: u16, timeout_ms: i64) bool {
+    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    defer _ = c.close(fd);
+    const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+    _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+    var addr: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_port = c.htons(port);
+    _ = c.inet_pton(c.AF_INET, "127.0.0.1", &addr.sin_addr);
+    const rc = c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in));
+    if (rc == 0) return true;
+    if (std.posix.errno(rc) != .INPROGRESS) return false;
+    var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
+    if (c.poll(&pfd, 1, @intCast(std.math.clamp(timeout_ms, 1, 30_000))) <= 0) return false;
+    var so_err: c_int = 0;
+    var slen: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &so_err, &slen) != 0) return false;
+    return so_err == 0;
+}
+
+/// Run a short-lived argv (scp / ssh command) in an unregistered
+/// headless terminal, wait for its exit, and hand back status + the
+/// rendered output. `.output` is arena-owned.
+const ArgvRun = struct { exited: bool, status: i32, status_known: bool, output: []const u8 };
+fn runArgvTerm(arena: std.mem.Allocator, argv: []const []const u8, timeout_ms: i64) !union(enum) { run: ArgvRun, err: []const u8 } {
+    const t = termdrive.Term.spawn(term_state.allocator, argv, 120, 30, term_state.mux_sock) catch
+        return .{ .err = "spawn failed (mux daemon unreachable?)" };
+    defer t.deinit();
+    const exited = t.waitExit(timeout_ms);
+    const output = blk: {
+        const text = t.readScreen(true) catch break :blk "";
+        defer term_state.allocator.free(text);
+        break :blk try arena.dupe(u8, std.mem.trim(u8, text, "\n "));
+    };
+    return .{ .run = .{
+        .exited = exited,
+        .status = t.exit_status,
+        .status_known = t.exit_status_known,
+        .output = output,
+    } };
+}
+
+/// Shell-quote into an arena string.
+fn quoted(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(arena);
+    try shellquote.appendQuoted(&list, arena, s);
+    return arena.dupe(u8, list.items);
+}
+
+/// Find a 64-char lowercase-hex token in text (remote sha output).
+fn findHex64(text: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + 64 <= text.len) : (i += 1) {
+        var ok = true;
+        var j: usize = 0;
+        while (j < 64) : (j += 1) {
+            const ch = text[i + j];
+            if (!((ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f'))) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            // Must not be part of a longer run.
+            const before_ok = i == 0 or !std.ascii.isHex(text[i - 1]);
+            const after_ok = i + 64 == text.len or !std.ascii.isHex(text[i + 64]);
+            if (before_ok and after_ok) return text[i .. i + 64];
+        }
+    }
+    return null;
+}
+
+fn xferOk(arena: std.mem.Allocator, direction: []const u8, path: []const u8, bytes: ?u64, sha: []const u8) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("{{\"ok\":true,\"direction\":\"{s}\",\"path\":", .{direction});
+    try std.json.Stringify.value(path, .{}, w);
+    if (bytes) |b| try w.print(",\"bytes\":{d}", .{b});
+    try w.print(",\"sha256\":\"{s}\",\"verified\":true,\"atomic\":true}}", .{sha});
+    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+}
+
+fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
+    const eql = std.mem.eql;
+    if (term_state.mux_sock == null)
+        return appErr(arena, "file transfer / port forward tools need isolated mode (they run over private headless terminals)");
+
+    if (eql(u8, name, "upload_file") or eql(u8, name, "download_file")) {
+        const upload = eql(u8, name, "upload_file");
+        const local = argStr(args, "local_path") orelse return appErr(arena, "requires 'local_path'");
+        const remote = argStr(args, "remote_path") orelse return appErr(arena, "requires 'remote_path'");
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 120_000;
+        const host = argStr(args, "host");
+
+        if (host == null) {
+            const src = if (upload) local else remote;
+            const dst = if (upload) remote else local;
+            switch (try localCopyAtomic(arena, src, dst)) {
+                .ok => |r| return xferOk(arena, if (upload) "upload" else "download", dst, r.bytes, &r.sha),
+                .err => |e| return appErr(arena, e),
+            }
+        }
+        const h = host.?;
+
+        if (upload) {
+            const local_sha = sha256File(local) orelse return appErr(arena, "cannot read/hash the local file");
+            const bytes = fileSize(local);
+            const tmp = try std.fmt.allocPrint(arena, "{s}.sketerm-part", .{remote});
+            const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ h, tmp });
+            switch (try runArgvTerm(arena, &.{ "scp", "-q", "-o", "BatchMode=yes", local, spec }, timeout_ms)) {
+                .err => |e| return appErr(arena, e),
+                .run => |r| {
+                    if (!r.exited) return appErr(arena, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
+                    if (!r.status_known or r.status != 0)
+                        return appErr(arena, try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }));
+                },
+            }
+            // Verify + atomic move in ONE remote command; echo tokens
+            // report the branch taken (no local shell echo — ssh runs
+            // the command directly).
+            const script = try std.fmt.allocPrint(
+                arena,
+                "sha=$(sha256sum {s} 2>/dev/null | cut -c1-64) || sha=fail; if [ \"$sha\" = \"{s}\" ]; then mv -f {s} {s} && echo SK_MOVED || echo SK_MVFAIL; else echo \"SK_SHA:$sha\"; rm -f {s}; fi",
+                .{ try quoted(arena, tmp), local_sha, try quoted(arena, tmp), try quoted(arena, remote), try quoted(arena, tmp) },
+            );
+            switch (try runArgvTerm(arena, &.{ "ssh", "-o", "BatchMode=yes", h, script }, 30_000)) {
+                .err => |e| return appErr(arena, e),
+                .run => |r| {
+                    if (std.mem.indexOf(u8, r.output, "SK_MOVED") != null)
+                        return xferOk(arena, "upload", remote, bytes, &local_sha);
+                    if (std.mem.indexOf(u8, r.output, "SK_MVFAIL") != null)
+                        return appErr(arena, "checksum verified but the atomic move failed on the remote (target dir not writable?)");
+                    if (std.mem.indexOf(u8, r.output, "SK_SHA:fail") != null)
+                        return appErr(arena, "remote has no usable sha256sum — cannot verify; file left absent (partial removed)");
+                    return appErr(arena, try std.fmt.allocPrint(arena, "remote checksum mismatch — corrupt transfer discarded:\n{s}", .{r.output}));
+                },
+            }
+        }
+
+        // download
+        const part = try std.fmt.allocPrint(arena, "{s}.sketerm-part", .{local});
+        const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ h, remote });
+        switch (try runArgvTerm(arena, &.{ "scp", "-q", "-o", "BatchMode=yes", spec, part }, timeout_ms)) {
+            .err => |e| return appErr(arena, e),
+            .run => |r| {
+                if (!r.exited) return appErr(arena, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
+                if (!r.status_known or r.status != 0)
+                    return appErr(arena, try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }));
+            },
+        }
+        const part_sha = sha256File(part) orelse return appErr(arena, "downloaded file vanished before hashing");
+        const bytes = fileSize(part);
+        const script = try std.fmt.allocPrint(arena, "sha256sum {s} 2>/dev/null | cut -c1-64", .{try quoted(arena, remote)});
+        switch (try runArgvTerm(arena, &.{ "ssh", "-o", "BatchMode=yes", h, script }, 30_000)) {
+            .err => |e| return appErr(arena, e),
+            .run => |r| {
+                const remote_sha = findHex64(r.output) orelse
+                    return appErr(arena, try std.fmt.allocPrint(arena, "remote sha256sum gave no hash — cannot verify (partial kept at {s}):\n{s}", .{ part, r.output }));
+                if (!std.mem.eql(u8, remote_sha, &part_sha)) {
+                    var pbuf: [4096]u8 = undefined;
+                    if (std.fmt.bufPrintZ(&pbuf, "{s}", .{part})) |pz| _ = c.unlink(pz.ptr) else |_| {}
+                    return appErr(arena, "checksum mismatch — corrupt download discarded");
+                }
+            },
+        }
+        var pbuf: [4096]u8 = undefined;
+        var dbuf: [4096]u8 = undefined;
+        const part_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{part}) catch return appErr(arena, "path too long");
+        const local_z = std.fmt.bufPrintZ(&dbuf, "{s}", .{local}) catch return appErr(arena, "path too long");
+        if (c.rename(part_z.ptr, local_z.ptr) != 0)
+            return appErr(arena, "atomic rename into place failed");
+        return xferOk(arena, "download", local, bytes, &part_sha);
+    }
+
+    if (eql(u8, name, "port_forward_open")) {
+        const h = argStr(args, "host") orelse return appErr(arena, "port_forward_open requires 'host'");
+        const rp_i = argInt(args, "remote_port") orelse return appErr(arena, "port_forward_open requires 'remote_port'");
+        if (rp_i < 1 or rp_i > 65535) return appErr(arena, "remote_port out of range");
+        const rp: u16 = @intCast(rp_i);
+        const rh = argStr(args, "remote_host") orelse "127.0.0.1";
+        const lp: u16 = if (argInt(args, "local_port")) |v| blk: {
+            if (v < 1 or v > 65535) return appErr(arena, "local_port out of range");
+            break :blk @intCast(v);
+        } else pickFreePort() orelse return appErr(arena, "could not pick a free local port");
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 20_000;
+
+        const t = spawnForwardTerm(arena, h, lp, rh, rp) catch
+            return appErr(arena, "spawn failed (mux daemon unreachable?)");
+        switch (try waitForwardReady(arena, t, lp, timeout_ms)) {
+            .ready => {},
+            .err => |e| {
+                t.deinit();
+                return appErr(arena, e);
+            },
+        }
+        const a = forward_state.allocator;
+        const f = a.create(Forward) catch {
+            t.deinit();
+            return error.OutOfMemory;
+        };
+        f.* = .{
+            .id = forward_state.next_id,
+            .host = a.dupe(u8, h) catch return error.OutOfMemory,
+            .local_port = lp,
+            .remote_host = a.dupe(u8, rh) catch return error.OutOfMemory,
+            .remote_port = rp,
+            .term = t,
+        };
+        forward_state.next_id += 1;
+        forward_state.forwards.put(a, f.id, f) catch {
+            t.deinit();
+            return error.OutOfMemory;
+        };
+        const msg = try std.fmt.allocPrint(arena, "{{\"forward\":{d},\"local_port\":{d},\"remote\":\"{s}:{d}\",\"host\":\"{s}\",\"listening\":true}}", .{ f.id, lp, rh, rp, h });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "port_forward_list")) {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("[");
+        for (forward_state.forwards.values(), 0..) |f, i| {
+            if (i > 0) try w.writeAll(",");
+            f.term.drain();
+            try w.print("{{\"forward\":{d},\"host\":\"{s}\",\"local_port\":{d},\"remote\":\"{s}:{d}\",\"alive\":{},\"reconnects\":{d}}}", .{ f.id, f.host, f.local_port, f.remote_host, f.remote_port, !f.term.exited, f.reconnects });
+        }
+        try w.writeAll("]");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+
+    const f = forwardFromArgs(args) orelse
+        return appErr(arena, "no such forward (pass 'forward' from port_forward_open, or omit it when only one is open)");
+
+    if (eql(u8, name, "port_forward_check")) {
+        f.term.drain();
+        var reconnected = false;
+        if (f.term.exited) {
+            // The ssh process died (network blip, sshd restart):
+            // respawn the same spec — this IS the reconnect behavior.
+            const nt = spawnForwardTerm(arena, f.host, f.local_port, f.remote_host, f.remote_port) catch
+                return appErr(arena, "forward is dead and respawn failed (mux daemon unreachable?)");
+            switch (try waitForwardReady(arena, nt, f.local_port, argInt(args, "timeout_ms") orelse 20_000)) {
+                .ready => {
+                    f.term.deinit();
+                    f.term = nt;
+                    f.reconnects += 1;
+                    reconnected = true;
+                },
+                .err => |e| {
+                    nt.deinit();
+                    return appErr(arena, try std.fmt.allocPrint(arena, "forward is dead and the reconnect failed: {s}", .{e}));
+                },
+            }
+        }
+        const listening = tcpListening(f.local_port, 2_000);
+        const msg = try std.fmt.allocPrint(arena, "{{\"forward\":{d},\"alive\":{},\"listening\":{},\"reconnected\":{},\"local_port\":{d}}}", .{ f.id, !f.term.exited, listening, reconnected, f.local_port });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "port_forward_close")) {
+        forward_state.removeOne(f);
+        return toolResult(arena, "forward closed", false) orelse error.OutOfMemory;
+    }
+    return appErr(arena, "unknown tool");
+}
+
+fn spawnForwardTerm(arena: std.mem.Allocator, host: []const u8, lp: u16, rh: []const u8, rp: u16) !*termdrive.Term {
+    const bindspec = try std.fmt.allocPrint(arena, "127.0.0.1:{d}:{s}:{d}", .{ lp, rh, rp });
+    const argv = [_][]const u8{
+        "ssh",                      "-N",
+        "-T",                       "-o",
+        "BatchMode=yes",            "-o",
+        "ExitOnForwardFailure=yes", "-o",
+        "ServerAliveInterval=15",   "-o",
+        "ServerAliveCountMax=4",    "-L",
+        bindspec,                   host,
+    };
+    return termdrive.Term.spawn(term_state.allocator, &argv, 120, 30, term_state.mux_sock) catch return error.SpawnFailed;
+}
+
+fn waitForwardReady(arena: std.mem.Allocator, t: *termdrive.Term, lp: u16, timeout_ms: i64) !union(enum) { ready, err: []const u8 } {
+    const deadline = monoMs() + timeout_ms;
+    while (true) {
+        t.drain();
+        if (t.exited) {
+            const tail = blk: {
+                const text = t.readScreen(false) catch break :blk "";
+                defer term_state.allocator.free(text);
+                break :blk try arena.dupe(u8, tailLines(text, 6));
+            };
+            return .{ .err = try std.fmt.allocPrint(arena, "ssh exited (status {d}) before the forward came up:\n{s}", .{ t.exit_status, tail }) };
+        }
+        if (tcpListening(lp, 300)) return .ready;
+        if (monoMs() >= deadline) {
+            const tail = blk: {
+                const text = t.readScreen(false) catch break :blk "";
+                defer term_state.allocator.free(text);
+                break :blk try arena.dupe(u8, tailLines(text, 6));
+            };
+            return .{ .err = try std.fmt.allocPrint(arena, "the local forward port never started listening within the timeout (auth failure? host unreachable?):\n{s}", .{tail}) };
+        }
+        _ = t.pumpOnce(200);
+    }
+}
+
+// ── Capabilities preflight ────────────────────────────────────────
+
+/// PATH search; arena-owned absolute path or null.
+fn findExecutable(arena: std.mem.Allocator, exe: []const u8) ?[]const u8 {
+    const path_env = c.getenv("PATH") orelse return null;
+    var it = std.mem.splitScalar(u8, std.mem.span(@as([*:0]const u8, @ptrCast(path_env))), ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        var buf: [4096]u8 = undefined;
+        const full_z = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, exe }) catch continue;
+        if (c.access(full_z.ptr, c.X_OK) == 0) {
+            return arena.dupe(u8, full_z) catch null;
+        }
+    }
+    return null;
+}
+
+const BROWSER_CANDIDATES = [_][]const u8{
+    "chromium", "chromium-browser", "google-chrome-stable", "google-chrome", "chrome", "brave", "brave-browser", "vivaldi-stable", "vivaldi", "microsoft-edge-stable", "microsoft-edge",
+};
+
+/// Basename-prefix match for the Chromium family (incl. Electron).
+fn chromiumFamily(arg0: []const u8) bool {
+    const base = std.fs.path.basename(arg0);
+    const prefixes = [_][]const u8{ "chromium", "chrome", "google-chrome", "brave", "vivaldi", "microsoft-edge", "opera", "electron" };
+    for (prefixes) |p| {
+        if (std.mem.startsWith(u8, base, p)) return true;
+    }
+    return false;
+}
+
+fn findBrowserBinary(arena: std.mem.Allocator) ?[]const u8 {
+    for (BROWSER_CANDIDATES) |cand| {
+        if (findExecutable(arena, cand)) |p| return p;
+    }
+    return null;
+}
+
+fn capabilitiesTool(arena: std.mem.Allocator) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("{{\"mode\":\"{s}\",\"gui_socket\":{},\"headless_terminals\":{},\"transfers_and_forwards\":{}", .{
+        srv_mode, srv_gui_socket, term_state.mux_sock != null, term_state.mux_sock != null,
+    });
+    const ocr_ok = ocr.available();
+    try w.print(",\"ocr\":{}", .{ocr_ok});
+    if (!ocr_ok) try w.writeAll(",\"ocr_hint\":\"app_read_text/app_wait_text need libtesseract — install tesseract + tesseract-data-eng on THIS machine\"");
+    if (findBrowserBinary(arena)) |bp| {
+        try w.writeAll(",\"browser\":");
+        try std.json.Stringify.value(bp, .{}, w);
+        try w.writeAll(",\"browser_hint\":\"browser_open launches it headless with CDP DOM access (browser_read/click/fill/wait)\"");
+    } else {
+        try w.writeAll(",\"browser\":null,\"browser_hint\":\"no Chromium-family binary on PATH — browser_* tools unavailable; install chromium\"");
+    }
+    try w.print(",\"ssh\":{},\"scp\":{}", .{ findExecutable(arena, "ssh") != null, findExecutable(arena, "scp") != null });
+    try w.print(",\"open_terms\":{d},\"open_apps\":{d},\"open_forwards\":{d},\"browser_sessions\":{d}}}", .{
+        term_state.terms.count(), app_state.apps.count(), forward_state.forwards.count(), browser_state.sessions.count(),
+    });
+    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+}
+
+// ── Browser automation (CDP) ─────────────────────────────────────
+//
+// browser_open launches a Chromium-family binary headlessly under the
+// Wayland session with --remote-debugging-port=0, discovers the real
+// DevTools port from the app log, and attaches a WebSocket CDP client.
+// The browser is a NORMAL app (screenshot_app/app_click/app_key all
+// work); the browser_* tools add DOM-level reading, clicking, filling
+// and waiting — trusted input goes through CDP Input.dispatch*.
+
+fn sleepMsLocal(ms: u32) void {
+    var ts: c.struct_timespec = .{ .tv_sec = ms / 1000, .tv_nsec = @as(c_long, ms % 1000) * 1_000_000 };
+    _ = c.nanosleep(&ts, null);
+}
+
+fn mkdirs(path: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    if (path.len >= buf.len) return;
+    var i: usize = 1;
+    while (i <= path.len) : (i += 1) {
+        if (i == path.len or path[i] == '/') {
+            @memcpy(buf[0..i], path[0..i]);
+            buf[i] = 0;
+            _ = c.mkdir(buf[0..i :0].ptr, 0o700);
+        }
+    }
+}
+
+/// Poll the app's log ring for Chromium's "DevTools listening" line.
+fn discoverDevtoolsPort(app: *appdrive.App, timeout_ms: i64) ?u16 {
+    const deadline = monoMs() + timeout_ms;
+    while (monoMs() < deadline) {
+        app.drain();
+        if (app.logGet("{\"tail\":300,\"from_id\":0,\"id\":0,\"max_chars\":300}", 3_000)) |reply| {
+            defer app_state.allocator.free(reply);
+            if (cdp.parseDevtoolsPort(reply)) |port| return port;
+        } else |_| {}
+        if (app.exited) return null;
+        _ = app.pumpOnce(250);
+    }
+    return null;
+}
+
+/// A JSON string literal (valid JS literal) for embedding in scripts.
+fn jsStr(arena: std.mem.Allocator, s: ?[]const u8) ![]const u8 {
+    const v = s orelse return "null";
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(v, .{}, &aw.writer);
+    return aw.written();
+}
+
+const BrowserGet = union(enum) { bs: *BrowserSession, err: []const u8 };
+
+fn browserEnsure(arena: std.mem.Allocator, app: *appdrive.App) !BrowserGet {
+    app.drain();
+    if (app.exited) {
+        const summary = try appSummary(arena, app);
+        return .{ .err = try std.fmt.allocPrint(arena, "the browser has exited\n{s}", .{summary}) };
+    }
+    const bs = browser_state.sessions.get(appIdOf(app)) orelse
+        return .{ .err = "this app has no CDP session — open pages with browser_open (or drive it with the app_* tools)" };
+    if (!bs.client.connected()) {
+        bs.client.attach(5_000) catch
+            return .{ .err = "cannot reattach the DevTools socket (browser hung or DevTools disabled?) — screenshots and app_* input still work" };
+    }
+    return .{ .bs = bs };
+}
+
+const BEvalOut = union(enum) { val: ?[]const u8, err: []const u8 };
+
+/// Evaluate JS with one transparent reconnect (navigation can replace
+/// the page target, killing the WebSocket).
+fn bEval(arena: std.mem.Allocator, bs: *BrowserSession, expr: []const u8, timeout_ms: i64) BEvalOut {
+    var attempt: u32 = 0;
+    while (true) {
+        const r = bs.client.eval(arena, expr, timeout_ms) catch |err| {
+            if (attempt == 0 and (err == cdp.Error.Closed or err == cdp.Error.Protocol)) {
+                attempt = 1;
+                bs.client.attach(5_000) catch
+                    return .{ .err = "the DevTools connection dropped and could not be reattached" };
+                continue;
+            }
+            return .{ .err = switch (err) {
+                cdp.Error.Timeout => "the page did not answer in time (JS blocked / page hung?)",
+                cdp.Error.Closed => "the DevTools connection closed",
+                else => "DevTools protocol error",
+            } };
+        };
+        if (r.exception) |ex|
+            return .{ .err = std.fmt.allocPrint(arena, "JavaScript exception: {s}", .{ex}) catch "JavaScript exception" };
+        return .{ .val = r.value_json };
+    }
+}
+
+const PageInfo = struct { url: []const u8, title: []const u8, ready: []const u8 };
+
+fn browserPageInfo(arena: std.mem.Allocator, bs: *BrowserSession, timeout_ms: i64) ?PageInfo {
+    const out = bEval(arena, bs, "location.href + '\\u0001' + document.title + '\\u0001' + document.readyState", timeout_ms);
+    const vj = (switch (out) {
+        .val => |v| v,
+        .err => null,
+    }) orelse return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, vj, .{}) catch return null;
+    if (parsed != .string) return null;
+    var it = std.mem.splitScalar(u8, parsed.string, 1);
+    const url = it.next() orelse return null;
+    const title = it.next() orelse "";
+    const ready = it.next() orelse "";
+    return .{ .url = url, .title = title, .ready = ready };
+}
+
+/// The shared element finder: selector and/or visible-text filter over
+/// interactive elements; tightest text match first.
+fn elementFinderJs(arena: std.mem.Allocator, selector: ?[]const u8, text: ?[]const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena,
+        \\const sel = {s}; const txt = {s};
+        \\let els; let badSelector = false;
+        \\try {{ els = sel ? Array.from(document.querySelectorAll(sel)) : Array.from(document.querySelectorAll("a,button,input,select,textarea,summary,[role='button'],[role='link'],[role='tab'],[role='menuitem'],[role='option'],[role='checkbox'],[role='radio'],[onclick],label")); }}
+        \\catch (e) {{ els = []; badSelector = true; }}
+        \\const vis = e => {{ const r = e.getBoundingClientRect(); if (r.width <= 0 || r.height <= 0) return false; const s = getComputedStyle(e); return s.visibility !== 'hidden' && s.display !== 'none'; }};
+        \\els = els.filter(vis);
+        \\if (txt) {{ const q = txt.toLowerCase(); els = els.filter(e => ((e.innerText || '') + ' ' + (e.value || '') + ' ' + (e.getAttribute('aria-label') || '') + ' ' + (e.getAttribute('placeholder') || '') + ' ' + (e.getAttribute('title') || '')).toLowerCase().includes(q)); els.sort((a, b) => ((a.innerText || '').length) - ((b.innerText || '').length)); }}
+    , .{ try jsStr(arena, selector), try jsStr(arena, text) });
+}
+
+fn browserErrOr(arena: std.mem.Allocator, out: BEvalOut) !?[]const u8 {
+    switch (out) {
+        .err => |e| return @as(?[]const u8, try appErr(arena, e)),
+        .val => return null,
+    }
+}
+
+fn browserTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
+    const eql = std.mem.eql;
+    if (!app_state.ready)
+        return appErr(arena, "browser tools unavailable (server not fully started)");
+
+    if (eql(u8, name, "browser_open")) {
+        if (argStr(args, "host") != null)
+            return appErr(arena, "browser_open is local-only (the DevTools port lives on the daemon host's loopback); for a remote browser, launch_app it and drive it with app_* tools");
+        const bin = argStr(args, "browser_path") orelse (findBrowserBinary(arena) orelse
+            return appErr(arena, "no Chromium-family browser found on PATH (install chromium) — pass 'browser_path' to use a specific binary"));
+        const url = argStr(args, "url") orelse "about:blank";
+        const wait_ms: i64 = argInt(args, "wait_ms") orelse 25_000;
+        const width: i64 = std.math.clamp(argInt(args, "width") orelse 1280, 320, 3840);
+        const height: i64 = std.math.clamp(argInt(args, "height") orelse 900, 240, 2160);
+
+        // Profile: named = persistent under the state dir (cookies and
+        // logins survive); default = throwaway per launch.
+        var profile_dir: []const u8 = undefined;
+        if (argStr(args, "profile")) |p| {
+            if (!mcpassets.validName(p)) return appErr(arena, "invalid profile name (letters, digits, . _ - only)");
+            const state_base = if (c.getenv("XDG_STATE_HOME")) |sh|
+                try std.fmt.allocPrint(arena, "{s}", .{std.mem.span(@as([*:0]const u8, @ptrCast(sh)))})
+            else if (c.getenv("HOME")) |home|
+                try std.fmt.allocPrint(arena, "{s}/.local/state", .{std.mem.span(@as([*:0]const u8, @ptrCast(home)))})
+            else
+                return appErr(arena, "no HOME to place the profile in");
+            profile_dir = try std.fmt.allocPrint(arena, "{s}/sketerm/browser-profiles/{s}", .{ state_base, p });
+        } else {
+            const rt = if (c.getenv("XDG_RUNTIME_DIR")) |r| std.mem.span(@as([*:0]const u8, @ptrCast(r))) else "/tmp";
+            profile_dir = try std.fmt.allocPrint(arena, "{s}/sketerm/browser-ephemeral-{d}-{d}", .{ rt, c.getpid(), app_state.next_id });
+        }
+        mkdirs(profile_dir);
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(arena);
+        try argv.appendSlice(arena, &.{
+            bin,
+            "--ozone-platform=wayland",
+            "--remote-debugging-port=0",
+            try std.fmt.allocPrint(arena, "--user-data-dir={s}", .{profile_dir}),
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            "--force-renderer-accessibility",
+            try std.fmt.allocPrint(arena, "--window-size={d},{d}", .{ width, height }),
+            url,
+        });
+        const app = appdrive.App.launch(app_state.allocator, argv.items, .{
+            .cols = 100,
+            .rows = 30,
+            .local_sock = app_state.mux_sock,
+        }) catch {
+            const why = appdrive.lastLaunchErr();
+            return appErr(arena, if (why.len > 0)
+                try std.fmt.allocPrint(arena, "browser spawn failed — {s}", .{why})
+            else
+                "browser spawn failed (mux daemon unreachable?)");
+        };
+        const id = app_state.next_id;
+        app_state.next_id += 1;
+        app_state.apps.put(app_state.allocator, id, app) catch {
+            app.deinit();
+            return error.OutOfMemory;
+        };
+        const started = monoMs();
+        _ = app.waitFirstWindow(wait_ms);
+        const port = discoverDevtoolsPort(app, @max(0, wait_ms - (monoMs() - started))) orelse {
+            const summary = try appSummary(arena, app);
+            return toolResult(arena, try std.fmt.allocPrint(arena, "the browser started but never announced a DevTools port — CDP tools unavailable, app_* tools still work (app {d})\n{s}", .{ id, summary }), true) orelse error.OutOfMemory;
+        };
+        const bs = browser_state.allocator.create(BrowserSession) catch return error.OutOfMemory;
+        bs.* = .{ .client = cdp.Client.init(browser_state.allocator, port) };
+        browser_state.sessions.put(browser_state.allocator, id, bs) catch {
+            bs.client.deinit();
+            browser_state.allocator.destroy(bs);
+            return error.OutOfMemory;
+        };
+        // The HTTP endpoint answers slightly before the first page
+        // target exists; retry the attach briefly.
+        var attach_deadline = monoMs() + 10_000;
+        while (true) {
+            bs.client.attach(4_000) catch {
+                if (monoMs() < attach_deadline) {
+                    sleepMsLocal(300);
+                    continue;
+                }
+                const summary = try appSummary(arena, app);
+                return toolResult(arena, try std.fmt.allocPrint(arena, "browser is up (app {d}, DevTools port {d}) but no page target became attachable\n{s}", .{ id, port, summary }), true) orelse error.OutOfMemory;
+            };
+            break;
+        }
+        // Best-effort: let the initial page settle.
+        attach_deadline = monoMs() + 8_000;
+        while (monoMs() < attach_deadline) {
+            if (browserPageInfo(arena, bs, 3_000)) |info| {
+                if (!eql(u8, info.ready, "loading")) break;
+            }
+            sleepMsLocal(300);
+        }
+        _ = app.waitIdle(300, 3_000);
+        var summary = try appSummary(arena, app);
+        summary = try std.fmt.allocPrint(arena, "browser open: app {d}, DevTools port {d} — read with browser_read/browser_elements, interact with browser_click/browser_fill, verify with browser_info; screenshots via get_app_state\n{s}", .{ id, port, summary });
+        var shot_win: u32 = 0;
+        for (app.windows.items) |win| {
+            if (!win.popup and win.frames > 0) {
+                shot_win = win.id;
+                break;
+            }
+        }
+        if (shot_win != 0) {
+            if (app.screenshotPng(shot_win, 1568, null, 1)) |shot| {
+                defer app_state.allocator.free(shot.png);
+                const caption = try screenshotCaption(arena, app, shot_win, shot, summary);
+                if (imageResult(arena, caption, shot.png)) |r| return r;
+            } else |_| {}
+        }
+        return toolResult(arena, summary, false) orelse error.OutOfMemory;
+    }
+
+    const app = appFromArgs(args) orelse
+        return appErr(arena, "unknown app (pass 'app' from browser_open; use list_apps)");
+    const bs = switch (try browserEnsure(arena, app)) {
+        .bs => |b| b,
+        .err => |e| return toolResult(arena, e, true) orelse error.OutOfMemory,
+    };
+
+    if (eql(u8, name, "browser_info")) {
+        const out = bEval(arena, bs,
+            \\({url: location.href, title: document.title, ready: document.readyState, scroll_y: Math.round(scrollY), doc_height: document.documentElement.scrollHeight, viewport: [innerWidth, innerHeight]})
+        , argInt(args, "timeout_ms") orelse 8_000);
+        if (try browserErrOr(arena, out)) |e| return e;
+        return toolResult(arena, out.val orelse "null", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "browser_navigate")) {
+        const url_arg = argStr(args, "url") orelse return appErr(arena, "browser_navigate requires 'url' (or \"back\"/\"forward\"/\"reload\")");
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 20_000;
+        if (eql(u8, url_arg, "back") or eql(u8, url_arg, "forward")) {
+            const js = if (eql(u8, url_arg, "back")) "history.back(); true" else "history.forward(); true";
+            const out = bEval(arena, bs, js, 5_000);
+            if (try browserErrOr(arena, out)) |e| return e;
+        } else if (eql(u8, url_arg, "reload")) {
+            _ = bs.client.call(arena, "Page.reload", "{}", 5_000) catch {};
+        } else {
+            const url = if (std.mem.indexOf(u8, url_arg, "://") != null)
+                url_arg
+            else
+                try std.fmt.allocPrint(arena, "https://{s}", .{url_arg});
+            const params = try std.fmt.allocPrint(arena, "{{\"url\":{s}}}", .{try jsStr(arena, url)});
+            const resp = bs.client.call(arena, "Page.navigate", params, 10_000) catch |err| return appErr(arena, switch (err) {
+                cdp.Error.Timeout => "navigation request timed out",
+                else => "navigation failed (DevTools connection lost?)",
+            });
+            if (std.mem.indexOf(u8, resp, "\"errorText\"") != null)
+                return appErr(arena, try std.fmt.allocPrint(arena, "navigation refused: {s}", .{resp}));
+        }
+        // Wait for the load to settle (target may be replaced —
+        // browserPageInfo reattaches transparently via bEval).
+        const deadline = monoMs() + timeout_ms;
+        var last: ?PageInfo = null;
+        while (monoMs() < deadline) {
+            sleepMsLocal(300);
+            if (browserPageInfo(arena, bs, 3_000)) |info| {
+                last = info;
+                if (eql(u8, info.ready, "complete")) break;
+            }
+        }
+        const info = last orelse return appErr(arena, "navigation started but the page never became readable before the timeout");
+        const msg = try std.fmt.allocPrint(arena, "{{\"url\":{s},\"title\":{s},\"ready\":\"{s}\"}}", .{ try jsStr(arena, info.url), try jsStr(arena, info.title), info.ready });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "browser_eval")) {
+        const js = argStr(args, "js") orelse return appErr(arena, "browser_eval requires 'js'");
+        const out = bEval(arena, bs, js, argInt(args, "timeout_ms") orelse 10_000);
+        if (try browserErrOr(arena, out)) |e| return e;
+        const v = out.val orelse "undefined";
+        const capped = if (v.len > 100_000) try std.fmt.allocPrint(arena, "{s}\n[truncated: {d} of {d} chars]", .{ v[0..100_000], @as(usize, 100_000), v.len }) else v;
+        return toolResult(arena, capped, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "browser_read")) {
+        const format = argStr(args, "format") orelse "text";
+        const selector = argStr(args, "selector");
+        const max_chars: usize = @intCast(std.math.clamp(argInt(args, "max_chars") orelse 20_000, 200, 200_000));
+        var js: []const u8 = undefined;
+        if (eql(u8, format, "text")) {
+            js = try std.fmt.allocPrint(arena,
+                \\(() => {{ const sel = {s}; const el = sel ? document.querySelector(sel) : document.body; if (!el) return null; return el.innerText; }})()
+            , .{try jsStr(arena, selector)});
+        } else if (eql(u8, format, "html")) {
+            js = try std.fmt.allocPrint(arena,
+                \\(() => {{ const sel = {s}; const el = sel ? document.querySelector(sel) : document.documentElement; if (!el) return null; return el.outerHTML; }})()
+            , .{try jsStr(arena, selector)});
+        } else if (eql(u8, format, "links")) {
+            js = try std.fmt.allocPrint(arena,
+                \\(() => {{ const sel = {s}; const root = sel ? document.querySelector(sel) : document; if (!root) return null; return JSON.stringify(Array.from(root.querySelectorAll('a[href]')).slice(0, 300).map(a => ({{text: (a.innerText || '').trim().slice(0, 120), href: a.href}}))); }})()
+            , .{try jsStr(arena, selector)});
+        } else {
+            return appErr(arena, "'format' must be text, html or links");
+        }
+        const out = bEval(arena, bs, js, argInt(args, "timeout_ms") orelse 10_000);
+        if (try browserErrOr(arena, out)) |e| return e;
+        const vj = out.val orelse return appErr(arena, "selector matched nothing");
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, vj, .{}) catch
+            return toolResult(arena, vj, false) orelse error.OutOfMemory;
+        if (parsed == .null) return appErr(arena, "selector matched nothing");
+        const content = if (parsed == .string) parsed.string else vj;
+        const info = browserPageInfo(arena, bs, 3_000);
+        const header = if (info) |i|
+            try std.fmt.allocPrint(arena, "page: {s}{s}{s}\n---\n", .{ i.url, if (i.title.len > 0) " — " else "", i.title })
+        else
+            "";
+        const capped = if (content.len > max_chars)
+            try std.fmt.allocPrint(arena, "{s}{s}\n[truncated: showing {d} of {d} chars — narrow with 'selector' or raise 'max_chars']", .{ header, content[0..max_chars], max_chars, content.len })
+        else
+            try std.fmt.allocPrint(arena, "{s}{s}", .{ header, content });
+        return toolResult(arena, capped, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "browser_elements")) {
+        const finder = try elementFinderJs(arena, argStr(args, "selector"), argStr(args, "text"));
+        const js = try std.fmt.allocPrint(arena,
+            \\(() => {{ {s}
+            \\if (badSelector) return 'bad selector';
+            \\return JSON.stringify(els.slice(0, 100).map((e, i) => {{ const r = e.getBoundingClientRect(); return {{n: i, tag: e.tagName.toLowerCase(), text: ((e.innerText || e.value || e.getAttribute('aria-label') || e.getAttribute('placeholder') || '').trim()).slice(0, 100), x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), w: Math.round(r.width), h: Math.round(r.height), href: e.href || undefined, type: e.type || undefined}}; }})); }})()
+        , .{finder});
+        const out = bEval(arena, bs, js, argInt(args, "timeout_ms") orelse 10_000);
+        if (try browserErrOr(arena, out)) |e| return e;
+        const vj = out.val orelse "[]";
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, vj, .{}) catch
+            return toolResult(arena, vj, false) orelse error.OutOfMemory;
+        if (parsed == .string and eql(u8, parsed.string, "bad selector"))
+            return appErr(arena, "invalid CSS selector");
+        const listing = if (parsed == .string) parsed.string else vj;
+        return toolResult(arena, try std.fmt.allocPrint(arena, "interactive elements (centers are viewport CSS px, valid for browser_click x/y):\n{s}", .{listing}), false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "browser_click")) {
+        const selector = argStr(args, "selector");
+        const text = argStr(args, "text");
+        var cx: f64 = 0;
+        var cy: f64 = 0;
+        var desc: []const u8 = "";
+        if (argFloat(args, "x")) |xv| {
+            cx = xv;
+            cy = argFloat(args, "y") orelse return appErr(arena, "'x' needs 'y'");
+            desc = try std.fmt.allocPrint(arena, "viewport point ({d:.0},{d:.0})", .{ cx, cy });
+        } else {
+            if (selector == null and text == null)
+                return appErr(arena, "browser_click needs 'selector' and/or 'text' (or explicit x/y viewport coords)");
+            const nth: i64 = argInt(args, "nth") orelse 0;
+            const finder = try elementFinderJs(arena, selector, text);
+            const js = try std.fmt.allocPrint(arena,
+                \\(() => {{ {s}
+                \\if (badSelector) return {{bad: true}};
+                \\const el = els[{d}]; if (!el) return {{found: els.length}};
+                \\el.scrollIntoView({{block: 'center', inline: 'center'}});
+                \\const r = el.getBoundingClientRect();
+                \\return {{found: els.length, x: r.x + r.width / 2, y: r.y + r.height / 2, tag: el.tagName.toLowerCase(), text: ((el.innerText || el.value || '').trim()).slice(0, 80)}}; }})()
+            , .{ finder, nth });
+            const out = bEval(arena, bs, js, argInt(args, "timeout_ms") orelse 10_000);
+            if (try browserErrOr(arena, out)) |e| return e;
+            const vj = out.val orelse return appErr(arena, "element lookup returned nothing");
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, vj, .{}) catch
+                return appErr(arena, "element lookup returned malformed data");
+            if (parsed != .object) return appErr(arena, "element lookup returned malformed data");
+            if (parsed.object.get("bad") != null) return appErr(arena, "invalid CSS selector");
+            const found: i64 = if (parsed.object.get("found")) |f| (if (f == .integer) f.integer else 0) else 0;
+            const xo = parsed.object.get("x") orelse
+                return appErr(arena, try std.fmt.allocPrint(arena, "no matching element (matched {d}, wanted index {d}) — browser_elements lists what IS clickable", .{ found, nth }));
+            cx = switch (xo) {
+                .float => xo.float,
+                .integer => @floatFromInt(xo.integer),
+                else => 0,
+            };
+            const yo = parsed.object.get("y").?;
+            cy = switch (yo) {
+                .float => yo.float,
+                .integer => @floatFromInt(yo.integer),
+                else => 0,
+            };
+            const tag = if (parsed.object.get("tag")) |t| (if (t == .string) t.string else "?") else "?";
+            const etext = if (parsed.object.get("text")) |t| (if (t == .string) t.string else "") else "";
+            desc = try std.fmt.allocPrint(arena, "<{s}> \"{s}\" of {d} match(es) at ({d:.0},{d:.0})", .{ tag, etext, found, cx, cy });
+        }
+        const button = switch (argInt(args, "button") orelse 1) {
+            2 => "middle",
+            3 => "right",
+            else => "left",
+        };
+        const clicks: u32 = @intCast(std.math.clamp(argInt(args, "clicks") orelse 1, 1, 3));
+        bs.client.clickAt(arena, cx, cy, button, clicks, 8_000) catch |err| return appErr(arena, switch (err) {
+            cdp.Error.Timeout => "the click was sent but the page did not acknowledge in time",
+            else => "click dispatch failed (DevTools connection lost?)",
+        });
+        _ = app.waitIdle(200, 2_000);
+        var msg = try std.fmt.allocPrint(arena, "clicked {s}", .{desc});
+        // Navigation may follow a click: report where we landed.
+        if (browserPageInfo(arena, bs, 3_000)) |info| {
+            msg = try std.fmt.allocPrint(arena, "{s}\npage: {s}{s}{s} ({s})", .{ msg, info.url, if (info.title.len > 0) " — " else "", info.title, info.ready });
+        }
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "browser_fill")) {
+        const selector = argStr(args, "selector");
+        const label = argStr(args, "text_label");
+        if (selector == null and label == null)
+            return appErr(arena, "browser_fill needs 'selector' (CSS) or 'text_label' (placeholder/label/aria text)");
+        const text = argStr(args, "value") orelse return appErr(arena, "browser_fill requires 'value' (the text to enter)");
+        const finder = try elementFinderJs(arena, selector orelse "input,textarea,select,[contenteditable]", label);
+        const nth: i64 = argInt(args, "nth") orelse 0;
+        const js = try std.fmt.allocPrint(arena,
+            \\(() => {{ {s}
+            \\if (badSelector) return {{bad: true}};
+            \\els = els.filter(e => e.matches('input,textarea,select,[contenteditable]') || e.querySelector('input,textarea,select'));
+            \\let el = els[{d}]; if (!el) return {{found: els.length}};
+            \\if (!el.matches('input,textarea,select,[contenteditable]')) el = el.querySelector('input,textarea,select');
+            \\if (!el) return {{found: 0}};
+            \\el.scrollIntoView({{block: 'center'}});
+            \\el.focus();
+            \\if (el.tagName === 'SELECT') return {{tag: 'select'}};
+            \\if (el.select) el.select();
+            \\else if (el.isContentEditable) {{ const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }}
+            \\return {{tag: el.tagName.toLowerCase(), name: el.name || el.id || ''}}; }})()
+        , .{ finder, nth });
+        const out = bEval(arena, bs, js, argInt(args, "timeout_ms") orelse 10_000);
+        if (try browserErrOr(arena, out)) |e| return e;
+        const vj = out.val orelse return appErr(arena, "field lookup returned nothing");
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, vj, .{}) catch
+            return appErr(arena, "field lookup returned malformed data");
+        if (parsed != .object) return appErr(arena, "field lookup returned malformed data");
+        if (parsed.object.get("bad") != null) return appErr(arena, "invalid CSS selector");
+        const tag = if (parsed.object.get("tag")) |t| (if (t == .string) t.string else null) else null;
+        if (tag == null) {
+            const found: i64 = if (parsed.object.get("found")) |f| (if (f == .integer) f.integer else 0) else 0;
+            return appErr(arena, try std.fmt.allocPrint(arena, "no matching editable field (matched {d}) — browser_elements shows the candidates", .{found}));
+        }
+        if (eql(u8, tag.?, "select")) {
+            // Dropdowns: choose the option whose text or value matches.
+            const sel_js = try std.fmt.allocPrint(arena,
+                \\(() => {{ const el = document.activeElement; if (!el || el.tagName !== 'SELECT') return 'lost focus';
+                \\const want = {s}.toLowerCase();
+                \\const idx = Array.from(el.options).findIndex(o => o.value.toLowerCase() === want || o.text.toLowerCase().includes(want));
+                \\if (idx < 0) return 'no option matching';
+                \\el.selectedIndex = idx; el.dispatchEvent(new Event('input', {{bubbles: true}})); el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                \\return 'selected: ' + el.options[idx].text; }})()
+            , .{try jsStr(arena, text)});
+            const sout = bEval(arena, bs, sel_js, 8_000);
+            if (try browserErrOr(arena, sout)) |e| return e;
+            return toolResult(arena, sout.val orelse "null", false) orelse error.OutOfMemory;
+        }
+        if (text.len == 0) {
+            const clear = bEval(arena, bs, "(() => { const el = document.activeElement; if (el.isContentEditable) el.textContent = ''; else el.value = ''; el.dispatchEvent(new Event('input', {bubbles: true})); return true; })()", 5_000);
+            if (try browserErrOr(arena, clear)) |e| return e;
+        } else {
+            bs.client.insertText(arena, text, 8_000) catch |err| return appErr(arena, switch (err) {
+                cdp.Error.Timeout => "typing was sent but not acknowledged in time",
+                else => "typing failed (DevTools connection lost?)",
+            });
+        }
+        if (argBool(args, "enter")) {
+            _ = bs.client.call(arena, "Input.dispatchKeyEvent", "{\"type\":\"keyDown\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13,\"nativeVirtualKeyCode\":13,\"text\":\"\\r\"}", 5_000) catch {};
+            _ = bs.client.call(arena, "Input.dispatchKeyEvent", "{\"type\":\"keyUp\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13,\"nativeVirtualKeyCode\":13}", 5_000) catch {};
+            _ = app.waitIdle(200, 2_000);
+        }
+        // Read back what the field now holds (secrets excepted).
+        const verify = bEval(arena, bs, "(() => { const el = document.activeElement; if (!el) return null; if (el.type === 'password') return '(password field: ' + (el.value || '').length + ' chars)'; return ((el.isContentEditable ? el.textContent : el.value) || '').slice(0, 120); })()", 5_000);
+        const now_holds: []const u8 = switch (verify) {
+            .val => |v| blk: {
+                const pv = std.json.parseFromSliceLeaky(std.json.Value, arena, v orelse "null", .{}) catch break :blk "?";
+                break :blk if (pv == .string) pv.string else "?";
+            },
+            .err => "?",
+        };
+        const msg = try std.fmt.allocPrint(arena, "filled <{s}>{s}; field now holds: {s}", .{ tag.?, if (argBool(args, "enter")) ", pressed Enter" else "", now_holds });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "browser_wait")) {
+        const selector = argStr(args, "selector");
+        const text = argStr(args, "text");
+        const url_contains = argStr(args, "url_contains");
+        const gone = argStr(args, "gone");
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 15_000;
+        if (selector == null and text == null and url_contains == null and gone == null)
+            return appErr(arena, "browser_wait needs at least one of: selector, text, url_contains, gone");
+        const cond_js = try std.fmt.allocPrint(arena,
+            \\(() => {{
+            \\const sel = {s}, txt = {s}, urlsub = {s}, gone = {s};
+            \\let ok = true; const why = [];
+            \\if (sel) {{ let m = null; try {{ m = document.querySelector(sel); }} catch (e) {{ return 'bad selector'; }} const visible = m && m.getBoundingClientRect().width > 0; if (!visible) {{ ok = false; why.push('selector not visible'); }} }}
+            \\if (txt && !(document.body.innerText || '').toLowerCase().includes(txt.toLowerCase())) {{ ok = false; why.push('text not visible'); }}
+            \\if (urlsub && !location.href.includes(urlsub)) {{ ok = false; why.push('url does not contain it'); }}
+            \\if (gone) {{ let m = null; try {{ m = document.querySelector(gone); }} catch (e) {{ return 'bad selector'; }} if (m && m.getBoundingClientRect().width > 0) {{ ok = false; why.push('element still present'); }} }}
+            \\return ok ? 'ok' : why.join('; ');
+            \\}})()
+        , .{ try jsStr(arena, selector), try jsStr(arena, text), try jsStr(arena, url_contains), try jsStr(arena, gone) });
+        const deadline = monoMs() + timeout_ms;
+        var last_why: []const u8 = "condition never evaluated";
+        while (true) {
+            const out = bEval(arena, bs, cond_js, 5_000);
+            switch (out) {
+                .val => |v| {
+                    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, v orelse "null", .{}) catch std.json.Value{ .null = {} };
+                    if (parsed == .string) {
+                        if (eql(u8, parsed.string, "ok")) {
+                            var msg: []const u8 = "condition met";
+                            if (browserPageInfo(arena, bs, 3_000)) |info|
+                                msg = try std.fmt.allocPrint(arena, "condition met\npage: {s}{s}{s}", .{ info.url, if (info.title.len > 0) " — " else "", info.title });
+                            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+                        }
+                        if (eql(u8, parsed.string, "bad selector")) return appErr(arena, "invalid CSS selector");
+                        last_why = parsed.string;
+                    }
+                },
+                .err => |e| last_why = e,
+            }
+            if (monoMs() >= deadline) break;
+            sleepMsLocal(300);
+        }
+        var fail_msg = try std.fmt.allocPrint(arena, "timeout: {s}", .{last_why});
+        if (browserPageInfo(arena, bs, 3_000)) |info|
+            fail_msg = try std.fmt.allocPrint(arena, "{s}\ncurrently on: {s}{s}{s}", .{ fail_msg, info.url, if (info.title.len > 0) " — " else "", info.title });
+        return toolResult(arena, fail_msg, true) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "browser_scroll")) {
+        var js: []const u8 = undefined;
+        if (argStr(args, "to")) |to| {
+            if (eql(u8, to, "top")) {
+                js = "window.scrollTo(0, 0)";
+            } else if (eql(u8, to, "bottom")) {
+                js = "window.scrollTo(0, document.documentElement.scrollHeight)";
+            } else {
+                return appErr(arena, "'to' must be \"top\" or \"bottom\" (use 'selector' to scroll an element into view)");
+            }
+        } else if (argStr(args, "selector")) |sel| {
+            js = try std.fmt.allocPrint(arena,
+                \\(() => {{ let el = null; try {{ el = document.querySelector({s}); }} catch (e) {{ return 'bad selector'; }} if (!el) return 'no match'; el.scrollIntoView({{block: 'center'}}); return true; }})()
+            , .{try jsStr(arena, sel)});
+        } else if (argInt(args, "y")) |y| {
+            js = try std.fmt.allocPrint(arena, "window.scrollTo(0, {d})", .{y});
+        } else if (argInt(args, "dy")) |dy| {
+            js = try std.fmt.allocPrint(arena, "window.scrollBy(0, {d})", .{dy});
+        } else {
+            return appErr(arena, "browser_scroll needs one of: to (top/bottom), selector, y (absolute), dy (relative)");
+        }
+        const out = bEval(arena, bs, js, 8_000);
+        if (try browserErrOr(arena, out)) |e| return e;
+        if (out.val) |v| {
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, v, .{}) catch std.json.Value{ .null = {} };
+            if (parsed == .string) {
+                if (eql(u8, parsed.string, "bad selector")) return appErr(arena, "invalid CSS selector");
+                if (eql(u8, parsed.string, "no match")) return appErr(arena, "selector matched nothing");
+            }
+        }
+        _ = app.waitIdle(150, 1_500);
+        const pos = bEval(arena, bs, "({scroll_y: Math.round(scrollY), doc_height: document.documentElement.scrollHeight, viewport_h: innerHeight})", 5_000);
+        return toolResult(arena, switch (pos) {
+            .val => |v| v orelse "scrolled",
+            .err => "scrolled",
+        }, false) orelse error.OutOfMemory;
+    }
+    return appErr(arena, "unknown tool");
+}
+
 fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
 
@@ -3524,6 +4875,17 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
     }
     if (std.mem.startsWith(u8, name, "term_")) {
         return termTool(arena, name, args);
+    }
+    if (eql(u8, name, "upload_file") or eql(u8, name, "download_file") or
+        std.mem.startsWith(u8, name, "port_forward_"))
+    {
+        return xferTool(arena, name, args);
+    }
+    if (std.mem.startsWith(u8, name, "browser_")) {
+        return browserTool(arena, name, args);
+    }
+    if (eql(u8, name, "capabilities")) {
+        return capabilitiesTool(arena);
     }
 
     const pane = paneFromArgs(args);
@@ -3657,7 +5019,19 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
         return toolResult(arena, if (settled) "settled" else "timeout: still producing output", false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "new_tab")) {
-        const resp = try ipc(arena, backend, .{ .cmd = "new-tab", .cwd = argStr(args, "cwd"), .title = argStr(args, "title") });
+        const resp = ipc(arena, backend, .{ .cmd = "new-tab", .cwd = argStr(args, "cwd"), .title = argStr(args, "title") }) catch |err| {
+            // No GUI reachable: fall back to a headless terminal so the
+            // caller can keep working instead of dead-ending.
+            if (term_state.mux_sock != null) {
+                const id = spawnRegisteredTerm(null, 120, 40) catch
+                    return appErr(arena, "no GUI socket, and the headless fallback failed too (mux daemon unreachable?)");
+                const t = term_state.terms.get(id).?;
+                _ = t.waitIdle(250, 3_000);
+                const msg = try std.fmt.allocPrint(arena, "{{\"headless\":true,\"term\":{d},\"note\":\"no GUI is running — opened headless terminal {d} instead; drive it with term_run/term_exec/term_read (term ids, not pane ids)\"}}", .{ id, id });
+                return toolResult(arena, msg, false) orelse error.OutOfMemory;
+            }
+            return err;
+        };
         return toolResult(arena, resp, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "split_pane")) {
@@ -3954,6 +5328,59 @@ test "mcp log: entries and screenshot files land in the dir" {
     _ = c.rmdir(sub_z.ptr);
     const dir_z = try std.fmt.bufPrintZ(&pbuf, "{s}", .{dir});
     _ = c.rmdir(dir_z.ptr);
+}
+
+test "chromiumFamily basename matching" {
+    const t = std.testing;
+    try t.expect(chromiumFamily("chromium"));
+    try t.expect(chromiumFamily("/usr/bin/chromium"));
+    try t.expect(chromiumFamily("/opt/google/chrome/google-chrome-stable"));
+    try t.expect(chromiumFamily("brave-browser"));
+    try t.expect(chromiumFamily("electron22"));
+    try t.expect(!chromiumFamily("firefox"));
+    try t.expect(!chromiumFamily("/usr/bin/gedit"));
+}
+
+test "findHex64 finds standalone sha tokens" {
+    const t = std.testing;
+    const sha = "a" ** 64;
+    try t.expectEqualStrings(sha, findHex64("prefix " ++ sha ++ "  /path/file").?);
+    try t.expect(findHex64("short deadbeef only") == null);
+    // 65 hex chars: not a standalone 64-run.
+    try t.expect(findHex64("f" ** 65) == null);
+}
+
+test "pickFreePort and tcpListening agree" {
+    const t = std.testing;
+    const port = pickFreePort() orelse return error.SkipZigTest;
+    try t.expect(port > 0);
+    // Nothing listens there after the probe socket closed.
+    try t.expect(!tcpListening(port, 200));
+}
+
+test "localCopyAtomic copies, verifies and renames" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var sbuf: [128]u8 = undefined;
+    var dbuf: [128]u8 = undefined;
+    const src = try std.fmt.bufPrintZ(&sbuf, "/tmp/sketerm-xfer-src-{d}", .{c.getpid()});
+    const dst = try std.fmt.bufPrintZ(&dbuf, "/tmp/sketerm-xfer-dst-{d}", .{c.getpid()});
+    const f = c.fopen(src.ptr, "wb") orelse return error.SkipZigTest;
+    _ = c.fwrite("hello transfer", 1, 14, f);
+    _ = c.fclose(f);
+    defer _ = c.unlink(src.ptr);
+    defer _ = c.unlink(dst.ptr);
+    const r = try localCopyAtomic(arena, src, dst);
+    try t.expect(r == .ok);
+    try t.expectEqual(@as(u64, 14), r.ok.bytes);
+    try t.expectEqual(@as(?u64, 14), fileSize(dst));
+    const src_sha = sha256File(src).?;
+    try t.expectEqualStrings(&src_sha, &r.ok.sha);
+    // Missing source is a described error, not a crash.
+    const bad = try localCopyAtomic(arena, "/nonexistent/nope", dst);
+    try t.expect(bad == .err);
 }
 
 test "instance name validation" {
