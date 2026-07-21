@@ -81,6 +81,12 @@ const MCP_HELP =
     \\term_send_keys, term_read, term_wait_idle, term_resize,
     \\term_list, term_close.
     \\
+    \\Every headless terminal (term_open, transfer/forward helpers) is
+    \\automatically recorded as an asciicast v2 (.cast) file, replayable
+    \\with asciinema: into the --log session folder when logging is on,
+    \\else $XDG_STATE_HOME/sketerm/mcp-casts/<stamp>-<pid>/.
+    \\  --no-record    disable the automatic terminal recordings
+    \\
 ;
 
 const PROTOCOL_VERSION = "2025-06-18";
@@ -104,6 +110,7 @@ pub const Opts = struct {
     durable: bool = false,
     name: ?[]const u8 = null,
     log_dir: ?[]const u8 = null,
+    no_record: bool = false,
     help: bool = false,
 
     pub const ParseError = error{ UnknownFlag, MissingValue, BadName, SharedConflict };
@@ -131,6 +138,8 @@ pub const Opts = struct {
                 if (i + 1 >= args.len) return error.MissingValue;
                 i += 1;
                 o.log_dir = args[i];
+            } else if (std.mem.eql(u8, a, "--no-record")) {
+                o.no_record = true;
             } else if (std.mem.eql(u8, a, "--help")) {
                 o.help = true;
             } else {
@@ -566,6 +575,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     defer term_state.deinit();
     forward_state = .{ .allocator = allocator };
     defer forward_state.deinit();
+    rec_state = .{ .allocator = allocator, .enabled = !opts.no_record };
+    defer rec_state.deinit();
     browser_state = .{ .allocator = allocator };
     defer browser_state.deinit();
     srv_mode = if (opts.shared) "shared" else if (iso != null and iso.?.durable) "durable" else "isolated";
@@ -926,8 +937,8 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_macros","description":"List saved macros; show one's steps (show); delete one (delete); or view an app's recorded input journal (journal:true + app) to pick last_steps for app_macro_save.","inputSchema":{"type":"object","properties":{"delete":{"type":"string"},"show":{"type":"string"},"journal":{"type":"boolean"},"app":{"type":"integer"}}}},
     \\{"name":"close_app_window","description":"Ask the app to close one window (like the titlebar button; the app decides).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"}},"required":["window"]}},
     \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
-    \\{"name":"term_open","description":"Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read. Pass 'host' for a PERSISTENT SSH session (keepalives preconfigured, survives long provisioning waits): run remote commands in it with term_exec for structured output + exit status.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional; with 'host' a string is the remote command)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH destination (user@box): opens ssh -tt with ServerAlive keepalives. Auth prompts appear on the screen — answer with term_send_text."},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
-    \\{"name":"term_list","description":"List open headless terminals: exit state + real exit_status, pending command/exec trackers, and the last rendered screen line (drained first, so a finished process never shows a stale progress frame).","inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"term_open","description":"Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read. Pass 'host' for a PERSISTENT SSH session (keepalives preconfigured, survives long provisioning waits): run remote commands in it with term_exec for structured output + exit status. Every headless terminal is AUTO-RECORDED as an asciicast v2 .cast file (the reply names the path; replay later with asciinema play).","inputSchema":{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional; with 'host' a string is the remote command)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH destination (user@box): opens ssh -tt with ServerAlive keepalives. Auth prompts appear on the screen — answer with term_send_text."},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
+    \\{"name":"term_list","description":"List open headless terminals: exit state + real exit_status, pending command/exec trackers, the last rendered screen line (drained first, so a finished process never shows a stale progress frame), and each terminal's asciicast recording path.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"term_run","description":"Run a command line in a headless terminal. wait_for=idle (default, backward compatible) returns after OUTPUT quiescence and does not imply child exit. wait_for=command waits for an OSC 133 command boundary (or tracked shell exit), returns structured running/completed state, exact exit_status, timed_out, and completion_source, and refuses to send (command_sent=false) when shell integration is unavailable or a foreground command started outside command mode is still running. If it times out, use term_wait_command to continue waiting without resending. output_only selects the completed command zone instead of the rendered screen.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"wait_for":{"type":"string","enum":["idle","command"],"description":"idle (default) waits for output quiescence; command waits for actual shell-command completion"},"quiet_ms":{"type":"integer","description":"Idle mode only: no-output window (default 400)"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the command's output instead of the whole screen"}},"required":["command"]}},
     \\{"name":"term_send_text","description":"Write text to a headless terminal's PTY. 'enter' appends a carriage return.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean"}},"required":["text"]}},
     \\{"name":"term_send_keys","description":"Press named key chords in a headless terminal: 'ctrl+c', 'enter', 'up', 'tab', space-separated.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
@@ -945,7 +956,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"port_forward_list","description":"List open port forwards with liveness and reconnect counts.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"port_forward_check","description":"Health-check one forward: verifies the ssh process AND that the local port accepts connections; if the ssh died (network blip, sshd restart) it RECONNECTS by respawning the same spec on the same local port.","inputSchema":{"type":"object","properties":{"forward":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Reconnect readiness budget, default 20000"}}}},
     \\{"name":"port_forward_close","description":"Close a port forward (kills its ssh).","inputSchema":{"type":"object","properties":{"forward":{"type":"integer"}},"required":["forward"]}},
-    \\{"name":"capabilities","description":"Preflight report of what THIS MCP server can do right now: isolation mode, GUI socket presence, OCR (tesseract) availability, which browser binary browser_open would use, ssh/scp presence, and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.","inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"capabilities","description":"Preflight report of what THIS MCP server can do right now: isolation mode, GUI socket presence, OCR (tesseract) availability, which browser binary browser_open would use, ssh/scp presence, the directory terminal asciicast recordings land in, and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"browser_open","description":"Launch a Chromium-family browser HEADLESSLY (Wayland, never on any screen) with DevTools (CDP) attached: you get real DOM access — browser_read (text/html/links), browser_elements, browser_click, browser_fill, browser_wait, browser_eval — plus everything an app has (screenshot via get_app_state, app_key for keyboard, app_scroll). Wayland + remote-debugging flags are applied automatically; renderer accessibility is enabled. Replies with the app id, DevTools port, page info and a first screenshot. Local daemon only.","inputSchema":{"type":"object","properties":{"url":{"type":"string","description":"Initial page (default about:blank)"},"profile":{"type":"string","description":"Named PERSISTENT profile (cookies/logins survive across sessions); omit = throwaway profile"},"browser_path":{"type":"string","description":"Specific browser binary (default: first Chromium-family binary on PATH)"},"width":{"type":"integer","description":"Window width, default 1280"},"height":{"type":"integer","description":"Window height, default 900"},"wait_ms":{"type":"integer","description":"Startup budget, default 25000"}}}},
     \\{"name":"browser_info","description":"Current URL, title, readyState, scroll position and viewport of a browser_open app — confirm soft navigations without reading the address bar pixels.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"browser_navigate","description":"Navigate a browser_open app: a URL (https:// assumed when schemeless), or \"back\"/\"forward\"/\"reload\". Waits for document readyState complete (bounded) and returns the landed URL + title.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"url":{"type":"string"},"timeout_ms":{"type":"integer","description":"Load wait, default 20000"}},"required":["url"]}},
@@ -1135,6 +1146,92 @@ var term_state: TermState = .{ .allocator = undefined };
 /// Server mode facts for the `capabilities` preflight tool.
 var srv_mode: []const u8 = "isolated";
 var srv_gui_socket: bool = false;
+
+/// Automatic asciicast recording of every headless terminal the MCP
+/// server spawns (term_open, new_tab fallback, transfer/forward
+/// helpers) — the terminal counterpart of the --log message trace.
+/// Daemon-side recording via the rec_start wire frame, finalized with
+/// each session; --no-record disables.
+const RecState = struct {
+    allocator: std.mem.Allocator,
+    enabled: bool = true,
+    /// Created lazily on the first spawn; null until then (and stays
+    /// null when creation fails — recording then silently stays off,
+    /// never blocking terminal work).
+    dir: ?[]u8 = null,
+    aux_counter: u32 = 0,
+    /// term id → cast path, for term_list / term_open replies.
+    casts: std.AutoArrayHashMapUnmanaged(u32, []u8) = .empty,
+
+    fn deinit(self: *RecState) void {
+        for (self.casts.values()) |p| self.allocator.free(p);
+        self.casts.deinit(self.allocator);
+        self.casts = .empty;
+        if (self.dir) |d| self.allocator.free(d);
+        self.dir = null;
+    }
+};
+
+var rec_state: RecState = .{ .allocator = undefined };
+
+/// The recordings directory, created on first use: the --log session
+/// folder when logging is on (casts sit next to the message trace),
+/// else $XDG_STATE_HOME/sketerm/mcp-casts/<stamp>-<pid>/.
+fn recDir() ?[]const u8 {
+    if (!rec_state.enabled) return null;
+    if (rec_state.dir) |d| return d;
+    const a = rec_state.allocator;
+    if (mcp_log) |l| {
+        rec_state.dir = a.dupe(u8, l.dir) catch return null;
+        return rec_state.dir;
+    }
+    var base_buf: [4096]u8 = undefined;
+    const state_base: []const u8 = if (c.getenv("XDG_STATE_HOME")) |sh|
+        std.mem.span(@as([*:0]const u8, @ptrCast(sh)))
+    else if (c.getenv("HOME")) |home|
+        std.fmt.bufPrint(&base_buf, "{s}/.local/state", .{std.mem.span(@as([*:0]const u8, @ptrCast(home)))}) catch return null
+    else
+        return null;
+    var stamp_buf: [40]u8 = undefined;
+    const stamp = McpLog.stamp(&stamp_buf);
+    const dir = std.fmt.allocPrint(a, "{s}/sketerm/mcp-casts/{s}-{d}", .{ state_base, stamp, c.getpid() }) catch return null;
+    mkdirs(dir);
+    var probe: [4096]u8 = undefined;
+    const dir_z = std.fmt.bufPrintZ(&probe, "{s}", .{dir}) catch {
+        a.free(dir);
+        return null;
+    };
+    if (c.access(dir_z.ptr, c.W_OK) != 0) {
+        a.free(dir);
+        return null;
+    }
+    rec_state.dir = dir;
+    return rec_state.dir;
+}
+
+/// Start recording a REGISTERED terminal; returns the cast path (kept
+/// in rec_state for term_list) or null when recording is off.
+fn recordRegisteredTerm(t: *termdrive.Term, term_id: u32) ?[]const u8 {
+    const dir = recDir() orelse return null;
+    const a = rec_state.allocator;
+    const path = std.fmt.allocPrint(a, "{s}/term-{d}.cast", .{ dir, term_id }) catch return null;
+    t.startRecording(path);
+    rec_state.casts.put(a, term_id, path) catch {
+        a.free(path);
+        return null;
+    };
+    return rec_state.casts.get(term_id);
+}
+
+/// Record an UNREGISTERED helper terminal (scp/ssh/forward).
+fn recordAuxTerm(t: *termdrive.Term, label: []const u8) void {
+    const dir = recDir() orelse return;
+    const a = rec_state.allocator;
+    rec_state.aux_counter += 1;
+    const path = std.fmt.allocPrint(a, "{s}/aux-{d}-{s}.cast", .{ dir, rec_state.aux_counter, label }) catch return;
+    defer a.free(path);
+    t.startRecording(path);
+}
 
 /// One structured SSH port forward: an owned `ssh -N -L` headless
 /// terminal plus its spec, so it can be health-checked and respawned.
@@ -3481,6 +3578,7 @@ fn spawnRegisteredTerm(argv: ?[]const []const u8, cols: u16, rows: u16) !u32 {
         t.deinit();
         return error.OutOfMemory;
     };
+    _ = recordRegisteredTerm(t, id);
     return id;
 }
 
@@ -3570,7 +3668,11 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
             try std.fmt.allocPrint(arena, " running ssh to {s} (watch term_read for auth prompts; term_exec gives structured remote command results)", .{h})
         else
             "";
-        const msg = try std.fmt.allocPrint(arena, "opened headless terminal {d} ({d}x{d}){s}", .{ id, cols, rows, where });
+        const rec_note = if (rec_state.casts.get(id)) |p|
+            try std.fmt.allocPrint(arena, "\nrecording: {s} (asciicast v2, replayable with asciinema)", .{p})
+        else
+            "";
+        const msg = try std.fmt.allocPrint(arena, "opened headless terminal {d} ({d}x{d}){s}{s}", .{ id, cols, rows, where, rec_note });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "term_list")) {
@@ -3592,6 +3694,10 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
             if (last.len > 0) {
                 try w.writeAll(",\"last_line\":");
                 try std.json.Stringify.value(last, .{}, w);
+            }
+            if (rec_state.casts.get(e.key_ptr.*)) |p| {
+                try w.writeAll(",\"recording\":");
+                try std.json.Stringify.value(p, .{}, w);
             }
             try w.writeAll("}");
         }
@@ -3805,6 +3911,9 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         const id = termIdOf(t);
         _ = term_state.terms.swapRemove(id);
         t.deinit();
+        // The daemon finalizes the cast with the session; keep the
+        // path out of future term_list output.
+        if (rec_state.casts.fetchSwapRemove(id)) |kv| rec_state.allocator.free(kv.value);
         return toolResult(arena, "terminal closed", false) orelse error.OutOfMemory;
     }
     return appErr(arena, "unknown tool");
@@ -3934,6 +4043,7 @@ fn runArgvTerm(arena: std.mem.Allocator, argv: []const []const u8, timeout_ms: i
     const t = termdrive.Term.spawn(term_state.allocator, argv, 120, 30, term_state.mux_sock) catch
         return .{ .err = "spawn failed (mux daemon unreachable?)" };
     defer t.deinit();
+    recordAuxTerm(t, std.fs.path.basename(argv[0]));
     const exited = t.waitExit(timeout_ms);
     const output = blk: {
         const text = t.readScreen(true) catch break :blk "";
@@ -4182,7 +4292,9 @@ fn spawnForwardTerm(arena: std.mem.Allocator, host: []const u8, lp: u16, rh: []c
         "ServerAliveCountMax=4",    "-L",
         bindspec,                   host,
     };
-    return termdrive.Term.spawn(term_state.allocator, &argv, 120, 30, term_state.mux_sock) catch return error.SpawnFailed;
+    const t = termdrive.Term.spawn(term_state.allocator, &argv, 120, 30, term_state.mux_sock) catch return error.SpawnFailed;
+    recordAuxTerm(t, "forward");
+    return t;
 }
 
 fn waitForwardReady(arena: std.mem.Allocator, t: *termdrive.Term, lp: u16, timeout_ms: i64) !union(enum) { ready, err: []const u8 } {
@@ -4265,6 +4377,13 @@ fn capabilitiesTool(arena: std.mem.Allocator) ![]const u8 {
         try w.writeAll(",\"browser\":null,\"browser_hint\":\"no Chromium-family binary on PATH — browser_* tools unavailable; install chromium\"");
     }
     try w.print(",\"ssh\":{},\"scp\":{}", .{ findExecutable(arena, "ssh") != null, findExecutable(arena, "scp") != null });
+    if (rec_state.enabled) {
+        try w.writeAll(",\"terminal_recordings\":");
+        if (recDir()) |d| try std.json.Stringify.value(d, .{}, w) else try w.writeAll("null");
+        try w.writeAll(",\"recordings_hint\":\"every headless terminal is auto-recorded as an asciicast v2 .cast file there (replay with asciinema play)\"");
+    } else {
+        try w.writeAll(",\"terminal_recordings\":null");
+    }
     try w.print(",\"open_terms\":{d},\"open_apps\":{d},\"open_forwards\":{d},\"browser_sessions\":{d}}}", .{
         term_state.terms.count(), app_state.apps.count(), forward_state.forwards.count(), browser_state.sessions.count(),
     });
@@ -5247,6 +5366,9 @@ test "mcp flag parsing: isolation modes" {
     const logged = try Opts.parse(&.{ "--log", "/tmp/trace", "--durable" });
     try t.expectEqualStrings("/tmp/trace", logged.log_dir.?);
     try t.expect(logged.durable);
+    // --no-record composes with every mode.
+    try t.expect(!(try Opts.parse(&.{"--shared"})).no_record);
+    try t.expect((try Opts.parse(&.{ "--no-record", "--durable" })).no_record);
     try t.expectError(error.MissingValue, Opts.parse(&.{"--log"}));
     // Errors.
     try t.expectError(error.MissingValue, Opts.parse(&.{"--name"}));
