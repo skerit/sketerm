@@ -8036,3 +8036,21 @@ cases: exit 42, quoting, timeout→wait continuation), byte-identical
 kill→check→reconnect on the same port, and a full Chromium session
 (fill, select, trusted click mutating the DOM, wait condition,
 scroll, link navigation crossing pages, history back, eval).
+
+## Automatic asciicast recording of MCP terminals
+
+Every headless terminal the MCP server spawns — term_open sessions
+(incl. SSH), the new_tab fallback, and the scp/ssh/forward helper
+terminals behind upload_file/download_file/port_forward — is now
+recorded automatically as an asciicast v2 file, the terminal
+counterpart of the --log message/screenshot trace. The daemon does
+the recording (existing `rec_start` wire frame; fire-and-forget from
+termdrive, finalized with the session, fflushed per event so files
+replay even mid-session). Casts land in the --log session folder
+when logging is on, else $XDG_STATE_HOME/sketerm/mcp-casts/
+<stamp>-<pid>/ (`term-<id>.cast`, `aux-<n>-<label>.cast`); the paths
+surface in the term_open reply, term_list, and capabilities.
+`--no-record` opts out. Verified by smoke-mcp (isolated
+XDG_STATE_HOME; header + recorded output asserted) and a live run:
+an SSH terminal's cast contains the remote command output, and an
+upload produced aux-1-scp / aux-2-ssh casts next to the mcp log.

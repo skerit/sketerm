@@ -146,6 +146,25 @@ fn fileExists(path: []const u8) bool {
     return c.access(p.ptr, c.F_OK) == 0;
 }
 
+/// Locate `<state>/sketerm/mcp-casts/<any>/<name>` and read it.
+fn findCast(state_dir: []const u8, name: []const u8, buf: []u8) ?[]const u8 {
+    var base_buf: [4096]u8 = undefined;
+    const base = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm/mcp-casts", .{state_dir}) catch return null;
+    const d = c.opendir(base.ptr) orelse return null;
+    defer _ = c.closedir(d);
+    while (c.readdir(d)) |ent| {
+        const sub = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (sub.len == 0 or sub[0] == '.') continue;
+        var path_buf: [4096]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}/{s}", .{ base, sub, name }) catch continue;
+        const f = c.fopen(path.ptr, "rb") orelse continue;
+        defer _ = c.fclose(f);
+        const n = c.fread(buf.ptr, 1, buf.len, f);
+        if (n > 0) return buf[0..n];
+    }
+    return null;
+}
+
 /// PIDs of sketerm-mux daemons whose /proc environ carries `rt`.
 fn daemonUnderRt(allocator: std.mem.Allocator, rt: []const u8) bool {
     const d = c.opendir("/proc") orelse return false;
@@ -218,6 +237,9 @@ pub fn main() u8 {
     const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/sketerm-smoke-mcp-{d}", .{c.getpid()}) catch return 1;
     _ = c.mkdir(rt.ptr, 0o700);
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
+    // Auto asciicast recordings must land under the isolated state
+    // dir, not the developer's real one.
+    _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
     // App/GUI socket auto-discovery must not find anything; keep the
     // env clean.
     _ = c.unsetenv("SKETERM_SOCKET");
@@ -236,6 +258,9 @@ pub fn main() u8 {
 
         const open = m.callTool("term_open", "{\"command\":[\"/bin/bash\"],\"cols\":80,\"rows\":24}");
         if (std.mem.indexOf(u8, open, "opened headless terminal") == null) fail("term_open failed");
+        if (std.mem.indexOf(u8, open, "recording: ") == null or
+            std.mem.indexOf(u8, open, "term-1.cast") == null)
+            fail("term_open did not announce its auto asciicast recording");
 
         // Private daemon socket exists; shared one does NOT.
         var priv_buf: [512]u8 = undefined;
@@ -408,6 +433,17 @@ pub fn main() u8 {
             std.mem.indexOf(u8, up, "\\\"atomic\\\":true") == null)
             fail("local upload_file did not verify");
         if (!fileExists(xdst)) fail("upload_file destination missing");
+
+        // ── automatic asciicast recording of terminal 1 ───────────
+        {
+            var cast_buf: [1 << 18]u8 = undefined;
+            const cast = findCast(rt, "term-1.cast", &cast_buf) orelse
+                fail("term-1.cast not found under the isolated state dir");
+            if (std.mem.indexOf(u8, cast, "{\"version\": 2,") == null)
+                fail("cast file has no asciicast v2 header");
+            if (std.mem.indexOf(u8, cast, "SMOKE-MCP-OK") == null)
+                fail("cast file does not contain the recorded output");
+        }
 
         // Ephemeral teardown on stdin close removes the private dir.
         var dir_buf: [512]u8 = undefined;

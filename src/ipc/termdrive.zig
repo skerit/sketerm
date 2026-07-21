@@ -417,6 +417,17 @@ pub const Term = struct {
         self.conn.sendFrame(.input, out.items) catch return Error.NotConnected;
     }
 
+    /// Ask the daemon to record this session as an asciicast v2 file
+    /// at `path` (on the daemon's host). Fire-and-forget: the ok/err
+    /// reply rides the frame stream and is ignored by handleFrame, so
+    /// a bad path just means no file appears. The daemon finalizes
+    /// the cast when the session ends and fflushes per event, so the
+    /// file is replayable at any point.
+    pub fn startRecording(self: *Term, path: []const u8) void {
+        if (self.exited) return;
+        self.conn.sendJson(.rec_start, .{ .path = path }) catch {};
+    }
+
     pub fn resize(self: *Term, cols: u16, rows: u16) Error!void {
         if (self.exited) return Error.NotConnected;
         var buf: [4]u8 = undefined;
