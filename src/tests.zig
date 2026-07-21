@@ -57,6 +57,7 @@ comptime {
     _ = @import("ipc/mux_cli.zig");
     _ = @import("ipc/keys.zig");
     _ = @import("ipc/termdrive.zig");
+    _ = @import("ipc/cdp.zig");
     _ = @import("ipc/mcp.zig");
     _ = @import("ipc/evkeys.zig");
     _ = @import("ipc/xkblayout.zig");
