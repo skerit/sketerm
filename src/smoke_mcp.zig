@@ -402,6 +402,35 @@ pub fn main() u8 {
         const cwd = m.callTool("term_exec", "{\"term\":3,\"command\":\"pwd\"}");
         if (std.mem.indexOf(u8, cwd, "/tmp") == null)
             fail("persistent-mode cd did not stick in the session");
+        // Interactive-prompt observability: a command waiting for
+        // keyboard input returns EARLY with pending + the live screen
+        // + interactive_prompt, the tracker survives, an answer via
+        // term_send_text completes it, and term_exec_wait reattaches.
+        const blocked = m.callTool("term_exec", "{\"term\":3,\"command\":\"printf 'Continue? [y/N] '; read ans; echo GOT:$ans\",\"timeout_ms\":15000}");
+        if (std.mem.indexOf(u8, blocked, "\\\"pending\\\":true") == null or
+            std.mem.indexOf(u8, blocked, "\\\"interactive_prompt\\\":true") == null or
+            std.mem.indexOf(u8, blocked, "\\\"tracker\\\":\\\"") == null or
+            std.mem.indexOf(u8, blocked, "\\\"screen\\\":\\\"") == null or
+            std.mem.indexOf(u8, blocked, "Continue?") == null)
+            fail("blocked interactive command did not surface pending state + screen");
+        if (std.mem.indexOf(u8, blocked, "\\\"timed_out\\\":true") != null)
+            fail("interactive early-return was misreported as a timeout");
+        _ = m.callTool("term_send_text", "{\"term\":3,\"text\":\"y\",\"enter\":true}");
+        const resumed = m.callTool("term_exec_wait", "{\"term\":3,\"timeout_ms\":10000}");
+        if (std.mem.indexOf(u8, resumed, "\\\"completed\\\":true") == null or
+            std.mem.indexOf(u8, resumed, "\\\"exit_status\\\":0") == null or
+            std.mem.indexOf(u8, resumed, "GOT:y") == null)
+            fail("term_exec_wait did not resume the answered command");
+        // output_file: full output to a local file, tail inline.
+        var of_buf: [640]u8 = undefined;
+        const of_args = std.fmt.bufPrint(&of_buf, "{{\"term\":3,\"command\":\"seq 1 500\",\"output_file\":\"{s}/exec-out.txt\"}}", .{rt}) catch unreachable;
+        const filed = m.callTool("term_exec", of_args);
+        if (std.mem.indexOf(u8, filed, "\\\"output_file\\\":") == null or
+            std.mem.indexOf(u8, filed, "\\\"output_bytes\\\":") == null)
+            fail("term_exec output_file was not honored");
+        var of_path_buf: [512]u8 = undefined;
+        const of_path = std.fmt.bufPrint(&of_path_buf, "{s}/exec-out.txt", .{rt}) catch unreachable;
+        if (!fileExists(of_path)) fail("term_exec output_file missing on disk");
 
         // ── term_wait_exit: real process exit, not output idle ────
         const t4 = m.callTool("term_open", "{\"command\":[\"sh\",\"-c\",\"sleep 0.3; exit 7\"]}");

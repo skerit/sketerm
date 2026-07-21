@@ -947,10 +947,10 @@ const TOOLS_JSON_RAW =
     \\{"name":"term_wait_command","description":"Continue waiting for a term_run wait_for=command request that timed out. Returns structured running/completed state, exact exit_status, timed_out, and completion_source without resending the command.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the completed command's output instead of the whole screen"}}}},
     \\{"name":"term_resize","description":"Resize a headless terminal's grid.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
     \\{"name":"term_close","description":"Close a headless terminal (kills its shell). Destructive.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"}}}},
-    \\{"name":"term_exec","description":"Run one command inside a LIVE interactive shell (including a persistent SSH session from term_open host) and get STRUCTURED results: exact exit_status and the exact output between sentinel markers, independent of shell integration. By default the command runs ISOLATED in a fresh `sh` (works typed into any shell dialect — fish/zsh/bash, local or remote — and cd/export/set -e cannot leak into or kill the session; the feedback scenario 'set -e + failing probe closed my SSH connection' cannot happen). Pass subshell=false to run IN the session shell so state persists (cd/export) — that mode needs a POSIX-ish shell (bash/zsh/dash, not fish). On timeout the command keeps running — continue with term_exec_wait, never resend. Not for interactive programs (editors, REPLs) — use term_send_text/term_send_keys for those.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"subshell":{"type":"boolean","description":"Default true (isolated, dialect-independent). false = run in the session shell itself: state persists, POSIX shells only"},"timeout_ms":{"type":"integer","description":"Default 30000"}},"required":["command"]}},
-    \\{"name":"term_exec_wait","description":"Continue waiting for a term_exec that timed out, without resending. Returns the same structured completed/exit_status/output shape.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"}}}},
+    \\{"name":"term_exec","description":"Run one command inside a LIVE interactive shell (including a persistent SSH session from term_open host) and get STRUCTURED results: exact exit_status and the exact output between sentinel markers, independent of shell integration. By default the command runs ISOLATED in a fresh `sh` (works typed into any shell dialect — fish/zsh/bash, local or remote — and cd/export/set -e cannot leak into or kill the session; the feedback scenario 'set -e + failing probe closed my SSH connection' cannot happen). Pass subshell=false to run IN the session shell so state persists (cd/export) — that mode needs a POSIX-ish shell (bash/zsh/dash, not fish). A command that does not complete comes back with pending:true, its tracker id, the LIVE RENDERED SCREEN, alt_screen, output_idle_ms and interactive_prompt — and when the output goes quiet behind something that looks like a question (apt's [Y/n], a password ask, a needrestart dialog) the call returns EARLY with interactive_prompt:true instead of burning the timeout: answer via term_send_text/term_send_keys, then term_exec_wait picks up the completion. The tracker survives client-side timeouts and aborted tool calls — term_exec_wait always reattaches; never resend. Not for fully interactive programs (editors, REPLs) — use term_send_text/term_send_keys for those.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"subshell":{"type":"boolean","description":"Default true (isolated, dialect-independent). false = run in the session shell itself: state persists, POSIX shells only"},"noninteractive":{"type":"boolean","description":"Export DEBIAN_FRONTEND=noninteractive + debconf/needrestart/apt-listchanges equivalents for THIS command only (package-manager runs that must not prompt). Needs the default isolated transport."},"output_file":{"type":"string","description":"Write the FULL untruncated output to this absolute LOCAL path; the inline reply keeps a short tail (large diagnostic dumps)"},"timeout_ms":{"type":"integer","description":"Default 30000, clamped to 120000 — for longer commands keep calling term_exec_wait"}},"required":["command"]}},
+    \\{"name":"term_exec_wait","description":"Continue waiting for a pending term_exec without resending — always attachable, including after a client-side tool timeout or abort. Same structured reply as term_exec (pending replies carry the live screen, interactive_prompt and the tracker id; returns early when the command is visibly waiting for input).","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000, clamped to 120000"},"output_file":{"type":"string","description":"Write the full output to this absolute local path on completion"}}}},
     \\{"name":"term_wait_exit","description":"Wait until a headless terminal's child PROCESS exits (distinct from output idleness — a silent scp can be running while output is idle, and an exited one can leave a stale progress frame). Returns the real exit status and the final screen tail.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"}}}},
-    \\{"name":"upload_file","description":"Copy a LOCAL file to a host with integrity + atomicity built in: scp to <path>.sketerm-part, remote SHA-256 verify against the local hash, then an atomic mv into place (a corrupt transfer is discarded, never half-written). Omit 'host' for a checksummed atomic local copy. Requires key/agent SSH auth (BatchMode).","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box); omit = local copy"},"local_path":{"type":"string"},"remote_path":{"type":"string","description":"Destination path (on the host, or locally when host is omitted)"},"timeout_ms":{"type":"integer","description":"scp budget, default 120000"}},"required":["local_path","remote_path"]}},
+    \\{"name":"upload_file","description":"Copy a LOCAL file to a host with integrity + atomicity built in: scp to a staged temp file, remote SHA-256 verify against the local hash, then an atomic mv into place (a corrupt transfer is discarded, never half-written). The staged name PRESERVES the extension (x.service → x.sketerm-part.service) so suffix-sensitive validators accept it, and 'verify_command' runs a remote check against the staged file BEFORE the move ({} = the staged path, appended if absent; nonzero exit = upload discarded, destination untouched — e.g. \"systemd-analyze verify {}\"). Omit 'host' for a checksummed atomic local copy. Requires key/agent SSH auth (BatchMode).","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box); omit = local copy"},"local_path":{"type":"string"},"remote_path":{"type":"string","description":"Destination path (on the host, or locally when host is omitted)"},"verify_command":{"type":"string","description":"Remote validation run against the staged file before the atomic move; {} substitutes the staged path"},"timeout_ms":{"type":"integer","description":"scp budget, default 120000"}},"required":["local_path","remote_path"]}},
     \\{"name":"download_file","description":"Copy a remote file here with integrity + atomicity: scp to <local>.sketerm-part, SHA-256 compare against the remote hash, atomic rename into place. Omit 'host' for a local copy.","inputSchema":{"type":"object","properties":{"host":{"type":"string"},"remote_path":{"type":"string","description":"Source path on the host"},"local_path":{"type":"string","description":"Destination path here"},"timeout_ms":{"type":"integer","description":"Default 120000"}},"required":["local_path","remote_path"]}},
     \\{"name":"port_forward_open","description":"Open a STRUCTURED SSH port forward (ssh -N -L with keepalives + ExitOnForwardFailure): picks a free local port when none is given, verifies the listener actually accepts before replying, and returns a forward id. Health-check/reconnect with port_forward_check. Requires key/agent auth (BatchMode).","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box)"},"remote_port":{"type":"integer","description":"Port on the remote side"},"remote_host":{"type":"string","description":"Remote-side connect address (default 127.0.0.1)"},"local_port":{"type":"integer","description":"Local listen port (omit = auto-pick a free one; the reply tells you which)"},"timeout_ms":{"type":"integer","description":"Readiness budget, default 20000"}},"required":["host","remote_port"]}},
     \\{"name":"port_forward_list","description":"List open port forwards with liveness and reconnect counts.","inputSchema":{"type":"object","properties":{}}},
@@ -3597,23 +3597,74 @@ fn termLastLine(arena: std.mem.Allocator, t: *termdrive.Term) []const u8 {
     return "";
 }
 
-/// Serialize a termdrive exec outcome as the term_exec reply.
-fn execResultJson(arena: std.mem.Allocator, r: termdrive.ExecOutcome) ![]const u8 {
+/// Serialize a termdrive exec outcome as the term_exec reply. On a
+/// pending outcome the reply carries everything needed to understand a
+/// blocked command WITHOUT further calls: the live screen tail, the
+/// alt-screen flag, output idleness, an interactive-prompt hint and
+/// the tracker id. `output_file` (optional, absolute, local) receives
+/// the FULL untruncated output; the inline payload then keeps a tail.
+fn execResultJson(arena: std.mem.Allocator, r: termdrive.ExecOutcome, t: *termdrive.Term, output_file: ?[]const u8) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.print("{{\"completed\":{},\"exit_status\":", .{r.completed});
     if (r.exit_status) |st| try w.print("{d}", .{st}) else try w.writeAll("null");
     try w.print(",\"timed_out\":{},\"truncated\":{},\"shell_died\":{}", .{ r.timed_out, r.truncated, r.shell_died });
-    // Bound the payload; the tail is what diagnosis needs.
-    const MAX_OUT = 200_000;
-    const out = if (r.output.len > MAX_OUT) r.output[r.output.len - MAX_OUT ..] else r.output;
+    if (r.pending) {
+        try w.writeAll(",\"pending\":true");
+        if (r.tracker) |nonce| try w.print(",\"tracker\":\"{s}\"", .{nonce});
+        try w.print(",\"alt_screen\":{},\"output_idle_ms\":{d},\"interactive_prompt\":{}", .{ r.alt_screen, r.idle_ms, r.interactive_hint });
+        // The live rendered screen: an interactive dialog (apt's
+        // needrestart, a password ask) must be VISIBLE in the reply,
+        // never hidden behind a bare timeout.
+        if (t.readScreen(false)) |screen_text| {
+            defer term_state.allocator.free(screen_text);
+            try w.writeAll(",\"screen\":");
+            try std.json.Stringify.value(tailLines(screen_text, 20), .{}, w);
+        } else |_| {}
+    }
+    var file_note: ?[]const u8 = null;
+    var inline_out: []const u8 = r.output;
+    var inline_cap: usize = 200_000;
+    if (output_file) |path| {
+        if (path.len == 0 or path[0] != '/') {
+            file_note = "output_file must be an absolute local path — ignored, full output inline";
+        } else if (writeFileBytes(path, r.output)) {
+            try w.writeAll(",\"output_file\":");
+            try std.json.Stringify.value(path, .{}, w);
+            try w.print(",\"output_bytes\":{d}", .{r.output.len});
+            inline_cap = 2_000;
+        } else {
+            file_note = "output_file could not be written (dir missing / not writable?) — full output inline";
+        }
+    }
+    if (inline_out.len > inline_cap) {
+        try w.print(",\"output_dropped_chars\":{d}", .{inline_out.len - inline_cap});
+        inline_out = inline_out[inline_out.len - inline_cap ..];
+    }
     try w.writeAll(",\"output\":");
-    try std.json.Stringify.value(out, .{}, w);
-    if (r.output.len > MAX_OUT) try w.print(",\"output_dropped_chars\":{d}", .{r.output.len - MAX_OUT});
-    if (r.timed_out) try w.writeAll(",\"reason\":\"still running at timeout — continue with term_exec_wait (do not resend)\"");
+    try std.json.Stringify.value(inline_out, .{}, w);
+    if (file_note) |n| {
+        try w.writeAll(",\"output_file_note\":");
+        try std.json.Stringify.value(n, .{}, w);
+    }
+    if (r.pending and r.interactive_hint) {
+        try w.writeAll(",\"reason\":\"the command appears to be WAITING FOR INPUT (see screen) — answer it with term_send_text/term_send_keys; the tracker stays attached and term_exec_wait picks up the completion afterwards\"");
+    } else if (r.pending) {
+        try w.writeAll(",\"reason\":\"still running — continue with term_exec_wait (do not resend); the tracker survives client-side timeouts and aborts\"");
+    }
     if (r.shell_died) try w.writeAll(",\"reason\":\"the shell/connection died before the command finished\"");
     try w.writeAll("}");
     return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+}
+
+/// Write bytes to an absolute local path; false on any failure.
+fn writeFileBytes(path: []const u8, bytes: []const u8) bool {
+    var pbuf: [4096]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return false;
+    const f = c.fopen(path_z.ptr, "wb") orelse return false;
+    const n = if (bytes.len == 0) 0 else c.fwrite(bytes.ptr, 1, bytes.len, f);
+    const bad = c.fclose(f) != 0;
+    return n == bytes.len and !bad;
 }
 
 fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
@@ -3744,7 +3795,11 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
     }
     if (eql(u8, name, "term_exec")) {
         const cmd = argStr(args, "command") orelse return appErr(arena, "term_exec requires 'command'");
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        // Clamped below the 150s watchdog: one blocked call must never
+        // wedge the single-threaded loop long enough to starve
+        // term_list/term_read or trip the connection-aborting cap.
+        // Longer waits = repeated term_exec_wait calls.
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
         // Default true: the isolated transport works typed into ANY
         // shell dialect (fish/zsh/bash, local or remote); false is the
         // POSIX-only state-persisting mode.
@@ -3752,6 +3807,9 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
             const v = args.object.get("subshell") orelse break :blk true;
             break :blk v == .bool and v.bool;
         } else true;
+        const noninteractive = argBool(args, "noninteractive");
+        if (noninteractive and !subshell)
+            return appErr(arena, "'noninteractive' needs the default isolated transport (drop subshell:false)");
         if (t.hasPendingExec()) {
             // A previously timed-out exec may have finished since;
             // resolve it silently so the new send is accepted.
@@ -3761,22 +3819,22 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         }
         if (t.hasPendingCommand())
             return appErr(arena, "a term_run wait_for=command command is still tracked; resolve it with term_wait_command first");
-        const r = t.execCommand(cmd, subshell, timeout_ms) catch |err| return appErr(arena, switch (err) {
+        const r = t.execCommand(cmd, subshell, noninteractive, timeout_ms) catch |err| return appErr(arena, switch (err) {
             termdrive.Error.NotConnected => "terminal exited",
             else => "exec failed",
         });
         defer term_state.allocator.free(r.output);
-        return execResultJson(arena, r);
+        return execResultJson(arena, r, t, argStr(args, "output_file"));
     }
     if (eql(u8, name, "term_exec_wait")) {
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
         const r = t.waitExecResult(timeout_ms) orelse
             return appErr(arena, "no pending term_exec in this terminal");
         defer term_state.allocator.free(r.output);
-        return execResultJson(arena, r);
+        return execResultJson(arena, r, t, argStr(args, "output_file"));
     }
     if (eql(u8, name, "term_wait_exit")) {
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
         const exited = t.waitExit(timeout_ms);
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
@@ -3798,7 +3856,7 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
     if (eql(u8, name, "term_run")) {
         const cmd = argStr(args, "command") orelse return appErr(arena, "term_run requires 'command'");
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
         const wait_for = argStr(args, "wait_for") orelse "idle";
         if (!eql(u8, wait_for, "idle") and !eql(u8, wait_for, "command"))
             return appErr(arena, "wait_for must be 'idle' or 'command'");
@@ -3874,7 +3932,7 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "term_wait_command")) {
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
         const result = t.waitPendingCommand(timeout_ms) orelse
             return appErr(arena, "no timed-out command is being tracked");
         var owned_output: ?[]u8 = null;
@@ -3896,7 +3954,7 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
     }
     if (eql(u8, name, "term_wait_idle")) {
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 500;
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 30_000;
+        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
         const settled = t.waitIdle(quiet_ms, timeout_ms);
         return toolResult(arena, if (settled) "idle" else "still active at timeout", false) orelse error.OutOfMemory;
     }
@@ -4066,6 +4124,30 @@ fn quoted(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     return arena.dupe(u8, list.items);
 }
 
+/// Staged-transfer temp name that PRESERVES the file extension, so
+/// suffix-sensitive validators (systemd-analyze verify needs .service)
+/// accept the staged file: "a/b.service" → "a/b.sketerm-part.service";
+/// extensionless paths get a plain ".sketerm-part" suffix.
+fn stagedPartPath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const base_start = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| s + 1 else 0;
+    const base = path[base_start..];
+    if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| {
+        if (dot > 0 and dot + 1 < base.len) {
+            return std.fmt.allocPrint(arena, "{s}{s}.sketerm-part.{s}", .{ path[0..base_start], base[0..dot], base[dot + 1 ..] });
+        }
+    }
+    return std.fmt.allocPrint(arena, "{s}.sketerm-part", .{path});
+}
+
+/// Wrap a POSIX script for execution on a REMOTE host regardless of
+/// the login shell sshd hands it to (fish included): base64 → sh.
+fn remoteShLine(arena: std.mem.Allocator, script: []const u8) ![]const u8 {
+    const enc = std.base64.standard.Encoder;
+    const b64 = try arena.alloc(u8, enc.calcSize(script.len));
+    _ = enc.encode(b64, script);
+    return std.fmt.allocPrint(arena, "echo {s} | base64 -d | sh", .{b64});
+}
+
 /// Find a 64-char lowercase-hex token in text (remote sha output).
 fn findHex64(text: []const u8) ?[]const u8 {
     var i: usize = 0;
@@ -4124,7 +4206,7 @@ fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         if (upload) {
             const local_sha = sha256File(local) orelse return appErr(arena, "cannot read/hash the local file");
             const bytes = fileSize(local);
-            const tmp = try std.fmt.allocPrint(arena, "{s}.sketerm-part", .{remote});
+            const tmp = try stagedPartPath(arena, remote);
             const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ h, tmp });
             switch (try runArgvTerm(arena, &.{ "scp", "-q", "-o", "BatchMode=yes", local, spec }, timeout_ms)) {
                 .err => |e| return appErr(arena, e),
@@ -4134,19 +4216,35 @@ fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
                         return appErr(arena, try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }));
                 },
             }
-            // Verify + atomic move in ONE remote command; echo tokens
-            // report the branch taken (no local shell echo — ssh runs
-            // the command directly).
+            // Checksum + optional caller validation + atomic move in
+            // ONE remote script (b64→sh so the remote login shell's
+            // dialect is irrelevant); echo tokens report the branch.
+            var verify_layer: []const u8 = "mv -f \"$SK_TMP\" \"$SK_DST\" && echo SK_MOVED || echo SK_MVFAIL";
+            if (argStr(args, "verify_command")) |vc| {
+                // "{}" marks where the staged path goes; without it
+                // the path is appended as the final argument.
+                const resolved = if (std.mem.indexOf(u8, vc, "{}")) |at|
+                    try std.fmt.allocPrint(arena, "{s}\"$SK_TMP\"{s}", .{ vc[0..at], vc[at + 2 ..] })
+                else
+                    try std.fmt.allocPrint(arena, "{s} \"$SK_TMP\"", .{vc});
+                verify_layer = try std.fmt.allocPrint(
+                    arena,
+                    "if ( {s} ); then mv -f \"$SK_TMP\" \"$SK_DST\" && echo SK_MOVED || echo SK_MVFAIL; else echo \"SK_VERIFYFAIL:$?\"; rm -f \"$SK_TMP\"; fi",
+                    .{resolved},
+                );
+            }
             const script = try std.fmt.allocPrint(
                 arena,
-                "sha=$(sha256sum {s} 2>/dev/null | cut -c1-64) || sha=fail; if [ \"$sha\" = \"{s}\" ]; then mv -f {s} {s} && echo SK_MOVED || echo SK_MVFAIL; else echo \"SK_SHA:$sha\"; rm -f {s}; fi",
-                .{ try quoted(arena, tmp), local_sha, try quoted(arena, tmp), try quoted(arena, remote), try quoted(arena, tmp) },
+                "SK_TMP={s}\nSK_DST={s}\nsha=$(sha256sum \"$SK_TMP\" 2>/dev/null | cut -c1-64) || sha=fail\nif [ \"$sha\" = \"{s}\" ]; then {s}; else echo \"SK_SHA:$sha\"; rm -f \"$SK_TMP\"; fi\n",
+                .{ try quoted(arena, tmp), try quoted(arena, remote), local_sha, verify_layer },
             );
-            switch (try runArgvTerm(arena, &.{ "ssh", "-o", "BatchMode=yes", h, script }, 30_000)) {
+            switch (try runArgvTerm(arena, &.{ "ssh", "-o", "BatchMode=yes", h, try remoteShLine(arena, script) }, 60_000)) {
                 .err => |e| return appErr(arena, e),
                 .run => |r| {
                     if (std.mem.indexOf(u8, r.output, "SK_MOVED") != null)
                         return xferOk(arena, "upload", remote, bytes, &local_sha);
+                    if (std.mem.indexOf(u8, r.output, "SK_VERIFYFAIL") != null)
+                        return appErr(arena, try std.fmt.allocPrint(arena, "verify_command rejected the staged file — upload discarded, destination untouched:\n{s}", .{r.output}));
                     if (std.mem.indexOf(u8, r.output, "SK_MVFAIL") != null)
                         return appErr(arena, "checksum verified but the atomic move failed on the remote (target dir not writable?)");
                     if (std.mem.indexOf(u8, r.output, "SK_SHA:fail") != null)
@@ -4157,7 +4255,7 @@ fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         }
 
         // download
-        const part = try std.fmt.allocPrint(arena, "{s}.sketerm-part", .{local});
+        const part = try stagedPartPath(arena, local);
         const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ h, remote });
         switch (try runArgvTerm(arena, &.{ "scp", "-q", "-o", "BatchMode=yes", spec, part }, timeout_ms)) {
             .err => |e| return appErr(arena, e),
@@ -4169,8 +4267,8 @@ fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         }
         const part_sha = sha256File(part) orelse return appErr(arena, "downloaded file vanished before hashing");
         const bytes = fileSize(part);
-        const script = try std.fmt.allocPrint(arena, "sha256sum {s} 2>/dev/null | cut -c1-64", .{try quoted(arena, remote)});
-        switch (try runArgvTerm(arena, &.{ "ssh", "-o", "BatchMode=yes", h, script }, 30_000)) {
+        const script = try std.fmt.allocPrint(arena, "sha256sum {s} 2>/dev/null | cut -c1-64\n", .{try quoted(arena, remote)});
+        switch (try runArgvTerm(arena, &.{ "ssh", "-o", "BatchMode=yes", h, try remoteShLine(arena, script) }, 30_000)) {
             .err => |e| return appErr(arena, e),
             .run => |r| {
                 const remote_sha = findHex64(r.output) orelse
@@ -5450,6 +5548,20 @@ test "mcp log: entries and screenshot files land in the dir" {
     _ = c.rmdir(sub_z.ptr);
     const dir_z = try std.fmt.bufPrintZ(&pbuf, "{s}", .{dir});
     _ = c.rmdir(dir_z.ptr);
+}
+
+test "stagedPartPath preserves the extension" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try t.expectEqualStrings("/etc/systemd/system/hohenheim.sketerm-part.service", try stagedPartPath(arena, "/etc/systemd/system/hohenheim.service"));
+    // Last-suffix preservation (what suffix-sensitive validators need).
+    try t.expectEqualStrings("/srv/app.tar.sketerm-part.gz", try stagedPartPath(arena, "/srv/app.tar.gz"));
+    try t.expectEqualStrings("/usr/local/bin/hohenheim.sketerm-part", try stagedPartPath(arena, "/usr/local/bin/hohenheim"));
+    // Dotfiles and trailing dots don't split.
+    try t.expectEqualStrings("/home/x/.bashrc.sketerm-part", try stagedPartPath(arena, "/home/x/.bashrc"));
+    try t.expectEqualStrings("/tmp/weird..sketerm-part", try stagedPartPath(arena, "/tmp/weird."));
 }
 
 test "chromiumFamily basename matching" {

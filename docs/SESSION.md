@@ -8054,3 +8054,32 @@ surface in the term_open reply, term_list, and capabilities.
 XDG_STATE_HOME; header + recorded output asserted) and a live run:
 an SSH terminal's cast contains the remote command output, and an
 upload produced aux-1-scp / aux-2-ssh casts next to the mcp log.
+
+## Feedback round 9 — interactive-prompt observability for term_exec
+
+The field report's key defect: an apt run hit a needrestart dialog,
+term_exec burned its whole timeout blind (hiding the dialog), the
+blocked single-threaded loop made term_list/term_read time out too,
+and the client aborted term_exec_wait. Fixes: a pending exec now
+returns `pending:true` + tracker id + the LIVE rendered screen +
+`alt_screen` + `output_idle_ms` + `interactive_prompt` (prompt
+heuristic over the output tail: y/n suffixes, trailing ?/:,
+password/press-enter, or alt-screen active), and returns EARLY when
+output goes quiet behind such a prompt instead of waiting out the
+timeout — answer via term_send_text, term_exec_wait (always
+reattachable, incl. after client-side aborts) completes it. All term
+wait timeouts clamp to 120s, under the 150s watchdog. Plus:
+`noninteractive:true` (DEBIAN_FRONTEND + debconf + needrestart env on
+the sh -c child only), `output_file` (full output to a local file,
+tail inline), upload staging that preserves the file extension
+(hohenheim.sketerm-part.service) with `verify_command` running a
+remote validation against the staged file before the atomic move
+(nonzero = discarded, destination untouched), and remote transfer
+scripts now travel base64→sh (dialect-proof like term_exec).
+
+Verified: 766 unit tests (prompt heuristic, staged naming), smoke-mcp
+(read -p flow: early pending + screen + tracker, answer, resume;
+output_file on disk), and live SSH runs — `less` returning pending
+with alt_screen after 2.6s idle then completing via q, verify_command
+accept/reject with clean staging, noninteractive env reaching only
+the child.

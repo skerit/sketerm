@@ -50,14 +50,59 @@ pub const ExecOutcome = struct {
     exit_status: ?i32 = null,
     timed_out: bool = false,
     /// Output between the sentinel markers (rendered lines; wrapped at
-    /// the terminal width). Allocator-owned by the caller.
+    /// the terminal width). When still pending, the output produced SO
+    /// FAR (empty if the begin marker isn't visible, e.g. behind an
+    /// alt-screen UI). Allocator-owned by the caller.
     output: []u8 = &.{},
     /// The begin marker scrolled out of the mirror's scrollback: the
     /// output is a TAIL, not the whole thing.
     truncated: bool = false,
     /// The terminal/shell itself died before the end marker.
     shell_died: bool = false,
+    /// The command is still running and the tracker stays attached
+    /// (term_exec_wait resumes it).
+    pending: bool = false,
+    /// The pending sentinel's nonce — the tracker id.
+    tracker: ?[12]u8 = null,
+    /// The alternate screen is active (full-screen dialog/TUI).
+    alt_screen: bool = false,
+    /// How long the terminal has produced no new output.
+    idle_ms: i64 = 0,
+    /// The output tail looks like a question/prompt (or an alt-screen
+    /// UI is up): the command is probably WAITING FOR INPUT, not slow.
+    interactive_hint: bool = false,
 };
+
+/// Prompt heuristic over the last non-empty output line: y/n style
+/// questions, trailing ?/:, password asks, "press enter". Only a HINT
+/// — the caller always ships the rendered screen alongside.
+pub fn looksInteractive(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0) return false;
+    var lower_buf: [256]u8 = undefined;
+    const take = trimmed[trimmed.len - @min(trimmed.len, lower_buf.len) ..];
+    const lower = std.ascii.lowerString(&lower_buf, take);
+    const suffixes = [_][]const u8{ "[y/n]", "(y/n)", "[yes/no]", "(yes/no)", "yes/no?", "?", ":" };
+    for (suffixes) |s| {
+        if (std.mem.endsWith(u8, lower, s)) return true;
+    }
+    const anywhere = [_][]const u8{ "password", "passphrase", "press enter", "press any key", "press return" };
+    for (anywhere) |s| {
+        if (std.mem.indexOf(u8, lower, s) != null) return true;
+    }
+    return false;
+}
+
+test "looksInteractive" {
+    const t = std.testing;
+    try t.expect(looksInteractive("Do you want to continue? [Y/n] "));
+    try t.expect(looksInteractive("Restart services during package upgrades without asking?"));
+    try t.expect(looksInteractive("Enter passphrase for key '/home/x/.ssh/id_ed25519': "));
+    try t.expect(looksInteractive("Press ENTER to continue"));
+    try t.expect(!looksInteractive("Unpacking openjdk-17 (17.0.10) ..."));
+    try t.expect(!looksInteractive("100%[==================>] 1.2M  --.-KB/s  in 0.1s"));
+    try t.expect(!looksInteractive(""));
+}
 
 const ExecPending = struct {
     nonce: [12]u8,
@@ -78,7 +123,9 @@ fn posixSquote(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 
 /// Where a sentinel scan landed in the rendered text.
 pub const SentinelParse = union(enum) {
-    pending,
+    /// Not complete; begin_after = offset just past the begin marker
+    /// when it is visible (output-so-far starts there).
+    pending: struct { begin_after: ?usize },
     done: struct { status: i32, start: usize, end: usize, truncated: bool },
 };
 
@@ -99,7 +146,7 @@ pub const SentinelParse = union(enum) {
 /// quote-split in the typed text so the command echo can never be
 /// mistaken for a marker; the `if` wrapper keeps a failing command
 /// from tripping an active `set -e`.
-pub fn buildExecLine(allocator: std.mem.Allocator, nonce: []const u8, command: []const u8, subshell: bool) ![]u8 {
+pub fn buildExecLine(allocator: std.mem.Allocator, nonce: []const u8, command: []const u8, subshell: bool, noninteractive: bool) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     const w = &aw.writer;
@@ -109,10 +156,17 @@ pub fn buildExecLine(allocator: std.mem.Allocator, nonce: []const u8, command: [
         // the end marker always prints with the child's real status.
         const quoted_cmd = try posixSquote(allocator, command);
         defer allocator.free(quoted_cmd);
+        // Package-manager safety net: the standard Debian/needrestart
+        // frontends that would otherwise block on a dialog. Prefix
+        // env on the sh -c child only — nothing leaks to the session.
+        const env: []const u8 = if (noninteractive)
+            "DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 "
+        else
+            "";
         const script = try std.fmt.allocPrint(
             allocator,
-            "printf '\\n%s\\n' SKB{s}\nsh -c {s}\n__sk_s=$?\nprintf '\\n%s%d\\n' SKE{s}. \"$__sk_s\"\n",
-            .{ nonce, quoted_cmd, nonce },
+            "printf '\\n%s\\n' SKB{s}\n{s}sh -c {s}\n__sk_s=$?\nprintf '\\n%s%d\\n' SKE{s}. \"$__sk_s\"\n",
+            .{ nonce, env, quoted_cmd, nonce },
         );
         defer allocator.free(script);
         const enc = std.base64.standard.Encoder;
@@ -160,12 +214,12 @@ pub fn findSentinel(text: []const u8, nonce: []const u8) SentinelParse {
         const start = if (truncated) 0 else begin_after.?;
         return .{ .done = .{ .status = status, .start = start, .end = endpos, .truncated = truncated } };
     }
-    return .pending;
+    return .{ .pending = .{ .begin_after = begin_after } };
 }
 
 test "buildExecLine wraps and quote-splits markers" {
     const t = std.testing;
-    const line = try buildExecLine(t.allocator, "aabbccddeeff", "echo hi", false);
+    const line = try buildExecLine(t.allocator, "aabbccddeeff", "echo hi", false, false);
     defer t.allocator.free(line);
     // The typed text never contains a contiguous marker string.
     try t.expect(std.mem.indexOf(u8, line, "SKBaabbccddeeff") == null);
@@ -173,7 +227,7 @@ test "buildExecLine wraps and quote-splits markers" {
     try t.expect(std.mem.indexOf(u8, line, "{ echo hi\n}") != null);
     // Subshell mode: dialect-independent base64 → sh transport, and
     // the decoded script carries the plain markers + set -e guard.
-    const sub = try buildExecLine(t.allocator, "aabbccddeeff", "cd /tmp && pwd", true);
+    const sub = try buildExecLine(t.allocator, "aabbccddeeff", "cd /tmp && pwd", true, false);
     defer t.allocator.free(sub);
     try t.expect(std.mem.startsWith(u8, sub, "echo "));
     try t.expect(std.mem.indexOf(u8, sub, "| base64 -d > /tmp/.sk_aabbccddeeff && sh /tmp/.sk_aabbccddeeff; rm -f /tmp/.sk_aabbccddeeff") != null);
@@ -187,7 +241,7 @@ test "buildExecLine wraps and quote-splits markers" {
     try t.expect(std.mem.indexOf(u8, buf, "sh -c 'cd /tmp && pwd'\n__sk_s=$?") != null);
     try t.expect(std.mem.indexOf(u8, buf, "SKEaabbccddeeff.") != null);
     // Embedded single quotes survive the POSIX quoting.
-    const q = try buildExecLine(t.allocator, "aabbccddeeff", "echo 'it''s'", true);
+    const q = try buildExecLine(t.allocator, "aabbccddeeff", "echo 'it''s'", true, false);
     defer t.allocator.free(q);
     const qb64 = q["echo ".len..std.mem.indexOf(u8, q, " |").?];
     const qbuf = try t.allocator.alloc(u8, try dec.calcSizeForSlice(qb64));
@@ -557,7 +611,7 @@ pub const Term = struct {
     /// shell (works over SSH, where OSC 133 integration cannot reach).
     /// On timeout the sentinel stays pending; continue with
     /// waitExecResult. Caller frees `.output`.
-    pub fn execCommand(self: *Term, command: []const u8, subshell: bool, timeout_ms: i64) Error!ExecOutcome {
+    pub fn execCommand(self: *Term, command: []const u8, subshell: bool, noninteractive: bool, timeout_ms: i64) Error!ExecOutcome {
         self.drain();
         if (self.exited) return Error.NotConnected;
         if (self.pending_exec != null) return Error.BadKey; // caller checks hasPendingExec first
@@ -569,7 +623,7 @@ pub const Term = struct {
             pend.nonce[i * 2] = hex[b >> 4];
             pend.nonce[i * 2 + 1] = hex[b & 0xf];
         }
-        const line = buildExecLine(self.allocator, &pend.nonce, command, subshell) catch return Error.OutOfMemory;
+        const line = buildExecLine(self.allocator, &pend.nonce, command, subshell, noninteractive) catch return Error.OutOfMemory;
         defer self.allocator.free(line);
         const with_cr = std.fmt.allocPrint(self.allocator, "{s}\r", .{line}) catch return Error.OutOfMemory;
         defer self.allocator.free(with_cr);
@@ -580,21 +634,35 @@ pub const Term = struct {
 
     /// Continue waiting for a pending exec sentinel. Null when none is
     /// pending. Caller frees `.output`.
+    ///
+    /// Returns EARLY (before timeout_ms) when the terminal has been
+    /// output-idle behind something that looks like an interactive
+    /// prompt or an alt-screen UI: burning the whole timeout there
+    /// would just hide the question — the caller should show the
+    /// screen and answer via sendText/sendKeys; the tracker stays
+    /// attached either way.
     pub fn waitExecResult(self: *Term, timeout_ms: i64) ?ExecOutcome {
         const pend = self.pending_exec orelse return null;
         const deadline = nowMs() + timeout_ms;
+        var last_seq = self.seq;
+        var last_change = nowMs();
         while (true) {
             _ = self.pumpOnce(50);
+            if (self.seq != last_seq) {
+                last_seq = self.seq;
+                last_change = nowMs();
+            }
             // Scan at a coarse cadence: extracting the whole
             // scrollback per pump would hurt under output floods.
             const text = blk: {
                 const screen = self.screen orelse break :blk null;
                 break :blk screen.extractScrollback(self.allocator) catch null;
             };
+            var partial_from: ?usize = null;
             if (text) |t| {
-                defer self.allocator.free(t);
                 switch (findSentinel(t, &pend.nonce)) {
                     .done => |d| {
+                        defer self.allocator.free(t);
                         self.pending_exec = null;
                         const out = self.allocator.dupe(u8, t[d.start..d.end]) catch &[_]u8{};
                         return .{
@@ -604,20 +672,57 @@ pub const Term = struct {
                             .truncated = d.truncated,
                         };
                     },
-                    .pending => {},
+                    .pending => |p| partial_from = p.begin_after,
                 }
             }
+            defer if (text) |t| self.allocator.free(t);
             if (self.exited) {
                 self.pending_exec = null;
                 return .{ .completed = false, .shell_died = true, .exit_status = if (self.exit_status_known) self.exit_status else null };
             }
-            if (nowMs() >= deadline) {
-                return .{ .completed = false, .timed_out = true };
+            const idle_ms = nowMs() - last_change;
+            const alt = if (self.screen) |s| s.use_alt else false;
+            var interactive = alt;
+            if (!interactive) {
+                if (text) |t| {
+                    if (partial_from) |from| {
+                        var it = std.mem.splitBackwardsScalar(u8, t[from..], '\n');
+                        while (it.next()) |line| {
+                            const trimmed = std.mem.trim(u8, line, " \t\r");
+                            if (trimmed.len == 0) continue;
+                            interactive = looksInteractive(trimmed);
+                            break;
+                        }
+                    }
+                }
+            }
+            const give_up = nowMs() >= deadline or (interactive and idle_ms >= 2_500);
+            if (give_up) {
+                const partial: []u8 = blk: {
+                    const t = text orelse break :blk @constCast(&[_]u8{});
+                    const from = partial_from orelse break :blk @constCast(&[_]u8{});
+                    break :blk @constCast(self.allocator.dupe(u8, t[from..]) catch &[_]u8{});
+                };
+                return .{
+                    .completed = false,
+                    .timed_out = nowMs() >= deadline,
+                    .pending = true,
+                    .tracker = pend.nonce,
+                    .output = partial,
+                    .alt_screen = alt,
+                    .idle_ms = idle_ms,
+                    .interactive_hint = interactive,
+                };
             }
             // Pace the scrollback scans.
             var waited: i64 = 0;
             while (waited < 100 and nowMs() < deadline) {
-                if (self.pumpOnce(50)) {} else waited += 50;
+                if (self.pumpOnce(50)) {
+                    if (self.seq != last_seq) {
+                        last_seq = self.seq;
+                        last_change = nowMs();
+                    }
+                } else waited += 50;
                 if (self.exited) break;
             }
         }
