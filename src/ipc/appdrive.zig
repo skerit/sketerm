@@ -863,11 +863,16 @@ pub const App = struct {
         return null;
     }
 
+    pub const LogFetch = struct { json: []u8, stale: bool };
+
     /// Fetch log lines from the daemon (`req_json` = a LogGetReq
     /// object). For an EXITED app the daemon already pushed the final
     /// log ahead of `.exit`; that stash is served instead (the session
-    /// is gone daemon-side). Caller owns the returned JSON.
-    pub fn logGet(self: *App, req_json: []const u8, timeout_ms: i64) Error![]u8 {
+    /// is gone daemon-side). When the fresh reply is still queued
+    /// behind streamed frame data at the deadline, the LAST CACHED
+    /// reply is served with `stale = true` — partial beats nothing.
+    /// Caller owns the returned JSON.
+    pub fn logGet(self: *App, req_json: []const u8, timeout_ms: i64) Error!LogFetch {
         self.drain();
         if (!self.exited) {
             const before = self.log_seq;
@@ -877,10 +882,17 @@ pub const App = struct {
                 if (self.exited) break;
                 _ = self.pumpOnce(25);
             }
-            if (self.log_seq == before and !self.exited) return Error.Timeout;
+            if (self.log_seq == before and !self.exited) {
+                if (self.log_buf.items.len > 0) {
+                    const json = self.allocator.dupe(u8, self.log_buf.items) catch return Error.OutOfMemory;
+                    return .{ .json = json, .stale = true };
+                }
+                return Error.Timeout;
+            }
         }
         if (self.log_buf.items.len == 0) return Error.NotConnected;
-        return self.allocator.dupe(u8, self.log_buf.items) catch Error.OutOfMemory;
+        const json = self.allocator.dupe(u8, self.log_buf.items) catch return Error.OutOfMemory;
+        return .{ .json = json, .stale = false };
     }
 
     fn dropChanWindows(self: *App, chan: u32) void {
@@ -1678,6 +1690,54 @@ pub const App = struct {
             const win = self.winById(win_id) orelse return false;
             if (win.frames != win.shot_frames and
                 (min_pct <= 0 or win.pctVsBaseline() >= min_pct)) return true;
+            if (self.exited or nowMs() >= deadline) return false;
+            _ = self.pumpOnce(25);
+        }
+    }
+
+    /// Pre-input reference for waitChangeSince: the window's commit
+    /// counter — and, when a pixel threshold will gate the wait, a
+    /// copy of its pixels — at the instant BEFORE input is injected.
+    pub const FrameRef = struct {
+        frames: u64,
+        px: []u8 = &.{},
+        w: i32 = 0,
+        h: i32 = 0,
+
+        pub fn deinit(self: *FrameRef, a: std.mem.Allocator) void {
+            if (self.px.len > 0) a.free(self.px);
+            self.px = &.{};
+        }
+    };
+
+    /// Capture a FrameRef of this window (null = no such window).
+    pub fn frameRef(self: *App, win_id: u32, with_pixels: bool) ?FrameRef {
+        const win = self.winById(win_id) orelse return null;
+        var px: []u8 = &.{};
+        if (with_pixels and win.pixels.items.len > 0) {
+            px = self.allocator.dupe(u8, win.pixels.items) catch &.{};
+        }
+        return .{ .frames = win.frames, .px = px, .w = win.w, .h = win.h };
+    }
+
+    /// Pump until the window commits a frame AFTER `ref` was taken —
+    /// with `min_pct > 0` (and pixels in the ref), one that also
+    /// differs from the ref by at least that % (a repainted-identical
+    /// frame or a cursor blink doesn't count). False = no such frame
+    /// before the deadline: the input hit a dead area, or the app
+    /// reacts without redrawing. Unlike waitWindowChange this ignores
+    /// the screenshot baseline entirely, so frames committed BETWEEN
+    /// the last screenshot and the input can't satisfy it.
+    pub fn waitChangeSince(self: *App, win_id: u32, ref: *const FrameRef, timeout_ms: i64, min_pct: f64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            if (self.winById(win_id)) |win| {
+                if (win.frames != ref.frames) {
+                    if (min_pct <= 0 or ref.px.len == 0) return true;
+                    if (win.w != ref.w or win.h != ref.h) return true;
+                    if (pctDiffBuf(win.pixels.items, ref.px) >= min_pct) return true;
+                }
+            } else return false;
             if (self.exited or nowMs() >= deadline) return false;
             _ = self.pumpOnce(25);
         }
