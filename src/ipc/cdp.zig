@@ -226,6 +226,97 @@ pub fn wsDecodeHeader(data: []const u8) !?WsFrame {
     return .{ .opcode = opcode, .fin = fin, .payload_start = off, .payload_len = @intCast(len), .total_len = off + @as(usize, @intCast(len)) };
 }
 
+// ── Network log ───────────────────────────────────────────────────
+
+/// One tracked network request, built from Network.* CDP events.
+/// Values from request bodies are NEVER stored — only field names.
+pub const NetEntry = struct {
+    seq: u64,
+    request_id: []u8,
+    url: []u8,
+    /// The URL the request STARTED at; empty until a redirect moves
+    /// `url` to the target (the POST /login behind a 303 stays
+    /// findable).
+    first_url: []u8,
+    method: []u8,
+    resource_type: []u8,
+    /// Form/JSON field names of the request body, comma-joined.
+    post_keys: []u8,
+    status: i64 = 0,
+    mime: []u8,
+    error_text: []u8,
+    finished: bool = false,
+    redirects: u32 = 0,
+
+    fn deinit(self: *NetEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.request_id);
+        allocator.free(self.url);
+        allocator.free(self.first_url);
+        allocator.free(self.method);
+        allocator.free(self.resource_type);
+        allocator.free(self.post_keys);
+        allocator.free(self.mime);
+        allocator.free(self.error_text);
+    }
+};
+
+const NET_CAP = 300;
+
+/// Field NAMES of a request body (form-encoded or top-level JSON),
+/// comma-joined; values are deliberately dropped (secret redaction).
+pub fn extractPostKeys(allocator: std.mem.Allocator, post: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    const trimmed = std.mem.trim(u8, post, " \t\r\n");
+    if (trimmed.len > 0 and trimmed[0] == '{') {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), trimmed, .{}) catch null;
+        if (parsed != null and parsed.? == .object) {
+            var first = true;
+            var it = parsed.?.object.iterator();
+            while (it.next()) |e| {
+                if (!first) try w.writeByte(',');
+                first = false;
+                try w.writeAll(e.key_ptr.*);
+                if (aw.written().len > 400) break;
+            }
+        }
+    } else {
+        var first = true;
+        var it = std.mem.splitScalar(u8, trimmed, '&');
+        while (it.next()) |kv| {
+            const key = kv[0 .. std.mem.indexOfScalar(u8, kv, '=') orelse kv.len];
+            if (key.len == 0) continue;
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.writeAll(key);
+            if (aw.written().len > 400) break;
+        }
+    }
+    return allocator.dupe(u8, aw.written());
+}
+
+test "extractPostKeys" {
+    const t = std.testing;
+    const form = try extractPostKeys(t.allocator, "email=x%40y.z&password=hunter2&remember=on");
+    defer t.allocator.free(form);
+    try t.expectEqualStrings("email,password,remember", form);
+    try t.expect(std.mem.indexOf(u8, form, "hunter2") == null);
+    const json = try extractPostKeys(t.allocator, "{\"user\":\"a\",\"token\":\"secret\"}");
+    defer t.allocator.free(json);
+    try t.expectEqualStrings("user,token", json);
+    const junk = try extractPostKeys(t.allocator, "not json {");
+    defer t.allocator.free(junk);
+    try t.expectEqualStrings("not json {", junk);
+}
+
+fn objStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return if (v == .string) v.string else null;
+}
+
 // ── The client ────────────────────────────────────────────────────
 
 pub const Client = struct {
@@ -237,6 +328,14 @@ pub const Client = struct {
     /// The attached page target's id (for reattach after navigation
     /// that replaces the target).
     target_id: []u8 = &.{},
+    /// Network.* event capture: enabled once via enableNetwork, then
+    /// re-enabled automatically on every (re)attach.
+    net_enabled: bool = false,
+    net: std.ArrayList(NetEntry) = .empty,
+    net_seq: u64 = 0,
+    net_dropped: u64 = 0,
+    /// When the last Network.* event arrived (network-idle waits).
+    net_last_ms: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, port: u16) Client {
         return .{ .allocator = allocator, .port = port };
@@ -247,6 +346,8 @@ pub const Client = struct {
         self.rbuf.deinit(self.allocator);
         if (self.target_id.len > 0) self.allocator.free(self.target_id);
         self.target_id = &.{};
+        self.netClear();
+        self.net.deinit(self.allocator);
     }
 
     fn closeFd(self: *Client) void {
@@ -288,6 +389,157 @@ pub const Client = struct {
         try self.wsUpgrade(url[path_at..], timeout_ms);
         if (self.target_id.len > 0) self.allocator.free(self.target_id);
         self.target_id = self.allocator.dupe(u8, tid orelse "") catch return Error.OutOfMemory;
+        // A replaced page target loses its Network subscription; keep
+        // capture continuous across reattaches.
+        if (self.net_enabled) {
+            _ = self.call(arena, "Network.enable", "{}", 5_000) catch {};
+        }
+    }
+
+    /// Start capturing Network.* events into the bounded net log.
+    /// Sticky: survives reattach.
+    pub fn enableNetwork(self: *Client, timeout_ms: i64) Error!void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        _ = try self.call(arena_state.allocator(), "Network.enable", "{}", timeout_ms);
+        self.net_enabled = true;
+    }
+
+    pub fn netClear(self: *Client) void {
+        for (self.net.items) |*e| e.deinit(self.allocator);
+        self.net.clearRetainingCapacity();
+        self.net_dropped = 0;
+    }
+
+    /// Requests still awaiting completion (streams that never finish —
+    /// WebSocket/EventSource — don't count against network idleness).
+    pub fn netInFlight(self: *const Client) usize {
+        var n: usize = 0;
+        for (self.net.items) |e| {
+            if (e.finished) continue;
+            if (std.mem.eql(u8, e.resource_type, "WebSocket") or
+                std.mem.eql(u8, e.resource_type, "EventSource")) continue;
+            n += 1;
+        }
+        return n;
+    }
+
+    fn findNet(self: *Client, request_id: []const u8) ?*NetEntry {
+        var i = self.net.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.net.items[i].request_id, request_id))
+                return &self.net.items[i];
+        }
+        return null;
+    }
+
+    /// Digest one CDP event message into the net log (non-Network
+    /// events and malformed payloads are ignored).
+    fn handleEvent(self: *Client, msg: []const u8) void {
+        if (!self.net_enabled) return;
+        if (std.mem.indexOf(u8, msg, "\"method\":\"Network.") == null) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, msg, .{}) catch return;
+        if (parsed != .object) return;
+        const method = objStr(parsed.object, "method") orelse return;
+        const params_v = parsed.object.get("params") orelse return;
+        if (params_v != .object) return;
+        const params = params_v.object;
+        const rid = objStr(params, "requestId") orelse return;
+        self.net_last_ms = nowMs();
+        const a = self.allocator;
+        if (std.mem.eql(u8, method, "Network.requestWillBeSent")) {
+            const req_v = params.get("request") orelse return;
+            if (req_v != .object) return;
+            const req = req_v.object;
+            const url = objStr(req, "url") orelse "";
+            if (params.get("redirectResponse") != null) {
+                if (self.findNet(rid)) |e| {
+                    e.redirects += 1;
+                    if (e.first_url.len == 0) {
+                        a.free(e.first_url);
+                        e.first_url = e.url;
+                    } else {
+                        a.free(e.url);
+                    }
+                    e.url = a.dupe(u8, url) catch return;
+                    e.status = 0;
+                    e.finished = false;
+                    return;
+                }
+            }
+            var post_keys: []u8 = a.dupe(u8, "") catch return;
+            if (objStr(req, "postData")) |pd| {
+                a.free(post_keys);
+                post_keys = extractPostKeys(a, pd) catch (a.dupe(u8, "") catch return);
+            }
+            self.net_seq += 1;
+            const entry = NetEntry{
+                .seq = self.net_seq,
+                .request_id = a.dupe(u8, rid) catch return,
+                .url = a.dupe(u8, url) catch return,
+                .first_url = a.dupe(u8, "") catch return,
+                .method = a.dupe(u8, objStr(req, "method") orelse "") catch return,
+                .resource_type = a.dupe(u8, objStr(params, "type") orelse "") catch return,
+                .post_keys = post_keys,
+                .mime = a.dupe(u8, "") catch return,
+                .error_text = a.dupe(u8, "") catch return,
+            };
+            self.net.append(a, entry) catch return;
+            if (self.net.items.len > NET_CAP) {
+                var old = self.net.orderedRemove(0);
+                old.deinit(a);
+                self.net_dropped += 1;
+            }
+        } else if (std.mem.eql(u8, method, "Network.responseReceived")) {
+            const e = self.findNet(rid) orelse return;
+            const resp_v = params.get("response") orelse return;
+            if (resp_v != .object) return;
+            if (resp_v.object.get("status")) |s| {
+                if (s == .integer) e.status = s.integer;
+            }
+            if (objStr(resp_v.object, "mimeType")) |m| {
+                a.free(e.mime);
+                e.mime = a.dupe(u8, m) catch return;
+            }
+            if (objStr(params, "type")) |ty| {
+                a.free(e.resource_type);
+                e.resource_type = a.dupe(u8, ty) catch return;
+            }
+        } else if (std.mem.eql(u8, method, "Network.loadingFinished")) {
+            const e = self.findNet(rid) orelse return;
+            e.finished = true;
+        } else if (std.mem.eql(u8, method, "Network.loadingFailed")) {
+            const e = self.findNet(rid) orelse return;
+            e.finished = true;
+            if (objStr(params, "errorText")) |et| {
+                a.free(e.error_text);
+                e.error_text = a.dupe(u8, et) catch return;
+            }
+        }
+    }
+
+    /// Drain buffered/pending event messages without issuing a call.
+    /// Returns quickly when nothing is waiting; a readable socket that
+    /// stalls mid-frame is bounded at ~1s (and closes, per no-hang).
+    pub fn pump(self: *Client, budget_ms: i64) void {
+        if (self.fd < 0) return;
+        const deadline = nowMs() + budget_ms;
+        while (true) {
+            const have_frame = ((wsDecodeHeader(self.rbuf.items) catch return) != null);
+            if (!have_frame) {
+                const left = deadline - nowMs();
+                if (left <= 0) return;
+                var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+                if (c.poll(&pfd, 1, @intCast(@min(left, 50))) <= 0) return;
+            }
+            const msg = self.recvMessage(nowMs() + 1_000) catch return;
+            defer self.allocator.free(msg);
+            self.handleEvent(msg);
+        }
     }
 
     fn wsUpgrade(self: *Client, path: []const u8, timeout_ms: i64) Error!void {
@@ -398,7 +650,9 @@ pub const Client = struct {
             if (std.mem.startsWith(u8, msg, needle)) {
                 return arena.dupe(u8, msg) catch return Error.OutOfMemory;
             }
-            // Anything else is an event or a stale reply: discard.
+            // Anything else is an event (fed to the net log) or a
+            // stale reply (dropped).
+            self.handleEvent(msg);
             if (nowMs() >= deadline) return Error.Timeout;
         }
     }
