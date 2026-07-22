@@ -1296,16 +1296,51 @@ pub const App = struct {
     }
 
     pub fn click(self: *App, win_id: u32, x: f64, y: f64, button: u32) Error!void {
+        return self.clickEx(win_id, x, y, button, 0, 1);
+    }
+
+    /// Click with a held button and/or repeated presses.
+    /// @param hold_ms spans press→release: an app polling per-tick edge
+    ///        counts can see an instantaneous press+release collapsed
+    ///        into one sample, and press-armed repeat UIs never fire.
+    /// @param count packs presses ~80ms apart — inside any double-click
+    ///        threshold, which two separate tool calls can never be.
+    pub fn clickEx(self: *App, win_id: u32, x: f64, y: f64, button: u32, hold_ms: i64, count: u32) Error!void {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
         wlpipe.appendSeatEnter(&units, a, win.sid, x, y) catch return Error.OutOfMemory;
         wlpipe.appendSeatMotion(&units, a, x, y) catch return Error.OutOfMemory;
-        wlpipe.appendSeatButton(&units, a, evdevButton(button), true) catch return Error.OutOfMemory;
-        wlpipe.appendSeatButton(&units, a, evdevButton(button), false) catch return Error.OutOfMemory;
-        try self.sendIntents(win.chan, units.items);
+        const reps = @max(count, 1);
+        var i: u32 = 0;
+        while (i < reps) : (i += 1) {
+            wlpipe.appendSeatButton(&units, a, evdevButton(button), true) catch return Error.OutOfMemory;
+            if (hold_ms > 0) {
+                try self.sendIntents(win.chan, units.items);
+                units.clearRetainingCapacity();
+                self.pumpFor(hold_ms);
+            }
+            wlpipe.appendSeatButton(&units, a, evdevButton(button), false) catch return Error.OutOfMemory;
+            if (i + 1 < reps) {
+                try self.sendIntents(win.chan, units.items);
+                units.clearRetainingCapacity();
+                self.pumpFor(80);
+            }
+        }
+        if (units.items.len > 0) try self.sendIntents(win.chan, units.items);
         self.rememberPtr(win.id, x, y);
+    }
+
+    /// Bounded wall-clock delay that keeps pumping frames (a blind
+    /// nanosleep would let the daemon-side wbuf back up mid-gesture).
+    fn pumpFor(self: *App, ms: i64) void {
+        const deadline = nowMs() + ms;
+        while (!self.exited) {
+            const left = deadline - nowMs();
+            if (left <= 0) return;
+            _ = self.pumpOnce(@intCast(@min(left, 20)));
+        }
     }
 
     pub fn scroll(self: *App, win_id: u32, x: f64, y: f64, dx: f64, dy: f64) Error!void {
@@ -1503,6 +1538,13 @@ pub const App = struct {
     }
 
     pub fn pressKey(self: *App, win_id: ?u32, spec: []const u8) Error!void {
+        return self.pressKeyHold(win_id, spec, 0);
+    }
+
+    /// pressKey with the key held down `hold_ms` before release — the
+    /// app's own key-repeat (Wayland repeat is client-side, driven by
+    /// how long the key stays down) fires during the hold.
+    pub fn pressKeyHold(self: *App, win_id: ?u32, spec: []const u8, hold_ms: i64) Error!void {
         var chord = evkeys.parseChord(spec) orelse return Error.BadKey;
         if (chord.ch) |ch| {
             // Chord letters name CHARACTERS ("ctrl+c" means the key
@@ -1521,6 +1563,11 @@ pub const App = struct {
         if (chord.mods.any())
             wlpipe.appendSeatMods(&units, a, chord.mods.bits(), 0, 0, 0) catch return Error.OutOfMemory;
         wlpipe.appendSeatKey(&units, a, chord.key.code, true) catch return Error.OutOfMemory;
+        if (hold_ms > 0) {
+            try self.sendIntents(win.chan, units.items);
+            units.clearRetainingCapacity();
+            self.pumpFor(hold_ms);
+        }
         wlpipe.appendSeatKey(&units, a, chord.key.code, false) catch return Error.OutOfMemory;
         if (chord.mods.any())
             wlpipe.appendSeatMods(&units, a, 0, 0, 0, 0) catch return Error.OutOfMemory;
