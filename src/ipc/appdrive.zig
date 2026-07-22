@@ -260,6 +260,11 @@ pub const App = struct {
     /// replica pixels are known-stale until the post-drain replay's
     /// native_sync lands. drainLive() waits this out.
     behind: bool = false,
+    /// The last drainLive() hit its deadline without reaching the
+    /// live head — replica pixels may lag until a later drain
+    /// completes. Captions surface this so a capture never silently
+    /// pretends to be current.
+    lagging: bool = false,
     exited: bool = false,
     exit_status: i32 = 0,
     /// Session child pid ON THE DAEMON'S HOST (0 = unknown). A string
@@ -693,15 +698,27 @@ pub const App = struct {
     /// "now", not a screensful-old frame. Terminates on quiet apps
     /// immediately; on continuously-committing apps it is within one
     /// commit of live when the socket goes momentarily quiet.
-    pub fn drainLive(self: *App, max_ms: i64) void {
+    /// Returns true when the live head was reached (the socket went
+    /// quiet with no pending daemon-side resync); false = deadline hit
+    /// while still consuming — `lagging` is set so captures can say so.
+    pub fn drainLive(self: *App, max_ms: i64) bool {
         const deadline = nowMs() + max_ms;
         while (!self.exited and nowMs() < deadline) {
             if (self.pumpOnce(0)) continue;
-            if (!self.behind) return;
+            if (!self.behind) {
+                self.lagging = false;
+                return true;
+            }
             // Backlog consumed but the post-drain replay hasn't landed
             // yet — the daemon queues it the moment its queue empties.
             _ = self.pumpOnce(20);
         }
+        if (self.exited) {
+            self.lagging = false;
+            return true; // final state is by definition current
+        }
+        self.lagging = true;
+        return false;
     }
 
     /// Drain whatever is queued without blocking — TIME-BOXED. A

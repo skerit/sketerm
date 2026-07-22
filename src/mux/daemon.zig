@@ -379,6 +379,11 @@ const WorkerPush = struct {
 const Client = struct {
     const WriteLane = enum { none, normal, audio };
 
+    /// Self-declared attach kind (peer roster / driving indicator /
+    /// per-kind native backlog policy). Wire values are stable: the
+    /// broker ships this as a byte in the 'A' handoff datagram.
+    pub const Kind = enum(u8) { unknown = 0, gui = 1, cli = 2, mcp = 3 };
+
     allocator: std.mem.Allocator,
     fd: c_int,
     rbuf: std.ArrayList(u8) = .empty,
@@ -405,8 +410,8 @@ const Client = struct {
     /// `video`). Gates whether forwarded surfaces route through the lossy
     /// video path — never send a tile a client can't decode.
     video: bool = false,
-    /// Self-declared attach kind (peer roster / driving indicator).
-    kind: enum { unknown, gui, cli, mcp } = .unknown,
+    /// Self-declared attach kind.
+    kind: Kind = .unknown,
     /// Terminal `.events` were withheld because this client's wbuf
     /// exceeded EVENTS_BACKLOG (a flooding session vs a slow/idle
     /// consumer — e.g. an MCP client between tool calls). Once the
@@ -1331,8 +1336,9 @@ pub const Daemon = struct {
     // A worker process owns one session and receives its clients as fds
     // passed by the broker over a SOCK_SEQPACKET control socketpair. Each
     // control message is one datagram: [opcode][payload], with at most one
-    // fd in SCM_RIGHTS. Opcodes: 'A' attach (payload [proto][video] + the
-    // client fd), 'K' kill. (list/rename/metadata join in B3.)
+    // fd in SCM_RIGHTS. Opcodes: 'A' attach (payload [proto][video][kind]
+    // + the client fd; kind = Client.Kind byte, absent from old brokers),
+    // 'K' kill. (list/rename/metadata join in B3.)
 
     /// Worker side: drain one control datagram and act on it.
     fn workerOnControl(self: *Daemon) void {
@@ -1350,7 +1356,17 @@ pub const Daemon = struct {
                 if (passed < 0) return;
                 const proto: u32 = if (n >= 2) buf[1] else 1;
                 const video: bool = n >= 3 and buf[2] != 0;
-                self.addPassedClient(passed, proto, video);
+                // Byte 3 (newer brokers): the client's attach kind.
+                // Without it an MCP client reads as .unknown in the
+                // worker and the whole per-kind native backlog policy
+                // (gap + live-mirror resync) silently never engages —
+                // the stale-screenshot bug in broker (= `sketerm mcp`
+                // isolation) mode while monolith tested clean.
+                const kind: Client.Kind = if (n >= 4)
+                    std.enums.fromInt(Client.Kind, buf[3]) orelse .unknown
+                else
+                    .unknown;
+                self.addPassedClient(passed, proto, video, kind);
             },
             'K' => {
                 for (self.clients.items) |cl| if (!cl.dead) cl.queueFrame(.gone, "");
@@ -1377,7 +1393,7 @@ pub const Daemon = struct {
 
     /// Worker side: adopt a broker-passed client fd as a client attached to
     /// our one session, and send it the attach snapshot.
-    fn addPassedClient(self: *Daemon, fd: c_int, proto: u32, video: bool) void {
+    fn addPassedClient(self: *Daemon, fd: c_int, proto: u32, video: bool, kind: Client.Kind) void {
         _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
         const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
         _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
@@ -1385,7 +1401,7 @@ pub const Daemon = struct {
             _ = c.close(fd);
             return;
         };
-        cl.* = .{ .allocator = self.allocator, .fd = fd, .proto = proto, .video = video };
+        cl.* = .{ .allocator = self.allocator, .fd = fd, .proto = proto, .video = video, .kind = kind };
         self.clients.append(self.allocator, cl) catch {
             cl.deinit();
             return;
@@ -1393,11 +1409,12 @@ pub const Daemon = struct {
         if (self.sessions.items.len == 0) return;
         const s = self.sessions.items[0];
         cl.attached = s;
-        log.info("client attached session='{s}' proto={d} video={} (worker handoff)", .{ s.name, proto, video });
+        log.info("client attached session='{s}' kind={s} proto={d} video={} (worker handoff)", .{ s.name, @tagName(kind), proto, video });
         self.queueSnapshot(cl, s);
         if (proto >= 2 and s.winstream != null) self.openWinstreamChan(s, cl);
         if (proto >= 5) self.replayNativeChannels(cl, s);
         self.refreshVideoGates();
+        self.broadcastPeerInfo(s);
     }
 
     /// Broker side: read one control datagram from a worker. 'Y' = ready
@@ -2700,6 +2717,19 @@ pub const Daemon = struct {
     /// up on the NEXT commit it can receive (or via reattach replay).
     const NATIVE_BACKLOG: usize = 8 << 20;
 
+    /// The gap threshold for "mcp"-kind clients is far LOWER: an MCP
+    /// client consumes its queue at replica-compose speed (a full
+    /// window memcpy per intermediate frame), so queued bytes map
+    /// directly onto catch-up latency at the next tool call — 8MB of
+    /// backlog is seconds of chewing before a capture is current.
+    /// 1MB keeps that under the tool-entry catch-up budget; the
+    /// post-drain live-mirror replay covers everything skipped.
+    const MCP_NATIVE_BACKLOG: usize = 1 << 20;
+
+    fn nativeBacklogCap(cl: *const Client) usize {
+        return if (cl.kind == .mcp) MCP_NATIVE_BACKLOG else NATIVE_BACKLOG;
+    }
+
     /// Should the commit path copy+encode this frame at all? True only
     /// when some attached proto>=5 viewer has room in its wbuf. With
     /// no viewer, OR every viewer already backed up, skip: the units
@@ -2712,7 +2742,7 @@ pub const Daemon = struct {
     fn hasNativeViewer(self: *const Daemon, nv: *const Native) bool {
         const s = (nv.chan orelse return true).session orelse return true;
         for (self.clients.items) |cl| {
-            if (nativeViewer(cl, s) and !cl.needs_native_resync and cl.wbuf.items.len < NATIVE_BACKLOG) return true;
+            if (nativeViewer(cl, s) and !cl.needs_native_resync and cl.wbuf.items.len < nativeBacklogCap(cl)) return true;
         }
         return false;
     }
@@ -3353,7 +3383,7 @@ pub const Daemon = struct {
                 // drain continuously and handle no mid-life replay.
                 if (cl.kind == .mcp) {
                     if (cl.needs_native_resync) continue;
-                    if (cl.wbuf.items.len > NATIVE_BACKLOG) {
+                    if (cl.wbuf.items.len > MCP_NATIVE_BACKLOG) {
                         cl.needs_native_resync = true;
                         cl.queueFrame(.native_gap, "");
                         log.debug("mcp client over native backlog ({d}B queued) — pausing app frames until it drains", .{cl.wbuf.items.len});
@@ -3364,7 +3394,7 @@ pub const Daemon = struct {
                 // One unit run can itself blow past the cap (the app
                 // committed a burst the daemon read in one batch) —
                 // re-check AFTER queueing or the gap never triggers.
-                if (cl.kind == .mcp and !cl.needs_native_resync and cl.wbuf.items.len > NATIVE_BACKLOG) {
+                if (cl.kind == .mcp and !cl.needs_native_resync and cl.wbuf.items.len > MCP_NATIVE_BACKLOG) {
                     cl.needs_native_resync = true;
                     cl.queueFrame(.native_gap, "");
                     log.debug("mcp client over native backlog ({d}B queued after burst) — pausing app frames until it drains", .{cl.wbuf.items.len});
@@ -3873,7 +3903,15 @@ pub const Daemon = struct {
             cl.queueErr("no such session");
             return;
         };
-        const msg = [_]u8{ 'A', @truncate(cl.proto), @intFromBool(cl.video) };
+        const kind: Client.Kind = if (std.mem.eql(u8, parsed.value.kind, "gui"))
+            .gui
+        else if (std.mem.eql(u8, parsed.value.kind, "cli"))
+            .cli
+        else if (std.mem.eql(u8, parsed.value.kind, "mcp"))
+            .mcp
+        else
+            .unknown;
+        const msg = [_]u8{ 'A', @truncate(cl.proto), @intFromBool(cl.video), @intFromEnum(kind) };
         controlSend(w.control_fd, &msg, cl.fd);
         // Handed off: the kernel duplicated the fd into the worker. Drop our
         // copy + the Client (reap closes the broker's fd; the worker's stays).

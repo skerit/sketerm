@@ -1005,7 +1005,7 @@ const TOOLS_JSON_RAW =
 /// entry (appdrive.drainLive): backlog consumption + the daemon's
 /// post-drain replay. Not a Tuning item — it bounds internal
 /// convergence, not an input-timing behavior.
-const CATCHUP_MS: i64 = 1_500;
+const CATCHUP_MS: i64 = 2_500;
 
 const Tuning = struct {
     const Item = struct {
@@ -1725,9 +1725,9 @@ fn screenshotCaption(arena: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
             if (win.title != null) " title=" else "",
             win.title orelse "",
             coord_note,
-            // Set only when drainLive timed out mid-resync: the frame
-            // stream is still catching up, so pixels may lag.
-            if (app.behind) " [WARNING: frame stream still resyncing — this capture may lag the app]" else "",
+            // Set only when drainLive timed out: the frame stream is
+            // still catching up, so pixels may lag the app.
+            if (app.behind or app.lagging) " [WARNING: frame stream still catching up — this capture may lag the app; retry with wait_change or stable_ms]" else "",
             browserPageSuffix(arena, app),
         },
     );
@@ -1904,7 +1904,7 @@ const PostInputWait = struct {
         // socket predates the input and must not satisfy the wait.
         // drainLive (not the 100ms-boxed drain): the baseline must be
         // the LIVE frame, incl. a pending daemon-side resync.
-        if (wait) app.drainLive(CATCHUP_MS);
+        if (wait) _ = app.drainLive(CATCHUP_MS);
         // Defaulted-on waits stay short (a no-op click costs at most
         // Tuning.timeout_ms); an explicit wait_change/settle gets a
         // real budget.
@@ -2685,7 +2685,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
     // apps (SDL games) — the daemon now pauses streaming to a
     // backlogged MCP client and replays current state once we drain;
     // drainLive waits for that replay (bounded).
-    app.drainLive(CATCHUP_MS);
+    _ = app.drainLive(CATCHUP_MS);
 
     // "The app exited" is a NORMAL state, handled centrally: every
     // interaction tool answers with the exit summary IMMEDIATELY
