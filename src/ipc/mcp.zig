@@ -601,6 +601,20 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     Watchdog.initLock();
     if (std.Thread.spawn(.{}, Watchdog.loop, .{})) |t| t.detach() else |_| {}
 
+    // Project-level input-timing overrides (see Tuning). Logged so
+    // the trace shows the effective defaults, not just the env.
+    Tuning.load();
+    if (mcp_log) |*l| {
+        for (Tuning.all()) |item| {
+            if (!item.overridden) continue;
+            var tbuf: [160]u8 = undefined;
+            const note = std.fmt.bufPrint(&tbuf, "tuning override: {s}={d} (via {s}; built-in {d})", .{
+                item.name, item.value, item.env, item.built_in,
+            }) catch continue;
+            l.logNote(note);
+        }
+    }
+
     if (mcp_log) |*l| {
         var nbuf: [512]u8 = undefined;
         const note = std.fmt.bufPrint(&nbuf, "mcp server started: pid={d} mode={s} name={s} gui_socket={s}", .{
@@ -764,7 +778,8 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
         return rpcResult(arena, id, "{}");
     }
     if (std.mem.eql(u8, method, "tools/list")) {
-        const result = std.fmt.allocPrint(arena, "{{\"tools\":{s}}}", .{TOOLS_JSON}) catch return null;
+        const tools = renderedToolsJson(arena) catch return null;
+        const result = std.fmt.allocPrint(arena, "{{\"tools\":{s}}}", .{tools}) catch return null;
         return rpcResult(arena, id, result);
     }
     if (std.mem.eql(u8, method, "tools/call")) {
@@ -909,8 +924,8 @@ const TOOLS_JSON_RAW =
     \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app. If the app exited, reports exit status, signal and recent output instead. Accepts the same region/zoom/wait_change/stable_ms/stats_only/burst options as screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"max_px":{"type":"integer"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer"},"wait_change":{"type":"boolean"},"stable_ms":{"type":"integer"},"stats_only":{"type":"boolean"},"burst":{"type":"integer"},"burst_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as RENDERED BY A TERMINAL — a fixed-width grid, so long lines wrap and scrolled-off content needs scrollback=true; right for TUI-style redraws). For log-style output app_log is the SOURCE OF TRUTH: indexed unwrapped lines with stable ids, re-readable in full — prefer it. When the grid mirror is blank after an exit, the log ring's last lines are served instead. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
     \\{"name":"app_log","description":"A headless app's stdout/stderr as an INDEXED LOG: each complete line gets a stable numeric id and a timestamp; the tail view shortens long lines (marked [+]) and any line can be re-read in full by id. The ring is bounded (oldest lines drop; the reply says how many). MARKERS: the app (or your injected code) can emit the escape  printf '\\033]5522;my-label\\033\\\\'  — it becomes a labelled log line AND sketerm stashes a screenshot of the app window at that exact instant; fetch label+image with {\"id\":<that line's id>}. Variant printf '\\033]5522;+N;my-label\\033\\\\' captures the Nth FUTURE frame commit instead (e.g. +1 = the next repaint after this point; resolved with the final frame if the app exits first). Markers are rate-limited (burst 8, then 2/s; excess are dropped and counted) so escape-laden files cat'ed to the terminal cannot flood the log. Survives app exit: the final log is delivered with the exit. Reliable on frame-flooding apps: a reply delayed behind streamed frame data is refetched over a FRESH daemon connection automatically; failing that, the last cached snapshot is served with a [STALE] banner, then the PTY grid mirror (no line ids) — an error only when nothing at all is reachable.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"tail":{"type":"integer","description":"Last N lines (default 60, max 500)"},"from_id":{"type":"integer","description":"Return lines starting at this id instead of the tail"},"id":{"type":"integer","description":"Return ONE line in full; for a marker line also returns the stashed screenshot"}}}},
-    \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right. By DEFAULT the reply is a post-click screenshot with a crosshair at the exact click pixel — where the click landed AND what it did, in one image (mark:false for a plain text reply; screenshot=true for the frame without the marker). CLICK-AND-SETTLE: the capture waits (bounded) for a frame committed AFTER the click, then a short settle (250ms default) so mid-repaint frames aren't captured; the caption states 'repainted Nms after the input' or 'NO repaint within Nms'. HONESTY LIMITS: on a continuously-animating app (blinking LEDs, a game) ANY commit counts as a repaint — set min_change_pct (1-2) there or the dead/live distinction is meaningless; and 'NO repaint within Nms' is not proof of a dead click on an app that reacts with multi-second latency — retry with a larger timeout_ms before concluding.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"},"mark":{"type":"boolean","description":"Crosshair-marked post-click screenshot (DEFAULT true; false = no image unless screenshot is set)"},"screenshot":{"type":"boolean","description":"Return the post-click frame without the marker"},"wait_change":{"type":"boolean","description":"Wait for a post-click frame commit before returning (defaults ON when an image is returned; false = capture immediately)"},"settle_ms":{"type":"integer","description":"After the first post-click frame, wait until repainting pauses this long before capturing (default 250; 0 = capture the first frame)"},"min_change_pct":{"type":"number","description":"Only frames changing at least this % of pixels count as change — REQUIRED for a meaningful dead/live verdict on continuously-animating apps"},"timeout_ms":{"type":"integer","description":"Bound for the post-click wait (default 1500; 5000 when wait_change/settle_ms is explicit)"},"max_px":{"type":"integer","description":"Bound on the screenshot's longest dimension (default 1568)"}},"required":["window","x","y"]}},
-    \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} (MILLISECONDS, max 30000) | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} (with change_pct = VISUAL settle: blocks until frames change less than that %% — use for scene transitions of unknown duration instead of guessing a fixed wait) | {\"wait_change\":timeout_ms or {\"timeout_ms\":N,\"min_change_pct\":P}} (P = ignore repaints below that %% of pixels; add \"required\":true to a wait_idle/wait_change step to make a timeout FAIL the batch instead of continuing — a timeout is then structurally distinct from success) | {\"screenshot\":true or {\"max_px\":N}} | {\"wait_image\":{\"template\":name,\"timeout_ms\":N,\"click\":true}} (wait for a saved template to appear, optionally click its center) | {\"click_image\":{\"template\":name}} (find + click NOW, error if absent) | {\"wait_text\":{\"text\":s,\"click\":true}} (OCR-wait for a string, optionally click it) — these three make batches STATE-driven instead of coordinate/timing-driven. MARKERS: add \"mark\":true to a click/move/move_rel/drag/scroll step to draw a labelled crosshair at that step's position (red = click, cyan = move; the number is the step index) onto the NEXT screenshot — several marked steps can share one image. Combine in one step: {\"click\":[x,y],\"mark\":true,\"screenshot\":true} captures the post-click frame with the click point marked. Leftover marks with no later screenshot are flushed as a final image automatically. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
+    \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right. By DEFAULT the reply is a post-click screenshot with a crosshair at the exact click pixel — where the click landed AND what it did, in one image (mark:false for a plain text reply; screenshot=true for the frame without the marker). HOLD/REPEAT/RETRY: the button stays DOWN for hold_ms between press and release (human-like — an instantaneous click can be collapsed into one sample by apps that poll input edges per tick, and a LONG hold exercises press-and-hold repeat widgets); count:2 sends a real double-click (two separate app_click calls are always too far apart to register as one); retry re-clicks when no qualifying repaint arrives in time, for apps whose buttons genuinely need a second press. CLICK-AND-SETTLE: the capture waits (bounded) for a frame committed AFTER the click, then a short settle (settle_ms) so mid-repaint frames aren't captured; the caption states 'repainted Nms after the input' or 'NO repaint within Nms'. HONESTY LIMITS: on a continuously-animating app (blinking LEDs, a game) ANY commit counts as a repaint — set min_change_pct (1-2) there or the dead/live distinction is meaningless; and 'NO repaint within Nms' is not proof of a dead click on an app that reacts with multi-second latency — retry with a larger timeout_ms before concluding.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"},"hold_ms":{"type":"integer","description":"How long the button stays down between press and release, ms (%HOLD_DEF%; max 10000). Long values drive press-and-hold repeat controls."},"count":{"type":"integer","description":"Clicks in quick succession, ~80ms apart: 2 = double-click, 3 = triple (default 1)"},"retry":{"type":"integer","description":"If no qualifying repaint arrives within timeout_ms, click again, up to this many EXTRA attempts (%RETRY_DEF%; max 5). Pair with min_change_pct on animating apps, or the first attempt always looks alive."},"mark":{"type":"boolean","description":"Crosshair-marked post-click screenshot (DEFAULT true; false = no image unless screenshot is set)"},"screenshot":{"type":"boolean","description":"Return the post-click frame without the marker"},"wait_change":{"type":"boolean","description":"Wait for a post-click frame commit before returning (defaults ON when an image is returned; false = capture immediately)"},"settle_ms":{"type":"integer","description":"After the first post-click frame, wait until repainting pauses this long before capturing (%SETTLE_DEF%; 0 = capture the first frame)"},"min_change_pct":{"type":"number","description":"Only frames changing at least this % of pixels count as change — REQUIRED for a meaningful dead/live verdict on continuously-animating apps. Deliberately per-call only (never an env default): it decides the VERDICT, not a timing bound."},"timeout_ms":{"type":"integer","description":"Bound for the post-click wait (%TIMEOUT_DEF%; raised to at least 5000 when wait_change/settle_ms is explicit)"},"max_px":{"type":"integer","description":"Bound on the screenshot's longest dimension (default 1568)"}},"required":["window","x","y"]}},
+    \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} (optional \"hold_ms\" and \"count\":2 for double-click, as in app_click) | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} (optional \"hold_ms\" per chord, as in app_key) | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} (MILLISECONDS, max 30000) | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} (with change_pct = VISUAL settle: blocks until frames change less than that %% — use for scene transitions of unknown duration instead of guessing a fixed wait) | {\"wait_change\":timeout_ms or {\"timeout_ms\":N,\"min_change_pct\":P}} (P = ignore repaints below that %% of pixels; add \"required\":true to a wait_idle/wait_change step to make a timeout FAIL the batch instead of continuing — a timeout is then structurally distinct from success) | {\"screenshot\":true or {\"max_px\":N}} | {\"wait_image\":{\"template\":name,\"timeout_ms\":N,\"click\":true}} (wait for a saved template to appear, optionally click its center) | {\"click_image\":{\"template\":name}} (find + click NOW, error if absent) | {\"wait_text\":{\"text\":s,\"click\":true}} (OCR-wait for a string, optionally click it) — these three make batches STATE-driven instead of coordinate/timing-driven. MARKERS: add \"mark\":true to a click/move/move_rel/drag/scroll step to draw a labelled crosshair at that step's position (red = click, cyan = move; the number is the step index) onto the NEXT screenshot — several marked steps can share one image. Combine in one step: {\"click\":[x,y],\"mark\":true,\"screenshot\":true} captures the post-click frame with the click point marked. Leftover marks with no later screenshot are flushed as a final image automatically. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
     \\{"name":"app_mouse_move","description":"Move the pointer in an app window WITHOUT clicking. Absolute: x,y in surface pixels (hover a widget, position before a click). Relative: dx,dy — a delta from the current pointer position, for apps that consume RELATIVE mouse motion (SDL games, DOSBox, anything with pointer-lock): sketerm derives relative_motion events from the move, so the app's own cursor moves by exactly your delta. Calibration for such apps: one large negative move (e.g. dx:-30000, dy:-30000) slams their internal cursor to the top-left corner, after which exact deltas land where you aim. With neither x/y nor dx/dy it just returns the tracked pointer position.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = window under the pointer, else first toplevel)"},"x":{"type":"number","description":"Absolute surface x (with y)"},"y":{"type":"number"},"dx":{"type":"number","description":"Relative delta x (with dy; exclusive with x/y)"},"dy":{"type":"number"}}}},
     \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
     \\{"name":"app_set_value","description":"Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value). Faster and more reliable than typing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}},
@@ -919,7 +934,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_type","description":"Type literal text into an app window. Non-ASCII text is delivered via a clipboard paste (Ctrl+V) automatically. screenshot=true returns the post-typing frame, captured only after the window repaints (wait_change/settle_ms/timeout_ms as in app_click).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"text":{"type":"string"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"}},"required":["text"]}},
     \\{"name":"app_clipboard_get","description":"Read what the app last copied to the clipboard (requires the app to have copied something).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"app_clipboard_set","description":"Offer text to the app as the host clipboard. Set paste=true to immediately press Ctrl+V in a window.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"text":{"type":"string"},"paste":{"type":"boolean"},"window":{"type":"integer"}},"required":["text"]}},
-    \\{"name":"app_key","description":"Press key chords in an app window: space-separated, e.g. 'ctrl+s', 'enter', 'alt+F4', 'down down enter'. screenshot=true returns the post-keypress frame, captured only after the window repaints (wait_change/settle_ms/timeout_ms as in app_click).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"keys":{"type":"string"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"}},"required":["keys"]}},
+    \\{"name":"app_key","description":"Press key chords in an app window: space-separated, e.g. 'ctrl+s', 'enter', 'alt+F4', 'down down enter'. hold_ms keeps each chord's key DOWN that long before releasing — the app's own key-repeat fires during the hold (hold-to-scroll, hold-to-increment). screenshot=true returns the post-keypress frame, captured only after the window repaints (wait_change/settle_ms/timeout_ms as in app_click).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"keys":{"type":"string"},"hold_ms":{"type":"integer","description":"Hold each chord's key down this long before releasing, ms (default 0 = tap; max 10000)"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"}},"required":["keys"]}},
     \\{"name":"app_scroll","description":"Scroll inside an app window. dy>0 scrolls down, dx>0 right (wheel steps). screenshot=true returns the post-scroll frame, captured only after the window repaints (wait_change/settle_ms/timeout_ms as in app_click).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"}},"required":["window"]}},
     \\{"name":"app_resize","description":"Ask an app window to redraw at a new size (deterministic screenshots).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["window","w","h"]}},
     \\{"name":"app_wait","description":"Wait until an app stopped producing new frames for quiet_ms (render quiescence), or — pass change_pct — until each new frame changes less than that percentage of pixels for quiet_ms (VISUAL quiescence: use this for games and other continuously-animating apps, which never stop committing frames but do reach a visually stable screen). Reports which outcome happened and returns the window list.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window for change_pct pixel diffing (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"},"change_pct":{"type":"number","description":"Settle when frames change less than this %% of pixels (e.g. 2). Omit = strict no-new-frames quiescence"}}}},
@@ -956,7 +971,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"port_forward_list","description":"List open port forwards with liveness and reconnect counts.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"port_forward_check","description":"Health-check one forward: verifies the ssh process AND that the local port accepts connections; if the ssh died (network blip, sshd restart) it RECONNECTS by respawning the same spec on the same local port.","inputSchema":{"type":"object","properties":{"forward":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Reconnect readiness budget, default 20000"}}}},
     \\{"name":"port_forward_close","description":"Close a port forward (kills its ssh).","inputSchema":{"type":"object","properties":{"forward":{"type":"integer"}},"required":["forward"]}},
-    \\{"name":"capabilities","description":"Preflight report of what THIS MCP server can do right now: isolation mode, GUI socket presence, OCR (tesseract) availability, which browser binary browser_open would use, ssh/scp presence, the directory terminal asciicast recordings land in, and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.","inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"capabilities","description":"Preflight report of what THIS MCP server can do right now: isolation mode, GUI socket presence, OCR (tesseract) availability, which browser binary browser_open would use, ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"browser_open","description":"Launch a Chromium-family browser HEADLESSLY (Wayland, never on any screen) with DevTools (CDP) attached: you get real DOM access — browser_read (text/html/links), browser_elements, browser_click, browser_fill, browser_wait, browser_eval — plus everything an app has (screenshot via get_app_state, app_key for keyboard, app_scroll). Wayland + remote-debugging flags are applied automatically; renderer accessibility is enabled. Replies with the app id, DevTools port, page info and a first screenshot. Local daemon only.","inputSchema":{"type":"object","properties":{"url":{"type":"string","description":"Initial page (default about:blank)"},"profile":{"type":"string","description":"Named PERSISTENT profile (cookies/logins survive across sessions); omit = throwaway profile"},"browser_path":{"type":"string","description":"Specific browser binary (default: first Chromium-family binary on PATH)"},"width":{"type":"integer","description":"Window width, default 1280"},"height":{"type":"integer","description":"Window height, default 900"},"wait_ms":{"type":"integer","description":"Startup budget, default 25000"}}}},
     \\{"name":"browser_info","description":"Current URL, title, readyState, scroll position and viewport of a browser_open app — confirm soft navigations without reading the address bar pixels.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"browser_navigate","description":"Navigate a browser_open app: a URL (https:// assumed when schemeless), or \"back\"/\"forward\"/\"reload\". Waits for document readyState complete (bounded) and returns the landed URL + title.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"url":{"type":"string"},"timeout_ms":{"type":"integer","description":"Load wait, default 20000"}},"required":["url"]}},
@@ -972,6 +987,98 @@ const TOOLS_JSON_RAW =
     \\{"name":"browser_network","description":"Structured network inspection (Playwright-style): the requests the page made — method, URL, status, resource type, mime, redirect count, failure reason (TLS/DNS/abort), in_flight state, and the request-body FIELD NAMES (values are never captured — secrets stay out of the log). Capture is on from browser_open; the log keeps the last 300 requests. Filter with 'filter' (URL substring), page with 'limit', reset with clear=true. Diagnose form submissions, redirect chains and hung XHRs without leaving the browser tool family.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"filter":{"type":"string"},"limit":{"type":"integer","description":"Max requests returned (default 30, newest kept)"},"clear":{"type":"boolean"}}}}
     \\]
 ;
+
+// ── input-timing tuning (env-overridable defaults) ────────────────
+//
+// A chronically slow app is a property of the PROJECT, not of one
+// tool call — these let a project's .mcp.json env block declare it
+// once (e.g. SKETERM_MCP_TIMEOUT_MS=15000). The SAME struct feeds
+// the runtime defaults AND the rendered tools/list descriptions
+// (renderedToolsJson), so the default the assistant reads is by
+// construction the default the server uses — they cannot drift.
+//
+// min_change_pct deliberately has NO entry here: it decides the
+// dead/live VERDICT rather than a timing bound, and an invisible
+// non-zero default would fabricate "NO repaint" verdicts on normal
+// apps. It stays per-call.
+const Tuning = struct {
+    const Item = struct {
+        name: []const u8,
+        value: i64,
+        built_in: i64,
+        env: [:0]const u8,
+        min: i64,
+        max: i64,
+        overridden: bool = false,
+    };
+    /// Click press→release span. Human clicks run 50-150ms; an
+    /// instantaneous click is exactly the regime where edge-polling
+    /// apps collapse press+release into one sample.
+    var hold_ms: Item = .{ .name = "hold_ms", .value = 100, .built_in = 100, .env = "SKETERM_MCP_HOLD_MS", .min = 0, .max = 10_000 };
+    var settle_ms: Item = .{ .name = "settle_ms", .value = 250, .built_in = 250, .env = "SKETERM_MCP_SETTLE_MS", .min = 0, .max = 30_000 };
+    /// Post-input repaint wait when the wait is defaulted-on.
+    var timeout_ms: Item = .{ .name = "timeout_ms", .value = 1_500, .built_in = 1_500, .env = "SKETERM_MCP_TIMEOUT_MS", .min = 100, .max = 30_000 };
+    /// Extra app_click attempts when no qualifying repaint arrives.
+    var click_retry: Item = .{ .name = "click_retry", .value = 0, .built_in = 0, .env = "SKETERM_MCP_CLICK_RETRY", .min = 0, .max = 5 };
+
+    fn all() [4]*Item {
+        return .{ &hold_ms, &settle_ms, &timeout_ms, &click_retry };
+    }
+
+    fn load() void {
+        for (all()) |item| loadOne(item);
+    }
+
+    fn loadOne(item: *Item) void {
+        const v = c.getenv(item.env.ptr) orelse return;
+        const span = std.mem.span(@as([*:0]const u8, @ptrCast(v)));
+        const parsed = std.fmt.parseInt(i64, span, 10) catch return;
+        item.value = std.math.clamp(parsed, item.min, item.max);
+        item.overridden = true;
+    }
+
+    /// Post-input wait budget when wait_change/settle_ms was passed
+    /// explicitly: never below the historical 5s, raised further by
+    /// an env override.
+    fn explicitTimeout() i64 {
+        return @max(timeout_ms.value, 5_000);
+    }
+
+    /// tools/list description fragment. An overridden value says so
+    /// AND names the built-in — "someone tuned this deliberately"
+    /// carries information the bare number does not.
+    fn defText(buf: []u8, item: *const Item) []const u8 {
+        if (!item.overridden)
+            return std.fmt.bufPrint(buf, "default {d}", .{item.value}) catch "default ?";
+        return std.fmt.bufPrint(buf, "default {d} — PROJECT OVERRIDE via {s}, built-in {d}", .{ item.value, item.env, item.built_in }) catch "default ?";
+    }
+};
+
+fn replaceAll(arena: std.mem.Allocator, haystack: []const u8, needle: []const u8, repl: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, haystack, needle) == null) return haystack;
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    var rest = haystack;
+    while (std.mem.indexOf(u8, rest, needle)) |i| {
+        try aw.writer.writeAll(rest[0..i]);
+        try aw.writer.writeAll(repl);
+        rest = rest[i + needle.len ..];
+    }
+    try aw.writer.writeAll(rest);
+    return aw.written();
+}
+
+/// TOOLS_JSON with the %..._DEF% timing tokens replaced by the
+/// EFFECTIVE defaults (env overrides included), so the description
+/// the assistant reads always states the value the server will use.
+fn renderedToolsJson(arena: std.mem.Allocator) ![]const u8 {
+    var buf: [128]u8 = undefined;
+    var out: []const u8 = TOOLS_JSON;
+    out = try replaceAll(arena, out, "%HOLD_DEF%", Tuning.defText(&buf, &Tuning.hold_ms));
+    out = try replaceAll(arena, out, "%SETTLE_DEF%", Tuning.defText(&buf, &Tuning.settle_ms));
+    out = try replaceAll(arena, out, "%TIMEOUT_DEF%", Tuning.defText(&buf, &Tuning.timeout_ms));
+    out = try replaceAll(arena, out, "%RETRY_DEF%", Tuning.defText(&buf, &Tuning.click_retry));
+    return out;
+}
 
 fn argInt(args: std.json.Value, key: []const u8) ?i64 {
     if (args != .object) return null;
@@ -1745,6 +1852,14 @@ fn firstToplevelId(app: *appdrive.App) u32 {
     return if (best) |b| b.id else 0;
 }
 
+/// A plain synthesized click honoring the project's hold default —
+/// every click the server invents (template match, OCR match) goes
+/// through this so an edge-polling app sees the same human-like
+/// press-to-release span as an explicit app_click.
+fn clickTuned(app: *appdrive.App, win_id: u32, x: f64, y: f64, button: u32) appdrive.Error!void {
+    return app.clickEx(win_id, x, y, button, Tuning.hold_ms.value, 1);
+}
+
 /// Click-and-settle: captured BEFORE injecting input so the post-input
 /// wait can tell "the app repainted in response" from "the frame on
 /// screen predates the input" — the old idle-only wait returned
@@ -1757,15 +1872,19 @@ const PostInputWait = struct {
     settle_ms: i64,
     min_pct: f64,
     t0: i64,
+    /// Set by finish(): a qualifying post-input frame arrived. Lets
+    /// callers (app_click auto-retry) branch on the verdict without
+    /// parsing the caption note.
+    repainted: bool = false,
 
     /// `want_shot` = a post-input screenshot was requested; wait_change
     /// then defaults ON (pass wait_change:false to capture immediately).
     fn begin(args: std.json.Value, app: *appdrive.App, win_id: u32, want_shot: bool) PostInputWait {
         const min_pct: f64 = argFloat(args, "min_change_pct") orelse 0;
-        // Default settle of 250ms: the FIRST post-input frame is often
-        // a partial mid-repaint — capture only once painting pauses.
-        // An explicit settle_ms:0 opts out.
-        const settle_ms: i64 = std.math.clamp(argInt(args, "settle_ms") orelse 250, 0, 30_000);
+        // Default settle (Tuning.settle_ms): the FIRST post-input
+        // frame is often a partial mid-repaint — capture only once
+        // painting pauses. An explicit settle_ms:0 opts out.
+        const settle_ms: i64 = std.math.clamp(argInt(args, "settle_ms") orelse Tuning.settle_ms.value, 0, 30_000);
         const settle_explicit = args == .object and args.object.get("settle_ms") != null;
         const explicit: ?bool = if (args == .object)
             (if (args.object.get("wait_change")) |v| (v == .bool and v.bool) else null)
@@ -1776,9 +1895,10 @@ const PostInputWait = struct {
         // socket predates the input and must not satisfy the wait.
         if (wait) app.drain();
         // Defaulted-on waits stay short (a no-op click costs at most
-        // 1.5s); an explicit wait_change/settle gets a real budget.
+        // Tuning.timeout_ms); an explicit wait_change/settle gets a
+        // real budget.
         const timeout_ms: i64 = std.math.clamp(
-            argInt(args, "timeout_ms") orelse @as(i64, if (explicit != null or settle_explicit) 5_000 else 1_500),
+            argInt(args, "timeout_ms") orelse @as(i64, if (explicit != null or settle_explicit) Tuning.explicitTimeout() else Tuning.timeout_ms.value),
             100,
             30_000,
         );
@@ -1802,6 +1922,7 @@ const PostInputWait = struct {
             return "";
         }
         if (app.waitChangeSince(win_id, &self.ref.?, self.timeout_ms, self.min_pct)) {
+            self.repainted = true;
             const elapsed = monoMs() - self.t0;
             if (self.settle_ms > 0) {
                 const remain = @max(self.timeout_ms - elapsed, 500);
@@ -1981,11 +2102,14 @@ fn journalStep(app: *appdrive.App, comptime fmt: []const u8, fmt_args: anytype) 
 }
 
 /// Journal a step whose payload needs real JSON escaping (type text).
-fn journalStepJson(app: *appdrive.App, arena: std.mem.Allocator, key: []const u8, text: []const u8) void {
+/// `extra_raw` is appended verbatim inside the object ("" = none),
+/// e.g. ",\"hold_ms\":500".
+fn journalStepJson(app: *appdrive.App, arena: std.mem.Allocator, key: []const u8, text: []const u8, extra_raw: []const u8) void {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     w.print("{{\"{s}\":", .{key}) catch return;
     std.json.Stringify.value(text, .{}, w) catch return;
+    w.writeAll(extra_raw) catch return;
     w.writeAll("}") catch return;
     Journal.record(appIdOf(app), aw.written());
 }
@@ -2849,6 +2973,9 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             return appErr(arena, "app_click requires 'window' and x/y. To target a widget by name/role use app_perform_action (coordinate-free)."));
         const x = argInt(args, "x") orelse return appErr(arena, "app_click requires 'x'");
         const y = argInt(args, "y") orelse return appErr(arena, "app_click requires 'y'");
+        const hold_ms: i64 = std.math.clamp(argInt(args, "hold_ms") orelse Tuning.hold_ms.value, 0, 10_000);
+        const count: u32 = @intCast(std.math.clamp(argInt(args, "count") orelse 1, 1, 3));
+        const retries: i64 = std.math.clamp(argInt(args, "retry") orelse Tuning.click_retry.value, 0, 5);
         // Crosshair-marked post-click screenshot is the DEFAULT: it
         // answers "did the click land where I aimed, and did it do
         // anything" in one image. mark:false (without screenshot)
@@ -2858,11 +2985,31 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         else
             true;
         const want_shot = want_mark or argBool(args, "screenshot");
-        var piw = PostInputWait.begin(args, app, win_id, want_shot);
-        app.click(win_id, @floatFromInt(x), @floatFromInt(y), button) catch
-            return appErr(arena, "click failed (bad window?)");
-        journalStep(app, "{{\"click\":[{d},{d}],\"button\":{d},\"window\":{d}}}", .{ x, y, button, win_id });
-        const note = try piw.finish(arena, app, win_id);
+        var attempts: i64 = 0;
+        var note: []const u8 = "";
+        var repainted = false;
+        while (true) {
+            var piw = PostInputWait.begin(args, app, win_id, want_shot);
+            app.clickEx(win_id, @floatFromInt(x), @floatFromInt(y), button, hold_ms, count) catch
+                return appErr(arena, "click failed (bad window?)");
+            attempts += 1;
+            note = try piw.finish(arena, app, win_id);
+            repainted = piw.repainted;
+            // Auto-retry only on a WAITED no-repaint verdict — a click
+            // that visibly landed must never get a second press, and
+            // without a wait there is no verdict to retry on.
+            if (repainted or !piw.wait or attempts > retries or app.exited) break;
+        }
+        journalStep(app, "{{\"click\":[{d},{d}],\"button\":{d},\"window\":{d},\"hold_ms\":{d},\"count\":{d}}}", .{ x, y, button, win_id, hold_ms, count });
+        if (attempts > 1) {
+            note = try std.fmt.allocPrint(arena, " — auto-retried: {d} attempts, earlier clicks produced no qualifying repaint{s}", .{ attempts, note });
+        }
+        const qual: []const u8 = if (count > 1)
+            try std.fmt.allocPrint(arena, " x{d} ({s}, held {d}ms each)", .{ count, if (count == 2) "double-click" else "triple-click", hold_ms })
+        else if (hold_ms > 0)
+            try std.fmt.allocPrint(arena, " (held {d}ms)", .{hold_ms})
+        else
+            "";
         if (want_shot) {
             // Post-click frame, optionally with the click point drawn
             // in — one call shows where the click landed AND what the
@@ -2874,8 +3021,8 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             const shot = app.screenshotPngMarked(win_id, max_px, null, 1, if (want_mark) &annot else &.{}) catch
                 return toolResult(arena, "clicked, but the post-click screenshot failed (no pixels yet?)", false) orelse error.OutOfMemory;
             defer app_state.allocator.free(shot.png);
-            const extra = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}{s}", .{
-                x, y, button, note,
+            const extra = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}{s}{s}", .{
+                x, y, button, qual, note,
                 if (want_mark)
                     " — the red crosshair marks the click point on the post-click frame. Coordinates are delivered to the app verbatim; a pointer-LOCKED app tracks its own cursor from relative deltas, so its internal cursor can differ (calibrate with app_mouse_move dx/dy)."
                 else
@@ -2884,8 +3031,8 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             const caption = try screenshotCaption(arena, app, win_id, shot, extra);
             return imageResultTagged(arena, caption, shot.png, "click") orelse error.OutOfMemory;
         }
-        if (note.len > 0) {
-            const msg = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}", .{ x, y, button, note });
+        if (note.len > 0 or qual.len > 0) {
+            const msg = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}{s}", .{ x, y, button, qual, note });
             return toolResult(arena, msg, false) orelse error.OutOfMemory;
         }
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
@@ -2988,7 +3135,9 @@ fn runActionSteps(
                 break;
             };
             const wid = win_step orelse firstToplevelId(app);
-            app.click(wid, xy[0], xy[1], button) catch {
+            const hold_ms: i64 = std.math.clamp(argInt(st, "hold_ms") orelse Tuning.hold_ms.value, 0, 10_000);
+            const cnt: u32 = @intCast(std.math.clamp(argInt(st, "count") orelse 1, 1, 3));
+            app.clickEx(wid, xy[0], xy[1], button, hold_ms, cnt) catch {
                 try w.print("step {d}: ERROR — click failed (bad window?)\n", .{n});
                 stopped = true;
                 break;
@@ -2996,7 +3145,11 @@ fn runActionSteps(
             _ = app.waitIdle(100, 1_000);
             const marked = argBool(st, "mark");
             if (marked) pending_marks.append(arena, .{ .x = xy[0], .y = xy[1], .kind = .click, .label = @intCast(n) }) catch {};
-            try w.print("step {d}: clicked ({d:.0},{d:.0}) button {d} window {d}{s}\n", .{ n, xy[0], xy[1], button, wid, if (marked) " [marked]" else "" });
+            if (cnt > 1) {
+                try w.print("step {d}: clicked ({d:.0},{d:.0}) x{d} button {d} window {d}{s}\n", .{ n, xy[0], xy[1], cnt, button, wid, if (marked) " [marked]" else "" });
+            } else {
+                try w.print("step {d}: clicked ({d:.0},{d:.0}) button {d} window {d}{s}\n", .{ n, xy[0], xy[1], button, wid, if (marked) " [marked]" else "" });
+            }
         } else if (st.object.get("drag")) |dv| {
             const q = numArray(dv, 4) orelse {
                 try w.print("step {d}: ERROR — \"drag\" wants [x1,y1,x2,y2]\n", .{n});
@@ -3024,10 +3177,11 @@ fn runActionSteps(
                 stopped = true;
                 break;
             }
+            const khold: i64 = std.math.clamp(argInt(st, "hold_ms") orelse 0, 0, 10_000);
             var bad = false;
             var it = std.mem.tokenizeScalar(u8, kv.string, ' ');
             while (it.next()) |spec| {
-                app.pressKey(win_step, spec) catch {
+                app.pressKeyHold(win_step, spec, khold) catch {
                     bad = true;
                     break;
                 };
@@ -3185,7 +3339,7 @@ fn runActionSteps(
                 break;
             };
             if (do_click) {
-                app.click(wid, @floatFromInt(m.cx), @floatFromInt(m.cy), btn) catch {
+                clickTuned(app, wid, @floatFromInt(m.cx), @floatFromInt(m.cy), btn) catch {
                     try w.print("step {d}: ERROR — template matched but the click failed (bad window?)\n", .{n});
                     stopped = true;
                     break;
@@ -3247,7 +3401,7 @@ fn runActionSteps(
                     stopped = true;
                     break;
                 };
-                app.click(wid, @floatFromInt(box.x + box.w / 2), @floatFromInt(box.y + box.h / 2), 1) catch {
+                clickTuned(app, wid, @floatFromInt(box.x + box.w / 2), @floatFromInt(box.y + box.h / 2), 1) catch {
                     try w.print("step {d}: ERROR — text found but the click failed (bad window?)\n", .{n});
                     stopped = true;
                     break;
@@ -3411,7 +3565,7 @@ fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Value,
             appdrive.Error.BadKey => "text contains a character outside the us keymap",
             else => "type failed (no window?)",
         });
-        journalStepJson(app, arena, "type", text);
+        journalStepJson(app, arena, "type", text, "");
         const desc = try std.fmt.allocPrint(arena, "typed {d} chars", .{text.len});
         return inputResult(arena, app, args, wait_win, &piw, desc);
     }
@@ -3419,16 +3573,24 @@ fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Value,
         const keys = argStr(args, "keys") orelse return appErr(arena, "app_key requires 'keys'");
         const win: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
         const wait_win: u32 = win orelse firstToplevelId(app);
+        const hold_ms: i64 = std.math.clamp(argInt(args, "hold_ms") orelse 0, 0, 10_000);
         var piw = PostInputWait.begin(args, app, wait_win, argBool(args, "screenshot"));
         var it = std.mem.tokenizeScalar(u8, keys, ' ');
         while (it.next()) |spec| {
-            app.pressKey(win, spec) catch |err| return appErr(arena, switch (err) {
+            app.pressKeyHold(win, spec, hold_ms) catch |err| return appErr(arena, switch (err) {
                 appdrive.Error.BadKey => "unknown key chord",
                 else => "key press failed (no window?)",
             });
         }
-        journalStepJson(app, arena, "key", keys);
-        const desc = try std.fmt.allocPrint(arena, "pressed: {s}", .{keys});
+        const extra: []const u8 = if (hold_ms > 0)
+            try std.fmt.allocPrint(arena, ",\"hold_ms\":{d}", .{hold_ms})
+        else
+            "";
+        journalStepJson(app, arena, "key", keys, extra);
+        const desc = if (hold_ms > 0)
+            try std.fmt.allocPrint(arena, "pressed (each held {d}ms): {s}", .{ hold_ms, keys })
+        else
+            try std.fmt.allocPrint(arena, "pressed: {s}", .{keys});
         return inputResult(arena, app, args, wait_win, &piw, desc);
     }
     if (eql(u8, name, "app_scroll")) {
@@ -3595,7 +3757,7 @@ fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Value,
                 box.x, box.y, box.w, box.h, box.x + box.w / 2, box.y + box.h / 2,
             });
             if (do_click) {
-                app.click(wid, @floatFromInt(box.x + box.w / 2), @floatFromInt(box.y + box.h / 2), 1) catch
+                clickTuned(app, wid, @floatFromInt(box.x + box.w / 2), @floatFromInt(box.y + box.h / 2), 1) catch
                     return appErr(arena, "text found but the click failed (bad window?)");
                 _ = app.waitIdle(100, 1_000);
                 // Journal as a replayable wait_text step (the macro
@@ -3674,7 +3836,7 @@ fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Value,
         };
         var clicked = false;
         if (do_click) {
-            app.click(wid, @floatFromInt(m.cx), @floatFromInt(m.cy), btn) catch
+            clickTuned(app, wid, @floatFromInt(m.cx), @floatFromInt(m.cy), btn) catch
                 return appErr(arena, "template matched but the click failed (bad window?)");
             _ = app.waitIdle(100, 1_000);
             clicked = true;
@@ -4676,6 +4838,17 @@ fn capabilitiesTool(arena: std.mem.Allocator) ![]const u8 {
     } else {
         try w.writeAll(",\"terminal_recordings\":null");
     }
+    // Effective input-timing defaults, with any env override marked —
+    // config-set defaults must never be invisible state.
+    try w.writeAll(",\"input_tuning\":{");
+    var any_override = false;
+    for (Tuning.all(), 0..) |item, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.print("\"{s}\":{{\"value\":{d},\"built_in\":{d},\"overridden\":{}}}", .{ item.name, item.value, item.built_in, item.overridden });
+        if (item.overridden) any_override = true;
+    }
+    try w.writeAll("}");
+    if (any_override) try w.writeAll(",\"input_tuning_hint\":\"values marked overridden were set via SKETERM_MCP_* env (project .mcp.json); the tools/list descriptions already state these effective defaults\"");
     try w.print(",\"open_terms\":{d},\"open_apps\":{d},\"open_forwards\":{d},\"browser_sessions\":{d}}}", .{
         term_state.terms.count(), app_state.apps.count(), forward_state.forwards.count(), browser_state.sessions.count(),
     });
@@ -6201,4 +6374,87 @@ test "instance name validation" {
     try t.expect(!validInstanceName("has space"));
     try t.expect(!validInstanceName("dot.dot"));
     try t.expect(!validInstanceName("a" ** 49));
+}
+
+test "replaceAll substitutes every occurrence" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try t.expectEqualStrings("a1b1c", try replaceAll(arena, "aXbXc", "X", "1"));
+    // No occurrence: the input slice comes back untouched.
+    const same = "nothing here";
+    try t.expect((try replaceAll(arena, same, "X", "1")).ptr == same.ptr);
+    try t.expectEqualStrings("longer text", try replaceAll(arena, "S text", "S", "longer"));
+}
+
+test "tuning defText: built-in vs project override" {
+    const t = std.testing;
+    var buf: [128]u8 = undefined;
+    var item: Tuning.Item = .{ .name = "hold_ms", .value = 100, .built_in = 100, .env = "SKETERM_MCP_HOLD_MS", .min = 0, .max = 10_000 };
+    try t.expectEqualStrings("default 100", Tuning.defText(&buf, &item));
+    item.value = 250;
+    item.overridden = true;
+    try t.expectEqualStrings("default 250 — PROJECT OVERRIDE via SKETERM_MCP_HOLD_MS, built-in 100", Tuning.defText(&buf, &item));
+}
+
+test "tuning load reads and clamps env overrides" {
+    const t = std.testing;
+    // Restore the global regardless of outcome — other tests read it.
+    defer {
+        Tuning.hold_ms.value = Tuning.hold_ms.built_in;
+        Tuning.hold_ms.overridden = false;
+        _ = c.unsetenv("SKETERM_MCP_HOLD_MS");
+    }
+    _ = c.setenv("SKETERM_MCP_HOLD_MS", "250", 1);
+    Tuning.loadOne(&Tuning.hold_ms);
+    try t.expectEqual(@as(i64, 250), Tuning.hold_ms.value);
+    try t.expect(Tuning.hold_ms.overridden);
+    // Out-of-range values clamp instead of poisoning the default.
+    _ = c.setenv("SKETERM_MCP_HOLD_MS", "999999", 1);
+    Tuning.loadOne(&Tuning.hold_ms);
+    try t.expectEqual(@as(i64, 10_000), Tuning.hold_ms.value);
+    // Garbage is ignored (value keeps the last good state).
+    _ = c.setenv("SKETERM_MCP_HOLD_MS", "not-a-number", 1);
+    Tuning.hold_ms.value = Tuning.hold_ms.built_in;
+    Tuning.hold_ms.overridden = false;
+    Tuning.loadOne(&Tuning.hold_ms);
+    try t.expectEqual(@as(i64, 100), Tuning.hold_ms.value);
+    try t.expect(!Tuning.hold_ms.overridden);
+}
+
+test "renderedToolsJson resolves every timing token" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const out = try renderedToolsJson(arena);
+    // No token survives rendering.
+    try t.expect(std.mem.indexOf(u8, out, "_DEF%") == null);
+    // Effective built-in defaults are stated in the descriptions.
+    try t.expect(std.mem.indexOf(u8, out, "\"hold_ms\"") != null);
+    try t.expect(std.mem.indexOf(u8, out, "(default 100; max 10000)") != null);
+    try t.expect(std.mem.indexOf(u8, out, "(default 0; max 5)") != null);
+    // The rendered list is still valid JSON.
+    _ = try std.json.parseFromSliceLeaky(std.json.Value, arena, out, .{});
+}
+
+test "tools/list states an override in the description" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    Tuning.timeout_ms.value = 15_000;
+    Tuning.timeout_ms.overridden = true;
+    defer {
+        Tuning.timeout_ms.value = Tuning.timeout_ms.built_in;
+        Tuning.timeout_ms.overridden = false;
+    }
+    var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
+    defer fake.deinit();
+    const tools = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":"t2","method":"tools/list"}
+    ).?;
+    try t.expect(std.mem.indexOf(u8, tools, "default 15000 — PROJECT OVERRIDE via SKETERM_MCP_TIMEOUT_MS, built-in 1500") != null);
+    try t.expect(std.mem.indexOf(u8, tools, "_DEF%") == null);
 }
