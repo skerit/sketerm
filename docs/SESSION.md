@@ -8083,3 +8083,51 @@ output_file on disk), and live SSH runs — `less` returning pending
 with alt_screen after 2.6s idle then completing via q, verify_command
 accept/reject with clean staging, noninteractive env reaching only
 the child.
+
+## Feedback round 10 — shadow-DOM browser automation + network inspection
+
+The field report's top asks after provisioning Hohenheim (a custom-
+element pl-input/pl-select/pl-switch admin UI): structured browser
+tools could not see inside shadow roots, there was no clean way to
+pick options in custom dropdowns, navigation completion was guessy,
+and network diagnostics required leaving the tool family.
+
+Browser: every element script now shares JS_HELPERS — deepQuery
+(walks open shadow roots), labelText (labels/aria/host text/shadow
+labels), activeDeep (nested activeElement). browser_fill text_label
+finds the editable input inside a custom host; browser_elements
+reports role/label/name/value/checked/disabled/expanded/options for
+custom hosts; new browser_form_state = one-call form inventory
+(host + inner control merged, password values as counts, select AND
+[role=option] options with selected marked, validationMessage, form
+owner); new browser_choose picks options in native selects, shadow
+selects, and ARIA/custom dropdowns (trusted click on the shadow
+trigger, poll for [role=option], click the match, read back; failure
+lists the options that WERE visible and presses Escape). Navigation
+honesty: browser_click reports navigated / navigation_pending (and
+wait_navigation:true blocks until the load ends); browser_fill
+reports field_detached_after_submit / navigation_started instead of
+a bogus empty readback; browser_wait grew url_exact / url_path /
+url_regex (url_contains substring false-positives) and network_idle.
+New browser_network: CDP Network.* capture (bounded 300-entry ring
+in cdp.Client, on from browser_open, re-enabled on reattach, pumped
+during calls) listing method/url/status/type/mime/failure/redirect
+chain (redirected_from keeps a 303'd POST findable) with request-body
+FIELD NAMES only — values are never stored.
+
+Terminal: term_exec `shell:"bash"` swaps the command-file interpreter
+(pipefail semantics) with the name validated against metacharacters;
+the isolated transport now writes the command into a second temp file
+via quoted heredoc and runs `<shell> /tmp/.sk_<nonce>.c`, so the
+command text never appears on any process command line (pgrep/ps
+noise gone — smoke asserts the canary count is exactly 1).
+
+Verified: 762 unit tests + 6 skip (new: extractPostKeys redaction,
+validShellName, heredoc/shell transport shape), smoke-mcp (bash
+pipefail, shell-injection rejection, ps canary), and two live
+Chromium runs against a custom-element page served over HTTP: full
+form_state before/after, shadow fill, choose on pl-select and native
+select, switch toggle via click (checked false→true), network_idle
+wait over a 2s fetch, POST→303 login with post_keys "user,pass" and
+the secret nowhere, wait_navigation across pages, url_path negative
+staying an error.
