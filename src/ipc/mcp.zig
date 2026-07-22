@@ -908,19 +908,19 @@ const TOOLS_JSON_RAW =
     \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Optional region crop and integer zoom for pixel-level inspection; downscaled when larger than max_px. The caption tells you how to map image coordinates back to app_click coordinates. wait_change=true blocks until the window renders something NEWER than your last screenshot (verify a click did something); stable_ms waits until repainting stops before capturing (settle-then-capture — combine both to catch 'changed, then went quiet'). stats_only=true skips the image and just reports whether/how much the window changed since your last look (cheap polling). burst=N captures up to N frames over burst_ms, each at least min_change_pct different from the previous — one call across an animated transition.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"},"region":{"type":"object","description":"Crop to a sub-rectangle in surface pixels","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer","description":"Nearest-neighbor integer upscale (1-32) — crop a small region and zoom to inspect pixels"},"wait_change":{"type":"boolean","description":"Wait until the window content changed since the last screenshot before capturing. Combine with min_change_pct to ignore trivial repaints (a software cursor)."},"stable_ms":{"type":"integer","description":"Capture only after the window committed no new frame for this long (settle-then-capture). With min_change_pct set, frames changing less than that %% don't reset the timer (VISUAL settle — works on continuously-animating apps)."},"stats_only":{"type":"boolean","description":"Return {changed, diff_pct, resized, w, h, frames} instead of an image"},"burst":{"type":"integer","description":"Capture up to N distinct frames (2-8) over burst_ms"},"burst_ms":{"type":"integer","description":"Burst time window (default 5000)"},"min_change_pct":{"type":"number","description":"Pixel-change threshold (%%): burst frames must differ this much from the previous one (default 1.0), and when set it also gates wait_change and turns stable_ms into a visual settle (default 0 = any repaint counts)"},"timeout_ms":{"type":"integer","description":"Bound for wait_change/stable_ms (default 10000)"}}}},
     \\{"name":"get_app_state","description":"One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping. Prefer this over separate app_windows + screenshot_app. If the app exited, reports exit status, signal and recent output instead. Accepts the same region/zoom/wait_change/stable_ms/stats_only/burst options as screenshot_app.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"max_px":{"type":"integer"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer"},"wait_change":{"type":"boolean"},"stable_ms":{"type":"integer"},"stats_only":{"type":"boolean"},"burst":{"type":"integer"},"burst_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"app_output","description":"Read a headless app's stdout/stderr (its PTY output as RENDERED BY A TERMINAL — a fixed-width grid, so long lines wrap and scrolled-off content needs scrollback=true; right for TUI-style redraws). For log-style output app_log is the SOURCE OF TRUTH: indexed unwrapped lines with stable ids, re-readable in full — prefer it. When the grid mirror is blank after an exit, the log ring's last lines are served instead. Also reports exit status + signal when the app has died.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
-    \\{"name":"app_log","description":"A headless app's stdout/stderr as an INDEXED LOG: each complete line gets a stable numeric id and a timestamp; the tail view shortens long lines (marked [+]) and any line can be re-read in full by id. The ring is bounded (oldest lines drop; the reply says how many). MARKERS: the app (or your injected code) can emit the escape  printf '\\033]5522;my-label\\033\\\\'  — it becomes a labelled log line AND sketerm stashes a screenshot of the app window at that exact instant; fetch label+image with {\"id\":<that line's id>}. Variant printf '\\033]5522;+N;my-label\\033\\\\' captures the Nth FUTURE frame commit instead (e.g. +1 = the next repaint after this point; resolved with the final frame if the app exits first). Markers are rate-limited (burst 8, then 2/s; excess are dropped and counted) so escape-laden files cat'ed to the terminal cannot flood the log. Survives app exit: the final log is delivered with the exit.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"tail":{"type":"integer","description":"Last N lines (default 60, max 500)"},"from_id":{"type":"integer","description":"Return lines starting at this id instead of the tail"},"id":{"type":"integer","description":"Return ONE line in full; for a marker line also returns the stashed screenshot"}}}},
-    \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right. mark=true returns a post-click screenshot with a crosshair drawn at the exact click pixel — see where the click landed relative to the UI AND what it did, in one image; screenshot=true returns the post-click frame without the marker.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"},"mark":{"type":"boolean","description":"Return a post-click screenshot with a crosshair marker at the click point"},"screenshot":{"type":"boolean","description":"Return a post-click screenshot (no marker)"},"max_px":{"type":"integer","description":"Bound on the screenshot's longest dimension (default 1568)"}},"required":["window","x","y"]}},
+    \\{"name":"app_log","description":"A headless app's stdout/stderr as an INDEXED LOG: each complete line gets a stable numeric id and a timestamp; the tail view shortens long lines (marked [+]) and any line can be re-read in full by id. The ring is bounded (oldest lines drop; the reply says how many). MARKERS: the app (or your injected code) can emit the escape  printf '\\033]5522;my-label\\033\\\\'  — it becomes a labelled log line AND sketerm stashes a screenshot of the app window at that exact instant; fetch label+image with {\"id\":<that line's id>}. Variant printf '\\033]5522;+N;my-label\\033\\\\' captures the Nth FUTURE frame commit instead (e.g. +1 = the next repaint after this point; resolved with the final frame if the app exits first). Markers are rate-limited (burst 8, then 2/s; excess are dropped and counted) so escape-laden files cat'ed to the terminal cannot flood the log. Survives app exit: the final log is delivered with the exit. If the daemon's reply is delayed behind heavy frame streaming, the last cached snapshot is served with a [STALE] banner instead of an error (partial beats nothing).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"tail":{"type":"integer","description":"Last N lines (default 60, max 500)"},"from_id":{"type":"integer","description":"Return lines starting at this id instead of the tail"},"id":{"type":"integer","description":"Return ONE line in full; for a marker line also returns the stashed screenshot"}}}},
+    \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right. mark=true returns a post-click screenshot with a crosshair drawn at the exact click pixel — see where the click landed relative to the UI AND what it did, in one image; screenshot=true returns the post-click frame without the marker. CLICK-AND-SETTLE: whenever a screenshot is requested, the capture waits (bounded) for a frame committed AFTER the click, and the caption states 'repainted Nms after the input' or 'NO repaint within Nms' — a dead click is structurally distinct from a slow frame. settle_ms additionally waits for repainting to stop before capturing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"},"mark":{"type":"boolean","description":"Return a post-click screenshot with a crosshair marker at the click point"},"screenshot":{"type":"boolean","description":"Return a post-click screenshot (no marker)"},"wait_change":{"type":"boolean","description":"Wait for a post-click frame commit before returning (defaults ON when mark/screenshot is set; false = capture immediately)"},"settle_ms":{"type":"integer","description":"After the first post-click frame, wait until repainting stops this long before capturing"},"min_change_pct":{"type":"number","description":"Only frames changing at least this % of pixels count as change (ignore cursor blinks)"},"timeout_ms":{"type":"integer","description":"Bound for the post-click wait (default 1500; 5000 when wait_change/settle_ms is explicit)"},"max_px":{"type":"integer","description":"Bound on the screenshot's longest dimension (default 1568)"}},"required":["window","x","y"]}},
     \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} (MILLISECONDS, max 30000) | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} (with change_pct = VISUAL settle: blocks until frames change less than that %% — use for scene transitions of unknown duration instead of guessing a fixed wait) | {\"wait_change\":timeout_ms or {\"timeout_ms\":N,\"min_change_pct\":P}} (P = ignore repaints below that %% of pixels; add \"required\":true to a wait_idle/wait_change step to make a timeout FAIL the batch instead of continuing — a timeout is then structurally distinct from success) | {\"screenshot\":true or {\"max_px\":N}} | {\"wait_image\":{\"template\":name,\"timeout_ms\":N,\"click\":true}} (wait for a saved template to appear, optionally click its center) | {\"click_image\":{\"template\":name}} (find + click NOW, error if absent) | {\"wait_text\":{\"text\":s,\"click\":true}} (OCR-wait for a string, optionally click it) — these three make batches STATE-driven instead of coordinate/timing-driven. MARKERS: add \"mark\":true to a click/move/move_rel/drag/scroll step to draw a labelled crosshair at that step's position (red = click, cyan = move; the number is the step index) onto the NEXT screenshot — several marked steps can share one image. Combine in one step: {\"click\":[x,y],\"mark\":true,\"screenshot\":true} captures the post-click frame with the click point marked. Leftover marks with no later screenshot are flushed as a final image automatically. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
     \\{"name":"app_mouse_move","description":"Move the pointer in an app window WITHOUT clicking. Absolute: x,y in surface pixels (hover a widget, position before a click). Relative: dx,dy — a delta from the current pointer position, for apps that consume RELATIVE mouse motion (SDL games, DOSBox, anything with pointer-lock): sketerm derives relative_motion events from the move, so the app's own cursor moves by exactly your delta. Calibration for such apps: one large negative move (e.g. dx:-30000, dy:-30000) slams their internal cursor to the top-left corner, after which exact deltas land where you aim. With neither x/y nor dx/dy it just returns the tracked pointer position.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = window under the pointer, else first toplevel)"},"x":{"type":"number","description":"Absolute surface x (with y)"},"y":{"type":"number"},"dx":{"type":"number","description":"Relative delta x (with dy; exclusive with x/y)"},"dy":{"type":"number"}}}},
     \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
     \\{"name":"app_set_value","description":"Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value). Faster and more reliable than typing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}},
     \\{"name":"app_wait_for_element","description":"Wait until a widget appears in the app's accessibility tree (dialog opened, page loaded, ...). Match by role number and/or case-insensitive name substring; returns the matched node with its id and rect.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"role":{"type":"integer","description":"AT-SPI role number (e.g. 42 push-button)"},"name":{"type":"string","description":"Name substring, case-insensitive"},"timeout_ms":{"type":"integer","description":"Default 10000"}}}},
-    \\{"name":"app_drag","description":"Press-move-release drag inside an app window (sliders, drag-and-drop, text selection). Surface-local pixel coordinates.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x1":{"type":"integer"},"y1":{"type":"integer"},"x2":{"type":"integer"},"y2":{"type":"integer"},"button":{"type":"integer"}},"required":["window","x1","y1","x2","y2"]}},
-    \\{"name":"app_type","description":"Type literal text into an app window. Non-ASCII text is delivered via a clipboard paste (Ctrl+V) automatically.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"text":{"type":"string"}},"required":["text"]}},
+    \\{"name":"app_drag","description":"Press-move-release drag inside an app window (sliders, drag-and-drop, text selection). Surface-local pixel coordinates. screenshot=true returns the post-drag frame, captured only after the window repaints (wait_change/settle_ms/timeout_ms as in app_click).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x1":{"type":"integer"},"y1":{"type":"integer"},"x2":{"type":"integer"},"y2":{"type":"integer"},"button":{"type":"integer"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"}},"required":["window","x1","y1","x2","y2"]}},
+    \\{"name":"app_type","description":"Type literal text into an app window. Non-ASCII text is delivered via a clipboard paste (Ctrl+V) automatically. screenshot=true returns the post-typing frame, captured only after the window repaints (wait_change/settle_ms/timeout_ms as in app_click).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"text":{"type":"string"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"}},"required":["text"]}},
     \\{"name":"app_clipboard_get","description":"Read what the app last copied to the clipboard (requires the app to have copied something).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"app_clipboard_set","description":"Offer text to the app as the host clipboard. Set paste=true to immediately press Ctrl+V in a window.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"text":{"type":"string"},"paste":{"type":"boolean"},"window":{"type":"integer"}},"required":["text"]}},
-    \\{"name":"app_key","description":"Press key chords in an app window: space-separated, e.g. 'ctrl+s', 'enter', 'alt+F4', 'down down enter'.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
-    \\{"name":"app_scroll","description":"Scroll inside an app window. dy>0 scrolls down, dx>0 right (wheel steps).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"}},"required":["window"]}},
+    \\{"name":"app_key","description":"Press key chords in an app window: space-separated, e.g. 'ctrl+s', 'enter', 'alt+F4', 'down down enter'. screenshot=true returns the post-keypress frame, captured only after the window repaints (wait_change/settle_ms/timeout_ms as in app_click).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"keys":{"type":"string"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"}},"required":["keys"]}},
+    \\{"name":"app_scroll","description":"Scroll inside an app window. dy>0 scrolls down, dx>0 right (wheel steps). screenshot=true returns the post-scroll frame, captured only after the window repaints (wait_change/settle_ms/timeout_ms as in app_click).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"}},"required":["window"]}},
     \\{"name":"app_resize","description":"Ask an app window to redraw at a new size (deterministic screenshots).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["window","w","h"]}},
     \\{"name":"app_wait","description":"Wait until an app stopped producing new frames for quiet_ms (render quiescence), or — pass change_pct — until each new frame changes less than that percentage of pixels for quiet_ms (VISUAL quiescence: use this for games and other continuously-animating apps, which never stop committing frames but do reach a visually stable screen). Reports which outcome happened and returns the window list.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window for change_pct pixel diffing (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"},"change_pct":{"type":"number","description":"Settle when frames change less than this %% of pixels (e.g. 2). Omit = strict no-new-frames quiescence"}}}},
     \\{"name":"app_a11y_tree","description":"Read the app's accessibility (AT-SPI) tree as JSON: every widget's role, name, description, states and screen rectangle. Target elements by name/role instead of pixel-hunting a screenshot. Works for GTK/Qt apps; empty for apps without accessibility (games, some Electron).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
@@ -1745,6 +1745,113 @@ fn firstToplevelId(app: *appdrive.App) u32 {
     return if (best) |b| b.id else 0;
 }
 
+/// Click-and-settle: captured BEFORE injecting input so the post-input
+/// wait can tell "the app repainted in response" from "the frame on
+/// screen predates the input" — the old idle-only wait returned
+/// instantly-quiet on an app that takes a moment to react, so a
+/// post-click screenshot was frequently the PRE-click frame.
+const PostInputWait = struct {
+    ref: ?appdrive.App.FrameRef,
+    wait: bool,
+    timeout_ms: i64,
+    settle_ms: i64,
+    min_pct: f64,
+    t0: i64,
+
+    /// `want_shot` = a post-input screenshot was requested; wait_change
+    /// then defaults ON (pass wait_change:false to capture immediately).
+    fn begin(args: std.json.Value, app: *appdrive.App, win_id: u32, want_shot: bool) PostInputWait {
+        const min_pct: f64 = argFloat(args, "min_change_pct") orelse 0;
+        const settle_ms: i64 = std.math.clamp(argInt(args, "settle_ms") orelse 0, 0, 30_000);
+        const explicit: ?bool = if (args == .object)
+            (if (args.object.get("wait_change")) |v| (v == .bool and v.bool) else null)
+        else
+            null;
+        const wait = explicit orelse (want_shot or settle_ms > 0);
+        // Catch the mirror up FIRST: a frame already queued on the
+        // socket predates the input and must not satisfy the wait.
+        if (wait) app.drain();
+        // Defaulted-on waits stay short (a no-op click costs at most
+        // 1.5s); an explicit wait_change/settle gets a real budget.
+        const timeout_ms: i64 = std.math.clamp(
+            argInt(args, "timeout_ms") orelse @as(i64, if (explicit != null or settle_ms > 0) 5_000 else 1_500),
+            100,
+            30_000,
+        );
+        return .{
+            .ref = if (wait) app.frameRef(win_id, min_pct > 0) else null,
+            .wait = wait,
+            .timeout_ms = timeout_ms,
+            .settle_ms = settle_ms,
+            .min_pct = min_pct,
+            .t0 = monoMs(),
+        };
+    }
+
+    /// Run AFTER the input. Returns a caption note ("" = nothing to
+    /// report); a dry wait yields an explicit NO-repaint note so a
+    /// dead click is structurally distinct from a late frame.
+    fn finish(self: *PostInputWait, arena: std.mem.Allocator, app: *appdrive.App, win_id: u32) ![]const u8 {
+        defer if (self.ref) |*r| r.deinit(app.allocator);
+        if (!self.wait or self.ref == null) {
+            _ = app.waitIdle(200, 2_000);
+            return "";
+        }
+        if (app.waitChangeSince(win_id, &self.ref.?, self.timeout_ms, self.min_pct)) {
+            const elapsed = monoMs() - self.t0;
+            if (self.settle_ms > 0) {
+                const remain = @max(self.timeout_ms - elapsed, 500);
+                _ = if (self.min_pct > 0)
+                    app.waitVisualSettle(win_id, self.settle_ms, remain, self.min_pct)
+                else
+                    app.waitWindowSettle(win_id, self.settle_ms, remain);
+            } else {
+                // Let a multi-frame transition finish before capture.
+                _ = app.waitIdle(150, 1_000);
+            }
+            return try std.fmt.allocPrint(arena, " — window repainted {d}ms after the input{s}", .{
+                elapsed, if (self.settle_ms > 0) " and settled" else "",
+            });
+        }
+        return try std.fmt.allocPrint(
+            arena,
+            " — NO repaint within {d}ms after the input: it may have hit a dead area, or the app reacts without redrawing (any frame shown predates the input)",
+            .{self.timeout_ms},
+        );
+    }
+};
+
+/// Shared tail for app_key/app_type/app_drag/app_scroll: finish the
+/// post-input wait, then answer with a screenshot (when asked) or a
+/// text result carrying the repaint note.
+fn inputResult(
+    arena: std.mem.Allocator,
+    app: *appdrive.App,
+    args: std.json.Value,
+    win_id: u32,
+    piw: *PostInputWait,
+    desc: []const u8,
+) ![]const u8 {
+    const note = try piw.finish(arena, app, win_id);
+    if (argBool(args, "screenshot") and win_id != 0) {
+        const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 1568, 0, 8192));
+        const shot = app.screenshotPng(win_id, max_px, null, 1) catch {
+            const msg = try std.fmt.allocPrint(arena, "{s}{s}, but the post-input screenshot failed (no pixels yet?)", .{ desc, note });
+            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        };
+        defer app_state.allocator.free(shot.png);
+        const extra = try std.fmt.allocPrint(arena, "{s}{s}", .{ desc, note });
+        const caption = try screenshotCaption(arena, app, win_id, shot, extra);
+        return imageResult(arena, caption, shot.png) orelse error.OutOfMemory;
+    }
+    if (note.len > 0) {
+        const msg = try std.fmt.allocPrint(arena, "{s}{s}", .{ desc, note });
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    const msg = try std.fmt.allocPrint(arena, "{s}", .{desc});
+    return toolResult(arena, msg, false) orelse error.OutOfMemory;
+}
+
 /// Fixed-length array of numbers out of a JSON value ([x,y], …).
 fn numArray(v: std.json.Value, comptime n: usize) ?[n]f64 {
     if (v != .array or v.array.items.len != n) return null;
@@ -2448,11 +2555,25 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             "{{\"tail\":{d},\"from_id\":{d},\"id\":{d},\"max_chars\":300}}",
             .{ tail, from_id, line_id },
         );
-        const reply = app.logGet(req, 5_000) catch |err| return appErr(arena, switch (err) {
-            appdrive.Error.Timeout => "daemon did not answer the log request in time",
+        const fetch = app.logGet(req, 5_000) catch |err| return appErr(arena, switch (err) {
+            appdrive.Error.Timeout => blk: {
+                // Diagnosable, not just "timed out": say what we know
+                // about the app so "log stuck" and "app wedged" are
+                // distinguishable.
+                var frames: u64 = 0;
+                for (app.windows.items) |w| frames += w.frames;
+                break :blk try std.fmt.allocPrint(
+                    arena,
+                    "the daemon's log reply did not arrive within 5s and no earlier log data is cached (app alive: {}, windows: {d}, frames committed: {d}) — the reply is likely queued behind heavy frame streaming; retry app_log",
+                    .{ !app.exited, app.windows.items.len, frames },
+                );
+            },
             else => "no log data for this app",
         });
+        const reply = fetch.json;
         defer app_state.allocator.free(reply);
+        if (fetch.stale and line_id != 0)
+            return appErr(arena, "the daemon's log reply did not arrive within 5s; only a stale cached snapshot is available, which cannot answer a single-line fetch honestly — retry in a moment");
         const parsed = std.json.parseFromSlice(LogReplyJ, arena, reply, .{
             .ignore_unknown_fields = true,
         }) catch return appErr(arena, "malformed log reply");
@@ -2496,6 +2617,8 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
 
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
+        if (fetch.stale)
+            try w.writeAll("[STALE: the daemon's fresh log reply was still queued behind streamed frame data after 5s — serving the last cached snapshot instead; retry app_log for current lines]\n");
         if (r.lines.len == 0) {
             try w.writeAll("(log empty — the app has not printed any complete line yet)");
         } else {
@@ -2669,6 +2792,7 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         const x2 = argInt(args, "x2") orelse return appErr(arena, "app_drag requires x1,y1,x2,y2");
         const y2 = argInt(args, "y2") orelse return appErr(arena, "app_drag requires x1,y1,x2,y2");
         const button: u32 = @intCast(argInt(args, "button") orelse 1);
+        var piw = PostInputWait.begin(args, app, win_id, argBool(args, "screenshot"));
         app.drag(
             win_id,
             @floatFromInt(x1),
@@ -2677,9 +2801,9 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             @floatFromInt(y2),
             button,
         ) catch return appErr(arena, "drag failed (bad window?)");
-        _ = app.waitIdle(200, 2_000);
         journalStep(app, "{{\"drag\":[{d},{d},{d},{d}],\"button\":{d},\"window\":{d}}}", .{ x1, y1, x2, y2, button, win_id });
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        const desc = try std.fmt.allocPrint(arena, "dragged ({d},{d}) -> ({d},{d}) button {d}", .{ x1, y1, x2, y2, button });
+        return inputResult(arena, app, args, win_id, &piw, desc);
     }
     if (eql(u8, name, "app_clipboard_get")) {
         const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 3_000;
@@ -2709,22 +2833,26 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             return appErr(arena, "app_click requires 'window' and x/y. To target a widget by name/role use app_perform_action (coordinate-free)."));
         const x = argInt(args, "x") orelse return appErr(arena, "app_click requires 'x'");
         const y = argInt(args, "y") orelse return appErr(arena, "app_click requires 'y'");
+        const want_mark = argBool(args, "mark");
+        const want_shot = want_mark or argBool(args, "screenshot");
+        var piw = PostInputWait.begin(args, app, win_id, want_shot);
         app.click(win_id, @floatFromInt(x), @floatFromInt(y), button) catch
             return appErr(arena, "click failed (bad window?)");
-        _ = app.waitIdle(200, 2_000);
         journalStep(app, "{{\"click\":[{d},{d}],\"button\":{d},\"window\":{d}}}", .{ x, y, button, win_id });
-        const want_mark = argBool(args, "mark");
-        if (want_mark or argBool(args, "screenshot")) {
+        const note = try piw.finish(arena, app, win_id);
+        if (want_shot) {
             // Post-click frame, optionally with the click point drawn
             // in — one call shows where the click landed AND what the
-            // UI did with it.
+            // UI did with it. The frame is captured only after the
+            // window commits something NEWER than the click (bounded),
+            // and the caption says explicitly when it never did.
             const annot = [_]marks_mod.Mark{.{ .x = @floatFromInt(x), .y = @floatFromInt(y) }};
             const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 1568, 0, 8192));
             const shot = app.screenshotPngMarked(win_id, max_px, null, 1, if (want_mark) &annot else &.{}) catch
                 return toolResult(arena, "clicked, but the post-click screenshot failed (no pixels yet?)", false) orelse error.OutOfMemory;
             defer app_state.allocator.free(shot.png);
-            const extra = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}", .{
-                x, y, button,
+            const extra = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}{s}", .{
+                x, y, button, note,
                 if (want_mark)
                     " — the red crosshair marks the click point on the post-click frame. Coordinates are delivered to the app verbatim; a pointer-LOCKED app tracks its own cursor from relative deltas, so its internal cursor can differ (calibrate with app_mouse_move dx/dy)."
                 else
@@ -2732,6 +2860,10 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             });
             const caption = try screenshotCaption(arena, app, win_id, shot, extra);
             return imageResultTagged(arena, caption, shot.png, "click") orelse error.OutOfMemory;
+        }
+        if (note.len > 0) {
+            const msg = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}", .{ x, y, button, note });
+            return toolResult(arena, msg, false) orelse error.OutOfMemory;
         }
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
     }
@@ -3250,17 +3382,21 @@ fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Value,
     if (eql(u8, name, "app_type")) {
         const text = argStr(args, "text") orelse return appErr(arena, "app_type requires 'text'");
         const win: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
+        const wait_win: u32 = win orelse firstToplevelId(app);
+        var piw = PostInputWait.begin(args, app, wait_win, argBool(args, "screenshot"));
         app.typeText(win, text) catch |err| return appErr(arena, switch (err) {
             appdrive.Error.BadKey => "text contains a character outside the us keymap",
             else => "type failed (no window?)",
         });
-        _ = app.waitIdle(200, 2_000);
         journalStepJson(app, arena, "type", text);
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        const desc = try std.fmt.allocPrint(arena, "typed {d} chars", .{text.len});
+        return inputResult(arena, app, args, wait_win, &piw, desc);
     }
     if (eql(u8, name, "app_key")) {
         const keys = argStr(args, "keys") orelse return appErr(arena, "app_key requires 'keys'");
         const win: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
+        const wait_win: u32 = win orelse firstToplevelId(app);
+        var piw = PostInputWait.begin(args, app, wait_win, argBool(args, "screenshot"));
         var it = std.mem.tokenizeScalar(u8, keys, ' ');
         while (it.next()) |spec| {
             app.pressKey(win, spec) catch |err| return appErr(arena, switch (err) {
@@ -3268,9 +3404,9 @@ fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Value,
                 else => "key press failed (no window?)",
             });
         }
-        _ = app.waitIdle(200, 2_000);
         journalStepJson(app, arena, "key", keys);
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        const desc = try std.fmt.allocPrint(arena, "pressed: {s}", .{keys});
+        return inputResult(arena, app, args, wait_win, &piw, desc);
     }
     if (eql(u8, name, "app_scroll")) {
         const win_id: u32 = @intCast(argInt(args, "window") orelse
@@ -3279,11 +3415,12 @@ fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Value,
         const y = argInt(args, "y") orelse 10;
         const dx = argInt(args, "dx") orelse 0;
         const dy = argInt(args, "dy") orelse 0;
+        var piw = PostInputWait.begin(args, app, win_id, argBool(args, "screenshot"));
         app.scroll(win_id, @floatFromInt(x), @floatFromInt(y), @floatFromInt(dx), @floatFromInt(dy)) catch
             return appErr(arena, "scroll failed (bad window?)");
-        _ = app.waitIdle(200, 2_000);
         journalStep(app, "{{\"scroll\":[{d},{d}],\"at\":[{d},{d}],\"window\":{d}}}", .{ dx, dy, x, y, win_id });
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        const desc = try std.fmt.allocPrint(arena, "scrolled ({d},{d}) at ({d},{d})", .{ dx, dy, x, y });
+        return inputResult(arena, app, args, win_id, &piw, desc);
     }
     if (eql(u8, name, "app_resize")) {
         const win_id: u32 = @intCast(argInt(args, "window") orelse
@@ -4555,8 +4692,8 @@ fn discoverDevtoolsPort(app: *appdrive.App, timeout_ms: i64) ?u16 {
     while (monoMs() < deadline) {
         app.drain();
         if (app.logGet("{\"tail\":300,\"from_id\":0,\"id\":0,\"max_chars\":300}", 3_000)) |reply| {
-            defer app_state.allocator.free(reply);
-            if (cdp.parseDevtoolsPort(reply)) |port| return port;
+            defer app_state.allocator.free(reply.json);
+            if (cdp.parseDevtoolsPort(reply.json)) |port| return port;
         } else |_| {}
         if (app.exited) return null;
         _ = app.pumpOnce(250);

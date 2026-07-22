@@ -8131,3 +8131,42 @@ select, switch toggle via click (checked false→true), network_idle
 wait over a 2s fetch, POST→303 login with post_keys "user,pass" and
 the secret nowhere, wait_navigation across pages, url_path negative
 staying an error.
+
+## MCP: click-and-settle input capture + resilient app_log (round 11)
+
+Feedback from the AFU reverse-engineering assistant: post-click
+screenshots were frequently the PRE-click frame (the idle-only wait
+returns instantly-quiet on an app that takes a moment to react), and
+app_log could time out with a bare error while the app was demonstrably
+alive.
+
+Click-and-settle: app_click/app_key/app_type/app_drag/app_scroll now
+capture their FrameRef (commit counter + optional pixel copy,
+appdrive.frameRef) BEFORE injecting input; when a screenshot is
+requested the capture waits — bounded, default on — for a frame
+committed strictly AFTER the input (appdrive.waitChangeSince; unlike
+waitWindowChange it ignores the screenshot baseline, so frames landed
+between the last screenshot and the input can't satisfy it, and
+PostInputWait.begin drains the mirror first so queued pre-input frames
+don't either). The caption states 'repainted Nms after the input' or
+'NO repaint within Nms' — a dead click is structurally distinct from a
+late frame. settle_ms adds settle-then-capture (visual settle with
+min_change_pct), wait_change:false opts out, timeout_ms bounds it
+(default 1500ms when defaulted-on, 5000ms when explicit).
+screenshot:true is new on key/type/drag/scroll.
+
+app_log: appdrive.logGet now returns LogFetch{json, stale} — when the
+daemon's fresh reply is still queued behind streamed frame data at the
+deadline, the last cached reply is served with a [STALE] banner
+(partial beats nothing; single-line id fetches refuse stale data
+honestly). The hard-timeout error (no cache at all) reports app
+liveness, window count, and frames committed so 'log stuck' and 'app
+wedged' are distinguishable.
+
+Verified: 762 unit tests + smoke-mcp pass; live Chromium runs — click
+on a page with an 800ms-delayed repaint reports 'repainted 916ms after
+the input and settled' (settle_ms:300) and captures the post-flip
+frame (hashes differ), min_change_pct:50 + timeout 500ms yields the
+explicit NO-repaint note with the screenshot still delivered, app_key
+F5 screenshot:true and app_drag screenshot:true both work, app_log
+serves fresh lines normally.
