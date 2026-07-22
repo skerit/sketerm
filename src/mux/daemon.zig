@@ -414,6 +414,15 @@ const Client = struct {
     /// event streaming resumes. Keeps a flooded client's backlog
     /// bounded instead of racing toward the MAX_WBUF reap.
     needs_resync: bool = false,
+    /// Native app-channel units were withheld because this MCP
+    /// client's wbuf exceeded NATIVE_BACKLOG (it drains only during
+    /// tool calls; streaming into the queue meanwhile is unbounded —
+    /// AND the client would spend whole tool calls chewing stale
+    /// frames instead of seeing "now"). A `native_gap` frame marks
+    /// the pause; once the wbuf fully drains, replayNativeChannels
+    /// rebuilds its replicas from the live mirrors and `native_sync`
+    /// closes the replay.
+    needs_native_resync: bool = false,
 
     fn deinit(self: *Client) void {
         _ = c.close(self.fd);
@@ -681,6 +690,12 @@ const Native = struct {
     /// Last logged commit pixel-path state (see nativeAction .commit)
     /// so the debug log records transitions, not every frame.
     pix_state: u8 = 0,
+    /// surface id → damage rows of commits whose PIXEL copy was
+    /// skipped (no viewer had queue room). Null value = full buffer.
+    /// Merged into the next shipped commit's range so a recovering
+    /// viewer isn't left with permanently stale regions the app
+    /// never re-damages (partial-damage clients).
+    skipped: std.AutoHashMapUnmanaged(u32, ?wltrack.RowRange) = .empty,
     /// app_ids already resolved (icon sent or none found), so repeated
     /// set_app_id / extra windows don't re-scan the icon theme. Keys owned.
     icon_seen: std.StringHashMapUnmanaged(void) = .empty,
@@ -788,6 +803,7 @@ const Native = struct {
         var vit = self.vstate.valueIterator();
         while (vit.next()) |v| v.deinit();
         self.vstate.deinit(self.allocator);
+        self.skipped.deinit(self.allocator);
         self.vscratch.deinit(self.allocator);
         self.vblob.deinit(self.allocator);
         self.pixscratch.deinit(self.allocator);
@@ -1672,12 +1688,33 @@ pub const Daemon = struct {
         // current seq) and resume streaming. Sent even for an exited
         // session — the final screen is exactly what a crash-flood
         // post-mortem needs.
-        if (cl.queuedBytes() == 0 and cl.write_lane == .none and cl.needs_resync) {
+        const fully_drained = cl.queuedBytes() == 0 and cl.write_lane == .none;
+        if (fully_drained and cl.needs_resync) {
             cl.needs_resync = false;
             if (cl.attached) |s| {
                 log.debug("resync snapshot toward drained client (session '{s}')", .{s.name});
                 self.queueSnapshot(cl, s);
             }
+        }
+        // App frames were withheld (native_gap); the client has caught
+        // up — rebuild its replicas from the LIVE mirrors and close
+        // the replay with native_sync so its capture paths know the
+        // stream is current again.
+        if (fully_drained and cl.needs_native_resync) {
+            cl.needs_native_resync = false;
+            if (cl.attached) |s| {
+                log.debug("native resync toward drained mcp client (session '{s}')", .{s.name});
+                // A rebuilt replica has no video reference frames.
+                for (self.channels.items) |ch| {
+                    if (ch.session != s) continue;
+                    if (ch.native) |nv| {
+                        var vit = nv.vstate.valueIterator();
+                        while (vit.next()) |v| v.needs_kf = true;
+                    }
+                }
+                self.replayNativeChannels(cl, s);
+            }
+            if (!cl.dead) cl.queueFrame(.native_sync, "");
         }
     }
 
@@ -2675,7 +2712,7 @@ pub const Daemon = struct {
     fn hasNativeViewer(self: *const Daemon, nv: *const Native) bool {
         const s = (nv.chan orelse return true).session orelse return true;
         for (self.clients.items) |cl| {
-            if (nativeViewer(cl, s) and cl.wbuf.items.len < NATIVE_BACKLOG) return true;
+            if (nativeViewer(cl, s) and !cl.needs_native_resync and cl.wbuf.items.len < NATIVE_BACKLOG) return true;
         }
         return false;
     }
@@ -3223,11 +3260,27 @@ pub const Daemon = struct {
                         else => {},
                     }
                 }
+                if (pix_state == 2) {
+                    // Pixels skipped with a viewer set to recover:
+                    // remember the missed rows so the next SHIPPED
+                    // commit re-covers them (regions the app never
+                    // re-damages would otherwise stay stale forever).
+                    const gop = nv.skipped.getOrPut(a, cm.surface) catch null;
+                    if (gop) |g| {
+                        g.value_ptr.* = if (g.found_existing)
+                            wltrack.RowRange.mergeOpt(g.value_ptr.*, cm.damage)
+                        else
+                            cm.damage;
+                    }
+                }
                 if (mirror_opt) |mirror| {
                     if (cm.info.offset >= 0 and cm.info.stride > 0 and cm.info.height > 0) {
+                        var eff_damage = cm.damage;
+                        if (nv.skipped.fetchRemove(cm.surface)) |kv|
+                            eff_damage = wltrack.RowRange.mergeOpt(eff_damage, kv.value);
                         var y0: i64 = 0;
                         var y1: i64 = cm.info.height;
-                        if (cm.damage) |d| {
+                        if (eff_damage) |d| {
                             y0 = @max(y0, @as(i64, d.y0));
                             y1 = @min(y1, @as(i64, d.y1));
                         }
@@ -3290,7 +3343,32 @@ pub const Daemon = struct {
     fn queueUnits(self: *Daemon, ch: *Channel, bytes: []const u8) void {
         if (ch.native != null) {
             for (self.clients.items) |cl| {
-                if (nativeViewer(cl, ch.session.?)) self.queueUnitsTo(cl, ch, bytes);
+                if (!nativeViewer(cl, ch.session.?)) continue;
+                // An MCP client drains only during tool calls; past the
+                // backlog cap, stop streaming entirely (a gap frame
+                // marks it) — clientWritable rebuilds its replicas
+                // from the live mirrors once it fully drains, which is
+                // both bounded AND current, unlike a mile-long queue
+                // of stale frames. GUI clients keep the stream: they
+                // drain continuously and handle no mid-life replay.
+                if (cl.kind == .mcp) {
+                    if (cl.needs_native_resync) continue;
+                    if (cl.wbuf.items.len > NATIVE_BACKLOG) {
+                        cl.needs_native_resync = true;
+                        cl.queueFrame(.native_gap, "");
+                        log.debug("mcp client over native backlog ({d}B queued) — pausing app frames until it drains", .{cl.wbuf.items.len});
+                        continue;
+                    }
+                }
+                self.queueUnitsTo(cl, ch, bytes);
+                // One unit run can itself blow past the cap (the app
+                // committed a burst the daemon read in one batch) —
+                // re-check AFTER queueing or the gap never triggers.
+                if (cl.kind == .mcp and !cl.needs_native_resync and cl.wbuf.items.len > NATIVE_BACKLOG) {
+                    cl.needs_native_resync = true;
+                    cl.queueFrame(.native_gap, "");
+                    log.debug("mcp client over native backlog ({d}B queued after burst) — pausing app frames until it drains", .{cl.wbuf.items.len});
+                }
             }
         } else if (ch.pa != null) {
             // PCM only flows to viewers that SUBSCRIBED — terminal-only
@@ -4349,6 +4427,9 @@ pub const Daemon = struct {
     /// serialized protocol state. Windows reappear with current
     /// pixels (durable GUI apps, multi-viewer).
     fn replayNativeChannels(self: *Daemon, cl: *Client, s: *Session) void {
+        // A full replay makes the client current — any pending
+        // withheld-frames state is superseded by it.
+        cl.needs_native_resync = false;
         // Audio channels: announce + re-open live streams so the
         // reattaching viewer builds its local sinks.
         for (self.channels.items) |ch| {

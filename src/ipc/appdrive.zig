@@ -173,6 +173,11 @@ pub const Window = struct {
     shot_pixels: std.ArrayList(u8) = .empty,
     shot_w: i32 = 0,
     shot_h: i32 = 0,
+    /// Cleared for the channel's windows when a resync replay starts
+    /// (repeated chan_open) and set again by any replica callback that
+    /// touches the window — windows the replay never re-announces are
+    /// pruned when `native_sync` closes it (they died during the gap).
+    resync_seen: bool = true,
 
     fn deinit(self: *Window, a: std.mem.Allocator) void {
         self.pixels.deinit(a);
@@ -223,6 +228,9 @@ const Chan = struct {
     /// become independently selectable headless "windows". JBR uses
     /// one such surface for every drop shadow.
     subsurfaces: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// A daemon resync replay is rebuilding this channel's replica
+    /// (repeated chan_open); cleared when `native_sync` lands.
+    resyncing: bool = false,
 
     fn deinit(self: *Chan) void {
         self.subsurfaces.deinit(self.app.allocator);
@@ -248,6 +256,10 @@ pub const App = struct {
     next_win_id: u32 = 1,
     /// Bumped on every committed frame — the quiescence signal.
     frame_seq: u64 = 0,
+    /// The daemon paused app-frame streaming toward us (native_gap):
+    /// replica pixels are known-stale until the post-drain replay's
+    /// native_sync lands. drainLive() waits this out.
+    behind: bool = false,
     exited: bool = false,
     exit_status: i32 = 0,
     /// Session child pid ON THE DAEMON'S HOST (0 = unknown). A string
@@ -650,6 +662,48 @@ pub const App = struct {
         return true;
     }
 
+    /// A resync replay finished (native_sync): windows the replay
+    /// never re-announced died during the withheld gap — prune them
+    /// (their surfaces no longer exist, no toplevel_gone will come).
+    fn finishResync(self: *App) void {
+        var any = false;
+        var cit = self.chans.iterator();
+        while (cit.next()) |e| {
+            if (e.value_ptr.*.resyncing) any = true;
+            e.value_ptr.*.resyncing = false;
+        }
+        if (!any) return;
+        var i: usize = 0;
+        while (i < self.windows.items.len) {
+            const w = self.windows.items[i];
+            if (!w.resync_seen) {
+                _ = self.windows.swapRemove(i);
+                w.deinit(self.allocator);
+                self.allocator.destroy(w);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Drain to the LIVE head, bounded by `max_ms`: unlike drain()
+    /// (a 100ms box that may only chew part of a backlog), this keeps
+    /// pumping until nothing is queued AND no daemon-side resync is
+    /// pending (`behind`) — so captures and input baselines reflect
+    /// "now", not a screensful-old frame. Terminates on quiet apps
+    /// immediately; on continuously-committing apps it is within one
+    /// commit of live when the socket goes momentarily quiet.
+    pub fn drainLive(self: *App, max_ms: i64) void {
+        const deadline = nowMs() + max_ms;
+        while (!self.exited and nowMs() < deadline) {
+            if (self.pumpOnce(0)) continue;
+            if (!self.behind) return;
+            // Backlog consumed but the post-drain replay hasn't landed
+            // yet — the daemon queues it the moment its queue empties.
+            _ = self.pumpOnce(20);
+        }
+    }
+
     /// Drain whatever is queued without blocking — TIME-BOXED. A
     /// flooding app (debug spam on its PTY) produces `.events` frames
     /// at least as fast as we consume them, so an unbounded loop here
@@ -680,28 +734,35 @@ pub const App = struct {
                     return;
                 }
                 if (open.kind != .wayland_native) return;
+                if (self.chans.get(open.id)) |existing| {
+                    // Daemon resync replay for a channel we already
+                    // hold: rebuild the replica IN PLACE. The Window
+                    // objects survive (ensureWindow dedupes by
+                    // chan+sid), so public window ids stay stable
+                    // across the resync; windows the replay never
+                    // re-announces are pruned at native_sync.
+                    existing.comp.deinit();
+                    existing.subsurfaces.clearRetainingCapacity();
+                    existing.comp = self.makeReplica(existing) catch {
+                        // Replica unusable — drop the channel wholesale.
+                        _ = self.chans.swapRemove(open.id);
+                        self.dropChanWindows(open.id);
+                        existing.subsurfaces.deinit(self.allocator);
+                        self.allocator.destroy(existing);
+                        return;
+                    };
+                    existing.resyncing = true;
+                    for (self.windows.items) |w| {
+                        if (w.chan == open.id) w.resync_seen = false;
+                    }
+                    return;
+                }
                 const ch = self.allocator.create(Chan) catch return;
                 ch.* = .{ .app = self, .id = open.id, .comp = undefined };
-                ch.comp = wlcomp.Compositor.init(self.allocator, .{
-                    .ctx = ch,
-                    .toplevel_new = onNew,
-                    .toplevel_frame = onFrame,
-                    .toplevel_title = onTitle,
-                    .toplevel_app_id = onAppId,
-                    .toplevel_gone = onGone,
-                    .popup_new = onPopupNew,
-                    .popup_gone = onGone,
-                    .subsurface_new = onSubsurfaceNew,
-                    .subsurface_gone = onSubsurfaceGone,
-                    .clipboard_offer = onClipOffer,
-                    .clipboard_data = onClipData,
-                    .clipboard_read = onClipRead,
-                    .primary_read = onPrimaryRead,
-                }) catch {
+                ch.comp = self.makeReplica(ch) catch {
                     self.allocator.destroy(ch);
                     return;
                 };
-                ch.comp.lenient = true;
                 self.chans.put(self.allocator, open.id, ch) catch {
                     ch.deinit();
                     self.allocator.destroy(ch);
@@ -732,8 +793,14 @@ pub const App = struct {
                 self.log_seq += 1;
             },
             .marker => self.stashMarker(payload),
+            .native_gap => self.behind = true,
+            .native_sync => {
+                self.behind = false;
+                self.finishResync();
+            },
             .exit => {
                 self.exited = true;
+                self.behind = false; // nothing more will stream
                 if (payload.len >= 4) self.exit_status = std.mem.readInt(i32, payload[0..4], .little);
                 self.resolvePendingMarkers();
             },
@@ -1015,7 +1082,10 @@ pub const App = struct {
     }
 
     fn ensureWindow(self: *App, chan: u32, sid: u32, popup: bool) ?*Window {
-        if (self.winBySurface(chan, sid)) |w| return w;
+        if (self.winBySurface(chan, sid)) |w| {
+            w.resync_seen = true;
+            return w;
+        }
         const w = self.allocator.create(Window) catch return null;
         w.* = .{ .id = self.next_win_id, .chan = chan, .sid = sid, .popup = popup };
         self.next_win_id += 1;
@@ -1027,6 +1097,30 @@ pub const App = struct {
     }
 
     // ── replica view callbacks ──────────────────────────────────
+
+    /// Fresh (lenient) replica compositor wired to this channel's
+    /// view callbacks — used at chan_open and for in-place resync
+    /// rebuilds.
+    fn makeReplica(self: *App, ch: *Chan) !wlcomp.Compositor {
+        var comp = try wlcomp.Compositor.init(self.allocator, .{
+            .ctx = ch,
+            .toplevel_new = onNew,
+            .toplevel_frame = onFrame,
+            .toplevel_title = onTitle,
+            .toplevel_app_id = onAppId,
+            .toplevel_gone = onGone,
+            .popup_new = onPopupNew,
+            .popup_gone = onGone,
+            .subsurface_new = onSubsurfaceNew,
+            .subsurface_gone = onSubsurfaceGone,
+            .clipboard_offer = onClipOffer,
+            .clipboard_data = onClipData,
+            .clipboard_read = onClipRead,
+            .primary_read = onPrimaryRead,
+        });
+        comp.lenient = true;
+        return comp;
+    }
 
     fn chanOf(ctx: ?*anyopaque) *Chan {
         return @ptrCast(@alignCast(ctx.?));
@@ -1290,6 +1384,15 @@ pub const App = struct {
         if (self.ptr_win == win.id) {
             bx = self.ptr_x;
             by = self.ptr_y;
+        } else {
+            // First contact: PLACE the pointer at the base before
+            // moving. The brain's enter resets its delta base to the
+            // enter coords, so folding the delta into the entering
+            // motion derives a relative_motion of (0,0) — a pointer-
+            // locked app (the main consumer of relative moves, and
+            // the documented dx/dy calibration pattern) would
+            // silently see nothing.
+            try self.sendPointer(win, bx, by);
         }
         try self.sendPointer(win, bx + dx, by + dy);
         return .{ .win = win.id, .x = bx + dx, .y = by + dy };
@@ -1995,4 +2098,157 @@ test "logNonceOf: header nonce parsed, lines content never scanned" {
     try t.expectEqual(@as(?u64, null), App.logNonceOf("{\"next_id\":9,\"dropped\":0,\"lines\":[]}"));
     // A line whose text CONTAINS "nonce": must not be picked up.
     try t.expectEqual(@as(?u64, null), App.logNonceOf("{\"next_id\":9,\"dropped\":0,\"lines\":[{\"id\":1,\"t\":0,\"text\":\"\\\"nonce\\\":777\"}]}"));
+}
+
+/// Test scaffold: an App with no live connection (conn undefined or a
+/// socketpair end), torn down manually — App.deinit assumes a full
+/// launch (name, terminal mirror, markers) the scaffold never builds.
+fn testTeardown(app: *App) void {
+    const a = app.allocator;
+    for (app.windows.items) |w| {
+        w.deinit(a);
+        a.destroy(w);
+    }
+    app.windows.deinit(a);
+    var it = app.chans.iterator();
+    while (it.next()) |e| {
+        e.value_ptr.*.deinit();
+        a.destroy(e.value_ptr.*);
+    }
+    app.chans.deinit(a);
+    app.audio_ids.deinit(a);
+}
+
+fn testChanOpenPayload(buf: *[5]u8, id: u32) []const u8 {
+    return wire.encodeChanOpen(buf, id, .wayland_native);
+}
+
+test "resync replay: chan_open replace keeps window identity, native_sync prunes gone windows" {
+    const t = std.testing;
+    const a = t.allocator;
+    var app = App{ .allocator = a, .conn = undefined, .name = @constCast("test") };
+    defer testTeardown(&app);
+
+    var pl: [5]u8 = undefined;
+    app.handleFrame(.chan_open, testChanOpenPayload(&pl, 7));
+    const ch = app.chans.get(7).?;
+
+    // Two live toplevels with committed pixels.
+    const px_a = [_]u8{ 1, 2, 3, 4 };
+    App.onFrame(ch, 1, 1, 1, 1, 1, 1, 0, &px_a);
+    App.onFrame(ch, 2, 1, 1, 1, 1, 1, 0, &px_a);
+    try t.expectEqual(@as(usize, 2), app.windows.items.len);
+    const win1 = app.winBySurface(7, 1).?;
+    try t.expectEqual(@as(u32, 1), win1.id);
+    try t.expectEqual(@as(u64, 1), win1.frames);
+
+    // Daemon paused streaming, then replays: gap → chan_open again.
+    app.handleFrame(.native_gap, "");
+    try t.expect(app.behind);
+    app.handleFrame(.chan_open, testChanOpenPayload(&pl, 7));
+    const ch2 = app.chans.get(7).?;
+    try t.expectEqual(ch, ch2); // same Chan object, replica rebuilt
+    try t.expect(ch2.resyncing);
+    try t.expect(!win1.resync_seen);
+
+    // Replay re-announces only surface 1, with CURRENT pixels.
+    const px_b = [_]u8{ 9, 9, 9, 9 };
+    App.onFrame(ch2, 1, 1, 1, 1, 1, 1, 0, &px_b);
+    try t.expectEqual(win1, app.winBySurface(7, 1).?); // identity kept
+    try t.expectEqualSlices(u8, &px_b, win1.pixels.items);
+
+    // native_sync closes the replay: surface 2 died during the gap.
+    app.handleFrame(.native_sync, "");
+    try t.expect(!app.behind);
+    try t.expect(!ch2.resyncing);
+    try t.expectEqual(@as(usize, 1), app.windows.items.len);
+    try t.expectEqual(win1, app.windows.items[0]);
+}
+
+test "moveMouseRel first contact places the pointer before the delta motion" {
+    const t = std.testing;
+    const a = t.allocator;
+    var fds: [2]c_int = undefined;
+    try t.expect(c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) == 0);
+    defer _ = c.close(fds[1]);
+    var app = App{
+        .allocator = a,
+        .conn = .{ .allocator = a, .fd = fds[0] },
+        .name = @constCast("test"),
+    };
+    defer {
+        app.conn.rbuf.deinit(a);
+        app.conn.wbuf.deinit(a);
+        _ = c.close(fds[0]);
+        testTeardown(&app);
+    }
+
+    var pl: [5]u8 = undefined;
+    app.handleFrame(.chan_open, testChanOpenPayload(&pl, 3));
+    const ch = app.chans.get(3).?;
+    const px = [_]u8{0} ** (100 * 80 * 4);
+    App.onFrame(ch, 5, 100, 80, 1, 100, 80, 0, &px);
+
+    // First contact: base = window center (50, 40).
+    const pos = try app.moveMouseRel(null, 10, -5);
+    try t.expectEqual(@as(f64, 60), pos.x);
+    try t.expectEqual(@as(f64, 35), pos.y);
+
+    // Read the sent chan_data frames and collect the seat units.
+    var raw: [4096]u8 = undefined;
+    const n = c.read(fds[1], &raw, raw.len);
+    try t.expect(n > 0);
+    const Motion = struct { x: f64, y: f64 };
+    var motions: std.ArrayList(Motion) = .empty;
+    defer motions.deinit(a);
+    var enters: usize = 0;
+    var off: usize = 0;
+    const bytes = raw[0..@intCast(n)];
+    while (try wire.peelFrame(bytes[off..])) |pf| {
+        off += pf.consumed;
+        try t.expectEqual(wire.FrameType.chan_data, pf.frame.ftype);
+        var upos: usize = 4; // skip channel id
+        while (try wlpipe.peelUnit(pf.frame.payload[upos..])) |pu| {
+            upos += pu.consumed;
+            switch (pu.unit.tag) {
+                .seat_enter => enters += 1,
+                .seat_motion => try motions.append(a, .{
+                    .x = @bitCast(std.mem.readInt(u64, pu.unit.payload[0..8], .little)),
+                    .y = @bitCast(std.mem.readInt(u64, pu.unit.payload[8..16], .little)),
+                }),
+                else => {},
+            }
+        }
+    }
+    // Placement motion at the base FIRST (the brain's enter resets
+    // its delta base, so this one derives 0,0), then the real move —
+    // its derived relative_motion is exactly (dx, dy).
+    try t.expect(enters >= 1);
+    try t.expectEqual(@as(usize, 2), motions.items.len);
+    try t.expectEqual(@as(f64, 50), motions.items[0].x);
+    try t.expectEqual(@as(f64, 40), motions.items[0].y);
+    try t.expectEqual(@as(f64, 60), motions.items[1].x);
+    try t.expectEqual(@as(f64, 35), motions.items[1].y);
+
+    // Second move: pointer tracked — a single motion, no placement.
+    motions.clearRetainingCapacity();
+    _ = try app.moveMouseRel(null, -20, 2);
+    const n2 = c.read(fds[1], &raw, raw.len);
+    try t.expect(n2 > 0);
+    off = 0;
+    const bytes2 = raw[0..@intCast(n2)];
+    while (try wire.peelFrame(bytes2[off..])) |pf| {
+        off += pf.consumed;
+        var upos: usize = 4;
+        while (try wlpipe.peelUnit(pf.frame.payload[upos..])) |pu| {
+            upos += pu.consumed;
+            if (pu.unit.tag == .seat_motion) try motions.append(a, .{
+                .x = @bitCast(std.mem.readInt(u64, pu.unit.payload[0..8], .little)),
+                .y = @bitCast(std.mem.readInt(u64, pu.unit.payload[8..16], .little)),
+            });
+        }
+    }
+    try t.expectEqual(@as(usize, 1), motions.items.len);
+    try t.expectEqual(@as(f64, 40), motions.items[0].x);
+    try t.expectEqual(@as(f64, 37), motions.items[0].y);
 }

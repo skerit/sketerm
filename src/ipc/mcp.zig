@@ -917,7 +917,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"focus_pane","description":"Focus a pane (selects its tab and grabs keyboard focus).","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
     \\{"name":"close_pane","description":"Close a pane. Destructive: the shell and any running process in it are terminated.","inputSchema":{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}},
     \\{"name":"list_installed_apps","description":"List installed GUI apps on the host (name + launch command), from its .desktop entries. Pass host for a remote machine. Use before launch_app to discover what can run.","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH host (user@box); omit = local"}}}},
-    \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns the app id, the child pid on the daemon's host (attach a debugger with gdb -p; with a string command the pid is the wrapping /bin/sh — pass an argv array to make it the app itself), its windows AND the first window's screenshot inline (launch-and-look in one call). If the app exits early, the reply includes exit status, terminating signal and its recent output. Drive it with get_app_state/app_click/app_type/app_key; read its stdout/stderr with app_output.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"cwd":{"type":"string","description":"Working directory for the app"},"env":{"type":"object","description":"Extra environment variables, e.g. {\"FOO\":\"1\"}","additionalProperties":{"type":"string"}},"wait_for":{"type":"string","enum":["window","exit"],"description":"What to wait for before replying: first window (default) or process exit (short-lived/CLI runs)"},"wait_ms":{"type":"integer","description":"Max wait (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"},"layout":{"type":"string","description":"Session keyboard layout: us (default), gb, fr, be, de"},"gpu":{"type":"boolean","description":"Render on the host's real GPU via linux-dmabuf instead of software GL. Needs a driver whose linear buffers allow CPU mmap."},"audio":{"type":"string","enum":["forward","none"],"description":"forward (default): PULSE_SERVER points at sketerm's per-session audio sink, which paces playback in real time (samples are discarded unless a GUI viewer is attached). none: no PULSE_SERVER, so the app falls back to its own dummy/null audio driver."},"audio_path":{"type":"string","description":"Capture the app's audio to WAV at this absolute path base ON THE DAEMON'S HOST (first stream: <base>.wav, later streams: <base>-N.wav; a trailing .wav in the base is stripped). Playback pacing is unaffected — this tees the PCM the sink consumes, so you can verify the app actually produced sound. Incompatible with audio:\"none\"."},"debug":{"type":"string","enum":["gdb","valgrind"],"description":"Run the app under a debug wrapper: gdb (batch mode — on a crash the full backtrace + registers land in app_log) or valgrind (report in app_log at exit). The reported pid is the wrapper's."}},"required":["command"]}},
+    \\{"name":"launch_app","description":"Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects. Returns the app id, the child pid on the daemon's host (attach a debugger with gdb -p; with a string command the pid is the wrapping /bin/sh — pass an argv array to make it the app itself), its windows AND the first window's screenshot inline (launch-and-look in one call). If the app exits early, the reply includes exit status, terminating signal and its recent output. Drive it with get_app_state/app_click/app_type/app_key; read its stdout/stderr with app_output.","inputSchema":{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"args":{"type":"array","items":{"type":"string"},"description":"Extra argv entries appended after command. With a string command, the command then runs as the bare EXECUTABLE (argv[0], NOT shell-parsed)."},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"cwd":{"type":"string","description":"Working directory for the app"},"env":{"type":"object","description":"Extra environment variables, e.g. {\"FOO\":\"1\"}","additionalProperties":{"type":"string"}},"wait_for":{"type":"string","enum":["window","exit"],"description":"What to wait for before replying: first window (default) or process exit (short-lived/CLI runs)"},"wait_ms":{"type":"integer","description":"Max wait (default 10000)"},"cols":{"type":"integer"},"rows":{"type":"integer"},"layout":{"type":"string","description":"Session keyboard layout: us (default), gb, fr, be, de"},"gpu":{"type":"boolean","description":"Render on the host's real GPU via linux-dmabuf instead of software GL. Needs a driver whose linear buffers allow CPU mmap."},"audio":{"type":"string","enum":["forward","none"],"description":"forward (default): PULSE_SERVER points at sketerm's per-session audio sink, which paces playback in real time (samples are discarded unless a GUI viewer is attached). none: no PULSE_SERVER, so the app falls back to its own dummy/null audio driver."},"audio_path":{"type":"string","description":"Capture the app's audio to WAV at this absolute path base ON THE DAEMON'S HOST (first stream: <base>.wav, later streams: <base>-N.wav; a trailing .wav in the base is stripped). Playback pacing is unaffected — this tees the PCM the sink consumes, so you can verify the app actually produced sound. Incompatible with audio:\"none\"."},"debug":{"type":"string","enum":["gdb","valgrind"],"description":"Run the app under a debug wrapper: gdb (batch mode — on a crash the full backtrace + registers land in app_log) or valgrind (report in app_log at exit). The reported pid is the wrapper's."}},"required":["command"]}},
     \\{"name":"list_apps","description":"List launched headless apps and their windows.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"app_windows","description":"List one app's rendered windows (ids, sizes, titles).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
     \\{"name":"screenshot_app","description":"Screenshot a headless app window as a lossless PNG (inline image). Optional region crop and integer zoom for pixel-level inspection; downscaled when larger than max_px. The caption tells you how to map image coordinates back to app_click coordinates. wait_change=true blocks until the window renders something NEWER than your last screenshot (verify a click did something); stable_ms waits until repainting stops before capturing (settle-then-capture — combine both to catch 'changed, then went quiet'). stats_only=true skips the image and just reports whether/how much the window changed since your last look (cheap polling). burst=N captures up to N frames over burst_ms, each at least min_change_pct different from the previous — one call across an animated transition.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"},"region":{"type":"object","description":"Crop to a sub-rectangle in surface pixels","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer","description":"Nearest-neighbor integer upscale (1-32) — crop a small region and zoom to inspect pixels"},"wait_change":{"type":"boolean","description":"Wait until the window content changed since the last screenshot before capturing. Combine with min_change_pct to ignore trivial repaints (a software cursor)."},"stable_ms":{"type":"integer","description":"Capture only after the window committed no new frame for this long (settle-then-capture). With min_change_pct set, frames changing less than that %% don't reset the timer (VISUAL settle — works on continuously-animating apps)."},"stats_only":{"type":"boolean","description":"Return {changed, diff_pct, resized, w, h, frames} instead of an image"},"burst":{"type":"integer","description":"Capture up to N distinct frames (2-8) over burst_ms"},"burst_ms":{"type":"integer","description":"Burst time window (default 5000)"},"min_change_pct":{"type":"number","description":"Pixel-change threshold (%%): burst frames must differ this much from the previous one (default 1.0), and when set it also gates wait_change and turns stable_ms into a visual settle (default 0 = any repaint counts)"},"timeout_ms":{"type":"integer","description":"Bound for wait_change/stable_ms (default 10000)"}}}},
@@ -926,7 +926,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_log","description":"A headless app's stdout/stderr as an INDEXED LOG: each complete line gets a stable numeric id and a timestamp; the tail view shortens long lines (marked [+]) and any line can be re-read in full by id. The ring is bounded (oldest lines drop; the reply says how many). MARKERS: the app (or your injected code) can emit the escape  printf '\\033]5522;my-label\\033\\\\'  — it becomes a labelled log line AND sketerm stashes a screenshot of the app window at that exact instant; fetch label+image with {\"id\":<that line's id>}. Variant printf '\\033]5522;+N;my-label\\033\\\\' captures the Nth FUTURE frame commit instead (e.g. +1 = the next repaint after this point; resolved with the final frame if the app exits first). Markers are rate-limited (burst 8, then 2/s; excess are dropped and counted) so escape-laden files cat'ed to the terminal cannot flood the log. Survives app exit: the final log is delivered with the exit. Reliable on frame-flooding apps: a reply delayed behind streamed frame data is refetched over a FRESH daemon connection automatically; failing that, the last cached snapshot is served with a [STALE] banner, then the PTY grid mirror (no line ids) — an error only when nothing at all is reachable.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"tail":{"type":"integer","description":"Last N lines (default 60, max 500)"},"from_id":{"type":"integer","description":"Return lines starting at this id instead of the tail"},"id":{"type":"integer","description":"Return ONE line in full; for a marker line also returns the stashed screenshot"}}}},
     \\{"name":"app_click","description":"Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled). To target a widget by name/role instead, prefer app_perform_action (coordinate-free, more reliable). button: 1 left (default), 2 middle, 3 right. By DEFAULT the reply is a post-click screenshot with a crosshair at the exact click pixel — where the click landed AND what it did, in one image (mark:false for a plain text reply; screenshot=true for the frame without the marker). HOLD/REPEAT/RETRY: the button stays DOWN for hold_ms between press and release (human-like — an instantaneous click can be collapsed into one sample by apps that poll input edges per tick, and a LONG hold exercises press-and-hold repeat widgets); count:2 sends a real double-click (two separate app_click calls are always too far apart to register as one); retry re-clicks when no qualifying repaint arrives in time, for apps whose buttons genuinely need a second press. CLICK-AND-SETTLE: the capture waits (bounded) for a frame committed AFTER the click, then a short settle (settle_ms) so mid-repaint frames aren't captured; the caption states 'repainted Nms after the input' or 'NO repaint within Nms'. HONESTY LIMITS: on a continuously-animating app (blinking LEDs, a game) ANY commit counts as a repaint — set min_change_pct (1-2) there or the dead/live distinction is meaningless; and 'NO repaint within Nms' is not proof of a dead click on an app that reacts with multi-second latency — retry with a larger timeout_ms before concluding.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"},"hold_ms":{"type":"integer","description":"How long the button stays down between press and release, ms (%HOLD_DEF%; max 10000). Long values drive press-and-hold repeat controls."},"count":{"type":"integer","description":"Clicks in quick succession, ~80ms apart: 2 = double-click, 3 = triple (default 1)"},"retry":{"type":"integer","description":"If no qualifying repaint arrives within timeout_ms, click again, up to this many EXTRA attempts (%RETRY_DEF%; max 5). Pair with min_change_pct on animating apps, or the first attempt always looks alive."},"mark":{"type":"boolean","description":"Crosshair-marked post-click screenshot (DEFAULT true; false = no image unless screenshot is set)"},"screenshot":{"type":"boolean","description":"Return the post-click frame without the marker"},"wait_change":{"type":"boolean","description":"Wait for a post-click frame commit before returning (defaults ON when an image is returned; false = capture immediately)"},"settle_ms":{"type":"integer","description":"After the first post-click frame, wait until repainting pauses this long before capturing (%SETTLE_DEF%; 0 = capture the first frame)"},"min_change_pct":{"type":"number","description":"Only frames changing at least this % of pixels count as change — REQUIRED for a meaningful dead/live verdict on continuously-animating apps. Deliberately per-call only (never an env default): it decides the VERDICT, not a timing bound."},"timeout_ms":{"type":"integer","description":"Bound for the post-click wait (%TIMEOUT_DEF%; raised to at least 5000 when wait_change/settle_ms is explicit)"},"max_px":{"type":"integer","description":"Bound on the screenshot's longest dimension (default 1568)"}},"required":["window","x","y"]}},
     \\{"name":"app_actions","description":"Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards). 'actions' is an array of step objects, each holding exactly one of: {\"move\":[x,y]} | {\"move_rel\":[dx,dy]} (relative pointer, see app_mouse_move) | {\"click\":[x,y]} (optional \"hold_ms\" and \"count\":2 for double-click, as in app_click) | {\"drag\":[x1,y1,x2,y2]} | {\"key\":\"space-separated chords\"} (optional \"hold_ms\" per chord, as in app_key) | {\"type\":\"text\"} | {\"scroll\":[dx,dy]} (optional \"at\":[x,y]) | {\"wait\":ms} (MILLISECONDS, max 30000) | {\"wait_idle\":{\"quiet_ms\":400,\"timeout_ms\":10000,\"change_pct\":2}} (with change_pct = VISUAL settle: blocks until frames change less than that %% — use for scene transitions of unknown duration instead of guessing a fixed wait) | {\"wait_change\":timeout_ms or {\"timeout_ms\":N,\"min_change_pct\":P}} (P = ignore repaints below that %% of pixels; add \"required\":true to a wait_idle/wait_change step to make a timeout FAIL the batch instead of continuing — a timeout is then structurally distinct from success) | {\"screenshot\":true or {\"max_px\":N}} | {\"wait_image\":{\"template\":name,\"timeout_ms\":N,\"click\":true}} (wait for a saved template to appear, optionally click its center) | {\"click_image\":{\"template\":name}} (find + click NOW, error if absent) | {\"wait_text\":{\"text\":s,\"click\":true}} (OCR-wait for a string, optionally click it) — these three make batches STATE-driven instead of coordinate/timing-driven. MARKERS: add \"mark\":true to a click/move/move_rel/drag/scroll step to draw a labelled crosshair at that step's position (red = click, cyan = move; the number is the step index) onto the NEXT screenshot — several marked steps can share one image. Combine in one step: {\"click\":[x,y],\"mark\":true,\"screenshot\":true} captures the post-click frame with the click point marked. Leftover marks with no later screenshot are flushed as a final image automatically. Optional per-step \"window\" and \"button\" (click/drag). Steps run in order server-side; execution stops with a per-step report when one fails or the app exits. Returns per-step results plus every screenshot taken (max 8) as inline images.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}},
-    \\{"name":"app_mouse_move","description":"Move the pointer in an app window WITHOUT clicking. Absolute: x,y in surface pixels (hover a widget, position before a click). Relative: dx,dy — a delta from the current pointer position, for apps that consume RELATIVE mouse motion (SDL games, DOSBox, anything with pointer-lock): sketerm derives relative_motion events from the move, so the app's own cursor moves by exactly your delta. Calibration for such apps: one large negative move (e.g. dx:-30000, dy:-30000) slams their internal cursor to the top-left corner, after which exact deltas land where you aim. With neither x/y nor dx/dy it just returns the tracked pointer position.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = window under the pointer, else first toplevel)"},"x":{"type":"number","description":"Absolute surface x (with y)"},"y":{"type":"number"},"dx":{"type":"number","description":"Relative delta x (with dy; exclusive with x/y)"},"dy":{"type":"number"}}}},
+    \\{"name":"app_mouse_move","description":"Move the pointer in an app window WITHOUT clicking. Absolute: x,y in surface pixels (hover a widget, position before a click; NOTE: a pointer-LOCKED app suppresses absolute motion and only sees deltas — use dx/dy there). Relative: dx,dy — a delta from the current pointer position, for apps that consume RELATIVE mouse motion (SDL games, DOSBox, anything with pointer-lock): sketerm derives relative_motion events from the move, so the app's own cursor moves by exactly your delta. Calibration for such apps: one large negative move (e.g. dx:-30000, dy:-30000) slams their internal cursor to the top-left corner, after which exact deltas land where you aim. With neither x/y nor dx/dy it just returns the tracked pointer position.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = window under the pointer, else first toplevel)"},"x":{"type":"number","description":"Absolute surface x (with y)"},"y":{"type":"number"},"dx":{"type":"number","description":"Relative delta x (with dy; exclusive with x/y)"},"dy":{"type":"number"}}}},
     \\{"name":"app_perform_action","description":"Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox. 'element' is an id from app_a11y_tree. Works for GTK/Qt apps that publish accessibility.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}},
     \\{"name":"app_set_value","description":"Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value). Faster and more reliable than typing.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}},
     \\{"name":"app_wait_for_element","description":"Wait until a widget appears in the app's accessibility tree (dialog opened, page loaded, ...). Match by role number and/or case-insensitive name substring; returns the matched node with its id and rect.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"role":{"type":"integer","description":"AT-SPI role number (e.g. 42 push-button)"},"name":{"type":"string","description":"Name substring, case-insensitive"},"timeout_ms":{"type":"integer","description":"Default 10000"}}}},
@@ -1001,6 +1001,12 @@ const TOOLS_JSON_RAW =
 // dead/live VERDICT rather than a timing bound, and an invisible
 // non-zero default would fabricate "NO repaint" verdicts on normal
 // apps. It stays per-call.
+/// Bound on catching the app mirror up to the LIVE frame at tool
+/// entry (appdrive.drainLive): backlog consumption + the daemon's
+/// post-drain replay. Not a Tuning item — it bounds internal
+/// convergence, not an input-timing behavior.
+const CATCHUP_MS: i64 = 1_500;
+
 const Tuning = struct {
     const Item = struct {
         name: []const u8,
@@ -1708,7 +1714,7 @@ fn screenshotCaption(arena: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
         );
     return std.fmt.allocPrint(
         arena,
-        "{s}{s}window {d}: {d}x{d} (scale {d}){s}{s} — {s}{s}",
+        "{s}{s}window {d}: {d}x{d} (scale {d}){s}{s} — {s}{s}{s}",
         .{
             extra,
             if (extra.len > 0) "\n" else "",
@@ -1719,6 +1725,9 @@ fn screenshotCaption(arena: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
             if (win.title != null) " title=" else "",
             win.title orelse "",
             coord_note,
+            // Set only when drainLive timed out mid-resync: the frame
+            // stream is still catching up, so pixels may lag.
+            if (app.behind) " [WARNING: frame stream still resyncing — this capture may lag the app]" else "",
             browserPageSuffix(arena, app),
         },
     );
@@ -1893,7 +1902,9 @@ const PostInputWait = struct {
         const wait = explicit orelse (want_shot or settle_explicit);
         // Catch the mirror up FIRST: a frame already queued on the
         // socket predates the input and must not satisfy the wait.
-        if (wait) app.drain();
+        // drainLive (not the 100ms-boxed drain): the baseline must be
+        // the LIVE frame, incl. a pending daemon-side resync.
+        if (wait) app.drainLive(CATCHUP_MS);
         // Defaulted-on waits stay short (a no-op click costs at most
         // Tuning.timeout_ms); an explicit wait_change/settle gets a
         // real budget.
@@ -2271,6 +2282,57 @@ fn findWordRun(words: []const ocr.Word, query: []const u8) ?struct { x: u32, y: 
     return null;
 }
 
+const LaunchArgv = union(enum) {
+    ok: struct {
+        /// True when the caller supplied explicit argv pieces (array
+        /// command, or string command + args) — safe to rewrite
+        /// (ozone-flag injection); a bare shell string is not.
+        argv_form: bool,
+    },
+    err: []const u8,
+};
+
+/// Build launch_app's argv into `argv` from `command` (string or argv
+/// array) plus the optional `args` array. A string command normally
+/// runs via `/bin/sh -c`; WITH extra args it becomes the bare
+/// EXECUTABLE instead (argv[0], not shell-parsed) — callers pairing a
+/// string with args mean "binary plus its arguments", and the old
+/// schema silently dropped `args`, launching apps with argc==1.
+fn buildLaunchArgv(arena: std.mem.Allocator, argv: *std.ArrayList([]const u8), args: std.json.Value) !LaunchArgv {
+    var extra: std.ArrayList([]const u8) = .empty;
+    defer extra.deinit(arena);
+    var cmd_is_array = false;
+    if (args == .object) {
+        if (args.object.get("args")) |ea| {
+            if (ea != .array) return .{ .err = "'args' must be an array of strings" };
+            for (ea.array.items) |item| {
+                if (item != .string) return .{ .err = "'args' must be an array of strings" };
+                try extra.append(arena, item.string);
+            }
+        }
+        if (args.object.get("command")) |cmd| switch (cmd) {
+            .string => if (extra.items.len > 0) {
+                try argv.append(arena, cmd.string);
+            } else {
+                try argv.append(arena, "/bin/sh");
+                try argv.append(arena, "-c");
+                try argv.append(arena, cmd.string);
+            },
+            .array => {
+                cmd_is_array = true;
+                for (cmd.array.items) |item| {
+                    if (item != .string) return .{ .err = "command array must be strings" };
+                    try argv.append(arena, item.string);
+                }
+            },
+            else => {},
+        };
+    }
+    if (argv.items.len == 0) return .{ .err = "launch_app requires 'command' (string or argv array)" };
+    try argv.appendSlice(arena, extra.items);
+    return .{ .ok = .{ .argv_form = cmd_is_array or extra.items.len > 0 } };
+}
+
 fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
     if (!app_state.ready)
@@ -2279,27 +2341,16 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
     if (eql(u8, name, "launch_app")) {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(arena);
-        if (args == .object) {
-            if (args.object.get("command")) |cmd| switch (cmd) {
-                .string => {
-                    try argv.append(arena, "/bin/sh");
-                    try argv.append(arena, "-c");
-                    try argv.append(arena, cmd.string);
-                },
-                .array => for (cmd.array.items) |item| {
-                    if (item != .string) return appErr(arena, "command array must be strings");
-                    try argv.append(arena, item.string);
-                },
-                else => {},
-            };
-        }
-        if (argv.items.len == 0) return appErr(arena, "launch_app requires 'command' (string or argv array)");
+        const built = switch (try buildLaunchArgv(arena, &argv, args)) {
+            .ok => |b| b,
+            .err => |msg| return appErr(arena, msg),
+        };
         // Chromium-family binaries default to X11 and die in the
         // Wayland-only session; inject the ozone flag unless the
         // caller chose one (argv form only — a shell string cannot be
         // rewritten safely).
         var browser_note: []const u8 = "";
-        const argv_form = args == .object and args.object.get("command") != null and args.object.get("command").? == .array;
+        const argv_form = built.argv_form;
         if (argv_form and chromiumFamily(argv.items[0])) {
             var has_ozone = false;
             for (argv.items) |a| {
@@ -2628,7 +2679,13 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
 
     const app = appFromArgs(args) orelse
         return appErr(arena, "unknown app (pass 'app' from launch_app; use list_apps)");
-    app.drain();
+    // Catch up to the LIVE frame before any observation or input
+    // baseline. The 100ms-boxed drain() only chewed part of a between-
+    // calls backlog, so screenshots lagged by whole screens on busy
+    // apps (SDL games) — the daemon now pauses streaming to a
+    // backlogged MCP client and replays current state once we drain;
+    // drainLive waits for that replay (bounded).
+    app.drainLive(CATCHUP_MS);
 
     // "The app exited" is a NORMAL state, handled centrally: every
     // interaction tool answers with the exit summary IMMEDIATELY
@@ -6457,4 +6514,65 @@ test "tools/list states an override in the description" {
     ).?;
     try t.expect(std.mem.indexOf(u8, tools, "default 15000 — PROJECT OVERRIDE via SKETERM_MCP_TIMEOUT_MS, built-in 1500") != null);
     try t.expect(std.mem.indexOf(u8, tools, "_DEF%") == null);
+}
+
+test "buildLaunchArgv: args array appends; string command + args = bare executable" {
+    const t = std.testing;
+    const a = t.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const parse = struct {
+        fn go(al: std.mem.Allocator, json: []const u8) std.json.Value {
+            return std.json.parseFromSliceLeaky(std.json.Value, al, json, .{}) catch unreachable;
+        }
+    }.go;
+
+    // String command alone: shell-wrapped (unchanged behavior).
+    {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(arena);
+        const r = try buildLaunchArgv(arena, &argv, parse(arena, "{\"command\":\"echo hi\"}"));
+        try t.expect(r == .ok and !r.ok.argv_form);
+        try t.expectEqual(@as(usize, 3), argv.items.len);
+        try t.expectEqualStrings("/bin/sh", argv.items[0]);
+        try t.expectEqualStrings("echo hi", argv.items[2]);
+    }
+    // String command + args: BARE executable + argv — the regression
+    // (args used to be silently dropped, so the app saw argc==1).
+    {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(arena);
+        const r = try buildLaunchArgv(arena, &argv, parse(arena,
+            "{\"command\":\"/opt/game/bin\",\"args\":[\"/data/dir\",\"-w\",\"-nobink\"]}"));
+        try t.expect(r == .ok and r.ok.argv_form);
+        try t.expectEqual(@as(usize, 4), argv.items.len);
+        try t.expectEqualStrings("/opt/game/bin", argv.items[0]);
+        try t.expectEqualStrings("/data/dir", argv.items[1]);
+        try t.expectEqualStrings("-nobink", argv.items[3]);
+    }
+    // Array command + args: appended.
+    {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(arena);
+        const r = try buildLaunchArgv(arena, &argv, parse(arena,
+            "{\"command\":[\"/opt/game/bin\",\"-w\"],\"args\":[\"-nobink\"]}"));
+        try t.expect(r == .ok and r.ok.argv_form);
+        try t.expectEqual(@as(usize, 3), argv.items.len);
+        try t.expectEqualStrings("-nobink", argv.items[2]);
+    }
+    // Bad shapes are described errors, not silent drops.
+    {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(arena);
+        const r = try buildLaunchArgv(arena, &argv, parse(arena, "{\"command\":\"x\",\"args\":\"-w\"}"));
+        try t.expect(r == .err);
+    }
+    {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(arena);
+        const r = try buildLaunchArgv(arena, &argv, parse(arena, "{\"args\":[\"-w\"]}"));
+        try t.expect(r == .err);
+    }
 }

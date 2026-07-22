@@ -142,6 +142,15 @@ pub const FrameType = enum(u8) {
     chan_open = 80,
     chan_data = 81,
     chan_close = 82,
+    /// Daemon → MCP client: native app-channel streaming toward this
+    /// client is PAUSED (its outbound queue crossed the backlog cap).
+    /// A replay of every native channel, rebuilt from the daemon's
+    /// live mirrors and terminated by `native_sync`, follows once the
+    /// client fully drains. Empty payload.
+    native_gap = 83,
+    /// Daemon → MCP client: the post-drain native replay is complete;
+    /// the client's replicas now reflect the live mirrors. Empty.
+    native_sync = 84,
     _,
 };
 
