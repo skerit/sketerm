@@ -88,7 +88,18 @@ pub const Action = union(enum) {
 /// Damaged rows [y0, y1) in buffer coordinates. Width collapses to
 /// full rows: rows are contiguous in the pool, so one linear copy
 /// covers them; terminals scroll full-width anyway.
-pub const RowRange = struct { y0: i32, y1: i32 };
+pub const RowRange = struct {
+    y0: i32,
+    y1: i32,
+
+    /// Bounding union of two optional ranges, where null means "full
+    /// buffer" (the conservative no-damage reading) and thus wins.
+    pub fn mergeOpt(a: ?RowRange, b: ?RowRange) ?RowRange {
+        const ra = a orelse return null;
+        const rb = b orelse return null;
+        return .{ .y0 = @min(ra.y0, rb.y0), .y1 = @max(ra.y1, rb.y1) };
+    }
+};
 
 /// Plane-0 layout captured from zwp_linux_buffer_params_v1.add.
 pub const DmabufParams = struct { offset: u32, stride: u32, ok: bool };
@@ -828,4 +839,14 @@ test "dmabuf: add/create_immed actions, LINEAR-only, commit resolves mirror" {
     _ = try tr.clientMessage(ad3.hdr, ad3.body);
     const cr = enc(&buf, 10, 2, .{ 32, 32, protocol.DRM_FORMAT_XRGB8888, 0 });
     try t.expectEqual(@as(u32, 10), (try tr.clientMessage(cr.hdr, cr.body)).dmabuf_create_failed.params);
+}
+
+test "RowRange.mergeOpt: bbox union, null (= full buffer) wins" {
+    const m = RowRange.mergeOpt;
+    try t.expectEqual(@as(?RowRange, null), m(null, null));
+    try t.expectEqual(@as(?RowRange, null), m(null, .{ .y0 = 3, .y1 = 9 }));
+    try t.expectEqual(@as(?RowRange, null), m(.{ .y0 = 3, .y1 = 9 }, null));
+    const u = m(.{ .y0 = 10, .y1 = 20 }, .{ .y0 = 2, .y1 = 12 }).?;
+    try t.expectEqual(@as(i32, 2), u.y0);
+    try t.expectEqual(@as(i32, 20), u.y1);
 }
