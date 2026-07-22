@@ -8307,3 +8307,53 @@ first-contact moveMouseRel emits place-then-move, buildLaunchArgv
 shapes, RowRange.mergeOpt. Full: zig build test (772 pass),
 smoke-mux, smoke-mcp, smoke-e2e (xvfb), mux-portable (musl +
 aarch64-macos), sketerm-mux still links libc only.
+
+## 2026-07-22: stale-frame fix round 2 — the broker handoff dropped `kind`
+
+The DS9DW assistant retested and both bugs "reproduced" — because the
+installed package (/usr/bin/sketerm, r993.gecfca39) predated the fix.
+But rebuilding and reproducing locally with a ground-truth A/B app
+(weston-terminal running a raw-mode bash loop that flips the whole
+screen A->B on a keypress, driven over real MCP NDJSON) surfaced a
+REAL hole anyway: `sketerm mcp` isolation runs the daemon in BROKER
+mode, and the 'A' worker-handoff datagram carried only [proto][video]
+— the worker saw `Client.kind == .unknown`, so the entire mcp-gated
+gap/resync policy silently never engaged. Monolith smokes were green;
+the actual MCP stack stayed stale. Landed as:
+
+- The 'A' handoff datagram grew a kind byte ([proto][video][kind],
+  `Client.Kind` enum with stable wire values; absent byte = unknown,
+  so old broker + new worker degrades to the old behavior).
+  addPassedClient logs the kind and now also broadcasts peer_info.
+- `MCP_NATIVE_BACKLOG` (1MB) split from `NATIVE_BACKLOG` (8MB): a
+  sub-cap backlog is chewed at replica-COMPOSE speed (full-window
+  memcpy per intermediate frame), so 8MB of queue was seconds of
+  catch-up — over the tool-entry budget, silently stale. 1MB bounds
+  catch-up under the budget. CATCHUP_MS raised to 2500.
+- drainLive() now RETURNS whether the live head was reached and sets
+  `App.lagging` on a deadline exit; screenshot captions warn
+  ("frame stream still catching up") on behind OR lagging — a capture
+  can no longer silently pretend to be current.
+- The backlog smoke stage moved to `src/smoke_backlog.zig` and runs
+  in BOTH smoke-mux (monolith) and smoke-broker (real forked broker +
+  worker) — single-mode coverage is exactly how the handoff bug
+  shipped. The stage discovers the newest wl-* display socket (works
+  for wl-N and broker wl-w<pid> naming) and kills via a fresh
+  connection (the attached conn is worker-served in broker mode).
+
+Verification: end-to-end over real `sketerm mcp` NDJSON — after a 45s
+no-tool-call gap on a continuously-committing app, gap+resync engage
+(daemon log), and the screenshot taken immediately after the A->B
+keypress shows the B screen (23.6% pixel diff vs pre-press, 1.9%
+noise vs settled B; the same test on the pre-fix build showed the
+stale A screen). launch_app args verified end-to-end: new binary
+delivers ["ARG1","ARG2"] to /bin/echo, installed pre-fix binary drops
+them — confirming the retest ran old binaries. Full suite: 772 tests,
+smoke-mux (6x, flake-checked against a baseline build), smoke-broker,
+smoke-mcp, mux-portable musl + aarch64-macos, daemon still libc-only.
+
+Known pre-existing issue surfaced while validating (NOT from these
+changes; reproduces at ecfca39): smoke-mux occasionally logs a
+DebugAllocator "Allocation size 38 does not match free size 37" —
+some 37/38-byte string is freed with a mismatched length somewhere in
+the daemon. Worth a separate hunt.
