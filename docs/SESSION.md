@@ -8242,3 +8242,68 @@ landed as six changes:
 - min_change_pct is deliberately NOT env-tunable: it decides the
   dead/live VERDICT, not a timing bound — an invisible default there
   manufactures false verdicts. The schema now says so.
+
+## 2026-07-22: MCP stale-frame fix — backlog gap + live-mirror resync
+
+Feedback from an assistant reverse-engineering an SDL2 game:
+screenshot_app returned frames whole SCREENS old (persisting for tens
+of seconds while the app's own readback checksums proved it was
+rendering correctly), launch_app dropped an `args` array, and
+app_mouse_move never moved the app's internal cursor.
+
+Root cause of the stale screenshots: between MCP tool calls nobody
+drains the appdrive connection, so the daemon-side wbuf for that
+client grows without bound; past NATIVE_BACKLOG (8MB) the daemon
+skipped PIXEL units but kept streaming the tiny wl_msg commits, and
+the client's 100ms time-boxed drain() chewed only part of the backlog
+per call — frames incremented, pixels lagged by whole screens
+(exactly the reported 652 -> 1348 -> 2731 frame counts with an
+unchanged image). Landed as:
+
+- Daemon: native app-channel units toward an "mcp"-kind client STOP
+  entirely once its wbuf crosses NATIVE_BACKLOG — a `native_gap`
+  frame (wire 83) marks the pause, and the cap is re-checked AFTER
+  queueing each unit run (one burst batch can blow past it in a
+  single queueUnits call). When the client fully drains,
+  clientWritable rebuilds its replicas from the LIVE pool mirrors via
+  replayNativeChannels (video keyframes forced) and closes the replay
+  with `native_sync` (wire 84). GUI clients keep the old
+  stream-always behavior.
+- Daemon: commits whose pixel copy was skipped (no viewer with queue
+  room) accumulate their damage per surface (Native.skipped,
+  RowRange.mergeOpt in track.zig — null = full buffer); the next
+  SHIPPED commit merges it into its copy range, so partial-damage
+  clients no longer keep permanently stale regions after a viewer
+  recovers. Benefits GUI viewers too.
+- appdrive: repeated chan_open for a live channel rebuilds the
+  replica IN PLACE (Window objects survive — ensureWindow dedupes by
+  chan+sid, so public window ids stay stable); windows the replay
+  never re-announces are pruned at native_sync (they died during the
+  gap). `behind` tracks gap→sync; drainLive(max_ms) pumps to the LIVE
+  head including a pending resync. mcp.zig calls drainLive at appTool
+  entry and before post-input FrameRef baselines (CATCHUP_MS 1500);
+  screenshot captions warn if a capture happened while still behind.
+- launch_app grew the `args` array the reporter assumed existed (it
+  was silently dropped -> argc==1): appended after an argv command;
+  with a STRING command the string becomes the bare executable (not
+  shell-parsed). buildLaunchArgv extracted + unit-tested.
+- app_mouse_move dx/dy on FIRST contact was swallowed: the enter
+  event resets the brain's delta base to the enter coords, so the
+  entering motion derived relative_motion (0,0) — the documented
+  corner-slam calibration did nothing on pointer-locked apps (SDL
+  games, the exact reporter scenario). moveMouseRel now places the
+  pointer at the base first, then moves by the delta in a second
+  motion. Schema notes that pointer-locked apps suppress ABSOLUTE
+  motion (use dx/dy).
+
+Verification: smoke-mux gained nativeBacklogStage — a fake Wayland
+app floods 250 x 64KB incompressible commits at a stalled mcp-kind
+client, with registry-reply barriers pinning WHICH content each
+commit was encoded against; asserts gap, replay chan_open,
+state_sync, native_sync, and that the replayed pool bytes equal the
+LIVE mirror (the final content), not the flood-era content. Unit
+tests: replica rebuild keeps window identity + prunes gone windows,
+first-contact moveMouseRel emits place-then-move, buildLaunchArgv
+shapes, RowRange.mergeOpt. Full: zig build test (772 pass),
+smoke-mux, smoke-mcp, smoke-e2e (xvfb), mux-portable (musl +
+aarch64-macos), sketerm-mux still links libc only.
