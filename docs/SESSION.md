@@ -8170,3 +8170,40 @@ frame (hashes differ), min_change_pct:50 + timeout 500ms yields the
 explicit NO-repaint note with the screenshot still delivered, app_key
 F5 screenshot:true and app_drag screenshot:true both work, app_log
 serves fresh lines normally.
+
+## MCP: default crosshair clicks, default settle, frame-flood-proof app_log
+
+Round-11 follow-up from live testing on AFU (a continuously-committing
+game): the crosshair earned default status, the first post-input frame
+was sometimes a mid-repaint, and app_log still starved because the
+daemon-side queue toward the PRIMARY appdrive connection grows without
+bound between tool calls (nobody pumps it), burying log_data
+arbitrarily deep.
+
+app_click now replies with the marked post-click screenshot BY DEFAULT
+(mark:false for plain text). All five input tools settle 250ms by
+default before capturing (settle_ms:0 opts out). Schemas state the
+honesty limits: on always-animating apps the dead/live verdict needs
+min_change_pct, and 'NO repaint within Nms' is not proof of a dead
+click on a slow-reacting app.
+
+app_log: logGet now falls back to a FRESH side connection
+(appdrive.logGetFresh — proto-1 hello so the daemon replays no native
+channels, empty write queue so log_data lands right after the attach
+snapshot), then the [STALE] cache, then the PTY grid mirror; an error
+only when nothing is reachable. Testing exposed a correlation bug: a
+reply buried from an EARLIER request surfaced during a later wait and
+served OLDER ring content as fresh (next_id went backwards across
+calls). log_get requests are now nonce-stamped; the daemon echoes the
+nonce in the reply header (before "lines" — line text is arbitrary app
+output and is never scanned) and the client skips non-matching strays.
+No-nonce replies (old daemons, the pre-exit push) are accepted as
+before, so durable sessions on a pre-upgrade daemon stay usable.
+
+Verified: 763 unit tests + smoke-mcp pass (new logNonceOf test;
+appdrive.zig now registered in tests.zig); live Chromium with a
+full-window CSS animation — app_log served fresh lines with monotonic
+next_id (14, 14, 27) across idle-separated calls where the previous
+build regressed to older content, daemon log shows the proto-1 side
+attaches; bare app_click returned the marked frame with 'repainted 5ms
+after the input and settled'.

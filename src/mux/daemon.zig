@@ -168,6 +168,10 @@ pub const LogGetReq = struct {
     from_id: u64 = 0,
     id: u64 = 0,
     max_chars: u32 = 300,
+    /// Echoed in the reply header (when nonzero) so a client can match
+    /// replies to requests — a reply buried behind a frame backlog can
+    /// surface during a LATER request's wait.
+    nonce: u64 = 0,
 };
 
 pub const RenameReq = struct {
@@ -4572,8 +4576,10 @@ pub const Daemon = struct {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         const w = &aw.writer;
-        w.print("{{\"next_id\":{d},\"dropped\":{d},\"markers_dropped\":{d},\"lines\":[", .{
-            ring.next_id, ring.dropped, ring.markers_dropped,
+        // nonce stays BEFORE "lines": clients scan only the header for
+        // it (line text is arbitrary app output and could contain it).
+        w.print("{{\"next_id\":{d},\"dropped\":{d},\"markers_dropped\":{d},\"nonce\":{d},\"lines\":[", .{
+            ring.next_id, ring.dropped, ring.markers_dropped, req.nonce,
         }) catch return;
         var first = true;
         for (items[start..end]) |l| {
