@@ -947,7 +947,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"term_wait_command","description":"Continue waiting for a term_run wait_for=command request that timed out. Returns structured running/completed state, exact exit_status, timed_out, and completion_source without resending the command.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the completed command's output instead of the whole screen"}}}},
     \\{"name":"term_resize","description":"Resize a headless terminal's grid.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
     \\{"name":"term_close","description":"Close a headless terminal (kills its shell). Destructive.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"}}}},
-    \\{"name":"term_exec","description":"Run one command inside a LIVE interactive shell (including a persistent SSH session from term_open host) and get STRUCTURED results: exact exit_status and the exact output between sentinel markers, independent of shell integration. By default the command runs ISOLATED in a fresh `sh` (works typed into any shell dialect — fish/zsh/bash, local or remote — and cd/export/set -e cannot leak into or kill the session; the feedback scenario 'set -e + failing probe closed my SSH connection' cannot happen). Pass subshell=false to run IN the session shell so state persists (cd/export) — that mode needs a POSIX-ish shell (bash/zsh/dash, not fish). A command that does not complete comes back with pending:true, its tracker id, the LIVE RENDERED SCREEN, alt_screen, output_idle_ms and interactive_prompt — and when the output goes quiet behind something that looks like a question (apt's [Y/n], a password ask, a needrestart dialog) the call returns EARLY with interactive_prompt:true instead of burning the timeout: answer via term_send_text/term_send_keys, then term_exec_wait picks up the completion. The tracker survives client-side timeouts and aborted tool calls — term_exec_wait always reattaches; never resend. Not for fully interactive programs (editors, REPLs) — use term_send_text/term_send_keys for those.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"subshell":{"type":"boolean","description":"Default true (isolated, dialect-independent). false = run in the session shell itself: state persists, POSIX shells only"},"noninteractive":{"type":"boolean","description":"Export DEBIAN_FRONTEND=noninteractive + debconf/needrestart/apt-listchanges equivalents for THIS command only (package-manager runs that must not prompt). Needs the default isolated transport."},"output_file":{"type":"string","description":"Write the FULL untruncated output to this absolute LOCAL path; the inline reply keeps a short tail (large diagnostic dumps)"},"timeout_ms":{"type":"integer","description":"Default 30000, clamped to 120000 — for longer commands keep calling term_exec_wait"}},"required":["command"]}},
+    \\{"name":"term_exec","description":"Run one command inside a LIVE interactive shell (including a persistent SSH session from term_open host) and get STRUCTURED results: exact exit_status and the exact output between sentinel markers, independent of shell integration. By default the command runs ISOLATED in a fresh `sh` (works typed into any shell dialect — fish/zsh/bash, local or remote — and cd/export/set -e cannot leak into or kill the session; the feedback scenario 'set -e + failing probe closed my SSH connection' cannot happen). Pass subshell=false to run IN the session shell so state persists (cd/export) — that mode needs a POSIX-ish shell (bash/zsh/dash, not fish). A command that does not complete comes back with pending:true, its tracker id, the LIVE RENDERED SCREEN, alt_screen, output_idle_ms and interactive_prompt — and when the output goes quiet behind something that looks like a question (apt's [Y/n], a password ask, a needrestart dialog) the call returns EARLY with interactive_prompt:true instead of burning the timeout: answer via term_send_text/term_send_keys, then term_exec_wait picks up the completion. The tracker survives client-side timeouts and aborted tool calls — term_exec_wait always reattaches; never resend. Not for fully interactive programs (editors, REPLs) — use term_send_text/term_send_keys for those.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"subshell":{"type":"boolean","description":"Default true (isolated, dialect-independent). false = run in the session shell itself: state persists, POSIX shells only"},"noninteractive":{"type":"boolean","description":"Export DEBIAN_FRONTEND=noninteractive + debconf/needrestart/apt-listchanges equivalents for THIS command only (package-manager runs that must not prompt). Needs the default isolated transport."},"output_file":{"type":"string","description":"Write the FULL untruncated output to this absolute LOCAL path; the inline reply keeps a short tail (large diagnostic dumps)"},"timeout_ms":{"type":"integer","description":"Default 30000, clamped to 120000 — for longer commands keep calling term_exec_wait"},"shell":{"type":"string","description":"Interpreter for the command file (e.g. bash for pipefail/array semantics; default sh). Needs the default isolated transport. The command travels inside a temp script, never on a process command line (ps/pgrep stay clean)"}},"required":["command"]}},
     \\{"name":"term_exec_wait","description":"Continue waiting for a pending term_exec without resending — always attachable, including after a client-side tool timeout or abort. Same structured reply as term_exec (pending replies carry the live screen, interactive_prompt and the tracker id; returns early when the command is visibly waiting for input).","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000, clamped to 120000"},"output_file":{"type":"string","description":"Write the full output to this absolute local path on completion"}}}},
     \\{"name":"term_wait_exit","description":"Wait until a headless terminal's child PROCESS exits (distinct from output idleness — a silent scp can be running while output is idle, and an exited one can leave a stale progress frame). Returns the real exit status and the final screen tail.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"}}}},
     \\{"name":"upload_file","description":"Copy a LOCAL file to a host with integrity + atomicity built in: scp to a staged temp file, remote SHA-256 verify against the local hash, then an atomic mv into place (a corrupt transfer is discarded, never half-written). The staged name PRESERVES the extension (x.service → x.sketerm-part.service) so suffix-sensitive validators accept it, and 'verify_command' runs a remote check against the staged file BEFORE the move ({} = the staged path, appended if absent; nonzero exit = upload discarded, destination untouched — e.g. \"systemd-analyze verify {}\"). Omit 'host' for a checksummed atomic local copy. Requires key/agent SSH auth (BatchMode).","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box); omit = local copy"},"local_path":{"type":"string"},"remote_path":{"type":"string","description":"Destination path (on the host, or locally when host is omitted)"},"verify_command":{"type":"string","description":"Remote validation run against the staged file before the atomic move; {} substitutes the staged path"},"timeout_ms":{"type":"integer","description":"scp budget, default 120000"}},"required":["local_path","remote_path"]}},
@@ -961,12 +961,15 @@ const TOOLS_JSON_RAW =
     \\{"name":"browser_info","description":"Current URL, title, readyState, scroll position and viewport of a browser_open app — confirm soft navigations without reading the address bar pixels.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"browser_navigate","description":"Navigate a browser_open app: a URL (https:// assumed when schemeless), or \"back\"/\"forward\"/\"reload\". Waits for document readyState complete (bounded) and returns the landed URL + title.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"url":{"type":"string"},"timeout_ms":{"type":"integer","description":"Load wait, default 20000"}},"required":["url"]}},
     \\{"name":"browser_read","description":"Read the page as DATA instead of pixels: format text (rendered innerText, default), html (outerHTML) or links (anchor list with hrefs). Scope with a CSS 'selector'. The reply is prefixed with the page URL + title.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"format":{"type":"string","enum":["text","html","links"]},"selector":{"type":"string","description":"CSS selector to scope the read (omit = whole page)"},"max_chars":{"type":"integer","description":"Default 20000"},"timeout_ms":{"type":"integer"}}}},
-    \\{"name":"browser_elements","description":"List VISIBLE interactive elements (links, buttons, inputs, menu items ...) with their text and viewport-CSS-pixel centers — the map for browser_click/browser_fill targeting. Filter with 'selector' (CSS) and/or 'text' (substring of text/aria-label/placeholder).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text":{"type":"string"},"timeout_ms":{"type":"integer"}}}},
-    \\{"name":"browser_click","description":"Click a page element by CSS 'selector' and/or visible 'text' (tightest text match first; 'nth' disambiguates): scrolls it into view, then dispatches a TRUSTED click via CDP at its center. Alternatively pass explicit viewport x/y. Reports what was clicked and where the page is afterwards (catches navigations).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text":{"type":"string","description":"Visible text / aria-label / placeholder substring"},"nth":{"type":"integer","description":"Which match (0-based, default 0)"},"button":{"type":"integer","description":"1 left (default), 2 middle, 3 right"},"clicks":{"type":"integer","description":"1 single (default), 2 double"},"x":{"type":"number","description":"Explicit viewport CSS x (with y; skips element lookup)"},"y":{"type":"number"},"timeout_ms":{"type":"integer"}}}},
-    \\{"name":"browser_fill","description":"Fill a form field: locate by CSS 'selector' or 'text_label' (placeholder/label/aria text), focus, select-all, then type the value as TRUSTED input (frameworks see real events). <select> dropdowns pick the option matching the value. enter=true presses Enter after. Reads the field back for confirmation — password fields report only the character count, never the value.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text_label":{"type":"string"},"value":{"type":"string"},"nth":{"type":"integer"},"enter":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["value"]}},
-    \\{"name":"browser_wait","description":"Wait until the page reaches a state: 'selector' visible, 'text' present in the page, 'url_contains' matches, and/or 'gone' (selector absent/hidden). Combine freely; all given conditions must hold. On timeout the reply is an ERROR that says which condition failed and where the page currently is — a timeout can never read as success.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text":{"type":"string"},"url_contains":{"type":"string"},"gone":{"type":"string","description":"CSS selector that must be absent/hidden (spinners, modals)"},"timeout_ms":{"type":"integer","description":"Default 15000"}}}},
+    \\{"name":"browser_elements","description":"List VISIBLE interactive elements with their text and viewport-CSS-pixel centers — the map for browser_click/browser_fill targeting. Traverses OPEN SHADOW ROOTS (custom elements like pl-input/pl-switch are listed, including their inner control's name/value/checked state, computed role, associated label, aria-expanded/disabled and select options). Filter with 'selector' (CSS) and/or 'text' (substring of text/label/aria/placeholder).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text":{"type":"string"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"browser_click","description":"Click a page element by CSS 'selector' and/or visible 'text' (tightest text match first; 'nth' disambiguates): scrolls it into view, then dispatches a TRUSTED click via CDP at its center. Alternatively pass explicit viewport x/y. Element lookup pierces open shadow roots. Reports what was clicked and where the page is afterwards; an unfinished load is flagged navigation_pending (never silently reported as the final page), a URL change is reported as navigated. wait_navigation=true blocks (bounded by nav_timeout_ms) until the resulting document finishes loading — use it when the click submits a long-running form.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text":{"type":"string","description":"Visible text / label / aria / placeholder substring"},"nth":{"type":"integer","description":"Which match (0-based, default 0)"},"button":{"type":"integer","description":"1 left (default), 2 middle, 3 right"},"clicks":{"type":"integer","description":"1 single (default), 2 double"},"x":{"type":"number","description":"Explicit viewport CSS x (with y; skips element lookup)"},"y":{"type":"number"},"wait_navigation":{"type":"boolean","description":"After the click, wait until the document finishes loading before reporting"},"nav_timeout_ms":{"type":"integer","description":"wait_navigation budget, default 15000"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"browser_fill","description":"Fill a form field: locate by CSS 'selector' or 'text_label' (placeholder/label/aria text — matching a custom element's label finds its editable input through the OPEN SHADOW ROOT, e.g. text_label 'Email' fills the input inside <pl-input>), focus, select-all, then type the value as TRUSTED input (frameworks see real events). <select> dropdowns pick the option matching the value (custom dropdowns: use browser_choose). enter=true presses Enter after. Reads the field back for confirmation — password fields report only the character count; when a submit detached the field or started a navigation the reply says so (field_detached_after_submit / navigation_started) instead of reporting a misleading empty value.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text_label":{"type":"string"},"value":{"type":"string"},"nth":{"type":"integer"},"enter":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["value"]}},
+    \\{"name":"browser_wait","description":"Wait until the page reaches a state: 'selector' visible, 'text' present, a URL condition, 'gone' (selector absent/hidden), and/or 'network_idle' (no requests in flight and none for 500ms — catches slow form submissions/XHR). URL matching: url_contains (substring — beware /admin/certificates also matching /admin/certificates-request), url_exact (whole href), url_path (exact location.pathname), url_regex (JS RegExp on the href). Combine freely; ALL given conditions must hold. On timeout the reply is an ERROR that says which condition failed and where the page currently is — a timeout can never read as success.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text":{"type":"string"},"url_contains":{"type":"string"},"url_exact":{"type":"string"},"url_path":{"type":"string","description":"Exact pathname, e.g. /admin/certificates"},"url_regex":{"type":"string"},"gone":{"type":"string","description":"CSS selector that must be absent/hidden (spinners, modals)"},"network_idle":{"type":"boolean"},"timeout_ms":{"type":"integer","description":"Default 15000"}}}},
     \\{"name":"browser_scroll","description":"DETERMINISTIC page scrolling: to \"top\"/\"bottom\", a CSS 'selector' into view (block center), an absolute 'y', or a relative 'dy' in CSS pixels — no wheel-delta guessing. Returns the resulting scroll position and document height.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"to":{"type":"string","enum":["top","bottom"]},"selector":{"type":"string"},"y":{"type":"integer"},"dy":{"type":"integer"}}}},
-    \\{"name":"browser_eval","description":"Evaluate JavaScript in the page (awaits promises, returns the value as JSON). The escape hatch when the structured browser tools don't cover it.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"js":{"type":"string"},"timeout_ms":{"type":"integer","description":"Default 10000"}},"required":["js"]}}
+    \\{"name":"browser_eval","description":"Evaluate JavaScript in the page (awaits promises, returns the value as JSON). The escape hatch when the structured browser tools don't cover it.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"js":{"type":"string"},"timeout_ms":{"type":"integer","description":"Default 10000"}},"required":["js"]}},
+    \\{"name":"browser_form_state","description":"One-call FORM inventory, traversing open shadow roots: every form control (native inputs/selects/textareas, ARIA-role widgets, and custom elements like pl-input/pl-select/pl-switch wrapping a shadow control) with its name, id, computed label, type/role, current value (password fields: character count only), checked state, select/listbox options with the selected one marked, disabled/required, the browser's validationMessage, the inner shadow input's name, the owning form, visibility and click center. THE tool for understanding and verifying custom-element forms — call it before and after filling instead of poking with browser_eval.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string","description":"Scope to the first match of this CSS selector (e.g. a form or dialog); omit = whole page"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"browser_choose","description":"Pick an option in ANY dropdown-ish control by its text or value: native <select> (chosen directly with input+change events), a custom element wrapping a shadow <select>, or an ARIA combobox / open-shadow custom dropdown (pl-select) — those get a trusted click to open, a shadow-piercing poll for the appearing [role=option]/option items, and a trusted click on the matching one, then read the control back. Locate the control by CSS 'selector' or visible/label 'text'. On failure the reply lists the option texts that WERE visible.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"selector":{"type":"string"},"text":{"type":"string","description":"Control label/visible text (like browser_fill text_label)"},"value":{"type":"string","description":"Option text or value to pick (exact match first, then substring)"},"nth":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Budget for the options to appear, default 8000"}},"required":["value"]}},
+    \\{"name":"browser_network","description":"Structured network inspection (Playwright-style): the requests the page made — method, URL, status, resource type, mime, redirect count, failure reason (TLS/DNS/abort), in_flight state, and the request-body FIELD NAMES (values are never captured — secrets stay out of the log). Capture is on from browser_open; the log keeps the last 300 requests. Filter with 'filter' (URL substring), page with 'limit', reset with clear=true. Diagnose form submissions, redirect chains and hung XHRs without leaving the browser tool family.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"filter":{"type":"string"},"limit":{"type":"integer","description":"Max requests returned (default 30, newest kept)"},"clear":{"type":"boolean"}}}}
     \\]
 ;
 
@@ -3657,6 +3660,30 @@ fn execResultJson(arena: std.mem.Allocator, r: termdrive.ExecOutcome, t: *termdr
     return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
 }
 
+/// A safe interpreter name/path for term_exec's `shell` option: it is
+/// interpolated into the transport script, so it must not carry shell
+/// metacharacters.
+fn validShellName(s: []const u8) bool {
+    if (s.len == 0 or s.len > 64) return false;
+    if (std.mem.indexOf(u8, s, "..") != null) return false;
+    for (s) |ch| {
+        const ok = std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '_' or ch == '-' or ch == '/';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+test "validShellName" {
+    const t = std.testing;
+    try t.expect(validShellName("bash"));
+    try t.expect(validShellName("/usr/bin/zsh"));
+    try t.expect(validShellName("busybox-sh"));
+    try t.expect(!validShellName(""));
+    try t.expect(!validShellName("bash; rm -rf /"));
+    try t.expect(!validShellName("bash $(x)"));
+    try t.expect(!validShellName("../../bin/sh"));
+}
+
 /// Write bytes to an absolute local path; false on any failure.
 fn writeFileBytes(path: []const u8, bytes: []const u8) bool {
     var pbuf: [4096]u8 = undefined;
@@ -3810,6 +3837,13 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         const noninteractive = argBool(args, "noninteractive");
         if (noninteractive and !subshell)
             return appErr(arena, "'noninteractive' needs the default isolated transport (drop subshell:false)");
+        const shell = argStr(args, "shell");
+        if (shell) |sh| {
+            if (!subshell)
+                return appErr(arena, "'shell' needs the default isolated transport (drop subshell:false)");
+            if (!validShellName(sh))
+                return appErr(arena, "invalid 'shell' (a command name or absolute path: letters, digits, . _ - / only)");
+        }
         if (t.hasPendingExec()) {
             // A previously timed-out exec may have finished since;
             // resolve it silently so the new send is accepted.
@@ -3819,7 +3853,7 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         }
         if (t.hasPendingCommand())
             return appErr(arena, "a term_run wait_for=command command is still tracked; resolve it with term_wait_command first");
-        const r = t.execCommand(cmd, subshell, noninteractive, timeout_ms) catch |err| return appErr(arena, switch (err) {
+        const r = t.execCommand(cmd, subshell, noninteractive, shell, timeout_ms) catch |err| return appErr(arena, switch (err) {
             termdrive.Error.NotConnected => "terminal exited",
             else => "exec failed",
         });
@@ -4598,18 +4632,33 @@ fn browserPageInfo(arena: std.mem.Allocator, bs: *BrowserSession, timeout_ms: i6
     return .{ .url = url, .title = title, .ready = ready };
 }
 
+/// Shared JS helpers injected ahead of every element script. deepQuery
+/// pierces OPEN shadow roots (custom-element UIs like pl-input);
+/// labelText computes an element's accessible label incl. its shadow
+/// host's text. Plain constant (inserted via {s}) so its braces never
+/// meet std.fmt.
+const JS_HELPERS: []const u8 =
+    \\let badSelector = false;
+    \\const deepQuery = s => { const out = []; const walk = root => { let m = []; try { m = root.querySelectorAll(s); } catch (e) { badSelector = true; return; } out.push(...m); for (const el of root.querySelectorAll('*')) if (el.shadowRoot) walk(el.shadowRoot); }; walk(document); return out; };
+    \\const labelText = e => { let t = ''; try { if (e.labels) for (const l of e.labels) t += ' ' + (l.innerText || ''); const al = e.getAttribute('aria-label'); if (al) t += ' ' + al; const alb = e.getAttribute('aria-labelledby'); if (alb) for (const id of alb.split(/\s+/)) { const rn = e.getRootNode(); const lr = (rn.getElementById ? rn.getElementById(id) : null) || document.getElementById(id); if (lr) t += ' ' + (lr.innerText || ''); } const host = e.getRootNode().host; if (host) { t += ' ' + (host.innerText || '').slice(0, 200); const hal = host.getAttribute('aria-label'); if (hal) t += ' ' + hal; } if (!t.trim() && e.shadowRoot) { const sl = e.shadowRoot.querySelector('label'); if (sl) t = sl.innerText || ''; } if (!t.trim() && host) { const rn2 = e.getRootNode(); const sl2 = rn2.querySelector ? rn2.querySelector('label') : null; if (sl2) t = sl2.innerText || ''; } } catch (err) {} return t; };
+    \\const vis = e => { const r = e.getBoundingClientRect(); if (r.width <= 0 || r.height <= 0) return false; const s = getComputedStyle(e); return s.visibility !== 'hidden' && s.display !== 'none'; };
+    \\const activeDeep = () => { let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; return a; };
+;
+
 /// The shared element finder: selector and/or visible-text filter over
-/// interactive elements; tightest text match first.
+/// interactive elements (shadow-root piercing); tightest text match
+/// first. Custom-element hosts wrapping a native control are included
+/// when no selector is given.
 fn elementFinderJs(arena: std.mem.Allocator, selector: ?[]const u8, text: ?[]const u8) ![]const u8 {
     return std.fmt.allocPrint(arena,
         \\const sel = {s}; const txt = {s};
-        \\let els; let badSelector = false;
-        \\try {{ els = sel ? Array.from(document.querySelectorAll(sel)) : Array.from(document.querySelectorAll("a,button,input,select,textarea,summary,[role='button'],[role='link'],[role='tab'],[role='menuitem'],[role='option'],[role='checkbox'],[role='radio'],[onclick],label")); }}
-        \\catch (e) {{ els = []; badSelector = true; }}
-        \\const vis = e => {{ const r = e.getBoundingClientRect(); if (r.width <= 0 || r.height <= 0) return false; const s = getComputedStyle(e); return s.visibility !== 'hidden' && s.display !== 'none'; }};
+        \\{s}
+        \\let els;
+        \\if (sel) els = deepQuery(sel);
+        \\else {{ els = deepQuery("a,button,input,select,textarea,summary,[role='button'],[role='link'],[role='tab'],[role='menuitem'],[role='option'],[role='checkbox'],[role='radio'],[role='switch'],[role='combobox'],[onclick],label"); for (const h of deepQuery('*')) if (h.tagName.includes('-') && h.shadowRoot && h.shadowRoot.querySelector('input,select,textarea,button')) els.push(h); els = [...new Set(els)]; }}
         \\els = els.filter(vis);
-        \\if (txt) {{ const q = txt.toLowerCase(); els = els.filter(e => ((e.innerText || '') + ' ' + (e.value || '') + ' ' + (e.getAttribute('aria-label') || '') + ' ' + (e.getAttribute('placeholder') || '') + ' ' + (e.getAttribute('title') || '')).toLowerCase().includes(q)); els.sort((a, b) => ((a.innerText || '').length) - ((b.innerText || '').length)); }}
-    , .{ try jsStr(arena, selector), try jsStr(arena, text) });
+        \\if (txt) {{ const q = txt.toLowerCase(); els = els.filter(e => ((e.innerText || '') + ' ' + (e.value || '') + ' ' + labelText(e) + ' ' + (e.getAttribute('placeholder') || '') + ' ' + (e.getAttribute('title') || '')).toLowerCase().includes(q)); els.sort((a, b) => ((a.innerText || '').length) - ((b.innerText || '').length)); }}
+    , .{ try jsStr(arena, selector), try jsStr(arena, text), JS_HELPERS });
 }
 
 fn browserErrOr(arena: std.mem.Allocator, out: BEvalOut) !?[]const u8 {
@@ -4711,6 +4760,9 @@ fn browserTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             };
             break;
         }
+        // Capture network traffic from the first request on: powers
+        // browser_network and browser_wait network_idle.
+        bs.client.enableNetwork(5_000) catch {};
         // Best-effort: let the initial page settle.
         attach_deadline = monoMs() + 8_000;
         while (monoMs() < attach_deadline) {
@@ -4841,7 +4893,27 @@ fn browserTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         const js = try std.fmt.allocPrint(arena,
             \\(() => {{ {s}
             \\if (badSelector) return 'bad selector';
-            \\return JSON.stringify(els.slice(0, 100).map((e, i) => {{ const r = e.getBoundingClientRect(); return {{n: i, tag: e.tagName.toLowerCase(), text: ((e.innerText || e.value || e.getAttribute('aria-label') || e.getAttribute('placeholder') || '').trim()).slice(0, 100), x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), w: Math.round(r.width), h: Math.round(r.height), href: e.href || undefined, type: e.type || undefined}}; }})); }})()
+            \\const implicit = el => ({{A: 'link', BUTTON: 'button', SELECT: 'combobox', TEXTAREA: 'textbox', LABEL: 'label', SUMMARY: 'button', INPUT: el.type === 'checkbox' ? 'checkbox' : el.type === 'radio' ? 'radio' : el.type === 'range' ? 'slider' : 'textbox'}})[el.tagName];
+            \\return JSON.stringify(els.slice(0, 100).map((e, i) => {{
+            \\const r = e.getBoundingClientRect();
+            \\const inner = e.shadowRoot ? e.shadowRoot.querySelector('input,select,textarea') : null;
+            \\const val = e.value !== undefined ? e.value : (inner ? inner.value : undefined);
+            \\const secret = e.type === 'password' || (inner && inner.type === 'password');
+            \\const chk = e.checked !== undefined ? e.checked : (inner && inner.checked !== undefined ? inner.checked : (e.getAttribute('aria-checked') ? e.getAttribute('aria-checked') === 'true' : undefined));
+            \\const oel = e.tagName === 'SELECT' ? e : (inner && inner.tagName === 'SELECT' ? inner : null);
+            \\return {{n: i, tag: e.tagName.toLowerCase(),
+            \\role: e.getAttribute('role') || implicit(e) || (e.tagName.includes('-') ? 'custom' : undefined),
+            \\text: ((e.innerText || e.value || e.getAttribute('aria-label') || e.getAttribute('placeholder') || '').trim()).slice(0, 100),
+            \\label: labelText(e).trim().slice(0, 80) || undefined,
+            \\x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), w: Math.round(r.width), h: Math.round(r.height),
+            \\href: e.href || undefined, type: e.type || (inner ? inner.type : undefined) || undefined,
+            \\name: e.name || e.getAttribute('name') || (inner ? inner.name : undefined) || undefined,
+            \\value: secret ? (val && String(val).length ? '(secret: ' + String(val).length + ' chars)' : undefined) : (val !== undefined && val !== null && String(val).length ? String(val).slice(0, 60) : undefined),
+            \\checked: chk,
+            \\disabled: e.disabled || (inner && inner.disabled) || e.getAttribute('aria-disabled') === 'true' || undefined,
+            \\expanded: e.getAttribute('aria-expanded') ? e.getAttribute('aria-expanded') === 'true' : undefined,
+            \\options: oel ? Array.from(oel.options).slice(0, 20).map(o => o.text.slice(0, 40)) : undefined,
+            \\shadow: e.shadowRoot ? true : undefined}}; }})); }})()
         , .{finder});
         const out = bEval(arena, bs, js, argInt(args, "timeout_ms") orelse 10_000);
         if (try browserErrOr(arena, out)) |e| return e;
@@ -4907,15 +4979,36 @@ fn browserTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             else => "left",
         };
         const clicks: u32 = @intCast(std.math.clamp(argInt(args, "clicks") orelse 1, 1, 3));
+        const pre_url: ?[]const u8 = if (browserPageInfo(arena, bs, 3_000)) |pre| pre.url else null;
         bs.client.clickAt(arena, cx, cy, button, clicks, 8_000) catch |err| return appErr(arena, switch (err) {
             cdp.Error.Timeout => "the click was sent but the page did not acknowledge in time",
             else => "click dispatch failed (DevTools connection lost?)",
         });
         _ = app.waitIdle(200, 2_000);
         var msg = try std.fmt.allocPrint(arena, "clicked {s}", .{desc});
-        // Navigation may follow a click: report where we landed.
-        if (browserPageInfo(arena, bs, 3_000)) |info| {
-            msg = try std.fmt.allocPrint(arena, "{s}\npage: {s}{s}{s} ({s})", .{ msg, info.url, if (info.title.len > 0) " — " else "", info.title, info.ready });
+        // Navigation may follow a click: report where we landed, and
+        // never let an intermediate state read as the final one —
+        // ready != complete is flagged as navigation_pending, and
+        // wait_navigation=true blocks (bounded) until the load ends.
+        var info = browserPageInfo(arena, bs, 3_000);
+        if (argBool(args, "wait_navigation")) {
+            const nav_deadline = monoMs() + (argInt(args, "nav_timeout_ms") orelse 15_000);
+            while (monoMs() < nav_deadline) {
+                if (info) |i| {
+                    if (eql(u8, i.ready, "complete")) break;
+                }
+                sleepMsLocal(300);
+                info = browserPageInfo(arena, bs, 3_000);
+            }
+        }
+        if (info) |i| {
+            msg = try std.fmt.allocPrint(arena, "{s}\npage: {s}{s}{s} ({s})", .{ msg, i.url, if (i.title.len > 0) " — " else "", i.title, i.ready });
+            if (pre_url != null and !eql(u8, pre_url.?, i.url))
+                msg = try std.fmt.allocPrint(arena, "{s}\nnavigated: {s} -> {s}", .{ msg, pre_url.?, i.url });
+            if (!eql(u8, i.ready, "complete"))
+                msg = try std.fmt.allocPrint(arena, "{s}\nnavigation_pending: the document is still loading — this URL/title may be an intermediate state (browser_wait url_path/selector, or browser_click wait_navigation=true)", .{msg});
+        } else {
+            msg = try std.fmt.allocPrint(arena, "{s}\nnavigation_pending: the page is not answering yet (target being replaced?) — verify with browser_info/browser_wait", .{msg});
         }
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
@@ -4930,10 +5023,11 @@ fn browserTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         const js = try std.fmt.allocPrint(arena,
             \\(() => {{ {s}
             \\if (badSelector) return {{bad: true}};
-            \\els = els.filter(e => e.matches('input,textarea,select,[contenteditable]') || e.querySelector('input,textarea,select'));
+            \\const q = 'input,textarea,select,[contenteditable]';
+            \\const resolve = e => {{ if (e.matches(q)) return e; if (e.tagName === 'LABEL' && e.control) return e.control; let m = e.querySelector('input,textarea,select'); if (m) return m; if (e.shadowRoot) {{ m = e.shadowRoot.querySelector('input,textarea,select'); if (m) return m; }} const host = e.getRootNode().host; if (host && host.shadowRoot) {{ m = host.shadowRoot.querySelector('input,textarea,select'); if (m) return m; }} return null; }};
+            \\els = els.filter(e => resolve(e));
             \\let el = els[{d}]; if (!el) return {{found: els.length}};
-            \\if (!el.matches('input,textarea,select,[contenteditable]')) el = el.querySelector('input,textarea,select');
-            \\if (!el) return {{found: 0}};
+            \\el = resolve(el);
             \\el.scrollIntoView({{block: 'center'}});
             \\el.focus();
             \\if (el.tagName === 'SELECT') return {{tag: 'select'}};
@@ -4956,7 +5050,7 @@ fn browserTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         if (eql(u8, tag.?, "select")) {
             // Dropdowns: choose the option whose text or value matches.
             const sel_js = try std.fmt.allocPrint(arena,
-                \\(() => {{ const el = document.activeElement; if (!el || el.tagName !== 'SELECT') return 'lost focus';
+                \\(() => {{ let el = document.activeElement; while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement; if (!el || el.tagName !== 'SELECT') return 'lost focus';
                 \\const want = {s}.toLowerCase();
                 \\const idx = Array.from(el.options).findIndex(o => o.value.toLowerCase() === want || o.text.toLowerCase().includes(want));
                 \\if (idx < 0) return 'no option matching';
@@ -4976,61 +5070,120 @@ fn browserTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
                 else => "typing failed (DevTools connection lost?)",
             });
         }
+        const pre_url: ?[]const u8 = if (browserPageInfo(arena, bs, 3_000)) |pre| try arena.dupe(u8, pre.url) else null;
         if (argBool(args, "enter")) {
             _ = bs.client.call(arena, "Input.dispatchKeyEvent", "{\"type\":\"keyDown\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13,\"nativeVirtualKeyCode\":13,\"text\":\"\\r\"}", 5_000) catch {};
             _ = bs.client.call(arena, "Input.dispatchKeyEvent", "{\"type\":\"keyUp\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13,\"nativeVirtualKeyCode\":13}", 5_000) catch {};
             _ = app.waitIdle(200, 2_000);
         }
-        // Read back what the field now holds (secrets excepted).
-        const verify = bEval(arena, bs, "(() => { const el = document.activeElement; if (!el) return null; if (el.type === 'password') return '(password field: ' + (el.value || '').length + ' chars)'; return ((el.isContentEditable ? el.textContent : el.value) || '').slice(0, 120); })()", 5_000);
-        const now_holds: []const u8 = switch (verify) {
+        // Read back what the field now holds (secrets excepted). A
+        // submit can detach the field or replace the page — report
+        // THAT instead of a misleading empty value.
+        const verify_js = try std.fmt.allocPrint(arena,
+            \\(() => {{ {s}
+            \\const a = activeDeep();
+            \\if (!a || a === document.body) return {{state: 'unfocused'}};
+            \\if (!a.isConnected) return {{state: 'detached'}};
+            \\if (a.type === 'password') return {{state: 'ok', secret_len: (a.value || '').length}};
+            \\return {{state: 'ok', value: ((a.isContentEditable ? a.textContent : a.value) || '').slice(0, 120)}}; }})()
+        , .{JS_HELPERS});
+        const verify = bEval(arena, bs, verify_js, 5_000);
+        var now_holds: []const u8 = "?";
+        var nav_note: []const u8 = "";
+        switch (verify) {
             .val => |v| blk: {
-                const pv = std.json.parseFromSliceLeaky(std.json.Value, arena, v orelse "null", .{}) catch break :blk "?";
-                break :blk if (pv == .string) pv.string else "?";
+                const pv = std.json.parseFromSliceLeaky(std.json.Value, arena, v orelse "null", .{}) catch break :blk;
+                if (pv != .object) break :blk;
+                const state = if (pv.object.get("state")) |s| (if (s == .string) s.string else "") else "";
+                if (eql(u8, state, "ok")) {
+                    if (pv.object.get("secret_len")) |sl| {
+                        if (sl == .integer) now_holds = try std.fmt.allocPrint(arena, "(password field: {d} chars)", .{sl.integer});
+                    } else if (pv.object.get("value")) |val| {
+                        if (val == .string) now_holds = val.string;
+                    }
+                } else if (eql(u8, state, "detached")) {
+                    now_holds = "(field_detached_after_submit: the element left the document — the form was likely submitted)";
+                } else {
+                    now_holds = "(field no longer focused — a submit/navigation probably moved focus)";
+                }
             },
-            .err => "?",
-        };
-        const msg = try std.fmt.allocPrint(arena, "filled <{s}>{s}; field now holds: {s}", .{ tag.?, if (argBool(args, "enter")) ", pressed Enter" else "", now_holds });
+            .err => now_holds = "(unreadable: the DevTools target was replaced — navigation_started)",
+        }
+        if (browserPageInfo(arena, bs, 3_000)) |info| {
+            if (pre_url != null and !eql(u8, pre_url.?, info.url)) {
+                nav_note = try std.fmt.allocPrint(arena, "\nnavigation_started: {s} -> {s} ({s})", .{ pre_url.?, info.url, info.ready });
+            } else if (!eql(u8, info.ready, "complete")) {
+                nav_note = try std.fmt.allocPrint(arena, "\nnavigation_pending: document readyState is {s}", .{info.ready});
+            }
+        }
+        const msg = try std.fmt.allocPrint(arena, "filled <{s}>{s}; field now holds: {s}{s}", .{ tag.?, if (argBool(args, "enter")) ", pressed Enter" else "", now_holds, nav_note });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "browser_wait")) {
         const selector = argStr(args, "selector");
         const text = argStr(args, "text");
         const url_contains = argStr(args, "url_contains");
+        const url_exact = argStr(args, "url_exact");
+        const url_path = argStr(args, "url_path");
+        const url_regex = argStr(args, "url_regex");
         const gone = argStr(args, "gone");
+        const net_idle = argBool(args, "network_idle");
         const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 15_000;
-        if (selector == null and text == null and url_contains == null and gone == null)
-            return appErr(arena, "browser_wait needs at least one of: selector, text, url_contains, gone");
+        if (selector == null and text == null and url_contains == null and url_exact == null and
+            url_path == null and url_regex == null and gone == null and !net_idle)
+            return appErr(arena, "browser_wait needs at least one of: selector, text, url_contains, url_exact, url_path, url_regex, gone, network_idle");
+        if (net_idle and !bs.client.net_enabled)
+            bs.client.enableNetwork(5_000) catch return appErr(arena, "network_idle needs DevTools network capture, which could not be enabled");
         const cond_js = try std.fmt.allocPrint(arena,
             \\(() => {{
-            \\const sel = {s}, txt = {s}, urlsub = {s}, gone = {s};
+            \\const sel = {s}, txt = {s}, urlsub = {s}, urlx = {s}, urlp = {s}, urlre = {s}, gone = {s};
             \\let ok = true; const why = [];
             \\if (sel) {{ let m = null; try {{ m = document.querySelector(sel); }} catch (e) {{ return 'bad selector'; }} const visible = m && m.getBoundingClientRect().width > 0; if (!visible) {{ ok = false; why.push('selector not visible'); }} }}
             \\if (txt && !(document.body.innerText || '').toLowerCase().includes(txt.toLowerCase())) {{ ok = false; why.push('text not visible'); }}
             \\if (urlsub && !location.href.includes(urlsub)) {{ ok = false; why.push('url does not contain it'); }}
+            \\if (urlx && location.href !== urlx) {{ ok = false; why.push('url is ' + location.href); }}
+            \\if (urlp && location.pathname !== urlp) {{ ok = false; why.push('pathname is ' + location.pathname); }}
+            \\if (urlre) {{ let re = null; try {{ re = new RegExp(urlre); }} catch (e) {{ return 'bad regex'; }} if (!re.test(location.href)) {{ ok = false; why.push('url does not match the regex (is ' + location.href + ')'); }} }}
             \\if (gone) {{ let m = null; try {{ m = document.querySelector(gone); }} catch (e) {{ return 'bad selector'; }} if (m && m.getBoundingClientRect().width > 0) {{ ok = false; why.push('element still present'); }} }}
             \\return ok ? 'ok' : why.join('; ');
             \\}})()
-        , .{ try jsStr(arena, selector), try jsStr(arena, text), try jsStr(arena, url_contains), try jsStr(arena, gone) });
+        , .{ try jsStr(arena, selector), try jsStr(arena, text), try jsStr(arena, url_contains), try jsStr(arena, url_exact), try jsStr(arena, url_path), try jsStr(arena, url_regex), try jsStr(arena, gone) });
         const deadline = monoMs() + timeout_ms;
         var last_why: []const u8 = "condition never evaluated";
         while (true) {
+            var js_ok = false;
             const out = bEval(arena, bs, cond_js, 5_000);
             switch (out) {
                 .val => |v| {
                     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, v orelse "null", .{}) catch std.json.Value{ .null = {} };
                     if (parsed == .string) {
                         if (eql(u8, parsed.string, "ok")) {
-                            var msg: []const u8 = "condition met";
-                            if (browserPageInfo(arena, bs, 3_000)) |info|
-                                msg = try std.fmt.allocPrint(arena, "condition met\npage: {s}{s}{s}", .{ info.url, if (info.title.len > 0) " — " else "", info.title });
-                            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+                            js_ok = true;
+                        } else {
+                            if (eql(u8, parsed.string, "bad selector")) return appErr(arena, "invalid CSS selector");
+                            if (eql(u8, parsed.string, "bad regex")) return appErr(arena, "invalid url_regex (JavaScript RegExp syntax)");
+                            last_why = parsed.string;
                         }
-                        if (eql(u8, parsed.string, "bad selector")) return appErr(arena, "invalid CSS selector");
-                        last_why = parsed.string;
                     }
                 },
                 .err => |e| last_why = e,
+            }
+            if (js_ok and net_idle) {
+                // Quiet window over CDP Network events: no requests in
+                // flight and none started/finished for 500ms.
+                bs.client.pump(150);
+                const inflight = bs.client.netInFlight();
+                const quiet = monoMs() - bs.client.net_last_ms;
+                if (inflight > 0 or quiet < 500) {
+                    js_ok = false;
+                    last_why = try std.fmt.allocPrint(arena, "network not idle ({d} request(s) in flight, {d}ms since last activity)", .{ inflight, quiet });
+                }
+            }
+            if (js_ok) {
+                var msg: []const u8 = "condition met";
+                if (browserPageInfo(arena, bs, 3_000)) |info|
+                    msg = try std.fmt.allocPrint(arena, "condition met\npage: {s}{s}{s}", .{ info.url, if (info.title.len > 0) " — " else "", info.title });
+                return toolResult(arena, msg, false) orelse error.OutOfMemory;
             }
             if (monoMs() >= deadline) break;
             sleepMsLocal(300);
@@ -5039,6 +5192,270 @@ fn browserTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         if (browserPageInfo(arena, bs, 3_000)) |info|
             fail_msg = try std.fmt.allocPrint(arena, "{s}\ncurrently on: {s}{s}{s}", .{ fail_msg, info.url, if (info.title.len > 0) " — " else "", info.title });
         return toolResult(arena, fail_msg, true) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "browser_form_state")) {
+        const selector = argStr(args, "selector");
+        const js = try std.fmt.allocPrint(arena,
+            \\(() => {{ {s}
+            \\const q = 'input,select,textarea,[contenteditable]';
+            \\const roleSel = "[role='checkbox'],[role='radio'],[role='switch'],[role='combobox'],[role='listbox'],[role='textbox'],[role='slider'],[role='spinbutton']";
+            \\const sel = {s};
+            \\let scope = null;
+            \\if (sel) {{ const m = deepQuery(sel); if (badSelector) return 'bad selector'; if (!m.length) return 'no scope match'; scope = m[0]; }}
+            \\const within = (e, root) => {{ if (!root) return true; let n = e; while (n) {{ if (n === root) return true; n = n.parentNode || n.host; }} return false; }};
+            \\const isHostCtl = h => h.tagName.includes('-') && h.shadowRoot && (h.shadowRoot.querySelector(q) || h.matches(roleSel) || h.shadowRoot.querySelector("[role='option'],[role='switch'],[role='checkbox'],[role='radio']"));
+            \\let ctls = deepQuery(q + ',' + roleSel);
+            \\const hosts = deepQuery('*').filter(isHostCtl);
+            \\const covered = new Set(); hosts.forEach(h => {{ for (const i2 of h.shadowRoot.querySelectorAll(q)) covered.add(i2); }});
+            \\ctls = ctls.filter(e => !covered.has(e));
+            \\const all = [...new Set([...ctls, ...hosts])].filter(e => within(e, scope)).filter(e => e.type !== 'hidden');
+            \\const entry = e => {{
+            \\const inner = e.shadowRoot ? e.shadowRoot.querySelector(q) : null;
+            \\const t = inner || e;
+            \\const type = t.type || e.getAttribute('type') || undefined;
+            \\const secret = type === 'password';
+            \\let value = e.value !== undefined ? e.value : (inner ? inner.value : undefined);
+            \\if (value === undefined && e.isContentEditable) value = e.textContent;
+            \\const checked = e.checked !== undefined ? e.checked : (inner && inner.checked !== undefined ? inner.checked : (e.getAttribute('aria-checked') ? e.getAttribute('aria-checked') === 'true' : undefined));
+            \\let options; const oel = e.tagName === 'SELECT' ? e : (inner && inner.tagName === 'SELECT' ? inner : null);
+            \\if (oel) options = Array.from(oel.options).slice(0, 30).map(o => ({{text: o.text.slice(0, 60), value: o.value.slice(0, 60), selected: o.selected || undefined}}));
+            \\else {{ const ropts = Array.from(e.querySelectorAll("[role='option']")).concat(e.shadowRoot ? Array.from(e.shadowRoot.querySelectorAll("[role='option']")) : []); if (ropts.length) options = ropts.slice(0, 30).map(o => ({{text: (o.innerText || '').trim().slice(0, 60), selected: o.getAttribute('aria-selected') === 'true' || undefined}})); }}
+            \\const fo = t.form || (e.closest ? e.closest('form') : null);
+            \\const r = e.getBoundingClientRect();
+            \\return {{tag: e.tagName.toLowerCase(),
+            \\role: e.getAttribute('role') || undefined,
+            \\name: e.name || e.getAttribute('name') || (inner ? inner.name : undefined) || undefined,
+            \\id: e.id || undefined,
+            \\label: labelText(e).trim().slice(0, 100) || undefined,
+            \\type,
+            \\value: secret ? (value && String(value).length ? '(secret: ' + String(value).length + ' chars)' : '(empty)') : (value !== undefined && value !== null ? String(value).slice(0, 120) : undefined),
+            \\checked, options,
+            \\disabled: e.disabled || (inner && inner.disabled) || e.getAttribute('aria-disabled') === 'true' || undefined,
+            \\required: t.required || e.getAttribute('aria-required') === 'true' || undefined,
+            \\validation: (t.validationMessage && t.validationMessage.slice(0, 120)) || undefined,
+            \\shadow_input: inner ? (inner.name || inner.tagName.toLowerCase()) : undefined,
+            \\form: fo ? (fo.id || fo.getAttribute('name') || '(unnamed form)') : undefined,
+            \\visible: vis(e) || undefined,
+            \\x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)}}; }};
+            \\return JSON.stringify(all.slice(0, 80).map(entry)); }})()
+        , .{ JS_HELPERS, try jsStr(arena, selector) });
+        const out = bEval(arena, bs, js, argInt(args, "timeout_ms") orelse 10_000);
+        if (try browserErrOr(arena, out)) |e| return e;
+        const vj = out.val orelse "[]";
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, vj, .{}) catch
+            return toolResult(arena, vj, false) orelse error.OutOfMemory;
+        if (parsed == .string) {
+            if (eql(u8, parsed.string, "bad selector")) return appErr(arena, "invalid CSS selector");
+            if (eql(u8, parsed.string, "no scope match")) return appErr(arena, "the scope selector matched nothing");
+            return toolResult(arena, try std.fmt.allocPrint(arena, "form state (open shadow roots traversed; password values are counts only; centers valid for browser_click x/y):\n{s}", .{parsed.string}), false) orelse error.OutOfMemory;
+        }
+        return toolResult(arena, vj, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "browser_choose")) {
+        const selector = argStr(args, "selector");
+        const text = argStr(args, "text");
+        const value = argStr(args, "value") orelse return appErr(arena, "browser_choose requires 'value' (the option's text or value)");
+        if (selector == null and text == null)
+            return appErr(arena, "browser_choose needs 'selector' (CSS) or 'text' (control label text)");
+        const nth: i64 = argInt(args, "nth") orelse 0;
+        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 8_000;
+        const finder = try elementFinderJs(arena, selector, text);
+        const js = try std.fmt.allocPrint(arena,
+            \\(() => {{ {s}
+            \\if (badSelector) return {{bad: true}};
+            \\const want = {s}.toLowerCase();
+            \\const chooseNative = el2 => {{ let idx = Array.from(el2.options).findIndex(o => o.value.toLowerCase() === want || o.text.trim().toLowerCase() === want); if (idx < 0) idx = Array.from(el2.options).findIndex(o => o.text.toLowerCase().includes(want)); if (idx < 0) return {{mode: 'native', err: 'no option matching', options: Array.from(el2.options).slice(0, 20).map(o => o.text)}}; el2.selectedIndex = idx; el2.dispatchEvent(new Event('input', {{bubbles: true}})); el2.dispatchEvent(new Event('change', {{bubbles: true}})); return {{mode: 'native', picked: el2.options[idx].text}}; }};
+            \\const selish = e => e.matches('select') || (e.shadowRoot && e.shadowRoot.querySelector('select')) || e.matches("[role='combobox'],[role='listbox']") || e.getAttribute('aria-haspopup') === 'listbox' || e.tagName.includes('-');
+            \\const cands = els.filter(selish);
+            \\const el = (cands.length ? cands : els)[{d}];
+            \\if (!el) return {{found: els.length}};
+            \\if (el.tagName === 'SELECT') return chooseNative(el);
+            \\const inner = el.shadowRoot ? el.shadowRoot.querySelector('select') : null;
+            \\if (inner) return chooseNative(inner);
+            \\el.scrollIntoView({{block: 'center'}});
+            \\const trg = el.shadowRoot ? el.shadowRoot.querySelector("[part*='trigger'],[aria-haspopup],button,[role='button'],[role='combobox']") : null;
+            \\const r = (trg && vis(trg) ? trg : el).getBoundingClientRect();
+            \\return {{mode: 'custom', x: r.x + r.width / 2, y: r.y + r.height / 2, tag: el.tagName.toLowerCase(), now: (el.value !== undefined && el.value !== null ? String(el.value) : (el.innerText || '')).trim().slice(0, 60)}}; }})()
+        , .{ finder, try jsStr(arena, value), nth });
+        const out = bEval(arena, bs, js, 10_000);
+        if (try browserErrOr(arena, out)) |e| return e;
+        const vj = out.val orelse return appErr(arena, "control lookup returned nothing");
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, vj, .{}) catch
+            return appErr(arena, "control lookup returned malformed data");
+        if (parsed != .object) return appErr(arena, "control lookup returned malformed data");
+        if (parsed.object.get("bad") != null) return appErr(arena, "invalid CSS selector");
+        const mode = if (parsed.object.get("mode")) |m| (if (m == .string) m.string else "") else "";
+        if (mode.len == 0) {
+            const found: i64 = if (parsed.object.get("found")) |f| (if (f == .integer) f.integer else 0) else 0;
+            return appErr(arena, try std.fmt.allocPrint(arena, "no matching control (matched {d}) — browser_form_state lists the form controls", .{found}));
+        }
+        if (eql(u8, mode, "native")) {
+            if (parsed.object.get("err") != null) {
+                var opts_note: []const u8 = "";
+                if (parsed.object.get("options")) |ov| {
+                    var ow: std.Io.Writer.Allocating = .init(arena);
+                    try std.json.Stringify.value(ov, .{}, &ow.writer);
+                    opts_note = try std.fmt.allocPrint(arena, "; available: {s}", .{ow.written()});
+                }
+                return appErr(arena, try std.fmt.allocPrint(arena, "no <select> option matching \"{s}\"{s}", .{ value, opts_note }));
+            }
+            const picked = if (parsed.object.get("picked")) |p| (if (p == .string) p.string else "?") else "?";
+            return toolResult(arena, try std.fmt.allocPrint(arena, "chose \"{s}\" (native select)", .{picked}), false) orelse error.OutOfMemory;
+        }
+        // Custom control: trusted-click it open, wait for options to
+        // surface (shadow-piercing), click the matching one.
+        const tag = if (parsed.object.get("tag")) |t| (if (t == .string) t.string else "?") else "?";
+        const was = if (parsed.object.get("now")) |n| (if (n == .string) n.string else "") else "";
+        const cxv = parsed.object.get("x") orelse return appErr(arena, "control lookup returned no coordinates");
+        const cx: f64 = switch (cxv) {
+            .float => cxv.float,
+            .integer => @floatFromInt(cxv.integer),
+            else => 0,
+        };
+        const cyv = parsed.object.get("y").?;
+        const cy: f64 = switch (cyv) {
+            .float => cyv.float,
+            .integer => @floatFromInt(cyv.integer),
+            else => 0,
+        };
+        bs.client.clickAt(arena, cx, cy, "left", 1, 8_000) catch
+            return appErr(arena, "could not click the control open (DevTools connection lost?)");
+        const opt_js = try std.fmt.allocPrint(arena,
+            \\(() => {{ {s}
+            \\const want = {s}.toLowerCase();
+            \\let opts = deepQuery("[role='option'],option,[part='option']").filter(vis);
+            \\if (!opts.length) opts = deepQuery("li").filter(vis);
+            \\if (!opts.length) return {{count: 0}};
+            \\let hit = opts.find(o => (o.innerText || '').trim().toLowerCase() === want || (o.value || '').toLowerCase() === want);
+            \\if (!hit) hit = opts.find(o => (o.innerText || '').toLowerCase().includes(want));
+            \\if (!hit) return {{count: opts.length, seen: opts.slice(0, 15).map(o => (o.innerText || '').trim().slice(0, 40))}};
+            \\hit.scrollIntoView({{block: 'center'}});
+            \\const r = hit.getBoundingClientRect();
+            \\return {{x: r.x + r.width / 2, y: r.y + r.height / 2, text: (hit.innerText || '').trim().slice(0, 60)}}; }})()
+        , .{ JS_HELPERS, try jsStr(arena, value) });
+        const deadline = monoMs() + timeout_ms;
+        var seen_note: []const u8 = "no visible options appeared";
+        while (true) {
+            sleepMsLocal(250);
+            const oout = bEval(arena, bs, opt_js, 5_000);
+            const ovj = switch (oout) {
+                .val => |v| v orelse "null",
+                .err => "null",
+            };
+            const op = std.json.parseFromSliceLeaky(std.json.Value, arena, ovj, .{}) catch std.json.Value{ .null = {} };
+            if (op == .object) {
+                if (op.object.get("x")) |oxv| {
+                    const ox: f64 = switch (oxv) {
+                        .float => oxv.float,
+                        .integer => @floatFromInt(oxv.integer),
+                        else => 0,
+                    };
+                    const oyv = op.object.get("y").?;
+                    const oy: f64 = switch (oyv) {
+                        .float => oyv.float,
+                        .integer => @floatFromInt(oyv.integer),
+                        else => 0,
+                    };
+                    const otext = if (op.object.get("text")) |t2| (if (t2 == .string) t2.string else "?") else "?";
+                    bs.client.clickAt(arena, ox, oy, "left", 1, 8_000) catch
+                        return appErr(arena, "found the option but could not click it (DevTools connection lost?)");
+                    _ = app.waitIdle(150, 1_500);
+                    // Read the control back for confirmation.
+                    const rb_js = try std.fmt.allocPrint(arena,
+                        \\(() => {{ {s}
+                        \\const seln = {s}; const txtn = {s};
+                        \\let els2 = seln ? deepQuery(seln) : [];
+                        \\if (!els2.length && txtn) {{ els2 = deepQuery('*').filter(e => e.tagName.includes('-') && e.shadowRoot).filter(e => labelText(e).toLowerCase().includes(txtn.toLowerCase())); }}
+                        \\const el3 = els2[0]; if (!el3) return null;
+                        \\return (el3.value !== undefined && el3.value !== null ? String(el3.value) : (el3.innerText || '')).trim().slice(0, 80); }})()
+                    , .{ JS_HELPERS, try jsStr(arena, selector), try jsStr(arena, text) });
+                    const rb = bEval(arena, bs, rb_js, 5_000);
+                    var now: []const u8 = "";
+                    if (rb == .val) {
+                        if (rb.val) |v2| {
+                            const pv = std.json.parseFromSliceLeaky(std.json.Value, arena, v2, .{}) catch std.json.Value{ .null = {} };
+                            if (pv == .string) now = pv.string;
+                        }
+                    }
+                    var msg = try std.fmt.allocPrint(arena, "chose \"{s}\" in <{s}>", .{ otext, tag });
+                    if (was.len > 0) msg = try std.fmt.allocPrint(arena, "{s} (was: {s})", .{ msg, was });
+                    if (now.len > 0) msg = try std.fmt.allocPrint(arena, "{s}; control now shows: {s}", .{ msg, now });
+                    return toolResult(arena, msg, false) orelse error.OutOfMemory;
+                }
+                if (op.object.get("seen")) |sv| {
+                    var ow: std.Io.Writer.Allocating = .init(arena);
+                    try std.json.Stringify.value(sv, .{}, &ow.writer);
+                    seen_note = try std.fmt.allocPrint(arena, "options visible but none match: {s}", .{ow.written()});
+                }
+            }
+            if (monoMs() >= deadline) break;
+        }
+        // Close whatever popup the click opened before reporting.
+        _ = bs.client.call(arena, "Input.dispatchKeyEvent", "{\"type\":\"keyDown\",\"key\":\"Escape\",\"code\":\"Escape\",\"windowsVirtualKeyCode\":27,\"nativeVirtualKeyCode\":27}", 3_000) catch {};
+        _ = bs.client.call(arena, "Input.dispatchKeyEvent", "{\"type\":\"keyUp\",\"key\":\"Escape\",\"code\":\"Escape\",\"windowsVirtualKeyCode\":27,\"nativeVirtualKeyCode\":27}", 3_000) catch {};
+        return appErr(arena, try std.fmt.allocPrint(arena, "clicked <{s}> open but could not pick \"{s}\": {s} — inspect with browser_form_state/browser_elements and click the option manually", .{ tag, value, seen_note }));
+    }
+    if (eql(u8, name, "browser_network")) {
+        if (!bs.client.net_enabled) {
+            bs.client.enableNetwork(5_000) catch return appErr(arena, "could not enable DevTools network capture");
+            return toolResult(arena, "network capture was off and is enabled NOW — requests are recorded from this point on; interact/navigate, then call browser_network again", false) orelse error.OutOfMemory;
+        }
+        bs.client.pump(200);
+        if (argBool(args, "clear")) {
+            bs.client.netClear();
+            return toolResult(arena, "network log cleared", false) orelse error.OutOfMemory;
+        }
+        const filter = argStr(args, "filter");
+        const limit: usize = @intCast(std.math.clamp(argInt(args, "limit") orelse 30, 1, 200));
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.print("{{\"tracked\":{d},\"in_flight\":{d},\"dropped\":{d},\"requests\":[", .{ bs.client.net.items.len, bs.client.netInFlight(), bs.client.net_dropped });
+        // Newest last; walk from the tail collecting up to `limit`.
+        var idxs: std.ArrayList(usize) = .empty;
+        defer idxs.deinit(arena);
+        var i = bs.client.net.items.len;
+        while (i > 0 and idxs.items.len < limit) {
+            i -= 1;
+            const e = bs.client.net.items[i];
+            if (filter) |f| {
+                if (std.mem.indexOf(u8, e.url, f) == null and
+                    std.mem.indexOf(u8, e.first_url, f) == null) continue;
+            }
+            try idxs.append(arena, i);
+        }
+        var first = true;
+        var j = idxs.items.len;
+        while (j > 0) {
+            j -= 1;
+            const e = bs.client.net.items[idxs.items[j]];
+            if (!first) try w.writeAll(",");
+            first = false;
+            try w.print("{{\"seq\":{d},\"method\":\"{s}\",\"url\":", .{ e.seq, e.method });
+            try std.json.Stringify.value(if (e.url.len > 200) e.url[0..200] else e.url, .{}, w);
+            if (e.status != 0) try w.print(",\"status\":{d}", .{e.status});
+            if (e.resource_type.len > 0) try w.print(",\"type\":\"{s}\"", .{e.resource_type});
+            if (e.mime.len > 0) {
+                try w.writeAll(",\"mime\":");
+                try std.json.Stringify.value(e.mime, .{}, w);
+            }
+            if (!e.finished) try w.writeAll(",\"in_flight\":true");
+            if (e.error_text.len > 0) {
+                try w.writeAll(",\"failed\":");
+                try std.json.Stringify.value(e.error_text, .{}, w);
+            }
+            if (e.redirects > 0) try w.print(",\"redirects\":{d}", .{e.redirects});
+            if (e.first_url.len > 0) {
+                try w.writeAll(",\"redirected_from\":");
+                try std.json.Stringify.value(if (e.first_url.len > 200) e.first_url[0..200] else e.first_url, .{}, w);
+            }
+            if (e.post_keys.len > 0) {
+                try w.writeAll(",\"post_keys\":");
+                try std.json.Stringify.value(e.post_keys, .{}, w);
+            }
+            try w.writeAll("}");
+        }
+        try w.writeAll("]}");
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "browser_scroll")) {
         var js: []const u8 = undefined;

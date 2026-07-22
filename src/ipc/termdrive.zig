@@ -108,19 +108,6 @@ const ExecPending = struct {
     nonce: [12]u8,
 };
 
-/// POSIX single-quote: wrap in '...', embedded ' becomes '\''.
-fn posixSquote(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
-    try w.writeByte('\'');
-    for (s) |ch| {
-        if (ch == '\'') try w.writeAll("'\\''") else try w.writeByte(ch);
-    }
-    try w.writeByte('\'');
-    return allocator.dupe(u8, aw.written());
-}
-
 /// Where a sentinel scan landed in the rendered text.
 pub const SentinelParse = union(enum) {
     /// Not complete; begin_after = offset just past the begin marker
@@ -138,7 +125,12 @@ pub const SentinelParse = union(enum) {
 /// local or over SSH) and shell state stays out of the session. The
 /// pipeline uses only syntax every shell family shares (`|`, `>`,
 /// `&&`, `;`) and the script always exits 0, so an active `set -e` in
-/// the session never kills it.
+/// the session never kills it. The command itself travels INSIDE the
+/// script via a quoted heredoc into a second temp file, so no process
+/// command line ever contains it — ps/pgrep searches stay clean.
+/// `shell` (null = "sh") runs the command file under a different
+/// interpreter (e.g. bash for pipefail semantics) while the wrapper
+/// stays plain sh.
 ///
 /// subshell=false: the POSIX construction is typed directly so state
 /// changes (cd/export/set) PERSIST in the session; needs a POSIX-ish
@@ -146,34 +138,34 @@ pub const SentinelParse = union(enum) {
 /// quote-split in the typed text so the command echo can never be
 /// mistaken for a marker; the `if` wrapper keeps a failing command
 /// from tripping an active `set -e`.
-pub fn buildExecLine(allocator: std.mem.Allocator, nonce: []const u8, command: []const u8, subshell: bool, noninteractive: bool) ![]u8 {
+pub fn buildExecLine(allocator: std.mem.Allocator, nonce: []const u8, command: []const u8, subshell: bool, noninteractive: bool, shell: ?[]const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     const w = &aw.writer;
     if (subshell) {
-        // The command runs in a `sh -c` CHILD of the script's sh, so
+        // The command runs from a file under a CHILD interpreter, so
         // an `exit`/`exec` in the command can only leave the child —
         // the end marker always prints with the child's real status.
-        const quoted_cmd = try posixSquote(allocator, command);
-        defer allocator.free(quoted_cmd);
         // Package-manager safety net: the standard Debian/needrestart
         // frontends that would otherwise block on a dialog. Prefix
-        // env on the sh -c child only — nothing leaks to the session.
+        // env on the child only — nothing leaks to the session.
         const env: []const u8 = if (noninteractive)
             "DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 "
         else
             "";
+        const interp = shell orelse "sh";
+        const nl: []const u8 = if (command.len > 0 and command[command.len - 1] == '\n') "" else "\n";
         const script = try std.fmt.allocPrint(
             allocator,
-            "printf '\\n%s\\n' SKB{s}\n{s}sh -c {s}\n__sk_s=$?\nprintf '\\n%s%d\\n' SKE{s}. \"$__sk_s\"\n",
-            .{ nonce, env, quoted_cmd, nonce },
+            "cat > /tmp/.sk_{s}.c <<'SK_EOF_{s}'\n{s}{s}SK_EOF_{s}\nprintf '\\n%s\\n' SKB{s}\n{s}{s} /tmp/.sk_{s}.c\n__sk_s=$?\nprintf '\\n%s%d\\n' SKE{s}. \"$__sk_s\"\n",
+            .{ nonce, nonce, command, nl, nonce, nonce, env, interp, nonce, nonce },
         );
         defer allocator.free(script);
         const enc = std.base64.standard.Encoder;
         const b64 = try allocator.alloc(u8, enc.calcSize(script.len));
         defer allocator.free(b64);
         _ = enc.encode(b64, script);
-        try w.print("echo {s} | base64 -d > /tmp/.sk_{s} && sh /tmp/.sk_{s}; rm -f /tmp/.sk_{s}", .{ b64, nonce, nonce, nonce });
+        try w.print("echo {s} | base64 -d > /tmp/.sk_{s} && sh /tmp/.sk_{s}; rm -f /tmp/.sk_{s} /tmp/.sk_{s}.c", .{ b64, nonce, nonce, nonce, nonce });
         return allocator.dupe(u8, aw.written());
     }
     try w.print("printf '\\n%s\\n' SKB''{s}; if {{ {s}\n}}; then __sk_s=0; else __sk_s=$?; fi; printf '\\n%s%d\\n' SKE''{s}. \"$__sk_s\"", .{ nonce, command, nonce });
@@ -219,7 +211,7 @@ pub fn findSentinel(text: []const u8, nonce: []const u8) SentinelParse {
 
 test "buildExecLine wraps and quote-splits markers" {
     const t = std.testing;
-    const line = try buildExecLine(t.allocator, "aabbccddeeff", "echo hi", false, false);
+    const line = try buildExecLine(t.allocator, "aabbccddeeff", "echo hi", false, false, null);
     defer t.allocator.free(line);
     // The typed text never contains a contiguous marker string.
     try t.expect(std.mem.indexOf(u8, line, "SKBaabbccddeeff") == null);
@@ -227,10 +219,10 @@ test "buildExecLine wraps and quote-splits markers" {
     try t.expect(std.mem.indexOf(u8, line, "{ echo hi\n}") != null);
     // Subshell mode: dialect-independent base64 → sh transport, and
     // the decoded script carries the plain markers + set -e guard.
-    const sub = try buildExecLine(t.allocator, "aabbccddeeff", "cd /tmp && pwd", true, false);
+    const sub = try buildExecLine(t.allocator, "aabbccddeeff", "cd /tmp && pwd", true, false, null);
     defer t.allocator.free(sub);
     try t.expect(std.mem.startsWith(u8, sub, "echo "));
-    try t.expect(std.mem.indexOf(u8, sub, "| base64 -d > /tmp/.sk_aabbccddeeff && sh /tmp/.sk_aabbccddeeff; rm -f /tmp/.sk_aabbccddeeff") != null);
+    try t.expect(std.mem.indexOf(u8, sub, "| base64 -d > /tmp/.sk_aabbccddeeff && sh /tmp/.sk_aabbccddeeff; rm -f /tmp/.sk_aabbccddeeff /tmp/.sk_aabbccddeeff.c") != null);
     try t.expect(std.mem.indexOf(u8, sub, "SKBaabbccddeeff") == null); // only inside the b64 payload
     const b64 = sub["echo ".len..std.mem.indexOf(u8, sub, " |").?];
     const dec = std.base64.standard.Decoder;
@@ -238,16 +230,29 @@ test "buildExecLine wraps and quote-splits markers" {
     defer t.allocator.free(buf);
     try dec.decode(buf, b64);
     try t.expect(std.mem.indexOf(u8, buf, "SKBaabbccddeeff") != null);
-    try t.expect(std.mem.indexOf(u8, buf, "sh -c 'cd /tmp && pwd'\n__sk_s=$?") != null);
+    // ps-safe: the command travels via a quoted heredoc into a file
+    // and runs as `sh /tmp/.sk_<nonce>.c` — never on a command line.
+    try t.expect(std.mem.indexOf(u8, buf, "cat > /tmp/.sk_aabbccddeeff.c <<'SK_EOF_aabbccddeeff'\ncd /tmp && pwd\nSK_EOF_aabbccddeeff") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "sh /tmp/.sk_aabbccddeeff.c\n__sk_s=$?") != null);
+    try t.expect(std.mem.indexOf(u8, buf, "sh -c") == null);
     try t.expect(std.mem.indexOf(u8, buf, "SKEaabbccddeeff.") != null);
-    // Embedded single quotes survive the POSIX quoting.
-    const q = try buildExecLine(t.allocator, "aabbccddeeff", "echo 'it''s'", true, false);
+    // Quotes need no escaping at all now (heredoc transport).
+    const q = try buildExecLine(t.allocator, "aabbccddeeff", "echo 'it''s' \"$HOME\"", true, false, null);
     defer t.allocator.free(q);
     const qb64 = q["echo ".len..std.mem.indexOf(u8, q, " |").?];
     const qbuf = try t.allocator.alloc(u8, try dec.calcSizeForSlice(qb64));
     defer t.allocator.free(qbuf);
     try dec.decode(qbuf, qb64);
-    try t.expect(std.mem.indexOf(u8, qbuf, "sh -c 'echo '\\''it'\\'''\\''s'\\'''") != null);
+    try t.expect(std.mem.indexOf(u8, qbuf, "\necho 'it''s' \"$HOME\"\nSK_EOF_") != null);
+    // shell option swaps the command-file interpreter, not the wrapper.
+    const bsh = try buildExecLine(t.allocator, "aabbccddeeff", "set -o pipefail; false | true", true, true, "bash");
+    defer t.allocator.free(bsh);
+    const bb64 = bsh["echo ".len..std.mem.indexOf(u8, bsh, " |").?];
+    const bbuf = try t.allocator.alloc(u8, try dec.calcSizeForSlice(bb64));
+    defer t.allocator.free(bbuf);
+    try dec.decode(bbuf, bb64);
+    try t.expect(std.mem.indexOf(u8, bbuf, "NEEDRESTART_SUSPEND=1 bash /tmp/.sk_aabbccddeeff.c") != null);
+    try t.expect(std.mem.indexOf(u8, bsh, "&& sh /tmp/.sk_aabbccddeeff;") != null);
 }
 
 test "findSentinel extracts output and status" {
@@ -611,7 +616,7 @@ pub const Term = struct {
     /// shell (works over SSH, where OSC 133 integration cannot reach).
     /// On timeout the sentinel stays pending; continue with
     /// waitExecResult. Caller frees `.output`.
-    pub fn execCommand(self: *Term, command: []const u8, subshell: bool, noninteractive: bool, timeout_ms: i64) Error!ExecOutcome {
+    pub fn execCommand(self: *Term, command: []const u8, subshell: bool, noninteractive: bool, shell: ?[]const u8, timeout_ms: i64) Error!ExecOutcome {
         self.drain();
         if (self.exited) return Error.NotConnected;
         if (self.pending_exec != null) return Error.BadKey; // caller checks hasPendingExec first
@@ -623,7 +628,7 @@ pub const Term = struct {
             pend.nonce[i * 2] = hex[b >> 4];
             pend.nonce[i * 2 + 1] = hex[b & 0xf];
         }
-        const line = buildExecLine(self.allocator, &pend.nonce, command, subshell, noninteractive) catch return Error.OutOfMemory;
+        const line = buildExecLine(self.allocator, &pend.nonce, command, subshell, noninteractive, shell) catch return Error.OutOfMemory;
         defer self.allocator.free(line);
         const with_cr = std.fmt.allocPrint(self.allocator, "{s}\r", .{line}) catch return Error.OutOfMemory;
         defer self.allocator.free(with_cr);

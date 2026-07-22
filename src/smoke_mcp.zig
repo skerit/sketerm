@@ -431,6 +431,21 @@ pub fn main() u8 {
         var of_path_buf: [512]u8 = undefined;
         const of_path = std.fmt.bufPrint(&of_path_buf, "{s}/exec-out.txt", .{rt}) catch unreachable;
         if (!fileExists(of_path)) fail("term_exec output_file missing on disk");
+        // shell option: bash-only semantics (pipefail) work when asked
+        // for, and the plain-sh default rejects them.
+        const pf = m.callTool("term_exec", "{\"term\":3,\"command\":\"set -o pipefail && false | cat; echo PF:$?\",\"shell\":\"bash\"}");
+        if (std.mem.indexOf(u8, pf, "PF:1") == null)
+            fail("shell=bash did not provide pipefail semantics");
+        const badsh = m.callTool("term_exec", "{\"term\":3,\"command\":\"true\",\"shell\":\"bash; rm -rf /\"}");
+        if (std.mem.indexOf(u8, badsh, "invalid 'shell'") == null)
+            fail("shell metacharacters were not rejected");
+        // ps-safety: the command line never appears in any process's
+        // argv — only the grep that searches for it matches itself,
+        // so the count is exactly 1 (the old sh -c transport made 2+).
+        const psq = m.callTool("term_exec", "{\"term\":3,\"command\":\"ps -eo args | grep -c SK_PS_CANARY_42\",\"timeout_ms\":15000}");
+        if (std.mem.indexOf(u8, psq, "\\\"exit_status\\\":0") == null or
+            std.mem.indexOf(u8, psq, "\\\"output\\\":\\\"1\\\\n") == null)
+            fail("the exec transport leaked the command onto a process command line (ps saw it)");
 
         // ── term_wait_exit: real process exit, not output idle ────
         const t4 = m.callTool("term_open", "{\"command\":[\"sh\",\"-c\",\"sleep 0.3; exit 7\"]}");
