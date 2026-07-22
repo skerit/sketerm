@@ -231,6 +231,9 @@ const Chan = struct {
 };
 
 var name_counter: u32 = 0;
+/// Monotonic per-process log_get nonce (uniqueness within one
+/// connection is all reply matching needs).
+var log_nonce_counter: u64 = 0;
 
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -286,6 +289,10 @@ pub const App = struct {
     term_pool: ?*Pool = null,
     term_screen: ?*Screen = null,
     term_seq: u64 = 0,
+    /// Connect target, kept for side connections (logGetFresh): the
+    /// private-instance socket path and/or SSH host used at launch.
+    local_sock: ?[]u8 = null,
+    ssh_host: ?[]u8 = null,
     /// Latest `.log_data` payload (a logGet reply, or the daemon's
     /// unsolicited post-mortem push just before `.exit`).
     log_buf: std.ArrayList(u8) = .empty,
@@ -428,7 +435,15 @@ pub const App = struct {
         defer snap.deinit(allocator);
 
         const self = allocator.create(App) catch return Error.OutOfMemory;
-        self.* = .{ .allocator = allocator, .conn = conn, .name = name, .layout = layout, .pid = spawn_pid };
+        self.* = .{
+            .allocator = allocator,
+            .conn = conn,
+            .name = name,
+            .layout = layout,
+            .pid = spawn_pid,
+            .local_sock = if (opts.host == null) (if (opts.local_sock) |p| allocator.dupe(u8, p) catch null else null) else null,
+            .ssh_host = if (opts.host) |h| allocator.dupe(u8, h) catch null else null,
+        };
         layout = null; // ownership moved
         self.applyTermSnapshot(snap.payload);
         return self;
@@ -473,7 +488,13 @@ pub const App = struct {
         defer snap.deinit(allocator);
 
         const self = allocator.create(App) catch return Error.OutOfMemory;
-        self.* = .{ .allocator = allocator, .conn = conn, .name = name, .layout = layout };
+        self.* = .{
+            .allocator = allocator,
+            .conn = conn,
+            .name = name,
+            .layout = layout,
+            .local_sock = if (local_sock) |p| allocator.dupe(u8, p) catch null else null,
+        };
         layout = null; // ownership moved
         self.applyTermSnapshot(snap.payload);
         return self;
@@ -523,6 +544,8 @@ pub const App = struct {
             p.deinit();
             a.destroy(p);
         }
+        if (self.local_sock) |p| a.free(p);
+        if (self.ssh_host) |h| a.free(h);
         a.free(self.name);
         a.destroy(self);
     }
@@ -865,6 +888,19 @@ pub const App = struct {
 
     pub const LogFetch = struct { json: []u8, stale: bool };
 
+    /// Read the nonce a log_data reply echoes in its HEADER (before
+    /// "lines" — line text is arbitrary app output and must not be
+    /// scanned). null = no/zero nonce (old daemon or unsolicited push).
+    pub fn logNonceOf(json: []const u8) ?u64 {
+        const header = if (std.mem.indexOf(u8, json, "\"lines\"")) |i| json[0..i] else json;
+        const key = "\"nonce\":";
+        const at = std.mem.indexOf(u8, header, key) orelse return null;
+        var end = at + key.len;
+        while (end < header.len and header[end] >= '0' and header[end] <= '9') end += 1;
+        const v = std.fmt.parseInt(u64, header[at + key.len .. end], 10) catch return null;
+        return if (v == 0) null else v;
+    }
+
     /// Fetch log lines from the daemon (`req_json` = a LogGetReq
     /// object). For an EXITED app the daemon already pushed the final
     /// log ahead of `.exit`; that stash is served instead (the session
@@ -875,14 +911,46 @@ pub const App = struct {
     pub fn logGet(self: *App, req_json: []const u8, timeout_ms: i64) Error!LogFetch {
         self.drain();
         if (!self.exited) {
-            const before = self.log_seq;
-            self.conn.sendFrame(.log_get, req_json) catch return Error.NotConnected;
+            // Nonce-stamped request: a reply to an EARLIER request can
+            // surface from the frame backlog during this wait and must
+            // not be mistaken for ours (a no-nonce reply — old daemon
+            // or the unsolicited pre-exit push — is accepted as-is).
+            log_nonce_counter += 1;
+            const nonce = log_nonce_counter;
+            std.debug.assert(req_json.len > 0 and req_json[req_json.len - 1] == '}');
+            const req = std.fmt.allocPrint(self.allocator, "{s},\"nonce\":{d}}}", .{
+                req_json[0 .. req_json.len - 1], nonce,
+            }) catch return Error.OutOfMemory;
+            defer self.allocator.free(req);
+            var seen = self.log_seq;
+            self.conn.sendFrame(.log_get, req) catch return Error.NotConnected;
             const deadline = nowMs() + timeout_ms;
-            while (self.log_seq == before and nowMs() < deadline) {
+            var matched = false;
+            while (nowMs() < deadline) {
+                if (self.log_seq != seen) {
+                    seen = self.log_seq;
+                    const got = logNonceOf(self.log_buf.items);
+                    if (got == null or got.? == nonce) {
+                        matched = true;
+                        break;
+                    }
+                    // A stray earlier reply — keep waiting for ours.
+                }
                 if (self.exited) break;
                 _ = self.pumpOnce(25);
             }
-            if (self.log_seq == before and !self.exited) {
+            if (!matched and !self.exited) {
+                // The reply is buried behind frame data queued toward
+                // the primary connection (a continuously-committing
+                // app deepens that queue between tool calls without
+                // bound). A FRESH side connection has an empty queue,
+                // so its reply comes right after the attach snapshot.
+                if (self.logGetFresh(req_json, timeout_ms)) |json| {
+                    self.log_buf.clearRetainingCapacity();
+                    self.log_buf.appendSlice(self.allocator, json) catch {};
+                    self.log_seq += 1;
+                    return .{ .json = json, .stale = false };
+                } else |_| {}
                 if (self.log_buf.items.len > 0) {
                     const json = self.allocator.dupe(u8, self.log_buf.items) catch return Error.OutOfMemory;
                     return .{ .json = json, .stale = true };
@@ -893,6 +961,32 @@ pub const App = struct {
         if (self.log_buf.items.len == 0) return Error.NotConnected;
         const json = self.allocator.dupe(u8, self.log_buf.items) catch return Error.OutOfMemory;
         return .{ .json = json, .stale = false };
+    }
+
+    /// Fetch log lines over a FRESH side connection: its daemon-side
+    /// write queue is empty, so log_data arrives immediately after the
+    /// attach snapshot no matter how deep the primary connection's
+    /// frame backlog is. Hellos proto 1 (no native-channel replay, no
+    /// pool bytes) and attaches kind "cli" (not counted as a driver).
+    /// Caller owns the returned JSON.
+    fn logGetFresh(self: *App, req_json: []const u8, timeout_ms: i64) Error![]u8 {
+        if (self.exited) return Error.NotConnected;
+        const a = self.allocator;
+        const deadline = nowMs() + timeout_ms;
+        var conn = blk: {
+            if (self.ssh_host) |h| break :blk muxclient.Conn.connectSsh(a, h) catch return Error.NotConnected;
+            break :blk muxclient.Conn.connectLocalAutostartAt(a, self.local_sock) catch return Error.NotConnected;
+        };
+        defer conn.deinit();
+        conn.setNonBlocking();
+        conn.sendJson(.hello, .{ .proto = 1 }) catch return Error.NotConnected;
+        (conn.recvExpectFor(&.{.welcome}, @max(deadline - nowMs(), 1)) catch return Error.Timeout).deinit(a);
+        conn.sendJson(.attach, .{ .name = self.name, .kind = "cli" }) catch return Error.NotConnected;
+        (conn.recvExpectFor(&.{.snapshot}, @max(deadline - nowMs(), 1)) catch return Error.Timeout).deinit(a);
+        conn.sendFrame(.log_get, req_json) catch return Error.NotConnected;
+        const f = conn.recvExpectFor(&.{.log_data}, @max(deadline - nowMs(), 1)) catch return Error.Timeout;
+        defer f.deinit(a);
+        return a.dupe(u8, f.payload) catch Error.OutOfMemory;
     }
 
     fn dropChanWindows(self: *App, chan: u32) void {
@@ -1845,3 +1939,13 @@ pub const App = struct {
         return stats;
     }
 };
+
+test "logNonceOf: header nonce parsed, lines content never scanned" {
+    const t = std.testing;
+    try t.expectEqual(@as(?u64, 42), App.logNonceOf("{\"next_id\":9,\"dropped\":0,\"markers_dropped\":0,\"nonce\":42,\"lines\":[]}"));
+    // Zero / absent = no nonce (old daemon, unsolicited exit push).
+    try t.expectEqual(@as(?u64, null), App.logNonceOf("{\"next_id\":9,\"dropped\":0,\"markers_dropped\":0,\"nonce\":0,\"lines\":[]}"));
+    try t.expectEqual(@as(?u64, null), App.logNonceOf("{\"next_id\":9,\"dropped\":0,\"lines\":[]}"));
+    // A line whose text CONTAINS "nonce": must not be picked up.
+    try t.expectEqual(@as(?u64, null), App.logNonceOf("{\"next_id\":9,\"dropped\":0,\"lines\":[{\"id\":1,\"t\":0,\"text\":\"\\\"nonce\\\":777\"}]}"));
+}
