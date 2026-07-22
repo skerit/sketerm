@@ -8207,3 +8207,38 @@ next_id (14, 14, 27) across idle-separated calls where the previous
 build regressed to older content, daemon log shows the proto-1 side
 attaches; bare app_click returned the marked frame with 'repainted 5ms
 after the input and settled'.
+
+## 2026-07-22: MCP input fidelity + env-tunable timing defaults
+
+Feedback from an agent driving a DOS-game port via the app tools
+(slow app, edge-polling input loop, buttons that need a second press)
+landed as six changes:
+
+- app_click hold_ms (default 100, human-like): the button stays down
+  between press and release. An instantaneous press+release can be
+  collapsed into one sample by apps polling per-tick edge counts, and
+  press-armed repeat widgets never fired at all. appdrive.clickEx
+  pumps frames during the hold (never a blind sleep). Every
+  server-synthesized click (template/OCR match clicks) goes through
+  the same default (clickTuned).
+- app_click count:2/3 = real double/triple click (~80ms apart) — two
+  separate MCP calls always exceed any double-click threshold.
+- app_click retry:N re-clicks when the post-input wait produced a NO
+  qualifying repaint verdict (default 0; only on a WAITED verdict, a
+  repainted window never gets a second press).
+- app_key hold_ms (+ per-step hold_ms/count in app_actions click/key
+  steps; appdrive.pressKeyHold): held keys drive client-side
+  key-repeat. Journal records hold/count so macros replay faithfully.
+- Env-tunable defaults for the timing knobs (project .mcp.json env):
+  SKETERM_MCP_HOLD_MS / SKETERM_MCP_SETTLE_MS / SKETERM_MCP_TIMEOUT_MS
+  / SKETERM_MCP_CLICK_RETRY (clamped; the explicit-wait budget stays
+  >= 5s). Config sets the NEW DEFAULT and tools/list SAYS SO: the
+  static TOOLS_JSON carries %..._DEF% tokens rendered from the same
+  Tuning struct the handlers read (renderedToolsJson) — description
+  and behavior cannot drift; an override renders as "default 15000 —
+  PROJECT OVERRIDE via SKETERM_MCP_TIMEOUT_MS, built-in 1500".
+  capabilities reports the effective values + override flags, and
+  overrides are logged at startup.
+- min_change_pct is deliberately NOT env-tunable: it decides the
+  dead/live VERDICT, not a timing bound — an invisible default there
+  manufactures false verdicts. The schema now says so.
