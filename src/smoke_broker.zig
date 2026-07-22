@@ -330,6 +330,13 @@ pub fn main() u8 {
     attachAndEcho(allocator, sock_path, survivor, "SURVIVOR-OK-7");
     std.debug.print("smoke-broker: crash isolation (SIGKILL worker) ok\n", .{});
 
+    // ── mcp backlog gap + live-mirror resync THROUGH THE BROKER ──
+    // The attach kind must survive the 'A' worker handoff or the
+    // whole mcp streaming policy silently never engages (the
+    // stale-screenshot bug reproduced only in broker mode).
+    @import("smoke_backlog.zig").run(allocator, sock_path);
+    std.debug.print("smoke-broker: mcp backlog gap + resync via worker ok\n", .{});
+
     // ── clean shutdown ──
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
