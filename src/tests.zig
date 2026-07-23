@@ -72,6 +72,7 @@ comptime {
     _ = @import("mux/fsjob.zig");
     _ = @import("ipc/fsdrive.zig");
     _ = @import("ipc/fstransfer.zig");
+    _ = @import("fsmount.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");
     _ = @import("mux/pulse.zig");

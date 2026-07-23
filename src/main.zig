@@ -218,6 +218,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return @import("ipc/mux_cli.zig").run(allocator, mux_args);
     }
 
+    // `sketerm mount <host>[:/path] <mountpoint>` — FUSE mount of a
+    // host's files (local apps open remote files through the kernel).
+    // Foreground; no GApplication.
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "mount")) {
+        const m_args = allocator.alloc([]const u8, argv.len - 2) catch return 1;
+        defer allocator.free(m_args);
+        for (argv[2..], 0..) |a, n| m_args[n] = std.mem.span(a);
+        return @import("fsmount.zig").run(allocator, m_args);
+    }
+
     // `sketerm doctor [host]` — health check; socket-only, no
     // GApplication.
     if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "doctor")) {
