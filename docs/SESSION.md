@@ -8765,3 +8765,103 @@ Surfaced while verifying (both worth separate attention):
    palette, ...) are dead while browser widgets hold focus — the
    bindings live on the hidden GLArea's controllers. Needs a
    window-level shortcut controller or a browser key-forwarder.
+
+## 2026-07-23: phase 4 — remote browser tabs, cross-host transfers, jobs panel
+
+- src/ipc/fstransfer.zig: client-mediated cross-host transfer engine
+  (GTK-free, libc-only, no blocking waits — a pure state machine over
+  two caller-owned Conns; the caller pumps sockets and offers frames
+  via feed()). Transfer = one file: stat → optional staged-partial
+  probe → 1MB read/write chunks (fs_data → fs_write at explicit
+  offsets) → rename .skpart into place → BOTH-ENDS verify: the client
+  hashes every byte it forwards and compares against a daemon-side
+  hash job on the destination (a resumed file falls back to hash jobs
+  on both ends, since the client never saw the partial's bytes);
+  mismatch = destination deleted + honest failure. Xfer = file OR
+  tree: walks source listings, recreates dirs + symlinks, streams
+  files sequentially; tree rerun with resume skips completed
+  same-size files (fsjob parity); resumed_bytes/files_skipped are
+  proof counters.
+- smoke-fs grew a cross-daemon stage (two daemons at once, client
+  mediates): single 5MB file with hash oracle + no leftover .skpart;
+  induced disconnect at 3MB → staged partial survives → second Xfer
+  RESUMES (resumed_bytes > 0) and content matches; corrupted partial
+  → verify FAILS and the corrupt destination is deleted; tree copy
+  (dirs/files/symlink) + skip-rerun; cancel drops the staged partial.
+  All green first run.
+- browser.zig phase 4: every internal tab references a shared
+  per-view HostConn (null = local, "user@box" = SSH, "udp:box" = UDP
+  — terminal host strings). Remote connects run on a WORKER THREAD
+  (Conn buffers use the C allocator; g_idle_add handback; an orphaned
+  handback frees itself if the view died) so a dead host degrades one
+  tab, never the GUI. Location specs: "host:/path", "user@h:/path",
+  "udp:h:/path", "local:/path"; bare "/path" keeps the tab's host.
+  History entries are host-qualified specs (back/forward cross
+  hosts). Dead conn → transfers on it fail first, socket closes,
+  status says "navigate to reconnect"; navigating spawns a fresh
+  HostConn. Cross-host Paste Here rides fstransfer.Xfer; same-host
+  paste stays a daemon copy job. Remote double-click downloads into
+  $XDG_CACHE_HOME/sketerm/fsopen/<hash>-<name> and opens the default
+  app (phase-5 hydrating cache predecessor). Jobs/transfers panel
+  above the status bar: live rows for client transfers (percent,
+  cancel) and daemon jobs (percent, pause/resume/cancel, dismiss).
+  Layout persistence now records host-qualified specs (older plain
+  paths parse unchanged).
+- Keybind gap FIXED (previous session's limitation 2): a bubble-phase
+  key controller on the browser root re-runs matchBinding/runAction
+  against the pane's input ctx — palette/save-layout/etc. work while
+  browser widgets hold focus; plain typing in entries is unaffected
+  (entries consume their keys first).
+- Crash found + fixed during live verify: onFdReadable freed frames
+  with the VIEW's allocator, but a remote conn's frames belong to the
+  conn's own allocator (c_allocator on thread-connected remotes) →
+  DebugAllocator "Invalid free" abort. Frames are now freed with
+  hc.conn.allocator. (Gotcha class: payload ownership follows the
+  CONN, not the consumer.)
+- Verified in a LIVE headless GUI (Xvfb, isolated XDG dirs, fake-ssh
+  rig serving a genuinely separate daemon instance in its own runtime
+  dir): remote tab listing via "fakehost:/…" in the path bar; live
+  delta from an externally-created file on the REMOTE host; Copy on
+  remote big.dat + Paste Here in a local tab → transfer done, sha256
+  identical; remote alpha.txt double-click → cache download + opened
+  in the default app (content verified); Ctrl+Shift+P palette opens
+  from browser focus; killing the remote daemon degrades one tab with
+  "connection to fakehost lost — navigate to reconnect" (GUI alive);
+  Enter in the path bar reconnects (fresh listing incl. a file
+  created while down); save_layout records "fakehost:/…" and
+  --restore brings the remote tab back, reconnected, live.
+
+Verification: full suite 778 pass / 6 skip / 0 fail (784, +parseSpec
+unit test); smoke-fs (mono + broker + NEW cross-daemon xfer stage)
+OK, leak-checked; GUI, mux, musl mux-portable, aarch64-macos cross
+all build; sketerm-mux still links libc only. The zig-build-test
+runner deadlock reproduced again under cross-session load (same
+signature); same workaround (run the compiled test binary directly).
+
+Not yet (next phases): dual-pane source/target UX, transfer-queue
+reordering/serialization, FUSE mount, live queries + panelize,
+mount bypass, batch rename, standalone-window mode.
+
+## 2026-07-23: INCIDENT — smoke-e2e retired the user's real daemon; harness now isolated
+
+What happened: `zig build smoke-e2e` (this worktree, proto 5) spawned
+the app WITHOUT isolating XDG_RUNTIME_DIR. The app connected to the
+REAL per-user daemon — a proto-6 build from the main checkout — hit
+MuxProtoMismatch, and connectLocalAutostart's retireStaleDaemon shut
+it down BY DESIGN, killing the user's live sessions (Zenit,
+Hohenheim, Traffic Giant, BOTF, STDS9W, ST:AFU at 19:59; mux.log has
+the full trail). A worktree proto-5 daemon then squatted the real
+socket (removed afterwards by exact PID). This is the second
+proto-skew casualty (first: 18:47, main-repo session) — the
+retire-on-mismatch policy itself deserves a rethink (migrate/warn
+instead of silent kill; separate design discussion).
+
+Fixes to the harness (smoke_e2e.zig):
+- The run now mkdtemps a private XDG_RUNTIME_DIR/CONFIG_HOME/
+  STATE_HOME before fork, so the app can never reach the real daemon
+  regardless of build skew; the isolated autostarted daemon is shut
+  down on both pass and fail paths (shutdownIsoDaemon).
+- The e2e "marker appears twice" check failed under xvfb-run's
+  640x480 default screen: the TYPED echo line wraps mid-marker, so
+  the count saw 1. The check now de-wraps (strips JSON \n escapes)
+  before counting, and prints the final get-text on failure.
