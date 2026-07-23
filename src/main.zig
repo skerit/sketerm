@@ -73,6 +73,13 @@ const HELP_TEXT =
     \\                         sketerm-mux on the remote.
     \\                         -u: mosh-style encrypted UDP with
     \\                         roaming.
+    \\  sketerm files [spec]   File browser: standalone window (or a
+    \\                         browser tab in the running instance).
+    \\                         spec = /path, host:/path, udp:host:/path.
+    \\  sketerm mount <host>[:/path] <mountpoint>
+    \\                         FUSE-mount a host's files so LOCAL apps
+    \\                         open them via the kernel (ranged reads,
+    \\                         write-through; fusermount3 -u to stop).
     \\  sketerm doctor [host]  Health check: binary/daemon version skew,
     \\                         socket liveness, terminfo, capabilities.
     \\                         With a host, also probes the REMOTE
