@@ -8630,3 +8630,51 @@ through the real `sketerm mcp` stdio stack: bare crash (sentinel served),
 exit), unknown-app error distinct, and a 15x crash/app_log loop with zero
 losses. 825 tests pass (6 skips); smoke-mux/broker/mcp, GUI + mux builds,
 Linux static-musl and aarch64-macOS portable builds pass.
+## 2026-07-23: file service phase 1 — live directory views + fsdrive
+
+First slice of the file browser (design: docs/filebrowser-roadmap.md,
+untracked): the mux daemon is now a file server with SUBSCRIPTION
+listings, not one-shot replies.
+
+- Wire: `fs_op` (JSON, op-discriminated: open_view/close_view/list/
+  stat/read/mkdir/rename/delete/symlink) + binary `fs_write`;
+  daemon→client `fs_reply` (req-nonce in the header — the log_get
+  lesson), `fs_delta` (pushed view changes), `fs_data` (ranged read
+  chunks). Not attach-scoped: the broker itself serves fs clients
+  (they never attach, so no worker handoff is involved).
+- `src/mux/fsserve.zig`: rich one-round-trip listings (lstat + symlink
+  target + follow-dir bit per entry, dirs-first ci sort, 512-entry
+  reply chunks, 100k cap), alignment-safe inotify event parsing,
+  Watcher gated to Linux (macOS compiles; deltas need a later FSEvents
+  backend — Linux never waits for it).
+- daemon: FsView registry ((client, client-chosen view id) → shared
+  inotify wd, refcounted across equal paths), per-tick coalesced
+  deltas (last state wins; stat decides upsert-vs-del, not the event
+  kind), IN_Q_OVERFLOW → honest `resync:true`, watched-dir deletion →
+  `gone:true`, views die with their client (reap) and a failed open
+  never leaks a view. IN_MODIFY deliberately unwatched (flood).
+- `src/ipc/fsdrive.zig`: GTK-free client in the appdrive mold —
+  deadline-bounded waits everywhere, replies matched by req nonce,
+  fs_delta frames stashed (never dropped) while awaiting replies.
+  Gotcha fixed en route: std.json's default alloc_if_needed returns
+  strings ALIASING the input buffer; frame payloads die with the call,
+  so every fsdrive parse pins `.allocate = .alloc_always` (was a
+  flaky SEGV in the smoke).
+- `zig build smoke-fs`: daemon-thread + fsdrive end-to-end — listing
+  richness, live deltas for external create/write/rename/delete (a
+  create is TWO deltas by design: IN_CREATE at size 0, then
+  IN_CLOSE_WRITE), mutation verbs observed through the view, 300KB
+  write + ranged read-back + eof, stat/symlink, 1300-entry chunked
+  listing, dir-gone views, close_view silence, error paths, abrupt
+  client death, leak-checked (DebugAllocator), run in BOTH monolith
+  and broker modes (smoke-backlog lesson).
+
+Verification: smoke-fs 10/10 runs green (both modes), full test suite
+776/782 (6 skipped, 0 failed), GUI + mux + mux-portable musl +
+aarch64-macos cross all build, daemon still links libc only,
+smoke-broker + smoke-mcp pass. smoke-mux still shows the KNOWN
+pre-existing DebugAllocator size-mismatch (reproduced unchanged on
+base 66433f2 before any of this landed).
+
+Phase 2 next: job engine (inline vs subprocess jobs, journaled
+resumable copy); MCP fs tools ride once those verbs exist.
