@@ -271,6 +271,11 @@ var name_counter: u32 = 0;
 var log_nonce_counter: u64 = 0;
 
 pub const App = struct {
+    pub const PresentationGone = enum {
+        client_disconnected,
+        last_toplevel_destroyed,
+    };
+
     allocator: std.mem.Allocator,
     conn: muxclient.Conn,
     name: []u8,
@@ -294,6 +299,11 @@ pub const App = struct {
     lagging: bool = false,
     exited: bool = false,
     exit_status: i32 = 0,
+    /// A debugger/diagnostic wrapper can outlive the GUI inferior. Keep
+    /// this separate from `exited`: deinit must still kill the wrapper,
+    /// while interaction waits treat a vanished last toplevel as final.
+    had_toplevel: bool = false,
+    presentation_gone: ?PresentationGone = null,
     /// Session child pid ON THE DAEMON'S HOST (0 = unknown). A string
     /// command spawns via `/bin/sh -c`, so this is the shell; argv-array
     /// launches exec directly and the pid IS the app.
@@ -705,17 +715,20 @@ pub const App = struct {
             e.value_ptr.*.resyncing = false;
         }
         if (!any) return;
+        var removed_toplevel = false;
         var i: usize = 0;
         while (i < self.windows.items.len) {
             const w = self.windows.items[i];
             if (!w.resync_seen) {
                 _ = self.windows.swapRemove(i);
+                removed_toplevel = removed_toplevel or !w.popup;
                 w.deinit(self.allocator);
                 self.allocator.destroy(w);
                 continue;
             }
             i += 1;
         }
+        if (removed_toplevel) self.noteToplevelRemoval(.last_toplevel_destroyed);
     }
 
     /// Drain to the LIVE head, bounded by `max_ms`: unlike drain()
@@ -790,7 +803,7 @@ pub const App = struct {
                     existing.comp = self.makeReplica(existing) catch {
                         // Replica unusable — drop the channel wholesale.
                         _ = self.chans.swapRemove(open.id);
-                        self.dropChanWindows(open.id);
+                        self.dropChanWindows(open.id, .client_disconnected);
                         existing.subsurfaces.deinit(self.allocator);
                         self.allocator.destroy(existing);
                         return;
@@ -815,7 +828,7 @@ pub const App = struct {
             .chan_close => {
                 const id = wire.decodeChanId(payload) orelse return;
                 if (self.chans.fetchSwapRemove(id)) |kv| {
-                    self.dropChanWindows(id);
+                    self.dropChanWindows(id, .client_disconnected);
                     kv.value.deinit();
                     self.allocator.destroy(kv.value);
                 }
@@ -1100,15 +1113,18 @@ pub const App = struct {
         return a.dupe(u8, f.payload) catch Error.OutOfMemory;
     }
 
-    fn dropChanWindows(self: *App, chan: u32) void {
+    fn dropChanWindows(self: *App, chan: u32, reason: PresentationGone) void {
+        var removed_toplevel = false;
         var i: usize = 0;
         while (i < self.windows.items.len) {
             if (self.windows.items[i].chan == chan) {
                 const w = self.windows.swapRemove(i);
+                removed_toplevel = removed_toplevel or !w.popup;
                 w.deinit(self.allocator);
                 self.allocator.destroy(w);
             } else i += 1;
         }
+        if (removed_toplevel) self.noteToplevelRemoval(reason);
     }
 
     fn winBySurface(self: *App, chan: u32, sid: u32) ?*Window {
@@ -1137,7 +1153,24 @@ pub const App = struct {
             self.allocator.destroy(w);
             return null;
         };
+        if (!popup) {
+            self.had_toplevel = true;
+            self.presentation_gone = null;
+        }
         return w;
+    }
+
+    fn noteToplevelRemoval(self: *App, reason: PresentationGone) void {
+        if (!self.had_toplevel) return;
+        for (self.windows.items) |w| {
+            if (!w.popup) return;
+        }
+        self.presentation_gone = reason;
+    }
+
+    /// True once an app that rendered a toplevel has lost its whole GUI.
+    pub fn presentationGone(self: *const App) bool {
+        return self.presentation_gone != null;
     }
 
     // ── replica view callbacks ──────────────────────────────────
@@ -1297,17 +1330,20 @@ pub const App = struct {
 
     fn onGone(ctx: ?*anyopaque, sid: u32) void {
         const ch = chanOf(ctx);
+        var removed_toplevel = false;
         var i: usize = 0;
         while (i < ch.app.windows.items.len) {
             const w = ch.app.windows.items[i];
             if (w.chan == ch.id and w.sid == sid) {
                 _ = ch.app.windows.swapRemove(i);
+                removed_toplevel = removed_toplevel or !w.popup;
                 w.deinit(ch.app.allocator);
                 ch.app.allocator.destroy(w);
                 continue;
             }
             i += 1;
         }
+        if (removed_toplevel) ch.app.noteToplevelRemoval(.last_toplevel_destroyed);
     }
 
     // ── waiting ─────────────────────────────────────────────────
@@ -1319,7 +1355,7 @@ pub const App = struct {
             for (self.windows.items) |w| {
                 if (!w.popup and w.frames > 0) return true;
             }
-            if (self.exited) return false;
+            if (self.exited or self.presentationGone()) return false;
             _ = self.pumpOnce(50);
         }
         for (self.windows.items) |w| {
@@ -1342,7 +1378,7 @@ pub const App = struct {
             } else if (nowMs() - quiet_since >= quiet_ms) {
                 return true;
             }
-            if (self.exited) return true;
+            if (self.exited or self.presentationGone()) return true;
         }
         return false;
     }
@@ -1978,7 +2014,7 @@ pub const App = struct {
             const win = self.winById(win_id) orelse return false;
             if (win.frames != win.shot_frames and
                 (min_pct <= 0 or win.pctVsBaseline(region) >= min_pct)) return true;
-            if (self.exited or nowMs() >= deadline) return false;
+            if (self.exited or self.presentationGone() or nowMs() >= deadline) return false;
             _ = self.pumpOnce(25);
         }
     }
@@ -1991,11 +2027,11 @@ pub const App = struct {
     }
 
     /// Pump briefly so a just-happened teardown's `.exit` frame lands;
-    /// true when the app is (now) known to have exited.
+    /// true when the session child exited or its last GUI disappeared.
     pub fn settleExit(self: *App, timeout_ms: i64) bool {
         const deadline = nowMs() + timeout_ms;
         while (!self.exited and nowMs() < deadline) _ = self.pumpOnce(25);
-        return self.exited;
+        return self.exited or self.presentationGone();
     }
 
     /// Pre-input reference for waitChangeSince: the window's commit
@@ -2041,7 +2077,7 @@ pub const App = struct {
                     if (pctDiff(win.pixels.items, ref.px, @intCast(@max(win.w, 0)), region) >= min_pct) return true;
                 }
             } else return false;
-            if (self.exited or nowMs() >= deadline) return false;
+            if (self.exited or self.presentationGone() or nowMs() >= deadline) return false;
             _ = self.pumpOnce(25);
         }
     }
@@ -2054,7 +2090,7 @@ pub const App = struct {
         var last: u64 = (self.winById(win_id) orelse return false).frames;
         var quiet_since = nowMs();
         while (nowMs() < deadline) {
-            if (self.exited) return true;
+            if (self.exited or self.presentationGone()) return true;
             _ = self.pumpOnce(25);
             const win = self.winById(win_id) orelse return false;
             if (win.frames != last) {
@@ -2089,7 +2125,7 @@ pub const App = struct {
         const deadline = nowMs() + timeout_ms;
         var quiet_since = nowMs();
         while (nowMs() < deadline) {
-            if (self.exited) return true;
+            if (self.exited or self.presentationGone()) return true;
             _ = self.pumpOnce(25);
             const win = self.winById(win_id) orelse return false;
             if (win.frames != last_frames) {
@@ -2222,6 +2258,37 @@ test "resync replay: chan_open replace keeps window identity, native_sync prunes
     try t.expect(!ch2.resyncing);
     try t.expectEqual(@as(usize, 1), app.windows.items.len);
     try t.expectEqual(win1, app.windows.items[0]);
+}
+
+test "presentation lifecycle distinguishes freeze, last toplevel, and client disconnect" {
+    const t = std.testing;
+    const a = t.allocator;
+    var app = App{ .allocator = a, .conn = undefined, .name = @constCast("test") };
+    defer testTeardown(&app);
+
+    var pl: [5]u8 = undefined;
+    app.handleFrame(.chan_open, testChanOpenPayload(&pl, 9));
+    const ch = app.chans.get(9).?;
+    const px = [_]u8{ 1, 2, 3, 4 };
+    App.onFrame(ch, 1, 1, 1, 1, 1, 1, 0, &px);
+    App.onFrame(ch, 2, 1, 1, 1, 1, 1, 0, &px);
+    try t.expect(app.had_toplevel);
+    try t.expect(!app.presentationGone());
+
+    // No commits is merely a visually frozen app, not a disconnect.
+    try t.expect(!app.presentationGone());
+    App.onGone(ch, 1);
+    try t.expect(!app.presentationGone()); // another toplevel survives
+    App.onGone(ch, 2);
+    try t.expectEqual(App.PresentationGone.last_toplevel_destroyed, app.presentation_gone.?);
+
+    // A replacement toplevel makes the presentation live again.
+    App.onFrame(ch, 3, 1, 1, 1, 1, 1, 0, &px);
+    try t.expect(!app.presentationGone());
+    var id: [4]u8 = undefined;
+    std.mem.writeInt(u32, &id, 9, .little);
+    app.handleFrame(.chan_close, &id);
+    try t.expectEqual(App.PresentationGone.client_disconnected, app.presentation_gone.?);
 }
 
 test "moveMouseRel first contact places the pointer before the delta motion" {
