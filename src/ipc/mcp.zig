@@ -17,6 +17,8 @@ const platform = @import("../util/platform.zig");
 const protocol = @import("protocol.zig");
 const appdrive = @import("appdrive.zig");
 const termdrive = @import("termdrive.zig");
+const fsdrive = @import("fsdrive.zig");
+const muxclient = @import("../mux/client.zig");
 const marks_mod = @import("../util/marks.zig");
 const template = @import("../util/template.zig");
 const ocr = @import("../util/ocr.zig");
@@ -336,7 +338,6 @@ fn setupIsolation(allocator: std.mem.Allocator, name: ?[]const u8, durable: bool
 /// Ask the daemon at `sock` to shut down and wait (briefly) for it to
 /// stop accepting connections. Best-effort.
 fn shutdownDaemonAt(allocator: std.mem.Allocator, sock: []const u8) void {
-    const muxclient = @import("../mux/client.zig");
     if (muxclient.Conn.connect(allocator, sock)) |conn| {
         var conn2 = conn;
         defer conn2.deinit();
@@ -576,6 +577,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     defer term_state.deinit();
     forward_state = .{ .allocator = allocator };
     defer forward_state.deinit();
+    fs_state = .{ .allocator = allocator };
+    defer fs_state.drop();
     rec_state = .{ .allocator = allocator, .enabled = !opts.no_record };
     defer rec_state.deinit();
     browser_state = .{ .allocator = allocator };
@@ -999,6 +1002,18 @@ const TOOLS_JSON_RAW =
     \\{"name":"port_forward_list","description":"List open port forwards with liveness and reconnect counts.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"port_forward_check","description":"Health-check one forward: verifies the ssh process AND that the local port accepts connections; if the ssh died (network blip, sshd restart) it RECONNECTS by respawning the same spec on the same local port.","inputSchema":{"type":"object","properties":{"forward":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Reconnect readiness budget, default 20000"}}}},
     \\{"name":"port_forward_close","description":"Close a port forward (kills its ssh).","inputSchema":{"type":"object","properties":{"forward":{"type":"integer"}},"required":["forward"]}},
+    \\{"name":"file_list","description":"Rich directory listing on the daemon's host in ONE round trip: kind, size, mtime, permissions and symlink target for every entry, dirs first. Absolute path required.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute directory path"}},"required":["path"]}},
+    \\{"name":"file_stat","description":"Stat one path: kind (file/dir/link/other), size, mtime, mode, owner, symlink target.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+    \\{"name":"file_read","description":"Read a file (ranged). Text returns verbatim after a one-line header (path, size, range, eof); non-UTF-8 content returns base64 with a note. Loop with offset for large files.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"Byte offset (default 0)"},"length":{"type":"integer","description":"Max bytes (default 262144, cap 2097152)"}},"required":["path"]}},
+    \\{"name":"file_write","description":"Write content to a file (created if missing; replaced unless append=true). Returns bytes written.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"append":{"type":"boolean"}},"required":["path","content"]}},
+    \\{"name":"file_mkdir","description":"Create a directory (single level, parent must exist).","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+    \\{"name":"file_rename","description":"Rename/move a file or directory on the same filesystem (rename(2) semantics). Cross-device moves: file_copy then file_delete_tree.","inputSchema":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"}},"required":["from","to"]}},
+    \\{"name":"file_delete","description":"Delete ONE entry: a file, symlink, or EMPTY directory. Trees: file_delete_tree.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+    \\{"name":"file_copy","description":"Copy a file or a whole directory tree as a daemon-side JOB: runs in its own process, survives this MCP server, and is RESUMABLE — resume=true continues a previous interrupted copy from its hash-verified partial (a corrupted partial honestly restarts from zero; the reply's resumed_from says which happened). By default the call waits for completion (bounded); on timeout the job KEEPS RUNNING — check file_jobs, or cancel with file_job.","inputSchema":{"type":"object","properties":{"src":{"type":"string"},"dst":{"type":"string"},"resume":{"type":"boolean","description":"Continue from a previous interrupted copy's staged partial (content-verified)"},"wait":{"type":"boolean","description":"Wait for completion (default true; false returns the job id immediately)"},"timeout_ms":{"type":"integer","description":"Wait bound (default 60000, max 120000)"}},"required":["src","dst"]}},
+    \\{"name":"file_delete_tree","description":"Recursively delete a directory tree as a daemon-side job (same wait/job semantics as file_copy). Destructive and not undoable.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"wait":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["path"]}},
+    \\{"name":"file_hash","description":"SHA-256 of a file, computed daemon-side as a job (only the digest crosses the wire — use for verifying copies).","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["path"]}},
+    \\{"name":"file_jobs","description":"List file jobs (running + recently finished): id, op, state, progress. Jobs survive client disconnects.","inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"file_job","description":"Control a file job: cancel (SIGKILL — works even on jobs stuck in unkillable IO), pause (SIGSTOP), resume (SIGCONT).","inputSchema":{"type":"object","properties":{"job":{"type":"integer"},"action":{"type":"string","enum":["cancel","pause","resume"]}},"required":["job","action"]}},
     \\{"name":"capabilities","description":"Preflight report of what THIS MCP server can do right now: isolation mode, GUI socket presence, OCR (tesseract) availability, which browser binary browser_open would use, ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"browser_open","description":"Launch a Chromium-family browser HEADLESSLY (Wayland, never on any screen) with DevTools (CDP) attached: you get real DOM access — browser_read (text/html/links), browser_elements, browser_click, browser_fill, browser_wait, browser_eval — plus everything an app has (screenshot via get_app_state, app_key for keyboard, app_scroll). Wayland + remote-debugging flags are applied automatically; renderer accessibility is enabled. Replies with the app id, DevTools port, page info and a first screenshot. Local daemon only.","inputSchema":{"type":"object","properties":{"url":{"type":"string","description":"Initial page (default about:blank)"},"profile":{"type":"string","description":"Named PERSISTENT profile (cookies/logins survive across sessions); omit = throwaway profile"},"browser_path":{"type":"string","description":"Specific browser binary (default: first Chromium-family binary on PATH)"},"width":{"type":"integer","description":"Window width, default 1280"},"height":{"type":"integer","description":"Window height, default 900"},"wait_ms":{"type":"integer","description":"Startup budget, default 25000"}}}},
     \\{"name":"browser_info","description":"Current URL, title, readyState, scroll position and viewport of a browser_open app — confirm soft navigations without reading the address bar pixels.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
@@ -1286,6 +1301,30 @@ const TermState = struct {
 };
 
 var term_state: TermState = .{ .allocator = undefined };
+
+/// Lazy fsdrive connection for the file_* tools — same daemon as the
+/// app tools (private in isolated mode, per-user with --shared). One
+/// connection serves every call; a lost daemon drops it so the next
+/// call reconnects.
+const FsState = struct {
+    allocator: std.mem.Allocator,
+    fs: ?fsdrive.Fs = null,
+
+    fn get(self: *FsState) ?*fsdrive.Fs {
+        if (self.fs == null) {
+            const conn = muxclient.Conn.connectLocalAutostartAt(self.allocator, app_state.mux_sock) catch return null;
+            self.fs = fsdrive.Fs.initConn(self.allocator, conn);
+        }
+        return &self.fs.?;
+    }
+
+    fn drop(self: *FsState) void {
+        if (self.fs) |*f| f.deinit();
+        self.fs = null;
+    }
+};
+
+var fs_state: FsState = .{ .allocator = undefined };
 
 /// Server mode facts for the `capabilities` preflight tool.
 var srv_mode: []const u8 = "isolated";
@@ -6259,6 +6298,195 @@ fn browserTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
     return appErr(arena, "unknown tool");
 }
 
+// ── file_* tools (fsdrive against the app daemon) ─────────────────
+
+fn fsFmtTime(buf: []u8, ms: i64) []const u8 {
+    var t: c.time_t = @intCast(@divTrunc(ms, 1000));
+    var tm: c.struct_tm = undefined;
+    if (c.localtime_r(&t, &tm) == null) return "?";
+    const n = c.strftime(buf.ptr, buf.len, "%Y-%m-%d %H:%M", &tm);
+    return buf[0..n];
+}
+
+fn fsEntryLine(w: *std.Io.Writer, e: fsdrive.Entry) !void {
+    var tb: [32]u8 = undefined;
+    try w.print("{s: <5} {d: >12}  {s}  {o:0>4}  {s}", .{
+        e.kind, e.size, fsFmtTime(&tb, e.mtime_ms), e.mode, e.name,
+    });
+    if (e.target) |t| try w.print(" -> {s}", .{t});
+    try w.writeAll("\n");
+}
+
+/// Describe an fsdrive failure. Captures the daemon's error string
+/// BEFORE dropping a dead connection (the Fs would dangle after).
+fn fsFail(arena: std.mem.Allocator, fs: *fsdrive.Fs, what: []const u8, err: fsdrive.Error) ![]const u8 {
+    if (err == fsdrive.Error.NotConnected) {
+        fs_state.drop();
+        return appErr(arena, "daemon connection lost (reconnects on the next file_* call)");
+    }
+    const msg = std.fmt.allocPrint(arena, "{s} failed: {s} ({s})", .{
+        what, fs.lastErr(), @errorName(err),
+    }) catch return error.OutOfMemory;
+    return toolResult(arena, msg, true) orelse error.OutOfMemory;
+}
+
+/// Wait for a job's terminal event and render the outcome. A timeout
+/// is HONEST: the job keeps running daemon-side and the reply says so.
+fn fsAwaitJob(arena: std.mem.Allocator, fs: *fsdrive.Fs, job: u64, opname: []const u8, timeout_ms: i64) ![]const u8 {
+    const end = fs.waitJobEnd(job, timeout_ms) catch |err| switch (err) {
+        fsdrive.Error.Timeout => {
+            const msg = std.fmt.allocPrint(arena, "{s} job {d} still running after {d}ms — it continues in the background (file_jobs to check, file_job to cancel)", .{ opname, job, timeout_ms }) catch return error.OutOfMemory;
+            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        },
+        else => return fsFail(arena, fs, opname, err),
+    };
+    if (end.ok) {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        w.print("{s} job {d} done: {d} bytes", .{ opname, job, end.bytes_done }) catch return error.OutOfMemory;
+        if (end.resumed_from > 0) w.print(", resumed from {d} (partial verified by hash)", .{end.resumed_from}) catch return error.OutOfMemory;
+        if (end.has_hash) w.print(", sha256={s}", .{end.hash[0..]}) catch return error.OutOfMemory;
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+    const msg = std.fmt.allocPrint(arena, "{s} job {d} {s}: {s}", .{
+        opname, job, if (end.canceled) "canceled" else "FAILED", end.messageText(),
+    }) catch return error.OutOfMemory;
+    return toolResult(arena, msg, true) orelse error.OutOfMemory;
+}
+
+fn fsTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
+    const eql = std.mem.eql;
+    const fs = fs_state.get() orelse
+        return appErr(arena, "cannot reach the mux daemon for file tools");
+
+    if (eql(u8, name, "file_list")) {
+        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        var l = fs.list(path) catch |err| return fsFail(arena, fs, "list", err);
+        defer l.deinit();
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        w.print("{s} — {d} entries{s}\n", .{
+            l.path, l.entries.len, if (l.truncated) " (TRUNCATED at the listing cap)" else "",
+        }) catch return error.OutOfMemory;
+        for (l.entries) |e| fsEntryLine(w, e) catch return error.OutOfMemory;
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "file_stat")) {
+        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const e = fs.statPath(arena, path) catch |err| return fsFail(arena, fs, "stat", err);
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        var tb: [32]u8 = undefined;
+        w.print("{s}: {s}, {d} bytes, mode {o:0>4}, uid {d} gid {d}, mtime {s}", .{
+            path, e.kind, e.size, e.mode, e.uid, e.gid, fsFmtTime(&tb, e.mtime_ms),
+        }) catch return error.OutOfMemory;
+        if (e.target) |t| w.print(", -> {s}{s}", .{ t, if (e.tdir) " (dir)" else "" }) catch return error.OutOfMemory;
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "file_read")) {
+        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const off: u64 = @intCast(@max(0, argInt(args, "offset") orelse 0));
+        const want: u32 = @intCast(std.math.clamp(argInt(args, "length") orelse 262_144, 1, 2_097_152));
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(arena);
+        const info = fs.read(path, off, want, &data) catch |err| return fsFail(arena, fs, "read", err);
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        w.print("# {s} (size {d}, read {d} bytes at offset {d}{s})\n", .{
+            path, info.size, data.items.len, off, if (info.eof) ", eof" else ", MORE remains",
+        }) catch return error.OutOfMemory;
+        if (std.unicode.utf8ValidateSlice(data.items) and std.mem.indexOfScalar(u8, data.items, 0) == null) {
+            w.writeAll(data.items) catch return error.OutOfMemory;
+        } else {
+            w.writeAll("# binary content, base64:\n") catch return error.OutOfMemory;
+            const enc = std.base64.standard.Encoder;
+            const b64 = arena.alloc(u8, enc.calcSize(data.items.len)) catch return error.OutOfMemory;
+            w.writeAll(enc.encode(b64, data.items)) catch return error.OutOfMemory;
+        }
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "file_write")) {
+        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const content = argStr(args, "content") orelse return appErr(arena, "missing content");
+        const append = argBool(args, "append");
+        const n = fs.write(path, 0, content, .{
+            .create = true,
+            .truncate = !append,
+            .append = append,
+        }) catch |err| return fsFail(arena, fs, "write", err);
+        const msg = std.fmt.allocPrint(arena, "{s}: {d} bytes {s}", .{
+            path, n, if (append) "appended" else "written",
+        }) catch return error.OutOfMemory;
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "file_mkdir")) {
+        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        fs.mkdir(path) catch |err| return fsFail(arena, fs, "mkdir", err);
+        return toolResult(arena, "created", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "file_rename")) {
+        const from = argStr(args, "from") orelse return appErr(arena, "missing from");
+        const to = argStr(args, "to") orelse return appErr(arena, "missing to");
+        fs.rename(from, to) catch |err| return fsFail(arena, fs, "rename", err);
+        return toolResult(arena, "renamed", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "file_delete")) {
+        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        fs.deletePath(path) catch |err| return fsFail(arena, fs, "delete", err);
+        return toolResult(arena, "deleted", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "file_copy") or eql(u8, name, "file_delete_tree") or eql(u8, name, "file_hash")) {
+        const timeout: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 60_000, 1_000, 120_000);
+        var job: u64 = 0;
+        var opname: []const u8 = "";
+        if (eql(u8, name, "file_copy")) {
+            const src = argStr(args, "src") orelse return appErr(arena, "missing src");
+            const dst = argStr(args, "dst") orelse return appErr(arena, "missing dst");
+            job = fs.startCopy(src, dst, argBool(args, "resume")) catch |err| return fsFail(arena, fs, "copy", err);
+            opname = "copy";
+        } else if (eql(u8, name, "file_delete_tree")) {
+            const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+            job = fs.startDeleteTree(path) catch |err| return fsFail(arena, fs, "delete_tree", err);
+            opname = "delete_tree";
+        } else {
+            const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+            job = fs.startHash(path) catch |err| return fsFail(arena, fs, "hash", err);
+            opname = "hash";
+        }
+        const wait = if (args == .object and args.object.get("wait") != null) argBool(args, "wait") else true;
+        if (!wait) {
+            const msg = std.fmt.allocPrint(arena, "{s} job {d} started (file_jobs to check)", .{ opname, job }) catch return error.OutOfMemory;
+            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        }
+        return fsAwaitJob(arena, fs, job, opname, timeout);
+    }
+    if (eql(u8, name, "file_jobs")) {
+        const rows = fs.jobList(arena) catch |err| return fsFail(arena, fs, "job_list", err);
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        if (rows.len == 0) {
+            w.writeAll("no file jobs") catch return error.OutOfMemory;
+        } else for (rows) |row| {
+            w.print("job {d}: {s} {s} {d}/{d} bytes\n", .{ row.job, row.op, row.state, row.done, row.total }) catch return error.OutOfMemory;
+        }
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "file_job")) {
+        const job: u64 = @intCast(@max(0, argInt(args, "job") orelse 0));
+        const action = argStr(args, "action") orelse return appErr(arena, "missing action");
+        if (eql(u8, action, "cancel")) {
+            fs.jobCancel(job) catch |err| return fsFail(arena, fs, "job_cancel", err);
+        } else if (eql(u8, action, "pause")) {
+            fs.jobPause(job) catch |err| return fsFail(arena, fs, "job_pause", err);
+        } else if (eql(u8, action, "resume")) {
+            fs.jobResume(job) catch |err| return fsFail(arena, fs, "job_resume", err);
+        } else return appErr(arena, "action must be cancel|pause|resume");
+        const msg = std.fmt.allocPrint(arena, "job {d}: {s} sent", .{ job, action }) catch return error.OutOfMemory;
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    }
+    return appErr(arena, "unknown file tool");
+}
+
 fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
 
@@ -6279,6 +6507,9 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
     }
     if (std.mem.startsWith(u8, name, "browser_")) {
         return browserTool(arena, name, args);
+    }
+    if (std.mem.startsWith(u8, name, "file_")) {
+        return fsTool(arena, name, args);
     }
     if (eql(u8, name, "capabilities")) {
         return capabilitiesTool(arena);

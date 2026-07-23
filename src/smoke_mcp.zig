@@ -362,6 +362,38 @@ pub fn main() u8 {
             std.mem.indexOf(u8, caps, "\\\"ocr\\\":") == null)
             fail("capabilities report incomplete");
 
+        // ── file_* tools (fsdrive against the private daemon) ─────
+        {
+            var fsd_buf: [512]u8 = undefined;
+            const fsd = std.fmt.bufPrint(&fsd_buf, "{s}/fs-tools", .{rt}) catch unreachable;
+            var jb: [1024]u8 = undefined;
+            _ = m.callTool("file_mkdir", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}\"}}", .{fsd}) catch unreachable);
+            const wr = m.callTool("file_write", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/a.txt\",\"content\":\"MCP-FS-PAYLOAD\"}}", .{fsd}) catch unreachable);
+            if (std.mem.indexOf(u8, wr, "14 bytes written") == null) fail("file_write failed");
+            const ls = m.callTool("file_list", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}\"}}", .{fsd}) catch unreachable);
+            if (std.mem.indexOf(u8, ls, "a.txt") == null or std.mem.indexOf(u8, ls, "1 entries") == null)
+                fail("file_list missing the written file");
+            const rd = m.callTool("file_read", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/a.txt\"}}", .{fsd}) catch unreachable);
+            if (std.mem.indexOf(u8, rd, "MCP-FS-PAYLOAD") == null or std.mem.indexOf(u8, rd, "eof") == null)
+                fail("file_read did not return the content");
+            const cp = m.callTool("file_copy", std.fmt.bufPrint(&jb, "{{\"src\":\"{s}/a.txt\",\"dst\":\"{s}/b.txt\"}}", .{ fsd, fsd }) catch unreachable);
+            if (std.mem.indexOf(u8, cp, "done: 14 bytes") == null) fail("file_copy job failed");
+            const h1 = m.callTool("file_hash", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/a.txt\"}}", .{fsd}) catch unreachable);
+            const h2 = m.callTool("file_hash", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/b.txt\"}}", .{fsd}) catch unreachable);
+            const hx1 = std.mem.indexOf(u8, h1, "sha256=") orelse fail("file_hash missing digest");
+            const hx2 = std.mem.indexOf(u8, h2, "sha256=") orelse fail("file_hash missing digest 2");
+            if (!std.mem.eql(u8, h1[hx1 + 7 .. hx1 + 71], h2[hx2 + 7 .. hx2 + 71]))
+                fail("copy hash mismatch");
+            const jl = m.callTool("file_jobs", "{}");
+            if (std.mem.indexOf(u8, jl, "copy done") == null) fail("file_jobs missing the finished copy");
+            const del = m.callTool("file_delete", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/b.txt\"}}", .{fsd}) catch unreachable);
+            if (std.mem.indexOf(u8, del, "deleted") == null) fail("file_delete failed");
+            // Error honesty: missing path is an isError reply, not a lie.
+            const missing = m.callTool("file_stat", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/nope\"}}", .{fsd}) catch unreachable);
+            if (std.mem.indexOf(u8, missing, "isError") == null) fail("file_stat of missing path not an error");
+            std.debug.print("smoke-mcp: file_* tools ok\n", .{});
+        }
+
         // ── new_tab falls back to a headless terminal (no GUI) ────
         const nt = m.callTool("new_tab", "{}");
         if (std.mem.indexOf(u8, nt, "\\\"headless\\\":true") == null or
