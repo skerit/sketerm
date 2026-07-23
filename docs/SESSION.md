@@ -8357,3 +8357,61 @@ changes; reproduces at ecfca39): smoke-mux occasionally logs a
 DebugAllocator "Allocation size 38 does not match free size 37" —
 some 37/38-byte string is freed with a mismatched length somewhere in
 the daemon. Worth a separate hunt.
+
+## 2026-07-23: MCP crash-debug loop — gdb_commands, exit-during-wait, region diffs
+
+Driven by field feedback from an assistant iterating on game crashes
+headlessly (relaunch-per-crash was the dominant cost; a click-caused
+crash read as "post-click screenshot failed (no pixels yet?)").
+
+- `launch_app gdb_commands:[...]` (debug:"gdb" only): extra gdb
+  commands appended as `-ex` args AFTER the automatic `bt full` +
+  `info registers` and BEFORE `--args`, so they execute at the crash
+  point — `["frame 3","p *ctx","x/8xw $rcx"]` dumps the state that
+  previously needed a relaunch. Entirely client-side in mcp.zig (the
+  wrapper argv rides SpawnReq.argv; no wire/daemon change). Extracted
+  the wrapper block into `applyDebugWrap` + unit tests; rejected for
+  valgrind and without `debug`.
+- Exit-during-wait honesty: every post-input/wait path now reports an
+  app exit AS an exit with the signal, instead of a misleading
+  verdict. `PostInputWait.finish` re-checks `app.exited` after a
+  false change-wait (the appdrive wait primitives bail on exit but
+  collapse it into plain bools) and returns "app EXITED during the
+  post-input wait (status N = killed by SIGSEGV)"; `inputResult` and
+  app_click then skip the doomed screenshot and attach the full exit
+  summary (signal/crashed/recent_output). Teardown race: the window
+  vanishes BEFORE the `.exit` frame is parsed, so a gone window pumps
+  bounded (`App.windowGone` + `App.settleExit(1s)`) before judging.
+  app_wait no longer says "settled" when the app died mid-wait;
+  app_actions wait_idle/wait_change steps print the exit too.
+- Region-scoped change detection: `pctDiffRegion` in appdrive.zig
+  (stride-walking variant of pctDiffBuf; clamped, out-of-bounds rect
+  diffs 0 — never a false "changed"), threaded as `?Region` through
+  waitChangeSince/waitVisualSettle/waitWindowChange/peekDiffPct/
+  diffStats. `region:{x,y,w,h}` on app_click/type/key/scroll/drag
+  scopes min_change_pct ("assert the tactical viewport repainted");
+  on app_wait it scopes change_pct; on app_actions wait steps via
+  step-level `region`; on screenshot_app the existing crop region now
+  ALSO scopes stats_only (`diff_scope:"region"` in the reply),
+  wait_change, stable_ms and burst gating. Bare region on
+  screenshot_app without a threshold stays a plain crop.
+- launch_app description now advertises the OSC 5522 marker escape as
+  a build-it-in tracing primitive (feedback: good primitive, easy to
+  miss).
+
+Verification: 774 tests pass (2 new: applyDebugWrap argv shape,
+pctDiffRegion semantics), smoke-mcp, smoke-mux, plus live end-to-end
+over real `sketerm mcp` NDJSON: a compiled segfaulting C binary under
+debug:"gdb" with gdb_commands ["frame 1","p c","p c.magic + 1"]
+landed `magic = 42424242` and `42424243` in app_log; weston-clickdot
+under `timeout 2` reported "app EXITED during the post-input wait" on
+a click (previously "screenshot failed"); region stats on clickdot
+discriminated dot-adjacent (2.72%) from far (0.00%) rects, and
+app_click with region passed at the dot and reported "NO repaint in
+the given region" away from it.
+
+Deliberately NOT built (from the same feedback): interactive gdb
+transport (gdb_commands covers the stated goal; a breakpoint/step
+session over MCP is a much larger design) and launch_app waiting on
+an app-private a11y socket (app-specific protocol; needs a design
+decision on what a generic hook would even speak).
