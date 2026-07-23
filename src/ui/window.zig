@@ -1296,15 +1296,54 @@ pub const Window = struct {
     /// New tab whose pane wears the file-browser face (the shell
     /// session underneath stays one toolbar click away).
     pub fn newBrowserTab(self: *Window) !void {
-        const start_cwd = self.focusedPaneCwd();
+        try self.newBrowserTabAt(null);
+    }
+
+    /// Browser tab starting at `spec` (host-qualified allowed); null
+    /// = the focused pane's cwd.
+    pub fn newBrowserTabAt(self: *Window, spec: ?[]const u8) !void {
+        const start_cwd: ?[]const u8 = spec orelse self.focusedPaneCwd();
         try self.newShellTab("Files");
         // newShellTab focuses the fresh pane; attach the browser to it.
         const pane = self.focusedPane() orelse
             (if (self.panes.items.len > 0) self.panes.items[self.panes.items.len - 1] else return);
-        _ = @import("browser.zig").BrowserView.attach(self.allocator, pane, start_cwd) catch |err| {
+        const bv = @import("browser.zig").BrowserView.attach(self.allocator, pane, start_cwd) catch |err| {
             logActionError("new_browser_tab attach", err);
             return err;
         };
+        self.installBrowserHooks(bv);
+    }
+
+    /// Give a browser face its window-level abilities: durable
+    /// terminal tabs on any host, and app-forwarded remote opens.
+    fn installBrowserHooks(self: *Window, bv: *@import("browser.zig").BrowserView) void {
+        bv.hooks_ctx = @ptrCast(self);
+        bv.on_host_term = &browserHostTermCb;
+        bv.on_host_open = &browserHostOpenCb;
+        bv.on_host_exec = &browserHostExecCb;
+    }
+
+    fn browserHostTermCb(ctx: *anyopaque, host: []const u8, path: []const u8) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        const h: ?[]const u8 = if (host.len > 0) host else null;
+        self.newDurableSessionAt(h, path) catch |err|
+            logActionError("browser terminal-here", err);
+    }
+
+    fn browserHostExecCb(ctx: *anyopaque, host: []const u8, cmdline: []const u8) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        const h: ?[]const u8 = if (host.len > 0) host else null;
+        const argv = [_][]const u8{ "/bin/sh", "-c", cmdline };
+        self.launchRemoteAppSession(h, &argv, false) catch |err|
+            logActionError("browser action-exec", err);
+    }
+
+    fn browserHostOpenCb(ctx: *anyopaque, host: []const u8, path: []const u8) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        const h: ?[]const u8 = if (host.len > 0) host else null;
+        const argv = [_][]const u8{ "xdg-open", path };
+        self.launchRemoteAppSession(h, &argv, false) catch |err|
+            logActionError("browser open-on-host", err);
     }
 
     pub fn newShellTabWithProfile(self: *Window, title_opt: ?[*:0]const u8, profile_name: ?[]const u8) !void {
@@ -1494,6 +1533,7 @@ pub const Window = struct {
                 if (p.browser_tabs.len > 0) {
                     const browser_mod = @import("browser.zig");
                     if (browser_mod.BrowserView.attach(self.allocator, pane, p.browser_tabs[0])) |bv| {
+                        self.installBrowserHooks(bv);
                         for (p.browser_tabs[1..]) |tp| _ = bv.newTabSpec(tp);
                     } else |err| {
                         std.debug.print("sketerm: browser restore failed: {s}\n", .{@errorName(err)});
@@ -3847,6 +3887,35 @@ pub const Window = struct {
     /// attach it as a tab.
     pub fn newDurableTab(self: *Window, host: ?[]const u8) !void {
         try self.newDurableSession(host, null);
+    }
+
+    /// Durable shell tab on `host` starting in `cwd` — the browser's
+    /// "Open Terminal Here (new tab)". Unlike newDurableSession, the
+    /// cwd travels even for remote hosts (it names a REMOTE path).
+    pub fn newDurableSessionAt(self: *Window, host: ?[]const u8, cwd: []const u8) !void {
+        var name_buf: [64]u8 = undefined;
+        const name = nextSessionName(&name_buf);
+        var conn = try self.muxConnect(host);
+        {
+            errdefer conn.deinit();
+            const argv: []const []const u8 = if (host != null) &.{} else blk: {
+                const sh: []const u8 = if (self.config.settings.shell) |s| s else sh2: {
+                    const env = c.getenv("SHELL");
+                    break :sh2 if (env != null) std.mem.span(env) else "/bin/sh";
+                };
+                break :blk &.{sh};
+            };
+            try conn.sendJson(.spawn, .{
+                .name = name,
+                .argv = argv,
+                .cwd = cwd,
+                .rows = @as(u16, 24),
+                .cols = @as(u16, 80),
+                .kb_layout = self.config.app_keyboard_layout,
+            });
+            (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
+        }
+        try self.attachMux(conn, name, host, null);
     }
 
     /// Spawn a fresh session on the daemon and attach it — into a new

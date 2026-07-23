@@ -44,6 +44,9 @@ pub const Entry = struct {
     /// True when the entry, links followed, is a directory — the
     /// "can browse into it" signal (true for plain dirs too).
     tdir: bool = false,
+    /// user.sketerm.tags xattr, comma-separated ("" = none; always ""
+    /// on platforms without lgetxattr).
+    tags: []const u8 = "",
 };
 
 pub fn kindOf(mode: c.mode_t) []const u8 {
@@ -97,7 +100,29 @@ pub fn statEntry(arena: std.mem.Allocator, dir: []const u8, name: []const u8) ?E
         var fst: c.struct_stat = undefined;
         if (c.stat(full, &fst) == 0) e.tdir = (fst.st_mode & c.S_IFMT) == c.S_IFDIR;
     }
+    if (comptime is_linux) {
+        var tag_buf: [256]u8 = undefined;
+        const tn = c.lgetxattr(full, TAGS_XATTR, &tag_buf, tag_buf.len);
+        if (tn > 0) {
+            if (std.unicode.utf8ValidateSlice(tag_buf[0..@intCast(tn)]))
+                e.tags = arena.dupe(u8, tag_buf[0..@intCast(tn)]) catch "";
+        }
+    }
     return e;
+}
+
+/// The xattr backing file tags (comma-separated UTF-8).
+pub const TAGS_XATTR = "user.sketerm.tags";
+
+/// Set (or clear with "") the tags xattr. Linux-only; elsewhere a
+/// described error.
+pub fn setTags(path: [*:0]const u8, tags: []const u8) bool {
+    if (comptime !is_linux) return false;
+    if (tags.len == 0) {
+        _ = c.lremovexattr(path, TAGS_XATTR);
+        return true; // absent == cleared
+    }
+    return c.lsetxattr(path, TAGS_XATTR, tags.ptr, tags.len, 0) == 0;
 }
 
 pub const Listing = struct {

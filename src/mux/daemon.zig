@@ -1256,7 +1256,7 @@ const FsView = struct {
 /// transfers — the roadmap's core promise). kill = cancel,
 /// SIGSTOP/SIGCONT = pause/resume.
 const FsJob = struct {
-    const Op = enum { copy, delete_tree, hash };
+    const Op = enum { copy, delete_tree, hash, find, grep };
     const State = enum { running, paused, done, failed, canceled };
 
     allocator: std.mem.Allocator,
@@ -1277,6 +1277,9 @@ const FsJob = struct {
     has_hash: bool = false,
     message: [192]u8 = undefined,
     message_len: usize = 0,
+    /// find/grep: total matches streamed + cap-truncation flag.
+    matches: u64 = 0,
+    truncated: bool = false,
 
     fn deinit(self: *FsJob, kill_child: bool) void {
         if (kill_child and self.out_fd >= 0 and self.pid > 0) {
@@ -3006,6 +3009,8 @@ pub const Daemon = struct {
         @"resume": bool = false,
         /// job_cancel/job_pause/job_resume target.
         job: u64 = 0,
+        /// find/grep search pattern.
+        pattern: []const u8 = "",
     };
 
     /// One change inside an fs_delta. upsert carries `entry`; del only
@@ -3036,7 +3041,8 @@ pub const Daemon = struct {
         // ~ and relative input; the daemon never guesses a cwd here.
         if (r.path.len == 0 or r.path[0] != '/') return fsReplyErr(cl, r.req, "path must be absolute");
         if (std.mem.eql(u8, r.op, "copy") or std.mem.eql(u8, r.op, "delete_tree") or
-            std.mem.eql(u8, r.op, "hash")) return self.fsStartJob(cl, r);
+            std.mem.eql(u8, r.op, "hash") or std.mem.eql(u8, r.op, "find") or
+            std.mem.eql(u8, r.op, "grep")) return self.fsStartJob(cl, r);
 
         if (std.mem.eql(u8, r.op, "open_view")) {
             self.fsOpenView(cl, r);
@@ -3071,6 +3077,13 @@ pub const Daemon = struct {
             if (c.lstat(p, &st) != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(@as(c_int, -1)));
             const rc = if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) c.rmdir(p) else c.unlink(p);
             if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+        } else if (std.mem.eql(u8, r.op, "tag_set")) {
+            // `to` = comma-separated tags ("" clears). Rides the
+            // user.sketerm.tags xattr, so tags travel with the file.
+            var z: [4096]u8 = undefined;
+            const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+            if (!fsserve.setTags(p, r.to)) return fsReplyErr(cl, r.req, "xattr set failed");
             cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
         } else if (std.mem.eql(u8, r.op, "symlink")) {
             // `to` is the link TARGET (may be relative by design);
@@ -3402,12 +3415,18 @@ pub const Daemon = struct {
             .copy
         else if (std.mem.eql(u8, r.op, "delete_tree"))
             .delete_tree
+        else if (std.mem.eql(u8, r.op, "find"))
+            .find
+        else if (std.mem.eql(u8, r.op, "grep"))
+            .grep
         else
             .hash;
         if (op == .copy and (r.to.len == 0 or r.to[0] != '/'))
             return fsReplyErr(cl, r.req, "to must be absolute");
         if (op == .delete_tree and r.path.len <= 1)
             return fsReplyErr(cl, r.req, "refusing to delete /");
+        if ((op == .find or op == .grep) and r.pattern.len == 0)
+            return fsReplyErr(cl, r.req, "empty pattern");
 
         // Helper = this binary re-exec'ed with --job (the broker-worker
         // pattern): spec on stdin, JSON-lines progress on stdout.
@@ -3431,6 +3450,7 @@ pub const Daemon = struct {
             .op = r.op,
             .src = r.path,
             .dst = r.to,
+            .pattern = r.pattern,
             .@"resume" = r.@"resume",
         }, .{}, &spec_aw.writer) catch return fsReplyErr(cl, r.req, "out of memory");
         spec_aw.writer.writeByte('\n') catch return fsReplyErr(cl, r.req, "out of memory");
@@ -3554,6 +3574,8 @@ pub const Daemon = struct {
             .resumed_from = job.resumed_from,
             .hash = if (job.has_hash) job.hash_hex[0..] else "",
             .message = job.message[0..job.message_len],
+            .matches = job.matches,
+            .truncated = job.truncated,
         });
     }
 
@@ -3582,15 +3604,41 @@ pub const Daemon = struct {
             resumed_from: u64 = 0,
             hash: []const u8 = "",
             message: []const u8 = "",
+            path: []const u8 = "",
+            line: u64 = 0,
+            text: []const u8 = "",
+            kind: []const u8 = "",
+            size: u64 = 0,
+            matches: u64 = 0,
+            truncated: bool = false,
         };
         const parsed = std.json.parseFromSlice(Ev, self.allocator, line, .{
             .ignore_unknown_fields = true,
         }) catch return;
         defer parsed.deinit();
         const e = parsed.value;
+        if (std.mem.eql(u8, e.ev, "match")) {
+            // Search hit: forwarded verbatim toward the owner (never
+            // stored — the stream IS the result).
+            job.matches += 1;
+            if (job.owner) |owner| {
+                if (!owner.dead) owner.queueJson(.fs_job, .{
+                    .job = job.id,
+                    .ev = "match",
+                    .path = e.path,
+                    .line = e.line,
+                    .text = e.text,
+                    .kind = e.kind,
+                    .size = e.size,
+                });
+            }
+            return;
+        }
         job.done = e.done;
         if (e.total > job.total) job.total = e.total;
         if (std.mem.eql(u8, e.ev, "done")) {
+            job.matches = if (e.matches > 0) e.matches else job.matches;
+            job.truncated = e.truncated;
             // Cancel raced completion: the work DID finish — honesty
             // says report done, not canceled.
             job.state = .done;

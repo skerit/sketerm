@@ -126,6 +126,14 @@ pub const JobEvent = struct {
     resumed_from: u64 = 0,
     hash: []const u8 = "",
     message: []const u8 = "",
+    /// find/grep match payload (ev == "match").
+    path: []const u8 = "",
+    line: u64 = 0,
+    text: []const u8 = "",
+    kind: []const u8 = "",
+    size: u64 = 0,
+    matches: u64 = 0,
+    truncated: bool = false,
 
     pub fn deinit(self: *JobEvent) void {
         self.arena.deinit();
@@ -242,6 +250,13 @@ pub const Fs = struct {
             resumed_from: u64 = 0,
             hash: []const u8 = "",
             message: []const u8 = "",
+            path: []const u8 = "",
+            line: u64 = 0,
+            text: []const u8 = "",
+            kind: []const u8 = "",
+            size: u64 = 0,
+            matches: u64 = 0,
+            truncated: bool = false,
         };
         const parsed = std.json.parseFromSliceLeaky(Wire, arena.allocator(), payload, .{
             .ignore_unknown_fields = true,
@@ -260,6 +275,13 @@ pub const Fs = struct {
             .resumed_from = parsed.resumed_from,
             .hash = parsed.hash,
             .message = parsed.message,
+            .path = parsed.path,
+            .line = parsed.line,
+            .text = parsed.text,
+            .kind = parsed.kind,
+            .size = parsed.size,
+            .matches = parsed.matches,
+            .truncated = parsed.truncated,
         }) catch arena.deinit();
     }
 
@@ -360,6 +382,7 @@ pub const Fs = struct {
             len: u32 = 0,
             @"resume": bool = false,
             job: u64 = 0,
+            pattern: []const u8 = "",
         };
         var b: Base = .{ .req = req, .op = op };
         inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |fld| {
@@ -550,6 +573,18 @@ pub const Fs = struct {
 
     pub fn startHash(self: *Fs, path: []const u8) Error!u64 {
         return self.startJob("hash", .{ .path = path });
+    }
+
+    /// Recursive name search under `root` (ci substring, or glob when
+    /// the pattern has wildcards). Matches arrive as job events with
+    /// ev == "match".
+    pub fn startFind(self: *Fs, root: []const u8, pattern: []const u8) Error!u64 {
+        return self.startJob("find", .{ .path = root, .pattern = pattern });
+    }
+
+    /// Recursive ci content search; matches carry path + line + text.
+    pub fn startGrep(self: *Fs, root: []const u8, pattern: []const u8) Error!u64 {
+        return self.startJob("grep", .{ .path = root, .pattern = pattern });
     }
 
     pub fn jobCancel(self: *Fs, job: u64) Error!void {
