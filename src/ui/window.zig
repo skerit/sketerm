@@ -1490,6 +1490,16 @@ pub const Window = struct {
                 if (p.mux_session.len > 0 and p.mux_host.len > 0)
                     self.startMuxRestoreJob(pane, p);
 
+                // Browser face: reattach with the saved internal tabs.
+                if (p.browser_tabs.len > 0) {
+                    const browser_mod = @import("browser.zig");
+                    if (browser_mod.BrowserView.attach(self.allocator, pane, p.browser_tabs[0])) |bv| {
+                        for (p.browser_tabs[1..]) |tp| _ = bv.newTab(tp);
+                    } else |err| {
+                        std.debug.print("sketerm: browser restore failed: {s}\n", .{@errorName(err)});
+                    }
+                }
+
                 node_out.* = .{ .leaf = pane };
                 return pane.widget();
             },
@@ -6029,6 +6039,13 @@ pub const Window = struct {
                         mux_host = try arena.dupe(u8, job.host);
                     }
                 }
+                // Browser face: persist the internal tab paths so a
+                // restore reopens the same locations.
+                const browser_tabs: []const []const u8 = blk: {
+                    const bv = @import("browser.zig").BrowserView.fromPane(p) orelse
+                        break :blk &[_][]const u8{};
+                    break :blk try bv.tabPaths(arena);
+                };
                 return .{
                     .cwd = cwd,
                     .command = cmd,
@@ -6039,6 +6056,7 @@ pub const Window = struct {
                     .shader_cleared = p.shader_cleared,
                     .mux_session = mux_session,
                     .mux_host = mux_host,
+                    .browser_tabs = browser_tabs,
                 };
             }
         }

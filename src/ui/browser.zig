@@ -233,6 +233,8 @@ pub const BrowserView = struct {
     notebook: *c.GtkNotebook = undefined,
     path_entry: *c.GtkEntry = undefined,
     status_label: *c.GtkLabel = undefined,
+    /// Copy-source path for the context menu's Copy/Paste (owned).
+    clip_src: ?[]u8 = null,
 
     /// Create a browser face on `pane`, starting at `start_path`
     /// (absolute; "~" and relative fall back to $HOME).
@@ -267,6 +269,20 @@ pub const BrowserView = struct {
         self.deinit();
     }
 
+    /// The BrowserView riding `pane`, if any. Safe cast: browser_ctx
+    /// is only ever set by attach().
+    pub fn fromPane(pane: *Pane) ?*BrowserView {
+        const ctx = pane.browser_ctx orelse return null;
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    /// Internal tab paths in notebook order (layout persistence).
+    pub fn tabPaths(self: *BrowserView, arena: std.mem.Allocator) ![]const []const u8 {
+        const out = try arena.alloc([]const u8, self.tabs.items.len);
+        for (self.tabs.items, 0..) |t, i| out[i] = try arena.dupe(u8, t.root.path);
+        return out;
+    }
+
     pub fn deinit(self: *BrowserView) void {
         if (self.watch_id != 0) _ = c.g_source_remove(self.watch_id);
         self.watch_id = 0;
@@ -278,6 +294,7 @@ pub const BrowserView = struct {
             self.allocator.destroy(p);
         }
         self.pending.deinit(self.allocator);
+        if (self.clip_src) |s| self.allocator.free(s);
         self.conn.deinit();
         self.allocator.destroy(self);
     }
@@ -347,11 +364,36 @@ pub const BrowserView = struct {
                 .fs_delta => {
                     if (self.onDelta(f.payload)) dirty = true;
                 },
+                .fs_job => self.onJobEvent(f.payload),
                 else => {},
             }
         }
         if (dirty) self.renderCurrent();
         return 1;
+    }
+
+    /// Job progress in the status bar (deltas already update the
+    /// listing itself when the copy lands).
+    fn onJobEvent(self: *BrowserView, payload: []const u8) void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const Ev = struct {
+            job: u64 = 0,
+            ev: []const u8 = "",
+            done: u64 = 0,
+            total: u64 = 0,
+            message: []const u8 = "",
+        };
+        const e = std.json.parseFromSliceLeaky(Ev, arena.allocator(), payload, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
+        if (std.mem.eql(u8, e.ev, "progress")) {
+            self.setStatusFmt("copying… {d} / {d} MB", .{ e.done >> 20, e.total >> 20 });
+        } else if (std.mem.eql(u8, e.ev, "done")) {
+            self.setStatus("done");
+        } else if (std.mem.eql(u8, e.ev, "error")) {
+            self.setStatusFmt("job failed: {s}", .{e.message});
+        }
     }
 
     fn onReply(self: *BrowserView, payload: []const u8) bool {
@@ -466,7 +508,7 @@ pub const BrowserView = struct {
         return d;
     }
 
-    fn newTab(self: *BrowserView, path: []const u8) ?*BTab {
+    pub fn newTab(self: *BrowserView, path: []const u8) ?*BTab {
         const dir = self.makeDir(path) orelse return null;
         const tab = self.allocator.create(BTab) catch {
             dir.deinit();
@@ -499,6 +541,11 @@ pub const BrowserView = struct {
         };
 
         _ = c.g_signal_connect_data(listbox, "row-activated", @ptrCast(&onRowActivated), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+
+        const rclick = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
+        _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(listbox, @ptrCast(rclick));
 
         const page_idx = c.gtk_notebook_append_page(self.notebook, scroller, label);
         c.gtk_notebook_set_current_page(self.notebook, page_idx);
@@ -777,6 +824,307 @@ pub const BrowserView = struct {
             const uri = std.fmt.bufPrintZ(&uri_buf, "file://{s}", .{ctx.path}) catch return;
             _ = c.g_app_info_launch_default_for_uri(uri.ptr, null, null);
         }
+    }
+
+    // ── context menu + file operations ──────────────────────────
+
+    /// Heap context for one open menu/dialog popover; owned by the
+    /// popover via g_object_set_data_full (freed when it dies).
+    const MenuCtx = struct {
+        allocator: std.mem.Allocator,
+        view: *BrowserView,
+        tab: *BTab,
+        /// Target entry (null = background click).
+        path: ?[]u8,
+        name: ?[]u8,
+        is_dir: bool,
+        popover: *c.GtkWidget,
+        /// Entry-dialog mode: what Enter commits.
+        mode: enum { none, rename, mkdir } = .none,
+        entry: ?*c.GtkWidget = null,
+
+        fn free(user: ?*anyopaque) callconv(.c) void {
+            const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+            if (ctx.path) |p| ctx.allocator.free(p);
+            if (ctx.name) |n| ctx.allocator.free(n);
+            ctx.allocator.destroy(ctx);
+        }
+    };
+
+    fn menuButton(box: *c.GtkWidget, label: [*:0]const u8, cb: anytype, ctx: *MenuCtx, destructive: bool) void {
+        const btn = c.gtk_button_new_with_label(label);
+        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+        c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(btn)), c.GTK_ALIGN_START);
+        if (destructive) c.gtk_widget_add_css_class(btn, "destructive-action");
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(cb), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(box), btn);
+    }
+
+    fn onRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+        _ = gesture;
+        _ = n_press;
+        const tab: *BTab = @ptrCast(@alignCast(user.?));
+        const self = tab.view;
+
+        var path: ?[]u8 = null;
+        var name: ?[]u8 = null;
+        var is_dir = false;
+        if (c.gtk_list_box_get_row_at_y(tab.listbox, @intFromFloat(y))) |row| {
+            if (c.g_object_get_data(@ptrCast(row), "sketerm-row")) |data| {
+                const rctx: *RowCtx = @ptrCast(@alignCast(data));
+                path = self.allocator.dupe(u8, rctx.path) catch null;
+                name = self.allocator.dupe(u8, std.fs.path.basename(rctx.path)) catch null;
+                is_dir = rctx.is_dir;
+                c.gtk_list_box_select_row(tab.listbox, row);
+            }
+        }
+
+        const popover = c.gtk_popover_new();
+        const ctx = self.allocator.create(MenuCtx) catch {
+            if (path) |p| self.allocator.free(p);
+            if (name) |n| self.allocator.free(n);
+            return;
+        };
+        ctx.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .tab = tab,
+            .path = path,
+            .name = name,
+            .is_dir = is_dir,
+            .popover = popover,
+        };
+        c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(ctx), @ptrCast(&MenuCtx.free));
+
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        if (ctx.path != null) {
+            if (is_dir) {
+                menuButton(box, "Open Terminal Here", &onMenuTerminalHere, ctx, false);
+                menuButton(box, "Open in New Browser Tab", &onMenuOpenTab, ctx, false);
+            }
+            menuButton(box, "Copy", &onMenuCopy, ctx, false);
+            menuButton(box, "Copy Path", &onMenuCopyPath, ctx, false);
+            menuButton(box, "Rename…", &onMenuRename, ctx, false);
+            menuButton(box, "Delete…", &onMenuDelete, ctx, true);
+        }
+        if (self.clip_src != null)
+            menuButton(box, "Paste Here", &onMenuPaste, ctx, false);
+        menuButton(box, "New Folder…", &onMenuNewFolder, ctx, false);
+
+        c.gtk_popover_set_child(@ptrCast(popover), box);
+        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(tab.listbox)));
+        connectPopoverAutoUnparent(popover);
+        const rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
+        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+        c.gtk_popover_popup(@ptrCast(popover));
+    }
+
+    fn onPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
+        if (user) |u| {
+            const pop: *c.GtkWidget = @ptrCast(@alignCast(u));
+            if (c.gtk_widget_get_parent(pop) != null) c.gtk_widget_unparent(pop);
+        }
+    }
+
+    fn connectPopoverAutoUnparent(popover: *c.GtkWidget) void {
+        _ = c.g_signal_connect_data(popover, "closed", @ptrCast(&onPopoverClosed), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
+    }
+
+    fn menuDone(ctx: *MenuCtx) void {
+        c.gtk_popover_popdown(@ptrCast(ctx.popover));
+    }
+
+    fn onMenuTerminalHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const path = ctx.path orelse return menuDone(ctx);
+        // cd the pane's shell into the target (single-quoted; embedded
+        // quotes escaped) and flip to the terminal face.
+        var buf: [4600]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.writeAll("cd '") catch return menuDone(ctx);
+        for (path) |ch| {
+            if (ch == '\'') w.writeAll("'\\''") catch return menuDone(ctx) else w.writeByte(ch) catch return menuDone(ctx);
+        }
+        w.writeAll("'\n") catch return menuDone(ctx);
+        ctx.view.pane.terminal.writeRaw(w.buffered());
+        ctx.view.pane.setBrowserVisible(false);
+        menuDone(ctx);
+    }
+
+    fn onMenuOpenTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        if (ctx.path) |p| _ = ctx.view.newTab(p);
+        menuDone(ctx);
+    }
+
+    fn onMenuCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const path = ctx.path orelse return menuDone(ctx);
+        if (ctx.view.clip_src) |s| ctx.view.allocator.free(s);
+        ctx.view.clip_src = ctx.view.allocator.dupe(u8, path) catch null;
+        ctx.view.setStatusFmt("copied: {s}", .{path});
+        menuDone(ctx);
+    }
+
+    fn onMenuCopyPath(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const path = ctx.path orelse return menuDone(ctx);
+        var z: [4096:0]u8 = undefined;
+        const n = @min(path.len, z.len - 1);
+        @memcpy(z[0..n], path[0..n]);
+        z[n] = 0;
+        const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(ctx.tab.listbox)));
+        c.gdk_clipboard_set_text(clip, &z);
+        menuDone(ctx);
+    }
+
+    fn onMenuPaste(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const src = self.clip_src orelse return menuDone(ctx);
+        const base = std.fs.path.basename(src);
+        var dst_buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&dst_buf);
+        const dir = ctx.tab.root.path;
+        // Same-name collision in the target listing → "-copy" suffix
+        // instead of a silent overwrite.
+        const collides = ctx.tab.root.find(base) != null;
+        w.print("{s}/{s}{s}", .{ if (dir.len == 1) "" else dir, base, if (collides) "-copy" else "" }) catch return menuDone(ctx);
+        const req = self.next_req;
+        self.next_req +%= 1;
+        self.conn.sendJson(.fs_op, .{
+            .req = req,
+            .op = "copy",
+            .path = src,
+            .to = w.buffered(),
+        }) catch self.setStatus("daemon connection lost");
+        self.setStatus("copying…");
+        menuDone(ctx);
+    }
+
+    fn onMenuNewFolder(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        ctx.view.entryDialog(ctx.tab, .mkdir, null);
+        menuDone(ctx);
+    }
+
+    fn onMenuRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const path = ctx.path orelse return menuDone(ctx);
+        ctx.view.entryDialog(ctx.tab, .rename, path);
+        menuDone(ctx);
+    }
+
+    fn onMenuDelete(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = ctx.path orelse return menuDone(ctx);
+        // Confirm popover with one destructive button.
+        const popover = c.gtk_popover_new();
+        const cctx = self.allocator.create(MenuCtx) catch return menuDone(ctx);
+        cctx.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .tab = ctx.tab,
+            .path = self.allocator.dupe(u8, path) catch null,
+            .name = null,
+            .is_dir = ctx.is_dir,
+            .popover = popover,
+        };
+        c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(cctx), @ptrCast(&MenuCtx.free));
+        var lbl: [300:0]u8 = undefined;
+        const base = std.fs.path.basename(path);
+        const txt = std.fmt.bufPrintZ(&lbl, "Delete {s}{s}", .{ base, if (ctx.is_dir) " (recursively)" else "" }) catch "Delete";
+        const btn = c.gtk_button_new_with_label(txt.ptr);
+        c.gtk_widget_add_css_class(btn, "destructive-action");
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onDeleteConfirmed), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
+        c.gtk_popover_set_child(@ptrCast(popover), btn);
+        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(ctx.tab.listbox)));
+        connectPopoverAutoUnparent(popover);
+        c.gtk_popover_popup(@ptrCast(popover));
+        menuDone(ctx);
+    }
+
+    fn onDeleteConfirmed(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = ctx.path orelse return menuDone(ctx);
+        const req = self.next_req;
+        self.next_req +%= 1;
+        self.conn.sendJson(.fs_op, .{
+            .req = req,
+            .op = if (ctx.is_dir) "delete_tree" else "delete",
+            .path = path,
+        }) catch self.setStatus("daemon connection lost");
+        menuDone(ctx);
+    }
+
+    /// One-entry popover shared by Rename (target = old full path)
+    /// and New Folder (target = null → current dir).
+    fn entryDialog(self: *BrowserView, tab: *BTab, mode: @TypeOf(@as(MenuCtx, undefined).mode), rename_path: ?[]const u8) void {
+        const popover = c.gtk_popover_new();
+        const entry = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(entry), if (mode == .mkdir) "folder name" else "new name");
+        if (rename_path) |rp| {
+            var z: [512:0]u8 = undefined;
+            const base = std.fs.path.basename(rp);
+            const n = @min(base.len, z.len - 1);
+            @memcpy(z[0..n], base[0..n]);
+            z[n] = 0;
+            c.gtk_editable_set_text(@ptrCast(entry), &z);
+            c.gtk_editable_select_region(@ptrCast(entry), 0, -1);
+        }
+        const ctx = self.allocator.create(MenuCtx) catch return;
+        ctx.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .tab = tab,
+            .path = if (rename_path) |rp| (self.allocator.dupe(u8, rp) catch null) else null,
+            .name = null,
+            .is_dir = false,
+            .popover = popover,
+            .mode = mode,
+            .entry = entry,
+        };
+        c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(ctx), @ptrCast(&MenuCtx.free));
+        _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onEntryDialogActivate), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        c.gtk_popover_set_child(@ptrCast(popover), entry);
+        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(tab.listbox)));
+        connectPopoverAutoUnparent(popover);
+        c.gtk_popover_popup(@ptrCast(popover));
+        _ = c.gtk_widget_grab_focus(entry);
+    }
+
+    fn onEntryDialogActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const txt = c.gtk_editable_get_text(@ptrCast(entry));
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) {
+            self.setStatus("invalid name");
+            return menuDone(ctx);
+        }
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        const req = self.next_req;
+        self.next_req +%= 1;
+        switch (ctx.mode) {
+            .mkdir => {
+                const dir = ctx.tab.root.path;
+                w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return menuDone(ctx);
+                self.conn.sendJson(.fs_op, .{ .req = req, .op = "mkdir", .path = w.buffered() }) catch
+                    self.setStatus("daemon connection lost");
+            },
+            .rename => {
+                const old = ctx.path orelse return menuDone(ctx);
+                const dir = std.fs.path.dirname(old) orelse return menuDone(ctx);
+                w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return menuDone(ctx);
+                self.conn.sendJson(.fs_op, .{ .req = req, .op = "rename", .path = old, .to = w.buffered() }) catch
+                    self.setStatus("daemon connection lost");
+            },
+            .none => {},
+        }
+        menuDone(ctx);
     }
 
     // ── toolbar ─────────────────────────────────────────────────
