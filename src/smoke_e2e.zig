@@ -134,9 +134,29 @@ pub fn main() u8 {
         _ = c.usleep(200_000);
         const text_resp = roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n") orelse return fail("get-text roundtrip");
         defer allocator.free(text_resp);
-        if (std.mem.count(u8, text_resp, MARKER) >= 2) {
+        // De-wrap before counting: on a narrow window (xvfb-run's
+        // 640x480 default) the TYPED echo line wraps mid-marker, so
+        // count on a copy with the JSON "\n" escapes removed.
+        const flat = allocator.alloc(u8, text_resp.len) catch return fail("alloc");
+        defer allocator.free(flat);
+        var w: usize = 0;
+        var r: usize = 0;
+        while (r < text_resp.len) {
+            if (r + 1 < text_resp.len and text_resp[r] == '\\' and text_resp[r + 1] == 'n') {
+                r += 2;
+                continue;
+            }
+            flat[w] = text_resp[r];
+            w += 1;
+            r += 1;
+        }
+        if (std.mem.count(u8, flat[0..w], MARKER) >= 2) {
             seen = true;
             break;
+        }
+        if (tries == 49) {
+            // Diagnosability: show what the screen actually held.
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: last get-text: %.*s\n", @as(c_int, @intCast(@min(text_resp.len, 2000))), text_resp.ptr);
         }
     }
     if (!seen) return fail("marker output never appeared in get-text");
