@@ -13,6 +13,7 @@ const daemon_mod = @import("mux/daemon.zig");
 const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
 const fsdrive = @import("ipc/fsdrive.zig");
+const fstransfer = @import("ipc/fstransfer.zig");
 const fsserve = @import("mux/fsserve.zig");
 const fsjob = @import("mux/fsjob.zig");
 const pathz = @import("util/pathz.zig");
@@ -578,6 +579,218 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
     std.debug.print("smoke-fs: {s} job stage ok\n", .{tag});
 }
 
+// ── cross-daemon (client-mediated) transfer stage ──────────────
+
+const XferConns = struct {
+    src: client_mod.Conn,
+    dst: client_mod.Conn,
+
+    fn open(allocator: std.mem.Allocator, src_sock: []const u8, dst_sock: []const u8) XferConns {
+        var s = client_mod.Conn.connectProbed(allocator, src_sock) catch fail("xfer src connect");
+        s.setNonBlocking();
+        var d = client_mod.Conn.connectProbed(allocator, dst_sock) catch fail("xfer dst connect");
+        d.setNonBlocking();
+        return .{ .src = s, .dst = d };
+    }
+
+    fn close(self: *XferConns) void {
+        self.src.deinit();
+        self.dst.deinit();
+    }
+};
+
+/// Pump both connections into the Xfer until it terminates, a
+/// deadline passes, or `stop_after` bytes of progress accumulate
+/// (0 = run to completion). Returns true when the Xfer terminated.
+fn pumpXfer(allocator: std.mem.Allocator, x: *fstransfer.Xfer, conns: *XferConns, timeout_ms: i64, stop_after: u64) bool {
+    var waited: i64 = 0;
+    while (waited < timeout_ms) {
+        var pfds = [_]c.struct_pollfd{
+            .{ .fd = conns.src.fd, .events = c.POLLIN, .revents = 0 },
+            .{ .fd = conns.dst.fd, .events = c.POLLIN, .revents = 0 },
+        };
+        _ = c.poll(&pfds, 2, 20);
+        waited += 20;
+        inline for (.{ .src, .dst }) |side| {
+            const conn = if (side == .src) &conns.src else &conns.dst;
+            if (!conn.fillAvailable()) fail("xfer conn hangup");
+            while (conn.takeFrame() catch null) |f| {
+                defer f.deinit(allocator);
+                _ = x.feed(side, f.ftype, f.payload);
+            }
+        }
+        if (x.isTerminal()) return true;
+        if (stop_after > 0 and x.progress().done >= stop_after) return false;
+    }
+    fail("xfer pump timed out");
+}
+
+fn statExists(fs: *fsdrive.Fs, allocator: std.mem.Allocator, path: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    _ = fs.statPath(arena.allocator(), path) catch return false;
+    return true;
+}
+
+fn xferStage(allocator: std.mem.Allocator, sock_a: []const u8, sock_b: []const u8) void {
+    var dbuf_a: [64]u8 = undefined;
+    var dbuf_b: [64]u8 = undefined;
+    const dir_a = mkTmpDir(&dbuf_a, "xa");
+    const dir_b = mkTmpDir(&dbuf_b, "xb");
+    var req: u32 = 1;
+    var pb: [8][4096]u8 = undefined;
+
+    // Oracle client on the destination daemon (existence checks).
+    var fsb = fsdrive.Fs.connect(allocator, sock_b) catch fail("xfer oracle connect");
+    defer fsb.deinit();
+
+    // ── single file A → B, hash-verified end to end ────────────
+    const src1 = std.fmt.bufPrint(&pb[0], "{s}/one.bin", .{dir_a}) catch unreachable;
+    const dst1 = std.fmt.bufPrint(&pb[1], "{s}/one.copy", .{dir_b}) catch unreachable;
+    writePattern(src1, 5 << 20, 11);
+    {
+        var conns = XferConns.open(allocator, sock_a, sock_b);
+        defer conns.close();
+        const x = fstransfer.Xfer.init(allocator, &conns.src, &conns.dst, &req, src1, dst1, false) catch fail("xfer init");
+        defer x.deinit();
+        x.start();
+        if (!pumpXfer(allocator, x, &conns, 30_000, 0)) fail("single xfer never finished");
+        if (!x.ok()) failErr("single xfer failed", x.errMsg());
+        if (!std.mem.eql(u8, &(fileSha(dst1) orelse fail("dst1 sha")), &(fileSha(src1) orelse fail("src1 sha"))))
+            fail("single xfer content mismatch");
+        var partp: [4096]u8 = undefined;
+        const staged = std.fmt.bufPrint(&partp, "{s}.skpart", .{dst1}) catch unreachable;
+        if (statExists(&fsb, allocator, staged)) fail("single xfer left staged partial");
+    }
+
+    // ── induced disconnect mid-transfer, then resume ───────────
+    const src2 = std.fmt.bufPrint(&pb[2], "{s}/big.bin", .{dir_a}) catch unreachable;
+    const dst2 = std.fmt.bufPrint(&pb[3], "{s}/big.copy", .{dir_b}) catch unreachable;
+    writePattern(src2, 12 << 20, 23);
+    {
+        // First attempt: kill both connections after ~3MB.
+        var conns = XferConns.open(allocator, sock_a, sock_b);
+        const x = fstransfer.Xfer.init(allocator, &conns.src, &conns.dst, &req, src2, dst2, true) catch fail("xfer2 init");
+        x.start();
+        if (pumpXfer(allocator, x, &conns, 30_000, 3 << 20)) fail("xfer2 finished before the induced disconnect");
+        x.deinit();
+        conns.close(); // abrupt client death; staged partial stays on B
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var partp: [4096]u8 = undefined;
+        const staged = std.fmt.bufPrint(&partp, "{s}.skpart", .{dst2}) catch unreachable;
+        const st = fsb.statPath(arena.allocator(), staged) catch failErr("no staged partial after disconnect", fsb.lastErr());
+        if (st.size == 0) fail("staged partial is empty");
+    }
+    {
+        // Second attempt resumes from the partial (proof: resumed_bytes).
+        var conns = XferConns.open(allocator, sock_a, sock_b);
+        defer conns.close();
+        const x = fstransfer.Xfer.init(allocator, &conns.src, &conns.dst, &req, src2, dst2, true) catch fail("xfer3 init");
+        defer x.deinit();
+        x.start();
+        if (!pumpXfer(allocator, x, &conns, 60_000, 0)) fail("resume xfer never finished");
+        if (!x.ok()) failErr("resume xfer failed", x.errMsg());
+        if (x.resumed_bytes == 0) fail("resume xfer did not resume");
+        if (!std.mem.eql(u8, &(fileSha(dst2) orelse fail("dst2 sha")), &(fileSha(src2) orelse fail("src2 sha"))))
+            fail("resumed xfer content mismatch");
+    }
+
+    // ── corrupted partial: resume must FAIL the verify and delete
+    // the corrupt destination (honesty over silence) ───────────
+    const src3 = std.fmt.bufPrint(&pb[4], "{s}/ver.bin", .{dir_a}) catch unreachable;
+    const dst3 = std.fmt.bufPrint(&pb[5], "{s}/ver.copy", .{dir_b}) catch unreachable;
+    writePattern(src3, 3 << 20, 31);
+    {
+        var partp: [4096]u8 = undefined;
+        const staged = std.fmt.bufPrint(&partp, "{s}.skpart", .{dst3}) catch unreachable;
+        writePattern(staged, 1 << 20, 77); // wrong bytes
+        var conns = XferConns.open(allocator, sock_a, sock_b);
+        defer conns.close();
+        const x = fstransfer.Xfer.init(allocator, &conns.src, &conns.dst, &req, src3, dst3, true) catch fail("xfer4 init");
+        defer x.deinit();
+        x.start();
+        if (!pumpXfer(allocator, x, &conns, 60_000, 0)) fail("verify xfer never finished");
+        if (x.ok()) fail("corrupt resume passed verification");
+        if (statExists(&fsb, allocator, dst3)) fail("corrupt destination not deleted");
+    }
+
+    // ── tree A → B (dirs, files, symlink), then a resumable rerun
+    // that skips completed files ───────────────────────────────
+    const tsrc = std.fmt.bufPrint(&pb[6], "{s}/tree", .{dir_a}) catch unreachable;
+    const tdst = std.fmt.bufPrint(&pb[7], "{s}/tree.copy", .{dir_b}) catch unreachable;
+    {
+        var z: [4096]u8 = undefined;
+        _ = c.mkdir(pathz.pathZ(&z, tsrc) catch unreachable, 0o755);
+        var fp: [4096]u8 = undefined;
+        const subp = std.fmt.bufPrint(&fp, "{s}/sub", .{tsrc}) catch unreachable;
+        _ = c.mkdir(pathz.pathZ(&z, subp) catch unreachable, 0o755);
+        var fp2: [4096]u8 = undefined;
+        writePattern(std.fmt.bufPrint(&fp2, "{s}/top.dat", .{tsrc}) catch unreachable, 100_000, 3);
+        writePattern(std.fmt.bufPrint(&fp2, "{s}/sub/leaf.dat", .{tsrc}) catch unreachable, 200_000, 4);
+        var lz: [4096]u8 = undefined;
+        const lp = std.fmt.bufPrint(&fp2, "{s}/ln", .{tsrc}) catch unreachable;
+        _ = c.symlink("top.dat", pathz.pathZ(&lz, lp) catch unreachable);
+    }
+    {
+        var conns = XferConns.open(allocator, sock_a, sock_b);
+        defer conns.close();
+        const x = fstransfer.Xfer.init(allocator, &conns.src, &conns.dst, &req, tsrc, tdst, false) catch fail("tree xfer init");
+        defer x.deinit();
+        x.start();
+        if (!pumpXfer(allocator, x, &conns, 60_000, 0)) fail("tree xfer never finished");
+        if (!x.ok()) failErr("tree xfer failed", x.errMsg());
+        if (x.files_done != 2) fail("tree xfer file count");
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var fp: [4096]u8 = undefined;
+        const leaf = std.fmt.bufPrint(&fp, "{s}/sub/leaf.dat", .{tdst}) catch unreachable;
+        const lst = fsb.statPath(arena.allocator(), leaf) catch failErr("tree leaf stat", fsb.lastErr());
+        if (lst.size != 200_000) fail("tree leaf size");
+        const lnp = std.fmt.bufPrint(&fp, "{s}/ln", .{tdst}) catch unreachable;
+        const lnst = fsb.statPath(arena.allocator(), lnp) catch failErr("tree link stat", fsb.lastErr());
+        if (!std.mem.eql(u8, lnst.kind, "link")) fail("tree link kind");
+        if (!std.mem.eql(u8, lnst.target orelse "", "top.dat")) fail("tree link target");
+    }
+    {
+        var conns = XferConns.open(allocator, sock_a, sock_b);
+        defer conns.close();
+        const x = fstransfer.Xfer.init(allocator, &conns.src, &conns.dst, &req, tsrc, tdst, true) catch fail("tree rerun init");
+        defer x.deinit();
+        x.start();
+        if (!pumpXfer(allocator, x, &conns, 60_000, 0)) fail("tree rerun never finished");
+        if (!x.ok()) failErr("tree rerun failed", x.errMsg());
+        if (x.files_skipped != 2) fail("tree rerun did not skip completed files");
+    }
+
+    // ── cancel drops the (non-resumable) staged partial ────────
+    {
+        var sb: [4096]u8 = undefined;
+        var db: [4096]u8 = undefined;
+        const csrc = std.fmt.bufPrint(&sb, "{s}/cx.bin", .{dir_a}) catch unreachable;
+        const cdst = std.fmt.bufPrint(&db, "{s}/cx.copy", .{dir_b}) catch unreachable;
+        writePattern(csrc, 8 << 20, 41);
+        var conns = XferConns.open(allocator, sock_a, sock_b);
+        defer conns.close();
+        const x = fstransfer.Xfer.init(allocator, &conns.src, &conns.dst, &req, csrc, cdst, false) catch fail("cancel xfer init");
+        defer x.deinit();
+        x.start();
+        if (pumpXfer(allocator, x, &conns, 30_000, 1 << 20)) fail("cancel xfer finished early");
+        x.cancel();
+        if (!x.isTerminal()) fail("cancel not terminal");
+        // Give the delete a moment, then confirm neither name exists.
+        _ = c.usleep(200_000);
+        var partp: [4096]u8 = undefined;
+        const staged = std.fmt.bufPrint(&partp, "{s}.skpart", .{cdst}) catch unreachable;
+        if (statExists(&fsb, allocator, staged)) fail("cancel left staged partial");
+        if (statExists(&fsb, allocator, cdst)) fail("cancel left destination");
+    }
+
+    std.debug.print("smoke-fs: xfer stage ok\n", .{});
+}
+
 fn sigNoop(_: c_int) callconv(.c) void {}
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -615,6 +828,27 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     th.join();
     d.deinit();
+
+    // ── cross-daemon transfer pass (two daemons at once: A is the
+    // source host, B the destination; the client mediates) ─────
+    var xa_buf: [128]u8 = undefined;
+    var xb_buf: [128]u8 = undefined;
+    const sock_xa = std.fmt.bufPrint(&xa_buf, "/tmp/sketerm-smoke-fs-xa{d}/mux.sock", .{c.getpid()}) catch unreachable;
+    const sock_xb = std.fmt.bufPrint(&xb_buf, "/tmp/sketerm-smoke-fs-xb{d}/mux.sock", .{c.getpid()}) catch unreachable;
+    const da = daemon_mod.Daemon.init(allocator, sock_xa) catch fail("daemon A init");
+    const tha = std.Thread.spawn(.{}, daemonMain, .{da}) catch fail("thread A spawn");
+    const db = daemon_mod.Daemon.init(allocator, sock_xb) catch fail("daemon B init");
+    const thb = std.Thread.spawn(.{}, daemonMain, .{db}) catch fail("thread B spawn");
+    xferStage(allocator, sock_xa, sock_xb);
+    inline for (.{ sock_xa, sock_xb }) |sp| {
+        var conn = client_mod.Conn.connect(allocator, sp) catch fail("xfer shutdown connect");
+        defer conn.deinit();
+        conn.sendFrame(.shutdown, "") catch fail("xfer shutdown send");
+    }
+    tha.join();
+    da.deinit();
+    thb.join();
+    db.deinit();
 
     // ── broker pass (same fs surface served by a broker-mode
     // daemon: fs clients never attach, so the broker itself must
