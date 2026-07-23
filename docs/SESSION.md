@@ -8865,3 +8865,79 @@ Fixes to the harness (smoke_e2e.zig):
   640x480 default screen: the TYPED echo line wraps mid-marker, so
   the count saw 1. The check now de-wraps (strips JSON \n escapes)
   before counting, and prints the final get-text on failure.
+
+## 2026-07-23: phases 5-8 sweep — search, openers, power features, FUSE
+
+- Daemon search verbs (fsjob subprocess jobs, capped streams): `find`
+  = recursive name match (ci substring, or glob when the pattern has
+  wildcards — pure-Zig iterative matcher, unit-tested) and `grep` =
+  recursive ci content match with line numbers + sanitized previews,
+  binary files (NUL probe) and >8MB files skipped. Matches stream as
+  fs_job "match" events (daemon forwards them verbatim; done carries
+  matches+truncated). fsdrive startFind/startGrep; smoke-fs grew a
+  search stage (ci find, glob find, grep line numbers, binary skip)
+  — green in monolith and broker.
+- `tag_set` verb + tags in every listing entry (user.sketerm.tags
+  xattr via l*etxattr; Linux-gated, macOS compiles). Browser renders
+  [tags] dimmed on rows (live via IN_ATTRIB deltas) and edits them
+  through a Tags… popover.
+- Browser: search bar (toolbar toggle) → results stream into a
+  panelize-style FLAT tab (full path in target; rows open/navigate);
+  a new search cancels the previous job. Internal tabs got close
+  buttons. Transfer queue: at most 2 client-mediated transfers run,
+  the rest show [queued] and start as slots free (also gated on host
+  connect). Mount bypass: navigation into a fuse.sshfs/NFS mountpoint
+  (longest /proc/mounts prefix, octal-unescaped) silently reroutes to
+  direct mux on the source host with a "via sketerm" status. Batch
+  rename (multi-select, find/replace on basenames). Cross-host
+  collection shelf (flat tab of host-qualified specs; open/remove;
+  session-local). Sync Here = resumable mirror paste without the
+  -copy suffix (same-host: daemon copy resume; cross-host: Xfer skip-
+  completed). Declarative actions: $XDG_CONFIG_HOME/sketerm/actions/
+  *.action (Name/Exec with %f quoted/Ext filter/RunsOnHost) — local
+  actions g_spawn, RunsOnHost actions run as app sessions on the
+  file's host via a window hook (windows forward). Rows are DnD
+  sources (path as text — terminal panes already accept string
+  drops). Remote files: "Open on Host (app forward)" menu item
+  (xdg-open in an app session); dirs: "Open Terminal Tab Here" =
+  durable session on the tab's host cd'ed to the dir (window hook →
+  newDurableSessionAt; remote cwd travels in spawn).
+- `sketerm files [spec]` + dev.sker.sketerm.files.desktop (PKGBUILD
+  installs it): standalone file-manager entry point. Fresh start
+  opens a browser-only window at the spec; against a RUNNING
+  instance the command-line handler opens the tab there instead.
+- Phase 6 FUSE: src/fsmount.zig — pure-Zig /dev/fuse client, NO
+  libfuse. fd via fusermount3's _FUSE_COMMFD SCM_RIGHTS handshake
+  (the unprivileged path); INIT negotiation (BIG_WRITES, 128K
+  max_write), LOOKUP/GETATTR/FORGET(+BATCH)/OPENDIR/READDIR/
+  RELEASEDIR/OPEN(O_TRUNC honored)/READ (ranged, chunked over
+  MAX_READ)/WRITE/CREATE/MKDIR/UNLINK/RMDIR/RENAME(2) with subtree
+  path rewrite/SYMLINK/READLINK/SETATTR(size 0 or no-op; else
+  EOPNOTSUPP — the wire has no ftruncate)/STATFS. Node table with
+  slot reuse (unit-tested: ensure/forget/reuse, rename subtree,
+  errno mapping). `sketerm mount <host>[:/path] <mountpoint>`,
+  Ctrl-C or fusermount3 -u to stop. smoke-fuse runs REAL kernel file
+  ops through the mount (readdir/read incl. multi-chunk/write-
+  through/mkdir/rename/unlink/symlink/O_TRUNC) against a daemon
+  thread — SKIPs honestly where /dev/fuse is missing.
+
+Verification: unit suite 782 pass / 6 skip / 0 fail (788; +glob,
++3 fsmount); smoke-fs (search + xfer stages, both modes) OK;
+smoke-broker, smoke-mcp PASS; GUI + mux + musl portable + aarch64-
+macos cross builds; daemon still libc-only (ldd). GUI features
+verified live under Xvfb with screenshots: files-mode window, grep
+results tab with line previews + jobs-panel row, tags set via
+popover and rendered from the ATTRIB delta (xattr confirmed on
+disk), Count Lines .action button (ext-filtered) executed, batch
+rename applied on disk, collection tab created. NOT runtime-
+verified here: the FUSE mount itself — this container has no
+/dev/fuse (fusermount3 present, device absent); `zig build
+smoke-fuse` is the one-command proof on a real host.
+
+Still open (deliberate scope calls, not oversights): Miller-columns
+view (large GTK view-mode work), Haiku-style PUSH-live saved queries
+(needs daemon-side whole-tree watch registration; searches re-run on
+demand today), collection persistence across sessions, per-rule file
+coloring config, FUSE placeholder/pin/evict cache tiers (reads are
+ranged+direct today; the CfAPI-style cache is the phase-6 second
+step), $EDITOR-buffer batch rename.
