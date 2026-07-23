@@ -1293,6 +1293,20 @@ pub const Window = struct {
         return self.newShellTabWithProfile(title_opt, null);
     }
 
+    /// New tab whose pane wears the file-browser face (the shell
+    /// session underneath stays one toolbar click away).
+    pub fn newBrowserTab(self: *Window) !void {
+        const start_cwd = self.focusedPaneCwd();
+        try self.newShellTab("Files");
+        // newShellTab focuses the fresh pane; attach the browser to it.
+        const pane = self.focusedPane() orelse
+            (if (self.panes.items.len > 0) self.panes.items[self.panes.items.len - 1] else return);
+        _ = @import("browser.zig").BrowserView.attach(self.allocator, pane, start_cwd) catch |err| {
+            logActionError("new_browser_tab attach", err);
+            return err;
+        };
+    }
+
     pub fn newShellTabWithProfile(self: *Window, title_opt: ?[*:0]const u8, profile_name: ?[]const u8) !void {
         var num_buf: [32]u8 = undefined;
         const title = if (title_opt) |t| t else blk: {
@@ -5219,6 +5233,12 @@ pub const Window = struct {
                 .tab = self.next_tab_id - 1,
                 .pane = self.next_pane_id - 1,
             });
+        } else if (eql(u8, req.cmd, "new-browser-tab")) {
+            try self.newBrowserTab();
+            try ipc_protocol.writeOk(out, allocator, "created", .{
+                .tab = self.next_tab_id - 1,
+                .pane = self.next_pane_id - 1,
+            });
         } else if (eql(u8, req.cmd, "split")) {
             const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
             const win = self.ownerWindow(pane);
@@ -6456,6 +6476,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .apply_profile => self.openApplyProfilePicker(),
         .show_scrollback => self.openScrollbackPager(),
         .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
+        .new_browser_tab => self.newBrowserTab() catch |err| logActionError("new_browser_tab", err),
         .mux_detach => if (self.focusedPane()) |p| self.detachPaneToShell(p),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         .hints_open => self.openHints(),

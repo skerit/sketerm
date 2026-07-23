@@ -101,6 +101,8 @@ const ENTRIES = [_]Entry{
        .desc = "Open the scrollback buffer plus visible screen in a pager tab.", .action = .show_scrollback },
     .{ .icon = "network-server-symbolic", .title = "New Durable Tab (mux)",
        .desc = "Shell in the sketerm-mux daemon; survives GUI restarts.", .action = .new_durable_tab },
+    .{ .icon = "folder-symbolic", .title = "New File Browser Tab",
+       .desc = "Browse files with live listings; the pane's shell is one click away.", .action = .new_browser_tab },
 
     // Font
     .{ .icon = "zoom-in-symbolic", .title = "Increase Font Size",
