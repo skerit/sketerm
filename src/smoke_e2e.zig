@@ -14,6 +14,7 @@ const protocol = @import("ipc/protocol.zig");
 const MARKER = "sketerm-e2e-marker-7423";
 
 var child_pid: c.pid_t = 0;
+var daemon_pid: c.pid_t = 0;
 
 fn fail(comptime msg: []const u8) u8 {
     _ = c.fprintf(platform.stderr(), "smoke-e2e: FAIL: " ++ msg ++ "\n");
@@ -21,6 +22,14 @@ fn fail(comptime msg: []const u8) u8 {
         _ = c.kill(child_pid, c.SIGKILL);
         var status: c_int = 0;
         _ = c.waitpid(child_pid, &status, 0);
+        child_pid = 0;
+    }
+    if (daemon_pid > 0) {
+        // Let the broker terminate and reap its exact worker children.
+        _ = c.kill(daemon_pid, c.SIGTERM);
+        var status: c_int = 0;
+        _ = c.waitpid(daemon_pid, &status, 0);
+        daemon_pid = 0;
     }
     return 1;
 }
@@ -39,12 +48,48 @@ pub fn main() u8 {
         return 0;
     }
 
+    // Every mutable path and the daemon itself are private to this smoke.
+    // A protocol bump must never classify the user's live daemon as stale
+    // and shut it down.
+    var rt_buf: [256]u8 = undefined;
+    const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/sketerm-smoke-e2e-{d}", .{c.getpid()}) catch return fail("runtime path");
+    _ = c.mkdir(rt.ptr, 0o700);
+    _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
+    _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
+    _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
+    _ = c.unsetenv("SKETERM_SOCKET");
+    defer @import("mux/daemon.zig").removeTreeBestEffort(rt);
+
+    const mux_pid = c.fork();
+    if (mux_pid < 0) return fail("mux fork");
+    if (mux_pid == 0) {
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", "--broker", null };
+        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    daemon_pid = mux_pid;
+    var mux_sock_buf: [512]u8 = undefined;
+    const mux_sock = std.fmt.bufPrintZ(&mux_sock_buf, "{s}/sketerm/mux.sock", .{rt}) catch return fail("mux socket path");
+    var waited: u32 = 0;
+    while (c.access(mux_sock.ptr, c.F_OK) != 0) {
+        _ = c.usleep(50_000);
+        waited += 1;
+        if (waited > 100) return fail("private mux socket never appeared (5s)");
+    }
+
     // Spawn the freshly-built binary with its own app id so it
     // doesn't join a running user instance via GApplication.
     const pid = c.fork();
     if (pid < 0) return fail("fork");
     if (pid == 0) {
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e", 1);
+        // xvfb-run adds DISPLAY but preserves an inherited WAYLAND_DISPLAY.
+        // Prefer the explicit test X server instead of opening a window on a
+        // live forwarded Wayland compositor.
+        if (c.getenv("DISPLAY") != null) {
+            _ = c.setenv("GDK_BACKEND", "x11", 1);
+            _ = c.unsetenv("WAYLAND_DISPLAY");
+        }
         // Cross-check the pane-tree model against the widget tree
         // after every split/close — divergence aborts the app, which
         // fails this harness.
@@ -56,10 +101,9 @@ pub fn main() u8 {
     child_pid = pid;
 
     // Wait for the socket to appear (app startup + bind).
-    const rt = @import("util/platform.zig").runtimeDir();
     const sock_path = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm/{d}.sock", .{ rt, pid }, 0) catch return fail("alloc");
     defer allocator.free(sock_path);
-    var waited: u32 = 0;
+    waited = 0;
     while (c.access(sock_path.ptr, c.F_OK) != 0) {
         _ = c.usleep(100_000);
         waited += 1;
@@ -147,6 +191,10 @@ pub fn main() u8 {
     _ = c.waitpid(pid, &status, 0);
     child_pid = 0;
     if (c.access(sock_path.ptr, c.F_OK) == 0) return fail("socket not unlinked on shutdown");
+
+    _ = c.kill(daemon_pid, c.SIGTERM);
+    _ = c.waitpid(daemon_pid, &status, 0);
+    daemon_pid = 0;
 
     _ = c.fputs("smoke-e2e: PASS\n", platform.stdout());
     return 0;
