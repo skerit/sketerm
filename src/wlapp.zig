@@ -310,6 +310,9 @@ pub const AppHost = struct {
             if (self.app_id) |old| self.host.allocator.free(old);
             self.app_id = owned;
             rw.applyAppId(self.window, owned);
+            // gtk_window_set_icon_name is only a local-name fallback;
+            // shipped pixels are authoritative when available.
+            self.applyIcon();
         }
 
         /// Ctrl+right-click host menu: the only host-side chrome a
@@ -1399,7 +1402,10 @@ pub const AppHost = struct {
     /// and set it on the window; stash if the window isn't up yet.
     fn onIcon(ctx: ?*anyopaque, surface: u32, kind: u8, bytes: []const u8) void {
         const self = cast.userData(AppHost, ctx);
-        const tex = decodeIcon(kind, bytes) orelse return;
+        const tex = decodeIcon(kind, bytes) orelse {
+            std.log.warn("forwarded-app icon decode failed (surface={d}, kind={d}, bytes={d})", .{ surface, kind, bytes.len });
+            return;
+        };
         if (self.windows.get(surface)) |win| {
             win.setIconTexture(tex);
             return;
@@ -1576,6 +1582,10 @@ pub const AppHost = struct {
         // Report the CSD shadow as the toplevel's shadow width once the
         // GdkSurface exists, so the WM snaps/maximizes to the geometry.
         _ = c.g_signal_connect_data(@ptrCast(window), "realize", @ptrCast(&onWinRealize), win, null, 0);
+        // GTK creates the Wayland xdg_toplevel during map, not realize.
+        // Apply identity after the role exists or the backend silently
+        // ignores it and maps the window as dev.sker.sketerm.
+        _ = c.g_signal_connect_data(@ptrCast(window), "map", @ptrCast(&onWinMap), win, null, c.G_CONNECT_AFTER);
 
         // Keyboard + focus on the window.
         const key = c.gtk_event_controller_key_new();
@@ -2062,10 +2072,16 @@ pub const AppHost = struct {
         const win = cast.userData(Win, user);
         const surface = c.gtk_native_get_surface(@ptrCast(window)) orelse return;
         _ = c.g_signal_connect_data(@ptrCast(surface), "compute-size", @ptrCast(&onComputeSize), win, null, c.G_CONNECT_AFTER);
-        // The surface exists now: apply the app_id's surface-bound
-        // parts (Wayland set_application_id / X11 WM_CLASS) that were
-        // skipped when it arrived before the first frame. Set before
-        // the first commit so the WM reads it on map.
+        // X11 needs WM_CLASS before map. Wayland ignores this early call and
+        // gets the same identity again from onWinMap once its role exists.
+        if (win.app_id) |aid| rw.applyAppId(win.window, aid);
+        // Icon lists are retained by GDK before the Wayland role exists.
+        win.applyIcon();
+    }
+
+    /// The native toplevel role exists now; realize alone is too early on Wayland.
+    fn onWinMap(_: ?*c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(Win, user);
         if (win.app_id) |aid| rw.applyAppId(win.window, aid);
         win.applyIcon();
     }

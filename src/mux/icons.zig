@@ -26,8 +26,8 @@ pub const Icon = struct {
 /// crisp at taskbar sizes and still downscales cleanly; scalable
 /// (SVG) beats a tiny raster.
 const size_dirs = [_][]const u8{
-    "128x128/apps", "96x96/apps",  "64x64/apps",
-    "48x48/apps",   "256x256/apps", "scalable/apps",
+    "128x128/apps", "96x96/apps",    "64x64/apps",
+    "48x48/apps",   "256x256/apps",  "scalable/apps",
     "32x32/apps",   "symbolic/apps",
 };
 
@@ -62,8 +62,9 @@ pub fn resolve(a: std.mem.Allocator, app_id: []const u8) !?Icon {
         a.free(roots);
     }
 
-    // Raster first (cheap decode), then SVG.
-    const exts = [_][]const u8{ ".png", ".svg" };
+    // Icon= may already include an extension; never turn foo.png into
+    // foo.png.png. Raster first (cheap decode), then SVG/SVGZ.
+    const exts = iconSuffixes(icon_name);
     var path_buf: [4096]u8 = undefined;
     for (roots) |root| {
         for (themes) |theme| {
@@ -183,6 +184,13 @@ fn kindFromPath(path: []const u8) Kind {
     return .other;
 }
 
+fn iconSuffixes(name: []const u8) []const []const u8 {
+    return if (kindFromPath(name) != .other)
+        &.{""}
+    else
+        &.{ ".png", ".svg", ".svgz" };
+}
+
 fn readFile(a: std.mem.Allocator, path: [:0]const u8, max: usize) !?[]u8 {
     const f = c.fopen(path.ptr, "rb") orelse return null;
     defer _ = c.fclose(f);
@@ -209,6 +217,16 @@ test "kindFromPath" {
     try t.expectEqual(Kind.svg, kindFromPath("/a/b/foo.svg"));
     try t.expectEqual(Kind.svg, kindFromPath("/a/b/foo.svgz"));
     try t.expectEqual(Kind.other, kindFromPath("/a/b/foo.xpm"));
+}
+
+test "iconSuffixes preserves explicit extensions" {
+    const explicit = iconSuffixes("foo.png");
+    try t.expectEqual(@as(usize, 1), explicit.len);
+    try t.expectEqualStrings("", explicit[0]);
+    const inferred = iconSuffixes("foo");
+    try t.expectEqual(@as(usize, 3), inferred.len);
+    try t.expectEqualStrings(".png", inferred[0]);
+    try t.expectEqualStrings(".svgz", inferred[2]);
 }
 
 test "parseIconKey: plain key from [Desktop Entry] only" {

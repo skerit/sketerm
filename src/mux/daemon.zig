@@ -672,6 +672,77 @@ test "dmabuf staging copy removes padding and honors Y_INVERT" {
     try std.testing.expect(!copyDmabufRows(&staging, source[0..10], 2, 2, 2, 10, false));
 }
 
+const SurfaceIconCache = struct {
+    map: std.AutoHashMapUnmanaged(u32, icons.Icon) = .empty,
+
+    fn putCopy(self: *SurfaceIconCache, a: std.mem.Allocator, sid: u32, icon: icons.Icon) !void {
+        const copy = icons.Icon{ .kind = icon.kind, .bytes = try a.dupe(u8, icon.bytes) };
+        errdefer a.free(copy.bytes);
+        if (try self.map.fetchPut(a, sid, copy)) |old| {
+            var replaced = old.value;
+            replaced.deinit(a);
+        }
+    }
+
+    fn remove(self: *SurfaceIconCache, a: std.mem.Allocator, sid: u32) void {
+        if (self.map.fetchRemove(sid)) |old| {
+            var icon = old.value;
+            icon.deinit(a);
+        }
+    }
+
+    fn appendReplay(self: *const SurfaceIconCache, out: *std.ArrayList(u8), a: std.mem.Allocator) !void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            try wlpipe.appendToplevelIcon(
+                out,
+                a,
+                entry.key_ptr.*,
+                @intFromEnum(entry.value_ptr.kind),
+                entry.value_ptr.bytes,
+            );
+        }
+    }
+
+    fn deinit(self: *SurfaceIconCache, a: std.mem.Allocator) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |icon| icon.deinit(a);
+        self.map.deinit(a);
+    }
+};
+
+test "surface icon cache replays every live surface independently" {
+    const t = std.testing;
+    var cache = SurfaceIconCache{};
+    defer cache.deinit(t.allocator);
+    var bytes = [_]u8{ 1, 2, 3 };
+    const icon = icons.Icon{ .kind = .png, .bytes = &bytes };
+    try cache.putCopy(t.allocator, 10, icon);
+    try cache.putCopy(t.allocator, 11, icon);
+
+    var units: std.ArrayList(u8) = .empty;
+    defer units.deinit(t.allocator);
+    try cache.appendReplay(&units, t.allocator);
+    var seen_10 = false;
+    var seen_11 = false;
+    var pos: usize = 0;
+    while (try wlpipe.peelUnit(units.items[pos..])) |peeled| {
+        try t.expectEqual(wlpipe.Tag.toplevel_icon, peeled.unit.tag);
+        const sid = std.mem.readInt(u32, peeled.unit.payload[0..4], .little);
+        seen_10 = seen_10 or sid == 10;
+        seen_11 = seen_11 or sid == 11;
+        pos += peeled.consumed;
+    }
+    try t.expect(seen_10 and seen_11);
+
+    cache.remove(t.allocator, 10);
+    units.clearRetainingCapacity();
+    try cache.appendReplay(&units, t.allocator);
+    const only = (try wlpipe.peelUnit(units.items)).?;
+    try t.expectEqual(@as(u32, 11), std.mem.readInt(u32, only.unit.payload[0..4], .little));
+    try t.expect((try wlpipe.peelUnit(units.items[only.consumed..])) == null);
+}
+
 const Native = struct {
     allocator: std.mem.Allocator,
     tracker: wltrack.Tracker,
@@ -757,12 +828,8 @@ const Native = struct {
     /// viewer isn't left with permanently stale regions the app
     /// never re-damages (partial-damage clients).
     skipped: std.AutoHashMapUnmanaged(u32, ?wltrack.RowRange) = .empty,
-    /// app_ids already resolved (icon sent or none found), so repeated
-    /// set_app_id / extra windows don't re-scan the icon theme. Keys owned.
-    icon_seen: std.StringHashMapUnmanaged(void) = .empty,
-    /// Accumulated toplevel_icon units, replayed to clients that
-    /// attach after the icon was first sent (durable reattach).
-    icon_replay: std.ArrayList(u8) = .empty,
+    /// Current surface id -> shipped icon bytes for durable reattach.
+    surface_icons: SurfaceIconCache = .{},
 
     const VideoSurface = struct {
         churn: churnmod.Tracker,
@@ -944,10 +1011,7 @@ const Native = struct {
         self.vscratch.deinit(self.allocator);
         self.vblob.deinit(self.allocator);
         self.pixscratch.deinit(self.allocator);
-        var kit = self.icon_seen.keyIterator();
-        while (kit.next()) |k| self.allocator.free(k.*);
-        self.icon_seen.deinit(self.allocator);
-        self.icon_replay.deinit(self.allocator);
+        self.surface_icons.deinit(self.allocator);
         self.tracker.deinit();
         self.allocator.destroy(self);
     }
@@ -2827,22 +2891,21 @@ pub const Daemon = struct {
         const self = nv.daemon orelse return;
         const ch = nv.chan orelse return;
         if (app_id.len == 0) return;
-        if (nv.icon_seen.contains(app_id)) return;
-        const key = self.allocator.dupe(u8, app_id) catch return;
-        nv.icon_seen.put(self.allocator, key, {}) catch {
-            self.allocator.free(key);
-            return;
-        };
         var icon = (icons.resolve(self.allocator, app_id) catch return) orelse return;
         defer icon.deinit(self.allocator);
         // Cap what we ship (a runaway icon file shouldn't flood the wire).
         if (icon.bytes.len > 2 * 1024 * 1024) return;
+        nv.surface_icons.putCopy(self.allocator, sid, icon) catch return;
         var unit: std.ArrayList(u8) = .empty;
         defer unit.deinit(self.allocator);
         wlpipe.appendToplevelIcon(&unit, self.allocator, sid, @intFromEnum(icon.kind), icon.bytes) catch return;
-        // Stash for reattach replay, then queue to current viewers.
-        nv.icon_replay.appendSlice(self.allocator, unit.items) catch {};
         if (!ch.dead) self.queueUnits(ch, unit.items);
+    }
+
+    /// Drop a dead surface's SID-specific replay icon.
+    fn onBrainGone(ctx: ?*anyopaque, sid: u32) void {
+        const nv: *Native = @ptrCast(@alignCast(ctx.?));
+        nv.surface_icons.remove(nv.allocator, sid);
     }
 
     fn nativeViewer(cl: *const Client, s: *const Session) bool {
@@ -3012,7 +3075,11 @@ pub const Daemon = struct {
         // announces its app_id. Stable pointers (native/ch are heap).
         native.daemon = self;
         native.chan = ch;
-        brain.view = .{ .ctx = native, .toplevel_app_id = onBrainAppId };
+        brain.view = .{
+            .ctx = native,
+            .toplevel_app_id = onBrainAppId,
+            .toplevel_gone = onBrainGone,
+        };
         self.next_chan_id += 1;
         self.channels.append(self.allocator, ch) catch {
             ch.deinit();
@@ -4924,10 +4991,10 @@ pub const Daemon = struct {
                     };
                 } else |_| ok = false;
             }
-            // Icons are daemon-injected, not part of brain state — replay
-            // them so a reattaching client's windows keep their icon.
-            if (ok and nv.icon_replay.items.len > 0)
-                units.appendSlice(self.allocator, nv.icon_replay.items) catch {};
+            // Icons are daemon-injected, not part of brain state.
+            if (ok) nv.surface_icons.appendReplay(&units, self.allocator) catch {
+                ok = false;
+            };
             if (!ok) {
                 cl.dead = true;
                 return;
