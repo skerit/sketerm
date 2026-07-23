@@ -38,11 +38,13 @@ const Entry = struct {
     mtime_ms: i64,
     target: ?[]u8,
     tdir: bool,
+    tags: []u8 = &.{},
 
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.kind);
         if (self.target) |t| allocator.free(t);
+        if (self.tags.len > 0) allocator.free(self.tags);
     }
 };
 
@@ -55,6 +57,7 @@ const WireEntry = struct {
     mtime_ms: i64 = 0,
     target: ?[]const u8 = null,
     tdir: bool = false,
+    tags: []const u8 = "",
 };
 
 const WireReply = struct {
@@ -86,6 +89,13 @@ const WireJobEv = struct {
     done: u64 = 0,
     total: u64 = 0,
     message: []const u8 = "",
+    path: []const u8 = "",
+    line: u64 = 0,
+    text: []const u8 = "",
+    kind: []const u8 = "",
+    size: u64 = 0,
+    matches: u64 = 0,
+    truncated: bool = false,
 };
 
 /// A parsed location spec. Bare "/path" keeps the CURRENT host
@@ -110,6 +120,99 @@ pub fn parseSpec(spec: []const u8) Loc {
         return .{ .host = host, .current_host = false, .path = path };
     }
     return .{ .host = null, .current_host = true, .path = spec };
+}
+
+/// A network-mount bypass hit: (mountpoint under `path`) rewritten
+/// to direct mux access on the mount's source host.
+pub const BypassHit = struct {
+    host_buf: [256]u8 = undefined,
+    host_len: usize = 0,
+    path_buf: [4096]u8 = undefined,
+    path_len: usize = 0,
+    mp_buf: [1024]u8 = undefined,
+    mp_len: usize = 0,
+
+    pub fn host(self: *const BypassHit) []const u8 {
+        return self.host_buf[0..self.host_len];
+    }
+    pub fn path(self: *const BypassHit) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
+    pub fn mountpoint(self: *const BypassHit) []const u8 {
+        return self.mp_buf[0..self.mp_len];
+    }
+};
+
+/// Decode /proc/mounts octal escapes (\040 = space, …) in place.
+fn unescapeMnt(buf: []u8, src: []const u8) []const u8 {
+    var w: usize = 0;
+    var r: usize = 0;
+    while (r < src.len and w < buf.len) {
+        if (src[r] == '\\' and r + 3 < src.len) {
+            const v = std.fmt.parseInt(u8, src[r + 1 .. r + 4], 8) catch {
+                buf[w] = src[r];
+                w += 1;
+                r += 1;
+                continue;
+            };
+            buf[w] = v;
+            w += 1;
+            r += 4;
+        } else {
+            buf[w] = src[r];
+            w += 1;
+            r += 1;
+        }
+    }
+    return buf[0..w];
+}
+
+/// Detect an sshfs/NFS mount covering `p` and rewrite to direct mux
+/// access: the mount source ("user@host:/remote") names both the ssh
+/// host and the remote prefix. Longest mountpoint wins. Linux-only
+/// (/proc/mounts); false elsewhere.
+pub fn mountBypass(p: []const u8, out: *BypassHit) bool {
+    const f = c.fopen("/proc/mounts", "r") orelse return false;
+    defer _ = c.fclose(f);
+    var line: [4096]u8 = undefined;
+    var best_mp_len: usize = 0;
+    var found = false;
+    while (c.fgets(&line, line.len, f) != null) {
+        const l = std.mem.sliceTo(std.mem.span(@as([*:0]const u8, @ptrCast(&line))), '\n');
+        var it = std.mem.tokenizeScalar(u8, l, ' ');
+        const src_raw = it.next() orelse continue;
+        const mp_raw = it.next() orelse continue;
+        const fstype = it.next() orelse continue;
+        const is_sshfs = std.mem.eql(u8, fstype, "fuse.sshfs");
+        const is_nfs = std.mem.startsWith(u8, fstype, "nfs");
+        if (!is_sshfs and !is_nfs) continue;
+        var mp_dec: [1024]u8 = undefined;
+        const mp = unescapeMnt(&mp_dec, mp_raw);
+        if (mp.len == 0 or mp.len > p.len) continue;
+        if (!std.mem.startsWith(u8, p, mp)) continue;
+        if (p.len > mp.len and p[mp.len] != '/' and mp.len > 1) continue;
+        if (mp.len <= best_mp_len) continue;
+        var src_dec: [1024]u8 = undefined;
+        const src = unescapeMnt(&src_dec, src_raw);
+        const colon = std.mem.indexOfScalar(u8, src, ':') orelse continue;
+        const h = src[0..colon];
+        var rroot = src[colon + 1 ..];
+        if (rroot.len == 0) rroot = "/";
+        if (h.len == 0 or h.len >= out.host_buf.len) continue;
+        const rest = p[mp.len..];
+        var pw = std.Io.Writer.fixed(&out.path_buf);
+        pw.print("{s}{s}", .{ if (std.mem.eql(u8, rroot, "/") and rest.len > 0) "" else rroot, rest }) catch continue;
+        if (pw.buffered().len == 0) pw.writeAll("/") catch continue;
+        @memcpy(out.host_buf[0..h.len], h);
+        out.host_len = h.len;
+        out.path_len = pw.buffered().len;
+        const mpn = @min(mp.len, out.mp_buf.len);
+        @memcpy(out.mp_buf[0..mpn], mp[0..mpn]);
+        out.mp_len = mpn;
+        best_mp_len = mp.len;
+        found = true;
+    }
+    return found;
 }
 
 fn hostEq(a: ?[]const u8, b: ?[]const u8) bool {
@@ -162,6 +265,12 @@ const Dir = struct {
     entries: std.ArrayList(Entry) = .empty,
     loaded: bool = false,
     gone: bool = false,
+    /// Search-results mode: entries are FLAT rows whose full path
+    /// lives in `target` (no subscription, no expanders).
+    flat: bool = false,
+    /// Collection mode: flat rows whose `target` is a host-qualified
+    /// SPEC ("host:/path" or "/path") — entries span hosts.
+    collection: bool = false,
 
     fn deinit(self: *Dir) void {
         for (self.entries.items) |*e| e.deinit(self.allocator);
@@ -186,6 +295,7 @@ const Dir = struct {
         };
         var tgt: ?[]u8 = null;
         if (we.target) |t| tgt = a.dupe(u8, t) catch null;
+        const tags: []u8 = if (we.tags.len > 0) (a.dupe(u8, we.tags) catch @constCast("")) else @constCast("");
         return .{
             .name = name,
             .kind = kind,
@@ -194,6 +304,7 @@ const Dir = struct {
             .mtime_ms = we.mtime_ms,
             .target = tgt,
             .tdir = we.tdir,
+            .tags = tags,
         };
     }
 
@@ -338,9 +449,10 @@ const PendingJob = struct {
     req: u32,
     hc: *HostConn,
     label: []u8,
+    kind: enum { normal, search } = .normal,
 };
 
-/// One client-mediated cross-host transfer in flight.
+/// One client-mediated cross-host transfer, running or queued.
 const ActiveTransfer = struct {
     x: *fstransfer.Xfer,
     src_hc: *HostConn,
@@ -349,7 +461,15 @@ const ActiveTransfer = struct {
     /// Launch the local destination file when the transfer lands
     /// (remote-file open-with-default path).
     open_when_done: bool = false,
+    /// Queue state: at most MAX_ACTIVE_TRANSFERS run concurrently;
+    /// the rest wait here in order.
+    started: bool = false,
 };
+
+/// Concurrent client-mediated transfers; more queue in order.
+const MAX_ACTIVE_TRANSFERS = 2;
+
+pub const HostAction = *const fn (ctx: *anyopaque, host: []const u8, path: []const u8) void;
 
 pub const BrowserView = struct {
     allocator: std.mem.Allocator,
@@ -372,6 +492,21 @@ pub const BrowserView = struct {
     /// Copy-source for the context menu's Copy/Paste (owned).
     clip_host: ?[]u8 = null,
     clip_path: ?[]u8 = null,
+    search_bar: *c.GtkWidget = undefined,
+    search_entry: *c.GtkEntry = undefined,
+    search_content: *c.GtkWidget = undefined,
+    /// Running search job (0 = none) and its host + results tab.
+    search_job: u64 = 0,
+    search_hc: ?*HostConn = null,
+    search_tab: ?*BTab = null,
+    collection_tab: ?*BTab = null,
+    /// Window-level abilities, installed by the owning Window.
+    hooks_ctx: ?*anyopaque = null,
+    on_host_term: ?HostAction = null,
+    on_host_open: ?HostAction = null,
+    /// Run a shell command as an app session on a host (declarative
+    /// .action files with RunsOnHost).
+    on_host_exec: ?HostAction = null,
 
     /// Create a browser face on `pane`, starting at `start_spec`
     /// (a path or host-qualified spec; null/relative = $HOME).
@@ -572,6 +707,7 @@ pub const BrowserView = struct {
             if (p.sent or p.tab.hc != hc) continue;
             self.sendListingOp(p);
         }
+        self.pumpTransferQueue();
     }
 
     /// Connection died: fail its transfers FIRST (they hold *Conn),
@@ -717,6 +853,23 @@ pub const BrowserView = struct {
         return false;
     }
 
+    /// Start queued transfers while below the concurrency cap.
+    fn pumpTransferQueue(self: *BrowserView) void {
+        var running: usize = 0;
+        for (self.transfers.items) |t| {
+            if (t.started and !t.x.isTerminal()) running += 1;
+        }
+        for (self.transfers.items) |t| {
+            if (running >= MAX_ACTIVE_TRANSFERS) break;
+            if (t.started or t.x.isTerminal()) continue;
+            if (t.src_hc.state != .ready or t.dst_hc.state != .ready) continue;
+            t.started = true;
+            t.x.start();
+            running += 1;
+            self.setStatusFmt("transfer started: {s}", .{t.label});
+        }
+    }
+
     /// Finish (and drop) transfers that reached a terminal state.
     fn reapTransfers(self: *BrowserView) void {
         var i: usize = 0;
@@ -739,6 +892,7 @@ pub const BrowserView = struct {
             self.allocator.destroy(t);
             _ = self.transfers.orderedRemove(i);
         }
+        self.pumpTransferQueue();
     }
 
     fn startTransfer(
@@ -786,8 +940,8 @@ pub const BrowserView = struct {
             self.allocator.destroy(t);
             return;
         };
-        x.start();
-        self.setStatusFmt("transfer started: {s}", .{label});
+        self.setStatusFmt("transfer queued: {s}", .{label});
+        self.pumpTransferQueue();
         self.renderJobs();
     }
 
@@ -816,6 +970,11 @@ pub const BrowserView = struct {
     // ── daemon jobs (same-host copy / recursive delete) ─────────
 
     fn startDaemonJob(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, label: []const u8) void {
+        self.startDaemonJobKind(hc, op, path, to, "", label, .normal);
+    }
+
+    /// Like startDaemonJob, with hash-verified resume on (sync).
+    fn startDaemonJobResumable(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, label: []const u8) void {
         if (hc.state != .ready) {
             self.setStatusFmt("not connected to {s}", .{hc.label()});
             return;
@@ -835,7 +994,42 @@ pub const BrowserView = struct {
             self.allocator.destroy(pj);
             return;
         };
-        if (to.len > 0) {
+        self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .@"resume" = true });
+    }
+
+    fn startDaemonJobKind(
+        self: *BrowserView,
+        hc: *HostConn,
+        comptime op: []const u8,
+        path: []const u8,
+        to: []const u8,
+        pattern: []const u8,
+        label: []const u8,
+        kind: @FieldType(PendingJob, "kind"),
+    ) void {
+        if (hc.state != .ready) {
+            self.setStatusFmt("not connected to {s}", .{hc.label()});
+            return;
+        }
+        const req = self.nextReq();
+        const pj = self.allocator.create(PendingJob) catch return;
+        pj.* = .{
+            .req = req,
+            .hc = hc,
+            .label = self.allocator.dupe(u8, label) catch {
+                self.allocator.destroy(pj);
+                return;
+            },
+            .kind = kind,
+        };
+        self.pending_jobs.append(self.allocator, pj) catch {
+            self.allocator.free(pj.label);
+            self.allocator.destroy(pj);
+            return;
+        };
+        if (pattern.len > 0) {
+            self.sendOp(hc, .{ .req = req, .op = op, .path = path, .pattern = pattern });
+        } else if (to.len > 0) {
             self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .@"resume" = false });
         } else {
             self.sendOp(hc, .{ .req = req, .op = op, .path = path });
@@ -850,6 +1044,15 @@ pub const BrowserView = struct {
         const e = std.json.parseFromSliceLeaky(WireJobEv, arena.allocator(), payload, .{
             .ignore_unknown_fields = true,
         }) catch return;
+        if (std.mem.eql(u8, e.ev, "match")) {
+            if (e.job == self.search_job and hc == self.search_hc) self.onSearchMatch(e);
+            return;
+        }
+        if (e.job == self.search_job and hc == self.search_hc and std.mem.eql(u8, e.ev, "done")) {
+            self.setStatusFmt("search done: {d} match(es){s}", .{
+                e.matches, if (e.truncated) " (truncated)" else "",
+            });
+        }
         const row = for (self.jobs.items) |j| {
             if (j.hc == hc and j.job == e.job) break j;
         } else return;
@@ -910,6 +1113,10 @@ pub const BrowserView = struct {
         for (self.pending_jobs.items, 0..) |pj, i| {
             if (pj.req != rep.req) continue;
             if (rep.ok and rep.job != 0) {
+                if (pj.kind == .search) {
+                    self.search_job = rep.job;
+                    self.search_hc = hc;
+                }
                 const row = self.allocator.create(JobRow) catch break;
                 row.* = .{ .hc = hc, .job = rep.job, .label = pj.label };
                 self.jobs.append(self.allocator, row) catch {
@@ -1027,6 +1234,11 @@ pub const BrowserView = struct {
         const label = c.gtk_label_new("...");
         c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);
         c.gtk_label_set_max_width_chars(@ptrCast(label), 24);
+        const label_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+        c.gtk_box_append(@ptrCast(label_box), label);
+        const close_btn = c.gtk_button_new_from_icon_name("window-close-symbolic");
+        c.gtk_button_set_has_frame(@ptrCast(close_btn), 0);
+        c.gtk_box_append(@ptrCast(label_box), close_btn);
 
         tab.* = .{
             .view = self,
@@ -1043,13 +1255,14 @@ pub const BrowserView = struct {
         };
 
         _ = c.g_signal_connect_data(listbox, "row-activated", @ptrCast(&onRowActivated), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(close_btn, "clicked", @ptrCast(&onTabCloseClicked), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
 
         const rclick = c.gtk_gesture_click_new();
         c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
         _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(listbox, @ptrCast(rclick));
 
-        const page_idx = c.gtk_notebook_append_page(self.notebook, scroller, label);
+        const page_idx = c.gtk_notebook_append_page(self.notebook, scroller, label_box);
         c.gtk_notebook_set_current_page(self.notebook, page_idx);
         self.updateTabLabel(tab);
         self.openDir(tab, dir);
@@ -1068,9 +1281,47 @@ pub const BrowserView = struct {
         return null;
     }
 
+    fn onTabCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const tab: *BTab = @ptrCast(@alignCast(user.?));
+        tab.view.closeTab(tab);
+    }
+
+    fn closeTab(self: *BrowserView, tab: *BTab) void {
+        if (self.search_tab == tab) self.search_tab = null;
+        if (self.collection_tab == tab) self.collection_tab = null;
+        var i: usize = 0;
+        while (i < self.pending.items.len) {
+            if (self.pending.items[i].tab == tab) self.dropPending(i) else i += 1;
+        }
+        const page_idx = c.gtk_notebook_page_num(self.notebook, tab.page);
+        if (page_idx >= 0) c.gtk_notebook_remove_page(self.notebook, page_idx);
+        for (self.tabs.items, 0..) |t, j| {
+            if (t == tab) {
+                _ = self.tabs.orderedRemove(j);
+                break;
+            }
+        }
+        tab.deinit();
+        if (self.currentTab()) |t| {
+            self.syncPathEntry(t);
+            self.renderTab(t);
+        }
+    }
+
     /// Navigate a tab to (host, path). `push_history` false = back/
     /// forward traversal (history untouched).
-    fn navigate(self: *BrowserView, tab: *BTab, host: ?[]const u8, path: []const u8, push_history: bool) void {
+    fn navigate(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_in: []const u8, push_history: bool) void {
+        // Mount bypass: a local path under an sshfs/NFS mount is
+        // silently rerouted to direct mux access on the source host
+        // (fast listings, push deltas, host-side jobs).
+        var host = host_in;
+        var path = path_in;
+        var bp: BypassHit = .{};
+        if (host == null and mountBypass(path, &bp)) {
+            host = bp.host();
+            path = bp.path();
+            self.setStatusFmt("via sketerm: {s} (bypassed mount {s})", .{ bp.host(), bp.mountpoint() });
+        }
         const same_host = hostEq(tab.hc.host, host);
         if (same_host and tab.hc.state != .dead and std.mem.eql(u8, tab.root.path, path)) return;
         const new_hc = if (same_host and tab.hc.state != .dead)
@@ -1263,11 +1514,14 @@ pub const BrowserView = struct {
         c.gtk_widget_set_margin_bottom(row_box, 2);
 
         var full_buf: [4096]u8 = undefined;
-        const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{
-            if (dir.path.len == 1) "" else dir.path, e.name,
-        }) catch return;
+        const full = if (dir.flat)
+            (e.target orelse return)
+        else
+            std.fmt.bufPrint(&full_buf, "{s}/{s}", .{
+                if (dir.path.len == 1) "" else dir.path, e.name,
+            }) catch return;
 
-        if (e.tdir) {
+        if (e.tdir and !dir.flat) {
             const expanded = tab.subdirByPath(full) != null;
             const exp = c.gtk_button_new_from_icon_name(if (expanded) "pan-down-symbolic" else "pan-end-symbolic");
             c.gtk_button_set_has_frame(@ptrCast(exp), 0);
@@ -1308,6 +1562,14 @@ pub const BrowserView = struct {
         c.gtk_label_set_ellipsize(@ptrCast(name_label), c.PANGO_ELLIPSIZE_MIDDLE);
         c.gtk_box_append(@ptrCast(row_box), name_label);
 
+        if (e.tags.len > 0) {
+            var tag_z: [128:0]u8 = undefined;
+            const ttxt = std.fmt.bufPrintZ(&tag_z, "[{s}]", .{e.tags}) catch "";
+            const tag_label = c.gtk_label_new(ttxt.ptr);
+            c.gtk_widget_add_css_class(tag_label, "dim-label");
+            c.gtk_box_append(@ptrCast(row_box), tag_label);
+        }
+
         if (!std.mem.eql(u8, e.kind, "dir")) {
             var size_buf: [48:0]u8 = undefined;
             const s = fmtSize(&size_buf, e.size);
@@ -1316,11 +1578,13 @@ pub const BrowserView = struct {
             c.gtk_box_append(@ptrCast(row_box), size_label);
         }
 
-        var time_buf: [40:0]u8 = undefined;
-        const tstr = fmtTimeZ(&time_buf, e.mtime_ms);
-        const time_label = c.gtk_label_new(tstr);
-        c.gtk_widget_add_css_class(time_label, "dim-label");
-        c.gtk_box_append(@ptrCast(row_box), time_label);
+        if (e.mtime_ms != 0) {
+            var time_buf: [40:0]u8 = undefined;
+            const tstr = fmtTimeZ(&time_buf, e.mtime_ms);
+            const time_label = c.gtk_label_new(tstr);
+            c.gtk_widget_add_css_class(time_label, "dim-label");
+            c.gtk_box_append(@ptrCast(row_box), time_label);
+        }
 
         const row = c.gtk_list_box_row_new();
         c.gtk_list_box_row_set_child(@ptrCast(row), row_box);
@@ -1337,6 +1601,19 @@ pub const BrowserView = struct {
             .is_dir = e.tdir,
         };
         c.g_object_set_data_full(@ptrCast(row), "sketerm-row", @ptrCast(ctx), @ptrCast(&freeRowCtx));
+
+        // Drag source: the entry's path as text — dropping on a
+        // terminal pane types the path (pane accepts string drops).
+        {
+            var pz: [4200:0]u8 = undefined;
+            if (std.fmt.bufPrintZ(&pz, "{s}", .{full})) |pzs| {
+                const provider = c.gdk_content_provider_new_typed(c.G_TYPE_STRING, pzs.ptr);
+                const dsrc = c.gtk_drag_source_new();
+                c.gtk_drag_source_set_content(dsrc, provider);
+                c.g_object_unref(provider);
+                c.gtk_widget_add_controller(row, @ptrCast(dsrc));
+            } else |_| {}
+        }
 
         c.gtk_list_box_append(tab.listbox, row);
     }
@@ -1357,6 +1634,28 @@ pub const BrowserView = struct {
         const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse return;
         const ctx: *RowCtx = @ptrCast(@alignCast(data));
         const self = tab.view;
+        if (tab.root.collection) {
+            // Collection rows hold host-qualified specs: open the
+            // entry (dir) or its parent (file) in a NEW tab.
+            const loc = parseSpec(ctx.path);
+            var pbuf: [4096]u8 = undefined;
+            const kind_dir = blk: {
+                const i = tab.root.find(ctx.path) orelse break :blk false;
+                break :blk std.mem.eql(u8, tab.root.entries.items[i].kind, "dir");
+            };
+            const dirp = if (kind_dir) loc.path else (std.fs.path.dirname(loc.path) orelse loc.path);
+            if (dirp.len >= pbuf.len) return;
+            @memcpy(pbuf[0..dirp.len], dirp);
+            var hbuf: [256]u8 = undefined;
+            var host: ?[]const u8 = null;
+            if (loc.host) |h| {
+                if (h.len >= hbuf.len) return;
+                @memcpy(hbuf[0..h.len], h);
+                host = hbuf[0..h.len];
+            }
+            _ = self.newTab(host, pbuf[0..dirp.len]);
+            return;
+        }
         if (ctx.is_dir) {
             // navigate() frees rows (and this ctx) — copy the path out.
             var buf: [4096]u8 = undefined;
@@ -1397,8 +1696,9 @@ pub const BrowserView = struct {
         is_dir: bool,
         popover: *c.GtkWidget,
         /// Entry-dialog mode: what Enter commits.
-        mode: enum { none, rename, mkdir } = .none,
+        mode: enum { none, rename, mkdir, tags } = .none,
         entry: ?*c.GtkWidget = null,
+        entry2: ?*c.GtkWidget = null,
 
         fn free(user: ?*anyopaque) callconv(.c) void {
             const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
@@ -1455,20 +1755,40 @@ pub const BrowserView = struct {
 
         const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
         const is_local = tab.hc.host == null;
+        if (tab.root.collection) {
+            // Collection rows: specs spanning hosts — navigation +
+            // membership only (path verbs would misparse specs).
+            if (ctx.path != null) {
+                menuButton(box, "Open in New Browser Tab", &onMenuCollectionOpen, ctx, false);
+                menuButton(box, "Remove from Collection", &onMenuCollectionRemove, ctx, false);
+            }
+        } else {
         if (ctx.path != null) {
             if (is_dir) {
                 if (is_local)
                     menuButton(box, "Open Terminal Here", &onMenuTerminalHere, ctx, false);
+                if (self.on_host_term != null)
+                    menuButton(box, "Open Terminal Tab Here", &onMenuTermTab, ctx, false);
                 menuButton(box, "Open in New Browser Tab", &onMenuOpenTab, ctx, false);
+            } else if (!is_local and self.on_host_open != null) {
+                menuButton(box, "Open on Host (app forward)", &onMenuHostOpen, ctx, false);
             }
             menuButton(box, "Copy", &onMenuCopy, ctx, false);
             menuButton(box, "Copy Path", &onMenuCopyPath, ctx, false);
             menuButton(box, "Rename…", &onMenuRename, ctx, false);
+            menuButton(box, "Tags…", &onMenuTags, ctx, false);
+            menuButton(box, "Add to Collection", &onMenuCollectionAdd, ctx, false);
+            if (countSelected(tab) > 1)
+                menuButton(box, "Batch Rename Selected…", &onMenuBatchRename, ctx, false);
             menuButton(box, "Delete…", &onMenuDelete, ctx, true);
         }
-        if (self.clip_path != null)
+        if (self.clip_path != null) {
             menuButton(box, "Paste Here", &onMenuPaste, ctx, false);
+            menuButton(box, "Sync Here (mirror copy, resumable)", &onMenuSyncHere, ctx, false);
+        }
         menuButton(box, "New Folder…", &onMenuNewFolder, ctx, false);
+        if (ctx.path != null) self.appendActionButtons(box, ctx);
+        }
 
         c.gtk_popover_set_child(@ptrCast(popover), box);
         c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(tab.listbox)));
@@ -1563,6 +1883,290 @@ pub const BrowserView = struct {
             self.startDaemonJob(tab.hc, "copy", src, dst, label);
         } else {
             // Cross-host: client-mediated transfer.
+            const src_hc = self.hostConnFor(if (self.clip_host) |h| @as(?[]const u8, h) else null) orelse
+                return menuDone(ctx);
+            self.startTransfer(src_hc, src, tab.hc, dst, false);
+        }
+        menuDone(ctx);
+    }
+
+    fn countSelected(tab: *BTab) usize {
+        var n: usize = 0;
+        var rows = c.gtk_list_box_get_selected_rows(tab.listbox);
+        const head = rows;
+        while (rows != null) : (rows = rows.*.next) n += 1;
+        if (head != null) c.g_list_free(head);
+        return n;
+    }
+
+    fn onMenuTermTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = ctx.path orelse return menuDone(ctx);
+        if (self.on_host_term) |cb| {
+            if (self.hooks_ctx) |hctx| cb(hctx, ctx.tab.hc.host orelse "", path);
+        }
+        menuDone(ctx);
+    }
+
+    fn onMenuHostOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = ctx.path orelse return menuDone(ctx);
+        if (self.on_host_open) |cb| {
+            if (self.hooks_ctx) |hctx| {
+                cb(hctx, ctx.tab.hc.host orelse "", path);
+                self.setStatus("opening on host (app window forwards here)…");
+            }
+        }
+        menuDone(ctx);
+    }
+
+    // ── tags ────────────────────────────────────────────────────
+
+    fn findEntryTags(tab: *BTab, path: []const u8) []const u8 {
+        const base = std.fs.path.basename(path);
+        const parent = std.fs.path.dirname(path) orelse return "";
+        const dir: *Dir = if (std.mem.eql(u8, tab.root.path, parent))
+            tab.root
+        else
+            tab.subdirByPath(parent) orelse return "";
+        const i = dir.find(base) orelse return "";
+        return dir.entries.items[i].tags;
+    }
+
+    fn onMenuTags(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = ctx.path orelse return menuDone(ctx);
+        const popover = c.gtk_popover_new();
+        const entry = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(entry), "comma,separated,tags (empty clears)");
+        const cur = findEntryTags(ctx.tab, path);
+        if (cur.len > 0) {
+            var z: [256:0]u8 = undefined;
+            const n = @min(cur.len, z.len - 1);
+            @memcpy(z[0..n], cur[0..n]);
+            z[n] = 0;
+            c.gtk_editable_set_text(@ptrCast(entry), &z);
+        }
+        const tctx = self.allocator.create(MenuCtx) catch return menuDone(ctx);
+        tctx.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .tab = ctx.tab,
+            .path = self.allocator.dupe(u8, path) catch null,
+            .name = null,
+            .is_dir = ctx.is_dir,
+            .popover = popover,
+            .mode = .tags,
+            .entry = entry,
+        };
+        c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(tctx), @ptrCast(&MenuCtx.free));
+        _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onTagsActivate), @ptrCast(tctx), null, c.G_CONNECT_DEFAULT);
+        c.gtk_popover_set_child(@ptrCast(popover), entry);
+        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(ctx.tab.listbox)));
+        connectPopoverAutoUnparent(popover);
+        c.gtk_popover_popup(@ptrCast(popover));
+        _ = c.gtk_widget_grab_focus(entry);
+        menuDone(ctx);
+    }
+
+    fn onTagsActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = ctx.path orelse return menuDone(ctx);
+        const txt = c.gtk_editable_get_text(@ptrCast(entry));
+        const tags = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+        self.sendOp(ctx.tab.hc, .{ .req = self.nextReq(), .op = "tag_set", .path = path, .to = tags });
+        menuDone(ctx);
+    }
+
+    // ── collection (cross-host shelf) ───────────────────────────
+
+    fn onMenuCollectionAdd(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = ctx.path orelse return menuDone(ctx);
+        const tab = self.collection_tab orelse blk: {
+            const t = self.newTab(ctx.tab.hc.host, ctx.tab.root.path) orelse return menuDone(ctx);
+            self.closeViewOf(t.hc, t.root);
+            var i: usize = 0;
+            while (i < self.pending.items.len) {
+                if (self.pending.items[i].tab == t) self.dropPending(i) else i += 1;
+            }
+            t.root.flat = true;
+            t.root.collection = true;
+            t.root.loaded = true;
+            t.root.view_id = 0;
+            c.gtk_label_set_text(t.tab_label, "collection");
+            self.collection_tab = t;
+            break :blk t;
+        };
+        // Entry: display = host-qualified spec; target = same spec.
+        var spec_buf: [4400]u8 = undefined;
+        const spec = if (ctx.tab.hc.host) |h|
+            std.fmt.bufPrint(&spec_buf, "{s}:{s}", .{ h, path }) catch return menuDone(ctx)
+        else
+            path;
+        const dir = tab.root;
+        if (dir.find(spec) != null) return menuDone(ctx); // already shelved
+        const a = self.allocator;
+        const name = a.dupe(u8, spec) catch return menuDone(ctx);
+        const kind = a.dupe(u8, if (ctx.is_dir) "dir" else "file") catch {
+            a.free(name);
+            return menuDone(ctx);
+        };
+        const tgt = a.dupe(u8, spec) catch {
+            a.free(name);
+            a.free(kind);
+            return menuDone(ctx);
+        };
+        dir.entries.append(a, .{
+            .name = name,
+            .kind = kind,
+            .size = 0,
+            .mode = 0,
+            .mtime_ms = 0,
+            .target = tgt,
+            .tdir = false,
+        }) catch {
+            a.free(name);
+            a.free(kind);
+            a.free(tgt);
+        };
+        self.setStatusFmt("added to collection: {s}", .{spec});
+        menuDone(ctx);
+    }
+
+    fn onMenuCollectionOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const spec = ctx.path orelse return menuDone(ctx);
+        const loc = parseSpec(spec);
+        if (loc.path.len > 0) {
+            // Open the entry itself (dir) or its parent (file).
+            const dirp = if (ctx.is_dir) loc.path else (std.fs.path.dirname(loc.path) orelse loc.path);
+            _ = self.newTab(loc.host, dirp);
+        }
+        menuDone(ctx);
+    }
+
+    fn onMenuCollectionRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const spec = ctx.path orelse return menuDone(ctx);
+        if (self.collection_tab) |tab| {
+            tab.root.del(std.fs.path.basename(spec));
+            // Collection names ARE the specs (basename won't match) —
+            // fall back to a full-name scan.
+            if (tab.root.find(spec)) |i| {
+                var e = tab.root.entries.orderedRemove(i);
+                e.deinit(self.allocator);
+            }
+            if (self.currentTab() == tab) self.renderTab(tab);
+        }
+        menuDone(ctx);
+    }
+
+    // ── batch rename ────────────────────────────────────────────
+
+    fn onMenuBatchRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const tab = ctx.tab;
+        const popover = c.gtk_popover_new();
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
+        const find_e = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(find_e), "find (substring)");
+        const repl_e = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(repl_e), "replace with");
+        const apply = c.gtk_button_new_with_label("Rename selected");
+        c.gtk_box_append(@ptrCast(box), find_e);
+        c.gtk_box_append(@ptrCast(box), repl_e);
+        c.gtk_box_append(@ptrCast(box), apply);
+        const bctx = self.allocator.create(MenuCtx) catch return menuDone(ctx);
+        bctx.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .tab = tab,
+            .path = null,
+            .name = null,
+            .is_dir = false,
+            .popover = popover,
+            .entry = find_e,
+            .entry2 = repl_e,
+        };
+        c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(bctx), @ptrCast(&MenuCtx.free));
+        _ = c.g_signal_connect_data(apply, "clicked", @ptrCast(&onBatchRenameApply), @ptrCast(bctx), null, c.G_CONNECT_DEFAULT);
+        c.gtk_popover_set_child(@ptrCast(popover), box);
+        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(tab.listbox)));
+        connectPopoverAutoUnparent(popover);
+        c.gtk_popover_popup(@ptrCast(popover));
+        menuDone(ctx);
+    }
+
+    fn onBatchRenameApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const tab = ctx.tab;
+        const find_txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.entry.?)))));
+        const repl_txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.entry2.?)))));
+        if (find_txt.len == 0 or std.mem.indexOfScalar(u8, repl_txt, '/') != null) {
+            self.setStatus("batch rename: bad pattern");
+            return menuDone(ctx);
+        }
+        var renamed: usize = 0;
+        var rows = c.gtk_list_box_get_selected_rows(tab.listbox);
+        const head = rows;
+        while (rows != null) : (rows = rows.*.next) {
+            const row: *c.GtkListBoxRow = @ptrCast(@alignCast(rows.*.data));
+            const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse continue;
+            const rctx: *RowCtx = @ptrCast(@alignCast(data));
+            const base = std.fs.path.basename(rctx.path);
+            const parent = std.fs.path.dirname(rctx.path) orelse continue;
+            // Replace ALL occurrences of `find` in the basename.
+            var nb: [1024]u8 = undefined;
+            var w = std.Io.Writer.fixed(&nb);
+            var rest = base;
+            var changed = false;
+            while (std.mem.indexOf(u8, rest, find_txt)) |i| {
+                w.writeAll(rest[0..i]) catch break;
+                w.writeAll(repl_txt) catch break;
+                rest = rest[i + find_txt.len ..];
+                changed = true;
+            }
+            w.writeAll(rest) catch continue;
+            if (!changed or w.buffered().len == 0) continue;
+            var full: [4096]u8 = undefined;
+            const to = std.fmt.bufPrint(&full, "{s}/{s}", .{
+                if (parent.len == 1) "" else parent, w.buffered(),
+            }) catch continue;
+            self.sendOp(tab.hc, .{ .req = self.nextReq(), .op = "rename", .path = rctx.path, .to = to });
+            renamed += 1;
+        }
+        if (head != null) c.g_list_free(head);
+        self.setStatusFmt("batch rename: {d} rename(s) sent", .{renamed});
+        menuDone(ctx);
+    }
+
+    fn onMenuSyncHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const src = self.clip_path orelse return menuDone(ctx);
+        const tab = ctx.tab;
+        const base = std.fs.path.basename(src);
+        var dst_buf: [4096]u8 = undefined;
+        const dir = tab.root.path;
+        const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{ if (dir.len == 1) "" else dir, base }) catch
+            return menuDone(ctx);
+        if (hostEq(self.clip_host, tab.hc.host)) {
+            // Same host: daemon copy with resume — completed files
+            // skip, partials continue (incremental mirror, no deletes).
+            var lbl: [128]u8 = undefined;
+            const label = std.fmt.bufPrint(&lbl, "sync {s}", .{base}) catch base;
+            self.startDaemonJobResumable(tab.hc, "copy", src, dst, label);
+        } else {
             const src_hc = self.hostConnFor(if (self.clip_host) |h| @as(?[]const u8, h) else null) orelse
                 return menuDone(ctx);
             self.startTransfer(src_hc, src, tab.hc, dst, false);
@@ -1687,9 +2291,255 @@ pub const BrowserView = struct {
                 w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return menuDone(ctx);
                 self.sendOp(ctx.tab.hc, .{ .req = req, .op = "rename", .path = old, .to = w.buffered() });
             },
-            .none => {},
+            .none, .tags => {},
         }
         menuDone(ctx);
+    }
+
+    // ── declarative actions (.action files) ─────────────────────
+
+    /// Heap context for one action button; freed with the button.
+    const ActionCtx = struct {
+        allocator: std.mem.Allocator,
+        view: *BrowserView,
+        host: ?[]u8,
+        cmdline: []u8,
+        runs_on_host: bool,
+
+        fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
+            _ = closure;
+            const a: *ActionCtx = @ptrCast(@alignCast(user.?));
+            if (a.host) |h| a.allocator.free(h);
+            a.allocator.free(a.cmdline);
+            a.allocator.destroy(a);
+        }
+    };
+
+    /// User actions from $XDG_CONFIG_HOME/sketerm/actions/*.action:
+    /// Name= / Exec= (%f = quoted path) / Ext=csv / RunsOnHost=true.
+    /// Local-only actions hide on remote tabs (a local command cannot
+    /// reach a remote path); RunsOnHost actions run as app sessions
+    /// on the file's host (windows forward here).
+    fn appendActionButtons(self: *BrowserView, box: *c.GtkWidget, ctx: *MenuCtx) void {
+        const path = ctx.path orelse return;
+        var dirbuf: [4096:0]u8 = undefined;
+        const cfg = c.g_get_user_config_dir();
+        const adir = std.fmt.bufPrintZ(&dirbuf, "{s}/sketerm/actions", .{cfg}) catch return;
+        const d = c.opendir(adir.ptr) orelse return;
+        defer _ = c.closedir(d);
+        const remote = ctx.tab.hc.host != null;
+        const base = std.fs.path.basename(path);
+        const ext = if (std.mem.lastIndexOfScalar(u8, base, '.')) |i| base[i + 1 ..] else "";
+
+        while (c.readdir(d)) |de| {
+            const fname = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
+            if (!std.mem.endsWith(u8, fname, ".action")) continue;
+            var fbuf: [4200:0]u8 = undefined;
+            const fpath = std.fmt.bufPrintZ(&fbuf, "{s}/{s}", .{ adir, fname }) catch continue;
+            const f = c.fopen(fpath.ptr, "rb") orelse continue;
+            var content: [4096]u8 = undefined;
+            const n = c.fread(&content, 1, content.len, f);
+            _ = c.fclose(f);
+            var name: []const u8 = "";
+            var exec: []const u8 = "";
+            var exts: []const u8 = "";
+            var on_host = false;
+            var it = std.mem.tokenizeScalar(u8, content[0..n], '\n');
+            while (it.next()) |line_raw| {
+                const line = std.mem.trim(u8, line_raw, " \t\r");
+                if (std.mem.startsWith(u8, line, "Name=")) name = line[5..];
+                if (std.mem.startsWith(u8, line, "Exec=")) exec = line[5..];
+                if (std.mem.startsWith(u8, line, "Ext=")) exts = line[4..];
+                if (std.mem.startsWith(u8, line, "RunsOnHost=")) on_host = std.mem.eql(u8, line[11..], "true");
+            }
+            if (name.len == 0 or exec.len == 0) continue;
+            if (remote and !on_host) continue;
+            if (exts.len > 0) {
+                var matched = false;
+                var eit = std.mem.tokenizeScalar(u8, exts, ',');
+                while (eit.next()) |e| {
+                    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, e, " "), ext)) matched = true;
+                }
+                if (!matched) continue;
+            }
+            // %f → single-quoted path, substituted now.
+            var cmd: std.ArrayList(u8) = .empty;
+            defer cmd.deinit(self.allocator);
+            var rest = exec;
+            while (std.mem.indexOf(u8, rest, "%f")) |i| {
+                cmd.appendSlice(self.allocator, rest[0..i]) catch return;
+                cmd.append(self.allocator, '\'') catch return;
+                for (path) |ch| {
+                    if (ch == '\'') {
+                        cmd.appendSlice(self.allocator, "'\\''") catch return;
+                    } else cmd.append(self.allocator, ch) catch return;
+                }
+                cmd.append(self.allocator, '\'') catch return;
+                rest = rest[i + 2 ..];
+            }
+            cmd.appendSlice(self.allocator, rest) catch return;
+
+            const actx = self.allocator.create(ActionCtx) catch return;
+            actx.* = .{
+                .allocator = self.allocator,
+                .view = self,
+                .host = if (ctx.tab.hc.host) |h| (self.allocator.dupe(u8, h) catch null) else null,
+                .cmdline = self.allocator.dupe(u8, cmd.items) catch {
+                    self.allocator.destroy(actx);
+                    return;
+                },
+                .runs_on_host = on_host,
+            };
+            var lbl: [128:0]u8 = undefined;
+            const ltxt = std.fmt.bufPrintZ(&lbl, "{s}{s}", .{
+                name, if (on_host) " (on host)" else "",
+            }) catch continue;
+            const btn = c.gtk_button_new_with_label(ltxt.ptr);
+            c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+            c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(btn)), c.GTK_ALIGN_START);
+            _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onActionClicked), @ptrCast(actx), @ptrCast(&ActionCtx.free), c.G_CONNECT_DEFAULT);
+            // Popdown when an action fires: reuse the menu ctx's popover.
+            c.g_object_set_data(@ptrCast(btn), "sketerm-popover", @ptrCast(ctx.popover));
+            c.gtk_box_append(@ptrCast(box), btn);
+        }
+    }
+
+    fn onActionClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const actx: *ActionCtx = @ptrCast(@alignCast(user.?));
+        const self = actx.view;
+        if (actx.runs_on_host) {
+            if (self.on_host_exec) |cb| {
+                if (self.hooks_ctx) |hctx| {
+                    var z: [4096:0]u8 = undefined;
+                    const cl = std.fmt.bufPrintZ(&z, "{s}", .{actx.cmdline}) catch return;
+                    cb(hctx, actx.host orelse "", cl);
+                    self.setStatus("action started (app session)");
+                }
+            }
+        } else {
+            var z: [4096:0]u8 = undefined;
+            const cl = std.fmt.bufPrintZ(&z, "{s}", .{actx.cmdline}) catch return;
+            _ = c.g_spawn_command_line_async(cl.ptr, null);
+            self.setStatus("action started");
+        }
+        if (c.g_object_get_data(@ptrCast(btn), "sketerm-popover")) |pop| {
+            c.gtk_popover_popdown(@ptrCast(@alignCast(pop)));
+        }
+    }
+
+    // ── search (find/grep jobs → panelize-style results tab) ────
+
+    /// Start a search from the bar: name search by default, content
+    /// grep when the toggle is on. Results stream into a flat tab.
+    fn startSearch(self: *BrowserView) void {
+        const tab = self.currentTab() orelse return;
+        if (tab.hc.state != .ready) {
+            self.setStatusFmt("not connected to {s}", .{tab.hc.label()});
+            return;
+        }
+        const txt = c.gtk_editable_get_text(@ptrCast(self.search_entry));
+        const pattern = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+        if (pattern.len == 0) return;
+        const content = c.gtk_check_button_get_active(@ptrCast(self.search_content)) != 0;
+
+        // One search at a time: a still-running previous job is
+        // canceled (its JobRow stays for the record).
+        if (self.search_job != 0) {
+            if (self.search_hc) |shc| {
+                if (shc.state == .ready)
+                    self.sendOp(shc, .{ .req = self.nextReq(), .op = "job_cancel", .job = self.search_job });
+            }
+            self.search_job = 0;
+        }
+
+        // Fresh results tab rooted at the searched directory.
+        var rbuf: [4096]u8 = undefined;
+        if (tab.root.path.len >= rbuf.len) return;
+        @memcpy(rbuf[0..tab.root.path.len], tab.root.path);
+        const root = rbuf[0..tab.root.path.len];
+        const host = tab.hc.host;
+        const rtab = self.newTab(host, root) orelse return;
+        // Flat results: no live view (newTab already subscribed the
+        // root — undo that; the results are the search stream).
+        self.closeViewOf(rtab.hc, rtab.root);
+        var i: usize = 0;
+        while (i < self.pending.items.len) {
+            if (self.pending.items[i].tab == rtab) self.dropPending(i) else i += 1;
+        }
+        rtab.root.flat = true;
+        rtab.root.loaded = true;
+        rtab.root.view_id = 0;
+        self.search_tab = rtab;
+        var lbl: [160:0]u8 = undefined;
+        const ltxt = std.fmt.bufPrintZ(&lbl, "search: {s}", .{pattern}) catch "search";
+        c.gtk_label_set_text(rtab.tab_label, ltxt.ptr);
+        self.renderTab(rtab);
+
+        var jl: [200]u8 = undefined;
+        const jlbl = std.fmt.bufPrint(&jl, "{s} \"{s}\"", .{
+            if (content) @as([]const u8, "grep") else "find", pattern,
+        }) catch "search";
+        if (content) {
+            self.startDaemonJobKind(tab.hc, "grep", root, "", pattern, jlbl, .search);
+        } else {
+            self.startDaemonJobKind(tab.hc, "find", root, "", pattern, jlbl, .search);
+        }
+        self.setStatusFmt("searching {s}…", .{root});
+    }
+
+    fn onSearchMatch(self: *BrowserView, e: WireJobEv) void {
+        const rtab = self.search_tab orelse return;
+        const dir = rtab.root;
+        if (e.path.len == 0) return;
+        // Display name: path relative to the search root (+ line
+        // preview for content matches). Full path rides `target`.
+        const rel = if (std.mem.startsWith(u8, e.path, dir.path) and e.path.len > dir.path.len + 1)
+            e.path[dir.path.len + 1 ..]
+        else
+            e.path;
+        var name_buf: [512]u8 = undefined;
+        const display = if (e.line > 0)
+            std.fmt.bufPrint(&name_buf, "{s}:{d}: {s}", .{ rel, e.line, e.text }) catch rel
+        else
+            rel;
+        const a = self.allocator;
+        const name = a.dupe(u8, display) catch return;
+        const kind = a.dupe(u8, if (e.kind.len > 0) e.kind else "file") catch {
+            a.free(name);
+            return;
+        };
+        const tgt = a.dupe(u8, e.path) catch {
+            a.free(name);
+            a.free(kind);
+            return;
+        };
+        dir.entries.append(a, .{
+            .name = name,
+            .kind = kind,
+            .size = e.size,
+            .mode = 0,
+            .mtime_ms = 0,
+            .target = tgt,
+            .tdir = std.mem.eql(u8, kind, "dir"),
+        }) catch {
+            a.free(name);
+            a.free(kind);
+            a.free(tgt);
+            return;
+        };
+        if (self.currentTab() == rtab) self.renderTab(rtab);
+    }
+
+    fn onSearchToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const on = c.gtk_toggle_button_get_active(btn) != 0;
+        c.gtk_widget_set_visible(self.search_bar, if (on) 1 else 0);
+        if (on) _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(self.search_entry)));
+    }
+
+    fn onSearchActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.startSearch();
     }
 
     // ── jobs / transfers panel ──────────────────────────────────
@@ -1781,9 +2631,12 @@ pub const BrowserView = struct {
             const p = t.x.progress();
             var lbl: [256:0]u8 = undefined;
             const pct: u64 = if (p.total > 0) p.done * 100 / p.total else 0;
-            const txt = std.fmt.bufPrintZ(&lbl, "⇄ {s} — {d}% ({d}/{d} MB)", .{
-                t.label, pct, p.done >> 20, p.total >> 20,
-            }) catch "transfer";
+            const txt = if (!t.started)
+                std.fmt.bufPrintZ(&lbl, "⇄ {s} — [queued]", .{t.label}) catch "transfer"
+            else
+                std.fmt.bufPrintZ(&lbl, "⇄ {s} — {d}% ({d}/{d} MB)", .{
+                    t.label, pct, p.done >> 20, p.total >> 20,
+                }) catch "transfer";
             const l = c.gtk_label_new(txt.ptr);
             c.gtk_label_set_xalign(@ptrCast(l), 0);
             c.gtk_widget_set_hexpand(l, 1);
@@ -1892,6 +2745,12 @@ pub const BrowserView = struct {
         _ = c.g_signal_connect_data(hidden, "toggled", @ptrCast(&onHiddenToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), hidden);
 
+        const search_toggle = c.gtk_toggle_button_new();
+        c.gtk_button_set_icon_name(@ptrCast(search_toggle), "system-search-symbolic");
+        c.gtk_widget_set_tooltip_text(search_toggle, "Search this directory (daemon-side, recursive)");
+        _ = c.g_signal_connect_data(search_toggle, "toggled", @ptrCast(&onSearchToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(bar), search_toggle);
+
         const newtab = c.gtk_button_new_from_icon_name("tab-new-symbolic");
         c.gtk_widget_set_tooltip_text(newtab, "New browser tab");
         _ = c.g_signal_connect_data(newtab, "clicked", @ptrCast(&onNewTabClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -1903,6 +2762,20 @@ pub const BrowserView = struct {
         c.gtk_box_append(@ptrCast(bar), term);
 
         c.gtk_box_append(@ptrCast(vbox), bar);
+
+        const sbar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+        c.gtk_widget_set_margin_start(sbar, 4);
+        c.gtk_widget_set_margin_end(sbar, 4);
+        c.gtk_widget_set_margin_bottom(sbar, 4);
+        const sentry = c.gtk_entry_new();
+        c.gtk_widget_set_hexpand(sentry, 1);
+        c.gtk_entry_set_placeholder_text(@ptrCast(sentry), "name substring or glob (*.zig) — Enter to search");
+        _ = c.g_signal_connect_data(sentry, "activate", @ptrCast(&onSearchActivate), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(sbar), sentry);
+        const scontent = c.gtk_check_button_new_with_label("in contents");
+        c.gtk_box_append(@ptrCast(sbar), scontent);
+        c.gtk_widget_set_visible(sbar, 0);
+        c.gtk_box_append(@ptrCast(vbox), sbar);
 
         const notebook = c.gtk_notebook_new();
         c.gtk_notebook_set_scrollable(@ptrCast(notebook), 1);
@@ -1937,6 +2810,9 @@ pub const BrowserView = struct {
         self.path_entry = @ptrCast(@alignCast(entry));
         self.status_label = @ptrCast(@alignCast(status));
         self.jobs_box = jobs_box;
+        self.search_bar = sbar;
+        self.search_entry = @ptrCast(@alignCast(sentry));
+        self.search_content = scontent;
     }
 
     fn onBrowserKey(

@@ -537,6 +537,92 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
         } else |_| {}
     }
 
+    // ── find / grep search jobs ────────────────────────────────
+    {
+        var z: [4096]u8 = undefined;
+        var fp: [4096]u8 = undefined;
+        const sdir = std.fmt.bufPrint(&fp, "{s}/searchme", .{dir}) catch unreachable;
+        _ = c.mkdir(pathz.pathZ(&z, sdir) catch unreachable, 0o755);
+        var fp2: [4096]u8 = undefined;
+        const sub2 = std.fmt.bufPrint(&fp2, "{s}/searchme/deep", .{dir}) catch unreachable;
+        _ = c.mkdir(pathz.pathZ(&z, sub2) catch unreachable, 0o755);
+        var fp3: [4096]u8 = undefined;
+        touch(sdir, "needle-alpha.txt", "nothing here\nthe MAGIC-TOKEN line\ntail\n");
+        touch(sub2, "other.log", "MAGIC-TOKEN again\n");
+        touch(sdir, "binary.bin", "\x00\x01MAGIC-TOKEN");
+        _ = std.fmt.bufPrint(&fp3, "x", .{}) catch unreachable;
+
+        // find by ci substring
+        const fjob = fs.startFind(sdir, "NEEDLE") catch failErr("start find", fs.lastErr());
+        var found_path = false;
+        var fdone = false;
+        var waited: i64 = 0;
+        while (!fdone and waited < 20_000) {
+            while (fs.takeJobEvent()) |e0| {
+                var e = e0;
+                defer e.deinit();
+                if (e.job != fjob) continue;
+                if (std.mem.eql(u8, e.ev, "match")) {
+                    if (std.mem.endsWith(u8, e.path, "needle-alpha.txt")) found_path = true;
+                } else if (e.terminal()) {
+                    if (!std.mem.eql(u8, e.ev, "done")) fail("find job failed");
+                    if (e.matches != 1) fail("find match count");
+                    fdone = true;
+                }
+            }
+            _ = c.usleep(5_000);
+            waited += 5;
+        }
+        if (!fdone or !found_path) fail("find never matched");
+
+        // find by glob
+        const gjob = fs.startFind(sdir, "*.log") catch failErr("start find glob", fs.lastErr());
+        var glob_hit = false;
+        var gdone = false;
+        waited = 0;
+        while (!gdone and waited < 20_000) {
+            while (fs.takeJobEvent()) |e0| {
+                var e = e0;
+                defer e.deinit();
+                if (e.job != gjob) continue;
+                if (std.mem.eql(u8, e.ev, "match")) {
+                    if (std.mem.endsWith(u8, e.path, "deep/other.log")) glob_hit = true;
+                } else if (e.terminal()) gdone = true;
+            }
+            _ = c.usleep(5_000);
+            waited += 5;
+        }
+        if (!gdone or !glob_hit) fail("glob find never matched");
+
+        // grep: ci content matches with line numbers; binary skipped
+        const cjob2 = fs.startGrep(sdir, "magic-token") catch failErr("start grep", fs.lastErr());
+        var hits: usize = 0;
+        var line2_seen = false;
+        var bin_hit = false;
+        var cdone = false;
+        waited = 0;
+        while (!cdone and waited < 20_000) {
+            while (fs.takeJobEvent()) |e0| {
+                var e = e0;
+                defer e.deinit();
+                if (e.job != cjob2) continue;
+                if (std.mem.eql(u8, e.ev, "match")) {
+                    hits += 1;
+                    if (std.mem.endsWith(u8, e.path, "needle-alpha.txt") and e.line == 2) line2_seen = true;
+                    if (std.mem.endsWith(u8, e.path, "binary.bin")) bin_hit = true;
+                    if (std.mem.indexOf(u8, e.text, "MAGIC-TOKEN") == null) fail("grep match text");
+                } else if (e.terminal()) {
+                    if (!std.mem.eql(u8, e.ev, "done")) fail("grep job failed");
+                    cdone = true;
+                }
+            }
+            _ = c.usleep(5_000);
+            waited += 5;
+        }
+        if (!cdone or hits != 2 or !line2_seen) fail("grep matches wrong");
+        if (bin_hit) fail("grep matched a binary file");
+    }
+
     // ── jobs survive their client (durability) ─────────────────
     var orphan_job: u64 = 0;
     {

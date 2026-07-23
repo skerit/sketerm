@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Sketerm Files
+GenericName=File Manager
+Comment=Sketerm file browser — local and remote files over the mux daemon
+Exec=sketerm files %f
+Icon=dev.sker.sketerm
+Categories=System;FileManager;Utility;
+StartupNotify=true
+StartupWMClass=sketerm
+Terminal=false
+Keywords=files;browser;remote;ssh;explorer;

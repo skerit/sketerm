@@ -28,8 +28,16 @@ pub const Spec = struct {
     op: []const u8 = "",
     src: []const u8 = "",
     dst: []const u8 = "",
+    pattern: []const u8 = "",
     @"resume": bool = false,
 };
+
+/// Search caps: a runaway query costs a bounded stream, never a
+/// flooded daemon pipe.
+const MAX_MATCHES: usize = 2000;
+const MAX_MATCHES_PER_FILE: usize = 200;
+const MAX_GREP_FILE: u64 = 8 << 20;
+const MAX_MATCH_LINE: usize = 300;
 
 // ── progress emission ───────────────────────────────────────────
 
@@ -106,7 +114,175 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
     if (std.mem.eql(u8, spec.op, "copy")) return runCopy(allocator, spec);
     if (std.mem.eql(u8, spec.op, "delete_tree")) return runDeleteTree(spec);
     if (std.mem.eql(u8, spec.op, "hash")) return runHash(spec);
+    if (std.mem.eql(u8, spec.op, "find")) return runSearch(allocator, spec, false);
+    if (std.mem.eql(u8, spec.op, "grep")) return runSearch(allocator, spec, true);
     return emitError("unknown job op");
+}
+
+// ── find / grep ─────────────────────────────────────────────────
+
+/// Case-insensitive glob: `*` and `?` wildcards; a pattern without
+/// wildcards matches as a SUBSTRING (what a search box means).
+pub fn nameMatches(pattern: []const u8, name: []const u8) bool {
+    if (std.mem.indexOfAny(u8, pattern, "*?") == null)
+        return std.ascii.indexOfIgnoreCase(name, pattern) != null;
+    return globMatch(pattern, name);
+}
+
+fn globMatch(pattern: []const u8, name: []const u8) bool {
+    // Iterative *-backtracking matcher, ASCII case-folded.
+    var p: usize = 0;
+    var n: usize = 0;
+    var star_p: ?usize = null;
+    var star_n: usize = 0;
+    while (n < name.len) {
+        if (p < pattern.len and (pattern[p] == '?' or
+            std.ascii.toLower(pattern[p]) == std.ascii.toLower(name[n])))
+        {
+            p += 1;
+            n += 1;
+        } else if (p < pattern.len and pattern[p] == '*') {
+            star_p = p;
+            star_n = n;
+            p += 1;
+        } else if (star_p) |sp| {
+            p = sp + 1;
+            star_n += 1;
+            n = star_n;
+        } else return false;
+    }
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
+}
+
+const SearchState = struct {
+    matches: usize = 0,
+    scanned: u64 = 0,
+    truncated: bool = false,
+    lower_pat: []u8,
+};
+
+fn runSearch(allocator: std.mem.Allocator, spec: Spec, content: bool) u8 {
+    if (spec.pattern.len == 0) return emitError("empty pattern");
+    var st: c.struct_stat = undefined;
+    if (!statOf(spec.src, &st, true)) return emitErrno("stat root");
+    if ((st.st_mode & c.S_IFMT) != c.S_IFDIR) return emitError("search root is not a directory");
+    const lower = allocator.dupe(u8, spec.pattern) catch return emitError("out of memory");
+    defer allocator.free(lower);
+    for (lower) |*ch| ch.* = std.ascii.toLower(ch.*);
+    var state = SearchState{ .lower_pat = lower };
+    searchDir(allocator, spec.src, spec.pattern, content, &state);
+    emit(.{
+        .ev = "done",
+        .done = state.scanned,
+        .total = state.scanned,
+        .matches = state.matches,
+        .truncated = state.truncated,
+    });
+    return 0;
+}
+
+fn searchDir(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []const u8, content: bool, state: *SearchState) void {
+    if (state.matches >= MAX_MATCHES) {
+        state.truncated = true;
+        return;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const l = fsserve.listDir(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES) catch return;
+    for (l.entries) |e| {
+        if (state.matches >= MAX_MATCHES) {
+            state.truncated = true;
+            return;
+        }
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.print("{s}/{s}", .{ if (dir_path.len == 1) "" else dir_path, e.name }) catch continue;
+        const full = w.buffered();
+        if (!content) {
+            if (nameMatches(pattern, e.name)) {
+                state.matches += 1;
+                emit(.{ .ev = "match", .path = full, .kind = e.kind, .size = e.size });
+            }
+        } else if (std.mem.eql(u8, e.kind, "file") and e.size <= MAX_GREP_FILE) {
+            grepFile(full, state);
+        }
+        state.scanned += 1;
+        if (state.scanned % 512 == 0)
+            emit(.{ .ev = "progress", .done = state.scanned, .total = @as(u64, 0) });
+        if (std.mem.eql(u8, e.kind, "dir"))
+            searchDir(allocator, full, pattern, content, state);
+    }
+}
+
+/// Line-based case-insensitive content scan; binary files (NUL in
+/// the first 4KB) are skipped.
+fn grepFile(path: []const u8, state: *SearchState) void {
+    var z: [4096]u8 = undefined;
+    const p = pathz.pathZ(&z, path) catch return;
+    const fd = c.open(p, c.O_RDONLY | c.O_CLOEXEC);
+    if (fd < 0) return;
+    defer _ = c.close(fd);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var carry: [MAX_MATCH_LINE]u8 = undefined;
+    var carry_len: usize = 0;
+    var line_no: u64 = 1;
+    var file_matches: usize = 0;
+    var first = true;
+    while (true) {
+        const n = c.read(fd, &buf, buf.len);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        if (n <= 0) break;
+        const chunk = buf[0..@intCast(n)];
+        if (first) {
+            first = false;
+            const probe = chunk[0..@min(chunk.len, 4096)];
+            if (std.mem.indexOfScalar(u8, probe, 0) != null) return; // binary
+        }
+        var start: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, chunk, start, '\n')) |nl| {
+            const tail = chunk[start..nl];
+            if (matchLine(state, path, line_no, carry[0..carry_len], tail)) {
+                file_matches += 1;
+                if (file_matches >= MAX_MATCHES_PER_FILE or state.matches >= MAX_MATCHES) return;
+            }
+            carry_len = 0;
+            line_no += 1;
+            start = nl + 1;
+        }
+        const rest = chunk[start..];
+        const room = carry.len - carry_len;
+        const take = @min(rest.len, room);
+        @memcpy(carry[carry_len .. carry_len + take], rest[0..take]);
+        carry_len += take;
+        // A line longer than the carry buffer: the head is enough for
+        // matching/preview; the overflow is dropped by design.
+    }
+    if (carry_len > 0)
+        _ = matchLine(state, path, line_no, carry[0..carry_len], "");
+}
+
+fn matchLine(state: *SearchState, path: []const u8, line_no: u64, head: []const u8, tail: []const u8) bool {
+    var line_buf: [MAX_MATCH_LINE]u8 = undefined;
+    const hn = @min(head.len, line_buf.len);
+    @memcpy(line_buf[0..hn], head[0..hn]);
+    const tn = @min(tail.len, line_buf.len - hn);
+    @memcpy(line_buf[hn .. hn + tn], tail[0..tn]);
+    const line = line_buf[0 .. hn + tn];
+    for (line) |*ch| {
+        if (ch.* == '\r' or ch.* == '\t') ch.* = ' ';
+    }
+    var lower_buf: [MAX_MATCH_LINE]u8 = undefined;
+    for (line, 0..) |ch, i| lower_buf[i] = std.ascii.toLower(ch);
+    if (std.mem.indexOf(u8, lower_buf[0..line.len], state.lower_pat) == null) return false;
+    // Strip non-printable control bytes for the preview.
+    for (line) |*ch| {
+        if (ch.* < 0x20) ch.* = ' ';
+    }
+    state.matches += 1;
+    emit(.{ .ev = "match", .path = path, .line = line_no, .text = line });
+    return true;
 }
 
 // ── hash ────────────────────────────────────────────────────────
@@ -420,6 +596,21 @@ fn deleteTreeDir(dir_path: []const u8, progress: *Progress) bool {
 }
 
 // ── tests ───────────────────────────────────────────────────────
+
+test "nameMatches: substring default, glob with wildcards, ci" {
+    const t = std.testing;
+    try t.expect(nameMatches("read", "README.md"));
+    try t.expect(nameMatches("ME.md", "README.md"));
+    try t.expect(!nameMatches("xyz", "README.md"));
+    try t.expect(nameMatches("*.md", "README.md"));
+    try t.expect(nameMatches("re*me.??", "README.md"));
+    try t.expect(!nameMatches("*.txt", "README.md"));
+    try t.expect(nameMatches("*", "anything"));
+    try t.expect(nameMatches("a?c", "AbC"));
+    try t.expect(!nameMatches("a?c", "abbc"));
+    try t.expect(nameMatches("*b*b*", "abxbx"));
+    try t.expect(!nameMatches("*b*b*", "abxx"));
+}
 
 test "copyOneFile resumes only on matching prefix hash" {
     const t = std.testing;

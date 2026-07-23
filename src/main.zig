@@ -28,6 +28,10 @@ const App = struct {
     debug_events: bool = false,
     debug_images: bool = false,
     config_path: ?[]const u8 = null,
+    /// `sketerm files [spec]`: open a file-browser tab (standalone
+    /// launcher mode; a running instance gains the tab instead).
+    files_request: bool = false,
+    files_path: ?[]const u8 = null,
 };
 
 const HELP_TEXT =
@@ -387,12 +391,31 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
             g_app.debug_events = true;
         } else if (std.mem.eql(u8, a, "--debug-images")) {
             g_app.debug_images = true;
+        } else if (std.mem.eql(u8, a, "files")) {
+            g_app.files_request = true;
+            if (n + 1 < argc) {
+                const peek = std.mem.span(@as([*:0]const u8, @ptrCast(argv_raw[@intCast(n + 1)])));
+                if (peek.len > 0 and peek[0] != '-') {
+                    n += 1;
+                    if (g_app.files_path) |old| g_app.allocator.free(old);
+                    g_app.files_path = g_app.allocator.dupe(u8, peek) catch null;
+                }
+            }
         } else if (std.mem.eql(u8, a, "--config") and n + 1 < argc) {
             n += 1;
             const v = std.mem.span(@as([*:0]const u8, @ptrCast(argv_raw[@intCast(n)])));
             if (g_app.config_path) |old| g_app.allocator.free(old);
             g_app.config_path = g_app.allocator.dupe(u8, v) catch null;
         }
+    }
+
+    // `sketerm files` against a RUNNING instance: open the browser
+    // tab there and present, no second window.
+    if (g_app.files_request and g_app.window != null) {
+        g_app.files_request = false;
+        openFilesTab();
+        c.g_application_activate(app);
+        return 0;
     }
 
     if (saw_toggle) {
@@ -454,14 +477,32 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         loaded = window.loadDefaultLayoutIfPresent() catch false;
     }
 
-    if (!loaded) {
+    if (!loaded and !g_app.files_request) {
         window.newShellTab(null) catch |err| {
             std.debug.print("sketerm: spawn first tab failed: {s}\n", .{@errorName(err)});
             return;
         };
     }
 
+    if (g_app.files_request) {
+        g_app.files_request = false;
+        openFilesTab();
+    }
+
     window.present();
+}
+
+/// Open a browser tab in the current window, honoring the optional
+/// `sketerm files <spec>` start location.
+fn openFilesTab() void {
+    const win = g_app.window orelse return;
+    win.newBrowserTabAt(g_app.files_path) catch |err| {
+        std.debug.print("sketerm: files tab failed: {s}\n", .{@errorName(err)});
+    };
+    if (g_app.files_path) |p| {
+        g_app.allocator.free(p);
+        g_app.files_path = null;
+    }
 }
 
 fn onShutdown(_: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {

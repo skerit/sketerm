@@ -84,6 +84,8 @@ package() {
     # Desktop entry + scalable icon (auto-discovered by the hicolor theme)
     install -Dm644 data/dev.sker.sketerm.desktop \
         "$pkgdir/usr/share/applications/dev.sker.sketerm.desktop"
+    install -Dm644 data/dev.sker.sketerm.files.desktop \
+        "$pkgdir/usr/share/applications/dev.sker.sketerm.files.desktop"
     install -Dm644 data/icons/hicolor/scalable/apps/dev.sker.sketerm.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.svg"
 
