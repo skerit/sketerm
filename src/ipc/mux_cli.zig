@@ -633,12 +633,13 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
             if (err == error.MuxProtoMismatch) {
                 _ = c.fprintf(
                     platform.stderr(),
-                    "sketerm mux: version mismatch with %.*s\n" ++
-                        "  remote sketerm-mux speaks protocol %u, this build needs %u\n" ++
-                        "  update sketerm to the same version on both machines\n",
+                    "sketerm mux: unsupported protocol with %.*s\n" ++
+                        "  remote sketerm-mux speaks protocol %u, this build supports %u through %u\n" ++
+                        "  update sketerm on the incompatible machine\n",
                     @as(c_int, @intCast(h.len)),
                     h.ptr,
                     @as(c_uint, mux_client.last_remote_proto),
+                    @as(c_uint, @import("../mux/wire.zig").MIN_COMPATIBLE_SERVER_PROTO),
                     @as(c_uint, @import("../mux/wire.zig").PROTO_VERSION),
                 );
                 return null;

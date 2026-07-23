@@ -8,10 +8,8 @@ const wire = @import("wire.zig");
 const daemon = @import("daemon.zig");
 
 /// Proto version advertised by the remote daemon's `welcome` the last
-/// time a handshake returned `error.MuxProtoMismatch`. The wire format
-/// is version-intolerant (parsed events + versioned snapshots), so a
-/// skew between this build and the remote `sketerm-mux` desyncs the
-/// stream — callers read this to tell the user which side is stale.
+/// time a handshake returned `error.MuxProtoMismatch`. Callers read this
+/// to report which side falls outside the supported compatibility range.
 /// Single-threaded (GUI main loop / blocking CLI), so a plain var is
 /// safe.
 pub var last_remote_proto: u32 = 0;
@@ -174,13 +172,12 @@ pub const Conn = struct {
         // swap-thrashing) must fail the connect, not hang the caller.
         const w = try conn.recvExpectFor(&.{.welcome}, 10_000);
         defer w.deinit(allocator);
-        // Version-skew guard: a daemon left running from a previous build
-        // speaks an older protocol. Refuse rather than corrupt the stream
-        // (the wire carries parsed events — a mismatched daemon desyncs).
+        // Older daemons emit their own older state format, which this client
+        // retains decoders for. Reject only versions outside that range.
         const Probe = struct { proto: u32 = 0 };
         if (std.json.parseFromSlice(Probe, allocator, w.payload, .{ .ignore_unknown_fields = true })) |parsed| {
             defer parsed.deinit();
-            if (parsed.value.proto != @import("wire.zig").PROTO_VERSION) return error.MuxProtoMismatch;
+            if (!wire.clientSupportsServerProto(parsed.value.proto)) return error.MuxProtoMismatch;
         } else |_| {}
         return conn;
     }
@@ -291,7 +288,7 @@ pub const Conn = struct {
         const Probe = struct { proto: u32 = 0 };
         if (std.json.parseFromSlice(Probe, allocator, w.payload, .{ .ignore_unknown_fields = true })) |parsed| {
             defer parsed.deinit();
-            if (parsed.value.proto != @import("wire.zig").PROTO_VERSION) {
+            if (!wire.clientSupportsServerProto(parsed.value.proto)) {
                 last_remote_proto = parsed.value.proto;
                 return error.MuxProtoMismatch;
             }
@@ -384,15 +381,13 @@ pub const Conn = struct {
         try waitReadable(conn.fd, 20_000);
         const w = conn.recvExpectFor(&.{.welcome}, 20_000) catch return error.SshTransportFailed;
         defer w.deinit(allocator);
-        // Version-skew guard: the remote `sketerm-mux` is a different
-        // build that speaks another protocol. `list` (plain JSON) would
-        // still work, but `attach` ships a versioned snapshot the other
-        // side can't decode — so fail HERE with a clear, non-retryable
-        // error instead of desyncing the stream deep in the attach.
+        // Accept older daemons while their snapshots and channel state remain
+        // decodable. Reject unsupported versions here rather than desyncing
+        // later during attach.
         const Probe = struct { proto: u32 = 0 };
         if (std.json.parseFromSlice(Probe, allocator, w.payload, .{ .ignore_unknown_fields = true })) |parsed| {
             defer parsed.deinit();
-            if (parsed.value.proto != @import("wire.zig").PROTO_VERSION) {
+            if (!wire.clientSupportsServerProto(parsed.value.proto)) {
                 last_remote_proto = parsed.value.proto;
                 return error.MuxProtoMismatch;
             }

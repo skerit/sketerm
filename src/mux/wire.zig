@@ -18,8 +18,9 @@ const Event = @import("../parser/event.zig").Event;
 /// the GUI streams a local file to the daemon, which writes it into
 /// the session shell's working directory — so "upload to remote"
 /// works over any transport (local/SSH/UDP) with no shell help. The
-/// handshake (helloProbe) requires an exact proto match, so an
-/// attached daemon is always the same build and understands them.
+/// Clients advertise their newest protocol and daemons only emit
+/// features they implement. A client may accept older daemon versions
+/// whose snapshots and channel state it can still decode.
 /// Version 4 widens the snapshot frame header from [seq:u64] to
 /// [seq:u64][app:u8], so an attaching client learns whether the
 /// session is a forwarded GUI app (`sketerm app`) and can hold the
@@ -30,10 +31,16 @@ const Event = @import("../parser/event.zig").Event;
 /// units, and attach replays pool bytes + a state_sync unit so app
 /// windows survive detach/reattach (durable GUI apps).
 /// Version 6 extends the native-channel state_sync blob with complete
-/// linux-dmabuf plane metadata. Exact hello matching prevents an older
-/// replica from receiving a state version it cannot restore.
+/// linux-dmabuf plane metadata. Daemons gate that state on the client's
+/// hello while newer clients retain the version 5 state decoder.
 pub const PROTO_VERSION: u32 = 6;
+pub const MIN_COMPATIBLE_SERVER_PROTO: u32 = 5;
 pub const NATIVE_STATE_PROTO_VERSION: u32 = 6;
+
+/// Whether this client can safely decode a daemon's frames and snapshots.
+pub fn clientSupportsServerProto(proto: u32) bool {
+    return proto >= MIN_COMPATIBLE_SERVER_PROTO and proto <= PROTO_VERSION;
+}
 
 /// Frame types. Append-only.
 pub const FrameType = enum(u8) {
@@ -601,4 +608,11 @@ test "partialInfo reports expected-vs-buffered for a half frame" {
     try t2.expectEqual(half.len, p.have);
     // Empty buffer → null.
     try t2.expectEqual(@as(?@TypeOf(p), null), partialInfo(""));
+}
+
+test "client accepts compatible older daemons but not unknown protocols" {
+    try std.testing.expect(clientSupportsServerProto(PROTO_VERSION));
+    try std.testing.expect(clientSupportsServerProto(MIN_COMPATIBLE_SERVER_PROTO));
+    try std.testing.expect(!clientSupportsServerProto(MIN_COMPATIBLE_SERVER_PROTO - 1));
+    try std.testing.expect(!clientSupportsServerProto(PROTO_VERSION + 1));
 }
