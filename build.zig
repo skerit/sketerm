@@ -229,6 +229,29 @@ pub fn build(b: *std.Build) void {
     const smoke_mux_step = b.step("smoke-mux", "Mux daemon end-to-end smoke (headless)");
     smoke_mux_step.dependOn(&smoke_mux_run.step);
 
+    // File-service smoke — `zig build smoke-fs` (headless). Daemon
+    // thread + fsdrive client: listings, live view deltas, verbs,
+    // ranged read/write, monolith AND broker mode.
+    const smoke_fs_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_fs.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, smoke_fs_mod, core_cbindings_mod);
+    smoke_fs_mod.addImport("build_options", noglib_opts_mod);
+    if (native_sck) addSckBackend(b, smoke_fs_mod);
+    if (have_x264) addVideo(b, smoke_fs_mod);
+    if (have_vtenc) addVtEnc(b, smoke_fs_mod);
+    const smoke_fs = b.addExecutable(.{
+        .name = "sketerm-smoke-fs",
+        .root_module = smoke_fs_mod,
+        .use_lld = use_lld,
+    });
+    const smoke_fs_run = b.addRunArtifact(smoke_fs);
+    const smoke_fs_step = b.step("smoke-fs", "Mux file-service end-to-end smoke (headless)");
+    smoke_fs_step.dependOn(&smoke_fs_run.step);
+
     // MCP isolation + headless-terminal smoke — `zig build smoke-mcp`.
     // Spawns `zig-out/bin/sketerm mcp` and drives it over stdio; only
     // needs /bin/sh (no display / GUI apps / a11y bus).

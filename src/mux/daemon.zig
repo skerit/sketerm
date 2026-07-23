@@ -31,6 +31,7 @@ const wlkeymaps = @import("../wlhost/keymaps.zig");
 const a11yhub = @import("a11yhub.zig");
 const cast_rec = @import("cast.zig");
 const logring = @import("logring.zig");
+const fsserve = @import("fsserve.zig");
 const build_options = @import("build_options");
 const version = @import("../version.zig");
 const wlvcodec = @import("../wlhost/vcodec.zig");
@@ -1224,6 +1225,31 @@ const Download = struct {
     }
 };
 
+/// One open fs directory view (fs_op open_view): a subscription — the
+/// initial listing is followed by inotify-driven fs_delta pushes until
+/// close_view or client death. `id` is CLIENT-chosen (client-scoped
+/// namespace, no allocation round trip). `wd` is the kernel watch
+/// descriptor; equal paths share one wd, so teardown only removes the
+/// kernel watch when the last view on it goes (see dropFsView).
+const FsView = struct {
+    allocator: std.mem.Allocator,
+    client: *Client,
+    id: u32,
+    /// Canonicalized watched path, owned.
+    path: []u8,
+    /// Kernel watch descriptor (-1 where inotify is unavailable —
+    /// the view then never receives deltas).
+    wd: c_int,
+    /// The watched directory vanished (IN_DELETE_SELF & co) — the
+    /// client got `gone:true`; kept only until it closes the view.
+    gone: bool = false,
+
+    fn deinit(self: *FsView) void {
+        self.allocator.free(self.path);
+        self.allocator.destroy(self);
+    }
+};
+
 pub const Daemon = struct {
     allocator: std.mem.Allocator,
     listen_fd: c_int,
@@ -1240,6 +1266,12 @@ pub const Daemon = struct {
     uploads: std.ArrayList(*Upload) = .empty,
     /// In-flight file downloads (file_get), keyed by (client, xfer).
     downloads: std.ArrayList(*Download) = .empty,
+    /// Open fs directory views (fs_op open_view), keyed by (client,
+    /// client-chosen view id). Views die with their client.
+    fs_views: std.ArrayList(*FsView) = .empty,
+    /// Shared inotify fd backing every view (lazy; -1 until the first
+    /// open_view, and permanently -1 where inotify doesn't exist).
+    fs_watch: fsserve.Watcher = .{},
     next_chan_id: u32 = 1,
     /// Monotonic id for per-session Wayland socket paths (session
     /// names are user input — not path-safe).
@@ -1361,6 +1393,9 @@ pub const Daemon = struct {
     }
 
     pub fn deinit(self: *Daemon) void {
+        for (self.fs_views.items) |v| v.deinit();
+        self.fs_views.deinit(self.allocator);
+        self.fs_watch.deinit();
         for (self.uploads.items) |u| u.deinit();
         self.uploads.deinit(self.allocator);
         for (self.downloads.items) |dl| dl.deinit();
@@ -1494,6 +1529,10 @@ pub const Daemon = struct {
         // rename/metadata). -1 in broker/monolith → ignored by poll.
         const control_idx = fds.items.len;
         try fds.append(self.allocator, .{ .fd = self.control_fd, .events = c.POLLIN, .revents = 0 });
+        // Shared inotify fd for fs directory views (-1 until the first
+        // open_view → ignored by poll).
+        const fs_idx = fds.items.len;
+        try fds.append(self.allocator, .{ .fd = self.fs_watch.fd, .events = c.POLLIN, .revents = 0 });
         const client_base = fds.items.len;
         const n_clients_built = self.clients.items.len;
         for (self.clients.items) |cl| {
@@ -1590,6 +1629,8 @@ pub const Daemon = struct {
         if (self.listen_fd >= 0 and fds.items[0].revents & c.POLLIN != 0) self.acceptClient();
         if (self.control_fd >= 0 and fds.items[control_idx].revents & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0)
             self.workerOnControl();
+        if (self.fs_watch.fd >= 0 and fds.items[fs_idx].revents & c.POLLIN != 0)
+            self.fsWatchReadable();
 
         // Snapshot counts: acceptClient/handleSpawn/attach run inside
         // the loops below and APPEND to these lists. Entries appended
@@ -2253,6 +2294,8 @@ pub const Daemon = struct {
                 cl.queueJson(.ok, .{ .ok = true });
                 self.running = false;
             },
+            .fs_op => self.handleFsOp(cl, frame.payload),
+            .fs_write => self.handleFsWrite(cl, frame.payload),
             .file_open => self.handleFileOpen(cl, frame.payload),
             .file_data => self.handleFileData(cl, frame.payload),
             .file_close => self.handleFileClose(cl, frame.payload),
@@ -2862,6 +2905,406 @@ pub const Daemon = struct {
             .@"error" = "",
             .truncated = truncated,
         });
+    }
+
+    // === File service (fs_op / fs_write / fs_delta) ================
+    // The phase-1 file-browser surface (docs/filebrowser-roadmap.md):
+    // rich one-round-trip listings, live directory views over inotify,
+    // and the small mutation verbs. Everything here is an INLINE job in
+    // the roadmap's terms — bounded work in the poll loop; recursive /
+    // long-running verbs arrive in phase 2 as subprocess jobs. NOT
+    // attach-scoped: in broker mode the broker itself serves these
+    // (fs clients never attach, so their fds are never handed off).
+
+    const FsOpReq = struct {
+        req: u32 = 0,
+        op: []const u8 = "",
+        path: []const u8 = "",
+        /// rename destination / symlink target.
+        to: []const u8 = "",
+        view: u32 = 0,
+        off: u64 = 0,
+        len: u32 = 0,
+    };
+
+    /// One change inside an fs_delta. upsert carries `entry`; del only
+    /// `name`.
+    const FsChange = struct {
+        op: []const u8,
+        name: []const u8,
+        entry: ?fsserve.Entry = null,
+    };
+
+    fn fsReplyErr(cl: *Client, req: u32, msg: []const u8) void {
+        cl.queueJson(.fs_reply, .{ .req = req, .ok = false, .@"error" = msg });
+    }
+
+    fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
+        const parsed = std.json.parseFromSlice(FsOpReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad fs_op");
+            return;
+        };
+        defer parsed.deinit();
+        const r = parsed.value;
+
+        if (std.mem.eql(u8, r.op, "close_view")) return self.fsCloseView(cl, r);
+        // Every other verb takes an absolute path — the client resolves
+        // ~ and relative input; the daemon never guesses a cwd here.
+        if (r.path.len == 0 or r.path[0] != '/') return fsReplyErr(cl, r.req, "path must be absolute");
+
+        if (std.mem.eql(u8, r.op, "open_view")) {
+            self.fsOpenView(cl, r);
+        } else if (std.mem.eql(u8, r.op, "list")) {
+            _ = self.fsSendListing(cl, r.req, r.path);
+        } else if (std.mem.eql(u8, r.op, "stat")) {
+            self.fsStat(cl, r);
+        } else if (std.mem.eql(u8, r.op, "read")) {
+            self.fsRead(cl, r);
+        } else if (std.mem.eql(u8, r.op, "mkdir")) {
+            var z: [4096]u8 = undefined;
+            const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+            const rc = c.mkdir(p, 0o755);
+            if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+        } else if (std.mem.eql(u8, r.op, "rename")) {
+            if (r.to.len == 0 or r.to[0] != '/') return fsReplyErr(cl, r.req, "to must be absolute");
+            var z1: [4096]u8 = undefined;
+            var z2: [4096]u8 = undefined;
+            const from = pathZ(&z1, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+            const to = pathZ(&z2, r.to) catch return fsReplyErr(cl, r.req, "path too long");
+            const rc = c.rename(from, to);
+            if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+        } else if (std.mem.eql(u8, r.op, "delete")) {
+            // Single entry only: files/links unlink, EMPTY dirs rmdir.
+            // Recursive delete is a phase-2 subprocess job — the poll
+            // loop must never walk an unbounded tree.
+            var z: [4096]u8 = undefined;
+            const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+            var st: c.struct_stat = undefined;
+            if (c.lstat(p, &st) != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(@as(c_int, -1)));
+            const rc = if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) c.rmdir(p) else c.unlink(p);
+            if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+        } else if (std.mem.eql(u8, r.op, "symlink")) {
+            // `to` is the link TARGET (may be relative by design);
+            // `path` is where the link is created.
+            if (r.to.len == 0) return fsReplyErr(cl, r.req, "missing target");
+            var z1: [4096]u8 = undefined;
+            var z2: [4096]u8 = undefined;
+            const tgt = pathZ(&z1, r.to) catch return fsReplyErr(cl, r.req, "target too long");
+            const link = pathZ(&z2, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+            const rc = c.symlink(tgt, link);
+            if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+        } else {
+            fsReplyErr(cl, r.req, "unknown fs op");
+        }
+    }
+
+    fn fsOpenView(self: *Daemon, cl: *Client, r: FsOpReq) void {
+        for (self.fs_views.items) |v| {
+            if (v.client == cl and v.id == r.view) return fsReplyErr(cl, r.req, "view id in use");
+        }
+        // Canonicalize so delta paths and the reported root agree.
+        var z: [4096]u8 = undefined;
+        const pz = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+        var real_buf: [4096]u8 = undefined;
+        const canon: []const u8 = if (c.realpath(pz, &real_buf)) |rp|
+            std.mem.span(@as([*:0]const u8, @ptrCast(rp)))
+        else
+            return fsReplyErr(cl, r.req, fsserve.errnoName(@as(c_int, -1)));
+        var dst: c.struct_stat = undefined;
+        if (c.stat(@as([*:0]const u8, @ptrCast(real_buf[0..canon.len :0])), &dst) != 0 or
+            (dst.st_mode & c.S_IFMT) != c.S_IFDIR)
+            return fsReplyErr(cl, r.req, "not a directory");
+
+        // Watch BEFORE listing: changes racing the listing surface as
+        // deltas after it (upserts are idempotent), never fall in a gap.
+        var wd: c_int = -1;
+        if (self.fs_watch.ensure()) {
+            var z2: [4096]u8 = undefined;
+            const cz = pathZ(&z2, canon) catch return fsReplyErr(cl, r.req, "path too long");
+            wd = self.fs_watch.add(cz);
+        }
+        const view = self.allocator.create(FsView) catch return fsReplyErr(cl, r.req, "out of memory");
+        const path_owned = self.allocator.dupe(u8, canon) catch {
+            self.allocator.destroy(view);
+            return fsReplyErr(cl, r.req, "out of memory");
+        };
+        view.* = .{
+            .allocator = self.allocator,
+            .client = cl,
+            .id = r.view,
+            .path = path_owned,
+            .wd = wd,
+        };
+        self.fs_views.append(self.allocator, view) catch {
+            view.deinit();
+            return fsReplyErr(cl, r.req, "out of memory");
+        };
+        // Listing failure (dir vanished between checks) → the open as
+        // a whole failed; the view must not linger daemon-side.
+        if (!self.fsSendListing(cl, r.req, canon))
+            self.dropFsViewAt(self.fs_views.items.len - 1);
+    }
+
+    fn fsCloseView(self: *Daemon, cl: *Client, r: FsOpReq) void {
+        var i: usize = 0;
+        while (i < self.fs_views.items.len) : (i += 1) {
+            const v = self.fs_views.items[i];
+            if (v.client == cl and v.id == r.view) {
+                self.dropFsViewAt(i);
+                cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+                return;
+            }
+        }
+        fsReplyErr(cl, r.req, "no such view");
+    }
+
+    /// Remove fs_views[i]; the kernel watch goes only when no other
+    /// view shares its wd (inotify hands equal paths the same wd).
+    fn dropFsViewAt(self: *Daemon, i: usize) void {
+        const v = self.fs_views.swapRemove(i);
+        if (v.wd >= 0) {
+            var shared = false;
+            for (self.fs_views.items) |o| {
+                if (o.wd == v.wd) {
+                    shared = true;
+                    break;
+                }
+            }
+            if (!shared) self.fs_watch.remove(v.wd);
+        }
+        v.deinit();
+    }
+
+    /// Rich listing as a chunk run of fs_reply frames (`more:true`
+    /// until the last) — one request, one round trip, every entry
+    /// fully stat'ed. This is the anti-GVFS listing shape.
+    fn fsSendListing(self: *Daemon, cl: *Client, req: u32, dir_path: []const u8) bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const l = fsserve.listDir(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES) catch {
+            fsReplyErr(cl, req, "cannot open directory");
+            return false;
+        };
+
+        var off: usize = 0;
+        while (true) {
+            const n = @min(fsserve.CHUNK_ENTRIES, l.entries.len - off);
+            const last = off + n == l.entries.len;
+            cl.queueJson(.fs_reply, .{
+                .req = req,
+                .ok = true,
+                .path = dir_path,
+                .entries = l.entries[off .. off + n],
+                .more = !last,
+                .truncated = l.truncated,
+            });
+            off += n;
+            if (last) break;
+        }
+        return true;
+    }
+
+    fn fsStat(self: *Daemon, cl: *Client, r: FsOpReq) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const dir = std.fs.path.dirname(r.path) orelse "/";
+        const base = std.fs.path.basename(r.path);
+        if (base.len == 0) {
+            // Stat of "/" itself.
+            const e = fsserve.statEntry(arena_state.allocator(), "/", ".") orelse
+                return fsReplyErr(cl, r.req, "stat failed");
+            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .entry = e });
+            return;
+        }
+        const e = fsserve.statEntry(arena_state.allocator(), dir, base) orelse
+            return fsReplyErr(cl, r.req, fsserve.errnoName(@as(c_int, -1)));
+        cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .entry = e });
+    }
+
+    /// Bounded ranged read: fs_data [u32 req][u64 off][bytes], then a
+    /// closing fs_reply { size, eof }. Clients loop for large files —
+    /// one request can never queue more than MAX_READ toward a client.
+    fn fsRead(self: *Daemon, cl: *Client, r: FsOpReq) void {
+        var z: [4096]u8 = undefined;
+        const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+        const fd = c.open(p, c.O_RDONLY | c.O_CLOEXEC);
+        if (fd < 0) return fsReplyErr(cl, r.req, fsserve.errnoName(fd));
+        defer _ = c.close(fd);
+        var st: c.struct_stat = undefined;
+        if (c.fstat(fd, &st) != 0) return fsReplyErr(cl, r.req, "fstat failed");
+        const size: u64 = if (st.st_size > 0) @intCast(st.st_size) else 0;
+
+        const want: usize = @min(@as(usize, r.len), fsserve.MAX_READ);
+        const buf = self.allocator.alloc(u8, 12 + want) catch
+            return fsReplyErr(cl, r.req, "out of memory");
+        defer self.allocator.free(buf);
+        std.mem.writeInt(u32, buf[0..4], r.req, .little);
+        std.mem.writeInt(u64, buf[4..12], r.off, .little);
+        var got: usize = 0;
+        while (got < want) {
+            const n = c.pread(fd, buf.ptr + 12 + got, want - got, @intCast(r.off + got));
+            if (n < 0) return fsReplyErr(cl, r.req, fsserve.errnoName(@as(c_int, @intCast(n))));
+            if (n == 0) break;
+            got += @intCast(n);
+        }
+        cl.queueFrame(.fs_data, buf[0 .. 12 + got]);
+        cl.queueJson(.fs_reply, .{
+            .req = r.req,
+            .ok = true,
+            .size = size,
+            .eof = r.off + got >= size,
+        });
+    }
+
+    /// fs_write payload: [u32 req][u64 off][u8 flags][u16 path_len]
+    /// [path][data]. flags bit0=create bit1=truncate bit2=append
+    /// bit3=exclusive.
+    fn handleFsWrite(self: *Daemon, cl: *Client, payload: []const u8) void {
+        _ = self;
+        if (payload.len < 15) {
+            cl.queueErr("bad fs_write");
+            return;
+        }
+        const req = std.mem.readInt(u32, payload[0..4], .little);
+        const off = std.mem.readInt(u64, payload[4..12], .little);
+        const flags = payload[12];
+        const plen = std.mem.readInt(u16, payload[13..15], .little);
+        if (payload.len < 15 + @as(usize, plen)) return fsReplyErr(cl, req, "bad fs_write");
+        const path = payload[15 .. 15 + plen];
+        const data = payload[15 + plen ..];
+        if (path.len == 0 or path[0] != '/') return fsReplyErr(cl, req, "path must be absolute");
+
+        var oflags: c_int = c.O_WRONLY | c.O_CLOEXEC;
+        if (flags & 1 != 0) oflags |= c.O_CREAT;
+        if (flags & 2 != 0) oflags |= c.O_TRUNC;
+        if (flags & 4 != 0) oflags |= c.O_APPEND;
+        if (flags & 8 != 0) oflags |= c.O_EXCL;
+        var z: [4096]u8 = undefined;
+        const p = pathZ(&z, path) catch return fsReplyErr(cl, req, "path too long");
+        const fd = c.open(p, oflags, @as(c.mode_t, 0o644));
+        if (fd < 0) return fsReplyErr(cl, req, fsserve.errnoName(fd));
+        defer _ = c.close(fd);
+
+        var written: usize = 0;
+        while (written < data.len) {
+            const n = if (flags & 4 != 0)
+                c.write(fd, data.ptr + written, data.len - written)
+            else
+                c.pwrite(fd, data.ptr + written, data.len - written, @intCast(off + written));
+            if (n <= 0) return fsReplyErr(cl, req, fsserve.errnoName(@as(c_int, @intCast(n))));
+            written += @intCast(n);
+        }
+        cl.queueJson(.fs_reply, .{ .req = req, .ok = true, .written = written });
+    }
+
+    /// Drain the shared inotify fd and push coalesced fs_delta frames.
+    /// Per view per drain: at most one delta frame, changes deduped by
+    /// name (last state wins — a create+delete burst nets out to what
+    /// a fresh stat says). Kernel queue overflow degrades honestly to
+    /// `resync:true` (the client must re-list; deltas alone are no
+    /// longer trustworthy).
+    fn fsWatchReadable(self: *Daemon) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const PerView = struct {
+            view: *FsView,
+            changes: std.ArrayList(FsChange) = .empty,
+            gone: bool = false,
+            resync: bool = false,
+        };
+        var touched: std.ArrayList(*PerView) = .empty;
+
+        const findOrAdd = struct {
+            fn go(a: std.mem.Allocator, list: *std.ArrayList(*PerView), v: *FsView) ?*PerView {
+                for (list.items) |pv| {
+                    if (pv.view == v) return pv;
+                }
+                const pv = a.create(PerView) catch return null;
+                pv.* = .{ .view = v };
+                list.append(a, pv) catch return null;
+                return pv;
+            }
+        }.go;
+
+        var buf: [16 * 1024]u8 = undefined;
+        var overflow = false;
+        while (true) {
+            const n = c.read(self.fs_watch.fd, &buf, buf.len);
+            if (n <= 0) break; // EAGAIN → drained
+            var it = fsserve.EventIter{ .buf = buf[0..@intCast(n)] };
+            while (it.next()) |ev| {
+                if (ev.isOverflow()) {
+                    overflow = true;
+                    continue;
+                }
+                for (self.fs_views.items) |v| {
+                    if (v.wd != ev.wd or v.gone) continue;
+                    const pv = findOrAdd(arena, &touched, v) orelse continue;
+                    if (ev.isSelfGone()) {
+                        pv.gone = true;
+                        continue;
+                    }
+                    if (ev.name.len == 0) continue;
+                    // Last state wins: drop any earlier change for this
+                    // name, then append the current verdict.
+                    var i: usize = 0;
+                    while (i < pv.changes.items.len) {
+                        if (std.mem.eql(u8, pv.changes.items[i].name, ev.name)) {
+                            _ = pv.changes.swapRemove(i);
+                        } else i += 1;
+                    }
+                    // A rename target may exist even when the event says
+                    // MOVED_FROM (rapid re-create) — trust a fresh stat
+                    // over the event kind.
+                    if (fsserve.statEntry(arena, v.path, ev.name)) |e| {
+                        pv.changes.append(arena, .{ .op = "upsert", .name = e.name, .entry = e }) catch {};
+                    } else {
+                        // Stat failed → the entry is gone now, whatever
+                        // the event kind said (create+delete bursts).
+                        const name_owned = arena.dupe(u8, ev.name) catch continue;
+                        pv.changes.append(arena, .{ .op = "del", .name = name_owned }) catch {};
+                    }
+                }
+            }
+        }
+
+        if (overflow) {
+            for (self.fs_views.items) |v| {
+                if (v.gone) continue;
+                const pv = findOrAdd(arena, &touched, v) orelse continue;
+                pv.resync = true;
+            }
+        }
+
+        for (touched.items) |pv| {
+            if (pv.gone) {
+                pv.view.gone = true;
+                pv.view.client.queueJson(.fs_delta, .{
+                    .view = pv.view.id,
+                    .gone = true,
+                    .changes = &[_]FsChange{},
+                });
+            } else if (pv.resync) {
+                pv.view.client.queueJson(.fs_delta, .{
+                    .view = pv.view.id,
+                    .resync = true,
+                    .changes = &[_]FsChange{},
+                });
+            } else if (pv.changes.items.len > 0) {
+                pv.view.client.queueJson(.fs_delta, .{
+                    .view = pv.view.id,
+                    .changes = pv.changes.items,
+                });
+            }
+        }
     }
 
     /// Stream each active download toward its client, bounded by the
@@ -5849,6 +6292,16 @@ pub const Daemon = struct {
             while (i < self.downloads.items.len) {
                 if (self.downloads.items[i].client.dead) {
                     self.downloads.swapRemove(i).deinit();
+                } else i += 1;
+            }
+        }
+        // A dying client's fs views die with it (dropFsViewAt keeps
+        // shared kernel watches alive for surviving views).
+        {
+            var i: usize = 0;
+            while (i < self.fs_views.items.len) {
+                if (self.fs_views.items[i].client.dead) {
+                    self.dropFsViewAt(i);
                 } else i += 1;
             }
         }
