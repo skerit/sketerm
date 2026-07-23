@@ -149,6 +149,9 @@ pub const Action = enum {
     /// Spawn a shell inside the sketerm-mux daemon and attach it as
     /// a tab — survives GUI restarts (reattach via `sketerm mux`).
     new_durable_tab,
+    /// Open a file-browser tab (src/ui/browser.zig): a shell pane
+    /// wearing the browser face.
+    new_browser_tab,
     /// Detach the focused mux pane: the session keeps running on the
     /// daemon; the pane lands in a fresh local shell. No-op on
     /// non-mux panes.
@@ -332,6 +335,7 @@ pub fn actionName(a: Action) []const u8 {
         .apply_profile => "apply_profile",
         .show_scrollback => "show_scrollback",
         .new_durable_tab => "new_durable_tab",
+        .new_browser_tab => "new_browser_tab",
         .mux_detach => "mux_detach",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
@@ -409,6 +413,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .apply_profile => "Apply profile to pane (colors, font, scrollback…)",
         .show_scrollback => "Show scrollback in pager",
         .new_durable_tab => "New durable tab (mux)",
+        .new_browser_tab => "New file browser tab",
         .mux_detach => "Detach mux session (pane drops to a local shell)",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",

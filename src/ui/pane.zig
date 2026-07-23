@@ -258,6 +258,13 @@ pub const Pane = struct {
     /// a Window-level GtkCssProvider that supplies the actual rgba
     /// values from Config.title_*_*.
     wrapper_box: ?*c.GtkWidget = null,
+    /// File-browser face (src/ui/browser.zig): a second widget in the
+    /// wrapper box, toggled against the GL area. The pane runs
+    /// `browser_deinit(browser_ctx)` in detachBrowser — the browser's
+    /// fd watch must never outlive the pane.
+    browser_widget: ?*c.GtkWidget = null,
+    browser_ctx: ?*anyopaque = null,
+    browser_deinit: ?*const fn (*anyopaque) void = null,
     /// The GraphicsOffload wrapping the GLArea — hidden while an app
     /// view (mirror of the session's forwarded windows) is shown.
     offload_widget: ?*c.GtkWidget = null,
@@ -754,6 +761,9 @@ pub const Pane = struct {
         // tree must be returned to its (hidden) window before GTK
         // destroys the tree under it. Normally done in unlistPane.
         self.detachAppHost();
+        // Browser face: its fd watch + connection must not outlive
+        // the pane (the callback holds a raw *BrowserView).
+        self.detachBrowser();
         self.grid_pass.deinit();
         self.cell_pass.deinit();
         self.image_pass.deinit();
@@ -797,6 +807,47 @@ pub const Pane = struct {
         h.on_request_embed = onAppRequestEmbed;
         installEmbedBox(self, h);
         h.popIn();
+    }
+
+    /// Attach a file-browser face (src/ui/browser.zig): the widget
+    /// joins the pane's wrapper box as a second face; the terminal
+    /// stays alive underneath (it IS "Open Terminal Here"). The pane
+    /// owns teardown: `deinit_cb(ctx)` runs from detachBrowser.
+    pub fn attachBrowser(self: *Pane, face: *c.GtkWidget, ctx: *anyopaque, deinit_cb: *const fn (*anyopaque) void) void {
+        const wrap = self.wrapper_box orelse return;
+        self.detachBrowser();
+        self.browser_widget = face;
+        self.browser_ctx = ctx;
+        self.browser_deinit = deinit_cb;
+        c.gtk_widget_set_vexpand(face, 1);
+        c.gtk_widget_set_hexpand(face, 1);
+        c.gtk_box_append(@ptrCast(wrap), face);
+        self.setBrowserVisible(true);
+    }
+
+    /// Flip between the browser face and the terminal face.
+    pub fn setBrowserVisible(self: *Pane, show: bool) void {
+        const bw = self.browser_widget orelse return;
+        c.gtk_widget_set_visible(bw, if (show) @as(c_int, 1) else 0);
+        if (self.offload_widget) |ow|
+            c.gtk_widget_set_visible(ow, if (show) @as(c_int, 0) else 1);
+        if (!show) _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+    }
+
+    /// Tear the browser face down (idempotent). Runs its deinit
+    /// callback BEFORE removing the widget so the fd watch dies while
+    /// the widgets still exist.
+    pub fn detachBrowser(self: *Pane) void {
+        if (self.browser_ctx) |ctx| {
+            if (self.browser_deinit) |cb| cb(ctx);
+        }
+        if (self.browser_widget) |bw| {
+            if (self.wrapper_box) |wrap| c.gtk_box_remove(@ptrCast(wrap), bw);
+            if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
+        }
+        self.browser_ctx = null;
+        self.browser_deinit = null;
+        self.browser_widget = null;
     }
 
     /// Sever the pane from its AppHost: return any embedded view to
