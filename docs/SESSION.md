@@ -8448,8 +8448,9 @@ real-daemon smoke using SCM_RIGHTS with offset+padded-stride LINEAR storage.
 The smoke proves legal object-id reuse orphans an old shm pool, pixels
 precede commit, wl_buffer.release follows capture, a no-viewer commit is
 still captured, post-release source overwrite cannot affect replay, and a
-second viewer receives tight pixels before state_sync. The state format
-change is gated by exact mux protocol 6 matching.
+second viewer receives tight pixels before state_sync. Protocol 6 daemons emit
+the new state format; protocol 6 clients retain the protocol 5 state decoder
+for rolling upgrades.
 The worker rejects nested session spawns, and a11y teardown now removes its
 private runtime tree in-process; no post-EGL fork remains in the worker, and
 the old sentinel-slice allocator mismatch is gone.
@@ -8469,3 +8470,20 @@ remain unadvertised because the readback shader requires TEXTURE_2D.
 Default broker workers fork before loading EGL and never fork another
 session. The legacy monolith remains LINEAR-only because its later PTY
 forks are unsafe after a vendor EGL driver has initialized threads.
+
+## Protocol 6 client compatibility with protocol 5 daemons
+
+Mux handshakes now accept daemon protocols in an explicit supported range
+instead of requiring an exact match. A protocol 6 client accepts protocol 5:
+the daemon receives the client's newest-version hello, emits only protocol 5
+features and state, and the client uses its retained protocol 5 snapshot and
+state-sync decoders. Daemons newer than the client and daemons older than
+protocol 5 remain rejected before attach with a diagnostic that names the
+supported range. The shared predicate is used by local, SSH, and UDP probes.
+
+Verification: 814 tests pass with 6 environment skips, including compatibility
+range boundaries. An isolated daemon built from the last protocol 5 commit was
+left running while the current client connected directly and through the real
+SSH proxy path, spawned a shell, attached to send input, restored/read its
+snapshot and output, and killed only the test session. The protocol 5 daemon
+was not restarted or upgraded between those client connections.

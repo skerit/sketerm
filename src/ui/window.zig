@@ -3776,16 +3776,15 @@ pub const Window = struct {
 
     /// Connect to the mux daemon — local (spawning it if absent) or
     /// on an SSH host (`ssh <host> sketerm-mux --proxy`).
-    /// Human-readable reason for a mux version skew, naming both
-    /// sides so the user knows which `sketerm`/`sketerm-mux` to update.
+    /// Human-readable reason for a mux version outside the supported range.
     fn muxProtoMismatchMsg(buf: []u8) []const u8 {
         const mux_client = @import("../mux/client.zig");
         const wire = @import("../mux/wire.zig");
         return std.fmt.bufPrint(
             buf,
-            "version mismatch: remote sketerm-mux speaks protocol {d}, this build needs {d}; update sketerm to the same version on both machines",
-            .{ mux_client.last_remote_proto, wire.PROTO_VERSION },
-        ) catch "version mismatch; update sketerm to the same version on both machines";
+            "unsupported protocol: remote sketerm-mux speaks protocol {d}, this build supports {d} through {d}; update sketerm on the incompatible machine",
+            .{ mux_client.last_remote_proto, wire.MIN_COMPATIBLE_SERVER_PROTO, wire.PROTO_VERSION },
+        ) catch "unsupported mux protocol; update sketerm on the incompatible machine";
     }
 
     fn muxConnect(self: *Window, host: ?[]const u8) !@import("../mux/client.zig").Conn {
