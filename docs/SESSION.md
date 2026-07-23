@@ -8678,3 +8678,60 @@ base 66433f2 before any of this landed).
 
 Phase 2 next: job engine (inline vs subprocess jobs, journaled
 resumable copy); MCP fs tools ride once those verbs exist.
+
+## 2026-07-23: file browser phases 2+3 — job engine, MCP tools, GUI pane
+
+Continuing docs/filebrowser-roadmap.md on the worktree-filebrowser
+branch (three commits after phase 1).
+
+- Job engine (src/mux/fsjob.zig + fs_job frame): `sketerm-mux --job`
+  runs one subprocess per copy/delete_tree/hash operation — spec on
+  stdin, JSON-lines progress on stdout, kill = cancel (proven against
+  a helper stuck in uninterruptible open(2) on a FIFO), SIGSTOP/CONT
+  = pause/resume. Resumable copy needs NO journal: the staged
+  `<dst>.skpart` IS the journal — resume hashes it against the
+  same-length source prefix and continues only on a match (a corrupt
+  partial honestly restarts; smoke covers both). Tree copy preserves
+  symlinks, sizes first for real progress totals, skips equal-size
+  files on resume. Jobs are daemon-owned and OUTLIVE their client;
+  job_list serves any client; finished jobs retained (bounded 64).
+- MCP file_* tools (twelve): daemon-side listings/read/write/mkdir/
+  rename/delete + copy/delete_tree/hash as jobs with honest timeout
+  replies ("still running — file_jobs / file_job"), binary reads as
+  base64. Lazy fsdrive connection to the app daemon (isolated or
+  --shared), dropped+reconnected on loss. New smoke-mcp stage incl.
+  copy-then-hash equality and error honesty.
+- GUI browser pane (src/ui/browser.zig): BrowserView rides a regular
+  Pane as a SECOND FACE in wrapper_box — the shell session underneath
+  is "Open Terminal Here" (one toolbar click, lands in the browsed
+  dir). Internal per-pane tab strip (Nemo per-split-tabs model,
+  confirmed requirement); tree-expand-inline where the expanded set
+  == the daemon watch set; back/forward/up/path-entry navigation;
+  hidden toggle; dirs-first with sizes/mtimes; double-click enters
+  dirs, files open via the default app. Fully async: one nonblocking
+  mux conn per view on g_unix_fd_add, listings accumulate across
+  reply chunks, fs_delta upserts/dels apply to the model and
+  re-render — the GLib loop never blocks (fsdrive's synchronous waits
+  are NOT used GUI-side). Pane.attachBrowser/detachBrowser mirror the
+  app-host embed rules (fd watch must die before the widget tree).
+  Entry points: palette "New File Browser Tab" (new_browser_tab
+  action) + IPC "new-browser-tab".
+- Verified in a LIVE headless GUI (Xvfb + isolated XDG dirs + IPC):
+  screenshots confirm the rendered pane, an externally-created file
+  appearing via pushed deltas with no refresh, src/ tree-expanding
+  inline, navigation, and the terminal-face toggle showing the
+  pane's shell in the browsed directory.
+
+Verification: full suite 777 pass / 6 skip / 0 fail (783); smoke-fs
+(both daemon modes) OK; smoke-broker, smoke-mcp PASS; GUI + musl
+mux-portable + aarch64-macos cross build; daemon still libc-only.
+Tooling note: `zig build test` twice DEADLOCKED (runner in
+futex_wait, spawned test binary starved on --listen stdin, 0 CPU
+both) while a second Claude session ran heavy builds against the
+shared ~/.cache/zig (load ~20) — worked around by executing the
+compiled test binary directly. smoke-mux still shows only the KNOWN
+pre-existing DebugAllocator mismatch (reproduced on base 66433f2).
+
+Not yet (next phases): file-operation UI (context menu, conflict
+dialogs, DnD), layout persistence of browser tabs, remote-host
+browser tabs, transfer queue UI, FUSE mount, live queries.
