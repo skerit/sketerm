@@ -199,9 +199,9 @@ pub const Window = struct {
 
     /// Fraction (0..100) of pixels differing from the baseline; 100
     /// when the window was resized or no baseline exists yet.
-    fn pctVsBaseline(self: *const Window) f64 {
+    fn pctVsBaseline(self: *const Window, region: ?App.Region) f64 {
         if (self.shot_w != self.w or self.shot_h != self.h) return 100.0;
-        return pctDiffBuf(self.pixels.items, self.shot_pixels.items);
+        return pctDiff(self.pixels.items, self.shot_pixels.items, @intCast(@max(self.w, 0)), region);
     }
 };
 
@@ -216,6 +216,33 @@ fn pctDiffBuf(cur: []const u8, base: []const u8) f64 {
         if (!std.mem.eql(u8, cur[i..][0..4], base[i..][0..4])) diff += 1;
     }
     return @as(f64, @floatFromInt(diff)) * 100.0 / @as(f64, @floatFromInt(n / 4));
+}
+
+/// Region-scoped pctDiffBuf over tightly-packed w*4 buffers. A rect
+/// falling entirely outside the buffer diffs as 0 (never a false
+/// "changed" verdict); a partially-outside rect is clamped.
+fn pctDiffRegion(cur: []const u8, base: []const u8, full_w: usize, r: App.Region) f64 {
+    if (base.len != cur.len or cur.len < 4 or full_w == 0) return 100.0;
+    const full_h = cur.len / (full_w * 4);
+    if (r.x >= full_w or r.y >= full_h or r.w == 0 or r.h == 0) return 0.0;
+    const rw: usize = @min(r.w, full_w - r.x);
+    const rh: usize = @min(r.h, full_h - r.y);
+    var diff: usize = 0;
+    var y: usize = 0;
+    while (y < rh) : (y += 1) {
+        const row = ((@as(usize, r.y) + y) * full_w + r.x) * 4;
+        var i: usize = 0;
+        while (i < rw * 4) : (i += 4) {
+            if (!std.mem.eql(u8, cur[row + i ..][0..4], base[row + i ..][0..4])) diff += 1;
+        }
+    }
+    return @as(f64, @floatFromInt(diff)) * 100.0 / @as(f64, @floatFromInt(rw * rh));
+}
+
+/// Whole-buffer or region diff, per `region`.
+fn pctDiff(cur: []const u8, base: []const u8, full_w: usize, region: ?App.Region) f64 {
+    const r = region orelse return pctDiffBuf(cur, base);
+    return pctDiffRegion(cur, base, full_w, r);
 }
 
 /// One wayland_native channel = one app display connection, with its
@@ -1945,15 +1972,30 @@ pub const App = struct {
     /// differ from the screenshot baseline — a 60Hz software cursor
     /// or blinking caret no longer counts as change. No baseline yet
     /// (never screenshotted) counts as 100% different.
-    pub fn waitWindowChange(self: *App, win_id: u32, timeout_ms: i64, min_pct: f64) bool {
+    pub fn waitWindowChange(self: *App, win_id: u32, timeout_ms: i64, min_pct: f64, region: ?Region) bool {
         const deadline = nowMs() + timeout_ms;
         while (true) {
             const win = self.winById(win_id) orelse return false;
             if (win.frames != win.shot_frames and
-                (min_pct <= 0 or win.pctVsBaseline() >= min_pct)) return true;
+                (min_pct <= 0 or win.pctVsBaseline(region) >= min_pct)) return true;
             if (self.exited or nowMs() >= deadline) return false;
             _ = self.pumpOnce(25);
         }
+    }
+
+    /// True when the window no longer exists (destroyed or never
+    /// created) — on teardown this flips BEFORE the `.exit` frame is
+    /// processed, so pair it with settleExit before judging.
+    pub fn windowGone(self: *App, win_id: u32) bool {
+        return self.winById(win_id) == null;
+    }
+
+    /// Pump briefly so a just-happened teardown's `.exit` frame lands;
+    /// true when the app is (now) known to have exited.
+    pub fn settleExit(self: *App, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (!self.exited and nowMs() < deadline) _ = self.pumpOnce(25);
+        return self.exited;
     }
 
     /// Pre-input reference for waitChangeSince: the window's commit
@@ -1989,14 +2031,14 @@ pub const App = struct {
     /// reacts without redrawing. Unlike waitWindowChange this ignores
     /// the screenshot baseline entirely, so frames committed BETWEEN
     /// the last screenshot and the input can't satisfy it.
-    pub fn waitChangeSince(self: *App, win_id: u32, ref: *const FrameRef, timeout_ms: i64, min_pct: f64) bool {
+    pub fn waitChangeSince(self: *App, win_id: u32, ref: *const FrameRef, timeout_ms: i64, min_pct: f64, region: ?Region) bool {
         const deadline = nowMs() + timeout_ms;
         while (true) {
             if (self.winById(win_id)) |win| {
                 if (win.frames != ref.frames) {
                     if (min_pct <= 0 or ref.px.len == 0) return true;
                     if (win.w != ref.w or win.h != ref.h) return true;
-                    if (pctDiffBuf(win.pixels.items, ref.px) >= min_pct) return true;
+                    if (pctDiff(win.pixels.items, ref.px, @intCast(@max(win.w, 0)), region) >= min_pct) return true;
                 }
             } else return false;
             if (self.exited or nowMs() >= deadline) return false;
@@ -2030,7 +2072,7 @@ pub const App = struct {
     /// unchanging or tiny-animation scene passes this one: commits
     /// below the threshold do not move the comparison baseline, so a
     /// slow cumulative drift still eventually counts as change.
-    pub fn waitVisualSettle(self: *App, win_id: u32, quiet_ms: i64, timeout_ms: i64, max_change_pct: f64) bool {
+    pub fn waitVisualSettle(self: *App, win_id: u32, quiet_ms: i64, timeout_ms: i64, max_change_pct: f64, region: ?Region) bool {
         const a = self.allocator;
         var base: std.ArrayList(u8) = .empty;
         defer base.deinit(a);
@@ -2053,7 +2095,7 @@ pub const App = struct {
             if (win.frames != last_frames) {
                 last_frames = win.frames;
                 const resized = win.w != base_w or win.h != base_h;
-                const pct = if (resized) 100.0 else pctDiffBuf(win.pixels.items, base.items);
+                const pct = if (resized) 100.0 else pctDiff(win.pixels.items, base.items, @intCast(@max(win.w, 0)), region);
                 if (pct >= max_change_pct) {
                     base.clearRetainingCapacity();
                     base.appendSlice(a, win.pixels.items) catch return false;
@@ -2078,22 +2120,22 @@ pub const App = struct {
 
     /// Changed fraction vs the baseline WITHOUT moving it — burst
     /// capture gates on this before paying for a PNG encode.
-    pub fn peekDiffPct(self: *App, win_id: u32) f64 {
+    pub fn peekDiffPct(self: *App, win_id: u32, region: ?Region) f64 {
         const win = self.winById(win_id) orelse return 0;
         // Pixels only change on a commit; same frame counter = same content.
         if (win.frames == win.shot_frames) return 0;
-        return win.pctVsBaseline();
+        return win.pctVsBaseline(region);
     }
 
     /// Cheap "did it change" answer: compare current pixels against the
     /// baseline from the last screenshot/stats call, then move the
     /// baseline forward. No image is encoded.
-    pub fn diffStats(self: *App, win_id: u32) Error!DiffStats {
+    pub fn diffStats(self: *App, win_id: u32, region: ?Region) Error!DiffStats {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         if (win.w <= 0 or win.h <= 0 or win.pixels.items.len == 0) return Error.NoSuchWindow;
         const had_baseline = win.shot_pixels.items.len != 0;
         const resized = had_baseline and (win.shot_w != win.w or win.shot_h != win.h);
-        const pct = win.pctVsBaseline();
+        const pct = win.pctVsBaseline(region);
         const stats = DiffStats{
             .changed = win.frames != win.shot_frames and pct > 0,
             .resized = resized,
@@ -2268,4 +2310,28 @@ test "moveMouseRel first contact places the pointer before the delta motion" {
     try t.expectEqual(@as(usize, 1), motions.items.len);
     try t.expectEqual(@as(f64, 40), motions.items[0].x);
     try t.expectEqual(@as(f64, 37), motions.items[0].y);
+}
+
+test "pctDiffRegion: scoped diff, clamping, out-of-bounds rects" {
+    const t = std.testing;
+    // 4x4 window; base all zero, cur differs in the 2x2 top-left block.
+    var base = [_]u8{0} ** (4 * 4 * 4);
+    var cur = [_]u8{0} ** (4 * 4 * 4);
+    for (0..2) |y| for (0..2) |x| {
+        cur[(y * 4 + x) * 4] = 0xff;
+    };
+    // Whole-buffer diff sees 4/16 = 25%.
+    try t.expectApproxEqAbs(@as(f64, 25.0), pctDiffBuf(&cur, &base), 0.001);
+    try t.expectApproxEqAbs(@as(f64, 25.0), pctDiff(&cur, &base, 4, null), 0.001);
+    // Region covering exactly the changed block: 100%.
+    try t.expectApproxEqAbs(@as(f64, 100.0), pctDiffRegion(&cur, &base, 4, .{ .x = 0, .y = 0, .w = 2, .h = 2 }), 0.001);
+    // Region covering only unchanged pixels: 0%.
+    try t.expectApproxEqAbs(@as(f64, 0.0), pctDiffRegion(&cur, &base, 4, .{ .x = 2, .y = 2, .w = 2, .h = 2 }), 0.001);
+    // Partially out-of-bounds rect is clamped (covers the right 2x4
+    // strip = 0 changed).
+    try t.expectApproxEqAbs(@as(f64, 0.0), pctDiffRegion(&cur, &base, 4, .{ .x = 2, .y = 0, .w = 10, .h = 10 }), 0.001);
+    // Fully out-of-bounds rect: 0 (never a false "changed" verdict).
+    try t.expectApproxEqAbs(@as(f64, 0.0), pctDiffRegion(&cur, &base, 4, .{ .x = 8, .y = 8, .w = 2, .h = 2 }), 0.001);
+    // Mismatched buffers stay 100 regardless of region.
+    try t.expectApproxEqAbs(@as(f64, 100.0), pctDiffRegion(cur[0..32], &base, 4, .{ .x = 0, .y = 0, .w = 2, .h = 2 }), 0.001);
 }
