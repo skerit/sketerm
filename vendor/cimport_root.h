@@ -63,6 +63,8 @@
 #include <sys/eventfd.h> /* Wakeup fast path (pipe fallback elsewhere) */
 #include <sys/inotify.h> /* fsserve: live directory-view deltas */
 #include <sys/xattr.h>   /* fsserve: user.sketerm.tags file tags */
+#include <linux/fuse.h>  /* fsmount: pure-Zig /dev/fuse client */
+#include <sys/uio.h>     /* fsmount: writev for big read replies */
 #include <pty.h>         /* openpty/forkpty live here on glibc/musl */
 /* Remote-audio playback: async libpulse on the GLib main loop
  * (audio_sink.zig). GUI-only — never in the mux graph. */
