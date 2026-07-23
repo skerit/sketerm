@@ -8415,3 +8415,57 @@ transport (gdb_commands covers the stated goal; a breakpoint/step
 session over MCP is a much larger design) and launch_app waiting on
 an app-private a11y socket (app-specific protocol; needs a design
 decision on what a generic hook would even speak).
+
+## Modifier-backed linux-dmabuf import
+
+The forwarded-app compositor now supports hardware-rendered ARGB/XRGB
+dmabufs beyond the old LINEAR-only mmap path. Native Linux session workers
+runtime-load one shared EGL/GLES importer, query importable non-external
+format/modifier pairs, union those with the guaranteed LINEAR tuples,
+import EGLImages, render/read them back as tight top-down BGRA, and feed
+the existing zstd synthetic-pool transport. LINEAR remains a direct mmap
+fast path; portable/non-Linux builds compile EGL import out, and no
+EGL/GLES/libdrm ELF dependency was added.
+
+DMABUF params now reject duplicate/out-of-range planes, mixed modifiers,
+reuse, unsupported flags/formats, overflow, the protocol-defined
+offset+stride*height bound, and tight images over 256 MiB. Finalized
+buffers use offset 0 and width*4 stride in replicas. Every commit is
+captured before the brain emits wl_buffer.release, including with no
+viewer, so durable replay serves the last committed staging image instead
+of rereading producer storage after the client was allowed to reuse it.
+Modifier-defined auxiliary planes are forwarded to EGL; a commit without
+a fresh attach never rereads a buffer that was already released.
+Initial create_immed import failure queues INVALID_WL_BUFFER before closing;
+a later capture failure retains the last good image and still commits and
+releases, as required by linux-dmabuf.
+
+Coverage includes pure metadata tests, v3 modifier and legacy implicit
+announcements, lenient replica replay, state-sync v7 plus a synthesized v6
+compatibility fixture, EGL loader/context/capability tests, exact modifier
+attributes, tight staging, channel conversion and Y_INVERT, and a scripted
+real-daemon smoke using SCM_RIGHTS with offset+padded-stride LINEAR storage.
+The smoke proves legal object-id reuse orphans an old shm pool, pixels
+precede commit, wl_buffer.release follows capture, a no-viewer commit is
+still captured, post-release source overwrite cannot affect replay, and a
+second viewer receives tight pixels before state_sync. The state format
+change is gated by exact mux protocol 6 matching.
+The worker rejects nested session spawns, and a11y teardown now removes its
+private runtime tree in-process; no post-EGL fork remains in the worker, and
+the old sentinel-slice allocator mismatch is gone.
+
+Verification: `zig build test --summary all` passes 811 tests with 6
+environment skips; `-Ddmabuf-import=false` passes 810 with 7 skips. Native
+and LINEAR-only `smoke-mux`, `smoke-broker`, the GUI build, native mux,
+Linux static-musl portable mux, aarch64-macOS portable cross-build, and all
+GL renderer smokes pass. Native `sketerm-mux` has only libc/libm/loader
+DT_NEEDED entries; the Linux portable artifact is static with no dynamic
+section.
+
+This host has no /dev/dri or /dev/udmabuf, so a real tiled exporter could
+not be exercised locally; multi-GPU device matching remains limited to
+EGL's selected surfaceless/default display, and external-only modifiers
+remain unadvertised because the readback shader requires TEXTURE_2D.
+Default broker workers fork before loading EGL and never fork another
+session. The legacy monolith remains LINEAR-only because its later PTY
+forks are unsafe after a vendor EGL driver has initialized threads.
