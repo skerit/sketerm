@@ -8516,3 +8516,19 @@ Xvfb run of a real forwarded Weston terminal observed remote
 A separate private nested-Weston run captured the outer GTK client sending
 `xdg_toplevel.set_app_id("org.freedesktop.weston.wayland-terminal")` after
 map. Neither integration run used the live desktop runtime or compositor.
+
+## smoke-e2e runtime isolation
+
+`smoke-e2e` now sets private runtime, config, and state directories before
+starting anything, launches its own broker as a tracked child, waits for that
+private socket, and terminates the exact broker PID after the GUI exits. Its
+failure path uses SIGTERM for the broker so workers are reaped. When
+`xvfb-run` supplies `DISPLAY`, the GUI explicitly selects X11 and drops an
+inherited `WAYLAND_DISPLAY` instead of opening on a live forwarded display.
+
+This closes a destructive regression exposed during protocol 6 testing: the
+previous unisolated smoke connected its v6 GUI to the user's running v5 local
+daemon, classified that daemon as stale under the old exact-match handshake,
+and sent it a shutdown frame. Verification reran that same command,
+`xvfb-run -a zig build smoke-e2e`, which now passes entirely inside the
+private runtime. The full 814-test suite and normal GUI build also pass.
