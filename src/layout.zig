@@ -36,6 +36,11 @@ pub const PaneSpec = struct {
     /// Transport-prefixed host for mux panes ("" = local daemon,
     /// "user@box" = ssh, "udp:box" = mosh-style UDP).
     mux_host: []const u8 = "",
+    /// File-browser face: paths of the browser's internal tabs (in
+    /// order). Empty = the pane has no browser. Restore reattaches
+    /// the browser with the same tabs; older files parse via
+    /// ignore_unknown_fields.
+    browser_tabs: []const []const u8 = &.{},
 };
 
 pub const SplitSpec = struct {
