@@ -24,6 +24,7 @@ const png_util = @import("../util/png.zig");
 const mcpassets = @import("mcpassets.zig");
 const cdp = @import("cdp.zig");
 const shellquote = @import("../util/shellquote.zig");
+const wire = @import("../mux/wire.zig");
 
 const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
@@ -883,6 +884,33 @@ fn toolResult(arena: std.mem.Allocator, text: []const u8, is_error: bool) ?[]con
     return aw.written();
 }
 
+const ActionStatus = union(enum) {
+    completed,
+    failed,
+    app_exited: struct { step: usize, stop: AppStop },
+};
+
+/// Add a machine-readable batch status without changing MCP content blocks.
+fn withActionStatus(arena: std.mem.Allocator, result: []const u8, status: ActionStatus) ?[]const u8 {
+    if (result.len == 0 or result[result.len - 1] != '}') return null;
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    w.writeAll(result[0 .. result.len - 1]) catch return null;
+    w.writeAll(",\"structuredContent\":{\"status\":") catch return null;
+    switch (status) {
+        .completed => w.writeAll("\"completed\"") catch return null,
+        .failed => w.writeAll("\"failed\"") catch return null,
+        .app_exited => |x| {
+            w.print("\"app_exited\",\"step\":{d},\"reason\":\"{s}\"", .{ x.step, x.stop.reasonName() }) catch return null;
+            if (x.stop.exit_status) |code| w.print(",\"exit_status\":{d}", .{code}) catch return null;
+            if (x.stop.signal) |sig| w.print(",\"signal\":{d},\"signal_name\":\"{s}\"", .{ sig, signalName(sig) }) catch return null;
+            w.writeAll(",\"remaining_steps_skipped\":true") catch return null;
+        },
+    }
+    w.writeAll("}}") catch return null;
+    return aw.written();
+}
+
 // ── Tools ─────────────────────────────────────────────────────────
 
 /// Newline-free (MCP stdio framing is one JSON object per line; a
@@ -1554,6 +1582,107 @@ fn exitSuffix(arena: std.mem.Allocator, status: i32) ![]const u8 {
     return "";
 }
 
+fn signalNumber(name: []const u8) ?i32 {
+    const names = [_]struct { name: []const u8, number: i32 }{
+        .{ .name = "SIGHUP", .number = 1 },
+        .{ .name = "SIGINT", .number = 2 },
+        .{ .name = "SIGILL", .number = 4 },
+        .{ .name = "SIGABRT", .number = 6 },
+        .{ .name = "SIGBUS", .number = 7 },
+        .{ .name = "SIGFPE", .number = 8 },
+        .{ .name = "SIGKILL", .number = 9 },
+        .{ .name = "SIGSEGV", .number = 11 },
+        .{ .name = "SIGPIPE", .number = 13 },
+        .{ .name = "SIGTERM", .number = 15 },
+    };
+    for (names) |entry| {
+        if (std.mem.eql(u8, name, entry.name)) return entry.number;
+    }
+    return null;
+}
+
+/// Recover an inferior signal from gdb/valgrind output when the wrapper survives it.
+fn debuggerSignal(log_json: []const u8) ?i32 {
+    const prefixes = [_][]const u8{
+        "Program received signal ",
+        "Process terminating with default action of signal ",
+    };
+    for (prefixes) |prefix| {
+        const at = std.mem.indexOf(u8, log_json, prefix) orelse continue;
+        const rest = log_json[at + prefix.len ..];
+        if (prefix[0] == 'P' and std.mem.startsWith(u8, prefix, "Process ")) {
+            const open = std.mem.indexOfScalar(u8, rest, '(') orelse continue;
+            const close_rel = std.mem.indexOfScalar(u8, rest[open + 1 ..], ')') orelse continue;
+            const close = open + 1 + close_rel;
+            if (signalNumber(rest[open + 1 .. close])) |sig| return sig;
+            continue;
+        }
+        var end: usize = 0;
+        while (end < rest.len and ((rest[end] >= 'A' and rest[end] <= 'Z') or (rest[end] >= '0' and rest[end] <= '9'))) end += 1;
+        if (signalNumber(rest[0..end])) |sig| return sig;
+    }
+    return null;
+}
+
+const AppStopReason = enum { process_exit, client_disconnected, last_toplevel_destroyed };
+
+const AppStop = struct {
+    reason: AppStopReason,
+    exit_status: ?i32 = null,
+    signal: ?i32 = null,
+
+    fn reasonName(self: AppStop) []const u8 {
+        return switch (self.reason) {
+            .process_exit => "process_exit",
+            .client_disconnected => "client_disconnected",
+            .last_toplevel_destroyed => "last_toplevel_destroyed",
+        };
+    }
+};
+
+/// Join process exit and GUI disappearance into one interaction-stop verdict.
+fn probeAppStop(app: *appdrive.App, settle_ms: i64) ?AppStop {
+    if (!app.exited and !app.presentationGone()) return null;
+    if (!app.exited and settle_ms > 0) _ = app.settleExit(settle_ms);
+
+    // A live debugger wrapper still has an indexed daemon-side log.
+    // Fetch it now so the inferior's signal wins over the wrapper's
+    // eventual status 0. Failure still leaves an honest disconnect.
+    if (!app.exited and app.presentationGone() and debuggerSignal(app.log_buf.items) == null) {
+        const fetched = app.logGet("{\"tail\":80,\"from_id\":0,\"id\":0,\"max_chars\":300}", 1_000) catch null;
+        if (fetched) |f| app.allocator.free(f.json);
+    }
+    const inferred_signal = debuggerSignal(app.log_buf.items);
+    if (app.exited) {
+        const status_signal: ?i32 = if (app.exit_status < 0)
+            -app.exit_status
+        else if (app.exit_status >= 129 and app.exit_status <= 159)
+            app.exit_status - 128
+        else
+            null;
+        return .{
+            .reason = .process_exit,
+            .exit_status = app.exit_status,
+            .signal = inferred_signal orelse status_signal,
+        };
+    }
+    const reason: AppStopReason = switch (app.presentation_gone.?) {
+        .client_disconnected => .client_disconnected,
+        .last_toplevel_destroyed => .last_toplevel_destroyed,
+    };
+    return .{ .reason = reason, .signal = inferred_signal };
+}
+
+fn appStopText(arena: std.mem.Allocator, stop: AppStop, context: []const u8) ![]const u8 {
+    if (stop.signal) |sig| {
+        return std.fmt.allocPrint(arena, "app EXITED during {s} ({s}, signal {d}) - see app_log for the backtrace", .{ context, signalName(sig), sig });
+    }
+    if (stop.exit_status) |status| {
+        return std.fmt.allocPrint(arena, "app exited during {s} (status {d})", .{ context, status });
+    }
+    return std.fmt.allocPrint(arena, "app EXITED/disconnected during {s} ({s}; exit status unavailable) - see app_log for details", .{ context, stop.reasonName() });
+}
+
 /// The daemon's log_get reply / pre-exit log stash, JSON shape.
 const LogLineJ = struct {
     id: u64 = 0,
@@ -1623,12 +1752,17 @@ fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
     // The daemon-host pid: a debugger handle (`gdb -p`). For a string
     // command this is the wrapping /bin/sh, not the app itself.
     if (app.pid != 0 and !app.exited) try w.print(",\"pid\":{d}", .{app.pid});
+    const inferred_signal = debuggerSignal(app.log_buf.items);
+    var crash_written = false;
     if (app.exited) {
         try w.print(",\"exited\":true,\"exit_status\":{d}", .{app.exit_status});
         // decodeStatus convention: negative = killed by that signal.
         if (app.exit_status < 0) {
             try w.print(",\"signaled\":true,\"signal\":{d},\"signal_name\":\"{s}\"", .{ -app.exit_status, signalName(-app.exit_status) });
-            if (crashSignal(-app.exit_status)) try w.writeAll(",\"crashed\":true");
+            if (crashSignal(-app.exit_status)) {
+                try w.writeAll(",\"crashed\":true");
+                crash_written = true;
+            }
         } else if (app.exit_status >= 129 and app.exit_status <= 128 + 31) {
             // A string `command` runs under /bin/sh, which reports a
             // child killed by signal N as exit 128+N.
@@ -1636,8 +1770,17 @@ fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
                 app.exit_status - 128, signalName(app.exit_status - 128),
                 app.exit_status,       app.exit_status - 128,
             });
-            if (crashSignal(app.exit_status - 128)) try w.writeAll(",\"crashed\":true");
+            if (crashSignal(app.exit_status - 128)) {
+                try w.writeAll(",\"crashed\":true");
+                crash_written = true;
+            }
         }
+    } else if (app.presentation_gone) |reason| {
+        try w.print(",\"app_gone\":true,\"disconnect_reason\":\"{s}\"", .{@tagName(reason)});
+    }
+    if (inferred_signal) |sig| {
+        try w.print(",\"debugger_caught_signal\":true,\"inferior_signal\":{d},\"inferior_signal_name\":\"{s}\"", .{ sig, signalName(sig) });
+        if (crashSignal(sig) and !crash_written) try w.writeAll(",\"crashed\":true");
     }
     try w.writeAll(",\"windows\":[");
     var first = true;
@@ -1667,7 +1810,7 @@ fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
     // the daemon ahead of `.exit`) is preferred: escape-free FULL
     // lines, never wrapped at the grid width, includes scrolled-off
     // output. The rendered-grid tail is only the fallback.
-    if (app.exited) {
+    if (app.exited or app.presentationGone()) {
         if (logStashTail(arena, app, 15)) |tail_text| {
             try w.writeAll(",\"recent_output\":");
             try std.json.Stringify.value(tail_text, .{}, w);
@@ -1682,8 +1825,8 @@ fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
             try w.writeAll(",\"sanitizer_report\":true,\"sanitizer_note\":\"a sanitizer wrote a report to stderr — read it in full with app_log\"");
         // A gdb wrapper exits 0 after catching the fault; the log
         // headline is the real story.
-        if (std.mem.indexOf(u8, app.log_buf.items, "Program received signal ") != null)
-            try w.writeAll(",\"debugger_caught_signal\":true,\"debugger_note\":\"the debug wrapper caught a fatal signal — backtrace in app_log\"");
+        if (inferred_signal != null)
+            try w.writeAll(",\"debugger_note\":\"the debug wrapper caught a fatal signal — backtrace in app_log\"");
     }
     try w.writeAll("}");
     return aw.written();
@@ -1888,9 +2031,8 @@ const PostInputWait = struct {
     /// callers (app_click auto-retry) branch on the verdict without
     /// parsing the caption note.
     repainted: bool = false,
-    /// Set by finish(): the app exited during the wait — the input
-    /// likely triggered a crash/quit, not a dead area.
-    exited: bool = false,
+    /// Set by finish(): the process exited or its final GUI vanished.
+    stop: ?AppStop = null,
 
     /// `want_shot` = a post-input screenshot was requested; wait_change
     /// then defaults ON (pass wait_change:false to capture immediately).
@@ -1937,6 +2079,11 @@ const PostInputWait = struct {
         defer if (self.ref) |*r| r.deinit(app.allocator);
         if (!self.wait or self.ref == null) {
             _ = app.waitIdle(200, 2_000);
+            if (probeAppStop(app, 1_000)) |stop| {
+                self.stop = stop;
+                const detail = try appStopText(arena, stop, "the post-input wait");
+                return try std.fmt.allocPrint(arena, " - {s}", .{detail});
+            }
             return "";
         }
         if (app.waitChangeSince(win_id, &self.ref.?, self.timeout_ms, self.min_pct, self.region)) {
@@ -1952,6 +2099,11 @@ const PostInputWait = struct {
                 // Let a multi-frame transition finish before capture.
                 _ = app.waitIdle(150, 1_000);
             }
+            if (probeAppStop(app, 1_000)) |stop| {
+                self.stop = stop;
+                const detail = try appStopText(arena, stop, "the post-input settle");
+                return try std.fmt.allocPrint(arena, " - {s}", .{detail});
+            }
             return try std.fmt.allocPrint(arena, " — window repainted {d}ms after the input{s}{s}", .{
                 elapsed,
                 if (self.settle_ms > 0) " and settled" else "",
@@ -1962,13 +2114,11 @@ const PostInputWait = struct {
         // false as a dead click — distinguish here, with the signal.
         // A vanished window usually means teardown raced ahead of the
         // .exit frame: give that frame a bounded moment to land.
-        if (app.exited or (app.windowGone(win_id) and app.settleExit(1_000))) {
-            self.exited = true;
-            return try std.fmt.allocPrint(
-                arena,
-                " — app EXITED during the post-input wait (status {d}{s}): the input likely triggered it; backtrace/report in app_log",
-                .{ app.exit_status, try exitSuffix(arena, app.exit_status) },
-            );
+        if (app.windowGone(win_id) and !app.presentationGone()) _ = app.settleExit(1_000);
+        if (probeAppStop(app, 1_000)) |stop| {
+            self.stop = stop;
+            const detail = try appStopText(arena, stop, "the post-input wait");
+            return try std.fmt.allocPrint(arena, " - {s}", .{detail});
         }
         return try std.fmt.allocPrint(
             arena,
@@ -1990,7 +2140,7 @@ fn inputResult(
     desc: []const u8,
 ) ![]const u8 {
     const note = try piw.finish(arena, app, win_id);
-    if (piw.exited) {
+    if (piw.stop != null) {
         // Skip the screenshot attempt (it would fail as "no pixels
         // yet?" and mask the crash) — report the exit with full detail.
         const summary = try appSummary(arena, app);
@@ -2070,7 +2220,6 @@ fn actionsCapture(
         tag = "move";
     }
     const shot = app.screenshotPngMarked(wid, max_px, null, 1, pending.items) catch {
-        try w.print("{s}: ERROR — screenshot failed (no pixels yet?)\n", .{prefix});
         return false;
     };
     pngs.append(arena, shot.png) catch {
@@ -2087,6 +2236,11 @@ fn actionsCapture(
     if (marks_n > 0) try w.print(" [{d} marker(s) drawn: red crosshair = click, cyan = move/hover, number = step]", .{marks_n});
     try w.writeAll("\n");
     return true;
+}
+
+fn reportActionStop(arena: std.mem.Allocator, w: *std.Io.Writer, step: usize, context: []const u8, stop: AppStop) !void {
+    const detail = try appStopText(arena, stop, context);
+    try w.print("step {d}: {s}; remaining steps skipped\n", .{ step, detail });
 }
 
 // ── input journal, macros, template matching, OCR ─────────────────
@@ -2753,9 +2907,10 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
     // Observation tools (output/log/windows/screenshot/state/actions/
     // wait/record_stop) handle exit themselves; close_app stays
     // idempotent.
-    if (app.exited and needsLiveApp(name)) {
+    if ((app.exited or app.presentationGone()) and needsLiveApp(name)) {
+        _ = probeAppStop(app, 1_000);
         const summary = try appSummary(arena, app);
-        const msg = try std.fmt.allocPrint(arena, "the app has exited — {s} needs a running app\n{s}", .{ name, summary });
+        const msg = try std.fmt.allocPrint(arena, "the app has exited or disconnected - {s} needs a running app\n{s}", .{ name, summary });
         return toolResult(arena, msg, true) orelse error.OutOfMemory;
     }
 
@@ -3115,20 +3270,29 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
         var attempts: i64 = 0;
         var note: []const u8 = "";
         var repainted = false;
+        var stopped: ?AppStop = null;
         while (true) {
             var piw = PostInputWait.begin(args, app, win_id, want_shot);
-            app.clickEx(win_id, @floatFromInt(x), @floatFromInt(y), button, hold_ms, count) catch
+            app.clickEx(win_id, @floatFromInt(x), @floatFromInt(y), button, hold_ms, count) catch {
+                if (probeAppStop(app, 1_000)) |stop| {
+                    const detail = try appStopText(arena, stop, "the click");
+                    const summary = try appSummary(arena, app);
+                    const msg = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d} - {s}\n{s}", .{ x, y, button, detail, summary });
+                    return toolResult(arena, msg, false) orelse error.OutOfMemory;
+                }
                 return appErr(arena, "click failed (bad window?)");
+            };
             attempts += 1;
             note = try piw.finish(arena, app, win_id);
             repainted = piw.repainted;
+            stopped = piw.stop;
             // Auto-retry only on a WAITED no-repaint verdict — a click
             // that visibly landed must never get a second press, and
             // without a wait there is no verdict to retry on.
-            if (repainted or !piw.wait or attempts > retries or app.exited) break;
+            if (repainted or !piw.wait or attempts > retries or stopped != null) break;
         }
         journalStep(app, "{{\"click\":[{d},{d}],\"button\":{d},\"window\":{d},\"hold_ms\":{d},\"count\":{d}}}", .{ x, y, button, win_id, hold_ms, count });
-        if (app.exited) {
+        if (stopped != null) {
             // Don't attempt the screenshot — it fails as "no pixels
             // yet?" and masks the crash the click just triggered.
             const summary = try appSummary(arena, app);
@@ -3153,7 +3317,12 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
             const annot = [_]marks_mod.Mark{.{ .x = @floatFromInt(x), .y = @floatFromInt(y) }};
             const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 1568, 0, 8192));
             const shot = app.screenshotPngMarked(win_id, max_px, null, 1, if (want_mark) &annot else &.{}) catch
-                return toolResult(arena, "clicked, but the post-click screenshot failed (no pixels yet?)", false) orelse error.OutOfMemory;
+                if (probeAppStop(app, 1_000)) |stop| {
+                    const detail = try appStopText(arena, stop, "the post-click capture");
+                    const summary = try appSummary(arena, app);
+                    const msg = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d} - {s}\n{s}", .{ x, y, button, detail, summary });
+                    return toolResult(arena, msg, false) orelse error.OutOfMemory;
+                } else return toolResult(arena, "clicked, but the post-click screenshot failed (no pixels yet?)", false) orelse error.OutOfMemory;
             defer app_state.allocator.free(shot.png);
             const extra = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}{s}{s}", .{
                 x, y, button, qual, note,
@@ -3209,6 +3378,8 @@ fn runActionSteps(
     var shot_tags: std.ArrayList([]const u8) = .empty;
     defer shot_tags.deinit(arena);
     var stopped = false;
+    var app_stop: ?AppStop = null;
+    var stop_step: usize = 0;
     // Marks accumulated by `"mark": true` steps; drawn onto (and
     // consumed by) the next screenshot so several clicks can share
     // one annotated image, each labelled with its step number.
@@ -3217,8 +3388,10 @@ fn runActionSteps(
     if (intro.len > 0) try w.writeAll(intro);
     for (steps, 0..) |st, idx| {
         const n = idx + 1;
-        if (app.exited) {
-            try w.print("step {d}: SKIPPED — app exited (status {d}{s}); remaining steps skipped\n", .{ n, app.exit_status, try exitSuffix(arena, app.exit_status) });
+        if (probeAppStop(app, 1_000)) |stop| {
+            try reportActionStop(arena, w, n, "the batch", stop);
+            app_stop = stop;
+            stop_step = n;
             stopped = true;
             break;
         }
@@ -3272,6 +3445,13 @@ fn runActionSteps(
             const hold_ms: i64 = std.math.clamp(argInt(st, "hold_ms") orelse Tuning.hold_ms.value, 0, 10_000);
             const cnt: u32 = @intCast(std.math.clamp(argInt(st, "count") orelse 1, 1, 3));
             app.clickEx(wid, xy[0], xy[1], button, hold_ms, cnt) catch {
+                if (probeAppStop(app, 1_000)) |stop| {
+                    try reportActionStop(arena, w, n, "the click", stop);
+                    app_stop = stop;
+                    stop_step = n;
+                    stopped = true;
+                    break;
+                }
                 try w.print("step {d}: ERROR — click failed (bad window?)\n", .{n});
                 stopped = true;
                 break;
@@ -3292,6 +3472,13 @@ fn runActionSteps(
             };
             const wid = win_step orelse firstToplevelId(app);
             app.drag(wid, q[0], q[1], q[2], q[3], button) catch {
+                if (probeAppStop(app, 1_000)) |stop| {
+                    try reportActionStop(arena, w, n, "the drag", stop);
+                    app_stop = stop;
+                    stop_step = n;
+                    stopped = true;
+                    break;
+                }
                 try w.print("step {d}: ERROR — drag failed (bad window?)\n", .{n});
                 stopped = true;
                 break;
@@ -3321,6 +3508,13 @@ fn runActionSteps(
                 };
             }
             if (bad) {
+                if (probeAppStop(app, 1_000)) |stop| {
+                    try reportActionStop(arena, w, n, "the key press", stop);
+                    app_stop = stop;
+                    stop_step = n;
+                    stopped = true;
+                    break;
+                }
                 try w.print("step {d}: ERROR — key press failed (unknown chord / no window?)\n", .{n});
                 stopped = true;
                 break;
@@ -3334,6 +3528,13 @@ fn runActionSteps(
                 break;
             }
             app.typeText(win_step, tv.string) catch {
+                if (probeAppStop(app, 1_000)) |stop| {
+                    try reportActionStop(arena, w, n, "text input", stop);
+                    app_stop = stop;
+                    stop_step = n;
+                    stopped = true;
+                    break;
+                }
                 try w.print("step {d}: ERROR — type failed (no window?)\n", .{n});
                 stopped = true;
                 break;
@@ -3359,6 +3560,13 @@ fn runActionSteps(
             }
             const wid = win_step orelse firstToplevelId(app);
             app.scroll(wid, sx, sy, dd[0], dd[1]) catch {
+                if (probeAppStop(app, 1_000)) |stop| {
+                    try reportActionStop(arena, w, n, "scroll input", stop);
+                    app_stop = stop;
+                    stop_step = n;
+                    stopped = true;
+                    break;
+                }
                 try w.print("step {d}: ERROR — scroll failed (bad window?)\n", .{n});
                 stopped = true;
                 break;
@@ -3383,12 +3591,19 @@ fn runActionSteps(
             } else {
                 settled = app.waitIdle(quiet_ms, timeout_ms);
             }
+            if (probeAppStop(app, 1_000)) |stop| {
+                try reportActionStop(arena, w, n, "wait_idle", stop);
+                app_stop = stop;
+                stop_step = n;
+                stopped = true;
+                break;
+            }
             if (!settled and (argBool(st, "required") or (wv == .object and argBool(wv, "required")))) {
                 try w.print("step {d}: ERROR — wait_idle did not settle before timeout (required); remaining steps skipped\n", .{n});
                 stopped = true;
                 break;
             }
-            try w.print("step {d}: wait_idle — {s}\n", .{ n, if (app.exited) "app EXITED during the wait (summary below)" else if (settled) "settled" else "TIMED OUT (still rendering)" });
+            try w.print("step {d}: wait_idle — {s}\n", .{ n, if (settled) "settled" else "TIMED OUT (still rendering)" });
         } else if (st.object.get("wait_change")) |wv| {
             var timeout_ms: i64 = 10_000;
             var min_pct: f64 = 0;
@@ -3400,12 +3615,19 @@ fn runActionSteps(
             }
             const wid = win_step orelse firstToplevelId(app);
             const changed = if (wid == 0) false else app.waitWindowChange(wid, timeout_ms, min_pct, if (wv == .object and min_pct > 0) regionFrom(wv) else null);
+            if (probeAppStop(app, 1_000)) |stop| {
+                try reportActionStop(arena, w, n, "wait_change", stop);
+                app_stop = stop;
+                stop_step = n;
+                stopped = true;
+                break;
+            }
             if (!changed and (argBool(st, "required") or (wv == .object and argBool(wv, "required")))) {
                 try w.print("step {d}: ERROR — wait_change saw no change before timeout (required); remaining steps skipped\n", .{n});
                 stopped = true;
                 break;
             }
-            try w.print("step {d}: wait_change — {s}\n", .{ n, if (changed) "content changed" else if (app.exited) "app EXITED during the wait (summary below)" else "TIMED OUT (no change)" });
+            try w.print("step {d}: wait_change — {s}\n", .{ n, if (changed) "content changed" else "TIMED OUT (no change)" });
         } else if (st.object.get("screenshot")) |sv| {
             const wid = win_step orelse firstToplevelId(app);
             if (wid == 0) {
@@ -3428,6 +3650,13 @@ fn runActionSteps(
             }
             const prefix = try std.fmt.allocPrint(arena, "step {d}", .{n});
             if (!try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, max_px, prefix)) {
+                if (probeAppStop(app, 1_000)) |stop| {
+                    try reportActionStop(arena, w, n, "the screenshot", stop);
+                    app_stop = stop;
+                    stop_step = n;
+                } else {
+                    try w.print("step {d}: ERROR - screenshot failed (no pixels yet?)\n", .{n});
+                }
                 stopped = true;
                 break;
             }
@@ -3464,8 +3693,15 @@ fn runActionSteps(
                     },
                     .err => {}, // window not rendered yet — keep waiting
                 }
-                if (found != null or app.exited or monoMs() >= deadline) break;
+                if (found != null or app.exited or app.presentationGone() or monoMs() >= deadline) break;
                 _ = app.pumpOnce(50);
+            }
+            if (probeAppStop(app, 1_000)) |stop| {
+                try reportActionStop(arena, w, n, if (is_wait) "wait_image" else "click_image", stop);
+                app_stop = stop;
+                stop_step = n;
+                stopped = true;
+                break;
             }
             const m = found orelse {
                 try w.print("step {d}: ERROR — template \"{s}\" not found{s}\n", .{ n, needle.name, if (is_wait) " before timeout" else "" });
@@ -3474,6 +3710,13 @@ fn runActionSteps(
             };
             if (do_click) {
                 clickTuned(app, wid, @floatFromInt(m.cx), @floatFromInt(m.cy), btn) catch {
+                    if (probeAppStop(app, 1_000)) |stop| {
+                        try reportActionStop(arena, w, n, if (is_wait) "wait_image click" else "click_image", stop);
+                        app_stop = stop;
+                        stop_step = n;
+                        stopped = true;
+                        break;
+                    }
                     try w.print("step {d}: ERROR — template matched but the click failed (bad window?)\n", .{n});
                     stopped = true;
                     break;
@@ -3515,8 +3758,15 @@ fn runActionSteps(
                         if (!std.mem.startsWith(u8, e, "no rendered")) fatal = e;
                     },
                 }
-                if (seen != null or fatal != null or app.exited or monoMs() >= deadline) break;
+                if (seen != null or fatal != null or app.exited or app.presentationGone() or monoMs() >= deadline) break;
                 _ = app.waitIdle(std.math.maxInt(i32), 300); // pumped sleep between OCR passes
+            }
+            if (probeAppStop(app, 1_000)) |stop| {
+                try reportActionStop(arena, w, n, "wait_text", stop);
+                app_stop = stop;
+                stop_step = n;
+                stopped = true;
+                break;
             }
             if (fatal) |e| {
                 try w.print("step {d}: ERROR — {s}\n", .{ n, e });
@@ -3536,6 +3786,13 @@ fn runActionSteps(
                     break;
                 };
                 clickTuned(app, wid, @floatFromInt(box.x + box.w / 2), @floatFromInt(box.y + box.h / 2), 1) catch {
+                    if (probeAppStop(app, 1_000)) |stop| {
+                        try reportActionStop(arena, w, n, "wait_text click", stop);
+                        app_stop = stop;
+                        stop_step = n;
+                        stopped = true;
+                        break;
+                    }
                     try w.print("step {d}: ERROR — text found but the click failed (bad window?)\n", .{n});
                     stopped = true;
                     break;
@@ -3551,6 +3808,13 @@ fn runActionSteps(
             stopped = true;
             break;
         }
+        if (probeAppStop(app, 1_000)) |stop| {
+            try reportActionStop(arena, w, n, "the action", stop);
+            app_stop = stop;
+            stop_step = n;
+            stopped = true;
+            break;
+        }
         // Combined form: {"click":[x,y],"screenshot":true} — capture
         // right after the action, with any pending marks drawn in.
         // (Dedicated screenshot steps `continue`d above.)
@@ -3560,7 +3824,17 @@ fn runActionSteps(
                 try w.print("step {d}: screenshot SKIPPED (max {d} per call)\n", .{ n, MAX_SHOTS });
             } else if (wid != 0) {
                 const prefix = try std.fmt.allocPrint(arena, "step {d}", .{n});
-                _ = try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, 1568, prefix);
+                if (!try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, 1568, prefix)) {
+                    if (probeAppStop(app, 1_000)) |stop| {
+                        try reportActionStop(arena, w, n, "the screenshot", stop);
+                        app_stop = stop;
+                        stop_step = n;
+                    } else {
+                        try w.print("step {d}: ERROR - screenshot failed (no pixels yet?)\n", .{n});
+                    }
+                    stopped = true;
+                    break;
+                }
             }
         }
         // Journal the step VERBATIM once it succeeded (pure
@@ -3574,16 +3848,24 @@ fn runActionSteps(
     }
     // `mark` without any screenshot still yields an image: capture
     // the final state with the leftover marks drawn in.
-    if (pending_marks.items.len > 0 and pngs.items.len < MAX_SHOTS) {
+    if (!stopped and pending_marks.items.len > 0 and pngs.items.len < MAX_SHOTS) {
         const wid = win_arg orelse firstToplevelId(app);
         if (wid != 0)
             _ = try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, 1568, "end of batch");
     }
     if (!stopped) try w.print("all {d} steps completed\n", .{steps.len});
-    if (app.exited) try w.writeAll(try appSummary(arena, app));
-    if (pngs.items.len > 0)
-        return imagesResultTagged(arena, aw.written(), pngs.items, shot_tags.items) orelse error.OutOfMemory;
-    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    if (app_stop != null or app.exited or app.presentationGone()) try w.writeAll(try appSummary(arena, app));
+    const base = if (pngs.items.len > 0)
+        imagesResultTagged(arena, aw.written(), pngs.items, shot_tags.items) orelse return error.OutOfMemory
+    else
+        toolResult(arena, aw.written(), false) orelse return error.OutOfMemory;
+    const status: ActionStatus = if (app_stop) |stop|
+        .{ .app_exited = .{ .step = stop_step, .stop = stop } }
+    else if (stopped)
+        .failed
+    else
+        .completed;
+    return withActionStatus(arena, base, status) orelse error.OutOfMemory;
 }
 
 /// Continuation of appTool (split around the step engine so
@@ -6203,6 +6485,215 @@ const FakeBackend = struct {
         self.requests.deinit(self.allocator);
     }
 };
+
+const DelayedExit = struct {
+    fd: c_int,
+    status: i32,
+    delay_us: u32 = 50_000,
+
+    fn send(self: DelayedExit) void {
+        _ = c.usleep(self.delay_us);
+        var frame: [9]u8 = undefined;
+        std.mem.writeInt(u32, frame[0..4], 5, .little);
+        frame[4] = @intFromEnum(wire.FrameType.exit);
+        std.mem.writeInt(i32, frame[5..9], self.status, .little);
+        _ = c.write(self.fd, &frame, frame.len);
+    }
+};
+
+fn testActionApp(a: std.mem.Allocator, with_window: bool) !struct { app: *appdrive.App, peer: c_int } {
+    var fds: [2]c_int = undefined;
+    if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return error.SocketFailed;
+    errdefer {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+    }
+    const app = try a.create(appdrive.App);
+    errdefer a.destroy(app);
+    app.* = .{
+        .allocator = a,
+        .conn = .{ .allocator = a, .fd = fds[0] },
+        .name = try a.dupe(u8, "mcp-action-test"),
+    };
+    app.conn.setNonBlocking();
+    if (with_window) {
+        const win = try a.create(appdrive.Window);
+        errdefer a.destroy(win);
+        win.* = .{ .id = 1, .chan = 7, .sid = 11, .w = 1, .h = 1, .frames = 1 };
+        try win.pixels.appendSlice(a, &.{ 1, 2, 3, 255 });
+        try app.windows.append(a, win);
+        app.had_toplevel = true;
+    }
+    app_state.allocator = a;
+    return .{ .app = app, .peer = fds[1] };
+}
+
+fn parseTestValue(a: std.mem.Allocator, json: []const u8) !std.json.Value {
+    return std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+}
+
+test "debuggerSignal parses gdb and valgrind crash headlines" {
+    const t = std.testing;
+    try t.expectEqual(@as(?i32, 11), debuggerSignal("Program received signal SIGSEGV, Segmentation fault."));
+    try t.expectEqual(@as(?i32, 6), debuggerSignal("Process terminating with default action of signal 6 (SIGABRT)"));
+    try t.expectEqual(@as(?i32, null), debuggerSignal("ordinary app output"));
+}
+
+test "app_actions stops structurally when a click crashes the app" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+
+    const sender = try std.Thread.spawn(.{}, DelayedExit.send, .{DelayedExit{ .fd = fixture.peer, .status = -11 }});
+    defer sender.join();
+    const root = try parseTestValue(arena,
+        \\{"actions":[{"click":[0,0],"screenshot":true},{"screenshot":true}]}
+    );
+    const result = try runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, 1, false, "");
+    try t.expect(std.mem.indexOf(u8, result, "app EXITED") != null);
+    try t.expect(std.mem.indexOf(u8, result, "SIGSEGV") != null);
+    try t.expect(std.mem.indexOf(u8, result, "\"status\":\"app_exited\"") != null);
+    try t.expect(std.mem.indexOf(u8, result, "\"step\":1") != null);
+    try t.expect(std.mem.indexOf(u8, result, "no pixels yet") == null);
+    try t.expect(std.mem.indexOf(u8, result, "all 2 steps completed") == null);
+}
+
+test "app_actions reports clean exit status and skips later steps" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+
+    const sender = try std.Thread.spawn(.{}, DelayedExit.send, .{DelayedExit{ .fd = fixture.peer, .status = 0 }});
+    defer sender.join();
+    const root = try parseTestValue(arena,
+        \\{"actions":[{"wait_idle":{"quiet_ms":500,"timeout_ms":1000}},{"key":"enter"}]}
+    );
+    const result = try runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, 1, false, "");
+    try t.expect(std.mem.indexOf(u8, result, "app exited during wait_idle (status 0)") != null);
+    try t.expect(std.mem.indexOf(u8, result, "\"status\":\"app_exited\"") != null);
+    try t.expect(std.mem.indexOf(u8, result, "\"exit_status\":0") != null);
+    try t.expect(std.mem.indexOf(u8, result, "pressed") == null);
+}
+
+test "app_actions keeps a live frozen app distinct from exit" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+
+    const root = try parseTestValue(arena,
+        \\{"actions":[{"wait_idle":{"quiet_ms":500,"timeout_ms":100,"required":true}}]}
+    );
+    const result = try runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, 1, false, "");
+    try t.expect(std.mem.indexOf(u8, result, "wait_idle did not settle before timeout") != null);
+    try t.expect(std.mem.indexOf(u8, result, "\"status\":\"failed\"") != null);
+    try t.expect(std.mem.indexOf(u8, result, "app_exited") == null);
+}
+
+test "app_actions treats debugger client loss as inferior exit" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, false);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    fixture.app.had_toplevel = true;
+    fixture.app.presentation_gone = .client_disconnected;
+    try fixture.app.log_buf.appendSlice(t.allocator, "{\"lines\":[{\"text\":\"Program received signal SIGSEGV, Segmentation fault.\"}]}");
+
+    const root = try parseTestValue(arena, "{\"actions\":[{\"wait_idle\":{\"timeout_ms\":100}},{\"screenshot\":true}]}");
+    const result = try runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, null, false, "");
+    try t.expect(std.mem.indexOf(u8, result, "SIGSEGV") != null);
+    try t.expect(std.mem.indexOf(u8, result, "\"reason\":\"client_disconnected\"") != null);
+    try t.expect(std.mem.indexOf(u8, result, "\"status\":\"app_exited\"") != null);
+    try t.expect(std.mem.indexOf(u8, result, "no rendered window") == null);
+}
+
+test "PostInputWait reports a click-triggered process crash" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    const args = try parseTestValue(arena, "{\"wait_change\":true,\"timeout_ms\":500,\"settle_ms\":0}");
+    var wait = PostInputWait.begin(args, fixture.app, 1, true);
+    const sender = try std.Thread.spawn(.{}, DelayedExit.send, .{DelayedExit{ .fd = fixture.peer, .status = -11 }});
+    defer sender.join();
+    const note = try wait.finish(arena, fixture.app, 1);
+    try t.expect(wait.stop != null);
+    try t.expectEqual(@as(?i32, 11), wait.stop.?.signal);
+    try t.expect(std.mem.indexOf(u8, note, "app EXITED") != null);
+    try t.expect(std.mem.indexOf(u8, note, "SIGSEGV") != null);
+}
+
+test "app_click reports a crash during its held click" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    try t.expectEqual(@as(usize, 0), app_state.apps.count());
+    app_state.ready = true;
+    try app_state.apps.put(t.allocator, 1, fixture.app);
+    defer {
+        _ = app_state.apps.fetchSwapRemove(1);
+        app_state.apps.deinit(t.allocator);
+        app_state.apps = .empty;
+        app_state.ready = false;
+    }
+
+    const args = try parseTestValue(arena, "{\"app\":1,\"window\":1,\"x\":0,\"y\":0,\"mark\":false,\"wait_change\":true,\"timeout_ms\":500}");
+    const sender = try std.Thread.spawn(.{}, DelayedExit.send, .{DelayedExit{ .fd = fixture.peer, .status = -11 }});
+    defer sender.join();
+    const result = try appTool(arena, "app_click", args);
+    try t.expect(std.mem.indexOf(u8, result, "app EXITED") != null);
+    try t.expect(std.mem.indexOf(u8, result, "SIGSEGV") != null);
+    try t.expect(std.mem.indexOf(u8, result, "click failed") == null);
+    try t.expect(std.mem.indexOf(u8, result, "no pixels yet") == null);
+}
+
+test "app_actions wait_image reports exit instead of template timeout" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, false);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+
+    const png_bytes = try png_util.encodeRgba(arena, &.{ 255, 0, 0, 255 }, 1, 1);
+    const enc = std.base64.standard.Encoder;
+    const b64 = try arena.alloc(u8, enc.calcSize(png_bytes.len));
+    _ = enc.encode(b64, png_bytes);
+    const json = try std.fmt.allocPrint(
+        arena,
+        "{{\"actions\":[{{\"wait_image\":{{\"image_b64\":\"{s}\",\"timeout_ms\":1000}}}},{{\"wait\":1}}]}}",
+        .{b64},
+    );
+    const root = try parseTestValue(arena, json);
+    const sender = try std.Thread.spawn(.{}, DelayedExit.send, .{DelayedExit{ .fd = fixture.peer, .status = -11 }});
+    defer sender.join();
+    const result = try runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, null, false, "");
+    try t.expect(std.mem.indexOf(u8, result, "app EXITED during wait_image") != null);
+    try t.expect(std.mem.indexOf(u8, result, "template") == null or std.mem.indexOf(u8, result, "not found") == null);
+    try t.expect(std.mem.indexOf(u8, result, "\"status\":\"app_exited\"") != null);
+}
 
 test "initialize / tools list / unknown method" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
