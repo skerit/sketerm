@@ -1494,7 +1494,7 @@ pub const Window = struct {
                 if (p.browser_tabs.len > 0) {
                     const browser_mod = @import("browser.zig");
                     if (browser_mod.BrowserView.attach(self.allocator, pane, p.browser_tabs[0])) |bv| {
-                        for (p.browser_tabs[1..]) |tp| _ = bv.newTab(tp);
+                        for (p.browser_tabs[1..]) |tp| _ = bv.newTabSpec(tp);
                     } else |err| {
                         std.debug.print("sketerm: browser restore failed: {s}\n", .{@errorName(err)});
                     }
