@@ -33,6 +33,7 @@ struct timespec { long tv_sec; long tv_nsec; };
 #include <sys/resource.h> /* broker: per-worker RLIMIT_AS memory containment */
 #ifdef __linux__
 #include <sys/eventfd.h> /* Wakeup fast path (pipe fallback elsewhere) */
+#include <sys/inotify.h> /* fsserve: live directory-view deltas */
 #include <pty.h>         /* openpty/forkpty live here on glibc/musl */
 #else
 /* macOS: openpty/forkpty live in libSystem, but their declaring

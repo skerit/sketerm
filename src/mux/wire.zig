@@ -114,6 +114,24 @@ pub const FrameType = enum(u8) {
     /// with `log_data`. Attach-scoped so it reaches the worker that
     /// owns the Session in broker mode.
     log_get = 22,
+    /// File-service control op (fsserve). JSON { req, op, ... } where
+    /// op selects the verb (open_view/close_view/list/stat/read/
+    /// mkdir/rename/delete/symlink) — extending the service is a new
+    /// op string, not a new frame type. NOT attach-scoped: served by
+    /// whichever process owns the client connection (the broker, in
+    /// broker mode — fs clients never attach). Every op is answered
+    /// by `fs_reply` frames echoing `req` (listings arrive as a chunk
+    /// run, `more:true` until the last), reads additionally stream
+    /// `fs_data`. A directory VIEW (open_view) stays subscribed:
+    /// daemon-side inotify pushes `fs_delta` until close_view / the
+    /// client disconnects. This is the phase-1 surface of the file
+    /// browser (docs/filebrowser-roadmap.md).
+    fs_op = 23,
+    /// File write (fsserve), binary — the one fs verb whose payload
+    /// is bulk bytes: [u32 req][u64 off][u8 flags][u16 path_len]
+    /// [path][data]. flags bit0=create bit1=truncate bit2=append
+    /// bit3=exclusive. Answered with `fs_reply` { req, written }.
+    fs_write = 24,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -169,6 +187,24 @@ pub const FrameType = enum(u8) {
     /// Daemon → MCP client: the post-drain native replay is complete;
     /// the client's replicas now reflect the live mirrors. Empty.
     native_sync = 84,
+    /// JSON answer to `fs_op`/`fs_write`, always echoing the request's
+    /// `req` IN THE HEADER (the log_get nonce lesson: never match
+    /// replies by arrival order). { req, ok, error?, ... } with
+    /// op-specific fields: listings { path, entries, more, truncated }
+    /// (chunk run — accumulate until more=false), stat { entry },
+    /// read { size, eof } (closes the fs_data run), write { written }.
+    fs_reply = 85,
+    /// Pushed change on an open directory view: JSON { view, changes:
+    /// [{op:"upsert", entry} | {op:"del", name}], gone?, resync? }.
+    /// `gone` = the watched directory itself vanished (view is dead);
+    /// `resync` = the kernel dropped events (queue overflow) — the
+    /// client must re-list, deltas alone are no longer sufficient.
+    /// Coalesced per poll tick; upserts are idempotent (an entry may
+    /// arrive both in the initial listing and as a delta).
+    fs_delta = 86,
+    /// Bulk bytes answering an fs_op read: [u32 req][u64 off][data].
+    /// A terminating `fs_reply` carries size/eof.
+    fs_data = 87,
     _,
 };
 
