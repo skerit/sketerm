@@ -8735,3 +8735,33 @@ pre-existing DebugAllocator mismatch (reproduced on base 66433f2).
 Not yet (next phases): file-operation UI (context menu, conflict
 dialogs, DnD), layout persistence of browser tabs, remote-host
 browser tabs, transfer queue UI, FUSE mount, live queries.
+
+## 2026-07-23: browser ops menu + browser-tab layout persistence
+
+- Context menu on browser rows (GtkPopover, MenuCtx owned by the
+  popover via set_data_full): Copy/Paste Here (paste = daemon copy
+  job; same-name collision gets a "-copy" suffix instead of a silent
+  overwrite; job progress streams into the status bar), Rename + New
+  Folder entry popovers (RenameCtx pattern), Delete behind a
+  destructive confirm popover (dirs = delete_tree job), Copy Path to
+  the clipboard, Open Terminal Here (quotes + cd's the pane's shell,
+  flips the face), Open in New Browser Tab. All mutations land in the
+  view via fs_delta pushes — no local refresh logic exists.
+- layout.zig PaneSpec grows `browser_tabs` (internal tab paths, older
+  files parse via ignore_unknown_fields); paneSpec serializes via
+  BrowserView.fromPane/tabPaths, restore reattaches the face and
+  reopens every tab. Verified end-to-end under Xvfb: save via
+  Ctrl+Shift+S from a terminal pane, kill, --restore → browser pane
+  back with both internal tabs live.
+
+Surfaced while verifying (both worth separate attention):
+1. PRE-EXISTING: closing the window via the X saves an EMPTY
+   last.json — gtk_window_destroy tears the tabs down before the
+   GApplication shutdown hook calls saveLayoutQuietly, so --restore
+   after an X-close restores nothing (terminals too, not browser-
+   specific). Only explicit saves (Ctrl+Shift+S / palette) capture
+   state.
+2. LIMITATION of the browser face: pane keybinds (Ctrl+Shift+S,
+   palette, ...) are dead while browser widgets hold focus — the
+   bindings live on the hidden GLArea's controllers. Needs a
+   window-level shortcut controller or a browser key-forwarder.
