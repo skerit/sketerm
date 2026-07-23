@@ -205,6 +205,12 @@ pub const FrameType = enum(u8) {
     /// Bulk bytes answering an fs_op read: [u32 req][u64 off][data].
     /// A terminating `fs_reply` carries size/eof.
     fs_data = 87,
+    /// Pushed job event (fs_op copy/delete_tree/hash verbs): JSON
+    /// { job, ev:"progress"|"done"|"error", done, total, hash?,
+    /// resumed_from?, message?, state? }. Jobs are daemon-owned and
+    /// survive the requesting client — events flow to the owner while
+    /// it lives; job_list serves any client afterwards.
+    fs_job = 88,
     _,
 };
 

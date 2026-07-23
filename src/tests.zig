@@ -68,6 +68,7 @@ comptime {
     _ = @import("render/bg_pass.zig");
     _ = @import("mux/wire.zig");
     _ = @import("mux/fsserve.zig");
+    _ = @import("mux/fsjob.zig");
     _ = @import("ipc/fsdrive.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");

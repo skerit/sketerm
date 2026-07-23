@@ -88,6 +88,15 @@ pub const WriteFlags = struct {
 
 pub const ReadInfo = struct { size: u64, eof: bool };
 
+/// One row of a job_list reply.
+pub const JobRow = struct {
+    job: u64 = 0,
+    op: []const u8 = "",
+    state: []const u8 = "",
+    done: u64 = 0,
+    total: u64 = 0,
+};
+
 /// Superset JSON shape of every fs_reply; absent fields keep their
 /// defaults, unknown (future) fields are ignored.
 const Reply = struct {
@@ -102,6 +111,47 @@ const Reply = struct {
     size: u64 = 0,
     eof: bool = false,
     written: u64 = 0,
+    job: u64 = 0,
+    jobs: []JobRow = &.{},
+};
+
+/// One pushed fs_job event, arena-owned.
+pub const JobEvent = struct {
+    arena: std.heap.ArenaAllocator,
+    job: u64 = 0,
+    ev: []const u8 = "",
+    state: []const u8 = "",
+    done: u64 = 0,
+    total: u64 = 0,
+    resumed_from: u64 = 0,
+    hash: []const u8 = "",
+    message: []const u8 = "",
+
+    pub fn deinit(self: *JobEvent) void {
+        self.arena.deinit();
+    }
+
+    pub fn terminal(self: *const JobEvent) bool {
+        return std.mem.eql(u8, self.ev, "done") or std.mem.eql(u8, self.ev, "error") or
+            std.mem.eql(u8, self.ev, "canceled");
+    }
+};
+
+/// Final outcome of a job wait — fixed buffers, no ownership.
+pub const JobEnd = struct {
+    ok: bool = false,
+    canceled: bool = false,
+    bytes_done: u64 = 0,
+    total: u64 = 0,
+    resumed_from: u64 = 0,
+    hash: [64]u8 = undefined,
+    has_hash: bool = false,
+    message: [192]u8 = undefined,
+    message_len: usize = 0,
+
+    pub fn messageText(self: *const JobEnd) []const u8 {
+        return self.message[0..self.message_len];
+    }
 };
 
 pub const Fs = struct {
@@ -112,6 +162,9 @@ pub const Fs = struct {
     /// via takeDelta(). Bounded by consumption — a caller that opens
     /// views must drain deltas.
     deltas: std.ArrayList(Delta) = .empty,
+    /// fs_job frames stashed the same way; consumed via takeJobEvent
+    /// / waitJobEnd.
+    job_events: std.ArrayList(JobEvent) = .empty,
     last_err: [192]u8 = undefined,
     last_err_len: usize = 0,
 
@@ -129,6 +182,8 @@ pub const Fs = struct {
     pub fn deinit(self: *Fs) void {
         for (self.deltas.items) |*d| d.deinit();
         self.deltas.deinit(self.allocator);
+        for (self.job_events.items) |*e| e.deinit();
+        self.job_events.deinit(self.allocator);
         self.conn.deinit();
     }
 
@@ -176,16 +231,69 @@ pub const Fs = struct {
         }) catch arena.deinit();
     }
 
+    fn stashJobEvent(self: *Fs, payload: []const u8) void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        const Wire = struct {
+            job: u64 = 0,
+            ev: []const u8 = "",
+            state: []const u8 = "",
+            done: u64 = 0,
+            total: u64 = 0,
+            resumed_from: u64 = 0,
+            hash: []const u8 = "",
+            message: []const u8 = "",
+        };
+        const parsed = std.json.parseFromSliceLeaky(Wire, arena.allocator(), payload, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch {
+            arena.deinit();
+            return;
+        };
+        self.job_events.append(self.allocator, .{
+            .arena = arena,
+            .job = parsed.job,
+            .ev = parsed.ev,
+            .state = parsed.state,
+            .done = parsed.done,
+            .total = parsed.total,
+            .resumed_from = parsed.resumed_from,
+            .hash = parsed.hash,
+            .message = parsed.message,
+        }) catch arena.deinit();
+    }
+
+    /// Route any pushed frame to its stash. Every receive loop calls
+    /// this for non-reply frames so pushes are never dropped.
+    fn stashPush(self: *Fs, ftype: wire.FrameType, payload: []const u8) void {
+        switch (ftype) {
+            .fs_delta => self.stashDelta(payload),
+            .fs_job => self.stashJobEvent(payload),
+            else => {},
+        }
+    }
+
     /// Pop the oldest pending delta (caller deinits), draining any
     /// bytes already on the socket first — never blocks.
     pub fn takeDelta(self: *Fs) ?Delta {
         _ = self.conn.fillAvailable();
         while (self.conn.takeFrame() catch null) |f| {
             defer f.deinit(self.allocator);
-            if (f.ftype == .fs_delta) self.stashDelta(f.payload);
+            self.stashPush(f.ftype, f.payload);
         }
         if (self.deltas.items.len == 0) return null;
         return self.deltas.orderedRemove(0);
+    }
+
+    /// Pop the oldest pending job event (caller deinits); non-blocking.
+    pub fn takeJobEvent(self: *Fs) ?JobEvent {
+        _ = self.conn.fillAvailable();
+        while (self.conn.takeFrame() catch null) |f| {
+            defer f.deinit(self.allocator);
+            self.stashPush(f.ftype, f.payload);
+        }
+        if (self.job_events.items.len == 0) return null;
+        return self.job_events.orderedRemove(0);
     }
 
     /// Block (bounded) until at least one delta is pending or the
@@ -197,7 +305,7 @@ pub const Fs = struct {
             if (remain <= 0) break;
             const f = self.conn.recvFrameFor(remain) catch break;
             defer f.deinit(self.allocator);
-            if (f.ftype == .fs_delta) self.stashDelta(f.payload);
+            self.stashPush(f.ftype, f.payload);
         }
         return self.deltas.items.len;
     }
@@ -216,7 +324,7 @@ pub const Fs = struct {
             };
             defer f.deinit(self.allocator);
             switch (f.ftype) {
-                .fs_delta => self.stashDelta(f.payload),
+                .fs_delta, .fs_job => self.stashPush(f.ftype, f.payload),
                 .fs_reply => {
                     // alloc_always: f.payload is freed on return; the
                     // reply must own its strings (use-after-free bug
@@ -250,6 +358,8 @@ pub const Fs = struct {
             view: u32 = 0,
             off: u64 = 0,
             len: u32 = 0,
+            @"resume": bool = false,
+            job: u64 = 0,
         };
         var b: Base = .{ .req = req, .op = op };
         inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |fld| {
@@ -364,7 +474,7 @@ pub const Fs = struct {
             };
             defer f.deinit(self.allocator);
             switch (f.ftype) {
-                .fs_delta => self.stashDelta(f.payload),
+                .fs_delta, .fs_job => self.stashPush(f.ftype, f.payload),
                 .fs_data => {
                     if (f.payload.len < 12) continue;
                     if (std.mem.readInt(u32, f.payload[0..4], .little) != req) continue;
@@ -414,5 +524,96 @@ pub const Fs = struct {
         defer scratch.deinit();
         const rep = try self.awaitReply(scratch.allocator(), req, OP_TIMEOUT_MS);
         return rep.written;
+    }
+
+    // ── jobs (subprocess verbs) ─────────────────────────────────
+
+    fn startJob(self: *Fs, op: []const u8, args: anytype) Error!u64 {
+        const req = self.nextReq();
+        try self.sendOp(op, req, args);
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const rep = try self.awaitReply(scratch.allocator(), req, OP_TIMEOUT_MS);
+        if (rep.job == 0) return Error.BadReply;
+        return rep.job;
+    }
+
+    /// Start a copy job (file or tree). `resumable` allows continuing
+    /// a previous interrupted copy's hash-verified partial.
+    pub fn startCopy(self: *Fs, src: []const u8, dst: []const u8, resumable: bool) Error!u64 {
+        return self.startJob("copy", .{ .path = src, .to = dst, .@"resume" = resumable });
+    }
+
+    pub fn startDeleteTree(self: *Fs, path: []const u8) Error!u64 {
+        return self.startJob("delete_tree", .{ .path = path });
+    }
+
+    pub fn startHash(self: *Fs, path: []const u8) Error!u64 {
+        return self.startJob("hash", .{ .path = path });
+    }
+
+    pub fn jobCancel(self: *Fs, job: u64) Error!void {
+        try self.simpleOp("job_cancel", .{ .job = job });
+    }
+
+    pub fn jobPause(self: *Fs, job: u64) Error!void {
+        try self.simpleOp("job_pause", .{ .job = job });
+    }
+
+    pub fn jobResume(self: *Fs, job: u64) Error!void {
+        try self.simpleOp("job_resume", .{ .job = job });
+    }
+
+    /// All jobs the daemon knows (running + retained finished), into
+    /// caller's arena.
+    pub fn jobList(self: *Fs, arena: std.mem.Allocator) Error![]JobRow {
+        const req = self.nextReq();
+        try self.sendOp("job_list", req, .{});
+        const rep = try self.awaitReply(arena, req, OP_TIMEOUT_MS);
+        return rep.jobs;
+    }
+
+    /// Wait (bounded) for the job's terminal event, consuming its
+    /// progress events along the way. Progress events for OTHER jobs
+    /// stay stashed.
+    pub fn waitJobEnd(self: *Fs, job: u64, timeout_ms: i64) Error!JobEnd {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            // Scan the stash for this job; keep other jobs' events.
+            var i: usize = 0;
+            while (i < self.job_events.items.len) {
+                const e = &self.job_events.items[i];
+                if (e.job != job) {
+                    i += 1;
+                    continue;
+                }
+                var ev = self.job_events.orderedRemove(i);
+                defer ev.deinit();
+                if (!ev.terminal()) continue; // progress: consumed
+                var end = JobEnd{
+                    .ok = std.mem.eql(u8, ev.ev, "done"),
+                    .canceled = std.mem.eql(u8, ev.ev, "canceled"),
+                    .bytes_done = ev.done,
+                    .total = ev.total,
+                    .resumed_from = ev.resumed_from,
+                };
+                if (ev.hash.len == 64) {
+                    @memcpy(&end.hash, ev.hash[0..64]);
+                    end.has_hash = true;
+                }
+                const n = @min(ev.message.len, end.message.len);
+                @memcpy(end.message[0..n], ev.message[0..n]);
+                end.message_len = n;
+                return end;
+            }
+            const remain = deadline - nowMs();
+            if (remain <= 0) return Error.Timeout;
+            const f = self.conn.recvFrameFor(remain) catch |err| switch (err) {
+                error.Timeout => return Error.Timeout,
+                else => return Error.NotConnected,
+            };
+            defer f.deinit(self.allocator);
+            self.stashPush(f.ftype, f.payload);
+        }
     }
 };

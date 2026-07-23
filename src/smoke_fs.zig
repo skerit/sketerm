@@ -14,7 +14,10 @@ const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
 const fsdrive = @import("ipc/fsdrive.zig");
 const fsserve = @import("mux/fsserve.zig");
+const fsjob = @import("mux/fsjob.zig");
 const pathz = @import("util/pathz.zig");
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 fn fail(comptime msg: []const u8) noreturn {
     std.debug.print("smoke-fs: FAIL: " ++ msg ++ "\n", .{});
@@ -326,9 +329,267 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
     std.debug.print("smoke-fs: {s} stage ok\n", .{tag});
 }
 
+/// Stream-hash a local file (verification oracle for copy jobs).
+fn fileSha(path: []const u8) ?[64]u8 {
+    var z: [4096]u8 = undefined;
+    const p = pathz.pathZ(&z, path) catch return null;
+    const f = c.fopen(p, "rb") orelse return null;
+    defer _ = c.fclose(f);
+    var h = Sha256.init(.{});
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, f);
+        if (n == 0) break;
+        h.update(buf[0..n]);
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    h.final(&digest);
+    var hex: [64]u8 = undefined;
+    for (digest, 0..) |b, i| {
+        _ = std.fmt.bufPrint(hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch unreachable;
+    }
+    return hex;
+}
+
+fn writePattern(path: []const u8, len: usize, seed: u8) void {
+    var z: [4096]u8 = undefined;
+    const p = pathz.pathZ(&z, path) catch fail("pattern path");
+    const f = c.fopen(p, "wb") orelse fail("pattern open");
+    defer _ = c.fclose(f);
+    var buf: [65536]u8 = undefined;
+    var off: usize = 0;
+    while (off < len) {
+        const n = @min(buf.len, len - off);
+        for (buf[0..n], 0..) |*b, i| b.* = @truncate((off + i) *% 31 +% seed);
+        if (c.fwrite(&buf, 1, n, f) != n) fail("pattern write");
+        off += n;
+    }
+}
+
+/// Consume this job's event stream until terminal, counting progress
+/// frames. Fails the smoke on timeout.
+const JobOutcome = struct {
+    ev: [12]u8 = undefined,
+    ev_len: usize = 0,
+    done: u64 = 0,
+    resumed_from: u64 = 0,
+    hash: [64]u8 = undefined,
+    has_hash: bool = false,
+    progress_events: usize = 0,
+
+    fn is(self: *const JobOutcome, ev: []const u8) bool {
+        return std.mem.eql(u8, self.ev[0..self.ev_len], ev);
+    }
+};
+
+fn collectJob(fs: *fsdrive.Fs, job: u64, timeout_ms: i64) JobOutcome {
+    var out = JobOutcome{};
+    var waited: i64 = 0;
+    while (waited < timeout_ms) {
+        while (fs.takeJobEvent()) |e0| {
+            var e = e0;
+            defer e.deinit();
+            if (e.job != job) continue;
+            if (std.mem.eql(u8, e.ev, "progress")) {
+                out.progress_events += 1;
+                continue;
+            }
+            if (e.terminal()) {
+                const n = @min(e.ev.len, out.ev.len);
+                @memcpy(out.ev[0..n], e.ev[0..n]);
+                out.ev_len = n;
+                out.done = e.done;
+                out.resumed_from = e.resumed_from;
+                if (e.hash.len == 64) {
+                    @memcpy(&out.hash, e.hash[0..64]);
+                    out.has_hash = true;
+                }
+                return out;
+            }
+        }
+        _ = c.usleep(5_000);
+        waited += 5;
+    }
+    fail("job never reached a terminal event");
+}
+
+fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []const u8) void {
+    var dbuf: [64]u8 = undefined;
+    const dir = mkTmpDir(&dbuf, tag ++ "-job");
+    var fs = fsdrive.Fs.connect(allocator, sock_path) catch fail("job fs connect");
+    defer fs.deinit();
+
+    var pb: [8][4096]u8 = undefined;
+    const src = (std.fmt.bufPrint(&pb[0], "{s}/big.bin", .{dir}) catch unreachable);
+    const dst = (std.fmt.bufPrint(&pb[1], "{s}/big.copy", .{dir}) catch unreachable);
+    writePattern(src, 6 << 20, 7);
+    const src_hash = fileSha(src) orelse fail("src hash");
+
+    // ── hash job matches a local oracle ────────────────────────
+    const hjob = fs.startHash(src) catch failErr("start hash", fs.lastErr());
+    const hout = collectJob(&fs, hjob, 20_000);
+    if (!hout.is("done") or !hout.has_hash) fail("hash job outcome");
+    if (!std.mem.eql(u8, &hout.hash, &src_hash)) fail("hash job digest mismatch");
+
+    // ── plain copy: progress + identical content ───────────────
+    const cjob = fs.startCopy(src, dst, false) catch failErr("start copy", fs.lastErr());
+    const cout = collectJob(&fs, cjob, 20_000);
+    if (!cout.is("done") or cout.resumed_from != 0) fail("copy outcome");
+    if (cout.progress_events < 1) fail("copy produced no progress events");
+    const dst_hash = fileSha(dst) orelse fail("dst hash");
+    if (!std.mem.eql(u8, &dst_hash, &src_hash)) fail("copy content mismatch");
+
+    // ── hash-verified resume: valid partial continues ──────────
+    const rdst = (std.fmt.bufPrint(&pb[2], "{s}/resumed.bin", .{dir}) catch unreachable);
+    {
+        var part: [4096]u8 = undefined;
+        const partp = std.fmt.bufPrint(&part, "{s}.skpart", .{rdst}) catch unreachable;
+        // Seed the partial with the true first 2MB.
+        var zs: [4096]u8 = undefined;
+        var zd: [4096]u8 = undefined;
+        const sf = c.fopen(pathz.pathZ(&zs, src) catch unreachable, "rb") orelse fail("seed open src");
+        const df = c.fopen(pathz.pathZ(&zd, partp) catch unreachable, "wb") orelse fail("seed open part");
+        var buf: [65536]u8 = undefined;
+        var left: usize = 2 << 20;
+        while (left > 0) {
+            const n = c.fread(&buf, 1, @min(buf.len, left), sf);
+            if (n == 0) break;
+            _ = c.fwrite(&buf, 1, n, df);
+            left -= n;
+        }
+        _ = c.fclose(sf);
+        _ = c.fclose(df);
+    }
+    const rjob = fs.startCopy(src, rdst, true) catch failErr("start resume copy", fs.lastErr());
+    const rout = collectJob(&fs, rjob, 20_000);
+    if (!rout.is("done")) fail("resume copy outcome");
+    if (rout.resumed_from != (2 << 20)) fail("resume did not continue from the partial");
+    if (!std.mem.eql(u8, &(fileSha(rdst) orelse fail("rdst hash")), &src_hash)) fail("resumed content mismatch");
+
+    // ── corrupt partial restarts from zero ─────────────────────
+    const xdst = (std.fmt.bufPrint(&pb[3], "{s}/restart.bin", .{dir}) catch unreachable);
+    {
+        var part: [4096]u8 = undefined;
+        const partp = std.fmt.bufPrint(&part, "{s}.skpart", .{xdst}) catch unreachable;
+        writePattern(partp, 1 << 20, 99); // wrong bytes
+    }
+    const xjob = fs.startCopy(src, xdst, true) catch failErr("start restart copy", fs.lastErr());
+    const xout = collectJob(&fs, xjob, 20_000);
+    if (!xout.is("done") or xout.resumed_from != 0) fail("corrupt partial was resumed");
+    if (!std.mem.eql(u8, &(fileSha(xdst) orelse fail("xdst hash")), &src_hash)) fail("restart content mismatch");
+
+    // ── pause / resume / cancel on a BLOCKED job (fifo src: the
+    // helper sits in open(2) forever — the stuck-IO case subprocess
+    // jobs exist for; only SIGKILL can end it) ─────────────────
+    const fifo = (std.fmt.bufPrint(&pb[4], "{s}/pipe.src", .{dir}) catch unreachable);
+    {
+        var z: [4096]u8 = undefined;
+        if (c.mkfifo(pathz.pathZ(&z, fifo) catch unreachable, 0o600) != 0) fail("mkfifo");
+    }
+    const fdst = (std.fmt.bufPrint(&pb[5], "{s}/pipe.copy", .{dir}) catch unreachable);
+    const pjob = fs.startCopy(fifo, fdst, false) catch failErr("start blocked copy", fs.lastErr());
+    fs.jobPause(pjob) catch failErr("job_pause", fs.lastErr());
+    fs.jobResume(pjob) catch failErr("job_resume", fs.lastErr());
+    fs.jobCancel(pjob) catch failErr("job_cancel", fs.lastErr());
+    const pout = collectJob(&fs, pjob, 20_000);
+    if (!pout.is("canceled")) fail("blocked job not canceled");
+
+    // ── tree copy + delete_tree ────────────────────────────────
+    const tsrc = (std.fmt.bufPrint(&pb[6], "{s}/tree", .{dir}) catch unreachable);
+    const tdst = (std.fmt.bufPrint(&pb[7], "{s}/tree.copy", .{dir}) catch unreachable);
+    {
+        var z: [4096]u8 = undefined;
+        _ = c.mkdir(pathz.pathZ(&z, tsrc) catch unreachable, 0o755);
+        var sub: [4096]u8 = undefined;
+        const subp = std.fmt.bufPrint(&sub, "{s}/sub", .{tsrc}) catch unreachable;
+        _ = c.mkdir(pathz.pathZ(&z, subp) catch unreachable, 0o755);
+        var fp: [4096]u8 = undefined;
+        writePattern(std.fmt.bufPrint(&fp, "{s}/top.dat", .{tsrc}) catch unreachable, 10_000, 3);
+        writePattern(std.fmt.bufPrint(&fp, "{s}/sub/leaf.dat", .{tsrc}) catch unreachable, 20_000, 4);
+        var lz: [4096]u8 = undefined;
+        const lp = std.fmt.bufPrint(&fp, "{s}/ln", .{tsrc}) catch unreachable;
+        _ = c.symlink("top.dat", pathz.pathZ(&lz, lp) catch unreachable);
+    }
+    const tjob = fs.startCopy(tsrc, tdst, false) catch failErr("start tree copy", fs.lastErr());
+    const tout = collectJob(&fs, tjob, 20_000);
+    if (!tout.is("done")) fail("tree copy outcome");
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var fp: [4096]u8 = undefined;
+        const leaf = std.fmt.bufPrint(&fp, "{s}/sub/leaf.dat", .{tdst}) catch unreachable;
+        const lst = fs.statPath(arena.allocator(), leaf) catch failErr("tree leaf stat", fs.lastErr());
+        if (lst.size != 20_000) fail("tree leaf size");
+        const lnp = std.fmt.bufPrint(&fp, "{s}/ln", .{tdst}) catch unreachable;
+        const lnst = fs.statPath(arena.allocator(), lnp) catch failErr("tree link stat", fs.lastErr());
+        if (!std.mem.eql(u8, lnst.kind, "link")) fail("tree link kind");
+        if (!std.mem.eql(u8, lnst.target orelse "", "top.dat")) fail("tree link target");
+    }
+    const djob = fs.startDeleteTree(tdst) catch failErr("start delete_tree", fs.lastErr());
+    const dout = collectJob(&fs, djob, 20_000);
+    if (!dout.is("done")) fail("delete_tree outcome");
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        if (fs.statPath(arena.allocator(), tdst)) |_| {
+            fail("delete_tree left the tree");
+        } else |_| {}
+    }
+
+    // ── jobs survive their client (durability) ─────────────────
+    var orphan_job: u64 = 0;
+    {
+        const fifo2 = std.fmt.bufPrint(pb[4][2048..], "{s}/pipe2.src", .{dir}) catch unreachable;
+        var z: [4096]u8 = undefined;
+        if (c.mkfifo(pathz.pathZ(&z, fifo2) catch unreachable, 0o600) != 0) fail("mkfifo2");
+        const fdst2 = std.fmt.bufPrint(pb[5][2048..], "{s}/pipe2.copy", .{dir}) catch unreachable;
+        var fs2 = fsdrive.Fs.connect(allocator, sock_path) catch fail("fs2 job connect");
+        orphan_job = fs2.startCopy(fifo2, fdst2, false) catch failErr("orphan start", fs2.lastErr());
+        fs2.deinit(); // owner dies; the job must keep running
+    }
+    {
+        // Another client sees it running, cancels it, sees canceled.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var found_running = false;
+        var tries: usize = 0;
+        while (tries < 100) : (tries += 1) {
+            const rows = fs.jobList(arena.allocator()) catch failErr("job_list", fs.lastErr());
+            for (rows) |row| {
+                if (row.job == orphan_job and std.mem.eql(u8, row.state, "running")) found_running = true;
+            }
+            if (found_running) break;
+            _ = c.usleep(10_000);
+        }
+        if (!found_running) fail("orphaned job not listed as running");
+        fs.jobCancel(orphan_job) catch failErr("orphan cancel", fs.lastErr());
+        var canceled = false;
+        tries = 0;
+        while (tries < 100 and !canceled) : (tries += 1) {
+            const rows = fs.jobList(arena.allocator()) catch failErr("job_list 2", fs.lastErr());
+            for (rows) |row| {
+                if (row.job == orphan_job and std.mem.eql(u8, row.state, "canceled")) canceled = true;
+            }
+            if (!canceled) _ = c.usleep(10_000);
+        }
+        if (!canceled) fail("orphaned job never canceled");
+    }
+
+    std.debug.print("smoke-fs: {s} job stage ok\n", .{tag});
+}
+
 fn sigNoop(_: c_int) callconv(.c) void {}
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init.Minimal) u8 {
+    // The daemon spawns job helpers by re-exec'ing ITSELF with --job;
+    // in this smoke "itself" is the smoke binary, so serve the mode.
+    const argv = init.args.vector;
+    if (argv.len > 1 and std.mem.eql(u8, std.mem.span(argv[1]), "--job")) {
+        var helper_gpa: std.heap.DebugAllocator(.{}) = .{};
+        defer _ = helper_gpa.deinit();
+        return fsjob.serve(helper_gpa.allocator());
+    }
+
     // A daemon-thread write racing a closed client socket (the abrupt-
     // death stage does this on purpose) must surface as EPIPE, not
     // kill the process.
@@ -346,6 +607,7 @@ pub fn main() u8 {
     const d = daemon_mod.Daemon.init(allocator, sock_path) catch fail("daemon init");
     const th = std.Thread.spawn(.{}, daemonMain, .{d}) catch fail("thread spawn");
     fsStage(allocator, sock_path, "mono");
+    jobStage(allocator, sock_path, "mono");
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
         defer conn.deinit();
@@ -363,6 +625,7 @@ pub fn main() u8 {
     bd.is_broker = true;
     const bth = std.Thread.spawn(.{}, daemonMain, .{bd}) catch fail("broker thread");
     fsStage(allocator, bsock, "broker");
+    jobStage(allocator, bsock, "broker");
     {
         var conn = client_mod.Conn.connect(allocator, bsock) catch fail("broker shutdown connect");
         defer conn.deinit();

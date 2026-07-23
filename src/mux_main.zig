@@ -59,6 +59,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             // Process-isolation mode: hold no sessions; fork one worker per
             // session and hand client fds to workers (Firefox-style).
             broker_mode = true;
+        } else if (std.mem.eql(u8, a, "--job")) {
+            // Internal: file-job helper (spawned by the daemon; spec on
+            // stdin, JSON-lines progress on stdout). One process per
+            // copy/delete_tree/hash operation — kill = cancel.
+            return @import("mux/fsjob.zig").serve(allocator);
         } else if (std.mem.eql(u8, a, "--proxy")) {
             return runProxy(allocator);
         } else if (std.mem.eql(u8, a, "--udp-listen")) {
