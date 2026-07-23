@@ -72,6 +72,7 @@ comptime {
     _ = @import("mux/pulse.zig");
     _ = @import("mux/wavcap.zig");
     _ = @import("mux/opuscodec.zig");
+    _ = @import("mux/dmabuf_egl.zig");
     _ = @import("mux/snapshot.zig");
     _ = @import("mux/desktop.zig");
     _ = @import("mux/icons.zig");
@@ -95,6 +96,7 @@ comptime {
     _ = @import("grid/bidi.zig");
     _ = @import("grid/schemes.zig");
     _ = @import("wlhost/wire.zig");
+    _ = @import("wlhost/dmabuf.zig");
     _ = @import("wlhost/protocol.zig");
     _ = @import("wlhost/track.zig");
     _ = @import("wlhost/pipe.zig");

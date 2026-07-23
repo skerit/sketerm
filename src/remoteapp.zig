@@ -38,8 +38,8 @@ const USAGE =
     \\        audio / notifications / portals.
     \\  --gpu render on the host's real GPU: the session compositor
     \\        announces linux-dmabuf and the app keeps its hardware GL
-    \\        driver (default is software GL). Needs a driver whose
-    \\        linear buffers allow CPU mmap; otherwise windows go stale.
+    \\        driver (default is software GL). LINEAR buffers use mmap;
+    \\        tiled/modifier buffers use runtime EGL/GLES import.
     \\
     \\  sketerm app devbox gnome-calculator
     \\  sketerm app -u flaky-wifi-box firefox --new-window

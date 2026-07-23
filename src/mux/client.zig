@@ -287,7 +287,15 @@ pub const Conn = struct {
 
         conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video }) catch return error.SshTransportFailed;
         const w = conn.recvExpectFor(&.{.welcome}, 20_000) catch return error.SshTransportFailed;
-        w.deinit(allocator);
+        defer w.deinit(allocator);
+        const Probe = struct { proto: u32 = 0 };
+        if (std.json.parseFromSlice(Probe, allocator, w.payload, .{ .ignore_unknown_fields = true })) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value.proto != @import("wire.zig").PROTO_VERSION) {
+                last_remote_proto = parsed.value.proto;
+                return error.MuxProtoMismatch;
+            }
+        } else |_| {}
         return conn;
     }
 

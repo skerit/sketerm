@@ -16,6 +16,7 @@
 const std = @import("std");
 const wire = @import("wire.zig");
 const protocol = @import("protocol.zig");
+const dmabuf = @import("dmabuf.zig");
 
 pub const Error = error{
     UnknownObject,
@@ -62,14 +63,31 @@ pub const Action = union(enum) {
     /// zwp_primary_selection_offer_v1.receive — same fd-holding
     /// dance, but paired with primary_data units (separate FIFO).
     primary_receive: struct { offer: u32 },
-    /// zwp_linux_buffer_params_v1.add — the message carries the
-    /// plane fd. `ok` = plane 0 with a LINEAR modifier; the daemon
-    /// must pop (and, when !ok, close) the fd either way to keep the
-    /// SCM_RIGHTS queue aligned.
-    dmabuf_add: struct { params: u32, offset: u32, stride: u32, ok: bool },
-    /// create_immed with valid LINEAR params: bind the pending fd to
-    /// this wl_buffer as a CPU-mapped mirror.
-    dmabuf_create: struct { id: u32, params: u32, offset: u32, stride: u32, width: i32, height: i32 },
+    /// zwp_linux_buffer_params_v1.add — the message carries one plane
+    /// fd. The daemon must pop it in SCM_RIGHTS arrival order. `ok` is
+    /// retained for the legacy single-fd consumer; full importers use
+    /// the plane index and metadata.
+    dmabuf_add: struct {
+        params: u32,
+        plane: u32,
+        offset: u32,
+        stride: u32,
+        modifier: u64,
+        ok: bool,
+    },
+    /// create_immed after complete metadata validation. `info`
+    /// describes the exported resource; commits use a separate tight
+    /// synthetic pool layout so replica updates have no source padding.
+    dmabuf_create: struct {
+        id: u32,
+        params: u32,
+        info: dmabuf.BufferInfo,
+        // Legacy daemon fields kept until its importer consumes `info`.
+        offset: u32,
+        stride: u32,
+        width: i32,
+        height: i32,
+    },
     /// Non-immed create — declined (the brain answers `failed`, the
     /// client falls back to shm); the daemon drops the pending fd.
     dmabuf_create_failed: struct { params: u32 },
@@ -82,7 +100,14 @@ pub const Action = union(enum) {
     /// `damage` is the row range the client declared dirty since
     /// its last commit (full height when it declared nothing —
     /// trust-but-clamp, like any compositor).
-    commit: struct { surface: u32, buffer: u32, info: BufferInfo, damage: ?RowRange },
+    commit: struct {
+        surface: u32,
+        buffer: u32,
+        info: BufferInfo,
+        damage: ?RowRange,
+        /// True only when this commit consumes a new attach request.
+        attached_now: bool,
+    },
 };
 
 /// Damaged rows [y0, y1) in buffer coordinates. Width collapses to
@@ -100,9 +125,6 @@ pub const RowRange = struct {
         return .{ .y0 = @min(ra.y0, rb.y0), .y1 = @max(ra.y1, rb.y1) };
     }
 };
-
-/// Plane-0 layout captured from zwp_linux_buffer_params_v1.add.
-pub const DmabufParams = struct { offset: u32, stride: u32, ok: bool };
 
 pub const BufferInfo = struct {
     pool: u32,
@@ -127,6 +149,8 @@ pub const Tracker = struct {
     /// is double-buffered state, but committed content persists:
     /// a commit without re-attach still implies a content update).
     attached: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Surfaces with an attach (including null) pending for the next commit.
+    pending_attaches: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// buffer id → geometry, dropped with the object on delete_id.
     buffers: std.AutoHashMapUnmanaged(u32, BufferInfo) = .empty,
     /// surface id → accumulated damage rows since the last commit.
@@ -148,9 +172,8 @@ pub const Tracker = struct {
     /// fractional-scale path). Logical damage rows are expanded by
     /// buffer_height/vp_h at commit time, when the ratio is known.
     vp_heights: std.AutoHashMapUnmanaged(u32, i32) = .empty,
-    /// zwp_linux_buffer_params_v1 id → plane-0 layout from `add`.
-    /// ok = single plane, LINEAR modifier.
-    dmabuf_params: std.AutoHashMapUnmanaged(u32, DmabufParams) = .empty,
+    /// zwp_linux_buffer_params_v1 id → validated single-use metadata.
+    dmabuf_params: std.AutoHashMapUnmanaged(u32, dmabuf.Params) = .empty,
     /// pool id → incarnation serial of the CURRENT pool under that id.
     pool_serials: std.AutoHashMapUnmanaged(u32, u64) = .empty,
     pool_serial_ctr: u64 = 0,
@@ -164,6 +187,7 @@ pub const Tracker = struct {
     pub fn deinit(self: *Tracker) void {
         self.objects.deinit(self.allocator);
         self.attached.deinit(self.allocator);
+        self.pending_attaches.deinit(self.allocator);
         self.buffers.deinit(self.allocator);
         self.damage.deinit(self.allocator);
         self.uses_damage.deinit(self.allocator);
@@ -214,6 +238,10 @@ pub const Tracker = struct {
             self.pool_serial_ctr += 1;
             try self.pool_serials.put(self.allocator, new_id, self.pool_serial_ctr);
             return .{ .pool_create = .{ .id = new_id, .size = size, .serial = self.pool_serial_ctr } };
+        }
+        if (iface == &protocol.zwp_linux_dmabuf_v1 and hdr.opcode == 1) { // create_params
+            try self.dmabuf_params.put(self.allocator, new_id, .{});
+            return .relay;
         }
         if (iface == &protocol.wl_shm_pool) switch (hdr.opcode) {
             0 => { // create_buffer
@@ -268,24 +296,32 @@ pub const Tracker = struct {
                 const stride = (try it.next()).?.uint;
                 const mod_hi = (try it.next()).?.uint;
                 const mod_lo = (try it.next()).?.uint;
-                // LINEAR-only import (that's all we advertise); any
-                // extra plane or other modifier poisons the params.
-                const ok = plane == 0 and
-                    (@as(u64, mod_hi) << 32 | mod_lo) == protocol.DRM_FORMAT_MOD_LINEAR;
-                const slot = try self.dmabuf_params.getOrPut(self.allocator, hdr.object);
-                if (slot.found_existing and plane != 0) {
-                    slot.value_ptr.ok = false;
-                } else {
-                    slot.value_ptr.* = .{ .offset = offset, .stride = stride, .ok = ok };
-                }
-                return .{ .dmabuf_add = .{
-                    .params = hdr.object,
+                const modifier = @as(u64, mod_hi) << 32 | mod_lo;
+                const params = self.dmabuf_params.getPtr(hdr.object) orelse return Error.Malformed;
+                params.add(plane, .{
                     .offset = offset,
                     .stride = stride,
-                    .ok = ok,
+                    .modifier = modifier,
+                }) catch return Error.Malformed;
+                return .{ .dmabuf_add = .{
+                    .params = hdr.object,
+                    .plane = plane,
+                    .offset = offset,
+                    .stride = stride,
+                    .modifier = modifier,
+                    .ok = plane == 0,
                 } };
             },
-            2 => return .{ .dmabuf_create_failed = .{ .params = hdr.object } },
+            2 => { // create(width, height, format, flags)
+                var it = wire.ArgIter.init(body, msg.sig);
+                const width = (try it.next()).?.int;
+                const height = (try it.next()).?.int;
+                const format = (try it.next()).?.uint;
+                const flags = (try it.next()).?.uint;
+                const params = self.dmabuf_params.getPtr(hdr.object) orelse return Error.Malformed;
+                _ = params.create(width, height, format, flags) catch return Error.Malformed;
+                return .{ .dmabuf_create_failed = .{ .params = hdr.object } };
+            },
             3 => { // create_immed(new_id, w, h, format, flags)
                 var it = wire.ArgIter.init(body, msg.sig);
                 _ = try it.next(); // n
@@ -293,31 +329,26 @@ pub const Tracker = struct {
                 const height = (try it.next()).?.int;
                 const format = (try it.next()).?.uint;
                 const flags = (try it.next()).?.uint;
-                const p = self.dmabuf_params.get(hdr.object) orelse return Error.Malformed;
-                const shm_format: u32 = switch (format) {
-                    protocol.DRM_FORMAT_ARGB8888 => 0,
-                    protocol.DRM_FORMAT_XRGB8888 => 1,
-                    else => return Error.Malformed,
-                };
-                // flags: y_invert/interlace — never legal for LINEAR
-                // RGB from the clients we advertise to.
-                if (!p.ok or flags != 0 or width <= 0 or height <= 0 or
-                    @as(u64, p.stride) < @as(u64, @intCast(width)) * 4)
-                    return Error.Malformed;
+                const params = self.dmabuf_params.getPtr(hdr.object) orelse return Error.Malformed;
+                const info = params.create(width, height, format, flags) catch return Error.Malformed;
+                const shm_format = dmabuf.shmFormat(info.format) orelse return Error.Malformed;
+                const tight_stride = std.math.mul(u32, info.width, 4) catch return Error.Malformed;
+                if (tight_stride > std.math.maxInt(i32)) return Error.Malformed;
                 try self.buffers.put(self.allocator, new_id, .{
                     .pool = new_id,
-                    .offset = @intCast(p.offset),
+                    .offset = 0,
                     .width = width,
                     .height = height,
-                    .stride = @intCast(p.stride),
+                    .stride = @intCast(tight_stride),
                     .format = shm_format,
                     .dmabuf = true,
                 });
                 return .{ .dmabuf_create = .{
                     .id = new_id,
                     .params = hdr.object,
-                    .offset = p.offset,
-                    .stride = p.stride,
+                    .info = info,
+                    .offset = info.plane.offset,
+                    .stride = info.plane.stride,
                     .width = width,
                     .height = height,
                 } };
@@ -372,6 +403,7 @@ pub const Tracker = struct {
                 } else {
                     try self.attached.put(self.allocator, hdr.object, buffer);
                 }
+                try self.pending_attaches.put(self.allocator, hdr.object, {});
                 return .relay;
             },
             2 => { // damage — surface-local (logical) coords
@@ -401,6 +433,7 @@ pub const Tracker = struct {
                 return .relay;
             },
             6 => { // commit
+                const attached_now = self.pending_attaches.remove(hdr.object);
                 const buffer = self.attached.get(hdr.object) orelse {
                     _ = self.damage.remove(hdr.object);
                     return .relay;
@@ -436,6 +469,7 @@ pub const Tracker = struct {
                     .buffer = buffer,
                     .info = info,
                     .damage = dmg,
+                    .attached_now = attached_now,
                 } };
             },
             else => return .relay,
@@ -465,6 +499,7 @@ pub const Tracker = struct {
             const id = (try it.next()).?.uint;
             _ = self.objects.remove(id);
             _ = self.attached.remove(id);
+            _ = self.pending_attaches.remove(id);
             _ = self.buffers.remove(id);
             _ = self.damage.remove(id);
             _ = self.uses_damage.remove(id);
@@ -615,10 +650,13 @@ test "attach + commit reports replication, null attach clears" {
     try t.expectEqual(@as(u32, 9), a.commit.buffer);
     try t.expectEqual(@as(u32, 8), a.commit.info.pool);
     try t.expectEqual(@as(i32, 128), a.commit.info.stride);
+    try t.expect(a.commit.attached_now);
 
     // commit again without re-attach: content may have changed in place
     const c2 = enc(&buf, 4, 6, .{});
-    try t.expectEqual(@as(u32, 9), (try tr.clientMessage(c2.hdr, c2.body)).commit.buffer);
+    const a2 = (try tr.clientMessage(c2.hdr, c2.body)).commit;
+    try t.expectEqual(@as(u32, 9), a2.buffer);
+    try t.expect(!a2.attached_now);
 
     // attaching an unknown buffer id relays instead of committing
     const at_unk = enc(&buf, 4, 1, .{ 99, 0, 0 });
@@ -631,6 +669,15 @@ test "attach + commit reports replication, null attach clears" {
     _ = try tr.clientMessage(an.hdr, an.body);
     const c3 = enc(&buf, 4, 6, .{});
     try t.expectEqual(Action.relay, try tr.clientMessage(c3.hdr, c3.body));
+
+    // Destroy before committing a fresh attach must not retain surface state.
+    _ = try tr.clientMessage(at.hdr, at.body);
+    try t.expect(tr.pending_attaches.contains(4));
+    const destroy = enc(&buf, 4, 0, .{});
+    _ = try tr.clientMessage(destroy.hdr, destroy.body);
+    const deleted = enc(&buf, 1, 1, .{4});
+    try tr.serverMessage(deleted.hdr, deleted.body);
+    try t.expect(!tr.pending_attaches.contains(4));
 }
 
 test "damage rows: accumulate, reset on commit, trust-but-clamp semantics" {
@@ -780,7 +827,7 @@ test "server delete_id frees the object" {
     try t.expectEqual(Action.relay, try tr.clientMessage(gr2.hdr, gr2.body));
 }
 
-test "dmabuf: add/create_immed actions, LINEAR-only, commit resolves mirror" {
+test "dmabuf: full metadata, tight commits, y-invert, and single-use params" {
     var tr = try Tracker.init(t.allocator);
     defer tr.deinit();
     var buf: [96]u8 = undefined;
@@ -803,16 +850,26 @@ test "dmabuf: add/create_immed actions, LINEAR-only, commit resolves mirror" {
     const ad = enc(&buf, 6, 1, .{ 0, 0, 128, 0, 0 });
     const a1 = try tr.clientMessage(ad.hdr, ad.body);
     try t.expect(a1.dmabuf_add.ok);
+    try t.expectEqual(@as(u32, 0), a1.dmabuf_add.plane);
     try t.expectEqual(@as(u32, 128), a1.dmabuf_add.stride);
+    try t.expectEqual(dmabuf.DRM_FORMAT_MOD_LINEAR, a1.dmabuf_add.modifier);
 
-    // create_immed(7, 32x32, XR24, 0)
-    const ci = enc(&buf, 6, 3, .{ 7, 32, 32, protocol.DRM_FORMAT_XRGB8888, 0 });
+    // create_immed accepts y-invert and carries the source metadata.
+    const ci = enc(&buf, 6, 3, .{ 7, 16, 32, protocol.DRM_FORMAT_XRGB8888, dmabuf.FLAG_Y_INVERT });
     const a2 = try tr.clientMessage(ci.hdr, ci.body);
     try t.expectEqual(@as(u32, 7), a2.dmabuf_create.id);
+    try t.expectEqual(@as(u32, 128), a2.dmabuf_create.info.plane.stride);
+    try t.expectEqual(dmabuf.FLAG_Y_INVERT, a2.dmabuf_create.info.flags);
     const info = tr.buffers.get(7).?;
     try t.expect(info.dmabuf);
     try t.expectEqual(@as(u32, 7), info.pool);
+    try t.expectEqual(@as(i32, 0), info.offset);
+    try t.expectEqual(@as(i32, 64), info.stride); // tight width * 4
     try t.expectEqual(@as(u32, 1), info.format); // XR24 -> shm xrgb8888
+
+    // A params object is consumed even after successful immediate create.
+    const ad_reuse = enc(&buf, 6, 1, .{ 1, 0, 128, 0, 0 });
+    try t.expectError(Error.Malformed, tr.clientMessage(ad_reuse.hdr, ad_reuse.body));
 
     // attach + commit resolve the dmabuf buffer
     const at = enc(&buf, 4, 1, .{ 7, 0, 0 });
@@ -822,15 +879,16 @@ test "dmabuf: add/create_immed actions, LINEAR-only, commit resolves mirror" {
     try t.expect(a3.commit.info.dmabuf);
     try t.expectEqual(@as(u32, 7), a3.commit.buffer);
 
-    // Non-LINEAR modifier poisons the params; create_immed on them
-    // is a protocol violation (we advertise LINEAR only).
+    // Tracker preserves non-LINEAR metadata for the daemon importer;
+    // capability policy belongs to the authoritative compositor.
     const cp2 = enc(&buf, 5, 1, .{8});
     _ = try tr.clientMessage(cp2.hdr, cp2.body);
     const ad2 = enc(&buf, 8, 1, .{ 0, 0, 128, 0, 216 });
     const a4 = try tr.clientMessage(ad2.hdr, ad2.body);
-    try t.expect(!a4.dmabuf_add.ok);
+    try t.expect(a4.dmabuf_add.ok);
+    try t.expectEqual(@as(u64, 216), a4.dmabuf_add.modifier);
     const ci2 = enc(&buf, 8, 3, .{ 9, 32, 32, protocol.DRM_FORMAT_XRGB8888, 0 });
-    try t.expectError(Error.Malformed, tr.clientMessage(ci2.hdr, ci2.body));
+    try t.expectEqual(@as(u64, 216), (try tr.clientMessage(ci2.hdr, ci2.body)).dmabuf_create.info.plane.modifier);
 
     // Non-immed create is declined: the daemon drops the pending fd.
     const cp3 = enc(&buf, 5, 1, .{10});
@@ -839,6 +897,49 @@ test "dmabuf: add/create_immed actions, LINEAR-only, commit resolves mirror" {
     _ = try tr.clientMessage(ad3.hdr, ad3.body);
     const cr = enc(&buf, 10, 2, .{ 32, 32, protocol.DRM_FORMAT_XRGB8888, 0 });
     try t.expectEqual(@as(u32, 10), (try tr.clientMessage(cr.hdr, cr.body)).dmabuf_create_failed.params);
+    try t.expectError(Error.Malformed, tr.clientMessage(cr.hdr, cr.body));
+}
+
+test "dmabuf tracker rejects duplicate, mismatched, and out-of-range planes" {
+    var tr = try Tracker.init(t.allocator);
+    defer tr.deinit();
+    var buf: [96]u8 = undefined;
+
+    const gr = enc(&buf, 1, 1, .{2});
+    _ = try tr.clientMessage(gr.hdr, gr.body);
+    const bindd = enc(&buf, 2, 0, .{ 22, @as([]const u8, "zwp_linux_dmabuf_v1"), 3, 5 });
+    _ = try tr.clientMessage(bindd.hdr, bindd.body);
+
+    const cp = enc(&buf, 5, 1, .{6});
+    _ = try tr.clientMessage(cp.hdr, cp.body);
+    const reverse = enc(&buf, 6, 1, .{ 1, 0, 64, 0, 7 });
+    const reverse_action = try tr.clientMessage(reverse.hdr, reverse.body);
+    try t.expectEqual(@as(u32, 1), reverse_action.dmabuf_add.plane);
+    try t.expect(!reverse_action.dmabuf_add.ok);
+    const mismatched = enc(&buf, 6, 1, .{ 0, 0, 64, 0, 8 });
+    try t.expectError(Error.Malformed, tr.clientMessage(mismatched.hdr, mismatched.body));
+
+    const cp2 = enc(&buf, 5, 1, .{7});
+    _ = try tr.clientMessage(cp2.hdr, cp2.body);
+    const first = enc(&buf, 7, 1, .{ 0, 4, 64, 0, 7 });
+    _ = try tr.clientMessage(first.hdr, first.body);
+    const duplicate = enc(&buf, 7, 1, .{ 0, 8, 64, 0, 7 });
+    try t.expectError(Error.Malformed, tr.clientMessage(duplicate.hdr, duplicate.body));
+
+    const cp3 = enc(&buf, 5, 1, .{8});
+    _ = try tr.clientMessage(cp3.hdr, cp3.body);
+    const p1 = enc(&buf, 8, 1, .{ 1, 0, 64, 0, 7 });
+    _ = try tr.clientMessage(p1.hdr, p1.body);
+    const p0 = enc(&buf, 8, 1, .{ 0, 0, 64, 0, 7 });
+    _ = try tr.clientMessage(p0.hdr, p0.body);
+    const create = enc(&buf, 8, 3, .{ 9, 16, 1, protocol.DRM_FORMAT_ARGB8888, 0 });
+    const multi = (try tr.clientMessage(create.hdr, create.body)).dmabuf_create;
+    try t.expectEqual(@as(u8, 2), multi.info.plane_count);
+
+    const cp4 = enc(&buf, 5, 1, .{10});
+    _ = try tr.clientMessage(cp4.hdr, cp4.body);
+    const out_of_range = enc(&buf, 10, 1, .{ dmabuf.MAX_PLANES, 0, 64, 0, 7 });
+    try t.expectError(Error.Malformed, tr.clientMessage(out_of_range.hdr, out_of_range.body));
 }
 
 test "RowRange.mergeOpt: bbox union, null (= full buffer) wins" {

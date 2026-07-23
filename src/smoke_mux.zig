@@ -12,6 +12,7 @@ const wire = @import("mux/wire.zig");
 const wlwire = @import("wlhost/wire.zig");
 const wlpipe = @import("wlhost/pipe.zig");
 const wlpixcodec = @import("wlhost/pixcodec.zig");
+const wlprotocol = @import("wlhost/protocol.zig");
 const snapshot = @import("mux/snapshot.zig");
 const Screen = @import("grid/screen.zig").Screen;
 const Pool = @import("grid/style_pool.zig").Pool;
@@ -598,6 +599,436 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
     }
 }
 
+/// Waits for the advertised linux-dmabuf global on a scripted app socket.
+fn awaitDmabufGlobal(allocator: std.mem.Allocator, app_fd: c_int) void {
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(allocator);
+    while (true) {
+        var pos: usize = 0;
+        while (true) {
+            const h = (wlwire.parseHeader(raw.items[pos..]) catch fail("dmabuf registry header")) orelse break;
+            if (raw.items[pos..].len < h.size) break;
+            const body = raw.items[pos + wlwire.header_size .. pos + h.size];
+            if (h.object == 2 and h.opcode == 0 and body.len >= 12) {
+                const name = std.mem.readInt(u32, body[0..4], .little);
+                const iface_len: usize = std.mem.readInt(u32, body[4..8], .little);
+                const padded = (iface_len + 3) & ~@as(usize, 3);
+                if (iface_len > 0 and 8 + padded + 4 <= body.len) {
+                    const iface = body[8 .. 8 + iface_len - 1];
+                    const version = std.mem.readInt(u32, body[8 + padded ..][0..4], .little);
+                    if (name == 22 and version == 3 and std.mem.eql(u8, iface, "zwp_linux_dmabuf_v1")) return;
+                }
+            }
+            pos += h.size;
+        }
+        if (pos > 0) {
+            const rem = raw.items.len - pos;
+            std.mem.copyForwards(u8, raw.items[0..rem], raw.items[pos..]);
+            raw.shrinkRetainingCapacity(rem);
+        }
+        var chunk: [4096]u8 = undefined;
+        const n = c.read(app_fd, &chunk, chunk.len);
+        if (n <= 0) fail("linux-dmabuf global was not advertised");
+        raw.appendSlice(allocator, chunk[0..@intCast(n)]) catch fail("oom");
+    }
+}
+
+/// Waits for one Wayland event while safely skipping unrelated events.
+fn awaitWaylandEvent(allocator: std.mem.Allocator, app_fd: c_int, object: u32, opcode: u16) void {
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(allocator);
+    while (true) {
+        var pos: usize = 0;
+        while (true) {
+            const h = (wlwire.parseHeader(raw.items[pos..]) catch fail("dmabuf app event header")) orelse break;
+            if (raw.items[pos..].len < h.size) break;
+            if (h.object == object and h.opcode == opcode) return;
+            pos += h.size;
+        }
+        if (pos > 0) {
+            const rem = raw.items.len - pos;
+            std.mem.copyForwards(u8, raw.items[0..rem], raw.items[pos..]);
+            raw.shrinkRetainingCapacity(rem);
+        }
+        var chunk: [4096]u8 = undefined;
+        const n = c.read(app_fd, &chunk, chunk.len);
+        if (n <= 0) fail("dmabuf app event timed out");
+        raw.appendSlice(allocator, chunk[0..@intCast(n)]) catch fail("oom");
+    }
+}
+
+/// Scripted linux-dmabuf import through the daemon, including durable replay.
+fn dmabufStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_path: []const u8) void {
+    const tv = c.struct_timeval{ .tv_sec = 15, .tv_usec = 0 };
+    _ = c.setsockopt(conn.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+
+    const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/').?;
+    var disp_buf: [128]u8 = undefined;
+    const disp_path = std.fmt.bufPrint(&disp_buf, "{s}/wl-1", .{sock_path[0..dir_end]}) catch unreachable;
+    const app_fd = @import("util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (app_fd < 0) fail("dmabuf app socket");
+    defer _ = c.close(app_fd);
+    var addr: c.struct_sockaddr_un = undefined;
+    daemon_mod.fillSockaddrUn(&addr, disp_path) catch fail("dmabuf app sockaddr");
+    if (c.connect(app_fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) fail("dmabuf app connect");
+    _ = c.setsockopt(app_fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+
+    var mbuf: [256]u8 = undefined;
+    { // get_registry(2), then prove gpu=true really exposed global 22.
+        var b = wlwire.Builder.init(&mbuf, 1, 1);
+        b.putNewId(2);
+        const m = b.finish() catch unreachable;
+        if (c.write(app_fd, m.ptr, m.len) != @as(isize, @intCast(m.len))) fail("dmabuf registry write");
+        awaitDmabufGlobal(allocator, app_fd);
+    }
+
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(allocator);
+    inline for (.{
+        .{ 1, "wl_compositor", 4, 3 },
+        .{ 22, "zwp_linux_dmabuf_v1", 3, 4 },
+        .{ 2, "wl_shm", 1, 8 },
+    }) |bind| {
+        var b = wlwire.Builder.init(&mbuf, 2, 0);
+        b.putUint(bind[0]);
+        b.putString(bind[1]);
+        b.putUint(bind[2]);
+        b.putNewId(bind[3]);
+        stream.appendSlice(allocator, b.finish() catch unreachable) catch fail("oom");
+    }
+    {
+        var b = wlwire.Builder.init(&mbuf, 4, 1); // create_params(5)
+        b.putNewId(5);
+        stream.appendSlice(allocator, b.finish() catch unreachable) catch fail("oom");
+    }
+    if (c.write(app_fd, stream.items.ptr, stream.items.len) != @as(isize, @intCast(stream.items.len))) fail("dmabuf bind write");
+
+    const expected = [_]u8{
+        0x11, 0x12, 0x13, 0xff, 0x21, 0x22, 0x23, 0xff,
+        0x31, 0x32, 0x33, 0xff, 0x41, 0x42, 0x43, 0xff,
+    };
+    // Offset 4, 8 bytes of pixels per row, and 4 bytes of padding.
+    const source = [_]u8{
+        0xa0, 0xa1, 0xa2, 0xa3,
+        0x11, 0x12, 0x13, 0xff,
+        0x21, 0x22, 0x23, 0xff,
+        0xb0, 0xb1, 0xb2, 0xb3,
+        0x31, 0x32, 0x33, 0xff,
+        0x41, 0x42, 0x43, 0xff,
+        0xc0, 0xc1, 0xc2, 0xc3,
+    };
+    var tmp_buf: [128]u8 = undefined;
+    const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "/tmp/sketerm-mux-smoke-{d}-dmabuf", .{c.getpid()}) catch unreachable;
+    const pool_fd = c.open(tmp_path.ptr, c.O_RDWR | c.O_CREAT | c.O_TRUNC, @as(c.mode_t, 0o600));
+    if (pool_fd < 0) fail("dmabuf source open");
+    defer _ = c.close(pool_fd);
+    _ = c.unlink(tmp_path.ptr);
+    if (c.write(pool_fd, &source, source.len) != source.len) fail("dmabuf source write");
+
+    // Keep a buffer from destroyed shm pool id 6 alive, receive delete_id,
+    // then legally reuse 6 for the dmabuf wl_buffer. The daemon must orphan
+    // the old pool incarnation rather than rejecting the synthetic pool id.
+    {
+        var b = wlwire.Builder.init(&mbuf, 8, 0); // wl_shm.create_pool(6)
+        b.putNewId(6);
+        b.putInt(16);
+        sendWithFd(app_fd, b.finish() catch unreachable, pool_fd) catch fail("dmabuf reuse pool sendmsg");
+        stream.clearRetainingCapacity();
+        var b2 = wlwire.Builder.init(&mbuf, 6, 0); // create_buffer(9)
+        b2.putNewId(9);
+        b2.putInt(0);
+        b2.putInt(1);
+        b2.putInt(1);
+        b2.putInt(4);
+        b2.putUint(1);
+        stream.appendSlice(allocator, b2.finish() catch unreachable) catch fail("oom");
+        var b3 = wlwire.Builder.init(&mbuf, 6, 1); // destroy pool 6
+        stream.appendSlice(allocator, b3.finish() catch unreachable) catch fail("oom");
+        if (c.write(app_fd, stream.items.ptr, stream.items.len) != @as(isize, @intCast(stream.items.len)))
+            fail("dmabuf reuse setup");
+        awaitWaylandEvent(allocator, app_fd, 1, 1); // wl_display.delete_id(6)
+    }
+    {
+        var b = wlwire.Builder.init(&mbuf, 5, 1); // add(fd, plane 0, offset 4, stride 12, LINEAR)
+        b.putUint(0);
+        b.putUint(4);
+        b.putUint(12);
+        b.putUint(0);
+        b.putUint(0);
+        sendWithFd(app_fd, b.finish() catch unreachable, pool_fd) catch fail("dmabuf add sendmsg");
+    }
+
+    stream.clearRetainingCapacity();
+    {
+        var b = wlwire.Builder.init(&mbuf, 5, 3); // create_immed(buffer 6, 2x2 XR24)
+        b.putNewId(6);
+        b.putInt(2);
+        b.putInt(2);
+        b.putUint(wlprotocol.DRM_FORMAT_XRGB8888);
+        b.putUint(0);
+        stream.appendSlice(allocator, b.finish() catch unreachable) catch fail("oom");
+        var b2 = wlwire.Builder.init(&mbuf, 3, 0); // create_surface(7)
+        b2.putNewId(7);
+        stream.appendSlice(allocator, b2.finish() catch unreachable) catch fail("oom");
+        var b3 = wlwire.Builder.init(&mbuf, 7, 1); // attach(buffer 6)
+        b3.putObject(6);
+        b3.putInt(0);
+        b3.putInt(0);
+        stream.appendSlice(allocator, b3.finish() catch unreachable) catch fail("oom");
+        var b4 = wlwire.Builder.init(&mbuf, 7, 2); // damage
+        b4.putInt(0);
+        b4.putInt(0);
+        b4.putInt(2);
+        b4.putInt(2);
+        stream.appendSlice(allocator, b4.finish() catch unreachable) catch fail("oom");
+        var b5 = wlwire.Builder.init(&mbuf, 7, 6); // commit
+        stream.appendSlice(allocator, b5.finish() catch unreachable) catch fail("oom");
+    }
+    if (c.write(app_fd, stream.items.ptr, stream.items.len) != @as(isize, @intCast(stream.items.len))) fail("dmabuf requests write");
+
+    // Live stream: tight pixel units must precede the relayed commit.
+    var chan_id: u32 = 0;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(allocator);
+    var saw_create = false;
+    var saw_update = false;
+    var saw_commit = false;
+    var rounds: usize = 0;
+    while (!saw_commit and rounds < 400) : (rounds += 1) {
+        const f = conn.recvFrame() catch fail("dmabuf live stream read");
+        defer f.deinit(allocator);
+        switch (f.ftype) {
+            .chan_open => {
+                const open = wire.decodeChanOpen(f.payload) orelse fail("dmabuf chan_open");
+                if (open.kind == .wayland_native) chan_id = open.id;
+            },
+            .chan_data => {
+                if (chan_id == 0 or (wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
+                raw.appendSlice(allocator, f.payload[4..]) catch fail("oom");
+                var pos: usize = 0;
+                while ((wlpipe.peelUnit(raw.items[pos..]) catch fail("dmabuf live unit")) != null) {
+                    const p = (wlpipe.peelUnit(raw.items[pos..]) catch unreachable).?;
+                    switch (p.unit.tag) {
+                        .wl_msg => {
+                            const h = (wlwire.parseHeader(p.unit.payload) catch fail("dmabuf live wl header")) orelse fail("dmabuf live wl header");
+                            if (h.object == 5 and h.opcode == 3) {
+                                const body = p.unit.payload[wlwire.header_size..];
+                                if (body.len != 20 or std.mem.readInt(u32, body[0..4], .little) != 6 or
+                                    std.mem.readInt(i32, body[4..8], .little) != 2 or
+                                    std.mem.readInt(i32, body[8..12], .little) != 2 or
+                                    std.mem.readInt(u32, body[12..16], .little) != wlprotocol.DRM_FORMAT_XRGB8888)
+                                    fail("dmabuf create_immed metadata wrong");
+                                saw_create = true;
+                            }
+                            if (h.object == 7 and h.opcode == 6) {
+                                if (!saw_update) fail("dmabuf commit preceded pixel units");
+                                saw_commit = true;
+                            }
+                        },
+                        .pool_create => {
+                            const meta = wlpipe.decodePoolMeta(p.unit.payload) orelse fail("dmabuf live pool meta");
+                            if (meta.pool == 6 and meta.size != 16) fail("dmabuf live synthetic pool size");
+                        },
+                        .pool_update_c => {
+                            const upd = wlpipe.decodePoolUpdateC(p.unit.payload) orelse fail("dmabuf live update");
+                            if (upd.pool == 6) {
+                                if (upd.offset != 0 or upd.body.raw_len != 16 or upd.body.row_stride != 8) fail("dmabuf live pool is not tight");
+                                var pixels: [16]u8 = undefined;
+                                wlpixcodec.decodeBody(upd.body, &pixels) catch fail("dmabuf live pixel decode");
+                                if (!std.mem.eql(u8, &pixels, &expected)) fail("dmabuf live pixels include offset/padding");
+                                saw_update = true;
+                            }
+                        },
+                        else => {},
+                    }
+                    pos += p.consumed;
+                }
+                if (pos > 0) {
+                    const rem = raw.items.len - pos;
+                    std.mem.copyForwards(u8, raw.items[0..rem], raw.items[pos..]);
+                    raw.shrinkRetainingCapacity(rem);
+                }
+            },
+            else => {},
+        }
+    }
+    if (chan_id == 0) fail("dmabuf channel never opened");
+    if (!saw_create) fail("dmabuf create_immed was not relayed");
+    if (!saw_update) fail("dmabuf tight pixel update missing");
+    if (!saw_commit) fail("dmabuf commit was not relayed");
+    awaitWaylandEvent(allocator, app_fd, 6, 0); // wl_buffer.release
+
+    // A damage-only commit after release must not reread producer storage.
+    // Poison the source and require the relayed commit to carry no pixels.
+    const early_poison = [_]u8{0xdd} ** source.len;
+    if (c.lseek(pool_fd, 0, c.SEEK_SET) != 0 or
+        c.write(pool_fd, &early_poison, early_poison.len) != early_poison.len)
+        fail("dmabuf no-attach poison");
+    stream.clearRetainingCapacity();
+    {
+        var b = wlwire.Builder.init(&mbuf, 7, 2); // damage without attach
+        b.putInt(0);
+        b.putInt(0);
+        b.putInt(2);
+        b.putInt(2);
+        stream.appendSlice(allocator, b.finish() catch unreachable) catch fail("oom");
+        var b2 = wlwire.Builder.init(&mbuf, 7, 6); // commit
+        stream.appendSlice(allocator, b2.finish() catch unreachable) catch fail("oom");
+    }
+    if (c.write(app_fd, stream.items.ptr, stream.items.len) != @as(isize, @intCast(stream.items.len)))
+        fail("dmabuf no-attach commit");
+    var no_attach_raw: std.ArrayList(u8) = .empty;
+    defer no_attach_raw.deinit(allocator);
+    var saw_no_attach_commit = false;
+    rounds = 0;
+    while (!saw_no_attach_commit and rounds < 400) : (rounds += 1) {
+        const f = conn.recvFrame() catch fail("dmabuf no-attach stream read");
+        defer f.deinit(allocator);
+        if (f.ftype != .chan_data or (wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
+        no_attach_raw.appendSlice(allocator, f.payload[4..]) catch fail("oom");
+        var pos: usize = 0;
+        while ((wlpipe.peelUnit(no_attach_raw.items[pos..]) catch fail("dmabuf no-attach unit")) != null) {
+            const p = (wlpipe.peelUnit(no_attach_raw.items[pos..]) catch unreachable).?;
+            if (p.unit.tag == .pool_update_c) {
+                const upd = wlpipe.decodePoolUpdateC(p.unit.payload) orelse fail("dmabuf no-attach update");
+                if (upd.pool == 6) fail("dmabuf reread a released buffer without attach");
+            } else if (p.unit.tag == .wl_msg) {
+                const h = (wlwire.parseHeader(p.unit.payload) catch fail("dmabuf no-attach header")) orelse
+                    fail("dmabuf no-attach header");
+                if (h.object == 7 and h.opcode == 6) saw_no_attach_commit = true;
+            }
+            pos += p.consumed;
+        }
+        if (pos > 0) {
+            const rem = no_attach_raw.items.len - pos;
+            std.mem.copyForwards(u8, no_attach_raw.items[0..rem], no_attach_raw.items[pos..]);
+            no_attach_raw.shrinkRetainingCapacity(rem);
+        }
+    }
+    if (!saw_no_attach_commit) fail("dmabuf no-attach commit missing");
+
+    // Prove headless commits are captured before release and replay never
+    // rereads producer storage. Detach the only viewer, commit a second image,
+    // wait for release, then overwrite the source before attaching a viewer.
+    conn.sendFrame(.detach, "") catch fail("dmabuf headless detach");
+    (conn.recvExpect(&.{.ok}) catch fail("dmabuf headless detach ok")).deinit(allocator);
+    const replay_expected = [_]u8{
+        0x51, 0x52, 0x53, 0xff, 0x61, 0x62, 0x63, 0xff,
+        0x71, 0x72, 0x73, 0xff, 0x81, 0x82, 0x83, 0xff,
+    };
+    const replay_source = [_]u8{
+        0xd0, 0xd1, 0xd2, 0xd3,
+        0x51, 0x52, 0x53, 0xff,
+        0x61, 0x62, 0x63, 0xff,
+        0xe0, 0xe1, 0xe2, 0xe3,
+        0x71, 0x72, 0x73, 0xff,
+        0x81, 0x82, 0x83, 0xff,
+        0xf0, 0xf1, 0xf2, 0xf3,
+    };
+    if (c.lseek(pool_fd, 0, c.SEEK_SET) != 0 or
+        c.write(pool_fd, &replay_source, replay_source.len) != replay_source.len)
+        fail("dmabuf headless source update");
+    stream.clearRetainingCapacity();
+    {
+        var b = wlwire.Builder.init(&mbuf, 7, 1); // re-attach released buffer
+        b.putObject(6);
+        b.putInt(0);
+        b.putInt(0);
+        stream.appendSlice(allocator, b.finish() catch unreachable) catch fail("oom");
+        var b2 = wlwire.Builder.init(&mbuf, 7, 2); // damage
+        b2.putInt(0);
+        b2.putInt(0);
+        b2.putInt(2);
+        b2.putInt(2);
+        stream.appendSlice(allocator, b2.finish() catch unreachable) catch fail("oom");
+        var b3 = wlwire.Builder.init(&mbuf, 7, 6); // commit
+        stream.appendSlice(allocator, b3.finish() catch unreachable) catch fail("oom");
+    }
+    if (c.write(app_fd, stream.items.ptr, stream.items.len) != @as(isize, @intCast(stream.items.len)))
+        fail("dmabuf headless commit");
+    awaitWaylandEvent(allocator, app_fd, 6, 0);
+    const poison = [_]u8{0xee} ** replay_source.len;
+    if (c.lseek(pool_fd, 0, c.SEEK_SET) != 0 or
+        c.write(pool_fd, &poison, poison.len) != poison.len)
+        fail("dmabuf post-release overwrite");
+
+    // A fresh viewer must rebuild the tight synthetic pool before state_sync.
+    var replay = client_mod.Conn.connect(allocator, sock_path) catch fail("dmabuf replay connect");
+    defer replay.deinit();
+    _ = c.setsockopt(replay.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+    replay.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("dmabuf replay hello");
+    (replay.recvExpect(&.{.welcome}) catch fail("dmabuf replay welcome")).deinit(allocator);
+    replay.sendJson(.attach, .{ .name = "smoke" }) catch fail("dmabuf replay attach");
+    (replay.recvExpect(&.{.snapshot}) catch fail("dmabuf replay snapshot")).deinit(allocator);
+
+    var replay_raw: std.ArrayList(u8) = .empty;
+    defer replay_raw.deinit(allocator);
+    var replay_pixels: [16]u8 = @splat(0);
+    var replay_open = false;
+    var replay_pool = false;
+    var replay_filled: usize = 0;
+    var saw_state_sync = false;
+    rounds = 0;
+    while (!saw_state_sync and rounds < 400) : (rounds += 1) {
+        const f = replay.recvFrame() catch fail("dmabuf replay stream read");
+        defer f.deinit(allocator);
+        switch (f.ftype) {
+            .chan_open => {
+                const open = wire.decodeChanOpen(f.payload) orelse fail("dmabuf replay chan_open");
+                if (open.kind == .wayland_native and open.id == chan_id) replay_open = true;
+            },
+            .chan_data => {
+                if ((wire.decodeChanId(f.payload) orelse 0) != chan_id) continue;
+                replay_raw.appendSlice(allocator, f.payload[4..]) catch fail("oom");
+                var pos: usize = 0;
+                while ((wlpipe.peelUnit(replay_raw.items[pos..]) catch fail("dmabuf replay unit")) != null) {
+                    const p = (wlpipe.peelUnit(replay_raw.items[pos..]) catch unreachable).?;
+                    switch (p.unit.tag) {
+                        .pool_create => {
+                            const meta = wlpipe.decodePoolMeta(p.unit.payload) orelse fail("dmabuf replay pool meta");
+                            if (meta.pool == 6) {
+                                if (meta.size != 16) fail("dmabuf replay synthetic pool is not tight");
+                                replay_pool = true;
+                            }
+                        },
+                        .pool_update_c => {
+                            const upd = wlpipe.decodePoolUpdateC(p.unit.payload) orelse fail("dmabuf replay update");
+                            if (upd.pool == 6) {
+                                const offset: usize = @intCast(upd.offset);
+                                const len: usize = @intCast(upd.body.raw_len);
+                                if (!replay_pool or offset + len > replay_pixels.len) fail("dmabuf replay update bounds/order");
+                                wlpixcodec.decodeBody(upd.body, replay_pixels[offset..][0..len]) catch fail("dmabuf replay pixel decode");
+                                replay_filled += len;
+                            }
+                        },
+                        .state_sync => {
+                            if (!replay_pool or replay_filled != 16 or !std.mem.eql(u8, &replay_pixels, &replay_expected))
+                                fail("dmabuf replay pixels were not rebuilt before state_sync");
+                            saw_state_sync = true;
+                        },
+                        else => {},
+                    }
+                    pos += p.consumed;
+                }
+                if (pos > 0) {
+                    const rem = replay_raw.items.len - pos;
+                    std.mem.copyForwards(u8, replay_raw.items[0..rem], replay_raw.items[pos..]);
+                    replay_raw.shrinkRetainingCapacity(rem);
+                }
+            },
+            else => {},
+        }
+    }
+    if (!replay_open) fail("dmabuf replay channel missing");
+    if (!saw_state_sync) fail("dmabuf replay state_sync missing");
+    replay.sendFrame(.detach, "") catch fail("dmabuf replay detach");
+    (replay.recvExpect(&.{.ok}) catch fail("dmabuf replay detach ok")).deinit(allocator);
+    conn.sendJson(.attach, .{ .name = "smoke" }) catch fail("dmabuf restore original viewer");
+    (conn.recvExpect(&.{.snapshot}) catch fail("dmabuf restore original snapshot")).deinit(allocator);
+
+    std.debug.print("smoke-mux: linux-dmabuf id reuse + tight pre-release headless replay ok\n", .{});
+}
+
 /// The real-client milestone: a stock Wayland app (weston-terminal)
 /// spawned in a native-pipe session, with the wlhost Compositor on
 /// this end answering the protocol. Pass = a committed toplevel
@@ -804,7 +1235,7 @@ fn winstreamStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     (conn.recvExpect(&.{.welcome}) catch fail("ws welcome")).deinit(allocator);
     conn.sendJson(.spawn, .{
         .name = "wsapp",
-        .argv = [_][]const u8{"/bin/sleep", "60"},
+        .argv = [_][]const u8{ "/bin/sleep", "60" },
         .rows = @as(u16, 10),
         .cols = @as(u16, 40),
         .app = true,
@@ -1234,7 +1665,7 @@ fn recvWithFd(sock: c_int) ?struct { fd: c_int, obj: u32 = 0, opcode: u16 = 0 } 
     var off: usize = 0;
     const clen: usize = @intCast(mh.msg_controllen);
     while (off + hdr_size <= clen) {
-        const hdr: *const c.struct_cmsghdr = @alignCast(@ptrCast(cbuf[off..].ptr));
+        const hdr: *const c.struct_cmsghdr = @ptrCast(@alignCast(cbuf[off..].ptr));
         const cl: usize = @intCast(hdr.cmsg_len);
         if (cl < hdr_size or off + cl > clen) break;
         if (hdr.cmsg_level == c.SOL_SOCKET and hdr.cmsg_type == c.SCM_RIGHTS) {
@@ -1563,6 +1994,7 @@ pub fn main() u8 {
         .argv = [_][]const u8{"/bin/sh"},
         .rows = @as(u16, 10),
         .cols = @as(u16, 60),
+        .gpu = true,
     }) catch fail("spawn send");
     (conn.recvExpect(&.{.ok}) catch fail("spawn ok")).deinit(allocator);
 
@@ -1688,6 +2120,9 @@ pub fn main() u8 {
 
     // Native Wayland app pipe end-to-end (scripted client).
     nativePipeStage(allocator, &conn, sock_path);
+
+    // Scripted LINEAR linux-dmabuf import + durable synthetic-pool replay.
+    dmabufStage(allocator, &conn, sock_path);
 
     // Backlogged mcp client: gap + live-mirror resync (shared stage,
     // also run against a real broker by smoke-broker).

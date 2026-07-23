@@ -29,7 +29,11 @@ const Event = @import("../parser/event.zig").Event;
 /// (passive replicas), viewers drive input via seat-intent pipe
 /// units, and attach replays pool bytes + a state_sync unit so app
 /// windows survive detach/reattach (durable GUI apps).
-pub const PROTO_VERSION: u32 = 5;
+/// Version 6 extends the native-channel state_sync blob with complete
+/// linux-dmabuf plane metadata. Exact hello matching prevents an older
+/// replica from receiving a state version it cannot restore.
+pub const PROTO_VERSION: u32 = 6;
+pub const NATIVE_STATE_PROTO_VERSION: u32 = 6;
 
 /// Frame types. Append-only.
 pub const FrameType = enum(u8) {
