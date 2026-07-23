@@ -8487,3 +8487,32 @@ left running while the current client connected directly and through the real
 SSH proxy path, spawned a shell, attached to send input, restored/read its
 snapshot and output, and killed only the test session. The protocol 5 daemon
 was not restarted or upgraded between those client connections.
+
+## Forwarded-app taskbar identity and icon lifecycle
+
+Forwarded windows now acquire the remote application's desktop identity at
+the backend-specific point where it can take effect. X11 still receives
+`WM_CLASS` during realize, before map. Wayland receives the app id again from
+an after-map callback, because GTK's Wayland backend does not create the
+`xdg_toplevel` role until map and silently ignores
+`gdk_wayland_toplevel_set_application_id` before that role exists. Shipped
+icon pixels are reapplied after every app-id update so the icon-name fallback
+cannot replace the daemon-host icon.
+
+Daemon icon replay is now keyed by surface id instead of suppressing every
+window after the first occurrence of an app id. Each live toplevel therefore
+receives and replays its own icon, destroyed surfaces release their cached
+bytes, and multi-window apps retain correct icons after reattach. Icon theme
+resolution also preserves explicit `.png`, `.svg`, and `.svgz` suffixes
+instead of searching for names such as `app.png.png`.
+
+Verification: 814 tests pass with 6 environment skips, including new
+multi-surface replay/removal and explicit-suffix tests. `smoke-mux`,
+`smoke-broker`, GUI/mux builds, Linux static-musl portable mux, and the
+aarch64-macOS portable cross-build pass. The native mux still links only
+libc/libm/loader and the portable artifact has no dynamic section. A private
+Xvfb run of a real forwarded Weston terminal observed remote
+`WM_CLASS = org.freedesktop.weston.wayland-terminal` plus `_NET_WM_ICON`.
+A separate private nested-Weston run captured the outer GTK client sending
+`xdg_toplevel.set_app_id("org.freedesktop.weston.wayland-terminal")` after
+map. Neither integration run used the live desktop runtime or compositor.
