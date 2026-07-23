@@ -68,12 +68,17 @@ pub fn build(b: *std.Build) void {
     // preserving the daemon's dependency-free link graph; portable
     // builds compile the probe out. `false` is an explicit opt-out.
     const have_opus = b.option(bool, "audio-opus", "Runtime Opus compression for remote audio (default on)") orelse true;
+    // Runtime EGL/GLES probing imports modifier-backed linux-dmabufs
+    // without adding either library to the daemon's ELF dependencies.
+    const have_dmabuf_import = target.result.os.tag == .linux and
+        (b.option(bool, "dmabuf-import", "Runtime EGL/GLES import for modifier-backed dma-bufs (default on on Linux)") orelse true);
     const glib_opts = b.addOptions();
     glib_opts.addOption(bool, "glib", true);
     glib_opts.addOption(bool, "winstream_sck", native_sck);
     glib_opts.addOption(bool, "video", have_x264);
     glib_opts.addOption(bool, "vtenc", have_vtenc);
     glib_opts.addOption(bool, "audio_opus", have_opus);
+    glib_opts.addOption(bool, "dmabuf_import", have_dmabuf_import);
     const glib_opts_mod = glib_opts.createModule();
     const noglib_opts = b.addOptions();
     noglib_opts.addOption(bool, "glib", false);
@@ -81,6 +86,7 @@ pub fn build(b: *std.Build) void {
     noglib_opts.addOption(bool, "video", have_x264);
     noglib_opts.addOption(bool, "vtenc", have_vtenc);
     noglib_opts.addOption(bool, "audio_opus", have_opus);
+    noglib_opts.addOption(bool, "dmabuf_import", have_dmabuf_import);
     const noglib_opts_mod = noglib_opts.createModule();
 
     const exe_mod = b.createModule(.{
@@ -186,6 +192,7 @@ pub fn build(b: *std.Build) void {
     portable_opts.addOption(bool, "video", false);
     portable_opts.addOption(bool, "vtenc", false);
     portable_opts.addOption(bool, "audio_opus", false);
+    portable_opts.addOption(bool, "dmabuf_import", false);
     mux_portable_mod.addImport("build_options", portable_opts.createModule());
     const mux_portable_exe = b.addExecutable(.{
         .name = "sketerm-mux-portable",

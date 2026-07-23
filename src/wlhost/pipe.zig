@@ -65,7 +65,7 @@ pub const Tag = enum(u8) {
     /// Pool BYTES are not inside — they precede it as pool_create +
     /// pool_update_c units replayed from the daemon's mirrors.
     state_sync = 12,
-    /// Seat intents, replica -> daemon brain (proto>=5). Little-endian
+    /// Seat intents, replica -> daemon brain (proto>=6). Little-endian
     /// payloads; f64 rides as its u64 bit pattern.
     seat_enter = 13, // u32 sid, u64 x, u64 y
     seat_leave = 14,

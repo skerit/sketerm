@@ -47,7 +47,7 @@ pub const Hub = struct {
     /// at-spi-bus-launcher's a11y-bus socket (derived from
     /// XDG_RUNTIME_DIR) is per-session, not shared. Removed on
     /// teardown.
-    rt_dir: []u8 = "",
+    rt_dir: ?[:0]u8 = null,
 
     pub fn setup(allocator: std.mem.Allocator, dir: []const u8, id: []const u8) ?Hub {
         const bus_path = std.fmt.allocPrint(allocator, "{s}/dbus-{s}", .{ dir, id }) catch return null;
@@ -241,31 +241,32 @@ pub const Hub = struct {
             zbuf[self.bus_path.len] = 0;
             _ = c.unlink(@ptrCast(&zbuf));
         }
-        if (self.rt_dir.len > 0) {
-            removeA11yTree(self.rt_dir);
-            self.allocator.free(self.rt_dir);
+        if (self.rt_dir) |dir| {
+            removeA11yTree(dir);
+            self.allocator.free(dir);
         }
         self.allocator.free(self.bus_path);
         self.allocator.free(self.bus_addr_z);
     }
 
-    /// Best-effort recursive rm of the small private a11y runtime dir
-    /// (at-spi/bus socket + a lock dir). Shells out to `rm -rf` (the
-    /// daemon already spawns processes; the tree is tiny and ours).
+    /// Removes the private a11y runtime tree without forking after EGL init.
     fn removeA11yTree(dir: []const u8) void {
         var zbuf: [4096]u8 = undefined;
-        if (dir.len + 1 > zbuf.len) return;
-        const pid = c.fork();
-        if (pid < 0) return;
-        if (pid == 0) {
-            @memcpy(zbuf[0..dir.len], dir);
-            zbuf[dir.len] = 0;
-            const argv = [_:null]?[*:0]const u8{ "rm", "-rf", @ptrCast(&zbuf), null };
-            _ = c.execvp("rm", @ptrCast(&argv));
-            c._exit(127);
+        const zdir = std.fmt.bufPrintZ(&zbuf, "{s}", .{dir}) catch return;
+        if (c.opendir(zdir.ptr)) |dp| {
+            while (c.readdir(dp)) |entry| {
+                const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+                var child_buf: [4096]u8 = undefined;
+                const child = std.fmt.bufPrintZ(&child_buf, "{s}/{s}", .{ dir, name }) catch continue;
+                if (c.unlinkat(c.AT_FDCWD, child.ptr, 0) != 0) {
+                    removeA11yTree(child);
+                    _ = c.unlinkat(c.AT_FDCWD, child.ptr, c.AT_REMOVEDIR);
+                }
+            }
+            _ = c.closedir(dp);
         }
-        var st: c_int = 0;
-        _ = c.waitpid(pid, &st, 0);
+        _ = c.rmdir(zdir.ptr);
     }
 
     /// Connect to the a11y bus and serialize the tree from the

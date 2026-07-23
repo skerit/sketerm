@@ -3,9 +3,8 @@
 //! client staples (selections incl. primary, relative pointer +
 //! constraints, text-input v3, xdg-activation, presentation-time,
 //! idle-inhibit, pointer gestures). Buffers are shm plus an opt-in
-//! LINEAR-only linux-dmabuf (SKETERM_MUX_DMABUF): the daemon reads
-//! dmabufs with plain mmap — no GPU libraries — and clients whose
-//! drivers refuse CPU mapping stay on shm by default.
+//! linux-dmabuf v3 path (SKETERM_MUX_DMABUF); advertised format and
+//! modifier capabilities are selected by the daemon's importer.
 //!
 //! Signature letters match wire.zig's ArgIter:
 //!   i int · u uint · f fixed · s string · o object · n new_id ·
@@ -17,6 +16,7 @@
 
 const std = @import("std");
 const wire = @import("wire.zig");
+const dmabuf = @import("dmabuf.zig");
 
 pub const Message = struct {
     name: []const u8,
@@ -173,8 +173,8 @@ pub const wl_buffer = Interface{
 };
 
 /// linux-dmabuf at v3 exactly: v4's feedback objects need a main DRM
-/// device identity we don't have. Import policy is LINEAR-only —
-/// the daemon reads buffers with plain mmap, no GPU libraries.
+/// device identity we don't have. Import policy follows the daemon's
+/// advertised format/modifier capabilities.
 pub const zwp_linux_dmabuf_v1 = Interface{
     .name = "zwp_linux_dmabuf_v1",
     .version = 3,
@@ -195,7 +195,7 @@ pub const zwp_linux_buffer_params_v1 = Interface{
         .{ .name = "destroy", .sig = "" },
         .{ .name = "add", .sig = "huuuuu" },
         .{ .name = "create", .sig = "iiuu" },
-        .{ .name = "create_immed", .sig = "niiuu", .new_id_iface = &wl_buffer },
+        .{ .name = "create_immed", .sig = "niiuu", .since = 2, .new_id_iface = &wl_buffer },
     },
     .events = &.{
         .{ .name = "created", .sig = "n", .new_id_iface = &wl_buffer },
@@ -203,11 +203,11 @@ pub const zwp_linux_buffer_params_v1 = Interface{
     },
 };
 
-/// DRM fourcc codes for the two formats we import (byte layout is
-/// identical to the matching wl_shm formats on little-endian).
-pub const DRM_FORMAT_ARGB8888: u32 = 0x34325241; // 'AR24'
-pub const DRM_FORMAT_XRGB8888: u32 = 0x34325258; // 'XR24'
-pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+/// DRM metadata shared with the importer and tracker.
+pub const DRM_FORMAT_ARGB8888 = dmabuf.DRM_FORMAT_ARGB8888;
+pub const DRM_FORMAT_XRGB8888 = dmabuf.DRM_FORMAT_XRGB8888;
+pub const DRM_FORMAT_MOD_LINEAR = dmabuf.DRM_FORMAT_MOD_LINEAR;
+pub const DRM_FORMAT_MOD_INVALID = dmabuf.DRM_FORMAT_MOD_INVALID;
 
 pub const wl_surface = Interface{
     .name = "wl_surface",
@@ -920,32 +920,22 @@ pub const xdg_popup = Interface{
 };
 
 pub const all = [_]*const Interface{
-    &wl_display,     &wl_registry,    &wl_callback,    &wl_compositor,
-    &wl_subcompositor, &wl_subsurface,
-    &wl_shm,         &wl_shm_pool,    &wl_buffer,      &wl_surface,
-    &wl_region,      &wl_seat,        &wl_pointer,     &wl_keyboard,
-    &wl_touch,       &wl_output,      &xdg_wm_base,    &xdg_positioner,
-    &xdg_surface,    &xdg_toplevel,   &xdg_popup,      &wl_data_offer,
-    &wl_data_source, &wl_data_device, &wl_data_device_manager,
-    &zwlr_data_control_offer_v1,       &zwlr_data_control_source_v1,
-    &zwlr_data_control_device_v1,      &zwlr_data_control_manager_v1,
-    &wp_cursor_shape_manager_v1,      &wp_cursor_shape_device_v1,
-    &wp_viewporter,  &wp_viewport,    &wp_fractional_scale_manager_v1,
-    &wp_fractional_scale_v1,            &zxdg_decoration_manager_v1,
-    &zxdg_toplevel_decoration_v1,
-    &zwp_primary_selection_device_manager_v1, &zwp_primary_selection_device_v1,
-    &zwp_primary_selection_source_v1,   &zwp_primary_selection_offer_v1,
-    &zwp_relative_pointer_manager_v1,   &zwp_relative_pointer_v1,
-    &zwp_pointer_constraints_v1,        &zwp_locked_pointer_v1,
-    &zwp_confined_pointer_v1,           &zwp_text_input_manager_v3,
-    &zwp_text_input_v3,                 &xdg_activation_v1,
-    &xdg_activation_token_v1,           &wp_presentation,
-    &wp_presentation_feedback,          &zwp_idle_inhibit_manager_v1,
-    &zwp_idle_inhibitor_v1,             &zwp_pointer_gestures_v1,
-    &zwp_pointer_gesture_swipe_v1,      &zwp_pointer_gesture_pinch_v1,
-    &zwp_pointer_gesture_hold_v1,       &zwp_linux_dmabuf_v1,
-    &zwp_linux_buffer_params_v1,        &zxdg_output_manager_v1,
-    &zxdg_output_v1,
+    &wl_display,                     &wl_registry,                             &wl_callback,                     &wl_compositor,
+    &wl_subcompositor,               &wl_subsurface,                           &wl_shm,                          &wl_shm_pool,
+    &wl_buffer,                      &wl_surface,                              &wl_region,                       &wl_seat,
+    &wl_pointer,                     &wl_keyboard,                             &wl_touch,                        &wl_output,
+    &xdg_wm_base,                    &xdg_positioner,                          &xdg_surface,                     &xdg_toplevel,
+    &xdg_popup,                      &wl_data_offer,                           &wl_data_source,                  &wl_data_device,
+    &wl_data_device_manager,         &zwlr_data_control_offer_v1,              &zwlr_data_control_source_v1,     &zwlr_data_control_device_v1,
+    &zwlr_data_control_manager_v1,   &wp_cursor_shape_manager_v1,              &wp_cursor_shape_device_v1,       &wp_viewporter,
+    &wp_viewport,                    &wp_fractional_scale_manager_v1,          &wp_fractional_scale_v1,          &zxdg_decoration_manager_v1,
+    &zxdg_toplevel_decoration_v1,    &zwp_primary_selection_device_manager_v1, &zwp_primary_selection_device_v1, &zwp_primary_selection_source_v1,
+    &zwp_primary_selection_offer_v1, &zwp_relative_pointer_manager_v1,         &zwp_relative_pointer_v1,         &zwp_pointer_constraints_v1,
+    &zwp_locked_pointer_v1,          &zwp_confined_pointer_v1,                 &zwp_text_input_manager_v3,       &zwp_text_input_v3,
+    &xdg_activation_v1,              &xdg_activation_token_v1,                 &wp_presentation,                 &wp_presentation_feedback,
+    &zwp_idle_inhibit_manager_v1,    &zwp_idle_inhibitor_v1,                   &zwp_pointer_gestures_v1,         &zwp_pointer_gesture_swipe_v1,
+    &zwp_pointer_gesture_pinch_v1,   &zwp_pointer_gesture_hold_v1,             &zwp_linux_dmabuf_v1,             &zwp_linux_buffer_params_v1,
+    &zxdg_output_manager_v1,         &zxdg_output_v1,
 };
 
 // ─── tests ──────────────────────────────────────────────────────

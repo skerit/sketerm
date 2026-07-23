@@ -202,11 +202,12 @@ pub const Pty = struct {
             // Software GL by default: without a GPU device the EGL
             // probe can crash GL apps at startup, and llvmpipe renders
             // into shm, exactly what the pixel pipeline ships. The
-            // compositor DOES speak linux-dmabuf (LINEAR-only, CPU-
-            // mapped import) — opts.gpu (per session) or
+            // compositor DOES speak linux-dmabuf: LINEAR buffers use
+            // CPU mmap, modifiers use runtime EGL/GLES readback.
+            // opts.gpu (per session) or
             // SKETERM_MUX_DMABUF=1 (daemon-wide) drops this force so
-            // Mesa renders on the real GPU and presents linear
-            // dmabufs. SKETERM_MUX_NO_SOFTGL=1 also opts out; an
+            // Mesa renders on the real GPU and presents dmabufs.
+            // SKETERM_MUX_NO_SOFTGL=1 also opts out; an
             // explicit user value is respected.
             if (!opts.gpu and
                 c.getenv("SKETERM_MUX_NO_SOFTGL") == null and

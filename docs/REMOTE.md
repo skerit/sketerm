@@ -126,9 +126,14 @@ is the compositor.
 
 Supported today: windows (resizable, titled, with the app's icon),
 keyboard + mouse, menus/popups, text clipboard both ways. Damage
-tracking + deflate keep buffer traffic reasonable over a network.
-Pixel transport is shm-only — software-rendered GL works (Mesa
-presents via shm), GPU-buffer (dmabuf) apps don't.
+tracking + zstd keep buffer traffic reasonable over a network.
+Pixel transport accepts shm and opt-in linux-dmabuf (`--gpu`): LINEAR
+buffers use direct mmap, while tiled/modifier-backed buffers are
+imported through runtime-loaded EGL/GLES and normalized to BGRA before
+crossing the mux transport. Missing runtime GPU import support leaves
+the safe software/shm default unchanged. The current v3 path accepts
+ARGB8888/XRGB8888 plus modifier-defined auxiliary planes; importability
+still depends on the app and mux worker selecting compatible GPUs.
 `SKETERM_MUX_NO_WAYLAND=1` disables forwarding entirely.
 
 `sketerm app [-u] [-i] <host> <cmd>` is the one-shot form: it spawns

@@ -17,6 +17,8 @@ const log = @import("log.zig");
 const wire = @import("wire.zig");
 const wlwire = @import("../wlhost/wire.zig");
 const wltrack = @import("../wlhost/track.zig");
+const dmabuf = @import("../wlhost/dmabuf.zig");
+const dmabuf_egl = @import("dmabuf_egl.zig");
 const pulse = @import("pulse.zig");
 const opuscodec = @import("opuscodec.zig");
 const wavcap = @import("wavcap.zig");
@@ -99,8 +101,8 @@ pub const SpawnReq = struct {
     isolated: bool = false,
     /// GPU rendering for this session (`sketerm app --gpu`): skip the
     /// LIBGL_ALWAYS_SOFTWARE force and announce linux-dmabuf on the
-    /// session's compositor. Only useful where the exporting driver
-    /// allows CPU mmap of linear buffers.
+    /// session's compositor. LINEAR buffers use mmap; modifier-backed
+    /// buffers use runtime-loaded EGL/GLES when available.
     gpu: bool = false,
     /// Skip this session's PulseAudio hub (`launch_app audio:"none"`):
     /// PULSE_SERVER stays unset, so clients fall back to their own
@@ -563,7 +565,7 @@ pub fn removeTreeBestEffort(path: []const u8) void {
 ///
 /// Ownership split (proto v5): a NATIVE channel belongs to the
 /// SESSION — `client` is null, its unit stream broadcasts to every
-/// attached proto>=5 client, and it survives client death (durable
+/// attached proto>=6 client, and it survives client death (durable
 /// GUI apps; the daemon-side brain keeps answering the protocol). A
 /// winstream channel keeps the legacy 1:1 client binding.
 const Channel = struct {
@@ -580,6 +582,8 @@ const Channel = struct {
     /// Bytes from the client not yet written to fd (partial writes).
     pending: std.ArrayList(u8) = .empty,
     dead: bool = false,
+    /// A fatal Wayland error is queued; stop reading and close once written.
+    close_after_flush: bool = false,
     /// Non-null on a Wayland app channel: the app speaks raw Wayland
     /// to us and the byte stream toward the GUI is wlhost/pipe units.
     native: ?*Native = null,
@@ -609,15 +613,63 @@ const Channel = struct {
 /// Per-channel state of the sketerm-native app pipe: the session's
 /// app connects straight to the daemon. Owns the protocol tracker
 /// and the mmapped shm pool mirrors.
-/// DMA_BUF_IOCTL_SYNC bracket around CPU reads of a dmabuf mapping.
-/// Best-effort: memfd/udmabuf exporters answer ENOTTY (fine); real
-/// GPU exporters need it for cache coherency.
-fn dmabufSync(fd: c_int, end: bool) void {
+/// Brackets CPU reads, accepting ENOTTY from coherent memfd exporters.
+fn dmabufSync(fd: c_int, end: bool) bool {
     const DmaBufSync = extern struct { flags: u64 };
     const DMA_BUF_SYNC_READ: u64 = 1;
     const DMA_BUF_SYNC_END: u64 = 1 << 2;
     var s = DmaBufSync{ .flags = DMA_BUF_SYNC_READ | (if (end) DMA_BUF_SYNC_END else 0) };
-    _ = c.ioctl(fd, 0x40086200, &s); // DMA_BUF_IOCTL_SYNC = _IOW('b', 0, u64)
+    var retries: u8 = 0;
+    while (retries < 64) : (retries += 1) {
+        const result = c.ioctl(fd, 0x40086200, &s); // DMA_BUF_IOCTL_SYNC = _IOW('b', 0, u64)
+        if (result == 0 or std.posix.errno(result) == .NOTTY) return true;
+        const errno = std.posix.errno(result);
+        if (errno != .INTR and errno != .AGAIN) return false;
+    }
+    return false;
+}
+
+/// Copies padded dma-buf storage into a tight top-down staging image.
+fn copyDmabufRows(dst: []u8, src: []const u8, width: u32, height: u32, offset: u32, stride: u32, y_invert: bool) bool {
+    const row_bytes = std.math.mul(usize, width, 4) catch return false;
+    const staging_size = std.math.mul(usize, row_bytes, height) catch return false;
+    if (dst.len != staging_size or stride < row_bytes) return false;
+    for (0..height) |dst_row| {
+        const src_row = if (y_invert) height - 1 - dst_row else dst_row;
+        const src_start = std.math.add(
+            usize,
+            offset,
+            std.math.mul(usize, src_row, stride) catch return false,
+        ) catch return false;
+        const src_end = std.math.add(usize, src_start, row_bytes) catch return false;
+        if (src_end > src.len) return false;
+        @memcpy(dst[dst_row * row_bytes ..][0..row_bytes], src[src_start..src_end]);
+    }
+    return true;
+}
+
+test "dmabuf staging copy removes padding and honors Y_INVERT" {
+    const source = [_]u8{
+        99, 99,
+        1,  2,
+        3,  4,
+        5,  6,
+        7,  8,
+        90, 90,
+        11, 12,
+        13, 14,
+        15, 16,
+        17, 18,
+        91, 91,
+    };
+    var staging: [16]u8 = undefined;
+
+    try std.testing.expect(copyDmabufRows(&staging, &source, 2, 2, 2, 10, false));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18 }, &staging);
+
+    try std.testing.expect(copyDmabufRows(&staging, &source, 2, 2, 2, 10, true));
+    try std.testing.expectEqualSlices(u8, &.{ 11, 12, 13, 14, 15, 16, 17, 18, 1, 2, 3, 4, 5, 6, 7, 8 }, &staging);
+    try std.testing.expect(!copyDmabufRows(&staging, source[0..10], 2, 2, 2, 10, false));
 }
 
 const Native = struct {
@@ -661,12 +713,16 @@ const Native = struct {
     /// while old buffers still referenced it (Vulkan WSI destroys its
     /// probe pools early; the recycled id must not cross refcounts).
     orphan_pools: std.AutoHashMapUnmanaged(u64, PoolMirror) = .empty,
-    /// zwp_linux_buffer_params_v1 id → plane fd awaiting create_immed.
-    dmabuf_pending: std.AutoHashMapUnmanaged(u32, c_int) = .empty,
-    /// dmabuf wl_buffer id → CPU-mapped mirror (LINEAR-only import).
-    /// Shipped through the same pipe units as pools, under a
-    /// synthetic pool id equal to the buffer id.
-    dmabufs: std.AutoHashMapUnmanaged(u32, PoolMirror) = .empty,
+    /// zwp_linux_buffer_params_v1 id → owned plane fds awaiting create.
+    dmabuf_pending: std.AutoHashMapUnmanaged(u32, DmabufPending) = .empty,
+    /// Process-wide EGL importer borrowed from the daemon.
+    dmabuf_importer: ?*dmabuf_egl.Importer = null,
+    /// dmabuf wl_buffer id → source ownership plus committed tight pixels.
+    /// Replicas address the staging image by synthetic pool id == buffer id.
+    dmabufs: std.AutoHashMapUnmanaged(u32, DmabufMirror) = .empty,
+    /// Per-channel scratch keeps the previous LINEAR capture intact until
+    /// both DMA_BUF_SYNC brackets and the row copy have succeeded.
+    dmabuf_scratch: std.ArrayList(u8) = .empty,
     /// Per-surface lossy-video state (only populated under
     /// build_options.video): a churn tracker + a fixed-resolution
     /// encoder, keyed by surface id. Hot, photographic surfaces route
@@ -751,6 +807,84 @@ const Native = struct {
         }
     };
 
+    const PixelMirror = struct {
+        ptr: [*]u8,
+        size: usize,
+        shm: ?PoolMirror = null,
+    };
+
+    const DmabufPending = struct {
+        fds: [dmabuf.MAX_PLANES]c_int = .{-1} ** dmabuf.MAX_PLANES,
+
+        fn deinit(self: *DmabufPending) void {
+            for (&self.fds) |*fd| {
+                if (fd.* >= 0) _ = c.close(fd.*);
+                fd.* = -1;
+            }
+        }
+
+        fn takeFds(self: *DmabufPending) [dmabuf.MAX_PLANES]c_int {
+            const fds = self.fds;
+            self.fds = .{-1} ** dmabuf.MAX_PLANES;
+            return fds;
+        }
+    };
+
+    const DmabufMirror = struct {
+        allocator: std.mem.Allocator,
+        source_fds: [dmabuf.MAX_PLANES]c_int,
+        linear: ?LinearMap = null,
+        imported: ?dmabuf_egl.Buffer = null,
+        staging: []u8,
+        width: u32,
+        height: u32,
+        offset: u32,
+        stride: u32,
+        flags: u32,
+
+        const LinearMap = struct {
+            ptr: [*]u8,
+            size: usize,
+        };
+
+        fn deinit(self: *DmabufMirror) void {
+            if (self.imported) |*buffer| buffer.deinit();
+            if (self.linear) |mapping| _ = c.munmap(mapping.ptr, mapping.size);
+            for (&self.source_fds) |*fd| {
+                if (fd.* >= 0) _ = c.close(fd.*);
+                fd.* = -1;
+            }
+            self.allocator.free(self.staging);
+        }
+
+        fn capture(self: *DmabufMirror, scratch: *std.ArrayList(u8)) !void {
+            if (self.linear) |mapping| {
+                const fd = self.source_fds[0];
+                if (fd < 0) return error.MissingFd;
+                try scratch.resize(self.allocator, self.staging.len);
+                if (!dmabufSync(fd, false)) return error.SyncFailed;
+                const copied = copyDmabufRows(
+                    scratch.items,
+                    mapping.ptr[0..mapping.size],
+                    self.width,
+                    self.height,
+                    self.offset,
+                    self.stride,
+                    self.flags & dmabuf.FLAG_Y_INVERT != 0,
+                );
+                if (!dmabufSync(fd, true)) return error.SyncFailed;
+                if (!copied) return error.CaptureFailed;
+                @memcpy(self.staging, scratch.items);
+                return;
+            }
+            if (self.imported) |*buffer| {
+                if (!buffer.readPixels(self.staging)) return error.CaptureFailed;
+                return;
+            }
+            return error.CaptureFailed;
+        }
+    };
+
     /// Drop one buffer reference from an orphaned mirror; the last
     /// one frees it (orphans are destroyed by construction).
     fn releaseOrphan(nv: *Native, serial: u64) void {
@@ -782,13 +916,11 @@ const Native = struct {
         while (oit.next()) |p| p.unmap();
         self.orphan_pools.deinit(self.allocator);
         var dbit = self.dmabufs.valueIterator();
-        while (dbit.next()) |m| {
-            _ = c.munmap(m.ptr, m.size);
-            _ = c.close(m.fd);
-        }
+        while (dbit.next()) |m| m.deinit();
         self.dmabufs.deinit(self.allocator);
+        self.dmabuf_scratch.deinit(self.allocator);
         var dpit = self.dmabuf_pending.valueIterator();
-        while (dpit.next()) |fd| _ = c.close(fd.*);
+        while (dpit.next()) |pending| pending.deinit();
         self.dmabuf_pending.deinit(self.allocator);
         for (self.fds.items) |fd| _ = c.close(fd);
         self.fds.deinit(self.allocator);
@@ -985,6 +1117,12 @@ pub const Daemon = struct {
     /// the dir from `sock_path` ("") the way the monolith/broker does — the
     /// broker hands it the dir at fork time. null in monolith/broker.
     base_dir: ?[]u8 = null,
+    /// One EGL display/context owner per process. EGL displays are commonly
+    /// shared handles, so terminating a per-channel importer could invalidate
+    /// every other live app channel.
+    dmabuf_importer: ?dmabuf_egl.Importer = null,
+    dmabuf_capabilities: std.ArrayList(dmabuf.Capability) = .empty,
+    dmabuf_initialized: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, sock_path: []const u8) !*Daemon {
         const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/') orelse return error.BadPath;
@@ -1018,6 +1156,8 @@ pub const Daemon = struct {
         self.downloads.deinit(self.allocator);
         for (self.channels.items) |ch| ch.deinit();
         self.channels.deinit(self.allocator);
+        if (self.dmabuf_importer) |*importer| importer.deinit();
+        self.dmabuf_capabilities.deinit(self.allocator);
         for (self.clients.items) |cl| cl.deinit();
         self.clients.deinit(self.allocator);
         for (self.sessions.items) |s| s.deinit();
@@ -1178,7 +1318,7 @@ pub const Daemon = struct {
         const chan_base = fds.items.len;
         const n_channels_built = self.channels.items.len;
         for (self.channels.items) |ch| {
-            var ev: c_short = c.POLLIN;
+            var ev: c_short = if (ch.close_after_flush) 0 else c.POLLIN;
             if (ch.pending.items.len > 0) ev |= c.POLLOUT;
             try fds.append(self.allocator, .{
                 .fd = if (ch.dead) -1 else ch.fd,
@@ -1265,7 +1405,7 @@ pub const Daemon = struct {
             const ch = self.channels.items[i];
             const re = fds.items[chan_base + i].revents;
             if (ch.dead) continue;
-            if (re & c.POLLIN != 0) self.channelReadable(ch);
+            if (re & c.POLLIN != 0 and !ch.close_after_flush) self.channelReadable(ch);
             if (!ch.dead and re & c.POLLOUT != 0) self.channelWritable(ch);
             if (!ch.dead and re & (c.POLLHUP | c.POLLERR) != 0 and re & c.POLLIN == 0)
                 self.closeChannel(ch, true);
@@ -1412,7 +1552,7 @@ pub const Daemon = struct {
         log.info("client attached session='{s}' kind={s} proto={d} video={} (worker handoff)", .{ s.name, @tagName(kind), proto, video });
         self.queueSnapshot(cl, s);
         if (proto >= 2 and s.winstream != null) self.openWinstreamChan(s, cl);
-        if (proto >= 5) self.replayNativeChannels(cl, s);
+        if (proto >= wire.NATIVE_STATE_PROTO_VERSION) self.replayNativeChannels(cl, s);
         self.refreshVideoGates();
         self.broadcastPeerInfo(s);
     }
@@ -2706,7 +2846,7 @@ pub const Daemon = struct {
     }
 
     fn nativeViewer(cl: *const Client, s: *const Session) bool {
-        return cl.attached == s and !cl.dead and cl.proto >= 5;
+        return cl.attached == s and !cl.dead and cl.proto >= wire.NATIVE_STATE_PROTO_VERSION;
     }
 
     /// Per-viewer outbound backlog above which the native commit path
@@ -2731,7 +2871,7 @@ pub const Daemon = struct {
     }
 
     /// Should the commit path copy+encode this frame at all? True only
-    /// when some attached proto>=5 viewer has room in its wbuf. With
+    /// when some attached proto>=6 viewer has room in its wbuf. With
     /// no viewer, OR every viewer already backed up, skip: the units
     /// would only pile into a wbuf (growing toward the reap cap) for
     /// frames the viewer can't keep up with. This is what stops a
@@ -2767,6 +2907,52 @@ pub const Daemon = struct {
         return any;
     }
 
+    /// Initializes the process-wide importer once and always preserves the
+    /// direct-mmap LINEAR tuples alongside driver-reported modifiers.
+    fn dmabufCapabilities(self: *Daemon) []const dmabuf.Capability {
+        if (self.dmabuf_initialized)
+            return if (self.dmabuf_capabilities.items.len > 0)
+                self.dmabuf_capabilities.items
+            else
+                &dmabuf.linear_capabilities;
+        self.dmabuf_capabilities.ensureTotalCapacity(
+            self.allocator,
+            dmabuf.linear_capabilities.len,
+        ) catch return &dmabuf.linear_capabilities;
+        dmabuf.appendUnique(
+            self.allocator,
+            &self.dmabuf_capabilities,
+            &dmabuf.linear_capabilities,
+        ) catch return &dmabuf.linear_capabilities;
+        self.dmabuf_initialized = true;
+
+        // EGL vendors may own background threads and internal locks. A
+        // monolith can fork another PTY after this app connects, which makes
+        // child-side pre-exec work unsafe; workers never fork another session.
+        if (!self.isWorker()) {
+            log.info("dmabuf import: modifier path disabled outside an isolated worker", .{});
+            return self.dmabuf_capabilities.items;
+        }
+
+        if (dmabuf_egl.Importer.init(self.allocator)) |importer_value| {
+            var importer = importer_value;
+            self.dmabuf_capabilities.ensureTotalCapacity(
+                self.allocator,
+                self.dmabuf_capabilities.items.len + importer.capabilities().len,
+            ) catch {
+                importer.deinit();
+                return self.dmabuf_capabilities.items;
+            };
+            dmabuf.appendUnique(
+                self.allocator,
+                &self.dmabuf_capabilities,
+                importer.capabilities(),
+            ) catch unreachable;
+            self.dmabuf_importer = importer;
+        }
+        return self.dmabuf_capabilities.items;
+    }
+
     /// Bridge one accepted app connection as a session-owned channel.
     fn openAppChannel(self: *Daemon, s: *Session, fd: c_int) void {
         const native = self.allocator.create(Native) catch {
@@ -2794,12 +2980,19 @@ pub const Daemon = struct {
             return;
         };
         brain.keymap = s.kb_keymap;
-        // Opt-in (see get_registry): only useful where the exporting
-        // driver allows CPU mmap of linear buffers; the softgl force
-        // in pty.zig is dropped by the same switches. Per-session via
-        // SpawnReq.gpu (`sketerm app --gpu`), daemon-wide via env.
+        brain.materialize_dmabuf_pools = false;
+        // Opt-in (see get_registry); the softgl force in pty.zig is
+        // dropped by the same switches. Per-session via SpawnReq.gpu
+        // (`sketerm app --gpu`), daemon-wide via env.
         brain.advertise_dmabuf = s.gpu or c.getenv("SKETERM_MUX_DMABUF") != null;
         native.* = .{ .allocator = self.allocator, .tracker = tracker, .brain = brain };
+        if (brain.advertise_dmabuf) {
+            brain.dmabuf_capabilities = self.dmabufCapabilities();
+            if (self.dmabuf_importer) |*importer| {
+                native.dmabuf_importer = importer;
+                log.info("dmabuf import: EGL modifier path active ({d} capabilities including LINEAR)", .{brain.dmabuf_capabilities.len});
+            } else log.info("dmabuf import: LINEAR mmap path active", .{});
+        }
 
         const ch = self.allocator.create(Channel) catch {
             native.deinit();
@@ -2853,7 +3046,10 @@ pub const Daemon = struct {
     }
 
     fn channelWritable(self: *Daemon, ch: *Channel) void {
-        if (ch.pending.items.len == 0) return;
+        if (ch.pending.items.len == 0) {
+            if (ch.close_after_flush) self.closeChannel(ch, true);
+            return;
+        }
         const n_raw = if (ch.native != null and ch.native.?.out_fds.items.len > 0)
             self.writeWithFds(ch)
         else
@@ -2866,6 +3062,7 @@ pub const Daemon = struct {
         const remaining = ch.pending.items.len - n;
         std.mem.copyForwards(u8, ch.pending.items[0..remaining], ch.pending.items[n..]);
         ch.pending.shrinkRetainingCapacity(remaining);
+        if (remaining == 0 and ch.close_after_flush) self.closeChannel(ch, true);
     }
 
     /// sendmsg with the queued SCM_RIGHTS fds attached. Attaching
@@ -2988,7 +3185,8 @@ pub const Daemon = struct {
 
         var pos: usize = 0;
         var fail = false;
-        while (!fail) {
+        var close_after_flush = false;
+        while (!fail and !close_after_flush) {
             const avail = nv.inbuf.items[pos..];
             const mh = wlwire.parseHeader(avail) catch {
                 fail = true;
@@ -3002,8 +3200,11 @@ pub const Daemon = struct {
                 fail = true;
                 break;
             };
-            self.nativeAction(nv, &units, msgb, action) catch {
-                fail = true;
+            self.nativeAction(nv, &units, msgb, action) catch |err| {
+                if (err == error.CloseAfterFlush)
+                    close_after_flush = true
+                else
+                    fail = true;
                 break;
             };
             wlpipe.appendUnit(&brain_in, self.allocator, .wl_msg, msgb) catch {
@@ -3017,7 +3218,7 @@ pub const Daemon = struct {
             std.mem.copyForwards(u8, nv.inbuf.items[0..rem], nv.inbuf.items[pos..]);
             nv.inbuf.shrinkRetainingCapacity(rem);
         }
-        if (!fail and brain_in.items.len > 0) {
+        if (!fail and !close_after_flush and brain_in.items.len > 0) {
             nv.brain.now_ms = @truncate(@as(u64, @intCast(nowMs())));
             nv.brain.feed(brain_in.items) catch {
                 fail = true;
@@ -3026,6 +3227,7 @@ pub const Daemon = struct {
         }
         if (units.items.len > 0 and !ch.dead) self.queueUnits(ch, units.items);
         if (fail) self.closeChannel(ch, true);
+        if (close_after_flush and !ch.dead) self.channelWritable(ch);
     }
 
     /// Apply the brain's queued output (events toward the app,
@@ -3050,6 +3252,19 @@ pub const Daemon = struct {
     /// which queueUnits may split the stream into chan_data frames.
     const POOL_CHUNK: usize = 1 << 20;
 
+    /// Queues the protocol-defined fatal outcome for create_immed import
+    /// failure; the channel closes only after the client can read it.
+    fn queueDmabufProtocolError(nv: *Native, params: u32, code: u32, message: []const u8) !void {
+        const ch = nv.chan orelse return error.NoChannel;
+        var buf: [128]u8 = undefined;
+        var b = wlwire.Builder.init(&buf, 1, 0); // wl_display.error
+        b.putObject(params);
+        b.putUint(code);
+        b.putString(message);
+        try ch.pending.appendSlice(ch.allocator, try b.finish());
+        ch.close_after_flush = true;
+    }
+
     fn nativeAction(self: *Daemon, nv: *Native, units: *std.ArrayList(u8), msgb: []const u8, action: wltrack.Action) !void {
         const a = self.allocator;
         switch (action) {
@@ -3060,7 +3275,8 @@ pub const Daemon = struct {
             },
             .buffer_destroy => |bd| {
                 if (nv.dmabufs.fetchRemove(bd.id)) |kv| {
-                    kv.value.unmap();
+                    var mirror = kv.value;
+                    mirror.deinit();
                 } else if (nv.tracker.buffers.get(bd.id)) |info| {
                     // Last buffer of an already-destroyed shm pool:
                     // the mirror is finally reclaimable. The buffer's
@@ -3090,54 +3306,139 @@ pub const Daemon = struct {
             },
             .dmabuf_add => |da| {
                 // The fd rides the same SCM_RIGHTS queue as create_pool;
-                // pop it even for a rejected plane to stay aligned.
+                // every add consumes exactly one descriptor in arrival order.
                 const fd = nv.popFd() orelse return error.MissingFd;
-                if (!da.ok) {
+                if (da.plane >= dmabuf.MAX_PLANES) {
                     _ = c.close(fd);
-                } else {
-                    if (nv.dmabuf_pending.fetchRemove(da.params)) |old| _ = c.close(old.value);
-                    nv.dmabuf_pending.put(a, da.params, fd) catch {
-                        _ = c.close(fd);
-                        return error.MissingFd;
-                    };
+                    return error.BadPlane;
                 }
+                const gop = nv.dmabuf_pending.getOrPut(a, da.params) catch {
+                    _ = c.close(fd);
+                    return error.OutOfMemory;
+                };
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                const slot = &gop.value_ptr.fds[@intCast(da.plane)];
+                if (slot.* >= 0) {
+                    _ = c.close(fd);
+                    return error.DuplicatePlane;
+                }
+                slot.* = fd;
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
             },
             .dmabuf_create_failed => |dcf| {
                 // Non-immed create: the brain answers `failed` (client
-                // falls back to shm); just drop the pending fd.
-                if (nv.dmabuf_pending.fetchRemove(dcf.params)) |old| _ = c.close(old.value);
+                // falls back to shm); drop every pending plane.
+                if (nv.dmabuf_pending.fetchRemove(dcf.params)) |kv| {
+                    var pending = kv.value;
+                    pending.deinit();
+                }
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
             },
             .params_destroy => |pd| {
-                if (nv.dmabuf_pending.fetchRemove(pd.id)) |old| _ = c.close(old.value);
+                if (nv.dmabuf_pending.fetchRemove(pd.id)) |kv| {
+                    var pending = kv.value;
+                    pending.deinit();
+                }
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
             },
             .dmabuf_create => |dc| {
                 const kv = nv.dmabuf_pending.fetchRemove(dc.params) orelse return error.MissingFd;
-                const fd = kv.value;
-                errdefer _ = c.close(fd);
-                var st: c.struct_stat = undefined;
-                if (c.fstat(fd, &st) != 0) return error.MapFailed;
-                const need = @as(usize, dc.offset) + @as(usize, dc.stride) * @as(usize, @intCast(dc.height));
-                if (st.st_size <= 0 or @as(usize, @intCast(st.st_size)) < need) return error.BadSize;
-                const sz: usize = @intCast(st.st_size);
-                const ptr = c.mmap(null, sz, c.PROT_READ, c.MAP_SHARED, fd, 0);
-                if (ptr == null or ptr == c.MAP_FAILED) {
-                    // Exporter refuses CPU mapping (VRAM-placed or
-                    // NVIDIA buffers). create_immed has no per-buffer
-                    // failure signal, so degrade: the buffer exists
-                    // but ships no pixels (stale window; GTK's tiny
-                    // probe buffer is never attached at all). The
-                    // brain still releases it, so the app never hangs.
-                    log.warn("dmabuf mmap refused (errno {d}) — buffer {d} will not update; unset SKETERM_MUX_DMABUF for this driver", .{ @intFromEnum(std.posix.errno(@as(isize, -1))), dc.id });
-                    _ = c.close(fd);
-                    try wlpipe.appendUnit(units, a, .wl_msg, msgb);
-                    return;
+                var pending = kv.value;
+                defer pending.deinit();
+                if (nv.dmabufs.contains(dc.id)) return error.PoolIdCollision;
+                if (pending.fds[0] < 0) return error.MissingFd;
+
+                var source_size: ?u64 = null;
+                for (0..dc.info.plane_count) |plane_index| {
+                    const source_fd = pending.fds[plane_index];
+                    if (source_fd < 0) return error.MissingFd;
+                    var source_stat: c.struct_stat = undefined;
+                    if (c.fstat(source_fd, &source_stat) == 0 and source_stat.st_size > 0) {
+                        const size: u64 = @intCast(source_stat.st_size);
+                        if (plane_index == 0) source_size = size;
+                        if (size < dc.info.required_sizes[plane_index]) {
+                            try queueDmabufProtocolError(nv, dc.params, 6, "dma-buf plane is out of bounds");
+                            return error.CloseAfterFlush;
+                        }
+                    }
                 }
-                errdefer _ = c.munmap(@ptrCast(ptr.?), sz);
+                if (source_size) |size| {
+                    if (size < dc.info.required_size) {
+                        try queueDmabufProtocolError(nv, dc.params, 6, "dma-buf plane is out of bounds");
+                        return error.CloseAfterFlush;
+                    }
+                }
+
+                // A destroyed wl_shm_pool may retain storage for its old
+                // buffers after delete_id made the numeric id reusable.
+                if (nv.pools.getPtr(dc.id)) |old| {
+                    if (old.buffers > 0) {
+                        try nv.orphan_pools.put(a, old.serial, old.*);
+                    } else {
+                        old.unmap();
+                    }
+                    _ = nv.pools.remove(dc.id);
+                }
+
+                const tight_stride = std.math.mul(usize, dc.info.width, 4) catch return error.BadSize;
+                const staging_size = std.math.mul(usize, tight_stride, dc.info.height) catch return error.BadSize;
+                const staging = try a.alloc(u8, staging_size);
+                @memset(staging, 0);
+                var mirror = Native.DmabufMirror{
+                    .allocator = a,
+                    .source_fds = pending.takeFds(),
+                    .staging = staging,
+                    .width = dc.info.width,
+                    .height = dc.info.height,
+                    .offset = dc.info.plane.offset,
+                    .stride = dc.info.plane.stride,
+                    .flags = dc.info.flags,
+                };
+                var installed = false;
+                defer if (!installed) mirror.deinit();
+
+                if (dc.info.plane.modifier == dmabuf.DRM_FORMAT_MOD_LINEAR) {
+                    if (source_size != null) {
+                        const map_size: usize = @intCast(dc.info.required_size);
+                        const ptr = c.mmap(null, map_size, c.PROT_READ, c.MAP_SHARED, mirror.source_fds[0], 0);
+                        if (ptr != null and ptr != c.MAP_FAILED)
+                            mirror.linear = .{ .ptr = @ptrCast(ptr.?), .size = map_size };
+                    }
+                }
+
+                if (mirror.linear == null) {
+                    const importer = nv.dmabuf_importer orelse {
+                        try queueDmabufProtocolError(nv, dc.params, 7, "dma-buf import failed");
+                        return error.CloseAfterFlush;
+                    };
+                    var planes: [dmabuf.MAX_PLANES]dmabuf_egl.Plane = undefined;
+                    for (0..dc.info.plane_count) |plane_index| {
+                        const plane = dc.info.planes[plane_index].?;
+                        planes[plane_index] = .{
+                            .fd = mirror.source_fds[plane_index],
+                            .offset = plane.offset,
+                            .stride = plane.stride,
+                            .modifier = plane.modifier,
+                        };
+                    }
+                    mirror.imported = importer.importBuffer(.{
+                        .width = dc.info.width,
+                        .height = dc.info.height,
+                        .format = dc.info.format,
+                        .flags = dc.info.flags,
+                        .planes = planes[0..dc.info.plane_count],
+                    }) orelse {
+                        try queueDmabufProtocolError(nv, dc.params, 7, "dma-buf import failed");
+                        return error.CloseAfterFlush;
+                    };
+                    log.debug("dmabuf buffer {d}: EGL modifier import active (modifier=0x{x})", .{ dc.id, dc.info.plane.modifier });
+                } else {
+                    log.debug("dmabuf buffer {d}: LINEAR mmap active", .{dc.id});
+                }
+
+                try nv.dmabufs.put(a, dc.id, mirror);
+                installed = true;
                 try wlpipe.appendUnit(units, a, .wl_msg, msgb);
-                try nv.dmabufs.put(a, dc.id, .{ .fd = fd, .ptr = @ptrCast(ptr.?), .size = sz });
             },
             .clip_receive => |cr| {
                 // App wants to paste: hold the write-end (tagged with
@@ -3162,6 +3463,7 @@ pub const Daemon = struct {
             .pool_create => |p| {
                 const fd = nv.popFd() orelse return error.MissingFd;
                 errdefer _ = c.close(fd);
+                if (nv.dmabufs.contains(p.id)) return error.PoolIdCollision;
                 if (p.size <= 0) return error.BadSize;
                 const sz: usize = @intCast(p.size);
                 const ptr = c.mmap(null, sz, c.PROT_READ, c.MAP_SHARED, fd, 0);
@@ -3231,16 +3533,36 @@ pub const Daemon = struct {
                 }
             },
             .commit => |cm| {
+                // A dmabuf is safe to reread only when this commit consumes
+                // a new attach. After release, a no-attach commit cannot
+                // authorize access to storage the producer may have reused.
+                if (cm.info.dmabuf and !cm.attached_now) {
+                    try wlpipe.appendUnit(units, a, .wl_msg, msgb);
+                    return;
+                }
+                // Capture every dmabuf before the request reaches the
+                // brain: commit may immediately produce wl_buffer.release,
+                // after which the producer may overwrite the source.
+                var dmabuf_mirror: ?*Native.DmabufMirror = null;
+                if (cm.info.dmabuf) {
+                    const mirror = nv.dmabufs.getPtr(cm.buffer) orelse return error.NoSuchBuffer;
+                    mirror.capture(&nv.dmabuf_scratch) catch |err| {
+                        // A successfully-created wl_buffer must not become a
+                        // protocol error after a later import/readback failure.
+                        // Keep its last capture and still commit/release it.
+                        log.warn("dmabuf buffer {d}: capture failed ({s}); retaining previous pixels", .{ cm.buffer, @errorName(err) });
+                    };
+                    dmabuf_mirror = mirror;
+                }
+
                 // Copy the damaged rows (full buffer when the client
-                // never declares damage). Rows are contiguous in the
-                // pool, so the range is one linear copy. A dmabuf
-                // buffer reads from its CPU mapping instead, bracketed
-                // by DMA_BUF_SYNC for coherency with the GPU.
+                // never declares damage). Rows are contiguous in shm;
+                // dmabufs expose the same layout through tight staging.
                 //
                 // Skip the whole pixel copy+encode when no client is
                 // watching this session: the units would be dropped by
                 // queueUnits anyway, and a reattaching viewer gets the
-                // live mirror re-encoded by replayNativeChannels. Saves
+                // committed mirror re-encoded by replayNativeChannels. Saves
                 // a headless daemon (MCP running an animated app) from
                 // burning CPU zstd-encoding frames for nobody.
                 //
@@ -3253,23 +3575,22 @@ pub const Daemon = struct {
                 // the orphan mirror, which holds the live bytes.
                 var pix_state: u8 = 1; // shipping
                 var orphan_route = false;
-                const mirror_opt: ?Native.PoolMirror = blk: {
+                const mirror_opt: ?Native.PixelMirror = blk: {
                     if (!self.hasNativeViewer(nv)) {
                         pix_state = 2;
                         break :blk null;
                     }
                     if (cm.info.dmabuf) {
-                        if (nv.dmabufs.get(cm.buffer)) |m| break :blk m;
-                        pix_state = 4;
-                        break :blk null;
+                        const m = dmabuf_mirror.?;
+                        break :blk .{ .ptr = m.staging.ptr, .size = m.staging.len };
                     }
                     if (nv.pools.get(cm.info.pool)) |m| {
-                        if (m.serial == cm.info.serial) break :blk m;
+                        if (m.serial == cm.info.serial) break :blk .{ .ptr = m.ptr, .size = m.size, .shm = m };
                     }
                     if (nv.orphan_pools.get(cm.info.serial)) |m| {
                         pix_state = 3;
                         orphan_route = true;
-                        break :blk m;
+                        break :blk .{ .ptr = m.ptr, .size = m.size, .shm = m };
                     }
                     pix_state = 4;
                     break :blk null;
@@ -3322,13 +3643,11 @@ pub const Daemon = struct {
                             var did_video = false;
                             if (comptime build_options.video) {
                                 // The video path is pool-id addressed;
-                                // orphan commits stay lossless+serial.
+                                // orphan and dmabuf commits stay lossless.
                                 if (!cm.info.dmabuf and !orphan_route)
-                                    did_video = nv.videoCommit(units, a, cm, mirror, y0, y1) catch false;
+                                    did_video = nv.videoCommit(units, a, cm, mirror.shm.?, y0, y1) catch false;
                             }
                             if (!did_video) {
-                                if (cm.info.dmabuf) dmabufSync(mirror.fd, false);
-                                defer if (cm.info.dmabuf) dmabufSync(mirror.fd, true);
                                 // Chunk by WHOLE ROWS so each chunk starts at
                                 // column 0 — the pixcodec predictor resets per
                                 // row, and arbitrary byte cuts would misalign it.
@@ -3368,7 +3687,7 @@ pub const Daemon = struct {
     /// Ship a unit stream to the channel's viewers, split into
     /// chan_data frames well below MAX_FRAME (units may split across
     /// frames — pipe.zig receivers reassemble). Native channels
-    /// broadcast to every attached proto>=5 client; winstream keeps
+    /// broadcast to every attached proto>=6 client; winstream keeps
     /// its 1:1 client.
     fn queueUnits(self: *Daemon, ch: *Channel, bytes: []const u8) void {
         if (ch.native != null) {
@@ -3740,6 +4059,10 @@ pub const Daemon = struct {
 
     fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         if (self.is_broker) return self.brokerSpawn(cl, payload);
+        if (self.isWorker()) {
+            cl.queueErr("session workers cannot spawn another session");
+            return;
+        }
         var parsed = std.json.parseFromSlice(SpawnReq, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {
@@ -4432,7 +4755,7 @@ pub const Daemon = struct {
         }
         self.queueSnapshot(cl, s);
         if (cl.proto >= 2 and s.winstream != null) self.openWinstreamChan(s, cl);
-        if (cl.proto >= 5) self.replayNativeChannels(cl, s);
+        if (cl.proto >= wire.NATIVE_STATE_PROTO_VERSION) self.replayNativeChannels(cl, s);
         self.refreshVideoGates();
         self.broadcastPeerInfo(s);
     }
@@ -4459,7 +4782,7 @@ pub const Daemon = struct {
         }
     }
 
-    /// A proto>=5 client just attached: for every live native app
+    /// A proto>=6 client just attached: for every live native app
     /// channel on `s`, announce the channel and rebuild its replica —
     /// current pool bytes from the mirrors, then the brain's
     /// serialized protocol state. Windows reappear with current
@@ -4560,22 +4883,26 @@ pub const Daemon = struct {
             }
             // Dmabuf mirrors replay as their synthetic pools (pool id
             // == buffer id) so a reattaching replica has pixels for
-            // the restored buffers.
+            // the restored buffers. Staging is the last pre-release
+            // capture; replay must never touch the producer's source.
             if (ok) {
                 var dit = nv.dmabufs.iterator();
                 while (dit.next()) |e| {
                     const pool_id = e.key_ptr.*;
                     const mirror = e.value_ptr.*;
-                    wlpipe.appendPoolMeta(&units, self.allocator, .pool_create, pool_id, @intCast(mirror.size)) catch {
+                    if (nv.pools.contains(pool_id)) {
+                        log.warn("dmabuf synthetic pool {d} collides with a live shm pool", .{pool_id});
+                        ok = false;
+                        break;
+                    }
+                    wlpipe.appendPoolMeta(&units, self.allocator, .pool_create, pool_id, @intCast(mirror.staging.len)) catch {
                         ok = false;
                         break;
                     };
-                    dmabufSync(mirror.fd, false);
-                    defer dmabufSync(mirror.fd, true);
                     var off: usize = 0;
-                    while (off < mirror.size) {
-                        const len = @min(POOL_CHUNK, mirror.size - off);
-                        const raw = mirror.ptr[off..][0..len];
+                    while (off < mirror.staging.len) {
+                        const len = @min(POOL_CHUNK, mirror.staging.len - off);
+                        const raw = mirror.staging[off..][0..len];
                         var sc: wlpixcodec.Scratch = .{};
                         defer sc.deinit(self.allocator);
                         const enc = wlpixcodec.encodeRegion(&sc, self.allocator, raw, len) catch

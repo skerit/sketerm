@@ -23,6 +23,7 @@
 const std = @import("std");
 const wire = @import("wire.zig");
 const protocol = @import("protocol.zig");
+const dmabuf = @import("dmabuf.zig");
 const pipe = @import("pipe.zig");
 const pixcodec = @import("pixcodec.zig");
 const vcodec = @import("vcodec.zig");
@@ -257,11 +258,9 @@ const globals = [_]Global{
     // gesture objects never fire (no gestures detected — legal).
     .{ .name = 19, .iface = &protocol.zwp_idle_inhibit_manager_v1, .version = 1 },
     .{ .name = 20, .iface = &protocol.zwp_pointer_gestures_v1, .version = 3 },
-    // linux-dmabuf v3 (v4 needs a main DRM device we don't have):
-    // LINEAR-only XRGB/ARGB — the daemon mmaps the plane fd and ships
-    // pixels exactly like an shm pool (no GPU libraries anywhere).
-    // GPU clients render natively and blit linear; import failure
-    // falls back to shm via `failed`.
+    // linux-dmabuf v3 (v4 needs a main DRM device we don't have).
+    // Format/modifier announcements come from the daemon importer's
+    // capability slice; replicas restore the synthetic CPU pixels.
     .{ .name = 22, .iface = &protocol.zwp_linux_dmabuf_v1, .version = 3 },
     // xdg-output: wl_output's LOGICAL geometry. SDL probes for it and
     // logs a scary "protocol missing: disabling" without it.
@@ -303,10 +302,6 @@ const Buffer = struct {
     /// (0 = unresolvable, e.g. restored from a pre-v4 state_sync).
     pool_serial: u64 = 0,
 };
-
-/// Plane-0 layout of a zwp_linux_buffer_params_v1 between add and
-/// create_immed. ok = single plane with the LINEAR modifier.
-const DmabufP = struct { offset: u32 = 0, stride: u32 = 0, ok: bool = false };
 
 const Surface = struct {
     /// Pending (attach happened since last commit). 0 with
@@ -460,7 +455,7 @@ pub const Compositor = struct {
     /// Dmabuf params negotiation state; a completed create_immed
     /// turns into a plain Buffer whose pool is the buffer's own id
     /// (a synthetic pool the pipe units fill like any shm pool).
-    dmabuf_params: std.AutoHashMapUnmanaged(u32, DmabufP) = .empty,
+    dmabuf_params: std.AutoHashMapUnmanaged(u32, dmabuf.Params) = .empty,
     surfaces: std.AutoHashMapUnmanaged(u32, Surface) = .empty,
     /// xdg_surface id → wl_surface id; xdg_toplevel id → wl_surface id.
     xdg_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
@@ -550,6 +545,12 @@ pub const Compositor = struct {
     /// false (their announcements are discarded, and binds validate
     /// against the static table regardless).
     advertise_dmabuf: bool = false,
+    /// Format/modifier pairs announced at bind and accepted by the
+    /// authoritative brain. Replicas deliberately ignore this policy.
+    dmabuf_capabilities: []const dmabuf.Capability = &dmabuf.linear_capabilities,
+    /// The daemon brain tracks pool identity but has no pixel consumer;
+    /// replicas retain the default and allocate their renderable copy.
+    materialize_dmabuf_pools: bool = true,
     /// Compiled xkb keymap announced to the app's keyboards. Must
     /// match whoever drives the seat (see keymaps.zig).
     keymap: []const u8 = us_keymap,
@@ -1492,12 +1493,9 @@ pub const Compositor = struct {
                 const reg = (try it.next()).?.new_id;
                 try self.register(reg, &protocol.wl_registry);
                 for (globals) |g| {
-                    // dmabuf is announce-gated (SKETERM_MUX_DMABUF):
-                    // drivers that refuse CPU mmap can't degrade
-                    // per-buffer under create_immed, so the safe
-                    // default keeps clients on shm. Binds stay
-                    // table-validated either way (replicas re-parse
-                    // them; their announcements are discarded).
+                    // dmabuf is announce-gated (SKETERM_MUX_DMABUF).
+                    // Replicas re-parse the authoritative request
+                    // stream but discard their own announcements.
                     if (g.iface == &protocol.zwp_linux_dmabuf_v1 and !self.advertise_dmabuf)
                         continue;
                     var buf: [64]u8 = undefined;
@@ -1518,6 +1516,12 @@ pub const Compositor = struct {
             const g = for (globals) |g| {
                 if (g.name == name) break g;
             } else return Error.Protocol;
+            // Reject clients guessing the stable dmabuf global name
+            // when it was not advertised. Replicas still need to parse
+            // that authoritative bind from the replayed request stream.
+            if (g.iface == &protocol.zwp_linux_dmabuf_v1 and
+                !self.advertise_dmabuf and !self.lenient)
+                return Error.Protocol;
             if (!std.mem.eql(u8, g.iface.name, iname) or ver == 0 or ver > g.version) {
                 std.debug.print("wlhost: bad bind {s} v{d} (advertised {s} v{d})\n", .{ iname, ver, g.iface.name, g.version });
                 return Error.Protocol;
@@ -1714,15 +1718,25 @@ pub const Compositor = struct {
                 const mod_hi = (try it.next()).?.uint;
                 const mod_lo = (try it.next()).?.uint;
                 const p = self.dmabuf_params.getPtr(hdr.object) orelse return Error.Protocol;
-                if (plane == 0) {
-                    p.* = .{
-                        .offset = offset,
-                        .stride = stride,
-                        .ok = (@as(u64, mod_hi) << 32 | mod_lo) == protocol.DRM_FORMAT_MOD_LINEAR,
-                    };
-                } else p.ok = false;
+                p.add(plane, .{
+                    .offset = offset,
+                    .stride = stride,
+                    .modifier = @as(u64, mod_hi) << 32 | mod_lo,
+                }) catch return Error.Protocol;
             },
             2 => { // create (non-immed) — declined: failed → shm fallback
+                const width = (try it.next()).?.int;
+                const height = (try it.next()).?.int;
+                const format = (try it.next()).?.uint;
+                const flags = (try it.next()).?.uint;
+                const p = self.dmabuf_params.getPtr(hdr.object) orelse return Error.Protocol;
+                const info = p.create(width, height, format, flags) catch return Error.Protocol;
+                if (!self.lenient and !dmabuf.contains(
+                    self.dmabuf_capabilities,
+                    info.format,
+                    info.plane.modifier,
+                )) return Error.Protocol;
+                _ = self.dmabuf_params.remove(hdr.object);
                 var buf: [8]u8 = undefined;
                 var b = wire.Builder.init(&buf, hdr.object, 1); // failed
                 try self.send(try b.finish());
@@ -1733,27 +1747,35 @@ pub const Compositor = struct {
                 const height = (try it.next()).?.int;
                 const format = (try it.next()).?.uint;
                 const flags = (try it.next()).?.uint;
-                const p = self.dmabuf_params.get(hdr.object) orelse return Error.Protocol;
-                const shm_format: u32 = switch (format) {
-                    protocol.DRM_FORMAT_ARGB8888 => 0,
-                    protocol.DRM_FORMAT_XRGB8888 => 1,
-                    else => return Error.Protocol,
-                };
-                if (!p.ok or flags != 0 or width <= 0 or height <= 0 or
-                    @as(u64, p.stride) < @as(u64, @intCast(width)) * 4)
+                const p = self.dmabuf_params.getPtr(hdr.object) orelse return Error.Protocol;
+                const info = p.create(width, height, format, flags) catch return Error.Protocol;
+                if (!self.lenient and !dmabuf.contains(
+                    self.dmabuf_capabilities,
+                    info.format,
+                    info.plane.modifier,
+                )) return Error.Protocol;
+                const shm_format = dmabuf.shmFormat(info.format) orelse return Error.Protocol;
+                const tight_stride_u64 = std.math.mul(u64, info.width, 4) catch return Error.Protocol;
+                const pool_size_u64 = std.math.mul(u64, tight_stride_u64, info.height) catch return Error.Protocol;
+                if (pool_size_u64 > dmabuf.MAX_BUFFER_BYTES or
+                    pool_size_u64 > std.math.maxInt(usize) or
+                    tight_stride_u64 > std.math.maxInt(i32))
                     return Error.Protocol;
+                _ = self.dmabuf_params.remove(hdr.object);
                 try self.register(id, &protocol.wl_buffer);
-                // Synthetic pool, laid out exactly like the mapped
-                // dmabuf so the daemon's pool_update offsets line up.
-                const pool_size = @as(usize, p.offset) + @as(usize, p.stride) * @as(usize, @intCast(height));
-                const pool = try self.freshPool(id, pool_size);
+                // The daemon importer normalizes source offset/stride
+                // into a tight synthetic CPU pool for every replica.
+                const pool = try self.freshPool(
+                    id,
+                    if (self.materialize_dmabuf_pools) @intCast(pool_size_u64) else 0,
+                );
                 pool.buffers = 1;
                 try self.buffers.put(self.allocator, id, .{
                     .pool = id,
-                    .offset = @intCast(p.offset),
+                    .offset = 0,
                     .width = width,
                     .height = height,
-                    .stride = @intCast(p.stride),
+                    .stride = @intCast(tight_stride_u64),
                     .format = shm_format,
                     .pool_serial = pool.serial,
                 });
@@ -2911,19 +2933,35 @@ pub const Compositor = struct {
                 try self.send(try b.finish());
             }
         } else if (iface == &protocol.zwp_linux_dmabuf_v1) {
-            for ([_]u32{ protocol.DRM_FORMAT_ARGB8888, protocol.DRM_FORMAT_XRGB8888 }) |fmt| {
-                var fbuf: [16]u8 = undefined;
-                var fb = wire.Builder.init(&fbuf, id, 0); // format (legacy)
-                fb.putUint(fmt);
-                try self.send(try fb.finish());
-                if (ver >= 3) {
-                    var mbuf: [24]u8 = undefined;
-                    var mb = wire.Builder.init(&mbuf, id, 1); // modifier
-                    mb.putUint(fmt);
-                    mb.putUint(0); // LINEAR hi
-                    mb.putUint(0); // LINEAR lo
-                    try self.send(try mb.finish());
+            for (self.dmabuf_capabilities, 0..) |capability, i| {
+                if (ver < 3) {
+                    // Pre-v3 clients cannot name an explicit modifier.
+                    if (capability.modifier != dmabuf.DRM_FORMAT_MOD_INVALID) continue;
+                    var format_seen = false;
+                    for (self.dmabuf_capabilities[0..i]) |prior| {
+                        format_seen = format_seen or (prior.format == capability.format and
+                            prior.modifier == dmabuf.DRM_FORMAT_MOD_INVALID);
+                    }
+                    if (format_seen) continue;
+                    var fbuf: [16]u8 = undefined;
+                    var fb = wire.Builder.init(&fbuf, id, 0); // format (legacy)
+                    fb.putUint(capability.format);
+                    try self.send(try fb.finish());
+                    continue;
                 }
+
+                var pair_seen = false;
+                for (self.dmabuf_capabilities[0..i]) |prior| {
+                    pair_seen = pair_seen or (prior.format == capability.format and
+                        prior.modifier == capability.modifier);
+                }
+                if (pair_seen) continue;
+                var mbuf: [24]u8 = undefined;
+                var mb = wire.Builder.init(&mbuf, id, 1); // modifier
+                mb.putUint(capability.format);
+                mb.putUint(@truncate(capability.modifier >> 32));
+                mb.putUint(@truncate(capability.modifier));
+                try self.send(try mb.finish());
             }
         } else if (iface == &protocol.wl_seat) {
             var buf: [16]u8 = undefined;
@@ -3017,7 +3055,10 @@ pub const Compositor = struct {
     // it), 0 = it referenced a displaced incarnation whose bytes are
     // not replayed (the buffer restores unresolvable, never frees a
     // stranger's pool).
-    const state_sync_version: u8 = 6;
+    // v7 (mux protocol 6) stores all pending dmabuf planes, their
+    // modifiers, and the single-use bit; older snapshots carried only
+    // a LINEAR plane 0.
+    const state_sync_version: u8 = 7;
 
     fn putU8(out: *std.ArrayList(u8), a: std.mem.Allocator, v: u8) Error!void {
         try out.append(a, v);
@@ -3300,15 +3341,24 @@ pub const Compositor = struct {
             }
         }
 
-        // v3: in-flight dmabuf params (a replica attaching between
-        // add and create_immed must know plane-0 layout).
+        // v7: in-flight dmabuf params (a replica attaching between
+        // add and create_immed must retain full metadata and reuse state).
         try putU32(&out, a, self.dmabuf_params.count());
         var dpit = self.dmabuf_params.iterator();
         while (dpit.next()) |e| {
             try putU32(&out, a, e.key_ptr.*);
-            try putU32(&out, a, e.value_ptr.offset);
-            try putU32(&out, a, e.value_ptr.stride);
-            try putU8(&out, a, @intFromBool(e.value_ptr.ok));
+            try putU8(&out, a, @intFromBool(e.value_ptr.used));
+            for (e.value_ptr.planes) |plane_opt| {
+                const plane = plane_opt orelse {
+                    try putU8(&out, a, 0);
+                    continue;
+                };
+                try putU8(&out, a, 1);
+                try putU32(&out, a, plane.offset);
+                try putU32(&out, a, plane.stride);
+                try putU32(&out, a, @truncate(plane.modifier >> 32));
+                try putU32(&out, a, @truncate(plane.modifier));
+            }
         }
 
         return out.toOwnedSlice(a);
@@ -3567,10 +3617,32 @@ pub const Compositor = struct {
             const n_dp = try r.u32v();
             for (0..n_dp) |_| {
                 const id = try r.u32v();
-                var dp = DmabufP{};
-                dp.offset = try r.u32v();
-                dp.stride = try r.u32v();
-                dp.ok = try r.u8v() != 0;
+                var dp = dmabuf.Params{};
+                if (ver >= 7) {
+                    const used = try r.u8v() != 0;
+                    for (0..dmabuf.MAX_PLANES) |plane_index| {
+                        if (try r.u8v() == 0) continue;
+                        const offset = try r.u32v();
+                        const stride = try r.u32v();
+                        const mod_hi: u64 = try r.u32v();
+                        const mod_lo: u64 = try r.u32v();
+                        dp.add(@intCast(plane_index), .{
+                            .offset = offset,
+                            .stride = stride,
+                            .modifier = mod_hi << 32 | mod_lo,
+                        }) catch return Error.Protocol;
+                    }
+                    dp.used = used;
+                } else {
+                    const offset = try r.u32v();
+                    const stride = try r.u32v();
+                    const ok = try r.u8v() != 0;
+                    if (ok) dp.add(0, .{
+                        .offset = offset,
+                        .stride = stride,
+                        .modifier = dmabuf.DRM_FORMAT_MOD_LINEAR,
+                    }) catch return Error.Protocol;
+                }
                 try self.dmabuf_params.put(a, id, dp);
             }
         }
@@ -4007,6 +4079,15 @@ test "registry dance announces our globals" {
         pos += p.consumed;
     }
     try t.expectEqual(globals.len - 1, seen);
+
+    // An authoritative client cannot guess the stable global name.
+    var guessed = wire.Builder.init(&buf, 2, 0);
+    guessed.putUint(22);
+    guessed.putString("zwp_linux_dmabuf_v1");
+    guessed.putUint(3);
+    guessed.putNewId(3);
+    try req(&comp2, try guessed.finish());
+    try t.expect(comp2.dead);
 }
 
 test "subsurface: get_subsurface, set_position, destroy" {
@@ -6090,10 +6171,181 @@ test "host_drop: synthesized dnd delivers host data via drop_data" {
     try t.expect(!comp.dead);
 }
 
+test "linux-dmabuf announces configured modifiers without legacy overadvertisement" {
+    const custom_modifier: u64 = 0x0123_4567_89ab_cdef;
+    const capabilities = [_]dmabuf.Capability{
+        .{ .format = dmabuf.DRM_FORMAT_ARGB8888, .modifier = dmabuf.DRM_FORMAT_MOD_LINEAR },
+        .{ .format = dmabuf.DRM_FORMAT_ARGB8888, .modifier = custom_modifier },
+        .{ .format = dmabuf.DRM_FORMAT_XRGB8888, .modifier = dmabuf.DRM_FORMAT_MOD_INVALID },
+    };
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    comp.advertise_dmabuf = true;
+    comp.dmabuf_capabilities = &capabilities;
+
+    try getRegistry(&comp);
+    comp.clearOut();
+    try bindGlobal(&comp, 22, "zwp_linux_dmabuf_v1", 3, 3);
+
+    var formats: std.ArrayList(u32) = .empty;
+    defer formats.deinit(t.allocator);
+    var pairs: std.ArrayList([2]u64) = .empty;
+    defer pairs.deinit(t.allocator);
+    var pos: usize = 0;
+    const bytes = comp.takeOut();
+    while (try pipe.peelUnit(bytes[pos..])) |peeled| {
+        if (peeled.unit.tag == .wl_msg) {
+            const hdr = (try wire.parseHeader(peeled.unit.payload)).?;
+            const body = peeled.unit.payload[wire.header_size..hdr.size];
+            if (hdr.opcode == 0) {
+                var args = wire.ArgIter.init(body, "u");
+                try formats.append(t.allocator, (try args.next()).?.uint);
+            } else if (hdr.opcode == 1) {
+                var args = wire.ArgIter.init(body, "uuu");
+                const format = (try args.next()).?.uint;
+                const hi: u64 = (try args.next()).?.uint;
+                const lo: u64 = (try args.next()).?.uint;
+                try pairs.append(t.allocator, .{ format, hi << 32 | lo });
+            }
+        }
+        pos += peeled.consumed;
+    }
+    try t.expectEqual(@as(usize, 0), formats.items.len);
+    try t.expectEqualSlices([2]u64, &.{
+        .{ dmabuf.DRM_FORMAT_ARGB8888, dmabuf.DRM_FORMAT_MOD_LINEAR },
+        .{ dmabuf.DRM_FORMAT_ARGB8888, custom_modifier },
+        .{ dmabuf.DRM_FORMAT_XRGB8888, dmabuf.DRM_FORMAT_MOD_INVALID },
+    }, pairs.items);
+}
+
+test "linux-dmabuf legacy bind announces only implicit formats" {
+    const capabilities = [_]dmabuf.Capability{
+        .{ .format = dmabuf.DRM_FORMAT_ARGB8888, .modifier = dmabuf.DRM_FORMAT_MOD_LINEAR },
+        .{ .format = dmabuf.DRM_FORMAT_XRGB8888, .modifier = dmabuf.DRM_FORMAT_MOD_INVALID },
+    };
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    comp.advertise_dmabuf = true;
+    comp.dmabuf_capabilities = &capabilities;
+
+    try getRegistry(&comp);
+    comp.clearOut();
+    try bindGlobal(&comp, 22, "zwp_linux_dmabuf_v1", 2, 3);
+
+    var formats: std.ArrayList(u32) = .empty;
+    defer formats.deinit(t.allocator);
+    var pos: usize = 0;
+    const bytes = comp.takeOut();
+    while (try pipe.peelUnit(bytes[pos..])) |peeled| {
+        if (peeled.unit.tag == .wl_msg) {
+            const hdr = (try wire.parseHeader(peeled.unit.payload)).?;
+            if (hdr.opcode == 0) {
+                var args = wire.ArgIter.init(peeled.unit.payload[wire.header_size..hdr.size], "u");
+                try formats.append(t.allocator, (try args.next()).?.uint);
+            }
+        }
+        pos += peeled.consumed;
+    }
+    try t.expectEqualSlices(u32, &.{dmabuf.DRM_FORMAT_XRGB8888}, formats.items);
+}
+
+test "linux-dmabuf lenient replay accepts modifiers and restores tight pools" {
+    const custom_modifier: u64 = 0x0123_4567_89ab_cdef;
+    var tv = TestView{};
+    var brain = try Compositor.init(t.allocator, tv.view());
+    defer brain.deinit();
+    brain.advertise_dmabuf = true;
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&brain);
+    try bindGlobal(&brain, 22, "zwp_linux_dmabuf_v1", 3, 3);
+    { // create_params(4)
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putNewId(4);
+        try req(&brain, try b.finish());
+    }
+    { // padded source: plane 0, offset 8, stride 16, custom modifier
+        var b = wire.Builder.init(&buf, 4, 1);
+        b.putUint(0);
+        b.putUint(8);
+        b.putUint(16);
+        b.putUint(@truncate(custom_modifier >> 32));
+        b.putUint(@truncate(custom_modifier));
+        try req(&brain, try b.finish());
+    }
+    const state = try brain.serializeState(t.allocator);
+    defer t.allocator.free(state);
+
+    var tv2 = TestView{};
+    var replica = try Compositor.init(t.allocator, tv2.view());
+    defer replica.deinit();
+    replica.lenient = true;
+    try replica.restoreState(state);
+    { // create_immed replays despite the replica's default LINEAR policy
+        var b = wire.Builder.init(&buf, 4, 3);
+        b.putNewId(5);
+        b.putInt(2);
+        b.putInt(2);
+        b.putUint(dmabuf.DRM_FORMAT_ARGB8888);
+        b.putUint(dmabuf.FLAG_Y_INVERT);
+        try req(&replica, try b.finish());
+    }
+    const info = replica.buffers.get(5).?;
+    try t.expectEqual(@as(i32, 0), info.offset);
+    try t.expectEqual(@as(i32, 8), info.stride);
+    try t.expectEqual(@as(u32, 0), info.format);
+    try t.expectEqual(@as(usize, 16), replica.pools.get(5).?.bytes.items.len);
+    try t.expect(!replica.dead);
+}
+
+test "linux-dmabuf authoritative create requires an announced capability" {
+    const custom_modifier: u64 = 77;
+    const capabilities = [_]dmabuf.Capability{
+        .{ .format = dmabuf.DRM_FORMAT_XRGB8888, .modifier = custom_modifier },
+    };
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    comp.advertise_dmabuf = true;
+    comp.dmabuf_capabilities = &capabilities;
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 22, "zwp_linux_dmabuf_v1", 3, 3);
+    {
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putNewId(4);
+        try req(&comp, try b.finish());
+    }
+    {
+        var b = wire.Builder.init(&buf, 4, 1);
+        b.putUint(0);
+        b.putUint(0);
+        b.putUint(8);
+        b.putUint(0);
+        b.putUint(0); // LINEAR was not announced
+        try req(&comp, try b.finish());
+    }
+    {
+        var b = wire.Builder.init(&buf, 4, 3);
+        b.putNewId(5);
+        b.putInt(2);
+        b.putInt(2);
+        b.putUint(dmabuf.DRM_FORMAT_XRGB8888);
+        b.putUint(0);
+        try req(&comp, try b.finish());
+    }
+    try t.expect(comp.dead);
+    try t.expect(comp.buffers.get(5) == null);
+}
+
 test "linux-dmabuf: modifiers at bind, create_immed pixels + release, create fails over to shm" {
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
     defer comp.deinit();
+    comp.advertise_dmabuf = true;
     var buf: [96]u8 = undefined;
 
     { // get_registry(2)
@@ -6113,10 +6365,10 @@ test "linux-dmabuf: modifiers at bind, create_immed pixels + release, create fai
     var evs: std.ArrayList([2]u32) = .empty;
     defer evs.deinit(t.allocator);
     try drainEvents(&comp, &evs);
-    // ARGB + XRGB, each as legacy format + LINEAR modifier.
+    // ARGB + XRGB, each as a LINEAR modifier tuple.
     const bind_expect = [_][2]u32{
-        .{ 3, 0 }, .{ 3, 1 },
-        .{ 3, 0 }, .{ 3, 1 },
+        .{ 3, 1 },
+        .{ 3, 1 },
     };
     try t.expectEqualSlices([2]u32, &bind_expect, evs.items);
 
@@ -6250,10 +6502,11 @@ test "linux-dmabuf: modifiers at bind, create_immed pixels + release, create fai
     try t.expect(comp.pools.get(10) == null);
 }
 
-test "state_sync v3: dmabuf buffer survives replica restore with pixels" {
+test "current state_sync: dmabuf buffer survives replica restore with pixels" {
     var tv = TestView{};
     var brain = try Compositor.init(t.allocator, tv.view());
     defer brain.deinit();
+    brain.advertise_dmabuf = true;
     var buf: [96]u8 = undefined;
 
     { // get_registry(2)
@@ -6345,6 +6598,62 @@ test "state_sync v3: dmabuf buffer survives replica restore with pixels" {
     try t.expectEqual(@as(usize, 1), tv2.frames);
     try t.expectEqual(@as(u8, 60), tv2.last_pixels[0]);
     try t.expect(!replica.dead);
+}
+
+test "pre-v7 state_sync restores legacy pending LINEAR dmabuf params" {
+    var tv = TestView{};
+    var brain = try Compositor.init(t.allocator, tv.view());
+    defer brain.deinit();
+    brain.advertise_dmabuf = true;
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&brain);
+    try bindGlobal(&brain, 22, "zwp_linux_dmabuf_v1", 3, 3);
+    { // create_params(4) + add a pending LINEAR plane
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putNewId(4);
+        try req(&brain, try b.finish());
+        var b2 = wire.Builder.init(&buf, 4, 1);
+        b2.putUint(0);
+        b2.putUint(12);
+        b2.putUint(64);
+        b2.putUint(0);
+        b2.putUint(0);
+        try req(&brain, try b2.finish());
+    }
+    const current = try brain.serializeState(t.allocator);
+    defer t.allocator.free(current);
+
+    // v7 tail: count + id + used + four presence bytes + plane-0 payload.
+    // v6 tail: count + id + offset + stride + ok.
+    const current_tail_len = 4 + 4 + 1 + dmabuf.MAX_PLANES + 16;
+    const legacy_tail_len = 4 + 4 + 4 + 4 + 1;
+    try t.expect(current.len > current_tail_len);
+    const prefix_len = current.len - current_tail_len;
+    const legacy = try t.allocator.alloc(u8, prefix_len + legacy_tail_len);
+    defer t.allocator.free(legacy);
+    @memcpy(legacy[0..prefix_len], current[0..prefix_len]);
+    legacy[0] = 6;
+    var pos = prefix_len;
+    std.mem.writeInt(u32, legacy[pos..][0..4], 1, .little);
+    pos += 4;
+    std.mem.writeInt(u32, legacy[pos..][0..4], 4, .little);
+    pos += 4;
+    std.mem.writeInt(u32, legacy[pos..][0..4], 12, .little);
+    pos += 4;
+    std.mem.writeInt(u32, legacy[pos..][0..4], 64, .little);
+    pos += 4;
+    legacy[pos] = 1;
+
+    var tv2 = TestView{};
+    var replica = try Compositor.init(t.allocator, tv2.view());
+    defer replica.deinit();
+    try replica.restoreState(legacy);
+    const params = replica.dmabuf_params.get(4).?;
+    try t.expect(!params.used);
+    try t.expectEqual(@as(u32, 12), params.planes[0].?.offset);
+    try t.expectEqual(@as(u32, 64), params.planes[0].?.stride);
+    try t.expectEqual(dmabuf.DRM_FORMAT_MOD_LINEAR, params.planes[0].?.modifier);
 }
 
 test "shm pool bytes reclaim only after pool destroy AND last buffer destroy" {
