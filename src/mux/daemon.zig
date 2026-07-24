@@ -1257,7 +1257,7 @@ const FsView = struct {
 /// transfers — the roadmap's core promise). kill = cancel,
 /// SIGSTOP/SIGCONT = pause/resume.
 const FsJob = struct {
-    const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, trash, trash_restore, cross_copy, panelize, live_find };
+    const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find };
     const State = enum { running, paused, done, failed, canceled };
 
     allocator: std.mem.Allocator,
@@ -1281,6 +1281,12 @@ const FsJob = struct {
     /// find/grep: total matches streamed + cap-truncation flag.
     matches: u64 = 0,
     truncated: bool = false,
+    /// Result paths from the DONE event (trash location + info file,
+    /// extracted member path) — forwarded to the owner.
+    done_path: [4096]u8 = undefined,
+    done_path_len: usize = 0,
+    done_text: [4096]u8 = undefined,
+    done_text_len: usize = 0,
     src: []u8,
     dst: []u8,
     pattern: []u8,
@@ -3079,7 +3085,8 @@ pub const Daemon = struct {
             std.mem.eql(u8, r.op, "grep") or std.mem.eql(u8, r.op, "extract") or
             std.mem.eql(u8, r.op, "archive_create") or std.mem.eql(u8, r.op, "trash") or
             std.mem.eql(u8, r.op, "trash_restore") or std.mem.eql(u8, r.op, "cross_copy") or
-            std.mem.eql(u8, r.op, "panelize") or std.mem.eql(u8, r.op, "live_find"))
+            std.mem.eql(u8, r.op, "panelize") or std.mem.eql(u8, r.op, "live_find") or
+            std.mem.eql(u8, r.op, "archive_list") or std.mem.eql(u8, r.op, "archive_extract"))
             return self.fsStartJob(cl, r);
 
         if (std.mem.eql(u8, r.op, "open_view")) {
@@ -3092,6 +3099,19 @@ pub const Daemon = struct {
             self.fsRead(cl, r);
         } else if (std.mem.eql(u8, r.op, "apps")) {
             self.fsApps(cl, r);
+        } else if (std.mem.eql(u8, r.op, "homedir")) {
+            // Host identity for cache placement: thumbnails belong to
+            // the machine that owns the files.
+            var cache_buf: [4096]u8 = undefined;
+            const home: []const u8 = if (c.getenv("HOME")) |h|
+                std.mem.span(@as([*:0]const u8, @ptrCast(h)))
+            else
+                "/";
+            const cache: []const u8 = if (c.getenv("XDG_CACHE_HOME")) |xc|
+                std.mem.span(@as([*:0]const u8, @ptrCast(xc)))
+            else
+                std.fmt.bufPrint(&cache_buf, "{s}/.cache", .{home}) catch "/tmp";
+            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .home = home, .cache = cache });
         } else if (std.mem.eql(u8, r.op, "mkdir")) {
             var z: [4096]u8 = undefined;
             const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
@@ -3642,6 +3662,10 @@ pub const Daemon = struct {
             .extract
         else if (std.mem.eql(u8, r.op, "archive_create"))
             .archive_create
+        else if (std.mem.eql(u8, r.op, "archive_list"))
+            .archive_list
+        else if (std.mem.eql(u8, r.op, "archive_extract"))
+            .archive_extract
         else if (std.mem.eql(u8, r.op, "trash"))
             .trash
         else if (std.mem.eql(u8, r.op, "trash_restore"))
@@ -3998,6 +4022,8 @@ pub const Daemon = struct {
             .message = job.message[0..job.message_len],
             .matches = job.matches,
             .truncated = job.truncated,
+            .path = job.done_path[0..job.done_path_len],
+            .text = job.done_text[0..job.done_text_len],
         });
     }
 
@@ -4071,6 +4097,10 @@ pub const Daemon = struct {
                 @memcpy(&job.hash_hex, e.hash[0..64]);
                 job.has_hash = true;
             }
+            job.done_path_len = @min(e.path.len, job.done_path.len);
+            @memcpy(job.done_path[0..job.done_path_len], e.path[0..job.done_path_len]);
+            job.done_text_len = @min(e.text.len, job.done_text.len);
+            @memcpy(job.done_text[0..job.done_text_len], e.text[0..job.done_text_len]);
             self.fsJobEmit(job, "done");
             self.journalFsJob(job);
         } else if (std.mem.eql(u8, e.ev, "error")) {

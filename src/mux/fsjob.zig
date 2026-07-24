@@ -142,6 +142,10 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
         runExtract(spec)
     else if (std.mem.eql(u8, spec.op, "archive_create"))
         runArchiveCreate(spec)
+    else if (std.mem.eql(u8, spec.op, "archive_list"))
+        runArchiveList(spec)
+    else if (std.mem.eql(u8, spec.op, "archive_extract"))
+        runArchiveExtractMember(spec)
     else if (std.mem.eql(u8, spec.op, "trash"))
         runTrash(spec)
     else if (std.mem.eql(u8, spec.op, "trash_restore"))
@@ -265,6 +269,102 @@ fn runExtract(spec: Spec) u8 {
     };
     if (!runArgv(&argv)) return emitError("archive extraction failed (bsdtar required)");
     emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1) });
+    return 0;
+}
+
+/// Stream an archive's member list as match events (bsdtar handles
+/// tar/tar.*/zip/7z alike). Only the member table crosses the wire.
+fn runArchiveList(spec: Spec) u8 {
+    var az: [4096:0]u8 = undefined;
+    const ap = std.fmt.bufPrintZ(&az, "{s}", .{spec.src}) catch return emitError("archive path too long");
+    var pipefd: [2]c_int = undefined;
+    if (c.pipe(&pipefd) != 0) return emitErrno("pipe");
+    const pid = c.fork();
+    if (pid < 0) return emitErrno("fork");
+    if (pid == 0) {
+        _ = c.dup2(pipefd[1], 1);
+        _ = c.close(pipefd[0]);
+        _ = c.close(pipefd[1]);
+        const argv = [_:null]?[*:0]const u8{ "bsdtar", "-tf", ap.ptr, null };
+        _ = c.execvp("bsdtar", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    _ = c.close(pipefd[1]);
+    var line: [4096]u8 = undefined;
+    var len: usize = 0;
+    var matches: u64 = 0;
+    var truncated = false;
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = c.read(pipefd[0], &buf, buf.len);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        if (n <= 0) break;
+        for (buf[0..@intCast(n)]) |ch| {
+            if (ch == '\n') {
+                if (len > 0 and matches < MAX_MATCHES) {
+                    const member = line[0..len];
+                    const is_dir = member[member.len - 1] == '/';
+                    emit(.{
+                        .ev = "match",
+                        .path = if (is_dir) member[0 .. member.len - 1] else member,
+                        .kind = if (is_dir) "dir" else "file",
+                        .size = @as(u64, 0),
+                    });
+                    matches += 1;
+                } else if (len > 0) {
+                    truncated = true;
+                }
+                len = 0;
+            } else if (len < line.len) {
+                line[len] = ch;
+                len += 1;
+            }
+        }
+    }
+    _ = c.close(pipefd[0]);
+    var wstatus: c_int = 0;
+    _ = c.waitpid(pid, &wstatus, 0);
+    if (matches == 0 and (wstatus != 0)) return emitError("cannot list archive (bsdtar required)");
+    emit(.{ .ev = "done", .done = matches, .total = matches, .matches = matches, .truncated = truncated });
+    return 0;
+}
+
+/// Extract ONE member host-side (into `dst`, or a fresh private tmp
+/// dir) and report the extracted path in the done event.
+fn runArchiveExtractMember(spec: Spec) u8 {
+    const member = spec.pattern;
+    if (member.len == 0) return emitError("archive_extract needs a member");
+    if (unsafeArchiveMember(member)) return emitError("unsafe archive member path");
+    var dir_buf: [4096]u8 = undefined;
+    var dir: []const u8 = undefined;
+    if (spec.dst.len > 0) {
+        dir = spec.dst;
+        var dz: [4096]u8 = undefined;
+        const dp = pathz.pathZ(&dz, dir) catch return emitError("destination too long");
+        if (c.mkdir(dp, 0o755) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST)
+            return emitErrno("mkdir destination");
+    } else {
+        const tmpl = "/tmp/sketerm-arx-XXXXXX";
+        @memcpy(dir_buf[0..tmpl.len], tmpl);
+        dir_buf[tmpl.len] = 0;
+        const made = c.mkdtemp(@ptrCast(&dir_buf)) orelse return emitErrno("mkdtemp");
+        dir = std.mem.span(@as([*:0]u8, @ptrCast(made)));
+    }
+    var az: [4096:0]u8 = undefined;
+    const ap = std.fmt.bufPrintZ(&az, "{s}", .{spec.src}) catch return emitError("archive path too long");
+    var dz2: [4096:0]u8 = undefined;
+    const dp2 = std.fmt.bufPrintZ(&dz2, "{s}", .{dir}) catch return emitError("destination too long");
+    var mz: [4096:0]u8 = undefined;
+    const mp = std.fmt.bufPrintZ(&mz, "{s}", .{member}) catch return emitError("member too long");
+    const argv = [_:null]?[*:0]const u8{
+        "bsdtar", "-xf", ap.ptr, "-C", dp2.ptr, "--no-same-owner", "--safe-writes", mp.ptr, null,
+    };
+    if (!runArgv(&argv)) return emitError("member extraction failed (bsdtar required)");
+    var out_buf: [4096]u8 = undefined;
+    const out = std.fmt.bufPrint(&out_buf, "{s}/{s}", .{ dir, member }) catch return emitError("path too long");
+    var st: c.struct_stat = undefined;
+    if (!statOf(out, &st, false)) return emitError("member not found after extraction");
+    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = out });
     return 0;
 }
 
