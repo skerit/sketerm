@@ -404,9 +404,15 @@ const Client = struct {
     attached: ?*Session = null,
     dead: bool = false,
     /// Negotiated core protocol, capped to this daemon's newest profile.
-    proto: u32 = 0,
+    /// Clients that never send a hello (the quick CLI send/kill paths of
+    /// every released build) get the documented legacy default instead of
+    /// the restricted profile 0 — only an explicit no-overlap negotiation
+    /// may refuse service. The default is 4, not 1: every daemon that ever
+    /// served those hello-less builds framed snapshots with the protocol-4
+    /// [seq][app] envelope, so their parsers require the app byte.
+    proto: u32 = 4,
     /// Snapshot body selected for this client (zero means no terminal profile).
-    snapshot_version: u8 = 0,
+    snapshot_version: u8 = snapshot.LEGACY_SNAPSHOT_VERSION,
     /// Highest daemon-compositor state version the peer can restore.
     native_state_max: u8 = 0,
     audio_channels: bool = false,
@@ -538,6 +544,23 @@ test "client audio lane preempts normal traffic only at frame boundaries" {
     try std.testing.expect(cl.startNextWriteFrame());
     try std.testing.expectEqual(Client.WriteLane.normal, cl.write_lane);
     try std.testing.expectEqual(@as(usize, 3), cl.write_frame_left);
+}
+
+test "hello-less clients default to the protocol-4 envelope with the legacy snapshot body" {
+    const a = std.testing.allocator;
+    var cl = Client{ .allocator = a, .fd = -1 };
+    defer cl.rbuf.deinit(a);
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+    // Released hello-less CLI builds (v4/v5 `mux send`/`kill`) parse only
+    // the [seq][app] snapshot envelope and reject profile-0 refusals as
+    // "no such session" — the default must serve them, not lock them out.
+    try std.testing.expect(cl.proto >= 4);
+    try std.testing.expect(cl.proto < 5); // no app/audio channels without a hello
+    try std.testing.expectEqual(snapshot.LEGACY_SNAPSHOT_VERSION, cl.snapshot_version);
+    try std.testing.expectEqual(@as(u8, 0), cl.native_state_max);
+    try std.testing.expect(!cl.audio_channels);
+    try std.testing.expect(!cl.winstream_channels);
 }
 
 const pathZ = @import("../util/pathz.zig").pathZ;
