@@ -106,6 +106,12 @@ pub const JobRow = struct {
     state: []const u8 = "",
     done: u64 = 0,
     total: u64 = 0,
+    src: []const u8 = "",
+    dst: []const u8 = "",
+    src_host: []const u8 = "",
+    dst_host: []const u8 = "",
+    client_token: []const u8 = "",
+    message: []const u8 = "",
 };
 
 /// Superset JSON shape of every fs_reply; absent fields keep their
@@ -415,6 +421,7 @@ pub const Fs = struct {
             mtime_ms: ?i64 = null,
             src_host: []const u8 = "",
             dst_host: []const u8 = "",
+            client_token: []const u8 = "",
         };
         var b: Base = .{ .req = req, .op = op };
         inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |fld| {
@@ -650,6 +657,10 @@ pub const Fs = struct {
         return self.startJob("copy", .{ .path = src, .to = dst, .@"resume" = resumable });
     }
 
+    pub fn startCopyToken(self: *Fs, src: []const u8, dst: []const u8, resumable: bool, client_token: []const u8) Error!u64 {
+        return self.startJob("copy", .{ .path = src, .to = dst, .@"resume" = resumable, .client_token = client_token });
+    }
+
     pub fn startDeleteTree(self: *Fs, path: []const u8) Error!u64 {
         return self.startJob("delete_tree", .{ .path = path });
     }
@@ -672,6 +683,14 @@ pub const Fs = struct {
     /// Recursive ci content search; matches carry path + line + text.
     pub fn startGrep(self: *Fs, root: []const u8, pattern: []const u8) Error!u64 {
         return self.startJob("grep", .{ .path = root, .pattern = pattern });
+    }
+
+    pub fn startThumbnail(self: *Fs, path: []const u8) Error!u64 {
+        return self.startJob("thumbnail", .{ .path = path });
+    }
+
+    pub fn startPreview(self: *Fs, path: []const u8) Error!u64 {
+        return self.startJob("preview", .{ .path = path });
     }
 
     pub fn startPanelize(self: *Fs, root: []const u8, command: []const u8) Error!u64 {
@@ -708,6 +727,27 @@ pub const Fs = struct {
             .src_host = src_host,
             .dst_host = dst_host,
             .@"resume" = resumable,
+        });
+    }
+
+    /// Idempotent durable copy. Reusing `client_token` returns and
+    /// claims the original job instead of starting a duplicate.
+    pub fn startCrossCopyToken(
+        self: *Fs,
+        src_host: []const u8,
+        src: []const u8,
+        dst_host: []const u8,
+        dst: []const u8,
+        resumable: bool,
+        client_token: []const u8,
+    ) Error!u64 {
+        return self.startJob("cross_copy", .{
+            .path = src,
+            .to = dst,
+            .src_host = src_host,
+            .dst_host = dst_host,
+            .@"resume" = resumable,
+            .client_token = client_token,
         });
     }
 
