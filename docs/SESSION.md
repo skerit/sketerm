@@ -9234,3 +9234,90 @@ libc/libm only. Tests 850 passed / 6 skipped / 0 failed (857 total;
 +3 thumbs spec tests incl. the canonical hash example). smoke-fs (5
 stages) / smoke-broker / smoke-mcp / smoke-e2e (xvfb) PASS. Rig torn
 down by exact PID (2 daemons), /tmp/sketerm-arx-* cleaned.
+
+## 2026-07-24: durable browser transfers, richer previews, redo + navigation
+
+- Remote open/edit is now process-owned rather than pane-owned. A
+  locked, atomically replaced `file-transfers.json` ledger stores
+  downloads, sync-back watches, retries, cancellation intent, source
+  fingerprints, and pending daemon acknowledgments. Browser tab moves
+  rebind to the destination window, multiple windows subscribe safely,
+  corrupt/partial ledgers fail closed, and a second GUI process cannot
+  overwrite the active coordinator's state.
+- Daemon filesystem jobs accept stable client tokens. Reclaim returns
+  the original job and replays terminal outcomes; terminal events are
+  delivered only after the journal is durable. Helpers remain gated on
+  stdin until their initial record is fsynced. Client acknowledgments
+  are themselves persisted and trim only acknowledged token records.
+- Cross-host and local copies verify staged data before replacement.
+  File/symlink renames and new destination directories fsync their
+  parents, preserving existing targets on creation failure. Offline
+  cache edits resume after GUI restart; edits made during an upload
+  schedule another generation. Existing watched cache files are never
+  implicitly replaced by a later open request.
+- Preview/thumbnail helpers are ephemeral and cancellable. Host-side
+  generation covers raster images, SVG, AVIF/HEIC fallbacks, video
+  frames, audio waveforms, PDF first pages, and media metadata. Cache
+  PNGs validate metadata, chunk CRCs, and IEND; remote request identity
+  includes its host/generation so late worker results cannot release a
+  newer request. Text previews safely carry an escaped 4 KiB head.
+- Browser navigation is transactional and generation-guarded. Added
+  bounded back/forward history, Ctrl+L path entry with async directory
+  completion, Alt+Left/Right/Up, select-all/invert/glob selection, and
+  completion-gated redo alongside undo.
+
+Verification: native GUI/mux, static-musl portable mux, and
+aarch64-macOS portable builds pass; `ldd` shows mux links only libc and
+libm. Direct unit artifact: 855 passed / 6 skipped / 0 failed (861
+total). smoke-fs, smoke-broker, smoke-mcp, and xvfb smoke-e2e pass. A
+fresh isolated fake-SSH run changed a watched cache while the GUI was
+closed, then proved automatic sync-back, an empty intent/ack queue, and
+matching persisted generations after restart. FUSE runtime remains
+unavailable because this container has no `/dev/fuse`; PDF runtime
+generation remains unexercised because poppler tools are not installed.
+
+### Review pass on the above batch (same day)
+
+Defects found reviewing that change set, all fixed and re-verified in a
+live isolated GUI:
+
+- `hostDied` never dropped in-flight listings. Since navigation became
+  transactional, the request OWNS its candidate directory, so a host
+  dying mid-navigation leaked it and left a navigation that could never
+  resolve. `BrowserView.deinit` leaked the same way.
+- Path completion listed the WRONG directory: `std.fs.path.dirname` on
+  a trailing-slash path ("/a/b/") answers "/a", so typing the usual
+  `dir/` showed the grandparent's children. Split at the last slash.
+- The completion debounce timer was not canceled on Enter, so the
+  popup re-opened after navigating — and it is autohide-free, so
+  nothing dismissed it. Now canceled on activate and on path sync.
+- Aborting a preview canceled an ephemeral helper that had usually
+  already finished and been reaped, surfacing "operation failed: no
+  such job" on every selection change. Sent with req 0 now.
+- Preview left the "loading…" placeholder under a rendered image.
+- Preview thumbnails were written at 512px into the freedesktop
+  `large` tier, which is a 256px contract other file managers rely on.
+  They go to `x-large` now.
+- `navigate`/`navigateSpec` still took a `push_history` bool whose two
+  branches were both `.push`. Removed rather than left lying.
+- Durable queue reordering swapped `order` but not array position, so
+  the visible queue never moved.
+- Remote open hard-failed when the ledger was unavailable (another
+  process holding the lock). It now degrades to the in-view transfer
+  and says the download is not restart-durable.
+- Daemon: `kill(-pid)` for an ephemeral job with a dead owner had no
+  `pid > 0` guard (would signal the daemon's own group); `out_pipe[0]`
+  could be closed twice on the journal-failure path; the transfer
+  service left a stale GSource id after an early return.
+
+Re-verified live (isolated rig, fake-SSH remote, torn down by exact
+PID): cross-host back/forward with correct button sensitivity, durable
+download landing with an armed watch, local-edit sync-back, offline-edit
+recovery across a GUI restart, completion listing the typed directory,
+remote image + text previews with no false errors, and thumbnails
+written into the REMOTE host's cache with the local cache untouched.
+Direct thumbnail/preview helper runs confirmed spec-conformant PNGs
+(tEXt Thumb::URI/MTime, 0700 dirs, 0600 files) and cache reuse on a
+second run. Full matrix re-run green: 855 passed / 6 skipped / 0 failed,
+smoke-fs / smoke-broker / smoke-mcp / smoke-e2e PASS, GUI + mux + musl +
+aarch64-macOS builds, mux still libc/libm only.
