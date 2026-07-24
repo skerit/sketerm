@@ -40,6 +40,10 @@ pub const Spec = struct {
     @"resume": bool = false,
     job_id: u64 = 0,
     journal_dir: []const u8 = "",
+    /// find: only entries modified within this window (0 = all).
+    within_ms: u64 = 0,
+    /// find: raise the match cap (0 = default; clamped to 200k).
+    max_matches: u64 = 0,
 };
 
 /// Search caps: a runaway query costs a bounded stream, never a
@@ -335,9 +339,32 @@ fn deletionStamp(buf: *[32]u8) []const u8 {
 fn runTrash(spec: Spec) u8 {
     if (spec.src.len <= 1) return emitError("refusing to trash root");
     var root_buf: [4096]u8 = undefined;
-    const root = trashRoot(&root_buf) orelse return emitError("cannot locate trash directory");
-    if (!ensureTrashDirs(root)) return emitErrno("create trash directory");
-    const base = std.fs.path.basename(spec.src);
+    const home_root = trashRoot(&root_buf) orelse return emitError("cannot locate trash directory");
+    switch (trashInto(spec.src, home_root)) {
+        .ok => return 0,
+        .fail => return emitErrno("move to trash"),
+        .xdev => {},
+    }
+    // Different filesystem: freedesktop $topdir/.Trash-$uid fallback.
+    var mp_buf: [4096]u8 = undefined;
+    const mp = deviceMountpoint(spec.src, &mp_buf) orelse return emitError("move to trash: cross-device and no mountpoint found");
+    var top_buf: [4096]u8 = undefined;
+    const top_root = std.fmt.bufPrint(&top_buf, "{s}/.Trash-{d}", .{
+        if (mp.len == 1) "" else mp, c.getuid(),
+    }) catch return emitError("trash path too long");
+    return switch (trashInto(spec.src, top_root)) {
+        .ok => 0,
+        else => emitErrno("move to trash (topdir)"),
+    };
+}
+
+const TrashResult = enum { ok, xdev, fail };
+
+/// One trash attempt into `root` (files/ + info/ created as needed).
+/// Emits the done event itself on success.
+fn trashInto(src: []const u8, root: []const u8) TrashResult {
+    if (!ensureTrashDirs(root)) return .fail;
+    const base = std.fs.path.basename(src);
     var name_buf: [512]u8 = undefined;
     var files_buf: [4096]u8 = undefined;
     var info_buf: [4096]u8 = undefined;
@@ -346,41 +373,66 @@ fn runTrash(spec: Spec) u8 {
     var info_path: []const u8 = undefined;
     while (attempt < 10000) : (attempt += 1) {
         const name = if (attempt == 0)
-            std.fmt.bufPrint(&name_buf, "{s}", .{base}) catch return emitError("name too long")
+            std.fmt.bufPrint(&name_buf, "{s}", .{base}) catch return .fail
         else
-            std.fmt.bufPrint(&name_buf, "{s}.{d}", .{ base, attempt }) catch return emitError("name too long");
-        trashed = std.fmt.bufPrint(&files_buf, "{s}/files/{s}", .{ root, name }) catch return emitError("path too long");
-        info_path = std.fmt.bufPrint(&info_buf, "{s}/info/{s}.trashinfo", .{ root, name }) catch return emitError("path too long");
+            std.fmt.bufPrint(&name_buf, "{s}.{d}", .{ base, attempt }) catch return .fail;
+        trashed = std.fmt.bufPrint(&files_buf, "{s}/files/{s}", .{ root, name }) catch return .fail;
+        info_path = std.fmt.bufPrint(&info_buf, "{s}/info/{s}.trashinfo", .{ root, name }) catch return .fail;
         var z: [4096]u8 = undefined;
         var st: c.struct_stat = undefined;
-        if (c.lstat(pathz.pathZ(&z, trashed) catch return emitError("path too long"), &st) != 0 and
+        if (c.lstat(pathz.pathZ(&z, trashed) catch return .fail, &st) != 0 and
             std.posix.errno(@as(c_int, -1)) == .NOENT) break;
     }
-    if (attempt == 10000) return emitError("cannot allocate unique trash name");
+    if (attempt == 10000) return .fail;
 
     var text: [8192]u8 = undefined;
     var w = std.Io.Writer.fixed(&text);
-    w.writeAll("[Trash Info]\nPath=") catch return emitError("trash metadata too large");
-    appendUrlEscaped(&w, spec.src) catch return emitError("trash metadata too large");
+    w.writeAll("[Trash Info]\nPath=") catch return .fail;
+    appendUrlEscaped(&w, src) catch return .fail;
     var stamp_buf: [32]u8 = undefined;
-    w.print("\nDeletionDate={s}\n", .{deletionStamp(&stamp_buf)}) catch return emitError("trash metadata too large");
+    w.print("\nDeletionDate={s}\n", .{deletionStamp(&stamp_buf)}) catch return .fail;
     var iz: [4096]u8 = undefined;
-    const ip = pathz.pathZ(&iz, info_path) catch return emitError("path too long");
-    const info = c.fopen(ip, "wx") orelse return emitErrno("create trash metadata");
+    const ip = pathz.pathZ(&iz, info_path) catch return .fail;
+    const info = c.fopen(ip, "wx") orelse return .fail;
     if (c.fwrite(w.buffered().ptr, 1, w.buffered().len, info) != w.buffered().len or c.fclose(info) != 0) {
         _ = c.unlink(ip);
-        return emitError("write trash metadata failed");
+        return .fail;
     }
     var sz: [4096]u8 = undefined;
     var tz: [4096]u8 = undefined;
-    if (c.rename(pathz.pathZ(&sz, spec.src) catch return emitError("path too long"),
-        pathz.pathZ(&tz, trashed) catch return emitError("path too long")) != 0)
+    if (c.rename(pathz.pathZ(&sz, src) catch return .fail,
+        pathz.pathZ(&tz, trashed) catch return .fail) != 0)
     {
+        const failed_errno = std.posix.errno(@as(c_int, -1));
         _ = c.unlink(ip);
-        return emitErrno("move to trash");
+        return if (failed_errno == .XDEV) .xdev else .fail;
     }
     emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = trashed, .text = info_path });
-    return 0;
+    return .ok;
+}
+
+/// The mountpoint holding `path`: walk parents until st_dev changes.
+fn deviceMountpoint(path: []const u8, buf: []u8) ?[]const u8 {
+    var st: c.struct_stat = undefined;
+    if (!statOf(path, &st, false)) return null;
+    const dev = st.st_dev;
+    var cur_buf: [4096]u8 = undefined;
+    var cur: []const u8 = std.fs.path.dirname(path) orelse "/";
+    if (cur.len > cur_buf.len) return null;
+    @memcpy(cur_buf[0..cur.len], cur);
+    cur = cur_buf[0..cur.len];
+    while (cur.len > 1) {
+        const parent = std.fs.path.dirname(cur) orelse "/";
+        var pst: c.struct_stat = undefined;
+        if (!statOf(parent, &pst, false)) break;
+        if (pst.st_dev != dev) break;
+        const plen = parent.len;
+        std.mem.copyForwards(u8, cur_buf[0..plen], parent);
+        cur = cur_buf[0..plen];
+    }
+    if (cur.len > buf.len) return null;
+    @memcpy(buf[0..cur.len], cur);
+    return buf[0..cur.len];
 }
 
 fn runTrashRestore(spec: Spec) u8 {
@@ -597,6 +649,9 @@ const SearchState = struct {
     scanned: u64 = 0,
     truncated: bool = false,
     lower_pat: []u8,
+    /// Relative-time filter: entries older than this are skipped.
+    min_mtime_ms: i64 = 0,
+    max_matches: usize = MAX_MATCHES,
 };
 
 fn runSearch(allocator: std.mem.Allocator, spec: Spec, content: bool) u8 {
@@ -608,6 +663,12 @@ fn runSearch(allocator: std.mem.Allocator, spec: Spec, content: bool) u8 {
     defer allocator.free(lower);
     for (lower) |*ch| ch.* = std.ascii.toLower(ch.*);
     var state = SearchState{ .lower_pat = lower };
+    if (spec.max_matches > 0)
+        state.max_matches = @intCast(@min(spec.max_matches, 200_000));
+    if (spec.within_ms > 0) {
+        const now_ms: i64 = @as(i64, c.time(null)) * 1000;
+        state.min_mtime_ms = now_ms - @as(i64, @intCast(@min(spec.within_ms, 1 << 50)));
+    }
     searchDir(allocator, spec.src, spec.pattern, content, &state);
     emit(.{
         .ev = "done",
@@ -620,7 +681,7 @@ fn runSearch(allocator: std.mem.Allocator, spec: Spec, content: bool) u8 {
 }
 
 fn searchDir(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []const u8, content: bool, state: *SearchState) void {
-    if (state.matches >= MAX_MATCHES) {
+    if (state.matches >= state.max_matches) {
         state.truncated = true;
         return;
     }
@@ -628,7 +689,7 @@ fn searchDir(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []cons
     defer arena_state.deinit();
     const l = fsserve.listDir(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES) catch return;
     for (l.entries) |e| {
-        if (state.matches >= MAX_MATCHES) {
+        if (state.matches >= state.max_matches) {
             state.truncated = true;
             return;
         }
@@ -637,7 +698,8 @@ fn searchDir(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []cons
         w.print("{s}/{s}", .{ if (dir_path.len == 1) "" else dir_path, e.name }) catch continue;
         const full = w.buffered();
         if (!content) {
-            if (nameMatches(pattern, e.name)) {
+            const fresh = state.min_mtime_ms == 0 or e.mtime_ms >= state.min_mtime_ms;
+            if (fresh and nameMatches(pattern, e.name)) {
                 state.matches += 1;
                 emit(.{ .ev = "match", .path = full, .kind = e.kind, .size = e.size, .mtime_ms = e.mtime_ms });
             }

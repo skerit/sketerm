@@ -3033,6 +3033,10 @@ pub const Daemon = struct {
         job: u64 = 0,
         /// find/grep search pattern.
         pattern: []const u8 = "",
+        /// find: only entries modified within this window (0 = all).
+        within_ms: u64 = 0,
+        /// find: raise the match cap (0 = default 2000; hard 200k).
+        max_matches: u64 = 0,
         mode: u32 = 0,
         uid: ?u32 = null,
         gid: ?u32 = null,
@@ -3658,7 +3662,7 @@ pub const Daemon = struct {
         if ((op == .find or op == .grep or op == .panelize or op == .live_find) and r.pattern.len == 0)
             return fsReplyErr(cl, r.req, "empty pattern");
 
-        const job = self.spawnFsJob(cl, op, self.next_fs_job_id, r.path, r.to, r.pattern, r.src_host, r.dst_host, r.@"resume") catch
+        const job = self.spawnFsJob(cl, op, self.next_fs_job_id, r.path, r.to, r.pattern, r.src_host, r.dst_host, r.@"resume", r.within_ms, r.max_matches) catch
             return fsReplyErr(cl, r.req, "cannot start job");
         self.next_fs_job_id = job.id + 1;
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .job = job.id });
@@ -3675,6 +3679,8 @@ pub const Daemon = struct {
         src_host: []const u8,
         dst_host: []const u8,
         resumable: bool,
+        within_ms: u64,
+        max_matches: u64,
     ) !*FsJob {
         var exe_buf: [4096:0]u8 = undefined;
         const exe = @import("../util/platform.zig").exePathZ(&exe_buf) orelse return error.NoExecutable;
@@ -3690,6 +3696,8 @@ pub const Daemon = struct {
             .@"resume" = resumable,
             .job_id = id,
             .journal_dir = self.fs_job_dir,
+            .within_ms = within_ms,
+            .max_matches = max_matches,
         }, .{}, &spec_aw.writer);
         try spec_aw.writer.writeByte('\n');
 
@@ -3873,7 +3881,7 @@ pub const Daemon = struct {
                 continue;
             }
             if (op == .copy or op == .cross_copy or op == .live_find) {
-                _ = self.spawnFsJob(null, op, rec.id, rec.src, rec.dst, rec.pattern, rec.src_host, rec.dst_host, true) catch {
+                _ = self.spawnFsJob(null, op, rec.id, rec.src, rec.dst, rec.pattern, rec.src_host, rec.dst_host, true, 0, 0) catch {
                     const job = self.restoredFsJob(rec, op, .failed) orelse continue;
                     job.setMessage("could not resume after daemon restart");
                     self.journalFsJob(job);
