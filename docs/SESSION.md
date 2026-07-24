@@ -8569,3 +8569,25 @@ used an actual protocol-5 daemon with the current client over local and SSH
 proxy transports, and an actual protocol-5 client against the current broker.
 The ownership test proved a second daemon cannot replace the first and its
 session remains interactive. No test used or restarted the live user daemon.
+
+## 2026-07-24: negotiation review — hello-less legacy clients need the proto-4 envelope
+
+Independent re-verification of the progressive-negotiation work found one real
+regression the original matrix missed: released v4/v5 builds send bare
+attach/kill frames with NO hello on their local CLI paths (`mux send`,
+`get-text`, `kill` — only spawn probed). The daemon's hello-less default of
+proto 1 framed their snapshots with the 8-byte `[seq]` envelope, but every
+daemon those builds ever met used the protocol-4 `[seq][app]` envelope — the
+v5 client parsed the version byte as the app flag and reported "bad snapshot"
+(surfaced as a bogus "no such session" on send paths). The default is now
+proto 4 with the legacy snapshot body: envelope correct for the entire real
+hello-less population, app/audio/native channels still gated behind an
+explicit hello. Regression test pins the default; live verification drove an
+actual v5 client's spawn/send/get-text/kill against the current daemon
+(TERM/COLORTERM expansion included) and the reverse direction unchanged.
+The original session's "v5 client vs v6 daemon" pass was traced to a stale
+`zig-out/bin/sketerm-mux` — plain `zig build` does not rebuild the daemon.
+
+Verification: 824 tests pass (6 skips); `zig build`, `zig build mux`,
+`smoke-mux`, `smoke-broker`, `smoke-mcp`, Linux static-musl and aarch64-macOS
+portable builds pass. No live user daemon was touched.
