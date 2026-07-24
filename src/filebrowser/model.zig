@@ -109,6 +109,8 @@ pub const TabState = struct {
     /// Empty = the built-in default set (also what pre-column state
     /// files deserialize to).
     columns: []const Column = &.{},
+    /// Extended-attribute columns (full `user.*` names).
+    attr_columns: []const []const u8 = &.{},
     sort: SortKey = .name,
     descending: bool = false,
     dirs_first: bool = true,
