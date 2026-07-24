@@ -203,16 +203,19 @@ end to end). `dist/deploy-macos.sh` automates the repeatable part.
    capture attempt registers `sketerm-mux` — DISABLED — under
    System Settings → Privacy & Security → **Screen Recording**;
    the first input injection does the same under **Accessibility**.
-   Enable both. After enabling, `launchctl kickstart -k
-   gui/$UID/dev.sker.sketerm-mux` (Screen Recording only takes
-   effect on restart). Until granted, the client shows a notice
+   Enable both. Screen Recording takes effect on restart; only run
+   `launchctl kickstart -k gui/$UID/dev.sker.sketerm-mux` after
+   `sketerm mux list` confirms there are no sessions, because `-k`
+   destroys them. Until granted, the client shows a notice
    window titled with these instructions and the daemon logs the
    exact failure — no silent hangs. If an entry was created against
    an *older* binary (stale hash), remove it with the **−** button
    first so the cert-signed binary re-registers.
 
-After this, rebuilds are just `dist/deploy-macos.sh` again — build,
-re-sign, kick. No re-grant, no clicking. The grants ride the cert.
+After this, rebuilds are just `dist/deploy-macos.sh` again. It builds,
+re-signs, and updates the LaunchAgent definition without replacing a
+loaded daemon; the new binary applies after its natural exit or reboot.
+No re-grant is needed because the grants ride the certificate.
 
 Caveats: system apps (Calculator, TextEdit, …) carry launch
 constraints on modern macOS and cannot be spawned as PTY children —

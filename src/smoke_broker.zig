@@ -39,7 +39,7 @@ const Mirror = struct {
         self.screen = null;
         self.pool.deinit();
         self.pool.* = try Pool.init(self.allocator);
-        self.screen = try snapshot.restore(self.allocator, self.pool, payload[9..]);
+        self.screen = try snapshot.restore(self.allocator, self.pool, (try snapshot.peelEnvelope(payload)).body);
     }
 
     fn applyEvents(self: *Mirror, payload: []const u8) !void {

@@ -362,7 +362,7 @@ pub const Terminal = struct {
         session_name: []const u8,
         snap_payload: []const u8,
     ) !*Terminal {
-        if (snap_payload.len < 9) return error.BadSnapshot;
+        const envelope = mux_snapshot.peelEnvelope(snap_payload) catch return error.BadSnapshot;
         const self = try allocator.create(Terminal);
         errdefer allocator.destroy(self);
 
@@ -382,7 +382,7 @@ pub const Terminal = struct {
             .conn = conn,
             .session = try allocator.dupe(u8, session_name),
             .predictor = predict_mod.Predictor.init(allocator),
-            .is_app = snap_payload[8] != 0,
+            .is_app = envelope.app,
         };
         if (profile_util.getenv("SKETERM_PREDICT")) |v| {
             if (std.mem.eql(u8, v, "always")) remote.predictor.force = .always;
@@ -403,7 +403,7 @@ pub const Terminal = struct {
         drain.terminal = self;
 
         // Restore the snapshot into our pool; wire sinks like init.
-        self.screen = try mux_snapshot.restore(allocator, &self.pool, snap_payload[9..]);
+        self.screen = try mux_snapshot.restore(allocator, &self.pool, envelope.body);
         errdefer self.screen.deinit();
         // Mirror screens never answer protocol queries — the daemon's
         // authoritative Screen already does; replying here would
@@ -564,8 +564,8 @@ pub const Terminal = struct {
                 }
             },
             .snapshot => {
-                if (frame.payload.len < 9) return;
-                const fresh = mux_snapshot.restore(self.allocator, &self.pool, frame.payload[9..]) catch return;
+                const envelope = mux_snapshot.peelEnvelope(frame.payload) catch return;
+                const fresh = mux_snapshot.restore(self.allocator, &self.pool, envelope.body) catch return;
                 // Carry over GUI-side fields the snapshot doesn't own.
                 fresh.scrollback_capacity = self.screen.scrollback_capacity;
                 fresh.word_chars = self.screen.word_chars;

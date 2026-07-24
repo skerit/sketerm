@@ -605,12 +605,12 @@ pub const App = struct {
     }
 
     /// Rebuild the terminal mirror from an attach snapshot
-    /// ([seq:u64][app:u8] + serialized Screen). Best-effort: a decode
+    /// (versioned envelope + serialized Screen). Best-effort: a decode
     /// failure just leaves the mirror empty (output unavailable).
     fn applyTermSnapshot(self: *App, payload: []const u8) void {
-        if (payload.len < 9) return;
+        const envelope = snapshot.peelEnvelope(payload) catch return;
         const a = self.allocator;
-        self.term_seq = std.mem.readInt(u64, payload[0..8], .little);
+        self.term_seq = envelope.seq;
         if (self.term_screen) |s| s.deinit();
         self.term_screen = null;
         if (self.term_pool == null) {
@@ -628,7 +628,7 @@ pub const App = struct {
                 return;
             };
         }
-        self.term_screen = snapshot.restore(a, self.term_pool.?, payload[9..]) catch null;
+        self.term_screen = snapshot.restore(a, self.term_pool.?, envelope.body) catch null;
     }
 
     /// Apply an `.events` frame ([seq:u64][count:u32] + wire events)
@@ -1090,8 +1090,8 @@ pub const App = struct {
     /// Fetch log lines over a FRESH side connection: its daemon-side
     /// write queue is empty, so log_data arrives immediately after the
     /// attach snapshot no matter how deep the primary connection's
-    /// frame backlog is. Hellos proto 1 (no native-channel replay, no
-    /// pool bytes) and attaches kind "cli" (not counted as a driver).
+    /// frame backlog is. It negotiates with native/audio/winstream disabled so
+    /// no channel replay precedes the reply, and attaches as a non-driver CLI.
     /// Caller owns the returned JSON.
     fn logGetFresh(self: *App, req_json: []const u8, timeout_ms: i64) Error![]u8 {
         if (self.exited) return Error.NotConnected;
@@ -1103,7 +1103,16 @@ pub const App = struct {
         };
         defer conn.deinit();
         conn.setNonBlocking();
-        conn.sendJson(.hello, .{ .proto = 1 }) catch return Error.NotConnected;
+        conn.sendJson(.hello, .{
+            .proto = wire.PROTO_VERSION,
+            .min_proto = @as(u32, 1),
+            .negotiation = @as(u8, 1),
+            .snapshot_max = snapshot.SNAPSHOT_VERSION,
+            .native_state_max = @as(u8, 0),
+            .audio = false,
+            .winstream = false,
+            .video = false,
+        }) catch return Error.NotConnected;
         (conn.recvExpectFor(&.{.welcome}, @max(deadline - nowMs(), 1)) catch return Error.Timeout).deinit(a);
         conn.sendJson(.attach, .{ .name = self.name, .kind = "cli" }) catch return Error.NotConnected;
         (conn.recvExpectFor(&.{.snapshot}, @max(deadline - nowMs(), 1)) catch return Error.Timeout).deinit(a);

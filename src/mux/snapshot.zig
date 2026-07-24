@@ -17,7 +17,15 @@ const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
 const Pool = style_pool.Pool;
 
-pub const SNAPSHOT_VERSION: u32 = 4;
+pub const SNAPSHOT_VERSION = 4;
+pub const LEGACY_SNAPSHOT_VERSION = 3;
+
+/// Select a snapshot body for a negotiated or historical core profile.
+pub fn negotiateVersion(proto: u32, advertised_max: u8, negotiated: bool) u8 {
+    if (proto == 0) return 0;
+    if (negotiated) return @min(advertised_max, SNAPSHOT_VERSION);
+    return if (proto >= 6) SNAPSHOT_VERSION else LEGACY_SNAPSHOT_VERSION;
+}
 
 /// Fixed-size OSC 133 state appended to every v4 snapshot.
 const V4_COMMAND_TAIL_LEN: usize = 8 + 1 + 8 + 8 + 4 + 8;
@@ -76,9 +84,16 @@ const Sink = struct {
 
 /// Serialize `screen` (+ its pool) into `out`.
 pub fn serialize(screen: *const Screen, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    return serializeVersion(screen, out, allocator, SNAPSHOT_VERSION);
+}
+
+/// Serialize a retained historical snapshot body for an older peer.
+pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocator: std.mem.Allocator, version: u32) !void {
+    if (version < 1 or version > SNAPSHOT_VERSION)
+        return error.UnsupportedSnapshotVersion;
     const s = Sink{ .out = out, .allocator = allocator };
 
-    try s.int(u32, SNAPSHOT_VERSION);
+    try s.int(u32, version);
     try s.int(u16, screen.cols);
     try s.int(u16, screen.rows);
 
@@ -128,8 +143,10 @@ pub fn serialize(screen: *const Screen, out: *std.ArrayList(u8), allocator: std.
     try s.boolean(screen.sync_output);
     // v3: a reattaching mirror must know these to emit the GUI-owned
     // reports (mode 2031 color-scheme) and agree on mode state.
-    try s.boolean(screen.mode_2031);
-    try s.boolean(screen.in_band_resize);
+    if (version >= 3) {
+        try s.boolean(screen.mode_2031);
+        try s.boolean(screen.in_band_resize);
+    }
 
     // Colors + title.
     try s.f32x4(screen.default_fg);
@@ -165,43 +182,68 @@ pub fn serialize(screen: *const Screen, out: *std.ArrayList(u8), allocator: std.
     // Newest-first budget pass keeps the freshest placements when
     // the lot would overflow the wire frame; emitted in original
     // order so z-equal stacking stays stable.
-    const items = screen.retained_images.items;
-    var budget: usize = Screen.RETAIN_IMAGE_BUDGET;
-    var first_kept: usize = items.len;
-    while (first_kept > 0) {
-        const need = items[first_kept - 1].owned.len;
-        if (need > budget) break;
-        budget -= need;
-        first_kept -= 1;
-    }
-    try s.int(u32, @intCast(items.len - first_kept));
-    for (items[first_kept..]) |ri| {
-        const ev = ri.ev;
-        try s.int(u32, ev.width);
-        try s.int(u32, ev.height);
-        try s.int(u16, ev.row);
-        try s.int(u16, ev.col);
-        try s.int(u32, ev.image_id);
-        try s.int(u32, ev.placement_id);
-        try s.int(i32, ev.z_index);
-        try s.int(u32, ev.cells_wide);
-        try s.int(u32, ev.cells_high);
-        try s.int(u32, ev.src_x);
-        try s.int(u32, ev.src_y);
-        try s.int(u32, ev.src_w);
-        try s.int(u32, ev.src_h);
-        try s.bytes(ri.owned);
+    if (version >= 2) {
+        const items = screen.retained_images.items;
+        var budget: usize = Screen.RETAIN_IMAGE_BUDGET;
+        var first_kept: usize = items.len;
+        while (first_kept > 0) {
+            const need = items[first_kept - 1].owned.len;
+            if (need > budget) break;
+            budget -= need;
+            first_kept -= 1;
+        }
+        try s.int(u32, @intCast(items.len - first_kept));
+        for (items[first_kept..]) |ri| {
+            const ev = ri.ev;
+            try s.int(u32, ev.width);
+            try s.int(u32, ev.height);
+            try s.int(u16, ev.row);
+            try s.int(u16, ev.col);
+            try s.int(u32, ev.image_id);
+            try s.int(u32, ev.placement_id);
+            try s.int(i32, ev.z_index);
+            try s.int(u32, ev.cells_wide);
+            try s.int(u32, ev.cells_high);
+            try s.int(u32, ev.src_x);
+            try s.int(u32, ev.src_y);
+            try s.int(u32, ev.src_w);
+            try s.int(u32, ev.src_h);
+            try s.bytes(ri.owned);
+        }
     }
 
     // v4: OSC 133 command state, LAST in the stream so a v3 payload is
     // exactly a v4 one without this tail. Keeping an open C marker and
     // the completion sequence makes command waits survive mux resyncs.
-    try s.int(u64, screen.pending_output_start_id);
-    try s.boolean(screen.pending_output_awaits_nl);
-    try s.int(u64, screen.last_output_start_id);
-    try s.int(u64, screen.last_output_end_id);
-    try s.int(i32, screen.last_cmd_exit);
-    try s.int(u64, screen.cmd_completion_seq);
+    if (version >= 4) {
+        try s.int(u64, screen.pending_output_start_id);
+        try s.boolean(screen.pending_output_awaits_nl);
+        try s.int(u64, screen.last_output_start_id);
+        try s.int(u64, screen.last_output_end_id);
+        try s.int(i32, screen.last_cmd_exit);
+        try s.int(u64, screen.cmd_completion_seq);
+    }
+}
+
+pub const Envelope = struct {
+    seq: u64,
+    app: bool,
+    body: []const u8,
+};
+
+/// Decode both the protocol 1-3 and protocol 4+ snapshot envelopes.
+pub fn peelEnvelope(payload: []const u8) !Envelope {
+    if (payload.len < 12) return error.Truncated;
+    const seq = std.mem.readInt(u64, payload[0..8], .little);
+    if (payload.len >= 13) {
+        const version = std.mem.readInt(u32, payload[9..13], .little);
+        if (version >= 1 and version <= SNAPSHOT_VERSION and payload[8] <= 1) {
+            return .{ .seq = seq, .app = payload[8] != 0, .body = payload[9..] };
+        }
+    }
+    const version = std.mem.readInt(u32, payload[8..12], .little);
+    if (version < 1 or version > SNAPSHOT_VERSION) return error.SnapshotVersionMismatch;
+    return .{ .seq = seq, .app = false, .body = payload[8..] };
 }
 
 const Src = struct {
@@ -282,9 +324,9 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
     var src = Src{ .bytes = bytes };
 
     const version = try src.int(u32);
-    // v3 is still accepted: an already-running pre-upgrade daemon must
-    // stay attachable or upgrading sketerm strands durable sessions.
-    if (version != 3 and version != SNAPSHOT_VERSION) return error.SnapshotVersionMismatch;
+    // Historical bodies stay readable so a newer client can attach without
+    // replacing the daemon that owns its durable sessions.
+    if (version < 1 or version > SNAPSHOT_VERSION) return error.SnapshotVersionMismatch;
     const cols = try src.int(u16);
     const rows = try src.int(u16);
     if (cols == 0 or rows == 0 or cols > 4096 or rows > 4096) return error.BadSnapshot;
@@ -372,8 +414,10 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
     screen.mouse_enc = std.enums.fromInt(@TypeOf(screen.mouse_enc), try src.byte()) orelse return error.BadSnapshot;
     screen.focus_reports = try src.boolean();
     screen.sync_output = try src.boolean();
-    screen.mode_2031 = try src.boolean();
-    screen.in_band_resize = try src.boolean();
+    if (version >= 3) {
+        screen.mode_2031 = try src.boolean();
+        screen.in_band_resize = try src.boolean();
+    }
 
     screen.default_fg = try src.f32x4();
     screen.default_bg = try src.f32x4();
@@ -415,7 +459,7 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
     // Retained image placements — parked on the screen; the client
     // replays them into its image sink once a pane is wired
     // (Terminal.replayRetainedImages) and then frees them.
-    var n_images = try src.int(u32);
+    var n_images: u32 = if (version >= 2) try src.int(u32) else 0;
     // A transitional v4 writer shipped before the command-state format was
     // finalized. Its legacy u32 occupies the slot now used by n_images and is
     // followed immediately by the fixed 37-byte command tail. When non-zero,
@@ -602,6 +646,70 @@ test "snapshot: v3 payload (no command tail) restores with defaults" {
     var pool3 = try Pool.init(a);
     defer pool3.deinit();
     try testing.expectError(error.Truncated, restore(a, &pool3, buf.items[0 .. buf.items.len - tail]));
+}
+
+test "snapshot: serializer targets v3 for legacy peers" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 8, 2);
+    defer h.deinit();
+    h.feed("legacy");
+    h.screen.cmd_completion_seq = 42;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try serializeVersion(h.screen, &buf, a, LEGACY_SNAPSHOT_VERSION);
+    try testing.expectEqual(LEGACY_SNAPSHOT_VERSION, std.mem.readInt(u32, buf.items[0..4], .little));
+
+    var pool = try Pool.init(a);
+    defer pool.deinit();
+    const restored = try restore(a, &pool, buf.items);
+    defer restored.deinit();
+    try testing.expectEqual(@as(u64, 0), restored.cmd_completion_seq);
+}
+
+test "snapshot: v1 and v2 bodies remain readable" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 8, 2);
+    defer h.deinit();
+    h.feed("old");
+    h.screen.mode_2031 = true;
+
+    for ([_]u32{ 1, 2 }) |version| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(a);
+        try serializeVersion(h.screen, &buf, a, version);
+        var pool = try Pool.init(a);
+        defer pool.deinit();
+        const restored = try restore(a, &pool, buf.items);
+        defer restored.deinit();
+        try testing.expect(!restored.mode_2031);
+    }
+}
+
+test "snapshot: envelope detects pre-v4 and current headers" {
+    var legacy: [12]u8 = @splat(0);
+    std.mem.writeInt(u64, legacy[0..8], 17, .little);
+    std.mem.writeInt(u32, legacy[8..12], LEGACY_SNAPSHOT_VERSION, .little);
+    const old = try peelEnvelope(&legacy);
+    try testing.expectEqual(@as(u64, 17), old.seq);
+    try testing.expect(!old.app);
+    try testing.expectEqualSlices(u8, legacy[8..], old.body);
+
+    var current: [13]u8 = @splat(0);
+    std.mem.writeInt(u64, current[0..8], 23, .little);
+    current[8] = 1;
+    std.mem.writeInt(u32, current[9..13], SNAPSHOT_VERSION, .little);
+    const modern = try peelEnvelope(&current);
+    try testing.expectEqual(@as(u64, 23), modern.seq);
+    try testing.expect(modern.app);
+    try testing.expectEqualSlices(u8, current[9..], modern.body);
+}
+
+test "snapshot: negotiation honors the peer maximum" {
+    try testing.expectEqual(@as(u8, 3), negotiateVersion(6, 3, true));
+    try testing.expectEqual(@as(u8, 4), negotiateVersion(6, 4, true));
+    try testing.expectEqual(@as(u8, 3), negotiateVersion(5, 0, false));
+    try testing.expectEqual(@as(u8, 0), negotiateVersion(0, 4, true));
 }
 
 test "snapshot: transitional v4 legacy field is not an image count" {

@@ -250,12 +250,38 @@ fn muxSpawn(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, r
         };
     };
     defer conn.deinit();
+    var cfg = @import("../config.zig").Config.load(allocator);
+    defer cfg.deinit();
+    const settings = cfg.profileSettings(cfg.default_profile);
+    const spawn_argv: []const []const u8 = if (argv.items.len > 0)
+        argv.items
+    else if (host != null)
+        &@import("../mux/shell.zig").remote_login_argv
+    else if (settings.shell) |shell|
+        &.{shell}
+    else
+        &.{@import("../mux/shell.zig").accountLoginShell()};
+    var remote_shell_buf: [512]u8 = undefined;
+    var remote_env_items: [2][]const u8 = undefined;
+    var remote_env_len: usize = 0;
+    if (argv.items.len == 0 and host != null) {
+        if (settings.shell) |shell| {
+            remote_env_items[remote_env_len] = std.fmt.bufPrint(&remote_shell_buf, "SKETERM_REMOTE_SHELL={s}", .{shell}) catch return 1;
+            remote_env_len += 1;
+        }
+        remote_env_items[remote_env_len] = if (settings.login_shell) "SKETERM_REMOTE_LOGIN=1" else "SKETERM_REMOTE_LOGIN=0";
+        remote_env_len += 1;
+    }
     conn.sendJson(.spawn, .{
         .name = name,
-        .argv = argv.items,
+        .argv = spawn_argv,
+        .env = remote_env_items[0..remote_env_len],
         .cwd = cwd,
         .rows = rows,
         .cols = cols,
+        .term = settings.term_env,
+        .color_term = settings.color_term_env,
+        .login_shell = argv.items.len == 0 and host == null and settings.login_shell,
     }) catch return 1;
     const f = conn.recvExpect(&.{.ok}) catch {
         _ = c.fprintf(platform.stderr(), "sketerm mux: spawn failed (name taken?)\n");
@@ -361,14 +387,12 @@ fn muxGetText(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8,
     var io = attachForIo(allocator, host, name) orelse return 1;
     defer io.conn.deinit();
     defer io.snap.deinit(allocator);
-    // Snapshot payload = [seq:u64][app:u8], then the screen.
-    if (io.snap.payload.len < 9) return 1;
-
     const Pool = @import("../grid/style_pool.zig").Pool;
     const snapshot = @import("../mux/snapshot.zig");
+    const envelope = snapshot.peelEnvelope(io.snap.payload) catch return 1;
     var pool = Pool.init(allocator) catch return 1;
     defer pool.deinit();
-    const screen = snapshot.restore(allocator, &pool, io.snap.payload[9..]) catch {
+    const screen = snapshot.restore(allocator, &pool, envelope.body) catch {
         _ = c.fprintf(platform.stderr(), "sketerm mux: bad snapshot\n");
         return 1;
     };
@@ -625,25 +649,11 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
         // MCP private daemon). Connect only — never autostart one.
         if (std.mem.startsWith(u8, h, "sock:")) {
             return mux_client.Conn.connectProbed(allocator, h[5..]) catch {
-                _ = c.fprintf(platform.stderr(), "sketerm mux: no daemon at that socket (or version mismatch)\n");
+                _ = c.fprintf(platform.stderr(), "sketerm mux: no daemon at that socket\n");
                 return null;
             };
         }
-        return mux_client.Conn.connectSsh(allocator, h) catch |err| {
-            if (err == error.MuxProtoMismatch) {
-                _ = c.fprintf(
-                    platform.stderr(),
-                    "sketerm mux: unsupported protocol with %.*s\n" ++
-                        "  remote sketerm-mux speaks protocol %u, this build supports %u through %u\n" ++
-                        "  update sketerm on the incompatible machine\n",
-                    @as(c_int, @intCast(h.len)),
-                    h.ptr,
-                    @as(c_uint, mux_client.last_remote_proto),
-                    @as(c_uint, @import("../mux/wire.zig").MIN_COMPATIBLE_SERVER_PROTO),
-                    @as(c_uint, @import("../mux/wire.zig").PROTO_VERSION),
-                );
-                return null;
-            }
+        return mux_client.Conn.connectSsh(allocator, h) catch {
             _ = c.fprintf(
                 platform.stderr(),
                 "sketerm mux: ssh transport to %.*s failed\n" ++

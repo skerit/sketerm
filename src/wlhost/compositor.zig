@@ -3128,10 +3128,17 @@ pub const Compositor = struct {
     /// Serialize the full protocol-tracking state. Caller owns the
     /// result. Pool bytes are excluded by design (see above).
     pub fn serializeState(self: *const Compositor, a: std.mem.Allocator) Error![]u8 {
+        return self.serializeStateVersion(a, state_sync_version);
+    }
+
+    /// Serialize state for a v6 or newer replica, downgrading only the v7 dmabuf tail.
+    pub fn serializeStateVersion(self: *const Compositor, a: std.mem.Allocator, max_version: u8) Error![]u8 {
+        if (max_version < 6) return Error.Protocol;
+        const version = @min(max_version, state_sync_version);
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(a);
 
-        try putU8(&out, a, state_sync_version);
+        try putU8(&out, a, version);
         try putI32(&out, a, self.output_scale);
         try putU32(&out, a, self.output_id);
         try putU32(&out, a, self.grabbed_popup);
@@ -3341,23 +3348,32 @@ pub const Compositor = struct {
             }
         }
 
-        // v7: in-flight dmabuf params (a replica attaching between
-        // add and create_immed must retain full metadata and reuse state).
+        // In-flight dmabuf params. v6 can represent only one unused LINEAR
+        // plane; sessions advertising modifiers are gated to v7 viewers.
         try putU32(&out, a, self.dmabuf_params.count());
         var dpit = self.dmabuf_params.iterator();
         while (dpit.next()) |e| {
             try putU32(&out, a, e.key_ptr.*);
-            try putU8(&out, a, @intFromBool(e.value_ptr.used));
-            for (e.value_ptr.planes) |plane_opt| {
-                const plane = plane_opt orelse {
-                    try putU8(&out, a, 0);
-                    continue;
-                };
-                try putU8(&out, a, 1);
-                try putU32(&out, a, plane.offset);
-                try putU32(&out, a, plane.stride);
-                try putU32(&out, a, @truncate(plane.modifier >> 32));
-                try putU32(&out, a, @truncate(plane.modifier));
+            if (version >= 7) {
+                try putU8(&out, a, @intFromBool(e.value_ptr.used));
+                for (e.value_ptr.planes) |plane_opt| {
+                    const plane = plane_opt orelse {
+                        try putU8(&out, a, 0);
+                        continue;
+                    };
+                    try putU8(&out, a, 1);
+                    try putU32(&out, a, plane.offset);
+                    try putU32(&out, a, plane.stride);
+                    try putU32(&out, a, @truncate(plane.modifier >> 32));
+                    try putU32(&out, a, @truncate(plane.modifier));
+                }
+            } else {
+                const plane = e.value_ptr.planes[0];
+                const usable = !e.value_ptr.used and plane != null and
+                    plane.?.modifier == dmabuf.DRM_FORMAT_MOD_LINEAR;
+                try putU32(&out, a, if (usable) plane.?.offset else 0);
+                try putU32(&out, a, if (usable) plane.?.stride else 0);
+                try putU8(&out, a, @intFromBool(usable));
             }
         }
 
@@ -6600,7 +6616,7 @@ test "current state_sync: dmabuf buffer survives replica restore with pixels" {
     try t.expect(!replica.dead);
 }
 
-test "pre-v7 state_sync restores legacy pending LINEAR dmabuf params" {
+test "v6 state_sync serializes legacy pending LINEAR dmabuf params" {
     var tv = TestView{};
     var brain = try Compositor.init(t.allocator, tv.view());
     defer brain.deinit();
@@ -6621,29 +6637,9 @@ test "pre-v7 state_sync restores legacy pending LINEAR dmabuf params" {
         b2.putUint(0);
         try req(&brain, try b2.finish());
     }
-    const current = try brain.serializeState(t.allocator);
-    defer t.allocator.free(current);
-
-    // v7 tail: count + id + used + four presence bytes + plane-0 payload.
-    // v6 tail: count + id + offset + stride + ok.
-    const current_tail_len = 4 + 4 + 1 + dmabuf.MAX_PLANES + 16;
-    const legacy_tail_len = 4 + 4 + 4 + 4 + 1;
-    try t.expect(current.len > current_tail_len);
-    const prefix_len = current.len - current_tail_len;
-    const legacy = try t.allocator.alloc(u8, prefix_len + legacy_tail_len);
+    const legacy = try brain.serializeStateVersion(t.allocator, 6);
     defer t.allocator.free(legacy);
-    @memcpy(legacy[0..prefix_len], current[0..prefix_len]);
-    legacy[0] = 6;
-    var pos = prefix_len;
-    std.mem.writeInt(u32, legacy[pos..][0..4], 1, .little);
-    pos += 4;
-    std.mem.writeInt(u32, legacy[pos..][0..4], 4, .little);
-    pos += 4;
-    std.mem.writeInt(u32, legacy[pos..][0..4], 12, .little);
-    pos += 4;
-    std.mem.writeInt(u32, legacy[pos..][0..4], 64, .little);
-    pos += 4;
-    legacy[pos] = 1;
+    try t.expectEqual(@as(u8, 6), legacy[0]);
 
     var tv2 = TestView{};
     var replica = try Compositor.init(t.allocator, tv2.view());

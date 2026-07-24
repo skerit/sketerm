@@ -105,8 +105,8 @@ This script:
 3. `codesign -f -s sketerm-dev --identifier dev.sker.sketerm-mux …`
    (override the identity with `SKETERM_SIGN_ID`)
 4. writes `~/Library/LaunchAgents/dev.sker.sketerm-mux.plist`
-5. `launchctl bootout` + `bootstrap gui/$UID` — loads the agent in
-   **your** GUI session
+5. bootstraps the agent in **your** GUI session when absent; an already
+   loaded daemon is preserved so its sessions keep running
 
 The first run prints `✓ deployed — signed by 'sketerm-dev', agent
 dev.sker.sketerm-mux running …`. The daemon is now alive but capture
@@ -132,14 +132,16 @@ Accessibility. Trigger them, then enable:
    enable **sketerm-mux**.
 3. **System Settings → Privacy & Security → Accessibility** →
    enable **sketerm-mux** (needed for keyboard/mouse/close).
-4. Restart the daemon so Screen Recording takes effect (it only
-   applies on relaunch):
+4. Screen Recording takes effect only on relaunch. First confirm
+   `sketerm mux list` has no sessions, then explicitly restart:
 
    ```bash
    launchctl kickstart -k gui/$(id -u)/dev.sker.sketerm-mux
    ```
 
-   (Re-running `dist/deploy-macos.sh` also does this.)
+   This command destroys live sessions. The deploy script deliberately
+   does not restart a loaded daemon; the new binary otherwise applies at
+   its natural exit or the next reboot.
 
 > **If an entry shows up but capture still says "declined":** it was
 > registered against an *older* binary hash. Select sketerm-mux in
@@ -184,7 +186,7 @@ tail -f /tmp/sketerm-mux.log
 
 ```bash
 # edit code …
-dist/deploy-macos.sh        # build, re-sign, reload agent — that's all
+dist/deploy-macos.sh        # build, re-sign, preserve the loaded agent
 tail -f /tmp/sketerm-mux.log
 ```
 

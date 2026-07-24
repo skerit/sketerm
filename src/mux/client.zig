@@ -7,13 +7,6 @@ const c = @import("../c.zig").c;
 const wire = @import("wire.zig");
 const daemon = @import("daemon.zig");
 
-/// Proto version advertised by the remote daemon's `welcome` the last
-/// time a handshake returned `error.MuxProtoMismatch`. Callers read this
-/// to report which side falls outside the supported compatibility range.
-/// Single-threaded (GUI main loop / blocking CLI), so a plain var is
-/// safe.
-pub var last_remote_proto: u32 = 0;
-
 /// Resolve the sketerm-mux binary: sibling of our own executable
 /// first (works for `zig build run` trees), then bare name ($PATH).
 pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
@@ -49,6 +42,10 @@ pub const Conn = struct {
     /// drain before failing (a wedged daemon must cost an error, not
     /// a hung caller).
     write_timeout_ms: c_int = 30_000,
+    /// Selected core profile and the daemon's newest profile when advertised.
+    proto: u32 = 1,
+    server_proto: u32 = 1,
+    snapshot_version: u8 = @import("snapshot.zig").LEGACY_SNAPSHOT_VERSION,
 
     pub fn connect(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -63,11 +60,11 @@ pub const Conn = struct {
     /// Connect to a specific daemon socket and complete the
     /// hello/welcome probe (proto negotiation — without it the daemon
     /// treats the client as proto 1 and never streams app channels).
-    /// NO autostart and no stale-daemon retire: viewer semantics — a
-    /// dead or mismatched daemon is an error, not a spawn.
+    /// NO autostart and no stale-daemon retire: a failed handshake is
+    /// an error and never triggers daemon replacement.
     pub fn connectProbed(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
         const conn = try Conn.connect(allocator, sock_path);
-        return helloProbe(allocator, conn);
+        return probe(allocator, conn);
     }
 
     /// Connect to the local daemon, spawning it (sibling binary,
@@ -89,16 +86,7 @@ pub const Conn = struct {
             try daemon.defaultSocketPath(allocator);
         defer allocator.free(path);
         if (Conn.connect(allocator, path)) |conn| {
-            if (helloProbe(allocator, conn)) |ready| {
-                return ready;
-            } else |err| {
-                // A handshake failure other than a version skew is real —
-                // propagate. On a version skew the running daemon is a stale
-                // build of OUR per-user local daemon: retire it and respawn
-                // the matching version below (the spawn/retry path).
-                if (err != error.MuxProtoMismatch) return err;
-                retireStaleDaemon(allocator, path);
-            }
+            return probe(allocator, conn);
         } else |_| {}
 
         // Process-isolation broker by default: each session runs in its own
@@ -135,51 +123,66 @@ pub const Conn = struct {
         while (tries < 40) : (tries += 1) {
             _ = c.usleep(50_000);
             if (Conn.connect(allocator, path)) |conn| {
-                return helloProbe(allocator, conn);
+                return probe(allocator, conn);
             } else |_| {}
         }
         return error.MuxDaemonUnreachable;
     }
 
-    /// Tell a running-but-version-mismatched LOCAL daemon (a stale build of
-    /// the per-user daemon we own) to shut down, then wait for it to release
-    /// the socket so the fresh, matching daemon can bind. Best-effort.
-    fn retireStaleDaemon(allocator: std.mem.Allocator, path: []const u8) void {
-        if (Conn.connect(allocator, path)) |conn| {
-            var c2 = conn;
-            defer c2.deinit();
-            // `.shutdown` is a stable (append-only) frame type, so even an
-            // older daemon understands it.
-            c2.sendFrame(.shutdown, "") catch {};
-        } else |_| return;
-        var tries: u32 = 0;
-        while (tries < 60) : (tries += 1) {
-            _ = c.usleep(50_000);
-            if (Conn.connect(allocator, path)) |probe| {
-                var pc = probe;
-                pc.deinit();
-            } else |_| return; // no longer accepting connections → gone
-        }
-    }
-
     /// hello → welcome round trip; consumes the welcome so the
     /// stream is clean for the caller's own frames.
-    fn helloProbe(allocator: std.mem.Allocator, conn_in: Conn) !Conn {
+    pub fn probe(allocator: std.mem.Allocator, conn_in: Conn) !Conn {
         var conn = conn_in;
         errdefer conn.deinit();
-        try conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video });
+        try conn.sendHello();
         // Bounded: a daemon that accepts but never answers (wedged,
         // swap-thrashing) must fail the connect, not hang the caller.
         const w = try conn.recvExpectFor(&.{.welcome}, 10_000);
         defer w.deinit(allocator);
-        // Older daemons emit their own older state format, which this client
-        // retains decoders for. Reject only versions outside that range.
-        const Probe = struct { proto: u32 = 0 };
-        if (std.json.parseFromSlice(Probe, allocator, w.payload, .{ .ignore_unknown_fields = true })) |parsed| {
-            defer parsed.deinit();
-            if (!wire.clientSupportsServerProto(parsed.value.proto)) return error.MuxProtoMismatch;
-        } else |_| {}
+        conn.applyWelcome(allocator, w.payload);
         return conn;
+    }
+
+    fn sendHello(self: *Conn) !void {
+        try self.sendJson(.hello, .{
+            .proto = wire.PROTO_VERSION,
+            .min_proto = @as(u32, 1),
+            .negotiation = @as(u8, 1),
+            .snapshot_max = @import("snapshot.zig").SNAPSHOT_VERSION,
+            .native_state_max = wire.NATIVE_STATE_VERSION,
+            .audio = true,
+            .winstream = true,
+            .video = @import("build_options").video,
+        });
+    }
+
+    fn applyWelcome(self: *Conn, allocator: std.mem.Allocator, payload: []const u8) void {
+        self.proto = 0;
+        self.server_proto = 0;
+        self.snapshot_version = 0;
+        const Probe = struct {
+            proto: u32 = 1,
+            server_proto: ?u32 = null,
+            negotiation: u8 = 0,
+            snapshot: u8 = 0,
+        };
+        if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
+            defer parsed.deinit();
+            const reported = parsed.value.proto;
+            self.proto = if (parsed.value.negotiation > 0)
+                reported
+            else if (reported >= 1 and reported <= wire.PROTO_VERSION)
+                reported
+            else
+                0;
+            self.server_proto = parsed.value.server_proto orelse reported;
+            self.snapshot_version = if (parsed.value.snapshot > 0)
+                @min(parsed.value.snapshot, @import("snapshot.zig").SNAPSHOT_VERSION)
+            else if (self.proto >= 6)
+                @import("snapshot.zig").SNAPSHOT_VERSION
+            else
+                @import("snapshot.zig").LEGACY_SNAPSHOT_VERSION;
+        } else |_| {}
     }
 
     pub fn deinit(self: *Conn) void {
@@ -282,17 +285,10 @@ pub const Conn = struct {
         var conn = try spawnOverSocketpair(allocator, mux_bin, &argv2);
         errdefer conn.deinit();
 
-        conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video }) catch return error.SshTransportFailed;
+        conn.sendHello() catch return error.SshTransportFailed;
         const w = conn.recvExpectFor(&.{.welcome}, 20_000) catch return error.SshTransportFailed;
         defer w.deinit(allocator);
-        const Probe = struct { proto: u32 = 0 };
-        if (std.json.parseFromSlice(Probe, allocator, w.payload, .{ .ignore_unknown_fields = true })) |parsed| {
-            defer parsed.deinit();
-            if (!wire.clientSupportsServerProto(parsed.value.proto)) {
-                last_remote_proto = parsed.value.proto;
-                return error.MuxProtoMismatch;
-            }
-        } else |_| {}
+        conn.applyWelcome(allocator, w.payload);
         return conn;
     }
 
@@ -318,8 +314,6 @@ pub const Conn = struct {
             if (connectSshOnce(allocator, host)) |conn| {
                 return conn;
             } else |err| {
-                // A version skew won't heal on retry — surface it now.
-                if (err == error.MuxProtoMismatch) return err;
                 if (attempt + 1 >= 3) return err;
                 _ = c.usleep(400_000);
             }
@@ -377,21 +371,11 @@ pub const Conn = struct {
         // binary + daemon all came up before we hand the conn out.
         // Bound the welcome wait so a stalled banner surfaces as a
         // retryable error instead of hanging the blocking read forever.
-        conn.sendJson(.hello, .{ .proto = @import("wire.zig").PROTO_VERSION, .video = @import("build_options").video }) catch return error.SshTransportFailed;
+        conn.sendHello() catch return error.SshTransportFailed;
         try waitReadable(conn.fd, 20_000);
         const w = conn.recvExpectFor(&.{.welcome}, 20_000) catch return error.SshTransportFailed;
         defer w.deinit(allocator);
-        // Accept older daemons while their snapshots and channel state remain
-        // decodable. Reject unsupported versions here rather than desyncing
-        // later during attach.
-        const Probe = struct { proto: u32 = 0 };
-        if (std.json.parseFromSlice(Probe, allocator, w.payload, .{ .ignore_unknown_fields = true })) |parsed| {
-            defer parsed.deinit();
-            if (!wire.clientSupportsServerProto(parsed.value.proto)) {
-                last_remote_proto = parsed.value.proto;
-                return error.MuxProtoMismatch;
-            }
-        } else |_| {}
+        conn.applyWelcome(allocator, w.payload);
         return conn;
     }
 
@@ -424,6 +408,8 @@ pub const Conn = struct {
     /// behind it and only the nonblocking flush runs; the upload pump
     /// (or a later flushQueuedFor) finishes the delivery.
     pub fn sendFrame(self: *Conn, ftype: wire.FrameType, payload: []const u8) !void {
+        if (self.proto == 0 and ftype != .hello and ftype != .list)
+            return error.NoSharedTerminalProfile;
         const had_backlog = self.wbuf.items.len > 0;
         try wire.appendFrame(&self.wbuf, self.allocator, ftype, payload);
         if (had_backlog) return self.flushQueued();
@@ -433,6 +419,8 @@ pub const Conn = struct {
     /// Queue one complete frame and write only what the nonblocking fd
     /// accepts immediately. Partial writes remain resumable in `wbuf`.
     pub fn queueFrame(self: *Conn, ftype: wire.FrameType, payload: []const u8) !void {
+        if (self.proto == 0 and ftype != .hello and ftype != .list)
+            return error.NoSharedTerminalProfile;
         try wire.appendFrame(&self.wbuf, self.allocator, ftype, payload);
         try self.flushQueued();
     }
@@ -666,6 +654,26 @@ pub const Conn = struct {
         return self.last_err[0..self.last_err_len];
     }
 };
+
+test "welcome records older and future daemon profiles without rejecting either" {
+    const a = std.testing.allocator;
+    var conn = Conn{ .allocator = a, .fd = -1 };
+    conn.applyWelcome(a, "{\"proto\":5}");
+    try std.testing.expectEqual(@as(u32, 5), conn.proto);
+    try std.testing.expectEqual(@as(u32, 5), conn.server_proto);
+    conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1}");
+    try std.testing.expectEqual(@as(u32, 6), conn.proto);
+    try std.testing.expectEqual(@as(u32, 9), conn.server_proto);
+    conn.applyWelcome(a, "{\"proto\":0,\"server_proto\":9,\"negotiation\":1}");
+    try std.testing.expectEqual(@as(u32, 0), conn.proto);
+    conn.applyWelcome(a, "{\"proto\":9}");
+    try std.testing.expectEqual(@as(u32, 0), conn.proto);
+    try std.testing.expectEqual(@as(u32, 9), conn.server_proto);
+    try std.testing.expectError(error.NoSharedTerminalProfile, conn.sendFrame(.attach, "{}"));
+    try std.testing.expectError(error.NoSharedTerminalProfile, conn.queueFrame(.kill, "{}"));
+    conn.applyWelcome(a, "{");
+    try std.testing.expectEqual(@as(u32, 0), conn.proto);
+}
 
 /// Pull the `error` string out of a daemon err payload (`{"error":"…"}`)
 /// without a full JSON parse. Falls back to the raw payload.

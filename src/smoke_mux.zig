@@ -24,6 +24,70 @@ fn fail(comptime msg: []const u8) noreturn {
 
 const MARKER = "mux-smoke-7311";
 
+fn negotiationStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    // A future client with no shared core can still list sessions; attach is
+    // refused without mutating the daemon or its sessions.
+    var future = client_mod.Conn.connect(allocator, sock_path) catch fail("neg future connect");
+    defer future.deinit();
+    future.sendJson(.hello, .{
+        .proto = @as(u32, wire.PROTO_VERSION + 3),
+        .min_proto = @as(u32, wire.PROTO_VERSION + 1),
+        .negotiation = @as(u8, 1),
+        .snapshot_max = snapshot.SNAPSHOT_VERSION,
+    }) catch fail("neg future hello");
+    const fw = future.recvExpect(&.{.welcome}) catch fail("neg future welcome");
+    if (std.mem.indexOf(u8, fw.payload, "\"proto\":0") == null) fail("neg future overlap");
+    fw.deinit(allocator);
+    future.sendFrame(.list, "") catch fail("neg future list");
+    const fl = future.recvExpect(&.{.welcome}) catch fail("neg future list reply");
+    if (std.mem.indexOf(u8, fl.payload, "\"smoke\"") == null) fail("neg future list lost sessions");
+    fl.deinit(allocator);
+    future.sendJson(.attach, .{ .name = "smoke" }) catch fail("neg future attach");
+    (future.recvExpect(&.{.err}) catch fail("neg future attach not refused")).deinit(allocator);
+
+    var legacy_future = client_mod.Conn.connect(allocator, sock_path) catch fail("neg legacy future connect");
+    defer legacy_future.deinit();
+    legacy_future.sendJson(.hello, .{ .proto = wire.PROTO_VERSION + 3 }) catch fail("neg legacy future hello");
+    const lfw = legacy_future.recvExpect(&.{.welcome}) catch fail("neg legacy future welcome");
+    if (std.mem.indexOf(u8, lfw.payload, "\"proto\":0") == null) fail("neg legacy future clamped");
+    lfw.deinit(allocator);
+    legacy_future.sendFrame(.shutdown, "") catch fail("neg legacy future shutdown send");
+    (legacy_future.recvExpect(&.{.err}) catch fail("neg legacy future shutdown not refused")).deinit(allocator);
+
+    // Protocol 1 cannot identify which historical snapshot revision it reads.
+    // Keep discovery available, but do not guess and corrupt its stream.
+    var v1 = client_mod.Conn.connect(allocator, sock_path) catch fail("neg v1 connect");
+    defer v1.deinit();
+    v1.sendJson(.hello, .{ .proto = @as(u32, 1) }) catch fail("neg v1 hello");
+    const v1w = v1.recvExpect(&.{.welcome}) catch fail("neg v1 welcome");
+    if (std.mem.indexOf(u8, v1w.payload, "\"proto\":0") == null) fail("neg v1 ambiguity");
+    v1w.deinit(allocator);
+    v1.sendJson(.attach, .{ .name = "smoke" }) catch fail("neg v1 attach");
+    (v1.recvExpect(&.{.err}) catch fail("neg v1 attach not refused")).deinit(allocator);
+
+    // Optional-format negotiation can select an older snapshot body while
+    // keeping the current core protocol.
+    var legacy = client_mod.Conn.connect(allocator, sock_path) catch fail("neg legacy connect");
+    defer legacy.deinit();
+    legacy.sendJson(.hello, .{
+        .proto = wire.PROTO_VERSION,
+        .min_proto = @as(u32, 1),
+        .negotiation = @as(u8, 1),
+        .snapshot_max = @as(u8, 3),
+        .native_state_max = @as(u8, 0),
+        .audio = false,
+        .winstream = false,
+    }) catch fail("neg legacy hello");
+    const lw = legacy.recvExpect(&.{.welcome}) catch fail("neg legacy welcome");
+    if (std.mem.indexOf(u8, lw.payload, "\"snapshot\":3") == null) fail("neg snapshot max ignored");
+    lw.deinit(allocator);
+    legacy.sendJson(.attach, .{ .name = "smoke" }) catch fail("neg legacy attach");
+    const snap = legacy.recvExpect(&.{.snapshot}) catch fail("neg legacy snapshot");
+    const envelope = snapshot.peelEnvelope(snap.payload) catch fail("neg legacy envelope");
+    if (std.mem.readInt(u32, envelope.body[0..4], .little) != 3) fail("neg legacy snapshot body");
+    snap.deinit(allocator);
+}
+
 /// 2x2 solid-red RGBA file for the t=f image stage.
 fn writeRedRgba(path: []const u8) !void {
     var z_buf: [4096]u8 = undefined;
@@ -46,7 +110,7 @@ const Mirror = struct {
         self.screen = null;
         self.pool.deinit();
         self.pool.* = try Pool.init(self.allocator);
-        self.screen = try snapshot.restore(self.allocator, self.pool, payload[9..]);
+        self.screen = try snapshot.restore(self.allocator, self.pool, (try snapshot.peelEnvelope(payload)).body);
     }
 
     fn applyEvents(self: *Mirror, payload: []const u8) !void {
@@ -596,6 +660,47 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
         const r = c.read(app_fd, &got, got.len);
         if (r > 0) fail("forged viewer wl_msg reached the app (v5 must drop it)");
         std.debug.print("smoke-mux: forged viewer event dropped ok\n", .{});
+    }
+
+    // An actual non-negotiating protocol-5 viewer must receive the historical
+    // v6 state blob, not be silently excluded by the current v7 capability.
+    {
+        var legacy = client_mod.Conn.connect(allocator, sock_path) catch fail("v5 native connect");
+        defer legacy.deinit();
+        _ = c.setsockopt(legacy.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+        legacy.sendJson(.hello, .{ .proto = @as(u32, 5) }) catch fail("v5 native hello");
+        const welcome = legacy.recvExpect(&.{.welcome}) catch fail("v5 native welcome");
+        if (std.mem.indexOf(u8, welcome.payload, "\"native_state\":6") == null) fail("v5 native capability");
+        welcome.deinit(allocator);
+        legacy.sendJson(.attach, .{ .name = "smoke" }) catch fail("v5 native attach");
+        (legacy.recvExpect(&.{.snapshot}) catch fail("v5 native snapshot")).deinit(allocator);
+
+        var replay: std.ArrayList(u8) = .empty;
+        defer replay.deinit(allocator);
+        var saw_v6 = false;
+        var tries: usize = 0;
+        while (!saw_v6 and tries < 200) : (tries += 1) {
+            const frame = legacy.recvFrame() catch fail("v5 native replay");
+            defer frame.deinit(allocator);
+            if (frame.ftype != .chan_data or frame.payload.len < 4) continue;
+            replay.appendSlice(allocator, frame.payload[4..]) catch fail("v5 native replay oom");
+            var replay_pos: usize = 0;
+            while (true) {
+                const unit = (wlpipe.peelUnit(replay.items[replay_pos..]) catch fail("v5 native replay unit")) orelse break;
+                if (unit.unit.tag == .state_sync) {
+                    if (unit.unit.payload.len == 0 or unit.unit.payload[0] != 6) fail("v5 native state version");
+                    saw_v6 = true;
+                }
+                replay_pos += unit.consumed;
+            }
+            if (replay_pos > 0) {
+                const remain = replay.items.len - replay_pos;
+                std.mem.copyForwards(u8, replay.items[0..remain], replay.items[replay_pos..]);
+                replay.shrinkRetainingCapacity(remain);
+            }
+        }
+        if (!saw_v6) fail("v5 native state replay missing");
+        std.debug.print("smoke-mux: protocol-5 native state downgrade ok\n", .{});
     }
 }
 
@@ -1998,6 +2103,8 @@ pub fn main() u8 {
     }) catch fail("spawn send");
     (conn.recvExpect(&.{.ok}) catch fail("spawn ok")).deinit(allocator);
 
+    negotiationStage(allocator, sock_path);
+
     // Attach → snapshot.
     var mirror = Mirror{ .allocator = allocator, .pool = allocator.create(Pool) catch fail("pool") };
     mirror.pool.* = Pool.init(allocator) catch fail("pool init");
@@ -2145,6 +2252,8 @@ pub fn main() u8 {
 
     // A second client sees the session in LIST.
     var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("connect2");
+    conn2.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("hello2 send");
+    (conn2.recvExpect(&.{.welcome}) catch fail("welcome2")).deinit(allocator);
     conn2.sendFrame(.list, "") catch fail("list send");
     const lst = conn2.recvExpect(&.{.welcome}) catch fail("list");
     if (std.mem.indexOf(u8, lst.payload, "\"smoke\"") == null) fail("list missing session");
