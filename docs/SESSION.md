@@ -8997,3 +8997,77 @@ loader. `zig build test --summary all` still deadlocks in the known Zig
 build runner after linking, so the linked artifact was executed directly.
 Kernel FUSE runtime coverage remains unavailable on this host because
 `/dev/fuse` is absent; `zig build smoke-fuse` remains the real-host proof.
+
+## 2026-07-24: browser high-importance batch — conflicts, preview, Open With, edit sync-back, compare/sync
+
+Five daily-driver features for the file browser, all live-verified under
+Xvfb against a genuinely separate fake-SSH daemon:
+
+- Conflict resolution for paste: the clipboard is now MULTI-item (Copy
+  captures the whole selection when it includes the clicked row), and a
+  paste that collides with the live target listing raises a popover with
+  Keep Both (unique -copy/-copyN name) / Skip Existing / Overwrite
+  (destructive-styled), one choice applying to all conflicting items.
+  Pasting a file onto itself is a guarded no-op. Verified on disk for all
+  three choices (keep-both created suffixed copies; overwrite replaced
+  content; skip left the modified target untouched).
+- Preview panel (toolbar toggle): metadata always; images render via
+  bounded gdk-pixbuf decode (local) or chunked fs reads (remote, capped
+  8MB); text files show a 4KB head with NUL-probe binary detection and
+  UTF-8 sanitization. Local image rows also get real 24px thumbnails,
+  cached by path+mtime (cap 256, decode bounded). Remote preview fetches
+  ride the SAME nonblocking conn as listings — new fs_data/fs_reply
+  consumers in browser.zig (feedPreview), abandoned safely on host death.
+- Unified Open With chooser on files: local GAppInfo handlers for the
+  guessed content type, PLUS on remote tabs a host-side application list
+  served by the new daemon `apps` fs op (one round trip; scans
+  usr/local/user .desktop dirs, skips NoDisplay/Hidden, user entries
+  shadow system ones, cap 400). Host apps are MIME-filtered client-side;
+  choosing one substitutes the Exec line (%f/%F/%u/%U quoted, %% literal,
+  stray codes dropped — unit-tested) and runs it as a forwarded app
+  session via on_host_exec. Choosing a local app on a remote file
+  downloads to the open-cache and launches THAT app by id.
+  Gotcha fixed: the chooser popover must popdown the context menu BEFORE
+  popping itself up, or its grab dies with the menu (blank popover).
+- Local-edit sync-back: every remote file opened locally registers a
+  GFileMonitor EditWatch on its cache copy; CHANGES_DONE_HINT uploads the
+  edit back to the origin host via a client-mediated transfer (staged
+  .skpart + both-ends hash verify), deduped per (host, remote path), with
+  an uploading latch so rapid saves cannot stack transfers. Verified
+  end-to-end: appended to the cache copy, remote file gained the edit.
+- Compare / Sync window ("Compare / Sync with Copied…" on a directory
+  when the clipboard holds one): BOTH trees are scanned host-side (find
+  jobs, pattern *, streaming path+kind+size+mtime digests — only digests
+  cross the wire; find match events now carry mtime_ms), diffed
+  client-side, and shown as rows (only-in-source / only-in-target /
+  differs with newer-side annotation) each with a direction dropdown
+  defaulting to copy-from-the-side-that-has-it / newer-wins. Comma-
+  separated exclude globs (fsjob.nameMatches). Execute runs mkdirs
+  (path-sorted, parents first) + same-host copy jobs or cross-host
+  durable transfers; copy-only by design (no deletes — a wrong direction
+  cannot destroy data). A truncated scan (2000-entry cap) is banner-
+  flagged as PARTIAL. Verified live: cross-host sync copied 3 files to
+  the target, overwrote the differing file (source newer), created the
+  missing directory + file back on the source side, and honored the
+  exclusion glob.
+
+Also in this batch:
+- FIXED pre-existing musl break: `zig build mux-portable` failed at the
+  baseline commit because musl's struct statvfs translates as opaque
+  (anonymous bitfield); the statfs op now comptime-gates on that and
+  serves conservative defaults on musl daemons.
+- smoke-fs was RED at the baseline commit: the corrupt-partial stage
+  still expected the old fail-hard contract, but fstransfer (previous
+  session) now deletes the corrupt destination and retries once from
+  zero. The stage now asserts the new contract: transfer ends OK,
+  content hash-matches the source, no staged partial left.
+
+Verification: GUI + mux + mux-portable (musl) + aarch64-macos builds
+pass; sketerm-mux links libc/libm only (ldd-checked). Direct test run:
+846 passed, 6 skipped, 0 failed (852 total; +3 unit tests for exec-line
+substitution, MIME list matching, image-extension gate). smoke-fs
+(monolith + broker + xfer + search stages), smoke-broker, smoke-mcp,
+smoke-e2e (xvfb) all PASS. The zig-build-test runner deadlock persists
+(documented workaround used). Live GUI proof: 20+ screenshots covering
+every feature above; isolated world torn down by exact PID (2 daemons,
+0 leftovers).
