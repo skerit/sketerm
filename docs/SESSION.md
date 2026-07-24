@@ -8941,3 +8941,59 @@ demand today), collection persistence across sessions, per-rule file
 coloring config, FUSE placeholder/pin/evict cache tiers (reads are
 ranged+direct today; the CfAPI-style cache is the phase-6 second
 step), $EDITOR-buffer batch rename.
+
+## 2026-07-24: durable file jobs, live queries, and FUSE hydration cache
+
+- Added the GTK-free browser state model (`filebrowser/model.zig`) and
+  versioned full-pane layout persistence: explicit host/path file refs,
+  per-tab history, expansion, selection, view/sort/filter state, and
+  virtual-folder specifications survive save/restore.
+- Added atomic daemon job journals (`mux/fsjournal.zig`) with stable job
+  ids and restart reconstruction. Local copies resume only after prefix
+  verification; detached helpers are rediscovered after daemon failure.
+  Cross-host copies now run as daemon jobs connecting both endpoints,
+  preserve trees/symlinks/metadata, resume `.skpart` files, and verify
+  SHA-256 at both ends.
+- Added host-side archive create/extract with archive-path traversal
+  rejection, freedesktop home-trash move/restore, command panelization,
+  and recursive live filename queries. Live queries maintain recursive
+  inotify registrations and stream match/unmatch/resync events instead
+  of rerunning a one-shot search.
+- Added browser actions for trash, permanent delete, archive operations,
+  metadata/permission editing, and matching MCP file tools. Directory
+  listings now own tag strings correctly; failed/truncated tree copies,
+  vanished files, symlink failures, and corrupt equal-size resume targets
+  fail honestly instead of being silently skipped.
+- Added Linux `/proc/self/mounts` and macOS `getmntinfo()` source parsing,
+  including NFS/SSH normalization, root mounts, and bracketed IPv6.
+- Completed the FUSE sparse hydration layer (`filebrowser/cache.zig`).
+  Mount namespaces include the full host/path specification; entries
+  persist sparse hydrated ranges atomically and expose
+  `user.sketerm.cache-state`, `user.sketerm.pin`, and
+  `user.sketerm.evict`. Pinning hydrates incrementally between kernel
+  requests, survives remounts, retries transient failures with bounded
+  backoff, and migrates across file/directory renames. Unlink removes pin
+  metadata rather than creating retrying zombie entries.
+- FUSE directory handles now use live mux views. Delta changes invalidate
+  affected kernel dentries/inodes and sparse cache entries; resync events
+  invalidate every known child. Renamed open directories establish the
+  replacement subscription before dropping the old one. Transport HUP
+  terminates the mount loop rather than spinning. `FUSE_EXPLICIT_INVAL_DATA`
+  is deliberately not negotiated because subscriptions are scoped to open
+  directory handles; normal kernel cache expiry remains the correctness
+  fallback when no directory is open.
+- File content generations include nanosecond mtime/ctime when available
+  and retain millisecond fields for older-daemon compatibility. Persisted
+  range metadata is accepted only when bounded by both remote size and the
+  local sparse file. Synthetic xattrs parse the compatibility FUSE header,
+  validate flags, reject non-regular pin targets, and report persistence
+  failures.
+
+Verification: `zig build -Dstrip=false`, `zig build mux`, and
+`zig build mux-portable -Dportable-target=aarch64-macos` pass. The freshly
+linked direct test executable reports 790 passed, 6 skipped, 0 failed (796
+total). `ldd zig-out/bin/sketerm-mux` remains limited to libc/libm and the
+loader. `zig build test --summary all` still deadlocks in the known Zig
+build runner after linking, so the linked artifact was executed directly.
+Kernel FUSE runtime coverage remains unavailable on this host because
+`/dev/fuse` is absent; `zig build smoke-fuse` remains the real-host proof.
