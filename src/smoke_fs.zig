@@ -784,8 +784,9 @@ fn xferStage(allocator: std.mem.Allocator, sock_a: []const u8, sock_b: []const u
             fail("resumed xfer content mismatch");
     }
 
-    // ── corrupted partial: resume must FAIL the verify and delete
-    // the corrupt destination (honesty over silence) ───────────
+    // ── corrupted partial: the verify must CATCH the mismatch,
+    // delete the corrupt destination, and retry once from zero —
+    // the transfer ends CORRECT, never silently corrupt ─────────
     const src3 = std.fmt.bufPrint(&pb[4], "{s}/ver.bin", .{dir_a}) catch unreachable;
     const dst3 = std.fmt.bufPrint(&pb[5], "{s}/ver.copy", .{dir_b}) catch unreachable;
     writePattern(src3, 3 << 20, 31);
@@ -799,8 +800,11 @@ fn xferStage(allocator: std.mem.Allocator, sock_a: []const u8, sock_b: []const u
         defer x.deinit();
         x.start();
         if (!pumpXfer(allocator, x, &conns, 60_000, 0)) fail("verify xfer never finished");
-        if (x.ok()) fail("corrupt resume passed verification");
-        if (statExists(&fsb, allocator, dst3)) fail("corrupt destination not deleted");
+        if (!x.ok()) failErr("corrupt-resume retry did not recover", x.errMsg());
+        if (!std.mem.eql(u8, &(fileSha(dst3) orelse fail("dst3 sha")), &(fileSha(src3) orelse fail("src3 sha"))))
+            fail("corrupt resume produced wrong content");
+        const staged_left = std.fmt.bufPrint(&partp, "{s}.skpart", .{dst3}) catch unreachable;
+        if (statExists(&fsb, allocator, staged_left)) fail("corrupt-resume retry left staged partial");
     }
 
     // ── tree A → B (dirs, files, symlink), then a resumable rerun
