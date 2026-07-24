@@ -234,6 +234,12 @@ pub const Window = struct {
     /// child gets SKETERM_SOCKET even if the listener starts later.
     ipc_path: ?[:0]u8 = null,
     debug_events: bool = false,
+    /// Save the layout right before an X-button close destroys the
+    /// widget tree (the shutdown hook runs too late — tabs are gone).
+    save_on_close: bool = true,
+    /// A close-path save already ran; the shutdown hook must not
+    /// overwrite it with the post-teardown (empty) state.
+    layout_saved_final: bool = false,
     /// Last (visible|urgent|percent) published to the taskbar via
     /// the Unity LauncherEntry signal; dedups OSC progress floods.
     taskbar_sent: u32 = 0xFFFF_FFFF,
@@ -2155,6 +2161,7 @@ pub const Window = struct {
         };
         win.debug_events = self.debug_events;
         win.hold_override = self.hold_override;
+        win.save_on_close = self.save_on_close;
         c.gtk_window_present(@ptrCast(win.app_window));
         return win;
     }
@@ -7903,6 +7910,14 @@ fn onCloseTabResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*a
 fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Window, user);
 
+    // Capture the layout NOW: the default close destroys every tab
+    // before the GApplication shutdown hook runs, which used to save
+    // an EMPTY last.json after any X-button close.
+    if (self.save_on_close) {
+        self.saveLayoutQuietly();
+        self.layout_saved_final = true;
+    }
+
     if (self.config.confirm_close == .never) return 0;
 
     const npanes = self.panes.items.len;
@@ -7948,6 +7963,10 @@ fn onCloseWinResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*a
     const resp_c = c.adw_alert_dialog_choose_finish(dialog, result);
     const resp = std.mem.span(@as([*:0]const u8, @ptrCast(resp_c)));
     if (std.mem.eql(u8, resp, "close")) {
+        if (pending.win.save_on_close) {
+            pending.win.saveLayoutQuietly();
+            pending.win.layout_saved_final = true;
+        }
         // Disconnect our close-request handler before destroying so
         // it doesn't fire again on the actual close.
         c.gtk_window_destroy(@ptrCast(pending.win.app_window));
