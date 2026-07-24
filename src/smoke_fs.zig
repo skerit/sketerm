@@ -716,6 +716,43 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
         if (pst.st_mode & 0o7777 != 0o700) fail("perm_tree did not reach the subdirectory");
     }
 
+    // ── extended attributes: set, list, and per-entry columns ──
+    {
+        touch(dir, "attrs.txt", "attributed\n");
+        const target = std.fmt.bufPrint(&pb[3], "{s}/attrs.txt", .{dir}) catch unreachable;
+        fs.attrSet(target, "user.sketerm.comment", "hello metadata") catch
+            failErr("attr_set", fs.lastErr());
+        fs.attrSet(target, "user.xdg.origin.url", "https://example.invalid/x") catch
+            failErr("attr_set origin", fs.lastErr());
+        // Namespaces outside user.* are refused: the browser must not
+        // become a path to editing security attributes.
+        if (fs.attrSet(target, "security.selinux", "x")) |_| {
+            fail("attr_set accepted a non-user namespace");
+        } else |_| {}
+
+        var listing = fs.listAttrs(dir, "user.sketerm.comment,user.xdg.origin.url") catch
+            failErr("list with attrs", fs.lastErr());
+        defer listing.deinit();
+        var seen = false;
+        for (listing.entries) |e| {
+            if (!std.mem.eql(u8, e.name, "attrs.txt")) continue;
+            seen = true;
+            if (e.attrs.len != 2) fail("entry attrs count");
+            if (!std.mem.eql(u8, e.attrs[0], "hello metadata")) fail("comment attr value");
+            if (!std.mem.eql(u8, e.attrs[1], "https://example.invalid/x")) fail("origin attr value");
+        }
+        if (!seen) fail("attributed entry missing from listing");
+
+        // Clearing removes the attribute rather than storing "".
+        fs.attrSet(target, "user.sketerm.comment", "") catch failErr("attr clear", fs.lastErr());
+        var after = fs.listAttrs(dir, "user.sketerm.comment") catch failErr("list after clear", fs.lastErr());
+        defer after.deinit();
+        for (after.entries) |e| {
+            if (!std.mem.eql(u8, e.name, "attrs.txt")) continue;
+            if (e.attrs.len != 1 or e.attrs[0].len != 0) fail("cleared attribute still present");
+        }
+    }
+
     // ── jobs survive their client (durability) ─────────────────
     var orphan_job: u64 = 0;
     {
