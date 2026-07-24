@@ -9175,3 +9175,62 @@ libc/libm only (ldd). Tests 847 passed / 6 skipped / 0 failed (854
 total; +1 places test). smoke-fs (5 stages), smoke-broker, smoke-mcp,
 smoke-e2e (xvfb) all PASS. The zig-build-test runner deadlock
 persists; direct-binary workaround used throughout.
+
+## 2026-07-24: freedesktop thumbnails (host-side, fully async) + archive browsing
+
+Replacing the admittedly crude first-pass thumbnails ("serious miss,
+unforgivable" — correctly) and adding archive browsing:
+
+- Thumbnails now use the REAL freedesktop thumbnail spec, verified
+  against the spec's canonical example hash (new GTK-free
+  src/filebrowser/thumbs.zig: percent-encoded file:// URI, md5 key,
+  thumbnails/normal/<md5>.png; unit-tested). Local files: a persistent
+  worker thread (pthread mutex/cond; refcounted ctx so a dying view
+  orphans in-flight results instead of racing them) probes the local
+  cache FIRST — thumbnails Nemo/GNOME already generated are reused
+  as-is, verified by unchanged file mtimes across an app restart —
+  validates Thumb::MTime, and only then decodes (bounded 128px) and
+  saves spec-compliant: tEXt Thumb::URI + Thumb::MTime chunks, dirs
+  0700, files 0600, temp+rename. Verified on-disk: correct keys,
+  correct chunks, correct permissions.
+- REMOTE thumbnails live on the HOST THAT OWNS THE FILES, never on
+  the viewer: a serial per-view pipeline reads the remote cache path
+  over the fs wire (new `homedir` op resolves the remote cache dir
+  once per connection), validates MTime, and on miss fetches the
+  source bytes (capped), decodes/encodes on the worker, displays, and
+  WRITES THE PNG BACK into the remote host's cache (mkdirs + fs_write
+  + rename, req-0 best-effort) — so the remote machine's own apps
+  share it. Verified: remote cache gained exactly the two expected
+  md5-keyed PNGs, the local cache did not, and a restart re-served
+  thumbnails from the remote cache without regeneration (mtimes
+  unchanged) with pixel-exact renders.
+- Everything is async by construction: render shows generic icons
+  and never waits; results trickle in via idle handbacks with a
+  coalesced 120ms re-render; failures are negative-cached. The old
+  synchronous decode-in-render path is deleted.
+- Archive browsing: "Browse Archive" on any archive opens a members
+  tab streamed by a new `archive_list` job (bsdtar -tf host-side —
+  only the member table crosses the wire; tar/zip/7z alike, capped
+  with truncation flag). Members activate (or "Extract and Open" via
+  their restricted menu) through `archive_extract`: ONE member is
+  extracted host-side into a private mkdtemp and then opened — local
+  directly, remote via the download-open path (which also registers
+  the edit sync-back watch). Verified live for a local tar.gz and a
+  REMOTE archive over the fake-SSH rig, including the extracted file
+  landing in the viewer (Chromium showed the image).
+- FIXED while verifying: the daemon's job DONE events never forwarded
+  the result path/text fields (fsJobEmit dropped them), which had
+  silently broken undo-of-trash (it needs the trashed+info paths from
+  the done event) and would have broken member-open. FsJob now
+  retains done_path/done_text and forwards them. Undo-of-trash
+  re-verified live: trash via menu removed the file, Ctrl+Z restored
+  it. Also fixed: the archive job op mapping initially fell through
+  to `hash` (a silent no-op patch); the members tab showed 0 items
+  until the mapping was corrected — caught by instrumented live
+  testing, not by review.
+
+Verification: GUI + mux + musl-portable + aarch64-macos build; daemon
+libc/libm only. Tests 850 passed / 6 skipped / 0 failed (857 total;
++3 thumbs spec tests incl. the canonical hash example). smoke-fs (5
+stages) / smoke-broker / smoke-mcp / smoke-e2e (xvfb) PASS. Rig torn
+down by exact PID (2 daemons), /tmp/sketerm-arx-* cleaned.
