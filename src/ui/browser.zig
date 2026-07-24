@@ -28,6 +28,7 @@ const fsserve = @import("../mux/fsserve.zig");
 const fstransfer = @import("../ipc/fstransfer.zig");
 const browser_model = @import("../filebrowser/model.zig");
 const places_mod = @import("../filebrowser/places.zig");
+const thumbs_mod = @import("../filebrowser/thumbs.zig");
 const fsjob = @import("../mux/fsjob.zig");
 const mounts = @import("../util/mounts.zig");
 const input = @import("input.zig");
@@ -88,6 +89,8 @@ const WireReply = struct {
     size: u64 = 0,
     eof: bool = false,
     apps: []WireApp = &.{},
+    home: []const u8 = "",
+    cache: []const u8 = "",
 };
 
 /// One host-side application (daemon `apps` op reply).
@@ -229,6 +232,10 @@ const HostConn = struct {
     /// Owning view died while the connect thread was in flight; the
     /// idle handback frees this struct.
     orphaned: bool = false,
+    /// The host's cache dir (thumbnail placement); fetched once via
+    /// the homedir op.
+    cache_dir: ?[]u8 = null,
+    cache_req: u32 = 0,
 
     fn label(self: *const HostConn) []const u8 {
         return self.host orelse "local";
@@ -237,6 +244,7 @@ const HostConn = struct {
     fn destroy(self: *HostConn, allocator: std.mem.Allocator) void {
         if (self.watch_id != 0) _ = c.g_source_remove(self.watch_id);
         if (self.state == .ready) self.conn.deinit();
+        if (self.cache_dir) |cd| allocator.free(cd);
         if (self.host) |h| allocator.free(h);
         allocator.destroy(self);
     }
@@ -267,6 +275,9 @@ const Dir = struct {
     /// Collection mode: flat rows whose `target` is a host-qualified
     /// SPEC ("host:/path" or "/path") — entries span hosts.
     collection: bool = false,
+    /// Archive-browse mode: rows are MEMBERS of this archive path
+    /// (owned); activation extracts host-side then opens.
+    archive: []u8 = &.{},
     /// Sort parameters (kept on the Dir so delta-driven re-sorts in
     /// onDelta need no tab lookup); the owning tab pushes changes.
     sort_key: browser_model.SortKey = .name,
@@ -276,6 +287,7 @@ const Dir = struct {
     fn deinit(self: *Dir) void {
         for (self.entries.items) |*e| e.deinit(self.allocator);
         self.entries.deinit(self.allocator);
+        if (self.archive.len > 0) self.allocator.free(self.archive);
         self.allocator.free(self.path);
         self.allocator.destroy(self);
     }
@@ -531,6 +543,7 @@ const JobRow = struct {
     /// Trash jobs learn the trashed/info paths only at DONE; this
     /// holds the ORIGINAL path until then (owned).
     undo_trash_orig: ?[]u8 = null,
+    open_on_done: bool = false,
 
     fn terminal(self: *const JobRow) bool {
         return self.state == .finished or self.state == .failed or self.state == .canceled;
@@ -542,9 +555,12 @@ const PendingJob = struct {
     req: u32,
     hc: *HostConn,
     label: []u8,
-    kind: enum { normal, search, compare_left, compare_right, calc_size, dup_scan } = .normal,
+    kind: enum { normal, search, compare_left, compare_right, calc_size, dup_scan, archive_list } = .normal,
     undo_op: ?*UndoOp = null,
     undo_trash_orig: ?[]u8 = null,
+    /// The done event's `path` opens when the job lands (archive
+    /// member extraction).
+    open_on_done: bool = false,
 };
 
 /// One client-mediated cross-host transfer, running or queued.
@@ -1149,6 +1165,97 @@ const DupState = struct {
     }
 };
 
+/// Shared context between a BrowserView and its thumbnail worker
+/// thread. Refcounted: the thread holds one ref, every in-flight
+/// idle handback holds one; the view's deinit orphans it so late
+/// results are dropped, never applied to a dead view.
+const ThumbCtx = struct {
+    view: *BrowserView,
+    /// pthread via libc: Zig 0.16 std.Thread has no Mutex.
+    mutex: c.pthread_mutex_t = undefined,
+    cond: c.pthread_cond_t = undefined,
+    queue: std.ArrayList(ThumbReq) = .empty,
+    shutdown: bool = false,
+    orphaned: bool = false,
+    refs: u32 = 1,
+    /// LOCAL cache dir (owned, c_allocator).
+    cache_dir: []u8,
+
+    fn lock(self: *ThumbCtx) void {
+        _ = c.pthread_mutex_lock(&self.mutex);
+    }
+    fn unlock(self: *ThumbCtx) void {
+        _ = c.pthread_mutex_unlock(&self.mutex);
+    }
+
+    fn ref(self: *ThumbCtx) void {
+        self.lock();
+        defer self.unlock();
+        self.refs += 1;
+    }
+
+    fn unref(self: *ThumbCtx) void {
+        self.lock();
+        self.refs -= 1;
+        const dead = self.refs == 0;
+        self.unlock();
+        if (dead) {
+            const a = std.heap.c_allocator;
+            for (self.queue.items) |*q| q.deinitReq();
+            self.queue.deinit(a);
+            a.free(self.cache_dir);
+            _ = c.pthread_mutex_destroy(&self.mutex);
+            _ = c.pthread_cond_destroy(&self.cond);
+            a.destroy(self);
+        }
+    }
+};
+
+/// One worker task: probe/generate a LOCAL thumbnail, or decode
+/// remote SOURCE bytes into a spec-compliant thumbnail PNG.
+const ThumbReq = struct {
+    /// Absolute path on its OWNING host (key material).
+    path: []u8,
+    mtime_ms: i64,
+    /// Remote-source bytes to decode (null = local file probe).
+    data: ?[]u8 = null,
+
+    fn deinitReq(self: *ThumbReq) void {
+        const a = std.heap.c_allocator;
+        a.free(self.path);
+        if (self.data) |d| a.free(d);
+    }
+};
+
+/// Worker -> main-thread handback.
+const ThumbResult = struct {
+    ctx: *ThumbCtx,
+    /// In-memory cache key ("path\x00mtime", owned by c_allocator).
+    key: []u8,
+    pixbuf: ?*c.GdkPixbuf,
+    /// Spec PNG bytes for remote write-back (owned, c_allocator).
+    png: ?[]u8 = null,
+    /// Original path (owned) — locates the remote write-back target.
+    path: []u8,
+    mtime_ms: i64,
+};
+
+/// One remote thumbnail fetch in flight (serial per view).
+const RemoteThumb = struct {
+    hc: *HostConn,
+    path: []u8,
+    mtime_ms: i64,
+    phase: enum { read_thumb, read_src } = .read_thumb,
+    req: u32 = 0,
+    buf: std.ArrayList(u8) = .empty,
+
+    fn destroy(self: *RemoteThumb, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.buf.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
 /// One in-flight .trashinfo fetch for Restore from Trash.
 const RestoreRead = struct {
     req: u32,
@@ -1245,6 +1352,15 @@ pub const BrowserView = struct {
     restore_read: ?*RestoreRead = null,
     /// Row-thumbnail cache: "path\x00mtime" -> owned texture ref.
     thumbs: std.StringHashMap(*c.GdkTexture) = undefined,
+    /// Keys that failed to thumbnail (skip re-tries this session).
+    thumb_failed: std.StringHashMap(void) = undefined,
+    /// Async thumbnail worker (freedesktop cache; lazily started).
+    thumb_ctx: ?*ThumbCtx = null,
+    /// Serial remote-thumbnail pipeline.
+    remote_thumb: ?*RemoteThumb = null,
+    remote_thumb_queue: std.ArrayList(*RemoteThumb) = .empty,
+    /// Coalesced re-render after thumbnails land.
+    thumb_render_src: c.guint = 0,
     /// Live local-edit sync-back watches (remote files opened here).
     watches: std.ArrayList(*EditWatch) = .empty,
     /// The one open Open With chooser (its popover owns the ctx).
@@ -1282,6 +1398,10 @@ pub const BrowserView = struct {
     calc_files: u64 = 0,
     /// Running duplicate scan: size-bucket phase then hash-confirm.
     dup: ?*DupState = null,
+    /// Running archive listing job and its results tab.
+    arch_job: u64 = 0,
+    arch_hc: ?*HostConn = null,
+    arch_tab: ?*BTab = null,
     /// Live $EDITOR batch-rename session (at most one).
     editor_rename: ?*EditorRename = null,
     switch_idle: c.guint = 0,
@@ -1304,6 +1424,7 @@ pub const BrowserView = struct {
         const self = try allocator.create(BrowserView);
         self.* = .{ .allocator = allocator, .pane = pane };
         self.thumbs = std.StringHashMap(*c.GdkTexture).init(allocator);
+        self.thumb_failed = std.StringHashMap(void).init(allocator);
         self.git_map = std.StringHashMap(u8).init(allocator);
         if (places_mod.load(allocator)) |parsed| {
             defer parsed.deinit();
@@ -1522,6 +1643,18 @@ pub const BrowserView = struct {
         if (self.restore_read) |rr| rr.destroy(self.allocator);
         if (self.dup) |d| d.destroy(self.allocator);
         if (self.editor_rename) |er| er.destroy(self.allocator);
+        if (self.thumb_render_src != 0) _ = c.g_source_remove(self.thumb_render_src);
+        if (self.thumb_ctx) |tc| {
+            tc.lock();
+            tc.orphaned = true;
+            tc.shutdown = true;
+            _ = c.pthread_cond_signal(&tc.cond);
+            tc.unlock();
+            tc.unref(); // the view's ref; thread + idles drop theirs
+        }
+        if (self.remote_thumb) |rt| rt.destroy(self.allocator);
+        for (self.remote_thumb_queue.items) |rt| rt.destroy(self.allocator);
+        self.remote_thumb_queue.deinit(self.allocator);
         for (self.undo_stack.items) |u| u.destroy(self.allocator);
         self.undo_stack.deinit(self.allocator);
         for (self.pending_undo.items) |pu| pu.op.destroy(self.allocator);
@@ -1543,6 +1676,9 @@ pub const BrowserView = struct {
         if (self.git_root.len > 0) self.allocator.free(self.git_root);
         self.clearThumbCache();
         self.thumbs.deinit();
+        var fit = self.thumb_failed.iterator();
+        while (fit.next()) |kv| self.allocator.free(kv.key_ptr.*);
+        self.thumb_failed.deinit();
         self.allocator.destroy(self);
     }
 
@@ -1788,6 +1924,7 @@ pub const BrowserView = struct {
             }
             if (self.feedPreview(hc, f.ftype, f.payload)) continue;
             if (self.feedRestore(hc, f.ftype, f.payload)) continue;
+            if (self.feedRemoteThumb(hc, f.ftype, f.payload)) continue;
             switch (f.ftype) {
                 .fs_reply => {
                     if (self.onReply(hc, f.payload)) dirty = true;
@@ -1988,12 +2125,16 @@ pub const BrowserView = struct {
     /// app on it when done (null appid = default handler), and watch
     /// the cache copy so local edits sync back to the host.
     fn openRemoteFile(self: *BrowserView, tab: *BTab, path: []const u8, appid: ?[]const u8) void {
+        self.openRemoteFileHc(tab.hc, path, appid);
+    }
+
+    fn openRemoteFileHc(self: *BrowserView, hc: *HostConn, path: []const u8, appid: ?[]const u8) void {
         const local = self.hostConnFor(null) orelse return;
         if (local.state != .ready) {
             self.setStatus("local daemon unreachable");
             return;
         }
-        const host = tab.hc.host orelse return;
+        const host = hc.host orelse return;
         const cache_root = c.g_get_user_cache_dir();
         var dirbuf: [4096:0]u8 = undefined;
         const dir = std.fmt.bufPrintZ(&dirbuf, "{s}/sketerm/fsopen", .{cache_root}) catch return;
@@ -2005,12 +2146,22 @@ pub const BrowserView = struct {
         const dst = std.fmt.bufPrint(&dstbuf, "{s}/{x:0>16}-{s}", .{
             dir, h.final(), std.fs.path.basename(path),
         }) catch return;
-        self.startTransfer(tab.hc, path, local, dst, .{
+        self.startTransfer(hc, path, local, dst, .{
             .open_when_done = true,
             .open_with_appid = appid,
             .watch_host = host,
             .watch_remote = path,
         });
+    }
+
+    /// Open a path that lives on `hc`'s host: directly for local,
+    /// download-and-open for remote.
+    fn openPathOnHost(self: *BrowserView, hc: *HostConn, path: []const u8) void {
+        if (hc.host == null) {
+            launchLocal(path);
+        } else {
+            self.openRemoteFileHc(hc, path, null);
+        }
     }
 
     // ── daemon jobs (same-host copy / recursive delete) ─────────
@@ -2125,6 +2276,21 @@ pub const BrowserView = struct {
         if (self.dup) |d| {
             if (d.hc == hc and self.dupConsumeEvent(d, e)) return;
         }
+        // Archive member listing.
+        if (self.arch_job != 0 and e.job == self.arch_job and hc == self.arch_hc) {
+            if (std.mem.eql(u8, e.ev, "match")) {
+                self.onArchiveMember(e);
+                return;
+            }
+            if (std.mem.eql(u8, e.ev, "done")) {
+                self.setStatusFmt("archive: {d} member(s){s}", .{
+                    e.matches, if (e.truncated) " (truncated)" else "",
+                });
+                self.arch_job = 0;
+            } else if (std.mem.eql(u8, e.ev, "error")) {
+                self.arch_job = 0;
+            }
+        }
         if (std.mem.eql(u8, e.ev, "match")) {
             if (e.job == self.search_job and hc == self.search_hc) self.onSearchMatch(e);
             return;
@@ -2167,6 +2333,10 @@ pub const BrowserView = struct {
                     self.recordTrashUndo(row.hc, orig, e.path, e.text);
                 }
                 self.allocator.free(orig);
+            }
+            if (row.open_on_done and e.path.len > 0) {
+                row.open_on_done = false;
+                self.openPathOnHost(row.hc, e.path);
             }
         } else if (std.mem.eql(u8, e.ev, "error")) {
             row.state = .failed;
@@ -2249,6 +2419,10 @@ pub const BrowserView = struct {
                         if (d.hc == hc) d.job = rep.job;
                     }
                 }
+                if (pj.kind == .archive_list) {
+                    self.arch_job = rep.job;
+                    self.arch_hc = hc;
+                }
                 const row = self.allocator.create(JobRow) catch break;
                 row.* = .{
                     .hc = hc,
@@ -2256,6 +2430,7 @@ pub const BrowserView = struct {
                     .label = pj.label,
                     .undo_op = pj.undo_op,
                     .undo_trash_orig = pj.undo_trash_orig,
+                    .open_on_done = pj.open_on_done,
                 };
                 self.jobs.append(self.allocator, row) catch {
                     self.allocator.destroy(row);
@@ -2312,6 +2487,15 @@ pub const BrowserView = struct {
                     }
                 }
             }
+        }
+        // Host cache-dir (homedir) reply?
+        if (hc.cache_req != 0 and rep.req == hc.cache_req) {
+            hc.cache_req = 0;
+            if (rep.ok and rep.cache.len > 0) {
+                hc.cache_dir = self.allocator.dupe(u8, rep.cache) catch null;
+            }
+            self.pumpRemoteThumbs();
+            return false;
         }
         // Open With host-apps reply?
         if (self.openwith) |ow| {
@@ -2529,6 +2713,10 @@ pub const BrowserView = struct {
     fn closeTab(self: *BrowserView, tab: *BTab) void {
         if (self.search_tab == tab) self.search_tab = null;
         if (self.collection_tab == tab) self.collection_tab = null;
+        if (self.arch_tab == tab) {
+            self.arch_tab = null;
+            self.arch_job = 0;
+        }
         var i: usize = 0;
         while (i < self.pending.items.len) {
             if (self.pending.items[i].tab == tab) self.dropPending(i) else i += 1;
@@ -2835,14 +3023,10 @@ pub const BrowserView = struct {
         const tile = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
         c.gtk_widget_set_size_request(tile, 96, -1);
         var icon: ?*c.GtkWidget = null;
-        if (tab.hc.host == null and std.mem.eql(u8, e.kind, "file") and
-            e.size <= THUMB_FILE_CAP and isImageName(e.name))
-        {
-            if (self.thumbTexture(full, e.mtime_ms)) |tex| {
-                const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
-                c.gtk_image_set_pixel_size(@ptrCast(img), 48);
-                icon = img;
-            }
+        if (self.thumbLookup(tab.hc, full, e)) |tex| {
+            const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
+            c.gtk_image_set_pixel_size(@ptrCast(img), 48);
+            icon = img;
         }
         if (icon == null) {
             const icon_name: [*:0]const u8 = if (std.mem.eql(u8, e.kind, "dir"))
@@ -3112,17 +3296,14 @@ pub const BrowserView = struct {
             c.gtk_box_append(@ptrCast(row_box), spacer);
         }
 
-        // Local image files get a real thumbnail (bounded decode,
-        // cached by path+mtime); everything else a symbolic icon.
+        // Image files get a real freedesktop thumbnail (async: rows
+        // show the generic icon until the texture lands); works for
+        // local AND remote entries.
         var icon: ?*c.GtkWidget = null;
-        if (tab.hc.host == null and std.mem.eql(u8, e.kind, "file") and
-            e.size <= THUMB_FILE_CAP and isImageName(e.name))
-        {
-            if (self.thumbTexture(full, e.mtime_ms)) |tex| {
-                const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
-                c.gtk_image_set_pixel_size(@ptrCast(img), 24);
-                icon = img;
-            }
+        if (self.thumbLookup(tab.hc, full, e)) |tex| {
+            const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
+            c.gtk_image_set_pixel_size(@ptrCast(img), 24);
+            icon = img;
         }
         if (icon == null) {
             const icon_name: [*:0]const u8 = if (std.mem.eql(u8, e.kind, "dir"))
@@ -3289,6 +3470,15 @@ pub const BrowserView = struct {
 
     fn activateEntry(tab: *BTab, ctx: *RowCtx) void {
         const self = tab.view;
+        if (tab.root.archive.len > 0) {
+            if (!ctx.is_dir) {
+                var mbuf: [4096]u8 = undefined;
+                if (ctx.path.len >= mbuf.len) return;
+                @memcpy(mbuf[0..ctx.path.len], ctx.path);
+                self.extractAndOpenMember(tab, mbuf[0..ctx.path.len]);
+            }
+            return;
+        }
         if (tab.root.collection) {
             // Collection rows hold host-qualified specs: open the
             // entry (dir) or its parent (file) in a NEW tab.
@@ -3424,7 +3614,12 @@ pub const BrowserView = struct {
 
         const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
         const is_local = tab.hc.host == null;
-        if (tab.root.collection) {
+        if (tab.root.archive.len > 0) {
+            // Archive members: extract-and-open is the only verb
+            // (path ops would misparse member names).
+            if (ctx.path != null and !is_dir)
+                menuButton(box, "Extract and Open", &onMenuExtractMember, ctx, false);
+        } else if (tab.root.collection) {
             // Collection rows: specs spanning hosts — navigation +
             // membership only (path verbs would misparse specs).
             if (ctx.path != null) {
@@ -3459,8 +3654,10 @@ pub const BrowserView = struct {
             menuButton(box, "Rename…", &onMenuRename, ctx, false);
             menuButton(box, "Properties…", &onMenuProperties, ctx, false);
             menuButton(box, "Tags…", &onMenuTags, ctx, false);
-            if (!is_dir and isArchivePath(ctx.path.?))
+            if (!is_dir and isArchivePath(ctx.path.?)) {
+                menuButton(box, "Browse Archive", &onMenuBrowseArchive, ctx, false);
                 menuButton(box, "Extract Here", &onMenuExtractHere, ctx, false);
+            }
             menuButton(box, "Compress to .tar.gz", &onMenuArchiveCreate, ctx, false);
             menuButton(box, "Add to Collection", &onMenuCollectionAdd, ctx, false);
             menuButton(box, "Export Selection to Shell ($SK_SEL)", &onMenuExportSel, ctx, false);
@@ -4849,6 +5046,32 @@ pub const BrowserView = struct {
         return false;
     }
 
+    fn onMenuBrowseArchive(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const tab = ctx.tab;
+        const path = ctx.path orelse return menuDone(ctx);
+        var pbuf: [4096]u8 = undefined;
+        if (path.len >= pbuf.len) return menuDone(ctx);
+        @memcpy(pbuf[0..path.len], path);
+        const pcopy = pbuf[0..path.len];
+        menuDone(ctx);
+        self.startArchiveBrowse(tab, pcopy);
+    }
+
+    fn onMenuExtractMember(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const tab = ctx.tab;
+        const member = ctx.path orelse return menuDone(ctx);
+        var mbuf: [4096]u8 = undefined;
+        if (member.len >= mbuf.len) return menuDone(ctx);
+        @memcpy(mbuf[0..member.len], member);
+        const mcopy = mbuf[0..member.len];
+        menuDone(ctx);
+        self.extractAndOpenMember(tab, mcopy);
+    }
+
     fn onMenuExtractHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
         const path = ctx.path orelse return menuDone(ctx);
@@ -5709,6 +5932,103 @@ pub const BrowserView = struct {
         self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .pattern = pattern });
     }
 
+    // ── archive browsing ────────────────────────────────────────
+
+    /// Open a flat results tab listing an archive's members (host-
+    /// side bsdtar; only the member table crosses the wire).
+    fn startArchiveBrowse(self: *BrowserView, tab: *BTab, archive: []const u8) void {
+        var rbuf: [4096]u8 = undefined;
+        const parent = std.fs.path.dirname(archive) orelse "/";
+        if (parent.len >= rbuf.len) return;
+        @memcpy(rbuf[0..parent.len], parent);
+        var hbuf: [256]u8 = undefined;
+        var host: ?[]const u8 = null;
+        if (tab.hc.host) |h| {
+            if (h.len >= hbuf.len) return;
+            @memcpy(hbuf[0..h.len], h);
+            host = hbuf[0..h.len];
+        }
+        const rtab = self.newTab(host, rbuf[0..parent.len]) orelse return;
+        self.closeViewOf(rtab.hc, rtab.root);
+        var i: usize = 0;
+        while (i < self.pending.items.len) {
+            if (self.pending.items[i].tab == rtab) self.dropPending(i) else i += 1;
+        }
+        rtab.root.flat = true;
+        rtab.root.loaded = true;
+        rtab.root.view_id = 0;
+        rtab.root.archive = self.allocator.dupe(u8, archive) catch &.{};
+        var lbl: [96:0]u8 = undefined;
+        const l = std.fmt.bufPrintZ(&lbl, "{s}", .{std.fs.path.basename(archive)}) catch "archive";
+        c.gtk_label_set_text(rtab.tab_label, l.ptr);
+        self.arch_tab = rtab;
+        self.startDaemonJobKind(rtab.hc, "archive_list", archive, "", "", "list archive", .archive_list);
+    }
+
+    fn onArchiveMember(self: *BrowserView, e: WireJobEv) void {
+        const rtab = self.arch_tab orelse return;
+        if (e.path.len == 0) return;
+        const dir = rtab.root;
+        if (dir.find(e.path) != null) return;
+        const a = self.allocator;
+        const name = a.dupe(u8, e.path) catch return;
+        const kind = a.dupe(u8, if (e.kind.len > 0) e.kind else "file") catch {
+            a.free(name);
+            return;
+        };
+        const tgt = a.dupe(u8, e.path) catch {
+            a.free(name);
+            a.free(kind);
+            return;
+        };
+        dir.entries.append(a, .{
+            .name = name,
+            .kind = kind,
+            .size = e.size,
+            .mode = 0,
+            .mtime_ms = 0,
+            .target = tgt,
+            .tdir = false,
+        }) catch {
+            a.free(name);
+            a.free(kind);
+            a.free(tgt);
+            return;
+        };
+        if (self.currentTab() == rtab) self.renderTab(rtab);
+    }
+
+    /// Extract one member on the archive's host, then open it.
+    fn extractAndOpenMember(self: *BrowserView, tab: *BTab, member: []const u8) void {
+        const archive = tab.root.archive;
+        if (archive.len == 0) return;
+        const hc = tab.hc;
+        if (hc.state != .ready) {
+            self.setStatusFmt("not connected to {s}", .{hc.label()});
+            return;
+        }
+        const req = self.nextReq();
+        const pj = self.allocator.create(PendingJob) catch return;
+        var lbl: [128]u8 = undefined;
+        const label = std.fmt.bufPrint(&lbl, "extract {s}", .{std.fs.path.basename(member)}) catch "extract member";
+        pj.* = .{
+            .req = req,
+            .hc = hc,
+            .label = self.allocator.dupe(u8, label) catch {
+                self.allocator.destroy(pj);
+                return;
+            },
+            .open_on_done = true,
+        };
+        self.pending_jobs.append(self.allocator, pj) catch {
+            self.allocator.free(pj.label);
+            self.allocator.destroy(pj);
+            return;
+        };
+        self.sendOp(hc, .{ .req = req, .op = "archive_extract", .path = archive, .pattern = member });
+        self.setStatusFmt("extracting {s} on {s}…", .{ member, hc.label() });
+    }
+
     // ── duplicate finder ────────────────────────────────────────
 
     fn startDupScan(self: *BrowserView, tab: *BTab, root: []const u8) void {
@@ -6092,6 +6412,493 @@ pub const BrowserView = struct {
 
     // ── toolbar ─────────────────────────────────────────────────
 
+    // ── async freedesktop thumbnails ────────────────────────────
+    //
+    // Nothing here ever blocks the GLib loop: local probe/decode/
+    // save runs on a worker thread; remote thumbnails ride the
+    // nonblocking fs wire (read the HOST's cache, else fetch source
+    // bytes, encode on the worker, write the PNG BACK to the host's
+    // cache so it is shared with that machine's own apps).
+
+    fn ensureThumbWorker(self: *BrowserView) ?*ThumbCtx {
+        if (self.thumb_ctx) |tc| return tc;
+        const a = std.heap.c_allocator;
+        const cache_root = c.g_get_user_cache_dir();
+        const cd = std.mem.span(@as([*:0]const u8, @ptrCast(cache_root)));
+        const tc = a.create(ThumbCtx) catch return null;
+        tc.* = .{
+            .view = self,
+            .refs = 2, // worker thread + this view
+            .cache_dir = a.dupe(u8, cd) catch {
+                a.destroy(tc);
+                return null;
+            },
+        };
+        _ = c.pthread_mutex_init(&tc.mutex, null);
+        _ = c.pthread_cond_init(&tc.cond, null);
+        const th = std.Thread.spawn(.{}, thumbWorkerMain, .{tc}) catch {
+            a.free(tc.cache_dir);
+            a.destroy(tc);
+            return null;
+        };
+        th.detach();
+        self.thumb_ctx = tc;
+        return tc;
+    }
+
+    fn thumbWorkerMain(tc: *ThumbCtx) void {
+        defer tc.unref();
+        while (true) {
+            tc.lock();
+            while (tc.queue.items.len == 0 and !tc.shutdown)
+                _ = c.pthread_cond_wait(&tc.cond, &tc.mutex);
+            if (tc.shutdown) {
+                tc.unlock();
+                return;
+            }
+            var req = tc.queue.orderedRemove(0);
+            tc.unlock();
+            thumbProcess(tc, &req);
+            req.deinitReq();
+        }
+    }
+
+    /// Worker-side: probe the freedesktop cache, else decode +
+    /// save (local) / encode for write-back (remote bytes).
+    fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
+        const a = std.heap.c_allocator;
+        var pixbuf: ?*c.GdkPixbuf = null;
+        var png_out: ?[]u8 = null;
+
+        var ubuf: [4096 * 3 + 8]u8 = undefined;
+        const uri = thumbs_mod.fileUri(req.path, &ubuf) orelse return;
+        var mstr: [24:0]u8 = undefined;
+        const msec = std.fmt.bufPrintZ(&mstr, "{d}", .{@divTrunc(req.mtime_ms, 1000)}) catch return;
+
+        if (req.data == null) {
+            // LOCAL: cached thumbnail first (validated by MTime).
+            var tp_buf: [4300:0]u8 = undefined;
+            const tp = thumbs_mod.thumbPath(tc.cache_dir, req.path, tp_buf[0 .. tp_buf.len - 1]) orelse return;
+            tp_buf[tp.len] = 0;
+            if (c.gdk_pixbuf_new_from_file(&tp_buf, null)) |cached| {
+                const opt = c.gdk_pixbuf_get_option(cached, "tEXt::Thumb::MTime");
+                if (opt != null and std.mem.eql(u8, std.mem.span(opt), msec)) {
+                    pixbuf = cached;
+                } else {
+                    c.g_object_unref(cached);
+                }
+            }
+            if (pixbuf == null) {
+                var pz: [4300:0]u8 = undefined;
+                const pp = std.fmt.bufPrintZ(&pz, "{s}", .{req.path}) catch return;
+                pixbuf = c.gdk_pixbuf_new_from_file_at_size(pp.ptr, 128, 128, null);
+                if (pixbuf != null) thumbSaveLocal(tc, pixbuf.?, &tp_buf, tp.len, uri, msec);
+            }
+        } else {
+            // REMOTE source bytes: decode + scale + encode a spec
+            // PNG for host-side write-back.
+            const loader = c.gdk_pixbuf_loader_new();
+            var loaded = false;
+            if (c.gdk_pixbuf_loader_write(loader, req.data.?.ptr, req.data.?.len, null) != 0)
+                loaded = c.gdk_pixbuf_loader_close(loader, null) != 0
+            else
+                _ = c.gdk_pixbuf_loader_close(loader, null);
+            if (loaded) {
+                if (c.gdk_pixbuf_loader_get_pixbuf(loader)) |full| {
+                    const w: f64 = @floatFromInt(c.gdk_pixbuf_get_width(full));
+                    const h: f64 = @floatFromInt(c.gdk_pixbuf_get_height(full));
+                    const scale = @max(w / 128.0, h / 128.0);
+                    const nw: c_int = if (scale > 1) @intFromFloat(@max(1.0, w / scale)) else @intFromFloat(w);
+                    const nh: c_int = if (scale > 1) @intFromFloat(@max(1.0, h / scale)) else @intFromFloat(h);
+                    pixbuf = c.gdk_pixbuf_scale_simple(full, nw, nh, c.GDK_INTERP_BILINEAR);
+                }
+            }
+            c.g_object_unref(loader); // drops `full` with it
+            if (pixbuf) |pb| {
+                var uz: [4096 * 3 + 8:0]u8 = undefined;
+                @memcpy(uz[0..uri.len], uri);
+                uz[uri.len] = 0;
+                var out_buf: [*c]u8 = null;
+                var out_len: usize = 0;
+                if (c.gdk_pixbuf_save_to_buffer(pb, &out_buf, &out_len, "png", null, "tEXt::Thumb::URI", &uz, "tEXt::Thumb::MTime", msec.ptr, @as(?*anyopaque, null)) != 0) {
+                    png_out = a.dupe(u8, out_buf[0..out_len]) catch null;
+                    c.g_free(out_buf);
+                }
+            }
+        }
+
+        // Hand the result to the main thread.
+        const key = std.fmt.allocPrint(a, "{s}\x00{d}", .{ req.path, req.mtime_ms }) catch {
+            if (pixbuf) |pb| c.g_object_unref(pb);
+            if (png_out) |pg| a.free(pg);
+            return;
+        };
+        const res = a.create(ThumbResult) catch {
+            a.free(key);
+            if (pixbuf) |pb| c.g_object_unref(pb);
+            if (png_out) |pg| a.free(pg);
+            return;
+        };
+        res.* = .{
+            .ctx = tc,
+            .key = key,
+            .pixbuf = pixbuf,
+            .png = png_out,
+            .path = a.dupe(u8, req.path) catch {
+                a.free(key);
+                a.destroy(res);
+                if (pixbuf) |pb| c.g_object_unref(pb);
+                if (png_out) |pg| a.free(pg);
+                return;
+            },
+            .mtime_ms = req.mtime_ms,
+        };
+        tc.ref();
+        _ = c.g_idle_add(@ptrCast(&onThumbIdle), @ptrCast(res));
+    }
+
+    /// Worker-side spec save: dirs 700, temp file in place, PNG with
+    /// URI/MTime tEXt chunks, chmod 600, atomic rename.
+    fn thumbSaveLocal(tc: *ThumbCtx, pb: *c.GdkPixbuf, tp_buf: *[4300:0]u8, tp_len: usize, uri: []const u8, msec: [:0]const u8) void {
+        var dbuf: [4300]u8 = undefined;
+        const dir1 = std.fmt.bufPrint(&dbuf, "{s}/thumbnails", .{tc.cache_dir}) catch return;
+        var z: [4300:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&z, "{s}", .{dir1})) |d1| {
+            _ = c.mkdir(d1.ptr, 0o700);
+        } else |_| return;
+        if (std.fmt.bufPrintZ(&z, "{s}/normal", .{dir1})) |d2| {
+            _ = c.mkdir(d2.ptr, 0o700);
+        } else |_| return;
+        var tmp: [4320:0]u8 = undefined;
+        const tmps = std.fmt.bufPrintZ(&tmp, "{s}.sketerm-tmp", .{tp_buf[0..tp_len]}) catch return;
+        var uz: [4096 * 3 + 8:0]u8 = undefined;
+        @memcpy(uz[0..uri.len], uri);
+        uz[uri.len] = 0;
+        if (c.gdk_pixbuf_save(pb, tmps.ptr, "png", null, "tEXt::Thumb::URI", &uz, "tEXt::Thumb::MTime", msec.ptr, @as(?*anyopaque, null)) == 0) return;
+        _ = c.chmod(tmps.ptr, 0o600);
+        _ = c.rename(tmps.ptr, tp_buf);
+    }
+
+    fn onThumbIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const res: *ThumbResult = @ptrCast(@alignCast(user.?));
+        const a = std.heap.c_allocator;
+        const tc = res.ctx;
+        defer {
+            a.free(res.key);
+            a.free(res.path);
+            if (res.png) |pg| a.free(pg);
+            a.destroy(res);
+            tc.unref();
+        }
+        tc.lock();
+        const orphaned = tc.orphaned;
+        tc.unlock();
+        if (orphaned) {
+            if (res.pixbuf) |pb| c.g_object_unref(pb);
+            return 0;
+        }
+        const self = tc.view;
+        self.applyThumbResult(res);
+        return 0;
+    }
+
+    fn applyThumbResult(self: *BrowserView, res: *ThumbResult) void {
+        if (res.pixbuf) |pb| {
+            defer c.g_object_unref(pb);
+            const tex = c.gdk_texture_new_for_pixbuf(pb) orelse return;
+            if (self.thumbs.count() >= THUMB_CACHE_CAP) self.clearThumbCache();
+            const owned = self.allocator.dupe(u8, res.key) catch {
+                c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
+                return;
+            };
+            self.thumbs.put(owned, tex) catch {
+                self.allocator.free(owned);
+                c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
+                return;
+            };
+            // Remote result: write the PNG back into the OWNING
+            // host's cache (best-effort, req 0 = replies ignored).
+            if (res.png) |png| self.thumbWriteBack(res.path, png);
+            self.scheduleThumbRender();
+        } else {
+            const owned = self.allocator.dupe(u8, res.key) catch return;
+            self.thumb_failed.put(owned, {}) catch self.allocator.free(owned);
+        }
+        // A remote decode holds the pipeline slot until now.
+        self.releaseRemoteThumbFor(res.path);
+    }
+
+    /// Push a generated thumbnail PNG into the owning host's
+    /// freedesktop cache over the fs wire (mkdirs + write + rename;
+    /// all best-effort with ignored replies).
+    fn thumbWriteBack(self: *BrowserView, path: []const u8, png: []const u8) void {
+        // The path's host is the CURRENT remote pipeline's host.
+        const rt = self.remote_thumb orelse return;
+        if (!std.mem.eql(u8, rt.path, path)) return;
+        const hc = rt.hc;
+        if (hc.state != .ready) return;
+        const cache = hc.cache_dir orelse return;
+        var tbuf: [4300]u8 = undefined;
+        const tp = thumbs_mod.thumbPath(cache, path, &tbuf) orelse return;
+        var dbuf: [4300]u8 = undefined;
+        if (std.fmt.bufPrint(&dbuf, "{s}/thumbnails", .{cache})) |d| {
+            self.sendOp(hc, .{ .req = @as(u32, 0), .op = "mkdir", .path = d });
+        } else |_| {}
+        if (std.fmt.bufPrint(&dbuf, "{s}/thumbnails/normal", .{cache})) |d| {
+            self.sendOp(hc, .{ .req = @as(u32, 0), .op = "mkdir", .path = d });
+        } else |_| {}
+        var tmpb: [4340]u8 = undefined;
+        const tmp = std.fmt.bufPrint(&tmpb, "{s}.sketerm-tmp", .{tp}) catch return;
+        // fs_write frame: [u32 req][u64 off][u8 flags][u16 len][path][data]
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        var hdr: [15]u8 = undefined;
+        std.mem.writeInt(u32, hdr[0..4], 0, .little);
+        std.mem.writeInt(u64, hdr[4..12], 0, .little);
+        hdr[12] = 0b011; // create + truncate
+        std.mem.writeInt(u16, hdr[13..15], @intCast(tmp.len), .little);
+        payload.appendSlice(self.allocator, &hdr) catch return;
+        payload.appendSlice(self.allocator, tmp) catch return;
+        payload.appendSlice(self.allocator, png) catch return;
+        hc.conn.sendFrame(.fs_write, payload.items) catch return;
+        self.sendOp(hc, .{ .req = @as(u32, 0), .op = "rename", .path = tmp, .to = tp });
+    }
+
+    /// Coalesced re-render ~8x/s while thumbnails trickle in.
+    fn scheduleThumbRender(self: *BrowserView) void {
+        if (self.thumb_render_src != 0) return;
+        self.thumb_render_src = c.g_timeout_add(120, @ptrCast(&onThumbRenderTick), @ptrCast(self));
+    }
+
+    fn onThumbRenderTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.thumb_render_src = 0;
+        self.renderCurrent();
+        return 0; // one-shot
+    }
+
+    /// The render-time lookup: cached texture, or a queued async
+    /// request (local worker / remote pipeline) and null for now.
+    fn thumbLookup(self: *BrowserView, hc: *HostConn, full: []const u8, e: Entry) ?*c.GdkTexture {
+        if (!std.mem.eql(u8, e.kind, "file") or e.size > THUMB_FILE_CAP or !isImageName(e.name)) return null;
+        var key_buf: [4300]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ full, e.mtime_ms }) catch return null;
+        if (self.thumbs.get(key)) |t| return t;
+        if (self.thumb_failed.contains(key)) return null;
+        if (hc.host == null) {
+            const tc = self.ensureThumbWorker() orelse return null;
+            const a = std.heap.c_allocator;
+            tc.lock();
+            defer tc.unlock();
+            for (tc.queue.items) |q| {
+                if (std.mem.eql(u8, q.path, full)) return null; // queued
+            }
+            if (tc.queue.items.len > 512) return null; // bounded
+            const owned = a.dupe(u8, full) catch return null;
+            tc.queue.append(a, .{ .path = owned, .mtime_ms = e.mtime_ms }) catch {
+                a.free(owned);
+                return null;
+            };
+            _ = c.pthread_cond_signal(&tc.cond);
+        } else {
+            self.enqueueRemoteThumb(hc, full, e.mtime_ms);
+        }
+        return null;
+    }
+
+    // ── remote thumbnail pipeline (serial per view) ─────────────
+
+    fn enqueueRemoteThumb(self: *BrowserView, hc: *HostConn, path: []const u8, mtime_ms: i64) void {
+        if (self.remote_thumb) |rt| {
+            if (rt.hc == hc and std.mem.eql(u8, rt.path, path)) return;
+        }
+        for (self.remote_thumb_queue.items) |rt| {
+            if (rt.hc == hc and std.mem.eql(u8, rt.path, path)) return;
+        }
+        if (self.remote_thumb_queue.items.len > 128) return;
+        const rt = self.allocator.create(RemoteThumb) catch return;
+        rt.* = .{
+            .hc = hc,
+            .path = self.allocator.dupe(u8, path) catch {
+                self.allocator.destroy(rt);
+                return;
+            },
+            .mtime_ms = mtime_ms,
+        };
+        self.remote_thumb_queue.append(self.allocator, rt) catch {
+            rt.destroy(self.allocator);
+            return;
+        };
+        self.pumpRemoteThumbs();
+    }
+
+    fn pumpRemoteThumbs(self: *BrowserView) void {
+        if (self.remote_thumb != null) return;
+        while (self.remote_thumb_queue.items.len > 0) {
+            const rt = self.remote_thumb_queue.orderedRemove(0);
+            if (rt.hc.state != .ready) {
+                rt.destroy(self.allocator);
+                continue;
+            }
+            if (rt.hc.cache_dir == null) {
+                // Need the host's cache dir first; re-queue and ask.
+                self.remote_thumb_queue.insert(self.allocator, 0, rt) catch rt.destroy(self.allocator);
+                if (rt.hc.cache_req == 0) {
+                    rt.hc.cache_req = self.nextReq();
+                    self.sendOp(rt.hc, .{ .req = rt.hc.cache_req, .op = "homedir", .path = "/" });
+                }
+                return;
+            }
+            var tbuf: [4300]u8 = undefined;
+            const tp = thumbs_mod.thumbPath(rt.hc.cache_dir.?, rt.path, &tbuf) orelse {
+                rt.destroy(self.allocator);
+                continue;
+            };
+            rt.req = self.nextReq();
+            rt.phase = .read_thumb;
+            self.remote_thumb = rt;
+            self.sendOp(rt.hc, .{ .req = rt.req, .op = "read", .path = tp, .off = @as(u64, 0), .len = @as(u64, 1 << 20) });
+            return;
+        }
+    }
+
+    fn finishRemoteThumb(self: *BrowserView) void {
+        if (self.remote_thumb) |rt| {
+            rt.destroy(self.allocator);
+            self.remote_thumb = null;
+        }
+        self.pumpRemoteThumbs();
+    }
+
+    /// Feed frames into the remote-thumbnail pipeline.
+    fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
+        const rt = self.remote_thumb orelse return false;
+        if (rt.hc != hc) return false;
+        switch (ftype) {
+            .fs_data => {
+                if (payload.len < 12) return false;
+                if (std.mem.readInt(u32, payload[0..4], .little) != rt.req) return false;
+                rt.buf.appendSlice(self.allocator, payload[12..]) catch {};
+                return true;
+            },
+            .fs_reply => {
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const rep = std.json.parseFromSliceLeaky(WireReply, arena.allocator(), payload, .{
+                    .ignore_unknown_fields = true,
+                }) catch return false;
+                if (rep.req != rt.req) return false;
+                switch (rt.phase) {
+                    .read_thumb => {
+                        if (rep.ok and rt.buf.items.len > 0 and self.tryRemoteCachedThumb(rt)) {
+                            self.finishRemoteThumb();
+                            return true;
+                        }
+                        // Missing/stale: fetch the source (capped).
+                        rt.buf.clearRetainingCapacity();
+                        rt.phase = .read_src;
+                        rt.req = self.nextReq();
+                        self.sendOp(rt.hc, .{ .req = rt.req, .op = "read", .path = rt.path, .off = @as(u64, 0), .len = @as(u64, THUMB_FILE_CAP) });
+                        return true;
+                    },
+                    .read_src => {
+                        if (!rep.ok or rt.buf.items.len == 0 or !rep.eof) {
+                            // Unreadable or larger than the cap: give
+                            // up on this file (negative-cached).
+                            self.markThumbFailed(rt.path, rt.mtime_ms);
+                            self.finishRemoteThumb();
+                            return true;
+                        }
+                        self.queueRemoteDecode(rt);
+                        self.finishRemoteThumbKeepCurrent();
+                        return true;
+                    },
+                }
+            },
+            else => return false,
+        }
+    }
+
+    /// Decode the host's cached thumbnail PNG; true when valid.
+    fn tryRemoteCachedThumb(self: *BrowserView, rt: *RemoteThumb) bool {
+        const loader = c.gdk_pixbuf_loader_new();
+        var ok = false;
+        if (c.gdk_pixbuf_loader_write(loader, rt.buf.items.ptr, rt.buf.items.len, null) != 0)
+            ok = c.gdk_pixbuf_loader_close(loader, null) != 0
+        else
+            _ = c.gdk_pixbuf_loader_close(loader, null);
+        defer c.g_object_unref(loader);
+        if (!ok) return false;
+        const pb = c.gdk_pixbuf_loader_get_pixbuf(loader) orelse return false;
+        const opt = c.gdk_pixbuf_get_option(pb, "tEXt::Thumb::MTime");
+        if (opt == null) return false;
+        var mstr: [24]u8 = undefined;
+        const msec = std.fmt.bufPrint(&mstr, "{d}", .{@divTrunc(rt.mtime_ms, 1000)}) catch return false;
+        if (!std.mem.eql(u8, std.mem.span(opt), msec)) return false;
+        const tex = c.gdk_texture_new_for_pixbuf(pb) orelse return false;
+        var key_buf: [4300]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ rt.path, rt.mtime_ms }) catch {
+            c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
+            return false;
+        };
+        if (self.thumbs.count() >= THUMB_CACHE_CAP) self.clearThumbCache();
+        const owned = self.allocator.dupe(u8, key) catch {
+            c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
+            return false;
+        };
+        self.thumbs.put(owned, tex) catch {
+            self.allocator.free(owned);
+            c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
+            return false;
+        };
+        self.scheduleThumbRender();
+        return true;
+    }
+
+    /// Source bytes arrived: hand them to the worker for decode +
+    /// spec-PNG encode (write-back happens when the result lands).
+    fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb) void {
+        const tc = self.ensureThumbWorker() orelse return;
+        const a = std.heap.c_allocator;
+        const path = a.dupe(u8, rt.path) catch return;
+        const data = a.dupe(u8, rt.buf.items) catch {
+            a.free(path);
+            return;
+        };
+        tc.lock();
+        defer tc.unlock();
+        tc.queue.append(a, .{ .path = path, .mtime_ms = rt.mtime_ms, .data = data }) catch {
+            a.free(path);
+            a.free(data);
+            return;
+        };
+        _ = c.pthread_cond_signal(&tc.cond);
+    }
+
+    /// Advance the queue but KEEP self.remote_thumb until the worker
+    /// result lands (thumbWriteBack needs its host + path).
+    fn finishRemoteThumbKeepCurrent(self: *BrowserView) void {
+        // The worker handback frees it via releaseRemoteThumbFor.
+        _ = self;
+    }
+
+    fn releaseRemoteThumbFor(self: *BrowserView, path: []const u8) void {
+        if (self.remote_thumb) |rt| {
+            if (std.mem.eql(u8, rt.path, path)) {
+                rt.destroy(self.allocator);
+                self.remote_thumb = null;
+                self.pumpRemoteThumbs();
+            }
+        }
+    }
+
+    fn markThumbFailed(self: *BrowserView, path: []const u8, mtime_ms: i64) void {
+        var key_buf: [4300]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ path, mtime_ms }) catch return;
+        const owned = self.allocator.dupe(u8, key) catch return;
+        self.thumb_failed.put(owned, {}) catch self.allocator.free(owned);
+    }
+
     // ── preview pane + thumbnails ───────────────────────────────
 
     fn clearThumbCache(self: *BrowserView) void {
@@ -6101,33 +6908,6 @@ pub const BrowserView = struct {
             self.allocator.free(kv.key_ptr.*);
         }
         self.thumbs.clearRetainingCapacity();
-    }
-
-    /// A bounded-decode thumbnail texture for a LOCAL image file,
-    /// cached by path+mtime (a changed file re-decodes).
-    fn thumbTexture(self: *BrowserView, path: []const u8, mtime_ms: i64) ?*c.GdkTexture {
-        var key_buf: [4200]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ path, mtime_ms }) catch return null;
-        if (self.thumbs.get(key)) |t| return t;
-        if (self.thumbs.count() >= THUMB_CACHE_CAP) self.clearThumbCache();
-        var z: [4200:0]u8 = undefined;
-        const pz = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return null;
-        const pixbuf = c.gdk_pixbuf_new_from_file_at_size(pz.ptr, 24, 24, null) orelse return null;
-        const tex = c.gdk_texture_new_for_pixbuf(pixbuf) orelse {
-            c.g_object_unref(pixbuf);
-            return null;
-        };
-        c.g_object_unref(pixbuf);
-        const owned_key = self.allocator.dupe(u8, key) catch {
-            c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
-            return null;
-        };
-        self.thumbs.put(owned_key, tex) catch {
-            self.allocator.free(owned_key);
-            c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
-            return null;
-        };
-        return tex;
     }
 
     fn clearPreviewContent(self: *BrowserView) void {
