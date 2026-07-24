@@ -8532,3 +8532,40 @@ daemon, classified that daemon as stale under the old exact-match handshake,
 and sent it a shutdown frame. Verification reran that same command,
 `xvfb-run -a zig build smoke-e2e`, which now passes entirely inside the
 private runtime. The full 814-test suite and normal GUI build also pass.
+
+## Progressive mux negotiation and non-destructive daemon upgrades
+
+Mux compatibility now selects the highest shared core profile and negotiates
+snapshot, native-state, audio, and winstream capabilities independently.
+Current clients read historical snapshot bodies and both snapshot envelopes;
+current daemons emit snapshot v3 and native state-sync v6 for protocol-5
+clients. State-sync v7 remains required only for sessions that advertise
+modifier-backed dmabufs, so older viewers retain terminal access without
+misdecoding GPU protocol traffic. Protocol 1 is discovery-only because three
+indistinguishable snapshot revisions shipped under that number. Peers with no
+safe overlap receive profile 0: list remains available, while every mutating
+or attach-scoped frame is refused server-side and sessions stay untouched.
+
+Daemon startup no longer retires or replaces a live socket owner. Stale-socket
+recovery and teardown share an advisory lock, teardown unlinks only its own
+recorded inode, and a second daemon returns `AlreadyRunning`. The macOS deploy
+script signs and atomically installs a sibling file, atomically replaces the
+LaunchAgent plist, preserves a loaded daemon, and updates both the loaded and
+next-login binary paths when `SKETERM_MUX_BIN` changes. Explicit restarts remain
+operator actions because they destroy live sessions.
+
+Durable shell creation now resolves the configured Default or saved named
+profile for shell, login-shell mode, TERM, and COLORTERM. Remote clients use an
+old-daemon-compatible account-shell launcher, prefer the configured shell when
+present, and no longer inherit the daemon service's unrelated `$SHELL`.
+Malformed snapshots release their connection, doctor warns on profile 0 and
+live-but-unresponsive daemons, and MCP's fresh log side channel negotiates a
+normal terminal profile while disabling native/audio/winstream replay.
+
+Verification: 823 tests pass with 6 environment skips; `zig build`,
+`smoke-mux`, `smoke-broker`, `smoke-mcp`, isolated Xvfb `smoke-e2e`, Linux
+static-musl mux, and aarch64-macOS portable mux pass. Cross-version integration
+used an actual protocol-5 daemon with the current client over local and SSH
+proxy transports, and an actual protocol-5 client against the current broker.
+The ownership test proved a second daemon cannot replace the first and its
+session remains interactive. No test used or restarted the live user daemon.
