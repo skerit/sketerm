@@ -670,6 +670,50 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
             waited += 5;
         }
         if (!preview_done) fail("preview never completed");
+
+        // dir_size walks host-side: bytes in `done`, entries in `total`.
+        const size_job = fs.startDirSize(sdir) catch failErr("start dir_size", fs.lastErr());
+        var size_done = false;
+        var size_bytes: u64 = 0;
+        var size_entries: u64 = 0;
+        waited = 0;
+        while (!size_done and waited < 20_000) {
+            while (fs.takeJobEvent()) |e0| {
+                var e = e0;
+                defer e.deinit();
+                if (e.job != size_job) continue;
+                if (std.mem.eql(u8, e.ev, "done")) {
+                    size_bytes = e.done;
+                    size_entries = e.total;
+                    size_done = true;
+                } else if (e.terminal()) fail("dir_size job failed");
+            }
+            if (!size_done) _ = c.usleep(5_000);
+            waited += 5;
+        }
+        if (!size_done) fail("dir_size never completed");
+        if (size_bytes == 0 or size_entries < 3) fail("dir_size totals wrong");
+
+        // perm_tree applies recursively and never follows symlinks.
+        const perm_job = fs.startPermTree(sdir, 0o700, null, null) catch failErr("start perm_tree", fs.lastErr());
+        var perm_done = false;
+        waited = 0;
+        while (!perm_done and waited < 20_000) {
+            while (fs.takeJobEvent()) |e0| {
+                var e = e0;
+                defer e.deinit();
+                if (e.job != perm_job) continue;
+                if (std.mem.eql(u8, e.ev, "done")) perm_done = true else if (e.terminal()) fail("perm_tree job failed");
+            }
+            if (!perm_done) _ = c.usleep(5_000);
+            waited += 5;
+        }
+        if (!perm_done) fail("perm_tree never completed");
+        var pst: c.struct_stat = undefined;
+        var pz: [4096]u8 = undefined;
+        const deep = std.fmt.bufPrint(&fp3, "{s}/deep", .{sdir}) catch unreachable;
+        if (c.stat(pathz.pathZ(&pz, deep) catch unreachable, &pst) != 0) fail("perm_tree stat");
+        if (pst.st_mode & 0o7777 != 0o700) fail("perm_tree did not reach the subdirectory");
     }
 
     // ── jobs survive their client (durability) ─────────────────

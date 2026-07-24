@@ -1257,7 +1257,7 @@ const FsView = struct {
 /// transfers — the roadmap's core promise). kill = cancel,
 /// SIGSTOP/SIGCONT = pause/resume.
 const FsJob = struct {
-    const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview };
+    const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree };
     const State = enum { running, paused, done, failed, canceled };
 
     allocator: std.mem.Allocator,
@@ -3096,7 +3096,8 @@ pub const Daemon = struct {
             std.mem.eql(u8, r.op, "trash_restore") or std.mem.eql(u8, r.op, "cross_copy") or
             std.mem.eql(u8, r.op, "panelize") or std.mem.eql(u8, r.op, "live_find") or
             std.mem.eql(u8, r.op, "archive_list") or std.mem.eql(u8, r.op, "archive_extract") or
-            std.mem.eql(u8, r.op, "thumbnail") or std.mem.eql(u8, r.op, "preview"))
+            std.mem.eql(u8, r.op, "thumbnail") or std.mem.eql(u8, r.op, "preview") or
+            std.mem.eql(u8, r.op, "dir_size") or std.mem.eql(u8, r.op, "perm_tree"))
             return self.fsStartJob(cl, r);
 
         if (std.mem.eql(u8, r.op, "open_view")) {
@@ -3706,6 +3707,10 @@ pub const Daemon = struct {
             .thumbnail
         else if (std.mem.eql(u8, r.op, "preview"))
             .preview
+        else if (std.mem.eql(u8, r.op, "dir_size"))
+            .dir_size
+        else if (std.mem.eql(u8, r.op, "perm_tree"))
+            .perm_tree
         else
             .hash;
         if ((op == .copy or op == .extract or op == .archive_create) and
@@ -3746,11 +3751,15 @@ pub const Daemon = struct {
                 return;
             }
         }
-        const job = self.spawnFsJob(cl, op, self.next_fs_job_id, r.path, r.to, r.pattern, r.src_host, r.dst_host, r.client_token, r.@"resume", r.within_ms, r.max_matches) catch
+        const job = self.spawnFsJob(cl, op, self.next_fs_job_id, r.path, r.to, r.pattern, r.src_host, r.dst_host, r.client_token, r.@"resume", r.within_ms, r.max_matches, .{ .mode = r.mode, .uid = if (r.uid) |v| @as(i64, v) else -1, .gid = if (r.gid) |v| @as(i64, v) else -1 }) catch
             return fsReplyErr(cl, r.req, "cannot start job");
         self.next_fs_job_id = job.id + 1;
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .job = job.id });
     }
+
+    /// Recursive-permission arguments; -1 keeps the current owner or
+    /// group, mode 0 keeps the current mode.
+    const PermArgs = struct { mode: u32 = 0, uid: i64 = -1, gid: i64 = -1 };
 
     fn spawnFsJob(
         self: *Daemon,
@@ -3766,6 +3775,7 @@ pub const Daemon = struct {
         resumable: bool,
         within_ms: u64,
         max_matches: u64,
+        perm: PermArgs,
     ) !*FsJob {
         var exe_buf: [4096:0]u8 = undefined;
         const exe = @import("../util/platform.zig").exePathZ(&exe_buf) orelse return error.NoExecutable;
@@ -3780,10 +3790,13 @@ pub const Daemon = struct {
             .dst_host = dst_host,
             .@"resume" = resumable,
             .job_id = id,
-            .journal_dir = if (op == .thumbnail or op == .preview) "" else self.fs_job_dir,
+            .journal_dir = if (op == .thumbnail or op == .preview or op == .dir_size) "" else self.fs_job_dir,
             .within_ms = within_ms,
             .max_matches = max_matches,
             .client_token = client_token,
+            .mode = perm.mode,
+            .uid = perm.uid,
+            .gid = perm.gid,
         }, .{}, &spec_aw.writer);
         try spec_aw.writer.writeByte('\n');
 
@@ -3851,7 +3864,7 @@ pub const Daemon = struct {
             .dst_host = dst_host_owned,
             .client_token = client_token_owned,
             .resumable = resumable,
-            .ephemeral = op == .thumbnail or op == .preview,
+            .ephemeral = op == .thumbnail or op == .preview or op == .dir_size,
         };
         job_initialized = true;
         // The job owns the read end from here on; its deinit closes it,
@@ -4006,7 +4019,7 @@ pub const Daemon = struct {
                 continue;
             }
             if (op == .copy or op == .cross_copy or op == .live_find) {
-                _ = self.spawnFsJob(null, op, rec.id, rec.src, rec.dst, rec.pattern, rec.src_host, rec.dst_host, rec.client_token, true, 0, 0) catch {
+                _ = self.spawnFsJob(null, op, rec.id, rec.src, rec.dst, rec.pattern, rec.src_host, rec.dst_host, rec.client_token, true, 0, 0, .{}) catch {
                     const job = self.restoredFsJob(rec, op, .failed) orelse continue;
                     job.setMessage("could not resume after daemon restart");
                     self.saveFsJob(job) catch { job.terminal_pending = true; };
