@@ -671,7 +671,7 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
     }
     const path = mux_daemon.defaultSocketPath(allocator) catch return null;
     defer allocator.free(path);
-    return mux_client.Conn.connect(allocator, path) catch {
+    return mux_client.Conn.connectProbed(allocator, path) catch {
         _ = c.fprintf(platform.stderr(), "sketerm mux: daemon not running (no durable sessions yet)\n");
         return null;
     };
