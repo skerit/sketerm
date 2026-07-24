@@ -46,6 +46,11 @@ pub const Spec = struct {
     /// find: raise the match cap (0 = default; clamped to 200k).
     max_matches: u64 = 0,
     client_token: []const u8 = "",
+    /// perm_tree: mode to apply (0o7777 mask).
+    mode: u32 = 0,
+    /// perm_tree: -1 leaves the current owner/group untouched.
+    uid: i64 = -1,
+    gid: i64 = -1,
 };
 
 /// Search caps: a runaway query costs a bounded stream, never a
@@ -163,6 +168,10 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
         runPanelize(spec)
     else if (std.mem.eql(u8, spec.op, "live_find"))
         runLiveFind(allocator, spec)
+    else if (std.mem.eql(u8, spec.op, "dir_size"))
+        runDirSize(spec)
+    else if (std.mem.eql(u8, spec.op, "perm_tree"))
+        runPermTree(spec)
     else if (std.mem.eql(u8, spec.op, "thumbnail"))
         runPreview(allocator, spec, true)
     else if (std.mem.eql(u8, spec.op, "preview"))
@@ -1580,6 +1589,116 @@ fn deleteTreeDir(dir_path: []const u8, progress: *Progress) bool {
     if (overflow) return deleteTreeDir(dir_path, progress);
     if (c.rmdir(dz) != 0) return false;
     progress.done += 1;
+    return true;
+}
+
+/// Recursive size: bytes plus an entry count, walked host-side so a
+/// remote "calculate folder size" never streams a listing per level.
+fn runDirSize(spec: Spec) u8 {
+    var st: c.struct_stat = undefined;
+    if (!statOf(spec.src, &st, false)) return emitErrno("stat");
+    var bytes: u64 = 0;
+    var entries: u64 = 0;
+    if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
+        dirSizeWalk(spec.src, &bytes, &entries);
+    } else {
+        bytes = @intCast(st.st_size);
+        entries = 1;
+    }
+    emit(.{ .ev = "done", .done = bytes, .total = entries });
+    return 0;
+}
+
+fn dirSizeWalk(dir_path: []const u8, bytes: *u64, entries: *u64) void {
+    var z: [4096]u8 = undefined;
+    const dz = pathz.pathZ(&z, dir_path) catch return;
+    const dir = c.opendir(dz) orelse return;
+    defer _ = c.closedir(dir);
+    var since_emit: u64 = 0;
+    while (c.readdir(dir)) |de| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
+        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        var fbuf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&fbuf);
+        w.print("{s}/{s}", .{ if (dir_path.len == 1) "" else dir_path, name }) catch continue;
+        const full = w.buffered();
+        var st: c.struct_stat = undefined;
+        if (!statOf(full, &st, false)) continue;
+        entries.* += 1;
+        if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
+            dirSizeWalk(full, bytes, entries);
+        } else {
+            bytes.* += @intCast(st.st_size);
+        }
+        since_emit += 1;
+        if (since_emit >= 2000) {
+            since_emit = 0;
+            emit(.{ .ev = "progress", .done = bytes.*, .total = entries.* });
+        }
+    }
+}
+
+/// Recursive chmod/chown. Symlinks are never followed: their own
+/// permissions are meaningless and following them would let a link
+/// inside the tree redirect the change outside it.
+fn runPermTree(spec: Spec) u8 {
+    var st: c.struct_stat = undefined;
+    if (!statOf(spec.src, &st, false)) return emitErrno("stat");
+    var progress = Progress{};
+    if (!permApply(spec, spec.src, &progress)) return emitError("could not apply to every entry");
+    emit(.{ .ev = "done", .done = progress.done, .total = progress.done });
+    return 0;
+}
+
+fn permApply(spec: Spec, path: []const u8, progress: *Progress) bool {
+    var z: [4096]u8 = undefined;
+    const pz = pathz.pathZ(&z, path) catch return false;
+    var st: c.struct_stat = undefined;
+    if (c.lstat(pz, &st) != 0) return false;
+    const is_link = (st.st_mode & c.S_IFMT) == c.S_IFLNK;
+    if (spec.uid >= 0 or spec.gid >= 0) {
+        const uid: c.uid_t = if (spec.uid >= 0) @intCast(spec.uid) else @bitCast(@as(c_int, -1));
+        const gid: c.gid_t = if (spec.gid >= 0) @intCast(spec.gid) else @bitCast(@as(c_int, -1));
+        if (c.lchown(pz, uid, gid) != 0) return false;
+    }
+    if (spec.mode != 0 and !is_link) {
+        if (c.chmod(pz, @intCast(spec.mode & 0o7777)) != 0) return false;
+    }
+    progress.done += 1;
+    if (progress.done % 500 == 0)
+        emit(.{ .ev = "progress", .done = progress.done, .total = @as(u64, 0) });
+    if ((st.st_mode & c.S_IFMT) != c.S_IFDIR) return true;
+
+    const dir = c.opendir(pz) orelse return false;
+    var names_buf: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&names_buf);
+    var names: std.ArrayList([]u8) = .empty;
+    var overflow_at: ?[]const u8 = null;
+    while (c.readdir(dir)) |de| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
+        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        const owned = fba.allocator().dupe(u8, name) catch {
+            overflow_at = name;
+            break;
+        };
+        names.append(fba.allocator(), owned) catch {
+            overflow_at = name;
+            break;
+        };
+    }
+    _ = c.closedir(dir);
+    if (overflow_at != null) {
+        // A directory wider than the name buffer would silently skip
+        // the tail; say so rather than report a complete apply.
+        emit(.{ .ev = "progress", .done = progress.done, .total = @as(u64, 0) });
+        return false;
+    }
+    for (names.items) |name| {
+        var fbuf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&fbuf);
+        w.print("{s}/{s}", .{ if (path.len == 1) "" else path, name }) catch return false;
+        if (!permApply(spec, w.buffered(), progress)) return false;
+    }
     return true;
 }
 

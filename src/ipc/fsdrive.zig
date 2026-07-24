@@ -693,6 +693,18 @@ pub const Fs = struct {
         return self.startJob("preview", .{ .path = path });
     }
 
+    /// Recursive size; the done event carries bytes in `done` and the
+    /// entry count in `total`.
+    pub fn startDirSize(self: *Fs, path: []const u8) Error!u64 {
+        return self.startJob("dir_size", .{ .path = path });
+    }
+
+    /// Recursive chmod/chown. mode 0 keeps modes; null uid/gid keep
+    /// the current owner/group.
+    pub fn startPermTree(self: *Fs, path: []const u8, mode: u32, uid: ?u32, gid: ?u32) Error!u64 {
+        return self.startJob("perm_tree", .{ .path = path, .mode = mode, .uid = uid, .gid = gid });
+    }
+
     pub fn startPanelize(self: *Fs, root: []const u8, command: []const u8) Error!u64 {
         return self.startJob("panelize", .{ .path = root, .pattern = command });
     }
