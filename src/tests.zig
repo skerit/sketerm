@@ -77,6 +77,7 @@ comptime {
     _ = @import("filebrowser/model.zig");
     _ = @import("filebrowser/cache.zig");
     _ = @import("filebrowser/places.zig");
+    _ = @import("filebrowser/thumbs.zig");
     _ = @import("fsmount.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");
