@@ -9071,3 +9071,107 @@ smoke-e2e (xvfb) all PASS. The zig-build-test runner deadlock persists
 (documented workaround used). Live GUI proof: 20+ screenshots covering
 every feature above; isolated world torn down by exact PID (2 daemons,
 0 leftovers).
+
+## 2026-07-24: browser completion sweep — views, places, move/undo, trash, metadata, integrations
+
+The remaining feature backlog, implemented and live-verified under Xvfb
+(screenshots for every headline item; disk-state checks for every
+mutation flow):
+
+- FIXED (pre-existing, all pane types): X-button close saved an EMPTY
+  last.json — the widget tree died before the shutdown hook ran. The
+  close-request path now saves FIRST (both the immediate-close and
+  confirm-dialog branches) and latches layout_saved_final so the
+  shutdown hook cannot overwrite the good save with post-teardown
+  emptiness. Verified: X-close now persists the full layout including
+  browser tabs.
+- View modes: the toolbar cycles details / compact / icon-grid /
+  Miller columns. Details gained a clickable sort header (Name/Size/
+  Modified with ^/v indicators; strict-weak-order safe descending) and
+  an rwx permissions column; grid is a GtkFlowBox with 48px thumbnails
+  in its OWN scroller (the listbox never leaves the tree, so popovers
+  survive mode switches); Miller keeps the normal listbox as the
+  RIGHTMOST column with subscribed ancestor columns to its left — all
+  existing menus/popovers/tree-expand keep working, and each ancestor
+  is a live view (dirByView covers them). Dir sort params live on the
+  Dir so delta-driven re-sorts need no tab lookup.
+- Places sidebar (toggle): Home / File System / Trash / Collection,
+  persisted bookmarks (Add Bookmark on dirs, inline remove), saved
+  searches, recent locations (deduped, cap 12, recorded on every
+  navigate), and Devices parsed from /proc/mounts (/dev-backed, nfs,
+  sshfs). Persistence in state-dir places.json via the new GTK-free
+  src/filebrowser/places.zig (unit-tested recent-dedupe).
+- Cut/Move + DnD + undo: Cut in the menu (multi-selection aware);
+  paste after cut MOVES — same-host as one rename (undoable), cross-
+  host as a verified transfer chained with source deletion; the cut
+  clipboard is one-shot. Row drags now carry host-qualified specs and
+  every listbox is a drop target: same-host drop moves (undoable),
+  cross-host drop copies, row-under-pointer targeting when it is a
+  directory. Undo (Ctrl+Z in the browser, or the context-menu entry
+  showing what it will undo): rename/move goes back, copy deletes the
+  created item, mkdir removes the folder, trash restores — recorded
+  only after the operation actually succeeded (deferred on the op
+  reply / job completion), bounded stack of 20.
+- Trash: freedesktop home trash PLUS the $topdir/.Trash-$UID fallback
+  when rename hits EXDEV (tmpfs and other filesystems trash correctly
+  now — verified live after the honest "XDEV" failure surfaced in the
+  jobs panel). "Restore from Trash" appears on entries inside any
+  trash files dir (home or topdir), fetches the .trashinfo over the
+  fs wire (RestoreRead), URL-unescapes Path=, and runs a trash_restore
+  job. Verified end-to-end including info-file cleanup.
+- Duplicate finder: "Find Duplicates Here" runs a host-side scan,
+  buckets by size, hash-confirms candidates with daemon hash jobs
+  (bounded 200), and opens a flat results tab of confirmed groups
+  only. Verified: 2-file group found, different-content file excluded.
+- Search/metadata: searches accept a "@7d pat" / "@12h" / "@30m"
+  prefix (server-side mtime filter — new within_ms on the find spec);
+  the star button saves the last search, saved searches persist and
+  re-run from the sidebar. Tags render as deterministic color chips;
+  ~/.config/sketerm/filecolors.conf ("glob=#RRGGBB") colors file
+  names (verified: red readme.md). Git status overlays for local
+  dirs: a worker thread runs git status --porcelain via popen (never
+  on the GLib loop), the idle handback is generation-checked and
+  orphan-safe, statuses aggregate onto immediate children ([M]
+  modified vs [?] untracked verified live).
+- Integrations: Open With gained "Always use for this file type"
+  (g_app_info_set_as_default_for_type); a toolbar button jumps to the
+  shell's OSC 7 cwd; "Export Selection to Shell" sets $SK_SEL /
+  $SK_SEL_ALL in the pane shell; the collection shelf persists across
+  restarts (places.json) with a sidebar entry; "Batch Rename in
+  $EDITOR" writes basenames to a temp file, runs $EDITOR in the
+  pane's shell, and a sentinel done-file (GFileMonitor) applies the
+  renames — count-mismatch aborts, each rename undoable. Verified by
+  simulating the editor.
+- Compare/sync deepening: scans now request a 100k match cap
+  (PARTIAL banner updated); a "Hash-verify equal-size rows" button
+  hash-jobs both sides of equal-size differs rows (cap 40) and flips
+  identical content to Skip with an [content IDENTICAL] annotation;
+  the direction dropdown gained "Delete (from the side that has it)"
+  plus a "Mirror: mark target-only rows for deletion" button —
+  deletion never happens without an explicit per-row setting.
+- FUSE: the stale "no ftruncate" comment was wrong — SETATTR size
+  already maps to the wire truncate op; comment fixed. Pin (keep
+  hydrated) / Evict Cached Data appear on files under a fuse.sketerm
+  mount and set the user.sketerm.pin/evict xattrs.
+- Files-mode identity: `sketerm files` windows title as "Sketerm
+  Files" with the files .desktop icon.
+
+DELIBERATE SKIP (user-authorized): the macOS live-delta watcher
+(FSEvents/kqueue). Blind-writing kernel-event plumbing for a platform
+this environment cannot run, inside the daemon's event path, is the
+"too difficult on macOS" case Jelle explicitly said to skip; the
+watcher seam stays documented, macOS still browses without live
+deltas.
+
+Not individually live-verified (machinery shared with verified flows):
+compact view rendering, the DnD drop handler (xdotool cannot
+synthesize reliable drags; same code path as verified cut-move),
+export-to-shell terminal output, cwd-sync (test shell has no OSC 7),
+pin/evict effects (no /dev/fuse here), compare hash-verify/mirror
+buttons (verified primitives: hash jobs + execute).
+
+Verification: GUI + mux + musl-portable + aarch64-macos builds; daemon
+libc/libm only (ldd). Tests 847 passed / 6 skipped / 0 failed (854
+total; +1 places test). smoke-fs (5 stages), smoke-broker, smoke-mcp,
+smoke-e2e (xvfb) all PASS. The zig-build-test runner deadlock
+persists; direct-binary workaround used throughout.
