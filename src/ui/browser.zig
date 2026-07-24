@@ -27,6 +27,7 @@ const wire = @import("../mux/wire.zig");
 const fsserve = @import("../mux/fsserve.zig");
 const fstransfer = @import("../ipc/fstransfer.zig");
 const browser_model = @import("../filebrowser/model.zig");
+const fsjob = @import("../mux/fsjob.zig");
 const mounts = @import("../util/mounts.zig");
 const input = @import("input.zig");
 const Pane = @import("pane.zig").Pane;
@@ -83,6 +84,16 @@ const WireReply = struct {
     more: bool = false,
     truncated: bool = false,
     job: u64 = 0,
+    size: u64 = 0,
+    eof: bool = false,
+    apps: []WireApp = &.{},
+};
+
+/// One host-side application (daemon `apps` op reply).
+const WireApp = struct {
+    name: []const u8 = "",
+    exec: []const u8 = "",
+    mimes: []const u8 = "",
 };
 
 const WireDelta = struct {
@@ -108,6 +119,7 @@ const WireJobEv = struct {
     text: []const u8 = "",
     kind: []const u8 = "",
     size: u64 = 0,
+    mtime_ms: i64 = 0,
     matches: u64 = 0,
     truncated: bool = false,
 };
@@ -453,7 +465,7 @@ const PendingJob = struct {
     req: u32,
     hc: *HostConn,
     label: []u8,
-    kind: enum { normal, search } = .normal,
+    kind: enum { normal, search, compare_left, compare_right } = .normal,
 };
 
 /// One client-mediated cross-host transfer, running or queued.
@@ -465,13 +477,391 @@ const ActiveTransfer = struct {
     /// Launch the local destination file when the transfer lands
     /// (remote-file open-with-default path).
     open_when_done: bool = false,
+    /// Launch with this specific application id instead of the
+    /// default handler (owned; Open With chooser).
+    open_with_appid: ?[]u8 = null,
+    /// Register a local-edit sync-back watch on the destination when
+    /// the download lands (owned remote source host + path).
+    watch_host: ?[]u8 = null,
+    watch_remote: ?[]u8 = null,
+    /// This transfer IS a sync-back upload for that watch (clears
+    /// its uploading flag on completion).
+    upload_watch: ?*EditWatch = null,
     /// Queue state: at most MAX_ACTIVE_TRANSFERS run concurrently;
     /// the rest wait here in order.
     started: bool = false,
+
+    fn freeExtras(t: *ActiveTransfer, allocator: std.mem.Allocator) void {
+        if (t.open_with_appid) |s| allocator.free(s);
+        if (t.watch_host) |s| allocator.free(s);
+        if (t.watch_remote) |s| allocator.free(s);
+    }
+};
+
+/// A remote file opened locally: its cache copy is monitored, and a
+/// local edit uploads back to the host (staged, hash-verified).
+const EditWatch = struct {
+    view: *BrowserView,
+    /// The remote host string the file came from.
+    host: []u8,
+    remote_path: []u8,
+    cache_path: []u8,
+    monitor: ?*c.GFileMonitor = null,
+    uploading: bool = false,
+
+    fn destroy(self: *EditWatch, allocator: std.mem.Allocator) void {
+        if (self.monitor) |m| {
+            _ = c.g_file_monitor_cancel(m);
+            c.g_object_unref(m);
+        }
+        allocator.free(self.host);
+        allocator.free(self.remote_path);
+        allocator.free(self.cache_path);
+        allocator.destroy(self);
+    }
 };
 
 /// Concurrent client-mediated transfers; more queue in order.
 const MAX_ACTIVE_TRANSFERS = 2;
+
+/// Two-tree compare/sync: both trees are scanned HOST-SIDE (find
+/// jobs streaming path+kind+size+mtime digests — only digests cross
+/// the wire), diffed client-side, and reconciled with per-row
+/// direction choices executed as jobs/transfers. Copy-only: no
+/// deletes, so a wrong direction cannot destroy data.
+const CompareCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    left: CmpSide,
+    right: CmpSide,
+    window: ?*c.GtkWidget = null,
+    listbox: *c.GtkListBox = undefined,
+    info_label: *c.GtkLabel = undefined,
+    excl_entry: *c.GtkEntry = undefined,
+    rows: std.ArrayList(*DiffRow) = .empty,
+    built: bool = false,
+
+    const CmpSide = struct {
+        hc: *HostConn,
+        root: []u8,
+        job: u64 = 0,
+        done: bool = false,
+        failed: bool = false,
+        truncated: bool = false,
+        /// rel path (owned) -> digest.
+        entries: std.StringHashMapUnmanaged(CmpInfo) = .empty,
+    };
+    const CmpInfo = struct { dir: bool, size: u64, mtime_ms: i64 };
+    const DiffStatus = enum { left_only, right_only, differs };
+    const Action = enum(c.guint) { skip = 0, to_right = 1, to_left = 2 };
+    const DiffRow = struct {
+        rel: []u8,
+        dir: bool,
+        status: DiffStatus,
+        l: ?CmpInfo,
+        r: ?CmpInfo,
+        dd: *c.GtkWidget,
+    };
+
+    fn sideFor(self: *CompareCtx, hc: *HostConn, job: u64) ?*CmpSide {
+        if (self.left.hc == hc and self.left.job == job and job != 0) return &self.left;
+        if (self.right.hc == hc and self.right.job == job and job != 0) return &self.right;
+        return null;
+    }
+
+    fn sideFailed(self: *CompareCtx, is_left: bool) void {
+        const s = if (is_left) &self.left else &self.right;
+        s.failed = true;
+        s.done = true;
+        c.gtk_label_set_text(self.info_label, "scan failed — see status bar");
+    }
+
+    /// Digest/completion events for the two scan jobs. Match events
+    /// are consumed; done/error also fall through to the jobs panel.
+    fn consumeJobEvent(self: *CompareCtx, hc: *HostConn, e: WireJobEv) bool {
+        const side = self.sideFor(hc, e.job) orelse return false;
+        if (std.mem.eql(u8, e.ev, "match")) {
+            self.record(side, e);
+            return true;
+        }
+        if (std.mem.eql(u8, e.ev, "done")) {
+            side.done = true;
+            side.truncated = e.truncated;
+            self.maybeBuild();
+            return false;
+        }
+        if (std.mem.eql(u8, e.ev, "error") or std.mem.eql(u8, e.ev, "canceled")) {
+            side.failed = true;
+            side.done = true;
+            c.gtk_label_set_text(self.info_label, "scan failed or canceled");
+            return false;
+        }
+        return false;
+    }
+
+    fn record(self: *CompareCtx, side: *CmpSide, e: WireJobEv) void {
+        if (!std.mem.startsWith(u8, e.path, side.root)) return;
+        var rel = e.path[side.root.len..];
+        if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
+        if (rel.len == 0) return;
+        const gop = side.entries.getOrPut(self.allocator, rel) catch return;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, rel) catch {
+                _ = side.entries.remove(rel);
+                return;
+            };
+        }
+        gop.value_ptr.* = .{
+            .dir = std.mem.eql(u8, e.kind, "dir"),
+            .size = e.size,
+            .mtime_ms = e.mtime_ms,
+        };
+    }
+
+    fn maybeBuild(self: *CompareCtx) void {
+        if (self.built or !self.left.done or !self.right.done) return;
+        if (self.left.failed or self.right.failed) return;
+        self.built = true;
+        self.buildDiff();
+    }
+
+    fn addRow(self: *CompareCtx, rel: []const u8, status: DiffStatus, l: ?CmpInfo, r: ?CmpInfo) void {
+        const is_dir = if (l) |i| i.dir else if (r) |i| i.dir else false;
+        // Default direction: copy from the side that has it; for a
+        // content difference the newer side wins.
+        var action: Action = switch (status) {
+            .left_only => .to_right,
+            .right_only => .to_left,
+            .differs => if (l.?.mtime_ms >= r.?.mtime_ms) .to_right else .to_left,
+        };
+        if (is_dir and status == .differs) action = .skip;
+
+        const row = self.allocator.create(DiffRow) catch return;
+        const rel_owned = self.allocator.dupe(u8, rel) catch {
+            self.allocator.destroy(row);
+            return;
+        };
+
+        const hbox = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
+        c.gtk_widget_set_margin_start(hbox, 6);
+        c.gtk_widget_set_margin_end(hbox, 6);
+        var lblz: [640:0]u8 = undefined;
+        var szl: [48:0]u8 = undefined;
+        var szr: [48:0]u8 = undefined;
+        const desc = switch (status) {
+            .left_only => std.fmt.bufPrintZ(&lblz, "{s}{s}  [only in source{s}]", .{
+                rel, if (is_dir) "/" else "", if (is_dir) "" else (std.fmt.bufPrintZ(&szl, ", {d} B", .{l.?.size}) catch ""),
+            }) catch "?",
+            .right_only => std.fmt.bufPrintZ(&lblz, "{s}{s}  [only in target{s}]", .{
+                rel, if (is_dir) "/" else "", if (is_dir) "" else (std.fmt.bufPrintZ(&szr, ", {d} B", .{r.?.size}) catch ""),
+            }) catch "?",
+            .differs => std.fmt.bufPrintZ(&lblz, "{s}  [differs: {s} vs {s}{s}]", .{
+                rel,
+                fmtSize(&szl, l.?.size),
+                fmtSize(&szr, r.?.size),
+                if (l.?.mtime_ms >= r.?.mtime_ms) ", source newer" else ", target newer",
+            }) catch "?",
+        };
+        const lab = c.gtk_label_new(desc.ptr);
+        c.gtk_label_set_xalign(@ptrCast(lab), 0);
+        c.gtk_widget_set_hexpand(lab, 1);
+        c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_MIDDLE);
+        c.gtk_box_append(@ptrCast(hbox), lab);
+
+        const options = [_:null]?[*:0]const u8{ "Skip", "Copy to target", "Copy to source" };
+        const dd = c.gtk_drop_down_new_from_strings(@ptrCast(&options));
+        c.gtk_drop_down_set_selected(@ptrCast(dd), @intFromEnum(action));
+        c.gtk_box_append(@ptrCast(hbox), dd);
+
+        const lrow = c.gtk_list_box_row_new();
+        c.gtk_list_box_row_set_child(@ptrCast(lrow), hbox);
+        c.gtk_list_box_append(self.listbox, lrow);
+
+        row.* = .{ .rel = rel_owned, .dir = is_dir, .status = status, .l = l, .r = r, .dd = dd };
+        self.rows.append(self.allocator, row) catch {
+            self.allocator.free(rel_owned);
+            self.allocator.destroy(row);
+        };
+    }
+
+    fn buildDiff(self: *CompareCtx) void {
+        // Deterministic order: parents before children (path sort).
+        var rels: std.ArrayList([]const u8) = .empty;
+        defer rels.deinit(self.allocator);
+        var itl = self.left.entries.iterator();
+        while (itl.next()) |kv| rels.append(self.allocator, kv.key_ptr.*) catch {};
+        var itr = self.right.entries.iterator();
+        while (itr.next()) |kv| {
+            if (self.left.entries.get(kv.key_ptr.*) == null)
+                rels.append(self.allocator, kv.key_ptr.*) catch {};
+        }
+        std.mem.sort([]const u8, rels.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lt);
+
+        var ndiff: usize = 0;
+        for (rels.items) |rel| {
+            const l = self.left.entries.get(rel);
+            const r = self.right.entries.get(rel);
+            if (l != null and r == null) {
+                self.addRow(rel, .left_only, l, null);
+                ndiff += 1;
+            } else if (l == null and r != null) {
+                self.addRow(rel, .right_only, null, r);
+                ndiff += 1;
+            } else if (l != null and r != null) {
+                if (l.?.dir or r.?.dir) continue;
+                const differs = l.?.size != r.?.size or
+                    @abs(l.?.mtime_ms - r.?.mtime_ms) > 2000;
+                if (differs) {
+                    self.addRow(rel, .differs, l, r);
+                    ndiff += 1;
+                }
+            }
+        }
+        var info: [256:0]u8 = undefined;
+        const trunc = self.left.truncated or self.right.truncated;
+        const txt = if (ndiff == 0)
+            std.fmt.bufPrintZ(&info, "Trees are identical ({d} entries scanned).{s}", .{
+                self.left.entries.count() + self.right.entries.count(),
+                if (trunc) " WARNING: scan truncated at 2000 entries/side — comparison is PARTIAL." else "",
+            }) catch "identical"
+        else
+            std.fmt.bufPrintZ(&info, "{d} difference(s). Review directions, then Execute.{s}", .{
+                ndiff,
+                if (trunc) " WARNING: scan truncated at 2000 entries/side — comparison is PARTIAL." else "",
+            }) catch "differences found";
+        c.gtk_label_set_text(self.info_label, txt.ptr);
+    }
+
+    /// Comma-separated exclusion globs against the rel path.
+    fn excluded(self: *CompareCtx, rel: []const u8) bool {
+        const txt = c.gtk_editable_get_text(@ptrCast(self.excl_entry));
+        const pats = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+        var it = std.mem.tokenizeScalar(u8, pats, ',');
+        while (it.next()) |p_raw| {
+            const p = std.mem.trim(u8, p_raw, " ");
+            if (p.len == 0) continue;
+            if (fsjob.nameMatches(p, rel)) return true;
+            if (fsjob.nameMatches(p, std.fs.path.basename(rel))) return true;
+        }
+        return false;
+    }
+
+    fn execute(self: *CompareCtx) void {
+        const view = self.view;
+        const same_host = hostEq(self.left.hc.host, self.right.hc.host);
+        var started: usize = 0;
+        var excluded_n: usize = 0;
+        for (self.rows.items) |row| {
+            const action: Action = switch (c.gtk_drop_down_get_selected(@ptrCast(row.dd))) {
+                1 => .to_right,
+                2 => .to_left,
+                else => .skip,
+            };
+            if (action == .skip) continue;
+            if (self.excluded(row.rel)) {
+                excluded_n += 1;
+                continue;
+            }
+            const src_side = if (action == .to_right) &self.left else &self.right;
+            const dst_side = if (action == .to_right) &self.right else &self.left;
+            var src_buf: [4096]u8 = undefined;
+            var dst_buf: [4096]u8 = undefined;
+            const src = std.fmt.bufPrint(&src_buf, "{s}/{s}", .{ src_side.root, row.rel }) catch continue;
+            const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{ dst_side.root, row.rel }) catch continue;
+            if (row.dir) {
+                // Rows are path-sorted, so parent dirs mkdir before
+                // their children copy.
+                view.sendOp(dst_side.hc, .{ .req = view.nextReq(), .op = "mkdir", .path = dst });
+                started += 1;
+                continue;
+            }
+            if (same_host) {
+                var lbl: [128]u8 = undefined;
+                const label = std.fmt.bufPrint(&lbl, "sync {s}", .{std.fs.path.basename(row.rel)}) catch "sync";
+                view.startDaemonJob(dst_side.hc, "copy", src, dst, label);
+            } else {
+                view.startTransfer(src_side.hc, src, dst_side.hc, dst, .{});
+            }
+            started += 1;
+        }
+        view.setStatusFmt("sync: {d} operation(s) started, {d} excluded", .{ started, excluded_n });
+        self.close();
+    }
+
+    fn close(self: *CompareCtx) void {
+        if (self.window) |w| {
+            self.window = null;
+            c.gtk_window_destroy(@ptrCast(w));
+        }
+    }
+
+    /// g_object destroy-notify on the window: final cleanup.
+    fn free(user: ?*anyopaque) callconv(.c) void {
+        const self: *CompareCtx = @ptrCast(@alignCast(user.?));
+        if (self.view.compare == self) self.view.compare = null;
+        self.window = null;
+        for (self.rows.items) |row| {
+            self.allocator.free(row.rel);
+            self.allocator.destroy(row);
+        }
+        self.rows.deinit(self.allocator);
+        freeSide(self.allocator, &self.left);
+        freeSide(self.allocator, &self.right);
+        self.allocator.destroy(self);
+    }
+
+    fn freeSide(allocator: std.mem.Allocator, side: *CmpSide) void {
+        var it = side.entries.iterator();
+        while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+        side.entries.deinit(allocator);
+        allocator.free(side.root);
+    }
+
+    fn onExecuteClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *CompareCtx = @ptrCast(@alignCast(user.?));
+        self.execute();
+    }
+    fn onCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *CompareCtx = @ptrCast(@alignCast(user.?));
+        self.close();
+    }
+};
+
+/// One in-flight remote preview fetch (chunked fs read).
+const PreviewRead = struct {
+    req: u32,
+    hc: *HostConn,
+    path: []u8,
+    is_image: bool,
+    cap: usize,
+    off: u64 = 0,
+    buf: std.ArrayList(u8) = .empty,
+
+    fn destroy(self: *PreviewRead, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.buf.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
+/// Extensions the preview pane and row thumbnails treat as images
+/// (decodable by gdk-pixbuf).
+fn isImageName(name: []const u8) bool {
+    const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tiff" };
+    for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
+    return false;
+}
+
+/// Content caps: whole image (bounded) vs a text head.
+const PREVIEW_IMAGE_CAP: usize = 8 << 20;
+const PREVIEW_TEXT_CAP: usize = 4096;
+/// Row thumbnails decode local images up to this size.
+const THUMB_FILE_CAP: u64 = 8 << 20;
+const THUMB_CACHE_CAP: usize = 256;
 
 pub const HostAction = *const fn (ctx: *anyopaque, host: []const u8, path: []const u8) void;
 
@@ -493,12 +883,31 @@ pub const BrowserView = struct {
     status_label: *c.GtkLabel = undefined,
     jobs_box: *c.GtkWidget = undefined,
     /// Copy-source for the context menu's Copy/Paste (owned).
+    /// clip_paths holds the full multi-selection; clip_path mirrors
+    /// its first item (single-source verbs: Sync Here, Compare).
     clip_host: ?[]u8 = null,
     clip_path: ?[]u8 = null,
+    clip_paths: std.ArrayList([]u8) = .empty,
     search_bar: *c.GtkWidget = undefined,
     search_entry: *c.GtkEntry = undefined,
     search_content: *c.GtkWidget = undefined,
     hidden_toggle: *c.GtkToggleButton = undefined,
+    /// Preview side panel (toggleable): metadata always, image or
+    /// text-head content when recognizably previewable.
+    preview_box: *c.GtkWidget = undefined,
+    preview_pic: *c.GtkWidget = undefined,
+    preview_text: *c.GtkLabel = undefined,
+    preview_meta: *c.GtkLabel = undefined,
+    preview_on: bool = false,
+    preview_read: ?*PreviewRead = null,
+    /// Row-thumbnail cache: "path\x00mtime" -> owned texture ref.
+    thumbs: std.StringHashMap(*c.GdkTexture) = undefined,
+    /// Live local-edit sync-back watches (remote files opened here).
+    watches: std.ArrayList(*EditWatch) = .empty,
+    /// The one open Open With chooser (its popover owns the ctx).
+    openwith: ?*OpenWithCtx = null,
+    /// The one open compare/sync window.
+    compare: ?*CompareCtx = null,
     switch_idle: c.guint = 0,
     /// Running search job (0 = none) and its host + results tab.
     search_job: u64 = 0,
@@ -518,6 +927,7 @@ pub const BrowserView = struct {
     pub fn attach(allocator: std.mem.Allocator, pane: *Pane, start_spec: ?[]const u8) !*BrowserView {
         const self = try allocator.create(BrowserView);
         self.* = .{ .allocator = allocator, .pane = pane };
+        self.thumbs = std.StringHashMap(*c.GdkTexture).init(allocator);
 
         self.buildUi();
         pane.attachBrowser(self.root_box, @ptrCast(self), destroyCb);
@@ -661,9 +1071,13 @@ pub const BrowserView = struct {
         for (self.transfers.items) |t| {
             t.x.deinit();
             self.allocator.free(t.label);
+            t.freeExtras(self.allocator);
             self.allocator.destroy(t);
         }
         self.transfers.deinit(self.allocator);
+        for (self.watches.items) |wt| wt.destroy(self.allocator);
+        self.watches.deinit(self.allocator);
+        if (self.compare) |cmp| cmp.close();
         for (self.tabs.items) |t| t.deinit();
         self.tabs.deinit(self.allocator);
         for (self.pending.items) |p| {
@@ -694,6 +1108,11 @@ pub const BrowserView = struct {
         self.conns.deinit(self.allocator);
         if (self.clip_host) |s| self.allocator.free(s);
         if (self.clip_path) |s| self.allocator.free(s);
+        for (self.clip_paths.items) |p| self.allocator.free(p);
+        self.clip_paths.deinit(self.allocator);
+        if (self.preview_read) |pr| pr.destroy(self.allocator);
+        self.clearThumbCache();
+        self.thumbs.deinit();
         self.allocator.destroy(self);
     }
 
@@ -825,11 +1244,16 @@ pub const BrowserView = struct {
             const t = self.transfers.items[i];
             if (t.src_hc == hc or t.dst_hc == hc) {
                 self.setStatusFmt("transfer failed: connection to {s} lost", .{hc.label()});
+                if (t.upload_watch) |wt| wt.uploading = false;
                 t.x.deinit();
                 self.allocator.free(t.label);
+                t.freeExtras(self.allocator);
                 self.allocator.destroy(t);
                 _ = self.transfers.orderedRemove(i);
             } else i += 1;
+        }
+        if (self.preview_read) |pr| {
+            if (pr.hc == hc) self.abandonPreviewRead();
         }
         hc.watch_id = 0;
         hc.conn.deinit();
@@ -932,6 +1356,7 @@ pub const BrowserView = struct {
                 xfer_touched = true;
                 continue;
             }
+            if (self.feedPreview(hc, f.ftype, f.payload)) continue;
             switch (f.ftype) {
                 .fs_reply => {
                     if (self.onReply(hc, f.payload)) dirty = true;
@@ -985,9 +1410,24 @@ pub const BrowserView = struct {
                 i += 1;
                 continue;
             }
-            if (t.x.ok()) {
+            if (t.upload_watch) |wt| {
+                wt.uploading = false;
+                if (t.x.ok()) {
+                    self.setStatusFmt("synced back: {s}", .{std.fs.path.basename(wt.remote_path)});
+                } else if (t.x.state != .canceled) {
+                    self.setStatusFmt("sync-back failed: {s} ({s})", .{ t.label, t.x.errMsg() });
+                }
+            } else if (t.x.ok()) {
                 self.setStatusFmt("transfer done: {s}", .{t.label});
-                if (t.open_when_done) launchLocal(t.x.dst_root);
+                if (t.open_when_done) {
+                    if (t.open_with_appid) |appid| {
+                        launchLocalWithApp(appid, t.x.dst_root);
+                    } else {
+                        launchLocal(t.x.dst_root);
+                    }
+                    if (t.watch_host != null and t.watch_remote != null)
+                        self.registerEditWatch(t.watch_host.?, t.watch_remote.?, t.x.dst_root);
+                }
             } else if (t.x.state == .canceled) {
                 self.setStatusFmt("transfer canceled: {s}", .{t.label});
             } else {
@@ -995,11 +1435,23 @@ pub const BrowserView = struct {
             }
             t.x.deinit();
             self.allocator.free(t.label);
+            t.freeExtras(self.allocator);
             self.allocator.destroy(t);
             _ = self.transfers.orderedRemove(i);
         }
         self.pumpTransferQueue();
     }
+
+    const TransferOpts = struct {
+        open_when_done: bool = false,
+        /// Launch with a specific application id (duped in).
+        open_with_appid: ?[]const u8 = null,
+        /// Register a sync-back watch on the landed download.
+        watch_host: ?[]const u8 = null,
+        watch_remote: ?[]const u8 = null,
+        /// This transfer is a sync-back upload for that watch.
+        upload_watch: ?*EditWatch = null,
+    };
 
     fn startTransfer(
         self: *BrowserView,
@@ -1007,13 +1459,14 @@ pub const BrowserView = struct {
         src_path: []const u8,
         dst_hc: *HostConn,
         dst_path: []const u8,
-        open_when_done: bool,
+        opts: TransferOpts,
     ) void {
+        const open_when_done = opts.open_when_done;
         if (src_hc.state != .ready or dst_hc.state != .ready) {
             self.setStatus("both hosts must be connected — retry in a moment");
             return;
         }
-        if (!open_when_done) {
+        if (!open_when_done and opts.upload_watch == null) {
             // User copies are coordinated by the local daemon, not this
             // BrowserView. They therefore survive pane/window teardown and
             // reconnect through the stable job journal.
@@ -1074,6 +1527,10 @@ pub const BrowserView = struct {
             .dst_hc = dst_hc,
             .label = label,
             .open_when_done = open_when_done,
+            .open_with_appid = if (opts.open_with_appid) |s| (self.allocator.dupe(u8, s) catch null) else null,
+            .watch_host = if (opts.watch_host) |s| (self.allocator.dupe(u8, s) catch null) else null,
+            .watch_remote = if (opts.watch_remote) |s| (self.allocator.dupe(u8, s) catch null) else null,
+            .upload_watch = opts.upload_watch,
         };
         self.transfers.append(self.allocator, t) catch {
             x.deinit();
@@ -1086,26 +1543,33 @@ pub const BrowserView = struct {
         self.renderJobs();
     }
 
-    /// Download a remote file into the local open-cache and launch
-    /// the default app on it when done.
-    fn openRemoteFile(self: *BrowserView, tab: *BTab, path: []const u8) void {
+    /// Download a remote file into the local open-cache, launch an
+    /// app on it when done (null appid = default handler), and watch
+    /// the cache copy so local edits sync back to the host.
+    fn openRemoteFile(self: *BrowserView, tab: *BTab, path: []const u8, appid: ?[]const u8) void {
         const local = self.hostConnFor(null) orelse return;
         if (local.state != .ready) {
             self.setStatus("local daemon unreachable");
             return;
         }
+        const host = tab.hc.host orelse return;
         const cache_root = c.g_get_user_cache_dir();
         var dirbuf: [4096:0]u8 = undefined;
         const dir = std.fmt.bufPrintZ(&dirbuf, "{s}/sketerm/fsopen", .{cache_root}) catch return;
         _ = c.g_mkdir_with_parents(dir.ptr, 0o700);
         var h = std.hash.Wyhash.init(0);
-        if (tab.hc.host) |hs| h.update(hs);
+        h.update(host);
         h.update(path);
         var dstbuf: [4600]u8 = undefined;
         const dst = std.fmt.bufPrint(&dstbuf, "{s}/{x:0>16}-{s}", .{
             dir, h.final(), std.fs.path.basename(path),
         }) catch return;
-        self.startTransfer(tab.hc, path, local, dst, true);
+        self.startTransfer(tab.hc, path, local, dst, .{
+            .open_when_done = true,
+            .open_with_appid = appid,
+            .watch_host = host,
+            .watch_remote = path,
+        });
     }
 
     // ── daemon jobs (same-host copy / recursive delete) ─────────
@@ -1185,6 +1649,9 @@ pub const BrowserView = struct {
         const e = std.json.parseFromSliceLeaky(WireJobEv, arena.allocator(), payload, .{
             .ignore_unknown_fields = true,
         }) catch return;
+        if (self.compare) |cmp| {
+            if (cmp.consumeJobEvent(hc, e)) return;
+        }
         if (std.mem.eql(u8, e.ev, "match")) {
             if (e.job == self.search_job and hc == self.search_hc) self.onSearchMatch(e);
             return;
@@ -1267,6 +1734,10 @@ pub const BrowserView = struct {
                     self.search_job = rep.job;
                     self.search_hc = hc;
                 }
+                if (self.compare) |cmp| {
+                    if (pj.kind == .compare_left) cmp.left.job = rep.job;
+                    if (pj.kind == .compare_right) cmp.right.job = rep.job;
+                }
                 const row = self.allocator.create(JobRow) catch break;
                 row.* = .{ .hc = hc, .job = rep.job, .label = pj.label };
                 self.jobs.append(self.allocator, row) catch {
@@ -1281,11 +1752,21 @@ pub const BrowserView = struct {
                 self.renderJobs();
             } else {
                 self.setStatusFmt("operation failed: {s}", .{rep.@"error"});
+                if (pj.kind == .compare_left or pj.kind == .compare_right) {
+                    if (self.compare) |cmp| cmp.sideFailed(pj.kind == .compare_left);
+                }
                 self.allocator.free(pj.label);
                 _ = self.pending_jobs.orderedRemove(i);
                 self.allocator.destroy(pj);
             }
             return false;
+        }
+        // Open With host-apps reply?
+        if (self.openwith) |ow| {
+            if (ow.req != 0 and ow.req == rep.req) {
+                self.populateHostApps(ow, rep.ok, rep.apps);
+                return false;
+            }
         }
         // Plain op reply (mkdir/rename/delete fired from the UI).
         if (!rep.ok) {
@@ -1720,13 +2201,27 @@ pub const BrowserView = struct {
             c.gtk_box_append(@ptrCast(row_box), spacer);
         }
 
-        const icon_name: [*:0]const u8 = if (std.mem.eql(u8, e.kind, "dir"))
-            "folder-symbolic"
-        else if (std.mem.eql(u8, e.kind, "link"))
-            "emblem-symbolic-link"
-        else
-            "text-x-generic-symbolic";
-        const icon = c.gtk_image_new_from_icon_name(icon_name);
+        // Local image files get a real thumbnail (bounded decode,
+        // cached by path+mtime); everything else a symbolic icon.
+        var icon: ?*c.GtkWidget = null;
+        if (tab.hc.host == null and std.mem.eql(u8, e.kind, "file") and
+            e.size <= THUMB_FILE_CAP and isImageName(e.name))
+        {
+            if (self.thumbTexture(full, e.mtime_ms)) |tex| {
+                const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
+                c.gtk_image_set_pixel_size(@ptrCast(img), 24);
+                icon = img;
+            }
+        }
+        if (icon == null) {
+            const icon_name: [*:0]const u8 = if (std.mem.eql(u8, e.kind, "dir"))
+                "folder-symbolic"
+            else if (std.mem.eql(u8, e.kind, "link"))
+                "emblem-symbolic-link"
+            else
+                "text-x-generic-symbolic";
+            icon = c.gtk_image_new_from_icon_name(icon_name);
+        }
         c.gtk_box_append(@ptrCast(row_box), icon);
 
         var name_buf: [512:0]u8 = undefined;
@@ -1822,6 +2317,7 @@ pub const BrowserView = struct {
             tab.selected.append(a, owned) catch a.free(owned);
         }
         if (head != null) c.g_list_free(head);
+        tab.view.updatePreview();
     }
 
     fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
@@ -1873,7 +2369,7 @@ pub const BrowserView = struct {
         } else {
             // Remote file: download into the local open-cache, then
             // launch (phase-5's hydrating cache predecessor).
-            self.openRemoteFile(tab, ctx.path);
+            self.openRemoteFile(tab, ctx.path, null);
         }
     }
 
@@ -1968,6 +2464,8 @@ pub const BrowserView = struct {
             } else if (!is_local and self.on_host_open != null) {
                 menuButton(box, "Open on Host (app forward)", &onMenuHostOpen, ctx, false);
             }
+            if (!is_dir)
+                menuButton(box, "Open With…", &onMenuOpenWith, ctx, false);
             menuButton(box, "Copy", &onMenuCopy, ctx, false);
             menuButton(box, "Copy Path", &onMenuCopyPath, ctx, false);
             menuButton(box, "Rename…", &onMenuRename, ctx, false);
@@ -1985,6 +2483,7 @@ pub const BrowserView = struct {
         if (self.clip_path != null) {
             menuButton(box, "Paste Here", &onMenuPaste, ctx, false);
             menuButton(box, "Sync Here (mirror copy, resumable)", &onMenuSyncHere, ctx, false);
+            menuButton(box, "Compare / Sync with Copied…", &onMenuCompare, ctx, false);
         }
         menuButton(box, "New Folder…", &onMenuNewFolder, ctx, false);
         if (ctx.path != null) self.appendActionButtons(box, ctx);
@@ -2044,8 +2543,31 @@ pub const BrowserView = struct {
         self.clip_host = null;
         if (ctx.tab.hc.host) |h| self.clip_host = self.allocator.dupe(u8, h) catch null;
         if (self.clip_path) |s| self.allocator.free(s);
-        self.clip_path = self.allocator.dupe(u8, path) catch null;
-        self.setStatusFmt("copied: {s}", .{path});
+        self.clip_path = null;
+        for (self.clip_paths.items) |p| self.allocator.free(p);
+        self.clip_paths.clearRetainingCapacity();
+        // A multi-selection that includes the clicked row copies the
+        // whole selection; otherwise just the clicked entry.
+        const in_selection = for (ctx.tab.selected.items) |sp| {
+            if (std.mem.eql(u8, sp, path)) break true;
+        } else false;
+        if (in_selection and ctx.tab.selected.items.len > 1) {
+            for (ctx.tab.selected.items) |sp| {
+                const owned = self.allocator.dupe(u8, sp) catch continue;
+                self.clip_paths.append(self.allocator, owned) catch self.allocator.free(owned);
+            }
+        } else {
+            if (self.allocator.dupe(u8, path)) |owned| {
+                self.clip_paths.append(self.allocator, owned) catch self.allocator.free(owned);
+            } else |_| {}
+        }
+        if (self.clip_paths.items.len > 0)
+            self.clip_path = self.allocator.dupe(u8, self.clip_paths.items[0]) catch null;
+        if (self.clip_paths.items.len > 1) {
+            self.setStatusFmt("copied {d} items", .{self.clip_paths.items.len});
+        } else {
+            self.setStatusFmt("copied: {s}", .{path});
+        }
         menuDone(ctx);
     }
 
@@ -2061,33 +2583,164 @@ pub const BrowserView = struct {
         menuDone(ctx);
     }
 
+    /// Heap context for one pending paste batch, owned by its
+    /// conflict popover (freed when the popover dies).
+    const PasteCtx = struct {
+        allocator: std.mem.Allocator,
+        view: *BrowserView,
+        tab: *BTab,
+        sources: std.ArrayList([]u8) = .empty,
+        conflicts: usize = 0,
+        popover: *c.GtkWidget,
+
+        fn free(user: ?*anyopaque) callconv(.c) void {
+            const p: *PasteCtx = @ptrCast(@alignCast(user.?));
+            for (p.sources.items) |s| p.allocator.free(s);
+            p.sources.deinit(p.allocator);
+            p.allocator.destroy(p);
+        }
+    };
+
+    const ConflictChoice = enum { overwrite, keep_both, skip };
+
     fn onMenuPaste(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
         const self = ctx.view;
-        const src = self.clip_path orelse return menuDone(ctx);
         const tab = ctx.tab;
-        const base = std.fs.path.basename(src);
-        var dst_buf: [4096]u8 = undefined;
-        var w = std.Io.Writer.fixed(&dst_buf);
-        const dir = tab.root.path;
-        // Same-name collision in the target listing → "-copy" suffix
-        // instead of a silent overwrite.
-        const collides = tab.root.find(base) != null;
-        w.print("{s}/{s}{s}", .{ if (dir.len == 1) "" else dir, base, if (collides) "-copy" else "" }) catch return menuDone(ctx);
-        const dst = w.buffered();
+        if (self.clip_paths.items.len == 0 and self.clip_path == null) return menuDone(ctx);
 
-        if (hostEq(self.clip_host, tab.hc.host)) {
-            // Same host: the daemon copies locally (job).
-            var lbl: [128]u8 = undefined;
-            const label = std.fmt.bufPrint(&lbl, "copy {s}", .{base}) catch base;
-            self.startDaemonJob(tab.hc, "copy", src, dst, label);
-        } else {
-            // Cross-host: client-mediated transfer.
-            const src_hc = self.hostConnFor(if (self.clip_host) |h| @as(?[]const u8, h) else null) orelse
-                return menuDone(ctx);
-            self.startTransfer(src_hc, src, tab.hc, dst, false);
+        // Count collisions against the LIVE target listing.
+        var conflicts: usize = 0;
+        const srcs: []const []u8 = if (self.clip_paths.items.len > 0)
+            self.clip_paths.items
+        else
+            (&[_][]u8{self.clip_path.?})[0..];
+        for (srcs) |src| {
+            if (tab.root.find(std.fs.path.basename(src)) != null) conflicts += 1;
         }
+        if (conflicts == 0) {
+            self.pasteExecute(tab, srcs, .overwrite);
+            return menuDone(ctx);
+        }
+
+        // Conflict dialog: one choice applies to every conflicting
+        // item; non-conflicting items copy either way.
+        const popover = c.gtk_popover_new();
+        const pctx = self.allocator.create(PasteCtx) catch return menuDone(ctx);
+        pctx.* = .{ .allocator = self.allocator, .view = self, .tab = tab, .popover = popover, .conflicts = conflicts };
+        for (srcs) |src| {
+            const owned = self.allocator.dupe(u8, src) catch continue;
+            pctx.sources.append(self.allocator, owned) catch self.allocator.free(owned);
+        }
+        c.g_object_set_data_full(@ptrCast(popover), "sketerm-paste", @ptrCast(pctx), @ptrCast(&PasteCtx.free));
+
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
+        c.gtk_widget_set_margin_start(box, 10);
+        c.gtk_widget_set_margin_end(box, 10);
+        c.gtk_widget_set_margin_top(box, 10);
+        c.gtk_widget_set_margin_bottom(box, 10);
+        var lbl: [256:0]u8 = undefined;
+        const first = std.fs.path.basename(srcs[0]);
+        const txt = if (conflicts == 1)
+            std.fmt.bufPrintZ(&lbl, "\"{s}\" already exists here.", .{first}) catch "Name conflict."
+        else
+            std.fmt.bufPrintZ(&lbl, "{d} of {d} items already exist here.", .{ conflicts, srcs.len }) catch "Name conflicts.";
+        const label = c.gtk_label_new(txt.ptr);
+        c.gtk_label_set_xalign(@ptrCast(label), 0);
+        c.gtk_box_append(@ptrCast(box), label);
+        if (conflicts > 1) {
+            const sub = c.gtk_label_new("The choice applies to all conflicting items.");
+            c.gtk_widget_add_css_class(sub, "dim-label");
+            c.gtk_label_set_xalign(@ptrCast(sub), 0);
+            c.gtk_box_append(@ptrCast(box), sub);
+        }
+        pasteChoiceButton(box, "Keep Both (rename copy)", &onPasteKeepBoth, pctx, false);
+        pasteChoiceButton(box, "Skip Existing", &onPasteSkip, pctx, false);
+        pasteChoiceButton(box, "Overwrite", &onPasteOverwrite, pctx, true);
+
+        c.gtk_popover_set_child(@ptrCast(popover), box);
+        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(tab.listbox)));
+        connectPopoverAutoUnparent(popover);
+        c.gtk_popover_popup(@ptrCast(popover));
         menuDone(ctx);
+    }
+
+    fn pasteChoiceButton(box: *c.GtkWidget, label: [*:0]const u8, cb: anytype, pctx: *PasteCtx, destructive: bool) void {
+        const btn = c.gtk_button_new_with_label(label);
+        if (destructive) c.gtk_widget_add_css_class(btn, "destructive-action");
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(cb), @ptrCast(pctx), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(box), btn);
+    }
+
+    fn onPasteOverwrite(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const p: *PasteCtx = @ptrCast(@alignCast(user.?));
+        p.view.pasteExecute(p.tab, p.sources.items, .overwrite);
+        c.gtk_popover_popdown(@ptrCast(p.popover));
+    }
+    fn onPasteKeepBoth(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const p: *PasteCtx = @ptrCast(@alignCast(user.?));
+        p.view.pasteExecute(p.tab, p.sources.items, .keep_both);
+        c.gtk_popover_popdown(@ptrCast(p.popover));
+    }
+    fn onPasteSkip(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const p: *PasteCtx = @ptrCast(@alignCast(user.?));
+        p.view.pasteExecute(p.tab, p.sources.items, .skip);
+        c.gtk_popover_popdown(@ptrCast(p.popover));
+    }
+
+    /// Pick a destination name that does not collide with the live
+    /// target listing: "name-copy", then "name-copy2"…
+    fn uniqueDstName(tab: *BTab, base: []const u8, buf: []u8) ?[]const u8 {
+        var candidate = std.fmt.bufPrint(buf, "{s}-copy", .{base}) catch return null;
+        var n: u32 = 2;
+        while (tab.root.find(candidate) != null) : (n += 1) {
+            if (n > 999) return null;
+            candidate = std.fmt.bufPrint(buf, "{s}-copy{d}", .{ base, n }) catch return null;
+        }
+        return candidate;
+    }
+
+    /// Start one copy per source, honoring `choice` for names that
+    /// already exist in the target directory.
+    fn pasteExecute(self: *BrowserView, tab: *BTab, sources: []const []u8, choice: ConflictChoice) void {
+        const dir = tab.root.path;
+        var skipped: usize = 0;
+        for (sources) |src| {
+            const base = std.fs.path.basename(src);
+            var name_buf: [512]u8 = undefined;
+            var name: []const u8 = base;
+            if (tab.root.find(base) != null) {
+                switch (choice) {
+                    .overwrite => {},
+                    .keep_both => name = uniqueDstName(tab, base, &name_buf) orelse {
+                        skipped += 1;
+                        continue;
+                    },
+                    .skip => {
+                        skipped += 1;
+                        continue;
+                    },
+                }
+            }
+            var dst_buf: [4096]u8 = undefined;
+            const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
+                if (dir.len == 1) "" else dir, name,
+            }) catch continue;
+            // Overwriting a file with itself is a no-op, not a copy.
+            if (hostEq(self.clip_host, tab.hc.host) and std.mem.eql(u8, src, dst)) {
+                skipped += 1;
+                continue;
+            }
+            if (hostEq(self.clip_host, tab.hc.host)) {
+                var lbl: [128]u8 = undefined;
+                const label = std.fmt.bufPrint(&lbl, "copy {s}", .{base}) catch base;
+                self.startDaemonJob(tab.hc, "copy", src, dst, label);
+            } else {
+                const src_hc = self.hostConnFor(if (self.clip_host) |h| @as(?[]const u8, h) else null) orelse continue;
+                self.startTransfer(src_hc, src, tab.hc, dst, .{});
+            }
+        }
+        if (skipped > 0) self.setStatusFmt("skipped {d} existing item(s)", .{skipped});
     }
 
     fn countSelected(tab: *BTab) usize {
@@ -2120,6 +2773,333 @@ pub const BrowserView = struct {
             }
         }
         menuDone(ctx);
+    }
+
+    // ── Open With chooser (local apps + host apps) ──────────────
+
+    /// Heap context for one Open With popover; owned by the popover.
+    const OpenWithCtx = struct {
+        allocator: std.mem.Allocator,
+        view: *BrowserView,
+        tab: *BTab,
+        path: []u8,
+        /// In-flight host `apps` request (0 = none).
+        req: u32 = 0,
+        host_box: *c.GtkWidget,
+        host_label: *c.GtkWidget,
+        popover: *c.GtkWidget,
+
+        fn free(user: ?*anyopaque) callconv(.c) void {
+            const ctx: *OpenWithCtx = @ptrCast(@alignCast(user.?));
+            if (ctx.view.openwith == ctx) ctx.view.openwith = null;
+            ctx.allocator.free(ctx.path);
+            ctx.allocator.destroy(ctx);
+        }
+    };
+
+    /// Heap context for one app button (GClosureNotify-freed).
+    const AppBtnCtx = struct {
+        allocator: std.mem.Allocator,
+        view: *BrowserView,
+        tab: *BTab,
+        path: []u8,
+        /// Local application id (GAppInfo) — launch locally.
+        appid: ?[]u8 = null,
+        /// Host .desktop Exec line — launch on the file's host.
+        exec: ?[]u8 = null,
+        popover: *c.GtkWidget,
+
+        fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
+            _ = closure;
+            const a: *AppBtnCtx = @ptrCast(@alignCast(user.?));
+            a.allocator.free(a.path);
+            if (a.appid) |s| a.allocator.free(s);
+            if (a.exec) |s| a.allocator.free(s);
+            a.allocator.destroy(a);
+        }
+    };
+
+    fn onMenuOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const mctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = mctx.view;
+        const orig = mctx.path orelse return menuDone(mctx);
+        const tab = mctx.tab;
+        const is_local = tab.hc.host == null;
+        // Copy the path out and close the menu popover FIRST — its
+        // popdown must not race the new popover's grab.
+        var pbuf: [4096]u8 = undefined;
+        if (orig.len >= pbuf.len) return menuDone(mctx);
+        @memcpy(pbuf[0..orig.len], orig);
+        const path = pbuf[0..orig.len];
+        menuDone(mctx);
+
+        const popover = c.gtk_popover_new();
+        const ctx = self.allocator.create(OpenWithCtx) catch return;
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
+        const host_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
+        const host_label = c.gtk_label_new("");
+        ctx.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .tab = tab,
+            .path = self.allocator.dupe(u8, path) catch {
+                self.allocator.destroy(ctx);
+                return;
+            },
+            .host_box = host_box,
+            .host_label = host_label,
+            .popover = popover,
+        };
+        c.g_object_set_data_full(@ptrCast(popover), "sketerm-openwith", @ptrCast(ctx), @ptrCast(&OpenWithCtx.free));
+
+        // Local applications for the file's guessed content type.
+        const sec = c.gtk_label_new(if (is_local) "Open with:" else "Open locally (downloads a copy):");
+        c.gtk_widget_add_css_class(sec, "dim-label");
+        c.gtk_label_set_xalign(@ptrCast(sec), 0);
+        c.gtk_box_append(@ptrCast(box), sec);
+
+        var namez: [512:0]u8 = undefined;
+        const base = std.fs.path.basename(path);
+        var app_count: usize = 0;
+        if (std.fmt.bufPrintZ(&namez, "{s}", .{base})) |bz| {
+            var uncertain: c.gboolean = 0;
+            const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
+            if (ct != null) {
+                const apps = c.g_app_info_get_all_for_type(ct);
+                var it = apps;
+                while (it != null and app_count < 20) : (it = it.*.next) {
+                    const app: *c.GAppInfo = @ptrCast(@alignCast(it.*.data orelse continue));
+                    const id = c.g_app_info_get_id(app) orelse continue;
+                    const nm = c.g_app_info_get_name(app) orelse continue;
+                    self.appChoiceButton(box, ctx, std.mem.span(nm), std.mem.span(id), null);
+                    app_count += 1;
+                }
+                if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
+                c.g_free(ct);
+            }
+        } else |_| {}
+        if (app_count == 0) {
+            const none = c.gtk_label_new("(no known local handler)");
+            c.gtk_widget_add_css_class(none, "dim-label");
+            c.gtk_box_append(@ptrCast(box), none);
+        }
+
+        // Host applications (remote tabs): one daemon round trip.
+        // The widgets always join the tree (hidden locally) so they
+        // never dangle as floating refs.
+        c.gtk_widget_add_css_class(host_label, "dim-label");
+        c.gtk_label_set_xalign(@ptrCast(host_label), 0);
+        c.gtk_box_append(@ptrCast(box), host_label);
+        c.gtk_box_append(@ptrCast(box), host_box);
+        if (!is_local) {
+            c.gtk_label_set_text(@ptrCast(host_label), "On host: loading…");
+            if (tab.hc.state == .ready) {
+                ctx.req = self.nextReq();
+                self.openwith = ctx;
+                self.sendOp(tab.hc, .{ .req = ctx.req, .op = "apps", .path = "/" });
+            } else {
+                c.gtk_label_set_text(@ptrCast(host_label), "On host: not connected");
+            }
+        } else {
+            c.gtk_widget_set_visible(host_label, 0);
+            c.gtk_widget_set_visible(host_box, 0);
+        }
+
+        const scroll = c.gtk_scrolled_window_new();
+        c.gtk_widget_set_size_request(scroll, 320, 380);
+        c.gtk_scrolled_window_set_child(@ptrCast(scroll), box);
+        c.gtk_popover_set_child(@ptrCast(popover), scroll);
+        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(tab.listbox)));
+        connectPopoverAutoUnparent(popover);
+        const rect = c.GdkRectangle{ .x = 320, .y = 200, .width = 1, .height = 1 };
+        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+        c.gtk_popover_popup(@ptrCast(popover));
+    }
+
+    fn appChoiceButton(
+        self: *BrowserView,
+        box: *c.GtkWidget,
+        ctx: *OpenWithCtx,
+        name: []const u8,
+        appid: ?[]const u8,
+        exec: ?[]const u8,
+    ) void {
+        const actx = self.allocator.create(AppBtnCtx) catch return;
+        actx.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .tab = ctx.tab,
+            .path = self.allocator.dupe(u8, ctx.path) catch {
+                self.allocator.destroy(actx);
+                return;
+            },
+            .appid = if (appid) |s| (self.allocator.dupe(u8, s) catch null) else null,
+            .exec = if (exec) |s| (self.allocator.dupe(u8, s) catch null) else null,
+            .popover = ctx.popover,
+        };
+        var lbl: [256:0]u8 = undefined;
+        const ltxt = std.fmt.bufPrintZ(&lbl, "{s}", .{name}) catch return;
+        const btn = c.gtk_button_new_with_label(ltxt.ptr);
+        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+        c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(btn)), c.GTK_ALIGN_START);
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onAppBtnClicked), @ptrCast(actx), @ptrCast(&AppBtnCtx.free), c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(box), btn);
+    }
+
+    fn onAppBtnClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const actx: *AppBtnCtx = @ptrCast(@alignCast(user.?));
+        const self = actx.view;
+        const tab = actx.tab;
+        if (actx.exec) |exec| {
+            // Host application: substituted Exec runs as an app
+            // session on the file's host; its window forwards here.
+            if (self.on_host_exec) |cb| {
+                if (self.hooks_ctx) |hctx| {
+                    if (buildHostExecCmd(self.allocator, exec, actx.path)) |cmd| {
+                        defer self.allocator.free(cmd);
+                        var z: [4600:0]u8 = undefined;
+                        if (std.fmt.bufPrintZ(&z, "{s}", .{cmd})) |cz| {
+                            cb(hctx, tab.hc.host orelse "", cz);
+                            self.setStatus("opening on host (app window forwards here)…");
+                        } else |_| {}
+                    }
+                }
+            }
+        } else if (actx.appid) |appid| {
+            if (tab.hc.host == null) {
+                launchLocalWithApp(appid, actx.path);
+            } else {
+                self.openRemoteFile(tab, actx.path, appid);
+            }
+        }
+        c.gtk_popover_popdown(@ptrCast(actx.popover));
+    }
+
+    /// Fill the chooser's host section from the daemon's app list,
+    /// filtered by the file's locally-guessed MIME type.
+    fn populateHostApps(self: *BrowserView, ow: *OpenWithCtx, ok: bool, apps: []const WireApp) void {
+        ow.req = 0;
+        if (!ok) {
+            c.gtk_label_set_text(@ptrCast(ow.host_label), "On host: unavailable (older daemon)");
+            return;
+        }
+        var hostz: [280:0]u8 = undefined;
+        const htxt = std.fmt.bufPrintZ(&hostz, "On {s}:", .{ow.tab.hc.label()}) catch "On host:";
+        c.gtk_label_set_text(@ptrCast(ow.host_label), htxt.ptr);
+
+        // Guess the MIME locally from the file name.
+        var mime_buf: [256]u8 = undefined;
+        var mime: []const u8 = "";
+        var namez: [512:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&namez, "{s}", .{std.fs.path.basename(ow.path)})) |bz| {
+            var uncertain: c.gboolean = 0;
+            const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
+            if (ct != null) {
+                const m = c.g_content_type_get_mime_type(ct);
+                if (m != null) {
+                    const ms = std.mem.span(@as([*:0]const u8, @ptrCast(m)));
+                    if (ms.len < mime_buf.len) {
+                        @memcpy(mime_buf[0..ms.len], ms);
+                        mime = mime_buf[0..ms.len];
+                    }
+                    c.g_free(m);
+                }
+                c.g_free(ct);
+            }
+        } else |_| {}
+
+        var shown: usize = 0;
+        if (mime.len > 0) {
+            for (apps) |app| {
+                if (shown >= 20) break;
+                if (!mimeListContains(app.mimes, mime)) continue;
+                self.appChoiceButton(ow.host_box, ow, app.name, null, app.exec);
+                shown += 1;
+            }
+        }
+        if (shown == 0) {
+            // No MIME match: offer everything, bounded.
+            for (apps) |app| {
+                if (shown >= 30) break;
+                self.appChoiceButton(ow.host_box, ow, app.name, null, app.exec);
+                shown += 1;
+            }
+        }
+        if (shown == 0)
+            c.gtk_label_set_text(@ptrCast(ow.host_label), "On host: no applications found");
+    }
+
+    // ── local-edit sync-back (remote files opened locally) ──────
+
+    /// Watch a landed download; local saves upload back to the host.
+    fn registerEditWatch(self: *BrowserView, host: []const u8, remote_path: []const u8, cache_path: []const u8) void {
+        for (self.watches.items) |wt| {
+            if (std.mem.eql(u8, wt.host, host) and std.mem.eql(u8, wt.remote_path, remote_path)) return;
+        }
+        const wt = self.allocator.create(EditWatch) catch return;
+        wt.* = .{
+            .view = self,
+            .host = self.allocator.dupe(u8, host) catch {
+                self.allocator.destroy(wt);
+                return;
+            },
+            .remote_path = self.allocator.dupe(u8, remote_path) catch {
+                self.allocator.free(wt.host);
+                self.allocator.destroy(wt);
+                return;
+            },
+            .cache_path = self.allocator.dupe(u8, cache_path) catch {
+                self.allocator.free(wt.host);
+                self.allocator.free(wt.remote_path);
+                self.allocator.destroy(wt);
+                return;
+            },
+        };
+        var z: [4600:0]u8 = undefined;
+        const pz = std.fmt.bufPrintZ(&z, "{s}", .{cache_path}) catch {
+            wt.destroy(self.allocator);
+            return;
+        };
+        const gfile = c.g_file_new_for_path(pz.ptr);
+        wt.monitor = c.g_file_monitor_file(gfile, c.G_FILE_MONITOR_NONE, null, null);
+        c.g_object_unref(gfile);
+        if (wt.monitor == null) {
+            wt.destroy(self.allocator);
+            return;
+        }
+        _ = c.g_signal_connect_data(wt.monitor, "changed", @ptrCast(&onEditWatchChanged), @ptrCast(wt), null, c.G_CONNECT_DEFAULT);
+        self.watches.append(self.allocator, wt) catch {
+            wt.destroy(self.allocator);
+            return;
+        };
+        self.setStatusFmt("local edits to {s} will sync back to {s}", .{
+            std.fs.path.basename(remote_path), host,
+        });
+    }
+
+    fn onEditWatchChanged(
+        _: *c.GFileMonitor,
+        _: ?*c.GFile,
+        _: ?*c.GFile,
+        event: c.GFileMonitorEvent,
+        user: ?*anyopaque,
+    ) callconv(.c) void {
+        if (event != c.G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT) return;
+        const wt: *EditWatch = @ptrCast(@alignCast(user.?));
+        wt.view.uploadEditWatch(wt);
+    }
+
+    fn uploadEditWatch(self: *BrowserView, wt: *EditWatch) void {
+        if (wt.uploading) return;
+        const local = self.hostConnFor(null) orelse return;
+        const remote = self.hostConnFor(wt.host) orelse return;
+        if (local.state != .ready or remote.state != .ready) {
+            self.setStatusFmt("edit sync-back to {s} deferred (reconnecting) — save again to retry", .{wt.host});
+            return;
+        }
+        wt.uploading = true;
+        self.startTransfer(local, wt.cache_path, remote, wt.remote_path, .{ .upload_watch = wt });
+        self.renderJobs();
     }
 
     // ── tags ────────────────────────────────────────────────────
@@ -2369,9 +3349,110 @@ pub const BrowserView = struct {
         } else {
             const src_hc = self.hostConnFor(if (self.clip_host) |h| @as(?[]const u8, h) else null) orelse
                 return menuDone(ctx);
-            self.startTransfer(src_hc, src, tab.hc, dst, false);
+            self.startTransfer(src_hc, src, tab.hc, dst, .{});
         }
         menuDone(ctx);
+    }
+
+    fn onMenuCompare(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const tab = ctx.tab;
+        const target = if (ctx.is_dir and ctx.path != null) ctx.path.? else tab.root.path;
+        var tbuf: [4096]u8 = undefined;
+        if (target.len >= tbuf.len) return menuDone(ctx);
+        @memcpy(tbuf[0..target.len], target);
+        const tcopy = tbuf[0..target.len];
+        menuDone(ctx);
+        self.startCompare(tab, tcopy);
+    }
+
+    /// Open the compare/sync window: source = the copied directory,
+    /// target = `right_path` on this tab's host. Host-side scans.
+    fn startCompare(self: *BrowserView, tab: *BTab, right_path: []const u8) void {
+        const src_path = self.clip_path orelse return;
+        if (self.compare != null) {
+            self.setStatus("a compare window is already open");
+            return;
+        }
+        const left_hc = self.hostConnFor(if (self.clip_host) |h| @as(?[]const u8, h) else null) orelse return;
+        const right_hc = tab.hc;
+        if (left_hc.state != .ready or right_hc.state != .ready) {
+            self.setStatus("both hosts must be connected — retry in a moment");
+            return;
+        }
+
+        const cmp = self.allocator.create(CompareCtx) catch return;
+        cmp.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .left = .{ .hc = left_hc, .root = self.allocator.dupe(u8, src_path) catch {
+                self.allocator.destroy(cmp);
+                return;
+            } },
+            .right = .{ .hc = right_hc, .root = self.allocator.dupe(u8, right_path) catch {
+                self.allocator.free(cmp.left.root);
+                self.allocator.destroy(cmp);
+                return;
+            } },
+        };
+
+        const win = c.gtk_window_new();
+        c.gtk_window_set_title(@ptrCast(win), "Compare / Sync");
+        c.gtk_window_set_default_size(@ptrCast(win), 760, 520);
+        const vbox = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
+        c.gtk_widget_set_margin_start(vbox, 10);
+        c.gtk_widget_set_margin_end(vbox, 10);
+        c.gtk_widget_set_margin_top(vbox, 10);
+        c.gtk_widget_set_margin_bottom(vbox, 10);
+
+        var hdr: [1024:0]u8 = undefined;
+        const htxt = std.fmt.bufPrintZ(&hdr, "Source: {s}:{s}\nTarget: {s}:{s}", .{
+            left_hc.label(), src_path, right_hc.label(), right_path,
+        }) catch "Compare";
+        const header = c.gtk_label_new(htxt.ptr);
+        c.gtk_label_set_xalign(@ptrCast(header), 0);
+        c.gtk_box_append(@ptrCast(vbox), header);
+
+        const info = c.gtk_label_new("Scanning both trees host-side…");
+        c.gtk_label_set_xalign(@ptrCast(info), 0);
+        c.gtk_widget_add_css_class(info, "dim-label");
+        c.gtk_box_append(@ptrCast(vbox), info);
+
+        const excl = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(excl), "exclude globs, comma-separated (e.g. *.o, .git*)");
+        c.gtk_box_append(@ptrCast(vbox), excl);
+
+        const scroll = c.gtk_scrolled_window_new();
+        c.gtk_widget_set_vexpand(scroll, 1);
+        const listbox = c.gtk_list_box_new();
+        c.gtk_list_box_set_selection_mode(@ptrCast(listbox), c.GTK_SELECTION_NONE);
+        c.gtk_scrolled_window_set_child(@ptrCast(scroll), listbox);
+        c.gtk_box_append(@ptrCast(vbox), scroll);
+
+        const btns = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+        c.gtk_widget_set_halign(btns, c.GTK_ALIGN_END);
+        const closeb = c.gtk_button_new_with_label("Close");
+        _ = c.g_signal_connect_data(closeb, "clicked", @ptrCast(&CompareCtx.onCloseClicked), @ptrCast(cmp), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(btns), closeb);
+        const execb = c.gtk_button_new_with_label("Execute Sync (copy only, no deletes)");
+        c.gtk_widget_add_css_class(execb, "suggested-action");
+        _ = c.g_signal_connect_data(execb, "clicked", @ptrCast(&CompareCtx.onExecuteClicked), @ptrCast(cmp), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(btns), execb);
+        c.gtk_box_append(@ptrCast(vbox), btns);
+
+        c.gtk_window_set_child(@ptrCast(win), vbox);
+        cmp.window = win;
+        cmp.listbox = @ptrCast(@alignCast(listbox));
+        cmp.info_label = @ptrCast(@alignCast(info));
+        cmp.excl_entry = @ptrCast(@alignCast(excl));
+        c.g_object_set_data_full(@ptrCast(win), "sketerm-compare", @ptrCast(cmp), @ptrCast(&CompareCtx.free));
+        self.compare = cmp;
+        c.gtk_window_present(@ptrCast(win));
+
+        // Host-side digest scans (pattern * = everything).
+        self.startDaemonJobKind(left_hc, "find", cmp.left.root, "", "*", "scan source tree", .compare_left);
+        self.startDaemonJobKind(right_hc, "find", cmp.right.root, "", "*", "scan target tree", .compare_right);
     }
 
     fn onMenuNewFolder(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -3040,6 +4121,231 @@ pub const BrowserView = struct {
 
     // ── toolbar ─────────────────────────────────────────────────
 
+    // ── preview pane + thumbnails ───────────────────────────────
+
+    fn clearThumbCache(self: *BrowserView) void {
+        var it = self.thumbs.iterator();
+        while (it.next()) |kv| {
+            c.g_object_unref(@ptrCast(kv.value_ptr.*));
+            self.allocator.free(kv.key_ptr.*);
+        }
+        self.thumbs.clearRetainingCapacity();
+    }
+
+    /// A bounded-decode thumbnail texture for a LOCAL image file,
+    /// cached by path+mtime (a changed file re-decodes).
+    fn thumbTexture(self: *BrowserView, path: []const u8, mtime_ms: i64) ?*c.GdkTexture {
+        var key_buf: [4200]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ path, mtime_ms }) catch return null;
+        if (self.thumbs.get(key)) |t| return t;
+        if (self.thumbs.count() >= THUMB_CACHE_CAP) self.clearThumbCache();
+        var z: [4200:0]u8 = undefined;
+        const pz = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return null;
+        const pixbuf = c.gdk_pixbuf_new_from_file_at_size(pz.ptr, 24, 24, null) orelse return null;
+        const tex = c.gdk_texture_new_for_pixbuf(pixbuf) orelse {
+            c.g_object_unref(pixbuf);
+            return null;
+        };
+        c.g_object_unref(pixbuf);
+        const owned_key = self.allocator.dupe(u8, key) catch {
+            c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
+            return null;
+        };
+        self.thumbs.put(owned_key, tex) catch {
+            self.allocator.free(owned_key);
+            c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
+            return null;
+        };
+        return tex;
+    }
+
+    fn clearPreviewContent(self: *BrowserView) void {
+        c.gtk_picture_set_paintable(@ptrCast(self.preview_pic), null);
+        c.gtk_label_set_text(self.preview_text, "");
+    }
+
+    fn abandonPreviewRead(self: *BrowserView) void {
+        if (self.preview_read) |pr| {
+            pr.destroy(self.allocator);
+            self.preview_read = null;
+        }
+    }
+
+    /// Refresh the preview panel from the current tab's selection.
+    fn updatePreview(self: *BrowserView) void {
+        if (!self.preview_on) return;
+        self.abandonPreviewRead();
+        self.clearPreviewContent();
+        const tab = self.currentTab() orelse {
+            c.gtk_label_set_text(self.preview_meta, "");
+            return;
+        };
+        if (tab.selected.items.len == 0) {
+            c.gtk_label_set_text(self.preview_meta, "No selection");
+            return;
+        }
+        const path = tab.selected.items[tab.selected.items.len - 1];
+        const entry = entryForPath(tab, path);
+
+        var meta: [1024:0]u8 = undefined;
+        var w = std.Io.Writer.fixed(meta[0 .. meta.len - 1]);
+        w.print("{s}", .{std.fs.path.basename(path)}) catch {};
+        if (entry) |e| {
+            var sz: [48:0]u8 = undefined;
+            var tz: [40:0]u8 = undefined;
+            w.print("\n{s}", .{e.kind}) catch {};
+            if (!std.mem.eql(u8, e.kind, "dir"))
+                w.print("  {s}", .{fmtSize(&sz, e.size)}) catch {};
+            if (e.mtime_ms != 0)
+                w.print("\n{s}", .{fmtTimeZ(&tz, e.mtime_ms)}) catch {};
+            if (e.tags.len > 0) w.print("\ntags: {s}", .{e.tags}) catch {};
+        }
+        meta[w.buffered().len] = 0;
+        c.gtk_label_set_text(self.preview_meta, &meta);
+
+        // Directories: metadata only.
+        if (entry != null and entry.?.tdir) return;
+        const is_image = isImageName(path);
+        const known_size: u64 = if (entry) |e| e.size else 0;
+        if (is_image and known_size > PREVIEW_IMAGE_CAP) {
+            c.gtk_label_set_text(self.preview_text, "(image too large to preview)");
+            return;
+        }
+
+        if (tab.hc.host == null) {
+            self.previewLocal(path, is_image);
+        } else {
+            self.previewRemoteStart(tab, path, is_image);
+        }
+    }
+
+    fn previewLocal(self: *BrowserView, path: []const u8, is_image: bool) void {
+        var z: [4200:0]u8 = undefined;
+        const pz = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return;
+        if (is_image) {
+            const pixbuf = c.gdk_pixbuf_new_from_file_at_size(pz.ptr, 480, 480, null) orelse {
+                c.gtk_label_set_text(self.preview_text, "(cannot decode image)");
+                return;
+            };
+            const tex = c.gdk_texture_new_for_pixbuf(pixbuf);
+            c.g_object_unref(pixbuf);
+            if (tex) |t| {
+                c.gtk_picture_set_paintable(@ptrCast(self.preview_pic), @ptrCast(t));
+                c.g_object_unref(@as(?*anyopaque, @ptrCast(t)));
+            }
+            return;
+        }
+        const f = c.fopen(pz.ptr, "rb") orelse return;
+        var head: [PREVIEW_TEXT_CAP]u8 = undefined;
+        const n = c.fread(&head, 1, head.len, f);
+        _ = c.fclose(f);
+        self.showTextPreview(head[0..n]);
+    }
+
+    fn showTextPreview(self: *BrowserView, data: []const u8) void {
+        if (data.len == 0) {
+            c.gtk_label_set_text(self.preview_text, "(empty file)");
+            return;
+        }
+        if (std.mem.indexOfScalar(u8, data, 0) != null) {
+            c.gtk_label_set_text(self.preview_text, "(binary file)");
+            return;
+        }
+        var z: [PREVIEW_TEXT_CAP + 1:0]u8 = undefined;
+        const n = @min(data.len, PREVIEW_TEXT_CAP);
+        @memcpy(z[0..n], data[0..n]);
+        z[n] = 0;
+        const valid = c.g_utf8_make_valid(&z, @intCast(n));
+        c.gtk_label_set_text(self.preview_text, valid);
+        c.g_free(valid);
+    }
+
+    fn previewRemoteStart(self: *BrowserView, tab: *BTab, path: []const u8, is_image: bool) void {
+        if (tab.hc.state != .ready) return;
+        const pr = self.allocator.create(PreviewRead) catch return;
+        pr.* = .{
+            .req = self.nextReq(),
+            .hc = tab.hc,
+            .path = self.allocator.dupe(u8, path) catch {
+                self.allocator.destroy(pr);
+                return;
+            },
+            .is_image = is_image,
+            .cap = if (is_image) PREVIEW_IMAGE_CAP else PREVIEW_TEXT_CAP,
+        };
+        self.preview_read = pr;
+        c.gtk_label_set_text(self.preview_text, "loading…");
+        self.sendOp(tab.hc, .{ .req = pr.req, .op = "read", .path = pr.path, .off = pr.off, .len = @as(u64, @intCast(pr.cap)) });
+    }
+
+    /// Feed preview-fetch frames; true when consumed.
+    fn feedPreview(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
+        const pr = self.preview_read orelse return false;
+        if (pr.hc != hc) return false;
+        switch (ftype) {
+            .fs_data => {
+                if (payload.len < 12) return false;
+                if (std.mem.readInt(u32, payload[0..4], .little) != pr.req) return false;
+                pr.buf.appendSlice(self.allocator, payload[12..]) catch {};
+                return true;
+            },
+            .fs_reply => {
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const rep = std.json.parseFromSliceLeaky(WireReply, arena.allocator(), payload, .{
+                    .ignore_unknown_fields = true,
+                }) catch return false;
+                if (rep.req != pr.req) return false;
+                if (!rep.ok) {
+                    c.gtk_label_set_text(self.preview_text, "(cannot read file)");
+                    self.abandonPreviewRead();
+                    return true;
+                }
+                pr.off = pr.buf.items.len;
+                if (rep.eof or pr.buf.items.len >= pr.cap) {
+                    self.finishPreviewRead();
+                } else {
+                    pr.req = self.nextReq();
+                    self.sendOp(pr.hc, .{
+                        .req = pr.req,
+                        .op = "read",
+                        .path = pr.path,
+                        .off = pr.off,
+                        .len = @as(u64, @intCast(pr.cap - pr.buf.items.len)),
+                    });
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn finishPreviewRead(self: *BrowserView) void {
+        const pr = self.preview_read orelse return;
+        if (pr.is_image) {
+            const bytes = c.g_bytes_new(pr.buf.items.ptr, pr.buf.items.len);
+            const tex = c.gdk_texture_new_from_bytes(bytes, null);
+            c.g_bytes_unref(bytes);
+            if (tex) |t| {
+                c.gtk_label_set_text(self.preview_text, "");
+                c.gtk_picture_set_paintable(@ptrCast(self.preview_pic), @ptrCast(t));
+                c.g_object_unref(@as(?*anyopaque, @ptrCast(t)));
+            } else {
+                c.gtk_label_set_text(self.preview_text, "(cannot decode image)");
+            }
+        } else {
+            self.showTextPreview(pr.buf.items);
+        }
+        self.abandonPreviewRead();
+    }
+
+    fn onPreviewToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.preview_on = c.gtk_toggle_button_get_active(btn) != 0;
+        c.gtk_widget_set_visible(self.preview_box, @intFromBool(self.preview_on));
+        if (self.preview_on) self.updatePreview() else self.abandonPreviewRead();
+    }
+
     fn buildUi(self: *BrowserView) void {
         const vbox = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
         c.gtk_widget_set_hexpand(vbox, 1);
@@ -3079,6 +4385,12 @@ pub const BrowserView = struct {
         _ = c.g_signal_connect_data(search_toggle, "toggled", @ptrCast(&onSearchToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), search_toggle);
 
+        const preview_toggle = c.gtk_toggle_button_new();
+        c.gtk_button_set_icon_name(@ptrCast(preview_toggle), "view-dual-symbolic");
+        c.gtk_widget_set_tooltip_text(preview_toggle, "Preview panel (images, text head, metadata)");
+        _ = c.g_signal_connect_data(preview_toggle, "toggled", @ptrCast(&onPreviewToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(bar), preview_toggle);
+
         const newtab = c.gtk_button_new_from_icon_name("tab-new-symbolic");
         c.gtk_widget_set_tooltip_text(newtab, "New browser tab");
         _ = c.g_signal_connect_data(newtab, "clicked", @ptrCast(&onNewTabClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -3110,7 +4422,40 @@ pub const BrowserView = struct {
         c.gtk_widget_set_hexpand(notebook, 1);
         c.gtk_widget_set_vexpand(notebook, 1);
         _ = c.g_signal_connect_data(notebook, "switch-page", @ptrCast(&onSwitchPage), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(vbox), notebook);
+
+        // Content row: notebook | preview panel (hidden until toggled).
+        const content = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+        c.gtk_widget_set_hexpand(content, 1);
+        c.gtk_widget_set_vexpand(content, 1);
+        c.gtk_box_append(@ptrCast(content), notebook);
+
+        const pbox = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
+        c.gtk_widget_set_size_request(pbox, 300, -1);
+        c.gtk_widget_set_margin_start(pbox, 8);
+        c.gtk_widget_set_margin_end(pbox, 8);
+        c.gtk_widget_set_margin_top(pbox, 8);
+        const pmeta = c.gtk_label_new("");
+        c.gtk_label_set_xalign(@ptrCast(pmeta), 0);
+        c.gtk_label_set_wrap(@ptrCast(pmeta), 1);
+        c.gtk_label_set_selectable(@ptrCast(pmeta), 1);
+        c.gtk_box_append(@ptrCast(pbox), pmeta);
+        const ppic = c.gtk_picture_new();
+        c.gtk_widget_set_size_request(ppic, 284, 200);
+        c.gtk_box_append(@ptrCast(pbox), ppic);
+        const ptext_scroll = c.gtk_scrolled_window_new();
+        c.gtk_widget_set_vexpand(ptext_scroll, 1);
+        const ptext = c.gtk_label_new("");
+        c.gtk_label_set_xalign(@ptrCast(ptext), 0);
+        c.gtk_label_set_yalign(@ptrCast(ptext), 0);
+        c.gtk_label_set_wrap(@ptrCast(ptext), 1);
+        c.gtk_label_set_selectable(@ptrCast(ptext), 1);
+        c.gtk_widget_add_css_class(ptext, "monospace");
+        c.gtk_scrolled_window_set_child(@ptrCast(ptext_scroll), ptext);
+        c.gtk_box_append(@ptrCast(pbox), ptext_scroll);
+        c.gtk_widget_set_visible(pbox, 0);
+        c.gtk_box_append(@ptrCast(content), pbox);
+
+        c.gtk_box_append(@ptrCast(vbox), content);
 
         const jobs_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
         c.gtk_widget_set_visible(jobs_box, 0);
@@ -3142,6 +4487,10 @@ pub const BrowserView = struct {
         self.search_entry = @ptrCast(@alignCast(sentry));
         self.search_content = scontent;
         self.hidden_toggle = @ptrCast(@alignCast(hidden));
+        self.preview_box = pbox;
+        self.preview_pic = ppic;
+        self.preview_text = @ptrCast(@alignCast(ptext));
+        self.preview_meta = @ptrCast(@alignCast(pmeta));
     }
 
     fn onBrowserKey(
@@ -3221,6 +4570,7 @@ pub const BrowserView = struct {
             self.syncPathEntry(t);
             self.renderTab(t);
         }
+        self.updatePreview();
         return 0;
     }
 };
@@ -3229,6 +4579,73 @@ fn launchLocal(path: []const u8) void {
     var uri_buf: [4300:0]u8 = undefined;
     const uri = std.fmt.bufPrintZ(&uri_buf, "file://{s}", .{path}) catch return;
     _ = c.g_app_info_launch_default_for_uri(uri.ptr, null, null);
+}
+
+/// Launch a specific installed application (by GAppInfo id) on a
+/// local path; falls back to the default handler if the id vanished.
+fn launchLocalWithApp(appid: []const u8, path: []const u8) void {
+    var uri_buf: [4300:0]u8 = undefined;
+    const uri = std.fmt.bufPrintZ(&uri_buf, "file://{s}", .{path}) catch return;
+    const apps = c.g_app_info_get_all();
+    defer if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
+    var it = apps;
+    while (it != null) : (it = it.*.next) {
+        const app: *c.GAppInfo = @ptrCast(@alignCast(it.*.data orelse continue));
+        const id = c.g_app_info_get_id(app) orelse continue;
+        if (!std.mem.eql(u8, std.mem.span(id), appid)) continue;
+        var list: ?*c.GList = null;
+        list = c.g_list_append(list, @ptrCast(@constCast(uri.ptr)));
+        _ = c.g_app_info_launch_uris(app, list, null, null);
+        c.g_list_free(list);
+        return;
+    }
+    launchLocal(path);
+}
+
+/// True when a ';'-separated .desktop MimeType list contains `mime`.
+fn mimeListContains(list: []const u8, mime: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, list, ';');
+    while (it.next()) |m| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, m, " "), mime)) return true;
+    }
+    return false;
+}
+
+/// Substitute a .desktop Exec line's field codes: %f/%F/%u/%U become
+/// the single-quoted path; other % codes are dropped; %% = literal %.
+fn buildHostExecCmd(allocator: std.mem.Allocator, exec: []const u8, path: []const u8) ?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    var substituted = false;
+    while (i < exec.len) : (i += 1) {
+        if (exec[i] != '%' or i + 1 >= exec.len) {
+            out.append(allocator, exec[i]) catch return null;
+            continue;
+        }
+        i += 1;
+        switch (exec[i]) {
+            'f', 'F', 'u', 'U' => {
+                appendQuoted(&out, allocator, path) catch return null;
+                substituted = true;
+            },
+            '%' => out.append(allocator, '%') catch return null,
+            else => {},
+        }
+    }
+    if (!substituted) {
+        out.append(allocator, ' ') catch return null;
+        appendQuoted(&out, allocator, path) catch return null;
+    }
+    return out.toOwnedSlice(allocator) catch null;
+}
+
+fn appendQuoted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, path: []const u8) !void {
+    try out.append(allocator, '\'');
+    for (path) |ch| {
+        if (ch == '\'') try out.appendSlice(allocator, "'\\''") else try out.append(allocator, ch);
+    }
+    try out.append(allocator, '\'');
 }
 
 fn fmtSize(buf: *[48:0]u8, size: u64) [:0]const u8 {
@@ -3250,6 +4667,41 @@ fn fmtTimeZ(buf: *[40:0]u8, ms: i64) [*:0]const u8 {
     const n = c.strftime(buf, buf.len - 1, "%Y-%m-%d %H:%M", &tm);
     buf[n] = 0;
     return @ptrCast(buf);
+}
+
+test "buildHostExecCmd substitutes and quotes field codes" {
+    const t = std.testing;
+    const a = t.allocator;
+    const cmd = buildHostExecCmd(a, "gimp %U", "/tmp/a'b.png").?;
+    defer a.free(cmd);
+    try t.expectEqualStrings("gimp '/tmp/a'\\''b.png'", cmd);
+    const cmd2 = buildHostExecCmd(a, "vlc --no-video %f %i", "/x.mp4").?;
+    defer a.free(cmd2);
+    try t.expectEqualStrings("vlc --no-video '/x.mp4' ", cmd2);
+    // No field code at all: the path appends.
+    const cmd3 = buildHostExecCmd(a, "xdg-open", "/f").?;
+    defer a.free(cmd3);
+    try t.expectEqualStrings("xdg-open '/f'", cmd3);
+    // %% stays a literal percent.
+    const cmd4 = buildHostExecCmd(a, "prog 100%% %f", "/f").?;
+    defer a.free(cmd4);
+    try t.expectEqualStrings("prog 100% '/f'", cmd4);
+}
+
+test "mimeListContains matches ';'-separated segments" {
+    const t = std.testing;
+    try t.expect(mimeListContains("image/png;image/jpeg;", "image/png"));
+    try t.expect(mimeListContains("image/png;image/jpeg", "IMAGE/JPEG"));
+    try t.expect(!mimeListContains("image/png;image/jpeg", "image/jp"));
+    try t.expect(!mimeListContains("", "image/png"));
+}
+
+test "isImageName recognizes previewable extensions" {
+    const t = std.testing;
+    try t.expect(isImageName("photo.JPG"));
+    try t.expect(isImageName("a.webp"));
+    try t.expect(!isImageName("notes.txt"));
+    try t.expect(!isImageName("jpg"));
 }
 
 test "parseSpec forms" {
