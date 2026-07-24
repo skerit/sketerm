@@ -21,6 +21,7 @@ const shader_preset_mod = @import("../shader_preset.zig");
 const tree_mod = @import("tree.zig");
 const tabbar_mod = @import("tabbar.zig");
 const tab_effects = @import("tab_effects.zig");
+const file_transfers = @import("file_transfers.zig");
 
 /// Toolkit-free pane-tree model — one per tab, attached to the
 /// AdwTabPage as qdata (travels with cross-window tab drags). The
@@ -186,6 +187,9 @@ pub const Window = struct {
     /// Window teardown marks them canceled — the idle frees them.
     mux_restore_jobs: std.ArrayList(*MuxRestoreJob) = .empty,
     allocator: std.mem.Allocator,
+    /// Process-shared durable download/edit-sync service, acquired
+    /// lazily when this window creates its first browser face.
+    file_transfer_service: ?*file_transfers.Service = null,
     tab_counter: u32 = 0,
     /// Remote control: monotonic pane / tab ids + the socket server.
     /// Pane ids are allocated BEFORE the PTY spawn so the child env
@@ -722,6 +726,7 @@ pub const Window = struct {
         for (self.terminals.items) |t| t.clearSinks();
         for (self.terminals.items) |t| t.deinit();
         for (self.panes.items) |p| p.deinit();
+        if (self.file_transfer_service) |service| file_transfers.release(service, @ptrCast(self));
         self.panes.deinit(self.allocator);
         self.terminals.deinit(self.allocator);
         // Tabless app sessions: detach (apps are durable — they keep
@@ -1323,10 +1328,23 @@ pub const Window = struct {
     /// Give a browser face its window-level abilities: durable
     /// terminal tabs on any host, and app-forwarded remote opens.
     fn installBrowserHooks(self: *Window, bv: *@import("browser.zig").BrowserView) void {
+        if (self.file_transfer_service == null) {
+            self.file_transfer_service = file_transfers.acquire(
+                self.allocator,
+                @ptrCast(self),
+                &browserTransferNotify,
+            ) catch null;
+        }
+        bv.transfer_service = self.file_transfer_service;
         bv.hooks_ctx = @ptrCast(self);
         bv.on_host_term = &browserHostTermCb;
         bv.on_host_open = &browserHostOpenCb;
         bv.on_host_exec = &browserHostExecCb;
+    }
+
+    fn browserTransferNotify(ctx: *anyopaque, text: []const u8) void {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        showToast(self, text);
     }
 
     fn browserHostTermCb(ctx: *anyopaque, host: []const u8, path: []const u8) void {
@@ -2185,6 +2203,7 @@ pub const Window = struct {
         self.panes.append(self.allocator, pane) catch return;
         self.terminals.append(self.allocator, pane.terminal) catch {};
         self.wirePaneSinks(pane);
+        if (@import("browser.zig").BrowserView.fromPane(pane)) |bv| self.installBrowserHooks(bv);
         // Re-point active_profile off the SOURCE window's config arena
         // (which is freed on its next applyConfigChange / deinit) onto
         // a name owned by OUR arena — same pattern as applyConfigChange.

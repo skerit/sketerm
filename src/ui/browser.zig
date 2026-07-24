@@ -33,6 +33,7 @@ const fsjob = @import("../mux/fsjob.zig");
 const mounts = @import("../util/mounts.zig");
 const input = @import("input.zig");
 const Pane = @import("pane.zig").Pane;
+const file_transfers = @import("file_transfers.zig");
 
 /// One owned directory entry (strings owned by the Dir's allocator).
 const Entry = struct {
@@ -394,6 +395,7 @@ const BTab = struct {
     /// forward can cross hosts.
     back: std.ArrayList([]u8) = .empty,
     fwd: std.ArrayList([]u8) = .empty,
+    navigation_generation: u64 = 0,
     selected: std.ArrayList([]u8) = .empty,
     rendering: bool = false,
     show_hidden: bool = false,
@@ -487,7 +489,7 @@ const BTab = struct {
         if (self.hc.host) |h| {
             return std.fmt.bufPrint(buf, "{s}:{s}", .{ h, self.root.path }) catch self.root.path;
         }
-        return self.root.path;
+        return std.fmt.bufPrint(buf, "local:{s}", .{self.root.path}) catch self.root.path;
     }
 
     fn deinit(self: *BTab) void {
@@ -518,13 +520,18 @@ const BTab = struct {
 /// In-flight listing request (open_view or refresh `list`). `sent`
 /// is false while the tab's host is still connecting; the connect
 /// handback flushes unsent requests.
+const NavigationIntent = enum { push, back, forward };
+
 const Pending = struct {
     req: u32,
     tab: *BTab,
     /// Accumulating target; entries replace dir.entries when the
     /// chunk run ends.
     dir: *Dir,
+    hc: *HostConn,
     op: enum { open_view, list },
+    navigation: ?NavigationIntent = null,
+    navigation_generation: u64 = 0,
     sent: bool = false,
     staged: std.ArrayList(Entry) = .empty,
 };
@@ -544,6 +551,8 @@ const JobRow = struct {
     /// holds the ORIGINAL path until then (owned).
     undo_trash_orig: ?[]u8 = null,
     open_on_done: bool = false,
+    history_op: ?*UndoOp = null,
+    history_direction: ?HistoryDirection = null,
 
     fn terminal(self: *const JobRow) bool {
         return self.state == .finished or self.state == .failed or self.state == .canceled;
@@ -561,6 +570,8 @@ const PendingJob = struct {
     /// The done event's `path` opens when the job lands (archive
     /// member extraction).
     open_on_done: bool = false,
+    history_op: ?*UndoOp = null,
+    history_direction: ?HistoryDirection = null,
 };
 
 /// One client-mediated cross-host transfer, running or queued.
@@ -1127,6 +1138,14 @@ const PendingUndo = struct {
     op: *UndoOp,
 };
 
+const HistoryDirection = enum { undo, redo };
+const PendingHistory = struct {
+    req: u32,
+    hc: *HostConn,
+    op: *UndoOp,
+    direction: HistoryDirection,
+};
+
 /// Duplicate finder: a host-side scan buckets files by SIZE, then
 /// same-size candidates are hash-confirmed with daemon hash jobs.
 /// Only confirmed same-digest groups are reported.
@@ -1219,10 +1238,17 @@ const ThumbReq = struct {
     mtime_ms: i64,
     /// Remote-source bytes to decode (null = local file probe).
     data: ?[]u8 = null,
+    /// Viewer-memory identity includes host; disk identity deliberately
+    /// remains path-only because each host owns a separate cache.
+    cache_key: []u8,
+    cached_png: bool = false,
+    preview_generation: u64 = 0,
+    remote_id: u64 = 0,
 
     fn deinitReq(self: *ThumbReq) void {
         const a = std.heap.c_allocator;
         a.free(self.path);
+        a.free(self.cache_key);
         if (self.data) |d| a.free(d);
     }
 };
@@ -1238,15 +1264,19 @@ const ThumbResult = struct {
     /// Original path (owned) — locates the remote write-back target.
     path: []u8,
     mtime_ms: i64,
+    preview_generation: u64 = 0,
+    remote_id: u64 = 0,
 };
 
 /// One remote thumbnail fetch in flight (serial per view).
 const RemoteThumb = struct {
+    id: u64,
     hc: *HostConn,
     path: []u8,
     mtime_ms: i64,
-    phase: enum { read_thumb, read_src } = .read_thumb,
+    phase: enum { start_job, wait_job, read_thumb } = .start_job,
     req: u32 = 0,
+    job: u64 = 0,
     buf: std.ArrayList(u8) = .empty,
 
     fn destroy(self: *RemoteThumb, allocator: std.mem.Allocator) void {
@@ -1279,8 +1309,9 @@ const PreviewRead = struct {
     req: u32,
     hc: *HostConn,
     path: []u8,
-    is_image: bool,
-    cap: usize,
+    phase: enum { start_job, wait_job, read_asset } = .start_job,
+    job: u64 = 0,
+    generation: u64,
     off: u64 = 0,
     buf: std.ArrayList(u8) = .empty,
 
@@ -1291,10 +1322,42 @@ const PreviewRead = struct {
     }
 };
 
+const PathCompletion = struct {
+    req: u32,
+    hc: *HostConn,
+    display_prefix: []u8,
+    typed_prefix: []u8,
+    names: std.ArrayList([]u8) = .empty,
+
+    fn destroy(self: *PathCompletion, allocator: std.mem.Allocator) void {
+        allocator.free(self.display_prefix);
+        allocator.free(self.typed_prefix);
+        for (self.names.items) |name| allocator.free(name);
+        self.names.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
 /// Extensions the preview pane and row thumbnails treat as images
 /// (decodable by gdk-pixbuf).
 fn isImageName(name: []const u8) bool {
-    const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tiff" };
+    const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tif", ".tiff", ".avif", ".heic", ".heif" };
+    for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
+    return false;
+}
+
+fn isWorkerImageName(name: []const u8) bool {
+    const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tif", ".tiff" };
+    for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
+    return false;
+}
+
+fn isPreviewMediaName(name: []const u8) bool {
+    if (isImageName(name)) return true;
+    const exts = [_][]const u8{
+        ".pdf", ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpeg", ".mpg",
+        ".mp3", ".flac", ".ogg", ".opus", ".wav", ".m4a", ".aac",
+    };
     for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
     return false;
 }
@@ -1313,6 +1376,7 @@ pub const BrowserView = struct {
     pane: *Pane,
     conns: std.ArrayList(*HostConn) = .empty,
     next_req: u32 = 1,
+    next_remote_thumb_id: u64 = 1,
     next_view: u32 = 1,
     tabs: std.ArrayList(*BTab) = .empty,
     pending: std.ArrayList(*Pending) = .empty,
@@ -1323,6 +1387,12 @@ pub const BrowserView = struct {
     root_box: *c.GtkWidget = undefined,
     notebook: *c.GtkNotebook = undefined,
     path_entry: *c.GtkEntry = undefined,
+    back_button: *c.GtkWidget = undefined,
+    fwd_button: *c.GtkWidget = undefined,
+    completion_popover: ?*c.GtkWidget = null,
+    completion_request: ?*PathCompletion = null,
+    completion_source: c.guint = 0,
+    syncing_path_entry: bool = false,
     status_label: *c.GtkLabel = undefined,
     jobs_box: *c.GtkWidget = undefined,
     /// Copy-source for the context menu's Copy/Paste (owned).
@@ -1336,7 +1406,10 @@ pub const BrowserView = struct {
     clip_cut: bool = false,
     /// Undo stack (newest last), bounded.
     undo_stack: std.ArrayList(*UndoOp) = .empty,
+    redo_stack: std.ArrayList(*UndoOp) = .empty,
     pending_undo: std.ArrayList(PendingUndo) = .empty,
+    pending_history: std.ArrayList(PendingHistory) = .empty,
+    history_busy: bool = false,
     search_bar: *c.GtkWidget = undefined,
     search_entry: *c.GtkEntry = undefined,
     search_content: *c.GtkWidget = undefined,
@@ -1349,6 +1422,7 @@ pub const BrowserView = struct {
     preview_meta: *c.GtkLabel = undefined,
     preview_on: bool = false,
     preview_read: ?*PreviewRead = null,
+    preview_generation: u64 = 0,
     restore_read: ?*RestoreRead = null,
     /// Row-thumbnail cache: "path\x00mtime" -> owned texture ref.
     thumbs: std.StringHashMap(*c.GdkTexture) = undefined,
@@ -1417,6 +1491,9 @@ pub const BrowserView = struct {
     /// Run a shell command as an app session on a host (declarative
     /// .action files with RunsOnHost).
     on_host_exec: ?HostAction = null,
+    /// Window-owned service: durable downloads and sync-back survive
+    /// this pane, this window, and GUI process restarts.
+    transfer_service: ?*file_transfers.Service = null,
 
     /// Create a browser face on `pane`, starting at `start_spec`
     /// (a path or host-qualified spec; null/relative = $HOME).
@@ -1608,12 +1685,16 @@ pub const BrowserView = struct {
         for (self.pending.items) |p| {
             for (p.staged.items) |*e| e.deinit(self.allocator);
             p.staged.deinit(self.allocator);
+            // A navigation candidate is owned by the request until it
+            // commits; the tabs above never saw it.
+            if (p.navigation != null) p.dir.deinit();
             self.allocator.destroy(p);
         }
         self.pending.deinit(self.allocator);
         for (self.pending_jobs.items) |pj| {
             if (pj.undo_op) |u| u.destroy(self.allocator);
             if (pj.undo_trash_orig) |o| self.allocator.free(o);
+            if (pj.history_op) |op| op.destroy(self.allocator);
             self.allocator.free(pj.label);
             self.allocator.destroy(pj);
         }
@@ -1621,6 +1702,7 @@ pub const BrowserView = struct {
         for (self.jobs.items) |j| {
             if (j.undo_op) |u| u.destroy(self.allocator);
             if (j.undo_trash_orig) |o| self.allocator.free(o);
+            if (j.history_op) |op| op.destroy(self.allocator);
             self.allocator.free(j.label);
             self.allocator.destroy(j);
         }
@@ -1639,6 +1721,9 @@ pub const BrowserView = struct {
         if (self.clip_path) |s| self.allocator.free(s);
         for (self.clip_paths.items) |p| self.allocator.free(p);
         self.clip_paths.deinit(self.allocator);
+        self.closePathCompletion();
+        if (self.completion_source != 0) _ = c.g_source_remove(self.completion_source);
+        if (self.completion_request) |request| request.destroy(self.allocator);
         if (self.preview_read) |pr| pr.destroy(self.allocator);
         if (self.restore_read) |rr| rr.destroy(self.allocator);
         if (self.dup) |d| d.destroy(self.allocator);
@@ -1657,8 +1742,12 @@ pub const BrowserView = struct {
         self.remote_thumb_queue.deinit(self.allocator);
         for (self.undo_stack.items) |u| u.destroy(self.allocator);
         self.undo_stack.deinit(self.allocator);
+        for (self.redo_stack.items) |u| u.destroy(self.allocator);
+        self.redo_stack.deinit(self.allocator);
         for (self.pending_undo.items) |pu| pu.op.destroy(self.allocator);
         self.pending_undo.deinit(self.allocator);
+        for (self.pending_history.items) |ph| ph.op.destroy(self.allocator);
+        self.pending_history.deinit(self.allocator);
         for (self.bookmarks.items) |b| self.allocator.free(b);
         self.bookmarks.deinit(self.allocator);
         for (self.recent.items) |r| self.allocator.free(r);
@@ -1795,7 +1884,7 @@ pub const BrowserView = struct {
             @ptrCast(hc),
         );
         for (self.pending.items) |p| {
-            if (p.sent or p.tab.hc != hc) continue;
+            if (p.sent or p.hc != hc) continue;
             self.sendListingOp(p);
         }
         self.pumpTransferQueue();
@@ -1806,6 +1895,13 @@ pub const BrowserView = struct {
     /// HostConn; navigating again reconnects.
     fn hostDied(self: *BrowserView, hc: *HostConn) void {
         var i: usize = 0;
+        // In-flight listings can never be answered. A navigation
+        // request also OWNS its candidate directory until it commits,
+        // so dropping it here is what frees it.
+        while (i < self.pending.items.len) {
+            if (self.pending.items[i].hc == hc) self.dropPending(i) else i += 1;
+        }
+        i = 0;
         while (i < self.transfers.items.len) {
             const t = self.transfers.items[i];
             if (t.src_hc == hc or t.dst_hc == hc) {
@@ -1818,9 +1914,50 @@ pub const BrowserView = struct {
                 _ = self.transfers.orderedRemove(i);
             } else i += 1;
         }
+        i = 0;
+        while (i < self.pending_history.items.len) {
+            const ph = self.pending_history.items[i];
+            if (ph.hc == hc) {
+                ph.op.destroy(self.allocator);
+                _ = self.pending_history.orderedRemove(i);
+                self.history_busy = false;
+                self.setStatus("history outcome unknown after connection loss");
+            } else i += 1;
+        }
+        for (self.pending_jobs.items) |pj| {
+            if (pj.hc == hc and pj.history_op != null) {
+                pj.history_op.?.destroy(self.allocator);
+                pj.history_op = null;
+                pj.history_direction = null;
+                self.history_busy = false;
+            }
+        }
+        for (self.jobs.items) |job| {
+            if (job.hc == hc and job.history_op != null) {
+                job.history_op.?.destroy(self.allocator);
+                job.history_op = null;
+                job.history_direction = null;
+                self.history_busy = false;
+            }
+        }
         if (self.preview_read) |pr| {
             if (pr.hc == hc) self.abandonPreviewRead();
         }
+        if (self.remote_thumb) |rt| {
+            if (rt.hc == hc) {
+                rt.destroy(self.allocator);
+                self.remote_thumb = null;
+            }
+        }
+        i = 0;
+        while (i < self.remote_thumb_queue.items.len) {
+            const rt = self.remote_thumb_queue.items[i];
+            if (rt.hc == hc) {
+                _ = self.remote_thumb_queue.orderedRemove(i);
+                rt.destroy(self.allocator);
+            } else i += 1;
+        }
+        self.pumpRemoteThumbs();
         hc.watch_id = 0;
         hc.conn.deinit();
         hc.state = .dead;
@@ -1851,13 +1988,13 @@ pub const BrowserView = struct {
     fn sendListingOp(self: *BrowserView, p: *Pending) void {
         p.sent = true;
         switch (p.op) {
-            .open_view => self.sendOp(p.tab.hc, .{
+            .open_view => self.sendOp(p.hc, .{
                 .req = p.req,
                 .op = "open_view",
                 .path = p.dir.path,
                 .view = p.dir.view_id,
             }),
-            .list => self.sendOp(p.tab.hc, .{
+            .list => self.sendOp(p.hc, .{
                 .req = p.req,
                 .op = "list",
                 .path = p.dir.path,
@@ -1881,7 +2018,7 @@ pub const BrowserView = struct {
     fn queueListing(self: *BrowserView, tab: *BTab, dir: *Dir, op: @FieldType(Pending, "op")) void {
         const req = self.nextReq();
         const p = self.allocator.create(Pending) catch return;
-        p.* = .{ .req = req, .tab = tab, .dir = dir, .op = op };
+        p.* = .{ .req = req, .tab = tab, .dir = dir, .hc = tab.hc, .op = op };
         self.pending.append(self.allocator, p) catch {
             self.allocator.destroy(p);
             return;
@@ -1904,14 +2041,7 @@ pub const BrowserView = struct {
         _ = fd;
         const hc: *HostConn = @ptrCast(@alignCast(user.?));
         const self = hc.view;
-        if (cond & (c.G_IO_HUP | c.G_IO_ERR) != 0) {
-            self.hostDied(hc);
-            return 0; // remove source
-        }
-        if (!hc.conn.fillAvailable()) {
-            self.hostDied(hc);
-            return 0;
-        }
+        const alive = hc.conn.fillAvailable();
         var dirty = false;
         var xfer_touched = false;
         while (hc.conn.takeFrame() catch null) |f| {
@@ -1939,6 +2069,10 @@ pub const BrowserView = struct {
         if (xfer_touched) self.reapTransfers();
         if (xfer_touched) self.renderJobs();
         if (dirty) self.renderCurrent();
+        if (!alive or cond & (c.G_IO_HUP | c.G_IO_ERR) != 0) {
+            self.hostDied(hc);
+            return 0;
+        }
         return 1;
     }
 
@@ -2129,11 +2263,6 @@ pub const BrowserView = struct {
     }
 
     fn openRemoteFileHc(self: *BrowserView, hc: *HostConn, path: []const u8, appid: ?[]const u8) void {
-        const local = self.hostConnFor(null) orelse return;
-        if (local.state != .ready) {
-            self.setStatus("local daemon unreachable");
-            return;
-        }
         const host = hc.host orelse return;
         const cache_root = c.g_get_user_cache_dir();
         var dirbuf: [4096:0]u8 = undefined;
@@ -2146,12 +2275,27 @@ pub const BrowserView = struct {
         const dst = std.fmt.bufPrint(&dstbuf, "{s}/{x:0>16}-{s}", .{
             dir, h.final(), std.fs.path.basename(path),
         }) catch return;
-        self.startTransfer(hc, path, local, dst, .{
-            .open_when_done = true,
-            .open_with_appid = appid,
-            .watch_host = host,
-            .watch_remote = path,
-        });
+        const service = self.transfer_service orelse {
+            // No ledger (another process holds it, or it is unreadable):
+            // degrade to the in-view transfer rather than refusing to
+            // open the file at all. It just does not survive a restart.
+            const local = self.hostConnFor(null) orelse return;
+            if (local.state != .ready) {
+                self.setStatus("local daemon unreachable");
+                return;
+            }
+            self.startTransfer(hc, path, local, dst, .{
+                .open_when_done = true,
+                .open_with_appid = appid,
+                .watch_host = host,
+                .watch_remote = path,
+            });
+            self.setStatus("download is not restart-durable (recovery ledger unavailable)");
+            return;
+        };
+        service.submitDownload(host, path, dst, appid);
+        self.setStatusFmt("durable download queued: {s}", .{std.fs.path.basename(path)});
+        self.renderJobs();
     }
 
     /// Open a path that lives on `hc`'s host: directly for local,
@@ -2338,6 +2482,14 @@ pub const BrowserView = struct {
                 row.open_on_done = false;
                 self.openPathOnHost(row.hc, e.path);
             }
+            if (row.history_op) |op| {
+                row.history_op = null;
+                const direction = row.history_direction.?;
+                row.history_direction = null;
+                if (direction == .redo and op.kind == .trash_restore and e.path.len > 0)
+                    self.updateTrashResult(op, e.path, e.text);
+                self.finishHistory(op, direction);
+            }
         } else if (std.mem.eql(u8, e.ev, "error")) {
             row.state = .failed;
             self.setStatusFmt("job failed: {s} ({s})", .{ row.label, e.message });
@@ -2349,6 +2501,12 @@ pub const BrowserView = struct {
                 row.undo_trash_orig = null;
                 self.allocator.free(orig);
             }
+            if (row.history_op) |op| {
+                row.history_op = null;
+                const direction = row.history_direction.?;
+                row.history_direction = null;
+                self.restoreHistory(op, direction);
+            }
         } else if (std.mem.eql(u8, e.ev, "canceled")) {
             row.state = .canceled;
             self.setStatusFmt("canceled: {s}", .{row.label});
@@ -2359,6 +2517,12 @@ pub const BrowserView = struct {
             if (row.undo_trash_orig) |orig| {
                 row.undo_trash_orig = null;
                 self.allocator.free(orig);
+            }
+            if (row.history_op) |op| {
+                row.history_op = null;
+                const direction = row.history_direction.?;
+                row.history_direction = null;
+                self.restoreHistory(op, direction);
             }
         }
         self.renderJobs();
@@ -2372,11 +2536,33 @@ pub const BrowserView = struct {
         }) catch return false;
         if (rep.req == 0) return false;
 
+        if (self.completion_request) |completion| {
+            if (completion.hc == hc and completion.req == rep.req) {
+                if (!rep.ok) {
+                    completion.destroy(self.allocator);
+                    self.completion_request = null;
+                    return false;
+                }
+                for (rep.entries) |entry| {
+                    if (!entry.tdir) continue;
+                    const name = self.allocator.dupe(u8, entry.name) catch continue;
+                    completion.names.append(self.allocator, name) catch self.allocator.free(name);
+                }
+                if (!rep.more) {
+                    self.showCompletionNames(completion.display_prefix, completion.typed_prefix, completion.names.items);
+                    completion.destroy(self.allocator);
+                    self.completion_request = null;
+                }
+                return false;
+            }
+        }
+
         // Listing chunk run?
         for (self.pending.items, 0..) |p, i| {
             if (p.req != rep.req) continue;
             if (!rep.ok) {
                 self.setStatusFmt("cannot open: {s}", .{rep.@"error"});
+                if (p.navigation != null and p.navigation_generation == p.tab.navigation_generation) self.syncPathEntry(p.tab);
                 self.dropPending(i);
                 return true;
             }
@@ -2391,6 +2577,18 @@ pub const BrowserView = struct {
                 p.dir.loaded = true;
                 p.dir.sort();
                 if (rep.truncated) self.setStatus("listing truncated (very large directory)");
+                if (p.navigation) |intent| {
+                    if (p.navigation_generation != p.tab.navigation_generation) {
+                        self.dropPending(i);
+                        return false;
+                    }
+                    p.navigation = null;
+                    _ = self.pending.swapRemove(i);
+                    p.staged.deinit(self.allocator);
+                    self.commitNavigation(p.tab, p.hc, p.dir, intent, rep.path);
+                    self.allocator.destroy(p);
+                    return true;
+                }
                 self.dropPending(i);
                 return true;
             }
@@ -2431,8 +2629,11 @@ pub const BrowserView = struct {
                     .undo_op = pj.undo_op,
                     .undo_trash_orig = pj.undo_trash_orig,
                     .open_on_done = pj.open_on_done,
+                    .history_op = pj.history_op,
+                    .history_direction = pj.history_direction,
                 };
                 self.jobs.append(self.allocator, row) catch {
+                    if (row.history_op) |op| self.restoreHistory(op, row.history_direction.?);
                     self.allocator.destroy(row);
                     self.allocator.free(pj.label);
                     _ = self.pending_jobs.orderedRemove(i);
@@ -2449,6 +2650,7 @@ pub const BrowserView = struct {
                 }
                 if (pj.undo_op) |u| u.destroy(self.allocator);
                 if (pj.undo_trash_orig) |o| self.allocator.free(o);
+                if (pj.history_op) |op| self.restoreHistory(op, pj.history_direction.?);
                 self.allocator.free(pj.label);
                 _ = self.pending_jobs.orderedRemove(i);
                 self.allocator.destroy(pj);
@@ -2465,6 +2667,18 @@ pub const BrowserView = struct {
                 self.setStatusFmt("operation failed: {s}", .{rep.@"error"});
             }
             _ = self.pending_undo.orderedRemove(i);
+            return false;
+        }
+        // Completion of a redo/undo plain mutation.
+        for (self.pending_history.items, 0..) |ph, i| {
+            if (ph.req != rep.req) continue;
+            _ = self.pending_history.orderedRemove(i);
+            if (rep.ok) {
+                self.finishHistory(ph.op, ph.direction);
+            } else {
+                self.restoreHistory(ph.op, ph.direction);
+                self.setStatusFmt("history operation failed: {s}", .{rep.@"error"});
+            }
             return false;
         }
         // Compare hash-verify start reply?
@@ -2516,6 +2730,10 @@ pub const BrowserView = struct {
         const p = self.pending.swapRemove(i);
         for (p.staged.items) |*e| e.deinit(self.allocator);
         p.staged.deinit(self.allocator);
+        if (p.navigation != null) {
+            self.closeViewOf(p.hc, p.dir);
+            p.dir.deinit();
+        }
         self.allocator.destroy(p);
     }
 
@@ -2736,9 +2954,13 @@ pub const BrowserView = struct {
         }
     }
 
-    /// Navigate a tab to (host, path). `push_history` false = back/
-    /// forward traversal (history untouched).
-    fn navigate(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_in: []const u8, push_history: bool) void {
+    /// Navigate a tab to (host, path), recording history. Back/forward
+    /// traversal goes through navigateSpecMode with its own intent.
+    fn navigate(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_in: []const u8) void {
+        self.navigateMode(tab, host_in, path_in, .push);
+    }
+
+    fn navigateMode(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_in: []const u8, intent: NavigationIntent) void {
         // Mount bypass: a local path under an sshfs/NFS mount is
         // silently rerouted to direct mux access on the source host
         // (fast listings, push deltas, host-side jobs).
@@ -2757,29 +2979,26 @@ pub const BrowserView = struct {
         else
             self.hostConnFor(host) orelse return;
         const new_dir = self.makeDir(path) orelse return;
-        if (push_history) {
-            var buf: [4200]u8 = undefined;
-            const old = self.allocator.dupe(u8, tab.spec(&buf)) catch null;
-            if (old) |o| tab.back.append(self.allocator, o) catch self.allocator.free(o);
-            for (tab.fwd.items) |p| self.allocator.free(p);
-            tab.fwd.clearRetainingCapacity();
+        tab.navigation_generation +%= 1;
+        if (tab.navigation_generation == 0) tab.navigation_generation = 1;
+        // Navigation is transactional: the visible root and history do
+        // not change until the candidate listing succeeds.
+        const p = self.allocator.create(Pending) catch { new_dir.deinit(); return; };
+        p.* = .{ .req = self.nextReq(), .tab = tab, .dir = new_dir, .hc = new_hc, .op = .open_view, .navigation = intent, .navigation_generation = tab.navigation_generation };
+        self.pending.append(self.allocator, p) catch { self.allocator.destroy(p); new_dir.deinit(); return; };
+        if (new_hc.state == .ready) {
+            self.sendListingOp(p);
+        } else if (new_hc.state == .dead) {
+            self.setStatus("destination host is unavailable");
+            self.dropPending(self.pending.items.len - 1);
         }
-        tab.dropSubdirsUnder(tab.root.path);
-        self.cancelPendingDir(tab.root);
-        self.closeViewOf(tab.hc, tab.root);
-        tab.root.deinit();
-        tab.root = new_dir;
-        tab.hc = new_hc;
-        self.updateTabLabel(tab);
-        self.openDir(tab, new_dir);
-        self.syncPathEntry(tab);
-        self.renderTab(tab);
-        self.refreshGitOverlay(tab);
-        var rbuf: [4300]u8 = undefined;
-        self.recordRecentSpec(tab.spec(&rbuf));
     }
 
-    fn navigateSpec(self: *BrowserView, tab: *BTab, spec: []const u8, push_history: bool) void {
+    fn navigateSpec(self: *BrowserView, tab: *BTab, spec: []const u8) void {
+        self.navigateSpecMode(tab, spec, .push);
+    }
+
+    fn navigateSpecMode(self: *BrowserView, tab: *BTab, spec: []const u8, intent: NavigationIntent) void {
         const loc = parseSpec(spec);
         // Spec strings from history/path-entry may alias tab state
         // that navigate() frees — copy to the stack first.
@@ -2800,25 +3019,57 @@ pub const BrowserView = struct {
             @memcpy(hbuf[0..h.len], h);
             host = hbuf[0..h.len];
         }
-        self.navigate(tab, host, path, push_history);
+        self.navigateMode(tab, host, path, intent);
     }
 
     fn goBack(self: *BrowserView, tab: *BTab) void {
-        const prev = tab.back.pop() orelse return;
-        var buf: [4200]u8 = undefined;
-        const cur = self.allocator.dupe(u8, tab.spec(&buf)) catch null;
-        if (cur) |cp| tab.fwd.append(self.allocator, cp) catch self.allocator.free(cp);
-        self.navigateSpec(tab, prev, false);
-        self.allocator.free(prev);
+        if (tab.back.items.len == 0) return;
+        self.navigateSpecMode(tab, tab.back.items[tab.back.items.len - 1], .back);
     }
 
     fn goForward(self: *BrowserView, tab: *BTab) void {
-        const next = tab.fwd.pop() orelse return;
-        var buf: [4200]u8 = undefined;
-        const cur = self.allocator.dupe(u8, tab.spec(&buf)) catch null;
-        if (cur) |cp| tab.back.append(self.allocator, cp) catch self.allocator.free(cp);
-        self.navigateSpec(tab, next, false);
-        self.allocator.free(next);
+        if (tab.fwd.items.len == 0) return;
+        self.navigateSpecMode(tab, tab.fwd.items[tab.fwd.items.len - 1], .forward);
+    }
+
+    fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate: *Dir, intent: NavigationIntent, canonical: []const u8) void {
+        if (canonical.len > 0 and !std.mem.eql(u8, candidate.path, canonical)) {
+            const owned = self.allocator.dupe(u8, canonical) catch null;
+            if (owned) |path| { self.allocator.free(candidate.path); candidate.path = path; }
+        }
+        var current_buf: [4300]u8 = undefined;
+        const current = self.allocator.dupe(u8, tab.spec(&current_buf)) catch null;
+        switch (intent) {
+            .push => {
+                if (current) |value| tab.back.append(self.allocator, value) catch self.allocator.free(value);
+                for (tab.fwd.items) |value| self.allocator.free(value);
+                tab.fwd.clearRetainingCapacity();
+            },
+            .back => {
+                if (tab.back.pop()) |value| self.allocator.free(value);
+                if (current) |value| tab.fwd.append(self.allocator, value) catch self.allocator.free(value);
+            },
+            .forward => {
+                if (tab.fwd.pop()) |value| self.allocator.free(value);
+                if (current) |value| tab.back.append(self.allocator, value) catch self.allocator.free(value);
+            },
+        }
+        while (tab.back.items.len > 100) self.allocator.free(tab.back.orderedRemove(0));
+        while (tab.fwd.items.len > 100) self.allocator.free(tab.fwd.orderedRemove(0));
+        for (tab.selected.items) |value| self.allocator.free(value);
+        tab.selected.clearRetainingCapacity();
+        tab.dropSubdirsUnder(tab.root.path);
+        self.cancelPendingDir(tab.root);
+        self.closeViewOf(tab.hc, tab.root);
+        tab.root.deinit();
+        tab.root = candidate;
+        tab.hc = hc;
+        self.updateTabLabel(tab);
+        self.syncPathEntry(tab);
+        self.renderTab(tab);
+        self.refreshGitOverlay(tab);
+        var recent_buf: [4300]u8 = undefined;
+        self.recordRecentSpec(tab.spec(&recent_buf));
     }
 
     fn goUp(self: *BrowserView, tab: *BTab) void {
@@ -2836,7 +3087,7 @@ pub const BrowserView = struct {
             @memcpy(hbuf[0..h.len], h);
             host = hbuf[0..h.len];
         }
-        self.navigate(tab, host, copy, true);
+        self.navigate(tab, host, copy);
     }
 
     fn toggleExpand(self: *BrowserView, tab: *BTab, dir_path: []const u8) void {
@@ -2873,7 +3124,13 @@ pub const BrowserView = struct {
         const n = @min(spec.len, z.len - 1);
         @memcpy(z[0..n], spec[0..n]);
         z[n] = 0;
+        self.syncing_path_entry = true;
         c.gtk_editable_set_text(@ptrCast(self.path_entry), &z);
+        self.syncing_path_entry = false;
+        // The entry no longer holds what the user was completing.
+        self.cancelPathCompletion();
+        c.gtk_widget_set_sensitive(self.back_button, @intFromBool(tab.back.items.len > 0));
+        c.gtk_widget_set_sensitive(self.fwd_button, @intFromBool(tab.fwd.items.len > 0));
     }
 
     fn setStatus(self: *BrowserView, msg: []const u8) void {
@@ -3226,7 +3483,7 @@ pub const BrowserView = struct {
             @memcpy(hbuf[0..h.len], h);
             host = hbuf[0..h.len];
         }
-        tab.view.navigate(tab, host, path, true);
+        tab.view.navigate(tab, host, path);
     }
 
     fn renderDirRows(self: *BrowserView, tab: *BTab, dir: *Dir, depth: u32) void {
@@ -3514,12 +3771,10 @@ pub const BrowserView = struct {
                 @memcpy(hbuf[0..h.len], h);
                 host = hbuf[0..h.len];
             }
-            self.navigate(tab, host, path, true);
+            self.navigate(tab, host, path);
         } else if (tab.hc.host == null) {
             // Local file: default application, straight from disk.
-            var uri_buf: [4200:0]u8 = undefined;
-            const uri = std.fmt.bufPrintZ(&uri_buf, "file://{s}", .{ctx.path}) catch return;
-            _ = c.g_app_info_launch_default_for_uri(uri.ptr, null, null);
+            launchLocal(ctx.path);
         } else {
             // Remote file: download into the local open-cache, then
             // launch (phase-5's hydrating cache predecessor).
@@ -3945,7 +4200,7 @@ pub const BrowserView = struct {
                 } else {
                     var lbl: [128]u8 = undefined;
                     const label = std.fmt.bufPrint(&lbl, "copy {s}", .{base}) catch base;
-                    self.startDaemonJobUndo(tab.hc, "copy", src, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, "", ""));
+                    self.startDaemonJobUndo(tab.hc, "copy", src, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, src, ""));
                 }
             } else {
                 const src_hc = self.hostConnFor(if (self.clip_host) |h| @as(?[]const u8, h) else null) orelse continue;
@@ -5829,13 +6084,23 @@ pub const BrowserView = struct {
 
     const UNDO_CAP = 20;
 
+    fn clearRedo(self: *BrowserView) void {
+        for (self.redo_stack.items) |op| op.destroy(self.allocator);
+        self.redo_stack.clearRetainingCapacity();
+    }
+
     fn pushUndo(self: *BrowserView, op: *UndoOp) void {
-        self.undo_stack.append(self.allocator, op) catch {
+        self.clearRedo();
+        self.pushHistoryStack(&self.undo_stack, op);
+    }
+
+    fn pushHistoryStack(self: *BrowserView, stack: *std.ArrayList(*UndoOp), op: *UndoOp) void {
+        stack.append(self.allocator, op) catch {
             op.destroy(self.allocator);
             return;
         };
-        while (self.undo_stack.items.len > UNDO_CAP) {
-            const old = self.undo_stack.orderedRemove(0);
+        while (stack.items.len > UNDO_CAP) {
+            const old = stack.orderedRemove(0);
             old.destroy(self.allocator);
         }
     }
@@ -5849,16 +6114,11 @@ pub const BrowserView = struct {
         p: []const u8,
     ) ?*UndoOp {
         const op = self.allocator.create(UndoOp) catch return null;
-        op.* = .{
-            .host = if (host) |h| (self.allocator.dupe(u8, h) catch null) else null,
-            .kind = kind,
-            .a = self.allocator.dupe(u8, a) catch {
-                self.allocator.destroy(op);
-                return null;
-            },
-            .b = if (b.len > 0) (self.allocator.dupe(u8, b) catch &.{}) else &.{},
-            .p = if (p.len > 0) (self.allocator.dupe(u8, p) catch &.{}) else &.{},
-        };
+        const host_owned = if (host) |h| self.allocator.dupe(u8, h) catch { self.allocator.destroy(op); return null; } else null;
+        const a_owned = self.allocator.dupe(u8, a) catch { self.allocator.destroy(op); return null; };
+        const b_owned: []u8 = if (b.len > 0) self.allocator.dupe(u8, b) catch { self.allocator.free(a_owned); if (host_owned) |h| self.allocator.free(h); self.allocator.destroy(op); return null; } else @constCast(&[_]u8{});
+        const p_owned: []u8 = if (p.len > 0) self.allocator.dupe(u8, p) catch { if (b_owned.len > 0) self.allocator.free(b_owned); self.allocator.free(a_owned); if (host_owned) |h| self.allocator.free(h); self.allocator.destroy(op); return null; } else @constCast(&[_]u8{});
+        op.* = .{ .host = host_owned, .kind = kind, .a = a_owned, .b = b_owned, .p = p_owned };
         return op;
     }
 
@@ -5873,39 +6133,109 @@ pub const BrowserView = struct {
     }
 
     fn performUndo(self: *BrowserView) void {
-        const op = self.undo_stack.pop() orelse {
-            self.setStatus("nothing to undo");
-            return;
-        };
-        defer op.destroy(self.allocator);
-        const hc = self.hostConnFor(if (op.host) |h| @as(?[]const u8, h) else null) orelse return;
-        if (hc.state != .ready) {
-            self.setStatus("host not connected — cannot undo right now");
-            // Put it back for a later attempt.
-            const clone = self.makeUndo(op.host, op.kind, op.a, op.b, op.p) orelse return;
-            self.undo_stack.append(self.allocator, clone) catch clone.destroy(self.allocator);
+        self.beginHistory(.undo);
+    }
+
+    fn performRedo(self: *BrowserView) void {
+        self.beginHistory(.redo);
+    }
+
+    fn beginHistory(self: *BrowserView, direction: HistoryDirection) void {
+        if (self.history_busy) {
+            self.setStatus("a history operation is still running");
             return;
         }
+        const source = if (direction == .undo) &self.undo_stack else &self.redo_stack;
+        const op = source.pop() orelse {
+            self.setStatus(if (direction == .undo) "nothing to undo" else "nothing to redo");
+            return;
+        };
+        const hc = self.hostConnFor(if (op.host) |h| @as(?[]const u8, h) else null) orelse {
+            self.pushHistoryStack(source, op);
+            return;
+        };
+        if (hc.state != .ready) {
+            self.setStatus("host not connected; history operation retained");
+            self.pushHistoryStack(source, op);
+            return;
+        }
+        self.history_busy = true;
         switch (op.kind) {
             .rename_back => {
-                self.sendOp(hc, .{ .req = self.nextReq(), .op = "rename", .path = op.a, .to = op.b });
-                self.setStatusFmt("undid move: {s} back to {s}", .{ std.fs.path.basename(op.a), op.b });
+                const req = self.nextReq();
+                if (!self.deferHistory(req, hc, op, direction)) return;
+                self.sendOp(hc, .{ .req = req, .op = "rename", .path = if (direction == .undo) op.a else op.b, .to = if (direction == .undo) op.b else op.a });
             },
             .delete_created => {
                 var lbl: [128]u8 = undefined;
-                const label = std.fmt.bufPrint(&lbl, "undo copy {s}", .{std.fs.path.basename(op.a)}) catch "undo copy";
-                self.startDaemonJob(hc, "delete_tree", op.a, "", label);
+                const label = std.fmt.bufPrint(&lbl, "{s} copy {s}", .{ @tagName(direction), std.fs.path.basename(op.a) }) catch "copy history";
+                if (direction == .undo)
+                    self.startHistoryJob(hc, "delete_tree", op.a, "", "", label, op, direction)
+                else if (op.b.len > 0)
+                    self.startHistoryJob(hc, "copy", op.b, op.a, "", label, op, direction)
+                else
+                    self.restoreHistory(op, direction);
             },
             .trash_restore => {
                 var lbl: [128]u8 = undefined;
-                const label = std.fmt.bufPrint(&lbl, "restore {s}", .{std.fs.path.basename(op.b)}) catch "restore";
-                self.startDaemonJobTo(hc, "trash_restore", op.a, op.b, op.p, label);
+                const label = std.fmt.bufPrint(&lbl, "{s} trash {s}", .{ @tagName(direction), std.fs.path.basename(op.b) }) catch "trash history";
+                if (direction == .undo)
+                    self.startHistoryJob(hc, "trash_restore", op.a, op.b, op.p, label, op, direction)
+                else
+                    self.startHistoryJob(hc, "trash", op.b, "", "", label, op, direction);
             },
             .rmdir_created => {
-                self.sendOp(hc, .{ .req = self.nextReq(), .op = "delete", .path = op.a });
-                self.setStatusFmt("undid new folder: {s}", .{op.a});
+                const req = self.nextReq();
+                if (!self.deferHistory(req, hc, op, direction)) return;
+                self.sendOp(hc, .{ .req = req, .op = if (direction == .undo) "delete" else "mkdir", .path = op.a });
             },
         }
+    }
+
+    fn deferHistory(self: *BrowserView, req: u32, hc: *HostConn, op: *UndoOp, direction: HistoryDirection) bool {
+        self.pending_history.append(self.allocator, .{ .req = req, .hc = hc, .op = op, .direction = direction }) catch {
+            self.restoreHistory(op, direction);
+            return false;
+        };
+        return true;
+    }
+
+    fn finishHistory(self: *BrowserView, op: *UndoOp, direction: HistoryDirection) void {
+        self.history_busy = false;
+        self.pushHistoryStack(if (direction == .undo) &self.redo_stack else &self.undo_stack, op);
+        self.setStatus(if (direction == .undo) "undo complete" else "redo complete");
+    }
+
+    fn restoreHistory(self: *BrowserView, op: *UndoOp, direction: HistoryDirection) void {
+        self.history_busy = false;
+        self.pushHistoryStack(if (direction == .undo) &self.undo_stack else &self.redo_stack, op);
+    }
+
+    fn updateTrashResult(self: *BrowserView, op: *UndoOp, trashed: []const u8, info: []const u8) void {
+        const a = self.allocator.dupe(u8, trashed) catch return;
+        const p = self.allocator.dupe(u8, info) catch { self.allocator.free(a); return; };
+        self.allocator.free(op.a);
+        if (op.p.len > 0) self.allocator.free(op.p);
+        op.a = a;
+        op.p = p;
+    }
+
+    fn startHistoryJob(self: *BrowserView, hc: *HostConn, op_name: []const u8, path: []const u8, to: []const u8, pattern: []const u8, label: []const u8, op: *UndoOp, direction: HistoryDirection) void {
+        const req = self.nextReq();
+        const pj = self.allocator.create(PendingJob) catch return self.restoreHistory(op, direction);
+        pj.* = .{
+            .req = req,
+            .hc = hc,
+            .label = self.allocator.dupe(u8, label) catch { self.allocator.destroy(pj); return self.restoreHistory(op, direction); },
+            .history_op = op,
+            .history_direction = direction,
+        };
+        self.pending_jobs.append(self.allocator, pj) catch {
+            self.allocator.free(pj.label);
+            self.allocator.destroy(pj);
+            return self.restoreHistory(op, direction);
+        };
+        self.sendOp(hc, .{ .req = req, .op = op_name, .path = path, .to = to, .pattern = pattern });
     }
 
     /// Job start with path+to+pattern (trash_restore shape).
@@ -6250,11 +6580,13 @@ pub const BrowserView = struct {
         hc: ?*HostConn = null,
         job: u64 = 0,
         xfer: ?*fstransfer.Xfer = null,
-        kind: enum { pause, resume_, cancel, dismiss },
+        service_token: ?[]u8 = null,
+        kind: enum { pause, resume_, cancel, dismiss, move_up, move_down },
 
         fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
             _ = closure;
             const ctx: *JobBtnCtx = @ptrCast(@alignCast(user.?));
+            if (ctx.service_token) |token| ctx.allocator.free(token);
             ctx.allocator.destroy(ctx);
         }
     };
@@ -6271,6 +6603,17 @@ pub const BrowserView = struct {
     fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx: *JobBtnCtx = @ptrCast(@alignCast(user.?));
         const self = ctx.view;
+        if (ctx.service_token) |token| {
+            const service = self.transfer_service orelse return;
+            switch (ctx.kind) {
+                .move_up => service.moveQueued(token, -1),
+                .move_down => service.moveQueued(token, 1),
+                .cancel => service.cancel(token),
+                else => {},
+            }
+            self.renderJobs();
+            return;
+        }
         if (ctx.xfer) |x| {
             switch (ctx.kind) {
                 .cancel => x.cancel(),
@@ -6305,6 +6648,7 @@ pub const BrowserView = struct {
                     }
                 }
             },
+            .move_up, .move_down => {},
         }
         self.renderJobs();
     }
@@ -6320,9 +6664,33 @@ pub const BrowserView = struct {
         while (c.gtk_widget_get_first_child(self.jobs_box)) |child| {
             c.gtk_box_remove(@ptrCast(self.jobs_box), child);
         }
-        const any = self.transfers.items.len > 0 or self.jobs.items.len > 0;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const durable_rows = if (self.transfer_service) |service|
+            service.rows(scratch.allocator()) catch &.{}
+        else
+            &.{};
+        const any = self.transfers.items.len > 0 or self.jobs.items.len > 0 or durable_rows.len > 0;
         c.gtk_widget_set_visible(self.jobs_box, if (any) 1 else 0);
         if (!any) return;
+
+        for (durable_rows) |d| {
+            const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+            c.gtk_widget_set_margin_start(row, 6);
+            c.gtk_widget_set_margin_end(row, 6);
+            var buf: [256:0]u8 = undefined;
+            const txt = std.fmt.bufPrintZ(&buf, "durable: {s} [{s}]", .{ d.label, @tagName(d.state) }) catch "durable transfer";
+            const label = c.gtk_label_new(txt.ptr);
+            c.gtk_label_set_xalign(@ptrCast(label), 0);
+            c.gtk_widget_set_hexpand(label, 1);
+            c.gtk_box_append(@ptrCast(row), label);
+            if (d.state == .queued or d.state == .waiting_retry) {
+                self.jobsButton(row, "go-up-symbolic", .{ .allocator = self.allocator, .view = self, .service_token = self.allocator.dupe(u8, d.token) catch null, .kind = .move_up });
+                self.jobsButton(row, "go-down-symbolic", .{ .allocator = self.allocator, .view = self, .service_token = self.allocator.dupe(u8, d.token) catch null, .kind = .move_down });
+            }
+            self.jobsButton(row, "process-stop-symbolic", .{ .allocator = self.allocator, .view = self, .service_token = self.allocator.dupe(u8, d.token) catch null, .kind = .cancel });
+            c.gtk_box_append(@ptrCast(self.jobs_box), row);
+        }
 
         for (self.transfers.items) |t| {
             const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
@@ -6481,8 +6849,9 @@ pub const BrowserView = struct {
             const tp = thumbs_mod.thumbPath(tc.cache_dir, req.path, tp_buf[0 .. tp_buf.len - 1]) orelse return;
             tp_buf[tp.len] = 0;
             if (c.gdk_pixbuf_new_from_file(&tp_buf, null)) |cached| {
-                const opt = c.gdk_pixbuf_get_option(cached, "tEXt::Thumb::MTime");
-                if (opt != null and std.mem.eql(u8, std.mem.span(opt), msec)) {
+                const mt = c.gdk_pixbuf_get_option(cached, "tEXt::Thumb::MTime");
+                const ur = c.gdk_pixbuf_get_option(cached, "tEXt::Thumb::URI");
+                if (mt != null and ur != null and std.mem.eql(u8, std.mem.span(mt), msec) and std.mem.eql(u8, std.mem.span(ur), uri)) {
                     pixbuf = cached;
                 } else {
                     c.g_object_unref(cached);
@@ -6495,8 +6864,8 @@ pub const BrowserView = struct {
                 if (pixbuf != null) thumbSaveLocal(tc, pixbuf.?, &tp_buf, tp.len, uri, msec);
             }
         } else {
-            // REMOTE source bytes: decode + scale + encode a spec
-            // PNG for host-side write-back.
+            // Wire-delivered PNG/source bytes: all decode/scale work
+            // stays on this worker, never in the fd callback.
             const loader = c.gdk_pixbuf_loader_new();
             var loaded = false;
             if (c.gdk_pixbuf_loader_write(loader, req.data.?.ptr, req.data.?.len, null) != 0)
@@ -6507,14 +6876,15 @@ pub const BrowserView = struct {
                 if (c.gdk_pixbuf_loader_get_pixbuf(loader)) |full| {
                     const w: f64 = @floatFromInt(c.gdk_pixbuf_get_width(full));
                     const h: f64 = @floatFromInt(c.gdk_pixbuf_get_height(full));
-                    const scale = @max(w / 128.0, h / 128.0);
+                    const bound: f64 = if (req.preview_generation != 0) 480.0 else 128.0;
+                    const scale = @max(w / bound, h / bound);
                     const nw: c_int = if (scale > 1) @intFromFloat(@max(1.0, w / scale)) else @intFromFloat(w);
                     const nh: c_int = if (scale > 1) @intFromFloat(@max(1.0, h / scale)) else @intFromFloat(h);
                     pixbuf = c.gdk_pixbuf_scale_simple(full, nw, nh, c.GDK_INTERP_BILINEAR);
                 }
             }
             c.g_object_unref(loader); // drops `full` with it
-            if (pixbuf) |pb| {
+            if (pixbuf) |pb| if (!req.cached_png and req.preview_generation == 0) {
                 var uz: [4096 * 3 + 8:0]u8 = undefined;
                 @memcpy(uz[0..uri.len], uri);
                 uz[uri.len] = 0;
@@ -6524,11 +6894,11 @@ pub const BrowserView = struct {
                     png_out = a.dupe(u8, out_buf[0..out_len]) catch null;
                     c.g_free(out_buf);
                 }
-            }
+            };
         }
 
         // Hand the result to the main thread.
-        const key = std.fmt.allocPrint(a, "{s}\x00{d}", .{ req.path, req.mtime_ms }) catch {
+        const key = std.fmt.allocPrint(a, "{s}\x00{d}", .{ req.cache_key, req.mtime_ms }) catch {
             if (pixbuf) |pb| c.g_object_unref(pb);
             if (png_out) |pg| a.free(pg);
             return;
@@ -6552,6 +6922,8 @@ pub const BrowserView = struct {
                 return;
             },
             .mtime_ms = req.mtime_ms,
+            .preview_generation = req.preview_generation,
+            .remote_id = req.remote_id,
         };
         tc.ref();
         _ = c.g_idle_add(@ptrCast(&onThumbIdle), @ptrCast(res));
@@ -6570,7 +6942,7 @@ pub const BrowserView = struct {
             _ = c.mkdir(d2.ptr, 0o700);
         } else |_| return;
         var tmp: [4320:0]u8 = undefined;
-        const tmps = std.fmt.bufPrintZ(&tmp, "{s}.sketerm-tmp", .{tp_buf[0..tp_len]}) catch return;
+        const tmps = std.fmt.bufPrintZ(&tmp, "{s}.sketerm-tmp-{x}", .{ tp_buf[0..tp_len], @intFromPtr(tc) }) catch return;
         var uz: [4096 * 3 + 8:0]u8 = undefined;
         @memcpy(uz[0..uri.len], uri);
         uz[uri.len] = 0;
@@ -6603,6 +6975,21 @@ pub const BrowserView = struct {
     }
 
     fn applyThumbResult(self: *BrowserView, res: *ThumbResult) void {
+        if (res.preview_generation != 0) {
+            defer if (res.pixbuf) |pb| c.g_object_unref(pb);
+            if (res.preview_generation == self.preview_generation) {
+                if (res.pixbuf) |pb| {
+                    const tex = c.gdk_texture_new_for_pixbuf(pb);
+                    if (tex) |t| {
+                        c.gtk_picture_set_paintable(@ptrCast(self.preview_pic), @ptrCast(t));
+                        c.g_object_unref(@as(?*anyopaque, @ptrCast(t)));
+                    }
+                } else {
+                    c.gtk_label_set_text(self.preview_text, "(cannot decode preview image)");
+                }
+            }
+            return;
+        }
         if (res.pixbuf) |pb| {
             defer c.g_object_unref(pb);
             const tex = c.gdk_texture_new_for_pixbuf(pb) orelse return;
@@ -6618,23 +7005,28 @@ pub const BrowserView = struct {
             };
             // Remote result: write the PNG back into the OWNING
             // host's cache (best-effort, req 0 = replies ignored).
-            if (res.png) |png| self.thumbWriteBack(res.path, png);
+            if (res.png) |png| self.thumbWriteBack(res.remote_id, res.path, png);
             self.scheduleThumbRender();
         } else {
+            if (self.thumb_failed.count() >= THUMB_CACHE_CAP) {
+                var it = self.thumb_failed.iterator();
+                while (it.next()) |kv| self.allocator.free(kv.key_ptr.*);
+                self.thumb_failed.clearRetainingCapacity();
+            }
             const owned = self.allocator.dupe(u8, res.key) catch return;
             self.thumb_failed.put(owned, {}) catch self.allocator.free(owned);
         }
         // A remote decode holds the pipeline slot until now.
-        self.releaseRemoteThumbFor(res.path);
+        self.releaseRemoteThumbFor(res.remote_id);
     }
 
     /// Push a generated thumbnail PNG into the owning host's
     /// freedesktop cache over the fs wire (mkdirs + write + rename;
     /// all best-effort with ignored replies).
-    fn thumbWriteBack(self: *BrowserView, path: []const u8, png: []const u8) void {
+    fn thumbWriteBack(self: *BrowserView, remote_id: u64, path: []const u8, png: []const u8) void {
         // The path's host is the CURRENT remote pipeline's host.
         const rt = self.remote_thumb orelse return;
-        if (!std.mem.eql(u8, rt.path, path)) return;
+        if (remote_id == 0 or rt.id != remote_id or !std.mem.eql(u8, rt.path, path)) return;
         const hc = rt.hc;
         if (hc.state != .ready) return;
         const cache = hc.cache_dir orelse return;
@@ -6680,12 +7072,18 @@ pub const BrowserView = struct {
     /// The render-time lookup: cached texture, or a queued async
     /// request (local worker / remote pipeline) and null for now.
     fn thumbLookup(self: *BrowserView, hc: *HostConn, full: []const u8, e: Entry) ?*c.GdkTexture {
-        if (!std.mem.eql(u8, e.kind, "file") or e.size > THUMB_FILE_CAP or !isImageName(e.name)) return null;
-        var key_buf: [4300]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ full, e.mtime_ms }) catch return null;
+        if (!std.mem.eql(u8, e.kind, "file") or !isPreviewMediaName(e.name)) return null;
+        if (isImageName(e.name) and e.size > THUMB_FILE_CAP) return null;
+        var identity_buf: [4600]u8 = undefined;
+        const identity = if (hc.host) |host|
+            std.fmt.bufPrint(&identity_buf, "{s}:{s}", .{ host, full }) catch return null
+        else
+            full;
+        var key_buf: [4700]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ identity, e.mtime_ms }) catch return null;
         if (self.thumbs.get(key)) |t| return t;
         if (self.thumb_failed.contains(key)) return null;
-        if (hc.host == null) {
+        if (hc.host == null and isWorkerImageName(e.name)) {
             const tc = self.ensureThumbWorker() orelse return null;
             const a = std.heap.c_allocator;
             tc.lock();
@@ -6695,8 +7093,10 @@ pub const BrowserView = struct {
             }
             if (tc.queue.items.len > 512) return null; // bounded
             const owned = a.dupe(u8, full) catch return null;
-            tc.queue.append(a, .{ .path = owned, .mtime_ms = e.mtime_ms }) catch {
+            const cache_key = a.dupe(u8, full) catch { a.free(owned); return null; };
+            tc.queue.append(a, .{ .path = owned, .cache_key = cache_key, .mtime_ms = e.mtime_ms }) catch {
                 a.free(owned);
+                a.free(cache_key);
                 return null;
             };
             _ = c.pthread_cond_signal(&tc.cond);
@@ -6717,7 +7117,11 @@ pub const BrowserView = struct {
         }
         if (self.remote_thumb_queue.items.len > 128) return;
         const rt = self.allocator.create(RemoteThumb) catch return;
+        const id = self.next_remote_thumb_id;
+        self.next_remote_thumb_id +%= 1;
+        if (self.next_remote_thumb_id == 0) self.next_remote_thumb_id = 1;
         rt.* = .{
+            .id = id,
             .hc = hc,
             .path = self.allocator.dupe(u8, path) catch {
                 self.allocator.destroy(rt);
@@ -6740,24 +7144,12 @@ pub const BrowserView = struct {
                 rt.destroy(self.allocator);
                 continue;
             }
-            if (rt.hc.cache_dir == null) {
-                // Need the host's cache dir first; re-queue and ask.
-                self.remote_thumb_queue.insert(self.allocator, 0, rt) catch rt.destroy(self.allocator);
-                if (rt.hc.cache_req == 0) {
-                    rt.hc.cache_req = self.nextReq();
-                    self.sendOp(rt.hc, .{ .req = rt.hc.cache_req, .op = "homedir", .path = "/" });
-                }
-                return;
-            }
-            var tbuf: [4300]u8 = undefined;
-            const tp = thumbs_mod.thumbPath(rt.hc.cache_dir.?, rt.path, &tbuf) orelse {
-                rt.destroy(self.allocator);
-                continue;
-            };
             rt.req = self.nextReq();
-            rt.phase = .read_thumb;
+            rt.phase = .start_job;
             self.remote_thumb = rt;
-            self.sendOp(rt.hc, .{ .req = rt.req, .op = "read", .path = tp, .off = @as(u64, 0), .len = @as(u64, 1 << 20) });
+            // Generation happens on the file-owning host. Only the
+            // bounded cached PNG returns over the wire.
+            self.sendOp(rt.hc, .{ .req = rt.req, .op = "thumbnail", .path = rt.path });
             return;
         }
     }
@@ -6789,86 +7181,70 @@ pub const BrowserView = struct {
                 }) catch return false;
                 if (rep.req != rt.req) return false;
                 switch (rt.phase) {
-                    .read_thumb => {
-                        if (rep.ok and rt.buf.items.len > 0 and self.tryRemoteCachedThumb(rt)) {
+                    .start_job => {
+                        if (!rep.ok or rep.job == 0) {
+                            self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
                             self.finishRemoteThumb();
                             return true;
                         }
-                        // Missing/stale: fetch the source (capped).
-                        rt.buf.clearRetainingCapacity();
-                        rt.phase = .read_src;
-                        rt.req = self.nextReq();
-                        self.sendOp(rt.hc, .{ .req = rt.req, .op = "read", .path = rt.path, .off = @as(u64, 0), .len = @as(u64, THUMB_FILE_CAP) });
+                        rt.job = rep.job;
+                        rt.phase = .wait_job;
                         return true;
                     },
-                    .read_src => {
-                        if (!rep.ok or rt.buf.items.len == 0 or !rep.eof) {
-                            // Unreadable or larger than the cap: give
-                            // up on this file (negative-cached).
-                            self.markThumbFailed(rt.path, rt.mtime_ms);
+                    .read_thumb => {
+                        if (!rep.ok or rt.buf.items.len == 0) {
+                            self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
                             self.finishRemoteThumb();
                             return true;
                         }
-                        self.queueRemoteDecode(rt);
+                        self.queueRemoteDecode(rt, true, 0);
                         self.finishRemoteThumbKeepCurrent();
                         return true;
                     },
+                    .wait_job => return false,
                 }
+            },
+            .fs_job => {
+                if (rt.phase != .wait_job) return false;
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const ev = std.json.parseFromSliceLeaky(WireJobEv, arena.allocator(), payload, .{ .ignore_unknown_fields = true }) catch return false;
+                if (ev.job != rt.job) return false;
+                if (std.mem.eql(u8, ev.ev, "done") and ev.path.len > 0) {
+                    rt.req = self.nextReq();
+                    rt.phase = .read_thumb;
+                    rt.buf.clearRetainingCapacity();
+                    self.sendOp(rt.hc, .{ .req = rt.req, .op = "read", .path = ev.path, .off = @as(u64, 0), .len = @as(u64, 2 << 20) });
+                } else if (std.mem.eql(u8, ev.ev, "error") or std.mem.eql(u8, ev.ev, "canceled")) {
+                    self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
+                    self.finishRemoteThumb();
+                }
+                return true;
             },
             else => return false,
         }
     }
 
-    /// Decode the host's cached thumbnail PNG; true when valid.
-    fn tryRemoteCachedThumb(self: *BrowserView, rt: *RemoteThumb) bool {
-        const loader = c.gdk_pixbuf_loader_new();
-        var ok = false;
-        if (c.gdk_pixbuf_loader_write(loader, rt.buf.items.ptr, rt.buf.items.len, null) != 0)
-            ok = c.gdk_pixbuf_loader_close(loader, null) != 0
-        else
-            _ = c.gdk_pixbuf_loader_close(loader, null);
-        defer c.g_object_unref(loader);
-        if (!ok) return false;
-        const pb = c.gdk_pixbuf_loader_get_pixbuf(loader) orelse return false;
-        const opt = c.gdk_pixbuf_get_option(pb, "tEXt::Thumb::MTime");
-        if (opt == null) return false;
-        var mstr: [24]u8 = undefined;
-        const msec = std.fmt.bufPrint(&mstr, "{d}", .{@divTrunc(rt.mtime_ms, 1000)}) catch return false;
-        if (!std.mem.eql(u8, std.mem.span(opt), msec)) return false;
-        const tex = c.gdk_texture_new_for_pixbuf(pb) orelse return false;
-        var key_buf: [4300]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ rt.path, rt.mtime_ms }) catch {
-            c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
-            return false;
-        };
-        if (self.thumbs.count() >= THUMB_CACHE_CAP) self.clearThumbCache();
-        const owned = self.allocator.dupe(u8, key) catch {
-            c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
-            return false;
-        };
-        self.thumbs.put(owned, tex) catch {
-            self.allocator.free(owned);
-            c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
-            return false;
-        };
-        self.scheduleThumbRender();
-        return true;
-    }
-
     /// Source bytes arrived: hand them to the worker for decode +
     /// spec-PNG encode (write-back happens when the result lands).
-    fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb) void {
+    fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb, cached_png: bool, preview_generation: u64) void {
         const tc = self.ensureThumbWorker() orelse return;
         const a = std.heap.c_allocator;
         const path = a.dupe(u8, rt.path) catch return;
+        const key = if (rt.hc.host) |host|
+            std.fmt.allocPrint(a, "{s}:{s}", .{ host, rt.path }) catch { a.free(path); return; }
+        else
+            a.dupe(u8, rt.path) catch { a.free(path); return; };
         const data = a.dupe(u8, rt.buf.items) catch {
             a.free(path);
+            a.free(key);
             return;
         };
         tc.lock();
         defer tc.unlock();
-        tc.queue.append(a, .{ .path = path, .mtime_ms = rt.mtime_ms, .data = data }) catch {
+        tc.queue.append(a, .{ .path = path, .cache_key = key, .mtime_ms = rt.mtime_ms, .data = data, .cached_png = cached_png, .preview_generation = preview_generation, .remote_id = rt.id }) catch {
             a.free(path);
+            a.free(key);
             a.free(data);
             return;
         };
@@ -6882,9 +7258,10 @@ pub const BrowserView = struct {
         _ = self;
     }
 
-    fn releaseRemoteThumbFor(self: *BrowserView, path: []const u8) void {
+    fn releaseRemoteThumbFor(self: *BrowserView, remote_id: u64) void {
+        if (remote_id == 0) return;
         if (self.remote_thumb) |rt| {
-            if (std.mem.eql(u8, rt.path, path)) {
+            if (rt.id == remote_id) {
                 rt.destroy(self.allocator);
                 self.remote_thumb = null;
                 self.pumpRemoteThumbs();
@@ -6892,9 +7269,14 @@ pub const BrowserView = struct {
         }
     }
 
-    fn markThumbFailed(self: *BrowserView, path: []const u8, mtime_ms: i64) void {
+    fn markThumbFailed(self: *BrowserView, hc: *HostConn, path: []const u8, mtime_ms: i64) void {
+        var identity_buf: [4600]u8 = undefined;
+        const identity = if (hc.host) |host|
+            std.fmt.bufPrint(&identity_buf, "{s}:{s}", .{ host, path }) catch return
+        else
+            path;
         var key_buf: [4300]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ path, mtime_ms }) catch return;
+        const key = std.fmt.bufPrint(&key_buf, "{s}\x00{d}", .{ identity, mtime_ms }) catch return;
         const owned = self.allocator.dupe(u8, key) catch return;
         self.thumb_failed.put(owned, {}) catch self.allocator.free(owned);
     }
@@ -6917,6 +7299,12 @@ pub const BrowserView = struct {
 
     fn abandonPreviewRead(self: *BrowserView) void {
         if (self.preview_read) |pr| {
+            if (pr.phase == .wait_job and pr.job != 0 and pr.hc.state == .ready) {
+                // req 0 = fire-and-forget: the helper is ephemeral and
+                // may already have finished and been reaped, and that
+                // "no such job" reply is not a user-facing failure.
+                self.sendOp(pr.hc, .{ .req = @as(u32, 0), .op = "job_cancel", .job = pr.job });
+            }
             pr.destroy(self.allocator);
             self.preview_read = null;
         }
@@ -6925,6 +7313,8 @@ pub const BrowserView = struct {
     /// Refresh the preview panel from the current tab's selection.
     fn updatePreview(self: *BrowserView) void {
         if (!self.preview_on) return;
+        self.preview_generation +%= 1;
+        if (self.preview_generation == 0) self.preview_generation = 1;
         self.abandonPreviewRead();
         self.clearPreviewContent();
         const tab = self.currentTab() orelse {
@@ -6956,41 +7346,7 @@ pub const BrowserView = struct {
 
         // Directories: metadata only.
         if (entry != null and entry.?.tdir) return;
-        const is_image = isImageName(path);
-        const known_size: u64 = if (entry) |e| e.size else 0;
-        if (is_image and known_size > PREVIEW_IMAGE_CAP) {
-            c.gtk_label_set_text(self.preview_text, "(image too large to preview)");
-            return;
-        }
-
-        if (tab.hc.host == null) {
-            self.previewLocal(path, is_image);
-        } else {
-            self.previewRemoteStart(tab, path, is_image);
-        }
-    }
-
-    fn previewLocal(self: *BrowserView, path: []const u8, is_image: bool) void {
-        var z: [4200:0]u8 = undefined;
-        const pz = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return;
-        if (is_image) {
-            const pixbuf = c.gdk_pixbuf_new_from_file_at_size(pz.ptr, 480, 480, null) orelse {
-                c.gtk_label_set_text(self.preview_text, "(cannot decode image)");
-                return;
-            };
-            const tex = c.gdk_texture_new_for_pixbuf(pixbuf);
-            c.g_object_unref(pixbuf);
-            if (tex) |t| {
-                c.gtk_picture_set_paintable(@ptrCast(self.preview_pic), @ptrCast(t));
-                c.g_object_unref(@as(?*anyopaque, @ptrCast(t)));
-            }
-            return;
-        }
-        const f = c.fopen(pz.ptr, "rb") orelse return;
-        var head: [PREVIEW_TEXT_CAP]u8 = undefined;
-        const n = c.fread(&head, 1, head.len, f);
-        _ = c.fclose(f);
-        self.showTextPreview(head[0..n]);
+        self.previewRemoteStart(tab, path);
     }
 
     fn showTextPreview(self: *BrowserView, data: []const u8) void {
@@ -7011,7 +7367,7 @@ pub const BrowserView = struct {
         c.g_free(valid);
     }
 
-    fn previewRemoteStart(self: *BrowserView, tab: *BTab, path: []const u8, is_image: bool) void {
+    fn previewRemoteStart(self: *BrowserView, tab: *BTab, path: []const u8) void {
         if (tab.hc.state != .ready) return;
         const pr = self.allocator.create(PreviewRead) catch return;
         pr.* = .{
@@ -7021,12 +7377,11 @@ pub const BrowserView = struct {
                 self.allocator.destroy(pr);
                 return;
             },
-            .is_image = is_image,
-            .cap = if (is_image) PREVIEW_IMAGE_CAP else PREVIEW_TEXT_CAP,
+            .generation = self.preview_generation,
         };
         self.preview_read = pr;
         c.gtk_label_set_text(self.preview_text, "loading…");
-        self.sendOp(tab.hc, .{ .req = pr.req, .op = "read", .path = pr.path, .off = pr.off, .len = @as(u64, @intCast(pr.cap)) });
+        self.sendOp(tab.hc, .{ .req = pr.req, .op = "preview", .path = pr.path });
     }
 
     /// Feed preview-fetch frames; true when consumed.
@@ -7047,23 +7402,50 @@ pub const BrowserView = struct {
                     .ignore_unknown_fields = true,
                 }) catch return false;
                 if (rep.req != pr.req) return false;
-                if (!rep.ok) {
-                    c.gtk_label_set_text(self.preview_text, "(cannot read file)");
+                if (pr.phase == .start_job) {
+                    if (!rep.ok or rep.job == 0) {
+                        c.gtk_label_set_text(self.preview_text, "(preview unavailable)");
+                        self.abandonPreviewRead();
+                    } else {
+                        pr.job = rep.job;
+                        pr.phase = .wait_job;
+                    }
+                    return true;
+                }
+                if (pr.phase != .read_asset) return false;
+                if (!rep.ok or pr.buf.items.len == 0) {
+                    c.gtk_label_set_text(self.preview_text, "(cannot read generated preview)");
                     self.abandonPreviewRead();
                     return true;
                 }
-                pr.off = pr.buf.items.len;
-                if (rep.eof or pr.buf.items.len >= pr.cap) {
-                    self.finishPreviewRead();
-                } else {
-                    pr.req = self.nextReq();
-                    self.sendOp(pr.hc, .{
-                        .req = pr.req,
-                        .op = "read",
-                        .path = pr.path,
-                        .off = pr.off,
-                        .len = @as(u64, @intCast(pr.cap - pr.buf.items.len)),
-                    });
+                self.queuePreviewDecode(pr);
+                self.abandonPreviewRead();
+                return true;
+            },
+            .fs_job => {
+                if (pr.phase != .wait_job) return false;
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const ev = std.json.parseFromSliceLeaky(WireJobEv, arena.allocator(), payload, .{ .ignore_unknown_fields = true }) catch return false;
+                if (ev.job != pr.job) return false;
+                if (std.mem.eql(u8, ev.ev, "done")) {
+                    if (ev.text.len > 0)
+                        self.showTextPreview(ev.text)
+                    else
+                        // Drop the "loading…" placeholder; a rendered
+                        // image must not sit under stale status text.
+                        c.gtk_label_set_text(self.preview_text, "");
+                    if (ev.path.len == 0) {
+                        self.abandonPreviewRead();
+                    } else {
+                        pr.phase = .read_asset;
+                        pr.req = self.nextReq();
+                        pr.buf.clearRetainingCapacity();
+                        self.sendOp(pr.hc, .{ .req = pr.req, .op = "read", .path = ev.path, .off = @as(u64, 0), .len = @as(u64, 2 << 20) });
+                    }
+                } else if (std.mem.eql(u8, ev.ev, "error") or std.mem.eql(u8, ev.ev, "canceled")) {
+                    self.showTextPreview(if (ev.message.len > 0) ev.message else "(preview unavailable)");
+                    self.abandonPreviewRead();
                 }
                 return true;
             },
@@ -7071,23 +7453,28 @@ pub const BrowserView = struct {
         }
     }
 
-    fn finishPreviewRead(self: *BrowserView) void {
-        const pr = self.preview_read orelse return;
-        if (pr.is_image) {
-            const bytes = c.g_bytes_new(pr.buf.items.ptr, pr.buf.items.len);
-            const tex = c.gdk_texture_new_from_bytes(bytes, null);
-            c.g_bytes_unref(bytes);
-            if (tex) |t| {
-                c.gtk_label_set_text(self.preview_text, "");
-                c.gtk_picture_set_paintable(@ptrCast(self.preview_pic), @ptrCast(t));
-                c.g_object_unref(@as(?*anyopaque, @ptrCast(t)));
-            } else {
-                c.gtk_label_set_text(self.preview_text, "(cannot decode image)");
-            }
-        } else {
-            self.showTextPreview(pr.buf.items);
-        }
-        self.abandonPreviewRead();
+    fn queuePreviewDecode(self: *BrowserView, pr: *PreviewRead) void {
+        const tc = self.ensureThumbWorker() orelse return;
+        const a = std.heap.c_allocator;
+        const path = a.dupe(u8, pr.path) catch return;
+        const key = a.dupe(u8, pr.path) catch { a.free(path); return; };
+        const data = a.dupe(u8, pr.buf.items) catch { a.free(path); a.free(key); return; };
+        tc.lock();
+        defer tc.unlock();
+        tc.queue.append(a, .{
+            .path = path,
+            .cache_key = key,
+            .mtime_ms = 0,
+            .data = data,
+            .cached_png = true,
+            .preview_generation = pr.generation,
+        }) catch {
+            a.free(path);
+            a.free(key);
+            a.free(data);
+            return;
+        };
+        _ = c.pthread_cond_signal(&tc.cond);
     }
 
     fn onPreviewToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
@@ -7109,9 +7496,11 @@ pub const BrowserView = struct {
         c.gtk_widget_set_margin_bottom(bar, 4);
 
         const back = c.gtk_button_new_from_icon_name("go-previous-symbolic");
+        c.gtk_widget_set_sensitive(back, 0);
         _ = c.g_signal_connect_data(back, "clicked", @ptrCast(&onBackClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), back);
         const fwd = c.gtk_button_new_from_icon_name("go-next-symbolic");
+        c.gtk_widget_set_sensitive(fwd, 0);
         _ = c.g_signal_connect_data(fwd, "clicked", @ptrCast(&onFwdClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), fwd);
         const up = c.gtk_button_new_from_icon_name("go-up-symbolic");
@@ -7122,6 +7511,11 @@ pub const BrowserView = struct {
         c.gtk_widget_set_hexpand(entry, 1);
         c.gtk_entry_set_placeholder_text(@ptrCast(entry), "/path — or host:/path, user@host:/path, udp:host:/path, local:/path");
         _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onPathActivate), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(entry, "changed", @ptrCast(&onPathChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        const entry_keys = c.gtk_event_controller_key_new();
+        c.gtk_event_controller_set_propagation_phase(@ptrCast(entry_keys), c.GTK_PHASE_CAPTURE);
+        _ = c.g_signal_connect_data(entry_keys, "key-pressed", @ptrCast(&onPathKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(entry, @ptrCast(entry_keys));
         c.gtk_box_append(@ptrCast(bar), entry);
 
         const hidden = c.gtk_toggle_button_new();
@@ -7264,6 +7658,8 @@ pub const BrowserView = struct {
         self.root_box = vbox;
         self.notebook = @ptrCast(@alignCast(notebook));
         self.path_entry = @ptrCast(@alignCast(entry));
+        self.back_button = back;
+        self.fwd_button = fwd;
         self.status_label = @ptrCast(@alignCast(status));
         self.jobs_box = jobs_box;
         self.search_bar = sbar;
@@ -7445,7 +7841,7 @@ pub const BrowserView = struct {
         var buf: [4300]u8 = undefined;
         if (ctx.spec.len >= buf.len) return;
         @memcpy(buf[0..ctx.spec.len], ctx.spec);
-        self.navigateSpec(tab, buf[0..ctx.spec.len], true);
+        self.navigateSpec(tab, buf[0..ctx.spec.len]);
     }
 
     /// Re-run a saved search: navigate its root, refill the search
@@ -7457,7 +7853,7 @@ pub const BrowserView = struct {
         var buf: [4300]u8 = undefined;
         if (sq.spec.len >= buf.len) return;
         @memcpy(buf[0..sq.spec.len], sq.spec);
-        self.navigateSpec(tab, buf[0..sq.spec.len], true);
+        self.navigateSpec(tab, buf[0..sq.spec.len]);
         var pz: [512:0]u8 = undefined;
         const pat = std.fmt.bufPrintZ(&pz, "{s}", .{sq.pattern}) catch return;
         c.gtk_editable_set_text(@ptrCast(self.search_entry), pat.ptr);
@@ -7563,9 +7959,37 @@ pub const BrowserView = struct {
     ) callconv(.c) c.gboolean {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         const lower_pre: c_uint = c.gdk_keyval_to_lower(keyval);
-        if ((state & c.GDK_CONTROL_MASK) != 0 and lower_pre == c.GDK_KEY_z) {
+        const mods = state & input.SIGNIFICANT_MODS;
+        if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_z) {
             self.performUndo();
             return 1;
+        }
+        if (mods == (c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK) and lower_pre == c.GDK_KEY_z) {
+            self.performRedo();
+            return 1;
+        }
+        if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_l) {
+            _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(self.path_entry)));
+            c.gtk_editable_select_region(@ptrCast(self.path_entry), 0, -1);
+            return 1;
+        }
+        if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_s) {
+            self.showSelectPattern();
+            return 1;
+        }
+        if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_a) {
+            self.selectPattern("*", false);
+            return 1;
+        }
+        if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_i) {
+            self.selectPattern("*", true);
+            return 1;
+        }
+        if (mods == c.GDK_ALT_MASK) {
+            const tab = self.currentTab() orelse return 0;
+            if (keyval == c.GDK_KEY_Left) { self.goBack(tab); return 1; }
+            if (keyval == c.GDK_KEY_Right) { self.goForward(tab); return 1; }
+            if (keyval == c.GDK_KEY_Up) { self.goUp(tab); return 1; }
         }
         const ictx = self.pane.input_ctx orelse return 0;
         const lower_kv: c_uint = lower_pre;
@@ -7700,25 +8124,248 @@ pub const BrowserView = struct {
         var buf: [4096]u8 = undefined;
         if (cwd.len >= buf.len) return;
         @memcpy(buf[0..cwd.len], cwd);
-        self.navigate(tab, null, buf[0..cwd.len], true);
+        self.navigate(tab, null, buf[0..cwd.len]);
     }
     fn onHiddenToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         if (self.currentTab()) |tab| tab.show_hidden = c.gtk_toggle_button_get_active(btn) != 0;
         self.renderCurrent();
     }
+
+    const CompletionCtx = struct {
+        allocator: std.mem.Allocator,
+        view: *BrowserView,
+        text: []u8,
+        fn free(user: ?*anyopaque) callconv(.c) void {
+            const ctx: *CompletionCtx = @ptrCast(@alignCast(user.?));
+            ctx.allocator.free(ctx.text);
+            ctx.allocator.destroy(ctx);
+        }
+    };
+
+    /// Close the popup AND drop the debounce timer: a timer left armed
+    /// re-opens the list right after the user has already navigated,
+    /// leaving a popover nothing dismisses (it is autohide-free).
+    fn cancelPathCompletion(self: *BrowserView) void {
+        if (self.completion_source != 0) {
+            _ = c.g_source_remove(self.completion_source);
+            self.completion_source = 0;
+        }
+        if (self.completion_request) |request| {
+            request.destroy(self.allocator);
+            self.completion_request = null;
+        }
+        self.closePathCompletion();
+    }
+
+    fn closePathCompletion(self: *BrowserView) void {
+        if (self.completion_popover) |pop| {
+            self.completion_popover = null;
+            if (c.gtk_widget_get_parent(pop) != null) c.gtk_widget_unparent(pop);
+        }
+    }
+
+    fn onPathChanged(_: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        if (self.syncing_path_entry) return;
+        if (self.completion_source != 0) _ = c.g_source_remove(self.completion_source);
+        self.completion_source = c.g_timeout_add(150, @ptrCast(&onCompletionTimeout), @ptrCast(self));
+    }
+
+    fn onCompletionTimeout(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.completion_source = 0;
+        self.renderPathCompletion();
+        return 0;
+    }
+
+    fn renderPathCompletion(self: *BrowserView) void {
+        self.closePathCompletion();
+        if (self.completion_request) |request| {
+            request.destroy(self.allocator);
+            self.completion_request = null;
+        }
+        const tab = self.currentTab() orelse return;
+        const raw = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(self.path_entry)))));
+        const slash = std.mem.lastIndexOfScalar(u8, raw, '/') orelse return;
+        const loc = parseSpec(raw);
+        if (loc.path.len == 0 or loc.path[0] != '/') return;
+        const path_slash = std.mem.lastIndexOfScalar(u8, loc.path, '/') orelse return;
+        const candidate_host: ?[]const u8 = if (loc.current_host) tab.hc.host else loc.host;
+        // Split at the last slash rather than using dirname: for the
+        // trailing-slash case ("/a/b/") dirname answers "/a", so the
+        // popup would list the grandparent of what was typed.
+        const parent = if (path_slash == 0) "/" else loc.path[0..path_slash];
+        const prefix = loc.path[path_slash + 1 ..];
+        if (hostEq(candidate_host, tab.hc.host) and std.mem.eql(u8, parent, tab.root.path)) {
+            var names: std.ArrayList([]const u8) = .empty;
+            defer names.deinit(self.allocator);
+            for (tab.root.entries.items) |entry| {
+                if (entry.tdir) names.append(self.allocator, entry.name) catch {};
+            }
+            self.showCompletionNames(raw[0 .. slash + 1], prefix, names.items);
+            return;
+        }
+        const hc = self.hostConnFor(candidate_host) orelse return;
+        if (hc.state != .ready) return;
+        const request = self.allocator.create(PathCompletion) catch return;
+        const display_owned = self.allocator.dupe(u8, raw[0 .. slash + 1]) catch { self.allocator.destroy(request); return; };
+        const prefix_owned = self.allocator.dupe(u8, prefix) catch { self.allocator.free(display_owned); self.allocator.destroy(request); return; };
+        request.* = .{
+            .req = self.nextReq(),
+            .hc = hc,
+            .display_prefix = display_owned,
+            .typed_prefix = prefix_owned,
+        };
+        self.completion_request = request;
+        self.sendOp(hc, .{ .req = request.req, .op = "list", .path = parent });
+    }
+
+    fn showCompletionNames(self: *BrowserView, display_prefix: []const u8, prefix: []const u8, names: []const []const u8) void {
+        self.closePathCompletion();
+        const pop = c.gtk_popover_new();
+        const list = c.gtk_list_box_new();
+        c.gtk_popover_set_autohide(@ptrCast(pop), 0);
+        c.gtk_widget_set_can_focus(pop, 0);
+        c.gtk_widget_set_can_focus(list, 0);
+        c.gtk_list_box_set_selection_mode(@ptrCast(list), c.GTK_SELECTION_BROWSE);
+        c.gtk_list_box_set_activate_on_single_click(@ptrCast(list), 1);
+        var count: usize = 0;
+        for (names) |name| {
+            if (name.len > 0 and name[0] == '.') continue;
+            if (prefix.len > name.len or !std.ascii.eqlIgnoreCase(prefix, name[0..prefix.len])) continue;
+            var text_buf: [4600]u8 = undefined;
+            const completed = std.fmt.bufPrint(&text_buf, "{s}{s}/", .{ display_prefix, name }) catch continue;
+            const ctx = self.allocator.create(CompletionCtx) catch continue;
+            ctx.* = .{ .allocator = self.allocator, .view = self, .text = self.allocator.dupe(u8, completed) catch { self.allocator.destroy(ctx); continue; } };
+            const row = c.gtk_list_box_row_new();
+            c.gtk_widget_set_can_focus(row, 0);
+            const label = c.gtk_label_new(null);
+            var name_z: [512:0]u8 = undefined;
+            const n = @min(name.len, name_z.len - 1);
+            @memcpy(name_z[0..n], name[0..n]);
+            name_z[n] = 0;
+            c.gtk_label_set_text(@ptrCast(label), &name_z);
+            c.gtk_label_set_xalign(@ptrCast(label), 0);
+            c.gtk_list_box_row_set_child(@ptrCast(row), label);
+            c.g_object_set_data_full(@ptrCast(row), "sketerm-completion", @ptrCast(ctx), @ptrCast(&CompletionCtx.free));
+            c.gtk_list_box_append(@ptrCast(list), row);
+            count += 1;
+            if (count >= 30) break;
+        }
+        if (count == 0) { c.g_object_unref(pop); return; }
+        _ = c.g_signal_connect_data(list, "row-activated", @ptrCast(&onCompletionActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_popover_set_child(@ptrCast(pop), list);
+        c.gtk_widget_set_parent(pop, @ptrCast(@alignCast(self.path_entry)));
+        self.completion_popover = pop;
+        c.gtk_popover_popup(@ptrCast(pop));
+    }
+
+    fn onCompletionActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const data = c.g_object_get_data(@ptrCast(row), "sketerm-completion") orelse return;
+        const ctx: *CompletionCtx = @ptrCast(@alignCast(data));
+        self.syncing_path_entry = true;
+        var z: [4600:0]u8 = undefined;
+        const n = @min(ctx.text.len, z.len - 1);
+        @memcpy(z[0..n], ctx.text[0..n]);
+        z[n] = 0;
+        c.gtk_editable_set_text(@ptrCast(self.path_entry), &z);
+        c.gtk_editable_set_position(@ptrCast(self.path_entry), -1);
+        self.syncing_path_entry = false;
+        self.closePathCompletion();
+        if (self.completion_source != 0) _ = c.g_source_remove(self.completion_source);
+        self.completion_source = c.g_timeout_add(150, @ptrCast(&onCompletionTimeout), @ptrCast(self));
+    }
+
+    fn onPathKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, _: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        if (keyval == c.GDK_KEY_Escape and self.completion_popover != null) {
+            self.closePathCompletion();
+            return 1;
+        }
+        if (keyval == c.GDK_KEY_Tab) {
+            const pop = self.completion_popover orelse return 0;
+            const child = c.gtk_popover_get_child(@ptrCast(pop)) orelse return 0;
+            const row = c.gtk_list_box_get_row_at_index(@ptrCast(@alignCast(child)), 0) orelse return 0;
+            onCompletionActivated(@ptrCast(@alignCast(child)), row, self);
+            return 1;
+        }
+        return 0;
+    }
+
+    const PatternCtx = struct {
+        allocator: std.mem.Allocator,
+        view: *BrowserView,
+        popover: *c.GtkWidget,
+        fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+            const ctx: *PatternCtx = @ptrCast(@alignCast(user.?));
+            ctx.allocator.destroy(ctx);
+        }
+    };
+
+    fn showSelectPattern(self: *BrowserView) void {
+        const pop = c.gtk_popover_new();
+        const entry = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(entry), "Select name/glob (* and ?)");
+        const ctx = self.allocator.create(PatternCtx) catch { c.g_object_unref(pop); return; };
+        ctx.* = .{ .allocator = self.allocator, .view = self, .popover = pop };
+        _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onPatternActivate), @ptrCast(ctx), @ptrCast(&PatternCtx.free), c.G_CONNECT_DEFAULT);
+        c.gtk_popover_set_child(@ptrCast(pop), entry);
+        c.gtk_widget_set_parent(pop, @ptrCast(@alignCast(self.path_entry)));
+        c.gtk_popover_popup(@ptrCast(pop));
+        _ = c.gtk_widget_grab_focus(entry);
+    }
+
+    fn onPatternActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *PatternCtx = @ptrCast(@alignCast(user.?));
+        const pattern = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
+        if (pattern.len > 0) ctx.view.selectPattern(pattern, false);
+        if (c.gtk_widget_get_parent(ctx.popover) != null) c.gtk_widget_unparent(ctx.popover);
+    }
+
+    fn selectPattern(self: *BrowserView, pattern: []const u8, invert: bool) void {
+        const tab = self.currentTab() orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var existing = std.StringHashMap(void).init(arena.allocator());
+        for (tab.selected.items) |path| existing.put(arena.allocator().dupe(u8, path) catch continue, {}) catch {};
+        for (tab.selected.items) |path| self.allocator.free(path);
+        tab.selected.clearRetainingCapacity();
+        const dirs = [_]*Dir{tab.root};
+        self.selectPatternDirs(tab, &dirs, pattern, invert, &existing);
+        if (tab.view_mode != .icons) self.selectPatternDirs(tab, tab.subdirs.items, pattern, invert, &existing);
+        self.renderTab(tab);
+        self.updatePreview();
+        self.setStatusFmt("selected {d} item(s)", .{tab.selected.items.len});
+    }
+
+    fn selectPatternDirs(self: *BrowserView, tab: *BTab, dirs: []const *Dir, pattern: []const u8, invert: bool, existing: *std.StringHashMap(void)) void {
+        for (dirs) |dir| for (dir.entries.items) |entry| {
+            if (!tab.show_hidden and entry.name.len > 0 and entry.name[0] == '.') continue;
+            var path_buf: [4200]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ if (dir.path.len == 1) "" else dir.path, entry.name }) catch continue;
+            const matched = fsjob.nameMatches(pattern, entry.name);
+            const selected = if (invert) (existing.contains(path) != matched) else matched;
+            if (!selected) continue;
+            const owned = self.allocator.dupe(u8, path) catch continue;
+            tab.selected.append(self.allocator, owned) catch self.allocator.free(owned);
+        };
+    }
+
     fn onPathActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         const tab = self.currentTab() orelse return;
         const txt = c.gtk_editable_get_text(@ptrCast(entry));
         const spec = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
         if (spec.len == 0) return;
+        self.cancelPathCompletion();
         const loc = parseSpec(spec);
         if (loc.path.len == 0 or loc.path[0] != '/') {
             self.setStatus("path must be absolute (host:/path for remote)");
             return;
         }
-        self.navigateSpec(tab, spec, true);
+        self.navigateSpec(tab, spec);
     }
     fn onSwitchPage(_: *c.GtkNotebook, _: *c.GtkWidget, _: c.guint, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
@@ -7837,16 +8484,16 @@ fn millerNextSegment(ancestor: []const u8, root: []const u8) ?[]const u8 {
 }
 
 fn launchLocal(path: []const u8) void {
-    var uri_buf: [4300:0]u8 = undefined;
-    const uri = std.fmt.bufPrintZ(&uri_buf, "file://{s}", .{path}) catch return;
-    _ = c.g_app_info_launch_default_for_uri(uri.ptr, null, null);
+    const uri = filenameUri(path) orelse return;
+    defer c.g_free(uri);
+    _ = c.g_app_info_launch_default_for_uri(uri, null, null);
 }
 
 /// Launch a specific installed application (by GAppInfo id) on a
 /// local path; falls back to the default handler if the id vanished.
 fn launchLocalWithApp(appid: []const u8, path: []const u8) void {
-    var uri_buf: [4300:0]u8 = undefined;
-    const uri = std.fmt.bufPrintZ(&uri_buf, "file://{s}", .{path}) catch return;
+    const uri = filenameUri(path) orelse return;
+    defer c.g_free(uri);
     const apps = c.g_app_info_get_all();
     defer if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
     var it = apps;
@@ -7855,12 +8502,19 @@ fn launchLocalWithApp(appid: []const u8, path: []const u8) void {
         const id = c.g_app_info_get_id(app) orelse continue;
         if (!std.mem.eql(u8, std.mem.span(id), appid)) continue;
         var list: ?*c.GList = null;
-        list = c.g_list_append(list, @ptrCast(@constCast(uri.ptr)));
+        list = c.g_list_append(list, @ptrCast(uri));
         _ = c.g_app_info_launch_uris(app, list, null, null);
         c.g_list_free(list);
         return;
     }
     launchLocal(path);
+}
+
+fn filenameUri(path: []const u8) ?[*c]c.gchar {
+    var path_buf: [4096:0]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return null;
+    const uri = c.g_filename_to_uri(path_z.ptr, null, null);
+    return if (uri == null) null else uri;
 }
 
 /// Make `appid` the default handler for `path`'s guessed type.
@@ -7996,6 +8650,14 @@ test "isImageName recognizes previewable extensions" {
     try t.expect(isImageName("a.webp"));
     try t.expect(!isImageName("notes.txt"));
     try t.expect(!isImageName("jpg"));
+}
+
+test "isPreviewMediaName includes document video and audio formats" {
+    const t = std.testing;
+    try t.expect(isPreviewMediaName("manual.PDF"));
+    try t.expect(isPreviewMediaName("clip.webm"));
+    try t.expect(isPreviewMediaName("album.flac"));
+    try t.expect(!isPreviewMediaName("source.zig"));
 }
 
 test "parseSpec forms" {
