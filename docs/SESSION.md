@@ -8591,3 +8591,11 @@ The original session's "v5 client vs v6 daemon" pass was traced to a stale
 Verification: 824 tests pass (6 skips); `zig build`, `zig build mux`,
 `smoke-mux`, `smoke-broker`, `smoke-mcp`, Linux static-musl and aarch64-macOS
 portable builds pass. No live user daemon was touched.
+
+Follow-up in the same review: the current CLI's own quick paths (`mux send`,
+`get-text`, `kill`) now negotiate via `connectProbed` instead of riding the
+hello-less legacy defaults, and `smoke-mux` gained a `noHelloStage` driving a
+real hello-less client end to end (spawn, legacy-body attach, kill) so the
+served-legacy contract cannot silently regress. Verified live: actual v5
+client spawn/send/get-text/kill and the v6 CLI against the current daemon,
+the current CLI against an actual v5 daemon, all sessions and daemons intact.

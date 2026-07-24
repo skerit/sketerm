@@ -88,6 +88,33 @@ fn negotiationStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     snap.deinit(allocator);
 }
 
+/// A client that never sends a hello (the quick CLI send/get-text/kill
+/// connections of every released build) is served with the documented
+/// legacy defaults — spawn, kill, and attach must all work, and the
+/// snapshot body must be the legacy revision its decoders accept.
+/// Runs late: its extra session must not shift the Wayland display
+/// ordinals earlier stages hard-code.
+fn noHelloStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    var nohello = client_mod.Conn.connect(allocator, sock_path) catch fail("nohello connect");
+    defer nohello.deinit();
+    nohello.sendJson(.spawn, .{
+        .name = "nohello",
+        .argv = [_][]const u8{ "/bin/sleep", "30" },
+        .rows = @as(u16, 24),
+        .cols = @as(u16, 80),
+    }) catch fail("nohello spawn send");
+    (nohello.recvExpect(&.{.ok}) catch fail("nohello spawn refused")).deinit(allocator);
+    nohello.sendJson(.attach, .{ .name = "nohello" }) catch fail("nohello attach");
+    const nh_snap = nohello.recvExpect(&.{.snapshot}) catch fail("nohello attach refused");
+    const nh_env = snapshot.peelEnvelope(nh_snap.payload) catch fail("nohello envelope");
+    if (std.mem.readInt(u32, nh_env.body[0..4], .little) != 3) fail("nohello snapshot body");
+    nh_snap.deinit(allocator);
+    nohello.sendJson(.detach, .{}) catch fail("nohello detach");
+    nohello.sendJson(.kill, .{ .name = "nohello" }) catch fail("nohello kill send");
+    (nohello.recvExpect(&.{.ok}) catch fail("nohello kill refused")).deinit(allocator);
+    std.debug.print("smoke-mux: no-hello legacy client served ok\n", .{});
+}
+
 /// 2x2 solid-red RGBA file for the t=f image stage.
 fn writeRedRgba(path: []const u8) !void {
     var z_buf: [4096]u8 = undefined;
@@ -2249,6 +2276,9 @@ pub fn main() u8 {
 
     // Isolated session: private runtime dir + dropped D-Bus + cleanup.
     isolatedStage(allocator, sock_path);
+
+    // Quick CLI connections send no hello and must still be served.
+    noHelloStage(allocator, sock_path);
 
     // A second client sees the session in LIST.
     var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("connect2");
