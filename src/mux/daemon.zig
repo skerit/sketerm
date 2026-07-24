@@ -1276,6 +1276,11 @@ pub const Daemon = struct {
     dmabuf_importer: ?dmabuf_egl.Importer = null,
     dmabuf_capabilities: std.ArrayList(dmabuf.Capability) = .empty,
     dmabuf_initialized: bool = false,
+    /// Worker teardown grace: once its session is gone, a worker with
+    /// undelivered client bytes (the post-mortem log push + `.exit`
+    /// behind an MCP client's between-tool-calls backlog) keeps
+    /// serving until everything drained or this deadline passes.
+    drain_deadline_ms: i64 = 0,
 
     const SocketPathState = enum { live, stale, unknown };
 
@@ -5900,7 +5905,27 @@ pub const Daemon = struct {
         // stale entry). The `.exit`/`.gone` already queued to the client is
         // delivered by run()'s flushClientsFinal before we close. The monolith
         // (no control_fd) keeps running client-less — that's its whole point.
-        if (self.isWorker() and self.sessions.items.len == 0) self.running = false;
+        if (self.isWorker() and self.sessions.items.len == 0) {
+            // Don't exit while a live client still has queued bytes: the
+            // post-mortem log push + `.exit` may sit behind megabytes of
+            // withheld events an MCP client only reads at its NEXT tool
+            // call — run()'s 8x50ms final flush cannot cover that gap,
+            // and a socket buffer holds far less than the backlog. Keep
+            // ticking (bounded) so the crash log outlives the app; a
+            // client that never reads costs one 10s grace, not forever.
+            var pending = false;
+            for (self.clients.items) |cl| {
+                if (!cl.dead and cl.queuedBytes() > 0) pending = true;
+            }
+            if (!pending) {
+                self.running = false;
+            } else if (self.drain_deadline_ms == 0) {
+                self.drain_deadline_ms = nowMs() + 10_000;
+                log.debug("worker lingering for client drain (post-mortem delivery)", .{});
+            } else if (nowMs() >= self.drain_deadline_ms) {
+                self.running = false;
+            }
+        }
         // Broker: a dead worker (control EOF or killed) is removed once its
         // process has been waitpid'd — otherwise it lingers as a zombie. We
         // hold the record (with its pid) until the reap succeeds; WNOHANG==0

@@ -337,6 +337,54 @@ pub fn main() u8 {
     @import("smoke_backlog.zig").run(allocator, sock_path);
     std.debug.print("smoke-broker: mcp backlog gap + resync via worker ok\n", .{});
 
+    // ── post-mortem delivery: a worker whose session died must NOT exit
+    //    before a backlogged, non-reading MCP client has been sent the
+    //    final log push + `.exit`. 2MB of output far exceeds the socket
+    //    buffer, and the client sleeps past the old 8x50ms final flush —
+    //    only the bounded worker linger gets the tail across. ──
+    {
+        var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("pm connect");
+        defer conn.deinit();
+        helloOk(allocator, &conn);
+        conn.sendJson(.spawn, .{
+            .name = "pm",
+            .argv = [_][]const u8{ "sh", "-c", "dd if=/dev/zero bs=1000 count=2000 2>/dev/null | tr '\\0' x; echo; echo SKLOG-SENTINEL; exit 7" },
+            .rows = @as(u16, 24),
+            .cols = @as(u16, 80),
+        }) catch fail("pm spawn send");
+        (conn.recvExpect(&.{.ok}) catch fail("pm spawn ok")).deinit(allocator);
+        conn.sendJson(.attach, .{ .name = "pm", .kind = "mcp" }) catch fail("pm attach");
+        (conn.recvExpect(&.{.snapshot}) catch fail("pm snapshot")).deinit(allocator);
+        // Do not read anything: the backlog piles up worker-side.
+        _ = c.usleep(2_500_000);
+        var got_log = false;
+        var got_exit = false;
+        var exit_status: i32 = 0;
+        var log_json: std.ArrayList(u8) = .empty;
+        defer log_json.deinit(allocator);
+        while (conn.recvFrame()) |f| {
+            defer f.deinit(allocator);
+            switch (f.ftype) {
+                .log_data => {
+                    got_log = true;
+                    log_json.clearRetainingCapacity();
+                    log_json.appendSlice(allocator, f.payload) catch fail("pm oom");
+                },
+                .exit => {
+                    got_exit = true;
+                    if (f.payload.len >= 4) exit_status = std.mem.readInt(i32, f.payload[0..4], .little);
+                },
+                else => {},
+            }
+            if (got_exit) break;
+        } else |_| {}
+        if (!got_log) fail("pm: post-mortem log push lost in worker teardown");
+        if (std.mem.indexOf(u8, log_json.items, "SKLOG-SENTINEL") == null) fail("pm: sentinel missing from final log");
+        if (!got_exit) fail("pm: exit frame lost in worker teardown");
+        if (exit_status != 7) fail("pm: wrong exit status");
+    }
+    std.debug.print("smoke-broker: post-mortem log outlives worker teardown ok\n", .{});
+
     // ── clean shutdown ──
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");

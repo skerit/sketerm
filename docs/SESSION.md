@@ -8599,3 +8599,34 @@ real hello-less client end to end (spawn, legacy-body attach, kill) so the
 served-legacy contract cannot silently regress. Verified live: actual v5
 client spawn/send/get-text/kill and the v6 CLI against the current daemon,
 the current CLI against an actual v5 daemon, all sessions and daemons intact.
+
+## 2026-07-24: post-mortem log delivery — crash backtraces must outlive the app
+
+ST:AFU feedback: after `app_actions` reported `app_exited`, `app_log`
+intermittently answered "no log data for this app", losing the gdb backtrace.
+Three cooperating holes, all in the delivery path (the daemon-side ordering —
+final log flushed on PTY EOF, i.e. wrapper exit, then pushed ahead of `.exit`
+— was already correct): appdrive's `pumpOnce` set `exited` when EOF landed in
+the same `fillAvailable` read that buffered the final frames, stranding them
+forever (pumpOnce refuses to run once exited); `logGet` returned NotConnected
+on an EPIPE'd send without draining what the worker HAD flushed; and a worker
+whose session died exited after run()'s 8x50ms flush even though an MCP
+client only reads between tool calls — everything beyond the socket buffer
+died with the worker's write queue. Fixes: peel all buffered frames before
+declaring EOF-exit, drain-then-serve-stash on send failure, and a bounded
+(10s) worker linger while a live client still has queued bytes. `app_log`
+for an exited app with an empty stash now says so explicitly instead of the
+ambiguous "no log data". The `app_exited` batch reply already inlines
+`recent_output` + the debugger-caught signal once the stash survives.
+
+Tests: an appdrive unit test pins the EOF-peel (frame stream sized to exactly
+one 16384-byte read so EOF lands in the same call; fails with "expected -11,
+found 0" without the fix), and a smoke-broker stage pins the worker linger
+(2MB backlog toward a non-reading mcp-kind client, sleep past the old final
+flush, then assert the sentinel log push + exit status 7 arrive; fails with
+"post-mortem log push lost in worker teardown" without it). Live validation
+through the real `sketerm mcp` stdio stack: bare crash (sentinel served),
+`debug:"gdb"` crash (SIGSEGV backtrace + `gdb_commands` output readable after
+exit), unknown-app error distinct, and a 15x crash/app_log loop with zero
+losses. 825 tests pass (6 skips); smoke-mux/broker/mcp, GUI + mux builds,
+Linux static-musl and aarch64-macOS portable builds pass.
