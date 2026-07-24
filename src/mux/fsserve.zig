@@ -55,7 +55,21 @@ pub const Entry = struct {
     /// user.sketerm.tags xattr, comma-separated ("" = none; always ""
     /// on platforms without lgetxattr).
     tags: []const u8 = "",
+    /// Values for the extended attributes the CLIENT asked for, in
+    /// request order; "" means absent. Only present when requested,
+    /// so an ordinary listing still costs one lgetxattr per entry.
+    attrs: []const []const u8 = &.{},
 };
+
+/// One extended attribute of a single file (attr_list replies).
+pub const Attr = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Cap on a single attribute value; anything larger is reported
+/// truncated rather than streamed through a listing.
+pub const MAX_ATTR_VALUE = 4096;
 
 pub fn kindOf(mode: c.mode_t) []const u8 {
     return switch (mode & c.S_IFMT) {
@@ -101,6 +115,12 @@ pub fn joinZ(buf: *[4096]u8, dir: []const u8, name: []const u8) pathz.Error![*:0
 /// entry vanished between readdir and stat — a live filesystem race,
 /// not an error.
 pub fn statEntry(arena: std.mem.Allocator, dir: []const u8, name: []const u8) ?Entry {
+    return statEntryAttrs(arena, dir, name, &.{});
+}
+
+/// statEntry plus the values of `attrs` (client-requested extended
+/// attribute names), in request order.
+pub fn statEntryAttrs(arena: std.mem.Allocator, dir: []const u8, name: []const u8, attrs: []const []const u8) ?Entry {
     var z_buf: [4096]u8 = undefined;
     const full = joinZ(&z_buf, dir, name) catch return null;
     var st: c.struct_stat = undefined;
@@ -131,6 +151,18 @@ pub fn statEntry(arena: std.mem.Allocator, dir: []const u8, name: []const u8) ?E
         var fst: c.struct_stat = undefined;
         if (c.stat(full, &fst) == 0) e.tdir = (fst.st_mode & c.S_IFMT) == c.S_IFDIR;
     }
+    if (attrs.len > 0) {
+        const values = arena.alloc([]const u8, attrs.len) catch return null;
+        for (attrs, 0..) |attr, i| {
+            values[i] = "";
+            var name_z: [256:0]u8 = undefined;
+            if (attr.len == 0 or attr.len >= name_z.len) continue;
+            @memcpy(name_z[0..attr.len], attr);
+            name_z[attr.len] = 0;
+            if (getAttr(arena, full, &name_z)) |v| values[i] = v;
+        }
+        e.attrs = values;
+    }
     if (comptime is_linux) {
         var tag_buf: [256]u8 = undefined;
         const tn = c.lgetxattr(full, TAGS_XATTR, &tag_buf, tag_buf.len);
@@ -144,6 +176,59 @@ pub fn statEntry(arena: std.mem.Allocator, dir: []const u8, name: []const u8) ?E
 
 /// The xattr backing file tags (comma-separated UTF-8).
 pub const TAGS_XATTR = "user.sketerm.tags";
+
+/// Read one extended attribute; null when absent, unreadable, or not
+/// valid UTF-8 (the browser shows attributes as text).
+pub fn getAttr(arena: std.mem.Allocator, path: [*:0]const u8, name: [*:0]const u8) ?[]const u8 {
+    if (comptime !is_linux) return null;
+    var buf: [MAX_ATTR_VALUE]u8 = undefined;
+    const n = c.lgetxattr(path, name, &buf, buf.len);
+    if (n <= 0) return null;
+    const value = buf[0..@intCast(n)];
+    if (!std.unicode.utf8ValidateSlice(value)) return null;
+    return arena.dupe(u8, value) catch null;
+}
+
+/// Set (or remove, with an empty value) one extended attribute.
+/// Refuses anything outside the `user.` namespace: the browser must
+/// not be a path to editing security or system attributes.
+pub fn setAttr(path: [*:0]const u8, name: []const u8, value: []const u8) bool {
+    if (comptime !is_linux) return false;
+    if (!std.mem.startsWith(u8, name, "user.")) return false;
+    var name_z: [256:0]u8 = undefined;
+    if (name.len >= name_z.len) return false;
+    @memcpy(name_z[0..name.len], name);
+    name_z[name.len] = 0;
+    if (value.len == 0) {
+        _ = c.lremovexattr(path, &name_z);
+        return true; // absent == cleared
+    }
+    if (value.len > MAX_ATTR_VALUE) return false;
+    return c.lsetxattr(path, &name_z, value.ptr, value.len, 0) == 0;
+}
+
+/// Every `user.` attribute on one file, names and values.
+pub fn listAttrs(arena: std.mem.Allocator, path: [*:0]const u8) []const Attr {
+    if (comptime !is_linux) return &.{};
+    var names: [16 * 1024]u8 = undefined;
+    const n = c.llistxattr(path, &names, names.len);
+    if (n <= 0) return &.{};
+    var out: std.ArrayList(Attr) = .empty;
+    var it = std.mem.splitScalar(u8, names[0..@intCast(n)], 0);
+    while (it.next()) |name| {
+        if (name.len == 0 or !std.mem.startsWith(u8, name, "user.")) continue;
+        var name_z: [256:0]u8 = undefined;
+        if (name.len >= name_z.len) continue;
+        @memcpy(name_z[0..name.len], name);
+        name_z[name.len] = 0;
+        const value = getAttr(arena, path, &name_z) orelse "(binary)";
+        out.append(arena, .{
+            .name = arena.dupe(u8, name) catch continue,
+            .value = value,
+        }) catch break;
+    }
+    return out.items;
+}
 
 /// Set (or clear with "") the tags xattr. Linux-only; elsewhere a
 /// described error.
@@ -166,6 +251,10 @@ pub const Listing = struct {
 /// the per-entry stat chatter of network FS emulation. Non-UTF-8 names
 /// are skipped (JSON cannot carry them).
 pub fn listDir(arena: std.mem.Allocator, dir_path: []const u8, max: usize) error{OpenFailed}!Listing {
+    return listDirAttrs(arena, dir_path, max, &.{});
+}
+
+pub fn listDirAttrs(arena: std.mem.Allocator, dir_path: []const u8, max: usize, attrs: []const []const u8) error{OpenFailed}!Listing {
     var z_buf: [4096]u8 = undefined;
     const dz = pathz.pathZ(&z_buf, dir_path) catch return error.OpenFailed;
     const dir = c.opendir(dz) orelse return error.OpenFailed;
@@ -182,7 +271,7 @@ pub fn listDir(arena: std.mem.Allocator, dir_path: []const u8, max: usize) error
             truncated = true;
             break;
         }
-        const e = statEntry(arena, dir_path, name) orelse continue;
+        const e = statEntryAttrs(arena, dir_path, name, attrs) orelse continue;
         entries.append(arena, e) catch break;
     }
     sortEntries(entries.items);

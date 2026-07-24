@@ -422,6 +422,7 @@ pub const Fs = struct {
             src_host: []const u8 = "",
             dst_host: []const u8 = "",
             client_token: []const u8 = "",
+            attrs: []const u8 = "",
         };
         var b: Base = .{ .req = req, .op = op };
         inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |fld| {
@@ -460,6 +461,11 @@ pub const Fs = struct {
         d.kind = try a.dupe(u8, e.kind);
         if (e.target) |t| d.target = try a.dupe(u8, t);
         d.tags = try a.dupe(u8, e.tags);
+        if (e.attrs.len > 0) {
+            const values = try a.alloc([]const u8, e.attrs.len);
+            for (e.attrs, 0..) |v, i| values[i] = try a.dupe(u8, v);
+            d.attrs = values;
+        }
         return d;
     }
 
@@ -469,6 +475,19 @@ pub const Fs = struct {
         const req = self.nextReq();
         try self.sendOp("open_view", req, .{ .path = path, .view = view_id });
         return self.collectListing(req);
+    }
+
+    /// One-shot listing whose entries also carry the values of
+    /// `attrs` (comma-separated user.* names), in request order.
+    pub fn listAttrs(self: *Fs, path: []const u8, attrs: []const u8) Error!Listing {
+        const req = self.nextReq();
+        try self.sendOp("list", req, .{ .path = path, .attrs = attrs });
+        return self.collectListing(req);
+    }
+
+    /// Set (or remove, with an empty value) one extended attribute.
+    pub fn attrSet(self: *Fs, path: []const u8, name: []const u8, value: []const u8) Error!void {
+        try self.simpleOp("attr_set", .{ .path = path, .pattern = name, .to = value });
     }
 
     /// One-shot listing, no subscription.

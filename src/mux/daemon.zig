@@ -1244,9 +1244,13 @@ const FsView = struct {
     /// The watched directory vanished (IN_DELETE_SELF & co) — the
     /// client got `gone:true`; kept only until it closes the view.
     gone: bool = false,
+    /// Comma-separated extended-attribute names this view asked for;
+    /// deltas must carry the same attributes as the initial listing.
+    attrs: []u8 = &.{},
 
     fn deinit(self: *FsView) void {
         self.allocator.free(self.path);
+        if (self.attrs.len > 0) self.allocator.free(self.attrs);
         self.allocator.destroy(self);
     }
 };
@@ -3060,6 +3064,9 @@ pub const Daemon = struct {
         src_host: []const u8 = "",
         dst_host: []const u8 = "",
         client_token: []const u8 = "",
+        /// Comma-separated extended-attribute names to include with
+        /// every entry (listings, stat and deltas).
+        attrs: []const u8 = "",
     };
 
     /// One change inside an fs_delta. upsert carries `entry`; del only
@@ -3103,7 +3110,7 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, r.op, "open_view")) {
             self.fsOpenView(cl, r);
         } else if (std.mem.eql(u8, r.op, "list")) {
-            _ = self.fsSendListing(cl, r.req, r.path);
+            _ = self.fsSendListing(cl, r.req, r.path, r.attrs);
         } else if (std.mem.eql(u8, r.op, "stat")) {
             self.fsStat(cl, r);
         } else if (std.mem.eql(u8, r.op, "read")) {
@@ -3169,6 +3176,26 @@ pub const Daemon = struct {
             const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
             const rc = if (std.mem.eql(u8, r.op, "rmdir")) c.rmdir(p) else c.unlink(p);
             if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+        } else if (std.mem.eql(u8, r.op, "attr_list")) {
+            var z: [4096]u8 = undefined;
+            const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+            var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena_state.deinit();
+            cl.queueJson(.fs_reply, .{
+                .req = r.req,
+                .ok = true,
+                .attrs = fsserve.listAttrs(arena_state.allocator(), p),
+            });
+        } else if (std.mem.eql(u8, r.op, "attr_set")) {
+            // `pattern` = attribute name (user.* only), `to` = value
+            // ("" removes). Attributes travel with the file, so this
+            // is how metadata survives a copy to another host.
+            var z: [4096]u8 = undefined;
+            const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+            if (!std.mem.startsWith(u8, r.pattern, "user."))
+                return fsReplyErr(cl, r.req, "attribute name must start with user.");
+            if (!fsserve.setAttr(p, r.pattern, r.to)) return fsReplyErr(cl, r.req, "xattr set failed");
             cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
         } else if (std.mem.eql(u8, r.op, "tag_set")) {
             // `to` = comma-separated tags ("" clears). Rides the
@@ -3313,12 +3340,18 @@ pub const Daemon = struct {
             self.allocator.destroy(view);
             return fsReplyErr(cl, r.req, "out of memory");
         };
+        const attrs_owned = self.allocator.dupe(u8, r.attrs) catch {
+            self.allocator.free(path_owned);
+            self.allocator.destroy(view);
+            return fsReplyErr(cl, r.req, "out of memory");
+        };
         view.* = .{
             .allocator = self.allocator,
             .client = cl,
             .id = r.view,
             .path = path_owned,
             .wd = wd,
+            .attrs = attrs_owned,
         };
         self.fs_views.append(self.allocator, view) catch {
             view.deinit();
@@ -3326,7 +3359,7 @@ pub const Daemon = struct {
         };
         // Listing failure (dir vanished between checks) → the open as
         // a whole failed; the view must not linger daemon-side.
-        if (!self.fsSendListing(cl, r.req, canon))
+        if (!self.fsSendListing(cl, r.req, canon, r.attrs))
             self.dropFsViewAt(self.fs_views.items.len - 1);
     }
 
@@ -3360,13 +3393,36 @@ pub const Daemon = struct {
         v.deinit();
     }
 
+    /// Cap on how many attributes one listing may carry per entry:
+    /// each name costs an lgetxattr per entry, so the column set is
+    /// bounded rather than trusted.
+    const MAX_ATTR_NAMES = 8;
+
+    /// Split a comma-separated attribute request into `buf`, keeping
+    /// only `user.`-namespaced names.
+    fn splitAttrs(spec: []const u8, buf: *[MAX_ATTR_NAMES][]const u8) []const []const u8 {
+        if (spec.len == 0) return &.{};
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, spec, ',');
+        while (it.next()) |raw| {
+            if (n >= buf.len) break;
+            const name = std.mem.trim(u8, raw, " ");
+            if (name.len == 0 or !std.mem.startsWith(u8, name, "user.")) continue;
+            buf[n] = name;
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
     /// Rich listing as a chunk run of fs_reply frames (`more:true`
     /// until the last) — one request, one round trip, every entry
     /// fully stat'ed. This is the anti-GVFS listing shape.
-    fn fsSendListing(self: *Daemon, cl: *Client, req: u32, dir_path: []const u8) bool {
+    fn fsSendListing(self: *Daemon, cl: *Client, req: u32, dir_path: []const u8, attr_spec: []const u8) bool {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
-        const l = fsserve.listDir(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES) catch {
+        var attr_buf: [MAX_ATTR_NAMES][]const u8 = undefined;
+        const attrs = splitAttrs(attr_spec, &attr_buf);
+        const l = fsserve.listDirAttrs(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES, attrs) catch {
             fsReplyErr(cl, req, "cannot open directory");
             return false;
         };
@@ -3626,7 +3682,8 @@ pub const Daemon = struct {
                     // A rename target may exist even when the event says
                     // MOVED_FROM (rapid re-create) — trust a fresh stat
                     // over the event kind.
-                    if (fsserve.statEntry(arena, v.path, ev.name)) |e| {
+                    var attr_buf: [MAX_ATTR_NAMES][]const u8 = undefined;
+                    if (fsserve.statEntryAttrs(arena, v.path, ev.name, splitAttrs(v.attrs, &attr_buf))) |e| {
                         pv.changes.append(arena, .{ .op = "upsert", .name = e.name, .entry = e }) catch {};
                     } else {
                         // Stat failed → the entry is gone now, whatever
