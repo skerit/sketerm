@@ -9390,3 +9390,59 @@ checkboxes, recursive apply verified with stat on four entries), and a
 dual-pane split where F5 copied two files, F6 moved one, and a
 colliding F5 raised the conflict dialog in the TARGET pane (Keep Both
 produced alpha.txt-copy). Rig torn down by exact PID.
+
+## 2026-07-25: metadata — attributes, emblems, richer properties
+
+Section 9 of the inventory, on top of the tags that already existed.
+
+**Extended attributes are first-class.** fsserve grew get/set/list for
+`user.*` attributes (anything outside that namespace is refused: the
+browser must not be a path to editing security attributes), and a
+listing can now carry the values of attributes the CLIENT asked for —
+`attrs` on open_view/list, remembered per view so pushed deltas re-stat
+with the same set. New ops: `attr_list` (all user attributes of one
+path) and `attr_set` (set, or remove with an empty value). The daemon
+caps a listing at 8 attribute names, since each one costs an lgetxattr
+per entry.
+
+**Attribute columns.** A details view can show any `user.*` attribute
+as a column: values ride the listing itself, so a remote attribute
+column costs no round trip per row. Columns are added and removed in
+the column picker, sort by value (entries WITHOUT the attribute sort
+last either way — an empty value is absence, not "smallest"), and
+persist per tab in `TabState.attr_columns`. Adding or removing one
+re-SUBSCRIBES the tab's directories: a plain re-list would leave the
+daemon-side view on the old attribute set and the next delta would
+blank the new column (found in live testing).
+
+**Properties grew the metadata half.** All `user.*` attributes are
+listed and editable in place, with an add row; `user.xdg.comment` and
+`user.xdg.origin.url` render as "Comment" and "Where from". Files also
+get an on-demand SHA-256 (a daemon hash job, so a remote checksum never
+streams the file here), the current default application with a Change…
+button that opens the same Open With chooser, and for audio/video/PDF
+an on-demand media-info line from the preview helper's ffprobe/pdfinfo
+metadata. The one-off size probe became a general `LabelProbe` list
+feeding size, checksum, and media labels.
+
+**Emblems.** `src/filebrowser/emblems.zig` (GTK-free, unit-tested)
+parses `$XDG_CONFIG_HOME/sketerm/emblems.conf`: `*.md = icon-name` for
+name globs, `attr:user.rating=5 = icon-name` for attribute predicates
+(`attr:user.foo` alone matches presence). First match wins. The
+attributes the rules reference are appended to the listing's attribute
+request automatically, so a badge needs no column and no extra query.
+This is the rule system the inventory asks for instead of a fixed
+overlay registry.
+
+Verification: unit suite 859 passed / 6 skipped / 0 failed (+2 emblem
+tests); smoke-fs grew an attribute stage (set, per-entry values in a
+listing, namespace refusal, clear-removes-rather-than-empties) and
+passes in both modes; smoke-broker, smoke-mcp, smoke-e2e PASS; GUI +
+mux + musl + aarch64-macOS builds; mux still links libc/libm only.
+Live in an isolated Xvfb rig: a `user.rating` column showing 3/blank/5
+straight from the listing, sorting by it with unrated entries last, an
+external `setfattr` arriving as a live delta (5 -> 7) in the column,
+Properties showing Where from / Comment / rating with working in-place
+edits (verified with getfattr), a checksum matching sha256sum, "Opens
+with: Vim", and emblem badges from both a glob rule and an attribute
+rule with no column configured. Rig torn down by exact PID.
