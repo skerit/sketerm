@@ -9321,3 +9321,72 @@ Direct thumbnail/preview helper runs confirmed spec-conformant PNGs
 second run. Full matrix re-run green: 855 passed / 6 skipped / 0 failed,
 smoke-fs / smoke-broker / smoke-mcp / smoke-e2e PASS, GUI + mux + musl +
 aarch64-macOS builds, mux still libc/libm only.
+
+## 2026-07-25: type-ahead, configurable columns, properties, dual-pane
+
+Four inventory items from sections 1-4 and 9.
+
+**Type-ahead jump.** Plain printable keys in a details/compact listing
+build a prefix and jump to the first matching name (case-insensitive),
+shown in the status bar; Backspace shortens it, Escape clears it, and a
+1.2s idle gap starts a fresh prefix. Handled in the browser's
+bubble-phase key controller, so a focused entry keeps its own input, and
+the prefix resets on navigation.
+
+**Configurable columns.** `browser_model.Column` (kind, perms, owner,
+group, size, mtime, ctime, target) carries its own title, fixed width
+and sort key; the details header is now REBUILT from the tab's column
+set rather than being three fixed buttons, every column header sorts,
+and a picker at the right end toggles columns. Hiding the column a view
+is sorted by falls back to name order. The set persists per tab in
+`TabState.columns`; an older state file without the key keeps the
+default (perms, size, mtime).
+
+**Properties.** Replaced the one-label popover: identity, location,
+host, kind + MIME (guessed from the NAME so a remote entry is never
+read), symlink target, size (on-disk figure omitted where st_blocks is
+0), link count, mtime/atime/ctime, an on-demand recursive size, a 3x3
+permission grid plus setuid/setgid/sticky wired two-way to an octal
+entry, uid/gid entries, and "apply to enclosed files and folders".
+Recursive size and recursive chmod/chown are new daemon job verbs
+(`dir_size`, `perm_tree` in fsjob.zig): both walk on the host that owns
+the tree, and perm_tree never follows symlinks, so a link inside the
+tree cannot redirect the change outside it. dir_size is ephemeral (no
+journal, dies with its client); the browser holds one probe at a time
+with a g_object_ref'd label so a closed dialog cannot dangle.
+
+**Dual-pane source/target.** A window hook resolves the other browser
+face in the same sketerm tab from the pane-tree model. F5 copies the
+selection there, F6 moves it, and both appear in the context menu
+labelled with the destination. The paste path was generalized: source
+host, cut-ness and clipboard ownership are now parameters, so a
+dual-pane send and Paste Here share one conflict dialog. A new
+`new_browser_split` action (palette: "Split into Two File Browsers")
+creates the layout.
+
+Two pre-existing bugs surfaced while wiring that action: `focusedPane`
+and `splitFocused` matched only a pane's GLArea, so EVERY focused-pane
+action (split, close pane) silently did nothing while a browser face
+had focus; both now climb the widget tree (`Window.paneForWidget`).
+`BrowserView.attach` on a pane that already had a browser orphaned the
+first one; it now returns the existing view.
+
+GTK gotcha worth keeping: a popover with no `pointing_to` rect and a
+large child silently fails to map. Properties was invisible until it
+got an explicit rect (the same workaround Open With already used). And
+a popover parented to a header button dies when the header rebuilds:
+the column picker parents to the page instead, with pointing_to
+computed from the button's bounds.
+
+Verification: unit suite 857 passed / 6 skipped / 0 failed (+3 model
+tests); smoke-fs grew dir_size/perm_tree stages (recursive apply
+confirmed on a subdirectory) and passes in both modes; smoke-broker,
+smoke-mcp, smoke-e2e PASS; GUI + mux + musl + aarch64-macOS builds;
+mux still links libc/libm only. Live in an isolated Xvfb rig: column
+picker toggling three columns in one session with rows aligned to the
+header, type-ahead jumps plus a no-match prefix, properties on a
+directory (recursive size 7 B in 3 items, octal 0700 syncing the
+checkboxes, recursive apply verified with stat on four entries), and a
+dual-pane split where F5 copied two files, F6 moved one, and a
+colliding F5 raised the conflict dialog in the TARGET pane (Keep Both
+produced alpha.txt-copy). Rig torn down by exact PID.
