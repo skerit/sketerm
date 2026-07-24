@@ -687,6 +687,12 @@ pub const App = struct {
 
         if (!pollIn(self.conn.fd, wait_ms)) return false;
         if (!self.conn.fillAvailable()) {
+            // EOF — but the read that hit it may have buffered the final
+            // frames (the daemon's post-mortem log push + `.exit`). Peel
+            // everything complete BEFORE declaring the stream over:
+            // pumpOnce refuses to run once `exited` is set, so anything
+            // left unprocessed here (a gdb backtrace) is lost forever.
+            while (self.takeOne()) {}
             self.exited = true;
             return false;
         }
@@ -1047,7 +1053,16 @@ pub const App = struct {
             }) catch return Error.OutOfMemory;
             defer self.allocator.free(req);
             var seen = self.log_seq;
-            self.conn.sendFrame(.log_get, req) catch return Error.NotConnected;
+            self.conn.sendFrame(.log_get, req) catch {
+                // The worker is already gone (EPIPE) but may have flushed
+                // its post-mortem push before dying — consume the tail of
+                // the stream so the stash below serves the final log
+                // instead of reporting "no log data".
+                _ = self.drainLive(2_000);
+                if (self.log_buf.items.len == 0) return Error.NotConnected;
+                const json = self.allocator.dupe(u8, self.log_buf.items) catch return Error.OutOfMemory;
+                return .{ .json = json, .stale = false };
+            };
             const deadline = nowMs() + timeout_ms;
             var matched = false;
             while (nowMs() < deadline) {
@@ -2410,4 +2425,52 @@ test "pctDiffRegion: scoped diff, clamping, out-of-bounds rects" {
     try t.expectApproxEqAbs(@as(f64, 0.0), pctDiffRegion(&cur, &base, 4, .{ .x = 8, .y = 8, .w = 2, .h = 2 }), 0.001);
     // Mismatched buffers stay 100 regardless of region.
     try t.expectApproxEqAbs(@as(f64, 100.0), pctDiffRegion(cur[0..32], &base, 4, .{ .x = 0, .y = 0, .w = 2, .h = 2 }), 0.001);
+}
+
+test "post-mortem log push + exit are peeled when EOF lands in the same read" {
+    const t = std.testing;
+    const a = t.allocator;
+    var fds: [2]c_int = undefined;
+    try t.expect(c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) == 0);
+    var app = App{
+        .allocator = a,
+        .conn = .{ .allocator = a, .fd = fds[0] },
+        .name = @constCast("test"),
+    };
+    defer {
+        app.log_buf.deinit(a);
+        app.conn.rbuf.deinit(a);
+        app.conn.wbuf.deinit(a);
+        _ = c.close(fds[0]);
+        testTeardown(&app);
+    }
+
+    // Size the stream to EXACTLY one fillAvailable read buffer (16384):
+    // the first read() consumes both frames, the second hits EOF in the
+    // SAME fillAvailable call — the branch that used to strand them.
+    const read_buf = 16384;
+    const exit_frame = 5 + 4;
+    const log_payload_len = read_buf - exit_frame - 5;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(a);
+    const head = "{\"lines\":[{\"id\":1,\"t\":0,\"text\":\"SENTINEL-BEFORE-CRASH\"}],\"pad\":\"";
+    try payload.appendSlice(a, head);
+    while (payload.items.len < log_payload_len - 2) try payload.append(a, 'x');
+    try payload.appendSlice(a, "\"}");
+    try t.expectEqual(@as(usize, log_payload_len), payload.items.len);
+
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(a);
+    try wire.appendFrame(&stream, a, .log_data, payload.items);
+    var st: [4]u8 = undefined;
+    std.mem.writeInt(i32, &st, -11, .little);
+    try wire.appendFrame(&stream, a, .exit, &st);
+    try t.expectEqual(@as(usize, read_buf), stream.items.len);
+    try t.expect(c.write(fds[1], stream.items.ptr, stream.items.len) == stream.items.len);
+    _ = c.close(fds[1]);
+
+    while (app.pumpOnce(100)) {}
+    try t.expect(app.exited);
+    try t.expectEqual(@as(i32, -11), app.exit_status);
+    try t.expectEqualSlices(u8, payload.items, app.log_buf.items);
 }

@@ -2980,7 +2980,10 @@ fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]
                 );
                 return appErr(arena, msg);
             },
-            else => return appErr(arena, "no log data for this app"),
+            else => return appErr(arena, if (app.exited)
+                "the app exited and its log stash is empty — no output was captured before exit (a known app id, distinct from 'unknown app')"
+            else
+                "log unavailable: the connection to the app's daemon was lost"),
         };
         const reply = fetch.json;
         defer app_state.allocator.free(reply);
