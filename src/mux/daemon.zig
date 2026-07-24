@@ -3086,6 +3086,8 @@ pub const Daemon = struct {
             self.fsStat(cl, r);
         } else if (std.mem.eql(u8, r.op, "read")) {
             self.fsRead(cl, r);
+        } else if (std.mem.eql(u8, r.op, "apps")) {
+            self.fsApps(cl, r);
         } else if (std.mem.eql(u8, r.op, "mkdir")) {
             var z: [4096]u8 = undefined;
             const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
@@ -3182,6 +3184,25 @@ pub const Daemon = struct {
             if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
             cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
         } else if (std.mem.eql(u8, r.op, "statfs")) {
+            // musl's struct statvfs contains an anonymous bitfield
+            // that translate-c cannot represent (the type comes out
+            // opaque), so musl-portable daemons serve conservative
+            // defaults instead of real filesystem numbers.
+            if (comptime @typeInfo(c.struct_statvfs) == .@"opaque") {
+                cl.queueJson(.fs_reply, .{
+                    .req = r.req,
+                    .ok = true,
+                    .bsize = @as(u64, 4096),
+                    .frsize = @as(u64, 4096),
+                    .blocks = @as(u64, 0),
+                    .bfree = @as(u64, 0),
+                    .bavail = @as(u64, 0),
+                    .files = @as(u64, 0),
+                    .ffree = @as(u64, 0),
+                    .namemax = @as(u64, 255),
+                });
+                return;
+            }
             var z: [4096]u8 = undefined;
             const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
             var st: c.struct_statvfs = undefined;
@@ -3368,6 +3389,89 @@ pub const Daemon = struct {
             .size = size,
             .eof = r.off + got >= size,
         });
+    }
+
+    const AppEntry = struct {
+        name: []const u8,
+        exec: []const u8,
+        mimes: []const u8,
+    };
+
+    /// Enumerate this host's launchable .desktop applications in one
+    /// reply, so a remote "Open With" costs one round trip instead of
+    /// one per .desktop file. Bounded: MAX_APPS entries, 8KB/file.
+    fn fsApps(self: *Daemon, cl: *Client, r: FsOpReq) void {
+        const MAX_APPS = 400;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var apps: std.ArrayList(AppEntry) = .empty;
+
+        var home_buf: [4096]u8 = undefined;
+        const home_apps: ?[]const u8 = if (c.getenv("HOME")) |h|
+            std.fmt.bufPrint(&home_buf, "{s}/.local/share/applications", .{
+                std.mem.span(@as([*:0]const u8, @ptrCast(h))),
+            }) catch null
+        else
+            null;
+        const dirs = [_]?[]const u8{
+            home_apps,
+            "/usr/local/share/applications",
+            "/usr/share/applications",
+        };
+        for (dirs) |maybe_dir| {
+            const dir_path = maybe_dir orelse continue;
+            var dz: [4096]u8 = undefined;
+            const dp = pathZ(&dz, dir_path) catch continue;
+            const d = c.opendir(dp) orelse continue;
+            defer _ = c.closedir(d);
+            while (c.readdir(d)) |de| {
+                if (apps.items.len >= MAX_APPS) break;
+                const fname = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
+                if (!std.mem.endsWith(u8, fname, ".desktop")) continue;
+                var fz: [4400:0]u8 = undefined;
+                const fp = std.fmt.bufPrintZ(&fz, "{s}/{s}", .{ dir_path, fname }) catch continue;
+                const f = c.fopen(fp.ptr, "rb") orelse continue;
+                var content: [8192]u8 = undefined;
+                const n = c.fread(&content, 1, content.len, f);
+                _ = c.fclose(f);
+                var name: []const u8 = "";
+                var exec: []const u8 = "";
+                var mimes: []const u8 = "";
+                var is_app = false;
+                var hidden = false;
+                var in_entry = false;
+                var it = std.mem.tokenizeScalar(u8, content[0..n], '\n');
+                while (it.next()) |line_raw| {
+                    const line = std.mem.trim(u8, line_raw, " \t\r");
+                    if (line.len > 0 and line[0] == '[') {
+                        in_entry = std.mem.eql(u8, line, "[Desktop Entry]");
+                        continue;
+                    }
+                    if (!in_entry) continue;
+                    if (std.mem.startsWith(u8, line, "Name=") and name.len == 0) name = line[5..];
+                    if (std.mem.startsWith(u8, line, "Exec=") and exec.len == 0) exec = line[5..];
+                    if (std.mem.startsWith(u8, line, "MimeType=")) mimes = line[9..];
+                    if (std.mem.startsWith(u8, line, "Type=")) is_app = std.mem.eql(u8, line[5..], "Application");
+                    if (std.mem.startsWith(u8, line, "NoDisplay=") or std.mem.startsWith(u8, line, "Hidden=")) {
+                        const v = line[std.mem.indexOfScalar(u8, line, '=').? + 1 ..];
+                        if (std.mem.eql(u8, v, "true")) hidden = true;
+                    }
+                }
+                if (!is_app or hidden or name.len == 0 or exec.len == 0) continue;
+                // User-dir entries shadow system ones of the same name.
+                const dup = for (apps.items) |a| {
+                    if (std.mem.eql(u8, a.name, name)) break true;
+                } else false;
+                if (dup) continue;
+                apps.append(arena, .{
+                    .name = arena.dupe(u8, name) catch continue,
+                    .exec = arena.dupe(u8, exec) catch continue,
+                    .mimes = arena.dupe(u8, mimes) catch continue,
+                }) catch break;
+            }
+        }
+        cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .apps = apps.items });
     }
 
     /// fs_write payload: [u32 req][u64 off][u8 flags][u16 path_len]

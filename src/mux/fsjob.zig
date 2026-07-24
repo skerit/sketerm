@@ -639,7 +639,7 @@ fn searchDir(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []cons
         if (!content) {
             if (nameMatches(pattern, e.name)) {
                 state.matches += 1;
-                emit(.{ .ev = "match", .path = full, .kind = e.kind, .size = e.size });
+                emit(.{ .ev = "match", .path = full, .kind = e.kind, .size = e.size, .mtime_ms = e.mtime_ms });
             }
         } else if (std.mem.eql(u8, e.kind, "file") and e.size <= MAX_GREP_FILE) {
             grepFile(full, state);
