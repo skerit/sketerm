@@ -14,11 +14,17 @@
 //! verification, never size trust.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
 const fsserve = @import("fsserve.zig");
+const fsjournal = @import("fsjournal.zig");
+const muxclient = @import("client.zig");
+const fsdrive = @import("../ipc/fsdrive.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
+
+fn sigNoop(_: c_int) callconv(.c) void {}
 
 pub const CHUNK: usize = 256 * 1024;
 /// Emit a progress line at least every this many bytes.
@@ -29,7 +35,11 @@ pub const Spec = struct {
     src: []const u8 = "",
     dst: []const u8 = "",
     pattern: []const u8 = "",
+    src_host: []const u8 = "",
+    dst_host: []const u8 = "",
     @"resume": bool = false,
+    job_id: u64 = 0,
+    journal_dir: []const u8 = "",
 };
 
 /// Search caps: a runaway query costs a bounded stream, never a
@@ -95,6 +105,9 @@ const Progress = struct {
 /// Read the one-line JSON spec from stdin and run the job. The
 /// process exists for exactly this operation.
 pub fn serve(allocator: std.mem.Allocator) u8 {
+    // A daemon restart closes the progress pipe. The operation must
+    // continue rather than dying from SIGPIPE while reporting progress.
+    _ = c.signal(c.SIGPIPE, &sigNoop);
     var spec_buf: [16 * 1024]u8 = undefined;
     var len: usize = 0;
     while (len < spec_buf.len) {
@@ -111,12 +124,436 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
     defer parsed.deinit();
     const spec = parsed.value;
 
-    if (std.mem.eql(u8, spec.op, "copy")) return runCopy(allocator, spec);
-    if (std.mem.eql(u8, spec.op, "delete_tree")) return runDeleteTree(spec);
-    if (std.mem.eql(u8, spec.op, "hash")) return runHash(spec);
-    if (std.mem.eql(u8, spec.op, "find")) return runSearch(allocator, spec, false);
-    if (std.mem.eql(u8, spec.op, "grep")) return runSearch(allocator, spec, true);
-    return emitError("unknown job op");
+    const rc: u8 = if (std.mem.eql(u8, spec.op, "copy"))
+        runCopy(allocator, spec)
+    else if (std.mem.eql(u8, spec.op, "delete_tree"))
+        runDeleteTree(spec)
+    else if (std.mem.eql(u8, spec.op, "hash"))
+        runHash(spec)
+    else if (std.mem.eql(u8, spec.op, "find"))
+        runSearch(allocator, spec, false)
+    else if (std.mem.eql(u8, spec.op, "grep"))
+        runSearch(allocator, spec, true)
+    else if (std.mem.eql(u8, spec.op, "extract"))
+        runExtract(spec)
+    else if (std.mem.eql(u8, spec.op, "archive_create"))
+        runArchiveCreate(spec)
+    else if (std.mem.eql(u8, spec.op, "trash"))
+        runTrash(spec)
+    else if (std.mem.eql(u8, spec.op, "trash_restore"))
+        runTrashRestore(spec)
+    else if (std.mem.eql(u8, spec.op, "cross_copy"))
+        runCrossCopy(allocator, spec)
+    else if (std.mem.eql(u8, spec.op, "panelize"))
+        runPanelize(spec)
+    else if (std.mem.eql(u8, spec.op, "live_find"))
+        runLiveFind(allocator, spec)
+    else
+        emitError("unknown job op");
+    if (spec.job_id != 0 and spec.journal_dir.len > 0) {
+        fsjournal.save(spec.journal_dir, .{
+            .id = spec.job_id,
+            .op = spec.op,
+            .state = if (rc == 0) "done" else "failed",
+            .src = spec.src,
+            .dst = spec.dst,
+            .pattern = spec.pattern,
+            .src_host = spec.src_host,
+            .dst_host = spec.dst_host,
+            .@"resume" = spec.@"resume",
+            .pid = c.getpid(),
+        }) catch {};
+    }
+    return rc;
+}
+
+// ── archives ─────────────────────────────────────────────────────
+
+fn unsafeArchiveMember(name_in: []const u8) bool {
+    var name = name_in;
+    while (std.mem.startsWith(u8, name, "./")) name = name[2..];
+    if (name.len == 0 or name[0] == '/') return true;
+    var parts = std.mem.splitScalar(u8, name, '/');
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, "..")) return true;
+    }
+    return false;
+}
+
+/// List through bsdtar without a shell and reject archive members that
+/// could escape the selected extraction directory.
+fn archiveMembersSafe(archive: []const u8) bool {
+    var az: [4096:0]u8 = undefined;
+    const ap = std.fmt.bufPrintZ(&az, "{s}", .{archive}) catch return false;
+    var pipefd: [2]c_int = undefined;
+    if (c.pipe(&pipefd) != 0) return false;
+    const pid = c.fork();
+    if (pid < 0) {
+        _ = c.close(pipefd[0]);
+        _ = c.close(pipefd[1]);
+        return false;
+    }
+    if (pid == 0) {
+        _ = c.dup2(pipefd[1], 1);
+        _ = c.close(pipefd[0]);
+        _ = c.close(pipefd[1]);
+        const argv = [_:null]?[*:0]const u8{ "bsdtar", "-tf", ap.ptr, null };
+        _ = c.execvp("bsdtar", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    _ = c.close(pipefd[1]);
+    var line: [4096]u8 = undefined;
+    var len: usize = 0;
+    var safe = true;
+    var buf: [8192]u8 = undefined;
+    read_loop: while (true) {
+        const n = c.read(pipefd[0], &buf, buf.len);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        if (n <= 0) break;
+        for (buf[0..@intCast(n)]) |ch| {
+            if (ch == '\n') {
+                if (unsafeArchiveMember(line[0..len])) {
+                    safe = false;
+                    break :read_loop;
+                }
+                len = 0;
+            } else if (len < line.len) {
+                line[len] = ch;
+                len += 1;
+            } else {
+                safe = false;
+                break :read_loop;
+            }
+        }
+    }
+    if (safe and len > 0) safe = !unsafeArchiveMember(line[0..len]);
+    _ = c.close(pipefd[0]);
+    if (!safe) _ = c.kill(pid, c.SIGKILL);
+    var st: c_int = 0;
+    while (c.waitpid(pid, &st, 0) < 0 and std.posix.errno(@as(c_int, -1)) == .INTR) {}
+    return safe and c.WIFEXITED(st) and c.WEXITSTATUS(st) == 0;
+}
+
+fn runArgv(argv: []const ?[*:0]const u8) bool {
+    const pid = c.fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        _ = c.execvp(argv[0].?, @ptrCast(@constCast(argv.ptr)));
+        c._exit(127);
+    }
+    var st: c_int = 0;
+    while (c.waitpid(pid, &st, 0) < 0 and std.posix.errno(@as(c_int, -1)) == .INTR) {}
+    return c.WIFEXITED(st) and c.WEXITSTATUS(st) == 0;
+}
+
+fn runExtract(spec: Spec) u8 {
+    if (spec.dst.len == 0) return emitError("extract needs destination directory");
+    if (!archiveMembersSafe(spec.src)) return emitError("archive is unreadable or contains unsafe paths");
+    var dz: [4096]u8 = undefined;
+    const dp = pathz.pathZ(&dz, spec.dst) catch return emitError("destination path too long");
+    if (c.mkdir(dp, 0o755) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST)
+        return emitErrno("mkdir destination");
+    var az: [4096:0]u8 = undefined;
+    const ap = std.fmt.bufPrintZ(&az, "{s}", .{spec.src}) catch return emitError("archive path too long");
+    emit(.{ .ev = "progress", .done = @as(u64, 0), .total = @as(u64, 0) });
+    const argv = [_:null]?[*:0]const u8{
+        "bsdtar", "-xf", ap.ptr, "-C", dp, "--no-same-owner", "--safe-writes", null,
+    };
+    if (!runArgv(&argv)) return emitError("archive extraction failed (bsdtar required)");
+    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1) });
+    return 0;
+}
+
+fn runArchiveCreate(spec: Spec) u8 {
+    if (spec.dst.len == 0) return emitError("archive_create needs destination archive");
+    var st: c.struct_stat = undefined;
+    if (!statOf(spec.src, &st, false)) return emitErrno("stat source");
+    const parent = std.fs.path.dirname(spec.src) orelse "/";
+    const base = std.fs.path.basename(spec.src);
+    var pz: [4096:0]u8 = undefined;
+    var bz: [4096:0]u8 = undefined;
+    var dz: [4096:0]u8 = undefined;
+    const pp = std.fmt.bufPrintZ(&pz, "{s}", .{parent}) catch return emitError("source path too long");
+    const bp = std.fmt.bufPrintZ(&bz, "{s}", .{base}) catch return emitError("source path too long");
+    const dp = std.fmt.bufPrintZ(&dz, "{s}", .{spec.dst}) catch return emitError("archive path too long");
+    emit(.{ .ev = "progress", .done = @as(u64, 0), .total = @as(u64, 0) });
+    const argv = [_:null]?[*:0]const u8{ "bsdtar", "-caf", dp.ptr, "-C", pp.ptr, bp.ptr, null };
+    if (!runArgv(&argv)) return emitError("archive creation failed (bsdtar required or format unsupported)");
+    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1) });
+    return 0;
+}
+
+// ── freedesktop trash ────────────────────────────────────────────
+
+fn trashRoot(buf: []u8) ?[]const u8 {
+    if (c.getenv("XDG_DATA_HOME")) |p| {
+        const base = std.mem.span(@as([*:0]const u8, @ptrCast(p)));
+        return std.fmt.bufPrint(buf, "{s}/Trash", .{base}) catch null;
+    }
+    const homep = c.getenv("HOME") orelse return null;
+    const home = std.mem.span(@as([*:0]const u8, @ptrCast(homep)));
+    return std.fmt.bufPrint(buf, "{s}/.local/share/Trash", .{home}) catch null;
+}
+
+fn ensureTrashDirs(root: []const u8) bool {
+    var files: [4096]u8 = undefined;
+    var info: [4096]u8 = undefined;
+    const fp = std.fmt.bufPrint(&files, "{s}/files", .{root}) catch return false;
+    const ip = std.fmt.bufPrint(&info, "{s}/info", .{root}) catch return false;
+    pathz.makeParentDirs(fp) catch return false;
+    var z: [4096]u8 = undefined;
+    const rz = pathz.pathZ(&z, root) catch return false;
+    if (c.mkdir(rz, 0o700) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST) return false;
+    const fz = pathz.pathZ(&z, fp) catch return false;
+    if (c.mkdir(fz, 0o700) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST) return false;
+    const iz = pathz.pathZ(&z, ip) catch return false;
+    return c.mkdir(iz, 0o700) == 0 or std.posix.errno(@as(c_int, -1)) == .EXIST;
+}
+
+fn appendUrlEscaped(w: *std.Io.Writer, path: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (path) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '/' or ch == '-' or ch == '_' or ch == '.' or ch == '~') {
+            try w.writeByte(ch);
+        } else {
+            try w.writeByte('%');
+            try w.writeByte(hex[ch >> 4]);
+            try w.writeByte(hex[ch & 15]);
+        }
+    }
+}
+
+fn deletionStamp(buf: *[32]u8) []const u8 {
+    var now: c.time_t = c.time(null);
+    var tm: c.struct_tm = undefined;
+    _ = c.localtime_r(&now, &tm);
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+    }) catch "1970-01-01T00:00:00";
+}
+
+fn runTrash(spec: Spec) u8 {
+    if (spec.src.len <= 1) return emitError("refusing to trash root");
+    var root_buf: [4096]u8 = undefined;
+    const root = trashRoot(&root_buf) orelse return emitError("cannot locate trash directory");
+    if (!ensureTrashDirs(root)) return emitErrno("create trash directory");
+    const base = std.fs.path.basename(spec.src);
+    var name_buf: [512]u8 = undefined;
+    var files_buf: [4096]u8 = undefined;
+    var info_buf: [4096]u8 = undefined;
+    var attempt: u32 = 0;
+    var trashed: []const u8 = undefined;
+    var info_path: []const u8 = undefined;
+    while (attempt < 10000) : (attempt += 1) {
+        const name = if (attempt == 0)
+            std.fmt.bufPrint(&name_buf, "{s}", .{base}) catch return emitError("name too long")
+        else
+            std.fmt.bufPrint(&name_buf, "{s}.{d}", .{ base, attempt }) catch return emitError("name too long");
+        trashed = std.fmt.bufPrint(&files_buf, "{s}/files/{s}", .{ root, name }) catch return emitError("path too long");
+        info_path = std.fmt.bufPrint(&info_buf, "{s}/info/{s}.trashinfo", .{ root, name }) catch return emitError("path too long");
+        var z: [4096]u8 = undefined;
+        var st: c.struct_stat = undefined;
+        if (c.lstat(pathz.pathZ(&z, trashed) catch return emitError("path too long"), &st) != 0 and
+            std.posix.errno(@as(c_int, -1)) == .NOENT) break;
+    }
+    if (attempt == 10000) return emitError("cannot allocate unique trash name");
+
+    var text: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&text);
+    w.writeAll("[Trash Info]\nPath=") catch return emitError("trash metadata too large");
+    appendUrlEscaped(&w, spec.src) catch return emitError("trash metadata too large");
+    var stamp_buf: [32]u8 = undefined;
+    w.print("\nDeletionDate={s}\n", .{deletionStamp(&stamp_buf)}) catch return emitError("trash metadata too large");
+    var iz: [4096]u8 = undefined;
+    const ip = pathz.pathZ(&iz, info_path) catch return emitError("path too long");
+    const info = c.fopen(ip, "wx") orelse return emitErrno("create trash metadata");
+    if (c.fwrite(w.buffered().ptr, 1, w.buffered().len, info) != w.buffered().len or c.fclose(info) != 0) {
+        _ = c.unlink(ip);
+        return emitError("write trash metadata failed");
+    }
+    var sz: [4096]u8 = undefined;
+    var tz: [4096]u8 = undefined;
+    if (c.rename(pathz.pathZ(&sz, spec.src) catch return emitError("path too long"),
+        pathz.pathZ(&tz, trashed) catch return emitError("path too long")) != 0)
+    {
+        _ = c.unlink(ip);
+        return emitErrno("move to trash");
+    }
+    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = trashed, .text = info_path });
+    return 0;
+}
+
+fn runTrashRestore(spec: Spec) u8 {
+    if (spec.dst.len == 0) return emitError("trash_restore needs original destination");
+    pathz.makeParentDirs(spec.dst) catch return emitError("cannot create restore parent");
+    var sz: [4096]u8 = undefined;
+    var dz: [4096]u8 = undefined;
+    if (c.rename(pathz.pathZ(&sz, spec.src) catch return emitError("path too long"),
+        pathz.pathZ(&dz, spec.dst) catch return emitError("path too long")) != 0)
+        return emitErrno("restore from trash");
+    if (spec.pattern.len > 0) {
+        var iz: [4096]u8 = undefined;
+        _ = c.unlink(pathz.pathZ(&iz, spec.pattern) catch return emitError("trash info path too long"));
+    }
+    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1) });
+    return 0;
+}
+
+// ── durable cross-host copy coordinator ──────────────────────────
+
+fn connectHostFs(allocator: std.mem.Allocator, host: []const u8) !fsdrive.Fs {
+    const conn = if (host.len == 0)
+        try muxclient.Conn.connectLocalAutostart(allocator)
+    else if (std.mem.startsWith(u8, host, "udp:"))
+        try muxclient.Conn.connectUdp(allocator, host[4..], null)
+    else
+        try muxclient.Conn.connectSsh(allocator, host);
+    return fsdrive.Fs.initConn(allocator, conn);
+}
+
+const CrossCopy = struct {
+    allocator: std.mem.Allocator,
+    src: *fsdrive.Fs,
+    dst: *fsdrive.Fs,
+    progress: Progress = .{},
+    resumed: u64 = 0,
+
+    fn hash(self: *CrossCopy, fs: *fsdrive.Fs, path: []const u8) ?[64]u8 {
+        _ = self;
+        const job = fs.startHash(path) catch return null;
+        const end = fs.waitJobEnd(job, 120_000) catch return null;
+        if (!end.ok or !end.has_hash) return null;
+        return end.hash;
+    }
+
+    fn copyFile(self: *CrossCopy, src_path: []const u8, dst_path: []const u8, size: u64, allow_resume: bool) bool {
+        if (allow_resume) {
+            var arena_final = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena_final.deinit();
+            if (self.dst.statPath(arena_final.allocator(), dst_path)) |e| {
+                if (std.mem.eql(u8, e.kind, "file") and e.size == size) {
+                    const sh = self.hash(self.src, src_path);
+                    const dh = self.hash(self.dst, dst_path);
+                    if (sh != null and dh != null and std.mem.eql(u8, &sh.?, &dh.?)) {
+                        self.progress.add(size);
+                        self.resumed += size;
+                        return true;
+                    }
+                }
+            } else |_| {}
+        }
+        var part_buf: [4096]u8 = undefined;
+        const part = std.fmt.bufPrint(&part_buf, "{s}.skpart", .{dst_path}) catch return false;
+        var off: u64 = 0;
+        if (allow_resume) {
+            var arena_part = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena_part.deinit();
+            if (self.dst.statPath(arena_part.allocator(), part)) |e| {
+                if (std.mem.eql(u8, e.kind, "file") and e.size <= size) off = e.size;
+            } else |_| {}
+        }
+        const resumed_from = off;
+        self.progress.done += off;
+        self.resumed += off;
+        emit(.{ .ev = "progress", .done = self.progress.done, .total = self.progress.total, .resumed_from = self.resumed });
+        var chunk: std.ArrayList(u8) = .empty;
+        defer chunk.deinit(self.allocator);
+        while (off < size) {
+            chunk.clearRetainingCapacity();
+            const want: u32 = @intCast(@min(@as(u64, fsserve.MAX_READ), size - off));
+            _ = self.src.read(src_path, off, want, &chunk) catch return false;
+            if (chunk.items.len == 0) return false;
+            const written = self.dst.write(part, off, chunk.items, .{
+                .create = true,
+                .truncate = off == 0 and resumed_from == 0,
+            }) catch return false;
+            if (written != chunk.items.len) return false;
+            off += written;
+            self.progress.add(written);
+        }
+        if (size == 0) {
+            _ = self.dst.write(part, 0, &.{}, .{ .create = true, .truncate = true }) catch return false;
+        }
+        self.dst.fsync(part) catch return false;
+        self.dst.rename(part, dst_path) catch return false;
+        const sh = self.hash(self.src, src_path) orelse return false;
+        const dh = self.hash(self.dst, dst_path) orelse return false;
+        if (!std.mem.eql(u8, &sh, &dh)) {
+            self.dst.deletePath(dst_path) catch {};
+            if (resumed_from > 0) {
+                self.progress.done -|= off;
+                self.resumed -|= resumed_from;
+                return self.copyFile(src_path, dst_path, size, false);
+            }
+            return false;
+        }
+        var arena_meta = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_meta.deinit();
+        if (self.src.statPath(arena_meta.allocator(), src_path)) |e| {
+            self.dst.chmod(dst_path, e.mode) catch {};
+            self.dst.utimens(dst_path, e.atime_ms, e.mtime_ms) catch {};
+        } else |_| {}
+        return true;
+    }
+
+    fn copyTree(self: *CrossCopy, src_dir: []const u8, dst_dir: []const u8, allow_resume: bool) bool {
+        self.dst.mkdir(dst_dir) catch |err| {
+            if (err != fsdrive.Error.FsOpFailed or std.mem.indexOf(u8, self.dst.lastErr(), "EXIST") == null)
+                return false;
+        };
+        var listing = self.src.list(src_dir) catch return false;
+        defer listing.deinit();
+        if (listing.truncated) return false;
+        for (listing.entries) |e| {
+            var sbuf: [4096]u8 = undefined;
+            var dbuf: [4096]u8 = undefined;
+            const sp = std.fmt.bufPrint(&sbuf, "{s}/{s}", .{ if (src_dir.len == 1) "" else src_dir, e.name }) catch return false;
+            const dp = std.fmt.bufPrint(&dbuf, "{s}/{s}", .{ if (dst_dir.len == 1) "" else dst_dir, e.name }) catch return false;
+            if (std.mem.eql(u8, e.kind, "dir")) {
+                if (!self.copyTree(sp, dp, allow_resume)) return false;
+            } else if (std.mem.eql(u8, e.kind, "file")) {
+                self.progress.total += e.size;
+                if (!self.copyFile(sp, dp, e.size, allow_resume)) return false;
+            } else if (std.mem.eql(u8, e.kind, "link")) {
+                self.dst.deletePath(dp) catch {};
+                self.dst.symlink(e.target orelse return false, dp) catch return false;
+            }
+        }
+        var arena_meta = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_meta.deinit();
+        if (self.src.statPath(arena_meta.allocator(), src_dir)) |e| {
+            self.dst.chmod(dst_dir, e.mode) catch {};
+            self.dst.utimens(dst_dir, e.atime_ms, e.mtime_ms) catch {};
+        } else |_| {}
+        return true;
+    }
+};
+
+fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
+    if (spec.dst.len == 0) return emitError("cross_copy needs destination");
+    var src = connectHostFs(allocator, spec.src_host) catch return emitError("cannot connect source host");
+    defer src.deinit();
+    var dst = connectHostFs(allocator, spec.dst_host) catch return emitError("cannot connect destination host");
+    defer dst.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const root = src.statPath(arena.allocator(), spec.src) catch return emitError("cannot stat source");
+    var cc = CrossCopy{ .allocator = allocator, .src = &src, .dst = &dst };
+    const ok = if (std.mem.eql(u8, root.kind, "file")) blk: {
+        cc.progress.total = root.size;
+        break :blk cc.copyFile(spec.src, spec.dst, root.size, spec.@"resume");
+    } else if (root.tdir)
+        cc.copyTree(spec.src, spec.dst, spec.@"resume")
+    else
+        false;
+    if (!ok) return emitError("cross-host copy failed");
+    emit(.{
+        .ev = "done",
+        .done = cc.progress.done,
+        .total = cc.progress.total,
+        .resumed_from = cc.resumed,
+    });
+    return 0;
 }
 
 // ── find / grep ─────────────────────────────────────────────────
@@ -212,6 +649,163 @@ fn searchDir(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []cons
             emit(.{ .ev = "progress", .done = state.scanned, .total = @as(u64, 0) });
         if (std.mem.eql(u8, e.kind, "dir"))
             searchDir(allocator, full, pattern, content, state);
+    }
+}
+
+/// Run an arbitrary host-side command and turn each LF- or NUL-delimited
+/// output path into an operable result entry. Relative paths use `src` as cwd.
+fn runPanelize(spec: Spec) u8 {
+    if (spec.pattern.len == 0) return emitError("panelize needs command");
+    var cwdz: [4096]u8 = undefined;
+    const cwd = pathz.pathZ(&cwdz, spec.src) catch return emitError("cwd too long");
+    var cmdz: [16 * 1024:0]u8 = undefined;
+    const cmd = std.fmt.bufPrintZ(&cmdz, "{s}", .{spec.pattern}) catch return emitError("command too long");
+    var pipefd: [2]c_int = undefined;
+    if (c.pipe(&pipefd) != 0) return emitErrno("pipe");
+    const pid = c.fork();
+    if (pid < 0) return emitErrno("fork");
+    if (pid == 0) {
+        _ = c.chdir(cwd);
+        _ = c.dup2(pipefd[1], 1);
+        _ = c.close(pipefd[0]);
+        _ = c.close(pipefd[1]);
+        const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-lc", cmd.ptr, null };
+        _ = c.execv("/bin/sh", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    _ = c.close(pipefd[1]);
+    var item: [4096]u8 = undefined;
+    var item_len: usize = 0;
+    var matches: usize = 0;
+    var truncated = false;
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = c.read(pipefd[0], &buf, buf.len);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        if (n <= 0) break;
+        for (buf[0..@intCast(n)]) |ch| {
+            if (ch == '\n' or ch == 0) {
+                if (item_len > 0) {
+                    if (matches >= MAX_MATCHES) {
+                        truncated = true;
+                    } else {
+                        panelizeOne(spec.src, item[0..item_len]);
+                        matches += 1;
+                    }
+                }
+                item_len = 0;
+            } else if (item_len < item.len) {
+                item[item_len] = ch;
+                item_len += 1;
+            }
+        }
+    }
+    if (item_len > 0 and matches < MAX_MATCHES) {
+        panelizeOne(spec.src, item[0..item_len]);
+        matches += 1;
+    }
+    _ = c.close(pipefd[0]);
+    var st: c_int = 0;
+    while (c.waitpid(pid, &st, 0) < 0 and std.posix.errno(@as(c_int, -1)) == .INTR) {}
+    if (!c.WIFEXITED(st) or c.WEXITSTATUS(st) != 0) return emitError("panel command failed");
+    emit(.{ .ev = "done", .done = matches, .total = matches, .matches = matches, .truncated = truncated });
+    return 0;
+}
+
+fn panelizeOne(root: []const u8, value_raw: []const u8) void {
+    const value = std.mem.trim(u8, value_raw, " \t\r");
+    if (value.len == 0) return;
+    var full_buf: [4096]u8 = undefined;
+    const full = if (value[0] == '/')
+        value
+    else
+        std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ if (root.len == 1) "" else root, value }) catch return;
+    var st: c.struct_stat = undefined;
+    if (!statOf(full, &st, false)) return;
+    emit(.{
+        .ev = "match",
+        .path = full,
+        .kind = fsserve.kindOf(st.st_mode),
+        .size = if (st.st_size > 0) @as(u64, @intCast(st.st_size)) else 0,
+    });
+}
+
+const LiveWatch = struct { wd: c_int, path: []u8 };
+
+fn addLiveDir(allocator: std.mem.Allocator, watcher: *fsserve.Watcher, watches: *std.ArrayList(LiveWatch), path: []const u8, pattern: []const u8, initial: bool) void {
+    if (watches.items.len >= 8192) return;
+    var z: [4096]u8 = undefined;
+    const pz = pathz.pathZ(&z, path) catch return;
+    const wd = watcher.add(pz);
+    if (wd < 0) return;
+    for (watches.items) |w| if (w.wd == wd) return;
+    const owned = allocator.dupe(u8, path) catch return;
+    watches.append(allocator, .{ .wd = wd, .path = owned }) catch {
+        allocator.free(owned);
+        return;
+    };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const listing = fsserve.listDir(arena.allocator(), path, fsserve.MAX_ENTRIES) catch return;
+    for (listing.entries) |e| {
+        var full_buf: [4096]u8 = undefined;
+        const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ if (path.len == 1) "" else path, e.name }) catch continue;
+        if (initial and nameMatches(pattern, e.name))
+            emit(.{ .ev = "match", .path = full, .kind = e.kind, .size = e.size });
+        if (std.mem.eql(u8, e.kind, "dir")) addLiveDir(allocator, watcher, watches, full, pattern, initial);
+    }
+}
+
+/// Durable Haiku-style live filename query. Linux uses recursive inotify;
+/// other hosts report the missing watcher honestly instead of polling.
+fn runLiveFind(allocator: std.mem.Allocator, spec: Spec) u8 {
+    if (spec.pattern.len == 0) return emitError("live_find needs pattern");
+    if (comptime builtin.os.tag != .linux) return emitError("live queries need the platform watcher backend");
+    var watcher: fsserve.Watcher = .{};
+    defer watcher.deinit();
+    if (!watcher.ensure()) return emitError("cannot create filesystem watcher");
+    var watches: std.ArrayList(LiveWatch) = .empty;
+    defer {
+        for (watches.items) |w| allocator.free(w.path);
+        watches.deinit(allocator);
+    }
+    addLiveDir(allocator, &watcher, &watches, spec.src, spec.pattern, true);
+    emit(.{ .ev = "ready", .done = watches.items.len, .total = watches.items.len });
+    var buf: [32 * 1024]u8 = undefined;
+    while (true) {
+        var pfd = c.struct_pollfd{ .fd = watcher.fd, .events = c.POLLIN, .revents = 0 };
+        const pr = c.poll(&pfd, 1, -1);
+        if (pr < 0 and std.posix.errno(pr) == .INTR) continue;
+        if (pr <= 0) return emitError("watcher stopped");
+        const n = c.read(watcher.fd, &buf, buf.len);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        if (n <= 0) return emitError("watcher read failed");
+        var it = fsserve.EventIter{ .buf = buf[0..@intCast(n)] };
+        while (it.next()) |ev| {
+            if (ev.isOverflow()) {
+                emit(.{ .ev = "resync" });
+                continue;
+            }
+            const parent = for (watches.items) |w| {
+                if (w.wd == ev.wd) break w.path;
+            } else continue;
+            if (ev.name.len == 0) continue;
+            var full_buf: [4096]u8 = undefined;
+            const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ if (parent.len == 1) "" else parent, ev.name }) catch continue;
+            var z: [4096]u8 = undefined;
+            var st: c.struct_stat = undefined;
+            if (c.lstat(pathz.pathZ(&z, full) catch continue, &st) != 0) {
+                emit(.{ .ev = "unmatch", .path = full });
+                continue;
+            }
+            const kind = fsserve.kindOf(st.st_mode);
+            if (nameMatches(spec.pattern, ev.name)) {
+                emit(.{ .ev = "match", .path = full, .kind = kind, .size = if (st.st_size > 0) @as(u64, @intCast(st.st_size)) else 0 });
+            } else {
+                emit(.{ .ev = "unmatch", .path = full });
+            }
+            if (std.mem.eql(u8, kind, "dir")) addLiveDir(allocator, &watcher, &watches, full, spec.pattern, true);
+        }
     }
 }
 
@@ -436,7 +1030,8 @@ fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_re
 /// verify is what the hash verb is for.
 fn runCopyTree(allocator: std.mem.Allocator, spec: Spec) u8 {
     var progress = Progress{};
-    sizeTree(allocator, spec.src, &progress.total);
+    if (!sizeTree(allocator, spec.src, &progress.total))
+        return emitError("cannot size source tree (listing failed or truncated)");
 
     var resumed_bytes: u64 = 0;
     switch (copyTreeDir(allocator, spec.src, spec.dst, spec.@"resume", &progress, &resumed_bytes)) {
@@ -448,20 +1043,22 @@ fn runCopyTree(allocator: std.mem.Allocator, spec: Spec) u8 {
     return 0;
 }
 
-fn sizeTree(allocator: std.mem.Allocator, dir_path: []const u8, total: *u64) void {
+fn sizeTree(allocator: std.mem.Allocator, dir_path: []const u8, total: *u64) bool {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
-    const l = fsserve.listDir(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES) catch return;
+    const l = fsserve.listDir(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES) catch return false;
+    if (l.truncated) return false;
     for (l.entries) |e| {
         if (std.mem.eql(u8, e.kind, "dir")) {
             var buf: [4096]u8 = undefined;
             var w = std.Io.Writer.fixed(&buf);
-            w.print("{s}/{s}", .{ dir_path, e.name }) catch continue;
-            sizeTree(allocator, w.buffered(), total);
+            w.print("{s}/{s}", .{ dir_path, e.name }) catch return false;
+            if (!sizeTree(allocator, w.buffered(), total)) return false;
         } else if (std.mem.eql(u8, e.kind, "file")) {
             total.* += e.size;
         }
     }
+    return true;
 }
 
 fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8, allow_resume: bool, progress: *Progress, resumed_bytes: *u64) CopyResult {
@@ -480,6 +1077,7 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
     defer arena_state.deinit();
     const l = fsserve.listDir(arena_state.allocator(), src_dir, fsserve.MAX_ENTRIES) catch
         return .{ .err = "cannot list source dir" };
+    if (l.truncated) return .{ .err = "source directory listing truncated" };
 
     for (l.entries) |e| {
         var sbuf: [4096]u8 = undefined;
@@ -499,23 +1097,29 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
         } else if (std.mem.eql(u8, e.kind, "link")) {
             var zt: [4096]u8 = undefined;
             var zl: [4096]u8 = undefined;
-            const tgt = pathz.pathZ(&zt, e.target orelse continue) catch continue;
-            const lp = pathz.pathZ(&zl, dpath) catch continue;
-            _ = c.unlink(lp);
-            _ = c.symlink(tgt, lp);
+            const tgt = pathz.pathZ(&zt, e.target orelse return .{ .err = "symlink target missing" }) catch
+                return .{ .err = "path too long" };
+            const lp = pathz.pathZ(&zl, dpath) catch return .{ .err = "path too long" };
+            if (c.unlink(lp) != 0 and std.posix.errno(@as(c_int, -1)) != .NOENT)
+                return .{ .errno = "unlink old symlink" };
+            if (c.symlink(tgt, lp) != 0) return .{ .errno = "create symlink" };
         } else if (std.mem.eql(u8, e.kind, "file")) {
             if (allow_resume) {
                 var dst_st: c.struct_stat = undefined;
                 if (statOf(dpath, &dst_st, false) and (dst_st.st_mode & c.S_IFMT) == c.S_IFREG and
                     @as(u64, @intCast(dst_st.st_size)) == e.size)
                 {
-                    progress.add(e.size);
-                    resumed_bytes.* += e.size;
-                    continue;
+                    const src_h = hashPrefix(spath, e.size, null);
+                    const dst_h = hashPrefix(dpath, e.size, null);
+                    if (src_h != null and dst_h != null and std.mem.eql(u8, &src_h.?, &dst_h.?)) {
+                        progress.add(e.size);
+                        resumed_bytes.* += e.size;
+                        continue;
+                    }
                 }
             }
             var fst: c.struct_stat = undefined;
-            if (!statOf(spath, &fst, true)) continue; // vanished mid-copy
+            if (!statOf(spath, &fst, true)) return .{ .errno = "stat source file" };
             var file_resumed: u64 = 0;
             switch (copyOneFile(spath, dpath, fst, allow_resume, progress, &file_resumed)) {
                 .ok => resumed_bytes.* += file_resumed,
@@ -610,6 +1214,14 @@ test "nameMatches: substring default, glob with wildcards, ci" {
     try t.expect(!nameMatches("a?c", "abbc"));
     try t.expect(nameMatches("*b*b*", "abxbx"));
     try t.expect(!nameMatches("*b*b*", "abxx"));
+}
+
+test "archive member validation rejects traversal and absolute paths" {
+    try std.testing.expect(!unsafeArchiveMember("dir/file.txt"));
+    try std.testing.expect(!unsafeArchiveMember("./dir/file.txt"));
+    try std.testing.expect(unsafeArchiveMember("../escape"));
+    try std.testing.expect(unsafeArchiveMember("dir/../../escape"));
+    try std.testing.expect(unsafeArchiveMember("/absolute"));
 }
 
 test "copyOneFile resumes only on matching prefix hash" {

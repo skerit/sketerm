@@ -37,8 +37,16 @@ pub const Entry = struct {
     /// Permission bits (mode & 0o7777).
     mode: u32 = 0,
     mtime_ms: i64 = 0,
+    mtime_ns: i64 = 0,
+    atime_ms: i64 = 0,
+    ctime_ms: i64 = 0,
+    ctime_ns: i64 = 0,
     uid: u32 = 0,
     gid: u32 = 0,
+    nlink: u64 = 1,
+    blocks: u64 = 0,
+    dev: u64 = 0,
+    ino: u64 = 0,
     /// Symlink target (links only).
     target: ?[]const u8 = null,
     /// True when the entry, links followed, is a directory — the
@@ -61,6 +69,21 @@ pub fn kindOf(mode: c.mode_t) []const u8 {
 fn mtimeMs(st: *const c.struct_stat) i64 {
     const ts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
     return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+}
+
+fn atimeMs(st: *const c.struct_stat) i64 {
+    const ts = if (@hasField(c.struct_stat, "st_atim")) st.st_atim else st.st_atimespec;
+    return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+}
+
+fn ctimeMs(st: *const c.struct_stat) i64 {
+    const ts = if (@hasField(c.struct_stat, "st_ctim")) st.st_ctim else st.st_ctimespec;
+    return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+}
+
+fn timespecNs(ts: c.struct_timespec) i64 {
+    const value = @as(i128, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(i128, @intCast(ts.tv_nsec));
+    return @intCast(std.math.clamp(value, std.math.minInt(i64), std.math.maxInt(i64)));
 }
 
 /// NUL-join dir + "/" + name into `buf`.
@@ -89,8 +112,16 @@ pub fn statEntry(arena: std.mem.Allocator, dir: []const u8, name: []const u8) ?E
         .size = if (st.st_size > 0) @intCast(st.st_size) else 0,
         .mode = @intCast(st.st_mode & 0o7777),
         .mtime_ms = mtimeMs(&st),
+        .mtime_ns = timespecNs(if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec),
+        .atime_ms = atimeMs(&st),
+        .ctime_ms = ctimeMs(&st),
+        .ctime_ns = timespecNs(if (@hasField(c.struct_stat, "st_ctim")) st.st_ctim else st.st_ctimespec),
         .uid = @intCast(st.st_uid),
         .gid = @intCast(st.st_gid),
+        .nlink = @intCast(st.st_nlink),
+        .blocks = if (st.st_blocks > 0) @intCast(st.st_blocks) else 0,
+        .dev = @intCast(st.st_dev),
+        .ino = @intCast(st.st_ino),
         .tdir = (st.st_mode & c.S_IFMT) == c.S_IFDIR,
     };
     if ((st.st_mode & c.S_IFMT) == c.S_IFLNK) {

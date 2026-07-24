@@ -91,6 +91,10 @@ pub const Transfer = struct {
     have_hash_src: bool = false,
     hash_dst: [64]u8 = undefined,
     have_hash_dst: bool = false,
+    /// Same-size tree entries are hash-verified before being skipped.
+    verifying_skip: bool = false,
+    /// A corrupt resumed partial is discarded and copied once from zero.
+    verify_retried: bool = false,
     err_buf: [192]u8 = undefined,
     err_len: usize = 0,
 
@@ -275,8 +279,10 @@ pub const Transfer = struct {
                 if (rep.ok) {
                     if (rep.entry) |e| {
                         if (std.mem.eql(u8, e.kind, "file") and e.size == self.size) {
-                            self.state = .skipped;
-                            self.off = self.size;
+                            self.verifying_skip = true;
+                            self.req_dst = self.nr();
+                            self.state = .hash_start_dst;
+                            _ = self.sendDstOp(.{ .req = self.req_dst, .op = "hash", .path = self.dst_path });
                             return;
                         }
                     }
@@ -329,7 +335,7 @@ pub const Transfer = struct {
             .hash_start_dst => {
                 if (!rep.ok or rep.job == 0) return self.failFmt("verify: {s}", .{rep.@"error"});
                 self.job_dst = rep.job;
-                if (self.resumed_from > 0) {
+                if (self.resumed_from > 0 or self.verifying_skip) {
                     // The client never saw the partial's bytes — hash
                     // the source daemon-side instead of locally.
                     self.req_src = self.nr();
@@ -349,7 +355,21 @@ pub const Transfer = struct {
                 self.job_src = rep.job;
                 self.state = .hash_wait;
             },
-            .cleanup_fail => self.fail("verify failed: content hash mismatch"),
+            .cleanup_fail => {
+                if (self.resumed_from > 0 and !self.verify_retried) {
+                    self.verify_retried = true;
+                    self.resumed_from = 0;
+                    self.off = 0;
+                    self.job_src = 0;
+                    self.job_dst = 0;
+                    self.have_hash_src = false;
+                    self.have_hash_dst = false;
+                    self.hasher = Sha256.init(.{});
+                    self.beginData();
+                } else {
+                    self.fail("verify failed: content hash mismatch");
+                }
+            },
             else => {},
         }
     }
@@ -373,7 +393,17 @@ pub const Transfer = struct {
         }
         if (self.state != .hash_wait or !self.have_hash_src or !self.have_hash_dst) return;
         if (std.mem.eql(u8, &self.hash_src, &self.hash_dst)) {
-            self.state = .done;
+            self.state = if (self.verifying_skip) .skipped else .done;
+            if (self.verifying_skip) self.off = self.size;
+            return;
+        }
+        if (self.verifying_skip) {
+            self.verifying_skip = false;
+            self.job_src = 0;
+            self.job_dst = 0;
+            self.have_hash_src = false;
+            self.have_hash_dst = false;
+            self.afterFinalStat();
             return;
         }
         // Never leave a corrupt file wearing the final name.
@@ -674,8 +704,8 @@ pub const Xfer = struct {
                 self.listNext();
             },
             .mkdirs, .symlinks => {
-                // EEXIST-style failures are fine on resume; anything
-                // else surfaces when the file copies fail.
+                if (!rep.ok and std.mem.indexOf(u8, rep.@"error", "EXIST") == null)
+                    return self.failFmt("destination setup: {s}", .{rep.@"error"});
                 self.setup_idx += 1;
                 self.setupNext();
             },

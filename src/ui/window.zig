@@ -1530,11 +1530,17 @@ pub const Window = struct {
                     self.startMuxRestoreJob(pane, p);
 
                 // Browser face: reattach with the saved internal tabs.
-                if (p.browser_tabs.len > 0) {
+                if (p.browser != null or p.browser_tabs.len > 0) {
                     const browser_mod = @import("browser.zig");
-                    if (browser_mod.BrowserView.attach(self.allocator, pane, p.browser_tabs[0])) |bv| {
+                    const restored = if (p.browser) |state|
+                        browser_mod.BrowserView.attachState(self.allocator, pane, state)
+                    else
+                        browser_mod.BrowserView.attach(self.allocator, pane, p.browser_tabs[0]);
+                    if (restored) |bv| {
                         self.installBrowserHooks(bv);
-                        for (p.browser_tabs[1..]) |tp| _ = bv.newTabSpec(tp);
+                        if (p.browser == null) {
+                            for (p.browser_tabs[1..]) |tp| _ = bv.newTabSpec(tp);
+                        }
                     } else |err| {
                         std.debug.print("sketerm: browser restore failed: {s}\n", .{@errorName(err)});
                     }
@@ -6115,6 +6121,10 @@ pub const Window = struct {
                         break :blk &[_][]const u8{};
                     break :blk try bv.tabPaths(arena);
                 };
+                const browser_state = blk: {
+                    const bv = @import("browser.zig").BrowserView.fromPane(p) orelse break :blk null;
+                    break :blk try bv.paneState(arena);
+                };
                 return .{
                     .cwd = cwd,
                     .command = cmd,
@@ -6126,6 +6136,7 @@ pub const Window = struct {
                     .mux_session = mux_session,
                     .mux_host = mux_host,
                     .browser_tabs = browser_tabs,
+                    .browser = browser_state,
                 };
             }
         }

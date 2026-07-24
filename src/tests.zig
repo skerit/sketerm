@@ -66,12 +66,16 @@ comptime {
     _ = @import("ipc/mcpassets.zig");
     _ = @import("util/template.zig");
     _ = @import("util/ocr.zig");
+    _ = @import("util/mounts.zig");
     _ = @import("render/bg_pass.zig");
     _ = @import("mux/wire.zig");
     _ = @import("mux/fsserve.zig");
     _ = @import("mux/fsjob.zig");
+    _ = @import("mux/fsjournal.zig");
     _ = @import("ipc/fsdrive.zig");
     _ = @import("ipc/fstransfer.zig");
+    _ = @import("filebrowser/model.zig");
+    _ = @import("filebrowser/cache.zig");
     _ = @import("fsmount.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");
