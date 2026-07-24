@@ -1012,6 +1012,11 @@ const TOOLS_JSON_RAW =
     \\{"name":"file_copy","description":"Copy a file or a whole directory tree as a daemon-side JOB: runs in its own process, survives this MCP server, and is RESUMABLE — resume=true continues a previous interrupted copy from its hash-verified partial (a corrupted partial honestly restarts from zero; the reply's resumed_from says which happened). By default the call waits for completion (bounded); on timeout the job KEEPS RUNNING — check file_jobs, or cancel with file_job.","inputSchema":{"type":"object","properties":{"src":{"type":"string"},"dst":{"type":"string"},"resume":{"type":"boolean","description":"Continue from a previous interrupted copy's staged partial (content-verified)"},"wait":{"type":"boolean","description":"Wait for completion (default true; false returns the job id immediately)"},"timeout_ms":{"type":"integer","description":"Wait bound (default 60000, max 120000)"}},"required":["src","dst"]}},
     \\{"name":"file_delete_tree","description":"Recursively delete a directory tree as a daemon-side job (same wait/job semantics as file_copy). Destructive and not undoable.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"wait":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["path"]}},
     \\{"name":"file_hash","description":"SHA-256 of a file, computed daemon-side as a job (only the digest crosses the wire — use for verifying copies).","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["path"]}},
+    \\{"name":"file_extract","description":"Extract an archive ON THE HOST THAT OWNS IT. Only the command and progress cross the network; archive members are checked for absolute/path-traversal names before extraction.","inputSchema":{"type":"object","properties":{"archive":{"type":"string"},"destination":{"type":"string"},"wait":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["archive","destination"]}},
+    \\{"name":"file_archive_create","description":"Create an archive ON THE SOURCE HOST. Format is inferred from the destination suffix by bsdtar (for example .tar.gz or .zip).","inputSchema":{"type":"object","properties":{"source":{"type":"string"},"archive":{"type":"string"},"wait":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["source","archive"]}},
+    \\{"name":"file_trash","description":"Move a file or directory to the owning host's freedesktop Trash as a daemon job, preserving restore metadata. Prefer this over permanent deletion.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"wait":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["path"]}},
+    \\{"name":"file_chmod","description":"Change permissions on the owning host. Mode is an integer containing octal permission bits (for example 420 = 0644).","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"mode":{"type":"integer"}},"required":["path","mode"]}},
+    \\{"name":"file_truncate","description":"Set a file's exact byte length on the owning host.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"size":{"type":"integer"}},"required":["path","size"]}},
     \\{"name":"file_jobs","description":"List file jobs (running + recently finished): id, op, state, progress. Jobs survive client disconnects.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"file_job","description":"Control a file job: cancel (SIGKILL — works even on jobs stuck in unkillable IO), pause (SIGSTOP), resume (SIGCONT).","inputSchema":{"type":"object","properties":{"job":{"type":"integer"},"action":{"type":"string","enum":["cancel","pause","resume"]}},"required":["job","action"]}},
     \\{"name":"capabilities","description":"Preflight report of what THIS MCP server can do right now: isolation mode, GUI socket presence, OCR (tesseract) availability, which browser binary browser_open would use, ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.","inputSchema":{"type":"object","properties":{}}},
@@ -6435,7 +6440,21 @@ fn fsTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]c
         fs.deletePath(path) catch |err| return fsFail(arena, fs, "delete", err);
         return toolResult(arena, "deleted", false) orelse error.OutOfMemory;
     }
-    if (eql(u8, name, "file_copy") or eql(u8, name, "file_delete_tree") or eql(u8, name, "file_hash")) {
+    if (eql(u8, name, "file_chmod")) {
+        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const mode: u32 = @intCast(std.math.clamp(argInt(args, "mode") orelse -1, 0, 0o7777));
+        fs.chmod(path, mode) catch |err| return fsFail(arena, fs, "chmod", err);
+        return toolResult(arena, "permissions changed", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "file_truncate")) {
+        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const size: u64 = @intCast(@max(0, argInt(args, "size") orelse 0));
+        fs.truncate(path, size) catch |err| return fsFail(arena, fs, "truncate", err);
+        return toolResult(arena, "size changed", false) orelse error.OutOfMemory;
+    }
+    if (eql(u8, name, "file_copy") or eql(u8, name, "file_delete_tree") or eql(u8, name, "file_hash") or
+        eql(u8, name, "file_extract") or eql(u8, name, "file_archive_create") or eql(u8, name, "file_trash"))
+    {
         const timeout: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 60_000, 1_000, 120_000);
         var job: u64 = 0;
         var opname: []const u8 = "";
@@ -6448,6 +6467,20 @@ fn fsTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]c
             const path = argStr(args, "path") orelse return appErr(arena, "missing path");
             job = fs.startDeleteTree(path) catch |err| return fsFail(arena, fs, "delete_tree", err);
             opname = "delete_tree";
+        } else if (eql(u8, name, "file_extract")) {
+            const archive = argStr(args, "archive") orelse return appErr(arena, "missing archive");
+            const destination = argStr(args, "destination") orelse return appErr(arena, "missing destination");
+            job = fs.startExtract(archive, destination) catch |err| return fsFail(arena, fs, "extract", err);
+            opname = "extract";
+        } else if (eql(u8, name, "file_archive_create")) {
+            const source = argStr(args, "source") orelse return appErr(arena, "missing source");
+            const archive = argStr(args, "archive") orelse return appErr(arena, "missing archive");
+            job = fs.startArchiveCreate(source, archive) catch |err| return fsFail(arena, fs, "archive_create", err);
+            opname = "archive_create";
+        } else if (eql(u8, name, "file_trash")) {
+            const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+            job = fs.startTrash(path) catch |err| return fsFail(arena, fs, "trash", err);
+            opname = "trash";
         } else {
             const path = argStr(args, "path") orelse return appErr(arena, "missing path");
             job = fs.startHash(path) catch |err| return fsFail(arena, fs, "hash", err);

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const browser_model = @import("filebrowser/model.zig");
 
 pub const Orient = enum { horizontal, vertical };
 
@@ -41,6 +42,9 @@ pub const PaneSpec = struct {
     /// the browser with the same tabs; older files parse via
     /// ignore_unknown_fields.
     browser_tabs: []const []const u8 = &.{},
+    /// Versioned full browser state. `browser_tabs` remains as the
+    /// compatibility reader for layouts written by the first prototype.
+    browser: ?browser_model.PaneState = null,
 };
 
 pub const SplitSpec = struct {
@@ -359,4 +363,35 @@ test "load tolerates older JSON without profile / pinned fields" {
         .pane => |p| try std.testing.expectEqualStrings("", p.profile),
         else => try std.testing.expect(false),
     }
+}
+
+test "round trip preserves full browser pane state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
+    const file_path = try std.fmt.allocPrint(a, "{s}/browser.json", .{real_path});
+    const refs = [_]browser_model.FileRef{.{ .host = "box", .path = "/old" }};
+    const btabs = [_]browser_model.TabState{.{
+        .location = .{ .host = "box", .path = "/work" },
+        .back = &refs,
+        .expanded = &refs,
+        .show_hidden = true,
+        .view = .miller,
+    }};
+    const cmd = [_][]const u8{"sh"};
+    const tabs = [_]TabSpec{.{ .title = "files", .tree = .{ .pane = .{
+        .cwd = "/",
+        .command = &cmd,
+        .browser = .{ .tabs = &btabs },
+    } } }};
+    try save(.{ .tabs = &tabs }, file_path);
+    const parsed = try load(a, file_path);
+    defer parsed.deinit();
+    const state = parsed.value.tabs[0].tree.pane.browser.?;
+    try std.testing.expectEqual(browser_model.ViewMode.miller, state.tabs[0].view);
+    try std.testing.expectEqualStrings("box", state.tabs[0].location.host);
+    try std.testing.expect(state.tabs[0].show_hidden);
 }

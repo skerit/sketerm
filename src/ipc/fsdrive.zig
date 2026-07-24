@@ -88,6 +88,17 @@ pub const WriteFlags = struct {
 
 pub const ReadInfo = struct { size: u64, eof: bool };
 
+pub const StatFs = struct {
+    bsize: u64 = 0,
+    frsize: u64 = 0,
+    blocks: u64 = 0,
+    bfree: u64 = 0,
+    bavail: u64 = 0,
+    files: u64 = 0,
+    ffree: u64 = 0,
+    namemax: u64 = 255,
+};
+
 /// One row of a job_list reply.
 pub const JobRow = struct {
     job: u64 = 0,
@@ -113,6 +124,14 @@ const Reply = struct {
     written: u64 = 0,
     job: u64 = 0,
     jobs: []JobRow = &.{},
+    bsize: u64 = 0,
+    frsize: u64 = 0,
+    blocks: u64 = 0,
+    bfree: u64 = 0,
+    bavail: u64 = 0,
+    files: u64 = 0,
+    ffree: u64 = 0,
+    namemax: u64 = 255,
 };
 
 /// One pushed fs_job event, arena-owned.
@@ -197,6 +216,11 @@ pub const Fs = struct {
 
     pub fn lastErr(self: *const Fs) []const u8 {
         return self.last_err[0..self.last_err_len];
+    }
+
+    /// Exposes the transport for integration into an external poll loop.
+    pub fn pollFd(self: *const Fs) c_int {
+        return self.conn.fd;
     }
 
     fn setErr(self: *Fs, msg: []const u8) void {
@@ -383,6 +407,14 @@ pub const Fs = struct {
             @"resume": bool = false,
             job: u64 = 0,
             pattern: []const u8 = "",
+            mode: u32 = 0,
+            uid: ?u32 = null,
+            gid: ?u32 = null,
+            size: u64 = 0,
+            atime_ms: ?i64 = null,
+            mtime_ms: ?i64 = null,
+            src_host: []const u8 = "",
+            dst_host: []const u8 = "",
         };
         var b: Base = .{ .req = req, .op = op };
         inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |fld| {
@@ -420,6 +452,7 @@ pub const Fs = struct {
         d.name = try a.dupe(u8, e.name);
         d.kind = try a.dupe(u8, e.kind);
         if (e.target) |t| d.target = try a.dupe(u8, t);
+        d.tags = try a.dupe(u8, e.tags);
         return d;
     }
 
@@ -469,9 +502,59 @@ pub const Fs = struct {
         try self.simpleOp("delete", .{ .path = path });
     }
 
+    pub fn unlink(self: *Fs, path: []const u8) Error!void {
+        try self.simpleOp("unlink", .{ .path = path });
+    }
+
+    pub fn rmdir(self: *Fs, path: []const u8) Error!void {
+        try self.simpleOp("rmdir", .{ .path = path });
+    }
+
     /// Create a symlink at `path` pointing to `target`.
     pub fn symlink(self: *Fs, target: []const u8, path: []const u8) Error!void {
         try self.simpleOp("symlink", .{ .path = path, .to = target });
+    }
+
+    pub fn chmod(self: *Fs, path: []const u8, mode: u32) Error!void {
+        try self.simpleOp("chmod", .{ .path = path, .mode = mode });
+    }
+
+    pub fn chown(self: *Fs, path: []const u8, uid: ?u32, gid: ?u32) Error!void {
+        try self.simpleOp("chown", .{ .path = path, .uid = uid, .gid = gid });
+    }
+
+    pub fn truncate(self: *Fs, path: []const u8, size: u64) Error!void {
+        try self.simpleOp("truncate", .{ .path = path, .size = size });
+    }
+
+    pub fn utimens(self: *Fs, path: []const u8, atime_ms: ?i64, mtime_ms: ?i64) Error!void {
+        try self.simpleOp("utimens", .{ .path = path, .atime_ms = atime_ms, .mtime_ms = mtime_ms });
+    }
+
+    pub fn access(self: *Fs, path: []const u8, mode: u32) Error!void {
+        try self.simpleOp("access", .{ .path = path, .mode = mode });
+    }
+
+    pub fn fsync(self: *Fs, path: []const u8) Error!void {
+        try self.simpleOp("fsync", .{ .path = path });
+    }
+
+    pub fn statFs(self: *Fs, path: []const u8) Error!StatFs {
+        const req = self.nextReq();
+        try self.sendOp("statfs", req, .{ .path = path });
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const rep = try self.awaitReply(scratch.allocator(), req, OP_TIMEOUT_MS);
+        return .{
+            .bsize = rep.bsize,
+            .frsize = rep.frsize,
+            .blocks = rep.blocks,
+            .bfree = rep.bfree,
+            .bavail = rep.bavail,
+            .files = rep.files,
+            .ffree = rep.ffree,
+            .namemax = rep.namemax,
+        };
     }
 
     fn simpleOp(self: *Fs, op: []const u8, args: anytype) Error!void {
@@ -582,9 +665,50 @@ pub const Fs = struct {
         return self.startJob("find", .{ .path = root, .pattern = pattern });
     }
 
+    pub fn startLiveFind(self: *Fs, root: []const u8, pattern: []const u8) Error!u64 {
+        return self.startJob("live_find", .{ .path = root, .pattern = pattern });
+    }
+
     /// Recursive ci content search; matches carry path + line + text.
     pub fn startGrep(self: *Fs, root: []const u8, pattern: []const u8) Error!u64 {
         return self.startJob("grep", .{ .path = root, .pattern = pattern });
+    }
+
+    pub fn startPanelize(self: *Fs, root: []const u8, command: []const u8) Error!u64 {
+        return self.startJob("panelize", .{ .path = root, .pattern = command });
+    }
+
+    pub fn startExtract(self: *Fs, archive: []const u8, destination: []const u8) Error!u64 {
+        return self.startJob("extract", .{ .path = archive, .to = destination });
+    }
+
+    pub fn startArchiveCreate(self: *Fs, source: []const u8, archive: []const u8) Error!u64 {
+        return self.startJob("archive_create", .{ .path = source, .to = archive });
+    }
+
+    pub fn startTrash(self: *Fs, path: []const u8) Error!u64 {
+        return self.startJob("trash", .{ .path = path });
+    }
+
+    pub fn startTrashRestore(self: *Fs, trashed: []const u8, original: []const u8, info_path: []const u8) Error!u64 {
+        return self.startJob("trash_restore", .{ .path = trashed, .to = original, .pattern = info_path });
+    }
+
+    pub fn startCrossCopy(
+        self: *Fs,
+        src_host: []const u8,
+        src: []const u8,
+        dst_host: []const u8,
+        dst: []const u8,
+        resumable: bool,
+    ) Error!u64 {
+        return self.startJob("cross_copy", .{
+            .path = src,
+            .to = dst,
+            .src_host = src_host,
+            .dst_host = dst_host,
+            .@"resume" = resumable,
+        });
     }
 
     pub fn jobCancel(self: *Fs, job: u64) Error!void {

@@ -61,6 +61,10 @@ int login_tty(int fd);
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#ifndef __linux__
+#include <sys/mount.h>
+#endif
 #include <sys/mman.h> /* mux daemon: shm pool mirrors for the native app pipe */
 #include <dirent.h>  /* mux daemon: Vulkan ICD discovery for waypipe --no-gpu */
 #include <netinet/in.h>

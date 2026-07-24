@@ -86,6 +86,10 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/statvfs.h>
+#ifndef __linux__
+#include <sys/mount.h>
+#endif
 /* UDP transport (sketerm-mux --udp-listen / --udp-connect). */
 #include <netinet/in.h>
 #include <arpa/inet.h>
