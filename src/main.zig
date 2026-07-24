@@ -479,6 +479,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         return;
     };
     window.debug_events = g_app.debug_events;
+    window.save_on_close = !g_app.no_save;
     window.debug_images = g_app.debug_images;
     window.hold_override = g_app.hold;
     g_app.window = window;
@@ -513,6 +514,10 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
 /// `sketerm files <spec>` start location.
 fn openFilesTab() void {
     const win = g_app.window orelse return;
+    // Files mode gets its own window identity (title + icon match
+    // the dev.sker.sketerm.files desktop entry).
+    c.gtk_window_set_title(@ptrCast(@alignCast(win.app_window)), "Sketerm Files");
+    c.gtk_window_set_icon_name(@ptrCast(@alignCast(win.app_window)), "dev.sker.sketerm.files");
     win.newBrowserTabAt(g_app.files_path) catch |err| {
         std.debug.print("sketerm: files tab failed: {s}\n", .{@errorName(err)});
     };
@@ -524,7 +529,7 @@ fn openFilesTab() void {
 
 fn onShutdown(_: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
     if (g_app.window) |w| {
-        if (!g_app.no_save) w.saveLayoutQuietly();
+        if (!g_app.no_save and !w.layout_saved_final) w.saveLayoutQuietly();
         w.deinit();
         g_app.window = null;
     }

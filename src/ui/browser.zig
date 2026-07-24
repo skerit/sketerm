@@ -27,6 +27,7 @@ const wire = @import("../mux/wire.zig");
 const fsserve = @import("../mux/fsserve.zig");
 const fstransfer = @import("../ipc/fstransfer.zig");
 const browser_model = @import("../filebrowser/model.zig");
+const places_mod = @import("../filebrowser/places.zig");
 const fsjob = @import("../mux/fsjob.zig");
 const mounts = @import("../util/mounts.zig");
 const input = @import("input.zig");
@@ -122,6 +123,7 @@ const WireJobEv = struct {
     mtime_ms: i64 = 0,
     matches: u64 = 0,
     truncated: bool = false,
+    hash: []const u8 = "",
 };
 
 /// A parsed location spec. Bare "/path" keeps the CURRENT host
@@ -265,6 +267,11 @@ const Dir = struct {
     /// Collection mode: flat rows whose `target` is a host-qualified
     /// SPEC ("host:/path" or "/path") — entries span hosts.
     collection: bool = false,
+    /// Sort parameters (kept on the Dir so delta-driven re-sorts in
+    /// onDelta need no tab lookup); the owning tab pushes changes.
+    sort_key: browser_model.SortKey = .name,
+    descending: bool = false,
+    dirs_first: bool = true,
 
     fn deinit(self: *Dir) void {
         for (self.entries.items) |*e| e.deinit(self.allocator);
@@ -335,10 +342,28 @@ const Dir = struct {
     }
 
     fn sort(self: *Dir) void {
-        std.mem.sort(Entry, self.entries.items, {}, struct {
-            fn lt(_: void, a: Entry, b: Entry) bool {
-                if (a.tdir != b.tdir) return a.tdir;
-                return std.ascii.lessThanIgnoreCase(a.name, b.name);
+        const Ctx = struct { key: browser_model.SortKey, desc: bool, dirs_first: bool };
+        std.mem.sort(Entry, self.entries.items, Ctx{
+            .key = self.sort_key,
+            .desc = self.descending,
+            .dirs_first = self.dirs_first,
+        }, struct {
+            fn lt(ctx: Ctx, a_in: Entry, b_in: Entry) bool {
+                // dirs-first is decided BEFORE the descending swap so
+                // it never inverts.
+                if (ctx.dirs_first and a_in.tdir != b_in.tdir) return a_in.tdir;
+                const a = if (ctx.desc) b_in else a_in;
+                const b = if (ctx.desc) a_in else b_in;
+                return switch (ctx.key) {
+                    .size => if (a.size != b.size) a.size < b.size else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .mtime => if (a.mtime_ms != b.mtime_ms) a.mtime_ms < b.mtime_ms else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .ctime => if (a.ctime_ms != b.ctime_ms) a.ctime_ms < b.ctime_ms else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .kind => if (!std.mem.eql(u8, a.kind, b.kind)) std.mem.lessThan(u8, a.kind, b.kind) else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .owner => if (a.uid != b.uid) a.uid < b.uid else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .group => if (a.gid != b.gid) a.gid < b.gid else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .permissions => if (a.mode != b.mode) a.mode < b.mode else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .name => std.ascii.lessThanIgnoreCase(a.name, b.name),
+                };
             }
         }.lt);
     }
@@ -369,6 +394,22 @@ const BTab = struct {
     page: *c.GtkWidget,
     listbox: *c.GtkListBox,
     tab_label: *c.GtkLabel,
+    /// Details/compact sort header (hidden in grid/miller).
+    header_box: *c.GtkWidget = undefined,
+    hbtn_name: *c.GtkWidget = undefined,
+    hbtn_size: *c.GtkWidget = undefined,
+    hbtn_time: *c.GtkWidget = undefined,
+    /// The scrolled window whose child swaps listbox <-> flowbox.
+    scroller: *c.GtkWidget = undefined,
+    /// Icon-grid view (lazily created).
+    flowbox: ?*c.GtkFlowBox = null,
+    /// Miller mode: ancestor columns to the LEFT of the listbox.
+    /// Each column subscribes its directory like a subdir does.
+    miller_box: *c.GtkWidget = undefined,
+    ancestors: std.ArrayList(*Dir) = .empty,
+    /// Grid view lives in its own scroller so the listbox (and every
+    /// popover parented near it) never leaves the widget tree.
+    flow_scroller: ?*c.GtkWidget = null,
 
     fn subdirByPath(self: *BTab, path: []const u8) ?*Dir {
         for (self.subdirs.items) |d| {
@@ -382,7 +423,36 @@ const BTab = struct {
         for (self.subdirs.items) |d| {
             if (d.view_id == view_id) return d;
         }
+        for (self.ancestors.items) |d| {
+            if (d.view_id == view_id) return d;
+        }
         return null;
+    }
+
+    /// Push the tab's sort parameters onto every live Dir and re-sort.
+    fn applySort(self: *BTab) void {
+        const dirs = [_]?*Dir{self.root};
+        for (dirs) |d| {
+            d.?.sort_key = self.sort_key;
+            d.?.descending = self.descending;
+            d.?.dirs_first = self.dirs_first;
+            d.?.sort();
+        }
+        for (self.subdirs.items) |d| {
+            d.sort_key = self.sort_key;
+            d.descending = self.descending;
+            d.dirs_first = self.dirs_first;
+            d.sort();
+        }
+    }
+
+    fn dropAncestors(self: *BTab) void {
+        for (self.ancestors.items) |d| {
+            self.view.cancelPendingDir(d);
+            self.view.closeViewOf(self.hc, d);
+            d.deinit();
+        }
+        self.ancestors.clearRetainingCapacity();
     }
 
     fn dropSubdirsUnder(self: *BTab, prefix: []const u8) void {
@@ -418,6 +488,8 @@ const BTab = struct {
             d.deinit();
         }
         self.subdirs.deinit(a);
+        self.dropAncestors();
+        self.ancestors.deinit(a);
         self.root.deinit();
         for (self.back.items) |p| a.free(p);
         self.back.deinit(a);
@@ -454,6 +526,11 @@ const JobRow = struct {
     done: u64 = 0,
     total: u64 = 0,
     state: enum { running, paused, finished, failed, canceled } = .running,
+    /// Pushed to the undo stack when the job finishes.
+    undo_op: ?*UndoOp = null,
+    /// Trash jobs learn the trashed/info paths only at DONE; this
+    /// holds the ORIGINAL path until then (owned).
+    undo_trash_orig: ?[]u8 = null,
 
     fn terminal(self: *const JobRow) bool {
         return self.state == .finished or self.state == .failed or self.state == .canceled;
@@ -465,7 +542,9 @@ const PendingJob = struct {
     req: u32,
     hc: *HostConn,
     label: []u8,
-    kind: enum { normal, search, compare_left, compare_right } = .normal,
+    kind: enum { normal, search, compare_left, compare_right, calc_size, dup_scan } = .normal,
+    undo_op: ?*UndoOp = null,
+    undo_trash_orig: ?[]u8 = null,
 };
 
 /// One client-mediated cross-host transfer, running or queued.
@@ -487,6 +566,8 @@ const ActiveTransfer = struct {
     /// This transfer IS a sync-back upload for that watch (clears
     /// its uploading flag on completion).
     upload_watch: ?*EditWatch = null,
+    /// Cross-host move: delete the source after a verified copy.
+    delete_src_after: bool = false,
     /// Queue state: at most MAX_ACTIVE_TRANSFERS run concurrently;
     /// the rest wait here in order.
     started: bool = false,
@@ -540,6 +621,8 @@ const CompareCtx = struct {
     excl_entry: *c.GtkEntry = undefined,
     rows: std.ArrayList(*DiffRow) = .empty,
     built: bool = false,
+    /// Hash-verify pass over equal-size "differs" rows.
+    hpairs: std.ArrayList(*CmpPair) = .empty,
 
     const CmpSide = struct {
         hc: *HostConn,
@@ -553,7 +636,7 @@ const CompareCtx = struct {
     };
     const CmpInfo = struct { dir: bool, size: u64, mtime_ms: i64 };
     const DiffStatus = enum { left_only, right_only, differs };
-    const Action = enum(c.guint) { skip = 0, to_right = 1, to_left = 2 };
+    const Action = enum(c.guint) { skip = 0, to_right = 1, to_left = 2, delete = 3 };
     const DiffRow = struct {
         rel: []u8,
         dir: bool,
@@ -561,6 +644,20 @@ const CompareCtx = struct {
         l: ?CmpInfo,
         r: ?CmpInfo,
         dd: *c.GtkWidget,
+        lab: *c.GtkWidget,
+    };
+
+    const CmpPair = struct {
+        row: *DiffRow,
+        l_req: u32,
+        r_req: u32,
+        l_job: u64 = 0,
+        r_job: u64 = 0,
+        l_hash: [64]u8 = undefined,
+        r_hash: [64]u8 = undefined,
+        l_have: bool = false,
+        r_have: bool = false,
+        failed: bool = false,
     };
 
     fn sideFor(self: *CompareCtx, hc: *HostConn, job: u64) ?*CmpSide {
@@ -668,7 +765,7 @@ const CompareCtx = struct {
         c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_MIDDLE);
         c.gtk_box_append(@ptrCast(hbox), lab);
 
-        const options = [_:null]?[*:0]const u8{ "Skip", "Copy to target", "Copy to source" };
+        const options = [_:null]?[*:0]const u8{ "Skip", "Copy to target", "Copy to source", "Delete (from the side that has it)" };
         const dd = c.gtk_drop_down_new_from_strings(@ptrCast(&options));
         c.gtk_drop_down_set_selected(@ptrCast(dd), @intFromEnum(action));
         c.gtk_box_append(@ptrCast(hbox), dd);
@@ -677,7 +774,7 @@ const CompareCtx = struct {
         c.gtk_list_box_row_set_child(@ptrCast(lrow), hbox);
         c.gtk_list_box_append(self.listbox, lrow);
 
-        row.* = .{ .rel = rel_owned, .dir = is_dir, .status = status, .l = l, .r = r, .dd = dd };
+        row.* = .{ .rel = rel_owned, .dir = is_dir, .status = status, .l = l, .r = r, .dd = dd, .lab = lab };
         self.rows.append(self.allocator, row) catch {
             self.allocator.free(rel_owned);
             self.allocator.destroy(row);
@@ -726,12 +823,12 @@ const CompareCtx = struct {
         const txt = if (ndiff == 0)
             std.fmt.bufPrintZ(&info, "Trees are identical ({d} entries scanned).{s}", .{
                 self.left.entries.count() + self.right.entries.count(),
-                if (trunc) " WARNING: scan truncated at 2000 entries/side — comparison is PARTIAL." else "",
+                if (trunc) " WARNING: scan truncated at 100k entries/side — comparison is PARTIAL." else "",
             }) catch "identical"
         else
             std.fmt.bufPrintZ(&info, "{d} difference(s). Review directions, then Execute.{s}", .{
                 ndiff,
-                if (trunc) " WARNING: scan truncated at 2000 entries/side — comparison is PARTIAL." else "",
+                if (trunc) " WARNING: scan truncated at 100k entries/side — comparison is PARTIAL." else "",
             }) catch "differences found";
         c.gtk_label_set_text(self.info_label, txt.ptr);
     }
@@ -759,11 +856,24 @@ const CompareCtx = struct {
             const action: Action = switch (c.gtk_drop_down_get_selected(@ptrCast(row.dd))) {
                 1 => .to_right,
                 2 => .to_left,
+                3 => .delete,
                 else => .skip,
             };
             if (action == .skip) continue;
             if (self.excluded(row.rel)) {
                 excluded_n += 1;
+                continue;
+            }
+            if (action == .delete) {
+                // Mirror deletion: remove the row's entry from the
+                // side that has it (only-one-side rows).
+                const del_side = if (row.l != null and row.r == null) &self.left else if (row.r != null and row.l == null) &self.right else continue;
+                var del_buf: [4096]u8 = undefined;
+                const dp = std.fmt.bufPrint(&del_buf, "{s}/{s}", .{ del_side.root, row.rel }) catch continue;
+                var dlbl: [128]u8 = undefined;
+                const dl = std.fmt.bufPrint(&dlbl, "mirror delete {s}", .{std.fs.path.basename(row.rel)}) catch "mirror delete";
+                view.startDaemonJob(del_side.hc, "delete_tree", dp, "", dl);
+                started += 1;
                 continue;
             }
             const src_side = if (action == .to_right) &self.left else &self.right;
@@ -804,6 +914,8 @@ const CompareCtx = struct {
         const self: *CompareCtx = @ptrCast(@alignCast(user.?));
         if (self.view.compare == self) self.view.compare = null;
         self.window = null;
+        for (self.hpairs.items) |pp| self.allocator.destroy(pp);
+        self.hpairs.deinit(self.allocator);
         for (self.rows.items) |row| {
             self.allocator.free(row.rel);
             self.allocator.destroy(row);
@@ -825,9 +937,233 @@ const CompareCtx = struct {
         const self: *CompareCtx = @ptrCast(@alignCast(user.?));
         self.execute();
     }
+    /// Hash-verify equal-size "differs" rows: identical digests
+    /// flip the row to Skip (mtime noise, not content).
+    fn startHashVerify(self: *CompareCtx) void {
+        const view = self.view;
+        var started: usize = 0;
+        for (self.rows.items) |row| {
+            if (started >= 40) break;
+            if (row.status != .differs or row.dir) continue;
+            if (row.l == null or row.r == null or row.l.?.size != row.r.?.size) continue;
+            const already = for (self.hpairs.items) |pp| {
+                if (pp.row == row) break true;
+            } else false;
+            if (already) continue;
+            const pp = self.allocator.create(CmpPair) catch break;
+            pp.* = .{ .row = row, .l_req = view.nextReq(), .r_req = view.nextReq() };
+            self.hpairs.append(self.allocator, pp) catch {
+                self.allocator.destroy(pp);
+                break;
+            };
+            var pbuf: [4096]u8 = undefined;
+            const lp = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ self.left.root, row.rel }) catch continue;
+            view.sendOp(self.left.hc, .{ .req = pp.l_req, .op = "hash", .path = lp });
+            const rp = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ self.right.root, row.rel }) catch continue;
+            view.sendOp(self.right.hc, .{ .req = pp.r_req, .op = "hash", .path = rp });
+            started += 1;
+        }
+        view.setStatusFmt("hash-verifying {d} equal-size row(s)…", .{started});
+    }
+
+    /// Match a hash-job start reply to a pair. True when consumed.
+    fn consumeHashStart(self: *CompareCtx, hc: *HostConn, rep: WireReply) bool {
+        for (self.hpairs.items) |pp| {
+            if (hc == self.left.hc and pp.l_req == rep.req and pp.l_job == 0) {
+                if (rep.ok and rep.job != 0) pp.l_job = rep.job else pp.failed = true;
+                return true;
+            }
+            if (hc == self.right.hc and pp.r_req == rep.req and pp.r_job == 0) {
+                if (rep.ok and rep.job != 0) pp.r_job = rep.job else pp.failed = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Hash-job done events for verify pairs. True when consumed.
+    fn consumeHashEvent(self: *CompareCtx, hc: *HostConn, e: WireJobEv) bool {
+        if (!std.mem.eql(u8, e.ev, "done") or e.hash.len != 64) return false;
+        for (self.hpairs.items) |pp| {
+            if (hc == self.left.hc and pp.l_job == e.job and pp.l_job != 0 and !pp.l_have) {
+                @memcpy(&pp.l_hash, e.hash[0..64]);
+                pp.l_have = true;
+            } else if (hc == self.right.hc and pp.r_job == e.job and pp.r_job != 0 and !pp.r_have) {
+                @memcpy(&pp.r_hash, e.hash[0..64]);
+                pp.r_have = true;
+            } else continue;
+            if (pp.l_have and pp.r_have) {
+                var lz: [700:0]u8 = undefined;
+                if (std.mem.eql(u8, &pp.l_hash, &pp.r_hash)) {
+                    c.gtk_drop_down_set_selected(@ptrCast(pp.row.dd), @intFromEnum(Action.skip));
+                    if (std.fmt.bufPrintZ(&lz, "{s}  [content IDENTICAL — mtime noise]", .{pp.row.rel})) |t| {
+                        c.gtk_label_set_text(@ptrCast(pp.row.lab), t.ptr);
+                    } else |_| {}
+                } else {
+                    if (std.fmt.bufPrintZ(&lz, "{s}  [content DIFFERS — hash mismatch]", .{pp.row.rel})) |t| {
+                        c.gtk_label_set_text(@ptrCast(pp.row.lab), t.ptr);
+                    } else |_| {}
+                }
+            }
+            return false; // let the jobs panel row complete too
+        }
+        return false;
+    }
+
+    fn onHashVerifyClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *CompareCtx = @ptrCast(@alignCast(user.?));
+        self.startHashVerify();
+    }
+
+    fn onMirrorClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *CompareCtx = @ptrCast(@alignCast(user.?));
+        var n: usize = 0;
+        for (self.rows.items) |row| {
+            if (row.status == .right_only) {
+                c.gtk_drop_down_set_selected(@ptrCast(row.dd), @intFromEnum(Action.delete));
+                n += 1;
+            }
+        }
+        self.view.setStatusFmt("mirror: {d} target-only row(s) marked for deletion — review, then Execute", .{n});
+    }
     fn onCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const self: *CompareCtx = @ptrCast(@alignCast(user.?));
         self.close();
+    }
+};
+
+/// An owned collection item.
+const OwnedColl = struct {
+    spec: []u8,
+    dir: bool,
+};
+
+/// An owned saved-search record.
+const OwnedSearch = struct {
+    spec: []u8,
+    pattern: []u8,
+    content: bool,
+
+    fn deinitOwned(self: OwnedSearch, allocator: std.mem.Allocator) void {
+        allocator.free(self.spec);
+        allocator.free(self.pattern);
+    }
+};
+
+/// One file-coloring rule from filecolors.conf ("glob=#RRGGBB").
+const FileColor = struct {
+    glob: []u8,
+    color: [7]u8,
+};
+
+/// Git-status worker context. The thread runs `git status` via
+/// popen (never on the GLib loop); the idle handback applies the
+/// result unless the view died (orphaned) or navigation moved on
+/// (generation mismatch).
+const GitCtx = struct {
+    view: *BrowserView,
+    root: []u8,
+    gen: u64,
+    out: ?[]u8 = null,
+    orphaned: bool = false,
+
+    fn destroy(self: *GitCtx) void {
+        const a = std.heap.c_allocator;
+        a.free(self.root);
+        if (self.out) |o| a.free(o);
+        a.destroy(self);
+    }
+};
+
+/// One undoable mutation. `a`/`b`/`p` meanings depend on kind:
+/// rename_back: a = current path, b = original path;
+/// delete_created: a = the path our copy created;
+/// trash_restore: a = trashed path, b = original path, p = info file;
+/// rmdir_created: a = the directory mkdir created.
+const UndoOp = struct {
+    host: ?[]u8,
+    kind: enum { rename_back, delete_created, trash_restore, rmdir_created },
+    a: []u8,
+    b: []u8 = &.{},
+    p: []u8 = &.{},
+
+    fn destroy(self: *UndoOp, allocator: std.mem.Allocator) void {
+        if (self.host) |h| allocator.free(h);
+        allocator.free(self.a);
+        if (self.b.len > 0) allocator.free(self.b);
+        if (self.p.len > 0) allocator.free(self.p);
+        allocator.destroy(self);
+    }
+
+    fn describe(self: *const UndoOp) []const u8 {
+        return switch (self.kind) {
+            .rename_back => "undo rename/move",
+            .delete_created => "undo copy (delete the created item)",
+            .trash_restore => "undo trash (restore)",
+            .rmdir_created => "undo new folder",
+        };
+    }
+};
+
+/// A plain-op undo record waiting for its ok reply.
+const PendingUndo = struct {
+    req: u32,
+    op: *UndoOp,
+};
+
+/// Duplicate finder: a host-side scan buckets files by SIZE, then
+/// same-size candidates are hash-confirmed with daemon hash jobs.
+/// Only confirmed same-digest groups are reported.
+const DupState = struct {
+    hc: *HostConn,
+    root: []u8,
+    job: u64 = 0,
+    scanning: bool = true,
+    sizes: std.AutoHashMapUnmanaged(u64, std.ArrayList([]u8)) = .empty,
+    hashes: std.ArrayList(DupHash) = .empty,
+
+    const DupHash = struct {
+        req: u32,
+        job: u64 = 0,
+        path: []u8,
+        size: u64,
+        hash: [64]u8 = undefined,
+        have: bool = false,
+        failed: bool = false,
+    };
+
+    /// Files hashed at most, across all buckets (bounded work).
+    const MAX_HASHED = 200;
+
+    fn destroy(self: *DupState, allocator: std.mem.Allocator) void {
+        var it = self.sizes.iterator();
+        while (it.next()) |kv| {
+            for (kv.value_ptr.items) |p| allocator.free(p);
+            kv.value_ptr.deinit(allocator);
+        }
+        self.sizes.deinit(allocator);
+        for (self.hashes.items) |h| allocator.free(h.path);
+        self.hashes.deinit(allocator);
+        allocator.free(self.root);
+        allocator.destroy(self);
+    }
+};
+
+/// One in-flight .trashinfo fetch for Restore from Trash.
+const RestoreRead = struct {
+    req: u32,
+    hc: *HostConn,
+    /// The trashed entry (…/Trash/files/<name>).
+    trashed: []u8,
+    /// Its metadata file (…/Trash/info/<name>.trashinfo).
+    info: []u8,
+    buf: std.ArrayList(u8) = .empty,
+
+    fn destroy(self: *RestoreRead, allocator: std.mem.Allocator) void {
+        allocator.free(self.trashed);
+        allocator.free(self.info);
+        self.buf.deinit(allocator);
+        allocator.destroy(self);
     }
 };
 
@@ -888,6 +1224,12 @@ pub const BrowserView = struct {
     clip_host: ?[]u8 = null,
     clip_path: ?[]u8 = null,
     clip_paths: std.ArrayList([]u8) = .empty,
+    /// Cut mode: paste MOVES (rename same-host, transfer+delete
+    /// cross-host) and then clears the clipboard.
+    clip_cut: bool = false,
+    /// Undo stack (newest last), bounded.
+    undo_stack: std.ArrayList(*UndoOp) = .empty,
+    pending_undo: std.ArrayList(PendingUndo) = .empty,
     search_bar: *c.GtkWidget = undefined,
     search_entry: *c.GtkEntry = undefined,
     search_content: *c.GtkWidget = undefined,
@@ -900,6 +1242,7 @@ pub const BrowserView = struct {
     preview_meta: *c.GtkLabel = undefined,
     preview_on: bool = false,
     preview_read: ?*PreviewRead = null,
+    restore_read: ?*RestoreRead = null,
     /// Row-thumbnail cache: "path\x00mtime" -> owned texture ref.
     thumbs: std.StringHashMap(*c.GdkTexture) = undefined,
     /// Live local-edit sync-back watches (remote files opened here).
@@ -908,6 +1251,39 @@ pub const BrowserView = struct {
     openwith: ?*OpenWithCtx = null,
     /// The one open compare/sync window.
     compare: ?*CompareCtx = null,
+    /// Places sidebar (bookmarks / recent / devices).
+    places_scroller: *c.GtkWidget = undefined,
+    places_list: *c.GtkListBox = undefined,
+    places_on: bool = false,
+    bookmarks: std.ArrayList([]u8) = .empty,
+    recent: std.ArrayList([]u8) = .empty,
+    /// Saved searches (persisted with places).
+    saved_searches: std.ArrayList(OwnedSearch) = .empty,
+    /// Persistent collection shelf (specs + kind).
+    collection_items: std.ArrayList(OwnedColl) = .empty,
+    /// The most recent search run (owned), for the save button.
+    last_search: ?OwnedSearch = null,
+    /// Relative-time filter for the NEXT find job ("@7d pattern").
+    search_within_ms: u64 = 0,
+    /// Match-cap override for the NEXT find job (compare scans).
+    search_max_matches: u64 = 0,
+    /// User file-coloring rules (~/.config/sketerm/filecolors.conf).
+    file_colors: std.ArrayList(FileColor) = .empty,
+    /// Git status overlay for the current LOCAL root: child name ->
+    /// porcelain status char. Rebuilt by a worker thread per navigate.
+    git_map: std.StringHashMap(u8) = undefined,
+    git_root: []u8 = &.{},
+    git_gen: u64 = 0,
+    git_inflight: ?*GitCtx = null,
+    /// Running "Calculate Size" scan (0 = none).
+    calc_job: u64 = 0,
+    calc_hc: ?*HostConn = null,
+    calc_total: u64 = 0,
+    calc_files: u64 = 0,
+    /// Running duplicate scan: size-bucket phase then hash-confirm.
+    dup: ?*DupState = null,
+    /// Live $EDITOR batch-rename session (at most one).
+    editor_rename: ?*EditorRename = null,
     switch_idle: c.guint = 0,
     /// Running search job (0 = none) and its host + results tab.
     search_job: u64 = 0,
@@ -928,6 +1304,34 @@ pub const BrowserView = struct {
         const self = try allocator.create(BrowserView);
         self.* = .{ .allocator = allocator, .pane = pane };
         self.thumbs = std.StringHashMap(*c.GdkTexture).init(allocator);
+        self.git_map = std.StringHashMap(u8).init(allocator);
+        if (places_mod.load(allocator)) |parsed| {
+            defer parsed.deinit();
+            for (parsed.value.bookmarks) |b| {
+                const owned = allocator.dupe(u8, b) catch continue;
+                self.bookmarks.append(allocator, owned) catch allocator.free(owned);
+            }
+            for (parsed.value.recent) |r| {
+                const owned = allocator.dupe(u8, r) catch continue;
+                self.recent.append(allocator, owned) catch allocator.free(owned);
+            }
+            for (parsed.value.collection) |ci| {
+                const spec = allocator.dupe(u8, ci.spec) catch continue;
+                self.collection_items.append(allocator, .{ .spec = spec, .dir = ci.dir }) catch allocator.free(spec);
+            }
+            for (parsed.value.searches) |sq| {
+                const spec = allocator.dupe(u8, sq.spec) catch continue;
+                const pat = allocator.dupe(u8, sq.pattern) catch {
+                    allocator.free(spec);
+                    continue;
+                };
+                self.saved_searches.append(allocator, .{ .spec = spec, .pattern = pat, .content = sq.content }) catch {
+                    allocator.free(spec);
+                    allocator.free(pat);
+                };
+            }
+        }
+        self.loadFileColors();
 
         self.buildUi();
         pane.attachBrowser(self.root_box, @ptrCast(self), destroyCb);
@@ -1087,11 +1491,15 @@ pub const BrowserView = struct {
         }
         self.pending.deinit(self.allocator);
         for (self.pending_jobs.items) |pj| {
+            if (pj.undo_op) |u| u.destroy(self.allocator);
+            if (pj.undo_trash_orig) |o| self.allocator.free(o);
             self.allocator.free(pj.label);
             self.allocator.destroy(pj);
         }
         self.pending_jobs.deinit(self.allocator);
         for (self.jobs.items) |j| {
+            if (j.undo_op) |u| u.destroy(self.allocator);
+            if (j.undo_trash_orig) |o| self.allocator.free(o);
             self.allocator.free(j.label);
             self.allocator.destroy(j);
         }
@@ -1111,6 +1519,28 @@ pub const BrowserView = struct {
         for (self.clip_paths.items) |p| self.allocator.free(p);
         self.clip_paths.deinit(self.allocator);
         if (self.preview_read) |pr| pr.destroy(self.allocator);
+        if (self.restore_read) |rr| rr.destroy(self.allocator);
+        if (self.dup) |d| d.destroy(self.allocator);
+        if (self.editor_rename) |er| er.destroy(self.allocator);
+        for (self.undo_stack.items) |u| u.destroy(self.allocator);
+        self.undo_stack.deinit(self.allocator);
+        for (self.pending_undo.items) |pu| pu.op.destroy(self.allocator);
+        self.pending_undo.deinit(self.allocator);
+        for (self.bookmarks.items) |b| self.allocator.free(b);
+        self.bookmarks.deinit(self.allocator);
+        for (self.recent.items) |r| self.allocator.free(r);
+        self.recent.deinit(self.allocator);
+        for (self.saved_searches.items) |sq| sq.deinitOwned(self.allocator);
+        self.saved_searches.deinit(self.allocator);
+        for (self.collection_items.items) |ci| self.allocator.free(ci.spec);
+        self.collection_items.deinit(self.allocator);
+        if (self.last_search) |ls| ls.deinitOwned(self.allocator);
+        for (self.file_colors.items) |fc| self.allocator.free(fc.glob);
+        self.file_colors.deinit(self.allocator);
+        if (self.git_inflight) |g| g.orphaned = true;
+        self.clearGitMap();
+        self.git_map.deinit();
+        if (self.git_root.len > 0) self.allocator.free(self.git_root);
         self.clearThumbCache();
         self.thumbs.deinit();
         self.allocator.destroy(self);
@@ -1357,6 +1787,7 @@ pub const BrowserView = struct {
                 continue;
             }
             if (self.feedPreview(hc, f.ftype, f.payload)) continue;
+            if (self.feedRestore(hc, f.ftype, f.payload)) continue;
             switch (f.ftype) {
                 .fs_reply => {
                     if (self.onReply(hc, f.payload)) dirty = true;
@@ -1419,6 +1850,13 @@ pub const BrowserView = struct {
                 }
             } else if (t.x.ok()) {
                 self.setStatusFmt("transfer done: {s}", .{t.label});
+                if (t.delete_src_after) {
+                    // The copy hash-verified; complete the MOVE by
+                    // removing the source (recursive when a tree).
+                    var lbl: [128]u8 = undefined;
+                    const dlabel = std.fmt.bufPrint(&lbl, "move cleanup {s}", .{std.fs.path.basename(t.x.src_root)}) catch "move cleanup";
+                    self.startDaemonJob(t.src_hc, "delete_tree", t.x.src_root, "", dlabel);
+                }
                 if (t.open_when_done) {
                     if (t.open_with_appid) |appid| {
                         launchLocalWithApp(appid, t.x.dst_root);
@@ -1451,6 +1889,8 @@ pub const BrowserView = struct {
         watch_remote: ?[]const u8 = null,
         /// This transfer is a sync-back upload for that watch.
         upload_watch: ?*EditWatch = null,
+        /// Cross-host MOVE: delete the source once the copy landed.
+        delete_src_after: bool = false,
     };
 
     fn startTransfer(
@@ -1466,7 +1906,7 @@ pub const BrowserView = struct {
             self.setStatus("both hosts must be connected — retry in a moment");
             return;
         }
-        if (!open_when_done and opts.upload_watch == null) {
+        if (!open_when_done and opts.upload_watch == null and !opts.delete_src_after) {
             // User copies are coordinated by the local daemon, not this
             // BrowserView. They therefore survive pane/window teardown and
             // reconnect through the stable job journal.
@@ -1531,6 +1971,7 @@ pub const BrowserView = struct {
             .watch_host = if (opts.watch_host) |s| (self.allocator.dupe(u8, s) catch null) else null,
             .watch_remote = if (opts.watch_remote) |s| (self.allocator.dupe(u8, s) catch null) else null,
             .upload_watch = opts.upload_watch,
+            .delete_src_after = opts.delete_src_after,
         };
         self.transfers.append(self.allocator, t) catch {
             x.deinit();
@@ -1633,7 +2074,14 @@ pub const BrowserView = struct {
             return;
         };
         if (pattern.len > 0) {
-            self.sendOp(hc, .{ .req = req, .op = op, .path = path, .pattern = pattern });
+            // search_within_ms / search_max_matches are single-shot:
+            // set right before their find job, zero for everything
+            // else.
+            const within = self.search_within_ms;
+            self.search_within_ms = 0;
+            const maxm = self.search_max_matches;
+            self.search_max_matches = 0;
+            self.sendOp(hc, .{ .req = req, .op = op, .path = path, .pattern = pattern, .within_ms = within, .max_matches = maxm });
         } else if (to.len > 0) {
             self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .@"resume" = false });
         } else {
@@ -1651,6 +2099,31 @@ pub const BrowserView = struct {
         }) catch return;
         if (self.compare) |cmp| {
             if (cmp.consumeJobEvent(hc, e)) return;
+            if (cmp.consumeHashEvent(hc, e)) return;
+        }
+        // Calculate Size scan.
+        if (self.calc_job != 0 and e.job == self.calc_job and hc == self.calc_hc) {
+            if (std.mem.eql(u8, e.ev, "match")) {
+                if (!std.mem.eql(u8, e.kind, "dir")) {
+                    self.calc_total += e.size;
+                    self.calc_files += 1;
+                }
+                return;
+            }
+            if (std.mem.eql(u8, e.ev, "done")) {
+                var sz: [48:0]u8 = undefined;
+                self.setStatusFmt("total size: {s} in {d} file(s){s}", .{
+                    fmtSize(&sz, self.calc_total),
+                    self.calc_files,
+                    if (e.truncated) " (PARTIAL — scan truncated)" else "",
+                });
+                self.calc_job = 0;
+                // fall through so the jobs panel row completes too
+            }
+        }
+        // Duplicate finder (scan phase + hash-confirm phase).
+        if (self.dup) |d| {
+            if (d.hc == hc and self.dupConsumeEvent(d, e)) return;
         }
         if (std.mem.eql(u8, e.ev, "match")) {
             if (e.job == self.search_job and hc == self.search_hc) self.onSearchMatch(e);
@@ -1684,12 +2157,39 @@ pub const BrowserView = struct {
             row.done = e.done;
             row.total = e.total;
             self.setStatusFmt("done: {s}", .{row.label});
+            if (row.undo_op) |u| {
+                row.undo_op = null;
+                self.pushUndo(u);
+            }
+            if (row.undo_trash_orig) |orig| {
+                row.undo_trash_orig = null;
+                if (e.path.len > 0) {
+                    self.recordTrashUndo(row.hc, orig, e.path, e.text);
+                }
+                self.allocator.free(orig);
+            }
         } else if (std.mem.eql(u8, e.ev, "error")) {
             row.state = .failed;
             self.setStatusFmt("job failed: {s} ({s})", .{ row.label, e.message });
+            if (row.undo_op) |u| {
+                row.undo_op = null;
+                u.destroy(self.allocator);
+            }
+            if (row.undo_trash_orig) |orig| {
+                row.undo_trash_orig = null;
+                self.allocator.free(orig);
+            }
         } else if (std.mem.eql(u8, e.ev, "canceled")) {
             row.state = .canceled;
             self.setStatusFmt("canceled: {s}", .{row.label});
+            if (row.undo_op) |u| {
+                row.undo_op = null;
+                u.destroy(self.allocator);
+            }
+            if (row.undo_trash_orig) |orig| {
+                row.undo_trash_orig = null;
+                self.allocator.free(orig);
+            }
         }
         self.renderJobs();
     }
@@ -1738,8 +2238,25 @@ pub const BrowserView = struct {
                     if (pj.kind == .compare_left) cmp.left.job = rep.job;
                     if (pj.kind == .compare_right) cmp.right.job = rep.job;
                 }
+                if (pj.kind == .calc_size) {
+                    self.calc_job = rep.job;
+                    self.calc_hc = hc;
+                    self.calc_total = 0;
+                    self.calc_files = 0;
+                }
+                if (pj.kind == .dup_scan) {
+                    if (self.dup) |d| {
+                        if (d.hc == hc) d.job = rep.job;
+                    }
+                }
                 const row = self.allocator.create(JobRow) catch break;
-                row.* = .{ .hc = hc, .job = rep.job, .label = pj.label };
+                row.* = .{
+                    .hc = hc,
+                    .job = rep.job,
+                    .label = pj.label,
+                    .undo_op = pj.undo_op,
+                    .undo_trash_orig = pj.undo_trash_orig,
+                };
                 self.jobs.append(self.allocator, row) catch {
                     self.allocator.destroy(row);
                     self.allocator.free(pj.label);
@@ -1755,11 +2272,46 @@ pub const BrowserView = struct {
                 if (pj.kind == .compare_left or pj.kind == .compare_right) {
                     if (self.compare) |cmp| cmp.sideFailed(pj.kind == .compare_left);
                 }
+                if (pj.undo_op) |u| u.destroy(self.allocator);
+                if (pj.undo_trash_orig) |o| self.allocator.free(o);
                 self.allocator.free(pj.label);
                 _ = self.pending_jobs.orderedRemove(i);
                 self.allocator.destroy(pj);
             }
             return false;
+        }
+        // Undo record for a plain op (rename/mkdir/move)?
+        for (self.pending_undo.items, 0..) |pu, i| {
+            if (pu.req != rep.req) continue;
+            if (rep.ok) {
+                self.pushUndo(pu.op);
+            } else {
+                pu.op.destroy(self.allocator);
+                self.setStatusFmt("operation failed: {s}", .{rep.@"error"});
+            }
+            _ = self.pending_undo.orderedRemove(i);
+            return false;
+        }
+        // Compare hash-verify start reply?
+        if (self.compare) |cmp| {
+            if (cmp.consumeHashStart(hc, rep)) return false;
+        }
+        // Duplicate-finder hash-start reply?
+        if (self.dup) |d| {
+            if (d.hc == hc) {
+                for (d.hashes.items) |*h| {
+                    if (h.req == rep.req) {
+                        if (rep.ok and rep.job != 0) {
+                            h.job = rep.job;
+                        } else {
+                            h.failed = true;
+                            h.job = 1; // sentinel: no longer "starting"
+                            self.dupMaybeFinish();
+                        }
+                        return false;
+                    }
+                }
+            }
         }
         // Open With host-apps reply?
         if (self.openwith) |ow| {
@@ -1866,6 +2418,32 @@ pub const BrowserView = struct {
             return null;
         };
 
+        const page = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        c.gtk_widget_set_hexpand(page, 1);
+        c.gtk_widget_set_vexpand(page, 1);
+
+        // Sort header (details/compact views).
+        const header = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+        const hname = c.gtk_button_new_with_label("Name");
+        c.gtk_button_set_has_frame(@ptrCast(hname), 0);
+        c.gtk_widget_set_hexpand(hname, 1);
+        c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(hname)), c.GTK_ALIGN_START);
+        const hsize = c.gtk_button_new_with_label("Size");
+        c.gtk_button_set_has_frame(@ptrCast(hsize), 0);
+        const htime = c.gtk_button_new_with_label("Modified");
+        c.gtk_button_set_has_frame(@ptrCast(htime), 0);
+        c.gtk_box_append(@ptrCast(header), hname);
+        c.gtk_box_append(@ptrCast(header), hsize);
+        c.gtk_box_append(@ptrCast(header), htime);
+        c.gtk_box_append(@ptrCast(page), header);
+
+        const content = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+        c.gtk_widget_set_hexpand(content, 1);
+        c.gtk_widget_set_vexpand(content, 1);
+        const miller_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+        c.gtk_widget_set_visible(miller_box, 0);
+        c.gtk_box_append(@ptrCast(content), miller_box);
+
         const scroller = c.gtk_scrolled_window_new();
         c.gtk_widget_set_hexpand(scroller, 1);
         c.gtk_widget_set_vexpand(scroller, 1);
@@ -1873,6 +2451,8 @@ pub const BrowserView = struct {
         c.gtk_list_box_set_selection_mode(@ptrCast(listbox), c.GTK_SELECTION_MULTIPLE);
         c.gtk_list_box_set_activate_on_single_click(@ptrCast(listbox), 0);
         c.gtk_scrolled_window_set_child(@ptrCast(scroller), listbox);
+        c.gtk_box_append(@ptrCast(content), scroller);
+        c.gtk_box_append(@ptrCast(page), content);
 
         const label = c.gtk_label_new("...");
         c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);
@@ -1887,9 +2467,15 @@ pub const BrowserView = struct {
             .view = self,
             .hc = hc,
             .root = dir,
-            .page = scroller,
+            .page = page,
             .listbox = @ptrCast(listbox),
             .tab_label = @ptrCast(@alignCast(label)),
+            .header_box = header,
+            .hbtn_name = hname,
+            .hbtn_size = hsize,
+            .hbtn_time = htime,
+            .scroller = scroller,
+            .miller_box = miller_box,
         };
         self.tabs.append(self.allocator, tab) catch {
             tab.root.deinit();
@@ -1900,17 +2486,27 @@ pub const BrowserView = struct {
         _ = c.g_signal_connect_data(listbox, "row-activated", @ptrCast(&onRowActivated), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(listbox, "selected-rows-changed", @ptrCast(&onSelectionChanged), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(close_btn, "clicked", @ptrCast(&onTabCloseClicked), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(hname, "clicked", @ptrCast(&onSortName), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(hsize, "clicked", @ptrCast(&onSortSize), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(htime, "clicked", @ptrCast(&onSortTime), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
 
         const rclick = c.gtk_gesture_click_new();
         c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
         _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(listbox, @ptrCast(rclick));
 
-        const page_idx = c.gtk_notebook_append_page(self.notebook, scroller, label_box);
+        // Internal DnD: dropping an entry spec here moves (same
+        // host) or copies (cross-host) into the target directory.
+        const dropt = c.gtk_drop_target_new(c.G_TYPE_STRING, c.GDK_ACTION_COPY | c.GDK_ACTION_MOVE);
+        _ = c.g_signal_connect_data(dropt, "drop", @ptrCast(&onListDrop), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(listbox, @ptrCast(dropt));
+
+        const page_idx = c.gtk_notebook_append_page(self.notebook, page, label_box);
         c.gtk_notebook_set_current_page(self.notebook, page_idx);
         self.updateTabLabel(tab);
         self.openDir(tab, dir);
         self.syncPathEntry(tab);
+        self.refreshGitOverlay(tab);
         if (hc.state == .connecting) self.setStatusFmt("connecting to {s}…", .{hc.label()});
         return tab;
     }
@@ -1990,6 +2586,9 @@ pub const BrowserView = struct {
         self.openDir(tab, new_dir);
         self.syncPathEntry(tab);
         self.renderTab(tab);
+        self.refreshGitOverlay(tab);
+        var rbuf: [4300]u8 = undefined;
+        self.recordRecentSpec(tab.spec(&rbuf));
     }
 
     fn navigateSpec(self: *BrowserView, tab: *BTab, spec: []const u8, push_history: bool) void {
@@ -2110,6 +2709,48 @@ pub const BrowserView = struct {
     }
 
     fn renderTab(self: *BrowserView, tab: *BTab) void {
+        tab.applySort();
+        self.updateSortHeader(tab);
+        self.applyViewChrome(tab);
+        switch (tab.view_mode) {
+            .details, .compact => self.renderList(tab),
+            .icons => self.renderGrid(tab),
+            .miller => {
+                self.renderMillerCols(tab);
+                self.renderList(tab);
+            },
+        }
+        var count_buf: [96]u8 = undefined;
+        const cmsg = std.fmt.bufPrint(&count_buf, "{d} items", .{tab.root.entries.items.len}) catch "";
+        self.setStatus(cmsg);
+    }
+
+    /// Show/hide the chrome that belongs to the tab's view mode.
+    fn applyViewChrome(self: *BrowserView, tab: *BTab) void {
+        _ = self;
+        const mode = tab.view_mode;
+        c.gtk_widget_set_visible(tab.header_box, @intFromBool(mode == .details or mode == .compact));
+        c.gtk_widget_set_visible(tab.miller_box, @intFromBool(mode == .miller));
+        c.gtk_widget_set_visible(tab.scroller, @intFromBool(mode != .icons));
+        if (tab.flow_scroller) |fs| c.gtk_widget_set_visible(fs, @intFromBool(mode == .icons));
+        if (mode != .miller and tab.ancestors.items.len > 0) tab.dropAncestors();
+    }
+
+    fn updateSortHeader(self: *BrowserView, tab: *BTab) void {
+        _ = self;
+        const mark_asc = " ^";
+        const mark_desc = " v";
+        const mark = if (tab.descending) mark_desc else mark_asc;
+        var buf: [32:0]u8 = undefined;
+        const nm = std.fmt.bufPrintZ(&buf, "Name{s}", .{if (tab.sort_key == .name) mark else ""}) catch "Name";
+        c.gtk_button_set_label(@ptrCast(tab.hbtn_name), nm.ptr);
+        const sz = std.fmt.bufPrintZ(&buf, "Size{s}", .{if (tab.sort_key == .size) mark else ""}) catch "Size";
+        c.gtk_button_set_label(@ptrCast(tab.hbtn_size), sz.ptr);
+        const tm = std.fmt.bufPrintZ(&buf, "Modified{s}", .{if (tab.sort_key == .mtime) mark else ""}) catch "Modified";
+        c.gtk_button_set_label(@ptrCast(tab.hbtn_time), tm.ptr);
+    }
+
+    fn renderList(self: *BrowserView, tab: *BTab) void {
         // Full rebuild — simple and correct; fine for the row counts
         // a human browses. (Optimization: diff rows later.)
         tab.rendering = true;
@@ -2129,9 +2770,279 @@ pub const BrowserView = struct {
                 }
             }
         }
-        var count_buf: [96]u8 = undefined;
-        const cmsg = std.fmt.bufPrint(&count_buf, "{d} items", .{tab.root.entries.items.len}) catch "";
-        self.setStatus(cmsg);
+    }
+
+    // ── icon-grid view ──────────────────────────────────────────
+
+    fn ensureFlowbox(self: *BrowserView, tab: *BTab) *c.GtkFlowBox {
+        if (tab.flowbox) |fb| return fb;
+        const fs = c.gtk_scrolled_window_new();
+        c.gtk_widget_set_hexpand(fs, 1);
+        c.gtk_widget_set_vexpand(fs, 1);
+        const fb = c.gtk_flow_box_new();
+        c.gtk_flow_box_set_selection_mode(@ptrCast(fb), c.GTK_SELECTION_MULTIPLE);
+        c.gtk_flow_box_set_activate_on_single_click(@ptrCast(fb), 0);
+        c.gtk_flow_box_set_homogeneous(@ptrCast(fb), 1);
+        c.gtk_flow_box_set_max_children_per_line(@ptrCast(fb), 32);
+        c.gtk_scrolled_window_set_child(@ptrCast(fs), fb);
+        // content box = miller_box | scroller | flow_scroller
+        const content = c.gtk_widget_get_parent(tab.scroller);
+        c.gtk_box_append(@ptrCast(content), fs);
+        _ = c.g_signal_connect_data(fb, "child-activated", @ptrCast(&onGridChildActivated), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(fb, "selected-children-changed", @ptrCast(&onGridSelectionChanged), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+        const rclick = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
+        _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onGridRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(@ptrCast(fb), @ptrCast(rclick));
+        tab.flow_scroller = fs;
+        tab.flowbox = @ptrCast(@alignCast(fb));
+        _ = self;
+        return tab.flowbox.?;
+    }
+
+    fn renderGrid(self: *BrowserView, tab: *BTab) void {
+        const fb = self.ensureFlowbox(tab);
+        c.gtk_widget_set_visible(tab.flow_scroller.?, 1);
+        tab.rendering = true;
+        defer tab.rendering = false;
+        while (c.gtk_flow_box_get_child_at_index(fb, 0)) |child| {
+            c.gtk_flow_box_remove(fb, @ptrCast(child));
+        }
+        for (tab.root.entries.items) |e| {
+            if (!tab.show_hidden and e.name.len > 0 and e.name[0] == '.') continue;
+            self.appendTile(tab, fb, e);
+        }
+        // Restore selection.
+        var i: c_int = 0;
+        while (c.gtk_flow_box_get_child_at_index(fb, i)) |child| : (i += 1) {
+            const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse continue;
+            const ctx: *RowCtx = @ptrCast(@alignCast(data));
+            for (tab.selected.items) |path| {
+                if (std.mem.eql(u8, path, ctx.path)) {
+                    c.gtk_flow_box_select_child(fb, child);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) void {
+        var full_buf: [4096]u8 = undefined;
+        const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{
+            if (tab.root.path.len == 1) "" else tab.root.path, e.name,
+        }) catch return;
+
+        const tile = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
+        c.gtk_widget_set_size_request(tile, 96, -1);
+        var icon: ?*c.GtkWidget = null;
+        if (tab.hc.host == null and std.mem.eql(u8, e.kind, "file") and
+            e.size <= THUMB_FILE_CAP and isImageName(e.name))
+        {
+            if (self.thumbTexture(full, e.mtime_ms)) |tex| {
+                const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
+                c.gtk_image_set_pixel_size(@ptrCast(img), 48);
+                icon = img;
+            }
+        }
+        if (icon == null) {
+            const icon_name: [*:0]const u8 = if (std.mem.eql(u8, e.kind, "dir"))
+                "folder-symbolic"
+            else if (std.mem.eql(u8, e.kind, "link"))
+                "emblem-symbolic-link"
+            else
+                "text-x-generic-symbolic";
+            const img = c.gtk_image_new_from_icon_name(icon_name);
+            c.gtk_image_set_pixel_size(@ptrCast(img), 48);
+            icon = img;
+        }
+        c.gtk_box_append(@ptrCast(tile), icon);
+
+        var name_z: [256:0]u8 = undefined;
+        const nn = @min(e.name.len, name_z.len - 1);
+        @memcpy(name_z[0..nn], e.name[0..nn]);
+        name_z[nn] = 0;
+        const lab = c.gtk_label_new(&name_z);
+        c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_MIDDLE);
+        c.gtk_label_set_max_width_chars(@ptrCast(lab), 12);
+        c.gtk_box_append(@ptrCast(tile), lab);
+
+        const child = c.gtk_flow_box_child_new();
+        c.gtk_flow_box_child_set_child(@ptrCast(child), tile);
+        const ctx = self.allocator.create(RowCtx) catch return;
+        ctx.* = .{
+            .allocator = self.allocator,
+            .tab = tab,
+            .path = self.allocator.dupe(u8, full) catch {
+                self.allocator.destroy(ctx);
+                return;
+            },
+            .is_dir = e.tdir,
+        };
+        c.g_object_set_data_full(@ptrCast(child), "sketerm-row", @ptrCast(ctx), @ptrCast(&freeRowCtx));
+        c.gtk_flow_box_append(fb, child);
+    }
+
+    fn onGridChildActivated(_: *c.GtkFlowBox, child: *c.GtkFlowBoxChild, user: ?*anyopaque) callconv(.c) void {
+        const tab: *BTab = @ptrCast(@alignCast(user.?));
+        const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse return;
+        const ctx: *RowCtx = @ptrCast(@alignCast(data));
+        activateEntry(tab, ctx);
+    }
+
+    fn onGridSelectionChanged(fb: *c.GtkFlowBox, user: ?*anyopaque) callconv(.c) void {
+        const tab: *BTab = @ptrCast(@alignCast(user.?));
+        if (tab.rendering) return;
+        const a = tab.view.allocator;
+        for (tab.selected.items) |p| a.free(p);
+        tab.selected.clearRetainingCapacity();
+        var children = c.gtk_flow_box_get_selected_children(fb);
+        const head = children;
+        while (children != null) : (children = children.*.next) {
+            const child: *c.GtkWidget = @ptrCast(@alignCast(children.*.data orelse continue));
+            const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse continue;
+            const ctx: *RowCtx = @ptrCast(@alignCast(data));
+            const owned = a.dupe(u8, ctx.path) catch continue;
+            tab.selected.append(a, owned) catch a.free(owned);
+        }
+        if (head != null) c.g_list_free(head);
+        tab.view.updatePreview();
+    }
+
+    fn onGridRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+        _ = gesture;
+        _ = n_press;
+        const tab: *BTab = @ptrCast(@alignCast(user.?));
+        const self = tab.view;
+        const fb = tab.flowbox orelse return;
+        var path: ?[]u8 = null;
+        var name: ?[]u8 = null;
+        var is_dir = false;
+        if (c.gtk_flow_box_get_child_at_pos(fb, @intFromFloat(x), @intFromFloat(y))) |child| {
+            if (c.g_object_get_data(@ptrCast(child), "sketerm-row")) |data| {
+                const rctx: *RowCtx = @ptrCast(@alignCast(data));
+                path = self.allocator.dupe(u8, rctx.path) catch null;
+                name = self.allocator.dupe(u8, std.fs.path.basename(rctx.path)) catch null;
+                is_dir = rctx.is_dir;
+                c.gtk_flow_box_select_child(fb, child);
+            }
+        }
+        self.showEntryMenu(tab, @as(*c.GtkWidget, @ptrCast(@alignCast(fb))), x, y, path, name, is_dir);
+    }
+
+    // ── miller columns ──────────────────────────────────────────
+
+    /// Rebuild the ancestor-column strip: one subscribed Dir per
+    /// ancestor of the current root, "/" first.
+    fn renderMillerCols(self: *BrowserView, tab: *BTab) void {
+        // Desired chain: every ancestor of root (excluding root).
+        var chain_buf: [64][]const u8 = undefined;
+        var chain_n: usize = 0;
+        {
+            var p: []const u8 = tab.root.path;
+            while (chain_n < chain_buf.len) {
+                const parent = std.fs.path.dirname(p) orelse break;
+                chain_buf[chain_n] = parent;
+                chain_n += 1;
+                if (parent.len <= 1) break;
+                p = parent;
+            }
+        }
+        // chain_buf is child-to-root; reverse into root-first order.
+        var want: [64][]const u8 = undefined;
+        for (0..chain_n) |i| want[i] = chain_buf[chain_n - 1 - i];
+
+        // Resubscribe when the chain changed.
+        var same = tab.ancestors.items.len == chain_n;
+        if (same) {
+            for (tab.ancestors.items, 0..) |d, i| {
+                if (!std.mem.eql(u8, d.path, want[i])) same = false;
+            }
+        }
+        if (!same) {
+            tab.dropAncestors();
+            for (want[0..chain_n]) |ap| {
+                const d = self.makeDir(ap) orelse continue;
+                tab.ancestors.append(self.allocator, d) catch {
+                    d.deinit();
+                    continue;
+                };
+                self.queueListing(tab, d, .open_view);
+            }
+        }
+
+        // Rebuild the column widgets.
+        while (c.gtk_widget_get_first_child(tab.miller_box)) |child| {
+            c.gtk_box_remove(@ptrCast(tab.miller_box), child);
+        }
+        for (tab.ancestors.items) |d| {
+            const col_scroll = c.gtk_scrolled_window_new();
+            c.gtk_widget_set_size_request(col_scroll, 190, -1);
+            c.gtk_widget_set_vexpand(col_scroll, 1);
+            const col = c.gtk_list_box_new();
+            c.gtk_list_box_set_selection_mode(@ptrCast(col), c.GTK_SELECTION_SINGLE);
+            c.gtk_list_box_set_activate_on_single_click(@ptrCast(col), 1);
+            _ = c.g_signal_connect_data(col, "row-activated", @ptrCast(&onMillerRowActivated), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+            c.gtk_scrolled_window_set_child(@ptrCast(col_scroll), col);
+            // The child on the path to root gets selected.
+            const next_seg = millerNextSegment(d.path, tab.root.path);
+            for (d.entries.items) |e| {
+                if (!tab.show_hidden and e.name.len > 0 and e.name[0] == '.') continue;
+                if (!e.tdir) continue; // ancestor columns list directories only
+                const row_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+                c.gtk_widget_set_margin_start(row_box, 6);
+                const icon = c.gtk_image_new_from_icon_name("folder-symbolic");
+                c.gtk_box_append(@ptrCast(row_box), icon);
+                var nz: [256:0]u8 = undefined;
+                const nn = @min(e.name.len, nz.len - 1);
+                @memcpy(nz[0..nn], e.name[0..nn]);
+                nz[nn] = 0;
+                const lab = c.gtk_label_new(&nz);
+                c.gtk_label_set_xalign(@ptrCast(lab), 0);
+                c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_MIDDLE);
+                c.gtk_box_append(@ptrCast(row_box), lab);
+                const row = c.gtk_list_box_row_new();
+                c.gtk_list_box_row_set_child(@ptrCast(row), row_box);
+                var full_buf: [4096]u8 = undefined;
+                const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{
+                    if (d.path.len == 1) "" else d.path, e.name,
+                }) catch continue;
+                const ctx = self.allocator.create(RowCtx) catch continue;
+                ctx.* = .{
+                    .allocator = self.allocator,
+                    .tab = tab,
+                    .path = self.allocator.dupe(u8, full) catch {
+                        self.allocator.destroy(ctx);
+                        continue;
+                    },
+                    .is_dir = true,
+                };
+                c.g_object_set_data_full(@ptrCast(row), "sketerm-row", @ptrCast(ctx), @ptrCast(&freeRowCtx));
+                c.gtk_list_box_append(@ptrCast(col), row);
+                if (next_seg != null and std.mem.eql(u8, e.name, next_seg.?))
+                    c.gtk_list_box_select_row(@ptrCast(col), @ptrCast(row));
+            }
+            c.gtk_box_append(@ptrCast(tab.miller_box), col_scroll);
+            const sep = c.gtk_separator_new(c.GTK_ORIENTATION_VERTICAL);
+            c.gtk_box_append(@ptrCast(tab.miller_box), sep);
+        }
+    }
+
+    fn onMillerRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
+        const tab: *BTab = @ptrCast(@alignCast(user.?));
+        const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse return;
+        const ctx: *RowCtx = @ptrCast(@alignCast(data));
+        var buf: [4096]u8 = undefined;
+        if (ctx.path.len >= buf.len) return;
+        @memcpy(buf[0..ctx.path.len], ctx.path);
+        const path = buf[0..ctx.path.len];
+        var hbuf: [256]u8 = undefined;
+        var host: ?[]const u8 = null;
+        if (tab.hc.host) |h| {
+            if (h.len >= hbuf.len) return;
+            @memcpy(hbuf[0..h.len], h);
+            host = hbuf[0..h.len];
+        }
+        tab.view.navigate(tab, host, path, true);
     }
 
     fn renderDirRows(self: *BrowserView, tab: *BTab, dir: *Dir, depth: u32) void {
@@ -2229,20 +3140,64 @@ pub const BrowserView = struct {
         @memcpy(name_buf[0..nn], e.name[0..nn]);
         name_buf[nn] = 0;
         const name_label = c.gtk_label_new(&name_buf);
+        if (self.fileColorFor(e.name)) |color| {
+            const esc = c.g_markup_escape_text(&name_buf, -1);
+            var mk: [640:0]u8 = undefined;
+            if (std.fmt.bufPrintZ(&mk, "<span foreground=\"{s}\">{s}</span>", .{
+                color, std.mem.span(@as([*:0]const u8, @ptrCast(esc))),
+            })) |m| {
+                c.gtk_label_set_markup(@ptrCast(name_label), m.ptr);
+            } else |_| {}
+            c.g_free(esc);
+        }
         c.gtk_label_set_xalign(@ptrCast(name_label), 0);
         c.gtk_widget_set_hexpand(name_label, 1);
         c.gtk_label_set_ellipsize(@ptrCast(name_label), c.PANGO_ELLIPSIZE_MIDDLE);
         c.gtk_box_append(@ptrCast(row_box), name_label);
 
+        // Git status badge (local current dir only).
+        if (tab.hc.host == null and dir == tab.root) {
+            if (self.git_map.get(e.name)) |st| {
+                var gz: [8:0]u8 = undefined;
+                const gtxt = std.fmt.bufPrintZ(&gz, "[{c}]", .{st}) catch "";
+                const gl = c.gtk_label_new(gtxt.ptr);
+                c.gtk_widget_add_css_class(gl, if (st == '?') "dim-label" else "warning");
+                c.gtk_box_append(@ptrCast(row_box), gl);
+            }
+        }
+
         if (e.tags.len > 0) {
             var tag_z: [128:0]u8 = undefined;
             const ttxt = std.fmt.bufPrintZ(&tag_z, "[{s}]", .{e.tags}) catch "";
             const tag_label = c.gtk_label_new(ttxt.ptr);
-            c.gtk_widget_add_css_class(tag_label, "dim-label");
+            // Deterministic per-tagset color chip (markup only when
+            // the text is markup-safe).
+            if (std.mem.indexOfAny(u8, e.tags, "<>&\"") == null) {
+                var mk: [192:0]u8 = undefined;
+                if (std.fmt.bufPrintZ(&mk, "<span foreground=\"{s}\">[{s}]</span>", .{
+                    tagColorHex(e.tags), e.tags,
+                })) |m| {
+                    c.gtk_label_set_markup(@ptrCast(tag_label), m.ptr);
+                } else |_| {}
+            } else {
+                c.gtk_widget_add_css_class(tag_label, "dim-label");
+            }
             c.gtk_box_append(@ptrCast(row_box), tag_label);
         }
 
-        if (!std.mem.eql(u8, e.kind, "dir")) {
+        // Compact view: name (+tags) only. Details adds perms, size,
+        // and mtime columns.
+        const compact = tab.view_mode == .compact;
+        if (!compact and tab.view_mode == .details) {
+            var perm_z: [16:0]u8 = undefined;
+            const ptxt = fmtModeZ(&perm_z, e.mode, e.tdir);
+            const perm_label = c.gtk_label_new(ptxt);
+            c.gtk_widget_add_css_class(perm_label, "dim-label");
+            c.gtk_widget_add_css_class(perm_label, "monospace");
+            c.gtk_box_append(@ptrCast(row_box), perm_label);
+        }
+
+        if (!compact and !std.mem.eql(u8, e.kind, "dir")) {
             var size_buf: [48:0]u8 = undefined;
             const s = fmtSize(&size_buf, e.size);
             const size_label = c.gtk_label_new(s.ptr);
@@ -2250,7 +3205,7 @@ pub const BrowserView = struct {
             c.gtk_box_append(@ptrCast(row_box), size_label);
         }
 
-        if (e.mtime_ms != 0) {
+        if (!compact and e.mtime_ms != 0) {
             var time_buf: [40:0]u8 = undefined;
             const tstr = fmtTimeZ(&time_buf, e.mtime_ms);
             const time_label = c.gtk_label_new(tstr);
@@ -2274,11 +3229,16 @@ pub const BrowserView = struct {
         };
         c.g_object_set_data_full(@ptrCast(row), "sketerm-row", @ptrCast(ctx), @ptrCast(&freeRowCtx));
 
-        // Drag source: the entry's path as text — dropping on a
-        // terminal pane types the path (pane accepts string drops).
+        // Drag source: host-qualified spec as text. A terminal drop
+        // types it (plain path for local files); a drop on another
+        // browser tab moves/copies (internal DnD).
         {
-            var pz: [4200:0]u8 = undefined;
-            if (std.fmt.bufPrintZ(&pz, "{s}", .{full})) |pzs| {
+            var pz: [4500:0]u8 = undefined;
+            const spec_res = if (tab.hc.host) |h|
+                std.fmt.bufPrintZ(&pz, "{s}:{s}", .{ h, full })
+            else
+                std.fmt.bufPrintZ(&pz, "{s}", .{full});
+            if (spec_res) |pzs| {
                 const provider = c.gdk_content_provider_new_typed(c.G_TYPE_STRING, pzs.ptr);
                 const dsrc = c.gtk_drag_source_new();
                 c.gtk_drag_source_set_content(dsrc, provider);
@@ -2324,6 +3284,10 @@ pub const BrowserView = struct {
         const tab: *BTab = @ptrCast(@alignCast(user.?));
         const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse return;
         const ctx: *RowCtx = @ptrCast(@alignCast(data));
+        activateEntry(tab, ctx);
+    }
+
+    fn activateEntry(tab: *BTab, ctx: *RowCtx) void {
         const self = tab.view;
         if (tab.root.collection) {
             // Collection rows hold host-qualified specs: open the
@@ -2426,7 +3390,21 @@ pub const BrowserView = struct {
                 c.gtk_list_box_select_row(tab.listbox, row);
             }
         }
+        self.showEntryMenu(tab, @ptrCast(@alignCast(tab.listbox)), x, y, path, name, is_dir);
+    }
 
+    /// Build and pop the entry context menu. Takes ownership of
+    /// `path`/`name`; `parent` is the visible widget the click hit.
+    fn showEntryMenu(
+        self: *BrowserView,
+        tab: *BTab,
+        parent: *c.GtkWidget,
+        x: f64,
+        y: f64,
+        path: ?[]u8,
+        name: ?[]u8,
+        is_dir: bool,
+    ) void {
         const popover = c.gtk_popover_new();
         const ctx = self.allocator.create(MenuCtx) catch {
             if (path) |p| self.allocator.free(p);
@@ -2461,12 +3439,22 @@ pub const BrowserView = struct {
                 if (self.on_host_term != null)
                     menuButton(box, "Open Terminal Tab Here", &onMenuTermTab, ctx, false);
                 menuButton(box, "Open in New Browser Tab", &onMenuOpenTab, ctx, false);
+                menuButton(box, "Calculate Size", &onMenuCalcSize, ctx, false);
+                menuButton(box, "Find Duplicates Here", &onMenuFindDups, ctx, false);
+                menuButton(box, "Add Bookmark", &onMenuBookmark, ctx, false);
             } else if (!is_local and self.on_host_open != null) {
                 menuButton(box, "Open on Host (app forward)", &onMenuHostOpen, ctx, false);
             }
             if (!is_dir)
                 menuButton(box, "Open With…", &onMenuOpenWith, ctx, false);
+            if (isTrashPath(ctx.path.?))
+                menuButton(box, "Restore from Trash", &onMenuTrashRestoreItem, ctx, false);
+            if (is_local and !is_dir and isSketermMount(ctx.path.?)) {
+                menuButton(box, "Pin (keep hydrated)", &onMenuPin, ctx, false);
+                menuButton(box, "Evict Cached Data", &onMenuEvict, ctx, false);
+            }
             menuButton(box, "Copy", &onMenuCopy, ctx, false);
+            menuButton(box, "Cut", &onMenuCut, ctx, false);
             menuButton(box, "Copy Path", &onMenuCopyPath, ctx, false);
             menuButton(box, "Rename…", &onMenuRename, ctx, false);
             menuButton(box, "Properties…", &onMenuProperties, ctx, false);
@@ -2475,8 +3463,11 @@ pub const BrowserView = struct {
                 menuButton(box, "Extract Here", &onMenuExtractHere, ctx, false);
             menuButton(box, "Compress to .tar.gz", &onMenuArchiveCreate, ctx, false);
             menuButton(box, "Add to Collection", &onMenuCollectionAdd, ctx, false);
-            if (countSelected(tab) > 1)
+            menuButton(box, "Export Selection to Shell ($SK_SEL)", &onMenuExportSel, ctx, false);
+            if (countSelected(tab) > 1) {
                 menuButton(box, "Batch Rename Selected…", &onMenuBatchRename, ctx, false);
+                menuButton(box, "Batch Rename in $EDITOR…", &onMenuEditorRename, ctx, false);
+            }
             menuButton(box, "Move to Trash", &onMenuTrash, ctx, false);
             menuButton(box, "Delete Permanently…", &onMenuDelete, ctx, true);
         }
@@ -2486,11 +3477,17 @@ pub const BrowserView = struct {
             menuButton(box, "Compare / Sync with Copied…", &onMenuCompare, ctx, false);
         }
         menuButton(box, "New Folder…", &onMenuNewFolder, ctx, false);
+        if (self.undo_stack.items.len > 0) {
+            var uz: [96:0]u8 = undefined;
+            const last = self.undo_stack.items[self.undo_stack.items.len - 1];
+            const utxt = std.fmt.bufPrintZ(&uz, "Undo ({s})", .{last.describe()}) catch "Undo";
+            menuButton(box, utxt.ptr, &onMenuUndo, ctx, false);
+        }
         if (ctx.path != null) self.appendActionButtons(box, ctx);
         }
 
         c.gtk_popover_set_child(@ptrCast(popover), box);
-        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(tab.listbox)));
+        c.gtk_widget_set_parent(popover, parent);
         connectPopoverAutoUnparent(popover);
         const rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
         c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
@@ -2536,9 +3533,17 @@ pub const BrowserView = struct {
     }
 
     fn onMenuCopy(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        copyToClip(@ptrCast(@alignCast(user.?)), false);
+    }
+
+    fn onMenuCut(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        copyToClip(@ptrCast(@alignCast(user.?)), true);
+    }
+
+    fn copyToClip(ctx: *MenuCtx, cut: bool) void {
         const self = ctx.view;
         const path = ctx.path orelse return menuDone(ctx);
+        self.clip_cut = cut;
         if (self.clip_host) |s| self.allocator.free(s);
         self.clip_host = null;
         if (ctx.tab.hc.host) |h| self.clip_host = self.allocator.dupe(u8, h) catch null;
@@ -2563,10 +3568,11 @@ pub const BrowserView = struct {
         }
         if (self.clip_paths.items.len > 0)
             self.clip_path = self.allocator.dupe(u8, self.clip_paths.items[0]) catch null;
+        const verb: []const u8 = if (cut) "cut" else "copied";
         if (self.clip_paths.items.len > 1) {
-            self.setStatusFmt("copied {d} items", .{self.clip_paths.items.len});
+            self.setStatusFmt("{s} {d} items", .{ verb, self.clip_paths.items.len });
         } else {
-            self.setStatusFmt("copied: {s}", .{path});
+            self.setStatusFmt("{s}: {s}", .{ verb, path });
         }
         menuDone(ctx);
     }
@@ -2659,7 +3665,7 @@ pub const BrowserView = struct {
         pasteChoiceButton(box, "Overwrite", &onPasteOverwrite, pctx, true);
 
         c.gtk_popover_set_child(@ptrCast(popover), box);
-        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(tab.listbox)));
+        c.gtk_widget_set_parent(popover, tab.page);
         connectPopoverAutoUnparent(popover);
         c.gtk_popover_popup(@ptrCast(popover));
         menuDone(ctx);
@@ -2700,10 +3706,12 @@ pub const BrowserView = struct {
         return candidate;
     }
 
-    /// Start one copy per source, honoring `choice` for names that
-    /// already exist in the target directory.
+    /// Start one copy (or move, when the clipboard is CUT) per
+    /// source, honoring `choice` for names that already exist in the
+    /// target directory.
     fn pasteExecute(self: *BrowserView, tab: *BTab, sources: []const []u8, choice: ConflictChoice) void {
         const dir = tab.root.path;
+        const cut = self.clip_cut;
         var skipped: usize = 0;
         for (sources) |src| {
             const base = std.fs.path.basename(src);
@@ -2726,21 +3734,67 @@ pub const BrowserView = struct {
             const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
                 if (dir.len == 1) "" else dir, name,
             }) catch continue;
-            // Overwriting a file with itself is a no-op, not a copy.
+            // Pasting onto itself is a no-op, not a copy/move.
             if (hostEq(self.clip_host, tab.hc.host) and std.mem.eql(u8, src, dst)) {
                 skipped += 1;
                 continue;
             }
             if (hostEq(self.clip_host, tab.hc.host)) {
-                var lbl: [128]u8 = undefined;
-                const label = std.fmt.bufPrint(&lbl, "copy {s}", .{base}) catch base;
-                self.startDaemonJob(tab.hc, "copy", src, dst, label);
+                if (cut) {
+                    // Same-host move = one rename, undoable.
+                    const req = self.nextReq();
+                    self.deferUndo(req, self.makeUndo(tab.hc.host, .rename_back, dst, src, ""));
+                    self.sendOp(tab.hc, .{ .req = req, .op = "rename", .path = src, .to = dst });
+                } else {
+                    var lbl: [128]u8 = undefined;
+                    const label = std.fmt.bufPrint(&lbl, "copy {s}", .{base}) catch base;
+                    self.startDaemonJobUndo(tab.hc, "copy", src, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, "", ""));
+                }
             } else {
                 const src_hc = self.hostConnFor(if (self.clip_host) |h| @as(?[]const u8, h) else null) orelse continue;
-                self.startTransfer(src_hc, src, tab.hc, dst, .{});
+                self.startTransfer(src_hc, src, tab.hc, dst, .{ .delete_src_after = cut });
             }
         }
         if (skipped > 0) self.setStatusFmt("skipped {d} existing item(s)", .{skipped});
+        if (cut) {
+            // Cut is one-shot: the sources are moving away.
+            if (self.clip_path) |s| self.allocator.free(s);
+            self.clip_path = null;
+            for (self.clip_paths.items) |p| self.allocator.free(p);
+            self.clip_paths.clearRetainingCapacity();
+            self.clip_cut = false;
+        }
+    }
+
+    /// startDaemonJob variant that records an undo op on completion.
+    fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, label: []const u8, undo: ?*UndoOp) void {
+        if (hc.state != .ready) {
+            self.setStatusFmt("not connected to {s}", .{hc.label()});
+            if (undo) |u| u.destroy(self.allocator);
+            return;
+        }
+        const req = self.nextReq();
+        const pj = self.allocator.create(PendingJob) catch {
+            if (undo) |u| u.destroy(self.allocator);
+            return;
+        };
+        pj.* = .{
+            .req = req,
+            .hc = hc,
+            .label = self.allocator.dupe(u8, label) catch {
+                self.allocator.destroy(pj);
+                if (undo) |u| u.destroy(self.allocator);
+                return;
+            },
+            .undo_op = undo,
+        };
+        self.pending_jobs.append(self.allocator, pj) catch {
+            self.allocator.free(pj.label);
+            self.allocator.destroy(pj);
+            if (undo) |u| u.destroy(self.allocator);
+            return;
+        };
+        self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .@"resume" = false });
     }
 
     fn countSelected(tab: *BTab) usize {
@@ -2858,6 +3912,9 @@ pub const BrowserView = struct {
         c.gtk_label_set_xalign(@ptrCast(sec), 0);
         c.gtk_box_append(@ptrCast(box), sec);
 
+        const owdef = c.gtk_check_button_new_with_label("Always use for this file type");
+        c.g_object_set_data(@ptrCast(popover), "sketerm-owdef", @ptrCast(owdef));
+
         var namez: [512:0]u8 = undefined;
         const base = std.fs.path.basename(path);
         var app_count: usize = 0;
@@ -2883,6 +3940,7 @@ pub const BrowserView = struct {
             c.gtk_widget_add_css_class(none, "dim-label");
             c.gtk_box_append(@ptrCast(box), none);
         }
+        c.gtk_box_append(@ptrCast(box), owdef);
 
         // Host applications (remote tabs): one daemon round trip.
         // The widgets always join the tree (hidden locally) so they
@@ -2909,7 +3967,7 @@ pub const BrowserView = struct {
         c.gtk_widget_set_size_request(scroll, 320, 380);
         c.gtk_scrolled_window_set_child(@ptrCast(scroll), box);
         c.gtk_popover_set_child(@ptrCast(popover), scroll);
-        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(tab.listbox)));
+        c.gtk_widget_set_parent(popover, tab.page);
         connectPopoverAutoUnparent(popover);
         const rect = c.GdkRectangle{ .x = 320, .y = 200, .width = 1, .height = 1 };
         c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
@@ -2966,6 +4024,12 @@ pub const BrowserView = struct {
                 }
             }
         } else if (actx.appid) |appid| {
+            // "Always use for this type": register the association
+            // before launching.
+            if (c.g_object_get_data(@ptrCast(actx.popover), "sketerm-owdef")) |cb| {
+                if (c.gtk_check_button_get_active(@ptrCast(@alignCast(cb))) != 0)
+                    setDefaultAppForPath(appid, actx.path);
+            }
             if (tab.hc.host == null) {
                 launchLocalWithApp(appid, actx.path);
             } else {
@@ -3145,7 +4209,7 @@ pub const BrowserView = struct {
         c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(tctx), @ptrCast(&MenuCtx.free));
         _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onTagsActivate), @ptrCast(tctx), null, c.G_CONNECT_DEFAULT);
         c.gtk_popover_set_child(@ptrCast(popover), entry);
-        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(ctx.tab.listbox)));
+        c.gtk_widget_set_parent(popover, ctx.tab.page);
         connectPopoverAutoUnparent(popover);
         c.gtk_popover_popup(@ptrCast(popover));
         _ = c.gtk_widget_grab_focus(entry);
@@ -3168,41 +4232,63 @@ pub const BrowserView = struct {
         const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
         const self = ctx.view;
         const path = ctx.path orelse return menuDone(ctx);
-        const tab = self.collection_tab orelse blk: {
-            const t = self.newTab(ctx.tab.hc.host, ctx.tab.root.path) orelse return menuDone(ctx);
-            self.closeViewOf(t.hc, t.root);
-            var i: usize = 0;
-            while (i < self.pending.items.len) {
-                if (self.pending.items[i].tab == t) self.dropPending(i) else i += 1;
-            }
-            t.root.flat = true;
-            t.root.collection = true;
-            t.root.loaded = true;
-            t.root.view_id = 0;
-            c.gtk_label_set_text(t.tab_label, "collection");
-            self.collection_tab = t;
-            break :blk t;
-        };
+        const tab = self.ensureCollectionTab(ctx.tab.hc.host, ctx.tab.root.path) orelse return menuDone(ctx);
         // Entry: display = host-qualified spec; target = same spec.
         var spec_buf: [4400]u8 = undefined;
         const spec = if (ctx.tab.hc.host) |h|
             std.fmt.bufPrint(&spec_buf, "{s}:{s}", .{ h, path }) catch return menuDone(ctx)
         else
             path;
-        const dir = tab.root;
-        if (dir.find(spec) != null) return menuDone(ctx); // already shelved
+        if (tab.root.find(spec) != null) return menuDone(ctx); // already shelved
+        self.appendCollectionEntry(tab, spec, ctx.is_dir);
+        const already = for (self.collection_items.items) |ci| {
+            if (std.mem.eql(u8, ci.spec, spec)) break true;
+        } else false;
+        if (!already) {
+            const owned = self.allocator.dupe(u8, spec) catch null;
+            if (owned) |o| {
+                self.collection_items.append(self.allocator, .{ .spec = o, .dir = ctx.is_dir }) catch self.allocator.free(o);
+                self.savePlaces();
+            }
+        }
+        self.setStatusFmt("added to collection: {s}", .{spec});
+        menuDone(ctx);
+    }
+
+    /// The collection shelf tab, created (and seeded from the
+    /// persisted list) on first use.
+    fn ensureCollectionTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
+        if (self.collection_tab) |t| return t;
+        const t = self.newTab(host, path) orelse return null;
+        self.closeViewOf(t.hc, t.root);
+        var i: usize = 0;
+        while (i < self.pending.items.len) {
+            if (self.pending.items[i].tab == t) self.dropPending(i) else i += 1;
+        }
+        t.root.flat = true;
+        t.root.collection = true;
+        t.root.loaded = true;
+        t.root.view_id = 0;
+        c.gtk_label_set_text(t.tab_label, "collection");
+        self.collection_tab = t;
+        for (self.collection_items.items) |ci| self.appendCollectionEntry(t, ci.spec, ci.dir);
+        return t;
+    }
+
+    fn appendCollectionEntry(self: *BrowserView, tab: *BTab, spec: []const u8, is_dir: bool) void {
         const a = self.allocator;
-        const name = a.dupe(u8, spec) catch return menuDone(ctx);
-        const kind = a.dupe(u8, if (ctx.is_dir) "dir" else "file") catch {
+        if (tab.root.find(spec) != null) return;
+        const name = a.dupe(u8, spec) catch return;
+        const kind = a.dupe(u8, if (is_dir) "dir" else "file") catch {
             a.free(name);
-            return menuDone(ctx);
+            return;
         };
         const tgt = a.dupe(u8, spec) catch {
             a.free(name);
             a.free(kind);
-            return menuDone(ctx);
+            return;
         };
-        dir.entries.append(a, .{
+        tab.root.entries.append(a, .{
             .name = name,
             .kind = kind,
             .size = 0,
@@ -3215,8 +4301,6 @@ pub const BrowserView = struct {
             a.free(kind);
             a.free(tgt);
         };
-        self.setStatusFmt("added to collection: {s}", .{spec});
-        menuDone(ctx);
     }
 
     fn onMenuCollectionOpen(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -3246,7 +4330,217 @@ pub const BrowserView = struct {
             }
             if (self.currentTab() == tab) self.renderTab(tab);
         }
+        var ci: usize = 0;
+        var changed = false;
+        while (ci < self.collection_items.items.len) {
+            if (std.mem.eql(u8, self.collection_items.items[ci].spec, spec)) {
+                self.allocator.free(self.collection_items.items[ci].spec);
+                _ = self.collection_items.orderedRemove(ci);
+                changed = true;
+            } else ci += 1;
+        }
+        if (changed) self.savePlaces();
         menuDone(ctx);
+    }
+
+    fn onMenuExportSel(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const tab = ctx.tab;
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(self.allocator);
+        const paths: []const []u8 = if (tab.selected.items.len > 0)
+            tab.selected.items
+        else if (ctx.path) |pp|
+            (&[_][]u8{pp})[0..]
+        else
+            return menuDone(ctx);
+        cmd.appendSlice(self.allocator, "SK_SEL=") catch return menuDone(ctx);
+        appendQuoted(&cmd, self.allocator, paths[0]) catch return menuDone(ctx);
+        cmd.appendSlice(self.allocator, "; SK_SEL_ALL='") catch return menuDone(ctx);
+        for (paths, 0..) |sp, i| {
+            if (i > 0) cmd.append(self.allocator, ' ') catch return menuDone(ctx);
+            for (sp) |ch| {
+                if (ch == '\'') {
+                    cmd.appendSlice(self.allocator, "'\\''") catch return menuDone(ctx);
+                } else cmd.append(self.allocator, ch) catch return menuDone(ctx);
+            }
+        }
+        cmd.appendSlice(self.allocator, "'\n") catch return menuDone(ctx);
+        self.pane.terminal.writeRaw(cmd.items);
+        self.pane.setBrowserVisible(false);
+        self.setStatusFmt("exported {d} path(s) as $SK_SEL / $SK_SEL_ALL", .{paths.len});
+        menuDone(ctx);
+    }
+
+    // ── $EDITOR batch rename ────────────────────────────────────
+
+    /// Editor-buffer rename: selection names go to a temp file, the
+    /// pane's SHELL runs $EDITOR on it, and a sentinel "done" file
+    /// (watched with GFileMonitor) triggers applying the renames.
+    const EditorRename = struct {
+        view: *BrowserView,
+        host: ?[]u8,
+        paths: std.ArrayList([]u8) = .empty,
+        tmp: []u8,
+        done: []u8,
+        monitor: ?*c.GFileMonitor = null,
+
+        fn destroy(self: *EditorRename, allocator: std.mem.Allocator) void {
+            if (self.monitor) |m| {
+                _ = c.g_file_monitor_cancel(m);
+                c.g_object_unref(m);
+            }
+            var zb: [4300]u8 = undefined;
+            if (std.fmt.bufPrintZ(&zb, "{s}", .{self.tmp})) |z| {
+                _ = c.unlink(z.ptr);
+            } else |_| {}
+            if (std.fmt.bufPrintZ(&zb, "{s}", .{self.done})) |z| {
+                _ = c.unlink(z.ptr);
+            } else |_| {}
+            for (self.paths.items) |sp| allocator.free(sp);
+            self.paths.deinit(allocator);
+            if (self.host) |h| allocator.free(h);
+            allocator.free(self.tmp);
+            allocator.free(self.done);
+            allocator.destroy(self);
+        }
+    };
+
+    fn onMenuEditorRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const tab = ctx.tab;
+        if (tab.selected.items.len < 2) return menuDone(ctx);
+        if (self.editor_rename) |er| {
+            er.destroy(self.allocator);
+            self.editor_rename = null;
+        }
+        var stamp: [32]u8 = undefined;
+        var t: c.timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &t);
+        const tag = std.fmt.bufPrint(&stamp, "{d}", .{@as(u64, @intCast(t.tv_nsec)) ^ @as(u64, @intCast(t.tv_sec))}) catch return menuDone(ctx);
+        const cache_root = c.g_get_user_cache_dir();
+        var tb: [4200]u8 = undefined;
+        var db: [4200]u8 = undefined;
+        const tmp = std.fmt.bufPrint(&tb, "{s}/sketerm-rename-{s}.txt", .{ cache_root, tag }) catch return menuDone(ctx);
+        const done = std.fmt.bufPrint(&db, "{s}/sketerm-rename-{s}.done", .{ cache_root, tag }) catch return menuDone(ctx);
+
+        const er = self.allocator.create(EditorRename) catch return menuDone(ctx);
+        er.* = .{
+            .view = self,
+            .host = if (tab.hc.host) |h| (self.allocator.dupe(u8, h) catch null) else null,
+            .tmp = self.allocator.dupe(u8, tmp) catch {
+                self.allocator.destroy(er);
+                return menuDone(ctx);
+            },
+            .done = self.allocator.dupe(u8, done) catch {
+                self.allocator.free(er.tmp);
+                self.allocator.destroy(er);
+                return menuDone(ctx);
+            },
+        };
+        // Write one basename per line; remember the full paths.
+        var zb: [4300:0]u8 = undefined;
+        const tz = std.fmt.bufPrintZ(&zb, "{s}", .{tmp}) catch {
+            er.destroy(self.allocator);
+            return menuDone(ctx);
+        };
+        const f = c.fopen(tz.ptr, "wb") orelse {
+            er.destroy(self.allocator);
+            return menuDone(ctx);
+        };
+        for (tab.selected.items) |sp| {
+            const owned = self.allocator.dupe(u8, sp) catch continue;
+            er.paths.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+                continue;
+            };
+            const base = std.fs.path.basename(sp);
+            _ = c.fwrite(base.ptr, 1, base.len, f);
+            _ = c.fwrite("\n", 1, 1, f);
+        }
+        _ = c.fclose(f);
+
+        var dzb: [4300:0]u8 = undefined;
+        const dz = std.fmt.bufPrintZ(&dzb, "{s}", .{done}) catch {
+            er.destroy(self.allocator);
+            return menuDone(ctx);
+        };
+        const gfile = c.g_file_new_for_path(dz.ptr);
+        er.monitor = c.g_file_monitor_file(gfile, c.G_FILE_MONITOR_NONE, null, null);
+        c.g_object_unref(gfile);
+        if (er.monitor == null) {
+            er.destroy(self.allocator);
+            return menuDone(ctx);
+        }
+        _ = c.g_signal_connect_data(er.monitor, "changed", @ptrCast(&onEditorRenameDone), @ptrCast(er), null, c.G_CONNECT_DEFAULT);
+        self.editor_rename = er;
+
+        // Run $EDITOR in the pane's shell; touching the done file
+        // fires the monitor.
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(self.allocator);
+        cmd.appendSlice(self.allocator, "\"${EDITOR:-vi}\" ") catch return menuDone(ctx);
+        appendQuoted(&cmd, self.allocator, tmp) catch return menuDone(ctx);
+        cmd.appendSlice(self.allocator, " && touch ") catch return menuDone(ctx);
+        appendQuoted(&cmd, self.allocator, done) catch return menuDone(ctx);
+        cmd.append(self.allocator, '\n') catch return menuDone(ctx);
+        self.pane.terminal.writeRaw(cmd.items);
+        self.pane.setBrowserVisible(false);
+        self.setStatus("edit the names, save, and quit the editor to apply");
+        menuDone(ctx);
+    }
+
+    fn onEditorRenameDone(
+        _: *c.GFileMonitor,
+        _: ?*c.GFile,
+        _: ?*c.GFile,
+        event: c.GFileMonitorEvent,
+        user: ?*anyopaque,
+    ) callconv(.c) void {
+        if (event != c.G_FILE_MONITOR_EVENT_CREATED and event != c.G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT) return;
+        const er: *EditorRename = @ptrCast(@alignCast(user.?));
+        const self = er.view;
+        if (self.editor_rename != er) return;
+        defer {
+            self.editor_rename = null;
+            er.destroy(self.allocator);
+        }
+        var zb: [4300:0]u8 = undefined;
+        const tz = std.fmt.bufPrintZ(&zb, "{s}", .{er.tmp}) catch return;
+        const f = c.fopen(tz.ptr, "rb") orelse return;
+        var content: [64 * 1024]u8 = undefined;
+        const n = c.fread(&content, 1, content.len, f);
+        _ = c.fclose(f);
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(self.allocator);
+        var it = std.mem.splitScalar(u8, content[0..n], '\n');
+        while (it.next()) |line| {
+            const nm = std.mem.trim(u8, line, " \t\r");
+            if (nm.len > 0) names.append(self.allocator, nm) catch return;
+        }
+        if (names.items.len != er.paths.items.len) {
+            self.setStatusFmt("rename aborted: {d} line(s) for {d} file(s) — line count must match", .{
+                names.items.len, er.paths.items.len,
+            });
+            return;
+        }
+        const hc = self.hostConnFor(if (er.host) |h| @as(?[]const u8, h) else null) orelse return;
+        var renamed: usize = 0;
+        for (er.paths.items, names.items) |old, new_name| {
+            const base = std.fs.path.basename(old);
+            if (std.mem.eql(u8, base, new_name)) continue;
+            if (std.mem.indexOfScalar(u8, new_name, '/') != null) continue;
+            const dir = std.fs.path.dirname(old) orelse continue;
+            var nb: [4300]u8 = undefined;
+            const np = std.fmt.bufPrint(&nb, "{s}/{s}", .{ if (dir.len == 1) "" else dir, new_name }) catch continue;
+            const req = self.nextReq();
+            self.deferUndo(req, self.makeUndo(hc.host, .rename_back, np, old, ""));
+            self.sendOp(hc, .{ .req = req, .op = "rename", .path = old, .to = np });
+            renamed += 1;
+        }
+        self.setStatusFmt("editor rename: {d} file(s) renamed", .{renamed});
     }
 
     // ── batch rename ────────────────────────────────────────────
@@ -3280,7 +4574,7 @@ pub const BrowserView = struct {
         c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(bctx), @ptrCast(&MenuCtx.free));
         _ = c.g_signal_connect_data(apply, "clicked", @ptrCast(&onBatchRenameApply), @ptrCast(bctx), null, c.G_CONNECT_DEFAULT);
         c.gtk_popover_set_child(@ptrCast(popover), box);
-        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(tab.listbox)));
+        c.gtk_widget_set_parent(popover, tab.page);
         connectPopoverAutoUnparent(popover);
         c.gtk_popover_popup(@ptrCast(popover));
         menuDone(ctx);
@@ -3432,6 +4726,12 @@ pub const BrowserView = struct {
 
         const btns = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
         c.gtk_widget_set_halign(btns, c.GTK_ALIGN_END);
+        const hashb = c.gtk_button_new_with_label("Hash-verify equal-size rows");
+        _ = c.g_signal_connect_data(hashb, "clicked", @ptrCast(&CompareCtx.onHashVerifyClicked), @ptrCast(cmp), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(btns), hashb);
+        const mirrorb = c.gtk_button_new_with_label("Mirror: mark target-only rows for deletion");
+        _ = c.g_signal_connect_data(mirrorb, "clicked", @ptrCast(&CompareCtx.onMirrorClicked), @ptrCast(cmp), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(btns), mirrorb);
         const closeb = c.gtk_button_new_with_label("Close");
         _ = c.g_signal_connect_data(closeb, "clicked", @ptrCast(&CompareCtx.onCloseClicked), @ptrCast(cmp), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(btns), closeb);
@@ -3450,9 +4750,84 @@ pub const BrowserView = struct {
         self.compare = cmp;
         c.gtk_window_present(@ptrCast(win));
 
-        // Host-side digest scans (pattern * = everything).
+        // Host-side digest scans (pattern * = everything; raised cap
+        // so big trees compare fully).
+        self.search_max_matches = 100_000;
         self.startDaemonJobKind(left_hc, "find", cmp.left.root, "", "*", "scan source tree", .compare_left);
+        self.search_max_matches = 100_000;
         self.startDaemonJobKind(right_hc, "find", cmp.right.root, "", "*", "scan target tree", .compare_right);
+    }
+
+    fn onMenuBookmark(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = ctx.path orelse return menuDone(ctx);
+        var spec_buf: [4400]u8 = undefined;
+        const spec = if (ctx.tab.hc.host) |h|
+            std.fmt.bufPrint(&spec_buf, "{s}:{s}", .{ h, path }) catch return menuDone(ctx)
+        else
+            path;
+        self.addBookmark(spec);
+        menuDone(ctx);
+    }
+
+    fn onMenuPin(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        setMountXattr(@ptrCast(@alignCast(user.?)), "user.sketerm.pin", "pinned — hydrating in the background");
+    }
+    fn onMenuEvict(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        setMountXattr(@ptrCast(@alignCast(user.?)), "user.sketerm.evict", "cached data evicted");
+    }
+    fn setMountXattr(ctx: *MenuCtx, comptime attr: [:0]const u8, comptime okmsg: []const u8) void {
+        const self = ctx.view;
+        const path = ctx.path orelse return menuDone(ctx);
+        var z: [4300:0]u8 = undefined;
+        const pz = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return menuDone(ctx);
+        if (c.setxattr(pz.ptr, attr.ptr, "1", 1, 0) != 0) {
+            self.setStatusFmt("{s} failed (is this really a sketerm mount?)", .{attr});
+        } else {
+            self.setStatusFmt("{s}: {s}", .{ std.fs.path.basename(path), okmsg });
+        }
+        menuDone(ctx);
+    }
+
+    fn onMenuTrashRestoreItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = ctx.path orelse return menuDone(ctx);
+        const tab = ctx.tab;
+        var pbuf: [4096]u8 = undefined;
+        if (path.len >= pbuf.len) return menuDone(ctx);
+        @memcpy(pbuf[0..path.len], path);
+        const pcopy = pbuf[0..path.len];
+        menuDone(ctx);
+        self.startTrashRestore(tab, pcopy);
+    }
+
+    fn onMenuUndo(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const view = ctx.view;
+        menuDone(ctx);
+        view.performUndo();
+    }
+
+    fn onMenuCalcSize(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const path = ctx.path orelse return menuDone(ctx);
+        ctx.view.startDaemonJobKind(ctx.tab.hc, "find", path, "", "*", "calculate size", .calc_size);
+        menuDone(ctx);
+    }
+
+    fn onMenuFindDups(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = ctx.path orelse return menuDone(ctx);
+        const tab = ctx.tab;
+        var pbuf: [4096]u8 = undefined;
+        if (path.len >= pbuf.len) return menuDone(ctx);
+        @memcpy(pbuf[0..path.len], path);
+        const pcopy = pbuf[0..path.len];
+        menuDone(ctx);
+        self.startDupScan(tab, pcopy);
     }
 
     fn onMenuNewFolder(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -3493,8 +4868,31 @@ pub const BrowserView = struct {
 
     fn onMenuTrash(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
         const path = ctx.path orelse return menuDone(ctx);
-        ctx.view.startDaemonJob(ctx.tab.hc, "trash", path, "", "move to trash");
+        const hc = ctx.tab.hc;
+        if (hc.state != .ready) {
+            self.setStatusFmt("not connected to {s}", .{hc.label()});
+            return menuDone(ctx);
+        }
+        const req = self.nextReq();
+        const pj = self.allocator.create(PendingJob) catch return menuDone(ctx);
+        pj.* = .{
+            .req = req,
+            .hc = hc,
+            .label = self.allocator.dupe(u8, "move to trash") catch {
+                self.allocator.destroy(pj);
+                return menuDone(ctx);
+            },
+            .undo_trash_orig = self.allocator.dupe(u8, path) catch null,
+        };
+        self.pending_jobs.append(self.allocator, pj) catch {
+            if (pj.undo_trash_orig) |o| self.allocator.free(o);
+            self.allocator.free(pj.label);
+            self.allocator.destroy(pj);
+            return menuDone(ctx);
+        };
+        self.sendOp(hc, .{ .req = req, .op = "trash", .path = path });
         menuDone(ctx);
     }
 
@@ -3545,7 +4943,7 @@ pub const BrowserView = struct {
         _ = c.g_signal_connect_data(mode_entry, "activate", @ptrCast(&onEntryDialogActivate), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(box), mode_entry);
         c.gtk_popover_set_child(@ptrCast(popover), box);
-        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(old.tab.listbox)));
+        c.gtk_widget_set_parent(popover, old.tab.page);
         connectPopoverAutoUnparent(popover);
         c.gtk_popover_popup(@ptrCast(popover));
         menuDone(old);
@@ -3575,7 +4973,7 @@ pub const BrowserView = struct {
         c.gtk_widget_add_css_class(btn, "destructive-action");
         _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onDeleteConfirmed), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
         c.gtk_popover_set_child(@ptrCast(popover), btn);
-        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(ctx.tab.listbox)));
+        c.gtk_widget_set_parent(popover, ctx.tab.page);
         connectPopoverAutoUnparent(popover);
         c.gtk_popover_popup(@ptrCast(popover));
         menuDone(ctx);
@@ -3625,7 +5023,7 @@ pub const BrowserView = struct {
         c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(ctx), @ptrCast(&MenuCtx.free));
         _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onEntryDialogActivate), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
         c.gtk_popover_set_child(@ptrCast(popover), entry);
-        c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(tab.listbox)));
+        c.gtk_widget_set_parent(popover, tab.page);
         connectPopoverAutoUnparent(popover);
         c.gtk_popover_popup(@ptrCast(popover));
         _ = c.gtk_widget_grab_focus(entry);
@@ -3660,12 +5058,14 @@ pub const BrowserView = struct {
             .mkdir => {
                 const dir = ctx.tab.root.path;
                 w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return menuDone(ctx);
+                self.deferUndo(req, self.makeUndo(ctx.tab.hc.host, .rmdir_created, w.buffered(), "", ""));
                 self.sendOp(ctx.tab.hc, .{ .req = req, .op = "mkdir", .path = w.buffered() });
             },
             .rename => {
                 const old = ctx.path orelse return menuDone(ctx);
                 const dir = std.fs.path.dirname(old) orelse return menuDone(ctx);
                 w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return menuDone(ctx);
+                self.deferUndo(req, self.makeUndo(ctx.tab.hc.host, .rename_back, w.buffered(), old, ""));
                 self.sendOp(ctx.tab.hc, .{ .req = req, .op = "rename", .path = old, .to = w.buffered() });
             },
             .none, .tags, .permissions => {},
@@ -3815,10 +5215,47 @@ pub const BrowserView = struct {
             return;
         }
         const txt = c.gtk_editable_get_text(@ptrCast(self.search_entry));
-        const pattern = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+        var pattern: []const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+        if (pattern.len == 0) return;
+        // Relative-time prefix: "@7d pat" / "@12h pat" / "@30m pat"
+        // limits name matches to entries modified in that window.
+        self.search_within_ms = 0;
+        if (pattern[0] == '@') {
+            if (std.mem.indexOfScalar(u8, pattern, ' ')) |sp| {
+                const tok = pattern[1..sp];
+                if (tok.len >= 2) {
+                    const unit: u64 = switch (tok[tok.len - 1]) {
+                        'd' => 24 * 3600 * 1000,
+                        'h' => 3600 * 1000,
+                        'm' => 60 * 1000,
+                        else => 0,
+                    };
+                    const num = std.fmt.parseInt(u64, tok[0 .. tok.len - 1], 10) catch 0;
+                    if (unit != 0 and num != 0) {
+                        self.search_within_ms = num * unit;
+                        pattern = std.mem.trimStart(u8, pattern[sp + 1 ..], " ");
+                    }
+                }
+            }
+        }
         if (pattern.len == 0) return;
         const panelize = pattern.len > 1 and pattern[0] == '!';
         const content = !panelize and c.gtk_check_button_get_active(@ptrCast(self.search_content)) != 0;
+
+        // Remember for the save-search button.
+        if (!panelize) {
+            var spec_buf: [4400]u8 = undefined;
+            const root_spec = tab.spec(&spec_buf);
+            const spec_owned = self.allocator.dupe(u8, root_spec) catch null;
+            const pat_owned = self.allocator.dupe(u8, pattern) catch null;
+            if (spec_owned != null and pat_owned != null) {
+                if (self.last_search) |ls| ls.deinitOwned(self.allocator);
+                self.last_search = .{ .spec = spec_owned.?, .pattern = pat_owned.?, .content = content };
+            } else {
+                if (spec_owned) |so| self.allocator.free(so);
+                if (pat_owned) |po| self.allocator.free(po);
+            }
+        }
 
         // One search at a time: a still-running previous job is
         // canceled (its JobRow stays for the record).
@@ -3939,6 +5376,538 @@ pub const BrowserView = struct {
         if (self.currentTab() == rtab) self.renderTab(rtab);
     }
 
+    // ── git status overlay (local roots) ────────────────────────
+
+    fn clearGitMap(self: *BrowserView) void {
+        var it = self.git_map.iterator();
+        while (it.next()) |kv| self.allocator.free(kv.key_ptr.*);
+        self.git_map.clearRetainingCapacity();
+    }
+
+    /// Kick a background `git status` for a LOCAL root. Results land
+    /// via idle handback; a stale generation is discarded.
+    fn refreshGitOverlay(self: *BrowserView, tab: *BTab) void {
+        if (tab.hc.host != null) return;
+        self.git_gen +%= 1;
+        self.clearGitMap();
+        if (self.git_root.len > 0) self.allocator.free(self.git_root);
+        self.git_root = self.allocator.dupe(u8, tab.root.path) catch &.{};
+        if (self.git_inflight) |g| g.orphaned = true;
+        const a = std.heap.c_allocator;
+        const ctx = a.create(GitCtx) catch return;
+        ctx.* = .{
+            .view = self,
+            .root = a.dupe(u8, tab.root.path) catch {
+                a.destroy(ctx);
+                return;
+            },
+            .gen = self.git_gen,
+        };
+        self.git_inflight = ctx;
+        const th = std.Thread.spawn(.{}, gitThreadMain, .{ctx}) catch {
+            self.git_inflight = null;
+            ctx.destroy();
+            return;
+        };
+        th.detach();
+    }
+
+    fn gitThreadMain(ctx: *GitCtx) void {
+        const a = std.heap.c_allocator;
+        // Quoted root; popen runs through sh.
+        var cmd: [4400:0]u8 = undefined;
+        var w = std.Io.Writer.fixed(cmd[0 .. cmd.len - 1]);
+        w.writeAll("cd '") catch return finishGit(ctx);
+        for (ctx.root) |ch| {
+            if (ch == '\'') w.writeAll("'\\''") catch return finishGit(ctx) else w.writeByte(ch) catch return finishGit(ctx);
+        }
+        w.writeAll("' 2>/dev/null && git status --porcelain --no-renames -z 2>/dev/null | head -c 65536 && printf '\\x01' && git rev-parse --show-prefix 2>/dev/null") catch return finishGit(ctx);
+        cmd[w.buffered().len] = 0;
+        const fp = c.popen(&cmd, "r") orelse return finishGit(ctx);
+        var out: std.ArrayList(u8) = .empty;
+        var buf: [8192]u8 = undefined;
+        while (true) {
+            const n = c.fread(&buf, 1, buf.len, fp);
+            if (n == 0) break;
+            out.appendSlice(a, buf[0..n]) catch break;
+            if (out.items.len > 128 * 1024) break;
+        }
+        _ = c.pclose(fp);
+        ctx.out = out.toOwnedSlice(a) catch null;
+        finishGit(ctx);
+    }
+
+    fn finishGit(ctx: *GitCtx) void {
+        _ = c.g_idle_add(@ptrCast(&onGitIdle), @ptrCast(ctx));
+    }
+
+    fn onGitIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const ctx: *GitCtx = @ptrCast(@alignCast(user.?));
+        defer ctx.destroy();
+        if (ctx.orphaned) return 0;
+        const self = ctx.view;
+        if (self.git_inflight == ctx) self.git_inflight = null;
+        if (ctx.gen != self.git_gen) return 0;
+        const out = ctx.out orelse return 0;
+        // out = "<porcelain -z>\x01<prefix>\n"
+        const sep = std.mem.indexOfScalar(u8, out, 1) orelse return 0;
+        const status = out[0..sep];
+        var prefix = std.mem.trim(u8, out[sep + 1 ..], "\n ");
+        _ = &prefix;
+        var it = std.mem.tokenizeScalar(u8, status, 0);
+        while (it.next()) |rec| {
+            if (rec.len < 4) continue;
+            const st: u8 = if (rec[0] != ' ' and rec[0] != '?') rec[0] else rec[1];
+            var path = rec[3..];
+            // Paths are repo-root-relative; strip the prefix of the
+            // browsed subdir, skip entries outside it.
+            if (prefix.len > 0) {
+                if (!std.mem.startsWith(u8, path, prefix)) continue;
+                path = path[prefix.len..];
+            }
+            if (path.len == 0) continue;
+            const end = std.mem.indexOfScalar(u8, path, '/') orelse path.len;
+            const child = path[0..end];
+            if (child.len == 0) continue;
+            const gop = self.git_map.getOrPut(child) catch continue;
+            if (!gop.found_existing) {
+                gop.key_ptr.* = self.allocator.dupe(u8, child) catch {
+                    _ = self.git_map.remove(child);
+                    continue;
+                };
+                gop.value_ptr.* = st;
+            } else if (gop.value_ptr.* == '?' and st != '?') {
+                // A real change outranks "untracked" for aggregation.
+                gop.value_ptr.* = st;
+            }
+        }
+        if (self.git_map.count() > 0) self.renderCurrent();
+        return 0;
+    }
+
+    // ── file color rules ────────────────────────────────────────
+
+    /// ~/.config/sketerm/filecolors.conf: one "glob=#RRGGBB" per
+    /// line; first matching rule colors the file name.
+    fn loadFileColors(self: *BrowserView) void {
+        var pbuf: [4096:0]u8 = undefined;
+        const cfg = c.g_get_user_config_dir();
+        const path = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/filecolors.conf", .{cfg}) catch return;
+        const f = c.fopen(path.ptr, "rb") orelse return;
+        defer _ = c.fclose(f);
+        var content: [16 * 1024]u8 = undefined;
+        const n = c.fread(&content, 1, content.len, f);
+        var it = std.mem.tokenizeScalar(u8, content[0..n], '\n');
+        while (it.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const glob = std.mem.trim(u8, line[0..eq], " ");
+            const color = std.mem.trim(u8, line[eq + 1 ..], " ");
+            if (glob.len == 0 or color.len != 7 or color[0] != '#') continue;
+            var fc = FileColor{
+                .glob = self.allocator.dupe(u8, glob) catch continue,
+                .color = undefined,
+            };
+            @memcpy(&fc.color, color[0..7]);
+            self.file_colors.append(self.allocator, fc) catch self.allocator.free(fc.glob);
+        }
+    }
+
+    fn fileColorFor(self: *BrowserView, name: []const u8) ?*const [7]u8 {
+        for (self.file_colors.items) |*fc| {
+            if (fsjob.nameMatches(fc.glob, name)) return &fc.color;
+        }
+        return null;
+    }
+
+    // ── restore from trash ──────────────────────────────────────
+
+    /// Fetch the .trashinfo for a trashed entry, then restore it to
+    /// the Path= recorded inside.
+    fn startTrashRestore(self: *BrowserView, tab: *BTab, trashed: []const u8) void {
+        if (self.restore_read) |rr| {
+            rr.destroy(self.allocator);
+            self.restore_read = null;
+        }
+        const name = std.fs.path.basename(trashed);
+        const files_dir = std.fs.path.dirname(trashed) orelse return;
+        const trash_root = std.fs.path.dirname(files_dir) orelse return;
+        var info_buf: [4300]u8 = undefined;
+        const info = std.fmt.bufPrint(&info_buf, "{s}/info/{s}.trashinfo", .{ trash_root, name }) catch return;
+        const rr = self.allocator.create(RestoreRead) catch return;
+        rr.* = .{
+            .req = self.nextReq(),
+            .hc = tab.hc,
+            .trashed = self.allocator.dupe(u8, trashed) catch {
+                self.allocator.destroy(rr);
+                return;
+            },
+            .info = self.allocator.dupe(u8, info) catch {
+                self.allocator.free(rr.trashed);
+                self.allocator.destroy(rr);
+                return;
+            },
+        };
+        self.restore_read = rr;
+        self.sendOp(tab.hc, .{ .req = rr.req, .op = "read", .path = rr.info, .off = @as(u64, 0), .len = @as(u64, 8192) });
+    }
+
+    fn feedRestore(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
+        const rr = self.restore_read orelse return false;
+        if (rr.hc != hc) return false;
+        switch (ftype) {
+            .fs_data => {
+                if (payload.len < 12) return false;
+                if (std.mem.readInt(u32, payload[0..4], .little) != rr.req) return false;
+                rr.buf.appendSlice(self.allocator, payload[12..]) catch {};
+                return true;
+            },
+            .fs_reply => {
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const rep = std.json.parseFromSliceLeaky(WireReply, arena.allocator(), payload, .{
+                    .ignore_unknown_fields = true,
+                }) catch return false;
+                if (rep.req != rr.req) return false;
+                defer {
+                    rr.destroy(self.allocator);
+                    self.restore_read = null;
+                }
+                if (!rep.ok) {
+                    self.setStatus("cannot read trash metadata");
+                    return true;
+                }
+                // Parse Path= (URL-escaped) from the .trashinfo.
+                var orig_buf: [4096]u8 = undefined;
+                var orig: ?[]const u8 = null;
+                var it = std.mem.tokenizeScalar(u8, rr.buf.items, '\n');
+                while (it.next()) |line_raw| {
+                    const line = std.mem.trim(u8, line_raw, " \t\r");
+                    if (std.mem.startsWith(u8, line, "Path=")) {
+                        orig = urlUnescape(line[5..], &orig_buf);
+                        break;
+                    }
+                }
+                const dst = orig orelse {
+                    self.setStatus("trash metadata has no Path entry");
+                    return true;
+                };
+                var lbl: [128]u8 = undefined;
+                const label = std.fmt.bufPrint(&lbl, "restore {s}", .{std.fs.path.basename(dst)}) catch "restore";
+                self.startDaemonJobTo(rr.hc, "trash_restore", rr.trashed, dst, rr.info, label);
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    // ── undo ────────────────────────────────────────────────────
+
+    const UNDO_CAP = 20;
+
+    fn pushUndo(self: *BrowserView, op: *UndoOp) void {
+        self.undo_stack.append(self.allocator, op) catch {
+            op.destroy(self.allocator);
+            return;
+        };
+        while (self.undo_stack.items.len > UNDO_CAP) {
+            const old = self.undo_stack.orderedRemove(0);
+            old.destroy(self.allocator);
+        }
+    }
+
+    fn makeUndo(
+        self: *BrowserView,
+        host: ?[]const u8,
+        kind: @FieldType(UndoOp, "kind"),
+        a: []const u8,
+        b: []const u8,
+        p: []const u8,
+    ) ?*UndoOp {
+        const op = self.allocator.create(UndoOp) catch return null;
+        op.* = .{
+            .host = if (host) |h| (self.allocator.dupe(u8, h) catch null) else null,
+            .kind = kind,
+            .a = self.allocator.dupe(u8, a) catch {
+                self.allocator.destroy(op);
+                return null;
+            },
+            .b = if (b.len > 0) (self.allocator.dupe(u8, b) catch &.{}) else &.{},
+            .p = if (p.len > 0) (self.allocator.dupe(u8, p) catch &.{}) else &.{},
+        };
+        return op;
+    }
+
+    /// Register an undo that becomes real when req's reply is ok.
+    fn deferUndo(self: *BrowserView, req: u32, op: ?*UndoOp) void {
+        const u = op orelse return;
+        self.pending_undo.append(self.allocator, .{ .req = req, .op = u }) catch u.destroy(self.allocator);
+    }
+
+    fn recordTrashUndo(self: *BrowserView, hc: *HostConn, orig: []const u8, trashed: []const u8, info: []const u8) void {
+        if (self.makeUndo(hc.host, .trash_restore, trashed, orig, info)) |op| self.pushUndo(op);
+    }
+
+    fn performUndo(self: *BrowserView) void {
+        const op = self.undo_stack.pop() orelse {
+            self.setStatus("nothing to undo");
+            return;
+        };
+        defer op.destroy(self.allocator);
+        const hc = self.hostConnFor(if (op.host) |h| @as(?[]const u8, h) else null) orelse return;
+        if (hc.state != .ready) {
+            self.setStatus("host not connected — cannot undo right now");
+            // Put it back for a later attempt.
+            const clone = self.makeUndo(op.host, op.kind, op.a, op.b, op.p) orelse return;
+            self.undo_stack.append(self.allocator, clone) catch clone.destroy(self.allocator);
+            return;
+        }
+        switch (op.kind) {
+            .rename_back => {
+                self.sendOp(hc, .{ .req = self.nextReq(), .op = "rename", .path = op.a, .to = op.b });
+                self.setStatusFmt("undid move: {s} back to {s}", .{ std.fs.path.basename(op.a), op.b });
+            },
+            .delete_created => {
+                var lbl: [128]u8 = undefined;
+                const label = std.fmt.bufPrint(&lbl, "undo copy {s}", .{std.fs.path.basename(op.a)}) catch "undo copy";
+                self.startDaemonJob(hc, "delete_tree", op.a, "", label);
+            },
+            .trash_restore => {
+                var lbl: [128]u8 = undefined;
+                const label = std.fmt.bufPrint(&lbl, "restore {s}", .{std.fs.path.basename(op.b)}) catch "restore";
+                self.startDaemonJobTo(hc, "trash_restore", op.a, op.b, op.p, label);
+            },
+            .rmdir_created => {
+                self.sendOp(hc, .{ .req = self.nextReq(), .op = "delete", .path = op.a });
+                self.setStatusFmt("undid new folder: {s}", .{op.a});
+            },
+        }
+    }
+
+    /// Job start with path+to+pattern (trash_restore shape).
+    fn startDaemonJobTo(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, pattern: []const u8, label: []const u8) void {
+        if (hc.state != .ready) {
+            self.setStatusFmt("not connected to {s}", .{hc.label()});
+            return;
+        }
+        const req = self.nextReq();
+        const pj = self.allocator.create(PendingJob) catch return;
+        pj.* = .{
+            .req = req,
+            .hc = hc,
+            .label = self.allocator.dupe(u8, label) catch {
+                self.allocator.destroy(pj);
+                return;
+            },
+        };
+        self.pending_jobs.append(self.allocator, pj) catch {
+            self.allocator.free(pj.label);
+            self.allocator.destroy(pj);
+            return;
+        };
+        self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .pattern = pattern });
+    }
+
+    // ── duplicate finder ────────────────────────────────────────
+
+    fn startDupScan(self: *BrowserView, tab: *BTab, root: []const u8) void {
+        if (self.dup) |old| {
+            old.destroy(self.allocator);
+            self.dup = null;
+        }
+        const d = self.allocator.create(DupState) catch return;
+        d.* = .{
+            .hc = tab.hc,
+            .root = self.allocator.dupe(u8, root) catch {
+                self.allocator.destroy(d);
+                return;
+            },
+        };
+        self.dup = d;
+        self.startDaemonJobKind(tab.hc, "find", d.root, "", "*", "duplicate scan", .dup_scan);
+    }
+
+    /// Handle scan matches / completion and hash-confirm results.
+    /// Returns true when the event belonged to the dup machinery.
+    fn dupConsumeEvent(self: *BrowserView, d: *DupState, e: WireJobEv) bool {
+        if (d.scanning and e.job == d.job and d.job != 0) {
+            if (std.mem.eql(u8, e.ev, "match")) {
+                if (std.mem.eql(u8, e.kind, "file") and e.size > 0) {
+                    const gop = d.sizes.getOrPut(self.allocator, e.size) catch return true;
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    const p = self.allocator.dupe(u8, e.path) catch return true;
+                    gop.value_ptr.append(self.allocator, p) catch self.allocator.free(p);
+                }
+                return true;
+            }
+            if (std.mem.eql(u8, e.ev, "done")) {
+                self.dupStartHashPhase(d);
+                return false; // let the jobs panel finish its row
+            }
+            if (std.mem.eql(u8, e.ev, "error") or std.mem.eql(u8, e.ev, "canceled")) {
+                d.destroy(self.allocator);
+                self.dup = null;
+                return false;
+            }
+            return false;
+        }
+        // Hash-confirm phase: match done events to our hash jobs.
+        if (!d.scanning and std.mem.eql(u8, e.ev, "done") and e.hash.len == 64) {
+            for (d.hashes.items) |*h| {
+                if (h.job == e.job and h.job != 0 and !h.have) {
+                    @memcpy(&h.hash, e.hash[0..64]);
+                    h.have = true;
+                    self.dupMaybeFinish();
+                    return true;
+                }
+            }
+        }
+        if (!d.scanning and (std.mem.eql(u8, e.ev, "error") or std.mem.eql(u8, e.ev, "canceled"))) {
+            for (d.hashes.items) |*h| {
+                if (h.job == e.job and h.job != 0 and !h.have and !h.failed) {
+                    h.failed = true;
+                    self.dupMaybeFinish();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn dupStartHashPhase(self: *BrowserView, d: *DupState) void {
+        d.scanning = false;
+        var hashed: usize = 0;
+        var it = d.sizes.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.items.len < 2) continue;
+            if (hashed + kv.value_ptr.items.len > DupState.MAX_HASHED) continue;
+            for (kv.value_ptr.items) |p| {
+                const req = self.nextReq();
+                const owned = self.allocator.dupe(u8, p) catch continue;
+                d.hashes.append(self.allocator, .{
+                    .req = req,
+                    .path = owned,
+                    .size = kv.key_ptr.*,
+                }) catch {
+                    self.allocator.free(owned);
+                    continue;
+                };
+                self.sendOp(d.hc, .{ .req = req, .op = "hash", .path = p });
+                hashed += 1;
+            }
+        }
+        if (d.hashes.items.len == 0) {
+            self.setStatus("no same-size duplicate candidates found");
+            d.destroy(self.allocator);
+            self.dup = null;
+            return;
+        }
+        self.setStatusFmt("hash-confirming {d} duplicate candidate(s)…", .{d.hashes.items.len});
+    }
+
+    fn dupMaybeFinish(self: *BrowserView) void {
+        const d = self.dup orelse return;
+        if (d.scanning) return;
+        for (d.hashes.items) |h| {
+            if (h.job == 0) continue; // start reply not yet in
+            if (!h.have and !h.failed) return;
+        }
+        for (d.hashes.items) |h| {
+            if (h.job == 0 and !h.failed) return; // still starting
+        }
+        // Group confirmed digests.
+        const H = DupState.DupHash;
+        std.mem.sort(H, d.hashes.items, {}, struct {
+            fn lt(_: void, a: H, b: H) bool {
+                if (a.have != b.have) return a.have;
+                return std.mem.lessThan(u8, &a.hash, &b.hash);
+            }
+        }.lt);
+        // Build a flat results tab listing every confirmed group.
+        var groups: usize = 0;
+        var files: usize = 0;
+        var host_buf: [256]u8 = undefined;
+        var host: ?[]const u8 = null;
+        if (d.hc.host) |h| {
+            const n = @min(h.len, host_buf.len);
+            @memcpy(host_buf[0..n], h[0..n]);
+            host = host_buf[0..n];
+        }
+        var root_buf: [4096]u8 = undefined;
+        const n = @min(d.root.len, root_buf.len);
+        @memcpy(root_buf[0..n], d.root[0..n]);
+        const rtab = self.newTab(host, root_buf[0..n]) orelse {
+            d.destroy(self.allocator);
+            self.dup = null;
+            return;
+        };
+        self.closeViewOf(rtab.hc, rtab.root);
+        var pi: usize = 0;
+        while (pi < self.pending.items.len) {
+            if (self.pending.items[pi].tab == rtab) self.dropPending(pi) else pi += 1;
+        }
+        rtab.root.flat = true;
+        rtab.root.loaded = true;
+        rtab.root.view_id = 0;
+
+        var i: usize = 0;
+        while (i < d.hashes.items.len) {
+            const start = i;
+            var end = i + 1;
+            while (end < d.hashes.items.len and d.hashes.items[start].have and
+                d.hashes.items[end].have and
+                std.mem.eql(u8, &d.hashes.items[start].hash, &d.hashes.items[end].hash))
+            {
+                end += 1;
+            }
+            if (d.hashes.items[start].have and end - start > 1) {
+                groups += 1;
+                for (d.hashes.items[start..end]) |h| {
+                    files += 1;
+                    var disp: [640]u8 = undefined;
+                    const rel = if (std.mem.startsWith(u8, h.path, d.root) and h.path.len > d.root.len + 1)
+                        h.path[d.root.len + 1 ..]
+                    else
+                        h.path;
+                    const display = std.fmt.bufPrint(&disp, "[group {d}] {s}", .{ groups, rel }) catch rel;
+                    const a = self.allocator;
+                    const nm = a.dupe(u8, display) catch continue;
+                    const kd = a.dupe(u8, "file") catch {
+                        a.free(nm);
+                        continue;
+                    };
+                    const tg = a.dupe(u8, h.path) catch {
+                        a.free(nm);
+                        a.free(kd);
+                        continue;
+                    };
+                    rtab.root.entries.append(a, .{
+                        .name = nm,
+                        .kind = kd,
+                        .size = h.size,
+                        .mode = 0,
+                        .mtime_ms = 0,
+                        .target = tg,
+                        .tdir = false,
+                    }) catch {
+                        a.free(nm);
+                        a.free(kd);
+                        a.free(tg);
+                    };
+                }
+            }
+            i = end;
+        }
+        var lbl: [64:0]u8 = undefined;
+        const l = std.fmt.bufPrintZ(&lbl, "duplicates ({d})", .{files}) catch "duplicates";
+        c.gtk_label_set_text(rtab.tab_label, l.ptr);
+        self.setStatusFmt("duplicates: {d} file(s) in {d} confirmed group(s)", .{ files, groups });
+        self.renderTab(rtab);
+        d.destroy(self.allocator);
+        self.dup = null;
+    }
+
     fn onSearchToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         const on = c.gtk_toggle_button_get_active(btn) != 0;
@@ -4007,6 +5976,8 @@ pub const BrowserView = struct {
                 while (i < self.jobs.items.len) : (i += 1) {
                     const j = self.jobs.items[i];
                     if (j.hc == hc and j.job == ctx.job) {
+                        if (j.undo_op) |u| u.destroy(self.allocator);
+                        if (j.undo_trash_orig) |o| self.allocator.free(o);
                         self.allocator.free(j.label);
                         self.allocator.destroy(j);
                         _ = self.jobs.orderedRemove(i);
@@ -4385,6 +6356,17 @@ pub const BrowserView = struct {
         _ = c.g_signal_connect_data(search_toggle, "toggled", @ptrCast(&onSearchToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), search_toggle);
 
+        const places_toggle = c.gtk_toggle_button_new();
+        c.gtk_button_set_icon_name(@ptrCast(places_toggle), "user-bookmarks-symbolic");
+        c.gtk_widget_set_tooltip_text(places_toggle, "Places sidebar (bookmarks, recent, devices)");
+        _ = c.g_signal_connect_data(places_toggle, "toggled", @ptrCast(&onPlacesToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(bar), places_toggle);
+
+        const viewmode = c.gtk_button_new_from_icon_name("view-grid-symbolic");
+        c.gtk_widget_set_tooltip_text(viewmode, "Cycle view: details / compact / grid / columns");
+        _ = c.g_signal_connect_data(viewmode, "clicked", @ptrCast(&onViewModeClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(bar), viewmode);
+
         const preview_toggle = c.gtk_toggle_button_new();
         c.gtk_button_set_icon_name(@ptrCast(preview_toggle), "view-dual-symbolic");
         c.gtk_widget_set_tooltip_text(preview_toggle, "Preview panel (images, text head, metadata)");
@@ -4395,6 +6377,11 @@ pub const BrowserView = struct {
         c.gtk_widget_set_tooltip_text(newtab, "New browser tab");
         _ = c.g_signal_connect_data(newtab, "clicked", @ptrCast(&onNewTabClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), newtab);
+
+        const cwdbtn = c.gtk_button_new_from_icon_name("go-jump-symbolic");
+        c.gtk_widget_set_tooltip_text(cwdbtn, "Go to the shell's current directory (OSC 7)");
+        _ = c.g_signal_connect_data(cwdbtn, "clicked", @ptrCast(&onCwdSyncClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(bar), cwdbtn);
 
         const term = c.gtk_button_new_from_icon_name("utilities-terminal-symbolic");
         c.gtk_widget_set_tooltip_text(term, "Show the pane's terminal (browser stays one click away)");
@@ -4414,6 +6401,10 @@ pub const BrowserView = struct {
         c.gtk_box_append(@ptrCast(sbar), sentry);
         const scontent = c.gtk_check_button_new_with_label("in contents");
         c.gtk_box_append(@ptrCast(sbar), scontent);
+        const ssave = c.gtk_button_new_from_icon_name("starred-symbolic");
+        c.gtk_widget_set_tooltip_text(ssave, "Save the last search (shows in the Places sidebar)");
+        _ = c.g_signal_connect_data(ssave, "clicked", @ptrCast(&onSaveSearchClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(sbar), ssave);
         c.gtk_widget_set_visible(sbar, 0);
         c.gtk_box_append(@ptrCast(vbox), sbar);
 
@@ -4423,10 +6414,22 @@ pub const BrowserView = struct {
         c.gtk_widget_set_vexpand(notebook, 1);
         _ = c.g_signal_connect_data(notebook, "switch-page", @ptrCast(&onSwitchPage), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
-        // Content row: notebook | preview panel (hidden until toggled).
+        // Content row: places | notebook | preview (side panels
+        // hidden until toggled).
         const content = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
         c.gtk_widget_set_hexpand(content, 1);
         c.gtk_widget_set_vexpand(content, 1);
+
+        const pl_scroll = c.gtk_scrolled_window_new();
+        c.gtk_widget_set_size_request(pl_scroll, 190, -1);
+        const pl_list = c.gtk_list_box_new();
+        c.gtk_list_box_set_selection_mode(@ptrCast(pl_list), c.GTK_SELECTION_NONE);
+        c.gtk_list_box_set_activate_on_single_click(@ptrCast(pl_list), 1);
+        _ = c.g_signal_connect_data(pl_list, "row-activated", @ptrCast(&onPlaceActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_scrolled_window_set_child(@ptrCast(pl_scroll), pl_list);
+        c.gtk_widget_set_visible(pl_scroll, 0);
+        c.gtk_box_append(@ptrCast(content), pl_scroll);
+
         c.gtk_box_append(@ptrCast(content), notebook);
 
         const pbox = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
@@ -4491,6 +6494,284 @@ pub const BrowserView = struct {
         self.preview_pic = ppic;
         self.preview_text = @ptrCast(@alignCast(ptext));
         self.preview_meta = @ptrCast(@alignCast(pmeta));
+        self.places_scroller = pl_scroll;
+        self.places_list = @ptrCast(@alignCast(pl_list));
+    }
+
+    // ── places sidebar ──────────────────────────────────────────
+
+    /// Heap ctx on each places row (freed with the row).
+    const PlaceCtx = struct {
+        allocator: std.mem.Allocator,
+        view: *BrowserView,
+        /// Host-qualified location spec; empty = section header.
+        spec: []u8,
+        is_bookmark: bool,
+
+        fn free(user: ?*anyopaque) callconv(.c) void {
+            const p: *PlaceCtx = @ptrCast(@alignCast(user.?));
+            p.allocator.free(p.spec);
+            p.allocator.destroy(p);
+        }
+    };
+
+    fn onPlacesToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.places_on = c.gtk_toggle_button_get_active(btn) != 0;
+        c.gtk_widget_set_visible(self.places_scroller, @intFromBool(self.places_on));
+        if (self.places_on) self.renderPlaces();
+    }
+
+    fn placeHeader(self: *BrowserView, text: [*:0]const u8) void {
+        const lab = c.gtk_label_new(text);
+        c.gtk_label_set_xalign(@ptrCast(lab), 0);
+        c.gtk_widget_add_css_class(lab, "dim-label");
+        c.gtk_widget_set_margin_top(lab, 8);
+        c.gtk_widget_set_margin_start(lab, 6);
+        const row = c.gtk_list_box_row_new();
+        c.gtk_list_box_row_set_activatable(@ptrCast(row), 0);
+        c.gtk_list_box_row_set_child(@ptrCast(row), lab);
+        c.gtk_list_box_append(self.places_list, row);
+    }
+
+    fn placeRow(self: *BrowserView, icon: [*:0]const u8, label: []const u8, spec: []const u8, is_bookmark: bool) void {
+        const hbox = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+        c.gtk_widget_set_margin_start(hbox, 10);
+        const img = c.gtk_image_new_from_icon_name(icon);
+        c.gtk_box_append(@ptrCast(hbox), img);
+        var lz: [256:0]u8 = undefined;
+        const n = @min(label.len, lz.len - 1);
+        @memcpy(lz[0..n], label[0..n]);
+        lz[n] = 0;
+        const lab = c.gtk_label_new(&lz);
+        c.gtk_label_set_xalign(@ptrCast(lab), 0);
+        c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_MIDDLE);
+        c.gtk_widget_set_hexpand(lab, 1);
+        c.gtk_box_append(@ptrCast(hbox), lab);
+        const ctx = self.allocator.create(PlaceCtx) catch return;
+        ctx.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .spec = self.allocator.dupe(u8, spec) catch {
+                self.allocator.destroy(ctx);
+                return;
+            },
+            .is_bookmark = is_bookmark,
+        };
+        if (is_bookmark) {
+            const rm = c.gtk_button_new_from_icon_name("window-close-symbolic");
+            c.gtk_button_set_has_frame(@ptrCast(rm), 0);
+            c.gtk_widget_set_tooltip_text(rm, "Remove bookmark");
+            _ = c.g_signal_connect_data(rm, "clicked", @ptrCast(&onBookmarkRemove), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+            c.gtk_box_append(@ptrCast(hbox), rm);
+        }
+        const row = c.gtk_list_box_row_new();
+        c.gtk_list_box_row_set_child(@ptrCast(row), hbox);
+        c.g_object_set_data_full(@ptrCast(row), "sketerm-place", @ptrCast(ctx), @ptrCast(&PlaceCtx.free));
+        c.gtk_list_box_append(self.places_list, row);
+    }
+
+    fn renderPlaces(self: *BrowserView) void {
+        while (c.gtk_list_box_get_row_at_index(self.places_list, 0)) |row| {
+            c.gtk_list_box_remove(self.places_list, @ptrCast(row));
+        }
+        self.placeHeader("Places");
+        const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
+        self.placeRow("user-home-symbolic", "Home", home, false);
+        self.placeRow("drive-harddisk-symbolic", "File System", "local:/", false);
+        var trash_buf: [4200]u8 = undefined;
+        if (trashFilesDir(&trash_buf)) |td| self.placeRow("user-trash-symbolic", "Trash", td, false);
+        if (self.collection_items.items.len > 0)
+            self.placeRow("folder-saved-search-symbolic", "Collection", "collection:", false);
+        if (self.bookmarks.items.len > 0) {
+            self.placeHeader("Bookmarks");
+            for (self.bookmarks.items) |b| {
+                self.placeRow("starred-symbolic", std.fs.path.basename(b), b, true);
+            }
+        }
+        if (self.saved_searches.items.len > 0) {
+            self.placeHeader("Saved Searches");
+            for (self.saved_searches.items, 0..) |sq, i| {
+                var lbl: [300]u8 = undefined;
+                const ltxt = std.fmt.bufPrint(&lbl, "{s}{s} in {s}", .{
+                    sq.pattern,
+                    if (sq.content) " (content)" else "",
+                    sq.spec,
+                }) catch sq.pattern;
+                // Encode the index as "search:<i>" — rows resolve it
+                // at click time so edits do not dangle.
+                var spec_buf: [32]u8 = undefined;
+                const sspec = std.fmt.bufPrint(&spec_buf, "search:{d}", .{i}) catch continue;
+                self.placeRow("system-search-symbolic", ltxt, sspec, true);
+            }
+        }
+        if (self.recent.items.len > 0) {
+            self.placeHeader("Recent");
+            for (self.recent.items) |r| {
+                self.placeRow("document-open-recent-symbolic", r, r, false);
+            }
+        }
+        // Devices: real block-device and network mounts.
+        const f = c.fopen("/proc/mounts", "rb") orelse {
+            return;
+        };
+        var buf: [32 * 1024]u8 = undefined;
+        const nread = c.fread(&buf, 1, buf.len, f);
+        _ = c.fclose(f);
+        var shown: usize = 0;
+        var first_dev = true;
+        var it = std.mem.tokenizeScalar(u8, buf[0..nread], '\n');
+        while (it.next()) |line| {
+            if (shown >= 12) break;
+            var fields = std.mem.tokenizeScalar(u8, line, ' ');
+            const src = fields.next() orelse continue;
+            const mp = fields.next() orelse continue;
+            const fstype = fields.next() orelse continue;
+            const interesting = std.mem.startsWith(u8, src, "/dev/") or
+                std.mem.startsWith(u8, fstype, "nfs") or
+                std.mem.eql(u8, fstype, "fuse.sshfs");
+            if (!interesting) continue;
+            if (first_dev) {
+                self.placeHeader("Devices");
+                first_dev = false;
+            }
+            // /proc/mounts octal-escapes spaces; show raw (rare).
+            self.placeRow("drive-harddisk-symbolic", mp, mp, false);
+            shown += 1;
+        }
+    }
+
+    fn onPlaceActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const data = c.g_object_get_data(@ptrCast(row), "sketerm-place") orelse return;
+        const ctx: *PlaceCtx = @ptrCast(@alignCast(data));
+        if (ctx.spec.len == 0) return;
+        if (std.mem.startsWith(u8, ctx.spec, "search:")) {
+            const idx = std.fmt.parseInt(usize, ctx.spec[7..], 10) catch return;
+            self.runSavedSearch(idx);
+            return;
+        }
+        if (std.mem.eql(u8, ctx.spec, "collection:")) {
+            const t = self.ensureCollectionTab(null, "/") orelse return;
+            const pn = c.gtk_notebook_page_num(self.notebook, t.page);
+            if (pn >= 0) c.gtk_notebook_set_current_page(self.notebook, pn);
+            self.renderTab(t);
+            return;
+        }
+        const tab = self.currentTab() orelse {
+            _ = self.newTabSpec(ctx.spec);
+            return;
+        };
+        var buf: [4300]u8 = undefined;
+        if (ctx.spec.len >= buf.len) return;
+        @memcpy(buf[0..ctx.spec.len], ctx.spec);
+        self.navigateSpec(tab, buf[0..ctx.spec.len], true);
+    }
+
+    /// Re-run a saved search: navigate its root, refill the search
+    /// bar, and fire.
+    fn runSavedSearch(self: *BrowserView, idx: usize) void {
+        if (idx >= self.saved_searches.items.len) return;
+        const sq = self.saved_searches.items[idx];
+        const tab = self.currentTab() orelse (self.newTabSpec(sq.spec) orelse return);
+        var buf: [4300]u8 = undefined;
+        if (sq.spec.len >= buf.len) return;
+        @memcpy(buf[0..sq.spec.len], sq.spec);
+        self.navigateSpec(tab, buf[0..sq.spec.len], true);
+        var pz: [512:0]u8 = undefined;
+        const pat = std.fmt.bufPrintZ(&pz, "{s}", .{sq.pattern}) catch return;
+        c.gtk_editable_set_text(@ptrCast(self.search_entry), pat.ptr);
+        c.gtk_check_button_set_active(@ptrCast(self.search_content), @intFromBool(sq.content));
+        c.gtk_widget_set_visible(self.search_bar, 1);
+        self.startSearch();
+    }
+
+    fn onSaveSearchClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const ls = self.last_search orelse {
+            self.setStatus("run a search first, then save it");
+            return;
+        };
+        for (self.saved_searches.items) |sq| {
+            if (std.mem.eql(u8, sq.spec, ls.spec) and std.mem.eql(u8, sq.pattern, ls.pattern) and sq.content == ls.content) {
+                self.setStatus("search already saved");
+                return;
+            }
+        }
+        const spec = self.allocator.dupe(u8, ls.spec) catch return;
+        const pat = self.allocator.dupe(u8, ls.pattern) catch {
+            self.allocator.free(spec);
+            return;
+        };
+        self.saved_searches.append(self.allocator, .{ .spec = spec, .pattern = pat, .content = ls.content }) catch {
+            self.allocator.free(spec);
+            self.allocator.free(pat);
+            return;
+        };
+        self.savePlaces();
+        if (self.places_on) self.renderPlaces();
+        self.setStatusFmt("saved search: {s}", .{ls.pattern});
+    }
+
+    fn onBookmarkRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *PlaceCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        if (std.mem.startsWith(u8, ctx.spec, "search:")) {
+            const idx = std.fmt.parseInt(usize, ctx.spec[7..], 10) catch return;
+            if (idx < self.saved_searches.items.len) {
+                self.saved_searches.items[idx].deinitOwned(self.allocator);
+                _ = self.saved_searches.orderedRemove(idx);
+            }
+        } else {
+            var i: usize = 0;
+            while (i < self.bookmarks.items.len) {
+                if (std.mem.eql(u8, self.bookmarks.items[i], ctx.spec)) {
+                    self.allocator.free(self.bookmarks.items[i]);
+                    _ = self.bookmarks.orderedRemove(i);
+                } else i += 1;
+            }
+        }
+        self.savePlaces();
+        self.renderPlaces();
+    }
+
+    fn savePlaces(self: *BrowserView) void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const bm = a.alloc([]const u8, self.bookmarks.items.len) catch return;
+        for (self.bookmarks.items, 0..) |b, i| bm[i] = b;
+        const rc = a.alloc([]const u8, self.recent.items.len) catch return;
+        for (self.recent.items, 0..) |r, i| rc[i] = r;
+        const sq = a.alloc(places_mod.SavedSearch, self.saved_searches.items.len) catch return;
+        for (self.saved_searches.items, 0..) |sv, i| {
+            sq[i] = .{ .spec = sv.spec, .pattern = sv.pattern, .content = sv.content };
+        }
+        const cl = a.alloc(places_mod.CollItem, self.collection_items.items.len) catch return;
+        for (self.collection_items.items, 0..) |ci, i| {
+            cl[i] = .{ .spec = ci.spec, .dir = ci.dir };
+        }
+        places_mod.save(self.allocator, .{ .bookmarks = bm, .recent = rc, .searches = sq, .collection = cl });
+    }
+
+    fn addBookmark(self: *BrowserView, spec: []const u8) void {
+        for (self.bookmarks.items) |b| {
+            if (std.mem.eql(u8, b, spec)) return;
+        }
+        const owned = self.allocator.dupe(u8, spec) catch return;
+        self.bookmarks.append(self.allocator, owned) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        self.savePlaces();
+        if (self.places_on) self.renderPlaces();
+        self.setStatusFmt("bookmarked: {s}", .{spec});
+    }
+
+    fn recordRecentSpec(self: *BrowserView, spec: []const u8) void {
+        places_mod.recordRecent(self.allocator, &self.recent, spec, places_mod.RECENT_CAP);
+        self.savePlaces();
+        if (self.places_on) self.renderPlaces();
     }
 
     fn onBrowserKey(
@@ -4501,13 +6782,105 @@ pub const BrowserView = struct {
         user: ?*anyopaque,
     ) callconv(.c) c.gboolean {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const lower_pre: c_uint = c.gdk_keyval_to_lower(keyval);
+        if ((state & c.GDK_CONTROL_MASK) != 0 and lower_pre == c.GDK_KEY_z) {
+            self.performUndo();
+            return 1;
+        }
         const ictx = self.pane.input_ctx orelse return 0;
-        const lower_kv: c_uint = c.gdk_keyval_to_lower(keyval);
+        const lower_kv: c_uint = lower_pre;
         const bindings: []const input.Binding = if (ictx.bindings.len > 0) ictx.bindings else &input.default_bindings;
         if (input.matchBinding(bindings, lower_kv, state) orelse input.matchBinding(bindings, keyval, state)) |action| {
             return input.runAction(ictx, action);
         }
         return 0;
+    }
+
+    /// Drop of an entry spec onto the listing: target dir = the row
+    /// under the pointer when it's a directory, else the tab root.
+    /// Same host = MOVE (rename, undoable); cross-host = copy.
+    fn onListDrop(
+        target: *c.GtkDropTarget,
+        value: *c.GValue,
+        x: f64,
+        y: f64,
+        user: ?*anyopaque,
+    ) callconv(.c) c.gboolean {
+        _ = target;
+        _ = x;
+        const tab: *BTab = @ptrCast(@alignCast(user.?));
+        const self = tab.view;
+        const cstr = c.g_value_get_string(value) orelse return 0;
+        const spec = std.mem.span(@as([*:0]const u8, @ptrCast(cstr)));
+        if (spec.len == 0) return 0;
+        const loc = parseSpec(spec);
+        const src_host: ?[]const u8 = if (loc.current_host) null else loc.host;
+        const src = loc.path;
+        if (src.len == 0 or src[0] != '/') return 0;
+
+        var dst_dir: []const u8 = tab.root.path;
+        var dbuf: [4096]u8 = undefined;
+        if (c.gtk_list_box_get_row_at_y(tab.listbox, @intFromFloat(y))) |row| {
+            if (c.g_object_get_data(@ptrCast(row), "sketerm-row")) |data| {
+                const rctx: *RowCtx = @ptrCast(@alignCast(data));
+                if (rctx.is_dir) {
+                    if (rctx.path.len < dbuf.len) {
+                        @memcpy(dbuf[0..rctx.path.len], rctx.path);
+                        dst_dir = dbuf[0..rctx.path.len];
+                    }
+                }
+            }
+        }
+        const base = std.fs.path.basename(src);
+        var dst_buf: [4200]u8 = undefined;
+        const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
+            if (dst_dir.len == 1) "" else dst_dir, base,
+        }) catch return 0;
+
+        if (hostEq(src_host, tab.hc.host)) {
+            if (std.mem.eql(u8, src, dst)) return 0; // dropped in place
+            const req = self.nextReq();
+            self.deferUndo(req, self.makeUndo(tab.hc.host, .rename_back, dst, src, ""));
+            self.sendOp(tab.hc, .{ .req = req, .op = "rename", .path = src, .to = dst });
+            self.setStatusFmt("moved {s} -> {s}", .{ base, dst_dir });
+        } else {
+            const src_hc = self.hostConnFor(src_host) orelse return 0;
+            self.startTransfer(src_hc, src, tab.hc, dst, .{});
+            self.setStatusFmt("copying {s} -> {s}", .{ base, dst_dir });
+        }
+        return 1;
+    }
+
+    fn onSortName(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        sortClicked(@ptrCast(@alignCast(user.?)), .name);
+    }
+    fn onSortSize(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        sortClicked(@ptrCast(@alignCast(user.?)), .size);
+    }
+    fn onSortTime(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        sortClicked(@ptrCast(@alignCast(user.?)), .mtime);
+    }
+    fn sortClicked(tab: *BTab, key: browser_model.SortKey) void {
+        if (tab.sort_key == key) {
+            tab.descending = !tab.descending;
+        } else {
+            tab.sort_key = key;
+            tab.descending = false;
+        }
+        tab.view.renderTab(tab);
+    }
+
+    fn onViewModeClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const tab = self.currentTab() orelse return;
+        tab.view_mode = switch (tab.view_mode) {
+            .details => .compact,
+            .compact => .icons,
+            .icons => .miller,
+            .miller => .details,
+        };
+        self.setStatusFmt("view: {s}", .{@tagName(tab.view_mode)});
+        self.renderTab(tab);
     }
 
     fn onBackClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -4536,6 +6909,18 @@ pub const BrowserView = struct {
     fn onTerminalClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         self.pane.setBrowserVisible(false);
+    }
+    fn onCwdSyncClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const tab = self.currentTab() orelse return;
+        const cwd = self.pane.terminal.cwd orelse {
+            self.setStatus("the shell has not reported a directory yet (needs OSC 7 shell integration)");
+            return;
+        };
+        var buf: [4096]u8 = undefined;
+        if (cwd.len >= buf.len) return;
+        @memcpy(buf[0..cwd.len], cwd);
+        self.navigate(tab, null, buf[0..cwd.len], true);
     }
     fn onHiddenToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
@@ -4575,6 +6960,102 @@ pub const BrowserView = struct {
     }
 };
 
+/// A readable, deterministic color for a tag set.
+fn tagColorHex(tags: []const u8) []const u8 {
+    const palette = [_][]const u8{
+        "#e05050", "#d08030", "#a0a020", "#40a040",
+        "#30a0a0", "#5080e0", "#9060d0", "#d060a0",
+    };
+    var h = std.hash.Wyhash.init(7);
+    h.update(tags);
+    return palette[@intCast(h.final() % palette.len)];
+}
+
+/// Decode %XX escapes (freedesktop .trashinfo Path values).
+fn urlUnescape(s: []const u8, buf: []u8) ?[]const u8 {
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (out >= buf.len) return null;
+        if (s[i] == '%' and i + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch {
+                buf[out] = s[i];
+                out += 1;
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch {
+                buf[out] = s[i];
+                out += 1;
+                i += 1;
+                continue;
+            };
+            buf[out] = (hi << 4) | lo;
+            out += 1;
+            i += 3;
+        } else {
+            buf[out] = s[i];
+            out += 1;
+            i += 1;
+        }
+    }
+    return buf[0..out];
+}
+
+/// True when a LOCAL path sits on a sketerm FUSE mount (whose pin/
+/// evict xattrs control the hydration cache).
+fn isSketermMount(path: []const u8) bool {
+    const f = c.fopen("/proc/mounts", "rb") orelse return false;
+    defer _ = c.fclose(f);
+    var buf: [32 * 1024]u8 = undefined;
+    const n = c.fread(&buf, 1, buf.len, f);
+    var it = std.mem.tokenizeScalar(u8, buf[0..n], '\n');
+    while (it.next()) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        _ = fields.next() orelse continue;
+        const mp = fields.next() orelse continue;
+        const fstype = fields.next() orelse continue;
+        if (!std.mem.eql(u8, fstype, "fuse.sketerm")) continue;
+        if (std.mem.startsWith(u8, path, mp) and
+            (path.len == mp.len or path[mp.len] == '/')) return true;
+    }
+    return false;
+}
+
+/// The local freedesktop trash "files" directory.
+fn trashFilesDir(buf: []u8) ?[]const u8 {
+    if (c.getenv("XDG_DATA_HOME")) |xd| {
+        const s = std.mem.span(@as([*:0]const u8, @ptrCast(xd)));
+        return std.fmt.bufPrint(buf, "{s}/Trash/files", .{s}) catch null;
+    }
+    if (c.getenv("HOME")) |h| {
+        const s = std.mem.span(@as([*:0]const u8, @ptrCast(h)));
+        return std.fmt.bufPrint(buf, "{s}/.local/share/Trash/files", .{s}) catch null;
+    }
+    return null;
+}
+
+/// True when `path` is inside a freedesktop trash "files" dir —
+/// the home trash (…/Trash/files) or a topdir one (…/.Trash-UID/files).
+fn isTrashPath(path: []const u8) bool {
+    if (std.mem.indexOf(u8, path, "/Trash/files") != null) return true;
+    if (std.mem.indexOf(u8, path, "/.Trash-")) |i| {
+        return std.mem.indexOf(u8, path[i..], "/files") != null;
+    }
+    return false;
+}
+
+/// The child name inside `ancestor` on the way toward `root`, or
+/// null when root is not under ancestor.
+fn millerNextSegment(ancestor: []const u8, root: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, root, ancestor)) return null;
+    var rest = root[ancestor.len..];
+    if (rest.len > 0 and rest[0] == '/') rest = rest[1..];
+    if (rest.len == 0) return null;
+    const end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    return rest[0..end];
+}
+
 fn launchLocal(path: []const u8) void {
     var uri_buf: [4300:0]u8 = undefined;
     const uri = std.fmt.bufPrintZ(&uri_buf, "file://{s}", .{path}) catch return;
@@ -4600,6 +7081,27 @@ fn launchLocalWithApp(appid: []const u8, path: []const u8) void {
         return;
     }
     launchLocal(path);
+}
+
+/// Make `appid` the default handler for `path`'s guessed type.
+fn setDefaultAppForPath(appid: []const u8, path: []const u8) void {
+    var namez: [512:0]u8 = undefined;
+    const base = std.fs.path.basename(path);
+    const bz = std.fmt.bufPrintZ(&namez, "{s}", .{base}) catch return;
+    var uncertain: c.gboolean = 0;
+    const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
+    if (ct == null) return;
+    defer c.g_free(ct);
+    const apps = c.g_app_info_get_all();
+    defer if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
+    var it = apps;
+    while (it != null) : (it = it.*.next) {
+        const app: *c.GAppInfo = @ptrCast(@alignCast(it.*.data orelse continue));
+        const id = c.g_app_info_get_id(app) orelse continue;
+        if (!std.mem.eql(u8, std.mem.span(id), appid)) continue;
+        _ = c.g_app_info_set_as_default_for_type(app, ct, null);
+        return;
+    }
 }
 
 /// True when a ';'-separated .desktop MimeType list contains `mime`.
@@ -4658,6 +7160,18 @@ fn fmtSize(buf: *[48:0]u8, size: u64) [:0]const u8 {
     else
         std.fmt.bufPrintZ(buf, "{d} B", .{size}) catch "?";
     return @ptrCast(s);
+}
+
+fn fmtModeZ(buf: *[16:0]u8, mode: u32, is_dir: bool) [*:0]const u8 {
+    const bits = [_]u8{ 'r', 'w', 'x' };
+    buf[0] = if (is_dir) 'd' else '-';
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        const on = (mode >> @intCast(8 - i)) & 1 == 1;
+        buf[1 + i] = if (on) bits[i % 3] else '-';
+    }
+    buf[10] = 0;
+    return @ptrCast(buf);
 }
 
 fn fmtTimeZ(buf: *[40:0]u8, ms: i64) [*:0]const u8 {
