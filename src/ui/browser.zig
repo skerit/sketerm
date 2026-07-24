@@ -128,6 +128,13 @@ const WireJobEv = struct {
     matches: u64 = 0,
     truncated: bool = false,
     hash: []const u8 = "",
+
+    /// True for the events that end a job.
+    fn terminalEv(self: WireJobEv) bool {
+        return std.mem.eql(u8, self.ev, "done") or
+            std.mem.eql(u8, self.ev, "error") or
+            std.mem.eql(u8, self.ev, "canceled");
+    }
 };
 
 /// A parsed location spec. Bare "/path" keeps the CURRENT host
@@ -408,11 +415,12 @@ const BTab = struct {
     page: *c.GtkWidget,
     listbox: *c.GtkListBox,
     tab_label: *c.GtkLabel,
-    /// Details/compact sort header (hidden in grid/miller).
+    /// Details/compact sort header (hidden in grid/miller). Rebuilt
+    /// whenever the column set or sort changes.
     header_box: *c.GtkWidget = undefined,
-    hbtn_name: *c.GtkWidget = undefined,
-    hbtn_size: *c.GtkWidget = undefined,
-    hbtn_time: *c.GtkWidget = undefined,
+    /// Optional details columns, rendered in Column declaration order.
+    columns: std.EnumSet(browser_model.Column) =
+        std.EnumSet(browser_model.Column).initMany(&browser_model.default_columns),
     /// The scrolled window whose child swaps listbox <-> flowbox.
     scroller: *c.GtkWidget = undefined,
     /// Icon-grid view (lazily created).
@@ -1491,13 +1499,28 @@ pub const BrowserView = struct {
     /// Run a shell command as an app session on a host (declarative
     /// .action files with RunsOnHost).
     on_host_exec: ?HostAction = null,
+    /// In-flight recursive folder-size probe (one at a time). The
+    /// label is g_object_ref'd, so a closed dialog cannot dangle.
+    size_probe: ?SizeProbe = null,
+    /// Resolve the other browser face in this sketerm tab (the
+    /// orthodox dual-pane destination); null when there is only one.
+    on_peer: ?*const fn (ctx: *anyopaque, pane: *Pane) ?*BrowserView = null,
     /// Window-owned service: durable downloads and sync-back survive
     /// this pane, this window, and GUI process restarts.
     transfer_service: ?*file_transfers.Service = null,
+    /// Scratch for currentSpec's caller-visible slice.
+    spec_scratch: [4300]u8 = undefined,
+    /// Type-ahead jump buffer; cleared after TYPEAHEAD_RESET_US idle.
+    ta_buf: [64]u8 = undefined,
+    ta_len: usize = 0,
+    ta_last_us: i64 = 0,
 
     /// Create a browser face on `pane`, starting at `start_spec`
     /// (a path or host-qualified spec; null/relative = $HOME).
     pub fn attach(allocator: std.mem.Allocator, pane: *Pane, start_spec: ?[]const u8) !*BrowserView {
+        // A pane owns at most one browser face; re-attaching would
+        // orphan the previous one together with its connections.
+        if (fromPane(pane)) |existing| return existing;
         const self = try allocator.create(BrowserView);
         self.* = .{ .allocator = allocator, .pane = pane };
         self.thumbs = std.StringHashMap(*c.GdkTexture).init(allocator);
@@ -1557,6 +1580,13 @@ pub const BrowserView = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
+    /// The current tab's location as a host-qualified spec, in a
+    /// caller-owned static buffer valid until the next call.
+    pub fn currentSpec(self: *BrowserView) ?[]const u8 {
+        const tab = self.currentTab() orelse return null;
+        return tab.spec(&self.spec_scratch);
+    }
+
     /// Internal tab location specs in notebook order (layout
     /// persistence; host-qualified for remote tabs).
     pub fn tabPaths(self: *BrowserView, arena: std.mem.Allocator) ![]const []const u8 {
@@ -1598,6 +1628,7 @@ pub const BrowserView = struct {
                 .expanded = expanded,
                 .selected = selected,
                 .view = tab.view_mode,
+                .columns = try columnsOf(arena, tab),
                 .sort = tab.sort_key,
                 .descending = tab.descending,
                 .dirs_first = tab.dirs_first,
@@ -1611,6 +1642,14 @@ pub const BrowserView = struct {
             .active_tab = if (active >= 0) @intCast(active) else 0,
             .tabs = tabs,
         };
+    }
+
+    fn columnsOf(arena: std.mem.Allocator, tab: *BTab) ![]const browser_model.Column {
+        var out: std.ArrayList(browser_model.Column) = .empty;
+        for (std.enums.values(browser_model.Column)) |col| {
+            if (tab.columns.contains(col)) try out.append(arena, col);
+        }
+        return out.items;
     }
 
     fn appendHistoryRef(self: *BrowserView, list: *std.ArrayList([]u8), ref: browser_model.FileRef) void {
@@ -1630,6 +1669,10 @@ pub const BrowserView = struct {
         }
         tab.show_hidden = state.show_hidden;
         tab.view_mode = state.view;
+        if (state.columns.len > 0) {
+            tab.columns = .initEmpty();
+            for (state.columns) |col| tab.columns.insert(col);
+        }
         tab.sort_key = state.sort;
         tab.descending = state.descending;
         tab.dirs_first = state.dirs_first;
@@ -1724,6 +1767,7 @@ pub const BrowserView = struct {
         self.closePathCompletion();
         if (self.completion_source != 0) _ = c.g_source_remove(self.completion_source);
         if (self.completion_request) |request| request.destroy(self.allocator);
+        self.endSizeProbe();
         if (self.preview_read) |pr| pr.destroy(self.allocator);
         if (self.restore_read) |rr| rr.destroy(self.allocator);
         if (self.dup) |d| d.destroy(self.allocator);
@@ -1943,6 +1987,12 @@ pub const BrowserView = struct {
         if (self.preview_read) |pr| {
             if (pr.hc == hc) self.abandonPreviewRead();
         }
+        if (self.size_probe) |probe| {
+            if (probe.hc == hc) {
+                c.gtk_label_set_text(@ptrCast(probe.label), "size unavailable");
+                self.endSizeProbe();
+            }
+        }
         if (self.remote_thumb) |rt| {
             if (rt.hc == hc) {
                 rt.destroy(self.allocator);
@@ -2055,6 +2105,7 @@ pub const BrowserView = struct {
             if (self.feedPreview(hc, f.ftype, f.payload)) continue;
             if (self.feedRestore(hc, f.ftype, f.payload)) continue;
             if (self.feedRemoteThumb(hc, f.ftype, f.payload)) continue;
+            if (self.feedSizeProbe(hc, f.ftype, f.payload)) continue;
             switch (f.ftype) {
                 .fs_reply => {
                     if (self.onReply(hc, f.payload)) dirty = true;
@@ -2824,19 +2875,9 @@ pub const BrowserView = struct {
         c.gtk_widget_set_hexpand(page, 1);
         c.gtk_widget_set_vexpand(page, 1);
 
-        // Sort header (details/compact views).
+        // Sort header (details/compact views); contents are built by
+        // rebuildHeader once the tab exists.
         const header = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
-        const hname = c.gtk_button_new_with_label("Name");
-        c.gtk_button_set_has_frame(@ptrCast(hname), 0);
-        c.gtk_widget_set_hexpand(hname, 1);
-        c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(hname)), c.GTK_ALIGN_START);
-        const hsize = c.gtk_button_new_with_label("Size");
-        c.gtk_button_set_has_frame(@ptrCast(hsize), 0);
-        const htime = c.gtk_button_new_with_label("Modified");
-        c.gtk_button_set_has_frame(@ptrCast(htime), 0);
-        c.gtk_box_append(@ptrCast(header), hname);
-        c.gtk_box_append(@ptrCast(header), hsize);
-        c.gtk_box_append(@ptrCast(header), htime);
         c.gtk_box_append(@ptrCast(page), header);
 
         const content = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
@@ -2873,9 +2914,6 @@ pub const BrowserView = struct {
             .listbox = @ptrCast(listbox),
             .tab_label = @ptrCast(@alignCast(label)),
             .header_box = header,
-            .hbtn_name = hname,
-            .hbtn_size = hsize,
-            .hbtn_time = htime,
             .scroller = scroller,
             .miller_box = miller_box,
         };
@@ -2888,9 +2926,6 @@ pub const BrowserView = struct {
         _ = c.g_signal_connect_data(listbox, "row-activated", @ptrCast(&onRowActivated), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(listbox, "selected-rows-changed", @ptrCast(&onSelectionChanged), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(close_btn, "clicked", @ptrCast(&onTabCloseClicked), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(hname, "clicked", @ptrCast(&onSortName), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(hsize, "clicked", @ptrCast(&onSortSize), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(htime, "clicked", @ptrCast(&onSortTime), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
 
         const rclick = c.gtk_gesture_click_new();
         c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
@@ -3058,6 +3093,7 @@ pub const BrowserView = struct {
         while (tab.fwd.items.len > 100) self.allocator.free(tab.fwd.orderedRemove(0));
         for (tab.selected.items) |value| self.allocator.free(value);
         tab.selected.clearRetainingCapacity();
+        self.ta_len = 0;
         tab.dropSubdirsUnder(tab.root.path);
         self.cancelPendingDir(tab.root);
         self.closeViewOf(tab.hc, tab.root);
@@ -3181,18 +3217,114 @@ pub const BrowserView = struct {
         if (mode != .miller and tab.ancestors.items.len > 0) tab.dropAncestors();
     }
 
+    /// Heap context for one header button (a column or the picker).
+    const HeaderCtx = struct {
+        allocator: std.mem.Allocator,
+        tab: *BTab,
+        column: ?browser_model.Column,
+
+        fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+            const ctx: *HeaderCtx = @ptrCast(@alignCast(user.?));
+            ctx.allocator.destroy(ctx);
+        }
+    };
+
+    fn headerButton(self: *BrowserView, tab: *BTab, label: [*:0]const u8, column: ?browser_model.Column, width: i32, expand: bool) void {
+        const btn = c.gtk_button_new_with_label(label);
+        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+        if (expand) {
+            c.gtk_widget_set_hexpand(btn, 1);
+            c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(btn)), c.GTK_ALIGN_START);
+        } else {
+            c.gtk_widget_set_size_request(btn, width, -1);
+        }
+        const ctx = self.allocator.create(HeaderCtx) catch return;
+        ctx.* = .{ .allocator = self.allocator, .tab = tab, .column = column };
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onHeaderClicked), @ptrCast(ctx), @ptrCast(&HeaderCtx.free), c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(tab.header_box), btn);
+    }
+
+    fn onHeaderClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *HeaderCtx = @ptrCast(@alignCast(user.?));
+        sortClicked(ctx.tab, if (ctx.column) |col| col.sortKey() else .name);
+    }
+
+    /// Rebuild the sort header for the tab's current column set. Also
+    /// the single place that renders sort direction.
     fn updateSortHeader(self: *BrowserView, tab: *BTab) void {
-        _ = self;
-        const mark_asc = " ^";
-        const mark_desc = " v";
-        const mark = if (tab.descending) mark_desc else mark_asc;
+        while (c.gtk_widget_get_first_child(tab.header_box)) |child|
+            c.gtk_box_remove(@ptrCast(tab.header_box), child);
+        const mark = if (tab.descending) " v" else " ^";
         var buf: [32:0]u8 = undefined;
         const nm = std.fmt.bufPrintZ(&buf, "Name{s}", .{if (tab.sort_key == .name) mark else ""}) catch "Name";
-        c.gtk_button_set_label(@ptrCast(tab.hbtn_name), nm.ptr);
-        const sz = std.fmt.bufPrintZ(&buf, "Size{s}", .{if (tab.sort_key == .size) mark else ""}) catch "Size";
-        c.gtk_button_set_label(@ptrCast(tab.hbtn_size), sz.ptr);
-        const tm = std.fmt.bufPrintZ(&buf, "Modified{s}", .{if (tab.sort_key == .mtime) mark else ""}) catch "Modified";
-        c.gtk_button_set_label(@ptrCast(tab.hbtn_time), tm.ptr);
+        self.headerButton(tab, nm.ptr, null, 0, true);
+        if (tab.view_mode == .details) {
+            for (std.enums.values(browser_model.Column)) |col| {
+                if (!tab.columns.contains(col)) continue;
+                var cb: [32:0]u8 = undefined;
+                const marked = tab.sort_key == col.sortKey() and col != .target;
+                const txt: [*:0]const u8 = if (std.fmt.bufPrintZ(&cb, "{s}{s}", .{ col.title(), if (marked) mark else "" })) |v| v.ptr else |_| col.title();
+                self.headerButton(tab, txt, col, col.width(), false);
+            }
+            const picker = c.gtk_button_new_from_icon_name("view-more-symbolic");
+            c.gtk_button_set_has_frame(@ptrCast(picker), 0);
+            c.gtk_widget_set_tooltip_text(picker, "Choose columns");
+            const ctx = self.allocator.create(HeaderCtx) catch return;
+            ctx.* = .{ .allocator = self.allocator, .tab = tab, .column = null };
+            _ = c.g_signal_connect_data(picker, "clicked", @ptrCast(&onColumnPicker), @ptrCast(ctx), @ptrCast(&HeaderCtx.free), c.G_CONNECT_DEFAULT);
+            c.gtk_box_append(@ptrCast(tab.header_box), picker);
+        }
+    }
+
+    fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *HeaderCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.tab.view;
+        const popover = c.gtk_popover_new();
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
+        c.gtk_widget_set_margin_start(box, 10);
+        c.gtk_widget_set_margin_end(box, 10);
+        c.gtk_widget_set_margin_top(box, 10);
+        c.gtk_widget_set_margin_bottom(box, 10);
+        for (std.enums.values(browser_model.Column)) |col| {
+            const check = c.gtk_check_button_new_with_label(col.title());
+            c.gtk_check_button_set_active(@ptrCast(check), @intFromBool(ctx.tab.columns.contains(col)));
+            const cctx = self.allocator.create(HeaderCtx) catch continue;
+            cctx.* = .{ .allocator = self.allocator, .tab = ctx.tab, .column = col };
+            _ = c.g_signal_connect_data(check, "toggled", @ptrCast(&onColumnToggled), @ptrCast(cctx), @ptrCast(&HeaderCtx.free), c.G_CONNECT_DEFAULT);
+            c.gtk_box_append(@ptrCast(box), check);
+        }
+        c.gtk_popover_set_child(@ptrCast(popover), box);
+        // Parent to the PAGE, not the button: every toggle rebuilds
+        // the header, which would destroy a button-parented popover
+        // and close the picker after a single click.
+        var bounds: c.graphene_rect_t = undefined;
+        if (c.gtk_widget_compute_bounds(@ptrCast(btn), ctx.tab.page, &bounds) != 0) {
+            const rect = c.GdkRectangle{
+                .x = @intFromFloat(bounds.origin.x),
+                .y = @intFromFloat(bounds.origin.y),
+                .width = @intFromFloat(bounds.size.width),
+                .height = @intFromFloat(bounds.size.height),
+            };
+            c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+        }
+        c.gtk_widget_set_parent(popover, ctx.tab.page);
+        connectPopoverAutoUnparent(popover);
+        c.gtk_popover_popup(@ptrCast(popover));
+    }
+
+    fn onColumnToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *HeaderCtx = @ptrCast(@alignCast(user.?));
+        const col = ctx.column orelse return;
+        const on = c.gtk_check_button_get_active(check) != 0;
+        if (on) ctx.tab.columns.insert(col) else ctx.tab.columns.remove(col);
+        const self = ctx.tab.view;
+        // A hidden column must not keep sorting the view.
+        if (!on and ctx.tab.sort_key == col.sortKey() and col != .target) {
+            ctx.tab.sort_key = .name;
+            ctx.tab.applySort();
+        }
+        self.updateSortHeader(ctx.tab);
+        self.renderTab(ctx.tab);
     }
 
     fn renderList(self: *BrowserView, tab: *BTab) void {
@@ -3623,32 +3755,13 @@ pub const BrowserView = struct {
             c.gtk_box_append(@ptrCast(row_box), tag_label);
         }
 
-        // Compact view: name (+tags) only. Details adds perms, size,
-        // and mtime columns.
-        const compact = tab.view_mode == .compact;
-        if (!compact and tab.view_mode == .details) {
-            var perm_z: [16:0]u8 = undefined;
-            const ptxt = fmtModeZ(&perm_z, e.mode, e.tdir);
-            const perm_label = c.gtk_label_new(ptxt);
-            c.gtk_widget_add_css_class(perm_label, "dim-label");
-            c.gtk_widget_add_css_class(perm_label, "monospace");
-            c.gtk_box_append(@ptrCast(row_box), perm_label);
-        }
-
-        if (!compact and !std.mem.eql(u8, e.kind, "dir")) {
-            var size_buf: [48:0]u8 = undefined;
-            const s = fmtSize(&size_buf, e.size);
-            const size_label = c.gtk_label_new(s.ptr);
-            c.gtk_widget_add_css_class(size_label, "dim-label");
-            c.gtk_box_append(@ptrCast(row_box), size_label);
-        }
-
-        if (!compact and e.mtime_ms != 0) {
-            var time_buf: [40:0]u8 = undefined;
-            const tstr = fmtTimeZ(&time_buf, e.mtime_ms);
-            const time_label = c.gtk_label_new(tstr);
-            c.gtk_widget_add_css_class(time_label, "dim-label");
-            c.gtk_box_append(@ptrCast(row_box), time_label);
+        // Compact view is name (+tags) only; details renders the
+        // tab's chosen columns, in Column declaration order.
+        if (tab.view_mode == .details) {
+            for (std.enums.values(browser_model.Column)) |col| {
+                if (!tab.columns.contains(col)) continue;
+                self.appendColumnCell(row_box, e, col);
+            }
         }
 
         const row = c.gtk_list_box_row_new();
@@ -3686,6 +3799,33 @@ pub const BrowserView = struct {
         }
 
         c.gtk_list_box_append(tab.listbox, row);
+    }
+
+    /// One details-view column cell. Widths match the header buttons
+    /// so the columns line up without a size group.
+    fn appendColumnCell(self: *BrowserView, row_box: *c.GtkWidget, e: Entry, col: browser_model.Column) void {
+        _ = self;
+        var buf: [256:0]u8 = undefined;
+        var mode_buf: [16:0]u8 = undefined;
+        var size_buf: [48:0]u8 = undefined;
+        var time_buf: [40:0]u8 = undefined;
+        const text: [*:0]const u8 = switch (col) {
+            .kind => copyZ(&buf, e.kind),
+            .permissions => fmtModeZ(&mode_buf, e.mode, e.tdir),
+            .owner => if (std.fmt.bufPrintZ(&buf, "{d}", .{e.uid})) |v| v.ptr else |_| "",
+            .group => if (std.fmt.bufPrintZ(&buf, "{d}", .{e.gid})) |v| v.ptr else |_| "",
+            .size => if (std.mem.eql(u8, e.kind, "dir")) "" else @as([*:0]const u8, fmtSize(&size_buf, e.size).ptr),
+            .mtime => if (e.mtime_ms == 0) "" else fmtTimeZ(&time_buf, e.mtime_ms),
+            .ctime => if (e.ctime_ms == 0) "" else fmtTimeZ(&time_buf, e.ctime_ms),
+            .target => copyZ(&buf, e.target orelse ""),
+        };
+        const label = c.gtk_label_new(text);
+        c.gtk_widget_add_css_class(label, "dim-label");
+        if (col == .permissions) c.gtk_widget_add_css_class(label, "monospace");
+        c.gtk_label_set_xalign(@ptrCast(label), if (col == .size) 1.0 else 0.0);
+        c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);
+        c.gtk_widget_set_size_request(label, col.width(), -1);
+        c.gtk_box_append(@ptrCast(row_box), label);
     }
 
     /// Signal-closure variant of freeRowCtx (GClosureNotify shape).
@@ -3796,7 +3936,7 @@ pub const BrowserView = struct {
         is_dir: bool,
         popover: *c.GtkWidget,
         /// Entry-dialog mode: what Enter commits.
-        mode: enum { none, rename, mkdir, tags, permissions } = .none,
+        mode: enum { none, rename, mkdir, tags } = .none,
         entry: ?*c.GtkWidget = null,
         entry2: ?*c.GtkWidget = null,
 
@@ -3905,6 +4045,19 @@ pub const BrowserView = struct {
             }
             menuButton(box, "Copy", &onMenuCopy, ctx, false);
             menuButton(box, "Cut", &onMenuCut, ctx, false);
+            if (self.peerView()) |peer| {
+                if (peer.currentTab()) |pt| {
+                    var pbuf: [4300]u8 = undefined;
+                    var lbuf: [4400:0]u8 = undefined;
+                    const dest = pt.spec(&pbuf);
+                    if (std.fmt.bufPrintZ(&lbuf, "Copy to Other Pane ({s})  F5", .{dest})) |t| {
+                        menuButton(box, t.ptr, &onMenuCopyToPeer, ctx, false);
+                    } else |_| {}
+                    if (std.fmt.bufPrintZ(&lbuf, "Move to Other Pane ({s})  F6", .{dest})) |t| {
+                        menuButton(box, t.ptr, &onMenuMoveToPeer, ctx, false);
+                    } else |_| {}
+                }
+            }
             menuButton(box, "Copy Path", &onMenuCopyPath, ctx, false);
             menuButton(box, "Rename…", &onMenuRename, ctx, false);
             menuButton(box, "Properties…", &onMenuProperties, ctx, false);
@@ -3992,6 +4145,24 @@ pub const BrowserView = struct {
         copyToClip(@ptrCast(@alignCast(user.?)), true);
     }
 
+    fn onMenuCopyToPeer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = if (ctx.path) |p| self.allocator.dupe(u8, p) catch null else null;
+        defer if (path) |p| self.allocator.free(p);
+        menuDone(ctx);
+        self.sendToPeer(false, path);
+    }
+
+    fn onMenuMoveToPeer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const path = if (ctx.path) |p| self.allocator.dupe(u8, p) catch null else null;
+        defer if (path) |p| self.allocator.free(p);
+        menuDone(ctx);
+        self.sendToPeer(true, path);
+    }
+
     fn copyToClip(ctx: *MenuCtx, cut: bool) void {
         const self = ctx.view;
         const path = ctx.path orelse return menuDone(ctx);
@@ -4050,11 +4221,17 @@ pub const BrowserView = struct {
         sources: std.ArrayList([]u8) = .empty,
         conflicts: usize = 0,
         popover: *c.GtkWidget,
+        /// Source host and whether this is a move; carried explicitly
+        /// so a dual-pane send is not tied to the clipboard.
+        src_host: ?[]u8 = null,
+        cut: bool = false,
+        clear_clipboard: bool = false,
 
         fn free(user: ?*anyopaque) callconv(.c) void {
             const p: *PasteCtx = @ptrCast(@alignCast(user.?));
             for (p.sources.items) |s| p.allocator.free(s);
             p.sources.deinit(p.allocator);
+            if (p.src_host) |h| p.allocator.free(h);
             p.allocator.destroy(p);
         }
     };
@@ -4064,28 +4241,51 @@ pub const BrowserView = struct {
     fn onMenuPaste(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
         const self = ctx.view;
-        const tab = ctx.tab;
         if (self.clip_paths.items.len == 0 and self.clip_path == null) return menuDone(ctx);
-
-        // Count collisions against the LIVE target listing.
-        var conflicts: usize = 0;
         const srcs: []const []u8 = if (self.clip_paths.items.len > 0)
             self.clip_paths.items
         else
             (&[_][]u8{self.clip_path.?})[0..];
+        self.beginPaste(ctx.tab, self.clip_host, srcs, self.clip_cut, true);
+        menuDone(ctx);
+    }
+
+    /// Copy/move `sources` (living on `src_host`) into `tab`'s
+    /// directory, asking about name collisions first. The clipboard is
+    /// only consulted by the caller, so a dual-pane send uses the same
+    /// path as Paste Here.
+    fn beginPaste(
+        self: *BrowserView,
+        tab: *BTab,
+        src_host: ?[]const u8,
+        srcs: []const []u8,
+        cut: bool,
+        clear_clipboard: bool,
+    ) void {
+        // Count collisions against the LIVE target listing.
+        var conflicts: usize = 0;
         for (srcs) |src| {
             if (tab.root.find(std.fs.path.basename(src)) != null) conflicts += 1;
         }
         if (conflicts == 0) {
-            self.pasteExecute(tab, srcs, .overwrite);
-            return menuDone(ctx);
+            self.pasteExecute(tab, srcs, .overwrite, src_host, cut, clear_clipboard);
+            return;
         }
 
         // Conflict dialog: one choice applies to every conflicting
         // item; non-conflicting items copy either way.
         const popover = c.gtk_popover_new();
-        const pctx = self.allocator.create(PasteCtx) catch return menuDone(ctx);
-        pctx.* = .{ .allocator = self.allocator, .view = self, .tab = tab, .popover = popover, .conflicts = conflicts };
+        const pctx = self.allocator.create(PasteCtx) catch return;
+        pctx.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .tab = tab,
+            .popover = popover,
+            .conflicts = conflicts,
+            .src_host = if (src_host) |h| (self.allocator.dupe(u8, h) catch null) else null,
+            .cut = cut,
+            .clear_clipboard = clear_clipboard,
+        };
         for (srcs) |src| {
             const owned = self.allocator.dupe(u8, src) catch continue;
             pctx.sources.append(self.allocator, owned) catch self.allocator.free(owned);
@@ -4120,7 +4320,6 @@ pub const BrowserView = struct {
         c.gtk_widget_set_parent(popover, tab.page);
         connectPopoverAutoUnparent(popover);
         c.gtk_popover_popup(@ptrCast(popover));
-        menuDone(ctx);
     }
 
     fn pasteChoiceButton(box: *c.GtkWidget, label: [*:0]const u8, cb: anytype, pctx: *PasteCtx, destructive: bool) void {
@@ -4132,17 +4331,17 @@ pub const BrowserView = struct {
 
     fn onPasteOverwrite(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const p: *PasteCtx = @ptrCast(@alignCast(user.?));
-        p.view.pasteExecute(p.tab, p.sources.items, .overwrite);
+        p.view.pasteExecute(p.tab, p.sources.items, .overwrite, p.src_host, p.cut, p.clear_clipboard);
         c.gtk_popover_popdown(@ptrCast(p.popover));
     }
     fn onPasteKeepBoth(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const p: *PasteCtx = @ptrCast(@alignCast(user.?));
-        p.view.pasteExecute(p.tab, p.sources.items, .keep_both);
+        p.view.pasteExecute(p.tab, p.sources.items, .keep_both, p.src_host, p.cut, p.clear_clipboard);
         c.gtk_popover_popdown(@ptrCast(p.popover));
     }
     fn onPasteSkip(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const p: *PasteCtx = @ptrCast(@alignCast(user.?));
-        p.view.pasteExecute(p.tab, p.sources.items, .skip);
+        p.view.pasteExecute(p.tab, p.sources.items, .skip, p.src_host, p.cut, p.clear_clipboard);
         c.gtk_popover_popdown(@ptrCast(p.popover));
     }
 
@@ -4161,9 +4360,16 @@ pub const BrowserView = struct {
     /// Start one copy (or move, when the clipboard is CUT) per
     /// source, honoring `choice` for names that already exist in the
     /// target directory.
-    fn pasteExecute(self: *BrowserView, tab: *BTab, sources: []const []u8, choice: ConflictChoice) void {
+    fn pasteExecute(
+        self: *BrowserView,
+        tab: *BTab,
+        sources: []const []u8,
+        choice: ConflictChoice,
+        src_host: ?[]const u8,
+        cut: bool,
+        clear_clipboard: bool,
+    ) void {
         const dir = tab.root.path;
-        const cut = self.clip_cut;
         var skipped: usize = 0;
         for (sources) |src| {
             const base = std.fs.path.basename(src);
@@ -4187,11 +4393,11 @@ pub const BrowserView = struct {
                 if (dir.len == 1) "" else dir, name,
             }) catch continue;
             // Pasting onto itself is a no-op, not a copy/move.
-            if (hostEq(self.clip_host, tab.hc.host) and std.mem.eql(u8, src, dst)) {
+            if (hostEq(src_host, tab.hc.host) and std.mem.eql(u8, src, dst)) {
                 skipped += 1;
                 continue;
             }
-            if (hostEq(self.clip_host, tab.hc.host)) {
+            if (hostEq(src_host, tab.hc.host)) {
                 if (cut) {
                     // Same-host move = one rename, undoable.
                     const req = self.nextReq();
@@ -4203,12 +4409,12 @@ pub const BrowserView = struct {
                     self.startDaemonJobUndo(tab.hc, "copy", src, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, src, ""));
                 }
             } else {
-                const src_hc = self.hostConnFor(if (self.clip_host) |h| @as(?[]const u8, h) else null) orelse continue;
+                const src_hc = self.hostConnFor(src_host) orelse continue;
                 self.startTransfer(src_hc, src, tab.hc, dst, .{ .delete_src_after = cut });
             }
         }
         if (skipped > 0) self.setStatusFmt("skipped {d} existing item(s)", .{skipped});
-        if (cut) {
+        if (cut and clear_clipboard) {
             // Cut is one-shot: the sources are moving away.
             if (self.clip_path) |s| self.allocator.free(s);
             self.clip_path = null;
@@ -5381,50 +5587,381 @@ pub const BrowserView = struct {
         return &dir.entries.items[idx];
     }
 
+    /// Recursive size probe: a daemon job so the walk happens on the
+    /// host that owns the tree.
+    const SizeProbe = struct {
+        req: u32,
+        job: u64 = 0,
+        hc: *HostConn,
+        label: *c.GtkWidget,
+    };
+
+    fn endSizeProbe(self: *BrowserView) void {
+        const probe = self.size_probe orelse return;
+        c.g_object_unref(@ptrCast(probe.label));
+        self.size_probe = null;
+    }
+
+    fn feedSizeProbe(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
+        const probe = self.size_probe orelse return false;
+        if (probe.hc != hc) return false;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        switch (ftype) {
+            .fs_reply => {
+                const rep = std.json.parseFromSliceLeaky(struct {
+                    req: u32 = 0,
+                    ok: bool = false,
+                    job: u64 = 0,
+                }, arena.allocator(), payload, .{ .ignore_unknown_fields = true }) catch return false;
+                if (rep.req != probe.req) return false;
+                if (!rep.ok or rep.job == 0) {
+                    c.gtk_label_set_text(@ptrCast(probe.label), "size unavailable");
+                    self.endSizeProbe();
+                } else self.size_probe.?.job = rep.job;
+                return true;
+            },
+            .fs_job => {
+                if (probe.job == 0) return false;
+                const ev = std.json.parseFromSliceLeaky(WireJobEv, arena.allocator(), payload, .{ .ignore_unknown_fields = true }) catch return false;
+                if (ev.job != probe.job) return false;
+                var buf: [96:0]u8 = undefined;
+                var human: [48:0]u8 = undefined;
+                const done = std.mem.eql(u8, ev.ev, "done");
+                if (done or std.mem.eql(u8, ev.ev, "progress")) {
+                    const txt = std.fmt.bufPrintZ(&buf, "{s} ({d} bytes) in {d} items{s}", .{
+                        fmtSize(&human, ev.done), ev.done, ev.total, if (done) "" else " …",
+                    }) catch "";
+                    c.gtk_label_set_text(@ptrCast(probe.label), txt.ptr);
+                    if (done) self.endSizeProbe();
+                } else if (ev.terminalEv()) {
+                    c.gtk_label_set_text(@ptrCast(probe.label), "size unavailable");
+                    self.endSizeProbe();
+                }
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    /// Properties: identity + timestamps, an on-demand recursive size
+    /// for directories, and a full permission/ownership editor with
+    /// optional recursive apply.
+    const PropsCtx = struct {
+        allocator: std.mem.Allocator,
+        view: *BrowserView,
+        tab: *BTab,
+        path: []u8,
+        is_dir: bool,
+        /// u/g/o x r/w/x, then setuid/setgid/sticky.
+        perm_bits: [12]*c.GtkWidget = undefined,
+        octal: *c.GtkWidget = undefined,
+        uid_entry: *c.GtkWidget = undefined,
+        gid_entry: *c.GtkWidget = undefined,
+        recursive: ?*c.GtkWidget = null,
+        size_label: *c.GtkWidget = undefined,
+        syncing: bool = false,
+
+        fn free(user: ?*anyopaque) callconv(.c) void {
+            const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+            ctx.allocator.free(ctx.path);
+            ctx.allocator.destroy(ctx);
+        }
+
+        /// Bit weight of perm_bits[i]: 0o400 down to 0o1, then the
+        /// setuid/setgid/sticky triple.
+        fn weight(i: usize) u32 {
+            if (i < 9) return @as(u32, 1) << @intCast(8 - i);
+            return switch (i) {
+                9 => 0o4000,
+                10 => 0o2000,
+                else => 0o1000,
+            };
+        }
+
+        fn modeFromChecks(self: *const PropsCtx) u32 {
+            var mode: u32 = 0;
+            for (self.perm_bits, 0..) |btn, i| {
+                if (c.gtk_check_button_get_active(@ptrCast(btn)) != 0) mode |= weight(i);
+            }
+            return mode;
+        }
+
+        fn applyChecks(self: *PropsCtx, mode: u32) void {
+            self.syncing = true;
+            for (self.perm_bits, 0..) |btn, i|
+                c.gtk_check_button_set_active(@ptrCast(btn), @intFromBool(mode & weight(i) != 0));
+            self.syncing = false;
+        }
+
+        fn setOctal(self: *PropsCtx, mode: u32) void {
+            var buf: [16:0]u8 = undefined;
+            const txt = std.fmt.bufPrintZ(&buf, "{o:0>4}", .{mode & 0o7777}) catch return;
+            self.syncing = true;
+            c.gtk_editable_set_text(@ptrCast(self.octal), txt.ptr);
+            self.syncing = false;
+        }
+    };
+
+    fn propsRow(box: *c.GtkWidget, label: []const u8, value: []const u8) void {
+        var buf: [1024:0]u8 = undefined;
+        const txt = std.fmt.bufPrintZ(&buf, "{s}: {s}", .{ label, value }) catch return;
+        const w = c.gtk_label_new(txt.ptr);
+        c.gtk_label_set_xalign(@ptrCast(w), 0);
+        c.gtk_label_set_selectable(@ptrCast(w), 1);
+        c.gtk_label_set_ellipsize(@ptrCast(w), c.PANGO_ELLIPSIZE_MIDDLE);
+        c.gtk_box_append(@ptrCast(box), w);
+    }
+
     fn onMenuProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const old: *MenuCtx = @ptrCast(@alignCast(user.?));
-        const path = old.path orelse return menuDone(old);
-        const e = entryForPath(old.tab, path) orelse return menuDone(old);
+        const old_path = old.path orelse return menuDone(old);
         const self = old.view;
+        const tab = old.tab;
+        // Pop the context menu down FIRST: a popover built while the
+        // menu is still up loses its grab when the menu closes.
+        var path_buf: [4096]u8 = undefined;
+        const n = @min(old_path.len, path_buf.len);
+        @memcpy(path_buf[0..n], old_path[0..n]);
+        const path = path_buf[0..n];
+        menuDone(old);
+        const e = entryForPath(tab, path) orelse {
+            self.setStatus("properties: entry is no longer in the listing");
+            return;
+        };
         const popover = c.gtk_popover_new();
-        const ctx = self.allocator.create(MenuCtx) catch return menuDone(old);
+        const ctx = self.allocator.create(PropsCtx) catch return;
         ctx.* = .{
             .allocator = self.allocator,
             .view = self,
-            .tab = old.tab,
-            .path = self.allocator.dupe(u8, path) catch null,
-            .name = null,
-            .is_dir = old.is_dir,
-            .popover = popover,
-            .mode = .permissions,
+            .tab = tab,
+            .path = self.allocator.dupe(u8, path) catch {
+                self.allocator.destroy(ctx);
+                return;
+            },
+            .is_dir = e.tdir,
         };
-        c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(ctx), @ptrCast(&MenuCtx.free));
+        c.g_object_set_data_full(@ptrCast(popover), "sketerm-props", @ptrCast(ctx), @ptrCast(&PropsCtx.free));
+
         const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
         c.gtk_widget_set_margin_start(box, 10);
         c.gtk_widget_set_margin_end(box, 10);
         c.gtk_widget_set_margin_top(box, 10);
         c.gtk_widget_set_margin_bottom(box, 10);
-        var info: [1024:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&info,
-            "{s}\nType: {s}\nSize: {d} bytes ({d} allocated)\nOwner: {d}:{d}\nLinks: {d}\nModified: {d}\nChanged: {d}",
-            .{ path, e.kind, e.size, e.blocks * 512, e.uid, e.gid, e.nlink, e.mtime_ms, e.ctime_ms }) catch "Properties";
-        const label = c.gtk_label_new(text.ptr);
-        c.gtk_label_set_xalign(@ptrCast(label), 0);
-        c.gtk_label_set_selectable(@ptrCast(label), 1);
-        c.gtk_box_append(@ptrCast(box), label);
-        const mode_entry = c.gtk_entry_new();
-        var modez: [16:0]u8 = undefined;
-        const modes = std.fmt.bufPrintZ(&modez, "{o:0>4}", .{e.mode}) catch "0644";
-        c.gtk_editable_set_text(@ptrCast(mode_entry), modes.ptr);
-        c.gtk_entry_set_placeholder_text(@ptrCast(mode_entry), "permissions (octal), Enter to apply");
-        ctx.entry = mode_entry;
-        _ = c.g_signal_connect_data(mode_entry, "activate", @ptrCast(&onEntryDialogActivate), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(box), mode_entry);
-        c.gtk_popover_set_child(@ptrCast(popover), box);
-        c.gtk_widget_set_parent(popover, old.tab.page);
+
+        var name_z: [512:0]u8 = undefined;
+        const title = c.gtk_label_new(copyZ(@ptrCast(&name_z), std.fs.path.basename(path)));
+        c.gtk_widget_add_css_class(title, "heading");
+        c.gtk_label_set_xalign(@ptrCast(title), 0);
+        c.gtk_box_append(@ptrCast(box), title);
+
+        var scratch: [1024]u8 = undefined;
+        propsRow(box, "Location", std.fs.path.dirname(path) orelse "/");
+        propsRow(box, "Host", if (tab.hc.host) |h| h else "local");
+        // MIME comes from the NAME only: guessing from content would
+        // mean reading the file, which is wrong for a remote entry.
+        var content_type: ?[*c]c.gchar = null;
+        if (!e.tdir) {
+            var basez: [512:0]u8 = undefined;
+            content_type = c.g_content_type_guess(copyZ(@ptrCast(&basez), std.fs.path.basename(path)), null, 0, null);
+        }
+        defer if (content_type) |ct| c.g_free(ct);
+        propsRow(box, "Type", if (content_type) |ct|
+            std.fmt.bufPrint(&scratch, "{s} ({s})", .{ e.kind, std.mem.span(@as([*:0]const u8, @ptrCast(ct))) }) catch e.kind
+        else
+            e.kind);
+        if (e.target) |t| propsRow(box, "Symlink target", t);
+        var human: [48:0]u8 = undefined;
+        // st_blocks is 0 on filesystems that do not report allocation
+        // (tmpfs directories); saying "0 on disk" would read as a fact.
+        propsRow(box, "Size", if (e.blocks > 0)
+            std.fmt.bufPrint(&scratch, "{s} ({d} bytes, {d} on disk)", .{
+                fmtSize(&human, e.size), e.size, e.blocks * 512,
+            }) catch ""
+        else
+            std.fmt.bufPrint(&scratch, "{s} ({d} bytes)", .{ fmtSize(&human, e.size), e.size }) catch "");
+        propsRow(box, "Links", std.fmt.bufPrint(&scratch, "{d}", .{e.nlink}) catch "");
+        var tbuf: [40:0]u8 = undefined;
+        propsRow(box, "Modified", std.mem.span(fmtTimeZ(&tbuf, e.mtime_ms)));
+        propsRow(box, "Accessed", std.mem.span(fmtTimeZ(&tbuf, e.atime_ms)));
+        propsRow(box, "Changed", std.mem.span(fmtTimeZ(&tbuf, e.ctime_ms)));
+
+        if (e.tdir) {
+            const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+            const lbl = c.gtk_label_new("Contents: not calculated");
+            c.gtk_label_set_xalign(@ptrCast(lbl), 0);
+            c.gtk_widget_set_hexpand(lbl, 1);
+            ctx.size_label = lbl;
+            c.gtk_box_append(@ptrCast(row), lbl);
+            const calc = c.gtk_button_new_with_label("Calculate");
+            _ = c.g_signal_connect_data(calc, "clicked", @ptrCast(&onPropsCalcSize), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+            c.gtk_box_append(@ptrCast(row), calc);
+            c.gtk_box_append(@ptrCast(box), row);
+        }
+
+        c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+
+        const grid = c.gtk_grid_new();
+        c.gtk_grid_set_row_spacing(@ptrCast(grid), 2);
+        c.gtk_grid_set_column_spacing(@ptrCast(grid), 8);
+        const who = [_][*:0]const u8{ "Owner", "Group", "Others" };
+        const what = [_][*:0]const u8{ "read", "write", "exec" };
+        for (who, 0..) |w, r| {
+            const wl = c.gtk_label_new(w);
+            c.gtk_label_set_xalign(@ptrCast(wl), 0);
+            c.gtk_grid_attach(@ptrCast(grid), wl, 0, @intCast(r), 1, 1);
+            for (what, 0..) |bit, col| {
+                const check = c.gtk_check_button_new_with_label(bit);
+                ctx.perm_bits[r * 3 + col] = check;
+                _ = c.g_signal_connect_data(check, "toggled", @ptrCast(&onPropsBitToggled), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+                c.gtk_grid_attach(@ptrCast(grid), check, @intCast(col + 1), @intCast(r), 1, 1);
+            }
+        }
+        const special = [_][*:0]const u8{ "setuid", "setgid", "sticky" };
+        const sl = c.gtk_label_new("Special");
+        c.gtk_label_set_xalign(@ptrCast(sl), 0);
+        c.gtk_grid_attach(@ptrCast(grid), sl, 0, 3, 1, 1);
+        for (special, 0..) |bit, col| {
+            const check = c.gtk_check_button_new_with_label(bit);
+            ctx.perm_bits[9 + col] = check;
+            _ = c.g_signal_connect_data(check, "toggled", @ptrCast(&onPropsBitToggled), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+            c.gtk_grid_attach(@ptrCast(grid), check, @intCast(col + 1), 3, 1, 1);
+        }
+        c.gtk_box_append(@ptrCast(box), grid);
+
+        const octal_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+        c.gtk_box_append(@ptrCast(octal_row), c.gtk_label_new("Octal"));
+        const octal = c.gtk_entry_new();
+        c.gtk_entry_set_max_length(@ptrCast(octal), 4);
+        ctx.octal = octal;
+        _ = c.g_signal_connect_data(octal, "changed", @ptrCast(&onPropsOctalChanged), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(octal_row), octal);
+        c.gtk_box_append(@ptrCast(box), octal_row);
+        ctx.applyChecks(e.mode);
+        ctx.setOctal(e.mode);
+
+        const own_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+        c.gtk_box_append(@ptrCast(own_row), c.gtk_label_new("uid"));
+        const uid_entry = c.gtk_entry_new();
+        c.gtk_widget_set_size_request(uid_entry, 80, -1);
+        var idbuf: [16:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&idbuf, "{d}", .{e.uid})) |v| c.gtk_editable_set_text(@ptrCast(uid_entry), v.ptr) else |_| {}
+        ctx.uid_entry = uid_entry;
+        c.gtk_box_append(@ptrCast(own_row), uid_entry);
+        c.gtk_box_append(@ptrCast(own_row), c.gtk_label_new("gid"));
+        const gid_entry = c.gtk_entry_new();
+        c.gtk_widget_set_size_request(gid_entry, 80, -1);
+        if (std.fmt.bufPrintZ(&idbuf, "{d}", .{e.gid})) |v| c.gtk_editable_set_text(@ptrCast(gid_entry), v.ptr) else |_| {}
+        ctx.gid_entry = gid_entry;
+        c.gtk_box_append(@ptrCast(own_row), gid_entry);
+        c.gtk_box_append(@ptrCast(box), own_row);
+
+        if (e.tdir) {
+            const rec = c.gtk_check_button_new_with_label("Apply to enclosed files and folders");
+            ctx.recursive = rec;
+            c.gtk_box_append(@ptrCast(box), rec);
+        }
+
+        const apply = c.gtk_button_new_with_label("Apply");
+        c.gtk_widget_add_css_class(apply, "suggested-action");
+        _ = c.g_signal_connect_data(apply, "clicked", @ptrCast(&onPropsApply), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(box), apply);
+
+        const scroll = c.gtk_scrolled_window_new();
+        c.gtk_widget_set_size_request(scroll, 400, 520);
+        c.gtk_scrolled_window_set_child(@ptrCast(scroll), box);
+        c.gtk_popover_set_child(@ptrCast(popover), scroll);
+        c.gtk_widget_set_parent(popover, tab.page);
         connectPopoverAutoUnparent(popover);
+        const rect = c.GdkRectangle{ .x = 320, .y = 120, .width = 1, .height = 1 };
+        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
         c.gtk_popover_popup(@ptrCast(popover));
-        menuDone(old);
+    }
+
+    fn onPropsBitToggled(_: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+        if (ctx.syncing) return;
+        ctx.setOctal(ctx.modeFromChecks());
+    }
+
+    fn onPropsOctalChanged(entry: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+        if (ctx.syncing) return;
+        const txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
+        const mode = std.fmt.parseInt(u32, txt, 8) catch return;
+        if (mode > 0o7777) return;
+        ctx.applyChecks(mode);
+    }
+
+    fn onPropsCalcSize(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const hc = ctx.tab.hc;
+        if (hc.state != .ready) {
+            self.setStatusFmt("not connected to {s}", .{hc.label()});
+            return;
+        }
+        self.endSizeProbe();
+        const req = self.nextReq();
+        _ = c.g_object_ref(@ptrCast(ctx.size_label));
+        self.size_probe = .{ .req = req, .hc = hc, .label = ctx.size_label };
+        c.gtk_label_set_text(@ptrCast(ctx.size_label), "Contents: calculating…");
+        self.sendOp(hc, .{ .req = req, .op = "dir_size", .path = ctx.path });
+    }
+
+    fn onPropsApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const hc = ctx.tab.hc;
+        if (hc.state != .ready) {
+            self.setStatusFmt("not connected to {s}", .{hc.label()});
+            return;
+        }
+        const mode = ctx.modeFromChecks();
+        const uid = parseId(ctx.uid_entry);
+        const gid = parseId(ctx.gid_entry);
+        const recursive = if (ctx.recursive) |r| c.gtk_check_button_get_active(@ptrCast(r)) != 0 else false;
+        if (recursive) {
+            var lbl: [128]u8 = undefined;
+            const label = std.fmt.bufPrint(&lbl, "permissions {s}", .{std.fs.path.basename(ctx.path)}) catch "permissions";
+            const req = self.nextReq();
+            const pj = self.allocator.create(PendingJob) catch return;
+            pj.* = .{
+                .req = req,
+                .hc = hc,
+                .label = self.allocator.dupe(u8, label) catch {
+                    self.allocator.destroy(pj);
+                    return;
+                },
+            };
+            self.pending_jobs.append(self.allocator, pj) catch {
+                self.allocator.free(pj.label);
+                self.allocator.destroy(pj);
+                return;
+            };
+            self.sendOp(hc, .{
+                .req = req,
+                .op = "perm_tree",
+                .path = ctx.path,
+                .mode = mode,
+                .uid = uid,
+                .gid = gid,
+            });
+            self.setStatus("applying permissions recursively");
+            return;
+        }
+        self.sendOp(hc, .{ .req = self.nextReq(), .op = "chmod", .path = ctx.path, .mode = mode });
+        if (uid != null or gid != null)
+            self.sendOp(hc, .{ .req = self.nextReq(), .op = "chown", .path = ctx.path, .uid = uid, .gid = gid });
+        self.setStatusFmt("applied {o:0>4} to {s}", .{ mode & 0o7777, std.fs.path.basename(ctx.path) });
+    }
+
+    /// Entry text as a uid/gid, or null when it is empty or invalid
+    /// (null leaves the current owner alone).
+    fn parseId(entry: *c.GtkWidget) ?u32 {
+        const txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
+        if (txt.len == 0) return null;
+        return std.fmt.parseInt(u32, txt, 10) catch null;
     }
 
     fn onMenuDelete(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -5512,19 +6049,6 @@ pub const BrowserView = struct {
         const self = ctx.view;
         const txt = c.gtk_editable_get_text(@ptrCast(entry));
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
-        if (ctx.mode == .permissions) {
-            const path = ctx.path orelse return menuDone(ctx);
-            const mode = std.fmt.parseInt(u32, name, 8) catch {
-                self.setStatus("invalid octal permissions");
-                return;
-            };
-            if (mode > 0o7777) {
-                self.setStatus("permissions must be between 0000 and 7777");
-                return;
-            }
-            self.sendOp(ctx.tab.hc, .{ .req = self.nextReq(), .op = "chmod", .path = path, .mode = mode });
-            return menuDone(ctx);
-        }
         if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) {
             self.setStatus("invalid name");
             return menuDone(ctx);
@@ -5546,7 +6070,7 @@ pub const BrowserView = struct {
                 self.deferUndo(req, self.makeUndo(ctx.tab.hc.host, .rename_back, w.buffered(), old, ""));
                 self.sendOp(ctx.tab.hc, .{ .req = req, .op = "rename", .path = old, .to = w.buffered() });
             },
-            .none, .tags, .permissions => {},
+            .none, .tags => {},
         }
         menuDone(ctx);
     }
@@ -7991,6 +8515,26 @@ pub const BrowserView = struct {
             if (keyval == c.GDK_KEY_Right) { self.goForward(tab); return 1; }
             if (keyval == c.GDK_KEY_Up) { self.goUp(tab); return 1; }
         }
+        // Orthodox dual-pane verbs: the other browser pane in this tab
+        // is the implicit destination.
+        if (mods == 0 and (keyval == c.GDK_KEY_F5 or keyval == c.GDK_KEY_F6)) {
+            if (self.peerView() != null) {
+                self.sendToPeer(keyval == c.GDK_KEY_F6, null);
+                return 1;
+            }
+        }
+        if (mods == 0 and keyval == c.GDK_KEY_BackSpace) {
+            if (self.typeaheadBackspace()) return 1;
+        }
+        if (mods == 0 and keyval == c.GDK_KEY_Escape and self.ta_len > 0) {
+            self.typeaheadReset();
+            return 1;
+        }
+        // Type-ahead: plain printable keys jump to the first matching
+        // name. Runs BEFORE the binding table only for keys no binding
+        // claims, since this handler is bubble-phase and a focused
+        // entry has already consumed its own input.
+        if ((mods == 0 or mods == c.GDK_SHIFT_MASK) and self.typeahead(keyval)) return 1;
         const ictx = self.pane.input_ctx orelse return 0;
         const lower_kv: c_uint = lower_pre;
         const bindings: []const input.Binding = if (ictx.bindings.len > 0) ictx.bindings else &input.default_bindings;
@@ -8055,15 +8599,6 @@ pub const BrowserView = struct {
         return 1;
     }
 
-    fn onSortName(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        sortClicked(@ptrCast(@alignCast(user.?)), .name);
-    }
-    fn onSortSize(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        sortClicked(@ptrCast(@alignCast(user.?)), .size);
-    }
-    fn onSortTime(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        sortClicked(@ptrCast(@alignCast(user.?)), .mtime);
-    }
     fn sortClicked(tab: *BTab, key: browser_model.SortKey) void {
         if (tab.sort_key == key) {
             tab.descending = !tab.descending;
@@ -8071,6 +8606,7 @@ pub const BrowserView = struct {
             tab.sort_key = key;
             tab.descending = false;
         }
+        tab.view.updateSortHeader(tab);
         tab.view.renderTab(tab);
     }
 
@@ -8353,6 +8889,120 @@ pub const BrowserView = struct {
         };
     }
 
+    // ── type-ahead jump ─────────────────────────────────────────
+
+    /// Idle gap after which the next keystroke starts a fresh prefix.
+    const TYPEAHEAD_RESET_US: i64 = 1_200_000;
+
+    fn typeaheadReset(self: *BrowserView) void {
+        self.ta_len = 0;
+        self.setStatus("");
+    }
+
+    fn typeaheadBackspace(self: *BrowserView) bool {
+        if (self.ta_len == 0) return false;
+        self.ta_len -= 1;
+        if (self.ta_len == 0) {
+            self.typeaheadReset();
+            return true;
+        }
+        _ = self.typeaheadJump();
+        return true;
+    }
+
+    /// Consume a printable key as a jump-to-name prefix. Returns false
+    /// for keys that are not type-ahead material so the caller can
+    /// keep dispatching them.
+    fn typeahead(self: *BrowserView, keyval: c_uint) bool {
+        const uni = c.gdk_keyval_to_unicode(keyval);
+        // Printable ASCII only: a jump prefix is compared against
+        // file names byte-wise, and space is a selection key.
+        if (uni < 0x21 or uni > 0x7e) return false;
+        const tab = self.currentTab() orelse return false;
+        if (tab.view_mode == .icons) return false;
+        const now = c.g_get_monotonic_time();
+        if (now - self.ta_last_us > TYPEAHEAD_RESET_US) self.ta_len = 0;
+        self.ta_last_us = now;
+        if (self.ta_len >= self.ta_buf.len) return true;
+        self.ta_buf[self.ta_len] = @intCast(uni);
+        self.ta_len += 1;
+        if (!self.typeaheadJump()) {
+            // Keep the prefix: the user is mid-word and the next
+            // keystroke may still match once the listing settles.
+            self.setStatusFmt("no match: {s}", .{self.ta_buf[0..self.ta_len]});
+        }
+        return true;
+    }
+
+    fn typeaheadJump(self: *BrowserView) bool {
+        const tab = self.currentTab() orelse return false;
+        const prefix = self.ta_buf[0..self.ta_len];
+        var idx: c_int = 0;
+        while (c.gtk_list_box_get_row_at_index(tab.listbox, idx)) |row| : (idx += 1) {
+            const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse continue;
+            const ctx: *RowCtx = @ptrCast(@alignCast(data));
+            const name = std.fs.path.basename(ctx.path);
+            if (name.len < prefix.len) continue;
+            if (!std.ascii.eqlIgnoreCase(name[0..prefix.len], prefix)) continue;
+            c.gtk_list_box_unselect_all(tab.listbox);
+            c.gtk_list_box_select_row(tab.listbox, @ptrCast(row));
+            _ = c.gtk_widget_grab_focus(@ptrCast(row));
+            self.setStatusFmt("jump: {s}", .{prefix});
+            return true;
+        }
+        return false;
+    }
+
+    // ── dual-pane source/target ─────────────────────────────────
+
+    /// The other browser face in this sketerm tab, if any: the
+    /// orthodox implicit destination.
+    fn peerView(self: *BrowserView) ?*BrowserView {
+        const lookup = self.on_peer orelse return null;
+        const ctx = self.hooks_ctx orelse return null;
+        const peer = lookup(ctx, self.pane) orelse return null;
+        return if (peer == self) null else peer;
+    }
+
+    /// Copy (or move) the current selection into the other pane's
+    /// current directory, conflict dialog included.
+    fn sendToPeer(self: *BrowserView, move: bool, clicked: ?[]const u8) void {
+        const tab = self.currentTab() orelse return;
+        const peer = self.peerView() orelse {
+            self.setStatus("no second browser pane in this tab");
+            return;
+        };
+        const peer_tab = peer.currentTab() orelse return;
+        // Same rule as Copy: a clicked row outside the selection acts
+        // on itself, not on the selection.
+        var one: [1][]u8 = undefined;
+        var sources: []const []u8 = tab.selected.items;
+        if (clicked) |path| {
+            const in_selection = for (tab.selected.items) |sp| {
+                if (std.mem.eql(u8, sp, path)) break true;
+            } else false;
+            if (!in_selection or tab.selected.items.len <= 1) {
+                one[0] = @constCast(path);
+                sources = one[0..];
+            }
+        }
+        if (sources.len == 0) {
+            self.setStatus("select something to send to the other pane");
+            return;
+        }
+        if (hostEq(tab.hc.host, peer_tab.hc.host) and std.mem.eql(u8, tab.root.path, peer_tab.root.path)) {
+            self.setStatus("both panes show the same directory");
+            return;
+        }
+        peer.beginPaste(peer_tab, tab.hc.host, sources, move, false);
+        var buf: [4300]u8 = undefined;
+        self.setStatusFmt("{s} {d} item(s) to {s}", .{
+            if (move) "moving" else "copying",
+            sources.len,
+            peer_tab.spec(&buf),
+        });
+    }
+
     fn onPathActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         const tab = self.currentTab() orelse return;
@@ -8582,6 +9232,14 @@ fn appendQuoted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, path: []c
         if (ch == '\'') try out.appendSlice(allocator, "'\\''") else try out.append(allocator, ch);
     }
     try out.append(allocator, '\'');
+}
+
+/// Truncating copy into a sentinel buffer for GTK label text.
+fn copyZ(buf: *[256:0]u8, text: []const u8) [*:0]const u8 {
+    const n = @min(text.len, buf.len - 1);
+    @memcpy(buf[0..n], text[0..n]);
+    buf[n] = 0;
+    return buf;
 }
 
 fn fmtSize(buf: *[48:0]u8, size: u64) [:0]const u8 {

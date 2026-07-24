@@ -152,6 +152,9 @@ pub const Action = enum {
     /// Open a file-browser tab (src/ui/browser.zig): a shell pane
     /// wearing the browser face.
     new_browser_tab,
+    /// Split the focused pane and give the new pane a browser face:
+    /// how a dual-pane source/target layout is created.
+    new_browser_split,
     /// Detach the focused mux pane: the session keeps running on the
     /// daemon; the pane lands in a fresh local shell. No-op on
     /// non-mux panes.
@@ -336,6 +339,7 @@ pub fn actionName(a: Action) []const u8 {
         .show_scrollback => "show_scrollback",
         .new_durable_tab => "new_durable_tab",
         .new_browser_tab => "new_browser_tab",
+        .new_browser_split => "new_browser_split",
         .mux_detach => "mux_detach",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
@@ -414,6 +418,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .show_scrollback => "Show scrollback in pager",
         .new_durable_tab => "New durable tab (mux)",
         .new_browser_tab => "New file browser tab",
+        .new_browser_split => "Split into a second file browser pane",
         .mux_detach => "Detach mux session (pane drops to a local shell)",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",

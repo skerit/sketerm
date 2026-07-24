@@ -103,6 +103,8 @@ const ENTRIES = [_]Entry{
        .desc = "Shell in the sketerm-mux daemon; survives GUI restarts.", .action = .new_durable_tab },
     .{ .icon = "folder-symbolic", .title = "New File Browser Tab",
        .desc = "Browse files with live listings; the pane's shell is one click away.", .action = .new_browser_tab },
+    .{ .icon = "view-dual-symbolic", .title = "Split into Two File Browsers",
+       .desc = "Dual-pane source/target: F5 copies to the other pane, F6 moves.", .action = .new_browser_split },
 
     // Font
     .{ .icon = "zoom-in-symbolic", .title = "Increase Font Size",

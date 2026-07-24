@@ -1325,6 +1325,28 @@ pub const Window = struct {
         self.installBrowserHooks(bv);
     }
 
+    /// Split the focused pane and give the new pane a browser face:
+    /// the way a dual-pane (source/target) layout is created.
+    pub fn newBrowserSplit(self: *Window, orient: c_uint) !void {
+        const start_cwd: ?[]const u8 = blk: {
+            const focused = self.focusedPane() orelse break :blk null;
+            if (@import("browser.zig").BrowserView.fromPane(focused)) |bv| break :blk bv.currentSpec();
+            break :blk self.focusedPaneCwd();
+        };
+        // Take the pane the split APPENDED: focus may still sit on the
+        // source pane's browser widget, and attaching there would be a
+        // no-op on the pane that already has a browser.
+        const before = self.panes.items.len;
+        try self.splitFocused(orient);
+        if (self.panes.items.len <= before) return error.SplitFailed;
+        const pane = self.panes.items[self.panes.items.len - 1];
+        const bv = @import("browser.zig").BrowserView.attach(self.allocator, pane, start_cwd) catch |err| {
+            logActionError("new_browser_split attach", err);
+            return err;
+        };
+        self.installBrowserHooks(bv);
+    }
+
     /// Give a browser face its window-level abilities: durable
     /// terminal tabs on any host, and app-forwarded remote opens.
     fn installBrowserHooks(self: *Window, bv: *@import("browser.zig").BrowserView) void {
@@ -1337,9 +1359,28 @@ pub const Window = struct {
         }
         bv.transfer_service = self.file_transfer_service;
         bv.hooks_ctx = @ptrCast(self);
+        bv.on_peer = &browserPeerCb;
         bv.on_host_term = &browserHostTermCb;
         bv.on_host_open = &browserHostOpenCb;
         bv.on_host_exec = &browserHostExecCb;
+    }
+
+    /// The other browser face in `pane`'s tab, from the pane-tree
+    /// MODEL (correct while a pane is zoomed). Exactly two browser
+    /// faces make a dual-pane pair; with more, the first other one
+    /// wins so the destination stays deterministic.
+    fn browserPeerCb(ctx: *anyopaque, pane: *Pane) ?*@import("browser.zig").BrowserView {
+        const self: *Window = @ptrCast(@alignCast(ctx));
+        const page = tabPageForPane(self, pane) orelse return null;
+        const tree = Window.tabTreeOf(page) orelse return null;
+        var leaves: std.ArrayList(*Pane) = .empty;
+        defer leaves.deinit(self.allocator);
+        tree.appendLeaves(self.allocator, &leaves) catch return null;
+        for (leaves.items) |leaf| {
+            if (leaf == pane) continue;
+            if (@import("browser.zig").BrowserView.fromPane(leaf)) |bv| return bv;
+        }
+        return null;
     }
 
     fn browserTransferNotify(ctx: *anyopaque, text: []const u8) void {
@@ -2405,15 +2446,7 @@ pub const Window = struct {
         // gtk_window_get_focus returns the inner GLArea. Match against
         // p.area, then operate on p.widget() (== the wrapper) for
         // reparenting.
-        var found_idx: ?usize = null;
-        for (self.panes.items, 0..) |p, idx| {
-            if (@intFromPtr(p.area) == @intFromPtr(focus)) {
-                found_idx = idx;
-                break;
-            }
-        }
-        if (found_idx == null) return;
-        const focused_pane = self.panes.items[found_idx.?];
+        const focused_pane = self.paneForWidget(focus) orelse return;
         const focused_w = focused_pane.widget();
 
         const parent = c.gtk_widget_get_parent(focused_w) orelse return;
@@ -3338,8 +3371,19 @@ pub const Window = struct {
 
     pub fn focusedPane(self: *Window) ?*Pane {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return null;
-        for (self.panes.items) |p| {
-            if (@intFromPtr(p.area) == @intFromPtr(focus)) return p;
+        return self.paneForWidget(focus);
+    }
+
+    /// The pane owning `widget`. Matching the GLArea alone is not
+    /// enough: a pane wearing the browser face has focus on a browser
+    /// widget, so climb to the wrapper each pane owns.
+    pub fn paneForWidget(self: *Window, widget: *c.GtkWidget) ?*Pane {
+        var w: ?*c.GtkWidget = widget;
+        while (w) |cur| : (w = c.gtk_widget_get_parent(cur)) {
+            for (self.panes.items) |p| {
+                if (@intFromPtr(p.area) == @intFromPtr(cur)) return p;
+                if (@intFromPtr(p.widget()) == @intFromPtr(cur)) return p;
+            }
         }
         return null;
     }
@@ -5876,16 +5920,7 @@ pub const Window = struct {
 
     pub fn closeFocusedPane(self: *Window) void {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
-        var found_idx: ?usize = null;
-        for (self.panes.items, 0..) |p, idx| {
-            if (@intFromPtr(p.area) == @intFromPtr(focus)) {
-                found_idx = idx;
-                break;
-            }
-        }
-        if (found_idx == null) return;
-
-        const pane = self.panes.items[found_idx.?];
+        const pane = self.paneForWidget(focus) orelse return;
         const w = pane.widget();
         const parent = c.gtk_widget_get_parent(w) orelse return;
         // Resolve the page BEFORE the widget surgery below detaches
@@ -6601,6 +6636,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .show_scrollback => self.openScrollbackPager(),
         .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
         .new_browser_tab => self.newBrowserTab() catch |err| logActionError("new_browser_tab", err),
+        .new_browser_split => self.newBrowserSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_browser_split", err),
         .mux_detach => if (self.focusedPane()) |p| self.detachPaneToShell(p),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         .hints_open => self.openHints(),

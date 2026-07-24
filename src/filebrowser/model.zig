@@ -44,6 +44,60 @@ pub const LocationKind = enum { directory, search, collection, panel };
 pub const ViewMode = enum { details, icons, compact, miller };
 pub const SortKey = enum { name, size, kind, mtime, ctime, owner, group, permissions };
 
+/// Optional details-view columns; the name column is always present.
+/// Render order is declaration order.
+pub const Column = enum {
+    kind,
+    permissions,
+    owner,
+    group,
+    size,
+    mtime,
+    ctime,
+    target,
+
+    pub fn sortKey(self: Column) SortKey {
+        return switch (self) {
+            .kind => .kind,
+            .permissions => .permissions,
+            .owner => .owner,
+            .group => .group,
+            .size => .size,
+            .mtime => .mtime,
+            .ctime => .ctime,
+            // Symlink targets have no meaningful order of their own.
+            .target => .name,
+        };
+    }
+
+    pub fn title(self: Column) [*:0]const u8 {
+        return switch (self) {
+            .kind => "Kind",
+            .permissions => "Perms",
+            .owner => "Owner",
+            .group => "Group",
+            .size => "Size",
+            .mtime => "Modified",
+            .ctime => "Changed",
+            .target => "Target",
+        };
+    }
+
+    /// Fixed pixel width so header and rows line up without a grid.
+    pub fn width(self: Column) i32 {
+        return switch (self) {
+            .kind => 64,
+            .permissions => 92,
+            .owner, .group => 72,
+            .size => 88,
+            .mtime, .ctime => 148,
+            .target => 200,
+        };
+    }
+};
+
+pub const default_columns = [_]Column{ .permissions, .size, .mtime };
+
 pub const TabState = struct {
     kind: LocationKind = .directory,
     location: FileRef = .{},
@@ -52,6 +106,9 @@ pub const TabState = struct {
     expanded: []const FileRef = &.{},
     selected: []const FileRef = &.{},
     view: ViewMode = .details,
+    /// Empty = the built-in default set (also what pre-column state
+    /// files deserialize to).
+    columns: []const Column = &.{},
     sort: SortKey = .name,
     descending: bool = false,
     dirs_first: bool = true,
@@ -115,4 +172,32 @@ test "PaneState JSON round-trip preserves future browser state" {
     try std.testing.expectEqual(ViewMode.miller, parsed.value.tabs[0].view);
     try std.testing.expectEqualStrings("box", parsed.value.tabs[0].selected[0].host);
     try std.testing.expectEqualStrings("*.zig", parsed.value.tabs[0].filter);
+}
+
+test "column choices survive a round-trip and old state keeps the defaults" {
+    const cols = [_]Column{ .kind, .owner, .mtime };
+    const tabs = [_]TabState{.{ .columns = &cols }};
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(PaneState{ .tabs = &tabs }, .{}, &out.writer);
+    const parsed = try std.json.parseFromSlice(PaneState, std.testing.allocator, out.written(), .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqualSlices(Column, &cols, parsed.value.tabs[0].columns);
+
+    // A pre-column state file has no "columns" key at all.
+    const old = try std.json.parseFromSlice(PaneState, std.testing.allocator,
+        \\{"version":1,"active_tab":0,"browser_visible":true,"tabs":[{"view":"details"}]}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer old.deinit();
+    try std.testing.expectEqual(@as(usize, 0), old.value.tabs[0].columns.len);
+}
+
+test "column sort keys and widths stay in the header/row contract" {
+    // Every column must map to a sort key the Dir comparator knows,
+    // and target must not claim a bogus ordering of its own.
+    try std.testing.expectEqual(SortKey.permissions, Column.permissions.sortKey());
+    try std.testing.expectEqual(SortKey.name, Column.target.sortKey());
+    for (std.enums.values(Column)) |col| try std.testing.expect(col.width() > 0);
 }
