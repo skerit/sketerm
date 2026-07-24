@@ -3776,17 +3776,6 @@ pub const Window = struct {
 
     /// Connect to the mux daemon — local (spawning it if absent) or
     /// on an SSH host (`ssh <host> sketerm-mux --proxy`).
-    /// Human-readable reason for a mux version outside the supported range.
-    fn muxProtoMismatchMsg(buf: []u8) []const u8 {
-        const mux_client = @import("../mux/client.zig");
-        const wire = @import("../mux/wire.zig");
-        return std.fmt.bufPrint(
-            buf,
-            "unsupported protocol: remote sketerm-mux speaks protocol {d}, this build supports {d} through {d}; update sketerm on the incompatible machine",
-            .{ mux_client.last_remote_proto, wire.MIN_COMPATIBLE_SERVER_PROTO, wire.PROTO_VERSION },
-        ) catch "unsupported mux protocol; update sketerm on the incompatible machine";
-    }
-
     fn muxConnect(self: *Window, host: ?[]const u8) !@import("../mux/client.zig").Conn {
         const mux_client = @import("../mux/client.zig");
         if (host) |h| {
@@ -3843,6 +3832,8 @@ pub const Window = struct {
         var name_buf: [64]u8 = undefined;
         // Process-unique name (pid + global counter); see nextSessionName.
         const name = nextSessionName(&name_buf);
+        const profile = if (self.config.default_profile.len > 0) self.findProfile(self.config.default_profile) else null;
+        const settings = if (profile) |p| &p.settings else &self.config.settings;
 
         var conn = try self.muxConnect(host);
         {
@@ -3850,27 +3841,43 @@ pub const Window = struct {
             // block exits cleanly, attachMuxTab owns the conn (and
             // deinits it on its own failures).
             errdefer conn.deinit();
-            // Local spawns honour the configured shell + cwd; remote
-            // spawns send empty argv = "the remote's login shell"
-            // and no cwd (local paths mean nothing over there).
-            const argv: []const []const u8 = if (host != null) &.{} else blk: {
-                const sh: []const u8 = if (self.config.settings.shell) |s| s else sh2: {
+            // The account-shell launcher works with older remote daemons that
+            // incorrectly use their inherited $SHELL.
+            const argv: []const []const u8 = if (host != null)
+                &@import("../mux/shell.zig").remote_login_argv
+            else blk: {
+                const sh: []const u8 = if (settings.shell) |s| s else sh2: {
                     const env = c.getenv("SHELL");
                     break :sh2 if (env != null) std.mem.span(env) else "/bin/sh";
                 };
                 break :blk &.{sh};
             };
+            var remote_shell_buf: [512]u8 = undefined;
+            var remote_env_items: [2][]const u8 = undefined;
+            var remote_env_len: usize = 0;
+            if (host != null) {
+                if (settings.shell) |shell| {
+                    remote_env_items[remote_env_len] = try std.fmt.bufPrint(&remote_shell_buf, "SKETERM_REMOTE_SHELL={s}", .{shell});
+                    remote_env_len += 1;
+                }
+                remote_env_items[remote_env_len] = if (settings.login_shell) "SKETERM_REMOTE_LOGIN=1" else "SKETERM_REMOTE_LOGIN=0";
+                remote_env_len += 1;
+            }
             try conn.sendJson(.spawn, .{
                 .name = name,
                 .argv = argv,
+                .env = remote_env_items[0..remote_env_len],
                 .cwd = if (host != null) null else self.focusedPaneCwd(),
                 .rows = @as(u16, 24),
                 .cols = @as(u16, 80),
+                .term = settings.term_env,
+                .color_term = settings.color_term_env,
+                .login_shell = host == null and settings.login_shell,
                 .kb_layout = self.config.app_keyboard_layout,
             });
             (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
         }
-        try self.attachMux(conn, name, host, takeover);
+        try self.attachMuxProfile(conn, name, host, takeover, profile);
     }
 
     pub fn attachMuxTab(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8) !void {
@@ -4145,6 +4152,7 @@ pub const Window = struct {
     /// "resume or create". Returns the placed-nowhere pane.
     fn restoreMuxPane(self: *Window, spec: layout_mod.PaneSpec) !*Pane {
         const host: ?[]const u8 = if (spec.mux_host.len > 0) spec.mux_host else null;
+        const settings = self.config.profileSettings(spec.profile);
         var conn = try self.muxConnect(host);
 
         const Owned = @TypeOf(try conn.recvFrame());
@@ -4157,22 +4165,37 @@ pub const Window = struct {
                 snap = reply;
             } else {
                 reply.deinit(self.allocator);
-                // Session gone — recreate. Local spawns honour the
-                // saved cwd + configured shell; remote spawns send
-                // empty argv = the remote's login shell.
-                const argv: []const []const u8 = if (host != null) &.{} else blk: {
-                    const sh: []const u8 = if (self.config.settings.shell) |s| s else sh2: {
+                // The explicit remote launcher also works with old daemons.
+                const argv: []const []const u8 = if (host != null)
+                    &@import("../mux/shell.zig").remote_login_argv
+                else blk: {
+                    const sh: []const u8 = if (settings.shell) |s| s else sh2: {
                         const env = c.getenv("SHELL");
                         break :sh2 if (env != null) std.mem.span(env) else "/bin/sh";
                     };
                     break :blk &.{sh};
                 };
+                var remote_shell_buf: [512]u8 = undefined;
+                var remote_env_items: [2][]const u8 = undefined;
+                var remote_env_len: usize = 0;
+                if (host != null) {
+                    if (settings.shell) |shell| {
+                        remote_env_items[remote_env_len] = try std.fmt.bufPrint(&remote_shell_buf, "SKETERM_REMOTE_SHELL={s}", .{shell});
+                        remote_env_len += 1;
+                    }
+                    remote_env_items[remote_env_len] = if (settings.login_shell) "SKETERM_REMOTE_LOGIN=1" else "SKETERM_REMOTE_LOGIN=0";
+                    remote_env_len += 1;
+                }
                 try conn.sendJson(.spawn, .{
                     .name = spec.mux_session,
                     .argv = argv,
+                    .env = remote_env_items[0..remote_env_len],
                     .cwd = if (host != null or spec.cwd.len == 0) null else spec.cwd,
                     .rows = @as(u16, 24),
                     .cols = @as(u16, 80),
+                    .term = settings.term_env,
+                    .color_term = settings.color_term_env,
+                    .login_shell = host == null and settings.login_shell,
                     .kb_layout = self.config.app_keyboard_layout,
                 });
                 (try conn.recvExpect(&.{.ok})).deinit(self.allocator);
@@ -4181,7 +4204,11 @@ pub const Window = struct {
             }
         }
         defer snap.deinit(self.allocator);
-        return self.makeRemotePaneFromSnap(conn, spec.mux_session, host, snap.payload, null);
+        const pane = try self.makeRemotePaneFromSnap(conn, spec.mux_session, host, snap.payload, null);
+        const profile = self.findProfile(spec.profile);
+        pane.active_profile = if (profile) |p| p.name else null;
+        self.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = spec.font_size });
+        return pane;
     }
 
     /// One in-flight async remote-mux reattach (layout restore).
@@ -4198,6 +4225,10 @@ pub const Window = struct {
         host: []u8,
         port_range: []u8,
         kb_layout: []u8,
+        remote_shell: []u8,
+        term: []u8,
+        color_term: []u8,
+        login_shell: bool,
         /// Thread results — set before g_idle_add, read after.
         conn: ?@import("../mux/client.zig").Conn = null,
         snap: ?[]u8 = null,
@@ -4212,6 +4243,9 @@ pub const Window = struct {
             job.allocator.free(job.host);
             job.allocator.free(job.port_range);
             job.allocator.free(job.kb_layout);
+            job.allocator.free(job.remote_shell);
+            job.allocator.free(job.term);
+            job.allocator.free(job.color_term);
             job.allocator.destroy(job);
         }
     };
@@ -4220,6 +4254,7 @@ pub const Window = struct {
     /// pane. Failure to start just leaves the placeholder shell.
     fn startMuxRestoreJob(self: *Window, pane: *Pane, spec: layout_mod.PaneSpec) void {
         const a = self.allocator;
+        const settings = self.config.profileSettings(spec.profile);
         const session = a.dupe(u8, spec.mux_session) catch return;
         const host = a.dupe(u8, spec.mux_host) catch {
             a.free(session);
@@ -4236,11 +4271,38 @@ pub const Window = struct {
             a.free(port_range);
             return;
         };
+        const remote_shell = a.dupe(u8, settings.shell orelse "") catch {
+            a.free(session);
+            a.free(host);
+            a.free(port_range);
+            a.free(kb_layout);
+            return;
+        };
+        const term = a.dupe(u8, settings.term_env) catch {
+            a.free(session);
+            a.free(host);
+            a.free(port_range);
+            a.free(kb_layout);
+            a.free(remote_shell);
+            return;
+        };
+        const color_term = a.dupe(u8, settings.color_term_env) catch {
+            a.free(session);
+            a.free(host);
+            a.free(port_range);
+            a.free(kb_layout);
+            a.free(remote_shell);
+            a.free(term);
+            return;
+        };
         const job = a.create(MuxRestoreJob) catch {
             a.free(session);
             a.free(host);
             a.free(port_range);
             a.free(kb_layout);
+            a.free(remote_shell);
+            a.free(term);
+            a.free(color_term);
             return;
         };
         job.* = .{
@@ -4251,6 +4313,10 @@ pub const Window = struct {
             .host = host,
             .port_range = port_range,
             .kb_layout = kb_layout,
+            .remote_shell = remote_shell,
+            .term = term,
+            .color_term = color_term,
+            .login_shell = settings.login_shell,
         };
         self.mux_restore_jobs.append(a, job) catch {
             job.destroy();
@@ -4322,16 +4388,26 @@ pub const Window = struct {
             job.snap = reply.payload;
         } else {
             reply.deinit(job.allocator);
-            // Session gone (daemon restarted / server rebooted) —
-            // recreate under the SAME name, mirroring restoreMuxPane.
-            // Empty argv = the remote's login shell; no cwd (local
-            // paths mean nothing over there).
+            // Session gone: recreate through the old-daemon-compatible
+            // account-shell launcher under the same durable name.
+            var remote_shell_buf: [512]u8 = undefined;
+            var remote_env_items: [2][]const u8 = undefined;
+            var remote_env_len: usize = 0;
+            if (job.remote_shell.len > 0) {
+                remote_env_items[remote_env_len] = try std.fmt.bufPrint(&remote_shell_buf, "SKETERM_REMOTE_SHELL={s}", .{job.remote_shell});
+                remote_env_len += 1;
+            }
+            remote_env_items[remote_env_len] = if (job.login_shell) "SKETERM_REMOTE_LOGIN=1" else "SKETERM_REMOTE_LOGIN=0";
+            remote_env_len += 1;
             try conn.sendJson(.spawn, .{
                 .name = job.session,
-                .argv = @as([]const []const u8, &.{}),
+                .argv = @as([]const []const u8, &@import("../mux/shell.zig").remote_login_argv),
+                .env = remote_env_items[0..remote_env_len],
                 .cwd = @as(?[]const u8, null),
                 .rows = @as(u16, 24),
                 .cols = @as(u16, 80),
+                .term = job.term,
+                .color_term = job.color_term,
                 .kb_layout = job.kb_layout,
             });
             (try conn.recvExpect(&.{.ok})).deinit(job.allocator);
@@ -4389,6 +4465,9 @@ pub const Window = struct {
             );
             return 0;
         };
+        const profile = if (old.active_profile) |name| win.findProfile(name) else null;
+        pane.active_profile = if (profile) |p| p.name else null;
+        win.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = old.font_size });
         _ = win.swapPaneInPlace(old, pane) catch {
             // No tab slot to land in (mid-teardown) — drop the new pane.
             win.unlistPane(pane);
@@ -4548,6 +4627,10 @@ pub const Window = struct {
     }
 
     pub fn attachMux(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane) !void {
+        return self.attachMuxProfile(conn_in, name, host, takeover, null);
+    }
+
+    fn attachMuxProfile(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane, profile: ?*const @import("../config.zig").Profile) !void {
         var conn = conn_in;
         self.mux_attach_err_len = 0;
 
@@ -4571,13 +4654,17 @@ pub const Window = struct {
         // not open a terminal). Snapshot header byte 8 is the app
         // flag. Takeover keeps the tab path: the user explicitly
         // attached from inside a pane.
-        if (takeover == null and self.config.app_view == .window and
-            snap.payload.len > 8 and snap.payload[8] != 0)
-        {
+        const envelope = @import("../mux/snapshot.zig").peelEnvelope(snap.payload) catch {
+            conn.deinit();
+            return error.BadSnapshot;
+        };
+        if (takeover == null and self.config.app_view == .window and envelope.app) {
             return self.attachMuxApp(conn, name, host, snap.payload);
         }
 
         const pane = try self.makeRemotePaneFromSnap(conn, name, host, snap.payload, null);
+        pane.active_profile = if (profile) |p| p.name else null;
+        self.applyPaneConfig(pane, .{ .profile = profile });
 
         var title_buf: [160:0]u8 = undefined;
         const title_z = if (host) |h|
@@ -5187,11 +5274,7 @@ pub const Window = struct {
             else
                 null;
             const win = if (takeover) |p| self.ownerWindow(p) else self;
-            win.newDurableSession(req.host, takeover) catch |err| {
-                if (err == error.MuxProtoMismatch) {
-                    var pm_buf: [192]u8 = undefined;
-                    return ipc_protocol.writeErr(out, allocator, muxProtoMismatchMsg(&pm_buf));
-                }
+            win.newDurableSession(req.host, takeover) catch {
                 return ipc_protocol.writeErr(out, allocator, "durable spawn failed (ssh/key auth?)");
             };
             try ipc_protocol.writeOk(out, allocator, "pane", win.next_pane_id - 1);
@@ -5204,11 +5287,7 @@ pub const Window = struct {
             else
                 null;
             const win = if (takeover) |p| self.ownerWindow(p) else self;
-            const conn = win.muxConnect(req.host) catch |err| {
-                if (err == error.MuxProtoMismatch) {
-                    var pm_buf: [192]u8 = undefined;
-                    return ipc_protocol.writeErr(out, allocator, muxProtoMismatchMsg(&pm_buf));
-                }
+            const conn = win.muxConnect(req.host) catch {
                 return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
             };
             win.attachMux(conn, name, req.host, takeover) catch |err| {

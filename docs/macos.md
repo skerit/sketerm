@@ -181,4 +181,4 @@ Streaming this Mac's app windows to a sketerm client (ScreenCaptureKit
 capture + CGEvent input) has its own setup — code signing, a
 GUI-session LaunchAgent, and TCC grants. The complete runbook is
 **`docs/macos-winstream-setup.md`**; `dist/deploy-macos.sh` automates
-the repeatable build→sign→reload step.
+the repeatable build and signing step without replacing a live daemon.

@@ -3,21 +3,22 @@
 //! THE compatibility surface between sketerm-mux daemon and clients
 //! (possibly different builds on different hosts). Rules:
 //!   - little-endian, length-prefixed frames and payloads
-//!   - tag values are append-only — never renumber, never reuse
-//!   - a reader skips unknown frame types via the length prefix
+//!   - frame tag values are append-only; readers skip unknown frames
+//!   - the legacy event stream is frozen because events lack lengths
+//!   - optional features use independent frames/capabilities, not a
+//!     mandatory core-version bump
 //!
 //! Pure code, no GTK, no sockets — unit-tested headless.
 
 const std = @import("std");
 const Event = @import("../parser/event.zig").Event;
 
-/// Version 2 adds the byte-channel frames (chan_*) used for Wayland
-/// app forwarding. The daemon only opens channels toward clients
-/// whose hello announced proto >= 2; older clients keep working
-/// without them. Version 3 adds the file-transfer frames (file_*):
+/// Version 2 adds the byte-channel frame envelope. Individual channel
+/// kinds remain gated until the profile that defined their payload.
+/// Version 3 adds the file-transfer frames (file_*):
 /// the GUI streams a local file to the daemon, which writes it into
 /// the session shell's working directory — so "upload to remote"
-/// works over any transport (local/SSH/UDP) with no shell help. The
+/// works over any transport (local/SSH/UDP) with no shell help.
 /// Clients advertise their newest protocol and daemons only emit
 /// features they implement. A client may accept older daemon versions
 /// whose snapshots and channel state it can still decode.
@@ -31,15 +32,21 @@ const Event = @import("../parser/event.zig").Event;
 /// units, and attach replays pool bytes + a state_sync unit so app
 /// windows survive detach/reattach (durable GUI apps).
 /// Version 6 extends the native-channel state_sync blob with complete
-/// linux-dmabuf plane metadata. Daemons gate that state on the client's
-/// hello while newer clients retain the version 5 state decoder.
+/// linux-dmabuf plane metadata. Daemons gate that state on the selected
+/// profile while newer clients retain older state decoders.
 pub const PROTO_VERSION: u32 = 6;
-pub const MIN_COMPATIBLE_SERVER_PROTO: u32 = 5;
+/// Protocol 1 shipped with three indistinguishable snapshot revisions, so a
+/// current daemon cannot safely choose a snapshot for an unmodified v1 client.
+pub const MIN_SERVER_PROTO: u32 = 2;
 pub const NATIVE_STATE_PROTO_VERSION: u32 = 6;
+pub const LEGACY_NATIVE_STATE_VERSION: u8 = 6;
+pub const NATIVE_STATE_VERSION: u8 = 7;
+pub const WINSTREAM_PROTO_VERSION: u32 = 5;
 
-/// Whether this client can safely decode a daemon's frames and snapshots.
-pub fn clientSupportsServerProto(proto: u32) bool {
-    return proto >= MIN_COMPATIBLE_SERVER_PROTO and proto <= PROTO_VERSION;
+/// Select the newest core profile both advertised ranges share, or zero.
+pub fn negotiateProtocol(peer_min: u32, peer_max: u32) u32 {
+    const selected = @min(peer_max, PROTO_VERSION);
+    return if (selected >= @max(peer_min, MIN_SERVER_PROTO)) selected else 0;
 }
 
 /// Frame types. Append-only.
@@ -214,8 +221,9 @@ pub fn decodeChanId(payload: []const u8) ?u32 {
 
 pub const MAX_FRAME = 16 << 20; // images can be chunky; bound anyway
 
-/// Event tags on the wire. Independent of the in-memory union order
-/// (which may be rearranged freely) — append-only here.
+/// Frozen legacy event schema: records have no length, so adding a tag
+/// would desynchronize older readers; new optional data belongs in a mux
+/// frame until a negotiated length-delimited event schema exists.
 const EventTag = enum(u8) {
     print = 1,
     print_byte = 2,
@@ -610,9 +618,10 @@ test "partialInfo reports expected-vs-buffered for a half frame" {
     try t2.expectEqual(@as(?@TypeOf(p), null), partialInfo(""));
 }
 
-test "client accepts compatible older daemons but not unknown protocols" {
-    try std.testing.expect(clientSupportsServerProto(PROTO_VERSION));
-    try std.testing.expect(clientSupportsServerProto(MIN_COMPATIBLE_SERVER_PROTO));
-    try std.testing.expect(!clientSupportsServerProto(MIN_COMPATIBLE_SERVER_PROTO - 1));
-    try std.testing.expect(!clientSupportsServerProto(PROTO_VERSION + 1));
+test "protocol negotiation selects the highest shared historical profile" {
+    try std.testing.expectEqual(@as(u32, PROTO_VERSION), negotiateProtocol(1, PROTO_VERSION + 10));
+    try std.testing.expectEqual(@as(u32, 5), negotiateProtocol(3, 5));
+    try std.testing.expectEqual(@as(u32, 0), negotiateProtocol(PROTO_VERSION + 1, PROTO_VERSION + 10));
+    try std.testing.expectEqual(@as(u32, 0), negotiateProtocol(1, 1));
+    try std.testing.expectEqual(@as(u32, 0), negotiateProtocol(1, 0));
 }

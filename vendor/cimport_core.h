@@ -62,6 +62,7 @@ int login_tty(int fd);
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <pwd.h>
 #include <regex.h>
 
 #include <fribidi.h>

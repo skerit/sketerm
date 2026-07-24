@@ -40,6 +40,7 @@ const wsproto = @import("../winstream/proto.zig");
 const wssource = @import("../winstream/source.zig");
 const WsSource = wssource.Source;
 const snapshot = @import("snapshot.zig");
+const shell_util = @import("shell.zig");
 const Pty = @import("../pty.zig").Pty;
 const Parser = @import("../parser/vt.zig").Parser;
 const Event = @import("../parser/event.zig").Event;
@@ -223,6 +224,9 @@ const Session = struct {
     /// GPU opt-in (SpawnReq.gpu): the session's compositor announces
     /// linux-dmabuf and the child keeps its real GL driver.
     gpu: bool = false,
+    /// The compositor advertised modifier-backed dmabufs, whose live request
+    /// stream and pending state require state-sync v7 readers.
+    native_requires_v7: bool = false,
     /// Compiled xkb keymap for this session's app keyboards (points
     /// at an embedded wlhost/keymaps.zig blob; never freed).
     kb_keymap: []const u8 = wlcomp.us_keymap,
@@ -399,9 +403,14 @@ const Client = struct {
     write_frame_left: usize = 0,
     attached: ?*Session = null,
     dead: bool = false,
-    /// Protocol version the client announced in hello. Channels are
-    /// only opened toward proto >= 2 clients.
-    proto: u32 = 1,
+    /// Negotiated core protocol, capped to this daemon's newest profile.
+    proto: u32 = 0,
+    /// Snapshot body selected for this client (zero means no terminal profile).
+    snapshot_version: u8 = 0,
+    /// Highest daemon-compositor state version the peer can restore.
+    native_state_max: u8 = 0,
+    audio_channels: bool = false,
+    winstream_channels: bool = false,
     /// The client sent an audio `subscribe` unit: it drains PCM.
     /// Audio units flow only to subscribed clients (a terminal-only
     /// viewer must never be flooded into its output cap).
@@ -741,6 +750,59 @@ test "surface icon cache replays every live surface independently" {
     const only = (try wlpipe.peelUnit(units.items)).?;
     try t.expectEqual(@as(u32, 11), std.mem.readInt(u32, only.unit.payload[0..4], .little));
     try t.expect((try wlpipe.peelUnit(units.items[only.consumed..])) == null);
+}
+
+test "daemon startup preserves live owners and socket inode ownership" {
+    const t = std.testing;
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-owner-{d}.sock", .{c.getpid()});
+    var lock_buf: [280:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    _ = c.unlink(path.ptr);
+    _ = c.unlink(lock_path.ptr);
+    defer {
+        _ = c.unlink(path.ptr);
+        _ = c.unlink(lock_path.ptr);
+    }
+
+    var first = try Daemon.init(t.allocator, path);
+    var first_live = true;
+    defer if (first_live) first.deinit();
+    try t.expectError(error.AlreadyRunning, Daemon.init(t.allocator, path));
+
+    // Simulate an externally removed path followed by a replacement owner.
+    // The old anonymous listener must not unlink the replacement on teardown.
+    try t.expectEqual(@as(c_int, 0), c.unlink(path.ptr));
+    var replacement = try Daemon.init(t.allocator, path);
+    defer replacement.deinit();
+    first.deinit();
+    first_live = false;
+    try t.expectEqual(Daemon.SocketPathState.live, Daemon.socketPathState(path));
+}
+
+test "daemon startup recovers a refused stale socket" {
+    const t = std.testing;
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-stale-{d}.sock", .{c.getpid()});
+    var lock_buf: [280:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    _ = c.unlink(path.ptr);
+    _ = c.unlink(lock_path.ptr);
+    defer {
+        _ = c.unlink(path.ptr);
+        _ = c.unlink(lock_path.ptr);
+    }
+
+    const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    try t.expect(fd >= 0);
+    var addr: c.struct_sockaddr_un = undefined;
+    try fillSockaddrUn(&addr, path);
+    try t.expectEqual(@as(c_int, 0), c.bind(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)));
+    _ = c.close(fd);
+
+    const daemon = try Daemon.init(t.allocator, path);
+    daemon.deinit();
+    try t.expect(c.access(path.ptr, c.F_OK) != 0);
 }
 
 const Native = struct {
@@ -1144,6 +1206,10 @@ pub const Daemon = struct {
     listen_fd: c_int,
     /// Owned socket path; unlinked on deinit.
     sock_path: []u8,
+    /// Identity of the bound socket inode; teardown must not unlink a
+    /// pathname another daemon acquired later.
+    sock_dev: u128 = 0,
+    sock_ino: u128 = 0,
     sessions: std.ArrayList(*Session) = .empty,
     clients: std.ArrayList(*Client) = .empty,
     channels: std.ArrayList(*Channel) = .empty,
@@ -1188,27 +1254,80 @@ pub const Daemon = struct {
     dmabuf_capabilities: std.ArrayList(dmabuf.Capability) = .empty,
     dmabuf_initialized: bool = false,
 
+    const SocketPathState = enum { live, stale, unknown };
+
+    fn socketPathState(sock_path: []const u8) SocketPathState {
+        const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+        if (fd < 0) return .unknown;
+        defer _ = c.close(fd);
+        var addr: c.struct_sockaddr_un = undefined;
+        fillSockaddrUn(&addr, sock_path) catch return .unknown;
+        const rc = c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un));
+        if (rc == 0) return .live;
+        return switch (std.posix.errno(rc)) {
+            .CONNREFUSED, .NOENT => .stale,
+            else => .unknown,
+        };
+    }
+
+    fn bindSocket(fd: c_int, addr: *c.struct_sockaddr_un) !void {
+        const rc = c.bind(fd, @ptrCast(addr), @sizeOf(c.struct_sockaddr_un));
+        if (rc == 0) return;
+        if (std.posix.errno(rc) == .ADDRINUSE) return error.AlreadyRunning;
+        return error.BindFailed;
+    }
+
     pub fn init(allocator: std.mem.Allocator, sock_path: []const u8) !*Daemon {
         const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/') orelse return error.BadPath;
         // mkdir -p the parent (one level is enough in practice:
         // $XDG_RUNTIME_DIR exists; we create the sketerm dir).
         var z_buf: [4096]u8 = undefined;
         _ = c.mkdir(try pathZ(&z_buf, sock_path[0..dir_end]), 0o700);
-        _ = c.unlink(try pathZ(&z_buf, sock_path));
+
+        // Serialize stale-socket recovery. Without this lock, two starters can
+        // both observe the same stale inode and one can unlink the other's new
+        // listener between its bind and listen calls.
+        var lock_buf: [4096:0]u8 = undefined;
+        const lock_path = std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{sock_path}) catch return error.BadPath;
+        const lock_fd = c.open(lock_path.ptr, c.O_CREAT | c.O_RDWR | c.O_CLOEXEC, @as(c_uint, 0o600));
+        if (lock_fd < 0) return error.LockFailed;
+        defer _ = c.close(lock_fd);
+        var lock = std.mem.zeroes(c.struct_flock);
+        lock.l_type = c.F_WRLCK;
+        lock.l_whence = c.SEEK_SET;
+        if (c.fcntl(lock_fd, c.F_SETLKW, &lock) < 0) return error.LockFailed;
 
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
         if (fd < 0) return error.SocketFailed;
         errdefer _ = c.close(fd);
         var addr: c.struct_sockaddr_un = undefined;
         try fillSockaddrUn(&addr, sock_path);
-        if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return error.BindFailed;
+        bindSocket(fd, &addr) catch |err| switch (err) {
+            error.AlreadyRunning => switch (socketPathState(sock_path)) {
+                .live, .unknown => return error.AlreadyRunning,
+                .stale => {
+                    var st: c.struct_stat = undefined;
+                    const path = try pathZ(&z_buf, sock_path);
+                    if (c.lstat(path, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFSOCK)
+                        return error.BindFailed;
+                    if (c.unlink(path) != 0 and std.posix.errno(-1) != .NOENT)
+                        return error.BindFailed;
+                    try bindSocket(fd, &addr);
+                },
+            },
+            else => return err,
+        };
         if (c.listen(fd, 8) != 0) return error.ListenFailed;
+        var bound_st: c.struct_stat = undefined;
+        if (c.lstat(try pathZ(&z_buf, sock_path), &bound_st) != 0) return error.StatFailed;
 
         const self = try allocator.create(Daemon);
         self.* = .{
             .allocator = allocator,
             .listen_fd = fd,
             .sock_path = try allocator.dupe(u8, sock_path),
+            .sock_dev = @intCast(bound_st.st_dev),
+            .sock_ino = @intCast(bound_st.st_ino),
         };
         return self;
     }
@@ -1228,15 +1347,38 @@ pub const Daemon = struct {
         self.sessions.deinit(self.allocator);
         for (self.workers.items) |w| w.deinit();
         self.workers.deinit(self.allocator);
+        // Hold the startup lock while closing and unlinking. Otherwise a new
+        // daemon can replace the stale pathname between lstat and unlink.
+        var lock_fd: c_int = -1;
+        var lock_buf: [4096:0]u8 = undefined;
+        if (self.sock_path.len > 0) {
+            if (std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{self.sock_path})) |lock_path| {
+                const fd = c.open(lock_path.ptr, c.O_CREAT | c.O_RDWR | c.O_CLOEXEC, @as(c_uint, 0o600));
+                if (fd >= 0) {
+                    var lock = std.mem.zeroes(c.struct_flock);
+                    lock.l_type = c.F_WRLCK;
+                    lock.l_whence = c.SEEK_SET;
+                    if (c.fcntl(fd, c.F_SETLKW, &lock) == 0) lock_fd = fd else _ = c.close(fd);
+                }
+            } else |_| {}
+        }
         if (self.listen_fd >= 0) _ = c.close(self.listen_fd);
         if (self.control_fd >= 0) _ = c.close(self.control_fd);
         if (self.base_dir) |d| self.allocator.free(d);
-        // Only the broker/monolith owns the socket file; a worker has none.
-        if (self.sock_path.len > 0) {
+        // Only unlink the exact inode this daemon bound. A replaced pathname
+        // belongs to another instance and must survive our teardown.
+        if (lock_fd >= 0) {
             var z_buf: [4096]u8 = undefined;
             if (pathZ(&z_buf, self.sock_path)) |p| {
-                _ = c.unlink(p);
+                var st: c.struct_stat = undefined;
+                if (c.lstat(p, &st) == 0 and
+                    @as(u128, @intCast(st.st_dev)) == self.sock_dev and
+                    @as(u128, @intCast(st.st_ino)) == self.sock_ino)
+                {
+                    _ = c.unlink(p);
+                }
             } else |_| {}
+            _ = c.close(lock_fd);
         }
         self.allocator.free(self.sock_path);
         self.allocator.destroy(self);
@@ -1540,8 +1682,9 @@ pub const Daemon = struct {
     // A worker process owns one session and receives its clients as fds
     // passed by the broker over a SOCK_SEQPACKET control socketpair. Each
     // control message is one datagram: [opcode][payload], with at most one
-    // fd in SCM_RIGHTS. Opcodes: 'A' attach (payload [proto][video][kind]
-    // + the client fd; kind = Client.Kind byte, absent from old brokers),
+    // fd in SCM_RIGHTS. Opcodes: 'A' attach (payload
+    // [proto][video][kind][native_state_max][snapshot][audio][winstream]
+    // + the client fd),
     // 'K' kill. (list/rename/metadata join in B3.)
 
     /// Worker side: drain one control datagram and act on it.
@@ -1570,7 +1713,23 @@ pub const Daemon = struct {
                     std.enums.fromInt(Client.Kind, buf[3]) orelse .unknown
                 else
                     .unknown;
-                self.addPassedClient(passed, proto, video, kind);
+                const native_state_max: u8 = if (n >= 5)
+                    buf[4]
+                else if (proto >= wire.NATIVE_STATE_PROTO_VERSION)
+                    wire.NATIVE_STATE_VERSION
+                else if (proto >= 5)
+                    wire.LEGACY_NATIVE_STATE_VERSION
+                else
+                    0;
+                const snapshot_version: u8 = if (n >= 6)
+                    buf[5]
+                else if (proto >= 6)
+                    snapshot.SNAPSHOT_VERSION
+                else
+                    snapshot.LEGACY_SNAPSHOT_VERSION;
+                const audio_channels = if (n >= 7) buf[6] != 0 else proto >= 5;
+                const winstream_channels = if (n >= 8) buf[7] != 0 else proto >= wire.WINSTREAM_PROTO_VERSION;
+                self.addPassedClient(passed, proto, video, kind, native_state_max, snapshot_version, audio_channels, winstream_channels);
             },
             'K' => {
                 for (self.clients.items) |cl| if (!cl.dead) cl.queueFrame(.gone, "");
@@ -1597,7 +1756,17 @@ pub const Daemon = struct {
 
     /// Worker side: adopt a broker-passed client fd as a client attached to
     /// our one session, and send it the attach snapshot.
-    fn addPassedClient(self: *Daemon, fd: c_int, proto: u32, video: bool, kind: Client.Kind) void {
+    fn addPassedClient(
+        self: *Daemon,
+        fd: c_int,
+        proto: u32,
+        video: bool,
+        kind: Client.Kind,
+        native_state_max: u8,
+        snapshot_version: u8,
+        audio_channels: bool,
+        winstream_channels: bool,
+    ) void {
         _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
         const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
         _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
@@ -1605,7 +1774,17 @@ pub const Daemon = struct {
             _ = c.close(fd);
             return;
         };
-        cl.* = .{ .allocator = self.allocator, .fd = fd, .proto = proto, .video = video, .kind = kind };
+        cl.* = .{
+            .allocator = self.allocator,
+            .fd = fd,
+            .proto = proto,
+            .snapshot_version = snapshot_version,
+            .native_state_max = native_state_max,
+            .audio_channels = audio_channels,
+            .winstream_channels = winstream_channels,
+            .video = video,
+            .kind = kind,
+        };
         self.clients.append(self.allocator, cl) catch {
             cl.deinit();
             return;
@@ -1615,8 +1794,8 @@ pub const Daemon = struct {
         cl.attached = s;
         log.info("client attached session='{s}' kind={s} proto={d} video={} (worker handoff)", .{ s.name, @tagName(kind), proto, video });
         self.queueSnapshot(cl, s);
-        if (proto >= 2 and s.winstream != null) self.openWinstreamChan(s, cl);
-        if (proto >= wire.NATIVE_STATE_PROTO_VERSION) self.replayNativeChannels(cl, s);
+        if (winstream_channels and s.winstream != null) self.openWinstreamChan(s, cl);
+        if (native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION or audio_channels) self.replayNativeChannels(cl, s);
         self.refreshVideoGates();
         self.broadcastPeerInfo(s);
     }
@@ -1940,18 +2119,57 @@ pub const Daemon = struct {
     }
 
     fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
+        if (cl.proto == 0 and frame.ftype != .hello and frame.ftype != .list) {
+            cl.queueErr("no shared terminal profile; daemon and sessions preserved");
+            return;
+        }
         switch (frame.ftype) {
             .hello => {
-                const HelloReq = struct { proto: u32 = 1, video: bool = false };
+                const HelloReq = struct {
+                    proto: u32 = 1,
+                    min_proto: u32 = 1,
+                    negotiation: u8 = 0,
+                    snapshot_max: u8 = 0,
+                    native_state_max: u8 = 0,
+                    audio: bool = false,
+                    winstream: bool = false,
+                    video: bool = false,
+                };
                 if (std.json.parseFromSlice(HelloReq, self.allocator, frame.payload, .{
                     .ignore_unknown_fields = true,
                 })) |p| {
-                    cl.proto = p.value.proto;
+                    const negotiated = p.value.negotiation > 0;
+                    cl.proto = if (negotiated)
+                        wire.negotiateProtocol(p.value.min_proto, p.value.proto)
+                    else if (p.value.proto >= wire.MIN_SERVER_PROTO and p.value.proto <= wire.PROTO_VERSION)
+                        p.value.proto
+                    else
+                        0;
+                    cl.snapshot_version = snapshot.negotiateVersion(cl.proto, p.value.snapshot_max, negotiated);
+                    cl.native_state_max = if (cl.proto == 0)
+                        0
+                    else if (negotiated)
+                        @min(p.value.native_state_max, wire.NATIVE_STATE_VERSION)
+                    else if (cl.proto >= wire.NATIVE_STATE_PROTO_VERSION)
+                        wire.NATIVE_STATE_VERSION
+                    else if (cl.proto >= 5)
+                        wire.LEGACY_NATIVE_STATE_VERSION
+                    else
+                        0;
+                    cl.audio_channels = cl.proto != 0 and if (negotiated) p.value.audio else cl.proto >= 5;
+                    cl.winstream_channels = cl.proto != 0 and if (negotiated) p.value.winstream else cl.proto >= wire.WINSTREAM_PROTO_VERSION;
                     cl.video = p.value.video;
                     p.deinit();
                 } else |_| {}
                 cl.queueJson(.welcome, .{
-                    .proto = wire.PROTO_VERSION,
+                    .proto = cl.proto,
+                    .server_proto = wire.PROTO_VERSION,
+                    .min_proto = wire.MIN_SERVER_PROTO,
+                    .negotiation = @as(u8, 1),
+                    .snapshot = cl.snapshot_version,
+                    .native_state = cl.native_state_max,
+                    .audio = cl.audio_channels,
+                    .winstream = cl.winstream_channels,
                     .version = version.string,
                     .audio_opus = opuscodec.available(),
                     .video = build_options.video,
@@ -2039,7 +2257,7 @@ pub const Daemon = struct {
                     return self.nativeClientData(ch, frame.payload[4..]);
                 }
                 if (ch.pa != null) {
-                    if (!nativeViewer(cl, ch.session.?)) return;
+                    if (!audioViewer(cl, ch.session.?)) return;
                     return self.paClientData(cl, ch, frame.payload[4..]);
                 }
                 if (ch.client != cl) return;
@@ -2708,7 +2926,7 @@ pub const Daemon = struct {
         };
         var hdr: [5]u8 = undefined;
         for (self.clients.items) |cl| {
-            if (nativeViewer(cl, s)) {
+            if (audioViewer(cl, s)) {
                 cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio));
                 // Only a SUBSCRIBED viewer counts as the clock owner:
                 // attached-but-deaf clients (MCP) must leave streams
@@ -2739,7 +2957,7 @@ pub const Daemon = struct {
     /// consumed reports already bound production to the local sink, so PCM
     /// remains bounded without tying liveness to the graphical backlog.
     fn subscribedAudioViewer(cl: *const Client, s: *const Session) bool {
-        return nativeViewer(cl, s) and cl.audio_ok;
+        return audioViewer(cl, s) and cl.audio_ok;
     }
 
     fn sessionHasReadyAudioViewer(self: *Daemon, s: *Session) bool {
@@ -2909,7 +3127,13 @@ pub const Daemon = struct {
     }
 
     fn nativeViewer(cl: *const Client, s: *const Session) bool {
-        return cl.attached == s and !cl.dead and cl.proto >= wire.NATIVE_STATE_PROTO_VERSION;
+        return cl.attached == s and !cl.dead and
+            cl.native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION and
+            (!s.native_requires_v7 or cl.native_state_max >= wire.NATIVE_STATE_VERSION);
+    }
+
+    fn audioViewer(cl: *const Client, s: *const Session) bool {
+        return cl.attached == s and !cl.dead and cl.audio_channels;
     }
 
     /// Per-viewer outbound backlog above which the native commit path
@@ -3051,6 +3275,12 @@ pub const Daemon = struct {
         native.* = .{ .allocator = self.allocator, .tracker = tracker, .brain = brain };
         if (brain.advertise_dmabuf) {
             brain.dmabuf_capabilities = self.dmabufCapabilities();
+            for (brain.dmabuf_capabilities) |capability| {
+                if (capability.modifier != dmabuf.DRM_FORMAT_MOD_LINEAR) {
+                    s.native_requires_v7 = true;
+                    break;
+                }
+            }
             if (self.dmabuf_importer) |*importer| {
                 native.dmabuf_importer = importer;
                 log.info("dmabuf import: EGL modifier path active ({d} capabilities including LINEAR)", .{brain.dmabuf_capabilities.len});
@@ -4110,7 +4340,8 @@ pub const Daemon = struct {
         const frame = wire.putChanHeader(&hdr, ch.id);
         if (ch.native != null or ch.pa != null) {
             for (self.clients.items) |cl| {
-                if (nativeViewer(cl, ch.session.?)) cl.queueFrame(.chan_close, frame);
+                const viewer = if (ch.pa != null) audioViewer(cl, ch.session.?) else nativeViewer(cl, ch.session.?);
+                if (viewer) cl.queueFrame(.chan_close, frame);
             }
         } else if (ch.client) |cl| {
             if (!cl.dead) cl.queueFrame(.chan_close, frame);
@@ -4125,6 +4356,10 @@ pub const Daemon = struct {
     }
 
     fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
+        if (cl.proto == 0 or cl.snapshot_version == 0) {
+            cl.queueErr("no shared terminal profile; daemon and sessions preserved");
+            return;
+        }
         if (self.is_broker) return self.brokerSpawn(cl, payload);
         if (self.isWorker()) {
             cl.queueErr("session workers cannot spawn another session");
@@ -4144,11 +4379,11 @@ pub const Daemon = struct {
         }
         // Empty argv = "the daemon host's login shell" — remote
         // clients can't know what's installed here.
-        const default_shell: []const []const u8 = &.{blk: {
-            const sh = std.c.getenv("SHELL");
-            break :blk if (sh != null) std.mem.span(sh.?) else "/bin/sh";
-        }};
-        if (req.argv.len == 0) req.argv = default_shell;
+        const default_shell: []const []const u8 = &.{shell_util.accountLoginShell()};
+        if (req.argv.len == 0) {
+            req.argv = default_shell;
+            req.login_shell = true;
+        }
         if (self.findSession(req.name) != null) {
             cl.queueErr("session name already exists");
             return;
@@ -4210,11 +4445,11 @@ pub const Daemon = struct {
             cl.queueErr("spawn needs a name");
             return;
         }
-        const default_shell: []const []const u8 = &.{blk: {
-            const sh = std.c.getenv("SHELL");
-            break :blk if (sh != null) std.mem.span(sh.?) else "/bin/sh";
-        }};
-        if (req.argv.len == 0) req.argv = default_shell;
+        const default_shell: []const []const u8 = &.{shell_util.accountLoginShell()};
+        if (req.argv.len == 0) {
+            req.argv = default_shell;
+            req.login_shell = true;
+        }
         if (self.brokerFindWorker(req.name) != null) {
             cl.queueErr("session name already exists");
             return;
@@ -4301,7 +4536,16 @@ pub const Daemon = struct {
             .mcp
         else
             .unknown;
-        const msg = [_]u8{ 'A', @truncate(cl.proto), @intFromBool(cl.video), @intFromEnum(kind) };
+        const msg = [_]u8{
+            'A',
+            @truncate(cl.proto),
+            @intFromBool(cl.video),
+            @intFromEnum(kind),
+            cl.native_state_max,
+            cl.snapshot_version,
+            @intFromBool(cl.audio_channels),
+            @intFromBool(cl.winstream_channels),
+        };
         controlSend(w.control_fd, &msg, cl.fd);
         // Handed off: the kernel duplicated the fd into the worker. Drop our
         // copy + the Client (reap closes the broker's fd; the worker's stays).
@@ -4339,7 +4583,7 @@ pub const Daemon = struct {
                 .pid = w.child_pid,
             }) catch return;
         }
-        cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
+        cl.queueJson(.welcome, .{ .proto = cl.proto, .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
     }
 
     /// Broker side of kill: send the worker a graceful 'K' (it flushes `.gone`
@@ -4779,6 +5023,10 @@ pub const Daemon = struct {
     }
 
     fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
+        if (cl.proto == 0 or cl.snapshot_version == 0) {
+            cl.queueErr("no shared terminal profile; session preserved");
+            return;
+        }
         if (self.is_broker) return self.brokerAttach(cl, payload);
         var parsed = std.json.parseFromSlice(AttachReq, self.allocator, payload, .{
             .ignore_unknown_fields = true,
@@ -4821,8 +5069,8 @@ pub const Daemon = struct {
             }
         }
         self.queueSnapshot(cl, s);
-        if (cl.proto >= 2 and s.winstream != null) self.openWinstreamChan(s, cl);
-        if (cl.proto >= wire.NATIVE_STATE_PROTO_VERSION) self.replayNativeChannels(cl, s);
+        if (cl.winstream_channels and s.winstream != null) self.openWinstreamChan(s, cl);
+        if (cl.native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION or cl.audio_channels) self.replayNativeChannels(cl, s);
         self.refreshVideoGates();
         self.broadcastPeerInfo(s);
     }
@@ -4858,29 +5106,30 @@ pub const Daemon = struct {
         // A full replay makes the client current — any pending
         // withheld-frames state is superseded by it.
         cl.needs_native_resync = false;
-        // Audio channels: announce + re-open live streams so the
-        // reattaching viewer builds its local sinks.
-        for (self.channels.items) |ch| {
-            if (ch.session != s or ch.dead) continue;
-            const srv = ch.pa orelse continue;
-            var hdr: [5]u8 = undefined;
-            cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio));
-            // Clock ownership needs a subscription (paReadable /
-            // pulseTick re-derive this each round anyway).
-            if (cl.audio_ok) srv.has_viewer = true;
-            var units: std.ArrayList(u8) = .empty;
-            defer units.deinit(self.allocator);
-            var it = srv.streams.iterator();
-            while (it.next()) |e| {
-                var pl: [10]u8 = undefined;
-                std.mem.writeInt(u32, pl[0..4], e.key_ptr.*, .little);
-                pl[4] = e.value_ptr.format;
-                pl[5] = e.value_ptr.channels;
-                std.mem.writeInt(u32, pl[6..10], e.value_ptr.rate, .little);
-                pulse.appendUnit(&units, self.allocator, .open, &pl) catch break;
+        if (cl.audio_channels) {
+            // Audio channels are independent of graphical state support.
+            for (self.channels.items) |ch| {
+                if (ch.session != s or ch.dead) continue;
+                const srv = ch.pa orelse continue;
+                var hdr: [5]u8 = undefined;
+                cl.queueFrame(.chan_open, wire.encodeChanOpen(&hdr, ch.id, .audio));
+                if (cl.audio_ok) srv.has_viewer = true;
+                var units: std.ArrayList(u8) = .empty;
+                defer units.deinit(self.allocator);
+                var it = srv.streams.iterator();
+                while (it.next()) |e| {
+                    var pl: [10]u8 = undefined;
+                    std.mem.writeInt(u32, pl[0..4], e.key_ptr.*, .little);
+                    pl[4] = e.value_ptr.format;
+                    pl[5] = e.value_ptr.channels;
+                    std.mem.writeInt(u32, pl[6..10], e.value_ptr.rate, .little);
+                    pulse.appendUnit(&units, self.allocator, .open, &pl) catch break;
+                }
+                if (units.items.len > 0) self.queueUnitsTo(cl, ch, units.items);
             }
-            if (units.items.len > 0) self.queueUnitsTo(cl, ch, units.items);
         }
+        if (cl.native_state_max < wire.LEGACY_NATIVE_STATE_VERSION or
+            (s.native_requires_v7 and cl.native_state_max < wire.NATIVE_STATE_VERSION)) return;
         for (self.channels.items) |ch| {
             if (ch.session != s or ch.dead) continue;
             const nv = ch.native orelse continue;
@@ -4984,7 +5233,7 @@ pub const Daemon = struct {
                 }
             }
             if (ok) {
-                if (nv.brain.serializeState(self.allocator)) |blob| {
+                if (nv.brain.serializeStateVersion(self.allocator, cl.native_state_max)) |blob| {
                     defer self.allocator.free(blob);
                     wlpipe.appendUnit(&units, self.allocator, .state_sync, blob) catch {
                         ok = false;
@@ -5142,17 +5391,16 @@ pub const Daemon = struct {
         cl.needs_resync = false;
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
-        // Header: [seq:u64][app:u8]. The app byte lets an attaching
-        // client hold the pane open with the log visible when a
-        // forwarded app exits, instead of detaching to a shell.
+        // Protocol 1-3 used [seq:u64]; protocol 4 added the app byte.
         var seq_hdr: [9]u8 = undefined;
         std.mem.writeInt(u64, seq_hdr[0..8], s.seq, .little);
         seq_hdr[8] = if (s.app) 1 else 0;
-        buf.appendSlice(self.allocator, &seq_hdr) catch {
+        const header = if (cl.proto >= 4) seq_hdr[0..9] else seq_hdr[0..8];
+        buf.appendSlice(self.allocator, header) catch {
             cl.dead = true;
             return;
         };
-        snapshot.serialize(s.screen, &buf, self.allocator) catch {
+        snapshot.serializeVersion(s.screen, &buf, self.allocator, cl.snapshot_version) catch {
             cl.queueErr("snapshot failed");
             return;
         };
@@ -5204,7 +5452,7 @@ pub const Daemon = struct {
                 .pid = s.pty.child_pid,
             }) catch return;
         }
-        cl.queueJson(.welcome, .{ .proto = wire.PROTO_VERSION, .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
+        cl.queueJson(.welcome, .{ .proto = cl.proto, .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
     }
 
     const ForwardReq = struct { port: u16 };
@@ -5679,6 +5927,15 @@ const EventCollector = struct {
 
     fn emit(user: ?*anyopaque, ev: Event) void {
         const self: *EventCollector = @ptrCast(@alignCast(user.?));
+        // parse_error was historically added to an event stream whose records
+        // have no lengths. Keep it daemon-local so protocol 1/2 readers never
+        // encounter an unknown tag that would desynchronize the whole batch.
+        if (ev == .parse_error) {
+            self.screen.apply(ev);
+            var mut = ev;
+            mut.deinit(self.allocator);
+            return;
+        }
         // sketerm marker escape: private — swallowed rather than
         // forwarded. `OSC 5522;label` = a labelled log-ring line and a
         // `.marker` push so viewers stash a screenshot of "the app

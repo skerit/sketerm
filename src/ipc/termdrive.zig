@@ -336,13 +336,9 @@ pub const Term = struct {
         // 133 zones it injects are what powers term_run output_only.
         // The daemon is local (term tools are isolated-mode only), so
         // client-resolved script paths are valid on its host. With no
-        // explicit argv the daemon spawns ITS $SHELL — same process
-        // environment, so resolving against ours matches.
+        // explicit argv, resolve the same account shell as the local daemon.
         const shellintegration = @import("../util/shellintegration.zig");
-        const shell: []const u8 = if (argv) |av| av[0] else blk: {
-            const sh = c.getenv("SHELL");
-            break :blk if (sh != null) std.mem.span(@as([*:0]const u8, @ptrCast(sh))) else "/bin/sh";
-        };
+        const shell: []const u8 = if (argv) |av| av[0] else @import("../mux/shell.zig").accountLoginShell();
         const si = shellintegration.resolve(allocator, shell);
         defer if (si) |r| r.deinit(allocator);
         const SiWire = struct { kind: []const u8, script: []const u8, shim_dir: []const u8 };
@@ -351,7 +347,7 @@ pub const Term = struct {
         if (argv) |av| {
             conn.sendJson(.spawn, .{ .name = name, .argv = av, .rows = rows, .cols = cols, .shell_integration = si_wire }) catch return Error.SpawnFailed;
         } else {
-            conn.sendJson(.spawn, .{ .name = name, .rows = rows, .cols = cols, .shell_integration = si_wire }) catch return Error.SpawnFailed;
+            conn.sendJson(.spawn, .{ .name = name, .argv = &.{shell}, .rows = rows, .cols = cols, .login_shell = true, .shell_integration = si_wire }) catch return Error.SpawnFailed;
         }
         (conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed).deinit(allocator);
         conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
@@ -380,13 +376,13 @@ pub const Term = struct {
     }
 
     fn applySnapshot(self: *Term, payload: []const u8) !void {
-        if (payload.len < 9) return error.Truncated; // [seq:u64][app:u8]
-        self.seq = std.mem.readInt(u64, payload[0..8], .little);
+        const envelope = try snapshot.peelEnvelope(payload);
+        self.seq = envelope.seq;
         if (self.screen) |s| s.deinit();
         self.screen = null;
         self.pool.deinit();
         self.pool.* = try Pool.init(self.allocator);
-        self.screen = try snapshot.restore(self.allocator, self.pool, payload[9..]);
+        self.screen = try snapshot.restore(self.allocator, self.pool, envelope.body);
         if (self.screen) |s| self.app_cursor = s.app_cursor_keys;
     }
 

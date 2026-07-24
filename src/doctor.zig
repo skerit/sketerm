@@ -19,6 +19,7 @@ const opuscodec = @import("mux/opuscodec.zig");
 /// and show up as version "" (reported as "pre-0.1.0 or stale").
 const Welcome = struct {
     proto: u32,
+    server_proto: ?u32 = null,
     version: []const u8 = "",
     audio_opus: bool = false,
     video: bool = false,
@@ -93,9 +94,13 @@ fn checkDaemon(allocator: std.mem.Allocator, host: ?[]const u8) u32 {
         // Deliberately no autostart: doctor reports, it doesn't mutate.
         const path = mux_daemon.defaultSocketPath(allocator) catch return 1;
         defer allocator.free(path);
-        conn = mux_client.Conn.connect(allocator, path) catch {
+        const raw = mux_client.Conn.connect(allocator, path) catch {
             _ = c.printf("daemon    not running (autostarts on demand) - ok\n");
             return 0;
+        };
+        conn = mux_client.Conn.probe(allocator, raw) catch {
+            _ = c.printf("daemon    accepts connections but the handshake failed\n");
+            return 1;
         };
     } else {
         conn = mux_cli.muxConnect(allocator, host) orelse {
@@ -122,6 +127,7 @@ fn checkDaemon(allocator: std.mem.Allocator, host: ?[]const u8) u32 {
     };
     defer parsed.deinit();
     const w = parsed.value;
+    const server_proto = w.server_proto orelse w.proto;
 
     var live: u32 = 0;
     var apps: u32 = 0;
@@ -137,9 +143,10 @@ fn checkDaemon(allocator: std.mem.Allocator, host: ?[]const u8) u32 {
         _ = c.printf("daemon    ");
     }
     _ = c.printf(
-        "%.*s  proto %u  opus:%s video:%s  %u session(s), %u app\n",
+        "%.*s  proto %u (selected %u)  opus:%s video:%s  %u session(s), %u app\n",
         @as(c_int, @intCast(ver.len)),
         ver.ptr,
+        @as(c_uint, server_proto),
         @as(c_uint, w.proto),
         onOff(w.audio_opus),
         onOff(w.video),
@@ -148,20 +155,18 @@ fn checkDaemon(allocator: std.mem.Allocator, host: ?[]const u8) u32 {
     );
 
     var warns: u32 = 0;
-    if (w.proto != wire.PROTO_VERSION) {
-        _ = c.printf("          WARN proto skew: daemon %u, binary %u\n", @as(c_uint, w.proto), @as(c_uint, wire.PROTO_VERSION));
+    if (w.proto == 0) {
+        _ = c.printf("          warning: no shared terminal profile; sessions are preserved but cannot be attached\n");
         warns += 1;
+    }
+    if (server_proto != wire.PROTO_VERSION) {
+        _ = c.printf("          note: protocol skew uses negotiated profile %u\n", @as(c_uint, w.proto));
     }
     if (!std.mem.eql(u8, w.version, version.string)) {
         _ = c.printf(
-            "          WARN version skew vs binary %s - %s\n",
+            "          note: version skew vs binary %s; running sessions stay on their current daemon\n",
             @as([*:0]const u8, version.string),
-            @as([*:0]const u8, if (host == null)
-                "restart the daemon to pick up the new binary"
-            else
-                "update sketerm-mux on the remote host"),
         );
-        warns += 1;
     }
     if (opuscodec.available() != w.audio_opus) {
         _ = c.printf("          note: opus mismatch (binary %s, daemon %s) - audio falls back to raw PCM\n", onOff(opuscodec.available()), onOff(w.audio_opus));
