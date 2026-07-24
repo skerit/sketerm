@@ -440,6 +440,35 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
     const dst_hash = fileSha(dst) orelse fail("dst hash");
     if (!std.mem.eql(u8, &dst_hash, &src_hash)) fail("copy content mismatch");
 
+    // Stable tokens make submission idempotent across a lost reply.
+    var token_dst_buf: [4096]u8 = undefined;
+    const token_dst = std.fmt.bufPrint(&token_dst_buf, "{s}/token.copy", .{dir}) catch unreachable;
+    const token_job = fs.startCopyToken(src, token_dst, true, "smoke-stable-token") catch failErr("start token copy", fs.lastErr());
+    const same_job = fs.startCopyToken(src, token_dst, true, "smoke-stable-token") catch failErr("repeat token copy", fs.lastErr());
+    if (same_job != token_job) fail("stable token started a duplicate job");
+    const token_out = collectJob(&fs, token_job, 20_000);
+    if (!token_out.is("done")) fail("token copy outcome");
+    // A reconnect after completion must get both the same identity and
+    // a replayed terminal event; otherwise waitJobEnd hangs forever.
+    {
+        var recovered = fsdrive.Fs.connect(allocator, sock_path) catch fail("token recovery connect");
+        defer recovered.deinit();
+        const recovered_job = recovered.startCopyToken(src, token_dst, true, "smoke-stable-token") catch failErr("recover completed token copy", recovered.lastErr());
+        if (recovered_job != token_job) fail("completed token started a duplicate job");
+        const recovered_out = collectJob(&recovered, recovered_job, 2_000);
+        if (!recovered_out.is("done")) fail("completed token outcome was not replayed");
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const rows = fs.jobList(arena.allocator()) catch failErr("token job_list", fs.lastErr());
+        var found = false;
+        for (rows) |row| {
+            if (row.job == token_job and std.mem.eql(u8, row.client_token, "smoke-stable-token")) found = true;
+        }
+        if (!found) fail("job_list omitted stable token metadata");
+    }
+
     // ── hash-verified resume: valid partial continues ──────────
     const rdst = (std.fmt.bufPrint(&pb[2], "{s}/resumed.bin", .{dir}) catch unreachable);
     {
@@ -621,6 +650,26 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
         }
         if (!cdone or hits != 2 or !line2_seen) fail("grep matches wrong");
         if (bin_hit) fail("grep matched a binary file");
+
+        // Preview text runs in an ephemeral helper and returns bounded
+        // content without blocking the daemon poll loop.
+        const preview_job = fs.startPreview(std.fmt.bufPrint(&fp3, "{s}/needle-alpha.txt", .{sdir}) catch unreachable) catch failErr("start preview", fs.lastErr());
+        var preview_done = false;
+        waited = 0;
+        while (!preview_done and waited < 20_000) {
+            while (fs.takeJobEvent()) |e0| {
+                var e = e0;
+                defer e.deinit();
+                if (e.job != preview_job) continue;
+                if (std.mem.eql(u8, e.ev, "done")) {
+                    if (std.mem.indexOf(u8, e.text, "MAGIC-TOKEN") == null) fail("preview text missing");
+                    preview_done = true;
+                } else if (e.terminal()) fail("preview job failed");
+            }
+            if (!preview_done) _ = c.usleep(5_000);
+            waited += 5;
+        }
+        if (!preview_done) fail("preview never completed");
     }
 
     // ── jobs survive their client (durability) ─────────────────

@@ -21,6 +21,7 @@ const fsserve = @import("fsserve.zig");
 const fsjournal = @import("fsjournal.zig");
 const muxclient = @import("client.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
+const thumbs = @import("../filebrowser/thumbs.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -44,6 +45,7 @@ pub const Spec = struct {
     within_ms: u64 = 0,
     /// find: raise the match cap (0 = default; clamped to 200k).
     max_matches: u64 = 0,
+    client_token: []const u8 = "",
 };
 
 /// Search caps: a runaway query costs a bounded stream, never a
@@ -69,12 +71,17 @@ fn emitRaw(line: []const u8) void {
     }
 }
 
+fn encodeEvent(buf: []u8, value: anytype) ?[]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    std.json.Stringify.value(value, .{}, &w) catch return null;
+    w.writeByte('\n') catch return null;
+    return w.buffered();
+}
+
 fn emit(value: anytype) void {
-    var buf: [4096]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    std.json.Stringify.value(value, .{}, &w) catch return;
-    w.writeByte('\n') catch return;
-    emitRaw(w.buffered());
+    // A 4 KiB text preview can expand sixfold under JSON escaping.
+    var buf: [32 * 1024]u8 = undefined;
+    emitRaw(encodeEvent(&buf, value) orelse return);
 }
 
 fn emitError(msg: []const u8) u8 {
@@ -156,6 +163,10 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
         runPanelize(spec)
     else if (std.mem.eql(u8, spec.op, "live_find"))
         runLiveFind(allocator, spec)
+    else if (std.mem.eql(u8, spec.op, "thumbnail"))
+        runPreview(allocator, spec, true)
+    else if (std.mem.eql(u8, spec.op, "preview"))
+        runPreview(allocator, spec, false)
     else
         emitError("unknown job op");
     if (spec.job_id != 0 and spec.journal_dir.len > 0) {
@@ -170,6 +181,7 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
             .dst_host = spec.dst_host,
             .@"resume" = spec.@"resume",
             .pid = c.getpid(),
+            .client_token = spec.client_token,
         }) catch {};
     }
     return rc;
@@ -252,6 +264,182 @@ fn runArgv(argv: []const ?[*:0]const u8) bool {
     var st: c_int = 0;
     while (c.waitpid(pid, &st, 0) < 0 and std.posix.errno(@as(c_int, -1)) == .INTR) {}
     return c.WIFEXITED(st) and c.WEXITSTATUS(st) == 0;
+}
+
+fn extIs(path: []const u8, exts: []const []const u8) bool {
+    for (exts) |ext| if (std.ascii.endsWithIgnoreCase(path, ext)) return true;
+    return false;
+}
+
+fn captureArgv(argv: []const ?[*:0]const u8, out: []u8) usize {
+    var pipefd: [2]c_int = undefined;
+    if (c.pipe(&pipefd) != 0) return 0;
+    const pid = c.fork();
+    if (pid < 0) { _ = c.close(pipefd[0]); _ = c.close(pipefd[1]); return 0; }
+    if (pid == 0) {
+        _ = c.dup2(pipefd[1], 1);
+        _ = c.dup2(pipefd[1], 2);
+        _ = c.close(pipefd[0]);
+        _ = c.close(pipefd[1]);
+        _ = c.execvp(argv[0].?, @ptrCast(@constCast(argv.ptr)));
+        c._exit(127);
+    }
+    _ = c.close(pipefd[1]);
+    var used: usize = 0;
+    while (used < out.len) {
+        const n = c.read(pipefd[0], out[used..].ptr, out.len - used);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        if (n <= 0) break;
+        used += @intCast(n);
+    }
+    _ = c.close(pipefd[0]);
+    var status: c_int = 0;
+    _ = c.waitpid(pid, &status, 0);
+    return if (c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0) used else 0;
+}
+
+fn rasterThumbnail(allocator: std.mem.Allocator, source: [:0]const u8, output: [:0]const u8, bound: c_int) bool {
+    var width: c_int = 0;
+    var height: c_int = 0;
+    var channels: c_int = 0;
+    const pixels = c.stbi_load(source.ptr, &width, &height, &channels, 4) orelse return false;
+    defer c.stbi_image_free(pixels);
+    if (width <= 0 or height <= 0) return false;
+    const scale = @max(@as(f64, @floatFromInt(width)) / @as(f64, @floatFromInt(bound)), @as(f64, @floatFromInt(height)) / @as(f64, @floatFromInt(bound)));
+    const out_w: c_int = if (scale > 1) @intFromFloat(@max(1.0, @as(f64, @floatFromInt(width)) / scale)) else width;
+    const out_h: c_int = if (scale > 1) @intFromFloat(@max(1.0, @as(f64, @floatFromInt(height)) / scale)) else height;
+    const count = @as(usize, @intCast(out_w)) * @as(usize, @intCast(out_h)) * 4;
+    const scaled = allocator.alloc(u8, count) catch return false;
+    defer allocator.free(scaled);
+    const src: [*]const u8 = @ptrCast(pixels);
+    var y: usize = 0;
+    while (y < @as(usize, @intCast(out_h))) : (y += 1) {
+        const sy: usize = @min(@as(usize, @intCast(height - 1)), y * @as(usize, @intCast(height)) / @as(usize, @intCast(out_h)));
+        var x: usize = 0;
+        while (x < @as(usize, @intCast(out_w))) : (x += 1) {
+            const sx: usize = @min(@as(usize, @intCast(width - 1)), x * @as(usize, @intCast(width)) / @as(usize, @intCast(out_w)));
+            @memcpy(scaled[(y * @as(usize, @intCast(out_w)) + x) * 4 ..][0..4], src[(sy * @as(usize, @intCast(width)) + sx) * 4 ..][0..4]);
+        }
+    }
+    return c.stbi_write_png(output.ptr, out_w, out_h, 4, scaled.ptr, out_w * 4) != 0;
+}
+
+fn runPreview(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool) u8 {
+    var source_z: [4096:0]u8 = undefined;
+    const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return emitError("preview path too long");
+    var st: c.struct_stat = undefined;
+    if (c.stat(source.ptr, &st) != 0) return emitErrno("preview stat");
+    const ts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+    const mtime_sec: i64 = ts.tv_sec;
+    const image_exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".ico", ".svg", ".avif", ".heic", ".heif" };
+    const pdf_exts = [_][]const u8{".pdf"};
+    const video_exts = [_][]const u8{ ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpeg", ".mpg" };
+    const audio_exts = [_][]const u8{ ".mp3", ".flac", ".ogg", ".opus", ".wav", ".m4a", ".aac" };
+    const media = extIs(spec.src, &image_exts) or extIs(spec.src, &pdf_exts) or extIs(spec.src, &video_exts) or extIs(spec.src, &audio_exts);
+
+    if (!media and !thumbnail_only) {
+        const fp = c.fopen(source.ptr, "rb") orelse return emitErrno("preview open");
+        var text: [4096]u8 = undefined;
+        const n = c.fread(&text, 1, text.len, fp);
+        _ = c.fclose(fp);
+        if (std.mem.indexOfScalar(u8, text[0..n], 0) != null)
+            emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .text = "(binary file)" })
+        else
+            emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .text = text[0..n] });
+        return 0;
+    }
+    if (!media) return emitError("no thumbnailer for this file type");
+
+    var cache_buf: [4096]u8 = undefined;
+    const cache_root: []const u8 = if (c.getenv("XDG_CACHE_HOME")) |p|
+        std.mem.span(@as([*:0]const u8, @ptrCast(p)))
+    else if (c.getenv("HOME")) |p|
+        std.fmt.bufPrint(&cache_buf, "{s}/.cache", .{std.mem.span(@as([*:0]const u8, @ptrCast(p)))}) catch return emitError("cache path too long")
+    else
+        "/tmp";
+    // Tier directories are size contracts other applications rely on:
+    // normal is 128px, x-large is 512px. Writing a 512px image into
+    // `large` (256px) would hand every other file manager an
+    // out-of-spec entry it is entitled to trust.
+    const tier: thumbs.Tier = if (thumbnail_only) .normal else .x_large;
+    var final_buf: [4096]u8 = undefined;
+    const final = thumbs.thumbPathTier(cache_root, spec.src, tier, &final_buf) orelse return emitError("thumbnail path too long");
+    var uri_buf: [4096 * 3 + 8]u8 = undefined;
+    const uri = thumbs.fileUri(spec.src, &uri_buf) orelse return emitError("thumbnail URI too long");
+    const cached = thumbs.validatePng(final, uri, mtime_sec);
+    if (cached and thumbnail_only) {
+        emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = final });
+        return 0;
+    }
+    if (!cached) {
+        pathz.makeParentDirs(final) catch return emitError("cannot create thumbnail cache");
+        var mode_buf: [4096]u8 = undefined;
+        const thumb_dir = std.fmt.bufPrint(&mode_buf, "{s}/thumbnails", .{cache_root}) catch return emitError("cache path too long");
+        var mode_z: [4096]u8 = undefined;
+        _ = c.chmod(pathz.pathZ(&mode_z, thumb_dir) catch return emitError("cache path too long"), 0o700);
+        const tier_dir = std.fs.path.dirname(final) orelse return emitError("bad thumbnail path");
+        _ = c.chmod(pathz.pathZ(&mode_z, tier_dir) catch return emitError("cache path too long"), 0o700);
+        var raw_buf: [4096:0]u8 = undefined;
+        const raw = std.fmt.bufPrintZ(&raw_buf, "{s}.generated-{d}.png", .{ final, c.getpid() }) catch return emitError("thumbnail path too long");
+        defer _ = c.unlink(raw.ptr);
+        const bound: c_int = if (thumbnail_only) 128 else 512;
+        var generated = false;
+        if (extIs(spec.src, &image_exts)) {
+            if (extIs(spec.src, &[_][]const u8{".svg"})) {
+                var size_buf: [16:0]u8 = undefined;
+                const size = std.fmt.bufPrintZ(&size_buf, "{d}", .{bound}) catch unreachable;
+                const argv = [_:null]?[*:0]const u8{ "rsvg-convert", "--keep-aspect-ratio", "-w", size.ptr, "-h", size.ptr, "-o", raw.ptr, source.ptr, null };
+                generated = runArgv(&argv);
+            } else {
+                generated = rasterThumbnail(allocator, source, raw, bound);
+                if (!generated) {
+                    var vf_buf: [64:0]u8 = undefined;
+                    const vf = std.fmt.bufPrintZ(&vf_buf, "scale={d}:-1", .{bound}) catch return emitError("scale");
+                    const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
+                    generated = runArgv(&argv);
+                }
+            }
+        } else if (extIs(spec.src, &pdf_exts)) {
+            var prefix_buf: [4096:0]u8 = undefined;
+            const prefix = std.fmt.bufPrintZ(&prefix_buf, "{s}.page", .{raw[0 .. raw.len - 4]}) catch return emitError("thumbnail path too long");
+            var scale_buf: [16:0]u8 = undefined;
+            const scale = std.fmt.bufPrintZ(&scale_buf, "{d}", .{bound}) catch unreachable;
+            const argv = [_:null]?[*:0]const u8{ "pdftoppm", "-f", "1", "-singlefile", "-scale-to", scale.ptr, "-png", source.ptr, prefix.ptr, null };
+            generated = runArgv(&argv);
+            if (generated) {
+                var made: [4096:0]u8 = undefined;
+                const mp = std.fmt.bufPrintZ(&made, "{s}.png", .{prefix}) catch return emitError("thumbnail path too long");
+                generated = c.rename(mp.ptr, raw.ptr) == 0;
+            }
+        } else {
+            var vf_buf: [64:0]u8 = undefined;
+            const vf = if (extIs(spec.src, &video_exts))
+                std.fmt.bufPrintZ(&vf_buf, "scale={d}:-1", .{bound}) catch return emitError("scale")
+            else
+                std.fmt.bufPrintZ(&vf_buf, "showwavespic=s={d}x240", .{bound}) catch return emitError("scale");
+            if (extIs(spec.src, &video_exts)) {
+                const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", source.ptr, "-frames:v", "1", "-vf", vf.ptr, raw.ptr, null };
+                generated = runArgv(&argv);
+            } else {
+                const argv = [_:null]?[*:0]const u8{ "ffmpeg", "-y", "-v", "error", "-i", source.ptr, "-filter_complex", vf.ptr, "-frames:v", "1", raw.ptr, null };
+                generated = runArgv(&argv);
+            }
+        }
+        if (!generated) return emitError("preview generator unavailable or failed");
+        thumbs.installPng(allocator, raw, final, uri, mtime_sec) catch return emitError("cannot install thumbnail cache entry");
+    }
+
+    var metadata: [2048]u8 = undefined;
+    var metadata_len: usize = 0;
+    if (!thumbnail_only and (extIs(spec.src, &video_exts) or extIs(spec.src, &audio_exts))) {
+        const argv = [_:null]?[*:0]const u8{ "ffprobe", "-v", "error", "-show_entries", "format=duration:format_tags=title,artist,album", "-of", "default=noprint_wrappers=1", source.ptr, null };
+        metadata_len = captureArgv(&argv, &metadata);
+    } else if (!thumbnail_only and extIs(spec.src, &pdf_exts)) {
+        const argv = [_:null]?[*:0]const u8{ "pdfinfo", source.ptr, null };
+        metadata_len = captureArgv(&argv, &metadata);
+    }
+    emit(.{ .ev = "done", .done = @as(u64, 1), .total = @as(u64, 1), .path = final, .text = metadata[0..metadata_len] });
+    return 0;
 }
 
 fn runExtract(spec: Spec) u8 {
@@ -627,11 +815,10 @@ const CrossCopy = struct {
             _ = self.dst.write(part, 0, &.{}, .{ .create = true, .truncate = true }) catch return false;
         }
         self.dst.fsync(part) catch return false;
-        self.dst.rename(part, dst_path) catch return false;
         const sh = self.hash(self.src, src_path) orelse return false;
-        const dh = self.hash(self.dst, dst_path) orelse return false;
+        const dh = self.hash(self.dst, part) orelse return false;
         if (!std.mem.eql(u8, &sh, &dh)) {
-            self.dst.deletePath(dst_path) catch {};
+            self.dst.deletePath(part) catch {};
             if (resumed_from > 0) {
                 self.progress.done -|= off;
                 self.resumed -|= resumed_from;
@@ -639,6 +826,9 @@ const CrossCopy = struct {
             }
             return false;
         }
+        // Verification precedes replacement: a corrupt transfer can
+        // never destroy the destination that existed before this job.
+        self.dst.rename(part, dst_path) catch return false;
         var arena_meta = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_meta.deinit();
         if (self.src.statPath(arena_meta.allocator(), src_path)) |e| {
@@ -667,8 +857,14 @@ const CrossCopy = struct {
                 self.progress.total += e.size;
                 if (!self.copyFile(sp, dp, e.size, allow_resume)) return false;
             } else if (std.mem.eql(u8, e.kind, "link")) {
-                self.dst.deletePath(dp) catch {};
-                self.dst.symlink(e.target orelse return false, dp) catch return false;
+                var temp_buf: [4096]u8 = undefined;
+                const temp = std.fmt.bufPrint(&temp_buf, "{s}.skpart-link-{d}", .{ dp, c.getpid() }) catch return false;
+                self.dst.deletePath(temp) catch {};
+                self.dst.symlink(e.target orelse return false, temp) catch return false;
+                self.dst.rename(temp, dp) catch {
+                    self.dst.deletePath(temp) catch {};
+                    return false;
+                };
             }
         }
         var arena_meta = std.heap.ArenaAllocator.init(self.allocator);
@@ -1091,6 +1287,15 @@ fn statOf(path: []const u8, st: *c.struct_stat, follow: bool) bool {
     return (if (follow) c.stat(p, st) else c.lstat(p, st)) == 0;
 }
 
+fn fsyncParent(path: []const u8) bool {
+    const parent = std.fs.path.dirname(path) orelse return false;
+    var z: [4096]u8 = undefined;
+    const dfd = c.open(pathz.pathZ(&z, parent) catch return false, c.O_RDONLY | c.O_DIRECTORY);
+    if (dfd < 0) return false;
+    defer _ = c.close(dfd);
+    return c.fsync(dfd) == 0;
+}
+
 fn runCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
     if (spec.dst.len == 0) return emitError("copy needs dst");
     // dst inside src would recurse into its own output.
@@ -1181,6 +1386,7 @@ fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_re
     var zr: [4096]u8 = undefined;
     const dp = pathz.pathZ(&zr, dst) catch return .{ .err = "path too long" };
     if (c.rename(pp, dp) != 0) return .{ .errno = "rename" };
+    if (!fsyncParent(dst)) return .{ .errno = "fsync destination parent" };
     return .ok;
 }
 
@@ -1229,10 +1435,13 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
     {
         var z: [4096]u8 = undefined;
         const dp = pathz.pathZ(&z, dst_dir) catch return .{ .err = "path too long" };
-        if (c.mkdir(dp, src_st.st_mode & 0o7777) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST) {
+        const rc = c.mkdir(dp, src_st.st_mode & 0o7777);
+        if (rc == 0) {
+            if (!fsyncParent(dst_dir)) return .{ .errno = "fsync directory parent" };
+        } else if (std.posix.errno(@as(c_int, -1)) == .EXIST) {
             var st2: c.struct_stat = undefined;
-            if (c.stat(dp, &st2) != 0) return .{ .errno = "mkdir" };
-        }
+            if (c.stat(dp, &st2) != 0 or (st2.st_mode & c.S_IFMT) != c.S_IFDIR) return .{ .errno = "mkdir" };
+        } else return .{ .errno = "mkdir" };
     }
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1259,12 +1468,25 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
         } else if (std.mem.eql(u8, e.kind, "link")) {
             var zt: [4096]u8 = undefined;
             var zl: [4096]u8 = undefined;
+            var ztmp: [4096]u8 = undefined;
             const tgt = pathz.pathZ(&zt, e.target orelse return .{ .err = "symlink target missing" }) catch
                 return .{ .err = "path too long" };
             const lp = pathz.pathZ(&zl, dpath) catch return .{ .err = "path too long" };
-            if (c.unlink(lp) != 0 and std.posix.errno(@as(c_int, -1)) != .NOENT)
-                return .{ .errno = "unlink old symlink" };
-            if (c.symlink(tgt, lp) != 0) return .{ .errno = "create symlink" };
+            var temp_buf: [4096]u8 = undefined;
+            const temp = std.fmt.bufPrint(&temp_buf, "{s}.skpart-link-{d}", .{ dpath, c.getpid() }) catch return .{ .err = "path too long" };
+            const temp_z = pathz.pathZ(&ztmp, temp) catch return .{ .err = "path too long" };
+            _ = c.unlink(temp_z);
+            if (c.symlink(tgt, temp_z) != 0) return .{ .errno = "create symlink" };
+            if (c.rename(temp_z, lp) != 0) {
+                _ = c.unlink(temp_z);
+                return .{ .errno = "replace symlink" };
+            }
+            const parent = std.fs.path.dirname(dpath) orelse dst_dir;
+            var zd: [4096]u8 = undefined;
+            const dfd = c.open(pathz.pathZ(&zd, parent) catch return .{ .err = "path too long" }, c.O_RDONLY | c.O_DIRECTORY);
+            if (dfd < 0) return .{ .errno = "open symlink parent" };
+            defer _ = c.close(dfd);
+            if (c.fsync(dfd) != 0) return .{ .errno = "fsync symlink parent" };
         } else if (std.mem.eql(u8, e.kind, "file")) {
             if (allow_resume) {
                 var dst_st: c.struct_stat = undefined;
@@ -1376,6 +1598,15 @@ test "nameMatches: substring default, glob with wildcards, ci" {
     try t.expect(!nameMatches("a?c", "abbc"));
     try t.expect(nameMatches("*b*b*", "abxbx"));
     try t.expect(!nameMatches("*b*b*", "abxx"));
+}
+
+test "preview event carries a fully escaped 4 KiB text head" {
+    var text: [4096]u8 = undefined;
+    @memset(&text, 1);
+    var encoded: [32 * 1024]u8 = undefined;
+    const line = encodeEvent(&encoded, .{ .ev = "done", .text = &text }) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(line.len > text.len);
+    try std.testing.expectEqual(@as(u8, '\n'), line[line.len - 1]);
 }
 
 test "archive member validation rejects traversal and absolute paths" {

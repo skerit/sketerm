@@ -5,7 +5,7 @@ const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
 
 pub const Record = struct {
-    version: u32 = 1,
+    version: u32 = 2,
     id: u64,
     op: []const u8,
     state: []const u8 = "running",
@@ -20,10 +20,18 @@ pub const Record = struct {
     total: u64 = 0,
     resumed_from: u64 = 0,
     message: []const u8 = "",
+    /// Stable caller identity used to reconcile a submission whose
+    /// reply was lost when the client disconnected.
+    client_token: []const u8 = "",
+    /// The durable client ledger has recorded this terminal outcome.
+    acknowledged: bool = false,
 };
 
 fn recordPath(buf: []u8, dir: []const u8, id: u64, temporary: bool) ![:0]u8 {
-    return std.fmt.bufPrintZ(buf, "{s}/{d}.json{s}", .{ dir, id, if (temporary) ".tmp" else "" });
+    return if (temporary)
+        std.fmt.bufPrintZ(buf, "{s}/{d}.json.tmp-{d}", .{ dir, id, c.getpid() })
+    else
+        std.fmt.bufPrintZ(buf, "{s}/{d}.json", .{ dir, id });
 }
 
 pub fn ensureDir(dir: []const u8) bool {
@@ -54,7 +62,11 @@ pub fn save(dir: []const u8, record: Record) !void {
         return error.WriteFailed;
     }
     const fd = c.fileno(fp);
-    if (fd >= 0) _ = c.fsync(fd);
+    if (fd < 0 or c.fsync(fd) != 0) {
+        _ = c.fclose(fp);
+        _ = c.unlink(temp.ptr);
+        return error.WriteFailed;
+    }
     if (c.fclose(fp) != 0) {
         _ = c.unlink(temp.ptr);
         return error.WriteFailed;
@@ -63,6 +75,14 @@ pub fn save(dir: []const u8, record: Record) !void {
         _ = c.unlink(temp.ptr);
         return error.WriteFailed;
     }
+    // Persist the directory entry too: after a power loss a durable
+    // job must not regress to the pre-rename record.
+    var dir_buf: [4096]u8 = undefined;
+    const dir_z = pathz.pathZ(&dir_buf, dir) catch return;
+    const dfd = c.open(dir_z, c.O_RDONLY | c.O_DIRECTORY);
+    if (dfd < 0) return error.WriteFailed;
+    defer _ = c.close(dfd);
+    if (c.fsync(dfd) != 0) return error.WriteFailed;
 }
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(Record) {
@@ -91,6 +111,8 @@ test "job journal save/load is atomic and complete" {
         .dst = "/dst",
         .@"resume" = true,
         .done = 99,
+        .client_token = "intent-42",
+        .acknowledged = true,
     });
     const path = try std.fmt.allocPrint(arena.allocator(), "{s}/42.json", .{base});
     const parsed = try load(arena.allocator(), path);
@@ -99,4 +121,6 @@ test "job journal save/load is atomic and complete" {
     try std.testing.expectEqualStrings("/src", parsed.value.src);
     try std.testing.expect(parsed.value.@"resume");
     try std.testing.expectEqual(@as(u64, 99), parsed.value.done);
+    try std.testing.expectEqualStrings("intent-42", parsed.value.client_token);
+    try std.testing.expect(parsed.value.acknowledged);
 }

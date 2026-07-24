@@ -1257,7 +1257,7 @@ const FsView = struct {
 /// transfers — the roadmap's core promise). kill = cancel,
 /// SIGSTOP/SIGCONT = pause/resume.
 const FsJob = struct {
-    const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find };
+    const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview };
     const State = enum { running, paused, done, failed, canceled };
 
     allocator: std.mem.Allocator,
@@ -1292,7 +1292,14 @@ const FsJob = struct {
     pattern: []u8,
     src_host: []u8,
     dst_host: []u8,
+    client_token: []u8,
+    acknowledged: bool = false,
+    ack_req: u32 = 0,
+    terminal_pending: bool = false,
     resumable: bool = false,
+    /// Short-lived client-owned helper: no journal/history and killed
+    /// when its requesting client disappears.
+    ephemeral: bool = false,
 
     fn deinit(self: *FsJob, kill_child: bool) void {
         if (kill_child and self.out_fd >= 0 and self.pid > 0) {
@@ -1307,6 +1314,7 @@ const FsJob = struct {
         self.allocator.free(self.pattern);
         self.allocator.free(self.src_host);
         self.allocator.free(self.dst_host);
+        self.allocator.free(self.client_token);
         self.allocator.destroy(self);
     }
 
@@ -3051,6 +3059,7 @@ pub const Daemon = struct {
         mtime_ms: ?i64 = null,
         src_host: []const u8 = "",
         dst_host: []const u8 = "",
+        client_token: []const u8 = "",
     };
 
     /// One change inside an fs_delta. upsert carries `entry`; del only
@@ -3086,7 +3095,8 @@ pub const Daemon = struct {
             std.mem.eql(u8, r.op, "archive_create") or std.mem.eql(u8, r.op, "trash") or
             std.mem.eql(u8, r.op, "trash_restore") or std.mem.eql(u8, r.op, "cross_copy") or
             std.mem.eql(u8, r.op, "panelize") or std.mem.eql(u8, r.op, "live_find") or
-            std.mem.eql(u8, r.op, "archive_list") or std.mem.eql(u8, r.op, "archive_extract"))
+            std.mem.eql(u8, r.op, "archive_list") or std.mem.eql(u8, r.op, "archive_extract") or
+            std.mem.eql(u8, r.op, "thumbnail") or std.mem.eql(u8, r.op, "preview"))
             return self.fsStartJob(cl, r);
 
         if (std.mem.eql(u8, r.op, "open_view")) {
@@ -3117,6 +3127,12 @@ pub const Daemon = struct {
             const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
             const rc = c.mkdir(p, 0o755);
             if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+            const parent = std.fs.path.dirname(r.path) orelse return fsReplyErr(cl, r.req, "directory has no parent");
+            var dz: [4096]u8 = undefined;
+            const dfd = c.open(pathZ(&dz, parent) catch return fsReplyErr(cl, r.req, "parent path too long"), c.O_RDONLY | c.O_DIRECTORY);
+            if (dfd < 0) return fsReplyErr(cl, r.req, "cannot open directory parent");
+            defer _ = c.close(dfd);
+            if (c.fsync(dfd) != 0) return fsReplyErr(cl, r.req, "cannot fsync directory parent");
             cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
         } else if (std.mem.eql(u8, r.op, "rename")) {
             if (r.to.len == 0 or r.to[0] != '/') return fsReplyErr(cl, r.req, "to must be absolute");
@@ -3126,6 +3142,15 @@ pub const Daemon = struct {
             const to = pathZ(&z2, r.to) catch return fsReplyErr(cl, r.req, "path too long");
             const rc = c.rename(from, to);
             if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+            if (std.fs.path.dirname(r.to)) |parent| {
+                var dz: [4096]u8 = undefined;
+                if (pathZ(&dz, parent)) |dir_z| {
+                    const dfd = c.open(dir_z, c.O_RDONLY | c.O_DIRECTORY);
+                    if (dfd < 0) return fsReplyErr(cl, r.req, "cannot open destination parent");
+                    defer _ = c.close(dfd);
+                    if (c.fsync(dfd) != 0) return fsReplyErr(cl, r.req, "cannot fsync destination parent");
+                } else |_| return fsReplyErr(cl, r.req, "destination parent path too long");
+            } else return fsReplyErr(cl, r.req, "destination has no parent");
             cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
         } else if (std.mem.eql(u8, r.op, "delete")) {
             // Single entry only: files/links unlink, EMPTY dirs rmdir.
@@ -3648,6 +3673,7 @@ pub const Daemon = struct {
     /// Cap on RETAINED finished jobs (job_list history). Running jobs
     /// are never dropped.
     const MAX_FINISHED_JOBS = 64;
+    const MAX_TOKEN_JOBS = 1024;
 
     fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         const op: FsJob.Op = if (std.mem.eql(u8, r.op, "copy"))
@@ -3676,6 +3702,10 @@ pub const Daemon = struct {
             .panelize
         else if (std.mem.eql(u8, r.op, "live_find"))
             .live_find
+        else if (std.mem.eql(u8, r.op, "thumbnail"))
+            .thumbnail
+        else if (std.mem.eql(u8, r.op, "preview"))
+            .preview
         else
             .hash;
         if ((op == .copy or op == .extract or op == .archive_create) and
@@ -3686,7 +3716,37 @@ pub const Daemon = struct {
         if ((op == .find or op == .grep or op == .panelize or op == .live_find) and r.pattern.len == 0)
             return fsReplyErr(cl, r.req, "empty pattern");
 
-        const job = self.spawnFsJob(cl, op, self.next_fs_job_id, r.path, r.to, r.pattern, r.src_host, r.dst_host, r.@"resume", r.within_ms, r.max_matches) catch
+        // Idempotent submission closes the crash window where the job
+        // started but its reply never reached the caller. Claiming the
+        // existing job also resumes its event stream after reconnect.
+        if (r.client_token.len > 0) {
+            for (self.fs_jobs.items) |existing| {
+                if (!std.mem.eql(u8, existing.client_token, r.client_token)) continue;
+                if (existing.terminal_pending) {
+                    self.saveFsJob(existing) catch return fsReplyErr(cl, r.req, "cannot persist terminal job state");
+                    existing.terminal_pending = false;
+                }
+                existing.owner = cl;
+                cl.queueJson(.fs_reply, .{
+                    .req = r.req,
+                    .ok = true,
+                    .job = existing.id,
+                    .state = @tagName(existing.state),
+                    .done = existing.done,
+                    .total = existing.total,
+                    .message = existing.message[0..existing.message_len],
+                });
+                if (existing.finished()) {
+                    self.fsJobEmit(existing, switch (existing.state) {
+                        .done => "done",
+                        .canceled => "canceled",
+                        else => "error",
+                    });
+                }
+                return;
+            }
+        }
+        const job = self.spawnFsJob(cl, op, self.next_fs_job_id, r.path, r.to, r.pattern, r.src_host, r.dst_host, r.client_token, r.@"resume", r.within_ms, r.max_matches) catch
             return fsReplyErr(cl, r.req, "cannot start job");
         self.next_fs_job_id = job.id + 1;
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .job = job.id });
@@ -3702,6 +3762,7 @@ pub const Daemon = struct {
         pattern: []const u8,
         src_host: []const u8,
         dst_host: []const u8,
+        client_token: []const u8,
         resumable: bool,
         within_ms: u64,
         max_matches: u64,
@@ -3719,11 +3780,31 @@ pub const Daemon = struct {
             .dst_host = dst_host,
             .@"resume" = resumable,
             .job_id = id,
-            .journal_dir = self.fs_job_dir,
+            .journal_dir = if (op == .thumbnail or op == .preview) "" else self.fs_job_dir,
             .within_ms = within_ms,
             .max_matches = max_matches,
+            .client_token = client_token,
         }, .{}, &spec_aw.writer);
         try spec_aw.writer.writeByte('\n');
+
+        // Allocate every daemon-owned record before forking. The child
+        // remains blocked on the spec pipe until its durable record is
+        // installed below.
+        var job_initialized = false;
+        const src_owned = try self.allocator.dupe(u8, src);
+        errdefer if (!job_initialized) self.allocator.free(src_owned);
+        const dst_owned = try self.allocator.dupe(u8, dst);
+        errdefer if (!job_initialized) self.allocator.free(dst_owned);
+        const pattern_owned = try self.allocator.dupe(u8, pattern);
+        errdefer if (!job_initialized) self.allocator.free(pattern_owned);
+        const src_host_owned = try self.allocator.dupe(u8, src_host);
+        errdefer if (!job_initialized) self.allocator.free(src_host_owned);
+        const dst_host_owned = try self.allocator.dupe(u8, dst_host);
+        errdefer if (!job_initialized) self.allocator.free(dst_host_owned);
+        const client_token_owned = try self.allocator.dupe(u8, client_token);
+        errdefer if (!job_initialized) self.allocator.free(client_token_owned);
+        const job = try self.allocator.create(FsJob);
+        errdefer if (!job_initialized) self.allocator.destroy(job);
 
         var spec_pipe: [2]c_int = undefined;
         var out_pipe: [2]c_int = undefined;
@@ -3748,35 +3829,14 @@ pub const Daemon = struct {
             _ = c.execv(exe, @ptrCast(@constCast(&argv)));
             c._exit(127);
         }
+        _ = c.setpgid(pid, pid);
         _ = c.close(spec_pipe[0]);
         spec_pipe[0] = -1;
         _ = c.close(out_pipe[1]);
         out_pipe[1] = -1;
-        const sw = spec_aw.written();
-        var off: usize = 0;
-        while (off < sw.len) {
-            const n = c.write(spec_pipe[1], sw.ptr + off, sw.len - off);
-            if (n < 0 and std.posix.errno(n) == .INTR) continue;
-            if (n <= 0) break;
-            off += @intCast(n);
-        }
-        _ = c.close(spec_pipe[1]);
-        spec_pipe[1] = -1;
         const fl = c.fcntl(out_pipe[0], c.F_GETFL);
         _ = c.fcntl(out_pipe[0], c.F_SETFL, fl | c.O_NONBLOCK);
         _ = c.fcntl(out_pipe[0], c.F_SETFD, c.FD_CLOEXEC);
-
-        const src_owned = self.allocator.dupe(u8, src) catch return error.OutOfMemory;
-        errdefer self.allocator.free(src_owned);
-        const dst_owned = self.allocator.dupe(u8, dst) catch return error.OutOfMemory;
-        errdefer self.allocator.free(dst_owned);
-        const pattern_owned = self.allocator.dupe(u8, pattern) catch return error.OutOfMemory;
-        errdefer self.allocator.free(pattern_owned);
-        const src_host_owned = self.allocator.dupe(u8, src_host) catch return error.OutOfMemory;
-        errdefer self.allocator.free(src_host_owned);
-        const dst_host_owned = self.allocator.dupe(u8, dst_host) catch return error.OutOfMemory;
-        errdefer self.allocator.free(dst_host_owned);
-        const job = try self.allocator.create(FsJob);
         job.* = .{
             .allocator = self.allocator,
             .id = id,
@@ -3789,13 +3849,38 @@ pub const Daemon = struct {
             .pattern = pattern_owned,
             .src_host = src_host_owned,
             .dst_host = dst_host_owned,
+            .client_token = client_token_owned,
             .resumable = resumable,
+            .ephemeral = op == .thumbnail or op == .preview,
         };
-        self.fs_jobs.append(self.allocator, job) catch {
-            job.deinit(true);
-            return error.OutOfMemory;
+        job_initialized = true;
+        // The job owns the read end from here on; its deinit closes it,
+        // so the pipe errdefer must not close it a second time.
+        out_pipe[0] = -1;
+        var job_owned = true;
+        errdefer if (job_owned) job.deinit(true);
+        self.fs_jobs.append(self.allocator, job) catch return error.OutOfMemory;
+        self.saveFsJob(job) catch {
+            _ = self.fs_jobs.pop();
+            self.deleteFsJobJournal(id);
+            return error.JournalFailed;
         };
-        self.journalFsJob(job);
+        const sw = spec_aw.written();
+        var off: usize = 0;
+        while (off < sw.len) {
+            const n = c.write(spec_pipe[1], sw.ptr + off, sw.len - off);
+            if (n < 0 and std.posix.errno(n) == .INTR) continue;
+            if (n <= 0) break;
+            off += @intCast(n);
+        }
+        _ = c.close(spec_pipe[1]);
+        spec_pipe[1] = -1;
+        if (off != sw.len) {
+            _ = self.fs_jobs.pop();
+            self.deleteFsJobJournal(id);
+            return error.SpecWriteFailed;
+        }
+        job_owned = false;
         return job;
     }
 
@@ -3807,8 +3892,12 @@ pub const Daemon = struct {
     }
 
     fn journalFsJob(self: *Daemon, job: *FsJob) void {
-        if (self.fs_job_dir.len == 0) return;
-        fsjournal.save(self.fs_job_dir, .{
+        self.saveFsJob(job) catch {};
+    }
+
+    fn saveFsJob(self: *Daemon, job: *FsJob) !void {
+        if (self.fs_job_dir.len == 0 or job.ephemeral) return;
+        try fsjournal.save(self.fs_job_dir, .{
             .id = job.id,
             .op = @tagName(job.op),
             .state = @tagName(job.state),
@@ -3823,7 +3912,15 @@ pub const Daemon = struct {
             .total = job.total,
             .resumed_from = job.resumed_from,
             .message = job.message[0..job.message_len],
-        }) catch {};
+            .client_token = job.client_token,
+            .acknowledged = job.acknowledged,
+        });
+    }
+
+    fn deleteFsJobJournal(self: *Daemon, id: u64) void {
+        var path_buf: [4096:0]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{d}.json", .{ self.fs_job_dir, id }) catch return;
+        _ = c.unlink(path.ptr);
     }
 
     fn restoredFsJob(self: *Daemon, rec: fsjournal.Record, op: FsJob.Op, state: FsJob.State) ?*FsJob {
@@ -3837,6 +3934,8 @@ pub const Daemon = struct {
         errdefer self.allocator.free(src_host);
         const dst_host = self.allocator.dupe(u8, rec.dst_host) catch return null;
         errdefer self.allocator.free(dst_host);
+        const client_token = self.allocator.dupe(u8, rec.client_token) catch return null;
+        errdefer self.allocator.free(client_token);
         const job = self.allocator.create(FsJob) catch return null;
         job.* = .{
             .allocator = self.allocator,
@@ -3854,6 +3953,8 @@ pub const Daemon = struct {
             .pattern = pattern,
             .src_host = src_host,
             .dst_host = dst_host,
+            .client_token = client_token,
+            .acknowledged = rec.acknowledged,
             .resumable = rec.@"resume",
         };
         job.setMessage(rec.message);
@@ -3905,15 +4006,15 @@ pub const Daemon = struct {
                 continue;
             }
             if (op == .copy or op == .cross_copy or op == .live_find) {
-                _ = self.spawnFsJob(null, op, rec.id, rec.src, rec.dst, rec.pattern, rec.src_host, rec.dst_host, true, 0, 0) catch {
+                _ = self.spawnFsJob(null, op, rec.id, rec.src, rec.dst, rec.pattern, rec.src_host, rec.dst_host, rec.client_token, true, 0, 0) catch {
                     const job = self.restoredFsJob(rec, op, .failed) orelse continue;
                     job.setMessage("could not resume after daemon restart");
-                    self.journalFsJob(job);
+                    self.saveFsJob(job) catch { job.terminal_pending = true; };
                 };
             } else {
                 const job = self.restoredFsJob(rec, op, .failed) orelse continue;
                 job.setMessage("operation interrupted by daemon restart");
-                self.journalFsJob(job);
+                self.saveFsJob(job) catch { job.terminal_pending = true; };
             }
         }
     }
@@ -3929,16 +4030,22 @@ pub const Daemon = struct {
             const parsed = fsjournal.load(arena_state.allocator(), path) catch {
                 job.state = .failed;
                 job.setMessage("detached helper exited without a final journal record");
-                self.journalFsJob(job);
+                self.saveFsJob(job) catch {
+                    job.terminal_pending = true;
+                    continue;
+                };
+                self.fsJobEmit(job, "error");
                 continue;
             };
             defer parsed.deinit();
             const state = parsed.value.state;
             if (std.mem.eql(u8, state, "done")) {
                 job.state = .done;
+                self.fsJobEmit(job, "done");
             } else {
                 job.state = .failed;
                 job.setMessage(parsed.value.message);
+                self.fsJobEmit(job, "error");
             }
         }
     }
@@ -3955,17 +4062,29 @@ pub const Daemon = struct {
                 state: []const u8,
                 done: u64,
                 total: u64,
+                src: []const u8,
+                dst: []const u8,
+                src_host: []const u8,
+                dst_host: []const u8,
+                client_token: []const u8,
+                message: []const u8,
             };
             var rows: std.ArrayList(Row) = .empty;
             defer rows.deinit(self.allocator);
             for (self.fs_jobs.items) |j| {
-                if (!j.finished()) j.owner = cl;
+                if (j.ephemeral) continue;
                 rows.append(self.allocator, .{
                     .job = j.id,
                     .op = @tagName(j.op),
                     .state = @tagName(j.state),
                     .done = j.done,
                     .total = j.total,
+                    .src = j.src,
+                    .dst = j.dst,
+                    .src_host = j.src_host,
+                    .dst_host = j.dst_host,
+                    .client_token = j.client_token,
+                    .message = j.message[0..j.message_len],
                 }) catch break;
             }
             cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .jobs = rows.items });
@@ -3975,7 +4094,22 @@ pub const Daemon = struct {
             if (j.id == r.job) break j;
         } else return fsReplyErr(cl, r.req, "no such job");
 
-        if (std.mem.eql(u8, r.op, "job_cancel")) {
+        if (std.mem.eql(u8, r.op, "job_ack")) {
+            if (!job.finished()) return fsReplyErr(cl, r.req, "job is not finished");
+            if (job.out_fd >= 0) {
+                if (job.ack_req != 0 and job.owner != null and !job.owner.?.dead)
+                    return fsReplyErr(cl, r.req, "job acknowledgment already pending");
+                job.owner = cl;
+                job.ack_req = r.req;
+                return;
+            }
+            job.acknowledged = true;
+            self.saveFsJob(job) catch {
+                job.acknowledged = false;
+                return fsReplyErr(cl, r.req, "cannot persist job acknowledgment");
+            };
+            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+        } else if (std.mem.eql(u8, r.op, "job_cancel")) {
             if (!job.finished()) {
                 // SIGCONT first: a SIGSTOPped child never dispatches
                 // SIGKILL... actually SIGKILL cannot be blocked even
@@ -3983,7 +4117,10 @@ pub const Daemon = struct {
                 _ = c.kill(-job.pid, c.SIGCONT);
                 _ = c.kill(-job.pid, c.SIGKILL);
                 job.state = .canceled;
-                self.journalFsJob(job);
+                self.saveFsJob(job) catch {
+                    job.terminal_pending = true;
+                    return fsReplyErr(cl, r.req, "cannot persist canceled job state");
+                };
                 self.fsJobEmit(job, "canceled");
             }
             cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
@@ -4101,13 +4238,19 @@ pub const Daemon = struct {
             @memcpy(job.done_path[0..job.done_path_len], e.path[0..job.done_path_len]);
             job.done_text_len = @min(e.text.len, job.done_text.len);
             @memcpy(job.done_text[0..job.done_text_len], e.text[0..job.done_text_len]);
+            self.saveFsJob(job) catch {
+                job.terminal_pending = true;
+                return;
+            };
             self.fsJobEmit(job, "done");
-            self.journalFsJob(job);
         } else if (std.mem.eql(u8, e.ev, "error")) {
             job.state = .failed;
             job.setMessage(e.message);
+            self.saveFsJob(job) catch {
+                job.terminal_pending = true;
+                return;
+            };
             self.fsJobEmit(job, "error");
-            self.journalFsJob(job);
         } else {
             self.fsJobEmit(job, "progress");
             self.journalFsJob(job);
@@ -4122,11 +4265,33 @@ pub const Daemon = struct {
         _ = c.waitpid(job.pid, &st, 0);
         _ = c.close(job.out_fd);
         job.out_fd = -1;
+        var emit_terminal = job.terminal_pending;
         if (!job.finished()) {
             job.state = .failed;
             job.setMessage("job helper died");
-            self.fsJobEmit(job, "error");
-            self.journalFsJob(job);
+            emit_terminal = true;
+        }
+        // The helper writes its detached-recovery record just before
+        // exiting. Reassert daemon-owned progress/acknowledgment only
+        // after EOF, so the helper can never overwrite a confirmed ack.
+        if (job.ack_req != 0) job.acknowledged = true;
+        self.saveFsJob(job) catch {
+            if (job.ack_req != 0) job.acknowledged = false;
+            job.terminal_pending = emit_terminal;
+            return;
+        };
+        if (emit_terminal) {
+            job.terminal_pending = false;
+            self.fsJobEmit(job, switch (job.state) {
+                .done => "done",
+                .canceled => "canceled",
+                else => "error",
+            });
+        }
+        if (job.ack_req != 0) {
+            if (job.owner) |owner| if (!owner.dead)
+                owner.queueJson(.fs_reply, .{ .req = job.ack_req, .ok = true });
+            job.ack_req = 0;
         }
         // Retention trim happens in reap() — this runs mid-iteration
         // over fs_jobs and must not reshape the list.
@@ -7136,20 +7301,76 @@ pub const Daemon = struct {
         {
             for (self.fs_jobs.items) |j| {
                 if (j.owner) |o| {
-                    if (o.dead) j.owner = null;
+                    if (o.dead) {
+                        // pid > 0 is load-bearing: kill(-0) would signal
+                        // the daemon's OWN process group.
+                        if (j.ephemeral and !j.finished() and j.pid > 0) {
+                            _ = c.kill(-j.pid, c.SIGKILL);
+                            j.state = .canceled;
+                        }
+                        j.owner = null;
+                    }
+                }
+            }
+            for (self.fs_jobs.items) |j| {
+                if (j.out_fd >= 0 or (!j.terminal_pending and j.ack_req == 0)) continue;
+                const emit_terminal = j.terminal_pending;
+                if (j.ack_req != 0) j.acknowledged = true;
+                self.saveFsJob(j) catch {
+                    if (j.ack_req != 0) j.acknowledged = false;
+                    continue;
+                };
+                if (emit_terminal) {
+                    j.terminal_pending = false;
+                    self.fsJobEmit(j, switch (j.state) {
+                        .done => "done",
+                        .canceled => "canceled",
+                        else => "error",
+                    });
+                }
+                if (j.ack_req != 0) {
+                    if (j.owner) |owner| if (!owner.dead)
+                        owner.queueJson(.fs_reply, .{ .req = j.ack_req, .ok = true });
+                    j.ack_req = 0;
                 }
             }
             var finished_count: usize = 0;
+            var token_count: usize = 0;
             for (self.fs_jobs.items) |j| {
-                if (j.finished()) finished_count += 1;
+                if (!j.ephemeral and j.finished() and !j.terminal_pending) {
+                    if (j.client_token.len > 0) {
+                        if (j.acknowledged) token_count += 1;
+                    } else finished_count += 1;
+                }
             }
             var i: usize = 0;
+            while (i < self.fs_jobs.items.len) {
+                const j = self.fs_jobs.items[i];
+                if (j.ephemeral and j.finished() and j.out_fd < 0) {
+                    _ = self.fs_jobs.orderedRemove(i);
+                    j.deinit(false);
+                } else i += 1;
+            }
+            i = 0;
             while (finished_count > MAX_FINISHED_JOBS and i < self.fs_jobs.items.len) {
                 const j = self.fs_jobs.items[i];
-                if (j.finished()) {
+                if (j.finished() and !j.terminal_pending and j.client_token.len == 0) {
                     _ = self.fs_jobs.orderedRemove(i);
                     j.deinit(false);
                     finished_count -= 1;
+                } else i += 1;
+            }
+            i = 0;
+            while (token_count > MAX_TOKEN_JOBS and i < self.fs_jobs.items.len) {
+                const j = self.fs_jobs.items[i];
+                if (j.finished() and j.client_token.len > 0 and j.acknowledged) {
+                    var record_buf: [4096]u8 = undefined;
+                    if (std.fmt.bufPrintZ(&record_buf, "{s}/{d}.json", .{ self.fs_job_dir, j.id })) |record| {
+                        _ = c.unlink(record.ptr);
+                    } else |_| {}
+                    _ = self.fs_jobs.orderedRemove(i);
+                    j.deinit(false);
+                    token_count -= 1;
                 } else i += 1;
             }
         }
