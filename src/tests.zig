@@ -76,6 +76,7 @@ comptime {
     _ = @import("ipc/fstransfer.zig");
     _ = @import("filebrowser/model.zig");
     _ = @import("filebrowser/cache.zig");
+    _ = @import("filebrowser/emblems.zig");
     _ = @import("filebrowser/places.zig");
     _ = @import("filebrowser/thumbs.zig");
     _ = @import("filebrowser/transfers.zig");

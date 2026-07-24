@@ -28,6 +28,7 @@ const fsserve = @import("../mux/fsserve.zig");
 const fstransfer = @import("../ipc/fstransfer.zig");
 const browser_model = @import("../filebrowser/model.zig");
 const places_mod = @import("../filebrowser/places.zig");
+const emblems_mod = @import("../filebrowser/emblems.zig");
 const thumbs_mod = @import("../filebrowser/thumbs.zig");
 const fsjob = @import("../mux/fsjob.zig");
 const mounts = @import("../util/mounts.zig");
@@ -51,12 +52,16 @@ const Entry = struct {
     target: ?[]u8,
     tdir: bool,
     tags: []u8 = &.{},
+    /// Values for the tab's attribute columns, in column order.
+    attrs: [][]u8 = &.{},
 
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.kind);
         if (self.target) |t| allocator.free(t);
         if (self.tags.len > 0) allocator.free(self.tags);
+        for (self.attrs) |v| allocator.free(v);
+        if (self.attrs.len > 0) allocator.free(self.attrs);
     }
 };
 
@@ -76,6 +81,7 @@ const WireEntry = struct {
     target: ?[]const u8 = null,
     tdir: bool = false,
     tags: []const u8 = "",
+    attrs: []const []const u8 = &.{},
 };
 
 const WireReply = struct {
@@ -289,6 +295,8 @@ const Dir = struct {
     /// Sort parameters (kept on the Dir so delta-driven re-sorts in
     /// onDelta need no tab lookup); the owning tab pushes changes.
     sort_key: browser_model.SortKey = .name,
+    /// Attribute-column index this dir is sorted by, if any.
+    attr_sort: ?usize = null,
     descending: bool = false,
     dirs_first: bool = true,
 
@@ -317,6 +325,20 @@ const Dir = struct {
         var tgt: ?[]u8 = null;
         if (we.target) |t| tgt = a.dupe(u8, t) catch null;
         const tags: []u8 = if (we.tags.len > 0) (a.dupe(u8, we.tags) catch @constCast("")) else @constCast("");
+        var attrs: [][]u8 = &.{};
+        if (we.attrs.len > 0) attrs = blk: {
+            const values = a.alloc([]u8, we.attrs.len) catch break :blk &.{};
+            for (we.attrs, 0..) |v, i| {
+                values[i] = a.dupe(u8, v) catch {
+                    // Partial ownership would make deinit free memory
+                    // it does not own; drop the whole set instead.
+                    for (values[0..i]) |owned| a.free(owned);
+                    a.free(values);
+                    break :blk &.{};
+                };
+            }
+            break :blk values;
+        };
         return .{
             .name = name,
             .kind = kind,
@@ -332,6 +354,7 @@ const Dir = struct {
             .target = tgt,
             .tdir = we.tdir,
             .tags = tags,
+            .attrs = attrs,
         };
     }
 
@@ -362,11 +385,12 @@ const Dir = struct {
     }
 
     fn sort(self: *Dir) void {
-        const Ctx = struct { key: browser_model.SortKey, desc: bool, dirs_first: bool };
+        const Ctx = struct { key: browser_model.SortKey, desc: bool, dirs_first: bool, attr: ?usize };
         std.mem.sort(Entry, self.entries.items, Ctx{
             .key = self.sort_key,
             .desc = self.descending,
             .dirs_first = self.dirs_first,
+            .attr = self.attr_sort,
         }, struct {
             fn lt(ctx: Ctx, a_in: Entry, b_in: Entry) bool {
                 // dirs-first is decided BEFORE the descending swap so
@@ -374,6 +398,15 @@ const Dir = struct {
                 if (ctx.dirs_first and a_in.tdir != b_in.tdir) return a_in.tdir;
                 const a = if (ctx.desc) b_in else a_in;
                 const b = if (ctx.desc) a_in else b_in;
+                if (ctx.attr) |i| {
+                    const av = if (i < a.attrs.len) a.attrs[i] else "";
+                    const bv = if (i < b.attrs.len) b.attrs[i] else "";
+                    // Entries WITHOUT the attribute sort last either
+                    // way: an empty value is absence, not "smallest".
+                    if ((av.len == 0) != (bv.len == 0)) return bv.len == 0;
+                    if (!std.mem.eql(u8, av, bv)) return std.ascii.lessThanIgnoreCase(av, bv);
+                    return std.ascii.lessThanIgnoreCase(a.name, b.name);
+                }
                 return switch (ctx.key) {
                     .size => if (a.size != b.size) a.size < b.size else std.ascii.lessThanIgnoreCase(a.name, b.name),
                     .mtime => if (a.mtime_ms != b.mtime_ms) a.mtime_ms < b.mtime_ms else std.ascii.lessThanIgnoreCase(a.name, b.name),
@@ -421,6 +454,12 @@ const BTab = struct {
     /// Optional details columns, rendered in Column declaration order.
     columns: std.EnumSet(browser_model.Column) =
         std.EnumSet(browser_model.Column).initMany(&browser_model.default_columns),
+    /// Extended-attribute columns (full user.* names, owned). Their
+    /// values ride the listing itself, so a remote attribute column
+    /// costs no extra round trip per row.
+    attr_columns: std.ArrayList([]u8) = .empty,
+    /// Index into attr_columns the view is sorted by, if any.
+    attr_sort: ?usize = null,
     /// The scrolled window whose child swaps listbox <-> flowbox.
     scroller: *c.GtkWidget = undefined,
     /// Icon-grid view (lazily created).
@@ -456,12 +495,14 @@ const BTab = struct {
         const dirs = [_]?*Dir{self.root};
         for (dirs) |d| {
             d.?.sort_key = self.sort_key;
+            d.?.attr_sort = self.attr_sort;
             d.?.descending = self.descending;
             d.?.dirs_first = self.dirs_first;
             d.?.sort();
         }
         for (self.subdirs.items) |d| {
             d.sort_key = self.sort_key;
+            d.attr_sort = self.attr_sort;
             d.descending = self.descending;
             d.dirs_first = self.dirs_first;
             d.sort();
@@ -519,6 +560,8 @@ const BTab = struct {
         self.fwd.deinit(a);
         for (self.selected.items) |p| a.free(p);
         self.selected.deinit(a);
+        for (self.attr_columns.items) |name| a.free(name);
+        self.attr_columns.deinit(a);
         if (self.filter.len > 0) a.free(self.filter);
         if (self.virtual_spec.len > 0) a.free(self.virtual_spec);
         a.destroy(self);
@@ -1499,9 +1542,14 @@ pub const BrowserView = struct {
     /// Run a shell command as an app session on a host (declarative
     /// .action files with RunsOnHost).
     on_host_exec: ?HostAction = null,
-    /// In-flight recursive folder-size probe (one at a time). The
-    /// label is g_object_ref'd, so a closed dialog cannot dangle.
-    size_probe: ?SizeProbe = null,
+    /// In-flight attr_list for an open Properties dialog.
+    attr_request: ?AttrRequest = null,
+    /// The open column picker, so editing a column can close it.
+    column_picker: ?*c.GtkWidget = null,
+    /// Emblem rules (name globs / attribute predicates -> badge icon).
+    emblems: emblems_mod.Rules = undefined,
+    /// Label probes in flight (folder size, checksum, media info).
+    probes: std.ArrayList(LabelProbe) = .empty,
     /// Resolve the other browser face in this sketerm tab (the
     /// orthodox dual-pane destination); null when there is only one.
     on_peer: ?*const fn (ctx: *anyopaque, pane: *Pane) ?*BrowserView = null,
@@ -1523,6 +1571,7 @@ pub const BrowserView = struct {
         if (fromPane(pane)) |existing| return existing;
         const self = try allocator.create(BrowserView);
         self.* = .{ .allocator = allocator, .pane = pane };
+        self.emblems = emblems_mod.load(allocator);
         self.thumbs = std.StringHashMap(*c.GdkTexture).init(allocator);
         self.thumb_failed = std.StringHashMap(void).init(allocator);
         self.git_map = std.StringHashMap(u8).init(allocator);
@@ -1629,6 +1678,7 @@ pub const BrowserView = struct {
                 .selected = selected,
                 .view = tab.view_mode,
                 .columns = try columnsOf(arena, tab),
+                .attr_columns = try attrColumnsOf(arena, tab),
                 .sort = tab.sort_key,
                 .descending = tab.descending,
                 .dirs_first = tab.dirs_first,
@@ -1652,6 +1702,12 @@ pub const BrowserView = struct {
         return out.items;
     }
 
+    fn attrColumnsOf(arena: std.mem.Allocator, tab: *BTab) ![]const []const u8 {
+        const out = try arena.alloc([]const u8, tab.attr_columns.items.len);
+        for (tab.attr_columns.items, 0..) |name, i| out[i] = try arena.dupe(u8, name);
+        return out;
+    }
+
     fn appendHistoryRef(self: *BrowserView, list: *std.ArrayList([]u8), ref: browser_model.FileRef) void {
         var buf: [4300]u8 = undefined;
         const spec = ref.format(&buf) catch return;
@@ -1672,6 +1728,12 @@ pub const BrowserView = struct {
         if (state.columns.len > 0) {
             tab.columns = .initEmpty();
             for (state.columns) |col| tab.columns.insert(col);
+        }
+        for (state.attr_columns) |name| {
+            if (!std.mem.startsWith(u8, name, "user.")) continue;
+            if (tab.attr_columns.items.len >= MAX_ATTR_COLUMNS) break;
+            const owned = self.allocator.dupe(u8, name) catch continue;
+            tab.attr_columns.append(self.allocator, owned) catch self.allocator.free(owned);
         }
         tab.sort_key = state.sort;
         tab.descending = state.descending;
@@ -1767,7 +1829,10 @@ pub const BrowserView = struct {
         self.closePathCompletion();
         if (self.completion_source != 0) _ = c.g_source_remove(self.completion_source);
         if (self.completion_request) |request| request.destroy(self.allocator);
-        self.endSizeProbe();
+        self.emblems.deinit();
+        self.endProbesFor(null, "");
+        self.probes.deinit(self.allocator);
+        self.endAttrRequest();
         if (self.preview_read) |pr| pr.destroy(self.allocator);
         if (self.restore_read) |rr| rr.destroy(self.allocator);
         if (self.dup) |d| d.destroy(self.allocator);
@@ -1987,11 +2052,9 @@ pub const BrowserView = struct {
         if (self.preview_read) |pr| {
             if (pr.hc == hc) self.abandonPreviewRead();
         }
-        if (self.size_probe) |probe| {
-            if (probe.hc == hc) {
-                c.gtk_label_set_text(@ptrCast(probe.label), "size unavailable");
-                self.endSizeProbe();
-            }
+        self.endProbesFor(hc, "host connection lost");
+        if (self.attr_request) |request| {
+            if (request.hc == hc) self.endAttrRequest();
         }
         if (self.remote_thumb) |rt| {
             if (rt.hc == hc) {
@@ -2035,19 +2098,52 @@ pub const BrowserView = struct {
         }) catch {};
     }
 
+    /// The tab's attribute columns as the wire's comma-separated
+    /// request. Empty when the tab shows none, so ordinary listings
+    /// pay nothing for the feature.
+    fn attrSpec(self: *BrowserView, tab: *BTab, buf: []u8) []const u8 {
+        var emblem_names: [MAX_ATTR_COLUMNS][]const u8 = undefined;
+        const wanted = self.emblems.attrNames(&emblem_names);
+        if (tab.attr_columns.items.len == 0 and wanted.len == 0) return "";
+        var w = std.Io.Writer.fixed(buf);
+        var n: usize = 0;
+        for (tab.attr_columns.items) |name| {
+            if (n > 0) w.writeByte(',') catch break;
+            w.writeAll(name) catch break;
+            n += 1;
+        }
+        // Emblem attributes ride the same listing; the column values
+        // stay first so row rendering can index by column position.
+        for (wanted) |name| {
+            var dup = false;
+            for (tab.attr_columns.items) |col| {
+                if (std.mem.eql(u8, col, name)) dup = true;
+            }
+            if (dup or n >= MAX_ATTR_COLUMNS) continue;
+            if (n > 0) w.writeByte(',') catch break;
+            w.writeAll(name) catch break;
+            n += 1;
+        }
+        return w.buffered();
+    }
+
     fn sendListingOp(self: *BrowserView, p: *Pending) void {
         p.sent = true;
+        var spec_buf: [1024]u8 = undefined;
+        const attrs = self.attrSpec(p.tab, &spec_buf);
         switch (p.op) {
             .open_view => self.sendOp(p.hc, .{
                 .req = p.req,
                 .op = "open_view",
                 .path = p.dir.path,
                 .view = p.dir.view_id,
+                .attrs = attrs,
             }),
             .list => self.sendOp(p.hc, .{
                 .req = p.req,
                 .op = "list",
                 .path = p.dir.path,
+                .attrs = attrs,
             }),
         }
     }
@@ -2105,7 +2201,8 @@ pub const BrowserView = struct {
             if (self.feedPreview(hc, f.ftype, f.payload)) continue;
             if (self.feedRestore(hc, f.ftype, f.payload)) continue;
             if (self.feedRemoteThumb(hc, f.ftype, f.payload)) continue;
-            if (self.feedSizeProbe(hc, f.ftype, f.payload)) continue;
+            if (self.feedProbes(hc, f.ftype, f.payload)) continue;
+            if (self.feedAttrRequest(hc, f.ftype, f.payload)) continue;
             switch (f.ftype) {
                 .fs_reply => {
                     if (self.onReply(hc, f.payload)) dirty = true;
@@ -3244,6 +3341,110 @@ pub const BrowserView = struct {
         c.gtk_box_append(@ptrCast(tab.header_box), btn);
     }
 
+    /// Width of an attribute column; values are free-form text, so
+    /// they get one generous ellipsized column each.
+    const ATTR_COLUMN_WIDTH = 160;
+    /// Cap on attribute columns: each one costs an lgetxattr per entry
+    /// per listing, and the daemon refuses more than this anyway.
+    const MAX_ATTR_COLUMNS = 8;
+
+    fn attrHeaderButton(self: *BrowserView, tab: *BTab, label: [*:0]const u8, index: usize) void {
+        const btn = c.gtk_button_new_with_label(label);
+        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+        c.gtk_widget_set_size_request(btn, ATTR_COLUMN_WIDTH, -1);
+        const ctx = self.allocator.create(AttrColumnCtx) catch return;
+        ctx.* = .{ .allocator = self.allocator, .tab = tab, .index = index, .entry = null };
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onAttrHeaderClicked), @ptrCast(ctx), @ptrCast(&AttrColumnCtx.free), c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(tab.header_box), btn);
+    }
+
+    /// Heap context for an attribute-column header, remove button, or
+    /// the add-column entry.
+    const AttrColumnCtx = struct {
+        allocator: std.mem.Allocator,
+        tab: *BTab,
+        index: usize,
+        entry: ?*c.GtkWidget,
+
+        fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+            const ctx: *AttrColumnCtx = @ptrCast(@alignCast(user.?));
+            ctx.allocator.destroy(ctx);
+        }
+    };
+
+    fn onAttrHeaderClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *AttrColumnCtx = @ptrCast(@alignCast(user.?));
+        const tab = ctx.tab;
+        if (ctx.index >= tab.attr_columns.items.len) return;
+        if (tab.attr_sort != null and tab.attr_sort.? == ctx.index) {
+            tab.descending = !tab.descending;
+        } else {
+            tab.attr_sort = ctx.index;
+            tab.descending = false;
+        }
+        // Attribute order is its own key; the fixed-column key stops
+        // claiming the header marker.
+        tab.sort_key = .name;
+        tab.view.updateSortHeader(tab);
+        tab.view.renderTab(tab);
+    }
+
+    fn onAttrColumnRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *AttrColumnCtx = @ptrCast(@alignCast(user.?));
+        const tab = ctx.tab;
+        if (ctx.index >= tab.attr_columns.items.len) return;
+        const self = tab.view;
+        self.allocator.free(tab.attr_columns.orderedRemove(ctx.index));
+        tab.attr_sort = null;
+        self.closeColumnPicker();
+        self.reopenTabListing(tab);
+    }
+
+    fn onAttrColumnAdd(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *AttrColumnCtx = @ptrCast(@alignCast(user.?));
+        const tab = ctx.tab;
+        const self = tab.view;
+        const raw = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
+        const name = std.mem.trim(u8, raw, " ");
+        if (name.len == 0) return;
+        if (!std.mem.startsWith(u8, name, "user."))
+            return self.setStatus("attribute names must start with user.");
+        if (tab.attr_columns.items.len >= MAX_ATTR_COLUMNS)
+            return self.setStatusFmt("at most {d} attribute columns", .{MAX_ATTR_COLUMNS});
+        for (tab.attr_columns.items) |existing| {
+            if (std.mem.eql(u8, existing, name)) return self.setStatus("that column is already shown");
+        }
+        const owned = self.allocator.dupe(u8, name) catch return;
+        tab.attr_columns.append(self.allocator, owned) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        self.closeColumnPicker();
+        self.reopenTabListing(tab);
+    }
+
+    fn closeColumnPicker(self: *BrowserView) void {
+        const pop = self.column_picker orelse return;
+        self.column_picker = null;
+        c.gtk_popover_popdown(@ptrCast(pop));
+    }
+
+    /// Re-SUBSCRIBE the tab's directories so both the listing and the
+    /// pushed deltas carry the new attribute set. A plain re-list
+    /// would leave the daemon-side view on the old attributes, and the
+    /// next delta would blank the new column.
+    fn reopenTabListing(self: *BrowserView, tab: *BTab) void {
+        self.cancelPendingDir(tab.root);
+        self.closeViewOf(tab.hc, tab.root);
+        self.openDir(tab, tab.root);
+        for (tab.subdirs.items) |d| {
+            self.cancelPendingDir(d);
+            self.closeViewOf(tab.hc, d);
+            self.openDir(tab, d);
+        }
+        self.updateSortHeader(tab);
+    }
+
     fn onHeaderClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx: *HeaderCtx = @ptrCast(@alignCast(user.?));
         sortClicked(ctx.tab, if (ctx.column) |col| col.sortKey() else .name);
@@ -3265,6 +3466,14 @@ pub const BrowserView = struct {
                 const marked = tab.sort_key == col.sortKey() and col != .target;
                 const txt: [*:0]const u8 = if (std.fmt.bufPrintZ(&cb, "{s}{s}", .{ col.title(), if (marked) mark else "" })) |v| v.ptr else |_| col.title();
                 self.headerButton(tab, txt, col, col.width(), false);
+            }
+            for (tab.attr_columns.items, 0..) |name, i| {
+                var cb: [64:0]u8 = undefined;
+                const marked = tab.attr_sort != null and tab.attr_sort.? == i;
+                const txt: [*:0]const u8 = if (std.fmt.bufPrintZ(&cb, "{s}{s}", .{
+                    attrLabel(name), if (marked) mark else "",
+                })) |v| v.ptr else |_| "attr";
+                self.attrHeaderButton(tab, txt, i);
             }
             const picker = c.gtk_button_new_from_icon_name("view-more-symbolic");
             c.gtk_button_set_has_frame(@ptrCast(picker), 0);
@@ -3293,6 +3502,32 @@ pub const BrowserView = struct {
             _ = c.g_signal_connect_data(check, "toggled", @ptrCast(&onColumnToggled), @ptrCast(cctx), @ptrCast(&HeaderCtx.free), c.G_CONNECT_DEFAULT);
             c.gtk_box_append(@ptrCast(box), check);
         }
+        c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+        const attr_head = c.gtk_label_new("Attribute columns");
+        c.gtk_label_set_xalign(@ptrCast(attr_head), 0);
+        c.gtk_widget_add_css_class(attr_head, "dim-label");
+        c.gtk_box_append(@ptrCast(box), attr_head);
+        for (ctx.tab.attr_columns.items, 0..) |name, i| {
+            const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+            var nz: [256:0]u8 = undefined;
+            const lbl = c.gtk_label_new(copyZ(@ptrCast(&nz), name));
+            c.gtk_label_set_xalign(@ptrCast(lbl), 0);
+            c.gtk_widget_set_hexpand(lbl, 1);
+            c.gtk_box_append(@ptrCast(row), lbl);
+            const remove = c.gtk_button_new_from_icon_name("list-remove-symbolic");
+            const rctx = self.allocator.create(AttrColumnCtx) catch continue;
+            rctx.* = .{ .allocator = self.allocator, .tab = ctx.tab, .index = i, .entry = null };
+            _ = c.g_signal_connect_data(remove, "clicked", @ptrCast(&onAttrColumnRemove), @ptrCast(rctx), @ptrCast(&AttrColumnCtx.free), c.G_CONNECT_DEFAULT);
+            c.gtk_box_append(@ptrCast(row), remove);
+            c.gtk_box_append(@ptrCast(box), row);
+        }
+        const add = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(add), "user.name — Enter to add");
+        const actx = self.allocator.create(AttrColumnCtx) catch return;
+        actx.* = .{ .allocator = self.allocator, .tab = ctx.tab, .index = 0, .entry = add };
+        _ = c.g_signal_connect_data(add, "activate", @ptrCast(&onAttrColumnAdd), @ptrCast(actx), @ptrCast(&AttrColumnCtx.free), c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(box), add);
+
         c.gtk_popover_set_child(@ptrCast(popover), box);
         // Parent to the PAGE, not the button: every toggle rebuilds
         // the header, which would destroy a button-parented popover
@@ -3309,6 +3544,7 @@ pub const BrowserView = struct {
         }
         c.gtk_widget_set_parent(popover, ctx.tab.page);
         connectPopoverAutoUnparent(popover);
+        self.column_picker = popover;
         c.gtk_popover_popup(@ptrCast(popover));
     }
 
@@ -3705,6 +3941,14 @@ pub const BrowserView = struct {
         }
         c.gtk_box_append(@ptrCast(row_box), icon);
 
+        if (self.emblemFor(tab, e)) |emblem| {
+            var iz: [128:0]u8 = undefined;
+            const badge = c.gtk_image_new_from_icon_name(copyZ(@ptrCast(&iz), emblem));
+            c.gtk_image_set_pixel_size(@ptrCast(badge), 12);
+            c.gtk_widget_set_valign(badge, c.GTK_ALIGN_END);
+            c.gtk_box_append(@ptrCast(row_box), badge);
+        }
+
         var name_buf: [512:0]u8 = undefined;
         const nn = @min(e.name.len, name_buf.len - 1);
         @memcpy(name_buf[0..nn], e.name[0..nn]);
@@ -3762,6 +4006,15 @@ pub const BrowserView = struct {
                 if (!tab.columns.contains(col)) continue;
                 self.appendColumnCell(row_box, e, col);
             }
+            for (tab.attr_columns.items, 0..) |_, i| {
+                var vz: [256:0]u8 = undefined;
+                const label = c.gtk_label_new(copyZ(@ptrCast(&vz), if (i < e.attrs.len) e.attrs[i] else ""));
+                c.gtk_widget_add_css_class(label, "dim-label");
+                c.gtk_label_set_xalign(@ptrCast(label), 0);
+                c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);
+                c.gtk_widget_set_size_request(label, ATTR_COLUMN_WIDTH, -1);
+                c.gtk_box_append(@ptrCast(row_box), label);
+            }
         }
 
         const row = c.gtk_list_box_row_new();
@@ -3799,6 +4052,29 @@ pub const BrowserView = struct {
         }
 
         c.gtk_list_box_append(tab.listbox, row);
+    }
+
+    /// Resolve an entry's badge icon from the emblem rules. Attribute
+    /// values come from the listing itself: the rules' attributes were
+    /// requested with it, so this costs no round trip.
+    fn emblemFor(self: *BrowserView, tab: *BTab, e: Entry) ?[]const u8 {
+        if (self.emblems.list.len == 0) return null;
+        var spec_buf: [1024]u8 = undefined;
+        const spec = self.attrSpec(tab, &spec_buf);
+        const Lookup = struct {
+            spec: []const u8,
+            entry: Entry,
+            fn get(self2: @This(), name: []const u8) ?[]const u8 {
+                var i: usize = 0;
+                var it = std.mem.splitScalar(u8, self2.spec, ',');
+                while (it.next()) |requested| : (i += 1) {
+                    if (!std.mem.eql(u8, requested, name)) continue;
+                    return if (i < self2.entry.attrs.len) self2.entry.attrs[i] else null;
+                }
+                return null;
+            }
+        };
+        return self.emblems.iconFor(e.name, Lookup{ .spec = spec, .entry = e }, Lookup.get);
     }
 
     /// One details-view column cell. Widths match the header buttons
@@ -4536,7 +4812,6 @@ pub const BrowserView = struct {
         const self = mctx.view;
         const orig = mctx.path orelse return menuDone(mctx);
         const tab = mctx.tab;
-        const is_local = tab.hc.host == null;
         // Copy the path out and close the menu popover FIRST — its
         // popdown must not race the new popover's grab.
         var pbuf: [4096]u8 = undefined;
@@ -4544,7 +4819,13 @@ pub const BrowserView = struct {
         @memcpy(pbuf[0..orig.len], orig);
         const path = pbuf[0..orig.len];
         menuDone(mctx);
+        self.openWithDialog(tab, path);
+    }
 
+    /// The application chooser: local apps for the guessed type plus,
+    /// on a remote tab, the apps installed on the file's host.
+    fn openWithDialog(self: *BrowserView, tab: *BTab, path: []const u8) void {
+        const is_local = tab.hc.host == null;
         const popover = c.gtk_popover_new();
         const ctx = self.allocator.create(OpenWithCtx) catch return;
         const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
@@ -5589,22 +5870,51 @@ pub const BrowserView = struct {
 
     /// Recursive size probe: a daemon job so the walk happens on the
     /// host that owns the tree.
-    const SizeProbe = struct {
+    /// One label fed by a daemon job: recursive size, checksum, or
+    /// media metadata. The label is g_object_ref'd, so a dialog closed
+    /// mid-flight cannot dangle.
+    const LabelProbe = struct {
+        kind: enum { size, hash, media },
         req: u32,
         job: u64 = 0,
         hc: *HostConn,
         label: *c.GtkWidget,
     };
 
-    fn endSizeProbe(self: *BrowserView) void {
-        const probe = self.size_probe orelse return;
+    fn endProbe(self: *BrowserView, i: usize) void {
+        const probe = self.probes.items[i];
         c.g_object_unref(@ptrCast(probe.label));
-        self.size_probe = null;
+        _ = self.probes.orderedRemove(i);
     }
 
-    fn feedSizeProbe(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
-        const probe = self.size_probe orelse return false;
-        if (probe.hc != hc) return false;
+    fn endProbesFor(self: *BrowserView, hc: ?*HostConn, message: [*:0]const u8) void {
+        var i: usize = 0;
+        while (i < self.probes.items.len) {
+            const probe = self.probes.items[i];
+            if (hc == null or probe.hc == hc.?) {
+                c.gtk_label_set_text(@ptrCast(probe.label), message);
+                self.endProbe(i);
+            } else i += 1;
+        }
+    }
+
+    fn startProbe(self: *BrowserView, kind: @FieldType(LabelProbe, "kind"), hc: *HostConn, label: *c.GtkWidget, op: []const u8, path: []const u8) void {
+        if (hc.state != .ready) {
+            self.setStatusFmt("not connected to {s}", .{hc.label()});
+            return;
+        }
+        const req = self.nextReq();
+        _ = c.g_object_ref(@ptrCast(label));
+        self.probes.append(self.allocator, .{ .kind = kind, .req = req, .hc = hc, .label = label }) catch {
+            c.g_object_unref(@ptrCast(label));
+            return;
+        };
+        c.gtk_label_set_text(@ptrCast(label), "calculating…");
+        self.sendOp(hc, .{ .req = req, .op = op, .path = path });
+    }
+
+    fn feedProbes(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
+        if (self.probes.items.len == 0) return false;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         switch (ftype) {
@@ -5614,31 +5924,42 @@ pub const BrowserView = struct {
                     ok: bool = false,
                     job: u64 = 0,
                 }, arena.allocator(), payload, .{ .ignore_unknown_fields = true }) catch return false;
-                if (rep.req != probe.req) return false;
-                if (!rep.ok or rep.job == 0) {
-                    c.gtk_label_set_text(@ptrCast(probe.label), "size unavailable");
-                    self.endSizeProbe();
-                } else self.size_probe.?.job = rep.job;
-                return true;
+                for (self.probes.items, 0..) |*probe, i| {
+                    if (probe.hc != hc or probe.req != rep.req) continue;
+                    if (!rep.ok or rep.job == 0) {
+                        c.gtk_label_set_text(@ptrCast(probe.label), "unavailable");
+                        self.endProbe(i);
+                    } else probe.job = rep.job;
+                    return true;
+                }
+                return false;
             },
             .fs_job => {
-                if (probe.job == 0) return false;
                 const ev = std.json.parseFromSliceLeaky(WireJobEv, arena.allocator(), payload, .{ .ignore_unknown_fields = true }) catch return false;
-                if (ev.job != probe.job) return false;
-                var buf: [96:0]u8 = undefined;
-                var human: [48:0]u8 = undefined;
-                const done = std.mem.eql(u8, ev.ev, "done");
-                if (done or std.mem.eql(u8, ev.ev, "progress")) {
-                    const txt = std.fmt.bufPrintZ(&buf, "{s} ({d} bytes) in {d} items{s}", .{
-                        fmtSize(&human, ev.done), ev.done, ev.total, if (done) "" else " …",
-                    }) catch "";
-                    c.gtk_label_set_text(@ptrCast(probe.label), txt.ptr);
-                    if (done) self.endSizeProbe();
-                } else if (ev.terminalEv()) {
-                    c.gtk_label_set_text(@ptrCast(probe.label), "size unavailable");
-                    self.endSizeProbe();
+                for (self.probes.items, 0..) |probe, i| {
+                    if (probe.hc != hc or probe.job == 0 or probe.job != ev.job) continue;
+                    const done = std.mem.eql(u8, ev.ev, "done");
+                    if (!done and !std.mem.eql(u8, ev.ev, "progress")) {
+                        if (ev.terminalEv()) {
+                            c.gtk_label_set_text(@ptrCast(probe.label), "unavailable");
+                            self.endProbe(i);
+                        }
+                        return true;
+                    }
+                    var buf: [1024:0]u8 = undefined;
+                    var human: [48:0]u8 = undefined;
+                    const text: [*:0]const u8 = switch (probe.kind) {
+                        .size => if (std.fmt.bufPrintZ(&buf, "{s} ({d} bytes) in {d} items{s}", .{
+                            fmtSize(&human, ev.done), ev.done, ev.total, if (done) "" else " …",
+                        })) |v| v.ptr else |_| "",
+                        .hash => if (!done) "hashing…" else copyZ(@ptrCast(&buf), ev.hash),
+                        .media => if (!done) "reading…" else copyZ(@ptrCast(&buf), if (ev.text.len > 0) ev.text else "(no metadata)"),
+                    };
+                    c.gtk_label_set_text(@ptrCast(probe.label), text);
+                    if (done) self.endProbe(i);
+                    return true;
                 }
-                return true;
+                return false;
             },
             else => return false,
         }
@@ -5660,6 +5981,11 @@ pub const BrowserView = struct {
         gid_entry: *c.GtkWidget = undefined,
         recursive: ?*c.GtkWidget = null,
         size_label: *c.GtkWidget = undefined,
+        hash_label: *c.GtkWidget = undefined,
+        media_label: ?*c.GtkWidget = null,
+        attr_box: *c.GtkWidget = undefined,
+        attr_name_entry: *c.GtkWidget = undefined,
+        attr_value_entry: *c.GtkWidget = undefined,
         syncing: bool = false,
 
         fn free(user: ?*anyopaque) callconv(.c) void {
@@ -5797,7 +6123,90 @@ pub const BrowserView = struct {
             _ = c.g_signal_connect_data(calc, "clicked", @ptrCast(&onPropsCalcSize), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
             c.gtk_box_append(@ptrCast(row), calc);
             c.gtk_box_append(@ptrCast(box), row);
+        } else {
+            // Checksum on demand: hashing runs on the file's host, so
+            // a remote checksum never streams the file to us.
+            const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+            const lbl = c.gtk_label_new("SHA-256: not calculated");
+            c.gtk_label_set_xalign(@ptrCast(lbl), 0);
+            c.gtk_label_set_selectable(@ptrCast(lbl), 1);
+            c.gtk_label_set_ellipsize(@ptrCast(lbl), c.PANGO_ELLIPSIZE_MIDDLE);
+            c.gtk_widget_set_hexpand(lbl, 1);
+            ctx.hash_label = lbl;
+            c.gtk_box_append(@ptrCast(row), lbl);
+            const calc = c.gtk_button_new_with_label("Checksum");
+            _ = c.g_signal_connect_data(calc, "clicked", @ptrCast(&onPropsChecksum), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+            c.gtk_box_append(@ptrCast(row), calc);
+            c.gtk_box_append(@ptrCast(box), row);
+
+            // Default application, changeable from here.
+            const app_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+            var app_buf: [256:0]u8 = undefined;
+            const app_name: [*:0]const u8 = blk: {
+                const ct = content_type orelse break :blk "Opens with: (unknown type)";
+                const info = c.g_app_info_get_default_for_type(ct, 0) orelse break :blk "Opens with: (no default)";
+                defer c.g_object_unref(@as(?*anyopaque, @ptrCast(info)));
+                const name = c.g_app_info_get_display_name(info) orelse break :blk "Opens with: (no default)";
+                if (std.fmt.bufPrintZ(&app_buf, "Opens with: {s}", .{std.mem.span(@as([*:0]const u8, @ptrCast(name)))})) |v| {
+                    break :blk v.ptr;
+                } else |_| break :blk "Opens with:";
+            };
+            const app_label = c.gtk_label_new(app_name);
+            c.gtk_label_set_xalign(@ptrCast(app_label), 0);
+            c.gtk_widget_set_hexpand(app_label, 1);
+            c.gtk_box_append(@ptrCast(app_row), app_label);
+            const change = c.gtk_button_new_with_label("Change…");
+            _ = c.g_signal_connect_data(change, "clicked", @ptrCast(&onPropsOpenWith), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+            c.gtk_box_append(@ptrCast(app_row), change);
+            c.gtk_box_append(@ptrCast(box), app_row);
+
+            if (isPreviewMediaName(path) and !isImageName(path)) {
+                const media_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+                const lbl2 = c.gtk_label_new("Media info: not read");
+                c.gtk_label_set_xalign(@ptrCast(lbl2), 0);
+                c.gtk_label_set_selectable(@ptrCast(lbl2), 1);
+                c.gtk_widget_set_hexpand(lbl2, 1);
+                ctx.media_label = lbl2;
+                c.gtk_box_append(@ptrCast(media_row), lbl2);
+                const read = c.gtk_button_new_with_label("Read");
+                _ = c.g_signal_connect_data(read, "clicked", @ptrCast(&onPropsMediaInfo), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+                c.gtk_box_append(@ptrCast(media_row), read);
+                c.gtk_box_append(@ptrCast(box), media_row);
+            }
         }
+
+        c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+
+        // Extended attributes: metadata that travels WITH the file,
+        // including the freedesktop comment and download origin.
+        const attr_head = c.gtk_label_new("Attributes");
+        c.gtk_widget_add_css_class(attr_head, "heading");
+        c.gtk_label_set_xalign(@ptrCast(attr_head), 0);
+        c.gtk_box_append(@ptrCast(box), attr_head);
+        const attr_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
+        ctx.attr_box = attr_box;
+        const loading = c.gtk_label_new("reading…");
+        c.gtk_label_set_xalign(@ptrCast(loading), 0);
+        c.gtk_widget_add_css_class(loading, "dim-label");
+        c.gtk_box_append(@ptrCast(attr_box), loading);
+        c.gtk_box_append(@ptrCast(box), attr_box);
+
+        const add_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+        const add_name = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(add_name), "user.name");
+        c.gtk_widget_set_hexpand(add_name, 1);
+        const add_value = c.gtk_entry_new();
+        c.gtk_entry_set_placeholder_text(@ptrCast(add_value), "value");
+        c.gtk_widget_set_hexpand(add_value, 1);
+        ctx.attr_name_entry = add_name;
+        ctx.attr_value_entry = add_value;
+        const add_btn = c.gtk_button_new_with_label("Set");
+        _ = c.g_signal_connect_data(add_btn, "clicked", @ptrCast(&onPropsAttrAdd), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(add_row), add_name);
+        c.gtk_box_append(@ptrCast(add_row), add_value);
+        c.gtk_box_append(@ptrCast(add_row), add_btn);
+        c.gtk_box_append(@ptrCast(box), add_row);
+        self.requestAttrs(ctx);
 
         c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
 
@@ -5878,6 +6287,170 @@ pub const BrowserView = struct {
         c.gtk_popover_popup(@ptrCast(popover));
     }
 
+    /// In-flight attr_list for an open Properties dialog. The box is
+    /// g_object_ref'd so a closed dialog cannot dangle; the path is
+    /// kept because the reply carries no echo of it.
+    const AttrRequest = struct {
+        req: u32,
+        hc: *HostConn,
+        box: *c.GtkWidget,
+        path: []u8,
+    };
+
+    fn endAttrRequest(self: *BrowserView) void {
+        const request = self.attr_request orelse return;
+        c.g_object_unref(@ptrCast(request.box));
+        self.allocator.free(request.path);
+        self.attr_request = null;
+    }
+
+    fn requestAttrs(self: *BrowserView, ctx: *PropsCtx) void {
+        const hc = ctx.tab.hc;
+        if (hc.state != .ready) return;
+        self.endAttrRequest();
+        const path = self.allocator.dupe(u8, ctx.path) catch return;
+        const req = self.nextReq();
+        _ = c.g_object_ref(@ptrCast(ctx.attr_box));
+        self.attr_request = .{ .req = req, .hc = hc, .box = ctx.attr_box, .path = path };
+        self.sendOp(hc, .{ .req = req, .op = "attr_list", .path = ctx.path });
+    }
+
+    /// Heap context for one attribute row's Set button.
+    const AttrRowCtx = struct {
+        allocator: std.mem.Allocator,
+        view: *BrowserView,
+        hc: *HostConn,
+        path: []u8,
+        name: []u8,
+        entry: *c.GtkWidget,
+
+        fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+            const ctx: *AttrRowCtx = @ptrCast(@alignCast(user.?));
+            ctx.allocator.free(ctx.path);
+            ctx.allocator.free(ctx.name);
+            ctx.allocator.destroy(ctx);
+        }
+    };
+
+    fn feedAttrRequest(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
+        if (ftype != .fs_reply) return false;
+        const request = self.attr_request orelse return false;
+        if (request.hc != hc) return false;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const rep = std.json.parseFromSliceLeaky(struct {
+            req: u32 = 0,
+            ok: bool = false,
+            attrs: []const fsserve.Attr = &.{},
+        }, arena.allocator(), payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return false;
+        if (rep.req != request.req) return false;
+
+        while (c.gtk_widget_get_first_child(request.box)) |child|
+            c.gtk_box_remove(@ptrCast(request.box), child);
+        if (!rep.ok or rep.attrs.len == 0) {
+            const none = c.gtk_label_new(if (rep.ok) "(none)" else "(unavailable)");
+            c.gtk_label_set_xalign(@ptrCast(none), 0);
+            c.gtk_widget_add_css_class(none, "dim-label");
+            c.gtk_box_append(@ptrCast(request.box), none);
+            self.endAttrRequest();
+            return true;
+        }
+        for (rep.attrs) |attr| {
+            const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+            var name_z: [256:0]u8 = undefined;
+            const label = c.gtk_label_new(copyZ(@ptrCast(&name_z), attrLabel(attr.name)));
+            c.gtk_label_set_xalign(@ptrCast(label), 0);
+            c.gtk_widget_set_size_request(label, 150, -1);
+            c.gtk_widget_set_tooltip_text(label, copyZ(@ptrCast(&name_z), attr.name));
+            c.gtk_box_append(@ptrCast(row), label);
+            const entry = c.gtk_entry_new();
+            c.gtk_widget_set_hexpand(entry, 1);
+            var value_z: [1024:0]u8 = undefined;
+            c.gtk_editable_set_text(@ptrCast(entry), copyZ(@ptrCast(&value_z), attr.value));
+            c.gtk_box_append(@ptrCast(row), entry);
+            const set = c.gtk_button_new_with_label("Set");
+            const rctx = self.allocator.create(AttrRowCtx) catch continue;
+            rctx.* = .{
+                .allocator = self.allocator,
+                .view = self,
+                .hc = hc,
+                .path = self.allocator.dupe(u8, request.path) catch {
+                    self.allocator.destroy(rctx);
+                    continue;
+                },
+                .name = self.allocator.dupe(u8, attr.name) catch {
+                    self.allocator.free(rctx.path);
+                    self.allocator.destroy(rctx);
+                    continue;
+                },
+                .entry = entry,
+            };
+            _ = c.g_signal_connect_data(set, "clicked", @ptrCast(&onAttrRowSet), @ptrCast(rctx), @ptrCast(&AttrRowCtx.free), c.G_CONNECT_DEFAULT);
+            _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onAttrRowActivate), @ptrCast(rctx), null, c.G_CONNECT_DEFAULT);
+            c.gtk_box_append(@ptrCast(row), set);
+            c.gtk_box_append(@ptrCast(request.box), row);
+        }
+        self.endAttrRequest();
+        return true;
+    }
+
+    /// Friendly name for the attributes with agreed meanings; other
+    /// names show as-is (minus the namespace).
+    fn attrLabel(name: []const u8) []const u8 {
+        if (std.mem.eql(u8, name, "user.xdg.comment")) return "Comment";
+        if (std.mem.eql(u8, name, "user.xdg.origin.url")) return "Where from";
+        if (std.mem.eql(u8, name, "user.xdg.referrer.url")) return "Referrer";
+        if (std.mem.eql(u8, name, fsserve.TAGS_XATTR)) return "Tags";
+        if (std.mem.startsWith(u8, name, "user.sketerm.")) return name["user.sketerm.".len..];
+        if (std.mem.startsWith(u8, name, "user.")) return name["user.".len..];
+        return name;
+    }
+
+    fn onAttrRowSet(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *AttrRowCtx = @ptrCast(@alignCast(user.?));
+        const value = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.entry)))));
+        const self = ctx.view;
+        self.sendOp(ctx.hc, .{ .req = self.nextReq(), .op = "attr_set", .path = ctx.path, .pattern = ctx.name, .to = value });
+        if (value.len == 0)
+            self.setStatusFmt("cleared {s}", .{attrLabel(ctx.name)})
+        else
+            self.setStatusFmt("set {s}", .{attrLabel(ctx.name)});
+    }
+
+    fn onAttrRowActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+        onAttrRowSet(undefined, user);
+    }
+
+    fn onPropsAttrAdd(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+        const self = ctx.view;
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.attr_name_entry)))));
+        const value = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.attr_value_entry)))));
+        if (name.len == 0) return self.setStatus("attribute name required");
+        if (!std.mem.startsWith(u8, name, "user."))
+            return self.setStatus("attribute names must start with user.");
+        self.sendOp(ctx.tab.hc, .{ .req = self.nextReq(), .op = "attr_set", .path = ctx.path, .pattern = name, .to = value });
+        self.setStatusFmt("set {s}", .{name});
+        // Re-read so the list shows what the host actually stored.
+        self.requestAttrs(ctx);
+    }
+
+    fn onPropsChecksum(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+        ctx.view.startProbe(.hash, ctx.tab.hc, ctx.hash_label, "hash", ctx.path);
+    }
+
+    fn onPropsMediaInfo(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+        const label = ctx.media_label orelse return;
+        ctx.view.startProbe(.media, ctx.tab.hc, label, "preview", ctx.path);
+    }
+
+    fn onPropsOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+        ctx.view.openWithDialog(ctx.tab, ctx.path);
+    }
+
     fn onPropsBitToggled(_: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
         const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
         if (ctx.syncing) return;
@@ -5901,12 +6474,7 @@ pub const BrowserView = struct {
             self.setStatusFmt("not connected to {s}", .{hc.label()});
             return;
         }
-        self.endSizeProbe();
-        const req = self.nextReq();
-        _ = c.g_object_ref(@ptrCast(ctx.size_label));
-        self.size_probe = .{ .req = req, .hc = hc, .label = ctx.size_label };
-        c.gtk_label_set_text(@ptrCast(ctx.size_label), "Contents: calculating…");
-        self.sendOp(hc, .{ .req = req, .op = "dir_size", .path = ctx.path });
+        self.startProbe(.size, hc, ctx.size_label, "dir_size", ctx.path);
     }
 
     fn onPropsApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -8600,6 +9168,9 @@ pub const BrowserView = struct {
     }
 
     fn sortClicked(tab: *BTab, key: browser_model.SortKey) void {
+        // Only one key orders the view; picking a fixed column drops
+        // any attribute ordering.
+        tab.attr_sort = null;
         if (tab.sort_key == key) {
             tab.descending = !tab.descending;
         } else {
