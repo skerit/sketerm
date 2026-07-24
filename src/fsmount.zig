@@ -12,9 +12,8 @@
 //! RANGED — streaming the head of a huge video never downloads the
 //! tail. Writes go straight through (fs_write at explicit offsets).
 //!
-//! Known limitation (wire has no ftruncate): SETATTR size is honored
-//! for 0 (O_TRUNC) and the current size (no-op); anything else is
-//! EOPNOTSUPP.
+//! SETATTR size maps to the wire `truncate` op (any length), with
+//! cached ranges invalidated afterward.
 
 const std = @import("std");
 const builtin = @import("builtin");
