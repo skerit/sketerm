@@ -12,11 +12,15 @@ const clipboard = @import("clipboard.zig");
 pub const Ctx = struct {
     widget: *c.GtkWidget,
     terminal: *Terminal,
-    /// Opaque back-pointer set by Pane.init right after attach. Used
-    /// only by `mouse_autohide` so input can flip Pane's
-    /// `cursor_hidden` flag without input.zig importing pane.zig.
-    autohide_ctx: ?*anyopaque = null,
+    /// Opaque back-pointer to the owning Pane, set by Pane.init right
+    /// after attach. Every callback below takes it; input.zig must not
+    /// import pane.zig.
+    pane_ctx: ?*anyopaque = null,
+    /// Flip Pane's `cursor_hidden` flag (mouse_autohide).
     autohide_set: ?*const fn (ctx: ?*anyopaque, hidden: bool) void = null,
+    /// Swap the pane's file-browser and terminal faces. @return false
+    /// when the pane has no browser face, so the key falls through.
+    browser_toggle: ?*const fn (ctx: ?*anyopaque) bool = null,
     /// Optional shortcut sink for tab/split/etc actions. May be null
     /// for top-level shortcuts handled elsewhere.
     shortcut_sink: ?*const fn (ctx: ?*anyopaque, action: Action) void = null,
@@ -155,6 +159,10 @@ pub const Action = enum {
     /// Split the focused pane and give the new pane a browser face:
     /// how a dual-pane source/target layout is created.
     new_browser_split,
+    /// Flip the focused pane between its file-browser face and its
+    /// terminal face. Dispatched locally (the Pane owns both faces);
+    /// a pane with no browser face leaves the key to the terminal.
+    toggle_browser_face,
     /// Detach the focused mux pane: the session keeps running on the
     /// daemon; the pane lands in a fresh local shell. No-op on
     /// non-mux panes.
@@ -228,6 +236,11 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_z, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .restore_closed_tab },
     .{ .keyval = c.GDK_KEY_o, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .launch_app },
     .{ .keyval = c.GDK_KEY_a, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_screen },
+    // Ctrl+Shift+B → swap the focused pane's browser and terminal
+    // faces. Works from BOTH faces (the browser forwards unclaimed
+    // chords to this table), which is what makes the browser
+    // reachable again after flipping away from it.
+    .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .toggle_browser_face },
     // Kitty's default for show_scrollback.
     .{ .keyval = c.GDK_KEY_h, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .show_scrollback },
     // Ctrl+Shift+P is the cross-app convention for "command palette"
@@ -340,6 +353,7 @@ pub fn actionName(a: Action) []const u8 {
         .new_durable_tab => "new_durable_tab",
         .new_browser_tab => "new_browser_tab",
         .new_browser_split => "new_browser_split",
+        .toggle_browser_face => "toggle_browser_face",
         .mux_detach => "mux_detach",
         .paste_clipboard => "paste_clipboard",
         .copy_selection => "copy_selection",
@@ -419,6 +433,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .new_durable_tab => "New durable tab (mux)",
         .new_browser_tab => "New file browser tab",
         .new_browser_split => "Split into a second file browser pane",
+        .toggle_browser_face => "Show the file browser / show the shell (this pane)",
         .mux_detach => "Detach mux session (pane drops to a local shell)",
         .paste_clipboard => "Paste clipboard",
         .copy_selection => "Copy selection",
@@ -657,7 +672,7 @@ fn onKeyPressed(
         => {},
         else => {
             c.gtk_widget_set_cursor_from_name(ctx.widget, "none");
-            if (ctx.autohide_set) |f| f(ctx.autohide_ctx, true);
+            if (ctx.autohide_set) |f| f(ctx.pane_ctx, true);
         },
     };
 
@@ -713,6 +728,12 @@ fn onKeyPressed(
 pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
     switch (action) {
         // Per-pane (local).
+        .toggle_browser_face => {
+            // A pane with no browser face has nothing to swap to; the
+            // key belongs to whatever is listening next (the shell).
+            const flip = ctx.browser_toggle orelse return 0;
+            return if (flip(ctx.pane_ctx)) 1 else 0;
+        },
         .paste_clipboard => {
             clipboard.pasteFromClipboard(ctx.widget, ctx.terminal);
             return 1;

@@ -219,6 +219,10 @@ pub const ColumnSort = struct {
 
 /// One live (subscribed) directory: a browser tab's root, or an
 /// expanded subdirectory.
+/// Stand-in for a listing failure whose reason could not be
+/// duplicated. Static storage, so `clearLoadError` must not free it.
+const LOAD_ERROR_OOM: []u8 = @constCast("the listing failed and the reason could not be kept");
+
 pub const Dir = struct {
     allocator: std.mem.Allocator,
     path: []u8,
@@ -226,6 +230,12 @@ pub const Dir = struct {
     entries: std.ArrayList(Entry) = .empty,
     loaded: bool = false,
     gone: bool = false,
+    /// Why the last listing of this directory was refused (owned), or
+    /// null. It rides the DIR so it dies with it, and so every render
+    /// keeps saying it: a status-bar line alone is erased by the next
+    /// render, which is exactly how a refused listing came to read as
+    /// "0 items".
+    load_error: ?[]u8 = null,
     /// Search-results mode: entries are FLAT rows whose full path
     /// lives in `target` (no subscription, no expanders).
     flat: bool = false,
@@ -252,8 +262,23 @@ pub const Dir = struct {
         for (self.entries.items) |*e| e.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         if (self.archive.len > 0) self.allocator.free(self.archive);
+        self.clearLoadError();
         self.allocator.free(self.path);
         self.allocator.destroy(self);
+    }
+
+    /// Record why this directory could not be listed. An unrecordable
+    /// reason (OOM) still marks the failure, so the listing can never
+    /// fall back to reading as empty.
+    pub fn setLoadError(self: *Dir, reason: []const u8) void {
+        self.clearLoadError();
+        self.load_error = self.allocator.dupe(u8, reason) catch LOAD_ERROR_OOM;
+    }
+
+    pub fn clearLoadError(self: *Dir) void {
+        const msg = self.load_error orelse return;
+        self.load_error = null;
+        if (msg.ptr != LOAD_ERROR_OOM.ptr) self.allocator.free(msg);
     }
 
     /// The full path of one of this directory's entries. Flat rows
@@ -491,6 +516,18 @@ pub const BTab = struct {
     /// Grid view lives in its own scroller so the listbox (and every
     /// popover parented near it) never leaves the widget tree.
     flow_scroller: ?*c.GtkWidget = null,
+    /// Shown INSTEAD of the rows when there are none: what an empty
+    /// listing area means, in the listing area itself. A status-bar
+    /// line is too easy to miss and the next render overwrites it.
+    empty_box: *c.GtkWidget = undefined,
+    empty_title: *c.GtkLabel = undefined,
+    empty_detail: *c.GtkLabel = undefined,
+    /// Why the last navigation from this tab was refused (owned), or
+    /// null. Distinct from `root.load_error`: the tab still shows a
+    /// perfectly good directory, so the listing area must NOT be
+    /// replaced -- but the refusal still has to be said, on every
+    /// render, until the next navigation lands.
+    nav_error: ?[]u8 = null,
 
     pub fn subdirByPath(self: *BTab, path: []const u8) ?*Dir {
         for (self.subdirs.items) |d| {
@@ -572,6 +609,21 @@ pub const BTab = struct {
         return formatSpec(buf, self.hc.host, self.root.path);
     }
 
+    /// Remember that a navigation was refused. Owned; replaced rather
+    /// than stacked, since the newest refusal is the one the user just
+    /// caused.
+    pub fn setNavError(self: *BTab, msg: []const u8) void {
+        const a = self.view.allocator;
+        self.clearNavError();
+        self.nav_error = a.dupe(u8, msg) catch null;
+    }
+
+    pub fn clearNavError(self: *BTab) void {
+        const msg = self.nav_error orelse return;
+        self.nav_error = null;
+        self.view.allocator.free(msg);
+    }
+
     pub fn deinit(self: *BTab) void {
         const a = self.view.allocator;
         // Before anything else: a running query holds a host-side
@@ -598,6 +650,7 @@ pub const BTab = struct {
         self.attr_columns.deinit(a);
         if (self.filter.len > 0) a.free(self.filter);
         if (self.virtual_spec.len > 0) a.free(self.virtual_spec);
+        self.clearNavError();
         self.vs.deinit(a);
         self.sel.deinit(a);
         a.destroy(self);
@@ -890,6 +943,36 @@ pub fn testEntry(a: std.mem.Allocator, name: []const u8, target: ?[]const u8) !E
 fn freeTestDir(dir: *Dir) void {
     for (dir.entries.items) |*e| e.deinit(dir.allocator);
     dir.entries.deinit(dir.allocator);
+}
+
+test "Dir keeps the reason a listing failed, and frees it exactly once" {
+    const t = std.testing;
+    const a = t.allocator;
+    var dir = Dir{ .allocator = a, .path = @constCast("/data"), .view_id = 1 };
+    defer freeTestDir(&dir);
+
+    try t.expect(dir.load_error == null);
+    dir.setLoadError("no such file or directory");
+    try t.expectEqualStrings("no such file or directory", dir.load_error.?);
+    // Replacing frees the old one (a leak here would fail the test
+    // allocator), and clearing leaves nothing behind.
+    dir.setLoadError("permission denied");
+    try t.expectEqualStrings("permission denied", dir.load_error.?);
+    dir.clearLoadError();
+    try t.expect(dir.load_error == null);
+    // Clearing twice is harmless.
+    dir.clearLoadError();
+
+    // Out of memory still marks the failure -- a listing may never
+    // fall back to looking empty -- with a STATIC message that
+    // clearLoadError must not hand to the allocator.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var poor = Dir{ .allocator = failing.allocator(), .path = @constCast("/data"), .view_id = 2 };
+    poor.setLoadError("permission denied");
+    try t.expect(poor.load_error != null);
+    try t.expect(poor.load_error.?.ptr == LOAD_ERROR_OOM.ptr);
+    poor.clearLoadError();
+    try t.expect(poor.load_error == null);
 }
 
 test "findPath resolves an ordinary child, and rejects a foreign parent" {

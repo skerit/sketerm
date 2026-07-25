@@ -258,6 +258,8 @@ pub const BrowserView = struct {
     pub const nextReq = @import("conn.zig").nextReq;
     pub const onFdReadable = @import("conn.zig").onFdReadable;
     pub const onReply = @import("conn.zig").onReply;
+    pub const listingRefused = @import("conn.zig").listingRefused;
+    pub const failPendingListings = @import("conn.zig").failPendingListings;
     pub const dropPending = @import("conn.zig").dropPending;
     pub const cancelPendingDir = @import("conn.zig").cancelPendingDir;
     pub const onDelta = @import("conn.zig").onDelta;
@@ -698,7 +700,7 @@ pub const BrowserView = struct {
         // built.
         self.installViewMenu();
         self.installSelectionMenu();
-        pane.attachBrowser(self.root_box, @ptrCast(self), destroyCb);
+        pane.attachBrowser(self.root_box, @ptrCast(self), destroyCb, focusCb);
 
         const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
         if (start_spec) |sp| {
@@ -708,12 +710,52 @@ pub const BrowserView = struct {
         } else {
             _ = self.newTab(null, home);
         }
+        // The face is already showing (attachBrowser raised it) but had
+        // no tab to focus at the time.
+        self.focusListing();
         return self;
     }
 
     fn destroyCb(ctx: *anyopaque) void {
         const self: *BrowserView = @ptrCast(@alignCast(ctx));
         self.deinit();
+    }
+
+    fn focusCb(ctx: *anyopaque) void {
+        const self: *BrowserView = @ptrCast(@alignCast(ctx));
+        self.focusListing();
+    }
+
+    /// Re-focus the listing when a rebuild DESTROYED the focused widget
+    /// (navigating from a clicked row or breadcrumb does exactly that,
+    /// leaving the window with no focus at all -- and therefore no
+    /// working chords). Focus that has legitimately moved elsewhere,
+    /// including into another pane, is left alone.
+    pub fn refocusListingIfLost(self: *BrowserView) void {
+        const root = c.gtk_widget_get_root(self.root_box) orelse return;
+        if (c.gtk_root_get_focus(root) != null) return;
+        self.focusListing();
+    }
+
+    /// Put GTK focus on the current tab's rows, so the browser's chords
+    /// (Ctrl+L, Ctrl+Shift+B, type-ahead) reach its key controller.
+    /// Falls back to the first focusable widget in the face -- what
+    /// matters is that focus is INSIDE it, since the controller sits on
+    /// the root and runs in the bubble phase.
+    pub fn focusListing(self: *BrowserView) void {
+        if (self.currentTab()) |tab| {
+            // The rows are HIDDEN whenever the empty/failed message
+            // shows, and a hidden widget cannot take focus -- so the
+            // message itself is the target in that state.
+            const target: *c.GtkWidget = if (c.gtk_widget_get_visible(tab.empty_box) != 0)
+                tab.empty_box
+            else if (tab.view_mode == .icons and tab.flowbox != null)
+                @ptrCast(@alignCast(tab.flowbox.?))
+            else
+                @ptrCast(@alignCast(tab.listbox));
+            if (c.gtk_widget_grab_focus(target) != 0) return;
+        }
+        _ = c.gtk_widget_child_focus(self.root_box, c.GTK_DIR_TAB_FORWARD);
     }
 
     /// The BrowserView riding `pane`, if any. Safe cast: browser_ctx
@@ -945,6 +987,48 @@ pub const BrowserView = struct {
         self.allocator.destroy(self);
     }
 
+    /// True when the running icon theme can actually draw `name`.
+    ///
+    /// `gtk_button_new_from_icon_name` with an unresolvable name is
+    /// SILENT: the button lays out and renders nothing. That is how the
+    /// "show the shell" button became invisible on a KDE desktop --
+    /// Adwaita keeps `utilities-terminal-symbolic` only under
+    /// `symbolic/legacy/`, which a Breeze-based theme chain never
+    /// reaches. Names sketerm ships itself live in `data/icons` (the
+    /// hicolor fallback, always searched), so they always resolve.
+    fn iconAvailable(name: [*:0]const u8) bool {
+        const display = c.gdk_display_get_default() orelse return true;
+        const theme = c.gtk_icon_theme_get_for_display(display) orelse return true;
+        return c.gtk_icon_theme_has_icon(theme, name) != 0;
+    }
+
+    /// One toolbar button. Falls back to a text label when the icon
+    /// name does not resolve, so the worst case is a labelled button
+    /// rather than an invisible one.
+    fn barButton(self: *BrowserView, bar: *c.GtkWidget, icon: [*:0]const u8, text: [*:0]const u8, tip: [*:0]const u8, cb: anytype) *c.GtkWidget {
+        const btn = if (iconAvailable(icon))
+            c.gtk_button_new_from_icon_name(icon)
+        else
+            c.gtk_button_new_with_label(text);
+        c.gtk_widget_set_tooltip_text(btn, tip);
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(bar), btn);
+        return btn.?;
+    }
+
+    /// `barButton` for a toggle. Same icon guarantee.
+    fn barToggle(self: *BrowserView, bar: *c.GtkWidget, icon: [*:0]const u8, text: [*:0]const u8, tip: [*:0]const u8, cb: anytype) *c.GtkWidget {
+        const btn = c.gtk_toggle_button_new();
+        if (iconAvailable(icon))
+            c.gtk_button_set_icon_name(@ptrCast(btn), icon)
+        else
+            c.gtk_button_set_label(@ptrCast(btn), text);
+        c.gtk_widget_set_tooltip_text(btn, tip);
+        _ = c.g_signal_connect_data(btn, "toggled", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(bar), btn);
+        return btn.?;
+    }
+
     fn buildUi(self: *BrowserView) void {
         const vbox = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
         c.gtk_widget_set_hexpand(vbox, 1);
@@ -956,19 +1040,13 @@ pub const BrowserView = struct {
         c.gtk_widget_set_margin_top(bar, 4);
         c.gtk_widget_set_margin_bottom(bar, 4);
 
-        const back = c.gtk_button_new_from_icon_name("go-previous-symbolic");
+        const back = self.barButton(bar, "go-previous-symbolic", "Back", "Back (Alt+Left)", &onBackClicked);
         c.gtk_widget_set_sensitive(back, 0);
-        _ = c.g_signal_connect_data(back, "clicked", @ptrCast(&onBackClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), back);
         self.appendHistoryArrow(bar, .back);
-        const fwd = c.gtk_button_new_from_icon_name("go-next-symbolic");
+        const fwd = self.barButton(bar, "go-next-symbolic", "Forward", "Forward (Alt+Right)", &onFwdClicked);
         c.gtk_widget_set_sensitive(fwd, 0);
-        _ = c.g_signal_connect_data(fwd, "clicked", @ptrCast(&onFwdClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), fwd);
         self.appendHistoryArrow(bar, .forward);
-        const up = c.gtk_button_new_from_icon_name("go-up-symbolic");
-        _ = c.g_signal_connect_data(up, "clicked", @ptrCast(&onUpClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), up);
+        _ = self.barButton(bar, "go-up-symbolic", "Up", "Up one folder (Alt+Up)", &onUpClicked);
 
         const entry = c.gtk_entry_new();
         c.gtk_widget_set_hexpand(entry, 1);
@@ -983,49 +1061,23 @@ pub const BrowserView = struct {
         // breadcrumb shows by default, Ctrl+L swaps to the entry.
         self.installLocationFace(bar, entry);
 
-        const hidden = c.gtk_toggle_button_new();
-        c.gtk_button_set_icon_name(@ptrCast(hidden), "view-reveal-symbolic");
-        c.gtk_widget_set_tooltip_text(hidden, "Show hidden files");
-        _ = c.g_signal_connect_data(hidden, "toggled", @ptrCast(&onHiddenToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), hidden);
-
-        const search_toggle = c.gtk_toggle_button_new();
-        c.gtk_button_set_icon_name(@ptrCast(search_toggle), "system-search-symbolic");
-        c.gtk_widget_set_tooltip_text(search_toggle, "Search this directory (daemon-side, recursive)");
-        _ = c.g_signal_connect_data(search_toggle, "toggled", @ptrCast(&onSearchToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), search_toggle);
-
-        const places_toggle = c.gtk_toggle_button_new();
-        c.gtk_button_set_icon_name(@ptrCast(places_toggle), "user-bookmarks-symbolic");
-        c.gtk_widget_set_tooltip_text(places_toggle, "Places sidebar (bookmarks, recent, devices)");
-        _ = c.g_signal_connect_data(places_toggle, "toggled", @ptrCast(&onPlacesToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), places_toggle);
-
-        const viewmode = c.gtk_button_new_from_icon_name("view-grid-symbolic");
-        c.gtk_widget_set_tooltip_text(viewmode, "Cycle view: details / compact / grid / columns");
-        _ = c.g_signal_connect_data(viewmode, "clicked", @ptrCast(&onViewModeClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), viewmode);
-
-        const preview_toggle = c.gtk_toggle_button_new();
-        c.gtk_button_set_icon_name(@ptrCast(preview_toggle), "view-dual-symbolic");
-        c.gtk_widget_set_tooltip_text(preview_toggle, "Preview panel (images, text head, metadata)");
-        _ = c.g_signal_connect_data(preview_toggle, "toggled", @ptrCast(&onPreviewToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), preview_toggle);
-
-        const newtab = c.gtk_button_new_from_icon_name("tab-new-symbolic");
-        c.gtk_widget_set_tooltip_text(newtab, "New browser tab");
-        _ = c.g_signal_connect_data(newtab, "clicked", @ptrCast(&onNewTabClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), newtab);
-
-        const cwdbtn = c.gtk_button_new_from_icon_name("go-jump-symbolic");
-        c.gtk_widget_set_tooltip_text(cwdbtn, "Go to the shell's current directory (OSC 7)");
-        _ = c.g_signal_connect_data(cwdbtn, "clicked", @ptrCast(&onCwdSyncClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), cwdbtn);
-
-        const term = c.gtk_button_new_from_icon_name("utilities-terminal-symbolic");
-        c.gtk_widget_set_tooltip_text(term, "Show the pane's terminal (browser stays one click away)");
-        _ = c.g_signal_connect_data(term, "clicked", @ptrCast(&onTerminalClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(bar), term);
+        const hidden = self.barToggle(bar, "view-reveal-symbolic", "Hidden", "Show hidden files", &onHiddenToggled);
+        _ = self.barToggle(bar, "system-search-symbolic", "Search", "Search this directory (daemon-side, recursive)", &onSearchToggled);
+        _ = self.barToggle(bar, "user-bookmarks-symbolic", "Places", "Places sidebar (bookmarks, recent, devices)", &onPlacesToggled);
+        _ = self.barButton(bar, "view-grid-symbolic", "View", "Cycle view: details / compact / grid / columns", &onViewModeClicked);
+        _ = self.barToggle(bar, "view-dual-symbolic", "Preview", "Preview panel (images, text head, metadata)", &onPreviewToggled);
+        _ = self.barButton(bar, "tab-new-symbolic", "New tab", "New browser tab", &onNewTabClicked);
+        _ = self.barButton(bar, "go-jump-symbolic", "Shell cwd", "Go to the shell's current directory (OSC 7)", &onCwdSyncClicked);
+        // Its own bundled icon: Adwaita ships utilities-terminal-symbolic
+        // only under symbolic/legacy/, so on a Breeze theme chain this
+        // button -- the one that leaves the browser -- rendered blank.
+        _ = self.barButton(
+            bar,
+            "sketerm-terminal-symbolic",
+            "Shell",
+            "Show this pane's shell. Ctrl+Shift+B (or the strip above the shell) brings the browser back.",
+            &onTerminalClicked,
+        );
 
         c.gtk_box_append(@ptrCast(vbox), bar);
 
@@ -1040,18 +1092,9 @@ pub const BrowserView = struct {
         c.gtk_box_append(@ptrCast(sbar), sentry);
         const scontent = c.gtk_check_button_new_with_label("in contents");
         c.gtk_box_append(@ptrCast(sbar), scontent);
-        const spreset = c.gtk_button_new_from_icon_name("utilities-terminal-symbolic");
-        c.gtk_widget_set_tooltip_text(spreset, "Panelize presets: browse a command's output as a listing");
-        _ = c.g_signal_connect_data(spreset, "clicked", @ptrCast(&onPresetClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(sbar), spreset);
-        const spromote = c.gtk_button_new_from_icon_name("folder-saved-search-symbolic");
-        c.gtk_widget_set_tooltip_text(spromote, "Keep these results: mark every row into a named register");
-        _ = c.g_signal_connect_data(spromote, "clicked", @ptrCast(&onPromoteClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(sbar), spromote);
-        const ssave = c.gtk_button_new_from_icon_name("starred-symbolic");
-        c.gtk_widget_set_tooltip_text(ssave, "Save this query (shows in the Places sidebar, reopens live)");
-        _ = c.g_signal_connect_data(ssave, "clicked", @ptrCast(&onSaveSearchClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(sbar), ssave);
+        _ = self.barButton(sbar, "sketerm-terminal-symbolic", "Presets", "Panelize presets: browse a command's output as a listing", &onPresetClicked);
+        _ = self.barButton(sbar, "folder-saved-search-symbolic", "Keep", "Keep these results: mark every row into a named register", &onPromoteClicked);
+        _ = self.barButton(sbar, "starred-symbolic", "Save", "Save this query (shows in the Places sidebar, reopens live)", &onSaveSearchClicked);
         c.gtk_widget_set_visible(sbar, 0);
         c.gtk_box_append(@ptrCast(vbox), sbar);
 

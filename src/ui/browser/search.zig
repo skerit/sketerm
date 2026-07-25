@@ -101,6 +101,10 @@ pub const TabQuery = struct {
     /// The job reached a terminal event: the rows stay, but the tab
     /// stops claiming to be live.
     ended: bool = false,
+    /// It ended by FAILING (or being cancelled), not by finishing. The
+    /// rows found so far are real, so they stay -- but a tab with none
+    /// must not read as "nothing matched".
+    failed: bool = false,
     /// The host watcher overflowed; the row set may have drifted.
     stale: bool = false,
     /// panelize: output lines that named nothing on disk, plus the
@@ -273,6 +277,10 @@ pub fn queryConsumeEvent(self: *BrowserView, hc: *HostConn, e: WireJobEv) bool {
             tq.truncated = e.truncated;
             tq.rejected = e.rejected;
             tq.exit_status = e.exit_status;
+        } else {
+            // error / canceled: the note carries it on every render,
+            // since the jobs panel's own status line erases ours.
+            tq.failed = true;
         }
         // Deliberately the COALESCED render: this event falls through
         // to the jobs panel, whose own "done: ..." status would erase
@@ -298,6 +306,9 @@ pub fn queryNote(tab: *BTab, buf: []u8) []const u8 {
     else
         tq.kind.label();
     w.print(" ({s}", .{state}) catch return "";
+    // Before every other detail: rows that are missing because the job
+    // died are not rows that did not match.
+    if (tq.failed) w.print(", the query FAILED - see the jobs panel", .{}) catch {};
     if (tq.live() and tq.watches > 0) w.print(", {d} watched dir(s)", .{tq.watches}) catch {};
     if (tq.truncated) w.print(", TRUNCATED at the match cap", .{}) catch {};
     if (tq.watch_limit) w.print(", watch limit reached: deeper subdirectories are NOT live", .{}) catch {};

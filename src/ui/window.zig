@@ -6964,6 +6964,10 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
         .new_browser_tab => self.newBrowserTab() catch |err| logActionError("new_browser_tab", err),
         .new_browser_split => self.newBrowserSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_browser_split", err),
+        // Only reached when the focused pane has NO browser face (the
+        // pane-local dispatch consumes it otherwise): say so, rather
+        // than let the action look broken.
+        .toggle_browser_face => showToast(self, "This pane has no file browser. Use New File Browser Tab."),
         .mux_detach => if (self.focusedPane()) |p| self.detachPaneToShell(p),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         .hints_open => self.openHints(),

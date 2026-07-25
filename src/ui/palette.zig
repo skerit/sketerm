@@ -105,6 +105,8 @@ const ENTRIES = [_]Entry{
        .desc = "Browse files with live listings; the pane's shell is one click away.", .action = .new_browser_tab },
     .{ .icon = "view-dual-symbolic", .title = "Split into Two File Browsers",
        .desc = "Dual-pane source/target: F5 copies to the other pane, F6 moves.", .action = .new_browser_split },
+    .{ .icon = "sketerm-terminal-symbolic", .title = "Show File Browser / Show Shell",
+       .desc = "Swap this pane between its file browser and its shell. Both stay alive; neither is closed.", .action = .toggle_browser_face },
 
     // Font
     .{ .icon = "zoom-in-symbolic", .title = "Increase Font Size",

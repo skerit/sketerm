@@ -22,6 +22,7 @@ const MAX_ATTR_COLUMNS = @import("render.zig").MAX_ATTR_COLUMNS;
 const Pending = @import("types.zig").Pending;
 const WireDelta = @import("types.zig").WireDelta;
 const WireReply = @import("types.zig").WireReply;
+const errorPhrase = @import("../../filebrowser/format.zig").errorPhrase;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 
 /// Heap context handed to the connect worker thread. The thread only
@@ -129,8 +130,35 @@ pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     } else {
         hc.state = .dead;
         view.setStatusFmt("cannot connect to {s}", .{hc.label()});
+        // The listings queued while connecting will never be answered.
+        // Without this the tabs that asked for them sit at "Listing..."
+        // for good, which reads like a slow host rather than a dead one.
+        var buf: [256]u8 = undefined;
+        const why = std.fmt.bufPrint(&buf, "cannot connect to {s}", .{hc.label()}) catch "cannot connect";
+        view.failPendingListings(hc, why);
     }
     return 0;
+}
+
+/// Refuse every in-flight listing on `hc`, recording `reason` where
+/// the listing was going to be shown. A dropped listing that leaves no
+/// trace is indistinguishable from a directory that is still loading.
+pub fn failPendingListings(self: *BrowserView, hc: *HostConn, reason: []const u8) void {
+    var i: usize = 0;
+    while (i < self.pending.items.len) {
+        const p = self.pending.items[i];
+        if (p.hc != hc) {
+            i += 1;
+            continue;
+        }
+        if (p.navigation != null) {
+            if (p.navigation_generation == p.tab.navigation_generation) p.tab.setNavError(reason);
+        } else if (!p.dir.loaded) {
+            p.dir.setLoadError(reason);
+        }
+        self.dropPending(i);
+    }
+    self.renderCurrent();
 }
 
 /// Make a freshly connected HostConn live: non-blocking fd, GLib
@@ -172,14 +200,14 @@ pub fn requestHostDirs(self: *BrowserView, hc: *HostConn) void {
 /// HostConn; navigating again reconnects.
 pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     mediacols.hostDied(self, hc);
-    var i: usize = 0;
     // In-flight listings can never be answered. A navigation
     // request also OWNS its candidate directory until it commits,
-    // so dropping it here is what frees it.
-    while (i < self.pending.items.len) {
-        if (self.pending.items[i].hc == hc) self.dropPending(i) else i += 1;
-    }
-    i = 0;
+    // so dropping it here is what frees it -- and whatever was
+    // waiting for one is told why it is not coming.
+    var lost_buf: [256]u8 = undefined;
+    const lost = std.fmt.bufPrint(&lost_buf, "connection to {s} lost", .{hc.label()}) catch "connection lost";
+    self.failPendingListings(hc, lost);
+    var i: usize = 0;
     while (i < self.transfers.items.len) {
         const t = self.transfers.items[i];
         if (t.src_hc == hc or t.dst_hc == hc) {
@@ -345,7 +373,12 @@ pub fn queueListing(self: *BrowserView, tab: *BTab, dir: *Dir, op: @FieldType(Pe
     if (tab.hc.state == .ready) {
         self.sendListingOp(p);
     } else if (tab.hc.state == .dead) {
-        self.setStatusFmt("not connected to {s}", .{tab.hc.label()});
+        // Nothing will ever answer this one, so the listing area is
+        // told now rather than left looking like a slow host.
+        var buf: [256]u8 = undefined;
+        const why = std.fmt.bufPrint(&buf, "not connected to {s}", .{tab.hc.label()}) catch "not connected";
+        self.setStatus(why);
+        dir.setLoadError(why);
     }
 }
 
@@ -438,11 +471,11 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     for (self.pending.items, 0..) |p, i| {
         if (p.req != rep.req) continue;
         if (!rep.ok) {
-            self.setStatusFmt("cannot open: {s}", .{rep.@"error"});
-            if (p.navigation != null and p.navigation_generation == p.tab.navigation_generation) self.syncPathEntry(p.tab);
+            self.listingRefused(p, rep.@"error");
             self.dropPending(i);
             return true;
         }
+        p.dir.clearLoadError();
         if (rep.dev != 0) p.dir.dev = rep.dev;
         for (rep.entries) |we| {
             if (p.dir.own(we)) |e| p.staged.append(self.allocator, e) catch {};
@@ -617,6 +650,35 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     return false;
 }
 
+/// A listing came back refused. Which surface has to say so depends
+/// on WHOSE listing it was: the directory a tab shows (or is about to
+/// show) owns the listing area, a navigation target that never landed
+/// only owns a note, because the rows on screen are still valid.
+///
+/// `reason` is the daemon's own error field -- errno tags get read out
+/// into words by `format.errorPhrase`, everything else is passed
+/// through as-is.
+pub fn listingRefused(self: *BrowserView, p: *Pending, reason: []const u8) void {
+    const why = errorPhrase(reason);
+    if (p.navigation != null) {
+        // The candidate dir is about to be freed with the Pending, so
+        // the refusal is remembered on the tab instead.
+        if (p.navigation_generation == p.tab.navigation_generation) {
+            var buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "cannot open {s}: {s}", .{ p.dir.path, why }) catch why;
+            p.tab.setNavError(msg);
+            self.syncPathEntry(p.tab);
+        }
+    } else {
+        p.dir.setLoadError(why);
+        // The location control has to stop claiming this path opened.
+        if (p.dir == p.tab.root) self.syncPathEntry(p.tab);
+    }
+    // Say it once immediately too: renderTab repeats it from the state
+    // above on every later render.
+    self.setStatusFmt("cannot open {s}: {s}", .{ p.dir.path, why });
+}
+
 pub fn dropPending(self: *BrowserView, i: usize) void {
     const p = self.pending.swapRemove(i);
     for (p.staged.items) |*e| e.deinit(self.allocator);
@@ -652,7 +714,12 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         if (d.gone) {
             dir.gone = true;
             if (dir == tab.root) {
+                // The rows on screen describe a directory that is not
+                // there any more; keeping them without saying so is
+                // the same lie as an empty listing for a failed one.
+                dir.setLoadError("the folder no longer exists");
                 self.setStatusFmt("{s} no longer exists", .{dir.path});
+                self.syncPathEntry(tab);
             } else {
                 // Expanded subdir vanished: its own delta already
                 // removed the entry from the parent; drop the view.
