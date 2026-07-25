@@ -575,6 +575,19 @@ pub const Xfer = struct {
         return self.state == .done;
     }
 
+    /// The source file currently in flight, or null between files.
+    /// The client drives every byte, so this is exact -- unlike a
+    /// daemon-side job, whose progress events carry no file name.
+    pub fn currentFile(self: *const Xfer) ?[]const u8 {
+        const t = self.cur orelse return null;
+        return t.src_path;
+    }
+
+    /// Files finished over files discovered (0 total while walking).
+    pub fn fileCounts(self: *const Xfer) struct { done: usize, total: usize } {
+        return .{ .done = self.files_done, .total = self.files.items.len };
+    }
+
     /// Bytes transferred (completed files + current file position)
     /// over total. Total is 0 until the walk finishes.
     pub fn progress(self: *const Xfer) struct { done: u64, total: u64 } {
