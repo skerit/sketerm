@@ -9,7 +9,7 @@
 
 pkgname=sketerm-git
 _pkgname=sketerm
-pkgver=0.1.0.r1012.gf1988c8
+pkgver=0.1.0.r1072.g609a8fe
 pkgrel=1
 pkgdesc='Native GTK4 terminal emulator written in Zig'
 arch=('x86_64')
