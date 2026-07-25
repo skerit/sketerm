@@ -9446,3 +9446,83 @@ Properties showing Where from / Comment / rating with working in-place
 edits (verified with getfattr), a checksum matching sha256sum, "Opens
 with: Vim", and emblem badges from both a glob rule and an attribute
 rule with no column configured. Rig torn down by exact PID.
+
+## 2026-07-25: browser package split, Quick Look, breadcrumb navigation
+
+Three commits, each verified independently of the agent that wrote it.
+
+**`src/ui/browser.zig` became a package.** At 9909 lines and ~378
+methods on one `BrowserView`, it was both a merge hazard and a wall for
+anyone reading it. The bodies moved into `src/ui/browser/`, one module
+per responsibility (view, types, conn, render, nav, locbar, tabs, menu,
+ops, jobs, open, preview, props, places, search, compare, gitstat), and
+`browser.zig` is now a 24-line facade re-exporting exactly the symbols
+other code already used.
+
+The technique is worth remembering: Zig 0.16 has no `usingnamespace`,
+but a decl alias inside a struct preserves method-call syntax --
+`pub const foo = @import("x.zig").foo;` makes `self.foo()` resolve to a
+body living in another file. So `view.zig` carries the struct plus a
+grouped index of 284 aliases, and NOT ONE internal call site changed.
+That kept the diff a pure move, which is what made it reviewable: a
+declaration-by-declaration comparison of the original against the new
+modules found 398 declarations, 0 missing, and exactly 1 body differing
+(`uniqueDstName`, deliberately reduced to an adapter over a new tested
+`paths.uniqueName`).
+
+Pure helpers left the GTK layer for `src/filebrowser/`, per the roadmap
+rule that the model imports no GTK: `paths.zig` (spec parsing, mount
+bypass, trash/archive/media predicates), `format.zig` (size/mode/time
+labels), `desktop.zig` (MIME list matching, Exec field codes). All with
+unit tests they never had.
+
+**Quick Look, and one preview code path.** Space opens a full preview
+of the focused entry, Left/Right walk the current selection (or the
+listing) without closing, Enter opens, Escape returns.
+
+The structural change is that previews now resolve through ONE
+registry. The old hardcoded "media goes to the daemon generator, else
+text head" chain is gone: `filebrowser/previewers.zig` expresses the
+built-ins (`thumbnail`, `head`, `hex`, `metadata`) as handlers, and
+`$XDG_CONFIG_HOME/sketerm/previewers.conf` adds user rules in the
+`emblems.conf` idiom -- `*.zip = text:host bsdtar -tf %f`, `mime:image/*
+= image:thumbnail`. A rule's producer may be a command run on the
+FILE's host, so a remote preview is generated where the file lives and
+only the result crosses the wire. Handlers are rejected at parse time
+when they cannot work (an `image:host` command that never names `%o`),
+which beats a handler that silently yields nothing forever.
+
+Unhandled types fall back to a bounded hex dump
+(`filebrowser/hexdump.zig`) instead of a blank panel, and settling on
+an entry warms a fixed 2-ahead/1-behind window. Boundedness was
+measured, not asserted: identical interactions in a 50-file and a
+10-file directory each generated exactly 6 previews (4 visited + the
+lookahead), so a big remote directory cannot become a job storm.
+
+**Breadcrumb location bar.** The path control has two faces now: a
+scrollable row of clickable segments, each carrying a dropdown of its
+SIBLING directories for lateral jumps and each a drop target, with the
+host as the root segment on remote locations; and the existing editable
+entry, reached with Ctrl+L and left with Escape. The entry, its
+completion popup and its `host:/path` parsing are reused rather than
+reimplemented -- `filebrowser/crumbs.zig` holds the GTK-free segment
+splitting and elision with its own tests.
+
+Back/forward grew dropdowns listing real history entries, which forced
+a good change: `NavigationIntent` now carries the number of steps and
+all the stack surgery moved into one `applyHistoryIntent`, including
+the "already there" early-return path that previously skipped it.
+Mouse buttons 8/9 navigate. Tabs gained middle-click open and close,
+Duplicate Tab, drag-onto-tab targeting, and a bounded reopen-closed
+ring that restores the tab's history and not just its location.
+
+Verification: unit suite 893 passed / 6 skipped / 0 failed (899 total,
++34); smoke-fs, smoke-broker, smoke-mcp, smoke-e2e all PASS; GUI, mux,
+musl and aarch64-macOS builds green; mux still links libc/libm only.
+The nav work was based on master from before Quick Look and both had
+edited the same key handler and the same struct, so it landed as a real
+three-way merge with the overlapping regions read by hand, then the
+MERGED tree was exercised live: breadcrumb segments, Space on a text
+file, an image fit to window, the hex fallback on a random binary,
+arrow stepping both directions, Escape, and the Ctrl+L round trip, with
+a clean log. Rig torn down by exact PID.
