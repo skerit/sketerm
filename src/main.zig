@@ -210,6 +210,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const allocator = gpa_state.allocator();
 
     @import("util/profile.zig").init();
+    // Post-mortem trail + SIGPIPE neutering. A GUI death takes every
+    // attached session's viewer with it, and a stripped ReleaseFast build
+    // otherwise leaves NO evidence anywhere of what it was doing.
+    @import("util/crashlog.zig").install();
 
     g_app = .{ .allocator = allocator };
 

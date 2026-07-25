@@ -23,6 +23,7 @@ const tabbar_mod = @import("tabbar.zig");
 const tab_effects = @import("tab_effects.zig");
 const file_transfers = @import("file_transfers.zig");
 const files_entry = @import("../filebrowser/entry.zig");
+const crashlog = @import("../util/crashlog.zig");
 
 /// Toolkit-free pane-tree model — one per tab, attached to the
 /// AdwTabPage as qdata (travels with cross-window tab drags). The
@@ -4137,6 +4138,9 @@ pub const Window = struct {
     /// on an SSH host (`ssh <host> sketerm-mux --proxy`).
     fn muxConnect(self: *Window, host: ?[]const u8) !@import("../mux/client.zig").Conn {
         const mux_client = @import("../mux/client.zig");
+        // The transport handshake forks (ssh/udp bridge) and blocks the main
+        // loop; name it so a death in here is attributable.
+        crashlog.set("mux connect host={s}", .{host orelse "local"});
         if (host) |h| {
             // "udp:host" selects the mosh-style encrypted UDP
             // transport (ssh bootstrap, then roaming datagrams).
@@ -4888,7 +4892,13 @@ pub const Window = struct {
     /// deferred past GTK's destroy chain). Shared by the mux takeover
     /// and the detach-to-local-shell path.
     fn swapPaneInPlace(self: *Window, old: *Pane, pane: *Pane) !*c.AdwTabPage {
+        // Resolve BOTH failure conditions before touching anything: an
+        // error after the model swap would leave the model pointing at a
+        // pane the widget tree doesn't have (and the caller then frees that
+        // pane, leaving the model holding freed memory).
         const page = tabPageForPane(self, old) orelse return error.PaneHasNoTab;
+        const old_w = old.widget();
+        const parent = c.gtk_widget_get_parent(old_w) orelse return error.PaneHasNoTab;
         // Preserve the user's per-pane shader across the swap (old's
         // Zig-side shader fields stay valid until the deferred unlist).
         self.transferPaneShader(old, pane);
@@ -4898,8 +4908,6 @@ pub const Window = struct {
             t.replaceLeaf(old, pane) catch
                 std.debug.print("sketerm: tree model takeover desync (leaf not found)\n", .{});
         }
-        const old_w = old.widget();
-        const parent = c.gtk_widget_get_parent(old_w) orelse return error.PaneHasNoTab;
         const is_paned = c.g_type_check_instance_is_a(
             @ptrCast(@alignCast(parent)),
             c.gtk_paned_get_type(),
@@ -5021,6 +5029,7 @@ pub const Window = struct {
     fn attachMuxProfile(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane, profile: ?*const @import("../config.zig").Profile) !void {
         var conn = conn_in;
         self.mux_attach_err_len = 0;
+        crashlog.set("mux attach '{s}' @ {s} takeover={} - handshake", .{ name, host orelse "local", takeover != null });
 
         const snap = blk: {
             errdefer conn.deinit();
@@ -5050,6 +5059,7 @@ pub const Window = struct {
             return self.attachMuxApp(conn, name, host, snap.payload);
         }
 
+        crashlog.set("mux attach '{s}' @ {s} takeover={} - building pane", .{ name, host orelse "local", takeover != null });
         const pane = try self.makeRemotePaneFromSnap(conn, name, host, snap.payload, null);
         pane.active_profile = if (profile) |p| p.name else null;
         self.applyPaneConfig(pane, .{ .profile = profile });
@@ -5060,8 +5070,15 @@ pub const Window = struct {
         else
             std.fmt.bufPrintZ(&title_buf, "⌁ {s}", .{name}) catch "mux";
 
+        // From here on the pane is LISTED (panes/terminals) and owns the
+        // connection, so a failure must unlist it - leaving it listed with
+        // no parent widget keeps a live fd watch and a phantom pane in every
+        // later query (layout save, `cli list`, pane cycling).
         const page = if (takeover) |old|
-            try self.swapPaneInPlace(old, pane)
+            self.swapPaneInPlace(old, pane) catch |err| {
+                self.unlistPane(pane);
+                return err;
+            }
         else blk: {
             const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
             c.gtk_widget_set_hexpand(wrapper, 1);
@@ -5489,6 +5506,17 @@ pub const Window = struct {
 
     fn ipcDispatchTrampoline(ctx: *anyopaque, req: ipc_protocol.Request, out: *std.ArrayList(u8), allocator: std.mem.Allocator) void {
         const self: *Window = @ptrCast(@alignCast(ctx));
+        // Post-mortem breadcrumb: a crash while servicing a remote-control
+        // command is otherwise invisible (the process just vanishes and only
+        // the far-side daemon logs its clients going away).
+        crashlog.set("ipc {s} data={s} host={s} pane={?d} session={s}", .{
+            req.cmd,
+            req.data orelse "-",
+            req.host orelse "-",
+            req.pane,
+            req.session orelse "-",
+        });
+        defer crashlog.clear();
         self.ipcDispatch(req, out, allocator) catch {
             out.clearRetainingCapacity();
             ipc_protocol.writeErr(out, allocator, "internal error") catch {};

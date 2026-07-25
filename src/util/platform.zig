@@ -49,6 +49,18 @@ pub fn socketCloexec(domain: c_int, sock_type: c_int, proto: c_int) c_int {
     return fd;
 }
 
+/// socketpair(2) with close-on-exec on BOTH ends, same Linux-vs-Darwin
+/// split as socketCloexec. Returns 0 on success (libc convention).
+pub fn socketpairCloexec(pair: *[2]c_int) c_int {
+    if (is_linux) return c.socketpair(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0, pair);
+    const r = c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, pair);
+    if (r == 0) {
+        _ = c.fcntl(pair[0], c.F_SETFD, c.FD_CLOEXEC);
+        _ = c.fcntl(pair[1], c.F_SETFD, c.FD_CLOEXEC);
+    }
+    return r;
+}
+
 /// memfd_create is in both glibc and musl libc but its declaration
 /// hides behind _GNU_SOURCE, which the translate-c pass doesn't
 /// define — declare it ourselves (Linux-only; resolved at link).
