@@ -60,6 +60,7 @@ comptime {
     _ = @import("ui/browser/types.zig");
     _ = @import("ui/browser/conn.zig");
     _ = @import("ui/browser/render.zig");
+    _ = @import("ui/browser/mediacols.zig");
     _ = @import("ui/browser/nav.zig");
     _ = @import("ui/browser/locbar.zig");
     _ = @import("ui/browser/tabs.zig");
@@ -101,6 +102,7 @@ comptime {
     _ = @import("ipc/fsdrive.zig");
     _ = @import("ipc/fstransfer.zig");
     _ = @import("filebrowser/model.zig");
+    _ = @import("filebrowser/colkeys.zig");
     _ = @import("filebrowser/cache.zig");
     _ = @import("filebrowser/emblems.zig");
     _ = @import("filebrowser/places.zig");

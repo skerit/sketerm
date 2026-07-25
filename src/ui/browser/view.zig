@@ -53,7 +53,9 @@ const RemoteThumb = @import("preview.zig").RemoteThumb;
 const RestoreRead = @import("ops.zig").RestoreRead;
 const ThumbCtx = @import("preview.zig").ThumbCtx;
 const UndoOp = @import("types.zig").UndoOp;
+const colkeys = @import("../../filebrowser/colkeys.zig");
 const locbar = @import("locbar.zig");
+const mediacols = @import("mediacols.zig");
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const selmod = @import("selection.zig");
 const tabsmod = @import("tabs.zig");
@@ -202,6 +204,9 @@ pub const BrowserView = struct {
     column_picker: ?*c.GtkWidget = null,
     /// Emblem rules (name globs / attribute predicates -> badge icon).
     emblems: emblems_mod.Rules = undefined,
+    /// Media-metadata columns: the answer cache, the one batch in
+    /// flight and its coalescing timer (mediacols.zig).
+    media: mediacols.State = .{},
     /// Label probes in flight (folder size, checksum, media info).
     probes: std.ArrayList(LabelProbe) = .empty,
     /// Resolve the other browser face in this sketerm tab (the
@@ -357,6 +362,16 @@ pub const BrowserView = struct {
     pub const fileColorFor = @import("render.zig").fileColorFor;
     pub const sortClicked = @import("render.zig").sortClicked;
     pub const onViewModeClicked = @import("render.zig").onViewModeClicked;
+
+    // mediacols.zig -- media-metadata columns (batched, bounded fetch)
+    pub const mediaApplyValues = @import("mediacols.zig").applyValues;
+    pub const mediaSchedule = @import("mediacols.zig").schedule;
+    pub const mediaCancel = @import("mediacols.zig").cancel;
+    pub const mediaResetForNavigation = @import("mediacols.zig").resetForNavigation;
+    pub const mediaHostDied = @import("mediacols.zig").hostDied;
+    pub const mediaFeed = @import("mediacols.zig").feed;
+    pub const mediaLookup = @import("mediacols.zig").lookup;
+    pub const mediaBeginSortFill = @import("mediacols.zig").beginSortFill;
 
     // views.zig -- grouping, zoom, filter, flat view, folder memory
     pub const installViewMenu = @import("views.zig").installViewMenu;
@@ -616,6 +631,7 @@ pub const BrowserView = struct {
         const self = try allocator.create(BrowserView);
         self.* = .{ .allocator = allocator, .pane = pane };
         self.emblems = emblems_mod.load(allocator);
+        self.media.init(allocator);
         self.thumbs = std.StringHashMap(*c.GdkTexture).init(allocator);
         self.thumb_failed = std.StringHashMap(void).init(allocator);
         self.git_map = std.StringHashMap(u8).init(allocator);
@@ -735,7 +751,10 @@ pub const BrowserView = struct {
             for (state.columns) |col| tab.columns.insert(col);
         }
         for (state.attr_columns) |name| {
-            if (!std.mem.startsWith(u8, name, "user.")) continue;
+            // Both column sources persist through the same list; an
+            // unrecognized namespace is dropped rather than restored
+            // as a column nothing can ever fill.
+            if (colkeys.sourceOf(name) == null) continue;
             if (tab.attr_columns.items.len >= MAX_ATTR_COLUMNS) break;
             const owned = self.allocator.dupe(u8, name) catch continue;
             tab.attr_columns.append(self.allocator, owned) catch self.allocator.free(owned);
@@ -843,6 +862,7 @@ pub const BrowserView = struct {
         self.views.deinit(self.allocator);
         self.sel.deinit(self.allocator);
         self.emblems.deinit();
+        self.media.deinit(self.allocator);
         self.endProbesFor(null, "");
         self.probes.deinit(self.allocator);
         self.endAttrRequest();

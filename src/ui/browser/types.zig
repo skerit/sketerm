@@ -6,6 +6,8 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const muxclient = @import("../../mux/client.zig");
+const colkeys = @import("../../filebrowser/colkeys.zig");
+const fsdrive = @import("../../ipc/fsdrive.zig");
 const fstransfer = @import("../../ipc/fstransfer.zig");
 const browser_model = @import("../../filebrowser/model.zig");
 
@@ -30,8 +32,15 @@ pub const Entry = struct {
     target: ?[]u8,
     tdir: bool,
     tags: []u8 = &.{},
-    /// Values for the tab's attribute columns, in column order.
+    /// Values for the tab's extended-attribute columns, in xattr
+    /// column order; they ride the listing itself.
     attrs: [][]u8 = &.{},
+    /// Values for the tab's media-metadata columns, in media column
+    /// order. Stitched on from the client-side cache by
+    /// mediacols.applyValues, since they arrive from a batched job
+    /// long after the listing. Short (or empty) means "no answer
+    /// yet", which every reader treats as no value.
+    meta: [][]u8 = &.{},
 
     pub fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -40,6 +49,8 @@ pub const Entry = struct {
         if (self.tags.len > 0) allocator.free(self.tags);
         for (self.attrs) |v| allocator.free(v);
         if (self.attrs.len > 0) allocator.free(self.attrs);
+        for (self.meta) |v| allocator.free(v);
+        if (self.meta.len > 0) allocator.free(self.meta);
     }
 };
 
@@ -115,6 +126,10 @@ pub const WireJobEv = struct {
     /// Bytes a staged partial contributed. The daemon only fills this
     /// on the terminal event, so the panel treats it as sticky.
     resumed_from: u64 = 0,
+    /// media_meta match payload: one file's extracted fields, plus
+    /// whether the host served them from its own cache.
+    meta: []const fsdrive.MediaField = &.{},
+    cached: bool = false,
 
     /// True for the events that end a job.
     pub fn terminalEv(self: WireJobEv) bool {
@@ -154,6 +169,25 @@ pub const HostConn = struct {
     }
 };
 
+/// An extra column resolved down to what sorting actually needs:
+/// which per-entry value array holds it, where in that array, and
+/// how its values order. Resolving once per sort keeps the
+/// comparator free of table lookups.
+pub const ColumnSort = struct {
+    source: colkeys.Source,
+    /// Index within `Entry.attrs` (xattr) or `Entry.meta` (media).
+    index: usize,
+    kind: colkeys.ValueKind,
+
+    fn valueOf(self: ColumnSort, e: Entry) []const u8 {
+        const values = switch (self.source) {
+            .xattr => e.attrs,
+            .media => e.meta,
+        };
+        return if (self.index < values.len) values[self.index] else "";
+    }
+};
+
 /// One live (subscribed) directory: a browser tab's root, or an
 /// expanded subdirectory.
 pub const Dir = struct {
@@ -175,8 +209,9 @@ pub const Dir = struct {
     /// Sort parameters (kept on the Dir so delta-driven re-sorts in
     /// onDelta need no tab lookup); the owning tab pushes changes.
     sort_key: browser_model.SortKey = .name,
-    /// Attribute-column index this dir is sorted by, if any.
-    attr_sort: ?usize = null,
+    /// The extra column this dir is sorted by, if any (resolved once
+    /// per sort by the owning tab, not looked up per comparison).
+    attr_sort: ?ColumnSort = null,
     descending: bool = false,
     dirs_first: bool = true,
 
@@ -276,7 +311,7 @@ pub const Dir = struct {
     }
 
     pub fn sort(self: *Dir) void {
-        const Ctx = struct { key: browser_model.SortKey, desc: bool, dirs_first: bool, attr: ?usize };
+        const Ctx = struct { key: browser_model.SortKey, desc: bool, dirs_first: bool, attr: ?ColumnSort };
         std.mem.sort(Entry, self.entries.items, Ctx{
             .key = self.sort_key,
             .desc = self.descending,
@@ -289,13 +324,14 @@ pub const Dir = struct {
                 if (ctx.dirs_first and a_in.tdir != b_in.tdir) return a_in.tdir;
                 const a = if (ctx.desc) b_in else a_in;
                 const b = if (ctx.desc) a_in else b_in;
-                if (ctx.attr) |i| {
-                    const av = if (i < a.attrs.len) a.attrs[i] else "";
-                    const bv = if (i < b.attrs.len) b.attrs[i] else "";
-                    // Entries WITHOUT the attribute sort last either
-                    // way: an empty value is absence, not "smallest".
-                    if ((av.len == 0) != (bv.len == 0)) return bv.len == 0;
-                    if (!std.mem.eql(u8, av, bv)) return std.ascii.lessThanIgnoreCase(av, bv);
+                if (ctx.attr) |col| {
+                    // colkeys owns the value semantics: type-aware
+                    // ordering, missing last in BOTH directions, and
+                    // malformed values that cannot corrupt the sort.
+                    // It takes the UNSWAPPED pair plus `desc` for
+                    // exactly that reason.
+                    const o = colkeys.order(col.kind, col.valueOf(a_in), col.valueOf(b_in), ctx.desc);
+                    if (o != .eq) return o == .lt;
                     return std.ascii.lessThanIgnoreCase(a.name, b.name);
                 }
                 return switch (ctx.key) {
@@ -350,9 +386,11 @@ pub const BTab = struct {
     /// Optional details columns, rendered in Column declaration order.
     columns: std.EnumSet(browser_model.Column) =
         std.EnumSet(browser_model.Column).initMany(&browser_model.default_columns),
-    /// Extended-attribute columns (full user.* names, owned). Their
-    /// values ride the listing itself, so a remote attribute column
-    /// costs no extra round trip per row.
+    /// Extra columns the user added by KEY (owned, in display
+    /// order). One list for both sources: `user.*` values ride the
+    /// listing, `media.*`/`tag.*`/`exif.*`/`image.*`/`doc.*` values
+    /// come from the batched media_meta job. colkeys.sourceOf tells
+    /// them apart, so there is one add/remove/sort path, not two.
     attr_columns: std.ArrayList([]u8) = .empty,
     /// Index into attr_columns the view is sorted by, if any.
     attr_sort: ?usize = null,
@@ -386,19 +424,33 @@ pub const BTab = struct {
         return null;
     }
 
+    /// The tab's extra-column sort, resolved to what the comparator
+    /// needs. Done once per sort rather than per comparison.
+    pub fn columnSort(self: *BTab) ?ColumnSort {
+        const i = self.attr_sort orelse return null;
+        if (i >= self.attr_columns.items.len) return null;
+        const key = self.attr_columns.items[i];
+        return .{
+            .source = colkeys.sourceOf(key) orelse return null,
+            .index = colkeys.subIndex(self.attr_columns.items, i),
+            .kind = colkeys.kindOf(key),
+        };
+    }
+
     /// Push the tab's sort parameters onto every live Dir and re-sort.
     pub fn applySort(self: *BTab) void {
+        const col = self.columnSort();
         const dirs = [_]?*Dir{self.root};
         for (dirs) |d| {
             d.?.sort_key = self.sort_key;
-            d.?.attr_sort = self.attr_sort;
+            d.?.attr_sort = col;
             d.?.descending = self.descending;
             d.?.dirs_first = self.dirs_first;
             d.?.sort();
         }
         for (self.subdirs.items) |d| {
             d.sort_key = self.sort_key;
-            d.attr_sort = self.attr_sort;
+            d.attr_sort = col;
             d.descending = self.descending;
             d.dirs_first = self.dirs_first;
             d.sort();

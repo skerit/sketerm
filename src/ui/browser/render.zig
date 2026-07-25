@@ -10,12 +10,14 @@ const grouping = @import("../../filebrowser/grouping.zig");
 const profile = @import("../../util/profile.zig");
 const views = @import("views.zig");
 
+const colkeys = @import("../../filebrowser/colkeys.zig");
+const mediacols = @import("mediacols.zig");
+
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const Dir = @import("types.zig").Dir;
 const Entry = @import("types.zig").Entry;
 const FileColor = @import("types.zig").FileColor;
-const attrLabel = @import("props.zig").attrLabel;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const copyZ = @import("../../filebrowser/format.zig").copyZ;
 const fmtModeZ = @import("../../filebrowser/format.zig").fmtModeZ;
@@ -31,6 +33,10 @@ pub fn renderCurrent(self: *BrowserView) void {
 }
 
 pub fn renderTab(self: *BrowserView, tab: *BTab) void {
+    // Media values are stitched onto the entries BEFORE the sort:
+    // they arrive from a batched job long after the listing, and a
+    // sort by a media column reads them straight off the entries.
+    mediacols.applyValues(self, tab);
     tab.applySort();
     self.updateSortHeader(tab);
     self.applyViewChrome(tab);
@@ -49,17 +55,45 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
             self.renderList(tab);
         },
     }
-    var count_buf: [160]u8 = undefined;
+    var count_buf: [240]u8 = undefined;
+    // Its own buffer: a note printed into count_buf would be
+    // overwritten by the print that reads it.
+    var note_buf: [96]u8 = undefined;
+    const note = mediaSortNote(tab, &note_buf);
     const cmsg = if (tab.filter.len > 0)
-        std.fmt.bufPrint(&count_buf, "showing {d} of {d} items (filter \"{s}\")", .{
-            tab.vs.shown, tab.vs.total, tab.filter[0..@min(tab.filter.len, 48)],
+        std.fmt.bufPrint(&count_buf, "showing {d} of {d} items (filter \"{s}\"){s}", .{
+            tab.vs.shown, tab.vs.total, tab.filter[0..@min(tab.filter.len, 48)], note,
         }) catch ""
     else
-        std.fmt.bufPrint(&count_buf, "{d} items{s}", .{
+        std.fmt.bufPrint(&count_buf, "{d} items{s}{s}", .{
             tab.vs.total,
             if (self.views.flat_tab == tab) @as([]const u8, " (flat view)") else "",
+            note,
         }) catch "";
     self.setStatus(cmsg);
+
+    // Fetching runs LAST: the rows it measures against are the ones
+    // just built, and the request itself is coalesced behind a timer.
+    if (mediacols.tabWantsMedia(tab)) {
+        mediacols.ensureScrollWatch(self, tab);
+        mediacols.schedule(self);
+    }
+}
+
+/// How much of the directory a media-column sort actually covers.
+/// Only the rows whose metadata has been READ have a value, and
+/// saying so is the difference between an honest sort and one that
+/// silently pretends the unread rows have none.
+fn mediaSortNote(tab: *BTab, buf: []u8) []const u8 {
+    const i = tab.attr_sort orelse return "";
+    if (i >= tab.attr_columns.items.len) return "";
+    const name = tab.attr_columns.items[i];
+    if (colkeys.sourceOf(name) != .media) return "";
+    const counted = mediacols.valuedCount(tab);
+    if (counted.total == 0 or counted.have >= counted.total) return "";
+    return std.fmt.bufPrint(buf, " ({s} read for {d} of {d} files)", .{
+        colkeys.label(name), counted.have, counted.total,
+    }) catch "";
 }
 
 /// Show/hide the chrome that belongs to the tab's view mode.
@@ -100,12 +134,13 @@ pub fn headerButton(self: *BrowserView, tab: *BTab, label: [*:0]const u8, column
     c.gtk_box_append(@ptrCast(tab.header_box), btn);
 }
 
-/// Width of an attribute column; values are free-form text, so
-/// they get one generous ellipsized column each.
+/// Width of an extra column; values are free-form text, so they get
+/// one generous ellipsized column each.
 pub const ATTR_COLUMN_WIDTH = 160;
 
-/// Cap on attribute columns: each one costs an lgetxattr per entry
-/// per listing, and the daemon refuses more than this anyway.
+/// Cap on extra (key-named) columns: an xattr column costs an
+/// lgetxattr per entry per listing and the daemon refuses more than
+/// this anyway, and a media column costs host-side file reads.
 pub const MAX_ATTR_COLUMNS = 8;
 
 pub fn attrHeaderButton(self: *BrowserView, tab: *BTab, label: [*:0]const u8, index: usize) void {
@@ -142,9 +177,15 @@ pub fn onAttrHeaderClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
         tab.attr_sort = ctx.index;
         tab.descending = false;
     }
-    // Attribute order is its own key; the fixed-column key stops
+    // Extra-column order is its own key; the fixed-column key stops
     // claiming the header marker.
     tab.sort_key = .name;
+    // Sorting by a media column is only meaningful for rows whose
+    // value has been read, so this ONE user action opts into a
+    // bounded read-ahead past the visible window. The status line
+    // reports how much of the directory the sort actually covers.
+    if (colkeys.sourceOf(tab.attr_columns.items[ctx.index]) == .media)
+        mediacols.beginSortFill(tab.view);
     tab.view.updateSortHeader(tab);
     tab.view.renderTab(tab);
 }
@@ -154,10 +195,29 @@ pub fn onAttrColumnRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     const tab = ctx.tab;
     if (ctx.index >= tab.attr_columns.items.len) return;
     const self = tab.view;
-    self.allocator.free(tab.attr_columns.orderedRemove(ctx.index));
+    const removed = tab.attr_columns.orderedRemove(ctx.index);
+    const was_xattr = colkeys.sourceOf(removed) == .xattr;
+    self.allocator.free(removed);
     tab.attr_sort = null;
     self.closeColumnPicker();
-    self.reopenTabListing(tab);
+    applyColumnChange(self, tab, was_xattr);
+}
+
+/// Re-fetch whatever a changed column set invalidated.
+///
+/// Only an XATTR change needs the listing re-SUBSCRIBED (the daemon
+/// stores the requested attributes with the view, so a plain re-list
+/// would leave the next delta blanking the new column). A media
+/// column rides no listing at all, so it costs a re-stitch and a
+/// batch instead of a remote round trip.
+fn applyColumnChange(self: *BrowserView, tab: *BTab, xattr_changed: bool) void {
+    mediacols.cancel(self);
+    if (xattr_changed) {
+        self.reopenTabListing(tab);
+    } else {
+        self.updateSortHeader(tab);
+        self.renderTab(tab);
+    }
 }
 
 pub fn onAttrColumnAdd(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
@@ -167,10 +227,10 @@ pub fn onAttrColumnAdd(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void 
     const raw = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
     const name = std.mem.trim(u8, raw, " ");
     if (name.len == 0) return;
-    if (!std.mem.startsWith(u8, name, "user."))
-        return self.setStatus("attribute names must start with user.");
+    if (colkeys.sourceOf(name) == null)
+        return self.setStatus("column keys are user.*, media.*, tag.*, exif.*, image.* or doc.*");
     if (tab.attr_columns.items.len >= MAX_ATTR_COLUMNS)
-        return self.setStatusFmt("at most {d} attribute columns", .{MAX_ATTR_COLUMNS});
+        return self.setStatusFmt("at most {d} extra columns", .{MAX_ATTR_COLUMNS});
     for (tab.attr_columns.items) |existing| {
         if (std.mem.eql(u8, existing, name)) return self.setStatus("that column is already shown");
     }
@@ -180,7 +240,7 @@ pub fn onAttrColumnAdd(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void 
         return;
     };
     self.closeColumnPicker();
-    self.reopenTabListing(tab);
+    applyColumnChange(self, tab, colkeys.sourceOf(name) == .xattr);
 }
 
 pub fn closeColumnPicker(self: *BrowserView) void {
@@ -231,8 +291,8 @@ pub fn updateSortHeader(self: *BrowserView, tab: *BTab) void {
             var cb: [64:0]u8 = undefined;
             const marked = tab.attr_sort != null and tab.attr_sort.? == i;
             const txt: [*:0]const u8 = if (std.fmt.bufPrintZ(&cb, "{s}{s}", .{
-                attrLabel(name), if (marked) mark else "",
-            })) |v| v.ptr else |_| "attr";
+                colkeys.label(name), if (marked) mark else "",
+            })) |v| v.ptr else |_| "column";
             self.attrHeaderButton(tab, txt, i);
         }
         const picker = c.gtk_button_new_from_icon_name("view-more-symbolic");
@@ -263,7 +323,7 @@ pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         c.gtk_box_append(@ptrCast(box), check);
     }
     c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
-    const attr_head = c.gtk_label_new("Attribute columns");
+    const attr_head = c.gtk_label_new("Attribute and metadata columns");
     c.gtk_label_set_xalign(@ptrCast(attr_head), 0);
     c.gtk_widget_add_css_class(attr_head, "dim-label");
     c.gtk_box_append(@ptrCast(box), attr_head);
@@ -282,7 +342,12 @@ pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         c.gtk_box_append(@ptrCast(box), row);
     }
     const add = c.gtk_entry_new();
-    c.gtk_entry_set_placeholder_text(@ptrCast(add), "user.name — Enter to add");
+    c.gtk_entry_set_placeholder_text(@ptrCast(add), "user.name or media.duration_ms - Enter to add");
+    c.gtk_widget_set_tooltip_text(
+        add,
+        "user.* reads an extended attribute; media.* tag.* exif.* image.* doc.* " ++
+            "read file metadata on the host that owns the file",
+    );
     const actx = self.allocator.create(AttrColumnCtx) catch return;
     actx.* = .{ .allocator = self.allocator, .tab = ctx.tab, .index = 0, .entry = add };
     _ = c.g_signal_connect_data(add, "activate", @ptrCast(&onAttrColumnAdd), @ptrCast(actx), @ptrCast(&AttrColumnCtx.free), c.G_CONNECT_DEFAULT);
@@ -870,9 +935,13 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
             if (!tab.columns.contains(col)) continue;
             self.appendColumnCell(row_box, e, col);
         }
-        for (tab.attr_columns.items, 0..) |_, i| {
+        for (tab.attr_columns.items, 0..) |name, i| {
             var vz: [256:0]u8 = undefined;
-            const label = c.gtk_label_new(copyZ(@ptrCast(&vz), if (i < e.attrs.len) e.attrs[i] else ""));
+            var disp_buf: [256]u8 = undefined;
+            const label = c.gtk_label_new(copyZ(
+                @ptrCast(&vz),
+                columnCellText(tab, dir, e, name, i, &disp_buf),
+            ));
             c.gtk_widget_add_css_class(label, "dim-label");
             c.gtk_label_set_xalign(@ptrCast(label), 0);
             c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);
@@ -900,6 +969,40 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
     addEntryDragSource(tab, row, full);
 
     c.gtk_list_box_append(tab.listbox, row);
+}
+
+/// One extra-column cell's text: the raw value resolved from the
+/// source that feeds it, rendered through the shared display form so
+/// an ESTIMATED duration is never shown as a measurement.
+/// A value-less cell is deliberately blank, not "unknown": a media
+/// value that has not landed yet is indistinguishable from one the
+/// file does not carry, and inventing either claim would be a lie.
+fn columnCellText(tab: *BTab, dir: *Dir, e: Entry, name: []const u8, i: usize, buf: []u8) []const u8 {
+    const source = colkeys.sourceOf(name) orelse return "";
+    const sub = colkeys.subIndex(tab.attr_columns.items, i);
+    const values = switch (source) {
+        .xattr => e.attrs,
+        .media => e.meta,
+    };
+    const raw = if (sub < values.len) values[sub] else "";
+    if (raw.len == 0) return "";
+    return colkeys.display(name, raw, mediaEstimated(tab, dir, e), false, buf);
+}
+
+/// Whether this entry's duration was DERIVED from a bitrate. Read
+/// from the media column set when it is shown, else from the cached
+/// answer, so the marker never depends on the user also adding
+/// media.duration_estimated as its own column.
+fn mediaEstimated(tab: *BTab, dir: *Dir, e: Entry) bool {
+    for (tab.attr_columns.items, 0..) |name, i| {
+        if (!std.mem.eql(u8, name, "media.duration_estimated")) continue;
+        const sub = colkeys.subIndex(tab.attr_columns.items, i);
+        if (sub < e.meta.len) return std.mem.eql(u8, e.meta[sub], "1");
+    }
+    var path_buf: [4096]u8 = undefined;
+    const full = dir.fullPath(e, &path_buf) orelse return false;
+    const v = mediacols.lookup(tab.view, tab.hc, full, e.mtime_ms, "media.duration_estimated") orelse return false;
+    return std.mem.eql(u8, v, "1");
 }
 
 /// Resolve an entry's badge icon from the emblem rules. Attribute

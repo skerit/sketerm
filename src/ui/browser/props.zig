@@ -5,6 +5,7 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const wire = @import("../../mux/wire.zig");
+const colkeys = @import("../../filebrowser/colkeys.zig");
 const fsserve = @import("../../mux/fsserve.zig");
 
 const BTab = @import("types.zig").BTab;
@@ -18,22 +19,43 @@ const copyZ = @import("../../filebrowser/format.zig").copyZ;
 const entryForPath = @import("nav.zig").entryForPath;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const fmtTimeZ = @import("../../filebrowser/format.zig").fmtTimeZ;
-const isImageName = @import("../../filebrowser/paths.zig").isImageName;
 const isPreviewMediaName = @import("../../filebrowser/paths.zig").isPreviewMediaName;
 const menuDone = @import("menu.zig").menuDone;
 
 /// Recursive size probe: a daemon job so the walk happens on the
 /// host that owns the tree.
-/// One label fed by a daemon job: recursive size, checksum, or
-/// media metadata. The label is g_object_ref'd, so a dialog closed
+/// One widget fed by a daemon job: recursive size, checksum, or
+/// media metadata. The widget is g_object_ref'd, so a dialog closed
 /// mid-flight cannot dangle.
+///
+/// `target` is a GtkLabel for size/hash and the CONTAINER the
+/// structured rows go into for `.media` -- one probe mechanism, two
+/// shapes of result, rather than a second async path for metadata.
 pub const LabelProbe = struct {
     kind: enum { size, hash, media },
     req: u32,
     job: u64 = 0,
     hc: *HostConn,
     label: *c.GtkWidget,
+    /// A duration this file's host DERIVED from a bitrate, latched
+    /// from the field stream so the row can say so (fields arrive in
+    /// one batch, but not in a guaranteed order).
+    duration_estimated: bool = false,
 };
+
+/// Show a plain message on a probe's target, whatever its shape.
+fn setProbeText(probe: LabelProbe, message: [*:0]const u8) void {
+    if (probe.kind != .media) return c.gtk_label_set_text(@ptrCast(probe.label), message);
+    clearBox(probe.label);
+    const lbl = c.gtk_label_new(message);
+    c.gtk_label_set_xalign(@ptrCast(lbl), 0);
+    c.gtk_widget_add_css_class(lbl, "dim-label");
+    c.gtk_box_append(@ptrCast(probe.label), lbl);
+}
+
+fn clearBox(box: *c.GtkWidget) void {
+    while (c.gtk_widget_get_first_child(box)) |child| c.gtk_box_remove(@ptrCast(box), child);
+}
 
 pub fn endProbe(self: *BrowserView, i: usize) void {
     const probe = self.probes.items[i];
@@ -46,7 +68,7 @@ pub fn endProbesFor(self: *BrowserView, hc: ?*HostConn, message: [*:0]const u8) 
     while (i < self.probes.items.len) {
         const probe = self.probes.items[i];
         if (hc == null or probe.hc == hc.?) {
-            c.gtk_label_set_text(@ptrCast(probe.label), message);
+            setProbeText(probe, message);
             self.endProbe(i);
         } else i += 1;
     }
@@ -63,8 +85,13 @@ pub fn startProbe(self: *BrowserView, kind: @FieldType(LabelProbe, "kind"), hc: 
         c.g_object_unref(@ptrCast(label));
         return;
     };
-    c.gtk_label_set_text(@ptrCast(label), "calculating…");
-    self.sendOp(hc, .{ .req = req, .op = op, .path = path });
+    setProbeText(self.probes.items[self.probes.items.len - 1], "reading...");
+    // media_meta names its files in `pattern` (it is a batch op);
+    // one file is simply a batch of one.
+    if (kind == .media)
+        self.sendOp(hc, .{ .req = req, .op = op, .path = "/", .pattern = path })
+    else
+        self.sendOp(hc, .{ .req = req, .op = op, .path = path });
 }
 
 pub fn feedProbes(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
@@ -81,7 +108,7 @@ pub fn feedProbes(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payl
             for (self.probes.items, 0..) |*probe, i| {
                 if (probe.hc != hc or probe.req != rep.req) continue;
                 if (!rep.ok or rep.job == 0) {
-                    c.gtk_label_set_text(@ptrCast(probe.label), "unavailable");
+                    setProbeText(probe.*, "unavailable");
                     self.endProbe(i);
                 } else probe.job = rep.job;
                 return true;
@@ -89,13 +116,31 @@ pub fn feedProbes(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payl
             return false;
         },
         .fs_job => {
-            const ev = std.json.parseFromSliceLeaky(WireJobEv, arena.allocator(), payload, .{ .ignore_unknown_fields = true }) catch return false;
-            for (self.probes.items, 0..) |probe, i| {
+            const ev = std.json.parseFromSliceLeaky(WireJobEv, arena.allocator(), payload, .{
+                .ignore_unknown_fields = true,
+                .allocate = .alloc_always,
+            }) catch return false;
+            for (self.probes.items, 0..) |*probe, i| {
                 if (probe.hc != hc or probe.job == 0 or probe.job != ev.job) continue;
                 const done = std.mem.eql(u8, ev.ev, "done");
+                if (probe.kind == .media) {
+                    // media_meta streams one `match` per file; the
+                    // rows are built from it, and `done` only ends
+                    // the probe.
+                    if (std.mem.eql(u8, ev.ev, "match")) {
+                        renderMediaFields(probe, ev);
+                        return true;
+                    }
+                    if (ev.terminalEv()) {
+                        if (!done or c.gtk_widget_get_first_child(probe.label) == null)
+                            setProbeText(probe.*, if (done) "no metadata found" else "unavailable");
+                        self.endProbe(i);
+                    }
+                    return true;
+                }
                 if (!done and !std.mem.eql(u8, ev.ev, "progress")) {
                     if (ev.terminalEv()) {
-                        c.gtk_label_set_text(@ptrCast(probe.label), "unavailable");
+                        setProbeText(probe.*, "unavailable");
                         self.endProbe(i);
                     }
                     return true;
@@ -104,10 +149,11 @@ pub fn feedProbes(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payl
                 var human: [48:0]u8 = undefined;
                 const text: [*:0]const u8 = switch (probe.kind) {
                     .size => if (std.fmt.bufPrintZ(&buf, "{s} ({d} bytes) in {d} items{s}", .{
-                        fmtSize(&human, ev.done), ev.done, ev.total, if (done) "" else " …",
+                        fmtSize(&human, ev.done), ev.done, ev.total, if (done) "" else " ...",
                     })) |v| v.ptr else |_| "",
-                    .hash => if (!done) "hashing…" else copyZ(@ptrCast(&buf), ev.hash),
-                    .media => if (!done) "reading…" else copyZ(@ptrCast(&buf), if (ev.text.len > 0) ev.text else "(no metadata)"),
+                    .hash => if (!done) "hashing..." else copyZ(@ptrCast(&buf), ev.hash),
+                    // Handled entirely above; never reached.
+                    .media => "",
                 };
                 c.gtk_label_set_text(@ptrCast(probe.label), text);
                 if (done) self.endProbe(i);
@@ -116,6 +162,46 @@ pub fn feedProbes(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payl
             return false;
         },
         else => return false,
+    }
+}
+
+/// Turn one media_meta match into labelled rows.
+///
+/// The daemon skipped the file when it sends a `text` note instead of
+/// fields; that note is shown verbatim rather than as "no metadata",
+/// since "not a regular file" and "this file carries none" are
+/// different answers.
+fn renderMediaFields(probe: *LabelProbe, ev: WireJobEv) void {
+    clearBox(probe.label);
+    if (ev.meta.len == 0) {
+        const note = if (ev.text.len > 0) ev.text else "no metadata found";
+        var nz: [256:0]u8 = undefined;
+        const lbl = c.gtk_label_new(copyZ(@ptrCast(&nz), note));
+        c.gtk_label_set_xalign(@ptrCast(lbl), 0);
+        c.gtk_widget_add_css_class(lbl, "dim-label");
+        c.gtk_box_append(@ptrCast(probe.label), lbl);
+        return;
+    }
+    for (ev.meta) |f| {
+        if (std.mem.eql(u8, f.k, "media.duration_estimated"))
+            probe.duration_estimated = std.mem.eql(u8, f.v, "1");
+    }
+    for (ev.meta) |f| {
+        // The estimated flag drives the duration row's wording; a
+        // row of its own would just repeat it.
+        if (std.mem.eql(u8, f.k, "media.duration_estimated")) continue;
+        var disp: [256]u8 = undefined;
+        propsRow(
+            probe.label,
+            colkeys.label(f.k),
+            colkeys.display(f.k, f.v, probe.duration_estimated, true, &disp),
+        );
+    }
+    if (ev.cached) {
+        const note = c.gtk_label_new("read from the host's metadata cache");
+        c.gtk_label_set_xalign(@ptrCast(note), 0);
+        c.gtk_widget_add_css_class(note, "dim-label");
+        c.gtk_box_append(@ptrCast(probe.label), note);
     }
 }
 
@@ -314,18 +400,29 @@ pub fn onMenuProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         c.gtk_box_append(@ptrCast(app_row), change);
         c.gtk_box_append(@ptrCast(box), app_row);
 
-        if (isPreviewMediaName(path) and !isImageName(path)) {
-            const media_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
-            const lbl2 = c.gtk_label_new("Media info: not read");
-            c.gtk_label_set_xalign(@ptrCast(lbl2), 0);
-            c.gtk_label_set_selectable(@ptrCast(lbl2), 1);
-            c.gtk_widget_set_hexpand(lbl2, 1);
-            ctx.media_label = lbl2;
-            c.gtk_box_append(@ptrCast(media_row), lbl2);
+        // Structured metadata for anything the host-side extractor
+        // covers, images included: EXIF is the richest of the lot.
+        if (isPreviewMediaName(path)) {
+            const head_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+            const head = c.gtk_label_new("Metadata");
+            c.gtk_widget_add_css_class(head, "heading");
+            c.gtk_label_set_xalign(@ptrCast(head), 0);
+            c.gtk_widget_set_hexpand(head, 1);
+            c.gtk_box_append(@ptrCast(head_row), head);
             const read = c.gtk_button_new_with_label("Read");
             _ = c.g_signal_connect_data(read, "clicked", @ptrCast(&onPropsMediaInfo), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
-            c.gtk_box_append(@ptrCast(media_row), read);
-            c.gtk_box_append(@ptrCast(box), media_row);
+            c.gtk_box_append(@ptrCast(head_row), read);
+            c.gtk_box_append(@ptrCast(box), head_row);
+            // The probe fills THIS box with one labelled row per
+            // field, so the media path is the same probe plumbing as
+            // the size and checksum probes, not a second mechanism.
+            const media_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
+            const placeholder = c.gtk_label_new("not read");
+            c.gtk_label_set_xalign(@ptrCast(placeholder), 0);
+            c.gtk_widget_add_css_class(placeholder, "dim-label");
+            c.gtk_box_append(@ptrCast(media_box), placeholder);
+            ctx.media_label = media_box;
+            c.gtk_box_append(@ptrCast(box), media_box);
         }
     }
 
@@ -512,7 +609,7 @@ pub fn feedAttrRequest(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
     for (rep.attrs) |attr| {
         const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
         var name_z: [256:0]u8 = undefined;
-        const label = c.gtk_label_new(copyZ(@ptrCast(&name_z), attrLabel(attr.name)));
+        const label = c.gtk_label_new(copyZ(@ptrCast(&name_z), colkeys.label(attr.name)));
         c.gtk_label_set_xalign(@ptrCast(label), 0);
         c.gtk_widget_set_size_request(label, 150, -1);
         c.gtk_widget_set_tooltip_text(label, copyZ(@ptrCast(&name_z), attr.name));
@@ -548,27 +645,15 @@ pub fn feedAttrRequest(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
     return true;
 }
 
-/// Friendly name for the attributes with agreed meanings; other
-/// names show as-is (minus the namespace).
-pub fn attrLabel(name: []const u8) []const u8 {
-    if (std.mem.eql(u8, name, "user.xdg.comment")) return "Comment";
-    if (std.mem.eql(u8, name, "user.xdg.origin.url")) return "Where from";
-    if (std.mem.eql(u8, name, "user.xdg.referrer.url")) return "Referrer";
-    if (std.mem.eql(u8, name, fsserve.TAGS_XATTR)) return "Tags";
-    if (std.mem.startsWith(u8, name, "user.sketerm.")) return name["user.sketerm.".len..];
-    if (std.mem.startsWith(u8, name, "user.")) return name["user.".len..];
-    return name;
-}
-
 pub fn onAttrRowSet(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *AttrRowCtx = @ptrCast(@alignCast(user.?));
     const value = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.entry)))));
     const self = ctx.view;
     self.sendOp(ctx.hc, .{ .req = self.nextReq(), .op = "attr_set", .path = ctx.path, .pattern = ctx.name, .to = value });
     if (value.len == 0)
-        self.setStatusFmt("cleared {s}", .{attrLabel(ctx.name)})
+        self.setStatusFmt("cleared {s}", .{colkeys.label(ctx.name)})
     else
-        self.setStatusFmt("set {s}", .{attrLabel(ctx.name)});
+        self.setStatusFmt("set {s}", .{colkeys.label(ctx.name)});
 }
 
 pub fn onAttrRowActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
@@ -596,8 +681,11 @@ pub fn onPropsChecksum(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
 pub fn onPropsMediaInfo(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
-    const label = ctx.media_label orelse return;
-    ctx.view.startProbe(.media, ctx.tab.hc, label, "preview", ctx.path);
+    const box = ctx.media_label orelse return;
+    // media_meta takes a batch; one file is a batch of one, and it
+    // goes through the SAME daemon-side extractor and host-side
+    // cache the listing columns use.
+    ctx.view.startProbe(.media, ctx.tab.hc, box, "media_meta", ctx.path);
 }
 
 pub fn onPropsOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
