@@ -101,6 +101,12 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
         mediacols.ensureScrollWatch(self, tab);
         mediacols.schedule(self);
     }
+
+    // A rebuild can have destroyed or hidden the focused widget (the
+    // clicked row, most navigations); without focus INSIDE the face
+    // every chord goes dead. Self-guarding: focus that legitimately
+    // sits elsewhere is left alone.
+    if (self.currentTab() == tab) self.refocusListingIfLost();
 }
 
 /// How much of the directory a media-column sort actually covers.

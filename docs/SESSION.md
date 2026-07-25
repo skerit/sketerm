@@ -10058,3 +10058,37 @@ SHA-256; a paused cross-host move stayed byte-frozen (size and mtime)
 across the pause, across a `kill -9`, and across the restart, then
 resumed to a byte-identical result with the source removed; and a
 hand-written legacy ledger was imported into records and retired.
+
+## Browser: keyboard cut/copy/paste, empty-folder menu, files "+" (2026-07-26)
+
+Three usability defects from the transfer session's report. (1)
+Ctrl+X/Ctrl+C/Ctrl+V now cut/copy/paste in the browser face -- new
+chords in the audited table (all three free in input.zig, audit test
+green), backed by a ctx-free `clipSelection`/`pasteIntoCurrent` in
+ops.zig sharing `clipStore` with the context menu. (2) An empty (or
+failed) folder had NO context menu: the placeholder hides the
+scroller, so the listbox gesture could never fire -- and a popover
+parented to the hidden listbox would not map anyway. A second button-3
+gesture on the always-visible content box, gated on empty_box
+visibility so it cannot double the listbox's own background menu,
+shows the background menu (Paste/New Folder/Templates/Undo) parented
+to the content box. (3) The "+" header button in a files-identity
+window opens a BROWSER tab (at the focused browser's location);
+terminal windows keep the shell tab.
+
+Chasing (1) live exposed the real killer: after ANY navigation the
+clicked row is destroyed and GTK moves focus to some visible widget
+OUTSIDE the browser (the window tab bar), so every chord went dead --
+`refocusListingIfLost`'s focus-is-non-null guard could not tell that
+from focus the user moved. Navigation now uses
+`refocusListingAfterNav` (focus must be visible AND inside the
+browser root, else pull it back -- navigation is always
+browser-initiated), `refocusListingIfLost` treats focus on a
+non-visible widget as lost, and renderTab re-checks after rebuilds.
+
+Live proof (Xvfb files-app rig, screenshots read): Ctrl+C on a row ->
+navigate into an empty folder -> Ctrl+V lands the file; Ctrl+X then
+paste via the new empty-area menu MOVES it (source gone on disk);
+"+" gave a browser tab at $HOME in files mode and a fish shell tab in
+a terminal window. Suite 1030/6/0 with the chord-shadow audit named
+green; smoke-e2e PASS.

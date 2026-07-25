@@ -176,6 +176,16 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(listbox, @ptrCast(rclick));
 
+    // The content box behind the rows: the background menu for the
+    // states where the rows are HIDDEN (empty folder, failed listing)
+    // and the listbox gesture therefore cannot fire. Bubble phase and
+    // gated on empty_box visibility, so it never doubles the listbox's
+    // own background menu.
+    const area_click = c.gtk_gesture_click_new();
+    c.gtk_gesture_single_set_button(@ptrCast(area_click), 3);
+    _ = c.g_signal_connect_data(area_click, "pressed", @ptrCast(&@import("menu.zig").onAreaRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(content, @ptrCast(area_click));
+
     // Sticky-click toggling and the visual-mode keys, both capture
     // phase so GtkListBox does not get there first.
     self.installSelectionGestures(tab, listbox, false);
@@ -411,9 +421,10 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     var recent_buf: [4300]u8 = undefined;
     self.recordRecentSpec(tab.spec(&recent_buf));
     // The row (or breadcrumb button) that was clicked to get here has
-    // just been destroyed with its widget; without this the window ends
-    // up with no focused widget and every chord stops working.
-    self.refocusListingIfLost();
+    // just been destroyed with its widget; GTK then moves focus to
+    // whatever visible widget it finds -- outside the browser -- and
+    // every chord stops working.
+    self.refocusListingAfterNav();
 }
 
 pub fn goUp(self: *BrowserView, tab: *BTab) void {
@@ -587,6 +598,9 @@ pub const browser_chords = [_]Chord{
         .shadows = .copy_screen,
         .run = &chordInvertSelection,
     },
+    .{ .keyval = c.GDK_KEY_x, .mods = c.GDK_CONTROL_MASK, .what = "cut selection", .run = &chordCut },
+    .{ .keyval = c.GDK_KEY_c, .mods = c.GDK_CONTROL_MASK, .what = "copy selection", .run = &chordCopy },
+    .{ .keyval = c.GDK_KEY_v, .mods = c.GDK_CONTROL_MASK, .what = "paste", .run = &chordPaste },
     .{ .keyval = c.GDK_KEY_i, .mods = c.GDK_CONTROL_MASK, .what = "filter listing", .run = &chordFilter },
     .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_CONTROL_MASK, .what = "flat view", .run = &chordFlat },
     .{ .keyval = c.GDK_KEY_m, .mods = c.GDK_CONTROL_MASK, .what = "mark selection in a register", .run = &selection.chordMark },
@@ -622,6 +636,21 @@ pub const browser_chords = [_]Chord{
 
 fn chordUndo(self: *BrowserView) bool {
     self.performUndo();
+    return true;
+}
+
+fn chordCut(self: *BrowserView) bool {
+    @import("ops.zig").clipSelection(self, true);
+    return true;
+}
+
+fn chordCopy(self: *BrowserView) bool {
+    @import("ops.zig").clipSelection(self, false);
+    return true;
+}
+
+fn chordPaste(self: *BrowserView) bool {
+    @import("ops.zig").pasteIntoCurrent(self);
     return true;
 }
 
