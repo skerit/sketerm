@@ -37,6 +37,7 @@ fn errnoOf(err: fsdrive.Error, last: []const u8) i32 {
         error.Timeout, error.NotConnected => return c.EIO,
         error.OutOfMemory => return c.ENOMEM,
         error.BadReply => return c.EIO,
+        error.BadRequest => return c.EINVAL,
         error.FsOpFailed => {},
     }
     const map = .{

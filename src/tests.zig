@@ -95,6 +95,8 @@ comptime {
     _ = @import("mux/wire.zig");
     _ = @import("mux/fsserve.zig");
     _ = @import("mux/fsjob.zig");
+    _ = @import("mux/mediameta.zig");
+    _ = @import("mux/mediameta_test.zig");
     _ = @import("mux/fsjournal.zig");
     _ = @import("ipc/fsdrive.zig");
     _ = @import("ipc/fstransfer.zig");

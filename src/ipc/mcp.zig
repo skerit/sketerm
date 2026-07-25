@@ -1017,6 +1017,7 @@ const TOOLS_JSON_RAW =
     \\{"name":"file_trash","description":"Move a file or directory to the owning host's freedesktop Trash as a daemon job, preserving restore metadata. Prefer this over permanent deletion.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"wait":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["path"]}},
     \\{"name":"file_chmod","description":"Change permissions on the owning host. Mode is an integer containing octal permission bits (for example 420 = 0644).","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"mode":{"type":"integer"}},"required":["path","mode"]}},
     \\{"name":"file_truncate","description":"Set a file's exact byte length on the owning host.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"size":{"type":"integer"}},"required":["path","size"]}},
+    \\{"name":"file_media_info","description":"Media metadata for MANY files in ONE daemon-side batch: image/video dimensions, JPEG EXIF (camera, lens, orientation, DateTimeOriginal, exposure, GPS), audio tags (ID3v1/v2, Vorbis, MP4 ilst), duration and bitrate. Extraction runs on the host that owns the files and is cached there keyed on path+mtime+size, so re-asking is nearly free and no file bytes cross the network. Values are flat key=value pairs in a stable namespace (media.*, tag.*, exif.*, image.*, doc.*); a duration marked estimated was derived from a bitrate, not read from a header. Files that are not media are answered with an empty field list rather than an error.","inputSchema":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"Absolute file paths (max 128 per call)"}},"required":["paths"]}},
     \\{"name":"file_jobs","description":"List file jobs (running + recently finished): id, op, state, progress. Jobs survive client disconnects.","inputSchema":{"type":"object","properties":{}}},
     \\{"name":"file_job","description":"Control a file job: cancel (SIGKILL — works even on jobs stuck in unkillable IO), pause (SIGSTOP), resume (SIGCONT).","inputSchema":{"type":"object","properties":{"job":{"type":"integer"},"action":{"type":"string","enum":["cancel","pause","resume"]}},"required":["job","action"]}},
     \\{"name":"capabilities","description":"Preflight report of what THIS MCP server can do right now: isolation mode, GUI socket presence, OCR (tesseract) availability, which browser binary browser_open would use, ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.","inputSchema":{"type":"object","properties":{}}},
@@ -6492,6 +6493,37 @@ fn fsTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]c
             return toolResult(arena, msg, false) orelse error.OutOfMemory;
         }
         return fsAwaitJob(arena, fs, job, opname, timeout);
+    }
+    if (eql(u8, name, "file_media_info")) {
+        const list_v = if (args == .object) args.object.get("paths") else null;
+        if (list_v == null or list_v.? != .array) return appErr(arena, "file_media_info needs a 'paths' array");
+        const items = list_v.?.array.items;
+        if (items.len == 0) return appErr(arena, "file_media_info needs at least one path");
+        if (items.len > fsdrive.MEDIA_BATCH_MAX) {
+            const msg = std.fmt.allocPrint(arena, "file_media_info takes at most {d} paths per call", .{fsdrive.MEDIA_BATCH_MAX}) catch return error.OutOfMemory;
+            return appErr(arena, msg);
+        }
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (items) |item| {
+            if (item != .string or item.string.len == 0 or item.string[0] != '/')
+                return appErr(arena, "every file_media_info path must be absolute");
+            paths.append(arena, item.string) catch return error.OutOfMemory;
+        }
+        // "/" plus absolute names: the daemon resolves absolute entries
+        // as-is, so one call can span directories.
+        const rows = fs.mediaMeta(arena, "/", paths.items, 30_000) catch |err|
+            return fsFail(arena, fs, "media_info", err);
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        w.print("{d} files\n", .{rows.len}) catch return error.OutOfMemory;
+        for (rows) |r| {
+            w.print("{s} [{s}]{s}\n", .{
+                r.path, r.kind, if (r.cached) " (cached)" else "",
+            }) catch return error.OutOfMemory;
+            if (r.note.len > 0) w.print("  skipped: {s}\n", .{r.note}) catch return error.OutOfMemory;
+            for (r.fields) |f| w.print("  {s}={s}\n", .{ f.k, f.v }) catch return error.OutOfMemory;
+        }
+        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "file_jobs")) {
         const rows = fs.jobList(arena) catch |err| return fsFail(arena, fs, "job_list", err);

@@ -797,6 +797,222 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
 
 // ── cross-daemon (client-mediated) transfer stage ──────────────
 
+// ── batched media metadata ──────────────────────────────────────
+
+/// A 33-byte PNG header: everything mediameta reads for dimensions.
+fn writePng(path: []const u8, w: u32, h: u32) void {
+    var buf: [33]u8 = undefined;
+    @memcpy(buf[0..8], "\x89PNG\r\n\x1a\x0a");
+    std.mem.writeInt(u32, buf[8..12], 13, .big);
+    @memcpy(buf[12..16], "IHDR");
+    std.mem.writeInt(u32, buf[16..20], w, .big);
+    std.mem.writeInt(u32, buf[20..24], h, .big);
+    buf[24] = 8; // bit depth
+    buf[25] = 6; // colour type
+    buf[26] = 0;
+    buf[27] = 0;
+    buf[28] = 0;
+    std.mem.writeInt(u32, buf[29..33], 0, .big); // crc (never validated)
+    writeFile(path, &buf);
+}
+
+/// 8-bit mono PCM at 8 kHz: `data_bytes` of payload is exactly
+/// data_bytes/8 milliseconds.
+fn writeWav(path: []const u8, data_bytes: u32) void {
+    var buf: [44]u8 = undefined;
+    @memcpy(buf[0..4], "RIFF");
+    std.mem.writeInt(u32, buf[4..8], 36 + data_bytes, .little);
+    @memcpy(buf[8..12], "WAVE");
+    @memcpy(buf[12..16], "fmt ");
+    std.mem.writeInt(u32, buf[16..20], 16, .little);
+    std.mem.writeInt(u16, buf[20..22], 1, .little); // PCM
+    std.mem.writeInt(u16, buf[22..24], 1, .little); // mono
+    std.mem.writeInt(u32, buf[24..28], 8000, .little); // sample rate
+    std.mem.writeInt(u32, buf[28..32], 8000, .little); // byte rate
+    std.mem.writeInt(u16, buf[32..34], 1, .little); // block align
+    std.mem.writeInt(u16, buf[34..36], 8, .little); // bits
+    @memcpy(buf[36..40], "data");
+    std.mem.writeInt(u32, buf[40..44], data_bytes, .little);
+    var z: [4096]u8 = undefined;
+    const p = pathz.pathZ(&z, path) catch fail("media wav path");
+    const f = c.fopen(p, "wb") orelse fail("media wav open");
+    defer _ = c.fclose(f);
+    if (c.fwrite(&buf, 1, buf.len, f) != buf.len) fail("media wav header");
+    var silence: [1024]u8 = @splat(0x80);
+    var left: usize = data_bytes;
+    while (left > 0) {
+        const n = @min(left, silence.len);
+        if (c.fwrite(&silence, 1, n, f) != n) fail("media wav data");
+        left -= n;
+    }
+}
+
+/// 20 constant-bitrate MPEG1 Layer III frames plus an ID3v1 trailer.
+fn writeMp3(path: []const u8) void {
+    const FRAME_LEN = 417; // 128 kbps, 44.1 kHz, no padding
+    var body: [20 * FRAME_LEN + 128]u8 = @splat(0);
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        @memcpy(body[i * FRAME_LEN ..][0..4], &[_]u8{ 0xFF, 0xFB, 0x90, 0x00 });
+    }
+    const tag = body[20 * FRAME_LEN ..];
+    @memcpy(tag[0..3], "TAG");
+    @memcpy(tag[3..][0.."Smoke Title".len], "Smoke Title");
+    @memcpy(tag[33..][0.."Smoke Artist".len], "Smoke Artist");
+    @memcpy(tag[93..97], "1998");
+    tag[127] = 17; // Rock
+    writeFile(path, &body);
+}
+
+fn writeFile(path: []const u8, bytes: []const u8) void {
+    var z: [4096]u8 = undefined;
+    const p = pathz.pathZ(&z, path) catch fail("media path");
+    const f = c.fopen(p, "wb") orelse fail("media open");
+    defer _ = c.fclose(f);
+    if (c.fwrite(bytes.ptr, 1, bytes.len, f) != bytes.len) fail("media write");
+}
+
+/// Pin a file's mtime so cache invalidation is tested deterministically
+/// rather than at the mercy of timestamp granularity.
+fn setMtime(path: []const u8, secs: i64) void {
+    var z: [4096]u8 = undefined;
+    const p = pathz.pathZ(&z, path) catch fail("media mtime path");
+    const times = [2]c.struct_timespec{
+        .{ .tv_sec = @intCast(secs), .tv_nsec = 0 },
+        .{ .tv_sec = @intCast(secs), .tv_nsec = 0 },
+    };
+    if (c.utimensat(c.AT_FDCWD, p, &times, 0) != 0) fail("media utimensat");
+}
+
+fn mediaField(r: fsdrive.MediaResult, key: []const u8) []const u8 {
+    return r.get(key) orelse {
+        std.debug.print("smoke-fs: media result {s} has no {s}\n", .{ r.path, key });
+        fail("media field missing");
+    };
+}
+
+fn mediaFind(rows: []fsdrive.MediaResult, name: []const u8) fsdrive.MediaResult {
+    for (rows) |r| {
+        if (std.mem.endsWith(u8, r.path, name)) return r;
+    }
+    std.debug.print("smoke-fs: no media result for {s}\n", .{name});
+    fail("media result missing");
+}
+
+fn expectMedia(r: fsdrive.MediaResult, key: []const u8, want: []const u8) void {
+    const got = mediaField(r, key);
+    if (!std.mem.eql(u8, got, want)) {
+        std.debug.print("smoke-fs: {s} {s} = \"{s}\", expected \"{s}\"\n", .{ r.path, key, got, want });
+        fail("media value mismatch");
+    }
+}
+
+/// Batched, cached, host-side media metadata: one request covers many
+/// files, the second request is served from the daemon-host cache, and
+/// a modified file invalidates only its own entry.
+fn mediaStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []const u8) void {
+    var dbuf: [64]u8 = undefined;
+    const dir = mkTmpDir(&dbuf, tag ++ "-media");
+    var fs = fsdrive.Fs.connect(allocator, sock_path) catch fail("media fs connect");
+    defer fs.deinit();
+
+    var pb: [4][4096]u8 = undefined;
+    const png = std.fmt.bufPrint(&pb[0], "{s}/shot.png", .{dir}) catch unreachable;
+    const wav = std.fmt.bufPrint(&pb[1], "{s}/tone.wav", .{dir}) catch unreachable;
+    const mp3 = std.fmt.bufPrint(&pb[2], "{s}/song.mp3", .{dir}) catch unreachable;
+    const txt = std.fmt.bufPrint(&pb[3], "{s}/notes.txt", .{dir}) catch unreachable;
+    writePng(png, 300, 150);
+    writeWav(wav, 4000); // 500 ms
+    writeMp3(mp3);
+    touch(dir, "notes.txt", "plain text, not media\n");
+    setMtime(png, 1_700_000_000);
+    _ = txt;
+
+    const names = [_][]const u8{ "shot.png", "tone.wav", "song.mp3", "notes.txt", "missing.jpg" };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const first = fs.mediaMeta(arena.allocator(), dir, &names, 20_000) catch
+        failErr("media batch", fs.lastErr());
+    // One reply covers every requested row, never one round trip per row.
+    if (first.len != names.len) fail("media batch dropped rows");
+    for (first) |r| {
+        if (r.cached) fail("first media batch was served from cache");
+    }
+
+    const png_row = mediaFind(first, "shot.png");
+    expectMedia(png_row, "media.kind", "image");
+    expectMedia(png_row, "media.format", "png");
+    expectMedia(png_row, "media.width", "300");
+    expectMedia(png_row, "media.height", "150");
+    expectMedia(png_row, "media.bit_depth", "8");
+
+    const wav_row = mediaFind(first, "tone.wav");
+    expectMedia(wav_row, "media.kind", "audio");
+    expectMedia(wav_row, "media.sample_rate", "8000");
+    expectMedia(wav_row, "media.channels", "1");
+    expectMedia(wav_row, "media.duration_ms", "500");
+
+    const mp3_row = mediaFind(first, "song.mp3");
+    expectMedia(mp3_row, "media.kind", "audio");
+    expectMedia(mp3_row, "tag.title", "Smoke Title");
+    expectMedia(mp3_row, "tag.artist", "Smoke Artist");
+    expectMedia(mp3_row, "tag.year", "1998");
+    expectMedia(mp3_row, "tag.genre", "Rock");
+    expectMedia(mp3_row, "media.bitrate_kbps", "128");
+    // Derived from the bitrate, and labelled as derived.
+    expectMedia(mp3_row, "media.duration_estimated", "1");
+
+    // A non-media file is answered, not skipped silently: the caller
+    // learns the row was examined and has nothing to show.
+    const txt_row = mediaFind(first, "notes.txt");
+    if (!std.mem.eql(u8, txt_row.kind, "unknown") or txt_row.fields.len != 0)
+        fail("non-media file reported metadata");
+    const gone_row = mediaFind(first, "missing.jpg");
+    if (gone_row.note.len == 0) fail("missing file carried no note");
+
+    // ── second request: same values, served from the cache ─────
+    var arena2 = std.heap.ArenaAllocator.init(allocator);
+    defer arena2.deinit();
+    const second = fs.mediaMeta(arena2.allocator(), dir, &names, 20_000) catch
+        failErr("media batch (cached)", fs.lastErr());
+    if (second.len != names.len) fail("cached media batch dropped rows");
+    for ([_][]const u8{ "shot.png", "tone.wav", "song.mp3" }) |name| {
+        const row = mediaFind(second, name);
+        if (!row.cached) {
+            std.debug.print("smoke-fs: {s} was re-extracted instead of cached\n", .{name});
+            fail("media cache miss on repeat");
+        }
+        const before = mediaFind(first, name);
+        if (row.fields.len != before.fields.len) fail("cached media differs from extracted");
+        for (before.fields) |f| expectMedia(row, f.k, f.v);
+    }
+
+    // ── modification invalidates only that file's entry ────────
+    writePng(png, 640, 400);
+    setMtime(png, 1_700_000_099);
+    var arena3 = std.heap.ArenaAllocator.init(allocator);
+    defer arena3.deinit();
+    const third = fs.mediaMeta(arena3.allocator(), dir, &names, 20_000) catch
+        failErr("media batch (invalidated)", fs.lastErr());
+    const png_again = mediaFind(third, "shot.png");
+    if (png_again.cached) fail("modified file was served from a stale cache entry");
+    expectMedia(png_again, "media.width", "640");
+    expectMedia(png_again, "media.height", "400");
+    if (!mediaFind(third, "song.mp3").cached) fail("untouched file lost its cache entry");
+
+    // The batch cap is enforced daemon-side rather than truncating
+    // silently at some layer in between.
+    var big: [fsdrive.MEDIA_BATCH_MAX + 1][]const u8 = undefined;
+    for (&big) |*slot| slot.* = "shot.png";
+    if (fs.startMediaMeta(dir, &big)) |_| {
+        fail("oversized media batch was accepted");
+    } else |err| {
+        if (err != fsdrive.Error.BadRequest) fail("oversized media batch gave the wrong error");
+    }
+    std.debug.print("smoke-fs: {s} media stage ok\n", .{tag});
+}
+
 const XferConns = struct {
     src: client_mod.Conn,
     dst: client_mod.Conn,
@@ -1027,6 +1243,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // death stage does this on purpose) must surface as EPIPE, not
     // kill the process.
     _ = c.signal(c.SIGPIPE, &sigNoop);
+    // Media extraction caches under the daemon host's state dir; point
+    // it at a private directory so a smoke run never touches (or is
+    // confused by) the real user cache. Job helpers inherit this.
+    var media_cache_buf: [128:0]u8 = undefined;
+    const media_cache = std.fmt.bufPrintZ(&media_cache_buf, "/tmp/sketerm-smoke-fs-media-{d}", .{c.getpid()}) catch unreachable;
+    _ = c.setenv("SKETERM_MEDIA_CACHE_DIR", media_cache.ptr, 1);
     var gpa_state: std.heap.DebugAllocator(.{ .safety = true }) = .{};
     defer if (gpa_state.deinit() == .leak) {
         std.debug.print("smoke-fs: FAIL — leaked memory (see GPA report above)\n", .{});
@@ -1041,6 +1263,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const th = std.Thread.spawn(.{}, daemonMain, .{d}) catch fail("thread spawn");
     fsStage(allocator, sock_path, "mono");
     jobStage(allocator, sock_path, "mono");
+    mediaStage(allocator, sock_path, "mono");
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
         defer conn.deinit();
@@ -1080,6 +1303,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const bth = std.Thread.spawn(.{}, daemonMain, .{bd}) catch fail("broker thread");
     fsStage(allocator, bsock, "broker");
     jobStage(allocator, bsock, "broker");
+    mediaStage(allocator, bsock, "broker");
     {
         var conn = client_mod.Conn.connect(allocator, bsock) catch fail("broker shutdown connect");
         defer conn.deinit();
