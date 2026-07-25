@@ -10,6 +10,7 @@ const fstransfer = @import("../../ipc/fstransfer.zig");
 const browser_model = @import("../../filebrowser/model.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
+const TabSel = @import("selection.zig").TabSel;
 const TabView = @import("views.zig").TabView;
 const formatSpec = @import("../../filebrowser/paths.zig").formatSpec;
 
@@ -338,6 +339,8 @@ pub const BTab = struct {
     virtual_spec: []u8 = &.{},
     /// Grouping, zoom and the collapsed-group set (views.zig).
     vs: TabView = .{},
+    /// Sticky-click flag and visual-mode anchor (selection.zig).
+    sel: TabSel = .{},
     page: *c.GtkWidget,
     listbox: *c.GtkListBox,
     tab_label: *c.GtkLabel,
@@ -455,6 +458,7 @@ pub const BTab = struct {
         if (self.filter.len > 0) a.free(self.filter);
         if (self.virtual_spec.len > 0) a.free(self.virtual_spec);
         self.vs.deinit(a);
+        self.sel.deinit(a);
         a.destroy(self);
     }
 };
@@ -624,12 +628,6 @@ pub const EditWatch = struct {
         allocator.free(self.cache_path);
         allocator.destroy(self);
     }
-};
-
-/// An owned collection item.
-pub const OwnedColl = struct {
-    spec: []u8,
-    dir: bool,
 };
 
 /// An owned saved-search record.

@@ -89,8 +89,19 @@ pub fn renderPlaces(self: *BrowserView) void {
     self.placeRow("drive-harddisk-symbolic", "File System", "local:/", false);
     var trash_buf: [4200]u8 = undefined;
     if (trashFilesDir(&trash_buf)) |td| self.placeRow("user-trash-symbolic", "Trash", td, false);
-    if (self.collection_items.items.len > 0)
-        self.placeRow("folder-saved-search-symbolic", "Collection", "collection:", false);
+    const store = self.regStore();
+    if (store.count() > 0) {
+        self.placeHeader("Registers");
+        var ri: usize = 0;
+        while (ri < store.count()) : (ri += 1) {
+            const name = store.nameAt(ri);
+            var lbl: [160]u8 = undefined;
+            const ltxt = std.fmt.bufPrint(&lbl, "{s} ({d})", .{ name, store.sizeOf(name) }) catch name;
+            var spec_buf: [80]u8 = undefined;
+            const rspec = std.fmt.bufPrint(&spec_buf, "register:{s}", .{name}) catch continue;
+            self.placeRow("folder-saved-search-symbolic", ltxt, rspec, false);
+        }
+    }
     if (self.bookmarks.items.len > 0) {
         self.placeHeader("Bookmarks");
         for (self.bookmarks.items) |b| {
@@ -159,11 +170,14 @@ pub fn onPlaceActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaq
         self.runSavedSearch(idx);
         return;
     }
-    if (std.mem.eql(u8, ctx.spec, "collection:")) {
-        const t = self.ensureCollectionTab(null, "/") orelse return;
-        const pn = c.gtk_notebook_page_num(self.notebook, t.page);
-        if (pn >= 0) c.gtk_notebook_set_current_page(self.notebook, pn);
-        self.renderTab(t);
+    if (std.mem.startsWith(u8, ctx.spec, "register:")) {
+        // registerTab re-points the tab, which frees the name it was
+        // showing -- and that could be this very slice.
+        var nbuf: [80]u8 = undefined;
+        const name = ctx.spec["register:".len..];
+        if (name.len > nbuf.len) return;
+        @memcpy(nbuf[0..name.len], name);
+        _ = self.registerTab(nbuf[0..name.len]);
         return;
     }
     const tab = self.currentTab() orelse {
@@ -255,11 +269,10 @@ pub fn savePlaces(self: *BrowserView) void {
     for (self.saved_searches.items, 0..) |sv, i| {
         sq[i] = .{ .spec = sv.spec, .pattern = sv.pattern, .content = sv.content };
     }
-    const cl = a.alloc(places_mod.CollItem, self.collection_items.items.len) catch return;
-    for (self.collection_items.items, 0..) |ci, i| {
-        cl[i] = .{ .spec = ci.spec, .dir = ci.dir };
-    }
-    places_mod.save(self.allocator, .{ .bookmarks = bm, .recent = rc, .searches = sq, .collection = cl });
+    // `collection` is deliberately written empty: the shelf lives in
+    // the register store now, and places.json only still carries the
+    // field so a pre-register file can be migrated exactly once.
+    places_mod.save(self.allocator, .{ .bookmarks = bm, .recent = rc, .searches = sq, .collection = &.{} });
 }
 
 pub fn addBookmark(self: *BrowserView, spec: []const u8) void {

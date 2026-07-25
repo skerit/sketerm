@@ -18,6 +18,7 @@ const HostConn = @import("types.zig").HostConn;
 const NavigationIntent = @import("types.zig").NavigationIntent;
 const Pending = @import("types.zig").Pending;
 const RowCtx = @import("render.zig").RowCtx;
+const selection = @import("selection.zig");
 const completionMatches = @import("../../filebrowser/paths.zig").completionMatches;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const mountBypass = @import("../../filebrowser/paths.zig").mountBypass;
@@ -128,6 +129,9 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(listbox, @ptrCast(rclick));
 
+    // Sticky-click toggling and the visual-mode keys, both capture
+    // phase so GtkListBox does not get there first.
+    self.installSelectionGestures(tab, listbox, false);
     // Mouse side buttons navigate history anywhere in the listing;
     // middle click opens folders in tabs and closes this one.
     self.installNavGestures(tab, page);
@@ -173,8 +177,9 @@ pub fn closeTab(self: *BrowserView, tab: *BTab) void {
     // history this is about to free.
     self.stashClosedTab(tab);
     self.flatForget(tab);
+    self.visualForget(tab);
     if (self.search_tab == tab) self.search_tab = null;
-    if (self.collection_tab == tab) self.collection_tab = null;
+    if (self.register_tab == tab) self.register_tab = null;
     if (self.arch_tab == tab) {
         self.arch_tab = null;
         self.arch_job = 0;
@@ -331,6 +336,8 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     self.applyHistoryIntent(tab, intent);
     for (tab.selected.items) |value| self.allocator.free(value);
     tab.selected.clearRetainingCapacity();
+    // The rows the visual range was anchored in are about to go.
+    self.visualForget(tab);
     self.ta_len = 0;
     tab.dropSubdirsUnder(tab.root.path);
     self.cancelPendingDir(tab.root);
@@ -443,6 +450,184 @@ pub fn entryForPath(tab: *BTab, path: []const u8) ?*Entry {
     return &dir.entries.items[idx];
 }
 
+/// One chord the browser face claims before the global binding table
+/// ever sees it.
+///
+/// This table IS the enumeration: `onBrowserKey` dispatches through
+/// it, and the audit test below cross-references every entry against
+/// `input.default_bindings`, so a chord that starts shadowing a
+/// global action fails the suite instead of waiting for a reviewer.
+pub const Chord = struct {
+    /// Lower-cased keyval (`gdk_keyval_to_lower` is identity for the
+    /// non-letter keys, so the handler can match one form).
+    keyval: c_uint,
+    mods: c_uint,
+    /// What the browser face does with it (audit failure message).
+    what: []const u8,
+    /// The global action this DELIBERATELY shadows while the browser
+    /// face has focus. Non-null is the allow-list: null means the
+    /// chord must stay free in `input.zig`.
+    shadows: ?input.Action = null,
+    /// Returns true when the chord was consumed; false keeps
+    /// dispatching (conditional chords: F5 without a peer pane,
+    /// Escape with no type-ahead prefix, Space mid-word).
+    /// null = the chord is consumed by a per-tab CAPTURE-phase
+    /// controller instead (visual mode's movement keys, which
+    /// GtkListBox would otherwise swallow before this handler runs);
+    /// it is listed here so the audit still covers it.
+    run: ?*const fn (self: *BrowserView) bool = null,
+};
+
+/// The chords the browser face intercepts, and why the two shadowed
+/// globals are intentional:
+///
+/// - Ctrl+Shift+A shadows `copy_screen`. The browser face COVERS the
+///   pane's terminal, so copying its screen has no visible subject;
+///   Ctrl+Shift+A is Dolphin's invert-selection chord.
+/// - Ctrl+Shift+X shadows `copy_mode`. Copy mode is the terminal's
+///   keyboard-selection mode; visual select mode is the browser's.
+///   Same chord, same concept, whichever face is showing.
+///
+/// Everything else here is free in `input.zig` and the audit test
+/// keeps it that way. Note that these chords are HARDCODED: a user
+/// who rebinds an action in config.conf changes the global table
+/// (which this handler still consults, last), not this list.
+pub const browser_chords = [_]Chord{
+    .{ .keyval = c.GDK_KEY_z, .mods = c.GDK_CONTROL_MASK, .what = "undo", .run = &chordUndo },
+    .{ .keyval = c.GDK_KEY_y, .mods = c.GDK_CONTROL_MASK, .what = "redo", .run = &chordRedo },
+    .{ .keyval = c.GDK_KEY_l, .mods = c.GDK_CONTROL_MASK, .what = "edit location", .run = &chordLocation },
+    .{ .keyval = c.GDK_KEY_s, .mods = c.GDK_CONTROL_MASK, .what = "select by pattern", .run = &chordSelectPattern },
+    .{ .keyval = c.GDK_KEY_a, .mods = c.GDK_CONTROL_MASK, .what = "select all", .run = &chordSelectAll },
+    .{
+        .keyval = c.GDK_KEY_a,
+        .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK,
+        .what = "invert selection",
+        .shadows = .copy_screen,
+        .run = &chordInvertSelection,
+    },
+    .{ .keyval = c.GDK_KEY_i, .mods = c.GDK_CONTROL_MASK, .what = "filter listing", .run = &chordFilter },
+    .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_CONTROL_MASK, .what = "flat view", .run = &chordFlat },
+    .{ .keyval = c.GDK_KEY_m, .mods = c.GDK_CONTROL_MASK, .what = "mark selection in a register", .run = &selection.chordMark },
+    .{
+        .keyval = c.GDK_KEY_x,
+        .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK,
+        .what = "visual select mode",
+        .shadows = .copy_mode,
+        .run = &selection.chordVisual,
+    },
+    // Marking is capture phase too: GtkListBox binds Ctrl+Space to
+    // activate-cursor-row, which OPENS the focused file.
+    .{ .keyval = c.GDK_KEY_Insert, .mods = 0, .what = "toggle mark, step down" },
+    .{ .keyval = c.GDK_KEY_space, .mods = c.GDK_CONTROL_MASK, .what = "toggle mark, step down" },
+    .{ .keyval = c.GDK_KEY_KP_Space, .mods = c.GDK_CONTROL_MASK, .what = "toggle mark, step down" },
+    .{ .keyval = c.GDK_KEY_Left, .mods = c.GDK_ALT_MASK, .what = "back", .run = &chordBack },
+    .{ .keyval = c.GDK_KEY_Right, .mods = c.GDK_ALT_MASK, .what = "forward", .run = &chordForward },
+    .{ .keyval = c.GDK_KEY_Up, .mods = c.GDK_ALT_MASK, .what = "up one directory", .run = &chordUp },
+    .{ .keyval = c.GDK_KEY_F5, .mods = 0, .what = "copy to the other pane", .run = &chordCopyPeer },
+    .{ .keyval = c.GDK_KEY_F6, .mods = 0, .what = "move to the other pane", .run = &chordMovePeer },
+    .{ .keyval = c.GDK_KEY_BackSpace, .mods = 0, .what = "type-ahead backspace", .run = &chordTypeaheadBackspace },
+    .{ .keyval = c.GDK_KEY_Escape, .mods = 0, .what = "clear the type-ahead prefix", .run = &chordTypeaheadReset },
+    .{ .keyval = c.GDK_KEY_space, .mods = 0, .what = "Quick Look", .run = &chordQuickLook },
+    .{ .keyval = c.GDK_KEY_KP_Space, .mods = 0, .what = "Quick Look", .run = &chordQuickLook },
+    // Visual mode's own keys: consumed per tab, in capture phase.
+    .{ .keyval = c.GDK_KEY_Up, .mods = 0, .what = "visual mode: extend up" },
+    .{ .keyval = c.GDK_KEY_Down, .mods = 0, .what = "visual mode: extend down" },
+    .{ .keyval = c.GDK_KEY_Home, .mods = 0, .what = "visual mode: extend to the top" },
+    .{ .keyval = c.GDK_KEY_End, .mods = 0, .what = "visual mode: extend to the bottom" },
+    .{ .keyval = c.GDK_KEY_Return, .mods = 0, .what = "visual mode: commit" },
+    .{ .keyval = c.GDK_KEY_KP_Enter, .mods = 0, .what = "visual mode: commit" },
+};
+
+fn chordUndo(self: *BrowserView) bool {
+    self.performUndo();
+    return true;
+}
+
+fn chordRedo(self: *BrowserView) bool {
+    self.performRedo();
+    return true;
+}
+
+fn chordLocation(self: *BrowserView) bool {
+    self.toggleLocationFace();
+    return true;
+}
+
+fn chordSelectPattern(self: *BrowserView) bool {
+    self.showSelectPattern();
+    return true;
+}
+
+fn chordSelectAll(self: *BrowserView) bool {
+    self.selectPattern("*", false);
+    return true;
+}
+
+fn chordInvertSelection(self: *BrowserView) bool {
+    self.selectPattern("*", true);
+    return true;
+}
+
+fn chordFilter(self: *BrowserView) bool {
+    self.toggleFilter();
+    return true;
+}
+
+fn chordFlat(self: *BrowserView) bool {
+    if (self.currentTab()) |tab| self.toggleFlat(tab);
+    return true;
+}
+
+fn chordBack(self: *BrowserView) bool {
+    const tab = self.currentTab() orelse return false;
+    self.goBack(tab);
+    return true;
+}
+
+fn chordForward(self: *BrowserView) bool {
+    const tab = self.currentTab() orelse return false;
+    self.goForward(tab);
+    return true;
+}
+
+fn chordUp(self: *BrowserView) bool {
+    const tab = self.currentTab() orelse return false;
+    self.goUp(tab);
+    return true;
+}
+
+/// Orthodox dual-pane verbs: the other browser pane in this sketerm
+/// tab is the implicit destination. With no peer the key is not ours.
+fn chordCopyPeer(self: *BrowserView) bool {
+    if (self.peerView() == null) return false;
+    self.sendToPeer(false, null);
+    return true;
+}
+
+fn chordMovePeer(self: *BrowserView) bool {
+    if (self.peerView() == null) return false;
+    self.sendToPeer(true, null);
+    return true;
+}
+
+fn chordTypeaheadBackspace(self: *BrowserView) bool {
+    return self.typeaheadBackspace();
+}
+
+fn chordTypeaheadReset(self: *BrowserView) bool {
+    if (self.ta_len == 0) return false;
+    self.typeaheadReset();
+    return true;
+}
+
+/// Space previews the focused entry full-pane (preview.zig owns the
+/// overlay and its own Escape/arrow/Enter keys). Mid-word the space
+/// belongs to type-ahead instead.
+fn chordQuickLook(self: *BrowserView) bool {
+    if (self.ta_len != 0) return false;
+    return self.quickLookToggle();
+}
+
 pub fn onBrowserKey(
     _: *c.GtkEventControllerKey,
     keyval: c_uint,
@@ -453,67 +638,11 @@ pub fn onBrowserKey(
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
     const lower_pre: c_uint = c.gdk_keyval_to_lower(keyval);
     const mods = state & input.SIGNIFICANT_MODS;
-    if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_z) {
-        self.performUndo();
-        return 1;
+    for (browser_chords) |chord| {
+        if (chord.keyval != lower_pre or chord.mods != mods) continue;
+        const run = chord.run orelse continue;
+        if (run(self)) return 1;
     }
-    if (mods == (c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK) and lower_pre == c.GDK_KEY_z) {
-        self.performRedo();
-        return 1;
-    }
-    if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_l) {
-        self.toggleLocationFace();
-        return 1;
-    }
-    if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_s) {
-        self.showSelectPattern();
-        return 1;
-    }
-    if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_a) {
-        self.selectPattern("*", false);
-        return 1;
-    }
-    // Invert-selection moved off Ctrl+I (Dolphin's filter chord) onto
-    // Dolphin's own invert chord.
-    if (mods == (c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK) and lower_pre == c.GDK_KEY_a) {
-        self.selectPattern("*", true);
-        return 1;
-    }
-    if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_i) {
-        self.toggleFilter();
-        return 1;
-    }
-    if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_b) {
-        if (self.currentTab()) |tab| self.toggleFlat(tab);
-        return 1;
-    }
-    if (mods == c.GDK_ALT_MASK) {
-        const tab = self.currentTab() orelse return 0;
-        if (keyval == c.GDK_KEY_Left) { self.goBack(tab); return 1; }
-        if (keyval == c.GDK_KEY_Right) { self.goForward(tab); return 1; }
-        if (keyval == c.GDK_KEY_Up) { self.goUp(tab); return 1; }
-    }
-    // Orthodox dual-pane verbs: the other browser pane in this tab
-    // is the implicit destination.
-    if (mods == 0 and (keyval == c.GDK_KEY_F5 or keyval == c.GDK_KEY_F6)) {
-        if (self.peerView() != null) {
-            self.sendToPeer(keyval == c.GDK_KEY_F6, null);
-            return 1;
-        }
-    }
-    if (mods == 0 and keyval == c.GDK_KEY_BackSpace) {
-        if (self.typeaheadBackspace()) return 1;
-    }
-    if (mods == 0 and keyval == c.GDK_KEY_Escape and self.ta_len > 0) {
-        self.typeaheadReset();
-        return 1;
-    }
-    // Quick Look: Space previews the focused entry full-pane
-    // (preview.zig owns the overlay and its own Escape/arrow/Enter
-    // keys). Mid-word the space belongs to type-ahead instead.
-    if (mods == 0 and self.ta_len == 0 and
-        (keyval == c.GDK_KEY_space or keyval == c.GDK_KEY_KP_Space) and
-        self.quickLookToggle()) return 1;
     // Type-ahead: plain printable keys jump to the first matching
     // name. Runs BEFORE the binding table only for keys no binding
     // claims, since this handler is bubble-phase and a focused
@@ -935,4 +1064,51 @@ pub fn idleAfterSwitch(user: ?*anyopaque) callconv(.c) c.gboolean {
     }
     self.updatePreview();
     return 0;
+}
+
+test "no browser-face chord shadows a global binding undeclared" {
+    // onBrowserKey runs in the bubble phase and returns 1 for every
+    // chord it claims, so anything in `browser_chords` is INVISIBLE
+    // to the global binding table while a browser face has focus.
+    // A shadow is therefore only allowed when the entry declares it.
+    for (browser_chords) |chord| {
+        const hit = input.matchBinding(&input.default_bindings, chord.keyval, chord.mods);
+        if (hit) |action| {
+            const declared = chord.shadows orelse {
+                std.debug.print("browser chord ({s}) silently shadows the global action {s}\n", .{
+                    chord.what, input.actionName(action),
+                });
+                return error.UndeclaredBrowserChordShadow;
+            };
+            if (declared != action) {
+                std.debug.print("browser chord ({s}) declares a shadow of {s} but now shadows {s}\n", .{
+                    chord.what, input.actionName(declared), input.actionName(action),
+                });
+                return error.BrowserChordShadowDrifted;
+            }
+        } else if (chord.shadows) |stale| {
+            // The global moved away: drop the declaration rather than
+            // keep a rationale for a shadow that no longer happens.
+            std.debug.print("browser chord ({s}) still declares a shadow of {s}, which no longer binds it\n", .{
+                chord.what, input.actionName(stale),
+            });
+            return error.StaleBrowserChordShadow;
+        }
+    }
+}
+
+test "type-ahead cannot swallow an unmodified global binding" {
+    // Type-ahead claims every printable key with no modifier (or
+    // Shift), which would shadow any global bound the same way.
+    for (input.default_bindings) |b| {
+        const mods = b.mods & input.SIGNIFICANT_MODS;
+        if (mods != 0 and mods != c.GDK_SHIFT_MASK) continue;
+        const uni = c.gdk_keyval_to_unicode(b.keyval);
+        if (uni >= 0x21 and uni <= 0x7e) {
+            std.debug.print("global binding {s} uses a bare printable key type-ahead eats first\n", .{
+                input.actionName(b.action),
+            });
+            return error.TypeaheadShadowsGlobalBinding;
+        }
+    }
 }

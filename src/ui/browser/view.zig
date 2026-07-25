@@ -41,7 +41,6 @@ const JobRow = @import("types.zig").JobRow;
 const LabelProbe = @import("props.zig").LabelProbe;
 const MAX_ATTR_COLUMNS = @import("render.zig").MAX_ATTR_COLUMNS;
 const OpenWithCtx = @import("open.zig").OpenWithCtx;
-const OwnedColl = @import("types.zig").OwnedColl;
 const OwnedSearch = @import("types.zig").OwnedSearch;
 const PathCompletion = @import("nav.zig").PathCompletion;
 const Pending = @import("types.zig").Pending;
@@ -56,6 +55,7 @@ const ThumbCtx = @import("preview.zig").ThumbCtx;
 const UndoOp = @import("types.zig").UndoOp;
 const locbar = @import("locbar.zig");
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
+const selmod = @import("selection.zig");
 const tabsmod = @import("tabs.zig");
 const viewsmod = @import("views.zig");
 
@@ -84,6 +84,8 @@ pub const BrowserView = struct {
     closed_tabs: tabsmod.State = .{},
     /// Grouping / zoom / filter / flat view / per-folder view memory.
     views: viewsmod.State = .{},
+    /// Sticky selection, visual range mode, persistent registers.
+    sel: selmod.State = .{},
     back_button: *c.GtkWidget = undefined,
     fwd_button: *c.GtkWidget = undefined,
     completion_popover: ?*c.GtkWidget = null,
@@ -152,8 +154,6 @@ pub const BrowserView = struct {
     recent: std.ArrayList([]u8) = .empty,
     /// Saved searches (persisted with places).
     saved_searches: std.ArrayList(OwnedSearch) = .empty,
-    /// Persistent collection shelf (specs + kind).
-    collection_items: std.ArrayList(OwnedColl) = .empty,
     /// The most recent search run (owned), for the save button.
     last_search: ?OwnedSearch = null,
     /// Relative-time filter for the NEXT find job ("@7d pattern").
@@ -186,7 +186,9 @@ pub const BrowserView = struct {
     search_job: u64 = 0,
     search_hc: ?*HostConn = null,
     search_tab: ?*BTab = null,
-    collection_tab: ?*BTab = null,
+    /// The one open register tab (its register name lives in the
+    /// tab's `virtual_spec`).
+    register_tab: ?*BTab = null,
     /// Window-level abilities, installed by the owning Window.
     hooks_ctx: ?*anyopaque = null,
     on_host_term: ?HostAction = null,
@@ -374,6 +376,25 @@ pub const BrowserView = struct {
     pub const rememberFolder = @import("views.zig").rememberFolder;
     pub const forgetFolder = @import("views.zig").forgetFolder;
     pub const forgetAllFolders = @import("views.zig").forgetAllFolders;
+
+    // selection.zig -- sticky selection, visual mode, registers
+    pub const installSelectionMenu = @import("selection.zig").installSelectionMenu;
+    pub const installSelectionGestures = @import("selection.zig").installSelectionGestures;
+    pub const migrateCollection = @import("selection.zig").migrateCollection;
+    pub const regStore = @import("selection.zig").regStore;
+    pub const toggleSticky = @import("selection.zig").toggleSticky;
+    pub const toggleMarkFocused = @import("selection.zig").toggleMarkFocused;
+    pub const toggleVisual = @import("selection.zig").toggleVisual;
+    pub const commitVisual = @import("selection.zig").commitVisual;
+    pub const cancelVisual = @import("selection.zig").cancelVisual;
+    pub const visualForget = @import("selection.zig").visualForget;
+    pub const markDialog = @import("selection.zig").markDialog;
+    pub const markPaths = @import("selection.zig").markPaths;
+    pub const registerTab = @import("selection.zig").registerTab;
+    pub const appendRegisterRow = @import("selection.zig").appendRegisterRow;
+    pub const selectRegisterHere = @import("selection.zig").selectRegisterHere;
+    pub const copyRegisterHere = @import("selection.zig").copyRegisterHere;
+    pub const deleteRegister = @import("selection.zig").deleteRegister;
 
     // menu.zig -- the entry context menu
     pub const menuButton = @import("menu.zig").menuButton;
@@ -564,11 +585,7 @@ pub const BrowserView = struct {
     pub const addBookmark = @import("places.zig").addBookmark;
     pub const recordRecentSpec = @import("places.zig").recordRecentSpec;
 
-    // search.zig -- find/grep, collections, duplicate finder
-    pub const onMenuCollectionAdd = @import("search.zig").onMenuCollectionAdd;
-    pub const ensureCollectionTab = @import("search.zig").ensureCollectionTab;
-    pub const appendCollectionEntry = @import("search.zig").appendCollectionEntry;
-    pub const onMenuCollectionRemove = @import("search.zig").onMenuCollectionRemove;
+    // search.zig -- find/grep, duplicate finder
     pub const startSearch = @import("search.zig").startSearch;
     pub const onSearchMatch = @import("search.zig").onSearchMatch;
     pub const onSearchUnmatch = @import("search.zig").onSearchUnmatch;
@@ -612,10 +629,6 @@ pub const BrowserView = struct {
                 const owned = allocator.dupe(u8, r) catch continue;
                 self.recent.append(allocator, owned) catch allocator.free(owned);
             }
-            for (parsed.value.collection) |ci| {
-                const spec = allocator.dupe(u8, ci.spec) catch continue;
-                self.collection_items.append(allocator, .{ .spec = spec, .dir = ci.dir }) catch allocator.free(spec);
-            }
             for (parsed.value.searches) |sq| {
                 const spec = allocator.dupe(u8, sq.spec) catch continue;
                 const pat = allocator.dupe(u8, sq.pattern) catch {
@@ -627,12 +640,18 @@ pub const BrowserView = struct {
                     allocator.free(pat);
                 };
             }
+            // The collection shelf is now the `collection` register;
+            // a shelf written by an older build moves over here (and
+            // leaves places.json) exactly once.
+            self.migrateCollection(parsed.value.collection);
         }
         self.loadFileColors();
 
         self.buildUi();
-        // The view menu rides the toolbar buildUi just built.
+        // The view and selection menus ride the toolbar buildUi just
+        // built.
         self.installViewMenu();
+        self.installSelectionMenu();
         pane.attachBrowser(self.root_box, @ptrCast(self), destroyCb);
 
         const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
@@ -822,6 +841,7 @@ pub const BrowserView = struct {
         self.locbar.deinit(self.allocator);
         self.closed_tabs.deinit(self.allocator);
         self.views.deinit(self.allocator);
+        self.sel.deinit(self.allocator);
         self.emblems.deinit();
         self.endProbesFor(null, "");
         self.probes.deinit(self.allocator);
@@ -857,8 +877,6 @@ pub const BrowserView = struct {
         self.recent.deinit(self.allocator);
         for (self.saved_searches.items) |sq| sq.deinitOwned(self.allocator);
         self.saved_searches.deinit(self.allocator);
-        for (self.collection_items.items) |ci| self.allocator.free(ci.spec);
-        self.collection_items.deinit(self.allocator);
         if (self.last_search) |ls| ls.deinitOwned(self.allocator);
         for (self.file_colors.items) |fc| self.allocator.free(fc.glob);
         self.file_colors.deinit(self.allocator);
