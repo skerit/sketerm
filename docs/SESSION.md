@@ -9526,3 +9526,117 @@ MERGED tree was exercised live: breadcrumb segments, Space on a text
 file, an image fit to window, the hex fallback on a random binary,
 arrow stepping both directions, Escape, and the Ctrl+L round trip, with
 a clean log. Rig torn down by exact PID.
+
+## 2026-07-25: views, selection, transfers, file ops, media metadata
+
+Six more commits, each reviewed and independently re-verified before
+merging rather than taken on the implementing agent's word.
+
+**Views.** Grouping with collapsible headers bucketed by the active
+sort key (name initial, size, date, kind, owner, mode), with
+directories forming a leading "Folders" group so a bucket never
+appears twice. Five zoom steps on Ctrl+wheel, capped at 128px because
+that is the freedesktop tier the thumbnail pipeline already generates
+-- zooming can therefore never trigger a re-thumbnail. Ctrl+I
+filter-as-you-type that narrows the current listing and survives a
+pushed delta. Ctrl+B flat view, flattening a subtree into one operable
+list over the existing `live_find` job and `Dir.flat` mode rather than
+a new verb. Per-folder view memory keyed on (host, path) in
+`viewmem.json`, bounded to 256 folders with LRU eviction and an
+explicit forget action -- never a sidecar in the browsed tree.
+
+**Selection.** Sticky mode makes a plain click toggle rather than
+replace, in both list and grid, so a misclick cannot destroy a curated
+set. Registers are named (host, path) mark sets that survive cd, tab
+close and restart, and can be opened, selected, copied into a folder
+or deleted as a unit, grouped by host so one gesture copies a register
+spanning several machines. The collection shelf was the same concept
+unnamed and singular, so it was UNIFIED into registers rather than
+shipped alongside them, with a one-time migration of an existing
+places.json shelf (verified end to end, including a cross-host entry).
+
+**Transfers.** Per-job smoothed rate, computed ETA, expandable detail
+and a throughput sparkline. `MAX_ACTIVE_TRANSFERS` was a global cap of
+2, which both thrashed one destination and needlessly serialized
+unrelated ones; the scheduling decision is now a pure, unit-tested
+function -- same destination host (and local device) serializes,
+different destinations run in parallel, under an overall ceiling.
+Cross-host copies previously bypassed the queue entirely, so a
+ten-file paste put ten helpers on one disk; they now flow through it.
+Unknowns stay unknown: no total means no ETA, a stalled job withholds
+its stale rate.
+
+**File operations.** A collision no longer stalls a paste -- free
+names start immediately and only colliders park, decided against a
+side-by-side view with a newer/older verdict and apply-to-all.
+Directory collisions distinguish merge (keeps destination-only files)
+from replace (removes the destination tree first); both are honestly
+non-undoable, since undo of a merge would delete files that were never
+copied. New from Template reads the templates of the host that owns
+the directory. Hard links are offered only where they can work,
+decided from a device id the daemon ships once per listing, and the
+verb re-checks rather than trusting the client.
+
+**Media metadata, host-side.** `src/mux/mediameta.zig` parses EXIF,
+ID3, Vorbis comments, MP4 atoms, dimensions, duration and bitrate in
+pure Zig on the host that owns the file. Requests are batched and
+answered one event per name, so a listing never becomes one round trip
+per row. Reads are windowed (head prefix plus tail suffix), so a 4 GB
+video costs a few hundred KB and an mp4 whose moov sits at the end
+still resolves; results cache on the daemon host keyed on path, mtime
+and size.
+
+Any key from that namespace is now a sortable column, carried by the
+SAME mechanism as the existing `user.*` xattr columns -- the namespace
+prefix decides the source, so there is one add/remove/sort/persist
+path and adding a media column costs no re-subscription. Sorting is
+type-aware and the comparator is a proven strict weak ordering;
+malformed values rank as missing, because mixing numeric and lexical
+comparison in one column breaks transitivity. Bounded fetching was
+MEASURED at the wire, not asserted: a 50-file and a 5000-file remote
+directory each cost one request, and 120 scroll events coalesced into
+six.
+
+**Two infrastructure findings worth remembering.**
+
+A test block in any `src/ui/browser/*.zig` module SILENTLY NEVER RAN.
+`src/tests.zig` imported only the facade, and re-exporting a few decls
+does not pull a package's tests in. Proven by putting a deliberately
+failing canary in `render.zig` and watching the suite report 897
+passed / 0 failed without mentioning it. `tests.zig` now imports every
+module by name, re-proven by watching the canary fail before removing
+it. Every agent since has been required to confirm new tests BY NAME
+in the runner output, since a count going up by the right number would
+not have caught this.
+
+The browser face intercepts keys bubble-phase, which silently hides
+global bindings. `Ctrl+Shift+Z` was swallowing `restore_closed_tab`
+and `Ctrl+Shift+A` was taking `copy_screen`. The chords are now a
+table, deliberate shadowing is declared with its reason, and a test
+fails on any new undeclared shadow -- the collision class is caught by
+the suite instead of by review.
+
+Also fixed: `currentSpec()` returned a slice into a shared scratch
+buffer that the preview code had already started borrowing for
+something else; the remote-thumbnail pipeline never released its
+single in-flight slot on a failed handoff, killing remote thumbnails
+for the life of the view; tab labels collapsed to "..." because an
+ellipsizing label reports the ellipsis as its minimum width; grid
+tiles were not drag sources, so dragging in icon view rubber-band
+selected instead; two popovers were unreffed while still floating; and
+`saveLayoutQuietly` swallowed three errors, making a lost layout
+indistinguishable from a saved one.
+
+Known and unfixed: `HostConn.cache_req` is read and cleared but never
+assigned, so `hc.cache_dir` stays null and `thumbWriteBack` returns
+early -- remote ROW thumbnails are recomputed every session instead of
+caching on the owning host. Confirmed pre-existing (never assigned even
+before the package split). The daemon-generated x-large preview
+thumbnails are a different path and do work, which is why earlier live
+verification looked convincing.
+
+Verification: unit suite 983 passed / 6 skipped / 0 failed (989
+total); smoke-fs (with new policy and media stages, monolith AND
+broker), smoke-broker, smoke-mcp, smoke-e2e all PASS; GUI, mux, musl
+and aarch64-macOS builds green; mux still links libc/libm only. Every
+live rig torn down by exact PID.
