@@ -88,6 +88,8 @@ pub const Mount = struct {
     uid: u32,
     gid: u32,
     cache: fscache.Cache,
+    /// Write end of the notifier pipe; -1 = notifications disabled.
+    inval_wr: c_int = -1,
 
     fn init(allocator: std.mem.Allocator, fs: *fsdrive.Fs, root: []const u8, namespace: []const u8, fuse_fd: c_int) !*Mount {
         const self = try allocator.create(Mount);
@@ -476,6 +478,76 @@ fn notifyInvalEntry(fd: c_int, parent: u64, name: []const u8) void {
     _ = c.writev(fd, &iov, iov.len);
 }
 
+// ── async invalidation ──────────────────────────────────────────
+//
+// Reverse invalidations (FUSE_NOTIFY_INVAL_INODE/ENTRY) must NEVER be
+// written from the request-serving thread: the kernel side takes folio
+// and directory locks that an in-flight request's caller already holds
+// (a write() holds the target folio lock while it waits for its WRITE
+// reply), so a synchronous notify deadlocks the whole mount. All
+// notifications therefore go through a pipe to a dedicated thread.
+
+const INVAL_NAME_MAX = 1024;
+
+fn readFull(fd: c_int, out: []u8) bool {
+    var off: usize = 0;
+    while (off < out.len) {
+        const n = c.read(fd, out.ptr + off, out.len - off);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        if (n <= 0) return false;
+        off += @intCast(n);
+    }
+    return true;
+}
+
+fn notifierMain(rd: c_int, fuse_fd: c_int) void {
+    var hdr_buf: [11]u8 = undefined;
+    var name_buf: [INVAL_NAME_MAX]u8 = undefined;
+    while (readFull(rd, &hdr_buf)) {
+        const tag = hdr_buf[0];
+        const nodeid = std.mem.readInt(u64, hdr_buf[1..9], .little);
+        const namelen = std.mem.readInt(u16, hdr_buf[9..11], .little);
+        if (namelen > INVAL_NAME_MAX) break;
+        if (namelen > 0 and !readFull(rd, name_buf[0..namelen])) break;
+        switch (tag) {
+            1 => notifyInvalInode(fuse_fd, nodeid),
+            2 => notifyInvalEntry(fuse_fd, nodeid, name_buf[0..namelen]),
+            else => break,
+        }
+    }
+    _ = c.close(rd);
+}
+
+fn sendInval(m: *Mount, rec: []const u8) void {
+    if (m.inval_wr < 0) return;
+    while (true) {
+        const n = c.write(m.inval_wr, rec.ptr, rec.len);
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        // EAGAIN (pipe full) drops the notification. Our own read cache
+        // is invalidated synchronously elsewhere; kernel staleness is
+        // bounded by the next open.
+        return;
+    }
+}
+
+fn queueInvalInode(m: *Mount, nodeid: u64) void {
+    var rec: [11]u8 = undefined;
+    rec[0] = 1;
+    std.mem.writeInt(u64, rec[1..9], nodeid, .little);
+    std.mem.writeInt(u16, rec[9..11], 0, .little);
+    sendInval(m, &rec);
+}
+
+fn queueInvalEntry(m: *Mount, parent: u64, name: []const u8) void {
+    if (name.len == 0 or name.len > INVAL_NAME_MAX) return;
+    var rec: [11 + INVAL_NAME_MAX]u8 = undefined;
+    rec[0] = 2;
+    std.mem.writeInt(u64, rec[1..9], parent, .little);
+    std.mem.writeInt(u16, rec[9..11], @intCast(name.len), .little);
+    @memcpy(rec[11..][0..name.len], name);
+    sendInval(m, rec[0 .. 11 + name.len]);
+}
+
 const cache_state_xattr = "user.sketerm.cache-state";
 const cache_pin_xattr = "user.sketerm.pin";
 const cache_evict_xattr = "user.sketerm.evict";
@@ -516,22 +588,22 @@ fn processDeltas(m: *Mount) void {
             if (dh.view_id != delta.view) continue;
             const parent = m.by_path.get(dh.path) orelse 1;
             if (delta.resync or delta.gone) {
-                notifyInvalInode(m.fuse_fd, parent);
+                queueInvalInode(m, parent);
                 for (m.nodes.items) |maybe_node| {
                     const node = maybe_node orelse continue;
                     const node_parent = std.fs.path.dirname(node.path) orelse continue;
                     if (!std.mem.eql(u8, node_parent, dh.path)) continue;
                     invalidateCached(m, node.path);
-                    notifyInvalEntry(m.fuse_fd, parent, std.fs.path.basename(node.path));
-                    if (m.by_path.get(node.path)) |nodeid| notifyInvalInode(m.fuse_fd, nodeid);
+                    queueInvalEntry(m, parent, std.fs.path.basename(node.path));
+                    if (m.by_path.get(node.path)) |nodeid| queueInvalInode(m, nodeid);
                 }
             }
             for (delta.changes) |change| {
-                notifyInvalEntry(m.fuse_fd, parent, change.name);
+                queueInvalEntry(m, parent, change.name);
                 var path_buf: [4096]u8 = undefined;
                 const full = Mount.joinChild(&path_buf, dh.path, change.name) orelse continue;
                 invalidateCached(m, full);
-                if (m.by_path.get(full)) |nodeid| notifyInvalInode(m.fuse_fd, nodeid);
+                if (m.by_path.get(full)) |nodeid| queueInvalInode(m, nodeid);
             }
             if (!delta.gone) {
                 if (m.fs.list(dh.path)) |listing| {
@@ -687,6 +759,21 @@ fn serveNamespaced(allocator: std.mem.Allocator, fs: *fsdrive.Fs, root: []const 
     if (comptime !is_linux) return error.Unsupported;
     const m = try Mount.init(allocator, fs, root, namespace, fuse_fd);
     defer m.deinit();
+
+    var inval_pipe: [2]c_int = undefined;
+    if (c.pipe(&inval_pipe) != 0) return error.PipeFailed;
+    _ = c.fcntl(inval_pipe[1], c.F_SETFL, c.fcntl(inval_pipe[1], c.F_GETFL, @as(c_int, 0)) | c.O_NONBLOCK);
+    const notifier = std.Thread.spawn(.{}, notifierMain, .{ inval_pipe[0], fuse_fd }) catch {
+        _ = c.close(inval_pipe[0]);
+        _ = c.close(inval_pipe[1]);
+        return error.ThreadFailed;
+    };
+    m.inval_wr = inval_pipe[1];
+    defer {
+        m.inval_wr = -1;
+        _ = c.close(inval_pipe[1]);
+        notifier.join();
+    }
 
     const buf = try allocator.alignedAlloc(u8, std.mem.Alignment.of(u64), MAX_WRITE + 64 * 1024);
     defer allocator.free(buf);
@@ -908,7 +995,7 @@ fn dispatch(m: *Mount, req: []align(8) u8) void {
             var out = std.mem.zeroes(c.struct_fuse_write_out);
             out.size = @intCast(written);
             invalidateCached(m, path);
-            notifyInvalInode(fd, hdr.nodeid);
+            queueInvalInode(m, hdr.nodeid);
             replyStruct(fd, u, out);
         },
         c.FUSE_FLUSH, c.FUSE_RELEASE => replyBytes(fd, u, ""),
@@ -935,7 +1022,7 @@ fn dispatch(m: *Mount, req: []align(8) u8) void {
                 m.fs.truncate(path, in.size) catch |err|
                     return replyErr(fd, u, errnoOf(err, m.fs.lastErr()));
                 invalidateCached(m, path);
-                notifyInvalInode(fd, hdr.nodeid);
+                queueInvalInode(m, hdr.nodeid);
             }
             if (in.valid & c.FATTR_MODE != 0)
                 m.fs.chmod(path, in.mode) catch |err| return replyErr(fd, u, errnoOf(err, m.fs.lastErr()));
@@ -1023,7 +1110,7 @@ fn dispatch(m: *Mount, req: []align(8) u8) void {
             }
             m.cache.remove(full);
             m.removeQueuedPins(full);
-            notifyInvalEntry(fd, hdr.nodeid, name);
+            queueInvalEntry(m, hdr.nodeid, name);
             replyBytes(fd, u, "");
         },
         c.FUSE_RENAME, c.FUSE_RENAME2 => {
@@ -1050,8 +1137,8 @@ fn dispatch(m: *Mount, req: []align(8) u8) void {
             const newp = Mount.joinChild(&b2, nparent, new_name) orelse return replyErr(fd, u, c.ENAMETOOLONG);
             m.fs.rename(oldp, newp) catch |err| return replyErr(fd, u, errnoOf(err, m.fs.lastErr()));
             m.renameCachedPaths(oldp, newp);
-            notifyInvalEntry(fd, hdr.nodeid, old_name);
-            notifyInvalEntry(fd, newdir, new_name);
+            queueInvalEntry(m, hdr.nodeid, old_name);
+            queueInvalEntry(m, newdir, new_name);
             m.renameDirHandles(oldp, newp);
             m.renamePaths(oldp, newp);
             replyBytes(fd, u, "");
@@ -1141,7 +1228,7 @@ fn dispatch(m: *Mount, req: []align(8) u8) void {
             } else if (std.mem.eql(u8, name, cache_evict_xattr)) {
                 if (!std.mem.eql(u8, value, "1")) return replyErr(fd, u, c.EINVAL);
                 if (!m.cache.evict(entry)) return replyErr(fd, u, c.EBUSY);
-                notifyInvalInode(fd, hdr.nodeid);
+                queueInvalInode(m, hdr.nodeid);
                 replyBytes(fd, u, "");
             } else {
                 replyErr(fd, u, c.EOPNOTSUPP);
