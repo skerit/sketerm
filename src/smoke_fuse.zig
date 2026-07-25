@@ -55,9 +55,15 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
     while (true) {
         const n = c.fread(&buf, 1, buf.len, f);
         if (n == 0) break;
-        out.appendSlice(allocator, buf[0..n]) catch return null;
+        out.appendSlice(allocator, buf[0..n]) catch {
+            out.deinit(allocator);
+            return null;
+        };
     }
-    return out.items;
+    return out.toOwnedSlice(allocator) catch {
+        out.deinit(allocator);
+        return null;
+    };
 }
 
 fn haveFuse() bool {
@@ -77,7 +83,12 @@ fn haveFuse() bool {
     return c.WIFEXITED(st) and c.WEXITSTATUS(st) == 0;
 }
 
+fn sigNoop(_: c_int) callconv(.c) void {}
+
 pub fn main() u8 {
+    // Teardown races (daemon gone before the last conn writes) must
+    // surface as EPIPE, not kill the smoke. Same idiom as mux_main.
+    _ = c.signal(c.SIGPIPE, &sigNoop);
     if (!haveFuse()) {
         std.debug.print("smoke-fuse: SKIP (no fusermount3 / /dev/fuse)\n", .{});
         return 0;
@@ -130,6 +141,7 @@ pub fn main() u8 {
     const sth = std.Thread.spawn(.{}, serveMain, .{ allocator, &fs, src, fuse_fd }) catch fail("serve thread");
 
     // ── readdir sees the source tree ───────────────────────────
+    std.debug.print("smoke-fuse: stage readdir\n", .{});
     {
         var found_hello = false;
         var found_sub = false;
@@ -145,6 +157,7 @@ pub fn main() u8 {
     }
 
     // ── read content (small + multi-chunk) ─────────────────────
+    std.debug.print("smoke-fuse: stage read\n", .{});
     {
         var pb: [4096]u8 = undefined;
         const p = std.fmt.bufPrint(&pb, "{s}/hello.txt", .{mnt}) catch unreachable;
@@ -162,6 +175,7 @@ pub fn main() u8 {
     }
 
     // ── nested lookup ──────────────────────────────────────────
+    std.debug.print("smoke-fuse: stage nested\n", .{});
     {
         var pb: [4096]u8 = undefined;
         const p = std.fmt.bufPrint(&pb, "{s}/subdir/nested.txt", .{mnt}) catch unreachable;
@@ -171,6 +185,7 @@ pub fn main() u8 {
     }
 
     // ── write through the mount → appears in the source dir ───
+    std.debug.print("smoke-fuse: stage write\n", .{});
     {
         writeFile(mnt, "written.txt", "written through fuse\n");
         var pb: [4096]u8 = undefined;
@@ -181,6 +196,7 @@ pub fn main() u8 {
     }
 
     // ── mkdir / rename / unlink / symlink+readlink ─────────────
+    std.debug.print("smoke-fuse: stage verbs\n", .{});
     {
         var z: [4096]u8 = undefined;
         var pb: [4096]u8 = undefined;
@@ -206,6 +222,7 @@ pub fn main() u8 {
     }
 
     // ── O_TRUNC rewrite keeps content coherent ─────────────────
+    std.debug.print("smoke-fuse: stage trunc\n", .{});
     {
         writeFile(mnt, "hello.txt", "replaced\n");
         var pb: [4096]u8 = undefined;
@@ -216,6 +233,7 @@ pub fn main() u8 {
     }
 
     // ── unmount ends the serve loop ────────────────────────────
+    std.debug.print("smoke-fuse: stage unmount\n", .{});
     fsmount.unmount(mp.ptr);
     sth.join();
 

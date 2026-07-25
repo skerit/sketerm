@@ -9946,3 +9946,36 @@ scrolls without crashing; the hamburger menu opens as a real popup
 surface; `app_resize` reflows the window. The GUI path (Xvfb +
 xdotool) renders the same page and takes motion/keyboard/wheel with no
 crash. Chromium is unchanged (scroll repaints, menu popup opens).
+
+## FUSE mount: first real-kernel run, deadlock root-caused and fixed (2026-07-25)
+
+`/dev/fuse` finally became available and `zig build smoke-fuse` ran for
+the first time. It found two real defects. (1) The smoke's own
+`readFileAlloc` returned `ArrayList.items` (length != capacity) which
+callers then freed -- invalid free, aborted the run. Now
+`toOwnedSlice`. (2) The real one: the mount deadlocked on the first
+write through it. Proven at syscall level: the writer holds the target
+folio lock while waiting in `request_wait_answer` for its FUSE WRITE;
+the serve thread was meanwhile stuck in `writev` on `/dev/fuse` inside
+`folio_wait_bit_common` -- a reverse invalidation
+(`FUSE_NOTIFY_INVAL_INODE`) whose kernel side needs that same folio
+lock. Synchronous notify from the request-serving thread is a
+guaranteed self-deadlock whenever an invalidation races an in-flight
+request on the same inode (the WRITE handler even invalidated the
+inode it was serving). Fix in `src/fsmount.zig`: all
+`notifyInvalInode`/`notifyInvalEntry` calls now enqueue fixed-format
+records into a pipe consumed by a dedicated notifier thread; the serve
+loop never blocks on the kernel's invalidation locks, and a full pipe
+drops the notification (our own read cache is invalidated
+synchronously; kernel staleness is bounded by the next open). The
+smoke also neuters SIGPIPE like the real binaries (teardown races
+surfaced as process death) and prints stage markers.
+
+Verified: smoke-fuse OK 6/6 consecutive runs (leak-checked
+DebugAllocator); live `sketerm mount local:...` against an isolated
+autostarted daemon: readdir/read/nested/write-through/mkdir/rename all
+correct on disk, and an external backend edit -- the exact racing
+scenario that deadlocked -- now shows coherently on the next read.
+Unit suite 1025 passed / 6 skipped / 0 failed (direct binary run);
+mux, musl mux-portable, aarch64-macos builds green; sketerm-mux still
+links libc/libm only.
