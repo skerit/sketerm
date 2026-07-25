@@ -182,6 +182,17 @@ pub const Dir = struct {
         self.allocator.destroy(self);
     }
 
+    /// The full path of one of this directory's entries. Flat rows
+    /// (search results, collections) carry theirs in `target`.
+    /// @return null when the name does not fit `buf` or a flat row
+    /// has no target.
+    pub fn fullPath(self: *Dir, e: Entry, buf: []u8) ?[]const u8 {
+        if (self.flat or self.collection) return e.target;
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{
+            if (self.path.len == 1) "" else self.path, e.name,
+        }) catch null;
+    }
+
     pub fn find(self: *Dir, name: []const u8) ?usize {
         for (self.entries.items, 0..) |e, i| {
             if (std.mem.eql(u8, e.name, name)) return i;

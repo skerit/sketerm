@@ -266,6 +266,24 @@ pub fn onAppBtnClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     c.gtk_popover_popdown(@ptrCast(actx.popover));
 }
 
+/// The MIME type GIO guesses from a file NAME alone (no content
+/// sniffing: the file may live on another host).
+/// @return "" when nothing could be guessed or `buf` is too small.
+pub fn guessMime(buf: []u8, name: []const u8) []const u8 {
+    var namez: [512:0]u8 = undefined;
+    const bz = std.fmt.bufPrintZ(&namez, "{s}", .{name}) catch return "";
+    var uncertain: c.gboolean = 0;
+    const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
+    if (ct == null) return "";
+    defer c.g_free(ct);
+    const m = c.g_content_type_get_mime_type(ct) orelse return "";
+    defer c.g_free(m);
+    const ms = std.mem.span(@as([*:0]const u8, @ptrCast(m)));
+    if (ms.len > buf.len) return "";
+    @memcpy(buf[0..ms.len], ms);
+    return buf[0..ms.len];
+}
+
 /// Fill the chooser's host section from the daemon's app list,
 /// filtered by the file's locally-guessed MIME type.
 pub fn populateHostApps(self: *BrowserView, ow: *OpenWithCtx, ok: bool, apps: []const WireApp) void {
@@ -280,24 +298,7 @@ pub fn populateHostApps(self: *BrowserView, ow: *OpenWithCtx, ok: bool, apps: []
 
     // Guess the MIME locally from the file name.
     var mime_buf: [256]u8 = undefined;
-    var mime: []const u8 = "";
-    var namez: [512:0]u8 = undefined;
-    if (std.fmt.bufPrintZ(&namez, "{s}", .{std.fs.path.basename(ow.path)})) |bz| {
-        var uncertain: c.gboolean = 0;
-        const ct = c.g_content_type_guess(bz.ptr, null, 0, &uncertain);
-        if (ct != null) {
-            const m = c.g_content_type_get_mime_type(ct);
-            if (m != null) {
-                const ms = std.mem.span(@as([*:0]const u8, @ptrCast(m)));
-                if (ms.len < mime_buf.len) {
-                    @memcpy(mime_buf[0..ms.len], ms);
-                    mime = mime_buf[0..ms.len];
-                }
-                c.g_free(m);
-            }
-            c.g_free(ct);
-        }
-    } else |_| {}
+    const mime = guessMime(&mime_buf, std.fs.path.basename(ow.path));
 
     var shown: usize = 0;
     if (mime.len > 0) {

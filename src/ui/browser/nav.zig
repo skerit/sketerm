@@ -445,6 +445,12 @@ pub fn onBrowserKey(
         self.typeaheadReset();
         return 1;
     }
+    // Quick Look: Space previews the focused entry full-pane
+    // (preview.zig owns the overlay and its own Escape/arrow/Enter
+    // keys). Mid-word the space belongs to type-ahead instead.
+    if (mods == 0 and self.ta_len == 0 and
+        (keyval == c.GDK_KEY_space or keyval == c.GDK_KEY_KP_Space) and
+        self.quickLookToggle()) return 1;
     // Type-ahead: plain printable keys jump to the first matching
     // name. Runs BEFORE the binding table only for keys no binding
     // claims, since this handler is bubble-phase and a focused

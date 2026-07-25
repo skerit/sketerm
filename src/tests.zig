@@ -83,6 +83,8 @@ comptime {
     _ = @import("filebrowser/paths.zig");
     _ = @import("filebrowser/format.zig");
     _ = @import("filebrowser/desktop.zig");
+    _ = @import("filebrowser/hexdump.zig");
+    _ = @import("filebrowser/previewers.zig");
     _ = @import("fsmount.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");

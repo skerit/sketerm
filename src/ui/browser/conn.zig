@@ -199,9 +199,7 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
             self.history_busy = false;
         }
     }
-    if (self.preview_read) |pr| {
-        if (pr.hc == hc) self.abandonPreviewRead();
-    }
+    self.previewHostDied(hc);
     self.endProbesFor(hc, "host connection lost");
     if (self.attr_request) |request| {
         if (request.hc == hc) self.endAttrRequest();
