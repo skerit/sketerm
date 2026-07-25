@@ -370,6 +370,8 @@ pub fn ensureFlowbox(self: *BrowserView, tab: *BTab) *c.GtkFlowBox {
     tab.flowbox = @ptrCast(@alignCast(fb));
     // Middle-click-a-folder-in-a-new-tab, grid half.
     self.installGridMiddleClick(tab, tab.flowbox.?);
+    // Sticky toggling works in the grid too, same capture-phase rule.
+    self.installSelectionGestures(tab, @ptrCast(fb), true);
     return tab.flowbox.?;
 }
 

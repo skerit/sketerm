@@ -1,7 +1,10 @@
-//! Find/grep searches, the collection shelf and the duplicate finder.
+//! Find/grep searches and the duplicate finder.
 //!
-//! All three are host-side jobs whose streamed events fill a virtual
-//! results tab; only digests cross the wire.
+//! Both are host-side jobs whose streamed events fill a virtual
+//! results tab; only digests cross the wire. The collection shelf
+//! used to live here too; it is now the `collection` register in
+//! selection.zig, which serves the same rows through the same flat
+//! Dir mechanism.
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
@@ -9,9 +12,7 @@ const c = @import("../../c.zig").c;
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const HostConn = @import("types.zig").HostConn;
-const MenuCtx = @import("menu.zig").MenuCtx;
 const WireJobEv = @import("types.zig").WireJobEv;
-const menuDone = @import("menu.zig").menuDone;
 
 /// Duplicate finder: a host-side scan buckets files by SIZE, then
 /// same-size candidates are hash-confirmed with daemon hash jobs.
@@ -50,108 +51,6 @@ pub const DupState = struct {
         allocator.destroy(self);
     }
 };
-
-pub fn onMenuCollectionAdd(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
-    const self = ctx.view;
-    const path = ctx.path orelse return menuDone(ctx);
-    const tab = self.ensureCollectionTab(ctx.tab.hc.host, ctx.tab.root.path) orelse return menuDone(ctx);
-    // Entry: display = host-qualified spec; target = same spec.
-    var spec_buf: [4400]u8 = undefined;
-    const spec = if (ctx.tab.hc.host) |h|
-        std.fmt.bufPrint(&spec_buf, "{s}:{s}", .{ h, path }) catch return menuDone(ctx)
-    else
-        path;
-    if (tab.root.find(spec) != null) return menuDone(ctx); // already shelved
-    self.appendCollectionEntry(tab, spec, ctx.is_dir);
-    const already = for (self.collection_items.items) |ci| {
-        if (std.mem.eql(u8, ci.spec, spec)) break true;
-    } else false;
-    if (!already) {
-        const owned = self.allocator.dupe(u8, spec) catch null;
-        if (owned) |o| {
-            self.collection_items.append(self.allocator, .{ .spec = o, .dir = ctx.is_dir }) catch self.allocator.free(o);
-            self.savePlaces();
-        }
-    }
-    self.setStatusFmt("added to collection: {s}", .{spec});
-    menuDone(ctx);
-}
-
-/// The collection shelf tab, created (and seeded from the
-/// persisted list) on first use.
-pub fn ensureCollectionTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
-    if (self.collection_tab) |t| return t;
-    const t = self.newTab(host, path) orelse return null;
-    self.closeViewOf(t.hc, t.root);
-    var i: usize = 0;
-    while (i < self.pending.items.len) {
-        if (self.pending.items[i].tab == t) self.dropPending(i) else i += 1;
-    }
-    t.root.flat = true;
-    t.root.collection = true;
-    t.root.loaded = true;
-    t.root.view_id = 0;
-    c.gtk_label_set_text(t.tab_label, "collection");
-    self.collection_tab = t;
-    for (self.collection_items.items) |ci| self.appendCollectionEntry(t, ci.spec, ci.dir);
-    return t;
-}
-
-pub fn appendCollectionEntry(self: *BrowserView, tab: *BTab, spec: []const u8, is_dir: bool) void {
-    const a = self.allocator;
-    if (tab.root.find(spec) != null) return;
-    const name = a.dupe(u8, spec) catch return;
-    const kind = a.dupe(u8, if (is_dir) "dir" else "file") catch {
-        a.free(name);
-        return;
-    };
-    const tgt = a.dupe(u8, spec) catch {
-        a.free(name);
-        a.free(kind);
-        return;
-    };
-    tab.root.entries.append(a, .{
-        .name = name,
-        .kind = kind,
-        .size = 0,
-        .mode = 0,
-        .mtime_ms = 0,
-        .target = tgt,
-        .tdir = false,
-    }) catch {
-        a.free(name);
-        a.free(kind);
-        a.free(tgt);
-    };
-}
-
-pub fn onMenuCollectionRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
-    const self = ctx.view;
-    const spec = ctx.path orelse return menuDone(ctx);
-    if (self.collection_tab) |tab| {
-        tab.root.del(std.fs.path.basename(spec));
-        // Collection names ARE the specs (basename won't match) —
-        // fall back to a full-name scan.
-        if (tab.root.find(spec)) |i| {
-            var e = tab.root.entries.orderedRemove(i);
-            e.deinit(self.allocator);
-        }
-        if (self.currentTab() == tab) self.renderTab(tab);
-    }
-    var ci: usize = 0;
-    var changed = false;
-    while (ci < self.collection_items.items.len) {
-        if (std.mem.eql(u8, self.collection_items.items[ci].spec, spec)) {
-            self.allocator.free(self.collection_items.items[ci].spec);
-            _ = self.collection_items.orderedRemove(ci);
-            changed = true;
-        } else ci += 1;
-    }
-    if (changed) self.savePlaces();
-    menuDone(ctx);
-}
 
 /// Start a search from the bar: name search by default, content
 /// grep when the toggle is on. Results stream into a flat tab.

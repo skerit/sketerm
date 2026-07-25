@@ -18,6 +18,9 @@ pub const SavedSearch = struct {
     content: bool = false,
 };
 
+/// A pre-register collection-shelf item. Kept only so a file written
+/// by an older build can be migrated into the register store; new
+/// saves always write this list empty.
 pub const CollItem = struct {
     spec: []const u8 = "",
     dir: bool = false,

@@ -14,12 +14,13 @@ const isArchivePath = @import("../../filebrowser/paths.zig").isArchivePath;
 const isSketermMount = @import("../../filebrowser/paths.zig").isSketermMount;
 const isTrashPath = @import("../../filebrowser/paths.zig").isTrashPath;
 const onMenuBatchRename = @import("ops.zig").onMenuBatchRename;
-const onMenuCollectionAdd = @import("search.zig").onMenuCollectionAdd;
-const onMenuCollectionRemove = @import("search.zig").onMenuCollectionRemove;
 const onMenuDelete = @import("ops.zig").onMenuDelete;
 const onMenuEditorRename = @import("ops.zig").onMenuEditorRename;
 const onMenuExportSel = @import("ops.zig").onMenuExportSel;
 const onMenuProperties = @import("props.zig").onMenuProperties;
+const onMenuRegisterAdd = @import("selection.zig").onMenuRegisterAdd;
+const onMenuRegisterAddNamed = @import("selection.zig").onMenuRegisterAddNamed;
+const onMenuRegisterRemove = @import("selection.zig").onMenuRegisterRemove;
 const onMenuSyncHere = @import("compare.zig").onMenuSyncHere;
 const onMenuTags = @import("ops.zig").onMenuTags;
 const onMenuTrash = @import("ops.zig").onMenuTrash;
@@ -120,11 +121,11 @@ pub fn showEntryMenu(
         if (ctx.path != null and !is_dir)
             menuButton(box, "Extract and Open", &onMenuExtractMember, ctx, false);
     } else if (tab.root.collection) {
-        // Collection rows: specs spanning hosts — navigation +
+        // Register rows: specs spanning hosts: navigation +
         // membership only (path verbs would misparse specs).
         if (ctx.path != null) {
             menuButton(box, "Open in New Browser Tab", &onMenuCollectionOpen, ctx, false);
-            menuButton(box, "Remove from Collection", &onMenuCollectionRemove, ctx, false);
+            menuButton(box, "Unmark (remove from this register)", &onMenuRegisterRemove, ctx, false);
         }
     } else {
     if (ctx.path != null) {
@@ -172,7 +173,8 @@ pub fn showEntryMenu(
             menuButton(box, "Extract Here", &onMenuExtractHere, ctx, false);
         }
         menuButton(box, "Compress to .tar.gz", &onMenuArchiveCreate, ctx, false);
-        menuButton(box, "Add to Collection", &onMenuCollectionAdd, ctx, false);
+        menuButton(box, "Add to Collection", &onMenuRegisterAdd, ctx, false);
+        menuButton(box, "Mark in Register...", &onMenuRegisterAddNamed, ctx, false);
         menuButton(box, "Export Selection to Shell ($SK_SEL)", &onMenuExportSel, ctx, false);
         if (countSelected(tab) > 1) {
             menuButton(box, "Batch Rename Selected…", &onMenuBatchRename, ctx, false);
