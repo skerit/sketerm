@@ -1085,7 +1085,6 @@ pub fn extractAndOpenMember(self: *BrowserView, tab: *BTab, member: []const u8) 
 
 /// Drop of an entry spec onto the listing: target dir = the row
 /// under the pointer when it's a directory, else the tab root.
-/// Same host = MOVE (rename, undoable); cross-host = copy.
 pub fn onListDrop(
     target: *c.GtkDropTarget,
     value: *c.GValue,
@@ -1099,11 +1098,6 @@ pub fn onListDrop(
     const self = tab.view;
     const cstr = c.g_value_get_string(value) orelse return 0;
     const spec = std.mem.span(@as([*:0]const u8, @ptrCast(cstr)));
-    if (spec.len == 0) return 0;
-    const loc = parseSpec(spec);
-    const src_host: ?[]const u8 = if (loc.current_host) null else loc.host;
-    const src = loc.path;
-    if (src.len == 0 or src[0] != '/') return 0;
 
     var dst_dir: []const u8 = tab.root.path;
     var dbuf: [4096]u8 = undefined;
@@ -1118,24 +1112,37 @@ pub fn onListDrop(
             }
         }
     }
+    return @intFromBool(dropSpecInto(self, tab, spec, dst_dir));
+}
+
+/// Land a dragged entry spec in `dst_dir` on `tab`'s host: same host
+/// = MOVE (rename, undoable), cross-host = copy. Shared by the
+/// listing, the breadcrumb segments and the tab labels.
+/// @return false when the spec is unusable or the drop is a no-op.
+pub fn dropSpecInto(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: []const u8) bool {
+    if (spec.len == 0) return false;
+    const loc = parseSpec(spec);
+    const src_host: ?[]const u8 = if (loc.current_host) null else loc.host;
+    const src = loc.path;
+    if (src.len == 0 or src[0] != '/') return false;
     const base = std.fs.path.basename(src);
     var dst_buf: [4200]u8 = undefined;
     const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
         if (dst_dir.len == 1) "" else dst_dir, base,
-    }) catch return 0;
+    }) catch return false;
 
     if (hostEq(src_host, tab.hc.host)) {
-        if (std.mem.eql(u8, src, dst)) return 0; // dropped in place
+        if (std.mem.eql(u8, src, dst)) return false; // dropped in place
         const req = self.nextReq();
         self.deferUndo(req, self.makeUndo(tab.hc.host, .rename_back, dst, src, ""));
         self.sendOp(tab.hc, .{ .req = req, .op = "rename", .path = src, .to = dst });
         self.setStatusFmt("moved {s} -> {s}", .{ base, dst_dir });
     } else {
-        const src_hc = self.hostConnFor(src_host) orelse return 0;
+        const src_hc = self.hostConnFor(src_host) orelse return false;
         self.startTransfer(src_hc, src, tab.hc, dst, .{});
         self.setStatusFmt("copying {s} -> {s}", .{ base, dst_dir });
     }
-    return 1;
+    return true;
 }
 
 /// The other browser face in this sketerm tab, if any: the

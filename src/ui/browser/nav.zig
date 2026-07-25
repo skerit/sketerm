@@ -122,6 +122,11 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(listbox, @ptrCast(rclick));
 
+    // Mouse side buttons navigate history anywhere in the listing;
+    // middle click opens folders in tabs and closes this one.
+    self.installNavGestures(tab, page);
+    self.installTabConveniences(tab, label_box);
+
     // Internal DnD: dropping an entry spec here moves (same
     // host) or copies (cross-host) into the target directory.
     const dropt = c.gtk_drop_target_new(c.G_TYPE_STRING, c.GDK_ACTION_COPY | c.GDK_ACTION_MOVE);
@@ -154,6 +159,9 @@ pub fn onTabCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn closeTab(self: *BrowserView, tab: *BTab) void {
+    // Snapshot first: undo-close-tab needs the location AND the
+    // history this is about to free.
+    self.stashClosedTab(tab);
     if (self.search_tab == tab) self.search_tab = null;
     if (self.collection_tab == tab) self.collection_tab = null;
     if (self.arch_tab == tab) {
@@ -198,7 +206,18 @@ pub fn navigateMode(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_i
         self.setStatusFmt("via sketerm: {s} (bypassed mount {s})", .{ bp.host(), bp.mountpoint() });
     }
     const same_host = hostEq(tab.hc.host, host);
-    if (same_host and tab.hc.state != .dead and std.mem.eql(u8, tab.root.path, path)) return;
+    if (same_host and tab.hc.state != .dead and std.mem.eql(u8, tab.root.path, path)) {
+        // Already there: nothing to list, but a history move still
+        // has to walk the stacks (a location can repeat in them).
+        switch (intent) {
+            .push => {},
+            else => {
+                self.applyHistoryIntent(tab, intent);
+                self.syncPathEntry(tab);
+            },
+        }
+        return;
+    }
     const new_hc = if (same_host and tab.hc.state != .dead)
         tab.hc
     else
@@ -249,19 +268,19 @@ pub fn navigateSpecMode(self: *BrowserView, tab: *BTab, spec: []const u8, intent
 
 pub fn goBack(self: *BrowserView, tab: *BTab) void {
     if (tab.back.items.len == 0) return;
-    self.navigateSpecMode(tab, tab.back.items[tab.back.items.len - 1], .back);
+    self.navigateSpecMode(tab, tab.back.items[tab.back.items.len - 1], .{ .back = 1 });
 }
 
 pub fn goForward(self: *BrowserView, tab: *BTab) void {
     if (tab.fwd.items.len == 0) return;
-    self.navigateSpecMode(tab, tab.fwd.items[tab.fwd.items.len - 1], .forward);
+    self.navigateSpecMode(tab, tab.fwd.items[tab.fwd.items.len - 1], .{ .forward = 1 });
 }
 
-pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate: *Dir, intent: NavigationIntent, canonical: []const u8) void {
-    if (canonical.len > 0 and !std.mem.eql(u8, candidate.path, canonical)) {
-        const owned = self.allocator.dupe(u8, canonical) catch null;
-        if (owned) |path| { self.allocator.free(candidate.path); candidate.path = path; }
-    }
+/// Move the tab's history stacks for a navigation that has landed.
+/// A multi-step jump is exactly the sequence of single steps it
+/// replaces: every entry it skipped ends up on the opposite stack,
+/// nearest first.
+pub fn applyHistoryIntent(self: *BrowserView, tab: *BTab, intent: NavigationIntent) void {
     var current_buf: [4300]u8 = undefined;
     const current = self.allocator.dupe(u8, tab.spec(&current_buf)) catch null;
     switch (intent) {
@@ -270,17 +289,35 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
             for (tab.fwd.items) |value| self.allocator.free(value);
             tab.fwd.clearRetainingCapacity();
         },
-        .back => {
-            if (tab.back.pop()) |value| self.allocator.free(value);
+        .back => |steps| {
             if (current) |value| tab.fwd.append(self.allocator, value) catch self.allocator.free(value);
+            var i: usize = 1;
+            while (i < steps) : (i += 1) {
+                const skipped = tab.back.pop() orelse break;
+                tab.fwd.append(self.allocator, skipped) catch self.allocator.free(skipped);
+            }
+            if (tab.back.pop()) |value| self.allocator.free(value);
         },
-        .forward => {
-            if (tab.fwd.pop()) |value| self.allocator.free(value);
+        .forward => |steps| {
             if (current) |value| tab.back.append(self.allocator, value) catch self.allocator.free(value);
+            var i: usize = 1;
+            while (i < steps) : (i += 1) {
+                const skipped = tab.fwd.pop() orelse break;
+                tab.back.append(self.allocator, skipped) catch self.allocator.free(skipped);
+            }
+            if (tab.fwd.pop()) |value| self.allocator.free(value);
         },
     }
     while (tab.back.items.len > 100) self.allocator.free(tab.back.orderedRemove(0));
     while (tab.fwd.items.len > 100) self.allocator.free(tab.fwd.orderedRemove(0));
+}
+
+pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate: *Dir, intent: NavigationIntent, canonical: []const u8) void {
+    if (canonical.len > 0 and !std.mem.eql(u8, candidate.path, canonical)) {
+        const owned = self.allocator.dupe(u8, canonical) catch null;
+        if (owned) |path| { self.allocator.free(candidate.path); candidate.path = path; }
+    }
+    self.applyHistoryIntent(tab, intent);
     for (tab.selected.items) |value| self.allocator.free(value);
     tab.selected.clearRetainingCapacity();
     self.ta_len = 0;
@@ -355,6 +392,8 @@ pub fn syncPathEntry(self: *BrowserView, tab: *BTab) void {
     self.syncing_path_entry = false;
     // The entry no longer holds what the user was completing.
     self.cancelPathCompletion();
+    // The breadcrumb is the same location control's other face.
+    self.rebuildCrumbs(tab);
     c.gtk_widget_set_sensitive(self.back_button, @intFromBool(tab.back.items.len > 0));
     c.gtk_widget_set_sensitive(self.fwd_button, @intFromBool(tab.fwd.items.len > 0));
 }
@@ -408,8 +447,7 @@ pub fn onBrowserKey(
         return 1;
     }
     if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_l) {
-        _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(self.path_entry)));
-        c.gtk_editable_select_region(@ptrCast(self.path_entry), 0, -1);
+        self.toggleLocationFace();
         return 1;
     }
     if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_s) {
@@ -664,9 +702,17 @@ pub fn onCompletionActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*an
 
 pub fn onPathKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, _: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
-    if (keyval == c.GDK_KEY_Escape and self.completion_popover != null) {
-        self.closePathCompletion();
-        return 1;
+    if (keyval == c.GDK_KEY_Escape) {
+        // First Escape dismisses the completion list, the next one
+        // abandons the entry face for the breadcrumb.
+        if (self.completion_popover != null) {
+            self.closePathCompletion();
+            return 1;
+        }
+        if (self.showCrumbFace()) {
+            if (self.currentTab()) |tab| self.syncPathEntry(tab);
+            return 1;
+        }
     }
     if (keyval == c.GDK_KEY_Tab) {
         const pop = self.completion_popover orelse return 0;
@@ -812,6 +858,9 @@ pub fn onPathActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
         return;
     }
     self.navigateSpec(tab, spec);
+    // The typed location is committed: hand the toolbar back to the
+    // breadcrumb face.
+    _ = self.showCrumbFace();
 }
 
 pub fn onSwitchPage(_: *c.GtkNotebook, _: *c.GtkWidget, _: c.guint, user: ?*anyopaque) callconv(.c) void {

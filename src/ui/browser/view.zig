@@ -52,7 +52,9 @@ const RemoteThumb = @import("preview.zig").RemoteThumb;
 const RestoreRead = @import("ops.zig").RestoreRead;
 const ThumbCtx = @import("preview.zig").ThumbCtx;
 const UndoOp = @import("types.zig").UndoOp;
+const locbar = @import("locbar.zig");
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
+const tabsmod = @import("tabs.zig");
 
 pub const BrowserView = struct {
     allocator: std.mem.Allocator,
@@ -69,7 +71,12 @@ pub const BrowserView = struct {
 
     root_box: *c.GtkWidget = undefined,
     notebook: *c.GtkNotebook = undefined,
+    /// Editable face of the location control; the breadcrumb face
+    /// and the history dropdowns live in `locbar`.
     path_entry: *c.GtkEntry = undefined,
+    locbar: locbar.State = .{},
+    /// Closed-tab ring (undo-close-tab), session state.
+    closed_tabs: tabsmod.State = .{},
     back_button: *c.GtkWidget = undefined,
     fwd_button: *c.GtkWidget = undefined,
     completion_popover: ?*c.GtkWidget = null,
@@ -270,6 +277,30 @@ pub const BrowserView = struct {
     pub const onPathActivate = @import("nav.zig").onPathActivate;
     pub const onSwitchPage = @import("nav.zig").onSwitchPage;
     pub const idleAfterSwitch = @import("nav.zig").idleAfterSwitch;
+    pub const applyHistoryIntent = @import("nav.zig").applyHistoryIntent;
+
+    // locbar.zig -- breadcrumb face, sibling and history dropdowns
+    pub const installLocationFace = @import("locbar.zig").installLocationFace;
+    pub const appendHistoryArrow = @import("locbar.zig").appendHistoryArrow;
+    pub const rebuildCrumbs = @import("locbar.zig").rebuildCrumbs;
+    pub const cancelSiblings = @import("locbar.zig").cancelSiblings;
+    pub const feedSiblings = @import("locbar.zig").feedSiblings;
+    pub const showSiblingPopover = @import("locbar.zig").showSiblingPopover;
+    pub const toggleLocationFace = @import("locbar.zig").toggleLocationFace;
+    pub const showEntryFace = @import("locbar.zig").showEntryFace;
+    pub const showCrumbFace = @import("locbar.zig").showCrumbFace;
+    pub const showHistoryMenu = @import("locbar.zig").showHistoryMenu;
+    pub const historyJump = @import("locbar.zig").historyJump;
+    pub const installNavGestures = @import("locbar.zig").installNavGestures;
+
+    // tabs.zig -- tab conveniences (duplicate, reopen, middle click)
+    pub const tabStateOf = @import("tabs.zig").tabStateOf;
+    pub const duplicateTab = @import("tabs.zig").duplicateTab;
+    pub const stashClosedTab = @import("tabs.zig").stashClosedTab;
+    pub const reopenClosedTab = @import("tabs.zig").reopenClosedTab;
+    pub const installTabConveniences = @import("tabs.zig").installTabConveniences;
+    pub const installGridMiddleClick = @import("tabs.zig").installGridMiddleClick;
+    pub const showTabMenu = @import("tabs.zig").showTabMenu;
 
     // render.zig -- listing rendering, columns, rows, emblems
     pub const renderCurrent = @import("render.zig").renderCurrent;
@@ -388,6 +419,7 @@ pub const BrowserView = struct {
     pub const onArchiveMember = @import("ops.zig").onArchiveMember;
     pub const extractAndOpenMember = @import("ops.zig").extractAndOpenMember;
     pub const onListDrop = @import("ops.zig").onListDrop;
+    pub const dropSpecInto = @import("ops.zig").dropSpecInto;
     pub const peerView = @import("ops.zig").peerView;
     pub const sendToPeer = @import("ops.zig").sendToPeer;
 
@@ -603,65 +635,17 @@ pub const BrowserView = struct {
         return out;
     }
 
-    fn refForTab(arena: std.mem.Allocator, tab: *BTab, path: []const u8) !browser_model.FileRef {
-        return .{
-            .host = if (tab.hc.host) |h| try arena.dupe(u8, h) else "",
-            .path = try arena.dupe(u8, path),
-        };
-    }
-
-    fn historyRefs(arena: std.mem.Allocator, current_host: []const u8, specs: []const []u8) ![]const browser_model.FileRef {
-        const out = try arena.alloc(browser_model.FileRef, specs.len);
-        for (specs, 0..) |spec, i| out[i] = try browser_model.dupeRef(arena, browser_model.parseSpec(spec, current_host).ref);
-        return out;
-    }
-
     /// Full GTK-free state projection used by layout persistence.
+    /// Per-tab snapshotting is tabs.zig's tabStateOf, which
+    /// duplicate-tab and the closed-tab ring share.
     pub fn paneState(self: *BrowserView, arena: std.mem.Allocator) !browser_model.PaneState {
         const tabs = try arena.alloc(browser_model.TabState, self.tabs.items.len);
-        for (self.tabs.items, 0..) |tab, i| {
-            const host = tab.hc.host orelse "";
-            const expanded = try arena.alloc(browser_model.FileRef, tab.subdirs.items.len);
-            for (tab.subdirs.items, 0..) |d, j| expanded[j] = try refForTab(arena, tab, d.path);
-            const selected = try arena.alloc(browser_model.FileRef, tab.selected.items.len);
-            for (tab.selected.items, 0..) |p, j| selected[j] = try refForTab(arena, tab, p);
-            tabs[i] = .{
-                .kind = if (tab.root.collection) .collection else if (tab.root.flat) .search else .directory,
-                .location = try refForTab(arena, tab, tab.root.path),
-                .back = try historyRefs(arena, host, tab.back.items),
-                .forward = try historyRefs(arena, host, tab.fwd.items),
-                .expanded = expanded,
-                .selected = selected,
-                .view = tab.view_mode,
-                .columns = try columnsOf(arena, tab),
-                .attr_columns = try attrColumnsOf(arena, tab),
-                .sort = tab.sort_key,
-                .descending = tab.descending,
-                .dirs_first = tab.dirs_first,
-                .show_hidden = tab.show_hidden,
-                .filter = try arena.dupe(u8, tab.filter),
-                .virtual_spec = try arena.dupe(u8, tab.virtual_spec),
-            };
-        }
+        for (self.tabs.items, 0..) |tab, i| tabs[i] = try tabsmod.tabStateOf(arena, tab);
         const active = c.gtk_notebook_get_current_page(self.notebook);
         return .{
             .active_tab = if (active >= 0) @intCast(active) else 0,
             .tabs = tabs,
         };
-    }
-
-    fn columnsOf(arena: std.mem.Allocator, tab: *BTab) ![]const browser_model.Column {
-        var out: std.ArrayList(browser_model.Column) = .empty;
-        for (std.enums.values(browser_model.Column)) |col| {
-            if (tab.columns.contains(col)) try out.append(arena, col);
-        }
-        return out.items;
-    }
-
-    fn attrColumnsOf(arena: std.mem.Allocator, tab: *BTab) ![]const []const u8 {
-        const out = try arena.alloc([]const u8, tab.attr_columns.items.len);
-        for (tab.attr_columns.items, 0..) |name, i| out[i] = try arena.dupe(u8, name);
-        return out;
     }
 
     fn appendHistoryRef(self: *BrowserView, list: *std.ArrayList([]u8), ref: browser_model.FileRef) void {
@@ -671,7 +655,9 @@ pub const BrowserView = struct {
         list.append(self.allocator, owned) catch self.allocator.free(owned);
     }
 
-    fn restoreTabState(self: *BrowserView, tab: *BTab, state: browser_model.TabState) void {
+    /// Apply a GTK-free tab snapshot to a freshly created tab
+    /// (layout restore, duplicate-tab, undo-close-tab).
+    pub fn restoreTabState(self: *BrowserView, tab: *BTab, state: browser_model.TabState) void {
         for (state.back) |ref| self.appendHistoryRef(&tab.back, ref);
         for (state.forward) |ref| self.appendHistoryRef(&tab.fwd, ref);
         for (state.selected) |ref| {
@@ -785,6 +771,8 @@ pub const BrowserView = struct {
         self.closePathCompletion();
         if (self.completion_source != 0) _ = c.g_source_remove(self.completion_source);
         if (self.completion_request) |request| request.destroy(self.allocator);
+        self.locbar.deinit(self.allocator);
+        self.closed_tabs.deinit(self.allocator);
         self.emblems.deinit();
         self.endProbesFor(null, "");
         self.probes.deinit(self.allocator);
@@ -852,10 +840,12 @@ pub const BrowserView = struct {
         c.gtk_widget_set_sensitive(back, 0);
         _ = c.g_signal_connect_data(back, "clicked", @ptrCast(&onBackClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), back);
+        self.appendHistoryArrow(bar, .back);
         const fwd = c.gtk_button_new_from_icon_name("go-next-symbolic");
         c.gtk_widget_set_sensitive(fwd, 0);
         _ = c.g_signal_connect_data(fwd, "clicked", @ptrCast(&onFwdClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), fwd);
+        self.appendHistoryArrow(bar, .forward);
         const up = c.gtk_button_new_from_icon_name("go-up-symbolic");
         _ = c.g_signal_connect_data(up, "clicked", @ptrCast(&onUpClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), up);
@@ -869,7 +859,9 @@ pub const BrowserView = struct {
         c.gtk_event_controller_set_propagation_phase(@ptrCast(entry_keys), c.GTK_PHASE_CAPTURE);
         _ = c.g_signal_connect_data(entry_keys, "key-pressed", @ptrCast(&onPathKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(entry, @ptrCast(entry_keys));
-        c.gtk_box_append(@ptrCast(bar), entry);
+        // Breadcrumb + entry are the two faces of one control; the
+        // breadcrumb shows by default, Ctrl+L swaps to the entry.
+        self.installLocationFace(bar, entry);
 
         const hidden = c.gtk_toggle_button_new();
         c.gtk_button_set_icon_name(@ptrCast(hidden), "view-reveal-symbolic");

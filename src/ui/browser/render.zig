@@ -349,7 +349,8 @@ pub fn ensureFlowbox(self: *BrowserView, tab: *BTab) *c.GtkFlowBox {
     c.gtk_widget_add_controller(@ptrCast(fb), @ptrCast(rclick));
     tab.flow_scroller = fs;
     tab.flowbox = @ptrCast(@alignCast(fb));
-    _ = self;
+    // Middle-click-a-folder-in-a-new-tab, grid half.
+    self.installGridMiddleClick(tab, tab.flowbox.?);
     return tab.flowbox.?;
 }
 

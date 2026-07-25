@@ -81,6 +81,7 @@ comptime {
     _ = @import("filebrowser/thumbs.zig");
     _ = @import("filebrowser/transfers.zig");
     _ = @import("filebrowser/paths.zig");
+    _ = @import("filebrowser/crumbs.zig");
     _ = @import("filebrowser/format.zig");
     _ = @import("filebrowser/desktop.zig");
     _ = @import("filebrowser/hexdump.zig");
