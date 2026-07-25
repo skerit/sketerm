@@ -381,9 +381,7 @@ pub fn renderGrid(self: *BrowserView, tab: *BTab) void {
 
 pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) void {
     var full_buf: [4096]u8 = undefined;
-    const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{
-        if (tab.root.path.len == 1) "" else tab.root.path, e.name,
-    }) catch return;
+    const full = tab.root.fullPath(e, &full_buf) orelse return;
 
     const tile = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
     c.gtk_widget_set_size_request(tile, 96, -1);
@@ -550,9 +548,7 @@ pub fn renderMillerCols(self: *BrowserView, tab: *BTab) void {
             const row = c.gtk_list_box_row_new();
             c.gtk_list_box_row_set_child(@ptrCast(row), row_box);
             var full_buf: [4096]u8 = undefined;
-            const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{
-                if (d.path.len == 1) "" else d.path, e.name,
-            }) catch continue;
+            const full = d.fullPath(e, &full_buf) orelse continue;
             const ctx = self.allocator.create(RowCtx) catch continue;
             ctx.* = .{
                 .allocator = self.allocator,
@@ -598,9 +594,7 @@ pub fn renderDirRows(self: *BrowserView, tab: *BTab, dir: *Dir, depth: u32) void
         self.appendRow(tab, dir, e, depth);
         if (e.tdir) {
             var buf: [4096]u8 = undefined;
-            const child = std.fmt.bufPrint(&buf, "{s}/{s}", .{
-                if (dir.path.len == 1) "" else dir.path, e.name,
-            }) catch continue;
+            const child = dir.fullPath(e, &buf) orelse continue;
             if (tab.subdirByPath(child)) |sub| {
                 if (sub.loaded) self.renderDirRows(tab, sub, depth + 1);
             }
@@ -630,12 +624,7 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
     c.gtk_widget_set_margin_bottom(row_box, 2);
 
     var full_buf: [4096]u8 = undefined;
-    const full = if (dir.flat)
-        (e.target orelse return)
-    else
-        std.fmt.bufPrint(&full_buf, "{s}/{s}", .{
-            if (dir.path.len == 1) "" else dir.path, e.name,
-        }) catch return;
+    const full = dir.fullPath(e, &full_buf) orelse return;
 
     if (e.tdir and !dir.flat) {
         const expanded = tab.subdirByPath(full) != null;

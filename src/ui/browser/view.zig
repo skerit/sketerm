@@ -47,6 +47,7 @@ const PendingHistory = @import("types.zig").PendingHistory;
 const PendingJob = @import("types.zig").PendingJob;
 const PendingUndo = @import("types.zig").PendingUndo;
 const PreviewRead = @import("preview.zig").PreviewRead;
+const PreviewState = @import("preview.zig").State;
 const RemoteThumb = @import("preview.zig").RemoteThumb;
 const RestoreRead = @import("ops.zig").RestoreRead;
 const ThumbCtx = @import("preview.zig").ThumbCtx;
@@ -105,6 +106,9 @@ pub const BrowserView = struct {
     preview_on: bool = false,
     preview_read: ?*PreviewRead = null,
     preview_generation: u64 = 0,
+    /// Handler registry, result cache, bounded preloader and the
+    /// Quick Look overlay -- all owned by preview.zig.
+    preview_state: PreviewState = .{},
     restore_read: ?*RestoreRead = null,
     /// Row-thumbnail cache: "path\x00mtime" -> owned texture ref.
     thumbs: std.StringHashMap(*c.GdkTexture) = undefined,
@@ -416,7 +420,7 @@ pub const BrowserView = struct {
     pub const onEditWatchChanged = @import("open.zig").onEditWatchChanged;
     pub const uploadEditWatch = @import("open.zig").uploadEditWatch;
 
-    // preview.zig -- preview pane and thumbnails
+    // preview.zig -- preview pane, Quick Look overlay, thumbnails
     pub const ensureThumbWorker = @import("preview.zig").ensureThumbWorker;
     pub const thumbWorkerMain = @import("preview.zig").thumbWorkerMain;
     pub const thumbProcess = @import("preview.zig").thumbProcess;
@@ -437,13 +441,21 @@ pub const BrowserView = struct {
     pub const markThumbFailed = @import("preview.zig").markThumbFailed;
     pub const clearThumbCache = @import("preview.zig").clearThumbCache;
     pub const clearPreviewContent = @import("preview.zig").clearPreviewContent;
+    pub const previewHostDied = @import("preview.zig").previewHostDied;
     pub const abandonPreviewRead = @import("preview.zig").abandonPreviewRead;
+    pub const abandonPreload = @import("preview.zig").abandonPreload;
     pub const updatePreview = @import("preview.zig").updatePreview;
-    pub const showTextPreview = @import("preview.zig").showTextPreview;
-    pub const previewRemoteStart = @import("preview.zig").previewRemoteStart;
     pub const feedPreview = @import("preview.zig").feedPreview;
     pub const queuePreviewDecode = @import("preview.zig").queuePreviewDecode;
     pub const onPreviewToggled = @import("preview.zig").onPreviewToggled;
+    pub const clearPreloadQueue = @import("preview.zig").clearPreloadQueue;
+    pub const schedulePreload = @import("preview.zig").schedulePreload;
+    pub const pumpPreload = @import("preview.zig").pumpPreload;
+    pub const quickLookToggle = @import("preview.zig").quickLookToggle;
+    pub const quickLookOpen = @import("preview.zig").quickLookOpen;
+    pub const quickLookClose = @import("preview.zig").quickLookClose;
+    pub const quickLookStep = @import("preview.zig").quickLookStep;
+    pub const quickLookActivate = @import("preview.zig").quickLookActivate;
 
     // props.zig -- Properties dialog, attributes, probes
     pub const endProbe = @import("props.zig").endProbe;
@@ -778,6 +790,7 @@ pub const BrowserView = struct {
         self.probes.deinit(self.allocator);
         self.endAttrRequest();
         if (self.preview_read) |pr| pr.destroy(self.allocator);
+        self.preview_state.deinit(self.allocator);
         if (self.restore_read) |rr| rr.destroy(self.allocator);
         if (self.dup) |d| d.destroy(self.allocator);
         if (self.editor_rename) |er| er.destroy(self.allocator);
