@@ -147,6 +147,7 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
         self.sendListingOp(p);
     }
     self.pumpTransferQueue();
+    self.pumpCopyQueue();
 }
 
 /// Connection died: fail its transfers FIRST (they hold *Conn),
@@ -480,6 +481,8 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 .open_on_done = pj.open_on_done,
                 .history_op = pj.history_op,
                 .history_direction = pj.history_direction,
+                .paths = pj.paths,
+                .dest_key = pj.dest_key,
             };
             self.jobs.append(self.allocator, row) catch {
                 if (row.history_op) |op| self.restoreHistory(op, row.history_direction.?);

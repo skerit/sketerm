@@ -111,6 +111,9 @@ pub const WireJobEv = struct {
     matches: u64 = 0,
     truncated: bool = false,
     hash: []const u8 = "",
+    /// Bytes a staged partial contributed. The daemon only fills this
+    /// on the terminal event, so the panel treats it as sticky.
+    resumed_from: u64 = 0,
 
     /// True for the events that end a job.
     pub fn terminalEv(self: WireJobEv) bool {
@@ -482,6 +485,41 @@ pub const Pending = struct {
     staged: std.ArrayList(Entry) = .empty,
 };
 
+/// What a job operates on, for the jobs-panel detail view. Fixed
+/// buffers (the daemon's own FsJob.done_path pattern) so a job record
+/// stays destroyable by allocator.destroy alone; an over-long path
+/// keeps its tail, which is the part that identifies the file.
+pub const JobPaths = struct {
+    src: [512]u8 = undefined,
+    src_len: u16 = 0,
+    dst: [512]u8 = undefined,
+    dst_len: u16 = 0,
+
+    pub fn set(self: *JobPaths, src: []const u8, dst: []const u8) void {
+        self.src_len = copyTail(&self.src, src);
+        self.dst_len = copyTail(&self.dst, dst);
+    }
+
+    pub fn srcPath(self: *const JobPaths) []const u8 {
+        return self.src[0..self.src_len];
+    }
+
+    pub fn dstPath(self: *const JobPaths) []const u8 {
+        return self.dst[0..self.dst_len];
+    }
+
+    fn copyTail(buf: *[512]u8, text: []const u8) u16 {
+        if (text.len <= buf.len) {
+            @memcpy(buf[0..text.len], text);
+            return @intCast(text.len);
+        }
+        const tail = text[text.len - (buf.len - 3) ..];
+        @memcpy(buf[0..3], "...");
+        @memcpy(buf[3..][0..tail.len], tail);
+        return @intCast(buf.len);
+    }
+};
+
 /// A daemon-side job (copy/delete_tree) started by this view, shown
 /// in the jobs panel.
 pub const JobRow = struct {
@@ -490,6 +528,9 @@ pub const JobRow = struct {
     label: []u8,
     done: u64 = 0,
     total: u64 = 0,
+    /// Bytes a staged partial contributed (sticky; the daemon fills it
+    /// on the terminal event).
+    resumed_from: u64 = 0,
     state: enum { running, paused, finished, failed, canceled } = .running,
     /// Pushed to the undo stack when the job finishes.
     undo_op: ?*UndoOp = null,
@@ -499,6 +540,11 @@ pub const JobRow = struct {
     open_on_done: bool = false,
     history_op: ?*UndoOp = null,
     history_direction: ?HistoryDirection = null,
+    /// Source and destination, for the panel's expanded detail.
+    paths: JobPaths = .{},
+    /// Destination identity for cross-host copies started by the
+    /// transfer queue (0 = this job does not hold a destination slot).
+    dest_key: u64 = 0,
 
     pub fn terminal(self: *const JobRow) bool {
         return self.state == .finished or self.state == .failed or self.state == .canceled;
@@ -518,6 +564,9 @@ pub const PendingJob = struct {
     open_on_done: bool = false,
     history_op: ?*UndoOp = null,
     history_direction: ?HistoryDirection = null,
+    /// Carried onto the JobRow when the daemon answers with the id.
+    paths: JobPaths = .{},
+    dest_key: u64 = 0,
 };
 
 /// One client-mediated cross-host transfer, running or queued.
@@ -541,9 +590,11 @@ pub const ActiveTransfer = struct {
     upload_watch: ?*EditWatch = null,
     /// Cross-host move: delete the source after a verified copy.
     delete_src_after: bool = false,
-    /// Queue state: at most MAX_ACTIVE_TRANSFERS run concurrently;
-    /// the rest wait here in order.
+    /// Queue state: transfers to one destination run one at a time,
+    /// the rest wait here in order (see filebrowser/xferqueue.zig).
     started: bool = false,
+    /// Scheduler identity of the destination (host plus local device).
+    dest_key: u64 = 0,
 
     pub fn freeExtras(t: *ActiveTransfer, allocator: std.mem.Allocator) void {
         if (t.open_with_appid) |s| allocator.free(s);
@@ -574,9 +625,6 @@ pub const EditWatch = struct {
         allocator.destroy(self);
     }
 };
-
-/// Concurrent client-mediated transfers; more queue in order.
-pub const MAX_ACTIVE_TRANSFERS = 2;
 
 /// An owned collection item.
 pub const OwnedColl = struct {

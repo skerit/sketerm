@@ -14,12 +14,19 @@ pub fn tagColorHex(tags: []const u8) []const u8 {
     return palette[@intCast(h.final() % palette.len)];
 }
 
-/// Truncating copy into a sentinel buffer for GTK label text.
-pub fn copyZ(buf: *[256:0]u8, text: []const u8) [*:0]const u8 {
+/// Truncating copy into a sentinel buffer of any size (`*[N:0]u8`).
+pub fn copyZN(buf: anytype, text: []const u8) [*:0]const u8 {
     const n = @min(text.len, buf.len - 1);
     @memcpy(buf[0..n], text[0..n]);
     buf[n] = 0;
-    return buf;
+    return @ptrCast(buf);
+}
+
+/// Truncating copy into a 256-byte sentinel buffer for GTK label text.
+/// Callers with a differently sized buffer use copyZN; this signature
+/// stays concrete so `@ptrCast(&buf)` arguments keep a result type.
+pub fn copyZ(buf: *[256:0]u8, text: []const u8) [*:0]const u8 {
+    return copyZN(buf, text);
 }
 
 pub fn fmtSize(buf: *[48:0]u8, size: u64) [:0]const u8 {
@@ -108,4 +115,7 @@ test "copyZ truncates instead of overflowing" {
     try t.expectEqualStrings("hi", std.mem.span(copyZ(&buf, "hi")));
     const long = "x" ** 300;
     try t.expectEqual(@as(usize, 255), std.mem.span(copyZ(&buf, long)).len);
+    // copyZN takes any sentinel buffer size, not just 256.
+    var wide: [512:0]u8 = undefined;
+    try t.expectEqual(@as(usize, 300), std.mem.span(copyZN(&wide, long)).len);
 }

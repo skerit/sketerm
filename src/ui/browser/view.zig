@@ -28,6 +28,7 @@ const ActiveTransfer = @import("types.zig").ActiveTransfer;
 const AttrRequest = @import("props.zig").AttrRequest;
 const BTab = @import("types.zig").BTab;
 const CompareCtx = @import("compare.zig").CompareCtx;
+const CopyQueue = @import("jobs.zig").CopyQueue;
 const DupState = @import("search.zig").DupState;
 const EditWatch = @import("types.zig").EditWatch;
 const EditorRename = @import("ops.zig").EditorRename;
@@ -35,6 +36,7 @@ const FileColor = @import("types.zig").FileColor;
 const GitCtx = @import("gitstat.zig").GitCtx;
 const HostAction = @import("types.zig").HostAction;
 const HostConn = @import("types.zig").HostConn;
+const JobPanel = @import("jobpanel.zig").Panel;
 const JobRow = @import("types.zig").JobRow;
 const LabelProbe = @import("props.zig").LabelProbe;
 const MAX_ATTR_COLUMNS = @import("render.zig").MAX_ATTR_COLUMNS;
@@ -69,6 +71,8 @@ pub const BrowserView = struct {
     pending_jobs: std.ArrayList(*PendingJob) = .empty,
     jobs: std.ArrayList(*JobRow) = .empty,
     transfers: std.ArrayList(*ActiveTransfer) = .empty,
+    /// Cross-host copies waiting for their destination (jobs.zig).
+    copy_queue: CopyQueue = .{},
 
     root_box: *c.GtkWidget = undefined,
     notebook: *c.GtkNotebook = undefined,
@@ -88,6 +92,9 @@ pub const BrowserView = struct {
     syncing_path_entry: bool = false,
     status_label: *c.GtkLabel = undefined,
     jobs_box: *c.GtkWidget = undefined,
+    /// Rate meters, expansion state and the sampling tick of the jobs
+    /// panel -- all owned by jobpanel.zig.
+    jobs_panel: JobPanel = .{},
     /// Copy-source for the context menu's Copy/Paste (owned).
     /// clip_paths holds the full multi-selection; clip_path mirrors
     /// its first item (single-source verbs: Sync Here, Compare).
@@ -450,9 +457,13 @@ pub const BrowserView = struct {
     pub const peerView = @import("ops.zig").peerView;
     pub const sendToPeer = @import("ops.zig").sendToPeer;
 
-    // jobs.zig -- daemon jobs, transfers, the jobs panel
+    // jobs.zig -- daemon jobs and client-mediated transfers
     pub const feedTransfers = @import("jobs.zig").feedTransfers;
     pub const pumpTransferQueue = @import("jobs.zig").pumpTransferQueue;
+    pub const moveTransfer = @import("jobs.zig").moveTransfer;
+    pub const pumpCopyQueue = @import("jobs.zig").pumpCopyQueue;
+    pub const cancelQueuedCopy = @import("jobs.zig").cancelQueuedCopy;
+    pub const moveQueuedCopy = @import("jobs.zig").moveQueuedCopy;
     pub const reapTransfers = @import("jobs.zig").reapTransfers;
     pub const startTransfer = @import("jobs.zig").startTransfer;
     pub const startDaemonJob = @import("jobs.zig").startDaemonJob;
@@ -462,10 +473,12 @@ pub const BrowserView = struct {
     pub const startDaemonJobUndo = @import("jobs.zig").startDaemonJobUndo;
     pub const startHistoryJob = @import("jobs.zig").startHistoryJob;
     pub const startDaemonJobTo = @import("jobs.zig").startDaemonJobTo;
-    pub const jobsButton = @import("jobs.zig").jobsButton;
-    pub const onJobBtn = @import("jobs.zig").onJobBtn;
     pub const markJob = @import("jobs.zig").markJob;
-    pub const renderJobs = @import("jobs.zig").renderJobs;
+
+    // jobpanel.zig -- the jobs/transfers panel (rows, rate, controls)
+    pub const jobsButton = @import("jobpanel.zig").jobsButton;
+    pub const onJobBtn = @import("jobpanel.zig").onJobBtn;
+    pub const renderJobs = @import("jobpanel.zig").renderJobs;
 
     // open.zig -- opening files, Open With, edit sync-back
     pub const openRemoteFile = @import("open.zig").openRemoteFile;
@@ -750,6 +763,8 @@ pub const BrowserView = struct {
             _ = c.g_source_remove(self.switch_idle);
             self.switch_idle = 0;
         }
+        self.jobs_panel.deinit(self.allocator);
+        self.copy_queue.deinit(self.allocator);
         for (self.transfers.items) |t| {
             t.x.deinit();
             self.allocator.free(t.label);

@@ -5,6 +5,7 @@ const c = @import("../c.zig").c;
 const muxclient = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
 const store = @import("../filebrowser/transfers.zig");
+const xferqueue = @import("../filebrowser/xferqueue.zig");
 const pathz = @import("../util/pathz.zig");
 
 pub const NotifyFn = *const fn (ctx: *anyopaque, text: []const u8) void;
@@ -28,6 +29,19 @@ const Intent = struct {
     cancel_requested: bool = false,
     submitted_size: u64 = 0,
     submitted_mtime_ns: i64 = 0,
+    /// User-held: never submitted, and SIGSTOPped daemon-side while
+    /// running. Persisted, so a pause survives a GUI restart.
+    paused: bool = false,
+    /// The daemon job is paused but this client has no id for it yet
+    /// (the pause outlived the connection); resume once it replies.
+    resume_pending: bool = false,
+    /// Scheduler identity of the destination (host plus local device).
+    dest_key: u64 = 0,
+    /// Live progress from the daemon's job events; volatile, the
+    /// daemon replays it after every reconnect.
+    done: u64 = 0,
+    total: u64 = 0,
+    resumed_from: u64 = 0,
 
     fn destroy(self: *Intent, a: std.mem.Allocator) void {
         inline for (.{ self.token, self.src_host, self.src_path, self.dst_host, self.dst_path, self.app_id, self.watch_token, self.message }) |s|
@@ -70,6 +84,14 @@ pub const QueueRow = struct {
     state: store.State,
     done: u64,
     total: u64,
+    kind: store.Kind = .download,
+    paused: bool = false,
+    src_host: []const u8 = "",
+    src_path: []const u8 = "",
+    dst_host: []const u8 = "",
+    dst_path: []const u8 = "",
+    resumed_from: u64 = 0,
+    message: []const u8 = "",
 };
 
 pub const Service = struct {
@@ -197,6 +219,8 @@ pub const Service = struct {
             .cancel_requested = value.cancel_requested,
             .submitted_size = value.submitted_size,
             .submitted_mtime_ns = value.submitted_mtime_ns,
+            .paused = value.paused,
+            .dest_key = destinationKey(value.dst.host, value.dst.path),
         };
         return it;
     }
@@ -301,6 +325,7 @@ pub const Service = struct {
             .cancel_requested = it.cancel_requested,
             .submitted_size = it.submitted_size,
             .submitted_mtime_ns = it.submitted_mtime_ns,
+            .paused = it.paused,
         };
         const watches = a.alloc(store.Watch, self.watches.items.len) catch {
             self.durability_error = true;
@@ -444,8 +469,18 @@ pub const Service = struct {
             } else {
                 p.intent.job = rep.job;
                 p.intent.state = parseState(rep.state) orelse .running;
-                if (p.intent.cancel_requested and p.intent.state == .running and !self.sendCancel(p.intent.job))
+                p.intent.done = rep.done;
+                p.intent.total = rep.total;
+                if (p.intent.cancel_requested and p.intent.state == .running and !self.sendJobControl(p.intent.job, "job_cancel"))
                     self.disconnect_after_drain = true;
+                if (p.intent.resume_pending and p.intent.state == .running) {
+                    p.intent.resume_pending = false;
+                    if (!self.sendJobControl(p.intent.job, "job_resume")) self.disconnect_after_drain = true;
+                } else if (p.intent.paused and p.intent.state == .running) {
+                    // A pause the daemon has not seen (it re-owns the
+                    // job on this resubmission) must be re-asserted.
+                    if (!self.sendJobControl(p.intent.job, "job_pause")) self.disconnect_after_drain = true;
+                }
                 if (p.intent.state == .done)
                     self.complete(p.intent, true, rep.message)
                 else if (p.intent.state == .failed or p.intent.state == .canceled)
@@ -458,7 +493,14 @@ pub const Service = struct {
     }
 
     fn onJob(self: *Service, payload: []const u8) void {
-        const Event = struct { job: u64 = 0, ev: []const u8 = "", message: []const u8 = "" };
+        const Event = struct {
+            job: u64 = 0,
+            ev: []const u8 = "",
+            message: []const u8 = "",
+            done: u64 = 0,
+            total: u64 = 0,
+            resumed_from: u64 = 0,
+        };
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const ev = std.json.parseFromSliceLeaky(Event, arena.allocator(), payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return;
@@ -468,6 +510,15 @@ pub const Service = struct {
                 self.complete(it, true, "");
             } else if (std.mem.eql(u8, ev.ev, "error") or std.mem.eql(u8, ev.ev, "canceled")) {
                 self.complete(it, false, ev.message);
+            } else if (std.mem.eql(u8, ev.ev, "paused") or std.mem.eql(u8, ev.ev, "resumed")) {
+                // The daemon is the authority on whether the helper is
+                // stopped; a pause from another client shows up here.
+                it.paused = std.mem.eql(u8, ev.ev, "paused");
+                self.persist();
+            } else {
+                it.done = ev.done;
+                if (ev.total > 0) it.total = ev.total;
+                if (ev.resumed_from > 0) it.resumed_from = ev.resumed_from;
             }
             return;
         }
@@ -666,42 +717,91 @@ pub const Service = struct {
             .attempts = 0,
             .submitted_size = if (submitted) |fp| fp.size else 0,
             .submitted_mtime_ns = if (submitted) |fp| fp.mtime_ns else 0,
+            .dest_key = destinationKey(dst_host, dst_path),
         };
         return it;
     }
 
+    /// Submit whatever the queue policy admits. A transfer that is
+    /// in flight holds its destination whether or not it is paused:
+    /// the SIGSTOPped job still owns the staged partial there.
     fn pump(self: *Service) void {
         const conn = if (self.conn) |*v| v else { self.connect(); return; };
         if (!self.pumpAcks(conn)) return;
-        var active: usize = 0;
-        for (self.intents.items) |it| if (it.state == .running or it.state == .submitting) { active += 1; };
         std.mem.sort(*Intent, self.intents.items, {}, struct { fn less(_: void, a: *Intent, b: *Intent) bool { return a.order < b.order; } }.less);
-        for (self.intents.items) |it| {
-            if (active >= 2) break;
-            if (it.state != .queued) continue;
-            const req = self.next_req;
-            self.next_req +%= 1;
-            if (self.next_req == 0) self.next_req = 1;
-            it.state = .submitting;
-            self.pending.append(self.allocator, .{ .req = req, .intent = it }) catch { it.state = .queued; continue; };
-            conn.sendJson(.fs_op, .{
-                .req = req,
-                .op = "cross_copy",
-                .path = it.src_path,
-                .to = it.dst_path,
-                .src_host = it.src_host,
-                .dst_host = it.dst_host,
-                .@"resume" = true,
-                .client_token = it.token,
-            }) catch {
-                _ = self.pending.pop();
-                it.state = .queued;
-                self.requestDisconnect();
-                return;
+        const slots = self.allocator.alloc(xferqueue.Slot, self.intents.items.len) catch return;
+        defer self.allocator.free(slots);
+        const map = self.allocator.alloc(usize, self.intents.items.len) catch return;
+        defer self.allocator.free(map);
+        var n: usize = 0;
+        for (self.intents.items, 0..) |it, i| {
+            const state: ?xferqueue.State = switch (it.state) {
+                .submitting, .running => .running,
+                .queued => if (it.paused or it.cancel_requested) null else .queued,
+                else => null,
             };
-            active += 1;
+            if (state) |s| {
+                slots[n] = .{ .dest = it.dest_key, .state = s };
+                map[n] = i;
+                n += 1;
+            }
+        }
+        var admitted: [xferqueue.MAX_ACTIVE]usize = undefined;
+        for (xferqueue.admissible(slots[0..n], &admitted)) |k| {
+            if (!self.submit(conn, self.intents.items[map[k]])) return;
         }
         self.persist();
+    }
+
+    /// @return false when the connection died mid-submit (the caller
+    /// must stop touching `conn`).
+    fn submit(self: *Service, conn: *muxclient.Conn, it: *Intent) bool {
+        const req = self.next_req;
+        self.next_req +%= 1;
+        if (self.next_req == 0) self.next_req = 1;
+        it.state = .submitting;
+        self.pending.append(self.allocator, .{ .req = req, .intent = it }) catch {
+            it.state = .queued;
+            return true;
+        };
+        conn.sendJson(.fs_op, .{
+            .req = req,
+            .op = "cross_copy",
+            .path = it.src_path,
+            .to = it.dst_path,
+            .src_host = it.src_host,
+            .dst_host = it.dst_host,
+            .@"resume" = true,
+            .client_token = it.token,
+        }) catch {
+            _ = self.pending.pop();
+            it.state = .queued;
+            self.requestDisconnect();
+            return false;
+        };
+        return true;
+    }
+
+    /// Hold or release one queued/running transfer. A queued one is
+    /// simply never submitted; a running one is SIGSTOPped daemon-side.
+    pub fn setPaused(self: *Service, token: []const u8, paused: bool) void {
+        for (self.intents.items) |it| {
+            if (!std.mem.eql(u8, it.token, token)) continue;
+            if (it.paused == paused) return;
+            it.paused = paused;
+            const live = it.job != 0 and (it.state == .running or it.state == .submitting);
+            if (live) {
+                if (!self.sendJobControl(it.job, if (paused) "job_pause" else "job_resume"))
+                    self.requestDisconnect();
+            } else if (!paused and it.job != 0) {
+                // The daemon job outlived the client that paused it;
+                // resume as soon as the resubmission returns its id.
+                it.resume_pending = true;
+            }
+            self.persist();
+            if (!paused) self.pump();
+            return;
+        }
     }
 
     pub fn moveQueued(self: *Service, token: []const u8, direction: i8) void {
@@ -730,17 +830,19 @@ pub const Service = struct {
                 return;
             }
             it.cancel_requested = true;
-            if (it.job != 0 and !self.sendCancel(it.job)) self.requestDisconnect();
+            if (it.job != 0 and !self.sendJobControl(it.job, "job_cancel")) self.requestDisconnect();
             self.persist();
             return;
         }
     }
 
-    fn sendCancel(self: *Service, job: u64) bool {
+    /// job_cancel / job_pause / job_resume toward a live job.
+    /// @return false when the frame could not be queued.
+    fn sendJobControl(self: *Service, job: u64, op: []const u8) bool {
         if (self.conn) |*conn| {
             const req = self.next_req;
             self.next_req +%= 1;
-            conn.sendJson(.fs_op, .{ .req = req, .op = "job_cancel", .job = job }) catch return false;
+            conn.sendJson(.fs_op, .{ .req = req, .op = op, .job = job }) catch return false;
             return true;
         }
         return false;
@@ -780,8 +882,16 @@ pub const Service = struct {
             .token = it.token,
             .label = std.fs.path.basename(it.dst_path),
             .state = it.state,
-            .done = 0,
-            .total = 0,
+            .done = it.done,
+            .total = it.total,
+            .kind = it.kind,
+            .paused = it.paused,
+            .src_host = it.src_host,
+            .src_path = it.src_path,
+            .dst_host = it.dst_host,
+            .dst_path = it.dst_path,
+            .resumed_from = it.resumed_from,
+            .message = it.message,
         };
         return out;
     }
@@ -853,6 +963,31 @@ pub const Service = struct {
         }
     }
 };
+
+/// Scheduler identity of a transfer destination: the host, plus the
+/// filesystem device for local paths so two copies onto one disk
+/// serialize while one per disk do not. A remote destination is
+/// identified by its host alone -- the device lives on the far side,
+/// where this process cannot stat it.
+pub fn destinationKey(host: []const u8, path: []const u8) u64 {
+    return xferqueue.destKey(host, if (host.len == 0) localDevice(path) else 0);
+}
+
+/// st_dev of the nearest existing ancestor of `path` (0 when unknown:
+/// unknown devices then share one key, which serializes rather than
+/// over-parallelizes).
+fn localDevice(path: []const u8) u64 {
+    var probe = path;
+    while (probe.len > 0) {
+        var z: [4096]u8 = undefined;
+        var st: c.struct_stat = undefined;
+        if (pathz.pathZ(&z, probe)) |pz| {
+            if (c.stat(pz, &st) == 0) return @intCast(st.st_dev);
+        } else |_| {}
+        probe = std.fs.path.dirname(probe) orelse return 0;
+    }
+    return 0;
+}
 
 var shared: ?*Service = null;
 

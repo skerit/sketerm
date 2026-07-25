@@ -1,14 +1,17 @@
 //! Daemon jobs and client-mediated transfers.
 //!
-//! Every mutation is a job with an id: this module starts them, folds
-//! their streamed events back into the view, and renders the jobs
-//! panel. Cross-host copies ride fstransfer.Xfer instead, queued so at
-//! most MAX_ACTIVE_TRANSFERS run at once.
+//! Every mutation is a job with an id: this module starts them and
+//! folds their streamed events back into the view. Cross-host copies
+//! ride fstransfer.Xfer instead, queued by the shared scheduling
+//! policy in filebrowser/xferqueue.zig so that transfers to one
+//! destination serialize while unrelated ones run in parallel. The
+//! panel that displays all of this lives in jobpanel.zig.
 
 const std = @import("std");
-const c = @import("../../c.zig").c;
 const wire = @import("../../mux/wire.zig");
+const file_transfers = @import("../file_transfers.zig");
 const fstransfer = @import("../../ipc/fstransfer.zig");
+const xferqueue = @import("../../filebrowser/xferqueue.zig");
 
 const ActiveTransfer = @import("types.zig").ActiveTransfer;
 const BrowserView = @import("view.zig").BrowserView;
@@ -16,7 +19,6 @@ const EditWatch = @import("types.zig").EditWatch;
 const HistoryDirection = @import("types.zig").HistoryDirection;
 const HostConn = @import("types.zig").HostConn;
 const JobRow = @import("types.zig").JobRow;
-const MAX_ACTIVE_TRANSFERS = @import("types.zig").MAX_ACTIVE_TRANSFERS;
 const PendingJob = @import("types.zig").PendingJob;
 const UndoOp = @import("types.zig").UndoOp;
 const WireJobEv = @import("types.zig").WireJobEv;
@@ -32,21 +34,49 @@ pub fn feedTransfers(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, p
     return false;
 }
 
-/// Start queued transfers while below the concurrency cap.
+/// Start whatever the queue policy admits: one transfer per
+/// destination at a time, distinct destinations in parallel, under a
+/// global ceiling. A transfer whose hosts are not both connected is
+/// not offered to the policy -- it cannot start, and holding a
+/// destination slot for it would stall the ones that can.
 pub fn pumpTransferQueue(self: *BrowserView) void {
-    var running: usize = 0;
-    for (self.transfers.items) |t| {
-        if (t.started and !t.x.isTerminal()) running += 1;
+    if (self.transfers.items.len == 0) return;
+    const slots = self.allocator.alloc(xferqueue.Slot, self.transfers.items.len) catch return;
+    defer self.allocator.free(slots);
+    const map = self.allocator.alloc(usize, self.transfers.items.len) catch return;
+    defer self.allocator.free(map);
+    var n: usize = 0;
+    for (self.transfers.items, 0..) |t, i| {
+        if (t.x.isTerminal()) continue;
+        const ready = t.src_hc.state == .ready and t.dst_hc.state == .ready;
+        if (!t.started and !ready) continue;
+        slots[n] = .{ .dest = t.dest_key, .state = if (t.started) .running else .queued };
+        map[n] = i;
+        n += 1;
     }
-    for (self.transfers.items) |t| {
-        if (running >= MAX_ACTIVE_TRANSFERS) break;
-        if (t.started or t.x.isTerminal()) continue;
-        if (t.src_hc.state != .ready or t.dst_hc.state != .ready) continue;
+    var admitted: [xferqueue.MAX_ACTIVE]usize = undefined;
+    for (xferqueue.admissible(slots[0..n], &admitted)) |k| {
+        const t = self.transfers.items[map[k]];
         t.started = true;
         t.x.start();
-        running += 1;
         self.setStatusFmt("transfer started: {s}", .{t.label});
     }
+}
+
+/// Move a not-yet-started transfer within the queue; the order here
+/// IS the start order. A queued transfer never overtakes a running
+/// one (that would not change what starts next anyway).
+pub fn moveTransfer(self: *BrowserView, t: *ActiveTransfer, direction: i8) void {
+    if (t.started) return;
+    const i = for (self.transfers.items, 0..) |item, idx| {
+        if (item == t) break idx;
+    } else return;
+    const j: usize = if (direction < 0)
+        (if (i == 0) return else i - 1)
+    else
+        (if (i + 1 >= self.transfers.items.len) return else i + 1);
+    if (self.transfers.items[j].started) return;
+    std.mem.swap(*ActiveTransfer, &self.transfers.items[i], &self.transfers.items[j]);
 }
 
 /// Finish (and drop) transfers that reached a terminal state.
@@ -97,6 +127,187 @@ pub fn reapTransfers(self: *BrowserView) void {
     self.pumpTransferQueue();
 }
 
+/// One cross-host copy waiting for its destination to be free. The
+/// daemon owns a copy once it is submitted; until then it is view
+/// state, so a queued copy can still be reordered or dropped.
+pub const CopyItem = struct {
+    coordinator: *HostConn,
+    src_hc: *HostConn,
+    dst_hc: *HostConn,
+    src_path: []u8,
+    dst_path: []u8,
+    label: []u8,
+    dest_key: u64,
+
+    pub fn destroy(self: *CopyItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.src_path);
+        allocator.free(self.dst_path);
+        allocator.free(self.label);
+        allocator.destroy(self);
+    }
+};
+
+/// Cross-host copies not yet handed to the daemon, in queue order.
+pub const CopyQueue = struct {
+    items: std.ArrayList(*CopyItem) = .empty,
+
+    pub fn deinit(self: *CopyQueue, allocator: std.mem.Allocator) void {
+        for (self.items.items) |item| item.destroy(allocator);
+        self.items.deinit(allocator);
+    }
+};
+
+fn enqueueCrossCopy(
+    self: *BrowserView,
+    coordinator: *HostConn,
+    src_hc: *HostConn,
+    src_path: []const u8,
+    dst_hc: *HostConn,
+    dst_path: []const u8,
+) void {
+    const item = self.allocator.create(CopyItem) catch return;
+    const src = self.allocator.dupe(u8, src_path) catch {
+        self.allocator.destroy(item);
+        return;
+    };
+    const dst = self.allocator.dupe(u8, dst_path) catch {
+        self.allocator.free(src);
+        self.allocator.destroy(item);
+        return;
+    };
+    const label = std.fmt.allocPrint(self.allocator, "{s}:{s} -> {s}", .{
+        src_hc.label(), std.fs.path.basename(src_path), dst_hc.label(),
+    }) catch {
+        self.allocator.free(src);
+        self.allocator.free(dst);
+        self.allocator.destroy(item);
+        return;
+    };
+    item.* = .{
+        .coordinator = coordinator,
+        .src_hc = src_hc,
+        .dst_hc = dst_hc,
+        .src_path = src,
+        .dst_path = dst,
+        .label = label,
+        .dest_key = file_transfers.destinationKey(dst_hc.host orelse "", dst_path),
+    };
+    self.copy_queue.items.append(self.allocator, item) catch {
+        item.destroy(self.allocator);
+        return;
+    };
+    self.setStatusFmt("transfer queued: {s}", .{label});
+    self.pumpCopyQueue();
+    self.renderJobs();
+}
+
+/// Submit the cross-host copies the queue policy admits. Running
+/// copies are the daemon jobs this queue started (they carry the
+/// destination key), so a copy released by a finished one starts here.
+pub fn pumpCopyQueue(self: *BrowserView) void {
+    if (self.copy_queue.items.items.len == 0) return;
+    var running: usize = 0;
+    for (self.jobs.items) |j| {
+        if (j.dest_key != 0 and !j.terminal()) running += 1;
+    }
+    for (self.pending_jobs.items) |pj| {
+        if (pj.dest_key != 0) running += 1;
+    }
+    const total = running + self.copy_queue.items.items.len;
+    const slots = self.allocator.alloc(xferqueue.Slot, total) catch return;
+    defer self.allocator.free(slots);
+    var n: usize = 0;
+    for (self.jobs.items) |j| {
+        if (j.dest_key == 0 or j.terminal()) continue;
+        slots[n] = .{ .dest = j.dest_key, .state = .running };
+        n += 1;
+    }
+    for (self.pending_jobs.items) |pj| {
+        if (pj.dest_key == 0) continue;
+        slots[n] = .{ .dest = pj.dest_key, .state = .running };
+        n += 1;
+    }
+    const first_queued = n;
+    for (self.copy_queue.items.items) |item| {
+        slots[n] = .{ .dest = item.dest_key, .state = .queued };
+        n += 1;
+    }
+    var admitted: [xferqueue.MAX_ACTIVE]usize = undefined;
+    const start = xferqueue.admissible(slots[0..n], &admitted);
+    // Submitting removes items, so collect the targets first.
+    var targets: [xferqueue.MAX_ACTIVE]*CopyItem = undefined;
+    var count: usize = 0;
+    for (start) |k| {
+        targets[count] = self.copy_queue.items.items[k - first_queued];
+        count += 1;
+    }
+    for (targets[0..count]) |item| submitCrossCopy(self, item);
+}
+
+fn submitCrossCopy(self: *BrowserView, item: *CopyItem) void {
+    for (self.copy_queue.items.items, 0..) |queued, i| {
+        if (queued == item) {
+            _ = self.copy_queue.items.orderedRemove(i);
+            break;
+        }
+    }
+    if (item.coordinator.state != .ready) {
+        self.setStatusFmt("transfer dropped, coordinator offline: {s}", .{item.label});
+        item.destroy(self.allocator);
+        return;
+    }
+    const req = self.nextReq();
+    const pj = self.allocator.create(PendingJob) catch {
+        item.destroy(self.allocator);
+        return;
+    };
+    // The label moves into the job record; the paths do not outlive it.
+    pj.* = .{ .req = req, .hc = item.coordinator, .label = item.label, .dest_key = item.dest_key };
+    pj.paths.set(item.src_path, item.dst_path);
+    self.pending_jobs.append(self.allocator, pj) catch {
+        self.allocator.destroy(pj);
+        item.destroy(self.allocator);
+        return;
+    };
+    self.sendOp(item.coordinator, .{
+        .req = req,
+        .op = "cross_copy",
+        .path = item.src_path,
+        .to = item.dst_path,
+        .src_host = item.src_hc.host orelse "",
+        .dst_host = item.dst_hc.host orelse "",
+        .@"resume" = true,
+    });
+    self.setStatusFmt("durable transfer started: {s}", .{item.label});
+    self.allocator.free(item.src_path);
+    self.allocator.free(item.dst_path);
+    self.allocator.destroy(item);
+}
+
+/// Drop a queued cross-host copy that was never submitted.
+pub fn cancelQueuedCopy(self: *BrowserView, item: *CopyItem) void {
+    for (self.copy_queue.items.items, 0..) |queued, i| {
+        if (queued != item) continue;
+        _ = self.copy_queue.items.orderedRemove(i);
+        self.setStatusFmt("transfer canceled: {s}", .{item.label});
+        item.destroy(self.allocator);
+        return;
+    }
+}
+
+/// Move a queued cross-host copy; the order here IS the start order.
+pub fn moveQueuedCopy(self: *BrowserView, item: *CopyItem, direction: i8) void {
+    const items = self.copy_queue.items.items;
+    const i = for (items, 0..) |queued, idx| {
+        if (queued == item) break idx;
+    } else return;
+    const j: usize = if (direction < 0)
+        (if (i == 0) return else i - 1)
+    else
+        (if (i + 1 >= items.len) return else i + 1);
+    std.mem.swap(*CopyItem, &items[i], &items[j]);
+}
+
 pub const TransferOpts = struct {
     open_when_done: bool = false,
     /// Launch with a specific application id (duped in).
@@ -126,36 +337,15 @@ pub fn startTransfer(
     if (!open_when_done and opts.upload_watch == null and !opts.delete_src_after) {
         // User copies are coordinated by the local daemon, not this
         // BrowserView. They therefore survive pane/window teardown and
-        // reconnect through the stable job journal.
+        // reconnect through the stable job journal. They still queue
+        // here first, so a paste of ten files does not put ten helpers
+        // on one destination disk at once.
         const coordinator = self.hostConnFor(null) orelse return;
         if (coordinator.state != .ready) {
             self.setStatus("local transfer coordinator is not connected");
             return;
         }
-        const req = self.nextReq();
-        const label = std.fmt.allocPrint(self.allocator, "{s}:{s} -> {s}", .{
-            src_hc.label(), std.fs.path.basename(src_path), dst_hc.label(),
-        }) catch return;
-        const pj = self.allocator.create(PendingJob) catch {
-            self.allocator.free(label);
-            return;
-        };
-        pj.* = .{ .req = req, .hc = coordinator, .label = label };
-        self.pending_jobs.append(self.allocator, pj) catch {
-            self.allocator.free(label);
-            self.allocator.destroy(pj);
-            return;
-        };
-        self.sendOp(coordinator, .{
-            .req = req,
-            .op = "cross_copy",
-            .path = src_path,
-            .to = dst_path,
-            .src_host = src_hc.host orelse "",
-            .dst_host = dst_hc.host orelse "",
-            .@"resume" = true,
-        });
-        self.setStatusFmt("durable transfer queued: {s}", .{label});
+        enqueueCrossCopy(self, coordinator, src_hc, src_path, dst_hc, dst_path);
         return;
     }
     const x = fstransfer.Xfer.init(
@@ -189,6 +379,7 @@ pub fn startTransfer(
         .watch_remote = if (opts.watch_remote) |s| (self.allocator.dupe(u8, s) catch null) else null,
         .upload_watch = opts.upload_watch,
         .delete_src_after = opts.delete_src_after,
+        .dest_key = file_transfers.destinationKey(dst_hc.host orelse "", dst_path),
     };
     self.transfers.append(self.allocator, t) catch {
         x.deinit();
@@ -221,6 +412,7 @@ pub fn startDaemonJobResumable(self: *BrowserView, hc: *HostConn, comptime op: [
             return;
         },
     };
+    pj.paths.set(path, to);
     self.pending_jobs.append(self.allocator, pj) catch {
         self.allocator.free(pj.label);
         self.allocator.destroy(pj);
@@ -254,6 +446,7 @@ pub fn startDaemonJobKind(
         },
         .kind = kind,
     };
+    pj.paths.set(path, to);
     self.pending_jobs.append(self.allocator, pj) catch {
         self.allocator.free(pj.label);
         self.allocator.destroy(pj);
@@ -352,13 +545,19 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
     if (std.mem.eql(u8, e.ev, "progress")) {
         row.done = e.done;
         row.total = e.total;
+        if (e.resumed_from > 0) row.resumed_from = e.resumed_from;
         if (row.state == .running) self.setStatusFmt("{s}: {d} / {d} MB", .{
             row.label, e.done >> 20, e.total >> 20,
         });
+    } else if (std.mem.eql(u8, e.ev, "paused") or std.mem.eql(u8, e.ev, "resumed")) {
+        // The daemon is the authority: another client may have paused
+        // this job, and our own optimistic mark can be wrong.
+        if (!row.terminal()) row.state = if (std.mem.eql(u8, e.ev, "paused")) .paused else .running;
     } else if (std.mem.eql(u8, e.ev, "done")) {
         row.state = .finished;
         row.done = e.done;
         row.total = e.total;
+        if (e.resumed_from > 0) row.resumed_from = e.resumed_from;
         self.setStatusFmt("done: {s}", .{row.label});
         if (row.undo_op) |u| {
             row.undo_op = null;
@@ -418,6 +617,8 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
             self.restoreHistory(op, direction);
         }
     }
+    // A finished cross-host copy releases its destination.
+    if (row.dest_key != 0 and row.terminal()) self.pumpCopyQueue();
     self.renderJobs();
 }
 
@@ -443,6 +644,7 @@ pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []cons
         },
         .undo_op = undo,
     };
+    pj.paths.set(path, to);
     self.pending_jobs.append(self.allocator, pj) catch {
         self.allocator.free(pj.label);
         self.allocator.destroy(pj);
@@ -462,6 +664,7 @@ pub fn startHistoryJob(self: *BrowserView, hc: *HostConn, op_name: []const u8, p
         .history_op = op,
         .history_direction = direction,
     };
+    pj.paths.set(path, to);
     self.pending_jobs.append(self.allocator, pj) catch {
         self.allocator.free(pj.label);
         self.allocator.destroy(pj);
@@ -486,6 +689,7 @@ pub fn startDaemonJobTo(self: *BrowserView, hc: *HostConn, comptime op: []const 
             return;
         },
     };
+    pj.paths.set(path, to);
     self.pending_jobs.append(self.allocator, pj) catch {
         self.allocator.free(pj.label);
         self.allocator.destroy(pj);
@@ -494,208 +698,8 @@ pub fn startDaemonJobTo(self: *BrowserView, hc: *HostConn, comptime op: []const 
     self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .pattern = pattern });
 }
 
-/// Heap context for one jobs-panel button, freed with the button.
-pub const JobBtnCtx = struct {
-    allocator: std.mem.Allocator,
-    view: *BrowserView,
-    /// Daemon job target (hc+job), or transfer target (xfer).
-    hc: ?*HostConn = null,
-    job: u64 = 0,
-    xfer: ?*fstransfer.Xfer = null,
-    service_token: ?[]u8 = null,
-    kind: enum { pause, resume_, cancel, dismiss, move_up, move_down },
-
-    fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
-        _ = closure;
-        const ctx: *JobBtnCtx = @ptrCast(@alignCast(user.?));
-        if (ctx.service_token) |token| ctx.allocator.free(token);
-        ctx.allocator.destroy(ctx);
-    }
-};
-
-pub fn jobsButton(self: *BrowserView, row: *c.GtkWidget, icon: [*:0]const u8, ctx_in: JobBtnCtx) void {
-    const ctx = self.allocator.create(JobBtnCtx) catch return;
-    ctx.* = ctx_in;
-    const btn = c.gtk_button_new_from_icon_name(icon);
-    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onJobBtn), @ptrCast(ctx), @ptrCast(&JobBtnCtx.free), c.G_CONNECT_DEFAULT);
-    c.gtk_box_append(@ptrCast(row), btn);
-}
-
-pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *JobBtnCtx = @ptrCast(@alignCast(user.?));
-    const self = ctx.view;
-    if (ctx.service_token) |token| {
-        const service = self.transfer_service orelse return;
-        switch (ctx.kind) {
-            .move_up => service.moveQueued(token, -1),
-            .move_down => service.moveQueued(token, 1),
-            .cancel => service.cancel(token),
-            else => {},
-        }
-        self.renderJobs();
-        return;
-    }
-    if (ctx.xfer) |x| {
-        switch (ctx.kind) {
-            .cancel => x.cancel(),
-            else => {},
-        }
-        self.reapTransfers();
-        self.renderJobs();
-        return;
-    }
-    const hc = ctx.hc orelse return;
-    switch (ctx.kind) {
-        .pause => {
-            self.sendOp(hc, .{ .req = self.nextReq(), .op = "job_pause", .job = ctx.job });
-            self.markJob(hc, ctx.job, .paused);
-        },
-        .resume_ => {
-            self.sendOp(hc, .{ .req = self.nextReq(), .op = "job_resume", .job = ctx.job });
-            self.markJob(hc, ctx.job, .running);
-        },
-        .cancel => self.sendOp(hc, .{ .req = self.nextReq(), .op = "job_cancel", .job = ctx.job }),
-        .dismiss => {
-            var i: usize = 0;
-            while (i < self.jobs.items.len) : (i += 1) {
-                const j = self.jobs.items[i];
-                if (j.hc == hc and j.job == ctx.job) {
-                    if (j.undo_op) |u| u.destroy(self.allocator);
-                    if (j.undo_trash_orig) |o| self.allocator.free(o);
-                    self.allocator.free(j.label);
-                    self.allocator.destroy(j);
-                    _ = self.jobs.orderedRemove(i);
-                    break;
-                }
-            }
-        },
-        .move_up, .move_down => {},
-    }
-    self.renderJobs();
-}
-
 pub fn markJob(self: *BrowserView, hc: *HostConn, job: u64, state: @FieldType(JobRow, "state")) void {
     for (self.jobs.items) |j| {
         if (j.hc == hc and j.job == job and !j.terminal()) j.state = state;
-    }
-}
-
-/// Rebuild the jobs/transfers panel (hidden when empty).
-pub fn renderJobs(self: *BrowserView) void {
-    while (c.gtk_widget_get_first_child(self.jobs_box)) |child| {
-        c.gtk_box_remove(@ptrCast(self.jobs_box), child);
-    }
-    var scratch = std.heap.ArenaAllocator.init(self.allocator);
-    defer scratch.deinit();
-    const durable_rows = if (self.transfer_service) |service|
-        service.rows(scratch.allocator()) catch &.{}
-    else
-        &.{};
-    const any = self.transfers.items.len > 0 or self.jobs.items.len > 0 or durable_rows.len > 0;
-    c.gtk_widget_set_visible(self.jobs_box, if (any) 1 else 0);
-    if (!any) return;
-
-    for (durable_rows) |d| {
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
-        c.gtk_widget_set_margin_start(row, 6);
-        c.gtk_widget_set_margin_end(row, 6);
-        var buf: [256:0]u8 = undefined;
-        const txt = std.fmt.bufPrintZ(&buf, "durable: {s} [{s}]", .{ d.label, @tagName(d.state) }) catch "durable transfer";
-        const label = c.gtk_label_new(txt.ptr);
-        c.gtk_label_set_xalign(@ptrCast(label), 0);
-        c.gtk_widget_set_hexpand(label, 1);
-        c.gtk_box_append(@ptrCast(row), label);
-        if (d.state == .queued or d.state == .waiting_retry) {
-            self.jobsButton(row, "go-up-symbolic", .{ .allocator = self.allocator, .view = self, .service_token = self.allocator.dupe(u8, d.token) catch null, .kind = .move_up });
-            self.jobsButton(row, "go-down-symbolic", .{ .allocator = self.allocator, .view = self, .service_token = self.allocator.dupe(u8, d.token) catch null, .kind = .move_down });
-        }
-        self.jobsButton(row, "process-stop-symbolic", .{ .allocator = self.allocator, .view = self, .service_token = self.allocator.dupe(u8, d.token) catch null, .kind = .cancel });
-        c.gtk_box_append(@ptrCast(self.jobs_box), row);
-    }
-
-    for (self.transfers.items) |t| {
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
-        c.gtk_widget_set_margin_start(row, 6);
-        c.gtk_widget_set_margin_end(row, 6);
-        const p = t.x.progress();
-        var lbl: [256:0]u8 = undefined;
-        const pct: u64 = if (p.total > 0) p.done * 100 / p.total else 0;
-        const txt = if (!t.started)
-            std.fmt.bufPrintZ(&lbl, "⇄ {s} — [queued]", .{t.label}) catch "transfer"
-        else
-            std.fmt.bufPrintZ(&lbl, "⇄ {s} — {d}% ({d}/{d} MB)", .{
-                t.label, pct, p.done >> 20, p.total >> 20,
-            }) catch "transfer";
-        const l = c.gtk_label_new(txt.ptr);
-        c.gtk_label_set_xalign(@ptrCast(l), 0);
-        c.gtk_widget_set_hexpand(l, 1);
-        c.gtk_label_set_ellipsize(@ptrCast(l), c.PANGO_ELLIPSIZE_MIDDLE);
-        c.gtk_box_append(@ptrCast(row), l);
-        self.jobsButton(row, "process-stop-symbolic", .{
-            .allocator = self.allocator,
-            .view = self,
-            .xfer = t.x,
-            .kind = .cancel,
-        });
-        c.gtk_box_append(@ptrCast(self.jobs_box), row);
-    }
-
-    for (self.jobs.items) |j| {
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
-        c.gtk_widget_set_margin_start(row, 6);
-        c.gtk_widget_set_margin_end(row, 6);
-        var lbl: [256:0]u8 = undefined;
-        const state_txt: []const u8 = switch (j.state) {
-            .running => "",
-            .paused => " [paused]",
-            .finished => " [done]",
-            .failed => " [failed]",
-            .canceled => " [canceled]",
-        };
-        const pct: u64 = if (j.total > 0) j.done * 100 / j.total else 0;
-        const txt = std.fmt.bufPrintZ(&lbl, "{s}@{s} — {d}%{s}", .{
-            j.label, j.hc.label(), pct, state_txt,
-        }) catch "job";
-        const l = c.gtk_label_new(txt.ptr);
-        c.gtk_label_set_xalign(@ptrCast(l), 0);
-        c.gtk_widget_set_hexpand(l, 1);
-        c.gtk_label_set_ellipsize(@ptrCast(l), c.PANGO_ELLIPSIZE_MIDDLE);
-        c.gtk_box_append(@ptrCast(row), l);
-        if (!j.terminal()) {
-            if (j.state == .paused) {
-                self.jobsButton(row, "media-playback-start-symbolic", .{
-                    .allocator = self.allocator,
-                    .view = self,
-                    .hc = j.hc,
-                    .job = j.job,
-                    .kind = .resume_,
-                });
-            } else {
-                self.jobsButton(row, "media-playback-pause-symbolic", .{
-                    .allocator = self.allocator,
-                    .view = self,
-                    .hc = j.hc,
-                    .job = j.job,
-                    .kind = .pause,
-                });
-            }
-            self.jobsButton(row, "process-stop-symbolic", .{
-                .allocator = self.allocator,
-                .view = self,
-                .hc = j.hc,
-                .job = j.job,
-                .kind = .cancel,
-            });
-        } else {
-            self.jobsButton(row, "window-close-symbolic", .{
-                .allocator = self.allocator,
-                .view = self,
-                .hc = j.hc,
-                .job = j.job,
-                .kind = .dismiss,
-            });
-        }
-        c.gtk_box_append(@ptrCast(self.jobs_box), row);
     }
 }

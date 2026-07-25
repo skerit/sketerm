@@ -66,6 +66,7 @@ comptime {
     _ = @import("ui/browser/menu.zig");
     _ = @import("ui/browser/ops.zig");
     _ = @import("ui/browser/jobs.zig");
+    _ = @import("ui/browser/jobpanel.zig");
     _ = @import("ui/browser/open.zig");
     _ = @import("ui/browser/preview.zig");
     _ = @import("ui/browser/props.zig");
@@ -105,6 +106,8 @@ comptime {
     _ = @import("filebrowser/paths.zig");
     _ = @import("filebrowser/crumbs.zig");
     _ = @import("filebrowser/format.zig");
+    _ = @import("filebrowser/progress.zig");
+    _ = @import("filebrowser/xferqueue.zig");
     _ = @import("filebrowser/desktop.zig");
     _ = @import("filebrowser/hexdump.zig");
     _ = @import("filebrowser/previewers.zig");

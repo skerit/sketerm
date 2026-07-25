@@ -29,6 +29,10 @@ pub const Intent = struct {
     cancel_requested: bool = false,
     submitted_size: u64 = 0,
     submitted_mtime_ns: i64 = 0,
+    /// User-held transfer. A plain defaulted field, not a new State
+    /// value: an older build parses the ledger with unknown fields
+    /// ignored, so a paused entry still loads there.
+    paused: bool = false,
 };
 
 pub const Watch = struct {
@@ -141,6 +145,7 @@ test "transfer ledger round trips recovery fields" {
             .dst = .{ .path = "/cache/a" },
             .state = .running,
             .job = 42,
+            .paused = true,
         }},
         .watches = &.{.{
             .token = "watch",
@@ -157,6 +162,7 @@ test "transfer ledger round trips recovery fields" {
     try t.expectEqual(@as(u64, 9), parsed.value.next_order);
     try t.expectEqualStrings("abc", parsed.value.intents[0].token);
     try t.expectEqual(.running, parsed.value.intents[0].state);
+    try t.expectEqual(true, parsed.value.intents[0].paused);
     try t.expectEqual(@as(u64, 3), parsed.value.watches[0].dirty_generation);
     try t.expectEqualSlices(u64, &.{42}, parsed.value.acknowledgments);
 }
