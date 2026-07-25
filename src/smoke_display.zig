@@ -1,0 +1,545 @@
+//! External display sessions + the controller lease, end to end.
+//!
+//! Shared stage: `smoke-mux` runs it against a MONOLITH daemon and
+//! `smoke-broker` against a real broker (whose per-session workers make
+//! the 'Y'/'A' control datagrams load-bearing). Broker-only regressions
+//! in exactly that hop have shipped before while monolith smokes stayed
+//! green, so both is not redundancy — it is the point.
+//!
+//! Covered: `display create` returns a usable environment as JSON; the
+//! returned Wayland socket accepts an EXTERNAL client (a stock
+//! weston-terminal sketerm never spawned); duplicate names are refused;
+//! `inspect`/`list` report the session; the no-viewer TTL kills an
+//! abandoned session; `destroy` closes the listener; and the controller
+//! lease actually gates input — a non-controller's `request_close` does
+//! nothing, the controller's closes the app.
+
+const std = @import("std");
+const c = @import("c.zig").c;
+const client_mod = @import("mux/client.zig");
+const wire = @import("mux/wire.zig");
+const display_cli = @import("mux/display.zig");
+const pipe_mod = @import("wlhost/pipe.zig");
+const compositor_mod = @import("wlhost/compositor.zig");
+
+fn fail(comptime msg: []const u8) noreturn {
+    std.debug.print("smoke-display: FAIL: " ++ msg ++ "\n", .{});
+    std.process.exit(1);
+}
+
+fn failf(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("smoke-display: FAIL: " ++ fmt ++ "\n", args);
+    std.process.exit(1);
+}
+
+/// Run the display CLI with stdout captured, so the stage asserts on
+/// the REAL bytes a caller would parse (not a re-implementation of the
+/// formatting). Output is small; the pipe buffer is never a concern.
+const CliResult = struct {
+    code: u8,
+    out: []u8,
+
+    fn deinit(self: CliResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.out);
+    }
+};
+
+fn runCli(allocator: std.mem.Allocator, argv: []const []const u8) CliResult {
+    var pfds: [2]c_int = undefined;
+    if (c.pipe(&pfds) != 0) fail("pipe");
+    const saved = c.dup(1);
+    if (saved < 0) fail("dup stdout");
+    _ = c.dup2(pfds[1], 1);
+    _ = c.close(pfds[1]);
+    const code = display_cli.run(allocator, argv);
+    _ = c.dup2(saved, 1);
+    _ = c.close(saved);
+
+    var out: std.ArrayList(u8) = .empty;
+    while (true) {
+        var buf: [4096]u8 = undefined;
+        const n = c.read(pfds[0], &buf, buf.len);
+        if (n <= 0) break;
+        out.appendSlice(allocator, buf[0..@intCast(n)]) catch fail("oom");
+    }
+    _ = c.close(pfds[0]);
+    return .{ .code = code, .out = out.toOwnedSlice(allocator) catch fail("oom") };
+}
+
+const CreateReply = struct {
+    session: []const u8 = "",
+    environment: struct {
+        WAYLAND_DISPLAY: []const u8 = "",
+        XDG_RUNTIME_DIR: []const u8 = "",
+        PULSE_SERVER: []const u8 = "",
+        LIBGL_ALWAYS_SOFTWARE: []const u8 = "",
+    } = .{},
+};
+
+fn socketAccepts(path: []const u8) bool {
+    const fd = @import("util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    defer _ = c.close(fd);
+    var addr: c.struct_sockaddr_un = undefined;
+    @import("mux/daemon.zig").fillSockaddrUn(&addr, path) catch return false;
+    return c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0;
+}
+
+/// One attached viewer. `has_control` mirrors the daemon's
+/// control_state pushes — the lease is only observable through them.
+const Viewer = struct {
+    allocator: std.mem.Allocator,
+    conn: client_mod.Conn,
+    comp: ?*compositor_mod.Compositor = null,
+    chan: u32 = 0,
+    has_control: bool = false,
+    holder: [32]u8 = undefined,
+    holder_len: usize = 0,
+    control_pushes: u32 = 0,
+    viewers: u32 = 0,
+    alive: bool = true,
+
+    fn attach(allocator: std.mem.Allocator, sock_path: []const u8, name: []const u8, opts: struct {
+        read_only: bool = false,
+        control: bool = false,
+        replica: bool = false,
+    }) Viewer {
+        var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("viewer connect");
+        conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("viewer hello");
+        (conn.recvExpectFor(&.{.welcome}, 15_000) catch fail("viewer welcome")).deinit(allocator);
+        conn.sendJson(.attach, .{
+            .name = name,
+            .kind = "gui",
+            .read_only = opts.read_only,
+            .control = opts.control,
+        }) catch fail("viewer attach");
+        (conn.recvExpectFor(&.{.snapshot}, 15_000) catch fail("viewer snapshot")).deinit(allocator);
+        // Non-blocking from here: the stage pumps several connections
+        // and must never park in a read on one of them.
+        conn.setNonBlocking();
+        var v = Viewer{ .allocator = allocator, .conn = conn };
+        if (opts.replica) {
+            const comp = allocator.create(compositor_mod.Compositor) catch fail("oom");
+            comp.* = compositor_mod.Compositor.init(allocator, .{
+                .toplevel_frame = onFrame,
+                .toplevel_gone = onGone,
+            }) catch fail("replica init");
+            comp.lenient = true;
+            v.comp = comp;
+        }
+        return v;
+    }
+
+    fn deinit(self: *Viewer) void {
+        if (self.comp) |comp| {
+            comp.deinit();
+            self.allocator.destroy(comp);
+            self.comp = null;
+        }
+        if (self.alive) {
+            self.conn.deinit();
+            self.alive = false;
+        }
+    }
+
+    /// Drop the socket WITHOUT detaching — a viewer process dying.
+    fn kill(self: *Viewer) void {
+        if (!self.alive) return;
+        self.conn.deinit();
+        self.alive = false;
+    }
+
+    fn label(self: *const Viewer) []const u8 {
+        return self.holder[0..self.holder_len];
+    }
+
+    /// Drain whatever has arrived. Returns false once the peer hung up.
+    fn pump(self: *Viewer) bool {
+        if (!self.alive) return false;
+        if (!self.conn.fillAvailable()) return false;
+        while (self.conn.takeFrame() catch return false) |f| {
+            defer f.deinit(self.allocator);
+            switch (f.ftype) {
+                .control_state => {
+                    const Msg = struct {
+                        controller: bool = false,
+                        read_only: bool = false,
+                        controller_label: []const u8 = "",
+                        viewers: u32 = 0,
+                    };
+                    var parsed = std.json.parseFromSlice(Msg, self.allocator, f.payload, .{
+                        .ignore_unknown_fields = true,
+                        .allocate = .alloc_always,
+                    }) catch fail("control_state parse");
+                    defer parsed.deinit();
+                    self.has_control = parsed.value.controller;
+                    self.viewers = parsed.value.viewers;
+                    self.holder_len = @min(parsed.value.controller_label.len, self.holder.len);
+                    @memcpy(self.holder[0..self.holder_len], parsed.value.controller_label[0..self.holder_len]);
+                    self.control_pushes += 1;
+                },
+                .chan_open => {
+                    const open = wire.decodeChanOpen(f.payload) orelse continue;
+                    if (open.kind == .wayland_native) self.chan = open.id;
+                },
+                .chan_data => {
+                    const comp = self.comp orelse continue;
+                    if ((wire.decodeChanId(f.payload) orelse 0) != self.chan) continue;
+                    comp.feed(f.payload[4..]) catch fail("replica feed");
+                    comp.clearOut(); // passive replica: output is discarded
+                    if (comp.dead) fail("replica flagged a protocol error");
+                },
+                else => {},
+            }
+        }
+        return true;
+    }
+
+    fn sendUnits(self: *Viewer, units: []const u8) void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, self.chan, .little);
+        payload.appendSlice(self.allocator, &idb) catch fail("oom");
+        payload.appendSlice(self.allocator, units) catch fail("oom");
+        self.conn.sendFrame(.chan_data, payload.items) catch fail("chan_data send");
+    }
+
+    fn requestClose(self: *Viewer, sid: u32) void {
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(self.allocator);
+        pipe_mod.appendRequestClose(&units, self.allocator, sid) catch fail("oom");
+        self.sendUnits(units.items);
+    }
+
+    fn requestControl(self: *Viewer, op: []const u8) void {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        std.json.Stringify.value(.{ .op = op }, .{}, &aw.writer) catch fail("oom");
+        self.conn.sendFrame(.control_req, aw.written()) catch fail("control_req send");
+    }
+};
+
+/// Frames land on a file-global because the compositor callback carries
+/// only an opaque ctx and every viewer here shares one accounting.
+var g_frames: usize = 0;
+var g_sid: u32 = 0;
+var g_gone: usize = 0;
+
+fn onFrame(ctx: ?*anyopaque, surface: u32, fw: i32, fh: i32, scale: i32, lw: i32, lh: i32, format: u32, pixels: []const u8) void {
+    _ = .{ ctx, fw, fh, scale, lw, lh, format, pixels };
+    g_frames += 1;
+    g_sid = surface;
+}
+
+fn onGone(ctx: ?*anyopaque, surface: u32) void {
+    _ = .{ ctx, surface };
+    g_gone += 1;
+}
+
+fn pumpFor(vs: []*Viewer, ms: i64) void {
+    const deadline = nowMs() + ms;
+    while (nowMs() < deadline) {
+        for (vs) |v| _ = v.pump();
+        _ = c.usleep(20_000);
+    }
+}
+
+fn nowMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+}
+
+fn childAlive(pid: c.pid_t) bool {
+    var st: c_int = 0;
+    // WNOHANG reap first: a zombie answers kill(0) just fine.
+    if (c.waitpid(pid, &st, c.WNOHANG) == pid) return false;
+    return c.kill(pid, 0) == 0;
+}
+
+/// Spawn an EXTERNAL Wayland client against `wl_path` — the whole point
+/// of a display session. Nothing about it goes through sketerm.
+fn spawnExternalApp(wl_path: []const u8) c.pid_t {
+    var wl_z: [4096:0]u8 = undefined;
+    const wz = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl_path}) catch fail("wl path too long");
+    const pid = c.fork();
+    if (pid < 0) fail("fork external app");
+    if (pid == 0) {
+        _ = c.setenv("WAYLAND_DISPLAY", wz.ptr, 1);
+        // The daemon's own hub is the display; a stray X11 display or
+        // GDK backend hint must not divert the client.
+        _ = c.unsetenv("DISPLAY");
+        const argv = [_:null]?[*:0]const u8{ "/usr/bin/weston-terminal", null };
+        _ = c.execv("/usr/bin/weston-terminal", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    return pid;
+}
+
+fn listJson(allocator: std.mem.Allocator, sock_path: []const u8) CliResult {
+    return runCli(allocator, &.{ "list", "--json", "--socket", sock_path });
+}
+
+fn hasDisplay(allocator: std.mem.Allocator, sock_path: []const u8, name: []const u8) bool {
+    const r = listJson(allocator, sock_path);
+    defer r.deinit(allocator);
+    if (r.code != 0) fail("list failed");
+    var needle_buf: [96]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"session\":\"{s}\"", .{name}) catch fail("oom");
+    return std.mem.indexOf(u8, r.out, needle) != null;
+}
+
+pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    // ── create: the JSON environment is the contract ──────────────
+    var wl_path_buf: [4096]u8 = undefined;
+    var wl_path_len: usize = 0;
+    {
+        const r = runCli(allocator, &.{ "create", "--name", "dsp1", "--json", "--socket", sock_path });
+        defer r.deinit(allocator);
+        if (r.code != 0) failf("create failed (exit {d}): {s}", .{ r.code, r.out });
+        var parsed = std.json.parseFromSlice(CreateReply, allocator, r.out, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch failf("create output is not the documented JSON: {s}", .{r.out});
+        defer parsed.deinit();
+        const env = parsed.value.environment;
+        if (!std.mem.eql(u8, parsed.value.session, "dsp1")) fail("create: wrong session name in reply");
+        if (env.WAYLAND_DISPLAY.len == 0 or env.WAYLAND_DISPLAY[0] != '/')
+            failf("create: WAYLAND_DISPLAY must be an absolute path, got '{s}'", .{env.WAYLAND_DISPLAY});
+        if (env.XDG_RUNTIME_DIR.len == 0) fail("create: no XDG_RUNTIME_DIR");
+        if (!std.mem.eql(u8, env.LIBGL_ALWAYS_SOFTWARE, "1"))
+            fail("create: software GL must be forced without --gpu");
+        // libpulse needs the scheme, exactly as the daemon hands it to
+        // its own children — a bare path is not a usable PULSE_SERVER.
+        if (env.PULSE_SERVER.len == 0)
+            fail("create: no PULSE_SERVER (the session has an audio hub)");
+        if (!std.mem.startsWith(u8, env.PULSE_SERVER, "unix:/"))
+            failf("create: PULSE_SERVER must be 'unix:<path>', got '{s}'", .{env.PULSE_SERVER});
+        if (!socketAccepts(env.WAYLAND_DISPLAY))
+            failf("create: nothing listening on {s}", .{env.WAYLAND_DISPLAY});
+        wl_path_len = env.WAYLAND_DISPLAY.len;
+        @memcpy(wl_path_buf[0..wl_path_len], env.WAYLAND_DISPLAY);
+    }
+    const wl_path = wl_path_buf[0..wl_path_len];
+    std.debug.print("smoke-display: create + live wayland socket ok ({s})\n", .{wl_path});
+
+    // ── duplicate names are refused, not silently reused ──────────
+    {
+        const r = runCli(allocator, &.{ "create", "--name", "dsp1", "--json", "--socket", sock_path });
+        defer r.deinit(allocator);
+        if (r.code == 0) fail("create: duplicate name was accepted");
+    }
+
+    // ── --gpu drops the software-GL force ─────────────────────────
+    {
+        const r = runCli(allocator, &.{ "create", "--name", "dspgpu", "--gpu", "--json", "--socket", sock_path });
+        defer r.deinit(allocator);
+        if (r.code != 0) failf("create --gpu failed: {s}", .{r.out});
+        if (std.mem.indexOf(u8, r.out, "LIBGL_ALWAYS_SOFTWARE") != null)
+            fail("create --gpu must not export LIBGL_ALWAYS_SOFTWARE");
+        const d = runCli(allocator, &.{ "destroy", "dspgpu", "--socket", sock_path });
+        defer d.deinit(allocator);
+        if (d.code != 0) fail("destroy dspgpu failed");
+    }
+    std.debug.print("smoke-display: duplicate refusal + --gpu env ok\n", .{});
+
+    // ── inspect / list ────────────────────────────────────────────
+    {
+        // In broker mode the viewer/controller fields ride the worker's
+        // 'M' push, so allow it a moment to land.
+        var tries: usize = 0;
+        while (tries < 100) : (tries += 1) {
+            const r = runCli(allocator, &.{ "inspect", "dsp1", "--json", "--socket", sock_path });
+            defer r.deinit(allocator);
+            if (r.code != 0) failf("inspect failed: {s}", .{r.out});
+            const ok = std.mem.indexOf(u8, r.out, "\"display\":true") != null and
+                std.mem.indexOf(u8, r.out, wl_path) != null and
+                std.mem.indexOf(u8, r.out, "\"controller\":null") != null;
+            if (ok) break;
+            if (tries == 99) failf("inspect fields never became right: {s}", .{r.out});
+            _ = c.usleep(50_000);
+        }
+    }
+    if (!hasDisplay(allocator, sock_path, "dsp1")) fail("list: dsp1 missing");
+    std.debug.print("smoke-display: inspect + list ok\n", .{});
+
+    // ── the controller lease, against a real external app ─────────
+    if (c.access("/usr/bin/weston-terminal", c.X_OK) == 0)
+        leaseStage(allocator, sock_path, wl_path)
+    else
+        std.debug.print("smoke-display: lease stage SKIPPED (no weston-terminal)\n", .{});
+
+    // ── controller death hands the lease to the oldest viewer ─────
+    handoverStage(allocator, sock_path);
+
+    // ── destroy closes the listener ───────────────────────────────
+    {
+        const r = runCli(allocator, &.{ "destroy", "dsp1", "--socket", sock_path });
+        defer r.deinit(allocator);
+        if (r.code != 0) failf("destroy failed: {s}", .{r.out});
+    }
+    {
+        var tries: usize = 0;
+        while (tries < 100 and socketAccepts(wl_path)) : (tries += 1) _ = c.usleep(50_000);
+        if (socketAccepts(wl_path)) fail("destroy: the wayland socket still accepts connections");
+    }
+    if (hasDisplay(allocator, sock_path, "dsp1")) fail("destroy: dsp1 still listed");
+    std.debug.print("smoke-display: destroy closes the listener ok\n", .{});
+
+    // ── TTL: an abandoned session must not leak a hub forever ─────
+    {
+        const r = runCli(allocator, &.{ "create", "--name", "dspttl", "--ttl", "1", "--json", "--socket", sock_path });
+        defer r.deinit(allocator);
+        if (r.code != 0) failf("create --ttl failed: {s}", .{r.out});
+    }
+    if (!hasDisplay(allocator, sock_path, "dspttl")) fail("ttl: session missing right after create");
+    {
+        // 1s TTL, checked on the daemon's reap; a worker additionally
+        // has to exit and be reaped by the broker.
+        var tries: usize = 0;
+        while (tries < 120) : (tries += 1) {
+            if (!hasDisplay(allocator, sock_path, "dspttl")) break;
+            _ = c.usleep(100_000);
+        }
+        if (hasDisplay(allocator, sock_path, "dspttl")) fail("ttl: never-attached session outlived its ttl");
+    }
+    std.debug.print("smoke-display: ttl expiry ok\n", .{});
+}
+
+/// Two viewers on one display session with a real external app: only
+/// the controller's input reaches it. `request_close` is the observable
+/// — binary, and immune to the app's own idle repaints (a cursor blink
+/// would defeat any "no new frames" assertion).
+fn leaseStage(allocator: std.mem.Allocator, sock_path: []const u8, wl_path: []const u8) void {
+    g_frames = 0;
+    g_sid = 0;
+    g_gone = 0;
+
+    const app_pid = spawnExternalApp(wl_path);
+    var app_reaped = false;
+    defer if (!app_reaped) {
+        // Our own child, by exact pid — never a name-based kill.
+        _ = c.kill(app_pid, c.SIGKILL);
+        var st: c_int = 0;
+        _ = c.waitpid(app_pid, &st, 0);
+    };
+
+    var a = Viewer.attach(allocator, sock_path, "dsp1", .{ .replica = true });
+    defer a.deinit();
+    var b = Viewer.attach(allocator, sock_path, "dsp1", .{ .replica = false });
+    defer b.deinit();
+    var vs = [_]*Viewer{ &a, &b };
+
+    // Wait for the external app's first committed toplevel frame.
+    {
+        const deadline = nowMs() + 30_000;
+        while (g_frames == 0 and nowMs() < deadline) {
+            for (&vs) |v| _ = v.pump();
+            if (!childAlive(app_pid)) fail("lease: the external app died before committing a frame");
+            _ = c.usleep(20_000);
+        }
+        if (g_frames == 0) fail("lease: the external app never committed a frame into the display session");
+    }
+    std.debug.print("smoke-display: external app rendered into the display session ({d} frames)\n", .{g_frames});
+
+    // First non-read-only attach holds the lease; the second is a viewer.
+    pumpFor(&vs, 500);
+    if (!a.has_control) fail("lease: the first viewer did not auto-acquire control");
+    if (b.has_control) fail("lease: the second viewer must not hold control");
+    if (b.holder_len == 0) fail("lease: a read-only viewer was not told who controls");
+    if (!std.mem.eql(u8, a.label(), b.label())) fail("lease: viewers disagree about the controller");
+    if (b.viewers != 2) failf("lease: viewer count is {d}, want 2", .{b.viewers});
+    std.debug.print("smoke-display: auto-acquire + read-only notice ok (controller {s})\n", .{b.label()});
+
+    // A non-controller's input must be DROPPED daemon-side.
+    b.requestClose(g_sid);
+    pumpFor(&vs, 1_500);
+    if (!childAlive(app_pid)) fail("lease: a NON-CONTROLLER's request_close reached the app");
+    std.debug.print("smoke-display: non-controller input dropped ok\n", .{});
+
+    // Forced takeover moves the lease both ways.
+    b.requestControl("takeover");
+    {
+        const deadline = nowMs() + 5_000;
+        while ((!b.has_control or a.has_control) and nowMs() < deadline) {
+            for (&vs) |v| _ = v.pump();
+            _ = c.usleep(20_000);
+        }
+    }
+    if (!b.has_control) fail("lease: takeover did not grant control");
+    if (a.has_control) fail("lease: the evicted controller still believes it controls");
+
+    // The previous controller is now gated too.
+    a.requestClose(g_sid);
+    pumpFor(&vs, 1_500);
+    if (!childAlive(app_pid)) fail("lease: the EVICTED controller's request_close reached the app");
+    std.debug.print("smoke-display: takeover ok (controller {s})\n", .{a.label()});
+
+    // And the new controller's input does reach it.
+    b.requestClose(g_sid);
+    {
+        const deadline = nowMs() + 10_000;
+        while (childAlive(app_pid) and nowMs() < deadline) {
+            for (&vs) |v| _ = v.pump();
+            _ = c.usleep(20_000);
+        }
+    }
+    if (childAlive(app_pid)) fail("lease: the controller's request_close did NOT reach the app");
+    app_reaped = true;
+    std.debug.print("smoke-display: controller input forwarded ok\n", .{});
+}
+
+/// A controller that vanishes must hand the lease to the oldest
+/// remaining eligible viewer — otherwise a session survives that nobody
+/// can drive. Read-only viewers are skipped by that handover.
+fn handoverStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    {
+        const r = runCli(allocator, &.{ "create", "--name", "dsphand", "--json", "--socket", sock_path });
+        defer r.deinit(allocator);
+        if (r.code != 0) failf("handover: create failed: {s}", .{r.out});
+    }
+    var a = Viewer.attach(allocator, sock_path, "dsphand", .{});
+    defer a.deinit();
+    var ro = Viewer.attach(allocator, sock_path, "dsphand", .{ .read_only = true });
+    defer ro.deinit();
+    var b = Viewer.attach(allocator, sock_path, "dsphand", .{});
+    defer b.deinit();
+    var vs = [_]*Viewer{ &a, &ro, &b };
+    pumpFor(&vs, 500);
+    if (!a.has_control) fail("handover: first viewer should hold the lease");
+    if (ro.has_control or b.has_control) fail("handover: later viewers must be read-only");
+
+    // The controller's process dies (socket drop, no detach).
+    a.kill();
+    {
+        const deadline = nowMs() + 5_000;
+        while (!b.has_control and nowMs() < deadline) {
+            _ = ro.pump();
+            _ = b.pump();
+            _ = c.usleep(20_000);
+        }
+    }
+    if (!b.has_control) fail("handover: no viewer picked up the lease after the controller died");
+    if (ro.has_control) fail("handover: a read-only viewer must never be handed the lease");
+    if (!std.mem.eql(u8, ro.label(), b.label())) fail("handover: viewers disagree about the new controller");
+    std.debug.print("smoke-display: controller-death handover ok (now {s})\n", .{b.label()});
+
+    // Explicit release with no eligible viewer left leaves nobody in
+    // charge — and says so.
+    b.requestControl("release");
+    {
+        const deadline = nowMs() + 5_000;
+        while (b.has_control and nowMs() < deadline) {
+            _ = ro.pump();
+            _ = b.pump();
+            _ = c.usleep(20_000);
+        }
+    }
+    if (b.has_control) fail("handover: release did not drop the lease");
+    if (ro.holder_len != 0) fail("handover: a released lease should report no controller");
+
+    const d = runCli(allocator, &.{ "destroy", "dsphand", "--socket", sock_path });
+    defer d.deinit(allocator);
+    if (d.code != 0) fail("handover: destroy failed");
+}

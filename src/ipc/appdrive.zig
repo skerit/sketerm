@@ -477,7 +477,9 @@ pub const App = struct {
                 p.deinit();
             } else |_| {}
         }
-        conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
+        // MCP drives the seat: ask for the controller lease outright
+        // (takeover), which is what every app tool already assumes.
+        conn.sendJson(.attach, .{ .name = name, .kind = "mcp", .control = true }) catch return Error.SpawnFailed;
         const snap = conn.recvExpectFor(&.{.snapshot}, opts.step_timeout_ms) catch |err| {
             setStepErr("attach", &conn, err);
             return Error.SpawnFailed;
@@ -530,7 +532,9 @@ pub const App = struct {
 
         const name = allocator.dupe(u8, session_name) catch return Error.OutOfMemory;
         errdefer allocator.free(name);
-        conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
+        // MCP drives the seat: ask for the controller lease outright
+        // (takeover), which is what every app tool already assumes.
+        conn.sendJson(.attach, .{ .name = name, .kind = "mcp", .control = true }) catch return Error.SpawnFailed;
         const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch |err| {
             setStepErr("attach", &conn, err);
             return Error.SpawnFailed;
@@ -1125,7 +1129,9 @@ pub const App = struct {
             .video = false,
         }) catch return Error.NotConnected;
         (conn.recvExpectFor(&.{.welcome}, @max(deadline - nowMs(), 1)) catch return Error.Timeout).deinit(a);
-        conn.sendJson(.attach, .{ .name = self.name, .kind = "cli" }) catch return Error.NotConnected;
+        // Read-only: this side connection only reads the log ring and
+        // must never take the lease off the primary connection.
+        conn.sendJson(.attach, .{ .name = self.name, .kind = "cli", .read_only = true }) catch return Error.NotConnected;
         (conn.recvExpectFor(&.{.snapshot}, @max(deadline - nowMs(), 1)) catch return Error.Timeout).deinit(a);
         conn.sendFrame(.log_get, req_json) catch return Error.NotConnected;
         const f = conn.recvExpectFor(&.{.log_data}, @max(deadline - nowMs(), 1)) catch return Error.Timeout;

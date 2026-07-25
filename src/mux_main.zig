@@ -21,6 +21,7 @@ const HELP =
     \\Usage: sketerm-mux [--socket PATH]
     \\       sketerm-mux --proxy
     \\       sketerm-mux --udp-listen [--udp-port LO:HI]
+    \\       sketerm-mux display <create|inspect|list|destroy> ...
     \\
     \\Runs in the foreground, listening on PATH (default
     \\$XDG_RUNTIME_DIR/sketerm/mux.sock). Clients (the sketerm GUI or
@@ -33,6 +34,13 @@ const HELP =
     \\runs `ssh <host> sketerm-mux --proxy` and speaks the mux
     \\protocol over the SSH pipe — sessions live in the REMOTE
     \\daemon and survive the connection.
+    \\
+    \\`display` manages EXTERNAL display sessions: a named session whose
+    \\child is a keeper process, existing only to own a Wayland display
+    \\an outside program (a browser under test automation, say) renders
+    \\into. `display create --json` prints the environment to export;
+    \\never derive those socket paths yourself. A human can attach the
+    \\normal sketerm GUI to the same session later and take over.
     \\
     \\--udp-listen is the mosh-style bootstrap (run via ssh): binds a
     \\UDP port, announces "SKETERM-UDP <port> <key>" on stdout, then
@@ -64,6 +72,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             // stdin, JSON-lines progress on stdout). One process per
             // copy/delete_tree/hash operation — kill = cancel.
             return @import("mux/fsjob.zig").serve(allocator);
+        } else if (std.mem.eql(u8, a, "--keep")) {
+            // Internal: the keeper child of a display session. Blocks
+            // on stdin (its PTY) and exits at EOF, so the PTY machinery
+            // is exactly what it is for a shell — no special case in
+            // the daemon, and killing the session kills this.
+            const cc = @import("c.zig").c;
+            _ = cc.signal(cc.SIGPIPE, sig_ign);
+            return @import("mux/keep.zig").serve();
+        } else if (std.mem.eql(u8, a, "display")) {
+            // Everything after the keyword belongs to the subcommand.
+            var rest: std.ArrayList([]const u8) = .empty;
+            defer rest.deinit(allocator);
+            var j: usize = i + 1;
+            while (j < argv.len) : (j += 1) rest.append(allocator, std.mem.span(argv[j])) catch return 1;
+            return @import("mux/display.zig").run(allocator, rest.items);
         } else if (std.mem.eql(u8, a, "--proxy")) {
             return runProxy(allocator);
         } else if (std.mem.eql(u8, a, "--udp-listen")) {

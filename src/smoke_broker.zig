@@ -202,7 +202,11 @@ fn waitForSocket(sock_path: []const u8, allocator: std.mem.Allocator) void {
     fail("broker socket never came up");
 }
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init.Minimal) u8 {
+    // This binary HOSTS a daemon (forked broker + its workers), so a
+    // display session's keeper is /proc/self/exe --keep = us. Answer it,
+    // or the keeper would re-run the whole smoke.
+    if (@import("mux/keep.zig").wanted(init.args.vector)) return @import("mux/keep.zig").serve();
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
@@ -336,6 +340,13 @@ pub fn main() u8 {
     // stale-screenshot bug reproduced only in broker mode).
     @import("smoke_backlog.zig").run(allocator, sock_path);
     std.debug.print("smoke-broker: mcp backlog gap + resync via worker ok\n", .{});
+
+    // ── external display sessions + the controller lease THROUGH THE
+    // BROKER. The hub paths ride the worker's 'Y' datagram and the
+    // lease intent rides the 'A' handoff; either omitted and this is
+    // silently broken while the monolith stage passes. ──
+    @import("smoke_display.zig").run(allocator, sock_path);
+    std.debug.print("smoke-broker: display sessions + controller lease via worker ok\n", .{});
 
     // ── post-mortem delivery: a worker whose session died must NOT exit
     //    before a backlogged, non-reading MCP client has been sent the

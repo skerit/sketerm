@@ -5022,18 +5022,34 @@ pub const Window = struct {
         c.gtk_box_append(@ptrCast(wrap), box);
     }
 
+    /// Controller-lease intent for one attach (see mux_cli.Lease).
+    pub const Lease = enum { default, read_only, control };
+
     pub fn attachMux(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane) !void {
         return self.attachMuxProfile(conn_in, name, host, takeover, null);
     }
 
     fn attachMuxProfile(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane, profile: ?*const @import("../config.zig").Profile) !void {
+        return self.attachMuxLease(conn_in, name, host, takeover, profile, .default);
+    }
+
+    fn attachMuxLease(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane, profile: ?*const @import("../config.zig").Profile, lease: Lease) !void {
         var conn = conn_in;
         self.mux_attach_err_len = 0;
         crashlog.set("mux attach '{s}' @ {s} takeover={} - handshake", .{ name, host orelse "local", takeover != null });
 
         const snap = blk: {
             errdefer conn.deinit();
-            try conn.sendJson(.attach, .{ .name = name, .kind = "gui" });
+            // A GUI attach asks for the app's controller lease by
+            // default (it only lands if free); the daemon answers with
+            // a control_state frame either way, so a viewer that did
+            // not get it finds out.
+            try conn.sendJson(.attach, .{
+                .name = name,
+                .kind = "gui",
+                .read_only = lease == .read_only,
+                .control = lease == .control,
+            });
             break :blk conn.recvExpect(&.{.snapshot}) catch |err| {
                 // Stash the daemon's reason while `conn` is still alive
                 // (the errdefer below frees it) so the caller surfaces it.
@@ -5760,7 +5776,8 @@ pub const Window = struct {
             const conn = win.muxConnect(req.host) catch {
                 return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
             };
-            win.attachMux(conn, name, req.host, takeover) catch |err| {
+            const lease: Lease = if (req.read_only) .read_only else if (req.control) .control else .default;
+            win.attachMuxLease(conn, name, req.host, takeover, null, lease) catch |err| {
                 // Prefer the daemon's own reason ("no such session", …)
                 // over the bare error name.
                 const detail = if (win.mux_attach_err_len > 0)

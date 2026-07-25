@@ -42,6 +42,12 @@ pub const Request = struct {
     /// new-durable-tab / attach-session: SSH host of the mux daemon
     /// ("user@box" accepted). null = local daemon.
     host: ?[]const u8 = null,
+    /// attach-session: controller-lease intent for a shared app
+    /// session. Neither set = take the lease only if it is free (the
+    /// default and the historical behaviour). `read_only` = view
+    /// without ever driving; `control` = force a takeover.
+    read_only: bool = false,
+    control: bool = false,
 };
 
 pub fn parseRequest(allocator: std.mem.Allocator, line: []const u8) !std.json.Parsed(Request) {

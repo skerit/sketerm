@@ -27,6 +27,8 @@ const MUX_HELP =
     \\Commands (each accepts an optional leading host):
     \\  list                  print sessions
     \\  attach <name>         attach a session as a GUI tab
+    \\      --read-only  view a forwarded app without driving it
+    \\      --control    take the app's controller lease by force
     \\  attach-all            attach EVERY session not already shown
     \\                        (bulk handoff after a move/crash)
     \\  new                   spawn a durable tab in the GUI
@@ -156,7 +158,24 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
         return 0;
     }
     if (std.mem.eql(u8, cmd, "attach") and args.len >= 2) {
-        return if (guiCommand(allocator, "attach-session", args[1], host, true)) 0 else 1;
+        // The session name is the first NON-flag argument, so
+        // `attach --read-only foo` and `attach foo --control` both work.
+        var lease: Lease = .default;
+        var target: ?[]const u8 = null;
+        for (args[1..]) |a| {
+            if (std.mem.eql(u8, a, "--read-only")) {
+                lease = .read_only;
+            } else if (std.mem.eql(u8, a, "--control")) {
+                lease = .control;
+            } else if (target == null) {
+                target = a;
+            }
+        }
+        const name = target orelse {
+            _ = c.fprintf(platform.stderr(), "sketerm mux: attach needs a session name\n");
+            return 1;
+        };
+        return if (guiCommandLease(allocator, "attach-session", name, host, true, lease)) 0 else 1;
     }
     if (std.mem.eql(u8, cmd, "attach-all")) {
         return if (guiCommand(allocator, "attach-all", null, host, false)) 0 else 1;
@@ -297,7 +316,9 @@ fn muxSpawn(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, r
 /// snapshot we discard.
 fn attachForIo(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8) ?struct { conn: mux_client.Conn, snap: mux_client.Conn.OwnedFrame } {
     var conn = muxConnect(allocator, host) orelse return null;
-    conn.sendJson(.attach, .{ .name = name, .kind = "cli" }) catch {
+    // Read-only: a one-shot send/get-text must not take a session's
+    // controller lease away from the viewer that holds it.
+    conn.sendJson(.attach, .{ .name = name, .kind = "cli", .read_only = true }) catch {
         conn.deinit();
         return null;
     };
@@ -691,7 +712,14 @@ pub fn fetchSessions(allocator: std.mem.Allocator, host: ?[]const u8) ?std.json.
 
 /// Send one command to the running GUI over its IPC socket
 /// ($SKETERM_SOCKET inside a pane, auto-discovery otherwise).
+/// Controller-lease intent for an attach that goes through the GUI.
+pub const Lease = enum { default, read_only, control };
+
 pub fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, host: ?[]const u8, use_pane: bool) bool {
+    return guiCommandLease(allocator, cmd, data, host, use_pane, .default);
+}
+
+pub fn guiCommandLease(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, host: ?[]const u8, use_pane: bool, lease: Lease) bool {
     const sock = ipc_client.resolveSocket(allocator, null) orelse {
         _ = c.fprintf(platform.stderr(), "sketerm mux: no running sketerm window found\n");
         return false;
@@ -717,7 +745,15 @@ pub fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const 
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    std.json.Stringify.value(.{ .cmd = cmd, .data = data, .host = host, .pane = self_pane, .session = self_session }, .{}, &aw.writer) catch return false;
+    std.json.Stringify.value(.{
+        .cmd = cmd,
+        .data = data,
+        .host = host,
+        .pane = self_pane,
+        .session = self_session,
+        .read_only = lease == .read_only,
+        .control = lease == .control,
+    }, .{}, &aw.writer) catch return false;
     aw.writer.writeAll("\n") catch return false;
 
     const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);

@@ -137,6 +137,15 @@ pub const Terminal = struct {
     /// headless MCP clients: the "assistant is driving" signal.
     peer_total: u32 = 0,
     peer_drivers: u32 = 0,
+    /// Controller lease (control_state frames): does THIS client drive
+    /// the session's Wayland seat? A forwarded app renders for every
+    /// viewer, but only the controller's input reaches it. Seeded true
+    /// so a pre-lease daemon (no control_state frames at all) behaves
+    /// exactly as before.
+    has_control: bool = true,
+    /// Label of whoever holds the lease when we don't ("" = nobody).
+    control_holder: [32]u8 = undefined,
+    control_holder_len: usize = 0,
     /// Fired when the attach roster changes.
     on_peers: ?*const fn (ctx: ?*anyopaque) void = null,
     /// Fired when this session's primary app host changes: non-null
@@ -638,6 +647,7 @@ pub const Terminal = struct {
             .file_listing => self.handleFileListing(frame.payload),
             .app_listing => self.handleAppListing(frame.payload),
             .peer_info => self.handlePeerInfo(frame.payload),
+            .control_state => self.handleControlState(frame.payload),
             .file_data => self.downloadData(frame.payload),
             .chan_open => self.chanOpen(frame.payload),
             .chan_data => self.chanData(frame.payload),
@@ -1278,6 +1288,57 @@ pub const Terminal = struct {
         if (changed) {
             if (self.on_peers) |f| f(self.user_ctx);
         }
+    }
+
+    /// Controller-lease state for this session. Only the controller's
+    /// seat input reaches a forwarded app, so a viewer that did NOT get
+    /// the lease must be told — otherwise its clicks silently do
+    /// nothing and the app looks hung. Deliberately a log line, not a
+    /// dialog: shared-seat arbitration is a rare, advanced situation.
+    fn handleControlState(self: *Terminal, payload: []const u8) void {
+        const Msg = struct {
+            controller: bool = true,
+            read_only: bool = false,
+            controller_label: []const u8 = "",
+            viewers: u32 = 0,
+        };
+        const parsed = std.json.parseFromSlice(Msg, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch return;
+        defer parsed.deinit();
+        const was = self.has_control;
+        self.has_control = parsed.value.controller;
+        const label = parsed.value.controller_label;
+        self.control_holder_len = @min(label.len, self.control_holder.len);
+        @memcpy(self.control_holder[0..self.control_holder_len], label[0..self.control_holder_len]);
+        if (was == self.has_control) return;
+        const session = if (self.remote) |r| r.session else "?";
+        if (self.has_control) {
+            std.debug.print("sketerm: session '{s}': this window now controls the app\n", .{session});
+        } else {
+            std.debug.print(
+                "sketerm: session '{s}': VIEW ONLY — '{s}' controls the app ({d} viewers). Input from this window is ignored.\n",
+                .{ session, self.control_holder[0..self.control_holder_len], parsed.value.viewers },
+            );
+        }
+    }
+
+    /// Ask the daemon for the session's controller lease. `force` evicts
+    /// the current holder; without it a held lease is left alone.
+    pub fn requestControl(self: *Terminal, force: bool) void {
+        const remote = self.remote orelse return;
+        if (remote.closed) return;
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        std.json.Stringify.value(
+            .{ .op = if (force) "takeover" else "acquire" },
+            .{},
+            &aw.writer,
+        ) catch return;
+        remote.conn.sendFrame(.control_req, aw.written()) catch {
+            remote.closed = true;
+        };
     }
 
     /// "file://host/path" → "/path"; otherwise unchanged.

@@ -9822,3 +9822,74 @@ after an apparently successful install. `dist/install.sh` (=
 `pkgver=` line in `git status` is makepkg's own rewrite of the
 PKGBUILD, not a local edit; that had been mistaken for a user change
 across several sessions.
+
+## External display sessions + the controller lease (2026-07-25)
+
+An outside automation system (Playwright driving a browser) wants to
+render into a sketerm-mux session that sketerm did NOT spawn, and have
+a human attach the normal GUI later and take over. Two pieces landed.
+
+**`sketerm-mux display create|inspect|list|destroy`** (`src/mux/display.zig`,
+dispatched from `mux_main.zig`) creates a named app session whose child
+is a keeper process — `--keep` (`src/mux/keep.zig`), which blocks on its
+PTY until the session dies. The session therefore exists only to own a
+Wayland display socket and a PulseAudio hub. `create --json` answers
+with the exact environment to export:
+
+```json
+{"session":"d1","environment":{"WAYLAND_DISPLAY":"/run/.../wl-w1234",
+ "XDG_RUNTIME_DIR":"...","PULSE_SERVER":"unix:...",
+ "LIBGL_ALWAYS_SOFTWARE":"1"}}
+```
+
+Callers must never derive `wl-w<pid>` themselves — the naming differs
+between monolith and broker mode. `--gpu` drops the software-GL force,
+`--isolated` gives the session a private runtime dir, `--ttl SECS`
+kills it after that long with no attached viewer (counted from creation
+if it is never attached, so an abandoned create cannot leak a hub).
+Duplicate names are refused.
+
+The keeper is spawned as the DAEMON'S OWN binary (`/proc/self/exe
+--keep`), resolved daemon-side: a client — possibly on another host
+over SSH — cannot know the daemon's binary path, and a mismatched build
+would exit instantly. The consequence is that any process hosting a
+Daemon must answer `--keep`, which is why `keep.zig` is shared and the
+smoke rigs (whose binaries host a daemon in-process) dispatch to it
+too. Without that, the keeper re-runs the smoke, recursively.
+
+Spawn `.ok` now carries `wl_display` / `pulse_server` / `runtime_dir`,
+and so does session `list`. In broker mode the worker owns the hubs, so
+those paths ride its `'Y'` ready datagram, which became `Y{json}`
+(`WorkerReady`; the bare-int form is still parsed defensively).
+
+**Controller lease.** Every attached viewer sees a forwarded app, but
+only ONE may drive its Wayland seat. The first attach that did not ask
+read-only takes a free lease; later ones are viewers. New frames:
+`control_req` (client -> daemon: acquire / release / takeover) and
+`control_state` (daemon -> every attached client on every change, with
+`controller` meaning "do YOU hold it"). Enforcement is daemon-side in
+`nativeClientData`: `isSeatIntent` units from a non-controller are
+DROPPED, never queued. Deliberately excluded from the gate are the
+data-transfer replies (`clip_send`/`clip_data`/`primary_data`/
+`drop_data` answer a request the daemon made of that specific viewer)
+and the selection offers / `set_scale`, which describe the viewer
+rather than drive the app. A controller that detaches or dies hands the
+lease to the oldest remaining eligible viewer (`Client.id`, because the
+clients list is `swapRemove`d and its order says nothing about age).
+
+`list`/`inspect` report `viewers` and `controller`. `sketerm mux <host>
+attach <name>` grew `--read-only` and `--control` (force takeover),
+plumbed through the GUI IPC (`Request.read_only`/`control`) into the
+attach handshake. MCP (`appdrive`) attaches with `control:true` so
+existing app tools keep driving; its log side-connection and the
+one-shot `mux send`/`get-text` attach read-only so they cannot steal
+the lease. The GUI logs a line when it is view-only — deliberately not
+a dialog.
+
+`smoke_display.zig` runs in BOTH `smoke-mux` (monolith) and
+`smoke-broker` (real worker processes): create/duplicate/inspect/list/
+ttl/destroy, an EXTERNAL weston-terminal rendering into the returned
+`WAYLAND_DISPLAY`, and the lease itself. The lease observable is
+`request_close`: a non-controller's does nothing, the controller's
+closes the app — binary, and immune to the app's own idle repaints
+(a cursor blink defeats any "no new frames" assertion).
