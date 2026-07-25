@@ -9709,3 +9709,82 @@ via plain `zig build test`; smoke-fs (with new policy, media and query
 stages, monolith AND broker), smoke-broker, smoke-mcp, smoke-e2e all
 PASS; GUI, mux, musl and aarch64-macOS builds green; mux still links
 libc/libm only.
+
+## 2026-07-25 (later still): `sketerm files` is its own application
+
+`sketerm files` used to reach into the RUNNING terminal instance and
+turn one of its existing panes into a file browser. Four separate
+defects stacked up: `newBrowserTabAt` created a tab and then attached
+the browser to `focusedPane()`, which is not the pane it just made --
+so a pre-existing pane became a browser while the new tab kept an
+unused shell; `onActivate` built a second is_primary window every time
+(closing either then quit the app); the target was always the single
+global `g_app.window`, so a command typed in a second window acted on
+the first; and the start location was the pane's bare `cwd`, which for
+a remote pane is a path on the OTHER machine.
+
+**The default form is now a separate application identity.** Launched
+as `sketerm files [spec]`, the process registers
+`dev.sker.sketerm.files` (the base id plus `.files`, so `SKETERM_APP_ID`
+still isolates a test rig) and calls `g_set_prgname` with it, because
+the Wayland app_id and the X11 WM_CLASS come from the process, not from
+any per-window call -- `gtk_window_set_icon_name` alone can never give
+the file manager its own taskbar group. Verified: WM_CLASS is
+`"dev.sker.sketerm.files", "dev.sker.sketerm.files"` while the terminal
+stays `"sketerm", "sketerm"`. Repeat launches open another browser
+window in that process (file-manager behaviour), each at the requested
+location. `file://` URIs are accepted and percent-decoded, and a URI
+naming a FILE opens its parent directory -- the start location cannot
+say "and select this entry".
+
+Files mode deliberately does NOT participate in layout persistence:
+`last.json` / `default.json` hold one window of terminal tabs and
+belong to the terminal identity, so the file manager neither saves nor
+restores them (proven byte-identical across a files-app lifetime). Its
+control socket is `files-<pid>.sock`, which `sketerm cli` discovery
+skips -- opening a file browser must not make terminal scripting
+ambiguous -- while an explicit `--socket` still reaches it.
+
+**`--here` and `--tab` are the opposite case** and stay inside the
+terminal: they are pure socket clients (no GApplication, no window of
+their own) that address the invoking pane through `$SKETERM_SESSION` /
+`$SKETERM_PANE_ID` and land on `browser-here` / `new-browser-tab` in
+the running instance. Both resolve STRICTLY: an address that does not
+resolve is an error, not a fallback to the focused pane -- a
+`$SKETERM_SESSION` from another sketerm instance would otherwise turn
+a pane nobody named into a browser, which is the original bug wearing
+a different hat. Inside a durable REMOTE shell the window's socket is
+on the other machine, and the error says exactly that.
+
+**Window targeting is now deterministic.** Pane, tab and window ids
+became process-global (a per-window counter gave two windows a "pane
+1" each, so "the window owning pane N" had no answer);
+`Window.liveWindows` and `Window.windowForPane` walk the
+GtkApplication window list, which already carries each Zig Window as
+qdata, so there is no second registry to keep in sync. `onActivate`
+opens a SECONDARY window when a primary exists; `onShutdown` saves the
+primary's layout and tears down EVERY window (a secondary owned panes
+and GUI-owned daemon sessions that used to leak), first detaching its
+signal handlers so the destroy GTK runs afterwards cannot call back
+into freed state. A secondary window closing no longer overwrites
+`last.json` with its handful of tabs. SIGUSR1 reloads the config in
+every window. The IPC dispatch states its window-resolution rule in
+one comment: a named pane acts on that pane's window, a named tab is
+found across windows, anything else acts on the active window; `list`
+reports every window and tags each tab with a `window` id.
+
+The in-terminal browser is untouched and stayed proven: the palette
+`new_browser_tab` puts a browser on the NEW pane (the pane that was
+already there keeps its shell and its scrollback),
+`new_browser_split` still gives the dual-pane layout with working
+F5/F6 copy/move, `sketerm cli new-browser-tab` works, a saved layout
+containing browser panes restores into a terminal window, and a
+terminal window with browser panes runs alongside the dedicated files
+app with each keeping its own identity.
+
+Known and unfixed: the durable-transfer ledger is process-exclusive
+(flock), so whichever process opens a browser face first owns it and
+the other degrades to in-view transfers with an honest status line
+("download is not restart-durable (recovery ledger unavailable)", then
+the normal transfer-done and edit-sync notices). With a dedicated
+files process that is now the common case rather than an edge one.

@@ -208,7 +208,41 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         return typeText(allocator, sock_path, req.pane, req.session, text, type_delay, type_jitter);
     }
 
-    return talk(allocator, sock_path, req);
+    return talk(allocator, sock_path, req, false);
+}
+
+/// `sketerm files --here` / `--tab`: put a file browser on the pane this
+/// command was typed in (or a tab in that pane's window), over the
+/// RUNNING terminal instance's control socket. Never registers a
+/// GApplication: the browser face belongs to an existing pane, and a
+/// second app identity would open a window of its own instead.
+pub fn browserInPane(allocator: std.mem.Allocator, here: bool, spec: ?[]const u8) u8 {
+    const flag: [*:0]const u8 = if (here) "--here" else "--tab";
+    var req: protocol.Request = .{
+        .cmd = if (here) "browser-here" else "new-browser-tab",
+        .data = spec,
+    };
+    // Same addressing as `sketerm cli --pane self`: stable session name
+    // first, pane id as the fallback for an older GUI.
+    if (c.getenv("SKETERM_SESSION")) |env| req.session = std.mem.span(env);
+    if (c.getenv("SKETERM_PANE_ID")) |env| req.pane = std.fmt.parseInt(u32, std.mem.span(env), 10) catch null;
+    if (req.session == null and req.pane == null) {
+        _ = c.fprintf(
+            platform.stderr(),
+            "sketerm files %s: not inside a sketerm pane ($SKETERM_PANE_ID unset) - run plain `sketerm files` for a browser window\n",
+            flag,
+        );
+        return 2;
+    }
+    const sock_path = resolveSocket(allocator, null) orelse {
+        _ = c.fprintf(
+            platform.stderr(),
+            "sketerm files %s: cannot reach the sketerm instance owning this pane ($SKETERM_SOCKET unset and no single instance found)\n",
+            flag,
+        );
+        return 1;
+    };
+    return talk(allocator, sock_path, req, true);
 }
 
 /// Poll a pane's text until a GRegex pattern matches a line; print
@@ -412,6 +446,11 @@ pub fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
         // The mux daemon's socket lives in the same dir; it speaks a
         // different protocol and must never match GUI discovery.
         if (std.mem.eql(u8, name, "mux.sock")) continue;
+        // A `sketerm files` process serves the same protocol, but it is
+        // the FILE MANAGER: auto-discovery must not start answering
+        // "multiple instances" (or worse, pick it) just because a file
+        // browser is open. Reachable with an explicit --socket.
+        if (std.mem.startsWith(u8, name, @import("server.zig").FILES_SOCKET_PREFIX)) continue;
         const path = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_z, name }, 0) catch return null;
         // A GUI crash (SIGSEGV) orphans its socket file — counting it
         // would wrongly trip "multiple instances". Only a socket with a
@@ -448,7 +487,10 @@ pub fn socketAlive(path_z: [:0]const u8) bool {
     return true;
 }
 
-fn talk(allocator: std.mem.Allocator, sock_path: [:0]u8, req: protocol.Request) u8 {
+/// `quiet` = say nothing on success (for user-facing commands like
+/// `sketerm files --here`, where a JSON line in the shell is noise);
+/// failures still print, prefixed, on stderr.
+fn talk(allocator: std.mem.Allocator, sock_path: [:0]u8, req: protocol.Request, quiet: bool) u8 {
     defer allocator.free(sock_path);
 
     // Serialize the request as one line.
@@ -492,14 +534,25 @@ fn talk(allocator: std.mem.Allocator, sock_path: [:0]u8, req: protocol.Request) 
     }
     defer c.g_free(resp);
 
-    _ = c.fwrite(resp, 1, rlen, platform.stdout());
-    _ = c.fputc('\n', platform.stdout());
-
     // Exit code mirrors the ok field.
-    const Ok = struct { ok: bool = false };
+    const Ok = struct { ok: bool = false, @"error": []const u8 = "" };
     const parsed = std.json.parseFromSlice(Ok, allocator, resp[0..rlen], .{
         .ignore_unknown_fields = true,
-    }) catch return 1;
+    }) catch {
+        if (!quiet) {
+            _ = c.fwrite(resp, 1, rlen, platform.stdout());
+            _ = c.fputc('\n', platform.stdout());
+        }
+        return 1;
+    };
     defer parsed.deinit();
+    if (!quiet) {
+        _ = c.fwrite(resp, 1, rlen, platform.stdout());
+        _ = c.fputc('\n', platform.stdout());
+    } else if (!parsed.value.ok) {
+        const msg_z = allocator.dupeZ(u8, parsed.value.@"error") catch return 1;
+        defer allocator.free(msg_z);
+        _ = c.fprintf(platform.stderr(), "sketerm: %s\n", msg_z.ptr);
+    }
     return if (parsed.value.ok) 0 else 1;
 }

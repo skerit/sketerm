@@ -30,11 +30,20 @@ pub const Server = struct {
     }
 };
 
-/// Compute the per-process socket path. Caller frees.
-pub fn defaultSocketPath(allocator: std.mem.Allocator) ![:0]u8 {
+/// Compute the per-process socket path. Caller frees. A file-manager
+/// process (`sketerm files`) gets the `files-` prefix: its socket is
+/// real and usable with an explicit --socket, but `sketerm cli`
+/// auto-discovery skips it so opening a file browser never makes
+/// "which instance did you mean?" the answer for terminal scripting.
+pub fn defaultSocketPath(allocator: std.mem.Allocator, files_identity: bool) ![:0]u8 {
     const rt = @import("../util/platform.zig").runtimeDir();
-    return std.fmt.allocPrintSentinel(allocator, "{s}/sketerm/{d}.sock", .{ rt, c.getpid() }, 0);
+    const prefix: []const u8 = if (files_identity) FILES_SOCKET_PREFIX else "";
+    return std.fmt.allocPrintSentinel(allocator, "{s}/sketerm/{s}{d}.sock", .{ rt, prefix, c.getpid() }, 0);
 }
+
+/// Socket-name prefix of the file-manager identity. Shared with
+/// client.zig's discovery so the two can never disagree.
+pub const FILES_SOCKET_PREFIX = "files-";
 
 /// Create the socket dir (0700), bind, and start listening. The
 /// returned Server owns `path`.

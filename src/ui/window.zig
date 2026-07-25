@@ -22,6 +22,7 @@ const tree_mod = @import("tree.zig");
 const tabbar_mod = @import("tabbar.zig");
 const tab_effects = @import("tab_effects.zig");
 const file_transfers = @import("file_transfers.zig");
+const files_entry = @import("../filebrowser/entry.zig");
 
 /// Toolkit-free pane-tree model — one per tab, attached to the
 /// AdwTabPage as qdata (travels with cross-window tab drags). The
@@ -37,6 +38,30 @@ const Screen = @import("../grid/screen.zig").Screen;
 /// `always_on_top = true` so we don't spam the log on every
 /// applyConfigChange.
 var always_on_top_warned: bool = false;
+
+/// Pane, tab and window ids are PROCESS-global, not per-window: they
+/// address panes across every window of this process (`sketerm cli
+/// --pane N`, `sketerm files --here`), and a per-window counter handed
+/// two windows a pane 1 each, so "the window owning pane N" had no
+/// answer.
+var next_pane_id: u32 = 1;
+var next_tab_id: u32 = 1;
+var next_window_id: u32 = 1;
+
+/// This PROCESS serves the dedicated file-manager identity (launched
+/// as `sketerm files`): its own GApplication id, its own taskbar icon,
+/// no layout persistence, and a control socket kept out of `sketerm
+/// cli` auto-discovery. Set once by main.zig before the first window.
+///
+/// It says nothing about browser FACES: a browser pane inside an
+/// ordinary terminal window is a first-class thing and never depends on
+/// this flag.
+var files_identity: bool = false;
+
+/// Window title of the file-manager identity, and the icon name its
+/// desktop entry installs (data/dev.sker.sketerm.files.desktop).
+pub const FILES_TITLE = "Sketerm Files";
+pub const FILES_ICON = "dev.sker.sketerm.files";
 
 /// Broadcast typing mode. Off / group / all — Terminator semantics.
 pub const GroupSend = enum { off, group, all };
@@ -191,11 +216,10 @@ pub const Window = struct {
     /// lazily when this window creates its first browser face.
     file_transfer_service: ?*file_transfers.Service = null,
     tab_counter: u32 = 0,
-    /// Remote control: monotonic pane / tab ids + the socket server.
-    /// Pane ids are allocated BEFORE the PTY spawn so the child env
-    /// can carry SKETERM_PANE_ID.
-    next_pane_id: u32 = 1,
-    next_tab_id: u32 = 1,
+    /// Process-global identity of this window, for cross-window
+    /// addressing (the `window` field of an IPC `list`). The pane / tab
+    /// id counters are process-global too; see next_pane_id.
+    id: u32 = 0,
     /// Daemon's reason for the last failed `attachMux`, so the IPC /
     /// `sketerm app` layer surfaces it ("no such session") instead of a
     /// bare "DaemonError".
@@ -222,9 +246,13 @@ pub const Window = struct {
     shader_source: shader_pass_mod.Source = .{},
     /// The first window of the process: owns the IPC socket, quake
     /// toggle, and layout persistence. Secondary windows (tab
-    /// drag-out) close when their last tab leaves; closing the
-    /// primary quits the app.
+    /// drag-out, a repeat launch) close when their last tab leaves;
+    /// closing the primary quits the app.
     is_primary: bool = false,
+    /// Window title before the broadcast suffix. The file-manager
+    /// identity titles its windows "Sketerm Files"; a terminal window
+    /// is never relabelled, whatever faces its panes wear.
+    title_base: []const u8 = "sketerm",
     /// Resolved auto shell-integration paths (allocator-owned,
     /// sentinel-terminated). All null when the script dir wasn't
     /// found; gated on Config.shell_integration at spawn time.
@@ -328,7 +356,13 @@ pub const Window = struct {
     copymode_anchor_col: u16 = 0,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
-        return initWithConfig(allocator, app, null);
+        return initWithConfig(allocator, app, null, true);
+    }
+
+    /// Declare this PROCESS the dedicated file manager (`sketerm
+    /// files`). Call before the first window; see `files_identity`.
+    pub fn setFilesIdentity() void {
+        files_identity = true;
     }
 
     pub fn initWithConfig(
@@ -463,10 +497,22 @@ pub const Window = struct {
             .allocator = allocator,
             .config = if (config_override) |co| co else Config.load(allocator),
             .is_primary = is_primary,
+            .id = next_window_id,
+            .title_base = if (files_identity) FILES_TITLE else "sketerm",
             .search_bar = search_bar,
             .search_entry = search_entry,
             .search_label = search_label,
         };
+        next_window_id += 1;
+
+        // The file-manager identity dresses EVERY window it owns. The
+        // icon name matters on X11 (_NET_WM_ICON); on Wayland the icon
+        // follows the app id / prgname main.zig sets, which is why files
+        // mode is its own GApplication rather than a window flag.
+        if (files_identity) {
+            c.gtk_window_set_title(@ptrCast(app_window), FILES_TITLE);
+            c.gtk_window_set_icon_name(@ptrCast(app_window), FILES_ICON);
+        }
 
         // Make this Zig Window reachable from its GtkWindow, so any
         // window can be found by walking gtk_application_get_windows
@@ -670,7 +716,7 @@ pub const Window = struct {
         // the socket path is keyed on the pid, so a secondary window
         // would collide with (and clobber) the primary's socket.
         if (is_primary) {
-            if (ipc_server.defaultSocketPath(allocator)) |sock_path| {
+            if (ipc_server.defaultSocketPath(allocator, files_identity)) |sock_path| {
                 self.ipc_path = sock_path;
                 self.ipc = ipc_server.start(allocator, sock_path, @ptrCast(self), ipcDispatchTrampoline) catch |err| blk: {
                     std.debug.print("sketerm: remote control disabled: {s}\n", .{@errorName(err)});
@@ -1311,17 +1357,55 @@ pub const Window = struct {
     }
 
     /// Browser tab starting at `spec` (host-qualified allowed); null
-    /// = the focused pane's cwd.
+    /// = the focused pane's location.
     pub fn newBrowserTabAt(self: *Window, spec: ?[]const u8) !void {
-        const start_cwd: ?[]const u8 = spec orelse self.focusedPaneCwd();
+        try self.newBrowserTabFrom(self.focusedPane(), spec);
+    }
+
+    /// Browser tab starting at `spec`, else at `origin`'s host-qualified
+    /// location. `origin` is the pane the request came FROM (the
+    /// invoking pane for `sketerm files --tab`), never the pane that
+    /// ends up wearing the browser face.
+    pub fn newBrowserTabFrom(self: *Window, origin: ?*Pane, spec: ?[]const u8) !void {
+        var spec_buf: [@import("browser.zig").SPEC_BUF_LEN]u8 = undefined;
+        const start_spec: ?[]const u8 = if (spec) |s|
+            files_entry.startLocation(&spec_buf, s)
+        else if (origin) |p|
+            paneBrowserSpec(p, &spec_buf)
+        else
+            null;
+        // Take the pane the tab spawn APPENDED, exactly like
+        // newBrowserSplit: focus does not reliably sit on the fresh
+        // pane, and attaching to the focused one turned a PRE-EXISTING
+        // pane into a browser while the new tab kept an unused shell.
+        const before = self.panes.items.len;
         try self.newShellTab("Files");
-        // newShellTab focuses the fresh pane; attach the browser to it.
-        const pane = self.focusedPane() orelse
-            (if (self.panes.items.len > 0) self.panes.items[self.panes.items.len - 1] else return);
-        const bv = @import("browser.zig").BrowserView.attach(self.allocator, pane, start_cwd) catch |err| {
+        if (self.panes.items.len <= before) return error.TabSpawnFailed;
+        const pane = self.panes.items[self.panes.items.len - 1];
+        const bv = @import("browser.zig").BrowserView.attach(self.allocator, pane, start_spec) catch |err| {
             logActionError("new_browser_tab attach", err);
             return err;
         };
+        self.installBrowserHooks(bv);
+    }
+
+    /// Put a browser face on `pane` itself (`sketerm files --here`):
+    /// the pane's shell stays alive underneath, one toolbar click away.
+    /// A pane that ALREADY wears a browser face gains a browser tab
+    /// instead -- re-attaching is a no-op that would silently drop the
+    /// requested location.
+    pub fn openBrowserHere(self: *Window, pane: *Pane, spec: ?[]const u8) !void {
+        const browser_mod = @import("browser.zig");
+        var spec_buf: [browser_mod.SPEC_BUF_LEN]u8 = undefined;
+        const start_spec: ?[]const u8 = if (spec) |s|
+            files_entry.startLocation(&spec_buf, s)
+        else
+            paneBrowserSpec(pane, &spec_buf);
+        if (browser_mod.BrowserView.fromPane(pane)) |bv| {
+            if (start_spec) |s| _ = bv.newTabSpec(s);
+            return;
+        }
+        const bv = try browser_mod.BrowserView.attach(self.allocator, pane, start_spec);
         self.installBrowserHooks(bv);
     }
 
@@ -1333,7 +1417,7 @@ pub const Window = struct {
         const start_cwd: ?[]const u8 = blk: {
             const focused = self.focusedPane() orelse break :blk null;
             if (@import("browser.zig").BrowserView.fromPane(focused)) |bv| break :blk bv.currentSpec(&spec_buf);
-            break :blk self.focusedPaneCwd();
+            break :blk paneBrowserSpec(focused, &spec_buf);
         };
         // Take the pane the split APPENDED: focus may still sit on the
         // source pane's browser widget, and attaching there would be a
@@ -1451,8 +1535,19 @@ pub const Window = struct {
         c.adw_tab_page_set_tooltip(page, title_z);
     }
 
+    /// Host-qualified browser location for `pane`: its last-reported
+    /// cwd (OSC 7) on the host its session actually runs on. A remote
+    /// pane's cwd is a path on THAT host, so passing the bare path to a
+    /// browser face would open a local directory that usually does not
+    /// exist. Writes into `buf`; null when the pane reported no cwd.
+    fn paneBrowserSpec(pane: *Pane, buf: []u8) ?[]const u8 {
+        const host: ?[]const u8 = if (pane.terminal.remote) |r| r.host else null;
+        return files_entry.startSpec(buf, host, pane.terminal.cwd);
+    }
+
     /// Last-reported cwd of the focused pane (OSC 7), or null if no
-    /// pane has the focus or no cwd has been reported.
+    /// pane has the focus or no cwd has been reported. Bare path, for
+    /// spawning a shell -- browser faces want `paneBrowserSpec`.
     fn focusedPaneCwd(self: *Window) ?[]const u8 {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return null;
         for (self.panes.items) |p| {
@@ -2224,6 +2319,26 @@ pub const Window = struct {
         win.hold_override = self.hold_override;
         win.save_on_close = self.save_on_close;
         c.gtk_window_present(@ptrCast(win.app_window));
+        return win;
+    }
+
+    /// A repeat launch of this identity (`sketerm` again, no args):
+    /// another window with one shell tab. SECONDARY on purpose: a
+    /// second is_primary window would quit the whole app when closed
+    /// and would clobber the process's notion of "the primary".
+    pub fn openShellWindow(self: *Window) !*Window {
+        const win = self.spawnSecondaryWindow() orelse return error.WindowSpawnFailed;
+        try win.newShellTab(null);
+        return win;
+    }
+
+    /// A repeat launch of the file-manager identity (`sketerm files`
+    /// again): another browser window, the way a file manager behaves.
+    /// Inherits this window's config; wears the files title/icon because
+    /// the whole PROCESS does.
+    pub fn openFilesWindow(self: *Window, spec: ?[]const u8) !*Window {
+        const win = self.spawnSecondaryWindow() orelse return error.WindowSpawnFailed;
+        try win.newBrowserTabFrom(null, spec);
         return win;
     }
 
@@ -3678,8 +3793,8 @@ pub const Window = struct {
         };
         // Stable id for remote-control addressing, stored on the
         // GObject (survives reorder; pages are never re-tagged).
-        c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-id", @ptrFromInt(self.next_tab_id));
-        self.next_tab_id += 1;
+        c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-tab-id", @ptrFromInt(next_tab_id));
+        next_tab_id += 1;
         self.attachTabTree(page, tree_root);
         self.last_created_page = page;
         return page;
@@ -3723,9 +3838,9 @@ pub const Window = struct {
 
     // ── Remote control (sketerm cli) ─────────────────────────────
 
-    fn allocPaneId(self: *Window) u32 {
-        const id = self.next_pane_id;
-        self.next_pane_id += 1;
+    fn allocPaneId(_: *Window) u32 {
+        const id = next_pane_id;
+        next_pane_id += 1;
         return id;
     }
 
@@ -3798,6 +3913,68 @@ pub const Window = struct {
         const g = gw orelse return null;
         const d = c.g_object_get_data(@ptrCast(@alignCast(g)), WINDOW_QDATA) orelse return null;
         return @ptrCast(@alignCast(d));
+    }
+
+    /// Every live Window of `app`, in GTK's own order. Caller frees.
+    /// GTK's window list mutates while windows are torn down, so any
+    /// caller that DESTROYS windows must iterate this copy.
+    ///
+    /// This plus `windowForPane` is the window registry: there is no
+    /// separate list to keep in sync, because the GtkWindow already
+    /// carries its Zig Window as qdata.
+    pub fn liveWindows(allocator: std.mem.Allocator, app: ?*c.GtkApplication) ![]*Window {
+        var out: std.ArrayList(*Window) = .empty;
+        errdefer out.deinit(allocator);
+        const a = app orelse return out.toOwnedSlice(allocator);
+        var node = c.gtk_application_get_windows(a);
+        while (node != null) : (node = node.*.next) {
+            const gw: ?*c.GtkWindow = @ptrCast(@alignCast(node.*.data));
+            if (windowFromGtk(gw)) |w| try out.append(allocator, w);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// The pane with id `pane_id` and the Window that owns it, across
+    /// every window of `app`. Pane ids are process-global, so the answer
+    /// is unambiguous. This is how `sketerm files --here` finds the pane
+    /// it was typed in.
+    pub fn windowForPane(app: ?*c.GtkApplication, pane_id: u32) ?PaneRef {
+        const a = app orelse return null;
+        var node = c.gtk_application_get_windows(a);
+        while (node != null) : (node = node.*.next) {
+            const gw: ?*c.GtkWindow = @ptrCast(@alignCast(node.*.data));
+            const w = windowFromGtk(gw) orelse continue;
+            for (w.panes.items) |p| if (p.id == pane_id) return .{ .win = w, .pane = p };
+        }
+        return null;
+    }
+
+    pub const PaneRef = struct { win: *Window, pane: *Pane };
+
+    /// The window a request that names no pane acts on: the one the user
+    /// is actually looking at, else `self` (the socket owner).
+    fn activeOrSelf(self: *Window) *Window {
+        const app = c.gtk_window_get_application(@ptrCast(self.app_window)) orelse return self;
+        const aw = c.gtk_application_get_active_window(app) orelse return self;
+        return windowFromGtk(@ptrCast(aw)) orelse self;
+    }
+
+    /// Detach every GTK signal handler carrying this Window as user
+    /// data. Only safe while the GtkWindow is alive (app shutdown, where
+    /// GTK destroys windows AFTER our handler runs): without it the
+    /// destroy that follows would call onWindowDestroyed on freed state.
+    pub fn detachWindowSignals(self: *Window) void {
+        // g_signal_handlers_disconnect_by_data is a macro the C-import
+        // cannot type (its NULL closure argument); this is its body.
+        _ = c.g_signal_handlers_disconnect_matched(
+            @as(c.gpointer, @ptrCast(@alignCast(self.app_window))),
+            c.G_SIGNAL_MATCH_DATA,
+            0,
+            0,
+            null,
+            null,
+            @as(c.gpointer, @ptrCast(self)),
+        );
     }
 
     /// Run `f(win)` for every Window in this application until it returns
@@ -3879,6 +4056,20 @@ pub const Window = struct {
         return self.globallyFocusedPane();
     }
 
+    /// Pane resolution for commands that must act on the named pane or
+    /// nothing: an address that does not resolve is an error, where
+    /// `reqPane` would quietly fall back to the focused pane. Turning
+    /// a pane the caller never named into a file browser is exactly the
+    /// bug `sketerm files --here` exists to avoid, and a $SKETERM_SESSION
+    /// from ANOTHER sketerm instance makes that a real case.
+    fn reqPaneExact(self: *Window, req: ipc_protocol.Request) ?*Pane {
+        if (req.session) |s| {
+            if (self.paneBySession(s)) |p| return p;
+        }
+        if (req.pane) |id| return self.paneByIdGlobal(id);
+        return null;
+    }
+
     /// Resolve the pane for a "take over the pane I'm in" command
     /// (`sketerm mux` attach / new-durable). This MUST NOT fail when run
     /// from inside a pane: session name -> pane id -> the globally-focused
@@ -3912,6 +4103,32 @@ pub const Window = struct {
             return null;
         }
         return c.adw_tab_view_get_selected_page(self.tab_view);
+    }
+
+    pub const TabRef = struct { win: *Window, page: *c.AdwTabPage };
+
+    /// A tab by id across EVERY window (tab ids are process-global), or
+    /// the selected tab of the default window when `id_opt` is null.
+    /// Acting on a page through the wrong window's AdwTabView is a GTK
+    /// critical, so the owning window travels with the page.
+    fn tabRefById(self: *Window, id_opt: ?u32) ?TabRef {
+        const id = id_opt orelse {
+            const win = self.activeOrSelf();
+            const page = c.adw_tab_view_get_selected_page(win.tab_view) orelse return null;
+            return .{ .win = win, .page = page };
+        };
+        const app = c.gtk_window_get_application(@ptrCast(self.app_window));
+        if (app == null) {
+            const page = self.tabPageById(id) orelse return null;
+            return .{ .win = self, .page = page };
+        }
+        var node = c.gtk_application_get_windows(app);
+        while (node != null) : (node = node.*.next) {
+            const gw: ?*c.GtkWindow = @ptrCast(@alignCast(node.*.data));
+            const w = windowFromGtk(gw) orelse continue;
+            if (w.tabPageById(id)) |page| return .{ .win = w, .page = page };
+        }
+        return null;
     }
 
     // ── Durable tabs (sketerm-mux) ───────────────────────────────
@@ -5278,6 +5495,19 @@ pub const Window = struct {
         };
     }
 
+    /// WINDOW RESOLUTION RULE for every command below. `self` is the
+    /// window that owns the socket (the primary), which is NOT always
+    /// the window a request means:
+    ///
+    ///   - names a pane (--pane / --session, `--pane self` included):
+    ///     acts on THAT pane's own window, via `ownerWindow`.
+    ///   - names only a tab: the tab is looked up across every window
+    ///     (`tabRefById`) and acted on in the window holding it.
+    ///   - names neither (new-tab, new-browser-tab, attach-all, bare
+    ///     action): the ACTIVE window, else the socket owner
+    ///     (`activeOrSelf`): "the window I am looking at".
+    ///   - `list` reports every window, each tab tagged with its
+    ///     window id.
     fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
         const eql = std.mem.eql;
         if (eql(u8, req.cmd, "list")) {
@@ -5370,6 +5600,7 @@ pub const Window = struct {
             defer allocator.free(text);
             try ipc_protocol.writeOk(out, allocator, "text", text);
         } else if (eql(u8, req.cmd, "new-tab")) {
+            const target = self.activeOrSelf();
             var title_buf: [256:0]u8 = undefined;
             const title_z: ?[*:0]const u8 = if (req.title) |t| blk: {
                 const s = std.fmt.bufPrintZ(&title_buf, "{s}", .{t}) catch break :blk null;
@@ -5378,24 +5609,57 @@ pub const Window = struct {
             if (req.cwd) |cwd| {
                 var num_buf: [32]u8 = undefined;
                 const t: [*:0]const u8 = title_z orelse tdef: {
-                    self.tab_counter += 1;
-                    const s = std.fmt.bufPrintZ(&num_buf, "Tab {d}", .{self.tab_counter}) catch "shell";
+                    target.tab_counter += 1;
+                    const s = std.fmt.bufPrintZ(&num_buf, "Tab {d}", .{target.tab_counter}) catch "shell";
                     break :tdef s.ptr;
                 };
-                try self.addTabWithProfile(t, cwd, null);
+                try target.addTabWithProfile(t, cwd, null);
             } else {
-                try self.newShellTab(title_z);
+                try target.newShellTab(title_z);
             }
             try ipc_protocol.writeOk(out, allocator, "created", .{
-                .tab = self.next_tab_id - 1,
-                .pane = self.next_pane_id - 1,
+                .tab = next_tab_id - 1,
+                .pane = next_pane_id - 1,
             });
         } else if (eql(u8, req.cmd, "new-browser-tab")) {
-            try self.newBrowserTab();
+            // A pane address means "a browser tab next to THIS pane"
+            // (`sketerm files --tab`): the tab lands in that pane's own
+            // window and starts at its host-qualified location. No
+            // address = the window in front, like new-tab.
+            const origin: ?*Pane = if (req.pane != null or req.session != null)
+                self.reqPaneExact(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane")
+            else
+                null;
+            const target = if (origin) |p| self.ownerWindow(p) else self.activeOrSelf();
+            try target.newBrowserTabFrom(origin orelse target.focusedPane(), req.data);
+            // Asked for from inside a pane (`sketerm files --tab`): show
+            // what was asked for. Scripted use (no address) keeps the
+            // non-stealing behaviour of new-tab.
+            if (origin != null) {
+                if (target.last_created_page) |page| c.adw_tab_view_set_selected_page(target.tab_view, page);
+                c.gtk_window_present(@ptrCast(target.app_window));
+            }
             try ipc_protocol.writeOk(out, allocator, "created", .{
-                .tab = self.next_tab_id - 1,
-                .pane = self.next_pane_id - 1,
+                .tab = next_tab_id - 1,
+                .pane = next_pane_id - 1,
             });
+        } else if (eql(u8, req.cmd, "browser-here")) {
+            // `sketerm files --here`: the addressed pane itself wears the
+            // browser face, in its own window. Explicit address only:
+            // silently converting some other pane is the bug this
+            // command exists to avoid.
+            if (req.pane == null and req.session == null)
+                return ipc_protocol.writeErr(out, allocator, "browser-here requires a pane (--pane N or a session name)");
+            const pane = self.reqPaneExact(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const win = self.ownerWindow(pane);
+            win.openBrowserHere(pane, req.data) catch |err| {
+                var msg_buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "browser attach failed: {s}", .{@errorName(err)}) catch "browser attach failed";
+                return ipc_protocol.writeErr(out, allocator, msg);
+            };
+            if (tabPageForPane(win, pane)) |page| c.adw_tab_view_set_selected_page(win.tab_view, page);
+            c.gtk_window_present(@ptrCast(win.app_window));
+            try ipc_protocol.writeOk(out, allocator, "pane", pane.id);
         } else if (eql(u8, req.cmd, "split")) {
             const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
             const win = self.ownerWindow(pane);
@@ -5407,7 +5671,7 @@ pub const Window = struct {
                 @intCast(c.GTK_ORIENTATION_HORIZONTAL);
             try win.splitFocused(orient);
             try ipc_protocol.writeOk(out, allocator, "created", .{
-                .pane = win.next_pane_id - 1,
+                .pane = next_pane_id - 1,
             });
         } else if (eql(u8, req.cmd, "focus")) {
             if (req.pane != null or req.session != null) {
@@ -5418,8 +5682,9 @@ pub const Window = struct {
                 _ = c.gtk_widget_grab_focus(@ptrCast(pane.area));
                 try ipc_protocol.writeOk(out, allocator, null, {});
             } else if (req.tab != null) {
-                const page = self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
-                c.adw_tab_view_set_selected_page(self.tab_view, page);
+                const ref = self.tabRefById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
+                c.adw_tab_view_set_selected_page(ref.win.tab_view, ref.page);
+                c.gtk_window_present(@ptrCast(ref.win.app_window));
                 try ipc_protocol.writeOk(out, allocator, null, {});
             } else {
                 try ipc_protocol.writeErr(out, allocator, "focus requires pane or tab");
@@ -5435,7 +5700,7 @@ pub const Window = struct {
             const page = if (req.pane != null or req.session != null) pg: {
                 const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
                 break :pg tabPageForPane(self.ownerWindow(pane), pane) orelse return ipc_protocol.writeErr(out, allocator, "pane has no tab");
-            } else self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
+            } else (self.tabRefById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab")).page;
             c.adw_tab_page_set_title(page, z.ptr);
             c.adw_tab_page_set_tooltip(page, z.ptr);
             try ipc_protocol.writeOk(out, allocator, null, {});
@@ -5454,7 +5719,7 @@ pub const Window = struct {
             win.newDurableSession(req.host, takeover) catch {
                 return ipc_protocol.writeErr(out, allocator, "durable spawn failed (ssh/key auth?)");
             };
-            try ipc_protocol.writeOk(out, allocator, "pane", win.next_pane_id - 1);
+            try ipc_protocol.writeOk(out, allocator, "pane", next_pane_id - 1);
         } else if (eql(u8, req.cmd, "attach-session")) {
             const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "attach-session requires data (session name)");
             // Take over the pane it ran in (never fails to a new tab when a
@@ -5482,15 +5747,16 @@ pub const Window = struct {
         } else if (eql(u8, req.cmd, "attach-all")) {
             // Bulk handoff: attach every session on the daemon that
             // this window isn't already showing.
-            const n = self.attachAllSessions(req.host);
+            const n = self.activeOrSelf().attachAllSessions(req.host);
             try ipc_protocol.writeOk(out, allocator, "attached", n);
         } else if (eql(u8, req.cmd, "set-tab-color")) {
-            const page = self.tabPageById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
+            const ref = self.tabRefById(req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
+            const page = ref.page;
             const spec = req.data orelse return ipc_protocol.writeErr(out, allocator, "set-tab-color requires data (#RRGGBB or none)");
             if (eql(u8, spec, "none")) {
-                self.setTabColor(page, null);
+                ref.win.setTabColor(page, null);
             } else if (parseHexRGB(spec)) |col| {
-                self.setTabColor(page, col);
+                ref.win.setTabColor(page, col);
             } else {
                 return ipc_protocol.writeErr(out, allocator, "bad color (want #RRGGBB or none)");
             }
@@ -5502,7 +5768,7 @@ pub const Window = struct {
             const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "action needs data=<name>");
             const action = @import("input.zig").actionFromName(name) orelse
                 return ipc_protocol.writeErr(out, allocator, "unknown action");
-            var target: *Window = self;
+            var target: *Window = self.activeOrSelf();
             if (req.pane != null or req.session != null) {
                 const pane = self.reqPane(req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
                 target = self.ownerWindow(pane);
@@ -5515,13 +5781,32 @@ pub const Window = struct {
         }
     }
 
+    /// Every tab of every window, each tagged with its window id. A
+    /// single-global `list` reported only the socket owner's tabs, so a
+    /// pane dragged into another window read as gone while `send-text`
+    /// still reached it.
     fn ipcList(self: *Window, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
         var tabs: std.ArrayList(ipc_protocol.TabInfo) = .empty;
-        const focused = self.focusedPane();
+        // "focused" means "where a keystroke would land": every window
+        // remembers a focus widget, so only the ACTIVE window's counts.
+        const focused = self.activeOrSelf().focusedPane();
+        const wins = try liveWindows(arena, c.gtk_window_get_application(@ptrCast(self.app_window)));
+        for (wins) |win| try win.appendTabInfos(arena, &tabs, focused);
+        // No application (unit/headless edge): still answer for self.
+        if (wins.len == 0) try self.appendTabInfos(arena, &tabs, focused);
+        try ipc_protocol.writeOk(out, allocator, "tabs", tabs.items);
+    }
+
+    fn appendTabInfos(
+        self: *Window,
+        arena: std.mem.Allocator,
+        tabs: *std.ArrayList(ipc_protocol.TabInfo),
+        focused: ?*Pane,
+    ) !void {
         const sel = c.adw_tab_view_get_selected_page(self.tab_view);
         const n = c.adw_tab_view_get_n_pages(self.tab_view);
         var i: c_int = 0;
@@ -5549,6 +5834,7 @@ pub const Window = struct {
             const title_c = c.adw_tab_page_get_title(page);
             try tabs.append(arena, .{
                 .id = tabPageId(page),
+                .window = self.id,
                 .title = if (title_c != null) try arena.dupe(u8, std.mem.span(title_c)) else "",
                 .selected = (page == sel),
                 .color = if (tabColorOf(page)) |col|
@@ -5558,7 +5844,6 @@ pub const Window = struct {
                 .panes = pane_infos.items,
             });
         }
-        try ipc_protocol.writeOk(out, allocator, "tabs", tabs.items);
     }
 
     /// Tell the compositor that our content is no longer opaque when
@@ -5642,21 +5927,16 @@ pub const Window = struct {
     /// Visible regardless of `show_titlebar` (per-pane bars), so
     /// users always have a cue that typing is being multiplexed.
     fn refreshWindowTitle(self: *Window) void {
-        const suffix: ?[]const u8 = switch (self.groupsend) {
-            .off => null,
+        const suffix: []const u8 = switch (self.groupsend) {
+            .off => "",
             .group => " — broadcast: group",
             .all => " — broadcast: all",
         };
-        if (suffix) |s| {
-            const total = "sketerm".len + s.len;
-            const buf = self.allocator.allocSentinel(u8, total, 0) catch return;
-            defer self.allocator.free(buf);
-            @memcpy(buf[0.."sketerm".len], "sketerm");
-            @memcpy(buf["sketerm".len..total], s);
-            c.gtk_window_set_title(@ptrCast(self.app_window), buf.ptr);
-        } else {
-            c.gtk_window_set_title(@ptrCast(self.app_window), "sketerm");
-        }
+        // title_base, not a literal: a file-manager window keeps its own
+        // name when broadcast mode is toggled off again.
+        var buf: [128:0]u8 = undefined;
+        const title = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ self.title_base, suffix }) catch return;
+        c.gtk_window_set_title(@ptrCast(self.app_window), title.ptr);
     }
 
     /// Wire / unwire each Terminal's broadcast_sink based on the
@@ -7987,7 +8267,11 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
     // Capture the layout NOW: the default close destroys every tab
     // before the GApplication shutdown hook runs, which used to save
     // an EMPTY last.json after any X-button close.
-    if (self.save_on_close) {
+    //
+    // PRIMARY only: last.json holds ONE window's tabs, so a secondary
+    // window closing used to overwrite the whole session with its own
+    // handful of tabs.
+    if (self.save_on_close and self.is_primary) {
         self.saveLayoutQuietly();
         self.layout_saved_final = true;
     }
@@ -8037,7 +8321,8 @@ fn onCloseWinResponse(source: [*c]c.GObject, result: ?*c.GAsyncResult, user: ?*a
     const resp_c = c.adw_alert_dialog_choose_finish(dialog, result);
     const resp = std.mem.span(@as([*:0]const u8, @ptrCast(resp_c)));
     if (std.mem.eql(u8, resp, "close")) {
-        if (pending.win.save_on_close) {
+        // Primary only; see onWindowCloseRequest.
+        if (pending.win.save_on_close and pending.win.is_primary) {
             pending.win.saveLayoutQuietly();
             pending.win.layout_saved_final = true;
         }
