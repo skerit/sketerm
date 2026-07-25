@@ -95,6 +95,8 @@ pub fn tabStateOf(arena: std.mem.Allocator, tab: *BTab) !browser_model.TabState 
         .descending = tab.descending,
         .dirs_first = tab.dirs_first,
         .show_hidden = tab.show_hidden,
+        .grouped = tab.vs.grouped,
+        .zoom = tab.vs.zoom,
         .filter = try arena.dupe(u8, tab.filter),
         .virtual_spec = try arena.dupe(u8, tab.virtual_spec),
     };

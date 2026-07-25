@@ -466,6 +466,10 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 self.arch_job = rep.job;
                 self.arch_hc = hc;
             }
+            if (pj.kind == .flat_view) {
+                self.views.flat_job = rep.job;
+                self.views.flat_hc = hc;
+            }
             const row = self.allocator.create(JobRow) catch break;
             row.* = .{
                 .hc = hc,

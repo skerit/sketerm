@@ -255,7 +255,17 @@ pub fn startSearch(self: *BrowserView) void {
 
 pub fn onSearchMatch(self: *BrowserView, e: WireJobEv) void {
     const rtab = self.search_tab orelse return;
-    const dir = rtab.root;
+    upsertFlatMatch(self, rtab, e);
+    if (self.currentTab() == rtab) self.renderTab(rtab);
+}
+
+/// Add (or refresh) one streamed job match as a flat row of `tab`.
+/// Shared by the search results tab and the flat/branch view: both
+/// are a host-side job filling a flat Dir whose display name is the
+/// path relative to the job's root and whose `target` is the full
+/// path every entry verb operates on.
+pub fn upsertFlatMatch(self: *BrowserView, tab: *BTab, e: WireJobEv) void {
+    const dir = tab.root;
     if (e.path.len == 0) return;
     // Display name: path relative to the search root (+ line
     // preview for content matches). Full path rides `target`.
@@ -272,7 +282,7 @@ pub fn onSearchMatch(self: *BrowserView, e: WireJobEv) void {
         if (existing.target) |target| {
             if (std.mem.eql(u8, target, e.path) and e.line == 0) {
                 existing.size = e.size;
-                if (self.currentTab() == rtab) self.renderTab(rtab);
+                existing.mtime_ms = e.mtime_ms;
                 return;
             }
         }
@@ -293,7 +303,7 @@ pub fn onSearchMatch(self: *BrowserView, e: WireJobEv) void {
         .kind = kind,
         .size = e.size,
         .mode = 0,
-        .mtime_ms = 0,
+        .mtime_ms = e.mtime_ms,
         .target = tgt,
         .tdir = std.mem.eql(u8, kind, "dir"),
     }) catch {
@@ -302,14 +312,19 @@ pub fn onSearchMatch(self: *BrowserView, e: WireJobEv) void {
         a.free(tgt);
         return;
     };
-    if (self.currentTab() == rtab) self.renderTab(rtab);
 }
 
 pub fn onSearchUnmatch(self: *BrowserView, path: []const u8) void {
     const rtab = self.search_tab orelse return;
+    removeFlatMatch(self, rtab, path);
+    if (self.currentTab() == rtab) self.renderTab(rtab);
+}
+
+/// Drop every flat row of `tab` whose full path is `path`.
+pub fn removeFlatMatch(self: *BrowserView, tab: *BTab, path: []const u8) void {
     var i: usize = 0;
-    while (i < rtab.root.entries.items.len) {
-        const target = rtab.root.entries.items[i].target orelse {
+    while (i < tab.root.entries.items.len) {
+        const target = tab.root.entries.items[i].target orelse {
             i += 1;
             continue;
         };
@@ -317,10 +332,9 @@ pub fn onSearchUnmatch(self: *BrowserView, path: []const u8) void {
             i += 1;
             continue;
         }
-        var entry = rtab.root.entries.orderedRemove(i);
+        var entry = tab.root.entries.orderedRemove(i);
         entry.deinit(self.allocator);
     }
-    if (self.currentTab() == rtab) self.renderTab(rtab);
 }
 
 pub fn startDupScan(self: *BrowserView, tab: *BTab, root: []const u8) void {

@@ -73,6 +73,7 @@ comptime {
     _ = @import("ui/browser/search.zig");
     _ = @import("ui/browser/compare.zig");
     _ = @import("ui/browser/gitstat.zig");
+    _ = @import("ui/browser/views.zig");
     _ = @import("a11y/view.zig");
     _ = @import("a11y/nsax.zig");
     _ = @import("ipc/protocol.zig");
@@ -107,6 +108,8 @@ comptime {
     _ = @import("filebrowser/desktop.zig");
     _ = @import("filebrowser/hexdump.zig");
     _ = @import("filebrowser/previewers.zig");
+    _ = @import("filebrowser/grouping.zig");
+    _ = @import("filebrowser/viewmem.zig");
     _ = @import("fsmount.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");

@@ -6,6 +6,9 @@ const std = @import("std");
 const c = @import("../../c.zig").c;
 const browser_model = @import("../../filebrowser/model.zig");
 const fsjob = @import("../../mux/fsjob.zig");
+const grouping = @import("../../filebrowser/grouping.zig");
+const profile = @import("../../util/profile.zig");
+const views = @import("views.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
@@ -31,6 +34,13 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     tab.applySort();
     self.updateSortHeader(tab);
     self.applyViewChrome(tab);
+    // The filter is per tab; the shared entry follows the visible one.
+    views.syncFilterEntry(self, tab);
+    tab.vs.total = tab.root.entries.items.len;
+    tab.vs.shown = 0;
+    for (tab.root.entries.items) |e| {
+        if (views.entryVisible(tab, e)) tab.vs.shown += 1;
+    }
     switch (tab.view_mode) {
         .details, .compact => self.renderList(tab),
         .icons => self.renderGrid(tab),
@@ -39,8 +49,16 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
             self.renderList(tab);
         },
     }
-    var count_buf: [96]u8 = undefined;
-    const cmsg = std.fmt.bufPrint(&count_buf, "{d} items", .{tab.root.entries.items.len}) catch "";
+    var count_buf: [160]u8 = undefined;
+    const cmsg = if (tab.filter.len > 0)
+        std.fmt.bufPrint(&count_buf, "showing {d} of {d} items (filter \"{s}\")", .{
+            tab.vs.shown, tab.vs.total, tab.filter[0..@min(tab.filter.len, 48)],
+        }) catch ""
+    else
+        std.fmt.bufPrint(&count_buf, "{d} items{s}", .{
+            tab.vs.total,
+            if (self.views.flat_tab == tab) @as([]const u8, " (flat view)") else "",
+        }) catch "";
     self.setStatus(cmsg);
 }
 
@@ -301,6 +319,7 @@ pub fn onColumnToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c)
         ctx.tab.sort_key = .name;
         ctx.tab.applySort();
     }
+    views.rememberFolder(self, ctx.tab);
     self.updateSortHeader(ctx.tab);
     self.renderTab(ctx.tab);
 }
@@ -313,7 +332,7 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
     while (c.gtk_list_box_get_row_at_index(tab.listbox, 0)) |row| {
         c.gtk_list_box_remove(tab.listbox, @ptrCast(row));
     }
-    self.renderDirRows(tab, tab.root, 0);
+    if (tab.vs.grouped) self.renderGroupedRows(tab) else self.renderDirRows(tab, tab.root, 0);
     var row_idx: c_int = 0;
     while (c.gtk_list_box_get_row_at_index(tab.listbox, row_idx)) |row| : (row_idx += 1) {
         const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse continue;
@@ -363,7 +382,7 @@ pub fn renderGrid(self: *BrowserView, tab: *BTab) void {
         c.gtk_flow_box_remove(fb, @ptrCast(child));
     }
     for (tab.root.entries.items) |e| {
-        if (!tab.show_hidden and e.name.len > 0 and e.name[0] == '.') continue;
+        if (!views.entryVisible(tab, e)) continue;
         self.appendTile(tab, fb, e);
     }
     // Restore selection.
@@ -403,12 +422,13 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
     var full_buf: [4096]u8 = undefined;
     const full = tab.root.fullPath(e, &full_buf) orelse return;
 
+    const step = tab.vs.step();
     const tile = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
-    c.gtk_widget_set_size_request(tile, 96, -1);
+    c.gtk_widget_set_size_request(tile, step.tile_px, -1);
     var icon: ?*c.GtkWidget = null;
     if (self.thumbLookup(tab.hc, full, e)) |tex| {
         const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
-        c.gtk_image_set_pixel_size(@ptrCast(img), 48);
+        c.gtk_image_set_pixel_size(@ptrCast(img), step.tile_icon_px);
         icon = img;
     }
     if (icon == null) {
@@ -419,7 +439,7 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
         else
             "text-x-generic-symbolic";
         const img = c.gtk_image_new_from_icon_name(icon_name);
-        c.gtk_image_set_pixel_size(@ptrCast(img), 48);
+        c.gtk_image_set_pixel_size(@ptrCast(img), step.tile_icon_px);
         icon = img;
     }
     c.gtk_box_append(@ptrCast(tile), icon);
@@ -611,16 +631,106 @@ pub fn onMillerRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*any
 
 pub fn renderDirRows(self: *BrowserView, tab: *BTab, dir: *Dir, depth: u32) void {
     for (dir.entries.items) |e| {
-        if (!tab.show_hidden and e.name.len > 0 and e.name[0] == '.') continue;
-        self.appendRow(tab, dir, e, depth);
-        if (e.tdir) {
-            var buf: [4096]u8 = undefined;
-            const child = dir.fullPath(e, &buf) orelse continue;
-            if (tab.subdirByPath(child)) |sub| {
-                if (sub.loaded) self.renderDirRows(tab, sub, depth + 1);
-            }
-        }
+        if (!views.entryVisible(tab, e)) continue;
+        self.appendRowTree(tab, dir, e, depth);
     }
+}
+
+/// One row plus the rows of its expanded subdirectory, if any. The
+/// shared step of the plain and the grouped list walk.
+pub fn appendRowTree(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32) void {
+    self.appendRow(tab, dir, e, depth);
+    if (!e.tdir) return;
+    var buf: [4096]u8 = undefined;
+    const child = dir.fullPath(e, &buf) orelse return;
+    const sub = tab.subdirByPath(child) orelse return;
+    if (sub.loaded) self.renderDirRows(tab, sub, depth + 1);
+}
+
+/// One group run of the root listing, for the header's count.
+const GroupRun = struct { id: u64, count: usize };
+
+/// Grouped list rendering: one collapsible header per bucket of the
+/// ROOT listing, carrying that group's visible count. Entries are
+/// already sorted by the same key the buckets come from, so a run
+/// ends exactly when the bucket id changes. Expanded subdirectories
+/// keep rendering under their parent row, inside its group.
+pub fn renderGroupedRows(self: *BrowserView, tab: *BTab) void {
+    const now_ms = profile.milliTimestamp();
+    // First pass: the visible count of each run, in listing order.
+    var runs: std.ArrayList(GroupRun) = .empty;
+    defer runs.deinit(self.allocator);
+    for (tab.root.entries.items) |e| {
+        if (!views.entryVisible(tab, e)) continue;
+        const g = views.groupFor(tab, e, now_ms);
+        if (runs.items.len > 0 and runs.items[runs.items.len - 1].id == g.id) {
+            runs.items[runs.items.len - 1].count += 1;
+            continue;
+        }
+        runs.append(self.allocator, .{ .id = g.id, .count = 1 }) catch return;
+    }
+    // Second pass: a header per run, then its rows unless collapsed.
+    var run: usize = 0;
+    var last_id: ?u64 = null;
+    for (tab.root.entries.items) |e| {
+        if (!views.entryVisible(tab, e)) continue;
+        const g = views.groupFor(tab, e, now_ms);
+        if (last_id == null or last_id.? != g.id) {
+            last_id = g.id;
+            const count = if (run < runs.items.len) runs.items[run].count else 0;
+            run += 1;
+            self.appendGroupHeader(tab, g, count);
+        }
+        if (views.groupCollapsed(tab, g.id)) continue;
+        self.appendRowTree(tab, tab.root, e, 0);
+    }
+}
+
+/// Heap context for one group header button.
+pub const GroupCtx = struct {
+    allocator: std.mem.Allocator,
+    tab: *BTab,
+    id: u64,
+
+    fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        const ctx: *GroupCtx = @ptrCast(@alignCast(user.?));
+        ctx.allocator.destroy(ctx);
+    }
+};
+
+pub fn appendGroupHeader(self: *BrowserView, tab: *BTab, g: grouping.Group, count: usize) void {
+    const collapsed = views.groupCollapsed(tab, g.id);
+    var text: [96:0]u8 = undefined;
+    const label: [*:0]const u8 = if (std.fmt.bufPrintZ(&text, "{s}  ({d})", .{
+        g.label(), count,
+    })) |v| v.ptr else |_| "group";
+    const btn = c.gtk_button_new();
+    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+    const btn_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+    const arrow = c.gtk_image_new_from_icon_name(if (collapsed) "pan-end-symbolic" else "pan-down-symbolic");
+    c.gtk_box_append(@ptrCast(btn_box), arrow);
+    const lab = c.gtk_label_new(label);
+    c.gtk_label_set_xalign(@ptrCast(lab), 0);
+    c.gtk_widget_set_hexpand(lab, 1);
+    c.gtk_widget_add_css_class(lab, "heading");
+    c.gtk_box_append(@ptrCast(btn_box), lab);
+    c.gtk_button_set_child(@ptrCast(btn), btn_box);
+    const ctx = self.allocator.create(GroupCtx) catch return;
+    ctx.* = .{ .allocator = self.allocator, .tab = tab, .id = g.id };
+    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onGroupHeaderClicked), @ptrCast(ctx), @ptrCast(&GroupCtx.free), c.G_CONNECT_DEFAULT);
+
+    const row = c.gtk_list_box_row_new();
+    c.gtk_list_box_row_set_child(@ptrCast(row), btn);
+    // Headers are chrome: never selected, never type-ahead targets
+    // (they carry no "sketerm-row" data).
+    c.gtk_list_box_row_set_selectable(@ptrCast(row), 0);
+    c.gtk_list_box_row_set_activatable(@ptrCast(row), 0);
+    c.gtk_list_box_append(tab.listbox, row);
+}
+
+pub fn onGroupHeaderClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *GroupCtx = @ptrCast(@alignCast(user.?));
+    views.toggleGroup(ctx.tab.view, ctx.tab, ctx.id);
 }
 
 pub const RowCtx = struct {
@@ -638,11 +748,13 @@ pub fn freeRowCtx(user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32) void {
+    // Zoom drives both the icon size and the row height.
+    const step = tab.vs.step();
     const row_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
     c.gtk_widget_set_margin_start(row_box, @intCast(6 + depth * 18));
     c.gtk_widget_set_margin_end(row_box, 6);
-    c.gtk_widget_set_margin_top(row_box, 2);
-    c.gtk_widget_set_margin_bottom(row_box, 2);
+    c.gtk_widget_set_margin_top(row_box, step.row_pad);
+    c.gtk_widget_set_margin_bottom(row_box, step.row_pad);
 
     var full_buf: [4096]u8 = undefined;
     const full = dir.fullPath(e, &full_buf) orelse return;
@@ -675,7 +787,7 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
     var icon: ?*c.GtkWidget = null;
     if (self.thumbLookup(tab.hc, full, e)) |tex| {
         const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
-        c.gtk_image_set_pixel_size(@ptrCast(img), 24);
+        c.gtk_image_set_pixel_size(@ptrCast(img), step.thumb_px);
         icon = img;
     }
     if (icon == null) {
@@ -685,7 +797,9 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
             "emblem-symbolic-link"
         else
             "text-x-generic-symbolic";
-        icon = c.gtk_image_new_from_icon_name(icon_name);
+        const img = c.gtk_image_new_from_icon_name(icon_name);
+        c.gtk_image_set_pixel_size(@ptrCast(img), step.icon_px);
+        icon = img;
     }
     c.gtk_box_append(@ptrCast(row_box), icon);
 
@@ -975,6 +1089,7 @@ pub fn sortClicked(tab: *BTab, key: browser_model.SortKey) void {
         tab.descending = false;
     }
     tab.view.updateSortHeader(tab);
+    views.rememberFolder(tab.view, tab);
     tab.view.renderTab(tab);
 }
 
@@ -988,6 +1103,7 @@ pub fn onViewModeClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         .miller => .details,
     };
     self.setStatusFmt("view: {s}", .{@tagName(tab.view_mode)});
+    views.rememberFolder(self, tab);
     self.renderTab(tab);
 }
 
