@@ -453,11 +453,18 @@ pub const BTab = struct {
     }
 };
 
+/// What a navigation does to the tab's history. The back/forward
+/// payload is how many entries the move travels: 1 for the toolbar
+/// buttons, N for a history-dropdown jump.
+pub const NavigationIntent = union(enum) {
+    push,
+    back: usize,
+    forward: usize,
+};
+
 /// In-flight listing request (open_view or refresh `list`). `sent`
 /// is false while the tab's host is still connecting; the connect
 /// handback flushes unsent requests.
-pub const NavigationIntent = enum { push, back, forward };
-
 pub const Pending = struct {
     req: u32,
     tab: *BTab,

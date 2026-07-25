@@ -399,6 +399,9 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         }
     }
 
+    // A breadcrumb segment's sibling listing?
+    if (self.feedSiblings(hc, rep)) return false;
+
     // Listing chunk run?
     for (self.pending.items, 0..) |p, i| {
         if (p.req != rep.req) continue;

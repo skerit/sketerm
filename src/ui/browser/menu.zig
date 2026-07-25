@@ -50,7 +50,10 @@ pub const MenuCtx = struct {
     }
 };
 
-pub fn menuButton(box: *c.GtkWidget, label: [*:0]const u8, cb: anytype, ctx: *MenuCtx, destructive: bool) void {
+/// One menu row. `ctx` is the caller's heap context (the entry menu
+/// passes its MenuCtx, the tab menu its own); the popover owning it
+/// is what frees it.
+pub fn menuButton(box: *c.GtkWidget, label: [*:0]const u8, cb: anytype, ctx: *anyopaque, destructive: bool) void {
     const btn = c.gtk_button_new_with_label(label);
     c.gtk_button_set_has_frame(@ptrCast(btn), 0);
     c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(btn)), c.GTK_ALIGN_START);
