@@ -66,6 +66,10 @@ pub const PaneInfo = struct {
 
 pub const TabInfo = struct {
     id: u32,
+    /// Id of the window holding this tab. Panes move between windows
+    /// (tab drag-out), and `list` spans them all, so the tree is only
+    /// unambiguous with the window named.
+    window: u32 = 0,
     title: []const u8,
     selected: bool,
     /// "#rrggbb" when a tab colour is set.
