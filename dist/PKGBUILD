@@ -3,13 +3,26 @@
 # Builds sketerm from the parent directory of this PKGBUILD (i.e. the
 # checked-out repo). Run as:
 #
-#     cd dist && makepkg -si
+#     cd dist && ./install.sh          # or: makepkg -sif
+#
+# The -f matters: pkgver() below derives the version from HEAD, so
+# rebuilding the same commit produces a package file that already
+# exists, and makepkg then refuses with "A package has already been
+# built" and exits WITHOUT installing -- leaving the previously
+# installed binary in place. Uncommitted source changes do not move
+# pkgver either, so -f is the normal case, not the exception.
+#
+# makepkg rewrites the pkgver= line below on every run; the resulting
+# dirty PKGBUILD in git status is expected, not a local edit.
+#
+# No check(): installing is not the time to run the suite. Run it
+# yourself with `zig build test` from the checkout.
 #
 # A future AUR-submitted PKGBUILD will use a public git+ source instead.
 
 pkgname=sketerm-git
 _pkgname=sketerm
-pkgver=0.1.0.r1072.g609a8fe
+pkgver=0.1.0.r1064.g8939e1b
 pkgrel=1
 pkgdesc='Native GTK4 terminal emulator written in Zig'
 arch=('x86_64')
@@ -60,9 +73,6 @@ build() {
     zig build -Doptimize=ReleaseFast
     zig build mux-portable -Doptimize=ReleaseFast
 }
-
-# No check(): installing is not the time to run the suite. Run it
-# yourself with `zig build test` from the checkout.
 
 package() {
     cd "$(_srcroot)"
