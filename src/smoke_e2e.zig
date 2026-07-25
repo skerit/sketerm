@@ -200,6 +200,31 @@ pub fn main() u8 {
     defer allocator.free(stale);
     if (std.mem.indexOf(u8, stale, "no such pane") != null) return fail("stale SKETERM_PANE_ID regressed to 'no such pane'");
 
+    // 6b. An attach that cannot proceed must DEGRADE, never abort the
+    // process: a crash here takes every attached durable session's viewer
+    // with it. Sessions whose names carry a space or a colon ("Traffic
+    // Giant", "ST:AFU") travel through the JSON request and the daemon's
+    // lookup, so they must fail the same clean way; every shape is followed
+    // by a `list` that proves the GUI is still serving.
+    const attach_shapes = [_][]const u8{
+        "{\"cmd\":\"attach-session\",\"data\":\"no-such-sess-e2e\"}\n",
+        "{\"cmd\":\"attach-session\",\"data\":\"no such sess e2e\"}\n",
+        "{\"cmd\":\"attach-session\",\"data\":\"NO:SUCH:E2E\",\"session\":\"nope-e2e\"}\n",
+        "{\"cmd\":\"attach-session\",\"data\":\"\"}\n",
+        "{\"cmd\":\"attach-session\"}\n",
+    };
+    for (attach_shapes) |shape| {
+        const resp = roundtrip(allocator, sock_path, shape) orelse return fail("attach-failure roundtrip");
+        defer allocator.free(resp);
+        if (std.mem.indexOf(u8, resp, "\"ok\":false") == null)
+            return fail("a doomed attach did not report failure");
+        const still = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return fail("GUI stopped serving after a failed attach");
+        defer allocator.free(still);
+        if (std.mem.indexOf(u8, still, "\"ok\":true") == null)
+            return fail("GUI unhealthy after a failed attach");
+    }
+
     // 7. unknown command must error.
     const bad = roundtrip(allocator, sock_path, "{\"cmd\":\"nope\"}\n") orelse return fail("bad-cmd roundtrip");
     defer allocator.free(bad);

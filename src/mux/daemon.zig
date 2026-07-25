@@ -6726,13 +6726,18 @@ pub const Daemon = struct {
             return;
         };
         defer parsed.deinit();
+        // A REFUSED attach used to log nothing at all, which made the log
+        // unable to answer the one question a GUI post-mortem needs: did the
+        // client even get as far as asking? Log both refusals.
         const s = self.findSession(parsed.value.name) orelse {
+            log.info("client attach REFUSED session='{s}' kind={s}: no such session", .{ parsed.value.name, parsed.value.kind });
             cl.queueErr("no such session");
             return;
         };
         if (s.exited) {
             // The corpse only lingers until the next reap; attaching
             // to it would wedge the client on a dead screen.
+            log.info("client attach REFUSED session='{s}' kind={s}: session has exited", .{ parsed.value.name, parsed.value.kind });
             cl.queueErr("session has exited");
             return;
         }

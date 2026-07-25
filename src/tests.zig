@@ -14,6 +14,7 @@ comptime {
     _ = @import("util/humantype.zig");
     _ = @import("util/platform.zig");
     _ = @import("util/clock.zig");
+    _ = @import("util/crashlog.zig");
     _ = @import("util/shellintegration.zig");
     _ = @import("util/png.zig");
     _ = @import("util/marks.zig");
