@@ -808,6 +808,13 @@ pub const ActiveTransfer = struct {
     /// Queue state: transfers to one destination run one at a time,
     /// the rest wait here in order (see filebrowser/xferqueue.zig).
     started: bool = false,
+    /// User-held. A started one stops at its next chunk boundary; an
+    /// unstarted one is simply not admitted by the queue. Persisted
+    /// through `token`, so the hold survives a GUI restart.
+    paused: bool = false,
+    /// Durable ledger record for this transfer (owned), null when it
+    /// is not recorded (sync-back uploads, or no ledger at all).
+    token: ?[]u8 = null,
     /// Scheduler identity of the destination (host plus local device).
     dest_key: u64 = 0,
 
@@ -815,6 +822,7 @@ pub const ActiveTransfer = struct {
         if (t.open_with_appid) |s| allocator.free(s);
         if (t.watch_host) |s| allocator.free(s);
         if (t.watch_remote) |s| allocator.free(s);
+        if (t.token) |s| allocator.free(s);
     }
 };
 

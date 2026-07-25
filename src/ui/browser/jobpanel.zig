@@ -238,14 +238,17 @@ fn transferRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayLis
     for (self.transfers.items) |t| {
         const p = t.x.progress();
         const counts = t.x.fileCounts();
-        const state: RowState = if (!t.started)
-            .queued
-        else switch (t.x.state) {
+        const terminal = t.x.isTerminal();
+        const state: RowState = if (terminal) switch (t.x.state) {
             .done => .finished,
             .failed => .failed,
-            .canceled => .canceled,
-            else => .running,
-        };
+            else => .canceled,
+        } else if (t.paused)
+            .paused
+        else if (!t.started)
+            .queued
+        else
+            .running;
         out.append(arena, .{
             .key = .{ .kind = .xfer, .ptr = @intFromPtr(t) },
             .label = t.label,
@@ -259,12 +262,14 @@ fn transferRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayLis
             .files_done = counts.done,
             .files_total = counts.total,
             .message = if (state == .failed) t.x.errMsg() else "",
-            // The client drives this state machine byte by byte; it has
-            // no pause point, so no pause button is offered. A terminal
-            // one is reaped rather than dismissed by hand.
+            // A terminal one is reaped rather than dismissed by hand.
+            // Pause stops the pumping at the next chunk boundary; the
+            // staged partial is the checkpoint it resumes from.
             .controls = .{
-                .cancel = state == .running or state == .queued,
-                .reorder = !t.started,
+                .pause = !terminal and !t.paused,
+                .unpause = !terminal and t.paused,
+                .cancel = !terminal,
+                .reorder = !t.started and !t.paused,
             },
             .transfer = t,
         }) catch return;
@@ -577,6 +582,8 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
                 t.x.cancel();
                 self.reapTransfers();
             },
+            .pause => self.setTransferPaused(t, true),
+            .resume_ => self.setTransferPaused(t, false),
             else => {},
         }
         self.renderJobs();

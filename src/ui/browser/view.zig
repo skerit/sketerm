@@ -514,6 +514,8 @@ pub const BrowserView = struct {
     pub const feedTransfers = @import("jobs.zig").feedTransfers;
     pub const pumpTransferQueue = @import("jobs.zig").pumpTransferQueue;
     pub const moveTransfer = @import("jobs.zig").moveTransfer;
+    pub const setTransferPaused = @import("jobs.zig").setTransferPaused;
+    pub const unclaimMediated = @import("jobs.zig").unclaimMediated;
     pub const pumpCopyQueue = @import("jobs.zig").pumpCopyQueue;
     pub const cancelQueuedCopy = @import("jobs.zig").cancelQueuedCopy;
     pub const moveQueuedCopy = @import("jobs.zig").moveQueuedCopy;
@@ -869,6 +871,13 @@ pub const BrowserView = struct {
     }
 
     pub fn deinit(self: *BrowserView) void {
+        // The client-mediated transfers this view runs are recorded in
+        // the durable ledger; hand them back before their Xfers die so
+        // the next browser face -- or another process -- resumes them.
+        if (self.transfer_service) |service| {
+            self.unclaimMediated();
+            service.removeMediatedDriver(@ptrCast(self));
+        }
         if (self.switch_idle != 0) {
             _ = c.g_source_remove(self.switch_idle);
             self.switch_idle = 0;
