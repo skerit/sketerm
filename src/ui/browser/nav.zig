@@ -18,6 +18,7 @@ const HostConn = @import("types.zig").HostConn;
 const NavigationIntent = @import("types.zig").NavigationIntent;
 const Pending = @import("types.zig").Pending;
 const RowCtx = @import("render.zig").RowCtx;
+const completionMatches = @import("../../filebrowser/paths.zig").completionMatches;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const mountBypass = @import("../../filebrowser/paths.zig").mountBypass;
 const onListDrop = @import("ops.zig").onListDrop;
@@ -89,6 +90,11 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
 
     const label = c.gtk_label_new("...");
     c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);
+    // An ellipsizing label reports the ellipsis itself as its minimum
+    // width, so without width_chars the notebook collapses every tab
+    // to "...". width_chars is the floor it always gets,
+    // max_width_chars the ceiling before it ellipsizes.
+    c.gtk_label_set_width_chars(@ptrCast(label), 14);
     c.gtk_label_set_max_width_chars(@ptrCast(label), 24);
     const label_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
     c.gtk_box_append(@ptrCast(label_box), label);
@@ -643,8 +649,27 @@ pub fn renderPathCompletion(self: *BrowserView) void {
     self.sendOp(hc, .{ .req = request.req, .op = "list", .path = parent });
 }
 
+/// Dispose a widget that was created but never parented. Its initial
+/// reference is still FLOATING, and g_object_unref on a floating
+/// object warns and leaks -- it has to be sunk first.
+fn unrefFloating(widget: ?*c.GtkWidget) void {
+    c.g_object_unref(c.g_object_ref_sink(@ptrCast(widget)));
+}
+
 pub fn showCompletionNames(self: *BrowserView, display_prefix: []const u8, prefix: []const u8, names: []const []const u8) void {
     self.closePathCompletion();
+    // Decide BEFORE building anything: a popover that is never
+    // parented still holds its floating reference, and dropping that
+    // with a plain g_object_unref is the GLib warning "A floating
+    // object was finalized" plus a leaked child.
+    var any = false;
+    for (names) |name| {
+        if (completionMatches(name, prefix)) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return;
     const pop = c.gtk_popover_new();
     const list = c.gtk_list_box_new();
     c.gtk_popover_set_autohide(@ptrCast(pop), 0);
@@ -654,8 +679,7 @@ pub fn showCompletionNames(self: *BrowserView, display_prefix: []const u8, prefi
     c.gtk_list_box_set_activate_on_single_click(@ptrCast(list), 1);
     var count: usize = 0;
     for (names) |name| {
-        if (name.len > 0 and name[0] == '.') continue;
-        if (prefix.len > name.len or !std.ascii.eqlIgnoreCase(prefix, name[0..prefix.len])) continue;
+        if (!completionMatches(name, prefix)) continue;
         var text_buf: [4600]u8 = undefined;
         const completed = std.fmt.bufPrint(&text_buf, "{s}{s}/", .{ display_prefix, name }) catch continue;
         const ctx = self.allocator.create(CompletionCtx) catch continue;
@@ -675,7 +699,13 @@ pub fn showCompletionNames(self: *BrowserView, display_prefix: []const u8, prefi
         count += 1;
         if (count >= 30) break;
     }
-    if (count == 0) { c.g_object_unref(pop); return; }
+    if (count == 0) {
+        // Only reachable when every row allocation failed. Sink the
+        // floating references before dropping them.
+        unrefFloating(list);
+        unrefFloating(pop);
+        return;
+    }
     _ = c.g_signal_connect_data(list, "row-activated", @ptrCast(&onCompletionActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_popover_set_child(@ptrCast(pop), list);
     c.gtk_widget_set_parent(pop, @ptrCast(@alignCast(self.path_entry)));
@@ -738,7 +768,12 @@ pub fn showSelectPattern(self: *BrowserView) void {
     const pop = c.gtk_popover_new();
     const entry = c.gtk_entry_new();
     c.gtk_entry_set_placeholder_text(@ptrCast(entry), "Select name/glob (* and ?)");
-    const ctx = self.allocator.create(PatternCtx) catch { c.g_object_unref(pop); return; };
+    const ctx = self.allocator.create(PatternCtx) catch {
+        // pop is still floating here (set_parent happens below).
+        unrefFloating(pop);
+        unrefFloating(entry);
+        return;
+    };
     ctx.* = .{ .allocator = self.allocator, .view = self, .popover = pop };
     _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onPatternActivate), @ptrCast(ctx), @ptrCast(&PatternCtx.free), c.G_CONNECT_DEFAULT);
     c.gtk_popover_set_child(@ptrCast(pop), entry);

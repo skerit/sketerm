@@ -51,7 +51,28 @@ comptime {
     _ = @import("ui/hints.zig");
     _ = @import("ui/pane.zig");
     _ = @import("ui/tab_effects.zig");
+    // The browser facade only re-exports a few decls, which is NOT
+    // enough to pull its package's tests in: a test block in one of
+    // these modules silently never runs unless the file is referenced
+    // here by name. Proven with a deliberately failing canary.
     _ = @import("ui/browser.zig");
+    _ = @import("ui/browser/view.zig");
+    _ = @import("ui/browser/types.zig");
+    _ = @import("ui/browser/conn.zig");
+    _ = @import("ui/browser/render.zig");
+    _ = @import("ui/browser/nav.zig");
+    _ = @import("ui/browser/locbar.zig");
+    _ = @import("ui/browser/tabs.zig");
+    _ = @import("ui/browser/menu.zig");
+    _ = @import("ui/browser/ops.zig");
+    _ = @import("ui/browser/jobs.zig");
+    _ = @import("ui/browser/open.zig");
+    _ = @import("ui/browser/preview.zig");
+    _ = @import("ui/browser/props.zig");
+    _ = @import("ui/browser/places.zig");
+    _ = @import("ui/browser/search.zig");
+    _ = @import("ui/browser/compare.zig");
+    _ = @import("ui/browser/gitstat.zig");
     _ = @import("a11y/view.zig");
     _ = @import("a11y/nsax.zig");
     _ = @import("ipc/protocol.zig");

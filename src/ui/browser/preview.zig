@@ -706,8 +706,17 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
                         self.finishRemoteThumb();
                         return true;
                     }
-                    self.queueRemoteDecode(rt, true);
-                    self.finishRemoteThumbKeepCurrent();
+                    // Deliberately NOT finishRemoteThumb: the worker
+                    // handback needs rt's host + path, so
+                    // releaseRemoteThumbFor owns the release and
+                    // pumps the next queue entry. If the handoff
+                    // failed there is no handback, and leaving
+                    // self.remote_thumb set would wedge the pipeline
+                    // for the life of the view.
+                    if (!self.queueRemoteDecode(rt, true)) {
+                        self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
+                        self.finishRemoteThumb();
+                    }
                     return true;
                 },
                 .wait_job => return false,
@@ -736,18 +745,20 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
 
 /// Source bytes arrived: hand them to the worker for decode +
 /// spec-PNG encode (write-back happens when the result lands).
-pub fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb, cached_png: bool) void {
-    const tc = self.ensureThumbWorker() orelse return;
+/// @return false when the job was NOT handed off, in which case no
+/// handback will ever arrive and the caller owns `rt`'s release.
+pub fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb, cached_png: bool) bool {
+    const tc = self.ensureThumbWorker() orelse return false;
     const a = std.heap.c_allocator;
-    const path = a.dupe(u8, rt.path) catch return;
+    const path = a.dupe(u8, rt.path) catch return false;
     const key = if (rt.hc.host) |host|
-        std.fmt.allocPrint(a, "{s}:{s}", .{ host, rt.path }) catch { a.free(path); return; }
+        std.fmt.allocPrint(a, "{s}:{s}", .{ host, rt.path }) catch { a.free(path); return false; }
     else
-        a.dupe(u8, rt.path) catch { a.free(path); return; };
+        a.dupe(u8, rt.path) catch { a.free(path); return false; };
     const data = a.dupe(u8, rt.buf.items) catch {
         a.free(path);
         a.free(key);
-        return;
+        return false;
     };
     tc.lock();
     defer tc.unlock();
@@ -755,16 +766,10 @@ pub fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb, cached_png: bool)
         a.free(path);
         a.free(key);
         a.free(data);
-        return;
+        return false;
     };
     _ = c.pthread_cond_signal(&tc.cond);
-}
-
-/// Advance the queue but KEEP self.remote_thumb until the worker
-/// result lands (thumbWriteBack needs its host + path).
-pub fn finishRemoteThumbKeepCurrent(self: *BrowserView) void {
-    // The worker handback frees it via releaseRemoteThumbFor.
-    _ = self;
+    return true;
 }
 
 pub fn releaseRemoteThumbFor(self: *BrowserView, remote_id: u64) void {
@@ -1023,9 +1028,9 @@ fn directorySummary(self: *BrowserView, path: []const u8) []const u8 {
 /// Copy a transient note into the view's scratch so callers can hand
 /// out a slice that outlives their own stack frame.
 fn previewNoteScratch(self: *BrowserView, text: []const u8) []const u8 {
-    const n = @min(text.len, self.spec_scratch.len);
-    @memcpy(self.spec_scratch[0..n], text[0..n]);
-    return self.spec_scratch[0..n];
+    const n = @min(text.len, self.note_scratch.len);
+    @memcpy(self.note_scratch[0..n], text[0..n]);
+    return self.note_scratch[0..n];
 }
 
 /// Run a user previewer on the file's host. `panelize` is the

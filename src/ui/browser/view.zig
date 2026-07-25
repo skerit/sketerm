@@ -198,8 +198,10 @@ pub const BrowserView = struct {
     /// Window-owned service: durable downloads and sync-back survive
     /// this pane, this window, and GUI process restarts.
     transfer_service: ?*file_transfers.Service = null,
-    /// Scratch for currentSpec's caller-visible slice.
-    spec_scratch: [4300]u8 = undefined,
+    /// Scratch for a transient preview note handed out as a slice
+    /// (preview.zig previewNoteScratch). Deliberately NOT shared with
+    /// anything else: a second borrower would rewrite a live note.
+    note_scratch: [128]u8 = undefined,
     /// Type-ahead jump buffer; cleared after TYPEAHEAD_RESET_US idle.
     ta_buf: [64]u8 = undefined,
     ta_len: usize = 0,
@@ -468,7 +470,6 @@ pub const BrowserView = struct {
     pub const finishRemoteThumb = @import("preview.zig").finishRemoteThumb;
     pub const feedRemoteThumb = @import("preview.zig").feedRemoteThumb;
     pub const queueRemoteDecode = @import("preview.zig").queueRemoteDecode;
-    pub const finishRemoteThumbKeepCurrent = @import("preview.zig").finishRemoteThumbKeepCurrent;
     pub const releaseRemoteThumbFor = @import("preview.zig").releaseRemoteThumbFor;
     pub const markThumbFailed = @import("preview.zig").markThumbFailed;
     pub const clearThumbCache = @import("preview.zig").clearThumbCache;
@@ -617,11 +618,14 @@ pub const BrowserView = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
-    /// The current tab's location as a host-qualified spec, in a
-    /// caller-owned static buffer valid until the next call.
-    pub fn currentSpec(self: *BrowserView) ?[]const u8 {
+    /// The current tab's location as a host-qualified spec, written
+    /// into the CALLER's `buf` (size it `paths.SPEC_BUF_LEN`): a
+    /// shared scratch buffer would alias between two calls in one
+    /// expression. The result may point at the tab's own path when
+    /// `buf` is too small, so it is only valid while the tab is.
+    pub fn currentSpec(self: *BrowserView, buf: []u8) ?[]const u8 {
         const tab = self.currentTab() orelse return null;
-        return tab.spec(&self.spec_scratch);
+        return tab.spec(buf);
     }
 
     /// Internal tab location specs in notebook order (layout
