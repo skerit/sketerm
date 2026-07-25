@@ -35,6 +35,8 @@ pub const Error = error{
     /// Daemon answered ok:false — message in `lastErr()`.
     FsOpFailed,
     BadReply,
+    /// Caller-side argument the client library refuses to send.
+    BadRequest,
     OutOfMemory,
 };
 
@@ -140,6 +142,40 @@ const Reply = struct {
     namemax: u64 = 255,
 };
 
+// ── batched media metadata ──────────────────────────────────────
+//
+// One request names many files; the daemon answers with one match
+// event per name, each carrying a flat key/value list (the namespace
+// is documented in src/mux/mediameta.zig). Extraction and caching
+// happen on the host that owns the files: no per-row round trip and
+// no file bytes on the wire.
+
+/// Separator inside a media_meta name list. ASCII US survives JSON
+/// transport and is not something real filenames usefully carry.
+pub const MEDIA_SEP: u8 = 0x1F;
+/// Names per request; the daemon rejects a larger batch outright, so
+/// callers must chunk (the browser asks for the VISIBLE rows).
+pub const MEDIA_BATCH_MAX: usize = 128;
+
+pub const MediaField = struct { k: []const u8 = "", v: []const u8 = "" };
+
+/// One file's metadata. `note` is set instead of `fields` when the
+/// daemon skipped the file (not a regular file, unreadable, empty).
+pub const MediaResult = struct {
+    path: []const u8 = "",
+    kind: []const u8 = "",
+    cached: bool = false,
+    note: []const u8 = "",
+    fields: []const MediaField = &.{},
+
+    pub fn get(self: MediaResult, key: []const u8) ?[]const u8 {
+        for (self.fields) |f| {
+            if (std.mem.eql(u8, f.k, key)) return f.v;
+        }
+        return null;
+    }
+};
+
 /// One pushed fs_job event, arena-owned.
 pub const JobEvent = struct {
     arena: std.heap.ArenaAllocator,
@@ -159,6 +195,10 @@ pub const JobEvent = struct {
     size: u64 = 0,
     matches: u64 = 0,
     truncated: bool = false,
+    /// media_meta match payload: extracted fields plus whether the
+    /// daemon served them from its cache.
+    meta: []const MediaField = &.{},
+    cached: bool = false,
 
     pub fn deinit(self: *JobEvent) void {
         self.arena.deinit();
@@ -287,6 +327,8 @@ pub const Fs = struct {
             size: u64 = 0,
             matches: u64 = 0,
             truncated: bool = false,
+            meta: []const MediaField = &.{},
+            cached: bool = false,
         };
         const parsed = std.json.parseFromSliceLeaky(Wire, arena.allocator(), payload, .{
             .ignore_unknown_fields = true,
@@ -312,6 +354,8 @@ pub const Fs = struct {
             .size = parsed.size,
             .matches = parsed.matches,
             .truncated = parsed.truncated,
+            .meta = parsed.meta,
+            .cached = parsed.cached,
         }) catch arena.deinit();
     }
 
@@ -453,6 +497,19 @@ pub const Fs = struct {
         }
         out.entries = entries.items;
         return out;
+    }
+
+    fn dupeMediaResult(a: std.mem.Allocator, ev: *const JobEvent) !MediaResult {
+        const fields = try a.alloc(MediaField, ev.meta.len);
+        for (ev.meta, 0..) |f, i|
+            fields[i] = .{ .k = try a.dupe(u8, f.k), .v = try a.dupe(u8, f.v) };
+        return .{
+            .path = try a.dupe(u8, ev.path),
+            .kind = try a.dupe(u8, ev.kind),
+            .cached = ev.cached,
+            .note = try a.dupe(u8, ev.text),
+            .fields = fields,
+        };
     }
 
     fn dupeEntry(a: std.mem.Allocator, e: Entry) !Entry {
@@ -702,6 +759,67 @@ pub const Fs = struct {
     /// Recursive ci content search; matches carry path + line + text.
     pub fn startGrep(self: *Fs, root: []const u8, pattern: []const u8) Error!u64 {
         return self.startJob("grep", .{ .path = root, .pattern = pattern });
+    }
+
+    /// Start a batched media-metadata extraction: `names` are resolved
+    /// against `dir` (absolute names are taken as-is). Results arrive
+    /// as job events with ev == "match", one per name, so a caller can
+    /// render rows as they land; the terminal event ends the batch.
+    pub fn startMediaMeta(self: *Fs, dir: []const u8, names: []const []const u8) Error!u64 {
+        if (names.len == 0 or names.len > MEDIA_BATCH_MAX) return Error.BadRequest;
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(self.allocator);
+        for (names, 0..) |name, i| {
+            if (i > 0) joined.append(self.allocator, MEDIA_SEP) catch return Error.OutOfMemory;
+            joined.appendSlice(self.allocator, name) catch return Error.OutOfMemory;
+        }
+        return self.startJob("media_meta", .{ .path = dir, .pattern = joined.items });
+    }
+
+    /// Run one media_meta batch to completion (bounded) and collect the
+    /// results into `arena`. The streaming form above is what a live
+    /// view wants; this is the one-call form for tools and tests.
+    pub fn mediaMeta(
+        self: *Fs,
+        arena: std.mem.Allocator,
+        dir: []const u8,
+        names: []const []const u8,
+        timeout_ms: i64,
+    ) Error![]MediaResult {
+        const job = try self.startMediaMeta(dir, names);
+        var out: std.ArrayList(MediaResult) = .empty;
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            var i: usize = 0;
+            var terminal = false;
+            while (i < self.job_events.items.len) {
+                if (self.job_events.items[i].job != job) {
+                    i += 1;
+                    continue;
+                }
+                var ev = self.job_events.orderedRemove(i);
+                defer ev.deinit();
+                if (std.mem.eql(u8, ev.ev, "match")) {
+                    out.append(arena, dupeMediaResult(arena, &ev) catch return Error.OutOfMemory) catch
+                        return Error.OutOfMemory;
+                } else if (ev.terminal()) {
+                    if (!std.mem.eql(u8, ev.ev, "done")) {
+                        self.setErr(ev.message);
+                        return Error.FsOpFailed;
+                    }
+                    terminal = true;
+                }
+            }
+            if (terminal) return out.items;
+            const remain = deadline - nowMs();
+            if (remain <= 0) return Error.Timeout;
+            const f = self.conn.recvFrameFor(remain) catch |err| switch (err) {
+                error.Timeout => return Error.Timeout,
+                else => return Error.NotConnected,
+            };
+            defer f.deinit(self.allocator);
+            self.stashPush(f.ftype, f.payload);
+        }
     }
 
     pub fn startThumbnail(self: *Fs, path: []const u8) Error!u64 {

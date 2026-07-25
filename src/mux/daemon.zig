@@ -1261,7 +1261,7 @@ const FsView = struct {
 /// transfers — the roadmap's core promise). kill = cancel,
 /// SIGSTOP/SIGCONT = pause/resume.
 const FsJob = struct {
-    const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree };
+    const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree, media_meta };
     const State = enum { running, paused, done, failed, canceled };
 
     allocator: std.mem.Allocator,
@@ -3104,7 +3104,8 @@ pub const Daemon = struct {
             std.mem.eql(u8, r.op, "panelize") or std.mem.eql(u8, r.op, "live_find") or
             std.mem.eql(u8, r.op, "archive_list") or std.mem.eql(u8, r.op, "archive_extract") or
             std.mem.eql(u8, r.op, "thumbnail") or std.mem.eql(u8, r.op, "preview") or
-            std.mem.eql(u8, r.op, "dir_size") or std.mem.eql(u8, r.op, "perm_tree"))
+            std.mem.eql(u8, r.op, "dir_size") or std.mem.eql(u8, r.op, "perm_tree") or
+            std.mem.eql(u8, r.op, "media_meta"))
             return self.fsStartJob(cl, r);
 
         if (std.mem.eql(u8, r.op, "open_view")) {
@@ -3731,6 +3732,8 @@ pub const Daemon = struct {
     /// Cap on RETAINED finished jobs (job_list history). Running jobs
     /// are never dropped.
     const MAX_FINISHED_JOBS = 64;
+    /// Cap on one media_meta batch's separator-joined name list.
+    const MAX_MEDIA_BATCH_BYTES = 16 * 1024;
     const MAX_TOKEN_JOBS = 1024;
 
     fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
@@ -3768,6 +3771,8 @@ pub const Daemon = struct {
             .dir_size
         else if (std.mem.eql(u8, r.op, "perm_tree"))
             .perm_tree
+        else if (std.mem.eql(u8, r.op, "media_meta"))
+            .media_meta
         else
             .hash;
         if ((op == .copy or op == .extract or op == .archive_create) and
@@ -3777,6 +3782,12 @@ pub const Daemon = struct {
             return fsReplyErr(cl, r.req, "refusing to delete /");
         if ((op == .find or op == .grep or op == .panelize or op == .live_find) and r.pattern.len == 0)
             return fsReplyErr(cl, r.req, "empty pattern");
+        // media_meta carries its batch in `pattern`; the cap keeps one
+        // spec line inside the job helper's stdin buffer.
+        if (op == .media_meta) {
+            if (r.pattern.len == 0) return fsReplyErr(cl, r.req, "media_meta needs at least one name");
+            if (r.pattern.len > MAX_MEDIA_BATCH_BYTES) return fsReplyErr(cl, r.req, "media_meta batch too large");
+        }
 
         // Idempotent submission closes the crash window where the job
         // started but its reply never reached the caller. Claiming the
@@ -3814,6 +3825,13 @@ pub const Daemon = struct {
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .job = job.id });
     }
 
+    /// Short-lived client-owned probes: no journal, no history, killed
+    /// with the requesting client. They report a view's decoration, not
+    /// a mutation worth recovering.
+    fn ephemeralOp(op: FsJob.Op) bool {
+        return op == .thumbnail or op == .preview or op == .dir_size or op == .media_meta;
+    }
+
     /// Recursive-permission arguments; -1 keeps the current owner or
     /// group, mode 0 keeps the current mode.
     const PermArgs = struct { mode: u32 = 0, uid: i64 = -1, gid: i64 = -1 };
@@ -3847,7 +3865,7 @@ pub const Daemon = struct {
             .dst_host = dst_host,
             .@"resume" = resumable,
             .job_id = id,
-            .journal_dir = if (op == .thumbnail or op == .preview or op == .dir_size) "" else self.fs_job_dir,
+            .journal_dir = if (ephemeralOp(op)) "" else self.fs_job_dir,
             .within_ms = within_ms,
             .max_matches = max_matches,
             .client_token = client_token,
@@ -3921,7 +3939,7 @@ pub const Daemon = struct {
             .dst_host = dst_host_owned,
             .client_token = client_token_owned,
             .resumable = resumable,
-            .ephemeral = op == .thumbnail or op == .preview or op == .dir_size,
+            .ephemeral = ephemeralOp(op),
         };
         job_initialized = true;
         // The job owns the read end from here on; its deinit closes it,
@@ -4251,6 +4269,9 @@ pub const Daemon = struct {
         }
     }
 
+    /// One extracted media-metadata field, forwarded verbatim.
+    const MetaKV = struct { k: []const u8 = "", v: []const u8 = "" };
+
     fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         const Ev = struct {
             ev: []const u8 = "",
@@ -4266,6 +4287,10 @@ pub const Daemon = struct {
             size: u64 = 0,
             matches: u64 = 0,
             truncated: bool = false,
+            /// media_meta: extracted key/value pairs for one file, plus
+            /// whether the helper served them from its cache.
+            meta: []const MetaKV = &.{},
+            cached: bool = false,
         };
         const parsed = std.json.parseFromSlice(Ev, self.allocator, line, .{
             .ignore_unknown_fields = true,
@@ -4287,6 +4312,8 @@ pub const Daemon = struct {
                     .text = e.text,
                     .kind = e.kind,
                     .size = e.size,
+                    .meta = e.meta,
+                    .cached = e.cached,
                 });
             }
             return;
