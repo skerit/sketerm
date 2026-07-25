@@ -56,10 +56,19 @@ pub fn newTabSpec(self: *BrowserView, spec: []const u8) ?*BTab {
 }
 
 pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
-    const hc = self.hostConnFor(host) orelse return null;
-    const dir = self.makeDir(path) orelse return null;
+    // These three failures are all out-of-memory; say so rather than
+    // return null to a caller that has no way to tell the user.
+    const hc = self.hostConnFor(host) orelse {
+        self.setStatus("cannot open a tab: out of memory");
+        return null;
+    };
+    const dir = self.makeDir(path) orelse {
+        self.setStatus("cannot open a tab: out of memory");
+        return null;
+    };
     const tab = self.allocator.create(BTab) catch {
         dir.deinit();
+        self.setStatus("cannot open a tab: out of memory");
         return null;
     };
 
@@ -78,6 +87,36 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     const miller_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
     c.gtk_widget_set_visible(miller_box, 0);
     c.gtk_box_append(@ptrCast(content), miller_box);
+
+    // The listing area's own message: shown instead of the rows when
+    // there are none, so "empty", "still listing", "no matches" and
+    // "refused, and here is why" can never look alike.
+    const empty_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
+    c.gtk_widget_set_hexpand(empty_box, 1);
+    c.gtk_widget_set_vexpand(empty_box, 1);
+    c.gtk_widget_set_valign(empty_box, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_halign(empty_box, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_visible(empty_box, 0);
+    // Focusable on purpose: while this shows, the rows are hidden, and
+    // a hidden widget cannot hold focus. Without somewhere for focus to
+    // land inside the browser face, its chords (Ctrl+Shift+B included)
+    // stop reaching it the moment a listing comes up empty.
+    c.gtk_widget_set_focusable(empty_box, 1);
+    const empty_title = c.gtk_label_new("");
+    c.gtk_widget_add_css_class(empty_title, "title-2");
+    c.gtk_label_set_wrap(@ptrCast(empty_title), 1);
+    c.gtk_label_set_justify(@ptrCast(empty_title), c.GTK_JUSTIFY_CENTER);
+    c.gtk_box_append(@ptrCast(empty_box), empty_title);
+    const empty_detail = c.gtk_label_new("");
+    c.gtk_widget_add_css_class(empty_detail, "dim-label");
+    c.gtk_label_set_wrap(@ptrCast(empty_detail), 1);
+    c.gtk_label_set_max_width_chars(@ptrCast(empty_detail), 60);
+    // NOT selectable: a selectable label is focusable and swallows key
+    // presses, which silently killed every browser chord (Ctrl+Shift+B
+    // included) as soon as this message was the only thing on screen.
+    c.gtk_label_set_justify(@ptrCast(empty_detail), c.GTK_JUSTIFY_CENTER);
+    c.gtk_box_append(@ptrCast(empty_box), empty_detail);
+    c.gtk_box_append(@ptrCast(content), empty_box);
 
     const scroller = c.gtk_scrolled_window_new();
     c.gtk_widget_set_hexpand(scroller, 1);
@@ -113,6 +152,9 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
         .header_box = header,
         .scroller = scroller,
         .miller_box = miller_box,
+        .empty_box = empty_box,
+        .empty_title = @ptrCast(@alignCast(empty_title)),
+        .empty_detail = @ptrCast(@alignCast(empty_detail)),
     };
     self.tabs.append(self.allocator, tab) catch {
         tab.root.deinit();
@@ -156,6 +198,10 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     c.gtk_notebook_set_current_page(self.notebook, page_idx);
     self.updateTabLabel(tab);
     self.openDir(tab, dir);
+    // Render once now: the listing area then says "Listing..." (or the
+    // refusal, when the host is already known to be unreachable)
+    // instead of showing a blank that reads as an empty folder.
+    self.renderTab(tab);
     self.syncPathEntry(tab);
     self.refreshGitOverlay(tab);
     if (hc.state == .connecting) self.setStatusFmt("connecting to {s}…", .{hc.label()});
@@ -336,6 +382,8 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
         const owned = self.allocator.dupe(u8, canonical) catch null;
         if (owned) |path| { self.allocator.free(candidate.path); candidate.path = path; }
     }
+    // A landed navigation settles the previous refusal.
+    tab.clearNavError();
     self.applyHistoryIntent(tab, intent);
     for (tab.selected.items) |value| self.allocator.free(value);
     tab.selected.clearRetainingCapacity();
@@ -362,6 +410,10 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     self.refreshGitOverlay(tab);
     var recent_buf: [4300]u8 = undefined;
     self.recordRecentSpec(tab.spec(&recent_buf));
+    // The row (or breadcrumb button) that was clicked to get here has
+    // just been destroyed with its widget; without this the window ends
+    // up with no focused widget and every chord stops working.
+    self.refocusListingIfLost();
 }
 
 pub fn goUp(self: *BrowserView, tab: *BTab) void {
@@ -419,6 +471,14 @@ pub fn syncPathEntry(self: *BrowserView, tab: *BTab) void {
     self.syncing_path_entry = true;
     c.gtk_editable_set_text(@ptrCast(self.path_entry), &z);
     self.syncing_path_entry = false;
+    // A location that could not be opened must not be presented as the
+    // one you are looking at: both faces of the control carry the
+    // error style while the tab's own listing is refused.
+    const refused = tab.root.load_error != null;
+    if (refused)
+        c.gtk_widget_add_css_class(@ptrCast(@alignCast(self.path_entry)), "error")
+    else
+        c.gtk_widget_remove_css_class(@ptrCast(@alignCast(self.path_entry)), "error");
     // The entry no longer holds what the user was completing.
     self.cancelPathCompletion();
     // The breadcrumb is the same location control's other face.

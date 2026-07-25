@@ -103,8 +103,11 @@ package() {
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.files.svg"
 
     # Bundled symbolic action icons (split left/right + top/bottom for
-    # the context menu; rendering for the prefs page), found via the
-    # hicolor fallback theme so they resolve regardless of icon theme.
+    # the context menu; rendering for the prefs page; terminal for the
+    # browser toolbar), found via the hicolor fallback theme so they
+    # resolve regardless of icon theme.
+    install -Dm644 data/icons/hicolor/scalable/actions/sketerm-terminal-symbolic.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/actions/sketerm-terminal-symbolic.svg"
     install -Dm644 data/icons/hicolor/scalable/actions/sketerm-split-left-right-symbolic.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/actions/sketerm-split-left-right-symbolic.svg"
     install -Dm644 data/icons/hicolor/scalable/actions/sketerm-split-top-bottom-symbolic.svg \

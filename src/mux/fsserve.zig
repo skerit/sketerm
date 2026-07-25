@@ -257,9 +257,33 @@ pub fn listDir(arena: std.mem.Allocator, dir_path: []const u8, max: usize) error
 }
 
 pub fn listDirAttrs(arena: std.mem.Allocator, dir_path: []const u8, max: usize, attrs: []const []const u8) error{OpenFailed}!Listing {
+    var why: []const u8 = "";
+    return listDirAttrsWhy(arena, dir_path, max, attrs, &why);
+}
+
+/// As `listDirAttrs`, but names the reason the open failed.
+///
+/// The errno has to be captured AT the failing call: a caller that
+/// reads errno after the fact may have made libc calls of its own in
+/// between. Without this, a permission denial and a vanished directory
+/// reached the browser as the same "cannot open directory", which is
+/// the whole difference for whoever is looking at the screen.
+pub fn listDirAttrsWhy(
+    arena: std.mem.Allocator,
+    dir_path: []const u8,
+    max: usize,
+    attrs: []const []const u8,
+    why: *[]const u8,
+) error{OpenFailed}!Listing {
     var z_buf: [4096]u8 = undefined;
-    const dz = pathz.pathZ(&z_buf, dir_path) catch return error.OpenFailed;
-    const dir = c.opendir(dz) orelse return error.OpenFailed;
+    const dz = pathz.pathZ(&z_buf, dir_path) catch {
+        why.* = "NAMETOOLONG";
+        return error.OpenFailed;
+    };
+    const dir = c.opendir(dz) orelse {
+        why.* = errnoName(@as(c_int, -1));
+        return error.OpenFailed;
+    };
     defer _ = c.closedir(dir);
 
     var entries: std.ArrayList(Entry) = .empty;
@@ -535,6 +559,54 @@ test "listDir: entry cap sets truncated" {
     const l = try listDir(arena_state.allocator(), dir, 4);
     try std.testing.expectEqual(@as(usize, 4), l.entries.len);
     try std.testing.expect(l.truncated);
+}
+
+test "listDirAttrsWhy names why the open failed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var dbuf: [64]u8 = undefined;
+    const dir = mkTmpDir(&dbuf) orelse return error.SkipZigTest;
+
+    // Absent: the reason a browser must be able to print instead of
+    // rendering an empty listing.
+    var z1: [4096]u8 = undefined;
+    var why: []const u8 = "";
+    try std.testing.expectError(
+        error.OpenFailed,
+        listDirAttrsWhy(arena, std.mem.span(try joinZ(&z1, dir, "nope")), MAX_ENTRIES, &.{}, &why),
+    );
+    try std.testing.expectEqualStrings("NOENT", why);
+
+    // Unreadable: distinct from absent, which is the point.
+    var z2: [4096]u8 = undefined;
+    const locked = try joinZ(&z2, dir, "locked");
+    _ = c.mkdir(locked, 0o000);
+    if (c.geteuid() != 0) {
+        why = "";
+        try std.testing.expectError(
+            error.OpenFailed,
+            listDirAttrsWhy(arena, std.mem.span(locked), MAX_ENTRIES, &.{}, &why),
+        );
+        try std.testing.expectEqualStrings("ACCES", why);
+    }
+    _ = c.chmod(locked, 0o755);
+
+    // A file where a directory was asked for.
+    var z3: [4096]u8 = undefined;
+    try touch(dir, "plain.txt", "x");
+    why = "";
+    try std.testing.expectError(
+        error.OpenFailed,
+        listDirAttrsWhy(arena, std.mem.span(try joinZ(&z3, dir, "plain.txt")), MAX_ENTRIES, &.{}, &why),
+    );
+    try std.testing.expectEqualStrings("NOTDIR", why);
+
+    // Success leaves the reason alone.
+    why = "untouched";
+    _ = try listDirAttrsWhy(arena, dir, MAX_ENTRIES, &.{}, &why);
+    try std.testing.expectEqualStrings("untouched", why);
 }
 
 test "watcher: create + delete surface as parsed events" {

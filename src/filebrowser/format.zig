@@ -53,6 +53,93 @@ pub fn fmtModeZ(buf: *[16:0]u8, mode: u32, is_dir: bool) [*:0]const u8 {
     return @ptrCast(buf);
 }
 
+/// The daemon's fs_reply `error` field made readable.
+///
+/// The daemon answers with the errno TAG (`fsserve.errnoName` =
+/// `@tagName` of `std.posix.E`), which is the real reason but reads
+/// like a compiler message. Anything that is not a tag we know passes
+/// through byte for byte: an unrecognised reason must never be
+/// replaced by a guess.
+pub fn errorPhrase(daemon_error: []const u8) []const u8 {
+    const map = [_]struct { tag: []const u8, phrase: []const u8 }{
+        .{ .tag = "NOENT", .phrase = "no such file or directory" },
+        .{ .tag = "ACCES", .phrase = "permission denied" },
+        .{ .tag = "PERM", .phrase = "operation not permitted" },
+        .{ .tag = "NOTDIR", .phrase = "not a directory" },
+        .{ .tag = "ISDIR", .phrase = "is a directory" },
+        .{ .tag = "LOOP", .phrase = "too many symbolic links" },
+        .{ .tag = "NAMETOOLONG", .phrase = "path too long" },
+        .{ .tag = "NOTEMPTY", .phrase = "directory not empty" },
+        .{ .tag = "EXIST", .phrase = "already exists" },
+        .{ .tag = "NOSPC", .phrase = "no space left on device" },
+        .{ .tag = "ROFS", .phrase = "read-only filesystem" },
+        .{ .tag = "XDEV", .phrase = "different filesystem" },
+        .{ .tag = "IO", .phrase = "I/O error" },
+        .{ .tag = "NFILE", .phrase = "too many open files" },
+        .{ .tag = "MFILE", .phrase = "too many open files" },
+        .{ .tag = "STALE", .phrase = "stale file handle" },
+        .{ .tag = "NOMEM", .phrase = "out of memory" },
+    };
+    for (map) |m| {
+        if (std.mem.eql(u8, daemon_error, m.tag)) return m.phrase;
+    }
+    if (daemon_error.len == 0) return "the daemon gave no reason";
+    return daemon_error;
+}
+
+/// What an empty-looking listing area actually MEANS. A failed
+/// listing, a directory that cannot be read, a query with no hits and
+/// a genuinely empty folder are four different states, and the whole
+/// point of naming them is that they must never share wording.
+pub const ListingState = enum {
+    /// The request is out; no reply yet.
+    listing,
+    /// The listing was refused, and `Dir.load_error` says why.
+    failed,
+    /// A real, readable, empty directory.
+    empty,
+    /// A search / panelize / register tab whose rows are its results.
+    no_matches,
+    /// Rows are present; the listing area speaks for itself.
+    populated,
+};
+
+/// Classify a listing from the four facts that decide it.
+/// `flat` marks result rows (search, panelize, registers) rather than
+/// a directory's children, which is what separates "no matches" from
+/// "empty folder".
+pub fn listingState(loaded: bool, failed: bool, flat: bool, count: usize) ListingState {
+    if (failed) return .failed;
+    if (count > 0) return .populated;
+    if (!loaded) return .listing;
+    return if (flat) .no_matches else .empty;
+}
+
+/// The headline for an empty listing area. `.failed` has none: the
+/// reason from the daemon is the headline, and inventing a second one
+/// would compete with it.
+pub fn listingHeadline(state: ListingState) []const u8 {
+    return switch (state) {
+        .listing => "Listing...",
+        .failed => "",
+        .empty => "Empty folder",
+        .no_matches => "No matches",
+        .populated => "",
+    };
+}
+
+/// The status-bar phrase for a listing with no rows, in the SAME
+/// words as the placeholder so the two can never disagree.
+pub fn listingStatus(state: ListingState) []const u8 {
+    return switch (state) {
+        .listing => "listing...",
+        .failed => "",
+        .empty => "Empty folder - 0 items",
+        .no_matches => "No matches - 0 items",
+        .populated => "",
+    };
+}
+
 pub fn fmtTimeZ(buf: *[40:0]u8, ms: i64) [*:0]const u8 {
     var t: c.time_t = @intCast(@divTrunc(ms, 1000));
     var tm: c.struct_tm = undefined;
@@ -107,6 +194,51 @@ test "tagColorHex is deterministic and stays in the palette" {
     try t.expectEqual(@as(usize, 7), a.len);
     try t.expectEqual(@as(u8, '#'), a[0]);
     for (a[1..]) |ch| try t.expect(std.ascii.isHex(ch));
+}
+
+test "errorPhrase reads out errno tags and passes anything else through" {
+    const t = std.testing;
+    try t.expectEqualStrings("no such file or directory", errorPhrase("NOENT"));
+    try t.expectEqualStrings("permission denied", errorPhrase("ACCES"));
+    try t.expectEqualStrings("not a directory", errorPhrase("NOTDIR"));
+    // The daemon also sends prose for its own refusals; it must
+    // survive verbatim rather than be replaced by a guess.
+    try t.expectEqualStrings("path must be absolute", errorPhrase("path must be absolute"));
+    try t.expectEqualStrings("view id in use", errorPhrase("view id in use"));
+    // A reply with an empty error field still has to say something.
+    try t.expect(errorPhrase("").len > 0);
+}
+
+test "listingState separates a failure from an empty folder" {
+    const t = std.testing;
+    // The exact case Jelle hit: a refused listing must NOT classify as
+    // an empty directory, whatever `loaded` ended up as.
+    try t.expectEqual(ListingState.failed, listingState(false, true, false, 0));
+    try t.expectEqual(ListingState.failed, listingState(true, true, false, 0));
+    try t.expectEqual(ListingState.listing, listingState(false, false, false, 0));
+    try t.expectEqual(ListingState.empty, listingState(true, false, false, 0));
+    try t.expectEqual(ListingState.no_matches, listingState(true, false, true, 0));
+    try t.expectEqual(ListingState.populated, listingState(true, false, false, 3));
+    // Rows present but a failure recorded: the failure wins, since it
+    // is the newer fact about the listing.
+    try t.expectEqual(ListingState.failed, listingState(true, true, false, 3));
+
+    // No two states may share their wording, in either surface.
+    const states = [_]ListingState{ .listing, .failed, .empty, .no_matches, .populated };
+    for (states, 0..) |a, i| {
+        for (states[i + 1 ..]) |b| {
+            const ha = listingHeadline(a);
+            const hb = listingHeadline(b);
+            if (ha.len > 0 and hb.len > 0) try t.expect(!std.mem.eql(u8, ha, hb));
+            const sa = listingStatus(a);
+            const sb = listingStatus(b);
+            if (sa.len > 0 and sb.len > 0) try t.expect(!std.mem.eql(u8, sa, sb));
+        }
+    }
+    // "0 items" alone was the old, dishonest message; both empty-ish
+    // states must say more than the count.
+    try t.expect(!std.mem.eql(u8, "0 items", listingStatus(.empty)));
+    try t.expect(!std.mem.eql(u8, "0 items", listingStatus(.no_matches)));
 }
 
 test "copyZ truncates instead of overflowing" {

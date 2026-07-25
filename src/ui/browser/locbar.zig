@@ -205,6 +205,18 @@ pub fn rebuildCrumbs(self: *BrowserView, tab: *BTab) void {
     while (c.gtk_widget_get_first_child(box)) |child|
         c.gtk_box_remove(@ptrCast(box), child);
 
+    // A path whose listing was refused is NOT where you are: the
+    // breadcrumb leads with a warning naming the reason, so the trail
+    // cannot be read as a location that opened.
+    if (tab.root.load_error) |why| {
+        const warn = c.gtk_label_new("!");
+        c.gtk_widget_add_css_class(warn, "error");
+        var tip: [512:0]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&tip, "could not be opened: {s}", .{why}) catch null;
+        c.gtk_widget_set_tooltip_text(warn, if (text) |t| t.ptr else "could not be opened");
+        c.gtk_box_append(@ptrCast(box), warn);
+    }
+
     var segs: [MAX_SEGMENTS]crumbs.Segment = undefined;
     const list = crumbs.split(tab.hc.host orelse "", tab.root.path, &segs);
     for (list) |seg| {

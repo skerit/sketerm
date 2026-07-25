@@ -12,6 +12,7 @@ const searchmod = @import("search.zig");
 const views = @import("views.zig");
 
 const colkeys = @import("../../filebrowser/colkeys.zig");
+const format = @import("../../filebrowser/format.zig");
 const mediacols = @import("mediacols.zig");
 
 const BTab = @import("types.zig").BTab;
@@ -56,6 +57,11 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
             self.renderList(tab);
         },
     }
+    // What an empty listing area MEANS, decided once and shown in both
+    // places (the area itself and the status line) so they cannot
+    // disagree.
+    const state = applyListingState(tab);
+
     var count_buf: [560]u8 = undefined;
     // Its own buffer: a note printed into count_buf would be
     // overwritten by the print that reads it.
@@ -66,12 +72,27 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     // erased by whatever status message comes next.
     var query_buf: [200]u8 = undefined;
     const qnote = searchmod.queryNote(tab, &query_buf);
-    const cmsg = if (tab.filter.len > 0)
+    // The count phrase, or -- when there is nothing to count -- what the
+    // emptiness means. Both are then prefixed by a refused navigation,
+    // which stays visible until the next one lands.
+    const counted: []const u8 = if (failureReason(tab)) |why|
+        std.fmt.bufPrint(&count_buf, "cannot open {s}: {s}", .{ tab.root.path, why }) catch
+            "cannot open this folder"
+    else if (tab.filter.len > 0)
         std.fmt.bufPrint(&count_buf, "showing {d} of {d} items (filter \"{s}\"){s}{s}", .{
             tab.vs.shown, tab.vs.total, tab.filter[0..@min(tab.filter.len, 48)], note, qnote,
         }) catch ""
+    else if (tab.vs.total == 0)
+        std.fmt.bufPrint(&count_buf, "{s}{s}{s}", .{ format.listingStatus(state), note, qnote }) catch ""
     else
         std.fmt.bufPrint(&count_buf, "{d} items{s}{s}", .{ tab.vs.total, note, qnote }) catch "";
+    var status_buf: [700]u8 = undefined;
+    const cmsg: []const u8 = if (tab.nav_error) |refused|
+        std.fmt.bufPrint(&status_buf, "{s} -- still showing {s} ({s})", .{
+            refused, tab.root.path, counted,
+        }) catch refused
+    else
+        counted;
     self.setStatus(cmsg);
 
     // Fetching runs LAST: the rows it measures against are the ones
@@ -96,6 +117,66 @@ fn mediaSortNote(tab: *BTab, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, " ({s} read for {d} of {d} files)", .{
         colkeys.label(name), counted.have, counted.total,
     }) catch "";
+}
+
+/// Why this tab's listing area cannot be taken at face value, or null.
+///
+/// Two sources, deliberately kept apart from the entry count: the
+/// directory's own refusal, and a query job that DIED. A query that
+/// died with rows already in keeps them (they are real), so only an
+/// empty result would otherwise read as "nothing matched".
+fn failureReason(tab: *BTab) ?[]const u8 {
+    if (tab.root.load_error) |why| return why;
+    if (tab.query) |q| {
+        if (q.failed and tab.root.entries.items.len == 0)
+            return "the query failed - see the jobs panel";
+    }
+    return null;
+}
+
+/// Put the meaning of an empty listing area INTO the listing area, and
+/// answer what that meaning was.
+///
+/// The rows, the grid and the miller columns are all hidden while this
+/// shows: a refusal has to replace the listing, not sit beside an
+/// expanse of white that reads as "this folder is empty". Runs after
+/// applyViewChrome, whose per-mode visibility it deliberately
+/// overrides.
+pub fn applyListingState(tab: *BTab) format.ListingState {
+    const state = format.listingState(
+        tab.root.loaded,
+        failureReason(tab) != null,
+        tab.root.isFlat(),
+        tab.root.entries.items.len,
+    );
+    const show = state != .populated;
+    c.gtk_widget_set_visible(tab.empty_box, @intFromBool(show));
+    if (show) {
+        c.gtk_widget_set_visible(tab.scroller, 0);
+        if (tab.flow_scroller) |fs| c.gtk_widget_set_visible(fs, 0);
+        // The miller ancestor columns stay: they are how you leave a
+        // folder that turned out to be empty or unreadable.
+        // Sortable column headers over a refusal would suggest there is
+        // a listing under them.
+        if (state == .failed) c.gtk_widget_set_visible(tab.header_box, 0);
+        var title_buf: [256:0]u8 = undefined;
+        var detail_buf: [256:0]u8 = undefined;
+        if (failureReason(tab)) |why| {
+            c.gtk_label_set_text(tab.empty_title, copyZ(&title_buf, "This folder could not be opened"));
+            var detail: [400]u8 = undefined;
+            const text = std.fmt.bufPrint(&detail, "{s}: {s}", .{ tab.root.path, why }) catch why;
+            c.gtk_label_set_text(tab.empty_detail, copyZ(&detail_buf, text));
+        } else {
+            c.gtk_label_set_text(tab.empty_title, copyZ(&title_buf, format.listingHeadline(state)));
+            c.gtk_label_set_text(tab.empty_detail, copyZ(&detail_buf, switch (state) {
+                .no_matches => "Nothing matched this query.",
+                .empty => "This folder has no items. Hidden files may exist -- use the eye button to show them.",
+                else => "",
+            }));
+        }
+        c.gtk_widget_set_visible(@ptrCast(@alignCast(tab.empty_detail)), @intFromBool(state != .listing));
+    }
+    return state;
 }
 
 /// Show/hide the chrome that belongs to the tab's view mode.
