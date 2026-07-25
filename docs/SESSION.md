@@ -9640,3 +9640,72 @@ total); smoke-fs (with new policy and media stages, monolith AND
 broker), smoke-broker, smoke-mcp, smoke-e2e all PASS; GUI, mux, musl
 and aarch64-macOS builds green; mux still links libc/libm only. Every
 live rig torn down by exact PID.
+
+## 2026-07-25 (later): live queries, cleanup, and the test-runner bug
+
+**The "zig build test runner deadlock" was our own bug.** For several
+sessions the suite could only be run by killing the wedged runner and
+executing the compiled binary directly, and this was written up as a
+toolchain quirk. It was not. `fsjob.emitRaw` writes progress lines to
+fd 1 because that is the job protocol -- but under `zig build test
+--listen=-` fd 1 is the BUILD RUNNER's IPC pipe. A test that ran a
+real copy streamed JSON into that protocol, corrupted it, and hung the
+run at "run test". `emitRaw` is now a no-op in test builds so the
+class cannot return, and the two tests that drive `copyOneFile` ask
+for a quiet Progress as well. `zig build test` completes in about a
+second again. `dist/PKGBUILD` also lost its `check()`: installing is
+not the time to run the suite.
+
+**Live queries.** A filename query opens a tab that keeps updating --
+rows appear as files start matching and vanish as they stop, no
+polling, no re-run -- and any number stay live at once, each owning
+its own daemon job, cancelled exactly when its tab closes. Relative
+time is re-evaluated by DEADLINE, not by rescanning: each match
+records the instant its mtime leaves the window and the poll sleeps
+until the nearest one, capped at 5 minutes so a clock jump cannot
+strand the view. The tree is walked once, at startup.
+
+Saved searches and saved queries turned out to be ONE record: whether
+opening it subscribes or scans once follows from the query text, so
+nothing new is persisted. In the same spirit the flat view, which was
+a second `live_find` singleton, became the same per-tab query with
+pattern `*` -- so several subtrees can be flat at once and 115 lines
+of parallel machinery went away. Panelize gained presets and honesty:
+output lines naming nothing on disk are counted and reported rather
+than dropped or turned into bogus rows.
+
+**Cleanup pass.** The `homedir` round trip had grown TWO request paths
+because `HostConn.cache_req` was read and cleared but never assigned;
+conn.zig now owns the single request. The client-side thumbnail
+write-back it was supposed to feed is DELETED rather than revived --
+the daemon already leaves the spec thumbnail in the owning host's
+cache, so a second writer would only fight it. (That also corrects
+the note in the previous entry: remote row thumbnails were never
+being recomputed every session; the write-back was redundant, not
+merely unreachable.)
+
+Also fixed: the remote-thumbnail pipeline could hold its single
+in-flight slot forever when a reply never came, killing remote
+thumbnails for the life of the view; `entryForPath` could not resolve
+flat rows at all, silently breaking properties, preview and register
+marks for every search and panelize result; right-clicking inside a
+multi-selection collapsed it, because the list and flow box claim
+button 0 themselves; the entry menu had outgrown its popover and
+simply failed to map on a short screen, and is now grouped into
+scrolling submenu pages; `nowMs` was copy-pasted in nine modules and
+moved to `src/util/clock.zig`; and `Dir.upsert` re-sorted on every
+delta using media values that are only stitched on at render time.
+
+And three more found by the query work: the daemon never forwarded
+`ready` or `mtime_ms` to any client, so the flat view's ready branch
+had been dead since it shipped; `fsdrive.stashJobEvent` silently
+dropped every field it did not name -- the "carry new fields
+explicitly" trap one layer further out; and a `live_find` helper whose
+daemon died held its recursive watcher open forever instead of
+noticing the closed pipe.
+
+Verification: **998 passed / 6 skipped / 0 failed (1004 total)**, now
+via plain `zig build test`; smoke-fs (with new policy, media and query
+stages, monolith AND broker), smoke-broker, smoke-mcp, smoke-e2e all
+PASS; GUI, mux, musl and aarch64-macOS builds green; mux still links
+libc/libm only.
