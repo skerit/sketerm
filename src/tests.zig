@@ -140,6 +140,8 @@ comptime {
     _ = @import("mux/a11yhub.zig");
     _ = @import("mux/cast.zig");
     _ = @import("mux/rudp.zig");
+    _ = @import("mux/display.zig");
+    _ = @import("mux/keep.zig");
     _ = @import("render/atlas_test.zig");
     _ = @import("render/atlas.zig");
     _ = @import("render/cell_pass.zig");

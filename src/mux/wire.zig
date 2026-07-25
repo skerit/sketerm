@@ -132,6 +132,13 @@ pub const FrameType = enum(u8) {
     /// [path][data]. flags bit0=create bit1=truncate bit2=append
     /// bit3=exclusive. Answered with `fs_reply` { req, written }.
     fs_write = 24,
+    /// Controller-lease request for the ATTACHED session's Wayland
+    /// seat: JSON { op } where op ∈ acquire|release|takeover.
+    /// `acquire` only succeeds while nobody holds the lease;
+    /// `takeover` evicts the current controller. Answered by a
+    /// `control_state` broadcast (never an ok/err — the state IS the
+    /// answer, and every viewer needs it anyway).
+    control_req = 25,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -211,6 +218,13 @@ pub const FrameType = enum(u8) {
     /// survive the requesting client — events flow to the owner while
     /// it lives; job_list serves any client afterwards.
     fs_job = 88,
+    /// Controller lease state for the client's session, pushed to
+    /// EVERY attached client on every change (attach, release,
+    /// takeover, controller death): JSON { controller, read_only,
+    /// controller_label, viewers }. `controller` is "do I hold it" —
+    /// each recipient gets its own view, so a viewer that asked for
+    /// control and did not get it learns so without polling.
+    control_state = 89,
     _,
 };
 

@@ -2080,8 +2080,12 @@ fn uploadStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, mirror: *Mi
 /// durability stage does exactly that) must EPIPE, not kill the smoke.
 fn sigNoop(_: c_int) callconv(.c) void {}
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.signal(c.SIGPIPE, &sigNoop);
+    // This binary HOSTS a daemon (in a thread), so a display session's
+    // keeper is spawned as /proc/self/exe --keep = us. Answer it, or
+    // the keeper would re-run the whole smoke.
+    if (@import("mux/keep.zig").wanted(init.args.vector)) return @import("mux/keep.zig").serve();
     // safety=true forces allocation tracking even in ReleaseFast (the
     // repo's default optimize mode), where it is off by default — so
     // the leak check below actually runs.
@@ -2279,6 +2283,10 @@ pub fn main() u8 {
 
     // Quick CLI connections send no hello and must still be served.
     noHelloStage(allocator, sock_path);
+
+    // External display sessions + the controller lease (shared stage,
+    // also run against a real broker by smoke-broker).
+    @import("smoke_display.zig").run(allocator, sock_path);
 
     // A second client sees the session in LIST.
     var conn2 = client_mod.Conn.connect(allocator, sock_path) catch fail("connect2");

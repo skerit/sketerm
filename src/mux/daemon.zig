@@ -43,6 +43,7 @@ const wssource = @import("../winstream/source.zig");
 const WsSource = wssource.Source;
 const snapshot = @import("snapshot.zig");
 const shell_util = @import("shell.zig");
+const platform = @import("../util/platform.zig");
 const Pty = @import("../pty.zig").Pty;
 const Parser = @import("../parser/vt.zig").Parser;
 const Event = @import("../parser/event.zig").Event;
@@ -149,6 +150,18 @@ pub const SpawnReq = struct {
     /// the daemon host; the GUI only fills this for the LOCAL daemon, where
     /// the integration scripts exist. null = off.
     shell_integration: ?SpawnShellIntegration = null,
+    /// External display session (`sketerm-mux display create`): the
+    /// child is a trivial keeper process (this daemon's own binary,
+    /// `--keep`) that just blocks, so the session exists purely to own
+    /// a Wayland/PulseAudio hub some OUTSIDE process renders into. The
+    /// daemon builds the keeper argv itself — a client cannot know the
+    /// daemon host's binary path, and a version mismatch would be a
+    /// silent instant exit. Any argv the client sent is ignored.
+    display: bool = false,
+    /// Seconds with NO attached viewer after which the daemon kills
+    /// this session (counted from creation while it has never been
+    /// attached). 0 = live forever, the historical behaviour.
+    ttl_secs: u32 = 0,
 };
 
 pub const SpawnShellIntegration = struct {
@@ -162,6 +175,18 @@ pub const AttachReq = struct {
     /// Client self-identification for the peer roster: "gui", "cli",
     /// "mcp" (headless assistant driver) or "" (unknown).
     kind: []const u8 = "",
+    /// Never drive the session's Wayland seat: this viewer stays out of
+    /// the controller lease entirely (it neither acquires a free lease
+    /// nor is eligible for the controller-death handover).
+    read_only: bool = false,
+    /// Force the controller lease on attach, evicting whoever holds it.
+    /// Without this an attach only acquires a FREE lease.
+    control: bool = false,
+};
+
+/// `control_req` payload. Unknown ops are ignored (append-only).
+pub const ControlReq = struct {
+    op: []const u8 = "",
 };
 
 /// `log_get` request. Exactly one selector applies, in this order:
@@ -203,6 +228,23 @@ pub const SessionInfo = struct {
     /// The session child's pid ON THE DAEMON'S HOST (0 = unknown). For a
     /// string-command spawn this is the wrapping `/bin/sh`, not the app.
     pid: i32 = 0,
+    /// External display session (`display create`) — its child is the
+    /// keeper, so the "terminal" is meaningless; what matters is the
+    /// environment below.
+    display: bool = false,
+    /// Absolute path of the session's Wayland display socket, its
+    /// PULSE_SERVER value and its private runtime dir (empty = none).
+    /// An external renderer needs these and must never guess them.
+    wl_display: []const u8 = "",
+    pulse_server: []const u8 = "",
+    runtime_dir: []const u8 = "",
+    /// No-viewer TTL in seconds (0 = none).
+    ttl_secs: u32 = 0,
+    /// Attached viewers, and a label for the one holding the controller
+    /// lease ("" = nobody). The label is "<kind>#<client id>" — stable
+    /// for the life of the connection, meaningless across daemons.
+    viewers: u32 = 0,
+    controller: []const u8 = "",
 };
 
 const Session = struct {
@@ -223,6 +265,21 @@ const Session = struct {
     exit_status: i32 = 0,
     /// Spawned via `sketerm app -u` — a forwarded GUI app, not a shell.
     app: bool = false,
+    /// External display session: the child is the `--keep` keeper and
+    /// the session exists to own the Wayland/audio hubs for a process
+    /// sketerm never spawned.
+    display: bool = false,
+    /// No-viewer TTL (ms, 0 = none) and the monotonic stamp since when
+    /// this session has had no attached viewer (0 = one is attached
+    /// right now). Seeded at spawn so a session nobody ever attaches to
+    /// still expires.
+    ttl_ms: i64 = 0,
+    no_viewer_since_ms: i64 = 0,
+    /// The attached client currently allowed to drive this session's
+    /// Wayland seat (null = nobody). Every other viewer is read-only:
+    /// its input-shaped pipe units are dropped daemon-side. Cleared
+    /// when that client detaches or dies (see releaseControl).
+    controller: ?*Client = null,
     /// GPU opt-in (SpawnReq.gpu): the session's compositor announces
     /// linux-dmabuf and the child keeps its real GL driver.
     gpu: bool = false,
@@ -337,9 +394,20 @@ const Worker = struct {
     /// The SESSION's child pid on this host (not the worker's own pid) —
     /// carried in the 'Y' ready datagram so the spawn `.ok` can ship it.
     child_pid: i32 = 0,
+    display: bool = false,
+    ttl_secs: u32 = 0,
+    viewers: u32 = 0,
     /// Owned copies of the worker's last-pushed title / cwd (null = none yet).
     title: ?[]u8 = null,
     cwd: ?[]u8 = null,
+    /// Owned session environment paths, learned from the 'Y' ready
+    /// datagram (the broker never creates these — the worker owns the
+    /// hubs) and refreshed by 'M' pushes so `list` can serve them.
+    wl_display: ?[]u8 = null,
+    pulse_server: ?[]u8 = null,
+    runtime_dir: ?[]u8 = null,
+    /// Controller label pushed by the worker ("" / null = nobody).
+    controller: ?[]u8 = null,
     /// The worker's reported spawn-failure reason ('E' control datagram,
     /// sent just before it dies), surfaced in the deferred `.err` reply.
     spawn_err: ?[]u8 = null,
@@ -350,8 +418,31 @@ const Worker = struct {
         if (self.title) |t| self.allocator.free(t);
         if (self.cwd) |cw| self.allocator.free(cw);
         if (self.spawn_err) |e| self.allocator.free(e);
+        if (self.wl_display) |p| self.allocator.free(p);
+        if (self.pulse_server) |p| self.allocator.free(p);
+        if (self.runtime_dir) |p| self.allocator.free(p);
+        if (self.controller) |p| self.allocator.free(p);
         self.allocator.destroy(self);
     }
+
+    /// Replace an owned optional string field with a copy of `val`
+    /// ("" keeps the field null). Silently keeps the old value on OOM —
+    /// stale metadata beats losing the record.
+    fn setOwned(self: *Worker, slot: *?[]u8, val: []const u8) void {
+        if (val.len == 0) return;
+        const fresh = self.allocator.dupe(u8, val) catch return;
+        if (slot.*) |old| self.allocator.free(old);
+        slot.* = fresh;
+    }
+};
+
+/// Worker→broker 'Y' ready datagram (JSON). Older workers sent a bare
+/// decimal pid; `parseWorkerReady` accepts both.
+const WorkerReady = struct {
+    pid: i32 = 0,
+    wl: []const u8 = "",
+    pa: []const u8 = "",
+    rt: []const u8 = "",
 };
 
 /// Worker→broker metadata push payload (JSON over the 'M' control datagram).
@@ -367,6 +458,17 @@ const WorkerMeta = struct {
     child_pid: i32 = 0,
     title: []const u8 = "",
     cwd: []const u8 = "",
+    /// Session identity/environment the broker cannot observe itself
+    /// (it owns no Screen and creates no hubs) but must answer `list`
+    /// with. Paths repeat on every push — cheap, and it keeps the
+    /// broker correct after a restart-free worker re-setup.
+    display: bool = false,
+    ttl_secs: u32 = 0,
+    viewers: u32 = 0,
+    controller: []const u8 = "",
+    wl: []const u8 = "",
+    pa: []const u8 = "",
+    rt: []const u8 = "",
 };
 
 /// Worker-side throttle state for metadata pushes. Structural changes (client
@@ -380,6 +482,7 @@ const WorkerPush = struct {
     rows: u16 = 0,
     cols: u16 = 0,
     title_hash: u64 = 0,
+    controller_hash: u64 = 0,
     activity: i64 = 0,
     last_push_ms: i64 = 0,
 };
@@ -394,6 +497,11 @@ const Client = struct {
 
     allocator: std.mem.Allocator,
     fd: c_int,
+    /// Per-daemon monotonic connection id. Two jobs: it labels the
+    /// controller in list/inspect, and it orders viewers by AGE
+    /// (`clients` is swapRemove'd, so list position is not arrival
+    /// order) for the controller-death handover.
+    id: u32 = 0,
     rbuf: std.ArrayList(u8) = .empty,
     /// Ordinary mux traffic. Audio has its own priority lane so a large
     /// graphical commit cannot strand PCM behind the whole queued backlog.
@@ -431,6 +539,9 @@ const Client = struct {
     video: bool = false,
     /// Self-declared attach kind.
     kind: Kind = .unknown,
+    /// The client asked to view only: it never takes the controller
+    /// lease, not even when the session has none.
+    read_only: bool = false,
     /// Terminal `.events` were withheld because this client's wbuf
     /// exceeded EVENTS_BACKLOG (a flooding session vs a slow/idle
     /// consumer — e.g. an MCP client between tool calls). Once the
@@ -1382,6 +1493,8 @@ pub const Daemon = struct {
     fs_job_dir: []u8 = &.{},
     fs_jobs_restored: bool = false,
     next_chan_id: u32 = 1,
+    /// Monotonic client-connection id (controller labels + viewer age).
+    next_client_id: u32 = 1,
     /// Monotonic id for per-session Wayland socket paths (session
     /// names are user input — not path-safe).
     next_wl_id: u32 = 1,
@@ -1876,7 +1989,8 @@ pub const Daemon = struct {
             _ = c.close(fd);
             return;
         };
-        cl.* = .{ .allocator = self.allocator, .fd = fd };
+        cl.* = .{ .allocator = self.allocator, .fd = fd, .id = self.next_client_id };
+        self.next_client_id += 1;
         self.clients.append(self.allocator, cl) catch {
             cl.deinit();
             return;
@@ -1935,7 +2049,22 @@ pub const Daemon = struct {
                     snapshot.LEGACY_SNAPSHOT_VERSION;
                 const audio_channels = if (n >= 7) buf[6] != 0 else proto >= 5;
                 const winstream_channels = if (n >= 8) buf[7] != 0 else proto >= wire.WINSTREAM_PROTO_VERSION;
-                self.addPassedClient(passed, proto, video, kind, native_state_max, snapshot_version, audio_channels, winstream_channels);
+                // Bytes 8/9 (controller lease): absent = the historical
+                // "every viewer drives" request, i.e. take a free lease
+                // and never force a takeover.
+                const read_only = n >= 9 and buf[8] != 0;
+                const want_control = n >= 10 and buf[9] != 0;
+                self.addPassedClient(passed, .{
+                    .proto = proto,
+                    .video = video,
+                    .kind = kind,
+                    .native_state_max = native_state_max,
+                    .snapshot_version = snapshot_version,
+                    .audio_channels = audio_channels,
+                    .winstream_channels = winstream_channels,
+                    .read_only = read_only,
+                    .want_control = want_control,
+                });
             },
             'K' => {
                 for (self.clients.items) |cl| if (!cl.dead) cl.queueFrame(.gone, "");
@@ -1960,11 +2089,12 @@ pub const Daemon = struct {
         }
     }
 
-    /// Worker side: adopt a broker-passed client fd as a client attached to
-    /// our one session, and send it the attach snapshot.
-    fn addPassedClient(
-        self: *Daemon,
-        fd: c_int,
+    /// Decoded 'A' worker-handoff datagram. A struct rather than a
+    /// parameter list because every new attach-time client property has
+    /// to travel here — the broker-mode gotcha is that a field left out
+    /// of this hop makes the worker see a DEFAULT and the whole feature
+    /// silently never engage (monolith smokes stay green).
+    const PassedClient = struct {
         proto: u32,
         video: bool,
         kind: Client.Kind,
@@ -1972,7 +2102,13 @@ pub const Daemon = struct {
         snapshot_version: u8,
         audio_channels: bool,
         winstream_channels: bool,
-    ) void {
+        read_only: bool = false,
+        want_control: bool = false,
+    };
+
+    /// Worker side: adopt a broker-passed client fd as a client attached to
+    /// our one session, and send it the attach snapshot.
+    fn addPassedClient(self: *Daemon, fd: c_int, req: PassedClient) void {
         _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
         const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
         _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
@@ -1983,14 +2119,17 @@ pub const Daemon = struct {
         cl.* = .{
             .allocator = self.allocator,
             .fd = fd,
-            .proto = proto,
-            .snapshot_version = snapshot_version,
-            .native_state_max = native_state_max,
-            .audio_channels = audio_channels,
-            .winstream_channels = winstream_channels,
-            .video = video,
-            .kind = kind,
+            .id = self.next_client_id,
+            .proto = req.proto,
+            .snapshot_version = req.snapshot_version,
+            .native_state_max = req.native_state_max,
+            .audio_channels = req.audio_channels,
+            .winstream_channels = req.winstream_channels,
+            .video = req.video,
+            .kind = req.kind,
+            .read_only = req.read_only,
         };
+        self.next_client_id += 1;
         self.clients.append(self.allocator, cl) catch {
             cl.deinit();
             return;
@@ -1998,11 +2137,13 @@ pub const Daemon = struct {
         if (self.sessions.items.len == 0) return;
         const s = self.sessions.items[0];
         cl.attached = s;
-        log.info("client attached session='{s}' kind={s} proto={d} video={} (worker handoff)", .{ s.name, @tagName(kind), proto, video });
+        log.info("client attached session='{s}' kind={s} proto={d} video={} (worker handoff)", .{ s.name, @tagName(req.kind), req.proto, req.video });
         self.queueSnapshot(cl, s);
-        if (winstream_channels and s.winstream != null) self.openWinstreamChan(s, cl);
-        if (native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION or audio_channels) self.replayNativeChannels(cl, s);
+        if (req.winstream_channels and s.winstream != null) self.openWinstreamChan(s, cl);
+        if (req.native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION or req.audio_channels) self.replayNativeChannels(cl, s);
         self.refreshVideoGates();
+        _ = self.acquireControl(s, cl, req.want_control);
+        self.broadcastControlState(s);
         self.broadcastPeerInfo(s);
     }
 
@@ -2024,7 +2165,7 @@ pub const Daemon = struct {
         switch (buf[0]) {
             'Y' => {
                 w.ready = true;
-                if (n > 1) w.child_pid = std.fmt.parseInt(i32, buf[1..@intCast(n)], 10) catch 0;
+                if (n > 1) self.applyWorkerReady(w, buf[1..@intCast(n)]);
                 self.replyPendingSpawn(w, true);
             },
             'E' => {
@@ -2048,6 +2189,9 @@ pub const Daemon = struct {
                 w.app = m.app;
                 w.last_activity_ms = m.activity;
                 if (m.child_pid != 0) w.child_pid = m.child_pid;
+                w.display = m.display;
+                w.ttl_secs = m.ttl_secs;
+                w.viewers = m.viewers;
                 if (self.allocator.dupe(u8, m.title)) |t| {
                     if (w.title) |old| self.allocator.free(old);
                     w.title = t;
@@ -2056,9 +2200,41 @@ pub const Daemon = struct {
                     if (w.cwd) |old| self.allocator.free(old);
                     w.cwd = cw;
                 } else |_| {}
+                // A dropped lease must clear the cached label, so this
+                // one assigns even for "" (unlike setOwned's keep-old).
+                if (self.allocator.dupe(u8, m.controller)) |ctrl| {
+                    if (w.controller) |old| self.allocator.free(old);
+                    w.controller = if (ctrl.len > 0) ctrl else blk: {
+                        self.allocator.free(ctrl);
+                        break :blk null;
+                    };
+                } else |_| {}
+                w.setOwned(&w.wl_display, m.wl);
+                w.setOwned(&w.pulse_server, m.pa);
+                w.setOwned(&w.runtime_dir, m.rt);
             },
             else => {},
         }
+    }
+
+    /// Adopt a worker's 'Y' ready payload. Parsed DEFENSIVELY: the JSON
+    /// form is current, a bare decimal pid is what pre-JSON workers
+    /// sent, and anything else leaves the record untouched (a spawn
+    /// still succeeds — only the returned paths would be missing).
+    fn applyWorkerReady(self: *Daemon, w: *Worker, payload: []const u8) void {
+        if (payload.len > 0 and payload[0] == '{') {
+            var parsed = std.json.parseFromSlice(WorkerReady, self.allocator, payload, .{
+                .ignore_unknown_fields = true,
+                .allocate = .alloc_always,
+            }) catch return;
+            defer parsed.deinit();
+            w.child_pid = parsed.value.pid;
+            w.setOwned(&w.wl_display, parsed.value.wl);
+            w.setOwned(&w.pulse_server, parsed.value.pa);
+            w.setOwned(&w.runtime_dir, parsed.value.rt);
+            return;
+        }
+        w.child_pid = std.fmt.parseInt(i32, payload, 10) catch 0;
     }
 
     /// Resolve a worker's deferred spawn reply. `ok` = session up (`.ok`),
@@ -2070,7 +2246,14 @@ pub const Daemon = struct {
         for (self.clients.items) |c2| {
             if (c2 == cl and !c2.dead) {
                 if (ok) {
-                    c2.queueJson(.ok, .{ .ok = true, .name = w.name, .pid = w.child_pid });
+                    c2.queueJson(.ok, .{
+                        .ok = true,
+                        .name = w.name,
+                        .pid = w.child_pid,
+                        .wl_display = if (w.wl_display) |p| p else "",
+                        .pulse_server = if (w.pulse_server) |p| p else "",
+                        .runtime_dir = if (w.runtime_dir) |p| p else "",
+                    });
                 } else if (w.spawn_err) |reason| {
                     var ebuf: [192]u8 = undefined;
                     const msg = std.fmt.bufPrint(&ebuf, "spawn failed: {s}", .{reason}) catch "spawn failed";
@@ -2095,12 +2278,16 @@ pub const Daemon = struct {
         }
         const title: []const u8 = if (s.screen.last_title) |t| t else "";
         const th = std.hash.Wyhash.hash(0, title);
+        var ctrl_buf: [32]u8 = undefined;
+        const controller = self.controllerLabel(s, &ctrl_buf);
+        const ch = std.hash.Wyhash.hash(0, controller);
         const structural = !self.wpush.inited or
             n_clients != self.wpush.clients or
             s.exited != self.wpush.exited or
             s.screen.rows != self.wpush.rows or
             s.screen.cols != self.wpush.cols or
-            th != self.wpush.title_hash;
+            th != self.wpush.title_hash or
+            ch != self.wpush.controller_hash;
         const activity_moved = s.last_activity_ms != self.wpush.activity;
         const now = nowMs();
         if (!structural and !(activity_moved and now - self.wpush.last_push_ms >= 200)) return;
@@ -2120,6 +2307,13 @@ pub const Daemon = struct {
             // recv buffer (a SOCK_SEQPACKET over-long datagram is truncated).
             .title = title[0..@min(title.len, 256)],
             .cwd = cwd[0..@min(cwd.len, 1024)],
+            .display = s.display,
+            .ttl_secs = @intCast(@divTrunc(s.ttl_ms, 1000)),
+            .viewers = n_clients,
+            .controller = controller,
+            .wl = if (s.wl_display_path) |p| p else "",
+            .pa = if (s.pa_socket_path) |p| p else "",
+            .rt = if (s.runtime_dir_path) |p| p else "",
         };
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
@@ -2134,6 +2328,7 @@ pub const Daemon = struct {
             .rows = s.screen.rows,
             .cols = s.screen.cols,
             .title_hash = th,
+            .controller_hash = ch,
             .activity = s.last_activity_ms,
             .last_push_ms = now,
         };
@@ -2221,11 +2416,22 @@ pub const Daemon = struct {
             return err;
         };
         try self.sessions.append(allocator, s);
-        // 'Y' carries the session's child pid so the deferred spawn
-        // `.ok` can hand callers a debugger-attachable handle.
-        var ybuf: [16]u8 = undefined;
-        const ymsg = std.fmt.bufPrint(&ybuf, "Y{d}", .{s.pty.child_pid}) catch "Y";
-        controlSend(control_fd, ymsg, -1);
+        // 'Y' carries the session's child pid (a debugger-attachable
+        // handle) AND the hub paths it just created — the broker owns
+        // neither, and the spawn `.ok` must return them so an external
+        // renderer never has to guess a wl-w<pid> path.
+        var yaw: std.Io.Writer.Allocating = .init(allocator);
+        defer yaw.deinit();
+        if (yaw.writer.writeByte('Y')) |_| {
+            if (std.json.Stringify.value(WorkerReady{
+                .pid = s.pty.child_pid,
+                .wl = if (s.wl_display_path) |p| p else "",
+                .pa = if (s.pa_socket_path) |p| p else "",
+                .rt = if (s.runtime_dir_path) |p| p else "",
+            }, .{}, &yaw.writer)) |_| {
+                controlSend(control_fd, yaw.written(), -1);
+            } else |_| controlSend(control_fd, "Y", -1);
+        } else |_| controlSend(control_fd, "Y", -1);
         try self.run();
     }
 
@@ -2387,8 +2593,14 @@ pub const Daemon = struct {
                 const was = cl.attached;
                 cl.attached = null;
                 cl.queueJson(.ok, .{ .ok = true });
-                if (was) |s| self.broadcastPeerInfo(s);
+                if (was) |s| {
+                    // Detach BEFORE the release so the handover scan
+                    // cannot pick this client again.
+                    if (self.releaseControl(s, cl)) self.broadcastControlState(s);
+                    self.broadcastPeerInfo(s);
+                }
             },
+            .control_req => self.handleControlReq(cl, frame.payload),
             .input => {
                 const s = cl.attached orelse {
                     cl.queueErr("not attached");
@@ -2460,9 +2672,11 @@ pub const Daemon = struct {
                 const ch = self.findChannel(id) orelse return;
                 if (ch.dead) return;
                 if (ch.native != null) {
-                    // Any attached viewer may drive input (shared seat).
                     if (!nativeViewer(cl, ch.session.?)) return;
-                    return self.nativeClientData(ch, frame.payload[4..]);
+                    // Input-shaped units are gated on the controller
+                    // lease INSIDE nativeClientData (data-transfer
+                    // replies must keep flowing for every viewer).
+                    return self.nativeClientData(cl, ch, frame.payload[4..]);
                 }
                 if (ch.pa != null) {
                     if (!audioViewer(cl, ch.session.?)) return;
@@ -5794,13 +6008,41 @@ pub const Daemon = struct {
         return true;
     }
 
+    /// Input-shaped viewer→brain units: only the session's CONTROLLER
+    /// may send these. Deliberately excludes the data-transfer replies
+    /// (clip_send/clip_data/primary_data/drop_data) — those answer a
+    /// request the DAEMON made of that specific viewer, so gating them
+    /// on the lease would hang the initiator's clipboard, and the
+    /// selection OFFERS (offer_selection/offer_primary) plus set_scale,
+    /// which are a viewer describing ITSELF, not driving the app.
+    fn isSeatIntent(tag: wlpipe.Tag) bool {
+        return switch (tag) {
+            .seat_enter,
+            .seat_leave,
+            .seat_motion,
+            .seat_button,
+            .seat_axis,
+            .seat_kbd_enter,
+            .seat_kbd_leave,
+            .seat_key,
+            .seat_mods,
+            .configure,
+            .dismiss_popups,
+            .text_commit,
+            .request_close,
+            => true,
+            else => false,
+        };
+    }
+
     /// Viewer→daemon bytes on a native channel: seat intents drive
     /// the brain; clipboard units keep their legacy handling. Raw
     /// wl_msg from viewers is IGNORED — the daemon brain is the only
     /// protocol driver (a replica answering too would double-drive
     /// the app).
-    fn nativeClientData(self: *Daemon, ch: *Channel, bytes: []const u8) void {
+    fn nativeClientData(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const u8) void {
         const nv = ch.native.?;
+        const drives = isController(cl, ch.session.?);
         nv.unitbuf.appendSlice(nv.allocator, bytes) catch {
             self.closeChannel(ch, true);
             return;
@@ -5813,7 +6055,11 @@ pub const Daemon = struct {
             } orelse break;
             switch (peeled.unit.tag) {
                 .seat_enter, .seat_leave, .seat_motion, .seat_button, .seat_axis, .seat_kbd_enter, .seat_kbd_leave, .seat_key, .seat_mods, .configure, .dismiss_popups, .offer_selection, .offer_primary, .text_commit, .set_scale, .host_drop, .request_close => {
-                    nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload);
+                    // Non-controller input is DROPPED (not queued): a
+                    // stale pointer/key stream replayed later would be
+                    // worse than never having been sent.
+                    if (drives or !isSeatIntent(peeled.unit.tag))
+                        nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload);
                 },
                 .clip_send, .clip_data, .primary_data => self.applyAppUnit(ch, peeled.unit.tag, peeled.unit.payload),
                 else => {},
@@ -6073,9 +6319,10 @@ pub const Daemon = struct {
             return;
         }
         // Empty argv = "the daemon host's login shell" — remote
-        // clients can't know what's installed here.
+        // clients can't know what's installed here. A display session
+        // is exempt: spawnSession substitutes the keeper argv.
         const default_shell: []const []const u8 = &.{shell_util.accountLoginShell()};
-        if (req.argv.len == 0) {
+        if (req.argv.len == 0 and !req.display) {
             req.argv = default_shell;
             req.login_shell = true;
         }
@@ -6094,7 +6341,16 @@ pub const Daemon = struct {
             cl.queueErr("oom");
             return;
         };
-        cl.queueJson(.ok, .{ .ok = true, .name = s.name, .pid = s.pty.child_pid });
+        cl.queueJson(.ok, .{
+            .ok = true,
+            .name = s.name,
+            .pid = s.pty.child_pid,
+            // The session's environment: an external renderer must be
+            // handed these, never left to derive a wl-w<pid> path.
+            .wl_display = if (s.wl_display_path) |p| p else "",
+            .pulse_server = if (s.pa_socket_path) |p| p else "",
+            .runtime_dir = if (s.runtime_dir_path) |p| p else "",
+        });
     }
 
     fn brokerFindWorker(self: *Daemon, name: []const u8) ?*Worker {
@@ -6141,7 +6397,7 @@ pub const Daemon = struct {
             return;
         }
         const default_shell: []const []const u8 = &.{shell_util.accountLoginShell()};
-        if (req.argv.len == 0) {
+        if (req.argv.len == 0 and !req.display) {
             req.argv = default_shell;
             req.login_shell = true;
         }
@@ -6197,7 +6453,18 @@ pub const Daemon = struct {
             cl.queueErr("oom");
             return;
         };
-        w.* = .{ .allocator = self.allocator, .name = name_owned, .pid = pid, .control_fd = sp[0], .app = req.app, .pending_client = cl };
+        w.* = .{
+            .allocator = self.allocator,
+            .name = name_owned,
+            .pid = pid,
+            .control_fd = sp[0],
+            .app = req.app,
+            // Seeded from the request so `list` is right before the
+            // worker's first 'M' push lands.
+            .display = req.display,
+            .ttl_secs = req.ttl_secs,
+            .pending_client = cl,
+        };
         self.workers.append(self.allocator, w) catch {
             w.deinit();
             cl.queueErr("oom");
@@ -6240,6 +6507,11 @@ pub const Daemon = struct {
             cl.snapshot_version,
             @intFromBool(cl.audio_channels),
             @intFromBool(cl.winstream_channels),
+            // Controller-lease intent. The worker owns the lease (it
+            // owns the session), so these MUST ride the handoff — the
+            // broker's own Client is discarded a few lines below.
+            @intFromBool(parsed.value.read_only),
+            @intFromBool(parsed.value.control),
         };
         controlSend(w.control_fd, &msg, cl.fd);
         // Handed off: the kernel duplicated the fd into the worker. Drop our
@@ -6276,6 +6548,13 @@ pub const Daemon = struct {
                 .idle_ms = if (w.last_activity_ms == 0) 0 else now - w.last_activity_ms,
                 .cwd = if (w.cwd) |cw| cw else "",
                 .pid = w.child_pid,
+                .display = w.display,
+                .wl_display = if (w.wl_display) |p| p else "",
+                .pulse_server = if (w.pulse_server) |p| p else "",
+                .runtime_dir = if (w.runtime_dir) |p| p else "",
+                .ttl_secs = w.ttl_secs,
+                .viewers = w.viewers,
+                .controller = if (w.controller) |p| p else "",
             }) catch return;
         }
         cl.queueJson(.welcome, .{ .proto = cl.proto, .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
@@ -6455,8 +6734,22 @@ pub const Daemon = struct {
         };
     }
 
-    fn spawnSession(self: *Daemon, req: SpawnReq) !*Session {
+    fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
         const allocator = self.allocator;
+
+        // External display session: the child is OUR OWN binary in
+        // `--keep` mode. Resolved daemon-side on purpose — a client
+        // (possibly on another host, over SSH) cannot know this host's
+        // binary path, and a mismatched build would exit instantly and
+        // take the session with it.
+        var req = req_in;
+        var keep_exe: [4096:0]u8 = undefined;
+        var keep_argv: [2][]const u8 = undefined;
+        if (req.display) {
+            const exe = platform.exePathZ(&keep_exe) orelse return error.NoSelfExePath;
+            keep_argv = .{ exe, "--keep" };
+            req.argv = &keep_argv;
+        }
 
         // Wayland forwarding: the daemon IS the session's display —
         // it listens on the display socket itself and parses each app
@@ -6661,6 +6954,11 @@ pub const Daemon = struct {
             .pool = pool,
             .screen = screen,
             .app = req.app,
+            .display = req.display,
+            .ttl_ms = @as(i64, req.ttl_secs) * 1000,
+            // A session nobody ever attaches to must still expire, so
+            // the no-viewer clock starts now rather than at first detach.
+            .no_viewer_since_ms = nowMs(),
             .gpu = req.gpu,
             .kb_keymap = wlkeymaps.get(req.kb_layout) orelse blk: {
                 log.warn("unknown kb_layout '{s}' (have: {s}) — using us", .{ req.kb_layout, wlkeymaps.names });
@@ -6747,6 +7045,7 @@ pub const Daemon = struct {
         }
         cl.attached = s;
         log.info("client attach session='{s}' kind={s} proto={d}", .{ s.name, parsed.value.kind, cl.proto });
+        cl.read_only = parsed.value.read_only;
         cl.kind = if (std.mem.eql(u8, parsed.value.kind, "gui"))
             .gui
         else if (std.mem.eql(u8, parsed.value.kind, "cli"))
@@ -6772,7 +7071,130 @@ pub const Daemon = struct {
         if (cl.winstream_channels and s.winstream != null) self.openWinstreamChan(s, cl);
         if (cl.native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION or cl.audio_channels) self.replayNativeChannels(cl, s);
         self.refreshVideoGates();
+        _ = self.acquireControl(s, cl, parsed.value.control);
+        self.broadcastControlState(s);
         self.broadcastPeerInfo(s);
+    }
+
+    // ── controller lease ────────────────────────────────────────────
+    //
+    // A session's Wayland seat has exactly one driver. Every attached
+    // viewer still SEES the app (frames broadcast to all), but only the
+    // controller's input-shaped pipe units reach the brain. The first
+    // viewer that did not ask read-only takes a free lease; later ones
+    // are read-only until they ask for a takeover. The lease is not
+    // security — it is arbitration between an automation client and a
+    // human operator sharing one app.
+
+    /// Label for the current controller ("<kind>#<id>"), written into
+    /// `buf`. Empty when nobody holds the lease. Same shape in monolith
+    /// and worker so the broker can pass it through verbatim.
+    fn controllerLabel(self: *const Daemon, s: *const Session, buf: []u8) []const u8 {
+        _ = self;
+        const cl = s.controller orelse return "";
+        return std.fmt.bufPrint(buf, "{s}#{d}", .{ @tagName(cl.kind), cl.id }) catch "?";
+    }
+
+    fn viewerCount(self: *const Daemon, s: *const Session) u32 {
+        var n: u32 = 0;
+        for (self.clients.items) |cl| {
+            if (!cl.dead and cl.attached == s) n += 1;
+        }
+        return n;
+    }
+
+    /// Push the lease state to every attached client. Each recipient's
+    /// `controller` field is ITS OWN answer ("do I hold it"), so a
+    /// viewer that wanted control and lost the race learns it here
+    /// rather than by noticing its input does nothing.
+    fn broadcastControlState(self: *Daemon, s: *Session) void {
+        var buf: [32]u8 = undefined;
+        const label = self.controllerLabel(s, &buf);
+        const viewers = self.viewerCount(s);
+        for (self.clients.items) |cl| {
+            if (cl.dead or cl.attached != s) continue;
+            cl.queueJson(.control_state, .{
+                .controller = s.controller == cl,
+                .read_only = cl.read_only,
+                .controller_label = label,
+                .viewers = viewers,
+            });
+        }
+    }
+
+    /// True when `cl` may drive `s`'s seat.
+    fn isController(cl: *const Client, s: *const Session) bool {
+        return s.controller == cl;
+    }
+
+    /// Give `cl` the lease unless it asked read-only. `force` evicts the
+    /// current holder; without it a held lease is left alone. Returns
+    /// true when the lease CHANGED hands (caller broadcasts).
+    fn acquireControl(self: *Daemon, s: *Session, cl: *Client, force: bool) bool {
+        _ = self;
+        if (cl.read_only) return false;
+        if (s.controller == cl) return false;
+        if (s.controller != null and !force) return false;
+        s.controller = cl;
+        log.info("session '{s}': control -> {s}#{d}{s}", .{
+            s.name, @tagName(cl.kind), cl.id, if (force) " (takeover)" else "",
+        });
+        return true;
+    }
+
+    /// Drop `cl`'s lease (if it holds one) and hand it to the OLDEST
+    /// remaining eligible viewer — a controller vanishing must not leave
+    /// a dead session nobody can drive. Returns true when anything
+    /// changed. `cl == null` releases unconditionally.
+    fn releaseControl(self: *Daemon, s: *Session, cl: ?*Client) bool {
+        const holder = s.controller orelse return false;
+        if (cl) |c2| {
+            if (holder != c2) return false;
+        }
+        s.controller = null;
+        // Oldest = lowest connection id; the clients list is
+        // swapRemove'd, so its ORDER says nothing about age.
+        var next: ?*Client = null;
+        for (self.clients.items) |other| {
+            if (other == holder or other.dead or other.attached != s or other.read_only) continue;
+            if (next == null or other.id < next.?.id) next = other;
+        }
+        if (next) |n| {
+            s.controller = n;
+            log.info("session '{s}': control -> {s}#{d} (handover)", .{ s.name, @tagName(n.kind), n.id });
+        } else {
+            log.info("session '{s}': control released (no eligible viewer)", .{s.name});
+        }
+        return true;
+    }
+
+    fn handleControlReq(self: *Daemon, cl: *Client, payload: []const u8) void {
+        const s = cl.attached orelse {
+            cl.queueErr("not attached");
+            return;
+        };
+        var parsed = std.json.parseFromSlice(ControlReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch {
+            cl.queueErr("bad control request");
+            return;
+        };
+        defer parsed.deinit();
+        const op = parsed.value.op;
+        if (std.mem.eql(u8, op, "acquire") or std.mem.eql(u8, op, "takeover")) {
+            // A read-only viewer asking for control is opting back in.
+            cl.read_only = false;
+            _ = self.acquireControl(s, cl, std.mem.eql(u8, op, "takeover"));
+        } else if (std.mem.eql(u8, op, "release")) {
+            _ = self.releaseControl(s, cl);
+        } else {
+            cl.queueErr("unknown control op (want acquire|release|takeover)");
+            return;
+        }
+        // Broadcast even when nothing changed: the requester must learn
+        // the outcome, and repeating state to the others is harmless.
+        self.broadcastControlState(s);
     }
 
     /// Push the session's attach roster to every attached client.
@@ -7125,11 +7547,29 @@ pub const Daemon = struct {
             for (cwd_bufs.items) |b| self.allocator.free(b);
             cwd_bufs.deinit(self.allocator);
         }
+        // Controller labels, one small buffer per session, alive for the
+        // whole call (SessionInfo holds slices into them).
+        var ctrl_bufs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (ctrl_bufs.items) |b| self.allocator.free(b);
+            ctrl_bufs.deinit(self.allocator);
+        }
         const now = nowMs();
         for (self.sessions.items) |s| {
             var n_clients: u32 = 0;
             for (self.clients.items) |c2| {
                 if (c2.attached == s) n_clients += 1;
+            }
+            var controller: []const u8 = "";
+            {
+                var lbuf: [32]u8 = undefined;
+                const label = self.controllerLabel(s, &lbuf);
+                if (label.len > 0) {
+                    if (self.allocator.dupe(u8, label)) |owned| {
+                        ctrl_bufs.append(self.allocator, owned) catch {};
+                        controller = owned;
+                    } else |_| {}
+                }
             }
             var cwd: []const u8 = "";
             var scratch: [4096]u8 = undefined;
@@ -7150,6 +7590,13 @@ pub const Daemon = struct {
                 .idle_ms = now - s.last_activity_ms,
                 .cwd = cwd,
                 .pid = s.pty.child_pid,
+                .display = s.display,
+                .wl_display = if (s.wl_display_path) |p| p else "",
+                .pulse_server = if (s.pa_socket_path) |p| p else "",
+                .runtime_dir = if (s.runtime_dir_path) |p| p else "",
+                .ttl_secs = @intCast(@divTrunc(s.ttl_ms, 1000)),
+                .viewers = n_clients,
+                .controller = controller,
             }) catch return;
         }
         cl.queueJson(.welcome, .{ .proto = cl.proto, .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
@@ -7327,6 +7774,7 @@ pub const Daemon = struct {
     }
 
     fn removeSession(self: *Daemon, s: *Session) void {
+        s.controller = null;
         for (self.clients.items) |cl| {
             if (cl.attached == s) {
                 cl.attached = null;
@@ -7445,6 +7893,9 @@ pub const Daemon = struct {
     fn sessionExited(self: *Daemon, s: *Session) void {
         if (s.exited) return;
         s.exited = true;
+        // Nothing will ever drive this session again; keeping the
+        // pointer would only risk a dangle past the client reap.
+        s.controller = null;
         log.info("session '{s}' exited", .{s.name});
         // We reach here on PTY EOF/EIO: the child has exited but may
         // not be waitpid-able for another scheduler tick, and a single
@@ -7484,6 +7935,37 @@ pub const Daemon = struct {
                 }
                 cl.attached = null;
             }
+        }
+    }
+
+    /// Kill sessions whose no-viewer TTL has run out. A session with an
+    /// attached viewer keeps resetting the clock; one that has NEVER
+    /// been attached counts from spawn (see no_viewer_since_ms), so an
+    /// abandoned `display create` cannot leak a Wayland hub forever.
+    /// In broker mode this runs in the WORKER (which owns the session
+    /// and knows its viewers); its exit is what retires the record.
+    fn ttlSweep(self: *Daemon) void {
+        const now = nowMs();
+        for (self.sessions.items) |s| {
+            if (s.ttl_ms == 0 or s.exited) continue;
+            var attached = false;
+            for (self.clients.items) |cl| {
+                if (!cl.dead and cl.attached == s) {
+                    attached = true;
+                    break;
+                }
+            }
+            if (attached) {
+                s.no_viewer_since_ms = 0;
+                continue;
+            }
+            if (s.no_viewer_since_ms == 0) {
+                s.no_viewer_since_ms = now;
+                continue;
+            }
+            if (now - s.no_viewer_since_ms < s.ttl_ms) continue;
+            log.info("session '{s}': ttl expired ({d}s with no viewer)", .{ s.name, @divTrunc(s.ttl_ms, 1000) });
+            self.removeSession(s);
         }
     }
 
@@ -7624,17 +8106,29 @@ pub const Daemon = struct {
                 }
                 const was = cl.attached;
                 if (was) |s| log.info("client gone (session '{s}')", .{s.name});
+                // Release BEFORE the client is freed and removed: the
+                // handover scan compares against this pointer, and
+                // s.controller would otherwise dangle.
+                const lease_moved = if (was) |s| self.releaseControl(s, cl) else false;
                 _ = self.clients.swapRemove(i);
                 cl.deinit();
                 // Duplicate rosters (several deaths, one session) are
                 // harmless; correctness beats coalescing here.
                 if (was) |s| {
-                    if (!s.exited) self.broadcastPeerInfo(s);
+                    if (!s.exited) {
+                        if (lease_moved) self.broadcastControlState(s);
+                        self.broadcastPeerInfo(s);
+                    }
                 }
             } else {
                 i += 1;
             }
         }
+        // No-viewer TTL (SpawnReq.ttl_secs): runs before the removal
+        // sweep below so an expiring session is gone within this same
+        // reap. Dead clients were dropped just above, so the viewer
+        // count here is live.
+        self.ttlSweep();
         // Exited sessions are removed outright — sessionExited
         // already detached every client (defensively re-checked here
         // so a dangling cl.attached is impossible). Live sessions are
