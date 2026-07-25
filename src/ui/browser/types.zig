@@ -12,6 +12,7 @@ const fstransfer = @import("../../ipc/fstransfer.zig");
 const browser_model = @import("../../filebrowser/model.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
+const TabQuery = @import("search.zig").TabQuery;
 const TabSel = @import("selection.zig").TabSel;
 const TabView = @import("views.zig").TabView;
 const formatSpec = @import("../../filebrowser/paths.zig").formatSpec;
@@ -129,6 +130,13 @@ pub const WireJobEv = struct {
     mtime_ms: i64 = 0,
     matches: u64 = 0,
     truncated: bool = false,
+    /// Live-query status detail (ev == "ready").
+    watches: u64 = 0,
+    watch_limit: bool = false,
+    /// panelize: output lines that named nothing on disk, and the
+    /// command's own exit status (both on the done event).
+    rejected: u64 = 0,
+    exit_status: i64 = 0,
     hash: []const u8 = "",
     /// Bytes a staged partial contributed. Sticky: the helper reports
     /// it once and the daemon repeats it on every later event.
@@ -446,6 +454,11 @@ pub const BTab = struct {
     /// Live view narrowing (filter-as-you-type); persisted per tab.
     filter: []u8 = &.{},
     virtual_spec: []u8 = &.{},
+    /// The live/one-shot query filling this tab's flat rows, if any
+    /// (search.zig). Per TAB, not per view: several live queries stay
+    /// open and updating at once, and closing the tab cancels its own
+    /// job so no recursive watcher outlives the rows it feeds.
+    query: ?*TabQuery = null,
     /// Grouping, zoom and the collapsed-group set (views.zig).
     vs: TabView = .{},
     /// Sticky-click flag and visual-mode anchor (selection.zig).
@@ -561,6 +574,9 @@ pub const BTab = struct {
 
     pub fn deinit(self: *BTab) void {
         const a = self.view.allocator;
+        // Before anything else: a running query holds a host-side
+        // recursive watcher, which must not outlive this tab.
+        self.view.queryForget(self);
         self.view.cancelPendingDir(self.root);
         self.view.closeViewOf(self.hc, self.root);
         for (self.subdirs.items) |d| {
@@ -698,7 +714,11 @@ pub const PendingJob = struct {
     req: u32,
     hc: *HostConn,
     label: []u8,
-    kind: enum { normal, search, compare_left, compare_right, calc_size, dup_scan, archive_list, flat_view } = .normal,
+    kind: enum { normal, query, compare_left, compare_right, calc_size, dup_scan, archive_list } = .normal,
+    /// The tab whose query this job feeds (`.query` only). Validated
+    /// with `tabAlive` before use: a tab can close between the start
+    /// request and its reply.
+    tab: ?*BTab = null,
     undo_op: ?*UndoOp = null,
     undo_trash_orig: ?[]u8 = null,
     /// The done event's `path` opens when the job lands (archive

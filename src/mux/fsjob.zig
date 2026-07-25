@@ -84,6 +84,20 @@ const MAX_MATCHES_PER_FILE: usize = 200;
 const MAX_GREP_FILE: u64 = 8 << 20;
 const MAX_MATCH_LINE: usize = 300;
 
+/// Hard ceiling a caller's `max_matches` is clamped to.
+const MAX_MATCHES_CEILING: u64 = 200_000;
+
+fn matchCapOf(spec: Spec) usize {
+    if (spec.max_matches == 0) return MAX_MATCHES;
+    return @intCast(@min(spec.max_matches, MAX_MATCHES_CEILING));
+}
+
+/// Wall-clock milliseconds. Relative-time predicates compare against
+/// file mtimes, which are wall clock, so they cannot use nowMs().
+fn wallMs() i64 {
+    return @as(i64, c.time(null)) * 1000;
+}
+
 // ── progress emission ───────────────────────────────────────────
 
 fn emitRaw(line: []const u8) void {
@@ -1094,13 +1108,9 @@ fn runSearch(allocator: std.mem.Allocator, spec: Spec, content: bool) u8 {
     const lower = allocator.dupe(u8, spec.pattern) catch return emitError("out of memory");
     defer allocator.free(lower);
     for (lower) |*ch| ch.* = std.ascii.toLower(ch.*);
-    var state = SearchState{ .lower_pat = lower };
-    if (spec.max_matches > 0)
-        state.max_matches = @intCast(@min(spec.max_matches, 200_000));
-    if (spec.within_ms > 0) {
-        const now_ms: i64 = @as(i64, c.time(null)) * 1000;
-        state.min_mtime_ms = now_ms - @as(i64, @intCast(@min(spec.within_ms, 1 << 50)));
-    }
+    var state = SearchState{ .lower_pat = lower, .max_matches = matchCapOf(spec) };
+    if (spec.within_ms > 0)
+        state.min_mtime_ms = wallMs() - @as(i64, @intCast(@min(spec.within_ms, 1 << 50)));
     searchDir(allocator, spec.src, spec.pattern, content, &state);
     emit(.{
         .ev = "done",
@@ -1146,8 +1156,52 @@ fn searchDir(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []cons
     }
 }
 
+/// Output lines quoted back when they are not usable paths. The
+/// COUNT on the done event is exact; this only bounds how many of
+/// them travel as text.
+const MAX_PANEL_REJECTS: usize = 20;
+
+/// Turns a panelize command's output stream into rows. A line that
+/// does not resolve to something on disk is REJECTED, never dropped:
+/// commands print diagnostics, totals and "fatal: ..." on stdout too,
+/// and a listing that silently swallows them is a listing you cannot
+/// trust.
+const PanelOut = struct {
+    root: []const u8,
+    max_matches: usize = MAX_MATCHES,
+    matches: usize = 0,
+    rejected: u64 = 0,
+    quoted: usize = 0,
+    truncated: bool = false,
+
+    /// One delimited output item. Blank items are separator noise and
+    /// count as nothing at all.
+    fn take(self: *PanelOut, raw: []const u8) void {
+        const value = std.mem.trim(u8, raw, " \t\r");
+        if (value.len == 0) return;
+        if (self.matches >= self.max_matches) {
+            self.truncated = true;
+            return;
+        }
+        if (panelizeOne(self.root, value)) {
+            self.matches += 1;
+            return;
+        }
+        self.rejected += 1;
+        if (self.quoted < MAX_PANEL_REJECTS) {
+            self.quoted += 1;
+            emit(.{ .ev = "reject", .text = value[0..@min(value.len, MAX_MATCH_LINE)] });
+        }
+    }
+};
+
 /// Run an arbitrary host-side command and turn each LF- or NUL-delimited
 /// output path into an operable result entry. Relative paths use `src` as cwd.
+///
+/// A nonzero exit is REPORTED (`exit_status` on the done event), not
+/// treated as failure: `rg -l` exits 1 when nothing matched and `find`
+/// exits 1 on an unreadable subdirectory, and in both cases the rows
+/// that did arrive are the listing the user asked for.
 fn runPanelize(spec: Spec) u8 {
     if (spec.pattern.len == 0) return emitError("panelize needs command");
     var cwdz: [4096]u8 = undefined;
@@ -1168,10 +1222,10 @@ fn runPanelize(spec: Spec) u8 {
         c._exit(127);
     }
     _ = c.close(pipefd[1]);
+    var out = PanelOut{ .root = spec.src, .max_matches = matchCapOf(spec) };
     var item: [4096]u8 = undefined;
     var item_len: usize = 0;
-    var matches: usize = 0;
-    var truncated = false;
+    var overlong = false;
     var buf: [8192]u8 = undefined;
     while (true) {
         const n = c.read(pipefd[0], &buf, buf.len);
@@ -1179,74 +1233,271 @@ fn runPanelize(spec: Spec) u8 {
         if (n <= 0) break;
         for (buf[0..@intCast(n)]) |ch| {
             if (ch == '\n' or ch == 0) {
-                if (item_len > 0) {
-                    if (matches >= MAX_MATCHES) {
-                        truncated = true;
-                    } else {
-                        panelizeOne(spec.src, item[0..item_len]);
-                        matches += 1;
+                // A truncated item would resolve to the WRONG file, so
+                // the whole item is rejected rather than shortened.
+                if (overlong) {
+                    out.rejected += 1;
+                    if (out.quoted < MAX_PANEL_REJECTS) {
+                        out.quoted += 1;
+                        emit(.{ .ev = "reject", .text = "output item longer than 4096 bytes" });
                     }
-                }
+                } else out.take(item[0..item_len]);
                 item_len = 0;
+                overlong = false;
             } else if (item_len < item.len) {
                 item[item_len] = ch;
                 item_len += 1;
-            }
+            } else overlong = true;
         }
     }
-    if (item_len > 0 and matches < MAX_MATCHES) {
-        panelizeOne(spec.src, item[0..item_len]);
-        matches += 1;
-    }
+    if (item_len > 0 and !overlong) out.take(item[0..item_len]);
     _ = c.close(pipefd[0]);
     var st: c_int = 0;
     while (c.waitpid(pid, &st, 0) < 0 and std.posix.errno(@as(c_int, -1)) == .INTR) {}
-    if (!c.WIFEXITED(st) or c.WEXITSTATUS(st) != 0) return emitError("panel command failed");
-    emit(.{ .ev = "done", .done = matches, .total = matches, .matches = matches, .truncated = truncated });
+    const status: i64 = if (c.WIFEXITED(st)) c.WEXITSTATUS(st) else -1;
+    emit(.{
+        .ev = "done",
+        .done = out.matches,
+        .total = out.matches,
+        .matches = out.matches,
+        .truncated = out.truncated,
+        .rejected = out.rejected,
+        .exit_status = status,
+    });
     return 0;
 }
 
-fn panelizeOne(root: []const u8, value_raw: []const u8) void {
-    const value = std.mem.trim(u8, value_raw, " \t\r");
-    if (value.len == 0) return;
+/// Resolve one output item against the panel root and stream it as a
+/// row. @return false when it does not name anything on disk.
+fn panelizeOne(root: []const u8, value: []const u8) bool {
     var full_buf: [4096]u8 = undefined;
     const full = if (value[0] == '/')
         value
     else
-        std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ if (root.len == 1) "" else root, value }) catch return;
+        std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ if (root.len == 1) "" else root, value }) catch return false;
     var st: c.struct_stat = undefined;
-    if (!statOf(full, &st, false)) return;
+    if (!statOf(full, &st, false)) return false;
     emit(.{
         .ev = "match",
         .path = full,
         .kind = fsserve.kindOf(st.st_mode),
         .size = if (st.st_size > 0) @as(u64, @intCast(st.st_size)) else 0,
+        .mtime_ms = fsserve.mtimeMs(&st),
     });
+    return true;
 }
+
+
+// ── live queries ────────────────────────────────────────────────
+
+/// Directories watched at once. A recursive watch costs kernel memory
+/// per directory, so a query over a huge tree stops adding watches --
+/// and SAYS so on its status event rather than silently going deaf.
+const MAX_LIVE_WATCHES: usize = 8192;
+
+/// Longest a query with a relative-time predicate sleeps between
+/// deadline checks. The sleep normally runs to the nearest expiry;
+/// this only bounds how stale a wall-clock jump (NTP step, suspend,
+/// DST) can leave the view.
+const MAX_LIVE_SLEEP_MS: i64 = 5 * 60 * 1000;
 
 const LiveWatch = struct { wd: c_int, path: []u8 };
 
-fn addLiveDir(allocator: std.mem.Allocator, watcher: *fsserve.Watcher, watches: *std.ArrayList(LiveWatch), path: []const u8, pattern: []const u8, initial: bool) void {
-    if (watches.items.len >= 8192) return;
+/// A live filename query: the watch set, the paths currently matching,
+/// and -- for a relative-time predicate -- when each of those stops
+/// matching.
+///
+/// Time predicates are re-evaluated by DEADLINE, never by rescanning.
+/// Every match knows the wall-clock instant its mtime leaves the
+/// window; the poll sleeps until the nearest one, and the wakeup is an
+/// integer scan of the tracked set with no readdir and no stat. A tree
+/// is walked exactly once, at startup.
+const LiveState = struct {
+    allocator: std.mem.Allocator,
+    watcher: *fsserve.Watcher,
+    pattern: []const u8,
+    /// 0 = no time predicate; matches then never expire.
+    within_ms: u64 = 0,
+    max_matches: usize = MAX_MATCHES,
+    watches: std.ArrayList(LiveWatch) = .empty,
+    /// Matching path -> expiry instant (0 = never). Owns its keys, and
+    /// IS the row set the client is showing: the caps below are about
+    /// this set, not about a cumulative count, so a query that runs
+    /// for a week never truncates itself over churn.
+    matched: std.StringHashMapUnmanaged(i64) = .empty,
+    truncated: bool = false,
+    watch_limit: bool = false,
+    /// A bound was newly hit; the status event needs re-sending.
+    status_dirty: bool = false,
+
+    fn deinit(self: *LiveState) void {
+        for (self.watches.items) |w| self.allocator.free(w.path);
+        self.watches.deinit(self.allocator);
+        var it = self.matched.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.matched.deinit(self.allocator);
+    }
+
+    /// The instant a file with this mtime leaves the query window
+    /// (0 = there is no window).
+    fn expiryOf(self: *const LiveState, mtime_ms: i64) i64 {
+        if (self.within_ms == 0) return 0;
+        return mtime_ms +| @as(i64, @intCast(@min(self.within_ms, 1 << 50)));
+    }
+
+    fn fresh(self: *const LiveState, mtime_ms: i64, now: i64) bool {
+        return self.within_ms == 0 or self.expiryOf(mtime_ms) > now;
+    }
+
+    fn pathOf(self: *const LiveState, wd: c_int) ?[]const u8 {
+        for (self.watches.items) |w| {
+            if (w.wd == wd) return w.path;
+        }
+        return null;
+    }
+
+    /// Stream one match, or refresh a row already on screen. Repeating
+    /// a match is deliberate: the client upserts by path, so a write
+    /// that changed size or mtime updates the row in place.
+    fn add(self: *LiveState, path: []const u8, kind: []const u8, size: u64, mtime_ms: i64) void {
+        const expiry = self.expiryOf(mtime_ms);
+        if (self.matched.getPtr(path)) |slot| {
+            slot.* = expiry;
+        } else {
+            if (self.matched.count() >= self.max_matches) {
+                if (!self.truncated) {
+                    self.truncated = true;
+                    self.status_dirty = true;
+                }
+                return;
+            }
+            const owned = self.allocator.dupe(u8, path) catch return;
+            self.matched.put(self.allocator, owned, expiry) catch {
+                self.allocator.free(owned);
+                return;
+            };
+        }
+        emit(.{ .ev = "match", .path = path, .kind = kind, .size = size, .mtime_ms = mtime_ms });
+    }
+
+    /// Drop exactly `path`. Silent when it was not a match: an unmatch
+    /// for a row the client never had is pure noise.
+    fn removeOne(self: *LiveState, path: []const u8) void {
+        const kv = self.matched.fetchRemove(path) orelse return;
+        emit(.{ .ev = "unmatch", .path = kv.key });
+        self.allocator.free(kv.key);
+    }
+
+    /// Drop `path` AND everything under it. A directory moved out of
+    /// the tree delivers no per-child event, so its rows would
+    /// otherwise linger forever under a name that no longer exists.
+    fn removeTree(self: *LiveState, path: []const u8) void {
+        self.removeOne(path);
+        var doomed: std.ArrayList([]const u8) = .empty;
+        defer doomed.deinit(self.allocator);
+        var it = self.matched.keyIterator();
+        while (it.next()) |k| {
+            const key = k.*;
+            if (key.len > path.len and std.mem.startsWith(u8, key, path) and key[path.len] == '/')
+                doomed.append(self.allocator, key) catch {};
+        }
+        for (doomed.items) |key| self.removeOne(key);
+        self.dropWatchesUnder(path);
+    }
+
+    fn dropWatchesUnder(self: *LiveState, path: []const u8) void {
+        var i: usize = 0;
+        while (i < self.watches.items.len) {
+            const w = self.watches.items[i];
+            const under = std.mem.eql(u8, w.path, path) or
+                (w.path.len > path.len and std.mem.startsWith(u8, w.path, path) and w.path[path.len] == '/');
+            if (!under) {
+                i += 1;
+                continue;
+            }
+            self.watcher.remove(w.wd);
+            self.allocator.free(w.path);
+            _ = self.watches.swapRemove(i);
+        }
+    }
+
+    /// Drop every match whose time predicate has run out.
+    fn expire(self: *LiveState, now: i64) void {
+        if (self.within_ms == 0) return;
+        var doomed: std.ArrayList([]const u8) = .empty;
+        defer doomed.deinit(self.allocator);
+        var it = self.matched.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.* != 0 and kv.value_ptr.* <= now)
+                doomed.append(self.allocator, kv.key_ptr.*) catch {};
+        }
+        for (doomed.items) |key| self.removeOne(key);
+    }
+
+    /// Poll timeout: milliseconds until the earliest match ages out.
+    /// -1 (sleep forever) whenever there is no time predicate at all.
+    fn sleepMs(self: *const LiveState, now: i64) c_int {
+        if (self.within_ms == 0) return -1;
+        var soonest: i64 = 0;
+        var it = self.matched.valueIterator();
+        while (it.next()) |v| {
+            if (v.* == 0) continue;
+            if (soonest == 0 or v.* < soonest) soonest = v.*;
+        }
+        if (soonest == 0) return @intCast(MAX_LIVE_SLEEP_MS);
+        const delta = soonest - now;
+        if (delta <= 0) return 0;
+        return @intCast(@min(delta, MAX_LIVE_SLEEP_MS));
+    }
+
+    /// The query's status line: rows streamed, directories watched, and
+    /// whether either bound was hit. Sent once the initial scan is done
+    /// and again whenever a bound is newly reached.
+    fn emitStatus(self: *LiveState) void {
+        self.status_dirty = false;
+        emit(.{
+            .ev = "ready",
+            .matches = self.matched.count(),
+            .watches = self.watches.items.len,
+            .truncated = self.truncated,
+            .watch_limit = self.watch_limit,
+        });
+    }
+};
+
+/// Watch `path`, stream the entries in it that match, and recurse.
+fn liveScanDir(st: *LiveState, path: []const u8) void {
+    if (st.watches.items.len >= MAX_LIVE_WATCHES) {
+        if (!st.watch_limit) {
+            st.watch_limit = true;
+            st.status_dirty = true;
+        }
+        return;
+    }
     var z: [4096]u8 = undefined;
     const pz = pathz.pathZ(&z, path) catch return;
-    const wd = watcher.add(pz);
+    const wd = st.watcher.add(pz);
     if (wd < 0) return;
-    for (watches.items) |w| if (w.wd == wd) return;
-    const owned = allocator.dupe(u8, path) catch return;
-    watches.append(allocator, .{ .wd = wd, .path = owned }) catch {
-        allocator.free(owned);
+    // inotify hands back the SAME descriptor for a directory already
+    // watched, which is how re-entering a known subtree costs nothing.
+    for (st.watches.items) |w| {
+        if (w.wd == wd) return;
+    }
+    const owned = st.allocator.dupe(u8, path) catch return;
+    st.watches.append(st.allocator, .{ .wd = wd, .path = owned }) catch {
+        st.allocator.free(owned);
         return;
     };
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    var arena = std.heap.ArenaAllocator.init(st.allocator);
     defer arena.deinit();
     const listing = fsserve.listDir(arena.allocator(), path, fsserve.MAX_ENTRIES) catch return;
+    const now = wallMs();
     for (listing.entries) |e| {
         var full_buf: [4096]u8 = undefined;
         const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ if (path.len == 1) "" else path, e.name }) catch continue;
-        if (initial and nameMatches(pattern, e.name))
-            emit(.{ .ev = "match", .path = full, .kind = e.kind, .size = e.size });
-        if (std.mem.eql(u8, e.kind, "dir")) addLiveDir(allocator, watcher, watches, full, pattern, initial);
+        if (nameMatches(st.pattern, e.name) and st.fresh(e.mtime_ms, now))
+            st.add(full, e.kind, e.size, e.mtime_ms);
+        if (std.mem.eql(u8, e.kind, "dir")) liveScanDir(st, full);
     }
 }
 
@@ -1258,49 +1509,78 @@ fn runLiveFind(allocator: std.mem.Allocator, spec: Spec) u8 {
     var watcher: fsserve.Watcher = .{};
     defer watcher.deinit();
     if (!watcher.ensure()) return emitError("cannot create filesystem watcher");
-    var watches: std.ArrayList(LiveWatch) = .empty;
-    defer {
-        for (watches.items) |w| allocator.free(w.path);
-        watches.deinit(allocator);
-    }
-    addLiveDir(allocator, &watcher, &watches, spec.src, spec.pattern, true);
-    emit(.{ .ev = "ready", .done = watches.items.len, .total = watches.items.len });
+    var st = LiveState{
+        .allocator = allocator,
+        .watcher = &watcher,
+        .pattern = spec.pattern,
+        .within_ms = spec.within_ms,
+        .max_matches = matchCapOf(spec),
+    };
+    defer st.deinit();
+    liveScanDir(&st, spec.src);
+    st.emitStatus();
     var buf: [32 * 1024]u8 = undefined;
     while (true) {
-        var pfd = c.struct_pollfd{ .fd = watcher.fd, .events = c.POLLIN, .revents = 0 };
-        const pr = c.poll(&pfd, 1, -1);
-        if (pr < 0 and std.posix.errno(pr) == .INTR) continue;
-        if (pr <= 0) return emitError("watcher stopped");
-        const n = c.read(watcher.fd, &buf, buf.len);
-        if (n < 0 and std.posix.errno(n) == .INTR) continue;
-        if (n <= 0) return emitError("watcher read failed");
-        var it = fsserve.EventIter{ .buf = buf[0..@intCast(n)] };
-        while (it.next()) |ev| {
-            if (ev.isOverflow()) {
-                emit(.{ .ev = "resync" });
-                continue;
-            }
-            const parent = for (watches.items) |w| {
-                if (w.wd == ev.wd) break w.path;
-            } else continue;
-            if (ev.name.len == 0) continue;
-            var full_buf: [4096]u8 = undefined;
-            const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ if (parent.len == 1) "" else parent, ev.name }) catch continue;
-            var z: [4096]u8 = undefined;
-            var st: c.struct_stat = undefined;
-            if (c.lstat(pathz.pathZ(&z, full) catch continue, &st) != 0) {
-                emit(.{ .ev = "unmatch", .path = full });
-                continue;
-            }
-            const kind = fsserve.kindOf(st.st_mode);
-            if (nameMatches(spec.pattern, ev.name)) {
-                emit(.{ .ev = "match", .path = full, .kind = kind, .size = if (st.st_size > 0) @as(u64, @intCast(st.st_size)) else 0 });
-            } else {
-                emit(.{ .ev = "unmatch", .path = full });
-            }
-            if (std.mem.eql(u8, kind, "dir")) addLiveDir(allocator, &watcher, &watches, full, spec.pattern, true);
+        // stdout rides the poll set purely for its hangup: a copy keeps
+        // running when the daemon dies (durability), but a live query
+        // with no one left to stream to is a recursive watcher held
+        // open forever for nobody.
+        var pfds = [_]c.struct_pollfd{
+            .{ .fd = watcher.fd, .events = c.POLLIN, .revents = 0 },
+            .{ .fd = 1, .events = 0, .revents = 0 },
+        };
+        const pr = c.poll(&pfds, 2, st.sleepMs(wallMs()));
+        if (pr < 0) {
+            if (std.posix.errno(pr) == .INTR) continue;
+            return emitError("watcher poll failed");
         }
+        if (pfds[1].revents & (c.POLLERR | c.POLLHUP | c.POLLNVAL) != 0) return 0;
+        if (pfds[0].revents != 0) {
+            const n = c.read(watcher.fd, &buf, buf.len);
+            if (n < 0 and std.posix.errno(n) == .INTR) continue;
+            if (n <= 0) return emitError("watcher read failed");
+            var it = fsserve.EventIter{ .buf = buf[0..@intCast(n)] };
+            while (it.next()) |ev| liveEvent(&st, ev);
+        }
+        // Checked after an event batch too, not just after a timeout:
+        // a busy tree can keep the poll returning readable straight
+        // through a deadline.
+        st.expire(wallMs());
+        if (st.status_dirty) st.emitStatus();
     }
+}
+
+fn liveEvent(st: *LiveState, ev: fsserve.InoEvent) void {
+    if (ev.isOverflow()) return emit(.{ .ev = "resync" });
+    const parent = st.pathOf(ev.wd) orelse return;
+    // removeTree frees the watch paths, so the parent has to be copied
+    // out before anything can invalidate it.
+    var parent_buf: [4096]u8 = undefined;
+    if (parent.len > parent_buf.len) return;
+    @memcpy(parent_buf[0..parent.len], parent);
+    const dir = parent_buf[0..parent.len];
+    if (ev.isSelfGone()) return st.removeTree(dir);
+    if (ev.name.len == 0) return;
+
+    var full_buf: [4096]u8 = undefined;
+    const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ if (dir.len == 1) "" else dir, ev.name }) catch return;
+    var z: [4096]u8 = undefined;
+    const fz = pathz.pathZ(&z, full) catch return;
+    var stt: c.struct_stat = undefined;
+    if (c.lstat(fz, &stt) != 0) return st.removeTree(full);
+    const kind = fsserve.kindOf(stt.st_mode);
+    const mtime_ms = fsserve.mtimeMs(&stt);
+    if (nameMatches(st.pattern, ev.name) and st.fresh(mtime_ms, wallMs())) {
+        st.add(full, kind, if (stt.st_size > 0) @as(u64, @intCast(stt.st_size)) else 0, mtime_ms);
+    } else {
+        // Only this entry stopped matching. Its children (a directory
+        // that never matched the pattern still holds matching files)
+        // are untouched.
+        st.removeOne(full);
+    }
+    // A directory that appeared -- or that was moved in under a new
+    // name -- has to be watched and listed, matching or not.
+    if (std.mem.eql(u8, kind, "dir")) liveScanDir(st, full);
 }
 
 /// Line-based case-insensitive content scan; binary files (NUL in

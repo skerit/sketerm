@@ -8,6 +8,7 @@ const browser_model = @import("../../filebrowser/model.zig");
 const fsjob = @import("../../mux/fsjob.zig");
 const grouping = @import("../../filebrowser/grouping.zig");
 const profile = @import("../../util/profile.zig");
+const searchmod = @import("search.zig");
 const views = @import("views.zig");
 
 const colkeys = @import("../../filebrowser/colkeys.zig");
@@ -55,21 +56,22 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
             self.renderList(tab);
         },
     }
-    var count_buf: [240]u8 = undefined;
+    var count_buf: [560]u8 = undefined;
     // Its own buffer: a note printed into count_buf would be
     // overwritten by the print that reads it.
     var note_buf: [96]u8 = undefined;
     const note = mediaSortNote(tab, &note_buf);
+    // The query note rides every render on purpose: a truncated result
+    // or a panel line that was not a path has to stay visible, not be
+    // erased by whatever status message comes next.
+    var query_buf: [200]u8 = undefined;
+    const qnote = searchmod.queryNote(tab, &query_buf);
     const cmsg = if (tab.filter.len > 0)
-        std.fmt.bufPrint(&count_buf, "showing {d} of {d} items (filter \"{s}\"){s}", .{
-            tab.vs.shown, tab.vs.total, tab.filter[0..@min(tab.filter.len, 48)], note,
+        std.fmt.bufPrint(&count_buf, "showing {d} of {d} items (filter \"{s}\"){s}{s}", .{
+            tab.vs.shown, tab.vs.total, tab.filter[0..@min(tab.filter.len, 48)], note, qnote,
         }) catch ""
     else
-        std.fmt.bufPrint(&count_buf, "{d} items{s}{s}", .{
-            tab.vs.total,
-            if (self.views.flat_tab == tab) @as([]const u8, " (flat view)") else "",
-            note,
-        }) catch "";
+        std.fmt.bufPrint(&count_buf, "{d} items{s}{s}", .{ tab.vs.total, note, qnote }) catch "";
     self.setStatus(cmsg);
 
     // Fetching runs LAST: the rows it measures against are the ones

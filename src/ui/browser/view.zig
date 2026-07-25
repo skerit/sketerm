@@ -169,9 +169,12 @@ pub const BrowserView = struct {
     places_on: bool = false,
     bookmarks: std.ArrayList([]u8) = .empty,
     recent: std.ArrayList([]u8) = .empty,
-    /// Saved searches (persisted with places).
+    /// Saved queries (persisted with places): the root spec plus the
+    /// query text exactly as typed. A live query and a one-shot search
+    /// are ONE concept here -- what a query text means is decided by
+    /// filebrowser/query.zig when it runs, not by a stored mode.
     saved_searches: std.ArrayList(OwnedSearch) = .empty,
-    /// The most recent search run (owned), for the save button.
+    /// The most recent query run (owned), for the save button.
     last_search: ?OwnedSearch = null,
     /// Relative-time filter for the NEXT find job ("@7d pattern").
     search_within_ms: u64 = 0,
@@ -199,10 +202,6 @@ pub const BrowserView = struct {
     /// Live $EDITOR batch-rename session (at most one).
     editor_rename: ?*EditorRename = null,
     switch_idle: c.guint = 0,
-    /// Running search job (0 = none) and its host + results tab.
-    search_job: u64 = 0,
-    search_hc: ?*HostConn = null,
-    search_tab: ?*BTab = null,
     /// The one open register tab (its register name lives in the
     /// tab's `virtual_spec`).
     register_tab: ?*BTab = null,
@@ -401,8 +400,6 @@ pub const BrowserView = struct {
     pub const toggleFlat = @import("views.zig").toggleFlat;
     pub const startFlat = @import("views.zig").startFlat;
     pub const stopFlat = @import("views.zig").stopFlat;
-    pub const flatForget = @import("views.zig").flatForget;
-    pub const flatConsumeEvent = @import("views.zig").flatConsumeEvent;
     pub const applyFolderMemory = @import("views.zig").applyFolderMemory;
     pub const rememberFolder = @import("views.zig").rememberFolder;
     pub const forgetFolder = @import("views.zig").forgetFolder;
@@ -420,7 +417,9 @@ pub const BrowserView = struct {
     pub const cancelVisual = @import("selection.zig").cancelVisual;
     pub const visualForget = @import("selection.zig").visualForget;
     pub const markDialog = @import("selection.zig").markDialog;
+    pub const markResultsDialog = @import("selection.zig").markResultsDialog;
     pub const markPaths = @import("selection.zig").markPaths;
+    pub const markEntries = @import("selection.zig").markEntries;
     pub const registerTab = @import("selection.zig").registerTab;
     pub const appendRegisterRow = @import("selection.zig").appendRegisterRow;
     pub const selectRegisterHere = @import("selection.zig").selectRegisterHere;
@@ -624,10 +623,17 @@ pub const BrowserView = struct {
     pub const addBookmark = @import("places.zig").addBookmark;
     pub const recordRecentSpec = @import("places.zig").recordRecentSpec;
 
-    // search.zig -- find/grep, duplicate finder
+    // search.zig -- live queries, greps, panels, duplicate finder
     pub const startSearch = @import("search.zig").startSearch;
-    pub const onSearchMatch = @import("search.zig").onSearchMatch;
-    pub const onSearchUnmatch = @import("search.zig").onSearchUnmatch;
+    pub const runQuery = @import("search.zig").runQuery;
+    pub const queryStart = @import("search.zig").queryStart;
+    pub const queryForget = @import("search.zig").queryForget;
+    pub const queryStarted = @import("search.zig").queryStarted;
+    pub const queryConsumeEvent = @import("search.zig").queryConsumeEvent;
+    pub const promoteResults = @import("search.zig").promoteResults;
+    pub const onPresetClicked = @import("search.zig").onPresetClicked;
+    pub const onPresetPicked = @import("search.zig").onPresetPicked;
+    pub const onPromoteClicked = @import("search.zig").onPromoteClicked;
     pub const startDupScan = @import("search.zig").startDupScan;
     pub const dupConsumeEvent = @import("search.zig").dupConsumeEvent;
     pub const dupStartHashPhase = @import("search.zig").dupStartHashPhase;
@@ -1029,13 +1035,21 @@ pub const BrowserView = struct {
         c.gtk_widget_set_margin_bottom(sbar, 4);
         const sentry = c.gtk_entry_new();
         c.gtk_widget_set_hexpand(sentry, 1);
-        c.gtk_entry_set_placeholder_text(@ptrCast(sentry), "name/glob, content toggle, or !command to panelize host output");
+        c.gtk_entry_set_placeholder_text(@ptrCast(sentry), "name/glob (live), @7d for a time window, or !command to panelize host output");
         _ = c.g_signal_connect_data(sentry, "activate", @ptrCast(&onSearchActivate), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(sbar), sentry);
         const scontent = c.gtk_check_button_new_with_label("in contents");
         c.gtk_box_append(@ptrCast(sbar), scontent);
+        const spreset = c.gtk_button_new_from_icon_name("utilities-terminal-symbolic");
+        c.gtk_widget_set_tooltip_text(spreset, "Panelize presets: browse a command's output as a listing");
+        _ = c.g_signal_connect_data(spreset, "clicked", @ptrCast(&onPresetClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(sbar), spreset);
+        const spromote = c.gtk_button_new_from_icon_name("folder-saved-search-symbolic");
+        c.gtk_widget_set_tooltip_text(spromote, "Keep these results: mark every row into a named register");
+        _ = c.g_signal_connect_data(spromote, "clicked", @ptrCast(&onPromoteClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(sbar), spromote);
         const ssave = c.gtk_button_new_from_icon_name("starred-symbolic");
-        c.gtk_widget_set_tooltip_text(ssave, "Save the last search (shows in the Places sidebar)");
+        c.gtk_widget_set_tooltip_text(ssave, "Save this query (shows in the Places sidebar, reopens live)");
         _ = c.g_signal_connect_data(ssave, "clicked", @ptrCast(&onSaveSearchClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(sbar), ssave);
         c.gtk_widget_set_visible(sbar, 0);

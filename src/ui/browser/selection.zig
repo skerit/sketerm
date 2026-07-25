@@ -106,7 +106,7 @@ pub const RegCtx = struct {
     allocator: std.mem.Allocator,
     view: *BrowserView,
     name: []u8,
-    action: enum { open, select_here, copy_here, delete, forget, mark_named },
+    action: enum { open, select_here, copy_here, delete, forget, mark_named, mark_results },
     popover: ?*c.GtkWidget = null,
     entry: ?*c.GtkWidget = null,
 
@@ -423,19 +423,47 @@ fn markTargets(ctx: *MenuCtx, one: *[1][]u8) []const []u8 {
     return one[0..1];
 }
 
-/// Mark `paths` (all on `tab`'s host) into the named register.
+/// Mark `paths` (all on `tab`'s host) into the named register. The
+/// directory flag comes from the tab's own listing, which is why this
+/// takes paths rather than register entries.
 pub fn markPaths(self: *BrowserView, tab: *BTab, name: []const u8, paths: []const []u8) void {
-    const store = regStore(self);
     var added: usize = 0;
     var full = false;
+    const store = regStore(self);
     for (paths) |p| {
-        const is_dir = if (entryForPath(tab, p)) |e| e.tdir else false;
-        switch (store.add(name, .{ .host = tab.hc.host orelse "", .path = p, .dir = is_dir })) {
+        switch (store.add(name, .{
+            .host = tab.hc.host orelse "",
+            .path = p,
+            .dir = if (entryForPath(tab, p)) |e| e.tdir else false,
+        })) {
             .added => added += 1,
             .full => full = true,
             else => {},
         }
     }
+    reportMarks(self, name, added, full);
+}
+
+/// Mark explicit (host, path, dir) records. A query results tab knows
+/// its own row kinds -- its rows are not entries of any listed
+/// directory, so entryForPath cannot answer for them.
+pub fn markEntries(self: *BrowserView, name: []const u8, items: []const registers.Entry) void {
+    var added: usize = 0;
+    var full = false;
+    const store = regStore(self);
+    for (items) |item| {
+        switch (store.add(name, item)) {
+            .added => added += 1,
+            .full => full = true,
+            else => {},
+        }
+    }
+    reportMarks(self, name, added, full);
+}
+
+/// Persist and report the outcome of a marking run.
+fn reportMarks(self: *BrowserView, name: []const u8, added: usize, full: bool) void {
+    const store = regStore(self);
     store.save();
     rememberName(self, name);
     if (full) {
@@ -801,9 +829,28 @@ pub fn markDialog(self: *BrowserView) void {
         self.setStatus("select something first, then mark it into a register");
         return;
     }
+    openMarkDialog(self, .mark_named);
+}
+
+/// The same dialog, marking every ROW of a query results tab rather
+/// than the selection: a search or panel result becomes a keepable
+/// named set that outlives the tab and the GUI process.
+pub fn markResultsDialog(self: *BrowserView) void {
+    const tab = self.currentTab() orelse return;
+    if (!tab.root.flat or tab.root.entries.items.len == 0) {
+        self.setStatus("run a query first: this keeps its whole result set in a register");
+        return;
+    }
+    openMarkDialog(self, .mark_results);
+}
+
+fn openMarkDialog(self: *BrowserView, action: @TypeOf(@as(RegCtx, undefined).action)) void {
     const popover = c.gtk_popover_new();
     const entry = c.gtk_entry_new();
-    c.gtk_entry_set_placeholder_text(@ptrCast(entry), "register name (Enter marks the selection)");
+    c.gtk_entry_set_placeholder_text(@ptrCast(entry), if (action == .mark_results)
+        "register name (Enter keeps every result row)"
+    else
+        "register name (Enter marks the selection)");
     var z: [registers.MAX_NAME + 1:0]u8 = undefined;
     const def = defaultName(self);
     const n = @min(def.len, z.len - 1);
@@ -819,7 +866,7 @@ pub fn markDialog(self: *BrowserView) void {
             self.allocator.destroy(ctx);
             return;
         },
-        .action = .mark_named,
+        .action = action,
         .popover = popover,
         .entry = entry,
     };
@@ -846,7 +893,27 @@ pub fn onMarkActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     var nbuf: [registers.MAX_NAME]u8 = undefined;
     @memcpy(nbuf[0..name.len], name);
     const tab = self.currentTab() orelse return;
-    markPaths(self, tab, nbuf[0..name.len], tab.selected.items);
+    if (ctx.action == .mark_results) markResults(self, tab, nbuf[0..name.len]) else markPaths(self, tab, nbuf[0..name.len], tab.selected.items);
+}
+
+/// Mark every row of a flat results tab. The rows carry their full
+/// path in `target` and their kind in `tdir`, which is everything a
+/// register entry needs -- no listing lookup is possible for them.
+fn markResults(self: *BrowserView, tab: *BTab, name: []const u8) void {
+    var items: std.ArrayList(registers.Entry) = .empty;
+    defer items.deinit(self.allocator);
+    const host = tab.hc.host orelse "";
+    for (tab.root.entries.items) |e| {
+        const target = e.target orelse continue;
+        // A collection row's target is already a host-qualified spec;
+        // a query row's is a plain path on the tab's own host.
+        const item = if (tab.root.collection)
+            registers.entryFromSpec(target, e.tdir)
+        else
+            registers.Entry{ .host = host, .path = target, .dir = e.tdir };
+        items.append(self.allocator, item) catch break;
+    }
+    markEntries(self, name, items.items);
 }
 
 pub fn onRegAction(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

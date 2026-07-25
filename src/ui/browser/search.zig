@@ -1,18 +1,35 @@
-//! Find/grep searches and the duplicate finder.
+//! Queries: live filename queries, content greps, panels, and the
+//! duplicate finder.
 //!
-//! Both are host-side jobs whose streamed events fill a virtual
-//! results tab; only digests cross the wire. The collection shelf
-//! used to live here too; it is now the `collection` register in
-//! selection.zig, which serves the same rows through the same flat
-//! Dir mechanism.
+//! A query is a host-side job whose streamed events fill a flat
+//! results tab; only the hits cross the wire. Every query is owned by
+//! the TAB it fills (`BTab.query`), so any number of them stay open
+//! and updating at once and closing a tab cancels exactly its own job
+//! -- a live query holds a recursive host-side watcher, which is
+//! expensive enough that leaking one is a real cost.
+//!
+//! There is one query concept, not a "search" and a separate "saved
+//! live query": what a query text means is decided by
+//! filebrowser/query.zig, and the daemon verb follows from that. A
+//! name query is served by `live_find` and therefore always live; a
+//! content grep and a panel command are one-shot because they cannot
+//! be anything else. The flat/subtree view is the same machinery with
+//! the pattern `*` over the tab's own directory.
+//!
+//! The collection shelf used to live here too; it is now the
+//! `collection` register in selection.zig, which serves the same rows
+//! through the same flat Dir mechanism.
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const query = @import("../../filebrowser/query.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const HostConn = @import("types.zig").HostConn;
+const OwnedSearch = @import("types.zig").OwnedSearch;
 const WireJobEv = @import("types.zig").WireJobEv;
+const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 
 /// Duplicate finder: a host-side scan buckets files by SIZE, then
 /// same-size candidates are hash-confirmed with daemon hash jobs.
@@ -52,8 +69,252 @@ pub const DupState = struct {
     }
 };
 
-/// Start a search from the bar: name search by default, content
-/// grep when the toggle is on. Results stream into a flat tab.
+/// Longest rejected panel line kept for the report.
+const MAX_REJECT_TEXT = 120;
+
+/// One tab's running query: the daemon job filling its flat rows, plus
+/// everything the tab has to be able to say about that job afterwards.
+///
+/// A live query never reaches a terminal event -- it ends when the tab
+/// closes and cancels it -- so its bounds and counts arrive on `ready`
+/// status events instead, and are re-reported from here on every
+/// render rather than only in a status line the next action erases.
+pub const TabQuery = struct {
+    hc: *HostConn,
+    /// 0 until the daemon answers the start request with an id.
+    job: u64 = 0,
+    kind: query.Kind,
+    mode: Mode = .results,
+    /// The query text exactly as typed, `@7d` and `!` included
+    /// (owned): what gets saved, re-run and labelled.
+    text: []u8,
+    /// Where the job runs (owned). A results tab keeps its own root
+    /// path, but the query belongs to the directory it was started in.
+    root: []u8,
+    /// Latest counts the host reported.
+    matches: u64 = 0,
+    watches: u64 = 0,
+    truncated: bool = false,
+    watch_limit: bool = false,
+    /// The initial scan finished (live queries).
+    ready: bool = false,
+    /// The job reached a terminal event: the rows stay, but the tab
+    /// stops claiming to be live.
+    ended: bool = false,
+    /// The host watcher overflowed; the row set may have drifted.
+    stale: bool = false,
+    /// panelize: output lines that named nothing on disk, plus the
+    /// first of them and the command's own exit status.
+    rejected: u64 = 0,
+    reject: [MAX_REJECT_TEXT]u8 = undefined,
+    reject_len: usize = 0,
+    exit_status: i64 = 0,
+
+    /// What the query is FOR. A results query owns a tab of its own;
+    /// a flat query replaces a real directory's listing, so stopping
+    /// it has to put the subscription back.
+    pub const Mode = enum { results, flat };
+
+    pub fn live(self: *const TabQuery) bool {
+        return self.kind == .live_name and !self.ended;
+    }
+
+    pub fn destroy(self: *TabQuery, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.root);
+        allocator.destroy(self);
+    }
+
+    fn rejectText(self: *const TabQuery) []const u8 {
+        return self.reject[0..self.reject_len];
+    }
+};
+
+/// Start `q` on `tab`, whose root Dir the caller has already put into
+/// flat mode. Replaces any query the tab was already running.
+/// @return false when nothing was started.
+pub fn queryStart(
+    self: *BrowserView,
+    tab: *BTab,
+    root: []const u8,
+    text: []const u8,
+    q: query.Query,
+    mode: TabQuery.Mode,
+) bool {
+    if (tab.hc.state != .ready) {
+        self.setStatusFmt("not connected to {s}", .{tab.hc.label()});
+        return false;
+    }
+    queryForget(self, tab);
+    const tq = self.allocator.create(TabQuery) catch return false;
+    tq.* = .{
+        .hc = tab.hc,
+        .kind = q.kind,
+        .mode = mode,
+        .text = self.allocator.dupe(u8, text) catch {
+            self.allocator.destroy(tq);
+            return false;
+        },
+        .root = self.allocator.dupe(u8, root) catch {
+            self.allocator.free(tq.text);
+            self.allocator.destroy(tq);
+            return false;
+        },
+    };
+    tab.query = tq;
+
+    var jl: [220]u8 = undefined;
+    const jlbl = std.fmt.bufPrint(&jl, "{s} \"{s}\" in {s}", .{
+        q.kindLabel(), q.pattern[0..@min(q.pattern.len, 80)], root,
+    }) catch "query";
+    // Single-shot by contract: the relative-time predicate belongs to
+    // the job about to be started and to nothing after it.
+    self.search_within_ms = q.within_ms;
+    self.startDaemonJobKind(tab.hc, q.op(), tq.root, "", q.pattern, jlbl, .{
+        .kind = .query,
+        .tab = tab,
+    });
+    self.search_within_ms = 0;
+    // startDaemonJobKind refuses on a dead connection without telling
+    // us, so a query whose request never went out must not sit there
+    // pretending to be live.
+    if (tab.query == tq and !queryRequested(self, tab)) {
+        queryForget(self, tab);
+        return false;
+    }
+    return true;
+}
+
+/// Whether the tab's query still has a request in flight or an id.
+fn queryRequested(self: *BrowserView, tab: *BTab) bool {
+    const tq = tab.query orelse return false;
+    if (tq.job != 0) return true;
+    for (self.pending_jobs.items) |pj| {
+        if (pj.kind == .query and pj.tab == tab) return true;
+    }
+    return false;
+}
+
+/// Cancel and forget the tab's query. The host job dies with it: a
+/// recursive watcher on a big tree is expensive, and nothing is left
+/// to consume its events.
+pub fn queryForget(self: *BrowserView, tab: *BTab) void {
+    const tq = tab.query orelse return;
+    tab.query = null;
+    if (tq.job != 0 and tq.hc.state == .ready)
+        self.sendOp(tq.hc, .{ .req = self.nextReq(), .op = "job_cancel", .job = tq.job });
+    // A start request still in flight would otherwise hand its id to a
+    // query that no longer exists.
+    for (self.pending_jobs.items) |pj| {
+        if (pj.kind == .query and pj.tab == tab) pj.tab = null;
+    }
+    tq.destroy(self.allocator);
+}
+
+/// The daemon answered a query's start request with its job id.
+pub fn queryStarted(self: *BrowserView, tab: *BTab, hc: *HostConn, job: u64) void {
+    const tq = tab.query orelse return;
+    if (tq.hc != hc) return;
+    tq.job = job;
+    if (self.currentTab() == tab) self.renderTab(tab);
+}
+
+/// Route one streamed job event to the tab that owns the job.
+/// @return true when it belonged to a query (and must not fall
+/// through to the generic jobs-panel handling).
+pub fn queryConsumeEvent(self: *BrowserView, hc: *HostConn, e: WireJobEv) bool {
+    if (e.job == 0) return false;
+    const tab = for (self.tabs.items) |t| {
+        const tq = t.query orelse continue;
+        if (tq.job == e.job and tq.hc == hc) break t;
+    } else return false;
+    const tq = tab.query.?;
+
+    // Rows are re-rendered through the coalescing timer, never per
+    // event: a subtree stream lands thousands of matches, and a tab
+    // that is not on screen is rebuilt when it is switched to.
+    if (std.mem.eql(u8, e.ev, "match")) {
+        upsertFlatMatch(self, tab, e);
+        self.scheduleThumbRender();
+        return true;
+    }
+    if (std.mem.eql(u8, e.ev, "unmatch")) {
+        removeFlatMatch(self, tab, e.path);
+        self.scheduleThumbRender();
+        return true;
+    }
+    if (std.mem.eql(u8, e.ev, "ready")) {
+        tq.ready = true;
+        tq.matches = e.matches;
+        tq.watches = e.watches;
+        tq.truncated = e.truncated;
+        tq.watch_limit = e.watch_limit;
+        self.scheduleThumbRender();
+        return true;
+    }
+    if (std.mem.eql(u8, e.ev, "reject")) {
+        tq.rejected += 1;
+        if (tq.reject_len == 0 and e.text.len > 0) {
+            tq.reject_len = @min(e.text.len, tq.reject.len);
+            @memcpy(tq.reject[0..tq.reject_len], e.text[0..tq.reject_len]);
+        }
+        self.scheduleThumbRender();
+        return true;
+    }
+    if (std.mem.eql(u8, e.ev, "resync")) {
+        tq.stale = true;
+        self.setStatus("live query watcher overflowed; reopen the query to resync");
+        return true;
+    }
+    if (e.terminalEv()) {
+        tq.ended = true;
+        if (std.mem.eql(u8, e.ev, "done")) {
+            tq.matches = e.matches;
+            tq.truncated = e.truncated;
+            tq.rejected = e.rejected;
+            tq.exit_status = e.exit_status;
+        }
+        // Deliberately the COALESCED render: this event falls through
+        // to the jobs panel, whose own "done: ..." status would erase
+        // an immediate one. The timer fires after that and wins.
+        self.scheduleThumbRender();
+        // Falls through so the jobs panel finishes its row.
+    }
+    return false;
+}
+
+/// The note the tab's status line carries about its query. Rendered
+/// on every render, so a truncation or a rejected panel line stays
+/// visible instead of being erased by the next status message.
+pub fn queryNote(tab: *BTab, buf: []u8) []const u8 {
+    const tq = tab.query orelse return "";
+    var w = std.Io.Writer.fixed(buf);
+    const state: []const u8 = if (tq.mode == .flat)
+        (if (tq.live()) "flat view, live" else "flat view")
+    else if (!tq.ready and tq.kind == .live_name)
+        "live query, scanning"
+    else if (tq.live())
+        "live query"
+    else
+        tq.kind.label();
+    w.print(" ({s}", .{state}) catch return "";
+    if (tq.live() and tq.watches > 0) w.print(", {d} watched dir(s)", .{tq.watches}) catch {};
+    if (tq.truncated) w.print(", TRUNCATED at the match cap", .{}) catch {};
+    if (tq.watch_limit) w.print(", watch limit reached: deeper subdirectories are NOT live", .{}) catch {};
+    if (tq.stale) w.print(", watcher overflowed", .{}) catch {};
+    if (tq.rejected > 0) {
+        const quoted = tq.rejectText();
+        w.print(", {d} output line(s) were not paths: \"{s}\"", .{
+            tq.rejected, quoted[0..@min(quoted.len, 60)],
+        }) catch {};
+    }
+    if (tq.exit_status != 0) w.print(", command exit status {d}", .{tq.exit_status}) catch {};
+    w.print(")", .{}) catch return "";
+    return w.buffered();
+}
+
+/// Start a query from the search bar. Its results stream into a fresh
+/// flat tab, which keeps updating for as long as it is open.
 pub fn startSearch(self: *BrowserView) void {
     const tab = self.currentTab() orelse return;
     if (tab.hc.state != .ready) {
@@ -61,67 +322,30 @@ pub fn startSearch(self: *BrowserView) void {
         return;
     }
     const txt = c.gtk_editable_get_text(@ptrCast(self.search_entry));
-    var pattern: []const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
-    if (pattern.len == 0) return;
-    // Relative-time prefix: "@7d pat" / "@12h pat" / "@30m pat"
-    // limits name matches to entries modified in that window.
-    self.search_within_ms = 0;
-    if (pattern[0] == '@') {
-        if (std.mem.indexOfScalar(u8, pattern, ' ')) |sp| {
-            const tok = pattern[1..sp];
-            if (tok.len >= 2) {
-                const unit: u64 = switch (tok[tok.len - 1]) {
-                    'd' => 24 * 3600 * 1000,
-                    'h' => 3600 * 1000,
-                    'm' => 60 * 1000,
-                    else => 0,
-                };
-                const num = std.fmt.parseInt(u64, tok[0 .. tok.len - 1], 10) catch 0;
-                if (unit != 0 and num != 0) {
-                    self.search_within_ms = num * unit;
-                    pattern = std.mem.trimStart(u8, pattern[sp + 1 ..], " ");
-                }
-            }
-        }
-    }
-    if (pattern.len == 0) return;
-    const panelize = pattern.len > 1 and pattern[0] == '!';
-    const content = !panelize and c.gtk_check_button_get_active(@ptrCast(self.search_content)) != 0;
+    const text = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+    const content = c.gtk_check_button_get_active(@ptrCast(self.search_content)) != 0;
+    const q = query.parse(text, content) orelse return;
+    runQuery(self, tab, text, q);
+}
 
-    // Remember for the save-search button.
-    if (!panelize) {
-        var spec_buf: [4400]u8 = undefined;
-        const root_spec = tab.spec(&spec_buf);
-        const spec_owned = self.allocator.dupe(u8, root_spec) catch null;
-        const pat_owned = self.allocator.dupe(u8, pattern) catch null;
-        if (spec_owned != null and pat_owned != null) {
-            if (self.last_search) |ls| ls.deinitOwned(self.allocator);
-            self.last_search = .{ .spec = spec_owned.?, .pattern = pat_owned.?, .content = content };
-        } else {
-            if (spec_owned) |so| self.allocator.free(so);
-            if (pat_owned) |po| self.allocator.free(po);
-        }
-    }
+/// Open `q` (typed as `text`) as a results tab rooted at `tab`'s
+/// directory. Shared by the search bar and the saved-query list, so a
+/// saved query can never run as something else than it was typed.
+pub fn runQuery(self: *BrowserView, tab: *BTab, text: []const u8, q: query.Query) void {
+    // Remember for the save button: the whole triple, command queries
+    // included -- a panel preset is exactly as worth keeping as a
+    // filename query.
+    var spec_buf: [4400]u8 = undefined;
+    const root_spec = tab.spec(&spec_buf);
+    rememberLastSearch(self, root_spec, text, q.kind == .content);
 
-    // One search at a time: a still-running previous job is
-    // canceled (its JobRow stays for the record).
-    if (self.search_job != 0) {
-        if (self.search_hc) |shc| {
-            if (shc.state == .ready)
-                self.sendOp(shc, .{ .req = self.nextReq(), .op = "job_cancel", .job = self.search_job });
-        }
-        self.search_job = 0;
-    }
-
-    // Fresh results tab rooted at the searched directory.
     var rbuf: [4096]u8 = undefined;
     if (tab.root.path.len >= rbuf.len) return;
     @memcpy(rbuf[0..tab.root.path.len], tab.root.path);
     const root = rbuf[0..tab.root.path.len];
-    const host = tab.hc.host;
-    const rtab = self.newTab(host, root) orelse return;
+    const rtab = self.newTab(tab.hc.host, root) orelse return;
     // Flat results: no live view (newTab already subscribed the
-    // root — undo that; the results are the search stream).
+    // root -- undo that; the query stream is the listing).
     self.closeViewOf(rtab.hc, rtab.root);
     var i: usize = 0;
     while (i < self.pending.items.len) {
@@ -130,32 +354,93 @@ pub fn startSearch(self: *BrowserView) void {
     rtab.root.flat = true;
     rtab.root.loaded = true;
     rtab.root.view_id = 0;
-    self.search_tab = rtab;
     if (rtab.virtual_spec.len > 0) self.allocator.free(rtab.virtual_spec);
-    rtab.virtual_spec = self.allocator.dupe(u8, pattern) catch &.{};
-    var lbl: [160:0]u8 = undefined;
-    const ltxt = std.fmt.bufPrintZ(&lbl, "{s}: {s}", .{ if (panelize) "panel" else "search", pattern }) catch "search";
+    rtab.virtual_spec = self.allocator.dupe(u8, text) catch &.{};
+    var lbl: [200:0]u8 = undefined;
+    const ltxt = std.fmt.bufPrintZ(&lbl, "{s}: {s}", .{ q.kindLabel(), text }) catch "query";
     c.gtk_label_set_text(rtab.tab_label, ltxt.ptr);
+    _ = queryStart(self, rtab, root, text, q, .results);
     self.renderTab(rtab);
-
-    var jl: [200]u8 = undefined;
-    const jlbl = std.fmt.bufPrint(&jl, "{s} \"{s}\"", .{
-        if (content) @as([]const u8, "grep") else "find", pattern,
-    }) catch "search";
-    if (panelize) {
-        self.startDaemonJobKind(tab.hc, "panelize", root, "", pattern[1..], jlbl, .search);
-    } else if (content) {
-        self.startDaemonJobKind(tab.hc, "grep", root, "", pattern, jlbl, .search);
-    } else {
-        self.startDaemonJobKind(tab.hc, "live_find", root, "", pattern, jlbl, .search);
-    }
-    self.setStatusFmt("searching {s}…", .{root});
 }
 
-pub fn onSearchMatch(self: *BrowserView, e: WireJobEv) void {
-    const rtab = self.search_tab orelse return;
-    upsertFlatMatch(self, rtab, e);
-    if (self.currentTab() == rtab) self.renderTab(rtab);
+fn rememberLastSearch(self: *BrowserView, spec: []const u8, text: []const u8, content: bool) void {
+    const spec_owned = self.allocator.dupe(u8, spec) catch return;
+    const text_owned = self.allocator.dupe(u8, text) catch {
+        self.allocator.free(spec_owned);
+        return;
+    };
+    if (self.last_search) |ls| ls.deinitOwned(self.allocator);
+    self.last_search = OwnedSearch{ .spec = spec_owned, .pattern = text_owned, .content = content };
+}
+
+/// Mark every row of the current results tab into a named register:
+/// a query result becomes a keepable set that outlives the tab, the
+/// query and the GUI process.
+pub fn promoteResults(self: *BrowserView) void {
+    self.markResultsDialog();
+}
+
+pub fn onPromoteClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    promoteResults(@ptrCast(@alignCast(user.?)));
+}
+
+/// The panelize preset menu: ready-made commands, dropped into the
+/// search bar so they stay editable before they run.
+pub fn onPresetClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const popover = c.gtk_popover_new();
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
+    c.gtk_widget_set_margin_start(box, 8);
+    c.gtk_widget_set_margin_end(box, 8);
+    c.gtk_widget_set_margin_top(box, 8);
+    c.gtk_widget_set_margin_bottom(box, 8);
+    const head = c.gtk_label_new("Run a command on this host and browse its output");
+    c.gtk_label_set_xalign(@ptrCast(head), 0);
+    c.gtk_widget_add_css_class(head, "dim-label");
+    c.gtk_box_append(@ptrCast(box), head);
+    for (query.presets, 0..) |preset, idx| {
+        const item = c.gtk_button_new_with_label(preset.label.ptr);
+        c.gtk_button_set_has_frame(@ptrCast(item), 0);
+        c.gtk_widget_set_tooltip_text(item, preset.text.ptr);
+        // The index rides the widget: a heap ctx per item would need a
+        // destroy-notify for a menu rebuilt on every click, and the
+        // index is all the handler needs.
+        c.g_object_set_data(@ptrCast(item), "sketerm-preset", @ptrFromInt(idx + 1));
+        _ = c.g_signal_connect_data(item, "clicked", @ptrCast(&onPresetPicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(box), item);
+    }
+    c.gtk_popover_set_child(@ptrCast(popover), box);
+    // Without an explicit rect a popover with a wide child never maps.
+    var bounds: c.graphene_rect_t = undefined;
+    if (c.gtk_widget_compute_bounds(@ptrCast(btn), @ptrCast(btn), &bounds) != 0) {
+        const rect = c.GdkRectangle{
+            .x = @intFromFloat(bounds.origin.x),
+            .y = @intFromFloat(bounds.origin.y),
+            .width = @intFromFloat(bounds.size.width),
+            .height = @intFromFloat(bounds.size.height),
+        };
+        c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
+    }
+    c.gtk_widget_set_parent(popover, @ptrCast(btn));
+    connectPopoverAutoUnparent(popover);
+    c.gtk_popover_popup(@ptrCast(popover));
+}
+
+/// A preset fills the search bar rather than running straight away:
+/// `rg -l TEXT` needs its TEXT replaced, and every preset is worth a
+/// look before it executes on the host.
+pub fn onPresetPicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const raw = c.g_object_get_data(@ptrCast(btn), "sketerm-preset") orelse return;
+    const idx = @intFromPtr(raw) - 1;
+    if (idx >= query.presets.len) return;
+    if (c.gtk_widget_get_ancestor(@ptrCast(btn), c.gtk_popover_get_type())) |menu|
+        c.gtk_popover_popdown(@ptrCast(@alignCast(menu)));
+    c.gtk_check_button_set_active(@ptrCast(self.search_content), 0);
+    c.gtk_editable_set_text(@ptrCast(self.search_entry), query.presets[idx].text.ptr);
+    _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(self.search_entry)));
+    c.gtk_editable_select_region(@ptrCast(self.search_entry), 0, -1);
+    self.setStatus("edit the command if you like, then press Enter to browse its output");
 }
 
 /// Add (or refresh) one streamed job match as a flat row of `tab`.
@@ -213,12 +498,6 @@ pub fn upsertFlatMatch(self: *BrowserView, tab: *BTab, e: WireJobEv) void {
     };
 }
 
-pub fn onSearchUnmatch(self: *BrowserView, path: []const u8) void {
-    const rtab = self.search_tab orelse return;
-    removeFlatMatch(self, rtab, path);
-    if (self.currentTab() == rtab) self.renderTab(rtab);
-}
-
 /// Drop every flat row of `tab` whose full path is `path`.
 pub fn removeFlatMatch(self: *BrowserView, tab: *BTab, path: []const u8) void {
     var i: usize = 0;
@@ -250,7 +529,7 @@ pub fn startDupScan(self: *BrowserView, tab: *BTab, root: []const u8) void {
         },
     };
     self.dup = d;
-    self.startDaemonJobKind(tab.hc, "find", d.root, "", "*", "duplicate scan", .dup_scan);
+    self.startDaemonJobKind(tab.hc, "find", d.root, "", "*", "duplicate scan", .{ .kind = .dup_scan });
 }
 
 /// Handle scan matches / completion and hash-confirm results.

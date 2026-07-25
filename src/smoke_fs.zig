@@ -1291,6 +1291,238 @@ fn mediaStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag:
     std.debug.print("smoke-fs: {s} media stage ok\n", .{tag});
 }
 
+/// The row set a live query is currently streaming, rebuilt from its
+/// match/unmatch events exactly the way the browser rebuilds its flat
+/// listing -- so what this asserts is what a user would see.
+const LiveRows = struct {
+    allocator: std.mem.Allocator,
+    job: u64,
+    paths: std.ArrayList([]u8) = .empty,
+    /// Latest `ready` status event.
+    ready: bool = false,
+    watches: u64 = 0,
+    matches: u64 = 0,
+    truncated: bool = false,
+    watch_limit: bool = false,
+
+    fn deinit(self: *LiveRows) void {
+        for (self.paths.items) |p| self.allocator.free(p);
+        self.paths.deinit(self.allocator);
+    }
+
+    fn has(self: *const LiveRows, path: []const u8) bool {
+        for (self.paths.items) |p| {
+            if (std.mem.eql(u8, p, path)) return true;
+        }
+        return false;
+    }
+
+    fn apply(self: *LiveRows, e: fsdrive.JobEvent) void {
+        if (std.mem.eql(u8, e.ev, "match")) {
+            if (self.has(e.path)) return;
+            const owned = self.allocator.dupe(u8, e.path) catch return;
+            self.paths.append(self.allocator, owned) catch self.allocator.free(owned);
+            return;
+        }
+        if (std.mem.eql(u8, e.ev, "unmatch")) {
+            var i: usize = 0;
+            while (i < self.paths.items.len) {
+                if (std.mem.eql(u8, self.paths.items[i], e.path)) {
+                    self.allocator.free(self.paths.items[i]);
+                    _ = self.paths.orderedRemove(i);
+                } else i += 1;
+            }
+            return;
+        }
+        if (std.mem.eql(u8, e.ev, "ready")) {
+            self.ready = true;
+            self.watches = e.watches;
+            self.matches = e.matches;
+            self.truncated = e.truncated;
+            self.watch_limit = e.watch_limit;
+        }
+    }
+
+    /// Drain events until `want` holds or the deadline passes.
+    /// @return whether it held.
+    fn until(self: *LiveRows, fs: *fsdrive.Fs, timeout_ms: i64, want: *const fn (*const LiveRows) bool) bool {
+        var waited: i64 = 0;
+        while (true) {
+            while (fs.takeJobEvent()) |e0| {
+                var e = e0;
+                defer e.deinit();
+                if (e.job != self.job) continue;
+                self.apply(e);
+            }
+            if (want(self)) return true;
+            if (waited >= timeout_ms) return false;
+            _ = c.usleep(10_000);
+            waited += 10;
+        }
+    }
+};
+
+fn expectLive(rows: *LiveRows, fs: *fsdrive.Fs, want: *const fn (*const LiveRows) bool, comptime what: []const u8) void {
+    if (!rows.until(fs, 8_000, want)) {
+        std.debug.print("smoke-fs: live query never reached: {s} (rows now:", .{what});
+        for (rows.paths.items) |p| std.debug.print(" {s}", .{p});
+        std.debug.print(")\n", .{});
+        fail("live query state never reached: " ++ what);
+    }
+}
+
+/// Live queries and panels: the streamed contract the browser's query
+/// tabs are built on. Everything here is host-side behaviour, so it is
+/// asserted with no GUI at all.
+fn queryStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []const u8) void {
+    var dbuf: [64]u8 = undefined;
+    const dir = mkTmpDir(&dbuf, tag ++ "-query");
+    var fs = fsdrive.Fs.connect(allocator, sock_path) catch fail("query fs connect");
+    defer fs.deinit();
+
+    var pb: [8][4096]u8 = undefined;
+    const sub = std.fmt.bufPrint(&pb[0], "{s}/sub", .{dir}) catch unreachable;
+    mkdirAt(sub);
+    touch(dir, "alpha.txt", "a\n");
+    touch(sub, "beta.txt", "b\n");
+    touch(dir, "ignore.log", "l\n");
+    const alpha = std.fmt.bufPrint(&pb[1], "{s}/alpha.txt", .{dir}) catch unreachable;
+    const beta = std.fmt.bufPrint(&pb[2], "{s}/sub/beta.txt", .{dir}) catch unreachable;
+    const gamma = std.fmt.bufPrint(&pb[3], "{s}/gamma.txt", .{dir}) catch unreachable;
+    const moved = std.fmt.bufPrint(&pb[4], "{s}/moved-away", .{dir}) catch unreachable;
+
+    // ── live filename query ────────────────────────────────────
+    const job = fs.startLiveFind(dir, "*.txt") catch failErr("start live_find", fs.lastErr());
+    var rows = LiveRows{ .allocator = allocator, .job = job };
+    defer rows.deinit();
+
+    const Want = struct {
+        var path: []const u8 = "";
+        fn ready(r: *const LiveRows) bool {
+            return r.ready;
+        }
+        fn present(r: *const LiveRows) bool {
+            return r.has(path);
+        }
+        fn absent(r: *const LiveRows) bool {
+            return !r.has(path);
+        }
+        fn empty(r: *const LiveRows) bool {
+            return r.paths.items.len == 0;
+        }
+    };
+
+    expectLive(&rows, &fs, Want.ready, "initial scan complete");
+    // The status event reports its own bounds: two directories watched
+    // (the root and sub), two rows, neither cap hit.
+    if (rows.watches != 2) fail("live query reported the wrong watch count");
+    if (rows.truncated or rows.watch_limit) fail("live query claimed a bound it never hit");
+    if (!rows.has(alpha) or !rows.has(beta)) fail("live query missed an initial match");
+    if (rows.has(std.fmt.bufPrint(&pb[5], "{s}/ignore.log", .{dir}) catch unreachable))
+        fail("live query matched a non-matching name");
+
+    // A file created externally appears with no request from anyone.
+    touch(dir, "gamma.txt", "g\n");
+    Want.path = gamma;
+    expectLive(&rows, &fs, Want.present, "externally created file appears");
+
+    // ...and a deleted one leaves.
+    var z: [4096]u8 = undefined;
+    _ = c.unlink(pathz.pathZ(&z, alpha) catch unreachable);
+    Want.path = alpha;
+    expectLive(&rows, &fs, Want.absent, "deleted file disappears");
+
+    // A whole directory MOVED out of the tree delivers no per-child
+    // event; its rows have to go anyway (this regressed once).
+    if (c.rename(
+        pathz.pathZ(&z, sub) catch unreachable,
+        pathz.pathZ(&pb[6], moved) catch unreachable,
+    ) != 0) fail("rename subdir");
+    Want.path = beta;
+    expectLive(&rows, &fs, Want.absent, "rows under a moved-away directory disappear");
+
+    fs.jobCancel(job) catch failErr("cancel live_find", fs.lastErr());
+
+    // ── relative-time predicate that keeps being re-evaluated ──
+    var tdir_buf: [64]u8 = undefined;
+    const tdir = mkTmpDir(&tdir_buf, tag ++ "-age");
+    const fresh = std.fmt.bufPrint(&pb[0], "{s}/fresh.txt", .{tdir}) catch unreachable;
+    const old = std.fmt.bufPrint(&pb[1], "{s}/old.txt", .{tdir}) catch unreachable;
+    const later = std.fmt.bufPrint(&pb[2], "{s}/later.txt", .{tdir}) catch unreachable;
+    touch(tdir, "fresh.txt", "f\n");
+    touch(tdir, "old.txt", "o\n");
+    // Aged with a backdated mtime rather than by waiting: the daemon
+    // compares mtimes, so this is the same code path as real ageing.
+    setMtime(old, @as(i64, c.time(null)) - 7200);
+
+    const tjob = fs.startLiveFindOpts(tdir, "*.txt", .{ .within_ms = 3000 }) catch
+        failErr("start timed live_find", fs.lastErr());
+    var trows = LiveRows{ .allocator = allocator, .job = tjob };
+    defer trows.deinit();
+    expectLive(&trows, &fs, Want.ready, "timed query initial scan");
+    if (!trows.has(fresh)) fail("timed query dropped a file inside its window");
+    if (trows.has(old)) fail("timed query matched a file outside its window");
+
+    // A file created inside the window matches...
+    touch(tdir, "later.txt", "l\n");
+    Want.path = later;
+    expectLive(&trows, &fs, Want.present, "new file inside the time window matches");
+    // ...and stops matching the moment its mtime is pushed out of it.
+    setMtime(later, @as(i64, c.time(null)) - 3600);
+    expectLive(&trows, &fs, Want.absent, "backdated file leaves the time window");
+    // ...and everything left ages out on its own deadline, with no
+    // filesystem event and nothing asked of the client.
+    expectLive(&trows, &fs, Want.empty, "matches age out on their own deadline");
+    fs.jobCancel(tjob) catch failErr("cancel timed live_find", fs.lastErr());
+
+    // ── panelize: rows, rejects and the command's exit status ──
+    var cmd_buf: [512]u8 = undefined;
+    const cmd = std.fmt.bufPrint(
+        &cmd_buf,
+        "echo gamma.txt; echo 'fatal: not a git repository'; echo {s}; echo nope.txt; exit 3",
+        .{gamma},
+    ) catch unreachable;
+    const pjob = fs.startPanelize(dir, cmd) catch failErr("start panelize", fs.lastErr());
+    var reject_texts: usize = 0;
+    var pdone = false;
+    var prows: usize = 0;
+    var prejected: u64 = 0;
+    var pexit: i64 = 0;
+    var waited: i64 = 0;
+    while (!pdone and waited < 10_000) {
+        while (fs.takeJobEvent()) |e0| {
+            var e = e0;
+            defer e.deinit();
+            if (e.job != pjob) continue;
+            if (std.mem.eql(u8, e.ev, "match")) prows += 1;
+            if (std.mem.eql(u8, e.ev, "reject")) {
+                reject_texts += 1;
+                if (e.text.len == 0) fail("panelize reject carried no text");
+            }
+            if (e.terminal()) {
+                if (!std.mem.eql(u8, e.ev, "done")) fail("panelize did not finish");
+                prejected = e.rejected;
+                pexit = e.exit_status;
+                pdone = true;
+            }
+        }
+        if (pdone) break;
+        _ = c.usleep(10_000);
+        waited += 10;
+    }
+    if (!pdone) fail("panelize never finished");
+    // Relative and absolute paths both resolve; the diagnostic line
+    // and the name of a file that does not exist do not.
+    if (prows != 2) fail("panelize resolved the wrong number of rows");
+    if (prejected != 2) fail("panelize miscounted unusable output lines");
+    if (reject_texts != 2) fail("panelize did not quote back its unusable lines");
+    // A nonzero exit is reported, not turned into a failed job: the
+    // rows that did arrive are still the listing.
+    if (pexit != 3) fail("panelize lost the command's exit status");
+
+    std.debug.print("smoke-fs: {s} query stage ok\n", .{tag});
+}
+
 const XferConns = struct {
     src: client_mod.Conn,
     dst: client_mod.Conn,
@@ -1543,6 +1775,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     jobStage(allocator, sock_path, "mono");
     policyStage(allocator, sock_path, "mono");
     mediaStage(allocator, sock_path, "mono");
+    queryStage(allocator, sock_path, "mono");
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
         defer conn.deinit();
@@ -1584,6 +1817,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     jobStage(allocator, bsock, "broker");
     policyStage(allocator, bsock, "broker");
     mediaStage(allocator, bsock, "broker");
+    queryStage(allocator, bsock, "broker");
     {
         var conn = client_mod.Conn.connect(allocator, bsock) catch fail("broker shutdown connect");
         defer conn.deinit();
