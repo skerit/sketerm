@@ -18,7 +18,9 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const wire = @import("../../mux/wire.zig");
+const colkeys = @import("../../filebrowser/colkeys.zig");
 const hexdump = @import("../../filebrowser/hexdump.zig");
+const mediacols = @import("mediacols.zig");
 const previewers = @import("../../filebrowser/previewers.zig");
 const thumbs_mod = @import("../../filebrowser/thumbs.zig");
 
@@ -906,11 +908,50 @@ pub fn updatePreview(self: *BrowserView) void {
     };
     const entry = entryForPath(tab, path);
     var meta_buf: [1024]u8 = undefined;
-    setPreviewMeta(self, describeEntry(&meta_buf, path, entry));
+    var described = describeEntry(&meta_buf, path, entry);
+    // Structured media fields already read for the listing columns
+    // are shown here for free. Never a fetch: the panel's own
+    // content read is the only round trip a selection may cost.
+    if (entry) |e| described = appendMediaLines(self, tab, path, e.mtime_ms, &meta_buf, described);
+    setPreviewMeta(self, described);
 
     const is_dir = if (entry) |e| e.tdir else false;
     startPreview(self, tab.hc, path, if (entry) |e| e.mtime_ms else 0, is_dir, false);
     self.schedulePreload(tab, path);
+}
+
+/// Append the media fields worth a glance to the panel header, as
+/// labelled lines. Only from what the media columns already cached:
+/// the full field set is one click away in Properties.
+fn appendMediaLines(
+    self: *BrowserView,
+    tab: *BTab,
+    path: []const u8,
+    mtime_ms: i64,
+    buf: []u8,
+    described: []const u8,
+) []const u8 {
+    const interesting = [_][]const u8{
+        "media.format",    "media.width",       "media.height", "media.duration_ms",
+        "media.bitrate_kbps", "tag.title",      "tag.artist",   "tag.album",
+        "exif.datetime_original", "exif.model", "doc.pages",
+    };
+    const estimated = if (mediacols.lookup(self, tab.hc, path, mtime_ms, "media.duration_estimated")) |v|
+        std.mem.eql(u8, v, "1")
+    else
+        false;
+    var w = std.Io.Writer.fixed(buf[described.len..]);
+    var n: usize = 0;
+    for (interesting) |key| {
+        const raw = mediacols.lookup(self, tab.hc, path, mtime_ms, key) orelse continue;
+        var disp: [192]u8 = undefined;
+        w.print("\n{s}: {s}", .{
+            colkeys.label(key), colkeys.display(key, raw, estimated, false, &disp),
+        }) catch break;
+        n += 1;
+    }
+    if (n == 0) return described;
+    return buf[0 .. described.len + w.buffered().len];
 }
 
 fn setPreviewMeta(self: *BrowserView, text: []const u8) void {

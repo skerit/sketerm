@@ -9,6 +9,8 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const colkeys = @import("../../filebrowser/colkeys.zig");
+const mediacols = @import("mediacols.zig");
 const muxclient = @import("../../mux/client.zig");
 
 const BTab = @import("types.zig").BTab;
@@ -154,6 +156,7 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
 /// then release the socket. Tabs keep referencing the dead
 /// HostConn; navigating again reconnects.
 pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
+    mediacols.hostDied(self, hc);
     var i: usize = 0;
     // In-flight listings can never be answered. A navigation
     // request also OWNS its candidate directory until it commits,
@@ -245,16 +248,23 @@ pub fn closeViewOf(self: *BrowserView, hc: *HostConn, dir: *Dir) void {
     }) catch {};
 }
 
-/// The tab's attribute columns as the wire's comma-separated
-/// request. Empty when the tab shows none, so ordinary listings
-/// pay nothing for the feature.
+/// The tab's EXTENDED-ATTRIBUTE columns as the wire's
+/// comma-separated request. Empty when the tab shows none, so
+/// ordinary listings pay nothing for the feature.
+///
+/// Media columns are deliberately absent: their values are not
+/// xattrs, they come from a batched media_meta job (mediacols.zig).
+/// That is also why Entry.attrs stays dense over the XATTR columns
+/// only, and colkeys.subIndex maps a column position into it.
 pub fn attrSpec(self: *BrowserView, tab: *BTab, buf: []u8) []const u8 {
     var emblem_names: [MAX_ATTR_COLUMNS][]const u8 = undefined;
     const wanted = self.emblems.attrNames(&emblem_names);
-    if (tab.attr_columns.items.len == 0 and wanted.len == 0) return "";
+    const xattr_columns = colkeys.countOf(tab.attr_columns.items, .xattr);
+    if (xattr_columns == 0 and wanted.len == 0) return "";
     var w = std.Io.Writer.fixed(buf);
     var n: usize = 0;
     for (tab.attr_columns.items) |name| {
+        if (colkeys.sourceOf(name) != .xattr) continue;
         if (n > 0) w.writeByte(',') catch break;
         w.writeAll(name) catch break;
         n += 1;
@@ -264,6 +274,7 @@ pub fn attrSpec(self: *BrowserView, tab: *BTab, buf: []u8) []const u8 {
     for (wanted) |name| {
         var dup = false;
         for (tab.attr_columns.items) |col| {
+            if (colkeys.sourceOf(col) != .xattr) continue;
             if (std.mem.eql(u8, col, name)) dup = true;
         }
         if (dup or n >= MAX_ATTR_COLUMNS) continue;
@@ -350,6 +361,7 @@ pub fn onFdReadable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv
         if (self.feedRemoteThumb(hc, f.ftype, f.payload)) continue;
         if (self.feedProbes(hc, f.ftype, f.payload)) continue;
         if (self.feedAttrRequest(hc, f.ftype, f.payload)) continue;
+        if (mediacols.feed(self, hc, f.ftype, f.payload)) continue;
         switch (f.ftype) {
             .fs_reply => {
                 if (self.onReply(hc, f.payload)) dirty = true;

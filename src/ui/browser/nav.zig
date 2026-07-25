@@ -348,6 +348,9 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     // A running flat view belonged to the OLD root; the new folder
     // brings its own remembered view settings.
     self.flatForget(tab);
+    // A media batch in flight was asked for rows that no longer
+    // exist; its answers would be paid for and thrown away.
+    self.mediaResetForNavigation();
     self.applyFolderMemory(tab);
     self.updateTabLabel(tab);
     self.syncPathEntry(tab);
