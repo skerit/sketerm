@@ -16,11 +16,23 @@ comptime {
 }
 
 const APP_ID: [*:0]const u8 = "dev.sker.sketerm";
+/// `sketerm files` registers its OWN application identity, appended to
+/// whichever base id applies. On Wayland the toplevel app_id and on X11
+/// the WM_CLASS come from the process identity, not from any per-window
+/// call, so a distinct GApplication is the only way the file manager
+/// gets its own taskbar group, icon and window list. It also keeps the
+/// two single-instance identities from competing for one window list.
+const FILES_ID_SUFFIX = ".files";
 const VERSION = @import("version.zig").string;
+const files_entry = @import("filebrowser/entry.zig");
 
 const App = struct {
     allocator: std.mem.Allocator,
-    window: ?*Window = null,
+    /// The PRIMARY window of this process: it owns the control socket,
+    /// the quake toggle and layout persistence, and it lives as long as
+    /// the process. Every other window is secondary and reachable
+    /// through `Window.liveWindows`, never through this field.
+    primary: ?*Window = null,
     restore: bool = false,
     layout_path: ?[]const u8 = null,
     no_save: bool = false,
@@ -28,9 +40,11 @@ const App = struct {
     debug_events: bool = false,
     debug_images: bool = false,
     config_path: ?[]const u8 = null,
-    /// `sketerm files [spec]`: open a file-browser tab (standalone
-    /// launcher mode; a running instance gains the tab instead).
-    files_request: bool = false,
+    /// This process was launched as `sketerm files`: it serves the
+    /// dedicated file-manager identity. Says nothing about browser
+    /// FACES: a browser pane inside a terminal window is unrelated.
+    files_mode: bool = false,
+    /// Start location for the file-manager window (owned).
     files_path: ?[]const u8 = null,
 };
 
@@ -73,9 +87,28 @@ const HELP_TEXT =
     \\                         sketerm-mux on the remote.
     \\                         -u: mosh-style encrypted UDP with
     \\                         roaming.
-    \\  sketerm files [spec]   File browser: standalone window (or a
-    \\                         browser tab in the running instance).
-    \\                         spec = /path, host:/path, udp:host:/path.
+    \\  sketerm files [spec]   File browser as its OWN application
+    \\                         ("Sketerm Files", own icon and taskbar
+    \\                         entry, id dev.sker.sketerm.files): each
+    \\                         invocation opens a browser window there,
+    \\                         never touching a running terminal.
+    \\                         spec = /path, host:/path, udp:host:/path,
+    \\                         local:/path or a file:// URI (a file
+    \\                         opens its parent directory).
+    \\  sketerm files --here [spec]
+    \\                         Turn the pane you typed this in INTO a
+    \\                         browser (its shell stays underneath, one
+    \\                         toolbar click away). Talks to the running
+    \\                         terminal over its socket; needs to be run
+    \\                         from inside a sketerm pane.
+    \\  sketerm files --tab [spec]
+    \\                         Browser tab in the WINDOW that owns the
+    \\                         pane you typed this in. Same requirement.
+    \\                         Both default to the pane's own directory,
+    \\                         on the pane's own host. Both need a LOCAL
+    \\                         pane: inside a durable REMOTE shell the
+    \\                         window's socket is on the other machine,
+    \\                         and they say so instead of guessing.
     \\  sketerm mount <host>[:/path] <mountpoint>
     \\                         FUSE-mount a host's files so LOCAL apps
     \\                         open them via the kernel (ranged reads,
@@ -280,6 +313,33 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
+    // `sketerm files ...`: three different programs behind one word.
+    if (filesRequest(allocator, argv)) |req| {
+        if (req.help) {
+            _ = c.fputs(HELP_TEXT, platform.stdout());
+            return 0;
+        }
+        switch (req.mode) {
+            // --here / --tab act on an EXISTING terminal pane: pure
+            // socket clients over the running terminal's control socket.
+            // They must never register a GApplication: a second app
+            // identity would open a window of its own instead of
+            // touching the pane the user asked about.
+            .here, .tab => return @import("ipc/client.zig").browserInPane(
+                allocator,
+                req.mode == .here,
+                req.spec,
+            ),
+            // The dedicated file manager: its own identity, from here on
+            // an ordinary GApplication run.
+            .window => {
+                g_app.files_mode = true;
+                Window.setFilesIdentity();
+                if (req.spec) |s| g_app.files_path = allocator.dupe(u8, s) catch null;
+            },
+        }
+    }
+
     // GApplication parses argv inside the "command-line" signal
     // handler (our `onCommandLine`). With HANDLES_COMMAND_LINE the
     // primary instance's signal fires for both its own startup
@@ -291,17 +351,26 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // SKETERM_APP_ID overrides the GApplication ID so a second instance
     // can run alongside the primary one (debug / profiling). Must be a
-    // valid reverse-DNS-style name; GLib aborts otherwise.
+    // valid reverse-DNS-style name; GLib aborts otherwise. Files mode
+    // appends its suffix to whichever base applies, so a test rig's
+    // isolated id keeps isolating both identities.
     var app_id_buf: [256:0]u8 = undefined;
     const app_id: [*:0]const u8 = blk: {
-        const raw = c.getenv("SKETERM_APP_ID");
-        if (raw == null) break :blk APP_ID;
-        const env = std.mem.span(raw);
-        if (env.len == 0 or env.len >= app_id_buf.len) break :blk APP_ID;
-        @memcpy(app_id_buf[0..env.len], env);
-        app_id_buf[env.len] = 0;
-        break :blk @ptrCast(&app_id_buf);
+        var base: []const u8 = std.mem.span(APP_ID);
+        if (c.getenv("SKETERM_APP_ID")) |raw| {
+            const env = std.mem.span(raw);
+            if (env.len > 0 and env.len < app_id_buf.len - FILES_ID_SUFFIX.len) base = env;
+        }
+        const suffix: []const u8 = if (g_app.files_mode) FILES_ID_SUFFIX else "";
+        const id = std.fmt.bufPrintZ(&app_id_buf, "{s}{s}", .{ base, suffix }) catch break :blk APP_ID;
+        break :blk id.ptr;
     };
+
+    // GTK takes the Wayland app_id and the X11 WM_CLASS from the
+    // program name, NOT from the GApplication id. Without this the file
+    // manager's windows would still group under the terminal's taskbar
+    // entry with the terminal's icon.
+    if (g_app.files_mode) c.g_set_prgname(app_id);
 
     const app = c.adw_application_new(app_id, c.G_APPLICATION_HANDLES_COMMAND_LINE);
     defer c.g_object_unref(app);
@@ -361,6 +430,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     return @intCast(status & 0xff);
 }
 
+/// Parse argv as a `sketerm files ...` invocation, or null when it is
+/// not one. Result slices point into argv, which outlives the process's
+/// use of them.
+fn filesRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) ?files_entry.Request {
+    const args = allocator.alloc([]const u8, argv.len) catch return null;
+    defer allocator.free(args);
+    for (argv, 0..) |a, n| args[n] = std.mem.span(a);
+    return files_entry.parse(args);
+}
+
 fn onSignalQuit(user: ?*anyopaque) callconv(.c) c.gboolean {
     const app: *c.GApplication = @ptrCast(@alignCast(user.?));
     c.g_application_quit(app);
@@ -369,8 +448,15 @@ fn onSignalQuit(user: ?*anyopaque) callconv(.c) c.gboolean {
 
 fn onSignalReloadConfig(_: ?*anyopaque) callconv(.c) c.gboolean {
     // g_unix_signal_add dispatches on the main thread; safe to
-    // reach into Window from here.
-    if (g_app.window) |win| win.reloadConfigFromDisk();
+    // reach into Window from here. Every window has its own Config, so
+    // every window reloads; a secondary window used to keep the old one.
+    const primary = g_app.primary orelse return 1;
+    const app = c.gtk_window_get_application(@ptrCast(primary.app_window));
+    if (Window.liveWindows(g_app.allocator, app)) |wins| {
+        defer g_app.allocator.free(wins);
+        for (wins) |w| w.reloadConfigFromDisk();
+        if (wins.len == 0) primary.reloadConfigFromDisk();
+    } else |_| primary.reloadConfigFromDisk();
     return 1; // keep source — reload should be re-armable
 }
 
@@ -408,16 +494,6 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
             g_app.debug_events = true;
         } else if (std.mem.eql(u8, a, "--debug-images")) {
             g_app.debug_images = true;
-        } else if (std.mem.eql(u8, a, "files")) {
-            g_app.files_request = true;
-            if (n + 1 < argc) {
-                const peek = std.mem.span(@as([*:0]const u8, @ptrCast(argv_raw[@intCast(n + 1)])));
-                if (peek.len > 0 and peek[0] != '-') {
-                    n += 1;
-                    if (g_app.files_path) |old| g_app.allocator.free(old);
-                    g_app.files_path = g_app.allocator.dupe(u8, peek) catch null;
-                }
-            }
         } else if (std.mem.eql(u8, a, "--config") and n + 1 < argc) {
             n += 1;
             const v = std.mem.span(@as([*:0]const u8, @ptrCast(argv_raw[@intCast(n)])));
@@ -426,20 +502,31 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
         }
     }
 
-    // `sketerm files` against a RUNNING instance: open the browser
-    // tab there and present, no second window.
-    if (g_app.files_request and g_app.window != null) {
-        g_app.files_request = false;
-        openFilesTab();
-        c.g_application_activate(app);
-        return 0;
+    // A `sketerm files [spec]` forwarded into the running FILE-MANAGER
+    // instance: remember the requested location so activate opens a
+    // window there. Only this identity ever grows a browser window from
+    // the command line -- a terminal instance is left alone.
+    if (g_app.files_mode) {
+        var n2: c_int = 0;
+        var spec: ?[]const u8 = null;
+        while (n2 < argc) : (n2 += 1) {
+            const a_raw = argv_raw[@intCast(n2)];
+            if (a_raw == null) break;
+            const a = std.mem.span(@as([*:0]const u8, @ptrCast(a_raw)));
+            if (n2 > 0 and a.len > 0 and a[0] != '-' and !std.mem.eql(u8, a, "files")) {
+                spec = a;
+                break;
+            }
+        }
+        if (g_app.files_path) |old| g_app.allocator.free(old);
+        g_app.files_path = if (spec) |s| g_app.allocator.dupe(u8, s) catch null else null;
     }
 
     if (saw_toggle) {
         // Activate the toggle action if a window already exists; if
         // we are the primary and no window yet, fall through to
         // activate so the first --toggle launches and shows.
-        const has_window = c.g_application_get_is_registered(app) != 0 and g_app.window != null;
+        const has_window = c.g_application_get_is_registered(app) != 0 and g_app.primary != null;
         if (has_window) {
             c.g_action_group_activate_action(@ptrCast(app), "toggle", null);
             return 0;
@@ -453,7 +540,9 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
 }
 
 fn onToggleAction(_: *c.GSimpleAction, _: ?*c.GVariant, _: ?*anyopaque) callconv(.c) void {
-    const win = g_app.window orelse return;
+    // Quake mode is a property of the PRIMARY window (it owns the
+    // socket and the toggle action); secondary windows are ordinary.
+    const win = g_app.primary orelse return;
     win.toggleQuake();
 }
 
@@ -465,6 +554,24 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     if (c.gdk_display_get_default()) |display| {
         const theme = c.gtk_icon_theme_get_for_display(display);
         c.gtk_icon_theme_add_search_path(theme, "data/icons");
+    }
+
+    // Launching an already-running identity again = one more window,
+    // the normal GApplication behaviour. It MUST be a secondary window:
+    // a second is_primary window would quit the whole app when closed
+    // and would take over "the primary". (This used to build a second
+    // primary and overwrite g_app.window with it.)
+    if (g_app.primary) |primary| {
+        if (g_app.files_mode) {
+            const spec = takeFilesPath();
+            defer if (spec) |s| g_app.allocator.free(s);
+            _ = primary.openFilesWindow(spec) catch |err|
+                std.debug.print("sketerm: files window failed: {s}\n", .{@errorName(err)});
+        } else {
+            _ = primary.openShellWindow() catch |err|
+                std.debug.print("sketerm: window failed: {s}\n", .{@errorName(err)});
+        }
+        return;
     }
 
     // Honour --config path if provided, otherwise let Window.init use
@@ -479,13 +586,20 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         return;
     };
     window.debug_events = g_app.debug_events;
-    window.save_on_close = !g_app.no_save;
+    // The file manager never touches the terminal's saved layout:
+    // last.json / default.json describe ONE window of terminal tabs and
+    // belong to the terminal identity. So files mode neither saves nor
+    // restores a layout; its own state (per-folder view memory,
+    // registers, saved queries) is the browser's, and persists already.
+    window.save_on_close = !g_app.no_save and !g_app.files_mode;
     window.debug_images = g_app.debug_images;
     window.hold_override = g_app.hold;
-    g_app.window = window;
+    g_app.primary = window;
 
     var loaded = false;
-    if (g_app.layout_path) |path| {
+    if (g_app.files_mode) {
+        // no layout in files mode -- see save_on_close above
+    } else if (g_app.layout_path) |path| {
         loaded = window.loadLayoutFromPath(path) catch false;
     } else if (g_app.restore) {
         loaded = window.loadLayoutDefault() catch false;
@@ -495,42 +609,60 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         loaded = window.loadDefaultLayoutIfPresent() catch false;
     }
 
-    if (!loaded and !g_app.files_request) {
+    if (g_app.files_mode) {
+        // The browser tab IS the window's content: no stray shell tab.
+        const spec = takeFilesPath();
+        defer if (spec) |s| g_app.allocator.free(s);
+        window.newBrowserTabFrom(null, spec) catch |err| {
+            std.debug.print("sketerm: files tab failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+    } else if (!loaded) {
         window.newShellTab(null) catch |err| {
             std.debug.print("sketerm: spawn first tab failed: {s}\n", .{@errorName(err)});
             return;
         };
     }
 
-    if (g_app.files_request) {
-        g_app.files_request = false;
-        openFilesTab();
-    }
-
     window.present();
 }
 
-/// Open a browser tab in the current window, honoring the optional
-/// `sketerm files <spec>` start location.
-fn openFilesTab() void {
-    const win = g_app.window orelse return;
-    // Files mode gets its own window identity (title + icon match
-    // the dev.sker.sketerm.files desktop entry).
-    c.gtk_window_set_title(@ptrCast(@alignCast(win.app_window)), "Sketerm Files");
-    c.gtk_window_set_icon_name(@ptrCast(@alignCast(win.app_window)), "dev.sker.sketerm.files");
-    win.newBrowserTabAt(g_app.files_path) catch |err| {
-        std.debug.print("sketerm: files tab failed: {s}\n", .{@errorName(err)});
-    };
-    if (g_app.files_path) |p| {
-        g_app.allocator.free(p);
-        g_app.files_path = null;
-    }
+/// Take the pending `sketerm files [spec]` start location OUT of the
+/// app state: ownership moves to the caller (which frees it), so a
+/// later invocation with no spec cannot inherit this one's.
+fn takeFilesPath() ?[]const u8 {
+    const p = g_app.files_path;
+    g_app.files_path = null;
+    return p;
 }
 
-fn onShutdown(_: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
-    if (g_app.window) |w| {
-        if (!g_app.no_save and !w.layout_saved_final) w.saveLayoutQuietly();
-        w.deinit();
-        g_app.window = null;
+fn onShutdown(app: ?*c.GApplication, _: ?*anyopaque) callconv(.c) void {
+    // Every live window, not just the primary: a secondary window (tab
+    // drag-out, repeat launch) owns real panes and GUI-owned daemon
+    // sessions, and skipping it leaked both. GTK destroys the windows
+    // AFTER this handler, so detach our handlers first, or the
+    // destroy calls back into freed Window state.
+    //
+    // Only the PRIMARY window's layout is saved: last.json holds one
+    // window's tabs (layout.Layout has no window dimension), so writing
+    // several would just leave the last one standing. Multi-window
+    // layout persistence needs a format change and is not attempted
+    // here.
+    const gtk_app: ?*c.GtkApplication = @ptrCast(@alignCast(app));
+    if (Window.liveWindows(g_app.allocator, gtk_app)) |wins| {
+        defer g_app.allocator.free(wins);
+        for (wins) |w| shutdownWindow(w);
+    } else |_| {
+        if (g_app.primary) |w| shutdownWindow(w);
     }
+    g_app.primary = null;
+}
+
+fn shutdownWindow(w: *Window) void {
+    if (w.is_primary and w.save_on_close and !g_app.no_save and !w.layout_saved_final) {
+        w.saveLayoutQuietly();
+        w.layout_saved_final = true;
+    }
+    w.detachWindowSignals();
+    w.deinit();
 }
