@@ -181,9 +181,7 @@ pub fn closeTab(self: *BrowserView, tab: *BTab) void {
     // Snapshot first: undo-close-tab needs the location AND the
     // history this is about to free.
     self.stashClosedTab(tab);
-    self.flatForget(tab);
     self.visualForget(tab);
-    if (self.search_tab == tab) self.search_tab = null;
     if (self.register_tab == tab) self.register_tab = null;
     if (self.arch_tab == tab) {
         self.arch_tab = null;
@@ -350,9 +348,10 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     tab.root.deinit();
     tab.root = candidate;
     tab.hc = hc;
-    // A running flat view belonged to the OLD root; the new folder
-    // brings its own remembered view settings.
-    self.flatForget(tab);
+    // A running query (flat view, search results) belonged to the OLD
+    // root; the new folder brings its own remembered view settings,
+    // and the host job has nothing left to fill.
+    self.queryForget(tab);
     // A media batch in flight was asked for rows that no longer
     // exist; its answers would be paid for and thrown away.
     self.mediaResetForNavigation();

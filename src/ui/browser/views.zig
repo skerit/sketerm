@@ -18,12 +18,8 @@ const viewmem = @import("../../filebrowser/viewmem.zig");
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const Entry = @import("types.zig").Entry;
-const HostConn = @import("types.zig").HostConn;
-const WireJobEv = @import("types.zig").WireJobEv;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const menuButton = @import("menu.zig").menuButton;
-const upsertFlatMatch = @import("search.zig").upsertFlatMatch;
-const removeFlatMatch = @import("search.zig").removeFlatMatch;
 
 /// One zoom step. Icon sizes stop at 128 on purpose: that is the
 /// freedesktop `normal` tier the thumbnail pipeline generates and
@@ -87,11 +83,6 @@ pub const State = struct {
     syncing_filter: bool = false,
     /// Per-folder view memory, loaded on first use.
     mem: ?viewmem.Store = null,
-    /// The one flat/branch view (like search: one at a time), its
-    /// streaming job and the host running it.
-    flat_tab: ?*BTab = null,
-    flat_job: u64 = 0,
-    flat_hc: ?*HostConn = null,
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         _ = allocator;
@@ -296,11 +287,18 @@ pub fn setGrouping(self: *BrowserView, tab: *BTab, on: bool) void {
 /// search produces (full path in `target`, path relative to the root
 /// as the display name), so every entry verb keeps working.
 pub fn toggleFlat(self: *BrowserView, tab: *BTab) void {
-    if (self.views.flat_tab == tab) {
-        stopFlat(self, true);
+    if (flatOn(tab)) {
+        stopFlat(self, tab);
         return;
     }
     startFlat(self, tab);
+}
+
+/// Whether this tab is showing its own subtree flattened (as opposed
+/// to a query results tab, which is flat but is not a directory).
+pub fn flatOn(tab: *BTab) bool {
+    const q = tab.query orelse return false;
+    return q.mode == .flat;
 }
 
 pub fn startFlat(self: *BrowserView, tab: *BTab) void {
@@ -316,9 +314,6 @@ pub fn startFlat(self: *BrowserView, tab: *BTab) void {
         self.setStatusFmt("not connected to {s}", .{tab.hc.label()});
         return;
     }
-    // Only one flat view at a time (one recursive watcher per view).
-    if (self.views.flat_tab != null) stopFlat(self, true);
-
     // The subtree stream replaces the directory subscription.
     self.cancelPendingDir(tab.root);
     self.closeViewOf(tab.hc, tab.root);
@@ -328,32 +323,24 @@ pub fn startFlat(self: *BrowserView, tab: *BTab) void {
     tab.dropSubdirsUnder(tab.root.path);
     tab.root.flat = true;
     tab.root.loaded = true;
-    self.views.flat_tab = tab;
-    self.views.flat_job = 0;
-    self.views.flat_hc = tab.hc;
-    var label: [200]u8 = undefined;
-    const lbl = std.fmt.bufPrint(&label, "flatten {s}", .{tab.root.path}) catch "flatten";
-    // live_find is the streaming find that also WATCHES: a rename or
-    // delete inside the subtree updates the flat list by itself.
-    self.startDaemonJobKind(tab.hc, "live_find", tab.root.path, "", "*", lbl, .flat_view);
-    self.setStatusFmt("flattening {s}…", .{tab.root.path});
+    // A flat view IS a live query over the tab's own directory: the
+    // same live_find job, so a rename or delete in the subtree updates
+    // the list by itself, and the same per-tab ownership, so several
+    // flattened tabs coexist.
+    var root_buf: [4096]u8 = undefined;
+    if (tab.root.path.len >= root_buf.len) return;
+    @memcpy(root_buf[0..tab.root.path.len], tab.root.path);
+    const root = root_buf[0..tab.root.path.len];
+    if (!self.queryStart(tab, root, "*", .{ .kind = .live_name, .pattern = "*" }, .flat)) return;
+    self.setStatusFmt("flattening {s}…", .{root});
     self.renderTab(tab);
 }
 
-/// Stop the flat view. `restore` re-subscribes the directory the tab
-/// was flattening (false is for a tab that is going away anyway).
-pub fn stopFlat(self: *BrowserView, restore: bool) void {
-    const tab = self.views.flat_tab orelse return;
-    if (self.views.flat_job != 0) {
-        if (self.views.flat_hc) |hc| {
-            if (hc.state == .ready)
-                self.sendOp(hc, .{ .req = self.nextReq(), .op = "job_cancel", .job = self.views.flat_job });
-        }
-    }
-    self.views.flat_tab = null;
-    self.views.flat_job = 0;
-    self.views.flat_hc = null;
-    if (!restore) return;
+/// Stop `tab`'s flat view and re-subscribe the directory it was
+/// flattening.
+pub fn stopFlat(self: *BrowserView, tab: *BTab) void {
+    if (!flatOn(tab)) return;
+    self.queryForget(tab);
     for (tab.root.entries.items) |*e| e.deinit(self.allocator);
     tab.root.entries.clearRetainingCapacity();
     tab.root.flat = false;
@@ -364,56 +351,6 @@ pub fn stopFlat(self: *BrowserView, restore: bool) void {
     self.openDir(tab, tab.root);
     self.setStatusFmt("flat view off: {s}", .{tab.root.path});
     self.renderTab(tab);
-}
-
-/// Forget a tab that is being closed while it holds the flat view.
-pub fn flatForget(self: *BrowserView, tab: *BTab) void {
-    if (self.views.flat_tab != tab) return;
-    stopFlat(self, false);
-}
-
-/// Consume a streamed event for the flat view's job.
-/// @return true when the event belonged to it (and must not fall
-/// through to the search/jobs handling).
-pub fn flatConsumeEvent(self: *BrowserView, hc: *HostConn, e: WireJobEv) bool {
-    const tab = self.views.flat_tab orelse return false;
-    if (self.views.flat_job == 0 or e.job != self.views.flat_job or hc != self.views.flat_hc) return false;
-    if (!tab.root.flat) {
-        // The tab navigated away underneath the job; nothing left to
-        // fill, so drop the watcher.
-        stopFlat(self, false);
-        return false;
-    }
-    if (std.mem.eql(u8, e.ev, "match")) {
-        upsertFlatMatch(self, tab, e);
-        // Coalesced: a subtree stream can land thousands of rows.
-        self.scheduleThumbRender();
-        return true;
-    }
-    if (std.mem.eql(u8, e.ev, "unmatch")) {
-        removeFlatMatch(self, tab, e.path);
-        self.scheduleThumbRender();
-        return true;
-    }
-    if (std.mem.eql(u8, e.ev, "ready")) {
-        self.setStatusFmt("flat view: {d} item(s) under {s}", .{
-            tab.root.entries.items.len, tab.root.path,
-        });
-        self.renderTab(tab);
-        return true;
-    }
-    if (std.mem.eql(u8, e.ev, "resync")) {
-        self.setStatus("flat view watcher overflowed; toggle flat view to resync");
-        return true;
-    }
-    if (e.terminalEv()) {
-        // The watcher died (or was canceled): keep the rows the user
-        // is looking at, but stop claiming the view is live.
-        self.views.flat_tab = null;
-        self.views.flat_job = 0;
-        self.views.flat_hc = null;
-    }
-    return false;
 }
 
 // -- per-folder view memory --------------------------------------
@@ -531,7 +468,7 @@ pub fn onViewMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
 
     const flat = c.gtk_check_button_new_with_label("Flat view (whole subtree)");
     c.gtk_widget_set_tooltip_text(flat, "Flatten every file under this folder into one operable list");
-    c.gtk_check_button_set_active(@ptrCast(flat), @intFromBool(self.views.flat_tab == tab));
+    c.gtk_check_button_set_active(@ptrCast(flat), @intFromBool(flatOn(tab)));
     _ = c.g_signal_connect_data(flat, "toggled", @ptrCast(&onFlatToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(box), flat);
 
@@ -597,7 +534,7 @@ pub fn onFlatToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) v
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
     const tab = self.currentTab() orelse return;
     const want = c.gtk_check_button_get_active(check) != 0;
-    if (want == (self.views.flat_tab == tab)) return;
+    if (want == flatOn(tab)) return;
     toggleFlat(self, tab);
 }
 

@@ -476,9 +476,12 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     for (self.pending_jobs.items, 0..) |pj, i| {
         if (pj.req != rep.req) continue;
         if (rep.ok and rep.job != 0) {
-            if (pj.kind == .search) {
-                self.search_job = rep.job;
-                self.search_hc = hc;
+            if (pj.kind == .query) {
+                // The tab may have closed since the request went out;
+                // its query was forgotten and pj.tab nulled with it.
+                if (pj.tab) |t| {
+                    if (self.tabAlive(t)) self.queryStarted(t, hc, rep.job);
+                }
             }
             if (self.compare) |cmp| {
                 if (pj.kind == .compare_left) cmp.left.job = rep.job;
@@ -498,10 +501,6 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             if (pj.kind == .archive_list) {
                 self.arch_job = rep.job;
                 self.arch_hc = hc;
-            }
-            if (pj.kind == .flat_view) {
-                self.views.flat_job = rep.job;
-                self.views.flat_hc = hc;
             }
             const row = self.allocator.create(JobRow) catch break;
             row.* = .{
@@ -531,6 +530,13 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             self.setStatusFmt("operation failed: {s}", .{rep.@"error"});
             if (pj.kind == .compare_left or pj.kind == .compare_right) {
                 if (self.compare) |cmp| cmp.sideFailed(pj.kind == .compare_left);
+            }
+            // A query whose job never started must not sit on its tab
+            // claiming to be live.
+            if (pj.kind == .query) {
+                if (pj.tab) |t| {
+                    if (self.tabAlive(t)) self.queryForget(t);
+                }
             }
             if (pj.undo_op) |u| u.destroy(self.allocator);
             if (pj.undo_trash_orig) |o| self.allocator.free(o);

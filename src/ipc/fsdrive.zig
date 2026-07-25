@@ -204,8 +204,17 @@ pub const JobEvent = struct {
     text: []const u8 = "",
     kind: []const u8 = "",
     size: u64 = 0,
+    mtime_ms: i64 = 0,
     matches: u64 = 0,
     truncated: bool = false,
+    /// Live-query status detail (ev == "ready"): how many directories
+    /// the query watches, and whether the watch cap stopped it.
+    watches: u64 = 0,
+    watch_limit: bool = false,
+    /// panelize: output lines that named nothing on disk, plus the
+    /// command's exit status (both on the done event).
+    rejected: u64 = 0,
+    exit_status: i64 = 0,
     /// Progress detail: the entry in flight (sticky daemon-side, so
     /// present on every event once the job has named one) plus the
     /// entry counters of a tree operation.
@@ -342,8 +351,13 @@ pub const Fs = struct {
             text: []const u8 = "",
             kind: []const u8 = "",
             size: u64 = 0,
+            mtime_ms: i64 = 0,
             matches: u64 = 0,
             truncated: bool = false,
+            watches: u64 = 0,
+            watch_limit: bool = false,
+            rejected: u64 = 0,
+            exit_status: i64 = 0,
             file: []const u8 = "",
             files_done: u64 = 0,
             files_total: u64 = 0,
@@ -372,8 +386,13 @@ pub const Fs = struct {
             .text = parsed.text,
             .kind = parsed.kind,
             .size = parsed.size,
+            .mtime_ms = parsed.mtime_ms,
             .matches = parsed.matches,
             .truncated = parsed.truncated,
+            .watches = parsed.watches,
+            .watch_limit = parsed.watch_limit,
+            .rejected = parsed.rejected,
+            .exit_status = parsed.exit_status,
             .file = parsed.file,
             .files_done = parsed.files_done,
             .files_total = parsed.files_total,
@@ -482,6 +501,10 @@ pub const Fs = struct {
             dir_mode: []const u8 = "",
             job: u64 = 0,
             pattern: []const u8 = "",
+            /// find/live_find: only entries modified inside this
+            /// window (0 = all), and a raised match cap.
+            within_ms: u64 = 0,
+            max_matches: u64 = 0,
             mode: u32 = 0,
             uid: ?u32 = null,
             gid: ?u32 = null,
@@ -811,8 +834,26 @@ pub const Fs = struct {
         return self.startJob("find", .{ .path = root, .pattern = pattern });
     }
 
+    /// Extra predicates a name query can carry. `within_ms` stays LIVE
+    /// in a live_find: the helper drops a row when its mtime ages past
+    /// the window, without the caller re-running anything.
+    pub const FindOpts = struct {
+        within_ms: u64 = 0,
+        /// 0 = the daemon default cap.
+        max_matches: u64 = 0,
+    };
+
     pub fn startLiveFind(self: *Fs, root: []const u8, pattern: []const u8) Error!u64 {
-        return self.startJob("live_find", .{ .path = root, .pattern = pattern });
+        return self.startLiveFindOpts(root, pattern, .{});
+    }
+
+    pub fn startLiveFindOpts(self: *Fs, root: []const u8, pattern: []const u8, opts: FindOpts) Error!u64 {
+        return self.startJob("live_find", .{
+            .path = root,
+            .pattern = pattern,
+            .within_ms = opts.within_ms,
+            .max_matches = opts.max_matches,
+        });
     }
 
     /// Recursive ci content search; matches carry path + line + text.

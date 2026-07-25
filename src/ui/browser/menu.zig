@@ -633,7 +633,7 @@ pub fn onMenuUndo(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 pub fn onMenuCalcSize(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
     const path = ctx.path orelse return menuDone(ctx);
-    ctx.view.startDaemonJobKind(ctx.tab.hc, "find", path, "", "*", "calculate size", .calc_size);
+    ctx.view.startDaemonJobKind(ctx.tab.hc, "find", path, "", "*", "calculate size", .{ .kind = .calc_size });
     menuDone(ctx);
 }
 

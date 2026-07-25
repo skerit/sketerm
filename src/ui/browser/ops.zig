@@ -1010,7 +1010,7 @@ pub fn startArchiveBrowse(self: *BrowserView, tab: *BTab, archive: []const u8) v
     const l = std.fmt.bufPrintZ(&lbl, "{s}", .{std.fs.path.basename(archive)}) catch "archive";
     c.gtk_label_set_text(rtab.tab_label, l.ptr);
     self.arch_tab = rtab;
-    self.startDaemonJobKind(rtab.hc, "archive_list", archive, "", "", "list archive", .archive_list);
+    self.startDaemonJobKind(rtab.hc, "archive_list", archive, "", "", "list archive", .{ .kind = .archive_list });
 }
 
 pub fn onArchiveMember(self: *BrowserView, e: WireJobEv) void {

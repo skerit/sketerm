@@ -80,7 +80,9 @@ pub fn kindOf(mode: c.mode_t) []const u8 {
     };
 }
 
-fn mtimeMs(st: *const c.struct_stat) i64 {
+/// Modification time of a stat result in wall-clock milliseconds.
+/// Public because every stat-driven job event carries one.
+pub fn mtimeMs(st: *const c.struct_stat) i64 {
     const ts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
     return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
 }

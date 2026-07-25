@@ -1,9 +1,16 @@
-//! The places sidebar: bookmarks, recent locations, saved searches and
+//! The places sidebar: bookmarks, recent locations, saved queries and
 //! the daemon-reported devices, persisted through filebrowser/places.
+//!
+//! A saved query and a saved search are ONE record: the root spec plus
+//! the query text as typed. Whether opening it subscribes (a live name
+//! query) or scans once (a grep, a panel command) follows from the
+//! text, so there is one list and one label rather than two mechanisms
+//! for one concept.
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const places_mod = @import("../../filebrowser/places.zig");
+const query_mod = @import("../../filebrowser/query.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
 const trashFilesDir = @import("../../filebrowser/paths.zig").trashFilesDir;
@@ -109,19 +116,29 @@ pub fn renderPlaces(self: *BrowserView) void {
         }
     }
     if (self.saved_searches.items.len > 0) {
-        self.placeHeader("Saved Searches");
+        self.placeHeader("Saved Queries");
         for (self.saved_searches.items, 0..) |sq, i| {
+            // A saved query is durable, not a stored mode: what it is
+            // follows from its own text, resolved here so the label
+            // and the run can never disagree.
+            const q = query_mod.parse(sq.pattern, sq.content);
+            // Kind first: the row ellipsizes in the MIDDLE, so what a
+            // query is has to sit where the ellipsis cannot eat it.
             var lbl: [300]u8 = undefined;
-            const ltxt = std.fmt.bufPrint(&lbl, "{s}{s} in {s}", .{
+            const ltxt = std.fmt.bufPrint(&lbl, "[{s}] {s} in {s}", .{
+                if (q) |v| v.kindLabel() else "empty",
                 sq.pattern,
-                if (sq.content) " (content)" else "",
                 sq.spec,
             }) catch sq.pattern;
             // Encode the index as "search:<i>" — rows resolve it
             // at click time so edits do not dangle.
             var spec_buf: [32]u8 = undefined;
             const sspec = std.fmt.bufPrint(&spec_buf, "search:{d}", .{i}) catch continue;
-            self.placeRow("system-search-symbolic", ltxt, sspec, true);
+            const icon: [*:0]const u8 = if (q != null and q.?.live())
+                "folder-saved-search-symbolic"
+            else
+                "system-search-symbolic";
+            self.placeRow(icon, ltxt, sspec, true);
         }
     }
     if (self.recent.items.len > 0) {
@@ -190,33 +207,42 @@ pub fn onPlaceActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaq
     self.navigateSpec(tab, buf[0..ctx.spec.len]);
 }
 
-/// Re-run a saved search: navigate its root, refill the search
-/// bar, and fire.
+/// Open a saved query: navigate its root, refill the search bar, and
+/// fire. A name query comes back LIVE -- reopening one is a
+/// subscription, not a re-run, which is the whole point of saving it.
 pub fn runSavedSearch(self: *BrowserView, idx: usize) void {
     if (idx >= self.saved_searches.items.len) return;
     const sq = self.saved_searches.items[idx];
     const tab = self.currentTab() orelse (self.newTabSpec(sq.spec) orelse return);
+    // Both strings live in the saved list, which navigateSpec's own
+    // recent-list bookkeeping can reallocate underneath us.
     var buf: [4300]u8 = undefined;
-    if (sq.spec.len >= buf.len) return;
+    var pbuf: [512]u8 = undefined;
+    if (sq.spec.len >= buf.len or sq.pattern.len >= pbuf.len) return;
     @memcpy(buf[0..sq.spec.len], sq.spec);
-    self.navigateSpec(tab, buf[0..sq.spec.len]);
+    @memcpy(pbuf[0..sq.pattern.len], sq.pattern);
+    const spec = buf[0..sq.spec.len];
+    const text = pbuf[0..sq.pattern.len];
+    const content = sq.content;
+    self.navigateSpec(tab, spec);
     var pz: [512:0]u8 = undefined;
-    const pat = std.fmt.bufPrintZ(&pz, "{s}", .{sq.pattern}) catch return;
+    const pat = std.fmt.bufPrintZ(&pz, "{s}", .{text}) catch return;
     c.gtk_editable_set_text(@ptrCast(self.search_entry), pat.ptr);
-    c.gtk_check_button_set_active(@ptrCast(self.search_content), @intFromBool(sq.content));
+    c.gtk_check_button_set_active(@ptrCast(self.search_content), @intFromBool(content));
     c.gtk_widget_set_visible(self.search_bar, 1);
-    self.startSearch();
+    const q = query_mod.parse(text, content) orelse return;
+    self.runQuery(tab, text, q);
 }
 
 pub fn onSaveSearchClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
     const ls = self.last_search orelse {
-        self.setStatus("run a search first, then save it");
+        self.setStatus("run a query first, then save it");
         return;
     };
     for (self.saved_searches.items) |sq| {
         if (std.mem.eql(u8, sq.spec, ls.spec) and std.mem.eql(u8, sq.pattern, ls.pattern) and sq.content == ls.content) {
-            self.setStatus("search already saved");
+            self.setStatus("query already saved");
             return;
         }
     }
@@ -232,7 +258,7 @@ pub fn onSaveSearchClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
     };
     self.savePlaces();
     if (self.places_on) self.renderPlaces();
-    self.setStatusFmt("saved search: {s}", .{ls.pattern});
+    self.setStatusFmt("saved query: {s}", .{ls.pattern});
 }
 
 pub fn onBookmarkRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

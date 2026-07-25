@@ -1285,6 +1285,11 @@ const FsJob = struct {
     /// find/grep: total matches streamed + cap-truncation flag.
     matches: u64 = 0,
     truncated: bool = false,
+    /// panelize: output lines that named nothing on disk, and the
+    /// command's own exit status (-1 = it died on a signal). A nonzero
+    /// status is reported, not treated as a failed job.
+    rejected: u64 = 0,
+    exit_status: i64 = 0,
     /// Entry the helper is working on RIGHT NOW, and how far through
     /// its entry count it is. The helper puts the path on the wire
     /// only when it changes, so this is sticky between updates.
@@ -4335,6 +4340,8 @@ pub const Daemon = struct {
             .message = job.message[0..job.message_len],
             .matches = job.matches,
             .truncated = job.truncated,
+            .rejected = job.rejected,
+            .exit_status = job.exit_status,
             .path = job.done_path[0..job.done_path_len],
             .text = job.done_text[0..job.done_text_len],
             .file = job.cur_file[0..job.cur_file_len],
@@ -4376,8 +4383,16 @@ pub const Daemon = struct {
             text: []const u8 = "",
             kind: []const u8 = "",
             size: u64 = 0,
+            mtime_ms: i64 = 0,
             matches: u64 = 0,
             truncated: bool = false,
+            /// Live-query status detail (ev == "ready").
+            watches: u64 = 0,
+            watch_limit: bool = false,
+            /// panelize: output lines that were not usable paths, and
+            /// what the command exited with (-1 = killed by a signal).
+            rejected: u64 = 0,
+            exit_status: i64 = 0,
             /// Progress detail: the entry in flight (present only when
             /// it CHANGED — the helper does not repeat it) and the
             /// entry counters for tree operations.
@@ -4395,10 +4410,14 @@ pub const Daemon = struct {
         defer parsed.deinit();
         const e = parsed.value;
         if (std.mem.eql(u8, e.ev, "match") or std.mem.eql(u8, e.ev, "unmatch") or
-            std.mem.eql(u8, e.ev, "resync"))
+            std.mem.eql(u8, e.ev, "resync") or std.mem.eql(u8, e.ev, "ready") or
+            std.mem.eql(u8, e.ev, "reject"))
         {
-            // Search hit: forwarded verbatim toward the owner (never
-            // stored — the stream IS the result).
+            // Streaming query events: forwarded verbatim toward the
+            // owner (never stored -- the stream IS the result). `ready`
+            // is a live query's status line and repeats whenever one of
+            // its bounds is newly hit; `reject` is one output line a
+            // panelize command produced that was not a usable path.
             if (std.mem.eql(u8, e.ev, "match")) job.matches += 1;
             if (job.owner) |owner| {
                 if (!owner.dead) owner.queueJson(.fs_job, .{
@@ -4409,8 +4428,13 @@ pub const Daemon = struct {
                     .text = e.text,
                     .kind = e.kind,
                     .size = e.size,
+                    .mtime_ms = e.mtime_ms,
                     .meta = e.meta,
                     .cached = e.cached,
+                    .matches = e.matches,
+                    .truncated = e.truncated,
+                    .watches = e.watches,
+                    .watch_limit = e.watch_limit,
                 });
             }
             return;
@@ -4431,6 +4455,8 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, e.ev, "done")) {
             job.matches = if (e.matches > 0) e.matches else job.matches;
             job.truncated = e.truncated;
+            job.rejected = e.rejected;
+            job.exit_status = e.exit_status;
             // Cancel raced completion: the work DID finish — honesty
             // says report done, not canceled.
             job.state = .done;

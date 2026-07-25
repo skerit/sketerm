@@ -14,6 +14,7 @@ const fstransfer = @import("../../ipc/fstransfer.zig");
 const xferqueue = @import("../../filebrowser/xferqueue.zig");
 
 const ActiveTransfer = @import("types.zig").ActiveTransfer;
+const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const EditWatch = @import("types.zig").EditWatch;
 const HistoryDirection = @import("types.zig").HistoryDirection;
@@ -393,8 +394,20 @@ pub fn startTransfer(
 }
 
 pub fn startDaemonJob(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, label: []const u8) void {
-    self.startDaemonJobKind(hc, op, path, to, "", label, .normal);
+    self.startDaemonJobKind(hc, op, path, to, "", label, .{});
 }
+
+/// Who the job's reply belongs to. The daemon answers a start request
+/// with the job id, and only then can a machine that streams events
+/// (a tab's query, the duplicate finder, a compare side) recognize
+/// its own events -- so the request has to remember its owner.
+pub const JobBind = struct {
+    kind: @FieldType(PendingJob, "kind") = .normal,
+    /// The tab whose query this job feeds (`.query` only). Never
+    /// dereferenced without `tabAlive`: a tab can close while its
+    /// start request is still in flight.
+    tab: ?*BTab = null,
+};
 
 /// Like startDaemonJob, with hash-verified resume on (sync).
 pub fn startDaemonJobResumable(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, label: []const u8) void {
@@ -424,12 +437,12 @@ pub fn startDaemonJobResumable(self: *BrowserView, hc: *HostConn, comptime op: [
 pub fn startDaemonJobKind(
     self: *BrowserView,
     hc: *HostConn,
-    comptime op: []const u8,
+    op: []const u8,
     path: []const u8,
     to: []const u8,
     pattern: []const u8,
     label: []const u8,
-    kind: @FieldType(PendingJob, "kind"),
+    bind: JobBind,
 ) void {
     if (hc.state != .ready) {
         self.setStatusFmt("not connected to {s}", .{hc.label()});
@@ -444,7 +457,8 @@ pub fn startDaemonJobKind(
             self.allocator.destroy(pj);
             return;
         },
-        .kind = kind,
+        .kind = bind.kind,
+        .tab = bind.tab,
     };
     pj.paths.set(path, to);
     self.pending_jobs.append(self.allocator, pj) catch {
@@ -504,8 +518,9 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
     if (self.dup) |d| {
         if (d.hc == hc and self.dupConsumeEvent(d, e)) return;
     }
-    // Flat/branch view: the subtree stream filling a flat tab.
-    if (self.flatConsumeEvent(hc, e)) return;
+    // Per-tab queries: searches, live queries, panels and flat views
+    // all stream into the tab that owns the job.
+    if (self.queryConsumeEvent(hc, e)) return;
     // Archive member listing.
     if (self.arch_job != 0 and e.job == self.arch_job and hc == self.arch_hc) {
         if (std.mem.eql(u8, e.ev, "match")) {
@@ -521,24 +536,11 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
             self.arch_job = 0;
         }
     }
-    if (std.mem.eql(u8, e.ev, "match")) {
-        if (e.job == self.search_job and hc == self.search_hc) self.onSearchMatch(e);
-        return;
-    }
-    if (std.mem.eql(u8, e.ev, "unmatch")) {
-        if (e.job == self.search_job and hc == self.search_hc) self.onSearchUnmatch(e.path);
-        return;
-    }
-    if (std.mem.eql(u8, e.ev, "resync")) {
-        if (e.job == self.search_job and hc == self.search_hc)
-            self.setStatus("live query watcher overflowed; rerun the saved query to resync");
-        return;
-    }
-    if (e.job == self.search_job and hc == self.search_hc and std.mem.eql(u8, e.ev, "done")) {
-        self.setStatusFmt("search done: {d} match(es){s}", .{
-            e.matches, if (e.truncated) " (truncated)" else "",
-        });
-    }
+    // Streaming query events belong to whichever tab owns the job;
+    // one that reaches here has no owner left and is simply spent.
+    if (std.mem.eql(u8, e.ev, "match") or std.mem.eql(u8, e.ev, "unmatch") or
+        std.mem.eql(u8, e.ev, "resync") or std.mem.eql(u8, e.ev, "ready") or
+        std.mem.eql(u8, e.ev, "reject")) return;
     const row = for (self.jobs.items) |j| {
         if (j.hc == hc and j.job == e.job) break j;
     } else return;

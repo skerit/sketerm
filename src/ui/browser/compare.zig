@@ -563,7 +563,7 @@ pub fn startCompare(self: *BrowserView, tab: *BTab, right_path: []const u8) void
     // Host-side digest scans (pattern * = everything; raised cap
     // so big trees compare fully).
     self.search_max_matches = 100_000;
-    self.startDaemonJobKind(left_hc, "find", cmp.left.root, "", "*", "scan source tree", .compare_left);
+    self.startDaemonJobKind(left_hc, "find", cmp.left.root, "", "*", "scan source tree", .{ .kind = .compare_left });
     self.search_max_matches = 100_000;
-    self.startDaemonJobKind(right_hc, "find", cmp.right.root, "", "*", "scan target tree", .compare_right);
+    self.startDaemonJobKind(right_hc, "find", cmp.right.root, "", "*", "scan target tree", .{ .kind = .compare_right });
 }
