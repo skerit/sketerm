@@ -484,9 +484,17 @@ pub const Compositor = struct {
     /// Surface currently holding pointer / keyboard focus (0 = none).
     pointer_focus: u32 = 0,
     keyboard_focus: u32 = 0,
-    /// Version the client bound wl_seat at (gates repeat_info,
-    /// pointer frame grouping, axis_value120).
+    /// Version of the LAST wl_seat bind — the fallback for devices
+    /// whose own seat is unknown (state_sync restore).
     seat_version: u32 = 1,
+    /// Interface version per bound object id. A client may bind the
+    /// SAME global at DIFFERENT versions (Firefox binds wl_seat at
+    /// both v5 and v8, from separate registries) and every event has
+    /// to be gated against the version of the object it goes to — a
+    /// v8-only event on a v5 wl_pointer hits a NULL listener slot and
+    /// aborts the client outright. Seat devices inherit their seat's
+    /// version at get_pointer/get_keyboard/get_touch.
+    obj_versions: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Version the client bound wl_compositor at (gates the
     /// preferred_buffer_scale/transform events on new surfaces).
     compositor_version: u32 = 1,
@@ -665,6 +673,7 @@ pub const Compositor = struct {
         self.data_control_devices.deinit(a);
         self.pointers.deinit(a);
         self.keyboards.deinit(a);
+        self.obj_versions.deinit(a);
         self.rel_pointers.deinit(a);
         self.constraints.deinit(a);
         self.text_inputs.deinit(a);
@@ -788,17 +797,31 @@ pub const Compositor = struct {
     /// `axis`: 0 vertical, 1 horizontal. `value` in surface px.
     /// `value120`: high-resolution wheel amount (±120 per detent),
     /// 0 for smooth/finger scroll.
+    /// Interface version an object was bound/created at (falls back to
+    /// the last wl_seat bind for devices restored from a state_sync,
+    /// which carries no per-object versions).
+    fn objVersion(self: *const Compositor, id: u32) u32 {
+        return self.obj_versions.get(id) orelse self.seat_version;
+    }
+
+    /// A child object speaks the version of the object that made it.
+    fn inheritVersion(self: *Compositor, id: u32, parent: u32) Error!void {
+        self.obj_versions.put(self.allocator, id, self.objVersion(parent)) catch
+            return Error.OutOfMemory;
+    }
+
     pub fn pointerAxis(self: *Compositor, axis: u32, value: f64, value120: i32) Error!void {
         if (self.pointer_focus == 0 or self.drag.active) return;
         for (self.pointers.items) |p| {
+            const pv = self.objVersion(p);
             if (value120 != 0) {
-                if (self.seat_version >= 8) {
+                if (pv >= 8) {
                     var vbuf: [16]u8 = undefined;
                     var vb = wire.Builder.init(&vbuf, p, 9); // axis_value120
                     vb.putUint(axis);
                     vb.putInt(value120);
                     try self.send(try vb.finish());
-                } else if (self.seat_version >= 5) {
+                } else if (pv >= 5) {
                     var dbuf: [16]u8 = undefined;
                     var db = wire.Builder.init(&dbuf, p, 8); // axis_discrete
                     db.putUint(axis);
@@ -819,7 +842,7 @@ pub const Compositor = struct {
     /// v5-bound clients buffer pointer events until the frame that
     /// closes the group — skipping it means input arrives never.
     fn pointerFrame(self: *Compositor, p: u32) Error!void {
-        if (self.seat_version < 5) return;
+        if (self.objVersion(p) < 5) return;
         var buf: [16]u8 = undefined;
         var b = wire.Builder.init(&buf, p, 5); // frame
         try self.send(try b.finish());
@@ -1527,6 +1550,7 @@ pub const Compositor = struct {
                 return Error.Protocol;
             }
             try self.register(id, g.iface);
+            self.obj_versions.put(self.allocator, id, ver) catch return Error.OutOfMemory;
             if (g.iface == &protocol.wl_seat) self.seat_version = ver;
             if (g.iface == &protocol.wl_compositor) self.compositor_version = ver;
             if (g.iface == &protocol.xdg_wm_base) self.wm_base_version = ver;
@@ -1787,11 +1811,13 @@ pub const Compositor = struct {
             0 => { // get_pointer
                 const id = (try it.next()).?.new_id;
                 try self.register(id, &protocol.wl_pointer);
+                try self.inheritVersion(id, hdr.object);
                 try self.pointers.append(self.allocator, id);
             },
             1 => { // get_keyboard
                 const id = (try it.next()).?.new_id;
                 try self.register(id, &protocol.wl_keyboard);
+                try self.inheritVersion(id, hdr.object);
                 try self.keyboards.append(self.allocator, id);
                 // The daemon materializes the keymap fd and emits
                 // wl_keyboard.keymap(id, format, fd, size) itself.
@@ -1803,7 +1829,7 @@ pub const Compositor = struct {
                 try payload.appendSlice(self.allocator, &meta);
                 try payload.appendSlice(self.allocator, self.keymap);
                 try pipe.appendUnit(&self.out, self.allocator, .keymap, payload.items);
-                if (self.seat_version >= 4) {
+                if (self.objVersion(id) >= 4) {
                     var rbuf: [16]u8 = undefined;
                     var rb = wire.Builder.init(&rbuf, id, 5); // repeat_info
                     rb.putInt(30); // keys/sec
@@ -1812,7 +1838,9 @@ pub const Compositor = struct {
                 }
             },
             2 => { // get_touch — registered, never speaks
-                try self.register((try it.next()).?.new_id, &protocol.wl_touch);
+                const id = (try it.next()).?.new_id;
+                try self.register(id, &protocol.wl_touch);
+                try self.inheritVersion(id, hdr.object);
             },
             3 => try self.destroyObject(hdr.object), // release (v5)
             else => return Error.Protocol,
@@ -2830,6 +2858,177 @@ pub const Compositor = struct {
         cb(self.view.ctx, sid, @intCast(w), @intCast(h), scale, lw, lh, info.format, self.frame_scratch.items);
     }
 
+    // ── surface-tree queries (renderer-facing) ──────────────────
+    // A window is a TREE: the root surface's own buffer plus every
+    // subsurface descendant. Firefox/Camoufox is the extreme case —
+    // the xdg_toplevel surface only ever carries the CSD background,
+    // and 100% of the chrome and page content lives in one
+    // desync'd subsurface that the client attaches to forever after.
+    // A renderer that presents only the root buffer therefore shows
+    // a single flat frame and never updates again.
+
+    /// One subsurface layer of a window tree, placeable directly in
+    /// root-local coordinates.
+    pub const SubLayer = struct {
+        sid: u32,
+        /// Offset from the ROOT surface's origin (offsets accumulate
+        /// down the tree).
+        x: i32,
+        y: i32,
+        /// Paint BEFORE the root's own buffer (stacked below the
+        /// parent). Inherited from the topmost ancestor's placement.
+        below: bool,
+    };
+
+    /// Cycle guard for the recursive tree walks: a malicious or
+    /// confused client cannot make us recurse without bound.
+    const max_sub_depth = 16;
+
+    /// Count of leading `below` entries in a `subtreeLayers` result
+    /// (the group painted before the root's own buffer).
+    pub fn belowCount(layers: []const SubLayer) usize {
+        var n: usize = 0;
+        while (n < layers.len and layers[n].below) n += 1;
+        return n;
+    }
+
+    /// Subsurface descendants of `root` in PAINT order (bottom to
+    /// top): every `below` layer first, then the caller paints the
+    /// root's own buffer, then the remainder.
+    ///
+    /// Siblings order by surface id — Wayland ids are handed out in
+    /// increasing creation order, so that is creation order in
+    /// practice. `wl_subsurface.place_above`/`place_below` against a
+    /// SIBLING (rather than the parent) is not modeled.
+    pub fn subtreeLayers(
+        self: *const Compositor,
+        a: std.mem.Allocator,
+        root: u32,
+        out: *std.ArrayList(SubLayer),
+    ) Error!void {
+        var tree: std.ArrayList(SubLayer) = .empty;
+        defer tree.deinit(a);
+        try self.collectSubLayers(a, root, 0, 0, null, 0, &tree);
+        // Paint order: the below-parent group first, each group in
+        // tree order (no reliance on sort stability).
+        for (tree.items) |l| if (l.below)
+            out.append(a, l) catch return Error.OutOfMemory;
+        for (tree.items) |l| if (!l.below)
+            out.append(a, l) catch return Error.OutOfMemory;
+    }
+
+    fn collectSubLayers(
+        self: *const Compositor,
+        a: std.mem.Allocator,
+        parent: u32,
+        base_x: i32,
+        base_y: i32,
+        group_below: ?bool,
+        depth: u32,
+        out: *std.ArrayList(SubLayer),
+    ) Error!void {
+        if (depth >= max_sub_depth) return;
+        // Direct children, sorted by sid (= creation order).
+        var kids: std.ArrayList(u32) = .empty;
+        defer kids.deinit(a);
+        var it = self.surfaces.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.subparent == parent and e.key_ptr.* != parent)
+                kids.append(a, e.key_ptr.*) catch return Error.OutOfMemory;
+        }
+        std.mem.sort(u32, kids.items, {}, std.sort.asc(u32));
+        for (kids.items) |sid| {
+            const s = self.surfaces.getPtr(sid) orelse continue;
+            const below = group_below orelse s.sub_below;
+            const x = base_x + s.sub_x;
+            const y = base_y + s.sub_y;
+            out.append(a, .{ .sid = sid, .x = x, .y = y, .below = below }) catch
+                return Error.OutOfMemory;
+            try self.collectSubLayers(a, sid, x, y, below, depth + 1, out);
+        }
+    }
+
+    /// The root of `sid`'s surface tree: `sid` itself unless it is a
+    /// subsurface, in which case the topmost non-subsurface ancestor
+    /// (the toplevel or popup whose window it is part of).
+    pub fn rootSurface(self: *const Compositor, sid: u32) u32 {
+        var cur = sid;
+        var depth: u32 = 0;
+        while (depth < max_sub_depth) : (depth += 1) {
+            const s = self.surfaces.getPtr(cur) orelse return cur;
+            if (s.subparent == 0 or s.subparent == cur) return cur;
+            cur = s.subparent;
+        }
+        return cur;
+    }
+
+    /// A surface's LOGICAL extent (what its offsets and input region
+    /// are expressed in): the viewport destination when set, else the
+    /// committed buffer size divided by the buffer scale. Null when
+    /// the surface has no content (unmapped).
+    pub fn surfaceExtent(self: *const Compositor, sid: u32) ?struct { w: i32, h: i32 } {
+        const s = self.surfaces.getPtr(sid) orelse return null;
+        if (s.vp_w > 0 and s.vp_h > 0) return .{ .w = s.vp_w, .h = s.vp_h };
+        if (s.committed_buffer == 0) return null;
+        const info = self.buffers.get(s.committed_buffer) orelse return null;
+        const scale = @max(1, s.buffer_scale);
+        return .{ .w = @divTrunc(info.width, scale), .h = @divTrunc(info.height, scale) };
+    }
+
+    /// Whether `sid` accepts pointer input at the surface-local point
+    /// (inside its extent AND its committed input region).
+    fn acceptsInput(self: *const Compositor, sid: u32, x: f64, y: f64) bool {
+        const ext = self.surfaceExtent(sid) orelse return false;
+        if (x < 0 or y < 0) return false;
+        if (x >= @as(f64, @floatFromInt(ext.w)) or y >= @as(f64, @floatFromInt(ext.h))) return false;
+        const s = self.surfaces.getPtr(sid) orelse return false;
+        if (s.input_whole) return true;
+        for (s.input_rects.items) |r| {
+            const fx = @as(f64, @floatFromInt(r.x));
+            const fy = @as(f64, @floatFromInt(r.y));
+            if (x >= fx and y >= fy and
+                x < fx + @as(f64, @floatFromInt(r.w)) and
+                y < fy + @as(f64, @floatFromInt(r.h))) return true;
+        }
+        return false;
+    }
+
+    /// Where a pointer at `root`-local (`x`,`y`) actually lands.
+    pub const Hit = struct { sid: u32, x: f64, y: f64 };
+
+    /// Topmost input-accepting surface of `root`'s tree under the
+    /// point, with the point translated into that surface's own
+    /// coordinate space. Falls back to `root` unchanged when nothing
+    /// (not even the root) claims the point — a caller must always
+    /// get a deliverable target, never a dropped event.
+    pub fn hitTest(self: *const Compositor, a: std.mem.Allocator, root: u32, x: f64, y: f64) Hit {
+        const fallback = Hit{ .sid = root, .x = x, .y = y };
+        var layers: std.ArrayList(SubLayer) = .empty;
+        defer layers.deinit(a);
+        self.subtreeLayers(a, root, &layers) catch return fallback;
+        // Top to bottom: above-parent layers (reverse paint order),
+        // then the root itself, then the below-parent layers.
+        const n_below = belowCount(layers.items);
+        var i = layers.items.len;
+        while (i > n_below) {
+            i -= 1;
+            const l = layers.items[i];
+            const lx = x - @as(f64, @floatFromInt(l.x));
+            const ly = y - @as(f64, @floatFromInt(l.y));
+            if (self.acceptsInput(l.sid, lx, ly)) return .{ .sid = l.sid, .x = lx, .y = ly };
+        }
+        if (self.acceptsInput(root, x, y)) return fallback;
+        var j = n_below;
+        while (j > 0) {
+            j -= 1;
+            const l = layers.items[j];
+            const lx = x - @as(f64, @floatFromInt(l.x));
+            const ly = y - @as(f64, @floatFromInt(l.y));
+            if (self.acceptsInput(l.sid, lx, ly)) return .{ .sid = l.sid, .x = lx, .y = ly };
+        }
+        return fallback;
+    }
+
     /// The effective display scale × 120 (fractional-scale wire unit).
     fn effScale120(self: *const Compositor) u32 {
         if (self.scale120 != 0) return self.scale120;
@@ -3023,6 +3222,7 @@ pub const Compositor = struct {
 
     fn deleteId(self: *Compositor, id: u32) Error!void {
         _ = self.objects.remove(id);
+        _ = self.obj_versions.remove(id);
         var buf: [16]u8 = undefined;
         var b = wire.Builder.init(&buf, 1, 1); // wl_display.delete_id
         b.putUint(id);
@@ -3398,6 +3598,11 @@ pub const Compositor = struct {
         self.keyboard_focus = try r.u32v();
 
         self.objects.clearRetainingCapacity();
+        // Per-object versions are NOT in the blob (a replica never
+        // sends protocol events, and live binds after the restore
+        // repopulate it): drop stale entries and fall back to
+        // seat_version for anything the replay does not rebind.
+        self.obj_versions.clearRetainingCapacity();
         const n_obj = try r.u32v();
         for (0..n_obj) |_| {
             const id = try r.u32v();
@@ -5309,6 +5514,279 @@ fn getRegistry(comp: *Compositor) !void {
     var b = wire.Builder.init(&buf, 1, 1);
     b.putNewId(2);
     try req(comp, try b.finish());
+}
+
+test "Firefox: per-object seat versions gate pointer axis and repeat_info" {
+    // Firefox binds wl_seat TWICE from separate registries — v5 for
+    // its widget code, v8 for the compositor thread — and takes a
+    // pointer + keyboard from each. A single global seat_version sent
+    // axis_value120 (v8, opcode 9) to the v5 pointer, whose listener
+    // slot for it is NULL: libwayland aborts the client ("listener
+    // function for opcode 9 of wl_pointer is NULL"). Every event must
+    // be gated on the version of the object it goes to.
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 6, 3);
+    try bindGlobal(&comp, 3, "wl_seat", 5, 4); // old seat
+    try bindGlobal(&comp, 3, "wl_seat", 8, 5); // modern seat
+    { // seat 4 (v5): get_pointer(6) + get_keyboard(7)
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(6);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 4, 1);
+        b2.putNewId(7);
+        try req(&comp, try b2.finish());
+    }
+    { // seat 5 (v8): get_pointer(8)
+        var b = wire.Builder.init(&buf, 5, 0);
+        b.putNewId(8);
+        try req(&comp, try b.finish());
+    }
+    { // create_surface(10) so the pointer has a focus target
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(10);
+        try req(&comp, try b.finish());
+    }
+    comp.clearOut();
+
+    try comp.pointerEnter(10, 4, 4);
+    comp.clearOut();
+    try comp.pointerAxis(0, 15.0, 120);
+
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    try drainEvents(&comp, &evs);
+    // Pointer 6 is v5: axis_discrete (8), never axis_value120 (9).
+    // Pointer 8 is v8: axis_value120 (9), never axis_discrete.
+    const expect = [_][2]u32{
+        .{ 6, 8 }, .{ 6, 4 }, .{ 6, 5 }, // discrete, axis, frame
+        .{ 8, 9 }, .{ 8, 4 }, .{ 8, 5 }, // value120, axis, frame
+    };
+    try t.expectEqualSlices([2]u32, &expect, evs.items);
+
+    // A v3 seat's keyboard predates repeat_info (v4) and must not get it.
+    try bindGlobal(&comp, 3, "wl_seat", 3, 11);
+    comp.clearOut();
+    { // get_keyboard(12) on the v3 seat
+        var b = wire.Builder.init(&buf, 11, 1);
+        b.putNewId(12);
+        try req(&comp, try b.finish());
+    }
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    for (evs.items) |e| try t.expect(!(e[0] == 12 and e[1] == 5));
+    // ...while the v8 seat's keyboard does.
+    comp.clearOut();
+    { // get_keyboard(13) on the v8 seat
+        var b = wire.Builder.init(&buf, 5, 1);
+        b.putNewId(13);
+        try req(&comp, try b.finish());
+    }
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    var saw_repeat = false;
+    for (evs.items) |e| if (e[0] == 13 and e[1] == 5) {
+        saw_repeat = true;
+    };
+    try t.expect(saw_repeat);
+
+    // A v3 pointer gets neither the v5 frame nor any discrete event.
+    { // get_pointer(14) on the v3 seat
+        var b = wire.Builder.init(&buf, 11, 0);
+        b.putNewId(14);
+        try req(&comp, try b.finish());
+    }
+    comp.clearOut();
+    try comp.pointerAxis(0, 15.0, 120);
+    evs.clearRetainingCapacity();
+    try drainEvents(&comp, &evs);
+    for (evs.items) |e| if (e[0] == 14) try t.expectEqual(@as(u32, 4), e[1]);
+}
+
+test "Firefox: content subsurface layers above the CSD root and takes input" {
+    // Firefox's xdg_toplevel surface only ever carries the CSD
+    // background; chrome and page content live in one desync'd
+    // subsurface it re-attaches to forever. A renderer needs the tree
+    // (subtreeLayers) to compose the window, and input has to land on
+    // the subsurface (hitTest), not the root.
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 6, 3);
+    try bindGlobal(&comp, 2, "wl_shm", 1, 4);
+    try bindGlobal(&comp, 5, "xdg_wm_base", 6, 5);
+    try bindGlobal(&comp, 11, "wl_subcompositor", 1, 6);
+
+    { // root surface 7 + xdg toplevel
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(7);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 5, 2); // get_xdg_surface(8, 7)
+        b2.putNewId(8);
+        b2.putObject(7);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 8, 1); // get_toplevel(9)
+        b3.putNewId(9);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 7, 6); // commit → configure
+        try req(&comp, try b4.finish());
+    }
+    { // content surface 10, subsurface of 7 at (10, 5)
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(10);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 6, 1); // get_subsurface(11, 10, 7)
+        b2.putNewId(11);
+        b2.putObject(10);
+        b2.putObject(7);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 11, 1); // set_position(10, 5)
+        b3.putInt(10);
+        b3.putInt(5);
+        try req(&comp, try b3.finish());
+    }
+    { // pool 12 with room for both buffers
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(12);
+        b.putInt(5600);
+        try req(&comp, try b.finish());
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        const px = try t.allocator.alloc(u8, 5600);
+        defer t.allocator.free(px);
+        @memset(px, 0x40);
+        try pipe.appendPoolUpdate(&unit, t.allocator, 12, 0, px);
+        try comp.feed(unit.items);
+    }
+    { // create_buffer(13) root 40x30, create_buffer(14) sub 20x10
+        var b = wire.Builder.init(&buf, 12, 0);
+        b.putNewId(13);
+        b.putInt(0);
+        b.putInt(40);
+        b.putInt(30);
+        b.putInt(160);
+        b.putUint(0); // argb8888
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 12, 0);
+        b2.putNewId(14);
+        b2.putInt(4800);
+        b2.putInt(20);
+        b2.putInt(10);
+        b2.putInt(80);
+        b2.putUint(0);
+        try req(&comp, try b2.finish());
+    }
+    { // attach + commit both surfaces
+        var b = wire.Builder.init(&buf, 7, 1);
+        b.putObject(13);
+        b.putInt(0);
+        b.putInt(0);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 7, 6);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 10, 1);
+        b3.putObject(14);
+        b3.putInt(0);
+        b3.putInt(0);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 10, 6);
+        try req(&comp, try b4.finish());
+    }
+
+    // Both surfaces reached the view as frames (the subsurface is a
+    // repaint of the window, not a separate window).
+    try t.expectEqual(@as(usize, 2), tv.frames);
+    try t.expectEqual(@as(u32, 7), comp.rootSurface(10));
+    try t.expectEqual(@as(u32, 7), comp.rootSurface(7));
+
+    var layers: std.ArrayList(Compositor.SubLayer) = .empty;
+    defer layers.deinit(t.allocator);
+    try comp.subtreeLayers(t.allocator, 7, &layers);
+    try t.expectEqual(@as(usize, 1), layers.items.len);
+    try t.expectEqual(@as(u32, 10), layers.items[0].sid);
+    try t.expectEqual(@as(i32, 10), layers.items[0].x);
+    try t.expectEqual(@as(i32, 5), layers.items[0].y);
+    try t.expect(!layers.items[0].below);
+    try t.expectEqual(@as(usize, 0), Compositor.belowCount(layers.items));
+
+    // Inside the subsurface: input goes there, in ITS coordinates.
+    const inside = comp.hitTest(t.allocator, 7, 15, 8);
+    try t.expectEqual(@as(u32, 10), inside.sid);
+    try t.expectEqual(@as(f64, 5), inside.x);
+    try t.expectEqual(@as(f64, 3), inside.y);
+    // Outside it, but inside the root: the root takes it unchanged.
+    const outside = comp.hitTest(t.allocator, 7, 2, 2);
+    try t.expectEqual(@as(u32, 7), outside.sid);
+    try t.expectEqual(@as(f64, 2), outside.x);
+
+    // A nested subsurface accumulates offsets and wins the hit.
+    { // surface 15, subsurface(16) of 10 at (2, 1)
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(15);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 6, 1);
+        b2.putNewId(16);
+        b2.putObject(15);
+        b2.putObject(10);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 16, 1); // set_position(2, 1)
+        b3.putInt(2);
+        b3.putInt(1);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 15, 1); // attach the sub buffer
+        b4.putObject(14);
+        b4.putInt(0);
+        b4.putInt(0);
+        try req(&comp, try b4.finish());
+        var b5 = wire.Builder.init(&buf, 15, 6);
+        try req(&comp, try b5.finish());
+    }
+    layers.clearRetainingCapacity();
+    try comp.subtreeLayers(t.allocator, 7, &layers);
+    try t.expectEqual(@as(usize, 2), layers.items.len);
+    try t.expectEqual(@as(u32, 15), layers.items[1].sid);
+    try t.expectEqual(@as(i32, 12), layers.items[1].x); // 10 + 2
+    try t.expectEqual(@as(i32, 6), layers.items[1].y); // 5 + 1
+    const nested = comp.hitTest(t.allocator, 7, 13, 7);
+    try t.expectEqual(@as(u32, 15), nested.sid);
+    try t.expectEqual(@as(f64, 1), nested.x);
+    try t.expectEqual(@as(f64, 1), nested.y);
+
+    // JBR's pattern: place the content subsurface BELOW the root. It
+    // paints first and the root's own buffer covers it, so the hit
+    // goes to the root.
+    { // place_below(sibling = parent 7)
+        var b = wire.Builder.init(&buf, 11, 3);
+        b.putObject(7);
+        try req(&comp, try b.finish());
+    }
+    layers.clearRetainingCapacity();
+    try comp.subtreeLayers(t.allocator, 7, &layers);
+    try t.expectEqual(@as(usize, 2), Compositor.belowCount(layers.items));
+    const covered = comp.hitTest(t.allocator, 7, 15, 8);
+    try t.expectEqual(@as(u32, 7), covered.sid);
+
+    // A root that rejects the point (CSD shadow: input region excludes
+    // it) hands the hit to the below-parent layer under it.
+    { // create_region(17), no rects → set_input_region + commit
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putNewId(17);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 7, 5); // set_input_region(17)
+        b2.putObject(17);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 7, 6);
+        try req(&comp, try b3.finish());
+    }
+    const through = comp.hitTest(t.allocator, 7, 15, 8);
+    try t.expectEqual(@as(u32, 15), through.sid);
 }
 
 test "v6 compositor / v6 wm_base / v4 output obligations" {
