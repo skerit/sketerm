@@ -149,7 +149,9 @@ Design documents are never committed — proposals stay untracked in the working
 
 ## Packaging
 
-`dist/PKGBUILD` builds the locally-checked-out repo (no remote source) and packages both binaries. Run `cd dist && makepkg -si`. The `.desktop` file lives at `data/dev.sker.sketerm.desktop`; the icon at `data/icons/hicolor/scalable/apps/dev.sker.sketerm.svg`. Terminfo source at `terminfo/sketerm-256color.src` — `tic`-compiled into `/usr/share/terminfo` by the PKGBUILD.
+`dist/PKGBUILD` builds the locally-checked-out repo (no remote source) and packages both binaries. Run `cd dist && ./install.sh` (= `makepkg -sif`). **Plain `makepkg -si` is a trap**: `pkgver()` derives from HEAD and uncommitted changes do not move it, so rebuilding the same commit hits "A package has already been built", exits 13, and installs NOTHING while leaving the old binary in place. There is no `check()`: installing is not the time to run the suite. The perpetually dirty `pkgver=` line in `git status` is makepkg's own rewrite, not a local edit.
+
+Two desktop entries and two app icons ship, because **files mode is its own application identity**: `sketerm files` registers the GApplication id `dev.sker.sketerm.files` and sets the matching prgname, so on Wayland the toplevel app_id and on X11 the WM_CLASS are that string and KDE gives the file manager its own taskbar entry and icon (a per-window `gtk_window_set_icon_name` cannot do this). `data/dev.sker.sketerm.desktop` + `apps/dev.sker.sketerm.svg` are the terminal; `data/dev.sker.sketerm.files.desktop` + `apps/dev.sker.sketerm.files.svg` are the file manager, and the latter declares `MimeType=inode/directory;x-scheme-handler/file;` so it can be set as the default file manager. `StartupWMClass` in that entry MUST stay equal to the app id. This is additive: a browser face on a pane inside a terminal window (palette `new_browser_tab`/`new_browser_split`, `cli new-browser-tab`, `sketerm files --here|--tab`) is unrelated to the files identity and must keep working. Terminfo source at `terminfo/sketerm-256color.src` — `tic`-compiled into `/usr/share/terminfo` by the PKGBUILD.
 
 ## License
 

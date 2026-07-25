@@ -97,6 +97,11 @@ package() {
     install -Dm644 data/icons/hicolor/scalable/apps/dev.sker.sketerm.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.svg"
 
+    # Files mode is its own application identity (own GApplication id,
+    # own taskbar entry), so it needs its own app icon.
+    install -Dm644 data/icons/hicolor/scalable/apps/dev.sker.sketerm.files.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.sker.sketerm.files.svg"
+
     # Bundled symbolic action icons (split left/right + top/bottom for
     # the context menu; rendering for the prefs page), found via the
     # hicolor fallback theme so they resolve regardless of icon theme.
