@@ -20,5 +20,7 @@ pub const HostAction = @import("browser/types.zig").HostAction;
 /// bypass live GTK-free under src/filebrowser.
 pub const Loc = paths.Loc;
 pub const parseSpec = paths.parseSpec;
+pub const formatSpec = paths.formatSpec;
+pub const SPEC_BUF_LEN = paths.SPEC_BUF_LEN;
 pub const BypassHit = paths.BypassHit;
 pub const mountBypass = paths.mountBypass;

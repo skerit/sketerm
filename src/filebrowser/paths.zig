@@ -30,6 +30,27 @@ pub fn parseSpec(spec: []const u8) Loc {
     return .{ .host = null, .current_host = true, .path = spec };
 }
 
+/// Buffer size a caller must provide to hold any spec `formatSpec`
+/// can produce (host + ':' + a PATH_MAX-class path).
+pub const SPEC_BUF_LEN = 4300;
+
+/// The inverse of `parseSpec`: render (host, path) as an unambiguous
+/// spec. Local paths are host-qualified as "local:" so a round trip
+/// never picks up a "current host". Falls back to the bare path when
+/// `buf` is too small, so the result is NOT always a slice of `buf`.
+pub fn formatSpec(buf: []u8, host: ?[]const u8, path: []const u8) []const u8 {
+    if (host) |h| return std.fmt.bufPrint(buf, "{s}:{s}", .{ h, path }) catch path;
+    return std.fmt.bufPrint(buf, "local:{s}", .{path}) catch path;
+}
+
+/// Whether `name` is offered as a path-bar completion for `prefix`
+/// (dotfiles are never suggested; matching is case-insensitive).
+pub fn completionMatches(name: []const u8, prefix: []const u8) bool {
+    if (name.len > 0 and name[0] == '.') return false;
+    if (prefix.len > name.len) return false;
+    return std.ascii.eqlIgnoreCase(prefix, name[0..prefix.len]);
+}
+
 /// A network-mount bypass hit: (mountpoint under `path`) rewritten
 /// to direct mux access on the mount's source host.
 pub const BypassHit = struct {
@@ -268,6 +289,55 @@ test "parseSpec forms" {
     l = parseSpec("docs");
     try t.expect(l.current_host);
     try t.expectEqualStrings("docs", l.path);
+}
+
+test "formatSpec round-trips through parseSpec" {
+    const t = std.testing;
+    var buf: [SPEC_BUF_LEN]u8 = undefined;
+
+    try t.expectEqualStrings("local:/etc", formatSpec(&buf, null, "/etc"));
+    try t.expectEqualStrings("nas:/srv/data", formatSpec(&buf, "nas", "/srv/data"));
+    try t.expectEqualStrings("udp:box:/p", formatSpec(&buf, "udp:box", "/p"));
+
+    // The spec a browser tab hands out must parse back to the same
+    // (host, path) with no dependence on a "current" host.
+    const local = parseSpec(formatSpec(&buf, null, "/etc"));
+    try t.expect(local.host == null and !local.current_host);
+    try t.expectEqualStrings("/etc", local.path);
+    const remote = parseSpec(formatSpec(&buf, "user@box", "/home/x"));
+    try t.expectEqualStrings("user@box", remote.host.?);
+    try t.expectEqualStrings("/home/x", remote.path);
+}
+
+test "formatSpec results in separate buffers do not alias" {
+    const t = std.testing;
+    // The regression: both specs used to be written into one
+    // BrowserView-owned scratch buffer, so the first result was
+    // silently rewritten by the second.
+    var a_buf: [SPEC_BUF_LEN]u8 = undefined;
+    var b_buf: [SPEC_BUF_LEN]u8 = undefined;
+    const a = formatSpec(&a_buf, "nas", "/srv/data");
+    const b = formatSpec(&b_buf, null, "/etc");
+    try t.expectEqualStrings("nas:/srv/data", a);
+    try t.expectEqualStrings("local:/etc", b);
+}
+
+test "formatSpec falls back to the bare path when the buffer is too small" {
+    const t = std.testing;
+    var tiny: [4]u8 = undefined;
+    // Not a slice of `tiny` - documented in formatSpec's docblock.
+    try t.expectEqualStrings("/srv/data", formatSpec(&tiny, "nas", "/srv/data"));
+}
+
+test "completionMatches skips dotfiles and matches case-insensitively" {
+    const t = std.testing;
+    try t.expect(completionMatches("Downloads", "dow"));
+    try t.expect(completionMatches("downloads", "Dow"));
+    try t.expect(completionMatches("downloads", ""));
+    try t.expect(!completionMatches(".config", ""));
+    try t.expect(!completionMatches(".config", ".co"));
+    try t.expect(!completionMatches("doc", "docs"));
+    try t.expect(!completionMatches("etc", "us"));
 }
 
 test "isWorkerImageName excludes what gdk-pixbuf may not decode" {

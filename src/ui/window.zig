@@ -1328,9 +1328,11 @@ pub const Window = struct {
     /// Split the focused pane and give the new pane a browser face:
     /// the way a dual-pane (source/target) layout is created.
     pub fn newBrowserSplit(self: *Window, orient: c_uint) !void {
+        // Outlives the block: currentSpec writes into the caller's buffer.
+        var spec_buf: [@import("browser.zig").SPEC_BUF_LEN]u8 = undefined;
         const start_cwd: ?[]const u8 = blk: {
             const focused = self.focusedPane() orelse break :blk null;
-            if (@import("browser.zig").BrowserView.fromPane(focused)) |bv| break :blk bv.currentSpec();
+            if (@import("browser.zig").BrowserView.fromPane(focused)) |bv| break :blk bv.currentSpec(&spec_buf);
             break :blk self.focusedPaneCwd();
         };
         // Take the pane the split APPENDED: focus may still sit on the
@@ -6318,15 +6320,23 @@ pub const Window = struct {
         );
     }
 
-    /// Save current state to the default path. Best-effort.
-    pub fn saveLayoutQuietly(self: *Window) void {
+    /// Save current state to the default path.
+    fn saveLayoutToDefault(self: *Window) !void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const path = layout_mod.defaultSavePath(arena) catch return;
-        const layout = self.collectLayout(arena) catch return;
-        layout_mod.save(layout, path) catch return;
+        const path = try layout_mod.defaultSavePath(arena);
+        const layout = try self.collectLayout(arena);
+        try layout_mod.save(layout, path);
+    }
+
+    /// Save current state to the default path. Non-fatal: a failure is
+    /// logged, never raised. Runs at shutdown too, where a toast could
+    /// not be seen and a dialog would block teardown - so stderr (the
+    /// GUI's log channel) is the only report.
+    pub fn saveLayoutQuietly(self: *Window) void {
+        self.saveLayoutToDefault() catch |err| logActionError("save_layout", err);
     }
 
     /// Duplicate the focused tab — spawn a new tab inheriting the
@@ -6535,7 +6545,10 @@ pub const Window = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const path = layout_mod.defaultLayoutPath(arena) catch return;
+        const path = layout_mod.defaultLayoutPath(arena) catch |err| {
+            std.debug.print("sketerm: default layout path failed: {s}\n", .{@errorName(err)});
+            return;
+        };
         const layout = self.collectLayout(arena) catch |err| {
             std.debug.print("sketerm: collect layout failed: {s}\n", .{@errorName(err)});
             return;
@@ -6593,7 +6606,13 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .search_open => self.openSearch(),
         .cross_search => @import("xsearch.zig").open(self) catch |err| logActionError("cross_search", err),
         .attach_all => _ = self.attachAllSessions(null),
-        .save_layout => self.saveLayoutQuietly(),
+        // The user asked for this one, so a silent no-op is a lie: a
+        // toast on top of the log line, but still no dialog.
+        .save_layout => self.saveLayoutToDefault() catch |err| {
+            logActionError("save_layout", err);
+            var msg: [160]u8 = undefined;
+            showToast(self, std.fmt.bufPrint(&msg, "Could not save layout: {s}", .{@errorName(err)}) catch "Could not save layout");
+        },
         .save_layout_as => self.saveLayoutAs(),
         .save_default_layout => self.saveDefaultLayout(),
         .load_layout => self.loadLayoutAs(),

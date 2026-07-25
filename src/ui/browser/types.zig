@@ -10,6 +10,7 @@ const fstransfer = @import("../../ipc/fstransfer.zig");
 const browser_model = @import("../../filebrowser/model.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
+const formatSpec = @import("../../filebrowser/paths.zig").formatSpec;
 
 /// One owned directory entry (strings owned by the Dir's allocator).
 pub const Entry = struct {
@@ -420,10 +421,7 @@ pub const BTab = struct {
 
     /// The host-qualified spec for this tab's current location.
     pub fn spec(self: *BTab, buf: []u8) []const u8 {
-        if (self.hc.host) |h| {
-            return std.fmt.bufPrint(buf, "{s}:{s}", .{ h, self.root.path }) catch self.root.path;
-        }
-        return std.fmt.bufPrint(buf, "local:{s}", .{self.root.path}) catch self.root.path;
+        return formatSpec(buf, self.hc.host, self.root.path);
     }
 
     pub fn deinit(self: *BTab) void {

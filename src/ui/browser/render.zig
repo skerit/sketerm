@@ -380,6 +380,25 @@ pub fn renderGrid(self: *BrowserView, tab: *BTab) void {
     }
 }
 
+/// Make an entry widget (list row or grid tile) a drag source
+/// carrying its host-qualified spec as text. A terminal drop types
+/// it; a drop on another browser tab moves (same host) or copies
+/// (cross-host). Local entries deliberately drag as a BARE path, not
+/// "local:/x", so a terminal drop is directly usable.
+pub fn addEntryDragSource(tab: *BTab, widget: *c.GtkWidget, full: []const u8) void {
+    var pz: [4500:0]u8 = undefined;
+    const spec_res = if (tab.hc.host) |h|
+        std.fmt.bufPrintZ(&pz, "{s}:{s}", .{ h, full })
+    else
+        std.fmt.bufPrintZ(&pz, "{s}", .{full});
+    const pzs = spec_res catch return;
+    const provider = c.gdk_content_provider_new_typed(c.G_TYPE_STRING, pzs.ptr);
+    const dsrc = c.gtk_drag_source_new();
+    c.gtk_drag_source_set_content(dsrc, provider);
+    c.g_object_unref(provider);
+    c.gtk_widget_add_controller(widget, @ptrCast(dsrc));
+}
+
 pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) void {
     var full_buf: [4096]u8 = undefined;
     const full = tab.root.fullPath(e, &full_buf) orelse return;
@@ -427,6 +446,7 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
         .is_dir = e.tdir,
     };
     c.g_object_set_data_full(@ptrCast(child), "sketerm-row", @ptrCast(ctx), @ptrCast(&freeRowCtx));
+    addEntryDragSource(tab, child, full);
     c.gtk_flow_box_append(fb, child);
 }
 
@@ -761,23 +781,7 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
     };
     c.g_object_set_data_full(@ptrCast(row), "sketerm-row", @ptrCast(ctx), @ptrCast(&freeRowCtx));
 
-    // Drag source: host-qualified spec as text. A terminal drop
-    // types it (plain path for local files); a drop on another
-    // browser tab moves/copies (internal DnD).
-    {
-        var pz: [4500:0]u8 = undefined;
-        const spec_res = if (tab.hc.host) |h|
-            std.fmt.bufPrintZ(&pz, "{s}:{s}", .{ h, full })
-        else
-            std.fmt.bufPrintZ(&pz, "{s}", .{full});
-        if (spec_res) |pzs| {
-            const provider = c.gdk_content_provider_new_typed(c.G_TYPE_STRING, pzs.ptr);
-            const dsrc = c.gtk_drag_source_new();
-            c.gtk_drag_source_set_content(dsrc, provider);
-            c.g_object_unref(provider);
-            c.gtk_widget_add_controller(row, @ptrCast(dsrc));
-        } else |_| {}
-    }
+    addEntryDragSource(tab, row, full);
 
     c.gtk_list_box_append(tab.listbox, row);
 }
@@ -986,3 +990,4 @@ pub fn onViewModeClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     self.setStatusFmt("view: {s}", .{@tagName(tab.view_mode)});
     self.renderTab(tab);
 }
+
