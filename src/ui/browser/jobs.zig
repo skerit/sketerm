@@ -534,6 +534,14 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
             self.arch_job = 0;
         } else if (std.mem.eql(u8, e.ev, "error")) {
             self.arch_job = 0;
+            // An archive that could not be read must not read as an
+            // archive with no members.
+            if (self.arch_tab) |at| {
+                if (self.tabAlive(at)) {
+                    at.root.setLoadError(if (e.message.len > 0) e.message else "the archive could not be read");
+                    self.renderTab(at);
+                }
+            }
         }
     }
     // Streaming query events belong to whichever tab owns the job;

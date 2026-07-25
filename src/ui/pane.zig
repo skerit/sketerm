@@ -265,6 +265,14 @@ pub const Pane = struct {
     browser_widget: ?*c.GtkWidget = null,
     browser_ctx: ?*anyopaque = null,
     browser_deinit: ?*const fn (*anyopaque) void = null,
+    /// Put GTK focus inside the browser face (its listing). Called
+    /// whenever that face becomes the visible one.
+    browser_focus: ?*const fn (*anyopaque) void = null,
+    /// "File browser hidden - click to show it" strip, shown on the
+    /// TERMINAL face while a browser face exists on this pane. Without
+    /// it the browser is unreachable once hidden: only its own toolbar
+    /// could flip the faces.
+    browser_banner: ?*c.GtkWidget = null,
     /// The GraphicsOffload wrapping the GLArea — hidden while an app
     /// view (mirror of the session's forwarded windows) is shown.
     offload_widget: ?*c.GtkWidget = null,
@@ -490,8 +498,9 @@ pub const Pane = struct {
         // M4: keyboard input → PTY (also handles shortcuts).
         self.input_ctx = try input.attach(area_widget, terminal, allocator);
         if (self.input_ctx) |ictx| {
-            ictx.autohide_ctx = @ptrCast(self);
+            ictx.pane_ctx = @ptrCast(self);
             ictx.autohide_set = setCursorHiddenSink;
+            ictx.browser_toggle = toggleBrowserFaceSink;
         }
 
         // Resize → TIOCSWINSZ → SIGWINCH child.
@@ -642,6 +651,13 @@ pub const Pane = struct {
     fn setCursorHiddenSink(ctx: ?*anyopaque, hidden: bool) void {
         const self = cast.userData(Pane, ctx);
         self.cursor_hidden = hidden;
+    }
+
+    /// Wired into input.zig's browser_toggle: the `toggle_browser_face`
+    /// action, dispatched without input.zig importing pane.zig.
+    fn toggleBrowserFaceSink(ctx: ?*anyopaque) bool {
+        const self = cast.userData(Pane, ctx);
+        return self.toggleBrowserFace();
     }
 
     /// Push the current focus / dim settings into the renderer. Called
@@ -813,25 +829,65 @@ pub const Pane = struct {
     /// joins the pane's wrapper box as a second face; the terminal
     /// stays alive underneath (it IS "Open Terminal Here"). The pane
     /// owns teardown: `deinit_cb(ctx)` runs from detachBrowser.
-    pub fn attachBrowser(self: *Pane, face: *c.GtkWidget, ctx: *anyopaque, deinit_cb: *const fn (*anyopaque) void) void {
+    pub fn attachBrowser(
+        self: *Pane,
+        face: *c.GtkWidget,
+        ctx: *anyopaque,
+        deinit_cb: *const fn (*anyopaque) void,
+        focus_cb: *const fn (*anyopaque) void,
+    ) void {
         const wrap = self.wrapper_box orelse return;
         self.detachBrowser();
         self.browser_widget = face;
         self.browser_ctx = ctx;
         self.browser_deinit = deinit_cb;
+        self.browser_focus = focus_cb;
         c.gtk_widget_set_vexpand(face, 1);
         c.gtk_widget_set_hexpand(face, 1);
         c.gtk_box_append(@ptrCast(wrap), face);
         self.setBrowserVisible(true);
     }
 
-    /// Flip between the browser face and the terminal face.
+    /// Flip between the browser face and the terminal face. Hiding the
+    /// browser raises the strip that flips back: the terminal face has
+    /// no browser toolbar to click, so without it the trip is one-way.
     pub fn setBrowserVisible(self: *Pane, show: bool) void {
         const bw = self.browser_widget orelse return;
         c.gtk_widget_set_visible(bw, if (show) @as(c_int, 1) else 0);
         if (self.offload_widget) |ow|
             c.gtk_widget_set_visible(ow, if (show) @as(c_int, 0) else 1);
-        if (!show) _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        setBrowserBanner(self, !show);
+        // Focus follows the visible face, in BOTH directions. A hidden
+        // widget cannot hold GTK focus, so leaving it on the GL area
+        // while the browser shows left the keyboard talking to nothing:
+        // no chord, no type-ahead, and no way back by keyboard either.
+        if (show) {
+            if (self.browser_focus) |focus| {
+                if (self.browser_ctx) |ctx| focus(ctx);
+            }
+        } else {
+            _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+        }
+    }
+
+    /// True when this pane has a browser face at all (visible or not).
+    pub fn hasBrowserFace(self: *Pane) bool {
+        return self.browser_widget != null;
+    }
+
+    /// True while the browser face is the one showing.
+    pub fn browserFaceVisible(self: *Pane) bool {
+        const bw = self.browser_widget orelse return false;
+        return c.gtk_widget_get_visible(bw) != 0;
+    }
+
+    /// Swap the pane's two faces. @return false when there is no
+    /// browser face to swap to, so a caller can say so instead of
+    /// silently doing nothing.
+    pub fn toggleBrowserFace(self: *Pane) bool {
+        if (!self.hasBrowserFace()) return false;
+        self.setBrowserVisible(!self.browserFaceVisible());
+        return true;
     }
 
     /// Tear the browser face down (idempotent). Runs its deinit
@@ -847,7 +903,10 @@ pub const Pane = struct {
         }
         self.browser_ctx = null;
         self.browser_deinit = null;
+        self.browser_focus = null;
         self.browser_widget = null;
+        // No face left to go back to.
+        setBrowserBanner(self, false);
     }
 
     /// Sever the pane from its AppHost: return any embedded view to
@@ -1994,6 +2053,34 @@ fn setAppEmbedActive(self: *Pane, active: bool) void {
     self.app_embed_active = active;
     if (self.app_embed_box) |box| c.gtk_widget_set_visible(box, @intFromBool(active));
     if (self.offload_widget) |o| c.gtk_widget_set_visible(o, @intFromBool(!active));
+}
+
+/// Show/hide the "back to the file browser" strip above the terminal.
+///
+/// The browser face is a sibling widget with its own toolbar; the
+/// terminal face has nothing that mentions it, so this strip is what
+/// makes the browser reachable again by pointing at it. Same idiom (and
+/// CSS class) as the app-window banner.
+fn setBrowserBanner(self: *Pane, show: bool) void {
+    if (show) {
+        if (self.browser_banner == null) {
+            const btn = c.gtk_button_new_with_label("File browser hidden - click to show it (Ctrl+Shift+B)");
+            c.gtk_widget_add_css_class(btn, "sketerm-app-banner");
+            c.gtk_widget_set_hexpand(btn, 1);
+            c.gtk_widget_set_tooltip_text(btn, "Show this pane's file browser again. The shell keeps running underneath either way.");
+            _ = c.g_signal_connect_data(@ptrCast(btn), "clicked", @ptrCast(&onBrowserBannerClick), @ptrCast(self), null, 0);
+            if (self.wrapper_box) |wrap| c.gtk_box_prepend(@ptrCast(wrap), btn);
+            self.browser_banner = btn;
+        }
+        c.gtk_widget_set_visible(self.browser_banner.?, 1);
+    } else if (self.browser_banner) |b| {
+        c.gtk_widget_set_visible(b, 0);
+    }
+}
+
+fn onBrowserBannerClick(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Pane, user);
+    self.setBrowserVisible(true);
 }
 
 /// Show/hide the "app window open" banner above the log.

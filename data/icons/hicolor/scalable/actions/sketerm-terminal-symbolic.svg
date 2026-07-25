@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- A terminal window with a prompt: the browser toolbar's "show the
+       pane's shell" button. Monochrome symbolic, so GTK recolours the
+       fill to the toolbar foreground. Bundled (hicolor fallback) so it
+       resolves regardless of the user's icon theme: Adwaita ships
+       utilities-terminal-symbolic only under symbolic/legacy/, which a
+       Breeze-based theme chain (KDE) never reaches, and the button then
+       renders EMPTY. -->
+  <g fill="#2e3436">
+    <path d="M2 2.5h12A1.5 1.5 0 0 1 15.5 4v8a1.5 1.5 0 0 1-1.5 1.5H2A1.5 1.5 0 0 1 .5 12V4A1.5 1.5 0 0 1 2 2.5zm0 1.5v8h12V4z"/>
+    <path d="M3.6 5.9 5.7 8l-2.1 2.1 1 1L7.7 8 4.6 4.9z"/>
+    <rect x="8" y="10" width="4.4" height="1.4" rx="0.7"/>
+  </g>
+</svg>

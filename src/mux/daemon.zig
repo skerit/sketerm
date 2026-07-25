@@ -3488,8 +3488,12 @@ pub const Daemon = struct {
         defer arena_state.deinit();
         var attr_buf: [MAX_ATTR_NAMES][]const u8 = undefined;
         const attrs = splitAttrs(attr_spec, &attr_buf);
-        const l = fsserve.listDirAttrs(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES, attrs) catch {
-            fsReplyErr(cl, req, "cannot open directory");
+        // The REASON travels: "cannot open directory" made a permission
+        // denial and a vanished directory indistinguishable, and a
+        // client cannot report what it was never told.
+        var why: []const u8 = "";
+        const l = fsserve.listDirAttrsWhy(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES, attrs, &why) catch {
+            fsReplyErr(cl, req, if (why.len > 0) why else "cannot open directory");
             return false;
         };
 
