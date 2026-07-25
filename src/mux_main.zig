@@ -216,12 +216,7 @@ fn parsePortRange(s: []const u8) ?[2]u16 {
 }
 
 /// Monotonic milliseconds (Zig 0.16 removed std.time.milliTimestamp).
-fn nowMs() i64 {
-    const cc = @import("c.zig").c;
-    var ts: cc.struct_timespec = undefined;
-    _ = cc.clock_gettime(cc.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
-}
+const nowMs = @import("util/clock.zig").nowMs;
 
 /// Emit context: sendto the (possibly roaming) peer.
 const UdpOut = struct {

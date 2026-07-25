@@ -29,11 +29,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 fn sigNoop(_: c_int) callconv(.c) void {}
 
-fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
 
 pub const CHUNK: usize = 256 * 1024;
 /// Emit a progress line at least every this many bytes.
@@ -91,6 +87,11 @@ const MAX_MATCH_LINE: usize = 300;
 // ── progress emission ───────────────────────────────────────────
 
 fn emitRaw(line: []const u8) void {
+    // fd 1 is the job protocol, but under `zig build test --listen=-`
+    // it is the build runner's own IPC pipe: a stray progress line
+    // corrupts that protocol and hangs the whole test run. Tests that
+    // want the emission checked should call the encoder directly.
+    if (builtin.is_test) return;
     var off: usize = 0;
     while (off < line.len) {
         const n = c.write(1, line.ptr + off, line.len - off);
@@ -2507,7 +2508,11 @@ test "copyOneFile resumes only on matching prefix hash" {
     }
     var st: c.struct_stat = undefined;
     try t.expect(statOf(src, &st, true));
-    var progress = Progress{ .total = data.len };
+    // Quiet, and NOT optionally: progress lines go to fd 1, which
+    // under `zig build test --listen=-` is the build runner's IPC
+    // pipe. Emitting into it corrupts the protocol and wedges the
+    // run -- the "test runner hangs" this file caused for a while.
+    var progress = Progress{ .total = data.len, .quiet = true };
     switch (copyOneFile(src, dst, st, true, &progress)) {
         .ok => {},
         else => return error.TestUnexpectedResult,
@@ -2526,7 +2531,7 @@ test "copyOneFile resumes only on matching prefix hash" {
         var junk: [1024]u8 = @splat(0xAA);
         try t.expect(c.fwrite(&junk, 1, junk.len, f) == junk.len);
     }
-    var progress2 = Progress{ .total = data.len };
+    var progress2 = Progress{ .total = data.len, .quiet = true };
     switch (copyOneFile(src, dst, st, true, &progress2)) {
         .ok => {},
         else => return error.TestUnexpectedResult,

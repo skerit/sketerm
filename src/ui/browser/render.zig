@@ -427,8 +427,12 @@ pub fn ensureFlowbox(self: *BrowserView, tab: *BTab) *c.GtkFlowBox {
     c.gtk_box_append(@ptrCast(content), fs);
     _ = c.g_signal_connect_data(fb, "child-activated", @ptrCast(&onGridChildActivated), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     _ = c.g_signal_connect_data(fb, "selected-children-changed", @ptrCast(&onGridSelectionChanged), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+    // Capture phase for the same reason as the list view: GtkFlowBox
+    // selects on any button, which would collapse a multi-selection
+    // the context menu is about to act on (see menu.onRightClick).
     const rclick = c.gtk_gesture_click_new();
     c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
+    c.gtk_event_controller_set_propagation_phase(@ptrCast(rclick), c.GTK_PHASE_CAPTURE);
     _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onGridRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(@ptrCast(fb), @ptrCast(rclick));
     tab.flow_scroller = fs;
@@ -564,7 +568,6 @@ pub fn onGridSelectionChanged(fb: *c.GtkFlowBox, user: ?*anyopaque) callconv(.c)
 }
 
 pub fn onGridRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-    _ = gesture;
     _ = n_press;
     const tab: *BTab = @ptrCast(@alignCast(user.?));
     const self = tab.view;
@@ -578,7 +581,13 @@ pub fn onGridRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: 
             path = self.allocator.dupe(u8, rctx.path) catch null;
             name = self.allocator.dupe(u8, std.fs.path.basename(rctx.path)) catch null;
             is_dir = rctx.is_dir;
-            c.gtk_flow_box_select_child(fb, child);
+            // Same rule as the list view: a right-click inside a
+            // multi-selection must not collapse it, and the press has
+            // to be claimed or GtkFlowBox collapses it regardless
+            // (see menu.keepOrSelect).
+            _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
+            if (c.gtk_flow_box_child_is_selected(child) == 0)
+                c.gtk_flow_box_select_child(fb, child);
         }
     }
     self.showEntryMenu(tab, @as(*c.GtkWidget, @ptrCast(@alignCast(fb))), x, y, path, name, is_dir);

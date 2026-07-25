@@ -30,8 +30,12 @@ pub const State = struct {
     /// Which host and tab the open menu belongs to.
     hc: ?*HostConn = null,
     tab: ?*BTab = null,
-    /// Awaiting the host's directory identities, then its listing.
-    dirs_req: u32 = 0,
+    /// The menu opened before the connection's one `homedir` reply
+    /// landed; conn.zig calls onHostDirs when it does. This module
+    /// does NOT issue that request itself -- conn.zig owns the one
+    /// per HostConn, sent as soon as the connection is live.
+    awaiting_dirs: bool = false,
+    /// Awaiting the Templates directory listing.
     list_req: u32 = 0,
     popover: ?*c.GtkWidget = null,
     box: ?*c.GtkWidget = null,
@@ -88,10 +92,25 @@ pub fn showTemplateMenu(self: *BrowserView, tab: *BTab) void {
     self.templates = .{ .hc = hc, .tab = tab, .popover = popover, .box = box };
     if (hc.templates_dir != null) {
         requestListing(self, hc);
+    } else if (hc.dirs_known) {
+        // The host already answered and reported none: no further
+        // reply is coming, so say so instead of waiting forever.
+        setMessage(self, "this host reports no template directory");
     } else {
-        self.templates.dirs_req = self.nextReq();
-        self.sendOp(hc, .{ .req = self.templates.dirs_req, .op = "homedir", .path = "/" });
+        self.templates.awaiting_dirs = true;
+        self.requestHostDirs(hc);
     }
+}
+
+/// The connection's `homedir` reply landed: continue a menu that was
+/// waiting for this host's Templates directory.
+pub fn onHostDirs(self: *BrowserView, hc: *HostConn) void {
+    const state = &self.templates;
+    if (!state.awaiting_dirs or state.hc != hc) return;
+    state.awaiting_dirs = false;
+    if (hc.templates_dir == null)
+        return setMessage(self, "this host reports no template directory");
+    requestListing(self, hc);
 }
 
 fn requestListing(self: *BrowserView, hc: *HostConn) void {
@@ -119,26 +138,13 @@ fn setMessage(self: *BrowserView, text: [*:0]const u8) void {
     c.gtk_box_append(@ptrCast(box), label);
 }
 
-/// Route the homedir / list replies that belong to the open menu.
+/// Route the Templates listing reply that belongs to the open menu.
+/// The `homedir` reply that precedes it is conn.zig's, and arrives
+/// here as onHostDirs.
 /// @return true when the reply was ours.
 pub fn feedTemplates(self: *BrowserView, hc: *HostConn, rep: WireReply) bool {
     const state = &self.templates;
     if (state.hc != hc) return false;
-    if (state.dirs_req != 0 and state.dirs_req == rep.req) {
-        state.dirs_req = 0;
-        if (!rep.ok or rep.templates.len == 0) {
-            setMessage(self, "this host reports no template directory");
-            return true;
-        }
-        if (hc.templates_dir == null)
-            hc.templates_dir = self.allocator.dupe(u8, rep.templates) catch null;
-        if (hc.templates_dir == null) {
-            setMessage(self, "out of memory");
-            return true;
-        }
-        requestListing(self, hc);
-        return true;
-    }
     if (state.list_req != 0 and state.list_req == rep.req) {
         if (!rep.ok) {
             state.list_req = 0;

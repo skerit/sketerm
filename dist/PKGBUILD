@@ -61,10 +61,8 @@ build() {
     zig build mux-portable -Doptimize=ReleaseFast
 }
 
-check() {
-    cd "$(_srcroot)"
-    zig build test
-}
+# No check(): installing is not the time to run the suite. Run it
+# yourself with `zig build test` from the checkout.
 
 package() {
     cd "$(_srcroot)"

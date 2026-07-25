@@ -124,8 +124,13 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     _ = c.g_signal_connect_data(listbox, "selected-rows-changed", @ptrCast(&onSelectionChanged), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     _ = c.g_signal_connect_data(close_btn, "clicked", @ptrCast(&onTabCloseClicked), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
 
+    // Capture phase: GtkListBox's own click gesture answers every
+    // button, so the context menu must see (and claim) the press
+    // before it, or a right-click inside a multi-selection collapses
+    // the selection the menu is about to act on.
     const rclick = c.gtk_gesture_click_new();
     c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
+    c.gtk_event_controller_set_propagation_phase(@ptrCast(rclick), c.GTK_PHASE_CAPTURE);
     _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(listbox, @ptrCast(rclick));
 
@@ -446,11 +451,26 @@ pub fn countSelected(tab: *BTab) usize {
     return n;
 }
 
+/// The listing entry `path` names in `tab`, or null when the tab no
+/// longer holds it.
+///
+/// The ordinary case is resolved by parent directory (O(1) dir
+/// lookup). A FLAT tab -- search results, panelize output, registers
+/// -- has rows from anywhere under one Dir, keyed by `target`, so its
+/// root is asked directly; before that, every caller silently got
+/// null for a search hit and quietly lost preview metadata,
+/// Properties and the file-vs-directory verdict on those rows.
 pub fn entryForPath(tab: *BTab, path: []const u8) ?*Entry {
-    const parent = std.fs.path.dirname(path) orelse return null;
-    const dir = if (std.mem.eql(u8, tab.root.path, parent)) tab.root else tab.subdirByPath(parent) orelse return null;
-    const idx = dir.find(std.fs.path.basename(path)) orelse return null;
-    return &dir.entries.items[idx];
+    if (tab.root.findPath(path)) |e| return e;
+    // Expanded subdirectories: only the ordinary form can match, and
+    // findPath rejects a non-matching parent in one comparison.
+    for (tab.subdirs.items) |d| {
+        if (d.findPath(path)) |e| return e;
+    }
+    for (tab.ancestors.items) |d| {
+        if (d.findPath(path)) |e| return e;
+    }
+    return null;
 }
 
 /// One chord the browser face claims before the global binding table
@@ -1067,6 +1087,62 @@ pub fn idleAfterSwitch(user: ?*anyopaque) callconv(.c) c.gboolean {
     }
     self.updatePreview();
     return 0;
+}
+
+test "entryForPath resolves flat rows, expanded subdirs and miller ancestors" {
+    const t = std.testing;
+    const a = t.allocator;
+    const types = @import("types.zig");
+
+    var root = Dir{ .allocator = a, .path = @constCast("/data"), .view_id = 1 };
+    var sub = Dir{ .allocator = a, .path = @constCast("/data/sub"), .view_id = 2 };
+    var anc = Dir{ .allocator = a, .path = @constCast("/"), .view_id = 3 };
+    defer {
+        for ([_]*Dir{ &root, &sub, &anc }) |d| {
+            for (d.entries.items) |*e| e.deinit(a);
+            d.entries.deinit(a);
+        }
+    }
+    try root.entries.append(a, try types.testEntry(a, "top.txt", null));
+    try sub.entries.append(a, try types.testEntry(a, "deep.txt", null));
+    try anc.entries.append(a, try types.testEntry(a, "data", null));
+
+    // Only the fields entryForPath reads are set; the rest is widget
+    // state it never touches.
+    var tab = BTab{
+        .view = undefined,
+        .hc = undefined,
+        .root = &root,
+        .page = undefined,
+        .listbox = undefined,
+        .tab_label = undefined,
+    };
+    defer {
+        tab.subdirs.deinit(a);
+        tab.ancestors.deinit(a);
+    }
+    try tab.subdirs.append(a, &sub);
+    try tab.ancestors.append(a, &anc);
+
+    try t.expectEqualStrings("top.txt", (entryForPath(&tab, "/data/top.txt") orelse return error.NotFound).name);
+    try t.expectEqualStrings("deep.txt", (entryForPath(&tab, "/data/sub/deep.txt") orelse return error.NotFound).name);
+    try t.expectEqualStrings("data", (entryForPath(&tab, "/data") orelse return error.NotFound).name);
+    try t.expect(entryForPath(&tab, "/data/nope.txt") == null);
+
+    // A FLAT root (search results, panelize output, registers) keeps
+    // each row's real location in `target`. Deriving the parent from
+    // the path finds nothing there, which is what silently cost these
+    // rows their preview metadata, Properties and dir/file verdict.
+    var flat = Dir{ .allocator = a, .path = @constCast("/data"), .view_id = 4 };
+    flat.flat = true;
+    defer {
+        for (flat.entries.items) |*e| e.deinit(a);
+        flat.entries.deinit(a);
+    }
+    try flat.entries.append(a, try types.testEntry(a, "hit.txt", "/elsewhere/hit.txt"));
+    tab.root = &flat;
+    const hit = entryForPath(&tab, "/elsewhere/hit.txt") orelse return error.NotFound;
+    try t.expectEqualStrings("hit.txt", hit.name);
 }
 
 test "no browser-face chord shadows a global binding undeclared" {

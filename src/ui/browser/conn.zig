@@ -148,8 +148,23 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
         if (p.sent or p.hc != hc) continue;
         self.sendListingOp(p);
     }
+    self.requestHostDirs(hc);
     self.pumpTransferQueue();
     self.pumpCopyQueue();
+}
+
+/// Ask the host to identify its own directories -- once per
+/// connection, at connect time so the answer is there before the
+/// first menu needs it.
+///
+/// This is the single `homedir` request path. templates.zig used to
+/// issue its own because this one was never sent (the request number
+/// was read and cleared but never assigned), which left two request
+/// paths for one reply. Callers read the answer off the HostConn.
+pub fn requestHostDirs(self: *BrowserView, hc: *HostConn) void {
+    if (hc.dirs_known or hc.dirs_req != 0 or hc.state != .ready) return;
+    hc.dirs_req = self.nextReq();
+    self.sendOp(hc, .{ .req = hc.dirs_req, .op = "homedir", .path = "/" });
 }
 
 /// Connection died: fail its transfers FIRST (they hold *Conn),
@@ -571,13 +586,14 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             }
         }
     }
-    // Host cache-dir (homedir) reply?
-    if (hc.cache_req != 0 and rep.req == hc.cache_req) {
-        hc.cache_req = 0;
-        if (rep.ok and rep.cache.len > 0) {
-            hc.cache_dir = self.allocator.dupe(u8, rep.cache) catch null;
-        }
-        self.pumpRemoteThumbs();
+    // Host directory identities (homedir) reply: the Templates dir
+    // the New menu lists, resolved on the machine that owns it.
+    if (hc.dirs_req != 0 and rep.req == hc.dirs_req) {
+        hc.dirs_req = 0;
+        hc.dirs_known = true;
+        if (rep.ok and rep.templates.len > 0 and hc.templates_dir == null)
+            hc.templates_dir = self.allocator.dupe(u8, rep.templates) catch null;
+        self.templatesHostDirs(hc);
         return false;
     }
     // Open With host-apps reply?

@@ -18,11 +18,7 @@ pub const Error = error{
 
 const MAX_MSG = 32 * 1024 * 1024;
 
-fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
 
 /// Non-blocking loopback TCP connect with a deadline.
 fn tcpConnect(port: u16, timeout_ms: i64) Error!c_int {

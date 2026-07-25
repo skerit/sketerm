@@ -18,11 +18,7 @@ const client = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
 pub const fsserve = @import("../mux/fsserve.zig");
 
-fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
 
 pub const Entry = fsserve.Entry;
 
