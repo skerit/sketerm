@@ -132,6 +132,10 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     // middle click opens folders in tabs and closes this one.
     self.installNavGestures(tab, page);
     self.installTabConveniences(tab, label_box);
+    // Ctrl+wheel zoom, then the folder's remembered view settings
+    // (an explicit TabState restore runs after newTab and wins).
+    self.installViewGestures(tab, page);
+    self.applyFolderMemory(tab);
 
     // Internal DnD: dropping an entry spec here moves (same
     // host) or copies (cross-host) into the target directory.
@@ -168,6 +172,7 @@ pub fn closeTab(self: *BrowserView, tab: *BTab) void {
     // Snapshot first: undo-close-tab needs the location AND the
     // history this is about to free.
     self.stashClosedTab(tab);
+    self.flatForget(tab);
     if (self.search_tab == tab) self.search_tab = null;
     if (self.collection_tab == tab) self.collection_tab = null;
     if (self.arch_tab == tab) {
@@ -333,6 +338,10 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     tab.root.deinit();
     tab.root = candidate;
     tab.hc = hc;
+    // A running flat view belonged to the OLD root; the new folder
+    // brings its own remembered view settings.
+    self.flatForget(tab);
+    self.applyFolderMemory(tab);
     self.updateTabLabel(tab);
     self.syncPathEntry(tab);
     self.renderTab(tab);
@@ -464,8 +473,18 @@ pub fn onBrowserKey(
         self.selectPattern("*", false);
         return 1;
     }
-    if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_i) {
+    // Invert-selection moved off Ctrl+I (Dolphin's filter chord) onto
+    // Dolphin's own invert chord.
+    if (mods == (c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK) and lower_pre == c.GDK_KEY_a) {
         self.selectPattern("*", true);
+        return 1;
+    }
+    if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_i) {
+        self.toggleFilter();
+        return 1;
+    }
+    if (mods == c.GDK_CONTROL_MASK and lower_pre == c.GDK_KEY_b) {
+        if (self.currentTab()) |tab| self.toggleFlat(tab);
         return 1;
     }
     if (mods == c.GDK_ALT_MASK) {

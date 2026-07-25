@@ -10,6 +10,7 @@ const fstransfer = @import("../../ipc/fstransfer.zig");
 const browser_model = @import("../../filebrowser/model.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
+const TabView = @import("views.zig").TabView;
 const formatSpec = @import("../../filebrowser/paths.zig").formatSpec;
 
 /// One owned directory entry (strings owned by the Dir's allocator).
@@ -329,8 +330,11 @@ pub const BTab = struct {
     sort_key: browser_model.SortKey = .name,
     descending: bool = false,
     dirs_first: bool = true,
+    /// Live view narrowing (filter-as-you-type); persisted per tab.
     filter: []u8 = &.{},
     virtual_spec: []u8 = &.{},
+    /// Grouping, zoom and the collapsed-group set (views.zig).
+    vs: TabView = .{},
     page: *c.GtkWidget,
     listbox: *c.GtkListBox,
     tab_label: *c.GtkLabel,
@@ -447,6 +451,7 @@ pub const BTab = struct {
         self.attr_columns.deinit(a);
         if (self.filter.len > 0) a.free(self.filter);
         if (self.virtual_spec.len > 0) a.free(self.virtual_spec);
+        self.vs.deinit(a);
         a.destroy(self);
     }
 };
@@ -505,7 +510,7 @@ pub const PendingJob = struct {
     req: u32,
     hc: *HostConn,
     label: []u8,
-    kind: enum { normal, search, compare_left, compare_right, calc_size, dup_scan, archive_list } = .normal,
+    kind: enum { normal, search, compare_left, compare_right, calc_size, dup_scan, archive_list, flat_view } = .normal,
     undo_op: ?*UndoOp = null,
     undo_trash_orig: ?[]u8 = null,
     /// The done event's `path` opens when the job lands (archive

@@ -311,6 +311,8 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
     if (self.dup) |d| {
         if (d.hc == hc and self.dupConsumeEvent(d, e)) return;
     }
+    // Flat/branch view: the subtree stream filling a flat tab.
+    if (self.flatConsumeEvent(hc, e)) return;
     // Archive member listing.
     if (self.arch_job != 0 and e.job == self.arch_job and hc == self.arch_hc) {
         if (std.mem.eql(u8, e.ev, "match")) {

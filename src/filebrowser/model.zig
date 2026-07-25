@@ -115,6 +115,13 @@ pub const TabState = struct {
     descending: bool = false,
     dirs_first: bool = true,
     show_hidden: bool = false,
+    /// Group the listing by the active sort key, with one collapsible
+    /// header per bucket. Off by default (and for pre-grouping state
+    /// files, which have no key at all).
+    grouped: bool = false,
+    /// Zoom step index (see ui/browser/views.zig ZOOM_STEPS). The
+    /// default IS the step a pre-zoom state file deserializes to.
+    zoom: u8 = 1,
     filter: []const u8 = "",
     scroll: f64 = 0,
     /// Search predicate, collection name, or panel command.
@@ -194,6 +201,34 @@ test "column choices survive a round-trip and old state keeps the defaults" {
     , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer old.deinit();
     try std.testing.expectEqual(@as(usize, 0), old.value.tabs[0].columns.len);
+}
+
+test "grouping and zoom round-trip and old state files keep their defaults" {
+    const tabs = [_]TabState{.{ .grouped = true, .zoom = 4 }};
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(PaneState{ .tabs = &tabs }, .{}, &out.writer);
+    const parsed = try std.json.parseFromSlice(PaneState, std.testing.allocator, out.written(), .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.tabs[0].grouped);
+    try std.testing.expectEqual(@as(u8, 4), parsed.value.tabs[0].zoom);
+
+    // A state file written before grouping/zoom existed still loads,
+    // with grouping off and the default zoom step.
+    const old = try std.json.parseFromSlice(PaneState, std.testing.allocator,
+        \\{"version":1,"active_tab":1,"browser_visible":true,"tabs":[
+        \\{"kind":"directory","location":{"host":"box","path":"/work"},"view":"compact",
+        \\ "columns":["size"],"sort":"size","descending":true,"dirs_first":false,
+        \\ "show_hidden":true,"filter":"log","scroll":0,"virtual_spec":""}]}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer old.deinit();
+    try std.testing.expect(!old.value.tabs[0].grouped);
+    try std.testing.expectEqual(@as(u8, 1), old.value.tabs[0].zoom);
+    try std.testing.expectEqual(ViewMode.compact, old.value.tabs[0].view);
+    try std.testing.expectEqualStrings("log", old.value.tabs[0].filter);
+    try std.testing.expectEqualStrings("box", old.value.tabs[0].location.host);
 }
 
 test "column sort keys and widths stay in the header/row contract" {

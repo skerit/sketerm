@@ -55,6 +55,7 @@ const UndoOp = @import("types.zig").UndoOp;
 const locbar = @import("locbar.zig");
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const tabsmod = @import("tabs.zig");
+const viewsmod = @import("views.zig");
 
 pub const BrowserView = struct {
     allocator: std.mem.Allocator,
@@ -77,6 +78,8 @@ pub const BrowserView = struct {
     locbar: locbar.State = .{},
     /// Closed-tab ring (undo-close-tab), session state.
     closed_tabs: tabsmod.State = .{},
+    /// Grouping / zoom / filter / flat view / per-folder view memory.
+    views: viewsmod.State = .{},
     back_button: *c.GtkWidget = undefined,
     fwd_button: *c.GtkWidget = undefined,
     completion_popover: ?*c.GtkWidget = null,
@@ -329,6 +332,9 @@ pub const BrowserView = struct {
     pub const renderMillerCols = @import("render.zig").renderMillerCols;
     pub const onMillerRowActivated = @import("render.zig").onMillerRowActivated;
     pub const renderDirRows = @import("render.zig").renderDirRows;
+    pub const appendRowTree = @import("render.zig").appendRowTree;
+    pub const renderGroupedRows = @import("render.zig").renderGroupedRows;
+    pub const appendGroupHeader = @import("render.zig").appendGroupHeader;
     pub const freeRowCtx = @import("render.zig").freeRowCtx;
     pub const appendRow = @import("render.zig").appendRow;
     pub const emblemFor = @import("render.zig").emblemFor;
@@ -342,6 +348,25 @@ pub const BrowserView = struct {
     pub const fileColorFor = @import("render.zig").fileColorFor;
     pub const sortClicked = @import("render.zig").sortClicked;
     pub const onViewModeClicked = @import("render.zig").onViewModeClicked;
+
+    // views.zig -- grouping, zoom, filter, flat view, folder memory
+    pub const installViewMenu = @import("views.zig").installViewMenu;
+    pub const installViewGestures = @import("views.zig").installViewGestures;
+    pub const toggleFilter = @import("views.zig").toggleFilter;
+    pub const setFilter = @import("views.zig").setFilter;
+    pub const syncFilterEntry = @import("views.zig").syncFilterEntry;
+    pub const zoomBy = @import("views.zig").zoomBy;
+    pub const setGrouping = @import("views.zig").setGrouping;
+    pub const toggleGroup = @import("views.zig").toggleGroup;
+    pub const toggleFlat = @import("views.zig").toggleFlat;
+    pub const startFlat = @import("views.zig").startFlat;
+    pub const stopFlat = @import("views.zig").stopFlat;
+    pub const flatForget = @import("views.zig").flatForget;
+    pub const flatConsumeEvent = @import("views.zig").flatConsumeEvent;
+    pub const applyFolderMemory = @import("views.zig").applyFolderMemory;
+    pub const rememberFolder = @import("views.zig").rememberFolder;
+    pub const forgetFolder = @import("views.zig").forgetFolder;
+    pub const forgetAllFolders = @import("views.zig").forgetAllFolders;
 
     // menu.zig -- the entry context menu
     pub const menuButton = @import("menu.zig").menuButton;
@@ -593,6 +618,8 @@ pub const BrowserView = struct {
         self.loadFileColors();
 
         self.buildUi();
+        // The view menu rides the toolbar buildUi just built.
+        self.installViewMenu();
         pane.attachBrowser(self.root_box, @ptrCast(self), destroyCb);
 
         const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
@@ -684,6 +711,8 @@ pub const BrowserView = struct {
         tab.sort_key = state.sort;
         tab.descending = state.descending;
         tab.dirs_first = state.dirs_first;
+        tab.vs.grouped = state.grouped;
+        tab.vs.zoom = @min(state.zoom, viewsmod.ZOOM_STEPS.len - 1);
         if (state.filter.len > 0) tab.filter = self.allocator.dupe(u8, state.filter) catch &.{};
         if (state.virtual_spec.len > 0) tab.virtual_spec = self.allocator.dupe(u8, state.virtual_spec) catch &.{};
         for (state.expanded) |ref| {
@@ -777,6 +806,7 @@ pub const BrowserView = struct {
         if (self.completion_request) |request| request.destroy(self.allocator);
         self.locbar.deinit(self.allocator);
         self.closed_tabs.deinit(self.allocator);
+        self.views.deinit(self.allocator);
         self.emblems.deinit();
         self.endProbesFor(null, "");
         self.probes.deinit(self.allocator);
