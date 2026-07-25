@@ -79,6 +79,10 @@ pub const WireReply = struct {
     @"error": []const u8 = "",
     path: []const u8 = "",
     entries: []WireEntry = &.{},
+    /// `stat` answers with ONE entry rather than a listing.
+    entry: ?WireEntry = null,
+    /// Device id of a listed directory: the hard-link pre-check.
+    dev: u64 = 0,
     more: bool = false,
     truncated: bool = false,
     job: u64 = 0,
@@ -87,6 +91,9 @@ pub const WireReply = struct {
     apps: []WireApp = &.{},
     home: []const u8 = "",
     cache: []const u8 = "",
+    /// The HOST's freedesktop template directory (XDG_TEMPLATES_DIR),
+    /// resolved by the daemon that owns the files.
+    templates: []const u8 = "",
 };
 
 /// One host-side application (daemon `apps` op reply).
@@ -123,13 +130,18 @@ pub const WireJobEv = struct {
     matches: u64 = 0,
     truncated: bool = false,
     hash: []const u8 = "",
-    /// Bytes a staged partial contributed. The daemon only fills this
-    /// on the terminal event, so the panel treats it as sticky.
+    /// Bytes a staged partial contributed. Sticky: the helper reports
+    /// it once and the daemon repeats it on every later event.
     resumed_from: u64 = 0,
     /// media_meta match payload: one file's extracted fields, plus
     /// whether the host served them from its own cache.
     meta: []const fsdrive.MediaField = &.{},
     cached: bool = false,
+    /// The entry the job is working on right now, and how far through
+    /// its entry count it is (tree operations; 0 total = not counted).
+    file: []const u8 = "",
+    files_done: u64 = 0,
+    files_total: u64 = 0,
 
     /// True for the events that end a job.
     pub fn terminalEv(self: WireJobEv) bool {
@@ -154,6 +166,9 @@ pub const HostConn = struct {
     /// The host's cache dir (thumbnail placement); fetched once via
     /// the homedir op.
     cache_dir: ?[]u8 = null,
+    /// ...and its template dir, from the same reply: "New from
+    /// Template" on a remote tab must offer THAT host's templates.
+    templates_dir: ?[]u8 = null,
     cache_req: u32 = 0,
 
     pub fn label(self: *const HostConn) []const u8 {
@@ -164,6 +179,7 @@ pub const HostConn = struct {
         if (self.watch_id != 0) _ = c.g_source_remove(self.watch_id);
         if (self.state == .ready) self.conn.deinit();
         if (self.cache_dir) |cd| allocator.free(cd);
+        if (self.templates_dir) |td| allocator.free(td);
         if (self.host) |h| allocator.free(h);
         allocator.destroy(self);
     }
@@ -212,6 +228,10 @@ pub const Dir = struct {
     /// The extra column this dir is sorted by, if any (resolved once
     /// per sort by the owning tab, not looked up per comparison).
     attr_sort: ?ColumnSort = null,
+    /// Device id of this directory (from the listing reply). Zero
+    /// until a listing lands; two paths sharing it are on one
+    /// filesystem, which is what a hard link needs.
+    dev: u64 = 0,
     descending: bool = false,
     dirs_first: bool = true,
 
@@ -564,7 +584,7 @@ pub const JobPaths = struct {
         return self.dst[0..self.dst_len];
     }
 
-    fn copyTail(buf: *[512]u8, text: []const u8) u16 {
+    pub fn copyTail(buf: *[512]u8, text: []const u8) u16 {
         if (text.len <= buf.len) {
             @memcpy(buf[0..text.len], text);
             return @intCast(text.len);
@@ -584,9 +604,14 @@ pub const JobRow = struct {
     label: []u8,
     done: u64 = 0,
     total: u64 = 0,
-    /// Bytes a staged partial contributed (sticky; the daemon fills it
-    /// on the terminal event).
+    /// Bytes a staged partial contributed (sticky).
     resumed_from: u64 = 0,
+    /// The entry the daemon says the job is working on right now, and
+    /// the entry counters of a tree operation.
+    current_file: [512]u8 = undefined,
+    current_file_len: u16 = 0,
+    files_done: u64 = 0,
+    files_total: u64 = 0,
     state: enum { running, paused, finished, failed, canceled } = .running,
     /// Pushed to the undo stack when the job finishes.
     undo_op: ?*UndoOp = null,
@@ -604,6 +629,14 @@ pub const JobRow = struct {
 
     pub fn terminal(self: *const JobRow) bool {
         return self.state == .finished or self.state == .failed or self.state == .canceled;
+    }
+
+    pub fn currentFile(self: *const JobRow) []const u8 {
+        return self.current_file[0..self.current_file_len];
+    }
+
+    pub fn setCurrentFile(self: *JobRow, path: []const u8) void {
+        self.current_file_len = JobPaths.copyTail(&self.current_file, path);
     }
 };
 
@@ -704,10 +737,12 @@ pub const FileColor = struct {
 /// rename_back: a = current path, b = original path;
 /// delete_created: a = the path our copy created;
 /// trash_restore: a = trashed path, b = original path, p = info file;
-/// rmdir_created: a = the directory mkdir created.
+/// rmdir_created: a = the directory mkdir created;
+/// link_created: a = the link created, b = its target, p = the verb
+/// ("symlink" or "hardlink") that redo must repeat.
 pub const UndoOp = struct {
     host: ?[]u8,
-    kind: enum { rename_back, delete_created, trash_restore, rmdir_created },
+    kind: enum { rename_back, delete_created, trash_restore, rmdir_created, link_created },
     a: []u8,
     b: []u8 = &.{},
     p: []u8 = &.{},
@@ -726,6 +761,7 @@ pub const UndoOp = struct {
             .delete_created => "undo copy (delete the created item)",
             .trash_restore => "undo trash (restore)",
             .rmdir_created => "undo new folder",
+            .link_created => "undo link creation",
         };
     }
 };
@@ -746,3 +782,20 @@ pub const PendingHistory = struct {
 };
 
 pub const HostAction = *const fn (ctx: *anyopaque, host: []const u8, path: []const u8) void;
+
+test "JobRow keeps the identifying TAIL of an over-long current file" {
+    const t = std.testing;
+    var row: JobRow = .{ .hc = undefined, .job = 1, .label = @constCast("copy") };
+    try t.expectEqualStrings("", row.currentFile());
+    row.setCurrentFile("/srv/data/report.pdf");
+    try t.expectEqualStrings("/srv/data/report.pdf", row.currentFile());
+
+    var long: [900]u8 = @splat('a');
+    @memcpy(long[long.len - 9 ..], "/last.bin");
+    row.setCurrentFile(&long);
+    const kept = row.currentFile();
+    try t.expectEqual(@as(usize, 512), kept.len);
+    try t.expectEqualStrings("...", kept[0..3]);
+    // The part that names the file survives; the head does not.
+    try t.expectEqualStrings("/last.bin", kept[kept.len - 9 ..]);
+}

@@ -291,6 +291,9 @@ fn daemonRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(
             .resumed_from = j.resumed_from,
             .src = hostQualified(arena, j.hc.host orelse "", j.paths.srcPath()),
             .dst = hostQualified(arena, j.hc.host orelse "", j.paths.dstPath()),
+            .current_file = if (j.currentFile().len > 0) j.currentFile() else null,
+            .files_done = @intCast(j.files_done),
+            .files_total = @intCast(j.files_total),
             .controls = .{
                 .pause = !j.terminal() and j.state != .paused,
                 .unpause = j.state == .paused,
@@ -477,7 +480,9 @@ fn detailText(buf: []u8, row: Row, meter: *const Meter) []const u8 {
     if (row.current_file) |file| {
         w.print("current file: {s}\n", .{file}) catch {};
     } else if (row.state == .running) {
-        w.print("current file: not reported by daemon-side jobs\n", .{}) catch {};
+        // Single-step jobs (rename, trash, hash) have no "current
+        // file" distinct from the source they already show.
+        w.print("current file: this job works on one item\n", .{}) catch {};
     }
     if (row.message.len > 0) w.print("message: {s}\n", .{row.message}) catch {};
     const text = w.buffered();

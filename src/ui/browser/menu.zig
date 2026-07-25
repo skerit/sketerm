@@ -10,6 +10,7 @@ const BrowserView = @import("view.zig").BrowserView;
 const RowCtx = @import("render.zig").RowCtx;
 const copyToClip = @import("ops.zig").copyToClip;
 const countSelected = @import("nav.zig").countSelected;
+const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const isArchivePath = @import("../../filebrowser/paths.zig").isArchivePath;
 const isSketermMount = @import("../../filebrowser/paths.zig").isSketermMount;
 const isTrashPath = @import("../../filebrowser/paths.zig").isTrashPath;
@@ -165,6 +166,7 @@ pub fn showEntryMenu(
             }
         }
         menuButton(box, "Copy Path", &onMenuCopyPath, ctx, false);
+        menuButton(box, "Duplicate", &onMenuDuplicate, ctx, false);
         menuButton(box, "Rename…", &onMenuRename, ctx, false);
         menuButton(box, "Properties…", &onMenuProperties, ctx, false);
         menuButton(box, "Tags…", &onMenuTags, ctx, false);
@@ -185,10 +187,16 @@ pub fn showEntryMenu(
     }
     if (self.clip_path != null) {
         menuButton(box, "Paste Here", &onMenuPaste, ctx, false);
+        menuButton(box, "Paste as Symbolic Link", &onMenuPasteSymlink, ctx, false);
+        // A hard link is offered only where it can succeed: same host,
+        // same filesystem. Everywhere else the verb is simply absent.
+        if (self.hardlinkPossible(tab))
+            menuButton(box, "Paste as Hard Link", &onMenuPasteHardlink, ctx, false);
         menuButton(box, "Sync Here (mirror copy, resumable)", &onMenuSyncHere, ctx, false);
         menuButton(box, "Compare / Sync with Copied…", &onMenuCompare, ctx, false);
     }
     menuButton(box, "New Folder…", &onMenuNewFolder, ctx, false);
+    menuButton(box, "New from Template…", &onMenuNewFromTemplate, ctx, false);
     if (self.undo_stack.items.len > 0) {
         var uz: [96:0]u8 = undefined;
         const last = self.undo_stack.items[self.undo_stack.items.len - 1];
@@ -423,6 +431,56 @@ pub fn onMenuNewFolder(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
     ctx.view.entryDialog(ctx.tab, .mkdir, null);
     menuDone(ctx);
+}
+
+pub fn onMenuNewFromTemplate(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const tab = ctx.tab;
+    // A popover opened from inside a menu must be built AFTER the menu
+    // is popped down, or the new grab races the old one.
+    menuDone(ctx);
+    self.showTemplateMenu(tab);
+}
+
+pub fn onMenuDuplicate(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const tab = ctx.tab;
+    const path = ctx.path orelse return menuDone(ctx);
+    var pbuf: [4096]u8 = undefined;
+    if (path.len >= pbuf.len) return menuDone(ctx);
+    @memcpy(pbuf[0..path.len], path);
+    const pcopy = pbuf[0..path.len];
+    menuDone(ctx);
+    self.duplicateEntry(tab, pcopy);
+}
+
+pub fn onMenuPasteSymlink(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    pasteAsLink(@ptrCast(@alignCast(user.?)), false);
+}
+
+pub fn onMenuPasteHardlink(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    pasteAsLink(@ptrCast(@alignCast(user.?)), true);
+}
+
+/// Paste-as-link for every copied path. The clipboard's own storage
+/// outlives the menu, so the paths are read directly from it.
+fn pasteAsLink(ctx: *MenuCtx, hard: bool) void {
+    const self = ctx.view;
+    const tab = ctx.tab;
+    menuDone(ctx);
+    if (!hostEq(if (self.clip_host) |h| @as(?[]const u8, h) else null, tab.hc.host)) {
+        self.setStatus("a link can only point at a path on the same host");
+        return;
+    }
+    const srcs: []const []u8 = if (self.clip_paths.items.len > 0)
+        self.clip_paths.items
+    else if (self.clip_path) |p|
+        (&[_][]u8{p})[0..]
+    else
+        return;
+    for (srcs) |src| self.linkHere(tab, src, hard);
 }
 
 pub fn onMenuRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

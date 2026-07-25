@@ -1285,6 +1285,13 @@ const FsJob = struct {
     /// find/grep: total matches streamed + cap-truncation flag.
     matches: u64 = 0,
     truncated: bool = false,
+    /// Entry the helper is working on RIGHT NOW, and how far through
+    /// its entry count it is. The helper puts the path on the wire
+    /// only when it changes, so this is sticky between updates.
+    cur_file: [512]u8 = undefined,
+    cur_file_len: usize = 0,
+    files_done: u64 = 0,
+    files_total: u64 = 0,
     /// Result paths from the DONE event (trash location + info file,
     /// extracted member path) — forwarded to the owner.
     done_path: [4096]u8 = undefined,
@@ -1297,6 +1304,10 @@ const FsJob = struct {
     src_host: []u8,
     dst_host: []u8,
     client_token: []u8,
+    /// copy: the per-entry collision policy this job was started with,
+    /// kept so a restart after a daemon crash resumes with the SAME
+    /// semantics rather than silently overwriting.
+    conflict: []u8,
     acknowledged: bool = false,
     ack_req: u32 = 0,
     terminal_pending: bool = false,
@@ -1319,6 +1330,7 @@ const FsJob = struct {
         self.allocator.free(self.src_host);
         self.allocator.free(self.dst_host);
         self.allocator.free(self.client_token);
+        self.allocator.free(self.conflict);
         self.allocator.destroy(self);
     }
 
@@ -3047,6 +3059,12 @@ pub const Daemon = struct {
         len: u32 = 0,
         /// Job verbs: allow hash-verified resume of a staged partial.
         @"resume": bool = false,
+        /// copy: per-entry collision policy INSIDE a tree
+        /// ("" = overwrite, "skip", "keep_both").
+        conflict: []const u8 = "",
+        /// copy onto an existing directory: "" / "merge" keeps
+        /// destination-only entries, "replace" removes the tree first.
+        dir_mode: []const u8 = "",
         /// job_cancel/job_pause/job_resume target.
         job: u64 = 0,
         /// find/grep search pattern.
@@ -3130,7 +3148,24 @@ pub const Daemon = struct {
                 std.mem.span(@as([*:0]const u8, @ptrCast(xc)))
             else
                 std.fmt.bufPrint(&cache_buf, "{s}/.cache", .{home}) catch "/tmp";
-            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .home = home, .cache = cache });
+            // The template directory is resolved HERE, on the host
+            // that owns the files: "New from Template" on a remote tab
+            // must offer that machine's templates, and only this
+            // daemon can read its user-dirs.dirs.
+            var config_buf: [4096]u8 = undefined;
+            const config_home: []const u8 = if (c.getenv("XDG_CONFIG_HOME")) |xc|
+                std.mem.span(@as([*:0]const u8, @ptrCast(xc)))
+            else
+                std.fmt.bufPrint(&config_buf, "{s}/.config", .{home}) catch "/tmp";
+            var templates_buf: [4096]u8 = undefined;
+            const templates = fsserve.templatesDir(home, config_home, &templates_buf);
+            cl.queueJson(.fs_reply, .{
+                .req = r.req,
+                .ok = true,
+                .home = home,
+                .cache = cache,
+                .templates = templates,
+            });
         } else if (std.mem.eql(u8, r.op, "mkdir")) {
             var z: [4096]u8 = undefined;
             const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
@@ -3214,6 +3249,31 @@ pub const Daemon = struct {
             const tgt = pathZ(&z1, r.to) catch return fsReplyErr(cl, r.req, "target too long");
             const link = pathZ(&z2, r.path) catch return fsReplyErr(cl, r.req, "path too long");
             const rc = c.symlink(tgt, link);
+            if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+            cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+        } else if (std.mem.eql(u8, r.op, "hardlink")) {
+            // `to` is the EXISTING file, `path` the new name. Both
+            // impossibilities are reported as themselves rather than
+            // as a bare errno: a hard link cannot cross filesystems
+            // and cannot name a directory, and a client offering the
+            // verb on stale device information deserves the reason.
+            if (r.to.len == 0 or r.to[0] != '/') return fsReplyErr(cl, r.req, "to must be absolute");
+            var z1: [4096]u8 = undefined;
+            var z2: [4096]u8 = undefined;
+            const tgt = pathZ(&z1, r.to) catch return fsReplyErr(cl, r.req, "target too long");
+            const link = pathZ(&z2, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+            var tst: c.struct_stat = undefined;
+            if (c.lstat(tgt, &tst) != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(@as(c_int, -1)));
+            if ((tst.st_mode & c.S_IFMT) == c.S_IFDIR)
+                return fsReplyErr(cl, r.req, "a directory cannot be hard linked");
+            const parent = std.fs.path.dirname(r.path) orelse return fsReplyErr(cl, r.req, "link has no parent");
+            var z3: [4096]u8 = undefined;
+            var pst: c.struct_stat = undefined;
+            const pz = pathZ(&z3, parent) catch return fsReplyErr(cl, r.req, "parent path too long");
+            if (c.stat(pz, &pst) != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(@as(c_int, -1)));
+            if (pst.st_dev != tst.st_dev)
+                return fsReplyErr(cl, r.req, "hard link would cross filesystems");
+            const rc = c.link(tgt, link);
             if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
             cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
         } else if (std.mem.eql(u8, r.op, "chmod")) {
@@ -3428,6 +3488,16 @@ pub const Daemon = struct {
             return false;
         };
 
+        // The directory's device id rides the listing (one number, not
+        // per entry): it is what lets a client decide BEFORE offering
+        // the verb whether a hard link into this directory could work.
+        var dir_st: c.struct_stat = undefined;
+        var z: [4096]u8 = undefined;
+        const dev: u64 = if (pathZ(&z, dir_path)) |dz|
+            (if (c.stat(dz, &dir_st) == 0) @intCast(dir_st.st_dev) else 0)
+        else |_|
+            0;
+
         var off: usize = 0;
         while (true) {
             const n = @min(fsserve.CHUNK_ENTRIES, l.entries.len - off);
@@ -3436,6 +3506,7 @@ pub const Daemon = struct {
                 .req = req,
                 .ok = true,
                 .path = dir_path,
+                .dev = dev,
                 .entries = l.entries[off .. off + n],
                 .more = !last,
                 .truncated = l.truncated,
@@ -3819,7 +3890,7 @@ pub const Daemon = struct {
                 return;
             }
         }
-        const job = self.spawnFsJob(cl, op, self.next_fs_job_id, r.path, r.to, r.pattern, r.src_host, r.dst_host, r.client_token, r.@"resume", r.within_ms, r.max_matches, .{ .mode = r.mode, .uid = if (r.uid) |v| @as(i64, v) else -1, .gid = if (r.gid) |v| @as(i64, v) else -1 }) catch
+        const job = self.spawnFsJob(cl, op, self.next_fs_job_id, r.path, r.to, r.pattern, r.src_host, r.dst_host, r.client_token, r.@"resume", r.within_ms, r.max_matches, .{ .mode = r.mode, .uid = if (r.uid) |v| @as(i64, v) else -1, .gid = if (r.gid) |v| @as(i64, v) else -1 }, .{ .conflict = r.conflict, .dir_mode = r.dir_mode }) catch
             return fsReplyErr(cl, r.req, "cannot start job");
         self.next_fs_job_id = job.id + 1;
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .job = job.id });
@@ -3836,6 +3907,9 @@ pub const Daemon = struct {
     /// group, mode 0 keeps the current mode.
     const PermArgs = struct { mode: u32 = 0, uid: i64 = -1, gid: i64 = -1 };
 
+    /// Copy-collision arguments, forwarded verbatim to the helper.
+    const CopyArgs = struct { conflict: []const u8 = "", dir_mode: []const u8 = "" };
+
     fn spawnFsJob(
         self: *Daemon,
         owner: ?*Client,
@@ -3851,6 +3925,7 @@ pub const Daemon = struct {
         within_ms: u64,
         max_matches: u64,
         perm: PermArgs,
+        copy: CopyArgs,
     ) !*FsJob {
         var exe_buf: [4096:0]u8 = undefined;
         const exe = @import("../util/platform.zig").exePathZ(&exe_buf) orelse return error.NoExecutable;
@@ -3872,6 +3947,8 @@ pub const Daemon = struct {
             .mode = perm.mode,
             .uid = perm.uid,
             .gid = perm.gid,
+            .conflict = copy.conflict,
+            .dir_mode = copy.dir_mode,
         }, .{}, &spec_aw.writer);
         try spec_aw.writer.writeByte('\n');
 
@@ -3891,6 +3968,8 @@ pub const Daemon = struct {
         errdefer if (!job_initialized) self.allocator.free(dst_host_owned);
         const client_token_owned = try self.allocator.dupe(u8, client_token);
         errdefer if (!job_initialized) self.allocator.free(client_token_owned);
+        const conflict_owned = try self.allocator.dupe(u8, copy.conflict);
+        errdefer if (!job_initialized) self.allocator.free(conflict_owned);
         const job = try self.allocator.create(FsJob);
         errdefer if (!job_initialized) self.allocator.destroy(job);
 
@@ -3938,6 +4017,7 @@ pub const Daemon = struct {
             .src_host = src_host_owned,
             .dst_host = dst_host_owned,
             .client_token = client_token_owned,
+            .conflict = conflict_owned,
             .resumable = resumable,
             .ephemeral = ephemeralOp(op),
         };
@@ -3995,6 +4075,7 @@ pub const Daemon = struct {
             .src_host = job.src_host,
             .dst_host = job.dst_host,
             .@"resume" = job.resumable,
+            .conflict = job.conflict,
             .pid = job.pid,
             .done = job.done,
             .total = job.total,
@@ -4024,6 +4105,8 @@ pub const Daemon = struct {
         errdefer self.allocator.free(dst_host);
         const client_token = self.allocator.dupe(u8, rec.client_token) catch return null;
         errdefer self.allocator.free(client_token);
+        const conflict = self.allocator.dupe(u8, rec.conflict) catch return null;
+        errdefer self.allocator.free(conflict);
         const job = self.allocator.create(FsJob) catch return null;
         job.* = .{
             .allocator = self.allocator,
@@ -4042,6 +4125,7 @@ pub const Daemon = struct {
             .src_host = src_host,
             .dst_host = dst_host,
             .client_token = client_token,
+            .conflict = conflict,
             .acknowledged = rec.acknowledged,
             .resumable = rec.@"resume",
         };
@@ -4094,7 +4178,11 @@ pub const Daemon = struct {
                 continue;
             }
             if (op == .copy or op == .cross_copy or op == .live_find) {
-                _ = self.spawnFsJob(null, op, rec.id, rec.src, rec.dst, rec.pattern, rec.src_host, rec.dst_host, rec.client_token, true, 0, 0, .{}) catch {
+                // dir_mode is deliberately absent: the destination was
+                // already replaced before any bytes moved, so a
+                // restart merges into the partial result instead of
+                // destroying it.
+                _ = self.spawnFsJob(null, op, rec.id, rec.src, rec.dst, rec.pattern, rec.src_host, rec.dst_host, rec.client_token, true, 0, 0, .{}, .{ .conflict = rec.conflict }) catch {
                     const job = self.restoredFsJob(rec, op, .failed) orelse continue;
                     job.setMessage("could not resume after daemon restart");
                     self.saveFsJob(job) catch { job.terminal_pending = true; };
@@ -4249,6 +4337,9 @@ pub const Daemon = struct {
             .truncated = job.truncated,
             .path = job.done_path[0..job.done_path_len],
             .text = job.done_text[0..job.done_text_len],
+            .file = job.cur_file[0..job.cur_file_len],
+            .files_done = job.files_done,
+            .files_total = job.files_total,
         });
     }
 
@@ -4287,6 +4378,12 @@ pub const Daemon = struct {
             size: u64 = 0,
             matches: u64 = 0,
             truncated: bool = false,
+            /// Progress detail: the entry in flight (present only when
+            /// it CHANGED — the helper does not repeat it) and the
+            /// entry counters for tree operations.
+            file: []const u8 = "",
+            files_done: u64 = 0,
+            files_total: u64 = 0,
             /// media_meta: extracted key/value pairs for one file, plus
             /// whether the helper served them from its cache.
             meta: []const MetaKV = &.{},
@@ -4320,13 +4417,23 @@ pub const Daemon = struct {
         }
         job.done = e.done;
         if (e.total > job.total) job.total = e.total;
+        // Sticky, on EVERY event kind: the helper repeats neither the
+        // in-flight path nor a zero resume offset, so a running row
+        // must keep what it last learned (before this, "resumed from
+        // N" could only ever appear once the job had already ended).
+        if (e.file.len > 0) {
+            job.cur_file_len = @min(e.file.len, job.cur_file.len);
+            @memcpy(job.cur_file[0..job.cur_file_len], e.file[0..job.cur_file_len]);
+        }
+        if (e.resumed_from > 0) job.resumed_from = e.resumed_from;
+        if (e.files_done > job.files_done) job.files_done = e.files_done;
+        if (e.files_total > job.files_total) job.files_total = e.files_total;
         if (std.mem.eql(u8, e.ev, "done")) {
             job.matches = if (e.matches > 0) e.matches else job.matches;
             job.truncated = e.truncated;
             // Cancel raced completion: the work DID finish — honesty
             // says report done, not canceled.
             job.state = .done;
-            job.resumed_from = e.resumed_from;
             if (e.hash.len == 64) {
                 @memcpy(&job.hash_hex, e.hash[0..64]);
                 job.has_hash = true;

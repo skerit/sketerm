@@ -29,6 +29,7 @@ const AttrRequest = @import("props.zig").AttrRequest;
 const BTab = @import("types.zig").BTab;
 const CompareCtx = @import("compare.zig").CompareCtx;
 const CopyQueue = @import("jobs.zig").CopyQueue;
+const conflict_mod = @import("conflict.zig");
 const DupState = @import("search.zig").DupState;
 const EditWatch = @import("types.zig").EditWatch;
 const EditorRename = @import("ops.zig").EditorRename;
@@ -59,6 +60,7 @@ const mediacols = @import("mediacols.zig");
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const selmod = @import("selection.zig");
 const tabsmod = @import("tabs.zig");
+const templates_mod = @import("templates.zig");
 const viewsmod = @import("views.zig");
 
 pub const BrowserView = struct {
@@ -108,6 +110,15 @@ pub const BrowserView = struct {
     /// Cut mode: paste MOVES (rename same-host, transfer+delete
     /// cross-host) and then clears the clipboard.
     clip_cut: bool = false,
+    /// Filesystem the clipboard's sources live on (0 = unknown). A
+    /// hard link is only OFFERED where it can work, and this is what
+    /// decides that without a round trip per menu.
+    clip_dev: u64 = 0,
+    /// Parked paste collisions and their decision dialog. A collision
+    /// never stalls the rest of the batch (conflict.zig).
+    conflicts: conflict_mod.State = .{},
+    /// The one open New-from-Template menu (templates.zig).
+    templates: templates_mod.State = .{},
     /// Undo stack (newest last), bounded.
     undo_stack: std.ArrayList(*UndoOp) = .empty,
     redo_stack: std.ArrayList(*UndoOp) = .empty,
@@ -450,12 +461,12 @@ pub const BrowserView = struct {
     // ops.zig -- clipboard, rename, delete/trash, undo, archives, tags
     pub const copyToClip = @import("ops.zig").copyToClip;
     pub const beginPaste = @import("ops.zig").beginPaste;
-    pub const pasteChoiceButton = @import("ops.zig").pasteChoiceButton;
-    pub const onPasteOverwrite = @import("ops.zig").onPasteOverwrite;
-    pub const onPasteKeepBoth = @import("ops.zig").onPasteKeepBoth;
-    pub const onPasteSkip = @import("ops.zig").onPasteSkip;
+    pub const pasteOne = @import("ops.zig").pasteOne;
+    pub const tabAlive = @import("ops.zig").tabAlive;
     pub const uniqueDstName = @import("ops.zig").uniqueDstName;
-    pub const pasteExecute = @import("ops.zig").pasteExecute;
+    pub const duplicateEntry = @import("ops.zig").duplicateEntry;
+    pub const linkHere = @import("ops.zig").linkHere;
+    pub const hardlinkPossible = @import("ops.zig").hardlinkPossible;
     pub const findEntryTags = @import("ops.zig").findEntryTags;
     pub const onMenuTags = @import("ops.zig").onMenuTags;
     pub const onTagsActivate = @import("ops.zig").onTagsActivate;
@@ -510,6 +521,14 @@ pub const BrowserView = struct {
     pub const startHistoryJob = @import("jobs.zig").startHistoryJob;
     pub const startDaemonJobTo = @import("jobs.zig").startDaemonJobTo;
     pub const markJob = @import("jobs.zig").markJob;
+
+    // conflict.zig -- the non-blocking paste-collision queue + dialog
+    pub const feedConflicts = @import("conflict.zig").feedConflicts;
+
+    // templates.zig -- New from Template (the HOST's Templates dir)
+    pub const showTemplateMenu = @import("templates.zig").showTemplateMenu;
+    pub const feedTemplates = @import("templates.zig").feedTemplates;
+    pub const instantiateTemplate = @import("templates.zig").instantiate;
 
     // jobpanel.zig -- the jobs/transfers panel (rows, rate, controls)
     pub const jobsButton = @import("jobpanel.zig").jobsButton;
@@ -803,6 +822,8 @@ pub const BrowserView = struct {
         }
         self.jobs_panel.deinit(self.allocator);
         self.copy_queue.deinit(self.allocator);
+        self.conflicts.deinit(self.allocator);
+        self.templates.deinit(self.allocator);
         for (self.transfers.items) |t| {
             t.x.deinit();
             self.allocator.free(t.label);

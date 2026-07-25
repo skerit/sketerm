@@ -15,6 +15,13 @@ pub const Record = struct {
     src_host: []const u8 = "",
     dst_host: []const u8 = "",
     @"resume": bool = false,
+    /// copy: per-entry collision policy inside a tree. Persisted
+    /// because it is a SEMANTIC choice — a job restarted after a
+    /// daemon crash must not start overwriting what the user chose to
+    /// skip. `dir_mode` deliberately is NOT persisted: replacing the
+    /// destination already happened before any copying, and doing it
+    /// again on restart would only destroy the partial result.
+    conflict: []const u8 = "",
     pid: i64 = -1,
     done: u64 = 0,
     total: u64 = 0,

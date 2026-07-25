@@ -23,14 +23,31 @@ const muxclient = @import("client.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
 const thumbs = @import("../filebrowser/thumbs.zig");
 const mediameta = @import("mediameta.zig");
+const uniqueName = @import("../filebrowser/paths.zig").uniqueName;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 fn sigNoop(_: c_int) callconv(.c) void {}
 
+fn nowMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+}
+
 pub const CHUNK: usize = 256 * 1024;
 /// Emit a progress line at least every this many bytes.
 const PROGRESS_BYTES: u64 = 4 << 20;
+/// ...and, when the entry in flight changes, no more often than this.
+/// A tree of small files never crosses the byte threshold, so without
+/// a second trigger the reported file would sit on the first one
+/// forever; without the throttle, a 100k-entry tree would put 100k
+/// path-carrying lines through the daemon. How often a human can read
+/// a changing filename is the honest bound, so it is a TIME one.
+const PROGRESS_FILE_MS: i64 = 150;
+/// Tail of the in-flight path carried on a progress line. The tail is
+/// the identifying part; the head is the job's own root anyway.
+const CURRENT_FILE_MAX: usize = 512;
 
 pub const Spec = struct {
     op: []const u8 = "",
@@ -40,6 +57,16 @@ pub const Spec = struct {
     src_host: []const u8 = "",
     dst_host: []const u8 = "",
     @"resume": bool = false,
+    /// copy: what to do about an entry INSIDE the tree whose name
+    /// already exists at the destination ("" = overwrite, the
+    /// historical behavior; also "skip" and "keep_both"). The
+    /// top-level destination name is always the caller's — it owns
+    /// the undo record that names it.
+    conflict: []const u8 = "",
+    /// copy of a directory onto an existing directory: "" / "merge"
+    /// recurses and keeps destination-only entries (Finder merge),
+    /// "replace" removes the destination tree first.
+    dir_mode: []const u8 = "",
     job_id: u64 = 0,
     journal_dir: []const u8 = "",
     /// find: only entries modified within this window (0 = all).
@@ -102,18 +129,71 @@ fn emitErrno(what: []const u8) u8 {
     return emitError(w.buffered());
 }
 
+/// Byte and entry counters plus the identity of the entry in flight.
+/// One instance per job; every progress line the job emits comes from
+/// here, so the shape of a progress event is defined in one place.
 const Progress = struct {
     done: u64 = 0,
     total: u64 = 0,
     since_emit: u64 = 0,
+    /// Bytes a verified staged partial (or an already-identical
+    /// destination file) contributed, cumulative across a tree.
+    resumed: u64 = 0,
+    /// Entries finished / expected. A zero total means "not a
+    /// countable tree" and the client hides the counter.
+    entries_done: u64 = 0,
+    entries_total: u64 = 0,
+    last_emit_ms: i64 = 0,
+    emitted: bool = false,
+    /// A sub-phase that shares the job's output stream but counts in
+    /// different units (replace's pre-delete counts ENTRIES while the
+    /// copy that follows counts BYTES). Reporting both would make the
+    /// panel's byte counter jump and then reset.
+    quiet: bool = false,
+    /// The entry being processed right now, OWNED: a borrowed slice
+    /// would dangle, since callers build paths in per-iteration
+    /// stack buffers.
+    file: [CURRENT_FILE_MAX]u8 = undefined,
+    file_len: usize = 0,
+    /// The path goes on the wire only when it CHANGED. Progress lines
+    /// stream at high frequency, and a 4 KiB path on every one of them
+    /// would cost more than the transfer it describes.
+    file_dirty: bool = false,
+
+    fn setFile(self: *Progress, path: []const u8) void {
+        const tail = if (path.len <= CURRENT_FILE_MAX) path else path[path.len - CURRENT_FILE_MAX ..];
+        if (std.mem.eql(u8, self.file[0..self.file_len], tail)) return;
+        @memcpy(self.file[0..tail.len], tail);
+        self.file_len = tail.len;
+        self.file_dirty = true;
+        if (!self.emitted or nowMs() - self.last_emit_ms >= PROGRESS_FILE_MS) self.emitNow();
+    }
+
+    fn entryDone(self: *Progress) void {
+        self.entries_done += 1;
+    }
 
     fn add(self: *Progress, n: u64) void {
         self.done += n;
         self.since_emit += n;
-        if (self.since_emit >= PROGRESS_BYTES) {
-            self.since_emit = 0;
-            emit(.{ .ev = "progress", .done = self.done, .total = self.total });
-        }
+        if (self.since_emit >= PROGRESS_BYTES) self.emitNow();
+    }
+
+    fn emitNow(self: *Progress) void {
+        self.since_emit = 0;
+        self.last_emit_ms = nowMs();
+        self.emitted = true;
+        if (self.quiet) return;
+        emit(.{
+            .ev = "progress",
+            .done = self.done,
+            .total = self.total,
+            .resumed_from = self.resumed,
+            .file = if (self.file_dirty) self.file[0..self.file_len] else "",
+            .files_done = self.entries_done,
+            .files_total = self.entries_total,
+        });
+        self.file_dirty = false;
     }
 };
 
@@ -809,7 +889,6 @@ const CrossCopy = struct {
     src: *fsdrive.Fs,
     dst: *fsdrive.Fs,
     progress: Progress = .{},
-    resumed: u64 = 0,
 
     fn hash(self: *CrossCopy, fs: *fsdrive.Fs, path: []const u8) ?[64]u8 {
         _ = self;
@@ -820,6 +899,7 @@ const CrossCopy = struct {
     }
 
     fn copyFile(self: *CrossCopy, src_path: []const u8, dst_path: []const u8, size: u64, allow_resume: bool) bool {
+        self.progress.setFile(src_path);
         if (allow_resume) {
             var arena_final = std.heap.ArenaAllocator.init(self.allocator);
             defer arena_final.deinit();
@@ -828,8 +908,9 @@ const CrossCopy = struct {
                     const sh = self.hash(self.src, src_path);
                     const dh = self.hash(self.dst, dst_path);
                     if (sh != null and dh != null and std.mem.eql(u8, &sh.?, &dh.?)) {
+                        self.progress.resumed += size;
                         self.progress.add(size);
-                        self.resumed += size;
+                        self.progress.entryDone();
                         return true;
                     }
                 }
@@ -847,8 +928,8 @@ const CrossCopy = struct {
         }
         const resumed_from = off;
         self.progress.done += off;
-        self.resumed += off;
-        emit(.{ .ev = "progress", .done = self.progress.done, .total = self.progress.total, .resumed_from = self.resumed });
+        self.progress.resumed += off;
+        self.progress.emitNow();
         var chunk: std.ArrayList(u8) = .empty;
         defer chunk.deinit(self.allocator);
         while (off < size) {
@@ -874,7 +955,7 @@ const CrossCopy = struct {
             self.dst.deletePath(part) catch {};
             if (resumed_from > 0) {
                 self.progress.done -|= off;
-                self.resumed -|= resumed_from;
+                self.progress.resumed -|= resumed_from;
                 return self.copyFile(src_path, dst_path, size, false);
             }
             return false;
@@ -888,6 +969,7 @@ const CrossCopy = struct {
             self.dst.chmod(dst_path, e.mode) catch {};
             self.dst.utimens(dst_path, e.atime_ms, e.mtime_ms) catch {};
         } else |_| {}
+        self.progress.entryDone();
         return true;
     }
 
@@ -907,7 +989,11 @@ const CrossCopy = struct {
             if (std.mem.eql(u8, e.kind, "dir")) {
                 if (!self.copyTree(sp, dp, allow_resume)) return false;
             } else if (std.mem.eql(u8, e.kind, "file")) {
+                // Discovered as the walk goes: a cross-host tree is
+                // never pre-sized (that would be a second full remote
+                // listing pass), so both totals grow with it.
                 self.progress.total += e.size;
+                self.progress.entries_total += 1;
                 if (!self.copyFile(sp, dp, e.size, allow_resume)) return false;
             } else if (std.mem.eql(u8, e.kind, "link")) {
                 var temp_buf: [4096]u8 = undefined;
@@ -942,18 +1028,14 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
     var cc = CrossCopy{ .allocator = allocator, .src = &src, .dst = &dst };
     const ok = if (std.mem.eql(u8, root.kind, "file")) blk: {
         cc.progress.total = root.size;
+        cc.progress.entries_total = 1;
         break :blk cc.copyFile(spec.src, spec.dst, root.size, spec.@"resume");
     } else if (root.tdir)
         cc.copyTree(spec.src, spec.dst, spec.@"resume")
     else
         false;
     if (!ok) return emitError("cross-host copy failed");
-    emit(.{
-        .ev = "done",
-        .done = cc.progress.done,
-        .total = cc.progress.total,
-        .resumed_from = cc.resumed,
-    });
+    emitCopyDone(&cc.progress);
     return 0;
 }
 
@@ -1361,22 +1443,59 @@ fn runCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
 
     if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) return runCopyTree(allocator, spec);
 
-    var progress = Progress{ .total = if (st.st_size > 0) @intCast(st.st_size) else 0 };
-    var resumed_from: u64 = 0;
-    switch (copyOneFile(spec.src, spec.dst, st, spec.@"resume", &progress, &resumed_from)) {
-        .ok => {},
+    var progress = Progress{
+        .total = if (st.st_size > 0) @intCast(st.st_size) else 0,
+        .entries_total = 1,
+    };
+    switch (copyOneFile(spec.src, spec.dst, st, spec.@"resume", &progress)) {
+        .ok => progress.entryDone(),
         .err => |m| return emitError(m),
         .errno => |what| return emitErrno(what),
     }
-    emit(.{ .ev = "done", .done = progress.done, .total = progress.total, .resumed_from = resumed_from });
+    emitCopyDone(&progress);
     return 0;
+}
+
+/// Terminal event of a copy job. Its shape is shared by the file and
+/// the tree path so the two can never drift.
+fn emitCopyDone(progress: *const Progress) void {
+    emit(.{
+        .ev = "done",
+        .done = progress.done,
+        .total = progress.total,
+        .resumed_from = progress.resumed,
+        .files_done = progress.entries_done,
+        .files_total = progress.entries_total,
+    });
 }
 
 const CopyResult = union(enum) { ok, err: []const u8, errno: []const u8 };
 
+/// What a tree copy does about names that already exist at the
+/// destination. `replace` is a property of the TOP-level directory
+/// only; nested collisions are always resolved per entry.
+const CopyOpts = struct {
+    allow_resume: bool = false,
+    conflict: enum { overwrite, skip, keep_both } = .overwrite,
+    replace: bool = false,
+
+    fn fromSpec(spec: Spec) CopyOpts {
+        return .{
+            .allow_resume = spec.@"resume",
+            .conflict = if (std.mem.eql(u8, spec.conflict, "skip"))
+                .skip
+            else if (std.mem.eql(u8, spec.conflict, "keep_both"))
+                .keep_both
+            else
+                .overwrite,
+            .replace = std.mem.eql(u8, spec.dir_mode, "replace"),
+        };
+    }
+};
+
 /// Single-file copy via a staged `.skpart` with hash-verified resume,
 /// fsync, mode preservation, and atomic rename.
-fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_resume: bool, progress: *Progress, resumed_from: *u64) CopyResult {
+fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_resume: bool, progress: *Progress) CopyResult {
     var part_buf: [4096]u8 = undefined;
     var wpart = std.Io.Writer.fixed(&part_buf);
     wpart.print("{s}.skpart", .{dst}) catch return .{ .err = "path too long" };
@@ -1397,9 +1516,12 @@ fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_re
                 std.mem.eql(u8, &part_h.?, &src_h.?)) start = plen;
         }
     }
-    resumed_from.* = start;
-    progress.done = start;
-    emit(.{ .ev = "progress", .done = start, .total = progress.total });
+    // Cumulative, not assigned: inside a tree copy `done` already
+    // carries every earlier file (assigning here made the panel's
+    // percentage restart from zero on every file of a tree).
+    progress.resumed += start;
+    progress.done += start;
+    progress.setFile(src);
 
     var zs: [4096]u8 = undefined;
     const sp = pathz.pathZ(&zs, src) catch return .{ .err = "path too long" };
@@ -1449,22 +1571,41 @@ fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_re
 /// completed files (equal size at dst) are skipped WITHOUT hashing —
 /// only the in-flight partial gets the hash check; a paranoid full
 /// verify is what the hash verb is for.
+///
+/// A destination directory that already exists is MERGED by default:
+/// the walk recurses into it and entries that exist only there are
+/// left alone. `dir_mode = "replace"` deletes the destination tree
+/// first, so those entries are gone.
 fn runCopyTree(allocator: std.mem.Allocator, spec: Spec) u8 {
     var progress = Progress{};
-    if (!sizeTree(allocator, spec.src, &progress.total))
+    if (!sizeTree(allocator, spec.src, &progress.total, &progress.entries_total))
         return emitError("cannot size source tree (listing failed or truncated)");
 
-    var resumed_bytes: u64 = 0;
-    switch (copyTreeDir(allocator, spec.src, spec.dst, spec.@"resume", &progress, &resumed_bytes)) {
+    const opts = CopyOpts.fromSpec(spec);
+    if (opts.replace) {
+        var dst_st: c.struct_stat = undefined;
+        if (statOf(spec.dst, &dst_st, false)) {
+            var drop = Progress{ .quiet = true };
+            const removed = if ((dst_st.st_mode & c.S_IFMT) == c.S_IFDIR)
+                deleteTreeDir(spec.dst, &drop)
+            else blk: {
+                var z: [4096]u8 = undefined;
+                break :blk c.unlink(pathz.pathZ(&z, spec.dst) catch
+                    return emitError("path too long")) == 0;
+            };
+            if (!removed) return emitErrno("replace destination");
+        }
+    }
+    switch (copyTreeDir(allocator, spec.src, spec.dst, opts, &progress)) {
         .ok => {},
         .err => |m| return emitError(m),
         .errno => |what| return emitErrno(what),
     }
-    emit(.{ .ev = "done", .done = progress.done, .total = progress.total, .resumed_from = resumed_bytes });
+    emitCopyDone(&progress);
     return 0;
 }
 
-fn sizeTree(allocator: std.mem.Allocator, dir_path: []const u8, total: *u64) bool {
+fn sizeTree(allocator: std.mem.Allocator, dir_path: []const u8, total: *u64, files: *u64) bool {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const l = fsserve.listDir(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES) catch return false;
@@ -1474,15 +1615,32 @@ fn sizeTree(allocator: std.mem.Allocator, dir_path: []const u8, total: *u64) boo
             var buf: [4096]u8 = undefined;
             var w = std.Io.Writer.fixed(&buf);
             w.print("{s}/{s}", .{ dir_path, e.name }) catch return false;
-            if (!sizeTree(allocator, w.buffered(), total)) return false;
+            if (!sizeTree(allocator, w.buffered(), total, files)) return false;
         } else if (std.mem.eql(u8, e.kind, "file")) {
             total.* += e.size;
+            files.* += 1;
         }
     }
     return true;
 }
 
-fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8, allow_resume: bool, progress: *Progress, resumed_bytes: *u64) CopyResult {
+/// A destination name that is free in `dir`, "name-copy" first —
+/// the same scheme the browser's own Keep Both uses.
+fn uniqueInDir(dir: []const u8, base: []const u8, buf: []u8) ?[]const u8 {
+    const OnDisk = struct {
+        dir: []const u8,
+        pub fn contains(self: @This(), name: []const u8) bool {
+            var full: [4096]u8 = undefined;
+            var z: [4096]u8 = undefined;
+            const p = std.fmt.bufPrint(&full, "{s}/{s}", .{ if (self.dir.len == 1) "" else self.dir, name }) catch return true;
+            var st: c.struct_stat = undefined;
+            return c.lstat(pathz.pathZ(&z, p) catch return true, &st) == 0;
+        }
+    };
+    return uniqueName(base, buf, OnDisk{ .dir = dir });
+}
+
+fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8, opts: CopyOpts, progress: *Progress) CopyResult {
     var src_st: c.struct_stat = undefined;
     if (!statOf(src_dir, &src_st, true)) return .{ .errno = "stat dir" };
     {
@@ -1511,10 +1669,31 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
         var dbuf: [4096]u8 = undefined;
         var dw = std.Io.Writer.fixed(&dbuf);
         dw.print("{s}/{s}", .{ dst_dir, e.name }) catch return .{ .err = "path too long" };
-        const dpath = dw.buffered();
+        var dpath = dw.buffered();
+
+        // Per-entry collision policy. Directories are exempt: merging
+        // recurses into them, which is what makes merge a merge.
+        var unique_buf: [4096]u8 = undefined;
+        if (opts.conflict != .overwrite and !std.mem.eql(u8, e.kind, "dir")) {
+            var exist_st: c.struct_stat = undefined;
+            if (statOf(dpath, &exist_st, false)) {
+                if (opts.conflict == .skip) {
+                    // Counted as handled: `total` already includes it,
+                    // so not counting it would strand the bar short.
+                    if (std.mem.eql(u8, e.kind, "file")) progress.add(e.size);
+                    progress.entryDone();
+                    continue;
+                }
+                const name = uniqueInDir(dst_dir, e.name, &unique_buf) orelse
+                    return .{ .err = "no free destination name" };
+                var rw = std.Io.Writer.fixed(&dbuf);
+                rw.print("{s}/{s}", .{ dst_dir, name }) catch return .{ .err = "path too long" };
+                dpath = rw.buffered();
+            }
+        }
 
         if (std.mem.eql(u8, e.kind, "dir")) {
-            switch (copyTreeDir(allocator, spath, dpath, allow_resume, progress, resumed_bytes)) {
+            switch (copyTreeDir(allocator, spath, dpath, opts, progress)) {
                 .ok => {},
                 else => |r| return r,
             }
@@ -1541,7 +1720,8 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
             defer _ = c.close(dfd);
             if (c.fsync(dfd) != 0) return .{ .errno = "fsync symlink parent" };
         } else if (std.mem.eql(u8, e.kind, "file")) {
-            if (allow_resume) {
+            progress.setFile(spath);
+            if (opts.allow_resume) {
                 var dst_st: c.struct_stat = undefined;
                 if (statOf(dpath, &dst_st, false) and (dst_st.st_mode & c.S_IFMT) == c.S_IFREG and
                     @as(u64, @intCast(dst_st.st_size)) == e.size)
@@ -1549,17 +1729,19 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
                     const src_h = hashPrefix(spath, e.size, null);
                     const dst_h = hashPrefix(dpath, e.size, null);
                     if (src_h != null and dst_h != null and std.mem.eql(u8, &src_h.?, &dst_h.?)) {
+                        progress.resumed += e.size;
                         progress.add(e.size);
-                        resumed_bytes.* += e.size;
+                        progress.entryDone();
                         continue;
                     }
                 }
             }
             var fst: c.struct_stat = undefined;
             if (!statOf(spath, &fst, true)) return .{ .errno = "stat source file" };
-            var file_resumed: u64 = 0;
-            switch (copyOneFile(spath, dpath, fst, allow_resume, progress, &file_resumed)) {
-                .ok => resumed_bytes.* += file_resumed,
+            // Only regular files are counted: `entries_total` comes
+            // from sizeTree, which counts exactly those.
+            switch (copyOneFile(spath, dpath, fst, opts.allow_resume, progress)) {
+                .ok => progress.entryDone(),
                 else => |r| return r,
             }
         }
@@ -1575,14 +1757,33 @@ fn runDeleteTree(spec: Spec) u8 {
     if (!statOf(spec.src, &st, false)) return emitErrno("stat");
     var progress = Progress{};
     if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
+        // Count first (a stat walk, cheap against the unlink storm to
+        // come) so the panel can show a fraction rather than a
+        // number climbing toward an unknown ceiling.
+        var bytes: u64 = 0;
+        var entries: u64 = 0;
+        dirSizeWalk(spec.src, &bytes, &entries, false);
+        progress.total = entries + 1; // + the root directory itself
+        progress.entries_total = progress.total;
         if (!deleteTreeDir(spec.src, &progress)) return emitErrno("delete");
     } else {
+        progress.entries_total = 1;
+        progress.total = 1;
+        progress.setFile(spec.src);
         var z: [4096]u8 = undefined;
         const p = pathz.pathZ(&z, spec.src) catch return emitError("path too long");
         if (c.unlink(p) != 0) return emitErrno("unlink");
         progress.done += 1;
+        progress.entryDone();
     }
-    emit(.{ .ev = "done", .done = progress.done, .total = progress.done, .resumed_from = @as(u64, 0) });
+    emit(.{
+        .ev = "done",
+        .done = progress.done,
+        .total = progress.done,
+        .resumed_from = @as(u64, 0),
+        .files_done = progress.entries_done,
+        .files_total = progress.entries_done,
+    });
     return 0;
 }
 
@@ -1624,15 +1825,19 @@ fn deleteTreeDir(dir_path: []const u8, progress: *Progress) bool {
         if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
             if (!deleteTreeDir(full, progress)) return false;
         } else {
+            progress.setFile(full);
             if (c.unlink(fz) != 0) return false;
             progress.done += 1;
+            progress.entryDone();
         }
     }
     // A directory too wide for the name buffer: re-run this level
     // until it drains (batches of ~what fits).
     if (overflow) return deleteTreeDir(dir_path, progress);
+    progress.setFile(dir_path);
     if (c.rmdir(dz) != 0) return false;
     progress.done += 1;
+    progress.entryDone();
     return true;
 }
 
@@ -1644,7 +1849,7 @@ fn runDirSize(spec: Spec) u8 {
     var bytes: u64 = 0;
     var entries: u64 = 0;
     if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
-        dirSizeWalk(spec.src, &bytes, &entries);
+        dirSizeWalk(spec.src, &bytes, &entries, true);
     } else {
         bytes = @intCast(st.st_size);
         entries = 1;
@@ -1653,7 +1858,9 @@ fn runDirSize(spec: Spec) u8 {
     return 0;
 }
 
-fn dirSizeWalk(dir_path: []const u8, bytes: *u64, entries: *u64) void {
+/// @param report false when the walk is a silent pre-count (delete's
+/// entry total) rather than the dir_size job's own answer.
+fn dirSizeWalk(dir_path: []const u8, bytes: *u64, entries: *u64, report: bool) void {
     var z: [4096]u8 = undefined;
     const dz = pathz.pathZ(&z, dir_path) catch return;
     const dir = c.opendir(dz) orelse return;
@@ -1670,12 +1877,12 @@ fn dirSizeWalk(dir_path: []const u8, bytes: *u64, entries: *u64) void {
         if (!statOf(full, &st, false)) continue;
         entries.* += 1;
         if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
-            dirSizeWalk(full, bytes, entries);
+            dirSizeWalk(full, bytes, entries, report);
         } else {
             bytes.* += @intCast(st.st_size);
         }
         since_emit += 1;
-        if (since_emit >= 2000) {
+        if (report and since_emit >= 2000) {
             since_emit = 0;
             emit(.{ .ev = "progress", .done = bytes.*, .total = entries.* });
         }
@@ -2222,6 +2429,43 @@ test "archive member validation rejects traversal and absolute paths" {
     try std.testing.expect(unsafeArchiveMember("/absolute"));
 }
 
+test "CopyOpts maps the wire strings, defaulting to merge + overwrite" {
+    const t = std.testing;
+    const plain = CopyOpts.fromSpec(.{});
+    try t.expectEqual(@as(@FieldType(CopyOpts, "conflict"), .overwrite), plain.conflict);
+    try t.expect(!plain.replace);
+    const skip = CopyOpts.fromSpec(.{ .conflict = "skip", .dir_mode = "merge" });
+    try t.expectEqual(@as(@FieldType(CopyOpts, "conflict"), .skip), skip.conflict);
+    try t.expect(!skip.replace);
+    const both = CopyOpts.fromSpec(.{ .conflict = "keep_both", .dir_mode = "replace", .@"resume" = true });
+    try t.expectEqual(@as(@FieldType(CopyOpts, "conflict"), .keep_both), both.conflict);
+    try t.expect(both.replace and both.allow_resume);
+    // An unknown policy is not an error: it falls back to what the
+    // verb did before the option existed.
+    try t.expectEqual(@as(@FieldType(CopyOpts, "conflict"), .overwrite), CopyOpts.fromSpec(.{ .conflict = "nonsense" }).conflict);
+}
+
+test "uniqueInDir walks past every name already on disk" {
+    const t = std.testing;
+    var dbuf: [64]u8 = undefined;
+    const tmpl0 = "/tmp/sketerm-fsjob-uniq-XXXXXX";
+    @memcpy(dbuf[0..tmpl0.len], tmpl0);
+    dbuf[tmpl0.len] = 0;
+    const made = c.mkdtemp(@ptrCast(&dbuf)) orelse return error.SkipZigTest;
+    const dir = std.mem.span(@as([*:0]u8, @ptrCast(made)));
+    var buf: [512]u8 = undefined;
+    // Nothing taken yet.
+    try t.expectEqualStrings("a.txt-copy", uniqueInDir(dir, "a.txt", &buf).?);
+    for ([_][]const u8{ "a.txt-copy", "a.txt-copy2" }) |name| {
+        var z: [4096]u8 = undefined;
+        var pb: [4096]u8 = undefined;
+        const p = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ dir, name });
+        const f = c.fopen(try pathz.pathZ(&z, p), "wb") orelse return error.SkipZigTest;
+        _ = c.fclose(f);
+    }
+    try t.expectEqualStrings("a.txt-copy3", uniqueInDir(dir, "a.txt", &buf).?);
+}
+
 test "copyOneFile resumes only on matching prefix hash" {
     const t = std.testing;
     var dbuf: [64]u8 = undefined;
@@ -2264,12 +2508,11 @@ test "copyOneFile resumes only on matching prefix hash" {
     var st: c.struct_stat = undefined;
     try t.expect(statOf(src, &st, true));
     var progress = Progress{ .total = data.len };
-    var resumed: u64 = 0;
-    switch (copyOneFile(src, dst, st, true, &progress, &resumed)) {
+    switch (copyOneFile(src, dst, st, true, &progress)) {
         .ok => {},
         else => return error.TestUnexpectedResult,
     }
-    try t.expectEqual(@as(u64, 256 * 1024), resumed);
+    try t.expectEqual(@as(u64, 256 * 1024), progress.resumed);
     const out_h = hashPrefix(dst, data.len, null).?;
     var expect_h: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(data, &expect_h, .{});
@@ -2284,12 +2527,11 @@ test "copyOneFile resumes only on matching prefix hash" {
         try t.expect(c.fwrite(&junk, 1, junk.len, f) == junk.len);
     }
     var progress2 = Progress{ .total = data.len };
-    var resumed2: u64 = 99;
-    switch (copyOneFile(src, dst, st, true, &progress2, &resumed2)) {
+    switch (copyOneFile(src, dst, st, true, &progress2)) {
         .ok => {},
         else => return error.TestUnexpectedResult,
     }
-    try t.expectEqual(@as(u64, 0), resumed2);
+    try t.expectEqual(@as(u64, 0), progress2.resumed);
     const out_h2 = hashPrefix(dst, data.len, null).?;
     try t.expectEqualSlices(u8, &expect_h, &out_h2);
 }

@@ -47,6 +47,9 @@ pub const Listing = struct {
     path: []const u8 = "",
     entries: []Entry = &.{},
     truncated: bool = false,
+    /// Device id of the listed directory: what decides whether a hard
+    /// link INTO it could work, without a per-entry cost.
+    dev: u64 = 0,
 
     pub fn deinit(self: *Listing) void {
         self.arena.deinit();
@@ -140,6 +143,18 @@ const Reply = struct {
     files: u64 = 0,
     ffree: u64 = 0,
     namemax: u64 = 255,
+    home: []const u8 = "",
+    cache: []const u8 = "",
+    templates: []const u8 = "",
+    dev: u64 = 0,
+};
+
+/// The host's own directory identities. Resolved by the daemon that
+/// owns the files, so a remote host answers with ITS paths.
+pub const HostDirs = struct {
+    home: []const u8 = "",
+    cache: []const u8 = "",
+    templates: []const u8 = "",
 };
 
 // ── batched media metadata ──────────────────────────────────────
@@ -195,6 +210,12 @@ pub const JobEvent = struct {
     size: u64 = 0,
     matches: u64 = 0,
     truncated: bool = false,
+    /// Progress detail: the entry in flight (sticky daemon-side, so
+    /// present on every event once the job has named one) plus the
+    /// entry counters of a tree operation.
+    file: []const u8 = "",
+    files_done: u64 = 0,
+    files_total: u64 = 0,
     /// media_meta match payload: extracted fields plus whether the
     /// daemon served them from its cache.
     meta: []const MediaField = &.{},
@@ -327,6 +348,9 @@ pub const Fs = struct {
             size: u64 = 0,
             matches: u64 = 0,
             truncated: bool = false,
+            file: []const u8 = "",
+            files_done: u64 = 0,
+            files_total: u64 = 0,
             meta: []const MediaField = &.{},
             cached: bool = false,
         };
@@ -354,6 +378,9 @@ pub const Fs = struct {
             .size = parsed.size,
             .matches = parsed.matches,
             .truncated = parsed.truncated,
+            .file = parsed.file,
+            .files_done = parsed.files_done,
+            .files_total = parsed.files_total,
             .meta = parsed.meta,
             .cached = parsed.cached,
         }) catch arena.deinit();
@@ -455,6 +482,8 @@ pub const Fs = struct {
             off: u64 = 0,
             len: u32 = 0,
             @"resume": bool = false,
+            conflict: []const u8 = "",
+            dir_mode: []const u8 = "",
             job: u64 = 0,
             pattern: []const u8 = "",
             mode: u32 = 0,
@@ -488,6 +517,7 @@ pub const Fs = struct {
             const rep = try self.awaitReply(scratch.allocator(), req, OP_TIMEOUT_MS);
             if (out.path.len == 0 and rep.path.len > 0)
                 out.path = a.dupe(u8, rep.path) catch return Error.OutOfMemory;
+            if (rep.dev != 0) out.dev = rep.dev;
             if (rep.truncated) out.truncated = true;
             for (rep.entries) |e| {
                 entries.append(a, dupeEntry(a, e) catch return Error.OutOfMemory) catch
@@ -596,6 +626,27 @@ pub const Fs = struct {
     /// Create a symlink at `path` pointing to `target`.
     pub fn symlink(self: *Fs, target: []const u8, path: []const u8) Error!void {
         try self.simpleOp("symlink", .{ .path = path, .to = target });
+    }
+
+    /// Create a hard link at `path` for the existing file `target`.
+    /// Fails with a described error across filesystems or on a
+    /// directory — both are impossible, not merely unusual.
+    pub fn hardlink(self: *Fs, target: []const u8, path: []const u8) Error!void {
+        try self.simpleOp("hardlink", .{ .path = path, .to = target });
+    }
+
+    /// This host's home / cache / template directories, arena-owned.
+    pub fn hostDirs(self: *Fs, arena: std.mem.Allocator) Error!HostDirs {
+        const req = self.nextReq();
+        try self.sendOp("homedir", req, .{ .path = "/" });
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const rep = try self.awaitReply(scratch.allocator(), req, OP_TIMEOUT_MS);
+        return .{
+            .home = arena.dupe(u8, rep.home) catch return Error.OutOfMemory,
+            .cache = arena.dupe(u8, rep.cache) catch return Error.OutOfMemory,
+            .templates = arena.dupe(u8, rep.templates) catch return Error.OutOfMemory,
+        };
     }
 
     pub fn chmod(self: *Fs, path: []const u8, mode: u32) Error!void {
@@ -735,6 +786,18 @@ pub const Fs = struct {
 
     pub fn startCopyToken(self: *Fs, src: []const u8, dst: []const u8, resumable: bool, client_token: []const u8) Error!u64 {
         return self.startJob("copy", .{ .path = src, .to = dst, .@"resume" = resumable, .client_token = client_token });
+    }
+
+    /// How a copy resolves names that already exist at the
+    /// destination. `dir_mode` applies to the top-level directory
+    /// only; `conflict` governs every entry inside the tree.
+    pub const CopyMode = struct {
+        conflict: []const u8 = "",
+        dir_mode: []const u8 = "",
+    };
+
+    pub fn startCopyMode(self: *Fs, src: []const u8, dst: []const u8, mode: CopyMode) Error!u64 {
+        return self.startJob("copy", .{ .path = src, .to = dst, .conflict = mode.conflict, .dir_mode = mode.dir_mode });
     }
 
     pub fn startDeleteTree(self: *Fs, path: []const u8) Error!u64 {
