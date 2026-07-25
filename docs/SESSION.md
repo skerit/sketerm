@@ -9893,3 +9893,56 @@ ttl/destroy, an EXTERNAL weston-terminal rendering into the returned
 `request_close`: a non-controller's does nothing, the controller's
 closes the app — binary, and immune to the app's own idle repaints
 (a cursor blink defeats any "no new frames" assertion).
+## Firefox under the session compositor (2026-07-25)
+
+Firefox (and its forks: Camoufox) came up as a window that showed one
+flat frame -- black on a dark theme -- and never updated again, and
+scrolling it killed the process outright. Two independent bugs, both
+proven from a `WAYLAND_DEBUG=1` capture of the real client.
+
+**All of Firefox's UI lives in a subsurface.** Its `xdg_toplevel`
+surface carries only the CSD background: one `attach` at startup and
+never again. Chrome and page content go into a single desync'd
+`wl_subsurface` (a `wp_viewport`-scaled MozContainer) that it
+re-attaches to forever. The daemon shipped those frames correctly --
+`mux.log` showed `commit pixels: shipping (surface 48, ...)` -- but
+`ipc/appdrive.zig` (the headless replica used by every MCP app tool)
+*dropped* every frame whose surface had the subsurface role. So the
+only frame a window ever got was the CSD background, `frames` stayed
+at 1, and the screenshot was the theme's flat window colour. The GUI
+renderer was never affected: it maps subsurfaces onto GTK overlay
+children.
+
+The replica now composes the window TREE. `wlhost/compositor.zig`
+grew the tree queries a renderer needs -- `subtreeLayers` (subsurface
+descendants in paint order, offsets accumulated into root-local
+coordinates, below-parent group first), `rootSurface`, `surfaceExtent`
+and `hitTest` -- and appdrive keeps the root's own buffer in
+`Window.base_pixels`, holds each subsurface's latest content, and
+recomposites `Window.pixels` (premultiplied-alpha `blendLayer`) on any
+frame, move, restack or destroy in the tree. Subsurface repaints count
+as window frames, so `wait_change`/`wait_idle`/marker stashes and
+recordings all see the real repaint rate. Pointer input goes through
+`hitTest`, so clicks/drags/scrolls land on the subsurface that owns
+the point, in ITS coordinates, instead of on a toplevel that ignores
+them.
+
+**Events were gated on one global seat version.** Firefox binds
+`wl_seat` TWICE from separate registries -- v5 for its widget code, v8
+for the compositor thread -- and takes a pointer from each. The
+compositor kept a single `seat_version` (last bind wins, 8) and sent
+`axis_value120` (opcode 9, v8-only) to BOTH pointers; libwayland finds
+a NULL listener slot for it on the v5 proxy and aborts the client:
+"Wayland protocol error: listener function for opcode 9 of wl_pointer
+is NULL", followed by a minidump. Object versions are now tracked per
+id (`obj_versions`, seat devices inheriting their seat's version), and
+`axis_value120` / `axis_discrete` / pointer `frame` / keyboard
+`repeat_info` are each gated on the version of the object they go to.
+
+Verified against Firefox 153 (downloaded, run user-level) on both
+paths: MCP screenshots show chrome, page content and a cross-origin
+iframe; keyboard (ctrl+l, typed URL, Return) navigates; the wheel
+scrolls without crashing; the hamburger menu opens as a real popup
+surface; `app_resize` reflows the window. The GUI path (Xvfb +
+xdotool) renders the same page and takes motion/keyboard/wheel with no
+crash. Chromium is unchanged (scroll repaints, menu popup opens).

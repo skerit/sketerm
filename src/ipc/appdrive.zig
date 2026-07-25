@@ -150,8 +150,13 @@ pub const Window = struct {
     h: i32 = 0,
     scale: i32 = 1,
     format: u32 = 0,
-    /// Latest committed pixels, tightly packed w*4 (wl_shm layout).
+    /// Latest COMPOSITED pixels (own buffer + every subsurface
+    /// layer), tightly packed w*4 (wl_shm layout). What screenshots,
+    /// diffs, OCR, templates and recordings all read.
     pixels: std.ArrayList(u8) = .empty,
+    /// The root surface's own committed buffer, kept apart so a
+    /// subsurface-only repaint can recomposite without it.
+    base_pixels: std.ArrayList(u8) = .empty,
     title: ?[]u8 = null,
     app_id: ?[]u8 = null,
     popup: bool = false,
@@ -177,6 +182,7 @@ pub const Window = struct {
 
     fn deinit(self: *Window, a: std.mem.Allocator) void {
         self.pixels.deinit(a);
+        self.base_pixels.deinit(a);
         self.shot_pixels.deinit(a);
         if (self.title) |s| a.free(s);
         if (self.app_id) |s| a.free(s);
@@ -247,19 +253,108 @@ const Chan = struct {
     app: *App,
     id: u32,
     comp: wlcomp.Compositor,
-    /// Child surfaces are composited into their parent and must never
-    /// become independently selectable headless "windows". JBR uses
-    /// one such surface for every drop shadow.
-    subsurfaces: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Child surfaces are composited into their root window and must
+    /// never become independently selectable headless "windows". JBR
+    /// uses one for every drop shadow; Firefox renders its ENTIRE UI
+    /// into one, so dropping their pixels leaves a window frozen on
+    /// its CSD background forever.
+    subsurfaces: std.AutoHashMapUnmanaged(u32, SubPix) = .empty,
     /// A daemon resync replay is rebuilding this channel's replica
     /// (repeated chan_open); cleared when `native_sync` lands.
     resyncing: bool = false,
 
     fn deinit(self: *Chan) void {
+        self.clearSubsurfaces();
         self.subsurfaces.deinit(self.app.allocator);
         self.comp.deinit();
     }
+
+    /// Drop every tracked subsurface layer (and its pixels).
+    fn clearSubsurfaces(self: *Chan) void {
+        var it = self.subsurfaces.valueIterator();
+        while (it.next()) |sp| sp.pixels.deinit(self.app.allocator);
+        self.subsurfaces.clearRetainingCapacity();
+    }
 };
+
+/// Latest committed content of one subsurface, held until it can be
+/// composited into its root window's image.
+const SubPix = struct {
+    w: i32 = 0,
+    h: i32 = 0,
+    format: u32 = 0,
+    pixels: std.ArrayList(u8) = .empty,
+};
+
+/// Alpha-blend `src` (tightly packed sw*4, wl_shm byte order BGRA
+/// with PREMULTIPLIED alpha) onto `dst` (tightly packed dw*4) at
+/// (`ox`,`oy`), clipping to the destination. `format` 1 (XRGB8888)
+/// carries no alpha: those pixels are copied opaque.
+fn blendLayer(
+    dst: []u8,
+    dw: i32,
+    dh: i32,
+    src: []const u8,
+    sw: i32,
+    sh: i32,
+    ox: i32,
+    oy: i32,
+    format: u32,
+) void {
+    if (dw <= 0 or dh <= 0 or sw <= 0 or sh <= 0) return;
+    const opaque_fmt = format == 1;
+    var sy: i32 = @max(0, -oy);
+    while (sy < sh) : (sy += 1) {
+        const dy = oy + sy;
+        if (dy >= dh) break;
+        const srow = @as(usize, @intCast(sy)) * @as(usize, @intCast(sw)) * 4;
+        const drow = @as(usize, @intCast(dy)) * @as(usize, @intCast(dw)) * 4;
+        if (srow + @as(usize, @intCast(sw)) * 4 > src.len) break;
+        const sx0: i32 = @max(0, -ox);
+        const sx1: i32 = @min(sw, dw - ox);
+        if (sx1 <= sx0) continue;
+        const n: usize = @intCast(sx1 - sx0);
+        const s0 = srow + @as(usize, @intCast(sx0)) * 4;
+        const d0 = drow + @as(usize, @intCast(ox + sx0)) * 4;
+        if (d0 + n * 4 > dst.len or s0 + n * 4 > src.len) break;
+        const srun = src[s0..][0 .. n * 4];
+        const drun = dst[d0..][0 .. n * 4];
+        // Whole-run fast paths: XRGB has no alpha at all, and a fully
+        // opaque ARGB run (the common case — an app's content buffer)
+        // is a copy. Blending 1.3M pixels per frame by hand is what
+        // makes a browser-sized window expensive.
+        if (opaque_fmt or allOpaque(srun)) {
+            @memcpy(drun, srun);
+            if (!opaque_fmt) continue;
+            var i: usize = 3;
+            while (i < drun.len) : (i += 4) drun[i] = 255;
+            continue;
+        }
+        var i: usize = 0;
+        while (i < n * 4) : (i += 4) {
+            const a: u32 = srun[i + 3];
+            if (a == 255) {
+                @memcpy(drun[i..][0..4], srun[i..][0..4]);
+                continue;
+            }
+            if (a == 0) continue;
+            const inv = 255 - a;
+            inline for (0..4) |k| {
+                const under = @as(u32, drun[i + k]) * inv / 255;
+                drun[i + k] = @intCast(@min(255, @as(u32, srun[i + k]) + under));
+            }
+        }
+    }
+}
+
+/// Whether every pixel of a tightly-packed BGRA run has alpha 255.
+fn allOpaque(run: []const u8) bool {
+    var i: usize = 3;
+    while (i < run.len) : (i += 4) {
+        if (run[i] != 255) return false;
+    }
+    return true;
+}
 
 var name_counter: u32 = 0;
 /// Monotonic per-process log_get nonce (uniqueness within one
@@ -805,7 +900,7 @@ pub const App = struct {
                     // across the resync; windows the replay never
                     // re-announces are pruned at native_sync.
                     existing.comp.deinit();
-                    existing.subsurfaces.clearRetainingCapacity();
+                    existing.clearSubsurfaces();
                     existing.comp = self.makeReplica(existing) catch {
                         // Replica unusable — drop the channel wholesale.
                         _ = self.chans.swapRemove(open.id);
@@ -1215,6 +1310,8 @@ pub const App = struct {
             .popup_new = onPopupNew,
             .popup_gone = onGone,
             .subsurface_new = onSubsurfaceNew,
+            .subsurface_pos = onSubsurfacePos,
+            .subsurface_below = onSubsurfaceBelow,
             .subsurface_gone = onSubsurfaceGone,
             .clipboard_offer = onClipOffer,
             .clipboard_data = onClipData,
@@ -1247,10 +1344,71 @@ pub const App = struct {
         _ = x;
         _ = y;
         const ch = chanOf(ctx);
-        ch.subsurfaces.put(ch.app.allocator, sid, {}) catch {};
+        if (!ch.subsurfaces.contains(sid))
+            ch.subsurfaces.put(ch.app.allocator, sid, .{}) catch {};
         // Defensive cleanup for a malformed/replayed stream whose
         // frame raced the role notification.
         onSubsurfaceGoneWindow(ch, sid);
+    }
+
+    /// A subsurface moved (or restacked): its root window's composite
+    /// is stale.
+    fn onSubsurfacePos(ctx: ?*anyopaque, sid: u32, x: i32, y: i32) void {
+        _ = x;
+        _ = y;
+        const ch = chanOf(ctx);
+        if (!ch.subsurfaces.contains(sid)) return;
+        recompositeRootOf(ch, sid);
+    }
+
+    fn onSubsurfaceBelow(ctx: ?*anyopaque, sid: u32, below: bool) void {
+        _ = below;
+        const ch = chanOf(ctx);
+        if (!ch.subsurfaces.contains(sid)) return;
+        recompositeRootOf(ch, sid);
+    }
+
+    /// Recomposite the window whose tree contains `sid`.
+    fn recompositeRootOf(ch: *Chan, sid: u32) void {
+        const root = ch.comp.rootSurface(sid);
+        const win = ch.app.winBySurface(ch.id, root) orelse return;
+        recomposite(ch, win);
+    }
+
+    /// Rebuild `win.pixels` from the root's own buffer plus every
+    /// subsurface layer, bottom to top. A window with no subsurfaces
+    /// is a straight copy of the root buffer.
+    fn recomposite(ch: *Chan, win: *Window) void {
+        const a = ch.app.allocator;
+        win.pixels.clearRetainingCapacity();
+        if (win.w <= 0 or win.h <= 0) return;
+        var layers: std.ArrayList(wlcomp.Compositor.SubLayer) = .empty;
+        defer layers.deinit(a);
+        ch.comp.subtreeLayers(a, win.sid, &layers) catch {};
+        const n_below = wlcomp.Compositor.belowCount(layers.items);
+        if (n_below == 0) {
+            // Nothing paints under the root: start FROM its buffer
+            // instead of blending it over a cleared canvas (the
+            // overwhelmingly common shape, and a full-window blend per
+            // frame is pure cost).
+            win.pixels.appendSlice(a, win.base_pixels.items) catch return;
+            if (layers.items.len == 0) return;
+        } else {
+            const need = @as(usize, @intCast(win.w)) * @as(usize, @intCast(win.h)) * 4;
+            win.pixels.appendNTimes(a, 0, need) catch return;
+        }
+        const paint = struct {
+            fn one(chan: *Chan, w: *Window, l: wlcomp.Compositor.SubLayer) void {
+                const sp = chan.subsurfaces.getPtr(l.sid) orelse return;
+                if (sp.pixels.items.len == 0) return;
+                blendLayer(w.pixels.items, w.w, w.h, sp.pixels.items, sp.w, sp.h, l.x, l.y, sp.format);
+            }
+        }.one;
+        if (n_below > 0) {
+            for (layers.items[0..n_below]) |l| paint(ch, win, l);
+            blendLayer(win.pixels.items, win.w, win.h, win.base_pixels.items, win.w, win.h, 0, 0, win.format);
+        }
+        for (layers.items[n_below..]) |l| paint(ch, win, l);
     }
 
     fn onSubsurfaceGoneWindow(ch: *Chan, sid: u32) void {
@@ -1269,8 +1427,15 @@ pub const App = struct {
 
     fn onSubsurfaceGone(ctx: ?*anyopaque, sid: u32) void {
         const ch = chanOf(ctx);
-        _ = ch.subsurfaces.remove(sid);
+        // The tree link is already gone by the time this fires, so
+        // resolve the root from the parent we still know about.
+        const root = ch.comp.rootSurface(sid);
+        if (ch.subsurfaces.fetchRemove(sid)) |kv| {
+            var sp = kv.value;
+            sp.pixels.deinit(ch.app.allocator);
+        }
         onSubsurfaceGoneWindow(ch, sid);
+        if (ch.app.winBySurface(ch.id, root)) |win| recomposite(ch, win);
     }
 
     fn onFrame(ctx: ?*anyopaque, sid: u32, w: i32, h: i32, scale: i32, lw: i32, lh: i32, format: u32, pixels: []const u8) void {
@@ -1279,24 +1444,52 @@ pub const App = struct {
         _ = lw;
         _ = lh;
         const ch = chanOf(ctx);
-        if (ch.subsurfaces.contains(sid)) return;
-        const win = ch.app.ensureWindow(ch.id, sid, false) orelse return;
-        win.w = w;
-        win.h = h;
-        win.scale = scale;
-        win.format = format;
-        win.pixels.clearRetainingCapacity();
-        win.pixels.appendSlice(ch.app.allocator, pixels) catch {};
+        const win = blk: {
+            if (ch.subsurfaces.getPtr(sid)) |sp| {
+                // Subsurface content: stash it and recomposite the
+                // window it belongs to. This IS the app's repaint for
+                // toolkits that render everything into a subsurface
+                // (Firefox), so it counts as a window frame.
+                sp.w = w;
+                sp.h = h;
+                sp.format = format;
+                sp.pixels.clearRetainingCapacity();
+                sp.pixels.appendSlice(ch.app.allocator, pixels) catch {};
+                const root = ch.comp.rootSurface(sid);
+                const rw = ch.app.winBySurface(ch.id, root) orelse return;
+                recomposite(ch, rw);
+                break :blk rw;
+            }
+            const win = ch.app.ensureWindow(ch.id, sid, false) orelse return;
+            win.w = w;
+            win.h = h;
+            win.scale = scale;
+            win.format = format;
+            win.base_pixels.clearRetainingCapacity();
+            win.base_pixels.appendSlice(ch.app.allocator, pixels) catch {};
+            recomposite(ch, win);
+            break :blk win;
+        };
+        // A subsurface can commit its content BEFORE the root surface
+        // ever attaches a buffer (Firefox does): there is no window
+        // image yet, so this is not a presentable frame — counting it
+        // would hand waiters a 0x0 window.
+        if (win.pixels.items.len == 0) return;
         win.frames += 1;
         win.last_commit_ms = nowMs();
         ch.app.frame_seq += 1;
         ch.app.tickPendingMarkers(win);
-        if (win.id == ch.app.rec_win and w > 0 and h > 0) {
+        // Recordings take the COMPOSITED window, not the buffer that
+        // happened to arrive (a subsurface frame is a fragment of it).
+        if (win.id == ch.app.rec_win and win.w > 0 and win.h > 0) {
             const t = nowMs();
             if (ch.app.rec_min_interval_ms <= 0 or t - ch.app.rec_last_add >= ch.app.rec_min_interval_ms) {
                 ch.app.rec_last_add = t;
-                if (ch.app.rec) |*r| r.addShmFrame(pixels, @intCast(w), @intCast(h), format, t) catch {};
-                if (ch.app.vrec) |*r| r.addShmFrame(pixels, @intCast(w), @intCast(h), format, t) catch {};
+                const wp = win.pixels.items;
+                const ww: u32 = @intCast(win.w);
+                const wh: u32 = @intCast(win.h);
+                if (ch.app.rec) |*r| r.addShmFrame(wp, ww, wh, win.format, t) catch {};
+                if (ch.app.vrec) |*r| r.addShmFrame(wp, ww, wh, win.format, t) catch {};
             }
         }
     }
@@ -1453,13 +1646,25 @@ pub const App = struct {
         return Error.NoSuchWindow;
     }
 
+    /// Which surface a window-local point belongs to, and the point in
+    /// that surface's own coordinates. Window coordinates are the ROOT
+    /// surface's, but Wayland input is delivered to the topmost
+    /// subsurface under the pointer — Firefox listens on the
+    /// subsurface that holds its whole UI, not on the CSD toplevel.
+    fn ptrTarget(self: *App, win: *Window, x: f64, y: f64) wlcomp.Compositor.Hit {
+        const ch = self.chans.get(win.chan) orelse
+            return .{ .sid = win.sid, .x = x, .y = y };
+        return ch.comp.hitTest(self.allocator, win.sid, x, y);
+    }
+
     /// Inject enter+motion to (x,y) and move the tracked position.
     fn sendPointer(self: *App, win: *Window, x: f64, y: f64) Error!void {
         const a = self.allocator;
+        const hit = self.ptrTarget(win, x, y);
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
-        wlpipe.appendSeatEnter(&units, a, win.sid, x, y) catch return Error.OutOfMemory;
-        wlpipe.appendSeatMotion(&units, a, x, y) catch return Error.OutOfMemory;
+        wlpipe.appendSeatEnter(&units, a, hit.sid, hit.x, hit.y) catch return Error.OutOfMemory;
+        wlpipe.appendSeatMotion(&units, a, hit.x, hit.y) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);
         self.rememberPtr(win.id, x, y);
     }
@@ -1517,10 +1722,11 @@ pub const App = struct {
     pub fn clickEx(self: *App, win_id: u32, x: f64, y: f64, button: u32, hold_ms: i64, count: u32) Error!void {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         const a = self.allocator;
+        const hit = self.ptrTarget(win, x, y);
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
-        wlpipe.appendSeatEnter(&units, a, win.sid, x, y) catch return Error.OutOfMemory;
-        wlpipe.appendSeatMotion(&units, a, x, y) catch return Error.OutOfMemory;
+        wlpipe.appendSeatEnter(&units, a, hit.sid, hit.x, hit.y) catch return Error.OutOfMemory;
+        wlpipe.appendSeatMotion(&units, a, hit.x, hit.y) catch return Error.OutOfMemory;
         const reps = @max(count, 1);
         var i: u32 = 0;
         while (i < reps) : (i += 1) {
@@ -1557,10 +1763,11 @@ pub const App = struct {
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
-        wlpipe.appendSeatEnter(&units, a, win.sid, x, y) catch return Error.OutOfMemory;
+        const hit = self.ptrTarget(win, x, y);
+        wlpipe.appendSeatEnter(&units, a, hit.sid, hit.x, hit.y) catch return Error.OutOfMemory;
         // Enter is a no-op when focus is unchanged, so the motion is
         // what actually puts the pointer at the scroll point.
-        wlpipe.appendSeatMotion(&units, a, x, y) catch return Error.OutOfMemory;
+        wlpipe.appendSeatMotion(&units, a, hit.x, hit.y) catch return Error.OutOfMemory;
         if (dy != 0) wlpipe.appendSeatAxis(&units, a, 0, dy * 10.0, @intFromFloat(dy * 120.0)) catch return Error.OutOfMemory;
         if (dx != 0) wlpipe.appendSeatAxis(&units, a, 1, dx * 10.0, @intFromFloat(dx * 120.0)) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);
@@ -1574,8 +1781,13 @@ pub const App = struct {
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
-        wlpipe.appendSeatEnter(&units, a, win.sid, x1, y1) catch return Error.OutOfMemory;
-        wlpipe.appendSeatMotion(&units, a, x1, y1) catch return Error.OutOfMemory;
+        // The press resolves the target surface; the drag then stays
+        // on it (pointer grab), so every motion uses the same offset.
+        const hit = self.ptrTarget(win, x1, y1);
+        const off_x = x1 - hit.x;
+        const off_y = y1 - hit.y;
+        wlpipe.appendSeatEnter(&units, a, hit.sid, hit.x, hit.y) catch return Error.OutOfMemory;
+        wlpipe.appendSeatMotion(&units, a, hit.x, hit.y) catch return Error.OutOfMemory;
         wlpipe.appendSeatButton(&units, a, evdevButton(button), true) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);
         const dist = @max(@abs(x2 - x1), @abs(y2 - y1));
@@ -1584,7 +1796,7 @@ pub const App = struct {
         while (i <= steps) : (i += 1) {
             const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps));
             units.clearRetainingCapacity();
-            wlpipe.appendSeatMotion(&units, a, x1 + (x2 - x1) * t, y1 + (y2 - y1) * t) catch return Error.OutOfMemory;
+            wlpipe.appendSeatMotion(&units, a, x1 + (x2 - x1) * t - off_x, y1 + (y2 - y1) * t - off_y) catch return Error.OutOfMemory;
             try self.sendIntents(win.chan, units.items);
             if (i % 4 == 0) _ = self.pumpOnce(5);
         }
@@ -2284,6 +2496,207 @@ test "resync replay: chan_open replace keeps window identity, native_sync prunes
     try t.expect(!ch2.resyncing);
     try t.expectEqual(@as(usize, 1), app.windows.items.len);
     try t.expectEqual(win1, app.windows.items[0]);
+}
+
+test "Firefox pattern: subsurface repaints composite into the window image" {
+    // The whole UI lives in a subsurface of the CSD toplevel. Dropping
+    // those frames (what the replica used to do) left the window frozen
+    // on its flat background forever — a black window that never
+    // updates. Drive the replica with the real request stream and check
+    // the composed image and the input target.
+    const t = std.testing;
+    const a = t.allocator;
+    const wlwire = @import("../wlhost/wire.zig");
+    var app = App{ .allocator = a, .conn = undefined, .name = @constCast("test") };
+    defer testTeardown(&app);
+
+    var pl: [5]u8 = undefined;
+    app.handleFrame(.chan_open, testChanOpenPayload(&pl, 3));
+    const ch = app.chans.get(3).?;
+
+    const H = struct {
+        fn req(chn: *Chan, msg: []const u8) !void {
+            var unit: std.ArrayList(u8) = .empty;
+            defer unit.deinit(std.testing.allocator);
+            try wlpipe.appendUnit(&unit, std.testing.allocator, .wl_msg, msg);
+            try chn.comp.feed(unit.items);
+        }
+        fn bind(chn: *Chan, name: u32, iface: []const u8, ver: u32, id: u32) !void {
+            var buf: [96]u8 = undefined;
+            var b = wlwire.Builder.init(&buf, 2, 0);
+            b.putUint(name);
+            b.putString(iface);
+            b.putUint(ver);
+            b.putNewId(id);
+            try req(chn, try b.finish());
+        }
+    };
+    var buf: [96]u8 = undefined;
+    { // get_registry(2)
+        var b = wlwire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try H.req(ch, try b.finish());
+    }
+    try H.bind(ch, 1, "wl_compositor", 6, 3);
+    try H.bind(ch, 2, "wl_shm", 1, 4);
+    try H.bind(ch, 5, "xdg_wm_base", 6, 5);
+    try H.bind(ch, 11, "wl_subcompositor", 1, 6);
+    { // root surface 7 → xdg_surface 8 → toplevel 9, first commit
+        var b = wlwire.Builder.init(&buf, 3, 0);
+        b.putNewId(7);
+        try H.req(ch, try b.finish());
+        var b2 = wlwire.Builder.init(&buf, 5, 2);
+        b2.putNewId(8);
+        b2.putObject(7);
+        try H.req(ch, try b2.finish());
+        var b3 = wlwire.Builder.init(&buf, 8, 1);
+        b3.putNewId(9);
+        try H.req(ch, try b3.finish());
+        var b4 = wlwire.Builder.init(&buf, 7, 6);
+        try H.req(ch, try b4.finish());
+    }
+    { // content surface 10 as a subsurface of 7 at (1, 1)
+        var b = wlwire.Builder.init(&buf, 3, 0);
+        b.putNewId(10);
+        try H.req(ch, try b.finish());
+        var b2 = wlwire.Builder.init(&buf, 6, 1);
+        b2.putNewId(11);
+        b2.putObject(10);
+        b2.putObject(7);
+        try H.req(ch, try b2.finish());
+        var b3 = wlwire.Builder.init(&buf, 11, 1);
+        b3.putInt(1);
+        b3.putInt(1);
+        try H.req(ch, try b3.finish());
+    }
+    { // pool 12 (80 bytes): root 4x4 at 0, content 2x2 at 64
+        var b = wlwire.Builder.init(&buf, 4, 0);
+        b.putNewId(12);
+        b.putInt(80);
+        try H.req(ch, try b.finish());
+        var px: [80]u8 = undefined;
+        var i: usize = 0;
+        while (i < 64) : (i += 4) {
+            px[i] = 10;
+            px[i + 1] = 20;
+            px[i + 2] = 30;
+            px[i + 3] = 255;
+        }
+        while (i < 80) : (i += 4) {
+            px[i] = 200;
+            px[i + 1] = 210;
+            px[i + 2] = 220;
+            px[i + 3] = 255;
+        }
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(a);
+        try wlpipe.appendPoolUpdate(&unit, a, 12, 0, &px);
+        try ch.comp.feed(unit.items);
+        var b2 = wlwire.Builder.init(&buf, 12, 0); // create_buffer(13) root
+        b2.putNewId(13);
+        b2.putInt(0);
+        b2.putInt(4);
+        b2.putInt(4);
+        b2.putInt(16);
+        b2.putUint(0);
+        try H.req(ch, try b2.finish());
+        var b3 = wlwire.Builder.init(&buf, 12, 0); // create_buffer(14) content
+        b3.putNewId(14);
+        b3.putInt(64);
+        b3.putInt(2);
+        b3.putInt(2);
+        b3.putInt(8);
+        b3.putUint(0);
+        try H.req(ch, try b3.finish());
+    }
+    { // the root attaches its background ONCE
+        var b = wlwire.Builder.init(&buf, 7, 1);
+        b.putObject(13);
+        b.putInt(0);
+        b.putInt(0);
+        try H.req(ch, try b.finish());
+        var b2 = wlwire.Builder.init(&buf, 7, 6);
+        try H.req(ch, try b2.finish());
+    }
+    try t.expectEqual(@as(usize, 1), app.windows.items.len);
+    const win = app.windows.items[0];
+    try t.expectEqual(@as(i32, 4), win.w);
+    try t.expectEqual(@as(u64, 1), win.frames);
+
+    { // ...then only the content subsurface repaints, twice
+        var i: usize = 0;
+        while (i < 2) : (i += 1) {
+            var b = wlwire.Builder.init(&buf, 10, 1);
+            b.putObject(14);
+            b.putInt(0);
+            b.putInt(0);
+            try H.req(ch, try b.finish());
+            var b2 = wlwire.Builder.init(&buf, 10, 6);
+            try H.req(ch, try b2.finish());
+        }
+    }
+    // Those repaints ARE window frames, and there is still exactly one
+    // window (the subsurface never becomes selectable).
+    try t.expectEqual(@as(usize, 1), app.windows.items.len);
+    try t.expectEqual(@as(u64, 3), win.frames);
+
+    // The content landed at (1,1) over the background.
+    try t.expectEqual(@as(usize, 64), win.pixels.items.len);
+    const px = win.pixels.items;
+    const root_rgba = [_]u8{ 10, 20, 30, 255 };
+    const sub_rgba = [_]u8{ 200, 210, 220, 255 };
+    for (0..4) |y| for (0..4) |x| {
+        const off = (y * 4 + x) * 4;
+        const want: []const u8 = if (x >= 1 and x <= 2 and y >= 1 and y <= 2)
+            &sub_rgba
+        else
+            &root_rgba;
+        try t.expectEqualSlices(u8, want, px[off..][0..4]);
+    };
+
+    // Pointer input aims at the subsurface, in ITS coordinates.
+    const hit = app.ptrTarget(win, 2, 2);
+    try t.expectEqual(@as(u32, 10), hit.sid);
+    try t.expectEqual(@as(f64, 1), hit.x);
+    try t.expectEqual(@as(f64, 1), hit.y);
+    // A point outside it stays on the root.
+    const miss = app.ptrTarget(win, 0, 0);
+    try t.expectEqual(@as(u32, 7), miss.sid);
+}
+
+test "blendLayer: premultiplied alpha, xrgb opacity, clipping" {
+    const t = std.testing;
+    var dst = [_]u8{0} ** 16; // 2x2 canvas
+    // Opaque 1x1 at (1,1).
+    const src = [_]u8{ 40, 50, 60, 255 };
+    blendLayer(&dst, 2, 2, &src, 1, 1, 1, 1, 0);
+    try t.expectEqualSlices(u8, &src, dst[12..16]);
+    try t.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, dst[0..4]);
+
+    // Half-transparent (premultiplied) over it: src + dst*(1-a).
+    const half = [_]u8{ 10, 10, 10, 128 };
+    blendLayer(&dst, 2, 2, &half, 1, 1, 1, 1, 0);
+    try t.expectEqual(@as(u8, 10 + 40 * 127 / 255), dst[12]);
+    try t.expectEqual(@as(u8, 255), dst[15]);
+
+    // An XRGB source ignores its alpha byte and lands opaque.
+    const xrgb = [_]u8{ 1, 2, 3, 0 };
+    blendLayer(&dst, 2, 2, &xrgb, 1, 1, 0, 0, 1);
+    try t.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 255 }, dst[0..4]);
+
+    // Fully off-canvas offsets touch nothing.
+    var before = dst;
+    blendLayer(&dst, 2, 2, &src, 1, 1, 9, 9, 0);
+    try t.expectEqualSlices(u8, &before, &dst);
+    blendLayer(&dst, 2, 2, &src, 1, 1, -9, -9, 0);
+    try t.expectEqualSlices(u8, &before, &dst);
+    // A partially off-canvas layer clips instead of wrapping.
+    const two = [_]u8{ 7, 7, 7, 255, 8, 8, 8, 255 };
+    blendLayer(&dst, 2, 2, &two, 2, 1, 1, 0, 0);
+    try t.expectEqualSlices(u8, &[_]u8{ 7, 7, 7, 255 }, dst[4..8]);
+    before = dst;
+    blendLayer(&dst, 2, 2, &two, 2, 1, -1, 0, 0);
+    try t.expectEqualSlices(u8, &[_]u8{ 8, 8, 8, 255 }, dst[0..4]);
 }
 
 test "presentation lifecycle distinguishes freeze, last toplevel, and client disconnect" {
