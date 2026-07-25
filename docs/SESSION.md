@@ -9788,3 +9788,37 @@ the other degrades to in-view transfers with an honest status line
 ("download is not restart-durable (recovery ledger unavailable)", then
 the normal transfer-done and edit-sync notices). With a dedicated
 files process that is now the common case rather than an edge one.
+
+## Desktop integration for the file manager (2026-07-25)
+
+The files identity now has the desktop-side half it was missing.
+`main.zig` had always asked windows for the icon name
+`dev.sker.sketerm.files`, but no such icon existed anywhere in the
+repo or on the system, and `dev.sker.sketerm.files.desktop` pointed
+`Icon=` at the terminal's icon instead: the file manager has never had
+an icon of its own. `data/icons/hicolor/scalable/apps/dev.sker.sketerm.files.svg`
+is that icon, drawn in the same family as the terminal one (same
+bezel, same title-bar dots) with a folder in place of the prompt
+chevron so the two stay distinguishable at taskbar sizes; checked
+rendered at 128/48/32/22 px.
+
+The entry also could not be chosen as a default file manager: it
+declared no `MimeType`. It now declares `inode/directory` and
+`x-scheme-handler/file`, takes `%U` rather than `%f` so KDE may hand
+it a `file://` URI (decoded by `filebrowser/entry.zig`), carries a
+"New Window" desktop action, and its `StartupWMClass` matches the
+GApplication id / WM_CLASS measured live (`dev.sker.sketerm.files`).
+Set it as the default with
+`xdg-mime default dev.sker.sketerm.files.desktop inode/directory`.
+Both entries pass `desktop-file-validate`.
+
+Packaging: `makepkg -si` was silently refusing to install. `pkgver()`
+derives from HEAD and uncommitted source changes do not move it, so a
+rebuild of the same commit hits makepkg's "A package has already been
+built" gate, exits 13 before building, and leaves the previously
+installed binary in place -- which is how a stale sketerm kept running
+after an apparently successful install. `dist/install.sh` (=
+`makepkg -sif`) is now the documented command. The perpetually dirty
+`pkgver=` line in `git status` is makepkg's own rewrite of the
+PKGBUILD, not a local edit; that had been mistaken for a user change
+across several sessions.

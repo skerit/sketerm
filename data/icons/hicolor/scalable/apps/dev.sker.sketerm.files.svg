@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Sketerm Files</title>
+  <defs>
+    <linearGradient id="bezel" x1="64" y1="12" x2="64" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3d3846"/>
+      <stop offset="1" stop-color="#241f31"/>
+    </linearGradient>
+    <linearGradient id="back" x1="64" y1="48" x2="64" y2="72" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#89b4fa"/>
+      <stop offset="1" stop-color="#74a0f0"/>
+    </linearGradient>
+    <linearGradient id="front" x1="64" y1="66" x2="64" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#b8d4fd"/>
+      <stop offset="1" stop-color="#8fb6f6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Window body: same bezel as the terminal icon, so the two read as siblings -->
+  <rect x="12" y="12" width="104" height="104" rx="20" ry="20" fill="url(#bezel)"/>
+
+  <!-- Title-bar dots -->
+  <circle cx="28" cy="28" r="3.5" fill="#ed5e5e"/>
+  <circle cx="40" cy="28" r="3.5" fill="#f9c74f"/>
+  <circle cx="52" cy="28" r="3.5" fill="#90be6d"/>
+
+  <!-- Folder back plate with its tab -->
+  <path d="M 26 48 h 22 l 7 8 h 47 c 2.2 0 4 1.8 4 4 v 44 c 0 2.2 -1.8 4 -4 4 H 26
+           c -2.2 0 -4 -1.8 -4 -4 V 52 c 0 -2.2 1.8 -4 4 -4 Z" fill="url(#back)"/>
+
+  <!-- Folder front, offset down so the plate reads as a folder rather than a box -->
+  <path d="M 26 66 h 76 c 2.2 0 4 1.8 4 4 v 34 c 0 2.2 -1.8 4 -4 4 H 26
+           c -2.2 0 -4 -1.8 -4 -4 V 70 c 0 -2.2 1.8 -4 4 -4 Z" fill="url(#front)"/>
+
+  <!-- Listing rows: three entries, the shortest last, so it reads as a file list -->
+  <rect x="34" y="78" width="52" height="6" rx="3" fill="#2a4a7c"/>
+  <rect x="34" y="90" width="40" height="6" rx="3" fill="#2a4a7c" opacity="0.75"/>
+</svg>
