@@ -476,9 +476,19 @@ pub const Conn = struct {
     /// Spawn `argv` with both stdio ends on one socketpair fd,
     /// double-forked so init reaps it (no zombies, child outlives
     /// nothing it shouldn't). Returns a Conn over our end.
+    ///
+    /// CLOEXEC on the pair is load-bearing: without it every transport
+    /// spawned LATER inherits the sockets of every earlier one, so the peer
+    /// of an old connection cannot see EOF until the last of those children
+    /// exits - a dead GUI's durable sessions then stay "attached" on the
+    /// daemon, streaming into a socket nobody reads. `dup2` clears CLOEXEC
+    /// on the copy it makes, so the exec'd child still gets stdin/stdout.
+    /// `setsid` keeps a terminal signal aimed at the spawner's process group
+    /// (a Ctrl+C or SIGHUP in the shell that launched the GUI) from taking
+    /// every session transport down with it.
     fn spawnOverSocketpair(allocator: std.mem.Allocator, bin: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) !Conn {
         var pair: [2]c_int = undefined;
-        if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair) != 0) return error.SocketFailed;
+        if (@import("../util/platform.zig").socketpairCloexec(&pair) != 0) return error.SocketFailed;
         errdefer {
             _ = c.close(pair[0]);
             _ = c.close(pair[1]);
@@ -487,6 +497,7 @@ pub const Conn = struct {
         if (pid < 0) return error.ForkFailed;
         if (pid == 0) {
             if (c.fork() == 0) {
+                _ = c.setsid();
                 _ = c.dup2(pair[1], 0);
                 _ = c.dup2(pair[1], 1);
                 _ = c.close(pair[0]);
@@ -654,6 +665,20 @@ pub const Conn = struct {
         return self.last_err[0..self.last_err_len];
     }
 };
+
+test "transport fd is close-on-exec so it cannot leak into a later child" {
+    // Regression: socketpair() without SOCK_CLOEXEC handed every transport
+    // socket to every child spawned afterwards (proxy N held N-1 foreign
+    // sockets, confirmed via /proc/<pid>/fd). The peer of an old connection
+    // then cannot see EOF until the last of those children exits, so a dead
+    // GUI's durable sessions stay attached on the daemon.
+    const a = std.testing.allocator;
+    var conn = try Conn.spawnOverSocketpair(a, "/bin/true", &[_:null]?[*:0]const u8{ "/bin/true", null });
+    defer conn.deinit();
+    const flags = c.fcntl(conn.fd, c.F_GETFD);
+    try std.testing.expect(flags >= 0);
+    try std.testing.expect(flags & c.FD_CLOEXEC != 0);
+}
 
 test "welcome records older and future daemon profiles without rejecting either" {
     const a = std.testing.allocator;
