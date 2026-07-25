@@ -13,11 +13,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const dbus = @import("dbus.zig");
 
-fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
 
 const ATSPI_ACCESSIBLE = "org.a11y.atspi.Accessible";
 const ATSPI_REGISTRY_DEST = "org.a11y.atspi.Registry";

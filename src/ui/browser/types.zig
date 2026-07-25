@@ -163,13 +163,19 @@ pub const HostConn = struct {
     /// Owning view died while the connect thread was in flight; the
     /// idle handback frees this struct.
     orphaned: bool = false,
-    /// The host's cache dir (thumbnail placement); fetched once via
-    /// the homedir op.
-    cache_dir: ?[]u8 = null,
-    /// ...and its template dir, from the same reply: "New from
-    /// Template" on a remote tab must offer THAT host's templates.
+    /// The host's freedesktop Templates dir, resolved by the daemon
+    /// that owns the files: "New from Template" on a remote tab must
+    /// offer THAT host's templates, and only its daemon can read its
+    /// user-dirs.dirs.
     templates_dir: ?[]u8 = null,
-    cache_req: u32 = 0,
+    /// The one in-flight `homedir` request (0 = none). A second
+    /// request for the same facts would be a wasted round trip that
+    /// could also land first and be dropped as unrecognized.
+    dirs_req: u32 = 0,
+    /// The host has ANSWERED `homedir`. Distinguishes "asked, this
+    /// host reports no such directory" from "never asked", so a
+    /// waiter is never left expecting a reply that will not come.
+    dirs_known: bool = false,
 
     pub fn label(self: *const HostConn) []const u8 {
         return self.host orelse "local";
@@ -178,7 +184,6 @@ pub const HostConn = struct {
     pub fn destroy(self: *HostConn, allocator: std.mem.Allocator) void {
         if (self.watch_id != 0) _ = c.g_source_remove(self.watch_id);
         if (self.state == .ready) self.conn.deinit();
-        if (self.cache_dir) |cd| allocator.free(cd);
         if (self.templates_dir) |td| allocator.free(td);
         if (self.host) |h| allocator.free(h);
         allocator.destroy(self);
@@ -261,6 +266,33 @@ pub const Dir = struct {
         return null;
     }
 
+    /// True when this directory's rows are NOT children of its own
+    /// path: search results, panelize output and register rows all
+    /// carry their real location in `target`.
+    pub fn isFlat(self: *const Dir) bool {
+        return self.flat or self.collection;
+    }
+
+    /// The entry whose full path is `path`, or null.
+    ///
+    /// Mirrors `fullPath` exactly, which is why the target scan is
+    /// restricted to flat dirs: an ordinary directory's `target` is a
+    /// SYMLINK's destination, and matching on it would hand back the
+    /// link when asked about the file it points at.
+    pub fn findPath(self: *Dir, path: []const u8) ?*Entry {
+        if (self.isFlat()) {
+            for (self.entries.items) |*e| {
+                const t = e.target orelse continue;
+                if (std.mem.eql(u8, t, path)) return e;
+            }
+            return null;
+        }
+        const parent = std.fs.path.dirname(path) orelse return null;
+        if (!std.mem.eql(u8, self.path, parent)) return null;
+        const i = self.find(std.fs.path.basename(path)) orelse return null;
+        return &self.entries.items[i];
+    }
+
     pub fn own(self: *Dir, we: WireEntry) ?Entry {
         const a = self.allocator;
         const name = a.dupe(u8, we.name) catch return null;
@@ -320,7 +352,28 @@ pub const Dir = struct {
                 return;
             };
         }
-        self.sort();
+        if (self.sortableNow()) self.sort();
+    }
+
+    /// May a pushed delta re-sort this directory on its own?
+    ///
+    /// Only when the sort key is carried BY the delta. Media-column
+    /// values are not: they come from a batched media_meta job and
+    /// are stitched onto the entries by mediacols.applyValues at
+    /// render time, so `own()` above hands back an entry with an
+    /// EMPTY `meta`. Sorting here would order the fresh row by a
+    /// value that provably is not there yet -- it sinks to the
+    /// missing end and jumps back the moment renderTab re-stitches
+    /// and re-sorts. Deferring costs nothing: renderTab's sort is
+    /// the one the user ever sees, and skipping this one also drops
+    /// an O(n log n) pass per delta on a busy directory.
+    ///
+    /// Everything else (name/size/mtime/kind and `user.*` xattr
+    /// columns) rides the listing itself, so the delta path stays
+    /// self-sufficient for it.
+    fn sortableNow(self: *const Dir) bool {
+        const col = self.attr_sort orelse return true;
+        return col.source != .media;
     }
 
     pub fn del(self: *Dir, name: []const u8) void {
@@ -798,4 +851,99 @@ test "JobRow keeps the identifying TAIL of an over-long current file" {
     try t.expectEqualStrings("...", kept[0..3]);
     // The part that names the file survives; the head does not.
     try t.expectEqualStrings("/last.bin", kept[kept.len - 9 ..]);
+}
+
+/// A listing entry owned by `a`, for the Dir tests below and for
+/// nav.zig's entryForPath test.
+pub fn testEntry(a: std.mem.Allocator, name: []const u8, target: ?[]const u8) !Entry {
+    return .{
+        .name = try a.dupe(u8, name),
+        .kind = try a.dupe(u8, "file"),
+        .size = 0,
+        .mode = 0,
+        .mtime_ms = 0,
+        .target = if (target) |t| try a.dupe(u8, t) else null,
+        .tdir = false,
+    };
+}
+
+fn freeTestDir(dir: *Dir) void {
+    for (dir.entries.items) |*e| e.deinit(dir.allocator);
+    dir.entries.deinit(dir.allocator);
+}
+
+test "findPath resolves an ordinary child, and rejects a foreign parent" {
+    const t = std.testing;
+    const a = t.allocator;
+    var dir = Dir{ .allocator = a, .path = @constCast("/data"), .view_id = 1 };
+    defer freeTestDir(&dir);
+    try dir.entries.append(a, try testEntry(a, "one.txt", null));
+    try dir.entries.append(a, try testEntry(a, "two.txt", null));
+
+    try t.expectEqualStrings("two.txt", (dir.findPath("/data/two.txt") orelse return error.NotFound).name);
+    // A different directory's child never resolves here.
+    try t.expect(dir.findPath("/other/two.txt") == null);
+    try t.expect(dir.findPath("/data/missing.txt") == null);
+    try t.expect(dir.findPath("relative") == null);
+}
+
+test "findPath resolves a FLAT row by its target, not by its parent" {
+    const t = std.testing;
+    const a = t.allocator;
+    var dir = Dir{ .allocator = a, .path = @constCast("/search"), .view_id = 1 };
+    dir.flat = true;
+    defer freeTestDir(&dir);
+    // Search hits keep their own name but live anywhere.
+    try dir.entries.append(a, try testEntry(a, "hit.txt", "/srv/deep/nested/hit.txt"));
+    try dir.entries.append(a, try testEntry(a, "other.txt", "/tmp/other.txt"));
+
+    const hit = dir.findPath("/srv/deep/nested/hit.txt") orelse return error.NotFound;
+    try t.expectEqualStrings("hit.txt", hit.name);
+    // The dirname-derived form is exactly what used to be asked, and
+    // it must NOT match: the row is not a child of the flat dir.
+    try t.expect(dir.findPath("/search/hit.txt") == null);
+}
+
+test "an ordinary dir never resolves a path through a symlink's target" {
+    const t = std.testing;
+    const a = t.allocator;
+    var dir = Dir{ .allocator = a, .path = @constCast("/data"), .view_id = 1 };
+    defer freeTestDir(&dir);
+    // `target` on a normal listing row is the SYMLINK's destination.
+    // Matching on it would hand back the link when asked about the
+    // file it points at, so the target scan is flat-dirs only.
+    try dir.entries.append(a, try testEntry(a, "link", "/etc/passwd"));
+    try t.expect(dir.findPath("/etc/passwd") == null);
+    try t.expectEqualStrings("link", (dir.findPath("/data/link") orelse return error.NotFound).name);
+}
+
+test "upsert defers the sort for a media column and performs it otherwise" {
+    const t = std.testing;
+    const a = t.allocator;
+    var dir = Dir{ .allocator = a, .path = @constCast("/d"), .view_id = 1 };
+    dir.dirs_first = false;
+    defer freeTestDir(&dir);
+    try dir.entries.append(a, try testEntry(a, "m.txt", null));
+    try dir.entries.append(a, try testEntry(a, "z.txt", null));
+
+    // Media column: the row's values are stitched on at RENDER time,
+    // so `own()` hands back an empty `meta` and sorting now would
+    // rank the fresh row by a value that is not there yet.
+    dir.attr_sort = .{ .source = .media, .index = 0, .kind = .text };
+    dir.upsert(.{ .name = "a.txt", .kind = "file" });
+    try t.expectEqual(@as(usize, 3), dir.entries.items.len);
+    try t.expectEqualStrings("a.txt", dir.entries.items[2].name);
+
+    // An xattr column's values ride the listing itself, so the delta
+    // path stays self-sufficient and sorts immediately.
+    dir.attr_sort = .{ .source = .xattr, .index = 0, .kind = .text };
+    dir.upsert(.{ .name = "b.txt", .kind = "file" });
+    try t.expectEqualStrings("a.txt", dir.entries.items[0].name);
+    try t.expectEqualStrings("b.txt", dir.entries.items[1].name);
+
+    // No extra column at all: ordinary keys always sort on the delta.
+    dir.attr_sort = null;
+    dir.upsert(.{ .name = "aa.txt", .kind = "file" });
+    try t.expectEqualStrings("a.txt", dir.entries.items[0].name);
+    try t.expectEqualStrings("aa.txt", dir.entries.items[1].name);
 }

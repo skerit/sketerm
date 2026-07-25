@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const clock = @import("../util/clock.zig");
 const platform = @import("../util/platform.zig");
 const protocol = @import("protocol.zig");
 const appdrive = @import("appdrive.zig");
@@ -737,9 +738,7 @@ const RealBackend = struct {
     }
 
     fn nowMs(_: *anyopaque) i64 {
-        var ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-        return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
+        return clock.nowMs();
     }
 };
 
@@ -2225,11 +2224,7 @@ fn numArray(v: std.json.Value, comptime n: usize) ?[n]f64 {
     return out;
 }
 
-fn monoMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const monoMs = clock.nowMs;
 
 /// Wall-clock ms, matching the daemon's log-line timestamps. Full ms
 /// precision — a seconds-truncated "now" makes fresh lines look like

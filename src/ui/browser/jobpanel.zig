@@ -190,9 +190,7 @@ pub const Panel = struct {
     }
 };
 
-fn nowMs() i64 {
-    return @divTrunc(c.g_get_monotonic_time(), 1000);
-}
+const nowMs = @import("../../util/clock.zig").nowMs;
 
 // ── row collection ──────────────────────────────────────────────
 

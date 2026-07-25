@@ -2,9 +2,14 @@
 //!
 //! Nothing here ever blocks the GLib loop: local probe/decode/save
 //! runs on a worker thread; remote thumbnails ride the nonblocking fs
-//! wire (read the HOST's cache, else fetch source bytes, encode on the
-//! worker, write the PNG BACK to the host's cache so it is shared with
-//! that machine's own apps).
+//! wire.
+//!
+//! Host-side thumbnail caching is the DAEMON's job, not this module's:
+//! the `thumbnail` op installs the spec 128px PNG into its own host's
+//! freedesktop cache and serves that path, so the entry is shared with
+//! that machine's own file managers and survives our restarts. This
+//! side only decodes what comes back; it must never write a second
+//! copy of the same entry.
 //!
 //! The side panel and the Quick Look overlay are two views of ONE
 //! pipeline: `previewers.resolve` picks a handler for the entry, one
@@ -17,6 +22,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const clock = @import("../../util/clock.zig");
 const wire = @import("../../mux/wire.zig");
 const colkeys = @import("../../filebrowser/colkeys.zig");
 const hexdump = @import("../../filebrowser/hexdump.zig");
@@ -99,7 +105,6 @@ pub const ThumbReq = struct {
     /// Viewer-memory identity includes host; disk identity deliberately
     /// remains path-only because each host owns a separate cache.
     cache_key: []u8,
-    cached_png: bool = false,
     kind: ThumbKind = .row_thumb,
     /// The view generation allowed to DISPLAY this result; 0 means
     /// cache-only (a preload must never paint over a newer selection).
@@ -120,15 +125,32 @@ pub const ThumbResult = struct {
     /// In-memory cache key ("path\x00mtime", owned by c_allocator).
     key: []u8,
     pixbuf: ?*c.GdkPixbuf,
-    /// Spec PNG bytes for remote write-back (owned, c_allocator).
-    png: ?[]u8 = null,
-    /// Original path (owned) — locates the remote write-back target.
+    /// Original path (owned); identifies the row the result belongs to.
     path: []u8,
     mtime_ms: i64,
     kind: ThumbKind = .row_thumb,
     preview_generation: u64 = 0,
     remote_id: u64 = 0,
 };
+
+/// How long the pipeline tolerates SILENCE on the fetch in flight
+/// before abandoning it.
+///
+/// The clock is reset by every frame that belongs to the fetch, so a
+/// slow host-side generation is never killed mid-work; only a reply
+/// that never comes is. Generous because the worst legitimate wait is
+/// a decode queued behind a backlog of local thumbnails.
+///
+/// Without this the pipeline had ONE slot and no way out of it: an
+/// unanswered read left `remote_thumb` set, `pumpRemoteThumbs`
+/// returned immediately forever, and remote thumbnails were dead for
+/// the life of the view.
+pub const REMOTE_THUMB_SILENCE_MS: i64 = 60_000;
+
+/// How often the silence deadline is checked while a fetch is in
+/// flight. The source runs only then; it disarms itself once the
+/// pipeline is idle.
+const REMOTE_THUMB_TICK_MS: c.guint = 1000;
 
 /// One remote thumbnail fetch in flight (serial per view).
 pub const RemoteThumb = struct {
@@ -140,11 +162,23 @@ pub const RemoteThumb = struct {
     req: u32 = 0,
     job: u64 = 0,
     buf: std.ArrayList(u8) = .empty,
+    /// Monotonic ms of the last frame that belonged to this fetch;
+    /// what REMOTE_THUMB_SILENCE_MS is measured from.
+    last_ms: i64 = 0,
 
     pub fn destroy(self: *RemoteThumb, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         self.buf.deinit(allocator);
         allocator.destroy(self);
+    }
+
+    /// A frame for this fetch arrived: the host is alive on it.
+    fn touch(self: *RemoteThumb) void {
+        self.last_ms = clock.nowMs();
+    }
+
+    pub fn silent(self: *const RemoteThumb, now_ms: i64) bool {
+        return now_ms -| self.last_ms >= REMOTE_THUMB_SILENCE_MS;
     }
 };
 
@@ -355,7 +389,6 @@ pub fn thumbWorkerMain(tc: *ThumbCtx) void {
 pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
     const a = std.heap.c_allocator;
     var pixbuf: ?*c.GdkPixbuf = null;
-    var png_out: ?[]u8 = null;
 
     var ubuf: [4096 * 3 + 8]u8 = undefined;
     const uri = thumbs_mod.fileUri(req.path, &ubuf) orelse return;
@@ -403,41 +436,26 @@ pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
             }
         }
         c.g_object_unref(loader); // drops `full` with it
-        if (pixbuf) |pb| if (!req.cached_png and req.kind == .row_thumb) {
-            var uz: [4096 * 3 + 8:0]u8 = undefined;
-            @memcpy(uz[0..uri.len], uri);
-            uz[uri.len] = 0;
-            var out_buf: [*c]u8 = null;
-            var out_len: usize = 0;
-            if (c.gdk_pixbuf_save_to_buffer(pb, &out_buf, &out_len, "png", null, "tEXt::Thumb::URI", &uz, "tEXt::Thumb::MTime", msec.ptr, @as(?*anyopaque, null)) != 0) {
-                png_out = a.dupe(u8, out_buf[0..out_len]) catch null;
-                c.g_free(out_buf);
-            }
-        };
     }
 
     // Hand the result to the main thread.
     const key = std.fmt.allocPrint(a, "{s}\x00{d}", .{ req.cache_key, req.mtime_ms }) catch {
         if (pixbuf) |pb| c.g_object_unref(pb);
-        if (png_out) |pg| a.free(pg);
         return;
     };
     const res = a.create(ThumbResult) catch {
         a.free(key);
         if (pixbuf) |pb| c.g_object_unref(pb);
-        if (png_out) |pg| a.free(pg);
         return;
     };
     res.* = .{
         .ctx = tc,
         .key = key,
         .pixbuf = pixbuf,
-        .png = png_out,
         .path = a.dupe(u8, req.path) catch {
             a.free(key);
             a.destroy(res);
             if (pixbuf) |pb| c.g_object_unref(pb);
-            if (png_out) |pg| a.free(pg);
             return;
         },
         .mtime_ms = req.mtime_ms,
@@ -478,7 +496,6 @@ pub fn onThumbIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     defer {
         a.free(res.key);
         a.free(res.path);
-        if (res.png) |pg| a.free(pg);
         a.destroy(res);
         tc.unref();
     }
@@ -516,9 +533,6 @@ pub fn applyThumbResult(self: *BrowserView, res: *ThumbResult) void {
             c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
             return;
         };
-        // Remote result: write the PNG back into the OWNING
-        // host's cache (best-effort, req 0 = replies ignored).
-        if (res.png) |png| self.thumbWriteBack(res.remote_id, res.path, png);
         self.scheduleThumbRender();
     } else {
         if (self.thumb_failed.count() >= THUMB_CACHE_CAP) {
@@ -531,42 +545,6 @@ pub fn applyThumbResult(self: *BrowserView, res: *ThumbResult) void {
     }
     // A remote decode holds the pipeline slot until now.
     self.releaseRemoteThumbFor(res.remote_id);
-}
-
-/// Push a generated thumbnail PNG into the owning host's
-/// freedesktop cache over the fs wire (mkdirs + write + rename;
-/// all best-effort with ignored replies).
-pub fn thumbWriteBack(self: *BrowserView, remote_id: u64, path: []const u8, png: []const u8) void {
-    // The path's host is the CURRENT remote pipeline's host.
-    const rt = self.remote_thumb orelse return;
-    if (remote_id == 0 or rt.id != remote_id or !std.mem.eql(u8, rt.path, path)) return;
-    const hc = rt.hc;
-    if (hc.state != .ready) return;
-    const cache = hc.cache_dir orelse return;
-    var tbuf: [4300]u8 = undefined;
-    const tp = thumbs_mod.thumbPath(cache, path, &tbuf) orelse return;
-    var dbuf: [4300]u8 = undefined;
-    if (std.fmt.bufPrint(&dbuf, "{s}/thumbnails", .{cache})) |d| {
-        self.sendOp(hc, .{ .req = @as(u32, 0), .op = "mkdir", .path = d });
-    } else |_| {}
-    if (std.fmt.bufPrint(&dbuf, "{s}/thumbnails/normal", .{cache})) |d| {
-        self.sendOp(hc, .{ .req = @as(u32, 0), .op = "mkdir", .path = d });
-    } else |_| {}
-    var tmpb: [4340]u8 = undefined;
-    const tmp = std.fmt.bufPrint(&tmpb, "{s}.sketerm-tmp", .{tp}) catch return;
-    // fs_write frame: [u32 req][u64 off][u8 flags][u16 len][path][data]
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(self.allocator);
-    var hdr: [15]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], 0, .little);
-    std.mem.writeInt(u64, hdr[4..12], 0, .little);
-    hdr[12] = 0b011; // create + truncate
-    std.mem.writeInt(u16, hdr[13..15], @intCast(tmp.len), .little);
-    payload.appendSlice(self.allocator, &hdr) catch return;
-    payload.appendSlice(self.allocator, tmp) catch return;
-    payload.appendSlice(self.allocator, png) catch return;
-    hc.conn.sendFrame(.fs_write, payload.items) catch return;
-    self.sendOp(hc, .{ .req = @as(u32, 0), .op = "rename", .path = tmp, .to = tp });
 }
 
 /// Coalesced re-render ~8x/s while thumbnails trickle in.
@@ -657,12 +635,47 @@ pub fn pumpRemoteThumbs(self: *BrowserView) void {
         }
         rt.req = self.nextReq();
         rt.phase = .start_job;
+        rt.touch();
         self.remote_thumb = rt;
+        armRemoteThumbWatch(self);
         // Generation happens on the file-owning host. Only the
         // bounded cached PNG returns over the wire.
         self.sendOp(rt.hc, .{ .req = rt.req, .op = "thumbnail", .path = rt.path });
         return;
     }
+}
+
+/// Start the silence watch, if it is not already running.
+fn armRemoteThumbWatch(self: *BrowserView) void {
+    if (self.remote_thumb_watch != 0) return;
+    self.remote_thumb_watch = c.g_timeout_add(
+        REMOTE_THUMB_TICK_MS,
+        @ptrCast(&onRemoteThumbWatch),
+        @ptrCast(self),
+    );
+}
+
+/// Abandon the fetch in flight once the daemon has gone quiet on it,
+/// freeing the pipeline's one slot for the rest of the queue.
+///
+/// Deliberately silent in the UI: a missing thumbnail is not worth
+/// clobbering the status line, and the entry is marked failed so the
+/// row is not re-queued in a loop.
+pub fn onRemoteThumbWatch(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const rt = self.remote_thumb orelse {
+        // Idle: the next pump re-arms.
+        self.remote_thumb_watch = 0;
+        return 0;
+    };
+    if (!rt.silent(clock.nowMs())) return 1;
+    // Cleared BEFORE finishing: finishRemoteThumb pumps the queue,
+    // which arms a FRESH source, and clearing afterwards would drop
+    // that id and leak a source nothing can remove.
+    self.remote_thumb_watch = 0;
+    self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
+    self.finishRemoteThumb();
+    return 0;
 }
 
 pub fn finishRemoteThumb(self: *BrowserView) void {
@@ -681,6 +694,9 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
         .fs_data => {
             if (payload.len < 12) return false;
             if (std.mem.readInt(u32, payload[0..4], .little) != rt.req) return false;
+            // The fetch is alive: restart its silence deadline before
+            // anything below can free it.
+            rt.touch();
             rt.buf.appendSlice(self.allocator, payload[12..]) catch {};
             return true;
         },
@@ -691,6 +707,7 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
                 .ignore_unknown_fields = true,
             }) catch return false;
             if (rep.req != rt.req) return false;
+            rt.touch();
             switch (rt.phase) {
                 .start_job => {
                     if (!rep.ok or rep.job == 0) {
@@ -715,7 +732,7 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
                     // failed there is no handback, and leaving
                     // self.remote_thumb set would wedge the pipeline
                     // for the life of the view.
-                    if (!self.queueRemoteDecode(rt, true)) {
+                    if (!self.queueRemoteDecode(rt)) {
                         self.markThumbFailed(rt.hc, rt.path, rt.mtime_ms);
                         self.finishRemoteThumb();
                     }
@@ -730,6 +747,7 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
             defer arena.deinit();
             const ev = std.json.parseFromSliceLeaky(WireJobEv, arena.allocator(), payload, .{ .ignore_unknown_fields = true }) catch return false;
             if (ev.job != rt.job) return false;
+            rt.touch();
             if (std.mem.eql(u8, ev.ev, "done") and ev.path.len > 0) {
                 rt.req = self.nextReq();
                 rt.phase = .read_thumb;
@@ -745,11 +763,12 @@ pub fn feedRemoteThumb(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
     }
 }
 
-/// Source bytes arrived: hand them to the worker for decode +
-/// spec-PNG encode (write-back happens when the result lands).
+/// The host's thumbnail PNG arrived: hand it to the worker to decode
+/// off the loop. Nothing is written back -- the daemon installed the
+/// spec entry in its own host's cache before serving it.
 /// @return false when the job was NOT handed off, in which case no
 /// handback will ever arrive and the caller owns `rt`'s release.
-pub fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb, cached_png: bool) bool {
+pub fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb) bool {
     const tc = self.ensureThumbWorker() orelse return false;
     const a = std.heap.c_allocator;
     const path = a.dupe(u8, rt.path) catch return false;
@@ -764,7 +783,7 @@ pub fn queueRemoteDecode(self: *BrowserView, rt: *RemoteThumb, cached_png: bool)
     };
     tc.lock();
     defer tc.unlock();
-    tc.queue.append(a, .{ .path = path, .cache_key = key, .mtime_ms = rt.mtime_ms, .data = data, .cached_png = cached_png, .remote_id = rt.id }) catch {
+    tc.queue.append(a, .{ .path = path, .cache_key = key, .mtime_ms = rt.mtime_ms, .data = data, .remote_id = rt.id }) catch {
         a.free(path);
         a.free(key);
         a.free(data);
@@ -1298,7 +1317,6 @@ pub fn queuePreviewDecode(self: *BrowserView, pr: *PreviewRead) void {
         .cache_key = key,
         .mtime_ms = 0,
         .data = data,
-        .cached_png = true,
         .kind = .preview,
         .preview_generation = if (pr.preload) 0 else pr.generation,
     }) catch {
@@ -1714,4 +1732,72 @@ pub fn quickLookActivate(self: *BrowserView) void {
     const hc = tab.hc;
     self.quickLookClose();
     self.openPathOnHost(hc, path);
+}
+
+test "the silence deadline is measured from the last frame, not the start" {
+    const t = std.testing;
+    var rt = RemoteThumb{ .id = 1, .hc = undefined, .path = &.{}, .mtime_ms = 0, .last_ms = 1000 };
+    try t.expect(!rt.silent(1000));
+    try t.expect(!rt.silent(1000 + REMOTE_THUMB_SILENCE_MS - 1));
+    try t.expect(rt.silent(1000 + REMOTE_THUMB_SILENCE_MS));
+    // A frame that belongs to the fetch restarts the clock, so a slow
+    // host-side generation is never killed mid-work.
+    rt.last_ms = 1000 + REMOTE_THUMB_SILENCE_MS;
+    try t.expect(!rt.silent(1000 + REMOTE_THUMB_SILENCE_MS));
+    // Saturating subtraction: a clock that reads BEFORE last_ms (the
+    // value was taken on a different sample) must not wrap into
+    // "expired".
+    rt.last_ms = 5_000_000;
+    try t.expect(!rt.silent(1000));
+}
+
+test "a silent remote thumbnail is abandoned and the queue moves on" {
+    const t = std.testing;
+    const a = t.allocator;
+    const HC = @import("types.zig").HostConn;
+
+    // Only the fields this path touches are initialized; everything
+    // else on the view is widget state it never reads.
+    const self = try a.create(BrowserView);
+    defer a.destroy(self);
+    self.allocator = a;
+    self.thumb_failed = std.StringHashMap(void).init(a);
+    self.remote_thumb = null;
+    self.remote_thumb_queue = .empty;
+    self.remote_thumb_watch = 0;
+    self.next_req = 1;
+    defer {
+        var it = self.thumb_failed.iterator();
+        while (it.next()) |kv| a.free(kv.key_ptr.*);
+        self.thumb_failed.deinit();
+        self.remote_thumb_queue.deinit(a);
+    }
+
+    var hc = HC{ .view = self, .host = null, .state = .dead };
+
+    const stuck = try a.create(RemoteThumb);
+    stuck.* = .{ .id = 7, .hc = &hc, .path = try a.dupe(u8, "/pics/wedged.png"), .mtime_ms = 42, .last_ms = 0 };
+    self.remote_thumb = stuck;
+    // A second request queued behind it: before the deadline existed,
+    // this could never start, because the one slot was never freed.
+    const waiting = try a.create(RemoteThumb);
+    waiting.* = .{ .id = 8, .hc = &hc, .path = try a.dupe(u8, "/pics/next.png"), .mtime_ms = 43 };
+    try self.remote_thumb_queue.append(a, waiting);
+
+    // Not yet silent: nothing moves and the watch keeps running.
+    stuck.last_ms = clock.nowMs();
+    try t.expectEqual(@as(c.gboolean, 1), onRemoteThumbWatch(@ptrCast(self)));
+    try t.expect(self.remote_thumb == stuck);
+
+    // Past the deadline: the slot is released and the queue drains
+    // (this host is dead, so the next entry is dropped rather than
+    // sent -- what matters is that the pipeline is no longer wedged).
+    stuck.last_ms = clock.nowMs() - REMOTE_THUMB_SILENCE_MS;
+    try t.expectEqual(@as(c.gboolean, 0), onRemoteThumbWatch(@ptrCast(self)));
+    try t.expect(self.remote_thumb == null);
+    try t.expectEqual(@as(usize, 0), self.remote_thumb_queue.items.len);
+    // The abandoned entry is remembered as failed, so the row is not
+    // re-queued on every render.
+    try t.expectEqual(@as(usize, 1), self.thumb_failed.count());
+    try t.expect(self.thumb_failed.contains("/pics/wedged.png\x0042"));
 }

@@ -151,6 +151,10 @@ pub const BrowserView = struct {
     /// Serial remote-thumbnail pipeline.
     remote_thumb: ?*RemoteThumb = null,
     remote_thumb_queue: std.ArrayList(*RemoteThumb) = .empty,
+    /// Silence deadline for the fetch in flight; runs only while the
+    /// pipeline is busy (preview.zig), so an unanswered reply frees
+    /// the one slot instead of wedging it forever.
+    remote_thumb_watch: c.guint = 0,
     /// Coalesced re-render after thumbnails land.
     thumb_render_src: c.guint = 0,
     /// Live local-edit sync-back watches (remote files opened here).
@@ -246,6 +250,7 @@ pub const BrowserView = struct {
     pub const hostDied = @import("conn.zig").hostDied;
     pub const sendOp = @import("conn.zig").sendOp;
     pub const closeViewOf = @import("conn.zig").closeViewOf;
+    pub const requestHostDirs = @import("conn.zig").requestHostDirs;
     pub const attrSpec = @import("conn.zig").attrSpec;
     pub const sendListingOp = @import("conn.zig").sendListingOp;
     pub const openDir = @import("conn.zig").openDir;
@@ -528,6 +533,7 @@ pub const BrowserView = struct {
     // templates.zig -- New from Template (the HOST's Templates dir)
     pub const showTemplateMenu = @import("templates.zig").showTemplateMenu;
     pub const feedTemplates = @import("templates.zig").feedTemplates;
+    pub const templatesHostDirs = @import("templates.zig").onHostDirs;
     pub const instantiateTemplate = @import("templates.zig").instantiate;
 
     // jobpanel.zig -- the jobs/transfers panel (rows, rate, controls)
@@ -554,7 +560,6 @@ pub const BrowserView = struct {
     pub const thumbSaveLocal = @import("preview.zig").thumbSaveLocal;
     pub const onThumbIdle = @import("preview.zig").onThumbIdle;
     pub const applyThumbResult = @import("preview.zig").applyThumbResult;
-    pub const thumbWriteBack = @import("preview.zig").thumbWriteBack;
     pub const scheduleThumbRender = @import("preview.zig").scheduleThumbRender;
     pub const onThumbRenderTick = @import("preview.zig").onThumbRenderTick;
     pub const thumbLookup = @import("preview.zig").thumbLookup;
@@ -901,6 +906,7 @@ pub const BrowserView = struct {
             tc.unlock();
             tc.unref(); // the view's ref; thread + idles drop theirs
         }
+        if (self.remote_thumb_watch != 0) _ = c.g_source_remove(self.remote_thumb_watch);
         if (self.remote_thumb) |rt| rt.destroy(self.allocator);
         for (self.remote_thumb_queue.items) |rt| rt.destroy(self.allocator);
         self.remote_thumb_queue.deinit(self.allocator);
