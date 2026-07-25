@@ -36,9 +36,11 @@ pub fn openRemoteFileHc(self: *BrowserView, hc: *HostConn, path: []const u8, app
         dir, h.final(), std.fs.path.basename(path),
     }) catch return;
     const service = self.transfer_service orelse {
-        // No ledger (another process holds it, or it is unreadable):
-        // degrade to the in-view transfer rather than refusing to
-        // open the file at all. It just does not survive a restart.
+        // The ledger DIRECTORY could not be created (an unwritable
+        // state dir is the only remaining cause -- ownership is per
+        // record now, so a second process is not one). Degrade to the
+        // in-view transfer rather than refusing to open the file at
+        // all; it just does not survive a restart.
         const local = self.hostConnFor(null) orelse return;
         if (local.state != .ready) {
             self.setStatus("local daemon unreachable");
@@ -50,7 +52,7 @@ pub fn openRemoteFileHc(self: *BrowserView, hc: *HostConn, path: []const u8, app
             .watch_host = host,
             .watch_remote = path,
         });
-        self.setStatus("download is not restart-durable (recovery ledger unavailable)");
+        self.setStatus("download is not restart-durable (the recovery ledger directory is unwritable)");
         return;
     };
     service.submitDownload(host, path, dst, appid);

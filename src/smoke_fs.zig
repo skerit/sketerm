@@ -1567,6 +1567,35 @@ fn pumpXfer(allocator: std.mem.Allocator, x: *fstransfer.Xfer, conns: *XferConns
     fail("xfer pump timed out");
 }
 
+/// Pump for a fixed window without any expectation of progress: what a
+/// paused transfer must survive.
+fn pumpFor(allocator: std.mem.Allocator, x: *fstransfer.Xfer, conns: *XferConns, ms: i64) void {
+    var waited: i64 = 0;
+    while (waited < ms) {
+        var pfds = [_]c.struct_pollfd{
+            .{ .fd = conns.src.fd, .events = c.POLLIN, .revents = 0 },
+            .{ .fd = conns.dst.fd, .events = c.POLLIN, .revents = 0 },
+        };
+        _ = c.poll(&pfds, 2, 20);
+        waited += 20;
+        inline for (.{ .src, .dst }) |side| {
+            const conn = if (side == .src) &conns.src else &conns.dst;
+            if (!conn.fillAvailable()) fail("xfer conn hangup");
+            while (conn.takeFrame() catch null) |f| {
+                defer f.deinit(allocator);
+                _ = x.feed(side, f.ftype, f.payload);
+            }
+        }
+    }
+}
+
+fn stagedSize(fs: *fsdrive.Fs, allocator: std.mem.Allocator, path: []const u8) u64 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const st = fs.statPath(arena.allocator(), path) catch return 0;
+    return st.size;
+}
+
 fn statExists(fs: *fsdrive.Fs, allocator: std.mem.Allocator, path: []const u8) bool {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1638,6 +1667,57 @@ fn xferStage(allocator: std.mem.Allocator, sock_a: []const u8, sock_b: []const u
         if (x.resumed_bytes == 0) fail("resume xfer did not resume");
         if (!std.mem.eql(u8, &(fileSha(dst2) orelse fail("dst2 sha")), &(fileSha(src2) orelse fail("src2 sha"))))
             fail("resumed xfer content mismatch");
+    }
+
+    // ── pause holds the transfer at a chunk boundary; resume in
+    // this session, and resume in a FRESH Xfer (what a GUI restart
+    // does), both land byte-identical content ──────────────────
+    {
+        var sb: [4096]u8 = undefined;
+        var db: [4096]u8 = undefined;
+        var partp: [4096]u8 = undefined;
+        const psrc = std.fmt.bufPrint(&sb, "{s}/pause.bin", .{dir_a}) catch unreachable;
+        const pdst = std.fmt.bufPrint(&db, "{s}/pause.copy", .{dir_b}) catch unreachable;
+        writePattern(psrc, 24 << 20, 53);
+        const staged = std.fmt.bufPrint(&partp, "{s}.skpart", .{pdst}) catch unreachable;
+
+        var conns = XferConns.open(allocator, sock_a, sock_b);
+        const x = fstransfer.Xfer.init(allocator, &conns.src, &conns.dst, &req, psrc, pdst, true) catch fail("pause xfer init");
+        x.start();
+        if (pumpXfer(allocator, x, &conns, 30_000, 2 << 20)) fail("pause xfer finished before the pause");
+        x.pause();
+        if (!x.isPaused()) fail("pause did not take");
+        // One already-requested chunk may still land; after that the
+        // transfer must be completely still.
+        pumpFor(allocator, x, &conns, 600);
+        const held_done = x.progress().done;
+        const held_size = stagedSize(&fsb, allocator, staged);
+        if (held_size == 0) fail("paused xfer has no staged partial");
+        pumpFor(allocator, x, &conns, 1500);
+        if (x.progress().done != held_done) fail("paused xfer kept moving bytes");
+        if (stagedSize(&fsb, allocator, staged) != held_size) fail("paused xfer kept growing the staged partial");
+        if (x.isTerminal()) fail("paused xfer went terminal");
+
+        // A fresh Xfer over fresh connections: the GUI-restart path.
+        x.deinit();
+        conns.close();
+        var conns2 = XferConns.open(allocator, sock_a, sock_b);
+        defer conns2.close();
+        const y = fstransfer.Xfer.init(allocator, &conns2.src, &conns2.dst, &req, psrc, pdst, true) catch fail("pause resume init");
+        defer y.deinit();
+        // Restored paused, then released -- the state a restart reads
+        // from the ledger record.
+        y.pause();
+        y.start();
+        pumpFor(allocator, y, &conns2, 300);
+        if (stagedSize(&fsb, allocator, staged) != held_size) fail("a restored paused xfer moved bytes");
+        y.unpause();
+        if (!pumpXfer(allocator, y, &conns2, 120_000, 0)) fail("resumed xfer never finished");
+        if (!y.ok()) failErr("resumed xfer failed", y.errMsg());
+        if (y.resumed_bytes == 0) fail("resumed xfer did not continue from the staged partial");
+        if (!std.mem.eql(u8, &(fileSha(pdst) orelse fail("pdst sha")), &(fileSha(psrc) orelse fail("psrc sha"))))
+            fail("resumed-after-pause content mismatch");
+        if (statExists(&fsb, allocator, staged)) fail("resumed xfer left staged partial");
     }
 
     // ── corrupted partial: the verify must CATCH the mismatch,

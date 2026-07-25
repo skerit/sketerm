@@ -49,6 +49,9 @@ pub fn pumpTransferQueue(self: *BrowserView) void {
     var n: usize = 0;
     for (self.transfers.items, 0..) |t, i| {
         if (t.x.isTerminal()) continue;
+        // A held transfer moves no bytes, so it occupies no slot and
+        // holds no destination: the ones that CAN work go first.
+        if (t.paused) continue;
         const ready = t.src_hc.state == .ready and t.dst_hc.state == .ready;
         if (!t.started and !ready) continue;
         slots[n] = .{ .dest = t.dest_key, .state = if (t.started) .running else .queued };
@@ -62,6 +65,26 @@ pub fn pumpTransferQueue(self: *BrowserView) void {
         t.x.start();
         self.setStatusFmt("transfer started: {s}", .{t.label});
     }
+}
+
+/// Hold or release one client-mediated transfer. A started one stops
+/// at its next chunk boundary and continues later from the staged
+/// `.skpart` through the ordinary hash-verified resume; an unstarted
+/// one simply stays out of the queue. The hold is written to the
+/// durable ledger record, so it survives a GUI restart.
+pub fn setTransferPaused(self: *BrowserView, t: *ActiveTransfer, paused: bool) void {
+    if (t.paused == paused) return;
+    t.paused = paused;
+    if (paused) {
+        if (t.started) t.x.pause();
+    } else if (t.started) {
+        t.x.unpause();
+    }
+    if (t.token) |token| {
+        if (self.transfer_service) |service| service.setMediatedPaused(token, paused);
+    }
+    if (!paused) self.pumpTransferQueue();
+    self.setStatusFmt("transfer {s}: {s}", .{ if (paused) "paused" else "resumed", t.label });
 }
 
 /// Move a not-yet-started transfer within the queue; the order here
@@ -118,6 +141,9 @@ pub fn reapTransfers(self: *BrowserView) void {
             self.setStatusFmt("transfer canceled: {s}", .{t.label});
         } else {
             self.setStatusFmt("transfer failed: {s} ({s})", .{ t.label, t.x.errMsg() });
+        }
+        if (t.token) |token| {
+            if (self.transfer_service) |service| service.finishMediated(token);
         }
         t.x.deinit();
         self.allocator.free(t.label);
@@ -385,12 +411,112 @@ pub fn startTransfer(
     self.transfers.append(self.allocator, t) catch {
         x.deinit();
         self.allocator.free(label);
+        t.freeExtras(self.allocator);
         self.allocator.destroy(t);
         return;
     };
+    // Record it so a pause -- or a crash -- can be picked up again,
+    // here or by another sketerm process. A sync-back upload is
+    // deliberately not recorded: it belongs to an in-view EditWatch
+    // that no other process can reconstruct.
+    if (opts.upload_watch == null) {
+        if (self.transfer_service) |service| {
+            const token = service.newMediated(
+                src_hc.host orelse "",
+                src_path,
+                dst_hc.host orelse "",
+                dst_path,
+                .{
+                    .app_id = opts.open_with_appid orelse "",
+                    .open_when_done = open_when_done,
+                    .delete_src_after = opts.delete_src_after,
+                    .watch_after = opts.watch_host != null,
+                },
+            );
+            if (token) |tok| t.token = self.allocator.dupe(u8, tok) catch null;
+        }
+    }
     self.setStatusFmt("transfer queued: {s}", .{label});
     self.pumpTransferQueue();
     self.renderJobs();
+}
+
+/// Rebuild a client-mediated transfer from its ledger record: the
+/// service hands over records whose previous owner is gone (a closed
+/// browser face, a crashed process), and the staged `.skpart` plus the
+/// ordinary hash-verified resume carry it on from where it stopped.
+pub fn adoptMediated(ctx: *anyopaque, rec: @import("../file_transfers.zig").MediatedRec) void {
+    const self: *BrowserView = @ptrCast(@alignCast(ctx));
+    for (self.transfers.items) |t| {
+        if (t.token) |tok| {
+            if (std.mem.eql(u8, tok, rec.token)) return;
+        }
+    }
+    const src_hc = self.hostConnFor(if (rec.src_host.len == 0) null else rec.src_host) orelse return;
+    const dst_hc = self.hostConnFor(if (rec.dst_host.len == 0) null else rec.dst_host) orelse return;
+    const x = fstransfer.Xfer.init(
+        self.allocator,
+        &src_hc.conn,
+        &dst_hc.conn,
+        &self.next_req,
+        rec.src_path,
+        rec.dst_path,
+        true,
+    ) catch return;
+    const label = std.fmt.allocPrint(self.allocator, "{s}:{s} → {s}", .{
+        src_hc.label(), std.fs.path.basename(rec.src_path), dst_hc.label(),
+    }) catch {
+        x.deinit();
+        return;
+    };
+    const t = self.allocator.create(ActiveTransfer) catch {
+        x.deinit();
+        self.allocator.free(label);
+        return;
+    };
+    t.* = .{
+        .x = x,
+        .src_hc = src_hc,
+        .dst_hc = dst_hc,
+        .label = label,
+        .open_when_done = rec.open_when_done,
+        .open_with_appid = if (rec.app_id.len > 0) (self.allocator.dupe(u8, rec.app_id) catch null) else null,
+        .watch_host = if (rec.watch_after and rec.src_host.len > 0) (self.allocator.dupe(u8, rec.src_host) catch null) else null,
+        .watch_remote = if (rec.watch_after and rec.src_host.len > 0) (self.allocator.dupe(u8, rec.src_path) catch null) else null,
+        .delete_src_after = rec.delete_src_after,
+        .paused = rec.paused,
+        .token = self.allocator.dupe(u8, rec.token) catch null,
+        .dest_key = file_transfers.destinationKey(rec.dst_host, rec.dst_path),
+    };
+    self.transfers.append(self.allocator, t) catch {
+        x.deinit();
+        self.allocator.free(label);
+        t.freeExtras(self.allocator);
+        self.allocator.destroy(t);
+        return;
+    };
+    self.setStatusFmt("transfer recovered{s}: {s}", .{ if (rec.paused) " (paused)" else "", t.label });
+    self.pumpTransferQueue();
+    self.renderJobs();
+}
+
+/// Repaint the panel for a change the service made on its own (an
+/// adopted orphan, a queued sync-back). Without it a transfer this
+/// process took over stays invisible until the user touches something:
+/// the panel's sampling tick only runs while it already has rows.
+pub fn refreshJobsPanel(ctx: *anyopaque) void {
+    const self: *BrowserView = @ptrCast(@alignCast(ctx));
+    self.renderJobs();
+}
+
+/// Give up the client-mediated transfers this view is running, without
+/// finishing them: the records stay, so the next browser face (or
+/// another sketerm process) resumes them.
+pub fn unclaimMediated(self: *BrowserView) void {
+    const service = self.transfer_service orelse return;
+    for (self.transfers.items) |t| {
+        if (t.token) |token| service.unclaimMediated(token);
+    }
 }
 
 pub fn startDaemonJob(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, label: []const u8) void {

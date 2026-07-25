@@ -1,4 +1,20 @@
-//! Window-owned durable downloads and remote edit synchronization.
+//! Process-level durable downloads, sync-back uploads and the records
+//! of client-mediated transfers.
+//!
+//! Ownership is PER RECORD (see filebrowser/transfers.zig): every
+//! durable transfer is its own locked file, so any number of GUI
+//! processes run their own transfers at the same time and a record
+//! whose owner died is adopted -- exactly once, because adoption IS
+//! taking the record's lock. Nothing here is a singleton across
+//! processes any more; the only single-process rule left is the
+//! `shared` service below, so one process has one owner per record.
+//!
+//! Two record kinds live here:
+//!   * daemon-coordinated downloads/uploads, submitted as `cross_copy`
+//!     jobs and driven by this service directly;
+//!   * client-mediated transfers (fstransfer), which need a browser
+//!     face with both host connections to run. Those are adopted only
+//!     while a DRIVER is registered, and handed to it.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -11,8 +27,16 @@ const pathz = @import("../util/pathz.zig");
 pub const NotifyFn = *const fn (ctx: *anyopaque, text: []const u8) void;
 const Subscriber = struct { ctx: *anyopaque, callback: NotifyFn };
 
+/// How often orphaned records (an owner that crashed) are looked for.
+const SWEEP_MS: c.guint = 15_000;
+
 const Intent = struct {
+    handle: store.Handle,
+    /// Record identity (ledger file name, panel row key).
     token: []u8,
+    /// Daemon idempotency key; re-minted on every retry, which is why
+    /// it is not the record identity.
+    client_token: []u8,
     kind: store.Kind,
     src_host: []u8,
     src_path: []u8,
@@ -35,6 +59,19 @@ const Intent = struct {
     /// The daemon job is paused but this client has no id for it yet
     /// (the pause outlived the connection); resume once it replies.
     resume_pending: bool = false,
+    /// Terminal daemon job still owed a job_ack, and the in-flight
+    /// request carrying it.
+    ack_job: u64 = 0,
+    ack_req: u32 = 0,
+    /// Finished; the record exists only until its ack lands.
+    retired: bool = false,
+    /// Client-mediated: run by a registered driver, not by this
+    /// service. `claimed` means the driver currently holds it.
+    mediated: bool = false,
+    claimed: bool = false,
+    open_when_done: bool = false,
+    delete_src_after: bool = false,
+    watch_after: bool = false,
     /// Scheduler identity of the destination (host plus local device).
     dest_key: u64 = 0,
     /// Live progress from the daemon's job events; volatile, the
@@ -43,8 +80,39 @@ const Intent = struct {
     total: u64 = 0,
     resumed_from: u64 = 0,
 
+    fn record(self: *const Intent) store.Record {
+        return .{
+            .rtype = .intent,
+            .intent = .{
+                .token = self.token,
+                .client_token = self.client_token,
+                .kind = self.kind,
+                .src = .{ .host = self.src_host, .path = self.src_path },
+                .dst = .{ .host = self.dst_host, .path = self.dst_path },
+                .app_id = self.app_id,
+                .state = self.state,
+                .job = self.job,
+                .order = self.order,
+                .watch_token = self.watch_token,
+                .submitted_generation = self.submitted_generation,
+                .message = self.message,
+                .attempts = self.attempts,
+                .cancel_requested = self.cancel_requested,
+                .submitted_size = self.submitted_size,
+                .submitted_mtime_ns = self.submitted_mtime_ns,
+                .paused = self.paused,
+                .ack_job = self.ack_job,
+                .retired = self.retired,
+                .mediated = self.mediated,
+                .open_when_done = self.open_when_done,
+                .delete_src_after = self.delete_src_after,
+                .watch_after = self.watch_after,
+            },
+        };
+    }
+
     fn destroy(self: *Intent, a: std.mem.Allocator) void {
-        inline for (.{ self.token, self.src_host, self.src_path, self.dst_host, self.dst_path, self.app_id, self.watch_token, self.message }) |s|
+        inline for (.{ self.token, self.client_token, self.src_host, self.src_path, self.dst_host, self.dst_path, self.app_id, self.watch_token, self.message }) |s|
             a.free(s);
         a.destroy(self);
     }
@@ -52,6 +120,7 @@ const Intent = struct {
 
 const Watch = struct {
     service: *Service,
+    handle: store.Handle,
     token: []u8,
     host: []u8,
     remote_path: []u8,
@@ -61,6 +130,22 @@ const Watch = struct {
     synced_size: u64,
     synced_mtime_ns: i64,
     monitor: ?*c.GFileMonitor = null,
+
+    fn record(self: *const Watch) store.Record {
+        return .{
+            .rtype = .watch,
+            .watch = .{
+                .token = self.token,
+                .host = self.host,
+                .remote_path = self.remote_path,
+                .cache_path = self.cache_path,
+                .dirty_generation = self.dirty_generation,
+                .synced_generation = self.synced_generation,
+                .synced_size = self.synced_size,
+                .synced_mtime_ns = self.synced_mtime_ns,
+            },
+        };
+    }
 
     fn destroy(self: *Watch, a: std.mem.Allocator) void {
         if (self.monitor) |m| {
@@ -76,7 +161,6 @@ const Watch = struct {
 };
 
 const Pending = struct { req: u32, intent: *Intent };
-const PendingAck = struct { req: u32, job: u64 };
 
 pub const QueueRow = struct {
     token: []const u8,
@@ -94,20 +178,40 @@ pub const QueueRow = struct {
     message: []const u8 = "",
 };
 
+/// One client-mediated transfer as handed to a driver.
+pub const MediatedRec = struct {
+    token: []const u8,
+    src_host: []const u8,
+    src_path: []const u8,
+    dst_host: []const u8,
+    dst_path: []const u8,
+    app_id: []const u8,
+    paused: bool,
+    open_when_done: bool,
+    delete_src_after: bool,
+    watch_after: bool,
+};
+
+pub const MediatedFn = *const fn (ctx: *anyopaque, rec: MediatedRec) void;
+/// Repaint the jobs/transfers panel: rows can appear without any user
+/// action here (an adopted orphan, a sync-back queued by a watch), and
+/// the panel's own sampling tick only runs while rows already exist.
+pub const RefreshFn = *const fn (ctx: *anyopaque) void;
+const Driver = struct { ctx: *anyopaque, callback: MediatedFn, refresh: RefreshFn };
+
 pub const Service = struct {
     allocator: std.mem.Allocator,
-    lock_fd: c_int = -1,
     conn: ?muxclient.Conn = null,
     fd_watch: c.guint = 0,
     retry_source: c.guint = 0,
+    sweep_source: c.guint = 0,
     next_req: u32 = 1,
-    next_order: u64 = 1,
+    order_seq: u64 = 0,
     intents: std.ArrayList(*Intent) = .empty,
     watches: std.ArrayList(*Watch) = .empty,
     pending: std.ArrayList(Pending) = .empty,
-    acknowledgments: std.ArrayList(u64) = .empty,
-    pending_acks: std.ArrayList(PendingAck) = .empty,
     subscribers: std.ArrayList(Subscriber) = .empty,
+    drivers: std.ArrayList(Driver) = .empty,
     shutting_down: bool = false,
     refs: usize = 1,
     retry_delay_ms: c.guint = 1000,
@@ -121,59 +225,51 @@ pub const Service = struct {
         errdefer self.deinit();
         if (notify_ctx != null and notify_fn != null)
             try self.subscribers.append(allocator, .{ .ctx = notify_ctx.?, .callback = notify_fn.? });
-        try self.lockLedger();
-        self.load();
-        if (self.durability_error) return self;
+        // A ledger directory we cannot even create means no durable
+        // transfer can be recorded; the caller degrades honestly.
+        try self.probeLedger();
+        self.migrateLegacy();
+        self.adoptOrphans();
         self.connect();
-        for (self.watches.items) |w| {
-            self.armWatch(w);
-            self.detectOfflineEdit(w);
-        }
-        var i: usize = 0;
-        while (i < self.intents.items.len and !self.durability_error) {
-            const it = self.intents.items[i];
-            if (it.state == .done) {
-                self.complete(it, true, it.message);
-            } else i += 1;
-        }
-        self.queueDirtyWatches();
+        self.sweep_source = c.g_timeout_add(SWEEP_MS, @ptrCast(&onSweep), @ptrCast(self));
         self.pump();
         return self;
     }
 
     pub fn deinit(self: *Service) void {
         self.shutting_down = true;
-        if (self.lock_fd >= 0) self.persist();
+        self.persist();
+        if (self.sweep_source != 0) _ = c.g_source_remove(self.sweep_source);
         if (self.retry_source != 0) _ = c.g_source_remove(self.retry_source);
         if (self.fd_watch != 0) _ = c.g_source_remove(self.fd_watch);
         if (self.conn) |*conn| conn.deinit();
-        if (self.lock_fd >= 0) _ = c.close(self.lock_fd);
-        for (self.intents.items) |it| it.destroy(self.allocator);
+        for (self.intents.items) |it| {
+            it.handle.release();
+            it.destroy(self.allocator);
+        }
         self.intents.deinit(self.allocator);
-        for (self.watches.items) |w| w.destroy(self.allocator);
+        for (self.watches.items) |w| {
+            w.handle.release();
+            w.destroy(self.allocator);
+        }
         self.watches.deinit(self.allocator);
         self.pending.deinit(self.allocator);
-        self.acknowledgments.deinit(self.allocator);
-        self.pending_acks.deinit(self.allocator);
         self.subscribers.deinit(self.allocator);
+        self.drivers.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
-    fn lockLedger(self: *Service) !void {
-        const path = try store.filePath(self.allocator);
-        defer self.allocator.free(path);
-        try pathz.makeParentDirs(path);
-        const lock_path = try std.fmt.allocPrint(self.allocator, "{s}.lock", .{path});
-        defer self.allocator.free(lock_path);
+    fn probeLedger(self: *Service) !void {
+        const dir = try store.dirPath(self.allocator);
+        defer self.allocator.free(dir);
+        var probe: [4096]u8 = undefined;
+        const inside = std.fmt.bufPrint(&probe, "{s}/x", .{dir}) catch return error.TransferLedgerUnavailable;
+        pathz.makeParentDirs(inside) catch return error.TransferLedgerUnavailable;
         var z: [4096]u8 = undefined;
-        const fd = c.open(try pathz.pathZ(&z, lock_path), c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c.mode_t, 0o600));
-        if (fd < 0) return error.TransferLedgerLockFailed;
-        var lock = c.struct_flock{ .l_type = c.F_WRLCK, .l_whence = c.SEEK_SET, .l_start = 0, .l_len = 0, .l_pid = 0 };
-        if (c.fcntl(fd, c.F_SETLK, &lock) != 0) {
-            _ = c.close(fd);
-            return error.TransferLedgerBusy;
-        }
-        self.lock_fd = fd;
+        _ = c.mkdir(pathz.pathZ(&z, dir) catch return error.TransferLedgerUnavailable, 0o700);
+        var st: c.struct_stat = undefined;
+        if (c.stat(pathz.pathZ(&z, dir) catch return error.TransferLedgerUnavailable, &st) != 0)
+            return error.TransferLedgerUnavailable;
     }
 
     fn notify(self: *Service, comptime fmt: []const u8, args: anytype) void {
@@ -182,12 +278,203 @@ pub const Service = struct {
         for (self.subscribers.items) |subscriber| subscriber.callback(subscriber.ctx, msg);
     }
 
-    fn dupIntent(self: *Service, value: store.Intent) !*Intent {
+    // ── record ownership ────────────────────────────────────────
+
+    fn ownsIntent(self: *Service, token: []const u8) bool {
+        for (self.intents.items) |it| if (std.mem.eql(u8, it.token, token)) return true;
+        return false;
+    }
+
+    fn ownsWatch(self: *Service, token: []const u8) bool {
+        for (self.watches.items) |w| if (std.mem.eql(u8, w.token, token)) return true;
+        return false;
+    }
+
+    /// Take over every record no live process owns. Called at startup
+    /// and on a timer: a peer GUI can die at any moment, and its
+    /// transfers must not wait for a restart of THIS one.
+    fn adoptOrphans(self: *Service) void {
+        const entries = store.list(self.allocator) catch return;
+        defer store.freeList(self.allocator, entries);
+        var handed: std.ArrayList(*Intent) = .empty;
+        defer handed.deinit(self.allocator);
+        for (entries) |e| {
+            switch (e.rtype) {
+                .intent => if (self.ownsIntent(e.token)) continue,
+                .watch => if (self.ownsWatch(e.token)) continue,
+            }
+            var handle = (store.open(self.allocator, e.rtype, e.token) catch continue) orelse continue;
+            const parsed = store.readFile(self.allocator, handle.json_path) catch null;
+            const rec = parsed orelse {
+                // A lock with no record: debris of an owner that died
+                // between creating the lock and writing the record.
+                handle.destroyRecord();
+                continue;
+            };
+            defer rec.deinit();
+            if (rec.value.version != store.VERSION) {
+                handle.release();
+                continue;
+            }
+            switch (e.rtype) {
+                .intent => {
+                    const value = rec.value.intent;
+                    if (value.state == .canceled) {
+                        handle.destroyRecord();
+                        continue;
+                    }
+                    if (value.mediated and self.drivers.items.len == 0) {
+                        // Nothing here can run it; leave it adoptable.
+                        handle.release();
+                        continue;
+                    }
+                    const it = self.dupIntent(handle, value) catch {
+                        handle.release();
+                        continue;
+                    };
+                    self.intents.append(self.allocator, it) catch {
+                        it.handle.release();
+                        it.destroy(self.allocator);
+                        continue;
+                    };
+                    if (it.mediated) handed.append(self.allocator, it) catch {};
+                },
+                .watch => {
+                    const w = self.dupWatch(handle, rec.value.watch) catch {
+                        handle.release();
+                        continue;
+                    };
+                    self.watches.append(self.allocator, w) catch {
+                        w.handle.release();
+                        w.destroy(self.allocator);
+                        continue;
+                    };
+                    self.armWatch(w);
+                    self.detectOfflineEdit(w);
+                },
+            }
+        }
+        // Dispatch AFTER the scan: a driver may call back into the
+        // service, and the lists must be settled first.
+        for (handed.items) |it| self.handToDriver(it);
+        self.queueDirtyWatches();
+        self.refreshViews();
+    }
+
+    fn onSweep(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *Service = @ptrCast(@alignCast(user.?));
+        if (self.shutting_down) return 0;
+        self.adoptOrphans();
+        self.pump();
+        return 1;
+    }
+
+    /// Import a pre-upgrade single-document ledger, once.
+    fn migrateLegacy(self: *Service) void {
+        const lock = (store.lockLegacy(self.allocator) catch return) orelse {
+            // A pre-upgrade binary still owns that document and is
+            // still running those transfers; importing them here would
+            // run every one of them twice.
+            return;
+        };
+        defer lock.release();
+        const parsed = (store.loadLegacy(self.allocator) catch {
+            self.notify("the old transfer ledger is unreadable; it was left in place", .{});
+            return;
+        }) orelse return;
+        defer parsed.deinit();
+        var imported: usize = 0;
+        for (parsed.value.intents) |value| {
+            if (value.state == .canceled) continue;
+            if (value.token.len == 0) continue;
+            if (self.importIntent(value, parsed.value.acknowledgments)) imported += 1;
+        }
+        for (parsed.value.watches) |value| {
+            if (value.token.len == 0) continue;
+            if (self.importWatch(value)) imported += 1;
+        }
+        // Acknowledgments with no surviving intent still have to reach
+        // the daemon: carry each in a retired record of its own.
+        for (parsed.value.acknowledgments) |job| {
+            var covered = false;
+            for (self.intents.items) |it| if (it.ack_job == job) {
+                covered = true;
+                break;
+            };
+            if (!covered and self.importAck(job)) imported += 1;
+        }
+        store.retireLegacy(self.allocator);
+        if (imported > 0) self.notify("imported {d} transfer record(s) from the old ledger", .{imported});
+    }
+
+    fn importIntent(self: *Service, value: store.Intent, acks: []const u64) bool {
+        var handle = (store.open(self.allocator, .intent, value.token) catch return false) orelse return false;
+        const it = self.dupIntent(handle, value) catch {
+            handle.release();
+            return false;
+        };
+        for (acks) |job| {
+            if (job != 0 and job == value.job) it.ack_job = job;
+        }
+        self.intents.append(self.allocator, it) catch {
+            it.handle.release();
+            it.destroy(self.allocator);
+            return false;
+        };
+        self.writeIntent(it);
+        return true;
+    }
+
+    fn importWatch(self: *Service, value: store.Watch) bool {
+        var handle = (store.open(self.allocator, .watch, value.token) catch return false) orelse return false;
+        const w = self.dupWatch(handle, value) catch {
+            handle.release();
+            return false;
+        };
+        self.watches.append(self.allocator, w) catch {
+            w.handle.release();
+            w.destroy(self.allocator);
+            return false;
+        };
+        self.writeWatch(w);
+        self.armWatch(w);
+        self.detectOfflineEdit(w);
+        return true;
+    }
+
+    fn importAck(self: *Service, job: u64) bool {
+        const token = self.newToken() catch return false;
+        defer self.allocator.free(token);
+        var handle = (store.open(self.allocator, .intent, token) catch return false) orelse return false;
+        const it = self.dupIntent(handle, .{
+            .token = token,
+            .state = .done,
+            .job = job,
+            .ack_job = job,
+            .retired = true,
+        }) catch {
+            handle.release();
+            return false;
+        };
+        self.intents.append(self.allocator, it) catch {
+            it.handle.release();
+            it.destroy(self.allocator);
+            return false;
+        };
+        self.writeIntent(it);
+        return true;
+    }
+
+    fn dupIntent(self: *Service, handle: store.Handle, value: store.Intent) !*Intent {
         const a = self.allocator;
         const it = try a.create(Intent);
         errdefer a.destroy(it);
         const token = try a.dupe(u8, value.token);
         errdefer a.free(token);
+        // A record written before client_token existed used its
+        // identity as the idempotency key.
+        const client_token = try a.dupe(u8, if (value.client_token.len > 0) value.client_token else value.token);
+        errdefer a.free(client_token);
         const src_host = try a.dupe(u8, value.src.host);
         errdefer a.free(src_host);
         const src_path = try a.dupe(u8, value.src.path);
@@ -202,7 +489,9 @@ pub const Service = struct {
         errdefer a.free(watch_token);
         const message = try a.dupe(u8, value.message);
         it.* = .{
+            .handle = handle,
             .token = token,
+            .client_token = client_token,
             .kind = value.kind,
             .src_host = src_host,
             .src_path = src_path,
@@ -211,7 +500,7 @@ pub const Service = struct {
             .app_id = app_id,
             .state = if (value.state == .done or value.state == .canceled or value.state == .failed) value.state else .queued,
             .job = value.job,
-            .order = value.order,
+            .order = if (value.order == 0) self.nextOrder() else value.order,
             .watch_token = watch_token,
             .submitted_generation = value.submitted_generation,
             .message = message,
@@ -220,12 +509,18 @@ pub const Service = struct {
             .submitted_size = value.submitted_size,
             .submitted_mtime_ns = value.submitted_mtime_ns,
             .paused = value.paused,
+            .ack_job = value.ack_job,
+            .retired = value.retired,
+            .mediated = value.mediated,
+            .open_when_done = value.open_when_done,
+            .delete_src_after = value.delete_src_after,
+            .watch_after = value.watch_after,
             .dest_key = destinationKey(value.dst.host, value.dst.path),
         };
         return it;
     }
 
-    fn dupWatch(self: *Service, value: store.Watch) !*Watch {
+    fn dupWatch(self: *Service, handle: store.Handle, value: store.Watch) !*Watch {
         const a = self.allocator;
         const w = try a.create(Watch);
         errdefer a.destroy(w);
@@ -238,6 +533,7 @@ pub const Service = struct {
         const cache_path = try a.dupe(u8, value.cache_path);
         w.* = .{
             .service = self,
+            .handle = handle,
             .token = token,
             .host = host,
             .remote_path = remote_path,
@@ -250,105 +546,47 @@ pub const Service = struct {
         return w;
     }
 
-    fn load(self: *Service) void {
-        const parsed = (store.load(self.allocator) catch {
+    // ── persistence ─────────────────────────────────────────────
+
+    fn writeIntent(self: *Service, it: *Intent) void {
+        it.handle.write(it.record()) catch {
             self.durability_error = true;
-            self.notify("transfer recovery ledger is unreadable; refusing to overwrite it", .{});
+            self.notify("cannot persist transfer recovery state", .{});
             return;
-        }) orelse return;
-        defer parsed.deinit();
-        if (parsed.value.version != 1) {
-            self.durability_error = true;
-            self.notify("transfer recovery ledger version is unsupported; refusing to overwrite it", .{});
-            return;
-        }
-        self.next_order = parsed.value.next_order;
-        for (parsed.value.intents) |value| {
-            if (value.state == .canceled) continue;
-            const it = self.dupIntent(value) catch {
-                self.durability_error = true;
-                self.notify("cannot reconstruct transfer recovery state", .{});
-                return;
-            };
-            self.intents.append(self.allocator, it) catch {
-                it.destroy(self.allocator);
-                self.durability_error = true;
-                self.notify("cannot reconstruct transfer recovery state", .{});
-                return;
-            };
-        }
-        for (parsed.value.watches) |value| {
-            const w = self.dupWatch(value) catch {
-                self.durability_error = true;
-                self.notify("cannot reconstruct transfer recovery state", .{});
-                return;
-            };
-            self.watches.append(self.allocator, w) catch {
-                w.destroy(self.allocator);
-                self.durability_error = true;
-                self.notify("cannot reconstruct transfer recovery state", .{});
-                return;
-            };
-        }
-        self.acknowledgments.appendSlice(self.allocator, parsed.value.acknowledgments) catch {
-            self.durability_error = true;
-            self.notify("cannot reconstruct transfer recovery state", .{});
         };
+        // A record that landed proves the ledger is writable again;
+        // leaving the flag set would refuse every later transfer over
+        // one transient failure.
+        self.durability_error = false;
     }
 
-    fn persist(self: *Service) void {
-        // Never replace an unreadable ledger or continue after a write
-        // failure; preserving the recovery evidence is safer than
-        // pretending subsequent work is durable.
-        if (self.durability_error) return;
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const intents = a.alloc(store.Intent, self.intents.items.len) catch {
-            self.durability_error = true;
-            self.notify("cannot allocate transfer recovery snapshot", .{});
-            return;
-        };
-        for (self.intents.items, 0..) |it, i| intents[i] = .{
-            .token = it.token,
-            .kind = it.kind,
-            .src = .{ .host = it.src_host, .path = it.src_path },
-            .dst = .{ .host = it.dst_host, .path = it.dst_path },
-            .app_id = it.app_id,
-            .state = it.state,
-            .job = it.job,
-            .order = it.order,
-            .watch_token = it.watch_token,
-            .submitted_generation = it.submitted_generation,
-            .message = it.message,
-            .attempts = it.attempts,
-            .cancel_requested = it.cancel_requested,
-            .submitted_size = it.submitted_size,
-            .submitted_mtime_ns = it.submitted_mtime_ns,
-            .paused = it.paused,
-        };
-        const watches = a.alloc(store.Watch, self.watches.items.len) catch {
-            self.durability_error = true;
-            self.notify("cannot allocate transfer recovery snapshot", .{});
-            return;
-        };
-        for (self.watches.items, 0..) |w, i| watches[i] = .{
-            .token = w.token,
-            .host = w.host,
-            .remote_path = w.remote_path,
-            .cache_path = w.cache_path,
-            .dirty_generation = w.dirty_generation,
-            .synced_generation = w.synced_generation,
-            .synced_size = w.synced_size,
-            .synced_mtime_ns = w.synced_mtime_ns,
-        };
-        store.save(self.allocator, .{ .next_order = self.next_order, .intents = intents, .watches = watches, .acknowledgments = self.acknowledgments.items }) catch {
+    fn writeWatch(self: *Service, w: *Watch) void {
+        w.handle.write(w.record()) catch {
             self.durability_error = true;
             self.notify("cannot persist transfer recovery state", .{});
             return;
         };
         self.durability_error = false;
     }
+
+    /// Write every owned record whose content changed.
+    fn persist(self: *Service) void {
+        for (self.intents.items) |it| self.writeIntent(it);
+        for (self.watches.items) |w| self.writeWatch(w);
+    }
+
+    fn nextOrder(self: *Service) u64 {
+        // Wall-clock based so records minted by DIFFERENT processes
+        // still order against each other; the counter breaks ties
+        // inside one millisecond.
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+        const ms: u64 = @as(u64, @intCast(ts.tv_sec)) * 1000 + @as(u64, @intCast(@divTrunc(ts.tv_nsec, 1_000_000)));
+        self.order_seq = (self.order_seq + 1) % 1000;
+        return ms * 1000 + self.order_seq;
+    }
+
+    // ── connection ──────────────────────────────────────────────
 
     fn connect(self: *Service) void {
         if (self.conn != null or self.shutting_down) return;
@@ -388,8 +626,8 @@ pub const Service = struct {
         if (self.conn) |*conn| conn.deinit();
         self.conn = null;
         self.pending.clearRetainingCapacity();
-        self.pending_acks.clearRetainingCapacity();
         for (self.intents.items) |it| {
+            it.ack_req = 0;
             if (it.state == .submitting or it.state == .running) it.state = .queued;
         }
         self.persist();
@@ -436,20 +674,19 @@ pub const Service = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const rep = std.json.parseFromSliceLeaky(Reply, arena.allocator(), payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return;
-        for (self.pending_acks.items, 0..) |pending, i| {
-            if (pending.req != rep.req) continue;
-            _ = self.pending_acks.orderedRemove(i);
+        for (self.intents.items) |it| {
+            if (it.ack_req == 0 or it.ack_req != rep.req) continue;
+            it.ack_req = 0;
             if (!rep.ok and !std.mem.eql(u8, rep.@"error", "no such job")) {
                 self.scheduleRetry();
                 return;
             }
-            for (self.acknowledgments.items, 0..) |job, j| {
-                if (job == pending.job) {
-                    _ = self.acknowledgments.orderedRemove(j);
-                    break;
-                }
+            it.ack_job = 0;
+            if (it.retired) {
+                self.removeIntent(it);
+            } else {
+                self.writeIntent(it);
             }
-            self.persist();
             return;
         }
         for (self.pending.items, 0..) |p, i| {
@@ -459,7 +696,6 @@ pub const Service = struct {
                 if (p.intent.cancel_requested) {
                     p.intent.state = .canceled;
                     self.removeIntent(p.intent);
-                    self.persist();
                     self.pump();
                     return;
                 }
@@ -505,7 +741,7 @@ pub const Service = struct {
         defer arena.deinit();
         const ev = std.json.parseFromSliceLeaky(Event, arena.allocator(), payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return;
         for (self.intents.items) |it| {
-            if (it.job != ev.job) continue;
+            if (it.job != ev.job or it.retired) continue;
             if (std.mem.eql(u8, ev.ev, "done")) {
                 self.complete(it, true, "");
             } else if (std.mem.eql(u8, ev.ev, "error") or std.mem.eql(u8, ev.ev, "canceled")) {
@@ -514,7 +750,8 @@ pub const Service = struct {
                 // The daemon is the authority on whether the helper is
                 // stopped; a pause from another client shows up here.
                 it.paused = std.mem.eql(u8, ev.ev, "paused");
-                self.persist();
+                self.writeIntent(it);
+                self.pump();
             } else {
                 it.done = ev.done;
                 if (ev.total > 0) it.total = ev.total;
@@ -542,21 +779,21 @@ pub const Service = struct {
         const terminal_job = it.job;
         if (!ok) {
             if (it.cancel_requested) {
-                if (terminal_job != 0 and !self.stageAck(terminal_job)) return;
+                it.ack_job = terminal_job;
                 it.state = .canceled;
                 self.notify("transfer canceled: {s}", .{std.fs.path.basename(it.dst_path)});
-                self.removeIntent(it);
-                self.persist();
+                self.retire(it);
                 self.pump();
                 return;
             }
             it.attempts +|= 1;
             if (it.attempts >= 8) {
-                if (terminal_job != 0 and !self.stageAck(terminal_job)) return;
+                it.ack_job = terminal_job;
                 it.state = .failed;
                 self.replaceMessage(it, message);
                 self.notify("transfer failed: {s}", .{std.fs.path.basename(it.dst_path)});
-                self.persist();
+                self.writeIntent(it);
+                self.pumpAcksNow();
                 self.pump();
                 return;
             }
@@ -565,34 +802,35 @@ pub const Service = struct {
             // checkpoint but receives a new job identity.
             const token = self.newToken() catch null;
             if (token) |fresh| {
-                self.allocator.free(it.token);
-                it.token = fresh;
+                self.allocator.free(it.client_token);
+                it.client_token = fresh;
                 it.job = 0;
             }
             it.state = .waiting_retry;
-            if (terminal_job != 0 and !self.stageAck(terminal_job)) return;
+            it.ack_job = terminal_job;
             self.replaceMessage(it, message);
             self.notify("transfer deferred: {s}", .{std.fs.path.basename(it.dst_path)});
-            self.persist();
+            self.writeIntent(it);
             self.scheduleRetry();
             self.pump();
             return;
         }
         it.state = .done;
-        if (terminal_job != 0 and !self.stageAck(terminal_job)) return;
+        it.ack_job = terminal_job;
         if (it.kind == .download) {
             const w = self.ensureWatch(it.watch_token, it.src_host, it.src_path, it.dst_path);
             const watch = w orelse {
                 it.state = .failed;
+                it.ack_job = terminal_job;
                 self.replaceMessage(it, "cannot create durable edit watch");
-                self.persist();
+                self.writeIntent(it);
                 self.notify("download held because edit recovery could not be created: {s}", .{std.fs.path.basename(it.dst_path)});
                 return;
             };
             self.captureFingerprint(watch);
             watch.synced_generation = watch.dirty_generation;
             self.armWatch(watch);
-            self.persist(); // arm recovery before launching an external app
+            self.writeWatch(watch); // arm recovery before launching an external app
             if (self.durability_error) return;
             if (it.app_id.len > 0) launchWithApp(it.app_id, it.dst_path) else launchDefault(it.dst_path);
             self.notify("download complete: {s}", .{std.fs.path.basename(it.dst_path)});
@@ -611,19 +849,34 @@ pub const Service = struct {
                         w.dirty_generation = @max(w.dirty_generation, it.submitted_generation + 1);
                     }
                 }
+                self.writeWatch(w);
                 self.notify("synced back: {s}", .{std.fs.path.basename(w.remote_path)});
             }
         }
-        self.removeIntent(it);
+        self.retire(it);
         self.queueDirtyWatches();
-        self.persist();
         self.pump();
+        self.refreshViews();
+    }
+
+    /// A finished intent leaves the queue but its record survives
+    /// until the daemon has acknowledged the job, so a crash in
+    /// between cannot strand the job on the daemon.
+    fn retire(self: *Service, it: *Intent) void {
+        if (it.ack_job == 0) {
+            self.removeIntent(it);
+            return;
+        }
+        it.retired = true;
+        self.writeIntent(it);
+        self.pumpAcksNow();
     }
 
     fn removeIntent(self: *Service, needle: *Intent) void {
         for (self.intents.items, 0..) |it, i| {
             if (it != needle) continue;
             _ = self.intents.orderedRemove(i);
+            it.handle.destroyRecord();
             it.destroy(self.allocator);
             return;
         }
@@ -633,9 +886,50 @@ pub const Service = struct {
         var raw: [16]u8 = undefined;
         if (c.getentropy(&raw, raw.len) != 0) {
             std.mem.writeInt(u64, raw[0..8], @intCast(c.getpid()), .little);
-            std.mem.writeInt(u64, raw[8..16], self.next_order, .little);
+            std.mem.writeInt(u64, raw[8..16], self.nextOrder(), .little);
         }
         return std.fmt.allocPrint(self.allocator, "{x}", .{raw});
+    }
+
+    // ── downloads and sync-back ─────────────────────────────────
+
+    /// A record in the ledger, owned by ANY process, that already
+    /// downloads `host:remote_path`. Cross-process duplicate detection:
+    /// two processes downloading the same file would write the same
+    /// staged `.skpart`.
+    fn foreignDownloadExists(self: *Service, host: []const u8, remote_path: []const u8) bool {
+        const entries = store.list(self.allocator) catch return false;
+        defer store.freeList(self.allocator, entries);
+        for (entries) |e| {
+            if (e.rtype != .intent) continue;
+            if (self.ownsIntent(e.token)) continue;
+            const parsed = (store.readToken(self.allocator, .intent, e.token) catch null) orelse continue;
+            defer parsed.deinit();
+            const v = parsed.value.intent;
+            if (v.retired or v.state == .canceled) continue;
+            if (v.kind != .download) continue;
+            if (std.mem.eql(u8, v.src.host, host) and std.mem.eql(u8, v.src.path, remote_path)) return true;
+        }
+        return false;
+    }
+
+    /// A watch record held by another process for the same remote
+    /// file, with its cache copy still present. That copy is the one
+    /// to open: re-downloading it would fight over the same path.
+    fn foreignWatchCache(self: *Service, allocator: std.mem.Allocator, host: []const u8, remote_path: []const u8) ?[]u8 {
+        const entries = store.list(self.allocator) catch return null;
+        defer store.freeList(self.allocator, entries);
+        for (entries) |e| {
+            if (e.rtype != .watch) continue;
+            if (self.ownsWatch(e.token)) continue;
+            const parsed = (store.readToken(self.allocator, .watch, e.token) catch null) orelse continue;
+            defer parsed.deinit();
+            const v = parsed.value.watch;
+            if (!std.mem.eql(u8, v.host, host) or !std.mem.eql(u8, v.remote_path, remote_path)) continue;
+            if (fingerprint(v.cache_path) == null) continue;
+            return allocator.dupe(u8, v.cache_path) catch null;
+        }
+        return null;
     }
 
     pub fn submitDownload(self: *Service, host: []const u8, remote_path: []const u8, cache_path: []const u8, app_id: ?[]const u8) void {
@@ -657,7 +951,18 @@ pub const Service = struct {
             }
         }
         for (self.intents.items) |it| {
+            if (it.retired) continue;
             if (it.kind == .download and std.mem.eql(u8, it.src_host, host) and std.mem.eql(u8, it.src_path, remote_path)) return;
+        }
+        if (self.foreignWatchCache(self.allocator, host, remote_path)) |cached| {
+            defer self.allocator.free(cached);
+            if (app_id) |id| launchWithApp(id, cached) else launchDefault(cached);
+            self.notify("opened the copy another sketerm window already holds: {s}", .{std.fs.path.basename(cached)});
+            return;
+        }
+        if (self.foreignDownloadExists(host, remote_path)) {
+            self.notify("another sketerm window is already downloading {s}", .{std.fs.path.basename(remote_path)});
+            return;
         }
         const watch_token = self.newToken() catch return;
         defer self.allocator.free(watch_token);
@@ -670,74 +975,65 @@ pub const Service = struct {
             return;
         }
         const it = self.createIntent(kind, src_host, src_path, dst_host, dst_path, app_id, watch_token, generation) catch return;
-        self.next_order += 1;
-        self.intents.append(self.allocator, it) catch { it.destroy(self.allocator); return; };
-        self.persist();
+        self.intents.append(self.allocator, it) catch {
+            it.handle.destroyRecord();
+            it.destroy(self.allocator);
+            return;
+        };
+        self.writeIntent(it);
         if (self.durability_error) {
             self.removeIntent(it);
             return;
         }
         self.pump();
+        self.refreshViews();
     }
 
     fn createIntent(self: *Service, kind: store.Kind, src_host: []const u8, src_path: []const u8, dst_host: []const u8, dst_path: []const u8, app_id: []const u8, watch_token: []const u8, generation: u64) !*Intent {
-        const a = self.allocator;
-        const it = try a.create(Intent);
-        errdefer a.destroy(it);
         const token = try self.newToken();
-        errdefer a.free(token);
-        const sh = try a.dupe(u8, src_host);
-        errdefer a.free(sh);
-        const sp = try a.dupe(u8, src_path);
-        errdefer a.free(sp);
-        const dh = try a.dupe(u8, dst_host);
-        errdefer a.free(dh);
-        const dp = try a.dupe(u8, dst_path);
-        errdefer a.free(dp);
-        const app = try a.dupe(u8, app_id);
-        errdefer a.free(app);
-        const watch = try a.dupe(u8, watch_token);
-        errdefer a.free(watch);
-        const message = try a.dupe(u8, "");
+        defer self.allocator.free(token);
+        var handle = (try store.open(self.allocator, .intent, token)) orelse return error.LedgerBusy;
+        errdefer handle.release();
         const submitted = if (kind == .upload) fingerprint(src_path) else null;
-        it.* = .{
+        return self.dupIntent(handle, .{
             .token = token,
             .kind = kind,
-            .src_host = sh,
-            .src_path = sp,
-            .dst_host = dh,
-            .dst_path = dp,
-            .app_id = app,
+            .src = .{ .host = src_host, .path = src_path },
+            .dst = .{ .host = dst_host, .path = dst_path },
+            .app_id = app_id,
             .state = .queued,
-            .job = 0,
-            .order = self.next_order,
-            .watch_token = watch,
+            .order = self.nextOrder(),
+            .watch_token = watch_token,
             .submitted_generation = generation,
-            .message = message,
-            .attempts = 0,
             .submitted_size = if (submitted) |fp| fp.size else 0,
             .submitted_mtime_ns = if (submitted) |fp| fp.mtime_ns else 0,
-            .dest_key = destinationKey(dst_host, dst_path),
-        };
-        return it;
+        });
     }
 
-    /// Submit whatever the queue policy admits. A transfer that is
-    /// in flight holds its destination whether or not it is paused:
-    /// the SIGSTOPped job still owns the staged partial there.
+    /// Submit whatever the queue policy admits. A PAUSED transfer does
+    /// not occupy an active slot: it is doing no work, so holding a
+    /// destination for it would only stall the transfers that are.
     fn pump(self: *Service) void {
-        const conn = if (self.conn) |*v| v else { self.connect(); return; };
+        const conn = if (self.conn) |*v| v else {
+            self.connect();
+            return;
+        };
         if (!self.pumpAcks(conn)) return;
-        std.mem.sort(*Intent, self.intents.items, {}, struct { fn less(_: void, a: *Intent, b: *Intent) bool { return a.order < b.order; } }.less);
+        std.mem.sort(*Intent, self.intents.items, {}, struct {
+            fn less(_: void, a: *Intent, b: *Intent) bool {
+                return a.order < b.order;
+            }
+        }.less);
         const slots = self.allocator.alloc(xferqueue.Slot, self.intents.items.len) catch return;
         defer self.allocator.free(slots);
         const map = self.allocator.alloc(usize, self.intents.items.len) catch return;
         defer self.allocator.free(map);
         var n: usize = 0;
         for (self.intents.items, 0..) |it, i| {
+            if (it.retired or it.mediated or it.paused) continue;
             const state: ?xferqueue.State = switch (it.state) {
                 .submitting, .running => .running,
-                .queued => if (it.paused or it.cancel_requested) null else .queued,
+                .queued => if (it.cancel_requested) null else .queued,
                 else => null,
             };
             if (state) |s| {
@@ -772,7 +1068,7 @@ pub const Service = struct {
             .src_host = it.src_host,
             .dst_host = it.dst_host,
             .@"resume" = true,
-            .client_token = it.token,
+            .client_token = it.client_token,
         }) catch {
             _ = self.pending.pop();
             it.state = .queued;
@@ -798,15 +1094,18 @@ pub const Service = struct {
                 // resume as soon as the resubmission returns its id.
                 it.resume_pending = true;
             }
-            self.persist();
-            if (!paused) self.pump();
+            self.writeIntent(it);
+            self.pump();
             return;
         }
     }
 
     pub fn moveQueued(self: *Service, token: []const u8, direction: i8) void {
         var idx: ?usize = null;
-        for (self.intents.items, 0..) |it, i| if (std.mem.eql(u8, it.token, token) and it.state == .queued) { idx = i; break; };
+        for (self.intents.items, 0..) |it, i| if (std.mem.eql(u8, it.token, token) and it.state == .queued) {
+            idx = i;
+            break;
+        };
         const i = idx orelse return;
         const j: usize = if (direction < 0) (if (i == 0) return else i - 1) else (if (i + 1 >= self.intents.items.len) return else i + 1);
         if (self.intents.items[j].state != .queued) return;
@@ -824,14 +1123,13 @@ pub const Service = struct {
             if (!std.mem.eql(u8, it.token, token)) continue;
             if (it.state == .queued or it.state == .waiting_retry or it.state == .failed) {
                 it.state = .canceled;
-                self.removeIntent(it);
-                self.persist();
+                self.retire(it);
                 self.pump();
                 return;
             }
             it.cancel_requested = true;
             if (it.job != 0 and !self.sendJobControl(it.job, "job_cancel")) self.requestDisconnect();
-            self.persist();
+            self.writeIntent(it);
             return;
         }
     }
@@ -848,27 +1146,20 @@ pub const Service = struct {
         return false;
     }
 
-    fn stageAck(self: *Service, job: u64) bool {
-        for (self.acknowledgments.items) |existing| if (existing == job) return true;
-        self.acknowledgments.append(self.allocator, job) catch {
-            self.durability_error = true;
-            self.notify("cannot allocate transfer acknowledgment recovery state", .{});
-            return false;
-        };
-        return true;
+    fn pumpAcksNow(self: *Service) void {
+        const conn = if (self.conn) |*v| v else return;
+        _ = self.pumpAcks(conn);
     }
 
     fn pumpAcks(self: *Service, conn: *muxclient.Conn) bool {
-        for (self.acknowledgments.items) |job| {
-            var pending = false;
-            for (self.pending_acks.items) |item| if (item.job == job) { pending = true; break; };
-            if (pending) continue;
+        for (self.intents.items) |it| {
+            if (it.ack_job == 0 or it.ack_req != 0) continue;
             const req = self.next_req;
             self.next_req +%= 1;
             if (self.next_req == 0) self.next_req = 1;
-            self.pending_acks.append(self.allocator, .{ .req = req, .job = job }) catch continue;
-            conn.sendJson(.fs_op, .{ .req = req, .op = "job_ack", .job = job }) catch {
-                _ = self.pending_acks.pop();
+            it.ack_req = req;
+            conn.sendJson(.fs_op, .{ .req = req, .op = "job_ack", .job = it.ack_job }) catch {
+                it.ack_req = 0;
                 self.disconnect_after_drain = true;
                 return false;
             };
@@ -877,24 +1168,173 @@ pub const Service = struct {
     }
 
     pub fn rows(self: *Service, allocator: std.mem.Allocator) ![]QueueRow {
-        const out = try allocator.alloc(QueueRow, self.intents.items.len);
-        for (self.intents.items, 0..) |it, i| out[i] = .{
+        var out: std.ArrayList(QueueRow) = .empty;
+        for (self.intents.items) |it| {
+            // Retired records are bookkeeping, and mediated ones are
+            // rendered by the view that runs them.
+            if (it.retired or it.mediated) continue;
+            try out.append(allocator, .{
+                .token = it.token,
+                .label = std.fs.path.basename(it.dst_path),
+                .state = it.state,
+                .done = it.done,
+                .total = it.total,
+                .kind = it.kind,
+                .paused = it.paused,
+                .src_host = it.src_host,
+                .src_path = it.src_path,
+                .dst_host = it.dst_host,
+                .dst_path = it.dst_path,
+                .resumed_from = it.resumed_from,
+                .message = it.message,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    // ── client-mediated records ─────────────────────────────────
+
+    fn intentByToken(self: *Service, token: []const u8) ?*Intent {
+        for (self.intents.items) |it| if (std.mem.eql(u8, it.token, token)) return it;
+        return null;
+    }
+
+    fn mediatedRec(it: *const Intent) MediatedRec {
+        return .{
             .token = it.token,
-            .label = std.fs.path.basename(it.dst_path),
-            .state = it.state,
-            .done = it.done,
-            .total = it.total,
-            .kind = it.kind,
-            .paused = it.paused,
             .src_host = it.src_host,
             .src_path = it.src_path,
             .dst_host = it.dst_host,
             .dst_path = it.dst_path,
-            .resumed_from = it.resumed_from,
-            .message = it.message,
+            .app_id = it.app_id,
+            .paused = it.paused,
+            .open_when_done = it.open_when_done,
+            .delete_src_after = it.delete_src_after,
+            .watch_after = it.watch_after,
         };
-        return out;
     }
+
+    /// Tell every registered view that the row set may have changed.
+    fn refreshViews(self: *Service) void {
+        for (self.drivers.items) |d| d.refresh(d.ctx);
+    }
+
+    fn handToDriver(self: *Service, it: *Intent) void {
+        if (it.claimed) return;
+        const driver = if (self.drivers.items.len > 0) self.drivers.items[0] else return;
+        it.claimed = true;
+        driver.callback(driver.ctx, mediatedRec(it));
+    }
+
+    /// Register a runner for client-mediated records. The FIRST driver
+    /// registered runs them; the rest only matter when it goes away.
+    pub fn addMediatedDriver(self: *Service, ctx: *anyopaque, callback: MediatedFn, refresh: RefreshFn) void {
+        for (self.drivers.items) |d| if (d.ctx == ctx) return;
+        self.drivers.append(self.allocator, .{ .ctx = ctx, .callback = callback, .refresh = refresh }) catch return;
+        if (self.drivers.items.len != 1) return;
+        self.adoptOrphans();
+        for (self.intents.items) |it| {
+            if (it.mediated) self.handToDriver(it);
+        }
+    }
+
+    pub fn removeMediatedDriver(self: *Service, ctx: *anyopaque) void {
+        var was_head = false;
+        for (self.drivers.items, 0..) |d, i| {
+            if (d.ctx != ctx) continue;
+            was_head = i == 0;
+            _ = self.drivers.orderedRemove(i);
+            break;
+        }
+        if (!was_head) return;
+        if (self.drivers.items.len > 0) {
+            for (self.intents.items) |it| {
+                if (it.mediated) self.handToDriver(it);
+            }
+            return;
+        }
+        // Nothing left here can run them: drop ownership so another
+        // process (or a later browser face) picks them up.
+        var i: usize = 0;
+        while (i < self.intents.items.len) {
+            const it = self.intents.items[i];
+            if (!it.mediated) {
+                i += 1;
+                continue;
+            }
+            self.writeIntent(it);
+            _ = self.intents.orderedRemove(i);
+            it.handle.release();
+            it.destroy(self.allocator);
+        }
+    }
+
+    /// The driver no longer runs `token` (its view is going away), but
+    /// the record stays: another driver or process resumes it.
+    pub fn unclaimMediated(self: *Service, token: []const u8) void {
+        const it = self.intentByToken(token) orelse return;
+        it.claimed = false;
+    }
+
+    /// Record a client-mediated transfer so it survives a restart.
+    /// @return the ledger token, borrowed and stable until the record
+    /// is finished; null when no record could be created.
+    pub fn newMediated(
+        self: *Service,
+        src_host: []const u8,
+        src_path: []const u8,
+        dst_host: []const u8,
+        dst_path: []const u8,
+        opts: struct {
+            app_id: []const u8 = "",
+            open_when_done: bool = false,
+            delete_src_after: bool = false,
+            watch_after: bool = false,
+        },
+    ) ?[]const u8 {
+        const token = self.newToken() catch return null;
+        defer self.allocator.free(token);
+        var handle = (store.open(self.allocator, .intent, token) catch return null) orelse return null;
+        const it = self.dupIntent(handle, .{
+            .token = token,
+            .kind = .download,
+            .src = .{ .host = src_host, .path = src_path },
+            .dst = .{ .host = dst_host, .path = dst_path },
+            .app_id = opts.app_id,
+            .state = .running,
+            .order = self.nextOrder(),
+            .mediated = true,
+            .open_when_done = opts.open_when_done,
+            .delete_src_after = opts.delete_src_after,
+            .watch_after = opts.watch_after,
+        }) catch {
+            handle.release();
+            return null;
+        };
+        it.claimed = true;
+        self.intents.append(self.allocator, it) catch {
+            it.handle.destroyRecord();
+            it.destroy(self.allocator);
+            return null;
+        };
+        self.writeIntent(it);
+        return it.token;
+    }
+
+    pub fn setMediatedPaused(self: *Service, token: []const u8, paused: bool) void {
+        const it = self.intentByToken(token) orelse return;
+        if (it.paused == paused) return;
+        it.paused = paused;
+        self.writeIntent(it);
+    }
+
+    /// The mediated transfer reached a terminal state; drop its record.
+    pub fn finishMediated(self: *Service, token: []const u8) void {
+        const it = self.intentByToken(token) orelse return;
+        self.removeIntent(it);
+    }
+
+    // ── edit watches ────────────────────────────────────────────
 
     fn watchByToken(self: *Service, token: []const u8) ?*Watch {
         for (self.watches.items) |w| if (std.mem.eql(u8, w.token, token)) return w;
@@ -903,8 +1343,16 @@ pub const Service = struct {
 
     fn ensureWatch(self: *Service, token: []const u8, host: []const u8, remote_path: []const u8, cache_path: []const u8) ?*Watch {
         if (self.watchByToken(token)) |w| return w;
-        const w = self.dupWatch(.{ .token = token, .host = host, .remote_path = remote_path, .cache_path = cache_path }) catch return null;
-        self.watches.append(self.allocator, w) catch { w.destroy(self.allocator); return null; };
+        var handle = (store.open(self.allocator, .watch, token) catch return null) orelse return null;
+        const w = self.dupWatch(handle, .{ .token = token, .host = host, .remote_path = remote_path, .cache_path = cache_path }) catch {
+            handle.release();
+            return null;
+        };
+        self.watches.append(self.allocator, w) catch {
+            w.handle.destroyRecord();
+            w.destroy(self.allocator);
+            return null;
+        };
         return w;
     }
 
@@ -927,7 +1375,7 @@ pub const Service = struct {
         const fp = fingerprint(w.cache_path) orelse return;
         if (fp.size != w.synced_size or fp.mtime_ns != w.synced_mtime_ns) {
             w.dirty_generation += 1;
-            self.persist();
+            self.writeWatch(w);
         }
     }
 
@@ -949,7 +1397,7 @@ pub const Service = struct {
         const fp = fingerprint(w.cache_path) orelse return;
         if (fp.size == w.synced_size and fp.mtime_ns == w.synced_mtime_ns) return;
         w.dirty_generation += 1;
-        w.service.persist();
+        w.service.writeWatch(w);
         w.service.queueDirtyWatches();
         w.service.pump();
     }
@@ -958,7 +1406,10 @@ pub const Service = struct {
         for (self.watches.items) |w| {
             if (w.dirty_generation <= w.synced_generation) continue;
             var active = false;
-            for (self.intents.items) |it| if (it.kind == .upload and std.mem.eql(u8, it.watch_token, w.token)) { active = true; break; };
+            for (self.intents.items) |it| if (it.kind == .upload and !it.retired and std.mem.eql(u8, it.watch_token, w.token)) {
+                active = true;
+                break;
+            };
             if (!active) self.appendIntent(.upload, "", w.cache_path, w.host, w.remote_path, "", w.token, w.dirty_generation);
         }
     }
@@ -995,7 +1446,10 @@ pub fn acquire(allocator: std.mem.Allocator, notify_ctx: ?*anyopaque, notify_fn:
     if (shared) |service| {
         if (notify_ctx != null and notify_fn != null) {
             var exists = false;
-            for (service.subscribers.items) |subscriber| if (subscriber.ctx == notify_ctx.?) { exists = true; break; };
+            for (service.subscribers.items) |subscriber| if (subscriber.ctx == notify_ctx.?) {
+                exists = true;
+                break;
+            };
             if (!exists) try service.subscribers.append(allocator, .{ .ctx = notify_ctx.?, .callback = notify_fn.? });
         }
         service.refs = service.subscribers.items.len;

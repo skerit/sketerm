@@ -1445,6 +1445,14 @@ pub const Window = struct {
             ) catch null;
         }
         bv.transfer_service = self.file_transfer_service;
+        // Client-mediated transfers need a browser face with both host
+        // connections; the service hands over any whose owner is gone.
+        if (self.file_transfer_service) |service|
+            service.addMediatedDriver(
+                @ptrCast(bv),
+                &@import("browser/jobs.zig").adoptMediated,
+                &@import("browser/jobs.zig").refreshJobsPanel,
+            );
         bv.hooks_ctx = @ptrCast(self);
         bv.on_peer = &browserPeerCb;
         bv.on_host_term = &browserHostTermCb;

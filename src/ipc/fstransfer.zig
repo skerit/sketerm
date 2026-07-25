@@ -95,6 +95,12 @@ pub const Transfer = struct {
     verifying_skip: bool = false,
     /// A corrupt resumed partial is discarded and copied once from zero.
     verify_retried: bool = false,
+    /// User-held. Honored at the chunk boundary in `requestRead`, the
+    /// only point where nothing is in flight: the staged partial and
+    /// `off` are then a consistent checkpoint that the ordinary resume
+    /// path (stat the `.skpart`, continue, hash-verify) picks up, in
+    /// this session or after a restart.
+    paused: bool = false,
     err_buf: [192]u8 = undefined,
     err_len: usize = 0,
 
@@ -103,6 +109,7 @@ pub const Transfer = struct {
         stat_src,
         stat_final,
         stat_staged,
+        paused,
         read,
         write,
         rename,
@@ -435,7 +442,27 @@ pub const Transfer = struct {
         self.requestRead();
     }
 
+    /// Hold this transfer at the next chunk boundary. At most one
+    /// already-requested chunk still lands.
+    pub fn pause(self: *Transfer) void {
+        if (self.isTerminal()) return;
+        self.paused = true;
+    }
+
+    /// Continue a held transfer from its staged partial.
+    pub fn unpause(self: *Transfer) void {
+        if (!self.paused) return;
+        self.paused = false;
+        if (self.state == .paused) self.requestRead();
+    }
+
     fn requestRead(self: *Transfer) void {
+        if (self.paused) {
+            // Nothing is in flight here: the staged partial holds
+            // exactly `off` bytes and no reply is owed.
+            self.state = .paused;
+            return;
+        }
         self.req_src = self.nr();
         self.state = .read;
         const want: u32 = @intCast(@min(@as(u64, CHUNK), self.size - self.off));
@@ -506,6 +533,9 @@ pub const Xfer = struct {
     /// Files skipped whole (destination already complete).
     files_skipped: usize = 0,
     single_file: bool = false,
+    /// User-held: the file in flight stops at its next chunk boundary
+    /// and no further file is started.
+    paused: bool = false,
     err_buf: [192]u8 = undefined,
     err_len: usize = 0,
 
@@ -627,6 +657,30 @@ pub const Xfer = struct {
         if (self.isTerminal()) return;
         if (self.cur) |t| t.cancel();
         self.state = .canceled;
+    }
+
+    /// Hold the whole operation. The walk (a metadata-only phase)
+    /// still runs to completion; the copying does not.
+    pub fn pause(self: *Xfer) void {
+        if (self.isTerminal()) return;
+        self.paused = true;
+        if (self.cur) |t| t.pause();
+    }
+
+    pub fn unpause(self: *Xfer) void {
+        if (!self.paused) return;
+        self.paused = false;
+        if (self.cur) |t| {
+            t.unpause();
+            return;
+        }
+        if (self.state == .copying) self.startNextFile();
+    }
+
+    /// Held, and not merely between requests.
+    pub fn isPaused(self: *const Xfer) bool {
+        if (self.isTerminal()) return false;
+        return self.paused;
     }
 
     fn srcAbs(self: *Xfer, buf: []u8, rel: []const u8) ?[]const u8 {
@@ -796,6 +850,9 @@ pub const Xfer = struct {
             self.state = .done;
             return;
         }
+        // Held between files: the state stays .copying with nothing in
+        // flight, and unpause() starts this same file.
+        if (self.paused) return;
         const f = self.files.items[self.cur_idx];
         var sbuf: [4096]u8 = undefined;
         var dbuf: [4096]u8 = undefined;

@@ -9979,3 +9979,82 @@ scenario that deadlocked -- now shows coherently on the next read.
 Unit suite 1025 passed / 6 skipped / 0 failed (direct binary run);
 mux, musl mux-portable, aarch64-macos builds green; sketerm-mux still
 links libc/libm only.
+## Per-record transfer ledger, and pausable client transfers (2026-07-25)
+
+Durable file transfers were the property of ONE process: the ledger
+was a single JSON document under one exclusive lock, so whichever GUI
+opened a browser face first owned every durable transfer and the
+others degraded to in-view transfers with an honest status line. Since
+`sketerm files` became its own application identity, two GUI processes
+at once is the normal case, so that model had to go.
+
+**Ownership is now per record.** `$XDG_STATE_HOME/sketerm/
+file-transfers.d/` holds one file per durable transfer (`i-<token>.json`)
+and per edit watch (`w-<token>.json`), each owned through its own
+`flock`ed `.lock` sidecar. The lock is taken BEFORE the record exists
+and held for as long as the process runs it, so a lock that can be
+taken means "no live owner"; the record itself is replaced atomically
+(temp + rename), which is why the lock lives in a separate file whose
+identity survives every rewrite. `flock` and not `fcntl`: fcntl locks
+are per PROCESS and are dropped by closing ANY descriptor to the file,
+so a second open of a record we already own would silently release it.
+
+Any process creates records and runs its own transfers; orphans (the
+owner crashed: record present, lock free, not terminal) are adopted at
+startup and every 15 s, exactly once, because adoption IS taking the
+lock. Adoption resubmits under the record's `client_token`, which the
+daemon answers by handing back the SAME job with its event stream
+re-owned -- so an adopted transfer continues rather than restarting.
+The record's identity and that idempotency key are now separate
+fields: a retry mints a fresh `client_token` (a terminal daemon job
+cannot be restarted under the old one) while the record keeps its
+name, so a retry no longer resets the panel row's measured rate.
+
+Cross-process duplicate work is prevented where it would actually
+collide: `submitDownload` reads the whole ledger, not just the records
+this process owns, and refuses to start a download of a file another
+window is already fetching (both would write the same staged
+`.skpart`); a cache copy another window holds a watch for is opened
+instead of re-fetched.
+
+`job_ack` survives a crash: a finished transfer's record is retired
+(hidden, never resubmitted) rather than deleted, and disappears only
+when the daemon has acknowledged the job. Migration imports a
+pre-upgrade `file-transfers.json` losslessly -- intents, watches and
+orphan acknowledgments (each as a retired record of its own) -- then
+renames it `.migrated`. The one compromise: a PRE-upgrade binary holds
+that document's exclusive lock for its whole life, and while it does,
+migration is skipped rather than run twice; the old process keeps
+running its own transfers from its own file, and the records this
+build mints are separate, so nothing is corrupted either way.
+
+The degraded in-view path is now reachable only when the ledger
+DIRECTORY cannot be created at all (an unwritable state dir); it is
+kept, with an honest message naming that cause, rather than refusing
+to open a remote file on a read-only home.
+
+**Client-mediated transfers pause.** `fstransfer` (the pure chunk
+state machine the client pumps over two Conns -- cross-host moves and
+degraded downloads) had cancel only, because it has no daemon helper
+to SIGSTOP. It now holds at the CHUNK BOUNDARY in `requestRead`, the
+one point where nothing is in flight and the staged `.skpart` plus
+`off` are a consistent checkpoint, and `Xfer` holds between files the
+same way. Resume needs no second path: it is the existing
+hash-verified resume from the staged partial, in this session or after
+a restart. A held transfer occupies no scheduler slot and holds no
+destination (it is doing no work), and its ledger record carries
+`paused`, so the hold survives a GUI restart -- the row comes back as
+`[paused]` with frozen counters, no rate and no ETA. Mediated records
+are adopted only while a browser face is registered as their driver
+(nothing else has both host connections), and are handed to the next
+face, or released for another process, when that view goes away.
+
+Proven live in an isolated Xvfb rig (two GUI processes sharing one
+state dir and one daemon, a rate-capped fake ssh host): the files app
+and the terminal app each ran a durable download at the same time,
+holding disjoint record locks; a `kill -9` mid-transfer was adopted by
+the surviving process, which finished the file with a matching
+SHA-256; a paused cross-host move stayed byte-frozen (size and mtime)
+across the pause, across a `kill -9`, and across the restart, then
+resumed to a byte-identical result with the source removed; and a
+hand-written legacy ledger was imported into records and retired.

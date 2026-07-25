@@ -85,6 +85,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+/* flock(2): per-open-file-description locks for the durable transfer
+ * ledger's per-record ownership (fcntl locks would be dropped by any
+ * close in the same process). */
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/statvfs.h>
 #ifndef __linux__
