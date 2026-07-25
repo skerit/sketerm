@@ -8090,6 +8090,14 @@ fn onTermProgress(ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) void {
 /// and is the safety net when no pane has focus.
 fn onNewTabAction(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
+    if (files_identity) {
+        // The "+" of a file-manager window makes a browser tab (at the
+        // focused browser's location), not a terminal tab.
+        self.newBrowserTabFrom(self.focusedPane(), null) catch |err| {
+            std.debug.print("sketerm: new-tab action failed: {s}\n", .{@errorName(err)});
+        };
+        return;
+    }
     self.newShellTab(null) catch |err| {
         std.debug.print("sketerm: new-tab action failed: {s}\n", .{@errorName(err)});
     };

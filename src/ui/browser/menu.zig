@@ -182,6 +182,20 @@ pub fn onRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64,
     self.showEntryMenu(tab, @ptrCast(@alignCast(tab.listbox)), x, y, path, name, is_dir);
 }
 
+/// Right-click on the listing AREA while the rows are hidden (empty
+/// folder, failed listing, no matches): the background menu, parented
+/// to the always-visible content box -- the listbox is hidden then, so
+/// its gesture never fires and a popover on it would not map. Without
+/// this an empty directory had no context menu at all, so nothing
+/// could be pasted into it.
+pub fn onAreaRightClick(_: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    _ = n_press;
+    const tab: *BTab = @ptrCast(@alignCast(user.?));
+    if (c.gtk_widget_get_visible(tab.empty_box) == 0) return;
+    const parent = c.gtk_widget_get_parent(tab.empty_box) orelse return;
+    tab.view.showEntryMenu(tab, parent, x, y, null, null, false);
+}
+
 /// Right-clicking INSIDE a multi-selection must KEEP it: the menu's
 /// verbs (Copy, Move to Trash, Batch Rename, register marks) all act
 /// on the whole selection, and collapsing it here made the menu

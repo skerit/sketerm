@@ -47,41 +47,68 @@ pub const RestoreRead = struct {
 pub fn copyToClip(ctx: *MenuCtx, cut: bool) void {
     const self = ctx.view;
     const path = ctx.path orelse return menuDone(ctx);
-    self.clip_cut = cut;
-    if (self.clip_host) |s| self.allocator.free(s);
-    self.clip_host = null;
-    if (ctx.tab.hc.host) |h| self.clip_host = self.allocator.dupe(u8, h) catch null;
-    // The source directory's filesystem: what decides later whether a
-    // hard link into another directory could work at all.
-    self.clip_dev = ctx.tab.root.dev;
-    if (self.clip_path) |s| self.allocator.free(s);
-    self.clip_path = null;
-    for (self.clip_paths.items) |p| self.allocator.free(p);
-    self.clip_paths.clearRetainingCapacity();
     // A multi-selection that includes the clicked row copies the
     // whole selection; otherwise just the clicked entry.
     const in_selection = for (ctx.tab.selected.items) |sp| {
         if (std.mem.eql(u8, sp, path)) break true;
     } else false;
     if (in_selection and ctx.tab.selected.items.len > 1) {
-        for (ctx.tab.selected.items) |sp| {
-            const owned = self.allocator.dupe(u8, sp) catch continue;
-            self.clip_paths.append(self.allocator, owned) catch self.allocator.free(owned);
-        }
+        clipStore(self, ctx.tab, ctx.tab.selected.items, cut);
     } else {
-        if (self.allocator.dupe(u8, path)) |owned| {
-            self.clip_paths.append(self.allocator, owned) catch self.allocator.free(owned);
-        } else |_| {}
+        clipStore(self, ctx.tab, (&[_][]u8{path})[0..], cut);
+    }
+    menuDone(ctx);
+}
+
+/// Chord-driven cut/copy (Ctrl+X / Ctrl+C): the tab's selection, no
+/// menu context and no clicked row.
+pub fn clipSelection(self: *BrowserView, cut: bool) void {
+    const tab = self.currentTab() orelse return;
+    if (tab.selected.items.len == 0) {
+        self.setStatus("nothing selected");
+        return;
+    }
+    clipStore(self, tab, tab.selected.items, cut);
+}
+
+fn clipStore(self: *BrowserView, tab: *BTab, srcs: []const []u8, cut: bool) void {
+    self.clip_cut = cut;
+    if (self.clip_host) |s| self.allocator.free(s);
+    self.clip_host = null;
+    if (tab.hc.host) |h| self.clip_host = self.allocator.dupe(u8, h) catch null;
+    // The source directory's filesystem: what decides later whether a
+    // hard link into another directory could work at all.
+    self.clip_dev = tab.root.dev;
+    if (self.clip_path) |s| self.allocator.free(s);
+    self.clip_path = null;
+    for (self.clip_paths.items) |p| self.allocator.free(p);
+    self.clip_paths.clearRetainingCapacity();
+    for (srcs) |sp| {
+        const owned = self.allocator.dupe(u8, sp) catch continue;
+        self.clip_paths.append(self.allocator, owned) catch self.allocator.free(owned);
     }
     if (self.clip_paths.items.len > 0)
         self.clip_path = self.allocator.dupe(u8, self.clip_paths.items[0]) catch null;
     const verb: []const u8 = if (cut) "cut" else "copied";
     if (self.clip_paths.items.len > 1) {
         self.setStatusFmt("{s} {d} items", .{ verb, self.clip_paths.items.len });
-    } else {
-        self.setStatusFmt("{s}: {s}", .{ verb, path });
+    } else if (self.clip_paths.items.len == 1) {
+        self.setStatusFmt("{s}: {s}", .{ verb, self.clip_paths.items[0] });
     }
-    menuDone(ctx);
+}
+
+/// Chord-driven paste (Ctrl+V): the clipboard into the current tab.
+pub fn pasteIntoCurrent(self: *BrowserView) void {
+    const tab = self.currentTab() orelse return;
+    if (self.clip_paths.items.len == 0 and self.clip_path == null) {
+        self.setStatus("clipboard is empty");
+        return;
+    }
+    const srcs: []const []u8 = if (self.clip_paths.items.len > 0)
+        self.clip_paths.items
+    else
+        (&[_][]u8{self.clip_path.?})[0..];
+    self.beginPaste(tab, self.clip_host, srcs, self.clip_cut, true);
 }
 
 /// Is `tab` still one of this view's tabs? Anything that parks work

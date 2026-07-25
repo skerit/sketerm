@@ -735,7 +735,29 @@ pub const BrowserView = struct {
     /// including into another pane, is left alone.
     pub fn refocusListingIfLost(self: *BrowserView) void {
         const root = c.gtk_widget_get_root(self.root_box) orelse return;
-        if (c.gtk_root_get_focus(root) != null) return;
+        if (c.gtk_root_get_focus(root)) |focused| {
+            // Focus on a widget that is not actually visible is LOST
+            // focus, not focus that moved: hiding the scroller (the
+            // empty/failed placeholder states) leaves the clicked row
+            // as the window's focus widget while no key can ever reach
+            // it -- every chord went dead there.
+            if (c.gtk_widget_is_visible(focused) != 0) return;
+        }
+        self.focusListing();
+    }
+
+    /// After a NAVIGATION, focus belongs inside the face. Destroying
+    /// the clicked row makes GTK move focus to some visible widget
+    /// OUTSIDE the browser (the window tab bar), where the lost-focus
+    /// guard above cannot tell it from focus the user moved -- and
+    /// every chord went dead after entering a folder. Navigation is
+    /// always browser-initiated, so pulling focus back is correct.
+    pub fn refocusListingAfterNav(self: *BrowserView) void {
+        const root = c.gtk_widget_get_root(self.root_box) orelse return;
+        if (c.gtk_root_get_focus(root)) |focused| {
+            if (c.gtk_widget_is_visible(focused) != 0 and
+                c.gtk_widget_is_ancestor(focused, self.root_box) != 0) return;
+        }
         self.focusListing();
     }
 
