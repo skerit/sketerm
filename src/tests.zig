@@ -77,6 +77,8 @@ comptime {
     _ = @import("ui/browser/gitstat.zig");
     _ = @import("ui/browser/views.zig");
     _ = @import("ui/browser/selection.zig");
+    _ = @import("ui/browser/conflict.zig");
+    _ = @import("ui/browser/templates.zig");
     _ = @import("a11y/view.zig");
     _ = @import("a11y/nsax.zig");
     _ = @import("ipc/protocol.zig");

@@ -414,6 +414,10 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
 
     // A breadcrumb segment's sibling listing?
     if (self.feedSiblings(hc, rep)) return false;
+    // A parked paste collision waiting on its two stat replies?
+    if (self.feedConflicts(hc, rep)) return false;
+    // A "New from Template" listing?
+    if (self.feedTemplates(hc, rep)) return false;
 
     // Listing chunk run?
     for (self.pending.items, 0..) |p, i| {
@@ -424,6 +428,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             self.dropPending(i);
             return true;
         }
+        if (rep.dev != 0) p.dir.dev = rep.dev;
         for (rep.entries) |we| {
             if (p.dir.own(we)) |e| p.staged.append(self.allocator, e) catch {};
         }

@@ -542,10 +542,15 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
     const row = for (self.jobs.items) |j| {
         if (j.hc == hc and j.job == e.job) break j;
     } else return;
+    // Detail the daemon repeats on every event kind, so it is folded
+    // in before the per-event branches rather than in each of them.
+    if (e.file.len > 0) row.setCurrentFile(e.file);
+    if (e.resumed_from > 0) row.resumed_from = e.resumed_from;
+    if (e.files_done > row.files_done) row.files_done = e.files_done;
+    if (e.files_total > row.files_total) row.files_total = e.files_total;
     if (std.mem.eql(u8, e.ev, "progress")) {
         row.done = e.done;
         row.total = e.total;
-        if (e.resumed_from > 0) row.resumed_from = e.resumed_from;
         if (row.state == .running) self.setStatusFmt("{s}: {d} / {d} MB", .{
             row.label, e.done >> 20, e.total >> 20,
         });
@@ -557,7 +562,6 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
         row.state = .finished;
         row.done = e.done;
         row.total = e.total;
-        if (e.resumed_from > 0) row.resumed_from = e.resumed_from;
         self.setStatusFmt("done: {s}", .{row.label});
         if (row.undo_op) |u| {
             row.undo_op = null;
@@ -622,8 +626,16 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
     self.renderJobs();
 }
 
+/// Copy-collision policy forwarded to the daemon's copy verb.
+/// `dir_mode` decides what happens to a destination DIRECTORY of the
+/// same name; `conflict` decides it per entry inside the tree.
+pub const CopyMode = struct {
+    conflict: []const u8 = "",
+    dir_mode: []const u8 = "",
+};
+
 /// startDaemonJob variant that records an undo op on completion.
-pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, label: []const u8, undo: ?*UndoOp) void {
+pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []const u8, path: []const u8, to: []const u8, label: []const u8, undo: ?*UndoOp, mode: CopyMode) void {
     if (hc.state != .ready) {
         self.setStatusFmt("not connected to {s}", .{hc.label()});
         if (undo) |u| u.destroy(self.allocator);
@@ -651,7 +663,15 @@ pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []cons
         if (undo) |u| u.destroy(self.allocator);
         return;
     };
-    self.sendOp(hc, .{ .req = req, .op = op, .path = path, .to = to, .@"resume" = false });
+    self.sendOp(hc, .{
+        .req = req,
+        .op = op,
+        .path = path,
+        .to = to,
+        .@"resume" = false,
+        .conflict = mode.conflict,
+        .dir_mode = mode.dir_mode,
+    });
 }
 
 pub fn startHistoryJob(self: *BrowserView, hc: *HostConn, op_name: []const u8, path: []const u8, to: []const u8, pattern: []const u8, label: []const u8, op: *UndoOp, direction: HistoryDirection) void {

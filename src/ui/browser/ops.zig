@@ -18,6 +18,7 @@ const UndoOp = @import("types.zig").UndoOp;
 const WireJobEv = @import("types.zig").WireJobEv;
 const WireReply = @import("types.zig").WireReply;
 const appendQuoted = @import("../../filebrowser/desktop.zig").appendQuoted;
+const conflict = @import("conflict.zig");
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const menuDone = @import("menu.zig").menuDone;
@@ -50,6 +51,9 @@ pub fn copyToClip(ctx: *MenuCtx, cut: bool) void {
     if (self.clip_host) |s| self.allocator.free(s);
     self.clip_host = null;
     if (ctx.tab.hc.host) |h| self.clip_host = self.allocator.dupe(u8, h) catch null;
+    // The source directory's filesystem: what decides later whether a
+    // hard link into another directory could work at all.
+    self.clip_dev = ctx.tab.root.dev;
     if (self.clip_path) |s| self.allocator.free(s);
     self.clip_path = null;
     for (self.clip_paths.items) |p| self.allocator.free(p);
@@ -80,127 +84,15 @@ pub fn copyToClip(ctx: *MenuCtx, cut: bool) void {
     menuDone(ctx);
 }
 
-/// Heap context for one pending paste batch, owned by its
-/// conflict popover (freed when the popover dies).
-pub const PasteCtx = struct {
-    allocator: std.mem.Allocator,
-    view: *BrowserView,
-    tab: *BTab,
-    sources: std.ArrayList([]u8) = .empty,
-    conflicts: usize = 0,
-    popover: *c.GtkWidget,
-    /// Source host and whether this is a move; carried explicitly
-    /// so a dual-pane send is not tied to the clipboard.
-    src_host: ?[]u8 = null,
-    cut: bool = false,
-    clear_clipboard: bool = false,
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        const p: *PasteCtx = @ptrCast(@alignCast(user.?));
-        for (p.sources.items) |s| p.allocator.free(s);
-        p.sources.deinit(p.allocator);
-        if (p.src_host) |h| p.allocator.free(h);
-        p.allocator.destroy(p);
+/// Is `tab` still one of this view's tabs? Anything that parks work
+/// against a tab and acts on it LATER (the conflict queue, the
+/// template menu) must ask, because the user can close the tab in
+/// between and the pointer would be stale.
+pub fn tabAlive(self: *BrowserView, tab: *BTab) bool {
+    for (self.tabs.items) |t| {
+        if (t == tab) return true;
     }
-};
-
-pub const ConflictChoice = enum { overwrite, keep_both, skip };
-
-/// Copy/move `sources` (living on `src_host`) into `tab`'s
-/// directory, asking about name collisions first. The clipboard is
-/// only consulted by the caller, so a dual-pane send uses the same
-/// path as Paste Here.
-pub fn beginPaste(
-    self: *BrowserView,
-    tab: *BTab,
-    src_host: ?[]const u8,
-    srcs: []const []u8,
-    cut: bool,
-    clear_clipboard: bool,
-) void {
-    // Count collisions against the LIVE target listing.
-    var conflicts: usize = 0;
-    for (srcs) |src| {
-        if (tab.root.find(std.fs.path.basename(src)) != null) conflicts += 1;
-    }
-    if (conflicts == 0) {
-        self.pasteExecute(tab, srcs, .overwrite, src_host, cut, clear_clipboard);
-        return;
-    }
-
-    // Conflict dialog: one choice applies to every conflicting
-    // item; non-conflicting items copy either way.
-    const popover = c.gtk_popover_new();
-    const pctx = self.allocator.create(PasteCtx) catch return;
-    pctx.* = .{
-        .allocator = self.allocator,
-        .view = self,
-        .tab = tab,
-        .popover = popover,
-        .conflicts = conflicts,
-        .src_host = if (src_host) |h| (self.allocator.dupe(u8, h) catch null) else null,
-        .cut = cut,
-        .clear_clipboard = clear_clipboard,
-    };
-    for (srcs) |src| {
-        const owned = self.allocator.dupe(u8, src) catch continue;
-        pctx.sources.append(self.allocator, owned) catch self.allocator.free(owned);
-    }
-    c.g_object_set_data_full(@ptrCast(popover), "sketerm-paste", @ptrCast(pctx), @ptrCast(&PasteCtx.free));
-
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
-    c.gtk_widget_set_margin_start(box, 10);
-    c.gtk_widget_set_margin_end(box, 10);
-    c.gtk_widget_set_margin_top(box, 10);
-    c.gtk_widget_set_margin_bottom(box, 10);
-    var lbl: [256:0]u8 = undefined;
-    const first = std.fs.path.basename(srcs[0]);
-    const txt = if (conflicts == 1)
-        std.fmt.bufPrintZ(&lbl, "\"{s}\" already exists here.", .{first}) catch "Name conflict."
-    else
-        std.fmt.bufPrintZ(&lbl, "{d} of {d} items already exist here.", .{ conflicts, srcs.len }) catch "Name conflicts.";
-    const label = c.gtk_label_new(txt.ptr);
-    c.gtk_label_set_xalign(@ptrCast(label), 0);
-    c.gtk_box_append(@ptrCast(box), label);
-    if (conflicts > 1) {
-        const sub = c.gtk_label_new("The choice applies to all conflicting items.");
-        c.gtk_widget_add_css_class(sub, "dim-label");
-        c.gtk_label_set_xalign(@ptrCast(sub), 0);
-        c.gtk_box_append(@ptrCast(box), sub);
-    }
-    pasteChoiceButton(box, "Keep Both (rename copy)", &onPasteKeepBoth, pctx, false);
-    pasteChoiceButton(box, "Skip Existing", &onPasteSkip, pctx, false);
-    pasteChoiceButton(box, "Overwrite", &onPasteOverwrite, pctx, true);
-
-    c.gtk_popover_set_child(@ptrCast(popover), box);
-    c.gtk_widget_set_parent(popover, tab.page);
-    connectPopoverAutoUnparent(popover);
-    c.gtk_popover_popup(@ptrCast(popover));
-}
-
-pub fn pasteChoiceButton(box: *c.GtkWidget, label: [*:0]const u8, cb: anytype, pctx: *PasteCtx, destructive: bool) void {
-    const btn = c.gtk_button_new_with_label(label);
-    if (destructive) c.gtk_widget_add_css_class(btn, "destructive-action");
-    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(cb), @ptrCast(pctx), null, c.G_CONNECT_DEFAULT);
-    c.gtk_box_append(@ptrCast(box), btn);
-}
-
-pub fn onPasteOverwrite(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const p: *PasteCtx = @ptrCast(@alignCast(user.?));
-    p.view.pasteExecute(p.tab, p.sources.items, .overwrite, p.src_host, p.cut, p.clear_clipboard);
-    c.gtk_popover_popdown(@ptrCast(p.popover));
-}
-
-pub fn onPasteKeepBoth(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const p: *PasteCtx = @ptrCast(@alignCast(user.?));
-    p.view.pasteExecute(p.tab, p.sources.items, .keep_both, p.src_host, p.cut, p.clear_clipboard);
-    c.gtk_popover_popdown(@ptrCast(p.popover));
-}
-
-pub fn onPasteSkip(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const p: *PasteCtx = @ptrCast(@alignCast(user.?));
-    p.view.pasteExecute(p.tab, p.sources.items, .skip, p.src_host, p.cut, p.clear_clipboard);
-    c.gtk_popover_popdown(@ptrCast(p.popover));
+    return false;
 }
 
 /// Pick a destination name that does not collide with the live
@@ -215,71 +107,162 @@ pub fn uniqueDstName(tab: *BTab, base: []const u8, buf: []u8) ?[]const u8 {
     return uniqueName(base, buf, Listing{ .tab = tab });
 }
 
-/// Start one copy (or move, when the clipboard is CUT) per
-/// source, honoring `choice` for names that already exist in the
-/// target directory.
-pub fn pasteExecute(
+/// Per-item paste modifiers. `dir_mode` reaches the daemon copy verb
+/// verbatim; `undoable` is false for merge and replace, which cannot
+/// be reversed by deleting what was created (a merge leaves the
+/// destination's own files in place, a replace destroyed them).
+pub const PasteOpts = struct {
+    dir_mode: []const u8 = "",
+    undoable: bool = true,
+};
+
+/// Copy/move `sources` (living on `src_host`) into `tab`'s directory.
+/// Names that are free start IMMEDIATELY; names that collide are
+/// parked in conflict.zig's queue and decided while the rest of the
+/// batch is already copying. The clipboard is only consulted by the
+/// caller, so a dual-pane send uses the same path as Paste Here.
+pub fn beginPaste(
     self: *BrowserView,
     tab: *BTab,
-    sources: []const []u8,
-    choice: ConflictChoice,
     src_host: ?[]const u8,
+    srcs: []const []u8,
     cut: bool,
     clear_clipboard: bool,
 ) void {
+    const src_hc = self.hostConnFor(src_host) orelse return;
     const dir = tab.root.path;
-    var skipped: usize = 0;
-    for (sources) |src| {
+    var started: usize = 0;
+    var conflicts: usize = 0;
+    for (srcs) |src| {
         const base = std.fs.path.basename(src);
-        var name_buf: [512]u8 = undefined;
-        var name: []const u8 = base;
-        if (tab.root.find(base) != null) {
-            switch (choice) {
-                .overwrite => {},
-                .keep_both => name = uniqueDstName(tab, base, &name_buf) orelse {
-                    skipped += 1;
-                    continue;
-                },
-                .skip => {
-                    skipped += 1;
-                    continue;
-                },
-            }
-        }
         var dst_buf: [4096]u8 = undefined;
         const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
-            if (dir.len == 1) "" else dir, name,
+            if (dir.len == 1) "" else dir, base,
         }) catch continue;
         // Pasting onto itself is a no-op, not a copy/move.
-        if (hostEq(src_host, tab.hc.host) and std.mem.eql(u8, src, dst)) {
-            skipped += 1;
+        if (hostEq(src_host, tab.hc.host) and std.mem.eql(u8, src, dst)) continue;
+        if (tab.root.find(base)) |i| {
+            conflict.enqueue(self, tab, src_hc, src_host, src, dst, tab.root.entries.items[i].tdir, cut);
+            conflicts += 1;
             continue;
         }
-        if (hostEq(src_host, tab.hc.host)) {
-            if (cut) {
-                // Same-host move = one rename, undoable.
-                const req = self.nextReq();
-                self.deferUndo(req, self.makeUndo(tab.hc.host, .rename_back, dst, src, ""));
-                self.sendOp(tab.hc, .{ .req = req, .op = "rename", .path = src, .to = dst });
-            } else {
-                var lbl: [128]u8 = undefined;
-                const label = std.fmt.bufPrint(&lbl, "copy {s}", .{base}) catch base;
-                self.startDaemonJobUndo(tab.hc, "copy", src, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, src, ""));
-            }
-        } else {
-            const src_hc = self.hostConnFor(src_host) orelse continue;
-            self.startTransfer(src_hc, src, tab.hc, dst, .{ .delete_src_after = cut });
-        }
+        pasteOne(self, tab, src_host, src, dst, cut, .{});
+        started += 1;
     }
-    if (skipped > 0) self.setStatusFmt("skipped {d} existing item(s)", .{skipped});
+    if (conflicts > 0) {
+        self.setStatusFmt("{d} item(s) started; {d} name conflict(s) waiting for a decision", .{ started, conflicts });
+    } else if (started == 0) {
+        self.setStatus("nothing to paste here");
+    }
     if (cut and clear_clipboard) {
-        // Cut is one-shot: the sources are moving away.
+        // Cut is one-shot: the sources are moving away. Parked
+        // conflicts own their own copy of the paths.
         if (self.clip_path) |s| self.allocator.free(s);
         self.clip_path = null;
         for (self.clip_paths.items) |p| self.allocator.free(p);
         self.clip_paths.clearRetainingCapacity();
         self.clip_cut = false;
     }
+}
+
+/// Start ONE source's copy (or move) to an exact destination path.
+/// Every paste path funnels through here, so same-host vs cross-host
+/// and the undo bookkeeping are decided in one place.
+pub fn pasteOne(
+    self: *BrowserView,
+    tab: *BTab,
+    src_host: ?[]const u8,
+    src: []const u8,
+    dst: []const u8,
+    cut: bool,
+    opts: PasteOpts,
+) void {
+    const base = std.fs.path.basename(src);
+    if (hostEq(src_host, tab.hc.host)) {
+        if (cut) {
+            // Same-host move = one rename, undoable.
+            const req = self.nextReq();
+            self.deferUndo(req, self.makeUndo(tab.hc.host, .rename_back, dst, src, ""));
+            self.sendOp(tab.hc, .{ .req = req, .op = "rename", .path = src, .to = dst });
+            return;
+        }
+        var lbl: [128]u8 = undefined;
+        const label = std.fmt.bufPrint(&lbl, "copy {s}", .{base}) catch base;
+        const undo = if (opts.undoable)
+            self.makeUndo(tab.hc.host, .delete_created, dst, src, "")
+        else
+            null;
+        self.startDaemonJobUndo(tab.hc, "copy", src, dst, label, undo, .{ .dir_mode = opts.dir_mode });
+        return;
+    }
+    const src_hc = self.hostConnFor(src_host) orelse return;
+    self.startTransfer(src_hc, src, tab.hc, dst, .{ .delete_src_after = cut });
+}
+
+/// Copy an entry beside itself under a free name ("x" -> "x-copy").
+/// Undoable like any other copy: the created path is what undo drops.
+pub fn duplicateEntry(self: *BrowserView, tab: *BTab, path: []const u8) void {
+    const base = std.fs.path.basename(path);
+    var name_buf: [512]u8 = undefined;
+    const unique = uniqueDstName(tab, base, &name_buf) orelse {
+        self.setStatusFmt("no free name beside {s}", .{base});
+        return;
+    };
+    const dir = std.fs.path.dirname(path) orelse "/";
+    var dst_buf: [4096]u8 = undefined;
+    const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
+        if (dir.len == 1) "" else dir, unique,
+    }) catch return;
+    var lbl: [128]u8 = undefined;
+    const label = std.fmt.bufPrint(&lbl, "duplicate {s}", .{base}) catch "duplicate";
+    self.startDaemonJobUndo(tab.hc, "copy", path, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, path, ""), .{});
+    self.setStatusFmt("duplicating {s} -> {s}", .{ base, unique });
+}
+
+/// Create a link to `target` in `tab`'s directory. Both kinds go
+/// through one path: only the wire verb and the undo payload differ.
+pub fn linkHere(self: *BrowserView, tab: *BTab, target: []const u8, hard: bool) void {
+    const base = std.fs.path.basename(target);
+    var name_buf: [512]u8 = undefined;
+    // A link beside its own target needs a free name; a link in
+    // another directory keeps the original one.
+    const dir = tab.root.path;
+    var name: []const u8 = base;
+    if (tab.root.find(base) != null) {
+        name = uniqueDstName(tab, base, &name_buf) orelse {
+            self.setStatusFmt("no free name for a link to {s}", .{base});
+            return;
+        };
+    }
+    var link_buf: [4096]u8 = undefined;
+    const link = std.fmt.bufPrint(&link_buf, "{s}/{s}", .{
+        if (dir.len == 1) "" else dir, name,
+    }) catch return;
+    const req = self.nextReq();
+    self.deferUndo(req, self.makeUndo(
+        tab.hc.host,
+        .link_created,
+        link,
+        target,
+        if (hard) "hardlink" else "symlink",
+    ));
+    self.sendOp(tab.hc, .{
+        .req = req,
+        .op = if (hard) "hardlink" else "symlink",
+        .path = link,
+        .to = target,
+    });
+    self.setStatusFmt("{s} link: {s} -> {s}", .{ if (hard) "hard" else "symbolic", name, target });
+}
+
+/// Can a hard link from `tab`'s directory to the clipboard source
+/// possibly work? Same host and same filesystem, decided from the
+/// device id the daemon ships with each listing -- the verb is only
+/// offered where it can succeed, never offered and then failed.
+pub fn hardlinkPossible(self: *BrowserView, tab: *BTab) bool {
+    if (self.clip_path == null) return false;
+    if (!hostEq(if (self.clip_host) |h| @as(?[]const u8, h) else null, tab.hc.host)) return false;
+    return self.clip_dev != 0 and self.clip_dev == tab.root.dev;
 }
 
 pub fn findEntryTags(tab: *BTab, path: []const u8) []const u8 {
@@ -956,6 +939,17 @@ pub fn beginHistory(self: *BrowserView, direction: HistoryDirection) void {
             const req = self.nextReq();
             if (!self.deferHistory(req, hc, op, direction)) return;
             self.sendOp(hc, .{ .req = req, .op = if (direction == .undo) "delete" else "mkdir", .path = op.a });
+        },
+        .link_created => {
+            // Undo unlinks the link (never its target); redo recreates
+            // it with the verb recorded in `p`.
+            const req = self.nextReq();
+            if (!self.deferHistory(req, hc, op, direction)) return;
+            if (direction == .undo) {
+                self.sendOp(hc, .{ .req = req, .op = "delete", .path = op.a });
+            } else {
+                self.sendOp(hc, .{ .req = req, .op = op.p, .path = op.a, .to = op.b });
+            }
         },
     }
 }

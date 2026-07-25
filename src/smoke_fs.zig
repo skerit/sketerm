@@ -377,9 +377,26 @@ const JobOutcome = struct {
     hash: [64]u8 = undefined,
     has_hash: bool = false,
     progress_events: usize = 0,
+    /// Distinct in-flight paths named by progress lines, and whether
+    /// the byte counter ever moved BACKWARDS (a tree copy used to
+    /// restart `done` at zero on every file).
+    files_named: usize = 0,
+    last_file: [512]u8 = undefined,
+    last_file_len: usize = 0,
+    regressed: bool = false,
+    max_done: u64 = 0,
+    /// Highest entry counters any event carried.
+    files_done: u64 = 0,
+    files_total: u64 = 0,
+    /// Was `resumed_from` ever non-zero on a RUNNING (progress) line?
+    resumed_while_running: bool = false,
 
     fn is(self: *const JobOutcome, ev: []const u8) bool {
         return std.mem.eql(u8, self.ev[0..self.ev_len], ev);
+    }
+
+    fn namedFile(self: *const JobOutcome) []const u8 {
+        return self.last_file[0..self.last_file_len];
     }
 };
 
@@ -391,8 +408,18 @@ fn collectJob(fs: *fsdrive.Fs, job: u64, timeout_ms: i64) JobOutcome {
             var e = e0;
             defer e.deinit();
             if (e.job != job) continue;
+            if (e.files_done > out.files_done) out.files_done = e.files_done;
+            if (e.files_total > out.files_total) out.files_total = e.files_total;
             if (std.mem.eql(u8, e.ev, "progress")) {
                 out.progress_events += 1;
+                if (e.done < out.max_done) out.regressed = true;
+                if (e.done > out.max_done) out.max_done = e.done;
+                if (e.resumed_from > 0) out.resumed_while_running = true;
+                if (e.file.len > 0 and !std.mem.eql(u8, e.file, out.namedFile())) {
+                    out.files_named += 1;
+                    out.last_file_len = @min(e.file.len, out.last_file.len);
+                    @memcpy(out.last_file[0..out.last_file_len], e.file[0..out.last_file_len]);
+                }
                 continue;
             }
             if (e.terminal()) {
@@ -793,6 +820,257 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
     }
 
     std.debug.print("smoke-fs: {s} job stage ok\n", .{tag});
+}
+
+// ── copy policy, link verbs and progress detail ─────────────────
+
+fn readSmall(path: []const u8, buf: []u8) []const u8 {
+    var z: [4096]u8 = undefined;
+    const p = pathz.pathZ(&z, path) catch fail("read path");
+    const f = c.fopen(p, "rb") orelse return "";
+    defer _ = c.fclose(f);
+    return buf[0..c.fread(buf.ptr, 1, buf.len, f)];
+}
+
+fn exists(path: []const u8) bool {
+    var z: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    return c.lstat(pathz.pathZ(&z, path) catch return false, &st) == 0;
+}
+
+fn inodeOf(path: []const u8) u64 {
+    var z: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    if (c.lstat(pathz.pathZ(&z, path) catch fail("inode path"), &st) != 0) fail("inode stat");
+    return @intCast(st.st_ino);
+}
+
+fn mkdirAt(path: []const u8) void {
+    var z: [4096]u8 = undefined;
+    _ = c.mkdir(pathz.pathZ(&z, path) catch fail("mkdir path"), 0o755);
+}
+
+fn expectText(path: []const u8, want: []const u8, comptime what: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const got = readSmall(path, &buf);
+    if (!std.mem.eql(u8, got, want)) {
+        std.debug.print("smoke-fs: {s}: {s} = \"{s}\", expected \"{s}\"\n", .{ what, path, got, want });
+        fail(what);
+    }
+}
+
+/// Build `<root>/tree` (source) and `<root>/dest/tree` (a destination
+/// that already holds a colliding file plus one of its own).
+fn seedMergeCase(root: []const u8, pb: *[6][4096]u8) void {
+    const src = std.fmt.bufPrint(&pb[0], "{s}/tree", .{root}) catch unreachable;
+    const dest_parent = std.fmt.bufPrint(&pb[1], "{s}/dest", .{root}) catch unreachable;
+    const dst = std.fmt.bufPrint(&pb[2], "{s}/dest/tree", .{root}) catch unreachable;
+    var scratch: [4096]u8 = undefined;
+    mkdirAt(src);
+    mkdirAt(std.fmt.bufPrint(&scratch, "{s}/sub", .{src}) catch unreachable);
+    touch(src, "shared.txt", "NEW");
+    var subdir: [4096]u8 = undefined;
+    const sub = std.fmt.bufPrint(&subdir, "{s}/sub", .{src}) catch unreachable;
+    touch(sub, "leaf.txt", "LEAF");
+    mkdirAt(dest_parent);
+    mkdirAt(dst);
+    touch(dst, "shared.txt", "OLD");
+    touch(dst, "only-here.txt", "KEEP");
+}
+
+/// Drop and rebuild the destination side of the merge case.
+fn resetMergeDest(fs: *fsdrive.Fs, root: []const u8) void {
+    var pb: [2][4096]u8 = undefined;
+    const dst = std.fmt.bufPrint(&pb[0], "{s}/dest/tree", .{root}) catch unreachable;
+    if (exists(dst)) {
+        const job = fs.startDeleteTree(dst) catch failErr("reset delete", fs.lastErr());
+        if (!collectJob(fs, job, 20_000).is("done")) fail("reset delete failed");
+    }
+    mkdirAt(dst);
+    touch(dst, "shared.txt", "OLD");
+    touch(dst, "only-here.txt", "KEEP");
+}
+
+fn policyStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []const u8) void {
+    var dbuf: [64]u8 = undefined;
+    const dir = mkTmpDir(&dbuf, tag ++ "-pol");
+    var fs = fsdrive.Fs.connect(allocator, sock_path) catch fail("policy fs connect");
+    defer fs.deinit();
+
+    var pb: [6][4096]u8 = undefined;
+    seedMergeCase(dir, &pb);
+    const src = std.fmt.bufPrint(&pb[0], "{s}/tree", .{dir}) catch unreachable;
+    const dst = std.fmt.bufPrint(&pb[1], "{s}/dest/tree", .{dir}) catch unreachable;
+    var scratch: [4][4096]u8 = undefined;
+    const dst_shared = std.fmt.bufPrint(&scratch[0], "{s}/shared.txt", .{dst}) catch unreachable;
+    const dst_only = std.fmt.bufPrint(&scratch[1], "{s}/only-here.txt", .{dst}) catch unreachable;
+    const dst_leaf = std.fmt.bufPrint(&scratch[2], "{s}/sub/leaf.txt", .{dst}) catch unreachable;
+    const dst_kept = std.fmt.bufPrint(&scratch[3], "{s}/shared.txt-copy", .{dst}) catch unreachable;
+
+    // ── merge (default): recurse, overwrite collisions, keep the
+    // destination's own entries ────────────────────────────────
+    {
+        const job = fs.startCopyMode(src, dst, .{}) catch failErr("merge copy", fs.lastErr());
+        const out = collectJob(&fs, job, 20_000);
+        if (!out.is("done")) fail("merge copy outcome");
+        expectText(dst_shared, "NEW", "merge did not overwrite the collision");
+        expectText(dst_only, "KEEP", "merge removed a destination-only file");
+        expectText(dst_leaf, "LEAF", "merge did not recurse");
+        // Two source files, both reported.
+        if (out.files_total != 2 or out.files_done != 2) {
+            std.debug.print("smoke-fs: merge files {d}/{d}\n", .{ out.files_done, out.files_total });
+            fail("merge entry counters");
+        }
+    }
+
+    // ── progress detail on a tree big enough to stream: distinct
+    // in-flight paths, and a byte counter that only ever grows
+    // (it used to restart at zero on every file) ────────────────
+    {
+        var bb: [2][4096]u8 = undefined;
+        const bsrc = std.fmt.bufPrint(&bb[0], "{s}/bigtree", .{dir}) catch unreachable;
+        const bdst = std.fmt.bufPrint(&bb[1], "{s}/bigtree.copy", .{dir}) catch unreachable;
+        mkdirAt(bsrc);
+        var fp: [4096]u8 = undefined;
+        writePattern(std.fmt.bufPrint(&fp, "{s}/one.bin", .{bsrc}) catch unreachable, 6 << 20, 9);
+        writePattern(std.fmt.bufPrint(&fp, "{s}/two.bin", .{bsrc}) catch unreachable, 6 << 20, 13);
+        const job = fs.startCopy(bsrc, bdst, false) catch failErr("bigtree copy", fs.lastErr());
+        const out = collectJob(&fs, job, 60_000);
+        if (!out.is("done")) fail("bigtree copy outcome");
+        if (out.files_named < 2) {
+            std.debug.print("smoke-fs: progress named {d} distinct files\n", .{out.files_named});
+            fail("tree copy never named a second file");
+        }
+        if (out.regressed) fail("tree copy progress went backwards");
+        if (out.files_done != 2 or out.files_total != 2) fail("bigtree entry counters");
+    }
+
+    // ── skip: the colliding file keeps its old content ─────────
+    resetMergeDest(&fs, dir);
+    {
+        const job = fs.startCopyMode(src, dst, .{ .conflict = "skip" }) catch failErr("skip copy", fs.lastErr());
+        if (!collectJob(&fs, job, 20_000).is("done")) fail("skip copy outcome");
+        expectText(dst_shared, "OLD", "skip overwrote the collision");
+        expectText(dst_leaf, "LEAF", "skip did not copy the non-colliding file");
+    }
+
+    // ── keep_both: both survive, the new one renamed ───────────
+    resetMergeDest(&fs, dir);
+    {
+        const job = fs.startCopyMode(src, dst, .{ .conflict = "keep_both" }) catch failErr("keep_both copy", fs.lastErr());
+        if (!collectJob(&fs, job, 20_000).is("done")) fail("keep_both copy outcome");
+        expectText(dst_shared, "OLD", "keep_both overwrote the collision");
+        expectText(dst_kept, "NEW", "keep_both did not write the renamed copy");
+    }
+
+    // ── replace: the destination tree is gone first, so entries
+    // that existed only there do NOT survive ───────────────────
+    resetMergeDest(&fs, dir);
+    {
+        const job = fs.startCopyMode(src, dst, .{ .dir_mode = "replace" }) catch failErr("replace copy", fs.lastErr());
+        if (!collectJob(&fs, job, 20_000).is("done")) fail("replace copy outcome");
+        expectText(dst_shared, "NEW", "replace did not write the source file");
+        if (exists(dst_only)) fail("replace kept a destination-only file");
+        expectText(dst_leaf, "LEAF", "replace did not recurse");
+    }
+
+    // ── delete_tree: pre-counted entries and named files ────────
+    {
+        var vb: [4096]u8 = undefined;
+        const victim = std.fmt.bufPrint(&vb, "{s}/victim", .{dir}) catch unreachable;
+        mkdirAt(victim);
+        var sb: [4096]u8 = undefined;
+        const vsub = std.fmt.bufPrint(&sb, "{s}/sub", .{victim}) catch unreachable;
+        mkdirAt(vsub);
+        touch(victim, "one.txt", "1");
+        touch(vsub, "two.txt", "2");
+        const job = fs.startDeleteTree(victim) catch failErr("delete progress", fs.lastErr());
+        const out = collectJob(&fs, job, 20_000);
+        if (!out.is("done")) fail("delete_tree outcome");
+        // 2 files + 2 directories.
+        if (out.files_done != 4) {
+            std.debug.print("smoke-fs: delete counted {d} entries\n", .{out.files_done});
+            fail("delete_tree entry count");
+        }
+        if (exists(victim)) fail("delete_tree left the tree");
+    }
+
+    // ── resume reports its offset while STILL RUNNING ──────────
+    {
+        var rb: [2][4096]u8 = undefined;
+        const big = std.fmt.bufPrint(&rb[0], "{s}/big.bin", .{dir}) catch unreachable;
+        const rdst = std.fmt.bufPrint(&rb[1], "{s}/big.resumed", .{dir}) catch unreachable;
+        writePattern(big, 6 << 20, 5);
+        var partb: [4096]u8 = undefined;
+        const part = std.fmt.bufPrint(&partb, "{s}.skpart", .{rdst}) catch unreachable;
+        {
+            var zs: [4096]u8 = undefined;
+            var zd: [4096]u8 = undefined;
+            const sf = c.fopen(pathz.pathZ(&zs, big) catch unreachable, "rb") orelse fail("resume src");
+            const df = c.fopen(pathz.pathZ(&zd, part) catch unreachable, "wb") orelse fail("resume part");
+            var buf: [65536]u8 = undefined;
+            var left: usize = 2 << 20;
+            while (left > 0) {
+                const n = c.fread(&buf, 1, @min(buf.len, left), sf);
+                if (n == 0) break;
+                _ = c.fwrite(&buf, 1, n, df);
+                left -= n;
+            }
+            _ = c.fclose(sf);
+            _ = c.fclose(df);
+        }
+        const job = fs.startCopy(big, rdst, true) catch failErr("resume copy", fs.lastErr());
+        const out = collectJob(&fs, job, 20_000);
+        if (!out.is("done")) fail("resume copy outcome");
+        if (out.resumed_from != (2 << 20)) fail("resume offset wrong");
+        if (!out.resumed_while_running) fail("resumed_from never appeared on a running progress line");
+        if (out.namedFile().len == 0) fail("single-file copy never named its file");
+    }
+
+    // ── hardlink: same inode, refused across kinds it cannot serve
+    {
+        var hb: [3][4096]u8 = undefined;
+        const target = std.fmt.bufPrint(&hb[0], "{s}/link-target.txt", .{dir}) catch unreachable;
+        const link = std.fmt.bufPrint(&hb[1], "{s}/dest/link-here.txt", .{dir}) catch unreachable;
+        const bad = std.fmt.bufPrint(&hb[2], "{s}/dest/dir-link", .{dir}) catch unreachable;
+        touch(dir, "link-target.txt", "shared bytes");
+        fs.hardlink(target, link) catch failErr("hardlink", fs.lastErr());
+        if (inodeOf(target) != inodeOf(link)) fail("hard link is not the same inode");
+        expectText(link, "shared bytes", "hard link content");
+        // A directory can never be hard linked: refused by name, not
+        // by a bare errno leaking through.
+        if (fs.hardlink(src, bad)) |_| {
+            fail("hard link of a directory succeeded");
+        } else |err| {
+            if (err != fsdrive.Error.FsOpFailed) fail("directory hardlink error kind");
+            if (std.mem.indexOf(u8, fs.lastErr(), "directory") == null)
+                failErr("directory hardlink message", fs.lastErr());
+        }
+    }
+
+    // ── listings carry the directory's device id (the hard-link
+    // pre-check the browser needs) ─────────────────────────────
+    {
+        var listing = fs.list(dir) catch failErr("dev listing", fs.lastErr());
+        defer listing.deinit();
+        if (listing.dev == 0) fail("listing carried no device id");
+        var dest_listing = fs.list(std.fmt.bufPrint(&scratch[0], "{s}/dest", .{dir}) catch unreachable) catch
+            failErr("dev listing 2", fs.lastErr());
+        defer dest_listing.deinit();
+        if (dest_listing.dev != listing.dev) fail("sibling directories reported different devices");
+    }
+
+    // ── the host resolves its own template directory ───────────
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const dirs = fs.hostDirs(arena.allocator()) catch failErr("hostDirs", fs.lastErr());
+        if (dirs.home.len == 0) fail("homedir reply had no home");
+        if (dirs.templates.len == 0) fail("homedir reply had no templates directory");
+        if (!std.mem.startsWith(u8, dirs.templates, "/")) fail("templates path not absolute");
+    }
+
+    std.debug.print("smoke-fs: {s} policy stage ok\n", .{tag});
 }
 
 // ── cross-daemon (client-mediated) transfer stage ──────────────
@@ -1263,6 +1541,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const th = std.Thread.spawn(.{}, daemonMain, .{d}) catch fail("thread spawn");
     fsStage(allocator, sock_path, "mono");
     jobStage(allocator, sock_path, "mono");
+    policyStage(allocator, sock_path, "mono");
     mediaStage(allocator, sock_path, "mono");
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
@@ -1303,6 +1582,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const bth = std.Thread.spawn(.{}, daemonMain, .{bd}) catch fail("broker thread");
     fsStage(allocator, bsock, "broker");
     jobStage(allocator, bsock, "broker");
+    policyStage(allocator, bsock, "broker");
     mediaStage(allocator, bsock, "broker");
     {
         var conn = client_mod.Conn.connect(allocator, bsock) catch fail("broker shutdown connect");
