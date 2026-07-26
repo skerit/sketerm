@@ -137,6 +137,9 @@ pub const HistoryCtx = struct {
 pub fn installLocationFace(self: *BrowserView, bar: *c.GtkWidget, entry: *c.GtkWidget) void {
     const holder = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
     c.gtk_widget_set_hexpand(holder, 1);
+    // The whole holder reads as ONE bordered control (a path bar),
+    // not as a row of loose flat buttons; see view.zig installCss.
+    c.gtk_widget_add_css_class(holder, "sketerm-fb-path");
 
     const sw = c.gtk_scrolled_window_new();
     // EXTERNAL keeps the content scrollable without a scrollbar
@@ -180,19 +183,28 @@ fn pinCrumbTail(user: ?*anyopaque) callconv(.c) c.gboolean {
     return 0;
 }
 
-/// Append the small dropdown arrow that belongs to a back/forward
-/// button; it lists the actual history entries of that side.
-pub fn appendHistoryArrow(self: *BrowserView, bar: *c.GtkWidget, side: HistorySide) void {
-    const btn = c.gtk_button_new_from_icon_name("pan-down-symbolic");
-    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-    c.gtk_widget_set_tooltip_text(btn, switch (side) {
-        .back => "Recent locations (jump several steps back)",
-        .forward => "Locations ahead (jump several steps forward)",
-    });
+/// Hang the history dropdown of one side off a RIGHT-CLICK on the
+/// back/forward button itself, the way Nemo does: the toolbar keeps
+/// two nav buttons instead of four, and the several-steps-at-once
+/// jump stays one gesture away.
+pub fn installHistoryMenuGesture(self: *BrowserView, btn: *c.GtkWidget, side: HistorySide) void {
     const ctx = self.allocator.create(HistoryCtx) catch return;
     ctx.* = .{ .allocator = self.allocator, .view = self, .side = side, .steps = 0 };
-    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onHistoryArrow), @ptrCast(ctx), @ptrCast(&HistoryCtx.freeClosure), c.G_CONNECT_DEFAULT);
-    c.gtk_box_append(@ptrCast(bar), btn);
+    const gesture = c.gtk_gesture_click_new();
+    c.gtk_gesture_single_set_button(@ptrCast(gesture), 3);
+    _ = c.g_signal_connect_data(gesture, "pressed", @ptrCast(&onHistoryGesture), @ptrCast(ctx), @ptrCast(&HistoryCtx.freeClosure), c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(btn, @ptrCast(gesture));
+    c.gtk_widget_set_tooltip_text(btn, switch (side) {
+        .back => "Back (Alt+Left). Right-click for recent locations.",
+        .forward => "Forward (Alt+Right). Right-click for locations ahead.",
+    });
+}
+
+fn onHistoryGesture(gesture: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *HistoryCtx = @ptrCast(@alignCast(user.?));
+    const widget = c.gtk_event_controller_get_widget(@ptrCast(gesture)) orelse return;
+    _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
+    ctx.view.showHistoryMenu(widget, ctx.side);
 }
 
 /// Rebuild the breadcrumb for `tab`'s current location. Called from
@@ -473,11 +485,6 @@ pub fn showCrumbFace(self: *BrowserView) bool {
 }
 
 // -- history dropdowns and side buttons --------------------------
-
-pub fn onHistoryArrow(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx: *HistoryCtx = @ptrCast(@alignCast(user.?));
-    ctx.view.showHistoryMenu(@ptrCast(@alignCast(btn)), ctx.side);
-}
 
 /// Pop the actual history entries of one side, newest first, so a
 /// user can jump several steps at once.

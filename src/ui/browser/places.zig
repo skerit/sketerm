@@ -37,15 +37,122 @@ pub fn onPlacesToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) 
     if (self.places_on) self.renderPlaces();
 }
 
+/// True when the user folded `name` shut. Unknown sections are open,
+/// so a places.json written before this existed reads as all-expanded.
+pub fn sectionCollapsed(self: *BrowserView, name: []const u8) bool {
+    for (self.collapsed.items) |s| {
+        if (std.mem.eql(u8, s, name)) return true;
+    }
+    return false;
+}
+
+/// Fold a section open or shut and persist it. The caller re-renders:
+/// the whole list is rebuilt on every change anyway, so collapsing is
+/// "leave the member rows out this time" rather than widget surgery.
+fn toggleSection(self: *BrowserView, name: []const u8) void {
+    for (self.collapsed.items, 0..) |s, i| {
+        if (!std.mem.eql(u8, s, name)) continue;
+        self.allocator.free(s);
+        _ = self.collapsed.orderedRemove(i);
+        return;
+    }
+    const owned = self.allocator.dupe(u8, name) catch return;
+    self.collapsed.append(self.allocator, owned) catch self.allocator.free(owned);
+}
+
+/// A section header row. It is activatable -- but as a fold control,
+/// not as a place: its ctx spec is "section:<text>", which
+/// onPlaceActivated routes to the fold before any navigation.
 pub fn placeHeader(self: *BrowserView, text: [*:0]const u8) void {
+    const name = std.mem.span(text);
+    const folded = sectionCollapsed(self, name);
+    const hbox = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+    c.gtk_widget_add_css_class(hbox, "sketerm-fb-section");
+    c.gtk_widget_set_margin_top(hbox, 8);
+    c.gtk_widget_set_margin_start(hbox, 4);
+    const arrow = c.gtk_image_new_from_icon_name(if (folded) "pan-end-symbolic" else "pan-down-symbolic");
+    c.gtk_box_append(@ptrCast(hbox), arrow);
     const lab = c.gtk_label_new(text);
     c.gtk_label_set_xalign(@ptrCast(lab), 0);
     c.gtk_widget_add_css_class(lab, "dim-label");
-    c.gtk_widget_set_margin_top(lab, 8);
-    c.gtk_widget_set_margin_start(lab, 6);
+    c.gtk_widget_set_hexpand(lab, 1);
+    c.gtk_box_append(@ptrCast(hbox), lab);
+
+    const ctx = self.allocator.create(PlaceCtx) catch return;
+    var spec_buf: [128]u8 = undefined;
+    const spec = std.fmt.bufPrint(&spec_buf, "section:{s}", .{name}) catch {
+        self.allocator.destroy(ctx);
+        return;
+    };
+    ctx.* = .{
+        .allocator = self.allocator,
+        .view = self,
+        .spec = self.allocator.dupe(u8, spec) catch {
+            self.allocator.destroy(ctx);
+            return;
+        },
+        .is_bookmark = false,
+    };
     const row = c.gtk_list_box_row_new();
-    c.gtk_list_box_row_set_activatable(@ptrCast(row), 0);
-    c.gtk_list_box_row_set_child(@ptrCast(row), lab);
+    c.gtk_list_box_row_set_child(@ptrCast(row), hbox);
+    c.gtk_widget_set_tooltip_text(@ptrCast(row), if (folded) "Show this section" else "Hide this section");
+    c.g_object_set_data_full(@ptrCast(row), "sketerm-place", @ptrCast(ctx), @ptrCast(&PlaceCtx.free));
+    c.gtk_list_box_append(self.places_list, row);
+}
+
+/// A recent-location row. The label is not the raw spec: the folder
+/// name reads plainly and the path leading to it is dimmed, so a
+/// column of recents scans as names rather than as repeated prefixes.
+/// Activation still uses the raw spec.
+fn recentRow(self: *BrowserView, spec: []const u8) void {
+    const split = places_mod.splitRecentLabel(spec);
+    var pz: [1024:0]u8 = undefined;
+    var nz: [512:0]u8 = undefined;
+    const pn = @min(split.parent.len, pz.len - 1);
+    @memcpy(pz[0..pn], split.parent[0..pn]);
+    pz[pn] = 0;
+    const nn = @min(split.name.len, nz.len - 1);
+    @memcpy(nz[0..nn], split.name[0..nn]);
+    nz[nn] = 0;
+    // Paths may contain &, < and >; Pango would reject the markup.
+    const esc_parent = c.g_markup_escape_text(&pz, -1) orelse return;
+    defer c.g_free(@ptrCast(esc_parent));
+    const esc_name = c.g_markup_escape_text(&nz, -1) orelse return;
+    defer c.g_free(@ptrCast(esc_name));
+    var markup: [3072:0]u8 = undefined;
+    const m = std.fmt.bufPrintZ(&markup, "<span alpha=\"55%\">{s}</span>{s}", .{
+        std.mem.span(@as([*:0]const u8, @ptrCast(esc_parent))),
+        std.mem.span(@as([*:0]const u8, @ptrCast(esc_name))),
+    }) catch return;
+    placeRowMarkup(self, "document-open-recent-symbolic", m.ptr, spec);
+}
+
+/// A places row whose label is Pango markup. The caller escapes.
+fn placeRowMarkup(self: *BrowserView, icon: [*:0]const u8, markup: [*:0]const u8, spec: []const u8) void {
+    const hbox = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+    c.gtk_widget_set_margin_start(hbox, 10);
+    c.gtk_box_append(@ptrCast(hbox), c.gtk_image_new_from_icon_name(icon));
+    const lab = c.gtk_label_new(null);
+    c.gtk_label_set_markup(@ptrCast(lab), markup);
+    c.gtk_label_set_xalign(@ptrCast(lab), 0);
+    c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_START);
+    c.gtk_widget_set_hexpand(lab, 1);
+    c.gtk_box_append(@ptrCast(hbox), lab);
+    const ctx = self.allocator.create(PlaceCtx) catch return;
+    ctx.* = .{
+        .allocator = self.allocator,
+        .view = self,
+        .spec = self.allocator.dupe(u8, spec) catch {
+            self.allocator.destroy(ctx);
+            return;
+        },
+        .is_bookmark = false,
+    };
+    const row = c.gtk_list_box_row_new();
+    c.gtk_list_box_row_set_child(@ptrCast(row), hbox);
+    var tip: [4300:0]u8 = undefined;
+    if (std.fmt.bufPrintZ(&tip, "{s}", .{spec})) |t| c.gtk_widget_set_tooltip_text(@ptrCast(row), t.ptr) else |_| {}
+    c.g_object_set_data_full(@ptrCast(row), "sketerm-place", @ptrCast(ctx), @ptrCast(&PlaceCtx.free));
     c.gtk_list_box_append(self.places_list, row);
 }
 
@@ -91,15 +198,17 @@ pub fn renderPlaces(self: *BrowserView) void {
         c.gtk_list_box_remove(self.places_list, @ptrCast(row));
     }
     self.placeHeader("Places");
-    const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
-    self.placeRow("user-home-symbolic", "Home", home, false);
-    self.placeRow("drive-harddisk-symbolic", "File System", "local:/", false);
-    var trash_buf: [4200]u8 = undefined;
-    if (trashFilesDir(&trash_buf)) |td| self.placeRow("user-trash-symbolic", "Trash", td, false);
+    if (!sectionCollapsed(self, "Places")) {
+        const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
+        self.placeRow("user-home-symbolic", "Home", home, false);
+        self.placeRow("drive-harddisk-symbolic", "File System", "local:/", false);
+        var trash_buf: [4200]u8 = undefined;
+        if (trashFilesDir(&trash_buf)) |td| self.placeRow("user-trash-symbolic", "Trash", td, false);
+    }
     const store = self.regStore();
     if (store.count() > 0) {
         self.placeHeader("Registers");
-        var ri: usize = 0;
+        var ri: usize = if (sectionCollapsed(self, "Registers")) store.count() else 0;
         while (ri < store.count()) : (ri += 1) {
             const name = store.nameAt(ri);
             var lbl: [160]u8 = undefined;
@@ -111,13 +220,13 @@ pub fn renderPlaces(self: *BrowserView) void {
     }
     if (self.bookmarks.items.len > 0) {
         self.placeHeader("Bookmarks");
-        for (self.bookmarks.items) |b| {
+        if (!sectionCollapsed(self, "Bookmarks")) for (self.bookmarks.items) |b| {
             self.placeRow("starred-symbolic", std.fs.path.basename(b), b, true);
-        }
+        };
     }
     if (self.saved_searches.items.len > 0) {
         self.placeHeader("Saved Queries");
-        for (self.saved_searches.items, 0..) |sq, i| {
+        if (!sectionCollapsed(self, "Saved Queries")) for (self.saved_searches.items, 0..) |sq, i| {
             // A saved query is durable, not a stored mode: what it is
             // follows from its own text, resolved here so the label
             // and the run can never disagree.
@@ -139,14 +248,15 @@ pub fn renderPlaces(self: *BrowserView) void {
             else
                 "system-search-symbolic";
             self.placeRow(icon, ltxt, sspec, true);
-        }
+        };
     }
     if (self.recent.items.len > 0) {
         self.placeHeader("Recent");
-        for (self.recent.items) |r| {
-            self.placeRow("document-open-recent-symbolic", r, r, false);
-        }
+        if (!sectionCollapsed(self, "Recent")) for (self.recent.items) |r| {
+            recentRow(self, r);
+        };
     }
+    const devices_folded = sectionCollapsed(self, "Devices");
     // Devices: real block-device and network mounts.
     const f = c.fopen("/proc/mounts", "rb") orelse {
         return;
@@ -170,6 +280,7 @@ pub fn renderPlaces(self: *BrowserView) void {
         if (first_dev) {
             self.placeHeader("Devices");
             first_dev = false;
+            if (devices_folded) break;
         }
         // /proc/mounts octal-escapes spaces; show raw (rare).
         self.placeRow("drive-harddisk-symbolic", mp, mp, false);
@@ -182,6 +293,18 @@ pub fn onPlaceActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaq
     const data = c.g_object_get_data(@ptrCast(row), "sketerm-place") orelse return;
     const ctx: *PlaceCtx = @ptrCast(@alignCast(data));
     if (ctx.spec.len == 0) return;
+    if (std.mem.startsWith(u8, ctx.spec, "section:")) {
+        // renderPlaces destroys every row -- and this ctx with it --
+        // so the section name is copied out before anything runs.
+        var nbuf: [128]u8 = undefined;
+        const name = ctx.spec["section:".len..];
+        if (name.len > nbuf.len) return;
+        @memcpy(nbuf[0..name.len], name);
+        toggleSection(self, nbuf[0..name.len]);
+        self.savePlaces();
+        self.renderPlaces();
+        return;
+    }
     if (std.mem.startsWith(u8, ctx.spec, "search:")) {
         const idx = std.fmt.parseInt(usize, ctx.spec[7..], 10) catch return;
         self.runSavedSearch(idx);
@@ -298,7 +421,15 @@ pub fn savePlaces(self: *BrowserView) void {
     // `collection` is deliberately written empty: the shelf lives in
     // the register store now, and places.json only still carries the
     // field so a pre-register file can be migrated exactly once.
-    places_mod.save(self.allocator, .{ .bookmarks = bm, .recent = rc, .searches = sq, .collection = &.{} });
+    const cl = a.alloc([]const u8, self.collapsed.items.len) catch return;
+    for (self.collapsed.items, 0..) |s, i| cl[i] = s;
+    places_mod.save(self.allocator, .{
+        .bookmarks = bm,
+        .recent = rc,
+        .searches = sq,
+        .collection = &.{},
+        .collapsed = cl,
+    });
 }
 
 pub fn addBookmark(self: *BrowserView, spec: []const u8) void {

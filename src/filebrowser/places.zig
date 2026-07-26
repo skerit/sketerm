@@ -31,7 +31,35 @@ pub const Places = struct {
     recent: []const []const u8 = &.{},
     searches: []const SavedSearch = &.{},
     collection: []const CollItem = &.{},
+    /// Sidebar section headers the user folded shut, by header text.
+    /// Missing (an older file) = everything expanded.
+    collapsed: []const []const u8 = &.{},
 };
+
+/// A recent location split for display: the leading path (shown
+/// dimmed) and the final component.
+pub const RecentLabel = struct {
+    /// Everything before the final component, trailing slash kept.
+    parent: []const u8 = "",
+    name: []const u8 = "",
+};
+
+/// Split a recent-location spec into its dimmed lead and its final
+/// component. The "local:" scheme is dropped (it is the default);
+/// a remote spec keeps its "user@host:" in the parent part.
+pub fn splitRecentLabel(spec: []const u8) RecentLabel {
+    var rest = spec;
+    if (std.mem.startsWith(u8, rest, "local:")) rest = rest["local:".len..];
+    if (rest.len == 0) return .{ .name = spec };
+    var end = rest.len;
+    while (end > 1 and rest[end - 1] == '/') end -= 1;
+    const trimmed = rest[0..end];
+    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse
+        return .{ .name = trimmed };
+    const name = trimmed[slash + 1 ..];
+    if (name.len == 0) return .{ .name = trimmed };
+    return .{ .parent = trimmed[0 .. slash + 1], .name = name };
+}
 
 pub fn filePath(allocator: std.mem.Allocator) ![]u8 {
     if (profile.getenv("XDG_STATE_HOME")) |xs| {
@@ -95,6 +123,30 @@ pub fn recordRecent(
         const last = list.pop() orelse break;
         allocator.free(last);
     }
+}
+
+test "splitRecentLabel dims the lead and drops the local scheme" {
+    const t = std.testing;
+    const a = splitRecentLabel("local:/home/skerit/projects/foo");
+    try t.expectEqualStrings("/home/skerit/projects/", a.parent);
+    try t.expectEqualStrings("foo", a.name);
+    const b = splitRecentLabel("/home/skerit");
+    try t.expectEqualStrings("/home/", b.parent);
+    try t.expectEqualStrings("skerit", b.name);
+    // A remote spec keeps its host visible, as part of the lead.
+    const d = splitRecentLabel("user@box:/srv/www");
+    try t.expectEqualStrings("user@box:/srv/", d.parent);
+    try t.expectEqualStrings("www", d.name);
+    // Roots and trailing slashes never yield an empty name.
+    const e = splitRecentLabel("local:/");
+    try t.expectEqualStrings("", e.parent);
+    try t.expectEqualStrings("/", e.name);
+    const f = splitRecentLabel("/home/skerit/");
+    try t.expectEqualStrings("/home/", f.parent);
+    try t.expectEqualStrings("skerit", f.name);
+    const g = splitRecentLabel("register:marks");
+    try t.expectEqualStrings("", g.parent);
+    try t.expectEqualStrings("register:marks", g.name);
 }
 
 test "recordRecent dedupes, front-inserts, and trims" {
