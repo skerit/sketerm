@@ -258,6 +258,11 @@ pub const Pane = struct {
     /// a Window-level GtkCssProvider that supplies the actual rgba
     /// values from Config.title_*_*.
     wrapper_box: ?*c.GtkWidget = null,
+    /// Set from wrapper_box's ::destroy. Pane.deinit is DEFERRED past
+    /// GTK's widget-destroy chain, so teardown code (detachBrowser)
+    /// can run after the widget tree is gone — this fence is what
+    /// tells it the GtkWidget pointers above are no longer callable.
+    widgets_dead: bool = false,
     /// File-browser face (src/ui/browser.zig): a second widget in the
     /// wrapper box, toggled against the GL area. The pane runs
     /// `browser_deinit(browser_ctx)` in detachBrowser — the browser's
@@ -434,6 +439,11 @@ pub const Pane = struct {
             .titlebar_box = tb_box,
             .titlebar_label = @ptrCast(@alignCast(tb_label_w)),
         };
+
+        // The widgets-dead fence: closing a pane destroys its widget
+        // subtree immediately while Pane.deinit is deferred, so late
+        // teardown must know when the pointers stop being widgets.
+        _ = c.g_signal_connect_data(wrap, "destroy", @ptrCast(&onWrapperDestroy), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
         // Pane is the Terminal's user_ctx for ALL sink callbacks.
         // Pane dispatches: image → its own store, clipboard/title →
@@ -780,6 +790,22 @@ pub const Pane = struct {
         // Browser face: its fd watch + connection must not outlive
         // the pane (the callback holds a raw *BrowserView).
         self.detachBrowser();
+        // A pane deinited while its widgets still exist (window
+        // teardown order varies) must not leave the destroy fence
+        // pointing at freed memory.
+        if (!self.widgets_dead) {
+            if (self.wrapper_box) |wrap| {
+                _ = c.g_signal_handlers_disconnect_matched(
+                    @ptrCast(wrap),
+                    c.G_SIGNAL_MATCH_FUNC | c.G_SIGNAL_MATCH_DATA,
+                    0,
+                    0,
+                    null,
+                    @constCast(@ptrCast(&onWrapperDestroy)),
+                    @ptrCast(self),
+                );
+            }
+        }
         self.grid_pass.deinit();
         self.cell_pass.deinit();
         self.image_pass.deinit();
@@ -898,15 +924,24 @@ pub const Pane = struct {
             if (self.browser_deinit) |cb| cb(ctx);
         }
         if (self.browser_widget) |bw| {
-            if (self.wrapper_box) |wrap| c.gtk_box_remove(@ptrCast(wrap), bw);
-            if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
+            // After the widget tree's destroy these pointers are no
+            // longer widgets; GTK already removed everything itself.
+            if (!self.widgets_dead) {
+                if (self.wrapper_box) |wrap| c.gtk_box_remove(@ptrCast(wrap), bw);
+                if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
+            }
         }
         self.browser_ctx = null;
         self.browser_deinit = null;
         self.browser_focus = null;
         self.browser_widget = null;
         // No face left to go back to.
-        setBrowserBanner(self, false);
+        if (!self.widgets_dead) setBrowserBanner(self, false);
+    }
+
+    fn onWrapperDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self: *Pane = @ptrCast(@alignCast(user.?));
+        self.widgets_dead = true;
     }
 
     /// Sever the pane from its AppHost: return any embedded view to
