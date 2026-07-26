@@ -1554,6 +1554,55 @@ pub const Window = struct {
         return files_entry.startSpec(buf, host, pane.terminal.cwd);
     }
 
+    /// "Open in Sketerm Files": hand the focused pane's host-qualified
+    /// location to the SEPARATE file-manager application by spawning
+    /// our own executable as `sketerm files <spec>`. GApplication
+    /// uniqueness forwards a second invocation into an already-running
+    /// files instance, so this either starts it or reaches it. The
+    /// child inherits this process's environment (an isolated test rig
+    /// keeps its own XDG dirs / app id); without G_SPAWN_DO_NOT_REAP_CHILD
+    /// GLib reaps the child itself, so no zombie and nothing for us to
+    /// waitpid.
+    fn openInFilesApp(self: *Window) void {
+        var spec_buf: [@import("browser.zig").SPEC_BUF_LEN]u8 = undefined;
+        const spec: ?[]const u8 = if (self.focusedPane()) |p|
+            paneBrowserSpec(p, &spec_buf)
+        else
+            null;
+
+        var exe_buf: [4096:0]u8 = undefined;
+        const exe = @import("../util/platform.zig").exePathZ(&exe_buf) orelse {
+            showToast(self, "Sketerm Files: own executable path unknown");
+            return;
+        };
+
+        var spec_z_buf: [@import("browser.zig").SPEC_BUF_LEN + 1]u8 = undefined;
+        var argv: [4][*c]u8 = @splat(null);
+        argv[0] = @constCast(@as([*c]const u8, exe.ptr));
+        argv[1] = @constCast(@as([*c]const u8, "files"));
+        if (spec) |s| {
+            if (std.fmt.bufPrintZ(&spec_z_buf, "{s}", .{s})) |z| {
+                argv[2] = @constCast(@as([*c]const u8, z.ptr));
+            } else |_| {}
+        }
+
+        var gerr: [*c]c.GError = null;
+        const ok = c.g_spawn_async(
+            null,
+            &argv,
+            null,
+            @intCast(c.G_SPAWN_DEFAULT),
+            null,
+            null,
+            null,
+            &gerr,
+        );
+        if (ok == 0) {
+            if (gerr != null) c.g_error_free(gerr);
+            showToast(self, "Sketerm Files: launch failed");
+        }
+    }
+
     /// Last-reported cwd of the focused pane (OSC 7), or null if no
     /// pane has the focus or no cwd has been reported. Bare path, for
     /// spawning a shell -- browser faces want `paneBrowserSpec`.
@@ -1849,8 +1898,11 @@ pub const Window = struct {
         pane.grid_pass.min_contrast = self.config.minimum_contrast;
         pane.cell_pass.min_contrast = self.config.minimum_contrast;
         pane.grid_pass.enable_url_underline = self.config.auto_url_detect;
-        // Per-pane titlebar visibility.
-        pane.setTitlebarVisible(self.config.show_titlebar);
+        // Per-pane titlebar visibility. The file-manager identity never
+        // shows it: a Files window's panes wear a browser face whose own
+        // location bar already names the pane, so the strip under the tab
+        // bar is pure redundancy there.
+        pane.setTitlebarVisible(self.config.show_titlebar and !files_identity);
         // Inactive-pane dimming factors.
         pane.inactive_darken = self.config.inactive_darken;
         pane.inactive_desaturate = self.config.inactive_desaturate;
@@ -3726,8 +3778,8 @@ pub const Window = struct {
             p.mouse_autohide = self.config.mouse_autohide;
             p.middle_click_action = self.config.mouse_middle_click;
             p.right_click_action = self.config.mouse_right_click;
-            // Per-pane titlebar visibility.
-            p.setTitlebarVisible(self.config.show_titlebar);
+            // Per-pane titlebar visibility (never in files identity).
+            p.setTitlebarVisible(self.config.show_titlebar and !files_identity);
             // Inactive-pane dimming.
             p.inactive_darken = self.config.inactive_darken;
             p.inactive_desaturate = self.config.inactive_desaturate;
@@ -7143,6 +7195,11 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .pin_tab => self.togglePinCurrentTab(),
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("split_h", err),
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch |err| logActionError("split_v", err),
+        .files_browse_here => if (self.focusedPane()) |p| self.openBrowserHere(p, null) catch |err|
+            logActionError("files_browse_here", err),
+        .files_browse_tab => self.newBrowserTabFrom(self.focusedPane(), null) catch |err|
+            logActionError("files_browse_tab", err),
+        .files_open_app => self.openInFilesApp(),
         .close_pane => self.closeFocusedPane(),
         .zoom_pane => self.toggleZoomPane(),
         .set_pane_title => self.setFocusedPaneTitle(),
