@@ -159,6 +159,9 @@ pub const Action = enum {
     /// Split the focused pane and give the new pane a browser face:
     /// how a dual-pane source/target layout is created.
     new_browser_split,
+    /// Close the focused pane, giving its space back to its sibling.
+    /// The last pane in a tab closes the tab.
+    close_pane,
     /// Flip the focused pane between its file-browser face and its
     /// terminal face. Dispatched locally (the Pane owns both faces);
     /// a pane with no browser face leaves the key to the terminal.
@@ -353,6 +356,7 @@ pub fn actionName(a: Action) []const u8 {
         .new_durable_tab => "new_durable_tab",
         .new_browser_tab => "new_browser_tab",
         .new_browser_split => "new_browser_split",
+        .close_pane => "close_pane",
         .toggle_browser_face => "toggle_browser_face",
         .mux_detach => "mux_detach",
         .paste_clipboard => "paste_clipboard",
@@ -433,6 +437,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .new_durable_tab => "New durable tab (mux)",
         .new_browser_tab => "New file browser tab",
         .new_browser_split => "Split into a second file browser pane",
+        .close_pane => "Close the focused pane (un-split)",
         .toggle_browser_face => "Show the file browser / show the shell (this pane)",
         .mux_detach => "Detach mux session (pane drops to a local shell)",
         .paste_clipboard => "Paste clipboard",

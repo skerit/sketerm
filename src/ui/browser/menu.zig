@@ -344,6 +344,11 @@ pub fn showEntryMenu(
             const utxt = std.fmt.bufPrintZ(&uz, "Undo ({s})", .{last.describe()}) catch "Undo";
             menuButton(box, utxt.ptr, &onMenuUndo, ctx, false);
         }
+        // Un-split: the background menu is the only place a browser
+        // pane can be closed from -- its face has no pane titlebar and
+        // no terminal right-click menu.
+        if (!on_entry)
+            menuButton(box, "Close Pane", &onMenuClosePane, ctx, false);
     }
 
     c.gtk_popover_set_child(@ptrCast(popover), stack);
@@ -486,6 +491,17 @@ pub fn connectPopoverAutoUnparent(popover: *c.GtkWidget) void {
 
 pub fn menuDone(ctx: *MenuCtx) void {
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
+}
+
+/// Un-split from the background menu. The pane binding table owns
+/// what closing a pane IS, so this forwards the action; it is
+/// deferred because the close destroys the widget tree this popover
+/// (and this handler) live in.
+pub fn onMenuClosePane(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const view = ctx.view;
+    menuDone(ctx);
+    view.closePaneDeferred();
 }
 
 pub fn onMenuTerminalHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
