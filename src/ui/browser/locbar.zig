@@ -160,9 +160,31 @@ pub fn installLocationFace(self: *BrowserView, bar: *c.GtkWidget, entry: *c.GtkW
     // plain scroll, so this does not fight the user's own scrolling.
     const adj = c.gtk_scrolled_window_get_hadjustment(@ptrCast(sw));
     _ = c.g_signal_connect_data(adj, "changed", @ptrCast(&onCrumbAdjustment), null, null, c.G_CONNECT_DEFAULT);
+    // This adjustment's page size IS the width the toolbar has left
+    // over for the path, so it is also the signal that decides whether
+    // the tool cluster still fits (view.zig owns that decision).
+    _ = c.g_signal_connect_data(adj, "notify::page-size", @ptrCast(&BrowserView.onCrumbViewport), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(adj, "changed", @ptrCast(&BrowserView.onCrumbConfigured), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+
+    // Double-clicking the path strip edits it, the way every file
+    // manager's breadcrumb does. Bubble phase, so a single click on a
+    // segment button still navigates.
+    const edit_click = c.gtk_gesture_click_new();
+    c.gtk_gesture_single_set_button(@ptrCast(edit_click), 1);
+    _ = c.g_signal_connect_data(edit_click, "pressed", @ptrCast(&onPathDoubleClick), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(holder, @ptrCast(edit_click));
 
     self.locbar.scroller = sw;
     self.locbar.box = box;
+}
+
+/// Second press on the path strip = show the editable entry. Routed
+/// through the toggle so `locbar.editing` cannot drift.
+fn onPathDoubleClick(_: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    if (n_press != 2) return;
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    if (self.locbar.editing) return;
+    self.toggleLocationFace();
 }
 
 /// A new segment set (or a resize) landed. The value cannot be set
@@ -251,7 +273,10 @@ fn appendSegment(self: *BrowserView, box: *c.GtkWidget, seg: crumbs.Segment, tab
     label_z[n] = 0;
 
     const btn = c.gtk_button_new_with_label(&label_z);
-    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+    // `.flat` as well as frameless: the hover/active rules in
+    // view.zig's stylesheet key off it, and a breadcrumb segment that
+    // does not light up under the pointer does not read as clickable.
+    BrowserView.flatten(btn.?);
     if (seg.root and tab.hc.host != null) c.gtk_widget_add_css_class(btn, "accent");
     var tip: [4200:0]u8 = undefined;
     if (std.fmt.bufPrintZ(&tip, "{s}", .{seg.path})) |t| c.gtk_widget_set_tooltip_text(btn, t.ptr) else |_| {}
@@ -268,7 +293,7 @@ fn appendSegment(self: *BrowserView, box: *c.GtkWidget, seg: crumbs.Segment, tab
     c.gtk_box_append(@ptrCast(box), btn);
 
     const arrow = c.gtk_button_new_from_icon_name("pan-down-symbolic");
-    c.gtk_button_set_has_frame(@ptrCast(arrow), 0);
+    BrowserView.flatten(arrow.?);
     c.gtk_widget_set_tooltip_text(arrow, if (seg.root)
         "Folders in this root"
     else

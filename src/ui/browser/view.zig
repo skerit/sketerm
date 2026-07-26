@@ -168,6 +168,41 @@ pub const BrowserView = struct {
     places_scroller: *c.GtkWidget = undefined,
     places_list: *c.GtkListBox = undefined,
     places_on: bool = false,
+    /// The Places toggle, so the persisted open state and the button
+    /// can never disagree.
+    places_toggle: *c.GtkToggleButton = undefined,
+    /// Sidebar splitter: places on the left, listing + preview right.
+    content_paned: *c.GtkWidget = undefined,
+    /// Persisted sidebar width, and the debounce that writes it (a
+    /// drag emits notify::position per pixel).
+    sidebar_px: i32 = places_mod.DEFAULT_SIDEBAR_PX,
+    sidebar_save_src: c.guint = 0,
+    /// Persisted sidebar open state; null = never toggled, so the
+    /// default follows the application identity.
+    sidebar_open: ?bool = null,
+    /// False until the persisted chrome state has been applied, so the
+    /// programmatic initial toggle does not write places.json back.
+    chrome_ready: bool = false,
+    /// Toolbar overflow. `right_box` is the whole right end of the
+    /// toolbar; `right_cluster` is the part that moves into the
+    /// hamburger's popover (`overflow_slot`) when the bar runs out of
+    /// room. The buttons are never rebuilt -- the box is reparented --
+    /// so toggle state survives collapsing.
+    right_box: *c.GtkWidget = undefined,
+    right_cluster: *c.GtkWidget = undefined,
+    overflow_btn: *c.GtkWidget = undefined,
+    overflow_slot: *c.GtkWidget = undefined,
+    bar_collapsed: bool = false,
+    /// The one-shot post-layout overflow evaluation (0 = none).
+    bar_idle_src: c.guint = 0,
+    /// Set from the root box's ::destroy. Closing a pane destroys the
+    /// browser's widgets IMMEDIATELY but defers `Pane.deinit` (and so
+    /// this view's deinit) -- a deferred callback scheduled before the
+    /// close would otherwise run against destroyed widgets.
+    widgets_dead: bool = false,
+    /// Toolbar width the collapsed cluster gives back, so expanding
+    /// cannot immediately re-trip the collapse (hysteresis).
+    bar_reclaim: c_int = 0,
     bookmarks: std.ArrayList([]u8) = .empty,
     recent: std.ArrayList([]u8) = .empty,
     /// Sidebar sections the user folded shut, by header text (owned,
@@ -687,6 +722,8 @@ pub const BrowserView = struct {
                 const owned = allocator.dupe(u8, s) catch continue;
                 self.collapsed.append(allocator, owned) catch allocator.free(owned);
             }
+            self.sidebar_px = places_mod.clampSidebarPx(parsed.value.sidebar_px);
+            self.sidebar_open = parsed.value.sidebar_open;
             for (parsed.value.searches) |sq| {
                 const spec = allocator.dupe(u8, sq.spec) catch continue;
                 const pat = allocator.dupe(u8, sq.pattern) catch {
@@ -710,6 +747,9 @@ pub const BrowserView = struct {
         // built.
         self.installViewMenu();
         self.installSelectionMenu();
+        // After the menus: their two buttons belong to the collapsible
+        // cluster, and the sidebar toggle below renders places.
+        self.applyChromeState();
         pane.attachBrowser(self.root_box, @ptrCast(self), destroyCb, focusCb);
 
         const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/";
@@ -863,6 +903,8 @@ pub const BrowserView = struct {
             const owned = self.allocator.dupe(u8, name) catch continue;
             tab.attr_columns.append(self.allocator, owned) catch self.allocator.free(owned);
         }
+        // Positional against the two column lists filled just above.
+        @import("render.zig").applyColumnWidths(tab, state);
         tab.sort_key = state.sort;
         tab.descending = state.descending;
         tab.dirs_first = state.dirs_first;
@@ -911,6 +953,28 @@ pub const BrowserView = struct {
         if (self.switch_idle != 0) {
             _ = c.g_source_remove(self.switch_idle);
             self.switch_idle = 0;
+        }
+        if (self.sidebar_save_src != 0) {
+            _ = c.g_source_remove(self.sidebar_save_src);
+            self.sidebar_save_src = 0;
+        }
+        if (self.bar_idle_src != 0) {
+            _ = c.g_source_remove(self.bar_idle_src);
+            self.bar_idle_src = 0;
+        }
+        // detachBrowser deinits the view BEFORE unparenting its widget,
+        // so the destroy fence would otherwise fire on freed memory.
+        if (!self.widgets_dead) {
+            _ = c.g_signal_handlers_disconnect_matched(
+                @ptrCast(self.root_box),
+                c.G_SIGNAL_MATCH_FUNC | c.G_SIGNAL_MATCH_DATA,
+                0,
+                0,
+                null,
+                @constCast(@ptrCast(&onRootDestroy)),
+                @ptrCast(self),
+            );
+            self.widgets_dead = true;
         }
         self.jobs_panel.deinit(self.allocator);
         self.copy_queue.deinit(self.allocator);
@@ -1045,7 +1109,7 @@ pub const BrowserView = struct {
 
     /// Nemo's toolbar buttons: flat, icon-only, and out of the focus
     /// chain, so Tab walks the listing rather than the chrome.
-    fn flatten(btn: *c.GtkWidget) void {
+    pub fn flatten(btn: *c.GtkWidget) void {
         c.gtk_button_set_has_frame(@ptrCast(btn), 0);
         c.gtk_widget_add_css_class(btn, "flat");
         c.gtk_widget_set_can_focus(btn, 0);
@@ -1084,7 +1148,9 @@ pub const BrowserView = struct {
     /// breadcrumb holder have to read as single controls, which no
     /// stock GTK class does for a plain box of flat buttons. Installed
     /// once per display, at APPLICATION priority, so a user theme
-    /// still wins.
+    /// still wins. It also states the hover/active feedback outright:
+    /// Breeze draws NOTHING for a `.flat` button, so without this the
+    /// whole browser chrome reads as dead pixels under the pointer.
     var css_installed: bool = false;
 
     fn installCss(any_widget: *c.GtkWidget) void {
@@ -1102,6 +1168,18 @@ pub const BrowserView = struct {
             \\}
             \\.sketerm-fb-toolbar button { padding-left: 6px; padding-right: 6px; }
             \\.sketerm-fb-section arrow, .sketerm-fb-section image { opacity: 0.6; }
+            \\.sketerm-fb-toolbar button:hover,
+            \\.sketerm-fb-path button:hover {
+            \\  background: alpha(currentColor, 0.10);
+            \\}
+            \\.sketerm-fb-toolbar button:active,
+            \\.sketerm-fb-toolbar button:checked,
+            \\.sketerm-fb-path button:active {
+            \\  background: alpha(currentColor, 0.20);
+            \\}
+            \\.sketerm-fb-toolbar button:checked:hover {
+            \\  background: alpha(currentColor, 0.26);
+            \\}
         ;
         const provider = c.gtk_css_provider_new();
         c.gtk_css_provider_load_from_string(provider, css);
@@ -1177,30 +1255,68 @@ pub const BrowserView = struct {
         // breadcrumb shows by default, Ctrl+L swaps to the entry.
         self.installLocationFace(bar, entry);
 
-        // The right cluster. `hidden` stays the insertion anchor the
-        // view and selection menus append themselves after
-        // (views.zig/selection.zig read its PARENT), so it must keep
-        // being a direct child of the box those buttons belong in.
+        // The right end of the toolbar, in two halves: `cluster`
+        // collapses into the hamburger when the bar runs out of room,
+        // `keep` never does (search and the way back to the shell stay
+        // one click away at any width).
+        //
+        // `hidden` stays the insertion anchor the view and selection
+        // menus append themselves after (views.zig/selection.zig read
+        // its PARENT), so it must keep being a direct child of the box
+        // those buttons belong in -- which is the collapsible one, so
+        // they collapse with it.
         const right = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
-        const hidden = self.barToggle(right, "view-reveal-symbolic", "Hidden", "Show hidden files", &onHiddenToggled);
-        _ = self.barToggle(right, "system-search-symbolic", "Search", "Search this directory (daemon-side, recursive)", &onSearchToggled);
-        _ = self.barToggle(right, "user-bookmarks-symbolic", "Places", "Places sidebar (bookmarks, recent, devices)", &onPlacesToggled);
-        _ = self.barButton(right, "view-grid-symbolic", "View", "Cycle view: details / compact / grid / columns", &onViewModeClicked);
-        _ = self.barToggle(right, "view-dual-symbolic", "Preview", "Preview panel (images, text head, metadata)", &onPreviewToggled);
-        _ = self.barButton(right, "sketerm-split-left-right-symbolic", "Split", "Split into two file browsers", &onSplitClicked);
-        _ = self.barButton(right, "tab-new-symbolic", "New tab", "New browser tab", &onNewTabClicked);
-        _ = self.barButton(right, "go-jump-symbolic", "Shell cwd", "Go to the shell's current directory (OSC 7)", &onCwdSyncClicked);
+        const cluster = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
+        const hidden = self.barToggle(cluster, "view-reveal-symbolic", "Hidden", "Show hidden files", &onHiddenToggled);
+        const places_btn = self.barToggle(cluster, "user-bookmarks-symbolic", "Places", "Places sidebar (bookmarks, recent, devices)", &onPlacesToggled);
+        _ = self.barButton(cluster, "view-grid-symbolic", "View", "Cycle view: details / compact / grid / columns", &onViewModeClicked);
+        _ = self.barToggle(cluster, "view-dual-symbolic", "Preview", "Preview panel (images, text head, metadata)", &onPreviewToggled);
+        _ = self.barButton(cluster, "sketerm-split-left-right-symbolic", "Split", "Add a browser pane beside this one", &onSplitClicked);
+        _ = self.barButton(cluster, "tab-new-symbolic", "New tab", "New browser tab", &onNewTabClicked);
+        _ = self.barButton(cluster, "go-jump-symbolic", "Shell cwd", "Go to the shell's current directory (OSC 7)", &onCwdSyncClicked);
+        c.gtk_box_append(@ptrCast(right), cluster);
+
+        const keep = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
+        _ = self.barToggle(keep, "system-search-symbolic", "Search", "Search this directory (daemon-side, recursive)", &onSearchToggled);
         // Its own bundled icon: Adwaita ships utilities-terminal-symbolic
         // only under symbolic/legacy/, so on a Breeze theme chain this
         // button -- the one that leaves the browser -- rendered blank.
         _ = self.barButton(
-            right,
+            keep,
             "sketerm-terminal-symbolic",
             "Shell",
             "Show this pane's shell. Ctrl+Shift+B (or the strip above the shell) brings the browser back.",
             &onTerminalClicked,
         );
+        c.gtk_box_append(@ptrCast(right), keep);
         c.gtk_box_append(@ptrCast(bar), right);
+
+        // The overflow hamburger: hidden until the toolbar is too
+        // narrow to show the cluster inline.
+        const pop = c.gtk_popover_new();
+        const pop_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
+        const slot = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
+        c.gtk_box_append(@ptrCast(pop_box), slot);
+        c.gtk_box_append(@ptrCast(pop_box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+        // Un-split lives here permanently: a browser face has no pane
+        // titlebar, so the toolbar is the only chrome that can offer it.
+        const closer = c.gtk_button_new_with_label("Close Pane");
+        c.gtk_button_set_has_frame(@ptrCast(closer), 0);
+        if (c.gtk_button_get_child(@ptrCast(closer))) |lbl|
+            c.gtk_widget_set_halign(lbl, c.GTK_ALIGN_START);
+        c.gtk_widget_set_tooltip_text(closer, "Close this pane and give its space back (un-split)");
+        _ = c.g_signal_connect_data(closer, "clicked", @ptrCast(&onOverflowClosePane), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(pop_box), closer);
+        c.gtk_popover_set_child(@ptrCast(pop), pop_box);
+        const burger = c.gtk_menu_button_new();
+        c.gtk_menu_button_set_icon_name(@ptrCast(burger), "open-menu-symbolic");
+        c.gtk_menu_button_set_popover(@ptrCast(burger), pop);
+        c.gtk_menu_button_set_has_frame(@ptrCast(burger), 0);
+        c.gtk_widget_add_css_class(burger, "flat");
+        c.gtk_widget_set_can_focus(burger, 0);
+        c.gtk_widget_set_tooltip_text(burger, "More toolbar actions");
+        c.gtk_widget_set_visible(burger, 0);
+        c.gtk_box_append(@ptrCast(right), burger);
 
         c.gtk_box_append(@ptrCast(vbox), bar);
 
@@ -1227,23 +1343,37 @@ pub const BrowserView = struct {
         c.gtk_widget_set_vexpand(notebook, 1);
         _ = c.g_signal_connect_data(notebook, "switch-page", @ptrCast(&onSwitchPage), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
-        // Content row: places | notebook | preview (side panels
-        // hidden until toggled).
-        const content = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+        // Content row: places | (notebook | preview). The sidebar is a
+        // real splitter so its width is the user's to set; the handle
+        // disappears with the sidebar, because GtkPaned draws none for
+        // an invisible child.
+        const content = c.gtk_paned_new(c.GTK_ORIENTATION_HORIZONTAL);
         c.gtk_widget_set_hexpand(content, 1);
         c.gtk_widget_set_vexpand(content, 1);
 
         const pl_scroll = c.gtk_scrolled_window_new();
-        c.gtk_widget_set_size_request(pl_scroll, 190, -1);
+        c.gtk_widget_set_size_request(pl_scroll, places_mod.MIN_SIDEBAR_PX, -1);
         const pl_list = c.gtk_list_box_new();
         c.gtk_list_box_set_selection_mode(@ptrCast(pl_list), c.GTK_SELECTION_NONE);
         c.gtk_list_box_set_activate_on_single_click(@ptrCast(pl_list), 1);
         _ = c.g_signal_connect_data(pl_list, "row-activated", @ptrCast(&onPlaceActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_scrolled_window_set_child(@ptrCast(pl_scroll), pl_list);
         c.gtk_widget_set_visible(pl_scroll, 0);
-        c.gtk_box_append(@ptrCast(content), pl_scroll);
+        c.gtk_paned_set_start_child(@ptrCast(content), pl_scroll);
+        // The sidebar keeps its width when the window resizes; the
+        // listing side absorbs the difference.
+        c.gtk_paned_set_resize_start_child(@ptrCast(content), 0);
+        c.gtk_paned_set_shrink_start_child(@ptrCast(content), 0);
+        c.gtk_paned_set_position(@ptrCast(content), self.sidebar_px);
+        _ = c.g_signal_connect_data(content, "notify::position", @ptrCast(&onSidebarPosition), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
-        c.gtk_box_append(@ptrCast(content), notebook);
+        const main_side = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+        c.gtk_widget_set_hexpand(main_side, 1);
+        c.gtk_widget_set_vexpand(main_side, 1);
+        c.gtk_paned_set_end_child(@ptrCast(content), main_side);
+        c.gtk_paned_set_resize_end_child(@ptrCast(content), 1);
+
+        c.gtk_box_append(@ptrCast(main_side), notebook);
 
         const pbox = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
         c.gtk_widget_set_size_request(pbox, 300, -1);
@@ -1269,7 +1399,7 @@ pub const BrowserView = struct {
         c.gtk_scrolled_window_set_child(@ptrCast(ptext_scroll), ptext);
         c.gtk_box_append(@ptrCast(pbox), ptext_scroll);
         c.gtk_widget_set_visible(pbox, 0);
-        c.gtk_box_append(@ptrCast(content), pbox);
+        c.gtk_box_append(@ptrCast(main_side), pbox);
 
         c.gtk_box_append(@ptrCast(vbox), content);
 
@@ -1294,6 +1424,10 @@ pub const BrowserView = struct {
         _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onBrowserKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(vbox, @ptrCast(keys));
 
+        // The fence for every deferred callback below: see
+        // `widgets_dead`.
+        _ = c.g_signal_connect_data(vbox, "destroy", @ptrCast(&onRootDestroy), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+
         self.root_box = vbox;
         self.notebook = @ptrCast(@alignCast(notebook));
         self.path_entry = @ptrCast(@alignCast(entry));
@@ -1311,5 +1445,184 @@ pub const BrowserView = struct {
         self.preview_meta = @ptrCast(@alignCast(pmeta));
         self.places_scroller = pl_scroll;
         self.places_list = @ptrCast(@alignCast(pl_list));
+        self.places_toggle = @ptrCast(@alignCast(places_btn));
+        self.content_paned = content.?;
+        self.right_box = right.?;
+        self.right_cluster = cluster.?;
+        self.overflow_btn = burger.?;
+        self.overflow_slot = slot.?;
+    }
+
+    /// The browser's widgets are gone: nothing deferred may touch them
+    /// again. The view itself lives on until the pane's deferred
+    /// deinit, so this cannot free anything -- it only fences.
+    fn onRootDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.widgets_dead = true;
+        if (self.bar_idle_src != 0) {
+            _ = c.g_source_remove(self.bar_idle_src);
+            self.bar_idle_src = 0;
+        }
+    }
+
+    // -- responsive toolbar ------------------------------------------
+
+    /// Breadcrumb viewport width below which the toolbar has no room
+    /// left for the tool cluster.
+    const BAR_COLLAPSE_PX: f64 = 200;
+
+    /// Fallback for the width a collapse gives back, used only when
+    /// the cluster has no allocation to measure yet.
+    const BAR_RECLAIM_FALLBACK: c_int = 220;
+
+    /// notify::page-size on the breadcrumb adjustment.
+    pub fn onCrumbViewport(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.evaluateBarOverflow();
+    }
+
+    /// ::changed on the same adjustment -- the crumb rebuild. A pane
+    /// born too narrow to show ANY path never moves page-size off
+    /// zero, so the notify alone would never fire for it.
+    pub fn onCrumbConfigured(_: *c.GtkAdjustment, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.evaluateBarOverflow();
+    }
+
+    /// Ask for the overflow state to be re-decided. The signals that
+    /// call this are emitted from INSIDE the layout pass (the crumb
+    /// adjustment is configured there), and moving widgets during a
+    /// size-allocate leaves the boxes measuring stale requests -- the
+    /// cluster came back into a bar that laid it out at its popover
+    /// width and clipped it. So the decision is taken, and applied, on
+    /// an idle once the frame has settled. Same reason pinCrumbTail
+    /// defers (locbar.zig).
+    pub fn evaluateBarOverflow(self: *BrowserView) void {
+        if (self.widgets_dead or self.bar_idle_src != 0) return;
+        self.bar_idle_src = c.g_idle_add(@ptrCast(&barOverflowIdle), @ptrCast(self));
+    }
+
+    pub fn barOverflowIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.bar_idle_src = 0;
+        if (self.widgets_dead) return 0;
+        if (self.wantBarCollapsed()) |want| self.setBarCollapsed(want);
+        return 0;
+    }
+
+    /// Should the tool cluster be in the hamburger right now? The
+    /// breadcrumb scroller's page size IS the width the toolbar has
+    /// left over for the path, so that is the measure.
+    /// @return null when the toolbar has never been laid out.
+    fn wantBarCollapsed(self: *BrowserView) ?bool {
+        const sw = self.locbar.scroller orelse return null;
+        // Zero page size is a REAL answer here (the path was squeezed
+        // out of the bar entirely); what has to be ignored is the
+        // state before the toolbar has ever been allocated.
+        if (c.gtk_widget_get_width(self.right_box) <= 0) return null;
+        const page = c.gtk_adjustment_get_page_size(c.gtk_scrolled_window_get_hadjustment(@ptrCast(sw)));
+        if (!self.bar_collapsed) return page < BAR_COLLAPSE_PX;
+        // Expanding hands the cluster's width straight back to this
+        // viewport, so the threshold has to sit above what a
+        // re-collapse needs or the two states flip-flop forever.
+        const back: f64 = @floatFromInt(self.bar_reclaim);
+        return page <= BAR_COLLAPSE_PX + back + 24;
+    }
+
+    /// Move the tool cluster between the toolbar and the hamburger's
+    /// popover. The SAME widgets travel either way, so a toggle that
+    /// is on stays on and no button is built twice.
+    fn setBarCollapsed(self: *BrowserView, on: bool) void {
+        if (self.bar_collapsed == on) return;
+        const cluster = self.right_cluster;
+        _ = c.g_object_ref(@ptrCast(cluster));
+        defer c.g_object_unref(@ptrCast(cluster));
+        if (on) {
+            const w = c.gtk_widget_get_width(cluster);
+            self.bar_reclaim = if (w > 0) w else BAR_RECLAIM_FALLBACK;
+            c.gtk_box_remove(@ptrCast(self.right_box), cluster);
+            c.gtk_box_append(@ptrCast(self.overflow_slot), cluster);
+            // A column reads as a menu; a strip of icons in a popover
+            // reads as a mistake. Re-oriented AFTER re-parenting: a
+            // size request changed while the widget is orphaned does
+            // not reach the box that ends up measuring it, and the new
+            // parent would keep laying it out at the OLD axis's
+            // request (that is what clipped the cluster off the bar).
+            c.gtk_orientable_set_orientation(@ptrCast(cluster), c.GTK_ORIENTATION_VERTICAL);
+            c.gtk_widget_set_visible(self.overflow_btn, 1);
+        } else {
+            c.gtk_menu_button_popdown(@ptrCast(self.overflow_btn));
+            c.gtk_box_remove(@ptrCast(self.overflow_slot), cluster);
+            // Prepend: the cluster is the LEFT half of the right end.
+            c.gtk_box_prepend(@ptrCast(self.right_box), cluster);
+            c.gtk_orientable_set_orientation(@ptrCast(cluster), c.GTK_ORIENTATION_HORIZONTAL);
+            c.gtk_widget_set_visible(self.overflow_btn, 0);
+        }
+        c.gtk_widget_queue_resize(cluster);
+        self.bar_collapsed = on;
+    }
+
+    fn onOverflowClosePane(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        c.gtk_menu_button_popdown(@ptrCast(self.overflow_btn));
+        self.closePaneDeferred();
+    }
+
+    /// Close this pane (un-split) once the click that asked for it has
+    /// unwound: running it inline would destroy the widget tree the
+    /// button's own handler is still standing on.
+    ///
+    /// A plain idle is too early. The popover the button lives in is
+    /// only POPPED DOWN at that point -- it dismisses over an
+    /// animation, and tearing its parent widget tree out from under a
+    /// popover still in that state crashes the process later, during
+    /// application teardown. One dismiss animation is the wait.
+    pub fn closePaneDeferred(self: *BrowserView) void {
+        const ictx = self.pane.input_ctx orelse return;
+        _ = c.g_timeout_add(250, @ptrCast(&closePaneIdle), @ptrCast(ictx));
+    }
+
+    fn closePaneIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const ictx: *input.Ctx = @ptrCast(@alignCast(user.?));
+        _ = input.runAction(ictx, .close_pane);
+        return 0;
+    }
+
+    // -- sidebar width persistence -----------------------------------
+
+    /// A drag emits this per pixel; the write is debounced so a resize
+    /// costs one places.json save, not hundreds.
+    fn onSidebarPosition(obj: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        // A hidden sidebar reports whatever GtkPaned last computed;
+        // only a visible one describes a width the user chose.
+        if (self.widgets_dead or !self.places_on or !self.chrome_ready) return;
+        const pos = c.gtk_paned_get_position(@ptrCast(@alignCast(obj)));
+        if (pos < places_mod.MIN_SIDEBAR_PX) return;
+        self.sidebar_px = places_mod.clampSidebarPx(pos);
+        if (self.sidebar_save_src != 0) _ = c.g_source_remove(self.sidebar_save_src);
+        self.sidebar_save_src = c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self));
+    }
+
+    fn onSidebarSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.sidebar_save_src = 0;
+        self.savePlaces();
+        return 0;
+    }
+
+    /// Apply the persisted chrome state once the widgets exist: the
+    /// sidebar's last width and, when the user has never toggled it,
+    /// the identity default (open in the dedicated file manager).
+    fn applyChromeState(self: *BrowserView) void {
+        c.gtk_paned_set_position(@ptrCast(self.content_paned), self.sidebar_px);
+        // Imported here rather than at file scope: the browser modules
+        // are below the window in the dependency order.
+        const want = self.sidebar_open orelse @import("../window.zig").Window.filesIdentity();
+        if (want) c.gtk_toggle_button_set_active(self.places_toggle, 1);
+        self.chrome_ready = true;
+        // One post-layout evaluation, for a pane that is born too
+        // narrow: the adjustment signals only describe CHANGES.
+        self.evaluateBarOverflow();
     }
 };

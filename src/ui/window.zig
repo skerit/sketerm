@@ -366,6 +366,13 @@ pub const Window = struct {
         files_identity = true;
     }
 
+    /// True when this process IS the file manager (`sketerm files`).
+    /// Read by the browser chrome for defaults that only make sense
+    /// for a dedicated file manager (the places sidebar starts open).
+    pub fn filesIdentity() bool {
+        return files_identity;
+    }
+
     pub fn initWithConfig(
         allocator: std.mem.Allocator,
         app: ?*c.GtkApplication,
@@ -7041,6 +7048,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .new_durable_tab => self.newDurableTab(null) catch |err| logActionError("new_durable_tab", err),
         .new_browser_tab => self.newBrowserTab() catch |err| logActionError("new_browser_tab", err),
         .new_browser_split => self.newBrowserSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_browser_split", err),
+        .close_pane => self.closeFocusedPane(),
         // Only reached when the focused pane has NO browser face (the
         // pane-local dispatch consumes it otherwise): say so, rather
         // than let the action look broken.

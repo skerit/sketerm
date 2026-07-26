@@ -103,8 +103,10 @@ const ENTRIES = [_]Entry{
        .desc = "Shell in the sketerm-mux daemon; survives GUI restarts.", .action = .new_durable_tab },
     .{ .icon = "folder-symbolic", .title = "New File Browser Tab",
        .desc = "Browse files with live listings; the pane's shell is one click away.", .action = .new_browser_tab },
-    .{ .icon = "view-dual-symbolic", .title = "Split into Two File Browsers",
-       .desc = "Dual-pane source/target: F5 copies to the other pane, F6 moves.", .action = .new_browser_split },
+    .{ .icon = "view-dual-symbolic", .title = "New Browser Pane (Split)",
+       .desc = "Add a browser pane beside this one. Dual-pane source/target: F5 copies to the other pane, F6 moves.", .action = .new_browser_split },
+    .{ .icon = "window-close-symbolic", .title = "Close Pane",
+       .desc = "Close the focused pane and give its space back (un-split).", .action = .close_pane },
     .{ .icon = "sketerm-terminal-symbolic", .title = "Show File Browser / Show Shell",
        .desc = "Swap this pane between its file browser and its shell. Both stay alive; neither is closed.", .action = .toggle_browser_face },
 

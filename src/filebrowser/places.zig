@@ -34,7 +34,25 @@ pub const Places = struct {
     /// Sidebar section headers the user folded shut, by header text.
     /// Missing (an older file) = everything expanded.
     collapsed: []const []const u8 = &.{},
+    /// Width of the places sidebar, in pixels (the GtkPaned position).
+    sidebar_px: i32 = DEFAULT_SIDEBAR_PX,
+    /// Whether the sidebar is shown. `null` = never toggled, so the
+    /// default follows the application identity (on in files mode).
+    sidebar_open: ?bool = null,
 };
+
+pub const DEFAULT_SIDEBAR_PX: i32 = 190;
+pub const MIN_SIDEBAR_PX: i32 = 120;
+pub const MAX_SIDEBAR_PX: i32 = 900;
+
+/// Keep a persisted sidebar width usable: a file written by a crashed
+/// drag (or hand-edited) must not be able to hide the sidebar or eat
+/// the listing.
+pub fn clampSidebarPx(px: i32) i32 {
+    if (px < MIN_SIDEBAR_PX) return DEFAULT_SIDEBAR_PX;
+    if (px > MAX_SIDEBAR_PX) return MAX_SIDEBAR_PX;
+    return px;
+}
 
 /// A recent location split for display: the leading path (shown
 /// dimmed) and the final component.
@@ -147,6 +165,42 @@ test "splitRecentLabel dims the lead and drops the local scheme" {
     const g = splitRecentLabel("register:marks");
     try t.expectEqualStrings("", g.parent);
     try t.expectEqualStrings("register:marks", g.name);
+}
+
+test "sidebar fields default for a file written before they existed" {
+    const t = std.testing;
+    const old = "{\"bookmarks\":[],\"recent\":[],\"searches\":[],\"collection\":[],\"collapsed\":[]}";
+    const parsed = try std.json.parseFromSlice(Places, t.allocator, old, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    try t.expectEqual(DEFAULT_SIDEBAR_PX, parsed.value.sidebar_px);
+    try t.expectEqual(@as(?bool, null), parsed.value.sidebar_open);
+}
+
+test "sidebar fields round-trip through the saved JSON" {
+    const t = std.testing;
+    var out: std.Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(Places{ .sidebar_px = 245, .sidebar_open = false }, .{}, &out.writer);
+    const parsed = try std.json.parseFromSlice(Places, t.allocator, out.written(), .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    try t.expectEqual(@as(i32, 245), parsed.value.sidebar_px);
+    try t.expectEqual(@as(?bool, false), parsed.value.sidebar_open);
+}
+
+test "clampSidebarPx rejects widths that would break the layout" {
+    const t = std.testing;
+    try t.expectEqual(DEFAULT_SIDEBAR_PX, clampSidebarPx(0));
+    try t.expectEqual(DEFAULT_SIDEBAR_PX, clampSidebarPx(-40));
+    try t.expectEqual(DEFAULT_SIDEBAR_PX, clampSidebarPx(MIN_SIDEBAR_PX - 1));
+    try t.expectEqual(MIN_SIDEBAR_PX, clampSidebarPx(MIN_SIDEBAR_PX));
+    try t.expectEqual(@as(i32, 245), clampSidebarPx(245));
+    try t.expectEqual(MAX_SIDEBAR_PX, clampSidebarPx(10_000));
 }
 
 test "recordRecent dedupes, front-inserts, and trims" {
