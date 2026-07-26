@@ -25,6 +25,9 @@ pub const Action = enum {
     pin_tab,
     split_h,
     split_v,
+    files_browse_here,
+    files_browse_tab,
+    files_open_app,
     zoom_pane,
     close_pane,
     set_pane_title,
@@ -121,6 +124,11 @@ const MENU = [_]Item{
     .separator,
     .{ .bind = .{ .name = "split-h", .label = "Split Left / Right", .detailed = "term.split-h", .icon = "sketerm-split-left-right-symbolic", .action = .split_h } },
     .{ .bind = .{ .name = "split-v", .label = "Split Top / Bottom", .detailed = "term.split-v", .icon = "sketerm-split-top-bottom-symbolic", .action = .split_v } },
+    .{ .submenu = .{ .label = "Files", .icon = "folder-symbolic", .items = &.{
+        .{ .name = "files-here", .label = "Browse Here in Pane", .detailed = "term.files-here", .icon = "folder-open-symbolic", .action = .files_browse_here },
+        .{ .name = "files-tab", .label = "Browse Here in New Tab", .detailed = "term.files-tab", .icon = "folder-new-symbolic", .action = .files_browse_tab },
+        .{ .name = "files-app", .label = "Open in Sketerm Files", .detailed = "term.files-app", .icon = "system-file-manager-symbolic", .action = .files_open_app },
+    } } },
     .{ .submenu = .{ .label = "Pane", .icon = "view-grid-symbolic", .items = &.{
         .{ .name = "zoom-pane", .label = "Zoom / Unzoom Pane", .detailed = "term.zoom-pane", .icon = "view-fullscreen-symbolic", .action = .zoom_pane },
         .{ .name = "set-pane-title", .label = "Set Pane Title…", .detailed = "term.set-pane-title", .icon = "document-edit-symbolic", .action = .set_pane_title },

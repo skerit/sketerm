@@ -2429,6 +2429,12 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
         return false;
     }
 
+    // Menu rows act on the FOCUSED pane (the window-level sink has no
+    // other handle on the pane the click landed in), so take the focus
+    // here: right-clicking pane B while pane A had it must not run the
+    // row against A.
+    _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
+
     // "Copy Command Output" greys out until a completed OSC 133
     // command zone is reachable.
     if (c.g_action_map_lookup_action(@ptrCast(group), "copy-output")) |act| {
