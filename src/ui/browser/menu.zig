@@ -120,16 +120,38 @@ const Pages = struct {
     /// Height past which a page scrolls (see pageMaxHeight).
     max_h: c_int,
 
-    /// A row that switches to page `page_name`.
+    /// A row that switches to page `page_name`, with the submenu
+    /// arrow at the trailing edge the way a real GtkMenu draws one.
     fn link(self: Pages, box: *c.GtkWidget, label: [*:0]const u8, page_name: []const u8) void {
+        self.linkRow(box, label, page_name, false);
+    }
+
+    /// The shared builder: `back` puts the arrow BEFORE the label and
+    /// points it the other way, which is what a return-to-parent row
+    /// is. The direction used to be spelled into the label text
+    /// ("Paste  >", "< Paste"), which no theme could render as an
+    /// icon and which had to be kept in sync by hand.
+    fn linkRow(self: Pages, box: *c.GtkWidget, label: [*:0]const u8, page_name: []const u8, back: bool) void {
         const ctx = self.allocator.create(PageCtx) catch return;
         ctx.* = .{ .allocator = self.allocator, .stack = self.stack, .popover = self.popover, .name = undefined };
         const n = @min(page_name.len, ctx.name.len);
         @memcpy(ctx.name[0..n], page_name[0..n]);
         ctx.name[n] = 0;
-        const btn = c.gtk_button_new_with_label(label);
+        const btn = c.gtk_button_new();
         c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-        c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(btn)), c.GTK_ALIGN_START);
+        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+        const lab = c.gtk_label_new(label);
+        c.gtk_label_set_xalign(@ptrCast(lab), 0);
+        c.gtk_widget_set_hexpand(lab, 1);
+        const arrow = c.gtk_image_new_from_icon_name(if (back) "go-previous-symbolic" else "pan-end-symbolic");
+        if (back) {
+            c.gtk_box_append(@ptrCast(row), arrow);
+            c.gtk_box_append(@ptrCast(row), lab);
+        } else {
+            c.gtk_box_append(@ptrCast(row), lab);
+            c.gtk_box_append(@ptrCast(row), arrow);
+        }
+        c.gtk_button_set_child(@ptrCast(btn), row);
         _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onPageClicked), @ptrCast(ctx), @ptrCast(&PageCtx.free), c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(box), btn);
     }
@@ -138,7 +160,7 @@ const Pages = struct {
     /// @return the box its own rows go in.
     fn page(self: Pages, page_name: []const u8, back_label: [*:0]const u8) *c.GtkWidget {
         const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-        self.link(box, back_label, "main");
+        self.linkRow(box, back_label, "main", true);
         c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
         var z: [32:0]u8 = undefined;
         const n = @min(page_name.len, z.len - 1);
@@ -288,17 +310,17 @@ pub fn showEntryMenu(
             menuButton(box, "Cut", &onMenuCut, ctx, false);
         }
         if (self.clip_path != null) {
-            pages.link(box, "Paste  >", "paste");
+            pages.link(box, "Paste", "paste");
             buildPaste(self, tab, ctx, pages);
         }
         if (on_entry) {
             menuButton(box, "Rename…", &onMenuRename, ctx, false);
-            pages.link(box, "Copy To  >", "copyto");
+            pages.link(box, "Copy To", "copyto");
             buildCopyTo(self, ctx, pages);
-            pages.link(box, "Organize  >", "organize");
+            pages.link(box, "Organize", "organize");
             buildOrganize(tab, ctx, pages, is_dir);
             if (tools) {
-                pages.link(box, "Tools  >", "tools");
+                pages.link(box, "Tools", "tools");
                 buildTools(ctx, pages, is_dir, is_local);
             }
         }
@@ -306,8 +328,8 @@ pub fn showEntryMenu(
         // a submenu for the only two verbs it has would be worse than
         // the length it saves.
         if (on_entry) {
-            pages.link(box, "New  >", "new");
-            buildNew(self, ctx, pages.page("new", "< New"));
+            pages.link(box, "New", "new");
+            buildNew(self, ctx, pages.page("new", "New"));
         } else {
             buildNew(self, ctx, box);
         }
@@ -351,8 +373,8 @@ fn buildOpen(
     const has_more = (is_dir and (is_local or self.on_host_term != null)) or
         (!is_dir and !is_local and self.on_host_open != null);
     if (!has_more) return;
-    pages.link(box, "Open  >", "open");
-    const p = pages.page("open", "< Open");
+    pages.link(box, "Open", "open");
+    const p = pages.page("open", "Open");
     if (is_dir) {
         if (is_local) menuButton(p, "Open Terminal Here", &onMenuTerminalHere, ctx, false);
         if (self.on_host_term != null)
@@ -363,7 +385,7 @@ fn buildOpen(
 }
 
 fn buildPaste(self: *BrowserView, tab: *BTab, ctx: *MenuCtx, pages: Pages) void {
-    const p = pages.page("paste", "< Paste");
+    const p = pages.page("paste", "Paste");
     menuButton(p, "Paste Here", &onMenuPaste, ctx, false);
     menuButton(p, "Paste as Symbolic Link", &onMenuPasteSymlink, ctx, false);
     // A hard link is offered only where it can succeed: same host,
@@ -377,7 +399,7 @@ fn buildPaste(self: *BrowserView, tab: *BTab, ctx: *MenuCtx, pages: Pages) void 
 /// Everywhere the selection can be sent: the other pane, the
 /// collection, a named register, the shell.
 fn buildCopyTo(self: *BrowserView, ctx: *MenuCtx, pages: Pages) void {
-    const p = pages.page("copyto", "< Copy To");
+    const p = pages.page("copyto", "Copy To");
     if (self.peerView()) |peer| {
         if (peer.currentTab()) |pt| {
             var pbuf: [4300]u8 = undefined;
@@ -401,7 +423,7 @@ fn buildCopyTo(self: *BrowserView, ctx: *MenuCtx, pages: Pages) void {
 /// bookmarks and the archive pair (compressing IS a reshape, and its
 /// two extract verbs only exist for archives anyway).
 fn buildOrganize(tab: *BTab, ctx: *MenuCtx, pages: Pages, is_dir: bool) void {
-    const p = pages.page("organize", "< Organize");
+    const p = pages.page("organize", "Organize");
     menuButton(p, "Duplicate", &onMenuDuplicate, ctx, false);
     menuButton(p, "Tags…", &onMenuTags, ctx, false);
     if (is_dir) menuButton(p, "Add Bookmark", &onMenuBookmark, ctx, false);
@@ -426,7 +448,7 @@ fn toolsApply(ctx: *MenuCtx, is_dir: bool, is_local: bool) bool {
 }
 
 fn buildTools(ctx: *MenuCtx, pages: Pages, is_dir: bool, is_local: bool) void {
-    const p = pages.page("tools", "< Tools");
+    const p = pages.page("tools", "Tools");
     if (is_dir) {
         menuButton(p, "Calculate Size", &onMenuCalcSize, ctx, false);
         menuButton(p, "Find Duplicates Here", &onMenuFindDups, ctx, false);

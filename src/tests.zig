@@ -115,6 +115,7 @@ comptime {
     _ = @import("filebrowser/paths.zig");
     _ = @import("filebrowser/entry.zig");
     _ = @import("filebrowser/crumbs.zig");
+    _ = @import("filebrowser/fileicon.zig");
     _ = @import("filebrowser/format.zig");
     _ = @import("filebrowser/progress.zig");
     _ = @import("filebrowser/xferqueue.zig");
