@@ -732,6 +732,10 @@ pub fn deleteRegister(self: *BrowserView, name: []const u8) void {
 pub fn installSelectionMenu(self: *BrowserView) void {
     const bar = c.gtk_widget_get_parent(@ptrCast(@alignCast(self.hidden_toggle))) orelse return;
     const btn = c.gtk_button_new_from_icon_name("edit-select-all-symbolic");
+    // Same treatment view.zig's `flatten` gives every other toolbar
+    // button; without it this one framed itself on hover while its
+    // neighbours did not.
+    BrowserView.flatten(btn.?);
     c.gtk_widget_set_tooltip_text(btn, "Selection: sticky clicks, visual range mode, persistent registers");
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onSelectionMenuClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_insert_child_after(@ptrCast(bar), btn, @ptrCast(@alignCast(self.hidden_toggle)));

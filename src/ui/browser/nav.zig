@@ -18,6 +18,7 @@ const HostConn = @import("types.zig").HostConn;
 const NavigationIntent = @import("types.zig").NavigationIntent;
 const Pending = @import("types.zig").Pending;
 const RowCtx = @import("render.zig").RowCtx;
+const render_mod = @import("render.zig");
 const selection = @import("selection.zig");
 const completionMatches = @import("../../filebrowser/paths.zig").completionMatches;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
@@ -77,8 +78,14 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     c.gtk_widget_set_vexpand(page, 1);
 
     // Sort header (details/compact views); contents are built by
-    // rebuildHeader once the tab exists.
-    const header = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+    // updateSortHeader once the tab exists. Its spacing and margins
+    // are the row boxes' spacing and margins -- render.zig budgets
+    // both from the same constants, and the columns only line up
+    // because these agree.
+    const header = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, render_mod.CELL_SPACING);
+    c.gtk_widget_add_css_class(header, "sketerm-fb-header");
+    c.gtk_widget_set_margin_start(header, render_mod.EDGE_MARGIN);
+    c.gtk_widget_set_margin_end(header, render_mod.EDGE_MARGIN);
     c.gtk_box_append(@ptrCast(page), header);
 
     const content = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
@@ -121,6 +128,10 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     const scroller = c.gtk_scrolled_window_new();
     c.gtk_widget_set_hexpand(scroller, 1);
     c.gtk_widget_set_vexpand(scroller, 1);
+    // The sort header sits OUTSIDE this scroller, so a scrollbar that
+    // took width would push every row left of its own column title.
+    // Overlay scrolling takes none.
+    c.gtk_scrolled_window_set_overlay_scrolling(@ptrCast(scroller), 1);
     const listbox = c.gtk_list_box_new();
     c.gtk_list_box_set_selection_mode(@ptrCast(listbox), c.GTK_SELECTION_MULTIPLE);
     c.gtk_list_box_set_activate_on_single_click(@ptrCast(listbox), 0);
@@ -185,6 +196,11 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     c.gtk_gesture_single_set_button(@ptrCast(area_click), 3);
     _ = c.g_signal_connect_data(area_click, "pressed", @ptrCast(&@import("menu.zig").onAreaRightClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(content, @ptrCast(area_click));
+
+    // Right-click the header STRIP (not just a title) opens the
+    // column picker. Installed once, on the box that survives every
+    // header rebuild -- the buttons inside it do not.
+    render_mod.installHeaderMenu(self, tab, header);
 
     // Sticky-click toggling and the visual-mode keys, both capture
     // phase so GtkListBox does not get there first.

@@ -37,6 +37,9 @@ pub const Record = struct {
     zoom: u8 = 1,
     /// Empty = the built-in default column set.
     columns: []const model.Column = &.{},
+    /// Dragged column widths, positional against `columns`; 0 (or a
+    /// short/absent list, e.g. a pre-resize file) = default width.
+    col_widths: []const i32 = &.{},
     /// Use counter, assigned on every write and read. Deterministic
     /// LRU: eviction always drops the smallest one.
     seq: u64 = 0,
@@ -68,6 +71,7 @@ pub const Store = struct {
         self.allocator.free(r.host);
         self.allocator.free(r.path);
         if (r.columns.len > 0) self.allocator.free(r.columns);
+        if (r.col_widths.len > 0) self.allocator.free(r.col_widths);
     }
 
     fn indexOf(self: *Store, host: []const u8, path: []const u8) ?usize {
@@ -114,10 +118,20 @@ pub const Store = struct {
                 return;
             };
         }
+        var col_widths: []i32 = &.{};
+        if (rec.col_widths.len > 0) {
+            col_widths = self.allocator.dupe(i32, rec.col_widths) catch {
+                self.allocator.free(host);
+                self.allocator.free(path);
+                if (columns.len > 0) self.allocator.free(columns);
+                return;
+            };
+        }
         var owned = rec;
         owned.host = host;
         owned.path = path;
         owned.columns = columns;
+        owned.col_widths = col_widths;
         owned.seq = self.takeSeq();
         if (self.indexOf(rec.host, rec.path)) |i| {
             self.freeRecord(self.records.items[i]);
@@ -185,10 +199,20 @@ pub const Store = struct {
                     continue;
                 };
             }
+            var col_widths: []i32 = &.{};
+            if (r.col_widths.len > 0) {
+                col_widths = allocator.dupe(i32, r.col_widths) catch {
+                    allocator.free(host);
+                    allocator.free(path);
+                    if (columns.len > 0) allocator.free(columns);
+                    continue;
+                };
+            }
             var owned = r;
             owned.host = host;
             owned.path = path;
             owned.columns = columns;
+            owned.col_widths = col_widths;
             if (owned.seq >= store.next_seq) store.next_seq = owned.seq + 1;
             store.records.append(allocator, owned) catch {
                 store.freeRecord(owned);
@@ -253,6 +277,7 @@ test "a folder's settings survive an encode/decode round trip" {
     var store = Store.init(t.allocator);
     defer store.deinit();
     const cols = [_]model.Column{ .kind, .size };
+    const widths = [_]i32{ 0, 130 };
     store.remember(.{
         .host = "box",
         .path = "/srv/data",
@@ -263,6 +288,7 @@ test "a folder's settings survive an encode/decode round trip" {
         .grouped = true,
         .zoom = 3,
         .columns = &cols,
+        .col_widths = &widths,
     });
     store.remember(.{ .path = "/home/me" });
     const json = try store.encode(t.allocator);
@@ -279,6 +305,10 @@ test "a folder's settings survive an encode/decode round trip" {
     try t.expect(rec.grouped);
     try t.expectEqual(@as(u8, 3), rec.zoom);
     try t.expectEqualSlices(model.Column, &cols, rec.columns);
+    try t.expectEqualSlices(i32, &widths, rec.col_widths);
+    // A record without widths (a pre-resize file) reads as empty,
+    // which every consumer treats as all-defaults.
+    try t.expectEqual(@as(usize, 0), back.peek("", "/home/me").?.col_widths.len);
     // The local folder is a different key, not an overwrite.
     try t.expect(back.peek("", "/home/me") != null);
     try t.expect(back.peek("box", "/home/me") == null);

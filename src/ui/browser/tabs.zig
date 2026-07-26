@@ -16,6 +16,7 @@ const browser_model = @import("../../filebrowser/model.zig");
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const RowCtx = @import("render.zig").RowCtx;
+const applyColumnWidths = @import("render.zig").applyColumnWidths;
 const dropSpecInto = @import("ops.zig").dropSpecInto;
 const menuButton = @import("menu.zig").menuButton;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
@@ -74,6 +75,24 @@ fn attrColumnsOf(arena: std.mem.Allocator, tab: *BTab) ![]const []const u8 {
     return out;
 }
 
+/// Dragged widths in the same order as `columnsOf`, so the two lists
+/// stay positional. 0 = this column was never dragged.
+fn colWidthsOf(arena: std.mem.Allocator, tab: *BTab) ![]const i32 {
+    var out: std.ArrayList(i32) = .empty;
+    for (std.enums.values(browser_model.Column)) |col| {
+        if (tab.columns.contains(col)) try out.append(arena, tab.col_widths.get(col));
+    }
+    return out.items;
+}
+
+/// Dragged widths of the extra columns, padded to the name list so a
+/// restore can walk them together.
+fn attrWidthsOf(arena: std.mem.Allocator, tab: *BTab) ![]const i32 {
+    const out = try arena.alloc(i32, tab.attr_columns.items.len);
+    for (out, 0..) |*w, i| w.* = if (i < tab.attr_col_widths.items.len) tab.attr_col_widths.items[i] else 0;
+    return out;
+}
+
 /// The full GTK-free snapshot of one tab, allocated in `arena`.
 pub fn tabStateOf(arena: std.mem.Allocator, tab: *BTab) !browser_model.TabState {
     const host = tab.hc.host orelse "";
@@ -91,6 +110,8 @@ pub fn tabStateOf(arena: std.mem.Allocator, tab: *BTab) !browser_model.TabState 
         .view = tab.view_mode,
         .columns = try columnsOf(arena, tab),
         .attr_columns = try attrColumnsOf(arena, tab),
+        .col_widths = try colWidthsOf(arena, tab),
+        .attr_col_widths = try attrWidthsOf(arena, tab),
         .sort = tab.sort_key,
         .descending = tab.descending,
         .dirs_first = tab.dirs_first,
@@ -114,6 +135,9 @@ fn openFromState(self: *BrowserView, state: browser_model.TabState) ?*BTab {
     const host: ?[]const u8 = if (state.location.host.len == 0) null else state.location.host;
     const tab = self.newTab(host, state.location.path) orelse return null;
     self.restoreTabState(tab, state);
+    // After restoreTabState: the width lists are positional against
+    // the column lists it just filled.
+    applyColumnWidths(tab, state);
     if (tab.attr_columns.items.len > 0) {
         // The listing newTab already asked for carries no attribute
         // values; re-subscribing is what fills the restored columns.
