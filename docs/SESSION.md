@@ -10168,3 +10168,93 @@ tree-expanded rows; an insensitive Back/Forward (empty history)
 cannot take the right-click history gesture; section fold state is
 user-global; file-symlinks now get their target-type icon (symlink
 identity rides emblems).
+
+## Files UX batch 2: columns, overflow, un-split, sidebar (2026-07-26)
+
+Second round of Nemo-parity feedback, again orchestrator + two Opus
+agents in disjoint worktrees, patches reviewed and re-verified on the
+merged tree.
+
+- 8719ea4 pane: widgets_dead fence. Closing a browser pane emitted
+  two Gtk-CRITICALs (gtk_box_remove/set_visible from detachBrowser at
+  the DEFERRED Pane.deinit, after the widget tree died). wrapper_box
+  ::destroy now flags the pane; detachBrowser skips the GTK calls
+  past it. Pre-existing (reproduced on master via cli close-pane),
+  promoted to a fix because Close Pane is now a first-class action.
+- da21f1d columns: ONE width authority (render.columnWidthOf over a
+  ColumnRef union) budgets header buttons AND data cells; header box
+  now shares the rows' spacing/margins (CELL_SPACING/EDGE_MARGIN
+  comptime-asserted against the CSS literals), header buttons lose
+  their theme padding via box.sketerm-fb-header CSS, cells gain the
+  same 4px inset (label.sketerm-fb-cell), the header's trailing
+  3-dots picker is GONE (header right-click + a "Columns..." row in
+  the view menu instead), the listing scroller is forced to overlay
+  scrolling (header sits outside it). Result: header text and cell
+  text start on the same pixel (agent measured deltas 0/0/1/0; size
+  stays right-aligned by design). Sort caret: always-reserved 16px
+  slot at the column's RIGHT edge -- toggling sort shifts nothing.
+  Drag grips between headers (col-resize cursor, live header during
+  the drag, one row re-render on release, double-click resets,
+  min 40px). Widths persist THREE ways: TabState.col_widths/
+  attr_col_widths (positional, absent/short = defaults -- old state
+  files load unchanged), duplicate-tab/undo-close/layout restore, and
+  NEW per-folder view memory (viewmem Record.col_widths) so a fresh
+  files-app start keeps them -- proven live across a restart
+  (viewmem.json col_widths [174,0,0] -> Perms back at 174px).
+  Column.width() defaults grew 12px to keep text room after the
+  insets; ATTR_COLUMN_WIDTH/MIN_COLUMN_WIDTH live in model.zig now.
+- 217db85 chrome: right tool cluster collapses into a hamburger
+  GtkMenuButton when the breadcrumb viewport drops under 200px
+  (expand needs 200 + measured reclaimed width + 24 -- hysteresis, no
+  oscillation). Event-driven: notify::page-size + changed on the
+  crumb hadjustment, decisions applied on an idle (moving widgets
+  inside the layout pass clips the cluster). The SAME widgets
+  reparent (ref/remove/append + re-orient vertical AFTER reparent),
+  so toggle state survives; search + shell stay inline always; the
+  two attach-time menu buttons collapse with the cluster because they
+  insert after hidden_toggle whose parent IS the cluster.
+  Un-split: new close_pane input action -> Window.closeFocusedPane,
+  in the palette, at the bottom of the browser background context
+  menu, and as a permanent hamburger row; runs via g_timeout(250)
+  because closing inside the popover's own dismiss crashed at app
+  teardown (a plain idle is too early). Split button/palette renamed
+  to say it ADDS a pane. Sidebar: content row is a GtkPaned
+  (resize=false/shrink=false start child), width persisted in
+  places.json (sidebar_px, clamped 120..900, 400ms debounced save),
+  sidebar_open tri-state (null = follow identity: OPEN in the files
+  app, closed in terminal panes; only a real user toggle writes it).
+  Double-click the path strip = editable entry (bubble-phase gesture,
+  n_press==2, through toggleLocationFace). Explicit
+  hover/active/checked CSS via alpha(currentColor,...) because Breeze
+  draws nothing for .flat buttons; breadcrumb segments + sibling
+  arrows now go through flatten() so the rules reach them.
+
+Taskbar identity: re-investigated with measurements this time. GTK
+sends set_app_id("dev.sker.sketerm.files") on the Wayland wire
+(WAYLAND_DEBUG=1 under a sketerm display session) and WM_CLASS
+"dev.sker.sketerm.files" on X11 (xprop under Xvfb); installed desktop
+files/icons on this machine are current and the two SVGs are clearly
+distinct at 48px. Every app-side surface is provably correct; no KDE
+in this container to reproduce the Plasma-side matching. Next step is
+on a Plasma machine: `qdbus org.kde.KWin /KWin supportInformation |
+grep -B2 -A8 -i sketerm` (X11) or the KWin debug console (Wayland)
+to see the resourceClass/desktopFile KWin actually resolved.
+
+Verification (merged tree): unit suite 1038/5/0 (new: places sidebar
+fields x3, model col_widths round-trip, viewmem widths in the
+round-trip test); smoke-fs, smoke-mux, smoke-broker, smoke-mcp,
+smoke-fuse, smoke-e2e sequentially PASS; GUI + mux + musl
+mux-portable + aarch64-macos cross build; sketerm-mux links
+libc/libm only. Live merged-tree Xvfb pass: default-open resizable
+sidebar persisting 300px across restart, split -> hamburger with
+live toggle state -> Close Pane -> survivor re-expands with ZERO
+Gtk-CRITICALs, column drag +60px with header/cells in lockstep,
+caret right-aligned, width surviving files-app restart via viewmem,
+double-click path editing, hover highlight, terminal "+" still
+opens a shell tab.
+
+Notes: the columns agent reported "browser tabs lost on --restore" as
+pre-existing; NOT reproducible on master via the canonical save ->
+--restore flow (browser tab restored fine, screenshot-verified) --
+treat as that rig's artifact. Known small gap: a dragged attr-column
+width persists per tab but not in viewmem (fixed columns only there).
