@@ -52,6 +52,11 @@ pub const Entry = struct {
     /// True when the entry, links followed, is a directory — the
     /// "can browse into it" signal (true for plain dirs too).
     tdir: bool = false,
+    /// Child entry count for directories ("." / ".." excluded), -1
+    /// when unknown (non-dirs, permission denied, or a count that hit
+    /// CHILD_COUNT_CAP). Counted daemon-side so remote listings get it
+    /// without extra round trips.
+    children: i64 = -1,
     /// user.sketerm.tags xattr, comma-separated ("" = none; always ""
     /// on platforms without lgetxattr).
     tags: []const u8 = "",
@@ -112,6 +117,25 @@ pub fn joinZ(buf: *[4096]u8, dir: []const u8, name: []const u8) pathz.Error![*:0
     return @ptrCast(buf);
 }
 
+/// A directory with more children than this reports -1 (unknown)
+/// rather than a misleading capped number.
+pub const CHILD_COUNT_CAP: i64 = 100_000;
+
+/// Count of a directory's entries excluding "." / "..", or -1 when it
+/// cannot be opened or exceeds CHILD_COUNT_CAP.
+fn countChildren(path: [*:0]const u8) i64 {
+    const d = c.opendir(path) orelse return -1;
+    defer _ = c.closedir(d);
+    var n: i64 = 0;
+    while (c.readdir(d)) |de| {
+        const nm: [*:0]const u8 = @ptrCast(&de.*.d_name);
+        if (nm[0] == '.' and (nm[1] == 0 or (nm[1] == '.' and nm[2] == 0))) continue;
+        n += 1;
+        if (n > CHILD_COUNT_CAP) return -1;
+    }
+    return n;
+}
+
 /// Stat one entry (lstat semantics; links resolved just enough for
 /// `target`/`tdir`). Strings are duped into `arena`. Null when the
 /// entry vanished between readdir and stat — a live filesystem race,
@@ -153,6 +177,7 @@ pub fn statEntryAttrs(arena: std.mem.Allocator, dir: []const u8, name: []const u
         var fst: c.struct_stat = undefined;
         if (c.stat(full, &fst) == 0) e.tdir = (fst.st_mode & c.S_IFMT) == c.S_IFDIR;
     }
+    if (e.tdir) e.children = countChildren(full);
     if (attrs.len > 0) {
         const values = arena.alloc([]const u8, attrs.len) catch return null;
         for (attrs, 0..) |attr, i| {
@@ -524,6 +549,7 @@ test "listDir: rich entries, dirs-first ci sort, symlink target" {
     try touch(dir, "alpha.txt", "");
     var z: [4096]u8 = undefined;
     _ = c.mkdir(try joinZ(&z, dir, "sub"), 0o755);
+    try touch(dir, "sub/inner.txt", "");
     _ = c.symlink("sub", try joinZ(&z, dir, "lnk"));
 
     const l = try listDir(arena, dir, MAX_ENTRIES);
@@ -543,6 +569,11 @@ test "listDir: rich entries, dirs-first ci sort, symlink target" {
     try std.testing.expectEqual(@as(u64, 5), l.entries[3].size);
     try std.testing.expect(l.entries[3].mtime_ms > 0);
     try std.testing.expect(!l.entries[3].tdir);
+
+    // Dirs (and links to dirs) carry their child count; files stay -1.
+    try std.testing.expectEqual(@as(i64, 1), l.entries[1].children);
+    try std.testing.expectEqual(@as(i64, 1), l.entries[0].children);
+    try std.testing.expectEqual(@as(i64, -1), l.entries[3].children);
 }
 
 test "listDir: entry cap sets truncated" {
