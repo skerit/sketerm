@@ -14,7 +14,6 @@ const HostConn = @import("types.zig").HostConn;
 const MenuCtx = @import("menu.zig").MenuCtx;
 const PendingJob = @import("types.zig").PendingJob;
 const WireJobEv = @import("types.zig").WireJobEv;
-const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const copyZ = @import("../../filebrowser/format.zig").copyZ;
 const entryForPath = @import("nav.zig").entryForPath;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
@@ -64,6 +63,10 @@ pub fn endProbe(self: *BrowserView, i: usize) void {
 }
 
 pub fn endProbesFor(self: *BrowserView, hc: ?*HostConn, message: [*:0]const u8) void {
+    // A null host means "every probe of this view", which only the
+    // view's own teardown asks for -- and a Properties toplevel must
+    // not outlive the view its buttons call into.
+    if (hc == null) closePropsWindows(self);
     var i: usize = 0;
     while (i < self.probes.items.len) {
         const probe = self.probes.items[i];
@@ -226,12 +229,36 @@ pub const PropsCtx = struct {
     attr_box: *c.GtkWidget = undefined,
     attr_name_entry: *c.GtkWidget = undefined,
     attr_value_entry: *c.GtkWidget = undefined,
+    /// The toplevel this context is attached to, so the view can
+    /// close its dialogs when it goes away.
+    window: *c.GtkWidget = undefined,
     syncing: bool = false,
 
     fn free(user: ?*anyopaque) callconv(.c) void {
         const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+        forgetPropsWindow(ctx.allocator, ctx.window);
         ctx.allocator.free(ctx.path);
         ctx.allocator.destroy(ctx);
+    }
+
+    /// False once the tab this dialog describes has been closed: the
+    /// dialog is a toplevel and outlives its tab, so every callback
+    /// that dereferences `tab` must ask first.
+    fn tabAlive(self: *const PropsCtx) bool {
+        for (self.view.tabs.items) |t| {
+            if (t == self.tab) return true;
+        }
+        return false;
+    }
+
+    /// The host connection this dialog acts through, or null (with a
+    /// status note) once its tab is gone.
+    fn liveHost(self: *const PropsCtx) ?*HostConn {
+        if (!self.tabAlive()) {
+            self.view.setStatus("properties: that tab was closed");
+            return null;
+        }
+        return self.tab.hc;
     }
 
     /// Bit weight of perm_bits[i]: 0o400 down to 0o1, then the
@@ -269,6 +296,49 @@ pub const PropsCtx = struct {
     }
 };
 
+/// Open Properties toplevels, so a dying BrowserView can take its
+/// dialogs down with it (they are real windows now, not popovers
+/// parented into the tab, so nothing else destroys them).
+///
+/// Process-wide rather than a BrowserView field only because every
+/// entry names its view; lookups are by view pointer, so two views --
+/// or two files -- never see each other's dialogs.
+const OpenProps = struct { view: *BrowserView, window: *c.GtkWidget };
+var open_props: std.ArrayList(OpenProps) = .empty;
+
+fn rememberPropsWindow(alloc: std.mem.Allocator, view: *BrowserView, window: *c.GtkWidget) void {
+    open_props.append(alloc, .{ .view = view, .window = window }) catch {};
+}
+
+fn forgetPropsWindow(alloc: std.mem.Allocator, window: *c.GtkWidget) void {
+    for (open_props.items, 0..) |entry, i| {
+        if (entry.window == window) {
+            _ = open_props.orderedRemove(i);
+            break;
+        }
+    }
+    // The last dialog closing releases the tracking array too, so
+    // nothing outlives the run.
+    if (open_props.items.len == 0) open_props.clearAndFree(alloc);
+}
+
+/// Destroy every Properties window this view opened.
+///
+/// The entry is dropped BEFORE the destroy, because destroying the
+/// window runs `PropsCtx.free`, which would otherwise try to remove
+/// it again mid-iteration.
+pub fn closePropsWindows(self: *BrowserView) void {
+    var i: usize = 0;
+    while (i < open_props.items.len) {
+        if (open_props.items[i].view != self) {
+            i += 1;
+            continue;
+        }
+        const window = open_props.orderedRemove(i).window;
+        c.gtk_window_destroy(@ptrCast(window));
+    }
+}
+
 pub fn propsRow(box: *c.GtkWidget, label: []const u8, value: []const u8) void {
     var buf: [1024:0]u8 = undefined;
     const txt = std.fmt.bufPrintZ(&buf, "{s}: {s}", .{ label, value }) catch return;
@@ -295,19 +365,47 @@ pub fn onMenuProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         self.setStatus("properties: entry is no longer in the listing");
         return;
     };
-    const popover = c.gtk_popover_new();
-    const ctx = self.allocator.create(PropsCtx) catch return;
+    // An AdwWindow (not a bare GtkWindow) so the dialog carries its
+    // own header bar: the window is a real toplevel, and its title
+    // and close button are drawn by the app rather than left to
+    // whatever decorations the session provides.
+    const window = c.adw_window_new();
+    const ctx = self.allocator.create(PropsCtx) catch {
+        c.gtk_window_destroy(@ptrCast(window));
+        return;
+    };
     ctx.* = .{
         .allocator = self.allocator,
         .view = self,
         .tab = tab,
         .path = self.allocator.dupe(u8, path) catch {
             self.allocator.destroy(ctx);
+            c.gtk_window_destroy(@ptrCast(window));
             return;
         },
         .is_dir = e.tdir,
+        .window = window,
     };
-    c.g_object_set_data_full(@ptrCast(popover), "sketerm-props", @ptrCast(ctx), @ptrCast(&PropsCtx.free));
+    c.g_object_set_data_full(@ptrCast(window), "sketerm-props", @ptrCast(ctx), @ptrCast(&PropsCtx.free));
+    rememberPropsWindow(self.allocator, self, window);
+
+    // A real, non-modal dialog: browsing continues behind it, and
+    // several files can have their properties open side by side.
+    var title_z: [576:0]u8 = undefined;
+    const win_title = std.fmt.bufPrintZ(&title_z, "{s} Properties", .{std.fs.path.basename(path)}) catch "Properties";
+    c.gtk_window_set_title(@ptrCast(window), win_title.ptr);
+    c.gtk_window_set_default_size(@ptrCast(window), 420, 560);
+    if (c.gtk_widget_get_root(self.root_box)) |root|
+        c.gtk_window_set_transient_for(@ptrCast(window), @ptrCast(@alignCast(root)));
+    const esc = c.gtk_shortcut_controller_new();
+    c.gtk_shortcut_controller_add_shortcut(
+        @ptrCast(esc),
+        c.gtk_shortcut_new(
+            c.gtk_keyval_trigger_new(c.GDK_KEY_Escape, 0),
+            c.gtk_callback_action_new(@ptrCast(&onPropsEscape), @ptrCast(ctx), null),
+        ),
+    );
+    c.gtk_widget_add_controller(window, esc);
 
     const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
     c.gtk_widget_set_margin_start(box, 10);
@@ -528,14 +626,24 @@ pub fn onMenuProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     c.gtk_box_append(@ptrCast(box), apply);
 
     const scroll = c.gtk_scrolled_window_new();
-    c.gtk_widget_set_size_request(scroll, 400, 520);
+    c.gtk_widget_set_vexpand(scroll, 1);
     c.gtk_scrolled_window_set_child(@ptrCast(scroll), box);
-    c.gtk_popover_set_child(@ptrCast(popover), scroll);
-    c.gtk_widget_set_parent(popover, tab.page);
-    connectPopoverAutoUnparent(popover);
-    const rect = c.GdkRectangle{ .x = 320, .y = 120, .width = 1, .height = 1 };
-    c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
-    c.gtk_popover_popup(@ptrCast(popover));
+    const toolbar = c.adw_toolbar_view_new();
+    c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar), c.adw_header_bar_new());
+    c.adw_toolbar_view_set_content(@ptrCast(toolbar), scroll);
+    c.adw_window_set_content(@ptrCast(window), toolbar);
+    c.gtk_window_present(@ptrCast(window));
+}
+
+/// Escape closes the dialog.
+///
+/// `close`, not `destroy`: tearing the window down inside its own key
+/// dispatch leaves the app without a focused toplevel, and the next
+/// context-menu popover then fails to appear.
+fn onPropsEscape(_: ?*c.GtkWidget, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+    c.gtk_window_close(@ptrCast(ctx.window));
+    return 1;
 }
 
 /// In-flight attr_list for an open Properties dialog. The box is
@@ -556,7 +664,7 @@ pub fn endAttrRequest(self: *BrowserView) void {
 }
 
 pub fn requestAttrs(self: *BrowserView, ctx: *PropsCtx) void {
-    const hc = ctx.tab.hc;
+    const hc = ctx.liveHost() orelse return;
     if (hc.state != .ready) return;
     self.endAttrRequest();
     const path = self.allocator.dupe(u8, ctx.path) catch return;
@@ -668,7 +776,8 @@ pub fn onPropsAttrAdd(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     if (name.len == 0) return self.setStatus("attribute name required");
     if (!std.mem.startsWith(u8, name, "user."))
         return self.setStatus("attribute names must start with user.");
-    self.sendOp(ctx.tab.hc, .{ .req = self.nextReq(), .op = "attr_set", .path = ctx.path, .pattern = name, .to = value });
+    const hc = ctx.liveHost() orelse return;
+    self.sendOp(hc, .{ .req = self.nextReq(), .op = "attr_set", .path = ctx.path, .pattern = name, .to = value });
     self.setStatusFmt("set {s}", .{name});
     // Re-read so the list shows what the host actually stored.
     self.requestAttrs(ctx);
@@ -676,7 +785,8 @@ pub fn onPropsAttrAdd(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
 pub fn onPropsChecksum(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
-    ctx.view.startProbe(.hash, ctx.tab.hc, ctx.hash_label, "hash", ctx.path);
+    const hc = ctx.liveHost() orelse return;
+    ctx.view.startProbe(.hash, hc, ctx.hash_label, "hash", ctx.path);
 }
 
 pub fn onPropsMediaInfo(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -685,11 +795,13 @@ pub fn onPropsMediaInfo(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     // media_meta takes a batch; one file is a batch of one, and it
     // goes through the SAME daemon-side extractor and host-side
     // cache the listing columns use.
-    ctx.view.startProbe(.media, ctx.tab.hc, box, "media_meta", ctx.path);
+    const hc = ctx.liveHost() orelse return;
+    ctx.view.startProbe(.media, hc, box, "media_meta", ctx.path);
 }
 
 pub fn onPropsOpenWith(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
+    if (ctx.liveHost() == null) return;
     ctx.view.openWithDialog(ctx.tab, ctx.path);
 }
 
@@ -711,7 +823,7 @@ pub fn onPropsOctalChanged(entry: *c.GtkEditable, user: ?*anyopaque) callconv(.c
 pub fn onPropsCalcSize(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
     const self = ctx.view;
-    const hc = ctx.tab.hc;
+    const hc = ctx.liveHost() orelse return;
     if (hc.state != .ready) {
         self.setStatusFmt("not connected to {s}", .{hc.label()});
         return;
@@ -722,7 +834,7 @@ pub fn onPropsCalcSize(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 pub fn onPropsApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *PropsCtx = @ptrCast(@alignCast(user.?));
     const self = ctx.view;
-    const hc = ctx.tab.hc;
+    const hc = ctx.liveHost() orelse return;
     if (hc.state != .ready) {
         self.setStatusFmt("not connected to {s}", .{hc.label()});
         return;
