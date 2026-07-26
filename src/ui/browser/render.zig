@@ -12,6 +12,7 @@ const searchmod = @import("search.zig");
 const views = @import("views.zig");
 
 const colkeys = @import("../../filebrowser/colkeys.zig");
+const fileicon = @import("../../filebrowser/fileicon.zig");
 const format = @import("../../filebrowser/format.zig");
 const mediacols = @import("mediacols.zig");
 
@@ -22,6 +23,7 @@ const Entry = @import("types.zig").Entry;
 const FileColor = @import("types.zig").FileColor;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const copyZ = @import("../../filebrowser/format.zig").copyZ;
+const copyZN = @import("../../filebrowser/format.zig").copyZN;
 const fmtModeZ = @import("../../filebrowser/format.zig").fmtModeZ;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const fmtTimeZ = @import("../../filebrowser/format.zig").fmtTimeZ;
@@ -29,6 +31,74 @@ const launchLocal = @import("open.zig").launchLocal;
 const millerNextSegment = @import("../../filebrowser/paths.zig").millerNextSegment;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const tagColorHex = @import("../../filebrowser/format.zig").tagColorHex;
+
+/// Width of the per-row expander button, and of the spacer that stands
+/// in for it on rows that cannot expand. They must agree or the name
+/// column would not line up between folders and files.
+const EXPANDER_PX = 16;
+
+var css_installed = false;
+
+/// Zero the theme's list-row padding and minimum height for the
+/// browser listing.
+///
+/// Adwaita gives every `list > row` a generous padding and a 34px
+/// min-height meant for settings rows; over a file listing that is
+/// pure whitespace, and no per-widget margin can shrink it. Installed
+/// once per process at APPLICATION priority, scoped to the
+/// `sketerm-fb-list` class so it can never reach another list.
+fn installCss(any_widget: *c.GtkWidget) void {
+    if (css_installed) return;
+    css_installed = true;
+    const css =
+        \\list.sketerm-fb-list > row {
+        \\  padding: 0;
+        \\  min-height: 0;
+        \\}
+        \\button.sketerm-fb-expander {
+        \\  padding: 0;
+        \\  margin: 0;
+        \\  min-width: 16px;
+        \\  min-height: 16px;
+        \\}
+    ;
+    const provider = c.gtk_css_provider_new();
+    c.gtk_css_provider_load_from_string(provider, css);
+    const display = c.gtk_widget_get_display(any_widget);
+    c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+}
+
+/// A themed, full-colour icon image for a listing entry, sized `px`.
+///
+/// Directories get the theme's `folder`; everything else is resolved
+/// from the content type GUESSED FROM THE NAME -- never from the
+/// content, which for a remote entry would mean reading the file. That
+/// is how the user's icon theme (Papirus, Breeze, ...) ends up
+/// deciding what a .png or a .zip looks like, exactly as in Nemo.
+fn entryIconImage(e: Entry, px: i32) ?*c.GtkWidget {
+    const img: ?*c.GtkWidget = blk: {
+        if (fileicon.folderIconName(e.kind, e.tdir)) |name| {
+            var fz: [32:0]u8 = undefined;
+            break :blk c.gtk_image_new_from_icon_name(copyZN(&fz, name));
+        }
+        var nz: [512:0]u8 = undefined;
+        _ = copyZN(&nz, e.name);
+        var uncertain: c.gboolean = 0;
+        const ctype = c.g_content_type_guess(&nz, null, 0, &uncertain);
+        if (ctype == null) break :blk null;
+        defer c.g_free(ctype);
+        // g_content_type_get_icon hands back a ref we own; the image
+        // takes its own, so ours is dropped right after.
+        const gicon = c.g_content_type_get_icon(ctype) orelse break :blk null;
+        defer c.g_object_unref(gicon);
+        break :blk c.gtk_image_new_from_gicon(gicon);
+    } orelse fallback: {
+        var gz: [32:0]u8 = undefined;
+        break :fallback c.gtk_image_new_from_icon_name(copyZN(&gz, fileicon.GENERIC_ICON));
+    };
+    if (img) |i| c.gtk_image_set_pixel_size(@ptrCast(i), px);
+    return img;
+}
 
 pub fn renderCurrent(self: *BrowserView) void {
     if (self.currentTab()) |t| self.renderTab(t);
@@ -208,18 +278,69 @@ pub const HeaderCtx = struct {
     }
 };
 
-pub fn headerButton(self: *BrowserView, tab: *BTab, label: [*:0]const u8, column: ?browser_model.Column, width: i32, expand: bool) void {
-    const btn = c.gtk_button_new_with_label(label);
+/// How a header button renders the sort it carries: not at all, or
+/// with the caret that says which way this column is ordered.
+pub const SortMark = enum { none, ascending, descending };
+
+pub fn sortMark(marked: bool, descending: bool) SortMark {
+    if (!marked) return .none;
+    return if (descending) .descending else .ascending;
+}
+
+/// Give a header button its label, plus the sort caret when it is the
+/// column the listing is ordered by.
+///
+/// The caret is an ICON to the right of the title (Nemo, Files, every
+/// GTK column view); it used to be a literal " ^"/" v" glued onto the
+/// label text, which no theme could style and which shifted the title
+/// every time the direction flipped.
+fn headerLabel(btn: *c.GtkWidget, label: [*:0]const u8, mark: SortMark, start: bool) void {
+    if (mark == .none) {
+        const lab = c.gtk_label_new(label);
+        if (start) c.gtk_widget_set_halign(lab, c.GTK_ALIGN_START);
+        c.gtk_button_set_child(@ptrCast(btn), lab);
+        return;
+    }
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+    if (start) c.gtk_widget_set_halign(box, c.GTK_ALIGN_START);
+    const lab = c.gtk_label_new(label);
+    c.gtk_box_append(@ptrCast(box), lab);
+    const arrow = c.gtk_image_new_from_icon_name(if (mark == .descending) "pan-down-symbolic" else "pan-up-symbolic");
+    c.gtk_box_append(@ptrCast(box), arrow);
+    c.gtk_button_set_child(@ptrCast(btn), box);
+}
+
+/// Right-click anywhere on the header strip opens the column picker,
+/// the way every file manager's column header does. The 3-dots button
+/// stays for discoverability.
+fn installHeaderMenu(self: *BrowserView, tab: *BTab, btn: *c.GtkWidget) void {
+    const ctx = self.allocator.create(HeaderCtx) catch return;
+    ctx.* = .{ .allocator = self.allocator, .tab = tab, .column = null };
+    const gesture = c.gtk_gesture_click_new();
+    c.gtk_gesture_single_set_button(@ptrCast(gesture), 3);
+    _ = c.g_signal_connect_data(gesture, "pressed", @ptrCast(&onHeaderRightClick), @ptrCast(ctx), @ptrCast(&HeaderCtx.free), c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(btn, @ptrCast(gesture));
+}
+
+pub fn onHeaderRightClick(gesture: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *HeaderCtx = @ptrCast(@alignCast(user.?));
+    const btn = c.gtk_event_controller_get_widget(@ptrCast(gesture)) orelse return;
+    showColumnPicker(ctx.tab, btn);
+}
+
+pub fn headerButton(self: *BrowserView, tab: *BTab, label: [*:0]const u8, column: ?browser_model.Column, width: i32, expand: bool, mark: SortMark) void {
+    const btn = c.gtk_button_new();
     c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+    headerLabel(btn.?, label, mark, expand);
     if (expand) {
         c.gtk_widget_set_hexpand(btn, 1);
-        c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(btn)), c.GTK_ALIGN_START);
     } else {
         c.gtk_widget_set_size_request(btn, width, -1);
     }
     const ctx = self.allocator.create(HeaderCtx) catch return;
     ctx.* = .{ .allocator = self.allocator, .tab = tab, .column = column };
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onHeaderClicked), @ptrCast(ctx), @ptrCast(&HeaderCtx.free), c.G_CONNECT_DEFAULT);
+    installHeaderMenu(self, tab, btn.?);
     c.gtk_box_append(@ptrCast(tab.header_box), btn);
 }
 
@@ -232,10 +353,12 @@ pub const ATTR_COLUMN_WIDTH = 160;
 /// this anyway, and a media column costs host-side file reads.
 pub const MAX_ATTR_COLUMNS = 8;
 
-pub fn attrHeaderButton(self: *BrowserView, tab: *BTab, label: [*:0]const u8, index: usize) void {
-    const btn = c.gtk_button_new_with_label(label);
+pub fn attrHeaderButton(self: *BrowserView, tab: *BTab, label: [*:0]const u8, index: usize, mark: SortMark) void {
+    const btn = c.gtk_button_new();
     c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+    headerLabel(btn.?, label, mark, false);
     c.gtk_widget_set_size_request(btn, ATTR_COLUMN_WIDTH, -1);
+    installHeaderMenu(self, tab, btn.?);
     const ctx = self.allocator.create(AttrColumnCtx) catch return;
     ctx.* = .{ .allocator = self.allocator, .tab = tab, .index = index, .entry = null };
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onAttrHeaderClicked), @ptrCast(ctx), @ptrCast(&AttrColumnCtx.free), c.G_CONNECT_DEFAULT);
@@ -364,39 +487,46 @@ pub fn onHeaderClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 pub fn updateSortHeader(self: *BrowserView, tab: *BTab) void {
     while (c.gtk_widget_get_first_child(tab.header_box)) |child|
         c.gtk_box_remove(@ptrCast(tab.header_box), child);
-    const mark = if (tab.descending) " v" else " ^";
-    var buf: [32:0]u8 = undefined;
-    const nm = std.fmt.bufPrintZ(&buf, "Name{s}", .{if (tab.sort_key == .name) mark else ""}) catch "Name";
-    self.headerButton(tab, nm.ptr, null, 0, true);
+    // The name column carries the sort only while no extra column
+    // claims it (an attribute sort parks sort_key back on .name).
+    const name_marked = tab.sort_key == .name and tab.attr_sort == null;
+    self.headerButton(tab, "Name", null, 0, true, sortMark(name_marked, tab.descending));
     if (tab.view_mode == .details) {
         for (std.enums.values(browser_model.Column)) |col| {
             if (!tab.columns.contains(col)) continue;
-            var cb: [32:0]u8 = undefined;
-            const marked = tab.sort_key == col.sortKey() and col != .target;
-            const txt: [*:0]const u8 = if (std.fmt.bufPrintZ(&cb, "{s}{s}", .{ col.title(), if (marked) mark else "" })) |v| v.ptr else |_| col.title();
-            self.headerButton(tab, txt, col, col.width(), false);
+            const marked = tab.sort_key == col.sortKey() and col != .target and tab.attr_sort == null;
+            self.headerButton(tab, col.title(), col, col.width(), false, sortMark(marked, tab.descending));
         }
         for (tab.attr_columns.items, 0..) |name, i| {
             var cb: [64:0]u8 = undefined;
             const marked = tab.attr_sort != null and tab.attr_sort.? == i;
-            const txt: [*:0]const u8 = if (std.fmt.bufPrintZ(&cb, "{s}{s}", .{
-                colkeys.label(name), if (marked) mark else "",
-            })) |v| v.ptr else |_| "column";
-            self.attrHeaderButton(tab, txt, i);
+            const txt: [*:0]const u8 = if (std.fmt.bufPrintZ(&cb, "{s}", .{colkeys.label(name)})) |v| v.ptr else |_| "column";
+            self.attrHeaderButton(tab, txt, i, sortMark(marked, tab.descending));
         }
         const picker = c.gtk_button_new_from_icon_name("view-more-symbolic");
         c.gtk_button_set_has_frame(@ptrCast(picker), 0);
-        c.gtk_widget_set_tooltip_text(picker, "Choose columns");
+        c.gtk_widget_set_tooltip_text(picker, "Choose columns (also on right-click anywhere in this header)");
         const ctx = self.allocator.create(HeaderCtx) catch return;
         ctx.* = .{ .allocator = self.allocator, .tab = tab, .column = null };
         _ = c.g_signal_connect_data(picker, "clicked", @ptrCast(&onColumnPicker), @ptrCast(ctx), @ptrCast(&HeaderCtx.free), c.G_CONNECT_DEFAULT);
+        installHeaderMenu(self, tab, picker.?);
         c.gtk_box_append(@ptrCast(tab.header_box), picker);
     }
 }
 
 pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *HeaderCtx = @ptrCast(@alignCast(user.?));
-    const self = ctx.tab.view;
+    showColumnPicker(ctx.tab, @ptrCast(@alignCast(btn)));
+}
+
+/// Build and pop the column picker, anchored at `btn` -- whichever
+/// header widget was clicked, since a right-click anywhere in the
+/// header opens it too.
+pub fn showColumnPicker(tab: *BTab, btn: *c.GtkWidget) void {
+    const self = tab.view;
+    // Right-clicking a second header while one is open would otherwise
+    // leave two pickers stacked, only one of them reachable.
+    self.closeColumnPicker();
     const popover = c.gtk_popover_new();
     const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
     c.gtk_widget_set_margin_start(box, 10);
@@ -405,9 +535,9 @@ pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     c.gtk_widget_set_margin_bottom(box, 10);
     for (std.enums.values(browser_model.Column)) |col| {
         const check = c.gtk_check_button_new_with_label(col.title());
-        c.gtk_check_button_set_active(@ptrCast(check), @intFromBool(ctx.tab.columns.contains(col)));
+        c.gtk_check_button_set_active(@ptrCast(check), @intFromBool(tab.columns.contains(col)));
         const cctx = self.allocator.create(HeaderCtx) catch continue;
-        cctx.* = .{ .allocator = self.allocator, .tab = ctx.tab, .column = col };
+        cctx.* = .{ .allocator = self.allocator, .tab = tab, .column = col };
         _ = c.g_signal_connect_data(check, "toggled", @ptrCast(&onColumnToggled), @ptrCast(cctx), @ptrCast(&HeaderCtx.free), c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(box), check);
     }
@@ -416,7 +546,7 @@ pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     c.gtk_label_set_xalign(@ptrCast(attr_head), 0);
     c.gtk_widget_add_css_class(attr_head, "dim-label");
     c.gtk_box_append(@ptrCast(box), attr_head);
-    for (ctx.tab.attr_columns.items, 0..) |name, i| {
+    for (tab.attr_columns.items, 0..) |name, i| {
         const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
         var nz: [256:0]u8 = undefined;
         const lbl = c.gtk_label_new(copyZ(@ptrCast(&nz), name));
@@ -425,7 +555,7 @@ pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         c.gtk_box_append(@ptrCast(row), lbl);
         const remove = c.gtk_button_new_from_icon_name("list-remove-symbolic");
         const rctx = self.allocator.create(AttrColumnCtx) catch continue;
-        rctx.* = .{ .allocator = self.allocator, .tab = ctx.tab, .index = i, .entry = null };
+        rctx.* = .{ .allocator = self.allocator, .tab = tab, .index = i, .entry = null };
         _ = c.g_signal_connect_data(remove, "clicked", @ptrCast(&onAttrColumnRemove), @ptrCast(rctx), @ptrCast(&AttrColumnCtx.free), c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(row), remove);
         c.gtk_box_append(@ptrCast(box), row);
@@ -438,7 +568,7 @@ pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             "read file metadata on the host that owns the file",
     );
     const actx = self.allocator.create(AttrColumnCtx) catch return;
-    actx.* = .{ .allocator = self.allocator, .tab = ctx.tab, .index = 0, .entry = add };
+    actx.* = .{ .allocator = self.allocator, .tab = tab, .index = 0, .entry = add };
     _ = c.g_signal_connect_data(add, "activate", @ptrCast(&onAttrColumnAdd), @ptrCast(actx), @ptrCast(&AttrColumnCtx.free), c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(box), add);
 
@@ -447,7 +577,7 @@ pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     // the header, which would destroy a button-parented popover
     // and close the picker after a single click.
     var bounds: c.graphene_rect_t = undefined;
-    if (c.gtk_widget_compute_bounds(@ptrCast(btn), ctx.tab.page, &bounds) != 0) {
+    if (c.gtk_widget_compute_bounds(@ptrCast(btn), tab.page, &bounds) != 0) {
         const rect = c.GdkRectangle{
             .x = @intFromFloat(bounds.origin.x),
             .y = @intFromFloat(bounds.origin.y),
@@ -456,7 +586,7 @@ pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         };
         c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
     }
-    c.gtk_widget_set_parent(popover, ctx.tab.page);
+    c.gtk_widget_set_parent(popover, tab.page);
     connectPopoverAutoUnparent(popover);
     self.column_picker = popover;
     c.gtk_popover_popup(@ptrCast(popover));
@@ -483,6 +613,13 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
     // a human browses. (Optimization: diff rows later.)
     tab.rendering = true;
     defer tab.rendering = false;
+    // The listbox is built in nav.zig; its density styling is claimed
+    // here, on the first render, because this is where the pointer is.
+    const listbox: *c.GtkWidget = @ptrCast(@alignCast(tab.listbox));
+    if (c.gtk_widget_has_css_class(listbox, "sketerm-fb-list") == 0) {
+        c.gtk_widget_add_css_class(listbox, "sketerm-fb-list");
+        installCss(listbox);
+    }
     while (c.gtk_list_box_get_row_at_index(tab.listbox, 0)) |row| {
         c.gtk_list_box_remove(tab.listbox, @ptrCast(row));
     }
@@ -591,17 +728,7 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
         c.gtk_image_set_pixel_size(@ptrCast(img), step.tile_icon_px);
         icon = img;
     }
-    if (icon == null) {
-        const icon_name: [*:0]const u8 = if (std.mem.eql(u8, e.kind, "dir"))
-            "folder-symbolic"
-        else if (std.mem.eql(u8, e.kind, "link"))
-            "emblem-symbolic-link"
-        else
-            "text-x-generic-symbolic";
-        const img = c.gtk_image_new_from_icon_name(icon_name);
-        c.gtk_image_set_pixel_size(@ptrCast(img), step.tile_icon_px);
-        icon = img;
-    }
+    if (icon == null) icon = entryIconImage(e, step.tile_icon_px);
     c.gtk_box_append(@ptrCast(tile), icon);
 
     var name_z: [256:0]u8 = undefined;
@@ -741,7 +868,8 @@ pub fn renderMillerCols(self: *BrowserView, tab: *BTab) void {
             if (!e.tdir) continue; // ancestor columns list directories only
             const row_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
             c.gtk_widget_set_margin_start(row_box, 6);
-            const icon = c.gtk_image_new_from_icon_name("folder-symbolic");
+            const icon = c.gtk_image_new_from_icon_name("folder");
+            c.gtk_image_set_pixel_size(@ptrCast(icon), 16);
             c.gtk_box_append(@ptrCast(row_box), icon);
             var nz: [256:0]u8 = undefined;
             const nn = @min(e.name.len, nz.len - 1);
@@ -915,7 +1043,7 @@ pub fn freeRowCtx(user: ?*anyopaque) callconv(.c) void {
 pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32) void {
     // Zoom drives both the icon size and the row height.
     const step = tab.vs.step();
-    const row_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+    const row_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
     c.gtk_widget_set_margin_start(row_box, @intCast(6 + depth * 18));
     c.gtk_widget_set_margin_end(row_box, 6);
     c.gtk_widget_set_margin_top(row_box, step.row_pad);
@@ -928,6 +1056,8 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
         const expanded = tab.subdirByPath(full) != null;
         const exp = c.gtk_button_new_from_icon_name(if (expanded) "pan-down-symbolic" else "pan-end-symbolic");
         c.gtk_button_set_has_frame(@ptrCast(exp), 0);
+        c.gtk_widget_add_css_class(exp, "sketerm-fb-expander");
+        c.gtk_widget_set_valign(exp, c.GTK_ALIGN_CENTER);
         const ctx = self.allocator.create(RowCtx) catch return;
         ctx.* = .{
             .allocator = self.allocator,
@@ -942,7 +1072,7 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
         c.gtk_box_append(@ptrCast(row_box), exp);
     } else {
         const spacer = c.gtk_label_new("");
-        c.gtk_widget_set_size_request(spacer, 24, -1);
+        c.gtk_widget_set_size_request(spacer, EXPANDER_PX, -1);
         c.gtk_box_append(@ptrCast(row_box), spacer);
     }
 
@@ -955,17 +1085,7 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
         c.gtk_image_set_pixel_size(@ptrCast(img), step.thumb_px);
         icon = img;
     }
-    if (icon == null) {
-        const icon_name: [*:0]const u8 = if (std.mem.eql(u8, e.kind, "dir"))
-            "folder-symbolic"
-        else if (std.mem.eql(u8, e.kind, "link"))
-            "emblem-symbolic-link"
-        else
-            "text-x-generic-symbolic";
-        const img = c.gtk_image_new_from_icon_name(icon_name);
-        c.gtk_image_set_pixel_size(@ptrCast(img), step.icon_px);
-        icon = img;
-    }
+    if (icon == null) icon = entryIconImage(e, step.icon_px);
     c.gtk_box_append(@ptrCast(row_box), icon);
 
     if (self.emblemFor(tab, e)) |emblem| {
@@ -1133,13 +1253,19 @@ pub fn appendColumnCell(self: *BrowserView, row_box: *c.GtkWidget, e: Entry, col
     var buf: [256:0]u8 = undefined;
     var mode_buf: [16:0]u8 = undefined;
     var size_buf: [48:0]u8 = undefined;
+    var items_buf: [32]u8 = undefined;
     var time_buf: [40:0]u8 = undefined;
     const text: [*:0]const u8 = switch (col) {
         .kind => copyZ(&buf, e.kind),
         .permissions => fmtModeZ(&mode_buf, e.mode, e.tdir),
         .owner => if (std.fmt.bufPrintZ(&buf, "{d}", .{e.uid})) |v| v.ptr else |_| "",
         .group => if (std.fmt.bufPrintZ(&buf, "{d}", .{e.gid})) |v| v.ptr else |_| "",
-        .size => if (std.mem.eql(u8, e.kind, "dir")) "" else @as([*:0]const u8, fmtSize(&size_buf, e.size).ptr),
+        // A directory has no meaningful byte size; Nemo shows what it
+        // holds instead, and so do we when the daemon counted it.
+        .size => if (std.mem.eql(u8, e.kind, "dir"))
+            copyZN(&size_buf, fileicon.fmtItems(&items_buf, e.children))
+        else
+            @as([*:0]const u8, fmtSize(&size_buf, e.size).ptr),
         .mtime => if (e.mtime_ms == 0) "" else fmtTimeZ(&time_buf, e.mtime_ms),
         .ctime => if (e.ctime_ms == 0) "" else fmtTimeZ(&time_buf, e.ctime_ms),
         .target => copyZ(&buf, e.target orelse ""),

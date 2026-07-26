@@ -39,8 +39,11 @@ pub const Step = struct {
     row_pad: i32,
 };
 
-/// Step DEFAULT_ZOOM reproduces the sizes the browser used before
-/// zoom existed, so an unzoomed listing looks exactly as it did.
+/// Step DEFAULT_ZOOM is the treeview-dense default: a 23px row, the
+/// density a GTK3 file manager (Nemo) has. These paddings ARE the
+/// whole row height now -- the theme's own list-row padding and
+/// min-height are zeroed for the browser listing by the stylesheet
+/// render.installCss puts up, so nothing is added on top of them.
 pub const ZOOM_STEPS = [_]Step{
     .{ .icon_px = 12, .thumb_px = 16, .tile_icon_px = 32, .tile_px = 72, .row_pad = 1 },
     .{ .icon_px = 16, .thumb_px = 24, .tile_icon_px = 48, .tile_px = 96, .row_pad = 2 },
