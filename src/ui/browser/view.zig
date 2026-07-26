@@ -55,6 +55,7 @@ const RestoreRead = @import("ops.zig").RestoreRead;
 const ThumbCtx = @import("preview.zig").ThumbCtx;
 const UndoOp = @import("types.zig").UndoOp;
 const colkeys = @import("../../filebrowser/colkeys.zig");
+const input = @import("../input.zig");
 const locbar = @import("locbar.zig");
 const mediacols = @import("mediacols.zig");
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
@@ -169,6 +170,9 @@ pub const BrowserView = struct {
     places_on: bool = false,
     bookmarks: std.ArrayList([]u8) = .empty,
     recent: std.ArrayList([]u8) = .empty,
+    /// Sidebar sections the user folded shut, by header text (owned,
+    /// persisted with places).
+    collapsed: std.ArrayList([]u8) = .empty,
     /// Saved queries (persisted with places): the root spec plus the
     /// query text exactly as typed. A live query and a one-shot search
     /// are ONE concept here -- what a query text means is decided by
@@ -317,7 +321,7 @@ pub const BrowserView = struct {
 
     // locbar.zig -- breadcrumb face, sibling and history dropdowns
     pub const installLocationFace = @import("locbar.zig").installLocationFace;
-    pub const appendHistoryArrow = @import("locbar.zig").appendHistoryArrow;
+    pub const installHistoryMenuGesture = @import("locbar.zig").installHistoryMenuGesture;
     pub const rebuildCrumbs = @import("locbar.zig").rebuildCrumbs;
     pub const cancelSiblings = @import("locbar.zig").cancelSiblings;
     pub const feedSiblings = @import("locbar.zig").feedSiblings;
@@ -679,6 +683,10 @@ pub const BrowserView = struct {
                 const owned = allocator.dupe(u8, r) catch continue;
                 self.recent.append(allocator, owned) catch allocator.free(owned);
             }
+            for (parsed.value.collapsed) |s| {
+                const owned = allocator.dupe(u8, s) catch continue;
+                self.collapsed.append(allocator, owned) catch allocator.free(owned);
+            }
             for (parsed.value.searches) |sq| {
                 const spec = allocator.dupe(u8, sq.spec) catch continue;
                 const pat = allocator.dupe(u8, sq.pattern) catch {
@@ -1001,6 +1009,8 @@ pub const BrowserView = struct {
         self.bookmarks.deinit(self.allocator);
         for (self.recent.items) |r| self.allocator.free(r);
         self.recent.deinit(self.allocator);
+        for (self.collapsed.items) |s| self.allocator.free(s);
+        self.collapsed.deinit(self.allocator);
         for (self.saved_searches.items) |sq| sq.deinitOwned(self.allocator);
         self.saved_searches.deinit(self.allocator);
         if (self.last_search) |ls| ls.deinitOwned(self.allocator);
@@ -1033,6 +1043,14 @@ pub const BrowserView = struct {
         return c.gtk_icon_theme_has_icon(theme, name) != 0;
     }
 
+    /// Nemo's toolbar buttons: flat, icon-only, and out of the focus
+    /// chain, so Tab walks the listing rather than the chrome.
+    fn flatten(btn: *c.GtkWidget) void {
+        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+        c.gtk_widget_add_css_class(btn, "flat");
+        c.gtk_widget_set_can_focus(btn, 0);
+    }
+
     /// One toolbar button. Falls back to a text label when the icon
     /// name does not resolve, so the worst case is a labelled button
     /// rather than an invisible one.
@@ -1042,6 +1060,7 @@ pub const BrowserView = struct {
         else
             c.gtk_button_new_with_label(text);
         c.gtk_widget_set_tooltip_text(btn, tip);
+        flatten(btn.?);
         _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), btn);
         return btn.?;
@@ -1055,9 +1074,58 @@ pub const BrowserView = struct {
         else
             c.gtk_button_set_label(@ptrCast(btn), text);
         c.gtk_widget_set_tooltip_text(btn, tip);
+        flatten(btn.?);
         _ = c.g_signal_connect_data(btn, "toggled", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(bar), btn);
         return btn.?;
+    }
+
+    /// The browser's own stylesheet: the linked nav pair and the
+    /// breadcrumb holder have to read as single controls, which no
+    /// stock GTK class does for a plain box of flat buttons. Installed
+    /// once per display, at APPLICATION priority, so a user theme
+    /// still wins.
+    var css_installed: bool = false;
+
+    fn installCss(any_widget: *c.GtkWidget) void {
+        if (css_installed) return;
+        css_installed = true;
+        const css =
+            \\.sketerm-fb-navpair, .sketerm-fb-path {
+            \\  border: 1px solid rgba(128,128,128,0.35);
+            \\  border-radius: 7px;
+            \\}
+            \\.sketerm-fb-navpair button, .sketerm-fb-path button {
+            \\  border-radius: 6px;
+            \\  margin: 0;
+            \\  min-height: 24px;
+            \\}
+            \\.sketerm-fb-toolbar button { padding-left: 6px; padding-right: 6px; }
+            \\.sketerm-fb-section arrow, .sketerm-fb-section image { opacity: 0.6; }
+        ;
+        const provider = c.gtk_css_provider_new();
+        c.gtk_css_provider_load_from_string(provider, css);
+        const display = c.gtk_widget_get_display(any_widget);
+        c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+
+    /// Re-list what the tab is showing, without touching history or
+    /// the view: the same one-shot `list` the resync path uses, for
+    /// the root and for every miller/column directory beside it.
+    fn onRefreshClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const tab = self.currentTab() orelse return;
+        self.refreshDir(tab, tab.root);
+        for (tab.subdirs.items) |d| self.refreshDir(tab, d);
+    }
+
+    /// Split into a second browser pane. The pane binding table owns
+    /// what a split IS (it can differ per profile), so this forwards
+    /// the action rather than reimplementing it.
+    fn onSplitClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        const ictx = self.pane.input_ctx orelse return;
+        _ = input.runAction(ictx, .new_browser_split);
     }
 
     fn buildUi(self: *BrowserView) void {
@@ -1065,19 +1133,36 @@ pub const BrowserView = struct {
         c.gtk_widget_set_hexpand(vbox, 1);
         c.gtk_widget_set_vexpand(vbox, 1);
 
-        const bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
-        c.gtk_widget_set_margin_start(bar, 4);
-        c.gtk_widget_set_margin_end(bar, 4);
-        c.gtk_widget_set_margin_top(bar, 4);
-        c.gtk_widget_set_margin_bottom(bar, 4);
+        installCss(vbox.?);
 
-        const back = self.barButton(bar, "go-previous-symbolic", "Back", "Back (Alt+Left)", &onBackClicked);
+        // Nemo's shape: a flat icon-only nav cluster on the left, the
+        // path control filling the middle, a flat icon-only tool
+        // cluster on the right.
+        const bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+        c.gtk_widget_add_css_class(bar, "sketerm-fb-toolbar");
+        c.gtk_widget_set_margin_start(bar, 3);
+        c.gtk_widget_set_margin_end(bar, 3);
+        c.gtk_widget_set_margin_top(bar, 3);
+        c.gtk_widget_set_margin_bottom(bar, 3);
+
+        const left = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
+        // Back and Forward are ONE control with two halves: they are
+        // the same axis, and Nemo's own pathbar reads that way.
+        const navpair = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+        c.gtk_widget_add_css_class(navpair, "linked");
+        c.gtk_widget_add_css_class(navpair, "sketerm-fb-navpair");
+        const back = self.barButton(navpair, "go-previous-symbolic", "Back", "Back (Alt+Left)", &onBackClicked);
         c.gtk_widget_set_sensitive(back, 0);
-        self.appendHistoryArrow(bar, .back);
-        const fwd = self.barButton(bar, "go-next-symbolic", "Forward", "Forward (Alt+Right)", &onFwdClicked);
+        const fwd = self.barButton(navpair, "go-next-symbolic", "Forward", "Forward (Alt+Right)", &onFwdClicked);
         c.gtk_widget_set_sensitive(fwd, 0);
-        self.appendHistoryArrow(bar, .forward);
-        _ = self.barButton(bar, "go-up-symbolic", "Up", "Up one folder (Alt+Up)", &onUpClicked);
+        // The per-side history list is a right-click on the button it
+        // belongs to; the two extra arrow buttons are gone.
+        self.installHistoryMenuGesture(back, .back);
+        self.installHistoryMenuGesture(fwd, .forward);
+        c.gtk_box_append(@ptrCast(left), navpair);
+        _ = self.barButton(left, "go-up-symbolic", "Up", "Up one folder (Alt+Up)", &onUpClicked);
+        _ = self.barButton(left, "view-refresh-symbolic", "Refresh", "Re-list this folder", &onRefreshClicked);
+        c.gtk_box_append(@ptrCast(bar), left);
 
         const entry = c.gtk_entry_new();
         c.gtk_widget_set_hexpand(entry, 1);
@@ -1092,23 +1177,30 @@ pub const BrowserView = struct {
         // breadcrumb shows by default, Ctrl+L swaps to the entry.
         self.installLocationFace(bar, entry);
 
-        const hidden = self.barToggle(bar, "view-reveal-symbolic", "Hidden", "Show hidden files", &onHiddenToggled);
-        _ = self.barToggle(bar, "system-search-symbolic", "Search", "Search this directory (daemon-side, recursive)", &onSearchToggled);
-        _ = self.barToggle(bar, "user-bookmarks-symbolic", "Places", "Places sidebar (bookmarks, recent, devices)", &onPlacesToggled);
-        _ = self.barButton(bar, "view-grid-symbolic", "View", "Cycle view: details / compact / grid / columns", &onViewModeClicked);
-        _ = self.barToggle(bar, "view-dual-symbolic", "Preview", "Preview panel (images, text head, metadata)", &onPreviewToggled);
-        _ = self.barButton(bar, "tab-new-symbolic", "New tab", "New browser tab", &onNewTabClicked);
-        _ = self.barButton(bar, "go-jump-symbolic", "Shell cwd", "Go to the shell's current directory (OSC 7)", &onCwdSyncClicked);
+        // The right cluster. `hidden` stays the insertion anchor the
+        // view and selection menus append themselves after
+        // (views.zig/selection.zig read its PARENT), so it must keep
+        // being a direct child of the box those buttons belong in.
+        const right = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
+        const hidden = self.barToggle(right, "view-reveal-symbolic", "Hidden", "Show hidden files", &onHiddenToggled);
+        _ = self.barToggle(right, "system-search-symbolic", "Search", "Search this directory (daemon-side, recursive)", &onSearchToggled);
+        _ = self.barToggle(right, "user-bookmarks-symbolic", "Places", "Places sidebar (bookmarks, recent, devices)", &onPlacesToggled);
+        _ = self.barButton(right, "view-grid-symbolic", "View", "Cycle view: details / compact / grid / columns", &onViewModeClicked);
+        _ = self.barToggle(right, "view-dual-symbolic", "Preview", "Preview panel (images, text head, metadata)", &onPreviewToggled);
+        _ = self.barButton(right, "sketerm-split-left-right-symbolic", "Split", "Split into two file browsers", &onSplitClicked);
+        _ = self.barButton(right, "tab-new-symbolic", "New tab", "New browser tab", &onNewTabClicked);
+        _ = self.barButton(right, "go-jump-symbolic", "Shell cwd", "Go to the shell's current directory (OSC 7)", &onCwdSyncClicked);
         // Its own bundled icon: Adwaita ships utilities-terminal-symbolic
         // only under symbolic/legacy/, so on a Breeze theme chain this
         // button -- the one that leaves the browser -- rendered blank.
         _ = self.barButton(
-            bar,
+            right,
             "sketerm-terminal-symbolic",
             "Shell",
             "Show this pane's shell. Ctrl+Shift+B (or the strip above the shell) brings the browser back.",
             &onTerminalClicked,
         );
+        c.gtk_box_append(@ptrCast(bar), right);
 
         c.gtk_box_append(@ptrCast(vbox), bar);
 
