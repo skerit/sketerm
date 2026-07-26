@@ -10092,3 +10092,79 @@ paste via the new empty-area menu MOVES it (source gone on disk);
 "+" gave a browser tab at $HOME in files mode and a fish shell tab in
 a terminal window. Suite 1030/6/0 with the chord-shadow audit named
 green; smoke-e2e PASS.
+
+## Files UX: Nemo-shaped chrome, real dialogs, terminal integration (2026-07-26)
+
+Jelle's feedback batch ("too fisherprice, too separate-buttons-y")
+addressed in five commits, implemented by four parallel worktree
+agents plus an orchestrator-authored wire change, each reviewed and
+independently re-verified before merging:
+
+- a86af5e fs: listings carry a per-directory child count, counted by
+  the OWNING daemon (getdents sweep, >100k = -1 unknown) so remote
+  listings get "N items" for free. Unit-tested in fsserve.
+- 0bea828 chrome: toolbar reshaped to Nemo's three clusters -- linked
+  bordered Back/Forward pair (right-click = that side's history; the
+  two pan-down arrow buttons are gone), Up, NEW Refresh, breadcrumb
+  path control drawn as one bordered unit expanding in the middle,
+  flat icon-only right cluster with a NEW split button (forwards
+  new_browser_split through the pane binding table). Sidebar sections
+  (Places/Registers/Bookmarks/Saved Queries/Recent/Devices) fold via
+  their header rows, persisted as `collapsed` in places.json (absent
+  = all expanded). Recent rows show dimmed-parent + plain-name labels
+  (splitRecentLabel, unit-tested; local: dropped, remote host kept in
+  the dimmed lead, raw spec in the tooltip).
+- aa03f78 listing: theme row padding zeroed via a sketerm-fb-list
+  scoped stylesheet -> 23px row pitch (Nemo density; ZOOM_STEPS
+  untouched). Row/tile/miller icons now come FULL-COLOUR from the
+  user's icon theme via g_content_type_guess(name)->
+  g_content_type_get_icon (name-only: remote-safe; folder for dirs,
+  text-x-generic fallback) -- this is the "why doesn't it use Nemo's
+  icons" answer: we hardcoded three symbolic names before. Dirs show
+  "N items"/"--" in Size (fileicon.fmtItems, unit-tested). Sort caret
+  is a pan-up/down icon right of the title, not " ^"/" v" label text.
+  Right-click on ANY header button opens the column picker (still
+  parented to tab.page + pointing_to, still survives header rebuilds).
+  Context-menu submenu rows carry a trailing pan-end icon and back
+  rows a leading go-previous icon (Pages.linkRow) instead of ">"/"<"
+  text.
+- c2b5d9e term: pane context menu grew a "Files" submenu -- Browse
+  Here in Pane (openBrowserHere), Browse Here in New Tab
+  (newBrowserTabFrom), Open in Sketerm Files (g_spawn_async of our
+  own exe `files <spec>`; GApplication uniqueness forwards into a
+  running files instance -- proven live: same pid, rig-isolated).
+  paneMenuPrePopup now FOCUSES the clicked pane first, fixing a
+  pre-existing bug where every menu row acted on the previously
+  focused pane. Files-identity windows never show the per-pane
+  titlebar strip (show_titlebar stays honored in terminal windows).
+- 978931b props: Properties is a real non-modal AdwWindow (header
+  bar, "<name> Properties", 420x560 default, Escape closes via
+  gtk_window_close, transient-for the browser toplevel, several open
+  side by side). New exposure handled: dialogs outlive tabs/panes, so
+  callbacks resolve the host via liveHost() (closed tab = status
+  note) and BrowserView teardown destroys its dialogs through
+  endProbesFor's existing null-host path.
+
+Taskbar identity mystery resolved WITHOUT code: the installed package
+(r1064.g8939e1b, Jul 25) predates eef440b's files-identity work --
+the installed .files.desktop still had Icon=dev.sker.sketerm +
+StartupWMClass=sketerm. Master is correct end to end (prgname before
+GTK init, own desktop entry + SVG, PKGBUILD installs both);
+`cd dist && ./install.sh` is the fix.
+
+Verification on the merged tree: unit suite 1033/6/0 (three new
+tests: splitRecentLabel, fmtItems, folderIconName); smoke-fs,
+smoke-mux, smoke-broker, smoke-mcp, smoke-fuse, smoke-e2e all PASS
+run sequentially; GUI + mux + musl mux-portable + aarch64-macos
+cross all build; sketerm-mux still links libc/libm only. Live merged
+Xvfb pass (10 screenshots read): three-cluster toolbar, dir counts,
+colored icons, 23px rows, header right-click picker, submenu arrows,
+real Properties window, foldable sidebar, terminal Files submenu
+opening the location in the running files instance, red titlebar in
+terminal windows / none in files windows.
+
+Deliberate scope notes: browser Refresh does not re-list inline
+tree-expanded rows; an insensitive Back/Forward (empty history)
+cannot take the right-click history gesture; section fold state is
+user-global; file-symlinks now get their target-type icon (symlink
+identity rides emblems).
