@@ -83,18 +83,30 @@ pub const Column = enum {
         };
     }
 
-    /// Fixed pixel width so header and rows line up without a grid.
+    /// Default pixel width of the WHOLE column slot -- the cell's
+    /// horizontal insets and the resize grip come out of it, so the
+    /// header button and the data cell can be budgeted from one
+    /// number and cannot drift apart. A user drag overrides it
+    /// (TabState.col_widths).
     pub fn width(self: Column) i32 {
         return switch (self) {
-            .kind => 64,
-            .permissions => 92,
-            .owner, .group => 72,
-            .size => 88,
-            .mtime, .ctime => 148,
-            .target => 200,
+            .kind => 76,
+            .permissions => 104,
+            .owner, .group => 84,
+            .size => 100,
+            .mtime, .ctime => 160,
+            .target => 212,
         };
     }
 };
+
+/// Default width of an extra (key-named) column. Its values are
+/// free-form text, so it gets one generous ellipsized slot.
+pub const ATTR_COLUMN_WIDTH: i32 = 172;
+
+/// Narrowest a column may be dragged: below this the header title is
+/// nothing but an ellipsis.
+pub const MIN_COLUMN_WIDTH: i32 = 40;
 
 pub const default_columns = [_]Column{ .permissions, .size, .mtime };
 
@@ -111,6 +123,12 @@ pub const TabState = struct {
     columns: []const Column = &.{},
     /// Extended-attribute columns (full `user.*` names).
     attr_columns: []const []const u8 = &.{},
+    /// Dragged column widths, parallel to `columns`; 0 (or a short /
+    /// absent list) means that column keeps its default width.
+    col_widths: []const i32 = &.{},
+    /// Dragged widths of the extra columns, parallel to
+    /// `attr_columns`, same 0-means-default convention.
+    attr_col_widths: []const i32 = &.{},
     sort: SortKey = .name,
     descending: bool = false,
     dirs_first: bool = true,
@@ -229,6 +247,46 @@ test "grouping and zoom round-trip and old state files keep their defaults" {
     try std.testing.expectEqual(ViewMode.compact, old.value.tabs[0].view);
     try std.testing.expectEqualStrings("log", old.value.tabs[0].filter);
     try std.testing.expectEqualStrings("box", old.value.tabs[0].location.host);
+}
+
+test "dragged column widths round-trip and old state files keep the defaults" {
+    const cols = [_]Column{ .permissions, .size };
+    const widths = [_]i32{ 0, 210 };
+    const attrs = [_][]const u8{"user.note"};
+    const attr_widths = [_]i32{240};
+    const tabs = [_]TabState{.{
+        .columns = &cols,
+        .col_widths = &widths,
+        .attr_columns = &attrs,
+        .attr_col_widths = &attr_widths,
+    }};
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(PaneState{ .tabs = &tabs }, .{}, &out.writer);
+    const parsed = try std.json.parseFromSlice(PaneState, std.testing.allocator, out.written(), .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqualSlices(i32, &widths, parsed.value.tabs[0].col_widths);
+    try std.testing.expectEqualSlices(i32, &attr_widths, parsed.value.tabs[0].attr_col_widths);
+
+    // A state file written before resizable columns existed still
+    // loads, with every column back at its default width.
+    const old = try std.json.parseFromSlice(PaneState, std.testing.allocator,
+        \\{"version":1,"active_tab":0,"browser_visible":true,"tabs":[
+        \\{"view":"details","columns":["size","mtime"],"attr_columns":["user.note"]}]}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer old.deinit();
+    try std.testing.expectEqual(@as(usize, 0), old.value.tabs[0].col_widths.len);
+    try std.testing.expectEqual(@as(usize, 0), old.value.tabs[0].attr_col_widths.len);
+    // A width list SHORTER than the column list is legal: the
+    // remaining columns fall back to their defaults.
+    const short = try std.json.parseFromSlice(PaneState, std.testing.allocator,
+        \\{"tabs":[{"columns":["size","mtime"],"col_widths":[120]}]}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer short.deinit();
+    try std.testing.expectEqual(@as(usize, 1), short.value.tabs[0].col_widths.len);
+    try std.testing.expectEqual(@as(i32, 120), short.value.tabs[0].col_widths[0]);
 }
 
 test "column sort keys and widths stay in the header/row contract" {

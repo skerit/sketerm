@@ -20,6 +20,7 @@ const BrowserView = @import("view.zig").BrowserView;
 const Entry = @import("types.zig").Entry;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const menuButton = @import("menu.zig").menuButton;
+const showColumnPicker = @import("render.zig").showColumnPicker;
 
 /// One zoom step. Icon sizes stop at 128 on purpose: that is the
 /// freedesktop `normal` tier the thumbnail pipeline generates and
@@ -385,6 +386,14 @@ pub fn applyFolderMemory(self: *BrowserView, tab: *BTab) void {
     if (rec.columns.len > 0) {
         tab.columns = .initEmpty();
         for (rec.columns) |col| tab.columns.insert(col);
+        // Widths are positional against rec.columns; a navigation
+        // reuses the tab, so widths from the previous folder must not
+        // bleed into this one.
+        tab.col_widths = .initFill(0);
+        for (rec.columns, 0..) |col, i| {
+            if (i >= rec.col_widths.len) break;
+            if (rec.col_widths[i] > 0) tab.col_widths.set(col, rec.col_widths[i]);
+        }
     }
 }
 
@@ -393,10 +402,12 @@ pub fn applyFolderMemory(self: *BrowserView, tab: *BTab) void {
 pub fn rememberFolder(self: *BrowserView, tab: *BTab) void {
     if (!memorable(tab)) return;
     var cols: [std.enums.values(browser_model.Column).len]browser_model.Column = undefined;
+    var widths: [std.enums.values(browser_model.Column).len]i32 = undefined;
     var n: usize = 0;
     for (std.enums.values(browser_model.Column)) |col| {
         if (!tab.columns.contains(col)) continue;
         cols[n] = col;
+        widths[n] = tab.col_widths.get(col);
         n += 1;
     }
     const store = memStore(self);
@@ -410,6 +421,7 @@ pub fn rememberFolder(self: *BrowserView, tab: *BTab) void {
         .grouped = tab.vs.grouped,
         .zoom = tab.vs.zoom,
         .columns = cols[0..n],
+        .col_widths = widths[0..n],
     });
     store.save();
 }
@@ -439,7 +451,11 @@ pub fn forgetAllFolders(self: *BrowserView) void {
 pub fn installViewMenu(self: *BrowserView) void {
     const bar = c.gtk_widget_get_parent(@ptrCast(@alignCast(self.hidden_toggle))) orelse return;
     const btn = c.gtk_button_new_from_icon_name("view-list-symbolic");
-    c.gtk_widget_set_tooltip_text(btn, "View options: grouping, zoom, filter, flat view, folder memory");
+    // Same treatment view.zig's `flatten` gives every other toolbar
+    // button: flat, out of the focus chain, so the right cluster
+    // reads as one row of icons.
+    BrowserView.flatten(btn.?);
+    c.gtk_widget_set_tooltip_text(btn, "View options: columns, grouping, zoom, filter, flat view, folder memory");
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onViewMenuClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_insert_child_after(@ptrCast(bar), btn, @ptrCast(@alignCast(self.hidden_toggle)));
 }
@@ -492,6 +508,10 @@ pub fn onViewMenuClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
     updateZoomLabel(self, tab);
 
     menuButton(box, "Filter this listing (Ctrl+I)", &onFilterMenu, @ptrCast(self), false);
+    // The visible way to the column picker, now that the header
+    // carries no picker button of its own (right-clicking the header
+    // still opens the same popover).
+    menuButton(box, "Columns...", &onColumnsMenu, @ptrCast(self), false);
     c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
     const mem_head = c.gtk_label_new("This folder's view is remembered per folder");
     c.gtk_label_set_xalign(@ptrCast(mem_head), 0);
@@ -553,6 +573,16 @@ pub fn onFilterMenu(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
     const bar = ensureFilterBar(self) orelse return;
     if (c.gtk_widget_get_visible(bar) == 0) toggleFilter(self);
+}
+
+/// "Columns..." in the view menu: close this popover, then open the
+/// column picker over the tab's header strip.
+pub fn onColumnsMenu(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const tab = self.currentTab() orelse return;
+    if (c.gtk_widget_get_ancestor(@ptrCast(@alignCast(btn)), c.gtk_popover_get_type())) |pop|
+        c.gtk_popover_popdown(@ptrCast(pop));
+    showColumnPicker(tab, tab.header_box);
 }
 
 pub fn onForgetFolder(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

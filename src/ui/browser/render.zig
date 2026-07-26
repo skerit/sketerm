@@ -37,6 +37,26 @@ const tagColorHex = @import("../../filebrowser/format.zig").tagColorHex;
 /// column would not line up between folders and files.
 const EXPANDER_PX = 16;
 
+/// Horizontal gap between two adjacent widgets of a row or of the
+/// header. The header box and every row box MUST use this same
+/// spacing (and the same start/end margins) or the columns cannot
+/// line up.
+pub const CELL_SPACING = 4;
+
+/// Row/header inset from the listing edges. Same reason.
+pub const EDGE_MARGIN = 6;
+
+/// Inset between a column's slot and its text, applied by CSS to
+/// BOTH the header button and the data cell, so their content boxes
+/// start at the same x. Doubled between two columns, plus
+/// CELL_SPACING, is the whitespace that separates them.
+pub const CELL_PAD = 4;
+
+/// Width of the drag handle at a column's right edge. It is budgeted
+/// INSIDE the column's width (the header button gets width - this),
+/// so adding grips cannot shift the columns away from the rows.
+pub const GRIP_PX = 6;
+
 var css_installed = false;
 
 /// Zero the theme's list-row padding and minimum height for the
@@ -48,6 +68,10 @@ var css_installed = false;
 /// once per process at APPLICATION priority, scoped to the
 /// `sketerm-fb-list` class so it can never reach another list.
 fn installCss(any_widget: *c.GtkWidget) void {
+    // The stylesheet below is a literal; these are the numbers the
+    // measuring code budgets with.
+    comptime std.debug.assert(CELL_PAD == 4);
+    comptime std.debug.assert(EXPANDER_PX == 16);
     if (css_installed) return;
     css_installed = true;
     const css =
@@ -60,6 +84,20 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\  margin: 0;
         \\  min-width: 16px;
         \\  min-height: 16px;
+        \\}
+        \\box.sketerm-fb-header button {
+        \\  padding: 0 4px;
+        \\  margin: 0;
+        \\  border: none;
+        \\  min-height: 0;
+        \\  min-width: 0;
+        \\}
+        \\label.sketerm-fb-cell {
+        \\  padding: 0 4px;
+        \\}
+        \\box.sketerm-fb-grip separator {
+        \\  margin: 2px 0;
+        \\  background: alpha(currentColor, 0.25);
         \\}
     ;
     const provider = c.gtk_css_provider_new();
@@ -287,33 +325,108 @@ pub fn sortMark(marked: bool, descending: bool) SortMark {
     return if (descending) .descending else .ascending;
 }
 
+/// Which column a header widget is about: one of the fixed set, or
+/// an index into the tab's extra columns. The one currency the width
+/// helpers and the resize grips deal in.
+pub const ColumnRef = union(enum) {
+    fixed: browser_model.Column,
+    attr: usize,
+};
+
+/// The width of a column when the user has never dragged it.
+pub fn defaultColumnWidth(ref: ColumnRef) i32 {
+    return switch (ref) {
+        .fixed => |col| col.width(),
+        .attr => browser_model.ATTR_COLUMN_WIDTH,
+    };
+}
+
+/// THE width of one details column, in the header and in every row.
+///
+/// Both the header button and the data cell are budgeted from this
+/// one number, so a column's title and its values can never end up
+/// over different pixels.
+pub fn columnWidthOf(tab: *BTab, ref: ColumnRef) i32 {
+    const stored: i32 = switch (ref) {
+        .fixed => |col| tab.col_widths.get(col),
+        // Deliberately tolerant: the width list may be shorter than
+        // the name list (a restore fills the names first).
+        .attr => |i| if (i < tab.attr_col_widths.items.len) tab.attr_col_widths.items[i] else 0,
+    };
+    if (stored <= 0) return defaultColumnWidth(ref);
+    return @max(stored, browser_model.MIN_COLUMN_WIDTH);
+}
+
+/// Record a dragged width. Growing the extra-column list here is what
+/// lets it stay shorter than `attr_columns` until someone drags.
+pub fn setColumnWidth(tab: *BTab, ref: ColumnRef, width: i32) void {
+    const w = @max(width, browser_model.MIN_COLUMN_WIDTH);
+    switch (ref) {
+        .fixed => |col| tab.col_widths.set(col, w),
+        .attr => |i| {
+            while (tab.attr_col_widths.items.len <= i)
+                tab.attr_col_widths.append(tab.view.allocator, 0) catch return;
+            tab.attr_col_widths.items[i] = w;
+        },
+    }
+}
+
+/// Forget a dragged width (double-click on the grip).
+pub fn resetColumnWidth(tab: *BTab, ref: ColumnRef) void {
+    switch (ref) {
+        .fixed => |col| tab.col_widths.set(col, 0),
+        .attr => |i| if (i < tab.attr_col_widths.items.len) {
+            tab.attr_col_widths.items[i] = 0;
+        },
+    }
+}
+
+/// Apply a restored snapshot's column widths. Both lists are
+/// positional (parallel to `columns` / `attr_columns`) and may be
+/// short or absent, which is what makes a pre-resize state file load
+/// as "every column at its default".
+pub fn applyColumnWidths(tab: *BTab, state: browser_model.TabState) void {
+    for (state.columns, 0..) |col, i| {
+        if (i >= state.col_widths.len) break;
+        if (state.col_widths[i] > 0) setColumnWidth(tab, .{ .fixed = col }, state.col_widths[i]);
+    }
+    for (state.attr_col_widths, 0..) |w, i| {
+        if (i >= tab.attr_columns.items.len) break;
+        if (w > 0) setColumnWidth(tab, .{ .attr = i }, w);
+    }
+}
+
 /// Give a header button its label, plus the sort caret when it is the
 /// column the listing is ordered by.
 ///
-/// The caret is an ICON to the right of the title (Nemo, Files, every
-/// GTK column view); it used to be a literal " ^"/" v" glued onto the
-/// label text, which no theme could style and which shifted the title
-/// every time the direction flipped.
-fn headerLabel(btn: *c.GtkWidget, label: [*:0]const u8, mark: SortMark, start: bool) void {
-    if (mark == .none) {
-        const lab = c.gtk_label_new(label);
-        if (start) c.gtk_widget_set_halign(lab, c.GTK_ALIGN_START);
-        c.gtk_button_set_child(@ptrCast(btn), lab);
-        return;
-    }
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
-    if (start) c.gtk_widget_set_halign(box, c.GTK_ALIGN_START);
+/// Nemo's layout: the title is LEFT-aligned over the cells below it
+/// and the caret sits at the far right of the column. The caret slot
+/// is reserved even when unsorted (an empty image), so toggling the
+/// sort cannot shift a single column's x.
+fn headerLabel(btn: *c.GtkWidget, label: [*:0]const u8, mark: SortMark) void {
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, CELL_SPACING);
     const lab = c.gtk_label_new(label);
+    c.gtk_label_set_xalign(@ptrCast(lab), 0);
+    c.gtk_widget_set_halign(lab, c.GTK_ALIGN_START);
+    c.gtk_widget_set_hexpand(lab, 1);
+    // The title never grows the button past its budgeted width.
+    c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_END);
     c.gtk_box_append(@ptrCast(box), lab);
-    const arrow = c.gtk_image_new_from_icon_name(if (mark == .descending) "pan-down-symbolic" else "pan-up-symbolic");
+    const arrow = switch (mark) {
+        .none => c.gtk_image_new(),
+        .descending => c.gtk_image_new_from_icon_name("pan-down-symbolic"),
+        .ascending => c.gtk_image_new_from_icon_name("pan-up-symbolic"),
+    };
+    c.gtk_image_set_pixel_size(@ptrCast(arrow), 16);
+    c.gtk_widget_set_halign(arrow, c.GTK_ALIGN_END);
     c.gtk_box_append(@ptrCast(box), arrow);
     c.gtk_button_set_child(@ptrCast(btn), box);
 }
 
 /// Right-click anywhere on the header strip opens the column picker,
-/// the way every file manager's column header does. The 3-dots button
-/// stays for discoverability.
-fn installHeaderMenu(self: *BrowserView, tab: *BTab, btn: *c.GtkWidget) void {
+/// the way every file manager's column header does. The visible
+/// control is "Columns..." in the view-options menu.
+pub fn installHeaderMenu(self: *BrowserView, tab: *BTab, btn: *c.GtkWidget) void {
     const ctx = self.allocator.create(HeaderCtx) catch return;
     ctx.* = .{ .allocator = self.allocator, .tab = tab, .column = null };
     const gesture = c.gtk_gesture_click_new();
@@ -328,25 +441,60 @@ pub fn onHeaderRightClick(gesture: *c.GtkGestureClick, _: c_int, _: f64, _: f64,
     showColumnPicker(ctx.tab, btn);
 }
 
-pub fn headerButton(self: *BrowserView, tab: *BTab, label: [*:0]const u8, column: ?browser_model.Column, width: i32, expand: bool, mark: SortMark) void {
+/// The Name header: the one column that takes the leftover width, so
+/// it carries no fixed size and no resize grip.
+pub fn nameHeaderButton(self: *BrowserView, tab: *BTab, mark: SortMark) void {
     const btn = c.gtk_button_new();
     c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-    headerLabel(btn.?, label, mark, expand);
-    if (expand) {
-        c.gtk_widget_set_hexpand(btn, 1);
-    } else {
-        c.gtk_widget_set_size_request(btn, width, -1);
-    }
+    c.gtk_widget_set_can_focus(btn, 0);
+    headerLabel(btn.?, "Name", mark);
+    c.gtk_widget_set_hexpand(btn, 1);
     const ctx = self.allocator.create(HeaderCtx) catch return;
-    ctx.* = .{ .allocator = self.allocator, .tab = tab, .column = column };
+    ctx.* = .{ .allocator = self.allocator, .tab = tab, .column = null };
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onHeaderClicked), @ptrCast(ctx), @ptrCast(&HeaderCtx.free), c.G_CONNECT_DEFAULT);
     installHeaderMenu(self, tab, btn.?);
     c.gtk_box_append(@ptrCast(tab.header_box), btn);
 }
 
-/// Width of an extra column; values are free-form text, so they get
-/// one generous ellipsized column each.
-pub const ATTR_COLUMN_WIDTH = 160;
+/// One sizeable column header: the sort button plus the drag grip at
+/// its right edge, together exactly `columnWidthOf` pixels wide.
+fn columnHeader(
+    self: *BrowserView,
+    tab: *BTab,
+    ref: ColumnRef,
+    label: [*:0]const u8,
+    mark: SortMark,
+    clicked: *const anyopaque,
+    ctx: ?*anyopaque,
+    free_ctx: ?*const anyopaque,
+) void {
+    const width = columnWidthOf(tab, ref);
+    const slot = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+    // GTK propagates a descendant's hexpand up the tree unless a
+    // parent sets its own explicitly -- and the header title inside
+    // the button DOES expand (that is what pushes the caret right).
+    // Without these two, every column claimed a share of the leftover
+    // width and the header ended up at twice the rows' column widths.
+    c.gtk_widget_set_hexpand(slot, 0);
+    const btn = c.gtk_button_new();
+    c.gtk_widget_set_hexpand(btn, 0);
+    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+    c.gtk_widget_set_can_focus(btn, 0);
+    headerLabel(btn.?, label, mark);
+    c.gtk_widget_set_size_request(btn, width - GRIP_PX, -1);
+    if (ctx != null)
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(clicked), ctx, @ptrCast(free_ctx), c.G_CONNECT_DEFAULT);
+    installHeaderMenu(self, tab, btn.?);
+    c.gtk_box_append(@ptrCast(slot), btn);
+    c.gtk_box_append(@ptrCast(slot), makeGrip(self, tab, ref, btn.?));
+    c.gtk_box_append(@ptrCast(tab.header_box), slot);
+}
+
+pub fn headerButton(self: *BrowserView, tab: *BTab, label: [*:0]const u8, column: browser_model.Column, mark: SortMark) void {
+    const ctx = self.allocator.create(HeaderCtx) catch return;
+    ctx.* = .{ .allocator = self.allocator, .tab = tab, .column = column };
+    columnHeader(self, tab, .{ .fixed = column }, label, mark, &onHeaderClicked, @ptrCast(ctx), &HeaderCtx.free);
+}
 
 /// Cap on extra (key-named) columns: an xattr column costs an
 /// lgetxattr per entry per listing and the daemon refuses more than
@@ -354,15 +502,100 @@ pub const ATTR_COLUMN_WIDTH = 160;
 pub const MAX_ATTR_COLUMNS = 8;
 
 pub fn attrHeaderButton(self: *BrowserView, tab: *BTab, label: [*:0]const u8, index: usize, mark: SortMark) void {
-    const btn = c.gtk_button_new();
-    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-    headerLabel(btn.?, label, mark, false);
-    c.gtk_widget_set_size_request(btn, ATTR_COLUMN_WIDTH, -1);
-    installHeaderMenu(self, tab, btn.?);
     const ctx = self.allocator.create(AttrColumnCtx) catch return;
     ctx.* = .{ .allocator = self.allocator, .tab = tab, .index = index, .entry = null };
-    _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onAttrHeaderClicked), @ptrCast(ctx), @ptrCast(&AttrColumnCtx.free), c.G_CONNECT_DEFAULT);
-    c.gtk_box_append(@ptrCast(tab.header_box), btn);
+    columnHeader(self, tab, .{ .attr = index }, label, mark, &onAttrHeaderClicked, @ptrCast(ctx), &AttrColumnCtx.free);
+}
+
+/// Heap context for one column's resize grip.
+pub const GripCtx = struct {
+    allocator: std.mem.Allocator,
+    tab: *BTab,
+    ref: ColumnRef,
+    /// The header button whose size request follows the pointer while
+    /// the drag is in flight (the rows follow on release).
+    button: *c.GtkWidget,
+    /// Column width when this drag began.
+    start: i32 = 0,
+
+    fn free(user: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+        const ctx: *GripCtx = @ptrCast(@alignCast(user.?));
+        ctx.allocator.destroy(ctx);
+    }
+};
+
+/// The thin draggable divider at a column's right edge: Nemo's
+/// column resize handle, cursor and all. Double-clicking it puts the
+/// column back at its default width.
+fn makeGrip(self: *BrowserView, tab: *BTab, ref: ColumnRef, button: *c.GtkWidget) *c.GtkWidget {
+    const grip = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+    c.gtk_widget_add_css_class(grip, "sketerm-fb-grip");
+    c.gtk_widget_set_size_request(grip, GRIP_PX, -1);
+    c.gtk_widget_set_tooltip_text(grip, "Drag to resize this column; double-click to reset it");
+    c.gtk_widget_set_cursor_from_name(grip, "col-resize");
+    const line = c.gtk_separator_new(c.GTK_ORIENTATION_VERTICAL);
+    c.gtk_widget_set_halign(line, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_hexpand(line, 1);
+    c.gtk_box_append(@ptrCast(grip), line);
+
+    const ctx = self.allocator.create(GripCtx) catch return grip.?;
+    ctx.* = .{ .allocator = self.allocator, .tab = tab, .ref = ref, .button = button };
+    const drag = c.gtk_gesture_drag_new();
+    _ = c.g_signal_connect_data(drag, "drag-begin", @ptrCast(&onGripDragBegin), @ptrCast(ctx), @ptrCast(&GripCtx.free), c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(drag, "drag-update", @ptrCast(&onGripDragUpdate), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(drag, "drag-end", @ptrCast(&onGripDragEnd), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(grip, @ptrCast(drag));
+    const click = c.gtk_gesture_click_new();
+    _ = c.g_signal_connect_data(click, "pressed", @ptrCast(&onGripPressed), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(grip, @ptrCast(click));
+    return grip.?;
+}
+
+pub fn onGripDragBegin(_: *c.GtkGestureDrag, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *GripCtx = @ptrCast(@alignCast(user.?));
+    ctx.start = columnWidthOf(ctx.tab, ctx.ref);
+}
+
+/// Live feedback while dragging: only the HEADER follows the pointer.
+/// Re-rendering every row per motion frame would cost a full listing
+/// rebuild per frame; the rows catch up on release.
+pub fn onGripDragUpdate(_: *c.GtkGestureDrag, dx: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    dragTo(@ptrCast(@alignCast(user.?)), dx);
+}
+
+fn dragTo(ctx: *GripCtx, dx: f64) void {
+    const width = @max(ctx.start + @as(i32, @intFromFloat(dx)), browser_model.MIN_COLUMN_WIDTH);
+    setColumnWidth(ctx.tab, ctx.ref, width);
+    c.gtk_widget_set_size_request(ctx.button, width - GRIP_PX, -1);
+}
+
+pub fn onGripDragEnd(_: *c.GtkGestureDrag, dx: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *GripCtx = @ptrCast(@alignCast(user.?));
+    dragTo(ctx, dx);
+    // A press that moved nothing is not a resize -- and re-rendering
+    // it would destroy this grip mid-click, which is exactly what
+    // stops the second press of a double-click from ever arriving.
+    if (columnWidthOf(ctx.tab, ctx.ref) == ctx.start) return;
+    // The re-render rebuilds the header, which destroys this grip and
+    // frees `ctx` -- so nothing may be read from it afterwards. This
+    // is the one re-render that moves the rows under the new header.
+    const tab = ctx.tab;
+    // A dragged width is a view setting like sort or zoom: it joins
+    // the folder's remembered view, so revisiting the folder (or a
+    // fresh files-app start) keeps it.
+    @import("views.zig").rememberFolder(tab.view, tab);
+    tab.view.renderTab(tab);
+}
+
+/// Double-click a grip: back to the column's built-in width.
+pub fn onGripPressed(_: *c.GtkGestureClick, n_press: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    if (n_press != 2) return;
+    const ctx: *GripCtx = @ptrCast(@alignCast(user.?));
+    resetColumnWidth(ctx.tab, ctx.ref);
+    // Same teardown rule as drag-end: read everything first.
+    const tab = ctx.tab;
+    @import("views.zig").rememberFolder(tab.view, tab);
+    tab.view.renderTab(tab);
 }
 
 /// Heap context for an attribute-column header, remove button, or
@@ -408,6 +641,10 @@ pub fn onAttrColumnRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     if (ctx.index >= tab.attr_columns.items.len) return;
     const self = tab.view;
     const removed = tab.attr_columns.orderedRemove(ctx.index);
+    // The width list is positional; drop the same slot or every
+    // column after this one inherits its neighbour's width.
+    if (ctx.index < tab.attr_col_widths.items.len)
+        _ = tab.attr_col_widths.orderedRemove(ctx.index);
     const was_xattr = colkeys.sourceOf(removed) == .xattr;
     self.allocator.free(removed);
     tab.attr_sort = null;
@@ -485,17 +722,25 @@ pub fn onHeaderClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// Rebuild the sort header for the tab's current column set. Also
 /// the single place that renders sort direction.
 pub fn updateSortHeader(self: *BrowserView, tab: *BTab) void {
+    installCss(tab.header_box);
     while (c.gtk_widget_get_first_child(tab.header_box)) |child|
         c.gtk_box_remove(@ptrCast(tab.header_box), child);
+    // The header's leading spacer stands in for a row's expander
+    // slot, less the header button's own text inset, so "Name" lands
+    // exactly over the row icons -- the Nemo layout. Without it the
+    // whole header sat one expander to the left of the rows.
+    const lead = c.gtk_label_new("");
+    c.gtk_widget_set_size_request(lead, EXPANDER_PX - CELL_PAD, -1);
+    c.gtk_box_append(@ptrCast(tab.header_box), lead);
     // The name column carries the sort only while no extra column
     // claims it (an attribute sort parks sort_key back on .name).
     const name_marked = tab.sort_key == .name and tab.attr_sort == null;
-    self.headerButton(tab, "Name", null, 0, true, sortMark(name_marked, tab.descending));
+    nameHeaderButton(self, tab, sortMark(name_marked, tab.descending));
     if (tab.view_mode == .details) {
         for (std.enums.values(browser_model.Column)) |col| {
             if (!tab.columns.contains(col)) continue;
             const marked = tab.sort_key == col.sortKey() and col != .target and tab.attr_sort == null;
-            self.headerButton(tab, col.title(), col, col.width(), false, sortMark(marked, tab.descending));
+            self.headerButton(tab, col.title(), col, sortMark(marked, tab.descending));
         }
         for (tab.attr_columns.items, 0..) |name, i| {
             var cb: [64:0]u8 = undefined;
@@ -503,14 +748,6 @@ pub fn updateSortHeader(self: *BrowserView, tab: *BTab) void {
             const txt: [*:0]const u8 = if (std.fmt.bufPrintZ(&cb, "{s}", .{colkeys.label(name)})) |v| v.ptr else |_| "column";
             self.attrHeaderButton(tab, txt, i, sortMark(marked, tab.descending));
         }
-        const picker = c.gtk_button_new_from_icon_name("view-more-symbolic");
-        c.gtk_button_set_has_frame(@ptrCast(picker), 0);
-        c.gtk_widget_set_tooltip_text(picker, "Choose columns (also on right-click anywhere in this header)");
-        const ctx = self.allocator.create(HeaderCtx) catch return;
-        ctx.* = .{ .allocator = self.allocator, .tab = tab, .column = null };
-        _ = c.g_signal_connect_data(picker, "clicked", @ptrCast(&onColumnPicker), @ptrCast(ctx), @ptrCast(&HeaderCtx.free), c.G_CONNECT_DEFAULT);
-        installHeaderMenu(self, tab, picker.?);
-        c.gtk_box_append(@ptrCast(tab.header_box), picker);
     }
 }
 
@@ -1043,9 +1280,11 @@ pub fn freeRowCtx(user: ?*anyopaque) callconv(.c) void {
 pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32) void {
     // Zoom drives both the icon size and the row height.
     const step = tab.vs.step();
-    const row_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
-    c.gtk_widget_set_margin_start(row_box, @intCast(6 + depth * 18));
-    c.gtk_widget_set_margin_end(row_box, 6);
+    // Spacing and margins are shared with the header box; they are
+    // half of what makes the columns line up.
+    const row_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, CELL_SPACING);
+    c.gtk_widget_set_margin_start(row_box, @intCast(EDGE_MARGIN + depth * 18));
+    c.gtk_widget_set_margin_end(row_box, EDGE_MARGIN);
     c.gtk_widget_set_margin_top(row_box, step.row_pad);
     c.gtk_widget_set_margin_bottom(row_box, step.row_pad);
 
@@ -1151,7 +1390,7 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
     if (tab.view_mode == .details) {
         for (std.enums.values(browser_model.Column)) |col| {
             if (!tab.columns.contains(col)) continue;
-            self.appendColumnCell(row_box, e, col);
+            self.appendColumnCell(tab, row_box, e, col);
         }
         for (tab.attr_columns.items, 0..) |name, i| {
             var vz: [256:0]u8 = undefined;
@@ -1161,9 +1400,7 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
                 columnCellText(tab, dir, e, name, i, &disp_buf),
             ));
             c.gtk_widget_add_css_class(label, "dim-label");
-            c.gtk_label_set_xalign(@ptrCast(label), 0);
-            c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);
-            c.gtk_widget_set_size_request(label, ATTR_COLUMN_WIDTH, -1);
+            cellLabel(tab, label.?, .{ .attr = i }, 0);
             c.gtk_box_append(@ptrCast(row_box), label);
         }
     }
@@ -1246,9 +1483,19 @@ pub fn emblemFor(self: *BrowserView, tab: *BTab, e: Entry) ?[]const u8 {
     return self.emblems.iconFor(e.name, Lookup{ .spec = spec, .entry = e }, Lookup.get);
 }
 
+/// Size one data cell exactly like its header: the same budgeted
+/// width and the same text inset (the CSS class), so the column's
+/// title and its values start on the same pixel.
+fn cellLabel(tab: *BTab, label: *c.GtkWidget, ref: ColumnRef, xalign: f32) void {
+    c.gtk_widget_add_css_class(label, "sketerm-fb-cell");
+    c.gtk_label_set_xalign(@ptrCast(label), xalign);
+    c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);
+    c.gtk_widget_set_size_request(label, columnWidthOf(tab, ref), -1);
+}
+
 /// One details-view column cell. Widths match the header buttons
 /// so the columns line up without a size group.
-pub fn appendColumnCell(self: *BrowserView, row_box: *c.GtkWidget, e: Entry, col: browser_model.Column) void {
+pub fn appendColumnCell(self: *BrowserView, tab: *BTab, row_box: *c.GtkWidget, e: Entry, col: browser_model.Column) void {
     _ = self;
     var buf: [256:0]u8 = undefined;
     var mode_buf: [16:0]u8 = undefined;
@@ -1273,9 +1520,9 @@ pub fn appendColumnCell(self: *BrowserView, row_box: *c.GtkWidget, e: Entry, col
     const label = c.gtk_label_new(text);
     c.gtk_widget_add_css_class(label, "dim-label");
     if (col == .permissions) c.gtk_widget_add_css_class(label, "monospace");
-    c.gtk_label_set_xalign(@ptrCast(label), if (col == .size) 1.0 else 0.0);
-    c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_MIDDLE);
-    c.gtk_widget_set_size_request(label, col.width(), -1);
+    // Sizes read as numbers, right-aligned; everything else lines up
+    // with its (left-aligned) header title.
+    cellLabel(tab, label.?, .{ .fixed = col }, if (col == .size) 1.0 else 0.0);
     c.gtk_box_append(@ptrCast(row_box), label);
 }
 

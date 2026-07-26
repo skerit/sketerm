@@ -507,6 +507,15 @@ pub const BTab = struct {
     /// come from the batched media_meta job. colkeys.sourceOf tells
     /// them apart, so there is one add/remove/sort path, not two.
     attr_columns: std.ArrayList([]u8) = .empty,
+    /// Widths the user dragged the fixed columns to; 0 means "use
+    /// `Column.width()`". Read only through render.columnWidthOf, so
+    /// a header button and its data cells cannot disagree.
+    col_widths: std.EnumArray(browser_model.Column, i32) = .initFill(0),
+    /// Dragged widths of the extra columns, indexed like
+    /// `attr_columns`. Deliberately allowed to be SHORTER than that
+    /// list (a restore fills the names first): a missing entry reads
+    /// as the default width.
+    attr_col_widths: std.ArrayList(i32) = .empty,
     /// Index into attr_columns the view is sorted by, if any.
     attr_sort: ?usize = null,
     /// The scrolled window whose child swaps listbox <-> flowbox.
@@ -652,6 +661,7 @@ pub const BTab = struct {
         self.selected.deinit(a);
         for (self.attr_columns.items) |name| a.free(name);
         self.attr_columns.deinit(a);
+        self.attr_col_widths.deinit(a);
         if (self.filter.len > 0) a.free(self.filter);
         if (self.virtual_spec.len > 0) a.free(self.virtual_spec);
         self.clearNavError();
