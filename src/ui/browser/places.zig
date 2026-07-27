@@ -14,8 +14,7 @@ const query_mod = @import("../../filebrowser/query.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
 const trashFilesDir = @import("../../filebrowser/paths.zig").trashFilesDir;
-const menuButton = @import("menu.zig").menuButton;
-const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
+const classicmenu = @import("classicmenu.zig");
 
 /// Heap ctx on each places row (freed with the row).
 pub const PlaceCtx = struct {
@@ -389,40 +388,40 @@ pub fn onPlacesRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user:
         self.allocator.destroy(ctx);
         return;
     };
-    const popover = c.gtk_popover_new();
     ctx.* = .{
         .allocator = self.allocator,
         .view = self,
         .spec = spec_owned,
-        .popover = popover,
+        .popover = undefined,
     };
-    c.g_object_set_data_full(@ptrCast(popover), "sketerm-placesmenu", @ptrCast(ctx), @ptrCast(&PlacesMenuCtx.free));
-
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+    const root = classicmenu.Root.create(self.allocator) orelse {
+        self.allocator.free(ctx.spec);
+        self.allocator.destroy(ctx);
+        return;
+    };
+    const m = root.top();
     const is_search = std.mem.startsWith(u8, ctx.spec, "search:");
     const is_register = std.mem.startsWith(u8, ctx.spec, "register:");
     if (is_search) {
-        menuButton(box, "Run Query", &onPlacesMenuOpen, @ptrCast(ctx), false);
-        menuButton(box, "Remove Saved Query", &onPlacesMenuRemove, @ptrCast(ctx), true);
+        m.item("Run Query", &onPlacesMenuOpen, @ptrCast(ctx));
+        m.item("Remove Saved Query", &onPlacesMenuRemove, @ptrCast(ctx));
     } else if (is_register) {
-        menuButton(box, "Open Register", &onPlacesMenuOpen, @ptrCast(ctx), false);
+        m.item("Open Register", &onPlacesMenuOpen, @ptrCast(ctx));
     } else {
-        menuButton(box, "Open in New Tab", &onPlacesMenuOpenTab, @ptrCast(ctx), false);
-        menuButton(box, "Open Here", &onPlacesMenuOpen, @ptrCast(ctx), false);
-        menuButton(box, "Copy Location", &onPlacesMenuCopy, @ptrCast(ctx), false);
+        m.item("Open in New Tab", &onPlacesMenuOpenTab, @ptrCast(ctx));
+        m.item("Open Here", &onPlacesMenuOpen, @ptrCast(ctx));
+        m.item("Copy Location", &onPlacesMenuCopy, @ptrCast(ctx));
+        const extra = m.section();
         if (pctx.is_bookmark)
-            menuButton(box, "Remove Bookmark", &onPlacesMenuRemove, @ptrCast(ctx), true)
+            extra.item("Remove Bookmark", &onPlacesMenuRemove, @ptrCast(ctx))
         else if (isRecentSpec(self, ctx.spec))
-            menuButton(box, "Remove from Recent", &onPlacesMenuRemove, @ptrCast(ctx), true)
+            extra.item("Remove from Recent", &onPlacesMenuRemove, @ptrCast(ctx))
         else
-            menuButton(box, "Add Bookmark", &onPlacesMenuBookmark, @ptrCast(ctx), false);
+            extra.item("Add Bookmark", &onPlacesMenuBookmark, @ptrCast(ctx));
     }
-    c.gtk_popover_set_child(@ptrCast(popover), box);
-    c.gtk_widget_set_parent(popover, @ptrCast(@alignCast(self.places_list)));
-    connectPopoverAutoUnparent(popover);
-    const rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
-    c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
-    c.gtk_popover_popup(@ptrCast(popover));
+    const popover = root.popupVia(@ptrCast(@alignCast(self.places_list)), self.root_box, x, y);
+    ctx.popover = popover;
+    c.g_object_set_data_full(@ptrCast(popover), "sketerm-placesmenu", @ptrCast(ctx), @ptrCast(&PlacesMenuCtx.free));
 }
 
 /// Activate the row exactly as a click would (navigate here, run the

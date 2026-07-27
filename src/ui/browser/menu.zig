@@ -5,6 +5,8 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 
+const classicmenu = @import("classicmenu.zig");
+
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const RowCtx = @import("render.zig").RowCtx;
@@ -64,125 +66,6 @@ pub fn menuButton(box: *c.GtkWidget, label: [*:0]const u8, cb: anytype, ctx: *an
     c.gtk_box_append(@ptrCast(box), btn);
 }
 
-/// Tallest a menu page may be before it scrolls, given where in
-/// `parent` the click landed.
-///
-/// A popover is placed either wholly ABOVE or wholly BELOW its
-/// `pointing_to` rect, so the bigger of those two gaps is all the
-/// room there is. A child taller than that does not shrink and does
-/// not scroll: the popover silently fails to map, with no warning --
-/// which is exactly what the flat ~26-item menu did on a short
-/// screen. Clamped below so an edge click still yields a usable menu
-/// (GTK slides it), and above so a tall window does not produce a
-/// full-height wall of buttons.
-fn pageMaxHeight(parent: *c.GtkWidget, y: f64) c_int {
-    const h: f64 = @floatFromInt(c.gtk_widget_get_height(parent));
-    const room = @max(y, h - y) - 24;
-    return @intFromFloat(std.math.clamp(room, 200, 560));
-}
-
-/// Heap context for one submenu row: the page it switches to. Freed
-/// with its button through the GDestroyNotify below.
-const PageCtx = struct {
-    allocator: std.mem.Allocator,
-    stack: *c.GtkStack,
-    popover: *c.GtkWidget,
-    /// Page name, inline: one menu row is not worth an allocation.
-    name: [24:0]u8,
-
-    fn free(user: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void {
-        _ = closure;
-        const p: *PageCtx = @ptrCast(@alignCast(user.?));
-        p.allocator.destroy(p);
-    }
-};
-
-fn onPageClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const p: *PageCtx = @ptrCast(@alignCast(user.?));
-    c.gtk_stack_set_visible_child_name(p.stack, &p.name);
-    // A mapped popover keeps the size it was placed at; without this
-    // every page would inherit the tallest one's height and a short
-    // submenu would render as a mostly empty box.
-    c.gtk_popover_present(@ptrCast(@alignCast(p.popover)));
-}
-
-/// The entry menu's pages.
-///
-/// Submenus are pages of ONE GtkStack inside the single popover, not
-/// nested popovers: a popover opened from inside a live menu races
-/// the menu's grab (the trap "New from Template" works around by
-/// popping the menu down first). Only the visible page is ever
-/// measured, so the top level stays short enough to map.
-const Pages = struct {
-    allocator: std.mem.Allocator,
-    stack: *c.GtkStack,
-    popover: *c.GtkWidget,
-    /// Height past which a page scrolls (see pageMaxHeight).
-    max_h: c_int,
-
-    /// A row that switches to page `page_name`, with the submenu
-    /// arrow at the trailing edge the way a real GtkMenu draws one.
-    fn link(self: Pages, box: *c.GtkWidget, label: [*:0]const u8, page_name: []const u8) void {
-        self.linkRow(box, label, page_name, false);
-    }
-
-    /// The shared builder: `back` puts the arrow BEFORE the label and
-    /// points it the other way, which is what a return-to-parent row
-    /// is. The direction used to be spelled into the label text
-    /// ("Paste  >", "< Paste"), which no theme could render as an
-    /// icon and which had to be kept in sync by hand.
-    fn linkRow(self: Pages, box: *c.GtkWidget, label: [*:0]const u8, page_name: []const u8, back: bool) void {
-        const ctx = self.allocator.create(PageCtx) catch return;
-        ctx.* = .{ .allocator = self.allocator, .stack = self.stack, .popover = self.popover, .name = undefined };
-        const n = @min(page_name.len, ctx.name.len);
-        @memcpy(ctx.name[0..n], page_name[0..n]);
-        ctx.name[n] = 0;
-        const btn = c.gtk_button_new();
-        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
-        const lab = c.gtk_label_new(label);
-        c.gtk_label_set_xalign(@ptrCast(lab), 0);
-        c.gtk_widget_set_hexpand(lab, 1);
-        const arrow = c.gtk_image_new_from_icon_name(if (back) "go-previous-symbolic" else "pan-end-symbolic");
-        if (back) {
-            c.gtk_box_append(@ptrCast(row), arrow);
-            c.gtk_box_append(@ptrCast(row), lab);
-        } else {
-            c.gtk_box_append(@ptrCast(row), lab);
-            c.gtk_box_append(@ptrCast(row), arrow);
-        }
-        c.gtk_button_set_child(@ptrCast(btn), row);
-        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onPageClicked), @ptrCast(ctx), @ptrCast(&PageCtx.free), c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(box), btn);
-    }
-
-    /// A new submenu page headed by a row back to the top level.
-    /// @return the box its own rows go in.
-    fn page(self: Pages, page_name: []const u8, back_label: [*:0]const u8) *c.GtkWidget {
-        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-        self.linkRow(box, back_label, "main", true);
-        c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
-        var z: [32:0]u8 = undefined;
-        const n = @min(page_name.len, z.len - 1);
-        @memcpy(z[0..n], page_name[0..n]);
-        z[n] = 0;
-        _ = c.gtk_stack_add_named(self.stack, self.scrolled(box), &z);
-        return box;
-    }
-
-    /// Wrap a page so an over-long one scrolls instead of growing the
-    /// popover past what GTK can place. A short page is unaffected:
-    /// propagate-natural-height keeps it exactly as tall as its rows.
-    fn scrolled(self: Pages, box: *c.GtkWidget) *c.GtkWidget {
-        const sw = c.gtk_scrolled_window_new();
-        c.gtk_scrolled_window_set_policy(@ptrCast(sw), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-        c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(sw), 1);
-        c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(sw), 1);
-        c.gtk_scrolled_window_set_max_content_height(@ptrCast(sw), self.max_h);
-        c.gtk_scrolled_window_set_child(@ptrCast(sw), box);
-        return sw.?;
-    }
-};
 
 pub fn onRightClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     _ = n_press;
@@ -238,13 +121,10 @@ fn keepOrSelect(gesture: *c.GtkGestureClick, tab: *BTab, row: *c.GtkListBoxRow) 
 /// Build and pop the entry context menu. Takes ownership of
 /// `path`/`name`; `parent` is the visible widget the click hit.
 ///
-/// The verbs are GROUPED into submenu pages. Flat, this menu reached
-/// ~26 rows with a non-empty clipboard, and a popover whose child is
-/// taller than the space above OR below the click silently fails to
-/// map -- the menu simply never appeared on a short screen. Pages.
-/// keeps only one page measured at a time, and each page scrolls past
-/// PAGE_MAX_HEIGHT, so no combination of verbs can bring the failure
-/// back.
+/// A classic menu: GtkPopoverMenu over a GMenuModel (classicmenu),
+/// so the rows are compact and submenus open to the side on hover.
+/// Long menus scroll inside the popover, which is what makes the old
+/// too-tall-to-map failure impossible here.
 pub fn showEntryMenu(
     self: *BrowserView,
     tab: *BTab,
@@ -255,7 +135,6 @@ pub fn showEntryMenu(
     name: ?[]u8,
     is_dir: bool,
 ) void {
-    const popover = c.gtk_popover_new();
     const ctx = self.allocator.create(MenuCtx) catch {
         if (path) |p| self.allocator.free(p);
         if (name) |n| self.allocator.free(n);
@@ -268,183 +147,157 @@ pub fn showEntryMenu(
         .path = path,
         .name = name,
         .is_dir = is_dir,
-        .popover = popover,
+        .popover = undefined, // set right after popup, before any item can fire
     };
-    c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(ctx), @ptrCast(&MenuCtx.free));
-
-    const stack = c.gtk_stack_new();
-    // A GtkStack is vhomogeneous by default, which would make every
-    // page as tall as the LONGEST one and defeat the whole split.
-    c.gtk_stack_set_vhomogeneous(@ptrCast(stack), 0);
-    c.gtk_stack_set_hhomogeneous(@ptrCast(stack), 1);
-    c.gtk_stack_set_transition_type(@ptrCast(stack), c.GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
-    const pages = Pages{
-        .allocator = self.allocator,
-        .stack = @ptrCast(@alignCast(stack)),
-        .popover = popover.?,
-        .max_h = pageMaxHeight(parent, y),
+    const root = classicmenu.Root.create(self.allocator) orelse {
+        MenuCtx.free(@ptrCast(ctx));
+        return;
     };
-
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-    _ = c.gtk_stack_add_named(pages.stack, pages.scrolled(box), "main");
+    const m = root.top();
 
     const is_local = tab.hc.host == null;
     if (tab.root.archive.len > 0) {
         // Archive members: extract-and-open is the only verb
         // (path ops would misparse member names).
         if (ctx.path != null and !is_dir)
-            menuButton(box, "Extract and Open", &onMenuExtractMember, ctx, false);
+            m.item("Extract and Open", &onMenuExtractMember, ctx);
     } else if (tab.root.collection) {
         // Register rows: specs spanning hosts: navigation +
         // membership only (path verbs would misparse specs).
         if (ctx.path != null) {
-            menuButton(box, "Open in New Browser Tab", &onMenuCollectionOpen, ctx, false);
-            menuButton(box, "Unmark (remove from this register)", &onMenuRegisterRemove, ctx, false);
+            m.item("Open in New Browser Tab", &onMenuCollectionOpen, ctx);
+            m.item("Unmark (remove from this register)", &onMenuRegisterRemove, ctx);
         }
     } else {
         const on_entry = ctx.path != null;
         const tools = on_entry and toolsApply(ctx, is_dir, is_local);
+        if (on_entry) buildOpen(self, ctx, m, is_dir, is_local);
+        const edit = m.section();
         if (on_entry) {
-            buildOpen(self, ctx, box, pages, is_dir, is_local);
-            menuButton(box, "Copy", &onMenuCopy, ctx, false);
-            menuButton(box, "Cut", &onMenuCut, ctx, false);
+            edit.item("Copy", &onMenuCopy, ctx);
+            edit.item("Cut", &onMenuCut, ctx);
         }
-        if (self.clip_path != null) {
-            pages.link(box, "Paste", "paste");
-            buildPaste(self, tab, ctx, pages);
-        }
+        if (self.clip_path != null)
+            buildPaste(self, tab, ctx, edit.submenu("Paste"));
         if (on_entry) {
-            menuButton(box, "Rename…", &onMenuRename, ctx, false);
-            pages.link(box, "Copy To", "copyto");
-            buildCopyTo(self, ctx, pages);
-            pages.link(box, "Organize", "organize");
-            buildOrganize(tab, ctx, pages, is_dir);
-            if (tools) {
-                pages.link(box, "Tools", "tools");
-                buildTools(ctx, pages, is_dir, is_local);
-            }
+            edit.item("Rename…", &onMenuRename, ctx);
+            buildCopyTo(self, ctx, edit.submenu("Copy To"));
+            buildOrganize(tab, ctx, edit.submenu("Organize"), is_dir);
+            if (tools) buildTools(ctx, edit.submenu("Tools"), is_dir, is_local);
         }
         // A background click has almost no menu; making the user open
         // a submenu for the only two verbs it has would be worse than
         // the length it saves.
+        const create = m.section();
+        buildNew(self, ctx, if (on_entry) create.submenu("New") else create);
+        const tail = m.section();
         if (on_entry) {
-            pages.link(box, "New", "new");
-            buildNew(self, ctx, pages.page("new", "New"));
-        } else {
-            buildNew(self, ctx, box);
-        }
-        if (on_entry) {
-            menuButton(box, "Move to Trash", &onMenuTrash, ctx, false);
-            menuButton(box, "Delete Permanently…", &onMenuDelete, ctx, true);
-            menuButton(box, "Properties…", &onMenuProperties, ctx, false);
+            tail.item("Move to Trash", &onMenuTrash, ctx);
+            tail.item("Delete Permanently…", &onMenuDelete, ctx);
+            tail.item("Properties…", &onMenuProperties, ctx);
         }
         if (self.undo_stack.items.len > 0) {
-            var uz: [96:0]u8 = undefined;
+            var ubuf: [96]u8 = undefined;
+            var uz: [200]u8 = undefined;
             const last = self.undo_stack.items[self.undo_stack.items.len - 1];
-            const utxt = std.fmt.bufPrintZ(&uz, "Undo ({s})", .{last.describe()}) catch "Undo";
-            menuButton(box, utxt.ptr, &onMenuUndo, ctx, false);
+            const utxt = std.fmt.bufPrint(&ubuf, "Undo ({s})", .{last.describe()}) catch "Undo";
+            tail.item(classicmenu.escapeLabel(utxt, &uz), &onMenuUndo, ctx);
         }
         // Un-split: the background menu is the only place a browser
         // pane can be closed from -- its face has no pane titlebar and
         // no terminal right-click menu.
         if (!on_entry)
-            menuButton(box, "Close Pane", &onMenuClosePane, ctx, false);
+            tail.item("Close Pane", &onMenuClosePane, ctx);
     }
 
-    c.gtk_popover_set_child(@ptrCast(popover), stack);
-    c.gtk_widget_set_parent(popover, parent);
-    connectPopoverAutoUnparent(popover);
-    const rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
-    c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
-    c.gtk_popover_popup(@ptrCast(popover));
+    const popover = root.popupVia(parent, self.root_box, x, y);
+    ctx.popover = popover;
+    c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(ctx), @ptrCast(&MenuCtx.free));
 }
 
-/// The primary open verb inline, the rest behind "Open  >". Which one
-/// is primary depends on the entry: a directory is opened, a file is
-/// handed to an application.
+/// The primary open verb inline, the rest behind an "Open" side
+/// submenu. Which one is primary depends on the entry: a directory
+/// is opened, a file is handed to an application.
 fn buildOpen(
     self: *BrowserView,
     ctx: *MenuCtx,
-    box: *c.GtkWidget,
-    pages: Pages,
+    m: classicmenu.Menu,
     is_dir: bool,
     is_local: bool,
 ) void {
     if (is_dir) {
-        menuButton(box, "Open in New Browser Tab", &onMenuOpenTab, ctx, false);
+        m.item("Open in New Browser Tab", &onMenuOpenTab, ctx);
     } else {
-        menuButton(box, "Open With…", &onMenuOpenWith, ctx, false);
+        m.item("Open With…", &onMenuOpenWith, ctx);
     }
     const has_more = (is_dir and (is_local or self.on_host_term != null)) or
         (!is_dir and !is_local and self.on_host_open != null);
     if (!has_more) return;
-    pages.link(box, "Open", "open");
-    const p = pages.page("open", "Open");
+    const p = m.submenu("Open");
     if (is_dir) {
-        if (is_local) menuButton(p, "Open Terminal Here", &onMenuTerminalHere, ctx, false);
+        if (is_local) p.item("Open Terminal Here", &onMenuTerminalHere, ctx);
         if (self.on_host_term != null)
-            menuButton(p, "Open Terminal Tab Here", &onMenuTermTab, ctx, false);
+            p.item("Open Terminal Tab Here", &onMenuTermTab, ctx);
     } else if (!is_local and self.on_host_open != null) {
-        menuButton(p, "Open on Host (app forward)", &onMenuHostOpen, ctx, false);
+        p.item("Open on Host (app forward)", &onMenuHostOpen, ctx);
     }
 }
 
-fn buildPaste(self: *BrowserView, tab: *BTab, ctx: *MenuCtx, pages: Pages) void {
-    const p = pages.page("paste", "Paste");
-    menuButton(p, "Paste Here", &onMenuPaste, ctx, false);
-    menuButton(p, "Paste as Symbolic Link", &onMenuPasteSymlink, ctx, false);
+fn buildPaste(self: *BrowserView, tab: *BTab, ctx: *MenuCtx, p: classicmenu.Menu) void {
+    p.item("Paste Here", &onMenuPaste, ctx);
+    p.item("Paste as Symbolic Link", &onMenuPasteSymlink, ctx);
     // A hard link is offered only where it can succeed: same host,
     // same filesystem. Everywhere else the verb is simply absent.
     if (self.hardlinkPossible(tab))
-        menuButton(p, "Paste as Hard Link", &onMenuPasteHardlink, ctx, false);
-    menuButton(p, "Sync Here (mirror copy, resumable)", &onMenuSyncHere, ctx, false);
-    menuButton(p, "Compare / Sync with Copied…", &onMenuCompare, ctx, false);
+        p.item("Paste as Hard Link", &onMenuPasteHardlink, ctx);
+    p.item("Sync Here (mirror copy, resumable)", &onMenuSyncHere, ctx);
+    p.item("Compare / Sync with Copied…", &onMenuCompare, ctx);
 }
 
 /// Everywhere the selection can be sent: the other pane, the
 /// collection, a named register, the shell.
-fn buildCopyTo(self: *BrowserView, ctx: *MenuCtx, pages: Pages) void {
-    const p = pages.page("copyto", "Copy To");
+fn buildCopyTo(self: *BrowserView, ctx: *MenuCtx, p: classicmenu.Menu) void {
     if (self.peerView()) |peer| {
         if (peer.currentTab()) |pt| {
             var pbuf: [4300]u8 = undefined;
-            var lbuf: [4400:0]u8 = undefined;
+            var lbuf: [4400]u8 = undefined;
+            var ebuf: [4500]u8 = undefined;
             const dest = pt.spec(&pbuf);
-            if (std.fmt.bufPrintZ(&lbuf, "Copy to Other Pane ({s})  F5", .{dest})) |t| {
-                menuButton(p, t.ptr, &onMenuCopyToPeer, ctx, false);
+            if (std.fmt.bufPrint(&lbuf, "Copy to Other Pane ({s})  F5", .{dest})) |t| {
+                p.item(classicmenu.escapeLabel(t, &ebuf), &onMenuCopyToPeer, ctx);
             } else |_| {}
-            if (std.fmt.bufPrintZ(&lbuf, "Move to Other Pane ({s})  F6", .{dest})) |t| {
-                menuButton(p, t.ptr, &onMenuMoveToPeer, ctx, false);
+            if (std.fmt.bufPrint(&lbuf, "Move to Other Pane ({s})  F6", .{dest})) |t| {
+                p.item(classicmenu.escapeLabel(t, &ebuf), &onMenuMoveToPeer, ctx);
             } else |_| {}
         }
     }
-    menuButton(p, "Copy Path", &onMenuCopyPath, ctx, false);
-    menuButton(p, "Add to Collection", &onMenuRegisterAdd, ctx, false);
-    menuButton(p, "Mark in Register...", &onMenuRegisterAddNamed, ctx, false);
-    menuButton(p, "Export Selection to Shell ($SK_SEL)", &onMenuExportSel, ctx, false);
+    p.item("Copy Path", &onMenuCopyPath, ctx);
+    p.item("Add to Collection", &onMenuRegisterAdd, ctx);
+    p.item("Mark in Register...", &onMenuRegisterAddNamed, ctx);
+    p.item("Export Selection to Shell ($SK__SEL)", &onMenuExportSel, ctx);
 }
 
 /// The verbs that reshape an entry in place: rename variants, tags,
 /// bookmarks and the archive pair (compressing IS a reshape, and its
 /// two extract verbs only exist for archives anyway).
-fn buildOrganize(tab: *BTab, ctx: *MenuCtx, pages: Pages, is_dir: bool) void {
-    const p = pages.page("organize", "Organize");
-    menuButton(p, "Duplicate", &onMenuDuplicate, ctx, false);
-    menuButton(p, "Tags…", &onMenuTags, ctx, false);
-    if (is_dir) menuButton(p, "Add Bookmark", &onMenuBookmark, ctx, false);
+fn buildOrganize(tab: *BTab, ctx: *MenuCtx, p: classicmenu.Menu, is_dir: bool) void {
+    p.item("Duplicate", &onMenuDuplicate, ctx);
+    p.item("Tags…", &onMenuTags, ctx);
+    if (is_dir) p.item("Add Bookmark", &onMenuBookmark, ctx);
     if (countSelected(tab) > 1) {
-        menuButton(p, "Batch Rename Selected…", &onMenuBatchRename, ctx, false);
-        menuButton(p, "Batch Rename in $EDITOR…", &onMenuEditorRename, ctx, false);
+        p.item("Batch Rename Selected…", &onMenuBatchRename, ctx);
+        p.item("Batch Rename in $EDITOR…", &onMenuEditorRename, ctx);
     }
     if (!is_dir and isArchivePath(ctx.path.?)) {
-        menuButton(p, "Browse Archive", &onMenuBrowseArchive, ctx, false);
-        menuButton(p, "Extract Here", &onMenuExtractHere, ctx, false);
+        p.item("Browse Archive", &onMenuBrowseArchive, ctx);
+        p.item("Extract Here", &onMenuExtractHere, ctx);
     }
-    menuButton(p, "Compress to .tar.gz", &onMenuArchiveCreate, ctx, false);
+    p.item("Compress to .tar.gz", &onMenuArchiveCreate, ctx);
 }
 
-/// Does the Tools page have anything in it? Every one of its verbs is
-/// conditional, so the row is only offered when at least one applies.
+/// Does the Tools submenu have anything in it? Every one of its verbs
+/// is conditional, so the row is only offered when at least one
+/// applies.
 fn toolsApply(ctx: *MenuCtx, is_dir: bool, is_local: bool) bool {
     const p = ctx.path orelse return false;
     if (is_dir) return true; // Calculate Size + Find Duplicates
@@ -452,30 +305,29 @@ fn toolsApply(ctx: *MenuCtx, is_dir: bool, is_local: bool) bool {
     return is_local and isSketermMount(p);
 }
 
-fn buildTools(ctx: *MenuCtx, pages: Pages, is_dir: bool, is_local: bool) void {
-    const p = pages.page("tools", "Tools");
+fn buildTools(ctx: *MenuCtx, p: classicmenu.Menu, is_dir: bool, is_local: bool) void {
     if (is_dir) {
-        menuButton(p, "Calculate Size", &onMenuCalcSize, ctx, false);
-        menuButton(p, "Find Duplicates Here", &onMenuFindDups, ctx, false);
+        p.item("Calculate Size", &onMenuCalcSize, ctx);
+        p.item("Find Duplicates Here", &onMenuFindDups, ctx);
     }
     if (isTrashPath(ctx.path.?))
-        menuButton(p, "Restore from Trash", &onMenuTrashRestoreItem, ctx, false);
+        p.item("Restore from Trash", &onMenuTrashRestoreItem, ctx);
     if (is_local and !is_dir and isSketermMount(ctx.path.?)) {
-        menuButton(p, "Pin (keep hydrated)", &onMenuPin, ctx, false);
-        menuButton(p, "Evict Cached Data", &onMenuEvict, ctx, false);
+        p.item("Pin (keep hydrated)", &onMenuPin, ctx);
+        p.item("Evict Cached Data", &onMenuEvict, ctx);
     }
 }
 
 /// New Folder / New from Template, plus the user's declarative
 /// .action commands -- both "things to run HERE" rather than verbs on
-/// the entry. `box` is a submenu page when there is an entry and the
-/// top level when there is not.
-fn buildNew(self: *BrowserView, ctx: *MenuCtx, box: *c.GtkWidget) void {
-    menuButton(box, "New Folder…", &onMenuNewFolder, ctx, false);
-    menuButton(box, "New from Template…", &onMenuNewFromTemplate, ctx, false);
+/// the entry. `m` is a submenu when there is an entry and a top-level
+/// section when there is not.
+fn buildNew(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
+    m.item("New Folder…", &onMenuNewFolder, ctx);
+    m.item("New from Template…", &onMenuNewFromTemplate, ctx);
     // Appended last so a long actions directory cannot push the
     // built-in rows out of view.
-    if (ctx.path != null) self.appendActionButtons(box, ctx);
+    if (ctx.path != null) self.appendActionItems(m, ctx);
 }
 
 pub fn onPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
@@ -830,7 +682,7 @@ pub const ActionCtx = struct {
 /// Local-only actions hide on remote tabs (a local command cannot
 /// reach a remote path); RunsOnHost actions run as app sessions
 /// on the file's host (windows forward here).
-pub fn appendActionButtons(self: *BrowserView, box: *c.GtkWidget, ctx: *MenuCtx) void {
+pub fn appendActionItems(self: *BrowserView, m: classicmenu.Menu, ctx: *MenuCtx) void {
     const path = ctx.path orelse return;
     var dirbuf: [4096:0]u8 = undefined;
     const cfg = c.g_get_user_config_dir();
@@ -872,7 +724,7 @@ pub fn appendActionButtons(self: *BrowserView, box: *c.GtkWidget, ctx: *MenuCtx)
             }
             if (!matched) continue;
         }
-        // %f → single-quoted path, substituted now.
+        // %f -> single-quoted path, substituted now.
         var cmd: std.ArrayList(u8) = .empty;
         defer cmd.deinit(self.allocator);
         var rest = exec;
@@ -900,21 +752,25 @@ pub fn appendActionButtons(self: *BrowserView, box: *c.GtkWidget, ctx: *MenuCtx)
             },
             .runs_on_host = on_host,
         };
-        var lbl: [128:0]u8 = undefined;
-        const ltxt = std.fmt.bufPrintZ(&lbl, "{s}{s}", .{
+        // The item's ctx is not the popover-owned MenuCtx, so the
+        // menu root owns its release.
+        m.root.own(&actionCtxCleanup, @ptrCast(actx));
+        var lbl: [128]u8 = undefined;
+        var ebuf: [200]u8 = undefined;
+        const ltxt = std.fmt.bufPrint(&lbl, "{s}{s}", .{
             name, if (on_host) " (on host)" else "",
         }) catch continue;
-        const btn = c.gtk_button_new_with_label(ltxt.ptr);
-        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-        c.gtk_widget_set_halign(c.gtk_button_get_child(@ptrCast(btn)), c.GTK_ALIGN_START);
-        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onActionClicked), @ptrCast(actx), @ptrCast(&ActionCtx.free), c.G_CONNECT_DEFAULT);
-        // Popdown when an action fires: reuse the menu ctx's popover.
-        c.g_object_set_data(@ptrCast(btn), "sketerm-popover", @ptrCast(ctx.popover));
-        c.gtk_box_append(@ptrCast(box), btn);
+        m.item(classicmenu.escapeLabel(ltxt, &ebuf), &onActionActivated, @ptrCast(actx));
     }
 }
 
-pub fn onActionClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+fn actionCtxCleanup(user: ?*anyopaque) callconv(.c) void {
+    ActionCtx.free(user, null);
+}
+
+/// A user .action item fired. The popover closes itself (classic
+/// menu); this only runs the command.
+pub fn onActionActivated(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const actx: *ActionCtx = @ptrCast(@alignCast(user.?));
     const self = actx.view;
     if (actx.runs_on_host) {
@@ -931,8 +787,5 @@ pub fn onActionClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const cl = std.fmt.bufPrintZ(&z, "{s}", .{actx.cmdline}) catch return;
         _ = c.g_spawn_command_line_async(cl.ptr, null);
         self.setStatus("action started");
-    }
-    if (c.g_object_get_data(@ptrCast(btn), "sketerm-popover")) |pop| {
-        c.gtk_popover_popdown(@ptrCast(@alignCast(pop)));
     }
 }

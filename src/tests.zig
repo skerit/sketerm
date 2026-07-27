@@ -67,6 +67,7 @@ comptime {
     _ = @import("ui/browser/locbar.zig");
     _ = @import("ui/browser/tabs.zig");
     _ = @import("ui/browser/menu.zig");
+    _ = @import("ui/browser/classicmenu.zig");
     _ = @import("ui/browser/ops.zig");
     _ = @import("ui/browser/jobs.zig");
     _ = @import("ui/browser/jobpanel.zig");
