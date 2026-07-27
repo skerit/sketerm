@@ -17,9 +17,8 @@ const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const RowCtx = @import("render.zig").RowCtx;
 const applyColumnWidths = @import("render.zig").applyColumnWidths;
+const classicmenu = @import("classicmenu.zig");
 const dropSpecInto = @import("ops.zig").dropSpecInto;
-const menuButton = @import("menu.zig").menuButton;
-const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 
 /// Closed tabs remembered for undo-close-tab. Session state on
 /// purpose: a reopened tab is a within-session correction, while
@@ -325,27 +324,25 @@ pub fn onTabRightClick(_: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*
 
 pub fn showTabMenu(self: *BrowserView, tab: *BTab, x: f64, y: f64) void {
     const label_box = c.gtk_notebook_get_tab_label(self.notebook, tab.page) orelse return;
-    const popover = c.gtk_popover_new();
     const ctx = self.allocator.create(TabMenuCtx) catch return;
-    ctx.* = .{ .allocator = self.allocator, .view = self, .tab = tab, .popover = popover };
-    c.g_object_set_data_full(@ptrCast(popover), "sketerm-tabmenu", @ptrCast(ctx), @ptrCast(&TabMenuCtx.free));
-
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-    menuButton(box, "Duplicate Tab", &onTabMenuDuplicate, @ptrCast(ctx), false);
+    ctx.* = .{ .allocator = self.allocator, .view = self, .tab = tab, .popover = undefined };
+    const root = classicmenu.Root.create(self.allocator) orelse {
+        self.allocator.destroy(ctx);
+        return;
+    };
+    const m = root.top();
+    m.item("Duplicate Tab", &onTabMenuDuplicate, @ptrCast(ctx));
     if (self.closed_tabs.closed.items.len > 0) {
         var label: [96:0]u8 = undefined;
         const text = std.fmt.bufPrintZ(&label, "Reopen Closed Tab ({d})", .{
             self.closed_tabs.closed.items.len,
         }) catch "Reopen Closed Tab";
-        menuButton(box, text.ptr, &onTabMenuReopen, @ptrCast(ctx), false);
+        m.item(text.ptr, &onTabMenuReopen, @ptrCast(ctx));
     }
-    menuButton(box, "Close Tab", &onTabMenuClose, @ptrCast(ctx), true);
-    c.gtk_popover_set_child(@ptrCast(popover), box);
-    c.gtk_widget_set_parent(popover, label_box);
-    connectPopoverAutoUnparent(popover);
-    const rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
-    c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
-    c.gtk_popover_popup(@ptrCast(popover));
+    m.item("Close Tab", &onTabMenuClose, @ptrCast(ctx));
+    const popover = root.popup(label_box, x, y);
+    ctx.popover = popover;
+    c.g_object_set_data_full(@ptrCast(popover), "sketerm-tabmenu", @ptrCast(ctx), @ptrCast(&TabMenuCtx.free));
 }
 
 pub fn onTabMenuDuplicate(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

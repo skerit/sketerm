@@ -503,7 +503,7 @@ pub const BrowserView = struct {
     pub const onMenuExtractMember = @import("menu.zig").onMenuExtractMember;
     pub const onMenuExtractHere = @import("menu.zig").onMenuExtractHere;
     pub const onMenuArchiveCreate = @import("menu.zig").onMenuArchiveCreate;
-    pub const appendActionButtons = @import("menu.zig").appendActionButtons;
+    pub const appendActionItems = @import("menu.zig").appendActionItems;
     pub const onActionClicked = @import("menu.zig").onActionClicked;
 
     // ops.zig -- clipboard, rename, delete/trash, undo, archives, tags
