@@ -39,6 +39,25 @@ pub fn exePath(buf: *[4096]u8) ?[]const u8 {
     return buf[0..@intCast(n)];
 }
 
+/// Path to exec THIS process's own image, for self-spawn sites
+/// (job helpers, keepers, daemon autostart).
+/// Linux: the literal "/proc/self/exe" symlink — readlink of it
+/// grows a " (deleted)" suffix once a package upgrade replaces the
+/// binary on disk, and execv of that string fails (the long-running
+/// daemon then reports "job helper died" for every job). Execing
+/// the symlink itself always runs the caller's own (consistent)
+/// image. macOS has no such symlink; the resolved path is the best
+/// available there.
+pub fn selfExecPathZ(buf: *[4096:0]u8) ?[:0]const u8 {
+    if (is_linux) {
+        const p = "/proc/self/exe";
+        @memcpy(buf[0..p.len], p);
+        buf[p.len] = 0;
+        return buf[0..p.len :0];
+    }
+    return exePathZ(buf);
+}
+
 /// socket(2) with close-on-exec. SOCK_CLOEXEC as a type flag is a
 /// Linux extension; Darwin sets the flag post-hoc via fcntl (the
 /// fork window race is acceptable — children exec immediately).

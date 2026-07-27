@@ -4151,7 +4151,7 @@ pub const Daemon = struct {
         copy: CopyArgs,
     ) !*FsJob {
         var exe_buf: [4096:0]u8 = undefined;
-        const exe = @import("../util/platform.zig").exePathZ(&exe_buf) orelse return error.NoExecutable;
+        const exe = @import("../util/platform.zig").selfExecPathZ(&exe_buf) orelse return error.NoExecutable;
         var spec_aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer spec_aw.deinit();
         try std.json.Stringify.value(.{
@@ -6746,7 +6746,7 @@ pub const Daemon = struct {
         var keep_exe: [4096:0]u8 = undefined;
         var keep_argv: [2][]const u8 = undefined;
         if (req.display) {
-            const exe = platform.exePathZ(&keep_exe) orelse return error.NoSelfExePath;
+            const exe = platform.selfExecPathZ(&keep_exe) orelse return error.NoSelfExePath;
             keep_argv = .{ exe, "--keep" };
             req.argv = &keep_argv;
         }
