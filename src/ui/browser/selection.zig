@@ -257,6 +257,13 @@ fn onBandEnd(_: *c.GtkGestureDrag, _: f64, _: f64, user: ?*anyopaque) callconv(.
     if (!tab.rubber.active) return;
     tab.rubber.active = false;
     if (tab.rubber_area) |area| c.gtk_widget_set_visible(area, 0);
+    // A press-and-release that never moved is a plain CLICK on empty
+    // space: clear the selection, like every file manager does.
+    const moved = @abs(tab.rubber.x1 - tab.rubber.x0) > 2 or @abs(tab.rubber.y1 - tab.rubber.y0) > 2;
+    if (!moved) {
+        c.gtk_list_box_unselect_all(tab.listbox);
+        return;
+    }
     if (tab.selected.items.len > 0)
         tab.view.setStatusFmt("{d} selected", .{tab.selected.items.len});
 }

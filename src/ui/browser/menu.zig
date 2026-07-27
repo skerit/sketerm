@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const browser_model = @import("../../filebrowser/model.zig");
 
 const classicmenu = @import("classicmenu.zig");
 
@@ -44,7 +45,7 @@ pub const MenuCtx = struct {
     is_dir: bool,
     popover: *c.GtkWidget,
     /// Entry-dialog mode: what Enter commits.
-    mode: enum { none, rename, mkdir, tags } = .none,
+    mode: enum { none, rename, mkdir, tags, newfile } = .none,
     entry: ?*c.GtkWidget = null,
     entry2: ?*c.GtkWidget = null,
 
@@ -174,49 +175,155 @@ pub fn showEntryMenu(
             m.item("Open in New Browser Tab", &onMenuCollectionOpen, ctx);
             m.item("Unmark (remove from this register)", &onMenuRegisterRemove, ctx);
         }
-    } else {
-        const on_entry = ctx.path != null;
-        const tools = on_entry and toolsApply(ctx, is_dir, is_local);
-        if (on_entry) buildOpen(self, ctx, m, is_dir, is_local);
+    } else if (ctx.path != null) {
+        // ── an entry's menu, Nemo's shape: open verbs, clipboard,
+        // reshaping, create-new, the dangerous pair, and Properties
+        // LAST (never Close Pane -- that is a background verb).
+        const tools = toolsApply(ctx, is_dir, is_local);
+        buildOpen(self, ctx, m, is_dir, is_local);
         const edit = m.section();
-        if (on_entry) {
-            edit.item("Copy", &onMenuCopy, ctx);
-            edit.item("Cut", &onMenuCut, ctx);
-        }
+        edit.itemIcon("Cut", .{ .name = "edit-cut-symbolic" }, &onMenuCut, ctx);
+        edit.itemIcon("Copy", .{ .name = "edit-copy-symbolic" }, &onMenuCopy, ctx);
         if (self.clip_path != null)
-            buildPaste(self, tab, ctx, edit.submenu("Paste"));
-        if (on_entry) {
-            edit.item("Rename…", &onMenuRename, ctx);
-            buildCopyTo(self, ctx, edit.submenu("Copy To"));
-            buildOrganize(tab, ctx, edit.submenu("Organize"), is_dir);
-            if (tools) buildTools(ctx, edit.submenu("Tools"), is_dir, is_local);
-        }
-        // A background click has almost no menu; making the user open
-        // a submenu for the only two verbs it has would be worse than
-        // the length it saves.
+            buildPaste(self, tab, ctx, edit.submenuIcon("Paste", .{ .name = "edit-paste-symbolic" }));
+        const org = m.section();
+        org.item("Rename…", &onMenuRename, ctx);
+        buildCopyTo(self, ctx, org.submenu("Copy To"));
+        buildOrganize(tab, ctx, org.submenu("Organize"), is_dir);
+        // Compress is its own top-level submenu, like Dolphin's --
+        // and a submenu inside Organize would be nested one popover
+        // too deep to receive clicks (classicmenu's depth limit).
+        buildCompress(self, ctx, org.submenuIcon("Compress", .{ .name = "package-x-generic" }));
+        if (tools) buildTools(ctx, org.submenu("Tools"), is_dir, is_local);
         const create = m.section();
-        buildNew(self, ctx, if (on_entry) create.submenu("New") else create);
+        buildCreateNew(self, ctx, create.submenuIcon("Create New", .{ .name = "list-add-symbolic" }), true);
+        const acts = m.section();
+        self.appendActionItems(acts, ctx);
+        const danger = m.section();
+        danger.itemIcon("Move to Trash", .{ .name = "user-trash-symbolic" }, &onMenuTrash, ctx);
+        danger.item("Delete Permanently…", &onMenuDelete, ctx);
         const tail = m.section();
-        if (on_entry) {
-            tail.item("Move to Trash", &onMenuTrash, ctx);
-            tail.item("Delete Permanently…", &onMenuDelete, ctx);
-            tail.item("Properties…", &onMenuProperties, ctx);
+        appendUndoItem(self, tail, ctx);
+        tail.itemIcon("Properties…", .{ .name = "document-properties-symbolic" }, &onMenuProperties, ctx);
+    } else {
+        // ── the background menu, Nemo's order: create-new first,
+        // Paste, the view toggles, terminal, then folder Properties
+        // last. Close Pane lives here (and only here): a background
+        // click is the pane, not a file.
+        buildCreateNew(self, ctx, m, false);
+        const paste = m.section();
+        if (self.clip_path != null) {
+            paste.itemIcon("Paste", .{ .name = "edit-paste-symbolic" }, &onMenuPaste, ctx);
+            buildPasteSpecial(self, tab, ctx, paste.submenu("Paste Special"));
         }
-        if (self.undo_stack.items.len > 0) {
-            var ubuf: [96]u8 = undefined;
-            var uz: [200]u8 = undefined;
-            const last = self.undo_stack.items[self.undo_stack.items.len - 1];
-            const utxt = std.fmt.bufPrint(&ubuf, "Undo ({s})", .{last.describe()}) catch "Undo";
-            tail.item(classicmenu.escapeLabel(utxt, &uz), &onMenuUndo, ctx);
-        }
-        // Un-split: offered on every listing right-click (entry or
-        // background) -- the browser face has no pane titlebar and no
-        // terminal right-click menu, so the context menu and the
-        // toolbar button are the only places to close a pane from.
-        tail.item("Close Pane", &onMenuClosePane, ctx);
+        const viewsec = m.section();
+        viewsec.check("Show Hidden Files", tab.show_hidden, &onMenuToggleHidden, ctx);
+        const term = m.section();
+        if (is_local) term.itemIcon("Open in Terminal", .{ .name = "sketerm-terminal-symbolic" }, &onMenuTerminalHere, ctx);
+        if (self.on_host_term != null) term.item("Open Terminal Tab Here", &onMenuTermTab, ctx);
+        const acts = m.section();
+        self.appendActionItems(acts, ctx);
+        const pane = m.section();
+        appendUndoItem(self, pane, ctx);
+        pane.item("Close Pane", &onMenuClosePane, ctx);
+        const tail = m.section();
+        tail.itemIcon("Properties…", .{ .name = "document-properties-symbolic" }, &onMenuFolderProperties, ctx);
     }
 
     const popover = root.popupVia(parent, self.root_box, x, y);
+    ctx.popover = popover;
+    c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(ctx), @ptrCast(&MenuCtx.free));
+}
+
+/// Heap context for one hamburger view-mode row.
+const HamModeCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    mode: browser_model.ViewMode,
+};
+
+fn hamModeCleanup(user: ?*anyopaque) callconv(.c) void {
+    const hm: *HamModeCtx = @ptrCast(@alignCast(user.?));
+    hm.allocator.destroy(hm);
+}
+
+fn onHamModeChosen(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const hm: *HamModeCtx = @ptrCast(@alignCast(user.?));
+    const self = hm.view;
+    const tab = self.currentTab() orelse return;
+    if (tab.view_mode == hm.mode) return;
+    tab.view_mode = hm.mode;
+    self.setStatusFmt("view: {s}", .{@tagName(hm.mode)});
+    @import("views.zig").rememberFolder(self, tab);
+    self.renderTab(tab);
+}
+
+fn onHamTogglePlaces(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const on = c.gtk_toggle_button_get_active(self.places_toggle);
+    c.gtk_toggle_button_set_active(self.places_toggle, @intFromBool(on == 0));
+}
+
+fn onHamToggleInfo(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    const on = c.gtk_toggle_button_get_active(self.info_toggle);
+    c.gtk_toggle_button_set_active(self.info_toggle, @intFromBool(on == 0));
+}
+
+/// The toolbar hamburger's menu, Dolphin's shape: Create New on top,
+/// the view toggles as check rows (plus the collapsed toolbar
+/// cluster's toggles when the bar is narrow), a View Mode submenu
+/// instead of a blind "cycle" row, then the tab/pane verbs.
+pub fn showHamburgerMenu(self: *BrowserView, anchor: *c.GtkWidget) void {
+    const tab = self.currentTab() orelse return;
+    const ctx = self.allocator.create(MenuCtx) catch return;
+    ctx.* = .{
+        .allocator = self.allocator,
+        .view = self,
+        .tab = tab,
+        .path = null,
+        .name = null,
+        .is_dir = false,
+        .popover = undefined,
+    };
+    const root = classicmenu.Root.create(self.allocator) orelse {
+        MenuCtx.free(@ptrCast(ctx));
+        return;
+    };
+    const m = root.top();
+
+    buildCreateNew(self, ctx, m, false);
+
+    const toggles = m.section();
+    if (self.bar_collapsed) {
+        toggles.check("Places Sidebar", c.gtk_toggle_button_get_active(self.places_toggle) != 0, &onHamTogglePlaces, @ptrCast(self));
+        toggles.check("Information Panel", c.gtk_toggle_button_get_active(self.info_toggle) != 0, &onHamToggleInfo, @ptrCast(self));
+    }
+    toggles.check("Show Hidden Files", tab.show_hidden, &onMenuToggleHidden, ctx);
+
+    const modes = m.section().submenu("View Mode");
+    const mode_rows = [_]struct { label: [*:0]const u8, mode: browser_model.ViewMode }{
+        .{ .label = "Details list", .mode = .details },
+        .{ .label = "Compact list", .mode = .compact },
+        .{ .label = "Icon grid", .mode = .icons },
+        .{ .label = "Miller columns", .mode = .miller },
+    };
+    for (mode_rows) |mr| {
+        const hm = self.allocator.create(HamModeCtx) catch break;
+        hm.* = .{ .allocator = self.allocator, .view = self, .mode = mr.mode };
+        root.own(&hamModeCleanup, @ptrCast(hm));
+        modes.check(mr.label, tab.view_mode == mr.mode, &onHamModeChosen, @ptrCast(hm));
+    }
+
+    const panes = m.section();
+    panes.itemIcon("New Tab", .{ .name = "tab-new-symbolic" }, &BrowserView.onNewTabClicked, @ptrCast(self));
+    panes.item("Split Pane", &BrowserView.onSplitClicked, @ptrCast(self));
+    panes.item("Close Pane", &onMenuClosePane, ctx);
+
+    const tail = m.section();
+    tail.itemIcon("Go to Shell Directory", .{ .name = "sketerm-terminal-symbolic" }, &BrowserView.onCwdSyncClicked, @ptrCast(self));
+
+    const popover = root.popup(anchor, @floatFromInt(@divTrunc(c.gtk_widget_get_width(anchor), 2)), @floatFromInt(c.gtk_widget_get_height(anchor)));
     ctx.popover = popover;
     c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(ctx), @ptrCast(&MenuCtx.free));
 }
@@ -285,6 +392,7 @@ fn addOpenAppItem(
     m: classicmenu.Menu,
     label: []const u8,
     appid: ?[]const u8,
+    app_icon: ?*c.GIcon,
 ) void {
     const path = ctx.path orelse return;
     const actx = self.allocator.create(OpenAppCtx) catch return;
@@ -300,7 +408,12 @@ fn addOpenAppItem(
     };
     m.root.own(&openAppCleanup, @ptrCast(actx));
     var ebuf: [320]u8 = undefined;
-    m.item(classicmenu.escapeLabel(label, &ebuf), &onOpenAppActivated, @ptrCast(actx));
+    const ltxt = classicmenu.escapeLabel(label, &ebuf);
+    if (app_icon) |gi| {
+        m.itemIcon(ltxt, .{ .gicon = gi }, &onOpenAppActivated, @ptrCast(actx));
+    } else {
+        m.item(ltxt, &onOpenAppActivated, @ptrCast(actx));
+    }
 }
 
 /// Nemo-style open block for a file: "Open with <Default>" launches
@@ -331,7 +444,9 @@ fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
                         std.mem.span(@as([*:0]const u8, @ptrCast(i)))
                     else
                         null;
-                    addOpenAppItem(self, ctx, m, ltxt, id);
+                    // The icon is borrowed from the app info; the row
+                    // resolves (or refs) it during the call.
+                    addOpenAppItem(self, ctx, m, ltxt, id, c.g_app_info_get_icon(info));
                 } else |_| {}
             }
         }
@@ -346,7 +461,7 @@ fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
             const app: *c.GAppInfo = @ptrCast(@alignCast(it.*.data orelse continue));
             const id = c.g_app_info_get_id(app) orelse continue;
             const nm = c.g_app_info_get_name(app) orelse continue;
-            addOpenAppItem(self, ctx, ow, std.mem.span(nm), std.mem.span(id));
+            addOpenAppItem(self, ctx, ow, std.mem.span(nm), std.mem.span(id), c.g_app_info_get_icon(app));
             count += 1;
         }
         if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
@@ -357,6 +472,13 @@ fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
 
 fn buildPaste(self: *BrowserView, tab: *BTab, ctx: *MenuCtx, p: classicmenu.Menu) void {
     p.item("Paste Here", &onMenuPaste, ctx);
+    buildPasteSpecial(self, tab, ctx, p);
+}
+
+/// The link/sync variants, shared by the entry menu's Paste submenu
+/// and the background menu's Paste Special submenu (whose plain Paste
+/// is a first-class item beside it, like Nemo's).
+fn buildPasteSpecial(self: *BrowserView, tab: *BTab, ctx: *MenuCtx, p: classicmenu.Menu) void {
     p.item("Paste as Symbolic Link", &onMenuPasteSymlink, ctx);
     // A hard link is offered only where it can succeed: same host,
     // same filesystem. Everywhere else the verb is simply absent.
@@ -364,6 +486,17 @@ fn buildPaste(self: *BrowserView, tab: *BTab, ctx: *MenuCtx, p: classicmenu.Menu
         p.item("Paste as Hard Link", &onMenuPasteHardlink, ctx);
     p.item("Sync Here (mirror copy, resumable)", &onMenuSyncHere, ctx);
     p.item("Compare / Sync with Copied…", &onMenuCompare, ctx);
+}
+
+/// The tail Undo row, present on both menus when there is anything
+/// to undo.
+fn appendUndoItem(self: *BrowserView, m: classicmenu.Menu, ctx: *MenuCtx) void {
+    if (self.undo_stack.items.len == 0) return;
+    var ubuf: [96]u8 = undefined;
+    var uz: [200]u8 = undefined;
+    const last = self.undo_stack.items[self.undo_stack.items.len - 1];
+    const utxt = std.fmt.bufPrint(&ubuf, "Undo ({s})", .{last.describe()}) catch "Undo";
+    m.itemIcon(classicmenu.escapeLabel(utxt, &uz), .{ .name = "edit-undo-symbolic" }, &onMenuUndo, ctx);
 }
 
 /// Everywhere the selection can be sent: the other pane, the
@@ -404,7 +537,57 @@ fn buildOrganize(tab: *BTab, ctx: *MenuCtx, p: classicmenu.Menu, is_dir: bool) v
         p.item("Browse Archive", &onMenuBrowseArchive, ctx);
         p.item("Extract Here", &onMenuExtractHere, ctx);
     }
-    p.item("Compress to .tar.gz", &onMenuArchiveCreate, ctx);
+}
+
+/// The formats bsdtar -caf can produce from the destination name.
+const COMPRESS_FORMATS = [_][:0]const u8{ "zip", "tar.gz", "tar.xz", "tar.zst", "7z", "tar" };
+
+/// Per-item context for one Compress format row.
+const CompressCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    tab: *BTab,
+    path: []u8,
+    ext: [:0]const u8,
+};
+
+fn compressCleanup(user: ?*anyopaque) callconv(.c) void {
+    const cc: *CompressCtx = @ptrCast(@alignCast(user.?));
+    cc.allocator.free(cc.path);
+    cc.allocator.destroy(cc);
+}
+
+fn onCompressActivated(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const cc: *CompressCtx = @ptrCast(@alignCast(user.?));
+    var out: [4096]u8 = undefined;
+    const archive = std.fmt.bufPrint(&out, "{s}.{s}", .{ cc.path, cc.ext }) catch return;
+    cc.view.startDaemonJob(cc.tab.hc, "archive_create", cc.path, archive, "create archive");
+}
+
+/// Dolphin's Compress submenu: one row per format, named after what
+/// it will create. The daemon's bsdtar derives the format from the
+/// destination extension.
+fn buildCompress(self: *BrowserView, ctx: *MenuCtx, p: classicmenu.Menu) void {
+    const path = ctx.path orelse return;
+    const base = std.fs.path.basename(path);
+    for (COMPRESS_FORMATS) |ext| {
+        const cc = self.allocator.create(CompressCtx) catch return;
+        cc.* = .{
+            .allocator = self.allocator,
+            .view = self,
+            .tab = ctx.tab,
+            .path = self.allocator.dupe(u8, path) catch {
+                self.allocator.destroy(cc);
+                return;
+            },
+            .ext = ext,
+        };
+        p.root.own(&compressCleanup, @ptrCast(cc));
+        var lbl: [320]u8 = undefined;
+        var lz: [400]u8 = undefined;
+        const ltxt = std.fmt.bufPrint(&lbl, "Compress to \"{s}.{s}\"", .{ base, ext }) catch continue;
+        p.item(classicmenu.escapeLabel(ltxt, &lz), &onCompressActivated, @ptrCast(cc));
+    }
 }
 
 /// Does the Tools submenu have anything in it? Every one of its verbs
@@ -430,16 +613,142 @@ fn buildTools(ctx: *MenuCtx, p: classicmenu.Menu, is_dir: bool, is_local: bool) 
     }
 }
 
-/// New Folder / New from Template, plus the user's declarative
-/// .action commands -- both "things to run HERE" rather than verbs on
-/// the entry. `m` is a submenu when there is an entry and a top-level
-/// section when there is not.
-fn buildNew(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
-    m.item("New Folder…", &onMenuNewFolder, ctx);
-    m.item("New from Template…", &onMenuNewFromTemplate, ctx);
-    // Appended last so a long actions directory cannot push the
-    // built-in rows out of view.
-    if (ctx.path != null) self.appendActionItems(m, ctx);
+/// Dolphin's "Create New" block / Nemo's background head: New Folder
+/// first, then the document templates. `in_submenu` = the entry
+/// menu's grouped form, where `m` is already the "Create New" side
+/// submenu and everything goes in FLAT (KNewFileMenu's shape) --
+/// submenus must not nest: a popover three surfaces deep never
+/// receives pointer input (see classicmenu's module doc).
+fn buildCreateNew(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu, in_submenu: bool) void {
+    m.itemIcon(
+        if (in_submenu) "New Folder…" else "Create New Folder…",
+        .{ .name = "folder-new-symbolic" },
+        &onMenuNewFolder,
+        ctx,
+    );
+    const docs = if (in_submenu)
+        m.section()
+    else
+        m.submenuIcon("Create New Document", .{ .name = "document-new-symbolic" });
+    const listed = appendTemplateItems(self, ctx, docs);
+    if (ctx.tab.hc.host != null)
+        docs.item("From Template…", &onMenuNewFromTemplate, ctx);
+    const tail = if (listed or ctx.tab.hc.host != null) docs.section() else docs;
+    tail.itemIcon("Empty Document…", .{ .name = "document-new-symbolic" }, &onMenuNewEmptyFile, ctx);
+}
+
+/// Cap on the template rows the Create New Document submenu lists; a
+/// Templates directory is a hand-curated place.
+const MAX_INLINE_TEMPLATES = 64;
+
+/// Heap context for one inline template row; owned by the menu root.
+const TemplateItemCtx = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    tab: *BTab,
+    source: []u8,
+};
+
+fn templateItemCleanup(user: ?*anyopaque) callconv(.c) void {
+    const t: *TemplateItemCtx = @ptrCast(@alignCast(user.?));
+    t.allocator.free(t.source);
+    t.allocator.destroy(t);
+}
+
+fn onTemplateItemActivated(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const t: *TemplateItemCtx = @ptrCast(@alignCast(user.?));
+    @import("templates.zig").instantiate(t.view, t.tab, t.source);
+}
+
+/// List the LOCAL Templates directory straight into the submenu,
+/// Nemo-style: each template is one row with its type's icon. Remote
+/// tabs keep the async "From Template…" popover instead (that
+/// listing is a round trip; a hover submenu cannot wait for it).
+/// @return true when at least one template row was added.
+fn appendTemplateItems(self: *BrowserView, ctx: *MenuCtx, docs: classicmenu.Menu) bool {
+    if (ctx.tab.hc.host != null) return false;
+    var dbuf: [4096]u8 = undefined;
+    const dir = localTemplatesDir(&dbuf) orelse return false;
+    var dz: [4096:0]u8 = undefined;
+    const dzs = std.fmt.bufPrintZ(&dz, "{s}", .{dir}) catch return false;
+    const d = c.opendir(dzs.ptr) orelse return false;
+    defer _ = c.closedir(d);
+
+    // readdir order is arbitrary; collect and sort so the menu is
+    // stable across opens.
+    var names_buf: [MAX_INLINE_TEMPLATES][256]u8 = undefined;
+    var names: [MAX_INLINE_TEMPLATES][]const u8 = undefined;
+    var count: usize = 0;
+    while (c.readdir(d)) |de| {
+        if (count >= MAX_INLINE_TEMPLATES) break;
+        const fname = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
+        if (fname.len == 0 or fname[0] == '.') continue;
+        if (fname.len >= names_buf[count].len) continue;
+        @memcpy(names_buf[count][0..fname.len], fname);
+        names[count] = names_buf[count][0..fname.len];
+        count += 1;
+    }
+    std.mem.sort([]const u8, names[0..count], {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.ascii.lessThanIgnoreCase(a, b);
+        }
+    }.lt);
+
+    for (names[0..count]) |name| {
+        const t = self.allocator.create(TemplateItemCtx) catch return count > 0;
+        const source = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, name }) catch {
+            self.allocator.destroy(t);
+            return count > 0;
+        };
+        t.* = .{ .allocator = self.allocator, .view = self, .tab = ctx.tab, .source = @constCast(source) };
+        docs.root.own(&templateItemCleanup, @ptrCast(t));
+        // Label without the extension, with the type's icon -- the
+        // way Nemo presents templates.
+        const stem = if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| name[0..i] else name;
+        var lz: [300]u8 = undefined;
+        const label = classicmenu.escapeLabel(stem, &lz);
+        var nz: [256:0]u8 = undefined;
+        const n = @min(name.len, nz.len - 1);
+        @memcpy(nz[0..n], name[0..n]);
+        nz[n] = 0;
+        var uncertain: c.gboolean = 0;
+        const ctype = c.g_content_type_guess(&nz, null, 0, &uncertain);
+        if (ctype != null) {
+            defer c.g_free(ctype);
+            if (c.g_content_type_get_icon(ctype)) |gicon| {
+                defer c.g_object_unref(gicon);
+                docs.itemIcon(label, .{ .gicon = @ptrCast(gicon) }, &onTemplateItemActivated, @ptrCast(t));
+                continue;
+            }
+        }
+        docs.item(label, &onTemplateItemActivated, @ptrCast(t));
+    }
+    return count > 0;
+}
+
+/// The local freedesktop Templates directory (XDG special dir with
+/// Nemo's $HOME/Templates fallback); null when it does not exist.
+fn localTemplatesDir(buf: []u8) ?[]const u8 {
+    var candidate: ?[]const u8 = null;
+    if (c.g_get_user_special_dir(c.G_USER_DIRECTORY_TEMPLATES)) |p| {
+        const s = std.mem.span(@as([*:0]const u8, @ptrCast(p)));
+        // GLib answers $HOME for an unconfigured special dir; that is
+        // not a templates directory.
+        const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "";
+        if (!std.mem.eql(u8, s, home)) candidate = s;
+    }
+    if (candidate == null) {
+        const homep = c.getenv("HOME") orelse return null;
+        const home = std.mem.span(@as([*:0]const u8, @ptrCast(homep)));
+        candidate = std.fmt.bufPrint(buf[2048..], "{s}/Templates", .{home}) catch return null;
+    }
+    const dir = candidate.?;
+    var z: [2048:0]u8 = undefined;
+    const zs = std.fmt.bufPrintZ(&z, "{s}", .{dir}) catch return null;
+    if (c.access(zs.ptr, c.F_OK) != 0) return null;
+    const n = @min(dir.len, buf.len - 1);
+    @memcpy(buf[0..n], dir[0..n]);
+    return buf[0..n];
 }
 
 pub fn onPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
@@ -470,7 +779,9 @@ pub fn onMenuClosePane(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
 pub fn onMenuTerminalHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
-    const path = ctx.path orelse return menuDone(ctx);
+    // Entry menus target the clicked directory; the background menu
+    // (no path) targets the folder being shown.
+    const path = ctx.path orelse ctx.tab.root.path;
     // cd the pane's shell into the target (single-quoted; embedded
     // quotes escaped) and flip to the terminal face.
     var buf: [4600]u8 = undefined;
@@ -544,7 +855,7 @@ pub fn onMenuPaste(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 pub fn onMenuTermTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
     const self = ctx.view;
-    const path = ctx.path orelse return menuDone(ctx);
+    const path = ctx.path orelse ctx.tab.root.path;
     if (self.on_host_term) |cb| {
         if (self.hooks_ctx) |hctx| cb(hctx, ctx.tab.hc.host orelse "", path);
     }
@@ -772,13 +1083,32 @@ pub fn onMenuExtractHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     menuDone(ctx);
 }
 
-pub fn onMenuArchiveCreate(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+/// Create an empty file here (Nemo's Empty Document): the name is
+/// asked via the entry dialog, the daemon `create` op does an
+/// O_EXCL create so an existing file can never be clobbered.
+pub fn onMenuNewEmptyFile(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
-    const path = ctx.path orelse return menuDone(ctx);
-    var out: [4096]u8 = undefined;
-    const archive = std.fmt.bufPrint(&out, "{s}.tar.gz", .{path}) catch return menuDone(ctx);
-    ctx.view.startDaemonJob(ctx.tab.hc, "archive_create", path, archive, "create archive");
+    ctx.view.entryDialog(ctx.tab, .newfile, null);
     menuDone(ctx);
+}
+
+/// The background menu's Show Hidden Files check row: flips the real
+/// hamburger toggle so every surface stays in sync.
+pub fn onMenuToggleHidden(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const view = ctx.view;
+    menuDone(ctx);
+    const active = c.gtk_toggle_button_get_active(view.hidden_toggle);
+    c.gtk_toggle_button_set_active(view.hidden_toggle, @intFromBool(active == 0));
+}
+
+/// Properties of the folder the background click landed in.
+pub fn onMenuFolderProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx: *MenuCtx = @ptrCast(@alignCast(user.?));
+    const view = ctx.view;
+    const tab = ctx.tab;
+    menuDone(ctx);
+    @import("props.zig").folderProperties(view, tab);
 }
 
 /// Heap context for one action button; freed with the button.
@@ -804,7 +1134,8 @@ pub const ActionCtx = struct {
 /// reach a remote path); RunsOnHost actions run as app sessions
 /// on the file's host (windows forward here).
 pub fn appendActionItems(self: *BrowserView, m: classicmenu.Menu, ctx: *MenuCtx) void {
-    const path = ctx.path orelse return;
+    // Background menus run actions against the folder itself.
+    const path = ctx.path orelse ctx.tab.root.path;
     var dirbuf: [4096:0]u8 = undefined;
     const cfg = c.g_get_user_config_dir();
     const adir = std.fmt.bufPrintZ(&dirbuf, "{s}/sketerm/actions", .{cfg}) catch return;

@@ -198,6 +198,9 @@ pub fn reopenClosedTab(self: *BrowserView) void {
 /// in a new tab, and the tab label's close/menu/drop behaviors.
 pub fn installTabConveniences(self: *BrowserView, tab: *BTab, label_box: *c.GtkWidget) void {
     _ = self;
+    // The tab-bar gestures below hit-test against this mark to tell
+    // "on a tab" from "on the strip's empty space".
+    c.g_object_set_data(@ptrCast(@alignCast(label_box)), "sketerm-tablabel", @ptrCast(label_box));
     const rows = c.gtk_gesture_click_new();
     c.gtk_gesture_single_set_button(@ptrCast(rows), c.GDK_BUTTON_MIDDLE);
     _ = c.g_signal_connect_data(rows, "pressed", @ptrCast(&onRowMiddleClick), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
@@ -369,4 +372,78 @@ pub fn onTabMenuClose(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     // destroy; pop it down first.
     c.gtk_popover_popdown(@ptrCast(ctx.popover));
     view.closeTab(tab);
+}
+
+// -- the tab STRIP (empty area) ------------------------------------
+
+/// Wire the notebook's tab strip: right-click empty strip space for a
+/// tab menu, double-click it to open a new tab -- both standard file
+/// manager affordances. Installed once per view (buildUi).
+pub fn installTabBarGestures(self: *BrowserView) void {
+    const nb: *c.GtkWidget = @ptrCast(@alignCast(self.notebook));
+    const rclick = c.gtk_gesture_click_new();
+    c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
+    _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onTabBarRightClick), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(nb, @ptrCast(rclick));
+    const dclick = c.gtk_gesture_click_new();
+    c.gtk_gesture_single_set_button(@ptrCast(dclick), c.GDK_BUTTON_PRIMARY);
+    _ = c.g_signal_connect_data(dclick, "pressed", @ptrCast(&onTabBarDoubleClick), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(nb, @ptrCast(dclick));
+}
+
+/// Was this notebook-space click on the strip's EMPTY area? False
+/// for clicks on a tab label (their own gestures handle those) and
+/// for clicks below the strip (the page content).
+fn onTabStripEmpty(self: *BrowserView, x: f64, y: f64) bool {
+    const nb: *c.GtkWidget = @ptrCast(@alignCast(self.notebook));
+    // The strip's height comes from any tab label's bounds; without a
+    // page there is no strip at all.
+    const page = c.gtk_notebook_get_nth_page(self.notebook, 0) orelse return false;
+    const label = c.gtk_notebook_get_tab_label(self.notebook, page) orelse return false;
+    var bounds: c.graphene_rect_t = undefined;
+    if (c.gtk_widget_compute_bounds(label, nb, &bounds) == 0) return false;
+    if (y > bounds.origin.y + bounds.size.height + 6) return false;
+    // On a tab? Walk the picked widget's ancestry for a label mark.
+    var w = c.gtk_widget_pick(nb, x, y, c.GTK_PICK_DEFAULT);
+    while (w) |cur| : (w = c.gtk_widget_get_parent(cur)) {
+        if (cur == nb) break;
+        if (c.g_object_get_data(@ptrCast(@alignCast(cur)), "sketerm-tablabel") != null) return false;
+    }
+    return true;
+}
+
+fn onTabBarRightClick(gesture: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    if (!onTabStripEmpty(self, x, y)) return;
+    _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
+    const root = classicmenu.Root.create(self.allocator) orelse return;
+    const m = root.top();
+    m.itemIcon("New Tab", .{ .name = "tab-new-symbolic" }, &onStripNewTab, @ptrCast(self));
+    if (self.closed_tabs.closed.items.len > 0) {
+        var label: [96:0]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&label, "Reopen Closed Tab ({d})", .{
+            self.closed_tabs.closed.items.len,
+        }) catch "Reopen Closed Tab";
+        m.item(text.ptr, &onStripReopen, @ptrCast(self));
+    }
+    _ = root.popupVia(@ptrCast(@alignCast(self.notebook)), self.root_box, x, y);
+}
+
+fn onTabBarDoubleClick(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+    if (n_press != 2) return;
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    if (!onTabStripEmpty(self, x, y)) return;
+    _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
+    // Same behavior as the menu/new-tab button: the new tab opens on
+    // the current tab's directory.
+    BrowserView.onNewTabClicked(undefined, @ptrCast(self));
+}
+
+fn onStripNewTab(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    BrowserView.onNewTabClicked(undefined, user);
+}
+
+fn onStripReopen(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const self: *BrowserView = @ptrCast(@alignCast(user.?));
+    self.reopenClosedTab();
 }

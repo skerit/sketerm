@@ -25,6 +25,7 @@ const c = @import("../../c.zig").c;
 const clock = @import("../../util/clock.zig");
 const wire = @import("../../mux/wire.zig");
 const colkeys = @import("../../filebrowser/colkeys.zig");
+const iconload = @import("iconload.zig");
 const hexdump = @import("../../filebrowser/hexdump.zig");
 const mediacols = @import("mediacols.zig");
 const previewers = @import("../../filebrowser/previewers.zig");
@@ -1112,9 +1113,11 @@ pub fn updateSideCard(self: *BrowserView) void {
     }
 }
 
-/// Themed icon for name/kind into an existing GtkImage.
+/// Themed icon for name/kind into an existing GtkImage. The image's
+/// pixel size is preserved (iconload sets it, so it is read first).
 fn setImageEntryIcon(img: *c.GtkWidget, name: []const u8, is_dir: bool) void {
-    if (is_dir) return c.gtk_image_set_from_icon_name(@ptrCast(@alignCast(img)), "folder");
+    const px = c.gtk_image_get_pixel_size(@ptrCast(@alignCast(img)));
+    if (is_dir) return iconload.setImageIcon(img, img, "folder", px);
     var nz: [512:0]u8 = undefined;
     const n = @min(name.len, nz.len - 1);
     @memcpy(nz[0..n], name[0..n]);
@@ -1125,11 +1128,10 @@ fn setImageEntryIcon(img: *c.GtkWidget, name: []const u8, is_dir: bool) void {
         defer c.g_free(ctype);
         if (c.g_content_type_get_icon(ctype)) |gicon| {
             defer c.g_object_unref(gicon);
-            c.gtk_image_set_from_gicon(@ptrCast(@alignCast(img)), gicon);
-            return;
+            return iconload.setImageGicon(img, img, @ptrCast(gicon), px);
         }
     }
-    c.gtk_image_set_from_icon_name(@ptrCast(@alignCast(img)), "text-x-generic");
+    iconload.setImageIcon(img, img, "text-x-generic", px);
 }
 
 /// The card view toggle (View options menu).
@@ -1184,7 +1186,8 @@ fn setPanelName(self: *BrowserView, text: []const u8) void {
 }
 
 fn setPanelIconName(self: *BrowserView, name: [*:0]const u8) void {
-    c.gtk_image_set_from_icon_name(@ptrCast(@alignCast(self.preview_icon)), name);
+    const px = c.gtk_image_get_pixel_size(@ptrCast(@alignCast(self.preview_icon)));
+    iconload.setImageIcon(self.preview_icon, self.preview_icon, name, px);
 }
 
 /// Themed stage icon for an entry (used until/unless a real preview

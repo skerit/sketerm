@@ -21,6 +21,7 @@ const c = @import("../../c.zig").c;
 const browser_model = @import("../../filebrowser/model.zig");
 const places_mod = @import("../../filebrowser/places.zig");
 const emblems_mod = @import("../../filebrowser/emblems.zig");
+const iconload = @import("iconload.zig");
 const Pane = @import("../pane.zig").Pane;
 const file_transfers = @import("../file_transfers.zig");
 
@@ -216,14 +217,14 @@ pub const BrowserView = struct {
     /// programmatic initial toggle does not write places.json back.
     chrome_ready: bool = false,
     /// Toolbar overflow. `right_box` is the whole right end of the
-    /// toolbar; `right_cluster` is the part that moves into the
-    /// hamburger's popover (`overflow_slot`) when the bar runs out of
-    /// room. The buttons are never rebuilt -- the box is reparented --
-    /// so toggle state survives collapsing.
+    /// toolbar; `right_cluster` is the part that HIDES when the bar
+    /// runs out of room -- the hamburger menu then offers the same
+    /// toggles as check rows, so nothing is lost.
     right_box: *c.GtkWidget = undefined,
     right_cluster: *c.GtkWidget = undefined,
-    overflow_btn: *c.GtkWidget = undefined,
-    overflow_slot: *c.GtkWidget = undefined,
+    /// The Information-panel toolbar toggle (the hamburger's check
+    /// row flips it so both stay in sync).
+    info_toggle: *c.GtkToggleButton = undefined,
     bar_collapsed: bool = false,
     /// The one-shot post-layout overflow evaluation (0 = none).
     bar_idle_src: c.guint = 0,
@@ -294,6 +295,10 @@ pub const BrowserView = struct {
     media: mediacols.State = .{},
     /// Label probes in flight (folder size, checksum, media info).
     probes: std.ArrayList(LabelProbe) = .empty,
+    /// Background-click folder Properties: the one stat in flight
+    /// (props.zig folderProperties/feedFolderProps).
+    props_stat_req: u32 = 0,
+    props_stat_tab: ?*BTab = null,
     /// Resolve the other browser face in this sketerm tab (the
     /// orthodox dual-pane destination); null when there is only one.
     on_peer: ?*const fn (ctx: *anyopaque, pane: *Pane) ?*BrowserView = null,
@@ -449,7 +454,6 @@ pub const BrowserView = struct {
     pub const loadFileColors = @import("render.zig").loadFileColors;
     pub const fileColorFor = @import("render.zig").fileColorFor;
     pub const sortClicked = @import("render.zig").sortClicked;
-    pub const onViewModeClicked = @import("render.zig").onViewModeClicked;
 
     // mediacols.zig -- media-metadata columns (batched, bounded fetch)
     pub const mediaApplyValues = @import("mediacols.zig").applyValues;
@@ -1157,10 +1161,11 @@ pub const BrowserView = struct {
     /// name does not resolve, so the worst case is a labelled button
     /// rather than an invisible one.
     fn barButton(self: *BrowserView, bar: *c.GtkWidget, icon: [*:0]const u8, text: [*:0]const u8, tip: [*:0]const u8, cb: anytype) *c.GtkWidget {
-        const btn = if (iconAvailable(icon))
-            c.gtk_button_new_from_icon_name(icon)
-        else
-            c.gtk_button_new_with_label(text);
+        const btn = if (iconAvailable(icon)) blk: {
+            const b = c.gtk_button_new();
+            c.gtk_button_set_child(@ptrCast(b), iconload.newImageIcon(bar, icon, 16));
+            break :blk b;
+        } else c.gtk_button_new_with_label(text);
         c.gtk_widget_set_tooltip_text(btn, tip);
         flatten(btn.?);
         _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -1168,29 +1173,18 @@ pub const BrowserView = struct {
         return btn.?;
     }
 
-    /// A flat, start-aligned labeled row inside the hamburger
-    /// popover; clicking it runs the action and closes the menu.
-    fn menuRow(self: *BrowserView, box: ?*c.GtkWidget, label: [*:0]const u8, tip: [*:0]const u8, cb: anytype) void {
-        const btn = c.gtk_button_new_with_label(label);
-        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-        if (c.gtk_button_get_child(@ptrCast(btn))) |lbl|
-            c.gtk_widget_set_halign(lbl, c.GTK_ALIGN_START);
-        c.gtk_widget_set_tooltip_text(btn, tip);
-        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onMenuRowDismiss), null, null, c.G_CONNECT_AFTER);
-        c.gtk_box_append(@ptrCast(box), btn);
-    }
-
-    fn onMenuRowDismiss(btn: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
-        const pop = c.gtk_widget_get_ancestor(@ptrCast(btn), c.gtk_popover_get_type());
-        if (pop != null) c.gtk_popover_popdown(@ptrCast(pop));
+    /// The hamburger button: builds its classic menu fresh per open,
+    /// so every check row and submenu reflects the current state.
+    fn onBurgerClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        @import("menu.zig").showHamburgerMenu(self, @ptrCast(@alignCast(btn)));
     }
 
     /// `barButton` for a toggle. Same icon guarantee.
     fn barToggle(self: *BrowserView, bar: *c.GtkWidget, icon: [*:0]const u8, text: [*:0]const u8, tip: [*:0]const u8, cb: anytype) *c.GtkWidget {
         const btn = c.gtk_toggle_button_new();
         if (iconAvailable(icon))
-            c.gtk_button_set_icon_name(@ptrCast(btn), icon)
+            c.gtk_button_set_child(@ptrCast(btn), iconload.newImageIcon(bar, icon, 16))
         else
             c.gtk_button_set_label(@ptrCast(btn), text);
         c.gtk_widget_set_tooltip_text(btn, tip);
@@ -1256,10 +1250,25 @@ pub const BrowserView = struct {
     /// Split into a second browser pane. The pane binding table owns
     /// what a split IS (it can differ per profile), so this forwards
     /// the action rather than reimplementing it.
-    fn onSplitClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    pub fn onSplitClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         const ictx = self.pane.input_ctx orelse return;
+        // splitFocused acts on the WINDOW's focused pane; a toolbar
+        // click does not focus anything (the buttons are out of the
+        // focus chain), so focus is pointed here first or the action
+        // silently hits whichever pane last had it.
+        self.focusOwnPane();
         _ = input.runAction(ictx, .new_browser_split);
+    }
+
+    /// Point the window's focus at THIS pane, so pane-scoped window
+    /// actions (split, close) act on the pane whose control was
+    /// clicked rather than wherever focus happened to sit.
+    pub fn focusOwnPane(self: *BrowserView) void {
+        if (self.currentTab()) |tab| {
+            if (c.gtk_widget_grab_focus(@ptrCast(@alignCast(tab.listbox))) != 0) return;
+        }
+        _ = c.gtk_widget_grab_focus(self.root_box);
     }
 
     fn buildUi(self: *BrowserView) void {
@@ -1322,7 +1331,8 @@ pub const BrowserView = struct {
         const right = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
         const cluster = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
         const places_btn = self.barToggle(cluster, "user-bookmarks-symbolic", "Places", "Places sidebar (bookmarks, recent, devices)", &onPlacesToggled);
-        _ = self.barToggle(cluster, "sketerm-preview-pane-symbolic", "Information", "Information panel (preview, metadata)", &onPreviewToggled);
+        const info_btn = self.barToggle(cluster, "sketerm-preview-pane-symbolic", "Information", "Information panel (preview, metadata)", &onPreviewToggled);
+        self.info_toggle = @ptrCast(@alignCast(info_btn));
         c.gtk_box_append(@ptrCast(right), cluster);
 
         const keep = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
@@ -1340,44 +1350,18 @@ pub const BrowserView = struct {
         c.gtk_box_append(@ptrCast(right), keep);
         c.gtk_box_append(@ptrCast(bar), right);
 
-        // The hamburger menu: always visible. Hosts the demoted
-        // toolbar actions permanently, plus the reparenting slot the
-        // cluster collapses into when the bar runs out of room.
-        const pop = c.gtk_popover_new();
-        const pop_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
-        const slot = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
-        c.gtk_box_append(@ptrCast(pop_box), slot);
-
-        const hidden = c.gtk_toggle_button_new_with_label("Show hidden files");
-        c.gtk_button_set_has_frame(@ptrCast(hidden), 0);
-        if (c.gtk_button_get_child(@ptrCast(hidden))) |lbl|
-            c.gtk_widget_set_halign(lbl, c.GTK_ALIGN_START);
+        // The state anchor for "show hidden files": not in any menu
+        // (the classic menus rebuild per open and read/flip THIS), but
+        // still a real toggle so nav.zig/view.zig sync keeps working.
+        const hidden = c.gtk_toggle_button_new();
+        _ = c.g_object_ref_sink(@ptrCast(hidden));
         _ = c.g_signal_connect_data(hidden, "toggled", @ptrCast(&onHiddenToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(pop_box), hidden);
-        self.menuRow(pop_box, "Cycle view mode", "Details / compact / grid / columns", &onViewModeClicked);
-        c.gtk_box_append(@ptrCast(pop_box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
-        self.menuRow(pop_box, "New Tab", "New browser tab", &onNewTabClicked);
-        self.menuRow(pop_box, "Split Pane", "Add a browser pane beside this one", &onSplitClicked);
-        // Un-split lives here permanently: a browser face has no pane
-        // titlebar, so the toolbar is the only chrome that can offer it.
-        const closer = c.gtk_button_new_with_label("Close Pane");
-        c.gtk_button_set_has_frame(@ptrCast(closer), 0);
-        if (c.gtk_button_get_child(@ptrCast(closer))) |lbl|
-            c.gtk_widget_set_halign(lbl, c.GTK_ALIGN_START);
-        c.gtk_widget_set_tooltip_text(closer, "Close this pane and give its space back (un-split; closing the last pane closes the tab)");
-        _ = c.g_signal_connect_data(closer, "clicked", @ptrCast(&onOverflowClosePane), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(pop_box), closer);
-        c.gtk_box_append(@ptrCast(pop_box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
-        self.menuRow(pop_box, "Go to Shell Directory", "Go to the shell's current directory (OSC 7)", &onCwdSyncClicked);
-        c.gtk_popover_set_child(@ptrCast(pop), pop_box);
-        const burger = c.gtk_menu_button_new();
-        c.gtk_menu_button_set_icon_name(@ptrCast(burger), "open-menu-symbolic");
-        c.gtk_menu_button_set_popover(@ptrCast(burger), pop);
-        c.gtk_menu_button_set_has_frame(@ptrCast(burger), 0);
-        c.gtk_widget_add_css_class(burger, "flat");
-        c.gtk_widget_set_can_focus(burger, 0);
-        c.gtk_widget_set_tooltip_text(burger, "Menu");
-        c.gtk_box_append(@ptrCast(right), burger);
+
+        // The hamburger: always visible; its menu is a classic menu
+        // built fresh per open (Dolphin's shape -- Create New on top,
+        // check rows for the toggles, a View Mode submenu).
+        const burger = self.barButton(right, "open-menu-symbolic", "Menu", "Menu", &onBurgerClicked);
+        _ = burger;
 
         c.gtk_box_append(@ptrCast(vbox), bar);
 
@@ -1506,8 +1490,7 @@ pub const BrowserView = struct {
         self.content_paned = content.?;
         self.right_box = right.?;
         self.right_cluster = cluster.?;
-        self.overflow_btn = burger.?;
-        self.overflow_slot = slot.?;
+        @import("tabs.zig").installTabBarGestures(self);
     }
 
     /// The browser's widgets are gone: nothing deferred may touch them
@@ -1586,46 +1569,18 @@ pub const BrowserView = struct {
         return page <= BAR_COLLAPSE_PX + back + 24;
     }
 
-    /// Move the tool cluster between the toolbar and the hamburger's
-    /// popover. The SAME widgets travel either way, so a toggle that
-    /// is on stays on and no button is built twice.
+    /// Collapse = hide the tool cluster; the hamburger menu carries
+    /// the same toggles as check rows, so nothing becomes unreachable
+    /// and no widget is reparented mid-layout.
     fn setBarCollapsed(self: *BrowserView, on: bool) void {
         if (self.bar_collapsed == on) return;
         const cluster = self.right_cluster;
-        _ = c.g_object_ref(@ptrCast(cluster));
-        defer c.g_object_unref(@ptrCast(cluster));
         if (on) {
             const w = c.gtk_widget_get_width(cluster);
             self.bar_reclaim = if (w > 0) w else BAR_RECLAIM_FALLBACK;
-            c.gtk_box_remove(@ptrCast(self.right_box), cluster);
-            c.gtk_box_append(@ptrCast(self.overflow_slot), cluster);
-            // A column reads as a menu; a strip of icons in a popover
-            // reads as a mistake. Re-oriented AFTER re-parenting: a
-            // size request changed while the widget is orphaned does
-            // not reach the box that ends up measuring it, and the new
-            // parent would keep laying it out at the OLD axis's
-            // request (that is what clipped the cluster off the bar).
-            c.gtk_orientable_set_orientation(@ptrCast(cluster), c.GTK_ORIENTATION_VERTICAL);
-        } else {
-            c.gtk_menu_button_popdown(@ptrCast(self.overflow_btn));
-            c.gtk_box_remove(@ptrCast(self.overflow_slot), cluster);
-            // Prepend: the cluster is the LEFT half of the right end.
-            c.gtk_box_prepend(@ptrCast(self.right_box), cluster);
-            c.gtk_orientable_set_orientation(@ptrCast(cluster), c.GTK_ORIENTATION_HORIZONTAL);
         }
-        c.gtk_widget_queue_resize(cluster);
+        c.gtk_widget_set_visible(cluster, @intFromBool(!on));
         self.bar_collapsed = on;
-    }
-
-    fn onClosePaneClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
-        self.closePaneDeferred();
-    }
-
-    fn onOverflowClosePane(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self: *BrowserView = @ptrCast(@alignCast(user.?));
-        c.gtk_menu_button_popdown(@ptrCast(self.overflow_btn));
-        self.closePaneDeferred();
     }
 
     /// Close this pane (un-split) once the click that asked for it has
@@ -1638,12 +1593,16 @@ pub const BrowserView = struct {
     /// popover still in that state crashes the process later, during
     /// application teardown. One dismiss animation is the wait.
     pub fn closePaneDeferred(self: *BrowserView) void {
-        const ictx = self.pane.input_ctx orelse return;
-        _ = c.g_timeout_add(250, @ptrCast(&closePaneIdle), @ptrCast(ictx));
+        _ = c.g_timeout_add(250, @ptrCast(&closePaneIdle), @ptrCast(self));
     }
 
     fn closePaneIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const ictx: *input.Ctx = @ptrCast(@alignCast(user.?));
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        if (self.widgets_dead) return 0;
+        const ictx = self.pane.input_ctx orelse return 0;
+        // closeFocusedPane closes the WINDOW's focused pane; see
+        // onSplitClicked for why focus must be pointed here first.
+        self.focusOwnPane();
         _ = input.runAction(ictx, .close_pane);
         return 0;
     }

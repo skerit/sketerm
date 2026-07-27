@@ -10655,3 +10655,110 @@ Known limitations: no horizontal scrollbar UI for over-wide column
 sets yet (the shared adjustment scrolls via touchpad/shift-wheel);
 media columns need the media_meta job to have answered (blank until
 then); the picker's custom-row list closes the popover on remove.
+
+
+## 2026-07-28: files -- third feedback round (menus rebuilt, icons, columns fixed)
+
+User feedback on the overhaul batch: broken folder icons, a ghosting/
+half-speed column drag, a dead strip after the last column, scroll
+jumps on expand, missing tab-strip gestures, flaky Split/Close Pane,
+menu-structure complaints (cycle-view row, Close Pane on file menus,
+no icons, no Create New), an invisible rename editor, and a wish list
+straight from Nemo/Dolphin (background menu shape, Compress formats,
+menu icons). All of it landed:
+
+- Folder icons showed the missing-image icon on the user's desktop:
+  their theme's icon-theme.cache lies about which sizes exist, GTK
+  trusts it and fails the load silently, and our 16->24px row-icon
+  bump moved HiDPI lookups into the broken slot. New
+  `ui/browser/iconload.zig`: every themed icon the browser draws
+  validates the lookup's backing FILE and falls back across sizes,
+  scales, and the non-symbolic name variant when the cache lied.
+  Wired into rows, tiles, miller, places sidebar, info panel/card
+  and the toolbar (the invisible Places toggle icon was the same
+  disease). Repro: GDK_SCALE=2 + Wings-Dark-Icons.
+- Column drag rebuilt: the drag gesture reports offsets relative to
+  the MOVING grip, so drags landed at roughly half the pointer
+  travel; the math now re-translates into header_box space each
+  update (self-correcting, verified 1:1 live and at drag-end). The
+  invisible fat-grip bug underneath: the separator line inside the
+  grip has hexpand, which propagated to the grip box and split the
+  Name slot's leftover 50/50 between button and grip. The mid-drag
+  "ghost" was the grip's tooltip popping up under the pointer; the
+  tooltip is gone (the col-resize cursor is the affordance).
+- Name column is now Nemo's expand column for real: always absorbs
+  the leftover width (no dead strip after Modified), a dragged width
+  is its MINIMUM (matters once columns overflow), double-click still
+  resets. Rows mirror the header (name_area always hexpands).
+- Expanding/refreshing no longer yanks the view to the selection:
+  the listing viewport's scroll-to-focus is OFF (focus falls back to
+  a selected row when the focused row dies in the rebuild -- that was
+  the whole bug), the listbox is handed the vadjustment explicitly
+  so arrow-key navigation still scrolls, and renderList pins the
+  scroll value across the rebuild (captured BEFORE rows are removed;
+  the empty list clamps the adjustment synchronously). Navigation
+  still starts at the top (per-tab listing hash).
+- classicmenu rebuilt as real widget menus: GTK4's model popovers
+  cannot render per-item icons (the icon attribute is ignored; the
+  custom-child escape hatch cannot reach NESTED submenus -- verified
+  empirically), so rows are now flat GtkButtons with a 16px icon
+  slot, check rows, and hover side submenus. API kept (item/
+  submenu/section + new itemIcon/itemGicon/check/submenuIcon);
+  escapeLabel is now a plain sentinel copy (GtkLabel has no
+  mnemonics). HARD LIMIT documented in the module: a popover three
+  surfaces deep never receives pointer input under the top
+  popover's autohide grab, so submenus must all hang off the top
+  menu -- menu structures are flattened accordingly (Dolphin's
+  KNewFileMenu shape for Create New; Compress as its own submenu).
+- Entry context menu, Nemo's shape: Open with <default app, its
+  icon>, Open With > (app icons), Cut/Copy (icons), Paste >,
+  Rename, Copy To >, Organize >, Compress > (zip/tar.gz/tar.xz/
+  tar.zst/7z/tar -- bsdtar derives the format from the destination
+  name), Create New > (New Folder + templates + Empty Document,
+  flat), user .actions, Move to Trash (icon), Delete Permanently,
+  Undo, Properties LAST. Close Pane is gone from entry menus.
+- Background menu, Nemo's order: Create New Folder / Create New
+  Document > (the local Templates directory listed inline with type
+  icons, remote tabs keep the async popover), Paste + Paste
+  Special >, Show Hidden Files as a real CHECK row, Open in
+  Terminal, user .actions, Undo, Close Pane, and folder Properties
+  last (the folder is stat'ed via the daemon -- new feedFolderProps
+  routing -- and the dialog opens on the reply; props.zig grew
+  showProperties(entry) split out of onMenuProperties).
+- Hamburger rebuilt as a classic menu built fresh per open: Create
+  New block on top (Dolphin), Show Hidden Files check row, View
+  Mode > submenu with check marks (the blind "Cycle view mode" row
+  is gone), New Tab/Split Pane/Close Pane, Go to Shell Directory.
+  When the toolbar collapses, Places Sidebar and Information Panel
+  appear as check rows in the menu instead of reparenting the widget
+  cluster (that machinery is deleted).
+- Split Pane / Close Pane no-ops fixed: both window actions resolve
+  the FOCUSED pane, and toolbar/menu clicks don't move focus; the
+  browser now points focus at its own listbox first (focusOwnPane).
+- Tab strip: right-click on empty strip space opens New Tab /
+  Reopen Closed Tab; double-click opens a new tab on the current
+  directory. Clicks on tab labels are excluded by hit-test.
+- Click on empty listing space now clears the selection immediately
+  (the rubber-band drag-end doubles as the click detector).
+- Inline rename editor is visible: the GtkText gets the view's base
+  color + rounded corners on the selected row, Nemo-style.
+- Empty Document: new `.newfile` entry-dialog mode + daemon `create`
+  op (O_CREAT|O_EXCL so nothing can be clobbered); an old daemon
+  answers "unknown fs op" cleanly.
+- Dead code removed: the cycle-view handler, the overflow
+  reparenting slot, the fat-grip tooltip.
+
+Verified: suite 1052/5 skip (same set; classicmenu's test replaced),
+mux-portable, smoke-e2e PASS, and a full manual Xvfb drive of every
+item above (screenshots at each step): icons at GDK_SCALE=2 with the
+corrupt-cache theme, 1:1 live column drag + double-click reset, Name
+fill, scroll pinned across refresh, keyboard scrolling intact, all
+menus incl. app icons + templates + Compress-to-zip producing a real
+archive + Empty Document creating on disk via the new op, folder
+Properties from a background click, tab-strip gestures, empty-click
+deselect, F2 editor styling, sidebar info card, Split/Close Pane.
+
+Known limitations: dragging Name NARROWER than the leftover is a
+no-op while nothing overflows (same as Nemo's expand column); the
+classicmenu depth limit means no submenu may contain another; a
+long-running daemon needs a restart to learn the `create` op.

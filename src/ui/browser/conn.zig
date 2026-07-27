@@ -466,6 +466,8 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     if (self.feedConflicts(hc, rep)) return false;
     // A "New from Template" listing?
     if (self.feedTemplates(hc, rep)) return false;
+    // A background-click folder Properties stat?
+    if (@import("props.zig").feedFolderProps(self, hc, rep)) return false;
 
     // Listing chunk run?
     for (self.pending.items, 0..) |p, i| {
