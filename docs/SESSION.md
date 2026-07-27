@@ -10428,3 +10428,31 @@ Verified: suite 1040/5/0, smoke-fs/mux/e2e PASS, mux-portable + ldd
 clean; Xvfb screenshot runs for sidebar sections, row menus, QL and
 tab-strip scrolling. smoke-mcp term_run-idle failure reproduces on
 clean HEAD (pre-existing, unrelated).
+
+## Files: classic context menus (2026-07-27)
+
+The entry/tab/places context menus are now real menus: GtkPopoverMenu
+over a GMenuModel (src/ui/browser/classicmenu.zig) with NESTED
+submenus -- compact native rows, submenus open to the side ON HOVER,
+no more click-to-swap stack pages or button-sized rows. One "run"
+GSimpleAction (int target = item index) dispatches into the
+unchanged legacy handlers; per-menu ctx structs still ride the
+popover as qdata, and the Root (model + dispatch table) is released
+via a DEFERRED unparent because GtkPopoverMenu can emit closed
+before the activation that still needs the table.
+
+Two GTK 4.22 landmines found standalone-reproducing the "last item
+missing" symptom: (1) a popover anchored to a widget INSIDE a
+GtkViewport (listing rows, sidebar) gets its height miscomputed and
+silently clips its final item -- menus therefore anchor to root_box
+with click coordinates translated via gtk_widget_compute_point
+(classicmenu.popupVia); (2) the popover's internal scrolled window
+under-reports its natural height, so popup() re-asserts min content
+height from the CHILD's measure, bounded by the window.
+
+User .action commands ride the New submenu as items (ActionCtx owned
+by the menu root). menuButton survives for the non-menu popovers
+(view options, selection tools). Verified under Xvfb: full item set
+incl. the tail section, hover flyouts, item activation (entry Copy,
+places Open-in-New-Tab), submenu labels with '_' escaped. Suite
+1043/5/0 (new classicmenu escape test), smoke-e2e PASS.
