@@ -10284,3 +10284,115 @@ process); plain sketerm windows keep WM_CLASS "sketerm" alongside.
 Unit suite 1039/5/0 (new: "the sketerm-files binary name IS the
 subcommand"); mux + mux-portable build, ldd libc/libm only;
 smoke-e2e PASS. Requires reinstall (cd dist && ./install.sh).
+
+## MCP: shell integration reaches SSH terms + idle honesty (2026-07-27)
+
+Bug report: `term_open host:` sessions had no OSC 133 on stock
+remotes, so `term_run wait_for:"command"` always refused (the local
+spawn-time injection keys on argv[0]="ssh" and never reaches the
+remote shell), and idle mode silently queued text typed while a
+foreground command ran, with term_wait_idle reporting "idle" during
+a sleep.
+
+Fix 1 — remote bootstrap: term_open host sessions now ship a forced
+ssh command (termdrive.buildSshBootstrap) whose outer line is quote-
+free (parses under any login shell, fish/csh included) and whose
+base64 payload is a self-deleting sh script casing on $SHELL: bash
+re-execs with --rcfile (temp rcfile emulates the login profile
+chain, then sources the shipped sketerm.bash), zsh re-execs -l with
+a temp ZDOTDIR carrying the shipped .zshenv shim + sketerm.zsh,
+anything else execs plainly (no integration, honest not-ready
+refusal). Temp files self-delete on both arms; needs remote base64
+(term_exec already does). `integration:false` opts out; an explicit
+remote command skips injection. Zsh shim fix that this surfaced:
+$precmd_functions is expanded once per cycle, so hooks registered
+during the first precmd skipped the FIRST prompt's A mark — the
+loader now emits it itself (also fixes local GUI zsh panes'
+unmarked first prompt).
+
+Fix 2 — idle honesty (needs active integration): term_run idle mode
+sent while a command zone is open appends a "went to that program's
+stdin / queued as pending input" note, and term_wait_idle answers
+"idle at shell prompt" vs "idle, but a foreground command is still
+RUNNING" instead of a bare "idle".
+
+Verified live against a stock Debian 11 VPS over real ssh: bash
+(full bug repro incl. sleep-then-queue scenario, exit statuses 0/1,
+completion_source shell_integration, no /tmp litter), zsh (temp
+user, marks + cleanup), dash (fallback: session usable, honest
+refusal, term_exec fine). Unit suite 1041/5/0 (new bootstrap
+builder tests), smoke-mcp PASS, mux-portable builds.
+
+Follow-up (same day): tool steering made explicit. term_run's schema
+now states it types INTO the live session shell (session dialect,
+state persists — cd/export/aliases/venv) and is preferred for
+ordinary commands on integrated terminals; term_exec's schema points
+back at term_run for those and positions itself as the isolation/
+dialect-proof/noninteractive/output_file tool (its on-screen base64
+line = the visible cost of isolation). term_open's ssh reply steers
+the same way when integration was injected. Rationale: with OSC 133
+now reaching remotes, the readable stateful path covers the common
+case, so a watching user sees real commands instead of base64 walls,
+and history stays truthful. Live-verified on the Debian VPS: state
+persists across term_run calls (cd + export observed from a later
+command) with exact exit statuses; full 14-check repro suite PASS;
+unit suite 1041/5/0; smoke-mcp PASS.
+
+Follow-up 2: term_open always reports the session's shell. Local
+terms name it from the spawn-time resolution (reply: "shell: bash,
+integration: active"). SSH bootstraps now print a visible
+"[sketerm] remote shell: <name> (integration injected|no
+integration)" line before exec'ing the shell; term_open waits
+(bounded 8s after the idle wait, bailing early when the screen
+looks like an auth prompt so interactive auth is never delayed) for
+it, parses it (termdrive.scanShellAnnounce), and the reply names
+the remote shell. A "no integration" announce (dash/fish remote)
+flips Term.integration off, so wait_for=command refuses instantly
+with the clean "unsupported" verdict instead of burning the 10s
+first-prompt wait, and the term_open steering note switches to
+term_exec accordingly. term_list carries "shell"/"integration"
+fields (fills in post-auth for sessions that were still connecting
+at open). integration:false ssh reports "shell: unknown
+(integration disabled; nothing injected to report it)" — honest,
+never guessed. Live-verified on the VPS: local bash, remote bash,
+remote zsh, remote dash (inactive + instant refusal), opt-out
+unknown, term_list fields for all; full 14-check repro suite still
+PASS; unit suite 1041/5/0; smoke-mcp PASS; mux-portable builds.
+
+## MCP: transparent sketerm-mux transport for remote terms (2026-07-27)
+
+term_open host: now upgrades its transport automatically: if the
+remote host has sketerm-mux in PATH (key auth; a scp'd mux-portable
+binary is exactly this), the session is spawned on the REMOTE
+host's own daemon over `ssh host sketerm-mux --proxy` instead of a
+local `ssh -tt` PTY. Nothing for the assistant to choose: `auto` is
+the default, `transport:"mux"` forces (error instead of fallback),
+`transport:"ssh"` opts out. Wins: the session survives connection
+drops (termdrive reattaches transparently on transport loss — one
+bounded connectSshOnce + attach + snapshot resync per drop, re-armed
+on success; state like cwd/exports is intact because the session
+never died), the integration bootstrap rides the spawn argv
+(invisible: not typed, no history entry, no /tmp staging file), and
+exit statuses come from the daemon's real waitpid. The bootstrap
+script itself was split (buildBootstrapScript inner / b64 ssh
+wrapper outer) and now resolves the account shell via the
+remote_login_argv ladder (SKETERM_REMOTE_SHELL -> getent -> dscl ->
+$SHELL) instead of trusting an inherited $SHELL, since a
+daemon-spawned session's env is not an sshd login env. SpawnReq
+needed NO wire changes (spawn argv + existing fields only), so any
+existing remote daemon version works. Mux terms skip auto-recording
+(the .cast would land on the remote host); ttl_secs=3600 reaps
+orphans if the MCP client dies without term_close. term_list gains
+"transport":"sketerm-mux" + "host". No daemon code changed;
+client.zig only made connectSshOnce pub for the bounded reattach.
+
+Verified live (Debian 11 VPS, mux-portable at /usr/local/bin):
+auto picks mux (reply says durable + shell: bash + integration
+active), command mode + state persistence over mux, kill of the
+remote proxy mid-session -> next term_run transparently reattaches
+with cd/export intact and exact exit status, transport:"ssh" forces
+the old path, deleting the remote binary makes auto fall back to
+plain ssh with full integration. The 14-check bug-repro suite
+passes over BOTH transports. Unit suite 1041/5/0, smoke-mcp +
+smoke-mux PASS, mux-portable builds, sketerm-mux still links
+libc/libm only. VPS restored afterwards.
