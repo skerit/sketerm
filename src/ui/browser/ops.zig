@@ -89,12 +89,56 @@ fn clipStore(self: *BrowserView, tab: *BTab, srcs: []const []u8, cut: bool) void
     }
     if (self.clip_paths.items.len > 0)
         self.clip_path = self.allocator.dupe(u8, self.clip_paths.items[0]) catch null;
+    exportClipToGdk(self, tab, cut);
     const verb: []const u8 = if (cut) "cut" else "copied";
     if (self.clip_paths.items.len > 1) {
         self.setStatusFmt("{s} {d} items", .{ verb, self.clip_paths.items.len });
     } else if (self.clip_paths.items.len == 1) {
         self.setStatusFmt("{s}: {s}", .{ verb, self.clip_paths.items[0] });
     }
+}
+
+/// Mirror the internal clipboard onto the GDK clipboard so other apps
+/// can paste it: text/plain is newline-delimited absolute paths (a
+/// text-editor paste gives usable paths, Nemo-style, no file://) and
+/// x-special/gnome-copied-files carries file:// URIs so GNOME-family
+/// file managers paste the files themselves.
+///
+/// Paste-into-self never reads GDK — it uses the internal clip_paths —
+/// so this is purely an export. Remote entries are skipped: their
+/// paths mean nothing to other local applications.
+fn exportClipToGdk(self: *BrowserView, tab: *BTab, cut: bool) void {
+    if (self.clip_host != null) return;
+    if (self.clip_paths.items.len == 0) return;
+    const a = self.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    var gnome: std.ArrayList(u8) = .empty;
+    defer gnome.deinit(a);
+    gnome.appendSlice(a, if (cut) "cut" else "copy") catch return;
+    for (self.clip_paths.items, 0..) |p, i| {
+        if (i > 0) text.append(a, '\n') catch return;
+        text.appendSlice(a, p) catch return;
+        const pz = a.dupeZ(u8, p) catch return;
+        defer a.free(pz);
+        const uri = c.g_filename_to_uri(pz.ptr, null, null) orelse continue;
+        defer c.g_free(uri);
+        gnome.append(a, '\n') catch return;
+        gnome.appendSlice(a, std.mem.span(@as([*:0]const u8, @ptrCast(uri)))) catch return;
+    }
+    text.append(a, 0) catch return;
+    // The typed provider copies the string into its GValue; the union
+    // takes ownership of both providers; set_content refs the union,
+    // so our own ref is dropped afterwards.
+    const text_provider = c.gdk_content_provider_new_typed(c.G_TYPE_STRING, text.items.ptr);
+    const bytes = c.g_bytes_new(gnome.items.ptr, gnome.items.len);
+    defer c.g_bytes_unref(bytes);
+    const gnome_provider = c.gdk_content_provider_new_for_bytes("x-special/gnome-copied-files", bytes);
+    var providers = [_]?*c.GdkContentProvider{ gnome_provider, text_provider };
+    const both = c.gdk_content_provider_new_union(&providers, providers.len);
+    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(tab.listbox)));
+    _ = c.gdk_clipboard_set_content(clip, both);
+    c.g_object_unref(@as(?*anyopaque, @ptrCast(both)));
 }
 
 /// Chord-driven paste (Ctrl+V): the clipboard into the current tab.
@@ -759,26 +803,187 @@ pub fn onEntryDialogActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c)
         self.setStatus("invalid name");
         return menuDone(ctx);
     }
-    var buf: [4096]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    const req = self.nextReq();
     switch (ctx.mode) {
         .mkdir => {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
             const dir = ctx.tab.root.path;
             w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return menuDone(ctx);
+            const req = self.nextReq();
             self.deferUndo(req, self.makeUndo(ctx.tab.hc.host, .rmdir_created, w.buffered(), "", ""));
             self.sendOp(ctx.tab.hc, .{ .req = req, .op = "mkdir", .path = w.buffered() });
         },
         .rename => {
             const old = ctx.path orelse return menuDone(ctx);
-            const dir = std.fs.path.dirname(old) orelse return menuDone(ctx);
-            w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return menuDone(ctx);
-            self.deferUndo(req, self.makeUndo(ctx.tab.hc.host, .rename_back, w.buffered(), old, ""));
-            self.sendOp(ctx.tab.hc, .{ .req = req, .op = "rename", .path = old, .to = w.buffered() });
+            commitRename(self, ctx.tab, old, name);
         },
         .none, .tags => {},
     }
     menuDone(ctx);
+}
+
+/// Send the rename wire op for `old` → same directory, `name`; with
+/// the undo record. Shared by the popover dialog and inline rename.
+pub fn commitRename(self: *BrowserView, tab: *BTab, old: []const u8, name: []const u8) void {
+    const dir = std.fs.path.dirname(old) orelse return;
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return;
+    const req = self.nextReq();
+    self.deferUndo(req, self.makeUndo(tab.hc.host, .rename_back, w.buffered(), old, ""));
+    self.sendOp(tab.hc, .{ .req = req, .op = "rename", .path = old, .to = w.buffered() });
+}
+
+/// The live inline-rename editor; at most one per view.
+///
+/// The row/label/text widgets are REF'd: a listing rebuild or a tab
+/// close can orphan the row while the editor is up, and the deferred
+/// teardown must never touch freed widgets.
+pub const InlineRename = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    tab: *BTab,
+    /// Old full path of the entry being renamed.
+    path: []u8,
+    row: *c.GtkWidget,
+    label: *c.GtkWidget,
+    text: *c.GtkWidget,
+    /// Guards re-entry: focus-leave fires again during teardown.
+    done: bool = false,
+    commit: bool = false,
+};
+
+fn rowForPath(tab: *BTab, path: []const u8) ?*c.GtkListBoxRow {
+    var i: c_int = 0;
+    while (c.gtk_list_box_get_row_at_index(tab.listbox, i)) |row| : (i += 1) {
+        const data = c.g_object_get_data(@ptrCast(row), "sketerm-row") orelse continue;
+        const rctx: *RowCtx = @ptrCast(@alignCast(data));
+        if (std.mem.eql(u8, rctx.path, path)) return row;
+    }
+    return null;
+}
+
+/// Rename `path` in place: the row's name label is swapped for a
+/// GtkText right in the row. Enter commits, Escape or focus loss
+/// cancels. Views without a visible row for the entry (grid, a
+/// filtered-out row) fall back to the popover dialog.
+pub fn startInlineRename(self: *BrowserView, tab: *BTab, path: []const u8) void {
+    if (self.inline_rename) |ir| finishInlineRenameDeferred(ir, false);
+    const base = std.fs.path.basename(path);
+    if (base.len == 0 or base.len > 511) return self.entryDialog(tab, .rename, path);
+    const row = rowForPath(tab, path) orelse return self.entryDialog(tab, .rename, path);
+    const label_data = c.g_object_get_data(@ptrCast(row), "sketerm-name-label") orelse
+        return self.entryDialog(tab, .rename, path);
+    const label: *c.GtkWidget = @ptrCast(@alignCast(label_data));
+    const box = c.gtk_widget_get_parent(label) orelse
+        return self.entryDialog(tab, .rename, path);
+
+    const ctx = self.allocator.create(InlineRename) catch return;
+    const owned = self.allocator.dupe(u8, path) catch {
+        self.allocator.destroy(ctx);
+        return;
+    };
+
+    const text = c.gtk_text_new();
+    var z: [512:0]u8 = undefined;
+    @memcpy(z[0..base.len], base);
+    z[base.len] = 0;
+    c.gtk_editable_set_text(@ptrCast(text), &z);
+    c.gtk_widget_set_hexpand(text, 1);
+    c.gtk_widget_add_css_class(text, "sketerm-fb-rename");
+
+    // The editor takes the label's spot; the hidden label keeps its
+    // place in the box so teardown restores the exact layout.
+    c.gtk_widget_set_visible(label, 0);
+    c.gtk_box_insert_child_after(@ptrCast(@alignCast(box)), text, label);
+
+    ctx.* = .{
+        .allocator = self.allocator,
+        .view = self,
+        .tab = tab,
+        .path = owned,
+        .row = @ptrCast(@alignCast(row)),
+        .label = label,
+        .text = text,
+    };
+    _ = c.g_object_ref(@as(?*anyopaque, @ptrCast(ctx.row)));
+    _ = c.g_object_ref(@as(?*anyopaque, @ptrCast(ctx.label)));
+    _ = c.g_object_ref(@as(?*anyopaque, @ptrCast(ctx.text)));
+    self.inline_rename = ctx;
+
+    _ = c.g_signal_connect_data(text, "activate", @ptrCast(&onInlineRenameActivate), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    const keys = c.gtk_event_controller_key_new();
+    _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onInlineRenameKey), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(text, keys);
+    const focus = c.gtk_event_controller_focus_new();
+    _ = c.g_signal_connect_data(focus, "leave", @ptrCast(&onInlineRenameFocusOut), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.gtk_widget_add_controller(text, focus);
+
+    _ = c.gtk_widget_grab_focus(text);
+    // Preselect the stem only (Nemo-style): typing replaces the name,
+    // the extension survives. select_region takes CHARACTER offsets.
+    const stem_end: c_int = blk: {
+        const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse break :blk -1;
+        if (dot == 0) break :blk -1;
+        const n = std.unicode.utf8CountCodepoints(base[0..dot]) catch break :blk -1;
+        break :blk @intCast(n);
+    };
+    c.gtk_editable_select_region(@ptrCast(text), 0, stem_end);
+}
+
+fn onInlineRenameActivate(_: *c.GtkText, user: ?*anyopaque) callconv(.c) void {
+    finishInlineRenameDeferred(@ptrCast(@alignCast(user.?)), true);
+}
+
+fn onInlineRenameKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, _: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
+    if (keyval != c.GDK_KEY_Escape) return 0;
+    finishInlineRenameDeferred(@ptrCast(@alignCast(user.?)), false);
+    return 1;
+}
+
+fn onInlineRenameFocusOut(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
+    finishInlineRenameDeferred(@ptrCast(@alignCast(user.?)), false);
+}
+
+/// End the edit on the next idle: the callers are the editor's own
+/// signal handlers, and removing the widget from inside them is not
+/// safe. `done` makes the first verdict (commit vs cancel) stick.
+pub fn finishInlineRenameDeferred(ctx: *InlineRename, commit: bool) void {
+    if (ctx.done) return;
+    ctx.done = true;
+    ctx.commit = commit;
+    _ = c.g_idle_add(@ptrCast(&inlineRenameIdle), @ptrCast(ctx));
+}
+
+fn inlineRenameIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const ctx: *InlineRename = @ptrCast(@alignCast(user.?));
+    const self = ctx.view;
+    const tab = ctx.tab;
+    if (ctx.commit) {
+        const txt = c.gtk_editable_get_text(@ptrCast(ctx.text));
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
+        const base = std.fs.path.basename(ctx.path);
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) {
+            self.setStatus("invalid name");
+        } else if (!std.mem.eql(u8, name, base) and tabAlive(self, tab)) {
+            commitRename(self, tab, ctx.path, name);
+        }
+    }
+    c.gtk_widget_set_visible(ctx.label, 1);
+    if (c.gtk_widget_get_parent(ctx.text)) |parent|
+        c.gtk_box_remove(@ptrCast(@alignCast(parent)), ctx.text);
+    const row = ctx.row;
+    c.g_object_unref(@as(?*anyopaque, @ptrCast(ctx.text)));
+    c.g_object_unref(@as(?*anyopaque, @ptrCast(ctx.label)));
+    if (self.inline_rename == ctx) self.inline_rename = null;
+    self.allocator.free(ctx.path);
+    self.allocator.destroy(ctx);
+    // Focus back onto the row (if it still lives in the listing) so
+    // the browser's chords keep working after the edit.
+    if (c.gtk_widget_get_parent(row) != null)
+        _ = c.gtk_widget_grab_focus(row);
+    c.g_object_unref(@as(?*anyopaque, @ptrCast(row)));
+    return 0;
 }
 
 /// Fetch the .trashinfo for a trashed entry, then restore it to

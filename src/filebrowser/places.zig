@@ -39,6 +39,12 @@ pub const Places = struct {
     /// Whether the sidebar is shown. `null` = never toggled, so the
     /// default follows the application identity (on in files mode).
     sidebar_open: ?bool = null,
+    /// Alternating row background in the list views.
+    zebra: bool = false,
+    /// Width of the Information panel, in pixels.
+    preview_px: i32 = 300,
+    /// Compact info card at the bottom of the places sidebar.
+    side_info: bool = false,
 };
 
 pub const DEFAULT_SIDEBAR_PX: i32 = 190;
@@ -183,7 +189,7 @@ test "sidebar fields round-trip through the saved JSON" {
     const t = std.testing;
     var out: std.Io.Writer.Allocating = .init(t.allocator);
     defer out.deinit();
-    try std.json.Stringify.value(Places{ .sidebar_px = 245, .sidebar_open = false }, .{}, &out.writer);
+    try std.json.Stringify.value(Places{ .sidebar_px = 245, .sidebar_open = false, .zebra = true }, .{}, &out.writer);
     const parsed = try std.json.parseFromSlice(Places, t.allocator, out.written(), .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
@@ -191,6 +197,7 @@ test "sidebar fields round-trip through the saved JSON" {
     defer parsed.deinit();
     try t.expectEqual(@as(i32, 245), parsed.value.sidebar_px);
     try t.expectEqual(@as(?bool, false), parsed.value.sidebar_open);
+    try t.expectEqual(true, parsed.value.zebra);
 }
 
 test "clampSidebarPx rejects widths that would break the layout" {

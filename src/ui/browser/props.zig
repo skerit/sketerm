@@ -48,6 +48,7 @@ fn setProbeText(probe: LabelProbe, message: [*:0]const u8) void {
     clearBox(probe.label);
     const lbl = c.gtk_label_new(message);
     c.gtk_label_set_xalign(@ptrCast(lbl), 0);
+    c.gtk_label_set_ellipsize(@ptrCast(lbl), c.PANGO_ELLIPSIZE_END);
     c.gtk_widget_add_css_class(lbl, "dim-label");
     c.gtk_box_append(@ptrCast(probe.label), lbl);
 }
@@ -394,9 +395,21 @@ pub fn onMenuProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     var title_z: [576:0]u8 = undefined;
     const win_title = std.fmt.bufPrintZ(&title_z, "{s} Properties", .{std.fs.path.basename(path)}) catch "Properties";
     c.gtk_window_set_title(@ptrCast(window), win_title.ptr);
-    c.gtk_window_set_default_size(@ptrCast(window), 420, 560);
-    if (c.gtk_widget_get_root(self.root_box)) |root|
+    // Tall enough that a plain file fits without a vertical
+    // scrollbar; clamped to 90% of the monitor for small screens.
+    var win_h: c.gint = 1120;
+    if (c.gtk_widget_get_root(self.root_box)) |root| {
         c.gtk_window_set_transient_for(@ptrCast(window), @ptrCast(@alignCast(root)));
+        if (c.gtk_native_get_surface(@ptrCast(@alignCast(root)))) |surface| {
+            const display = c.gtk_widget_get_display(self.root_box);
+            if (c.gdk_display_get_monitor_at_surface(display, surface)) |monitor| {
+                var geo: c.GdkRectangle = undefined;
+                c.gdk_monitor_get_geometry(monitor, &geo);
+                win_h = @min(win_h, @divTrunc(geo.height * 9, 10));
+            }
+        }
+    }
+    c.gtk_window_set_default_size(@ptrCast(window), 440, win_h);
     const esc = c.gtk_shortcut_controller_new();
     c.gtk_shortcut_controller_add_shortcut(
         @ptrCast(esc),
@@ -417,6 +430,8 @@ pub fn onMenuProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const title = c.gtk_label_new(copyZ(@ptrCast(&name_z), std.fs.path.basename(path)));
     c.gtk_widget_add_css_class(title, "heading");
     c.gtk_label_set_xalign(@ptrCast(title), 0);
+    c.gtk_label_set_selectable(@ptrCast(title), 1);
+    c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_MIDDLE);
     c.gtk_box_append(@ptrCast(box), title);
 
     var scratch: [1024]u8 = undefined;
@@ -491,6 +506,7 @@ pub fn onMenuProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         };
         const app_label = c.gtk_label_new(app_name);
         c.gtk_label_set_xalign(@ptrCast(app_label), 0);
+        c.gtk_label_set_ellipsize(@ptrCast(app_label), c.PANGO_ELLIPSIZE_END);
         c.gtk_widget_set_hexpand(app_label, 1);
         c.gtk_box_append(@ptrCast(app_row), app_label);
         const change = c.gtk_button_new_with_label("Change…");
@@ -627,6 +643,9 @@ pub fn onMenuProperties(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
     const scroll = c.gtk_scrolled_window_new();
     c.gtk_widget_set_vexpand(scroll, 1);
+    // Long names/values ellipsize instead of widening the window: a
+    // horizontal scrollbar on a properties dialog is never right.
+    c.gtk_scrolled_window_set_policy(@ptrCast(scroll), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
     c.gtk_scrolled_window_set_child(@ptrCast(scroll), box);
     const toolbar = c.adw_toolbar_view_new();
     c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar), c.adw_header_bar_new());

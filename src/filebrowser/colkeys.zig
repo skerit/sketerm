@@ -41,13 +41,15 @@ pub const ValueKind = enum {
 /// A key with a meaning beyond "some text": its ordering and the
 /// title its header shows. Keys absent here are `.text` and titled
 /// by their trailing segment.
-const Known = struct {
+pub const Known = struct {
     key: []const u8,
     kind: ValueKind,
     title: []const u8,
 };
 
-const KNOWN = [_]Known{
+/// Public so the column picker can offer every known metadata column
+/// as a checkbox instead of a type-the-key entry.
+pub const KNOWN = [_]Known{
     .{ .key = "media.kind", .kind = .text, .title = "Media" },
     .{ .key = "media.format", .kind = .text, .title = "Format" },
     .{ .key = "media.codec", .kind = .text, .title = "Codec" },

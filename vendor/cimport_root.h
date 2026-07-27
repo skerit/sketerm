@@ -81,6 +81,7 @@
 #include <poll.h>
 #include <errno.h>
 #include <pwd.h>
+#include <grp.h>
 /* Unix-domain sockets for the sketerm-mux daemon + clients. */
 #include <sys/socket.h>
 #include <sys/un.h>

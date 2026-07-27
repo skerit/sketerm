@@ -28,6 +28,12 @@ pub const Entry = struct {
     ctime_ms: i64 = 0,
     uid: u32 = 0,
     gid: u32 = 0,
+    /// Owner/group names resolved by the owning host ("" = unknown
+    /// there; fall back to the numeric id).
+    owner: []u8 = &.{},
+    group: []u8 = &.{},
+    /// Birth/creation time, 0 when the filesystem has none.
+    btime_ms: i64 = 0,
     nlink: u64 = 1,
     blocks: u64 = 0,
     /// Directory child count from the owning host, -1 = unknown.
@@ -48,6 +54,8 @@ pub const Entry = struct {
     pub fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.kind);
+        if (self.owner.len > 0) allocator.free(self.owner);
+        if (self.group.len > 0) allocator.free(self.group);
         if (self.target) |t| allocator.free(t);
         if (self.tags.len > 0) allocator.free(self.tags);
         for (self.attrs) |v| allocator.free(v);
@@ -56,6 +64,13 @@ pub const Entry = struct {
         if (self.meta.len > 0) allocator.free(self.meta);
     }
 };
+
+/// Extension after the last dot ("" for dotless and dotfile names).
+pub fn extensionOf(name: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return "";
+    if (dot == 0 or dot + 1 == name.len) return "";
+    return name[dot + 1 ..];
+}
 
 /// Wire mirror of the fs_reply fields the browser consumes.
 pub const WireEntry = struct {
@@ -68,6 +83,9 @@ pub const WireEntry = struct {
     ctime_ms: i64 = 0,
     uid: u32 = 0,
     gid: u32 = 0,
+    owner: []const u8 = "",
+    group: []const u8 = "",
+    btime_ms: i64 = 0,
     nlink: u64 = 1,
     blocks: u64 = 0,
     children: i64 = -1,
@@ -367,6 +385,9 @@ pub const Dir = struct {
             .ctime_ms = we.ctime_ms,
             .uid = we.uid,
             .gid = we.gid,
+            .owner = if (we.owner.len > 0) (a.dupe(u8, we.owner) catch @constCast("")) else @constCast(""),
+            .group = if (we.group.len > 0) (a.dupe(u8, we.group) catch @constCast("")) else @constCast(""),
+            .btime_ms = we.btime_ms,
             .nlink = we.nlink,
             .blocks = we.blocks,
             .children = we.children,
@@ -450,11 +471,32 @@ pub const Dir = struct {
                 }
                 return switch (ctx.key) {
                     .size => if (a.size != b.size) a.size < b.size else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .allocated => if (a.blocks != b.blocks) a.blocks < b.blocks else std.ascii.lessThanIgnoreCase(a.name, b.name),
                     .mtime => if (a.mtime_ms != b.mtime_ms) a.mtime_ms < b.mtime_ms else std.ascii.lessThanIgnoreCase(a.name, b.name),
                     .ctime => if (a.ctime_ms != b.ctime_ms) a.ctime_ms < b.ctime_ms else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .atime => if (a.atime_ms != b.atime_ms) a.atime_ms < b.atime_ms else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .btime => if (a.btime_ms != b.btime_ms) a.btime_ms < b.btime_ms else std.ascii.lessThanIgnoreCase(a.name, b.name),
                     .kind => if (!std.mem.eql(u8, a.kind, b.kind)) std.mem.lessThan(u8, a.kind, b.kind) else std.ascii.lessThanIgnoreCase(a.name, b.name),
-                    .owner => if (a.uid != b.uid) a.uid < b.uid else std.ascii.lessThanIgnoreCase(a.name, b.name),
-                    .group => if (a.gid != b.gid) a.gid < b.gid else std.ascii.lessThanIgnoreCase(a.name, b.name),
+                    .extension => blk: {
+                        const ea = extensionOf(a.name);
+                        const eb = extensionOf(b.name);
+                        if (!std.ascii.eqlIgnoreCase(ea, eb)) break :blk std.ascii.lessThanIgnoreCase(ea, eb);
+                        break :blk std.ascii.lessThanIgnoreCase(a.name, b.name);
+                    },
+                    .owner => blk: {
+                        // Names when the host resolved both; ids otherwise.
+                        if (a.owner.len > 0 and b.owner.len > 0 and !std.ascii.eqlIgnoreCase(a.owner, b.owner))
+                            break :blk std.ascii.lessThanIgnoreCase(a.owner, b.owner);
+                        if (a.uid != b.uid) break :blk a.uid < b.uid;
+                        break :blk std.ascii.lessThanIgnoreCase(a.name, b.name);
+                    },
+                    .group => blk: {
+                        if (a.group.len > 0 and b.group.len > 0 and !std.ascii.eqlIgnoreCase(a.group, b.group))
+                            break :blk std.ascii.lessThanIgnoreCase(a.group, b.group);
+                        if (a.gid != b.gid) break :blk a.gid < b.gid;
+                        break :blk std.ascii.lessThanIgnoreCase(a.name, b.name);
+                    },
+                    .nlink => if (a.nlink != b.nlink) a.nlink < b.nlink else std.ascii.lessThanIgnoreCase(a.name, b.name),
                     .permissions => if (a.mode != b.mode) a.mode < b.mode else std.ascii.lessThanIgnoreCase(a.name, b.name),
                     .name => std.ascii.lessThanIgnoreCase(a.name, b.name),
                 };
@@ -496,12 +538,26 @@ pub const BTab = struct {
     vs: TabView = .{},
     /// Sticky-click flag and visual-mode anchor (selection.zig).
     sel: TabSel = .{},
+    /// Rubber-band drag-to-select (selection.zig): the overlay
+    /// drawing area and the live band rectangle, in listbox coords.
+    rubber_area: ?*c.GtkWidget = null,
+    rubber: struct {
+        active: bool = false,
+        x0: f64 = 0,
+        y0: f64 = 0,
+        x1: f64 = 0,
+        y1: f64 = 0,
+    } = .{},
     page: *c.GtkWidget,
     listbox: *c.GtkListBox,
     tab_label: *c.GtkLabel,
     /// Details/compact sort header (hidden in grid/miller). Rebuilt
     /// whenever the column set or sort changes.
     header_box: *c.GtkWidget = undefined,
+    /// The header's scrollbar-less scroller, h-locked to `scroller`;
+    /// what show/hide toggles (hiding only the inner box would leave
+    /// an empty scroller behind).
+    header_scroll: *c.GtkWidget = undefined,
     /// Optional details columns, rendered in Column declaration order.
     columns: std.EnumSet(browser_model.Column) =
         std.EnumSet(browser_model.Column).initMany(&browser_model.default_columns),
@@ -520,6 +576,9 @@ pub const BTab = struct {
     /// list (a restore fills the names first): a missing entry reads
     /// as the default width.
     attr_col_widths: std.ArrayList(i32) = .empty,
+    /// Width the user dragged the Name column to; 0 = auto (the name
+    /// takes all leftover width, the pre-resize behavior).
+    name_width: i32 = 0,
     /// Index into attr_columns the view is sorted by, if any.
     attr_sort: ?usize = null,
     /// The scrolled window whose child swaps listbox <-> flowbox.

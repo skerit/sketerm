@@ -43,6 +43,13 @@ pub const Entry = struct {
     ctime_ns: i64 = 0,
     uid: u32 = 0,
     gid: u32 = 0,
+    /// Owner/group NAMES resolved on the owning host ("" when the id
+    /// has no passwd/group entry there) -- the daemon resolves them
+    /// because only it can answer correctly for remote listings.
+    owner: []const u8 = "",
+    group: []const u8 = "",
+    /// Birth/creation time, 0 when the filesystem cannot report one.
+    btime_ms: i64 = 0,
     nlink: u64 = 1,
     blocks: u64 = 0,
     dev: u64 = 0,
@@ -100,6 +107,80 @@ fn atimeMs(st: *const c.struct_stat) i64 {
 fn ctimeMs(st: *const c.struct_stat) i64 {
     const ts = if (@hasField(c.struct_stat, "st_ctim")) st.st_ctim else st.st_ctimespec;
     return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+}
+
+/// uid/gid -> name, memoized: NSS lookups can be arbitrarily slow
+/// (LDAP...), and a listing repeats the same handful of ids
+/// thousands of times. Single-threaded daemon, so no locking.
+const IdNameCache = struct {
+    const Slot = struct { id: u32 = 0, used: bool = false, len: u8 = 0, buf: [64]u8 = undefined };
+    slots: [32]Slot = @splat(.{}),
+    next: usize = 0,
+
+    fn get(self: *IdNameCache, id: u32, comptime lookup: fn (u32) ?[]const u8) []const u8 {
+        for (&self.slots) |*s| {
+            if (s.used and s.id == id) return s.buf[0..s.len];
+        }
+        const name = lookup(id) orelse "";
+        const s = &self.slots[self.next];
+        self.next = (self.next + 1) % self.slots.len;
+        const n: u8 = @intCast(@min(name.len, s.buf.len));
+        s.* = .{ .id = id, .used = true, .len = n };
+        @memcpy(s.buf[0..n], name[0..n]);
+        return s.buf[0..n];
+    }
+};
+
+var uid_names: IdNameCache = .{};
+var gid_names: IdNameCache = .{};
+
+fn lookupUser(id: u32) ?[]const u8 {
+    const pw = c.getpwuid(id) orelse return null;
+    const nm = pw.*.pw_name orelse return null;
+    return std.mem.span(@as([*:0]const u8, @ptrCast(nm)));
+}
+
+fn lookupGroup(id: u32) ?[]const u8 {
+    const gr = c.getgrgid(id) orelse return null;
+    const nm = gr.*.gr_name orelse return null;
+    return std.mem.span(@as([*:0]const u8, @ptrCast(nm)));
+}
+
+/// Owner name for a uid, "" when it has no passwd entry. The slice
+/// points into a rotating cache slot -- dupe it before it outlives
+/// the next 32 distinct ids.
+pub fn ownerName(uid: u32) []const u8 {
+    return uid_names.get(uid, lookupUser);
+}
+
+pub fn groupName(gid: u32) []const u8 {
+    return gid_names.get(gid, lookupGroup);
+}
+
+/// Birth (creation) time in wall-clock ms, 0 when the kernel or the
+/// filesystem cannot report one. Linux needs a second syscall
+/// (statx); macOS already carries it on the stat result.
+fn btimeMsOf(st: *const c.struct_stat, full: [*:0]const u8) i64 {
+    if (comptime @hasField(c.struct_stat, "st_birthtimespec")) {
+        const ts = st.st_birthtimespec;
+        if (ts.tv_sec == 0 and ts.tv_nsec == 0) return 0;
+        return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
+    } else if (comptime is_linux) {
+        const linux = std.os.linux;
+        var stx: linux.Statx = undefined;
+        const rc = linux.statx(
+            c.AT_FDCWD,
+            full,
+            linux.AT.SYMLINK_NOFOLLOW | linux.AT.STATX_DONT_SYNC,
+            .{ .BTIME = true },
+            &stx,
+        );
+        // Raw syscall: 0 is success, anything else is -errno.
+        if (rc != 0) return 0;
+        if (!stx.mask.BTIME) return 0;
+        return @as(i64, stx.btime.sec) * 1000 + @as(i64, stx.btime.nsec / 1_000_000);
+    }
+    return 0;
 }
 
 fn timespecNs(ts: c.struct_timespec) i64 {
@@ -164,6 +245,9 @@ pub fn statEntryAttrs(arena: std.mem.Allocator, dir: []const u8, name: []const u
         .ctime_ns = timespecNs(if (@hasField(c.struct_stat, "st_ctim")) st.st_ctim else st.st_ctimespec),
         .uid = @intCast(st.st_uid),
         .gid = @intCast(st.st_gid),
+        .owner = arena.dupe(u8, ownerName(@intCast(st.st_uid))) catch "",
+        .group = arena.dupe(u8, groupName(@intCast(st.st_gid))) catch "",
+        .btime_ms = btimeMsOf(&st, full),
         .nlink = @intCast(st.st_nlink),
         .blocks = if (st.st_blocks > 0) @intCast(st.st_blocks) else 0,
         .dev = @intCast(st.st_dev),

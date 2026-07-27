@@ -111,6 +111,7 @@ pub fn tabStateOf(arena: std.mem.Allocator, tab: *BTab) !browser_model.TabState 
         .attr_columns = try attrColumnsOf(arena, tab),
         .col_widths = try colWidthsOf(arena, tab),
         .attr_col_widths = try attrWidthsOf(arena, tab),
+        .name_width = tab.name_width,
         .sort = tab.sort_key,
         .descending = tab.descending,
         .dirs_first = tab.dirs_first,

@@ -40,6 +40,9 @@ pub const Record = struct {
     /// Dragged column widths, positional against `columns`; 0 (or a
     /// short/absent list, e.g. a pre-resize file) = default width.
     col_widths: []const i32 = &.{},
+    /// Dragged Name-column width; 0 (incl. pre-name-resize files) =
+    /// auto, the name takes the leftover width.
+    name_width: i32 = 0,
     /// Use counter, assigned on every write and read. Deterministic
     /// LRU: eviction always drops the smallest one.
     seq: u64 = 0,

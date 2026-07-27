@@ -130,12 +130,27 @@ pub const BrowserView = struct {
     search_entry: *c.GtkEntry = undefined,
     search_content: *c.GtkWidget = undefined,
     hidden_toggle: *c.GtkToggleButton = undefined,
-    /// Preview side panel (toggleable): metadata always, image or
-    /// text-head content when recognizably previewable.
+    /// Information side panel (toggleable), Dolphin-style: preview
+    /// stage, bold name, key/value metadata grid, note, content head.
     preview_box: *c.GtkWidget = undefined,
     preview_pic: *c.GtkWidget = undefined,
+    /// Big themed icon shown in the stage while there is no rendered
+    /// preview (exactly one of pic/icon is visible).
+    preview_icon: *c.GtkWidget = undefined,
+    preview_name: *c.GtkLabel = undefined,
+    preview_grid: *c.GtkWidget = undefined,
+    preview_grid_rows: i32 = 0,
     preview_text: *c.GtkLabel = undefined,
+    /// The content head's own scroller (horizontal only, for hex).
+    preview_text_scroll: *c.GtkWidget = undefined,
     preview_meta: *c.GtkLabel = undefined,
+    /// The notebook|panel paned; position drives preview_px.
+    info_paned: *c.GtkWidget = undefined,
+    /// Persisted panel width (places.json).
+    preview_px: i32 = 300,
+    /// Compact info card at the bottom of the places sidebar
+    /// (places.json; independent of the full panel).
+    side_info: bool = false,
     preview_on: bool = false,
     preview_read: ?*PreviewRead = null,
     preview_generation: u64 = 0,
@@ -166,6 +181,15 @@ pub const BrowserView = struct {
     compare: ?*CompareCtx = null,
     /// Places sidebar (bookmarks / recent / devices).
     places_scroller: *c.GtkWidget = undefined,
+    /// The sidebar column (places list + optional info card); what
+    /// the Places toggle shows and hides.
+    places_box: *c.GtkWidget = undefined,
+    /// Compact info card widgets (bottom of the sidebar).
+    side_card: *c.GtkWidget = undefined,
+    side_card_img: *c.GtkWidget = undefined,
+    side_card_title: *c.GtkLabel = undefined,
+    side_card_sub: *c.GtkLabel = undefined,
+    side_card_sub2: *c.GtkLabel = undefined,
     places_list: *c.GtkListBox = undefined,
     places_on: bool = false,
     /// Smooth-scroll accumulator for scroll-to-switch on the tab
@@ -183,6 +207,11 @@ pub const BrowserView = struct {
     /// Persisted sidebar open state; null = never toggled, so the
     /// default follows the application identity.
     sidebar_open: ?bool = null,
+    /// Alternating row background in the list views (persisted in
+    /// places.json, toggled from the view-options menu).
+    zebra: bool = false,
+    /// The live inline-rename editor, if any (see ops.InlineRename).
+    inline_rename: ?*@import("ops.zig").InlineRename = null,
     /// False until the persisted chrome state has been applied, so the
     /// programmatic initial toggle does not write places.json back.
     chrome_ready: bool = false,
@@ -528,6 +557,7 @@ pub const BrowserView = struct {
     pub const onMenuDelete = @import("ops.zig").onMenuDelete;
     pub const onDeleteConfirmed = @import("ops.zig").onDeleteConfirmed;
     pub const entryDialog = @import("ops.zig").entryDialog;
+    pub const startInlineRename = @import("ops.zig").startInlineRename;
     pub const onEntryDialogActivate = @import("ops.zig").onEntryDialogActivate;
     pub const startTrashRestore = @import("ops.zig").startTrashRestore;
     pub const feedRestore = @import("ops.zig").feedRestore;
@@ -729,6 +759,9 @@ pub const BrowserView = struct {
             }
             self.sidebar_px = places_mod.clampSidebarPx(parsed.value.sidebar_px);
             self.sidebar_open = parsed.value.sidebar_open;
+            self.zebra = parsed.value.zebra;
+            self.preview_px = std.math.clamp(parsed.value.preview_px, 220, 700);
+            self.side_info = parsed.value.side_info;
             for (parsed.value.searches) |sq| {
                 const spec = allocator.dupe(u8, sq.spec) catch continue;
                 const pat = allocator.dupe(u8, sq.pattern) catch {
@@ -1135,6 +1168,24 @@ pub const BrowserView = struct {
         return btn.?;
     }
 
+    /// A flat, start-aligned labeled row inside the hamburger
+    /// popover; clicking it runs the action and closes the menu.
+    fn menuRow(self: *BrowserView, box: ?*c.GtkWidget, label: [*:0]const u8, tip: [*:0]const u8, cb: anytype) void {
+        const btn = c.gtk_button_new_with_label(label);
+        c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+        if (c.gtk_button_get_child(@ptrCast(btn))) |lbl|
+            c.gtk_widget_set_halign(lbl, c.GTK_ALIGN_START);
+        c.gtk_widget_set_tooltip_text(btn, tip);
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(cb), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onMenuRowDismiss), null, null, c.G_CONNECT_AFTER);
+        c.gtk_box_append(@ptrCast(box), btn);
+    }
+
+    fn onMenuRowDismiss(btn: *c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+        const pop = c.gtk_widget_get_ancestor(@ptrCast(btn), c.gtk_popover_get_type());
+        if (pop != null) c.gtk_popover_popdown(@ptrCast(pop));
+    }
+
     /// `barButton` for a toggle. Same icon guarantee.
     fn barToggle(self: *BrowserView, bar: *c.GtkWidget, icon: [*:0]const u8, text: [*:0]const u8, tip: [*:0]const u8, cb: anytype) *c.GtkWidget {
         const btn = c.gtk_toggle_button_new();
@@ -1265,20 +1316,13 @@ pub const BrowserView = struct {
         // `keep` never does (search and the way back to the shell stay
         // one click away at any width).
         //
-        // `hidden` stays the insertion anchor the view and selection
-        // menus append themselves after (views.zig/selection.zig read
-        // its PARENT), so it must keep being a direct child of the box
-        // those buttons belong in -- which is the collapsible one, so
-        // they collapse with it.
+        // Dolphin's uncluttered-toolbar rule applies: only the
+        // constantly-used toggles stay as buttons; everything else
+        // lives in the always-visible hamburger menu.
         const right = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
         const cluster = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
-        const hidden = self.barToggle(cluster, "view-reveal-symbolic", "Hidden", "Show hidden files", &onHiddenToggled);
         const places_btn = self.barToggle(cluster, "user-bookmarks-symbolic", "Places", "Places sidebar (bookmarks, recent, devices)", &onPlacesToggled);
-        _ = self.barButton(cluster, "view-grid-symbolic", "View", "Cycle view: details / compact / grid / columns", &onViewModeClicked);
-        _ = self.barToggle(cluster, "view-dual-symbolic", "Preview", "Preview panel (images, text head, metadata)", &onPreviewToggled);
-        _ = self.barButton(cluster, "sketerm-split-left-right-symbolic", "Split", "Add a browser pane beside this one", &onSplitClicked);
-        _ = self.barButton(cluster, "tab-new-symbolic", "New tab", "New browser tab", &onNewTabClicked);
-        _ = self.barButton(cluster, "go-jump-symbolic", "Shell cwd", "Go to the shell's current directory (OSC 7)", &onCwdSyncClicked);
+        _ = self.barToggle(cluster, "sketerm-preview-pane-symbolic", "Information", "Information panel (preview, metadata)", &onPreviewToggled);
         c.gtk_box_append(@ptrCast(right), cluster);
 
         const keep = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
@@ -1296,22 +1340,35 @@ pub const BrowserView = struct {
         c.gtk_box_append(@ptrCast(right), keep);
         c.gtk_box_append(@ptrCast(bar), right);
 
-        // The overflow hamburger: hidden until the toolbar is too
-        // narrow to show the cluster inline.
+        // The hamburger menu: always visible. Hosts the demoted
+        // toolbar actions permanently, plus the reparenting slot the
+        // cluster collapses into when the bar runs out of room.
         const pop = c.gtk_popover_new();
-        const pop_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
+        const pop_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2);
         const slot = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
         c.gtk_box_append(@ptrCast(pop_box), slot);
+
+        const hidden = c.gtk_toggle_button_new_with_label("Show hidden files");
+        c.gtk_button_set_has_frame(@ptrCast(hidden), 0);
+        if (c.gtk_button_get_child(@ptrCast(hidden))) |lbl|
+            c.gtk_widget_set_halign(lbl, c.GTK_ALIGN_START);
+        _ = c.g_signal_connect_data(hidden, "toggled", @ptrCast(&onHiddenToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(pop_box), hidden);
+        self.menuRow(pop_box, "Cycle view mode", "Details / compact / grid / columns", &onViewModeClicked);
         c.gtk_box_append(@ptrCast(pop_box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+        self.menuRow(pop_box, "New Tab", "New browser tab", &onNewTabClicked);
+        self.menuRow(pop_box, "Split Pane", "Add a browser pane beside this one", &onSplitClicked);
         // Un-split lives here permanently: a browser face has no pane
         // titlebar, so the toolbar is the only chrome that can offer it.
         const closer = c.gtk_button_new_with_label("Close Pane");
         c.gtk_button_set_has_frame(@ptrCast(closer), 0);
         if (c.gtk_button_get_child(@ptrCast(closer))) |lbl|
             c.gtk_widget_set_halign(lbl, c.GTK_ALIGN_START);
-        c.gtk_widget_set_tooltip_text(closer, "Close this pane and give its space back (un-split)");
+        c.gtk_widget_set_tooltip_text(closer, "Close this pane and give its space back (un-split; closing the last pane closes the tab)");
         _ = c.g_signal_connect_data(closer, "clicked", @ptrCast(&onOverflowClosePane), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(pop_box), closer);
+        c.gtk_box_append(@ptrCast(pop_box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+        self.menuRow(pop_box, "Go to Shell Directory", "Go to the shell's current directory (OSC 7)", &onCwdSyncClicked);
         c.gtk_popover_set_child(@ptrCast(pop), pop_box);
         const burger = c.gtk_menu_button_new();
         c.gtk_menu_button_set_icon_name(@ptrCast(burger), "open-menu-symbolic");
@@ -1319,8 +1376,7 @@ pub const BrowserView = struct {
         c.gtk_menu_button_set_has_frame(@ptrCast(burger), 0);
         c.gtk_widget_add_css_class(burger, "flat");
         c.gtk_widget_set_can_focus(burger, 0);
-        c.gtk_widget_set_tooltip_text(burger, "More toolbar actions");
-        c.gtk_widget_set_visible(burger, 0);
+        c.gtk_widget_set_tooltip_text(burger, "Menu");
         c.gtk_box_append(@ptrCast(right), burger);
 
         c.gtk_box_append(@ptrCast(vbox), bar);
@@ -1368,8 +1424,15 @@ pub const BrowserView = struct {
         _ = c.g_signal_connect_data(pl_rclick, "pressed", @ptrCast(&onPlacesRightClick), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(pl_list, @ptrCast(pl_rclick));
         c.gtk_scrolled_window_set_child(@ptrCast(pl_scroll), pl_list);
-        c.gtk_widget_set_visible(pl_scroll, 0);
-        c.gtk_paned_set_start_child(@ptrCast(content), pl_scroll);
+        // The sidebar column: the places list above, an optional
+        // compact info card pinned at the bottom (iTunes-style
+        // "now playing" slot for the current selection).
+        const pl_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
+        c.gtk_widget_set_vexpand(pl_scroll, 1);
+        c.gtk_box_append(@ptrCast(pl_box), pl_scroll);
+        c.gtk_box_append(@ptrCast(pl_box), @import("preview.zig").buildSideCard(self));
+        c.gtk_widget_set_visible(pl_box, 0);
+        c.gtk_paned_set_start_child(@ptrCast(content), pl_box);
         // The sidebar keeps its width when the window resizes; the
         // listing side absorbs the difference.
         c.gtk_paned_set_resize_start_child(@ptrCast(content), 0);
@@ -1377,39 +1440,26 @@ pub const BrowserView = struct {
         c.gtk_paned_set_position(@ptrCast(content), self.sidebar_px);
         _ = c.g_signal_connect_data(content, "notify::position", @ptrCast(&onSidebarPosition), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
-        const main_side = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+        // Listing | Information panel. A paned, so the panel's width
+        // belongs to the user (drag the divider) and can never be
+        // pushed around by whatever content the panel shows.
+        const main_side = c.gtk_paned_new(c.GTK_ORIENTATION_HORIZONTAL);
         c.gtk_widget_set_hexpand(main_side, 1);
         c.gtk_widget_set_vexpand(main_side, 1);
         c.gtk_paned_set_end_child(@ptrCast(content), main_side);
         c.gtk_paned_set_resize_end_child(@ptrCast(content), 1);
 
-        c.gtk_box_append(@ptrCast(main_side), notebook);
+        c.gtk_paned_set_start_child(@ptrCast(main_side), notebook);
+        c.gtk_paned_set_resize_start_child(@ptrCast(main_side), 1);
+        c.gtk_paned_set_shrink_start_child(@ptrCast(main_side), 1);
 
-        const pbox = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
-        c.gtk_widget_set_size_request(pbox, 300, -1);
-        c.gtk_widget_set_margin_start(pbox, 8);
-        c.gtk_widget_set_margin_end(pbox, 8);
-        c.gtk_widget_set_margin_top(pbox, 8);
-        const pmeta = c.gtk_label_new("");
-        c.gtk_label_set_xalign(@ptrCast(pmeta), 0);
-        c.gtk_label_set_wrap(@ptrCast(pmeta), 1);
-        c.gtk_label_set_selectable(@ptrCast(pmeta), 1);
-        c.gtk_box_append(@ptrCast(pbox), pmeta);
-        const ppic = c.gtk_picture_new();
-        c.gtk_widget_set_size_request(ppic, 284, 200);
-        c.gtk_box_append(@ptrCast(pbox), ppic);
-        const ptext_scroll = c.gtk_scrolled_window_new();
-        c.gtk_widget_set_vexpand(ptext_scroll, 1);
-        const ptext = c.gtk_label_new("");
-        c.gtk_label_set_xalign(@ptrCast(ptext), 0);
-        c.gtk_label_set_yalign(@ptrCast(ptext), 0);
-        c.gtk_label_set_wrap(@ptrCast(ptext), 1);
-        c.gtk_label_set_selectable(@ptrCast(ptext), 1);
-        c.gtk_widget_add_css_class(ptext, "monospace");
-        c.gtk_scrolled_window_set_child(@ptrCast(ptext_scroll), ptext);
-        c.gtk_box_append(@ptrCast(pbox), ptext_scroll);
+        const pbox = @import("preview.zig").buildInfoPanel(self);
+        c.gtk_paned_set_end_child(@ptrCast(main_side), pbox);
+        c.gtk_paned_set_resize_end_child(@ptrCast(main_side), 0);
+        c.gtk_paned_set_shrink_end_child(@ptrCast(main_side), 0);
         c.gtk_widget_set_visible(pbox, 0);
-        c.gtk_box_append(@ptrCast(main_side), pbox);
+        self.info_paned = main_side.?;
+        _ = c.g_signal_connect_data(main_side, "notify::position", @ptrCast(&onInfoPanedPosition), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
         c.gtk_box_append(@ptrCast(vbox), content);
 
@@ -1449,11 +1499,8 @@ pub const BrowserView = struct {
         self.search_entry = @ptrCast(@alignCast(sentry));
         self.search_content = scontent;
         self.hidden_toggle = @ptrCast(@alignCast(hidden));
-        self.preview_box = pbox;
-        self.preview_pic = ppic;
-        self.preview_text = @ptrCast(@alignCast(ptext));
-        self.preview_meta = @ptrCast(@alignCast(pmeta));
         self.places_scroller = pl_scroll;
+        self.places_box = pl_box.?;
         self.places_list = @ptrCast(@alignCast(pl_list));
         self.places_toggle = @ptrCast(@alignCast(places_btn));
         self.content_paned = content.?;
@@ -1559,17 +1606,20 @@ pub const BrowserView = struct {
             // parent would keep laying it out at the OLD axis's
             // request (that is what clipped the cluster off the bar).
             c.gtk_orientable_set_orientation(@ptrCast(cluster), c.GTK_ORIENTATION_VERTICAL);
-            c.gtk_widget_set_visible(self.overflow_btn, 1);
         } else {
             c.gtk_menu_button_popdown(@ptrCast(self.overflow_btn));
             c.gtk_box_remove(@ptrCast(self.overflow_slot), cluster);
             // Prepend: the cluster is the LEFT half of the right end.
             c.gtk_box_prepend(@ptrCast(self.right_box), cluster);
             c.gtk_orientable_set_orientation(@ptrCast(cluster), c.GTK_ORIENTATION_HORIZONTAL);
-            c.gtk_widget_set_visible(self.overflow_btn, 0);
         }
         c.gtk_widget_queue_resize(cluster);
         self.bar_collapsed = on;
+    }
+
+    fn onClosePaneClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        self.closePaneDeferred();
     }
 
     fn onOverflowClosePane(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -1602,6 +1652,19 @@ pub const BrowserView = struct {
 
     /// A drag emits this per pixel; the write is debounced so a resize
     /// costs one places.json save, not hundreds.
+    fn onInfoPanedPosition(obj: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+        const self: *BrowserView = @ptrCast(@alignCast(user.?));
+        // Position is the LISTING side; the panel width is the rest.
+        if (self.widgets_dead or !self.preview_on or !self.chrome_ready) return;
+        const total = c.gtk_widget_get_width(@ptrCast(@alignCast(obj)));
+        if (total <= 0) return;
+        const px = total - c.gtk_paned_get_position(@ptrCast(@alignCast(obj)));
+        if (px < 220) return;
+        self.preview_px = @min(px, 700);
+        if (self.sidebar_save_src != 0) _ = c.g_source_remove(self.sidebar_save_src);
+        self.sidebar_save_src = c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self));
+    }
+
     fn onSidebarPosition(obj: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
         const self: *BrowserView = @ptrCast(@alignCast(user.?));
         // A hidden sidebar reports whatever GtkPaned last computed;
@@ -1630,6 +1693,10 @@ pub const BrowserView = struct {
         // are below the window in the dependency order.
         const want = self.sidebar_open orelse @import("../window.zig").Window.filesIdentity();
         if (want) c.gtk_toggle_button_set_active(self.places_toggle, 1);
+        if (self.side_info) {
+            c.gtk_widget_set_visible(self.side_card, 1);
+            @import("preview.zig").updateSideCard(self);
+        }
         self.chrome_ready = true;
         // One post-layout evaluation, for a pane that is born too
         // narrow: the adjustment signals only describe CHANGES.

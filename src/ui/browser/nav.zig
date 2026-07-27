@@ -86,7 +86,14 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     c.gtk_widget_add_css_class(header, "sketerm-fb-header");
     c.gtk_widget_set_margin_start(header, render_mod.EDGE_MARGIN);
     c.gtk_widget_set_margin_end(header, render_mod.EDGE_MARGIN);
-    c.gtk_box_append(@ptrCast(page), header);
+    // The header rides its own scrollbar-less scroller LOCKED to the
+    // listing's horizontal adjustment (set below, once the listing
+    // scroller exists): a column set wider than the pane scrolls
+    // header and rows as ONE surface instead of clipping.
+    const header_scroll = c.gtk_scrolled_window_new();
+    c.gtk_scrolled_window_set_policy(@ptrCast(header_scroll), c.GTK_POLICY_EXTERNAL, c.GTK_POLICY_NEVER);
+    c.gtk_scrolled_window_set_child(@ptrCast(header_scroll), header);
+    c.gtk_box_append(@ptrCast(page), header_scroll);
 
     const content = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
     c.gtk_widget_set_hexpand(content, 1);
@@ -128,14 +135,30 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     const scroller = c.gtk_scrolled_window_new();
     c.gtk_widget_set_hexpand(scroller, 1);
     c.gtk_widget_set_vexpand(scroller, 1);
-    // The sort header sits OUTSIDE this scroller, so a scrollbar that
-    // took width would push every row left of its own column title.
+    // The sort header sits outside this scroller (but shares its
+    // horizontal adjustment, above): a VERTICAL scrollbar that took
+    // width would push every row left of its own column title.
     // Overlay scrolling takes none.
     c.gtk_scrolled_window_set_overlay_scrolling(@ptrCast(scroller), 1);
     const listbox = c.gtk_list_box_new();
     c.gtk_list_box_set_selection_mode(@ptrCast(listbox), c.GTK_SELECTION_MULTIPLE);
     c.gtk_list_box_set_activate_on_single_click(@ptrCast(listbox), 0);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroller), listbox);
+    // The listbox rides inside an overlay so the rubber-band rectangle
+    // can be drawn OVER it; the drawing area scrolls with the content,
+    // so band coordinates equal listbox coordinates.
+    const list_overlay = c.gtk_overlay_new();
+    c.gtk_overlay_set_child(@ptrCast(list_overlay), listbox);
+    const band_area = c.gtk_drawing_area_new();
+    c.gtk_widget_set_can_target(band_area, 0);
+    c.gtk_widget_set_visible(band_area, 0);
+    c.gtk_overlay_add_overlay(@ptrCast(list_overlay), band_area);
+    c.gtk_scrolled_window_set_child(@ptrCast(scroller), list_overlay);
+    // ONE horizontal adjustment for header and rows: scrolling an
+    // over-wide column set moves both together, always aligned.
+    c.gtk_scrolled_window_set_hadjustment(
+        @ptrCast(header_scroll),
+        c.gtk_scrolled_window_get_hadjustment(@ptrCast(scroller)),
+    );
     c.gtk_box_append(@ptrCast(content), scroller);
     c.gtk_box_append(@ptrCast(page), content);
 
@@ -161,6 +184,7 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
         .listbox = @ptrCast(listbox),
         .tab_label = @ptrCast(@alignCast(label)),
         .header_box = header,
+        .header_scroll = header_scroll,
         .scroller = scroller,
         .miller_box = miller_box,
         .empty_box = empty_box,
@@ -205,6 +229,10 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     // Sticky-click toggling and the visual-mode keys, both capture
     // phase so GtkListBox does not get there first.
     self.installSelectionGestures(tab, listbox, false);
+    // Rubber-band drag-to-select from empty listing space.
+    tab.rubber_area = band_area;
+    c.gtk_drawing_area_set_draw_func(@ptrCast(band_area), @ptrCast(&selection.drawRubberBand), @ptrCast(tab), null);
+    selection.installRubberBand(tab, listbox);
     // Mouse side buttons navigate history anywhere in the listing;
     // middle click opens folders in tabs and closes this one.
     self.installNavGestures(tab, page);
@@ -632,9 +660,13 @@ pub const browser_chords = [_]Chord{
     .{ .keyval = c.GDK_KEY_Insert, .mods = 0, .what = "toggle mark, step down" },
     .{ .keyval = c.GDK_KEY_space, .mods = c.GDK_CONTROL_MASK, .what = "toggle mark, step down" },
     .{ .keyval = c.GDK_KEY_KP_Space, .mods = c.GDK_CONTROL_MASK, .what = "toggle mark, step down" },
+    // Tree navigation, consumed by selection.zig's capture handler.
+    .{ .keyval = c.GDK_KEY_Right, .mods = 0, .what = "expand focused directory (tree)" },
+    .{ .keyval = c.GDK_KEY_Left, .mods = 0, .what = "collapse focused directory / go to parent row (tree)" },
     .{ .keyval = c.GDK_KEY_Left, .mods = c.GDK_ALT_MASK, .what = "back", .run = &chordBack },
     .{ .keyval = c.GDK_KEY_Right, .mods = c.GDK_ALT_MASK, .what = "forward", .run = &chordForward },
     .{ .keyval = c.GDK_KEY_Up, .mods = c.GDK_ALT_MASK, .what = "up one directory", .run = &chordUp },
+    .{ .keyval = c.GDK_KEY_F2, .mods = 0, .what = "rename", .run = &chordRename },
     .{ .keyval = c.GDK_KEY_F5, .mods = 0, .what = "copy to the other pane", .run = &chordCopyPeer },
     .{ .keyval = c.GDK_KEY_F6, .mods = 0, .what = "move to the other pane", .run = &chordMovePeer },
     .{ .keyval = c.GDK_KEY_BackSpace, .mods = 0, .what = "type-ahead backspace", .run = &chordTypeaheadBackspace },
@@ -652,6 +684,26 @@ pub const browser_chords = [_]Chord{
 
 fn chordUndo(self: *BrowserView) bool {
     self.performUndo();
+    return true;
+}
+
+/// F2: inline-rename the focused row, else a single selected entry.
+fn chordRename(self: *BrowserView) bool {
+    const tab = self.currentTab() orelse return false;
+    var target: ?[]const u8 = null;
+    if (c.gtk_widget_get_focus_child(@ptrCast(@alignCast(tab.listbox)))) |child| {
+        if (c.g_object_get_data(@ptrCast(child), "sketerm-row")) |data| {
+            const rctx: *render_mod.RowCtx = @ptrCast(@alignCast(data));
+            target = rctx.path;
+        }
+    }
+    if (target == null and tab.selected.items.len == 1)
+        target = tab.selected.items[0];
+    const path = target orelse return false;
+    var buf: [4096]u8 = undefined;
+    if (path.len >= buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    self.startInlineRename(tab, buf[0..path.len]);
     return true;
 }
 

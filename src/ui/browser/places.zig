@@ -34,7 +34,7 @@ pub const PlaceCtx = struct {
 pub fn onPlacesToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
     const self: *BrowserView = @ptrCast(@alignCast(user.?));
     self.places_on = c.gtk_toggle_button_get_active(btn) != 0;
-    c.gtk_widget_set_visible(self.places_scroller, @intFromBool(self.places_on));
+    c.gtk_widget_set_visible(self.places_box, @intFromBool(self.places_on));
     if (self.places_on) {
         // The splitter forgets a position set while its start child
         // was hidden; re-assert the saved width as it comes back.
@@ -657,6 +657,9 @@ pub fn savePlaces(self: *BrowserView) void {
         .collapsed = cl,
         .sidebar_px = self.sidebar_px,
         .sidebar_open = self.sidebar_open,
+        .zebra = self.zebra,
+        .preview_px = self.preview_px,
+        .side_info = self.side_info,
     });
 }
 
