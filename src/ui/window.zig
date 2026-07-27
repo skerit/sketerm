@@ -1583,13 +1583,33 @@ pub const Window = struct {
             return;
         };
 
+        // Prefer the sibling `sketerm-files` binary: taskbars that
+        // match windows by process/cmdline see a distinct executable
+        // instead of `sketerm files`, which they merge with the
+        // terminal's entry. Fall back to the subcommand spelling when
+        // the sibling is absent (dev tree before install).
+        var files_buf: [4096:0]u8 = undefined;
+        const sibling: ?[*:0]const u8 = blk: {
+            const dir_end = std.mem.lastIndexOfScalar(u8, exe, '/') orelse break :blk null;
+            const p = std.fmt.bufPrintZ(&files_buf, "{s}/sketerm-files", .{exe[0..dir_end]}) catch break :blk null;
+            if (c.access(p.ptr, c.X_OK) != 0) break :blk null;
+            break :blk p.ptr;
+        };
+
         var spec_z_buf: [@import("browser.zig").SPEC_BUF_LEN + 1]u8 = undefined;
         var argv: [4][*c]u8 = @splat(null);
-        argv[0] = @constCast(@as([*c]const u8, exe.ptr));
-        argv[1] = @constCast(@as([*c]const u8, "files"));
+        var n: usize = 0;
+        if (sibling) |fb| {
+            argv[n] = @constCast(@as([*c]const u8, fb));
+            n += 1;
+        } else {
+            argv[n] = @constCast(@as([*c]const u8, exe.ptr));
+            argv[n + 1] = @constCast(@as([*c]const u8, "files"));
+            n += 2;
+        }
         if (spec) |s| {
             if (std.fmt.bufPrintZ(&spec_z_buf, "{s}", .{s})) |z| {
-                argv[2] = @constCast(@as([*c]const u8, z.ptr));
+                argv[n] = @constCast(@as([*c]const u8, z.ptr));
             } else |_| {}
         }
 

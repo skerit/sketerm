@@ -112,6 +112,14 @@ pub fn build(b: *std.Build) void {
         .use_lld = use_lld,
     });
     b.installArtifact(exe);
+    // Second install of the SAME artifact as `sketerm-files`: the
+    // dedicated file manager ships as its own executable (argv[0]
+    // dispatch in filebrowser/entry.zig) so desktop taskbars that
+    // match windows by process/cmdline can never merge the two apps.
+    // The PKGBUILD hardlinks instead of shipping this copy twice.
+    b.getInstallStep().dependOn(
+        &b.addInstallArtifact(exe, .{ .dest_sub_path = "sketerm-files" }).step,
+    );
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

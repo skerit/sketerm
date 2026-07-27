@@ -77,8 +77,12 @@ build() {
 package() {
     cd "$(_srcroot)"
 
-    # Main binary
+    # Main binary. The file manager is the SAME executable under its
+    # own name (argv[0] dispatch): a distinct binary + cmdline is what
+    # keeps Plasma's taskbar from merging the two apps. Hardlinked so
+    # the package does not ship the 5MB binary twice.
     install -Dm755 zig-out/bin/sketerm "$pkgdir/usr/bin/sketerm"
+    ln "$pkgdir/usr/bin/sketerm" "$pkgdir/usr/bin/sketerm-files"
 
     # Session daemon (durable panes; links libc only)
     install -Dm755 zig-out/bin/sketerm-mux "$pkgdir/usr/bin/sketerm-mux"

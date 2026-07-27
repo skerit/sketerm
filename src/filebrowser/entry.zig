@@ -43,8 +43,15 @@ pub fn parse(args: []const []const u8) ?Request {
         if (!found) {
             // argv[0] is the program name; a later bare `files` opens
             // the subcommand, so a directory named "files" can still be
-            // passed as the spec after it.
-            if (i > 0 and std.mem.eql(u8, a, "files")) found = true;
+            // passed as the spec after it. A binary NAMED sketerm-files
+            // is the subcommand itself: the distinct executable exists
+            // so taskbars that match windows by process cannot merge
+            // the file manager with the terminal.
+            if (i == 0 and invokedAsFiles(a)) {
+                found = true;
+            } else if (i > 0 and std.mem.eql(u8, a, "files")) {
+                found = true;
+            }
             continue;
         }
         if (std.mem.eql(u8, a, "--here")) {
@@ -61,6 +68,15 @@ pub fn parse(args: []const []const u8) ?Request {
     }
     if (!found) return null;
     return req;
+}
+
+/// True when argv[0] names the dedicated file-manager binary.
+fn invokedAsFiles(argv0: []const u8) bool {
+    const base = if (std.mem.lastIndexOfScalar(u8, argv0, '/')) |s|
+        argv0[s + 1 ..]
+    else
+        argv0;
+    return std.mem.eql(u8, base, "sketerm-files");
 }
 
 /// Host-qualified start location for a browser opened from a pane
@@ -189,6 +205,24 @@ test "files entry: mode flags and spec" {
 test "files entry: a directory named files is a spec, not a second subcommand" {
     const req = parse(&.{ "sketerm", "files", "files" }).?;
     try std.testing.expectEqualStrings("files", req.spec.?);
+}
+
+test "files entry: the sketerm-files binary name IS the subcommand" {
+    const bare = parse(&.{"/usr/bin/sketerm-files"}).?;
+    try std.testing.expectEqual(Mode.window, bare.mode);
+    try std.testing.expect(bare.spec == null);
+
+    const spec = parse(&.{ "sketerm-files", "/srv" }).?;
+    try std.testing.expectEqualStrings("/srv", spec.spec.?);
+
+    // A dir named "files" after the binary name is a spec, never a
+    // second subcommand token.
+    const dir = parse(&.{ "sketerm-files", "files" }).?;
+    try std.testing.expectEqualStrings("files", dir.spec.?);
+
+    // Only the exact basename counts.
+    try std.testing.expect(parse(&.{"/usr/bin/sketerm-files-extra"}) == null);
+    try std.testing.expect(parse(&.{"sketerm"}) == null);
 }
 
 test "files entry: help wins over the mode" {

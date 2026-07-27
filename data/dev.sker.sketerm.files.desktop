@@ -3,7 +3,8 @@ Type=Application
 Name=Sketerm Files
 GenericName=File Manager
 Comment=Local and remote files over the sketerm-mux daemon
-Exec=sketerm files %U
+TryExec=sketerm-files
+Exec=sketerm-files %U
 Icon=dev.sker.sketerm.files
 Categories=System;FileTools;FileManager;
 MimeType=inode/directory;x-scheme-handler/file;
@@ -15,4 +16,4 @@ Actions=new-window;
 
 [Desktop Action new-window]
 Name=New Window
-Exec=sketerm files
+Exec=sketerm-files
