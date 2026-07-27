@@ -428,7 +428,10 @@ pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
             if (c.gdk_pixbuf_loader_get_pixbuf(loader)) |full| {
                 const w: f64 = @floatFromInt(c.gdk_pixbuf_get_width(full));
                 const h: f64 = @floatFromInt(c.gdk_pixbuf_get_height(full));
-                const bound: f64 = if (req.kind == .preview) 480.0 else 128.0;
+                // Previews feed the Quick Look overlay too, which is
+                // near screen-sized -- 480px looked postage-stamp
+                // there. ~1MP ceiling keeps the 12-entry cache sane.
+                const bound: f64 = if (req.kind == .preview) 1024.0 else 128.0;
                 const scale = @max(w / bound, h / bound);
                 const nw: c_int = if (scale > 1) @intFromFloat(@max(1.0, w / scale)) else @intFromFloat(w);
                 const nh: c_int = if (scale > 1) @intFromFloat(@max(1.0, h / scale)) else @intFromFloat(h);
@@ -982,7 +985,19 @@ fn setPreviewMeta(self: *BrowserView, text: []const u8) void {
     @memcpy(z[0..n], text[0..n]);
     z[n] = 0;
     c.gtk_label_set_text(self.preview_meta, &z);
-    if (self.preview_state.ql) |ql| c.gtk_label_set_text(ql.title, &z);
+    if (self.preview_state.ql) |ql| {
+        // The overlay's header renders the name line and the details
+        // as two differently styled labels.
+        const name_end = std.mem.indexOfScalar(u8, z[0..n], '\n') orelse n;
+        var name_z: [512:0]u8 = undefined;
+        const name_n = @min(name_end, name_z.len - 1);
+        @memcpy(name_z[0..name_n], z[0..name_n]);
+        name_z[name_n] = 0;
+        c.gtk_label_set_text(ql.title, &name_z);
+        const rest: [*:0]const u8 = if (name_end < n) z[name_end + 1 ..].ptr else "";
+        c.gtk_label_set_text(ql.meta, rest);
+        c.gtk_widget_set_visible(@ptrCast(@alignCast(ql.meta)), @intFromBool(name_end < n));
+    }
 }
 
 /// The user's previewer rules, loaded once per view.
@@ -1531,6 +1546,8 @@ pub const QuickLook = struct {
     view: *BrowserView,
     window: *c.GtkWidget,
     title: *c.GtkLabel,
+    /// Everything below the name line of the metadata block.
+    meta: *c.GtkLabel,
     picture: *c.GtkWidget,
     text_scroll: *c.GtkWidget,
     text: *c.GtkLabel,
@@ -1571,6 +1588,28 @@ pub fn quickLookToggle(self: *BrowserView) bool {
     return self.quickLookOpen(path);
 }
 
+/// One-time CSS for the overlay: an image "stage" backdrop so photos
+/// float on a quiet dark surface instead of the window background.
+var ql_css_installed = false;
+
+fn installQuickLookCss(any_widget: *c.GtkWidget) void {
+    if (ql_css_installed) return;
+    ql_css_installed = true;
+    const css =
+        \\picture.sketerm-ql-stage {
+        \\  background-color: alpha(black, 0.25);
+        \\  border-radius: 12px;
+        \\}
+        \\scrolledwindow.sketerm-ql-text {
+        \\  border-radius: 8px;
+        \\}
+    ;
+    const provider = c.gtk_css_provider_new();
+    c.gtk_css_provider_load_from_string(provider, css);
+    const display = c.gtk_widget_get_display(any_widget);
+    c.gtk_style_context_add_provider_for_display(display, @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+}
+
 pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
     const ql = self.allocator.create(QuickLook) catch return false;
     const owned = self.allocator.dupe(u8, path) catch {
@@ -1578,24 +1617,51 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
         return false;
     };
 
+    installQuickLookCss(self.root_box);
     const window = c.gtk_window_new();
     c.gtk_window_set_title(@ptrCast(window), "Preview");
-    if (c.gtk_widget_get_root(self.root_box)) |root|
+    var w = c.gtk_widget_get_width(self.root_box);
+    var h = c.gtk_widget_get_height(self.root_box);
+    if (w <= 200) w = 900;
+    if (h <= 200) h = 700;
+    if (c.gtk_widget_get_root(self.root_box)) |root| {
         c.gtk_window_set_transient_for(@ptrCast(window), @ptrCast(@alignCast(root)));
-    const w = c.gtk_widget_get_width(self.root_box);
-    const h = c.gtk_widget_get_height(self.root_box);
-    c.gtk_window_set_default_size(@ptrCast(window), if (w > 200) w else 900, if (h > 200) h else 700);
+        // Never taller/wider than 90% of the monitor: the browser
+        // window is usually near-maximized, and a preview that fills
+        // the whole screen reads as a mode switch, not an overlay.
+        if (c.gtk_native_get_surface(@ptrCast(@alignCast(root)))) |surface| {
+            const display = c.gtk_widget_get_display(self.root_box);
+            if (c.gdk_display_get_monitor_at_surface(display, surface)) |monitor| {
+                var geo: c.GdkRectangle = undefined;
+                c.gdk_monitor_get_geometry(monitor, &geo);
+                w = @min(w, @divTrunc(geo.width * 9, 10));
+                h = @min(h, @divTrunc(geo.height * 9, 10));
+            }
+        }
+    }
+    c.gtk_window_set_default_size(@ptrCast(window), w, h);
 
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6);
-    c.gtk_widget_set_margin_start(box, 10);
-    c.gtk_widget_set_margin_end(box, 10);
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 8);
+    c.gtk_widget_set_margin_start(box, 14);
+    c.gtk_widget_set_margin_end(box, 14);
     c.gtk_widget_set_margin_top(box, 10);
-    c.gtk_widget_set_margin_bottom(box, 10);
+    c.gtk_widget_set_margin_bottom(box, 8);
 
+    // Header: the entry's name, then its details, dimmer and smaller.
     const title = c.gtk_label_new("");
     c.gtk_label_set_xalign(@ptrCast(title), 0);
     c.gtk_label_set_selectable(@ptrCast(title), 1);
+    c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_MIDDLE);
+    c.gtk_widget_add_css_class(title, "title-4");
     c.gtk_box_append(@ptrCast(box), title);
+
+    const meta = c.gtk_label_new("");
+    c.gtk_label_set_xalign(@ptrCast(meta), 0);
+    c.gtk_label_set_selectable(@ptrCast(meta), 1);
+    c.gtk_widget_add_css_class(meta, "dim-label");
+    c.gtk_widget_add_css_class(meta, "caption");
+    c.gtk_widget_set_visible(meta, 0);
+    c.gtk_box_append(@ptrCast(box), meta);
 
     const picture = c.gtk_picture_new();
     c.gtk_picture_set_can_shrink(@ptrCast(picture), 1);
@@ -1603,12 +1669,17 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
     c.gtk_widget_set_hexpand(picture, 1);
     c.gtk_widget_set_vexpand(picture, 1);
     c.gtk_widget_set_visible(picture, 0);
+    c.gtk_widget_set_margin_top(picture, 4);
+    c.gtk_widget_add_css_class(picture, "sketerm-ql-stage");
     c.gtk_box_append(@ptrCast(box), picture);
 
     const text_scroll = c.gtk_scrolled_window_new();
     c.gtk_scrolled_window_set_policy(@ptrCast(text_scroll), c.GTK_POLICY_AUTOMATIC, c.GTK_POLICY_AUTOMATIC);
     c.gtk_widget_set_hexpand(text_scroll, 1);
     c.gtk_widget_set_vexpand(text_scroll, 1);
+    c.gtk_widget_set_margin_top(text_scroll, 4);
+    c.gtk_widget_add_css_class(text_scroll, "card");
+    c.gtk_widget_add_css_class(text_scroll, "sketerm-ql-text");
     const text = c.gtk_label_new("");
     c.gtk_label_set_xalign(@ptrCast(text), 0);
     c.gtk_label_set_yalign(@ptrCast(text), 0);
@@ -1617,6 +1688,10 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
     c.gtk_label_set_wrap(@ptrCast(text), 0);
     c.gtk_label_set_selectable(@ptrCast(text), 1);
     c.gtk_widget_add_css_class(text, "monospace");
+    c.gtk_widget_set_margin_start(text, 12);
+    c.gtk_widget_set_margin_end(text, 12);
+    c.gtk_widget_set_margin_top(text, 10);
+    c.gtk_widget_set_margin_bottom(text, 10);
     c.gtk_scrolled_window_set_child(@ptrCast(text_scroll), text);
     c.gtk_box_append(@ptrCast(box), text_scroll);
 
@@ -1625,9 +1700,10 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
     c.gtk_widget_add_css_class(status, "dim-label");
     c.gtk_box_append(@ptrCast(box), status);
 
-    const hint = c.gtk_label_new("Space or Esc closes - arrows move - Enter opens");
-    c.gtk_label_set_xalign(@ptrCast(hint), 0);
+    const hint = c.gtk_label_new("Space or Esc closes  \u{00b7}  arrows move  \u{00b7}  Enter opens");
+    c.gtk_widget_set_halign(hint, c.GTK_ALIGN_CENTER);
     c.gtk_widget_add_css_class(hint, "dim-label");
+    c.gtk_widget_add_css_class(hint, "caption");
     c.gtk_box_append(@ptrCast(box), hint);
 
     c.gtk_window_set_child(@ptrCast(window), box);
@@ -1636,6 +1712,7 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
         .view = self,
         .window = window,
         .title = @ptrCast(@alignCast(title)),
+        .meta = @ptrCast(@alignCast(meta)),
         .picture = picture,
         .text_scroll = text_scroll,
         .text = @ptrCast(@alignCast(text)),
