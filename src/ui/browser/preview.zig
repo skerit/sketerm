@@ -533,7 +533,10 @@ pub fn applyThumbResult(self: *BrowserView, res: *ThumbResult) void {
             c.g_object_unref(@as(?*anyopaque, @ptrCast(tex)));
             return;
         };
-        self.scheduleThumbRender();
+        // Swap the texture into the live rows directly; a full
+        // rebuild only when no row was waiting for it (rare: the
+        // listing was rebuilt without the pending-thumb marker).
+        if (!self.applyThumbTexture(res.key, tex)) self.scheduleThumbRender();
     } else {
         if (self.thumb_failed.count() >= THUMB_CACHE_CAP) {
             var it = self.thumb_failed.iterator();

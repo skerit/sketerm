@@ -24,6 +24,7 @@ const FileColor = @import("types.zig").FileColor;
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const copyZ = @import("../../filebrowser/format.zig").copyZ;
 const copyZN = @import("../../filebrowser/format.zig").copyZN;
+const isPreviewMediaName = @import("../../filebrowser/paths.zig").isPreviewMediaName;
 const fmtModeZ = @import("../../filebrowser/format.zig").fmtModeZ;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const fmtTimeZ = @import("../../filebrowser/format.zig").fmtTimeZ;
@@ -960,10 +961,13 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
     const tile = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
     c.gtk_widget_set_size_request(tile, step.tile_px, -1);
     var icon: ?*c.GtkWidget = null;
+    var thumb_pending = false;
     if (self.thumbLookup(tab.hc, full, e)) |tex| {
         const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
         c.gtk_image_set_pixel_size(@ptrCast(img), step.tile_icon_px);
         icon = img;
+    } else {
+        thumb_pending = std.mem.eql(u8, e.kind, "file") and isPreviewMediaName(e.name);
     }
     if (icon == null) icon = entryIconImage(e, step.tile_icon_px);
     c.gtk_box_append(@ptrCast(tile), icon);
@@ -990,6 +994,10 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
         .is_dir = e.tdir,
     };
     c.g_object_set_data_full(@ptrCast(child), "sketerm-row", @ptrCast(ctx), @ptrCast(&freeRowCtx));
+    if (thumb_pending) if (icon) |ic| {
+        c.g_object_set_data(@ptrCast(child), "sketerm-thumb-img", @ptrCast(ic));
+        c.g_object_set_data(@ptrCast(child), "sketerm-thumb-px", @ptrFromInt(@as(usize, @intCast(step.tile_icon_px))));
+    };
     addEntryDragSource(tab, child, full);
     c.gtk_flow_box_append(fb, child);
 }
@@ -1263,6 +1271,58 @@ pub fn onGroupHeaderClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) voi
     views.toggleGroup(ctx.tab.view, ctx.tab, ctx.id);
 }
 
+/// Swap a landed thumbnail into every live row/tile showing the
+/// entry, IN PLACE. This is what makes a trickle of async thumbnails
+/// cheap: before it, every arrival scheduled a full listing rebuild
+/// (70ms+ for a few hundred rows, 8x/s while a remote folder's
+/// thumbnails stream in).
+/// @param key the thumb-cache key, "identity\x00mtime" with identity
+/// "host:path" (remote) or the bare path (local).
+/// @return true when at least one widget was updated.
+pub fn applyThumbTexture(self: *BrowserView, key: []const u8, tex: *c.GdkTexture) bool {
+    const key_end = std.mem.indexOfScalar(u8, key, 0) orelse key.len;
+    const identity = key[0..key_end];
+    var updated = false;
+    for (self.tabs.items) |tab| {
+        // Match the row path against the identity WITHOUT allocating:
+        // strip the host prefix when the tab is remote.
+        var want: []const u8 = identity;
+        if (tab.hc.host) |host| {
+            if (identity.len <= host.len + 1) continue;
+            if (!std.mem.startsWith(u8, identity, host)) continue;
+            if (identity[host.len] != ':') continue;
+            want = identity[host.len + 1 ..];
+        } else if (std.mem.indexOf(u8, identity, ":/") != null) continue;
+        var i: c_int = 0;
+        while (c.gtk_list_box_get_row_at_index(tab.listbox, i)) |row| : (i += 1) {
+            if (swapThumbWidget(@ptrCast(row), want, tex)) updated = true;
+        }
+        if (tab.flowbox) |fb| {
+            var j: c_int = 0;
+            while (c.gtk_flow_box_get_child_at_index(fb, j)) |child| : (j += 1) {
+                if (swapThumbWidget(@ptrCast(child), want, tex)) updated = true;
+            }
+        }
+    }
+    return updated;
+}
+
+/// One row/tile: if it shows `path` and still waits for a thumbnail,
+/// point its icon at the texture.
+fn swapThumbWidget(row: *c.GObject, path: []const u8, tex: *c.GdkTexture) bool {
+    const data = c.g_object_get_data(row, "sketerm-row") orelse return false;
+    const ctx: *RowCtx = @ptrCast(@alignCast(data));
+    if (!std.mem.eql(u8, ctx.path, path)) return false;
+    const img_data = c.g_object_get_data(row, "sketerm-thumb-img") orelse return false;
+    const img: *c.GtkImage = @ptrCast(@alignCast(img_data));
+    c.gtk_image_set_from_paintable(img, @ptrCast(tex));
+    const px_data = c.g_object_get_data(row, "sketerm-thumb-px");
+    const px: c_int = @intCast(@min(@intFromPtr(px_data), 512));
+    if (px > 0) c.gtk_image_set_pixel_size(img, px);
+    c.g_object_set_data(row, "sketerm-thumb-img", null);
+    return true;
+}
+
 pub const RowCtx = struct {
     allocator: std.mem.Allocator,
     tab: *BTab,
@@ -1319,10 +1379,13 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
     // show the generic icon until the texture lands); works for
     // local AND remote entries.
     var icon: ?*c.GtkWidget = null;
+    var thumb_pending = false;
     if (self.thumbLookup(tab.hc, full, e)) |tex| {
         const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
         c.gtk_image_set_pixel_size(@ptrCast(img), step.thumb_px);
         icon = img;
+    } else {
+        thumb_pending = std.mem.eql(u8, e.kind, "file") and isPreviewMediaName(e.name);
     }
     if (icon == null) icon = entryIconImage(e, step.icon_px);
     c.gtk_box_append(@ptrCast(row_box), icon);
@@ -1420,6 +1483,14 @@ pub fn appendRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: Entry, depth: u32
         .is_dir = e.tdir,
     };
     c.g_object_set_data_full(@ptrCast(row), "sketerm-row", @ptrCast(ctx), @ptrCast(&freeRowCtx));
+
+    // The icon a landed thumbnail may replace IN PLACE (see
+    // applyThumbTexture) -- a trickle of async thumbnails must not
+    // cost one full listing rebuild each.
+    if (thumb_pending) if (icon) |ic| {
+        c.g_object_set_data(@ptrCast(row), "sketerm-thumb-img", @ptrCast(ic));
+        c.g_object_set_data(@ptrCast(row), "sketerm-thumb-px", @ptrFromInt(@as(usize, @intCast(step.thumb_px))));
+    };
 
     addEntryDragSource(tab, row, full);
 

@@ -603,6 +603,7 @@ pub const BrowserView = struct {
     pub const onThumbIdle = @import("preview.zig").onThumbIdle;
     pub const applyThumbResult = @import("preview.zig").applyThumbResult;
     pub const scheduleThumbRender = @import("preview.zig").scheduleThumbRender;
+    pub const applyThumbTexture = @import("render.zig").applyThumbTexture;
     pub const onThumbRenderTick = @import("preview.zig").onThumbRenderTick;
     pub const thumbLookup = @import("preview.zig").thumbLookup;
     pub const enqueueRemoteThumb = @import("preview.zig").enqueueRemoteThumb;
