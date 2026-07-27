@@ -982,17 +982,17 @@ const TOOLS_JSON_RAW =
     \\{"name":"app_macros","description":"List saved macros; show one's steps (show); delete one (delete); or view an app's recorded input journal (journal:true + app) to pick last_steps for app_macro_save.","inputSchema":{"type":"object","properties":{"delete":{"type":"string"},"show":{"type":"string"},"journal":{"type":"boolean"},"app":{"type":"integer"}}}},
     \\{"name":"close_app_window","description":"Ask the app to close one window (like the titlebar button; the app decides).","inputSchema":{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"}},"required":["window"]}},
     \\{"name":"close_app","description":"Kill a headless app session outright. Destructive.","inputSchema":{"type":"object","properties":{"app":{"type":"integer"}}}},
-    \\{"name":"term_open","description":"Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read. Pass 'host' for a PERSISTENT SSH session (keepalives preconfigured, survives long provisioning waits): run remote commands in it with term_exec for structured output + exit status. Every headless terminal is AUTO-RECORDED as an asciicast v2 .cast file (the reply names the path; replay later with asciinema play).","inputSchema":{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional; with 'host' a string is the remote command)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH destination (user@box): opens ssh -tt with ServerAlive keepalives. Auth prompts appear on the screen — answer with term_send_text."},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
-    \\{"name":"term_list","description":"List open headless terminals: exit state + real exit_status, pending command/exec trackers, the last rendered screen line (drained first, so a finished process never shows a stale progress frame), and each terminal's asciicast recording path.","inputSchema":{"type":"object","properties":{}}},
-    \\{"name":"term_run","description":"Run a command line in a headless terminal. wait_for=idle (default, backward compatible) returns after OUTPUT quiescence and does not imply child exit. wait_for=command waits for an OSC 133 command boundary (or tracked shell exit), returns structured running/completed state, exact exit_status, timed_out, and completion_source, and refuses to send (command_sent=false) when shell integration is unavailable or a foreground command started outside command mode is still running. If it times out, use term_wait_command to continue waiting without resending. output_only selects the completed command zone instead of the rendered screen.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"wait_for":{"type":"string","enum":["idle","command"],"description":"idle (default) waits for output quiescence; command waits for actual shell-command completion"},"quiet_ms":{"type":"integer","description":"Idle mode only: no-output window (default 400)"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the command's output instead of the whole screen"}},"required":["command"]}},
+    \\{"name":"term_open","description":"Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read. The reply names the SESSION'S SHELL and whether shell integration is active (for ssh, detected on the remote side and announced by a visible '[sketerm] remote shell: ...' line; if auth is still pending the reply says so and term_list carries the fields once connected). Pass 'host' for a PERSISTENT SSH session (keepalives preconfigured, survives long provisioning waits). The transport is picked automatically: when the remote host has sketerm-mux in PATH (key auth), the session lives on ITS daemon — it survives connection drops and is reattached transparently; otherwise plain interactive ssh is used. Either way, remote shell sessions get OSC 133 shell integration auto-bootstrapped into a remote bash/zsh, so term_run wait_for=command works on stock hosts too; other remote shells fall back to a plain login shell with term_exec as the structured path. Every headless terminal is AUTO-RECORDED as an asciicast v2 .cast file (the reply names the path; replay later with asciinema play).","inputSchema":{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional; with 'host' a string is the remote command)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH destination (user@box): opens ssh -tt with ServerAlive keepalives. Auth prompts appear on the screen — answer with term_send_text."},"integration":{"type":"boolean","description":"Default true: with 'host', bootstrap OSC 133 shell integration into the remote bash/zsh. false = plain remote login shell, nothing injected."},"transport":{"type":"string","enum":["auto","mux","ssh"],"description":"Default auto (use the remote sketerm-mux daemon when reachable, else plain ssh). mux = require the daemon (error instead of falling back); ssh = never probe for it. Normally leave unset."},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
+    \\{"name":"term_list","description":"List open headless terminals: shell name + whether shell integration is active, exit state + real exit_status, pending command/exec trackers, the last rendered screen line (drained first, so a finished process never shows a stale progress frame), and each terminal's asciicast recording path.","inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"term_run","description":"Type a command line INTO the terminal's live session shell, exactly like a human: the SESSION SHELL parses it (its own dialect — bash/zsh/fish/whatever is running there) and state changes PERSIST across calls (cd, export, aliases, venv activation). Prefer wait_for=command for ordinary commands — readable on screen and in shell history, stateful, with exact exit status via shell integration; term_exec is the isolated dialect-proof alternative (no state persists there). wait_for=idle (default, backward compatible) returns after OUTPUT quiescence and does not imply child exit; when shell integration shows a foreground command already running, the idle-mode reply says the text went to that program's stdin (or was queued) instead of letting a quiet screen read as executed. wait_for=command waits for an OSC 133 command boundary (or tracked shell exit), returns structured running/completed state, exact exit_status, timed_out, and completion_source, and refuses to send (command_sent=false) when shell integration is unavailable or a foreground command started outside command mode is still running. If it times out, use term_wait_command to continue waiting without resending. output_only selects the completed command zone instead of the rendered screen.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"wait_for":{"type":"string","enum":["idle","command"],"description":"idle (default) waits for output quiescence; command waits for actual shell-command completion"},"quiet_ms":{"type":"integer","description":"Idle mode only: no-output window (default 400)"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the command's output instead of the whole screen"}},"required":["command"]}},
     \\{"name":"term_send_text","description":"Write text to a headless terminal's PTY. 'enter' appends a carriage return.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean"}},"required":["text"]}},
     \\{"name":"term_send_keys","description":"Press named key chords in a headless terminal: 'ctrl+c', 'enter', 'up', 'tab', space-separated.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}},
     \\{"name":"term_read","description":"Read a headless terminal's rendered screen text. 'scrollback' true dumps the scrollback too.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"scrollback":{"type":"boolean"}}}},
-    \\{"name":"term_wait_idle","description":"Wait until a headless terminal's output stops changing (or timeout). Output idle does NOT imply that the foreground command exited.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
+    \\{"name":"term_wait_idle","description":"Wait until a headless terminal's output stops changing (or timeout). Output idle does NOT imply that the foreground command exited; when shell integration is active the reply distinguishes 'idle at shell prompt' from 'idle, but a foreground command is still RUNNING'.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}},
     \\{"name":"term_wait_command","description":"Continue waiting for a term_run wait_for=command request that timed out. Returns structured running/completed state, exact exit_status, timed_out, and completion_source without resending the command.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the completed command's output instead of the whole screen"}}}},
     \\{"name":"term_resize","description":"Resize a headless terminal's grid.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"cols":{"type":"integer"},"rows":{"type":"integer"}}}},
     \\{"name":"term_close","description":"Close a headless terminal (kills its shell). Destructive.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"}}}},
-    \\{"name":"term_exec","description":"Run one command inside a LIVE interactive shell (including a persistent SSH session from term_open host) and get STRUCTURED results: exact exit_status and the exact output between sentinel markers, independent of shell integration. By default the command runs ISOLATED in a fresh `sh` (works typed into any shell dialect — fish/zsh/bash, local or remote — and cd/export/set -e cannot leak into or kill the session; the feedback scenario 'set -e + failing probe closed my SSH connection' cannot happen). Pass subshell=false to run IN the session shell so state persists (cd/export) — that mode needs a POSIX-ish shell (bash/zsh/dash, not fish). A command that does not complete comes back with pending:true, its tracker id, the LIVE RENDERED SCREEN, alt_screen, output_idle_ms and interactive_prompt — and when the output goes quiet behind something that looks like a question (apt's [Y/n], a password ask, a needrestart dialog) the call returns EARLY with interactive_prompt:true instead of burning the timeout: answer via term_send_text/term_send_keys, then term_exec_wait picks up the completion. The tracker survives client-side timeouts and aborted tool calls — term_exec_wait always reattaches; never resend. Not for fully interactive programs (editors, REPLs) — use term_send_text/term_send_keys for those.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"subshell":{"type":"boolean","description":"Default true (isolated, dialect-independent). false = run in the session shell itself: state persists, POSIX shells only"},"noninteractive":{"type":"boolean","description":"Export DEBIAN_FRONTEND=noninteractive + debconf/needrestart/apt-listchanges equivalents for THIS command only (package-manager runs that must not prompt). Needs the default isolated transport."},"output_file":{"type":"string","description":"Write the FULL untruncated output to this absolute LOCAL path; the inline reply keeps a short tail (large diagnostic dumps)"},"timeout_ms":{"type":"integer","description":"Default 30000, clamped to 120000 — for longer commands keep calling term_exec_wait"},"shell":{"type":"string","description":"Interpreter for the command file (e.g. bash for pipefail/array semantics; default sh). Needs the default isolated transport. The command travels inside a temp script, never on a process command line (ps/pgrep stay clean)"}},"required":["command"]}},
+    \\{"name":"term_exec","description":"Run one command inside a LIVE interactive shell (including a persistent SSH session from term_open host) and get STRUCTURED results: exact exit_status and the exact output between sentinel markers, independent of shell integration. By default the command runs ISOLATED in a fresh `sh` (works typed into any shell dialect — fish/zsh/bash, local or remote — and cd/export/set -e cannot leak into or kill the session; the feedback scenario 'set -e + failing probe closed my SSH connection' cannot happen). Pass subshell=false to run IN the session shell so state persists (cd/export) — that mode needs a POSIX-ish shell (bash/zsh/dash, not fish). A command that does not complete comes back with pending:true, its tracker id, the LIVE RENDERED SCREEN, alt_screen, output_idle_ms and interactive_prompt — and when the output goes quiet behind something that looks like a question (apt's [Y/n], a password ask, a needrestart dialog) the call returns EARLY with interactive_prompt:true instead of burning the timeout: answer via term_send_text/term_send_keys, then term_exec_wait picks up the completion. The tracker survives client-side timeouts and aborted tool calls — term_exec_wait always reattaches; never resend. Not for fully interactive programs (editors, REPLs) — use term_send_text/term_send_keys for those. For ordinary commands on a shell-integrated terminal prefer term_run wait_for=command: it runs IN the session shell (cd/export persist, no cd-prefix dance) and shows the literal command on screen instead of this tool's base64 transport line — term_exec is the tool for when you NEED isolation, a guaranteed dialect, noninteractive env, or output_file.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"subshell":{"type":"boolean","description":"Default true (isolated, dialect-independent). false = run in the session shell itself: state persists, POSIX shells only"},"noninteractive":{"type":"boolean","description":"Export DEBIAN_FRONTEND=noninteractive + debconf/needrestart/apt-listchanges equivalents for THIS command only (package-manager runs that must not prompt). Needs the default isolated transport."},"output_file":{"type":"string","description":"Write the FULL untruncated output to this absolute LOCAL path; the inline reply keeps a short tail (large diagnostic dumps)"},"timeout_ms":{"type":"integer","description":"Default 30000, clamped to 120000 — for longer commands keep calling term_exec_wait"},"shell":{"type":"string","description":"Interpreter for the command file (e.g. bash for pipefail/array semantics; default sh). Needs the default isolated transport. The command travels inside a temp script, never on a process command line (ps/pgrep stay clean)"}},"required":["command"]}},
     \\{"name":"term_exec_wait","description":"Continue waiting for a pending term_exec without resending — always attachable, including after a client-side tool timeout or abort. Same structured reply as term_exec (pending replies carry the live screen, interactive_prompt and the tracker id; returns early when the command is visibly waiting for input).","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000, clamped to 120000"},"output_file":{"type":"string","description":"Write the full output to this absolute local path on completion"}}}},
     \\{"name":"term_wait_exit","description":"Wait until a headless terminal's child PROCESS exits (distinct from output idleness — a silent scp can be running while output is idle, and an exited one can leave a stale progress frame). Returns the real exit status and the final screen tail.","inputSchema":{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"}}}},
     \\{"name":"upload_file","description":"Copy a LOCAL file to a host with integrity + atomicity built in: scp to a staged temp file, remote SHA-256 verify against the local hash, then an atomic mv into place (a corrupt transfer is discarded, never half-written). The staged name PRESERVES the extension (x.service → x.sketerm-part.service) so suffix-sensitive validators accept it, and 'verify_command' runs a remote check against the staged file BEFORE the move ({} = the staged path, appended if absent; nonzero exit = upload discarded, destination untouched — e.g. \"systemd-analyze verify {}\"). Omit 'host' for a checksummed atomic local copy. Requires key/agent SSH auth (BatchMode).","inputSchema":{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box); omit = local copy"},"local_path":{"type":"string"},"remote_path":{"type":"string","description":"Destination path (on the host, or locally when host is omitted)"},"verify_command":{"type":"string","description":"Remote validation run against the staged file before the atomic move; {} substitutes the staged path"},"timeout_ms":{"type":"integer","description":"scp budget, default 120000"}},"required":["local_path","remote_path"]}},
@@ -4362,6 +4362,21 @@ fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Value,
 
 // ── headless terminal tools (shell sessions on the private daemon) ─
 
+/// Spawn + register a terminal on a REMOTE host's own sketerm-mux
+/// daemon. No local asciicast: rec_start writes on the daemon's host,
+/// which would litter the remote box.
+fn spawnRegisteredRemoteTerm(host: []const u8, argv: []const []const u8, cols: u16, rows: u16) !u32 {
+    const t = termdrive.Term.spawnRemoteMux(term_state.allocator, host, argv, cols, rows) catch
+        return error.SpawnFailed;
+    const id = term_state.next_id;
+    term_state.next_id += 1;
+    term_state.terms.put(term_state.allocator, id, t) catch {
+        t.deinit();
+        return error.OutOfMemory;
+    };
+    return id;
+}
+
 /// Spawn + register a headless terminal; returns its id.
 fn spawnRegisteredTerm(argv: ?[]const []const u8, cols: u16, rows: u16) !u32 {
     const t = termdrive.Term.spawn(term_state.allocator, argv, cols, rows, term_state.mux_sock) catch
@@ -4493,55 +4508,160 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
     if (eql(u8, name, "term_open")) {
         const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 120, 10, 500));
         const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 40, 4, 300));
-        var argv_store: std.ArrayList([]const u8) = .empty;
-        defer argv_store.deinit(arena);
         const host = argStr(args, "host");
-        if (host) |h| {
-            // Persistent SSH session with keepalives: survives long
-            // provisioning waits; interactive (auth prompts reach the
-            // screen — drive them with term_send_text).
-            try argv_store.appendSlice(arena, &.{
-                "ssh", "-tt",
-                "-o",  "ServerAliveInterval=15",
-                "-o",  "ServerAliveCountMax=4",
-            });
-            try argv_store.append(arena, h);
-        }
+        var cmd_string: ?[]const u8 = null;
+        var cmd_array: ?[]const []const u8 = null;
         if (args == .object) {
             if (args.object.get("command")) |cmd| switch (cmd) {
-                .string => {
-                    if (host != null) {
-                        try argv_store.append(arena, cmd.string);
-                    } else {
-                        try argv_store.appendSlice(arena, &.{ "/bin/sh", "-c", cmd.string });
-                    }
-                },
+                .string => cmd_string = cmd.string,
                 .array => {
-                    for (cmd.array.items) |item| {
+                    const items = try arena.alloc([]const u8, cmd.array.items.len);
+                    for (cmd.array.items, 0..) |item, i| {
                         if (item != .string) return appErr(arena, "command array must be strings");
-                        try argv_store.append(arena, item.string);
+                        items[i] = item.string;
                     }
+                    if (items.len > 0) cmd_array = items;
                 },
                 else => {},
             };
         }
-        const argv: ?[]const []const u8 = if (argv_store.items.len > 0) argv_store.items else null;
-        const id = spawnRegisteredTerm(argv, cols, rows) catch |err| switch (err) {
-            error.SpawnFailed => return appErr(arena, "spawn failed (mux daemon unreachable?)"),
-            else => return err,
-        };
+        const has_cmd = cmd_string != null or cmd_array != null;
+        // Remote SHELL sessions get OSC 133 integration bootstrapped
+        // into the remote bash/zsh so term_run wait_for=command works
+        // on stock remotes. An explicit remote command,
+        // integration:false, or a missing script dir keeps the plain
+        // behavior.
+        const want_integration = if (args == .object) blk: {
+            const v = args.object.get("integration") orelse break :blk true;
+            break :blk !(v == .bool and !v.bool);
+        } else true;
+        const transport = argStr(args, "transport") orelse "auto";
+        if (!eql(u8, transport, "auto") and !eql(u8, transport, "mux") and !eql(u8, transport, "ssh"))
+            return appErr(arena, "transport must be 'auto', 'mux' or 'ssh'");
+
+        var remote_integration = false;
+        var via_mux = false;
+        var id: u32 = 0;
+        // Transparent transport upgrade: when the remote host has
+        // sketerm-mux in PATH (key auth), the session lives on ITS
+        // daemon — it survives connection drops (termdrive reattaches)
+        // and the bootstrap rides the spawn argv instead of a typed
+        // ssh forced command. Absent binary / password auth / any
+        // failure falls back to plain interactive ssh below; the
+        // assistant never chooses.
+        if (host != null and !eql(u8, transport, "ssh")) mux: {
+            var margv: []const []const u8 = undefined;
+            if (cmd_array) |a| {
+                margv = a;
+            } else if (cmd_string) |s| {
+                const trio = try arena.alloc([]const u8, 3);
+                trio[0] = "/bin/sh";
+                trio[1] = "-c";
+                trio[2] = s;
+                margv = trio;
+            } else if (want_integration) {
+                if (termdrive.integrationBootstrapScript(arena)) |script| {
+                    const trio = try arena.alloc([]const u8, 3);
+                    trio[0] = "/bin/sh";
+                    trio[1] = "-c";
+                    trio[2] = script;
+                    margv = trio;
+                    remote_integration = true;
+                } else {
+                    margv = &@import("../mux/shell.zig").remote_login_argv;
+                }
+            } else {
+                margv = &@import("../mux/shell.zig").remote_login_argv;
+            }
+            id = spawnRegisteredRemoteTerm(host.?, margv, cols, rows) catch {
+                remote_integration = false;
+                if (eql(u8, transport, "mux"))
+                    return appErr(arena, "no reachable sketerm-mux daemon on the remote host (needs key/agent auth and sketerm-mux in the remote PATH; transport 'auto' would fall back to plain ssh)");
+                break :mux;
+            };
+            via_mux = true;
+        }
+        if (!via_mux) {
+            var argv_store: std.ArrayList([]const u8) = .empty;
+            defer argv_store.deinit(arena);
+            if (host) |h| {
+                // Persistent SSH session with keepalives: survives long
+                // provisioning waits; interactive (auth prompts reach
+                // the screen — drive them with term_send_text).
+                try argv_store.appendSlice(arena, &.{
+                    "ssh", "-tt",
+                    "-o",  "ServerAliveInterval=15",
+                    "-o",  "ServerAliveCountMax=4",
+                });
+                try argv_store.append(arena, h);
+            }
+            if (cmd_string) |s| {
+                if (host != null) {
+                    try argv_store.append(arena, s);
+                } else {
+                    try argv_store.appendSlice(arena, &.{ "/bin/sh", "-c", s });
+                }
+            } else if (cmd_array) |a| {
+                try argv_store.appendSlice(arena, a);
+            }
+            if (host != null and !has_cmd and want_integration) {
+                if (termdrive.sshIntegrationCommand(arena)) |boot| {
+                    try argv_store.append(arena, boot);
+                    remote_integration = true;
+                }
+            }
+            const argv: ?[]const []const u8 = if (argv_store.items.len > 0) argv_store.items else null;
+            id = spawnRegisteredTerm(argv, cols, rows) catch |err| switch (err) {
+                error.SpawnFailed => return appErr(arena, "spawn failed (mux daemon unreachable?)"),
+                else => return err,
+            };
+        }
         const t = term_state.terms.get(id).?;
+        // The injection claim: command-mode still waits for the first
+        // real prompt mark before trusting it, so an unsupported
+        // remote shell degrades to an honest not-ready refusal.
+        if (remote_integration) t.integration = true;
+        if (host != null) t.setRemoteShellPending(remote_integration);
         // Let the shell print its first prompt.
         _ = t.waitIdle(250, 3_000);
-        const where = if (host) |h|
-            try std.fmt.allocPrint(arena, " running ssh to {s} (watch term_read for auth prompts; term_exec gives structured remote command results)", .{h})
-        else
-            "";
+        // SSH: wait (bounded) for the bootstrap's announce line so
+        // THIS reply names the remote shell — bailing early when the
+        // screen sits behind an auth prompt, because the assistant
+        // needs the reply back to answer it.
+        if (host != null and remote_integration and !t.scanShellAnnounce()) {
+            const announce_deadline = monoMs() + 8_000;
+            while (!t.scanShellAnnounce() and monoMs() < announce_deadline and !t.exited) {
+                if (termdrive.looksInteractive(termLastLine(arena, t))) break;
+                _ = t.waitIdle(150, 400);
+            }
+        }
+        const shell_note: []const u8 = blk: {
+            if (t.shell_name) |sn|
+                break :blk try std.fmt.allocPrint(arena, ", shell: {s}, integration: {s}", .{ sn, if (t.integration) "active" else "inactive" });
+            if (host != null and remote_integration)
+                break :blk ", shell: not detected yet (ssh still connecting or auth pending; term_list reports it once the session is up)";
+            if (host != null)
+                break :blk ", shell: unknown (integration disabled; nothing injected to report it)";
+            break :blk "";
+        };
+        const where = if (host) |h| blk: {
+            // Key on the detected OUTCOME: a bootstrap that landed on
+            // dash/fish announces "no integration" and flips
+            // t.integration off — steering to wait_for=command there
+            // would point at a tool that refuses.
+            const drive_note = if (remote_integration and t.integration)
+                "shell integration is auto-injected into a remote bash/zsh — prefer term_run wait_for=command for remote commands (stateful, readable, exact exit status); term_exec when you need isolation or a guaranteed dialect"
+            else
+                "term_exec gives structured remote command results";
+            if (via_mux)
+                break :blk try std.fmt.allocPrint(arena, " durable remote session on {s} via its sketerm-mux daemon (survives connection drops — reattached transparently; {s})", .{ h, drive_note });
+            break :blk try std.fmt.allocPrint(arena, " running ssh to {s} (watch term_read for auth prompts; {s})", .{ h, drive_note });
+        } else "";
         const rec_note = if (rec_state.casts.get(id)) |p|
             try std.fmt.allocPrint(arena, "\nrecording: {s} (asciicast v2, replayable with asciinema)", .{p})
         else
             "";
-        const msg = try std.fmt.allocPrint(arena, "opened headless terminal {d} ({d}x{d}){s}{s}", .{ id, cols, rows, where, rec_note });
+        const msg = try std.fmt.allocPrint(arena, "opened headless terminal {d} ({d}x{d}{s}){s}{s}", .{ id, cols, rows, shell_note, where, rec_note });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "term_list")) {
@@ -4555,7 +4675,17 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
             first = false;
             const t = e.value_ptr.*;
             t.drain();
+            _ = t.scanShellAnnounce();
             try w.print("{{\"term\":{d},\"exited\":{}", .{ e.key_ptr.*, t.exited });
+            if (t.shell_name) |sn| {
+                try w.writeAll(",\"shell\":");
+                try std.json.Stringify.value(sn, .{}, w);
+                try w.print(",\"integration\":{}", .{t.integration});
+            }
+            if (t.remote_host) |rh| {
+                try w.writeAll(",\"transport\":\"sketerm-mux\",\"host\":");
+                try std.json.Stringify.value(rh, .{}, w);
+            }
             if (t.exited and t.exit_status_known) try w.print(",\"exit_status\":{d}", .{t.exit_status});
             if (t.hasPendingCommand()) try w.writeAll(",\"pending_command\":true");
             if (t.hasPendingExec()) try w.writeAll(",\"pending_exec\":true");
@@ -4698,7 +4828,7 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
             const token_res = t.commandToken(@min(timeout_ms, 10_000)) catch return appErr(arena, "command completion unavailable (terminal exited?)");
             const token = switch (token_res) {
                 .unsupported => return commandCompletionResult(arena, .{ .state = .unsupported }, false, null, null, "shell integration is unavailable for this shell; command was not sent and no exit status was fabricated"),
-                .not_ready => return commandCompletionResult(arena, .{ .state = .unsupported, .timed_out = true }, false, null, null, "shell integration is injected but no prompt mark has arrived yet (shell still starting, or its rc files broke the injection); command was not sent — retry shortly"),
+                .not_ready => return commandCompletionResult(arena, .{ .state = .unsupported, .timed_out = true }, false, null, null, "shell integration is injected but no prompt mark has arrived yet (shell still starting, ssh auth still pending, an unsupported remote shell, or rc files broke the injection); command was not sent — retry shortly, or use term_exec"),
                 .busy => return commandCompletionResult(arena, .{ .state = .running }, false, null, null, "a foreground command started outside command mode is still running; its completion would be misattributed. Wait for it (term_wait_idle) before sending in command mode"),
                 .token => |tok| tok,
             };
@@ -4732,10 +4862,18 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         if (t.hasPendingCommand()) _ = t.waitPendingCommand(0);
         if (t.hasPendingCommand())
             return appErr(arena, "a command-mode command is still being tracked; resolve it with term_wait_command before running another command, or its exit status would be misattributed");
+        // Honesty over silent queueing: when integration shows an
+        // open command zone, the typed line goes to the RUNNING
+        // program's stdin (or sits queued by the shell), not to a new
+        // shell command — say so instead of letting a quiet screen
+        // read as "executed".
+        const busy_before = t.integration and t.foregroundRunning();
         const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
         t.sendText(line) catch return appErr(arena, "send failed (terminal exited?)");
         const settled = t.waitIdle(quiet_ms, timeout_ms);
-        const note = if (settled) "" else "\n[note: output still flowing at timeout]";
+        var note: []const u8 = if (settled) "" else "\n[note: output still flowing at timeout]";
+        if (busy_before)
+            note = try std.fmt.allocPrint(arena, "{s}\n[note: a foreground command was already running when this text was sent — it went to that program's stdin, or the shell queued it as pending input; it did NOT start as a new shell command. Wait with term_wait_idle, or interrupt with term_send_keys ctrl+c]", .{note});
         const want_output_only = argBool(args, "output_only");
         if (want_output_only) {
             // OSC 133 zone: output + exit code only. Screen-scrape
@@ -4781,7 +4919,17 @@ fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 500;
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
         const settled = t.waitIdle(quiet_ms, timeout_ms);
-        return toolResult(arena, if (settled) "idle" else "still active at timeout", false) orelse error.OutOfMemory;
+        // Prompt-aware verdict when integration can tell: "quiet
+        // because sleeping" must not masquerade as "done".
+        const msg = if (!settled)
+            "still active at timeout"
+        else if (t.integration and t.foregroundRunning())
+            "idle, but a foreground command is still RUNNING (output is quiet, not finished)"
+        else if (t.integration)
+            "idle at shell prompt"
+        else
+            "idle";
+        return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "term_resize")) {
         const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 120, 10, 500));

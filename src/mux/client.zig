@@ -320,7 +320,10 @@ pub const Conn = struct {
         }
     }
 
-    fn connectSshOnce(allocator: std.mem.Allocator, host: []const u8) !Conn {
+    /// Single bounded connect attempt (~20s worst case) — pub for
+    /// callers that must not pay connectSsh's 3x retry inline (e.g.
+    /// termdrive's transparent reattach inside a drain path).
+    pub fn connectSshOnce(allocator: std.mem.Allocator, host: []const u8) !Conn {
         var host_z_buf: [256:0]u8 = undefined;
         const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{host}) catch return error.BadPath;
         const ssh_env = c.getenv("SKETERM_SSH");

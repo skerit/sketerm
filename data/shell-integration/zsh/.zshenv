@@ -25,6 +25,11 @@ if [[ -o interactive && -n "$SKETERM_SHELL_INTEGRATION" ]]; then
         [[ -r "$SKETERM_SHELL_INTEGRATION" ]] && builtin source "$SKETERM_SHELL_INTEGRATION"
         unset SKETERM_SHELL_INTEGRATION
         unset -f _sketerm_load_integration
+        # zsh expands $precmd_functions once per cycle, so the hooks
+        # registered just now won't run for THIS (first) prompt — emit
+        # its A mark ourselves or the first prompt stays unmarked (the
+        # D with no open C is dropped by the terminal).
+        (( $+functions[_sketerm_emit_133a] )) && _sketerm_emit_133a
     }
     typeset -ga precmd_functions
     precmd_functions+=(_sketerm_load_integration)
