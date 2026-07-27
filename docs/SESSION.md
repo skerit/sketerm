@@ -10396,3 +10396,35 @@ plain ssh with full integration. The 14-check bug-repro suite
 passes over BOTH transports. Unit suite 1041/5/0, smoke-mcp +
 smoke-mux PASS, mux-portable builds, sketerm-mux still links
 libc/libm only. VPS restored afterwards.
+
+## Files fixes: helper exec, listing perf, sidebar, QL (2026-07-27)
+
+"job helper died" on remote previews root-caused on a live host: the
+long-running daemon predated a pacman upgrade, so readlink of
+/proc/self/exe yielded "/usr/bin/sketerm-mux (deleted)" and every
+job-helper execv failed at spawn. All self-spawn sites (job helper,
+display keeper, daemon autostart) now exec the literal /proc/self/exe
+via platform.selfExecPathZ (Linux; macOS keeps the resolved path).
+Old daemons keep failing until restarted with a fixed binary.
+
+Remote-listing "takes a second" measured end-to-end: wire was 7ms for
+353 entries; the cost was client-side. Navigation rendered the listing
+twice per drain (commitNavigation + dirty pass -> now once), and each
+async thumbnail scheduled a full listing rebuild (70ms+ x 8/s while a
+remote folder streamed thumbs -> rows carry a pending-thumb marker and
+applyThumbTexture swaps the texture into the live widget in place).
+
+Sidebar: top section is now "Local Places" with local:-qualified specs
+(Home/Trash/Devices used bare paths resolved against the CURRENT tab's
+host -- wrong machine on a remote tab), plus a per-host "<Host> Places"
+section (Home from the homedir reply, now kept on HostConn.home_dir).
+Right-click context menus on all sidebar rows (open/copy/bookmark/
+remove, matched to row kind). Scroll on the files tab strip switches
+tabs like the terminal bar. Quick Look restyled (header split, rounded
+image stage, carded text, centered hint), capped at 90% of the
+monitor, decode bound 480 -> 1024px.
+
+Verified: suite 1040/5/0, smoke-fs/mux/e2e PASS, mux-portable + ldd
+clean; Xvfb screenshot runs for sidebar sections, row menus, QL and
+tab-strip scrolling. smoke-mcp term_run-idle failure reproduces on
+clean HEAD (pre-existing, unrelated).
