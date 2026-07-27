@@ -635,7 +635,12 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         hc.dirs_known = true;
         if (rep.ok and rep.templates.len > 0 and hc.templates_dir == null)
             hc.templates_dir = self.allocator.dupe(u8, rep.templates) catch null;
+        if (rep.ok and rep.home.len > 0 and hc.home_dir == null)
+            hc.home_dir = self.allocator.dupe(u8, rep.home) catch null;
         self.templatesHostDirs(hc);
+        // The sidebar's per-host section shows this host's Home once
+        // it is known.
+        if (self.places_on and hc.host != null) self.renderPlaces();
         return false;
     }
     // Open With host-apps reply?

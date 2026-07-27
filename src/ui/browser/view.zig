@@ -660,6 +660,7 @@ pub const BrowserView = struct {
     pub const placeRow = @import("places.zig").placeRow;
     pub const renderPlaces = @import("places.zig").renderPlaces;
     pub const onPlaceActivated = @import("places.zig").onPlaceActivated;
+    pub const onPlacesRightClick = @import("places.zig").onPlacesRightClick;
     pub const runSavedSearch = @import("places.zig").runSavedSearch;
     pub const onSaveSearchClicked = @import("places.zig").onSaveSearchClicked;
     pub const onBookmarkRemove = @import("places.zig").onBookmarkRemove;
@@ -1358,6 +1359,11 @@ pub const BrowserView = struct {
         c.gtk_list_box_set_selection_mode(@ptrCast(pl_list), c.GTK_SELECTION_NONE);
         c.gtk_list_box_set_activate_on_single_click(@ptrCast(pl_list), 1);
         _ = c.g_signal_connect_data(pl_list, "row-activated", @ptrCast(&onPlaceActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        // Right-click a sidebar row for its context menu.
+        const pl_rclick = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(pl_rclick), 3);
+        _ = c.g_signal_connect_data(pl_rclick, "pressed", @ptrCast(&onPlacesRightClick), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(pl_list, @ptrCast(pl_rclick));
         c.gtk_scrolled_window_set_child(@ptrCast(pl_scroll), pl_list);
         c.gtk_widget_set_visible(pl_scroll, 0);
         c.gtk_paned_set_start_child(@ptrCast(content), pl_scroll);

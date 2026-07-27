@@ -1190,6 +1190,8 @@ pub fn idleAfterSwitch(user: ?*anyopaque) callconv(.c) c.gboolean {
         self.renderTab(t);
     }
     self.updatePreview();
+    // The sidebar's per-host section follows the CURRENT tab's host.
+    if (self.places_on) self.renderPlaces();
     return 0;
 }
 

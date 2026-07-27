@@ -179,6 +179,9 @@ pub const HostConn = struct {
     /// offer THAT host's templates, and only its daemon can read its
     /// user-dirs.dirs.
     templates_dir: ?[]u8 = null,
+    /// The host's home directory (same `homedir` reply); what the
+    /// sidebar's per-host places section navigates to.
+    home_dir: ?[]u8 = null,
     /// The one in-flight `homedir` request (0 = none). A second
     /// request for the same facts would be a wasted round trip that
     /// could also land first and be dropped as unrecognized.
@@ -196,6 +199,7 @@ pub const HostConn = struct {
         if (self.watch_id != 0) _ = c.g_source_remove(self.watch_id);
         if (self.state == .ready) self.conn.deinit();
         if (self.templates_dir) |td| allocator.free(td);
+        if (self.home_dir) |hd| allocator.free(hd);
         if (self.host) |h| allocator.free(h);
         allocator.destroy(self);
     }
