@@ -168,6 +168,9 @@ pub const BrowserView = struct {
     places_scroller: *c.GtkWidget = undefined,
     places_list: *c.GtkListBox = undefined,
     places_on: bool = false,
+    /// Smooth-scroll accumulator for scroll-to-switch on the tab
+    /// strip (one tab per ~1.0 of delta).
+    tab_scroll_accum: f64 = 0,
     /// The Places toggle, so the persisted open state and the button
     /// can never disagree.
     places_toggle: *c.GtkToggleButton = undefined,
